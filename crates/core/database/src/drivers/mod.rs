@@ -10,6 +10,7 @@ use authifier::config::SMTPSettings;
 use authifier::config::Shield;
 use authifier::config::Template;
 use authifier::config::Templates;
+use authifier::config::EmailExpiryConfig;
 use authifier::Authifier;
 use rand::Rng;
 use revolt_config::config;
@@ -143,7 +144,11 @@ impl Database {
                         use_tls: config.api.smtp.use_tls,
                         use_starttls: config.api.smtp.use_starttls,
                     },
-                    expiry: Default::default(),
+                    expiry: EmailExpiryConfig {
+                        expire_verification: 3600 * 24 * 7,
+                        expire_password_reset: 3600 * 24,
+                        expire_account_deletion: 3600 * 24,
+                    },
                     templates: if config.production {
                         Templates {
                             verify: Template {
