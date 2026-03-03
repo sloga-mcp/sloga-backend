@@ -16,7 +16,9 @@ mod voice_client;
 pub use voice_client::VoiceClient;
 
 async fn get_connection() -> Result<Conn> {
-    _get_connection().await.map_err(|_| create_error!(InternalError))
+    _get_connection()
+        .await
+        .map_err(|_| create_error!(InternalError))
 }
 
 pub async fn raise_if_in_voice(user: &User, channel_id: &str) -> Result<()> {
@@ -55,6 +57,14 @@ pub async fn get_channel_node(channel: &str) -> Result<Option<String>> {
     get_connection()
         .await?
         .get(format!("node:{channel}"))
+        .await
+        .to_internal_error()
+}
+
+pub async fn delete_channel_node(channel: &str) -> Result<()> {
+    get_connection()
+        .await?
+        .del(format!("node:{channel}"))
         .await
         .to_internal_error()
 }
@@ -226,6 +236,7 @@ pub async fn delete_channel_voice_state(
 
     let mut pipeline = Pipeline::new();
     pipeline.del(format!("vc_members:{channel_id}"));
+    pipeline.del(format!("node:{channel_id}"));
 
     for user_id in user_ids {
         let unique_key = format!("{user_id}:{parent_id}");
@@ -567,15 +578,24 @@ pub async fn get_call_notification_recipients(
         .to_internal_error()
 }
 
-pub async fn remove_user_from_voice_channels(db: &Database, voice_client: &VoiceClient, user_id: &str) -> Result<()> {
+pub async fn remove_user_from_voice_channels(
+    db: &Database,
+    voice_client: &VoiceClient,
+    user_id: &str,
+) -> Result<()> {
     for channel_id in get_user_voice_channels(user_id).await? {
         remove_user_from_voice_channel(db, voice_client, &channel_id, user_id).await?;
-    };
+    }
 
     Ok(())
 }
 
-pub async fn remove_user_from_voice_channel(db: &Database, voice_client: &VoiceClient, channel_id: &str, user_id: &str) -> Result<()> {
+pub async fn remove_user_from_voice_channel(
+    db: &Database,
+    voice_client: &VoiceClient,
+    channel_id: &str,
+    user_id: &str,
+) -> Result<()> {
     if let Some(node) = get_channel_node(channel_id).await? {
         let _ = voice_client.remove_user(&node, user_id, channel_id).await;
     }
@@ -587,7 +607,11 @@ pub async fn remove_user_from_voice_channel(db: &Database, voice_client: &VoiceC
     Ok(())
 }
 
-pub async fn delete_voice_channel(voice_client: &VoiceClient, channel_id: &str, server_id: Option<&str>) -> Result<()> {
+pub async fn delete_voice_channel(
+    voice_client: &VoiceClient,
+    channel_id: &str,
+    server_id: Option<&str>,
+) -> Result<()> {
     if let Some(users) = get_voice_channel_members(channel_id).await? {
         let node = get_channel_node(channel_id).await?.unwrap();
 

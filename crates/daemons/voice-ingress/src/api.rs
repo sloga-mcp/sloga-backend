@@ -5,9 +5,8 @@ use revolt_database::{
     iso8601_timestamp::{Duration, Timestamp},
     util::reference::Reference,
     voice::{
-        create_voice_state, delete_voice_state,
-        get_user_moved_from_voice, get_user_moved_to_voice,
-        update_voice_state_tracks, VoiceClient,
+        create_voice_state, delete_channel_node, delete_voice_state, get_user_moved_from_voice,
+        get_user_moved_to_voice, get_voice_channel_members, update_voice_state_tracks, VoiceClient,
     },
     Database, AMQP,
 };
@@ -160,6 +159,8 @@ pub async fn ingress(
             // let members = get_voice_channel_members(channel_id).await?;
 
             // if members.is_none_or(|m| m.is_empty()) {
+            //     delete_channel_node(channel_id).await?;
+            //
             //     // The channel is empty so send out an "end" message for ringing
             //     if let Err(e) = amqp
             //         .dm_call_updated(user_id, channel_id, None, true, None)
