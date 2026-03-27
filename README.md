@@ -72,6 +72,7 @@ Now you can clone and build the project:
 ```bash
 git clone https://github.com/stoatchat/stoatchat stoat-backend
 cd stoat-backend
+mise install
 mise build
 ```
 
@@ -130,9 +131,6 @@ Then continue:
 # start other necessary services
 docker compose up -d
 
-# run everything together
-./scripts/start.sh
-# .. or individually
 # run the API server
 cargo run --bin revolt-delta
 # run the events server
