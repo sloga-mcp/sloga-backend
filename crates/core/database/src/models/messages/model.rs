@@ -388,6 +388,7 @@ impl Message {
             mut role_mentions,
             mut mentions_everyone,
             mut mentions_online,
+            ..
         } = message_mentions;
 
         if allow_mass_mentions && server_id.is_some() && !role_mentions.is_empty() {
