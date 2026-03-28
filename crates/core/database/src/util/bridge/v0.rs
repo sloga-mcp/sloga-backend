@@ -415,11 +415,13 @@ impl From<crate::Metadata> for Metadata {
             crate::Metadata::Image {
                 width,
                 height,
+                thumbhash,
                 animated,
             } => Metadata::Image {
                 width: width as usize,
                 height: height as usize,
-                animated: animated as bool,
+                thumbhash,
+                animated,
             },
             crate::Metadata::Video { width, height } => Metadata::Video {
                 width: width as usize,
@@ -438,10 +440,12 @@ impl From<Metadata> for crate::Metadata {
             Metadata::Image {
                 width,
                 height,
+                thumbhash,
                 animated,
             } => crate::Metadata::Image {
                 width: width as isize,
                 height: height as isize,
+                thumbhash,
                 animated,
             },
             Metadata::Video { width, height } => crate::Metadata::Video {
@@ -531,7 +535,9 @@ impl From<crate::SystemMessage> for SystemMessage {
             crate::SystemMessage::UserRemove { id, by } => Self::UserRemove { id, by },
             crate::SystemMessage::MessagePinned { id, by } => Self::MessagePinned { id, by },
             crate::SystemMessage::MessageUnpinned { id, by } => Self::MessageUnpinned { id, by },
-            crate::SystemMessage::CallStarted { by, finished_at } => Self::CallStarted { by, finished_at }
+            crate::SystemMessage::CallStarted { by, finished_at } => {
+                Self::CallStarted { by, finished_at }
+            }
         }
     }
 }
@@ -1398,7 +1404,7 @@ impl From<FieldsMessage> for crate::FieldsMessage {
 impl From<VoiceInformation> for crate::VoiceInformation {
     fn from(value: VoiceInformation) -> Self {
         crate::VoiceInformation {
-            max_users: value.max_users
+            max_users: value.max_users,
         }
     }
 }
@@ -1406,7 +1412,7 @@ impl From<VoiceInformation> for crate::VoiceInformation {
 impl From<crate::VoiceInformation> for VoiceInformation {
     fn from(value: crate::VoiceInformation) -> Self {
         VoiceInformation {
-            max_users: value.max_users
+            max_users: value.max_users,
         }
     }
 }
