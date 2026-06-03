@@ -80,10 +80,10 @@ const config: Config = {
       respectPrefersColorScheme: true,
     },
     navbar: {
-      title: 'Stoat Developers',
       logo: {
-        alt: 'Stoat',
-        src: 'https://stoat.chat/favicon.svg',
+        alt: 'Stoat for Developers',
+        src: '/img/navbar.light.svg',
+        srcDark: '/img/navbar.dark.svg'
       },
       items: [
         {
