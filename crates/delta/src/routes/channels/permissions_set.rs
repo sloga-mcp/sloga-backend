@@ -29,7 +29,9 @@ pub async fn set_role_permissions(
 
     if let Some(server) = query.server_ref() {
         if let Some(role) = server.roles.get(&role_id) {
-            if role.rank <= query.get_member_rank().unwrap_or(i64::MIN) {
+            if server.owner != user.id
+                && role.rank <= query.get_member_rank().unwrap_or(i64::MIN)
+            {
                 return Err(create_error!(NotElevated));
             }
 
