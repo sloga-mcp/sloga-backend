@@ -89,6 +89,7 @@ auto_derived!(
         Avatar,
         StatusText,
         StatusPresence,
+        StatusActivity,
         ProfileContent,
         ProfileBackground,
         DisplayName,
@@ -152,6 +153,10 @@ auto_derived!(
         /// Current presence option
         #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
         pub presence: Option<Presence>,
+        /// Name of the game or application the user is currently playing, shown to friends
+        #[validate(length(min = 0, max = 64))]
+        #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+        pub activity: Option<String>,
     }
 
     /// User's profile

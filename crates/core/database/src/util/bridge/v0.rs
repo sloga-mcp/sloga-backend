@@ -1269,6 +1269,7 @@ impl From<FieldsUser> for crate::FieldsUser {
             FieldsUser::ProfileBackground => crate::FieldsUser::ProfileBackground,
             FieldsUser::ProfileContent => crate::FieldsUser::ProfileContent,
             FieldsUser::StatusPresence => crate::FieldsUser::StatusPresence,
+            FieldsUser::StatusActivity => crate::FieldsUser::StatusActivity,
             FieldsUser::StatusText => crate::FieldsUser::StatusText,
             FieldsUser::DisplayName => crate::FieldsUser::DisplayName,
             FieldsUser::Pronouns => crate::FieldsUser::Pronouns,
@@ -1285,6 +1286,7 @@ impl From<crate::FieldsUser> for FieldsUser {
             crate::FieldsUser::ProfileBackground => FieldsUser::ProfileBackground,
             crate::FieldsUser::ProfileContent => FieldsUser::ProfileContent,
             crate::FieldsUser::StatusPresence => FieldsUser::StatusPresence,
+            crate::FieldsUser::StatusActivity => FieldsUser::StatusActivity,
             crate::FieldsUser::StatusText => FieldsUser::StatusText,
             crate::FieldsUser::DisplayName => FieldsUser::DisplayName,
             crate::FieldsUser::Pronouns => FieldsUser::Pronouns,
@@ -1353,9 +1355,10 @@ impl crate::UserStatus {
                     Some(presence.into())
                 }
             }),
+            activity: self.activity,
         };
 
-        if status.text.is_none() && status.presence.is_none() {
+        if status.text.is_none() && status.presence.is_none() && status.activity.is_none() {
             None
         } else {
             Some(status)
@@ -1368,6 +1371,7 @@ impl From<UserStatus> for crate::UserStatus {
         crate::UserStatus {
             text: value.text,
             presence: value.presence.map(|presence| presence.into()),
+            activity: value.activity,
         }
     }
 }

@@ -103,6 +103,10 @@ pub async fn edit(
             new_status.presence = Some(presence.into());
         }
 
+        if let Some(activity) = status.activity {
+            new_status.activity = Some(activity);
+        }
+
         partial.status = Some(new_status);
     }
 
@@ -129,4 +133,77 @@ pub async fn edit(
     .await?;
 
     Ok(Json(user.into_self(false).await))
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::util::test::TestHarness;
+    use revolt_models::v0;
+    use rocket::http::{ContentType, Status};
+
+    #[rocket::async_test]
+    async fn set_game_activity() {
+        let harness = TestHarness::new().await;
+        let (_, session, _) = harness.new_user().await;
+
+        // Set the "playing a game" activity via the status object.
+        let response = TestHarness::with_session(
+            session,
+            harness
+                .client
+                .patch("/users/@me")
+                .header(ContentType::JSON)
+                .body(
+                    json!({
+                        "status": {
+                            "activity": "Celeste"
+                        }
+                    })
+                    .to_string(),
+                ),
+        )
+        .await;
+
+        assert_eq!(response.status(), Status::Ok);
+
+        // The returned user should advertise the game to anyone who can see them.
+        let user = response.into_json::<v0::User>().await.expect("`User`");
+        assert_eq!(
+            user.status.and_then(|status| status.activity),
+            Some("Celeste".to_string())
+        );
+    }
+
+    #[rocket::async_test]
+    async fn clear_game_activity() {
+        let harness = TestHarness::new().await;
+        let (_, session, _) = harness.new_user().await;
+
+        // Set it first.
+        TestHarness::with_session(
+            session.clone(),
+            harness
+                .client
+                .patch("/users/@me")
+                .header(ContentType::JSON)
+                .body(json!({ "status": { "activity": "Celeste" } }).to_string()),
+        )
+        .await;
+
+        // Then clear it via the remove field.
+        let response = TestHarness::with_session(
+            session,
+            harness
+                .client
+                .patch("/users/@me")
+                .header(ContentType::JSON)
+                .body(json!({ "remove": ["StatusActivity"] }).to_string()),
+        )
+        .await;
+
+        assert_eq!(response.status(), Status::Ok);
+
+        let user = response.into_json::<v0::User>().await.expect("`User`");
+        assert_eq!(user.status.and_then(|status| status.activity), None);
+    }
 }

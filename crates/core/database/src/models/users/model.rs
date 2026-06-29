@@ -76,6 +76,7 @@ auto_derived!(
         Avatar,
         StatusText,
         StatusPresence,
+        StatusActivity,
         ProfileContent,
         ProfileBackground,
         DisplayName,
@@ -127,6 +128,9 @@ auto_derived!(
         /// Current presence option
         #[serde(skip_serializing_if = "Option::is_none")]
         pub presence: Option<Presence>,
+        /// Name of the game or application the user is currently playing, shown to friends
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub activity: Option<String>,
     }
 
     /// User's profile
@@ -698,6 +702,11 @@ impl User {
             FieldsUser::StatusPresence => {
                 if let Some(x) = self.status.as_mut() {
                     x.presence = None;
+                }
+            }
+            FieldsUser::StatusActivity => {
+                if let Some(x) = self.status.as_mut() {
+                    x.activity = None;
                 }
             }
             FieldsUser::ProfileContent => {
