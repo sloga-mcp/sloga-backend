@@ -10,7 +10,7 @@ const sidebars: SidebarsConfig = {
       label: "Developers",
       link: {
         type: "generated-index",
-        description: "Building with Stoat"
+        description: "Building with Acutest"
       },
       items: [
         {
@@ -21,10 +21,10 @@ const sidebars: SidebarsConfig = {
     },
     {
       type: 'category',
-      label: "Developing Stoat",
+      label: "Developing Acutest",
       link: {
         type: "generated-index",
-        description: "Building Stoat"
+        description: "Building Acutest"
       },
       items: [
         {

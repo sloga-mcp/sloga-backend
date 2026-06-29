@@ -78,7 +78,7 @@ fn custom_openapi_spec() -> OpenApi {
         "x-logo".to_owned(),
         json!({
             "url": "https://stoat.chat/header.png",
-            "altText": "Stoat Header"
+            "altText": "Acutest Header"
         }),
     );
 
@@ -86,7 +86,7 @@ fn custom_openapi_spec() -> OpenApi {
         "x-tagGroups".to_owned(),
         json!([
           {
-            "name": "Stoat",
+            "name": "Acutest",
             "tags": [
               "Core"
             ]
@@ -167,11 +167,11 @@ fn custom_openapi_spec() -> OpenApi {
     OpenApi {
         openapi: OpenApi::default_version(),
         info: Info {
-            title: "Stoat API".to_owned(),
+            title: "Acutest API".to_owned(),
             description: Some("Open source user-first chat platform.".to_owned()),
             terms_of_service: Some("https://stoat.chat/terms".to_owned()),
             contact: Some(Contact {
-                name: Some("Stoat".to_owned()),
+                name: Some("Acutest".to_owned()),
                 url: Some("https://stoat.chat".to_owned()),
                 email: Some("contact@stoat.chat".to_owned()),
                 ..Default::default()
@@ -190,18 +190,18 @@ fn custom_openapi_spec() -> OpenApi {
         servers: vec![
             Server {
                 url: "https://api.stoat.chat".to_owned(),
-                description: Some("Stoat Production".to_owned()),
+                description: Some("Acutest Production".to_owned()),
                 ..Default::default()
             },
             Server {
                 url: "https://beta.stoat.chat/api".to_owned(),
-                description: Some("Stoat Beta".to_owned()),
+                description: Some("Acutest Beta".to_owned()),
                 ..Default::default()
             },
         ],
         external_docs: Some(ExternalDocs {
             url: "https://developers.stoat.chat".to_owned(),
-            description: Some("Stoat Developer Documentation".to_owned()),
+            description: Some("Acutest Developer Documentation".to_owned()),
             ..Default::default()
         }),
         extensions,
@@ -209,19 +209,19 @@ fn custom_openapi_spec() -> OpenApi {
             Tag {
                 name: "Core".to_owned(),
                 description: Some(
-                    "Use in your applications to determine information about the Stoat node"
+                    "Use in your applications to determine information about the Acutest node"
                         .to_owned(),
                 ),
                 ..Default::default()
             },
             Tag {
                 name: "User Information".to_owned(),
-                description: Some("Query and fetch users on Stoat".to_owned()),
+                description: Some("Query and fetch users on Acutest".to_owned()),
                 ..Default::default()
             },
             Tag {
                 name: "Direct Messaging".to_owned(),
-                description: Some("Direct message other users on Stoat".to_owned()),
+                description: Some("Direct message other users on Acutest".to_owned()),
                 ..Default::default()
             },
             Tag {
@@ -238,7 +238,7 @@ fn custom_openapi_spec() -> OpenApi {
             },
             Tag {
                 name: "Channel Information".to_owned(),
-                description: Some("Query and fetch channels on Stoat".to_owned()),
+                description: Some("Query and fetch channels on Acutest".to_owned()),
                 ..Default::default()
             },
             Tag {
@@ -268,7 +268,7 @@ fn custom_openapi_spec() -> OpenApi {
             },
             Tag {
                 name: "Server Information".to_owned(),
-                description: Some("Query and fetch servers on Stoat".to_owned()),
+                description: Some("Query and fetch servers on Acutest".to_owned()),
                 ..Default::default()
             },
             Tag {
@@ -304,7 +304,7 @@ fn custom_openapi_spec() -> OpenApi {
             Tag {
                 name: "Onboarding".to_owned(),
                 description: Some(
-                    "After signing up to Stoat, users must pick a unique username".to_owned(),
+                    "After signing up to Acutest, users must pick a unique username".to_owned(),
                 ),
                 ..Default::default()
             },
@@ -316,7 +316,7 @@ fn custom_openapi_spec() -> OpenApi {
             Tag {
                 name: "Web Push".to_owned(),
                 description: Some(
-                    "Subscribe to and receive Stoat push notifications while offline".to_owned(),
+                    "Subscribe to and receive Acutest push notifications while offline".to_owned(),
                 ),
                 ..Default::default()
             },

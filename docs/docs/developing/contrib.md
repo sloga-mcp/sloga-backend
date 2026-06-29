@@ -4,7 +4,7 @@ sidebar_position: 2
 
 # Contribution Guide
 
-This is the contribution guide for developers wanting to help out with Stoat.
+This is the contribution guide for developers wanting to help out with Acutest.
 
 ## Repository Lifecycle
 

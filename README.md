@@ -1,6 +1,6 @@
 <div align="center">
 <h1>
-  Stoat Backend
+  Acutest Backend
   
   [![Stars](https://img.shields.io/github/stars/stoatchat/stoatchat?style=flat-square&logoColor=white)](https://github.com/stoatchat/stoatchat/stargazers)
   [![Forks](https://img.shields.io/github/forks/stoatchat/stoatchat?style=flat-square&logoColor=white)](https://github.com/stoatchat/stoatchat/network/members)
@@ -9,7 +9,13 @@
   [![Contributors](https://img.shields.io/github/contributors/stoatchat/stoatchat?style=flat-square&logoColor=white)](https://github.com/stoatchat/stoatchat/graphs/contributors)
   [![License](https://img.shields.io/github/license/stoatchat/stoatchat?style=flat-square&logoColor=white)](https://github.com/stoatchat/stoatchat/blob/main/LICENSE)
 </h1>
-The services and libraries that power the Stoat service.<br/>
+The services and libraries that power the Acutest service.<br/>
+<br/>
+
+> **Acutest is a fork of [Stoat](https://github.com/stoatchat/stoatchat)** (itself a fork of
+> Revolt), rebranded as Acutest. It remains licensed under the GNU Affero General Public
+> License v3.0. Internal crates retain their upstream `revolt-*` names; only the product
+> branding has changed. The status badges above still point at the upstream repository.
 <br/>
 
 | Crate              | Path                                               | Description                         |                                                                                                                                                                                                                                                                                                           |
@@ -214,6 +220,6 @@ TEST_DB=MONGODB cargo nextest run
 
 ## License
 
-The Stoat backend is generally licensed under the [GNU Affero General Public License v3.0](https://github.com/stoatchat/stoatchat/blob/main/LICENSE).
+The Acutest backend is generally licensed under the [GNU Affero General Public License v3.0](https://github.com/stoatchat/stoatchat/blob/main/LICENSE).
 
 **Individual crates may supply their own licenses!**

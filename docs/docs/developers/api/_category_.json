@@ -3,7 +3,7 @@
     "position": 2,
     "link": {
         "type": "generated-index",
-        "description": "Connecting and consuming the Stoat API"
+        "description": "Connecting and consuming the Acutest API"
     },
     "collapsed": false,
     "collapsible": true

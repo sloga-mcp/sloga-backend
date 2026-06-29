@@ -4,8 +4,8 @@ import type * as Preset from '@docusaurus/preset-classic';
 import type { ScalarOptions } from '@scalar/docusaurus';
 
 const config: Config = {
-  title: 'Stoat Developers',
-  tagline: 'Developer documentation for Stoat',
+  title: 'Acutest Developers',
+  tagline: 'Developer documentation for Acutest',
   favicon: 'https://stoat.chat/favicon-stoat.svg',
 
   future: {
@@ -81,7 +81,7 @@ const config: Config = {
     },
     navbar: {
       logo: {
-        alt: 'Stoat for Developers',
+        alt: 'Acutest for Developers',
         src: '/img/navbar.light.svg',
         srcDark: '/img/navbar.dark.svg'
       },
@@ -132,7 +132,7 @@ const config: Config = {
           ],
         },
         {
-          title: 'Stoat on Socials',
+          title: 'Acutest on Socials',
           items: [
             {
               label: 'Bluesky',
@@ -143,7 +143,7 @@ const config: Config = {
               href: 'https://reddit.com/r/stoatchat'
             },
             {
-              label: 'Stoat Server',
+              label: 'Acutest Server',
               href: 'https://stt.gg/Testers'
             },
           ],

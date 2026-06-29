@@ -1,6 +1,6 @@
 # Rate Limits
 
-Stoat uses a fixed-window ratelimiting algorithm:
+Acutest uses a fixed-window ratelimiting algorithm:
 
 - You are given a set amount of calls per each named bucket.
 - Any calls past this limit will result in 429 errors.

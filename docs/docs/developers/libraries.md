@@ -1,6 +1,6 @@
 # Libraries
 
-The following libraries are provided by the Stoat team:
+The following libraries are provided by the Acutest team:
 
 - [Javascript SDK](https://github.com/stoatchat/javascript-client-sdk)
 - [Python SDK](https://github.com/stoatchat/python-client-sdk)

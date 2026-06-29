@@ -1,4 +1,4 @@
-# Stoat Migration Guide
+# Acutest Migration Guide
 
 :::warning
 

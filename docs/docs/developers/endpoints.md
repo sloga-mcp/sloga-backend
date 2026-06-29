@@ -4,7 +4,7 @@ sidebar_position: 1
 
 # Endpoints
 
-[![Run in Yaak](https://external.stoatusercontent.com/proxy?url=https://yaak.app/static/button.svg)](https://yaak.app/button/run?name=Stoat+API&url=https%3A%2F%2Fstoat.chat%2Fapi%2Fopenapi.json)
+[![Run in Yaak](https://external.stoatusercontent.com/proxy?url=https://yaak.app/static/button.svg)](https://yaak.app/button/run?name=Acutest+API&url=https%3A%2F%2Fstoat.chat%2Fapi%2Fopenapi.json)
 
 **We are moving stuff around currently following the rebrand, guidance will follow soon!**
 

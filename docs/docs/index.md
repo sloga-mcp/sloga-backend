@@ -4,7 +4,7 @@ sidebar_position: 1
 
 # 🤗 Introduction
 
-Welcome to Stoat's developer documentation. Everything you need to contribute to Stoat, build apps or bots, or to learn more about the project can be found here.
+Welcome to Acutest's developer documentation. Everything you need to contribute to Acutest, build apps or bots, or to learn more about the project can be found here.
 
 Learn more about:
 

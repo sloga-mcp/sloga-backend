@@ -4,7 +4,7 @@ New API features must be documented where appropriate, this document aims to cov
 
 Before writing new API features, generally a good idea to:
 
-- Consult with other developers in the [Stoat Developers space](https://stt.gg/API)
+- Consult with other developers in the [Acutest Developers space](https://stt.gg/API)
 - If it's a relatively big feature, also [write an RFC](https://github.com/revoltchat/rfcs)
 
 When your feature is ready to release, ensure to:
