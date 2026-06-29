@@ -153,10 +153,22 @@ auto_derived!(
         /// Current presence option
         #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
         pub presence: Option<Presence>,
-        /// Name of the game or application the user is currently playing, shown to friends
-        #[validate(length(min = 0, max = 64))]
+        /// Game or application the user is currently playing, shown to friends
+        #[cfg_attr(feature = "validator", validate)]
         #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
-        pub activity: Option<String>,
+        pub activity: Option<UserActivity>,
+    }
+
+    /// Information about a game or application a user is playing
+    #[cfg_attr(feature = "validator", derive(Validate))]
+    pub struct UserActivity {
+        /// Name of the game or application being played
+        #[validate(length(min = 1, max = 64))]
+        pub name: String,
+        /// When the user started playing, for "playing for 2h"-style displays.
+        /// Set server-side; ignored on input.
+        #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+        pub started_at: Option<Timestamp>,
     }
 
     /// User's profile

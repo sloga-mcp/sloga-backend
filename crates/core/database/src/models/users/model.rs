@@ -128,9 +128,18 @@ auto_derived!(
         /// Current presence option
         #[serde(skip_serializing_if = "Option::is_none")]
         pub presence: Option<Presence>,
-        /// Name of the game or application the user is currently playing, shown to friends
+        /// Game or application the user is currently playing, shown to friends
         #[serde(skip_serializing_if = "Option::is_none")]
-        pub activity: Option<String>,
+        pub activity: Option<UserActivity>,
+    }
+
+    /// Information about a game or application a user is playing
+    pub struct UserActivity {
+        /// Name of the game or application being played
+        pub name: String,
+        /// When the user started playing
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub started_at: Option<Timestamp>,
     }
 
     /// User's profile

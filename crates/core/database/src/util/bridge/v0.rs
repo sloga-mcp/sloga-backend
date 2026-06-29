@@ -1355,7 +1355,7 @@ impl crate::UserStatus {
                     Some(presence.into())
                 }
             }),
-            activity: self.activity,
+            activity: self.activity.map(|activity| activity.into()),
         };
 
         if status.text.is_none() && status.presence.is_none() && status.activity.is_none() {
@@ -1371,7 +1371,25 @@ impl From<UserStatus> for crate::UserStatus {
         crate::UserStatus {
             text: value.text,
             presence: value.presence.map(|presence| presence.into()),
-            activity: value.activity,
+            activity: value.activity.map(|activity| activity.into()),
+        }
+    }
+}
+
+impl From<crate::UserActivity> for UserActivity {
+    fn from(value: crate::UserActivity) -> Self {
+        UserActivity {
+            name: value.name,
+            started_at: value.started_at,
+        }
+    }
+}
+
+impl From<UserActivity> for crate::UserActivity {
+    fn from(value: UserActivity) -> crate::UserActivity {
+        crate::UserActivity {
+            name: value.name,
+            started_at: value.started_at,
         }
     }
 }

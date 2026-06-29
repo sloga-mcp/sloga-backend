@@ -1,5 +1,6 @@
+use iso8601_timestamp::Timestamp;
 use revolt_database::FieldsUser;
-use revolt_database::{util::reference::Reference, Database, File, PartialUser, User};
+use revolt_database::{util::reference::Reference, Database, File, PartialUser, User, UserActivity};
 use revolt_models::v0;
 use revolt_result::{create_error, Result};
 use rocket::serde::json::Json;
@@ -104,7 +105,17 @@ pub async fn edit(
         }
 
         if let Some(activity) = status.activity {
-            new_status.activity = Some(activity);
+            // Server-authoritative timer: keep it running if they're still playing
+            // the same game, otherwise stamp the moment this one started.
+            let started_at = match &new_status.activity {
+                Some(current) if current.name == activity.name => current.started_at,
+                _ => Some(Timestamp::now_utc()),
+            };
+
+            new_status.activity = Some(UserActivity {
+                name: activity.name,
+                started_at,
+            });
         }
 
         partial.status = Some(new_status);
@@ -156,7 +167,7 @@ mod tests {
                 .body(
                     json!({
                         "status": {
-                            "activity": "Celeste"
+                            "activity": { "name": "Celeste" }
                         }
                     })
                     .to_string(),
@@ -166,12 +177,15 @@ mod tests {
 
         assert_eq!(response.status(), Status::Ok);
 
-        // The returned user should advertise the game to anyone who can see them.
+        // The returned user should advertise the game to anyone who can see them,
+        // with a server-stamped start time.
         let user = response.into_json::<v0::User>().await.expect("`User`");
-        assert_eq!(
-            user.status.and_then(|status| status.activity),
-            Some("Celeste".to_string())
-        );
+        let activity = user
+            .status
+            .and_then(|status| status.activity)
+            .expect("`activity`");
+        assert_eq!(activity.name, "Celeste".to_string());
+        assert!(activity.started_at.is_some());
     }
 
     #[rocket::async_test]
@@ -186,7 +200,7 @@ mod tests {
                 .client
                 .patch("/users/@me")
                 .header(ContentType::JSON)
-                .body(json!({ "status": { "activity": "Celeste" } }).to_string()),
+                .body(json!({ "status": { "activity": { "name": "Celeste" } } }).to_string()),
         )
         .await;
 
