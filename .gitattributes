@@ -1,0 +1,5 @@
+# Shell scripts must keep LF endings, or the shebang breaks under WSL/Linux
+# ("bad interpreter: /usr/bin/env bash^M"). The mise task scripts have no
+# extension, so they are matched by path.
+*.sh text eol=lf
+.mise/tasks/** text eol=lf
