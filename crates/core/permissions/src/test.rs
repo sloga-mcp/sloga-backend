@@ -411,10 +411,11 @@ async fn validate_dm_allows_video_calls() {
 }
 
 #[tokio::test]
-async fn validate_default_group_allows_video_calls() {
+async fn validate_default_group_grants_video_permission() {
     /// Scenario in which we are a non-owner member of a group with default
     /// permissions (`permissions: None`). The default falls back to the DM
-    /// permission set, so voice and video calling should be available.
+    /// permission set, so members hold the Connect/Speak/Video permissions —
+    /// these are used once an owner turns calling on for the group.
     struct Scenario {}
     let mut query = Scenario {};
 

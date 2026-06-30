@@ -458,12 +458,12 @@ impl Channel {
         match self {
             // DMs are always call-capable.
             Self::DirectMessage { .. } => Some(Cow::Owned(VoiceInformation::default())),
-            // Groups are call-capable by default; an owner may configure limits
-            // (max_users) or turn calling off entirely (disabled).
+            // Groups have calling OFF by default; an owner turns it on (and may
+            // set limits via max_users). Setting `disabled` keeps any saved
+            // configuration while turning calling back off.
             Self::Group { voice, .. } => match voice {
-                Some(voice) if voice.disabled => None,
-                Some(voice) => Some(Cow::Borrowed(voice)),
-                None => Some(Cow::Owned(VoiceInformation::default())),
+                Some(voice) if !voice.disabled => Some(Cow::Borrowed(voice)),
+                _ => None,
             },
             // Server channels are voice channels only when voice info is present
             // and not explicitly disabled.
@@ -878,20 +878,27 @@ mod tests {
             voice,
         };
 
-        // Default group: calling available, no participant limit.
-        assert!(group(None).voice().is_some());
-        assert_eq!(group(None).voice().unwrap().max_users, None);
+        // Default group (unconfigured): calling is OFF, so join_call is refused.
+        assert!(group(None).voice().is_none());
 
-        // Group with a participant limit: available, limit is surfaced to join_call.
+        // Owner turns calling on (no limit).
+        let enabled = group(Some(VoiceInformation {
+            max_users: None,
+            disabled: false,
+        }));
+        assert!(enabled.voice().is_some());
+        assert_eq!(enabled.voice().unwrap().max_users, None);
+
+        // On, with a participant limit surfaced to join_call.
         let limited = group(Some(VoiceInformation {
             max_users: Some(5),
             disabled: false,
         }));
         assert_eq!(limited.voice().unwrap().max_users, Some(5));
 
-        // Group with calling turned off: not call-capable, so join_call is refused.
+        // Explicitly disabled (config preserved): not call-capable.
         let off = group(Some(VoiceInformation {
-            max_users: None,
+            max_users: Some(5),
             disabled: true,
         }));
         assert!(off.voice().is_none());

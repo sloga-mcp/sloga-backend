@@ -12,7 +12,7 @@ Any channel that is "call-capable" can host a voice/video call:
 | Channel type | Call-capable? |
 | ------------ | ------------- |
 | Direct message | Always |
-| Group | Yes, unless the owner has turned calling off |
+| Group | Off by default; an owner enables calling |
 | Server text/voice channel | When voice information is set on the channel |
 | Saved messages | Never |
 
@@ -41,14 +41,24 @@ derived from your channel permissions:
 | `Listen`   | Subscribe to (hear/see) others |
 
 So a participant publishes video only if they hold `Video` and the deployment's
-`limits.video` feature flag is enabled. In DMs and default groups these
-permissions are granted out of the box, so video calling works without extra
+`limits.video` feature flag is enabled. These permissions are granted out of the
+box in DMs and groups, so once a call is available, video works without extra
 setup.
 
 ## Group call configuration
 
-A group's owner (or any member with `ManageChannel`) can configure calling for
-the group through `PATCH /channels/{groupId}`, using the `voice` object:
+Group calling is **off by default**. A group's owner (or any member with
+`ManageChannel`) configures it through `PATCH /channels/{groupId}` using the
+`voice` object.
+
+### Turn calling on
+
+```http
+PATCH /channels/{groupId}
+{ "voice": {} }
+```
+
+Sending an empty `voice` object enables calling with no participant limit.
 
 ### Limit the number of participants
 
@@ -70,12 +80,15 @@ PATCH /channels/{groupId}
 While disabled, the channel reports as not call-capable and `join_call` returns
 `NotAVoiceChannel`; any active call is torn down.
 
-### Reset to defaults (calling on, unlimited)
+### Reset to defaults (calling off)
 
 ```http
 PATCH /channels/{groupId}
 { "remove": ["Voice"] }
 ```
+
+This clears the voice configuration, returning the group to the default state
+where calling is off.
 
 ## Voice state
 
