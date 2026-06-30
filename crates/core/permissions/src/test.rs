@@ -315,6 +315,203 @@ async fn validate_server_permissions() {
 }
 
 #[tokio::test]
+async fn validate_dm_allows_video_calls() {
+    /// Scenario in which we have a DM open with a friend: voice and video
+    /// calling should be available to both participants by default.
+    struct Scenario {}
+    let mut query = Scenario {};
+
+    let perms = calculate_channel_permissions(&mut query).await;
+    assert!(perms.has_channel_permission(ChannelPermission::Connect));
+    assert!(perms.has_channel_permission(ChannelPermission::Speak));
+    assert!(perms.has_channel_permission(ChannelPermission::Video));
+
+    #[async_trait]
+    impl PermissionQuery for Scenario {
+        async fn are_we_privileged(&mut self) -> bool {
+            false
+        }
+
+        async fn are_we_a_bot(&mut self) -> bool {
+            false
+        }
+
+        async fn are_the_users_same(&mut self) -> bool {
+            false
+        }
+
+        async fn user_relationship(&mut self) -> RelationshipStatus {
+            RelationshipStatus::Friend
+        }
+
+        async fn user_is_bot(&mut self) -> bool {
+            false
+        }
+
+        async fn have_mutual_connection(&mut self) -> bool {
+            false
+        }
+
+        async fn are_we_server_owner(&mut self) -> bool {
+            unreachable!()
+        }
+
+        async fn are_we_a_member(&mut self) -> bool {
+            unreachable!()
+        }
+
+        async fn get_default_server_permissions(&mut self) -> u64 {
+            unreachable!()
+        }
+
+        async fn get_our_server_role_overrides(&mut self) -> Vec<Override> {
+            unreachable!()
+        }
+
+        async fn are_we_timed_out(&mut self) -> bool {
+            unreachable!()
+        }
+
+        async fn do_we_have_publish_overwrites(&mut self) -> bool {
+            true
+        }
+
+        async fn do_we_have_receive_overwrites(&mut self) -> bool {
+            true
+        }
+
+        async fn get_channel_type(&mut self) -> ChannelType {
+            ChannelType::DirectMessage
+        }
+
+        async fn get_default_channel_permissions(&mut self) -> Override {
+            unreachable!()
+        }
+
+        async fn get_our_channel_role_overrides(&mut self) -> Vec<Override> {
+            unreachable!()
+        }
+
+        async fn do_we_own_the_channel(&mut self) -> bool {
+            unreachable!()
+        }
+
+        async fn are_we_part_of_the_channel(&mut self) -> bool {
+            true
+        }
+
+        async fn set_recipient_as_user(&mut self) {
+            // no-op
+        }
+
+        async fn set_server_from_channel(&mut self) {
+            unreachable!()
+        }
+    }
+}
+
+#[tokio::test]
+async fn validate_default_group_allows_video_calls() {
+    /// Scenario in which we are a non-owner member of a group with default
+    /// permissions (`permissions: None`). The default falls back to the DM
+    /// permission set, so voice and video calling should be available.
+    struct Scenario {}
+    let mut query = Scenario {};
+
+    let perms = calculate_channel_permissions(&mut query).await;
+    assert!(perms.has_channel_permission(ChannelPermission::Connect));
+    assert!(perms.has_channel_permission(ChannelPermission::Speak));
+    assert!(perms.has_channel_permission(ChannelPermission::Video));
+
+    #[async_trait]
+    impl PermissionQuery for Scenario {
+        async fn are_we_privileged(&mut self) -> bool {
+            false
+        }
+
+        async fn are_we_a_bot(&mut self) -> bool {
+            unreachable!()
+        }
+
+        async fn are_the_users_same(&mut self) -> bool {
+            unreachable!()
+        }
+
+        async fn user_relationship(&mut self) -> RelationshipStatus {
+            unreachable!()
+        }
+
+        async fn user_is_bot(&mut self) -> bool {
+            unreachable!()
+        }
+
+        async fn have_mutual_connection(&mut self) -> bool {
+            unreachable!()
+        }
+
+        async fn are_we_server_owner(&mut self) -> bool {
+            unreachable!()
+        }
+
+        async fn are_we_a_member(&mut self) -> bool {
+            unreachable!()
+        }
+
+        async fn get_default_server_permissions(&mut self) -> u64 {
+            unreachable!()
+        }
+
+        async fn get_our_server_role_overrides(&mut self) -> Vec<Override> {
+            unreachable!()
+        }
+
+        async fn are_we_timed_out(&mut self) -> bool {
+            unreachable!()
+        }
+
+        async fn do_we_have_publish_overwrites(&mut self) -> bool {
+            true
+        }
+
+        async fn do_we_have_receive_overwrites(&mut self) -> bool {
+            true
+        }
+
+        async fn get_channel_type(&mut self) -> ChannelType {
+            ChannelType::Group
+        }
+
+        async fn get_default_channel_permissions(&mut self) -> Override {
+            // Mirrors the `permissions: None` fallback in the database layer.
+            Override {
+                allow: *DEFAULT_PERMISSION_DIRECT_MESSAGE,
+                deny: 0,
+            }
+        }
+
+        async fn get_our_channel_role_overrides(&mut self) -> Vec<Override> {
+            unreachable!()
+        }
+
+        async fn do_we_own_the_channel(&mut self) -> bool {
+            false
+        }
+
+        async fn are_we_part_of_the_channel(&mut self) -> bool {
+            true
+        }
+
+        async fn set_recipient_as_user(&mut self) {
+            unreachable!()
+        }
+
+        async fn set_server_from_channel(&mut self) {
+            unreachable!()
+        }
+    }
+}
+
+#[tokio::test]
 async fn validate_timed_out_member() {
     /// Scenario in which we are in a server that we have been timed out from
     struct Scenario {}
