@@ -67,6 +67,10 @@ auto_derived!(
                 serde(skip_serializing_if = "crate::if_false", default)
             )]
             nsfw: bool,
+
+            /// Voice call configuration for this group (limits, on/off)
+            #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+            voice: Option<VoiceInformation>,
         },
         /// Text channel belonging to a server
         TextChannel {
@@ -127,6 +131,12 @@ auto_derived!(
         #[cfg_attr(feature = "validator", validate(range(min = 1)))]
         #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
         pub max_users: Option<usize>,
+        /// Whether voice/video calling is turned off for this channel
+        #[cfg_attr(
+            feature = "serde",
+            serde(skip_serializing_if = "crate::if_false", default)
+        )]
+        pub disabled: bool,
     }
 
     /// Partial representation of a channel

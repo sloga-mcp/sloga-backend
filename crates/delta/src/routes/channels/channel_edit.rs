@@ -98,6 +98,7 @@ pub async fn edit(
             description,
             icon,
             nsfw,
+            voice,
             ..
         } => {
             if data.remove.contains(&v0::FieldsChannel::Icon) {
@@ -113,6 +114,9 @@ pub async fn edit(
                     }
                     v0::FieldsChannel::Icon => {
                         icon.take();
+                    }
+                    v0::FieldsChannel::Voice => {
+                        voice.take();
                     }
                     _ => {}
                 }
@@ -136,6 +140,11 @@ pub async fn edit(
             if let Some(new_nsfw) = data.nsfw {
                 *nsfw = new_nsfw;
                 partial.nsfw = Some(new_nsfw);
+            }
+
+            if let Some(new_voice) = data.voice {
+                *voice = Some(new_voice.clone().into());
+                partial.voice = Some(new_voice.into());
             }
 
             // Send out mutation system messages.

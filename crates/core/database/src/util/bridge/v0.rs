@@ -168,6 +168,7 @@ impl From<crate::Channel> for Channel {
                 last_message_id,
                 permissions,
                 nsfw,
+                voice,
             } => Channel::Group {
                 id,
                 name,
@@ -178,6 +179,7 @@ impl From<crate::Channel> for Channel {
                 last_message_id,
                 permissions,
                 nsfw,
+                voice: voice.map(|voice| voice.into()),
             },
             crate::Channel::TextChannel {
                 id,
@@ -234,6 +236,7 @@ impl From<Channel> for crate::Channel {
                 last_message_id,
                 permissions,
                 nsfw,
+                voice,
             } => crate::Channel::Group {
                 id,
                 name,
@@ -244,6 +247,7 @@ impl From<Channel> for crate::Channel {
                 last_message_id,
                 permissions,
                 nsfw,
+                voice: voice.map(|voice| voice.into()),
             },
             Channel::TextChannel {
                 id,
@@ -1447,6 +1451,7 @@ impl From<VoiceInformation> for crate::VoiceInformation {
     fn from(value: VoiceInformation) -> Self {
         crate::VoiceInformation {
             max_users: value.max_users,
+            disabled: value.disabled,
         }
     }
 }
@@ -1455,6 +1460,7 @@ impl From<crate::VoiceInformation> for VoiceInformation {
     fn from(value: crate::VoiceInformation) -> Self {
         VoiceInformation {
             max_users: value.max_users,
+            disabled: value.disabled,
         }
     }
 }

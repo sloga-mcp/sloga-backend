@@ -72,6 +72,10 @@ auto_derived!(
             /// Whether this group is marked as not safe for work
             #[serde(skip_serializing_if = "crate::if_false", default)]
             nsfw: bool,
+
+            /// Voice call configuration for this group (limits, on/off)
+            #[serde(skip_serializing_if = "Option::is_none")]
+            voice: Option<VoiceInformation>,
         },
         /// Text channel belonging to a server
         TextChannel {
@@ -123,6 +127,9 @@ auto_derived!(
         /// Maximium amount of users allowed in the voice channel at once
         #[serde(skip_serializing_if = "Option::is_none")]
         pub max_users: Option<usize>,
+        /// Whether voice/video calling is turned off for this channel
+        #[serde(skip_serializing_if = "crate::if_false", default)]
+        pub disabled: bool,
     }
 );
 
@@ -290,6 +297,8 @@ impl Channel {
             permissions: None,
 
             nsfw: data.nsfw.unwrap_or(false),
+
+            voice: None,
         };
 
         db.insert_channel(&channel).await?;
@@ -447,12 +456,20 @@ impl Channel {
     /// Gets this channel's voice information
     pub fn voice(&self) -> Option<Cow<VoiceInformation>> {
         match self {
-            Self::DirectMessage { .. } | Self::Group { .. } => {
-                Some(Cow::Owned(VoiceInformation::default()))
-            }
+            // DMs are always call-capable.
+            Self::DirectMessage { .. } => Some(Cow::Owned(VoiceInformation::default())),
+            // Groups are call-capable by default; an owner may configure limits
+            // (max_users) or turn calling off entirely (disabled).
+            Self::Group { voice, .. } => match voice {
+                Some(voice) if voice.disabled => None,
+                Some(voice) => Some(Cow::Borrowed(voice)),
+                None => Some(Cow::Owned(VoiceInformation::default())),
+            },
+            // Server channels are voice channels only when voice info is present
+            // and not explicitly disabled.
             Self::TextChannel {
                 voice: Some(voice), ..
-            } => Some(Cow::Borrowed(voice)),
+            } if !voice.disabled => Some(Cow::Borrowed(voice)),
             _ => None,
         }
     }
@@ -549,7 +566,7 @@ impl Channel {
                 _ => {}
             },
             FieldsChannel::Voice => match self {
-                Self::TextChannel { voice, .. } => {
+                Self::Group { voice, .. } | Self::TextChannel { voice, .. } => {
                     voice.take();
                 }
                 _ => {}
@@ -581,6 +598,7 @@ impl Channel {
                 icon,
                 nsfw,
                 permissions,
+                voice,
                 ..
             } => {
                 if let Some(v) = partial.name {
@@ -605,6 +623,10 @@ impl Channel {
 
                 if let Some(v) = partial.permissions {
                     permissions.replace(v);
+                }
+
+                if let Some(v) = partial.voice {
+                    voice.replace(v);
                 }
             }
             Self::TextChannel {
@@ -837,5 +859,41 @@ mod tests {
                 .await
                 .has_channel_permission(ChannelPermission::SendMessage));
         });
+    }
+
+    #[test]
+    fn group_voice_calling_toggle() {
+        use crate::{Channel, VoiceInformation};
+
+        let group = |voice| Channel::Group {
+            id: "0".to_string(),
+            name: "test".to_string(),
+            owner: "1".to_string(),
+            description: None,
+            recipients: vec![],
+            icon: None,
+            last_message_id: None,
+            permissions: None,
+            nsfw: false,
+            voice,
+        };
+
+        // Default group: calling available, no participant limit.
+        assert!(group(None).voice().is_some());
+        assert_eq!(group(None).voice().unwrap().max_users, None);
+
+        // Group with a participant limit: available, limit is surfaced to join_call.
+        let limited = group(Some(VoiceInformation {
+            max_users: Some(5),
+            disabled: false,
+        }));
+        assert_eq!(limited.voice().unwrap().max_users, Some(5));
+
+        // Group with calling turned off: not call-capable, so join_call is refused.
+        let off = group(Some(VoiceInformation {
+            max_users: None,
+            disabled: true,
+        }));
+        assert!(off.voice().is_none());
     }
 }
