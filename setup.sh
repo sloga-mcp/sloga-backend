@@ -24,6 +24,27 @@ if [ "${OS:-}" = "Windows_NT" ] && [ -z "${WSL_DISTRO_NAME:-}" ]; then
   exit 1
 fi
 
+# --- system build dependencies --------------------------------------------------
+# Sourced from the project Dockerfile, which installs: make, pkg-config,
+# libssl-dev (a C toolchain comes from the rust base image). On a bare
+# Debian/Ubuntu/WSL we add build-essential for that toolchain, plus curl/git/
+# ca-certificates to bootstrap mise. The heavy media crates (webp, lcms2, usvg,
+# image) build from bundled C source, so they need a compiler but no extra libs.
+step "Installing system build dependencies"
+SYS_DEPS="build-essential make pkg-config libssl-dev curl git ca-certificates"
+if command -v apt-get >/dev/null 2>&1; then
+  if [ "$(id -u)" -eq 0 ]; then SUDO=""; else SUDO="sudo"; fi
+  $SUDO apt-get update -qq
+  # shellcheck disable=SC2086
+  $SUDO apt-get install -y $SYS_DEPS
+  ok "system build dependencies installed"
+else
+  warn "Non-apt system detected; install the equivalents of these yourself:"
+  warn "  $SYS_DEPS"
+  warn "  Fedora/RHEL: gcc gcc-c++ make pkgconf-pkg-config openssl-devel"
+  warn "  Arch:        base-devel pkgconf openssl"
+fi
+
 # --- git ------------------------------------------------------------------------
 step "Checking git"
 command -v git >/dev/null 2>&1 || { warn "git not found. Install it first (e.g. sudo apt install git)."; exit 1; }
