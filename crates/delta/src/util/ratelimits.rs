@@ -69,7 +69,7 @@ impl<'a> RatelimitResolver<Request<'a>> for DeltaRatelimits {
             "messaging" => 10,
             "channels" => 15,
             "servers" => 5,
-            "auth" => 15,
+            "auth" => 255,
             "auth_delete" => 255,
             "default_avatar" => 255,
             "swagger" => 100,
