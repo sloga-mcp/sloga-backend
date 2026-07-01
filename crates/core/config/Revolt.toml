@@ -189,6 +189,7 @@ backgrounds = [1280, 720]
 icons = [128, 128]
 banners = [480, 480]
 emojis = [128, 128]
+stickers = [320, 320]
 
 [files.s3]
 # Configuration for S3
@@ -233,6 +234,7 @@ message_embeds = 5
 message_replies = 5
 message_reactions = 20
 server_emoji = 100
+server_stickers = 60
 server_roles = 200
 server_channels = 200
 
@@ -285,6 +287,7 @@ backgrounds = 6_000_000
 icons = 2_500_000
 banners = 6_000_000
 emojis = 500_000
+stickers = 500_000
 
 [features.limits.default]
 # Limits imposed on users by default
@@ -323,6 +326,7 @@ avatars = 4_000_000
 backgrounds = 6_000_000
 icons = 2_500_000
 banners = 6_000_000
+stickers = 500_000
 emojis = 500_000
 
 [features.advanced]

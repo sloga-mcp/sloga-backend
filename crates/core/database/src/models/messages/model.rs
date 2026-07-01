@@ -77,6 +77,10 @@ auto_derived_partial!(
         #[serde(skip_serializing_if = "crate::if_option_false")]
         pub pinned: Option<bool>,
 
+        /// Sticker IDs attached to this message
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub sticker_ids: Option<Vec<String>>,
+
         /// Bitfield of message flags
         #[serde(skip_serializing_if = "Option::is_none")]
         pub flags: Option<u32>,
@@ -258,6 +262,7 @@ impl Default for Message {
             masquerade: None,
             flags: None,
             pinned: None,
+            sticker_ids: None,
         }
     }
 }
@@ -296,6 +301,7 @@ impl Message {
         if (data.content.as_ref().is_none_or(|v| v.is_empty()))
             && (data.attachments.as_ref().is_none_or(|v| v.is_empty()))
             && (data.embeds.as_ref().is_none_or(|v| v.is_empty()))
+            && (data.sticker_ids.as_ref().is_none_or(|v| v.is_empty()))
         {
             return Err(create_error!(EmptyMessage));
         }
@@ -596,6 +602,13 @@ impl Message {
 
         // Set content
         message.content = data.content;
+
+        // Set sticker IDs
+        if let Some(sticker_ids) = data.sticker_ids {
+            if !sticker_ids.is_empty() {
+                message.sticker_ids = Some(sticker_ids);
+            }
+        }
 
         // Pass-through nonce value for clients
         message.nonce = Some(idempotency.into_key());

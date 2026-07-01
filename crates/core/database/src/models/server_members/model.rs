@@ -151,6 +151,7 @@ impl Member {
         }
 
         let emojis = db.fetch_emoji_by_parent_id(&server.id).await?;
+        let stickers = db.fetch_stickers_by_server_id(&server.id).await.unwrap_or_default();
 
         #[allow(unused_mut)]
         let mut voice_states = Vec::new();
@@ -183,6 +184,7 @@ impl Member {
                 .map(|channel| channel.into())
                 .collect(),
             emojis: emojis.into_iter().map(|emoji| emoji.into()).collect(),
+            stickers: stickers.into_iter().map(|s| s.into()).collect(),
             voice_states,
         }
         .private(user.id.clone())

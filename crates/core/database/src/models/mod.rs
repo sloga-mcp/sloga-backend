@@ -8,6 +8,7 @@ mod emojis;
 mod file_hashes;
 mod files;
 mod messages;
+mod stickers;
 mod policy_changes;
 mod ratelimit_events;
 mod safety_reports;
@@ -32,6 +33,7 @@ pub use emojis::*;
 pub use file_hashes::*;
 pub use files::*;
 pub use messages::*;
+pub use stickers::*;
 pub use policy_changes::*;
 pub use ratelimit_events::*;
 pub use safety_reports::*;
@@ -63,6 +65,7 @@ pub trait AbstractDatabase:
     + emojis::AbstractEmojis
     + file_hashes::AbstractAttachmentHashes
     + files::AbstractAttachments
+    + stickers::AbstractStickers
     + messages::AbstractMessages
     + policy_changes::AbstractPolicyChange
     + ratelimit_events::AbstractRatelimitEvents

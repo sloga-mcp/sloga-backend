@@ -129,6 +129,7 @@ pub enum Tag {
     icons,
     banners,
     emojis,
+    stickers,
 }
 
 /// Request body for upload

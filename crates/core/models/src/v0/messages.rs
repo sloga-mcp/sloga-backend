@@ -72,6 +72,13 @@ auto_derived_partial!(
         #[serde(skip_serializing_if = "crate::if_option_false")]
         pub pinned: Option<bool>,
 
+        /// Sticker IDs attached to this message
+        #[cfg_attr(
+            feature = "serde",
+            serde(skip_serializing_if = "Option::is_none")
+        )]
+        pub sticker_ids: Option<Vec<String>>,
+
         /// Bitfield of message flags
         ///
         /// https://docs.rs/revolt-models/latest/revolt_models/v0/enum.MessageFlags.html
@@ -277,6 +284,9 @@ auto_derived!(
         pub masquerade: Option<Masquerade>,
         /// Information about how this message should be interacted with
         pub interactions: Option<Interactions>,
+
+        /// Sticker IDs to attach to this message
+        pub sticker_ids: Option<Vec<String>>,
 
         /// Bitfield of message flags
         ///

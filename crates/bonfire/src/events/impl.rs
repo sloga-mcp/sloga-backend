@@ -223,18 +223,28 @@ impl State {
             .collect();
 
         // Fetch customisations.
+        let server_ids: Vec<String> = servers.iter().map(|x| x.id.to_string()).collect();
+
         let emojis = if fields.emojis {
             Some(
-                db.fetch_emoji_by_parent_ids(
-                    &servers
-                        .iter()
-                        .map(|x| x.id.to_string())
-                        .collect::<Vec<String>>(),
-                )
-                .await?
-                .into_iter()
-                .map(|emoji| emoji.into())
-                .collect(),
+                db.fetch_emoji_by_parent_ids(&server_ids)
+                    .await?
+                    .into_iter()
+                    .map(|emoji| emoji.into())
+                    .collect(),
+            )
+        } else {
+            None
+        };
+
+        let stickers = if fields.emojis {
+            Some(
+                db.fetch_stickers_by_server_ids(&server_ids)
+                    .await
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|s| s.into())
+                    .collect(),
             )
         } else {
             None
@@ -324,6 +334,7 @@ impl State {
             voice_states,
 
             emojis,
+            stickers,
             user_settings,
             channel_unreads,
 
@@ -520,6 +531,7 @@ impl State {
                 server,
                 channels,
                 emojis: _,
+                stickers: _,
                 voice_states: _,
             } => {
                 self.insert_subscription(id.clone()).await;

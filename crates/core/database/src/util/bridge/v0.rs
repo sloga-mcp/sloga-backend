@@ -369,6 +369,43 @@ impl From<EmojiParent> for crate::EmojiParent {
     }
 }
 
+impl From<crate::Sticker> for Sticker {
+    fn from(value: crate::Sticker) -> Self {
+        Sticker {
+            id: value.id,
+            server_id: value.server_id,
+            creator_id: value.creator_id,
+            name: value.name,
+            description: value.description,
+            file_id: value.file_id,
+            format: value.format.into(),
+            nsfw: value.nsfw,
+        }
+    }
+}
+
+impl From<crate::StickerFormat> for StickerFormat {
+    fn from(value: crate::StickerFormat) -> Self {
+        match value {
+            crate::StickerFormat::PNG => StickerFormat::PNG,
+            crate::StickerFormat::APNG => StickerFormat::APNG,
+            crate::StickerFormat::GIF => StickerFormat::GIF,
+            crate::StickerFormat::Lottie => StickerFormat::Lottie,
+        }
+    }
+}
+
+impl From<StickerFormat> for crate::StickerFormat {
+    fn from(value: StickerFormat) -> Self {
+        match value {
+            StickerFormat::PNG => crate::StickerFormat::PNG,
+            StickerFormat::APNG => crate::StickerFormat::APNG,
+            StickerFormat::GIF => crate::StickerFormat::GIF,
+            StickerFormat::Lottie => crate::StickerFormat::Lottie,
+        }
+    }
+}
+
 impl From<crate::File> for File {
     fn from(value: crate::File) -> Self {
         File {
@@ -486,6 +523,7 @@ impl crate::Message {
             masquerade: self.masquerade.map(Into::into),
             flags: self.flags.unwrap_or_default(),
             pinned: self.pinned,
+            sticker_ids: self.sticker_ids,
         }
     }
 }
@@ -515,6 +553,7 @@ impl From<crate::PartialMessage> for PartialMessage {
             masquerade: value.masquerade.map(Into::into),
             flags: value.flags,
             pinned: value.pinned,
+            sticker_ids: value.sticker_ids,
         }
     }
 }

@@ -5,9 +5,9 @@ use revolt_models::v0::{
     AppendMessage, Channel, ChannelSlowmode, ChannelUnread, ChannelVoiceState, Emoji,
     FieldsChannel, FieldsMember, FieldsMessage, FieldsRole, FieldsServer, FieldsUser,
     FieldsWebhook, Member, MemberCompositeKey, Message, PartialChannel, PartialEmoji,
-    PartialMember, PartialMessage, PartialRole, PartialServer, PartialUser, PartialUserVoiceState,
-    PartialWebhook, PolicyChange, RemovalIntention, Report, Server, User, UserSettings,
-    UserVoiceState, Webhook,
+    PartialMember, PartialMessage, PartialRole, PartialServer, PartialSticker, PartialUser,
+    PartialUserVoiceState, PartialWebhook, PolicyChange, RemovalIntention, Report, Server,
+    Sticker, User, UserSettings, UserVoiceState, Webhook,
 };
 
 use crate::{Account, Database, Session};
@@ -79,6 +79,8 @@ pub enum EventV1 {
         members: Option<Vec<Member>>,
         #[serde(skip_serializing_if = "Option::is_none")]
         emojis: Option<Vec<Emoji>>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        stickers: Option<Vec<Sticker>>,
         #[serde(skip_serializing_if = "Option::is_none")]
         voice_states: Option<Vec<ChannelVoiceState>>,
 
@@ -155,6 +157,7 @@ pub enum EventV1 {
         server: Server,
         channels: Vec<Channel>,
         emojis: Vec<Emoji>,
+        stickers: Vec<Sticker>,
         voice_states: Vec<ChannelVoiceState>,
     },
 
@@ -260,6 +263,20 @@ pub enum EventV1 {
 
     /// Delete emoji
     EmojiDelete {
+        id: String,
+    },
+
+    /// New sticker
+    StickerCreate(Sticker),
+
+    /// Update existing sticker
+    StickerUpdate {
+        id: String,
+        data: PartialSticker,
+    },
+
+    /// Delete sticker
+    StickerDelete {
         id: String,
     },
 
