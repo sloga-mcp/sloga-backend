@@ -7588,6 +7588,7 @@ version = "0.13.7"
 dependencies = [
  "chrono",
  "futures",
+ "lapin",
  "livekit-api",
  "livekit-protocol",
  "livekit-runtime",

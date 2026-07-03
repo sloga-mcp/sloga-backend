@@ -27,6 +27,7 @@ rocket_empty = { workspace = true }
 
 # Async
 futures = { workspace = true }
+lapin = { workspace = true, features = ["tokio"] }
 
 # Core
 revolt-result = { workspace = true, features = ["rocket"] }
