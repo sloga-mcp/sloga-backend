@@ -1,0 +1,38 @@
+# Acutest reverse proxy
+:80 {
+    # WebSocket (Bonfire)
+    handle /ws {
+        reverse_proxy 172.23.130.41:14703
+    }
+
+    # LiveKit voice (strip /livekit prefix, handles both /livekit and /livekit/*)
+    handle /livekit* {
+        uri strip_prefix /livekit
+        reverse_proxy 172.23.130.41:7880
+    }
+
+    # File/media server (Autumn)
+    handle_path /media/* {
+        reverse_proxy 172.23.130.41:14704
+    }
+
+    # Link proxy (January)
+    handle_path /proxy/* {
+        reverse_proxy 172.23.130.41:14705
+    }
+
+    # REST API (Delta) — proxied under /api, prefix stripped
+    handle_path /api/* {
+        reverse_proxy 172.23.130.41:14702
+    }
+
+    # API root discovery endpoint
+    handle /api {
+        reverse_proxy 172.23.130.41:14702
+    }
+
+    # Frontend — proxy to Vite dev server
+    handle {
+        reverse_proxy 172.23.130.41:5174
+    }
+}
