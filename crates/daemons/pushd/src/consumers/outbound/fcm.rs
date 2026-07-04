@@ -4,10 +4,20 @@ use crate::utils::Consumer;
 use anyhow::{bail, Result};
 use async_trait::async_trait;
 use fcm_v1::{
+    android::{AndroidConfig, AndroidMessagePriority},
     auth::{Authenticator, ServiceAccountKey},
     message::Message,
     Client, Error as FcmError,
 };
+
+/// Data-only messages are delivered lazily on dozing devices unless sent at
+/// high priority — which makes notifications arrive minutes late.
+fn high_priority() -> Option<AndroidConfig> {
+    Some(AndroidConfig {
+        priority: Some(AndroidMessagePriority::High),
+        ..Default::default()
+    })
+}
 use lapin::{message::Delivery, Channel as AMQPChannel, Connection};
 use revolt_config::config;
 use revolt_database::{events::rabbit::*, Database};
@@ -106,8 +116,9 @@ impl NotificationData {
                 data.insert("initiator_id".to_string(), Value::String(initiator_id));
                 data.insert("channel_id".to_string(), Value::String(channel_id));
                 data.insert("started_at".to_string(), Value::String(started_at));
-                data.insert("ended".to_string(), Value::Bool(ended));
-                data.insert("duration".to_string(), Value::Number(duration.into()));
+                // FCM requires all data values to be strings (400 otherwise)
+                data.insert("ended".to_string(), Value::String(ended.to_string()));
+                data.insert("duration".to_string(), Value::String(duration.to_string()));
             }
         }
 
@@ -186,6 +197,7 @@ impl Consumer for FcmOutboundConsumer {
                 let msg = Message {
                     token: Some(payload.token),
                     data: Some(data.into_payload()),
+                    android: high_priority(),
                     ..Default::default()
                 };
 
@@ -208,6 +220,7 @@ impl Consumer for FcmOutboundConsumer {
                 let msg = Message {
                     token: Some(payload.token),
                     data: Some(data.into_payload()),
+                    android: high_priority(),
                     ..Default::default()
                 };
 
@@ -223,6 +236,7 @@ impl Consumer for FcmOutboundConsumer {
                 let msg = Message {
                     token: Some(payload.token),
                     data: Some(data.into_payload()),
+                    android: high_priority(),
                     ..Default::default()
                 };
 
@@ -242,6 +256,7 @@ impl Consumer for FcmOutboundConsumer {
                 let msg = Message {
                     token: Some(payload.token),
                     data: Some(data.into_payload()),
+                    android: high_priority(),
                     ..Default::default()
                 };
 
@@ -260,6 +275,7 @@ impl Consumer for FcmOutboundConsumer {
                 let msg = Message {
                     token: Some(payload.token),
                     data: Some(data.into_payload()),
+                    android: high_priority(),
                     ..Default::default()
                 };
 

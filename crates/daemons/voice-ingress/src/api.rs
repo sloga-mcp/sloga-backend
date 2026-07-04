@@ -6,8 +6,9 @@ use revolt_database::{
     util::reference::Reference,
     voice::{
         create_voice_state, delete_channel_voice_state, delete_voice_state,
-        get_user_moved_from_voice, get_user_moved_to_voice, update_voice_state_tracks,
-        RoomMetadata, UserVoiceChannel, VoiceClient,
+        get_user_moved_from_voice, get_user_moved_to_voice, get_user_voice_channels,
+        get_voice_channel_members, update_voice_state_tracks, RoomMetadata, UserVoiceChannel,
+        VoiceClient,
     },
     Database, AMQP,
 };
@@ -21,7 +22,7 @@ use crate::guard::AuthHeader;
 pub async fn ingress(
     db: &State<Database>,
     voice_client: &State<VoiceClient>,
-    _amqp: &State<AMQP>,
+    amqp: &State<AMQP>,
     node: &str,
     auth_header: AuthHeader<'_>,
     body: &str,
@@ -51,10 +52,13 @@ pub async fn ingress(
 
     let channel_id = event.room.as_ref().map(|r| &r.name);
     let user_id = event.participant.as_ref().map(|r| &r.identity);
-    let room_metadata = if let Some(room) = event.room.as_ref() {
-        Some(serde_json::from_str::<RoomMetadata>(&room.metadata).to_internal_error()?)
-    } else {
-        None
+    // Track events arrive with an empty room.metadata — treat as absent
+    // instead of failing to parse (was causing 500s + endless retries).
+    let room_metadata = match event.room.as_ref() {
+        Some(room) if !room.metadata.is_empty() => {
+            Some(serde_json::from_str::<RoomMetadata>(&room.metadata).to_internal_error()?)
+        }
+        _ => None,
     };
 
     match event.event.as_str() {
@@ -92,6 +96,20 @@ pub async fn ingress(
                 .p(channel_id.to_string())
                 .await;
             };
+
+            // Ring other recipients via push notification when the first
+            // participant starts the call. Uses our own voice state (not
+            // LiveKit's `num_participants`, which is unreliable — see #457).
+            let members = get_voice_channel_members(&channel).await?;
+            if members.map_or(0, |m| m.len()) <= 1 {
+                let now = joined_at.to_string();
+                if let Err(e) = amqp
+                    .dm_call_updated(user_id, channel_id, Some(&now), false, None)
+                    .await
+                {
+                    log::error!("failed to publish call ring push: {e:?}");
+                }
+            }
 
             // TODO: fix `num_participants` being incorrect sometimes see (#457)
             // First user who joined - send call started system message.
@@ -150,6 +168,17 @@ pub async fn ingress(
             };
 
             delete_voice_state(&channel, user_id).await?;
+
+            // Everyone left — dismiss the ring notification on recipients
+            let members = get_voice_channel_members(&channel).await?;
+            if members.is_none_or(|m| m.is_empty()) {
+                if let Err(e) = amqp
+                    .dm_call_updated(user_id, channel_id, None, true, None)
+                    .await
+                {
+                    log::error!("failed to publish call end push: {e:?}");
+                }
+            }
 
             // Dont send leave event when a user is moved
             if get_user_moved_from_voice(channel_id, user_id)
@@ -213,10 +242,18 @@ pub async fn ingress(
             let channel_id = channel_id.to_internal_error()?;
             let user_id = user_id.to_internal_error()?;
             let track = event.track.as_ref().to_internal_error()?;
-            let server_id = room_metadata.to_internal_error()?.server;
-            let channel = UserVoiceChannel {
-                id: channel_id.clone(),
-                server_id: server_id.clone(),
+            // Track events carry no room metadata; recover the channel from
+            // the user's stored voice state instead.
+            let channel = match room_metadata {
+                Some(metadata) => UserVoiceChannel {
+                    id: channel_id.clone(),
+                    server_id: metadata.server,
+                },
+                None => get_user_voice_channels(user_id)
+                    .await?
+                    .into_iter()
+                    .find(|c| &c.id == channel_id)
+                    .to_internal_error()?,
             };
 
             let user = Reference::from_unchecked(user_id).as_user(db).await?;
