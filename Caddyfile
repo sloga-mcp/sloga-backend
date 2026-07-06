@@ -31,6 +31,12 @@
         reverse_proxy 172.23.130.41:14702
     }
 
+    # App updates (desktop latest.json + installers, Android APKs)
+    handle_path /updates/* {
+        root * "/home/mcp/stoatchat/updates"
+        file_server
+    }
+
     # Frontend — proxy to Vite dev server
     handle {
         reverse_proxy 172.23.130.41:5174

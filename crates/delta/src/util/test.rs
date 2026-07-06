@@ -86,6 +86,7 @@ impl TestHarness {
             mfa: Default::default(),
             password_reset: None,
             verification: EmailVerification::Verified,
+            google_id: None,
         };
 
         self.db.save_account(&account).await.expect("`Account`");
@@ -178,6 +179,7 @@ impl TestHarness {
                 embeds: None,
                 masquerade: None,
                 interactions: None,
+                sticker_ids: None,
                 flags: None,
             },
             v0::MessageAuthor::User(&user.clone().into(&self.db, Some(user)).await),

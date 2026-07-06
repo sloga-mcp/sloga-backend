@@ -31,6 +31,10 @@ bitfield = { workspace = true }
 ulid = { workspace = true }
 nanoid = { workspace = true }
 
+# oauth (PKCE + id_token decoding)
+sha2 = { workspace = true }
+base64 = { workspace = true }
+
 # serde
 serde_json = { workspace = true }
 serde = { workspace = true }

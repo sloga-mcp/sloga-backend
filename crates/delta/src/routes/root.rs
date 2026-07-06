@@ -47,6 +47,8 @@ pub struct RevoltFeatures {
     pub captcha: CaptchaFeature,
     /// Whether email verification is enabled
     pub email: bool,
+    /// Whether Google OAuth login is enabled
+    pub oauth_google: bool,
     /// Whether this server is invite only
     pub invite_only: bool,
     /// File server service configuration
@@ -201,6 +203,7 @@ pub async fn root() -> Result<Json<RevoltConfig>> {
                 key: config.api.security.captcha.hcaptcha_sitekey.clone(),
             },
             email: !config.api.smtp.host.is_empty(),
+            oauth_google: config.api.oauth.google.enabled,
             invite_only: config.api.registration.invite_only,
             autumn: Feature {
                 enabled: !config.hosts.autumn.is_empty(),

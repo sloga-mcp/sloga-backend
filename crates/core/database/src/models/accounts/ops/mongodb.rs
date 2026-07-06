@@ -36,6 +36,18 @@ impl AbstractAccounts for MongoDb {
         )
     }
 
+    /// Find account by linked Google account id
+    async fn fetch_account_by_google_id(&self, google_id: &str) -> Result<Option<Account>> {
+        query!(
+            self,
+            find_one,
+            COL,
+            doc! {
+                "google_id": google_id
+            }
+        )
+    }
+
     /// Find account with active pending email verification
     async fn fetch_account_with_email_verification(&self, token: &str) -> Result<Account> {
         query!(

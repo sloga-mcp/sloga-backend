@@ -25,6 +25,15 @@ impl AbstractAccounts for ReferenceDb {
             .cloned())
     }
 
+    /// Find account by linked Google account id
+    async fn fetch_account_by_google_id(&self, google_id: &str) -> Result<Option<Account>> {
+        let accounts = self.accounts.lock().await;
+        Ok(accounts
+            .values()
+            .find(|account| account.google_id.as_deref() == Some(google_id))
+            .cloned())
+    }
+
     /// Find account with active pending email verification
     async fn fetch_account_with_email_verification(&self, token_to_match: &str) -> Result<Account> {
         let accounts = self.accounts.lock().await;

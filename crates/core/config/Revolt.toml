@@ -59,6 +59,14 @@ expire_verification = 604800  # 3600 * 24 * 7
 expire_password_reset = 86400  # 3600 * 24
 expire_account_deletion = 86400  # 3600 * 24
 
+[api.oauth.google]
+# Google OAuth login (authorization code + PKCE)
+# Set enabled = true plus client credentials in Revolt.overrides.toml
+enabled = false
+client_id = ""
+client_secret = ""
+redirect_uri = ""
+
 [api.security]
 # Authifier Shield API key
 authifier_shield_key = ""

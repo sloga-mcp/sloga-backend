@@ -51,6 +51,10 @@ auto_derived_partial!(
 
         /// Multi-factor authentication information
         pub mfa: MultiFactorAuthentication,
+
+        /// Google account id, if this account is linked to Google OAuth
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        pub google_id: Option<String>,
     },
     "PartialAccount"
 );
@@ -318,6 +322,7 @@ impl Account {
                 lockout: None,
 
                 mfa: Default::default(),
+                google_id: None,
             };
 
             // Send email verification
@@ -336,6 +341,48 @@ impl Account {
 
             Ok(account)
         }
+    }
+
+    /// Create a new account from a verified Google OAuth identity
+    ///
+    /// Unlike [`Account::new`], this never sends emails and never touches
+    /// existing accounts — callers must have already checked for a match.
+    /// The password is random and unusable; the password reset flow can
+    /// set a real one later.
+    pub async fn new_from_google(
+        db: &Database,
+        email: String,
+        google_id: String,
+    ) -> Result<Account> {
+        let email_normalised = normalise_email(email.clone());
+        let password = hash_password(nanoid!(64))?;
+
+        let account = Account {
+            id: ulid::Ulid::new().to_string(),
+
+            email,
+            email_normalised,
+            password,
+
+            disabled: false,
+            verification: EmailVerification::Verified,
+            password_reset: None,
+            deletion: None,
+            lockout: None,
+
+            mfa: Default::default(),
+            google_id: Some(google_id),
+        };
+
+        account.save(db).await?;
+
+        EventV1::CreateAccount {
+            account: account.clone(),
+        }
+        .global()
+        .await;
+
+        Ok(account)
     }
 
     /// Create a new session

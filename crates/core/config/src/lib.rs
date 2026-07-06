@@ -260,6 +260,24 @@ pub struct ApiUsers {
     pub min_username_length: usize,
 }
 
+#[derive(Deserialize, Debug, Clone, Default)]
+pub struct ApiOauthGoogle {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub client_id: String,
+    #[serde(default)]
+    pub client_secret: String,
+    #[serde(default)]
+    pub redirect_uri: String,
+}
+
+#[derive(Deserialize, Debug, Clone, Default)]
+pub struct ApiOauth {
+    #[serde(default)]
+    pub google: ApiOauthGoogle,
+}
+
 #[derive(Deserialize, Debug, Clone)]
 pub struct Api {
     pub registration: ApiRegistration,
@@ -268,6 +286,8 @@ pub struct Api {
     pub workers: ApiWorkers,
     pub livekit: ApiLiveKit,
     pub users: ApiUsers,
+    #[serde(default)]
+    pub oauth: ApiOauth,
 }
 
 #[derive(Deserialize, Debug, Clone)]
