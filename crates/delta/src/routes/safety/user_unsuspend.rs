@@ -22,5 +22,12 @@ pub async fn user_unsuspend(
     }
 
     let mut target_user = target.as_user(db).await?;
+
+    log::info!(
+        "AUDIT unsuspend: actor={} target={}",
+        user.id,
+        target_user.id
+    );
+
     target_user.unsuspend(db).await.map(|_| EmptyResponse)
 }

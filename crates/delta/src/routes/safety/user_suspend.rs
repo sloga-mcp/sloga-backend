@@ -48,6 +48,14 @@ pub async fn user_suspend(
         return Err(create_error!(NotPrivileged));
     }
 
+    log::info!(
+        "AUDIT suspend: actor={} target={} duration_days={:?} reason={:?}",
+        user.id,
+        target_user.id,
+        data.duration_days,
+        data.reason
+    );
+
     target_user
         .suspend(db, data.duration_days, data.reason)
         .await
