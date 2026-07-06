@@ -794,6 +794,11 @@ impl User {
 
     /// Unsuspend the user
     pub async fn unsuspend(&mut self, db: &Database) -> Result<()> {
+        // Re-enable the account so the user can log in again
+        let mut account = db.fetch_account(&self.id).await?;
+        account.disabled = false;
+        account.save(db).await?;
+
         self.update(
             db,
             PartialUser {
@@ -801,11 +806,9 @@ impl User {
                 suspended_until: None,
                 ..Default::default()
             },
-            vec![],
+            vec![FieldsUser::Suspension],
         )
-        .await?;
-
-        unimplemented!()
+        .await
     }
 
     /// Permanently ban the user

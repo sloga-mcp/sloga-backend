@@ -82,6 +82,9 @@ auto_derived!(
         },
         Disabled {
             user_id: String,
+            /// When the suspension lifts, if this is a timed suspension
+            #[serde(skip_serializing_if = "Option::is_none")]
+            suspended_until: Option<Timestamp>,
         },
     }
 

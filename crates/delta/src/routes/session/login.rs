@@ -149,11 +149,27 @@ pub async fn login(
     // Generate a session name
     let name = name.unwrap_or_else(|| "Unknown".to_string());
 
-    // Prevent disabled accounts from logging in
+    // Prevent disabled accounts from logging in;
+    // timed suspensions that have expired are lifted here
     if account.disabled {
-        return Ok(Json(v0::ResponseLogin::Disabled {
-            user_id: account.id,
-        }));
+        let suspended_until = match db.fetch_user(&account.id).await {
+            Ok(mut user) => match user.suspended_until {
+                Some(until) if until <= Timestamp::now_utc() => {
+                    user.unsuspend(db).await?;
+                    None
+                }
+                until => until,
+            },
+            Err(_) => None,
+        };
+
+        // Unless the suspension just expired, refuse the login
+        if suspended_until.is_some() || db.fetch_account(&account.id).await?.disabled {
+            return Ok(Json(v0::ResponseLogin::Disabled {
+                user_id: account.id,
+                suspended_until,
+            }));
+        }
     }
 
     // Create and return a new session
