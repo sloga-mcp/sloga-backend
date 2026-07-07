@@ -13,4 +13,16 @@ impl AbstractSnapshot for MongoDb {
     async fn insert_snapshot(&self, snapshot: &Snapshot) -> Result<()> {
         query!(self, insert_one, COL, &snapshot).map(|_| ())
     }
+
+    /// Fetch all snapshots attached to a report
+    async fn fetch_snapshots_by_report(&self, report_id: &str) -> Result<Vec<Snapshot>> {
+        query!(
+            self,
+            find,
+            COL,
+            doc! {
+                "report_id": report_id
+            }
+        )
+    }
 }

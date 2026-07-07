@@ -17,4 +17,17 @@ impl AbstractSnapshot for ReferenceDb {
             Ok(())
         }
     }
+
+    /// Fetch all snapshots attached to a report
+    async fn fetch_snapshots_by_report(&self, report_id: &str) -> Result<Vec<Snapshot>> {
+        let snapshots = self.safety_snapshots.lock().await;
+        let mut snapshots: Vec<Snapshot> = snapshots
+            .values()
+            .filter(|snapshot| snapshot.report_id == report_id)
+            .cloned()
+            .collect();
+
+        snapshots.sort_by(|a, b| a.id.cmp(&b.id));
+        Ok(snapshots)
+    }
 }

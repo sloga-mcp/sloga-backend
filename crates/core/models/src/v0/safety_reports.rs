@@ -145,4 +145,19 @@ auto_derived!(
         /// Report was actioned and resolved
         Resolved,
     }
+
+    /// Reporter-supplied copy of a message, captured on the reporter's
+    /// device at the time of reporting. Stands alone from server-side data
+    /// so reports keep working for conversations the server cannot read
+    /// (end-to-end encrypted DMs).
+    pub struct ReportedMessageSnapshot {
+        /// Id of the message
+        pub id: String,
+        /// Channel the message was sent in
+        pub channel: String,
+        /// Id of the message author
+        pub author: String,
+        /// Message content as rendered on the reporter's device
+        pub content: String,
+    }
 );

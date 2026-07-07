@@ -659,6 +659,40 @@ impl From<crate::Report> for Report {
     }
 }
 
+impl crate::Snapshot {
+    /// Convert to the v0 API model
+    pub async fn into_v0(self) -> Snapshot {
+        Snapshot {
+            id: self.id,
+            report_id: self.report_id,
+            content: match self.content {
+                crate::SnapshotContent::Message {
+                    prior_context,
+                    leading_context,
+                    message,
+                } => SnapshotContent::Message {
+                    prior_context: prior_context
+                        .into_iter()
+                        .map(|message| message.into_model(None, None))
+                        .collect(),
+                    leading_context: leading_context
+                        .into_iter()
+                        .map(|message| message.into_model(None, None))
+                        .collect(),
+                    message: message.into_model(None, None),
+                },
+                crate::SnapshotContent::Server(server) => SnapshotContent::Server(server.into()),
+                crate::SnapshotContent::User(user) => {
+                    SnapshotContent::User(user.into_self(false).await)
+                }
+                crate::SnapshotContent::ReporterMessage { message, context } => {
+                    SnapshotContent::ReporterMessage { message, context }
+                }
+            },
+        }
+    }
+}
+
 impl From<crate::ServerBan> for ServerBan {
     fn from(value: crate::ServerBan) -> Self {
         ServerBan {

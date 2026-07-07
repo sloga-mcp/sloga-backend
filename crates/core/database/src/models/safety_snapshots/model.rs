@@ -1,4 +1,4 @@
-use revolt_models::v0::MessageSort;
+use revolt_models::v0::{MessageSort, ReportedMessageSnapshot};
 use revolt_result::Result;
 
 use crate::{Database, Message, MessageFilter, MessageQuery, MessageTimePeriod, Server, User};
@@ -34,6 +34,17 @@ auto_derived!(
         },
         Server(Server),
         User(User),
+        /// Copy of the reported message supplied by the reporter's client;
+        /// stands alone so reports work for conversations the server cannot
+        /// read (end-to-end encrypted DMs)
+        ReporterMessage {
+            /// The reported message as seen on the reporter's device
+            message: ReportedMessageSnapshot,
+
+            /// Surrounding messages supplied by the reporter, ordered by id
+            #[serde(default)]
+            context: Vec<ReportedMessageSnapshot>,
+        },
     }
 );
 
