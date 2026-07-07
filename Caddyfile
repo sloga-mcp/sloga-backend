@@ -32,8 +32,10 @@
     }
 
     # App updates (desktop latest.json + installers, Android APKs)
+    # CORS: the Android app fetches latest.json from origin https://localhost
     handle_path /updates/* {
         root * "/home/mcp/stoatchat/updates"
+        header Access-Control-Allow-Origin "*"
         file_server
     }
 
