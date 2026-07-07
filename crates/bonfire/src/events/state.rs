@@ -80,6 +80,14 @@ impl State {
         subscribed.insert(private_topic.clone());
         subscribed.insert(user.id.clone());
 
+        // Privileged (platform moderator) sessions also listen on the global
+        // topic, where moderation events such as ReportCreate are broadcast.
+        // This is what delivers new-report notifications to moderators' live
+        // clients; non-privileged users never subscribe here.
+        if user.privileged {
+            subscribed.insert("global".to_string());
+        }
+
         let mut cache: Cache = Cache {
             user_id: user.id.clone(),
             ..Default::default()

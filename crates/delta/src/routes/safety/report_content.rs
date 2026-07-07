@@ -217,6 +217,10 @@ pub async fn report_content(
 
     db.insert_report(&report).await?;
 
+    // Broadcast on the "global" topic. Privileged (moderator) sessions
+    // subscribe to this topic in bonfire, so their connected clients receive
+    // the report live and can raise a notification + queue badge. The event
+    // is content-free beyond the report metadata, safe for E2EE reports.
     EventV1::ReportCreate(report.into()).global().await;
 
     Ok(EmptyResponse)
@@ -225,7 +229,7 @@ pub async fn report_content(
 #[cfg(test)]
 mod test {
     use crate::{rocket, util::test::TestHarness};
-    use revolt_database::SnapshotContent;
+    use revolt_database::{PartialUser, SnapshotContent};
     use rocket::http::{ContentType, Header, Status};
     use serde_json::json;
 
@@ -376,6 +380,62 @@ mod test {
             .await;
 
         assert_eq!(response.status(), Status::BadRequest);
+    }
+
+    #[rocket::async_test]
+    async fn report_succeeds_with_moderator_present() {
+        // Filing a report while a privileged moderator exists must still
+        // return NoContent: report notification delivery (the global-topic
+        // broadcast consumed by moderator sessions) must never block or fail
+        // the report submission itself.
+        let harness = TestHarness::new().await;
+        let (_, session, _reporter) = harness.new_user().await;
+        let (_, _, author) = harness.new_user().await;
+        let (_, _, moderator) = harness.new_user().await;
+
+        moderator
+            .clone()
+            .update(
+                &harness.db,
+                PartialUser {
+                    privileged: Some(true),
+                    ..Default::default()
+                },
+                vec![],
+            )
+            .await
+            .expect("promote moderator");
+
+        let (server, channels) = harness.new_server(&author).await;
+        let (channel, _, message) = harness.new_message(&author, &server, channels).await;
+
+        let response = harness
+            .client
+            .post("/safety/report")
+            .header(ContentType::JSON)
+            .header(Header::new("x-session-token", session.token.to_string()))
+            .body(
+                json!({
+                    "content": {
+                        "type": "Message",
+                        "id": message.id,
+                        "report_reason": "Harassment"
+                    },
+                    "message_snapshot": {
+                        "message": {
+                            "id": message.id,
+                            "channel": channel.id(),
+                            "author": author.id,
+                            "content": "Test message"
+                        }
+                    }
+                })
+                .to_string(),
+            )
+            .dispatch()
+            .await;
+
+        assert_eq!(response.status(), Status::NoContent);
     }
 
     #[rocket::async_test]
