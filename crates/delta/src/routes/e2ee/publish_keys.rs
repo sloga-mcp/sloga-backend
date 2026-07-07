@@ -76,8 +76,14 @@ pub async fn publish_keys(
     }
 
     check_signed_key(&data.fallback_key)?;
+    let mut seen_key_ids = std::collections::HashSet::new();
     for key in &data.one_time_keys {
         check_signed_key(key)?;
+        if !seen_key_ids.insert(key.key_id.as_str()) {
+            return Err(create_error!(FailedValidation {
+                error: "duplicate one-time key ids".to_string()
+            }));
+        }
     }
 
     let existing = db.fetch_e2ee_identity(&user.id, &data.device_id).await.ok();
@@ -169,7 +175,17 @@ pub async fn publish_keys(
         .count_e2ee_one_time_keys(&user.id, &identity.device_id)
         .await?;
 
-    if current + one_time_keys.len() as u64 > MAX_ONE_TIME_KEYS as u64 {
+    // Inserts upsert by key id, so a replenish reusing key ids replaces in
+    // place — only genuinely new ids count toward the cap
+    let key_ids: Vec<String> = one_time_keys
+        .iter()
+        .map(|key| key.key_id.clone())
+        .collect();
+    let already_stored = db
+        .count_e2ee_one_time_keys_among(&user.id, &identity.device_id, &key_ids)
+        .await?;
+
+    if current + one_time_keys.len() as u64 - already_stored > MAX_ONE_TIME_KEYS as u64 {
         return Err(create_error!(FailedValidation {
             error: format!("at most {MAX_ONE_TIME_KEYS} one-time keys may be stored")
         }));

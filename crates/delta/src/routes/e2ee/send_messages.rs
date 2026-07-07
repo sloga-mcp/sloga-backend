@@ -96,6 +96,11 @@ pub async fn send_messages(
     let mut receipts = vec![];
     let mut accepted = vec![];
 
+    // Queue depths seeded from the database once per recipient device, then
+    // tracked across the request — the cap must hold against envelopes
+    // accepted earlier in this same request, not just already-queued ones
+    let mut queue_depths: HashMap<(String, String), u64> = HashMap::new();
+
     for envelope in data.envelopes {
         // Unknown / revoked recipient device: report it so the sender tears
         // down the session (invariant: device changes are loud)
@@ -114,11 +119,23 @@ pub async fn send_messages(
 
         // Per-device queue-depth cap: a dead device fills its own queue
         // without affecting the user's live devices
-        let depth = db
-            .count_e2ee_envelopes(&envelope.recipient_user_id, &envelope.recipient_device_id)
-            .await?;
+        let depth_key = (
+            envelope.recipient_user_id.clone(),
+            envelope.recipient_device_id.clone(),
+        );
 
-        if depth >= MAX_QUEUE_DEPTH {
+        if !queue_depths.contains_key(&depth_key) {
+            let stored = db
+                .count_e2ee_envelopes(&envelope.recipient_user_id, &envelope.recipient_device_id)
+                .await?;
+            queue_depths.insert(depth_key.clone(), stored);
+        }
+
+        let depth = queue_depths
+            .get_mut(&depth_key)
+            .expect("seeded immediately above");
+
+        if *depth >= MAX_QUEUE_DEPTH {
             receipts.push(v0::E2EEDeliveryReceipt {
                 recipient_user_id: envelope.recipient_user_id,
                 recipient_device_id: envelope.recipient_device_id,
@@ -126,6 +143,8 @@ pub async fn send_messages(
             });
             continue;
         }
+
+        *depth += 1;
 
         let queued = E2EEEnvelope {
             id: Ulid::new().to_string(),

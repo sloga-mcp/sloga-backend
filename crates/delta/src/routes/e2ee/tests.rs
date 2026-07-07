@@ -512,3 +512,137 @@ async fn revoke_device_is_mfa_gated_and_cascades() {
         0
     );
 }
+
+#[rocket::async_test]
+async fn queue_depth_cap_holds_within_a_single_request() {
+    let harness = TestHarness::new().await;
+    let (account_a, session_a, user_a) = harness.new_user().await;
+    let (account_b, session_b, user_b) = harness.new_user().await;
+
+    make_dm_eligible(&harness, &user_a, &user_b).await;
+
+    let device_a = publish_device(&harness, &account_a.id, &session_a.token, 1).await;
+    let device_b = publish_device(&harness, &account_b.id, &session_b.token, 1).await;
+
+    // Fill the recipient device's queue to one below the cap
+    let envelopes: Vec<_> = (0..super::MAX_QUEUE_DEPTH - 1)
+        .map(|i| revolt_database::E2EEEnvelope {
+            id: ulid::Ulid::new().to_string(),
+            recipient_user_id: user_b.id.clone(),
+            recipient_device_id: device_b.device_id.clone(),
+            sender_user_id: user_a.id.clone(),
+            sender_device_id: device_a.device_id.clone(),
+            protocol_version: E2EE_PROTOCOL_VERSION,
+            sequence: i,
+            ciphertext: "AAAA".to_string(),
+            timestamp: iso8601_timestamp::Timestamp::now_utc(),
+        })
+        .collect();
+    harness.db.insert_e2ee_envelopes(&envelopes).await.unwrap();
+
+    // A burst of envelopes to the same device in ONE request must not blow
+    // through the cap on the stale pre-request count: exactly one fits
+    let body = v0::DataSendE2EEMessages {
+        device_id: device_a.device_id.clone(),
+        protocol_version: E2EE_PROTOCOL_VERSION,
+        envelopes: (0..4u64)
+            .map(|i| v0::DataE2EEEnvelope {
+                recipient_user_id: user_b.id.clone(),
+                recipient_device_id: device_b.device_id.clone(),
+                sequence: 1000 + i,
+                ciphertext: STANDARD_NO_PAD.encode(b"burst"),
+            })
+            .collect(),
+    };
+
+    let response = TestHarness::with_session(
+        session_a,
+        harness
+            .client
+            .post("/e2ee/messages")
+            .header(ContentType::JSON)
+            .body(serde_json::to_string(&body).unwrap()),
+    )
+    .await;
+    assert_eq!(response.status(), Status::Ok);
+    let result: v0::ResponseSendE2EEMessages = response.into_json().await.unwrap();
+
+    let queued = result
+        .receipts
+        .iter()
+        .filter(|receipt| matches!(receipt.status, v0::E2EEDeliveryStatus::Queued { .. }))
+        .count();
+    let full = result
+        .receipts
+        .iter()
+        .filter(|receipt| matches!(receipt.status, v0::E2EEDeliveryStatus::QueueFull))
+        .count();
+    assert_eq!(queued, 1);
+    assert_eq!(full, 3);
+
+    assert_eq!(
+        harness
+            .db
+            .count_e2ee_envelopes(&user_b.id, &device_b.device_id)
+            .await
+            .unwrap(),
+        super::MAX_QUEUE_DEPTH
+    );
+}
+
+#[rocket::async_test]
+async fn one_time_key_cap_counts_upserts_correctly() {
+    let harness = TestHarness::new().await;
+    let (account, session, _user) = harness.new_user().await;
+
+    let device = publish_device(
+        &harness,
+        &account.id,
+        &session.token,
+        super::MAX_ONE_TIME_KEYS,
+    )
+    .await;
+
+    // Replenishing with the SAME key ids upserts in place: the cap must not
+    // treat the batch as additive and spuriously reject it
+    let response = harness
+        .client
+        .put("/e2ee/keys")
+        .header(ContentType::JSON)
+        .header(Header::new("x-session-token", session.token.clone()))
+        .body(serde_json::to_string(&device.bundle(super::MAX_ONE_TIME_KEYS)).unwrap())
+        .dispatch()
+        .await;
+    assert_eq!(response.status(), Status::Ok);
+    let body: v0::ResponsePublishE2EEKeys = response.into_json().await.unwrap();
+    assert_eq!(body.one_time_key_count, super::MAX_ONE_TIME_KEYS as u64);
+
+    // A genuinely new key id past the cap is still rejected
+    let mut bundle = device.bundle(0);
+    bundle.one_time_keys = vec![device.signed_key(E2EE_SIGN_CONTEXT_ONE_TIME, "fresh0")];
+    let response = harness
+        .client
+        .put("/e2ee/keys")
+        .header(ContentType::JSON)
+        .header(Header::new("x-session-token", session.token.clone()))
+        .body(serde_json::to_string(&bundle).unwrap())
+        .dispatch()
+        .await;
+    assert_eq!(response.status(), Status::BadRequest);
+
+    // Duplicate key ids within one request are rejected outright
+    let mut bundle = device.bundle(0);
+    bundle.one_time_keys = vec![
+        device.signed_key(E2EE_SIGN_CONTEXT_ONE_TIME, "dup"),
+        device.signed_key(E2EE_SIGN_CONTEXT_ONE_TIME, "dup"),
+    ];
+    let response = harness
+        .client
+        .put("/e2ee/keys")
+        .header(ContentType::JSON)
+        .header(Header::new("x-session-token", session.token.clone()))
+        .body(serde_json::to_string(&bundle).unwrap())
+        .dispatch()
+        .await;
+    assert_eq!(response.status(), Status::BadRequest);
+}

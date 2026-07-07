@@ -47,6 +47,16 @@ pub trait AbstractE2EE: Sync + Send {
     /// Count remaining one-time keys for a device
     async fn count_e2ee_one_time_keys(&self, user_id: &str, device_id: &str) -> Result<u64>;
 
+    /// Count how many of the given key ids are already stored for a device.
+    /// Inserts upsert by id, so cap accounting must not double-count a
+    /// replenish that reuses key ids.
+    async fn count_e2ee_one_time_keys_among(
+        &self,
+        user_id: &str,
+        device_id: &str,
+        key_ids: &[String],
+    ) -> Result<u64>;
+
     /// Atomically consume one one-time key for a device; None at exhaustion
     /// (callers then serve the fallback key — "no bundle" is never the
     /// answer for a registered device)

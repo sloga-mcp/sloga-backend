@@ -177,6 +177,25 @@ impl AbstractE2EE for MongoDb {
             .map_err(|_| create_database_error!("count_documents", COL_PREKEYS))
     }
 
+    async fn count_e2ee_one_time_keys_among(
+        &self,
+        user_id: &str,
+        device_id: &str,
+        key_ids: &[String],
+    ) -> Result<u64> {
+        let ids: Vec<String> = key_ids
+            .iter()
+            .map(|key_id| E2EEOneTimeKey::composite_id(user_id, device_id, key_id))
+            .collect();
+
+        self.col::<E2EEOneTimeKey>(COL_PREKEYS)
+            .count_documents(doc! {
+                "_id": { "$in": ids }
+            })
+            .await
+            .map_err(|_| create_database_error!("count_documents", COL_PREKEYS))
+    }
+
     async fn consume_e2ee_one_time_key(
         &self,
         user_id: &str,

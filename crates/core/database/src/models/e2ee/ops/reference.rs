@@ -118,6 +118,21 @@ impl AbstractE2EE for ReferenceDb {
             .count() as u64)
     }
 
+    async fn count_e2ee_one_time_keys_among(
+        &self,
+        user_id: &str,
+        device_id: &str,
+        key_ids: &[String],
+    ) -> Result<u64> {
+        let keys = self.e2ee_one_time_keys.lock().await;
+        Ok(key_ids
+            .iter()
+            .filter(|key_id| {
+                keys.contains_key(&E2EEOneTimeKey::composite_id(user_id, device_id, key_id))
+            })
+            .count() as u64)
+    }
+
     async fn consume_e2ee_one_time_key(
         &self,
         user_id: &str,
