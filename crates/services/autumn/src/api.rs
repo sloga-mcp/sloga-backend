@@ -423,8 +423,13 @@ async fn fetch_preview(
     if !matches!(hash.metadata, Metadata::Image { .. })
         || (is_animated && !matches!(tag, Tag::avatars | Tag::icons))
     {
+        // Relative redirect so it survives a reverse-proxy path prefix (e.g.
+        // Caddy serving Autumn under `/media`). An absolute `/{tag}/...`
+        // Location loses the prefix and 404s to the SPA. Temporary so clients
+        // that cached the old broken 308 recover.
         return Ok(
-            Redirect::permanent(&format!("/{tag_str}/{file_id}/{}", file.filename)).into_response(),
+            Redirect::temporary(&format!("{file_id}/{}", encode_component(&file.filename)))
+                .into_response(),
         );
     }
 
@@ -492,9 +497,12 @@ async fn fetch_file(
         if file_name == "original" {
             let safe_filename = encode_component(&file.filename);
 
-            return Ok(
-                Redirect::permanent(&format!("/{tag}/{file_id}/{}", safe_filename)).into_response(),
-            );
+            // Relative redirect (sibling of `original`) so it survives a
+            // reverse-proxy path prefix (e.g. Caddy serving Autumn under
+            // `/media`). An absolute `/{tag}/...` Location loses the prefix and
+            // 404s to the SPA, which is why <img src=.../original> renders
+            // blank. Temporary so clients that cached the old broken 308 recover.
+            return Ok(Redirect::temporary(&safe_filename).into_response());
         }
 
         return Err(create_error!(NotFound));
