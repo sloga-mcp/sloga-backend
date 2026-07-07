@@ -114,6 +114,106 @@ devices), sealed sender, sender-keys for large groups.
   is client-honored); the lock indicator must be derived from *message type*,
   not conversation state, so a downgrade is visible.
 
+## 9a. Slice-0 decision record (2026-07-07)
+
+### Library: vodozemac (decided)
+
+| Criterion | libsignal | vodozemac 0.10 |
+|---|---|---|
+| License | AGPLv3 | Apache-2.0 |
+| Third-party use | README: "Use outside of Signal is unsupported"; APIs "subject to change without notice" | Built for reuse; semver on crates.io |
+| Distribution | git dependency, Rust crates unpublished | crates.io, MSRV 1.85 (ours: 1.92) |
+| Audit | Signal's own pedigree | Least Authority audit, no significant findings |
+| Handshake | PQXDH (post-quantum) | Olm (classical X25519 triple-DH) |
+| Groups | sender keys (more work) | Megolm included (aligns with slice 5) |
+| Android | libsignal-android (Java, Signal-internal) | pure Rust → our own uniffi bindings, same core as desktop |
+
+Decision: **vodozemac**. The clinchers: libsignal explicitly disclaims
+third-party support with no API stability, which is untenable for a
+security-critical dependency we must track for years; vodozemac is audited,
+semver'd, Apache-2.0, and lets ONE Rust crypto core serve both Tauri desktop
+(commands) and Android (uniffi) — exactly the architecture in §3.
+
+Accepted cost: **no post-quantum handshake in v1** (harvest-now-decrypt-later
+exposure). Mitigation: `protocol_version` on bundles/envelopes/identities (per
+implementation-plan invariants) gives a migration path when vodozemac or the
+Matrix ecosystem ships PQ; revisit at slice 5.
+
+Terminology mapping for the plan: "signed prekey" → Olm **fallback key**;
+one-time prekeys → Olm one-time keys; X3DH session establishment → Olm
+`create_outbound_session` / `create_inbound_session`.
+
+**Signed bundle format (REQUIRED — reviewer F1/F8).** Unlike libsignal,
+vodozemac does NOT sign or verify prekeys internally — Olm one-time/fallback
+keys are bare Curve25519 keys. Signature handling is therefore application-
+layer and mandatory:
+- Bundle = Ed25519 identity key + **Ed25519 signature over the canonical
+  serialization of {Curve25519 identity key, fallback key, one-time key
+  batch, protocol_version, device_id}** (via `Account::sign`).
+- `protocol_version` lives INSIDE the signed payload — a server cannot strip
+  PQ capability during the future migration.
+- Clients MUST verify the signature before `create_outbound_session`; an
+  invalid signature rejects the bundle (hard error, fail closed).
+- The phase-2 safety number covers BOTH identity keys (Ed25519 + Curve25519),
+  so a server-side Curve25519 swap cannot survive user verification.
+- Slice-1 schemas (`e2ee_identity`, `e2ee_prekeys`) carry the signature
+  fields from day one; the slice-3 hostile-server harness permanently
+  includes key-substitution and signature-stripping cases.
+
+**Device claim authentication (REQUIRED — reviewer F2).** `last_session_id`
+may NOT be updated by mere assertion. A bonfire connection claiming a
+device_id must prove possession of the device identity key (Ed25519-signed
+challenge on connect). Queue drain and E2EEAck are restricted to the
+currently-proven session; an unproven claim gets no drain, no ack rights.
+This closes the stolen-token attack (drain-and-ack = silent message
+destruction; logout-cascade = destroying the victim's device).
+
+**Logout semantics (reviewer F3/F4).** The local E2EE wipe hangs ONLY off the
+deliberate user-logout action with a blocking confirmation ("logging out
+destroys this device's encrypted history — type LOGOUT to confirm" style);
+programmatic session teardown (InvalidSession, token expiry, route-change
+dispose — see the historical dispose()/logout() footgun) must NEVER trigger
+it (slice-3 adversarial test). Consent copy explicitly states logout = local
+history destruction. Authz decision: the token-only logout cascade revoking
+the device server-side is accepted (own-session, availability-only impact,
+bounded by the device-claim proof above); `DELETE /e2ee/keys/{device}` stays
+MFA-gated for revoking OTHER devices.
+
+**Further reviewer-driven decisions (F5–F13):** fallback key rotates on a
+cadence (Matrix-style), previous fallback retained to decrypt in-flight
+prekey messages; `POST /e2ee/messages` returns per-device status so senders
+tear down sessions to unknown/revoked devices (events alone can't reach
+offline peers), and clients reconcile peer device lists on connect; device
+revocation is server-side only — UI copy must not imply remote wipe, and a
+revoked device that reconnects performs a mandatory local wipe; new-device
+warnings distinguish "safety number changed" from unchanged to limit warning
+fatigue (fresh-device-per-login makes these common); device_id is a random
+128-bit value, NOT a ULID (avoids leaking creation time); per-DEVICE queue
+depth caps so a dead device can't block live ones; the Android uniffi surface
+stays at encrypt/decrypt/persist granularity — no key-export across FFI
+(reference matrix-sdk-crypto's bindings before hand-rolling). Correction:
+Megolm is NOT a v1 group argument — slice 5 uses pairwise fan-out; Megolm
+stays deferred.
+
+### Device model (decided)
+
+- **device_id**: random ULID generated in the NATIVE layer when E2EE is
+  enabled on a device; stored in the platform keystore alongside the identity
+  key. NOT derived from session id (sessions churn per login).
+- **Binding**: first `PUT /e2ee/keys` binds (session's user_id, device_id)
+  under MFA; `e2ee_identity` unique index on (user_id, device_id); user_id
+  always from the authenticated session.
+- **Session mapping**: `e2ee_identity.last_session_id` updated on each key
+  publish/connect. Revoking that session (or logout) revokes the device:
+  server deletes identity+prekeys+queued envelopes, emits device-removed.
+- **Logout wipes local E2EE state** (keys + encrypted history) and calls
+  `DELETE /e2ee/keys/{device}`. Each enable cycle = fresh device identity.
+  This is the v1 simplicity/safety tradeoff — consistent with the consent
+  screen's "no recovery" promise; persistent-device-across-logins is a later
+  optimization, NOT v1.
+- **Device list UI**: settings page lists a user's own E2EE devices
+  (created-at, last-seen) with revoke buttons (MFA-gated).
+
 ## 9. Moderation interaction (why reporting ships first)
 
 We cannot scan ciphertext. Reporting must therefore be **reporter-side**: the
