@@ -14,6 +14,7 @@ use utoipa_scalar::{Scalar, Servable as ScalarServable};
 
 mod api;
 pub mod clamav;
+mod e2ee;
 pub mod exif;
 pub mod metadata;
 pub mod mime_type;
@@ -42,7 +43,9 @@ async fn main() -> Result<(), std::io::Error> {
             api::root,
             api::upload_file,
             api::fetch_preview,
-            api::fetch_file
+            api::fetch_file,
+            e2ee::upload_blob,
+            e2ee::fetch_blob
         ),
         components(
             schemas(
@@ -51,7 +54,9 @@ async fn main() -> Result<(), std::io::Error> {
                 api::RootResponse,
                 api::Tag,
                 api::UploadPayload,
-                api::UploadResponse
+                api::UploadResponse,
+                e2ee::BlobUploadPayload,
+                e2ee::BlobUploadResponse
             )
         ),
         tags(

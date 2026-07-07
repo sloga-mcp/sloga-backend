@@ -49,6 +49,7 @@ tracing-subscriber = { workspace = true }
 revolt-files = { workspace = true }
 revolt-config = { workspace = true }
 revolt-database = { workspace = true, features = ["axum-impl"] }
+revolt-permissions = { workspace = true }
 revolt-result = { workspace = true, features = ["utoipa", "axum"] }
 revolt-ratelimits = { workspace = true, features = ["axum"] }
 

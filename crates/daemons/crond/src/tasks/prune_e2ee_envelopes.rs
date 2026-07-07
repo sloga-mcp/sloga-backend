@@ -1,3 +1,4 @@
+// (Blob TTLs in prune_e2ee_blobs mirror this envelope TTL for small blobs.)
 use std::time::{Duration, SystemTime};
 
 use revolt_database::Database;

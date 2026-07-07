@@ -146,6 +146,77 @@ auto_derived!(
     }
 );
 
+/// Ciphertext blobs above this size expire 24 hours after upload; smaller
+/// blobs follow the 30-day envelope TTL (slice 3.5, blob lifecycle).
+pub const E2EE_LARGE_BLOB_SIZE: isize = 10 * 1024 * 1024;
+
+/// Maximum recipient devices per blob (mirrors the envelope fan-out cap)
+pub const E2EE_MAX_BLOB_RECIPIENTS: usize = 128;
+
+auto_derived!(
+    /// A recipient device of an encrypted attachment blob
+    pub struct E2EEBlobRecipient {
+        /// Recipient user
+        pub user_id: String,
+        /// Recipient device
+        pub device_id: String,
+        /// Whether this device has fetched the blob
+        pub fetched: bool,
+    }
+);
+
+auto_derived!(
+    /// An end-to-end encrypted attachment blob in TRANSIT storage
+    ///
+    /// The server stores an opaque ciphertext (encrypted client-side with a
+    /// per-file key that travels INSIDE the message envelope ciphertext) plus
+    /// the minimum routing metadata below — mirroring the envelope queue:
+    /// blobs are transit storage, not history. Deleted once every declared
+    /// recipient device has fetched it, with a size-tiered TTL backstop
+    /// (see `E2EE_LARGE_BLOB_SIZE`) swept by crond.
+    ///
+    /// The recipient set is declared by the uploader at upload time; the
+    /// server would learn the same set from the message envelopes anyway, so
+    /// this adds nothing to the accepted metadata set.
+    pub struct E2EEBlob {
+        /// ULID, server-generated — creation time drives the TTL sweep
+        #[serde(rename = "_id")]
+        pub id: String,
+        /// Uploading user (always from the authenticated session)
+        pub uploader_user_id: String,
+        /// Uploading device (the session's device-bound identity)
+        pub uploader_device_id: String,
+        /// Ciphertext size in bytes
+        pub size: isize,
+        /// S3 bucket holding the ciphertext
+        pub bucket_id: String,
+        /// At-rest encryption nonce from the S3 upload layer
+        pub iv: String,
+        /// Devices that may fetch this blob, with per-device fetch tracking
+        pub recipients: Vec<E2EEBlobRecipient>,
+    }
+);
+
+impl E2EEBlob {
+    /// S3 object path for a blob id (prefixed so blob objects can never
+    /// collide with content-hash file paths in the same bucket)
+    pub fn s3_path(id: &str) -> String {
+        format!("e2ee_{id}")
+    }
+
+    /// Whether every declared recipient device has fetched this blob
+    pub fn fully_fetched(&self) -> bool {
+        self.recipients.iter().all(|recipient| recipient.fetched)
+    }
+
+    /// Whether the given (user, device) may fetch this blob
+    pub fn authorizes_fetch(&self, user_id: &str, device_id: &str) -> bool {
+        self.recipients
+            .iter()
+            .any(|recipient| recipient.user_id == user_id && recipient.device_id == device_id)
+    }
+}
+
 /// Decode an unpadded standard base64 field of an exact byte length
 fn decode_exact(value: &str, length: usize) -> Option<Vec<u8>> {
     STANDARD_NO_PAD

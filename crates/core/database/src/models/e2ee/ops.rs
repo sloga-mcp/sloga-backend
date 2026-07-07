@@ -1,6 +1,6 @@
 use revolt_result::Result;
 
-use crate::{E2EEEnvelope, E2EEIdentity, E2EEOneTimeKey};
+use crate::{E2EEBlob, E2EEEnvelope, E2EEIdentity, E2EEOneTimeKey};
 
 #[cfg(feature = "mongodb")]
 mod mongodb;
@@ -93,4 +93,33 @@ pub trait AbstractE2EE: Sync + Send {
 
     /// TTL sweep: delete envelopes with id (ULID) older than the threshold
     async fn delete_e2ee_envelopes_before(&self, threshold_id: &str) -> Result<usize>;
+
+    /// Insert an encrypted attachment blob record
+    async fn insert_e2ee_blob(&self, blob: &E2EEBlob) -> Result<()>;
+
+    /// Fetch a blob record
+    async fn fetch_e2ee_blob(&self, id: &str) -> Result<E2EEBlob>;
+
+    /// Atomically mark a blob fetched by one recipient device and return
+    /// the updated record. NotFound when the blob does not exist or the
+    /// (user, device) pair is not a declared recipient.
+    async fn mark_e2ee_blob_fetched(
+        &self,
+        id: &str,
+        user_id: &str,
+        device_id: &str,
+    ) -> Result<E2EEBlob>;
+
+    /// Delete a blob record. Idempotent; returns whether it existed.
+    /// (Callers delete the S3 object — the record carries bucket/path/iv.)
+    async fn delete_e2ee_blob(&self, id: &str) -> Result<bool>;
+
+    /// TTL sweep candidates: blobs with id (ULID) older than the threshold
+    /// and ciphertext size strictly greater than `min_size` bytes. Returns
+    /// the records so the caller can delete the S3 objects too.
+    async fn fetch_expired_e2ee_blobs(
+        &self,
+        threshold_id: &str,
+        min_size: isize,
+    ) -> Result<Vec<E2EEBlob>>;
 }

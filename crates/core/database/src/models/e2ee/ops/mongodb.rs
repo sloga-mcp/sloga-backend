@@ -5,11 +5,12 @@ use revolt_result::Result;
 
 use futures::StreamExt;
 
-use crate::{AbstractE2EE, E2EEEnvelope, E2EEIdentity, E2EEOneTimeKey, MongoDb};
+use crate::{AbstractE2EE, E2EEBlob, E2EEEnvelope, E2EEIdentity, E2EEOneTimeKey, MongoDb};
 
 const COL_IDENTITY: &str = "e2ee_identity";
 const COL_PREKEYS: &str = "e2ee_prekeys";
 const COL_QUEUE: &str = "e2ee_queue";
+const COL_BLOBS: &str = "e2ee_blobs";
 
 #[async_trait]
 impl AbstractE2EE for MongoDb {
@@ -287,5 +288,91 @@ impl AbstractE2EE for MongoDb {
             .await
             .map_err(|_| create_database_error!("delete_many", COL_QUEUE))
             .map(|result| result.deleted_count as usize)
+    }
+
+    async fn insert_e2ee_blob(&self, blob: &E2EEBlob) -> Result<()> {
+        self.col::<E2EEBlob>(COL_BLOBS)
+            .insert_one(blob)
+            .await
+            .map_err(|_| create_database_error!("insert_one", COL_BLOBS))
+            .map(|_| ())
+    }
+
+    async fn fetch_e2ee_blob(&self, id: &str) -> Result<E2EEBlob> {
+        query!(
+            self,
+            find_one,
+            COL_BLOBS,
+            doc! {
+                "_id": id
+            }
+        )?
+        .ok_or_else(|| create_error!(NotFound))
+    }
+
+    async fn mark_e2ee_blob_fetched(
+        &self,
+        id: &str,
+        user_id: &str,
+        device_id: &str,
+    ) -> Result<E2EEBlob> {
+        // Atomic array update: the filter requires a matching recipient
+        // entry, so a non-recipient can never flip anything, and the
+        // returned (post-update) document decides deletion exactly once
+        // per fully-fetched state transition observed by a caller
+        self.col::<E2EEBlob>(COL_BLOBS)
+            .find_one_and_update(
+                doc! {
+                    "_id": id,
+                    "recipients": {
+                        "$elemMatch": {
+                            "user_id": user_id,
+                            "device_id": device_id
+                        }
+                    }
+                },
+                doc! {
+                    "$set": { "recipients.$[entry].fetched": true }
+                },
+            )
+            .with_options(
+                mongodb::options::FindOneAndUpdateOptions::builder()
+                    .array_filters(vec![doc! {
+                        "entry.user_id": user_id,
+                        "entry.device_id": device_id
+                    }])
+                    .return_document(mongodb::options::ReturnDocument::After)
+                    .build(),
+            )
+            .await
+            .map_err(|_| create_database_error!("find_one_and_update", COL_BLOBS))?
+            .ok_or_else(|| create_error!(NotFound))
+    }
+
+    async fn delete_e2ee_blob(&self, id: &str) -> Result<bool> {
+        self.col::<E2EEBlob>(COL_BLOBS)
+            .delete_one(doc! { "_id": id })
+            .await
+            .map_err(|_| create_database_error!("delete_one", COL_BLOBS))
+            .map(|result| result.deleted_count > 0)
+    }
+
+    async fn fetch_expired_e2ee_blobs(
+        &self,
+        threshold_id: &str,
+        min_size: isize,
+    ) -> Result<Vec<E2EEBlob>> {
+        Ok(self
+            .col::<E2EEBlob>(COL_BLOBS)
+            .find(doc! {
+                "_id": { "$lt": threshold_id },
+                "size": { "$gt": min_size as i64 }
+            })
+            .with_options(FindOptions::builder().sort(doc! { "_id": 1 }).build())
+            .await
+            .map_err(|_| create_database_error!("find", COL_BLOBS))?
+            .filter_map(|s| async { s.ok() })
+            .collect::<Vec<E2EEBlob>>()
+            .await)
     }
 }

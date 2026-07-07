@@ -48,6 +48,15 @@ pub async fn router() -> Router<AppState> {
 
     Router::new()
         .route("/", get(root))
+        // E2EE blob routes: static segments take precedence over the
+        // parameterised tag routes below
+        .route(
+            "/e2ee",
+            post(crate::e2ee::upload_blob)
+                .options(options)
+                .layer(DefaultBodyLimit::max(crate::e2ee::E2EE_BLOB_BODY_LIMIT)),
+        )
+        .route("/e2ee/:blob_id", get(crate::e2ee::fetch_blob))
         .route(
             "/:tag",
             post(upload_file)

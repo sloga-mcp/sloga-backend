@@ -7,7 +7,10 @@ use rand::RngCore;
 use revolt_result::ErrorType;
 use ulid::Ulid;
 
-use crate::{E2EEEnvelope, E2EEIdentity, E2EEOneTimeKey, E2EESignedKey, E2EE_PROTOCOL_VERSION};
+use crate::{
+    E2EEBlob, E2EEBlobRecipient, E2EEEnvelope, E2EEIdentity, E2EEOneTimeKey, E2EESignedKey,
+    E2EE_LARGE_BLOB_SIZE, E2EE_PROTOCOL_VERSION,
+};
 
 fn random_bytes<const N: usize>() -> [u8; N] {
     let mut bytes = [0u8; N];
@@ -427,5 +430,136 @@ async fn device_deletion_cascades() {
         ];
         expected.sort();
         assert_eq!(removed, expected);
+    });
+}
+
+fn make_blob(at: SystemTime, size: isize, recipients: Vec<E2EEBlobRecipient>) -> E2EEBlob {
+    E2EEBlob {
+        id: Ulid::from_datetime(at).to_string(),
+        uploader_user_id: "alice".to_string(),
+        uploader_device_id: "dev_alice".to_string(),
+        size,
+        bucket_id: "bucket".to_string(),
+        iv: "iv".to_string(),
+        recipients,
+    }
+}
+
+fn recipient(user_id: &str, device_id: &str) -> E2EEBlobRecipient {
+    E2EEBlobRecipient {
+        user_id: user_id.to_string(),
+        device_id: device_id.to_string(),
+        fetched: false,
+    }
+}
+
+#[tokio::test]
+async fn blob_fetch_tracking_and_recipient_scoped_authz() {
+    database_test!(|db| async move {
+        let blob = make_blob(
+            SystemTime::now(),
+            1000,
+            vec![
+                recipient("bob", "dev_b1"),
+                recipient("bob", "dev_b2"),
+                recipient("alice", "dev_alice2"),
+            ],
+        );
+        db.insert_e2ee_blob(&blob).await.unwrap();
+
+        // Fetch authz is scoped to DECLARED recipient devices only — the
+        // uploading device, a stranger, and a wrong device of a legitimate
+        // recipient are all refused
+        let fetched = db.fetch_e2ee_blob(&blob.id).await.unwrap();
+        assert!(fetched.authorizes_fetch("bob", "dev_b1"));
+        assert!(!fetched.authorizes_fetch("alice", "dev_alice"));
+        assert!(!fetched.authorizes_fetch("mallory", "dev_m"));
+        assert!(!fetched.authorizes_fetch("bob", "dev_b3"));
+
+        // Marking a non-recipient fetched matches nothing (atomic filter)
+        assert!(db
+            .mark_e2ee_blob_fetched(&blob.id, "mallory", "dev_m")
+            .await
+            .is_err());
+
+        // Per-device fetch tracking: fully_fetched flips only when EVERY
+        // declared device has fetched
+        let after = db
+            .mark_e2ee_blob_fetched(&blob.id, "bob", "dev_b1")
+            .await
+            .unwrap();
+        assert!(!after.fully_fetched());
+
+        let after = db
+            .mark_e2ee_blob_fetched(&blob.id, "bob", "dev_b2")
+            .await
+            .unwrap();
+        assert!(!after.fully_fetched());
+
+        let after = db
+            .mark_e2ee_blob_fetched(&blob.id, "alice", "dev_alice2")
+            .await
+            .unwrap();
+        assert!(after.fully_fetched());
+
+        // Deletion (post-full-fetch or by the sweep) is idempotent
+        assert!(db.delete_e2ee_blob(&blob.id).await.unwrap());
+        assert!(!db.delete_e2ee_blob(&blob.id).await.unwrap());
+        assert!(db.fetch_e2ee_blob(&blob.id).await.is_err());
+    });
+}
+
+#[tokio::test]
+async fn blob_ttl_sweep_is_size_tiered() {
+    database_test!(|db| async move {
+        let day_old = SystemTime::now() - Duration::from_secs(25 * 60 * 60);
+        let month_old = SystemTime::now() - Duration::from_secs(31 * 24 * 60 * 60);
+
+        let large_old = make_blob(
+            day_old,
+            E2EE_LARGE_BLOB_SIZE + 1,
+            vec![recipient("bob", "dev_b")],
+        );
+        let small_old = make_blob(day_old, 1000, vec![recipient("bob", "dev_b")]);
+        let small_ancient = make_blob(month_old, 1000, vec![recipient("bob", "dev_b")]);
+        let large_fresh = make_blob(
+            SystemTime::now(),
+            E2EE_LARGE_BLOB_SIZE + 1,
+            vec![recipient("bob", "dev_b")],
+        );
+
+        for blob in [&large_old, &small_old, &small_ancient, &large_fresh] {
+            db.insert_e2ee_blob(blob).await.unwrap();
+        }
+
+        // The 24h sweep uses the large-size floor: it must catch ONLY the
+        // day-old large blob — a small day-old blob is retained (30-day
+        // tier) and a fresh large blob is untouched
+        let threshold_24h =
+            Ulid::from_datetime(SystemTime::now() - Duration::from_secs(24 * 60 * 60))
+                .to_string();
+        let expired = db
+            .fetch_expired_e2ee_blobs(&threshold_24h, E2EE_LARGE_BLOB_SIZE)
+            .await
+            .unwrap();
+        assert_eq!(
+            expired.iter().map(|b| b.id.as_str()).collect::<Vec<_>>(),
+            vec![large_old.id.as_str()]
+        );
+
+        // The 30-day sweep (no size floor) catches only the ancient blob
+        // (the large day-old one is handled by the tier above)
+        let threshold_30d = Ulid::from_datetime(
+            SystemTime::now() - Duration::from_secs(30 * 24 * 60 * 60),
+        )
+        .to_string();
+        let expired = db
+            .fetch_expired_e2ee_blobs(&threshold_30d, 0)
+            .await
+            .unwrap();
+        assert_eq!(
+            expired.iter().map(|b| b.id.as_str()).collect::<Vec<_>>(),
+            vec![small_ancient.id.as_str()]
+        );
     });
 }

@@ -1,7 +1,7 @@
 use iso8601_timestamp::Timestamp;
 use revolt_result::Result;
 
-use crate::{AbstractE2EE, E2EEEnvelope, E2EEIdentity, E2EEOneTimeKey, ReferenceDb};
+use crate::{AbstractE2EE, E2EEBlob, E2EEEnvelope, E2EEIdentity, E2EEOneTimeKey, ReferenceDb};
 
 #[async_trait]
 impl AbstractE2EE for ReferenceDb {
@@ -218,5 +218,64 @@ impl AbstractE2EE for ReferenceDb {
         let before = queue.len();
         queue.retain(|id, _| id.as_str() >= threshold_id);
         Ok(before - queue.len())
+    }
+
+    async fn insert_e2ee_blob(&self, blob: &E2EEBlob) -> Result<()> {
+        let mut blobs = self.e2ee_blobs.lock().await;
+        if blobs.contains_key(&blob.id) {
+            return Err(create_error!(InvalidOperation));
+        }
+
+        blobs.insert(blob.id.clone(), blob.clone());
+        Ok(())
+    }
+
+    async fn fetch_e2ee_blob(&self, id: &str) -> Result<E2EEBlob> {
+        let blobs = self.e2ee_blobs.lock().await;
+        blobs
+            .get(id)
+            .cloned()
+            .ok_or_else(|| create_error!(NotFound))
+    }
+
+    async fn mark_e2ee_blob_fetched(
+        &self,
+        id: &str,
+        user_id: &str,
+        device_id: &str,
+    ) -> Result<E2EEBlob> {
+        // The mutex makes check-and-set atomic, matching Mongo's
+        // find_one_and_update with an array filter
+        let mut blobs = self.e2ee_blobs.lock().await;
+        let blob = blobs.get_mut(id).ok_or_else(|| create_error!(NotFound))?;
+
+        let recipient = blob
+            .recipients
+            .iter_mut()
+            .find(|recipient| recipient.user_id == user_id && recipient.device_id == device_id)
+            .ok_or_else(|| create_error!(NotFound))?;
+
+        recipient.fetched = true;
+        Ok(blob.clone())
+    }
+
+    async fn delete_e2ee_blob(&self, id: &str) -> Result<bool> {
+        let mut blobs = self.e2ee_blobs.lock().await;
+        Ok(blobs.remove(id).is_some())
+    }
+
+    async fn fetch_expired_e2ee_blobs(
+        &self,
+        threshold_id: &str,
+        min_size: isize,
+    ) -> Result<Vec<E2EEBlob>> {
+        let blobs = self.e2ee_blobs.lock().await;
+        let mut expired: Vec<E2EEBlob> = blobs
+            .values()
+            .filter(|blob| blob.id.as_str() < threshold_id && blob.size > min_size)
+            .cloned()
+            .collect();
+        expired.sort_by(|a, b| a.id.cmp(&b.id));
+        Ok(expired)
     }
 }

@@ -26,7 +26,7 @@ struct MigrationInfo {
     revision: i32,
 }
 
-pub const LATEST_REVISION: i32 = 52; // MUST BE +1 to last migration
+pub const LATEST_REVISION: i32 = 53; // MUST BE +1 to last migration
 
 pub async fn migrate_database(db: &MongoDb) {
     let migrations = db.col::<Document>("migrations");
@@ -1546,6 +1546,14 @@ pub async fn run_migrations(db: &MongoDb, revision: i32) -> i32 {
             })
             .await
             .expect("Failed to create e2ee_queue index.");
+    }
+
+    if revision <= 52 {
+        info!("Running migration [revision 52 / 07-07-2026]: Create E2EE blob collection");
+
+        db.db().create_collection("e2ee_blobs").await.ok();
+        // Lookups are by _id (built-in index); the TTL sweep is an _id range
+        // scan with an in-range size filter — no additional index needed
     }
 
     // Reminder to update LATEST_REVISION when adding new migrations.
