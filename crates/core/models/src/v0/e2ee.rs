@@ -82,6 +82,11 @@ auto_derived!(
         /// Ed25519 identity key (lets clients detect key substitution
         /// without consuming a one-time key)
         pub ed25519_key: String,
+        /// Curve25519 identity key — together with `signature` lets clients
+        /// verify the full identity binding without consuming a one-time key
+        pub curve25519_key: String,
+        /// Ed25519 self-signature over the canonical identity payload
+        pub signature: String,
         /// When the device first published keys (own devices only)
         #[serde(skip_serializing_if = "Option::is_none")]
         pub created_at: Option<String>,

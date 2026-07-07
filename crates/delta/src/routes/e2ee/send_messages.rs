@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet};
 use iso8601_timestamp::Timestamp;
 use revolt_database::{
     events::client::EventV1, util::permissions::DatabasePermissionQuery, Database, E2EEEnvelope,
-    User, AMQP, E2EE_PROTOCOL_VERSION,
+    Session, User, AMQP, E2EE_PROTOCOL_VERSION,
 };
 use revolt_models::v0;
 use revolt_permissions::{calculate_user_permissions, UserPermission};
@@ -32,6 +32,7 @@ pub async fn send_messages(
     db: &State<Database>,
     amqp: &State<AMQP>,
     user: User,
+    session: Session,
     data: Json<v0::DataSendE2EEMessages>,
 ) -> Result<Json<v0::ResponseSendE2EEMessages>> {
     super::require_e2ee_enabled().await?;
@@ -62,14 +63,18 @@ pub async fn send_messages(
         return Err(create_error!(PayloadTooLarge));
     }
 
-    // The sending device must be registered to the authenticated sender
-    db.fetch_e2ee_identity(&user.id, &data.device_id)
+    // The sending device must be registered to the authenticated sender,
+    // AND the calling session must be bound to that device (design §8:
+    // web/stolen session tokens cannot act as an E2EE device)
+    let sending_identity = db
+        .fetch_e2ee_identity(&user.id, &data.device_id)
         .await
         .map_err(|_| {
             create_error!(FailedValidation {
                 error: "sending device is not registered".to_string()
             })
         })?;
+    sending_identity.assert_bound_session(&session.id)?;
 
     // Every distinct recipient user must be DM-eligible (a blocked sender
     // can neither deliver envelopes nor probe device inventories); sending

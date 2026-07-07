@@ -273,6 +273,42 @@ impl E2EEIdentity {
         format!("acutest:e2ee:device-claim\ndevice_id:{device_id}\nsession_id:{session_id}\nnonce:{nonce}")
     }
 
+    /// Require that the calling session is bound to THIS device (design §8,
+    /// assumption int-H3: web session tokens are refused on E2EE routes).
+    ///
+    /// A session becomes device-bound in exactly two ways: the MFA-gated
+    /// first key publish from that session, or a bonfire device-claim proof
+    /// (an Ed25519 signature over a session-bound nonce that only the
+    /// holder of the device identity key can produce). Web sessions have no
+    /// key material, so they can never satisfy this check — a stolen web
+    /// token cannot act as an E2EE device. Defense in depth on top of key
+    /// absence; the client's native layer remains the real boundary.
+    pub fn assert_bound_session(&self, session_id: &str) -> Result<()> {
+        if self.last_session_id != session_id {
+            return Err(create_error!(NotAuthenticated));
+        }
+
+        Ok(())
+    }
+
+    /// Require that the calling session is bound to ANY of the user's
+    /// registered devices (see [`Self::assert_bound_session`]). Gates E2EE
+    /// routes that act as "an E2EE-capable device of this user" without
+    /// naming a specific device (bundle fetch, peer device listing).
+    pub async fn require_device_bound_session(
+        db: &Database,
+        user_id: &str,
+        session_id: &str,
+    ) -> Result<()> {
+        for identity in db.fetch_e2ee_identities(user_id).await? {
+            if identity.last_session_id == session_id {
+                return Ok(());
+            }
+        }
+
+        Err(create_error!(NotAuthenticated))
+    }
+
     /// Broadcast a device-list change to the account's other devices (private
     /// topic) and to DM peers (each direct-message channel topic) — device
     /// changes are loud, both add and remove

@@ -127,6 +127,12 @@ pub async fn publish_keys(
     }
 
     if let Some(existing) = existing {
+        // Republishing (fallback rotation / one-time-key replenishment)
+        // requires the session bound to this device (design §8): a stolen
+        // web token must not be able to re-upload previously-observed,
+        // already-consumed public keys and wedge the device's peers
+        existing.assert_bound_session(&session.id)?;
+
         // Identity keys are immutable per device: a differing key is a
         // substitution attempt (or a reinstall that must enroll fresh)
         if existing.ed25519_key != identity.ed25519_key

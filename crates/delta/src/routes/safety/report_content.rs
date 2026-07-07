@@ -260,7 +260,8 @@ mod test {
                             "id": message.id,
                             "channel": channel.id(),
                             "author": author.id,
-                            "content": "Test message"
+                            "content": "Test message",
+                            "encrypted": true
                         },
                         "context": [
                             {
@@ -306,7 +307,11 @@ mod test {
 
         assert_eq!(reported_message.id, message.id);
         assert_eq!(reported_message.content, "Test message");
+        // Reporter-attached plaintext of an E2EE message is flagged as such
+        // so moderators know it was never server-visible
+        assert!(reported_message.encrypted);
         assert_eq!(context.len(), 1);
+        assert!(!context[0].encrypted);
 
         assert!(snapshots.iter().any(|snapshot| matches!(
             &snapshot.content,

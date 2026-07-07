@@ -159,5 +159,10 @@ auto_derived!(
         pub author: String,
         /// Message content as rendered on the reporter's device
         pub content: String,
+        /// Whether this content was end-to-end encrypted: the plaintext was
+        /// attached by the reporter from their local store and was NEVER
+        /// server-visible (provenance for the moderation team).
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        pub encrypted: bool,
     }
 );

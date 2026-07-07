@@ -229,11 +229,13 @@ async fn publish_rejects_bad_signatures() {
 async fn fetch_consumes_one_time_keys_and_never_returns_empty() {
     let harness = TestHarness::new().await;
     let (account_a, session_a, user_a) = harness.new_user().await;
-    let (_account_b, session_b, user_b) = harness.new_user().await;
+    let (account_b, session_b, user_b) = harness.new_user().await;
 
     make_dm_eligible(&harness, &user_a, &user_b).await;
 
     let device = publish_device(&harness, &account_a.id, &session_a.token, 1).await;
+    // Fetching key material requires a device-bound session (design §8)
+    publish_device(&harness, &account_b.id, &session_b.token, 1).await;
 
     // First fetch consumes the only one-time key
     let response = TestHarness::with_session(
@@ -266,10 +268,13 @@ async fn fetch_consumes_one_time_keys_and_never_returns_empty() {
 async fn blocked_user_cannot_fetch_keys_or_devices() {
     let harness = TestHarness::new().await;
     let (account_a, session_a, user_a) = harness.new_user().await;
-    let (_account_b, session_b, user_b) = harness.new_user().await;
+    let (account_b, session_b, user_b) = harness.new_user().await;
 
     make_dm_eligible(&harness, &user_a, &user_b).await;
     publish_device(&harness, &account_a.id, &session_a.token, 1).await;
+    // B gets a bound device so the BLOCK is the gate under test, not the
+    // device-bound-session requirement
+    publish_device(&harness, &account_b.id, &session_b.token, 1).await;
 
     // A blocks B
     let response = TestHarness::with_session(
@@ -645,4 +650,158 @@ async fn one_time_key_cap_counts_upserts_correctly() {
         .dispatch()
         .await;
     assert_eq!(response.status(), Status::BadRequest);
+}
+
+/// Design §8 / int-H3: a session that never proved possession of a device
+/// identity key (a web login, or any stolen token) is refused on E2EE
+/// routes that consume key material or act as a device. Own-device listing
+/// and MFA-gated revocation stay reachable — that's the lost-device
+/// recovery path.
+#[rocket::async_test]
+async fn unbound_session_is_refused_on_e2ee_routes() {
+    let harness = TestHarness::new().await;
+    let (account_a, session_a, user_a) = harness.new_user().await;
+    let (account_b, session_b, user_b) = harness.new_user().await;
+
+    make_dm_eligible(&harness, &user_a, &user_b).await;
+
+    let device_a = publish_device(&harness, &account_a.id, &session_a.token, 2).await;
+    let device_b = publish_device(&harness, &account_b.id, &session_b.token, 2).await;
+
+    // A second session for account A — the "web login". It never publishes
+    // or proves a device claim, so it is not device-bound.
+    let web = account_a
+        .create_session(&harness.db, "web".to_string())
+        .await
+        .unwrap();
+
+    // Bundle fetch: refused (would consume B's one-time keys)
+    let response = TestHarness::with_session(
+        web.clone(),
+        harness.client.get(format!("/e2ee/keys/{}", user_b.id)),
+    )
+    .await;
+    assert_eq!(response.status(), Status::Unauthorized);
+
+    // Peer device listing: refused
+    let response = TestHarness::with_session(
+        web.clone(),
+        harness.client.get(format!("/e2ee/devices/{}", user_b.id)),
+    )
+    .await;
+    assert_eq!(response.status(), Status::Unauthorized);
+
+    // OWN device listing: allowed (web device management)
+    let response = TestHarness::with_session(
+        web.clone(),
+        harness.client.get(format!("/e2ee/devices/{}", user_a.id)),
+    )
+    .await;
+    assert_eq!(response.status(), Status::Ok);
+
+    // Sending as the account's device: refused (session not bound to it)
+    let body = v0::DataSendE2EEMessages {
+        device_id: device_a.device_id.clone(),
+        protocol_version: E2EE_PROTOCOL_VERSION,
+        envelopes: vec![v0::DataE2EEEnvelope {
+            recipient_user_id: user_b.id.clone(),
+            recipient_device_id: device_b.device_id.clone(),
+            sequence: 1,
+            ciphertext: STANDARD_NO_PAD.encode(b"stolen token"),
+        }],
+    };
+    let response = TestHarness::with_session(
+        web.clone(),
+        harness
+            .client
+            .post("/e2ee/messages")
+            .header(ContentType::JSON)
+            .body(serde_json::to_string(&body).unwrap()),
+    )
+    .await;
+    assert_eq!(response.status(), Status::Unauthorized);
+
+    // Republish (replenish / fallback rotation) for the device: refused —
+    // a token thief cannot re-upload stale public keys
+    let response = TestHarness::with_session(
+        web.clone(),
+        harness
+            .client
+            .put("/e2ee/keys")
+            .header(ContentType::JSON)
+            .body(serde_json::to_string(&device_a.bundle(2)).unwrap()),
+    )
+    .await;
+    assert_eq!(response.status(), Status::Unauthorized);
+
+    // The bound session still works for all of the above
+    let response = TestHarness::with_session(
+        session_a.clone(),
+        harness.client.get(format!("/e2ee/keys/{}", user_b.id)),
+    )
+    .await;
+    assert_eq!(response.status(), Status::Ok);
+
+    // MFA-gated revocation from the unbound session: allowed (recovery
+    // path for a lost or stolen device)
+    let ticket = mfa_ticket(&harness, &account_a.id).await;
+    let response = harness
+        .client
+        .delete(format!("/e2ee/keys/{}", device_a.device_id))
+        .header(Header::new("x-session-token", web.token.clone()))
+        .header(Header::new("X-MFA-Ticket", ticket))
+        .dispatch()
+        .await;
+    assert_eq!(response.status(), Status::NoContent);
+}
+
+/// A device claim proven over the events connection (bonfire) rebinds the
+/// device to the proving session: the new session gains E2EE-route access
+/// and the old session loses it. (The claim verification itself is
+/// signature-tested in the database crate; here we exercise the rebind's
+/// effect on the route gates.)
+#[rocket::async_test]
+async fn device_claim_rebind_moves_route_access_between_sessions() {
+    let harness = TestHarness::new().await;
+    let (account_a, session_a, user_a) = harness.new_user().await;
+    let (account_b, session_b, user_b) = harness.new_user().await;
+
+    make_dm_eligible(&harness, &user_a, &user_b).await;
+
+    let device_a = publish_device(&harness, &account_a.id, &session_a.token, 2).await;
+    publish_device(&harness, &account_b.id, &session_b.token, 2).await;
+
+    // Fresh login on the same physical device: new session, then the client
+    // proves the device claim on connect (bonfire calls this exact update)
+    let relogin = account_a
+        .create_session(&harness.db, "relogin".to_string())
+        .await
+        .unwrap();
+
+    harness
+        .db
+        .update_e2ee_identity_session(
+            &user_a.id,
+            &device_a.device_id,
+            &relogin.id,
+            iso8601_timestamp::Timestamp::now_utc(),
+        )
+        .await
+        .unwrap();
+
+    // The new session is now the bound one...
+    let response = TestHarness::with_session(
+        relogin,
+        harness.client.get(format!("/e2ee/keys/{}", user_b.id)),
+    )
+    .await;
+    assert_eq!(response.status(), Status::Ok);
+
+    // ...and the original session lost its binding
+    let response = TestHarness::with_session(
+        session_a,
+        harness.client.get(format!("/e2ee/keys/{}", user_b.id)),
+    )
+    .await;
+    assert_eq!(response.status(), Status::Unauthorized);
 }

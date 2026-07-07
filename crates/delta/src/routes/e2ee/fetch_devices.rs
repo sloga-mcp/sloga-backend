@@ -1,6 +1,6 @@
 use revolt_database::{
     util::{permissions::DatabasePermissionQuery, reference::Reference},
-    Database, User,
+    Database, E2EEIdentity, Session, User,
 };
 use revolt_models::v0;
 use revolt_permissions::{calculate_user_permissions, UserPermission};
@@ -16,11 +16,17 @@ use rocket::{serde::json::Json, State};
 /// For your own devices the listing includes registration/last-seen times and
 /// the remaining one-time key count (drives replenishment); for peers only
 /// the device id, protocol version and identity key are returned.
+///
+/// Peer listings require a device-bound session (design §8) — only an
+/// E2EE-capable device has any use for them. Listing your OWN devices is
+/// allowed from any session: the web device-management UI needs it (e.g. to
+/// revoke a lost desktop, which stays MFA-gated).
 #[openapi(tag = "E2EE")]
 #[get("/devices/<target>")]
 pub async fn fetch_devices(
     db: &State<Database>,
     user: User,
+    session: Session,
     target: Reference<'_>,
 ) -> Result<Json<Vec<v0::E2EEDeviceInfo>>> {
     super::require_e2ee_enabled().await?;
@@ -33,6 +39,8 @@ pub async fn fetch_devices(
     let own = target.id == user.id;
 
     if !own {
+        E2EEIdentity::require_device_bound_session(db, &user.id, &session.id).await?;
+
         let mut query = DatabasePermissionQuery::new(db, &user).user(&target);
         calculate_user_permissions(&mut query)
             .await
@@ -56,6 +64,8 @@ pub async fn fetch_devices(
             device_id: identity.device_id,
             protocol_version: identity.protocol_version,
             ed25519_key: identity.ed25519_key,
+            curve25519_key: identity.curve25519_key,
+            signature: identity.signature,
             one_time_key_count,
         });
     }

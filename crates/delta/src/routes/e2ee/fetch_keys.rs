@@ -1,6 +1,6 @@
 use revolt_database::{
     util::{permissions::DatabasePermissionQuery, reference::Reference},
-    Database, User,
+    Database, E2EEIdentity, Session, User,
 };
 use revolt_models::v0;
 use revolt_permissions::{calculate_user_permissions, UserPermission};
@@ -21,11 +21,16 @@ use rocket::{serde::json::Json, State};
 /// Clients MUST verify the identity self-signature and every key signature
 /// before establishing a session, and MUST pin identity keys: a later bundle
 /// absence or key change is an alert, never a silent downgrade.
+///
+/// Requires a device-bound session (design §8): only a session that has
+/// proven possession of one of the caller's device identity keys may consume
+/// key material. Web session tokens are refused.
 #[openapi(tag = "E2EE")]
 #[get("/keys/<target>")]
 pub async fn fetch_keys(
     db: &State<Database>,
     user: User,
+    session: Session,
     target: Reference<'_>,
 ) -> Result<Json<v0::E2EEKeyBundle>> {
     super::require_e2ee_enabled().await?;
@@ -33,6 +38,8 @@ pub async fn fetch_keys(
     if user.bot.is_some() {
         return Err(create_error!(IsBot));
     }
+
+    E2EEIdentity::require_device_bound_session(db, &user.id, &session.id).await?;
 
     let target = target.as_user(db).await?;
 
