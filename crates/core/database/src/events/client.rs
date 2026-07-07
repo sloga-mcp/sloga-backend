@@ -2,8 +2,8 @@ use revolt_result::Error;
 use serde::{Deserialize, Serialize};
 
 use revolt_models::v0::{
-    AppendMessage, Channel, ChannelSlowmode, ChannelUnread, ChannelVoiceState, Emoji,
-    FieldsChannel, FieldsMember, FieldsMessage, FieldsRole, FieldsServer, FieldsUser,
+    AppendMessage, Channel, ChannelSlowmode, ChannelUnread, ChannelVoiceState, E2EEMessage,
+    Emoji, FieldsChannel, FieldsMember, FieldsMessage, FieldsRole, FieldsServer, FieldsUser,
     FieldsWebhook, Member, MemberCompositeKey, Message, PartialChannel, PartialEmoji,
     PartialMember, PartialMessage, PartialRole, PartialServer, PartialSticker, PartialUser,
     PartialUserVoiceState, PartialWebhook, PolicyChange, RemovalIntention, Report, Server,
@@ -389,6 +389,42 @@ pub enum EventV1 {
     /// User's active slowmodes
     UserSlowmodes {
         slowmodes: Vec<ChannelSlowmode>,
+    },
+
+    /// New E2EE envelope for one of the user's devices
+    ///
+    /// Pushed on the recipient's private topic; each device keeps envelopes
+    /// addressed to its own device id and acknowledges them via E2EEAck.
+    /// The envelope ULID is the client's dedup key against the
+    /// drain-vs-live-push race.
+    E2EEMessage(E2EEMessage),
+
+    /// A user registered a new E2EE device
+    ///
+    /// Sent to the account's other devices and to DM peers — device-list
+    /// changes are loud (both add and remove).
+    E2EEDeviceCreate {
+        user_id: String,
+        device_id: String,
+    },
+
+    /// A user's E2EE device was revoked
+    E2EEDeviceDelete {
+        user_id: String,
+        device_id: String,
+    },
+
+    /// Device-claim challenge (connection-local, issued by the events
+    /// server; the client signs this with the device Ed25519 identity key)
+    E2EEChallenge {
+        nonce: String,
+    },
+
+    /// Device-claim result (connection-local). Only an accepted claim grants
+    /// queue drain and acknowledgement rights.
+    E2EEClaimResult {
+        device_id: String,
+        accepted: bool,
     },
 }
 

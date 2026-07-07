@@ -1,6 +1,6 @@
 use iso8601_timestamp::Timestamp;
 
-use crate::{events::client::EventV1, Database};
+use crate::{events::client::EventV1, Database, E2EEIdentity};
 use revolt_result::Result;
 
 auto_derived_partial!(
@@ -54,6 +54,10 @@ impl Session {
     pub async fn delete(self, db: &Database) -> Result<()> {
         // Delete from database
         db.delete_session(&self.id).await?;
+
+        // An E2EE device dies with the session it is bound to: remove its
+        // keys and queued envelopes and notify peers
+        E2EEIdentity::revoke_devices_for_session(db, &self.user_id, &self.id).await?;
 
         // Create and push event
         EventV1::DeleteSession {

@@ -461,6 +461,10 @@ pub struct Features {
     pub mass_mentions_send_notifications: bool,
     pub mass_mentions_enabled: bool,
 
+    /// Operator flag for the E2EE key directory + envelope relay routes
+    #[serde(default)]
+    pub e2ee_enabled: bool,
+
     #[serde(default)]
     pub advanced: FeaturesAdvanced,
 }

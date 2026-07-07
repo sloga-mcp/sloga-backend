@@ -661,6 +661,14 @@ impl Account {
         db.delete_all_sessions(&self.id, exclude_session_id.clone())
             .await?;
 
+        // E2EE devices die with their sessions: revoke every device except
+        // those bound to the surviving session
+        for identity in db.fetch_e2ee_identities(&self.id).await? {
+            if exclude_session_id.as_deref() != Some(identity.last_session_id.as_str()) {
+                crate::E2EEIdentity::revoke_device(db, &self.id, &identity.device_id).await?;
+            }
+        }
+
         // Create and push event
         EventV1::DeleteAllSessions {
             user_id: self.id.clone(),

@@ -55,6 +55,7 @@ pub async fn edit(
         && data.avatar.is_none()
         && data.badges.is_none()
         && data.flags.is_none()
+        && data.e2ee_enabled.is_none()
         && data.remove.is_empty()
     {
         return Ok(Json(user.into_self(false).await));
@@ -85,6 +86,9 @@ pub async fn edit(
         pronouns: data.pronouns,
         badges: data.badges,
         flags: data.flags,
+        // UI hint only: E2EE capability is always derived from published,
+        // signature-verified key bundles, never from this flag
+        e2ee_enabled: data.e2ee_enabled,
         ..Default::default()
     };
 

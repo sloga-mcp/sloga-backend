@@ -75,6 +75,16 @@ auto_derived_partial!(
         #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
         pub bot: Option<BotInformation>,
 
+        /// Whether this user has opted in to E2EE DMs
+        ///
+        /// UI hint ONLY — clients derive actual E2EE capability from a
+        /// fetched, signature-verified key bundle, never from this flag
+        #[cfg_attr(
+            feature = "serde",
+            serde(skip_serializing_if = "crate::if_false", default)
+        )]
+        pub e2ee_enabled: bool,
+
         /// Current session user's relationship with this user
         pub relationship: RelationshipStatus,
         /// Whether this user is currently online
@@ -268,6 +278,10 @@ auto_derived!(
         /// Enum of user flags
         #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
         pub flags: Option<i32>,
+
+        /// Whether this user has opted in to E2EE DMs (UI hint only)
+        #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+        pub e2ee_enabled: Option<bool>,
 
         /// Fields to remove from user object
         #[cfg_attr(feature = "serde", serde(default))]

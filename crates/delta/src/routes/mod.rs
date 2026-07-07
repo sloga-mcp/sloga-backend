@@ -7,6 +7,7 @@ use rocket::{Build, Rocket};
 mod bots;
 mod channels;
 mod customisation;
+mod e2ee;
 mod invites;
 mod onboard;
 mod policy;
@@ -37,6 +38,7 @@ pub fn mount(config: Settings, mut rocket: Rocket<Build>) -> Rocket<Build> {
             "/invites" => invites::routes(),
             "/custom" => customisation::routes(),
             "/safety" => safety::routes(),
+            "/e2ee" => e2ee::routes(),
             "/auth/account" => account::routes(),
             "/auth/session" => session::routes(),
             "/auth/oauth" => oauth::routes(),
@@ -59,6 +61,7 @@ pub fn mount(config: Settings, mut rocket: Rocket<Build>) -> Rocket<Build> {
             "/invites" => invites::routes(),
             "/custom" => customisation::routes(),
             "/safety" => safety::routes(),
+            "/e2ee" => e2ee::routes(),
             "/auth/account" => account::routes(),
             "/auth/session" => session::routes(),
             "/auth/oauth" => oauth::routes(),
@@ -155,6 +158,12 @@ fn custom_openapi_spec() -> OpenApi {
               "Session",
               "Onboarding",
               "MFA"
+            ]
+          },
+          {
+            "name": "E2EE",
+            "tags": [
+              "E2EE"
             ]
           },
           {
@@ -326,6 +335,14 @@ fn custom_openapi_spec() -> OpenApi {
             Tag {
                 name: "Webhooks".to_owned(),
                 description: Some("Send messages from 3rd party services".to_owned()),
+                ..Default::default()
+            },
+            Tag {
+                name: "E2EE".to_owned(),
+                description: Some(
+                    "Key directory and encrypted-envelope relay for end-to-end encrypted DMs"
+                        .to_owned(),
+                ),
                 ..Default::default()
             },
         ],

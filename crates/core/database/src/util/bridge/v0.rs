@@ -1148,6 +1148,7 @@ impl crate::User {
             flags: self.flags.unwrap_or_default() as u32,
             privileged: self.privileged,
             bot: self.bot.map(|bot| bot.into()),
+            e2ee_enabled: self.e2ee_enabled,
             relationship,
             id: self.id,
         }
@@ -1213,6 +1214,7 @@ impl crate::User {
             flags: self.flags.unwrap_or_default() as u32,
             privileged: self.privileged,
             bot: self.bot.map(|bot| bot.into()),
+            e2ee_enabled: self.e2ee_enabled,
             relationship,
             id: self.id,
         }
@@ -1242,6 +1244,7 @@ impl crate::User {
             flags: self.flags.unwrap_or_default() as u32,
             privileged: self.privileged,
             bot: self.bot.map(|bot| bot.into()),
+            e2ee_enabled: self.e2ee_enabled,
             relationship: RelationshipStatus::None, // events client will populate this from cache
             id: self.id,
         }
@@ -1278,6 +1281,7 @@ impl crate::User {
             flags: self.flags.unwrap_or_default() as u32,
             privileged: self.privileged,
             bot: self.bot.map(|bot| bot.into()),
+            e2ee_enabled: self.e2ee_enabled,
             relationship: RelationshipStatus::User,
             id: self.id,
         }
@@ -1307,6 +1311,7 @@ impl From<User> for crate::User {
             flags: Some(value.flags as i32),
             privileged: value.privileged,
             bot: value.bot.map(Into::into),
+            e2ee_enabled: value.e2ee_enabled,
             suspended_until: None,
             last_acknowledged_policy_change: Timestamp::UNIX_EPOCH,
         }
@@ -1332,6 +1337,7 @@ impl From<crate::PartialUser> for PartialUser {
             flags: value.flags.map(|flags| flags as u32),
             privileged: value.privileged,
             bot: value.bot.map(|bot| bot.into()),
+            e2ee_enabled: value.e2ee_enabled,
             relationship: None,
             online: None,
             id: value.id,
@@ -1623,6 +1629,41 @@ impl From<WebPushSubscription> for crate::WebPushSubscription {
             endpoint: value.endpoint,
             p256dh: value.p256dh,
             auth: value.auth,
+        }
+    }
+}
+
+impl From<crate::E2EESignedKey> for E2EESignedKey {
+    fn from(value: crate::E2EESignedKey) -> Self {
+        E2EESignedKey {
+            key_id: value.key_id,
+            key: value.key,
+            signature: value.signature,
+        }
+    }
+}
+
+impl From<E2EESignedKey> for crate::E2EESignedKey {
+    fn from(value: E2EESignedKey) -> Self {
+        crate::E2EESignedKey {
+            key_id: value.key_id,
+            key: value.key,
+            signature: value.signature,
+        }
+    }
+}
+
+impl From<crate::E2EEEnvelope> for E2EEMessage {
+    fn from(value: crate::E2EEEnvelope) -> Self {
+        E2EEMessage {
+            id: value.id,
+            recipient_user_id: value.recipient_user_id,
+            recipient_device_id: value.recipient_device_id,
+            sender_user_id: value.sender_user_id,
+            sender_device_id: value.sender_device_id,
+            protocol_version: value.protocol_version,
+            sequence: value.sequence,
+            ciphertext: value.ciphertext,
         }
     }
 }

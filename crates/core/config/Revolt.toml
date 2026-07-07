@@ -228,6 +228,8 @@ default_bucket = "revolt-uploads"
 [features]
 # Feature gate options
 webhooks_enabled = false
+# End-to-end encrypted DMs: key directory + envelope relay routes
+e2ee_enabled = false
 # Enable push notifications for mass pings (everyone, online, roles)
 # When false this will still ping in-client but will not send notifications from pushd
 mass_mentions_send_notifications = true

@@ -22,6 +22,10 @@ async-channel = { workspace = true }
 querystring = { workspace = true }
 regex = { workspace = true }
 
+# e2ee device claims
+rand = { workspace = true }
+base64 = { workspace = true }
+
 # serde
 bincode = { workspace = true }
 serde_json = { workspace = true }

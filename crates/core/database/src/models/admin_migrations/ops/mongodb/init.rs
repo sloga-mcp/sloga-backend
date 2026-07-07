@@ -110,6 +110,18 @@ pub async fn create_database(db: &MongoDb) {
         .await
         .expect("Failed to create mfa_tickets collection.");
 
+    db.create_collection("e2ee_identity")
+        .await
+        .expect("Failed to create e2ee_identity collection.");
+
+    db.create_collection("e2ee_prekeys")
+        .await
+        .expect("Failed to create e2ee_prekeys collection.");
+
+    db.create_collection("e2ee_queue")
+        .await
+        .expect("Failed to create e2ee_queue collection.");
+
     db.run_command(doc! {
         "createIndexes": "users",
         "indexes": [
@@ -353,6 +365,53 @@ pub async fn create_database(db: &MongoDb) {
                 },
                 "name": "token",
                 "unique": true
+            }
+        ]
+    })
+    .await
+    .unwrap();
+
+    db.run_command(doc! {
+        "createIndexes": "e2ee_identity",
+        "indexes": [
+            {
+                "key": {
+                    "user_id": 1,
+                    "device_id": 1
+                },
+                "name": "user_device",
+                "unique": true
+            }
+        ]
+    })
+    .await
+    .unwrap();
+
+    db.run_command(doc! {
+        "createIndexes": "e2ee_prekeys",
+        "indexes": [
+            {
+                "key": {
+                    "user_id": 1,
+                    "device_id": 1
+                },
+                "name": "user_device"
+            }
+        ]
+    })
+    .await
+    .unwrap();
+
+    db.run_command(doc! {
+        "createIndexes": "e2ee_queue",
+        "indexes": [
+            {
+                "key": {
+                    "recipient_user_id": 1,
+                    "recipient_device_id": 1,
+                    "_id": 1
+                },
+                "name": "recipient_compound"
             }
         ]
     })

@@ -26,7 +26,7 @@ struct MigrationInfo {
     revision: i32,
 }
 
-pub const LATEST_REVISION: i32 = 51; // MUST BE +1 to last migration
+pub const LATEST_REVISION: i32 = 52; // MUST BE +1 to last migration
 
 pub async fn migrate_database(db: &MongoDb) {
     let migrations = db.col::<Document>("migrations");
@@ -1488,6 +1488,64 @@ pub async fn run_migrations(db: &MongoDb, revision: i32) -> i32 {
             })
             .await
             .unwrap();
+    }
+
+    if revision <= 51 {
+        info!("Running migration [revision 51 / 07-07-2026]: Create E2EE collections and indexes");
+
+        db.db().create_collection("e2ee_identity").await.ok();
+        db.db().create_collection("e2ee_prekeys").await.ok();
+        db.db().create_collection("e2ee_queue").await.ok();
+
+        db.db()
+            .run_command(doc! {
+                "createIndexes": "e2ee_identity",
+                "indexes": [
+                    {
+                        "key": {
+                            "user_id": 1,
+                            "device_id": 1
+                        },
+                        "name": "user_device",
+                        "unique": true
+                    }
+                ]
+            })
+            .await
+            .expect("Failed to create e2ee_identity index.");
+
+        db.db()
+            .run_command(doc! {
+                "createIndexes": "e2ee_prekeys",
+                "indexes": [
+                    {
+                        "key": {
+                            "user_id": 1,
+                            "device_id": 1
+                        },
+                        "name": "user_device"
+                    }
+                ]
+            })
+            .await
+            .expect("Failed to create e2ee_prekeys index.");
+
+        db.db()
+            .run_command(doc! {
+                "createIndexes": "e2ee_queue",
+                "indexes": [
+                    {
+                        "key": {
+                            "recipient_user_id": 1,
+                            "recipient_device_id": 1,
+                            "_id": 1
+                        },
+                        "name": "recipient_compound"
+                    }
+                ]
+            })
+            .await
+            .expect("Failed to create e2ee_queue index.");
     }
 
     // Reminder to update LATEST_REVISION when adding new migrations.

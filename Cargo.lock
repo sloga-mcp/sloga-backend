@@ -7209,6 +7209,7 @@ version = "0.13.7"
 dependencies = [
  "async-channel",
  "async-tungstenite",
+ "base64 0.21.7",
  "bincode",
  "fred",
  "futures",
@@ -7217,6 +7218,7 @@ dependencies = [
  "lru_time_cache",
  "once_cell",
  "querystring",
+ "rand 0.8.6",
  "redis-kiss",
  "regex",
  "revolt-config",
@@ -7278,6 +7280,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "ulid",
 ]
 
 [[package]]
@@ -7293,6 +7296,7 @@ dependencies = [
  "bson",
  "deadqueue",
  "decancer",
+ "ed25519-dalek",
  "futures",
  "handlebars",
  "indexmap 2.14.0",
@@ -7347,6 +7351,7 @@ dependencies = [
  "bitfield",
  "chrono",
  "dashmap",
+ "ed25519-dalek",
  "futures",
  "impl_ops",
  "iso8601-timestamp",

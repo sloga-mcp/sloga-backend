@@ -61,6 +61,13 @@ auto_derived_partial!(
         #[serde(skip_serializing_if = "Option::is_none")]
         pub bot: Option<BotInformation>,
 
+        /// Whether this user has opted in to E2EE DMs
+        ///
+        /// UI hint ONLY — clients derive actual E2EE capability from a
+        /// fetched, signature-verified key bundle, never from this flag
+        #[serde(skip_serializing_if = "crate::if_false", default)]
+        pub e2ee_enabled: bool,
+
         /// Time until user is unsuspended
         #[serde(skip_serializing_if = "Option::is_none")]
         pub suspended_until: Option<Timestamp>,
@@ -208,6 +215,7 @@ impl Default for User {
             flags: Default::default(),
             privileged: Default::default(),
             bot: Default::default(),
+            e2ee_enabled: Default::default(),
             suspended_until: Default::default(),
             last_acknowledged_policy_change: Timestamp::UNIX_EPOCH,
         }
@@ -901,6 +909,21 @@ impl User {
         db.clear_memberships(&self.id).await?;
         self.clear_relationships(db).await?;
         db.delete_messages_by_user(&self.id).await?;
+
+        // E2EE cascade: remove all device identities, prekeys and queued
+        // envelopes, notifying peers of each removed device
+        for device_id in db.delete_all_e2ee_devices(&self.id).await? {
+            crate::E2EEIdentity::broadcast_device_change(
+                db,
+                &self.id,
+                crate::events::client::EventV1::E2EEDeviceDelete {
+                    user_id: self.id.to_string(),
+                    device_id,
+                },
+            )
+            .await;
+        }
+
         self.mark_deleted(db).await?;
 
         Ok(())

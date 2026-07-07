@@ -35,22 +35,20 @@ impl Consumer for GenericConsumer {
 
     /// This consumer handles delegating messages into their respective platform queues.
     async fn consume(&self, delivery: Delivery) -> Result<()> {
-        let payload: MessageSentPayload = serde_json::from_slice(&delivery.data)?;
+        let payload: GenericPayload = serde_json::from_slice(&delivery.data)?;
 
-        debug!("Received message event on origin");
+        debug!("Received generic event on origin");
 
         if let Ok(sessions) = self
             .db
-            .fetch_sessions_with_subscription(&payload.users)
+            .fetch_sessions_with_subscription(&[payload.user.id.clone()])
             .await
         {
             let config = revolt_config::config().await;
             for session in sessions {
                 if let Some(sub) = session.subscription {
                     let mut sendable = PayloadToService {
-                        notification: PayloadKind::MessageNotification(
-                            payload.notification.clone(),
-                        ),
+                        notification: PayloadKind::Generic(payload.clone()),
                         token: sub.auth,
                         user_id: session.user_id,
                         session_id: session.id,

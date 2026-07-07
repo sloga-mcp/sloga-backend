@@ -34,6 +34,23 @@ use crate::config::{ProtocolConfiguration, WebsocketHandshakeCallback};
 use crate::events::state::{State, SubscriptionStateChange};
 use revolt_models::v0;
 
+/// Upper bound on envelopes pushed in one drain; comfortably above the
+/// per-device queue-depth cap enforced at submission
+const E2EE_DRAIN_LIMIT: i64 = 1024;
+
+/// Maximum envelope ids per acknowledgement frame
+const E2EE_MAX_ACK_BATCH: usize = 128;
+
+/// Random 256-bit device-claim nonce, unpadded standard base64
+fn e2ee_generate_nonce() -> String {
+    use base64::{engine::general_purpose::STANDARD_NO_PAD, Engine};
+    use rand::RngCore;
+
+    let mut bytes = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    STANDARD_NO_PAD.encode(bytes)
+}
+
 type WsReader = SplitStream<WebSocketStream<Compat<TcpStream>>>;
 type WsWriter = SplitSink<WebSocketStream<Compat<TcpStream>>, async_tungstenite::tungstenite::Message>;
 
@@ -150,6 +167,7 @@ pub async fn client(db: &'static Database, stream: TcpStream, addr: SocketAddr) 
         let write = Mutex::new(write);
         let subscribed = state.subscribed.clone();
         let active_servers = state.active_servers.clone();
+        let session_id = state.session_id.clone();
         let (topic_signal_s, topic_signal_r) = async_channel::unbounded();
 
         // TODO: this needs to be rewritten
@@ -171,10 +189,12 @@ pub async fn client(db: &'static Database, stream: TcpStream, addr: SocketAddr) 
 
         // Read from WebSocket stream.
         let worker = worker_with_kill_signal(
+            db,
             addr,
             subscribed,
             active_servers,
             user_id.clone(),
+            session_id,
             &config,
             topic_signal_s,
             kill_signal_2_r,
@@ -402,10 +422,12 @@ async fn listener(
 
 #[allow(clippy::too_many_arguments)]
 async fn worker_with_kill_signal(
+    db: &'static Database,
     addr: SocketAddr,
     subscribed: Arc<RwLock<HashSet<String>>>,
     active_servers: Arc<Mutex<lru_time_cache::LruCache<String, ()>>>,
     user_id: String,
+    session_id: String,
     config: &ProtocolConfiguration,
     topic_signal_s: async_channel::Sender<()>,
     kill_signal_r: async_channel::Receiver<()>,
@@ -414,10 +436,12 @@ async fn worker_with_kill_signal(
     kill_signal_s: async_channel::Sender<()>,
 ) {
     worker(
+        db,
         addr,
         subscribed,
         active_servers,
         user_id,
+        session_id,
         config,
         topic_signal_s,
         kill_signal_r,
@@ -430,10 +454,12 @@ async fn worker_with_kill_signal(
 
 #[allow(clippy::too_many_arguments)]
 async fn worker(
+    db: &'static Database,
     addr: SocketAddr,
     subscribed: Arc<RwLock<HashSet<String>>>,
     active_servers: Arc<Mutex<lru_time_cache::LruCache<String, ()>>>,
     user_id: String,
+    session_id: String,
     config: &ProtocolConfiguration,
     topic_signal_s: async_channel::Sender<()>,
     kill_signal_r: async_channel::Receiver<()>,
@@ -441,6 +467,13 @@ async fn worker(
     write: &Mutex<WsWriter>,
 ) {
     let revolt_config = revolt_config::config().await;
+
+    // E2EE device-claim state, local to this connection. A claim must be
+    // proven (Ed25519 signature over a server nonce) before this connection
+    // gains drain or acknowledgement rights — a stolen session token alone
+    // must not be able to drain-and-ack (silently destroy) queued messages.
+    let mut e2ee_pending_challenge: Option<(String, String)> = None;
+    let mut e2ee_proven_device: Option<String> = None;
 
     loop {
         let t1 = read.try_next().fuse();
@@ -527,6 +560,118 @@ async fn worker(
                                 .send(config.encode(&EventV1::Pong { data }))
                                 .await
                                 .ok();
+                        }
+                    }
+                    ClientMessage::E2EERequestChallenge { device_id } => {
+                        if !revolt_config.features.e2ee_enabled {
+                            continue;
+                        }
+
+                        // Fresh nonce per attempt; issuing a new challenge
+                        // invalidates any previous one
+                        let nonce = e2ee_generate_nonce();
+                        e2ee_pending_challenge = Some((device_id, nonce.clone()));
+
+                        write
+                            .lock()
+                            .await
+                            .send(config.encode(&EventV1::E2EEChallenge { nonce }))
+                            .await
+                            .ok();
+                    }
+                    ClientMessage::E2EEProveDevice {
+                        device_id,
+                        signature,
+                    } => {
+                        if !revolt_config.features.e2ee_enabled {
+                            continue;
+                        }
+
+                        // Single-use challenge: taken here so a failed proof
+                        // cannot be retried against the same nonce
+                        let challenge = e2ee_pending_challenge.take();
+
+                        let accepted = match challenge {
+                            Some((challenged_device, nonce)) if challenged_device == device_id => {
+                                if let Ok(identity) =
+                                    db.fetch_e2ee_identity(&user_id, &device_id).await
+                                {
+                                    identity.verify_claim(&nonce, &session_id, &signature)
+                                } else {
+                                    false
+                                }
+                            }
+                            _ => false,
+                        };
+
+                        if accepted {
+                            e2ee_proven_device = Some(device_id.clone());
+
+                            db.update_e2ee_identity_session(
+                                &user_id,
+                                &device_id,
+                                &session_id,
+                                Timestamp::now_utc(),
+                            )
+                            .await
+                            .ok();
+                        }
+
+                        {
+                            let mut write = write.lock().await;
+
+                            if write
+                                .send(config.encode(&EventV1::E2EEClaimResult {
+                                    device_id: device_id.clone(),
+                                    accepted,
+                                }))
+                                .await
+                                .is_err()
+                            {
+                                return;
+                            }
+
+                            // Drain the queue for the proven device, ordered
+                            // by envelope ULID. Envelopes stay queued until
+                            // acknowledged; clients dedup against live pushes
+                            // by envelope id.
+                            if accepted {
+                                if let Ok(envelopes) = db
+                                    .fetch_e2ee_envelopes(&user_id, &device_id, E2EE_DRAIN_LIMIT)
+                                    .await
+                                {
+                                    for envelope in envelopes {
+                                        if write
+                                            .send(
+                                                config.encode(&EventV1::E2EEMessage(
+                                                    envelope.into(),
+                                                )),
+                                            )
+                                            .await
+                                            .is_err()
+                                        {
+                                            return;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    ClientMessage::E2EEAck { ids } => {
+                        if !revolt_config.features.e2ee_enabled {
+                            continue;
+                        }
+
+                        // Acknowledgement rights require a proven device
+                        // claim; acks are scoped to that device and
+                        // idempotent (deleting an already-deleted envelope
+                        // is a no-op)
+                        let Some(device_id) = &e2ee_proven_device else {
+                            continue;
+                        };
+
+                        for id in ids.iter().take(E2EE_MAX_ACK_BATCH) {
+                            db.delete_e2ee_envelope(id, &user_id, device_id).await.ok();
                         }
                     }
                     _ => {}

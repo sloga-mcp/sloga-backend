@@ -88,6 +88,7 @@ livekit-protocol = { workspace = true }
 
 [dev-dependencies]
 revolt-config = { workspace = true, features = ["test"] }
+ed25519-dalek = { workspace = true }
 
 [build-dependencies]
 vergen = { workspace = true }

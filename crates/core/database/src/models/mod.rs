@@ -4,6 +4,7 @@ mod channel_invites;
 mod channel_unreads;
 mod channel_webhooks;
 mod channels;
+mod e2ee;
 mod emojis;
 mod file_hashes;
 mod files;
@@ -29,6 +30,7 @@ pub use channel_invites::*;
 pub use channel_unreads::*;
 pub use channel_webhooks::*;
 pub use channels::*;
+pub use e2ee::*;
 pub use emojis::*;
 pub use file_hashes::*;
 pub use files::*;
@@ -62,6 +64,7 @@ pub trait AbstractDatabase:
     + channel_invites::AbstractChannelInvites
     + channel_unreads::AbstractChannelUnreads
     + channel_webhooks::AbstractWebhooks
+    + e2ee::AbstractE2EE
     + emojis::AbstractEmojis
     + file_hashes::AbstractAttachmentHashes
     + files::AbstractAttachments

@@ -12,6 +12,7 @@ publish = false
 [dependencies]
 # Utility
 log = { workspace = true }
+ulid = { workspace = true }
 
 # Async
 tokio = { workspace = true }

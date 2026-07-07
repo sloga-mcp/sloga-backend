@@ -160,6 +160,19 @@ layer and mandatory:
   fields from day one; the slice-3 hostile-server harness permanently
   includes key-substitution and signature-stripping cases.
 
+**Slice-1 amendment (2026-07-07): per-key signatures.** The batch signature
+above is unverifiable by recipients — a fetching client receives at most ONE
+one-time key, never the signed batch. Slice 1 therefore implements
+per-unit signatures (Matrix-style), preserving the same security properties:
+identity is Ed25519-self-signed; the fallback key and each one-time key carry
+their own Ed25519 signature; every signed payload is domain-separated
+(`acutest:e2ee:identity` / `:fallback` / `:one-time` — a fallback key cannot
+be replayed as a one-time key) and includes `protocol_version` and
+`device_id` INSIDE the payload. Canonical payload builders live in
+`crates/core/database/src/models/e2ee/model.rs` and are the source of truth
+for what slice-2 native layers must sign. Flagged for the slice-1 reviewer
+gate.
+
 **Device claim authentication (REQUIRED — reviewer F2).** `last_session_id`
 may NOT be updated by mere assertion. A bonfire connection claiming a
 device_id must prove possession of the device identity key (Ed25519-signed

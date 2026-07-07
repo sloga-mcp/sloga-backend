@@ -54,6 +54,11 @@ impl<'a> RatelimitResolver<Request<'a>> for DeltaRatelimits {
                 ("swagger", _, _) => ("swagger", None),
                 ("safety", Some("report"), _) => ("safety_report", Some("report")),
                 ("safety", _, _) => ("safety", None),
+                // Bundle fetches are keyed by target user: probing one
+                // user's keys can't be amortised across targets
+                ("e2ee", Some("keys"), Method::Get) => ("e2ee_fetch_keys", extra),
+                ("e2ee", Some("messages"), Method::Post) => ("e2ee_messages", None),
+                ("e2ee", _, _) => ("e2ee", None),
                 _ => ("any", None),
             }
         } else {
@@ -75,6 +80,9 @@ impl<'a> RatelimitResolver<Request<'a>> for DeltaRatelimits {
             "swagger" => 100,
             "safety" => 15,
             "safety_report" => 3,
+            "e2ee_fetch_keys" => 10,
+            "e2ee_messages" => 30,
+            "e2ee" => 10,
             _ => 20,
         }
     }
