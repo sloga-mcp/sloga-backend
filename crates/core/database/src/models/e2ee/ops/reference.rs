@@ -1,7 +1,9 @@
 use iso8601_timestamp::Timestamp;
 use revolt_result::Result;
 
-use crate::{AbstractE2EE, E2EEBlob, E2EEEnvelope, E2EEIdentity, E2EEOneTimeKey, ReferenceDb};
+use crate::{
+    AbstractE2EE, E2EEBackup, E2EEBlob, E2EEEnvelope, E2EEIdentity, E2EEOneTimeKey, ReferenceDb,
+};
 
 #[async_trait]
 impl AbstractE2EE for ReferenceDb {
@@ -108,6 +110,13 @@ impl AbstractE2EE for ReferenceDb {
             keys.insert(key.id.clone(), key.clone());
         }
         Ok(())
+    }
+
+    async fn delete_e2ee_one_time_keys(&self, user_id: &str, device_id: &str) -> Result<usize> {
+        let mut keys = self.e2ee_one_time_keys.lock().await;
+        let before = keys.len();
+        keys.retain(|_, key| !(key.user_id == user_id && key.device_id == device_id));
+        Ok(before - keys.len())
     }
 
     async fn count_e2ee_one_time_keys(&self, user_id: &str, device_id: &str) -> Result<u64> {
@@ -277,5 +286,47 @@ impl AbstractE2EE for ReferenceDb {
             .collect();
         expired.sort_by(|a, b| a.id.cmp(&b.id));
         Ok(expired)
+    }
+
+    async fn fetch_e2ee_backup(
+        &self,
+        user_id: &str,
+        device_id: &str,
+    ) -> Result<Option<E2EEBackup>> {
+        let backups = self.e2ee_backups.lock().await;
+        Ok(backups
+            .get(&E2EEBackup::composite_id(user_id, device_id))
+            .cloned())
+    }
+
+    async fn fetch_e2ee_backups(&self, user_id: &str) -> Result<Vec<E2EEBackup>> {
+        let backups = self.e2ee_backups.lock().await;
+        let mut result: Vec<E2EEBackup> = backups
+            .values()
+            .filter(|backup| backup.user_id == user_id)
+            .cloned()
+            .collect();
+        result.sort_by(|a, b| a.device_id.cmp(&b.device_id));
+        Ok(result)
+    }
+
+    async fn upsert_e2ee_backup(&self, backup: &E2EEBackup) -> Result<()> {
+        let mut backups = self.e2ee_backups.lock().await;
+        backups.insert(backup.id.clone(), backup.clone());
+        Ok(())
+    }
+
+    async fn delete_e2ee_backup(&self, user_id: &str, device_id: &str) -> Result<bool> {
+        let mut backups = self.e2ee_backups.lock().await;
+        Ok(backups
+            .remove(&E2EEBackup::composite_id(user_id, device_id))
+            .is_some())
+    }
+
+    async fn delete_all_e2ee_backups(&self, user_id: &str) -> Result<usize> {
+        let mut backups = self.e2ee_backups.lock().await;
+        let before = backups.len();
+        backups.retain(|_, backup| backup.user_id != user_id);
+        Ok(before - backups.len())
     }
 }

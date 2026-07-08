@@ -51,6 +51,7 @@ pub async fn publish_keys(
     }
 
     let data = data.into_inner();
+    let replace_one_time_keys = data.replace_one_time_keys;
 
     // Structural validation before any crypto
     if !is_valid_device_id(&data.device_id) {
@@ -154,6 +155,18 @@ pub async fn publish_keys(
         }
 
         db.replace_e2ee_identity(&identity).await?;
+
+        // Key-backup restore (slice 5.5 §6.3): atomically replace this
+        // device's server-side one-time keys. Honored ONLY on this
+        // device-bound republish path AND ONLY with a non-empty batch (L3),
+        // so a compromised webview cannot append the flag to strip a live
+        // device's keys. Post-restore stale OTKs (their private halves died
+        // with the old machine) become unclaimable; the fresh batch below is
+        // inserted after the wipe.
+        if replace_one_time_keys && !one_time_keys.is_empty() {
+            db.delete_e2ee_one_time_keys(&user.id, &identity.device_id)
+                .await?;
+        }
     } else {
         // First publication from a new device requires MFA
         if ticket.is_none() {

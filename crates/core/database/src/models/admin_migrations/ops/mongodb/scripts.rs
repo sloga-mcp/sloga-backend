@@ -26,7 +26,7 @@ struct MigrationInfo {
     revision: i32,
 }
 
-pub const LATEST_REVISION: i32 = 53; // MUST BE +1 to last migration
+pub const LATEST_REVISION: i32 = 54; // MUST BE +1 to last migration
 
 pub async fn migrate_database(db: &MongoDb) {
     let migrations = db.col::<Document>("migrations");
@@ -1554,6 +1554,32 @@ pub async fn run_migrations(db: &MongoDb, revision: i32) -> i32 {
         db.db().create_collection("e2ee_blobs").await.ok();
         // Lookups are by _id (built-in index); the TTL sweep is an _id range
         // scan with an in-range size filter — no additional index needed
+    }
+
+    if revision <= 53 {
+        info!("Running migration [revision 53 / 08-07-2026]: Create E2EE key-backup collection");
+
+        db.db().create_collection("e2ee_backups").await.ok();
+
+        // One backup blob per (user_id, device_id). The composite _id already
+        // guarantees uniqueness; this named index makes the per-user restore
+        // fetch and the account-deletion cascade efficient.
+        db.db()
+            .run_command(doc! {
+                "createIndexes": "e2ee_backups",
+                "indexes": [
+                    {
+                        "key": {
+                            "user_id": 1,
+                            "device_id": 1
+                        },
+                        "name": "user_device",
+                        "unique": true
+                    }
+                ]
+            })
+            .await
+            .expect("Failed to create e2ee_backups index.");
     }
 
     // Reminder to update LATEST_REVISION when adding new migrations.

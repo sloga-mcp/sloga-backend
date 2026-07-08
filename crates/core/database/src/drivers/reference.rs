@@ -3,9 +3,9 @@ use std::{collections::HashMap, sync::Arc};
 use futures::lock::Mutex;
 
 use crate::{
-    Bot, Channel, ChannelCompositeKey, ChannelUnread, E2EEBlob, E2EEEnvelope, E2EEIdentity,
-    E2EEOneTimeKey, Emoji, File, FileHash, Invite, Member, MemberCompositeKey, Message,
-    PolicyChange, RatelimitEvent, Report, Server, ServerBan, Snapshot, Sticker, User,
+    Bot, Channel, ChannelCompositeKey, ChannelUnread, E2EEBackup, E2EEBlob, E2EEEnvelope,
+    E2EEIdentity, E2EEOneTimeKey, Emoji, File, FileHash, Invite, Member, MemberCompositeKey,
+    Message, PolicyChange, RatelimitEvent, Report, Server, ServerBan, Snapshot, Sticker, User,
     UserSettings, Webhook, Account, AccountInvite, Session, MFATicket
 };
 
@@ -40,5 +40,6 @@ database_derived!(
         pub e2ee_one_time_keys: Arc<Mutex<HashMap<String, E2EEOneTimeKey>>>,
         pub e2ee_queue: Arc<Mutex<HashMap<String, E2EEEnvelope>>>,
         pub e2ee_blobs: Arc<Mutex<HashMap<String, E2EEBlob>>>,
+        pub e2ee_backups: Arc<Mutex<HashMap<String, E2EEBackup>>>,
     }
 );

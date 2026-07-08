@@ -5,12 +5,13 @@ use revolt_result::Result;
 
 use futures::StreamExt;
 
-use crate::{AbstractE2EE, E2EEBlob, E2EEEnvelope, E2EEIdentity, E2EEOneTimeKey, MongoDb};
+use crate::{AbstractE2EE, E2EEBackup, E2EEBlob, E2EEEnvelope, E2EEIdentity, E2EEOneTimeKey, MongoDb};
 
 const COL_IDENTITY: &str = "e2ee_identity";
 const COL_PREKEYS: &str = "e2ee_prekeys";
 const COL_QUEUE: &str = "e2ee_queue";
 const COL_BLOBS: &str = "e2ee_blobs";
+const COL_BACKUPS: &str = "e2ee_backups";
 
 #[async_trait]
 impl AbstractE2EE for MongoDb {
@@ -166,6 +167,17 @@ impl AbstractE2EE for MongoDb {
         }
 
         Ok(())
+    }
+
+    async fn delete_e2ee_one_time_keys(&self, user_id: &str, device_id: &str) -> Result<usize> {
+        self.col::<Document>(COL_PREKEYS)
+            .delete_many(doc! {
+                "user_id": user_id,
+                "device_id": device_id
+            })
+            .await
+            .map_err(|_| create_database_error!("delete_many", COL_PREKEYS))
+            .map(|result| result.deleted_count as usize)
     }
 
     async fn count_e2ee_one_time_keys(&self, user_id: &str, device_id: &str) -> Result<u64> {
@@ -374,5 +386,72 @@ impl AbstractE2EE for MongoDb {
             .filter_map(|s| async { s.ok() })
             .collect::<Vec<E2EEBlob>>()
             .await)
+    }
+
+    async fn fetch_e2ee_backup(
+        &self,
+        user_id: &str,
+        device_id: &str,
+    ) -> Result<Option<E2EEBackup>> {
+        query!(
+            self,
+            find_one,
+            COL_BACKUPS,
+            doc! {
+                "user_id": user_id,
+                "device_id": device_id
+            }
+        )
+    }
+
+    async fn fetch_e2ee_backups(&self, user_id: &str) -> Result<Vec<E2EEBackup>> {
+        query!(
+            self,
+            find,
+            COL_BACKUPS,
+            doc! {
+                "user_id": user_id
+            }
+        )
+    }
+
+    async fn upsert_e2ee_backup(&self, backup: &E2EEBackup) -> Result<()> {
+        let document =
+            to_document(backup).map_err(|_| create_database_error!("to_document", COL_BACKUPS))?;
+
+        self.col::<E2EEBackup>(COL_BACKUPS)
+            .update_one(
+                doc! { "_id": &backup.id },
+                doc! { "$set": document },
+            )
+            .with_options(
+                mongodb::options::UpdateOptions::builder()
+                    .upsert(true)
+                    .build(),
+            )
+            .await
+            .map_err(|_| create_database_error!("upsert_one", COL_BACKUPS))
+            .map(|_| ())
+    }
+
+    async fn delete_e2ee_backup(&self, user_id: &str, device_id: &str) -> Result<bool> {
+        self.col::<Document>(COL_BACKUPS)
+            .delete_one(doc! {
+                "user_id": user_id,
+                "device_id": device_id
+            })
+            .await
+            .map_err(|_| create_database_error!("delete_one", COL_BACKUPS))
+            .map(|result| result.deleted_count > 0)
+    }
+
+    async fn delete_all_e2ee_backups(&self, user_id: &str) -> Result<usize> {
+        self.col::<Document>(COL_BACKUPS)
+            .delete_many(doc! {
+                "user_id": user_id
+            })
+            .await
+            .map_err(|_| create_database_error!("delete_many", COL_BACKUPS))
+            .map(|result| result.deleted_count as usize)
     }
 }

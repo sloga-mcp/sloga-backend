@@ -4,13 +4,26 @@ use revolt_result::{create_error, Result};
 use revolt_rocket_okapi::revolt_okapi::openapi3::OpenApi;
 use rocket::Route;
 
+mod delete_backup;
 mod fetch_devices;
 mod fetch_keys;
+mod get_backup;
+mod get_backup_status;
 mod publish_keys;
+mod put_backup;
 mod revoke_device;
 mod send_messages;
 #[cfg(test)]
 mod tests;
+
+/// Maximum length of a key-backup header (the plaintext, server-visible AAD)
+pub const MAX_BACKUP_HEADER_LENGTH: usize = 1024;
+
+/// Maximum a backup `generation` may exceed the previously-stored value on a
+/// single PUT. Legitimate refreshes step by 1, so this generous bound only
+/// blocks a compromised webview from jumping the stored generation to a huge
+/// value to permanently wedge future PUTs (M2 defence-in-depth).
+pub const MAX_BACKUP_GENERATION_JUMP: i64 = 1_000_000;
 
 /// Maximum one-time keys stored per device
 pub const MAX_ONE_TIME_KEYS: usize = 100;
@@ -149,5 +162,9 @@ pub fn routes() -> (Vec<Route>, OpenApi) {
         fetch_keys::fetch_keys,
         fetch_devices::fetch_devices,
         send_messages::send_messages,
+        put_backup::put_backup,
+        get_backup::get_backup,
+        get_backup_status::get_backup_status,
+        delete_backup::delete_backup,
     ]
 }

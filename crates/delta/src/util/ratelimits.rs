@@ -58,6 +58,17 @@ impl<'a> RatelimitResolver<Request<'a>> for DeltaRatelimits {
                 // user's keys can't be amortised across targets
                 ("e2ee", Some("keys"), Method::Get) => ("e2ee_fetch_keys", extra),
                 ("e2ee", Some("messages"), Method::Post) => ("e2ee_messages", None),
+                // The MFA-gated key-backup RESTORE fetch (`GET /e2ee/backup`)
+                // gets a tight dedicated bucket — it is rare. The metadata
+                // `GET /e2ee/backup/status` (settings-card/nag poller) uses the
+                // normal e2ee bucket (LOW-4).
+                ("e2ee", Some("backup"), Method::Get) => {
+                    if extra == Some("status") {
+                        ("e2ee", None)
+                    } else {
+                        ("e2ee_backup_get", None)
+                    }
+                }
                 ("e2ee", _, _) => ("e2ee", None),
                 _ => ("any", None),
             }
@@ -82,6 +93,7 @@ impl<'a> RatelimitResolver<Request<'a>> for DeltaRatelimits {
             "safety_report" => 3,
             "e2ee_fetch_keys" => 10,
             "e2ee_messages" => 30,
+            "e2ee_backup_get" => 3,
             "e2ee" => 10,
             _ => 20,
         }

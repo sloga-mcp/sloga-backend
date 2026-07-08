@@ -1,6 +1,6 @@
 use revolt_result::Result;
 
-use crate::{E2EEBlob, E2EEEnvelope, E2EEIdentity, E2EEOneTimeKey};
+use crate::{E2EEBackup, E2EEBlob, E2EEEnvelope, E2EEIdentity, E2EEOneTimeKey};
 
 #[cfg(feature = "mongodb")]
 mod mongodb;
@@ -43,6 +43,12 @@ pub trait AbstractE2EE: Sync + Send {
 
     /// Insert (or overwrite by id) a batch of one-time keys
     async fn insert_e2ee_one_time_keys(&self, keys: &[E2EEOneTimeKey]) -> Result<()>;
+
+    /// Delete ALL stored one-time keys for a device (restore's
+    /// replace-and-republish, design §5/§6.3). Idempotent; returns how many
+    /// were removed. Scoped strictly to (user_id, device_id) — never touches
+    /// another device's or user's keys.
+    async fn delete_e2ee_one_time_keys(&self, user_id: &str, device_id: &str) -> Result<usize>;
 
     /// Count remaining one-time keys for a device
     async fn count_e2ee_one_time_keys(&self, user_id: &str, device_id: &str) -> Result<u64>;
@@ -122,4 +128,28 @@ pub trait AbstractE2EE: Sync + Send {
         threshold_id: &str,
         min_size: isize,
     ) -> Result<Vec<E2EEBlob>>;
+
+    /// Fetch one device's key-backup blob, if present (design §5).
+    async fn fetch_e2ee_backup(
+        &self,
+        user_id: &str,
+        device_id: &str,
+    ) -> Result<Option<E2EEBackup>>;
+
+    /// Fetch ALL of a user's key-backup blobs, one per device (the restore
+    /// path — the caller tries the entered recovery code against each).
+    async fn fetch_e2ee_backups(&self, user_id: &str) -> Result<Vec<E2EEBackup>>;
+
+    /// Insert or replace a device's key-backup blob (upsert by composite id).
+    /// Generation monotonicity is enforced by the caller BEFORE this call
+    /// (design §5); this is a plain last-writer-wins upsert.
+    async fn upsert_e2ee_backup(&self, backup: &E2EEBackup) -> Result<()>;
+
+    /// Delete a device's key-backup blob. Idempotent; returns whether it
+    /// existed. Only ever reached from the MFA-gated DELETE route or the
+    /// account-deletion cascade — NOT from device revocation (design §5).
+    async fn delete_e2ee_backup(&self, user_id: &str, device_id: &str) -> Result<bool>;
+
+    /// Delete ALL of a user's key-backup blobs (account-deletion cascade).
+    async fn delete_all_e2ee_backups(&self, user_id: &str) -> Result<usize>;
 }

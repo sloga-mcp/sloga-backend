@@ -72,6 +72,7 @@ impl TestDevice {
             one_time_keys: (0..one_time_keys)
                 .map(|i| self.signed_key(E2EE_SIGN_CONTEXT_ONE_TIME, &format!("otk{i}")))
                 .collect(),
+            replace_one_time_keys: false,
         }
     }
 }
@@ -958,4 +959,373 @@ async fn device_claim_rebind_moves_route_access_between_sessions() {
     )
     .await;
     assert_eq!(response.status(), Status::Unauthorized);
+}
+
+// ========================================================================
+// Key backup & recovery (slice 5.5)
+// ========================================================================
+
+/// A minimal valid backup header bound to (user, device, generation) with
+/// in-range Argon2id params. The server parses it only to range-check the
+/// KDF and cross-check the generation binding; salt/nonce are opaque to it.
+fn backup_header(user_id: &str, device_id: &str, generation: i64) -> String {
+    format!(
+        "{{\"v\":1,\"kdf\":{{\"alg\":\"argon2id\",\"m_kib\":262144,\"t\":3,\"p\":4}},\
+         \"salt\":\"AAAAAAAAAAAAAAAAAAAAAA\",\"nonce\":\"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\",\
+         \"user_id\":\"{user_id}\",\"device_id\":\"{device_id}\",\
+         \"generation\":{generation},\"created_at\":0}}"
+    )
+}
+
+async fn put_backup(
+    harness: &TestHarness,
+    session_token: &str,
+    device_id: &str,
+    header: String,
+    generation: i64,
+) -> Status {
+    let body = v0::DataPutE2EEBackup {
+        device_id: device_id.to_string(),
+        header,
+        ciphertext: "AAAAAAAAAAAAAAAA".to_string(),
+        generation,
+    };
+    harness
+        .client
+        .put("/e2ee/backup")
+        .header(ContentType::JSON)
+        .header(Header::new("x-session-token", session_token.to_string()))
+        .body(serde_json::to_string(&body).unwrap())
+        .dispatch()
+        .await
+        .status()
+}
+
+#[rocket::async_test]
+async fn backup_roundtrip_and_generation_monotonic() {
+    let harness = TestHarness::new().await;
+    let (account, session, user) = harness.new_user().await;
+    let device = publish_device(&harness, &account.id, &session.token, 2).await;
+
+    // First upload (generation 1) from the device-bound session
+    assert_eq!(
+        put_backup(
+            &harness,
+            &session.token,
+            &device.device_id,
+            backup_header(&user.id, &device.device_id, 1),
+            1,
+        )
+        .await,
+        Status::Ok
+    );
+
+    // A stale-or-equal generation is a no-op that echoes the stored value
+    assert_eq!(
+        put_backup(
+            &harness,
+            &session.token,
+            &device.device_id,
+            backup_header(&user.id, &device.device_id, 1),
+            1,
+        )
+        .await,
+        Status::Ok
+    );
+    assert_eq!(
+        harness
+            .db
+            .fetch_e2ee_backup(&user.id, &device.device_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .generation,
+        1
+    );
+
+    // A strictly greater generation advances the stored blob
+    assert_eq!(
+        put_backup(
+            &harness,
+            &session.token,
+            &device.device_id,
+            backup_header(&user.id, &device.device_id, 2),
+            2,
+        )
+        .await,
+        Status::Ok
+    );
+
+    // GET restore (MFA-gated) returns the blob
+    let ticket = mfa_ticket(&harness, &account.id).await;
+    let response = harness
+        .client
+        .get("/e2ee/backup")
+        .header(Header::new("x-session-token", session.token.clone()))
+        .header(Header::new("X-MFA-Ticket", ticket))
+        .dispatch()
+        .await;
+    assert_eq!(response.status(), Status::Ok);
+    let body: v0::ResponseFetchE2EEBackups = response.into_json().await.unwrap();
+    assert_eq!(body.backups.len(), 1);
+    assert_eq!(body.backups[0].generation, 2);
+    assert_eq!(body.backups[0].device_id, device.device_id);
+}
+
+#[rocket::async_test]
+async fn backup_get_requires_mfa_and_binds_to_user() {
+    let harness = TestHarness::new().await;
+    let (account, session, user) = harness.new_user().await;
+    let device = publish_device(&harness, &account.id, &session.token, 1).await;
+    put_backup(
+        &harness,
+        &session.token,
+        &device.device_id,
+        backup_header(&user.id, &device.device_id, 1),
+        1,
+    )
+    .await;
+
+    // No MFA ticket -> refused
+    let response = harness
+        .client
+        .get("/e2ee/backup")
+        .header(Header::new("x-session-token", session.token.clone()))
+        .dispatch()
+        .await;
+    assert_eq!(response.status(), Status::Unauthorized);
+
+    // A ticket belonging to ANOTHER account is refused (M8)
+    let (other_account, _, _) = harness.new_user().await;
+    let foreign = mfa_ticket(&harness, &other_account.id).await;
+    let response = harness
+        .client
+        .get("/e2ee/backup")
+        .header(Header::new("x-session-token", session.token.clone()))
+        .header(Header::new("X-MFA-Ticket", foreign))
+        .dispatch()
+        .await;
+    assert_eq!(response.status(), Status::Unauthorized);
+}
+
+#[rocket::async_test]
+async fn backup_put_rejects_generation_and_kdf_and_binding_tampering() {
+    let harness = TestHarness::new().await;
+    let (account, session, user) = harness.new_user().await;
+    let device = publish_device(&harness, &account.id, &session.token, 1).await;
+
+    // Body generation disagrees with the header's bound generation (M2)
+    assert_eq!(
+        put_backup(
+            &harness,
+            &session.token,
+            &device.device_id,
+            backup_header(&user.id, &device.device_id, 5),
+            2,
+        )
+        .await,
+        Status::BadRequest
+    );
+
+    // KDF memory cost out of range (M1 DoS guard)
+    let huge = backup_header(&user.id, &device.device_id, 1)
+        .replace("\"m_kib\":262144", "\"m_kib\":4294967295");
+    assert_eq!(
+        put_backup(&harness, &session.token, &device.device_id, huge, 1).await,
+        Status::BadRequest
+    );
+
+    // A generation far beyond the previous value (here: from a floor of 0) is
+    // refused, so a compromised webview cannot poison the stored generation to
+    // a huge value to permanently wedge future PUTs (M2 defence-in-depth).
+    assert_eq!(
+        put_backup(
+            &harness,
+            &session.token,
+            &device.device_id,
+            backup_header(&user.id, &device.device_id, i64::MAX),
+            i64::MAX,
+        )
+        .await,
+        Status::BadRequest
+    );
+
+    // Header bound to a different user than the authenticated session
+    let wrong_user = backup_header("01SOMEONEELSE0000000000000", &device.device_id, 1);
+    assert_eq!(
+        put_backup(&harness, &session.token, &device.device_id, wrong_user, 1).await,
+        Status::BadRequest
+    );
+}
+
+#[rocket::async_test]
+async fn backup_put_requires_a_device_bound_session() {
+    let harness = TestHarness::new().await;
+    let (account, session, user) = harness.new_user().await;
+    let device = publish_device(&harness, &account.id, &session.token, 1).await;
+
+    // A second session of the SAME user that never proved the device is not
+    // bound -> cannot write the device's backup
+    let other = account
+        .create_session(&harness.db, "web".to_string())
+        .await
+        .unwrap();
+    assert_eq!(
+        put_backup(
+            &harness,
+            &other.token,
+            &device.device_id,
+            backup_header(&user.id, &device.device_id, 1),
+            1,
+        )
+        .await,
+        Status::Unauthorized
+    );
+}
+
+#[rocket::async_test]
+async fn backup_survives_device_revocation_but_dies_with_account() {
+    let harness = TestHarness::new().await;
+    let (account, session, mut user) = harness.new_user().await;
+    let device = publish_device(&harness, &account.id, &session.token, 1).await;
+    put_backup(
+        &harness,
+        &session.token,
+        &device.device_id,
+        backup_header(&user.id, &device.device_id, 1),
+        1,
+    )
+    .await;
+
+    // Revoke the device (MFA-gated) — the backup must SURVIVE (a lost device
+    // keeps its recovery path)
+    let ticket = mfa_ticket(&harness, &account.id).await;
+    let response = harness
+        .client
+        .delete(format!("/e2ee/keys/{}", device.device_id))
+        .header(Header::new("x-session-token", session.token.clone()))
+        .header(Header::new("X-MFA-Ticket", ticket))
+        .dispatch()
+        .await;
+    assert_eq!(response.status(), Status::NoContent);
+    assert!(harness
+        .db
+        .fetch_e2ee_backup(&user.id, &device.device_id)
+        .await
+        .unwrap()
+        .is_some());
+
+    // Account deletion cascades the backup away
+    user.delete(&harness.db).await.unwrap();
+    assert!(harness
+        .db
+        .fetch_e2ee_backup(&user.id, &device.device_id)
+        .await
+        .unwrap()
+        .is_none());
+}
+
+#[rocket::async_test]
+async fn backup_delete_requires_mfa_and_scopes_to_user() {
+    let harness = TestHarness::new().await;
+    let (account, session, user) = harness.new_user().await;
+    let device = publish_device(&harness, &account.id, &session.token, 1).await;
+    put_backup(
+        &harness,
+        &session.token,
+        &device.device_id,
+        backup_header(&user.id, &device.device_id, 1),
+        1,
+    )
+    .await;
+
+    // No MFA -> refused
+    let response = harness
+        .client
+        .delete(format!("/e2ee/backup/{}", device.device_id))
+        .header(Header::new("x-session-token", session.token.clone()))
+        .dispatch()
+        .await;
+    assert_eq!(response.status(), Status::Unauthorized);
+    assert!(harness
+        .db
+        .fetch_e2ee_backup(&user.id, &device.device_id)
+        .await
+        .unwrap()
+        .is_some());
+
+    // With a valid own ticket -> deleted
+    let ticket = mfa_ticket(&harness, &account.id).await;
+    let response = harness
+        .client
+        .delete(format!("/e2ee/backup/{}", device.device_id))
+        .header(Header::new("x-session-token", session.token.clone()))
+        .header(Header::new("X-MFA-Ticket", ticket))
+        .dispatch()
+        .await;
+    assert_eq!(response.status(), Status::NoContent);
+    assert!(harness
+        .db
+        .fetch_e2ee_backup(&user.id, &device.device_id)
+        .await
+        .unwrap()
+        .is_none());
+}
+
+#[rocket::async_test]
+async fn replace_one_time_keys_replaces_only_with_a_nonempty_batch() {
+    let harness = TestHarness::new().await;
+    let (account, session, _user) = harness.new_user().await;
+    let device = publish_device(&harness, &account.id, &session.token, 3).await;
+    assert_eq!(
+        harness
+            .db
+            .count_e2ee_one_time_keys(&account.id, &device.device_id)
+            .await
+            .unwrap(),
+        3
+    );
+
+    // replace_one_time_keys with an EMPTY batch must NOT strip keys (L3)
+    let mut bundle = device.bundle(0);
+    bundle.replace_one_time_keys = true;
+    let response = harness
+        .client
+        .put("/e2ee/keys")
+        .header(ContentType::JSON)
+        .header(Header::new("x-session-token", session.token.clone()))
+        .body(serde_json::to_string(&bundle).unwrap())
+        .dispatch()
+        .await;
+    assert_eq!(response.status(), Status::Ok);
+    assert_eq!(
+        harness
+            .db
+            .count_e2ee_one_time_keys(&account.id, &device.device_id)
+            .await
+            .unwrap(),
+        3
+    );
+
+    // With a non-empty batch it replaces: the stored set becomes exactly the
+    // new keys (restore's stale-OTK eviction, section 6.3)
+    let mut bundle = device.bundle(2);
+    bundle.replace_one_time_keys = true;
+    let response = harness
+        .client
+        .put("/e2ee/keys")
+        .header(ContentType::JSON)
+        .header(Header::new("x-session-token", session.token.clone()))
+        .body(serde_json::to_string(&bundle).unwrap())
+        .dispatch()
+        .await;
+    assert_eq!(response.status(), Status::Ok);
+    assert_eq!(
+        harness
+            .db
+            .count_e2ee_one_time_keys(&account.id, &device.device_id)
+            .await
+            .unwrap(),
+        2
+    );
 }

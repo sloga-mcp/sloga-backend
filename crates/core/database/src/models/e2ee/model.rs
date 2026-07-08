@@ -217,6 +217,144 @@ impl E2EEBlob {
     }
 }
 
+/// Maximum decoded ciphertext size of a key-backup blob (design §4.4). Fits
+/// a MongoDB document with comfortable headroom; S3 offload is the escape
+/// hatch if this is ever raised.
+pub const E2EE_MAX_BACKUP_SIZE: usize = 8 * 1024 * 1024;
+
+/// Maximum size of a backup blob header (the plaintext, server-visible AAD).
+pub const E2EE_MAX_BACKUP_HEADER_SIZE: usize = 1024;
+
+/// Accepted Argon2id memory-cost bounds (KiB) for a backup header. The
+/// restoring client runs Argon2id on these params BEFORE the AEAD check, so
+/// an unbounded header is a resource-exhaustion DoS (design §4.1 M1). The
+/// server range-checks as defense in depth; the client clamps authoritatively.
+pub const E2EE_BACKUP_KDF_M_MIN_KIB: u64 = 8 * 1024; // 8 MiB
+pub const E2EE_BACKUP_KDF_M_MAX_KIB: u64 = 512 * 1024; // 512 MiB
+/// Accepted Argon2id time-cost (iterations) bounds.
+pub const E2EE_BACKUP_KDF_T_MIN: u64 = 1;
+pub const E2EE_BACKUP_KDF_T_MAX: u64 = 10;
+/// Accepted Argon2id parallelism bounds.
+pub const E2EE_BACKUP_KDF_P_MIN: u64 = 1;
+pub const E2EE_BACKUP_KDF_P_MAX: u64 = 4;
+
+auto_derived!(
+    /// A key-backup blob for one (user, device) — the recovery-code-encrypted
+    /// identity + history export (slice 5.5, design §4/§5).
+    ///
+    /// The server stores an OPAQUE `header` (plaintext AAD: KDF salt/params +
+    /// user/device/generation binding) and an OPAQUE `ciphertext`
+    /// (XChaCha20-Poly1305 under a key the server never sees). It parses the
+    /// header ONLY to range-check KDF params and to cross-check the
+    /// header-bound `generation` against the row (`validate_header`); it can
+    /// never read the backed-up keys or history. This is the feature's first
+    /// deliberate key-egress artifact; its confidentiality rests entirely on
+    /// the client-side recovery code.
+    pub struct E2EEBackup {
+        /// Composite id: `{user_id}:{device_id}`
+        #[serde(rename = "_id")]
+        pub id: String,
+        /// Owning user (always from the authenticated session)
+        pub user_id: String,
+        /// Device this backup belongs to
+        pub device_id: String,
+        /// Opaque canonical header bytes (JSON): KDF params, salt, nonce,
+        /// user_id, device_id, generation, created_at. AAD of the ciphertext.
+        pub header: String,
+        /// Opaque ciphertext, standard base64 (≤ `E2EE_MAX_BACKUP_SIZE` decoded)
+        pub ciphertext: String,
+        /// Monotonic generation — must strictly increase on every upsert;
+        /// never resets, even across recovery-code rotation (design §4.5).
+        pub generation: i64,
+        /// When this device's backup was first created
+        pub created_at: Timestamp,
+        /// When it was last refreshed
+        pub updated_at: Timestamp,
+    }
+);
+
+impl E2EEBackup {
+    /// Composite row id for a backup
+    pub fn composite_id(user_id: &str, device_id: &str) -> String {
+        format!("{user_id}:{device_id}")
+    }
+
+    /// Parse and validate a backup header for a PUT (design §5, M1 + M2).
+    ///
+    /// Fails closed on: oversized/unparseable header; wrong KDF alg;
+    /// out-of-range KDF params (DoS guard); a header `generation`/`user_id`/
+    /// `device_id` that disagrees with the request. The header's own bound
+    /// copies of user/device/generation must match the authenticated request
+    /// so the two deliberately-duplicated copies (header vs column) can never
+    /// diverge — a compromised webview cannot poison the column while the
+    /// AAD-bound header says otherwise.
+    pub fn validate_header(
+        header: &str,
+        expected_user_id: &str,
+        expected_device_id: &str,
+        body_generation: i64,
+    ) -> Result<()> {
+        if header.len() > E2EE_MAX_BACKUP_HEADER_SIZE {
+            return Err(create_error!(FailedValidation {
+                error: "backup header too large".to_string()
+            }));
+        }
+
+        let parsed: serde_json::Value = serde_json::from_str(header).map_err(|_| {
+            create_error!(FailedValidation {
+                error: "backup header is not valid JSON".to_string()
+            })
+        })?;
+
+        let bad = |what: &str| {
+            create_error!(FailedValidation {
+                error: format!("backup header: {what}")
+            })
+        };
+
+        if parsed.get("v").and_then(|v| v.as_u64()) != Some(1) {
+            return Err(bad("unsupported version"));
+        }
+
+        let kdf = parsed.get("kdf").ok_or_else(|| bad("missing kdf"))?;
+        if kdf.get("alg").and_then(|v| v.as_str()) != Some("argon2id") {
+            return Err(bad("unsupported kdf alg"));
+        }
+
+        let m_kib = kdf.get("m_kib").and_then(|v| v.as_u64());
+        let t = kdf.get("t").and_then(|v| v.as_u64());
+        let p = kdf.get("p").and_then(|v| v.as_u64());
+        match (m_kib, t, p) {
+            (Some(m), Some(t), Some(p))
+                if (E2EE_BACKUP_KDF_M_MIN_KIB..=E2EE_BACKUP_KDF_M_MAX_KIB).contains(&m)
+                    && (E2EE_BACKUP_KDF_T_MIN..=E2EE_BACKUP_KDF_T_MAX).contains(&t)
+                    && (E2EE_BACKUP_KDF_P_MIN..=E2EE_BACKUP_KDF_P_MAX).contains(&p) => {}
+            _ => return Err(bad("kdf params out of range")),
+        }
+
+        // The header's bound copies MUST match the authenticated request
+        if parsed.get("user_id").and_then(|v| v.as_str()) != Some(expected_user_id) {
+            return Err(bad("user_id mismatch"));
+        }
+        if parsed.get("device_id").and_then(|v| v.as_str()) != Some(expected_device_id) {
+            return Err(bad("device_id mismatch"));
+        }
+
+        // M2: header generation must equal the body generation (the two
+        // copies can never diverge). serde_json numbers are i64-representable
+        // here (client emits a small counter).
+        let header_generation = parsed
+            .get("generation")
+            .and_then(|v| v.as_i64())
+            .ok_or_else(|| bad("missing generation"))?;
+        if header_generation != body_generation {
+            return Err(bad("generation mismatch"));
+        }
+
+        Ok(())
+    }
+}
+
 /// Decode an unpadded standard base64 field of an exact byte length
 fn decode_exact(value: &str, length: usize) -> Option<Vec<u8>> {
     STANDARD_NO_PAD

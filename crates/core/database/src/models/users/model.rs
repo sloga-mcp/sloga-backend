@@ -924,6 +924,11 @@ impl User {
             .await;
         }
 
+        // Key backups are NOT removed by device revocation (a lost device
+        // must keep its recovery path), so the account-deletion cascade is
+        // where they die — the ONLY implicit deletion of a backup (design §5).
+        db.delete_all_e2ee_backups(&self.id).await?;
+
         self.mark_deleted(db).await?;
 
         Ok(())

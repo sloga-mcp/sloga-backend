@@ -30,6 +30,13 @@ auto_derived!(
         /// One-time keys to add
         #[serde(default)]
         pub one_time_keys: Vec<E2EESignedKey>,
+        /// Replace ALL of this device's stored one-time keys with the batch
+        /// in this request (key-backup restore, slice 5.5 §6.3). Honored only
+        /// on a device-bound republish AND only with a non-empty batch, so a
+        /// compromised webview cannot strip a live device's keys. Defaults to
+        /// additive replenishment.
+        #[serde(default)]
+        pub replace_one_time_keys: bool,
     }
 
     /// Response to publishing keys
@@ -151,6 +158,70 @@ auto_derived!(
     pub struct ResponseSendE2EEMessages {
         /// One receipt per submitted envelope, in submission order
         pub receipts: Vec<E2EEDeliveryReceipt>,
+    }
+
+    /// Data to upload (upsert) this device's key-backup blob (slice 5.5 §5).
+    pub struct DataPutE2EEBackup {
+        /// Device this backup belongs to (must be a bound device of the
+        /// authenticated session)
+        pub device_id: String,
+        /// Opaque canonical header (KDF params, salt, nonce, user_id,
+        /// device_id, generation, created_at). Server-visible AAD; the server
+        /// parses it ONLY to range-check KDF params and cross-check the
+        /// generation.
+        pub header: String,
+        /// Opaque ciphertext, standard base64 (≤ 8 MiB decoded)
+        pub ciphertext: String,
+        /// Monotonic generation; must strictly exceed the stored generation
+        /// AND equal the header's bound generation.
+        pub generation: i64,
+    }
+
+    /// Response to uploading a key backup
+    pub struct ResponsePutE2EEBackup {
+        /// The generation now stored server-side (echoed for the caller's
+        /// optimistic bookkeeping; a hostile webview can fake this, so it is
+        /// not a durability proof — design §4.5)
+        pub generation: i64,
+    }
+
+    /// One device's key-backup blob returned on the restore path (§5, §6.1)
+    pub struct E2EEBackup {
+        /// Device this backup belongs to
+        pub device_id: String,
+        /// Opaque header (the restoring client derives per-blob from this)
+        pub header: String,
+        /// Opaque ciphertext, standard base64
+        pub ciphertext: String,
+        /// Stored generation
+        pub generation: i64,
+        /// When it was last refreshed (ISO8601)
+        pub updated_at: String,
+    }
+
+    /// Response to fetching key backups (restore): all of the user's device
+    /// blobs; the native layer tries the entered recovery code against each.
+    pub struct ResponseFetchE2EEBackups {
+        /// One entry per device that has a backup (possibly empty)
+        pub backups: Vec<E2EEBackup>,
+    }
+
+    /// Metadata for one device's backup (status card / nag — no key material)
+    pub struct E2EEBackupStatus {
+        /// Device this backup belongs to
+        pub device_id: String,
+        /// Stored generation
+        pub generation: i64,
+        /// When it was last refreshed (ISO8601)
+        pub updated_at: String,
+        /// Approximate ciphertext size in bytes
+        pub size: u64,
+    }
+
+    /// Response to fetching backup status (metadata only)
+    pub struct ResponseE2EEBackupStatus {
+        /// One entry per device that has a backup (possibly empty)
+        pub backups: Vec<E2EEBackupStatus>,
     }
 
     /// An encrypted envelope delivered to a device
