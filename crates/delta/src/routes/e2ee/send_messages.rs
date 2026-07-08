@@ -2,11 +2,9 @@ use std::collections::{HashMap, HashSet};
 
 use iso8601_timestamp::Timestamp;
 use revolt_database::{
-    events::client::EventV1, util::permissions::DatabasePermissionQuery, Database, E2EEEnvelope,
-    Session, User, AMQP, E2EE_PROTOCOL_VERSION,
+    events::client::EventV1, Database, E2EEEnvelope, Session, User, AMQP, E2EE_PROTOCOL_VERSION,
 };
 use revolt_models::v0;
-use revolt_permissions::{calculate_user_permissions, UserPermission};
 use revolt_result::{create_error, Result};
 use rocket::{serde::json::Json, State};
 use ulid::Ulid;
@@ -90,10 +88,11 @@ pub async fn send_messages(
     for recipient_id in &recipient_user_ids {
         let recipient = db.fetch_user(recipient_id).await?;
 
-        let mut query = DatabasePermissionQuery::new(db, &user).user(&recipient);
-        calculate_user_permissions(&mut query)
-            .await
-            .throw_if_lacking_user_permission(UserPermission::SendMessage)?;
+        // Friend-eligible OR shared-group co-member (slice 5). DELIVERY
+        // allows blocked co-members (E2EE must not be weaker OR stronger
+        // than plaintext group behaviour); bundle/device FETCH between
+        // blocked pairs stays refused in fetch_keys/fetch_devices (§2.6).
+        super::require_e2ee_deliver_eligible(db, &user, &recipient).await?;
 
         recipient_users.insert(recipient_id.clone(), recipient);
     }

@@ -1,3 +1,5 @@
+use revolt_database::{Channel, Database, RelationshipStatus, User};
+use revolt_permissions::{calculate_user_permissions, UserPermission};
 use revolt_result::{create_error, Result};
 use revolt_rocket_okapi::revolt_okapi::openapi3::OpenApi;
 use rocket::Route;
@@ -41,6 +43,103 @@ pub async fn require_e2ee_enabled() -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Whether `caller` and `target` share at least one Group channel (both are
+/// current recipients). Group DM E2EE (slice 5): group co-members must be
+/// able to fetch each other's bundles and exchange envelopes even when they
+/// are not friends, mirroring the plaintext group behaviour. Computed
+/// entirely from the SERVER's own channel data — the client names no
+/// channel, so this reveals nothing the server did not already know and adds
+/// nothing to the stored/relayed metadata set.
+pub async fn users_share_group(db: &Database, caller: &str, target: &str) -> Result<bool> {
+    let mut generator = db.find_group_message_channels(caller).await?;
+    while let Some(groups) = generator.next_n(100).await? {
+        for channel in groups {
+            if let Channel::Group { recipients, .. } = channel {
+                if recipients.iter().any(|id| id == caller)
+                    && recipients.iter().any(|id| id == target)
+                {
+                    return Ok(true);
+                }
+            }
+        }
+    }
+    Ok(false)
+}
+
+/// Whether the caller is blocked-paired with the target (either direction).
+fn is_blocked_pair(caller: &User, target: &str) -> bool {
+    matches!(
+        caller.relationship_with(target),
+        RelationshipStatus::Blocked | RelationshipStatus::BlockedOther
+    )
+}
+
+/// The pre-slice-5 friend/mutual-connection DM-eligibility check
+/// (`UserPermission::SendMessage`): friends, or a mutual server/channel.
+async fn friend_or_mutual_eligible(db: &Database, caller: &User, target: &User) -> bool {
+    let mut query = revolt_database::util::permissions::DatabasePermissionQuery::new(db, caller)
+        .user(target);
+    calculate_user_permissions(&mut query)
+        .await
+        .has_user_permission(UserPermission::SendMessage)
+}
+
+/// E2EE bundle/device-FETCH eligibility (slice 5, design §2.6): the caller
+/// may fetch `target`'s bundle/devices iff they share a Group channel AND
+/// are not a blocked pair, OR they are friend/mutual-eligible as before.
+/// Fetching your own material is always allowed (own-device fan-out).
+/// Blocked members of a shared group are refused here so a blocked member
+/// surfaces to the sender as Blocked; the honest resolution is
+/// removal/unblock. (The shared-group check comes first because it is
+/// portable across both DB drivers; the friend/mutual check is only reached
+/// for non-group pairs.)
+pub async fn require_e2ee_fetch_eligible(
+    db: &Database,
+    caller: &User,
+    target: &User,
+) -> Result<()> {
+    if caller.id == target.id {
+        return Ok(());
+    }
+
+    if is_blocked_pair(caller, &target.id) {
+        return Err(create_error!(NotFound));
+    }
+
+    if users_share_group(db, &caller.id, &target.id).await?
+        || friend_or_mutual_eligible(db, caller, target).await
+    {
+        return Ok(());
+    }
+
+    Err(create_error!(NotFound))
+}
+
+/// E2EE envelope-DELIVERY eligibility (slice 5, design §2.6): the caller may
+/// deliver an envelope to `target` iff they share a Group channel OR they
+/// are friend/mutual-eligible. Unlike FETCH, a blocked pair inside a shared
+/// group may still exchange envelopes — E2EE delivery must be neither weaker
+/// nor stronger than the plaintext group behaviour (blocked members already
+/// see each other's plaintext group messages). The shared-group check comes
+/// first (portable across drivers).
+pub async fn require_e2ee_deliver_eligible(
+    db: &Database,
+    caller: &User,
+    target: &User,
+) -> Result<()> {
+    if caller.id == target.id {
+        return Ok(());
+    }
+
+    if users_share_group(db, &caller.id, &target.id).await?
+        || friend_or_mutual_eligible(db, caller, target).await
+    {
+        return Ok(());
+    }
+
+    Err(create_error!(NotFound))
 }
 
 pub fn routes() -> (Vec<Route>, OpenApi) {

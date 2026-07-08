@@ -300,6 +300,160 @@ async fn blocked_user_cannot_fetch_keys_or_devices() {
     assert_ne!(response.status(), Status::Ok);
 }
 
+/// Create a Group channel owned by `owner` also containing `member` (no
+/// friendship — exercises the shared-group eligibility path).
+async fn make_group(harness: &TestHarness, owner: &User, member: &User) -> String {
+    let channel = revolt_database::Channel::create_group(
+        &harness.db,
+        v0::DataCreateGroup {
+            name: "g".to_string(),
+            description: None,
+            icon: None,
+            users: std::iter::once(member.id.clone()).collect(),
+            nsfw: None,
+        },
+        owner.id.clone(),
+    )
+    .await
+    .expect("create group");
+    channel.id().to_string()
+}
+
+#[rocket::async_test]
+async fn group_comembers_can_fetch_and_send_without_friendship() {
+    let harness = TestHarness::new().await;
+    let (account_a, session_a, user_a) = harness.new_user().await;
+    let (account_b, session_b, user_b) = harness.new_user().await;
+
+    // NOT friends — only a shared group
+    make_group(&harness, &user_a, &user_b).await;
+
+    let device_a = publish_device(&harness, &account_a.id, &session_a.token, 1).await;
+    let device_b = publish_device(&harness, &account_b.id, &session_b.token, 1).await;
+
+    // A can fetch B's bundle (shared-group co-member)
+    let response = TestHarness::with_session(
+        session_a.clone(),
+        harness.client.get(format!("/e2ee/keys/{}", user_b.id)),
+    )
+    .await;
+    assert_eq!(response.status(), Status::Ok);
+
+    // A can fetch B's device listing
+    let response = TestHarness::with_session(
+        session_a.clone(),
+        harness.client.get(format!("/e2ee/devices/{}", user_b.id)),
+    )
+    .await;
+    assert_eq!(response.status(), Status::Ok);
+
+    // A can deliver an envelope to B
+    let body = v0::DataSendE2EEMessages {
+        device_id: device_a.device_id.clone(),
+        protocol_version: E2EE_PROTOCOL_VERSION,
+        envelopes: vec![v0::DataE2EEEnvelope {
+            recipient_user_id: user_b.id.clone(),
+            recipient_device_id: device_b.device_id.clone(),
+            sequence: 1,
+            ciphertext: STANDARD_NO_PAD.encode(b"group"),
+        }],
+    };
+    let response = TestHarness::with_session(
+        session_a,
+        harness
+            .client
+            .post("/e2ee/messages")
+            .header(ContentType::JSON)
+            .body(serde_json::to_string(&body).unwrap()),
+    )
+    .await;
+    assert_eq!(response.status(), Status::Ok);
+    let result: v0::ResponseSendE2EEMessages = response.into_json().await.unwrap();
+    assert!(matches!(
+        result.receipts[0].status,
+        v0::E2EEDeliveryStatus::Queued { .. }
+    ));
+}
+
+#[rocket::async_test]
+async fn non_member_stranger_is_refused() {
+    let harness = TestHarness::new().await;
+    let (account_a, session_a, user_a) = harness.new_user().await;
+    let (account_b, session_b, user_b) = harness.new_user().await;
+
+    // No friendship, no shared group. (The REFERENCE driver's
+    // has_mutual_connection is unimplemented, so the friend/mutual fallback
+    // 500s here where MongoDB cleanly returns NotFound — both are refusals,
+    // asserted as "not Ok". The friend/group positive paths are covered by
+    // the other tests, which never reach the mutual fallback.)
+    publish_device(&harness, &account_a.id, &session_a.token, 1).await;
+    publish_device(&harness, &account_b.id, &session_b.token, 1).await;
+
+    let response = TestHarness::with_session(
+        session_a,
+        harness.client.get(format!("/e2ee/keys/{}", user_b.id)),
+    )
+    .await;
+    assert_ne!(response.status(), Status::Ok);
+    let _ = user_a;
+}
+
+#[rocket::async_test]
+async fn blocked_pair_in_a_group_can_deliver_but_not_fetch() {
+    let harness = TestHarness::new().await;
+    let (account_a, session_a, user_a) = harness.new_user().await;
+    let (account_b, session_b, user_b) = harness.new_user().await;
+
+    make_group(&harness, &user_a, &user_b).await;
+    let device_a = publish_device(&harness, &account_a.id, &session_a.token, 1).await;
+    let device_b = publish_device(&harness, &account_b.id, &session_b.token, 1).await;
+
+    // A blocks B
+    let response = TestHarness::with_session(
+        session_a.clone(),
+        harness.client.put(format!("/users/{}/block", user_b.id)),
+    )
+    .await;
+    assert_eq!(response.status(), Status::Ok);
+
+    // FETCH between the blocked pair is refused even though they share a
+    // group (design §2.6) — the blocked member surfaces as Blocked
+    let response = TestHarness::with_session(
+        session_b.clone(),
+        harness.client.get(format!("/e2ee/keys/{}", user_a.id)),
+    )
+    .await;
+    assert_ne!(response.status(), Status::Ok);
+
+    // DELIVERY still works (E2EE must not be weaker OR stronger than
+    // plaintext group behaviour — blocked co-members see plaintext today)
+    let body = v0::DataSendE2EEMessages {
+        device_id: device_b.device_id.clone(),
+        protocol_version: E2EE_PROTOCOL_VERSION,
+        envelopes: vec![v0::DataE2EEEnvelope {
+            recipient_user_id: user_a.id.clone(),
+            recipient_device_id: device_a.device_id.clone(),
+            sequence: 1,
+            ciphertext: STANDARD_NO_PAD.encode(b"still-delivers"),
+        }],
+    };
+    let response = TestHarness::with_session(
+        session_b,
+        harness
+            .client
+            .post("/e2ee/messages")
+            .header(ContentType::JSON)
+            .body(serde_json::to_string(&body).unwrap()),
+    )
+    .await;
+    assert_eq!(response.status(), Status::Ok);
+    let result: v0::ResponseSendE2EEMessages = response.into_json().await.unwrap();
+    assert!(matches!(
+        result.receipts[0].status,
+        v0::E2EEDeliveryStatus::Queued { .. }
+    ));
+}
+
 #[rocket::async_test]
 async fn send_stamps_sender_and_reports_per_device_status() {
     let harness = TestHarness::new().await;

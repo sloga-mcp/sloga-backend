@@ -1,9 +1,5 @@
-use revolt_database::{
-    util::{permissions::DatabasePermissionQuery, reference::Reference},
-    Database, E2EEIdentity, Session, User,
-};
+use revolt_database::{util::reference::Reference, Database, E2EEIdentity, Session, User};
 use revolt_models::v0;
-use revolt_permissions::{calculate_user_permissions, UserPermission};
 use revolt_result::{create_error, Result};
 use rocket::{serde::json::Json, State};
 
@@ -41,10 +37,9 @@ pub async fn fetch_devices(
     if !own {
         E2EEIdentity::require_device_bound_session(db, &user.id, &session.id).await?;
 
-        let mut query = DatabasePermissionQuery::new(db, &user).user(&target);
-        calculate_user_permissions(&mut query)
-            .await
-            .throw_if_lacking_user_permission(UserPermission::SendMessage)?;
+        // Friend-eligible OR shared-group co-member; blocked pairs refused
+        // on the FETCH path even inside a shared group (design §2.6)
+        super::require_e2ee_fetch_eligible(db, &user, &target).await?;
     }
 
     let mut devices = vec![];
