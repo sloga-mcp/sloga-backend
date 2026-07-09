@@ -100,7 +100,10 @@ pub async fn create_event(
 /// # List Events
 ///
 /// List events in a server whose series overlaps the `[from, to]` window (ms epoch).
-/// Events whose channel the caller cannot view are filtered out.
+/// Events whose channel the caller cannot view are filtered out. Each returned series
+/// carries its per-occurrence starts within the window (expanded by the server's single
+/// DST-aware engine) so the client renders one grid entry per occurrence without
+/// re-implementing recurrence math.
 #[openapi(tag = "Calendar")]
 #[get("/server/<server>?<from>&<to>")]
 pub async fn list_events(
@@ -109,7 +112,7 @@ pub async fn list_events(
     server: Reference<'_>,
     from: i64,
     to: i64,
-) -> Result<Json<Vec<v0::Event>>> {
+) -> Result<Json<Vec<v0::EventWithOccurrences>>> {
     super::require_events_enabled().await?;
 
     let server = server.as_server(db).await?;
@@ -137,11 +140,16 @@ pub async fn list_events(
         if super::authorize_view(db, &user, &event).await.is_err() {
             continue;
         }
-        // Drop series with no real occurrence in the window (e.g. all excepted).
-        if occurrences_in_window(&event, from, to).is_empty() {
+        // Expand occurrences once: drop series with none in the window (e.g. all excepted)
+        // and return the same array to the client (0.1-A — no client-side recurrence math).
+        let occurrences = occurrences_in_window(&event, from, to);
+        if occurrences.is_empty() {
             continue;
         }
-        out.push(super::event_to_wire(event));
+        out.push(v0::EventWithOccurrences {
+            event: super::event_to_wire(event),
+            occurrences,
+        });
         if out.len() >= MAX_EVENTS {
             break;
         }

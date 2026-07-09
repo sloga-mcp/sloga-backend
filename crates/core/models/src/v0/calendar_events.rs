@@ -134,6 +134,18 @@ auto_derived!(
         pub counts: AttendeeCounts,
     }
 
+    /// An event series plus its occurrence-start instants within the queried window.
+    ///
+    /// The list route expands recurrence server-side (the single DST-aware engine) and
+    /// returns the per-occurrence starts (ms epoch, UTC), so the client renders one grid
+    /// entry per occurrence without re-implementing recurrence math.
+    pub struct EventWithOccurrences {
+        /// The event series
+        pub event: Event,
+        /// Occurrence-start instants (ms epoch, UTC) overlapping the window, exceptions removed
+        pub occurrences: Vec<i64>,
+    }
+
     /// Optional event fields that a PATCH may unset
     pub enum FieldsEvent {
         Channel,

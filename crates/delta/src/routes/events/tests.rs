@@ -464,17 +464,22 @@ async fn channel_scoped_event_hidden_from_non_viewer() {
         server.id
     );
 
-    // Owner (can view) sees the event.
+    // Owner (can view) sees the event, with its occurrence expanded in-window (0.1-A).
     let owner_list = harness
         .client
         .get(&list_url)
         .header(Header::new("x-session-token", owner_session.token.to_string()))
         .dispatch()
         .await
-        .into_json::<Vec<v0::Event>>()
+        .into_json::<Vec<v0::EventWithOccurrences>>()
         .await
         .expect("owner list");
     assert_eq!(owner_list.len(), 1);
+    assert_eq!(
+        owner_list[0].occurrences,
+        vec![1_900_000_000_000_i64],
+        "the list must carry the series' in-window occurrence starts"
+    );
 
     // Guest (cannot view the channel) does NOT see the event (finding C1).
     let guest_list = harness
@@ -483,7 +488,7 @@ async fn channel_scoped_event_hidden_from_non_viewer() {
         .header(Header::new("x-session-token", guest_session.token.to_string()))
         .dispatch()
         .await
-        .into_json::<Vec<v0::Event>>()
+        .into_json::<Vec<v0::EventWithOccurrences>>()
         .await
         .expect("guest list");
     assert!(

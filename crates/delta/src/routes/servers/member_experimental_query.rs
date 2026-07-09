@@ -62,15 +62,16 @@ pub async fn member_experimental_query(
     members.sort_by(|a, b| a.id.user.cmp(&b.id.user));
     users.sort_by(|a, b| a.id.cmp(&b.id));
 
-    // Filter all matches
+    // Filter all matches (case-insensitive: "simtendo" must find "Simtendo")
+    let needle = options.query.to_lowercase();
     let mut zipped_vec: Vec<(Member, User)> = members
         .into_iter()
         .zip(users)
         .filter(|(member, user)| {
             if let Some(nickname) = &member.nickname {
-                nickname.contains(&options.query)
+                nickname.to_lowercase().contains(&needle)
             } else {
-                user.username.contains(&options.query)
+                user.username.to_lowercase().contains(&needle)
             }
         })
         .collect();
