@@ -24,6 +24,7 @@ pub struct AMQP {
     mass_mention_message_sent: Arc<Channel>,
     ack_notification_message: Arc<Channel>,
     dm_call_updated: Arc<Channel>,
+    calendar_event: Arc<Channel>,
     process_ack: Arc<Channel>,
     #[allow(unused)]
     connection: Arc<Connection>,
@@ -39,6 +40,7 @@ impl AMQP {
             mass_mention_message_sent: Self::create_channel(&connection).await,
             ack_notification_message: Self::create_channel(&connection).await,
             dm_call_updated: Self::create_channel(&connection).await,
+            calendar_event: Self::create_channel(&connection).await,
             process_ack: Self::create_channel(&connection).await,
             connection,
         }
@@ -335,6 +337,39 @@ impl AMQP {
                 config.pushd.get_dm_call_routing_key().into(),
                 BasicPublishOptions::default(),
                 payload.as_bytes(),
+                AMQPProperties::default()
+                    .with_content_type("application/json".into())
+                    .with_delivery_mode(2),
+            )
+            .await?;
+
+        Ok(())
+    }
+
+    /// # Calendar event notification
+    /// Enqueue a single per-recipient calendar-event push (invite / cancel / reminder).
+    /// One message per recipient — pushd fans it out to that user's subscribed sessions.
+    /// Delivery is intentionally offline-agnostic (reminders/cancels must reach devices
+    /// that are not connected), so there is no online filtering here (design §9).
+    pub async fn calendar_event_notify(
+        &self,
+        payload: &CalendarEventPayload,
+    ) -> Result<(), AMQPError> {
+        let config = revolt_config::config().await;
+        let body = to_string(payload).unwrap();
+
+        debug!(
+            "Sending calendar event payload on channel {}: {}",
+            config.pushd.get_calendar_event_routing_key(),
+            body
+        );
+
+        self.calendar_event
+            .basic_publish(
+                config.pushd.exchange.clone().into(),
+                config.pushd.get_calendar_event_routing_key().into(),
+                BasicPublishOptions::default(),
+                body.as_bytes(),
                 AMQPProperties::default()
                     .with_content_type("application/json".into())
                     .with_delivery_mode(2),

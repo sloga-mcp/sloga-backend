@@ -54,6 +54,13 @@ pub enum NotificationData {
         ended: bool,
         duration: usize,
     },
+    CalendarEvent {
+        event_id: String,
+        server_id: String,
+        title: String,
+        kind: String,
+        occurrence_start: Option<i64>,
+    },
 }
 
 impl NotificationData {
@@ -64,6 +71,7 @@ impl NotificationData {
             NotificationData::Generic { .. } => "push.generic",
             NotificationData::Message { .. } => "push.message",
             NotificationData::DmCallStartEnd { .. } => "push.dm.call",
+            NotificationData::CalendarEvent { .. } => "push.calendar",
         }
     }
 
@@ -119,6 +127,25 @@ impl NotificationData {
                 // FCM requires all data values to be strings (400 otherwise)
                 data.insert("ended".to_string(), Value::String(ended.to_string()));
                 data.insert("duration".to_string(), Value::String(duration.to_string()));
+            }
+            NotificationData::CalendarEvent {
+                event_id,
+                server_id,
+                title,
+                kind,
+                occurrence_start,
+            } => {
+                data.insert("event_id".to_string(), Value::String(event_id));
+                data.insert("server_id".to_string(), Value::String(server_id));
+                data.insert("title".to_string(), Value::String(title));
+                data.insert("kind".to_string(), Value::String(kind));
+                // FCM requires all data values to be strings (400 otherwise)
+                if let Some(occurrence_start) = occurrence_start {
+                    data.insert(
+                        "occurrence_start".to_string(),
+                        Value::String(occurrence_start.to_string()),
+                    );
+                }
             }
         }
 
@@ -270,6 +297,25 @@ impl Consumer for FcmOutboundConsumer {
                     started_at: alert.started_at.unwrap_or_else(|| "".to_string()),
                     ended: alert.ended,
                     duration: config().await.api.livekit.call_ring_duration,
+                };
+
+                let msg = Message {
+                    token: Some(payload.token),
+                    data: Some(data.into_payload()),
+                    android: high_priority(),
+                    ..Default::default()
+                };
+
+                resp = self.client.send(&msg).await;
+            }
+
+            PayloadKind::CalendarEvent(alert) => {
+                let data = NotificationData::CalendarEvent {
+                    event_id: alert.event_id,
+                    server_id: alert.server_id,
+                    title: alert.title,
+                    kind: alert.kind.as_str().to_string(),
+                    occurrence_start: alert.occurrence_start,
                 };
 
                 let msg = Message {

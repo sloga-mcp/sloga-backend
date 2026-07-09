@@ -1,5 +1,6 @@
 pub mod delete_accounts;
 pub mod acks;
+pub mod event_reminders;
 pub mod file_deletion;
 pub mod prune_dangling_files;
 pub mod prune_e2ee_blobs;

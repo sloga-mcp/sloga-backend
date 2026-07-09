@@ -16,8 +16,8 @@ mod consumers;
 mod utils;
 use consumers::{
     inbound::{
-        ack::AckConsumer, dm_call::DmCallConsumer, fr_accepted::FRAcceptedConsumer,
-        fr_received::FRReceivedConsumer, generic::GenericConsumer,
+        ack::AckConsumer, calendar_event::CalendarEventConsumer, dm_call::DmCallConsumer,
+        fr_accepted::FRAcceptedConsumer, fr_received::FRReceivedConsumer, generic::GenericConsumer,
         mass_mention::MassMessageConsumer, message::MessageConsumer,
     },
     outbound::{apn::ApnsOutboundConsumer, fcm::FcmOutboundConsumer, vapid::VapidOutboundConsumer},
@@ -128,6 +128,18 @@ async fn main() {
             &config,
             &config.pushd.dm_call_queue,
             &config.pushd.get_dm_call_routing_key(),
+            None,
+        )
+        .await,
+    );
+
+    channels.push(
+        make_queue_and_consume::<CalendarEventConsumer>(
+            &db,
+            &connection,
+            &config,
+            &config.pushd.calendar_event_queue,
+            &config.pushd.get_calendar_event_routing_key(),
             None,
         )
         .await,

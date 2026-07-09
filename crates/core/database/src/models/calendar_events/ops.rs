@@ -1,6 +1,8 @@
 use revolt_result::Result;
 
-use crate::{CalendarEvent, EventRsvp, FieldsCalendarEvent, PartialCalendarEvent};
+use crate::{
+    CalendarEvent, EventRsvp, FieldsCalendarEvent, PartialCalendarEvent, ReminderSentKey,
+};
 
 #[cfg(feature = "mongodb")]
 mod mongodb;
@@ -58,4 +60,22 @@ pub trait AbstractCalendarEvents: Sync + Send {
 
     /// Delete every RSVP row for an event (cascade on event delete)
     async fn delete_rsvps_for_event(&self, event_id: &str) -> Result<()>;
+
+    /// Fetch non-cancelled events across all servers that the reminder scan must
+    /// consider: `start <= start_max AND series_end >= series_end_min`. The caller
+    /// (crond) expands occurrences and filters precisely (design §9).
+    async fn fetch_events_in_reminder_window(
+        &self,
+        start_max: i64,
+        series_end_min: i64,
+    ) -> Result<Vec<CalendarEvent>>;
+
+    /// Record that a reminder was sent for `(event, user, occurrence, offset)` only if
+    /// no marker exists yet. Returns true when newly marked — the caller sends the push
+    /// exactly then (mark-then-send idempotency, design §9, finding H3).
+    async fn mark_reminder_sent_if_absent(&self, key: &ReminderSentKey) -> Result<bool>;
+
+    /// Delete reminder markers for occurrences strictly before `occurrence_before`
+    /// (retention sweep). Returns the number removed.
+    async fn delete_reminders_sent_before(&self, occurrence_before: i64) -> Result<usize>;
 }

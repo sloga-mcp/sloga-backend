@@ -3,12 +3,16 @@ use futures::StreamExt;
 use revolt_result::Result;
 
 use crate::MongoDb;
-use crate::{CalendarEvent, EventRsvp, FieldsCalendarEvent, IntoDocumentPath, PartialCalendarEvent};
+use crate::{
+    CalendarEvent, EventRsvp, FieldsCalendarEvent, IntoDocumentPath, PartialCalendarEvent,
+    ReminderSent, ReminderSentKey,
+};
 
 use super::AbstractCalendarEvents;
 
 static COL_EVENTS: &str = "calendar_events";
 static COL_RSVPS: &str = "event_rsvps";
+static COL_REMINDERS: &str = "event_reminders_sent";
 
 #[async_trait]
 impl AbstractCalendarEvents for MongoDb {
@@ -208,6 +212,72 @@ impl AbstractCalendarEvents for MongoDb {
             .await
             .map(|_| ())
             .map_err(|_| create_database_error!("delete_many", COL_RSVPS))
+    }
+
+    async fn fetch_events_in_reminder_window(
+        &self,
+        start_max: i64,
+        series_end_min: i64,
+    ) -> Result<Vec<CalendarEvent>> {
+        Ok(self
+            .col::<CalendarEvent>(COL_EVENTS)
+            .find(doc! {
+                "cancelled": { "$ne": true },
+                "start": { "$lte": start_max },
+                "series_end": { "$gte": series_end_min },
+            })
+            .await
+            .map_err(|_| create_database_error!("find", COL_EVENTS))?
+            .filter_map(|s| async {
+                if cfg!(debug_assertions) {
+                    Some(s.unwrap())
+                } else {
+                    s.ok()
+                }
+            })
+            .collect()
+            .await)
+    }
+
+    async fn mark_reminder_sent_if_absent(&self, key: &ReminderSentKey) -> Result<bool> {
+        // Atomic insert-if-absent on the composite (event, user, occurrence, offset) key,
+        // mirroring `insert_rsvp_if_absent`: the `_id` sub-fields are seeded from the
+        // filter equalities on insert, so only `sent_at` goes in `$setOnInsert`.
+        let marker = ReminderSent {
+            id: key.clone(),
+            sent_at: super::super::model::now_ms(),
+        };
+        let mut on_insert =
+            to_document(&marker).map_err(|_| create_database_error!("serialize", COL_REMINDERS))?;
+        on_insert.remove("_id");
+
+        let result = self
+            .col::<Document>(COL_REMINDERS)
+            .update_one(
+                doc! {
+                    "_id.event": &key.event,
+                    "_id.user": &key.user,
+                    "_id.occurrence": key.occurrence,
+                    "_id.offset": key.offset,
+                },
+                doc! { "$setOnInsert": on_insert },
+            )
+            .upsert(true)
+            .await
+            .map_err(|_| create_database_error!("update_one", COL_REMINDERS))?;
+
+        Ok(result.upserted_id.is_some())
+    }
+
+    async fn delete_reminders_sent_before(&self, occurrence_before: i64) -> Result<usize> {
+        let result = self
+            .col::<Document>(COL_REMINDERS)
+            .delete_many(doc! {
+                "_id.occurrence": { "$lt": occurrence_before },
+            })
+            .await
+            .map_err(|_| create_database_error!("delete_many", COL_REMINDERS))?;
+        Ok(result.deleted_count as usize)
     }
 }
 

@@ -51,6 +51,71 @@ pub struct InternalDmCallPayload {
     pub recipients: Option<Vec<String>>,
 }
 
+/// Which calendar-event moment a notification is about (design §9).
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
+#[serde(rename_all = "snake_case")]
+pub enum CalendarEventNotification {
+    /// A user was invited to an event
+    Invited,
+    /// An event the user is Going to was cancelled
+    Cancelled,
+    /// Reminder that an occurrence is starting soon / now
+    Reminder,
+}
+
+impl CalendarEventNotification {
+    /// Stable client-facing discriminator carried in the push data payload.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            CalendarEventNotification::Invited => "invited",
+            CalendarEventNotification::Cancelled => "cancelled",
+            CalendarEventNotification::Reminder => "reminder",
+        }
+    }
+}
+
+/// A per-recipient calendar-event push. Carries only ids + the event title the
+/// recipient already saw when invited/RSVPing — never channel contents — so it is
+/// safe to deliver to a `Going` attendee who has since lost `ViewChannel`
+/// (design §8/§9: pushd is authoritative for `Going` rows, keyed by user id).
+#[derive(Serialize, Deserialize, Clone)]
+pub struct CalendarEventPayload {
+    /// Recipient user id
+    pub user: String,
+    /// Event id (for client deep-linking)
+    pub event_id: String,
+    /// Owning server id
+    pub server_id: String,
+    /// Event title
+    pub title: String,
+    /// What happened
+    pub kind: CalendarEventNotification,
+    /// For `Reminder`: the specific occurrence start (ms epoch); absent otherwise
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub occurrence_start: Option<i64>,
+}
+
+impl CalendarEventPayload {
+    /// Fallback `(title, body)` text for platforms that render server-side (APN/VAPID).
+    /// Rich clients instead route on the structured `kind`/`event_id` in the data payload.
+    pub fn render(&self) -> (String, String) {
+        match self.kind {
+            CalendarEventNotification::Invited => (
+                "Event invitation".to_string(),
+                format!("You're invited to {}", self.title),
+            ),
+            CalendarEventNotification::Cancelled => (
+                "Event cancelled".to_string(),
+                format!("{} was cancelled", self.title),
+            ),
+            CalendarEventNotification::Reminder => (
+                "Upcoming event".to_string(),
+                format!("{} is starting soon", self.title),
+            ),
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "type", content = "data")]
 #[allow(clippy::large_enum_variant)]
@@ -61,6 +126,7 @@ pub enum PayloadKind {
     BadgeUpdate(usize),
     Generic(GenericPayload),
     DmCallStartEnd(DmCallPayload),
+    CalendarEvent(CalendarEventPayload),
 }
 
 #[derive(Serialize, Deserialize)]

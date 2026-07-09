@@ -308,6 +308,84 @@ async fn reinvite_is_noop() {
     ));
 }
 
+/// Finding H6: soft-cancel must retain the `Going` RSVP rows so the cancel-notify
+/// list is intact (pushd delivers the cancel to those attendees by user id). After a
+/// cancel, an attendee who accepted is still counted `Going`.
+#[rocket::async_test]
+async fn cancel_retains_going_rows_for_notify() {
+    let harness = TestHarness::new().await;
+    let (_, owner_session, owner) = harness.new_user().await;
+    let (_, guest_session, guest) = harness.new_user().await;
+    let server = make_server(&harness, &owner).await;
+    Member::create(&harness.db, &server, &guest, None)
+        .await
+        .expect("guest member");
+
+    let event = harness
+        .client
+        .post(format!("/events/server/{}", server.id))
+        .header(Header::new("x-session-token", owner_session.token.to_string()))
+        .header(ContentType::JSON)
+        .body(json!({ "title": "Offsite", "start": 1_900_000_000_000_i64, "timezone": "UTC" }).to_string())
+        .dispatch()
+        .await
+        .into_json::<v0::Event>()
+        .await
+        .expect("event");
+
+    // Invite + accept so there is a Going attendee to notify.
+    harness
+        .client
+        .post(format!("/events/event/{}/invites", event.id))
+        .header(Header::new("x-session-token", owner_session.token.to_string()))
+        .header(ContentType::JSON)
+        .body(json!({ "users": [guest.id] }).to_string())
+        .dispatch()
+        .await;
+    harness
+        .client
+        .put(format!("/events/event/{}/rsvp", event.id))
+        .header(Header::new("x-session-token", guest_session.token.to_string()))
+        .header(ContentType::JSON)
+        .body(json!({ "status": "Going" }).to_string())
+        .dispatch()
+        .await;
+
+    // Cancel.
+    let response = harness
+        .client
+        .delete(format!("/events/event/{}", event.id))
+        .header(Header::new("x-session-token", owner_session.token.to_string()))
+        .dispatch()
+        .await;
+    assert_eq!(response.status(), Status::NoContent);
+
+    // The Going row survived the soft-cancel: the notify-list was never destroyed.
+    let attendees = harness
+        .client
+        .get(format!("/events/event/{}/attendees", event.id))
+        .header(Header::new("x-session-token", owner_session.token.to_string()))
+        .dispatch()
+        .await
+        .into_json::<v0::AttendeesResponse>()
+        .await
+        .expect("attendees");
+    assert_eq!(attendees.attendees.len(), 1);
+    assert!(matches!(
+        attendees.attendees[0].status,
+        v0::RsvpStatus::Going
+    ));
+
+    // A second cancel is an idempotent no-op (it must not re-run the notify fan-out).
+    let response = harness
+        .client
+        .delete(format!("/events/event/{}", event.id))
+        .header(Header::new("x-session-token", owner_session.token.to_string()))
+        .dispatch()
+        .await;
+    assert_eq!(response.status(), Status::NoContent);
+}
+
 /// Finding C1: an event scoped to a channel the caller cannot view must be invisible
 /// to them in the list, and inviting such a member must be skipped.
 #[rocket::async_test]

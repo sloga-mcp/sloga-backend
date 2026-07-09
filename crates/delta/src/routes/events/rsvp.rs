@@ -1,6 +1,9 @@
 use revolt_database::{
-    events::client::EventV1, util::permissions::DatabasePermissionQuery, util::reference::Reference,
-    Database, EventRsvp, User,
+    events::client::EventV1,
+    events::rabbit::{CalendarEventNotification, CalendarEventPayload},
+    util::permissions::DatabasePermissionQuery,
+    util::reference::Reference,
+    Database, EventRsvp, User, AMQP,
 };
 use revolt_models::v0;
 use revolt_permissions::{calculate_channel_permissions, ChannelPermission};
@@ -21,6 +24,7 @@ const MAX_ATTENDEES_PAGE: usize = 100;
 #[post("/event/<target>/invites", data = "<data>")]
 pub async fn invite_to_event(
     db: &State<Database>,
+    amqp: &State<AMQP>,
     user: User,
     target: Reference<'_>,
     data: Json<v0::DataInviteToEvent>,
@@ -72,6 +76,19 @@ pub async fn invite_to_event(
             }
             .private(uid.clone())
             .await;
+
+            // Push the invite (offline-agnostic); best-effort — a push failure must not
+            // fail the invite. The invitee just passed the ViewChannel gate above.
+            amqp.calendar_event_notify(&CalendarEventPayload {
+                user: uid.clone(),
+                event_id: event.id.clone(),
+                server_id: event.server.clone(),
+                title: event.title.clone(),
+                kind: CalendarEventNotification::Invited,
+                occurrence_start: None,
+            })
+            .await
+            .ok();
         }
     }
 

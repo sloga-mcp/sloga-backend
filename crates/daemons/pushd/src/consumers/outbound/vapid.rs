@@ -138,6 +138,17 @@ impl Consumer for VapidOutboundConsumer {
 
                 serde_json::to_string(&body)?
             }
+            PayloadKind::CalendarEvent(alert) => {
+                let (title, body) = alert.render();
+                serde_json::to_string(&serde_json::json!({
+                    "title": title,
+                    "body": body,
+                    "event_id": alert.event_id,
+                    "server_id": alert.server_id,
+                    "kind": alert.kind.as_str(),
+                    "occurrence_start": alert.occurrence_start,
+                }))?
+            }
             PayloadKind::BadgeUpdate(_) => {
                 bail!("Vapid cannot handle badge updates and they should not be sent here.");
             }

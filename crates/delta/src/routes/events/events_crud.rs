@@ -1,7 +1,10 @@
 use revolt_database::{
-    events::client::EventV1, occurrences_in_window, util::permissions::DatabasePermissionQuery,
-    util::reference::Reference, CalendarEvent, Database, FieldsCalendarEvent, PartialCalendarEvent,
-    User,
+    events::client::EventV1,
+    events::rabbit::{CalendarEventNotification, CalendarEventPayload},
+    occurrences_in_window,
+    util::permissions::DatabasePermissionQuery,
+    util::reference::Reference,
+    CalendarEvent, Database, FieldsCalendarEvent, PartialCalendarEvent, RsvpStatus, User, AMQP,
 };
 use revolt_models::v0;
 use revolt_permissions::{calculate_channel_permissions, ChannelPermission};
@@ -237,29 +240,64 @@ pub async fn edit_event(
 #[delete("/event/<target>")]
 pub async fn cancel_event(
     db: &State<Database>,
+    amqp: &State<AMQP>,
     user: User,
     target: Reference<'_>,
 ) -> Result<EmptyResponse> {
     super::require_events_enabled().await?;
 
-    let event = db.fetch_event(target.id).await?;
+    let mut event = db.fetch_event(target.id).await?;
     super::authorize_manage(db, &user, &event).await?;
+
+    // Idempotent: a re-issued DELETE on an already-cancelled event is a no-op. Without
+    // this, each retry/double-cancel would re-notify every attendee (cancel is terminal,
+    // design §7); the cancel path has no per-send marker like reminders do.
+    if event.cancelled {
+        return Ok(EmptyResponse);
+    }
 
     let partial = PartialCalendarEvent {
         cancelled: Some(true),
         ..Default::default()
     };
     db.update_event(&event.id, &partial, vec![]).await?;
+    event.cancelled = true;
 
     // Reflect the soft-cancel in the fan-out payload so clients mark it cancelled.
-    let mut event = event;
-    event.cancelled = true;
     let topic = super::event_topic(&event);
     EventV1::CalendarEventUpdate {
-        event: super::event_to_wire(event),
+        event: super::event_to_wire(event.clone()),
     }
     .p(topic)
     .await;
+
+    // Notify Going attendees AFTER the cancel commits (finding H6). The soft-cancel keeps
+    // the RSVP rows, so the notify-list is intact when gathered here — and notifying only
+    // after a successful write avoids announcing a cancellation that did not persist.
+    // Delivery is by user id (pushd is authoritative for Going rows), so an attendee who
+    // lost ViewChannel — and is thus off the channel WS topic above — is still told;
+    // a user who fully left / was banned is filtered out (their Going row is stale).
+    if let Ok(rsvps) = db.fetch_rsvps_for_event(&event.id).await {
+        for rsvp in rsvps {
+            if !matches!(rsvp.status, RsvpStatus::Going) {
+                continue;
+            }
+            if db.fetch_member(&event.server, &rsvp.id.user).await.is_err() {
+                continue;
+            }
+            // Best-effort: a push failure must not fail the cancel.
+            amqp.calendar_event_notify(&CalendarEventPayload {
+                user: rsvp.id.user,
+                event_id: event.id.clone(),
+                server_id: event.server.clone(),
+                title: event.title.clone(),
+                kind: CalendarEventNotification::Cancelled,
+                occurrence_start: None,
+            })
+            .await
+            .ok();
+        }
+    }
 
     Ok(EmptyResponse)
 }

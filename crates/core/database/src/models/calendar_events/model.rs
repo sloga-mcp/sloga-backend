@@ -107,6 +107,34 @@ auto_derived!(
         SourceMessageId,
         EditedAt,
     }
+
+    /// Composite key of a sent-reminder marker: one row per notified
+    /// (event, user, occurrence-start, lead-offset). The `offset` distinguishes the
+    /// 30-min-before reminder from the at-start one so both fire, while the
+    /// per-occurrence key keeps a recurring series from collapsing to a single
+    /// reminder (design §9, finding H3).
+    #[derive(Hash, Default)]
+    pub struct ReminderSentKey {
+        /// Event id
+        pub event: String,
+        /// Recipient user id
+        pub user: String,
+        /// Occurrence start (UTC ms epoch) the reminder is for
+        pub occurrence: i64,
+        /// Lead offset (ms before the occurrence) this reminder fired at
+        pub offset: i64,
+    }
+
+    /// Idempotency marker recording that a reminder was sent for a given
+    /// (event, user, occurrence, offset). Its presence suppresses re-sends across
+    /// crond re-runs/reconnects (mark-then-send, design §9).
+    pub struct ReminderSent {
+        /// Composite (event, user, occurrence, offset) id
+        #[serde(rename = "_id")]
+        pub id: ReminderSentKey,
+        /// When the reminder was marked/sent (ms epoch)
+        pub sent_at: i64,
+    }
 );
 
 auto_derived_partial!(
@@ -372,9 +400,60 @@ pub fn occurrences_in_window(event: &CalendarEvent, from: i64, to: i64) -> Vec<i
         .collect()
 }
 
+/// Lead offsets (ms before an occurrence's start) at which a reminder fires:
+/// 30 minutes before, and at the start itself (design §9, default lead "30 min +
+/// at-start"). Each (occurrence, offset) is notified at most once.
+pub const REMINDER_OFFSETS_MS: [i64; 2] = [30 * 60 * 1000, 0];
+
+/// How stale a reminder trigger may be before it is dropped rather than fired late.
+/// Bounds a notification flood after crond downtime: a trigger missed by more than
+/// this is simply not sent (the occurrence is imminent/past anyway) (design §9).
+pub const REMINDER_GRACE_MS: i64 = 5 * 60 * 1000;
+
+/// The (occurrence-start, lead-offset) reminders that have just come due at `now`
+/// for this event. For every non-excepted occurrence and every lead offset, the
+/// trigger instant `occurrence - offset` is due when it lands in
+/// `(now - REMINDER_GRACE_MS, now]`. Cancelled series yield nothing.
+///
+/// Pure and storage-free: the caller (crond) is responsible for the per-recipient
+/// `Going` filter and the per-(event, user, occurrence, offset) idempotency marker
+/// that turns "due" into "sent exactly once" (design §9, finding H3).
+pub fn reminders_due_for_event(event: &CalendarEvent, now: i64) -> Vec<(i64, i64)> {
+    if event.cancelled {
+        return vec![];
+    }
+    let exceptions = event
+        .recurrence
+        .as_ref()
+        .map(|r| r.exceptions.clone())
+        .unwrap_or_default();
+
+    // All-day events are anchored to local midnight; a "30-min-before" reminder would
+    // fire at 23:30 the night before, which is surprising. Remind only at the start.
+    let offsets: &[i64] = if event.all_day {
+        &[0]
+    } else {
+        &REMINDER_OFFSETS_MS
+    };
+
+    let mut due = Vec::new();
+    for occ in series_occurrence_starts(event) {
+        if exceptions.contains(&occ) {
+            continue;
+        }
+        for &offset in offsets {
+            let trigger = occ - offset;
+            if trigger <= now && trigger > now - REMINDER_GRACE_MS {
+                due.push((occ, offset));
+            }
+        }
+    }
+    due
+}
+
 /// Current time in milliseconds since the Unix epoch.
 #[allow(clippy::disallowed_methods)]
-fn now_ms() -> i64 {
+pub(crate) fn now_ms() -> i64 {
     use iso8601_timestamp::Timestamp;
     Timestamp::now_utc()
         .duration_since(Timestamp::UNIX_EPOCH)
@@ -1008,6 +1087,201 @@ mod tests {
             assert!(db.delete_event("does-not-exist").await.is_err());
             assert!(db.delete_rsvp("nope", "nobody").await.is_err());
             assert!(db.fetch_rsvp("nope", "nobody").await.is_err());
+        });
+    }
+
+    #[test]
+    fn reminders_fire_per_occurrence_not_per_series() {
+        // Finding H3: a recurring series must remind per occurrence, never once for
+        // the whole series. Daily standup; "now" sits in the lead window of exactly
+        // one occurrence, which yields both the 30-min-before and at-start triggers.
+        let rule = RecurrenceRule {
+            freq: Frequency::Daily,
+            interval: 1,
+            by_weekday: vec![],
+            end: RecurrenceEnd::Count { count: 10 },
+            exceptions: vec![],
+        };
+        let event = event_at_local(chrono_tz::UTC, 2026, 6, 1, 9, 0, Some(rule));
+        let starts = series_occurrence_starts(&event);
+
+        // At the 3rd occurrence's start, its at-start (offset 0) trigger and — only if
+        // 30 min already elapsed — nothing else is due; check the at-start moment.
+        let at_start = reminders_due_for_event(&event, starts[2]);
+        assert!(at_start.contains(&(starts[2], 0)), "at-start reminder due");
+        // No OTHER occurrence should be due at this instant (per-occurrence, not per-series).
+        assert!(
+            at_start.iter().all(|(occ, _)| *occ == starts[2]),
+            "only the current occurrence is due, never the whole series"
+        );
+
+        // 30 minutes before the 4th occurrence: its lead reminder is due, at-start is not.
+        let lead = REMINDER_OFFSETS_MS[0];
+        let due = reminders_due_for_event(&event, starts[3] - lead);
+        assert!(due.contains(&(starts[3], lead)), "30-min-before reminder due");
+        assert!(!due.contains(&(starts[3], 0)), "at-start not yet due");
+    }
+
+    #[test]
+    fn reminders_skip_excepted_occurrence_and_cancelled_series() {
+        let rule = RecurrenceRule {
+            freq: Frequency::Daily,
+            interval: 1,
+            by_weekday: vec![],
+            end: RecurrenceEnd::Count { count: 5 },
+            exceptions: vec![],
+        };
+        let mut event = event_at_local(chrono_tz::UTC, 2026, 6, 1, 9, 0, Some(rule));
+        let starts = series_occurrence_starts(&event);
+        if let Some(r) = event.recurrence.as_mut() {
+            r.exceptions = vec![starts[2]];
+        }
+        // The excepted occurrence yields no reminder at its start.
+        assert!(reminders_due_for_event(&event, starts[2]).is_empty());
+        // A non-excepted occurrence still does.
+        assert!(!reminders_due_for_event(&event, starts[1]).is_empty());
+
+        // A cancelled series never reminds.
+        event.cancelled = true;
+        assert!(reminders_due_for_event(&event, starts[1]).is_empty());
+    }
+
+    #[test]
+    fn all_day_reminds_only_at_start() {
+        // All-day event anchored at local midnight: no 23:30 prior-night lead reminder,
+        // only the at-start (offset 0) reminder.
+        let mut event = event_at_local(chrono_tz::UTC, 2026, 6, 1, 0, 0, None);
+        event.all_day = true;
+        let start = event.start;
+        let lead = REMINDER_OFFSETS_MS[0];
+
+        // 30 min before: nothing (the lead offset is suppressed for all-day).
+        assert!(reminders_due_for_event(&event, start - lead).is_empty());
+        // At start: exactly the at-start reminder.
+        let at_start = reminders_due_for_event(&event, start);
+        assert_eq!(at_start, vec![(start, 0)]);
+    }
+
+    #[test]
+    fn stale_reminder_trigger_is_dropped() {
+        // A trigger older than the grace window is not fired (no flood after downtime).
+        let event = event_at_local(chrono_tz::UTC, 2026, 6, 1, 9, 0, None);
+        let start = event.start;
+        // Just inside grace: at-start trigger fires.
+        assert!(reminders_due_for_event(&event, start + REMINDER_GRACE_MS - 1)
+            .contains(&(start, 0)));
+        // Beyond grace: dropped.
+        assert!(reminders_due_for_event(&event, start + REMINDER_GRACE_MS + 1).is_empty());
+    }
+
+    #[tokio::test]
+    async fn reminder_marker_is_insert_if_absent_and_prunes() {
+        database_test!(|db| async move {
+            let key = ReminderSentKey {
+                event: "01EVENT".to_string(),
+                user: "01USER".to_string(),
+                occurrence: 1_900_000_000_000,
+                offset: 0,
+            };
+            // First mark wins (send); the second is suppressed (no double-fire).
+            assert!(db.mark_reminder_sent_if_absent(&key).await.unwrap());
+            assert!(!db.mark_reminder_sent_if_absent(&key).await.unwrap());
+
+            // A different offset for the same occurrence is a distinct reminder.
+            let lead_key = ReminderSentKey {
+                offset: REMINDER_OFFSETS_MS[0],
+                ..key.clone()
+            };
+            assert!(db.mark_reminder_sent_if_absent(&lead_key).await.unwrap());
+
+            // Retention: markers for occurrences before the threshold are swept, and a
+            // swept marker can be inserted again (its occurrence is long past).
+            let removed = db
+                .delete_reminders_sent_before(key.occurrence + 1)
+                .await
+                .unwrap();
+            assert_eq!(removed, 2);
+            assert!(db.mark_reminder_sent_if_absent(&key).await.unwrap());
+        });
+    }
+
+    #[tokio::test]
+    async fn reminder_window_scan_matches_series_end_and_start() {
+        database_test!(|db| async move {
+            // A weekly series anchored well before "now" whose series_end is still ahead
+            // must be a reminder-scan candidate; a fully-past series must not.
+            let now = 1_900_000_000_000_i64;
+            let live = CalendarEvent::create(
+                &db,
+                "01S".to_string(),
+                "01H".to_string(),
+                "Weekly".to_string(),
+                None,
+                None,
+                now - 60 * 24 * 3_600_000, // started 60 days ago
+                Some(now - 60 * 24 * 3_600_000 + 3_600_000),
+                false,
+                "UTC".to_string(),
+                Some(RecurrenceRule {
+                    freq: Frequency::Weekly,
+                    interval: 1,
+                    by_weekday: vec![],
+                    end: RecurrenceEnd::Count { count: 30 },
+                    exceptions: vec![],
+                }),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+            let past = CalendarEvent::create(
+                &db,
+                "01S".to_string(),
+                "01H".to_string(),
+                "Old".to_string(),
+                None,
+                None,
+                now - 10 * 24 * 3_600_000,
+                Some(now - 10 * 24 * 3_600_000 + 3_600_000),
+                false,
+                "UTC".to_string(),
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+            let hits = db
+                .fetch_events_in_reminder_window(now + REMINDER_OFFSETS_MS[0], now - REMINDER_GRACE_MS)
+                .await
+                .unwrap();
+            assert!(hits.iter().any(|e| e.id == live.id), "live series is a candidate");
+            assert!(
+                !hits.iter().any(|e| e.id == past.id),
+                "fully-past event is excluded by series_end"
+            );
+
+            // A cancelled series is never a reminder-scan candidate.
+            db.update_event(
+                &live.id,
+                &PartialCalendarEvent {
+                    cancelled: Some(true),
+                    ..Default::default()
+                },
+                vec![],
+            )
+            .await
+            .unwrap();
+            let hits = db
+                .fetch_events_in_reminder_window(now + REMINDER_OFFSETS_MS[0], now - REMINDER_GRACE_MS)
+                .await
+                .unwrap();
+            assert!(
+                !hits.iter().any(|e| e.id == live.id),
+                "cancelled series is excluded from the reminder scan"
+            );
         });
     }
 }

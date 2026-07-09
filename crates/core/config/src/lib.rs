@@ -304,6 +304,7 @@ pub struct Pushd {
     pub fr_accepted_queue: String,
     pub fr_received_queue: String,
     pub generic_queue: String,
+    pub calendar_event_queue: String,
     pub ack_queue: String,
 
     pub vapid: PushVapid,
@@ -345,6 +346,10 @@ impl Pushd {
 
     pub fn get_generic_routing_key(&self) -> String {
         self.get_routing_key(self.generic_queue.clone())
+    }
+
+    pub fn get_calendar_event_routing_key(&self) -> String {
+        self.get_routing_key(self.calendar_event_queue.clone())
     }
 }
 

@@ -125,6 +125,7 @@ fr_accepted_queue = "notifications.ingest.fr_accepted"   # friend request accept
 fr_received_queue = "notifications.ingest.fr_received"   # friend request received
 dm_call_queue = "notifications.ingest.dm_call"   # direct message voice call
 generic_queue = "notifications.ingest.generic"           # generic messages (title + body)
+calendar_event_queue = "notifications.ingest.calendar_event" # calendar event invite/cancel/reminder
 ack_queue = "notifications.process.ack"                  # updates badges for apple devices
 
 

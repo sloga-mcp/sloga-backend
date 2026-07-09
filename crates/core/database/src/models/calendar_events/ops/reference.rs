@@ -1,7 +1,10 @@
 use revolt_result::Result;
 
 use crate::ReferenceDb;
-use crate::{CalendarEvent, EventRsvp, EventRsvpKey, FieldsCalendarEvent, PartialCalendarEvent};
+use crate::{
+    CalendarEvent, EventRsvp, EventRsvpKey, FieldsCalendarEvent, PartialCalendarEvent, ReminderSent,
+    ReminderSentKey,
+};
 
 use super::AbstractCalendarEvents;
 
@@ -141,5 +144,41 @@ impl AbstractCalendarEvents for ReferenceDb {
         let mut rsvps = self.event_rsvps.lock().await;
         rsvps.retain(|k, _| k.event != event_id);
         Ok(())
+    }
+
+    async fn fetch_events_in_reminder_window(
+        &self,
+        start_max: i64,
+        series_end_min: i64,
+    ) -> Result<Vec<CalendarEvent>> {
+        let events = self.calendar_events.lock().await;
+        Ok(events
+            .values()
+            .filter(|e| !e.cancelled && e.start <= start_max && e.series_end >= series_end_min)
+            .cloned()
+            .collect())
+    }
+
+    async fn mark_reminder_sent_if_absent(&self, key: &ReminderSentKey) -> Result<bool> {
+        let mut reminders = self.event_reminders.lock().await;
+        if reminders.contains_key(key) {
+            Ok(false)
+        } else {
+            reminders.insert(
+                key.clone(),
+                ReminderSent {
+                    id: key.clone(),
+                    sent_at: super::super::model::now_ms(),
+                },
+            );
+            Ok(true)
+        }
+    }
+
+    async fn delete_reminders_sent_before(&self, occurrence_before: i64) -> Result<usize> {
+        let mut reminders = self.event_reminders.lock().await;
+        let before = reminders.len();
+        reminders.retain(|k, _| k.occurrence >= occurrence_before);
+        Ok(before - reminders.len())
     }
 }

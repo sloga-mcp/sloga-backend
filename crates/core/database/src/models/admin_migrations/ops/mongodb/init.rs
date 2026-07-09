@@ -56,6 +56,10 @@ pub async fn create_database(db: &MongoDb) {
         .await
         .expect("Failed to create event_rsvps collection.");
 
+    db.create_collection("event_reminders_sent")
+        .await
+        .expect("Failed to create event_reminders_sent collection.");
+
     db.create_collection("migrations")
         .await
         .expect("Failed to create migrations collection.");
@@ -442,6 +446,14 @@ pub async fn create_database(db: &MongoDb) {
                     "start": 1_i32,
                 },
                 "name": "server_start"
+            },
+            // Global (server-agnostic) bound for crond's cross-server reminder scan,
+            // which filters on series_end/start without a server prefix (design §9).
+            {
+                "key": {
+                    "series_end": 1_i32,
+                },
+                "name": "series_end_global"
             }
         ]
     })
@@ -467,6 +479,21 @@ pub async fn create_database(db: &MongoDb) {
     })
     .await
     .expect("Failed to create event_rsvps index.");
+
+    db.run_command(doc! {
+        "createIndexes": "event_reminders_sent",
+        "indexes": [
+            // Serves the reminder retention sweep (delete markers by occurrence).
+            {
+                "key": {
+                    "_id.occurrence": 1_i32,
+                },
+                "name": "occurrence"
+            }
+        ]
+    })
+    .await
+    .expect("Failed to create event_reminders_sent index.");
 
     info!("Created database.");
 }

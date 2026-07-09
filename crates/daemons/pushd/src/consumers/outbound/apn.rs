@@ -74,6 +74,33 @@ impl<'a> PayloadLike for CallStartStopPayload<'a> {
     }
 }
 
+#[derive(Serialize, Debug)]
+struct CalendarEventPayload<'a> {
+    aps: APS<'a>,
+    #[serde(skip_serializing)]
+    options: NotificationOptions<'a>,
+    #[serde(skip_serializing)]
+    device_token: &'a str,
+
+    // Structured fields for client deep-linking / kind discrimination (parity with the
+    // FCM/VAPID arms; mirrors how CallStartStopPayload carries call ids). Keys match the
+    // FCM data payload so clients route uniformly across platforms.
+    event_id: &'a str,
+    server_id: &'a str,
+    kind: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    occurrence_start: Option<i64>,
+}
+
+impl<'a> PayloadLike for CalendarEventPayload<'a> {
+    fn get_device_token(&self) -> &'a str {
+        self.device_token
+    }
+    fn get_options(&self) -> &NotificationOptions<'a> {
+        &self.options
+    }
+}
+
 // region: consumer
 
 #[derive(Clone)]
@@ -335,6 +362,44 @@ impl Consumer for ApnsOutboundConsumer {
 
                 debug!(
                     "Sending message notification for user: {:}",
+                    &payload.user_id
+                );
+                self.client.send(apn_payload).await
+            }
+
+            PayloadKind::CalendarEvent(alert) => {
+                let (title, body) = alert.render();
+                let apn_payload = CalendarEventPayload {
+                    aps: APS {
+                        alert: Some(APSAlert::Default(DefaultAlert {
+                            title: Some(&title),
+                            subtitle: None,
+                            body: Some(&body),
+                            title_loc_key: None,
+                            title_loc_args: None,
+                            action_loc_key: None,
+                            loc_key: None,
+                            loc_args: None,
+                            launch_image: None,
+                        })),
+                        badge: self.get_badge_count(&payload.user_id).await,
+                        sound: Some(APSSound::Sound("default")),
+                        thread_id: None,
+                        content_available: None,
+                        category: None,
+                        mutable_content: Some(1),
+                        url_args: None,
+                    },
+                    device_token: &payload.token,
+                    options: payload_options.clone(),
+                    event_id: &alert.event_id,
+                    server_id: &alert.server_id,
+                    kind: alert.kind.as_str(),
+                    occurrence_start: alert.occurrence_start,
+                };
+
+                debug!(
+                    "Sending calendar event notification for user: {:}",
                     &payload.user_id
                 );
                 self.client.send(apn_payload).await
