@@ -559,8 +559,10 @@ traffic, exactly like the established stale-session path. Then:
   reject), raises a reactive `reenrollNeeded` that drives the second MFA'd
   first-publish (`finishReenroll`) via an auto-opened re-enroll modal. Gated
   SHIP WITH FIXES by two reviewers (crypto + frontend) 2026-07-08; the security
-  core is fail-closed (no plaintext/downgrade/egress). This recovery is NOT yet
-  DURABLE — **see the HIGH-1 residual in §8 (accepted pre-ship gate).**
+  core is fail-closed (no plaintext/downgrade/egress). This recovery is now
+  DURABLE across dismissal and restart — **see the HIGH-1 closure in §8**
+  (re-derivable native payload + `#onClaimResult` re-detection on every
+  reconnect + a persistent Security & Privacy affordance).
 - **The old install is still alive** (restore was used as "copy", not
   "recover"): two installs now hold the same device identity. They fight
   over the device binding (each bonfire claim rebinds
@@ -740,26 +742,57 @@ documented, not mitigated further in v1.
 - **Stolen unlocked device**: the sealed backup key (§4.5) adds nothing —
   the same attacker already reads the whole local store via local DPAPI.
 - **Clipboard**: §7.2, documented residual.
-- **Revoked-device restore recovery is not durable (HIGH-1, accepted PRE-SHIP
-  GATE, 2026-07-08):** the §6.4 re-enroll opportunity lives only in the
-  in-memory `reenrollNeeded` flag + the CONSUME-ONCE native republish payload.
-  A single dismissal (Not now / backdrop / ESC) OR an app/webview restart
-  before the user completes `finishReenroll` leaves the device
-  provisioned-but-unpublished and receive-broken, with NO in-app recovery entry
-  point and no way to re-run restore (the store is now provisioned ⇒
-  `StoreAlreadyProvisioned`). Confidentiality/integrity untouched and
-  FAIL-CLOSED (send_mode keys off local store state, never server publish state
-  ⇒ `Encrypt`/hard-error, never plaintext); this is an AVAILABILITY dead-end
-  only. Recovery today = native wipe + re-restore. True closure needs NATIVE
-  support (a re-derivable first-publish payload) + `#onReady` re-detection
-  (provisioned + unpublished + own row absent ⇒ re-raise `reenrollNeeded`) + a
-  PERSISTENT Security & Privacy affordance (not a one-shot auto-modal). **This
-  MUST be closed before §6.4 ships to users.** Two folded sub-findings live
-  here: MEDIUM (the modal's backdrop/ESC are not gated by `busy()`, so an
-  accidental outside-click can detach an in-flight `finishReenroll` — the
-  easiest way to lose the one-shot) and LOW (`#ownDeviceMissing` GET-error is
-  swallowed to "present", so a genuine revocation during a network blip can
-  miss the prompt for a connect cycle; distinguish present-vs-unknown).
+- **Revoked-device restore recovery IS NOW DURABLE (HIGH-1, CLOSED 2026-07-09;
+  two-reviewer gate SHIP WITH FIXES).** Was: the §6.4 re-enroll opportunity
+  lived only in the in-memory `reenrollNeeded` flag + a CONSUME-ONCE native
+  republish payload, so a single dismissal (Not now / backdrop / ESC) OR an
+  app/webview restart before `finishReenroll` stranded the device
+  provisioned-but-receive-broken with no in-app recovery and no way to re-run
+  restore (`StoreAlreadyProvisioned`). Confidentiality/integrity were never at
+  risk and the state was FAIL-CLOSED (`send_mode` keys off local store state,
+  never server publish state ⇒ `Encrypt`/hard-error, never plaintext) — an
+  availability dead-end only. **Closed by three parts:**
+  1. a NATIVE re-derivable first-publish payload — `e2ee_backup_rederive_republish`
+     (desktop Tauri command / Android Capacitor `call()` arm) re-runs the
+     re-callable `post_restore_rekey` (public-key-only export; the audited
+     AEAD/KDF/pickle crypto is untouched);
+  2. DURABLE re-detection in `#onClaimResult` — when a device claim is rejected
+     and this device's row is a CONFIRMED-absent (`#ownDevicePresence`
+     tri-state: present/missing/**unknown**, folding the old GET-error-as-present
+     LOW) it re-derives the payload and re-raises `reenrollNeeded`, on EVERY
+     reconnect until re-enrolled. **Placement note (corrected during
+     implementation):** a restored store carries `published = true` (restore
+     imports the source device's published flag), so a stranded restored device
+     is NOT provisioned-**un**published — it re-challenges on reconnect and the
+     server rejects it (revoked row), which is why the durable re-detection
+     lives in the claim-rejection path, not a `!published` branch;
+  3. a PERSISTENT Security & Privacy affordance ("Finish restoring on this
+     device") driven by `reenrollNeeded`, plus the original auto-modal kept only
+     as a backstop.
+  Folded sub-findings: MEDIUM (modal backdrop/ESC not gated by `busy()`) closed
+  via a `guardedClose` backdrop guard + an id-scoped controller dismiss-lock for
+  ESC; a root-cause MFA-flow fix (dismissing the `mfa_flow` modal now settles its
+  callback as a cancel, so ESC during the second MFA prompt can no longer strand
+  `reauth()` in a permanent busy state — HIGH, frontend gate); LOW
+  present-vs-unknown distinction (above).
+- **Post-restore re-derive is a webview-reachable local key-churn primitive
+  (accepted webview-availability residual, 2026-07-09).** `e2ee_backup_rederive_republish`
+  is a `with_engine` command, so the standing remote-webview-trust actor can call
+  it on demand. On a healthy device this rotates the served fallback +
+  regenerates OTKs locally; two calls WITHOUT a republish discard the fallback
+  secret the server still advertises, so peers that establish a session against
+  it produce `undecryptable` prekey messages until the next legitimate republish.
+  This is AVAILABILITY-only (no confidentiality/integrity loss; AEAD + identity
+  intact) and in the SAME trust class as the already-accepted "webview suppresses
+  the courier" / "durable backup wedge" residuals — a compromised webview can
+  already `enable`/`wipe`-request to grief. It is NOT closable by the reviewer's
+  suggested `!published` guard: a stranded (legitimately re-deriving) device is
+  `published = true` (see the placement note above), so that guard would reject
+  the real recovery path AND the restore-time rekey (it breaks
+  `post_restore_rekey_yields_a_fresh_one_time_key_batch`). True closure = carried
+  risk #1 (bundle the frontend + CSP); a cheaper future hardening would be a
+  non-fallback-rotating re-derive (top up OTKs + rebuild the payload from the
+  current fallback), deferred.
 
 ## 9. Explicitly out of scope (v1)
 
