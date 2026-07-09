@@ -8,6 +8,7 @@ mod bots;
 mod channels;
 mod customisation;
 mod e2ee;
+mod events;
 mod invites;
 mod onboard;
 mod policy;
@@ -39,6 +40,7 @@ pub fn mount(config: Settings, mut rocket: Rocket<Build>) -> Rocket<Build> {
             "/custom" => customisation::routes(),
             "/safety" => safety::routes(),
             "/e2ee" => e2ee::routes(),
+            "/events" => events::routes(),
             "/auth/account" => account::routes(),
             "/auth/session" => session::routes(),
             "/auth/oauth" => oauth::routes(),
@@ -62,6 +64,7 @@ pub fn mount(config: Settings, mut rocket: Rocket<Build>) -> Rocket<Build> {
             "/custom" => customisation::routes(),
             "/safety" => safety::routes(),
             "/e2ee" => e2ee::routes(),
+            "/events" => events::routes(),
             "/auth/account" => account::routes(),
             "/auth/session" => session::routes(),
             "/auth/oauth" => oauth::routes(),
@@ -129,7 +132,8 @@ fn custom_openapi_spec() -> OpenApi {
             "tags": [
               "Server Information",
               "Server Members",
-              "Server Permissions"
+              "Server Permissions",
+              "Calendar"
             ]
           },
           {
@@ -342,6 +346,13 @@ fn custom_openapi_spec() -> OpenApi {
                 description: Some(
                     "Key directory and encrypted-envelope relay for end-to-end encrypted DMs"
                         .to_owned(),
+                ),
+                ..Default::default()
+            },
+            Tag {
+                name: "Calendar".to_owned(),
+                description: Some(
+                    "Server calendar events, recurrence, and RSVP invitations".to_owned(),
                 ),
                 ..Default::default()
             },

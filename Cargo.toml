@@ -49,6 +49,7 @@ bitfield = "0.13.2"
 
 # Time
 chrono = "0.4.15"
+chrono-tz = "0.10"
 iso8601-timestamp = "0.2.10"
 
 # Data Collections

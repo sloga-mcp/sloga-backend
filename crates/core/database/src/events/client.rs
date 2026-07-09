@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 
 use revolt_models::v0::{
     AppendMessage, Channel, ChannelSlowmode, ChannelUnread, ChannelVoiceState, E2EEMessage,
-    Emoji, FieldsChannel, FieldsMember, FieldsMessage, FieldsRole, FieldsServer, FieldsUser,
+    Emoji, Event, EventRsvp, FieldsChannel, FieldsMember, FieldsMessage, FieldsRole, FieldsServer, FieldsUser,
     FieldsWebhook, Member, MemberCompositeKey, Message, PartialChannel, PartialEmoji,
     PartialMember, PartialMessage, PartialRole, PartialServer, PartialSticker, PartialUser,
     PartialUserVoiceState, PartialWebhook, PolicyChange, RemovalIntention, Report, Server,
@@ -425,6 +425,30 @@ pub enum EventV1 {
     E2EEClaimResult {
         device_id: String,
         accepted: bool,
+    },
+
+    /// A calendar event was created. Published on the event's channel topic when
+    /// it has a channel (only ViewChannel subscribers receive it), else the server
+    /// topic — the topic IS the authorization boundary (finding C1).
+    CalendarEventCreate {
+        event: Event,
+    },
+
+    /// A calendar event was updated (or soft-cancelled — the payload's `cancelled`
+    /// flag distinguishes). Same topic rule as create.
+    CalendarEventUpdate {
+        event: Event,
+    },
+
+    /// The current user was specifically invited to a calendar event.
+    /// Delivered to the invited user's private topic.
+    CalendarEventInvite {
+        event: Event,
+    },
+
+    /// A user's RSVP to a calendar event changed. Published to the event audience.
+    CalendarEventRsvp {
+        rsvp: EventRsvp,
     },
 }
 

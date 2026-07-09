@@ -70,6 +70,11 @@ impl<'a> RatelimitResolver<Request<'a>> for DeltaRatelimits {
                     }
                 }
                 ("e2ee", _, _) => ("e2ee", None),
+                // Event creation (keyed per server) and invites (keyed per event) get
+                // tight dedicated buckets — invites fan out to notifications in slice D.
+                ("events", Some("server"), Method::Post) => ("events_create", extra),
+                ("events", Some("event"), Method::Post) => ("events_invite", extra),
+                ("events", _, _) => ("events", None),
                 _ => ("any", None),
             }
         } else {
@@ -95,6 +100,9 @@ impl<'a> RatelimitResolver<Request<'a>> for DeltaRatelimits {
             "e2ee_messages" => 30,
             "e2ee_backup_get" => 3,
             "e2ee" => 10,
+            "events_create" => 10,
+            "events_invite" => 5,
+            "events" => 30,
             _ => 20,
         }
     }

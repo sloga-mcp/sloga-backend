@@ -1,5 +1,6 @@
 mod admin_migrations;
 mod bots;
+mod calendar_events;
 mod channel_invites;
 mod channel_unreads;
 mod channel_webhooks;
@@ -26,6 +27,7 @@ mod mfa_tickets;
 
 pub use admin_migrations::*;
 pub use bots::*;
+pub use calendar_events::*;
 pub use channel_invites::*;
 pub use channel_unreads::*;
 pub use channel_webhooks::*;
@@ -60,6 +62,7 @@ pub trait AbstractDatabase:
     + Send
     + admin_migrations::AbstractMigrations
     + bots::AbstractBots
+    + calendar_events::AbstractCalendarEvents
     + channels::AbstractChannels
     + channel_invites::AbstractChannelInvites
     + channel_unreads::AbstractChannelUnreads

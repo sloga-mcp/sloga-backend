@@ -3,10 +3,11 @@ use std::{collections::HashMap, sync::Arc};
 use futures::lock::Mutex;
 
 use crate::{
-    Bot, Channel, ChannelCompositeKey, ChannelUnread, E2EEBackup, E2EEBlob, E2EEEnvelope,
-    E2EEIdentity, E2EEOneTimeKey, Emoji, File, FileHash, Invite, Member, MemberCompositeKey,
-    Message, PolicyChange, RatelimitEvent, Report, Server, ServerBan, Snapshot, Sticker, User,
-    UserSettings, Webhook, Account, AccountInvite, Session, MFATicket
+    Bot, CalendarEvent, Channel, ChannelCompositeKey, ChannelUnread, E2EEBackup, E2EEBlob,
+    E2EEEnvelope, E2EEIdentity, E2EEOneTimeKey, Emoji, EventRsvp, EventRsvpKey, File, FileHash,
+    Invite, Member, MemberCompositeKey, Message, PolicyChange, RatelimitEvent, Report, Server,
+    ServerBan, Snapshot, Sticker, User, UserSettings, Webhook, Account, AccountInvite, Session,
+    MFATicket
 };
 
 database_derived!(
@@ -14,6 +15,8 @@ database_derived!(
     #[derive(Default, Debug)]
     pub struct ReferenceDb {
         pub bots: Arc<Mutex<HashMap<String, Bot>>>,
+        pub calendar_events: Arc<Mutex<HashMap<String, CalendarEvent>>>,
+        pub event_rsvps: Arc<Mutex<HashMap<EventRsvpKey, EventRsvp>>>,
         pub channels: Arc<Mutex<HashMap<String, Channel>>>,
         pub channel_invites: Arc<Mutex<HashMap<String, Invite>>>,
         pub channel_unreads: Arc<Mutex<HashMap<ChannelCompositeKey, ChannelUnread>>>,

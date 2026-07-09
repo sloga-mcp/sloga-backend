@@ -1,4 +1,5 @@
 mod bots;
+mod calendar_events;
 mod channel_invites;
 mod channel_unreads;
 mod channel_webhooks;
@@ -22,6 +23,7 @@ mod mfa_tickets;
 mod sessions;
 
 pub use bots::*;
+pub use calendar_events::*;
 pub use channel_invites::*;
 pub use channel_unreads::*;
 pub use channel_webhooks::*;

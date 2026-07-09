@@ -48,6 +48,14 @@ pub async fn create_database(db: &MongoDb) {
         .await
         .expect("Failed to create channel_webhooks collection.");
 
+    db.create_collection("calendar_events")
+        .await
+        .expect("Failed to create calendar_events collection.");
+
+    db.create_collection("event_rsvps")
+        .await
+        .expect("Failed to create event_rsvps collection.");
+
     db.create_collection("migrations")
         .await
         .expect("Failed to create migrations collection.");
@@ -417,6 +425,48 @@ pub async fn create_database(db: &MongoDb) {
     })
     .await
     .unwrap();
+
+    db.run_command(doc! {
+        "createIndexes": "calendar_events",
+        "indexes": [
+            {
+                "key": {
+                    "server": 1_i32,
+                    "series_end": 1_i32,
+                },
+                "name": "server_series_end"
+            },
+            {
+                "key": {
+                    "server": 1_i32,
+                    "start": 1_i32,
+                },
+                "name": "server_start"
+            }
+        ]
+    })
+    .await
+    .expect("Failed to create calendar_events index.");
+
+    db.run_command(doc! {
+        "createIndexes": "event_rsvps",
+        "indexes": [
+            {
+                "key": {
+                    "_id.event": 1_i32,
+                },
+                "name": "event_id"
+            },
+            {
+                "key": {
+                    "_id.user": 1_i32,
+                },
+                "name": "user_id"
+            }
+        ]
+    })
+    .await
+    .expect("Failed to create event_rsvps index.");
 
     info!("Created database.");
 }

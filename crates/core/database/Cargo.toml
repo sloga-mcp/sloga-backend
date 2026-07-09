@@ -63,6 +63,8 @@ serde_json = { workspace = true }
 revolt_optional_struct = { workspace = true }
 serde = { workspace = true }
 iso8601-timestamp = { workspace = true, features = ["serde", "bson"] }
+chrono = { workspace = true }
+chrono-tz = { workspace = true }
 
 # Events
 redis-kiss = { workspace = true, default-features = false, features = ["tokio-runtime"] }

@@ -465,6 +465,10 @@ pub struct Features {
     #[serde(default)]
     pub e2ee_enabled: bool,
 
+    /// Operator flag for the server calendar/events routes
+    #[serde(default)]
+    pub events_enabled: bool,
+
     #[serde(default)]
     pub advanced: FeaturesAdvanced,
 }
