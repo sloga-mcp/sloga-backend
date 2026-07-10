@@ -10,6 +10,8 @@ venv/
 
 .vercel
 .DS_Store
+*.bak
+*.bak-*
 
 livekit.yml
 .idea
