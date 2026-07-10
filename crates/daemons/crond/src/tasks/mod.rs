@@ -3,6 +3,7 @@ pub mod acks;
 pub mod event_reminders;
 pub mod file_deletion;
 pub mod prune_dangling_files;
+pub mod prune_large_attachments;
 pub mod prune_e2ee_blobs;
 pub mod prune_e2ee_envelopes;
 pub mod prune_members;

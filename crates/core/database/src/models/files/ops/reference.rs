@@ -2,6 +2,7 @@ use revolt_result::Result;
 
 use crate::File;
 use crate::FileUsedFor;
+use crate::FileUsedForType;
 use crate::ReferenceDb;
 
 use super::AbstractAttachments;
@@ -54,6 +55,22 @@ impl AbstractAttachments for ReferenceDb {
         Ok(files
             .values()
             .filter(|file| file.used_for.is_none() && !file.deleted.is_some_and(|v| v))
+            .cloned()
+            .collect())
+    }
+
+    /// Fetch message attachments larger than `min_size` bytes that are not yet deleted.
+    async fn fetch_large_message_attachments(&self, min_size: usize) -> Result<Vec<File>> {
+        let files = self.files.lock().await;
+        Ok(files
+            .values()
+            .filter(|file| {
+                file.used_for
+                    .as_ref()
+                    .is_some_and(|used_for| used_for.object_type == FileUsedForType::Message)
+                    && file.size > min_size as isize
+                    && !file.deleted.is_some_and(|v| v)
+            })
             .cloned()
             .collect())
     }
@@ -125,7 +142,7 @@ impl AbstractAttachments for ReferenceDb {
 
         for id in ids {
             if let Some(file) = files.get_mut(id) {
-                file.reported = Some(true);
+                file.deleted = Some(true);
             }
         }
 

@@ -25,6 +25,18 @@ impl AbstractMessages for ReferenceDb {
         }
     }
 
+    /// Remove a single attachment (by file id) from a message's embedded attachment list.
+    async fn remove_message_attachment(&self, message_id: &str, file_id: &str) -> Result<()> {
+        let mut messages = self.messages.lock().await;
+        if let Some(message) = messages.get_mut(message_id) {
+            if let Some(attachments) = &mut message.attachments {
+                attachments.retain(|attachment| attachment.id != file_id);
+            }
+        }
+        // Idempotent: a missing message/attachment is treated as success.
+        Ok(())
+    }
+
     /// Fetch a message by its id
     async fn fetch_message(&self, id: &str) -> Result<Message> {
         let messages = self.messages.lock().await;

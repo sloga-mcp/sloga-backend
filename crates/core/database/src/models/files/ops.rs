@@ -22,6 +22,9 @@ pub trait AbstractAttachments: Sync + Send {
     /// Fetch all dangling attachments.
     async fn fetch_dangling_files(&self) -> Result<Vec<File>>;
 
+    /// Fetch message attachments larger than `min_size` bytes that are not yet deleted.
+    async fn fetch_large_message_attachments(&self, min_size: usize) -> Result<Vec<File>>;
+
     /// Count references to a given hash.
     async fn count_file_hash_references(&self, hash: &str) -> Result<usize>;
 

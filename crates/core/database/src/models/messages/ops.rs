@@ -28,6 +28,10 @@ pub trait AbstractMessages: Sync + Send {
     /// Append information to a given message
     async fn append_message(&self, id: &str, append: &AppendMessage) -> Result<()>;
 
+    /// Remove a single attachment (by file id) from a message's embedded attachment list.
+    /// Idempotent: succeeds even if the message or attachment no longer exists.
+    async fn remove_message_attachment(&self, message_id: &str, file_id: &str) -> Result<()>;
+
     /// Add a new reaction to a message
     async fn add_reaction(&self, id: &str, emoji: &str, user: &str) -> Result<()>;
 

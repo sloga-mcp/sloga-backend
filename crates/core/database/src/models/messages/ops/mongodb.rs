@@ -422,6 +422,25 @@ impl AbstractMessages for MongoDb {
             "author": user_id,
         }).await
     }
+
+    async fn remove_message_attachment(&self, message_id: &str, file_id: &str) -> Result<()> {
+        self.col::<Document>(COL)
+            .update_one(
+                doc! {
+                    "_id": message_id
+                },
+                doc! {
+                    "$pull": {
+                        "attachments": {
+                            "_id": file_id
+                        }
+                    }
+                },
+            )
+            .await
+            .map(|_| ())
+            .map_err(|_| create_database_error!("update_one", COL))
+    }
 }
 
 impl IntoDocumentPath for FieldsMessage {
