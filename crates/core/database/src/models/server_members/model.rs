@@ -280,6 +280,14 @@ impl Member {
     ) -> Result<()> {
         db.soft_delete_member(&self.id).await?;
 
+        // Calendar cascade (slice F): drop the member's RSVP rows for this server so
+        // they stop appearing as attendees/counts. Best-effort — a leave/kick/ban must
+        // never fail on calendar cleanup; crond reminder + cancel delivery also
+        // live-filter by membership as the safety net for exactly this window.
+        db.delete_rsvps_for_member(&self.id.server, &self.id.user)
+            .await
+            .ok();
+
         EventV1::ServerMemberLeave {
             id: self.id.server.to_string(),
             user: self.id.user.to_string(),

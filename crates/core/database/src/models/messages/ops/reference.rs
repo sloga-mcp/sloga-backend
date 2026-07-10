@@ -1,8 +1,9 @@
 use crate::{
-    AppendMessage, FieldsMessage, Message, MessageQuery,
-    PartialMessage, ReferenceDb,
+    AppendMessage, FieldsMessage, Message, MessageQuery, MessageTimePeriod, PartialMessage,
+    ReferenceDb,
 };
 use futures::future::try_join_all;
+use revolt_models::v0::MessageSort;
 use indexmap::IndexSet;
 use revolt_result::Result;
 use std::collections::HashMap;
@@ -36,7 +37,7 @@ impl AbstractMessages for ReferenceDb {
     /// Fetch multiple messages by given query
     async fn fetch_messages(&self, query: MessageQuery) -> Result<Vec<Message>> {
         let messages = self.messages.lock().await;
-        let matched_messages = messages
+        let mut matched_messages: Vec<Message> = messages
             .values()
             .filter(|message| {
                 if let Some(channel) = &query.filter.channel {
@@ -72,120 +73,40 @@ impl AbstractMessages for ReferenceDb {
             .cloned()
             .collect();
 
-        // FIXME: sorting, etc (will be required for tests)
+        // Ulid message ids are lexicographically chronological, so all ordering and
+        // cursor comparisons below work on the id string, matching the Mongo `_id`
+        // semantics (messages/ops/mongodb.rs).
+        let limit = query.limit.unwrap_or(50).max(0) as usize;
 
-        Ok(matched_messages)
-
-        /*
-        // 2. Find query limit
-        let limit = query.limit.unwrap_or(50);
-
-        // 3. Apply message time period
         match query.time_period {
-            MessageTimePeriod::Relative { nearby } => {
-                // 3.1. Prepare filters
-                let mut older_message_filter = filter.clone();
-                let mut newer_message_filter = filter;
-
-                older_message_filter.insert(
-                    "_id",
-                    doc! {
-                        "$lt": &nearby
-                    },
-                );
-
-                newer_message_filter.insert(
-                    "_id",
-                    doc! {
-                        "$gte": &nearby
-                    },
-                );
-
-                // 3.2. Execute in both directions
-                let (a, b) = try_join!(
-                    self.find_with_options::<_, Message>(
-                        COL,
-                        newer_message_filter,
-                        FindOptions::builder()
-                            .limit(limit / 2 + 1)
-                            .sort(doc! {
-                                "_id": 1_i32
-                            })
-                            .build(),
-                    ),
-                    self.find_with_options::<_, Message>(
-                        COL,
-                        older_message_filter,
-                        FindOptions::builder()
-                            .limit(limit / 2)
-                            .sort(doc! {
-                                "_id": -1_i32
-                            })
-                            .build(),
-                    )
-                )
-                .map_err(|_| create_database_error!("find", COL))?;
-
-                Ok([a, b].concat())
-            }
+            // FIXME: `Relative { nearby }` is still unsorted/unlimited (no test depends
+            // on it under REFERENCE yet). `Absolute` was completed in slice F so the
+            // legacy-import pagination tests exercise real before/limit semantics.
+            MessageTimePeriod::Relative { .. } => Ok(matched_messages),
             MessageTimePeriod::Absolute {
                 before,
                 after,
                 sort,
             } => {
-                // 3.1. Apply message ID filter
-                if let Some(doc) = match (before, after) {
-                    (Some(before), Some(after)) => Some(doc! {
-                        "$lt": before,
-                        "$gt": after
-                    }),
-                    (Some(before), _) => Some(doc! {
-                        "$lt": before
-                    }),
-                    (_, Some(after)) => Some(doc! {
-                        "$gt": after
-                    }),
-                    _ => None,
-                } {
-                    filter.insert("_id", doc);
+                if let Some(before) = &before {
+                    matched_messages.retain(|m| &m.id < before);
                 }
-
-                // 3.2. Execute with given message sort
-                self.find_with_options(
-                    COL,
-                    filter,
-                    FindOptions::builder()
-                        .limit(limit)
-                        .sort(match sort.unwrap_or(MessageSort::Latest) {
-                            // Sort by relevance, fallback to latest
-                            MessageSort::Relevance => {
-                                if is_search_query {
-                                    doc! {
-                                        "score": {
-                                            "$meta": "textScore"
-                                        }
-                                    }
-                                } else {
-                                    doc! {
-                                        "_id": -1_i32
-                                    }
-                                }
-                            }
-                            // Sort by latest first
-                            MessageSort::Latest => doc! {
-                                "_id": -1_i32
-                            },
-                            // Sort by oldest first
-                            MessageSort::Oldest => doc! {
-                                "_id": 1_i32
-                            },
-                        })
-                        .build(),
-                )
-                .await
-                .map_err(|_| create_database_error!("find", COL))
+                if let Some(after) = &after {
+                    matched_messages.retain(|m| &m.id > after);
+                }
+                match sort.unwrap_or(MessageSort::Latest) {
+                    MessageSort::Oldest => matched_messages.sort_by(|a, b| a.id.cmp(&b.id)),
+                    // Relevance falls back to latest-first, as in the Mongo driver
+                    // when no text score is available.
+                    MessageSort::Latest | MessageSort::Relevance => {
+                        matched_messages.sort_by(|a, b| b.id.cmp(&a.id))
+                    }
+                }
+                matched_messages.truncate(limit);
+                Ok(matched_messages)
             }
-        }*/
+        }
+
     }
 
     /// Fetch multiple messages by given IDs

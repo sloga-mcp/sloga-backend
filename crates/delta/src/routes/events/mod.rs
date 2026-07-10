@@ -11,6 +11,7 @@ use revolt_rocket_okapi::revolt_okapi::openapi3::OpenApi;
 use rocket::Route;
 
 mod events_crud;
+mod import;
 mod rsvp;
 #[cfg(test)]
 mod tests;
@@ -47,8 +48,13 @@ pub async fn authorize_view(db: &Database, user: &revolt_database::User, event: 
 
 /// The caller may MANAGE an event iff they created it OR hold `ManageChannel`
 /// (evaluated on the event's channel, or server-wide when it has none) (design §6).
+///
+/// The creator branch additionally requires LIVE membership (slice F hardening): a
+/// banned/departed creator with a still-valid session must not retitle/cancel events
+/// or fan out invite pushes to the server's members. Imported events (whose creator is
+/// the original message author, possibly long gone) rely on the same gate.
 pub async fn authorize_manage(db: &Database, user: &revolt_database::User, event: &CalendarEvent) -> Result<()> {
-    if user.id == event.creator {
+    if user.id == event.creator && db.fetch_member(&event.server, &user.id).await.is_ok() {
         return Ok(());
     }
     if let Some(channel_id) = &event.channel {
@@ -217,6 +223,7 @@ pub fn routes() -> (Vec<Route>, OpenApi) {
         events_crud::fetch_event,
         events_crud::edit_event,
         events_crud::cancel_event,
+        import::import_legacy_events,
         rsvp::invite_to_event,
         rsvp::uninvite_from_event,
         rsvp::set_rsvp,

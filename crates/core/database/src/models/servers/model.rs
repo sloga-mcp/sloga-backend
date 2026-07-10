@@ -215,6 +215,12 @@ impl Server {
 
     /// Delete a server
     pub async fn delete(self, db: &Database) -> Result<()> {
+        // Calendar cascade (slice F): without this, a deleted server's events keep
+        // matching crond's cross-server reminder scan until their `series_end`.
+        // Runs BEFORE the ServerDelete broadcast so a cascade failure aborts the
+        // deletion without having announced it.
+        db.delete_calendar_for_server(&self.id).await?;
+
         EventV1::ServerDelete {
             id: self.id.clone(),
         }

@@ -907,6 +907,10 @@ impl User {
 
         self.remove_from_all_groups(db).await?;
         db.clear_memberships(&self.id).await?;
+        // Calendar cascade (slice F): `clear_memberships` bypasses `Member::remove`,
+        // so the per-server RSVP cascade never runs — drop every RSVP row the account
+        // holds, or attendee lists would keep a ghost user id forever.
+        db.delete_rsvps_for_user(&self.id).await?;
         self.clear_relationships(db).await?;
         db.delete_messages_by_user(&self.id).await?;
 

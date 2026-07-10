@@ -97,7 +97,7 @@ async fn invite_accept_and_non_invited_rejected() {
         .await
         .expect("event");
 
-    // Owner invites the guest.
+    // Owner invites the guest. The route reports counts (slice F, decision 0.1-A).
     let response = harness
         .client
         .post(format!("/events/event/{}/invites", event.id))
@@ -106,7 +106,13 @@ async fn invite_accept_and_non_invited_rejected() {
         .body(json!({ "users": [guest.id] }).to_string())
         .dispatch()
         .await;
-    assert_eq!(response.status(), Status::NoContent);
+    assert_eq!(response.status(), Status::Ok);
+    let result = response
+        .into_json::<v0::InviteResult>()
+        .await
+        .expect("invite result");
+    assert_eq!(result.invited, 1);
+    assert_eq!(result.skipped, 0);
 
     // Guest accepts.
     let response = harness
@@ -518,4 +524,801 @@ async fn channel_scoped_event_hidden_from_non_viewer() {
         attendees.attendees.is_empty(),
         "invite must skip a member who cannot view the channel"
     );
+}
+
+/// Slice F (0.1-A): a role invite expands to the role's CURRENT holders server-side,
+/// dedups against explicit user ids, hard-fails on an unknown role, and rejects an
+/// empty request. A removed holder is not re-invited (their cascaded row stays gone).
+#[rocket::async_test]
+async fn role_invite_expands_and_dedups() {
+    use revolt_database::{PartialMember, RemovalIntention, Role};
+    use revolt_permissions::OverrideField;
+    use ulid::Ulid;
+
+    let harness = TestHarness::new().await;
+    let (_, owner_session, owner) = harness.new_user().await;
+    let (_, _a_session, member_a) = harness.new_user().await;
+    let (_, _b_session, member_b) = harness.new_user().await;
+    let server = make_server(&harness, &owner).await;
+    let ma = Member::create(&harness.db, &server, &member_a, None)
+        .await
+        .expect("member a")
+        .0;
+    let mb = Member::create(&harness.db, &server, &member_b, None)
+        .await
+        .expect("member b")
+        .0;
+
+    // A role held by both members.
+    let role = Role {
+        id: Ulid::new().to_string(),
+        name: "Raid group 1".to_string(),
+        permissions: OverrideField { a: 0, d: 0 },
+        colour: None,
+        hoist: false,
+        rank: 5,
+        icon: None,
+    };
+    harness
+        .db
+        .insert_role(&server.id, &role)
+        .await
+        .expect("role");
+    for member in [&ma, &mb] {
+        harness
+            .db
+            .update_member(
+                &member.id,
+                &PartialMember {
+                    roles: Some(vec![role.id.clone()]),
+                    ..Default::default()
+                },
+                vec![],
+            )
+            .await
+            .expect("assign role");
+    }
+
+    let event = harness
+        .client
+        .post(format!("/events/server/{}", server.id))
+        .header(Header::new("x-session-token", owner_session.token.to_string()))
+        .header(ContentType::JSON)
+        .body(json!({ "title": "Raid", "start": 1_900_000_000_000_i64, "timezone": "UTC" }).to_string())
+        .dispatch()
+        .await
+        .into_json::<v0::Event>()
+        .await
+        .expect("event");
+
+    // users ∩ roles dedups: member_a is named explicitly AND holds the role.
+    let response = harness
+        .client
+        .post(format!("/events/event/{}/invites", event.id))
+        .header(Header::new("x-session-token", owner_session.token.to_string()))
+        .header(ContentType::JSON)
+        .body(json!({ "users": [member_a.id], "roles": [role.id] }).to_string())
+        .dispatch()
+        .await;
+    assert_eq!(response.status(), Status::Ok);
+    let result = response
+        .into_json::<v0::InviteResult>()
+        .await
+        .expect("invite result");
+    assert_eq!(result.invited, 2, "role expands to both holders, deduped");
+
+    // Unknown role is a hard error before any insert.
+    let response = harness
+        .client
+        .post(format!("/events/event/{}/invites", event.id))
+        .header(Header::new("x-session-token", owner_session.token.to_string()))
+        .header(ContentType::JSON)
+        .body(json!({ "roles": [Ulid::new().to_string()] }).to_string())
+        .dispatch()
+        .await;
+    assert_ne!(response.status(), Status::Ok);
+
+    // Neither users nor roles is a validation error.
+    let response = harness
+        .client
+        .post(format!("/events/event/{}/invites", event.id))
+        .header(Header::new("x-session-token", owner_session.token.to_string()))
+        .header(ContentType::JSON)
+        .body(json!({}).to_string())
+        .dispatch()
+        .await;
+    assert_ne!(response.status(), Status::Ok);
+
+    // Kick member_b: the cascade removes their row, and a role re-invite must not
+    // resurrect them (they are no longer a member/holder).
+    harness
+        .db
+        .fetch_member(&server.id, &member_b.id)
+        .await
+        .expect("member b row")
+        .remove(&harness.db, &server, RemovalIntention::Kick, true)
+        .await
+        .expect("kick");
+    let result = harness
+        .client
+        .post(format!("/events/event/{}/invites", event.id))
+        .header(Header::new("x-session-token", owner_session.token.to_string()))
+        .header(ContentType::JSON)
+        .body(json!({ "roles": [role.id] }).to_string())
+        .dispatch()
+        .await
+        .into_json::<v0::InviteResult>()
+        .await
+        .expect("re-invite result");
+    assert_eq!(result.invited, 0, "no new invitees after the kick");
+
+    let attendees = harness
+        .client
+        .get(format!("/events/event/{}/attendees", event.id))
+        .header(Header::new("x-session-token", owner_session.token.to_string()))
+        .dispatch()
+        .await
+        .into_json::<v0::AttendeesResponse>()
+        .await
+        .expect("attendees");
+    assert_eq!(
+        attendees.attendees.len(),
+        1,
+        "the kicked member's RSVP row was cascaded and never re-created"
+    );
+    assert_eq!(attendees.attendees[0].user, member_a.id);
+}
+
+/// Slice F (F4a): removing a member cascades their RSVP rows for THAT server only —
+/// their rows on another server survive.
+#[rocket::async_test]
+async fn member_removal_cascades_rsvps_per_server() {
+    use revolt_database::RemovalIntention;
+
+    let harness = TestHarness::new().await;
+    let (_, owner_session, owner) = harness.new_user().await;
+    let (_, _guest_session, guest) = harness.new_user().await;
+    let server_a = make_server(&harness, &owner).await;
+    let server_b = make_server(&harness, &owner).await;
+    Member::create(&harness.db, &server_a, &guest, None)
+        .await
+        .expect("guest in a");
+    Member::create(&harness.db, &server_b, &guest, None)
+        .await
+        .expect("guest in b");
+
+    let mut events = Vec::new();
+    for server in [&server_a, &server_b] {
+        let event = harness
+            .client
+            .post(format!("/events/server/{}", server.id))
+            .header(Header::new("x-session-token", owner_session.token.to_string()))
+            .header(ContentType::JSON)
+            .body(json!({ "title": "Meet", "start": 1_900_000_000_000_i64, "timezone": "UTC" }).to_string())
+            .dispatch()
+            .await
+            .into_json::<v0::Event>()
+            .await
+            .expect("event");
+        harness
+            .client
+            .post(format!("/events/event/{}/invites", event.id))
+            .header(Header::new("x-session-token", owner_session.token.to_string()))
+            .header(ContentType::JSON)
+            .body(json!({ "users": [guest.id] }).to_string())
+            .dispatch()
+            .await;
+        events.push(event);
+    }
+
+    // Kick the guest from server A only.
+    harness
+        .db
+        .fetch_member(&server_a.id, &guest.id)
+        .await
+        .expect("member row")
+        .remove(&harness.db, &server_a, RemovalIntention::Kick, true)
+        .await
+        .expect("kick");
+
+    assert!(
+        harness
+            .db
+            .fetch_rsvp(&events[0].id, &guest.id)
+            .await
+            .is_err(),
+        "server A row cascaded"
+    );
+    assert!(
+        harness
+            .db
+            .fetch_rsvp(&events[1].id, &guest.id)
+            .await
+            .is_ok(),
+        "server B row untouched"
+    );
+}
+
+/// Slice F (F4b): a creator who is no longer a member (kicked/banned) loses manage
+/// authority — edit, cancel and invite are all rejected for their still-valid session.
+#[rocket::async_test]
+async fn removed_creator_loses_manage() {
+    use revolt_database::RemovalIntention;
+
+    let harness = TestHarness::new().await;
+    let (_, _owner_session, owner) = harness.new_user().await;
+    let (_, creator_session, creator) = harness.new_user().await;
+    let server = make_server(&harness, &owner).await;
+    Member::create(&harness.db, &server, &creator, None)
+        .await
+        .expect("creator member");
+
+    // Any member may create an event.
+    let event = harness
+        .client
+        .post(format!("/events/server/{}", server.id))
+        .header(Header::new("x-session-token", creator_session.token.to_string()))
+        .header(ContentType::JSON)
+        .body(json!({ "title": "Mine", "start": 1_900_000_000_000_i64, "timezone": "UTC" }).to_string())
+        .dispatch()
+        .await
+        .into_json::<v0::Event>()
+        .await
+        .expect("event");
+
+    // While a member, the creator can edit.
+    let response = harness
+        .client
+        .patch(format!("/events/event/{}", event.id))
+        .header(Header::new("x-session-token", creator_session.token.to_string()))
+        .header(ContentType::JSON)
+        .body(json!({ "title": "Renamed" }).to_string())
+        .dispatch()
+        .await;
+    assert_eq!(response.status(), Status::Ok);
+
+    // Kick the creator; their session stays valid but manage authority must not.
+    harness
+        .db
+        .fetch_member(&server.id, &creator.id)
+        .await
+        .expect("member row")
+        .remove(&harness.db, &server, RemovalIntention::Kick, true)
+        .await
+        .expect("kick");
+
+    let response = harness
+        .client
+        .patch(format!("/events/event/{}", event.id))
+        .header(Header::new("x-session-token", creator_session.token.to_string()))
+        .header(ContentType::JSON)
+        .body(json!({ "title": "Hijacked" }).to_string())
+        .dispatch()
+        .await;
+    assert_ne!(response.status(), Status::Ok, "edit must be rejected");
+
+    let response = harness
+        .client
+        .post(format!("/events/event/{}/invites", event.id))
+        .header(Header::new("x-session-token", creator_session.token.to_string()))
+        .header(ContentType::JSON)
+        .body(json!({ "users": [owner.id] }).to_string())
+        .dispatch()
+        .await;
+    assert_ne!(response.status(), Status::Ok, "invite must be rejected");
+
+    let response = harness
+        .client
+        .delete(format!("/events/event/{}", event.id))
+        .header(Header::new("x-session-token", creator_session.token.to_string()))
+        .dispatch()
+        .await;
+    assert_ne!(response.status(), Status::NoContent, "cancel must be rejected");
+}
+
+/// Slice F (0.2-A): a cancelled series stays in the list (clients render it
+/// struck-through) with its occurrences expanded; RSVPing it stays rejected.
+#[rocket::async_test]
+async fn cancelled_event_still_listed() {
+    let harness = TestHarness::new().await;
+    let (_, owner_session, owner) = harness.new_user().await;
+    let server = make_server(&harness, &owner).await;
+
+    let event = harness
+        .client
+        .post(format!("/events/server/{}", server.id))
+        .header(Header::new("x-session-token", owner_session.token.to_string()))
+        .header(ContentType::JSON)
+        .body(json!({ "title": "Gone", "start": 1_900_000_000_000_i64, "timezone": "UTC" }).to_string())
+        .dispatch()
+        .await
+        .into_json::<v0::Event>()
+        .await
+        .expect("event");
+
+    harness
+        .client
+        .delete(format!("/events/event/{}", event.id))
+        .header(Header::new("x-session-token", owner_session.token.to_string()))
+        .dispatch()
+        .await;
+
+    let list = harness
+        .client
+        .get(format!(
+            "/events/server/{}?from=1899000000000&to=1901000000000",
+            server.id
+        ))
+        .header(Header::new("x-session-token", owner_session.token.to_string()))
+        .dispatch()
+        .await
+        .into_json::<Vec<v0::EventWithOccurrences>>()
+        .await
+        .expect("list");
+    assert_eq!(list.len(), 1, "cancelled series must stay listed (0.2-A)");
+    assert!(list[0].event.cancelled);
+    assert_eq!(list[0].occurrences, vec![1_900_000_000_000_i64]);
+}
+
+/// Slice F (F5): the legacy import maps tagged messages through create's validation,
+/// takes the creator from the message author (spoof-proof), imports date-only starts
+/// as all-day, degrades a dead voiceId to no channel, counts invalid rows without
+/// storing them, and dedups by source message id so a re-run imports nothing.
+#[rocket::async_test]
+async fn import_legacy_events_end_to_end() {
+    use revolt_database::Message;
+    use ulid::Ulid;
+
+    let harness = TestHarness::new().await;
+    let (_, owner_session, owner) = harness.new_user().await;
+    let (_, author_session, author) = harness.new_user().await;
+
+    let (server, channels) = Server::create(
+        &harness.db,
+        DataCreateServer {
+            name: "Legacy".to_string(),
+            description: None,
+            nsfw: None,
+        },
+        &owner,
+        true,
+    )
+    .await
+    .expect("server");
+    Member::create(&harness.db, &server, &owner, None)
+        .await
+        .expect("owner member");
+    Member::create(&harness.db, &server, &author, None)
+        .await
+        .expect("author member");
+    let channel_id = channels[0].id().to_string();
+
+    let tag = |json: &str| format!("[ACUTEST_EVENT]:{json}");
+    let contents = [
+        // Valid timed event with extras (authorId must be IGNORED — creator is the
+        // message author, not the payload).
+        tag(r##"{"title":"Old Party","start":"2030-03-01T18:00:00.000Z","end":"2030-03-01T19:00:00.000Z","desc":"bring snacks","color":"#ff8800","authorId":"01SPOOFED"}"##),
+        // Date-only start imports as all-day.
+        tag(r##"{"title":"Fair","start":"2030-04-05"}"##),
+        // Dead voiceId degrades to no channel, still imports.
+        tag(r##"{"title":"Voice hang","start":"2030-05-01T10:00:00.000Z","voiceId":"01DEADCHANNEL0000000000000"}"##),
+        // Invalid: end before start.
+        tag(r##"{"title":"Backwards","start":"2030-06-01T10:00:00.000Z","end":"2030-06-01T09:00:00.000Z"}"##),
+        // Invalid: not JSON.
+        "[ACUTEST_EVENT]:{definitely not json".to_string(),
+        // Plain chat message: scanned, not an event.
+        "hello world".to_string(),
+    ];
+    for content in &contents {
+        harness
+            .db
+            .insert_message(&Message {
+                id: Ulid::new().to_string(),
+                channel: channel_id.clone(),
+                author: author.id.clone(),
+                content: Some(content.clone()),
+                ..Default::default()
+            })
+            .await
+            .expect("message");
+    }
+
+    // A plain member (the author) is not a manager: import rejected.
+    let response = harness
+        .client
+        .post(format!("/events/server/{}/import", server.id))
+        .header(Header::new("x-session-token", author_session.token.to_string()))
+        .header(ContentType::JSON)
+        .body(json!({ "channel": channel_id }).to_string())
+        .dispatch()
+        .await;
+    assert_ne!(response.status(), Status::Ok);
+
+    // The owner imports.
+    let response = harness
+        .client
+        .post(format!("/events/server/{}/import", server.id))
+        .header(Header::new("x-session-token", owner_session.token.to_string()))
+        .header(ContentType::JSON)
+        .body(json!({ "channel": channel_id }).to_string())
+        .dispatch()
+        .await;
+    assert_eq!(response.status(), Status::Ok);
+    let result = response
+        .into_json::<v0::ImportResult>()
+        .await
+        .expect("import result");
+    assert_eq!(result.imported, 3);
+    assert_eq!(result.skipped_invalid, 2);
+    assert_eq!(result.skipped_duplicates, 0);
+    assert_eq!(result.scanned, 6);
+    assert!(!result.truncated);
+
+    // The imported events are real: correct mapping, creator = message author.
+    let list = harness
+        .client
+        .get(format!(
+            "/events/server/{}?from=1890000000000&to=1920000000000",
+            server.id
+        ))
+        .header(Header::new("x-session-token", owner_session.token.to_string()))
+        .dispatch()
+        .await
+        .into_json::<Vec<v0::EventWithOccurrences>>()
+        .await
+        .expect("list");
+    assert_eq!(list.len(), 3);
+    for row in &list {
+        assert_eq!(row.event.creator, author.id, "creator is the message author");
+        assert!(row.event.channel.is_none(), "dead voiceId degraded to None");
+    }
+    let party = list
+        .iter()
+        .find(|r| r.event.title == "Old Party")
+        .expect("party");
+    assert_eq!(party.event.description.as_deref(), Some("bring snacks"));
+    assert_eq!(party.event.color.as_deref(), Some("#ff8800"));
+    assert!(!party.event.all_day);
+    let fair = list.iter().find(|r| r.event.title == "Fair").expect("fair");
+    assert!(fair.event.all_day, "date-only start imports as all-day");
+
+    // Re-running imports nothing (source_message_id dedup).
+    let result = harness
+        .client
+        .post(format!("/events/server/{}/import", server.id))
+        .header(Header::new("x-session-token", owner_session.token.to_string()))
+        .header(ContentType::JSON)
+        .body(json!({ "channel": channel_id }).to_string())
+        .dispatch()
+        .await
+        .into_json::<v0::ImportResult>()
+        .await
+        .expect("re-import result");
+    assert_eq!(result.imported, 0);
+    assert_eq!(result.skipped_duplicates, 3);
+}
+
+/// Slice F (F5 gates): the import source channel must belong to the server, and a
+/// manager without ViewChannel on it must be rejected (no private-channel exfil).
+#[rocket::async_test]
+async fn import_requires_viewable_in_server_channel() {
+    use revolt_database::{Channel, PartialChannel, PartialMember, Role};
+    use revolt_permissions::{ChannelPermission, OverrideField};
+    use ulid::Ulid;
+
+    let harness = TestHarness::new().await;
+    let (_, owner_session, owner) = harness.new_user().await;
+    let (_, manager_session, manager) = harness.new_user().await;
+
+    let (server, channels) = Server::create(
+        &harness.db,
+        DataCreateServer {
+            name: "Gated".to_string(),
+            description: None,
+            nsfw: None,
+        },
+        &owner,
+        true,
+    )
+    .await
+    .expect("server");
+    Member::create(&harness.db, &server, &owner, None)
+        .await
+        .expect("owner member");
+    let manager_member = Member::create(&harness.db, &server, &manager, None)
+        .await
+        .expect("manager member")
+        .0;
+
+    // Cross-server channel is rejected outright.
+    let other_server = make_server(&harness, &owner).await;
+    let response = harness
+        .client
+        .post(format!("/events/server/{}/import", other_server.id))
+        .header(Header::new("x-session-token", owner_session.token.to_string()))
+        .header(ContentType::JSON)
+        .body(json!({ "channel": channels[0].id() }).to_string())
+        .dispatch()
+        .await;
+    assert_ne!(response.status(), Status::Ok);
+
+    // Grant the manager server-wide ManageChannel via a role, then deny ViewChannel
+    // on the channel itself: manager authority without readability.
+    let role = Role {
+        id: Ulid::new().to_string(),
+        name: "Mgr".to_string(),
+        permissions: OverrideField {
+            a: ChannelPermission::ManageChannel as i64,
+            d: 0,
+        },
+        colour: None,
+        hoist: false,
+        rank: 1,
+        icon: None,
+    };
+    harness
+        .db
+        .insert_role(&server.id, &role)
+        .await
+        .expect("role");
+    harness
+        .db
+        .update_member(
+            &manager_member.id,
+            &PartialMember {
+                roles: Some(vec![role.id.clone()]),
+                ..Default::default()
+            },
+            vec![],
+        )
+        .await
+        .expect("assign role");
+
+    let mut channel = channels
+        .into_iter()
+        .find(|c| matches!(c, Channel::TextChannel { .. }))
+        .expect("text channel");
+    let channel_id = channel.id().to_string();
+    channel
+        .update(
+            &harness.db,
+            PartialChannel {
+                default_permissions: Some(OverrideField {
+                    a: 0,
+                    d: ChannelPermission::ViewChannel as i64,
+                }),
+                ..Default::default()
+            },
+            vec![],
+        )
+        .await
+        .expect("deny view");
+
+    let response = harness
+        .client
+        .post(format!("/events/server/{}/import", server.id))
+        .header(Header::new("x-session-token", manager_session.token.to_string()))
+        .header(ContentType::JSON)
+        .body(json!({ "channel": channel_id }).to_string())
+        .dispatch()
+        .await;
+    assert_ne!(
+        response.status(),
+        Status::Ok,
+        "a manager denied ViewChannel must not import from that channel"
+    );
+}
+
+/// Slice F (F5, cal-HIGH-1 follow-through): the import's cursor pagination is
+/// exercised for real — a multi-page channel is scanned to exhaustion with tagged
+/// messages on different pages, and a channel larger than `MAX_IMPORT_SCAN` stops
+/// at the cap with `truncated` set. A cursor regression (no progress) would hang
+/// this test rather than pass it.
+#[rocket::async_test]
+async fn import_paginates_and_truncates() {
+    use revolt_database::Message;
+    use ulid::Ulid;
+
+    let harness = TestHarness::new().await;
+    let (_, owner_session, owner) = harness.new_user().await;
+    let (server, channels) = Server::create(
+        &harness.db,
+        DataCreateServer {
+            name: "Paged".to_string(),
+            description: None,
+            nsfw: None,
+        },
+        &owner,
+        true,
+    )
+    .await
+    .expect("server");
+    Member::create(&harness.db, &server, &owner, None)
+        .await
+        .expect("owner member");
+    let channel_id = channels[0].id().to_string();
+
+    let insert = |content: String| {
+        let db = harness.db.clone();
+        let channel = channel_id.clone();
+        let author = owner.id.clone();
+        async move {
+            db.insert_message(&Message {
+                id: Ulid::new().to_string(),
+                channel,
+                author,
+                content: Some(content),
+                ..Default::default()
+            })
+            .await
+            .expect("message");
+        }
+    };
+
+    // 120 messages spanning two scan pages (page size 100, newest-first): a tagged
+    // message among the OLDEST (first inserted → only reachable via the second
+    // page / cursor advance) and one among the newest.
+    insert(r##"[ACUTEST_EVENT]:{"title":"Oldest","start":"2030-01-01T10:00:00.000Z"}"##.to_string())
+        .await;
+    for i in 0..118 {
+        insert(format!("filler {i}")).await;
+    }
+    insert(r##"[ACUTEST_EVENT]:{"title":"Newest","start":"2030-02-01T10:00:00.000Z"}"##.to_string())
+        .await;
+
+    let result = harness
+        .client
+        .post(format!("/events/server/{}/import", server.id))
+        .header(Header::new("x-session-token", owner_session.token.to_string()))
+        .header(ContentType::JSON)
+        .body(json!({ "channel": channel_id }).to_string())
+        .dispatch()
+        .await
+        .into_json::<v0::ImportResult>()
+        .await
+        .expect("import result");
+    assert_eq!(result.scanned, 120, "both pages scanned to exhaustion");
+    assert_eq!(result.imported, 2, "tagged messages found on both pages");
+    assert!(!result.truncated);
+
+    // Bury the history under more messages than the scan cap: the re-run stops at
+    // the cap (newest-first), reports truncation, and never reaches the two
+    // already-imported tags at the oldest end.
+    for i in 0..2000 {
+        insert(format!("burying filler {i}")).await;
+    }
+    let result = harness
+        .client
+        .post(format!("/events/server/{}/import", server.id))
+        .header(Header::new("x-session-token", owner_session.token.to_string()))
+        .header(ContentType::JSON)
+        .body(json!({ "channel": channel_id }).to_string())
+        .dispatch()
+        .await
+        .into_json::<v0::ImportResult>()
+        .await
+        .expect("re-import result");
+    assert_eq!(result.scanned, 2000, "scan stops at MAX_IMPORT_SCAN");
+    assert!(result.truncated, "cap hit before exhausting history");
+    assert_eq!(result.imported, 0);
+    assert_eq!(result.skipped_duplicates, 0, "tags lie beyond the cap");
+}
+
+/// Slice F (F6, cal-MED-5): a member slated for deletion (`pending_deletion_at`
+/// set — the state a kicked-while-in-timeout member has) must not be invitable,
+/// neither named explicitly nor via role expansion. `pending_deletion_at` is a
+/// database-layer-only field the Reference driver cannot represent (its
+/// soft-delete of an in-timeout member is unimplemented), so this test is
+/// Mongo-gated and runs in the WSL MONGODB pass; the invite loop's `fetch_member`
+/// re-check is the only filter (`fetch_all_members_with_roles` does not apply it).
+#[rocket::async_test]
+async fn pending_deletion_member_not_invitable() {
+    use revolt_database::mongodb::bson::{doc, Document};
+    use revolt_database::{Database, PartialMember, Role};
+    use revolt_permissions::OverrideField;
+    use ulid::Ulid;
+
+    let harness = TestHarness::new().await;
+    let Database::MongoDb(mongo) = &harness.db else {
+        return; // REFERENCE cannot represent pending_deletion_at
+    };
+
+    let (_, owner_session, owner) = harness.new_user().await;
+    let (_, _ghost_session, ghost) = harness.new_user().await;
+    let server = make_server(&harness, &owner).await;
+    let ghost_member = Member::create(&harness.db, &server, &ghost, None)
+        .await
+        .expect("ghost member")
+        .0;
+
+    // The ghost holds a role…
+    let role = Role {
+        id: Ulid::new().to_string(),
+        name: "Raiders".to_string(),
+        permissions: OverrideField { a: 0, d: 0 },
+        colour: None,
+        hoist: false,
+        rank: 5,
+        icon: None,
+    };
+    harness
+        .db
+        .insert_role(&server.id, &role)
+        .await
+        .expect("role");
+    harness
+        .db
+        .update_member(
+            &ghost_member.id,
+            &PartialMember {
+                roles: Some(vec![role.id.clone()]),
+                ..Default::default()
+            },
+            vec![],
+        )
+        .await
+        .expect("assign role");
+
+    // …and is then slated for deletion. Roles stay set in this synthetic state,
+    // so role expansion WILL surface them — the fetch_member re-check must not.
+    mongo
+        .col::<Document>("server_members")
+        .update_one(
+            doc! { "_id.server": &server.id, "_id.user": &ghost.id },
+            doc! { "$set": { "pending_deletion_at": "2100-01-01T00:00:00Z" } },
+        )
+        .await
+        .expect("mark pending deletion");
+
+    let event = harness
+        .client
+        .post(format!("/events/server/{}", server.id))
+        .header(Header::new("x-session-token", owner_session.token.to_string()))
+        .header(ContentType::JSON)
+        .body(json!({ "title": "Raid", "start": 1_900_000_000_000_i64, "timezone": "UTC" }).to_string())
+        .dispatch()
+        .await
+        .into_json::<v0::Event>()
+        .await
+        .expect("event");
+
+    // Named explicitly: skipped.
+    let result = harness
+        .client
+        .post(format!("/events/event/{}/invites", event.id))
+        .header(Header::new("x-session-token", owner_session.token.to_string()))
+        .header(ContentType::JSON)
+        .body(json!({ "users": [ghost.id] }).to_string())
+        .dispatch()
+        .await
+        .into_json::<v0::InviteResult>()
+        .await
+        .expect("invite result");
+    assert_eq!(result.invited, 0, "pending-deletion member must be skipped");
+    assert_eq!(result.skipped, 1);
+
+    // Via role expansion: skipped too.
+    let result = harness
+        .client
+        .post(format!("/events/event/{}/invites", event.id))
+        .header(Header::new("x-session-token", owner_session.token.to_string()))
+        .header(ContentType::JSON)
+        .body(json!({ "roles": [role.id] }).to_string())
+        .dispatch()
+        .await
+        .into_json::<v0::InviteResult>()
+        .await
+        .expect("role invite result");
+    assert_eq!(result.invited, 0, "role expansion must not resurrect them");
+
+    let attendees = harness
+        .client
+        .get(format!("/events/event/{}/attendees", event.id))
+        .header(Header::new("x-session-token", owner_session.token.to_string()))
+        .dispatch()
+        .await
+        .into_json::<v0::AttendeesResponse>()
+        .await
+        .expect("attendees");
+    assert!(attendees.attendees.is_empty());
 }

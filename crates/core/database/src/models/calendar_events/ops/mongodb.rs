@@ -1,5 +1,8 @@
+use std::collections::HashSet;
+
 use bson::{to_document, Document};
 use futures::StreamExt;
+use mongodb::options::FindOptions;
 use revolt_result::Result;
 
 use crate::MongoDb;
@@ -30,11 +33,12 @@ impl AbstractCalendarEvents for MongoDb {
         from: i64,
         to: i64,
     ) -> Result<Vec<CalendarEvent>> {
+        // Cancelled series are INCLUDED (slice F, 0.2-A): clients strike them through;
+        // the reminder scan uses `fetch_events_in_reminder_window`, which excludes them.
         Ok(self
             .col::<CalendarEvent>(COL_EVENTS)
             .find(doc! {
                 "server": server_id,
-                "cancelled": { "$ne": true },
                 "start": { "$lte": to },
                 "series_end": { "$gte": from },
             })
@@ -214,6 +218,74 @@ impl AbstractCalendarEvents for MongoDb {
             .map_err(|_| create_database_error!("delete_many", COL_RSVPS))
     }
 
+    async fn delete_rsvps_for_member(&self, server_id: &str, user_id: &str) -> Result<()> {
+        // Two-step: the server's event ids (indexed on `server`, prefix of
+        // `server_series_end`), then one delete over the `user_id` index.
+        let event_ids = self.fetch_event_ids_for_server(server_id).await?;
+        if event_ids.is_empty() {
+            return Ok(());
+        }
+        self.col::<Document>(COL_RSVPS)
+            .delete_many(doc! {
+                "_id.user": user_id,
+                "_id.event": { "$in": &event_ids },
+            })
+            .await
+            .map(|_| ())
+            .map_err(|_| create_database_error!("delete_many", COL_RSVPS))
+    }
+
+    async fn delete_rsvps_for_user(&self, user_id: &str) -> Result<()> {
+        self.col::<Document>(COL_RSVPS)
+            .delete_many(doc! {
+                "_id.user": user_id,
+            })
+            .await
+            .map(|_| ())
+            .map_err(|_| create_database_error!("delete_many", COL_RSVPS))
+    }
+
+    async fn delete_calendar_for_server(&self, server_id: &str) -> Result<()> {
+        let event_ids = self.fetch_event_ids_for_server(server_id).await?;
+        if !event_ids.is_empty() {
+            self.col::<Document>(COL_RSVPS)
+                .delete_many(doc! { "_id.event": { "$in": &event_ids } })
+                .await
+                .map_err(|_| create_database_error!("delete_many", COL_RSVPS))?;
+            self.col::<Document>(COL_REMINDERS)
+                .delete_many(doc! { "_id.event": { "$in": &event_ids } })
+                .await
+                .map_err(|_| create_database_error!("delete_many", COL_REMINDERS))?;
+        }
+        self.col::<Document>(COL_EVENTS)
+            .delete_many(doc! { "server": server_id })
+            .await
+            .map(|_| ())
+            .map_err(|_| create_database_error!("delete_many", COL_EVENTS))
+    }
+
+    async fn fetch_imported_source_ids(&self, server_id: &str) -> Result<HashSet<String>> {
+        Ok(self
+            .col::<Document>(COL_EVENTS)
+            .find(doc! {
+                "server": server_id,
+                "source_message_id": { "$exists": true },
+            })
+            .with_options(
+                FindOptions::builder()
+                    .projection(doc! { "_id": 0_i32, "source_message_id": 1_i32 })
+                    .build(),
+            )
+            .await
+            .map_err(|_| create_database_error!("find", COL_EVENTS))?
+            .filter_map(|s| async {
+                s.ok()
+                    .and_then(|d| d.get_str("source_message_id").map(|v| v.to_string()).ok())
+            })
+            .collect()
+            .await)
+    }
+
     async fn fetch_events_in_reminder_window(
         &self,
         start_max: i64,
@@ -278,6 +350,29 @@ impl AbstractCalendarEvents for MongoDb {
             .await
             .map_err(|_| create_database_error!("delete_many", COL_REMINDERS))?;
         Ok(result.deleted_count as usize)
+    }
+}
+
+impl MongoDb {
+    /// The `_id`s of every calendar event in a server (served by the `server` prefix
+    /// of the `server_series_end` index).
+    async fn fetch_event_ids_for_server(&self, server_id: &str) -> Result<Vec<String>> {
+        Ok(self
+            .col::<Document>(COL_EVENTS)
+            .find(doc! { "server": server_id })
+            .with_options(
+                FindOptions::builder()
+                    .projection(doc! { "_id": 1_i32 })
+                    .build(),
+            )
+            .await
+            .map_err(|_| create_database_error!("find", COL_EVENTS))?
+            .filter_map(|s| async {
+                s.ok()
+                    .and_then(|d| d.get_str("_id").map(|v| v.to_string()).ok())
+            })
+            .collect()
+            .await)
     }
 }
 

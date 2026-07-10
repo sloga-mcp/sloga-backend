@@ -68,10 +68,11 @@ pub async fn task(db: Database, amqp: AMQP) -> Result<()> {
                 continue;
             }
 
-            // Drop attendees who have fully left / been banned from the server: their
-            // `Going` row is stale (RSVP rows are not cascaded on member removal), and
-            // they must stop being reminded. A member who merely lost `ViewChannel` is
-            // still a member and is intentionally still reminded (design §8/§9).
+            // Drop attendees who have fully left / been banned from the server. RSVP
+            // rows ARE cascaded on member removal (slice F), but only best-effort —
+            // this live check is the defense-in-depth for a missed cascade. A member
+            // who merely lost `ViewChannel` is still a member and is intentionally
+            // still reminded (design §8/§9).
             let mut recipients = Vec::with_capacity(going.len());
             for user in going {
                 if db.fetch_member(&event.server, &user).await.is_ok() {

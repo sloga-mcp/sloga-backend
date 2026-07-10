@@ -26,7 +26,7 @@ struct MigrationInfo {
     revision: i32,
 }
 
-pub const LATEST_REVISION: i32 = 54; // MUST BE +1 to last migration
+pub const LATEST_REVISION: i32 = 55; // MUST BE +1 to last migration
 
 pub async fn migrate_database(db: &MongoDb) {
     let migrations = db.col::<Document>("migrations");
@@ -1580,6 +1580,87 @@ pub async fn run_migrations(db: &MongoDb, revision: i32) -> i32 {
             })
             .await
             .expect("Failed to create e2ee_backups index.");
+    }
+
+    if revision <= 54 {
+        info!("Running migration [revision 54 / 09-07-2026]: Create calendar events collections and indexes");
+
+        // Existing deployments predate the calendar feature: init.rs only covers fresh
+        // DBs. Collections + indexes mirror init.rs exactly; both operations are
+        // idempotent (create_collection errors are ignored; createIndexes is a no-op
+        // when key+name already match), so a re-run or a fresh DB is safe.
+        db.db().create_collection("calendar_events").await.ok();
+        db.db().create_collection("event_rsvps").await.ok();
+        db.db().create_collection("event_reminders_sent").await.ok();
+
+        db.db()
+            .run_command(doc! {
+                "createIndexes": "calendar_events",
+                "indexes": [
+                    {
+                        "key": {
+                            "server": 1_i32,
+                            "series_end": 1_i32,
+                        },
+                        "name": "server_series_end"
+                    },
+                    {
+                        "key": {
+                            "server": 1_i32,
+                            "start": 1_i32,
+                        },
+                        "name": "server_start"
+                    },
+                    // Global (server-agnostic) bound for crond's cross-server reminder
+                    // scan, which filters on series_end/start without a server prefix
+                    // (design §9).
+                    {
+                        "key": {
+                            "series_end": 1_i32,
+                        },
+                        "name": "series_end_global"
+                    }
+                ]
+            })
+            .await
+            .expect("Failed to create calendar_events indexes.");
+
+        db.db()
+            .run_command(doc! {
+                "createIndexes": "event_rsvps",
+                "indexes": [
+                    {
+                        "key": {
+                            "_id.event": 1_i32,
+                        },
+                        "name": "event_id"
+                    },
+                    {
+                        "key": {
+                            "_id.user": 1_i32,
+                        },
+                        "name": "user_id"
+                    }
+                ]
+            })
+            .await
+            .expect("Failed to create event_rsvps indexes.");
+
+        db.db()
+            .run_command(doc! {
+                "createIndexes": "event_reminders_sent",
+                "indexes": [
+                    // Serves the reminder retention sweep (delete markers by occurrence).
+                    {
+                        "key": {
+                            "_id.occurrence": 1_i32,
+                        },
+                        "name": "occurrence"
+                    }
+                ]
+            })
+            .await
+            .expect("Failed to create event_reminders_sent indexes.");
     }
 
     // Reminder to update LATEST_REVISION when adding new migrations.

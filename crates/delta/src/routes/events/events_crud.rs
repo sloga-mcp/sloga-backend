@@ -83,6 +83,7 @@ pub async fn create_event(
         data.recurrence.map(super::recurrence_from_wire),
         data.color,
         data.channel,
+        None,
     )
     .await?;
 

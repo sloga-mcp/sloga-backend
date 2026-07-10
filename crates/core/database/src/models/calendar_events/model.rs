@@ -282,7 +282,25 @@ fn append_occurrence(out: &mut Vec<i64>, tz: Tz, until_ms: Option<i64>, local: N
 /// checked date arithmetic so a hostile interval cannot panic on datetime overflow.
 /// A non-recurring event yields a single occurrence at its `start`.
 pub fn series_occurrence_starts(event: &CalendarEvent) -> Vec<i64> {
+    series_occurrence_starts_bounded(event, None)
+}
+
+/// As [`series_occurrence_starts`], but stops expanding once an occurrence start
+/// exceeds `stop_after` (inclusive bound: a start equal to it is still returned).
+///
+/// Safe truncation: UTC occurrence starts are **non-decreasing** — the minimum
+/// local step is one calendar day and no tzdb offset delta exceeds 24h (historical
+/// date-line jumps, e.g. Pacific/Apia 2011, can make consecutive daily starts
+/// *equal*, never smaller) — so the first start past the bound proves every later
+/// one is past it. Occurrences at or before the bound still count toward a `Count`
+/// terminator; the bound only ever drops the tail. Callers that need the true
+/// series tail (`compute_series_end`, the `Until`-cap probe in `validate`) must
+/// pass `None`.
+pub fn series_occurrence_starts_bounded(event: &CalendarEvent, stop_after: Option<i64>) -> Vec<i64> {
     let Some(rule) = event.recurrence.as_ref() else {
+        if stop_after.is_some_and(|bound| event.start > bound) {
+            return vec![];
+        }
         return vec![event.start];
     };
 
@@ -294,9 +312,15 @@ pub fn series_occurrence_starts(event: &CalendarEvent) -> Vec<i64> {
         RecurrenceEnd::Count { count } => (*count as usize).min(MAX_OCCURRENCES),
         RecurrenceEnd::Until { .. } => MAX_OCCURRENCES,
     };
+    // The truncation bound composes with an `Until` terminator as a min: both mean
+    // "stop once an occurrence lands past this instant" in the loops below.
     let until_ms = match &rule.end {
         RecurrenceEnd::Until { timestamp } => Some(*timestamp),
         RecurrenceEnd::Count { .. } => None,
+    };
+    let until_ms = match (until_ms, stop_after) {
+        (Some(u), Some(s)) => Some(u.min(s)),
+        (u, s) => u.or(s),
     };
 
     let mut out: Vec<i64> = Vec::new();
@@ -390,7 +414,9 @@ pub fn occurrences_in_window(event: &CalendarEvent, from: i64, to: i64) -> Vec<i
         .map(|r| r.exceptions.clone())
         .unwrap_or_default();
 
-    series_occurrence_starts(event)
+    // Bounded expansion: no occurrence starting after `to` can overlap the window,
+    // and starts are non-decreasing, so stop expanding there (slice F, deferred LOW).
+    series_occurrence_starts_bounded(event, Some(to))
         .into_iter()
         .filter(|s| !exceptions.contains(s))
         .filter(|s| {
@@ -436,8 +462,12 @@ pub fn reminders_due_for_event(event: &CalendarEvent, now: i64) -> Vec<(i64, i64
         &REMINDER_OFFSETS_MS
     };
 
+    // Bounded expansion: a trigger `occ - offset <= now` implies
+    // `occ <= now + offset <= now + max(offsets)` — nothing past that bound can be
+    // due, and starts are non-decreasing (slice F, deferred LOW).
+    let max_offset = offsets.iter().copied().max().unwrap_or(0);
     let mut due = Vec::new();
-    for occ in series_occurrence_starts(event) {
+    for occ in series_occurrence_starts_bounded(event, Some(now + max_offset)) {
         if exceptions.contains(&occ) {
             continue;
         }
@@ -592,6 +622,7 @@ impl CalendarEvent {
         recurrence: Option<RecurrenceRule>,
         color: Option<String>,
         channel: Option<String>,
+        source_message_id: Option<String>,
     ) -> Result<CalendarEvent> {
         let mut event = CalendarEvent {
             id: Ulid::new().to_string(),
@@ -610,7 +641,7 @@ impl CalendarEvent {
             recurrence,
             color,
             cancelled: false,
-            source_message_id: None,
+            source_message_id,
             created_at: now_ms(),
             edited_at: None,
         };
@@ -983,6 +1014,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -1045,6 +1077,7 @@ mod tests {
                 false,
                 "UTC".to_string(),
                 Some(rule),
+                None,
                 None,
                 None,
             )
@@ -1231,6 +1264,7 @@ mod tests {
                 }),
                 None,
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -1246,6 +1280,7 @@ mod tests {
                 Some(now - 10 * 24 * 3_600_000 + 3_600_000),
                 false,
                 "UTC".to_string(),
+                None,
                 None,
                 None,
                 None,
@@ -1282,6 +1317,274 @@ mod tests {
                 !hits.iter().any(|e| e.id == live.id),
                 "cancelled series is excluded from the reminder scan"
             );
+        });
+    }
+
+    /// Slice F (F3): for any bound, the bounded expansion must equal the unbounded
+    /// expansion filtered to `start <= bound` — across a DST-transition daily series,
+    /// a multi-weekday weekly series, and a monthly day-31 clamp series, with bounds
+    /// placed before, on, between and after occurrences. `Count`/`Until` semantics
+    /// are unchanged because the bound only ever drops the tail.
+    #[test]
+    fn bounded_expansion_matches_unbounded_truncation() {
+        let weekly_until = {
+            let start = chrono_tz::UTC.with_ymd_and_hms(2026, 6, 1, 12, 0, 0).single().unwrap();
+            RecurrenceRule {
+                freq: Frequency::Weekly,
+                interval: 1,
+                by_weekday: vec![Weekday::Monday, Weekday::Wednesday, Weekday::Friday],
+                end: RecurrenceEnd::Until {
+                    timestamp: start.timestamp_millis() + day_ms(15),
+                },
+                exceptions: vec![],
+            }
+        };
+        let shapes = [
+            // Daily across the US spring-forward week (2025-03-09).
+            event_at_local(
+                New_York,
+                2025,
+                3,
+                7,
+                2,
+                30,
+                Some(RecurrenceRule {
+                    freq: Frequency::Daily,
+                    interval: 1,
+                    by_weekday: vec![],
+                    end: RecurrenceEnd::Count { count: 10 },
+                    exceptions: vec![],
+                }),
+            ),
+            event_at_local(chrono_tz::UTC, 2026, 6, 1, 12, 0, Some(weekly_until)),
+            // Monthly day-31 clamp.
+            event_at_local(
+                chrono_tz::UTC,
+                2026,
+                1,
+                31,
+                10,
+                0,
+                Some(RecurrenceRule {
+                    freq: Frequency::Monthly,
+                    interval: 1,
+                    by_weekday: vec![],
+                    end: RecurrenceEnd::Count { count: 5 },
+                    exceptions: vec![],
+                }),
+            ),
+            // Non-recurring.
+            event_at_local(chrono_tz::UTC, 2026, 6, 1, 9, 0, None),
+        ];
+
+        for event in &shapes {
+            let all = series_occurrence_starts(event);
+            assert!(!all.is_empty());
+
+            let mut bounds = vec![all[0] - 1, *all.last().unwrap() + day_ms(1)];
+            bounds.extend(all.iter().copied()); // on each occurrence (inclusive bound)
+            bounds.extend(all.windows(2).map(|w| (w[0] + w[1]) / 2)); // between
+
+            for bound in bounds {
+                let bounded = series_occurrence_starts_bounded(event, Some(bound));
+                let expected: Vec<i64> = all.iter().copied().filter(|s| *s <= bound).collect();
+                assert_eq!(
+                    bounded, expected,
+                    "bounded expansion must equal filtered unbounded (bound {bound})"
+                );
+            }
+        }
+    }
+
+    /// Slice F (F3): hostile anchor across a date-line jump. Pacific/Apia skipped
+    /// 2011-12-30 entirely (UTC-11 → UTC+13), so consecutive daily UTC starts may be
+    /// EQUAL — the invariant is non-decreasing, not strictly increasing, and the
+    /// bounded expansion must still agree with filtered-unbounded at every cut.
+    #[test]
+    fn bounded_expansion_survives_dateline_jump() {
+        let rule = RecurrenceRule {
+            freq: Frequency::Daily,
+            interval: 1,
+            by_weekday: vec![],
+            end: RecurrenceEnd::Count { count: 6 },
+            exceptions: vec![],
+        };
+        let event = event_at_local(chrono_tz::Pacific::Apia, 2011, 12, 27, 18, 0, Some(rule));
+        let all = series_occurrence_starts(&event);
+        assert_eq!(all.len(), 6);
+        for w in all.windows(2) {
+            assert!(w[1] >= w[0], "starts must be non-decreasing across the jump");
+        }
+        for bound in all.iter().copied().chain([all[0] - 1, *all.last().unwrap() + 1]) {
+            let bounded = series_occurrence_starts_bounded(&event, Some(bound));
+            let expected: Vec<i64> = all.iter().copied().filter(|s| *s <= bound).collect();
+            assert_eq!(bounded, expected);
+        }
+    }
+
+    /// Slice F (F2 + F4 + F5 ops): the window query includes cancelled series (the
+    /// reminder scan still excludes them); the member/user/server cascades delete
+    /// exactly the right rows; the import dedup set reflects `source_message_id`.
+    #[tokio::test]
+    async fn lifecycle_ops_and_import_dedup() {
+        database_test!(|db| async move {
+            let mk = |server: &str, source: Option<&str>| {
+                CalendarEvent::create(
+                    &db,
+                    server.to_string(),
+                    "01HOST".to_string(),
+                    "Ev".to_string(),
+                    None,
+                    None,
+                    1_900_000_000_000,
+                    Some(1_900_003_600_000),
+                    false,
+                    "UTC".to_string(),
+                    None,
+                    None,
+                    None,
+                    source.map(|s| s.to_string()),
+                )
+            };
+            let ev_a1 = mk("01SA", Some("01MSGA1")).await.unwrap();
+            let ev_a2 = mk("01SA", Some("01MSGA2")).await.unwrap();
+            let ev_b = mk("01SB", Some("01MSGB1")).await.unwrap();
+
+            // F5: the dedup set is per-server.
+            let ids = db.fetch_imported_source_ids("01SA").await.unwrap();
+            assert_eq!(ids.len(), 2);
+            assert!(ids.contains("01MSGA1") && ids.contains("01MSGA2"));
+            assert!(!ids.contains("01MSGB1"));
+
+            // F2: a cancelled series stays in the window query but leaves the
+            // reminder scan.
+            db.update_event(
+                &ev_a2.id,
+                &PartialCalendarEvent {
+                    cancelled: Some(true),
+                    ..Default::default()
+                },
+                vec![],
+            )
+            .await
+            .unwrap();
+            let window = db
+                .fetch_events_for_server_in_window("01SA", 1_899_000_000_000, 1_901_000_000_000)
+                .await
+                .unwrap();
+            assert_eq!(window.len(), 2, "cancelled series included (0.2-A)");
+            let reminder = db
+                .fetch_events_in_reminder_window(1_901_000_000_000, 1_899_000_000_000)
+                .await
+                .unwrap();
+            assert!(
+                reminder.iter().all(|e| e.id != ev_a2.id),
+                "reminder scan still excludes cancelled"
+            );
+
+            // Seed RSVPs: user U on both servers, user V on server A only.
+            for (event, user) in [(&ev_a1, "01U"), (&ev_a1, "01V"), (&ev_b, "01U")] {
+                assert!(EventRsvp::invite(&db, &event.id, user, "01HOST").await.unwrap());
+            }
+
+            // F4a: member cascade hits that server only.
+            db.delete_rsvps_for_member("01SA", "01U").await.unwrap();
+            assert!(db.fetch_rsvp(&ev_a1.id, "01U").await.is_err());
+            assert!(db.fetch_rsvp(&ev_a1.id, "01V").await.is_ok());
+            assert!(db.fetch_rsvp(&ev_b.id, "01U").await.is_ok());
+
+            // F4d: account cascade hits every server.
+            db.delete_rsvps_for_user("01U").await.unwrap();
+            assert!(db.fetch_rsvp(&ev_b.id, "01U").await.is_err());
+
+            // F4c: server cascade removes events, RSVPs and reminder markers.
+            let marker = ReminderSentKey {
+                event: ev_a1.id.clone(),
+                user: "01V".to_string(),
+                occurrence: ev_a1.start,
+                offset: 0,
+            };
+            assert!(db.mark_reminder_sent_if_absent(&marker).await.unwrap());
+            db.delete_calendar_for_server("01SA").await.unwrap();
+            assert!(db.fetch_event(&ev_a1.id).await.is_err());
+            assert!(db.fetch_event(&ev_a2.id).await.is_err());
+            assert!(db.fetch_event(&ev_b.id).await.is_ok(), "other server untouched");
+            assert!(db.fetch_rsvp(&ev_a1.id, "01V").await.is_err());
+            assert!(
+                db.mark_reminder_sent_if_absent(&marker).await.unwrap(),
+                "the reminder marker was deleted by the server cascade"
+            );
+        });
+    }
+
+    /// Slice F (F1): the prod migration (revision 54) creates the calendar
+    /// collections + indexes for an EXISTING deployment and is idempotent — run
+    /// from a pre-calendar revision (53) and re-run at the shipped revision (54,
+    /// what the live DB stores). Mongo-only: migrations are a Mongo concept and
+    /// init.rs already covers fresh DBs; under REFERENCE this is a no-op.
+    #[cfg(feature = "mongodb")]
+    #[tokio::test]
+    async fn prod_migration_revision_54_idempotent() {
+        database_test!(|db| async move {
+            let crate::Database::MongoDb(mongo) = &db else {
+                return;
+            };
+            use bson::{doc, Document};
+
+            let migrations = mongo.col::<Document>("migrations");
+            let assert_created = || async {
+                let collections = mongo.db().list_collection_names().await.unwrap();
+                for col in ["calendar_events", "event_rsvps", "event_reminders_sent"] {
+                    assert!(
+                        collections.contains(&col.to_string()),
+                        "missing collection {col}"
+                    );
+                }
+                let index_names = mongo
+                    .db()
+                    .collection::<Document>("calendar_events")
+                    .list_index_names()
+                    .await
+                    .unwrap();
+                for index in ["server_series_end", "server_start", "series_end_global"] {
+                    assert!(
+                        index_names.contains(&index.to_string()),
+                        "missing index {index}"
+                    );
+                }
+            };
+
+            for pinned in [53_i32, 54_i32] {
+                // Drop the calendar collections so EACH pinned revision must
+                // independently prove creation — otherwise a guard regression
+                // excluding revision 54 (the deployed prod state) would pass on
+                // leftovers from the 53 iteration.
+                for col in ["calendar_events", "event_rsvps", "event_reminders_sent"] {
+                    mongo.db().collection::<Document>(col).drop().await.ok();
+                }
+                migrations
+                    .update_one(
+                        doc! { "_id": 0_i32 },
+                        doc! { "$set": { "revision": pinned } },
+                    )
+                    .upsert(true)
+                    .await
+                    .unwrap();
+                db.migrate_database().await.unwrap();
+                assert_created().await;
+            }
+
+            // Re-run at 54 WITHOUT dropping: the migration must be idempotent
+            // against existing collections + indexes.
+            migrations
+                .update_one(
+                    doc! { "_id": 0_i32 },
+                    doc! { "$set": { "revision": 54_i32 } },
+                )
+                .await
+                .unwrap();
+            db.migrate_database().await.unwrap();
+            assert_created().await;
         });
     }
 }

@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use revolt_result::Result;
 
 use crate::ReferenceDb;
@@ -35,11 +37,11 @@ impl AbstractCalendarEvents for ReferenceDb {
         to: i64,
     ) -> Result<Vec<CalendarEvent>> {
         let events = self.calendar_events.lock().await;
+        // Cancelled series are INCLUDED (slice F, 0.2-A): clients strike them through;
+        // the reminder scan uses `fetch_events_in_reminder_window`, which excludes them.
         Ok(events
             .values()
-            .filter(|e| {
-                e.server == server_id && !e.cancelled && e.start <= to && e.series_end >= from
-            })
+            .filter(|e| e.server == server_id && e.start <= to && e.series_end >= from)
             .cloned()
             .collect())
     }
@@ -144,6 +146,52 @@ impl AbstractCalendarEvents for ReferenceDb {
         let mut rsvps = self.event_rsvps.lock().await;
         rsvps.retain(|k, _| k.event != event_id);
         Ok(())
+    }
+
+    async fn delete_rsvps_for_member(&self, server_id: &str, user_id: &str) -> Result<()> {
+        let events = self.calendar_events.lock().await;
+        let server_events: HashSet<&str> = events
+            .values()
+            .filter(|e| e.server == server_id)
+            .map(|e| e.id.as_str())
+            .collect();
+        let mut rsvps = self.event_rsvps.lock().await;
+        rsvps.retain(|k, _| k.user != user_id || !server_events.contains(k.event.as_str()));
+        Ok(())
+    }
+
+    async fn delete_rsvps_for_user(&self, user_id: &str) -> Result<()> {
+        let mut rsvps = self.event_rsvps.lock().await;
+        rsvps.retain(|k, _| k.user != user_id);
+        Ok(())
+    }
+
+    async fn delete_calendar_for_server(&self, server_id: &str) -> Result<()> {
+        let mut events = self.calendar_events.lock().await;
+        let removed: HashSet<String> = events
+            .values()
+            .filter(|e| e.server == server_id)
+            .map(|e| e.id.clone())
+            .collect();
+        events.retain(|_, e| e.server != server_id);
+        drop(events);
+
+        let mut rsvps = self.event_rsvps.lock().await;
+        rsvps.retain(|k, _| !removed.contains(&k.event));
+        drop(rsvps);
+
+        let mut reminders = self.event_reminders.lock().await;
+        reminders.retain(|k, _| !removed.contains(&k.event));
+        Ok(())
+    }
+
+    async fn fetch_imported_source_ids(&self, server_id: &str) -> Result<HashSet<String>> {
+        let events = self.calendar_events.lock().await;
+        Ok(events
+            .values()
+            .filter(|e| e.server == server_id)
+            .filter_map(|e| e.source_message_id.clone())
+            .collect())
     }
 
     async fn fetch_events_in_reminder_window(

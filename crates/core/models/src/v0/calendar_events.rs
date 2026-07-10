@@ -224,12 +224,51 @@ auto_derived!(
         pub remove: Vec<FieldsEvent>,
     }
 
-    /// Users to invite to an event
+    /// Users and/or roles to invite to an event. At least one of `users`/`roles`
+    /// must be non-empty (enforced at the route).
     #[cfg_attr(feature = "validator", derive(Validate))]
     pub struct DataInviteToEvent {
         /// User ids to invite
-        #[cfg_attr(feature = "validator", validate(length(min = 1, max = 100)))]
-        pub users: Vec<String>,
+        #[cfg_attr(feature = "validator", validate(length(max = 100)))]
+        #[serde(default)]
+        pub users: Option<Vec<String>>,
+        /// Role ids whose current holders are invited (server-side expansion —
+        /// slice F, decision 0.1-A). Unknown roles fail the whole request.
+        #[cfg_attr(feature = "validator", validate(length(max = 25)))]
+        #[serde(default)]
+        pub roles: Option<Vec<String>>,
+    }
+
+    /// Result of an invite request
+    pub struct InviteResult {
+        /// Number of genuinely-new invitees (RSVP rows created)
+        pub invited: usize,
+        /// Number skipped: non-members, pending-deletion members, invitees without
+        /// channel view permission, or users who already had an RSVP row
+        pub skipped: usize,
+    }
+
+    /// Import legacy `[ACUTEST_EVENT]:`-tagged messages from a channel (design §11)
+    pub struct DataImportLegacyEvents {
+        /// Channel to scan for tagged messages; must belong to the server and be
+        /// viewable by the caller
+        pub channel: String,
+    }
+
+    /// Result of a legacy import run
+    pub struct ImportResult {
+        /// Events created
+        pub imported: usize,
+        /// Tagged messages skipped because they were already imported
+        /// (`source_message_id` dedup)
+        pub skipped_duplicates: usize,
+        /// Tagged messages rejected by validation (bad JSON, title/description
+        /// length, unparseable start, end before start)
+        pub skipped_invalid: usize,
+        /// Messages scanned in total
+        pub scanned: usize,
+        /// Whether the scan stopped at the message cap before exhausting history
+        pub truncated: bool,
     }
 
     /// Set the caller's RSVP

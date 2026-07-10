@@ -17,9 +17,12 @@ const MAX_ATTENDEES_PAGE: usize = 100;
 
 /// # Invite Users
 ///
-/// Invite server members to an event. Insert-if-absent: re-inviting a user who
-/// already answered is a no-op. Non-members — and, for a channel-scoped event,
-/// members who cannot view that channel — are skipped. Requires manage.
+/// Invite server members to an event, by user id and/or by role (each named role's
+/// CURRENT holders are expanded server-side — slice F, decision 0.1-A; an unknown
+/// role fails the whole request before any insert). Insert-if-absent: re-inviting a
+/// user who already answered is a no-op. Non-members — and, for a channel-scoped
+/// event, members who cannot view that channel — are skipped and counted. Requires
+/// manage.
 #[openapi(tag = "Calendar")]
 #[post("/event/<target>/invites", data = "<data>")]
 pub async fn invite_to_event(
@@ -28,7 +31,7 @@ pub async fn invite_to_event(
     user: User,
     target: Reference<'_>,
     data: Json<v0::DataInviteToEvent>,
-) -> Result<EmptyResponse> {
+) -> Result<Json<v0::InviteResult>> {
     super::require_events_enabled().await?;
     let data = data.into_inner();
     data.validate().map_err(|error| {
@@ -37,11 +40,35 @@ pub async fn invite_to_event(
         })
     })?;
 
+    let users = data.users.unwrap_or_default();
+    let roles = data.roles.unwrap_or_default();
+    if users.is_empty() && roles.is_empty() {
+        return Err(create_error!(FailedValidation {
+            error: "users_or_roles".to_string()
+        }));
+    }
+
     let event = db.fetch_event(target.id).await?;
     if event.cancelled {
         return Err(create_error!(InvalidOperation));
     }
     super::authorize_manage(db, &user, &event).await?;
+
+    // Role expansion: every role must exist on the server (a typo'd/deleted role is
+    // a hard error, not a silent no-op), then its current holders join the invite
+    // set. Dedup across users∩roles and role∩role via the set.
+    let mut invitees: std::collections::HashSet<String> = users.into_iter().collect();
+    if !roles.is_empty() {
+        let server = db.fetch_server(&event.server).await?;
+        for role_id in &roles {
+            if !server.roles.contains_key(role_id) {
+                return Err(create_error!(NotFound));
+            }
+        }
+        for member in db.fetch_all_members_with_roles(&event.server, &roles).await? {
+            invitees.insert(member.id.user);
+        }
+    }
 
     // For a channel-scoped event, an invitee must be able to view that channel —
     // otherwise they would be "invited but cannot open" (keeps invite/view/RSVP
@@ -51,26 +78,37 @@ pub async fn invite_to_event(
         None => None,
     };
 
+    let mut invited = 0usize;
+    let mut skipped = 0usize;
     let wire = super::event_to_wire(event.clone());
-    for uid in &data.users {
+    for uid in &invitees {
+        // REQUIRED even for role-expanded members: `fetch_all_members_with_roles`
+        // does not filter `pending_deletion_at`, so this re-check is the only thing
+        // keeping a soft-deleted member from being re-invited (slice-F audit).
         if db.fetch_member(&event.server, uid).await.is_err() {
+            skipped += 1;
             continue;
         }
         if let Some(channel) = &channel {
             let target_user = match db.fetch_user(uid).await {
                 Ok(u) => u,
-                Err(_) => continue,
+                Err(_) => {
+                    skipped += 1;
+                    continue;
+                }
             };
             let mut query = DatabasePermissionQuery::new(db, &target_user).channel(channel);
             if !calculate_channel_permissions(&mut query)
                 .await
                 .has_channel_permission(ChannelPermission::ViewChannel)
             {
+                skipped += 1;
                 continue;
             }
         }
         // Only fan out an invite for a genuinely new invitee (insert-if-absent → true).
         if EventRsvp::invite(db, &event.id, uid, &user.id).await? {
+            invited += 1;
             EventV1::CalendarEventInvite {
                 event: wire.clone(),
             }
@@ -89,10 +127,13 @@ pub async fn invite_to_event(
             })
             .await
             .ok();
+        } else {
+            // Already had an RSVP row — re-invites never reset an answer (finding H5).
+            skipped += 1;
         }
     }
 
-    Ok(EmptyResponse)
+    Ok(Json(v0::InviteResult { invited, skipped }))
 }
 
 /// # Uninvite User

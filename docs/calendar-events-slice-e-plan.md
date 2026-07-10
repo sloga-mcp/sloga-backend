@@ -379,6 +379,10 @@ Existing title/date/time/desc plus:
 
 ## Carried to slice F (from browser verification, 2026-07-09)
 
+> **Resolved in slice F** (2026-07-09, `calendar-events-slice-f-plan.md`): role-based group
+> invites landed as the server-side `{users?, roles?}` expansion (decision 0.1-A); the edit form,
+> legacy import, cancelled-on-grid (0.2-A) and the deferred slice-D LOWs all shipped there.
+
 - **Role-based group invites** (operator request): the invite search should match server *role* names
   alongside member names — picking "Raid group 1" invites everyone currently holding that role
   (client-side expansion → existing `users:[]` invite route, ≤100/batch, dedup vs attendees; consider a

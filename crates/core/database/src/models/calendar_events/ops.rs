@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use revolt_result::Result;
 
 use crate::{
@@ -16,7 +18,9 @@ pub trait AbstractCalendarEvents: Sync + Send {
     /// Fetch a calendar event by its id
     async fn fetch_event(&self, id: &str) -> Result<CalendarEvent>;
 
-    /// Fetch non-cancelled events in a server whose series overlaps the window `[from, to]`.
+    /// Fetch events in a server whose series overlaps the window `[from, to]`, INCLUDING
+    /// cancelled series (rendered struck-through by clients — slice F decision 0.2-A; the
+    /// reminder scan uses the separate `fetch_events_in_reminder_window`, which excludes them).
     /// Returns candidate series (recurrence is expanded by the caller); the query is bounded
     /// by `series_end >= from AND start <= to` so a series anchored before the window is found.
     async fn fetch_events_for_server_in_window(
@@ -60,6 +64,23 @@ pub trait AbstractCalendarEvents: Sync + Send {
 
     /// Delete every RSVP row for an event (cascade on event delete)
     async fn delete_rsvps_for_event(&self, event_id: &str) -> Result<()>;
+
+    /// Delete every RSVP row a user holds on events of one server (cascade on member
+    /// removal — leave/kick/ban all route through `Member::remove`). Zero matches is Ok.
+    async fn delete_rsvps_for_member(&self, server_id: &str, user_id: &str) -> Result<()>;
+
+    /// Delete every RSVP row a user holds anywhere (cascade on account deletion —
+    /// `User::delete` bypasses `Member::remove`). Zero matches is Ok.
+    async fn delete_rsvps_for_user(&self, user_id: &str) -> Result<()>;
+
+    /// Delete all calendar state owned by a server: events, their RSVP rows and their
+    /// reminder markers (cascade on server deletion — without this, dead series keep
+    /// matching crond's cross-server reminder scan until their `series_end`).
+    async fn delete_calendar_for_server(&self, server_id: &str) -> Result<()>;
+
+    /// The `source_message_id`s of every event already imported into a server from the
+    /// legacy tag format — the import's dedup set (design §11, finding M5).
+    async fn fetch_imported_source_ids(&self, server_id: &str) -> Result<HashSet<String>>;
 
     /// Fetch non-cancelled events across all servers that the reminder scan must
     /// consider: `start <= start_max AND series_end >= series_end_min`. The caller
