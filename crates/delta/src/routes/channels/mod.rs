@@ -18,6 +18,7 @@ mod message_fetch;
 mod message_pin;
 mod message_query;
 mod message_react;
+mod message_roll;
 mod message_search;
 mod message_send;
 mod message_unpin;
@@ -38,6 +39,7 @@ pub fn routes() -> (Vec<Route>, OpenApi) {
         channel_edit::edit,
         invite_create::create_invite,
         message_send::message_send,
+        message_roll::message_roll,
         message_query::query,
         message_search::search,
         message_pin::message_pin,

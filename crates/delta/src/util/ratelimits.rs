@@ -36,7 +36,8 @@ impl<'a> RatelimitResolver<Request<'a>> for DeltaRatelimits {
                 ("bots", _, _) => ("bots", None),
                 ("channels", Some(id), _) => {
                     if request.method() == Method::Post {
-                        if let Some("messages") = extra {
+                        // Dice rolls create messages, so they share the messaging bucket
+                        if let Some("messages" | "roll") = extra {
                             return ("messaging", Some(id));
                         }
                     }
