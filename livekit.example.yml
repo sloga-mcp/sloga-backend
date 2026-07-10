@@ -11,3 +11,16 @@ logging:
   level: debug
 keys:
   worldwide: ZjCofRlfm6GGtjlifmNpCDkcQbEIIVC0
+rtc:
+  tcp_port: 7881
+  port_range_start: 50500
+  port_range_end: 50600
+  # Advertise the host's public IP (detected via STUN) so remote peers can reach media.
+  use_external_ip: true
+# Built-in TURN relay — gives callers behind symmetric NAT / VPN / strict firewalls a
+# guaranteed media path by relaying through this (publicly-reachable) server. LiveKit
+# hands the turn: URL to clients automatically; no frontend change needed.
+# Forward UDP 3478 to this host on the router; the relay range (30000-40000) stays internal.
+turn:
+  enabled: true
+  udp_port: 3478

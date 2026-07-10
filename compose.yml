@@ -90,6 +90,7 @@ services:
     ports:
       - "7880:7880"
       - "7881:7881"
+      - "3478:3478/udp"
       - "50500-50600:50500-50600/udp"
     volumes:
       - ./livekit.yml:/etc/livekit.yml
