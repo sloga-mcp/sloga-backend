@@ -1,34 +1,37 @@
 # Acutest reverse proxy
+# Upstreams use 127.0.0.1 (caddy + all backends share one WSL netns). Do NOT hardcode the
+# WSL eth0 IP here — it changes with WSL networking mode (was 127.0.0.1 under NAT; the
+# switch to mirrored mode on 2026-07-08 made that IP unreachable → every route 502'd).
 :80 {
     # WebSocket (Bonfire)
     handle /ws {
-        reverse_proxy 172.23.130.41:14703
+        reverse_proxy 127.0.0.1:14703
     }
 
     # LiveKit voice (strip /livekit prefix, handles both /livekit and /livekit/*)
     handle /livekit* {
         uri strip_prefix /livekit
-        reverse_proxy 172.23.130.41:7880
+        reverse_proxy 127.0.0.1:7880
     }
 
     # File/media server (Autumn)
     handle_path /media/* {
-        reverse_proxy 172.23.130.41:14704
+        reverse_proxy 127.0.0.1:14704
     }
 
     # Link proxy (January)
     handle_path /proxy/* {
-        reverse_proxy 172.23.130.41:14705
+        reverse_proxy 127.0.0.1:14705
     }
 
     # REST API (Delta) — proxied under /api, prefix stripped
     handle_path /api/* {
-        reverse_proxy 172.23.130.41:14702
+        reverse_proxy 127.0.0.1:14702
     }
 
     # API root discovery endpoint
     handle /api {
-        reverse_proxy 172.23.130.41:14702
+        reverse_proxy 127.0.0.1:14702
     }
 
     # App updates (desktop latest.json + installers, Android APKs)
@@ -41,6 +44,6 @@
 
     # Frontend — proxy to Vite dev server
     handle {
-        reverse_proxy 172.23.130.41:5174
+        reverse_proxy 127.0.0.1:5174
     }
 }
