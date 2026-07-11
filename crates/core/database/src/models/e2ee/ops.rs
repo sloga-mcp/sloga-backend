@@ -79,6 +79,15 @@ pub trait AbstractE2EE: Sync + Send {
     async fn count_e2ee_envelopes(&self, recipient_user_id: &str, recipient_device_id: &str)
         -> Result<u64>;
 
+    /// Sum the ENCODED ciphertext bytes queued for a device (the per-device
+    /// queue BYTE budget — media-E2EE plan §2.2.4: welcome-sized envelopes
+    /// must not multiply the abuse ceiling the depth cap was sized for)
+    async fn sum_e2ee_envelope_bytes(
+        &self,
+        recipient_user_id: &str,
+        recipient_device_id: &str,
+    ) -> Result<u64>;
+
     /// Fetch queued envelopes for a device, ordered by id ascending
     async fn fetch_e2ee_envelopes(
         &self,

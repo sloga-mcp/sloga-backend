@@ -470,6 +470,11 @@ pub struct Features {
     #[serde(default)]
     pub e2ee_enabled: bool,
 
+    /// Operator flag for the MLS delivery service + KeyPackage directory
+    /// backing media E2EE (calls). Requires `e2ee_enabled`.
+    #[serde(default)]
+    pub media_e2ee_enabled: bool,
+
     /// Operator flag for the server calendar/events routes
     #[serde(default)]
     pub events_enabled: bool,

@@ -1653,6 +1653,16 @@ impl From<E2EESignedKey> for crate::E2EESignedKey {
     }
 }
 
+impl From<crate::E2EEContentType> for E2EEContentType {
+    fn from(value: crate::E2EEContentType) -> Self {
+        match value {
+            crate::E2EEContentType::Olm => E2EEContentType::Olm,
+            crate::E2EEContentType::MlsCommit => E2EEContentType::MlsCommit,
+            crate::E2EEContentType::MlsWelcome => E2EEContentType::MlsWelcome,
+        }
+    }
+}
+
 impl From<crate::E2EEEnvelope> for E2EEMessage {
     fn from(value: crate::E2EEEnvelope) -> Self {
         E2EEMessage {
@@ -1664,6 +1674,9 @@ impl From<crate::E2EEEnvelope> for E2EEMessage {
             protocol_version: value.protocol_version,
             sequence: value.sequence,
             ciphertext: value.ciphertext,
+            content_type: value.content_type.into(),
+            group_id: value.group_id,
+            epoch: value.epoch,
         }
     }
 }

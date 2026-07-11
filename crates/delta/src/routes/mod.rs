@@ -10,6 +10,7 @@ mod customisation;
 mod e2ee;
 mod events;
 mod invites;
+mod mls;
 mod onboard;
 mod policy;
 mod push;
@@ -40,6 +41,7 @@ pub fn mount(config: Settings, mut rocket: Rocket<Build>) -> Rocket<Build> {
             "/custom" => customisation::routes(),
             "/safety" => safety::routes(),
             "/e2ee" => e2ee::routes(),
+            "/mls" => mls::routes(),
             "/events" => events::routes(),
             "/auth/account" => account::routes(),
             "/auth/session" => session::routes(),
@@ -64,6 +66,7 @@ pub fn mount(config: Settings, mut rocket: Rocket<Build>) -> Rocket<Build> {
             "/custom" => customisation::routes(),
             "/safety" => safety::routes(),
             "/e2ee" => e2ee::routes(),
+            "/mls" => mls::routes(),
             "/events" => events::routes(),
             "/auth/account" => account::routes(),
             "/auth/session" => session::routes(),
@@ -167,7 +170,8 @@ fn custom_openapi_spec() -> OpenApi {
           {
             "name": "E2EE",
             "tags": [
-              "E2EE"
+              "E2EE",
+              "MLS"
             ]
           },
           {
@@ -345,6 +349,14 @@ fn custom_openapi_spec() -> OpenApi {
                 name: "E2EE".to_owned(),
                 description: Some(
                     "Key directory and encrypted-envelope relay for end-to-end encrypted DMs"
+                        .to_owned(),
+                ),
+                ..Default::default()
+            },
+            Tag {
+                name: "MLS".to_owned(),
+                description: Some(
+                    "MLS delivery service + KeyPackage directory for media E2EE (calls)"
                         .to_owned(),
                 ),
                 ..Default::default()

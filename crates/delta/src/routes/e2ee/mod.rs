@@ -14,7 +14,7 @@ mod put_backup;
 mod revoke_device;
 mod send_messages;
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 /// Maximum length of a key-backup header (the plaintext, server-visible AAD)
 pub const MAX_BACKUP_HEADER_LENGTH: usize = 1024;
@@ -46,6 +46,16 @@ pub const MAX_CIPHERTEXT_LENGTH: usize = 65536;
 /// Maximum queued envelopes per recipient device: a dead device's queue
 /// fills up and TTLs out without blocking live devices (per-device cap)
 pub const MAX_QUEUE_DEPTH: u64 = 512;
+
+/// Maximum queued ENCODED ciphertext bytes per recipient device (media-E2EE
+/// plan §2.2.4 queue-budget re-derivation). The depth cap was sized when
+/// every envelope was ≤ 64 KiB — an implicit worst case of 512 × 64 KiB =
+/// 32 MiB per device. MLS Welcomes raise the per-envelope cap to 256 KiB
+/// raw (≈ 341 KiB encoded), so without a byte budget the same depth cap
+/// would mean a ~5× larger abuse ceiling. This budget pins the ceiling at
+/// the pre-slice-6 value; it is enforced on the MLS fan-out path (the only
+/// source of over-64-KiB envelopes — client submission stays olm-only).
+pub const MAX_QUEUE_BYTES: u64 = 32 * 1024 * 1024;
 
 /// All E2EE routes sit behind the operator feature flag
 pub async fn require_e2ee_enabled() -> Result<()> {

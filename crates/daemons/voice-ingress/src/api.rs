@@ -5,10 +5,11 @@ use revolt_database::{
     iso8601_timestamp::{Duration, Timestamp},
     util::reference::Reference,
     voice::{
-        create_voice_state, delete_channel_voice_state, delete_voice_state,
-        get_user_moved_from_voice, get_user_moved_to_voice, get_user_voice_channels,
-        get_voice_channel_members, update_voice_state_tracks, RoomMetadata, UserVoiceChannel,
-        VoiceClient,
+        clear_voice_participant_identities, create_voice_state, delete_channel_voice_state,
+        delete_voice_state, delete_voice_participant_identity, get_user_moved_from_voice,
+        get_user_moved_to_voice, get_user_voice_channels, get_voice_channel_members,
+        set_voice_participant_identity, update_voice_state_tracks,
+        user_id_from_participant_identity, RoomMetadata, UserVoiceChannel, VoiceClient,
     },
     Database, AMQP,
 };
@@ -51,7 +52,11 @@ pub async fn ingress(
         .to_internal_error()?;
 
     let channel_id = event.room.as_ref().map(|r| &r.name);
-    let user_id = event.participant.as_ref().map(|r| &r.identity);
+    // Participant identities may be device-qualified ({user_id}:{device_id},
+    // media E2EE) — everything downstream keys on the bare user id
+    let identity = event.participant.as_ref().map(|r| &r.identity);
+    let user_id = identity.map(|i| user_id_from_participant_identity(i).to_string());
+    let user_id = user_id.as_ref();
     // Track events arrive with an empty room.metadata — treat as absent
     // instead of failing to parse (was causing 500s + endless retries).
     let room_metadata = match event.room.as_ref() {
@@ -75,6 +80,15 @@ pub async fn ingress(
             let joined_at = Timestamp::UNIX_EPOCH
                 .checked_add(Duration::seconds(event.created_at))
                 .unwrap();
+
+            // Record the full (possibly device-qualified) identity so
+            // server-side participant operations can address the SFU
+            set_voice_participant_identity(
+                channel_id,
+                user_id,
+                identity.to_internal_error()?,
+            )
+            .await?;
 
             let voice_state = create_voice_state(&channel, user_id, joined_at).await?;
 
@@ -168,6 +182,7 @@ pub async fn ingress(
             };
 
             delete_voice_state(&channel, user_id).await?;
+            delete_voice_participant_identity(channel_id, user_id).await?;
 
             // Everyone left — dismiss the ring notification on recipients
             let members = get_voice_channel_members(&channel).await?;
@@ -325,6 +340,14 @@ pub async fn ingress(
             };
 
             delete_channel_voice_state(&channel, &[]).await?;
+            clear_voice_participant_identities(channel_id).await?;
+
+            // Media E2EE: the call ended — close the channel's open MLS
+            // group so members wipe state and the crond sweep reclaims it
+            // (plan §1.4 end-of-call / §2.5)
+            if let Some(group) = db.fetch_open_mls_group_for_channel(channel_id).await? {
+                db.close_mls_group(&group.id).await?;
+            }
         }
         _ => {}
     };

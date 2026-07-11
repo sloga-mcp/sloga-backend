@@ -161,6 +161,11 @@ pub async fn send_messages(
             sequence: envelope.sequence,
             ciphertext: envelope.ciphertext,
             timestamp: Timestamp::now_utc(),
+            // Client envelope submission is olm-only: MLS envelope types are
+            // minted exclusively by the /mls commit fan-out (server-side)
+            content_type: revolt_database::E2EEContentType::Olm,
+            group_id: None,
+            epoch: None,
         };
 
         receipts.push(v0::E2EEDeliveryReceipt {

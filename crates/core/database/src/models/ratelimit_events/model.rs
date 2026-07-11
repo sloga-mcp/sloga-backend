@@ -20,6 +20,9 @@ auto_derived!(
     /// Event type
     pub enum RatelimitEventType {
         DiscriminatorChange,
+        /// MLS KeyPackage claim, keyed per (claimer, target device) pair
+        /// (media E2EE — plan §1.4 racing-admitter accounting)
+        MlsKeyPackageClaim,
     }
 );
 

@@ -7,9 +7,9 @@ use revolt_database::{
         reference::Reference,
     },
     voice::{
-        get_channel_node, get_user_voice_channel_in_server, set_channel_node,
-        set_user_moved_from_voice, set_user_moved_to_voice, sync_user_voice_permissions,
-        UserVoiceChannel, VoiceClient,
+        get_channel_node, get_user_voice_channel_in_server, get_voice_participant_identity,
+        set_channel_node, set_user_moved_from_voice, set_user_moved_to_voice,
+        sync_user_voice_permissions, UserVoiceChannel, VoiceClient,
     },
     Database, File, PartialMember, User,
 };
@@ -247,8 +247,26 @@ pub async fn edit(
             voice_client
                 .create_room(&new_node, &new_voice_channel)
                 .await?;
+
+            // Preserve a device-qualified identity across the move: the
+            // target's device suffix is recovered from the old channel's
+            // ingress-maintained mapping (the server itself never knows
+            // which device is in a call)
+            let old_identity =
+                get_voice_participant_identity(&channel, &target_user.id).await?;
+            let device_id = old_identity
+                .strip_prefix(&format!("{}:", target_user.id))
+                .map(str::to_string);
+
             let token = voice_client
-                .create_token(&new_node, db, &target_user, permissions, &new_voice_channel)
+                .create_token(
+                    &new_node,
+                    db,
+                    &target_user,
+                    permissions,
+                    &new_voice_channel,
+                    device_id.as_deref(),
+                )
                 .await?;
 
             voice_client

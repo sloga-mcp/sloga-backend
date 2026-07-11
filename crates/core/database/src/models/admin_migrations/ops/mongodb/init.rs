@@ -134,6 +134,22 @@ pub async fn create_database(db: &MongoDb) {
         .await
         .expect("Failed to create e2ee_queue collection.");
 
+    db.create_collection("mls_key_packages")
+        .await
+        .expect("Failed to create mls_key_packages collection.");
+
+    db.create_collection("mls_groups")
+        .await
+        .expect("Failed to create mls_groups collection.");
+
+    db.create_collection("mls_commits")
+        .await
+        .expect("Failed to create mls_commits collection.");
+
+    db.create_collection("mls_join_intents")
+        .await
+        .expect("Failed to create mls_join_intents collection.");
+
     db.run_command(doc! {
         "createIndexes": "users",
         "indexes": [
@@ -494,6 +510,81 @@ pub async fn create_database(db: &MongoDb) {
     })
     .await
     .expect("Failed to create event_reminders_sent index.");
+
+    db.run_command(doc! {
+        "createIndexes": "mls_key_packages",
+        "indexes": [
+            // Serves count/consume/replace (consume filters on last_resort)
+            {
+                "key": {
+                    "user_id": 1_i32,
+                    "device_id": 1_i32,
+                    "last_resort": 1_i32
+                },
+                "name": "user_device_last_resort"
+            },
+            // Serves the hourly expiry sweep
+            {
+                "key": {
+                    "expires_at": 1_i32
+                },
+                "name": "expires_at"
+            }
+        ]
+    })
+    .await
+    .expect("Failed to create mls_key_packages index.");
+
+    db.run_command(doc! {
+        "createIndexes": "mls_groups",
+        "indexes": [
+            // The channel-scoped create-race arbitration (media-E2EE plan
+            // §1.2/A5): at most ONE open group per channel; racing creators
+            // are settled by this partial unique index, never by group_id
+            // (racing creators derive DIFFERENT group ids).
+            {
+                "key": {
+                    "channel_id": 1_i32
+                },
+                "name": "open_channel_group",
+                "unique": true,
+                "partialFilterExpression": { "open": true }
+            }
+        ]
+    })
+    .await
+    .expect("Failed to create mls_groups index.");
+
+    db.run_command(doc! {
+        "createIndexes": "mls_commits",
+        "indexes": [
+            // Serves the gap refetch (epoch range scan per group)
+            {
+                "key": {
+                    "group_id": 1_i32,
+                    "epoch": 1_i32
+                },
+                "name": "group_epoch"
+            }
+        ]
+    })
+    .await
+    .expect("Failed to create mls_commits index.");
+
+    db.run_command(doc! {
+        "createIndexes": "mls_join_intents",
+        "indexes": [
+            // Serves the group sweep's cascade delete
+            {
+                "key": {
+                    "group_id": 1_i32
+                },
+                "name": "group_id"
+            }
+        ]
+    })
+    .await
+    .expect("Failed to create mls_join_intents index.");
 
     info!("Created database.");
 }

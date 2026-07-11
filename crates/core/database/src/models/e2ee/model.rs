@@ -111,6 +111,25 @@ auto_derived!(
 );
 
 auto_derived!(
+    /// What an envelope's ciphertext contains — routing-opaque, but clients
+    /// dispatch on it and size caps differ per type (media-E2EE plan §2.2.4).
+    /// MLS envelope types are only ever minted SERVER-SIDE by the `/mls`
+    /// commit fan-out; the client envelope-submission route is olm-only.
+    #[derive(Copy, Default)]
+    #[serde(rename_all = "snake_case")]
+    pub enum E2EEContentType {
+        /// An Olm message (text E2EE, the slice-1..5 default)
+        #[default]
+        Olm,
+        /// An MLS commit (opaque MLS PrivateMessage), fanned out per member
+        /// device on epoch arbitration
+        MlsCommit,
+        /// An MLS Welcome, delivered to a newly added device
+        MlsWelcome,
+    }
+);
+
+auto_derived!(
     /// An encrypted envelope awaiting delivery
     ///
     /// Deleted on acknowledged delivery; swept by TTL for dead devices. The
@@ -143,6 +162,18 @@ auto_derived!(
         pub ciphertext: String,
         /// Server-stamped submission time
         pub timestamp: Timestamp,
+        /// What the ciphertext contains (routing-opaque; clients dispatch on
+        /// it, and per-type size caps apply — media-E2EE plan §2.2.4).
+        /// Defaults to `olm` so pre-slice-6 rows deserialize unchanged.
+        #[serde(default)]
+        pub content_type: E2EEContentType,
+        /// MLS group this envelope belongs to (mls_* content only) — opaque
+        /// to routing; clients order commits per group by `epoch`
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub group_id: Option<String>,
+        /// MLS epoch this envelope establishes (mls_commit/mls_welcome only)
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub epoch: Option<i64>,
     }
 );
 
@@ -464,6 +495,18 @@ impl E2EEIdentity {
         Ok(())
     }
 
+    /// Verify an Ed25519 signature by this device's identity key over an
+    /// arbitrary canonical payload. Used by the MLS delivery service (media
+    /// E2EE): credential binding at KeyPackage publish and join-intent
+    /// signatures — the canonical builders live in `models/mls/model.rs`.
+    pub fn verify_payload(&self, payload: &str, signature: &str) -> bool {
+        let Some(verifying_key) = self.verifying_key() else {
+            return false;
+        };
+
+        verify_signature(&verifying_key, payload, signature)
+    }
+
     /// Verify a signed device-claim challenge: proof of possession of this
     /// device's Ed25519 identity key by a connecting session. The nonce is
     /// server-generated; the session id is bound into the payload so a
@@ -538,6 +581,11 @@ impl E2EEIdentity {
     /// (`Session::delete`) and the account-deletion cascade (`User::delete`).
     pub async fn revoke_device(db: &Database, user_id: &str, device_id: &str) -> Result<bool> {
         let existed = db.delete_e2ee_device(user_id, device_id).await?;
+
+        // A revoked device's MLS KeyPackages must leave the directory with
+        // it — a claim against a dead device would brick the joiner's
+        // Welcome (media E2EE, slice 6)
+        db.delete_mls_key_packages(user_id, device_id).await?;
 
         if existed {
             Self::broadcast_device_change(

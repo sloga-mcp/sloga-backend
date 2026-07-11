@@ -8,3 +8,5 @@ pub mod prune_e2ee_blobs;
 pub mod prune_e2ee_envelopes;
 pub mod prune_members;
 pub mod prune_mfa_tickets;
+pub mod prune_mls_groups;
+pub mod prune_mls_key_packages;

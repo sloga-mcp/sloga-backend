@@ -26,7 +26,7 @@ struct MigrationInfo {
     revision: i32,
 }
 
-pub const LATEST_REVISION: i32 = 55; // MUST BE +1 to last migration
+pub const LATEST_REVISION: i32 = 56; // MUST BE +1 to last migration
 
 pub async fn migrate_database(db: &MongoDb) {
     let migrations = db.col::<Document>("migrations");
@@ -1661,6 +1661,93 @@ pub async fn run_migrations(db: &MongoDb, revision: i32) -> i32 {
             })
             .await
             .expect("Failed to create event_reminders_sent indexes.");
+    }
+
+    if revision <= 55 {
+        info!("Running migration [revision 55 / 10-07-2026]: Create MLS delivery-service collections and indexes (media E2EE)");
+
+        // Existing deployments predate media E2EE: init.rs only covers fresh
+        // DBs. Collections + indexes mirror init.rs exactly; both operations
+        // are idempotent (create_collection errors are ignored; createIndexes
+        // is a no-op when key+name already match), so a re-run or a fresh DB
+        // is safe.
+        db.db().create_collection("mls_key_packages").await.ok();
+        db.db().create_collection("mls_groups").await.ok();
+        db.db().create_collection("mls_commits").await.ok();
+        db.db().create_collection("mls_join_intents").await.ok();
+
+        db.db()
+            .run_command(doc! {
+                "createIndexes": "mls_key_packages",
+                "indexes": [
+                    {
+                        "key": {
+                            "user_id": 1_i32,
+                            "device_id": 1_i32,
+                            "last_resort": 1_i32
+                        },
+                        "name": "user_device_last_resort"
+                    },
+                    {
+                        "key": {
+                            "expires_at": 1_i32
+                        },
+                        "name": "expires_at"
+                    }
+                ]
+            })
+            .await
+            .expect("Failed to create mls_key_packages indexes.");
+
+        // The channel-scoped create-race arbitration (media-E2EE plan
+        // §1.2/A5): at most ONE open group per channel.
+        db.db()
+            .run_command(doc! {
+                "createIndexes": "mls_groups",
+                "indexes": [
+                    {
+                        "key": {
+                            "channel_id": 1_i32
+                        },
+                        "name": "open_channel_group",
+                        "unique": true,
+                        "partialFilterExpression": { "open": true }
+                    }
+                ]
+            })
+            .await
+            .expect("Failed to create mls_groups indexes.");
+
+        db.db()
+            .run_command(doc! {
+                "createIndexes": "mls_commits",
+                "indexes": [
+                    {
+                        "key": {
+                            "group_id": 1_i32,
+                            "epoch": 1_i32
+                        },
+                        "name": "group_epoch"
+                    }
+                ]
+            })
+            .await
+            .expect("Failed to create mls_commits indexes.");
+
+        db.db()
+            .run_command(doc! {
+                "createIndexes": "mls_join_intents",
+                "indexes": [
+                    {
+                        "key": {
+                            "group_id": 1_i32
+                        },
+                        "name": "group_id"
+                    }
+                ]
+            })
+            .await
+            .expect("Failed to create mls_join_intents indexes.");
     }
 
     // Reminder to update LATEST_REVISION when adding new migrations.

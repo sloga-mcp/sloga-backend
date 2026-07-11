@@ -216,7 +216,19 @@ impl TestHarness {
         let mut stream = self.sub.on_message();
         while let Some(item) = stream.next().await {
             let msg_topic = item.get_channel_name();
-            let payload: EventV1 = redis_kiss::decode_payload(&item).unwrap();
+            // The wildcard psubscribe sees EVERY topic; tolerate payloads
+            // that are not EventV1 (but surface them, since a silently
+            // skipped target event turns into a hang)
+            let payload: EventV1 = match redis_kiss::decode_payload(&item) {
+                Ok(payload) => payload,
+                Err(error) => {
+                    eprintln!(
+                        "wait_for_event: skipping undecodable payload on '{msg_topic}': {error:?} raw={:?}",
+                        item.get_payload::<String>()
+                    );
+                    continue;
+                }
+            };
 
             if topic == msg_topic && predicate(&payload) {
                 return payload;

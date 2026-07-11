@@ -71,15 +71,26 @@ impl VoiceClient {
         user: &User,
         permissions: PermissionValue,
         channel: &Channel,
+        device_id: Option<&str>,
     ) -> Result<String> {
         let room = self.get_node(node)?;
 
         let limits = user.limits().await;
         let allowed_sources = get_allowed_sources(&limits, permissions);
 
+        // Device-qualified identity (media E2EE, plan Q4): per-device frame
+        // keys require an injective identity → (user, device) mapping, and
+        // distinct identities stop the SFU kicking a user's first device the
+        // moment a second one connects (the one-device-per-call rule is
+        // enforced at the MLS delivery service instead).
+        let identity = match device_id {
+            Some(device_id) => format!("{}:{}", user.id, device_id),
+            None => user.id.clone(),
+        };
+
         AccessToken::with_api_key(&room.node.key, &room.node.secret)
             .with_name(&format!("{}#{}", user.username, user.discriminator))
-            .with_identity(&user.id)
+            .with_identity(&identity)
             .with_metadata(
                 &serde_json::to_string(&user.clone().into(db, None).await).to_internal_error()?,
             )
@@ -129,10 +140,14 @@ impl VoiceClient {
     ) -> Result<ParticipantInfo> {
         let room = self.get_node(node)?;
 
+        // LiveKit addresses participants by identity, which may be
+        // device-qualified — resolve through the ingress-maintained mapping
+        let identity = super::get_voice_participant_identity(channel_id, &user.id).await?;
+
         room.client
             .update_participant(
                 channel_id,
-                &user.id,
+                &identity,
                 UpdateParticipantOptions {
                     permission: Some(new_permissions),
                     ..Default::default()
@@ -145,8 +160,11 @@ impl VoiceClient {
     pub async fn remove_user(&self, node: &str, user_id: &str, channel_id: &str) -> Result<()> {
         let room = self.get_node(node)?;
 
+        // Resolve the (possibly device-qualified) identity the SFU knows
+        let identity = super::get_voice_participant_identity(channel_id, user_id).await?;
+
         room.client
-            .remove_participant(channel_id, user_id)
+            .remove_participant(channel_id, &identity)
             .await
             .to_internal_error()
     }

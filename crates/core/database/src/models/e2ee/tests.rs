@@ -123,6 +123,9 @@ fn make_envelope(recipient_user: &str, recipient_device: &str) -> E2EEEnvelope {
         sequence: 0,
         ciphertext: STANDARD_NO_PAD.encode(b"ciphertext"),
         timestamp: Timestamp::now_utc(),
+        content_type: crate::E2EEContentType::Olm,
+        group_id: None,
+        epoch: None,
     }
 }
 

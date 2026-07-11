@@ -1,4 +1,19 @@
 auto_derived!(
+    /// What an E2EE envelope's ciphertext contains. MLS types are only ever
+    /// minted server-side by the `/mls` commit fan-out; client envelope
+    /// submission is olm-only.
+    #[derive(Copy, Default)]
+    #[serde(rename_all = "snake_case")]
+    pub enum E2EEContentType {
+        /// An Olm message (text E2EE)
+        #[default]
+        Olm,
+        /// An MLS commit (opaque MLS PrivateMessage)
+        MlsCommit,
+        /// An MLS Welcome for a newly added device
+        MlsWelcome,
+    }
+
     /// A signed Curve25519 public key (fallback or one-time)
     ///
     /// The signature is Ed25519 by the owning device's identity key over the
@@ -243,5 +258,15 @@ auto_derived!(
         pub sequence: u64,
         /// Opaque ciphertext
         pub ciphertext: String,
+        /// What the ciphertext contains (clients dispatch on this; defaults
+        /// to `olm` so pre-slice-6 servers/rows interop unchanged)
+        #[serde(default)]
+        pub content_type: E2EEContentType,
+        /// MLS group this envelope belongs to (mls_* content only)
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub group_id: Option<String>,
+        /// MLS epoch this envelope establishes (mls_* content only)
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub epoch: Option<i64>,
     }
 );

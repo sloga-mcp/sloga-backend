@@ -5,9 +5,10 @@ use futures::lock::Mutex;
 use crate::{
     Bot, CalendarEvent, Channel, ChannelCompositeKey, ChannelUnread, E2EEBackup, E2EEBlob,
     E2EEEnvelope, E2EEIdentity, E2EEOneTimeKey, Emoji, EventRsvp, EventRsvpKey, File, FileHash,
-    Invite, Member, MemberCompositeKey, Message, PolicyChange, RatelimitEvent, ReminderSent,
-    ReminderSentKey, Report, Server, ServerBan, Snapshot, Sticker, User, UserSettings, Webhook,
-    Account, AccountInvite, Session, MFATicket
+    Invite, Member, MemberCompositeKey, Message, MlsCommit, MlsGroup, MlsJoinIntent,
+    MlsKeyPackage, PolicyChange, RatelimitEvent, ReminderSent, ReminderSentKey, Report, Server,
+    ServerBan, Snapshot, Sticker, User, UserSettings, Webhook, Account, AccountInvite, Session,
+    MFATicket
 };
 
 database_derived!(
@@ -45,5 +46,9 @@ database_derived!(
         pub e2ee_queue: Arc<Mutex<HashMap<String, E2EEEnvelope>>>,
         pub e2ee_blobs: Arc<Mutex<HashMap<String, E2EEBlob>>>,
         pub e2ee_backups: Arc<Mutex<HashMap<String, E2EEBackup>>>,
+        pub mls_key_packages: Arc<Mutex<HashMap<String, MlsKeyPackage>>>,
+        pub mls_groups: Arc<Mutex<HashMap<String, MlsGroup>>>,
+        pub mls_commits: Arc<Mutex<HashMap<String, MlsCommit>>>,
+        pub mls_join_intents: Arc<Mutex<HashMap<String, MlsJoinIntent>>>,
     }
 );

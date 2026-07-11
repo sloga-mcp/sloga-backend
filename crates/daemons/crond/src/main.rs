@@ -51,6 +51,8 @@ async fn main() {
         cron_task_wrapper(prune_mfa_tickets::task, db.clone(), amqp.clone()),
         cron_task_wrapper(prune_e2ee_envelopes::task, db.clone(), amqp.clone()),
         cron_task_wrapper(prune_e2ee_blobs::task, db.clone(), amqp.clone()),
+        cron_task_wrapper(prune_mls_groups::task, db.clone(), amqp.clone()),
+        cron_task_wrapper(prune_mls_key_packages::task, db.clone(), amqp.clone()),
         cron_task_wrapper(event_reminders::task, db.clone(), amqp.clone()),
     );
 }

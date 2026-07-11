@@ -250,6 +250,43 @@ impl AbstractE2EE for MongoDb {
             .map_err(|_| create_database_error!("count_documents", COL_QUEUE))
     }
 
+    async fn sum_e2ee_envelope_bytes(
+        &self,
+        recipient_user_id: &str,
+        recipient_device_id: &str,
+    ) -> Result<u64> {
+        // $strLenBytes on the stored base64 text: the budget is accounted in
+        // ENCODED bytes (documented at the enforcement site)
+        let mut cursor = self
+            .col::<Document>(COL_QUEUE)
+            .aggregate(vec![
+                doc! {
+                    "$match": {
+                        "recipient_user_id": recipient_user_id,
+                        "recipient_device_id": recipient_device_id
+                    }
+                },
+                doc! {
+                    "$group": {
+                        "_id": null,
+                        "total": { "$sum": { "$strLenBytes": "$ciphertext" } }
+                    }
+                },
+            ])
+            .await
+            .map_err(|_| create_database_error!("aggregate", COL_QUEUE))?;
+
+        let total = match cursor.next().await {
+            Some(Ok(document)) => document
+                .get_i64("total")
+                .or_else(|_| document.get_i32("total").map(i64::from))
+                .unwrap_or(0),
+            _ => 0,
+        };
+
+        Ok(total.max(0) as u64)
+    }
+
     async fn fetch_e2ee_envelopes(
         &self,
         recipient_user_id: &str,

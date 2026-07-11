@@ -414,6 +414,31 @@ pub enum EventV1 {
         device_id: String,
     },
 
+    /// A device signalled intent to join a call's MLS group (media E2EE).
+    ///
+    /// Fanned out to each member USER's private topic; member devices verify
+    /// the intent signature against their own pins before admitting — the
+    /// server relay is never the trust decision (plan §1.4).
+    MlsJoinRequested {
+        group_id: String,
+        channel_id: String,
+        user_id: String,
+        device_id: String,
+        key_package_ref: String,
+        signature: String,
+    },
+
+    /// Live push of an MLS commit envelope (media E2EE).
+    ///
+    /// The envelope is ALSO queued in the device mailbox (queue-first);
+    /// clients dedup by envelope ULID exactly like E2EEMessage, and order
+    /// per group strictly by consecutive epoch, parking/refetching on gaps.
+    MlsCommit(E2EEMessage),
+
+    /// Live push of an MLS Welcome envelope to a newly added device
+    /// (media E2EE). Same queue-first + ULID-dedup contract as MlsCommit.
+    MlsWelcome(E2EEMessage),
+
     /// Device-claim challenge (connection-local, issued by the events
     /// server; the client signs this with the device Ed25519 identity key)
     E2EEChallenge {

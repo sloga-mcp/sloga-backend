@@ -6,7 +6,7 @@ use revolt_database::{
         raise_if_in_voice, set_call_notification_recipients, set_channel_node, UserVoiceChannel,
         VoiceClient,
     },
-    Database, User,
+    Database, Session, User,
 };
 use revolt_models::v0;
 use revolt_permissions::{calculate_channel_permissions, ChannelPermission};
@@ -23,6 +23,7 @@ pub async fn call(
     db: &State<Database>,
     voice_client: &State<VoiceClient>,
     user: User,
+    session: Session,
     target: Reference<'_>,
     data: Json<v0::DataJoinCall>,
 ) -> Result<Json<v0::CreateVoiceUserResponse>> {
@@ -34,10 +35,29 @@ pub async fn call(
         node,
         force_disconnect,
         recipients,
+        device_id,
     } = data.into_inner();
 
     if user.bot.is_some() && force_disconnect == Some(true) {
         return Err(create_error!(IsBot));
+    }
+
+    // Device-qualified join (media E2EE, plan Q4): the claimed device must
+    // be a registered E2EE device of the calling user AND the session must
+    // be bound to it — a stolen web token cannot impersonate a device
+    // identity on the SFU.
+    if let Some(device_id) = &device_id {
+        crate::routes::mls::require_media_e2ee_enabled().await?;
+
+        let identity = db
+            .fetch_e2ee_identity(&user.id, device_id)
+            .await
+            .map_err(|_| {
+                create_error!(FailedValidation {
+                    error: "joining device is not registered".to_string()
+                })
+            })?;
+        identity.assert_bound_session(&session.id)?;
     }
 
     let channel = target.as_channel(db).await?;
@@ -97,7 +117,14 @@ pub async fn call(
     }
 
     let token = voice_client
-        .create_token(&node, db, &user, current_permissions, &channel)
+        .create_token(
+            &node,
+            db,
+            &user,
+            current_permissions,
+            &channel,
+            device_id.as_deref(),
+        )
         .await?;
 
     let room = voice_client.create_room(&node, &channel).await?;

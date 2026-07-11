@@ -10,6 +10,7 @@ mod emojis;
 mod file_hashes;
 mod files;
 mod messages;
+mod mls;
 mod stickers;
 mod policy_changes;
 mod ratelimit_events;
@@ -37,6 +38,7 @@ pub use emojis::*;
 pub use file_hashes::*;
 pub use files::*;
 pub use messages::*;
+pub use mls::*;
 pub use stickers::*;
 pub use policy_changes::*;
 pub use ratelimit_events::*;
@@ -69,6 +71,7 @@ pub trait AbstractDatabase:
     + channel_webhooks::AbstractWebhooks
     + e2ee::AbstractE2EE
     + emojis::AbstractEmojis
+    + mls::AbstractMls
     + file_hashes::AbstractAttachmentHashes
     + files::AbstractAttachments
     + stickers::AbstractStickers

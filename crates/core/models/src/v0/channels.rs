@@ -323,6 +323,14 @@ auto_derived!(
         ///
         /// Only used when the user is the first one connected.
         pub recipients: Option<Vec<String>>,
+        /// E2EE device id joining the call (media E2EE).
+        ///
+        /// When present (requires media E2EE to be enabled) it must be a
+        /// registered E2EE device of the calling user whose session is bound
+        /// to it; the LiveKit participant identity then becomes
+        /// `{user_id}:{device_id}` so per-device frame keys map injectively
+        /// onto SFU participants.
+        pub device_id: Option<String>,
     }
 
     pub struct ChannelSlowmode {

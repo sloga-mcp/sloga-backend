@@ -1,6 +1,6 @@
 use revolt_result::Result;
 
-use crate::{FieldsUser, PartialUser, RelationshipStatus, User};
+use crate::{Channel, FieldsUser, PartialUser, RelationshipStatus, User};
 use crate::{ReferenceDb, Relationship};
 
 use super::AbstractUsers;
@@ -66,18 +66,69 @@ impl AbstractUsers for ReferenceDb {
     }
 
     /// Fetch ids of users that both users are friends with
-    async fn fetch_mutual_user_ids(&self, _user_a: &str, _user_b: &str) -> Result<Vec<String>> {
-        todo!()
+    ///
+    /// (Was `todo!()` — a latent panic on any request path reaching the
+    /// friend/mutual eligibility fallback for strangers, e.g. the MLS
+    /// KeyPackage claim route. Mirrors the Mongo query semantics.)
+    async fn fetch_mutual_user_ids(&self, user_a: &str, user_b: &str) -> Result<Vec<String>> {
+        let users = self.users.lock().await;
+
+        let friends_of = |target: &str| -> std::collections::HashSet<String> {
+            users
+                .values()
+                .filter(|user| {
+                    user.relations.iter().flatten().any(|relation| {
+                        relation.id == target
+                            && matches!(relation.status, RelationshipStatus::Friend)
+                    })
+                })
+                .map(|user| user.id.clone())
+                .collect()
+        };
+
+        let of_a = friends_of(user_a);
+        let of_b = friends_of(user_b);
+        let mut mutual: Vec<String> = of_a.intersection(&of_b).cloned().collect();
+        mutual.sort();
+        Ok(mutual)
     }
 
     /// Fetch ids of channels that both users are in
-    async fn fetch_mutual_channel_ids(&self, _user_a: &str, _user_b: &str) -> Result<Vec<String>> {
-        todo!()
+    async fn fetch_mutual_channel_ids(&self, user_a: &str, user_b: &str) -> Result<Vec<String>> {
+        let channels = self.channels.lock().await;
+        let mut mutual: Vec<String> = channels
+            .values()
+            .filter_map(|channel| match channel {
+                Channel::Group { id, recipients, .. }
+                | Channel::DirectMessage { id, recipients, .. }
+                    if recipients.iter().any(|r| r == user_a)
+                        && recipients.iter().any(|r| r == user_b) =>
+                {
+                    Some(id.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        mutual.sort();
+        Ok(mutual)
     }
 
     /// Fetch ids of servers that both users share
-    async fn fetch_mutual_server_ids(&self, _user_a: &str, _user_b: &str) -> Result<Vec<String>> {
-        todo!()
+    async fn fetch_mutual_server_ids(&self, user_a: &str, user_b: &str) -> Result<Vec<String>> {
+        let members = self.server_members.lock().await;
+        let of_a: std::collections::HashSet<&str> = members
+            .keys()
+            .filter(|key| key.user == user_a)
+            .map(|key| key.server.as_str())
+            .collect();
+
+        let mut mutual: Vec<String> = members
+            .keys()
+            .filter(|key| key.user == user_b && of_a.contains(key.server.as_str()))
+            .map(|key| key.server.clone())
+            .collect();
+        mutual.sort();
+        Ok(mutual)
     }
 
     /// Update a user by their id given some data

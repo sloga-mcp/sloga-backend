@@ -77,14 +77,14 @@ impl TestDevice {
     }
 }
 
-async fn mfa_ticket(harness: &TestHarness, account_id: &str) -> String {
+pub(crate) async fn mfa_ticket(harness: &TestHarness, account_id: &str) -> String {
     let ticket = MFATicket::new(account_id.to_string(), true);
     ticket.save(&harness.db).await.unwrap();
     ticket.token
 }
 
 /// Publish a device for the user and return it
-async fn publish_device(
+pub(crate) async fn publish_device(
     harness: &TestHarness,
     account_id: &str,
     session_token: &str,
@@ -567,6 +567,9 @@ async fn queue_depth_cap_reports_queue_full() {
             sequence: i,
             ciphertext: "AAAA".to_string(),
             timestamp: iso8601_timestamp::Timestamp::now_utc(),
+            content_type: revolt_database::E2EEContentType::Olm,
+            group_id: None,
+            epoch: None,
         })
         .collect();
     harness.db.insert_e2ee_envelopes(&envelopes).await.unwrap();
@@ -696,6 +699,9 @@ async fn queue_depth_cap_holds_within_a_single_request() {
             sequence: i,
             ciphertext: "AAAA".to_string(),
             timestamp: iso8601_timestamp::Timestamp::now_utc(),
+            content_type: revolt_database::E2EEContentType::Olm,
+            group_id: None,
+            epoch: None,
         })
         .collect();
     harness.db.insert_e2ee_envelopes(&envelopes).await.unwrap();

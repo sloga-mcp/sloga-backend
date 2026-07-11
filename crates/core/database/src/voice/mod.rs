@@ -51,6 +51,86 @@ pub async fn raise_if_in_voice(user: &User, channel: &UserVoiceChannel) -> Resul
     Ok(())
 }
 
+/// LiveKit participant identities may be device-qualified
+/// (`{user_id}:{device_id}`, media-E2EE plan Q4), but server-side voice
+/// operations address participants by user id. voice-ingress records each
+/// participant's full identity here (a hash per channel) so
+/// `update_participant`/`remove_participant` can resolve the identity the
+/// SFU actually knows. User ids are ULIDs and never contain `:`, so the
+/// user id is always the segment before the first `:`.
+///
+/// The map is keyed per USER (not per device): this is correct because the
+/// MLS delivery service enforces one device per user per call (plan §1.5),
+/// so a user has at most one participant identity in a channel at a time.
+/// Reconciling the map against the live SFU participant set (for the
+/// Redis-eviction / missed-webhook case, where a stale/absent mapping makes
+/// a kick target a bare id the SFU no longer knows) is the roster-
+/// reconciliation work in 6.4; until then `get_voice_participant_identity`
+/// logs when it falls back so a silently-missed moderation action is at
+/// least visible in logs.
+pub fn user_id_from_participant_identity(identity: &str) -> &str {
+    identity
+        .split(':')
+        .next()
+        .expect("split always yields at least one segment")
+}
+
+/// Record a participant's full LiveKit identity (voice-ingress, on join)
+pub async fn set_voice_participant_identity(
+    channel_id: &str,
+    user_id: &str,
+    identity: &str,
+) -> Result<()> {
+    get_connection()
+        .await?
+        .hset(format!("voice_identity:{channel_id}"), user_id, identity)
+        .await
+        .to_internal_error()
+}
+
+/// Resolve the LiveKit identity for a user in a channel; falls back to the
+/// bare user id (web / pre-E2EE participants join with an unqualified
+/// identity, and so do participants whose mapping is gone)
+pub async fn get_voice_participant_identity(channel_id: &str, user_id: &str) -> Result<String> {
+    let stored: Option<String> = get_connection()
+        .await?
+        .hget(format!("voice_identity:{channel_id}"), user_id)
+        .await
+        .to_internal_error()?;
+
+    Ok(stored.unwrap_or_else(|| {
+        // No recorded identity: fall back to the bare user id. This is
+        // correct for non-E2EE participants (their SFU identity IS the bare
+        // user id), but for a device-qualified participant whose mapping was
+        // evicted/never-written it means a kick/permission update will match
+        // no SFU participant and silently no-op — surface it (plan §1.5,
+        // 6.4 roster reconciliation).
+        log::debug!(
+            "voice identity mapping missing for {user_id} in {channel_id}; using bare user id (moderation of a device-qualified participant may not apply)"
+        );
+        user_id.to_string()
+    }))
+}
+
+/// Forget a participant's identity mapping (voice-ingress, on leave)
+pub async fn delete_voice_participant_identity(channel_id: &str, user_id: &str) -> Result<()> {
+    get_connection()
+        .await?
+        .hdel(format!("voice_identity:{channel_id}"), user_id)
+        .await
+        .to_internal_error()
+}
+
+/// Drop every identity mapping for a channel (voice-ingress, room_finished —
+/// the backstop against mappings leaked by missed participant_left events)
+pub async fn clear_voice_participant_identities(channel_id: &str) -> Result<()> {
+    get_connection()
+        .await?
+        .del(format!("voice_identity:{channel_id}"))
+        .await
+        .to_internal_error()
+}
+
 pub async fn set_channel_node(channel_id: &str, node: &str) -> Result<()> {
     get_connection()
         .await?
@@ -465,6 +545,59 @@ pub async fn sync_voice_permissions(
     Ok(())
 }
 
+/// The LiveKit participant permissions a channel-permission sync grants.
+///
+/// Data publishing stays revoked UNCONDITIONALLY: the join token grants
+/// `can_publish_data: false` (voice_client.rs) and the LiveKit data channel
+/// is an untrusted injection surface for E2EE call machinery (media-E2EE
+/// plan §0.4) — a permission sync must never silently re-grant it. This
+/// previously re-granted `can_speak` on every sync.
+pub fn voice_participant_permissions(
+    can_listen: bool,
+    can_speak: bool,
+) -> ParticipantPermission {
+    ParticipantPermission {
+        can_subscribe: can_listen,
+        can_publish: can_speak,
+        can_publish_data: false,
+        ..Default::default()
+    }
+}
+
+#[cfg(test)]
+mod permission_tests {
+    use super::{user_id_from_participant_identity, voice_participant_permissions};
+
+    #[test]
+    fn participant_identity_parse_recovers_user_id() {
+        // ULIDs contain no ':', so the user id is the first segment for
+        // both bare and device-qualified identities (media-E2EE plan Q4)
+        let user = "01KX7HASD9FHBYA3XGKA5YACYX";
+        let device = "4208aa7e9ff58761b2d7a5d6c45f7383";
+
+        assert_eq!(user_id_from_participant_identity(user), user);
+        assert_eq!(
+            user_id_from_participant_identity(&format!("{user}:{device}")),
+            user
+        );
+    }
+
+    #[test]
+    fn permission_sync_never_regrants_data_publishing() {
+        for can_listen in [false, true] {
+            for can_speak in [false, true] {
+                let permissions = voice_participant_permissions(can_listen, can_speak);
+                assert!(
+                    !permissions.can_publish_data,
+                    "data publishing must stay revoked (media-E2EE plan §0.4)"
+                );
+                assert_eq!(permissions.can_subscribe, can_listen);
+                assert_eq!(permissions.can_publish, can_speak);
+            }
+        }
+    }
+}
+
 pub async fn sync_user_voice_permissions(
     db: &Database,
     voice_client: &VoiceClient,
@@ -531,12 +664,7 @@ pub async fn sync_user_voice_permissions(
                 node,
                 user,
                 channel_id,
-                ParticipantPermission {
-                    can_subscribe: can_listen,
-                    can_publish: can_speak,
-                    can_publish_data: can_speak,
-                    ..Default::default()
-                },
+                voice_participant_permissions(can_listen, can_speak),
             )
             .await?;
 

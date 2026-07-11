@@ -182,6 +182,22 @@ impl AbstractE2EE for ReferenceDb {
             .count() as u64)
     }
 
+    async fn sum_e2ee_envelope_bytes(
+        &self,
+        recipient_user_id: &str,
+        recipient_device_id: &str,
+    ) -> Result<u64> {
+        let queue = self.e2ee_queue.lock().await;
+        Ok(queue
+            .values()
+            .filter(|envelope| {
+                envelope.recipient_user_id == recipient_user_id
+                    && envelope.recipient_device_id == recipient_device_id
+            })
+            .map(|envelope| envelope.ciphertext.len() as u64)
+            .sum())
+    }
+
     async fn fetch_e2ee_envelopes(
         &self,
         recipient_user_id: &str,
