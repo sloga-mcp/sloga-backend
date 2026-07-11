@@ -127,6 +127,10 @@ auto_derived!(
         Conflict {
             /// The channel's open group id
             open_group_id: String,
+            /// The channel_id the open group is bound to, from the group
+            /// record — the client compares its route-truth channel against
+            /// this before signing a join intent (T-15 client-leg, §1.4)
+            channel_id: String,
         },
     }
 

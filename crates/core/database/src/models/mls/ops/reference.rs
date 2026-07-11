@@ -167,6 +167,7 @@ impl crate::AbstractMls for ReferenceDb {
         {
             return Ok(MlsGroupCreateOutcome::Conflict {
                 open_group_id: open.id.clone(),
+                channel_id: open.channel_id.clone(),
             });
         }
 

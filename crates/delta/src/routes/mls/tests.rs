@@ -238,8 +238,14 @@ async fn full_flow_create_join_commit_fanout() {
         .await;
         assert_eq!(response.status(), Status::Conflict);
         match response.into_json::<v0::ResponseCreateMlsGroup>().await {
-            Some(v0::ResponseCreateMlsGroup::Conflict { open_group_id }) => {
-                assert_eq!(open_group_id, gid)
+            Some(v0::ResponseCreateMlsGroup::Conflict {
+                open_group_id,
+                channel_id,
+            }) => {
+                assert_eq!(open_group_id, gid);
+                // The DS asserts the open group's channel — the client's T-15
+                // guard compares this against its route-truth channel (H2)
+                assert_eq!(channel_id, channel.id().to_string());
             }
             other => panic!("expected conflict body, got {other:?}"),
         }

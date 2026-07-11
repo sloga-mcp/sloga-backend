@@ -121,9 +121,15 @@ pub async fn create_group(
             conflict: false,
             body: Json(v0::ResponseCreateMlsGroup::Created),
         }),
-        MlsGroupCreateOutcome::Conflict { open_group_id } => Ok(Arbitrated {
+        MlsGroupCreateOutcome::Conflict {
+            open_group_id,
+            channel_id,
+        } => Ok(Arbitrated {
             conflict: true,
-            body: Json(v0::ResponseCreateMlsGroup::Conflict { open_group_id }),
+            body: Json(v0::ResponseCreateMlsGroup::Conflict {
+                open_group_id,
+                channel_id,
+            }),
         }),
     }
 }

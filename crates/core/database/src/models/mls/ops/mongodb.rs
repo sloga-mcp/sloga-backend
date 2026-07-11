@@ -303,6 +303,7 @@ impl AbstractMls for MongoDb {
                 match open {
                     Some(existing) => Ok(MlsGroupCreateOutcome::Conflict {
                         open_group_id: existing.id,
+                        channel_id: existing.channel_id,
                     }),
                     // The winner closed again between our insert and this
                     // fetch (or the duplicate was the group id itself);

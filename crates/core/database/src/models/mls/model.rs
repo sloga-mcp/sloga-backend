@@ -277,6 +277,11 @@ auto_derived!(
         Conflict {
             /// The channel's existing open group id
             open_group_id: String,
+            /// The channel_id the existing open group is bound to — sourced
+            /// from the group RECORD, not echoed from the request, so the
+            /// client's T-15 guard has an independent DS assertion to compare
+            /// its route-truth channel against (plan §1.4 / slice-6.4 audit H2)
+            channel_id: String,
         },
     }
 );

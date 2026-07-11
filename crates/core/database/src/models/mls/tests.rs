@@ -107,7 +107,11 @@ async fn create_race_yields_exactly_one_open_group_per_channel() {
         for handle in handles {
             match handle.await.expect("join").expect("create must not error") {
                 MlsGroupCreateOutcome::Created => created += 1,
-                MlsGroupCreateOutcome::Conflict { open_group_id } => {
+                MlsGroupCreateOutcome::Conflict {
+                    open_group_id,
+                    channel_id,
+                } => {
+                    assert_eq!(channel_id, "channel_race");
                     conflicts.push(open_group_id)
                 }
             }
@@ -127,8 +131,12 @@ async fn create_race_yields_exactly_one_open_group_per_channel() {
         // A late creator still conflicts with the open group
         let late = make_group(&group_id(99), "channel_race", &creator_a);
         match db.create_mls_group(&late, None).await.unwrap() {
-            MlsGroupCreateOutcome::Conflict { open_group_id } => {
-                assert_eq!(open_group_id, open.id)
+            MlsGroupCreateOutcome::Conflict {
+                open_group_id,
+                channel_id,
+            } => {
+                assert_eq!(open_group_id, open.id);
+                assert_eq!(channel_id, open.channel_id);
             }
             _ => panic!("late creator must conflict"),
         }
@@ -172,8 +180,12 @@ async fn supersedes_closes_old_group_atomically() {
         // conflicts with the live successor instead of forking the channel
         let stale = make_group(&group_id(3), "channel_super", &creator);
         match db.create_mls_group(&stale, Some(&old.id)).await.unwrap() {
-            MlsGroupCreateOutcome::Conflict { open_group_id } => {
-                assert_eq!(open_group_id, successor.id)
+            MlsGroupCreateOutcome::Conflict {
+                open_group_id,
+                channel_id,
+            } => {
+                assert_eq!(open_group_id, successor.id);
+                assert_eq!(channel_id, successor.channel_id);
             }
             _ => panic!("stale successor must conflict"),
         }
