@@ -39,6 +39,35 @@ probe on this WebView2 build, not cross-version/cross-shell corroboration (both 
 `Edg/150` build on the same machine). Field-WebView-version variance is a separate concern the
 Android sub-slice (6.7a) probes for; on desktop the WebView2 Evergreen runtime is auto-updated.
 
+## 2a. Live two-desktop media-plane proof (P5 — added 2026-07-10, post-gate)
+
+The gate's HIGH finding (see §5 caveat 2) asked for the live two-peer proof to be a **blocking
+checkpoint by 6.3/6.4**. It was in fact run immediately after the gate, once a second test account
+was available — so this must-carry item is **satisfied ahead of schedule**. Two real accounts in
+one server voice channel, both in the real WebView2 shell, driven over CDP:
+
+- **Peers:** JeffS `01KWFKG47HBFTEEN6XPPS8H3HN` (`b`, key A) + JPhone `01KWHY6P2RPHWNJADM59F97JGE`
+  (`b2`), channel `01KX789WHX8GJFHDH4RADDHM2C`. Both mics live.
+- **Positive path (both key A):** LiveKit's `ParticipantEncryptionStatusChanged` reported
+  `encrypted=true` for **every** participant on **both** sides (the plan's dual-gate signal (b));
+  keys applied remote-first/local-last (§1.5); **`totalSamplesReceived` climbed ~288k samples / 6 s
+  on both receivers with `packetsLost:0` and zero `encryptionError`.** Samples only accumulate if
+  encrypted frames decrypt+decode ⇒ shared-key media flows and decrypts cross-peer.
+- **Negative control (JPhone re-armed to a mismatched key B, rejoined):** packets still traversed
+  the SFU (`packetsReceived`/`bytesReceived` kept climbing, `packetsLost:0`) but
+  **`totalSamplesReceived` stayed pinned at `0`** on both receivers and LiveKit fired
+  **`encryptionError: "InvalidKey: Decryption failed"`** on both. Plaintext passthrough would have
+  decoded regardless of key; zero-decode-on-key-mismatch is the definitive proof the frames are
+  **ciphertext end-to-end through the real SFU** — the functional equivalent of an SFU-capture
+  ciphertext check.
+- **Signal note (feeds §4.4):** `ParticipantEncryptionStatusChanged` reflects *E2EE enabled*
+  (`encryptionType != NONE`), not decrypt success; decrypt failure surfaces on the separate
+  `encryptionError` event. So "status=encrypted **and** `InvalidKey`" = the §4.4 error-classification
+  input for a key-mismatched peer. Both signals are needed (invariant 11), as the plan states.
+
+Raw evidence: `.spike-reports/01KWFKG47HBFTEEN6XPPS8H3HN-bo9so7.latest.json` (JeffS) +
+`01KWHY6P2RPHWNJADM59F97JGE-k1xm7s.latest.json` (JPhone).
+
 ## 3. Probe results
 
 ### P1 — Encoded-transform + WebCrypto API surface (the blocker)
@@ -131,25 +160,18 @@ when the identity exists.
    capability result does **not** transfer to the CSP'd origin. 6.0 proves the *Chromium/WebView2
    engine* is capable; **6.2b/6.3 must re-run P1+P2 (worker instantiation especially) under the
    bundled origin + final CSP** and treat a failure there as a 6.2b/6.3 blocker.
-2. **No live two-peer media decrypt / wrong-key negative control / SFU-ciphertext capture — this
-   is a real gap, promoted to a BLOCKING checkpoint (gate-review HIGH, folded).** 6.0's charter
-   row (plan §8) named a "throwaway static-key two-desktop E2EE call to prove the media plane
-   end-to-end"; it was **not** delivered here. P1 proves the transform API is *present*
-   (`'RTCRtpScriptTransform' in window`), which is **not** the same as proving WebView2's WebRTC
-   pipeline actually *routes encoded frames through the script transform and encrypts them*
-   (`framesEncoded`/`framesDecoded` advancing, SFU capture = ciphertext, wrong-key decrypt
-   failing). A present-but-inert insertable-streams implementation in an embedded webview is
-   exactly the class of surprise a spike should catch. The blocker to running it here was that a
-   second logged-in account needs a password, which the assistant will not enter.
-
-   **Disposition (supersedes the earlier "risk retired / operator-owned after 6.7b" framing):**
-   this functional media-plane proof is a **blocking checkpoint no later than 6.3/6.4**, NOT
-   slice-end operator cleanup. The harness already contains the exact instrumentation — `#sampleStats`
-   captures `framesEncoded`/`framesDecoded`, and `ARM A`/`ARM B` is a shared-key/wrong-key control —
-   so the only missing ingredient is a second connected peer. The GO below rests on the *engine
-   capability* unknowns (P1–P4), which are genuinely retired; it does **not** claim the functional
-   media plane is proven. If the transform is present-but-inert, that must surface at 6.3/6.4, not
-   after the whole slice is built.
+2. **Live two-peer media decrypt / wrong-key negative control — the gate-review HIGH, now
+   RESOLVED (see §2a).** 6.0's charter row (plan §8) named a "throwaway static-key two-desktop
+   E2EE call to prove the media plane end-to-end." The gate correctly noted that P1 proving the
+   transform API is *present* is not the same as proving WebView2 actually *routes encoded frames
+   through the transform and encrypts them*, and made the live proof a blocking checkpoint by
+   6.3/6.4. **That checkpoint was run on 2026-07-10** once a second test account was available (§2a):
+   with matching keys `totalSamplesReceived` advanced on both receivers, and with a mismatched key
+   the SFU still delivered packets but zero frames decoded (`totalSamplesReceived` pinned at 0 +
+   `InvalidKey: Decryption failed`). The present-but-inert-transform failure mode is **ruled out** —
+   frames are ciphertext end-to-end through the real SFU. The only remaining slice-end operator item
+   is a formal packet capture at the SFU node itself (nice-to-have; the decrypt-failure-on-mismatch
+   result already establishes the frames are undecryptable without the key).
 3. **`setE2EEEnabled` was exercised disconnected** (see §3 P4 nuance). The connected-room flip and
    `ParticipantEncryptionStatusChanged` firing are part of the 6.3/6.4 live-call work (and the
    operator manual E2E), where a real track and identity exist.
@@ -172,11 +194,11 @@ The GO does **not** claim the functional media plane is proven (see §5 caveat 2
 
 **Must-carry conditions into 6.1 / 6.2b / 6.3 (blocking, not advisory — from the gate):**
 
-1. **Live media-plane functional proof is a blocking checkpoint no later than 6.3/6.4** (NOT
-   after-6.7b operator cleanup): a two-instance static-key (or real-key) encrypted call showing
-   `framesEncoded`/`framesDecoded` advancing, an SFU packet capture = ciphertext, and the `ARM B`
-   wrong-key control failing to decrypt. The harness instrumentation already exists; it needs a
-   second logged-in peer.
+1. ~~Live media-plane functional proof is a blocking checkpoint no later than 6.3/6.4~~ —
+   **DONE 2026-07-10 (§2a):** two real accounts, matching-key decrypt succeeds
+   (`totalSamplesReceived` advancing), mismatched-key decrypt fails (samples pinned at 0 +
+   `InvalidKey`), packets still SFU-delivered ⇒ frames are ciphertext end-to-end. Residual
+   nice-to-have: a formal SFU-node packet capture at slice end.
 2. **Re-run P1 + P2 (worker instantiation especially) under the bundled `tauri://` origin + the
    final restrictive CSP** in 6.2b/6.3 — the remote-origin result does not transfer.
 3. When 6.3 wires the real `MlsKeyProvider`, **exercise `setE2EEEnabled(true)` on a *connected*
