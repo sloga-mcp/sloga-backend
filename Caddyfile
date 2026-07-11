@@ -42,6 +42,18 @@
         file_server
     }
 
+    # Unicode-emoji SVG packs — proxied to the upstream pack host so the client
+    # only ever requests them from the app origin (E2EE 6.2b: the desktop shell
+    # CSP img-src has no external host; also the no-CDN policy). Keeps the
+    # /emoji prefix (handle, not handle_path). Full self-hosting (vendor the
+    # SVGs to disk + file_server) can replace the upstream later with no client
+    # change. See VITE_EMOJI_URL / unicodeEmojiUrl.
+    handle /emoji/* {
+        reverse_proxy https://static.stoat.chat {
+            header_up Host static.stoat.chat
+        }
+    }
+
     # Frontend — proxy to Vite dev server
     handle {
         reverse_proxy 127.0.0.1:5174
