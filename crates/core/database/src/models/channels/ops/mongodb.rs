@@ -255,7 +255,7 @@ impl AbstractChannels for MongoDb {
     async fn delete_channel(&self, channel: &Channel) -> Result<()> {
         let id = channel.id().to_string();
         let server_id = match channel {
-            Channel::TextChannel { server, .. } => Some(server),
+            Channel::TextChannel { server, .. } | Channel::Forum { server, .. } => Some(server),
             _ => None,
         };
 

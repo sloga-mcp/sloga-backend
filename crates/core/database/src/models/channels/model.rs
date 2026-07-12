@@ -156,7 +156,82 @@ auto_derived!(
             /// Whether this thread is locked
             #[serde(skip_serializing_if = "crate::if_false", default)]
             locked: bool,
+
+            /// Ids of this forum's tags applied to this thread
+            /// (only ever set on threads whose parent is a forum channel)
+            #[serde(default, skip_serializing_if = "Vec::is_empty")]
+            applied_tags: Vec<String>,
         },
+        /// Forum channel belonging to a server; every post is a thread
+        Forum {
+            /// Unique Id
+            #[serde(rename = "_id")]
+            id: String,
+            /// Id of the server this channel belongs to
+            server: String,
+
+            /// Display name of the channel
+            name: String,
+            /// Channel description
+            #[serde(skip_serializing_if = "Option::is_none")]
+            description: Option<String>,
+
+            /// Custom icon attachment
+            #[serde(skip_serializing_if = "Option::is_none")]
+            icon: Option<File>,
+            /// Id of the last message sent in a post under this forum
+            /// (drives the existing unread / ack machinery unchanged)
+            #[serde(skip_serializing_if = "Option::is_none")]
+            last_message_id: Option<String>,
+
+            /// Default permissions assigned to users in this channel
+            #[serde(skip_serializing_if = "Option::is_none")]
+            default_permissions: Option<OverrideField>,
+            /// Permissions assigned based on role to this channel
+            #[serde(
+                default = "HashMap::<String, OverrideField>::new",
+                skip_serializing_if = "HashMap::<String, OverrideField>::is_empty"
+            )]
+            role_permissions: HashMap<String, OverrideField>,
+
+            /// Whether this channel is marked as not safe for work
+            #[serde(skip_serializing_if = "crate::if_false", default)]
+            nsfw: bool,
+
+            /// Tags that can be applied to posts in this forum
+            #[serde(default, skip_serializing_if = "Vec::is_empty")]
+            tags: Vec<ForumTag>,
+            /// Whether every post must carry at least one tag
+            #[serde(skip_serializing_if = "crate::if_false", default)]
+            require_tag: bool,
+            /// Default ordering of the post browse view
+            #[serde(default)]
+            default_sort: ForumSortOrder,
+        },
+    }
+
+    /// Tag that can be applied to posts in a forum channel
+    pub struct ForumTag {
+        /// Unique Id of this tag (server-assigned ulid)
+        pub id: String,
+        /// Display name of the tag
+        pub name: String,
+        /// Emoji shown alongside the tag name
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub emoji: Option<String>,
+        /// Whether only members with ManageChannel may apply this tag
+        #[serde(skip_serializing_if = "crate::if_false", default)]
+        pub moderated: bool,
+    }
+
+    /// Default ordering of a forum's post browse view
+    #[derive(Default)]
+    pub enum ForumSortOrder {
+        /// Most recently active post first
+        #[default]
+        LatestActivity,
+        /// Most recently created post first
+        CreationDate,
     }
 
     #[derive(Default)]
@@ -201,6 +276,14 @@ auto_derived!(
         pub archived: Option<bool>,
         #[serde(skip_serializing_if = "Option::is_none")]
         pub archived_timestamp: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub tags: Option<Vec<ForumTag>>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub require_tag: Option<bool>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub default_sort: Option<ForumSortOrder>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub applied_tags: Option<Vec<String>>,
     }
 
     /// Optional fields on channel object
@@ -209,6 +292,7 @@ auto_derived!(
         Icon,
         DefaultPermissions,
         Voice,
+        Tags,
     }
 );
 
@@ -275,6 +359,20 @@ impl Channel {
                 nsfw: data.nsfw.unwrap_or(false),
                 voice: Some(data.voice.unwrap_or_default().into()),
                 slowmode: None,
+            },
+            v0::LegacyServerChannelType::Forum => Channel::Forum {
+                id: id.clone(),
+                server: server.id.to_owned(),
+                name: data.name,
+                description: data.description,
+                icon: None,
+                last_message_id: None,
+                default_permissions: None,
+                role_permissions: HashMap::new(),
+                nsfw: data.nsfw.unwrap_or(false),
+                tags: vec![],
+                require_tag: false,
+                default_sort: ForumSortOrder::default(),
             },
         };
 
@@ -373,6 +471,7 @@ impl Channel {
             archived_timestamp: None,
             auto_archive_minutes,
             locked: false,
+            applied_tags: vec![],
         };
 
         db.insert_channel(&channel).await?;
@@ -425,18 +524,92 @@ impl Channel {
         Ok(channel)
     }
 
+    /// Create a new post (thread) under a forum channel
+    ///
+    /// Like `create_thread` but for forum parents: no origin message, no
+    /// system message into the parent (forums have no message stream), and
+    /// the post carries its applied tag ids. The caller is responsible for
+    /// creating the starter message and bumping the forum's activity marker.
+    pub async fn create_forum_post(
+        db: &Database,
+        forum: &Channel,
+        creator: &User,
+        name: String,
+        applied_tags: Vec<String>,
+        auto_archive_minutes: Option<u32>,
+    ) -> Result<Channel> {
+        // Posts may only exist under forum channels; this is also the E2EE
+        // fail-closed gate (encrypted DMs / groups can never host one).
+        let (parent_id, server_id) = match forum {
+            Channel::Forum { id, server, .. } => (id.clone(), server.clone()),
+            _ => return Err(create_error!(InvalidOperation)),
+        };
+
+        // Enforce the per-channel active post cap (shared with threads).
+        let config = config().await;
+        let max_threads = config.features.limits.global.threads_per_channel;
+        let active_posts = db
+            .fetch_threads_by_parent(&parent_id)
+            .await?
+            .into_iter()
+            .filter(|thread| !matches!(thread, Channel::Thread { archived: true, .. }))
+            .count();
+        if active_posts >= max_threads {
+            return Err(create_error!(TooManyChannels { max: max_threads }));
+        }
+
+        // Validate the auto-archive duration.
+        let auto_archive_minutes =
+            auto_archive_minutes.unwrap_or_else(Channel::default_auto_archive_minutes);
+        if !Channel::ALLOWED_AUTO_ARCHIVE_MINUTES.contains(&auto_archive_minutes) {
+            return Err(create_error!(InvalidProperty));
+        }
+
+        let id = Ulid::new().to_string();
+        let channel = Channel::Thread {
+            id: id.clone(),
+            server: server_id.clone(),
+            parent_channel: parent_id,
+            name,
+            creator: creator.id.clone(),
+            origin_message_id: None,
+            last_message_id: None,
+            archived: false,
+            archived_timestamp: None,
+            auto_archive_minutes,
+            locked: false,
+            applied_tags,
+        };
+
+        db.insert_channel(&channel).await?;
+
+        // Auto-join the creator.
+        db.join_thread_if_absent(&id, &creator.id).await?;
+
+        // Everyone who can see the forum learns about the post.
+        EventV1::ChannelCreate(channel.clone().into())
+            .p(server_id)
+            .await;
+
+        Ok(channel)
+    }
+
     /// Resolve the channel whose permission overrides apply to this channel.
     ///
-    /// Threads delegate their entire permission calculus to their parent text
-    /// channel; the parent MUST be resolved before constructing a
-    /// `DatabasePermissionQuery` (never substituted mid-calculation). All
-    /// other channel types are their own permission target. Fails closed
-    /// (NotFound) when a thread's parent is missing or not a text channel.
+    /// Threads delegate their entire permission calculus to their parent
+    /// channel (text channel, or forum for forum posts); the parent MUST be
+    /// resolved before constructing a `DatabasePermissionQuery` (never
+    /// substituted mid-calculation). All other channel types are their own
+    /// permission target. Fails closed (NotFound) when a thread's parent is
+    /// missing or not a thread-capable channel.
     pub async fn permission_target<'a>(&'a self, db: &Database) -> Result<Cow<'a, Channel>> {
         match self {
             Channel::Thread { parent_channel, .. } => {
                 let parent = db.fetch_channel(parent_channel).await?;
-                if matches!(parent, Channel::TextChannel { .. }) {
+                if matches!(
+                    parent,
+                    Channel::TextChannel { .. } | Channel::Forum { .. }
+                ) {
                     Ok(Cow::Owned(parent))
                 } else {
                     Err(create_error!(NotFound))
@@ -629,14 +802,17 @@ impl Channel {
             | Channel::Group { id, .. }
             | Channel::SavedMessages { id, .. }
             | Channel::TextChannel { id, .. }
-            | Channel::Thread { id, .. } => id,
+            | Channel::Thread { id, .. }
+            | Channel::Forum { id, .. } => id,
         }
     }
 
     /// Clone this channel's server id
     pub fn server(&self) -> Option<&str> {
         match self {
-            Channel::TextChannel { server, .. } | Channel::Thread { server, .. } => Some(server),
+            Channel::TextChannel { server, .. }
+            | Channel::Thread { server, .. }
+            | Channel::Forum { server, .. } => Some(server),
             _ => None,
         }
     }
@@ -671,6 +847,12 @@ impl Channel {
     ) -> Result<()> {
         match self {
             Channel::TextChannel {
+                id,
+                server,
+                role_permissions,
+                ..
+            }
+            | Channel::Forum {
                 id,
                 server,
                 role_permissions,
@@ -721,7 +903,9 @@ impl Channel {
             clear: remove.into_iter().map(|v| v.into()).collect(),
         }
         .p(match self {
-            Self::TextChannel { server, .. } | Self::Thread { server, .. } => server.clone(),
+            Self::TextChannel { server, .. }
+            | Self::Thread { server, .. }
+            | Self::Forum { server, .. } => server.clone(),
             _ => id,
         })
         .await;
@@ -733,19 +917,27 @@ impl Channel {
     pub fn remove_field(&mut self, field: &FieldsChannel) {
         match field {
             FieldsChannel::Description => match self {
-                Self::Group { description, .. } | Self::TextChannel { description, .. } => {
+                Self::Group { description, .. }
+                | Self::TextChannel { description, .. }
+                | Self::Forum { description, .. } => {
                     description.take();
                 }
                 _ => {}
             },
             FieldsChannel::Icon => match self {
-                Self::Group { icon, .. } | Self::TextChannel { icon, .. } => {
+                Self::Group { icon, .. }
+                | Self::TextChannel { icon, .. }
+                | Self::Forum { icon, .. } => {
                     icon.take();
                 }
                 _ => {}
             },
             FieldsChannel::DefaultPermissions => match self {
                 Self::TextChannel {
+                    default_permissions,
+                    ..
+                }
+                | Self::Forum {
                     default_permissions,
                     ..
                 } => {
@@ -756,6 +948,12 @@ impl Channel {
             FieldsChannel::Voice => match self {
                 Self::Group { voice, .. } | Self::TextChannel { voice, .. } => {
                     voice.take();
+                }
+                _ => {}
+            },
+            FieldsChannel::Tags => match self {
+                Self::Forum { tags, .. } => {
+                    tags.clear();
                 }
                 _ => {}
             },
@@ -860,6 +1058,7 @@ impl Channel {
                 archived,
                 archived_timestamp,
                 last_message_id,
+                applied_tags,
                 ..
             } => {
                 if let Some(v) = partial.name {
@@ -876,6 +1075,63 @@ impl Channel {
 
                 if let Some(v) = partial.last_message_id {
                     last_message_id.replace(v);
+                }
+
+                if let Some(v) = partial.applied_tags {
+                    *applied_tags = v;
+                }
+            }
+            Self::Forum {
+                name,
+                description,
+                icon,
+                nsfw,
+                default_permissions,
+                role_permissions,
+                last_message_id,
+                tags,
+                require_tag,
+                default_sort,
+                ..
+            } => {
+                if let Some(v) = partial.name {
+                    *name = v;
+                }
+
+                if let Some(v) = partial.description {
+                    description.replace(v);
+                }
+
+                if let Some(v) = partial.icon {
+                    icon.replace(v);
+                }
+
+                if let Some(v) = partial.nsfw {
+                    *nsfw = v;
+                }
+
+                if let Some(v) = partial.role_permissions {
+                    *role_permissions = v;
+                }
+
+                if let Some(v) = partial.default_permissions {
+                    default_permissions.replace(v);
+                }
+
+                if let Some(v) = partial.last_message_id {
+                    last_message_id.replace(v);
+                }
+
+                if let Some(v) = partial.tags {
+                    *tags = v;
+                }
+
+                if let Some(v) = partial.require_tag {
+                    *require_tag = v;
+                }
+
+                if let Some(v) = partial.default_sort {
+                    *default_sort = v;
                 }
             }
         }
@@ -995,9 +1251,10 @@ impl Channel {
     pub async fn delete(&self, db: &Database) -> Result<()> {
         let id = self.id().to_string();
 
-        // Cascade: deleting a text channel deletes its child threads first, so
-        // no thread is ever orphaned with a dangling parent_channel pointer.
-        if let Channel::TextChannel { server, .. } = self {
+        // Cascade: deleting a text or forum channel deletes its child threads
+        // first, so no thread is ever orphaned with a dangling parent_channel
+        // pointer.
+        if let Channel::TextChannel { server, .. } | Channel::Forum { server, .. } = self {
             for thread in db.fetch_threads_by_parent(&id).await? {
                 let thread_id = thread.id().to_string();
                 db.delete_all_thread_memberships(&thread_id).await?;
@@ -1036,6 +1293,7 @@ impl IntoDocumentPath for FieldsChannel {
             FieldsChannel::Icon => "icon",
             FieldsChannel::DefaultPermissions => "default_permissions",
             FieldsChannel::Voice => "voice",
+            FieldsChannel::Tags => "tags",
         })
     }
 }

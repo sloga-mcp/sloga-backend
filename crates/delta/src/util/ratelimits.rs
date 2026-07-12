@@ -46,6 +46,12 @@ impl<'a> RatelimitResolver<Request<'a>> for DeltaRatelimits {
                         if let Some("threads") = extra {
                             return ("thread_create", Some(id));
                         }
+
+                        // Forum post creation is stricter than plain messaging
+                        // (every post fans out a ChannelCreate to the server).
+                        if let Some("posts") = extra {
+                            return ("forum_post_create", Some(id));
+                        }
                     }
 
                     ("channels", Some(id))
@@ -111,6 +117,7 @@ impl<'a> RatelimitResolver<Request<'a>> for DeltaRatelimits {
             "events_invite" => 5,
             "events" => 30,
             "thread_create" => 5,
+            "forum_post_create" => 5,
             _ => 20,
         }
     }

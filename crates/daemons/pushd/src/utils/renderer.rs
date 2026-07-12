@@ -198,7 +198,8 @@ async fn get_channel_name(id: &str, _server: Option<&str>, db: &Database) -> Res
         Channel::DirectMessage { .. } => "DM Channel".to_string(),
         Channel::Group { name, .. }
         | Channel::TextChannel { name, .. }
-        | Channel::Thread { name, .. } => name,
+        | Channel::Thread { name, .. }
+        | Channel::Forum { name, .. } => name,
         Channel::SavedMessages { .. } => "Err".to_string(),
     };
 
@@ -262,7 +263,9 @@ async fn get_channel_server_id(channel_id: &str, db: &Database) -> Result<String
         Channel::DirectMessage { .. } | Channel::Group { .. } | Channel::SavedMessages { .. } => {
             Err(create_error!(NotFound))
         }
-        Channel::TextChannel { server, .. } | Channel::Thread { server, .. } => Ok(server),
+        Channel::TextChannel { server, .. }
+        | Channel::Thread { server, .. }
+        | Channel::Forum { server, .. } => Ok(server),
     }
 }
 

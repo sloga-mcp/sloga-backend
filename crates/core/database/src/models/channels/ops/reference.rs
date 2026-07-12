@@ -137,6 +137,9 @@ impl AbstractChannels for ReferenceDb {
             match &mut channel {
                 Channel::TextChannel {
                     role_permissions, ..
+                }
+                | Channel::Forum {
+                    role_permissions, ..
                 } => {
                     if role_permissions.get(role_id).is_some() {
                         role_permissions.remove(role_id);

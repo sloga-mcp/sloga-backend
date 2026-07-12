@@ -21,7 +21,7 @@ impl Cache {
     pub async fn can_view_channel(&self, db: &Database, channel: &Channel) -> bool {
         #[allow(deprecated)]
         match &channel {
-            Channel::TextChannel { server, .. } => {
+            Channel::TextChannel { server, .. } | Channel::Forum { server, .. } => {
                 let member = self.members.get(server);
                 let server = self.servers.get(server);
                 let mut query =
@@ -46,10 +46,12 @@ impl Cache {
                 parent_channel,
                 ..
             } => {
-                // A thread's visibility is exactly its parent text channel's
-                // visibility. Resolve the parent from cache, falling back to
-                // the database, and fail closed if it is missing or is not a
-                // text channel — a thread must never leak past a hidden parent.
+                // A thread's visibility is exactly its parent channel's
+                // visibility (text channel, or forum for forum posts).
+                // Resolve the parent from cache, falling back to the
+                // database, and fail closed if it is missing or is not a
+                // thread-capable channel — a thread must never leak past a
+                // hidden parent.
                 let parent = if let Some(parent) = self.channels.get(parent_channel) {
                     parent.clone()
                 } else if let Ok(parent) = db.fetch_channel(parent_channel).await {
@@ -58,7 +60,10 @@ impl Cache {
                     return false;
                 };
 
-                if !matches!(parent, Channel::TextChannel { .. }) {
+                if !matches!(
+                    parent,
+                    Channel::TextChannel { .. } | Channel::Forum { .. }
+                ) {
                     return false;
                 }
 
@@ -595,7 +600,18 @@ impl State {
                             queue_remove = Some(id.clone());
                             *event = EventV1::ChannelDelete { id: id.clone() };
                         }
+                    } else if !can_view {
+                        // Hidden before AND after the update: drop the event
+                        // entirely — ChannelUpdate is published to the server
+                        // topic, so without this a member denied ViewChannel
+                        // receives hidden-channel metadata (renames,
+                        // description edits) over their socket.
+                        return false;
                     }
+                } else {
+                    // The channel cannot be resolved at all; fail closed
+                    // rather than forwarding an update we cannot authorise.
+                    return false;
                 }
 
                 // Propagate the parent's (possibly) changed visibility to its
@@ -825,5 +841,147 @@ impl State {
         }
 
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use revolt_database::{
+        events::client::EventV1, Channel, DatabaseInfo, Member, MemberCompositeKey, Server, User,
+    };
+    use revolt_models::v0;
+    use revolt_permissions::{ChannelPermission, OverrideField};
+    use std::collections::HashMap;
+
+    use super::super::state::State;
+
+    /// Build a state for `user` who is a plain (role-less) member of `server`.
+    fn member_state(user: User, server: &Server) -> State {
+        let mut state = State::from(user, "session".to_string());
+        state.cache.servers.insert(server.id.clone(), server.clone());
+        state.cache.members.insert(
+            server.id.clone(),
+            Member {
+                id: MemberCompositeKey {
+                    server: server.id.clone(),
+                    user: state.cache.user_id.clone(),
+                },
+                ..Default::default()
+            },
+        );
+        state
+    }
+
+    /// A ChannelUpdate for a channel the member cannot view — before or
+    /// after the update — must be dropped, not forwarded: it is published
+    /// to the server topic and would otherwise leak hidden-channel
+    /// metadata (renames, description edits) to denied members' sockets.
+    #[tokio::test]
+    async fn hidden_channel_update_is_dropped_for_denied_member() {
+        let db = DatabaseInfo::Test("bonfire_hidden_channel_update".to_string())
+            .connect()
+            .await
+            .expect("database");
+
+        let member_user = User {
+            id: "01USER000000000000000MEMBER".to_string(),
+            username: "member".to_string(),
+            ..Default::default()
+        };
+
+        let server = Server {
+            id: "01SERVER00000000000000000A".to_string(),
+            owner: "01USER0000000000000000OWNER".to_string(),
+            name: "server".to_string(),
+            description: None,
+            channels: vec![
+                "01CHANNEL000000000000HIDDEN".to_string(),
+                "01CHANNEL00000000000VISIBLE".to_string(),
+            ],
+            categories: None,
+            system_messages: None,
+            roles: HashMap::new(),
+            default_permissions: ChannelPermission::ViewChannel as i64,
+            icon: None,
+            banner: None,
+            flags: None,
+            nsfw: false,
+            analytics: false,
+            discoverable: false,
+        };
+
+        // Hidden: channel override denies ViewChannel for everyone.
+        let hidden = Channel::TextChannel {
+            id: "01CHANNEL000000000000HIDDEN".to_string(),
+            server: server.id.clone(),
+            name: "hidden".to_string(),
+            description: None,
+            icon: None,
+            last_message_id: None,
+            default_permissions: Some(OverrideField {
+                a: 0,
+                d: ChannelPermission::ViewChannel as i64,
+            }),
+            role_permissions: HashMap::new(),
+            nsfw: false,
+            voice: None,
+            slowmode: None,
+        };
+        db.insert_channel(&hidden).await.expect("insert hidden");
+
+        let visible = Channel::TextChannel {
+            id: "01CHANNEL00000000000VISIBLE".to_string(),
+            server: server.id.clone(),
+            name: "visible".to_string(),
+            description: None,
+            icon: None,
+            last_message_id: None,
+            default_permissions: None,
+            role_permissions: HashMap::new(),
+            nsfw: false,
+            voice: None,
+            slowmode: None,
+        };
+        db.insert_channel(&visible).await.expect("insert visible");
+
+        // The denied member's Ready excluded the hidden channel, so it is
+        // NOT in their cache; bonfire resolves it from the database.
+        let mut state = member_state(member_user, &server);
+        state
+            .cache
+            .channels
+            .insert(visible.id().to_string(), visible.clone());
+
+        let mut event = EventV1::ChannelUpdate {
+            id: hidden.id().to_string(),
+            data: v0::PartialChannel {
+                name: Some("renamed secret".to_string()),
+                ..Default::default()
+            },
+            clear: vec![],
+        };
+        assert!(
+            !state.handle_incoming_event_v1(&db, &mut event).await,
+            "hidden-channel update must be dropped for a denied member"
+        );
+
+        // Control: an update to a channel the member CAN view is forwarded
+        // untouched.
+        let mut event = EventV1::ChannelUpdate {
+            id: visible.id().to_string(),
+            data: v0::PartialChannel {
+                name: Some("renamed public".to_string()),
+                ..Default::default()
+            },
+            clear: vec![],
+        };
+        assert!(
+            state.handle_incoming_event_v1(&db, &mut event).await,
+            "visible-channel update must still be forwarded"
+        );
+        assert!(
+            matches!(event, EventV1::ChannelUpdate { .. }),
+            "forwarded event must remain a ChannelUpdate"
+        );
     }
 }

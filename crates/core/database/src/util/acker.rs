@@ -42,6 +42,9 @@ pub async fn ack_server(user: &User, server: &Server, db: &Database, amqp: &AMQP
             let channel_last_msg = match &channel {
                 Channel::TextChannel {
                     last_message_id, ..
+                }
+                | Channel::Forum {
+                    last_message_id, ..
                 } => last_message_id,
                 _ => unreachable!(),
             }

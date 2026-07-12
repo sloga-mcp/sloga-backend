@@ -165,7 +165,100 @@ auto_derived!(
                 serde(skip_serializing_if = "crate::if_false", default)
             )]
             locked: bool,
+
+            /// Ids of this forum's tags applied to this thread
+            /// (only ever set on threads whose parent is a forum channel)
+            #[cfg_attr(
+                feature = "serde",
+                serde(default, skip_serializing_if = "Vec::is_empty")
+            )]
+            applied_tags: Vec<String>,
         },
+        /// Forum channel belonging to a server; every post is a thread
+        Forum {
+            /// Unique Id
+            #[cfg_attr(feature = "serde", serde(rename = "_id"))]
+            id: String,
+            /// Id of the server this channel belongs to
+            server: String,
+
+            /// Display name of the channel
+            name: String,
+            /// Channel description
+            #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+            description: Option<String>,
+
+            /// Custom icon attachment
+            #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+            icon: Option<File>,
+            /// Id of the last message sent in a post under this forum
+            /// (drives the existing unread / ack machinery unchanged)
+            #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+            last_message_id: Option<String>,
+
+            /// Default permissions assigned to users in this channel
+            #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+            default_permissions: Option<OverrideField>,
+            /// Permissions assigned based on role to this channel
+            #[cfg_attr(
+                feature = "serde",
+                serde(
+                    default = "HashMap::<String, OverrideField>::new",
+                    skip_serializing_if = "HashMap::<String, OverrideField>::is_empty"
+                )
+            )]
+            role_permissions: HashMap<String, OverrideField>,
+
+            /// Whether this channel is marked as not safe for work
+            #[cfg_attr(
+                feature = "serde",
+                serde(skip_serializing_if = "crate::if_false", default)
+            )]
+            nsfw: bool,
+
+            /// Tags that can be applied to posts in this forum
+            #[cfg_attr(
+                feature = "serde",
+                serde(default, skip_serializing_if = "Vec::is_empty")
+            )]
+            tags: Vec<ForumTag>,
+            /// Whether every post must carry at least one tag
+            #[cfg_attr(
+                feature = "serde",
+                serde(skip_serializing_if = "crate::if_false", default)
+            )]
+            require_tag: bool,
+            /// Default ordering of the post browse view
+            #[cfg_attr(feature = "serde", serde(default))]
+            default_sort: ForumSortOrder,
+        },
+    }
+
+    /// Tag that can be applied to posts in a forum channel
+    pub struct ForumTag {
+        /// Unique Id of this tag (server-assigned ulid)
+        pub id: String,
+        /// Display name of the tag
+        pub name: String,
+        /// Emoji shown alongside the tag name
+        #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+        pub emoji: Option<String>,
+        /// Whether only members with ManageChannel may apply this tag
+        #[cfg_attr(
+            feature = "serde",
+            serde(skip_serializing_if = "crate::if_false", default)
+        )]
+        pub moderated: bool,
+    }
+
+    /// Default ordering of a forum's post browse view
+    #[derive(Default)]
+    pub enum ForumSortOrder {
+        /// Most recently active post first
+        #[default]
+        LatestActivity,
+        /// Most recently created post first
+        CreationDate,
     }
 
     /// Voice information for a channel
@@ -215,6 +308,14 @@ auto_derived!(
         pub archived: Option<bool>,
         #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
         pub archived_timestamp: Option<String>,
+        #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+        pub tags: Option<Vec<ForumTag>>,
+        #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+        pub require_tag: Option<bool>,
+        #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+        pub default_sort: Option<ForumSortOrder>,
+        #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+        pub applied_tags: Option<Vec<String>>,
     }
 
     /// Optional fields on channel object
@@ -223,13 +324,18 @@ auto_derived!(
         Icon,
         DefaultPermissions,
         Voice,
+        Tags,
     }
 
     /// New webhook information
     #[cfg_attr(feature = "validator", derive(validator::Validate))]
     pub struct DataEditChannel {
         /// Channel name
-        #[cfg_attr(feature = "validator", validate(length(min = 1, max = 32)))]
+        ///
+        /// The shared validator allows up to 100 characters (forum post
+        /// titles); channel_edit enforces the 32-character limit for every
+        /// channel type except forum-post threads.
+        #[cfg_attr(feature = "validator", validate(length(min = 1, max = 100)))]
         pub name: Option<String>,
 
         /// Channel description
@@ -258,9 +364,36 @@ auto_derived!(
         #[cfg_attr(feature = "validator", validate(range(min = 0, max = 21600)))]
         pub slowmode: Option<u64>,
 
+        /// Tag definitions for a forum channel (replaces the whole set;
+        /// tags without an id are new and get a server-assigned id)
+        pub tags: Option<Vec<DataForumTag>>,
+
+        /// Whether every post in a forum must carry at least one tag
+        pub require_tag: Option<bool>,
+
+        /// Default ordering of a forum's post browse view
+        pub default_sort: Option<ForumSortOrder>,
+
+        /// Ids of forum tags applied to this post (forum-post threads only;
+        /// replaces the whole set)
+        pub applied_tags: Option<Vec<String>>,
+
         /// Fields to remove from channel
         #[cfg_attr(feature = "serde", serde(default))]
         pub remove: Vec<FieldsChannel>,
+    }
+
+    /// Forum tag definition as submitted by a client
+    pub struct DataForumTag {
+        /// Id of an existing tag to keep/edit; omit for a new tag
+        pub id: Option<String>,
+        /// Display name of the tag
+        pub name: String,
+        /// Emoji shown alongside the tag name
+        pub emoji: Option<String>,
+        /// Whether only members with ManageChannel may apply this tag
+        #[cfg_attr(feature = "serde", serde(default))]
+        pub moderated: bool,
     }
 
     /// Create new group
@@ -307,6 +440,42 @@ auto_derived!(
         Text,
         /// Voice Channel
         Voice,
+        /// Forum Channel
+        Forum,
+    }
+
+    /// Create a new post in a forum channel
+    #[cfg_attr(feature = "validator", derive(validator::Validate))]
+    pub struct DataCreateForumPost {
+        /// Post title (becomes the thread name)
+        #[cfg_attr(feature = "validator", validate(length(min = 1, max = 100)))]
+        pub title: String,
+        /// Ids of forum tags applied to this post
+        #[cfg_attr(feature = "serde", serde(default))]
+        pub tags: Vec<String>,
+        /// Minutes of inactivity after which the post auto-archives
+        /// (one of 60 / 1440 / 4320 / 10080, defaults to 1440)
+        pub auto_archive_minutes: Option<u32>,
+        /// Starter message of the post
+        pub message: super::DataMessageSend,
+    }
+
+    /// A newly created forum post with its starter message
+    pub struct ForumPostResponse {
+        /// The post (a thread under the forum)
+        pub post: Channel,
+        /// The starter message (its id equals the post's id)
+        pub message: super::Message,
+    }
+
+    /// A page of forum posts
+    pub struct ForumPostsResponse {
+        /// Posts, ordered by the requested sort
+        pub posts: Vec<Channel>,
+        /// Starter messages for this page's posts (present when
+        /// `include_starters` was set; each message's id equals its post's id)
+        #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+        pub starters: Option<Vec<super::Message>>,
     }
 
     /// Create new server channel
@@ -414,7 +583,8 @@ impl Channel {
             | Channel::Group { id, .. }
             | Channel::SavedMessages { id, .. }
             | Channel::TextChannel { id, .. }
-            | Channel::Thread { id, .. } => id,
+            | Channel::Thread { id, .. }
+            | Channel::Forum { id, .. } => id,
         }
     }
 
@@ -428,7 +598,8 @@ impl Channel {
             Channel::SavedMessages { .. } => Some("Saved Messages"),
             Channel::TextChannel { name, .. }
             | Channel::Group { name, .. }
-            | Channel::Thread { name, .. } => Some(name),
+            | Channel::Thread { name, .. }
+            | Channel::Forum { name, .. } => Some(name),
         }
     }
 }

@@ -293,9 +293,46 @@ impl Message {
         user: Option<v0::User>,
         member: Option<v0::Member>,
         limits: FeaturesLimits,
+        idempotency: IdempotencyKey,
+        generate_embeds: bool,
+        allow_mentions: bool,
+    ) -> Result<Message> {
+        Message::create_from_api_with_id(
+            db,
+            amqp,
+            channel,
+            data,
+            author,
+            user,
+            member,
+            limits,
+            idempotency,
+            generate_embeds,
+            allow_mentions,
+            None,
+        )
+        .await
+    }
+
+    /// Create message from API data, optionally forcing the message id.
+    ///
+    /// Forum post creation pins the starter message's id to the post's
+    /// (thread's) id so starters can be bulk-fetched by id when listing
+    /// posts. Every other caller passes `None` and gets a fresh ulid.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_from_api_with_id(
+        db: &Database,
+        amqp: Option<&AMQP>,
+        channel: Channel,
+        data: DataMessageSend,
+        author: MessageAuthor<'_>,
+        user: Option<v0::User>,
+        member: Option<v0::Member>,
+        limits: FeaturesLimits,
         mut idempotency: IdempotencyKey,
         generate_embeds: bool,
         allow_mentions: bool,
+        forced_id: Option<String>,
     ) -> Result<Message> {
         let config = config().await;
 
@@ -350,9 +387,9 @@ impl Message {
         }
 
         let server_id = match channel {
-            Channel::TextChannel { ref server, .. } | Channel::Thread { ref server, .. } => {
-                Some(server.clone())
-            }
+            Channel::TextChannel { ref server, .. }
+            | Channel::Thread { ref server, .. }
+            | Channel::Forum { ref server, .. } => Some(server.clone()),
             _ => None,
         };
 
@@ -378,7 +415,7 @@ impl Message {
         };
 
         // Start constructing the message
-        let message_id = Ulid::new().to_string();
+        let message_id = forced_id.unwrap_or_else(|| Ulid::new().to_string());
         let mut message = Message {
             id: message_id.clone(),
             channel: channel.id().to_string(),
@@ -522,7 +559,9 @@ impl Message {
                     user_mentions.retain(|m| recipients_hash.contains(m));
                     role_mentions.clear();
                 }
-                Channel::TextChannel { ref server, .. } | Channel::Thread { ref server, .. } => {
+                Channel::TextChannel { ref server, .. }
+                | Channel::Thread { ref server, .. }
+                | Channel::Forum { ref server, .. } => {
                     let mentions_vec = Vec::from_iter(user_mentions.iter().cloned());
 
                     let valid_members = db.fetch_members(server.as_str(), &mentions_vec[..]).await;

@@ -36,6 +36,13 @@ pub async fn message_send(
 
     // Ensure we have permissions to send a message
     let channel = target.as_channel(db).await?;
+
+    // Forum channels have no message stream of their own — content lives in
+    // posts (threads). Fail closed on direct sends.
+    if matches!(channel, Channel::Forum { .. }) {
+        return Err(create_error!(InvalidOperation));
+    }
+
     // Threads delegate their permission calculus to the parent text channel;
     // resolve it BEFORE constructing the query so a thread under a private
     // parent inherits the parent's overrides instead of falling through to
@@ -226,6 +233,10 @@ mod test {
             slowmode: None,
             archived: None,
             archived_timestamp: None,
+            tags: None,
+            require_tag: None,
+            default_sort: None,
+            applied_tags: None,
         };
         locked_channel
             .update(&harness.db, partial, vec![])

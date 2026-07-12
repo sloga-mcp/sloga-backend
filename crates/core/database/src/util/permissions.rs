@@ -224,6 +224,9 @@ impl PermissionQuery for DatabasePermissionQuery<'_> {
                 Cow::Borrowed(Channel::Thread { .. }) | Cow::Owned(Channel::Thread { .. }) => {
                     ChannelType::ServerChannel
                 }
+                Cow::Borrowed(Channel::Forum { .. }) | Cow::Owned(Channel::Forum { .. }) => {
+                    ChannelType::ServerChannel
+                }
             }
         } else {
             ChannelType::Unknown
@@ -247,6 +250,14 @@ impl PermissionQuery for DatabasePermissionQuery<'_> {
                 | Cow::Owned(Channel::TextChannel {
                     default_permissions,
                     ..
+                })
+                | Cow::Borrowed(Channel::Forum {
+                    default_permissions,
+                    ..
+                })
+                | Cow::Owned(Channel::Forum {
+                    default_permissions,
+                    ..
                 }) => default_permissions.unwrap_or_default().into(),
                 _ => Default::default(),
             }
@@ -263,6 +274,12 @@ impl PermissionQuery for DatabasePermissionQuery<'_> {
                     role_permissions, ..
                 })
                 | Cow::Owned(Channel::TextChannel {
+                    role_permissions, ..
+                })
+                | Cow::Borrowed(Channel::Forum {
+                    role_permissions, ..
+                })
+                | Cow::Owned(Channel::Forum {
                     role_permissions, ..
                 }) => {
                     if let Some(server) = &self.server {
@@ -356,7 +373,9 @@ impl PermissionQuery for DatabasePermissionQuery<'_> {
                 Cow::Borrowed(Channel::TextChannel { server, .. })
                 | Cow::Owned(Channel::TextChannel { server, .. })
                 | Cow::Borrowed(Channel::Thread { server, .. })
-                | Cow::Owned(Channel::Thread { server, .. }) => {
+                | Cow::Owned(Channel::Thread { server, .. })
+                | Cow::Borrowed(Channel::Forum { server, .. })
+                | Cow::Owned(Channel::Forum { server, .. }) => {
                     if let Some(known_server) =
                         // I'm not sure why I can't just pattern match both at once here?
                         // It throws some weird error and the provided fix doesn't work :/

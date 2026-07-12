@@ -218,6 +218,7 @@ impl From<crate::Channel> for Channel {
                 archived_timestamp,
                 auto_archive_minutes,
                 locked,
+                applied_tags,
             } => Channel::Thread {
                 id,
                 server,
@@ -230,6 +231,34 @@ impl From<crate::Channel> for Channel {
                 archived_timestamp,
                 auto_archive_minutes,
                 locked,
+                applied_tags,
+            },
+            crate::Channel::Forum {
+                id,
+                server,
+                name,
+                description,
+                icon,
+                last_message_id,
+                default_permissions,
+                role_permissions,
+                nsfw,
+                tags,
+                require_tag,
+                default_sort,
+            } => Channel::Forum {
+                id,
+                server,
+                name,
+                description,
+                icon: icon.map(|file| file.into()),
+                last_message_id,
+                default_permissions,
+                role_permissions,
+                nsfw,
+                tags: tags.into_iter().map(|tag| tag.into()).collect(),
+                require_tag,
+                default_sort: default_sort.into(),
             },
         }
     }
@@ -311,6 +340,7 @@ impl From<Channel> for crate::Channel {
                 archived_timestamp,
                 auto_archive_minutes,
                 locked,
+                applied_tags,
             } => crate::Channel::Thread {
                 id,
                 server,
@@ -323,7 +353,75 @@ impl From<Channel> for crate::Channel {
                 archived_timestamp,
                 auto_archive_minutes,
                 locked,
+                applied_tags,
             },
+            Channel::Forum {
+                id,
+                server,
+                name,
+                description,
+                icon,
+                last_message_id,
+                default_permissions,
+                role_permissions,
+                nsfw,
+                tags,
+                require_tag,
+                default_sort,
+            } => crate::Channel::Forum {
+                id,
+                server,
+                name,
+                description,
+                icon: icon.map(|file| file.into()),
+                last_message_id,
+                default_permissions,
+                role_permissions,
+                nsfw,
+                tags: tags.into_iter().map(|tag| tag.into()).collect(),
+                require_tag,
+                default_sort: default_sort.into(),
+            },
+        }
+    }
+}
+
+impl From<crate::ForumTag> for ForumTag {
+    fn from(value: crate::ForumTag) -> Self {
+        ForumTag {
+            id: value.id,
+            name: value.name,
+            emoji: value.emoji,
+            moderated: value.moderated,
+        }
+    }
+}
+
+impl From<ForumTag> for crate::ForumTag {
+    fn from(value: ForumTag) -> Self {
+        crate::ForumTag {
+            id: value.id,
+            name: value.name,
+            emoji: value.emoji,
+            moderated: value.moderated,
+        }
+    }
+}
+
+impl From<crate::ForumSortOrder> for ForumSortOrder {
+    fn from(value: crate::ForumSortOrder) -> Self {
+        match value {
+            crate::ForumSortOrder::LatestActivity => ForumSortOrder::LatestActivity,
+            crate::ForumSortOrder::CreationDate => ForumSortOrder::CreationDate,
+        }
+    }
+}
+
+impl From<ForumSortOrder> for crate::ForumSortOrder {
+    fn from(value: ForumSortOrder) -> Self {
+        match value {
+            ForumSortOrder::LatestActivity => crate::ForumSortOrder::LatestActivity,
+            ForumSortOrder::CreationDate => crate::ForumSortOrder::CreationDate,
         }
     }
 }
@@ -345,6 +443,12 @@ impl From<crate::PartialChannel> for PartialChannel {
             slowmode: value.slowmode,
             archived: value.archived,
             archived_timestamp: value.archived_timestamp,
+            tags: value
+                .tags
+                .map(|tags| tags.into_iter().map(|tag| tag.into()).collect()),
+            require_tag: value.require_tag,
+            default_sort: value.default_sort.map(|sort| sort.into()),
+            applied_tags: value.applied_tags,
         }
     }
 }
@@ -366,6 +470,12 @@ impl From<PartialChannel> for crate::PartialChannel {
             slowmode: value.slowmode,
             archived: value.archived,
             archived_timestamp: value.archived_timestamp,
+            tags: value
+                .tags
+                .map(|tags| tags.into_iter().map(|tag| tag.into()).collect()),
+            require_tag: value.require_tag,
+            default_sort: value.default_sort.map(|sort| sort.into()),
+            applied_tags: value.applied_tags,
         }
     }
 }
@@ -377,6 +487,7 @@ impl From<FieldsChannel> for crate::FieldsChannel {
             FieldsChannel::Icon => crate::FieldsChannel::Icon,
             FieldsChannel::DefaultPermissions => crate::FieldsChannel::DefaultPermissions,
             FieldsChannel::Voice => crate::FieldsChannel::Voice,
+            FieldsChannel::Tags => crate::FieldsChannel::Tags,
         }
     }
 }
@@ -388,6 +499,7 @@ impl From<crate::FieldsChannel> for FieldsChannel {
             crate::FieldsChannel::Icon => FieldsChannel::Icon,
             crate::FieldsChannel::DefaultPermissions => FieldsChannel::DefaultPermissions,
             crate::FieldsChannel::Voice => FieldsChannel::Voice,
+            crate::FieldsChannel::Tags => FieldsChannel::Tags,
         }
     }
 }

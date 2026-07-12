@@ -1,7 +1,7 @@
 use revolt_database::util::idempotency::IdempotencyKey;
 use revolt_database::util::permissions::DatabasePermissionQuery;
 use revolt_database::util::reference::Reference;
-use revolt_database::{Database, Message, MessageFlagsValue, User, AMQP};
+use revolt_database::{Channel, Database, Message, MessageFlagsValue, User, AMQP};
 use revolt_models::v0::{self, MessageFlags};
 use revolt_permissions::{calculate_channel_permissions, ChannelPermission, PermissionQuery};
 use revolt_result::{create_error, Result};
@@ -40,11 +40,21 @@ pub async fn message_roll(
 
     // Same gate as sending a normal message
     let channel = target.as_channel(db).await?;
+
+    // Forum channels have no message stream of their own — fail closed like
+    // message_send.
+    if matches!(channel, Channel::Forum { .. }) {
+        return Err(create_error!(InvalidOperation));
+    }
+
     // Threads inherit their parent channel's permission overrides.
     let permission_channel = channel.permission_target(db).await?.into_owned();
     let mut query = DatabasePermissionQuery::new(db, &user).channel(&permission_channel);
     let permissions = calculate_channel_permissions(&mut query).await;
     permissions.throw_if_lacking_channel_permission(ChannelPermission::SendMessage)?;
+
+    // Archived or locked threads reject rolls exactly like normal messages.
+    crate::util::threads::ensure_thread_writable(&channel, &permissions)?;
 
     crate::util::slowmode::enforce_slowmode(&user, &channel, &permissions).await?;
 

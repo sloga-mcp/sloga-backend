@@ -183,6 +183,10 @@ impl<'z> BulkDatabasePermissionQuery<'z> {
                 Channel::TextChannel {
                     default_permissions,
                     ..
+                }
+                | Channel::Forum {
+                    default_permissions,
+                    ..
                 } => default_permissions.unwrap_or_default().into(),
                 _ => Default::default(),
             }
@@ -199,8 +203,10 @@ impl<'z> BulkDatabasePermissionQuery<'z> {
                 Channel::Group { .. } => ChannelType::Group,
                 Channel::SavedMessages { .. } => ChannelType::SavedMessages,
                 // Defensive fallback only: callers MUST substitute the parent
-                // text channel (Channel::permission_target) before querying.
-                Channel::TextChannel { .. } | Channel::Thread { .. } => ChannelType::ServerChannel,
+                // channel (Channel::permission_target) before querying.
+                Channel::TextChannel { .. } | Channel::Thread { .. } | Channel::Forum { .. } => {
+                    ChannelType::ServerChannel
+                }
             }
         } else {
             ChannelType::Unknown
@@ -213,6 +219,9 @@ impl<'z> BulkDatabasePermissionQuery<'z> {
         if let Some(channel) = &self.channel {
             match channel {
                 Channel::TextChannel {
+                    role_permissions, ..
+                }
+                | Channel::Forum {
                     role_permissions, ..
                 } => role_permissions,
                 _ => panic!("Not supported for non-server channels"),
@@ -241,6 +250,12 @@ async fn calculate_members_permissions<'a>(
 
     let (_, channel_role_permissions, channel_default_permissions) = match channel {
         Channel::TextChannel {
+            id,
+            role_permissions,
+            default_permissions,
+            ..
+        }
+        | Channel::Forum {
             id,
             role_permissions,
             default_permissions,
