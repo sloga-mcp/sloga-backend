@@ -426,6 +426,13 @@ pub enum EventV1 {
         device_id: String,
         key_package_ref: String,
         signature: String,
+        /// The intent came from a device that is ALREADY a group member: its
+        /// leaf is stale (the device wiped local state via rejoin-fresh) and
+        /// verifying members should REMOVE it so the device's next normal
+        /// intent can be admitted. `serde(default)` so a newer bonfire can
+        /// relay events from an older delta during rollout.
+        #[serde(default)]
+        rejoin: bool,
     },
 
     /// Live push of an MLS commit envelope (media E2EE).

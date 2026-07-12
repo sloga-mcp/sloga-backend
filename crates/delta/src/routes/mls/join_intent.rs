@@ -79,26 +79,41 @@ pub async fn join_intent(
         return Err(create_error!(NotFound));
     }
 
-    // One device per user per call (plan §1.5), enforced at the DS — two
-    // native layers on two devices share no state; only the DS sees both
-    if let Some(existing) = group.member_device_of(&user.id) {
-        let error = if existing.device_id == data.device_id {
-            "this device is already a member of the call group"
-        } else {
-            "another device of this user is already in the call group"
-        };
-        return Err(create_error!(FailedValidation {
-            error: error.to_string()
-        }));
-    }
-
     // Defense-in-depth signature verification (clients re-verify — that is
-    // the real check; plan §2.3)
+    // the real check; plan §2.3). Runs BEFORE the membership branch so the
+    // rejoin and solo-close arms below are only reachable by the
+    // authenticated signing device (rejoin plan AUD-LOW-1).
     let payload = mls_join_intent_payload(&user.id, &data.device_id, &group.id, &data.key_package_ref);
     if !identity.verify_payload(&payload, &data.signature) {
         return Err(create_error!(FailedValidation {
             error: "invalid join intent signature".to_string()
         }));
+    }
+
+    // One device per user per call (plan §1.5), enforced at the DS — two
+    // native layers on two devices share no state; only the DS sees both.
+    // SAME device already a member = a REJOIN: the device wiped its local
+    // group state (rejoin-fresh) but its stale leaf is still in the roster,
+    // and it can never remove itself (RFC 9420 forbids self-removal). Fan
+    // the intent out flagged `rejoin` so verifying members remove the stale
+    // leaf; the device's next normal intent then rides the unchanged
+    // admit path (rejoin-affordance plan §3.1).
+    let mut rejoin = false;
+    if let Some(existing) = group.member_device_of(&user.id) {
+        if existing.device_id != data.device_id {
+            return Err(create_error!(FailedValidation {
+                error: "another device of this user is already in the call group".to_string()
+            }));
+        }
+        if group.members.len() == 1 {
+            // The sole member IS the stale self: no other leaf-holder exists
+            // to serve the rejoin, and the sole member's group secrets are
+            // wiped by definition — the group is unrecoverable. Close it so
+            // the device's next establish takes the CREATE path.
+            db.close_mls_group(&group.id).await?;
+            return Ok(EmptyResponse);
+        }
+        rejoin = true;
     }
 
     let intent = MlsJoinIntent {
@@ -141,6 +156,7 @@ pub async fn join_intent(
             device_id: data.device_id.clone(),
             key_package_ref: data.key_package_ref.clone(),
             signature: data.signature.clone(),
+            rejoin,
         }
         .private(member_user)
         .await;

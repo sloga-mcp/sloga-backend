@@ -280,12 +280,14 @@ async fn full_flow_create_join_commit_fanout() {
         group_id: event_group,
         user_id: event_user,
         key_package_ref,
+        rejoin,
         ..
     } = event
     {
         assert_eq!(event_group, gid);
         assert_eq!(event_user, user_b.id);
         assert_eq!(key_package_ref, "b0");
+        assert!(!rejoin, "a non-member's intent is a normal join");
     }
 
     // A (stranger co-member) claims B's KeyPackage — the co-presence class
@@ -441,6 +443,168 @@ async fn full_flow_create_join_commit_fanout() {
         .dispatch()
         .await;
     assert_eq!(response.status(), Status::NotFound);
+}
+
+#[rocket::async_test]
+async fn rejoin_affordance_flags_and_solo_close() {
+    let mut harness = TestHarness::new().await;
+    let (account_a, session_a, user_a) = harness.new_user().await;
+    let (account_b, session_b, user_b) = harness.new_user().await;
+
+    let channel = voice_channel_with_members(&harness, &user_a, &[&user_b]).await;
+    let device_a = enroll_mls_device(
+        &harness,
+        &account_a.id,
+        &user_a.id,
+        &session_a.token,
+        &["a0"],
+        Some("alast"),
+    )
+    .await;
+    let device_b = enroll_mls_device(
+        &harness,
+        &account_b.id,
+        &user_b.id,
+        &session_b.token,
+        &["b0"],
+        Some("blast"),
+    )
+    .await;
+
+    // A registers the group and commits epoch 1 adding B (the DS commit
+    // route does not require a prior intent — B being a MEMBER is the
+    // precondition the rejoin arm keys on, and skipping the HTTP intent
+    // keeps B's rejoin below outside the per-device intent slowmode).
+    let gid = group_id(3);
+    {
+        let response = post_json(
+            &harness,
+            &session_a,
+            "/mls/groups".to_string(),
+            serde_json::to_string(&v0::DataCreateMlsGroup {
+                group_id: gid.clone(),
+                channel_id: channel.id().to_string(),
+                device_id: device_a.device.device_id.clone(),
+                supersedes: None,
+            })
+            .unwrap(),
+        )
+        .await;
+        assert_eq!(response.status(), Status::Ok);
+    }
+    {
+        let response = post_json(
+            &harness,
+            &session_a,
+            format!("/mls/groups/{gid}/commits"),
+            serde_json::to_string(&v0::DataSubmitMlsCommit {
+                device_id: device_a.device.device_id.clone(),
+                epoch: 1,
+                commit: STANDARD_NO_PAD.encode(b"add b"),
+                welcome: Some(STANDARD_NO_PAD.encode(b"welcome b")),
+                added: vec![v0::MlsMemberDevice {
+                    user_id: user_b.id.clone(),
+                    device_id: device_b.device.device_id.clone(),
+                }],
+                removed: vec![],
+            })
+            .unwrap(),
+        )
+        .await;
+        assert_eq!(response.status(), Status::Ok);
+    }
+
+    // B — already a member (stale leaf after a local rejoin-fresh) —
+    // signals join intent again: accepted (204, NOT the old 400) and fanned
+    // out flagged `rejoin` so verifying members remove the stale leaf.
+    {
+        let response = post_json(
+            &harness,
+            &session_b,
+            format!("/mls/groups/{gid}/join_intent"),
+            serde_json::to_string(&v0::DataMlsJoinIntent {
+                device_id: device_b.device.device_id.clone(),
+                key_package_ref: "b0".to_string(),
+                signature: device_b.join_signature(&user_b.id, &gid, "b0"),
+            })
+            .unwrap(),
+        )
+        .await;
+        assert_eq!(response.status(), Status::NoContent);
+    }
+    let event = harness
+        .wait_for_event(&format!("{}!", user_a.id), |event| {
+            matches!(
+                event,
+                revolt_database::events::client::EventV1::MlsJoinRequested { .. }
+            )
+        })
+        .await;
+    if let revolt_database::events::client::EventV1::MlsJoinRequested {
+        user_id: event_user,
+        device_id: event_device,
+        rejoin,
+        ..
+    } = event
+    {
+        assert_eq!(event_user, user_b.id);
+        assert_eq!(event_device, device_b.device.device_id);
+        assert!(rejoin, "an already-member device's intent is a rejoin");
+    }
+
+    // Solo-stale: A is the SOLE member of a fresh group on a second channel
+    // and rejoins it — nobody can serve the rejoin (no other leaf-holder),
+    // so the DS closes the group instead of fanning out.
+    let solo_channel = voice_channel_with_members(&harness, &user_a, &[]).await;
+    let solo_gid = group_id(4);
+    {
+        let response = post_json(
+            &harness,
+            &session_a,
+            "/mls/groups".to_string(),
+            serde_json::to_string(&v0::DataCreateMlsGroup {
+                group_id: solo_gid.clone(),
+                channel_id: solo_channel.id().to_string(),
+                device_id: device_a.device.device_id.clone(),
+                supersedes: None,
+            })
+            .unwrap(),
+        )
+        .await;
+        assert_eq!(response.status(), Status::Ok);
+    }
+    {
+        let response = post_json(
+            &harness,
+            &session_a,
+            format!("/mls/groups/{solo_gid}/join_intent"),
+            serde_json::to_string(&v0::DataMlsJoinIntent {
+                device_id: device_a.device.device_id.clone(),
+                key_package_ref: "a0".to_string(),
+                signature: device_a.join_signature(&user_a.id, &solo_gid, "a0"),
+            })
+            .unwrap(),
+        )
+        .await;
+        assert_eq!(response.status(), Status::NoContent);
+    }
+    // The group is now CLOSED: a further intent 404s (open == false), which
+    // the joiner surfaces as `not_found` → re-establish → CREATE path.
+    {
+        let response = post_json(
+            &harness,
+            &session_a,
+            format!("/mls/groups/{solo_gid}/join_intent"),
+            serde_json::to_string(&v0::DataMlsJoinIntent {
+                device_id: device_a.device.device_id.clone(),
+                key_package_ref: "a0".to_string(),
+                signature: device_a.join_signature(&user_a.id, &solo_gid, "a0"),
+            })
+            .unwrap(),
+        )
+        .await;
+        assert_eq!(response.status(), Status::NotFound);
+    }
 }
 
 #[rocket::async_test]
