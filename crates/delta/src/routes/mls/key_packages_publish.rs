@@ -1,7 +1,7 @@
 use iso8601_timestamp::{Duration, Timestamp};
 use revolt_database::{
     is_valid_device_id, is_valid_key_package_ref, mls_credential_binding_payload, Database,
-    MlsKeyPackage, Session, User, ValidatedTicket,
+    MlsKeyPackage, Session, User,
 };
 use revolt_models::v0;
 use revolt_result::{create_error, Result};
@@ -43,16 +43,18 @@ fn check_upload(upload: &v0::MlsKeyPackageUpload) -> Result<()> {
 /// the credential inside each KeyPackage at Welcome time; the server is
 /// outside the trust boundary.
 ///
-/// The first publication for a device requires a validated MFA ticket;
-/// replenishment requires the session bound to the device. The MLS signature
-/// key is immutable while any package for the device is stored.
+/// Every publication (first and replenish) requires the session bound to the
+/// device plus a valid credential binding — the device identity behind that
+/// binding was itself MFA-gated at enrollment, so no publish-time MFA ticket
+/// is demanded (publish-UX plan §3.1; a stray `X-MFA-Ticket` header from an
+/// older client is simply ignored). The MLS signature key is immutable while
+/// any package for the device is stored.
 #[openapi(tag = "MLS")]
 #[put("/key_packages", data = "<data>")]
 pub async fn publish_key_packages(
     db: &State<Database>,
     user: User,
     session: Session,
-    ticket: Option<ValidatedTicket>,
     data: Json<v0::DataPublishMlsKeyPackages>,
 ) -> Result<Json<v0::ResponsePublishMlsKeyPackages>> {
     super::require_media_e2ee_enabled().await?;
@@ -148,11 +150,10 @@ pub async fn publish_key_packages(
     // MLS signature-key immutability (v1: rotation is deferred, plan §1.3):
     // while any package is stored, the key must not change — a differing key
     // is a substitution attempt or a state loss that must re-enroll
-    let existing = db
+    if let Some(existing) = db
         .fetch_one_mls_key_package(&user.id, &device_id)
-        .await?;
-
-    if let Some(existing) = existing {
+        .await?
+    {
         if existing.mls_signature_key != mls_signature_key {
             return Err(create_error!(FailedValidation {
                 error:
@@ -160,35 +161,9 @@ pub async fn publish_key_packages(
                         .to_string()
             }));
         }
-    } else {
-        // First MLS publication for this device requires MFA, mirroring the
-        // first E2EE key publish. (A device offline long enough for ALL its
-        // packages to expire re-enrolls through MFA too — deliberate.)
-        if ticket.is_none() {
-            return Err(create_error!(InvalidToken));
-        }
     }
 
     let now = Timestamp::now_utc();
-
-    // Cap accounting is upsert-aware: republishing an already-stored ref
-    // replaces in place and must not double-count
-    let current = db
-        .count_mls_key_packages(&user.id, &device_id)
-        .await?;
-    let refs: Vec<String> = key_packages
-        .iter()
-        .map(|upload| upload.key_package_ref.clone())
-        .collect();
-    let already_stored = db
-        .count_mls_key_packages_among(&user.id, &device_id, &refs)
-        .await?;
-
-    if current + key_packages.len() as u64 - already_stored > MAX_KEY_PACKAGES as u64 {
-        return Err(create_error!(FailedValidation {
-            error: format!("at most {MAX_KEY_PACKAGES} key packages may be stored")
-        }));
-    }
 
     let build = |upload: v0::MlsKeyPackageUpload, last_resort: bool, lifetime_days: i64| {
         MlsKeyPackage {
@@ -212,7 +187,13 @@ pub async fn publish_key_packages(
         .map(|upload| build(upload, false, KEY_PACKAGE_LIFETIME_DAYS))
         .collect();
 
-    db.insert_mls_key_packages(&packages).await?;
+    // Capped upsert: a batch that would overflow the directory prunes the
+    // device's oldest packages instead of 400-ing, so a fresh-start client
+    // (watermark 0 → full regen) can never wedge itself (publish-UX plan
+    // §3.4). The returned count is the client's replenish watermark.
+    let key_package_count = db
+        .insert_mls_key_packages_capped(&user.id, &device_id, &packages, MAX_KEY_PACKAGES)
+        .await?;
 
     if let Some(last_resort) = last_resort {
         // Replaces any previous last-resort package; the native layer
@@ -224,10 +205,6 @@ pub async fn publish_key_packages(
         ))
         .await?;
     }
-
-    let key_package_count = db
-        .count_mls_key_packages(&user.id, &device_id)
-        .await?;
 
     Ok(Json(v0::ResponsePublishMlsKeyPackages { key_package_count }))
 }

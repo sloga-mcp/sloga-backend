@@ -28,19 +28,58 @@ impl crate::AbstractMls for ReferenceDb {
             .count() as u64)
     }
 
-    async fn count_mls_key_packages_among(
+    async fn insert_mls_key_packages_capped(
         &self,
         user_id: &str,
         device_id: &str,
-        refs: &[String],
+        packages: &[MlsKeyPackage],
+        max: usize,
     ) -> Result<u64> {
-        let stored = self.mls_key_packages.lock().await;
-        Ok(refs
-            .iter()
-            .filter(|reference| {
-                stored.contains_key(&MlsKeyPackage::composite_id(user_id, device_id, reference))
+        // One Mutex hold makes upsert + prune atomic outright — the
+        // stronger of the two drivers (Mongo converges via a bounded loop)
+        let mut stored = self.mls_key_packages.lock().await;
+        for package in packages {
+            stored.insert(package.id.clone(), package.clone());
+        }
+
+        let batch_ids: std::collections::HashSet<&str> =
+            packages.iter().map(|package| package.id.as_str()).collect();
+
+        let count = stored
+            .values()
+            .filter(|package| {
+                package.user_id == user_id
+                    && package.device_id == device_id
+                    && !package.last_resort
             })
-            .count() as u64)
+            .count();
+
+        if count <= max {
+            return Ok(count as u64);
+        }
+
+        // Oldest first: created_at ascending, tie-broken by id ascending
+        // (an intra-batch publish shares one `now`) — never the last-resort
+        // row, never the batch's own refs
+        let mut prunable: Vec<(Timestamp, String)> = stored
+            .values()
+            .filter(|package| {
+                package.user_id == user_id
+                    && package.device_id == device_id
+                    && !package.last_resort
+                    && !batch_ids.contains(package.id.as_str())
+            })
+            .map(|package| (package.created_at, package.id.clone()))
+            .collect();
+        prunable.sort();
+
+        let mut pruned = 0;
+        for (_, id) in prunable.into_iter().take(count - max) {
+            stored.remove(&id);
+            pruned += 1;
+        }
+
+        Ok((count - pruned) as u64)
     }
 
     async fn consume_mls_key_package(

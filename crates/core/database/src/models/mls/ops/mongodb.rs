@@ -129,23 +129,72 @@ impl AbstractMls for MongoDb {
             .map_err(|_| create_database_error!("count_documents", COL_KEY_PACKAGES))
     }
 
-    async fn count_mls_key_packages_among(
+    async fn insert_mls_key_packages_capped(
         &self,
         user_id: &str,
         device_id: &str,
-        refs: &[String],
+        packages: &[MlsKeyPackage],
+        max: usize,
     ) -> Result<u64> {
-        let ids: Vec<String> = refs
-            .iter()
-            .map(|reference| MlsKeyPackage::composite_id(user_id, device_id, reference))
-            .collect();
+        self.insert_mls_key_packages(packages).await?;
 
-        self.col::<MlsKeyPackage>(COL_KEY_PACKAGES)
-            .count_documents(doc! {
-                "_id": { "$in": ids }
-            })
-            .await
-            .map_err(|_| create_database_error!("count_documents", COL_KEY_PACKAGES))
+        let batch_ids: Vec<String> = packages.iter().map(|package| package.id.clone()).collect();
+
+        // No sort/limit on delete_many, so prune is find-oldest-ids →
+        // delete-by-id, re-checked in a bounded loop: a publish racing the
+        // find/delete window converges on a later round, and concurrent
+        // claims only ever DECREASE the count (their find_one_and_delete is
+        // atomic), so a transient over-`max` between rounds is the accepted
+        // worst case (plan-audit HIGH-1)
+        for _ in 0..3 {
+            let count = self.count_mls_key_packages(user_id, device_id).await?;
+            if count <= max as u64 {
+                return Ok(count);
+            }
+
+            // Oldest first: created_at ascending (Int64 unix-ms — see
+            // `timestamp_bson`), tie-broken by _id ascending; never the
+            // last-resort row, never the batch's own refs
+            let mut cursor = self
+                .col::<Document>(COL_KEY_PACKAGES)
+                .find(doc! {
+                    "user_id": user_id,
+                    "device_id": device_id,
+                    "last_resort": false,
+                    "_id": { "$nin": batch_ids.clone() }
+                })
+                .with_options(
+                    FindOptions::builder()
+                        .sort(doc! { "created_at": 1, "_id": 1 })
+                        .projection(doc! { "_id": 1 })
+                        .limit((count - max as u64) as i64)
+                        .build(),
+                )
+                .await
+                .map_err(|_| create_database_error!("find", COL_KEY_PACKAGES))?;
+
+            let mut ids: Vec<String> = vec![];
+            while let Some(document) = cursor.next().await {
+                let document =
+                    document.map_err(|_| create_database_error!("find", COL_KEY_PACKAGES))?;
+                if let Ok(id) = document.get_str("_id") {
+                    ids.push(id.to_string());
+                }
+            }
+
+            if ids.is_empty() {
+                // Nothing prunable (everything stored is the batch itself /
+                // last-resort) — the count stands
+                break;
+            }
+
+            self.col::<Document>(COL_KEY_PACKAGES)
+                .delete_many(doc! { "_id": { "$in": ids } })
+                .await
+                .map_err(|_| create_database_error!("delete_many", COL_KEY_PACKAGES))?;
+        }
+
+        self.count_mls_key_packages(user_id, device_id).await
     }
 
     async fn consume_mls_key_package(

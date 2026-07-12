@@ -382,6 +382,173 @@ async fn key_package_claims_are_atomic() {
 }
 
 #[tokio::test]
+async fn capped_insert_prunes_oldest_and_spares_batch_and_last_resort() {
+    database_test!(|db| async move {
+        let target = device("bob", 2);
+
+        // Three aged packages (old0 the oldest) + a last-resort
+        let aged: Vec<MlsKeyPackage> = (0..3)
+            .map(|i| {
+                let mut package = make_key_package(&target, &format!("old{i}"), false);
+                package.created_at = Timestamp::now_utc()
+                    .checked_sub(Duration::days(3 - i as i64))
+                    .unwrap();
+                package
+            })
+            .collect();
+        db.insert_mls_key_packages(&aged).await.unwrap();
+        db.replace_mls_last_resort_key_package(&make_key_package(&target, "last", true))
+            .await
+            .unwrap();
+
+        // A fresh batch of three against cap 4: 6 stored → the TWO oldest
+        // (old0, old1) go; the fresh batch survives intact
+        let fresh: Vec<MlsKeyPackage> = (0..3)
+            .map(|i| make_key_package(&target, &format!("new{i}"), false))
+            .collect();
+        let count = db
+            .insert_mls_key_packages_capped(&target.user_id, &target.device_id, &fresh, 4)
+            .await
+            .unwrap();
+        assert_eq!(count, 4, "prune converges on the cap");
+
+        // Republishing the SAME refs is upsert-idempotent — nothing to prune
+        let count = db
+            .insert_mls_key_packages_capped(&target.user_id, &target.device_id, &fresh, 4)
+            .await
+            .unwrap();
+        assert_eq!(count, 4);
+
+        // The last-resort row lives outside the cap and is never pruned
+        assert!(db
+            .fetch_mls_last_resort_key_package(&target.user_id, &target.device_id)
+            .await
+            .unwrap()
+            .is_some());
+
+        // Exactly {old2, new0, new1, new2} survived (consume order is
+        // driver-specific; set equality is not)
+        let mut survivors = Vec::new();
+        while let Some(package) = db
+            .consume_mls_key_package(&target.user_id, &target.device_id)
+            .await
+            .unwrap()
+        {
+            survivors.push(package.key_package_ref);
+        }
+        survivors.sort();
+        assert_eq!(survivors, vec!["new0", "new1", "new2", "old2"]);
+    });
+}
+
+#[tokio::test]
+async fn capped_insert_tie_breaks_equal_created_at_by_id() {
+    database_test!(|db| async move {
+        let target = device("bob", 2);
+
+        // Two packages sharing ONE created_at (an intra-batch publish, or
+        // two publishes within the same millisecond): the prune victim must
+        // be the id-ascending one, identically in both drivers (re-audit
+        // LOW-3 — Mongo sorts Int64 unix-ms, Reference full precision;
+        // equal stamps must fall through to the id tie-break)
+        let stamp = Timestamp::now_utc().checked_sub(Duration::days(1)).unwrap();
+        let tied: Vec<MlsKeyPackage> = ["tie_a", "tie_b"]
+            .iter()
+            .map(|reference| {
+                let mut package = make_key_package(&target, reference, false);
+                package.created_at = stamp;
+                package
+            })
+            .collect();
+        db.insert_mls_key_packages(&tied).await.unwrap();
+
+        let fresh = vec![make_key_package(&target, "fresh", false)];
+        let count = db
+            .insert_mls_key_packages_capped(&target.user_id, &target.device_id, &fresh, 2)
+            .await
+            .unwrap();
+        assert_eq!(count, 2);
+
+        let mut survivors = Vec::new();
+        while let Some(package) = db
+            .consume_mls_key_package(&target.user_id, &target.device_id)
+            .await
+            .unwrap()
+        {
+            survivors.push(package.key_package_ref);
+        }
+        survivors.sort();
+        assert_eq!(survivors, vec!["fresh", "tie_b"], "tie_a (id-ascending) is the victim");
+    });
+}
+
+#[tokio::test]
+async fn capped_insert_converges_under_concurrent_claims() {
+    database_test!(|db| async move {
+        let target = device("bob", 2);
+
+        // Ten aged packages fill the cap exactly
+        let aged: Vec<MlsKeyPackage> = (0..10)
+            .map(|i| {
+                let mut package = make_key_package(&target, &format!("seed{i:02}"), false);
+                package.created_at = Timestamp::now_utc()
+                    .checked_sub(Duration::days(1))
+                    .unwrap();
+                package
+            })
+            .collect();
+        db.insert_mls_key_packages(&aged).await.unwrap();
+
+        // A full replenish (8 fresh, cap 10) racing five concurrent claims:
+        // claims must never serve the same package twice, and the directory
+        // must converge at (or under — claims shrink it) the cap
+        let mut claim_handles = Vec::new();
+        for _ in 0..5 {
+            let db = db.clone();
+            let target = target.clone();
+            claim_handles.push(tokio::spawn(async move {
+                db.consume_mls_key_package(&target.user_id, &target.device_id)
+                    .await
+            }));
+        }
+        let fresh: Vec<MlsKeyPackage> = (0..8)
+            .map(|i| make_key_package(&target, &format!("fresh{i}"), false))
+            .collect();
+        let insert_handle = {
+            let db = db.clone();
+            let target = target.clone();
+            tokio::spawn(async move {
+                db.insert_mls_key_packages_capped(&target.user_id, &target.device_id, &fresh, 10)
+                    .await
+            })
+        };
+
+        let mut claimed = Vec::new();
+        for handle in claim_handles {
+            if let Some(package) = handle.await.expect("join").expect("claim must not error") {
+                claimed.push(package.key_package_ref);
+            }
+        }
+        let reported = insert_handle
+            .await
+            .expect("join")
+            .expect("capped insert must not error");
+
+        let mut distinct = claimed.clone();
+        distinct.sort();
+        distinct.dedup();
+        assert_eq!(distinct.len(), claimed.len(), "no package served twice");
+
+        assert!(reported <= 10, "reported count converges on the cap");
+        let count = db
+            .count_mls_key_packages(&target.user_id, &target.device_id)
+            .await
+            .unwrap();
+        assert!(count <= 10, "stored count converges on the cap");
+    });
+}
+
+#[tokio::test]
 async fn expired_key_packages_are_swept() {
     database_test!(|db| async move {
         let target = device("bob", 2);

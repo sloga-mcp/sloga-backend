@@ -18,14 +18,26 @@ pub trait AbstractMls: Sync + Send {
     /// package lives outside the cap)
     async fn count_mls_key_packages(&self, user_id: &str, device_id: &str) -> Result<u64>;
 
-    /// Count how many of the given refs are already stored for a device —
-    /// inserts upsert by id, so cap accounting must not double-count a
-    /// replenish that reuses refs
-    async fn count_mls_key_packages_among(
+    /// Upsert a batch of one-time KeyPackages, then prune the device's
+    /// OLDEST one-time packages down to `max` so a replenish can never be
+    /// refused for a full directory (publish-UX plan §3.4).
+    ///
+    /// Prune ordering is `created_at` ascending, tie-broken by id ascending
+    /// — identical in both drivers. The prune NEVER touches the last-resort
+    /// row (outside the cap) or the INVOKING call's own refs (a concurrent
+    /// same-device publish may still prune this batch as "oldest" — ≤ cap
+    /// and a correct count either way; packages are fungible consumables).
+    /// Pruned entries just stop being claimable; the Welcome acceptance
+    /// gate keys on group_id, not a specific ref.
+    ///
+    /// Returns the device's resulting one-time count (the client's
+    /// replenish watermark).
+    async fn insert_mls_key_packages_capped(
         &self,
         user_id: &str,
         device_id: &str,
-        refs: &[String],
+        packages: &[MlsKeyPackage],
+        max: usize,
     ) -> Result<u64>;
 
     /// Atomically consume one ONE-TIME KeyPackage for a device; None at

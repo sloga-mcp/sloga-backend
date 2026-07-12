@@ -14,7 +14,7 @@ use revolt_models::v0;
 use rocket::http::{ContentType, Header, Status};
 use ulid::Ulid;
 
-use crate::routes::e2ee::tests::{mfa_ticket, publish_device, TestDevice};
+use crate::routes::e2ee::tests::{publish_device, TestDevice};
 use crate::util::test::TestHarness;
 
 /// A user's E2EE device plus its MLS signing material
@@ -90,13 +90,13 @@ async fn enroll_mls_device(
         mls_signature_key: STANDARD_NO_PAD.encode([7u8; 32]),
     };
 
-    let ticket = mfa_ticket(harness, account_id).await;
+    // No MFA ticket: the device-bound session + verified credential binding
+    // is the publish credential (publish-UX plan §3.1)
     let response = harness
         .client
         .put("/mls/key_packages")
         .header(ContentType::JSON)
         .header(Header::new("x-session-token", session_token.to_string()))
-        .header(Header::new("X-MFA-Ticket", ticket))
         .body(serde_json::to_string(&mls_device.publish_body(user_id, refs, last_resort)).unwrap())
         .dispatch()
         .await;
@@ -862,33 +862,29 @@ async fn publish_validates_binding_caps_and_immutability() {
         mls_signature_key: STANDARD_NO_PAD.encode([7u8; 32]),
     };
 
-    // First publish without MFA is refused
-    let response = post_put_publish(&harness, &session, &mls_device, &user.id, &["k0"], None).await;
-    assert_eq!(response, Status::Unauthorized);
-
-    // Tampered binding signature is refused (even with MFA)
+    // Tampered binding signature is refused
     let mut body = mls_device.publish_body(&user.id, &["k0"], None);
     body.binding_signature = STANDARD_NO_PAD.encode([0u8; 64]);
-    let ticket = mfa_ticket(&harness, &account.id).await;
     let response = harness
         .client
         .put("/mls/key_packages")
         .header(ContentType::JSON)
         .header(Header::new("x-session-token", session.token.clone()))
-        .header(Header::new("X-MFA-Ticket", ticket))
         .body(serde_json::to_string(&body).unwrap())
         .dispatch()
         .await;
     assert_eq!(response.status(), Status::BadRequest);
 
-    // Valid first publish with MFA
-    let ticket = mfa_ticket(&harness, &account.id).await;
+    // Valid FIRST publish needs no MFA ticket (publish-UX plan §3.1): the
+    // device-bound session + verified credential binding is the credential.
+    // A stray X-MFA-Ticket header from an older client is simply ignored —
+    // it must never fail the request.
     let response = harness
         .client
         .put("/mls/key_packages")
         .header(ContentType::JSON)
         .header(Header::new("x-session-token", session.token.clone()))
-        .header(Header::new("X-MFA-Ticket", ticket))
+        .header(Header::new("X-MFA-Ticket", "stray-legacy-ticket"))
         .body(
             serde_json::to_string(&mls_device.publish_body(&user.id, &["k0", "k1"], Some("lr")))
                 .unwrap(),
@@ -897,10 +893,12 @@ async fn publish_validates_binding_caps_and_immutability() {
         .await;
     assert_eq!(response.status(), Status::Ok);
 
-    // Replenish without MFA is fine; upsert-aware accounting: same refs
-    // don't double-count
-    let response = post_put_publish(&harness, &session, &mls_device, &user.id, &["k0", "k2"], None).await;
-    assert_eq!(response, Status::Ok);
+    // Replenish; upsert-aware accounting: same refs don't double-count
+    let response = post_put_publish(&harness, &session, &mls_device, &user.id, &["k0", "k2"], None)
+        .await;
+    assert_eq!(response.status(), Status::Ok);
+    let body: v0::ResponsePublishMlsKeyPackages = response.into_json().await.unwrap();
+    assert_eq!(body.key_package_count, 3, "k0 replaced in place, k2 added");
 
     // The MLS signature key is immutable while packages are stored
     let impostor = MlsTestDevice {
@@ -912,23 +910,37 @@ async fn publish_validates_binding_caps_and_immutability() {
         mls_signature_key: STANDARD_NO_PAD.encode([9u8; 32]),
     };
     let response = post_put_publish(&harness, &session, &impostor, &user.id, &["k9"], None).await;
-    assert_eq!(response, Status::BadRequest);
+    assert_eq!(response.status(), Status::BadRequest);
 
-    // Cap accounting: pushing past MAX_KEY_PACKAGES is refused
+    // Cap self-heal (publish-UX plan §3.4): pushing past MAX_KEY_PACKAGES
+    // prunes the device's oldest packages instead of refusing — the fresh
+    // batch survives intact and the count converges on the cap
     let too_many: Vec<String> = (0..99).map(|i| format!("bulk{i}")).collect();
     let refs: Vec<&str> = too_many.iter().map(String::as_str).collect();
     let response = post_put_publish(&harness, &session, &mls_device, &user.id, &refs, None).await;
-    assert_eq!(response, Status::BadRequest);
+    assert_eq!(response.status(), Status::Ok);
+    let body: v0::ResponsePublishMlsKeyPackages = response.into_json().await.unwrap();
+    assert_eq!(
+        body.key_package_count, 100,
+        "prune converges on MAX_KEY_PACKAGES"
+    );
+
+    // A single batch that ALONE exceeds the cap is still structurally refused
+    // (no amount of pruning makes room for it)
+    let way_too_many: Vec<String> = (0..101).map(|i| format!("flood{i}")).collect();
+    let refs: Vec<&str> = way_too_many.iter().map(String::as_str).collect();
+    let response = post_put_publish(&harness, &session, &mls_device, &user.id, &refs, None).await;
+    assert_eq!(response.status(), Status::BadRequest);
 }
 
-async fn post_put_publish(
-    harness: &TestHarness,
+async fn post_put_publish<'a>(
+    harness: &'a TestHarness,
     session: &Session,
     device: &MlsTestDevice,
     user_id: &str,
     refs: &[&str],
     last_resort: Option<&str>,
-) -> Status {
+) -> rocket::local::asynchronous::LocalResponse<'a> {
     harness
         .client
         .put("/mls/key_packages")
@@ -937,7 +949,6 @@ async fn post_put_publish(
         .body(serde_json::to_string(&device.publish_body(user_id, refs, last_resort)).unwrap())
         .dispatch()
         .await
-        .status()
 }
 
 #[rocket::async_test]
