@@ -42,6 +42,31 @@ impl AbstractChannels for ReferenceDb {
             .collect()
     }
 
+    /// Fetch all threads hanging off a given parent channel
+    async fn fetch_threads_by_parent(&self, parent_id: &str) -> Result<Vec<Channel>> {
+        let channels = self.channels.lock().await;
+        Ok(channels
+            .values()
+            .filter(|channel| {
+                matches!(
+                    channel,
+                    Channel::Thread { parent_channel, .. } if parent_channel == parent_id
+                )
+            })
+            .cloned()
+            .collect())
+    }
+
+    /// Fetch every non-archived thread (used by the auto-archive daemon)
+    async fn fetch_active_threads(&self) -> Result<Vec<Channel>> {
+        let channels = self.channels.lock().await;
+        Ok(channels
+            .values()
+            .filter(|channel| matches!(channel, Channel::Thread { archived: false, .. }))
+            .cloned()
+            .collect())
+    }
+
     /// Fetch all direct messages for a user
     async fn find_direct_messages(&self, user_id: &str) -> Result<Vec<Channel>> {
         let channels = self.channels.lock().await;

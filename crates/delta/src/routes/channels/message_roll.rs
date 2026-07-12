@@ -40,7 +40,9 @@ pub async fn message_roll(
 
     // Same gate as sending a normal message
     let channel = target.as_channel(db).await?;
-    let mut query = DatabasePermissionQuery::new(db, &user).channel(&channel);
+    // Threads inherit their parent channel's permission overrides.
+    let permission_channel = channel.permission_target(db).await?.into_owned();
+    let mut query = DatabasePermissionQuery::new(db, &user).channel(&permission_channel);
     let permissions = calculate_channel_permissions(&mut query).await;
     permissions.throw_if_lacking_channel_permission(ChannelPermission::SendMessage)?;
 

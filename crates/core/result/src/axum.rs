@@ -39,6 +39,7 @@ impl IntoResponse for Error {
             ErrorType::GroupTooLarge { .. } => StatusCode::FORBIDDEN,
             ErrorType::AlreadyInGroup => StatusCode::CONFLICT,
             ErrorType::NotInGroup => StatusCode::NOT_FOUND,
+            ErrorType::ThreadAlreadyExists => StatusCode::CONFLICT,
             ErrorType::AlreadyPinned => StatusCode::BAD_REQUEST,
             ErrorType::NotPinned => StatusCode::BAD_REQUEST,
             ErrorType::InSlowmode { retry_after: _ } => StatusCode::TOO_MANY_REQUESTS,

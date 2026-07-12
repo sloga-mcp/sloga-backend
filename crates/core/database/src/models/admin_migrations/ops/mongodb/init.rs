@@ -150,6 +150,10 @@ pub async fn create_database(db: &MongoDb) {
         .await
         .expect("Failed to create mls_join_intents collection.");
 
+    db.create_collection("thread_members")
+        .await
+        .expect("Failed to create thread_members collection.");
+
     db.run_command(doc! {
         "createIndexes": "users",
         "indexes": [
@@ -235,6 +239,46 @@ pub async fn create_database(db: &MongoDb) {
     })
     .await
     .expect("Failed to create channel_unreads index.");
+
+    db.run_command(doc! {
+        "createIndexes": "thread_members",
+        "indexes": [
+            // Serves member-list fetches and thread-deletion cascades.
+            {
+                "key": {
+                    "_id.thread": 1_i32,
+                },
+                "name": "thread"
+            },
+            // Serves "which threads has this user joined" (Ready assembly).
+            {
+                "key": {
+                    "_id.user": 1_i32,
+                },
+                "name": "user"
+            }
+        ]
+    })
+    .await
+    .expect("Failed to create thread_members index.");
+
+    db.run_command(doc! {
+        "createIndexes": "channels",
+        "indexes": [
+            // Serves the per-channel threads list, the active-thread cap and
+            // the crond auto-archive scan.
+            {
+                "key": {
+                    "channel_type": 1_i32,
+                    "parent_channel": 1_i32,
+                    "archived": 1_i32,
+                },
+                "name": "thread_parent_archived"
+            }
+        ]
+    })
+    .await
+    .expect("Failed to create channels thread index.");
 
     db.run_command(doc! {
         "createIndexes": "server_members",

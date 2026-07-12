@@ -10,7 +10,8 @@ use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
 use crate::{
-    events::client::EventV1, Database, File, PartialServer, Server, SystemMessage, User, AMQP,
+    events::client::EventV1, Database, File, Message, PartialMessage, PartialServer, Server,
+    SystemMessage, User, AMQP,
 };
 
 #[cfg(feature = "mongodb")]
@@ -120,6 +121,42 @@ auto_derived!(
             #[serde(skip_serializing_if = "Option::is_none")]
             slowmode: Option<u64>,
         },
+        /// Thread belonging to a server text channel
+        Thread {
+            /// Unique Id
+            #[serde(rename = "_id")]
+            id: String,
+            /// Id of the server this thread belongs to
+            server: String,
+            /// Id of the parent text channel this thread hangs off
+            parent_channel: String,
+
+            /// Display name of the thread
+            name: String,
+            /// Id of the user that created this thread
+            creator: String,
+            /// Id of the message in the parent channel this thread was created from
+            #[serde(skip_serializing_if = "Option::is_none")]
+            origin_message_id: Option<String>,
+            /// Id of the last message sent in this thread
+            #[serde(skip_serializing_if = "Option::is_none")]
+            last_message_id: Option<String>,
+
+            /// Whether this thread is archived
+            #[serde(skip_serializing_if = "crate::if_false", default)]
+            archived: bool,
+            /// When the archive state of this thread last changed
+            #[serde(skip_serializing_if = "Option::is_none")]
+            archived_timestamp: Option<String>,
+            /// Minutes of inactivity after which this thread auto-archives
+            /// (one of 60 / 1440 / 4320 / 10080)
+            #[serde(default = "Channel::default_auto_archive_minutes")]
+            auto_archive_minutes: u32,
+
+            /// Whether this thread is locked
+            #[serde(skip_serializing_if = "crate::if_false", default)]
+            locked: bool,
+        },
     }
 
     #[derive(Default)]
@@ -160,6 +197,10 @@ auto_derived!(
         pub voice: Option<VoiceInformation>,
         #[serde(skip_serializing_if = "Option::is_none")]
         pub slowmode: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub archived: Option<bool>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub archived_timestamp: Option<String>,
     }
 
     /// Optional fields on channel object
@@ -257,6 +298,152 @@ impl Channel {
         }
 
         Ok(channel)
+    }
+
+    /// Default auto-archive duration for threads, in minutes
+    pub fn default_auto_archive_minutes() -> u32 {
+        1440
+    }
+
+    /// Allowed auto-archive durations for threads, in minutes
+    pub const ALLOWED_AUTO_ARCHIVE_MINUTES: [u32; 4] = [60, 1440, 4320, 10080];
+
+    /// Create a new thread under a server text channel
+    ///
+    /// This inserts the channel document directly — threads are intentionally
+    /// NEVER pushed into `Server.channels`; clients discover them via the
+    /// `parent_channel` pointer instead.
+    pub async fn create_thread(
+        db: &Database,
+        parent: &Channel,
+        creator: &User,
+        origin_message: Option<&Message>,
+        data: v0::DataCreateThread,
+    ) -> Result<Channel> {
+        // Threads may only exist under server text channels; this is also the
+        // E2EE fail-closed gate (encrypted DMs / groups can never host one).
+        let (parent_id, server_id) = match parent {
+            Channel::TextChannel { id, server, .. } => (id.clone(), server.clone()),
+            _ => return Err(create_error!(InvalidOperation)),
+        };
+
+        // Enforce the per-channel active thread cap.
+        let config = config().await;
+        let max_threads = config.features.limits.global.threads_per_channel;
+        let active_threads = db
+            .fetch_threads_by_parent(&parent_id)
+            .await?
+            .into_iter()
+            .filter(|thread| !matches!(thread, Channel::Thread { archived: true, .. }))
+            .count();
+        if active_threads >= max_threads {
+            return Err(create_error!(TooManyChannels { max: max_threads }));
+        }
+
+        // Validate the auto-archive duration.
+        let auto_archive_minutes = data
+            .auto_archive_minutes
+            .unwrap_or_else(Channel::default_auto_archive_minutes);
+        if !Channel::ALLOWED_AUTO_ARCHIVE_MINUTES.contains(&auto_archive_minutes) {
+            return Err(create_error!(InvalidProperty));
+        }
+
+        // Validate the origin message belongs to the parent channel and is not
+        // already anchoring another thread.
+        if let Some(message) = origin_message {
+            if message.channel != parent_id {
+                return Err(create_error!(InvalidOperation));
+            }
+
+            if message.thread_id.is_some() {
+                return Err(create_error!(ThreadAlreadyExists));
+            }
+        }
+
+        let id = Ulid::new().to_string();
+        let channel = Channel::Thread {
+            id: id.clone(),
+            server: server_id.clone(),
+            parent_channel: parent_id.clone(),
+            name: data.name.clone(),
+            creator: creator.id.clone(),
+            origin_message_id: origin_message.map(|message| message.id.clone()),
+            last_message_id: None,
+            archived: false,
+            archived_timestamp: None,
+            auto_archive_minutes,
+            locked: false,
+        };
+
+        db.insert_channel(&channel).await?;
+
+        // Auto-join the creator.
+        db.join_thread_if_absent(&id, &creator.id).await?;
+
+        // Everyone who can see the parent learns about the thread.
+        EventV1::ChannelCreate(channel.clone().into())
+            .p(server_id.clone())
+            .await;
+
+        // Stamp the origin message with the thread id (server-set only).
+        if let Some(message) = origin_message {
+            let mut message = message.clone();
+            message
+                .update(
+                    db,
+                    PartialMessage {
+                        thread_id: Some(id.clone()),
+                        ..Default::default()
+                    },
+                    vec![],
+                )
+                .await?;
+        }
+
+        // Post a system message linking the thread into the parent channel.
+        SystemMessage::ThreadCreated {
+            id: id.clone(),
+            by: creator.id.clone(),
+            name: data.name,
+        }
+        .into_message(parent_id)
+        .send(
+            db,
+            None,
+            MessageAuthor::System {
+                username: &creator.username,
+                avatar: creator.avatar.as_ref().map(|file| file.id.as_ref()),
+            },
+            None,
+            None,
+            parent,
+            false,
+        )
+        .await
+        .ok();
+
+        Ok(channel)
+    }
+
+    /// Resolve the channel whose permission overrides apply to this channel.
+    ///
+    /// Threads delegate their entire permission calculus to their parent text
+    /// channel; the parent MUST be resolved before constructing a
+    /// `DatabasePermissionQuery` (never substituted mid-calculation). All
+    /// other channel types are their own permission target. Fails closed
+    /// (NotFound) when a thread's parent is missing or not a text channel.
+    pub async fn permission_target<'a>(&'a self, db: &Database) -> Result<Cow<'a, Channel>> {
+        match self {
+            Channel::Thread { parent_channel, .. } => {
+                let parent = db.fetch_channel(parent_channel).await?;
+                if matches!(parent, Channel::TextChannel { .. }) {
+                    Ok(Cow::Owned(parent))
+                } else {
+                    Err(create_error!(NotFound))
+                }
+            }
+            _ => Ok(Cow::Borrowed(self)),
+        }
     }
 
     /// Create a group
@@ -441,14 +628,15 @@ impl Channel {
             Channel::DirectMessage { id, .. }
             | Channel::Group { id, .. }
             | Channel::SavedMessages { id, .. }
-            | Channel::TextChannel { id, .. } => id,
+            | Channel::TextChannel { id, .. }
+            | Channel::Thread { id, .. } => id,
         }
     }
 
     /// Clone this channel's server id
     pub fn server(&self) -> Option<&str> {
         match self {
-            Channel::TextChannel { server, .. } => Some(server),
+            Channel::TextChannel { server, .. } | Channel::Thread { server, .. } => Some(server),
             _ => None,
         }
     }
@@ -533,7 +721,7 @@ impl Channel {
             clear: remove.into_iter().map(|v| v.into()).collect(),
         }
         .p(match self {
-            Self::TextChannel { server, .. } => server.clone(),
+            Self::TextChannel { server, .. } | Self::Thread { server, .. } => server.clone(),
             _ => id,
         })
         .await;
@@ -667,6 +855,29 @@ impl Channel {
                     voice.replace(v);
                 }
             }
+            Self::Thread {
+                name,
+                archived,
+                archived_timestamp,
+                last_message_id,
+                ..
+            } => {
+                if let Some(v) = partial.name {
+                    *name = v;
+                }
+
+                if let Some(v) = partial.archived {
+                    *archived = v;
+                }
+
+                if let Some(v) = partial.archived_timestamp {
+                    archived_timestamp.replace(v);
+                }
+
+                if let Some(v) = partial.last_message_id {
+                    last_message_id.replace(v);
+                }
+            }
         }
     }
 
@@ -783,6 +994,32 @@ impl Channel {
     /// Delete a channel
     pub async fn delete(&self, db: &Database) -> Result<()> {
         let id = self.id().to_string();
+
+        // Cascade: deleting a text channel deletes its child threads first, so
+        // no thread is ever orphaned with a dangling parent_channel pointer.
+        if let Channel::TextChannel { server, .. } = self {
+            for thread in db.fetch_threads_by_parent(&id).await? {
+                let thread_id = thread.id().to_string();
+                db.delete_all_thread_memberships(&thread_id).await?;
+
+                EventV1::ChannelDelete {
+                    id: thread_id.clone(),
+                }
+                .p(server.clone())
+                .await;
+                EventV1::ChannelDelete { id: thread_id }
+                    .p(thread.id().to_string())
+                    .await;
+
+                db.delete_channel(&thread).await?;
+            }
+        }
+
+        // Deleting a thread removes its membership rows.
+        if let Channel::Thread { .. } = self {
+            db.delete_all_thread_memberships(&id).await?;
+        }
+
         EventV1::ChannelDelete { id: id.clone() }.p(id).await;
         // TODO: missing functionality:
         // - group invites

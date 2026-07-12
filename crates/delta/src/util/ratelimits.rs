@@ -40,6 +40,12 @@ impl<'a> RatelimitResolver<Request<'a>> for DeltaRatelimits {
                         if let Some("messages" | "roll") = extra {
                             return ("messaging", Some(id));
                         }
+
+                        // Thread creation is bounded per parent channel to cap
+                        // fan-out abuse.
+                        if let Some("threads") = extra {
+                            return ("thread_create", Some(id));
+                        }
                     }
 
                     ("channels", Some(id))
@@ -104,6 +110,7 @@ impl<'a> RatelimitResolver<Request<'a>> for DeltaRatelimits {
             "events_create" => 10,
             "events_invite" => 5,
             "events" => 30,
+            "thread_create" => 5,
             _ => 20,
         }
     }

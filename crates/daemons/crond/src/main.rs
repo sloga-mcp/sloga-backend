@@ -54,5 +54,6 @@ async fn main() {
         cron_task_wrapper(prune_mls_groups::task, db.clone(), amqp.clone()),
         cron_task_wrapper(prune_mls_key_packages::task, db.clone(), amqp.clone()),
         cron_task_wrapper(event_reminders::task, db.clone(), amqp.clone()),
+        cron_task_wrapper(thread_archiver::task, db.clone(), amqp.clone()),
     );
 }

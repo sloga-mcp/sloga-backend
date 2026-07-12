@@ -26,7 +26,7 @@ struct MigrationInfo {
     revision: i32,
 }
 
-pub const LATEST_REVISION: i32 = 56; // MUST BE +1 to last migration
+pub const LATEST_REVISION: i32 = 57; // MUST BE +1 to last migration
 
 pub async fn migrate_database(db: &MongoDb) {
     let migrations = db.col::<Document>("migrations");
@@ -1748,6 +1748,58 @@ pub async fn run_migrations(db: &MongoDb, revision: i32) -> i32 {
             })
             .await
             .expect("Failed to create mls_join_intents indexes.");
+    }
+
+    if revision <= 56 {
+        info!("Running migration [revision 56 / 11-07-2026]: Create thread_members collection and thread indexes");
+
+        // Existing deployments predate threads: init.rs only covers fresh DBs.
+        // Collections + indexes mirror init.rs exactly; both operations are
+        // idempotent (create_collection errors are ignored; createIndexes is a
+        // no-op when key+name already match), so a re-run or a fresh DB is safe.
+        db.db().create_collection("thread_members").await.ok();
+
+        db.db()
+            .run_command(doc! {
+                "createIndexes": "thread_members",
+                "indexes": [
+                    // Serves member-list fetches and thread-deletion cascades.
+                    {
+                        "key": {
+                            "_id.thread": 1_i32,
+                        },
+                        "name": "thread"
+                    },
+                    // Serves "which threads has this user joined" (Ready assembly).
+                    {
+                        "key": {
+                            "_id.user": 1_i32,
+                        },
+                        "name": "user"
+                    }
+                ]
+            })
+            .await
+            .expect("Failed to create thread_members indexes.");
+
+        // Serves the per-channel threads list, the active-thread cap and the
+        // crond auto-archive scan.
+        db.db()
+            .run_command(doc! {
+                "createIndexes": "channels",
+                "indexes": [
+                    {
+                        "key": {
+                            "channel_type": 1_i32,
+                            "parent_channel": 1_i32,
+                            "archived": 1_i32,
+                        },
+                        "name": "thread_parent_archived"
+                    }
+                ]
+            })
+            .await
+            .expect("Failed to create channels thread index.");
     }
 
     // Reminder to update LATEST_REVISION when adding new migrations.

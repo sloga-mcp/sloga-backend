@@ -399,6 +399,7 @@ pub struct GlobalLimits {
     pub server_stickers: usize,
     pub server_roles: usize,
     pub server_channels: usize,
+    pub threads_per_channel: usize,
 
     pub new_user_hours: usize,
 

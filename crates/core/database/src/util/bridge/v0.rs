@@ -206,6 +206,31 @@ impl From<crate::Channel> for Channel {
                 voice: voice.map(|voice| voice.into()),
                 slowmode,
             },
+            crate::Channel::Thread {
+                id,
+                server,
+                parent_channel,
+                name,
+                creator,
+                origin_message_id,
+                last_message_id,
+                archived,
+                archived_timestamp,
+                auto_archive_minutes,
+                locked,
+            } => Channel::Thread {
+                id,
+                server,
+                parent_channel,
+                name,
+                creator,
+                origin_message_id,
+                last_message_id,
+                archived,
+                archived_timestamp,
+                auto_archive_minutes,
+                locked,
+            },
         }
     }
 }
@@ -274,6 +299,31 @@ impl From<Channel> for crate::Channel {
                 voice: voice.map(|voice| voice.into()),
                 slowmode,
             },
+            Channel::Thread {
+                id,
+                server,
+                parent_channel,
+                name,
+                creator,
+                origin_message_id,
+                last_message_id,
+                archived,
+                archived_timestamp,
+                auto_archive_minutes,
+                locked,
+            } => crate::Channel::Thread {
+                id,
+                server,
+                parent_channel,
+                name,
+                creator,
+                origin_message_id,
+                last_message_id,
+                archived,
+                archived_timestamp,
+                auto_archive_minutes,
+                locked,
+            },
         }
     }
 }
@@ -293,6 +343,8 @@ impl From<crate::PartialChannel> for PartialChannel {
             last_message_id: value.last_message_id,
             voice: value.voice.map(|voice| voice.into()),
             slowmode: value.slowmode,
+            archived: value.archived,
+            archived_timestamp: value.archived_timestamp,
         }
     }
 }
@@ -312,6 +364,8 @@ impl From<PartialChannel> for crate::PartialChannel {
             last_message_id: value.last_message_id,
             voice: value.voice.map(|voice| voice.into()),
             slowmode: value.slowmode,
+            archived: value.archived,
+            archived_timestamp: value.archived_timestamp,
         }
     }
 }
@@ -523,6 +577,7 @@ impl crate::Message {
             masquerade: self.masquerade.map(Into::into),
             flags: self.flags.unwrap_or_default(),
             pinned: self.pinned,
+            thread_id: self.thread_id,
             sticker_ids: self.sticker_ids,
         }
     }
@@ -553,6 +608,7 @@ impl From<crate::PartialMessage> for PartialMessage {
             masquerade: value.masquerade.map(Into::into),
             flags: value.flags,
             pinned: value.pinned,
+            thread_id: value.thread_id,
             sticker_ids: value.sticker_ids,
         }
     }
@@ -580,6 +636,9 @@ impl From<crate::SystemMessage> for SystemMessage {
             crate::SystemMessage::MessageUnpinned { id, by } => Self::MessageUnpinned { id, by },
             crate::SystemMessage::CallStarted { by, finished_at } => {
                 Self::CallStarted { by, finished_at }
+            }
+            crate::SystemMessage::ThreadCreated { id, by, name } => {
+                Self::ThreadCreated { id, by, name }
             }
         }
     }
@@ -1659,6 +1718,7 @@ impl From<crate::E2EEContentType> for E2EEContentType {
             crate::E2EEContentType::Olm => E2EEContentType::Olm,
             crate::E2EEContentType::MlsCommit => E2EEContentType::MlsCommit,
             crate::E2EEContentType::MlsWelcome => E2EEContentType::MlsWelcome,
+            crate::E2EEContentType::MlsCtl => E2EEContentType::MlsCtl,
         }
     }
 }

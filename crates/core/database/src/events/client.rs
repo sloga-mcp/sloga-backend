@@ -310,6 +310,18 @@ pub enum EventV1 {
         user: String,
     },
 
+    /// User joins a thread
+    ThreadMemberJoin {
+        id: String,
+        user: String,
+    },
+
+    /// User leaves a thread
+    ThreadMemberLeave {
+        id: String,
+        user: String,
+    },
+
     /// User started typing in a channel
     ChannelStartTyping {
         id: String,

@@ -23,10 +23,14 @@ pub async fn message_pin(
     let channel = target.as_channel(db).await?;
 
     if !matches!(channel, Channel::DirectMessage { .. }) {
-        let mut query = DatabasePermissionQuery::new(db, &user).channel(&channel);
-        calculate_channel_permissions(&mut query)
-            .await
-            .throw_if_lacking_channel_permission(ChannelPermission::ManageMessages)?;
+        // Threads inherit their parent channel's permission overrides.
+        let permission_channel = channel.permission_target(db).await?.into_owned();
+        let mut query = DatabasePermissionQuery::new(db, &user).channel(&permission_channel);
+        let permissions = calculate_channel_permissions(&mut query).await;
+        permissions.throw_if_lacking_channel_permission(ChannelPermission::ManageMessages)?;
+
+        // Archived/locked threads reject participation.
+        crate::util::threads::ensure_thread_writable(&channel, &permissions)?;
     }
 
     let mut message = msg.as_message_in_channel(db, channel.id()).await?;

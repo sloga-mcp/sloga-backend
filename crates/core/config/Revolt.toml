@@ -250,6 +250,8 @@ server_emoji = 100
 server_stickers = 60
 server_roles = 200
 server_channels = 200
+# Maximum active (non-archived) threads per text channel
+threads_per_channel = 100
 
 # How many hours since creation a user is considered new
 new_user_hours = 72

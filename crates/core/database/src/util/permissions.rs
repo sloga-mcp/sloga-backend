@@ -217,6 +217,13 @@ impl PermissionQuery for DatabasePermissionQuery<'_> {
                 | Cow::Owned(Channel::SavedMessages { .. }) => ChannelType::SavedMessages,
                 Cow::Borrowed(Channel::TextChannel { .. })
                 | Cow::Owned(Channel::TextChannel { .. }) => ChannelType::ServerChannel,
+                // Defensive fallback only: callers MUST resolve the parent via
+                // `Channel::permission_target` BEFORE constructing this query
+                // so the parent's overrides apply. A raw Thread here still
+                // resolves as a server channel (with no channel overrides).
+                Cow::Borrowed(Channel::Thread { .. }) | Cow::Owned(Channel::Thread { .. }) => {
+                    ChannelType::ServerChannel
+                }
             }
         } else {
             ChannelType::Unknown
@@ -347,7 +354,9 @@ impl PermissionQuery for DatabasePermissionQuery<'_> {
             #[allow(deprecated)]
             match channel {
                 Cow::Borrowed(Channel::TextChannel { server, .. })
-                | Cow::Owned(Channel::TextChannel { server, .. }) => {
+                | Cow::Owned(Channel::TextChannel { server, .. })
+                | Cow::Borrowed(Channel::Thread { server, .. })
+                | Cow::Owned(Channel::Thread { server, .. }) => {
                     if let Some(known_server) =
                         // I'm not sure why I can't just pattern match both at once here?
                         // It throws some weird error and the provided fix doesn't work :/

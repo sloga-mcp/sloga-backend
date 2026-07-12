@@ -77,6 +77,12 @@ auto_derived_partial!(
         #[serde(skip_serializing_if = "crate::if_option_false")]
         pub pinned: Option<bool>,
 
+        /// Id of the thread that was created from this message
+        ///
+        /// This is server-set only and never accepted from clients.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub thread_id: Option<String>,
+
         /// Sticker IDs attached to this message
         #[serde(skip_serializing_if = "Option::is_none")]
         pub sticker_ids: Option<Vec<String>>,
@@ -122,6 +128,12 @@ auto_derived!(
         CallStarted {
             by: String,
             finished_at: Option<Timestamp>,
+        },
+        #[serde(rename = "thread_created")]
+        ThreadCreated {
+            id: String,
+            by: String,
+            name: String,
         },
     }
 
@@ -262,6 +274,7 @@ impl Default for Message {
             masquerade: None,
             flags: None,
             pinned: None,
+            thread_id: None,
             sticker_ids: None,
         }
     }
@@ -337,7 +350,9 @@ impl Message {
         }
 
         let server_id = match channel {
-            Channel::TextChannel { ref server, .. } => Some(server.clone()),
+            Channel::TextChannel { ref server, .. } | Channel::Thread { ref server, .. } => {
+                Some(server.clone())
+            }
             _ => None,
         };
 
@@ -428,7 +443,10 @@ impl Message {
                 }
                 let owned_user: User = user.unwrap().to_owned().into();
 
-                let mut query = DatabasePermissionQuery::new(db, &owned_user).channel(&channel);
+                // Threads delegate permissions to their parent text channel.
+                let permission_channel = channel.permission_target(db).await?;
+                let mut query =
+                    DatabasePermissionQuery::new(db, &owned_user).channel(&permission_channel);
                 let perms = calculate_channel_permissions(&mut query).await;
 
                 if (mentions_everyone || mentions_online)
@@ -504,7 +522,7 @@ impl Message {
                     user_mentions.retain(|m| recipients_hash.contains(m));
                     role_mentions.clear();
                 }
-                Channel::TextChannel { ref server, .. } => {
+                Channel::TextChannel { ref server, .. } | Channel::Thread { ref server, .. } => {
                     let mentions_vec = Vec::from_iter(user_mentions.iter().cloned());
 
                     let valid_members = db.fetch_members(server.as_str(), &mentions_vec[..]).await;
@@ -517,10 +535,12 @@ impl Message {
 
                         if !user_mentions.is_empty() {
                             // if there are still mentions, drill down to a channel-level
+                            // (threads evaluate visibility against their parent's overrides)
+                            let permission_channel = channel.permission_target(db).await?;
                             let member_channel_view_perms =
                                 BulkDatabasePermissionQuery::from_server_id(db, server)
                                     .await
-                                    .channel(&channel)
+                                    .channel(&permission_channel)
                                     .members(&valid_members)
                                     .members_can_see_channel()
                                     .await;
@@ -705,42 +725,80 @@ impl Message {
             channel,
             Channel::DirectMessage { .. } | Channel::Group { .. }
         );
+        // Threads push like DMs: every joined member is a notification target,
+        // not just mentioned users.
+        let is_thread = matches!(channel, Channel::Thread { .. });
 
         if !self.has_suppressed_notifications()
-            && (is_dm_or_group || self.mentions.is_some() || self.contains_mass_push_mention())
+            && (is_dm_or_group
+                || is_thread
+                || self.mentions.is_some()
+                || self.contains_mass_push_mention())
         {
             // send Push notifications
             #[cfg(feature = "tasks")]
-            tasks::ack::queue_message(
-                self.channel.to_string(),
-                AckEvent::ProcessMessage {
-                    messages: vec![(
-                        Some(
-                            PushNotification::from(
-                                self.clone().into_model(user, member),
-                                Some(author.clone()),
-                                channel.to_owned().into(),
-                            )
-                            .await,
-                        ),
-                        self.clone(),
-                        match channel {
-                            Channel::DirectMessage { recipients, .. }
-                            | Channel::Group { recipients, .. } => recipients
-                                .iter()
-                                .filter(|uid| *uid != author.id())
-                                .cloned()
-                                .collect(),
-                            Channel::TextChannel { .. } => {
-                                self.mentions.clone().unwrap_or_default()
+            {
+                let recipients: Vec<String> = match channel {
+                    Channel::DirectMessage { recipients, .. }
+                    | Channel::Group { recipients, .. } => recipients
+                        .iter()
+                        .filter(|uid| *uid != author.id())
+                        .cloned()
+                        .collect(),
+                    // Joined thread members (minus the author) receive DM-style
+                    // push; the ack task applies each recipient's mute settings.
+                    // Explicitly-mentioned users are unioned in so a mention
+                    // still notifies even if they have not joined the thread.
+                    Channel::Thread { .. } => {
+                        let mut targets: Vec<String> = db
+                            .fetch_thread_members(&self.channel)
+                            .await
+                            .unwrap_or_default()
+                            .into_iter()
+                            .map(|member| member.id.user)
+                            .filter(|uid| uid.as_str() != author.id())
+                            .collect();
+
+                        if let Some(mentions) = &self.mentions {
+                            for uid in mentions {
+                                if uid.as_str() != author.id() && !targets.contains(uid) {
+                                    targets.push(uid.clone());
+                                }
                             }
-                            _ => vec![],
+                        }
+
+                        targets
+                    }
+                    Channel::TextChannel { .. } => self.mentions.clone().unwrap_or_default(),
+                    _ => vec![],
+                };
+
+                // Queue when there is a concrete recipient OR the message is a
+                // mass mention — mass mentions have no explicit recipients but
+                // must still reach the ack worker, which fans them out to the
+                // server (mirrors the worker's own rejection predicate).
+                if !recipients.is_empty() || self.contains_mass_push_mention() {
+                    tasks::ack::queue_message(
+                        self.channel.to_string(),
+                        AckEvent::ProcessMessage {
+                            messages: vec![(
+                                Some(
+                                    PushNotification::from(
+                                        self.clone().into_model(user, member),
+                                        Some(author.clone()),
+                                        channel.to_owned().into(),
+                                    )
+                                    .await,
+                                ),
+                                self.clone(),
+                                recipients,
+                                false, // branch already dictates this
+                            )],
                         },
-                        false, // branch already dictates this
-                    )],
-                },
-            )
-            .await;
+                    )
+                    .await;
+                }
+            }
         }
 
         Ok(())
@@ -869,6 +927,7 @@ impl Message {
                                 users.push(by.clone());
                             }
                             v0::SystemMessage::CallStarted { by, .. } => users.push(by.clone()),
+                            v0::SystemMessage::ThreadCreated { by, .. } => users.push(by.clone()),
                         }
                     }
                     users

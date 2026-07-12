@@ -30,10 +30,21 @@ pub async fn edit(
     })?;
 
     let mut channel = target.as_channel(db).await?;
-    let mut query = DatabasePermissionQuery::new(db, &user).channel(&channel);
-    calculate_channel_permissions(&mut query)
-        .await
-        .throw_if_lacking_channel_permission(ChannelPermission::ManageChannel)?;
+
+    // Threads delegate their permission calculus to the parent text channel;
+    // resolve it BEFORE constructing the query. A thread's creator may edit
+    // their own thread without ManageChannel.
+    let permission_channel = channel.permission_target(db).await?.into_owned();
+    let mut query = DatabasePermissionQuery::new(db, &user).channel(&permission_channel);
+    let permissions = calculate_channel_permissions(&mut query).await;
+
+    let is_own_thread = matches!(&channel, Channel::Thread { creator, .. } if creator == &user.id);
+    if !is_own_thread {
+        permissions.throw_if_lacking_channel_permission(ChannelPermission::ManageChannel)?;
+    } else {
+        // Thread creators still need to be able to view the parent channel.
+        permissions.throw_if_lacking_channel_permission(ChannelPermission::ViewChannel)?;
+    }
 
     if data.name.is_none()
         && data.description.is_none()
@@ -42,6 +53,7 @@ pub async fn edit(
         && data.owner.is_none()
         && data.voice.is_none()
         && data.slowmode.is_none()
+        && data.archived.is_none()
         && data.remove.is_empty()
     {
         return Ok(Json(channel.into()));
@@ -262,6 +274,31 @@ pub async fn edit(
             if let Some(new_slowmode) = data.slowmode {
                 *slowmode = Some(new_slowmode);
                 partial.slowmode = Some(new_slowmode);
+            }
+        }
+        Channel::Thread {
+            name,
+            archived,
+            archived_timestamp,
+            ..
+        } => {
+            if let Some(new_name) = data.name {
+                *name = new_name.clone();
+                partial.name = Some(new_name);
+            }
+
+            if let Some(new_archived) = data.archived {
+                if *archived != new_archived {
+                    *archived = new_archived;
+                    partial.archived = Some(new_archived);
+
+                    // Records when the archive state last changed (set on both
+                    // archive and unarchive, since partial updates cannot
+                    // clear fields).
+                    let timestamp = iso8601_timestamp::Timestamp::now_utc().to_string();
+                    archived_timestamp.replace(timestamp.clone());
+                    partial.archived_timestamp = Some(timestamp);
+                }
             }
         }
         _ => return Err(create_error!(InvalidOperation)),

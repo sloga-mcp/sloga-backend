@@ -16,6 +16,12 @@ pub trait AbstractChannels: Sync + Send {
     /// Fetch all channels from the database
     async fn fetch_channels<'a>(&self, ids: &'a [String]) -> Result<Vec<Channel>>;
 
+    /// Fetch all threads hanging off a given parent channel
+    async fn fetch_threads_by_parent(&self, parent_id: &str) -> Result<Vec<Channel>>;
+
+    /// Fetch every non-archived thread (used by the auto-archive daemon)
+    async fn fetch_active_threads(&self) -> Result<Vec<Channel>>;
+
     /// Fetch all direct messages for a user
     async fn find_direct_messages(&self, user_id: &str) -> Result<Vec<Channel>>;
 

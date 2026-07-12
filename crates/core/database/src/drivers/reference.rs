@@ -7,8 +7,8 @@ use crate::{
     E2EEEnvelope, E2EEIdentity, E2EEOneTimeKey, Emoji, EventRsvp, EventRsvpKey, File, FileHash,
     Invite, Member, MemberCompositeKey, Message, MlsCommit, MlsGroup, MlsJoinIntent,
     MlsKeyPackage, PolicyChange, RatelimitEvent, ReminderSent, ReminderSentKey, Report, Server,
-    ServerBan, Snapshot, Sticker, User, UserSettings, Webhook, Account, AccountInvite, Session,
-    MFATicket
+    ServerBan, Snapshot, Sticker, ThreadMember, ThreadMemberCompositeKey, User, UserSettings,
+    Webhook, Account, AccountInvite, Session, MFATicket
 };
 
 database_derived!(
@@ -25,6 +25,7 @@ database_derived!(
         pub channel_webhooks: Arc<Mutex<HashMap<String, Webhook>>>,
         pub emojis: Arc<Mutex<HashMap<String, Emoji>>>,
         pub stickers: Arc<Mutex<HashMap<String, Sticker>>>,
+        pub thread_members: Arc<Mutex<HashMap<ThreadMemberCompositeKey, ThreadMember>>>,
         pub file_hashes: Arc<Mutex<HashMap<String, FileHash>>>,
         pub files: Arc<Mutex<HashMap<String, File>>>,
         pub messages: Arc<Mutex<HashMap<String, Message>>>,

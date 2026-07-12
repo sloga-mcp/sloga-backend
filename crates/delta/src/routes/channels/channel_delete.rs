@@ -26,7 +26,11 @@ pub async fn delete(
     options: v0::OptionsChannelDelete,
 ) -> Result<EmptyResponse> {
     let mut channel = target.as_channel(db).await?;
-    let mut query = DatabasePermissionQuery::new(db, &user).channel(&channel);
+
+    // Threads delegate their permission calculus to the parent text channel;
+    // resolve it BEFORE constructing the query.
+    let permission_channel = channel.permission_target(db).await?.into_owned();
+    let mut query = DatabasePermissionQuery::new(db, &user).channel(&permission_channel);
     let permissions = calculate_channel_permissions(&mut query).await;
 
     permissions.throw_if_lacking_channel_permission(ChannelPermission::ViewChannel)?;
@@ -68,6 +72,11 @@ pub async fn delete(
             channel.delete(db).await?;
 
             delete_voice_channel(voice_client, &UserVoiceChannel::from_channel(&channel)).await?;
+        }
+        Channel::Thread { .. } => {
+            // ManageChannel on the PARENT channel is required to delete a thread.
+            permissions.throw_if_lacking_channel_permission(ChannelPermission::ManageChannel)?;
+            channel.delete(db).await?;
         }
     };
 

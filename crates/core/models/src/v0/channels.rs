@@ -121,6 +121,51 @@ auto_derived!(
             #[serde(skip_serializing_if = "Option::is_none")]
             slowmode: Option<u64>,
         },
+        /// Thread belonging to a server text channel
+        Thread {
+            /// Unique Id
+            #[cfg_attr(feature = "serde", serde(rename = "_id"))]
+            id: String,
+            /// Id of the server this thread belongs to
+            server: String,
+            /// Id of the parent text channel this thread hangs off
+            parent_channel: String,
+
+            /// Display name of the thread
+            name: String,
+            /// Id of the user that created this thread
+            creator: String,
+            /// Id of the message in the parent channel this thread was created from
+            #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+            origin_message_id: Option<String>,
+            /// Id of the last message sent in this thread
+            #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+            last_message_id: Option<String>,
+
+            /// Whether this thread is archived
+            #[cfg_attr(
+                feature = "serde",
+                serde(skip_serializing_if = "crate::if_false", default)
+            )]
+            archived: bool,
+            /// When the archive state of this thread last changed
+            #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+            archived_timestamp: Option<String>,
+            /// Minutes of inactivity after which this thread auto-archives
+            /// (one of 60 / 1440 / 4320 / 10080)
+            #[cfg_attr(
+                feature = "serde",
+                serde(default = "default_auto_archive_minutes")
+            )]
+            auto_archive_minutes: u32,
+
+            /// Whether this thread is locked
+            #[cfg_attr(
+                feature = "serde",
+                serde(skip_serializing_if = "crate::if_false", default)
+            )]
+            locked: bool,
+        },
     }
 
     /// Voice information for a channel
@@ -166,6 +211,10 @@ auto_derived!(
         pub voice: Option<VoiceInformation>,
         #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
         pub slowmode: Option<u64>,
+        #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+        pub archived: Option<bool>,
+        #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+        pub archived_timestamp: Option<String>,
     }
 
     /// Optional fields on channel object
@@ -236,6 +285,18 @@ auto_derived!(
         /// Whether this group is age-restricted
         #[serde(skip_serializing_if = "Option::is_none")]
         pub nsfw: Option<bool>,
+    }
+
+    /// Create new thread
+    #[derive(Default)]
+    #[cfg_attr(feature = "validator", derive(validator::Validate))]
+    pub struct DataCreateThread {
+        /// Thread name
+        #[cfg_attr(feature = "validator", validate(length(min = 1, max = 32)))]
+        pub name: String,
+        /// Minutes of inactivity after which the thread auto-archives
+        /// (one of 60 / 1440 / 4320 / 10080, defaults to 1440)
+        pub auto_archive_minutes: Option<u32>,
     }
 
     /// Server Channel Type
@@ -340,6 +401,11 @@ auto_derived!(
     }
 );
 
+/// Default auto-archive duration for threads, in minutes
+pub(crate) fn default_auto_archive_minutes() -> u32 {
+    1440
+}
+
 impl Channel {
     /// Get a reference to this channel's id
     pub fn id(&self) -> &str {
@@ -347,7 +413,8 @@ impl Channel {
             Channel::DirectMessage { id, .. }
             | Channel::Group { id, .. }
             | Channel::SavedMessages { id, .. }
-            | Channel::TextChannel { id, .. } => id,
+            | Channel::TextChannel { id, .. }
+            | Channel::Thread { id, .. } => id,
         }
     }
 
@@ -359,7 +426,9 @@ impl Channel {
         match self {
             Channel::DirectMessage { .. } => None,
             Channel::SavedMessages { .. } => Some("Saved Messages"),
-            Channel::TextChannel { name, .. } | Channel::Group { name, .. } => Some(name),
+            Channel::TextChannel { name, .. }
+            | Channel::Group { name, .. }
+            | Channel::Thread { name, .. } => Some(name),
         }
     }
 }

@@ -4,6 +4,7 @@ use revolt_database::util::permissions::DatabasePermissionQuery;
 use revolt_database::{
     util::idempotency::IdempotencyKey, util::reference::Reference, Database, User,
 };
+use revolt_database::events::client::EventV1;
 use revolt_database::{Channel, Interactions, Message, AMQP};
 use revolt_models::v0;
 use revolt_permissions::PermissionQuery;
@@ -35,9 +36,18 @@ pub async fn message_send(
 
     // Ensure we have permissions to send a message
     let channel = target.as_channel(db).await?;
-    let mut query = DatabasePermissionQuery::new(db, &user).channel(&channel);
+    // Threads delegate their permission calculus to the parent text channel;
+    // resolve it BEFORE constructing the query so a thread under a private
+    // parent inherits the parent's overrides instead of falling through to
+    // server-wide defaults.
+    let permission_channel = channel.permission_target(db).await?.into_owned();
+    let mut query = DatabasePermissionQuery::new(db, &user).channel(&permission_channel);
     let permissions = calculate_channel_permissions(&mut query).await;
     permissions.throw_if_lacking_channel_permission(ChannelPermission::SendMessage)?;
+
+    // Archived or locked threads reject new messages unless the sender can
+    // manage the parent channel (which is also how a thread gets unarchived).
+    crate::util::threads::ensure_thread_writable(&channel, &permissions)?;
 
     // Verify permissions for masquerade
     if let Some(masq) = &data.masquerade {
@@ -99,23 +109,43 @@ pub async fn message_send(
         .as_ref()
         .map(|member| member.clone().into_owned().into());
 
-    Ok(Json(
-        Message::create_from_api(
-            db,
-            Some(amqp),
-            channel,
-            data,
-            v0::MessageAuthor::User(&author),
-            Some(model_user.clone()),
-            model_member.clone(),
-            user.limits().await,
-            idempotency,
-            permissions.has_channel_permission(ChannelPermission::SendEmbeds),
-            allow_mentions,
-        )
-        .await?
-        .into_model(Some(model_user), model_member),
-    ))
+    // Capture the thread's identity before `channel` is consumed by the send,
+    // so we can auto-join the author once the message lands.
+    let thread_info = if let Channel::Thread { server, .. } = &channel {
+        Some((channel.id().to_string(), server.clone()))
+    } else {
+        None
+    };
+
+    let message = Message::create_from_api(
+        db,
+        Some(amqp),
+        channel,
+        data,
+        v0::MessageAuthor::User(&author),
+        Some(model_user.clone()),
+        model_member.clone(),
+        user.limits().await,
+        idempotency,
+        permissions.has_channel_permission(ChannelPermission::SendEmbeds),
+        allow_mentions,
+    )
+    .await?;
+
+    // Sending in a thread joins you to it (Discord parity), so you start
+    // receiving its notifications.
+    if let Some((thread_id, server_id)) = thread_info {
+        if db.join_thread_if_absent(&thread_id, &user.id).await? {
+            EventV1::ThreadMemberJoin {
+                id: thread_id,
+                user: user.id.clone(),
+            }
+            .p(server_id)
+            .await;
+        }
+    }
+
+    Ok(Json(message.into_model(Some(model_user), model_member)))
 }
 
 #[cfg(test)]
@@ -194,6 +224,8 @@ mod test {
             last_message_id: None,
             voice: None,
             slowmode: None,
+            archived: None,
+            archived_timestamp: None,
         };
         locked_channel
             .update(&harness.db, partial, vec![])

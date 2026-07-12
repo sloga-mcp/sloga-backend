@@ -42,6 +42,32 @@ impl AbstractChannels for MongoDb {
             .await)
     }
 
+    /// Fetch all threads hanging off a given parent channel
+    async fn fetch_threads_by_parent(&self, parent_id: &str) -> Result<Vec<Channel>> {
+        query!(
+            self,
+            find,
+            COL,
+            doc! {
+                "channel_type": "Thread",
+                "parent_channel": parent_id
+            }
+        )
+    }
+
+    /// Fetch every non-archived thread (used by the auto-archive daemon)
+    async fn fetch_active_threads(&self) -> Result<Vec<Channel>> {
+        query!(
+            self,
+            find,
+            COL,
+            doc! {
+                "channel_type": "Thread",
+                "archived": { "$ne": true }
+            }
+        )
+    }
+
     /// Fetch all direct messages for a user
     async fn find_direct_messages(&self, user_id: &str) -> Result<Vec<Channel>> {
         query!(
@@ -324,6 +350,15 @@ impl MongoDb {
             .await
             .map_err(|_| create_database_error!("delete_many", "channel_unreads"))
             .map(|_| ())?;
+
+        // Delete thread membership rows on channels.
+        // (covers both deleting a thread itself and bulk channel deletion)
+        self.col::<Document>("thread_members")
+            .delete_many(doc! {
+                "_id.thread": &id
+            })
+            .await
+            .map_err(|_| create_database_error!("delete_many", "thread_members"))?;
 
         // update many attachments with parent id
 

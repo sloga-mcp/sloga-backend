@@ -14,7 +14,7 @@ use validator::HasLen;
 use revolt_result::Result;
 
 use super::DelayedTask;
-use crate::Channel::TextChannel;
+use crate::Channel::{TextChannel, Thread};
 
 /// Enumeration of possible events
 #[derive(Debug, Eq, PartialEq)]
@@ -195,12 +195,25 @@ pub async fn handle_ack_event(
                     .await
                     .expect("Failed to fetch channel from db");
 
-                if let TextChannel { server, .. } = channel {
-                    if let Err(err) = amqp.mass_mention_message_sent(server, mass_mentions).await {
-                        revolt_config::capture_error(&err);
+                // Threads carry their server id directly, so mass mentions in a
+                // thread fan out the same way as in a text channel. Any other
+                // channel type is a bug upstream — log it rather than panicking,
+                // since a panic here kills the shared ack worker for the whole
+                // instance.
+                match channel {
+                    TextChannel { server, .. } | Thread { server, .. } => {
+                        if let Err(err) =
+                            amqp.mass_mention_message_sent(server, mass_mentions).await
+                        {
+                            revolt_config::capture_error(&err);
+                        }
                     }
-                } else {
-                    panic!("Unknown channel type when sending mass mention event");
+                    _ => {
+                        capture_message(
+                            "Unknown channel type when sending mass mention event",
+                            revolt_config::Level::Error,
+                        );
+                    }
                 }
             }
         }

@@ -101,6 +101,7 @@ pub enum ErrorType {
     },
     AlreadyInGroup,
     NotInGroup,
+    ThreadAlreadyExists,
     AlreadyPinned,
     NotPinned,
     InSlowmode {

@@ -41,6 +41,45 @@ impl Cache {
                     .await
                     .has_channel_permission(ChannelPermission::ViewChannel)
             }
+            Channel::Thread {
+                server,
+                parent_channel,
+                ..
+            } => {
+                // A thread's visibility is exactly its parent text channel's
+                // visibility. Resolve the parent from cache, falling back to
+                // the database, and fail closed if it is missing or is not a
+                // text channel — a thread must never leak past a hidden parent.
+                let parent = if let Some(parent) = self.channels.get(parent_channel) {
+                    parent.clone()
+                } else if let Ok(parent) = db.fetch_channel(parent_channel).await {
+                    parent
+                } else {
+                    return false;
+                };
+
+                if !matches!(parent, Channel::TextChannel { .. }) {
+                    return false;
+                }
+
+                let member = self.members.get(server);
+                let server = self.servers.get(server);
+                let mut query =
+                    DatabasePermissionQuery::new(db, self.users.get(&self.user_id).unwrap())
+                        .channel(&parent);
+
+                if let Some(member) = member {
+                    query = query.member(member);
+                }
+
+                if let Some(server) = server {
+                    query = query.server(server);
+                }
+
+                calculate_channel_permissions(&mut query)
+                    .await
+                    .has_channel_permission(ChannelPermission::ViewChannel)
+            }
             _ => true,
         }
     }
@@ -142,7 +181,7 @@ impl State {
         channels.append(&mut db.fetch_channels(&channel_ids).await?);
 
         // Filter server channels by permission.
-        let channels = self.cache.filter_accessible_channels(db, channels).await;
+        let mut channels = self.cache.filter_accessible_channels(db, channels).await;
 
         // Append known user IDs from DMs.
         for channel in &channels {
@@ -272,6 +311,23 @@ impl State {
         } else {
             None
         };
+
+        // Include threads the user has joined so they are re-subscribed and
+        // rendered on reconnect. Threads are not part of `Server.channels`, so
+        // they are not fetched with the server's channels above; `members` is
+        // now cached, so the visibility filter has the user's roles in context.
+        let mut joined_thread_ids: Vec<String> = vec![];
+        for server in &servers {
+            if let Ok(ids) = db.fetch_joined_thread_ids(&user.id, &server.id).await {
+                joined_thread_ids.extend(ids);
+            }
+        }
+        if !joined_thread_ids.is_empty() {
+            if let Ok(threads) = db.fetch_channels(&joined_thread_ids).await {
+                let viewable = self.cache.filter_accessible_channels(db, threads).await;
+                channels.extend(viewable);
+            }
+        }
 
         // Copy data into local state cache.
         self.cache.users = users.iter().cloned().map(|x| (x.id.clone(), x)).collect();
@@ -471,9 +527,27 @@ impl State {
 
         match event {
             EventV1::ChannelCreate(channel) => {
-                let id = channel.id().to_string();
-                self.insert_subscription(id.clone()).await;
-                self.cache.channels.insert(id, channel.clone().into());
+                let db_channel: Channel = channel.clone().into();
+                let id = db_channel.id().to_string();
+
+                // Threads are announced to the entire server topic. Only
+                // subscribe (and forward the event) if we can view the parent
+                // channel — otherwise a member denied ViewChannel on a private
+                // parent would receive the thread and all of its messages.
+                // Other channel types retain their existing behaviour.
+                let can_view = if matches!(db_channel, Channel::Thread { .. }) {
+                    self.cache.can_view_channel(db, &db_channel).await
+                } else {
+                    true
+                };
+
+                self.cache.channels.insert(id.clone(), db_channel);
+
+                if can_view {
+                    self.insert_subscription(id).await;
+                } else {
+                    return false;
+                }
             }
             EventV1::ChannelUpdate {
                 id, data, clear, ..
@@ -483,6 +557,19 @@ impl State {
                 } else {
                     false
                 };
+
+                // Capture each child thread's prior visibility BEFORE the parent
+                // is mutated — a parent permission change must propagate to the
+                // threads that delegate their permissions to it, or a newly
+                // denied user keeps live thread subscriptions until reconnect.
+                let mut thread_prior: Vec<(String, bool)> = vec![];
+                for (child_id, channel) in &self.cache.channels {
+                    if matches!(channel, Channel::Thread { parent_channel, .. } if parent_channel == id)
+                    {
+                        thread_prior
+                            .push((child_id.clone(), self.cache.can_view_channel(db, channel).await));
+                    }
+                }
 
                 if let Some(channel) = self.cache.channels.get_mut(id) {
                     for field in clear {
@@ -508,6 +595,39 @@ impl State {
                             queue_remove = Some(id.clone());
                             *event = EventV1::ChannelDelete { id: id.clone() };
                         }
+                    }
+                }
+
+                // Propagate the parent's (possibly) changed visibility to its
+                // child threads, emitting synthetic ChannelCreate/Delete so the
+                // client's cache and subscriptions stay correct.
+                let mut thread_events: Vec<EventV1> = vec![];
+                for (thread_id, could_view) in thread_prior {
+                    let can_view = if let Some(channel) = self.cache.channels.get(&thread_id) {
+                        self.cache.can_view_channel(db, channel).await
+                    } else {
+                        false
+                    };
+
+                    if could_view != can_view {
+                        if can_view {
+                            self.insert_subscription(thread_id.clone()).await;
+                            if let Some(channel) = self.cache.channels.get(&thread_id) {
+                                thread_events.push(EventV1::ChannelCreate(channel.clone().into()));
+                            }
+                        } else {
+                            self.remove_subscription(&thread_id).await;
+                            thread_events.push(EventV1::ChannelDelete { id: thread_id.clone() });
+                        }
+                    }
+                }
+
+                if !thread_events.is_empty() {
+                    let mut new_event = EventV1::Bulk { v: thread_events };
+                    std::mem::swap(&mut new_event, event);
+
+                    if let EventV1::Bulk { v } = event {
+                        v.push(new_event);
                     }
                 }
             }

@@ -72,6 +72,12 @@ auto_derived_partial!(
         #[serde(skip_serializing_if = "crate::if_option_false")]
         pub pinned: Option<bool>,
 
+        /// Id of the thread that was created from this message
+        ///
+        /// This is server-set only and never accepted from clients.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub thread_id: Option<String>,
+
         /// Sticker IDs attached to this message
         #[cfg_attr(
             feature = "serde",
@@ -143,6 +149,12 @@ auto_derived!(
         CallStarted {
             by: String,
             finished_at: Option<Timestamp>,
+        },
+        #[serde(rename = "thread_created")]
+        ThreadCreated {
+            id: String,
+            by: String,
+            name: String,
         },
     }
 
@@ -484,6 +496,7 @@ impl From<SystemMessage> for String {
             SystemMessage::MessagePinned { .. } => "Message pinned.".to_string(),
             SystemMessage::MessageUnpinned { .. } => "Message unpinned.".to_string(),
             SystemMessage::CallStarted { .. } => "Call started.".to_string(),
+            SystemMessage::ThreadCreated { .. } => "Thread created.".to_string(),
         }
     }
 }

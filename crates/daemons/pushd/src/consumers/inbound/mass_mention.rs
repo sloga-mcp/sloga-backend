@@ -148,10 +148,25 @@ impl Consumer for MassMessageConsumer {
                             }
                         }
 
-                        let userids: Vec<String> =
-                            chunk.iter().map(|member| member.id.user.clone()).collect();
+                        // Only members who can actually see the channel get the
+                        // unread + push — @everyone must not leak into hidden
+                        // channels (threads delegate visibility to their parent;
+                        // the bulk query substitutes the parent already).
+                        let mut q = query.clone().members(&chunk);
+                        let userids: Vec<String> = q
+                            .members_can_see_channel()
+                            .await
+                            .iter()
+                            .filter_map(|(uid, viewable)| {
+                                if *viewable {
+                                    Some(uid.clone())
+                                } else {
+                                    None
+                                }
+                            })
+                            .collect();
 
-                        debug!("Userids in chunk: {:?}", userids);
+                        debug!("Viewable userids in chunk: {:?}", userids);
 
                         if let Err(err) = self
                             .db

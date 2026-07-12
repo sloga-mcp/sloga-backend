@@ -12,7 +12,9 @@ pub struct BulkDatabasePermissionQuery<'a> {
     #[allow(dead_code)]
     database: &'a Database,
 
-    server: Server,
+    /// `None` when the server could not be fetched (deleted between queue and
+    /// drain) — the calculation then fails closed (deny-all).
+    server: Option<Server>,
     channel: Option<Channel>,
     users: Option<Vec<User>>,
     members: Option<Vec<Member>>,
@@ -61,7 +63,7 @@ impl<'z> BulkDatabasePermissionQuery<'z> {
     pub fn new(database: &Database, server: Server) -> BulkDatabasePermissionQuery<'_> {
         BulkDatabasePermissionQuery {
             database,
-            server,
+            server: Some(server),
             channel: None,
             users: None,
             members: None,
@@ -75,9 +77,22 @@ impl<'z> BulkDatabasePermissionQuery<'z> {
         db: &'a Database,
         server: &str,
     ) -> BulkDatabasePermissionQuery<'a> {
+        // The server may have been deleted between queue time and drain time;
+        // fail closed (deny-all downstream) rather than panicking the caller.
+        let server = match db.fetch_server(server).await {
+            Ok(server) => Some(server),
+            Err(_) => {
+                revolt_config::capture_message(
+                    "Bulk permission query on a missing server; denying all",
+                    revolt_config::Level::Error,
+                );
+                None
+            }
+        };
+
         BulkDatabasePermissionQuery {
             database: db,
-            server: db.fetch_server(server).await.unwrap(),
+            server,
             channel: None,
             users: None,
             members: None,
@@ -95,13 +110,37 @@ impl<'z> BulkDatabasePermissionQuery<'z> {
     }
 
     pub async fn from_channel_id(self, channel_id: String) -> BulkDatabasePermissionQuery<'z> {
-        let channel = self
-            .database
-            .fetch_channel(channel_id.as_str())
-            .await
-            .expect("Valid channel id");
+        // The channel may have been deleted between queue time and drain time
+        // (threads especially: they cascade-delete with their parent). Fail
+        // closed with `channel: None` — the calculation then denies everyone —
+        // rather than panicking the shared worker that called us.
+        let Ok(channel) = self.database.fetch_channel(channel_id.as_str()).await else {
+            revolt_config::capture_message(
+                "Bulk permission query on a missing channel; denying all",
+                revolt_config::Level::Error,
+            );
+
+            return BulkDatabasePermissionQuery {
+                channel: None,
+                ..self
+            };
+        };
 
         drop(channel_id);
+
+        // Threads delegate their permission calculus to the parent text
+        // channel; substitute it here so bulk queries built from a bare id
+        // (e.g. the pushd mass-mention consumer) evaluate the parent's
+        // overrides. If the parent cannot be resolved the thread is kept and
+        // the calculation fails closed (deny-all) instead of panicking.
+        let channel = if matches!(channel, Channel::Thread { .. }) {
+            match channel.permission_target(self.database).await {
+                Ok(parent) => parent.into_owned(),
+                Err(_) => channel,
+            }
+        } else {
+            channel
+        };
 
         BulkDatabasePermissionQuery {
             channel: Some(channel),
@@ -159,7 +198,9 @@ impl<'z> BulkDatabasePermissionQuery<'z> {
                 Channel::DirectMessage { .. } => ChannelType::DirectMessage,
                 Channel::Group { .. } => ChannelType::Group,
                 Channel::SavedMessages { .. } => ChannelType::SavedMessages,
-                Channel::TextChannel { .. } => ChannelType::ServerChannel,
+                // Defensive fallback only: callers MUST substitute the parent
+                // text channel (Channel::permission_target) before querying.
+                Channel::TextChannel { .. } | Channel::Thread { .. } => ChannelType::ServerChannel,
             }
         } else {
             ChannelType::Unknown
@@ -188,19 +229,42 @@ async fn calculate_members_permissions<'a>(
 ) -> HashMap<String, PermissionValue> {
     let mut resp = HashMap::new();
 
-    let (_, channel_role_permissions, channel_default_permissions) = match query
-        .channel
-        .as_ref()
-        .expect("A channel must be assigned to calculate channel permissions")
-        .clone()
-    {
+    // Fail closed on a missing channel (deleted between queue and drain, or a
+    // failed fetch upstream) — deny everyone rather than panicking the caller.
+    let Some(channel) = query.channel.clone() else {
+        revolt_config::capture_message(
+            "Bulk member permissions queried with no channel assigned; denying all",
+            revolt_config::Level::Error,
+        );
+        return resp;
+    };
+
+    let (_, channel_role_permissions, channel_default_permissions) = match channel {
         Channel::TextChannel {
             id,
             role_permissions,
             default_permissions,
             ..
         } => (id, role_permissions, default_permissions),
-        _ => panic!("Calculation of member permissions must be done on a server channel"),
+        // Fail closed: a non-server channel here is a caller bug (threads must
+        // be parent-substituted before querying), but panicking would kill the
+        // shared worker that called us — deny everyone instead.
+        _ => {
+            revolt_config::capture_message(
+                "Bulk member permissions queried on a non-server channel; denying all",
+                revolt_config::Level::Error,
+            );
+            return resp;
+        }
+    };
+
+    // Fail closed if the server vanished between queue and drain time.
+    let Some(server) = query.server.clone() else {
+        revolt_config::capture_message(
+            "Bulk member permissions queried with no server assigned; denying all",
+            revolt_config::Level::Error,
+        );
+        return resp;
     };
 
     if query.users.is_none() {
@@ -212,13 +276,15 @@ async fn calculate_members_permissions<'a>(
             .map(|m| m.id.user.clone())
             .collect();
 
-        query.cached_users = Some(
-            query
-                .database
-                .fetch_users(&ids[..])
-                .await
-                .expect("Failed to get data from the db"),
-        );
+        // Fail closed on a drain-time database error — deny everyone rather
+        // than panicking the shared worker.
+        match query.database.fetch_users(&ids[..]).await {
+            Ok(users) => query.cached_users = Some(users),
+            Err(err) => {
+                revolt_config::capture_error(&err);
+                return resp;
+            }
+        }
 
         query.users = Some(query.cached_users.as_ref().unwrap().to_vec())
     }
@@ -234,13 +300,14 @@ async fn calculate_members_permissions<'a>(
             .map(|m| m.id.clone())
             .collect();
 
-        query.cached_members = Some(
-            query
-                .database
-                .fetch_members(&query.server.id, &ids[..])
-                .await
-                .expect("Failed to get data from the db"),
-        );
+        // Fail closed on a drain-time database error (as above).
+        match query.database.fetch_members(&server.id, &ids[..]).await {
+            Ok(members) => query.cached_members = Some(members),
+            Err(err) => {
+                revolt_config::capture_error(&err);
+                return resp;
+            }
+        }
         query.members = Some(query.cached_members.as_ref().unwrap().to_vec())
     }
 
@@ -272,7 +339,7 @@ async fn calculate_members_permissions<'a>(
             continue;
         }
 
-        if user.id == query.server.owner {
+        if user.id == server.owner {
             resp.insert(
                 user.id.clone(),
                 PermissionValue::from(ChannelPermission::GrantAllSafe),
@@ -281,7 +348,7 @@ async fn calculate_members_permissions<'a>(
         }
 
         // Get the user's server permissions
-        let mut permission = calculate_server_permissions(&query.server, user, member);
+        let mut permission = calculate_server_permissions(&server, user, member);
 
         if let Some(defaults) = channel_default_permissions {
             permission.apply(defaults.into());
@@ -292,7 +359,7 @@ async fn calculate_members_permissions<'a>(
             .iter()
             .filter(|(id, _)| member.roles.contains(id))
             .filter_map(|(id, permission)| {
-                query.server.roles.get(id).map(|role| {
+                server.roles.get(id).map(|role| {
                     let v: Override = (*permission).into();
                     (role.rank, v)
                 })
