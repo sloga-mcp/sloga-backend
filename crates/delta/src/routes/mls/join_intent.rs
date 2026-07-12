@@ -3,7 +3,7 @@ use std::collections::HashSet;
 use iso8601_timestamp::Timestamp;
 use revolt_database::{
     events::client::EventV1, is_valid_device_id, is_valid_key_package_ref,
-    mls_join_intent_payload, Database, MlsJoinIntent, Session, User,
+    mls_join_intent_payload, Database, MlsJoinIntent, Session, User, MAX_MLS_GROUP_MEMBERS,
 };
 use revolt_models::v0;
 use revolt_result::{create_error, Result};
@@ -114,6 +114,18 @@ pub async fn join_intent(
             return Ok(EmptyResponse);
         }
         rejoin = true;
+    }
+
+    // Roster ceiling for NEW members only (plan A3, 6.5 fold ME-3): the
+    // call stays E2EE and the overflow joiner is refused loudly BEFORE
+    // burning the claim/admit round-trip. Rejoins are exempt — a stale-leaf
+    // member's own leaf occupies a slot and blocking its recovery would
+    // permanently lock it out of a full call. The commit-CAS ceiling
+    // (`create_mls_commit`, both drivers) remains the hard guarantee.
+    if !rejoin && group.members.len() >= MAX_MLS_GROUP_MEMBERS {
+        return Err(create_error!(MlsCallFull {
+            max: MAX_MLS_GROUP_MEMBERS
+        }));
     }
 
     let intent = MlsJoinIntent {

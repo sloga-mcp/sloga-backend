@@ -20,10 +20,12 @@ use rocket::{Request, Response, Route};
 
 mod commits_fetch;
 mod commits_submit;
+mod group_open;
 mod groups_create;
 mod join_intent;
 mod key_packages_claim;
 mod key_packages_publish;
+mod messages_send;
 #[cfg(test)]
 mod tests;
 
@@ -42,6 +44,19 @@ pub const MAX_MLS_COMMIT_RAW_SIZE: usize = 64 * 1024;
 /// Maximum RAW (decoded) size of an MLS Welcome: 256 KiB. A Welcome is O(n)
 /// in roster size; `MAX_MLS_GROUP_MEMBERS` is derived from this budget.
 pub const MAX_MLS_WELCOME_RAW_SIZE: usize = 256 * 1024;
+
+/// Maximum RAW (decoded) size of an MLS application message (the §3.4
+/// downgrade ctl-announce) — a mode-change record is tiny; the cap exists
+/// so the ctl pipe can never carry meaningful payload volume
+pub const MAX_MLS_CTL_RAW_SIZE: usize = 4 * 1024;
+
+/// Ctl application-message sends allowed per (group, sender user) within
+/// the trailing window — a legitimate announce is ~once per interlude plus
+/// one re-announce per epoch change (plan §3.4 fold ME-4/ME-5)
+pub const CTL_BURST: usize = 2;
+
+/// Trailing window for `CTL_BURST`
+pub const CTL_INTERVAL_SECONDS: i64 = 5;
 
 /// Maximum commits returned per gap-refetch request
 pub const MAX_COMMITS_PER_FETCH: i64 = 100;
@@ -180,6 +195,8 @@ pub fn routes() -> (Vec<Route>, OpenApi) {
         join_intent::join_intent,
         commits_submit::submit_commit,
         commits_fetch::fetch_commits,
+        messages_send::send_message,
+        group_open::open_group,
     ]
 }
 

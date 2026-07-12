@@ -920,7 +920,10 @@ The server already learns call metadata (who/when/duration). Slice 6 adds to the
 per-call MLS group existence bound to a channel id; the (user, device) membership/delivery sets
 for fan-out (equivalent to what envelope recipients already reveal); the epoch counter and
 commit/Welcome sizes and timing; each device's KeyPackage inventory and claim events (equivalent
-to existing OTK inventory/consume). The server does NOT learn: group secrets, frame keys, roster
+to existing OTK inventory/consume). **Amendment (6.5, ctl-announce):** the existence and timing
+of MLS application-message envelopes (`mls_ctl`) — i.e. "a member announced a call mode change
+at time T" — join the accepted set; the announce CONTENT stays group-encrypted and opaque. The
+server does NOT learn: group secrets, frame keys, roster
 *cryptographic* structure (no GroupInfo/ratchet tree stored — a consequence of the Welcome-based
 join decision, §1.6), or media content. Any future feature requiring server-held GroupInfo must
 re-open this section explicitly.

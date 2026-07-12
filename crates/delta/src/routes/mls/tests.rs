@@ -1309,6 +1309,364 @@ async fn fanout_skips_devices_over_queue_budget() {
     assert_eq!(body.commits.len(), 1);
 }
 
+/// Create a group as `creator` and grow it to `creator + added` via an
+/// epoch-1 commit (the only server-side way a roster grows)
+async fn seed_group_with_members(
+    harness: &TestHarness,
+    session: &Session,
+    creator_device: &str,
+    channel_id: &str,
+    gid: &str,
+    added: &[v0::MlsMemberDevice],
+) {
+    let response = post_json(
+        harness,
+        session,
+        "/mls/groups".to_string(),
+        serde_json::to_string(&v0::DataCreateMlsGroup {
+            group_id: gid.to_string(),
+            channel_id: channel_id.to_string(),
+            device_id: creator_device.to_string(),
+            supersedes: None,
+        })
+        .unwrap(),
+    )
+    .await;
+    assert_eq!(response.status(), Status::Ok, "group create must succeed");
+
+    if added.is_empty() {
+        return;
+    }
+    let response = post_json(
+        harness,
+        session,
+        format!("/mls/groups/{gid}/commits"),
+        serde_json::to_string(&v0::DataSubmitMlsCommit {
+            device_id: creator_device.to_string(),
+            epoch: 1,
+            commit: STANDARD_NO_PAD.encode(b"commit"),
+            welcome: Some(STANDARD_NO_PAD.encode(b"welcome")),
+            added: added.to_vec(),
+            removed: vec![],
+        })
+        .unwrap(),
+    )
+    .await;
+    assert_eq!(response.status(), Status::Ok, "seed commit must win");
+}
+
+#[rocket::async_test]
+async fn ctl_messages_member_gated_capped_and_fanned_out() {
+    let harness = TestHarness::new().await;
+    let (account_a, session_a, user_a) = harness.new_user().await;
+    let (account_b, session_b, user_b) = harness.new_user().await;
+    let (account_c, session_c, user_c) = harness.new_user().await;
+
+    let channel = voice_channel_with_members(&harness, &user_a, &[&user_b, &user_c]).await;
+
+    let device_a =
+        enroll_mls_device(&harness, &account_a.id, &user_a.id, &session_a.token, &["a0"], None)
+            .await;
+    let device_b =
+        enroll_mls_device(&harness, &account_b.id, &user_b.id, &session_b.token, &["b0"], None)
+            .await;
+    // C is enrolled + channel member but NOT a group member
+    let device_c =
+        enroll_mls_device(&harness, &account_c.id, &user_c.id, &session_c.token, &["c0"], None)
+            .await;
+
+    let gid = group_id(0x11);
+    seed_group_with_members(
+        &harness,
+        &session_a,
+        &device_a.device.device_id,
+        &channel.id(),
+        &gid,
+        &[v0::MlsMemberDevice {
+            user_id: user_b.id.clone(),
+            device_id: device_b.device.device_id.clone(),
+        }],
+    )
+    .await;
+
+    // Member B sends a ctl → 204; queued for A's device ONLY (sender
+    // excluded), content_type mls_ctl, no epoch
+    let response = post_json(
+        &harness,
+        &session_b,
+        format!("/mls/groups/{gid}/messages"),
+        serde_json::to_string(&v0::DataSendMlsMessage {
+            device_id: device_b.device.device_id.clone(),
+            ciphertext: STANDARD_NO_PAD.encode(b"opaque ctl announce"),
+        })
+        .unwrap(),
+    )
+    .await;
+    assert_eq!(response.status(), Status::NoContent);
+
+    let queued_a = harness
+        .db
+        .fetch_e2ee_envelopes(&user_a.id, &device_a.device.device_id, 10)
+        .await
+        .unwrap();
+    assert_eq!(queued_a.len(), 1, "one ctl envelope for the other member");
+    assert!(matches!(
+        queued_a[0].content_type,
+        revolt_database::E2EEContentType::MlsCtl
+    ));
+    assert_eq!(queued_a[0].group_id.as_deref(), Some(gid.as_str()));
+    assert_eq!(queued_a[0].epoch, None, "a ctl never carries an epoch");
+    assert_eq!(queued_a[0].sender_user_id, user_b.id, "sender server-stamped");
+
+    // B's mailbox holds the seed Welcome but must hold NO ctl — the sender
+    // never receives its own announce
+    let queued_b = harness
+        .db
+        .fetch_e2ee_envelopes(&user_b.id, &device_b.device.device_id, 10)
+        .await
+        .unwrap();
+    assert!(
+        !queued_b
+            .iter()
+            .any(|env| matches!(env.content_type, revolt_database::E2EEContentType::MlsCtl)),
+        "the sender never receives its own ctl"
+    );
+
+    // Non-member device (channel access, no group membership) → refused
+    let response = post_json(
+        &harness,
+        &session_c,
+        format!("/mls/groups/{gid}/messages"),
+        serde_json::to_string(&v0::DataSendMlsMessage {
+            device_id: device_c.device.device_id.clone(),
+            ciphertext: STANDARD_NO_PAD.encode(b"forged"),
+        })
+        .unwrap(),
+    )
+    .await;
+    assert_eq!(response.status(), Status::BadRequest);
+
+    // Over the 4 KiB raw size cap → refused
+    let response = post_json(
+        &harness,
+        &session_b,
+        format!("/mls/groups/{gid}/messages"),
+        serde_json::to_string(&v0::DataSendMlsMessage {
+            device_id: device_b.device.device_id.clone(),
+            ciphertext: "A".repeat(super::encoded_len(super::MAX_MLS_CTL_RAW_SIZE) + 4),
+        })
+        .unwrap(),
+    )
+    .await;
+    assert_eq!(response.status(), Status::BadRequest);
+
+    // Rate limit: burst 2 per window per (group, sender) — B already sent 1
+    // (the oversize + non-member attempts never reach the limiter)
+    let ok = post_json(
+        &harness,
+        &session_b,
+        format!("/mls/groups/{gid}/messages"),
+        serde_json::to_string(&v0::DataSendMlsMessage {
+            device_id: device_b.device.device_id.clone(),
+            ciphertext: STANDARD_NO_PAD.encode(b"second announce"),
+        })
+        .unwrap(),
+    )
+    .await;
+    assert_eq!(ok.status(), Status::NoContent);
+    let limited = post_json(
+        &harness,
+        &session_b,
+        format!("/mls/groups/{gid}/messages"),
+        serde_json::to_string(&v0::DataSendMlsMessage {
+            device_id: device_b.device.device_id.clone(),
+            ciphertext: STANDARD_NO_PAD.encode(b"third announce"),
+        })
+        .unwrap(),
+    )
+    .await;
+    assert_eq!(limited.status(), Status::TooManyRequests);
+}
+
+#[rocket::async_test]
+async fn open_group_probe_access_and_absence() {
+    let harness = TestHarness::new().await;
+    let (account_a, session_a, user_a) = harness.new_user().await;
+    let (_account_s, session_s, _user_s) = harness.new_user().await; // stranger
+
+    let channel = voice_channel_with_members(&harness, &user_a, &[]).await;
+    let device_a =
+        enroll_mls_device(&harness, &account_a.id, &user_a.id, &session_a.token, &["a0"], None)
+            .await;
+
+    // No open group yet → 404
+    let response = harness
+        .client
+        .get(format!("/mls/channels/{}/open_group", channel.id()))
+        .header(Header::new("x-session-token", session_a.token.clone()))
+        .dispatch()
+        .await;
+    assert_eq!(response.status(), Status::NotFound);
+
+    let gid = group_id(0x22);
+    seed_group_with_members(
+        &harness,
+        &session_a,
+        &device_a.device.device_id,
+        &channel.id(),
+        &gid,
+        &[],
+    )
+    .await;
+
+    // Channel member → 200 with the open group + roster size
+    let response = harness
+        .client
+        .get(format!("/mls/channels/{}/open_group", channel.id()))
+        .header(Header::new("x-session-token", session_a.token.clone()))
+        .dispatch()
+        .await;
+    assert_eq!(response.status(), Status::Ok);
+    let body: v0::ResponseOpenMlsGroup = response.into_json().await.unwrap();
+    assert_eq!(body.group_id, gid);
+    assert_eq!(body.member_count, 1);
+
+    // A stranger with no channel access must not see group existence
+    let response = harness
+        .client
+        .get(format!("/mls/channels/{}/open_group", channel.id()))
+        .header(Header::new("x-session-token", session_s.token.clone()))
+        .dispatch()
+        .await;
+    assert_ne!(
+        response.status(),
+        Status::Ok,
+        "no channel access ⇒ no group metadata"
+    );
+}
+
+#[rocket::async_test]
+async fn join_intent_call_full_boundary_and_rejoin_exemption() {
+    let harness = TestHarness::new().await;
+    let (account_a, session_a, user_a) = harness.new_user().await;
+    let (account_b, session_b, user_b) = harness.new_user().await;
+    let (account_c, session_c, user_c) = harness.new_user().await;
+
+    let channel = voice_channel_with_members(&harness, &user_a, &[&user_b, &user_c]).await;
+
+    let device_a =
+        enroll_mls_device(&harness, &account_a.id, &user_a.id, &session_a.token, &["a0"], None)
+            .await;
+    let device_b =
+        enroll_mls_device(&harness, &account_b.id, &user_b.id, &session_b.token, &["b0"], None)
+            .await;
+    let device_c =
+        enroll_mls_device(&harness, &account_c.id, &user_c.id, &session_c.token, &["c0"], None)
+            .await;
+
+    // Roster at EXACTLY the cap: A + B via the route (registered devices),
+    // then 98 synthetic member devices seeded at the DB layer — the route
+    // rightly refuses unregistered added devices, but the cap check reads
+    // the roster mirror, which is what we need at 100
+    let gid = group_id(0x33);
+    seed_group_with_members(
+        &harness,
+        &session_a,
+        &device_a.device.device_id,
+        &channel.id(),
+        &gid,
+        &[v0::MlsMemberDevice {
+            user_id: user_b.id.clone(),
+            device_id: device_b.device.device_id.clone(),
+        }],
+    )
+    .await;
+
+    let synthetic: Vec<revolt_database::MlsMemberDevice> = (0..98u32)
+        .map(|index| revolt_database::MlsMemberDevice {
+            user_id: format!("0SYNTHETICUSER{index:012}"),
+            device_id: format!("{index:032x}"),
+        })
+        .collect();
+    let outcome = harness
+        .db
+        .insert_mls_commit(&revolt_database::MlsCommit {
+            id: revolt_database::MlsCommit::composite_id(&gid, 2),
+            group_id: gid.clone(),
+            epoch: 2,
+            committer: revolt_database::MlsMemberDevice {
+                user_id: user_a.id.clone(),
+                device_id: device_a.device.device_id.clone(),
+            },
+            commit: STANDARD_NO_PAD.encode(b"seed commit"),
+            size: 16,
+            added: synthetic,
+            removed: vec![],
+            created_at: iso8601_timestamp::Timestamp::now_utc(),
+        })
+        .await
+        .unwrap();
+    assert!(
+        matches!(outcome, revolt_database::MlsCommitOutcome::Won),
+        "db-layer roster seed must win epoch 2"
+    );
+    let seeded = harness.db.fetch_mls_group(&gid).await.unwrap();
+    assert_eq!(seeded.members.len(), 100, "roster at exactly the cap");
+
+    // A NEW member's intent at the cap → MlsCallFull (409), refused BEFORE
+    // any claim/admit round-trip
+    let response = post_json(
+        &harness,
+        &session_c,
+        format!("/mls/groups/{gid}/join_intent"),
+        serde_json::to_string(&v0::DataMlsJoinIntent {
+            device_id: device_c.device.device_id.clone(),
+            key_package_ref: STANDARD_NO_PAD.encode(b"ref-c"),
+            signature: device_c.join_signature(
+                &user_c.id,
+                &gid,
+                &STANDARD_NO_PAD.encode(b"ref-c"),
+            ),
+        })
+        .unwrap(),
+    )
+    .await;
+    assert_eq!(response.status(), Status::Conflict);
+    assert!(
+        response
+            .into_string()
+            .await
+            .unwrap()
+            .contains("MlsCallFull"),
+        "the refusal must be the distinguishable MlsCallFull error"
+    );
+
+    // An EXISTING member device's re-intent (rejoin) at exactly-100 is
+    // exempt — blocking it would permanently lock a crashed member out of
+    // a full call (fold ME-3)
+    let response = post_json(
+        &harness,
+        &session_b,
+        format!("/mls/groups/{gid}/join_intent"),
+        serde_json::to_string(&v0::DataMlsJoinIntent {
+            device_id: device_b.device.device_id.clone(),
+            key_package_ref: STANDARD_NO_PAD.encode(b"ref-b2"),
+            signature: device_b.join_signature(
+                &user_b.id,
+                &gid,
+                &STANDARD_NO_PAD.encode(b"ref-b2"),
+            ),
+        })
+        .unwrap(),
+    )
+    .await;
+    assert_eq!(
+        response.status(),
+        Status::NoContent,
+        "rejoin at cap must succeed"
+    );
+}
+
 #[rocket::async_test]
 async fn flag_off_rejects_every_route() {
     // overwrite_config is once-per-process and must run BEFORE the harness
@@ -1359,10 +1717,23 @@ async fn flag_off_rejects_every_route() {
             format!("/mls/groups/{gid}/commits"),
             format!(r#"{{"device_id":"{device}","epoch":1,"commit":"a"}}"#),
         ),
+        (
+            format!("/mls/groups/{gid}/messages"),
+            format!(r#"{{"device_id":"{device}","ciphertext":"a"}}"#),
+        ),
     ] {
         let response = post_json(&harness, &session, uri, body).await;
         assert_eq!(response.status(), Status::BadRequest);
     }
+
+    // The open-group probe (GET) is flag-gated too
+    let response = harness
+        .client
+        .get("/mls/channels/somechannel/open_group")
+        .header(Header::new("x-session-token", session.token.clone()))
+        .dispatch()
+        .await;
+    assert_eq!(response.status(), Status::BadRequest);
 
     let response = harness
         .client

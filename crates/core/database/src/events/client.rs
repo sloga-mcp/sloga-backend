@@ -458,6 +458,11 @@ pub enum EventV1 {
     /// (media E2EE). Same queue-first + ULID-dedup contract as MlsCommit.
     MlsWelcome(E2EEMessage),
 
+    /// Live push of an MLS application-message envelope (media E2EE) — the
+    /// §3.4 downgrade ctl-announce. Same queue-first + ULID-dedup contract
+    /// as MlsCommit, but NO epoch ordering: a ctl never parks the drain.
+    MlsCtl(E2EEMessage),
+
     /// Device-claim challenge (connection-local, issued by the events
     /// server; the client signs this with the device Ed25519 identity key)
     E2EEChallenge {

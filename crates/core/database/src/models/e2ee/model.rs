@@ -126,6 +126,10 @@ auto_derived!(
         MlsCommit,
         /// An MLS Welcome, delivered to a newly added device
         MlsWelcome,
+        /// An MLS application message (opaque MLS PrivateMessage) — the
+        /// media-E2EE §3.4 downgrade ctl-announce, fanned out to the roster
+        /// minus the sender. Never advances an epoch; no per-group ordering
+        MlsCtl,
     }
 );
 

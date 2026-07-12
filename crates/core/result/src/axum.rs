@@ -122,6 +122,7 @@ impl IntoResponse for Error {
             ErrorType::DisallowedMFAMethod => StatusCode::BAD_REQUEST,
             ErrorType::OperationFailed => StatusCode::INTERNAL_SERVER_ERROR,
             ErrorType::IncorrectData { .. } => StatusCode::BAD_REQUEST,
+            ErrorType::MlsCallFull { .. } => StatusCode::CONFLICT,
         };
 
         (status, Json(&self)).into_response()

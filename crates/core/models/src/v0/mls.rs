@@ -205,4 +205,26 @@ auto_derived!(
         /// The group's current epoch (so a fully caught-up client knows it)
         pub current_epoch: i64,
     }
+
+    /// Send an MLS application message to the group roster (plan §3.4 —
+    /// the downgrade ctl-announce). The ciphertext is an opaque MLS
+    /// PrivateMessage encrypted+authenticated by the group; the server
+    /// relays it to every member device except the sender's. It never
+    /// advances an epoch.
+    pub struct DataSendMlsMessage {
+        /// The sending device (must be a group member device of the caller)
+        pub device_id: String,
+        /// Opaque application-message ciphertext, unpadded standard base64
+        pub ciphertext: String,
+    }
+
+    /// The channel's open MLS group, if any — the pre-join mode probe
+    /// (plan §3.4 compose-time rule + A3 cap pre-warning). Reveals only
+    /// metadata the server already holds (§5.6) to channel-access holders.
+    pub struct ResponseOpenMlsGroup {
+        /// The open group's id
+        pub group_id: String,
+        /// Current roster size (device count) — pre-join cap warning input
+        pub member_count: usize,
+    }
 );

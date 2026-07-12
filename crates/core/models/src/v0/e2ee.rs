@@ -12,6 +12,9 @@ auto_derived!(
         MlsCommit,
         /// An MLS Welcome for a newly added device
         MlsWelcome,
+        /// An MLS application message (opaque MLS PrivateMessage) — the
+        /// media-E2EE §3.4 downgrade ctl-announce. Never advances an epoch
+        MlsCtl,
     }
 
     /// A signed Curve25519 public key (fallback or one-time)

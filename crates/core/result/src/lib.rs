@@ -215,6 +215,14 @@ pub enum ErrorType {
 
     TotpAlreadyEnabled,
     DisallowedMFAMethod,
+
+    // ? Media E2EE (MLS) errors
+    /// The call's MLS group is at the roster ceiling — a NEW member cannot
+    /// join encrypted (the call stays E2EE; plan A3). Rejoins of existing
+    /// members are exempt.
+    MlsCallFull {
+        max: usize,
+    },
 }
 
 #[macro_export]
