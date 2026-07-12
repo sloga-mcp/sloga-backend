@@ -123,6 +123,7 @@ impl IntoResponse for Error {
             ErrorType::OperationFailed => StatusCode::INTERNAL_SERVER_ERROR,
             ErrorType::IncorrectData { .. } => StatusCode::BAD_REQUEST,
             ErrorType::MlsCallFull { .. } => StatusCode::CONFLICT,
+            ErrorType::VideoCallFull { .. } => StatusCode::CONFLICT,
         };
 
         (status, Json(&self)).into_response()

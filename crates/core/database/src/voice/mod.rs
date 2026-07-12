@@ -27,6 +27,56 @@ async fn get_connection() -> Result<Conn> {
         .map_err(|_| create_error!(InternalError))
 }
 
+/// Product gate (media E2EE plan §0.2 / A3(b), D12): the maximum number of
+/// call participants that may have video (camera or screenshare) active at
+/// once. Independent of E2EE — applies to ALL calls. The client mirrors this
+/// as `MAX_VIDEO_PARTICIPANTS = 30` in `state.tsx`; keep the two in lockstep.
+pub const MAX_VIDEO_PARTICIPANTS: usize = 30;
+
+/// Whether a LiveKit `TrackSource` int is a VIDEO source subject to the video
+/// cap's enable leg. Camera = 1, ScreenShare(video) = 3. ScreenShareAudio = 4
+/// maps to the `screensharing` flag too (see `count_video_participants`) but is
+/// audio-only, so it is NOT refused by the enable leg — a deliberate asymmetry.
+pub fn is_video_source(source: i32) -> bool {
+    matches!(source, 1 /* Camera */ | 3 /* ScreenShare */)
+}
+
+/// Count the current members of a voice channel who have video active — camera
+/// OR screensharing. Reads the per-member Redis flags under the SAME key
+/// composition the rest of this module uses: `{user_id}:{server_id | channel_id}`
+/// (the members SET is keyed by channel id, but the per-member flags are keyed
+/// by server id for server voice channels — composing `{user}:{channel_id}` on a
+/// server channel misses every flag and the count reads 0, failing the cap OPEN).
+///
+/// NB: the `screensharing` flag is set for BOTH screen-video (source 3) and
+/// screen-audio (source 4), so an audio-only screenshare conservatively consumes
+/// a video slot here. That is the safe direction (cap slightly stricter).
+pub async fn count_video_participants(channel: &UserVoiceChannel) -> Result<usize> {
+    let Some(members) = get_voice_channel_members(channel).await? else {
+        return Ok(0);
+    };
+
+    let parent_id = channel.server_id.as_ref().unwrap_or(&channel.id);
+    let mut conn = get_connection().await?;
+    let mut count = 0;
+
+    for user_id in members {
+        let unique_key = format!("{user_id}:{parent_id}");
+        let (camera, screensharing): (Option<bool>, Option<bool>) = conn
+            .mget(&[
+                format!("camera:{unique_key}"),
+                format!("screensharing:{unique_key}"),
+            ])
+            .await
+            .to_internal_error()?;
+        if camera.unwrap_or(false) || screensharing.unwrap_or(false) {
+            count += 1;
+        }
+    }
+
+    Ok(count)
+}
+
 pub async fn raise_if_in_voice(user: &User, channel: &UserVoiceChannel) -> Result<()> {
     let mut conn = get_connection().await?;
 
@@ -820,5 +870,66 @@ impl ToRedisArgs for UserVoiceChannel {
 impl FromRedisValue for UserVoiceChannel {
     fn from_redis_value(v: &Value) -> Result<Self, RedisError> {
         String::from_redis_value(v).map(UserVoiceChannel::from_string)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use iso8601_timestamp::Timestamp;
+
+    // Redis-backed (mirrors the mls delta-test pattern, which also drives live
+    // Redis voice state). Verifies count_video_participants over the ACTUAL key
+    // composition — including the SERVER voice channel case (server_id present),
+    // where the per-member flags key by server id, not channel id (audit
+    // ME-MED-2: composing `{user}:{channel_id}` there would miss every flag and
+    // read 0, failing the D12 cap OPEN).
+    #[tokio::test]
+    async fn count_video_participants_counts_camera_or_screenshare_on_server_channel() {
+        // Unique ids so parallel test runs don't collide on shared Redis.
+        let suffix = ulid::Ulid::new().to_string();
+        let channel = UserVoiceChannel {
+            id: format!("chan{suffix}"),
+            server_id: Some(format!("srv{suffix}")), // server channel: flags key by server id
+        };
+        let users: Vec<String> = (0..4).map(|i| format!("user{i}{suffix}")).collect();
+
+        // Clean seed.
+        for user in &users {
+            create_voice_state(&channel, user, Timestamp::now_utc())
+                .await
+                .expect("seed voice state");
+        }
+
+        // No video yet ⇒ 0.
+        assert_eq!(count_video_participants(&channel).await.unwrap(), 0);
+
+        // user0 turns on camera (track 1); user1 turns on screenshare (track 3);
+        // user2 turns on the mic only (track 2 = is_publishing, NOT video);
+        // user3 stays idle.
+        update_voice_state_tracks(&channel, &users[0], true, 1)
+            .await
+            .unwrap();
+        update_voice_state_tracks(&channel, &users[1], true, 3)
+            .await
+            .unwrap();
+        update_voice_state_tracks(&channel, &users[2], true, 2)
+            .await
+            .unwrap();
+
+        // Exactly the two video publishers count.
+        assert_eq!(count_video_participants(&channel).await.unwrap(), 2);
+
+        // user0 turns camera back off ⇒ back to 1.
+        update_voice_state_tracks(&channel, &users[0], false, 1)
+            .await
+            .unwrap();
+        assert_eq!(count_video_participants(&channel).await.unwrap(), 1);
+
+        // Cleanup.
+        delete_channel_voice_state(&channel, &users)
+            .await
+            .expect("cleanup");
+        assert_eq!(count_video_participants(&channel).await.unwrap(), 0);
     }
 }

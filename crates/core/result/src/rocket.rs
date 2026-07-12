@@ -128,6 +128,7 @@ impl<'r> Responder<'r, 'static> for Error {
             ErrorType::OperationFailed => Status::InternalServerError,
             ErrorType::IncorrectData { .. } => Status::BadRequest,
             ErrorType::MlsCallFull { .. } => Status::Conflict,
+            ErrorType::VideoCallFull { .. } => Status::Conflict,
         };
 
         // Serialize the error data structure into JSON.

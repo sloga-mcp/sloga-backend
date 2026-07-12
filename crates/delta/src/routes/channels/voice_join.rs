@@ -2,11 +2,11 @@ use revolt_config::config;
 use revolt_database::{
     util::{permissions::perms, reference::Reference},
     voice::{
-        delete_voice_state, get_channel_node, get_user_voice_channels, get_voice_channel_members,
-        raise_if_in_voice, set_call_notification_recipients, set_channel_node, UserVoiceChannel,
-        VoiceClient,
+        count_video_participants, delete_voice_state, get_channel_node, get_user_voice_channels,
+        get_voice_channel_members, raise_if_in_voice, set_call_notification_recipients,
+        set_channel_node, UserVoiceChannel, VoiceClient, MAX_VIDEO_PARTICIPANTS,
     },
-    Database, Session, User,
+    Database, Session, User, MAX_MLS_GROUP_MEMBERS,
 };
 use revolt_models::v0;
 use revolt_permissions::{calculate_channel_permissions, ChannelPermission};
@@ -80,6 +80,46 @@ pub async fn call(
         && !current_permissions.has(ChannelPermission::ManageChannel as u64)
     {
         return Err(create_error!(CannotJoinCall));
+    }
+
+    // D12 / A3(b): a video call is capped at MAX_VIDEO_PARTICIPANTS members.
+    // PRODUCT gate over ALL calls — must sit OUTSIDE the E2EE device block
+    // above (which is gated by require_media_e2ee_enabled), so a non-E2EE /
+    // downgraded client that omits device_id cannot bypass the cap. NO
+    // ManageChannel exemption (unlike max_users): the cap is a hard media
+    // ceiling, not a per-channel policy knob. Self-reconnect (force_disconnect)
+    // is exempt — it removes prior state first and never grows the roster.
+    if force_disconnect != Some(true) {
+        let members = get_voice_channel_members(&user_voice_channel)
+            .await?
+            .map(|m| m.len())
+            .unwrap_or(0);
+        if members >= MAX_VIDEO_PARTICIPANTS
+            && count_video_participants(&user_voice_channel).await? > 0
+        {
+            return Err(create_error!(VideoCallFull {
+                max: MAX_VIDEO_PARTICIPANTS
+            }));
+        }
+    }
+
+    // T-20 (media E2EE plan A3, 6.6 audit CR-HIGH-2): couple SFU admission to
+    // the MLS roster cap for E2EE-active calls. Without this, a non-cooperative
+    // overflow joiner (refused the MLS leaf at join_intent) still gets an SFU
+    // token, sits as a non-enrolled ghost, and trips every member's loud
+    // downgrade banner. Only fires when an open MLS group exists (non-E2EE
+    // calls untouched); existing members (by user_id, any device = rejoin) are
+    // exempt so a legitimate rejoin at the ceiling still works.
+    if force_disconnect != Some(true) {
+        if let Some(group) = db.fetch_open_mls_group_for_channel(channel.id()).await? {
+            if group.members.len() >= MAX_MLS_GROUP_MEMBERS
+                && !group.members.iter().any(|m| m.user_id == user.id)
+            {
+                return Err(create_error!(MlsCallFull {
+                    max: MAX_MLS_GROUP_MEMBERS
+                }));
+            }
+        }
     }
 
     let existing_node = get_channel_node(channel.id()).await?;

@@ -962,6 +962,11 @@ as `hostile_server.rs` (hand-crafted DS lies fed to `E2ee`, asserting fail-close
 `routes/mls/tests.rs` over ReferenceDb + Mongo. Media-plane: scripted two-desktop probe + SFU
 capture.
 
+> **6.6 consolidation note (2026-07-12):** the native hostile-DS matrix was implemented in
+> `tests/mls_adversarial.rs` (which already forges Welcomes/commits + owns the shared helpers)
+> rather than a separate `hostile_ds.rs` — a second file would fork the forge helpers. The full
+> desktop-scoped T-01..T-21 coverage map lives in `e2ee-media-slice-6.6-breakdown.md` §4.5.
+
 | # | Test | Asserts |
 |---|---|---|
 | T-01 | SFU/relay capture | Frames captured at the SFU (packet capture on the LiveKit node) are ciphertext; no plaintext codec payloads. |

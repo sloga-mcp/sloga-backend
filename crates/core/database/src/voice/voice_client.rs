@@ -169,6 +169,28 @@ impl VoiceClient {
             .to_internal_error()
     }
 
+    /// Server-side mute one published track (media E2EE plan D12 video-cap
+    /// enable-leg): refuse an over-cap video track without kicking the member
+    /// from the whole call — they stay connected audio-only, matching the
+    /// client's "video is full, you're still connected" toast.
+    pub async fn mute_track(
+        &self,
+        node: &str,
+        user_id: &str,
+        channel_id: &str,
+        track_sid: &str,
+    ) -> Result<()> {
+        let room = self.get_node(node)?;
+
+        let identity = super::get_voice_participant_identity(channel_id, user_id).await?;
+
+        room.client
+            .mute_published_track(channel_id, &identity, track_sid, true)
+            .await
+            .map(|_| ())
+            .to_internal_error()
+    }
+
     pub async fn delete_room(&self, node: &str, channel_id: &str) -> Result<()> {
         let room = self.get_node(node)?;
 

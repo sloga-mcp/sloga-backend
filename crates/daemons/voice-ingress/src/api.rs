@@ -8,8 +8,9 @@ use revolt_database::{
         clear_voice_participant_identities, create_voice_state, delete_channel_voice_state,
         delete_voice_state, delete_voice_participant_identity, get_user_moved_from_voice,
         get_user_moved_to_voice, get_user_voice_channels, get_voice_channel_members,
-        set_voice_participant_identity, update_voice_state_tracks,
+        is_video_source, set_voice_participant_identity, update_voice_state_tracks,
         user_id_from_participant_identity, RoomMetadata, UserVoiceChannel, VoiceClient,
+        MAX_VIDEO_PARTICIPANTS,
     },
     Database, AMQP,
 };
@@ -312,6 +313,27 @@ pub async fn ingress(
                     delete_voice_state(&channel, user_id).await?;
 
                     return Ok(EmptyResponse);
+                };
+
+                // D12 / A3(b) video-cap ENABLE leg (plan §0.2 ">30 present ⇒
+                // video enable refused"): once the call exceeds
+                // MAX_VIDEO_PARTICIPANTS members, a new camera/screenshare-video
+                // publish is refused by server-side MUTE — the member stays
+                // connected audio-only (matching the client's "video is full,
+                // you're still connected" toast), NOT disconnected. Product gate
+                // over all calls. Audio-only screenshare (source 4) is exempt.
+                if is_video_source(track.source) {
+                    let members = get_voice_channel_members(&channel)
+                        .await?
+                        .map(|m| m.len())
+                        .unwrap_or(0);
+                    if members > MAX_VIDEO_PARTICIPANTS {
+                        log::debug!("Muting over-cap video track {} for user {user_id} in channel {channel_id} (>{MAX_VIDEO_PARTICIPANTS} present).", track.sid);
+                        let _ = voice_client
+                            .mute_track(node, user_id, channel_id, &track.sid)
+                            .await;
+                        return Ok(EmptyResponse);
+                    };
                 };
             };
 

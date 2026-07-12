@@ -223,6 +223,15 @@ pub enum ErrorType {
     MlsCallFull {
         max: usize,
     },
+
+    /// A video call is at the video-participant ceiling
+    /// (`MAX_VIDEO_PARTICIPANTS`) — a NEW member cannot join a video-active
+    /// call, or a member cannot enable video, once the cap is reached. Product
+    /// gate (all calls; plan D12 / A3(b)), independent of E2EE. Self-reconnect
+    /// and existing members are exempt.
+    VideoCallFull {
+        max: usize,
+    },
 }
 
 #[macro_export]
