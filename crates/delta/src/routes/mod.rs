@@ -9,6 +9,7 @@ mod channels;
 mod customisation;
 mod e2ee;
 mod events;
+mod interactions;
 mod invites;
 mod mls;
 mod onboard;
@@ -38,6 +39,7 @@ pub fn mount(config: Settings, mut rocket: Rocket<Build>) -> Rocket<Build> {
             "/channels" => channels::routes(),
             "/servers" => servers::routes(),
             "/invites" => invites::routes(),
+            "/interactions" => interactions::routes(),
             "/custom" => customisation::routes(),
             "/safety" => safety::routes(),
             "/e2ee" => e2ee::routes(),
@@ -63,6 +65,7 @@ pub fn mount(config: Settings, mut rocket: Rocket<Build>) -> Rocket<Build> {
             "/channels" => channels::routes(),
             "/servers" => servers::routes(),
             "/invites" => invites::routes(),
+            "/interactions" => interactions::routes(),
             "/custom" => customisation::routes(),
             "/safety" => safety::routes(),
             "/e2ee" => e2ee::routes(),

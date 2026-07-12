@@ -33,7 +33,15 @@ impl<'a> RatelimitResolver<Request<'a>> for DeltaRatelimits {
 
                     ("users", None)
                 }
-                ("bots", _, _) => ("bots", None),
+                ("bots", _, _) => {
+                    // Command registration is bounded separately from general
+                    // bot management (audit: dedicated bucket).
+                    if let Some("commands") = extra {
+                        return ("bot_commands", None);
+                    }
+
+                    ("bots", None)
+                }
                 ("channels", Some(id), _) => {
                     if request.method() == Method::Post {
                         // Dice rolls create messages, so they share the messaging bucket
@@ -52,10 +60,17 @@ impl<'a> RatelimitResolver<Request<'a>> for DeltaRatelimits {
                         if let Some("posts") = extra {
                             return ("forum_post_create", Some(id));
                         }
+
+                        // Command invocations wake a bot per call — bound
+                        // the spam separately from plain messaging.
+                        if let Some("interactions") = extra {
+                            return ("interaction_create", Some(id));
+                        }
                     }
 
                     ("channels", Some(id))
                 }
+                ("interactions", _, _) => ("interaction_respond", None),
                 ("servers", Some(id), _) => ("servers", Some(id)),
                 ("auth", _, _) => {
                     if request.method() == Method::Delete {
@@ -118,6 +133,9 @@ impl<'a> RatelimitResolver<Request<'a>> for DeltaRatelimits {
             "events" => 30,
             "thread_create" => 5,
             "forum_post_create" => 5,
+            "interaction_create" => 10,
+            "interaction_respond" => 30,
+            "bot_commands" => 10,
             _ => 20,
         }
     }

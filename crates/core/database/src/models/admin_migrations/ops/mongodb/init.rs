@@ -154,6 +154,14 @@ pub async fn create_database(db: &MongoDb) {
         .await
         .expect("Failed to create thread_members collection.");
 
+    db.create_collection("application_commands")
+        .await
+        .expect("Failed to create application_commands collection.");
+
+    db.create_collection("interactions")
+        .await
+        .expect("Failed to create interactions collection.");
+
     db.run_command(doc! {
         "createIndexes": "users",
         "indexes": [
@@ -261,6 +269,47 @@ pub async fn create_database(db: &MongoDb) {
     })
     .await
     .expect("Failed to create thread_members index.");
+
+    db.run_command(doc! {
+        "createIndexes": "application_commands",
+        "indexes": [
+            // Uniqueness backstop for the (bot, scope, name) triple.
+            {
+                "key": {
+                    "bot_id": 1_i32,
+                    "server": 1_i32,
+                    "name": 1_i32
+                },
+                "name": "bot_scope_name",
+                "unique": true
+            },
+            // Serves the per-channel command picker.
+            {
+                "key": {
+                    "server": 1_i32
+                },
+                "name": "server"
+            }
+        ]
+    })
+    .await
+    .expect("Failed to create application_commands index.");
+
+    db.run_command(doc! {
+        "createIndexes": "interactions",
+        "indexes": [
+            // Serves the bot-deletion cascade; expiry cleanup deletes by
+            // _id range (ULID clock) so the primary index covers it.
+            {
+                "key": {
+                    "bot_id": 1_i32
+                },
+                "name": "bot_id"
+            }
+        ]
+    })
+    .await
+    .expect("Failed to create interactions index.");
 
     db.run_command(doc! {
         "createIndexes": "channels",

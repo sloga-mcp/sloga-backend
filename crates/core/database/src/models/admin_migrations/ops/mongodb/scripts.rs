@@ -26,7 +26,7 @@ struct MigrationInfo {
     revision: i32,
 }
 
-pub const LATEST_REVISION: i32 = 57; // MUST BE +1 to last migration
+pub const LATEST_REVISION: i32 = 58; // MUST BE +1 to last migration
 
 pub async fn migrate_database(db: &MongoDb) {
     let migrations = db.col::<Document>("migrations");
@@ -1800,6 +1800,66 @@ pub async fn run_migrations(db: &MongoDb, revision: i32) -> i32 {
             })
             .await
             .expect("Failed to create channels thread index.");
+    }
+
+    if revision <= 57 {
+        info!("Running migration [revision 57 / 12-07-2026]: Create application_commands and interactions collections (slash-command bots)");
+
+        // Existing deployments predate slash commands: init.rs only covers
+        // fresh DBs. Collections + indexes mirror init.rs exactly; both
+        // operations are idempotent (create_collection errors are ignored;
+        // createIndexes is a no-op when key+name already match), so a re-run
+        // or a fresh DB is safe.
+        db.db().create_collection("application_commands").await.ok();
+        db.db().create_collection("interactions").await.ok();
+
+        db.db()
+            .run_command(doc! {
+                "createIndexes": "application_commands",
+                "indexes": [
+                    // Uniqueness backstop for the (bot, scope, name) triple —
+                    // global commands store `server` as missing/null, which
+                    // the index treats as a value, so global names are unique
+                    // per bot too.
+                    {
+                        "key": {
+                            "bot_id": 1_i32,
+                            "server": 1_i32,
+                            "name": 1_i32
+                        },
+                        "name": "bot_scope_name",
+                        "unique": true
+                    },
+                    // Serves the per-channel command picker (server-scoped
+                    // OR global commands).
+                    {
+                        "key": {
+                            "server": 1_i32
+                        },
+                        "name": "server"
+                    }
+                ]
+            })
+            .await
+            .expect("Failed to create application_commands indexes.");
+
+        // `interactions` needs a bot_id index for the bot-deletion cascade;
+        // expiry cleanup deletes by _id range (ULID clock) so the primary
+        // index covers it.
+        db.db()
+            .run_command(doc! {
+                "createIndexes": "interactions",
+                "indexes": [
+                    {
+                        "key": {
+                            "bot_id": 1_i32
+                        },
+                        "name": "bot_id"
+                    }
+                ]
+            })
+            .await
+            .expect("Failed to create interactions indexes.");
     }
 
     // Reminder to update LATEST_REVISION when adding new migrations.

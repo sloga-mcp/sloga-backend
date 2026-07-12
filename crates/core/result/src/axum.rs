@@ -62,6 +62,10 @@ impl IntoResponse for Error {
             ErrorType::IsBot => StatusCode::BAD_REQUEST,
             ErrorType::IsNotBot => StatusCode::BAD_REQUEST,
             ErrorType::BotIsPrivate => StatusCode::FORBIDDEN,
+            ErrorType::TooManyCommands { .. } => StatusCode::BAD_REQUEST,
+            ErrorType::BotOffline => StatusCode::BAD_REQUEST,
+            ErrorType::InteractionExpired => StatusCode::GONE,
+            ErrorType::InteractionAlreadyResponded => StatusCode::CONFLICT,
 
             ErrorType::CannotReportYourself => StatusCode::BAD_REQUEST,
 

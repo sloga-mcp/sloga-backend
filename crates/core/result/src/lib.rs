@@ -133,6 +133,12 @@ pub enum ErrorType {
     IsBot,
     IsNotBot,
     BotIsPrivate,
+    TooManyCommands {
+        max: usize,
+    },
+    BotOffline,
+    InteractionExpired,
+    InteractionAlreadyResponded,
 
     // ? User safety related errors
     CannotReportYourself,

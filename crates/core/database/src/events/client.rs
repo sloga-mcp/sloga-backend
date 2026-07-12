@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use revolt_models::v0::{
     AppendMessage, Channel, ChannelSlowmode, ChannelUnread, ChannelVoiceState, E2EEMessage,
     Emoji, Event, EventRsvp, FieldsChannel, FieldsMember, FieldsMessage, FieldsRole, FieldsServer, FieldsUser,
-    FieldsWebhook, Member, MemberCompositeKey, Message, PartialChannel, PartialEmoji,
+    FieldsWebhook, Interaction, Member, MemberCompositeKey, Message, PartialChannel, PartialEmoji,
     PartialMember, PartialMessage, PartialRole, PartialServer, PartialSticker, PartialUser,
     PartialUserVoiceState, PartialWebhook, PolicyChange, RemovalIntention, Report, Server,
     Sticker, User, UserSettings, UserVoiceState, Webhook,
@@ -498,6 +498,14 @@ pub enum EventV1 {
     /// A user's RSVP to a calendar event changed. Published to the event audience.
     CalendarEventRsvp {
         rsvp: EventRsvp,
+    },
+
+    /// A slash command was invoked (later slices: component clicked). The
+    /// payload carries the single-use response token, so this event is
+    /// published ONLY on the target bot user's private topic — never on a
+    /// channel or server topic.
+    InteractionCreate {
+        interaction: Interaction,
     },
 }
 

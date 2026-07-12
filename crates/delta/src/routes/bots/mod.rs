@@ -1,6 +1,7 @@
 use revolt_rocket_okapi::revolt_okapi::openapi3::OpenApi;
 use rocket::Route;
 
+mod commands;
 mod create;
 mod delete;
 mod edit;
@@ -18,5 +19,9 @@ pub fn routes() -> (Vec<Route>, OpenApi) {
         fetch_owned::fetch_owned_bots,
         edit::edit_bot,
         delete::delete_bot,
+        commands::create_command,
+        commands::fetch_commands,
+        commands::edit_command,
+        commands::delete_command,
     ]
 }

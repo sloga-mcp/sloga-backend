@@ -690,6 +690,7 @@ impl crate::Message {
             flags: self.flags.unwrap_or_default(),
             pinned: self.pinned,
             thread_id: self.thread_id,
+            command_context: self.command_context.map(Into::into),
             sticker_ids: self.sticker_ids,
         }
     }
@@ -721,6 +722,7 @@ impl From<crate::PartialMessage> for PartialMessage {
             flags: value.flags,
             pinned: value.pinned,
             thread_id: value.thread_id,
+            command_context: value.command_context.map(Into::into),
             sticker_ids: value.sticker_ids,
         }
     }

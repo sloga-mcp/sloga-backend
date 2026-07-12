@@ -1,4 +1,5 @@
 mod admin_migrations;
+mod application_commands;
 mod bots;
 mod calendar_events;
 mod channel_invites;
@@ -9,6 +10,7 @@ mod e2ee;
 mod emojis;
 mod file_hashes;
 mod files;
+mod interactions;
 mod messages;
 mod mls;
 mod stickers;
@@ -28,6 +30,7 @@ mod sessions;
 mod mfa_tickets;
 
 pub use admin_migrations::*;
+pub use application_commands::*;
 pub use bots::*;
 pub use calendar_events::*;
 pub use channel_invites::*;
@@ -38,6 +41,7 @@ pub use e2ee::*;
 pub use emojis::*;
 pub use file_hashes::*;
 pub use files::*;
+pub use interactions::*;
 pub use messages::*;
 pub use mls::*;
 pub use stickers::*;
@@ -65,6 +69,7 @@ pub trait AbstractDatabase:
     Sync
     + Send
     + admin_migrations::AbstractMigrations
+    + application_commands::AbstractApplicationCommands
     + bots::AbstractBots
     + calendar_events::AbstractCalendarEvents
     + channels::AbstractChannels
@@ -78,6 +83,7 @@ pub trait AbstractDatabase:
     + files::AbstractAttachments
     + stickers::AbstractStickers
     + thread_members::AbstractThreadMembers
+    + interactions::AbstractInteractions
     + messages::AbstractMessages
     + policy_changes::AbstractPolicyChange
     + ratelimit_events::AbstractRatelimitEvents

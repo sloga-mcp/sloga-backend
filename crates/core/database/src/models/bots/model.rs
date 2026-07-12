@@ -156,6 +156,13 @@ impl Bot {
     /// Delete this bot
     pub async fn delete(&self, db: &Database) -> Result<()> {
         db.fetch_user(&self.id).await?.mark_deleted(db).await?;
+
+        // Cascade: registered slash commands and open interactions must not
+        // outlive the bot (deleted bots would otherwise linger in command
+        // pickers forever).
+        db.delete_commands_by_bot(&self.id).await?;
+        db.delete_interactions_by_bot(&self.id).await?;
+
         db.delete_bot(&self.id).await
     }
 }
@@ -213,10 +220,42 @@ mod tests {
             assert_eq!(fetched_bot1, fetched_bots[0]);
             assert_eq!(1, db.get_number_of_bots_by_user(&owner.id).await.unwrap());
 
+            // Bot deletion cascades registered commands and open interactions
+            db.insert_command(&crate::ApplicationCommand {
+                id: "01CMD0000000000000000000000".to_string(),
+                bot_id: bot.id.clone(),
+                server: None,
+                name: "ping".to_string(),
+                description: "Ping".to_string(),
+                options: vec![],
+            })
+            .await
+            .unwrap();
+            db.insert_interaction(&crate::Interaction {
+                id: "01INT0000000000000000000000".to_string(),
+                kind: crate::InteractionKind::Command,
+                token: "token".to_string(),
+                bot_id: bot.id.clone(),
+                user_id: owner.id.clone(),
+                channel_id: "01CHAN000000000000000000000".to_string(),
+                message_id: None,
+                command_id: None,
+                command_name: None,
+                options: Default::default(),
+                responded: false,
+            })
+            .await
+            .unwrap();
+
             bot.delete(&db).await.unwrap();
             assert!(db.fetch_bot(&bot.id).await.is_err());
             assert_eq!(0, db.get_number_of_bots_by_user(&owner.id).await.unwrap());
-            assert_eq!(db.fetch_user(&bot.id).await.unwrap().flags, Some(2))
+            assert_eq!(db.fetch_user(&bot.id).await.unwrap().flags, Some(2));
+            assert!(db.fetch_commands_by_bot(&bot.id).await.unwrap().is_empty());
+            assert!(db
+                .fetch_interaction("01INT0000000000000000000000")
+                .await
+                .is_err());
         });
     }
 }

@@ -259,6 +259,15 @@ impl MongoDb {
         })
         .await?;
 
+        // Delete server-scoped slash commands (global commands untouched;
+        // a deleted server must not linger in bots' command lists forever).
+        self.col::<Document>("application_commands")
+            .delete_many(doc! {
+                "server": &server_id
+            })
+            .await
+            .map_err(|_| create_database_error!("delete_many", "application_commands"))?;
+
         Ok(())
     }
 }

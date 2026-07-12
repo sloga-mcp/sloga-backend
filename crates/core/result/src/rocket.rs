@@ -65,6 +65,10 @@ impl<'r> Responder<'r, 'static> for Error {
             ErrorType::IsBot => Status::BadRequest,
             ErrorType::IsNotBot => Status::BadRequest,
             ErrorType::BotIsPrivate => Status::Forbidden,
+            ErrorType::TooManyCommands { .. } => Status::BadRequest,
+            ErrorType::BotOffline => Status::BadRequest,
+            ErrorType::InteractionExpired => Status::Gone,
+            ErrorType::InteractionAlreadyResponded => Status::Conflict,
 
             ErrorType::CannotReportYourself => Status::BadRequest,
 

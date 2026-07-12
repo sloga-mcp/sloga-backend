@@ -6,6 +6,7 @@ pub mod prune_dangling_files;
 pub mod prune_large_attachments;
 pub mod prune_e2ee_blobs;
 pub mod prune_e2ee_envelopes;
+pub mod prune_interactions;
 pub mod prune_members;
 pub mod prune_mfa_tickets;
 pub mod prune_mls_groups;

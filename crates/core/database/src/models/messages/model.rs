@@ -18,7 +18,7 @@ use crate::{
         bulk_permissions::BulkDatabasePermissionQuery, idempotency::IdempotencyKey,
         permissions::DatabasePermissionQuery,
     },
-    Channel, Database, Emoji, File, User, AMQP,
+    Channel, Database, Emoji, File, MessageInteraction, User, AMQP,
 };
 
 #[cfg(feature = "tasks")]
@@ -82,6 +82,15 @@ auto_derived_partial!(
         /// This is server-set only and never accepted from clients.
         #[serde(skip_serializing_if = "Option::is_none")]
         pub thread_id: Option<String>,
+
+        /// Interaction context when this message is a bot's response to a
+        /// slash command ("used /cmd").
+        ///
+        /// Server-set only (by the interaction respond route); the regular
+        /// send path never accepts it. NOT the `interactions`
+        /// (reaction-guidance) field above.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub command_context: Option<MessageInteraction>,
 
         /// Sticker IDs attached to this message
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -275,6 +284,7 @@ impl Default for Message {
             flags: None,
             pinned: None,
             thread_id: None,
+            command_context: None,
             sticker_ids: None,
         }
     }

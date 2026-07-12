@@ -72,6 +72,10 @@ impl AbstractServers for ReferenceDb {
     }
 
     /// Delete a server by its id
+    ///
+    /// Unlike the MongoDb driver, this deliberately cascades NOTHING (no
+    /// channels, members, bans — and likewise no server-scoped
+    /// application_commands): the reference mock only models the row itself.
     async fn delete_server(&self, id: &str) -> Result<()> {
         let mut servers = self.servers.lock().await;
         if servers.remove(id).is_some() {

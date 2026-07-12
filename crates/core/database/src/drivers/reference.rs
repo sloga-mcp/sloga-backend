@@ -3,19 +3,22 @@ use std::{collections::HashMap, sync::Arc};
 use futures::lock::Mutex;
 
 use crate::{
-    Bot, CalendarEvent, Channel, ChannelCompositeKey, ChannelUnread, E2EEBackup, E2EEBlob,
-    E2EEEnvelope, E2EEIdentity, E2EEOneTimeKey, Emoji, EventRsvp, EventRsvpKey, File, FileHash,
-    Invite, Member, MemberCompositeKey, Message, MlsCommit, MlsGroup, MlsJoinIntent,
-    MlsKeyPackage, PolicyChange, RatelimitEvent, ReminderSent, ReminderSentKey, Report, Server,
-    ServerBan, Snapshot, Sticker, ThreadMember, ThreadMemberCompositeKey, User, UserSettings,
-    Webhook, Account, AccountInvite, Session, MFATicket
+    ApplicationCommand, Bot, CalendarEvent, Channel, ChannelCompositeKey, ChannelUnread,
+    E2EEBackup, E2EEBlob, E2EEEnvelope, E2EEIdentity, E2EEOneTimeKey, Emoji, EventRsvp,
+    EventRsvpKey, File, FileHash, Interaction, Invite, Member, MemberCompositeKey, Message,
+    MlsCommit, MlsGroup, MlsJoinIntent, MlsKeyPackage, PolicyChange, RatelimitEvent, ReminderSent,
+    ReminderSentKey, Report, Server, ServerBan, Snapshot, Sticker, ThreadMember,
+    ThreadMemberCompositeKey, User, UserSettings, Webhook, Account, AccountInvite, Session,
+    MFATicket
 };
 
 database_derived!(
     /// Reference implementation
     #[derive(Default, Debug)]
     pub struct ReferenceDb {
+        pub application_commands: Arc<Mutex<HashMap<String, ApplicationCommand>>>,
         pub bots: Arc<Mutex<HashMap<String, Bot>>>,
+        pub interactions: Arc<Mutex<HashMap<String, Interaction>>>,
         pub calendar_events: Arc<Mutex<HashMap<String, CalendarEvent>>>,
         pub event_rsvps: Arc<Mutex<HashMap<EventRsvpKey, EventRsvp>>>,
         pub event_reminders: Arc<Mutex<HashMap<ReminderSentKey, ReminderSent>>>,
