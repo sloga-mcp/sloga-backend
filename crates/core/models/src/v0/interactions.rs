@@ -202,6 +202,12 @@ auto_derived!(
         /// message (Component interactions only)
         #[serde(skip_serializing_if = "crate::if_false", default)]
         pub edit: bool,
+        /// Deliver the response only to the invoking user. Ephemeral
+        /// responses are never persisted (gone on reload) and are published
+        /// solely on the invoker's private topic. Incompatible with `edit`
+        /// and with `components`.
+        #[serde(skip_serializing_if = "crate::if_false", default)]
+        pub ephemeral: bool,
     }
 
     /// Interact with a component on a message

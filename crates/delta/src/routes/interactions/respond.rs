@@ -1,6 +1,7 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use iso8601_timestamp::Timestamp;
+use revolt_database::events::client::EventV1;
 use revolt_database::util::permissions::DatabasePermissionQuery;
 use revolt_database::util::reference::Reference;
 use revolt_database::{
@@ -80,6 +81,14 @@ pub async fn interaction_respond(
         && (!matches!(interaction.kind, InteractionKind::Component)
             || interaction.message_id.is_none())
     {
+        return Err(create_error!(InvalidOperation));
+    }
+
+    // Ephemeral responses are delivery-only: editing a persisted message
+    // "ephemerally" is a contradiction, and components on a never-persisted
+    // message would be dead buttons (the interact route resolves custom_ids
+    // against stored messages).
+    if data.ephemeral && (data.edit || data.components.is_some()) {
         return Err(create_error!(InvalidOperation));
     }
 
@@ -226,6 +235,22 @@ pub async fn interaction_respond(
     message.content = data.content;
     message.components = data.components;
 
+    if data.ephemeral {
+        // Delivery-only: skip persistence, the channel topic, AMQP push,
+        // unread/mention processing, and last_message_id — the response
+        // exists solely as this one event on the invoker's private topic.
+        // The slot claim above still applies: one response per interaction
+        // regardless of visibility.
+        let model = message.into_model(Some(model_user), model_member);
+        EventV1::InteractionEphemeralMessage {
+            message: model.clone(),
+        }
+        .private(interaction.user_id.clone())
+        .await;
+
+        return Ok(Json(model));
+    }
+
     message
         .send(
             db,
@@ -244,6 +269,7 @@ pub async fn interaction_respond(
 #[cfg(test)]
 mod test {
     use crate::{rocket, util::test::TestHarness};
+    use revolt_database::events::client::EventV1;
     use revolt_database::{
         Bot, Interaction, InteractionKind, Member, Message, MessageFlagsValue, Server, User,
     };
@@ -839,6 +865,311 @@ mod test {
             untouched.content.as_deref(),
             Some("pick something"),
             "the message must be untouched after the rejected edit"
+        );
+    }
+
+    #[rocket::async_test]
+    async fn ephemeral_respond_is_delivery_only() {
+        let harness = TestHarness::new().await;
+        let (_, _session, user) = harness.new_user().await;
+        let (server, _) = harness.new_server(&user).await;
+        let channel = harness.new_channel(&server).await;
+        let (bot, _) = setup_bot(&harness, &user, &server).await;
+
+        let interaction = interaction_row(
+            ulid::Ulid::new().to_string(),
+            "tok-eph",
+            &bot.id,
+            &user.id,
+            channel.id(),
+        );
+        harness
+            .db
+            .insert_interaction(&interaction)
+            .await
+            .expect("interaction");
+
+        // Rejected combo first — validation precedes the slot claim, so the
+        // interaction must remain answerable afterwards.
+        let response = harness
+            .client
+            .post(format!("/interactions/{}/respond", interaction.id))
+            .header(Header::new("x-bot-token", bot.token.clone()))
+            .header(ContentType::JSON)
+            .body(
+                json!({
+                    "token": "tok-eph",
+                    "content": "secret",
+                    "ephemeral": true,
+                    "components": [
+                        { "components": [
+                            { "type": "Button", "custom_id": "x", "label": "X", "style": "Primary" }
+                        ] }
+                    ]
+                })
+                .to_string(),
+            )
+            .dispatch()
+            .await;
+        assert_ne!(
+            response.status(),
+            Status::Ok,
+            "ephemeral+components must be rejected (dead buttons)"
+        );
+
+        // Plain ephemeral succeeds, carrying the unforgeable context.
+        let response = harness
+            .client
+            .post(format!("/interactions/{}/respond", interaction.id))
+            .header(Header::new("x-bot-token", bot.token.clone()))
+            .header(ContentType::JSON)
+            .body(
+                json!({ "token": "tok-eph", "content": "only you", "ephemeral": true })
+                    .to_string(),
+            )
+            .dispatch()
+            .await;
+        assert_eq!(response.status(), Status::Ok);
+        let message: v0::Message = response.into_json().await.expect("`Message`");
+        assert_eq!(message.author, bot.id);
+        assert!(
+            MessageFlagsValue(message.flags).has(MessageFlags::Interaction),
+            "ephemeral command responses still carry the Interaction flag"
+        );
+        assert_eq!(
+            message.command_context.expect("context").id,
+            interaction.id
+        );
+
+        // Never persisted.
+        assert!(
+            harness.db.fetch_message(&message.id).await.is_err(),
+            "ephemeral responses must not be persisted"
+        );
+
+        // The single-use slot burns regardless of visibility: no visible
+        // follow-up can ride the same interaction.
+        let response = harness
+            .client
+            .post(format!("/interactions/{}/respond", interaction.id))
+            .header(Header::new("x-bot-token", bot.token.clone()))
+            .header(ContentType::JSON)
+            .body(json!({ "token": "tok-eph", "content": "now visible" }).to_string())
+            .dispatch()
+            .await;
+        assert_eq!(response.status(), Status::Conflict);
+    }
+
+    #[rocket::async_test]
+    async fn ephemeral_component_respond_replies_without_flag() {
+        let harness = TestHarness::new().await;
+        let (_, _session, user) = harness.new_user().await;
+        let (server, _) = harness.new_server(&user).await;
+        let channel = harness.new_channel(&server).await;
+        let (bot, _) = setup_bot(&harness, &user, &server).await;
+
+        let message = component_message(channel.id(), &bot.id);
+        harness.db.insert_message(&message).await.expect("message");
+
+        let interaction = component_interaction_row(
+            "tok-eph-comp",
+            &bot.id,
+            &user.id,
+            channel.id(),
+            &message.id,
+        );
+        harness
+            .db
+            .insert_interaction(&interaction)
+            .await
+            .expect("interaction");
+
+        // Ephemeral edits are a contradiction — rejected before the slot
+        // claim even for Component interactions where edit is otherwise
+        // valid.
+        let response = harness
+            .client
+            .post(format!("/interactions/{}/respond", interaction.id))
+            .header(Header::new("x-bot-token", bot.token.clone()))
+            .header(ContentType::JSON)
+            .body(
+                json!({
+                    "token": "tok-eph-comp",
+                    "content": "sneaky",
+                    "edit": true,
+                    "ephemeral": true
+                })
+                .to_string(),
+            )
+            .dispatch()
+            .await;
+        assert_ne!(
+            response.status(),
+            Status::Ok,
+            "ephemeral+edit must be rejected"
+        );
+
+        // A plain ephemeral component response replies to the host message
+        // with no Interaction flag ("used /cmd" stays command-only).
+        let response = harness
+            .client
+            .post(format!("/interactions/{}/respond", interaction.id))
+            .header(Header::new("x-bot-token", bot.token.clone()))
+            .header(ContentType::JSON)
+            .body(
+                json!({ "token": "tok-eph-comp", "content": "just for you", "ephemeral": true })
+                    .to_string(),
+            )
+            .dispatch()
+            .await;
+        assert_eq!(response.status(), Status::Ok);
+        let reply: v0::Message = response.into_json().await.expect("`Message`");
+        assert_eq!(reply.replies, Some(vec![message.id.clone()]));
+        assert!(!MessageFlagsValue(reply.flags).has(MessageFlags::Interaction));
+        assert!(reply.command_context.is_none());
+        assert!(
+            harness.db.fetch_message(&reply.id).await.is_err(),
+            "ephemeral component responses must not be persisted"
+        );
+    }
+
+    #[rocket::async_test]
+    async fn ephemeral_respond_delivers_only_to_invoker_private_topic() {
+        let mut harness = TestHarness::new().await;
+        let (_, session, user) = harness.new_user().await;
+        let (server, _) = harness.new_server(&user).await;
+        let channel = harness.new_channel(&server).await;
+        let (bot, _) = setup_bot(&harness, &user, &server).await;
+
+        let interaction = interaction_row(
+            ulid::Ulid::new().to_string(),
+            "tok-topic",
+            &bot.id,
+            &user.id,
+            channel.id(),
+        );
+        harness
+            .db
+            .insert_interaction(&interaction)
+            .await
+            .expect("interaction");
+
+        let response = harness
+            .client
+            .post(format!("/interactions/{}/respond", interaction.id))
+            .header(Header::new("x-bot-token", bot.token.clone()))
+            .header(ContentType::JSON)
+            .body(
+                json!({ "token": "tok-topic", "content": "only you", "ephemeral": true })
+                    .to_string(),
+            )
+            .dispatch()
+            .await;
+        assert_eq!(response.status(), Status::Ok);
+        let ephemeral: v0::Message = response.into_json().await.expect("`Message`");
+
+        // Marker published to the channel topic AFTER the respond: pub/sub
+        // is FIFO per subscription, so once the marker is observed, every
+        // event the respond route published — the private-topic delivery
+        // and any channel-topic leak — is already in the event buffer.
+        let response = harness
+            .client
+            .post(format!("/channels/{}/messages", channel.id()))
+            .header(Header::new("x-session-token", session.token.to_string()))
+            .header(ContentType::JSON)
+            .body(json!({ "content": "marker" }).to_string())
+            .dispatch()
+            .await;
+        assert_eq!(response.status(), Status::Ok);
+        drop(response);
+
+        // Single live stream session (parallel-suite noise can be heavy;
+        // the wildcard psubscribe sees every test's events).
+        harness
+            .wait_for_event(channel.id(), |event| match event {
+                EventV1::Message(message) => message.content.as_deref() == Some("marker"),
+                _ => false,
+            })
+            .await;
+
+        // The one delivery this slice exists to guarantee: the event lands
+        // on the INVOKER's private topic ("{user_id}!"). Served from the
+        // buffer filled while waiting for the marker above.
+        let event = harness
+            .wait_for_event(&format!("{}!", user.id), |event| match event {
+                EventV1::InteractionEphemeralMessage { message } => message.id == ephemeral.id,
+                _ => false,
+            })
+            .await;
+        match event {
+            EventV1::InteractionEphemeralMessage { message } => {
+                assert_eq!(message.author, bot.id);
+                assert_eq!(message.channel, channel.id());
+            }
+            _ => unreachable!(),
+        }
+
+        // Nothing about the ephemeral response reached the channel topic.
+        harness.assert_no_buffered_event(channel.id(), |event| match event {
+            EventV1::InteractionEphemeralMessage { message } => message.id == ephemeral.id,
+            EventV1::Message(message) => message.id == ephemeral.id,
+            _ => false,
+        });
+    }
+
+    #[rocket::async_test]
+    async fn ephemeral_respond_rechecks_bot_standing_at_response_time() {
+        let harness = TestHarness::new().await;
+        let (_, _session, user) = harness.new_user().await;
+        let (server, _) = harness.new_server(&user).await;
+        let channel = harness.new_channel(&server).await;
+        let (bot, bot_user) = setup_bot(&harness, &user, &server).await;
+
+        let interaction = interaction_row(
+            ulid::Ulid::new().to_string(),
+            "tok-eph-kick",
+            &bot.id,
+            &user.id,
+            channel.id(),
+        );
+        harness
+            .db
+            .insert_interaction(&interaction)
+            .await
+            .expect("interaction");
+
+        let member = harness
+            .db
+            .fetch_member(&server.id, &bot_user.id)
+            .await
+            .expect("member");
+        member
+            .remove(
+                &harness.db,
+                &server,
+                revolt_database::RemovalIntention::Kick,
+                false,
+            )
+            .await
+            .expect("kick bot");
+
+        // The standing re-check applies to ephemeral delivery too — a
+        // kicked bot must not reach the invoker's private topic either.
+        let response = harness
+            .client
+            .post(format!("/interactions/{}/respond", interaction.id))
+            .header(Header::new("x-bot-token", bot.token.clone()))
+            .header(ContentType::JSON)
+            .body(
+                json!({ "token": "tok-eph-kick", "content": "psst", "ephemeral": true })
+                    .to_string(),
+            )
+            .dispatch()
+            .await;
+        assert_ne!(
+            response.status(),
+            Status::Ok,
+            "a kicked bot must not deliver ephemeral responses"
         );
     }
 }

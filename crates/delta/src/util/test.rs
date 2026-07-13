@@ -244,6 +244,25 @@ impl TestHarness {
         unreachable!()
     }
 
+    /// Assert that no already-buffered event on `topic` matches the
+    /// predicate. Only events pulled off the wire by earlier
+    /// `wait_for_event` calls are visible here — to prove a NEGATIVE
+    /// ("nothing leaked to this topic"), publish a later marker event and
+    /// `wait_for_event` on it first: redis pub/sub is FIFO per
+    /// subscription, so anything published before the marker is guaranteed
+    /// to be in the buffer by the time the marker is observed.
+    pub fn assert_no_buffered_event<F>(&self, topic: &str, predicate: F)
+    where
+        F: Fn(&EventV1) -> bool,
+    {
+        for (msg_topic, event) in &self.event_buffer {
+            assert!(
+                !(topic == msg_topic && predicate(event)),
+                "unexpected event on '{topic}': {event:?}"
+            );
+        }
+    }
+
     pub async fn assert_email(&self, mailbox: &str) -> (Mail, String) {
         // Wait a moment for maildev to catch the email
 

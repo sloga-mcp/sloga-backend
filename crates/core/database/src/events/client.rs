@@ -507,6 +507,14 @@ pub enum EventV1 {
     InteractionCreate {
         interaction: Interaction,
     },
+
+    /// An ephemeral interaction response — a bot message that is NEVER
+    /// persisted. Published ONLY on the invoking user's private topic; it
+    /// must never reach the channel topic, the database, push
+    /// notifications, or unread tracking. Gone on reload by design.
+    InteractionEphemeralMessage {
+        message: Message,
+    },
 }
 
 impl EventV1 {
