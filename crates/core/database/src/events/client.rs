@@ -548,8 +548,13 @@ impl EventV1 {
         #[cfg(debug_assertions)]
         info!("Publishing event to {channel}: {self:?}");
 
+        // Non-panicking like the release path above: a transient Redis
+        // hiccup (parallel test runs hit this intermittently) must not
+        // take down the caller — the event is simply lost, as in release.
         #[cfg(debug_assertions)]
-        redis_kiss::publish(channel, self).await.unwrap();
+        if let Err(err) = redis_kiss::publish(channel, self).await {
+            error!("Failed to publish event: {err:?}");
+        }
     }
 
     /// Publish user event
