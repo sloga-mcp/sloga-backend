@@ -20,6 +20,7 @@ pub mod metadata;
 pub mod mime_type;
 mod ratelimits;
 mod utils;
+pub mod video;
 
 #[derive(FromRef, Clone)]
 struct AppState {

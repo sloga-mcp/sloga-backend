@@ -1,13 +1,12 @@
-use std::io::{Cursor, Read};
+use std::io::Cursor;
 
 use crate::utils::apply_icc_profile;
 use exif::Reader;
 use image::{ImageEncoder, ImageReader};
 use revolt_config::report_internal_error;
 use revolt_database::Metadata;
-use revolt_result::{create_error, Result};
+use revolt_result::Result;
 use tempfile::NamedTempFile;
-use tokio::process::Command;
 
 macro_rules! encode_with_icc {
     ($encoder:expr, $icc:expr, $image:expr, $width:expr, $height:expr, $color:expr) => {{
@@ -19,13 +18,16 @@ macro_rules! encode_with_icc {
     }};
 }
 
-/// Strip EXIF data from given file and produce new file and metadata
+/// Strip EXIF data from given file and produce new file, metadata and mime type
+///
+/// Videos are additionally remuxed or transcoded into a web-playable format,
+/// which may change the mime type (see [`crate::video::process_video`]).
 pub async fn strip_metadata(
     file: NamedTempFile,
     buf: Vec<u8>,
     metadata: Metadata,
     mime: &str,
-) -> Result<(Vec<u8>, Metadata)> {
+) -> Result<(Vec<u8>, Metadata, String)> {
     match &metadata {
         Metadata::Image {
             width: _,
@@ -148,71 +150,17 @@ pub async fn strip_metadata(
                         thumbhash: thumbhash.clone(),
                         animated: *animated,
                     },
+                    mime.to_owned(),
                 ))
             }
             // JXLs store EXIF data but we don't have the ability to write them
-            "image/jxl" => Ok((buf, metadata)),
+            "image/jxl" => Ok((buf, metadata, mime.to_owned())),
             // All other images that cannot store EXIF data
-            _ => Ok((buf, metadata)),
+            _ => Ok((buf, metadata, mime.to_owned())),
         },
-        // Use ffmpeg to copy video stream and probe new metadata
-        Metadata::Video { .. } => match mime {
-            // Strip EXIF data by copying video stream
-            "video/mp4" | "video/webm" | "video/quicktime" => {
-                // Pick the correct file format for ffmpeg
-                let ext = match mime {
-                    "video/mp4" => "mp4",
-                    "video/webm" => "webm",
-                    "video/quicktime" => "mov",
-                    _ => unreachable!(),
-                };
-
-                // Temporary output file
-                let mut out_file = report_internal_error!(NamedTempFile::new())?;
-
-                // Process the file with ffmpeg
-                report_internal_error!(
-                    Command::new("ffmpeg")
-                        .args([
-                            // Overwrite the temporary file
-                            "-y",
-                            // Read original uploaded file
-                            "-i",
-                            file.path().to_str().ok_or(create_error!(InternalError))?,
-                            // Strip any metadata
-                            "-map_metadata",
-                            "-1",
-                            // Copy video / audio data to new file
-                            "-c:v",
-                            "copy",
-                            "-c:a",
-                            "copy",
-                            // Select correct file format
-                            "-f",
-                            ext,
-                            // Save to new temporary file
-                            out_file
-                                .path()
-                                .to_str()
-                                .ok_or(create_error!(InternalError))?,
-                        ])
-                        .output()
-                        .await
-                )?;
-
-                // Probe the file again
-                let metadata = crate::metadata::generate_metadata(&out_file, mime);
-
-                // Read the file from disk
-                let mut buf = Vec::<u8>::new();
-                report_internal_error!(out_file.read_to_end(&mut buf))?;
-
-                Ok((buf, metadata))
-            }
-            // Assume all other video formats cannot store EXIF data
-            _ => Ok((buf, metadata)),
-        },
+        // Remux or transcode into a web-playable format, stripping metadata in the process
+        Metadata::Video { .. } => crate::video::process_video(&file, buf, metadata, mime).await,
         // all other file types don't store EXIF data
-        _ => Ok((buf, metadata)),
+        _ => Ok((buf, metadata, mime.to_owned())),
     }
 }

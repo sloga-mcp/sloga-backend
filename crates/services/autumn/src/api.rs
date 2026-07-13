@@ -262,7 +262,16 @@ async fn upload_file(
         .fetch_attachment_hash(&format!("{original_hash:02x}"))
         .await
     {
-        if !file_hash.iv.is_empty() {
+        // Video hashes recorded before web transcoding existed (or while ffprobe
+        // was unavailable) carry a stale `File` classification; reprocess the
+        // upload and replace the record instead of inheriting it
+        let stale_video = matches!(file_hash.metadata, Metadata::File)
+            && file_hash.content_type.starts_with("video/");
+
+        if !file_hash.iv.is_empty() && !stale_video {
+            // The stored file may have been transcoded into a different container
+            let filename = filename_for_mime(filename, mime_type, &file_hash.content_type);
+
             let tag: &'static str = tag.into();
             db.insert_attachment(&file_hash.into_file(
                 id.clone(),
@@ -275,18 +284,27 @@ async fn upload_file(
             return Ok(Json(UploadResponse { id }));
         }
 
-        true
+        if stale_video {
+            db.delete_attachment_hash(&file_hash.id).await?;
+            false
+        } else {
+            true
+        }
     } else {
         false
     };
 
-    // Strip metadata
-    let (buf, metadata) = strip_metadata(file.contents, buf, metadata, mime_type).await?;
+    // Strip metadata; videos may also be remuxed/transcoded for inline playback,
+    // changing their mime type and container
+    let (buf, metadata, new_mime_type) =
+        strip_metadata(file.contents, buf, metadata, mime_type).await?;
+    let filename = filename_for_mime(filename, mime_type, &new_mime_type);
+    let mime_type = new_mime_type;
 
     // Virus scan files if ClamAV is configured
     if matches!(metadata, Metadata::File)
         && (config.files.scan_mime_types.is_empty()
-            || config.files.scan_mime_types.iter().any(|v| v == mime_type))
+            || config.files.scan_mime_types.iter().any(|v| v == &mime_type))
         && crate::clamav::is_malware(&buf).await?
     {
         return Err(create_error!(InternalError));
@@ -316,7 +334,7 @@ async fn upload_file(
         iv: String::new(), // indicates file is not uploaded yet
 
         metadata,
-        content_type: mime_type.to_owned(),
+        content_type: mime_type,
         size: new_file_size as isize,
     };
 
@@ -340,6 +358,56 @@ async fn upload_file(
         .await?;
 
     Ok(Json(UploadResponse { id }))
+}
+
+/// Rewrite a filename's extension when processing moved the file into a
+/// different container (e.g. `clip.mkv` transcoded to mp4 becomes `clip.mp4`)
+fn filename_for_mime(filename: String, old_mime: &str, new_mime: &str) -> String {
+    if old_mime == new_mime {
+        return filename;
+    }
+
+    let ext = match new_mime {
+        "video/mp4" => "mp4",
+        "video/webm" => "webm",
+        _ => return filename,
+    };
+
+    match filename.rsplit_once('.') {
+        Some((stem, _)) if !stem.is_empty() => format!("{stem}.{ext}"),
+        _ => format!("{filename}.{ext}"),
+    }
+}
+
+#[cfg(test)]
+mod upload_tests {
+    use super::filename_for_mime;
+
+    #[test]
+    fn filename_follows_container_change() {
+        assert_eq!(
+            filename_for_mime("clip.mkv".into(), "video/x-matroska", "video/mp4"),
+            "clip.mp4"
+        );
+        assert_eq!(
+            filename_for_mime("archive.tar.mkv".into(), "video/x-matroska", "video/mp4"),
+            "archive.tar.mp4"
+        );
+        assert_eq!(
+            filename_for_mime("noext".into(), "video/x-msvideo", "video/mp4"),
+            "noext.mp4"
+        );
+        // Unchanged mime keeps the name untouched
+        assert_eq!(
+            filename_for_mime("clip.mp4".into(), "video/mp4", "video/mp4"),
+            "clip.mp4"
+        );
+        // Non-video rewrites are ignored
+        assert_eq!(
+            filename_for_mime("photo.jpeg".into(), "image/jpeg", "image/jpeg"),
+            "photo.jpeg"
+        );
+    }
 }
 
 /// Header value used for cache control
