@@ -87,14 +87,18 @@ pub async fn call(
     // above (which is gated by require_media_e2ee_enabled), so a non-E2EE /
     // downgraded client that omits device_id cannot bypass the cap. NO
     // ManageChannel exemption (unlike max_users): the cap is a hard media
-    // ceiling, not a per-channel policy knob. Self-reconnect (force_disconnect)
-    // is exempt — it removes prior state first and never grows the roster.
-    if force_disconnect != Some(true) {
+    // ceiling, not a per-channel policy knob. Only an ACTUAL same-channel
+    // reconnect is exempt — the user already holds voice state HERE (the
+    // members set is written by voice-ingress, never the client), so
+    // rejoining never grows the roster. The exemption must NOT key on
+    // `force_disconnect`: the client always sends it, so trusting the flag
+    // voids the cap on every real join (6.6 live-proof blocker).
+    {
         let members = get_voice_channel_members(&user_voice_channel)
             .await?
-            .map(|m| m.len())
-            .unwrap_or(0);
-        if members >= MAX_VIDEO_PARTICIPANTS
+            .unwrap_or_default();
+        if !members.iter().any(|member| member == &user.id)
+            && members.len() >= MAX_VIDEO_PARTICIPANTS
             && count_video_participants(&user_voice_channel).await? > 0
         {
             return Err(create_error!(VideoCallFull {
@@ -109,16 +113,16 @@ pub async fn call(
     // token, sits as a non-enrolled ghost, and trips every member's loud
     // downgrade banner. Only fires when an open MLS group exists (non-E2EE
     // calls untouched); existing members (by user_id, any device = rejoin) are
-    // exempt so a legitimate rejoin at the ceiling still works.
-    if force_disconnect != Some(true) {
-        if let Some(group) = db.fetch_open_mls_group_for_channel(channel.id()).await? {
-            if group.members.len() >= MAX_MLS_GROUP_MEMBERS
-                && !group.members.iter().any(|m| m.user_id == user.id)
-            {
-                return Err(create_error!(MlsCallFull {
-                    max: MAX_MLS_GROUP_MEMBERS
-                }));
-            }
+    // exempt so a legitimate rejoin at the ceiling still works. That inner
+    // member check is the ONLY reconnect exemption — never `force_disconnect`,
+    // which the client always sends (6.6 live-proof blocker).
+    if let Some(group) = db.fetch_open_mls_group_for_channel(channel.id()).await? {
+        if group.members.len() >= MAX_MLS_GROUP_MEMBERS
+            && !group.members.iter().any(|m| m.user_id == user.id)
+        {
+            return Err(create_error!(MlsCallFull {
+                max: MAX_MLS_GROUP_MEMBERS
+            }));
         }
     }
 
@@ -185,4 +189,213 @@ pub async fn call(
         token,
         url: node_host.clone(),
     }))
+}
+
+// NB: these tests share the process-global redis_kiss connection, so (like
+// the routes::mls suite) they are only reliable one-per-process — nextest,
+// the repo's canonical runner, isolates them; under plain `cargo test` run
+// with `--test-threads=1`.
+#[cfg(test)]
+mod test {
+    use crate::util::test::TestHarness;
+    use iso8601_timestamp::Timestamp;
+    use revolt_database::{
+        voice::{
+            create_voice_state, delete_channel_voice_state, update_voice_state, UserVoiceChannel,
+            MAX_VIDEO_PARTICIPANTS,
+        },
+        Channel, Member, MlsGroup, MlsGroupCreateOutcome, MlsMemberDevice, User,
+        MAX_MLS_GROUP_MEMBERS,
+    };
+    use revolt_models::v0;
+    use rocket::http::{ContentType, Header, Status};
+
+    /// A server voice channel owned by `owner` with `members` added
+    async fn voice_channel(harness: &TestHarness, owner: &User, members: &[&User]) -> Channel {
+        let (server, _channels) = harness.new_server(owner).await;
+
+        let channel = Channel::create_server_channel(
+            &harness.db,
+            &mut server.clone(),
+            v0::DataCreateServerChannel {
+                channel_type: v0::LegacyServerChannelType::Text,
+                name: "Voice".to_string(),
+                description: None,
+                nsfw: Some(false),
+                voice: Some(v0::VoiceInformation {
+                    max_users: None,
+                    disabled: false,
+                }),
+            },
+            true,
+        )
+        .await
+        .expect("voice channel");
+
+        for member in members {
+            Member::create(&harness.db, &server, member, None)
+                .await
+                .expect("member");
+        }
+
+        channel
+    }
+
+    /// POST join_call with NO node: a request that passes the cap checks then
+    /// fails deterministically at node resolution (400 UnknownNode) — the
+    /// caps refuse with 409 BEFORE that point, so the two outcomes cleanly
+    /// distinguish "cap fired" from "cap exempted" without a live LiveKit.
+    async fn join_call<'a>(
+        harness: &'a TestHarness,
+        session_token: &str,
+        channel_id: &str,
+        force_disconnect: bool,
+    ) -> rocket::local::asynchronous::LocalResponse<'a> {
+        harness
+            .client
+            .post(format!("/channels/{channel_id}/join_call"))
+            .header(ContentType::JSON)
+            .header(Header::new("x-session-token", session_token.to_string()))
+            .body(
+                serde_json::to_string(&v0::DataJoinCall {
+                    node: None,
+                    force_disconnect: Some(force_disconnect),
+                    recipients: None,
+                    device_id: None,
+                })
+                .unwrap(),
+            )
+            .dispatch()
+            .await
+    }
+
+    async fn assert_refused(
+        response: rocket::local::asynchronous::LocalResponse<'_>,
+        error_type: &str,
+    ) {
+        assert_eq!(response.status(), Status::Conflict);
+        assert!(
+            response.into_string().await.unwrap().contains(error_type),
+            "the refusal must be the distinguishable {error_type} error"
+        );
+    }
+
+    async fn assert_past_caps(response: rocket::local::asynchronous::LocalResponse<'_>) {
+        assert_eq!(response.status(), Status::BadRequest);
+        assert!(
+            response.into_string().await.unwrap().contains("UnknownNode"),
+            "an exempt join must get past the caps to node resolution"
+        );
+    }
+
+    #[rocket::async_test]
+    async fn video_cap_refuses_overflow_join_despite_force_disconnect() {
+        let harness = TestHarness::new().await;
+        let (_account_a, _session_a, user_a) = harness.new_user().await;
+        let (_account_b, session_b, user_b) = harness.new_user().await;
+        let (_account_c, session_c, user_c) = harness.new_user().await;
+
+        let channel = voice_channel(&harness, &user_a, &[&user_b, &user_c]).await;
+        let voice_channel = UserVoiceChannel::from_channel(&channel);
+
+        // Roster at EXACTLY the cap: B (a real member who will reconnect)
+        // plus synthetic members, one of which has its camera on — the
+        // voice-ingress-shaped Redis state the cap check reads
+        create_voice_state(&voice_channel, &user_b.id, Timestamp::now_utc())
+            .await
+            .expect("voice state");
+        let synthetic_ids: Vec<String> = (0..MAX_VIDEO_PARTICIPANTS - 1)
+            .map(|index| format!("0SYNTHVOICEUSER{index:011}"))
+            .collect();
+        for user_id in &synthetic_ids {
+            create_voice_state(&voice_channel, user_id, Timestamp::now_utc())
+                .await
+                .expect("voice state");
+        }
+        update_voice_state(
+            &voice_channel,
+            &synthetic_ids[0],
+            &v0::PartialUserVoiceState {
+                camera: Some(true),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("camera flag");
+
+        // The real client ALWAYS sends force_disconnect:true — the flag must
+        // not void the cap (6.6 live-proof blocker)
+        let response = join_call(&harness, &session_c.token, channel.id(), true).await;
+        assert_refused(response, "VideoCallFull").await;
+
+        // ...and the non-force path stays refused
+        let response = join_call(&harness, &session_c.token, channel.id(), false).await;
+        assert_refused(response, "VideoCallFull").await;
+
+        // B already holds voice state in THIS channel: a genuine same-channel
+        // reconnect at the cap is exempt (it never grows the roster)
+        let response = join_call(&harness, &session_b.token, channel.id(), true).await;
+        assert_past_caps(response).await;
+
+        // Redis is shared and the synthetic ids are fixed strings — drop the
+        // seeded voice state so it does not accumulate across runs
+        let mut seeded = synthetic_ids;
+        seeded.push(user_b.id.clone());
+        delete_channel_voice_state(&voice_channel, &seeded)
+            .await
+            .expect("cleanup");
+    }
+
+    #[rocket::async_test]
+    async fn mls_cap_refuses_overflow_join_despite_force_disconnect() {
+        let harness = TestHarness::new().await;
+        let (_account_a, _session_a, user_a) = harness.new_user().await;
+        let (_account_b, session_b, user_b) = harness.new_user().await;
+        let (_account_c, session_c, user_c) = harness.new_user().await;
+
+        let channel = voice_channel(&harness, &user_a, &[&user_b, &user_c]).await;
+
+        // Open MLS group at EXACTLY the roster cap, seeded at the DB layer
+        // (the cap check reads the members mirror; no enrollment needed) —
+        // B is a group member, C is not
+        let mut members: Vec<MlsMemberDevice> = (0..MAX_MLS_GROUP_MEMBERS - 1)
+            .map(|index| MlsMemberDevice {
+                user_id: format!("0SYNTHETICUSER{index:012}"),
+                device_id: format!("{index:032x}"),
+            })
+            .collect();
+        members.push(MlsMemberDevice {
+            user_id: user_b.id.clone(),
+            device_id: "bb".repeat(16),
+        });
+        let outcome = harness
+            .db
+            .create_mls_group(
+                &MlsGroup {
+                    id: "11".repeat(32),
+                    channel_id: channel.id().to_string(),
+                    open: true,
+                    created_by: members[0].clone(),
+                    created_at: Timestamp::now_utc(),
+                    current_epoch: 1,
+                    members,
+                    closed_at: None,
+                    superseded_by: None,
+                },
+                None,
+            )
+            .await
+            .expect("group seed");
+        assert!(matches!(outcome, MlsGroupCreateOutcome::Created));
+
+        // A non-member at the ceiling is refused the SFU token even with
+        // force_disconnect:true (T-20 / CR-HIGH-2; 6.6 live-proof blocker)
+        let response = join_call(&harness, &session_c.token, channel.id(), true).await;
+        assert_refused(response, "MlsCallFull").await;
+
+        // An existing group member (any device) rejoining at the ceiling is
+        // exempt — blocking it would lock a crashed member out of a full call
+        let response = join_call(&harness, &session_b.token, channel.id(), true).await;
+        assert_past_caps(response).await;
+    }
 }

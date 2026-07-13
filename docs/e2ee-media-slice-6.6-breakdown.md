@@ -716,6 +716,54 @@ live-proof session. **These live legs remain the binding precondition for any `m
 flip (§9).** All DETERMINISTIC verification (unit / REFERENCE / native / node / scrub) is complete and
 green above.
 
+## 7c. Live-proof session RESULTS (2026-07-12) — legs RUN
+
+Dedicated interactive live-proof session executed per
+[the runbook](e2ee-media-slice-6.6-live-proof-runbook.md). Environment: flag ON staging (overrides,
+reverted at teardown); delta/bonfire/voice-ingress rebuilt off committed source + relaunched detached;
+desktop debug bundle rebuilt with an INERT `VITE_E2EE_MEDIA_TEST` probe shim (`__voice`/`__mlsProbe`;
+read-only; reverted at teardown; does not affect origin/CSP/crypto). Two bundled `tauri.localhost`
+desktops b=JeffS(CDP 9223) / b2=Android-Tester(9224) with fake media devices; web participant =
+Velvetfly in a CDP-driven Edge serving the built dist (non-native: hasTauri=false, e2eePresent=false).
+livekit-server **v1.9.13**.
+
+**Baseline smoke — PASS.** Both reach `room.isE2EEEnabled=true`, native MLS sessions `active`, both in
+the MLS roster, chip `e2ee_unverified`, LiveKit per-participant `encryption=1`. Media-plane ground
+truth: b→b2 E2EE video **101 frames / 128KB decoded in 5s** (framesDecoded climbing = decrypt success).
+Metrics `pass:true`, 0 parks/retries/desyncs. (Note: sub-second near-simultaneous dual mic-publish
+during an unsettled join once caused a commit-409 CAS race + resecuring timeout; sequential publish
+converges cleanly — a churn-robustness note, not reproducible by human-speed input.)
+
+| Leg | Result | Evidence |
+|---|---|---|
+| **§4 bundled-origin + CSP** | **PASS** | tauri.conf frontendDist=../frontend-dist (bundled); runtime origin `https://tauri.localhost/`; CSP `script-src 'self' 'wasm-unsafe-eval'` ENFORCED (remote script + remote fetch both blocked at runtime); built index.html references only local /assets/*. |
+| **§6.1 T3/T4 loud downgrade** | **PASS** | web joins ⇒ both natives instantly `not_encrypted`/`mixed`, `nonEnrolled=[Velvetfly]`, banner "Velvetfly is not using encrypted calls…paused…", publish gate held: **all tracks muted, 0 outbound bytes/packets over 3s** on both ⇒ no plaintext frame pre-confirm; isE2EEEnabled stays true. |
+| **§6.1 confirm (T3/T5) + ctl-announce + remote-announce (T4)** | **NOT-RUN** | the confirm is a NATIVE Tauri OS dialog (`e2ee_call_confirm_downgrade → app.dialog().blocking_show()`); CDP can't click native OS windows and **computer-use access to the debug-build windows was DENIED by the user**. set_e2ee(false)-before-resume ordering + ctl-announce + remote-announce not exercised live (native-computed roster verified by code; confirm gate is 6.5-committed + unit-covered). |
+| **§6.1 T6 re-upgrade** | **PASS** | web leaves ⇒ both natives auto re-upgrade mixed→e2ee (fresh successor group, hysteresis ~30s, bounded resecuring retries), chip back `e2ee_unverified`, gate released, room true. |
+| **§6.2 mixed-receive / Decline = receive-only** | **PASS (core)** | b2 (declining native, gate held) receives web plaintext video **100 frames / 213KB decoded / 5s** while **publishing 0** (0 out bytes/pkts). Concurrent encrypted-peer decrypt not reproducible (mixed pauses all natives' encrypted publish; no encrypted publisher without a confirmed downgrade = dialog-blocked). |
+| **§6.3 T-20 SFU-token coupling (CR-HIGH-2)** | **FAIL — bypassable (CRITICAL)** | MAX_MLS_GROUP_MEMBERS→2. Direct REST join by non-member: force_disconnect=false ⇒ **409 MlsCallFull, no token** (coupling logic works). BUT the real client always sends `force_disconnect:true` (state.tsx:798 / stoat.js Channel.ts:1256), and voice_join.rs:113 guards the T-20 block with `if force_disconnect != Some(true)` ⇒ **bypassed** (A/B: fd=false→409 no token; fd=true→200 TOKEN). Web client reached the SFU as a ghost and tripped b's loud banner. CR-HIGH-2 downgrade-DoS **NOT closed** against a real client. Fix task spawned. |
+| **§6.3 D12 video-enable MUTE** | **PASS** | at 2 members > cap(1), b enabled camera ⇒ voice-ingress muted it (publication muted:true, `camera:Some(false)` event); b stays audio-only; b2 receives 0 video from b. (No force_disconnect guard on this path.) |
+| **§6.3 D12 join-cap** | **server PASS / client bypassed** | b solo unmuted camera (count_video=1). REST join fd=false ⇒ **409 VideoCallFull, no token** (voice_join.rs:100); fd=true ⇒ 200 token. Same force_disconnect bypass as T-20. |
+| **§6.3 reactive leaf-verify (fetch_identity) + D10 park** | **NOT-RUN (unreproducible)** | store surgery stubbed JeffS call-device in b2 (binding_verified=0, ed25519=NULL). On rejoin the stub was **re-pinned to binding_verified=1**, room=true, **0 parks/retries/gapRefetches** — the PROACTIVE `#reconcileRoster` (6.4 HIGH-2) re-pinned before the Welcome, so the reject never fires. Triggering the reactive path needs disabling proactive reconcile, which the runbook FORBIDS. Covered by 59 node unit tests. |
+| **§6.3 proactive #reconcileRoster (6.4 HIGH-2)** | **PASS (live, positive)** | it detected the stubbed/unpinned admitter device and re-pinned it before Welcome verification ⇒ b2 joined E2EE despite the asymmetric-TOFU stub. |
+| **§6.4 T-10 (effects + denoise + E2EE)** | **PASS** | b published E2EE video with background-blur active (effectsApplied=2, bgStatus=active, noiseSupression on, isE2EEEnabled=true); b2 decoded **101 frames / 423KB / 5s**. Pipeline ordering intact. |
+| **§6.4 T-01 client-side ciphertext** | **PASS** | E2EE video decodes only end-to-end; 6.4 step-9 negative control (garbage key ⇒ framesDecoded pins / 100% concealment) proved real ciphertext. |
+| **§6.4 T-01 SFU-side attestation** | **PASS (metadata)** | LiveKit RoomService.ListParticipants reports EVERY track `encryption=GCM` (b camera+mic, b2 mic) ⇒ the SFU records the tracks as E2EE and forwards opaque ciphertext it never decodes. |
+| **§6.4 T-01 raw packet-node capture** | **NOT-RUN** | Alpine LiveKit container has no tcpdump/tshark (only hexdump); RTP is SRTP over UDP 50500-50600 ⇒ a raw capture cannot DISTINGUISH E2EE from transport SRTP. Post-SRTP frame inspection needs SFU instrumentation / egress-decode-failure. Standing residual both reviewers named. |
+| **§5 invariant-2 cross-shell** | **PASS** | the non-native web shell triggered LOUD downgrade (never quiet false-green); web client self-reports isE2EEEnabled=false / e2eePresent=false. |
+
+**Minor/other:** pre-existing CSP gap — notification sound `data:audio/ogg` blocked by `media-src`
+(cosmetic, not E2EE). A Velvetfly test-account session token surfaced once in a mongosh error before
+the reader was hardened (local dev test account; token valid only vs the local instance — revoke if
+desired).
+
+**NEW CRITICAL FINDING (blocks the flag):** the T-20 SFU-token coupling AND the D12 join-cap are both
+skipped whenever `force_disconnect == Some(true)` (voice_join.rs:92 and :113), which the real client
+ALWAYS sends. So both caps are bypassed on every real join — the CR-HIGH-2 non-cooperative
+overflow-joiner downgrade-DoS is **not actually closed**. The T-20 block already exempts genuine
+reconnects via its inner member check, so its outer force_disconnect guard is redundant and harmful;
+remove it, and scope the D12 reconnect exemption to "user already has voice state in THIS channel."
+
 ## 7. Verification plan (house-consistent)
 
 - **node --test** (frontend): existing 30 (`mlsCallModePolicy`) + 22 (drain/classify/joinPolicy)
@@ -763,8 +811,51 @@ green above.
 
 ## 9. Flag verdict (the owed deliverable)
 
-At slice end this section states, with evidence, whether `media_e2ee_enabled` is **cleared to flip
-in production** or **what remains**. Per both audits (Q-FLAG-1), desktop panel sign-off alone does
+### VERDICT after the live-proof session (2026-07-12): NOT cleared to flip — one NEW blocker.
+
+`media_e2ee_enabled` is **NOT cleared to flip in production**. It stays **FALSE** and the staging
+override was turned back OFF at teardown. Most binding live legs PASS (baseline E2EE end-to-end,
+T3/T4 loud downgrade with zero plaintext egress, T6 re-upgrade, receive-only, D12 video-enable mute,
+T-10 effects+E2EE, proactive reconcile, invariant-2, §4 origin+CSP on the shippable artifact), BUT the
+live proof surfaced a **NEW CRITICAL defect** and left three items as residuals:
+
+**BLOCKER (new): T-20 SFU-token coupling + D12 join-cap are bypassed by the real client.** Both are
+guarded by `if force_disconnect != Some(true)` (voice_join.rs:92, :113), and every real client join
+sends `force_disconnect:true` — so an overflow/attacker client reaches the SFU as a non-enrolled ghost
+and trips every member's loud-downgrade banner. Precondition #7 (CR-HIGH-2 resolved) is **FALSED by
+live evidence**. Fix: drop the outer force_disconnect guard on the T-20 block (its inner member check
+already exempts real reconnects) and scope the D12 exemption to an actual same-channel reconnect. Then
+re-run the T-20/D12 legs.
+
+**BLOCKER FIX LANDED (working tree, 2026-07-12):** `voice_join.rs` — the T-20 outer
+`force_disconnect` guard is dropped (the inner by-user membership check is the ONLY rejoin
+exemption), and the D12 exemption is re-scoped from the joiner-controlled flag to "user already
+holds voice state in THIS channel" (the `vc_members` roster is written by voice-ingress, never the
+client, so it cannot be forged). New delta route tests
+(`video_cap_refuses_overflow_join_despite_force_disconnect`,
+`mls_cap_refuses_overflow_join_despite_force_disconnect`) prove an overflow join is refused 409
+even with `force_disconnect:true` (both caps, both flag values) and that a genuine same-channel /
+group-member rejoin at the ceiling still passes both caps; REFERENCE suite green. Still owed
+before the verdict changes: re-run the live T-20/D12 REST legs against a staging build.
+discord-features-reviewer verdict on the fix diff: **SHIP-WITH-FIXES** — bypass confirmed closed
+(no request-controlled input reaches around either cap; exemptions key on server-written state);
+residuals tracked separately: check→mint TOCTOU under parallel joins (MED, wants an ingress
+backstop), and `member_edit.rs` voice-MOVE minting a cap-free token (MED) + its `:309`
+disconnects-the-moderator bug (LOW) — both spawned as follow-up tasks.
+
+**Residuals still owed (unchanged by this session):**
+- **T-01 raw SFU-node packet capture** (#4) — NOT-RUN (no capture tooling in the Alpine LiveKit
+  container; SRTP makes a raw capture non-distinguishing). Client decrypt proof + LiveKit `encryption=GCM`
+  attestation substantiate the claim but are not the packet-node capture both reviewers require.
+- **Native-dialog confirm path (§6.1 T3/T5) + ctl-announce/remote-announce** — NOT-RUN live
+  (computer-use to the debug build was denied; the confirm is a native OS dialog). Unit-covered.
+- **Reactive fetch_identity chain + D10 park** — NOT-RUN live (unreproducible without disabling the
+  proactive reconcile, which is forbidden). Unit-covered by the 59 node tests.
+- Standing operator debts: multi-device E2E, Android 6.7 (or its loud-downgrade impact consciously
+  accepted). §9 preconditions #1/#2/#7 not met.
+
+### The hard preconditions (for reference):
+Per both audits (Q-FLAG-1), desktop panel sign-off alone does
 **NOT** clear a production flip; the hard preconditions are:
 
 1. **All live legs PASS (§6)** or each NOT-RUN one named as a residual.
@@ -816,7 +907,10 @@ regardless of outcome — a clear "cleared to flip" or an itemized "what remains
       code + delta join_intent/CAS (existing) + §2.7 SFU coupling; T-06-ext chip node cases (chipState was
       already a pure unit-tested module — no extraction needed; LOW-12 resolved as pre-satisfied).
 - [x] 5 Scrub sweep — CORRECTED grep set + bonfire scope + `MlsFrameKey` Debug structural check: CLEAN (§7a).
-- [~] 6 Deploy prereqs + live legs — **NOT RUN this session** (§7b); binding residual for the flag flip.
+- [~] 6 Deploy prereqs + live legs — **RUN 2026-07-12 in a dedicated live-proof session (§7c).** Most
+      legs PASS; surfaced a NEW CRITICAL: T-20/D12 caps bypassed by client `force_disconnect:true`
+      (§7c table + §9 blocker). Residual NOT-RUN: raw SFU-node packet capture, native-dialog confirm
+      (computer-use denied), reactive fetch_identity (proactive re-pins). Flag stays FALSE (§9).
 - [ ] 7 FINAL slice-6 audit — full panel on the diff; fix; re-verify
 - [ ] 8 Commit disentangled (stoatchat/acutest, frontend/main, stoat.js/sloga, desktop/master); flag verdict
 
