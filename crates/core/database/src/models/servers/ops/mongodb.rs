@@ -259,6 +259,26 @@ impl MongoDb {
         })
         .await?;
 
+        // Delete polls and their ballots (messages are dropped wholesale
+        // above, so the per-message cascade never runs on this path). Poll
+        // docs carry `server`; ballots carry `channel`, and the channel
+        // list above includes threads (they carry `server` too).
+        self.col::<Document>("poll_votes")
+            .delete_many(doc! {
+                "channel": {
+                    "$in": &channels
+                }
+            })
+            .await
+            .map_err(|_| create_database_error!("delete_many", "poll_votes"))?;
+
+        self.col::<Document>("polls")
+            .delete_many(doc! {
+                "server": &server_id
+            })
+            .await
+            .map_err(|_| create_database_error!("delete_many", "polls"))?;
+
         // Delete server-scoped slash commands (global commands untouched;
         // a deleted server must not linger in bots' command lists forever).
         self.col::<Document>("application_commands")

@@ -69,6 +69,7 @@ impl<'r> Responder<'r, 'static> for Error {
             ErrorType::BotOffline => Status::BadRequest,
             ErrorType::InteractionExpired => Status::Gone,
             ErrorType::InteractionAlreadyResponded => Status::Conflict,
+            ErrorType::PollClosed => Status::Gone,
 
             ErrorType::CannotReportYourself => Status::BadRequest,
 

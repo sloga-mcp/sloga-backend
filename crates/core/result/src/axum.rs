@@ -66,6 +66,7 @@ impl IntoResponse for Error {
             ErrorType::BotOffline => StatusCode::BAD_REQUEST,
             ErrorType::InteractionExpired => StatusCode::GONE,
             ErrorType::InteractionAlreadyResponded => StatusCode::CONFLICT,
+            ErrorType::PollClosed => StatusCode::GONE,
 
             ErrorType::CannotReportYourself => StatusCode::BAD_REQUEST,
 

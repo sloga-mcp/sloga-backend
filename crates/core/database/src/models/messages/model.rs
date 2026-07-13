@@ -102,6 +102,12 @@ auto_derived_partial!(
         #[serde(skip_serializing_if = "Option::is_none")]
         pub sticker_ids: Option<Vec<String>>,
 
+        /// Immutable poll definition when this message carries a poll.
+        /// Server-set only (by the poll create route); the regular send
+        /// path never accepts it. Mutable poll state lives in `polls`.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub poll: Option<v0::PollDefinition>,
+
         /// Bitfield of message flags
         #[serde(skip_serializing_if = "Option::is_none")]
         pub flags: Option<u32>,
@@ -296,6 +302,7 @@ impl Default for Message {
             command_context: None,
             components: None,
             sticker_ids: None,
+            poll: None,
         }
     }
 }
@@ -1152,6 +1159,15 @@ impl Message {
             db.mark_attachments_as_deleted(&file_ids).await?;
         }
 
+        // Cascade: a poll message takes its poll (and ballots) with it, so
+        // the crond expiry scan can never publish PollClose for a deleted
+        // message. Gated on the embedded definition to avoid a query on
+        // every ordinary delete.
+        if self.poll.is_some() {
+            db.delete_polls_for_messages(std::slice::from_ref(&self.id))
+                .await?;
+        }
+
         db.delete_message(&self.id).await?;
 
         EventV1::MessageDelete {
@@ -1173,6 +1189,9 @@ impl Message {
             .map(|msg| msg.id)
             .collect::<Vec<String>>();
 
+        // Cascade before the messages go (single query for the whole batch).
+        db.delete_polls_for_messages(&valid_ids).await?;
+
         db.delete_messages(channel, &valid_ids).await?;
         EventV1::BulkMessageDelete {
             channel: channel.to_string(),
@@ -1193,6 +1212,15 @@ impl Message {
         let deleted_groups = db
             .delete_messages_by_author_since(channels, author, since)
             .await?;
+
+        // Cascade: prune-deleted poll messages take their polls with them.
+        let all_ids: Vec<String> = deleted_groups
+            .iter()
+            .flat_map(|(_, ids)| ids.iter().cloned())
+            .collect();
+        if !all_ids.is_empty() {
+            db.delete_polls_for_messages(&all_ids).await?;
+        }
 
         for (channel_id, message_ids) in deleted_groups {
             if !message_ids.is_empty() {

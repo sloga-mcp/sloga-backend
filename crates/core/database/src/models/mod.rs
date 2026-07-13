@@ -13,6 +13,7 @@ mod files;
 mod interactions;
 mod messages;
 mod mls;
+mod polls;
 mod stickers;
 mod thread_members;
 mod policy_changes;
@@ -44,6 +45,7 @@ pub use files::*;
 pub use interactions::*;
 pub use messages::*;
 pub use mls::*;
+pub use polls::*;
 pub use stickers::*;
 pub use thread_members::*;
 pub use policy_changes::*;
@@ -85,6 +87,7 @@ pub trait AbstractDatabase:
     + thread_members::AbstractThreadMembers
     + interactions::AbstractInteractions
     + messages::AbstractMessages
+    + polls::AbstractPolls
     + policy_changes::AbstractPolicyChange
     + ratelimit_events::AbstractRatelimitEvents
     + safety_reports::AbstractReport

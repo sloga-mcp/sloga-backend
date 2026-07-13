@@ -140,6 +140,9 @@ pub enum ErrorType {
     InteractionExpired,
     InteractionAlreadyResponded,
 
+    // ? Poll errors
+    PollClosed,
+
     // ? User safety related errors
     CannotReportYourself,
 

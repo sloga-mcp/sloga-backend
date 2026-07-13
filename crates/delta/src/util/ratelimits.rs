@@ -44,6 +44,15 @@ impl<'a> RatelimitResolver<Request<'a>> for DeltaRatelimits {
                     ("bots", None)
                 }
                 ("channels", Some(id), _) => {
+                    // Vote casts / retractions (PUT+DELETE …/polls/<id>/vote)
+                    // get their own bucket to stop vote-flip spam amplifying
+                    // the count-only WS fan-out.
+                    if matches!(request.method(), Method::Put | Method::Delete)
+                        && extra == Some("polls")
+                    {
+                        return ("poll_vote", Some(id));
+                    }
+
                     if request.method() == Method::Post {
                         // Component clicks wake a bot per call — bounded
                         // separately from plain messaging. (Segment index
@@ -58,6 +67,23 @@ impl<'a> RatelimitResolver<Request<'a>> for DeltaRatelimits {
                         // Dice rolls create messages, so they share the messaging bucket
                         if let Some("messages" | "roll") = extra {
                             return ("messaging", Some(id));
+                        }
+
+                        // Poll creation creates a message → messaging bucket
+                        // (roll precedent). The bulk state fetch
+                        // (POST …/polls/fetch — literal at segment 3) and
+                        // manual close (POST …/polls/<poll_id>/end — literal
+                        // at segment 4) are reads/updates, not message sends
+                        // — they fall through to the channels bucket. All
+                        // indexes shift by one under the legacy "0.8" prefix.
+                        if extra == Some("polls") {
+                            let seg3 =
+                                request.routed_segment(if versioned { 4 } else { 3 });
+                            let seg4 =
+                                request.routed_segment(if versioned { 5 } else { 4 });
+                            if seg3 != Some("fetch") && seg4 != Some("end") {
+                                return ("messaging", Some(id));
+                            }
                         }
 
                         // Thread creation is bounded per parent channel to cap
@@ -145,6 +171,7 @@ impl<'a> RatelimitResolver<Request<'a>> for DeltaRatelimits {
             "thread_create" => 5,
             "forum_post_create" => 5,
             "interaction_create" => 10,
+            "poll_vote" => 10,
             "interaction_respond" => 30,
             "message_interact" => 20,
             "bot_commands" => 10,

@@ -26,7 +26,7 @@ struct MigrationInfo {
     revision: i32,
 }
 
-pub const LATEST_REVISION: i32 = 58; // MUST BE +1 to last migration
+pub const LATEST_REVISION: i32 = 59; // MUST BE +1 to last migration
 
 pub async fn migrate_database(db: &MongoDb) {
     let migrations = db.col::<Document>("migrations");
@@ -1860,6 +1860,78 @@ pub async fn run_migrations(db: &MongoDb, revision: i32) -> i32 {
             })
             .await
             .expect("Failed to create interactions indexes.");
+    }
+
+    if revision <= 58 {
+        info!("Running migration [revision 58 / 13-07-2026]: Create polls and poll_votes collections (Discord-style polls)");
+
+        // Existing deployments predate polls: init.rs only covers fresh DBs.
+        // Collections + indexes mirror init.rs exactly; both operations are
+        // idempotent (create_collection errors are ignored; createIndexes is
+        // a no-op when key+name already match), so a re-run or a fresh DB is
+        // safe.
+        db.db().create_collection("polls").await.ok();
+        db.db().create_collection("poll_votes").await.ok();
+
+        db.db()
+            .run_command(doc! {
+                "createIndexes": "polls",
+                "indexes": [
+                    // One poll per message; serves the message-deletion
+                    // cascade.
+                    {
+                        "key": {
+                            "message": 1_i32
+                        },
+                        "name": "message",
+                        "unique": true
+                    },
+                    // Serves the crond expiry scan (open polls past their
+                    // expiry).
+                    {
+                        "key": {
+                            "closed": 1_i32,
+                            "expires_at": 1_i32
+                        },
+                        "name": "closed_expires"
+                    },
+                    // Serves the channel-deletion cascade.
+                    {
+                        "key": {
+                            "channel": 1_i32
+                        },
+                        "name": "channel"
+                    }
+                ]
+            })
+            .await
+            .expect("Failed to create polls indexes.");
+
+        db.db()
+            .run_command(doc! {
+                "createIndexes": "poll_votes",
+                "indexes": [
+                    // Multikey (answer_ids is an array): serves the
+                    // author-gated voters-per-answer listing and the
+                    // recount-at-close fetch.
+                    {
+                        "key": {
+                            "poll": 1_i32,
+                            "answer_ids": 1_i32
+                        },
+                        "name": "poll_answers"
+                    },
+                    // Serves the channel-deletion cascade.
+                    {
+                        "key": {
+                            "channel": 1_i32
+                        },
+                        "name": "channel"
+                    }
+                ]
+            })
+            .await
+            .expect("Failed to create poll_votes indexes.");
     }
 
     // Reminder to update LATEST_REVISION when adding new migrations.

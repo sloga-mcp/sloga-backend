@@ -6,7 +6,8 @@ use crate::{
     ApplicationCommand, Bot, CalendarEvent, Channel, ChannelCompositeKey, ChannelUnread,
     E2EEBackup, E2EEBlob, E2EEEnvelope, E2EEIdentity, E2EEOneTimeKey, Emoji, EventRsvp,
     EventRsvpKey, File, FileHash, Interaction, Invite, Member, MemberCompositeKey, Message,
-    MlsCommit, MlsGroup, MlsJoinIntent, MlsKeyPackage, PolicyChange, RatelimitEvent, ReminderSent,
+    MlsCommit, MlsGroup, MlsJoinIntent, MlsKeyPackage, PolicyChange, Poll, PollVote,
+    RatelimitEvent, ReminderSent,
     ReminderSentKey, Report, Server, ServerBan, Snapshot, Sticker, ThreadMember,
     ThreadMemberCompositeKey, User, UserSettings, Webhook, Account, AccountInvite, Session,
     MFATicket
@@ -32,6 +33,8 @@ database_derived!(
         pub file_hashes: Arc<Mutex<HashMap<String, FileHash>>>,
         pub files: Arc<Mutex<HashMap<String, File>>>,
         pub messages: Arc<Mutex<HashMap<String, Message>>>,
+        pub polls: Arc<Mutex<HashMap<String, Poll>>>,
+        pub poll_votes: Arc<Mutex<HashMap<String, PollVote>>>,
         pub policy_changes: Arc<Mutex<HashMap<String, PolicyChange>>>,
         pub ratelimit_events: Arc<Mutex<HashMap<String, RatelimitEvent>>>,
         pub user_settings: Arc<Mutex<HashMap<String, UserSettings>>>,

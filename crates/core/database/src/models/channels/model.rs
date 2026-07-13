@@ -1258,6 +1258,8 @@ impl Channel {
             for thread in db.fetch_threads_by_parent(&id).await? {
                 let thread_id = thread.id().to_string();
                 db.delete_all_thread_memberships(&thread_id).await?;
+                // Polls live per-channel; a thread's polls die with it.
+                db.delete_polls_for_channel(&thread_id).await?;
 
                 EventV1::ChannelDelete {
                     id: thread_id.clone(),
@@ -1276,6 +1278,10 @@ impl Channel {
         if let Channel::Thread { .. } = self {
             db.delete_all_thread_memberships(&id).await?;
         }
+
+        // Cascade: deleting a channel deletes its polls and their ballots
+        // (messages are dropped wholesale, so no per-message cascade runs).
+        db.delete_polls_for_channel(&id).await?;
 
         EventV1::ChannelDelete { id: id.clone() }.p(id).await;
         // TODO: missing functionality:

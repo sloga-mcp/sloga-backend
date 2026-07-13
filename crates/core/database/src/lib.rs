@@ -125,3 +125,8 @@ pub fn if_false(t: &bool) -> bool {
 pub fn if_option_false(t: &Option<bool>) -> bool {
     t != &Some(true)
 }
+
+/// Utility function to check if an i64 is zero
+pub fn if_zero_i64(t: &i64) -> bool {
+    *t == 0
+}

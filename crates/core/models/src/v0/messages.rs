@@ -11,7 +11,7 @@ use rocket::{FromForm, FromFormField};
 
 use iso8601_timestamp::Timestamp;
 
-use super::{Channel, Embed, File, Member, MessageInteraction, MessageWebhook, User, Webhook, RE_COLOUR};
+use super::{Channel, Embed, File, Member, MessageInteraction, MessageWebhook, PollDefinition, User, Webhook, RE_COLOUR};
 
 auto_derived_partial!(
     /// Message
@@ -101,6 +101,14 @@ auto_derived_partial!(
             serde(skip_serializing_if = "Option::is_none")
         )]
         pub sticker_ids: Option<Vec<String>>,
+
+        /// Immutable poll definition when this message carries a poll.
+        ///
+        /// Server-set only (by the poll create route, together with the
+        /// `Poll` flag) — the regular send path never accepts it. Mutable
+        /// poll state (counts / closed) is fetched and pushed separately.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub poll: Option<PollDefinition>,
 
         /// Bitfield of message flags
         ///
@@ -450,6 +458,11 @@ auto_derived!(
         /// so this flag (with `command_context`) guarantees the "used /cmd"
         /// attribution is authentic.
         Interaction = 5,
+        /// Message carries a poll (with the `poll` definition field).
+        /// Can only be set by the poll create endpoint — the regular send
+        /// path rejects client-supplied flag values above 7, so a flagged
+        /// message is a guaranteed-authentic server-counted poll.
+        Poll = 6,
     }
 
     /// Optional fields on message

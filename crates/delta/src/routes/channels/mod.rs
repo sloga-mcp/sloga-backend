@@ -30,6 +30,11 @@ mod message_unpin;
 mod message_unreact;
 mod permissions_set;
 mod permissions_set_default;
+mod poll_create;
+mod poll_end;
+mod poll_fetch;
+mod poll_vote;
+mod poll_voters;
 mod thread_create;
 mod thread_list;
 mod thread_members;
@@ -79,5 +84,12 @@ pub fn routes() -> (Vec<Route>, OpenApi) {
         command_list::fetch_channel_commands,
         interaction_create::interaction_create,
         message_interact::message_interact,
+        poll_create::poll_create,
+        poll_vote::poll_vote,
+        poll_vote::poll_unvote,
+        poll_fetch::poll_fetch,
+        poll_fetch::polls_fetch_bulk,
+        poll_voters::poll_voters,
+        poll_end::poll_end,
     ]
 }

@@ -162,6 +162,14 @@ pub async fn create_database(db: &MongoDb) {
         .await
         .expect("Failed to create interactions collection.");
 
+    db.create_collection("polls")
+        .await
+        .expect("Failed to create polls collection.");
+
+    db.create_collection("poll_votes")
+        .await
+        .expect("Failed to create poll_votes collection.");
+
     db.run_command(doc! {
         "createIndexes": "users",
         "indexes": [
@@ -310,6 +318,61 @@ pub async fn create_database(db: &MongoDb) {
     })
     .await
     .expect("Failed to create interactions index.");
+
+    db.run_command(doc! {
+        "createIndexes": "polls",
+        "indexes": [
+            // One poll per message; serves the message-deletion cascade.
+            {
+                "key": {
+                    "message": 1_i32
+                },
+                "name": "message",
+                "unique": true
+            },
+            // Serves the crond expiry scan (open polls past their expiry).
+            {
+                "key": {
+                    "closed": 1_i32,
+                    "expires_at": 1_i32
+                },
+                "name": "closed_expires"
+            },
+            // Serves the channel-deletion cascade.
+            {
+                "key": {
+                    "channel": 1_i32
+                },
+                "name": "channel"
+            }
+        ]
+    })
+    .await
+    .expect("Failed to create polls index.");
+
+    db.run_command(doc! {
+        "createIndexes": "poll_votes",
+        "indexes": [
+            // Multikey (answer_ids is an array): serves the author-gated
+            // voters-per-answer listing and the recount-at-close fetch.
+            {
+                "key": {
+                    "poll": 1_i32,
+                    "answer_ids": 1_i32
+                },
+                "name": "poll_answers"
+            },
+            // Serves the channel-deletion cascade.
+            {
+                "key": {
+                    "channel": 1_i32
+                },
+                "name": "channel"
+            }
+        ]
+    })
+    .await
+    .expect("Failed to create poll_votes index.");
 
     db.run_command(doc! {
         "createIndexes": "channels",

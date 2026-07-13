@@ -6,8 +6,8 @@ use revolt_models::v0::{
     Emoji, Event, EventRsvp, FieldsChannel, FieldsMember, FieldsMessage, FieldsRole, FieldsServer, FieldsUser,
     FieldsWebhook, Interaction, Member, MemberCompositeKey, Message, PartialChannel, PartialEmoji,
     PartialMember, PartialMessage, PartialRole, PartialServer, PartialSticker, PartialUser,
-    PartialUserVoiceState, PartialWebhook, PolicyChange, RemovalIntention, Report, Server,
-    Sticker, User, UserSettings, UserVoiceState, Webhook,
+    PartialUserVoiceState, PartialWebhook, PolicyChange, PollAnswerCount, RemovalIntention,
+    Report, Server, Sticker, User, UserSettings, UserVoiceState, Webhook,
 };
 
 use crate::{Account, Database, Session};
@@ -474,6 +474,28 @@ pub enum EventV1 {
     E2EEClaimResult {
         device_id: String,
         accepted: bool,
+    },
+
+    /// A poll's aggregate counts changed (vote cast, replaced or retracted).
+    /// Published on the channel topic — the topic is the authorization
+    /// boundary. Deliberately count-only: ballots (voter identities) are
+    /// never broadcast; the voters list is REST and author-gated.
+    PollVoteUpdate {
+        id: String,
+        channel_id: String,
+        message_id: String,
+        counts: Vec<PollAnswerCount>,
+        total_votes: i64,
+    },
+
+    /// A poll closed (expiry, manual end, or lazy close). Published exactly
+    /// once by the close winner with authoritative final results.
+    PollClose {
+        id: String,
+        channel_id: String,
+        message_id: String,
+        counts: Vec<PollAnswerCount>,
+        total_votes: i64,
     },
 
     /// A calendar event was created. Published on the event's channel topic when

@@ -693,6 +693,7 @@ impl crate::Message {
             command_context: self.command_context.map(Into::into),
             components: self.components,
             sticker_ids: self.sticker_ids,
+            poll: self.poll,
         }
     }
 }
@@ -726,6 +727,7 @@ impl From<crate::PartialMessage> for PartialMessage {
             command_context: value.command_context.map(Into::into),
             components: value.components,
             sticker_ids: value.sticker_ids,
+            poll: value.poll,
         }
     }
 }
