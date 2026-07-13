@@ -19,11 +19,13 @@ mod message_clear_reactions;
 mod message_delete;
 mod message_edit;
 mod message_fetch;
+mod message_forward;
 mod message_interact;
 mod message_pin;
 mod message_query;
 mod message_react;
 mod message_roll;
+mod message_schedule;
 mod message_search;
 mod message_send;
 mod message_unpin;
@@ -35,6 +37,8 @@ mod poll_end;
 mod poll_fetch;
 mod poll_vote;
 mod poll_voters;
+mod scheduled_message_delete;
+mod scheduled_messages_list;
 mod thread_create;
 mod thread_list;
 mod thread_members;
@@ -53,6 +57,10 @@ pub fn routes() -> (Vec<Route>, OpenApi) {
         invite_create::create_invite,
         message_send::message_send,
         message_roll::message_roll,
+        message_forward::message_forward,
+        message_schedule::message_schedule,
+        scheduled_messages_list::scheduled_messages_list,
+        scheduled_message_delete::scheduled_message_delete,
         message_query::query,
         message_search::search,
         message_pin::message_pin,

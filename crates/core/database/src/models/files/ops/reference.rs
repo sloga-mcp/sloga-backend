@@ -108,6 +108,19 @@ impl AbstractAttachments for ReferenceDb {
         }
     }
 
+    /// Repoint an already-claimed attachment's `used_for.id` at a new parent.
+    async fn retarget_attachment(&self, id: &str, new_parent_id: &str) -> Result<()> {
+        let mut files = self.files.lock().await;
+        if let Some(file) = files.get_mut(id) {
+            if let Some(used_for) = &mut file.used_for {
+                used_for.id = new_parent_id.to_string();
+            }
+            Ok(())
+        } else {
+            Err(create_error!(NotFound))
+        }
+    }
+
     /// Mark an attachment as having been reported.
     async fn mark_attachment_as_reported(&self, id: &str) -> Result<()> {
         let mut files = self.files.lock().await;

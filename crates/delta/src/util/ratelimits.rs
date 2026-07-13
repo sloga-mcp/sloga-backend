@@ -53,6 +53,14 @@ impl<'a> RatelimitResolver<Request<'a>> for DeltaRatelimits {
                         return ("poll_vote", Some(id));
                     }
 
+                    // Scheduled-message routes (POST/GET
+                    // …/scheduled_messages, DELETE …/scheduled_messages/
+                    // <id>) manage a queue rather than creating live
+                    // messages — they get their own bucket.
+                    if extra == Some("scheduled_messages") {
+                        return ("message_schedule", Some(id));
+                    }
+
                     if request.method() == Method::Post {
                         // Component clicks wake a bot per call — bounded
                         // separately from plain messaging. (Segment index
@@ -64,7 +72,12 @@ impl<'a> RatelimitResolver<Request<'a>> for DeltaRatelimits {
                             return ("message_interact", Some(id));
                         }
 
-                        // Dice rolls create messages, so they share the messaging bucket
+                        // Dice rolls create messages, so they share the
+                        // messaging bucket — as do forwards
+                        // (POST …/messages/<msg>/forward), which land here
+                        // via the "messages" segment so a client cannot
+                        // interleave forwards and sends to exceed the
+                        // per-channel message rate.
                         if let Some("messages" | "roll") = extra {
                             return ("messaging", Some(id));
                         }
@@ -172,6 +185,7 @@ impl<'a> RatelimitResolver<Request<'a>> for DeltaRatelimits {
             "forum_post_create" => 5,
             "interaction_create" => 10,
             "poll_vote" => 10,
+            "message_schedule" => 10,
             "interaction_respond" => 30,
             "message_interact" => 20,
             "bot_commands" => 10,

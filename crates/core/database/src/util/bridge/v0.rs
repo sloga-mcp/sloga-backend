@@ -694,6 +694,25 @@ impl crate::Message {
             components: self.components,
             sticker_ids: self.sticker_ids,
             poll: self.poll,
+            forwarded: self.forwarded.map(Into::into),
+        }
+    }
+}
+
+impl From<crate::ForwardedSnapshot> for ForwardedSnapshot {
+    fn from(value: crate::ForwardedSnapshot) -> Self {
+        ForwardedSnapshot {
+            message_id: value.message_id,
+            channel_id: value.channel_id,
+            server_id: value.server_id,
+            author_id: value.author_id,
+            content: value.content,
+            attachments: value
+                .attachments
+                .into_iter()
+                .map(Into::into)
+                .collect(),
+            original_sent_at: value.original_sent_at,
         }
     }
 }
@@ -728,6 +747,7 @@ impl From<crate::PartialMessage> for PartialMessage {
             components: value.components,
             sticker_ids: value.sticker_ids,
             poll: value.poll,
+            forwarded: value.forwarded.map(Into::into),
         }
     }
 }

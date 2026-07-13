@@ -70,6 +70,7 @@ impl<'r> Responder<'r, 'static> for Error {
             ErrorType::InteractionExpired => Status::Gone,
             ErrorType::InteractionAlreadyResponded => Status::Conflict,
             ErrorType::PollClosed => Status::Gone,
+            ErrorType::TooManyScheduledMessages { .. } => Status::BadRequest,
 
             ErrorType::CannotReportYourself => Status::BadRequest,
 

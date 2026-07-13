@@ -110,6 +110,16 @@ auto_derived_partial!(
         #[serde(skip_serializing_if = "Option::is_none")]
         pub poll: Option<PollDefinition>,
 
+        /// Immutable snapshot of another message this message forwards.
+        ///
+        /// Server-set only (by the forward route, which verifies the
+        /// forwarder can actually read the source) — this field is absent
+        /// from `DataMessageSend` and `DataEditMessage`, so the regular
+        /// send/edit paths can never set or mutate it. Edits or deletion of
+        /// the original do NOT propagate (snapshot semantics).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub forwarded: Option<ForwardedSnapshot>,
+
         /// Bitfield of message flags
         ///
         /// https://docs.rs/revolt-models/latest/revolt_models/v0/enum.MessageFlags.html
@@ -333,6 +343,49 @@ auto_derived!(
         ///
         /// https://docs.rs/revolt-models/latest/revolt_models/v0/enum.MessageFlags.html
         pub flags: Option<u32>,
+    }
+
+    /// Immutable, server-copied snapshot of a forwarded message.
+    ///
+    /// Constructed exclusively by the forward route from server-stored
+    /// fields of the source message. Forward-of-forward copies the ORIGINAL
+    /// snapshot, so provenance always points at the first hop.
+    pub struct ForwardedSnapshot {
+        /// Id of the original message
+        pub message_id: String,
+        /// Id of the channel the original message was sent in
+        pub channel_id: String,
+        /// Id of the server the original channel belongs to, if any
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub server_id: Option<String>,
+        /// Id of the original author (None when the original was sent by
+        /// a webhook)
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub author_id: Option<String>,
+        /// Content of the original message at forward time
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub content: Option<String>,
+        /// Copies of the original attachments (freshly-minted file records
+        /// owned by the forwarding message — deleting either side never
+        /// breaks the other)
+        #[serde(skip_serializing_if = "Vec::is_empty", default)]
+        pub attachments: Vec<File>,
+        /// When the original message was sent (ms since epoch, UTC)
+        pub original_sent_at: i64,
+    }
+
+    /// Forward a message to another channel
+    #[cfg_attr(feature = "validator", derive(Validate))]
+    pub struct DataMessageForward {
+        /// Unique token to prevent duplicate message sending
+        ///
+        /// **This is deprecated and replaced by `Idempotency-Key`!**
+        #[cfg_attr(feature = "validator", validate(length(min = 1, max = 64)))]
+        pub nonce: Option<String>,
+
+        /// Id of the channel to forward the message to
+        #[cfg_attr(feature = "validator", validate(length(min = 26, max = 26)))]
+        pub destination: String,
     }
 
     /// Dice roll to perform
@@ -736,16 +789,29 @@ impl PushNotification {
             format!("{}/assets/logo.png", config.hosts.app)
         };
 
-        let image = msg.attachments.as_ref().and_then(|attachments| {
-            attachments
-                .first()
-                .map(|v| format!("{}/attachments/{}", config.hosts.autumn, v.id))
-        });
+        let image = msg
+            .attachments
+            .as_ref()
+            .and_then(|attachments| attachments.first())
+            .or_else(|| {
+                // Forward snapshots carry their attachments inline
+                msg.forwarded
+                    .as_ref()
+                    .and_then(|forwarded| forwarded.attachments.first())
+            })
+            .map(|v| format!("{}/attachments/{}", config.hosts.autumn, v.id));
 
         let body = if let Some(ref sys) = msg.system {
             sys.clone().into()
         } else if let Some(ref text) = msg.content {
             text.clone()
+        } else if let Some(ref forwarded) = msg.forwarded {
+            // Forwarded messages have no content of their own; fall back to
+            // the snapshot's content so previews are never blank.
+            forwarded
+                .content
+                .clone()
+                .unwrap_or_else(|| "Forwarded a message".to_string())
         } else if let Some(text) = msg.embeds.as_ref().and_then(|embeds| match embeds.first() {
             Some(Embed::Image(_)) => Some("Sent an image".to_string()),
             Some(Embed::Video(_)) => Some("Sent a video".to_string()),

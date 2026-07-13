@@ -1260,6 +1260,9 @@ impl Channel {
                 db.delete_all_thread_memberships(&thread_id).await?;
                 // Polls live per-channel; a thread's polls die with it.
                 db.delete_polls_for_channel(&thread_id).await?;
+                // Pending scheduled messages die with it too — cancel them
+                // loudly so authors' pending lists stay accurate.
+                crate::ScheduledMessage::cancel_all_for_channel(db, &thread_id).await?;
 
                 EventV1::ChannelDelete {
                     id: thread_id.clone(),
@@ -1282,6 +1285,11 @@ impl Channel {
         // Cascade: deleting a channel deletes its polls and their ballots
         // (messages are dropped wholesale, so no per-message cascade runs).
         db.delete_polls_for_channel(&id).await?;
+
+        // Cascade: pending scheduled messages are cancelled (not fired into
+        // a missing channel), their claimed attachments released, and each
+        // author notified on their private topic.
+        crate::ScheduledMessage::cancel_all_for_channel(db, &id).await?;
 
         EventV1::ChannelDelete { id: id.clone() }.p(id).await;
         // TODO: missing functionality:

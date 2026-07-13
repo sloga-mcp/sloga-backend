@@ -143,6 +143,11 @@ pub enum ErrorType {
     // ? Poll errors
     PollClosed,
 
+    // ? Scheduled message errors
+    TooManyScheduledMessages {
+        max: usize,
+    },
+
     // ? User safety related errors
     CannotReportYourself,
 

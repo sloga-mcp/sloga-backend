@@ -108,6 +108,13 @@ auto_derived_partial!(
         #[serde(skip_serializing_if = "Option::is_none")]
         pub poll: Option<v0::PollDefinition>,
 
+        /// Immutable snapshot of another message this message forwards.
+        /// Server-set only (by the forward route, which verifies read
+        /// access on the source) — absent from `DataMessageSend` and
+        /// `DataEditMessage`, so send/edit paths can never touch it.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub forwarded: Option<ForwardedSnapshot>,
+
         /// Bitfield of message flags
         #[serde(skip_serializing_if = "Option::is_none")]
         pub flags: Option<u32>,
@@ -250,6 +257,32 @@ auto_derived!(
         /// array clears the message's components)
         Components,
     }
+
+    /// Immutable, server-copied snapshot of a forwarded message.
+    ///
+    /// The attachments here are freshly-minted `File` documents owned by
+    /// the FORWARDING message (hash refcounting keeps the underlying object
+    /// alive while either side references it).
+    pub struct ForwardedSnapshot {
+        /// Id of the original message
+        pub message_id: String,
+        /// Id of the channel the original message was sent in
+        pub channel_id: String,
+        /// Id of the server the original channel belongs to, if any
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub server_id: Option<String>,
+        /// Id of the original author (None when sent by a webhook)
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub author_id: Option<String>,
+        /// Content of the original message at forward time
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub content: Option<String>,
+        /// Copies of the original attachments
+        #[serde(skip_serializing_if = "Vec::is_empty", default)]
+        pub attachments: Vec<File>,
+        /// When the original message was sent (ms since epoch, UTC)
+        pub original_sent_at: i64,
+    }
 );
 
 pub struct MessageFlagsValue(pub u32);
@@ -303,6 +336,7 @@ impl Default for Message {
             components: None,
             sticker_ids: None,
             poll: None,
+            forwarded: None,
         }
     }
 }
@@ -337,6 +371,7 @@ impl Message {
             generate_embeds,
             allow_mentions,
             None,
+            None,
         )
         .await
     }
@@ -346,6 +381,13 @@ impl Message {
     /// Forum post creation pins the starter message's id to the post's
     /// (thread's) id so starters can be bulk-fetched by id when listing
     /// posts. Every other caller passes `None` and gets a fresh ulid.
+    ///
+    /// `resolved_attachments`, when `Some`, replaces the normal
+    /// claim-by-id attachment path: the given `File` rows are attached
+    /// verbatim and `data.attachments` is ignored. The scheduled-message
+    /// daemon uses this — its attachments were already claimed (against
+    /// the scheduled row) at schedule time, so `File::use_attachment`
+    /// (which only matches unclaimed files) would 404 on them.
     #[allow(clippy::too_many_arguments)]
     pub async fn create_from_api_with_id(
         db: &Database,
@@ -360,6 +402,7 @@ impl Message {
         generate_embeds: bool,
         allow_mentions: bool,
         forced_id: Option<String>,
+        resolved_attachments: Option<Vec<File>>,
     ) -> Result<Message> {
         let config = config().await;
 
@@ -685,9 +728,15 @@ impl Message {
             }));
         }
 
-        for attachment_id in data.attachments.as_deref().unwrap_or_default() {
-            attachments
-                .push(File::use_attachment(db, attachment_id, &message_id, author.id()).await?);
+        if let Some(resolved) = resolved_attachments {
+            // Pre-resolved files (scheduled delivery): already claimed at
+            // schedule time and retargeted to this message by the caller.
+            attachments.extend(resolved);
+        } else {
+            for attachment_id in data.attachments.as_deref().unwrap_or_default() {
+                attachments
+                    .push(File::use_attachment(db, attachment_id, &message_id, author.id()).await?);
+            }
         }
 
         if !attachments.is_empty() {
@@ -1150,10 +1199,17 @@ impl Message {
 
     /// Delete a message
     pub async fn delete(self, db: &Database) -> Result<()> {
-        let file_ids: Vec<String> = self
+        let mut file_ids: Vec<String> = self
             .attachments
             .map(|files| files.iter().map(|file| file.id.to_string()).collect())
             .unwrap_or_default();
+
+        // Forward snapshots own their (freshly-minted) attachment copies —
+        // they die with the forwarding message. Hash refcounting keeps the
+        // underlying object alive for the original.
+        if let Some(forwarded) = &self.forwarded {
+            file_ids.extend(forwarded.attachments.iter().map(|file| file.id.to_string()));
+        }
 
         if !file_ids.is_empty() {
             db.mark_attachments_as_deleted(&file_ids).await?;

@@ -430,8 +430,17 @@ impl AbstractMessages for MongoDb {
                     "_id": message_id
                 },
                 doc! {
+                    // A large-attachment prune must strip the file from
+                    // wherever it lives on the message: the ordinary
+                    // `attachments` array OR a forwarded snapshot's own
+                    // `forwarded.attachments` copies — otherwise the
+                    // snapshot renders a 404 for a blob that's been
+                    // S3-collected.
                     "$pull": {
                         "attachments": {
+                            "_id": file_id
+                        },
+                        "forwarded.attachments": {
                             "_id": file_id
                         }
                     }

@@ -7,7 +7,7 @@ use revolt_models::v0::{
     FieldsWebhook, Interaction, Member, MemberCompositeKey, Message, PartialChannel, PartialEmoji,
     PartialMember, PartialMessage, PartialRole, PartialServer, PartialSticker, PartialUser,
     PartialUserVoiceState, PartialWebhook, PolicyChange, PollAnswerCount, RemovalIntention,
-    Report, Server, Sticker, User, UserSettings, UserVoiceState, Webhook,
+    Report, ScheduledMessage, Server, Sticker, User, UserSettings, UserVoiceState, Webhook,
 };
 
 use crate::{Account, Database, Session};
@@ -536,6 +536,29 @@ pub enum EventV1 {
     /// notifications, or unread tracking. Gone on reload by design.
     InteractionEphemeralMessage {
         message: Message,
+    },
+
+    /// A message was scheduled for later delivery. Published ONLY on the
+    /// author's private topic — pending messages are never visible to
+    /// other members. The eventual delivery is a normal `Message` event.
+    MessageScheduled {
+        message: ScheduledMessage,
+    },
+
+    /// A scheduled message was cancelled (by the author, or because its
+    /// channel was deleted). Author's private topic only.
+    MessageScheduleCancelled {
+        id: String,
+        channel: String,
+    },
+
+    /// A scheduled message could not be delivered (permissions revoked,
+    /// channel gone, validation failed at fire time — permanent, never
+    /// retried). Author's private topic only.
+    ScheduledMessageFailed {
+        id: String,
+        channel: String,
+        reason: String,
     },
 }
 

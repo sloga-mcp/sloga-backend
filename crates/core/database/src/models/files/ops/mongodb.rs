@@ -135,6 +135,24 @@ impl AbstractAttachments for MongoDb {
         Ok(file)
     }
 
+    /// Repoint an already-claimed attachment's `used_for.id` at a new parent.
+    async fn retarget_attachment(&self, id: &str, new_parent_id: &str) -> Result<()> {
+        self.col::<Document>(COL)
+            .update_one(
+                doc! {
+                    "_id": id
+                },
+                doc! {
+                    "$set": {
+                        "used_for.id": new_parent_id
+                    }
+                },
+            )
+            .await
+            .map(|_| ())
+            .map_err(|_| create_database_error!("update_one", COL))
+    }
+
     /// Mark an attachment as having been reported.
     async fn mark_attachment_as_reported(&self, id: &str) -> Result<()> {
         self.col::<Document>(COL)

@@ -8,7 +8,7 @@ use crate::{
     EventRsvpKey, File, FileHash, Interaction, Invite, Member, MemberCompositeKey, Message,
     MlsCommit, MlsGroup, MlsJoinIntent, MlsKeyPackage, PolicyChange, Poll, PollVote,
     RatelimitEvent, ReminderSent,
-    ReminderSentKey, Report, Server, ServerBan, Snapshot, Sticker, ThreadMember,
+    ReminderSentKey, Report, ScheduledMessage, Server, ServerBan, Snapshot, Sticker, ThreadMember,
     ThreadMemberCompositeKey, User, UserSettings, Webhook, Account, AccountInvite, Session,
     MFATicket
 };
@@ -35,6 +35,7 @@ database_derived!(
         pub messages: Arc<Mutex<HashMap<String, Message>>>,
         pub polls: Arc<Mutex<HashMap<String, Poll>>>,
         pub poll_votes: Arc<Mutex<HashMap<String, PollVote>>>,
+        pub scheduled_messages: Arc<Mutex<HashMap<String, ScheduledMessage>>>,
         pub policy_changes: Arc<Mutex<HashMap<String, PolicyChange>>>,
         pub ratelimit_events: Arc<Mutex<HashMap<String, RatelimitEvent>>>,
         pub user_settings: Arc<Mutex<HashMap<String, UserSettings>>>,

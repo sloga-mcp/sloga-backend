@@ -279,6 +279,16 @@ impl MongoDb {
             .await
             .map_err(|_| create_database_error!("delete_many", "polls"))?;
 
+        // Delete scheduled messages targeting the server's channels so they
+        // don't sit as pending rows that can only fail at fire time. Rows
+        // carry `server`, so this also covers thread-targeted rows.
+        self.col::<Document>("scheduled_messages")
+            .delete_many(doc! {
+                "server": &server_id
+            })
+            .await
+            .map_err(|_| create_database_error!("delete_many", "scheduled_messages"))?;
+
         // Delete server-scoped slash commands (global commands untouched;
         // a deleted server must not linger in bots' command lists forever).
         self.col::<Document>("application_commands")

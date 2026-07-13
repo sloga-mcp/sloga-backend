@@ -32,8 +32,14 @@ serde = { workspace = true }
 iso8601-timestamp = { workspace = true, features = ["serde", "bson"] }
 
 # Core
-revolt-database = { workspace = true }
+# Scheduled-message delivery runs Message::create_from_api with FULL live
+# side-effects — the "tasks" feature (push/ack/embed queues) and "mongodb"
+# are default features today, but are spelled out so a future
+# default-features change cannot silently degrade scheduled sends.
+revolt-database = { workspace = true, features = ["tasks", "mongodb"] }
 revolt-result = { workspace = true }
 revolt-config = { workspace = true }
 revolt-files = { workspace = true }
 revolt-permissions = { workspace = true }
+revolt-presence = { workspace = true }
+revolt-models = { workspace = true }

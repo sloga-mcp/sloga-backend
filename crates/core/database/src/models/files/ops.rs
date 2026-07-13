@@ -37,6 +37,13 @@ pub trait AbstractAttachments: Sync + Send {
         uploader_id: String,
     ) -> Result<File>;
 
+    /// Repoint an already-claimed attachment's `used_for.id` at a new
+    /// parent. Used by scheduled-message delivery: attachments are claimed
+    /// against the scheduled row at schedule time (so the dangling-file
+    /// sweep can't collect them) and retargeted to the real message id at
+    /// fire time.
+    async fn retarget_attachment(&self, id: &str, new_parent_id: &str) -> Result<()>;
+
     /// Mark an attachment as having been reported.
     async fn mark_attachment_as_reported(&self, id: &str) -> Result<()>;
 

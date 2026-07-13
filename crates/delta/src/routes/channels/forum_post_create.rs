@@ -136,6 +136,7 @@ pub async fn create_forum_post(
         permissions.has_channel_permission(ChannelPermission::SendEmbeds),
         allow_mentions,
         Some(post_id.clone()),
+        None,
     )
     .await
     {

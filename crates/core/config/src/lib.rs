@@ -400,6 +400,8 @@ pub struct GlobalLimits {
     pub server_roles: usize,
     pub server_channels: usize,
     pub threads_per_channel: usize,
+    pub scheduled_messages_per_channel: usize,
+    pub scheduled_messages_per_user: usize,
 
     pub new_user_hours: usize,
 

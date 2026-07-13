@@ -26,7 +26,7 @@ struct MigrationInfo {
     revision: i32,
 }
 
-pub const LATEST_REVISION: i32 = 59; // MUST BE +1 to last migration
+pub const LATEST_REVISION: i32 = 60; // MUST BE +1 to last migration
 
 pub async fn migrate_database(db: &MongoDb) {
     let migrations = db.col::<Document>("migrations");
@@ -1932,6 +1932,51 @@ pub async fn run_migrations(db: &MongoDb, revision: i32) -> i32 {
             })
             .await
             .expect("Failed to create poll_votes indexes.");
+    }
+
+    if revision <= 59 {
+        info!("Running migration [revision 59 / 13-07-2026]: Create scheduled_messages collection (message scheduling)");
+
+        // Existing deployments predate scheduled messages: init.rs only
+        // covers fresh DBs. Collection + indexes mirror init.rs exactly;
+        // both operations are idempotent (create_collection errors are
+        // ignored; createIndexes is a no-op when key+name already match),
+        // so a re-run or a fresh DB is safe.
+        db.db().create_collection("scheduled_messages").await.ok();
+
+        db.db()
+            .run_command(doc! {
+                "createIndexes": "scheduled_messages",
+                "indexes": [
+                    // Serves the crond due-delivery scan (pending rows past
+                    // their instant) and the retention sweep.
+                    {
+                        "key": {
+                            "status": 1_i32,
+                            "scheduled_at": 1_i32
+                        },
+                        "name": "status_scheduled_at"
+                    },
+                    // Serves the author-scoped pending list and the pending
+                    // caps.
+                    {
+                        "key": {
+                            "author": 1_i32,
+                            "channel": 1_i32
+                        },
+                        "name": "author_channel"
+                    },
+                    // Serves the channel-deletion cascade.
+                    {
+                        "key": {
+                            "channel": 1_i32
+                        },
+                        "name": "channel"
+                    }
+                ]
+            })
+            .await
+            .expect("Failed to create scheduled_messages indexes.");
     }
 
     // Reminder to update LATEST_REVISION when adding new migrations.

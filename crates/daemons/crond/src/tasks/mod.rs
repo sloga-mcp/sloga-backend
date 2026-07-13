@@ -12,4 +12,5 @@ pub mod prune_members;
 pub mod prune_mfa_tickets;
 pub mod prune_mls_groups;
 pub mod prune_mls_key_packages;
+pub mod scheduled_messages;
 pub mod thread_archiver;

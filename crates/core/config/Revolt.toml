@@ -253,6 +253,10 @@ server_channels = 200
 # Maximum active (non-archived) threads per text channel
 threads_per_channel = 100
 
+# Pending scheduled-message caps (per author)
+scheduled_messages_per_channel = 10
+scheduled_messages_per_user = 30
+
 # How many hours since creation a user is considered new
 new_user_hours = 72
 

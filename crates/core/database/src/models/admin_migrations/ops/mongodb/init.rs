@@ -170,6 +170,10 @@ pub async fn create_database(db: &MongoDb) {
         .await
         .expect("Failed to create poll_votes collection.");
 
+    db.create_collection("scheduled_messages")
+        .await
+        .expect("Failed to create scheduled_messages collection.");
+
     db.run_command(doc! {
         "createIndexes": "users",
         "indexes": [
@@ -373,6 +377,38 @@ pub async fn create_database(db: &MongoDb) {
     })
     .await
     .expect("Failed to create poll_votes index.");
+
+    db.run_command(doc! {
+        "createIndexes": "scheduled_messages",
+        "indexes": [
+            // Serves the crond due-delivery scan (pending rows past their
+            // instant) and the retention sweep.
+            {
+                "key": {
+                    "status": 1_i32,
+                    "scheduled_at": 1_i32
+                },
+                "name": "status_scheduled_at"
+            },
+            // Serves the author-scoped pending list and the pending caps.
+            {
+                "key": {
+                    "author": 1_i32,
+                    "channel": 1_i32
+                },
+                "name": "author_channel"
+            },
+            // Serves the channel-deletion cascade.
+            {
+                "key": {
+                    "channel": 1_i32
+                },
+                "name": "channel"
+            }
+        ]
+    })
+    .await
+    .expect("Failed to create scheduled_messages index.");
 
     db.run_command(doc! {
         "createIndexes": "channels",

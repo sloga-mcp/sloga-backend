@@ -67,6 +67,7 @@ impl IntoResponse for Error {
             ErrorType::InteractionExpired => StatusCode::GONE,
             ErrorType::InteractionAlreadyResponded => StatusCode::CONFLICT,
             ErrorType::PollClosed => StatusCode::GONE,
+            ErrorType::TooManyScheduledMessages { .. } => StatusCode::BAD_REQUEST,
 
             ErrorType::CannotReportYourself => StatusCode::BAD_REQUEST,
 

@@ -67,6 +67,16 @@ pub async fn task(db: Database, _: revolt_database::AMQP) -> Result<()> {
                     if exempt_channels.contains(channel) {
                         continue;
                     }
+                } else {
+                    // No message owns this file — it may instead be claimed
+                    // against a PENDING scheduled-message row (attachments
+                    // are claimed at schedule time and only retargeted to a
+                    // real message at fire time). Pruning it would guarantee
+                    // a failed send, so leave it until the row fires or is
+                    // cancelled (which releases it into the normal sweep).
+                    if db.fetch_scheduled_message(&used_for.id).await.is_ok() {
+                        continue;
+                    }
                 }
 
                 // 1. Strip the attachment from its parent message so clients stop

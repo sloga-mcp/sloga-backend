@@ -221,6 +221,12 @@ impl Server {
         // deletion without having announced it.
         db.delete_calendar_for_server(&self.id).await?;
 
+        // Scheduled-message cascade: cancel pending rows LOUDLY (release
+        // claimed attachments + notify each author privately) before the
+        // channels are dropped wholesale — the Mongo bulk cascade cannot
+        // notify or release. Rows carry `server`, so threads are covered.
+        crate::ScheduledMessage::cancel_all_for_server(db, &self.id).await?;
+
         EventV1::ServerDelete {
             id: self.id.clone(),
         }
