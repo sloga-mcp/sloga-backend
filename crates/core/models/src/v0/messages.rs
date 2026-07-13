@@ -87,6 +87,14 @@ auto_derived_partial!(
         #[serde(skip_serializing_if = "Option::is_none")]
         pub command_context: Option<MessageInteraction>,
 
+        /// Interactive components attached to this message (buttons /
+        /// selects), arranged in rows.
+        ///
+        /// Only bot authors may attach components — the send path rejects
+        /// them from regular users and webhooks.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub components: Option<Vec<ActionRow>>,
+
         /// Sticker IDs attached to this message
         #[cfg_attr(
             feature = "serde",
@@ -306,6 +314,10 @@ auto_derived!(
         /// Information about how this message should be interacted with
         pub interactions: Option<Interactions>,
 
+        /// Interactive components to attach to this message (bot authors
+        /// only; max 5 rows of 5 buttons or 1 select each)
+        pub components: Option<Vec<ActionRow>>,
+
         /// Sticker IDs to attach to this message
         pub sticker_ids: Option<Vec<String>>,
 
@@ -443,8 +455,188 @@ auto_derived!(
     /// Optional fields on message
     pub enum FieldsMessage {
         Pinned,
+        /// Component rows removed (a component edit-response with an empty
+        /// array clears the message's components)
+        Components,
     }
 );
+
+/// Maximum number of component rows on a message
+pub const MAX_COMPONENT_ROWS: usize = 5;
+
+/// Maximum number of buttons in a single row
+pub const MAX_COMPONENTS_PER_ROW: usize = 5;
+
+/// Maximum number of options on a string select
+pub const MAX_SELECT_OPTIONS: usize = 25;
+
+auto_derived!(
+    /// Visual style of a button component
+    pub enum ButtonStyle {
+        /// Prominent, brand-coloured
+        Primary,
+        /// Neutral
+        Secondary,
+        /// Green / confirm
+        Success,
+        /// Red / destructive
+        Danger,
+    }
+
+    /// One choice offered by a string select
+    pub struct SelectOption {
+        /// Human-readable option label
+        pub label: String,
+        /// Value submitted when this option is picked
+        pub value: String,
+    }
+
+    /// An interactive component on a message
+    #[serde(tag = "type")]
+    pub enum Component {
+        /// A clickable button
+        Button {
+            /// Bot-chosen id, echoed back on interaction
+            custom_id: String,
+            /// Button label
+            label: String,
+            /// Visual style
+            style: ButtonStyle,
+            /// Whether the button is non-interactive
+            #[serde(skip_serializing_if = "crate::if_false", default)]
+            disabled: bool,
+        },
+        /// A single-choice dropdown
+        StringSelect {
+            /// Bot-chosen id, echoed back on interaction
+            custom_id: String,
+            /// Choices offered (1..=25)
+            options: Vec<SelectOption>,
+            /// Hint shown before a choice is made
+            #[serde(skip_serializing_if = "Option::is_none")]
+            placeholder: Option<String>,
+            /// Whether the select is non-interactive
+            #[serde(skip_serializing_if = "crate::if_false", default)]
+            disabled: bool,
+        },
+    }
+
+    /// A horizontal row of components
+    pub struct ActionRow {
+        /// Components in this row (5 buttons, or exactly 1 select)
+        pub components: Vec<Component>,
+    }
+);
+
+impl Component {
+    /// The component's bot-chosen id.
+    pub fn custom_id(&self) -> &str {
+        match self {
+            Component::Button { custom_id, .. } => custom_id,
+            Component::StringSelect { custom_id, .. } => custom_id,
+        }
+    }
+
+    /// Whether the component is marked non-interactive.
+    pub fn is_disabled(&self) -> bool {
+        match self {
+            Component::Button { disabled, .. } => *disabled,
+            Component::StringSelect { disabled, .. } => *disabled,
+        }
+    }
+}
+
+impl ActionRow {
+    /// Structural validation for a message's component rows (validator
+    /// derive can't recurse into `Vec<ActionRow>`; same approach as
+    /// `CommandOption::validate_structure`).
+    pub fn validate_structure(rows: &[ActionRow]) -> std::result::Result<(), String> {
+        if rows.is_empty() {
+            return Err("components must contain at least one row".to_string());
+        }
+
+        if rows.len() > MAX_COMPONENT_ROWS {
+            return Err(format!("at most {MAX_COMPONENT_ROWS} component rows"));
+        }
+
+        let mut seen_ids: Vec<&str> = Vec::new();
+
+        for row in rows {
+            if row.components.is_empty() {
+                return Err("component rows must not be empty".to_string());
+            }
+
+            let has_select = row
+                .components
+                .iter()
+                .any(|c| matches!(c, Component::StringSelect { .. }));
+
+            if has_select && row.components.len() != 1 {
+                return Err("a select must be the only component in its row".to_string());
+            }
+
+            if row.components.len() > MAX_COMPONENTS_PER_ROW {
+                return Err(format!(
+                    "at most {MAX_COMPONENTS_PER_ROW} components per row"
+                ));
+            }
+
+            for component in &row.components {
+                let custom_id = component.custom_id();
+                if custom_id.is_empty() || custom_id.len() > 64 {
+                    return Err("custom_id must be 1..=64 characters".to_string());
+                }
+
+                if seen_ids.contains(&custom_id) {
+                    return Err(format!("duplicate custom_id `{custom_id}`"));
+                }
+                seen_ids.push(custom_id);
+
+                match component {
+                    Component::Button { label, .. } => {
+                        if label.is_empty() || label.len() > 80 {
+                            return Err("button labels must be 1..=80 characters".to_string());
+                        }
+                    }
+                    Component::StringSelect {
+                        options,
+                        placeholder,
+                        ..
+                    } => {
+                        if options.is_empty() || options.len() > MAX_SELECT_OPTIONS {
+                            return Err(format!(
+                                "selects must offer 1..={MAX_SELECT_OPTIONS} options"
+                            ));
+                        }
+
+                        if placeholder.as_ref().is_some_and(|p| p.len() > 100) {
+                            return Err("placeholder must be at most 100 characters".to_string());
+                        }
+
+                        for (index, option) in options.iter().enumerate() {
+                            if option.label.is_empty()
+                                || option.label.len() > 100
+                                || option.value.is_empty()
+                                || option.value.len() > 100
+                            {
+                                return Err("select option labels and values must be 1..=100 characters".to_string());
+                            }
+
+                            if options[..index].iter().any(|o| o.value == option.value) {
+                                return Err(format!(
+                                    "duplicate select option value `{}`",
+                                    option.value
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+}
 
 /// Message Author Abstraction
 #[derive(Clone)]
@@ -579,5 +771,97 @@ impl PushNotification {
             message: msg,
             channel,
         }
+    }
+}
+
+#[cfg(test)]
+mod component_tests {
+    use super::*;
+
+    fn button(id: &str) -> Component {
+        Component::Button {
+            custom_id: id.to_string(),
+            label: "Click".to_string(),
+            style: ButtonStyle::Primary,
+            disabled: false,
+        }
+    }
+
+    fn select(id: &str, values: &[&str]) -> Component {
+        Component::StringSelect {
+            custom_id: id.to_string(),
+            options: values
+                .iter()
+                .map(|value| SelectOption {
+                    label: value.to_string(),
+                    value: value.to_string(),
+                })
+                .collect(),
+            placeholder: None,
+            disabled: false,
+        }
+    }
+
+    fn rows(rows: Vec<Vec<Component>>) -> Vec<ActionRow> {
+        rows.into_iter()
+            .map(|components| ActionRow { components })
+            .collect()
+    }
+
+    #[test]
+    fn component_structure_limits() {
+        // Maximal legal layout: 5 rows of 5 buttons
+        let full = rows((0..5)
+            .map(|r| (0..5).map(|c| button(&format!("b{r}{c}"))).collect())
+            .collect());
+        assert!(ActionRow::validate_structure(&full).is_ok());
+
+        // A lone select in a row is fine
+        assert!(
+            ActionRow::validate_structure(&rows(vec![vec![select("s", &["x", "y"])]])).is_ok()
+        );
+
+        // Empty structures are rejected
+        assert!(ActionRow::validate_structure(&[]).is_err());
+        assert!(ActionRow::validate_structure(&rows(vec![vec![]])).is_err());
+
+        // Too many rows / too many buttons per row
+        let six_rows = rows((0..6).map(|r| vec![button(&format!("r{r}"))]).collect());
+        assert!(ActionRow::validate_structure(&six_rows).is_err());
+        let six_wide = rows(vec![(0..6).map(|c| button(&format!("c{c}"))).collect()]);
+        assert!(ActionRow::validate_structure(&six_wide).is_err());
+
+        // A select must be alone in its row
+        assert!(ActionRow::validate_structure(&rows(vec![vec![
+            select("s", &["x"]),
+            button("b"),
+        ]]))
+        .is_err());
+
+        // custom_ids are unique across the whole message
+        assert!(ActionRow::validate_structure(&rows(vec![
+            vec![button("dup")],
+            vec![button("dup")],
+        ]))
+        .is_err());
+
+        // custom_id / label bounds
+        assert!(ActionRow::validate_structure(&rows(vec![vec![button(&"x".repeat(65))]])).is_err());
+        assert!(ActionRow::validate_structure(&rows(vec![vec![Component::Button {
+            custom_id: "b".to_string(),
+            label: String::new(),
+            style: ButtonStyle::Primary,
+            disabled: false,
+        }]]))
+        .is_err());
+
+        // Select option bounds: 0 options, >25 options, duplicate values
+        assert!(ActionRow::validate_structure(&rows(vec![vec![select("s", &[])]])).is_err());
+        let many: Vec<String> = (0..26).map(|i| format!("v{i}")).collect();
+        let many_refs: Vec<&str> = many.iter().map(String::as_str).collect();
+        assert!(ActionRow::validate_structure(&rows(vec![vec![select("s", &many_refs)]])).is_err());
+        assert!(
+            ActionRow::validate_structure(&rows(vec![vec![select("s", &["x", "x"])]])).is_err()
+        );
     }
 }

@@ -44,6 +44,8 @@ mod tests {
             message_id: None,
             command_id: Some("01CMD0000000000000000000000".to_string()),
             command_name: Some("ping".to_string()),
+            custom_id: None,
+            values: Vec::new(),
             options: Default::default(),
             responded: false,
         }

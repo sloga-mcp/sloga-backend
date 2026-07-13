@@ -19,6 +19,7 @@ mod message_clear_reactions;
 mod message_delete;
 mod message_edit;
 mod message_fetch;
+mod message_interact;
 mod message_pin;
 mod message_query;
 mod message_react;
@@ -77,5 +78,6 @@ pub fn routes() -> (Vec<Route>, OpenApi) {
         forum_posts_fetch::fetch_forum_posts,
         command_list::fetch_channel_commands,
         interaction_create::interaction_create,
+        message_interact::message_interact,
     ]
 }

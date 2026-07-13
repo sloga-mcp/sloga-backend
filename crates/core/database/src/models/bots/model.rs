@@ -241,6 +241,8 @@ mod tests {
                 message_id: None,
                 command_id: None,
                 command_name: None,
+                custom_id: None,
+                values: Vec::new(),
                 options: Default::default(),
                 responded: false,
             })

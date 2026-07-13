@@ -125,6 +125,8 @@ pub async fn interaction_create(
         message_id: None,
         command_id: Some(command.id.clone()),
         command_name: Some(command.name.clone()),
+        custom_id: None,
+        values: Vec::new(),
         options: data.options,
         responded: false,
     };

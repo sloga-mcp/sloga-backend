@@ -50,6 +50,12 @@ auto_derived!(
         /// Name of the invoked command (convenience copy)
         #[serde(skip_serializing_if = "Option::is_none")]
         pub command_name: Option<String>,
+        /// Custom id of the clicked component (Component kind)
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub custom_id: Option<String>,
+        /// Submitted select values (Component kind, selects only)
+        #[serde(skip_serializing_if = "Vec::is_empty", default)]
+        pub values: Vec<String>,
         /// Supplied option values, validated against the command's schema
         #[serde(skip_serializing_if = "HashMap::is_empty", default)]
         pub options: HashMap<String, String>,
@@ -122,8 +128,11 @@ impl Interaction {
             channel_id: self.channel_id,
             user_id: self.user_id,
             bot_id: self.bot_id,
+            message_id: self.message_id,
             command_id: self.command_id,
             command_name: self.command_name,
+            custom_id: self.custom_id,
+            values: self.values,
             options: self.options,
             token: self.token,
         }
@@ -155,6 +164,8 @@ mod tests {
             message_id: None,
             command_id: None,
             command_name: None,
+            custom_id: None,
+            values: Vec::new(),
             options: Default::default(),
             responded: false,
         }

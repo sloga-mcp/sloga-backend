@@ -1,9 +1,11 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use iso8601_timestamp::Timestamp;
 use revolt_database::util::permissions::DatabasePermissionQuery;
 use revolt_database::util::reference::Reference;
 use revolt_database::{
-    Channel, Database, InteractionKind, Message, MessageFlagsValue, MessageInteraction, User, AMQP,
+    Channel, Database, InteractionKind, Message, MessageFlagsValue, MessageInteraction,
+    PartialMessage, User, AMQP,
 };
 use revolt_models::v0::{self, MessageFlags};
 use revolt_permissions::{calculate_channel_permissions, ChannelPermission, PermissionQuery};
@@ -52,8 +54,41 @@ pub async fn interaction_respond(
     }
     interaction.assert_token(&data.token)?;
 
-    if !matches!(interaction.kind, InteractionKind::Command) {
+    // Command (slice 1) and Component (slice 2) interactions accept message
+    // responses; autocomplete / modal kinds are later slices.
+    if !matches!(
+        interaction.kind,
+        InteractionKind::Command | InteractionKind::Component
+    ) {
         return Err(create_error!(InvalidOperation));
+    }
+
+    if let Some(components) = &data.components {
+        // On the edit path an explicit empty array means "remove the rows"
+        // (one-shot flows must be able to retire their buttons); everywhere
+        // else components must be structurally valid, which implies
+        // non-empty.
+        if !(data.edit && components.is_empty()) {
+            v0::ActionRow::validate_structure(components)
+                .map_err(|error| create_error!(FailedValidation { error }))?;
+        }
+    }
+
+    // Editing is only meaningful for component interactions — it targets the
+    // message the clicked component lives on.
+    if data.edit
+        && (!matches!(interaction.kind, InteractionKind::Component)
+            || interaction.message_id.is_none())
+    {
+        return Err(create_error!(InvalidOperation));
+    }
+
+    // A response must change something: a new message needs content or
+    // components; an edit needs at least one of the two to replace.
+    if data.content.is_none() && data.components.is_none() {
+        return Err(create_error!(FailedValidation {
+            error: "response must carry content or components".to_string()
+        }));
     }
 
     let now_ms = SystemTime::now()
@@ -86,9 +121,58 @@ pub async fn interaction_respond(
     // A thread archived/locked since invocation rejects the response too.
     crate::util::threads::ensure_thread_writable(&channel, &permissions)?;
 
+    // Edit path: fetch and verify the component's host message BEFORE
+    // claiming the single-use slot, so a deleted message doesn't burn it.
+    let mut edit_target = None;
+    if data.edit {
+        let Some(message_id) = interaction.message_id.clone() else {
+            return Err(create_error!(InvalidOperation));
+        };
+        let message = db
+            .fetch_message(&message_id)
+            .await
+            .map_err(|_| create_error!(NotFound))?;
+
+        // Bots only ever edit their own component message, in the channel
+        // the interaction was created in.
+        if message.author != user.id || message.channel != interaction.channel_id {
+            return Err(create_error!(InvalidOperation));
+        }
+
+        edit_target = Some(message);
+    }
+
     // Single-use: atomically claim the response slot (replay defence).
+    // A transient send/update failure AFTER this point burns the slot —
+    // accepted trade-off (slice-1 LOW-11, Discord-comparable): the claim
+    // must precede the side effect or replays could double-post.
     if !db.try_claim_interaction_response(&interaction.id).await? {
         return Err(create_error!(InteractionAlreadyResponded));
+    }
+
+    if let Some(mut message) = edit_target {
+        // Component-driven update of the original bot message; fans out as
+        // a regular MessageUpdate on the channel topic.
+        let mut partial = PartialMessage {
+            edited: Some(Timestamp::now_utc()),
+            ..Default::default()
+        };
+        let mut remove = Vec::new();
+        if let Some(content) = data.content {
+            partial.content = Some(content);
+        }
+        if let Some(components) = data.components {
+            if components.is_empty() {
+                // Explicit empty array retires the rows entirely
+                remove.push(revolt_database::FieldsMessage::Components);
+            } else {
+                partial.components = Some(components);
+            }
+        }
+
+        message.update(db, partial, remove).await?;
+
+        return Ok(Json(message.into_model(None, None)));
     }
 
     // Build author objects for the event fan-out
@@ -107,24 +191,40 @@ pub async fn interaction_respond(
         .as_ref()
         .map(|member| member.clone().into_owned().into());
 
-    // Exact DiceRoll pattern: the flag is set here, server-side, and the
-    // regular send path rejects client-supplied flag values above 7.
-    let mut flags = MessageFlagsValue(0);
-    flags.set(MessageFlags::Interaction, true);
+    let mut message = match interaction.kind {
+        InteractionKind::Command => {
+            // Exact DiceRoll pattern: the flag is set here, server-side, and
+            // the regular send path rejects client-supplied flag values
+            // above 7 — flag + command_context prove "used /cmd".
+            let mut flags = MessageFlagsValue(0);
+            flags.set(MessageFlags::Interaction, true);
 
-    let mut message = Message {
-        id: Ulid::new().to_string(),
-        channel: channel.id().to_string(),
-        author: user.id.clone(),
-        content: Some(data.content),
-        flags: Some(flags.0),
-        command_context: Some(MessageInteraction {
-            id: interaction.id.clone(),
-            user_id: interaction.user_id.clone(),
-            command_name: interaction.command_name.clone().unwrap_or_default(),
-        }),
-        ..Default::default()
+            Message {
+                flags: Some(flags.0),
+                command_context: Some(MessageInteraction {
+                    id: interaction.id.clone(),
+                    user_id: interaction.user_id.clone(),
+                    command_name: interaction.command_name.clone().unwrap_or_default(),
+                }),
+                ..Default::default()
+            }
+        }
+        // Component follow-ups are plain bot messages; provenance comes
+        // from replying to the message the component lives on ("used /cmd"
+        // is reserved for actual command invocations).
+        InteractionKind::Component => Message {
+            replies: interaction.message_id.clone().map(|id| vec![id]),
+            ..Default::default()
+        },
+        // Rejected above.
+        _ => return Err(create_error!(InvalidOperation)),
     };
+
+    message.id = Ulid::new().to_string();
+    message.channel = channel.id().to_string();
+    message.author = user.id.clone();
+    message.content = data.content;
+    message.components = data.components;
 
     message
         .send(
@@ -144,7 +244,9 @@ pub async fn interaction_respond(
 #[cfg(test)]
 mod test {
     use crate::{rocket, util::test::TestHarness};
-    use revolt_database::{Bot, Interaction, InteractionKind, Member, MessageFlagsValue, Server, User};
+    use revolt_database::{
+        Bot, Interaction, InteractionKind, Member, Message, MessageFlagsValue, Server, User,
+    };
     use revolt_models::v0::{self, MessageFlags};
     use rocket::http::{ContentType, Header, Status};
     use serde_json::json;
@@ -181,6 +283,8 @@ mod test {
             message_id: None,
             command_id: Some("01COMMAND000000000000000000".to_string()),
             command_name: Some("ping".to_string()),
+            custom_id: None,
+            values: Vec::new(),
             options: Default::default(),
             responded: false,
         }
@@ -404,6 +508,337 @@ mod test {
         assert!(
             message.command_context.is_none(),
             "client-supplied command_context must be stripped"
+        );
+    }
+    fn component_message(channel_id: &str, author_id: &str) -> Message {
+        Message {
+            id: ulid::Ulid::new().to_string(),
+            channel: channel_id.to_string(),
+            author: author_id.to_string(),
+            content: Some("pick something".to_string()),
+            components: Some(vec![v0::ActionRow {
+                components: vec![v0::Component::Button {
+                    custom_id: "btn_a".to_string(),
+                    label: "Click me".to_string(),
+                    style: v0::ButtonStyle::Primary,
+                    disabled: false,
+                }],
+            }]),
+            ..Default::default()
+        }
+    }
+
+    fn component_interaction_row(
+        token: &str,
+        bot_id: &str,
+        user_id: &str,
+        channel_id: &str,
+        message_id: &str,
+    ) -> Interaction {
+        Interaction {
+            id: ulid::Ulid::new().to_string(),
+            kind: InteractionKind::Component,
+            token: token.to_string(),
+            bot_id: bot_id.to_string(),
+            user_id: user_id.to_string(),
+            channel_id: channel_id.to_string(),
+            message_id: Some(message_id.to_string()),
+            command_id: None,
+            command_name: None,
+            custom_id: Some("btn_a".to_string()),
+            values: Vec::new(),
+            options: Default::default(),
+            responded: false,
+        }
+    }
+
+    #[rocket::async_test]
+    async fn component_respond_edit_and_followup_paths() {
+        let harness = TestHarness::new().await;
+        let (_, _session, user) = harness.new_user().await;
+        let (server, _) = harness.new_server(&user).await;
+        let channel = harness.new_channel(&server).await;
+        let (bot, _) = setup_bot(&harness, &user, &server).await;
+
+        let message = component_message(channel.id(), &bot.id);
+        harness.db.insert_message(&message).await.expect("message");
+
+        // Edit path: the bot updates the message the component lives on
+        let interaction =
+            component_interaction_row("tok-edit", &bot.id, &user.id, channel.id(), &message.id);
+        harness
+            .db
+            .insert_interaction(&interaction)
+            .await
+            .expect("interaction");
+
+        let new_components = json!([
+            { "components": [
+                { "type": "Button", "custom_id": "btn_b", "label": "Next", "style": "Secondary" }
+            ] }
+        ]);
+        let response = harness
+            .client
+            .post(format!("/interactions/{}/respond", interaction.id))
+            .header(Header::new("x-bot-token", bot.token.clone()))
+            .header(ContentType::JSON)
+            .body(
+                json!({
+                    "token": "tok-edit",
+                    "content": "updated!",
+                    "components": new_components,
+                    "edit": true
+                })
+                .to_string(),
+            )
+            .dispatch()
+            .await;
+        assert_eq!(response.status(), Status::Ok);
+
+        let updated = harness
+            .db
+            .fetch_message(&message.id)
+            .await
+            .expect("message");
+        assert_eq!(updated.content.as_deref(), Some("updated!"));
+        assert!(updated.edited.is_some(), "edit must stamp the timestamp");
+        let rows = updated.components.expect("components");
+        assert_eq!(rows[0].components[0].custom_id(), "btn_b");
+
+        // The single-use slot still applies to edits (replay defence)
+        let response = harness
+            .client
+            .post(format!("/interactions/{}/respond", interaction.id))
+            .header(Header::new("x-bot-token", bot.token.clone()))
+            .header(ContentType::JSON)
+            .body(json!({ "token": "tok-edit", "content": "again", "edit": true }).to_string())
+            .dispatch()
+            .await;
+        assert_eq!(response.status(), Status::Conflict);
+
+        // Follow-up path: a component response WITHOUT edit is a plain bot
+        // message replying to the component's host message — no Interaction
+        // flag, no command_context ("used /cmd" is reserved for commands).
+        let followup =
+            component_interaction_row("tok-new", &bot.id, &user.id, channel.id(), &message.id);
+        harness
+            .db
+            .insert_interaction(&followup)
+            .await
+            .expect("interaction");
+
+        let response = harness
+            .client
+            .post(format!("/interactions/{}/respond", followup.id))
+            .header(Header::new("x-bot-token", bot.token.clone()))
+            .header(ContentType::JSON)
+            .body(json!({ "token": "tok-new", "content": "you clicked!" }).to_string())
+            .dispatch()
+            .await;
+        assert_eq!(response.status(), Status::Ok);
+        let reply: v0::Message = response.into_json().await.expect("`Message`");
+        assert_eq!(reply.replies, Some(vec![message.id.clone()]));
+        assert!(
+            !MessageFlagsValue(reply.flags).has(MessageFlags::Interaction),
+            "component follow-ups are not command responses"
+        );
+        assert!(reply.command_context.is_none());
+
+        // Editing is meaningless for Command interactions
+        let command_interaction = interaction_row(
+            ulid::Ulid::new().to_string(),
+            "tok-cmd",
+            &bot.id,
+            &user.id,
+            channel.id(),
+        );
+        harness
+            .db
+            .insert_interaction(&command_interaction)
+            .await
+            .expect("interaction");
+        let response = harness
+            .client
+            .post(format!("/interactions/{}/respond", command_interaction.id))
+            .header(Header::new("x-bot-token", bot.token.clone()))
+            .header(ContentType::JSON)
+            .body(json!({ "token": "tok-cmd", "content": "nope", "edit": true }).to_string())
+            .dispatch()
+            .await;
+        assert_ne!(
+            response.status(),
+            Status::Ok,
+            "edit must be rejected for Command interactions"
+        );
+
+        // Retiring the rows: an edit with an explicit empty array clears
+        // the message's components entirely (one-shot flows must be able
+        // to take their buttons out of service).
+        let clear = component_interaction_row(
+            "tok-clear",
+            &bot.id,
+            &user.id,
+            channel.id(),
+            &message.id,
+        );
+        harness.db.insert_interaction(&clear).await.expect("row");
+        let response = harness
+            .client
+            .post(format!("/interactions/{}/respond", clear.id))
+            .header(Header::new("x-bot-token", bot.token.clone()))
+            .header(ContentType::JSON)
+            .body(
+                json!({ "token": "tok-clear", "edit": true, "components": [] }).to_string(),
+            )
+            .dispatch()
+            .await;
+        assert_eq!(response.status(), Status::Ok);
+        let retired = harness
+            .db
+            .fetch_message(&message.id)
+            .await
+            .expect("message");
+        assert!(
+            retired.components.is_none(),
+            "an empty array on the edit path must clear components"
+        );
+
+        // A response must change something
+        let empty = component_interaction_row(
+            "tok-empty",
+            &bot.id,
+            &user.id,
+            channel.id(),
+            &message.id,
+        );
+        harness.db.insert_interaction(&empty).await.expect("row");
+        let response = harness
+            .client
+            .post(format!("/interactions/{}/respond", empty.id))
+            .header(Header::new("x-bot-token", bot.token.clone()))
+            .header(ContentType::JSON)
+            .body(json!({ "token": "tok-empty" }).to_string())
+            .dispatch()
+            .await;
+        assert_ne!(
+            response.status(),
+            Status::Ok,
+            "a response with neither content nor components is rejected"
+        );
+    }
+
+    #[rocket::async_test]
+    async fn component_edit_of_deleted_message_does_not_burn_the_slot() {
+        let harness = TestHarness::new().await;
+        let (_, _session, user) = harness.new_user().await;
+        let (server, _) = harness.new_server(&user).await;
+        let channel = harness.new_channel(&server).await;
+        let (bot, _) = setup_bot(&harness, &user, &server).await;
+
+        // Interaction points at a message that no longer exists
+        let interaction = component_interaction_row(
+            "tok-gone",
+            &bot.id,
+            &user.id,
+            channel.id(),
+            "01DELETED000000000000000000",
+        );
+        harness
+            .db
+            .insert_interaction(&interaction)
+            .await
+            .expect("interaction");
+
+        let response = harness
+            .client
+            .post(format!("/interactions/{}/respond", interaction.id))
+            .header(Header::new("x-bot-token", bot.token.clone()))
+            .header(ContentType::JSON)
+            .body(json!({ "token": "tok-gone", "content": "edit me", "edit": true }).to_string())
+            .dispatch()
+            .await;
+        assert_eq!(response.status(), Status::NotFound);
+
+        // The failed edit must not have consumed the single-use slot: the
+        // bot can still answer with a plain follow-up message.
+        let response = harness
+            .client
+            .post(format!("/interactions/{}/respond", interaction.id))
+            .header(Header::new("x-bot-token", bot.token.clone()))
+            .header(ContentType::JSON)
+            .body(json!({ "token": "tok-gone", "content": "fallback" }).to_string())
+            .dispatch()
+            .await;
+        assert_eq!(response.status(), Status::Ok);
+    }
+
+    #[rocket::async_test]
+    async fn component_edit_rechecks_bot_standing_at_response_time() {
+        let harness = TestHarness::new().await;
+        let (_, _session, user) = harness.new_user().await;
+        let (server, _) = harness.new_server(&user).await;
+        let channel = harness.new_channel(&server).await;
+        let (bot, bot_user) = setup_bot(&harness, &user, &server).await;
+
+        let message = component_message(channel.id(), &bot.id);
+        harness.db.insert_message(&message).await.expect("message");
+
+        let interaction = component_interaction_row(
+            "tok-kicked",
+            &bot.id,
+            &user.id,
+            channel.id(),
+            &message.id,
+        );
+        harness
+            .db
+            .insert_interaction(&interaction)
+            .await
+            .expect("interaction");
+
+        // Kick the bot between click and respond — the permission re-check
+        // must reject the EDIT path too, not just new-message responses.
+        let member = harness
+            .db
+            .fetch_member(&server.id, &bot_user.id)
+            .await
+            .expect("member");
+        member
+            .remove(
+                &harness.db,
+                &server,
+                revolt_database::RemovalIntention::Kick,
+                false,
+            )
+            .await
+            .expect("kick bot");
+
+        let response = harness
+            .client
+            .post(format!("/interactions/{}/respond", interaction.id))
+            .header(Header::new("x-bot-token", bot.token.clone()))
+            .header(ContentType::JSON)
+            .body(
+                json!({ "token": "tok-kicked", "content": "still here", "edit": true })
+                    .to_string(),
+            )
+            .dispatch()
+            .await;
+        assert_ne!(
+            response.status(),
+            Status::Ok,
+            "a kicked bot must not edit its component message"
+        );
+
+        let untouched = harness
+            .db
+            .fetch_message(&message.id)
+            .await
+            .expect("message");
+        assert_eq!(
+            untouched.content.as_deref(),
+            Some("pick something"),
+            "the message must be untouched after the rejected edit"
         );
     }
 }

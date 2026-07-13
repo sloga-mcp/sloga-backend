@@ -5,7 +5,8 @@ pub struct DeltaRatelimits;
 
 impl<'a> RatelimitResolver<Request<'a>> for DeltaRatelimits {
     fn resolve_bucket<'r>(&self, request: &'r Request<'_>) -> (&'r str, Option<&'r str>) {
-        let (segment, resource, extra) = if request.routed_segment(0) == Some("0.8") {
+        let versioned = request.routed_segment(0) == Some("0.8");
+        let (segment, resource, extra) = if versioned {
             (
                 request.routed_segment(1),
                 request.routed_segment(2),
@@ -44,6 +45,16 @@ impl<'a> RatelimitResolver<Request<'a>> for DeltaRatelimits {
                 }
                 ("channels", Some(id), _) => {
                     if request.method() == Method::Post {
+                        // Component clicks wake a bot per call — bounded
+                        // separately from plain messaging. (Segment index
+                        // shifts by one under the legacy "0.8" prefix.)
+                        if extra == Some("messages")
+                            && request.routed_segment(if versioned { 5 } else { 4 })
+                                == Some("interact")
+                        {
+                            return ("message_interact", Some(id));
+                        }
+
                         // Dice rolls create messages, so they share the messaging bucket
                         if let Some("messages" | "roll") = extra {
                             return ("messaging", Some(id));
@@ -135,6 +146,7 @@ impl<'a> RatelimitResolver<Request<'a>> for DeltaRatelimits {
             "forum_post_create" => 5,
             "interaction_create" => 10,
             "interaction_respond" => 30,
+            "message_interact" => 20,
             "bot_commands" => 10,
             _ => 20,
         }

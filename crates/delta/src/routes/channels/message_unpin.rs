@@ -113,6 +113,7 @@ mod test {
                 embeds: None,
                 masquerade: None,
                 interactions: None,
+                components: None,
                 sticker_ids: None,
                 flags: None,
             },

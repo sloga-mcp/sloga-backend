@@ -92,6 +92,12 @@ auto_derived_partial!(
         #[serde(skip_serializing_if = "Option::is_none")]
         pub command_context: Option<MessageInteraction>,
 
+        /// Interactive components attached to this message (buttons /
+        /// selects). Bot authors only — the send path rejects components
+        /// from regular users and webhooks.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub components: Option<Vec<v0::ActionRow>>,
+
         /// Sticker IDs attached to this message
         #[serde(skip_serializing_if = "Option::is_none")]
         pub sticker_ids: Option<Vec<String>>,
@@ -234,6 +240,9 @@ auto_derived!(
     /// Optional fields on message
     pub enum FieldsMessage {
         Pinned,
+        /// Component rows removed (a component edit-response with an empty
+        /// array clears the message's components)
+        Components,
     }
 );
 
@@ -285,6 +294,7 @@ impl Default for Message {
             pinned: None,
             thread_id: None,
             command_context: None,
+            components: None,
             sticker_ids: None,
         }
     }
@@ -403,6 +413,18 @@ impl Message {
             _ => None,
         };
 
+        // Components are bot-only: regular users, webhooks and system
+        // messages cannot attach them (interaction fan-out must always
+        // resolve to a live bot session).
+        if let Some(components) = &data.components {
+            if user.as_ref().is_none_or(|u| u.bot.is_none()) {
+                return Err(create_error!(IsNotBot));
+            }
+
+            v0::ActionRow::validate_structure(components)
+                .map_err(|error| create_error!(FailedValidation { error }))?;
+        }
+
         // Ensure restrict_reactions is not specified without reactions list
         if let Some(interactions) = &data.interactions {
             if interactions.restrict_reactions {
@@ -437,6 +459,7 @@ impl Message {
             author: author_id,
             webhook: webhook.map(|w| w.into()),
             flags: data.flags,
+            components: data.components,
             ..Default::default()
         };
 
@@ -1235,6 +1258,7 @@ impl Message {
     pub fn remove_field(&mut self, field: &FieldsMessage) {
         match field {
             FieldsMessage::Pinned => self.pinned = None,
+            FieldsMessage::Components => self.components = None,
         }
     }
 }

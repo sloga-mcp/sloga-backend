@@ -3,6 +3,8 @@ use std::collections::HashMap;
 use once_cell::sync::Lazy;
 use regex::Regex;
 
+use super::ActionRow;
+
 #[cfg(feature = "validator")]
 use validator::Validate;
 
@@ -143,12 +145,21 @@ auto_derived!(
         pub user_id: String,
         /// Bot the interaction is addressed to
         pub bot_id: String,
+        /// Message the interaction targets (Component kind)
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub message_id: Option<String>,
         /// Id of the invoked command
         #[serde(skip_serializing_if = "Option::is_none")]
         pub command_id: Option<String>,
         /// Name of the invoked command (convenience copy)
         #[serde(skip_serializing_if = "Option::is_none")]
         pub command_name: Option<String>,
+        /// Custom id of the clicked component (Component kind)
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub custom_id: Option<String>,
+        /// Submitted select values (Component kind, selects only)
+        #[serde(skip_serializing_if = "Vec::is_empty", default)]
+        pub values: Vec<String>,
         /// Supplied option values, validated against the command's schema
         #[serde(skip_serializing_if = "HashMap::is_empty", default)]
         pub options: HashMap<String, String>,
@@ -177,9 +188,29 @@ auto_derived!(
         /// The interaction's response token (delivered with InteractionCreate)
         #[cfg_attr(feature = "validator", validate(length(min = 1, max = 128)))]
         pub token: String,
-        /// Message content to send
+        /// Message content to send (or replace, when editing).
+        ///
+        /// Optional since slice 2: a response may carry only components.
+        /// When present it must be non-empty.
         #[cfg_attr(feature = "validator", validate(length(min = 1, max = 2000)))]
-        pub content: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub content: Option<String>,
+        /// Components to attach (or replace, when editing)
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub components: Option<Vec<ActionRow>>,
+        /// Edit the message the component lives on instead of sending a new
+        /// message (Component interactions only)
+        #[serde(skip_serializing_if = "crate::if_false", default)]
+        pub edit: bool,
+    }
+
+    /// Interact with a component on a message
+    pub struct DataMessageInteract {
+        /// Custom id of the component being interacted with
+        pub custom_id: String,
+        /// Selected values (selects only; exactly one)
+        #[serde(skip_serializing_if = "Vec::is_empty", default)]
+        pub values: Vec<String>,
     }
 
     /// Interaction context carried on a response message ("used /cmd").

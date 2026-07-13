@@ -57,3 +57,58 @@ pub trait AbstractMessages: Sync + Send {
 
     async fn delete_messages_by_user(&self, user_id: &str) -> Result<()>;
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::{Message, PartialMessage};
+    use revolt_models::v0;
+
+    fn button(id: &str) -> v0::Component {
+        v0::Component::Button {
+            custom_id: id.to_string(),
+            label: "Click".to_string(),
+            style: v0::ButtonStyle::Primary,
+            disabled: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn components_survive_insert_and_partial_update() {
+        database_test!(|db| async move {
+            let message = Message {
+                id: "01MESSAGE000000000000000000".to_string(),
+                channel: "01CHANNEL000000000000000000".to_string(),
+                author: "01BOT0000000000000000000000".to_string(),
+                content: Some("pick one".to_string()),
+                components: Some(vec![v0::ActionRow {
+                    components: vec![button("a")],
+                }]),
+                ..Default::default()
+            };
+            db.insert_message(&message).await.unwrap();
+
+            let fetched = db.fetch_message(&message.id).await.unwrap();
+            assert_eq!(fetched.components, message.components);
+
+            // A components-carrying partial must not silently drop the
+            // field on either driver (component edit-responses depend on
+            // update_message fanning the new rows out).
+            let partial = PartialMessage {
+                components: Some(vec![v0::ActionRow {
+                    components: vec![button("b"), button("c")],
+                }]),
+                ..Default::default()
+            };
+            db.update_message(&message.id, &partial, vec![])
+                .await
+                .unwrap();
+
+            let updated = db.fetch_message(&message.id).await.unwrap();
+            assert_eq!(updated.components, partial.components);
+            assert_eq!(
+                updated.content, message.content,
+                "unrelated fields must be untouched"
+            );
+        });
+    }
+}

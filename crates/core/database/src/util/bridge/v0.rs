@@ -691,6 +691,7 @@ impl crate::Message {
             pinned: self.pinned,
             thread_id: self.thread_id,
             command_context: self.command_context.map(Into::into),
+            components: self.components,
             sticker_ids: self.sticker_ids,
         }
     }
@@ -723,6 +724,7 @@ impl From<crate::PartialMessage> for PartialMessage {
             pinned: value.pinned,
             thread_id: value.thread_id,
             command_context: value.command_context.map(Into::into),
+            components: value.components,
             sticker_ids: value.sticker_ids,
         }
     }
@@ -1688,6 +1690,7 @@ impl From<crate::FieldsMessage> for FieldsMessage {
     fn from(value: crate::FieldsMessage) -> Self {
         match value {
             crate::FieldsMessage::Pinned => FieldsMessage::Pinned,
+            crate::FieldsMessage::Components => FieldsMessage::Components,
         }
     }
 }
@@ -1695,6 +1698,7 @@ impl From<FieldsMessage> for crate::FieldsMessage {
     fn from(value: FieldsMessage) -> Self {
         match value {
             FieldsMessage::Pinned => crate::FieldsMessage::Pinned,
+            FieldsMessage::Components => crate::FieldsMessage::Components,
         }
     }
 }
