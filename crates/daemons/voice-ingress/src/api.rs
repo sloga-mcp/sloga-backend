@@ -8,9 +8,9 @@ use revolt_database::{
         clear_voice_participant_identities, create_voice_state, delete_channel_voice_state,
         delete_voice_state, delete_voice_participant_identity, get_user_moved_from_voice,
         get_user_moved_to_voice, get_user_voice_channels, get_voice_channel_members,
-        is_video_source, set_voice_participant_identity, update_voice_state_tracks,
-        user_id_from_participant_identity, RoomMetadata, UserVoiceChannel, VoiceClient,
-        MAX_VIDEO_PARTICIPANTS,
+        is_video_source, mls_cap_would_refuse, set_voice_participant_identity,
+        update_voice_state_tracks, user_id_from_participant_identity, video_roster_over_cap,
+        RoomMetadata, UserVoiceChannel, VoiceClient, MAX_VIDEO_PARTICIPANTS,
     },
     Database, AMQP,
 };
@@ -92,6 +92,32 @@ pub async fn ingress(
             .await?;
 
             let voice_state = create_voice_state(&channel, user_id, joined_at).await?;
+
+            // TOCTOU backstop (6.6 review finding 1): the join-leg caps in
+            // join_call / member_edit are check-then-act — a burst of joins at
+            // the ceiling can each read below-cap and all mint a token, so
+            // overflow the front door meant to refuse still reaches the SFU.
+            // Now that this join is RECORDED, re-check and evict anyone the caps
+            // would have refused, BEFORE announcing them. T-20 (a non-enrolled
+            // MLS ghost, the CR-HIGH-2 downgrade-DoS) is membership-based so the
+            // join-leg predicate applies directly; D12 uses a strict `>` on the
+            // post-join roster so the legitimate cap-th member is kept and only
+            // genuine excess is dropped. Inert below the ceiling — normal calls
+            // never hit this.
+            if video_roster_over_cap(&channel).await?
+                || mls_cap_would_refuse(db, channel_id, user_id).await?
+            {
+                log::debug!("Evicting over-cap participant {user_id} from {channel_id} (join-leg admission-race backstop).");
+                let _ = voice_client.remove_user(node, user_id, channel_id).await;
+                delete_voice_state(&channel, user_id).await?;
+                delete_voice_participant_identity(channel_id, user_id).await?;
+                // Drain any pending move marker for THIS channel so a rejoin
+                // within its TTL isn't mis-announced as a VoiceChannelMove from
+                // the old channel (the moved_from marker belongs to the old
+                // channel's participant_left, so it is left untouched).
+                let _ = get_user_moved_to_voice(channel_id, user_id).await;
+                return Ok(EmptyResponse);
+            }
 
             // Only publish one event when a user is moved from one channel to another.
             if let Some(moved_from) = get_user_moved_to_voice(channel_id, user_id).await? {

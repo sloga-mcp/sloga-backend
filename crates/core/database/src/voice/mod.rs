@@ -4,7 +4,7 @@ use crate::{
     events::client::EventV1,
     models::{Channel, User},
     util::{permissions::DatabasePermissionQuery, reference::Reference},
-    Database, Server,
+    Database, Server, MAX_MLS_GROUP_MEMBERS,
 };
 use iso8601_timestamp::{Duration, Timestamp};
 use livekit_protocol::ParticipantPermission;
@@ -75,6 +75,76 @@ pub async fn count_video_participants(channel: &UserVoiceChannel) -> Result<usiz
     }
 
     Ok(count)
+}
+
+/// Whether the D12 video-participant cap would REFUSE admitting `user_id` to
+/// this channel's call right now (the join / moderator-move leg). The cap only
+/// bites a call that is video-active AND already at `MAX_VIDEO_PARTICIPANTS`
+/// members; a user who already holds voice state in this channel is exempt (a
+/// reconnect / move within the same channel never grows the roster). The
+/// `vc_members` set is written only by voice-ingress, so this exemption cannot
+/// be forged by a client-supplied flag (the 6.6 `force_disconnect` fix).
+pub async fn video_cap_would_refuse(channel: &UserVoiceChannel, user_id: &str) -> Result<bool> {
+    let members = get_voice_channel_members(channel).await?.unwrap_or_default();
+    Ok(!members.iter().any(|member| member == user_id)
+        && members.len() >= MAX_VIDEO_PARTICIPANTS
+        && count_video_participants(channel).await? > 0)
+}
+
+/// Whether the T-20 MLS SFU-token coupling would REFUSE admitting `user_id`:
+/// the channel has an open MLS group at `MAX_MLS_GROUP_MEMBERS` and `user_id`
+/// is not already one of its members (any device of theirs = rejoin is exempt).
+/// Non-E2EE calls (no open group) never refuse. Without this an overflow joiner
+/// sits as a non-enrolled SFU ghost tripping every member's loud-downgrade
+/// banner (audit CR-HIGH-2).
+pub async fn mls_cap_would_refuse(db: &Database, channel_id: &str, user_id: &str) -> Result<bool> {
+    Ok(match db.fetch_open_mls_group_for_channel(channel_id).await? {
+        Some(group) => {
+            group.members.len() >= MAX_MLS_GROUP_MEMBERS
+                && !group.members.iter().any(|member| member.user_id == user_id)
+        }
+        None => false,
+    })
+}
+
+/// Enforce BOTH call-admission caps for a NEW join / moderator move (D12 then
+/// T-20), raising the distinguishable 409 the cap owns. This is the single
+/// source of truth for the join-leg caps: `join_call` and the moderator
+/// voice-move path both call it, so a privileged door cannot bypass a cap the
+/// front door enforces (6.6 review findings). It is check-then-act — the
+/// voice-ingress backstop (`video_roster_over_cap` / `mls_cap_would_refuse`)
+/// re-checks once the join is recorded to close the admission race.
+pub async fn assert_call_caps_admit(
+    db: &Database,
+    channel: &UserVoiceChannel,
+    user_id: &str,
+) -> Result<()> {
+    if video_cap_would_refuse(channel, user_id).await? {
+        return Err(create_error!(VideoCallFull {
+            max: MAX_VIDEO_PARTICIPANTS
+        }));
+    }
+    if mls_cap_would_refuse(db, &channel.id, user_id).await? {
+        return Err(create_error!(MlsCallFull {
+            max: MAX_MLS_GROUP_MEMBERS
+        }));
+    }
+    Ok(())
+}
+
+/// TOCTOU backstop predicate for voice-ingress `participant_joined`: once a
+/// join is RECORDED (the user is already in `vc_members`), is the video roster
+/// OVER the cap — i.e. this participant is overflow that the join leg let race
+/// past? Uses a strict `>` on the post-join roster so the legitimate cap-th
+/// member is kept and only genuine excess is kicked. Pairs with
+/// `mls_cap_would_refuse` (membership-based, unaffected by the SFU join) for
+/// the non-enrolled-ghost case.
+pub async fn video_roster_over_cap(channel: &UserVoiceChannel) -> Result<bool> {
+    let members = get_voice_channel_members(channel)
+        .await?
+        .map(|m| m.len())
+        .unwrap_or(0);
+    Ok(members > MAX_VIDEO_PARTICIPANTS && count_video_participants(channel).await? > 0)
 }
 
 pub async fn raise_if_in_voice(user: &User, channel: &UserVoiceChannel) -> Result<()> {

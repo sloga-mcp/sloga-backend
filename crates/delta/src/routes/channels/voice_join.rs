@@ -2,11 +2,11 @@ use revolt_config::config;
 use revolt_database::{
     util::{permissions::perms, reference::Reference},
     voice::{
-        count_video_participants, delete_voice_state, get_channel_node, get_user_voice_channels,
+        assert_call_caps_admit, delete_voice_state, get_channel_node, get_user_voice_channels,
         get_voice_channel_members, raise_if_in_voice, set_call_notification_recipients,
-        set_channel_node, UserVoiceChannel, VoiceClient, MAX_VIDEO_PARTICIPANTS,
+        set_channel_node, UserVoiceChannel, VoiceClient,
     },
-    Database, Session, User, MAX_MLS_GROUP_MEMBERS,
+    Database, Session, User,
 };
 use revolt_models::v0;
 use revolt_permissions::{calculate_channel_permissions, ChannelPermission};
@@ -82,49 +82,17 @@ pub async fn call(
         return Err(create_error!(CannotJoinCall));
     }
 
-    // D12 / A3(b): a video call is capped at MAX_VIDEO_PARTICIPANTS members.
-    // PRODUCT gate over ALL calls — must sit OUTSIDE the E2EE device block
-    // above (which is gated by require_media_e2ee_enabled), so a non-E2EE /
-    // downgraded client that omits device_id cannot bypass the cap. NO
-    // ManageChannel exemption (unlike max_users): the cap is a hard media
-    // ceiling, not a per-channel policy knob. Only an ACTUAL same-channel
-    // reconnect is exempt — the user already holds voice state HERE (the
-    // members set is written by voice-ingress, never the client), so
-    // rejoining never grows the roster. The exemption must NOT key on
-    // `force_disconnect`: the client always sends it, so trusting the flag
-    // voids the cap on every real join (6.6 live-proof blocker).
-    {
-        let members = get_voice_channel_members(&user_voice_channel)
-            .await?
-            .unwrap_or_default();
-        if !members.iter().any(|member| member == &user.id)
-            && members.len() >= MAX_VIDEO_PARTICIPANTS
-            && count_video_participants(&user_voice_channel).await? > 0
-        {
-            return Err(create_error!(VideoCallFull {
-                max: MAX_VIDEO_PARTICIPANTS
-            }));
-        }
-    }
-
-    // T-20 (media E2EE plan A3, 6.6 audit CR-HIGH-2): couple SFU admission to
-    // the MLS roster cap for E2EE-active calls. Without this, a non-cooperative
-    // overflow joiner (refused the MLS leaf at join_intent) still gets an SFU
-    // token, sits as a non-enrolled ghost, and trips every member's loud
-    // downgrade banner. Only fires when an open MLS group exists (non-E2EE
-    // calls untouched); existing members (by user_id, any device = rejoin) are
-    // exempt so a legitimate rejoin at the ceiling still works. That inner
-    // member check is the ONLY reconnect exemption — never `force_disconnect`,
-    // which the client always sends (6.6 live-proof blocker).
-    if let Some(group) = db.fetch_open_mls_group_for_channel(channel.id()).await? {
-        if group.members.len() >= MAX_MLS_GROUP_MEMBERS
-            && !group.members.iter().any(|m| m.user_id == user.id)
-        {
-            return Err(create_error!(MlsCallFull {
-                max: MAX_MLS_GROUP_MEMBERS
-            }));
-        }
-    }
+    // Call-admission caps (D12 video-participant cap + T-20 MLS SFU-token
+    // coupling), enforced against THIS channel for the joining user. This is
+    // the shared front-door check (`assert_call_caps_admit`); the moderator
+    // voice-move path enforces the identical caps so a privileged door cannot
+    // bypass them. Both run OUTSIDE the E2EE device block above (which is
+    // gated by require_media_e2ee_enabled), so a non-E2EE / downgraded client
+    // that omits device_id cannot bypass them. The only reconnect exemption is
+    // server-written membership (same-channel voice state for D12, MLS group
+    // membership by user_id for T-20) — NEVER the client-controlled
+    // `force_disconnect`, which the real client always sends (6.6 blocker).
+    assert_call_caps_admit(db, &user_voice_channel, &user.id).await?;
 
     let existing_node = get_channel_node(channel.id()).await?;
     let has_existing_node = existing_node.is_some(); // we move existing_node in the next statement so this is the quickest way to know if we need to set it.
@@ -201,8 +169,8 @@ mod test {
     use iso8601_timestamp::Timestamp;
     use revolt_database::{
         voice::{
-            create_voice_state, delete_channel_voice_state, update_voice_state, UserVoiceChannel,
-            MAX_VIDEO_PARTICIPANTS,
+            create_voice_state, delete_channel_voice_state, mls_cap_would_refuse,
+            update_voice_state, video_roster_over_cap, UserVoiceChannel, MAX_VIDEO_PARTICIPANTS,
         },
         Channel, Member, MlsGroup, MlsGroupCreateOutcome, MlsMemberDevice, User,
         MAX_MLS_GROUP_MEMBERS,
@@ -397,5 +365,108 @@ mod test {
         // exempt — blocking it would lock a crashed member out of a full call
         let response = join_call(&harness, &session_b.token, channel.id(), true).await;
         assert_past_caps(response).await;
+    }
+
+    /// The voice-ingress TOCTOU backstop predicates (`video_roster_over_cap` /
+    /// `mls_cap_would_refuse`): after a join is recorded they must detect the
+    /// overflow the check-then-act join leg could let race past — but stay
+    /// inert at/below the cap so the legitimate cap-th member is never evicted.
+    #[rocket::async_test]
+    async fn ingress_backstop_predicates_fire_only_over_cap() {
+        let harness = TestHarness::new().await;
+        let (_account_a, _session_a, user_a) = harness.new_user().await;
+        let (_account_b, _session_b, user_b) = harness.new_user().await;
+
+        let channel = voice_channel(&harness, &user_a, &[&user_b]).await;
+        let voice_channel = UserVoiceChannel::from_channel(&channel);
+
+        // Seed the roster to EXACTLY the cap with one camera on (video active).
+        let at_cap: Vec<String> = (0..MAX_VIDEO_PARTICIPANTS)
+            .map(|index| format!("0SYNTHVIDEOUSER{index:011}"))
+            .collect();
+        for user_id in &at_cap {
+            create_voice_state(&voice_channel, user_id, Timestamp::now_utc())
+                .await
+                .expect("voice state");
+        }
+        update_voice_state(
+            &voice_channel,
+            &at_cap[0],
+            &v0::PartialUserVoiceState {
+                camera: Some(true),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("camera flag");
+
+        // At exactly the cap: NOT over (strict `>`) — the cap-th member stays.
+        assert!(
+            !video_roster_over_cap(&voice_channel).await.unwrap(),
+            "roster at the cap must not be flagged over-cap"
+        );
+
+        // One more (the raced overflow) → over cap.
+        create_voice_state(&voice_channel, &user_b.id, Timestamp::now_utc())
+            .await
+            .expect("voice state");
+        assert!(
+            video_roster_over_cap(&voice_channel).await.unwrap(),
+            "roster past the cap must be flagged over-cap"
+        );
+
+        // No open MLS group → the ghost predicate never fires.
+        assert!(!mls_cap_would_refuse(&harness.db, channel.id(), &user_b.id)
+            .await
+            .unwrap());
+
+        // Open group at the roster cap: a non-member is a ghost (refuse), an
+        // existing member is not.
+        let mut members: Vec<MlsMemberDevice> = (0..MAX_MLS_GROUP_MEMBERS - 1)
+            .map(|index| MlsMemberDevice {
+                user_id: format!("0SYNTHETICUSER{index:012}"),
+                device_id: format!("{index:032x}"),
+            })
+            .collect();
+        members.push(MlsMemberDevice {
+            user_id: user_a.id.clone(),
+            device_id: "aa".repeat(16),
+        });
+        harness
+            .db
+            .create_mls_group(
+                &MlsGroup {
+                    id: "22".repeat(32),
+                    channel_id: channel.id().to_string(),
+                    open: true,
+                    created_by: members[0].clone(),
+                    created_at: Timestamp::now_utc(),
+                    current_epoch: 1,
+                    members,
+                    closed_at: None,
+                    superseded_by: None,
+                },
+                None,
+            )
+            .await
+            .expect("group seed");
+        assert!(
+            mls_cap_would_refuse(&harness.db, channel.id(), &user_b.id)
+                .await
+                .unwrap(),
+            "a non-member at the ceiling is a ghost the backstop must evict"
+        );
+        assert!(
+            !mls_cap_would_refuse(&harness.db, channel.id(), &user_a.id)
+                .await
+                .unwrap(),
+            "an existing member is exempt"
+        );
+
+        let mut seeded = at_cap;
+        seeded.push(user_b.id.clone());
+        delete_channel_voice_state(&voice_channel, &seeded)
+            .await
+            .expect("cleanup");
     }
 }
