@@ -238,6 +238,24 @@ impl AbstractMessages for MongoDb {
             .map_err(|_| create_database_error!("update_one", COL))
     }
 
+    /// Count published (Crossposted-flagged) messages in a channel at/after
+    /// `min_id`. `channel` + `_id` lead so only one hour of one channel is
+    /// scanned before the bit filter applies.
+    async fn count_crossposts_since(&self, channel: &str, min_id: &str) -> Result<usize> {
+        let mask = 1_i64 << (revolt_models::v0::MessageFlags::Crossposted as i64);
+        query!(
+            self,
+            count_documents,
+            COL,
+            doc! {
+                "channel": channel,
+                "_id": { "$gte": min_id },
+                "flags": { "$bitsAllSet": mask }
+            }
+        )
+        .map(|count| count as usize)
+    }
+
     /// Add a new reaction to a message
     async fn add_reaction(&self, id: &str, emoji: &str, user: &str) -> Result<()> {
         self.col::<Document>(COL)

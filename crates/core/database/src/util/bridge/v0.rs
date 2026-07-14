@@ -193,6 +193,7 @@ impl From<crate::Channel> for Channel {
                 nsfw,
                 voice,
                 slowmode,
+                announcement,
             } => Channel::TextChannel {
                 id,
                 server,
@@ -205,6 +206,7 @@ impl From<crate::Channel> for Channel {
                 nsfw,
                 voice: voice.map(|voice| voice.into()),
                 slowmode,
+                announcement,
             },
             crate::Channel::Thread {
                 id,
@@ -315,6 +317,7 @@ impl From<Channel> for crate::Channel {
                 nsfw,
                 voice,
                 slowmode,
+                announcement,
             } => crate::Channel::TextChannel {
                 id,
                 server,
@@ -327,6 +330,7 @@ impl From<Channel> for crate::Channel {
                 nsfw,
                 voice: voice.map(|voice| voice.into()),
                 slowmode,
+                announcement,
             },
             Channel::Thread {
                 id,
@@ -449,6 +453,7 @@ impl From<crate::PartialChannel> for PartialChannel {
             require_tag: value.require_tag,
             default_sort: value.default_sort.map(|sort| sort.into()),
             applied_tags: value.applied_tags,
+            announcement: value.announcement,
         }
     }
 }
@@ -476,6 +481,7 @@ impl From<PartialChannel> for crate::PartialChannel {
             require_tag: value.require_tag,
             default_sort: value.default_sort.map(|sort| sort.into()),
             applied_tags: value.applied_tags,
+            announcement: value.announcement,
         }
     }
 }
@@ -695,6 +701,7 @@ impl crate::Message {
             sticker_ids: self.sticker_ids,
             poll: self.poll,
             forwarded: self.forwarded.map(Into::into),
+            crosspost: self.crosspost,
         }
     }
 }
@@ -748,6 +755,7 @@ impl From<crate::PartialMessage> for PartialMessage {
             sticker_ids: value.sticker_ids,
             poll: value.poll,
             forwarded: value.forwarded.map(Into::into),
+            crosspost: value.crosspost,
         }
     }
 }

@@ -402,6 +402,8 @@ pub struct GlobalLimits {
     pub threads_per_channel: usize,
     pub scheduled_messages_per_channel: usize,
     pub scheduled_messages_per_user: usize,
+    pub followers_per_channel: usize,
+    pub crossposts_per_hour: usize,
 
     pub new_user_hours: usize,
 

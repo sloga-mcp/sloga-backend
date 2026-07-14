@@ -148,6 +148,22 @@ pub enum ErrorType {
         max: usize,
     },
 
+    // ? Announcement channel / follow errors
+    /// The source channel is not an announcement channel (cannot be
+    /// followed or published from).
+    NotAnAnnouncementChannel,
+    /// This message has already been published (or is itself a delivered
+    /// crosspost copy) — it cannot be crossposted again.
+    AlreadyCrossposted,
+    /// The source announcement channel is at its follower ceiling.
+    TooManyFollowers {
+        max: usize,
+    },
+    /// The source announcement channel has hit its hourly publish cap.
+    TooManyCrossposts {
+        max: usize,
+    },
+
     // ? User safety related errors
     CannotReportYourself,
 

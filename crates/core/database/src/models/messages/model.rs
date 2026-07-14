@@ -115,6 +115,12 @@ auto_derived_partial!(
         #[serde(skip_serializing_if = "Option::is_none")]
         pub forwarded: Option<ForwardedSnapshot>,
 
+        /// Server-set attribution on a delivered crosspost copy (origin
+        /// message/channel/server ids). Set only by the crosspost route;
+        /// the regular send path never accepts it.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub crosspost: Option<v0::CrosspostInfo>,
+
         /// Bitfield of message flags
         #[serde(skip_serializing_if = "Option::is_none")]
         pub flags: Option<u32>,
@@ -337,6 +343,7 @@ impl Default for Message {
             sticker_ids: None,
             poll: None,
             forwarded: None,
+            crosspost: None,
         }
     }
 }

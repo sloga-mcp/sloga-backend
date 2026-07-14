@@ -194,6 +194,7 @@ mod test {
                     max_users: None,
                     disabled: false,
                 }),
+                announcement: None,
             },
             true,
         )

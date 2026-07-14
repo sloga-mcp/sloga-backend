@@ -174,6 +174,10 @@ pub async fn create_database(db: &MongoDb) {
         .await
         .expect("Failed to create scheduled_messages collection.");
 
+    db.create_collection("channel_follows")
+        .await
+        .expect("Failed to create channel_follows collection.");
+
     db.run_command(doc! {
         "createIndexes": "users",
         "indexes": [
@@ -409,6 +413,38 @@ pub async fn create_database(db: &MongoDb) {
     })
     .await
     .expect("Failed to create scheduled_messages index.");
+
+    db.run_command(doc! {
+        "createIndexes": "channel_follows",
+        "indexes": [
+            // Unique (source, target) makes follows idempotent AND serves the
+            // follower-list + publish fan-out (source prefix).
+            {
+                "key": {
+                    "source_channel": 1_i32,
+                    "target_channel": 1_i32
+                },
+                "name": "source_target",
+                "unique": true
+            },
+            // Serves target-side cleanup on channel deletion.
+            {
+                "key": {
+                    "target_channel": 1_i32
+                },
+                "name": "target_channel"
+            },
+            // Serves the webhook-deletion unfollow hook.
+            {
+                "key": {
+                    "webhook_id": 1_i32
+                },
+                "name": "webhook_id"
+            }
+        ]
+    })
+    .await
+    .expect("Failed to create channel_follows index.");
 
     db.run_command(doc! {
         "createIndexes": "channels",

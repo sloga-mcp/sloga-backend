@@ -195,7 +195,8 @@ mod test {
                 name: "Voice Channel".to_string(),
                 description: None,
                 nsfw: Some(false),
-                voice: None
+                voice: None,
+                announcement: None,
             },
             true,
         )

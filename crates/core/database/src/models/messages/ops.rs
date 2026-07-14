@@ -41,6 +41,12 @@ pub trait AbstractMessages: Sync + Send {
     /// Remove reaction from a message
     async fn clear_reaction(&self, id: &str, emoji: &str) -> Result<()>;
 
+    /// Count published (Crossposted-flagged) messages in a channel whose id
+    /// is at or after `min_id` — drives the durable per-channel hourly
+    /// publish cap. `channel` + `_id` lead the predicate so the flag bit
+    /// filter only scans one hour of one channel.
+    async fn count_crossposts_since(&self, channel: &str, min_id: &str) -> Result<usize>;
+
     /// Delete a message from the database by its id
     async fn delete_message(&self, id: &str) -> Result<()>;
 
@@ -108,6 +114,66 @@ mod tests {
             assert_eq!(
                 updated.content, message.content,
                 "unrelated fields must be untouched"
+            );
+        });
+    }
+
+    #[tokio::test]
+    async fn count_crossposts_since_scopes_by_channel_time_and_flag() {
+        database_test!(|db| async move {
+            use revolt_models::v0::MessageFlags;
+            let crossposted = 1_u32 << (MessageFlags::Crossposted as u32);
+            let is_crosspost = 1_u32 << (MessageFlags::IsCrosspost as u32);
+
+            let channel = "01CHANXPOST0000000000000001";
+            let other_channel = "01CHANXPOST0000000000000002";
+
+            // `rand` keeps ids unique even when two rows share a timestamp.
+            let mk = |ms: u64, rand: u128, flags: Option<u32>, chan: &str| Message {
+                id: ulid::Ulid::from_parts(ms, rand).to_string(),
+                channel: chan.to_string(),
+                author: "01USER000000000000000000000".to_string(),
+                content: Some("published".to_string()),
+                flags,
+                ..Default::default()
+            };
+
+            // 12 published messages at ms 2000, 3000 .. 13000 in the channel.
+            for i in 0..12u64 {
+                db.insert_message(&mk(2_000 + i * 1_000, 1, Some(crossposted), channel))
+                    .await
+                    .unwrap();
+            }
+            // An OLD published message before the window.
+            db.insert_message(&mk(500, 2, Some(crossposted), channel))
+                .await
+                .unwrap();
+            // A non-published message in-window (no Crossposted flag).
+            db.insert_message(&mk(2_500, 3, None, channel))
+                .await
+                .unwrap();
+            // A delivered crosspost copy (IsCrosspost, NOT Crossposted) must
+            // not count toward the source's publish cap.
+            db.insert_message(&mk(2_600, 4, Some(is_crosspost), channel))
+                .await
+                .unwrap();
+            // A published message in another channel must not leak in.
+            db.insert_message(&mk(3_000, 5, Some(crossposted), other_channel))
+                .await
+                .unwrap();
+
+            // Window lower bound at ms 1000 catches all 12 (>10 → cap tripped).
+            let min_id = ulid::Ulid::from_parts(1_000, 0).to_string();
+            assert_eq!(
+                db.count_crossposts_since(channel, &min_id).await.unwrap(),
+                12
+            );
+
+            // A tighter lower bound drops the earliest publishes from the count.
+            let tighter = ulid::Ulid::from_parts(8_000, 0).to_string();
+            assert_eq!(
+                db.count_crossposts_since(channel, &tighter).await.unwrap(),
+                6
             );
         });
     }

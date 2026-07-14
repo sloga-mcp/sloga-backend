@@ -926,6 +926,7 @@ mod tests {
             nsfw: false,
             voice: None,
             slowmode: None,
+            announcement: None,
         };
         db.insert_channel(&hidden).await.expect("insert hidden");
 
@@ -941,6 +942,7 @@ mod tests {
             nsfw: false,
             voice: None,
             slowmode: None,
+            announcement: None,
         };
         db.insert_channel(&visible).await.expect("insert visible");
 

@@ -68,6 +68,10 @@ impl IntoResponse for Error {
             ErrorType::InteractionAlreadyResponded => StatusCode::CONFLICT,
             ErrorType::PollClosed => StatusCode::GONE,
             ErrorType::TooManyScheduledMessages { .. } => StatusCode::BAD_REQUEST,
+            ErrorType::NotAnAnnouncementChannel => StatusCode::BAD_REQUEST,
+            ErrorType::AlreadyCrossposted => StatusCode::BAD_REQUEST,
+            ErrorType::TooManyFollowers { .. } => StatusCode::BAD_REQUEST,
+            ErrorType::TooManyCrossposts { .. } => StatusCode::TOO_MANY_REQUESTS,
 
             ErrorType::CannotReportYourself => StatusCode::BAD_REQUEST,
 

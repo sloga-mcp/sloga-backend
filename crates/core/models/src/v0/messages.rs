@@ -120,6 +120,16 @@ auto_derived_partial!(
         #[serde(skip_serializing_if = "Option::is_none")]
         pub forwarded: Option<ForwardedSnapshot>,
 
+        /// Server-authoritative attribution for a delivered crosspost copy
+        /// (points at the origin announcement message/channel/server).
+        ///
+        /// Set only by the crosspost route — absent from `DataMessageSend`
+        /// and `DataEditMessage`, so the "From {server} #{channel}" line a
+        /// client renders always derives from server-set ids and can never
+        /// be spoofed by a webhook masquerade.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub crosspost: Option<CrosspostInfo>,
+
         /// Bitfield of message flags
         ///
         /// https://docs.rs/revolt-models/latest/revolt_models/v0/enum.MessageFlags.html
@@ -374,6 +384,21 @@ auto_derived!(
         pub original_sent_at: i64,
     }
 
+    /// Server-set attribution attached to a delivered crosspost copy,
+    /// pointing at the origin announcement message.
+    ///
+    /// Constructed exclusively by the crosspost route — the client renders
+    /// "From {server} • #{channel}" from these ids (resolved locally only
+    /// when the origin is visible), never from webhook masquerade text.
+    pub struct CrosspostInfo {
+        /// Id of the origin (published) message
+        pub message_id: String,
+        /// Id of the origin announcement channel
+        pub channel_id: String,
+        /// Id of the origin server
+        pub server_id: String,
+    }
+
     /// Forward a message to another channel
     #[cfg_attr(feature = "validator", derive(Validate))]
     pub struct DataMessageForward {
@@ -516,6 +541,16 @@ auto_derived!(
         /// path rejects client-supplied flag values above 7, so a flagged
         /// message is a guaranteed-authentic server-counted poll.
         Poll = 6,
+        /// This origin message has been published (crossposted) from an
+        /// announcement channel. Set only by the crosspost endpoint — the
+        /// regular send path rejects client-supplied flag values above 7,
+        /// so the "Published" state cannot be forged.
+        Crossposted = 7,
+        /// This message is a delivered crosspost copy fanned into a
+        /// follower channel (carries the `crosspost` attribution). Set only
+        /// by the crosspost endpoint; a message bearing it can never be
+        /// crossposted again (loop prevention).
+        IsCrosspost = 8,
     }
 
     /// Optional fields on message

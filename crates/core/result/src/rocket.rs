@@ -71,6 +71,10 @@ impl<'r> Responder<'r, 'static> for Error {
             ErrorType::InteractionAlreadyResponded => Status::Conflict,
             ErrorType::PollClosed => Status::Gone,
             ErrorType::TooManyScheduledMessages { .. } => Status::BadRequest,
+            ErrorType::NotAnAnnouncementChannel => Status::BadRequest,
+            ErrorType::AlreadyCrossposted => Status::BadRequest,
+            ErrorType::TooManyFollowers { .. } => Status::BadRequest,
+            ErrorType::TooManyCrossposts { .. } => Status::TooManyRequests,
 
             ErrorType::CannotReportYourself => Status::BadRequest,
 

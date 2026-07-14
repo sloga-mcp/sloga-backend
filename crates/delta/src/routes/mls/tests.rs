@@ -127,6 +127,7 @@ async fn voice_channel_with_members(
                 max_users: None,
                 disabled: false,
             }),
+            announcement: None,
         },
         true,
     )

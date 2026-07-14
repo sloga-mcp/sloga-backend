@@ -58,9 +58,18 @@ pub async fn edit(
         && data.require_tag.is_none()
         && data.default_sort.is_none()
         && data.applied_tags.is_none()
+        && data.announcement.is_none()
         && data.remove.is_empty()
     {
         return Ok(Json(channel.into()));
+    }
+
+    // The announcement flag only ever applies to plain server text channels
+    // (never voice-flavoured text channels).
+    if data.announcement.is_some()
+        && !matches!(channel, Channel::TextChannel { voice: None, .. })
+    {
+        return Err(create_error!(InvalidOperation));
     }
 
     // Forum configuration fields only ever apply to forum channels; reject
@@ -254,6 +263,7 @@ pub async fn edit(
             nsfw,
             voice,
             slowmode,
+            announcement,
             ..
         } => {
             if data.remove.contains(&v0::FieldsChannel::Icon) {
@@ -305,6 +315,11 @@ pub async fn edit(
             if let Some(new_slowmode) = data.slowmode {
                 *slowmode = Some(new_slowmode);
                 partial.slowmode = Some(new_slowmode);
+            }
+
+            if let Some(new_announcement) = data.announcement {
+                *announcement = Some(new_announcement);
+                partial.announcement = Some(new_announcement);
             }
         }
         Channel::Thread {

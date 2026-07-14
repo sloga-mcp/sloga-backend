@@ -227,6 +227,12 @@ impl Server {
         // notify or release. Rows carry `server`, so threads are covered.
         crate::ScheduledMessage::cancel_all_for_server(db, &self.id).await?;
 
+        // Announcement-follow cascade: the bulk server-delete path never runs
+        // Channel::delete, so follows touching this server on either side —
+        // and the far-side webhooks living in OTHER, surviving servers'
+        // channels — must be severed here, before the channels are dropped.
+        crate::ChannelFollow::cleanup_for_deleted_server(db, &self.id).await?;
+
         EventV1::ServerDelete {
             id: self.id.clone(),
         }

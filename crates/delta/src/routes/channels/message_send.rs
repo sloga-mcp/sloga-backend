@@ -196,6 +196,7 @@ mod test {
                 description: None,
                 nsfw: Some(false),
                 voice: None,
+                announcement: None,
             },
             true,
         )
@@ -237,6 +238,7 @@ mod test {
             require_tag: None,
             default_sort: None,
             applied_tags: None,
+            announcement: None,
         };
         locked_channel
             .update(&harness.db, partial, vec![])

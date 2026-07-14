@@ -120,6 +120,11 @@ auto_derived!(
             /// The channel's slowmode delay in seconds
             #[serde(skip_serializing_if = "Option::is_none")]
             slowmode: Option<u64>,
+
+            /// Whether this text channel is an announcement channel that
+            /// other servers' channels can follow (crosspost fan-out).
+            #[serde(skip_serializing_if = "Option::is_none")]
+            announcement: Option<bool>,
         },
         /// Thread belonging to a server text channel
         Thread {
@@ -284,6 +289,8 @@ auto_derived!(
         pub default_sort: Option<ForumSortOrder>,
         #[serde(skip_serializing_if = "Option::is_none")]
         pub applied_tags: Option<Vec<String>>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub announcement: Option<bool>,
     }
 
     /// Optional fields on channel object
@@ -346,6 +353,7 @@ impl Channel {
                 nsfw: data.nsfw.unwrap_or(false),
                 voice: data.voice.map(|voice| voice.into()),
                 slowmode: None,
+                announcement: data.announcement.filter(|v| *v),
             },
             v0::LegacyServerChannelType::Voice => Channel::TextChannel {
                 id: id.clone(),
@@ -359,6 +367,7 @@ impl Channel {
                 nsfw: data.nsfw.unwrap_or(false),
                 voice: Some(data.voice.unwrap_or_default().into()),
                 slowmode: None,
+                announcement: None,
             },
             v0::LegacyServerChannelType::Forum => Channel::Forum {
                 id: id.clone(),
@@ -1023,6 +1032,8 @@ impl Channel {
                 default_permissions,
                 role_permissions,
                 voice,
+                slowmode,
+                announcement,
                 ..
             } => {
                 if let Some(v) = partial.name {
@@ -1051,6 +1062,14 @@ impl Channel {
 
                 if let Some(v) = partial.voice {
                     voice.replace(v);
+                }
+
+                if let Some(v) = partial.slowmode {
+                    slowmode.replace(v);
+                }
+
+                if let Some(v) = partial.announcement {
+                    *announcement = Some(v);
                 }
             }
             Self::Thread {
@@ -1290,6 +1309,12 @@ impl Channel {
         // a missing channel), their claimed attachments released, and each
         // author notified on their private topic.
         crate::ScheduledMessage::cancel_all_for_channel(db, &id).await?;
+
+        // Cascade: sever announcement follows on BOTH sides (a deleted source
+        // loses its followers + their target webhooks; a deleted follower
+        // target loses its follows + orphaned webhooks) so nothing can keep
+        // injecting crosspost copies.
+        crate::ChannelFollow::cleanup_for_deleted_channel(db, &id).await?;
 
         EventV1::ChannelDelete { id: id.clone() }.p(id).await;
         // TODO: missing functionality:

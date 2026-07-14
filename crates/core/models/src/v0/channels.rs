@@ -120,6 +120,13 @@ auto_derived!(
             /// The channel's slowmode delay in seconds
             #[serde(skip_serializing_if = "Option::is_none")]
             slowmode: Option<u64>,
+
+            /// Whether this text channel is an announcement channel that
+            /// other servers' channels can follow (Discord-style
+            /// publish/crosspost fan-out). Absent / `None` means an
+            /// ordinary text channel.
+            #[serde(skip_serializing_if = "Option::is_none")]
+            announcement: Option<bool>,
         },
         /// Thread belonging to a server text channel
         Thread {
@@ -316,6 +323,8 @@ auto_derived!(
         pub default_sort: Option<ForumSortOrder>,
         #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
         pub applied_tags: Option<Vec<String>>,
+        #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+        pub announcement: Option<bool>,
     }
 
     /// Optional fields on channel object
@@ -377,6 +386,10 @@ auto_derived!(
         /// Ids of forum tags applied to this post (forum-post threads only;
         /// replaces the whole set)
         pub applied_tags: Option<Vec<String>>,
+
+        /// Whether this text channel is an announcement channel
+        /// (server text channels only; ManageChannel required)
+        pub announcement: Option<bool>,
 
         /// Fields to remove from channel
         #[cfg_attr(feature = "serde", serde(default))]
@@ -498,6 +511,10 @@ auto_derived!(
         /// Voice Information for when this channel is also a voice channel
         #[serde(skip_serializing_if = "Option::is_none")]
         pub voice: Option<VoiceInformation>,
+
+        /// Whether this text channel is created as an announcement channel
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub announcement: Option<bool>,
     }
 
     /// New default permissions

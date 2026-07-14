@@ -26,7 +26,7 @@ struct MigrationInfo {
     revision: i32,
 }
 
-pub const LATEST_REVISION: i32 = 60; // MUST BE +1 to last migration
+pub const LATEST_REVISION: i32 = 61; // MUST BE +1 to last migration
 
 pub async fn migrate_database(db: &MongoDb) {
     let migrations = db.col::<Document>("migrations");
@@ -1977,6 +1977,51 @@ pub async fn run_migrations(db: &MongoDb, revision: i32) -> i32 {
             })
             .await
             .expect("Failed to create scheduled_messages indexes.");
+    }
+
+    if revision <= 60 {
+        info!("Running migration [revision 60 / 14-07-2026]: Create channel_follows collection (announcement channels)");
+
+        // Existing deployments predate announcement channels: init.rs only
+        // covers fresh DBs. Collection + indexes mirror init.rs exactly;
+        // both operations are idempotent (create_collection errors are
+        // ignored; createIndexes is a no-op when key+name already match),
+        // so a re-run or a fresh DB is safe.
+        db.db().create_collection("channel_follows").await.ok();
+
+        db.db()
+            .run_command(doc! {
+                "createIndexes": "channel_follows",
+                "indexes": [
+                    // Unique (source, target) makes follows idempotent AND
+                    // serves the follower-list + publish fan-out (source
+                    // prefix).
+                    {
+                        "key": {
+                            "source_channel": 1_i32,
+                            "target_channel": 1_i32
+                        },
+                        "name": "source_target",
+                        "unique": true
+                    },
+                    // Serves target-side cleanup on channel deletion.
+                    {
+                        "key": {
+                            "target_channel": 1_i32
+                        },
+                        "name": "target_channel"
+                    },
+                    // Serves the webhook-deletion unfollow hook.
+                    {
+                        "key": {
+                            "webhook_id": 1_i32
+                        },
+                        "name": "webhook_id"
+                    }
+                ]
+            })
+            .await
+            .expect("Failed to create channel_follows indexes.");
     }
 
     // Reminder to update LATEST_REVISION when adding new migrations.

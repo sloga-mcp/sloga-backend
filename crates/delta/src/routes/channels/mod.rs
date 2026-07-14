@@ -6,9 +6,13 @@ mod channel_delete;
 mod channel_edit;
 mod channel_fetch;
 mod command_list;
+mod follow_create;
+mod follow_delete;
+mod followers_fetch;
 mod forum_post_create;
 mod forum_posts_fetch;
 mod interaction_create;
+mod message_crosspost;
 mod group_add_member;
 mod group_create;
 mod group_remove_member;
@@ -58,6 +62,10 @@ pub fn routes() -> (Vec<Route>, OpenApi) {
         message_send::message_send,
         message_roll::message_roll,
         message_forward::message_forward,
+        message_crosspost::message_crosspost,
+        follow_create::follow_channel,
+        follow_delete::unfollow_channel,
+        followers_fetch::fetch_followers,
         message_schedule::message_schedule,
         scheduled_messages_list::scheduled_messages_list,
         scheduled_message_delete::scheduled_message_delete,

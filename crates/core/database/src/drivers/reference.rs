@@ -3,7 +3,7 @@ use std::{collections::HashMap, sync::Arc};
 use futures::lock::Mutex;
 
 use crate::{
-    ApplicationCommand, Bot, CalendarEvent, Channel, ChannelCompositeKey, ChannelUnread,
+    ApplicationCommand, Bot, CalendarEvent, Channel, ChannelCompositeKey, ChannelFollow, ChannelUnread,
     E2EEBackup, E2EEBlob, E2EEEnvelope, E2EEIdentity, E2EEOneTimeKey, Emoji, EventRsvp,
     EventRsvpKey, File, FileHash, Interaction, Invite, Member, MemberCompositeKey, Message,
     MlsCommit, MlsGroup, MlsJoinIntent, MlsKeyPackage, PolicyChange, Poll, PollVote,
@@ -24,6 +24,7 @@ database_derived!(
         pub event_rsvps: Arc<Mutex<HashMap<EventRsvpKey, EventRsvp>>>,
         pub event_reminders: Arc<Mutex<HashMap<ReminderSentKey, ReminderSent>>>,
         pub channels: Arc<Mutex<HashMap<String, Channel>>>,
+        pub channel_follows: Arc<Mutex<HashMap<String, ChannelFollow>>>,
         pub channel_invites: Arc<Mutex<HashMap<String, Invite>>>,
         pub channel_unreads: Arc<Mutex<HashMap<ChannelCompositeKey, ChannelUnread>>>,
         pub channel_webhooks: Arc<Mutex<HashMap<String, Webhook>>>,

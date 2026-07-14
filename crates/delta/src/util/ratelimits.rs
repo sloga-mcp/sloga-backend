@@ -61,6 +61,17 @@ impl<'a> RatelimitResolver<Request<'a>> for DeltaRatelimits {
                         return ("message_schedule", Some(id));
                     }
 
+                    // Following an announcement channel creates a webhook in
+                    // the target and fans events to two server topics — bound
+                    // it separately (both POST create and DELETE unfollow live
+                    // under the `follow` segment). Publishing (crosspost) has
+                    // extra == Some("messages") and shares the messaging
+                    // bucket, additionally capped by the durable hourly limit
+                    // enforced in the route.
+                    if extra == Some("follow") {
+                        return ("follow", Some(id));
+                    }
+
                     if request.method() == Method::Post {
                         // Component clicks wake a bot per call — bounded
                         // separately from plain messaging. (Segment index
@@ -186,6 +197,7 @@ impl<'a> RatelimitResolver<Request<'a>> for DeltaRatelimits {
             "interaction_create" => 10,
             "poll_vote" => 10,
             "message_schedule" => 10,
+            "follow" => 2,
             "interaction_respond" => 30,
             "message_interact" => 20,
             "bot_commands" => 10,

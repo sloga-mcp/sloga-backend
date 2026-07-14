@@ -150,6 +150,7 @@ impl TestHarness {
                 description: None,
                 nsfw: Some(false),
                 voice: None,
+                announcement: None,
             },
             true,
         )

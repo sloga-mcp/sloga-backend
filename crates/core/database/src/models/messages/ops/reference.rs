@@ -167,6 +167,21 @@ impl AbstractMessages for ReferenceDb {
         }
     }
 
+    /// Count published (Crossposted-flagged) messages in a channel at/after
+    /// `min_id`.
+    async fn count_crossposts_since(&self, channel: &str, min_id: &str) -> Result<usize> {
+        let mask = 1_u32 << (revolt_models::v0::MessageFlags::Crossposted as u32);
+        let messages = self.messages.lock().await;
+        Ok(messages
+            .values()
+            .filter(|message| {
+                message.channel == channel
+                    && message.id.as_str() >= min_id
+                    && message.flags.is_some_and(|flags| flags & mask == mask)
+            })
+            .count())
+    }
+
     /// Add a new reaction to a message
     async fn add_reaction(&self, id: &str, emoji: &str, user: &str) -> Result<()> {
         let mut messages = self.messages.lock().await;

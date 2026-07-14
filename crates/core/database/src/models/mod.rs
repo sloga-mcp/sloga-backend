@@ -2,6 +2,7 @@ mod admin_migrations;
 mod application_commands;
 mod bots;
 mod calendar_events;
+mod channel_follows;
 mod channel_invites;
 mod channel_unreads;
 mod channel_webhooks;
@@ -35,6 +36,7 @@ pub use admin_migrations::*;
 pub use application_commands::*;
 pub use bots::*;
 pub use calendar_events::*;
+pub use channel_follows::*;
 pub use channel_invites::*;
 pub use channel_unreads::*;
 pub use channel_webhooks::*;
@@ -76,6 +78,7 @@ pub trait AbstractDatabase:
     + application_commands::AbstractApplicationCommands
     + bots::AbstractBots
     + calendar_events::AbstractCalendarEvents
+    + channel_follows::AbstractChannelFollows
     + channels::AbstractChannels
     + channel_invites::AbstractChannelInvites
     + channel_unreads::AbstractChannelUnreads

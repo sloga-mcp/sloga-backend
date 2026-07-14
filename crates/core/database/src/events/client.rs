@@ -356,6 +356,32 @@ pub enum EventV1 {
         id: String,
     },
 
+    /// A target channel started following a source announcement channel.
+    /// Published to the TARGET server topic with the full follow (target
+    /// members may see their own channel's follow). The source server only
+    /// receives the privacy-trimmed `ChannelFollowersUpdate` refetch signal
+    /// so target ids never leak to non-admin source members.
+    ChannelFollowCreate {
+        follow: ChannelFollow,
+    },
+
+    /// A follow was severed (explicit unfollow, webhook deletion, or channel
+    /// deletion). Published to the TARGET server topic. The source server
+    /// receives `ChannelFollowersUpdate` instead.
+    ChannelFollowDelete {
+        id: String,
+        source_channel: String,
+        target_channel: String,
+    },
+
+    /// A source announcement channel's follower set changed — a
+    /// privacy-trimmed refetch signal published to the SOURCE server topic
+    /// (carries no target ids; the full follower list stays behind the
+    /// ManageChannel-gated GET /channels/<id>/followers endpoint).
+    ChannelFollowersUpdate {
+        channel: String,
+    },
+
     /// Auth events
     CreateAccount {
         account: Account,

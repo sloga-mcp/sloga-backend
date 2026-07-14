@@ -120,6 +120,16 @@ impl Webhook {
         .p(self.channel_id.clone())
         .await;
 
+        // If this webhook backs an announcement follow, deleting it (e.g. a
+        // target-side admin removing it from normal webhook settings) severs
+        // the follow too. The follow row is deleted here only when it still
+        // exists — the follow-delete / channel-delete paths remove the row
+        // FIRST, so this never double-acts on those re-entrant calls.
+        if let Ok(Some(follow)) = db.fetch_follow_by_webhook(&self.id).await {
+            db.delete_channel_follow(&follow.id).await?;
+            follow.emit_delete().await;
+        }
+
         Ok(())
     }
 }

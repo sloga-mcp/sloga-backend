@@ -257,6 +257,11 @@ threads_per_channel = 100
 scheduled_messages_per_channel = 10
 scheduled_messages_per_user = 30
 
+# Announcement channels: max follower channels per source channel, and the
+# durable per-source hourly publish (crosspost) cap
+followers_per_channel = 100
+crossposts_per_hour = 10
+
 # How many hours since creation a user is considered new
 new_user_hours = 72
 
