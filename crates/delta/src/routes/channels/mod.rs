@@ -46,6 +46,7 @@ mod scheduled_messages_list;
 mod thread_create;
 mod thread_list;
 mod thread_members;
+mod soundboard_trigger;
 mod voice_join;
 mod voice_stop_ring;
 mod webhook_create;
@@ -82,6 +83,7 @@ pub fn routes() -> (Vec<Route>, OpenApi) {
         group_remove_member::remove_member,
         voice_join::call,
         voice_stop_ring::stop_ring,
+        soundboard_trigger::trigger_sound,
         permissions_set::set_role_permissions,
         permissions_set_default::set_default_channel_permissions,
         message_react::react_message,

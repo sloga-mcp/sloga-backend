@@ -58,6 +58,7 @@ impl<'r> Responder<'r, 'static> for Error {
             ErrorType::TooManyEmbeds { .. } => Status::BadRequest,
             ErrorType::TooManyEmoji { .. } => Status::BadRequest,
             ErrorType::TooManyStickers { .. } => Status::BadRequest,
+            ErrorType::TooManySounds { .. } => Status::BadRequest,
             ErrorType::TooManyChannels { .. } => Status::BadRequest,
             ErrorType::TooManyRoles { .. } => Status::BadRequest,
 
@@ -99,6 +100,7 @@ impl<'r> Responder<'r, 'static> for Error {
             ErrorType::FailedValidation { .. } => Status::BadRequest,
             ErrorType::LiveKitUnavailable => Status::BadRequest,
             ErrorType::NotAVoiceChannel => Status::BadRequest,
+            ErrorType::NotInVoiceChannel => Status::BadRequest,
             ErrorType::AlreadyConnected => Status::BadRequest,
             ErrorType::NotConnected => Status::BadRequest,
             ErrorType::UnknownNode => Status::BadRequest,

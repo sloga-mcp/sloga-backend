@@ -2,12 +2,13 @@ use revolt_result::Error;
 use serde::{Deserialize, Serialize};
 
 use revolt_models::v0::{
-    AppendMessage, Channel, ChannelSlowmode, ChannelUnread, ChannelVoiceState, E2EEMessage,
+    AppendMessage, Channel, ChannelFollow, ChannelSlowmode, ChannelUnread, ChannelVoiceState, E2EEMessage,
     Emoji, Event, EventRsvp, FieldsChannel, FieldsMember, FieldsMessage, FieldsRole, FieldsServer, FieldsUser,
     FieldsWebhook, Interaction, Member, MemberCompositeKey, Message, PartialChannel, PartialEmoji,
     PartialMember, PartialMessage, PartialRole, PartialServer, PartialSticker, PartialUser,
-    PartialUserVoiceState, PartialWebhook, PolicyChange, PollAnswerCount, RemovalIntention,
-    Report, ScheduledMessage, Server, Sticker, User, UserSettings, UserVoiceState, Webhook,
+    PartialSoundboardSound, PartialUserVoiceState, PartialWebhook, PolicyChange, PollAnswerCount,
+    RemovalIntention, Report, ScheduledMessage, Server, SoundboardSound, Sticker, User,
+    UserSettings, UserVoiceState, Webhook,
 };
 
 use crate::{Account, Database, Session};
@@ -278,6 +279,34 @@ pub enum EventV1 {
     /// Delete sticker
     StickerDelete {
         id: String,
+    },
+
+    /// New soundboard sound (server topic — keeps every member's list live)
+    SoundboardCreate(SoundboardSound),
+
+    /// Update existing soundboard sound (server topic)
+    SoundboardUpdate {
+        id: String,
+        data: PartialSoundboardSound,
+    },
+
+    /// Delete soundboard sound (server topic)
+    SoundboardDelete {
+        id: String,
+    },
+
+    /// A soundboard sound was triggered in a voice call. Published on the
+    /// CHANNEL topic (ViewChannel = the authorization boundary); carries no
+    /// audio, only the public `sound_id`. Played locally only by clients
+    /// currently in the call — the clip never touches the LiveKit/SFU media
+    /// path or the call's MLS E2EE (sounds are public per-server assets).
+    SoundboardSound {
+        /// Sound id (equals the Autumn file id — clients build the clip URL from it)
+        id: String,
+        channel_id: String,
+        server_id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        emoji: Option<String>,
     },
 
     /// New report

@@ -248,6 +248,7 @@ message_replies = 5
 message_reactions = 20
 server_emoji = 100
 server_stickers = 60
+server_sounds = 48
 server_roles = 200
 server_channels = 200
 # Maximum active (non-archived) threads per text channel
@@ -312,6 +313,7 @@ icons = 2_500_000
 banners = 6_000_000
 emojis = 500_000
 stickers = 500_000
+soundboard = 1_000_000
 
 [features.limits.default]
 # Limits imposed on users by default
@@ -352,6 +354,7 @@ icons = 2_500_000
 banners = 6_000_000
 stickers = 500_000
 emojis = 500_000
+soundboard = 1_000_000
 
 [features.advanced]
 # The max amount of messages the rabbitmq provider/db mention adder job will delay for before forcing handling of a channel.

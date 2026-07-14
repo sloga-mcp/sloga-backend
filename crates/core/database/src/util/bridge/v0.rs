@@ -556,6 +556,19 @@ impl From<crate::Sticker> for Sticker {
     }
 }
 
+impl From<crate::SoundboardSound> for SoundboardSound {
+    fn from(value: crate::SoundboardSound) -> Self {
+        SoundboardSound {
+            id: value.id,
+            server_id: value.server_id,
+            creator_id: value.creator_id,
+            name: value.name,
+            file_id: value.file_id,
+            emoji: value.emoji,
+        }
+    }
+}
+
 impl From<crate::StickerFormat> for StickerFormat {
     fn from(value: crate::StickerFormat) -> Self {
         match value {

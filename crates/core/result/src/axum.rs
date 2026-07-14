@@ -55,6 +55,7 @@ impl IntoResponse for Error {
             ErrorType::TooManyEmbeds { .. } => StatusCode::BAD_REQUEST,
             ErrorType::TooManyEmoji { .. } => StatusCode::BAD_REQUEST,
             ErrorType::TooManyStickers { .. } => StatusCode::BAD_REQUEST,
+            ErrorType::TooManySounds { .. } => StatusCode::BAD_REQUEST,
             ErrorType::TooManyChannels { .. } => StatusCode::BAD_REQUEST,
             ErrorType::TooManyRoles { .. } => StatusCode::BAD_REQUEST,
 
@@ -98,6 +99,7 @@ impl IntoResponse for Error {
             ErrorType::LiveKitUnavailable => StatusCode::BAD_REQUEST,
             ErrorType::NotConnected => StatusCode::BAD_REQUEST,
             ErrorType::NotAVoiceChannel => StatusCode::BAD_REQUEST,
+            ErrorType::NotInVoiceChannel => StatusCode::BAD_REQUEST,
             ErrorType::AlreadyConnected => StatusCode::BAD_REQUEST,
             ErrorType::UnknownNode => StatusCode::BAD_REQUEST,
             ErrorType::InvalidFlagValue => StatusCode::BAD_REQUEST,

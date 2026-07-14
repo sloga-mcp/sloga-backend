@@ -61,6 +61,12 @@ impl<'a> RatelimitResolver<Request<'a>> for DeltaRatelimits {
                         return ("message_schedule", Some(id));
                     }
 
+                    // Soundboard triggers fan audio to the whole call, so bound
+                    // them tighter than plain messaging (per user, per channel).
+                    if request.method() == Method::Post && extra == Some("soundboard") {
+                        return ("soundboard", Some(id));
+                    }
+
                     // Following an announcement channel creates a webhook in
                     // the target and fans events to two server topics — bound
                     // it separately (both POST create and DELETE unfollow live
@@ -197,6 +203,7 @@ impl<'a> RatelimitResolver<Request<'a>> for DeltaRatelimits {
             "interaction_create" => 10,
             "poll_vote" => 10,
             "message_schedule" => 10,
+            "soundboard" => 4,
             "follow" => 2,
             "interaction_respond" => 30,
             "message_interact" => 20,

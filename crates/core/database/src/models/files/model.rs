@@ -65,6 +65,7 @@ auto_derived!(
         ServerBanner,
         Emoji,
         Sticker,
+        SoundboardSound,
         UserAvatar,
         WebhookAvatar,
         UserProfileBackground,
@@ -255,6 +256,25 @@ impl File {
             FileUsedFor {
                 id: parent.to_owned(),
                 object_type: FileUsedForType::Sticker,
+            },
+            uploader_id.to_owned(),
+        )
+        .await
+    }
+
+    /// Use a file for a soundboard sound
+    pub async fn use_soundboard(
+        db: &Database,
+        id: &str,
+        parent: &str,
+        uploader_id: &str,
+    ) -> Result<File> {
+        db.find_and_use_attachment(
+            id,
+            "soundboard",
+            FileUsedFor {
+                id: parent.to_owned(),
+                object_type: FileUsedForType::SoundboardSound,
             },
             uploader_id.to_owned(),
         )

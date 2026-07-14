@@ -26,7 +26,7 @@ struct MigrationInfo {
     revision: i32,
 }
 
-pub const LATEST_REVISION: i32 = 61; // MUST BE +1 to last migration
+pub const LATEST_REVISION: i32 = 62; // MUST BE +1 to last migration
 
 pub async fn migrate_database(db: &MongoDb) {
     let migrations = db.col::<Document>("migrations");
@@ -2022,6 +2022,33 @@ pub async fn run_migrations(db: &MongoDb, revision: i32) -> i32 {
             })
             .await
             .expect("Failed to create channel_follows indexes.");
+    }
+
+    if revision <= 61 {
+        info!("Running migration [revision 61 / 14-07-2026]: Create sounds collection (soundboard)");
+
+        // Existing deployments predate the soundboard: init.rs only covers
+        // fresh DBs. Collection + index mirror init.rs exactly; both
+        // operations are idempotent (create_collection errors are ignored;
+        // createIndexes is a no-op when key+name already match), so a re-run
+        // or a fresh DB is safe.
+        db.db().create_collection("sounds").await.ok();
+
+        db.db()
+            .run_command(doc! {
+                "createIndexes": "sounds",
+                "indexes": [
+                    // Serves the per-server sound listing (settings + picker).
+                    {
+                        "key": {
+                            "server_id": 1_i32
+                        },
+                        "name": "server_id"
+                    }
+                ]
+            })
+            .await
+            .expect("Failed to create sounds indexes.");
     }
 
     // Reminder to update LATEST_REVISION when adding new migrations.

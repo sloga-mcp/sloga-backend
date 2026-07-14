@@ -122,6 +122,9 @@ pub enum ErrorType {
     TooManyStickers {
         max: usize,
     },
+    TooManySounds {
+        max: usize,
+    },
     TooManyRoles {
         max: usize,
     },
@@ -206,6 +209,7 @@ pub enum ErrorType {
     // ? Voice errors
     LiveKitUnavailable,
     NotAVoiceChannel,
+    NotInVoiceChannel,
     AlreadyConnected,
     NotConnected,
     UnknownNode,

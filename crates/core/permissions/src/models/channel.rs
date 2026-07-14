@@ -93,6 +93,8 @@ pub enum ChannelPermission {
     MoveMembers = 1 << 35,
     /// Listen to other users
     Listen = 1 << 36,
+    /// Use the server soundboard in a voice call
+    UseSoundboard = 1 << 40,
 
     // * Channel permissions two electric boogaloo
     /// Mention everyone and online members
@@ -137,6 +139,7 @@ pub static DEFAULT_PERMISSION: Lazy<u64> = Lazy::new(|| {
             + ChannelPermission::Speak
             + ChannelPermission::Listen
             + ChannelPermission::Video
+            + ChannelPermission::UseSoundboard
     )
 });
 

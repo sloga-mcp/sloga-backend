@@ -16,6 +16,7 @@ mod messages;
 mod mls;
 mod polls;
 mod scheduled_messages;
+mod soundboard;
 mod stickers;
 mod thread_members;
 mod policy_changes;
@@ -50,6 +51,7 @@ pub use messages::*;
 pub use mls::*;
 pub use polls::*;
 pub use scheduled_messages::*;
+pub use soundboard::*;
 pub use stickers::*;
 pub use thread_members::*;
 pub use policy_changes::*;
@@ -94,6 +96,7 @@ pub trait AbstractDatabase:
     + messages::AbstractMessages
     + polls::AbstractPolls
     + scheduled_messages::AbstractScheduledMessages
+    + soundboard::AbstractSoundboard
     + policy_changes::AbstractPolicyChange
     + ratelimit_events::AbstractRatelimitEvents
     + safety_reports::AbstractReport

@@ -139,6 +139,7 @@ pub enum Tag {
     banners,
     emojis,
     stickers,
+    soundboard,
 }
 
 /// Request body for upload
@@ -252,9 +253,22 @@ async fn upload_file(
     // Determine metadata for the file
     let metadata = generate_metadata(&file.contents, mime_type);
 
-    // Block non-images for non-attachment uploads
-    if !matches!(tag, Tag::attachments) && !matches!(metadata, Metadata::Image { .. }) {
-        return Err(create_error!(FileTypeNotAllowed));
+    // Enforce per-tag content type:
+    // - attachments accept anything
+    // - soundboard accepts audio only (short voice-call clips)
+    // - every other tag is image-only
+    match tag {
+        Tag::attachments => {}
+        Tag::soundboard => {
+            if !matches!(metadata, Metadata::Audio) {
+                return Err(create_error!(FileTypeNotAllowed));
+            }
+        }
+        _ => {
+            if !matches!(metadata, Metadata::Image { .. }) {
+                return Err(create_error!(FileTypeNotAllowed));
+            }
+        }
     }
 
     // Find an existing hash and use that if possible

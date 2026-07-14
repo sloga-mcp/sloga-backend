@@ -178,6 +178,10 @@ pub async fn create_database(db: &MongoDb) {
         .await
         .expect("Failed to create channel_follows collection.");
 
+    db.create_collection("sounds")
+        .await
+        .expect("Failed to create sounds collection.");
+
     db.run_command(doc! {
         "createIndexes": "users",
         "indexes": [
@@ -445,6 +449,21 @@ pub async fn create_database(db: &MongoDb) {
     })
     .await
     .expect("Failed to create channel_follows index.");
+
+    db.run_command(doc! {
+        "createIndexes": "sounds",
+        "indexes": [
+            // Serves the per-server sound listing (settings + picker).
+            {
+                "key": {
+                    "server_id": 1_i32
+                },
+                "name": "server_id"
+            }
+        ]
+    })
+    .await
+    .expect("Failed to create sounds index.");
 
     db.run_command(doc! {
         "createIndexes": "channels",
