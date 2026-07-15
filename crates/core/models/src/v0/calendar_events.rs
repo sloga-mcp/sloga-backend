@@ -1,6 +1,8 @@
 #[cfg(feature = "validator")]
 use validator::Validate;
 
+use super::File;
+
 auto_derived!(
     /// How often a recurring event repeats
     pub enum Frequency {
@@ -92,6 +94,9 @@ auto_derived!(
         pub color: Option<String>,
         /// Whether the series is cancelled
         pub cancelled: bool,
+        /// Files attached to the event; visible to anyone who can view the event
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub attachments: Option<Vec<File>>,
         /// Creation time (ms epoch)
         pub created_at: i64,
         /// Last edit time (ms epoch)
@@ -154,6 +159,7 @@ auto_derived!(
         End,
         Recurrence,
         Color,
+        Attachments,
     }
 );
 
@@ -192,6 +198,11 @@ auto_derived!(
         /// Optional associated channel; requires ViewChannel there
         #[serde(default)]
         pub channel: Option<String>,
+        /// Optional attachment file ids (uploaded to the `attachments` bucket, claimed
+        /// server-side). Capped at `MAX_EVENT_ATTACHMENTS` (10) — must match the constant.
+        #[cfg_attr(feature = "validator", validate(length(max = 10)))]
+        #[serde(default)]
+        pub attachments: Option<Vec<String>>,
     }
 
     /// Event edit data
@@ -219,7 +230,17 @@ auto_derived!(
         #[cfg_attr(feature = "validator", validate(length(max = 32)))]
         #[serde(default)]
         pub color: Option<String>,
-        /// Fields to unset
+        /// Attachment file ids to ADD (uploaded to the `attachments` bucket, claimed
+        /// server-side). The resulting total (kept + added) is capped at
+        /// `MAX_EVENT_ATTACHMENTS` server-side; this per-request add-list is capped here.
+        #[cfg_attr(feature = "validator", validate(length(max = 10)))]
+        #[serde(default)]
+        pub attachments: Option<Vec<String>>,
+        /// Attachment file ids to DETACH from the event (files are marked deleted)
+        #[cfg_attr(feature = "validator", validate(length(max = 10)))]
+        #[serde(default)]
+        pub remove_attachments: Option<Vec<String>>,
+        /// Fields to unset (`Attachments` clears the whole attachment set)
         #[serde(default)]
         pub remove: Vec<FieldsEvent>,
     }

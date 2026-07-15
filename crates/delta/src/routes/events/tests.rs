@@ -1,5 +1,5 @@
 use crate::{rocket, util::test::TestHarness};
-use revolt_database::{Member, Server, User};
+use revolt_database::{File, Member, Metadata, Server, User};
 use revolt_models::v0::{self, DataCreateServer};
 use rocket::http::{ContentType, Header, Status};
 use serde_json::json;
@@ -23,6 +23,36 @@ async fn make_server(harness: &TestHarness, owner: &User) -> Server {
         .await
         .expect("owner member");
     server
+}
+
+/// Slice G: seed an UNCLAIMED file in the `attachments` bucket, exactly as Autumn
+/// leaves one after an upload (no `used_for`), so a route can claim it. Returns the id.
+async fn upload_attachment(harness: &TestHarness, filename: &str, uploader: &User) -> String {
+    use iso8601_timestamp::Timestamp;
+    let id = ulid::Ulid::new().to_string();
+    harness
+        .db
+        .insert_attachment(&File {
+            id: id.clone(),
+            tag: "attachments".to_string(),
+            filename: filename.to_string(),
+            hash: None,
+            uploaded_at: Some(Timestamp::now_utc()),
+            uploader_id: Some(uploader.id.clone()),
+            used_for: None,
+            deleted: None,
+            reported: None,
+            metadata: Metadata::File,
+            content_type: "application/octet-stream".to_string(),
+            size: 10,
+            message_id: None,
+            user_id: None,
+            server_id: None,
+            object_id: None,
+        })
+        .await
+        .expect("insert attachment");
+    id
 }
 
 #[rocket::async_test]
@@ -1321,4 +1351,311 @@ async fn pending_deletion_member_not_invitable() {
         .await
         .expect("attendees");
     assert!(attendees.attendees.is_empty());
+}
+
+/// Slice G: an event created with attachment file ids claims those files (bad ids
+/// fail), carries them on the wire, and — because attachments inherit the event's
+/// view rule — is visible to any other member who can see the event.
+#[rocket::async_test]
+async fn create_with_attachments_visible_to_members() {
+    let harness = TestHarness::new().await;
+    let (_, owner_session, owner) = harness.new_user().await;
+    let (_, member_session, member) = harness.new_user().await;
+    let server = make_server(&harness, &owner).await;
+    Member::create(&harness.db, &server, &member, None)
+        .await
+        .expect("member");
+
+    let f1 = upload_attachment(&harness, "agenda.pdf", &owner).await;
+    let f2 = upload_attachment(&harness, "map.png", &owner).await;
+
+    let event = harness
+        .client
+        .post(format!("/events/server/{}", server.id))
+        .header(Header::new("x-session-token", owner_session.token.to_string()))
+        .header(ContentType::JSON)
+        .body(
+            json!({
+                "title": "Kickoff",
+                "start": 1_900_000_000_000_i64,
+                "timezone": "UTC",
+                "attachments": [f1, f2]
+            })
+            .to_string(),
+        )
+        .dispatch()
+        .await
+        .into_json::<v0::Event>()
+        .await
+        .expect("event");
+    let attachments = event.attachments.expect("attachments present");
+    assert_eq!(attachments.len(), 2);
+    let names: Vec<&str> = attachments.iter().map(|f| f.filename.as_str()).collect();
+    assert!(names.contains(&"agenda.pdf") && names.contains(&"map.png"));
+
+    // Another member who can view the event sees its attachments (visibility inherits
+    // the event's view rule).
+    let ctx = harness
+        .client
+        .get(format!("/events/event/{}", event.id))
+        .header(Header::new("x-session-token", member_session.token.to_string()))
+        .dispatch()
+        .await
+        .into_json::<v0::EventWithContext>()
+        .await
+        .expect("context");
+    assert_eq!(ctx.event.attachments.map(|a| a.len()), Some(2));
+
+    // The files are now claimed: a second event re-using the same id fails (claim-once,
+    // enforced by both drivers — Mongo via `used_for: {$exists:false}`, Reference via the
+    // matching unclaimed check).
+    let response = harness
+        .client
+        .post(format!("/events/server/{}", server.id))
+        .header(Header::new("x-session-token", owner_session.token.to_string()))
+        .header(ContentType::JSON)
+        .body(
+            json!({
+                "title": "Dup",
+                "start": 1_900_000_000_000_i64,
+                "timezone": "UTC",
+                "attachments": [f1]
+            })
+            .to_string(),
+        )
+        .dispatch()
+        .await;
+    assert_ne!(response.status(), Status::Ok, "a claimed file cannot be reused");
+}
+
+/// Slice G (audit HIGH): an edit that changes attachments but fails the event's OWN
+/// validator (bad timezone — which the DTO length checks do not catch) must be rejected
+/// with NO file side effects: the detached file stays referenced and undeleted, and the
+/// would-be new file stays unclaimed (re-usable). Guards the "validate/persist the event
+/// before mutating any files" ordering.
+#[rocket::async_test]
+async fn edit_validation_failure_leaves_attachments_untouched() {
+    let harness = TestHarness::new().await;
+    let (_, owner_session, owner) = harness.new_user().await;
+    let server = make_server(&harness, &owner).await;
+
+    let f1 = upload_attachment(&harness, "keep.pdf", &owner).await;
+    let event = harness
+        .client
+        .post(format!("/events/server/{}", server.id))
+        .header(Header::new("x-session-token", owner_session.token.to_string()))
+        .header(ContentType::JSON)
+        .body(
+            json!({ "title": "Docs", "start": 1_900_000_000_000_i64, "timezone": "UTC", "attachments": [f1] })
+                .to_string(),
+        )
+        .dispatch()
+        .await
+        .into_json::<v0::Event>()
+        .await
+        .expect("event");
+
+    // Edit that detaches f1, adds f2, AND sets an invalid timezone → event.validate() fails.
+    let f2 = upload_attachment(&harness, "new.pdf", &owner).await;
+    let response = harness
+        .client
+        .patch(format!("/events/event/{}", event.id))
+        .header(Header::new("x-session-token", owner_session.token.to_string()))
+        .header(ContentType::JSON)
+        .body(
+            json!({ "timezone": "Not/AZone", "attachments": [f2], "remove_attachments": [f1] })
+                .to_string(),
+        )
+        .dispatch()
+        .await;
+    assert_ne!(response.status(), Status::Ok, "invalid timezone must reject the edit");
+
+    // f1 was NOT deleted and is still the event's only attachment.
+    let f1_doc = harness
+        .db
+        .fetch_attachment("attachments", &f1)
+        .await
+        .expect("f1 present");
+    assert_ne!(
+        f1_doc.deleted,
+        Some(true),
+        "a rejected edit must not delete the detached file"
+    );
+    let ctx = harness
+        .client
+        .get(format!("/events/event/{}", event.id))
+        .header(Header::new("x-session-token", owner_session.token.to_string()))
+        .dispatch()
+        .await
+        .into_json::<v0::EventWithContext>()
+        .await
+        .expect("context");
+    assert_eq!(ctx.event.attachments.map(|a| a.len()), Some(1), "attachments unchanged");
+
+    // f2 was never claimed, so a valid edit can still add it.
+    let response = harness
+        .client
+        .patch(format!("/events/event/{}", event.id))
+        .header(Header::new("x-session-token", owner_session.token.to_string()))
+        .header(ContentType::JSON)
+        .body(json!({ "attachments": [f2] }).to_string())
+        .dispatch()
+        .await;
+    assert_eq!(
+        response.status(),
+        Status::Ok,
+        "the rejected edit left f2 unclaimed and re-usable"
+    );
+}
+
+/// Slice G: the edit path adds and detaches files (detached files are marked deleted),
+/// and `remove: ["Attachments"]` clears the whole set — all without disturbing the
+/// rest of the event.
+#[rocket::async_test]
+async fn edit_add_remove_and_clear_attachments() {
+    let harness = TestHarness::new().await;
+    let (_, owner_session, owner) = harness.new_user().await;
+    let server = make_server(&harness, &owner).await;
+
+    let f1 = upload_attachment(&harness, "one.pdf", &owner).await;
+    let event = harness
+        .client
+        .post(format!("/events/server/{}", server.id))
+        .header(Header::new("x-session-token", owner_session.token.to_string()))
+        .header(ContentType::JSON)
+        .body(
+            json!({ "title": "Docs", "start": 1_900_000_000_000_i64, "timezone": "UTC", "attachments": [f1] })
+                .to_string(),
+        )
+        .dispatch()
+        .await
+        .into_json::<v0::Event>()
+        .await
+        .expect("event");
+
+    // Add f2, detach f1 in a single PATCH.
+    let f2 = upload_attachment(&harness, "two.pdf", &owner).await;
+    let edited = harness
+        .client
+        .patch(format!("/events/event/{}", event.id))
+        .header(Header::new("x-session-token", owner_session.token.to_string()))
+        .header(ContentType::JSON)
+        .body(json!({ "attachments": [f2], "remove_attachments": [f1] }).to_string())
+        .dispatch()
+        .await
+        .into_json::<v0::Event>()
+        .await
+        .expect("edited");
+    let attachments = edited.attachments.expect("attachments");
+    assert_eq!(attachments.len(), 1);
+    assert_eq!(attachments[0].filename, "two.pdf");
+
+    // The detached file was marked deleted (crond will sweep it).
+    let f1_doc = harness
+        .db
+        .fetch_attachment("attachments", &f1)
+        .await
+        .expect("f1 still present");
+    assert_eq!(f1_doc.deleted, Some(true), "detached file is marked deleted");
+
+    // Clearing the whole set unsets attachments.
+    let cleared = harness
+        .client
+        .patch(format!("/events/event/{}", event.id))
+        .header(Header::new("x-session-token", owner_session.token.to_string()))
+        .header(ContentType::JSON)
+        .body(json!({ "remove": ["Attachments"] }).to_string())
+        .dispatch()
+        .await
+        .into_json::<v0::Event>()
+        .await
+        .expect("cleared");
+    assert!(
+        cleared.attachments.is_none() || cleared.attachments.as_ref().unwrap().is_empty(),
+        "attachments cleared"
+    );
+    let f2_doc = harness
+        .db
+        .fetch_attachment("attachments", &f2)
+        .await
+        .expect("f2 present");
+    assert_eq!(f2_doc.deleted, Some(true), "cleared file is marked deleted");
+}
+
+/// Slice G: the attachment count is capped at `MAX_EVENT_ATTACHMENTS` (10) on create
+/// (DTO validation) and on the post-edit total — and an over-cap edit has NO side
+/// effects (its would-be new file is left unclaimed and re-usable).
+#[rocket::async_test]
+async fn attachment_cap_enforced() {
+    let harness = TestHarness::new().await;
+    let (_, owner_session, owner) = harness.new_user().await;
+    let server = make_server(&harness, &owner).await;
+
+    // 11 ids on create → rejected before any claim (DTO length cap).
+    let too_many: Vec<String> = (0..11).map(|i| format!("id{i}")).collect();
+    let response = harness
+        .client
+        .post(format!("/events/server/{}", server.id))
+        .header(Header::new("x-session-token", owner_session.token.to_string()))
+        .header(ContentType::JSON)
+        .body(
+            json!({ "title": "Too many", "start": 1_900_000_000_000_i64, "timezone": "UTC", "attachments": too_many })
+                .to_string(),
+        )
+        .dispatch()
+        .await;
+    assert_ne!(response.status(), Status::Ok, "11 attachments rejected on create");
+
+    // Create with 8 real files, then try to add 3 more (total 11) — rejected, with the
+    // new file left unclaimed.
+    let mut ids = Vec::new();
+    for i in 0..8 {
+        ids.push(upload_attachment(&harness, &format!("f{i}.bin"), &owner).await);
+    }
+    let event = harness
+        .client
+        .post(format!("/events/server/{}", server.id))
+        .header(Header::new("x-session-token", owner_session.token.to_string()))
+        .header(ContentType::JSON)
+        .body(
+            json!({ "title": "Eight", "start": 1_900_000_000_000_i64, "timezone": "UTC", "attachments": ids })
+                .to_string(),
+        )
+        .dispatch()
+        .await
+        .into_json::<v0::Event>()
+        .await
+        .expect("event");
+    assert_eq!(event.attachments.map(|a| a.len()), Some(8));
+
+    let add = [
+        upload_attachment(&harness, "a.bin", &owner).await,
+        upload_attachment(&harness, "b.bin", &owner).await,
+        upload_attachment(&harness, "c.bin", &owner).await,
+    ];
+    let response = harness
+        .client
+        .patch(format!("/events/event/{}", event.id))
+        .header(Header::new("x-session-token", owner_session.token.to_string()))
+        .header(ContentType::JSON)
+        .body(json!({ "attachments": add }).to_string())
+        .dispatch()
+        .await;
+    assert_ne!(response.status(), Status::Ok, "8 + 3 exceeds the cap");
+
+    // No side effects: the first would-be file was never claimed, so it can still be
+    // claimed by a valid single-file edit.
+    let response = harness
+        .client
+        .patch(format!("/events/event/{}", event.id))
+        .header(Header::new("x-session-token", owner_session.token.to_string()))
+        .header(ContentType::JSON)
+        .body(json!({ "remove_attachments": ids, "attachments": [add[0]] }).to_string())
+        .dispatch()
+        .await;
+    assert_eq!(
+        response.status(),
+        Status::Ok,
+        "the over-cap edit left its file unclaimed and re-usable"
+    );
 }

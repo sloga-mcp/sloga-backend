@@ -73,6 +73,7 @@ auto_derived!(
         ChannelIcon,
         ServerIcon,
         RoleIcon,
+        CalendarEvent,
     }
 
     /// Information about what the file was used for
@@ -104,6 +105,28 @@ impl File {
             FileUsedFor {
                 id: parent.to_owned(),
                 object_type: FileUsedForType::Message,
+            },
+            uploader_id.to_owned(),
+        )
+        .await
+    }
+
+    /// Use a file as a calendar event attachment (slice G). Reuses the generic
+    /// `attachments` bucket, distinguished by `FileUsedForType::CalendarEvent`;
+    /// claimed against the owning event id. `find_and_use_attachment` enforces
+    /// claim-once + tag match, so a re-used or foreign id fails with `NotFound`.
+    pub async fn use_calendar_event_attachment(
+        db: &Database,
+        id: &str,
+        parent: &str,
+        uploader_id: &str,
+    ) -> Result<File> {
+        db.find_and_use_attachment(
+            id,
+            "attachments",
+            FileUsedFor {
+                id: parent.to_owned(),
+                object_type: FileUsedForType::CalendarEvent,
             },
             uploader_id.to_owned(),
         )

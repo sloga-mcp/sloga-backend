@@ -95,7 +95,11 @@ impl AbstractAttachments for ReferenceDb {
     ) -> Result<File> {
         let mut files = self.files.lock().await;
         if let Some(file) = files.get_mut(id) {
-            if file.tag == tag {
+            // Claim-once: match the tag AND require the file to be unclaimed, mirroring the
+            // Mongo driver's `used_for: {$exists: false}` filter. Without the `used_for`
+            // check a file already claimed by one parent could be re-pointed/stolen into
+            // another — this keeps the Reference mock a faithful oracle for that guarantee.
+            if file.tag == tag && file.used_for.is_none() {
                 file.uploader_id = Some(uploader_id);
                 file.used_for = Some(used_for);
 

@@ -173,6 +173,9 @@ pub fn event_to_wire(e: CalendarEvent) -> v0::Event {
         recurrence: e.recurrence.map(recurrence_to_wire),
         color: e.color,
         cancelled: e.cancelled,
+        attachments: e
+            .attachments
+            .map(|files| files.into_iter().map(Into::into).collect()),
         created_at: e.created_at,
         edited_at: e.edited_at,
     }

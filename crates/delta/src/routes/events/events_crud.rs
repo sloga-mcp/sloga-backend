@@ -4,7 +4,8 @@ use revolt_database::{
     occurrences_in_window,
     util::permissions::DatabasePermissionQuery,
     util::reference::Reference,
-    CalendarEvent, Database, FieldsCalendarEvent, PartialCalendarEvent, RsvpStatus, User, AMQP,
+    CalendarEvent, Database, File, FieldsCalendarEvent, PartialCalendarEvent, RsvpStatus, User,
+    AMQP, MAX_EVENT_ATTACHMENTS,
 };
 use revolt_models::v0;
 use revolt_permissions::{calculate_channel_permissions, ChannelPermission};
@@ -27,7 +28,35 @@ fn field_from_wire(f: v0::FieldsEvent) -> FieldsCalendarEvent {
         v0::FieldsEvent::End => FieldsCalendarEvent::End,
         v0::FieldsEvent::Recurrence => FieldsCalendarEvent::Recurrence,
         v0::FieldsEvent::Color => FieldsCalendarEvent::Color,
+        v0::FieldsEvent::Attachments => FieldsCalendarEvent::Attachments,
     }
+}
+
+/// Claim every file id as an attachment of `event_id` (slice G). Claim-once + tag
+/// match are enforced by `find_and_use_attachment`, so a bad/foreign/already-claimed
+/// id fails with `NotFound`. On a mid-list failure the ids already claimed in THIS
+/// call are marked deleted (best-effort) so a partial claim never leaks orphaned
+/// files, then the error is surfaced. Returns the claimed `File`s on full success.
+async fn claim_event_attachments(
+    db: &Database,
+    ids: &[String],
+    event_id: &str,
+    uploader_id: &str,
+) -> Result<Vec<File>> {
+    let mut files: Vec<File> = Vec::with_capacity(ids.len());
+    for id in ids {
+        match File::use_calendar_event_attachment(db, id, event_id, uploader_id).await {
+            Ok(file) => files.push(file),
+            Err(error) => {
+                let claimed: Vec<String> = files.iter().map(|f| f.id.clone()).collect();
+                if !claimed.is_empty() {
+                    db.mark_attachments_as_deleted(&claimed).await.ok();
+                }
+                return Err(error);
+            }
+        }
+    }
+    Ok(files)
 }
 
 /// # Create Event
@@ -69,7 +98,7 @@ pub async fn create_event(
             .throw_if_lacking_channel_permission(ChannelPermission::ViewChannel)?;
     }
 
-    let event = CalendarEvent::create(
+    let mut event = CalendarEvent::create(
         db,
         server.id.clone(),
         user.id.clone(),
@@ -86,6 +115,42 @@ pub async fn create_event(
         None,
     )
     .await?;
+
+    // Claim attachment files (slice G): reuse the generic `attachments` bucket, tagged
+    // CalendarEvent and claimed against the freshly-created event id. On ANY attachment
+    // failure (over-cap, or a bad/foreign/re-used id) the just-created event is deleted
+    // and the partially-claimed files released (`claim_event_attachments`) so a failed
+    // create leaves neither an empty event nor orphaned files.
+    if let Some(ids) = data.attachments {
+        if !ids.is_empty() {
+            // Enforce the cap against the constant (the DTO literal must agree, but the
+            // constant is the real gate).
+            if ids.len() > MAX_EVENT_ATTACHMENTS {
+                db.delete_event(&event.id).await.ok();
+                return Err(create_error!(FailedValidation {
+                    error: "attachments".to_string()
+                }));
+            }
+            match claim_event_attachments(db, &ids, &event.id, &user.id).await {
+                Ok(files) => {
+                    db.update_event(
+                        &event.id,
+                        &PartialCalendarEvent {
+                            attachments: Some(files.clone()),
+                            ..Default::default()
+                        },
+                        vec![],
+                    )
+                    .await?;
+                    event.attachments = Some(files);
+                }
+                Err(error) => {
+                    db.delete_event(&event.id).await.ok();
+                    return Err(error);
+                }
+            }
+        }
+    }
 
     let topic = super::event_topic(&event);
     let wire = super::event_to_wire(event);
@@ -214,6 +279,45 @@ pub async fn edit_event(
     }
     super::authorize_manage(db, &user, &event).await?;
 
+    // ----- resolve the attachment plan (slice G) -------------------------------
+    // Attachments are NOT time-affecting and must never clear recurrence exceptions,
+    // so they are handled separately from the event-field edit below. The cap is
+    // checked up front — before ANY mutation (event fields OR files) — so an over-cap
+    // request has no side effects.
+    let clear_all = data
+        .remove
+        .iter()
+        .any(|f| matches!(f, v0::FieldsEvent::Attachments));
+    let add_ids = data.attachments.unwrap_or_default();
+    let detach_ids = data.remove_attachments.unwrap_or_default();
+    let attachments_changed = clear_all || !add_ids.is_empty() || !detach_ids.is_empty();
+
+    let existing = event.attachments.clone().unwrap_or_default();
+    let detach: std::collections::HashSet<&str> =
+        detach_ids.iter().map(|s| s.as_str()).collect();
+    // Existing files kept after removals (unchanged when nothing about attachments changed).
+    let kept: Vec<File> = if clear_all {
+        Vec::new()
+    } else {
+        existing
+            .iter()
+            .filter(|f| !detach.contains(f.id.as_str()))
+            .cloned()
+            .collect()
+    };
+    if attachments_changed && kept.len() + add_ids.len() > MAX_EVENT_ATTACHMENTS {
+        return Err(create_error!(FailedValidation {
+            error: "attachments".to_string()
+        }));
+    }
+
+    // Apply the event-field edit FIRST. `event.edit` runs the full validator (timezone,
+    // start/end ordering, recurrence bounds) that the DTO validation does NOT — so it
+    // must succeed and PERSIST before any file is claimed or deleted. Were files mutated
+    // first, a rejected edit (bad tz/time/recurrence) would leave a detached file marked
+    // deleted while the event still referenced it (broken link) and orphan any added
+    // files. Attachments are excluded from this partial (resolved below); the wire
+    // `Attachments` unset is filtered out of `remove`.
     let partial = PartialCalendarEvent {
         title: data.title,
         description: data.description,
@@ -226,9 +330,57 @@ pub async fn edit_event(
         color: data.color,
         ..Default::default()
     };
-    let remove = data.remove.into_iter().map(field_from_wire).collect();
-
+    let remove: Vec<FieldsCalendarEvent> = data
+        .remove
+        .into_iter()
+        .filter(|f| !matches!(f, v0::FieldsEvent::Attachments))
+        .map(field_from_wire)
+        .collect();
     event.edit(db, partial, remove).await?;
+
+    // The event is now validated and persisted — safe to mutate files. Claim the new
+    // ids (orphan-safe), mark the detached/cleared ones deleted, and persist the
+    // resulting set: non-empty via the partial, emptied via the `Attachments` unset
+    // (an Option field cannot be set to None via the partial under opt_some_priority).
+    if attachments_changed {
+        let added = claim_event_attachments(db, &add_ids, &event.id, &user.id).await?;
+
+        let to_delete: Vec<String> = if clear_all {
+            existing.iter().map(|f| f.id.clone()).collect()
+        } else {
+            existing
+                .iter()
+                .filter(|f| detach.contains(f.id.as_str()))
+                .map(|f| f.id.clone())
+                .collect()
+        };
+        if !to_delete.is_empty() {
+            db.mark_attachments_as_deleted(&to_delete).await?;
+        }
+
+        let mut resolved = kept;
+        resolved.extend(added);
+        if resolved.is_empty() {
+            db.update_event(
+                &event.id,
+                &PartialCalendarEvent::default(),
+                vec![FieldsCalendarEvent::Attachments],
+            )
+            .await?;
+            event.attachments = None;
+        } else {
+            db.update_event(
+                &event.id,
+                &PartialCalendarEvent {
+                    attachments: Some(resolved.clone()),
+                    ..Default::default()
+                },
+                vec![],
+            )
+            .await?;
+            event.attachments = Some(resolved);
+        }
+    }
 
     let topic = super::event_topic(&event);
     let wire = super::event_to_wire(event);

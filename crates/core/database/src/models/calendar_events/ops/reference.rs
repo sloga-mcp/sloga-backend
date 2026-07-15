@@ -173,8 +173,26 @@ impl AbstractCalendarEvents for ReferenceDb {
             .filter(|e| e.server == server_id)
             .map(|e| e.id.clone())
             .collect();
+        // Attachment files owned by the removed events (slice G) — marked deleted so
+        // crond's file sweep reclaims them; the events themselves are dropped below.
+        let attachment_ids: Vec<String> = events
+            .values()
+            .filter(|e| e.server == server_id)
+            .filter_map(|e| e.attachments.as_ref())
+            .flatten()
+            .map(|f| f.id.clone())
+            .collect();
         events.retain(|_, e| e.server != server_id);
         drop(events);
+
+        if !attachment_ids.is_empty() {
+            let mut files = self.files.lock().await;
+            for id in &attachment_ids {
+                if let Some(file) = files.get_mut(id) {
+                    file.deleted = Some(true);
+                }
+            }
+        }
 
         let mut rsvps = self.event_rsvps.lock().await;
         rsvps.retain(|k, _| !removed.contains(&k.event));

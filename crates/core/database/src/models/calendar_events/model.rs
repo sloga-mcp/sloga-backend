@@ -5,12 +5,17 @@ use chrono_tz::Tz;
 use revolt_result::{create_error, Result};
 use ulid::Ulid;
 
-use crate::Database;
+use crate::{Database, File};
 
 /// Hard upper bound on how many occurrences a recurring series may expand to.
 /// Bounds both the (storage-free) window expansion and `series_end` computation,
 /// so no rule can ever fan out unbounded (design §4.2, review finding H4).
 pub const MAX_OCCURRENCES: usize = 730;
+
+/// Hard upper bound on how many files a single event may carry (slice G). Enforced
+/// on create and on the post-edit total; the create/edit DTO validators cap the
+/// per-request add-list at the same value (they must agree).
+pub const MAX_EVENT_ATTACHMENTS: usize = 10;
 
 auto_derived!(
     /// How often a recurring event repeats
@@ -106,6 +111,7 @@ auto_derived!(
         Color,
         SourceMessageId,
         EditedAt,
+        Attachments,
     }
 
     /// Composite key of a sent-reminder marker: one row per notified
@@ -189,6 +195,11 @@ auto_derived_partial!(
         /// Source message id when imported from the legacy tag format (dedup key, finding M5)
         #[serde(skip_serializing_if = "Option::is_none")]
         pub source_message_id: Option<String>,
+        /// Files attached to the event (slice G). Freshly-minted `File` docs owned by this
+        /// event (claimed via `File::use_calendar_event_attachment`); visible to anyone who
+        /// can view the event. Not a time-affecting field — editing it never clears exceptions.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub attachments: Option<Vec<File>>,
         /// When the event was created
         pub created_at: i64,
         /// When the event was last edited
@@ -642,6 +653,7 @@ impl CalendarEvent {
             color,
             cancelled: false,
             source_message_id,
+            attachments: None,
             created_at: now_ms(),
             edited_at: None,
         };
@@ -704,6 +716,7 @@ impl CalendarEvent {
             FieldsCalendarEvent::Color => self.color = None,
             FieldsCalendarEvent::SourceMessageId => self.source_message_id = None,
             FieldsCalendarEvent::EditedAt => self.edited_at = None,
+            FieldsCalendarEvent::Attachments => self.attachments = None,
         }
     }
 }
@@ -800,6 +813,7 @@ mod tests {
             color: None,
             cancelled: false,
             source_message_id: None,
+            attachments: None,
             created_at: 0,
             edited_at: None,
         };
@@ -1111,6 +1125,150 @@ mod tests {
             assert_eq!(refetched.start, new_start);
             assert_eq!(refetched.series_end, event.series_end);
             assert!(refetched.recurrence.as_ref().unwrap().exceptions.is_empty());
+        });
+    }
+
+    /// Build an `attachments`-bucket file for the slice-G tests.
+    fn attachment_file(id: &str, filename: &str, used_for: Option<crate::FileUsedFor>) -> File {
+        File {
+            id: id.to_string(),
+            tag: "attachments".to_string(),
+            filename: filename.to_string(),
+            hash: None,
+            uploaded_at: None,
+            uploader_id: Some("01H".to_string()),
+            used_for,
+            deleted: None,
+            reported: None,
+            metadata: crate::Metadata::File,
+            content_type: "application/octet-stream".to_string(),
+            size: 10,
+            message_id: None,
+            user_id: None,
+            server_id: None,
+            object_id: None,
+        }
+    }
+
+    /// Slice G: attachments are NOT time-affecting — an attachment-only edit must
+    /// leave `series_end`/`duration_ms` untouched and must not clear recurrence
+    /// exceptions (unlike a start/end/recurrence edit).
+    #[tokio::test]
+    async fn edit_attachments_preserves_exceptions() {
+        database_test!(|db| async move {
+            let rule = RecurrenceRule {
+                freq: Frequency::Daily,
+                interval: 1,
+                by_weekday: vec![],
+                end: RecurrenceEnd::Count { count: 5 },
+                exceptions: vec![],
+            };
+            let start = 1_900_000_000_000;
+            let mut event = CalendarEvent::create(
+                &db,
+                "01S".to_string(),
+                "01H".to_string(),
+                "Sync".to_string(),
+                None,
+                None,
+                start,
+                Some(start + 3_600_000),
+                false,
+                "UTC".to_string(),
+                Some(rule),
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+            let series_end_before = event.series_end;
+            if let Some(r) = event.recurrence.as_mut() {
+                r.exceptions = vec![start];
+            }
+
+            // Edit ONLY the attachments.
+            let file = attachment_file(
+                "01FILE",
+                "agenda.pdf",
+                Some(crate::FileUsedFor {
+                    object_type: crate::FileUsedForType::CalendarEvent,
+                    id: event.id.clone(),
+                }),
+            );
+            let partial = PartialCalendarEvent {
+                attachments: Some(vec![file]),
+                ..Default::default()
+            };
+            event.edit(&db, partial, vec![]).await.unwrap();
+
+            assert_eq!(
+                event.recurrence.as_ref().unwrap().exceptions,
+                vec![start],
+                "an attachment-only edit must not clear exceptions"
+            );
+            assert_eq!(event.series_end, series_end_before, "series_end unchanged");
+            assert_eq!(event.attachments.as_ref().map(|a| a.len()), Some(1));
+
+            let refetched = db.fetch_event(&event.id).await.unwrap();
+            assert_eq!(refetched.attachments.map(|a| a.len()), Some(1));
+            assert_eq!(refetched.recurrence.as_ref().unwrap().exceptions, vec![start]);
+        });
+    }
+
+    /// Slice G: the server cascade marks the events' attachment files deleted (crond's
+    /// file sweep reclaims them) while deleting the events themselves.
+    #[tokio::test]
+    async fn server_cascade_marks_attachment_files_deleted() {
+        database_test!(|db| async move {
+            let event = CalendarEvent::create(
+                &db,
+                "01SCAS".to_string(),
+                "01H".to_string(),
+                "Docs".to_string(),
+                None,
+                None,
+                1_900_000_000_000,
+                Some(1_900_003_600_000),
+                false,
+                "UTC".to_string(),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+            let file = attachment_file(
+                "01CASFILE",
+                "deck.pdf",
+                Some(crate::FileUsedFor {
+                    object_type: crate::FileUsedForType::CalendarEvent,
+                    id: event.id.clone(),
+                }),
+            );
+            db.insert_attachment(&file).await.unwrap();
+            db.update_event(
+                &event.id,
+                &PartialCalendarEvent {
+                    attachments: Some(vec![file.clone()]),
+                    ..Default::default()
+                },
+                vec![],
+            )
+            .await
+            .unwrap();
+
+            db.delete_calendar_for_server("01SCAS").await.unwrap();
+
+            assert!(db.fetch_event(&event.id).await.is_err(), "event deleted");
+            let after = db.fetch_attachment("attachments", &file.id).await.unwrap();
+            assert_eq!(
+                after.deleted,
+                Some(true),
+                "the event's attachment file is marked deleted by the cascade"
+            );
         });
     }
 

@@ -256,6 +256,19 @@ impl AbstractCalendarEvents for MongoDb {
                 .delete_many(doc! { "_id.event": { "$in": &event_ids } })
                 .await
                 .map_err(|_| create_database_error!("delete_many", COL_REMINDERS))?;
+            // Attachment files owned by these events (slice G) — marked deleted so
+            // crond's file sweep reclaims them. Keyed on `used_for.{type,id}`, which the
+            // claim helper stamped as CalendarEvent + the event id.
+            self.col::<Document>("attachments")
+                .update_many(
+                    doc! {
+                        "used_for.type": "CalendarEvent",
+                        "used_for.id": { "$in": &event_ids },
+                    },
+                    doc! { "$set": { "deleted": true } },
+                )
+                .await
+                .map_err(|_| create_database_error!("update_many", "attachments"))?;
         }
         self.col::<Document>(COL_EVENTS)
             .delete_many(doc! { "server": server_id })
@@ -387,6 +400,7 @@ impl IntoDocumentPath for FieldsCalendarEvent {
             FieldsCalendarEvent::Color => "color",
             FieldsCalendarEvent::SourceMessageId => "source_message_id",
             FieldsCalendarEvent::EditedAt => "edited_at",
+            FieldsCalendarEvent::Attachments => "attachments",
         })
     }
 }
