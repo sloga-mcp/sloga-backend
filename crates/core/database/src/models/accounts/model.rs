@@ -55,6 +55,10 @@ auto_derived_partial!(
         /// Google account id, if this account is linked to Google OAuth
         #[serde(skip_serializing_if = "Option::is_none", default)]
         pub google_id: Option<String>,
+
+        /// Apple user id (id_token `sub`), if linked to Sign in with Apple
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        pub apple_id: Option<String>,
     },
     "PartialAccount"
 );
@@ -323,6 +327,7 @@ impl Account {
 
                 mfa: Default::default(),
                 google_id: None,
+                apple_id: None,
             };
 
             // Send email verification
@@ -354,6 +359,27 @@ impl Account {
         email: String,
         google_id: String,
     ) -> Result<Account> {
+        Account::new_from_oauth(db, email, Some(google_id), None).await
+    }
+
+    /// Create a new account from a verified Sign in with Apple identity
+    ///
+    /// Same contract as [`Account::new_from_google`].
+    pub async fn new_from_apple(
+        db: &Database,
+        email: String,
+        apple_id: String,
+    ) -> Result<Account> {
+        Account::new_from_oauth(db, email, None, Some(apple_id)).await
+    }
+
+    /// Shared OAuth account construction
+    async fn new_from_oauth(
+        db: &Database,
+        email: String,
+        google_id: Option<String>,
+        apple_id: Option<String>,
+    ) -> Result<Account> {
         let email_normalised = normalise_email(email.clone());
         let password = hash_password(nanoid!(64))?;
 
@@ -371,7 +397,8 @@ impl Account {
             lockout: None,
 
             mfa: Default::default(),
-            google_id: Some(google_id),
+            google_id,
+            apple_id,
         };
 
         account.save(db).await?;

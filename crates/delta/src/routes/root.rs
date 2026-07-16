@@ -49,6 +49,8 @@ pub struct RevoltFeatures {
     pub email: bool,
     /// Whether Google OAuth login is enabled
     pub oauth_google: bool,
+    /// Whether Sign in with Apple login is enabled
+    pub oauth_apple: bool,
     /// Whether this server is invite only
     pub invite_only: bool,
     /// File server service configuration
@@ -204,6 +206,7 @@ pub async fn root() -> Result<Json<RevoltConfig>> {
             },
             email: !config.api.smtp.host.is_empty(),
             oauth_google: config.api.oauth.google.enabled,
+            oauth_apple: config.api.oauth.apple.enabled,
             invite_only: config.api.registration.invite_only,
             autumn: Feature {
                 enabled: !config.hosts.autumn.is_empty(),

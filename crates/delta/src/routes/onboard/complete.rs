@@ -1,6 +1,7 @@
 use once_cell::sync::Lazy;
 use regex::Regex;
-use revolt_database::{Database, User, Session};
+use revolt_config::config;
+use revolt_database::{Database, Member, Session, User};
 use revolt_models::v0;
 use revolt_result::{create_error, Result};
 
@@ -44,10 +45,32 @@ pub async fn complete(
         })
     })?;
 
-    Ok(Json(
-        User::create(db, data.username, session.user_id, None)
-            .await?
-            .into_self(false)
-            .await,
-    ))
+    let user = User::create(db, data.username, session.user_id, None).await?;
+
+    // Auto-join the configured welcome / landing-spot server, if one is set.
+    // Best-effort: onboarding must never fail because of this. We ignore a
+    // missing/misconfigured server id, an existing membership, a ban, etc.
+    if let Some(welcome_id) = config()
+        .await
+        .features
+        .welcome_server
+        .as_deref()
+        .filter(|id| !id.is_empty())
+    {
+        match db.fetch_server(welcome_id).await {
+            Ok(server) => {
+                if let Err(err) = Member::create(db, &server, &user, None).await {
+                    log::warn!(
+                        "Failed to auto-join user {} to welcome server {welcome_id}: {err:?}",
+                        user.id
+                    );
+                }
+            }
+            Err(err) => log::warn!(
+                "welcome_server {welcome_id} is set but could not be fetched: {err:?}"
+            ),
+        }
+    }
+
+    Ok(Json(user.into_self(false).await))
 }

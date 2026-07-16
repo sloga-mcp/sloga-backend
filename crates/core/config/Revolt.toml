@@ -242,6 +242,9 @@ media_e2ee_enabled = true
 mass_mentions_send_notifications = true
 # Can role/everyone pings be used at all
 mass_mentions_enabled = true
+# Server id that every newly-onboarded user is auto-joined to (landing-spot
+# server). Leave empty to disable. Set the real id in Revolt.overrides.toml.
+welcome_server = ""
 
 [features.limits]
 

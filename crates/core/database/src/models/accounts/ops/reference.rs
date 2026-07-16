@@ -34,6 +34,15 @@ impl AbstractAccounts for ReferenceDb {
             .cloned())
     }
 
+    /// Find account by linked Apple user id
+    async fn fetch_account_by_apple_id(&self, apple_id: &str) -> Result<Option<Account>> {
+        let accounts = self.accounts.lock().await;
+        Ok(accounts
+            .values()
+            .find(|account| account.apple_id.as_deref() == Some(apple_id))
+            .cloned())
+    }
+
     /// Find account with active pending email verification
     async fn fetch_account_with_email_verification(&self, token_to_match: &str) -> Result<Account> {
         let accounts = self.accounts.lock().await;

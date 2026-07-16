@@ -1,5 +1,5 @@
-//! Begin Google OAuth login
-//! GET /auth/oauth/google
+//! Begin Sign in with Apple login
+//! GET /auth/oauth/apple
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use nanoid::nanoid;
 use redis_kiss::{get_connection, redis, AsyncCommands};
@@ -8,17 +8,17 @@ use revolt_result::{create_error, Result};
 use rocket::response::Redirect;
 use sha2::{Digest, Sha256};
 
-/// # Google OAuth
+/// # Apple OAuth
 ///
-/// Redirects the browser to Google's consent screen using the
+/// Redirects the browser to Apple's consent screen using the
 /// authorization-code flow with PKCE.
 #[openapi(skip)]
-#[get("/google")]
-pub async fn google_authorise() -> Result<Redirect> {
+#[get("/apple")]
+pub async fn apple_authorise() -> Result<Redirect> {
     let config = config().await;
-    let google = &config.api.oauth.google;
+    let apple = &config.api.oauth.apple;
 
-    if !google.enabled || google.client_id.is_empty() {
+    if !apple.enabled || apple.client_id.is_empty() {
         return Err(create_error!(OperationFailed));
     }
 
@@ -35,7 +35,7 @@ pub async fn google_authorise() -> Result<Redirect> {
 
     let set: Option<String> = conn
         .set_options(
-            super::state_key("google", &state),
+            super::state_key("apple", &state),
             &verifier,
             redis::SetOptions::default()
                 .conditional_set(redis::ExistenceCheck::NX)
@@ -48,26 +48,28 @@ pub async fn google_authorise() -> Result<Redirect> {
         return Err(create_error!(InternalError));
     }
 
-    let mut url = url::Url::parse("https://accounts.google.com/o/oauth2/v2/auth")
+    let mut url = url::Url::parse("https://appleid.apple.com/auth/authorize")
         .expect("valid authorisation endpoint");
     url.query_pairs_mut()
-        .append_pair("client_id", &google.client_id)
-        .append_pair("redirect_uri", &redirect_uri(google, &config.hosts.api))
+        .append_pair("client_id", &apple.client_id)
+        .append_pair("redirect_uri", &redirect_uri(apple, &config.hosts.api))
         .append_pair("response_type", "code")
-        .append_pair("scope", "openid email")
+        .append_pair("scope", "email")
+        // Apple requires form_post whenever scopes are requested, so the
+        // callback below is a POST rather than a GET
+        .append_pair("response_mode", "form_post")
         .append_pair("state", &state)
         .append_pair("code_challenge", &challenge)
-        .append_pair("code_challenge_method", "S256")
-        .append_pair("prompt", "select_account");
+        .append_pair("code_challenge_method", "S256");
 
     Ok(Redirect::to(url.to_string()))
 }
 
 /// Resolve the redirect URI, defaulting to the public API host
-pub fn redirect_uri(google: &revolt_config::ApiOauthGoogle, api_host: &str) -> String {
-    if google.redirect_uri.is_empty() {
-        format!("{}/auth/oauth/google/callback", api_host)
+pub fn redirect_uri(apple: &revolt_config::ApiOauthApple, api_host: &str) -> String {
+    if apple.redirect_uri.is_empty() {
+        format!("{}/auth/oauth/apple/callback", api_host)
     } else {
-        google.redirect_uri.clone()
+        apple.redirect_uri.clone()
     }
 }

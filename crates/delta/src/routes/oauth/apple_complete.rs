@@ -1,31 +1,27 @@
 //! Exchange a one-time OAuth handoff code for the login response
-//! POST /auth/oauth/google/complete
+//! POST /auth/oauth/apple/complete
 use redis_kiss::{get_connection, redis};
 use revolt_models::v0;
 use revolt_result::{create_error, Result};
 use rocket::serde::json::Json;
 
-#[derive(serde::Deserialize, schemars::JsonSchema)]
-pub struct DataOauthComplete {
-    /// One-time handoff code issued by the OAuth callback
-    pub code: String,
-}
+use super::google_complete::DataOauthComplete;
 
-/// # Complete Google OAuth
+/// # Complete Apple OAuth
 ///
 /// Swaps the one-time handoff code from the OAuth redirect for the
 /// actual login response (session token, MFA challenge or disabled
 /// notice). Codes are single-use and expire after 60 seconds.
 #[openapi(tag = "Session")]
-#[post("/google/complete", data = "<data>")]
-pub async fn google_complete(data: Json<DataOauthComplete>) -> Result<Json<v0::ResponseLogin>> {
+#[post("/apple/complete", data = "<data>")]
+pub async fn apple_complete(data: Json<DataOauthComplete>) -> Result<Json<v0::ResponseLogin>> {
     let mut conn = get_connection()
         .await
         .map_err(|_| create_error!(InternalError))?
         .into_inner();
 
     let payload: Option<String> = redis::cmd("GETDEL")
-        .arg(super::handoff_key("google", &data.code))
+        .arg(super::handoff_key("apple", &data.code))
         .query_async(&mut conn)
         .await
         .map_err(|_| create_error!(InternalError))?;
@@ -50,7 +46,7 @@ mod tests {
 
         let res = harness
             .client
-            .post("/auth/oauth/google/complete")
+            .post("/auth/oauth/apple/complete")
             .header(ContentType::JSON)
             .body(json!({ "code": "not-a-real-handoff-code" }).to_string())
             .dispatch()
@@ -68,7 +64,7 @@ mod tests {
         let harness = TestHarness::new().await;
 
         // Config defaults ship with oauth disabled
-        let res = harness.client.get("/auth/oauth/google").dispatch().await;
+        let res = harness.client.get("/auth/oauth/apple").dispatch().await;
         assert_eq!(res.status(), Status::InternalServerError);
     }
 }

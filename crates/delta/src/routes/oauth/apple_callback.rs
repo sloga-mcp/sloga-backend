@@ -1,17 +1,50 @@
-//! Google OAuth callback
-//! GET /auth/oauth/google/callback
+//! Sign in with Apple callback
+//! POST /auth/oauth/apple/callback
+//!
+//! Apple POSTs the result here (`response_mode=form_post`) because we
+//! request the `email` scope — this is the one structural difference
+//! from the Google flow, which uses a GET redirect.
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use nanoid::nanoid;
 use redis_kiss::{get_connection, redis, AsyncCommands};
 use revolt_config::config;
 use revolt_database::{Account, Database, EmailVerification, MFATicket};
 use revolt_models::v0;
+use rocket::form::Form;
 use rocket::response::Redirect;
 use rocket::State;
+
+#[derive(FromForm)]
+pub struct AppleCallbackForm {
+    code: Option<String>,
+    state: Option<String>,
+    error: Option<String>,
+    /// JSON blob with the user's name, sent on first authorisation only —
+    /// unused, the username comes from onboarding
+    #[allow(dead_code)]
+    user: Option<String>,
+}
 
 #[derive(serde::Deserialize)]
 struct TokenResponse {
     id_token: String,
+}
+
+/// Apple serialises some boolean claims as the string "true"/"false"
+#[derive(serde::Deserialize)]
+#[serde(untagged)]
+enum BoolOrString {
+    Bool(bool),
+    String(String),
+}
+
+impl BoolOrString {
+    fn as_bool(&self) -> bool {
+        match self {
+            BoolOrString::Bool(value) => *value,
+            BoolOrString::String(value) => value == "true",
+        }
+    }
 }
 
 #[derive(serde::Deserialize)]
@@ -21,24 +54,18 @@ struct IdTokenClaims {
     exp: i64,
     sub: String,
     email: Option<String>,
-    #[serde(default)]
-    email_verified: bool,
+    email_verified: Option<BoolOrString>,
 }
 
-/// # Google OAuth Callback
+/// # Apple OAuth Callback
 ///
-/// Completes the code exchange with Google, finds or creates the
+/// Completes the code exchange with Apple, finds or creates the
 /// matching account and redirects to the frontend with a one-time
 /// handoff code the client swaps for the session.
 #[openapi(skip)]
-#[get("/google/callback?<code>&<state>&<error>")]
-pub async fn google_callback(
-    db: &State<Database>,
-    code: Option<String>,
-    state: Option<String>,
-    error: Option<String>,
-) -> Redirect {
-    match callback_inner(db, code, state, error).await {
+#[post("/apple/callback", data = "<form>")]
+pub async fn apple_callback(db: &State<Database>, form: Form<AppleCallbackForm>) -> Redirect {
+    match callback_inner(db, form.into_inner()).await {
         Ok(redirect) => redirect,
         Err(code) => error_redirect(code).await,
     }
@@ -46,28 +73,29 @@ pub async fn google_callback(
 
 async fn error_redirect(code: &str) -> Redirect {
     let config = config().await;
-    Redirect::to(format!("{}/login/oauth?error={}", config.hosts.app, code))
+    Redirect::to(format!(
+        "{}/login/oauth?error={}&provider=apple",
+        config.hosts.app, code
+    ))
 }
 
 async fn callback_inner(
     db: &State<Database>,
-    code: Option<String>,
-    state: Option<String>,
-    error: Option<String>,
+    form: AppleCallbackForm,
 ) -> std::result::Result<Redirect, &'static str> {
     let config = config().await;
-    let google = &config.api.oauth.google;
+    let apple = &config.api.oauth.apple;
 
-    if !google.enabled {
+    if !apple.enabled {
         return Err("disabled");
     }
 
-    if error.is_some() {
-        // User cancelled at the consent screen or Google reported failure
+    if form.error.is_some() {
+        // User cancelled at the consent screen or Apple reported failure
         return Err("cancelled");
     }
 
-    let (code, state) = match (code, state) {
+    let (code, state) = match (form.code, form.state) {
         (Some(code), Some(state)) => (code, state),
         _ => return Err("invalid_request"),
     };
@@ -79,23 +107,27 @@ async fn callback_inner(
         .into_inner();
 
     let verifier: Option<String> = redis::cmd("GETDEL")
-        .arg(super::state_key("google", &state))
+        .arg(super::state_key("apple", &state))
         .query_async(&mut conn)
         .await
         .map_err(|_| "internal")?;
 
     let verifier = verifier.ok_or("invalid_state")?;
 
+    // Apple's client secret is not static: it is a short-lived ES256 JWT
+    // signed with the Sign in with Apple private key.
+    let client_secret = client_secret(apple).ok_or("internal")?;
+
     // Exchange the authorisation code for tokens
     let response = reqwest::Client::new()
-        .post("https://oauth2.googleapis.com/token")
+        .post("https://appleid.apple.com/auth/token")
         .form(&[
             ("code", code.as_str()),
-            ("client_id", google.client_id.as_str()),
-            ("client_secret", google.client_secret.as_str()),
+            ("client_id", apple.client_id.as_str()),
+            ("client_secret", client_secret.as_str()),
             (
                 "redirect_uri",
-                &super::google_authorise::redirect_uri(google, &config.hosts.api),
+                &super::apple_authorise::redirect_uri(apple, &config.hosts.api),
             ),
             ("grant_type", "authorization_code"),
             ("code_verifier", verifier.as_str()),
@@ -110,16 +142,16 @@ async fn callback_inner(
 
     let tokens: TokenResponse = response.json().await.map_err(|_| "exchange_failed")?;
 
-    // The id_token comes directly from Google over TLS on an
+    // The id_token comes directly from Apple over TLS on an
     // authenticated (client_secret) exchange, so validating claims is
     // sufficient without a JWKS signature check (OIDC Core 3.1.3.7).
     let claims = decode_claims(&tokens.id_token).ok_or("invalid_token")?;
 
-    if claims.iss != "https://accounts.google.com" && claims.iss != "accounts.google.com" {
+    if claims.iss != "https://appleid.apple.com" {
         return Err("invalid_token");
     }
 
-    if claims.aud != google.client_id {
+    if claims.aud != apple.client_id {
         return Err("invalid_token");
     }
 
@@ -132,15 +164,16 @@ async fn callback_inner(
         return Err("invalid_token");
     }
 
-    if !claims.email_verified {
+    if !claims.email_verified.as_ref().is_some_and(BoolOrString::as_bool) {
         return Err("email_unverified");
     }
     let email = claims.email.clone().ok_or("email_unverified")?;
 
-    // Find or create the account: by Google id, then by verified email
-    // (auto-link), then a brand new account.
+    // Find or create the account: by Apple id, then by verified email
+    // (auto-link), then a brand new account. Note the email may be a
+    // @privaterelay.appleid.com address if the user hid their real one.
     let mut account =
-        if let Some(account) = fetch_by_google_id(db, &claims.sub).await? {
+        if let Some(account) = fetch_by_apple_id(db, &claims.sub).await? {
             account
         } else {
             let normalised = revolt_database::util::email::normalise_email(email.clone());
@@ -149,11 +182,11 @@ async fn callback_inner(
                 .await
                 .map_err(|_| "internal")?
             {
-                account.google_id = Some(claims.sub.clone());
+                account.apple_id = Some(claims.sub.clone());
                 account.save(db).await.map_err(|_| "internal")?;
                 account
             } else {
-                Account::new_from_google(db, email, claims.sub.clone())
+                Account::new_from_apple(db, email, claims.sub.clone())
                     .await
                     .map_err(|_| "internal")?
             }
@@ -163,7 +196,7 @@ async fn callback_inner(
         return Err("disabled_account");
     }
 
-    // Google has verified ownership of this email
+    // Apple has verified ownership of this email
     if let EmailVerification::Pending { .. } = account.verification {
         account.verification = EmailVerification::Verified;
         account.save(db).await.map_err(|_| "internal")?;
@@ -182,7 +215,7 @@ async fn callback_inner(
     } else {
         v0::ResponseLogin::Success(
             account
-                .create_session(db, "Google OAuth".to_string())
+                .create_session(db, "Apple OAuth".to_string())
                 .await
                 .map_err(|_| "internal")?
                 .into(),
@@ -196,7 +229,7 @@ async fn callback_inner(
 
     let set: Option<String> = conn
         .set_options(
-            super::handoff_key("google", &handoff),
+            super::handoff_key("apple", &handoff),
             payload,
             redis::SetOptions::default()
                 .conditional_set(redis::ExistenceCheck::NX)
@@ -210,9 +243,35 @@ async fn callback_inner(
     }
 
     Ok(Redirect::to(format!(
-        "{}/login/oauth?code={}",
+        "{}/login/oauth?code={}&provider=apple",
         config.hosts.app, handoff
     )))
+}
+
+/// Build the ES256 client-secret JWT (Team ID as issuer, Services ID as
+/// subject, signed with the .p8 key)
+fn client_secret(apple: &revolt_config::ApiOauthApple) -> Option<String> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("time went backwards")
+        .as_secs() as i64;
+
+    let header = jsonwebtoken::Header {
+        alg: jsonwebtoken::Algorithm::ES256,
+        kid: Some(apple.key_id.clone()),
+        ..Default::default()
+    };
+
+    let claims = serde_json::json!({
+        "iss": apple.team_id,
+        "iat": now,
+        "exp": now + 300,
+        "aud": "https://appleid.apple.com",
+        "sub": apple.client_id,
+    });
+
+    let key = jsonwebtoken::EncodingKey::from_ec_pem(apple.private_key.as_bytes()).ok()?;
+    jsonwebtoken::encode(&header, &claims, &key).ok()
 }
 
 fn decode_claims(id_token: &str) -> Option<IdTokenClaims> {
@@ -221,11 +280,11 @@ fn decode_claims(id_token: &str) -> Option<IdTokenClaims> {
     serde_json::from_slice(&bytes).ok()
 }
 
-async fn fetch_by_google_id(
+async fn fetch_by_apple_id(
     db: &State<Database>,
-    google_id: &str,
+    apple_id: &str,
 ) -> std::result::Result<Option<Account>, &'static str> {
-    db.fetch_account_by_google_id(google_id)
+    db.fetch_account_by_apple_id(apple_id)
         .await
         .map_err(|_| "internal")
 }

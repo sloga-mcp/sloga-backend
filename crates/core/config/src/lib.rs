@@ -273,9 +273,31 @@ pub struct ApiOauthGoogle {
 }
 
 #[derive(Deserialize, Debug, Clone, Default)]
+pub struct ApiOauthApple {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Services ID acting as the OAuth client id (e.g. "gg.sloga.signin")
+    #[serde(default)]
+    pub client_id: String,
+    /// Apple Developer Team ID
+    #[serde(default)]
+    pub team_id: String,
+    /// Key ID of the Sign in with Apple private key
+    #[serde(default)]
+    pub key_id: String,
+    /// Contents of the .p8 private key (PKCS#8 PEM)
+    #[serde(default)]
+    pub private_key: String,
+    #[serde(default)]
+    pub redirect_uri: String,
+}
+
+#[derive(Deserialize, Debug, Clone, Default)]
 pub struct ApiOauth {
     #[serde(default)]
     pub google: ApiOauthGoogle,
+    #[serde(default)]
+    pub apple: ApiOauthApple,
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -484,6 +506,12 @@ pub struct Features {
     /// Operator flag for the server calendar/events routes
     #[serde(default)]
     pub events_enabled: bool,
+
+    /// Optional server id that every newly-onboarded user is automatically
+    /// added to (a "Welcome" / landing-spot server). Empty/unset disables the
+    /// behaviour. Existing users are unaffected (backfill separately).
+    #[serde(default)]
+    pub welcome_server: Option<String>,
 
     #[serde(default)]
     pub advanced: FeaturesAdvanced,

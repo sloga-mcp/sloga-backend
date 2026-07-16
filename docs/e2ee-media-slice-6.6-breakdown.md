@@ -741,15 +741,16 @@ converges cleanly — a churn-robustness note, not reproducible by human-speed i
 | **§6.1 confirm (T3/T5) + ctl-announce + remote-announce (T4)** | **NOT-RUN** | the confirm is a NATIVE Tauri OS dialog (`e2ee_call_confirm_downgrade → app.dialog().blocking_show()`); CDP can't click native OS windows and **computer-use access to the debug-build windows was DENIED by the user**. set_e2ee(false)-before-resume ordering + ctl-announce + remote-announce not exercised live (native-computed roster verified by code; confirm gate is 6.5-committed + unit-covered). |
 | **§6.1 T6 re-upgrade** | **PASS** | web leaves ⇒ both natives auto re-upgrade mixed→e2ee (fresh successor group, hysteresis ~30s, bounded resecuring retries), chip back `e2ee_unverified`, gate released, room true. |
 | **§6.2 mixed-receive / Decline = receive-only** | **PASS (core)** | b2 (declining native, gate held) receives web plaintext video **100 frames / 213KB decoded / 5s** while **publishing 0** (0 out bytes/pkts). Concurrent encrypted-peer decrypt not reproducible (mixed pauses all natives' encrypted publish; no encrypted publisher without a confirmed downgrade = dialog-blocked). |
-| **§6.3 T-20 SFU-token coupling (CR-HIGH-2)** | **FAIL — bypassable (CRITICAL)** | MAX_MLS_GROUP_MEMBERS→2. Direct REST join by non-member: force_disconnect=false ⇒ **409 MlsCallFull, no token** (coupling logic works). BUT the real client always sends `force_disconnect:true` (state.tsx:798 / stoat.js Channel.ts:1256), and voice_join.rs:113 guards the T-20 block with `if force_disconnect != Some(true)` ⇒ **bypassed** (A/B: fd=false→409 no token; fd=true→200 TOKEN). Web client reached the SFU as a ghost and tripped b's loud banner. CR-HIGH-2 downgrade-DoS **NOT closed** against a real client. Fix task spawned. |
+| **§6.3 T-20 SFU-token coupling (CR-HIGH-2)** | **PASS after fix (was FAIL — bypassable)** | Original run: real client's `force_disconnect:true` bypassed the `if force_disconnect != Some(true)` guard (fd=false→409 no token; fd=true→200 TOKEN). **Fix `5f37cd07` re-run 2026-07-12 (delta rebuilt off the fix; seeded open MLS group at cap 100, JeffS a non-member):** non-member overflow **fd=true ⇒ 409 MlsCallFull, NO token** (voice_join.rs:123); fd=false ⇒ 409; JeffS added as member ⇒ fd=true ⇒ 400 UnknownNode (past the caps = rejoin exemption intact). The `force_disconnect` bypass is CLOSED; CR-HIGH-2 downgrade-DoS no longer reachable by a real client. |
 | **§6.3 D12 video-enable MUTE** | **PASS** | at 2 members > cap(1), b enabled camera ⇒ voice-ingress muted it (publication muted:true, `camera:Some(false)` event); b stays audio-only; b2 receives 0 video from b. (No force_disconnect guard on this path.) |
-| **§6.3 D12 join-cap** | **server PASS / client bypassed** | b solo unmuted camera (count_video=1). REST join fd=false ⇒ **409 VideoCallFull, no token** (voice_join.rs:100); fd=true ⇒ 200 token. Same force_disconnect bypass as T-20. |
+| **§6.3 D12 join-cap** | **PASS after fix (was server PASS / client bypassed)** | Original: fd=true bypassed (same guard as T-20). **Fix `5f37cd07` re-run 2026-07-12 (seeded 30 vc_members video-active, JeffS absent):** non-member overflow **fd=true ⇒ 409 VideoCallFull, NO token** (voice_join.rs:104); fd=false ⇒ 409; JeffS added to vc_members ⇒ fd=true ⇒ 400 UnknownNode (same-channel reconnect exemption). Bypass CLOSED; exemption now keys on the ingress-written `vc_members` roster, not the client flag. |
 | **§6.3 reactive leaf-verify (fetch_identity) + D10 park** | **NOT-RUN (unreproducible)** | store surgery stubbed JeffS call-device in b2 (binding_verified=0, ed25519=NULL). On rejoin the stub was **re-pinned to binding_verified=1**, room=true, **0 parks/retries/gapRefetches** — the PROACTIVE `#reconcileRoster` (6.4 HIGH-2) re-pinned before the Welcome, so the reject never fires. Triggering the reactive path needs disabling proactive reconcile, which the runbook FORBIDS. Covered by 59 node unit tests. |
 | **§6.3 proactive #reconcileRoster (6.4 HIGH-2)** | **PASS (live, positive)** | it detected the stubbed/unpinned admitter device and re-pinned it before Welcome verification ⇒ b2 joined E2EE despite the asymmetric-TOFU stub. |
 | **§6.4 T-10 (effects + denoise + E2EE)** | **PASS** | b published E2EE video with background-blur active (effectsApplied=2, bgStatus=active, noiseSupression on, isE2EEEnabled=true); b2 decoded **101 frames / 423KB / 5s**. Pipeline ordering intact. |
 | **§6.4 T-01 client-side ciphertext** | **PASS** | E2EE video decodes only end-to-end; 6.4 step-9 negative control (garbage key ⇒ framesDecoded pins / 100% concealment) proved real ciphertext. |
 | **§6.4 T-01 SFU-side attestation** | **PASS (metadata)** | LiveKit RoomService.ListParticipants reports EVERY track `encryption=GCM` (b camera+mic, b2 mic) ⇒ the SFU records the tracks as E2EE and forwards opaque ciphertext it never decodes. |
-| **§6.4 T-01 raw packet-node capture** | **NOT-RUN** | Alpine LiveKit container has no tcpdump/tshark (only hexdump); RTP is SRTP over UDP 50500-50600 ⇒ a raw capture cannot DISTINGUISH E2EE from transport SRTP. Post-SRTP frame inspection needs SFU instrumentation / egress-decode-failure. Standing residual both reviewers named. |
+| **§6.4 T-01 raw packet-node capture** | **~~NOT-RUN~~ → PASS (session-2, 2026-07-13)** | Closed via egress-decode-failure instead of tcpdump (SRTP makes a raw wire capture non-discriminating, as noted). A **hidden LiveKit subscriber bot** (`hidden:true` token ⇒ invisible to peers, doesn't trip downgrade) with NO MLS keys joined the room and got what the SFU forwards past SRTP: **E2EE call video = 0 decodable frames** (enc=GCM) vs the **same bot decoding 356 frames / 28.7 MB** on a plaintext CONTROL call (enc=NONE). Direct proof the SFU forwards ciphertext it can't read. Runbook §3.6 RESULT block has full numbers + method. |
+| **§6.4 T-10 re-run (session-2)** | **PASS** | denoise=Enhanced/RNNoise + camera Background=Blur + E2EE all active on b; b2 decoded b's video end-to-end in real time (currentTime advanced 1 s/s, not paused); SFU bot on the same effects-active call still saw video frames=0 / enc=GCM (no plaintext leak from the pre-encode processors). |
 | **§5 invariant-2 cross-shell** | **PASS** | the non-native web shell triggered LOUD downgrade (never quiet false-green); web client self-reports isE2EEEnabled=false / e2eePresent=false. |
 
 **Minor/other:** pre-existing CSP gap — notification sound `data:audio/ogg` blocked by `media-src`
@@ -835,13 +836,33 @@ client, so it cannot be forged). New delta route tests
 (`video_cap_refuses_overflow_join_despite_force_disconnect`,
 `mls_cap_refuses_overflow_join_despite_force_disconnect`) prove an overflow join is refused 409
 even with `force_disconnect:true` (both caps, both flag values) and that a genuine same-channel /
-group-member rejoin at the ceiling still passes both caps; REFERENCE suite green. Still owed
-before the verdict changes: re-run the live T-20/D12 REST legs against a staging build.
+group-member rejoin at the ceiling still passes both caps; REFERENCE suite green.
 discord-features-reviewer verdict on the fix diff: **SHIP-WITH-FIXES** — bypass confirmed closed
 (no request-controlled input reaches around either cap; exemptions key on server-written state);
 residuals tracked separately: check→mint TOCTOU under parallel joins (MED, wants an ingress
 backstop), and `member_edit.rs` voice-MOVE minting a cap-free token (MED) + its `:309`
 disconnects-the-moderator bug (LOW) — both spawned as follow-up tasks.
+
+**BLOCKER RESOLVED — committed `5f37cd07` + LIVE RE-RUN PASSED 2026-07-12.** Delta rebuilt off the
+fix and restarted; the T-20/D12 A/B was re-run against the live instance as JeffS (a test-server
+member), seeding an open MLS group at cap and a video-active roster at cap on the "Voice Encyption
+Test" channel: **T-20** non-member overflow `fd=true` ⇒ **409 MlsCallFull, no token** (was 200+TOKEN
+pre-fix), `fd=false` ⇒ 409, member rejoin ⇒ 400 UnknownNode (exempt); **D12** non-member overflow
+`fd=true` ⇒ **409 VideoCallFull, no token**, `fd=false` ⇒ 409, same-channel reconnect ⇒ 400
+UnknownNode (exempt). Precondition #7 (CR-HIGH-2 resolved) is now **MET** — the real-client
+`force_disconnect:true` bypass no longer voids either cap. All seeded state torn down; the
+`media_e2ee_enabled` override was NOT flipped (both caps run independent of it, so the REST proof
+needed no flag change). **The two follow-up MED/LOW findings are fixed, REVIEWED & COMMITTED
+`08a67f77`:** `member_edit` voice-move enforces both caps against the destination + the `:309`
+self-disconnect bug fixed; the voice-ingress `participant_joined` TOCTOU backstop evicts
+race-overflow/ghosts; the caps are refactored into a shared `assert_call_caps_admit` (single source
+of truth for join + move). Tests green (`voice_join` 3, `member_edit` 2). discord-features-reviewer
+verdict **SHIP-WITH-FIXES** (folded LOW-3 drain-move-marker; chipped `task_252e7ddf` for the two MED
+backstop-hardening residuals — non-atomic over-eviction + below-cap enrollment-race ghost — which
+are defense-in-depth gaps, the authoritative front-door caps + MLS commit-CAS ceiling hold). Live
+delta + voice-ingress **redeployed onto `08a67f77`** (pids 71001/71002). The D12 live re-run above
+was executed against this binary (`assert_video_cap_admits` → `voice/mod.rs:123`). **Flag still NOT
+cleared** — the residuals below stand.
 
 **Residuals still owed (unchanged by this session):**
 - **T-01 raw SFU-node packet capture** (#4) — NOT-RUN (no capture tooling in the Alpine LiveKit

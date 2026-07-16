@@ -20,6 +20,9 @@ pub trait AbstractAccounts: Sync + Send {
     /// Find account by linked Google account id
     async fn fetch_account_by_google_id(&self, google_id: &str) -> Result<Option<Account>>;
 
+    /// Find account by linked Apple user id
+    async fn fetch_account_by_apple_id(&self, apple_id: &str) -> Result<Option<Account>>;
+
     /// Find account with active pending email verification
     async fn fetch_account_with_email_verification(&self, token: &str) -> Result<Account>;
 

@@ -501,9 +501,13 @@ async fn fetch_preview(
         _ => false,
     };
 
-    // Only process image files and don't process GIFs if not avatar or icon
+    // Serve the original (animated) file for non-images and for animated
+    // images — except avatars, which keep a static thumbnail on the base URL
+    // (the client fetches their animated variant explicitly). Animated *icons*
+    // animate on the base URL so server icons play everywhere, including shells
+    // that only ever request the base URL (e.g. the bundled desktop app).
     if !matches!(hash.metadata, Metadata::Image { .. })
-        || (is_animated && !matches!(tag, Tag::avatars | Tag::icons))
+        || (is_animated && !matches!(tag, Tag::avatars))
     {
         // Relative redirect so it survives a reverse-proxy path prefix (e.g.
         // Caddy serving Autumn under `/media`). An absolute `/{tag}/...`

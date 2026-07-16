@@ -48,6 +48,18 @@ impl AbstractAccounts for MongoDb {
         )
     }
 
+    /// Find account by linked Apple user id
+    async fn fetch_account_by_apple_id(&self, apple_id: &str) -> Result<Option<Account>> {
+        query!(
+            self,
+            find_one,
+            COL,
+            doc! {
+                "apple_id": apple_id
+            }
+        )
+    }
+
     /// Find account with active pending email verification
     async fn fetch_account_with_email_verification(&self, token: &str) -> Result<Account> {
         query!(
