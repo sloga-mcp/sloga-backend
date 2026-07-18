@@ -59,3 +59,9 @@
         reverse_proxy 127.0.0.1:5174
     }
 }
+
+# Marketing site — sloga.gg apex (host-matched; app.sloga.gg + localhost still hit the :80 block above)
+http://sloga.gg {
+    root * /home/mcp/sloga-website
+    file_server
+}
