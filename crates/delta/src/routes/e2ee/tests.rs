@@ -1335,3 +1335,58 @@ async fn replace_one_time_keys_replaces_only_with_a_nonempty_batch() {
         2
     );
 }
+
+#[rocket::async_test]
+async fn second_publish_same_session_revokes_predecessor() {
+    // Device-lifecycle fixes §2: a first publication from a session sweeps
+    // any OTHER identity row bound to the SAME session — the wipe→re-enable
+    // flow's stale predecessor is provably a dead store. A fresh session
+    // publishing does NOT touch other sessions' devices.
+    let harness = TestHarness::new().await;
+    let (account, session, user) = harness.new_user().await;
+
+    let first = publish_device(&harness, &account.id, &session.token, 2).await;
+    let second = publish_device(&harness, &account.id, &session.token, 2).await;
+
+    // Predecessor bound to the same session is gone; successor remains
+    assert!(
+        harness
+            .db
+            .fetch_e2ee_identity(&user.id, &first.device_id)
+            .await
+            .is_err(),
+        "same-session predecessor must be revoked"
+    );
+    assert!(harness
+        .db
+        .fetch_e2ee_identity(&user.id, &second.device_id)
+        .await
+        .is_ok());
+
+    // A DIFFERENT session's device is untouched by a sweep: publish from a
+    // second session, then re-publish a third device on the first session —
+    // only the first session's predecessor (second device) is swept.
+    let session_b = account
+        .create_session(&harness.db, String::new())
+        .await
+        .expect("second session");
+    let other = publish_device(&harness, &account.id, &session_b.token, 2).await;
+    let third = publish_device(&harness, &account.id, &session.token, 2).await;
+
+    assert!(harness
+        .db
+        .fetch_e2ee_identity(&user.id, &other.device_id)
+        .await
+        .is_ok(),
+    );
+    assert!(harness
+        .db
+        .fetch_e2ee_identity(&user.id, &second.device_id)
+        .await
+        .is_err());
+    assert!(harness
+        .db
+        .fetch_e2ee_identity(&user.id, &third.device_id)
+        .await
+        .is_ok());
+}

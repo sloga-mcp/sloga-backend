@@ -188,6 +188,18 @@ pub async fn publish_keys(
             },
         )
         .await;
+
+        // Same-session predecessor sweep (device-lifecycle fixes §2): a
+        // first publication from this session proves any OTHER identity
+        // row bound to the same session is a wiped predecessor store.
+        // Best-effort; emits the existing loud delete events.
+        E2EEIdentity::revoke_same_session_predecessors(
+            db,
+            &user.id,
+            &session.id,
+            &identity.device_id,
+        )
+        .await;
     }
 
     let current = db

@@ -615,6 +615,20 @@ async fn worker(
                             )
                             .await
                             .ok();
+
+                            // Same-session predecessor sweep (device-
+                            // lifecycle fixes §2): an accepted claim
+                            // proves THIS install's store holds device_id;
+                            // any other row bound to this session is a
+                            // dead predecessor. Recurring self-heal for a
+                            // crash between publish-insert and its sweep.
+                            revolt_database::E2EEIdentity::revoke_same_session_predecessors(
+                                db,
+                                &user_id,
+                                &session_id,
+                                &device_id,
+                            )
+                            .await;
                         }
 
                         {

@@ -621,6 +621,43 @@ impl E2EEIdentity {
 
         Ok(())
     }
+
+    /// Same-session predecessor sweep (device-lifecycle fixes design §2,
+    /// rev 2): one session = one client install = one native store, so any
+    /// OTHER identity row still bound to `session_id` is a provably wiped
+    /// predecessor — its private keys were destroyed when this install
+    /// minted the device it is now proving/publishing. Revoke them: loud
+    /// (the existing E2EEDeviceDelete broadcast), best-effort (a failure
+    /// leaves the status quo ante — callers never fail the publish/claim
+    /// on it), and recurring (runs on first publication AND on every
+    /// accepted device claim, so a crash between insert and sweep
+    /// self-heals on the next connect).
+    ///
+    /// Named assumption (reviewer, rev 2): "one session = one install" is
+    /// not server-enforced. A COPIED session token that enables E2EE on a
+    /// second install revokes the first install's device — loud and
+    /// recoverable; token sharing is outside the supported model.
+    pub async fn revoke_same_session_predecessors(
+        db: &Database,
+        user_id: &str,
+        session_id: &str,
+        keep_device_id: &str,
+    ) {
+        let Ok(identities) = db.fetch_e2ee_identities(user_id).await else {
+            // Best-effort: an unreadable listing = no sweep this cycle
+            return;
+        };
+
+        for identity in identities {
+            if identity.device_id != keep_device_id
+                && identity.last_session_id == session_id
+            {
+                // Best-effort per row; the broadcast inside revoke_device
+                // keeps every successful removal loud
+                let _ = Self::revoke_device(db, user_id, &identity.device_id).await;
+            }
+        }
+    }
 }
 
 impl E2EESignedKey {
