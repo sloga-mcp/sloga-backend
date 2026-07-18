@@ -1342,11 +1342,36 @@ async fn second_publish_same_session_revokes_predecessor() {
     // any OTHER identity row bound to the SAME session — the wipe→re-enable
     // flow's stale predecessor is provably a dead store. A fresh session
     // publishing does NOT touch other sessions' devices.
-    let harness = TestHarness::new().await;
+    let mut harness = TestHarness::new().await;
     let (account, session, user) = harness.new_user().await;
 
     let first = publish_device(&harness, &account.id, &session.token, 2).await;
     let second = publish_device(&harness, &account.id, &session.token, 2).await;
+
+    // Diff-review MINOR-3: BOTH lifecycle events must fan loudly on the
+    // sweep — the successor's create AND the swept predecessor's delete
+    // (observers prune stale pins only if the delete actually broadcasts;
+    // a silent sweep would recreate the invisible-dead-device state this
+    // slice exists to kill).
+    let user_topic = format!("{}!", user.id);
+    harness
+        .wait_for_event(&user_topic, |event| {
+            matches!(
+                event,
+                revolt_database::events::client::EventV1::E2EEDeviceCreate { device_id, .. }
+                    if device_id == &second.device_id
+            )
+        })
+        .await;
+    harness
+        .wait_for_event(&user_topic, |event| {
+            matches!(
+                event,
+                revolt_database::events::client::EventV1::E2EEDeviceDelete { device_id, .. }
+                    if device_id == &first.device_id
+            )
+        })
+        .await;
 
     // Predecessor bound to the same session is gone; successor remains
     assert!(

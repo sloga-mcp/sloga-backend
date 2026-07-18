@@ -2,7 +2,6 @@ use std::time::Duration;
 
 use futures::StreamExt;
 use rand::Rng;
-use redis_kiss::redis::aio::PubSub;
 use revolt_database::util::email::normalise_email;
 use revolt_database::util::password::hash_password;
 use revolt_database::{
@@ -21,7 +20,7 @@ pub struct TestHarness {
     pub client: Client,
     pub db: Database,
     pub amqp: AMQP,
-    sub: PubSub,
+    events_rx: tokio::sync::mpsc::UnboundedReceiver<(String, EventV1)>,
     event_buffer: Vec<(String, EventV1)>,
 }
 
@@ -37,6 +36,31 @@ impl TestHarness {
 
         sub.psubscribe("*").await.unwrap();
 
+        // Pump the subscription from construction time. The previous
+        // per-`wait_for_event`-call `on_message()` stream lost events that
+        // fanned while no stream was polling — an event published BEFORE
+        // the first wait (or between two waits) never surfaced even though
+        // redis delivered it (verified with an external subscriber), which
+        // turned event assertions into permanent hangs. The pump owns the
+        // connection for the harness's lifetime and forwards every
+        // decodable event in order; `wait_for_event` reads the channel.
+        let (events_tx, events_rx) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            let mut stream = sub.on_message();
+            while let Some(item) = stream.next().await {
+                let msg_topic = item.get_channel_name().to_string();
+                // The wildcard psubscribe sees EVERY topic on a shared
+                // redis; skip payloads that are not EventV1 (e.g. LiveKit
+                // keepalives) silently — a genuinely missing target event
+                // now surfaces as a wait_for_event TIMEOUT, not a hang.
+                if let Ok(payload) = redis_kiss::decode_payload::<EventV1>(&item) {
+                    if events_tx.send((msg_topic, payload)).is_err() {
+                        break;
+                    }
+                }
+            }
+        });
+
         let db = client
             .rocket()
             .state::<Database>()
@@ -49,7 +73,7 @@ impl TestHarness {
             client,
             db,
             amqp,
-            sub,
+            events_rx,
             event_buffer: vec![],
         }
     }
@@ -216,34 +240,31 @@ impl TestHarness {
             }
         }
 
-        let mut stream = self.sub.on_message();
-        while let Some(item) = stream.next().await {
-            let msg_topic = item.get_channel_name();
-            // The wildcard psubscribe sees EVERY topic; tolerate payloads
-            // that are not EventV1 (but surface them, since a silently
-            // skipped target event turns into a hang)
-            let payload: EventV1 = match redis_kiss::decode_payload(&item) {
-                Ok(payload) => payload,
-                Err(error) => {
-                    eprintln!(
-                        "wait_for_event: skipping undecodable payload on '{msg_topic}': {error:?} raw={:?}",
-                        item.get_payload::<String>()
-                    );
-                    continue;
-                }
+        // Events arrive via the construction-time pump (see `new`), so
+        // anything fanned since harness creation is observable here even
+        // if it fired before this call. Bounded: a missing event fails the
+        // test in 30s instead of hanging the whole suite.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            let received = tokio::time::timeout_at(deadline, self.events_rx.recv())
+                .await
+                .unwrap_or_else(|_| {
+                    panic!(
+                        "wait_for_event: no event matching predicate on '{topic}' within 30s \
+                         (buffered: {} events)",
+                        self.event_buffer.len()
+                    )
+                });
+            let Some((msg_topic, payload)) = received else {
+                panic!("wait_for_event: event pump ended (subscription dropped)");
             };
 
             if topic == msg_topic && predicate(&payload) {
                 return payload;
             }
 
-            self.event_buffer.push((msg_topic.to_string(), payload));
+            self.event_buffer.push((msg_topic, payload));
         }
-
-        // WARNING: if predicate is never satisfied, this will never return
-        //          should add a timeout for events so tests can fail gracefully
-
-        unreachable!()
     }
 
     /// Assert that no already-buffered event on `topic` matches the
