@@ -174,6 +174,10 @@ impl<'a> RatelimitResolver<Request<'a>> for DeltaRatelimits {
                 ("events", Some("server"), Method::Post) => ("events_create", extra),
                 ("events", Some("event"), Method::Post) => ("events_invite", extra),
                 ("events", _, _) => ("events", None),
+                // GIF picker proxy — search fires per keystroke, so give it
+                // headroom above the shared "any" bucket (server-side caching
+                // keeps the upstream provider quota safe regardless).
+                ("gifs", _, _) => ("gifs", None),
                 _ => ("any", None),
             }
         } else {
@@ -195,6 +199,7 @@ impl<'a> RatelimitResolver<Request<'a>> for DeltaRatelimits {
             "swagger" => 100,
             "safety" => 15,
             "safety_report" => 3,
+            "gifs" => 30,
             "e2ee_fetch_keys" => 10,
             "e2ee_messages" => 30,
             "e2ee_backup_get" => 3,

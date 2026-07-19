@@ -317,6 +317,16 @@ pub struct ApiSoundboard {
     pub default_sounds: Vec<ApiSoundboardDefaultSound>,
 }
 
+/// Server-side GIF search proxy (fills the client's GIF picker). The client
+/// only ever talks to delta; delta queries the provider with this key, so
+/// user session tokens and IPs never reach the third party. Empty key =
+/// picker returns no results (feature off).
+#[derive(Deserialize, Debug, Clone, Default)]
+pub struct ApiGifs {
+    #[serde(default)]
+    pub giphy_key: String,
+}
+
 #[derive(Deserialize, Debug, Clone)]
 pub struct Api {
     pub registration: ApiRegistration,
@@ -329,6 +339,8 @@ pub struct Api {
     pub oauth: ApiOauth,
     #[serde(default)]
     pub soundboard: ApiSoundboard,
+    #[serde(default)]
+    pub gifs: ApiGifs,
 }
 
 #[derive(Deserialize, Debug, Clone)]

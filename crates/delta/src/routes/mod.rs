@@ -10,6 +10,7 @@ mod discover;
 mod customisation;
 mod e2ee;
 mod events;
+mod gifs;
 mod interactions;
 mod invites;
 mod mls;
@@ -47,6 +48,7 @@ pub fn mount(config: Settings, mut rocket: Rocket<Build>) -> Rocket<Build> {
             "/e2ee" => e2ee::routes(),
             "/mls" => mls::routes(),
             "/events" => events::routes(),
+            "/gifs" => gifs::routes(),
             "/auth/account" => account::routes(),
             "/auth/session" => session::routes(),
             "/auth/oauth" => oauth::routes(),
@@ -74,6 +76,7 @@ pub fn mount(config: Settings, mut rocket: Rocket<Build>) -> Rocket<Build> {
             "/e2ee" => e2ee::routes(),
             "/mls" => mls::routes(),
             "/events" => events::routes(),
+            "/gifs" => gifs::routes(),
             "/auth/account" => account::routes(),
             "/auth/session" => session::routes(),
             "/auth/oauth" => oauth::routes(),
