@@ -24,6 +24,7 @@ mod server_create;
 mod server_delete;
 mod server_edit;
 mod server_fetch;
+mod server_join;
 
 pub fn routes() -> (Vec<Route>, OpenApi) {
     openapi_get_routes_spec![
@@ -31,6 +32,7 @@ pub fn routes() -> (Vec<Route>, OpenApi) {
         server_delete::delete,
         server_fetch::fetch,
         server_edit::edit,
+        server_join::join,
         server_ack::ack,
         channel_create::create_server_channel,
         member_fetch_all::fetch_all,

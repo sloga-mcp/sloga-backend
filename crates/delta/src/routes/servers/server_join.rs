@@ -1,0 +1,121 @@
+use revolt_database::{util::reference::Reference, Database, Member, User};
+use revolt_models::v0::{self, InviteJoinResponse};
+use revolt_result::{create_error, Result};
+use rocket::{serde::json::Json, State};
+
+/// # Join Discoverable Server
+///
+/// Join a publicly discoverable server without an invite.
+///
+/// Returns an identical NotFound for "does not exist" and "not discoverable"
+/// so this route cannot be used to probe private server ids. Ban enforcement
+/// and the max-servers cap come from `Member::create` / `can_acquire_server`,
+/// matching the invite join path exactly.
+#[openapi(tag = "Discovery")]
+#[post("/<target>/join")]
+pub async fn join(
+    db: &State<Database>,
+    user: User,
+    target: Reference<'_>,
+) -> Result<Json<v0::InviteJoinResponse>> {
+    if user.bot.is_some() {
+        return Err(create_error!(IsBot));
+    }
+
+    user.can_acquire_server(db).await?;
+
+    let server = target.as_server(db).await?;
+    if !server.discoverable {
+        return Err(create_error!(NotFound));
+    }
+
+    let (_, channels) = Member::create(db, &server, &user, None).await?;
+
+    Ok(Json(InviteJoinResponse::Server {
+        channels: channels.into_iter().map(|c| c.into()).collect(),
+        server: server.into(),
+    }))
+}
+
+#[cfg(test)]
+mod test {
+    use crate::util::test::TestHarness;
+    use revolt_database::{PartialServer, Server, ServerBan, Session};
+    use revolt_models::v0;
+    use rocket::http::{Header, Status};
+
+    async fn join(harness: &TestHarness, server_id: &str, session: &Session) -> Status {
+        harness
+            .client
+            .post(format!("/servers/{}/join", server_id))
+            .header(Header::new("x-session-token", session.token.to_string()))
+            .dispatch()
+            .await
+            .status()
+    }
+
+    #[rocket::async_test]
+    async fn join_gated_on_discoverable_and_bans() {
+        let harness = TestHarness::new().await;
+        let (_, _, owner) = harness.new_user().await;
+        let (_, joiner_session, joiner) = harness.new_user().await;
+        let (_, banned_session, banned_user) = harness.new_user().await;
+
+        let (server, _) = Server::create(
+            &harness.db,
+            v0::DataCreateServer {
+                name: "Joinable".to_string(),
+                ..Default::default()
+            },
+            &owner,
+            true,
+        )
+        .await
+        .expect("`Server`");
+
+        // Not discoverable: identical NotFound (no existence probing).
+        assert_eq!(
+            join(&harness, &server.id, &joiner_session).await,
+            Status::NotFound
+        );
+
+        harness
+            .db
+            .update_server(
+                &server.id,
+                &PartialServer {
+                    discoverable: Some(true),
+                    ..Default::default()
+                },
+                vec![],
+            )
+            .await
+            .expect("approve listing");
+
+        // Banned users are rejected by Member::create.
+        ServerBan::create(&harness.db, &server, &banned_user.id, None)
+            .await
+            .expect("`ServerBan`");
+        assert_eq!(
+            join(&harness, &server.id, &banned_session).await,
+            Status::Forbidden
+        );
+
+        // Plain user joins without an invite.
+        assert_eq!(
+            join(&harness, &server.id, &joiner_session).await,
+            Status::Ok
+        );
+        assert!(harness
+            .db
+            .fetch_member(&server.id, &joiner.id)
+            .await
+            .is_ok());
+
+        // Idempotence guard: joining again conflicts instead of duplicating.
+        assert_eq!(
+            join(&harness, &server.id, &joiner_session).await,
+            Status::Conflict
+        );
+    }
+}

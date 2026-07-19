@@ -78,6 +78,13 @@ auto_derived_partial!(
             serde(skip_serializing_if = "crate::if_false", default)
         )]
         pub discoverable: bool,
+        /// Whether the owner has requested a public discovery listing
+        /// (pending until a platform admin sets `discoverable`)
+        #[cfg_attr(
+            feature = "serde",
+            serde(skip_serializing_if = "crate::if_false", default)
+        )]
+        pub discovery_requested: bool,
     },
     "PartialServer"
 );
@@ -251,6 +258,8 @@ auto_derived!(
         // nsfw: Option<bool>,
         /// Whether this server is public and should show up on [Revolt Discover](https://rvlt.gg)
         pub discoverable: Option<bool>,
+        /// Whether the owner requests a public discovery listing (owner-only; admin approves via `discoverable`)
+        pub discovery_requested: Option<bool>,
         /// Whether analytics should be collected for this server
         ///
         /// Must be enabled in order to show up on [Revolt Discover](https://rvlt.gg).

@@ -138,6 +138,10 @@ impl<'a> RatelimitResolver<Request<'a>> for DeltaRatelimits {
                     ("channels", Some(id))
                 }
                 ("interactions", _, _) => ("interaction_respond", None),
+                // Public unauthenticated directory (identity falls back to
+                // IP for sessionless requests) — dedicated bucket so a burst
+                // against /discover can't starve the shared "any" bucket.
+                ("discover", _, _) => ("discover", None),
                 ("servers", Some(id), _) => ("servers", Some(id)),
                 ("auth", _, _) => {
                     if request.method() == Method::Delete {
@@ -205,6 +209,7 @@ impl<'a> RatelimitResolver<Request<'a>> for DeltaRatelimits {
             "message_schedule" => 10,
             "soundboard" => 4,
             "follow" => 2,
+            "discover" => 20,
             "interaction_respond" => 30,
             "message_interact" => 20,
             "bot_commands" => 10,

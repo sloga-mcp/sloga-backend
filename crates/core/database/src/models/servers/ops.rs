@@ -30,6 +30,24 @@ pub trait AbstractServers: Sync + Send {
     /// Delete a server by its id
     async fn delete_server(&self, id: &str) -> Result<()>;
 
+    /// Fetch a page of publicly discoverable servers plus the total match
+    /// count (public directory: `discoverable == true`, not nsfw, optional
+    /// case-insensitive substring match on name/description), newest first.
+    ///
+    /// NOTE (Mongo): `discoverable` / `nsfw` use `skip_serializing_if =
+    /// if_false`, so false is an ABSENT field — filters must use
+    /// `{"$ne": true}` semantics, never `{field: false}`.
+    async fn fetch_discoverable_servers(
+        &self,
+        query: Option<&str>,
+        skip: u64,
+        limit: i64,
+    ) -> Result<(Vec<Server>, u64)>;
+
+    /// Fetch a page of servers with a pending discovery listing request
+    /// (`discovery_requested == true && discoverable != true`), newest first.
+    async fn fetch_discovery_requests(&self, skip: u64, limit: i64) -> Result<Vec<Server>>;
+
     /// Insert a new role into server object
     async fn insert_role(&self, server_id: &str, role: &Role) -> Result<()>;
 

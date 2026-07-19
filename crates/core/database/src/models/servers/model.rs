@@ -61,6 +61,10 @@ auto_derived_partial!(
         /// Whether this server should be publicly discoverable
         #[serde(skip_serializing_if = "crate::if_false", default)]
         pub discoverable: bool,
+        /// Whether the owner has requested a public discovery listing
+        /// (pending until a platform admin sets `discoverable`)
+        #[serde(skip_serializing_if = "crate::if_false", default)]
+        pub discovery_requested: bool,
     },
     "PartialServer"
 );
@@ -158,6 +162,7 @@ impl Server {
             banner: None,
             categories: None,
             discoverable: false,
+            discovery_requested: false,
             flags: None,
             icon: None,
             roles: HashMap::new(),

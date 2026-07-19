@@ -44,6 +44,7 @@ pub async fn edit(
         && data.flags.is_none()
         && data.analytics.is_none()
         && data.discoverable.is_none()
+        && data.discovery_requested.is_none()
         && data.owner.is_none()
         && data.remove.is_empty()
     {
@@ -71,9 +72,25 @@ pub async fn edit(
     }
 
     // Check we are privileged if changing sensitive fields
-    if (data.flags.is_some() /*|| data.nsfw.is_some()*/ || data.discoverable.is_some())
-        && !user.privileged
-    {
+    if data.flags.is_some() /*|| data.nsfw.is_some()*/ && !user.privileged {
+        return Err(create_error!(NotPrivileged));
+    }
+
+    // Discovery gating, fail closed. server_edit has NO membership
+    // precondition, so every arm must reject explicitly:
+    // - listing (`discoverable: true`) is admin approval — privileged only
+    // - delisting (`discoverable: false`) — owner or privileged, so an owner
+    //   can withdraw public exposure without an admin round-trip
+    // - `discovery_requested` (any value) — owner or privileged (privileged
+    //   path is admin rejection); NOT ManageServer: publicly listing a
+    //   community is an owner-level decision
+    let is_owner_or_privileged = user.id == server.owner || user.privileged;
+    match data.discoverable {
+        Some(true) if !user.privileged => return Err(create_error!(NotPrivileged)),
+        Some(false) if !is_owner_or_privileged => return Err(create_error!(NotPrivileged)),
+        _ => {}
+    }
+    if data.discovery_requested.is_some() && !is_owner_or_privileged {
         return Err(create_error!(NotPrivileged));
     }
 
@@ -92,10 +109,20 @@ pub async fn edit(
         flags,
         // nsfw,
         discoverable,
+        discovery_requested,
         analytics,
         owner,
         remove,
     } = data;
+
+    // Any explicit transition of `discoverable` clears the pending request:
+    // approval consumes it, delisting withdraws it. Set server-side, never
+    // trusting the client to couple the two.
+    let discovery_requested = if discoverable.is_some() {
+        Some(false)
+    } else {
+        discovery_requested
+    };
 
     let mut partial = PartialServer {
         name,
@@ -105,6 +132,7 @@ pub async fn edit(
         flags,
         // nsfw,
         discoverable,
+        discovery_requested,
         analytics,
         owner: owner.clone(),
         ..Default::default()
@@ -181,4 +209,152 @@ pub async fn edit(
         .await?;
 
     Ok(Json(server.into()))
+}
+
+#[cfg(test)]
+mod test {
+    use crate::util::test::TestHarness;
+    use revolt_database::{Member, PartialUser, Server, Session};
+    use revolt_models::v0;
+    use rocket::http::{ContentType, Header, Status};
+
+    async fn edit(
+        harness: &TestHarness,
+        server_id: &str,
+        session: &Session,
+        body: serde_json::Value,
+    ) -> Status {
+        harness
+            .client
+            .patch(format!("/servers/{}", server_id))
+            .header(ContentType::JSON)
+            .body(body.to_string())
+            .header(Header::new("x-session-token", session.token.to_string()))
+            .dispatch()
+            .await
+            .status()
+    }
+
+    /// Audit MAJOR 5: server_edit has no membership precondition, so every
+    /// discovery arm must fail closed on its own.
+    #[rocket::async_test]
+    async fn discovery_gating_fail_closed() {
+        let harness = TestHarness::new().await;
+        let (_, owner_session, owner) = harness.new_user().await;
+        let (_, member_session, member_user) = harness.new_user().await;
+        let (_, outsider_session, _) = harness.new_user().await;
+        let (_, admin_session, mut admin) = harness.new_user().await;
+
+        admin
+            .update(
+                &harness.db,
+                PartialUser {
+                    privileged: Some(true),
+                    ..Default::default()
+                },
+                vec![],
+            )
+            .await
+            .expect("privileged admin");
+
+        let (server, _) = Server::create(
+            &harness.db,
+            v0::DataCreateServer {
+                name: "Gated".to_string(),
+                ..Default::default()
+            },
+            &owner,
+            true,
+        )
+        .await
+        .expect("`Server`");
+
+        Member::create(&harness.db, &server, &member_user, None)
+            .await
+            .expect("`Member`");
+
+        // Non-owner member: every discovery field is rejected.
+        for body in [
+            json!({ "discovery_requested": true }),
+            json!({ "discovery_requested": false }),
+            json!({ "discoverable": true }),
+            json!({ "discoverable": false }),
+        ] {
+            assert_eq!(
+                edit(&harness, &server.id, &member_session, body).await,
+                Status::Forbidden
+            );
+        }
+
+        // Non-member authenticated user: same, fail closed.
+        for body in [
+            json!({ "discovery_requested": true }),
+            json!({ "discovery_requested": false }),
+            json!({ "discoverable": true }),
+            json!({ "discoverable": false }),
+        ] {
+            assert_eq!(
+                edit(&harness, &server.id, &outsider_session, body).await,
+                Status::Forbidden
+            );
+        }
+
+        // Owner cannot list their own server (admin approval required)...
+        assert_eq!(
+            edit(
+                &harness,
+                &server.id,
+                &owner_session,
+                json!({ "discoverable": true })
+            )
+            .await,
+            Status::Forbidden
+        );
+
+        // ...but can request a listing...
+        assert_eq!(
+            edit(
+                &harness,
+                &server.id,
+                &owner_session,
+                json!({ "discovery_requested": true })
+            )
+            .await,
+            Status::Ok
+        );
+        let fetched = harness.db.fetch_server(&server.id).await.unwrap();
+        assert!(fetched.discovery_requested);
+        assert!(!fetched.discoverable);
+
+        // ...and privileged approval flips discoverable AND consumes the
+        // pending request server-side.
+        assert_eq!(
+            edit(
+                &harness,
+                &server.id,
+                &admin_session,
+                json!({ "discoverable": true })
+            )
+            .await,
+            Status::Ok
+        );
+        let fetched = harness.db.fetch_server(&server.id).await.unwrap();
+        assert!(fetched.discoverable);
+        assert!(!fetched.discovery_requested);
+
+        // Owner can instantly delist without an admin round-trip.
+        assert_eq!(
+            edit(
+                &harness,
+                &server.id,
+                &owner_session,
+                json!({ "discoverable": false })
+            )
+            .await,
+            Status::Ok
+        );
+        let fetched = harness.db.fetch_server(&server.id).await.unwrap();
+        assert!(!fetched.discoverable);
+        assert!(!fetched.discovery_requested);
+    }
 }

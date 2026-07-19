@@ -26,7 +26,7 @@ struct MigrationInfo {
     revision: i32,
 }
 
-pub const LATEST_REVISION: i32 = 62; // MUST BE +1 to last migration
+pub const LATEST_REVISION: i32 = 63; // MUST BE +1 to last migration
 
 pub async fn migrate_database(db: &MongoDb) {
     let migrations = db.col::<Document>("migrations");
@@ -2049,6 +2049,37 @@ pub async fn run_migrations(db: &MongoDb, revision: i32) -> i32 {
             })
             .await
             .expect("Failed to create sounds indexes.");
+    }
+
+    if revision <= 62 {
+        info!("Running migration [revision 62 / 19-07-2026]: Server discovery indexes");
+
+        // Public directory + admin approval queue. Both flags are sparse
+        // (false = absent field, skip_serializing_if = if_false), so the
+        // queries use {"$ne": true} — these exact-match indexes serve the
+        // `true` side, which is the only side ever queried by equality.
+        db.db()
+            .run_command(doc! {
+                "createIndexes": "servers",
+                "indexes": [
+                    // Serves the public /discover/servers listing.
+                    {
+                        "key": {
+                            "discoverable": 1_i32
+                        },
+                        "name": "discoverable"
+                    },
+                    // Serves the privileged /discover/requests queue.
+                    {
+                        "key": {
+                            "discovery_requested": 1_i32
+                        },
+                        "name": "discovery_requested"
+                    }
+                ]
+            })
+            .await
+            .expect("Failed to create servers discovery indexes.");
     }
 
     // Reminder to update LATEST_REVISION when adding new migrations.

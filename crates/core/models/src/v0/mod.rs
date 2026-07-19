@@ -1,4 +1,5 @@
 mod bots;
+mod discover;
 mod calendar_events;
 mod channel_follows;
 mod channel_invites;
@@ -29,6 +30,7 @@ mod mfa_tickets;
 mod sessions;
 
 pub use bots::*;
+pub use discover::*;
 pub use calendar_events::*;
 pub use channel_follows::*;
 pub use channel_invites::*;

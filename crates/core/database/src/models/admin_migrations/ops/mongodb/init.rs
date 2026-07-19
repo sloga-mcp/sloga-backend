@@ -466,6 +466,29 @@ pub async fn create_database(db: &MongoDb) {
     .expect("Failed to create sounds index.");
 
     db.run_command(doc! {
+        "createIndexes": "servers",
+        "indexes": [
+            // Serves the public /discover/servers listing. Sparse boolean:
+            // false is an absent field; queries match {"discoverable": true}.
+            {
+                "key": {
+                    "discoverable": 1_i32
+                },
+                "name": "discoverable"
+            },
+            // Serves the privileged /discover/requests queue.
+            {
+                "key": {
+                    "discovery_requested": 1_i32
+                },
+                "name": "discovery_requested"
+            }
+        ]
+    })
+    .await
+    .expect("Failed to create servers discovery indexes.");
+
+    db.run_command(doc! {
         "createIndexes": "channels",
         "indexes": [
             // Serves the per-channel threads list, the active-thread cap and

@@ -6,6 +6,7 @@ use rocket::{Build, Rocket};
 
 mod bots;
 mod channels;
+mod discover;
 mod customisation;
 mod e2ee;
 mod events;
@@ -39,6 +40,7 @@ pub fn mount(config: Settings, mut rocket: Rocket<Build>) -> Rocket<Build> {
             "/channels" => channels::routes(),
             "/servers" => servers::routes(),
             "/invites" => invites::routes(),
+            "/discover" => discover::routes(),
             "/interactions" => interactions::routes(),
             "/custom" => customisation::routes(),
             "/safety" => safety::routes(),
@@ -65,6 +67,7 @@ pub fn mount(config: Settings, mut rocket: Rocket<Build>) -> Rocket<Build> {
             "/channels" => channels::routes(),
             "/servers" => servers::routes(),
             "/invites" => invites::routes(),
+            "/discover" => discover::routes(),
             "/interactions" => interactions::routes(),
             "/custom" => customisation::routes(),
             "/safety" => safety::routes(),
@@ -146,6 +149,12 @@ fn custom_openapi_spec() -> OpenApi {
             "name": "Invites",
             "tags": [
               "Invites"
+            ]
+          },
+          {
+            "name": "Discovery",
+            "tags": [
+              "Discovery"
             ]
           },
           {
@@ -307,6 +316,13 @@ fn custom_openapi_spec() -> OpenApi {
             Tag {
                 name: "Invites".to_owned(),
                 description: Some("View, join and delete invites".to_owned()),
+                ..Default::default()
+            },
+            Tag {
+                name: "Discovery".to_owned(),
+                description: Some(
+                    "Public server directory: browse and join discoverable servers".to_owned(),
+                ),
                 ..Default::default()
             },
             Tag {

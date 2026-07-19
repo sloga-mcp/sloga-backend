@@ -1,5 +1,6 @@
 use bson::{to_document, Bson, Document};
 use futures::StreamExt;
+use mongodb::options::FindOptions;
 use revolt_result::Result;
 
 use crate::{FieldsRole, FieldsServer, PartialRole, PartialServer, Role, Server};
@@ -77,6 +78,71 @@ impl AbstractServers for MongoDb {
     async fn delete_server(&self, id: &str) -> Result<()> {
         self.delete_associated_server_objects(id).await?;
         query!(self, delete_one_by_id, COL, id).map(|_| ())
+    }
+
+    /// Fetch a page of publicly discoverable servers plus the total match count
+    async fn fetch_discoverable_servers(
+        &self,
+        query: Option<&str>,
+        skip: u64,
+        limit: i64,
+    ) -> Result<(Vec<Server>, u64)> {
+        // Sparse booleans: false is an absent field, so nsfw must be matched
+        // with $ne, never {nsfw: false}.
+        let mut filter = doc! {
+            "discoverable": true,
+            "nsfw": { "$ne": true }
+        };
+
+        if let Some(q) = query.filter(|q| !q.is_empty()) {
+            // User input is regex-escaped so it can never inject regex syntax.
+            let pattern = regex::escape(q);
+            filter.insert(
+                "$or",
+                vec![
+                    doc! { "name": { "$regex": &pattern, "$options": "i" } },
+                    doc! { "description": { "$regex": &pattern, "$options": "i" } },
+                ],
+            );
+        }
+
+        let total = self
+            .count_documents(COL, filter.clone())
+            .await
+            .map_err(|_| create_database_error!("count_documents", COL))?;
+
+        let servers = self
+            .find_with_options::<_, Server>(
+                COL,
+                filter,
+                FindOptions::builder()
+                    .sort(doc! { "_id": -1 })
+                    .skip(skip)
+                    .limit(limit)
+                    .build(),
+            )
+            .await
+            .map_err(|_| create_database_error!("find", COL))?;
+
+        Ok((servers, total))
+    }
+
+    /// Fetch a page of servers with a pending discovery listing request
+    async fn fetch_discovery_requests(&self, skip: u64, limit: i64) -> Result<Vec<Server>> {
+        self.find_with_options::<_, Server>(
+            COL,
+            doc! {
+                "discovery_requested": true,
+                "discoverable": { "$ne": true }
+            },
+            FindOptions::builder()
+                .sort(doc! { "_id": -1 })
+                .skip(skip)
+                .limit(limit)
+                .build(),
+        )
+        .await
+        .map_err(|_| create_database_error!("find", COL))
     }
 
     /// Insert a new role into server object
