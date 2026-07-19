@@ -5,7 +5,17 @@ REST + bonfire WebSocket) — it is deliberately shaped like a third-party
 bot. Zero runtime dependencies; Node >= 22.
 
 Commands (all global): `/coinflip`, `/8ball`, `/remind` (slice 1);
-`/giveaway` (slice 2, not yet implemented).
+`/giveaway` (slice 2 — Enter/End-early buttons, throttled entry-count edits,
+deadline draw with tombstoned button retirement on the first straggler
+click; a deadline-ended giveaway nobody clicks again keeps live-looking but
+harmless buttons — accepted platform residual, message edits can't touch
+components. Second residual: deadlines are checked on a 15s tick, so
+entries/End-early landing within ~15s past the deadline — longer during
+boot catch-up — still count toward the draw).
+
+Note: the state file is v2 since slice 2. Rolling the daemon BACK to the
+slice-1 build discards the whole state file (reminders included), not just
+the giveaway fields — don't downgrade with pending reminders.
 
 ## One-time provisioning (operator)
 

@@ -56,8 +56,9 @@ const REST_GAP_MS = 400;
 const PING_INTERVAL_MS = 20_000;
 const PONG_DEADLINE_MS = 45_000;
 const SCHEDULER_TICK_MS = 15_000;
-const REMINDER_MIN_MS = 60_000;
-const REMINDER_MAX_MS = 30 * 24 * 60 * 60 * 1000;
+// Shared by /remind and /giveaway durations.
+const DURATION_MIN_MS = 60_000;
+const DURATION_MAX_MS = 30 * 24 * 60 * 60 * 1000;
 // Transient send failures (delta restart etc.) retry until the reminder is
 // hopelessly stale — a fixed failure count would let ~75s of downtime
 // silently destroy every due reminder.
@@ -66,6 +67,12 @@ const REMINDER_GIVEUP_MS = 24 * 60 * 60 * 1000;
 const QUEUE_LATENCY_WARN_MS = 10 * 60 * 1000;
 const COMMAND_SYNC_RETRY_MS = 30_000;
 const NEVER_READY_WARN_THRESHOLD = 10;
+// Giveaway entry-count display edits are content-only PATCHes, throttled to
+// at most one edit per giveaway per this window (messages bucket is 10/10s
+// per channel — a click-storm degrades to slower counter updates).
+const GIVEAWAY_EDIT_THROTTLE_MS = 5_000;
+const GIVEAWAY_MAX_WINNERS = 20;
+const GIVEAWAY_MAX_PRIZE_LEN = 256;
 
 // ----------------------------------------------------------------- utils --
 
@@ -126,15 +133,58 @@ function releaseLock() {
 
 // ------------------------------------------------------------------ state --
 
-/** @type {{version: number, reminders: Array<{id: string, channelId: string, userId: string, text: string, fireAt: number}>}} */
-let state = { version: 1, reminders: [] };
+/**
+ * @type {{
+ *   version: number,
+ *   reminders: Array<{id: string, channelId: string, userId: string, text: string, fireAt: number}>,
+ *   giveaways: Array<{id: string, messageId: string, channelId: string, creatorId: string,
+ *     prize: string, winnersWanted: number, endAt: number, entrants: string[], lastCountEditAt: number}>,
+ *   tombstones: Array<{messageId: string, channelId: string, endedContent: string,
+ *     announcement: string, patched: boolean, retired: boolean, announced: boolean}>,
+ * }}
+ *
+ * Tombstones are ended giveaways with unfinished business: `patched` = the
+ * message shows the ended content, `retired` = the buttons are gone (only a
+ * respond edit:true on a live click can do that — a normal message edit
+ * cannot touch components), `announced` = the winner announcement posted.
+ * Kept so straggler clicks retire the buttons instead of orphaning the
+ * clicker into the 15s timeout, and so a crash mid-end is healed on boot.
+ * Dropped once all three flags are true.
+ */
+let state = { version: 2, reminders: [], giveaways: [], tombstones: [] };
 
 function loadState() {
   try {
     const parsed = JSON.parse(readFileSync(STATE_PATH, "utf8"));
-    if (parsed?.version === 1 && Array.isArray(parsed.reminders)) {
-      state = parsed;
-      log(`state loaded: ${state.reminders.length} pending reminder(s)`);
+    // v1 (slice 1) had reminders only — migrate by defaulting the new arrays.
+    if ((parsed?.version === 1 || parsed?.version === 2) && Array.isArray(parsed.reminders)) {
+      state = {
+        version: 2,
+        reminders: parsed.reminders,
+        giveaways: Array.isArray(parsed.giveaways) ? parsed.giveaways : [],
+        // Validate tombstone shape: an entry missing channelId/announcement
+        // (pre-release dev state) would aim heal legs at /channels/undefined
+        // and then prune, silently discarding its retirement duty.
+        tombstones: (Array.isArray(parsed.tombstones) ? parsed.tombstones : [])
+          .filter(
+            (t) =>
+              t &&
+              typeof t.messageId === "string" &&
+              typeof t.channelId === "string" &&
+              typeof t.endedContent === "string" &&
+              typeof t.announcement === "string"
+          )
+          .map((t) => ({
+            ...t,
+            patched: Boolean(t.patched),
+            retired: Boolean(t.retired),
+            announced: Boolean(t.announced),
+          })),
+      };
+      log(
+        `state loaded: ${state.reminders.length} reminder(s), ` +
+          `${state.giveaways.length} giveaway(s), ${state.tombstones.length} tombstone(s)`
+      );
     } else {
       log("state file has unknown shape — starting fresh");
     }
@@ -185,12 +235,12 @@ async function drainRestQueue() {
 
       if (response.status === 429) {
         // Honor retry-after and retry the SAME item (never skip ahead —
-        // ordering matters for command sync).
+        // ordering matters for command sync). Delta carries the wait in the
+        // X-RateLimit-Reset-After header (ms until bucket reset) — 429
+        // bodies are Rocket's default, there is no retry_after JSON field.
         let retryMs = 1000;
-        try {
-          const body = await response.json();
-          if (Number.isFinite(body?.retry_after)) retryMs = body.retry_after;
-        } catch {}
+        const resetAfter = Number(response.headers.get("x-ratelimit-reset-after"));
+        if (Number.isFinite(resetAfter) && resetAfter > 0) retryMs = resetAfter;
         log(`429 on ${item.method} ${item.path} — backing off ${retryMs}ms`);
         await sleep(Math.min(retryMs + 100, 30_000));
         continue;
@@ -251,6 +301,30 @@ const COMMANDS = [
         description: "What to remind you about",
         kind: "String",
         required: true,
+      },
+    ],
+  },
+  {
+    name: "giveaway",
+    description: "Start a giveaway in this channel",
+    options: [
+      {
+        name: "prize",
+        description: "What's being given away",
+        kind: "String",
+        required: true,
+      },
+      {
+        name: "duration",
+        description: "How long it runs (e.g. 10m, 2h, 3d)",
+        kind: "String",
+        required: true,
+      },
+      {
+        name: "winners",
+        description: "Number of winners (default 1, max 20)",
+        kind: "Integer",
+        required: false,
       },
     ],
   },
@@ -325,7 +399,7 @@ function parseDuration(input) {
   const amount = Number(match[1]);
   const unit = match[2][0].toLowerCase();
   const ms = amount * (unit === "m" ? 60_000 : unit === "h" ? 3_600_000 : 86_400_000);
-  if (ms < REMINDER_MIN_MS || ms > REMINDER_MAX_MS) return null;
+  if (ms < DURATION_MIN_MS || ms > DURATION_MAX_MS) return null;
   return ms;
 }
 
@@ -335,13 +409,17 @@ function humanDuration(ms) {
   return `${Math.round(ms / 60_000)} minute(s)`;
 }
 
+/** Raw respond — caller handles failures (and needs the returned message). */
+function respondRaw(interaction, body) {
+  return api("POST", `/interactions/${interaction._id}/respond`, {
+    token: interaction.token,
+    ...body,
+  });
+}
+
 async function respond(interaction, content, ephemeral) {
   try {
-    await api("POST", `/interactions/${interaction._id}/respond`, {
-      token: interaction.token,
-      content,
-      ephemeral: Boolean(ephemeral),
-    });
+    await respondRaw(interaction, { content, ephemeral: Boolean(ephemeral) });
   } catch (error) {
     // 410 = interaction expired (e.g. it sat >15min behind a queue stall);
     // nothing to do but log — WITHOUT the token or user content.
@@ -349,10 +427,332 @@ async function respond(interaction, content, ephemeral) {
   }
 }
 
+// -------------------------------------------------------------- giveaways --
+//
+// KEY PLATFORM CONSTRAINT: a normal message edit (DataEditMessage) is
+// content+embeds only — components can ONLY be changed via respond
+// edit:true on a live component-interaction token. So: entry counts live in
+// content text (plain PATCHes suffice), End-early retires the buttons using
+// the creator's own click, and a deadline draw leaves live-looking buttons
+// until the first straggler click retires them (tombstones above).
+
+function giveawayRows() {
+  return [
+    {
+      components: [
+        { type: "Button", custom_id: "gw_enter", label: "Enter 🎉", style: "Primary" },
+        { type: "Button", custom_id: "gw_end", label: "End early", style: "Secondary" },
+      ],
+    },
+  ];
+}
+
+function activeContent(gw) {
+  const ends = new Date(gw.endAt).toISOString().slice(0, 16).replace("T", " ");
+  const entries = gw.entrants.length === 1 ? "1 entry" : `${gw.entrants.length} entries`;
+  const winners = gw.winnersWanted === 1 ? "1 winner" : `${gw.winnersWanted} winners`;
+  return (
+    `🎉 **GIVEAWAY** — ${gw.prize}\n` +
+    `**${entries}** · ${winners} · ends **${ends} UTC**\n` +
+    `Click **Enter 🎉** to enter — click again to leave.`
+  );
+}
+
+function endedContent(gw, winners) {
+  const header = `🎉 **GIVEAWAY ENDED** — ${gw.prize}\n`;
+  if (winners.length === 0) return `${header}No entries — no winner.`;
+  const label = winners.length === 1 ? "Winner" : "Winners";
+  return `${header}${label}: ${winners.map((id) => `<@${id}>`).join(", ")}`;
+}
+
+/** Crypto-random draw of distinct entrants. */
+function drawWinners(gw) {
+  const pool = [...gw.entrants];
+  const count = Math.min(gw.winnersWanted, pool.length);
+  const picked = [];
+  for (let i = 0; i < count; i++) {
+    picked.push(pool.splice(randomInt(pool.length), 1)[0]);
+  }
+  return picked;
+}
+
+// Throttled content-only count edits: at most one PATCH per giveaway per
+// GIVEAWAY_EDIT_THROTTLE_MS; content is computed at flush time, so a click
+// burst coalesces into a single edit.
+const countEditTimers = new Map(); // messageId -> Timeout
+
+function scheduleCountEdit(gw) {
+  if (countEditTimers.has(gw.messageId)) return;
+  const wait = Math.max(0, GIVEAWAY_EDIT_THROTTLE_MS - (Date.now() - (gw.lastCountEditAt ?? 0)));
+  countEditTimers.set(
+    gw.messageId,
+    setTimeout(() => {
+      countEditTimers.delete(gw.messageId);
+      void flushCountEdit(gw.messageId);
+    }, wait)
+  );
+}
+
+async function flushCountEdit(messageId) {
+  const gw = state.giveaways.find((g) => g.messageId === messageId);
+  if (!gw) return; // ended while the edit was pending
+  gw.lastCountEditAt = Date.now();
+  saveState();
+  try {
+    await api("PATCH", `/channels/${gw.channelId}/messages/${gw.messageId}`, {
+      content: activeContent(gw),
+    });
+  } catch (error) {
+    if (error.status === 404) {
+      // Message truly gone — the giveaway can't proceed.
+      log(`giveaway ${gw.id} dropped (count edit -> 404)`);
+      state.giveaways = state.giveaways.filter((g) => g.id !== gw.id);
+      saveState();
+    }
+    // Anything else (403 while the operator shuffles roles, archived
+    // thread, 5xx, network) is transient for a DISPLAY-ONLY counter — the
+    // entries themselves are already persisted and the next toggle
+    // reschedules. Never destroy an active giveaway over it.
+  }
+}
+
+/** Drop a tombstone once nothing is left to do for it. */
+function pruneTombstone(tombstone) {
+  if (tombstone.patched && tombstone.retired && tombstone.announced) {
+    state.tombstones = state.tombstones.filter((t) => t !== tombstone);
+    saveState();
+  }
+}
+
+// Reentrancy guards: announce/patch legs are called from the end path, the
+// straggler-click path, boot healing AND the scheduler tick — a click racing
+// a deadline draw must not double-post the winner announcement (the flag
+// only flips after the awaited POST resolves, so a flag check alone races).
+const announcingTombstones = new Set();
+const patchingTombstones = new Set();
+
+/** Post the winner announcement (reply to the giveaway message, falling
+ *  back to a plain message if the reply target is gone). */
+async function announceTombstone(tombstone) {
+  if (tombstone.announced || announcingTombstones.has(tombstone.messageId)) return;
+  announcingTombstones.add(tombstone.messageId);
+  try {
+    await announceTombstoneInner(tombstone);
+  } finally {
+    announcingTombstones.delete(tombstone.messageId);
+  }
+}
+
+async function announceTombstoneInner(tombstone) {
+  try {
+    await api("POST", `/channels/${tombstone.channelId}/messages`, {
+      content: tombstone.announcement,
+      replies: [{ id: tombstone.messageId, mention: false }],
+    });
+  } catch {
+    try {
+      await api("POST", `/channels/${tombstone.channelId}/messages`, {
+        content: tombstone.announcement,
+      });
+    } catch (error) {
+      log(
+        `giveaway announcement failed for ${tombstone.messageId}: ${error.status ?? error.message}`
+      );
+      if (error.status !== 404) return; // transient — boot healing retries
+      // 404 on a plain send = channel gone; nothing left to announce into.
+    }
+  }
+  tombstone.announced = true;
+  saveState();
+  pruneTombstone(tombstone);
+}
+
+/** PATCH the ended content onto the giveaway message (content-only — the
+ *  buttons stay until a live click retires them). */
+async function patchTombstone(tombstone) {
+  if (tombstone.patched || patchingTombstones.has(tombstone.messageId)) return;
+  patchingTombstones.add(tombstone.messageId);
+  try {
+    await patchTombstoneInner(tombstone);
+  } finally {
+    patchingTombstones.delete(tombstone.messageId);
+  }
+}
+
+async function patchTombstoneInner(tombstone) {
+  try {
+    await api("PATCH", `/channels/${tombstone.channelId}/messages/${tombstone.messageId}`, {
+      content: tombstone.endedContent,
+    });
+    tombstone.patched = true;
+    saveState();
+  } catch (error) {
+    log(
+      `ended-content PATCH failed for ${tombstone.messageId}: ${error.status ?? error.message}`
+    );
+    if (error.status === 404) {
+      // Message truly gone: no content to fix, no buttons left to click.
+      tombstone.patched = true;
+      tombstone.retired = true;
+      saveState();
+    }
+    // Other 4xx (archived thread, transient 403) / 5xx / network: keep the
+    // tombstone as-is — boot healing retries the PATCH, straggler clicks
+    // still serve the ended form.
+  }
+  pruneTombstone(tombstone);
+}
+
+/** Boot healing: finish whatever a crash mid-end left undone. (Residual: a
+ *  crash after the announcement POST but before its flag persists can
+ *  double-post the announcement on the next boot — rarer and more honest
+ *  than silently losing winners.) */
+async function healTombstone(tombstone) {
+  // Both legs no-op when already done or already in flight.
+  await patchTombstone(tombstone);
+  await announceTombstone(tombstone);
+}
+
+/**
+ * End a giveaway: draw, tombstone, retire/PATCH the message, announce.
+ * `liveInteraction` is the creator's End-early click when present — the only
+ * path that can retire the buttons in the same stroke.
+ */
+async function endGiveaway(gw, liveInteraction) {
+  // Re-check membership SYNCHRONOUSLY before drawing: the boot catch-up
+  // loop iterates a snapshot and awaits between items, so a giveaway can be
+  // ended (e.g. by a creator's End-early click) while its snapshot entry is
+  // still queued — a second draw here would announce contradictory winners.
+  if (!state.giveaways.some((g) => g.id === gw.id)) return;
+
+  const winners = drawWinners(gw);
+
+  const pending = countEditTimers.get(gw.messageId);
+  if (pending) {
+    clearTimeout(pending);
+    countEditTimers.delete(gw.messageId);
+  }
+
+  // Tombstone FIRST (per plan): once this save lands, a crash can no longer
+  // re-draw or orphan a click into a timeout, and boot healing finishes the
+  // PATCH/announcement legs below.
+  const tombstone = {
+    messageId: gw.messageId,
+    channelId: gw.channelId,
+    endedContent: endedContent(gw, winners),
+    announcement:
+      winners.length > 0
+        ? `🎉 Congratulations ${winners.map((id) => `<@${id}>`).join(", ")} — you won **${gw.prize}**!`
+        : `🎉 The giveaway for **${gw.prize}** ended with no entries.`,
+    patched: false,
+    retired: false,
+    announced: false,
+  };
+  state.giveaways = state.giveaways.filter((g) => g.id !== gw.id);
+  state.tombstones.push(tombstone);
+  saveState();
+
+  if (liveInteraction) {
+    try {
+      // One shot: ended content + button retirement on the creator's click.
+      await respondRaw(liveInteraction, {
+        content: tombstone.endedContent,
+        components: [],
+        edit: true,
+      });
+      tombstone.patched = true;
+      tombstone.retired = true;
+      saveState();
+    } catch (error) {
+      log(
+        `giveaway ${gw.id}: End-early retirement failed (${error.status ?? error.message}) — falling back to content PATCH`
+      );
+    }
+  }
+
+  await patchTombstone(tombstone);
+  await announceTombstone(tombstone);
+  pruneTombstone(tombstone);
+}
+
+async function handleComponent(interaction) {
+  const messageId = interaction.message_id;
+  const gw = state.giveaways.find((g) => g.messageId === messageId);
+
+  if (!gw) {
+    const tombstone = state.tombstones.find((t) => t.messageId === messageId);
+    if (tombstone) {
+      // First click after a deadline draw: use this live token to finally
+      // retire the buttons for everyone.
+      try {
+        await respondRaw(interaction, {
+          content: tombstone.endedContent,
+          components: [],
+          edit: true,
+        });
+        tombstone.patched = true;
+        tombstone.retired = true;
+        saveState();
+      } catch (error) {
+        log(`tombstone retirement failed for ${messageId}: ${error.status ?? error.message}`);
+        if (error.status === 404) {
+          // Message gone — no future clicks either.
+          tombstone.patched = true;
+          tombstone.retired = true;
+          saveState();
+        }
+      }
+      // Self-heal a still-unposted announcement while we're here (no-ops if
+      // done or already in flight from the end path / a tick).
+      await announceTombstone(tombstone);
+      pruneTombstone(tombstone);
+    } else {
+      // Raced a just-finished retirement, or state was lost — either way
+      // the giveaway is over for the clicker.
+      await respond(interaction, "This giveaway has ended.", true);
+    }
+    return;
+  }
+
+  switch (interaction.custom_id) {
+    case "gw_enter": {
+      const index = gw.entrants.indexOf(interaction.user_id);
+      let reply;
+      if (index === -1) {
+        gw.entrants.push(interaction.user_id);
+        reply = "🎉 You're in! Click **Enter 🎉** again to leave.";
+      } else {
+        gw.entrants.splice(index, 1);
+        reply = "Entry removed.";
+      }
+      saveState();
+      scheduleCountEdit(gw);
+      await respond(interaction, reply, true);
+      return;
+    }
+
+    case "gw_end":
+      if (interaction.user_id !== gw.creatorId) {
+        await respond(interaction, "Only the giveaway creator can end it early.", true);
+        return;
+      }
+      await endGiveaway(gw, interaction);
+      return;
+
+    default:
+      await respond(interaction, "I can't handle that button.", true);
+  }
+}
+
 async function handleInteraction(interaction) {
+  if (interaction.kind === "Component") {
+    await handleComponent(interaction);
+    return;
+  }
+
   if (interaction.kind !== "Command") {
-    // Slice 1 ships no components; answer rather than leave the clicker
-    // hanging into the 15s client timeout.
+    // Autocomplete/modals are later slices; answer rather than leave the
+    // user hanging into the 15s client timeout.
     await respond(interaction, "I can't handle that yet.", true);
     return;
   }
@@ -397,6 +797,70 @@ async function handleInteraction(interaction) {
       return;
     }
 
+    case "giveaway": {
+      const prize = (options.prize ?? "").trim();
+      if (!prize || prize.length > GIVEAWAY_MAX_PRIZE_LEN) {
+        await respond(
+          interaction,
+          `Please give the prize a name (up to ${GIVEAWAY_MAX_PRIZE_LEN} characters).`,
+          true
+        );
+        return;
+      }
+      const ms = parseDuration(options.duration ?? "");
+      if (ms === null) {
+        await respond(
+          interaction,
+          "I couldn't read that duration. Try something like `10m`, `2h` or `3d` (1 minute to 30 days).",
+          true
+        );
+        return;
+      }
+      let winnersWanted = 1;
+      if (options.winners !== undefined) {
+        winnersWanted = Number(options.winners);
+        if (
+          !Number.isInteger(winnersWanted) ||
+          winnersWanted < 1 ||
+          winnersWanted > GIVEAWAY_MAX_WINNERS
+        ) {
+          await respond(
+            interaction,
+            `Winners must be a whole number between 1 and ${GIVEAWAY_MAX_WINNERS}.`,
+            true
+          );
+          return;
+        }
+      }
+
+      const gw = {
+        id: randomUUID(),
+        messageId: "",
+        channelId: interaction.channel_id,
+        creatorId: interaction.user_id,
+        prize,
+        winnersWanted,
+        endAt: Date.now() + ms,
+        entrants: [],
+        lastCountEditAt: 0,
+      };
+      try {
+        // The respond returns the created message — its id is what entry
+        // clicks and edits key on, so persist only after we have it.
+        const message = await respondRaw(interaction, {
+          content: activeContent(gw),
+          components: giveawayRows(),
+        });
+        gw.messageId = message._id;
+        state.giveaways.push(gw);
+        saveState();
+      } catch (error) {
+        // The invoker sees the standard 15s timeout; log WITHOUT the prize.
+        log(`giveaway create respond failed: ${error.status ?? error.message}`);
+      }
+      return;
+    }
+
     default:
       await respond(interaction, "I don't know that command.", true);
   }
@@ -410,8 +874,23 @@ function startScheduler() {
   if (schedulerTimer) return;
   // A coarse tick instead of per-reminder setTimeout: restart-safe, and
   // immune to the ~24.8-day setTimeout overflow (30d cap > 2^31-1 ms).
-  schedulerTimer = setInterval(() => void fireDueReminders(), SCHEDULER_TICK_MS);
-  void fireDueReminders(); // catch up anything that came due while down
+  schedulerTimer = setInterval(() => {
+    void fireDueReminders();
+    void fireDueGiveaways();
+    // Retry unfinished tombstone legs (reminder-style tick retry — boot-only
+    // healing would leave a winner announcement unposted for days in a
+    // quiet channel after a transient failure). Finished tombstones
+    // (patched+announced, awaiting a straggler click) no-op here.
+    for (const tombstone of [...state.tombstones]) void healTombstone(tombstone);
+  }, SCHEDULER_TICK_MS);
+  // Catch up anything that came due while down (missed giveaway deadlines
+  // draw immediately, through the paced queue).
+  void fireDueReminders();
+  void fireDueGiveaways();
+  // Self-heal entry-count displays that went stale across a restart, and
+  // finish any PATCH/announcement legs a crash mid-end left undone.
+  for (const gw of state.giveaways) scheduleCountEdit(gw);
+  for (const tombstone of [...state.tombstones]) void healTombstone(tombstone);
 }
 
 let firing = false;
@@ -446,6 +925,22 @@ async function fireDueReminders() {
     }
   } finally {
     firing = false;
+  }
+}
+
+let firingGiveaways = false;
+
+async function fireDueGiveaways() {
+  if (firingGiveaways) return;
+  firingGiveaways = true;
+  try {
+    const now = Date.now();
+    for (const gw of [...state.giveaways]) {
+      if (gw.endAt > now) continue;
+      await endGiveaway(gw, null);
+    }
+  } finally {
+    firingGiveaways = false;
   }
 }
 
