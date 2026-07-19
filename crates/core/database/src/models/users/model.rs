@@ -308,7 +308,9 @@ impl User {
 
     /// Check if this user can acquire another server
     pub async fn can_acquire_server(&self, db: &Database) -> Result<()> {
-        if db.fetch_server_count(&self.id).await? <= self.limits().await.servers {
+        // Called BEFORE the join/create: a user already AT the limit must be
+        // rejected (`<=` allowed limit+1 servers).
+        if db.fetch_server_count(&self.id).await? < self.limits().await.servers {
             Ok(())
         } else {
             Err(create_error!(TooManyServers {

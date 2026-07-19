@@ -118,4 +118,72 @@ mod test {
             Status::Conflict
         );
     }
+
+    /// Regression: `can_acquire_server` used `count <= limit`, letting a
+    /// user AT the cap join one more (limit+1 servers total).
+    #[rocket::async_test]
+    async fn join_rejected_at_server_cap() {
+        let harness = TestHarness::new().await;
+        let (_, _, owner) = harness.new_user().await;
+        let (_, joiner_session, joiner) = harness.new_user().await;
+
+        let limit = joiner.limits().await.servers;
+
+        // Fill the joiner up to the cap (memberships, not ownership —
+        // fetch_server_count counts server_members rows).
+        for i in 0..limit {
+            let (server, _) = Server::create(
+                &harness.db,
+                v0::DataCreateServer {
+                    name: format!("Filler {}", i),
+                    ..Default::default()
+                },
+                &owner,
+                false,
+            )
+            .await
+            .expect("`Server`");
+
+            revolt_database::Member::create(&harness.db, &server, &joiner, None)
+                .await
+                .expect("`Member`");
+        }
+
+        // At the cap: acquiring one more must be rejected...
+        assert!(joiner.can_acquire_server(&harness.db).await.is_err());
+
+        // ...including through the discover join route.
+        let (extra, _) = Server::create(
+            &harness.db,
+            v0::DataCreateServer {
+                name: "One too many".to_string(),
+                ..Default::default()
+            },
+            &owner,
+            false,
+        )
+        .await
+        .expect("`Server`");
+        harness
+            .db
+            .update_server(
+                &extra.id,
+                &PartialServer {
+                    discoverable: Some(true),
+                    ..Default::default()
+                },
+                vec![],
+            )
+            .await
+            .expect("approve listing");
+
+        assert_eq!(
+            join(&harness, &extra.id, &joiner_session).await,
+            Status::BadRequest
+        );
+        assert_eq!(
+            harness.db.fetch_server_count(&joiner.id).await.unwrap(),
+            limit
+        );
+    }
 }
