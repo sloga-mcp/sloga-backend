@@ -30,13 +30,31 @@ pub async fn trigger_sound(
         return Err(create_error!(NotAVoiceChannel));
     }
 
-    // The sound must belong to THIS channel's server (a group/DM voice call
-    // has no server → no soundboard). Fetch first so a non-existent or
-    // cross-server sound is refused before any fan-out.
-    let sound = db.fetch_soundboard_sound(&sound_id).await?;
-    if channel.server() != Some(sound.server_id.as_str()) {
-        return Err(create_error!(NotFound));
-    }
+    // Global default sounds ("Sloga Sounds") play in any SERVER voice
+    // channel; server sounds must belong to THIS channel's server. Either way
+    // a group/DM voice call has no server → no soundboard, and the sound is
+    // resolved before any fan-out.
+    let server_id = match channel.server() {
+        Some(server_id) => server_id.to_string(),
+        None => return Err(create_error!(NotFound)),
+    };
+
+    let config = revolt_config::config().await;
+    let (id, emoji) = if let Some(sound) = config
+        .api
+        .soundboard
+        .default_sounds
+        .iter()
+        .find(|sound| sound.id == sound_id)
+    {
+        (sound.id.clone(), sound.emoji.clone())
+    } else {
+        let sound = db.fetch_soundboard_sound(&sound_id).await?;
+        if sound.server_id != server_id {
+            return Err(create_error!(NotFound));
+        }
+        (sound.id, sound.emoji)
+    };
 
     let mut query = perms(db, &user).channel(&channel);
     let permissions = calculate_channel_permissions(&mut query).await;
@@ -51,10 +69,10 @@ pub async fn trigger_sound(
     }
 
     EventV1::SoundboardSound {
-        id: sound.id,
+        id,
         channel_id: channel.id().to_string(),
-        server_id: sound.server_id,
-        emoji: sound.emoji,
+        server_id,
+        emoji,
     }
     .p(channel.id().to_string())
     .await;

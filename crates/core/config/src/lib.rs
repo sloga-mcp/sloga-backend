@@ -300,6 +300,23 @@ pub struct ApiOauth {
     pub apple: ApiOauthApple,
 }
 
+/// A preconfigured global soundboard sound ("Sloga Sounds"), playable in any
+/// server voice channel. `id` is an Autumn file id in the `soundboard` bucket;
+/// the file must be uploaded and marked used out-of-band.
+#[derive(Deserialize, Debug, Clone)]
+pub struct ApiSoundboardDefaultSound {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub emoji: Option<String>,
+}
+
+#[derive(Deserialize, Debug, Clone, Default)]
+pub struct ApiSoundboard {
+    #[serde(default)]
+    pub default_sounds: Vec<ApiSoundboardDefaultSound>,
+}
+
 #[derive(Deserialize, Debug, Clone)]
 pub struct Api {
     pub registration: ApiRegistration,
@@ -310,6 +327,8 @@ pub struct Api {
     pub users: ApiUsers,
     #[serde(default)]
     pub oauth: ApiOauth,
+    #[serde(default)]
+    pub soundboard: ApiSoundboard,
 }
 
 #[derive(Deserialize, Debug, Clone)]

@@ -29,6 +29,7 @@ pub fn routes() -> (Vec<Route>, OpenApi) {
         sound_delete::delete_sound,
         sound_edit::edit_sound,
         sound_fetch::fetch_sound,
+        sound_fetch::fetch_default_sounds,
         sound_fetch::fetch_server_sounds
     ]
 }

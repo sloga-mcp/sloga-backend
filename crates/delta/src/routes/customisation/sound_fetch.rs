@@ -1,8 +1,34 @@
+use revolt_config::config;
 use revolt_database::{Database, User};
 use revolt_models::v0;
 use revolt_result::Result;
 
 use rocket::{serde::json::Json, State};
+
+/// # Fetch Default Soundboard Sounds
+///
+/// Fetch the global preconfigured soundboard sounds ("Sloga Sounds"),
+/// playable in any server voice channel. Defined in server config.
+#[openapi(tag = "Soundboard")]
+#[get("/sounds/default")]
+pub async fn fetch_default_sounds(
+    _user: User,
+) -> Result<Json<Vec<v0::DefaultSoundboardSound>>> {
+    let config = config().await;
+    Ok(Json(
+        config
+            .api
+            .soundboard
+            .default_sounds
+            .iter()
+            .map(|sound| v0::DefaultSoundboardSound {
+                id: sound.id.clone(),
+                name: sound.name.clone(),
+                emoji: sound.emoji.clone(),
+            })
+            .collect(),
+    ))
+}
 
 /// # Fetch Soundboard Sound
 ///

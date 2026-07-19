@@ -29,6 +29,22 @@ auto_derived!(
         pub emoji: Option<String>,
     }
 
+    /// Preconfigured global soundboard sound ("Sloga Sounds") — defined in
+    /// server config, playable in any server voice channel. Serialized with a
+    /// plain `id` (no `_id` rename — this is not a DB document).
+    pub struct DefaultSoundboardSound {
+        /// Autumn file id of the audio clip (also the trigger id)
+        pub id: String,
+        /// Sound name
+        pub name: String,
+        /// Optional emoji shown on the soundboard button
+        #[cfg_attr(
+            feature = "serde",
+            serde(skip_serializing_if = "Option::is_none")
+        )]
+        pub emoji: Option<String>,
+    }
+
     /// Create a new soundboard sound
     #[cfg_attr(feature = "validator", derive(Validate))]
     pub struct DataCreateSound {
