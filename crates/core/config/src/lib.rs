@@ -317,6 +317,26 @@ pub struct ApiSoundboard {
     pub default_sounds: Vec<ApiSoundboardDefaultSound>,
 }
 
+/// A curated first-party app-catalog entry ("Add apps" panel). `bot_id`
+/// must reference an existing PUBLIC bot; entries that fail to resolve or
+/// are not public are skipped fail-soft at serve time (a misconfigured id
+/// must never 500 the whole catalog).
+#[derive(Deserialize, Debug, Clone)]
+pub struct ApiAppCatalogEntry {
+    pub bot_id: String,
+    #[serde(default)]
+    pub tagline: Option<String>,
+}
+
+// `Default` + `serde(default)` are load-bearing here (as on every optional
+// config table): a non-defaulted key panics EVERY service at boot when
+// parsing configs that lack it.
+#[derive(Deserialize, Debug, Clone, Default)]
+pub struct ApiApps {
+    #[serde(default)]
+    pub catalog: Vec<ApiAppCatalogEntry>,
+}
+
 /// Server-side GIF search proxy (fills the client's GIF picker). The client
 /// only ever talks to delta; delta queries the provider with this key, so
 /// user session tokens and IPs never reach the third party. Empty key =
@@ -341,6 +361,8 @@ pub struct Api {
     pub soundboard: ApiSoundboard,
     #[serde(default)]
     pub gifs: ApiGifs,
+    #[serde(default)]
+    pub apps: ApiApps,
 }
 
 #[derive(Deserialize, Debug, Clone)]

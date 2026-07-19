@@ -1,4 +1,4 @@
-use super::{File, Metadata};
+use super::{File, Metadata, PublicBot};
 
 auto_derived!(
     /// Sanitized file DTO for fully public (unauthenticated) endpoints.
@@ -74,6 +74,24 @@ auto_derived!(
     pub struct OptionsDiscoverRequests {
         /// Number of entries to skip
         pub skip: Option<u64>,
+    }
+
+    /// A curated first-party app-catalog entry ("Add apps" panel).
+    ///
+    /// `bot` is the existing `PublicBot` whitelist DTO — id, username,
+    /// avatar id and description only; never token or owner.
+    pub struct AppCatalogEntry {
+        /// Short operator-configured tagline
+        #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+        pub tagline: Option<String>,
+        /// Public card for the bot
+        pub bot: PublicBot,
+    }
+
+    /// Response for the curated app catalog
+    pub struct AppCatalogResponse {
+        /// Catalog entries, in operator-configured order
+        pub apps: Vec<AppCatalogEntry>,
     }
 );
 

@@ -1,0 +1,14 @@
+{
+  "name": "sloga-helper",
+  "version": "0.1.0",
+  "private": true,
+  "description": "First-party Sloga Helper bot daemon — rides the public bot APIs (bonfire WS + delta REST), zero runtime dependencies.",
+  "type": "module",
+  "main": "index.mjs",
+  "scripts": {
+    "start": "node index.mjs"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}

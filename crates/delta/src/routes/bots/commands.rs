@@ -12,13 +12,17 @@ use validator::Validate;
 
 /// Resolve a bot reference and enforce ownership (same pattern as bots/edit.rs:
 /// non-owners get NotFound, not Forbidden, to avoid existence leaks).
+///
+/// A bot may also manage its OWN commands: with `x-bot-token` auth the
+/// `User` guard resolves to the bot's user (id == bot id), so hosted bots
+/// can self-sync their command set without holding the owner's session.
 async fn owned_bot(
     db: &Database,
     user: &User,
     bot_id: &Reference<'_>,
 ) -> Result<revolt_database::Bot> {
     let bot = bot_id.as_bot(db).await?;
-    if bot.owner != user.id {
+    if bot.owner != user.id && bot.id != user.id {
         return Err(create_error!(NotFound));
     }
     Ok(bot)
@@ -291,6 +295,95 @@ mod test {
             .client
             .delete(format!("/bots/{}/commands/{}", bot.id, command.id))
             .header(Header::new("x-session-token", session.token.to_string()))
+            .dispatch()
+            .await;
+        assert_eq!(response.status(), Status::Ok);
+    }
+
+    /// A bot may manage its OWN commands with its bot token (hosted bots
+    /// self-sync on boot); other bots' tokens and non-owner sessions stay
+    /// locked out.
+    #[rocket::async_test]
+    async fn bot_manages_own_commands() {
+        let harness = TestHarness::new().await;
+        let (_, _, owner) = harness.new_user().await;
+        let (_, other_session, other_user) = harness.new_user().await;
+
+        let (bot, _) = Bot::create(&harness.db, TestHarness::rand_string(), &owner, None)
+            .await
+            .expect("`Bot`");
+        let (other_bot, _) = Bot::create(&harness.db, TestHarness::rand_string(), &other_user, None)
+            .await
+            .expect("`Bot`");
+
+        // The bot registers a command for itself.
+        let response = harness
+            .client
+            .post(format!("/bots/{}/commands", bot.id))
+            .header(Header::new("x-bot-token", bot.token.to_string()))
+            .header(ContentType::JSON)
+            .body(json!({ "name": "selfsync", "description": "Registered by the bot" }).to_string())
+            .dispatch()
+            .await;
+        assert_eq!(response.status(), Status::Ok);
+        let command: v0::ApplicationCommand = response.into_json().await.expect("`Command`");
+
+        // It can list its own commands.
+        let response = harness
+            .client
+            .get(format!("/bots/{}/commands", bot.id))
+            .header(Header::new("x-bot-token", bot.token.to_string()))
+            .dispatch()
+            .await;
+        assert_eq!(response.status(), Status::Ok);
+        let commands: Vec<v0::ApplicationCommand> =
+            response.into_json().await.expect("`Commands`");
+        assert!(commands.iter().any(|c| c.id == command.id));
+
+        // Another bot's token gets NotFound, exactly like a non-owner.
+        let response = harness
+            .client
+            .get(format!("/bots/{}/commands", bot.id))
+            .header(Header::new("x-bot-token", other_bot.token.to_string()))
+            .dispatch()
+            .await;
+        assert_eq!(response.status(), Status::NotFound);
+
+        let response = harness
+            .client
+            .delete(format!("/bots/{}/commands/{}", bot.id, command.id))
+            .header(Header::new("x-bot-token", other_bot.token.to_string()))
+            .dispatch()
+            .await;
+        assert_eq!(response.status(), Status::NotFound);
+
+        // Non-owner user sessions stay locked out (regression).
+        let response = harness
+            .client
+            .get(format!("/bots/{}/commands", bot.id))
+            .header(Header::new(
+                "x-session-token",
+                other_session.token.to_string(),
+            ))
+            .dispatch()
+            .await;
+        assert_eq!(response.status(), Status::NotFound);
+
+        // The bot edits then deletes its own command.
+        let response = harness
+            .client
+            .patch(format!("/bots/{}/commands/{}", bot.id, command.id))
+            .header(Header::new("x-bot-token", bot.token.to_string()))
+            .header(ContentType::JSON)
+            .body(json!({ "description": "Updated by the bot" }).to_string())
+            .dispatch()
+            .await;
+        assert_eq!(response.status(), Status::Ok);
+
+        let response = harness
+            .client
+            .delete(format!("/bots/{}/commands/{}", bot.id, command.id))
+            .header(Header::new("x-bot-token", bot.token.to_string()))
             .dispatch()
             .await;
         assert_eq!(response.status(), Status::Ok);

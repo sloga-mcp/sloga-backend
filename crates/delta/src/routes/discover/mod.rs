@@ -4,6 +4,7 @@ use revolt_result::Result;
 use revolt_rocket_okapi::revolt_okapi::openapi3::OpenApi;
 use rocket::Route;
 
+mod apps_list;
 mod requests_list;
 mod server_fetch;
 mod servers_list;
@@ -17,7 +18,8 @@ pub fn routes() -> (Vec<Route>, OpenApi) {
     openapi_get_routes_spec![
         servers_list::list,
         server_fetch::fetch,
-        requests_list::requests
+        requests_list::requests,
+        apps_list::apps
     ]
 }
 
