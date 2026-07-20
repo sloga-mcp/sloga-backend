@@ -3,3 +3,6 @@
 # extension, so they are matched by path.
 *.sh text eol=lf
 .mise/tasks/** text eol=lf
+
+# Keep the pre-commit hook LF so it runs on Windows/Git Bash
+.githooks/** text eol=lf

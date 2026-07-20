@@ -1,0 +1,30 @@
+Sloga — server (backend)
+Copyright (C) Sloga Technologies LLC and the Sloga contributors.
+
+This program is a modified version of Stoat
+(https://github.com/stoatchat/stoatchat), which is itself derived from Revolt
+(https://github.com/revoltchat). Portions are Copyright (C) the Stoat and
+Revolt contributors.
+
+LICENSE
+-------
+Except where a subdirectory or crate provides its own LICENSE file, this program
+is free software: you may redistribute it and/or modify it under the terms of
+the GNU Affero General Public License, version 3, or (at your option) any later
+version (AGPL-3.0-or-later). See the LICENSE file for the full text.
+
+The following components are licensed under the MIT License and carry their own
+LICENSE files:
+  - crates/core/models
+  - crates/core/permissions
+
+AGPL section 13: if you run a modified version of this software on a network
+server and let users interact with it there, you must offer those users access
+to the Corresponding Source of your modified version.
+
+END-TO-END ENCRYPTION
+---------------------
+Sloga's native end-to-end-encryption components (the `e2ee-core` and
+`e2ee-android` crates) are independently authored by Sloga Technologies LLC,
+separately licensed, and maintained outside this repository. They are not
+included here.
