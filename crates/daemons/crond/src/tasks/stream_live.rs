@@ -217,7 +217,7 @@ async fn twitch_app_token(force_refresh: bool) -> Option<String> {
             TWITCH_APP_TOKEN_KEY,
             &tokens.access_token,
             redis::SetOptions::default()
-                .with_expiration(redis::SetExpiry::EX(tokens.expires_in.saturating_sub(300))),
+                .with_expiration(redis::SetExpiry::EX(tokens.expires_in.saturating_sub(300) as usize)),
         )
         .await
         .ok();
