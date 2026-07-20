@@ -28,7 +28,9 @@ pub async fn boost_remove(
         }));
     }
 
-    let count = count.unwrap_or(1).clamp(1, 100);
+    let count = count
+        .unwrap_or(1)
+        .clamp(1, config.features.boosts.max_per_user_per_server.max(1));
 
     // The op's query is keyed on (caller, server) — it can only ever touch
     // the caller's own slots.
@@ -40,8 +42,14 @@ pub async fn boost_remove(
         return Err(create_error!(NoEffect));
     }
 
-    // Tolerates a deleted server (recount no-ops on NotFound).
-    ServerBoost::recount_for_server(db, target.id).await?;
+    // Best-effort: the deallocation above has already committed, so a
+    // transient recount failure must not surface as a 500 (the caller's
+    // retry would then hit NoEffect). The crond self-heal sweep — which
+    // also covers servers left with a stale count and ZERO slots —
+    // reconciles anything missed here. NotFound (deleted server) no-ops.
+    if let Err(error) = ServerBoost::recount_for_server(db, target.id).await {
+        log::warn!("boost_remove: recount failed for {}: {error:?}", target.id);
+    }
 
     Ok(Json(v0::BoostRemoved {
         removed: removed as u32,

@@ -159,8 +159,12 @@ impl AbstractServerBoosts for MongoDb {
                 doc! {
                     "_id": { "$in": &ids },
                     // Belt-and-suspenders: never free someone else's slots
-                    // even if the id list were somehow wrong.
-                    "user_id": user_id
+                    // even if the id list were somehow wrong — and re-assert
+                    // server_id so a slot the same user concurrently moved to
+                    // ANOTHER server between the find and this update is left
+                    // alone (find-then-update is not atomic).
+                    "user_id": user_id,
+                    "server_id": server_id
                 },
                 doc! {
                     "$unset": {
@@ -232,7 +236,20 @@ impl AbstractServerBoosts for MongoDb {
     }
 
     async fn delete_server_boost(&self, id: &str) -> Result<()> {
-        query!(self, delete_one_by_id, COL, id).map(|_| ())
+        // Check deleted_count so a missing id is NotFound on BOTH drivers
+        // (the reference impl errors; silently returning Ok here would let
+        // reference-driver tests and prod disagree on a fetch/prune race).
+        self.col::<Document>(COL)
+            .delete_one(doc! { "_id": id })
+            .await
+            .map_err(|_| create_database_error!("delete_one", COL))
+            .and_then(|result| {
+                if result.deleted_count == 1 {
+                    Ok(())
+                } else {
+                    Err(create_error!(NotFound))
+                }
+            })
     }
 
     async fn delete_expired_server_boosts(&self, now_ms: i64) -> Result<Vec<ServerBoost>> {

@@ -145,6 +145,27 @@ impl AbstractServers for MongoDb {
         .map_err(|_| create_database_error!("find", COL))
     }
 
+    async fn fetch_server_ids_with_boost_counts(&self) -> Result<Vec<String>> {
+        // `boost_count` is skip-serialized when None, but a recount always
+        // writes a concrete number, so a stale-perk server has a stored
+        // positive value — exactly the set this query serves.
+        self.col::<Document>(COL)
+            .distinct(
+                "_id",
+                doc! {
+                    "boost_count": { "$gt": 0_i32 }
+                },
+            )
+            .await
+            .map(|values| {
+                values
+                    .into_iter()
+                    .filter_map(|value| value.as_str().map(|s| s.to_string()))
+                    .collect()
+            })
+            .map_err(|_| create_database_error!("distinct", COL))
+    }
+
     /// Insert a new role into server object
     async fn insert_role(&self, server_id: &str, role: &Role) -> Result<()> {
         self.col::<Document>(COL)

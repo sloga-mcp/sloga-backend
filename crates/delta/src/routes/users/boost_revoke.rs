@@ -53,8 +53,12 @@ pub async fn boost_revoke(
 
     db.delete_server_boost(&boost.id).await?;
 
+    // Best-effort — the delete has committed; crond's self-heal sweep
+    // reconciles a missed recount (including the zero-slots-left case).
     if let Some(server_id) = &boost.server_id {
-        ServerBoost::recount_for_server(db, server_id).await?;
+        if let Err(error) = ServerBoost::recount_for_server(db, server_id).await {
+            log::warn!("boost_revoke: recount failed for {server_id}: {error:?}");
+        }
     }
 
     Ok(EmptyResponse)

@@ -91,7 +91,13 @@ impl ServerBoost {
     pub async fn recount_for_server(db: &Database, server_id: &str) -> Result<()> {
         let mut server = match db.fetch_server(server_id).await {
             Ok(server) => server,
-            Err(_) => return Ok(()),
+            // Deleted server — nothing to recount. Any OTHER error must
+            // propagate: swallowing a transient fetch failure here is how a
+            // stale tier would get stranded past the self-heal sweep.
+            Err(error) if matches!(error.error_type, revolt_result::ErrorType::NotFound) => {
+                return Ok(())
+            }
+            Err(error) => return Err(error),
         };
 
         let config = revolt_config::config().await;

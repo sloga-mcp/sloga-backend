@@ -37,6 +37,15 @@ pub async fn task(db: Database, _: revolt_database::AMQP) -> Result<()> {
             affected.insert(server_id);
         }
 
+        //    Also sweep servers with a stored positive boost_count: a server
+        //    whose LAST slot vanished without a successful recount no longer
+        //    appears in server_boosts at all, so the distinct above can
+        //    never find it — without this leg its perk tier would be
+        //    stranded forever (review MAJOR).
+        for server_id in db.fetch_server_ids_with_boost_counts().await? {
+            affected.insert(server_id);
+        }
+
         for server_id in &affected {
             ServerBoost::recount_for_server(&db, server_id).await?;
         }

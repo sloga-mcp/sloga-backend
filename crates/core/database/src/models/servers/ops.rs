@@ -48,6 +48,12 @@ pub trait AbstractServers: Sync + Send {
     /// (`discovery_requested == true && discoverable != true`), newest first.
     async fn fetch_discovery_requests(&self, skip: u64, limit: i64) -> Result<Vec<Server>>;
 
+    /// Ids of servers whose stored `boost_count` is positive (crond
+    /// self-heal sweep: covers servers whose LAST slot vanished without a
+    /// successful recount — those no longer appear in `server_boosts` at
+    /// all, so a distinct over that collection can never find them)
+    async fn fetch_server_ids_with_boost_counts(&self) -> Result<Vec<String>>;
+
     /// Insert a new role into server object
     async fn insert_role(&self, server_id: &str, role: &Role) -> Result<()>;
 

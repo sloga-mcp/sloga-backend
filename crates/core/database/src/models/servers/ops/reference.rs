@@ -144,6 +144,17 @@ impl AbstractServers for ReferenceDb {
             .collect())
     }
 
+    async fn fetch_server_ids_with_boost_counts(&self) -> Result<Vec<String>> {
+        let servers = self.servers.lock().await;
+        let mut ids: Vec<String> = servers
+            .values()
+            .filter(|server| server.boost_count.unwrap_or(0) > 0)
+            .map(|server| server.id.clone())
+            .collect();
+        ids.sort();
+        Ok(ids)
+    }
+
     /// Insert a new role into server object
     async fn insert_role(&self, server_id: &str, role: &Role) -> Result<()> {
         let mut servers = self.servers.lock().await;
