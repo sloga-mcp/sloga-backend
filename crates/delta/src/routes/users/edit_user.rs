@@ -61,6 +61,13 @@ pub async fn edit(
         return Ok(Json(user.into_self(false).await));
     }
 
+    // `connections` is denormalized from user_stream_connections and only
+    // the link/unlink/poller paths may rewrite it — removing it here would
+    // silently desync until the next live-flip. Unlink is the real API.
+    if data.remove.contains(&v0::FieldsUser::Connections) {
+        return Err(create_error!(InvalidOperation));
+    }
+
     // 1. Remove fields from object
     if data.remove.contains(&v0::FieldsUser::Avatar) {
         if let Some(avatar) = &user.avatar {

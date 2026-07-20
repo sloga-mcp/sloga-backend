@@ -46,7 +46,10 @@ iso8601-timestamp = { workspace = true }
 futures = { workspace = true }
 chrono = { workspace = true }
 async-channel = { workspace = true }
-reqwest = { workspace = true, features = ["json"] }
+# "query" is NOT default in reqwest 0.13 — without it .query() only
+# compiles when another workspace crate's features unify in (full builds
+# pass, `cargo check -p` fails)
+reqwest = { workspace = true, features = ["json", "query"] }
 tokio = { workspace = true }
 
 # internal util

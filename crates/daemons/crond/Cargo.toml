@@ -25,8 +25,10 @@ redis-kiss = { workspace = true, default-features = false, features = ["tokio-ru
 lapin = { workspace = true }
 futures-lite = { workspace = true }
 
-# HTTP (Twitch Helix / YouTube Data API live checks)
-reqwest = { workspace = true, features = ["json"] }
+# HTTP (Twitch Helix / YouTube Data API live checks). "query" is NOT
+# default in reqwest 0.13 — required for .query(), don't rely on
+# workspace feature unification
+reqwest = { workspace = true, features = ["json", "query"] }
 
 # Processing
 serde_json = { workspace = true }

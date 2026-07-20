@@ -439,7 +439,25 @@ async fn poll_youtube(db: &Database, amqp: &AMQP) -> Result<()> {
             Ok(response) => {
                 log::warn!("youtube liveBroadcasts returned {}", response.status());
                 connection.poll_failures += 1;
-                let _ = db.save_stream_connection(&connection).await;
+                // API failures count toward the same auto-unlink cap as
+                // refresh failures — a permanently-403ing connection is
+                // just as dead as one with a revoked refresh token
+                if connection.poll_failures >= MAX_POLL_FAILURES {
+                    log::warn!(
+                        "auto-unlinking youtube connection for {} after {} failures",
+                        connection.user_id,
+                        connection.poll_failures
+                    );
+                    let _ = db
+                        .delete_stream_connection(
+                            &connection.user_id,
+                            &ConnectionPlatform::YouTube,
+                        )
+                        .await;
+                    let _ = StreamConnection::sync_user_field(db, &connection.user_id).await;
+                } else {
+                    let _ = db.save_stream_connection(&connection).await;
+                }
                 continue;
             }
             Err(_) => continue,
@@ -449,7 +467,14 @@ async fn poll_youtube(db: &Database, amqp: &AMQP) -> Result<()> {
             continue;
         };
 
-        connection.poll_failures = 0;
+        // Persist the reset: apply_live_state's change gate skips its save
+        // in the common nothing-changed case, and an unpersisted reset
+        // makes the DB counter CUMULATIVE — 12 transient blips over weeks
+        // would auto-unlink a healthy connection
+        if connection.poll_failures != 0 {
+            connection.poll_failures = 0;
+            let _ = db.save_stream_connection(&connection).await;
+        }
 
         // `broadcastStatus=active` still includes ready/testing persistent
         // broadcasts — only lifeCycleStatus "live" counts
