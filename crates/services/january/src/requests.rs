@@ -343,7 +343,7 @@ impl Request {
 
         loop {
             let response = CLIENT
-            .get(url)
+            .get(url.clone())
             .header(
                 "User-Agent",
                 if RE_USER_AGENT_SPOOFING_AS_DISCORD.is_match(&url_host_str) {
