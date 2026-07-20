@@ -1,5 +1,6 @@
 use std::{
-    io::{Cursor, Read, Write},
+    fs::File,
+    io::{Cursor, Read, Seek, SeekFrom, Write},
     time::Duration,
 };
 
@@ -30,6 +31,25 @@ use utoipa::ToSchema;
 use crate::{
     exif::strip_metadata, metadata::generate_metadata, mime_type::determine_mime_type, AppState,
 };
+
+/// Compute the sha256 of a file by streaming it, without loading it into memory
+fn hash_file(f: &mut File) -> std::io::Result<sha2::digest::Output<sha2::Sha256>> {
+    f.seek(SeekFrom::Start(0))?;
+
+    let mut hasher = sha2::Sha256::new();
+    let mut chunk = vec![0u8; 64 * 1024];
+
+    loop {
+        let read = f.read(&mut chunk)?;
+        if read == 0 {
+            break;
+        }
+
+        hasher.update(&chunk[..read]);
+    }
+
+    Ok(hasher.finalize())
+}
 
 /// Build the API router
 pub async fn router() -> Router<AppState> {
@@ -200,12 +220,14 @@ async fn upload_file(
     // Extract the filename, or give it a generic name
     let filename = file.metadata.file_name.unwrap_or("unnamed-file".to_owned());
 
-    // Load file to memory
-    let mut buf = Vec::<u8>::new();
-    report_internal_error!(file.contents.read_to_end(&mut buf))?;
-
     // Take note of original file size
-    let original_file_size = buf.len();
+    //
+    // The multipart extractor has already streamed the body to a temp file on
+    // disk, so the length comes from there. Everything up to the dedupe check
+    // below works off disk too — an oversized, blocked or already-known upload
+    // now bails out without ever allocating the file in memory.
+    let original_file_size =
+        report_internal_error!(file.contents.as_file().metadata())?.len() as usize;
 
     // Ensure the file is not empty
     if original_file_size < config.files.limit.min_file_size {
@@ -223,12 +245,8 @@ async fn upload_file(
         return Err(create_error!(FileTooLarge { max: size_limit }));
     }
 
-    // Generate sha256 hash
-    let original_hash = {
-        let mut hasher = sha2::Sha256::new();
-        hasher.update(&buf);
-        hasher.finalize()
-    };
+    // Generate sha256 hash by streaming the file off disk
+    let original_hash = report_internal_error!(hash_file(file.contents.as_file_mut()))?;
 
     // Generate an ID for this file
     let id = if matches!(tag, Tag::emojis) {
@@ -238,7 +256,7 @@ async fn upload_file(
     };
 
     // Determine the mime type for the file
-    let mime_type = determine_mime_type(&mut file.contents, &buf, &filename);
+    let mime_type = determine_mime_type(&mut file.contents, &filename);
 
     // Check blocklist for mime type
     if config
@@ -307,6 +325,13 @@ async fn upload_file(
     } else {
         false
     };
+
+    // Past the dedupe early-exit, so this upload is genuinely new: pull it into
+    // memory for metadata stripping and the S3 upload, both of which need the
+    // whole thing
+    let mut buf = Vec::<u8>::with_capacity(original_file_size);
+    report_internal_error!(file.contents.as_file_mut().seek(SeekFrom::Start(0)))?;
+    report_internal_error!(file.contents.read_to_end(&mut buf))?;
 
     // Strip metadata; videos may also be remuxed/transcoded for inline playback,
     // changing their mime type and container

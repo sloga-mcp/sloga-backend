@@ -381,7 +381,7 @@ mod tests {
 
         // infer cannot tell MKV from WebM (shared EBML magic), so MKVs arrive
         // as video/webm; the plan is chosen by actual codecs, not container
-        let mime = crate::mime_type::determine_mime_type(&mut file, &buf, "clip.mkv");
+        let mime = crate::mime_type::determine_mime_type(&mut file, "clip.mkv");
         assert_eq!(mime, "video/webm");
 
         let metadata = crate::metadata::generate_metadata(&file, mime);

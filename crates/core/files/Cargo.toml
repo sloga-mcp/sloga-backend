@@ -15,6 +15,7 @@ tracing = { workspace = true }
 
 tokio = { workspace = true }
 async-trait = { workspace = true }
+futures = { workspace = true }
 
 ffprobe = { workspace = true }
 imagesize = { workspace = true }
