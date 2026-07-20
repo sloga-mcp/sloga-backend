@@ -36,11 +36,15 @@ pub async fn create_sound(
         .await
         .throw_if_lacking_channel_permission(ChannelPermission::ManageCustomisation)?;
 
+    // Boost tiers can raise the global sound cap; with boosts disabled
+    // this resolves to the global limit unchanged.
+    let max_sounds = config.features.boosts.effective_server_sounds(
+        config.features.limits.global.server_sounds,
+        server.boost_tier.unwrap_or_default() as u32,
+    );
     let sounds = db.fetch_soundboard_sounds_by_server_id(&server.id).await?;
-    if sounds.len() >= config.features.limits.global.server_sounds {
-        return Err(create_error!(TooManySounds {
-            max: config.features.limits.global.server_sounds,
-        }));
+    if sounds.len() >= max_sounds {
+        return Err(create_error!(TooManySounds { max: max_sounds }));
     }
 
     let attachment = File::use_soundboard(db, &sound_id, &sound_id, &user.id).await?;

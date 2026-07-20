@@ -182,6 +182,14 @@ pub async fn create_database(db: &MongoDb) {
         .await
         .expect("Failed to create sounds collection.");
 
+    db.create_collection("user_stream_connections")
+        .await
+        .expect("Failed to create user_stream_connections collection.");
+
+    db.create_collection("server_boosts")
+        .await
+        .expect("Failed to create server_boosts collection.");
+
     db.run_command(doc! {
         "createIndexes": "users",
         "indexes": [
@@ -464,6 +472,61 @@ pub async fn create_database(db: &MongoDb) {
     })
     .await
     .expect("Failed to create sounds index.");
+
+    db.run_command(doc! {
+        "createIndexes": "user_stream_connections",
+        "indexes": [
+            // Serves per-user fetch/sync/unlink + deletion cascade.
+            {
+                "key": {
+                    "user_id": 1_i32
+                },
+                "name": "user_id"
+            },
+            // Serves the live-status poller's per-platform scan.
+            {
+                "key": {
+                    "platform": 1_i32
+                },
+                "name": "platform"
+            }
+        ]
+    })
+    .await
+    .expect("Failed to create user_stream_connections index.");
+
+    db.run_command(doc! {
+        "createIndexes": "server_boosts",
+        "indexes": [
+            // Serves inventory fetch/count + account-deletion cascade.
+            {
+                "key": {
+                    "user_id": 1_i32
+                },
+                "name": "user_id"
+            },
+            // Serves per-server counts/lists + deletion cascade.
+            // Sparse: unallocated slots have NO server_id field.
+            {
+                "key": {
+                    "server_id": 1_i32
+                },
+                "name": "server_id",
+                "sparse": true
+            },
+            // Serves the crond expiry sweep ($lte scan). Sparse:
+            // permanent slots have NO expires_at field.
+            {
+                "key": {
+                    "expires_at": 1_i32
+                },
+                "name": "expires_at",
+                "sparse": true
+            }
+        ]
+    })
+    .await
+    .expect("Failed to create server_boosts index.");
 
     db.run_command(doc! {
         "createIndexes": "servers",

@@ -61,6 +61,8 @@ impl<'r> Responder<'r, 'static> for Error {
             ErrorType::TooManySounds { .. } => Status::BadRequest,
             ErrorType::TooManyChannels { .. } => Status::BadRequest,
             ErrorType::TooManyRoles { .. } => Status::BadRequest,
+            ErrorType::NotEnoughBoosts { .. } => Status::BadRequest,
+            ErrorType::TooManyBoosts { .. } => Status::BadRequest,
 
             ErrorType::ReachedMaximumBots => Status::BadRequest,
             ErrorType::IsBot => Status::BadRequest,

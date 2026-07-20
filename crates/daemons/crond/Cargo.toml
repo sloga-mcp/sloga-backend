@@ -25,6 +25,9 @@ redis-kiss = { workspace = true, default-features = false, features = ["tokio-ru
 lapin = { workspace = true }
 futures-lite = { workspace = true }
 
+# HTTP (Twitch Helix / YouTube Data API live checks)
+reqwest = { workspace = true, features = ["json"] }
+
 # Processing
 serde_json = { workspace = true }
 revolt_optional_struct = { workspace = true }

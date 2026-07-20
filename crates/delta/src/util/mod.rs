@@ -1,3 +1,4 @@
+pub mod boosts;
 pub mod dice;
 pub mod polls;
 pub mod ratelimits;

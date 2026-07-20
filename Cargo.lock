@@ -7302,6 +7302,7 @@ dependencies = [
  "lapin",
  "log",
  "redis-kiss",
+ "reqwest 0.13.4",
  "revolt-config",
  "revolt-database",
  "revolt-files",

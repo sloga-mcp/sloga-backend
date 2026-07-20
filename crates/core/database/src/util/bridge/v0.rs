@@ -1069,6 +1069,8 @@ impl From<crate::Server> for Server {
             analytics: value.analytics,
             discoverable: value.discoverable,
             discovery_requested: value.discovery_requested,
+            boost_count: value.boost_count.unwrap_or_default() as u32,
+            boost_tier: value.boost_tier.unwrap_or_default() as u32,
         }
     }
 }
@@ -1098,6 +1100,8 @@ impl From<Server> for crate::Server {
             analytics: value.analytics,
             discoverable: value.discoverable,
             discovery_requested: value.discovery_requested,
+            boost_count: Some(value.boost_count as i32),
+            boost_tier: Some(value.boost_tier as i32),
         }
     }
 }
@@ -1125,6 +1129,8 @@ impl From<crate::PartialServer> for PartialServer {
             analytics: value.analytics,
             discoverable: value.discoverable,
             discovery_requested: value.discovery_requested,
+            boost_count: value.boost_count.map(|v| v as u32),
+            boost_tier: value.boost_tier.map(|v| v as u32),
         }
     }
 }
@@ -1152,6 +1158,8 @@ impl From<PartialServer> for crate::PartialServer {
             analytics: value.analytics,
             discoverable: value.discoverable,
             discovery_requested: value.discovery_requested,
+            boost_count: value.boost_count.map(|v| v as i32),
+            boost_tier: value.boost_tier.map(|v| v as i32),
         }
     }
 }
@@ -1367,6 +1375,13 @@ impl crate::User {
             } else {
                 None
             },
+            connections: if can_see_profile {
+                self.connections
+                    .map(|list| list.into_iter().map(Into::into).collect())
+                    .unwrap_or_default()
+            } else {
+                vec![]
+            },
             flags: self.flags.unwrap_or_default() as u32,
             privileged: self.privileged,
             bot: self.bot.map(|bot| bot.into()),
@@ -1433,6 +1448,13 @@ impl crate::User {
             } else {
                 None
             },
+            connections: if can_see_profile {
+                self.connections
+                    .map(|list| list.into_iter().map(Into::into).collect())
+                    .unwrap_or_default()
+            } else {
+                vec![]
+            },
             flags: self.flags.unwrap_or_default() as u32,
             privileged: self.privileged,
             bot: self.bot.map(|bot| bot.into()),
@@ -1463,6 +1485,10 @@ impl crate::User {
                     })
                 ),
             status: self.status.and_then(|status| status.into(true)),
+            connections: self
+                .connections
+                .map(|list| list.into_iter().map(Into::into).collect())
+                .unwrap_or_default(),
             flags: self.flags.unwrap_or_default() as u32,
             privileged: self.privileged,
             bot: self.bot.map(|bot| bot.into()),
@@ -1500,6 +1526,10 @@ impl crate::User {
                     })
                 ),
             status: self.status.and_then(|status| status.into(true)),
+            connections: self
+                .connections
+                .map(|list| list.into_iter().map(Into::into).collect())
+                .unwrap_or_default(),
             flags: self.flags.unwrap_or_default() as u32,
             privileged: self.privileged,
             bot: self.bot.map(|bot| bot.into()),
@@ -1530,6 +1560,7 @@ impl From<User> for crate::User {
             badges: Some(value.badges as i32),
             status: value.status.map(Into::into),
             profile: None,
+            connections: None,
             flags: Some(value.flags as i32),
             privileged: value.privileged,
             bot: value.bot.map(Into::into),
@@ -1556,6 +1587,9 @@ impl From<crate::PartialUser> for PartialUser {
             }),
             badges: value.badges.map(|badges| badges as u32),
             status: value.status.and_then(|status| status.into(false)),
+            connections: value
+                .connections
+                .map(|list| list.into_iter().map(Into::into).collect()),
             flags: value.flags.map(|flags| flags as u32),
             privileged: value.privileged,
             bot: value.bot.map(|bot| bot.into()),
@@ -1578,6 +1612,7 @@ impl From<FieldsUser> for crate::FieldsUser {
             FieldsUser::StatusText => crate::FieldsUser::StatusText,
             FieldsUser::DisplayName => crate::FieldsUser::DisplayName,
             FieldsUser::Pronouns => crate::FieldsUser::Pronouns,
+            FieldsUser::Connections => crate::FieldsUser::Connections,
 
             FieldsUser::Internal => crate::FieldsUser::None,
         }
@@ -1595,6 +1630,7 @@ impl From<crate::FieldsUser> for FieldsUser {
             crate::FieldsUser::StatusText => FieldsUser::StatusText,
             crate::FieldsUser::DisplayName => FieldsUser::DisplayName,
             crate::FieldsUser::Pronouns => FieldsUser::Pronouns,
+            crate::FieldsUser::Connections => FieldsUser::Connections,
 
             crate::FieldsUser::Suspension => FieldsUser::Internal,
             crate::FieldsUser::None => FieldsUser::Internal,
@@ -1695,6 +1731,50 @@ impl From<UserActivity> for crate::UserActivity {
         crate::UserActivity {
             name: value.name,
             started_at: value.started_at,
+        }
+    }
+}
+
+impl From<crate::ConnectionPlatform> for ConnectionPlatform {
+    fn from(value: crate::ConnectionPlatform) -> Self {
+        match value {
+            crate::ConnectionPlatform::Twitch => ConnectionPlatform::Twitch,
+            crate::ConnectionPlatform::YouTube => ConnectionPlatform::YouTube,
+        }
+    }
+}
+
+impl From<ConnectionPlatform> for crate::ConnectionPlatform {
+    fn from(value: ConnectionPlatform) -> crate::ConnectionPlatform {
+        match value {
+            ConnectionPlatform::Twitch => crate::ConnectionPlatform::Twitch,
+            ConnectionPlatform::YouTube => crate::ConnectionPlatform::YouTube,
+        }
+    }
+}
+
+impl From<crate::UserConnection> for UserConnection {
+    fn from(value: crate::UserConnection) -> Self {
+        UserConnection {
+            platform: value.platform.into(),
+            handle: value.handle,
+            display_name: value.display_name,
+            live: value.live,
+            live_title: value.live_title,
+            live_since: value.live_since,
+        }
+    }
+}
+
+impl From<UserConnection> for crate::UserConnection {
+    fn from(value: UserConnection) -> crate::UserConnection {
+        crate::UserConnection {
+            platform: value.platform.into(),
+            handle: value.handle,
+            display_name: value.display_name,
+            live: value.live,
+            live_title: value.live_title,
+            live_since: value.live_since,
         }
     }
 }
@@ -1902,6 +1982,29 @@ impl From<crate::E2EEEnvelope> for E2EEMessage {
             content_type: value.content_type.into(),
             group_id: value.group_id,
             epoch: value.epoch,
+        }
+    }
+}
+
+impl From<crate::BoostSource> for BoostSource {
+    fn from(value: crate::BoostSource) -> Self {
+        match value {
+            crate::BoostSource::AdminGrant => BoostSource::AdminGrant,
+            crate::BoostSource::Purchase => BoostSource::Purchase,
+            crate::BoostSource::Subscription => BoostSource::Subscription,
+        }
+    }
+}
+
+impl From<crate::ServerBoost> for ServerBoost {
+    fn from(value: crate::ServerBoost) -> Self {
+        ServerBoost {
+            id: value.id,
+            user_id: value.user_id,
+            server_id: value.server_id,
+            source: value.source.into(),
+            expires_at: value.expires_at,
+            allocated_at: value.allocated_at,
         }
     }
 }

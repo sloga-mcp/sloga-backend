@@ -126,6 +126,11 @@ pub fn if_option_false(t: &Option<bool>) -> bool {
     t != &Some(true)
 }
 
+/// Utility function to check if a u32 is zero
+pub fn if_zero_u32(t: &u32) -> bool {
+    t == &0
+}
+
 /// Utility function to check if an i64 is zero
 pub fn if_zero_i64(t: &i64) -> bool {
     *t == 0

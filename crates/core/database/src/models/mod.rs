@@ -17,6 +17,7 @@ mod mls;
 mod polls;
 mod scheduled_messages;
 mod soundboard;
+mod stream_connections;
 mod stickers;
 mod thread_members;
 mod policy_changes;
@@ -24,6 +25,7 @@ mod ratelimit_events;
 mod safety_reports;
 mod safety_snapshots;
 mod server_bans;
+mod server_boosts;
 mod server_members;
 mod servers;
 mod user_settings;
@@ -52,6 +54,7 @@ pub use mls::*;
 pub use polls::*;
 pub use scheduled_messages::*;
 pub use soundboard::*;
+pub use stream_connections::*;
 pub use stickers::*;
 pub use thread_members::*;
 pub use policy_changes::*;
@@ -59,6 +62,7 @@ pub use ratelimit_events::*;
 pub use safety_reports::*;
 pub use safety_snapshots::*;
 pub use server_bans::*;
+pub use server_boosts::*;
 pub use server_members::*;
 pub use servers::*;
 pub use user_settings::*;
@@ -97,11 +101,13 @@ pub trait AbstractDatabase:
     + polls::AbstractPolls
     + scheduled_messages::AbstractScheduledMessages
     + soundboard::AbstractSoundboard
+    + stream_connections::AbstractStreamConnections
     + policy_changes::AbstractPolicyChange
     + ratelimit_events::AbstractRatelimitEvents
     + safety_reports::AbstractReport
     + safety_snapshots::AbstractSnapshot
     + server_bans::AbstractServerBans
+    + server_boosts::AbstractServerBoosts
     + server_members::AbstractServerMembers
     + servers::AbstractServers
     + user_settings::AbstractUserSettings

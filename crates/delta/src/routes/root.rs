@@ -40,6 +40,17 @@ pub struct VoiceFeature {
     pub nodes: Vec<VoiceNode>,
 }
 
+/// # Server Boost Configuration
+#[derive(Serialize, JsonSchema, Debug)]
+pub struct BoostsFeature {
+    /// Whether server boosts are enabled
+    pub enabled: bool,
+    /// Whether boosts can be purchased (future billing; advertisement only)
+    pub purchases_enabled: bool,
+    /// Boosts required for tiers 1/2/3
+    pub tier_thresholds: [u32; 3],
+}
+
 /// # Feature Configuration
 #[derive(Serialize, JsonSchema, Debug)]
 pub struct RevoltFeatures {
@@ -51,6 +62,10 @@ pub struct RevoltFeatures {
     pub oauth_google: bool,
     /// Whether Sign in with Apple login is enabled
     pub oauth_apple: bool,
+    /// Whether Twitch channel linking is enabled
+    pub oauth_twitch: bool,
+    /// Whether YouTube channel linking is enabled
+    pub oauth_youtube: bool,
     /// Whether this server is invite only
     pub invite_only: bool,
     /// File server service configuration
@@ -63,6 +78,8 @@ pub struct RevoltFeatures {
     pub limits: LimitsConfig,
     /// Legal links
     pub legal_links: LegalLinks,
+    /// Server boost configuration
+    pub boosts: BoostsFeature,
 }
 
 /// # Limits For Users
@@ -207,6 +224,8 @@ pub async fn root() -> Result<Json<RevoltConfig>> {
             email: !config.api.smtp.host.is_empty(),
             oauth_google: config.api.oauth.google.enabled,
             oauth_apple: config.api.oauth.apple.enabled,
+            oauth_twitch: config.api.oauth.twitch.enabled,
+            oauth_youtube: config.api.oauth.youtube.enabled,
             invite_only: config.api.registration.invite_only,
             autumn: Feature {
                 enabled: !config.hosts.autumn.is_empty(),
@@ -261,6 +280,11 @@ pub async fn root() -> Result<Json<RevoltConfig>> {
                 terms_of_service: config.features.legal_links.terms_of_service,
                 privacy_policy: config.features.legal_links.privacy_policy,
                 guidelines: config.features.legal_links.guidelines,
+            },
+            boosts: BoostsFeature {
+                enabled: config.features.boosts.enabled,
+                purchases_enabled: config.features.boosts.purchases_enabled,
+                tier_thresholds: config.features.boosts.tier_thresholds,
             },
         },
         ws: config.hosts.events,

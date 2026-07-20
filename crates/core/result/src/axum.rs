@@ -58,6 +58,8 @@ impl IntoResponse for Error {
             ErrorType::TooManySounds { .. } => StatusCode::BAD_REQUEST,
             ErrorType::TooManyChannels { .. } => StatusCode::BAD_REQUEST,
             ErrorType::TooManyRoles { .. } => StatusCode::BAD_REQUEST,
+            ErrorType::NotEnoughBoosts { .. } => StatusCode::BAD_REQUEST,
+            ErrorType::TooManyBoosts { .. } => StatusCode::BAD_REQUEST,
 
             ErrorType::ReachedMaximumBots => StatusCode::BAD_REQUEST,
             ErrorType::IsBot => StatusCode::BAD_REQUEST,

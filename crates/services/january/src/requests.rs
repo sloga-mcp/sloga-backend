@@ -365,7 +365,11 @@ impl Request {
                 }
                 if let Some(location) = response.headers().get("location") {
                     let location = location.to_str().map_err(|_| create_error!(ProxyError))?;
-                    url = Url::from_str(location).to_internal_error()?;
+                    // Location may be relative (RFC 9110 §10.2.2) — resolve
+                    // against the current URL. Autumn deliberately issues
+                    // relative redirects (e.g. stickers → `<id>/<name>`) so
+                    // they survive the `/media` reverse-proxy prefix.
+                    url = url.join(location).to_internal_error()?;
 
                     blocker = Request::url_is_blacklisted(&url).await?;
 

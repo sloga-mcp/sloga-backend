@@ -65,6 +65,16 @@ auto_derived_partial!(
         /// (pending until a platform admin sets `discoverable`)
         #[serde(skip_serializing_if = "crate::if_false", default)]
         pub discovery_requested: bool,
+
+        /// Denormalized count of active boost slots — written ONLY by
+        /// authoritative recounts (ServerBoost::recount_for_server), never
+        /// incrementally and never from client input
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub boost_count: Option<i32>,
+        /// Denormalized boost perk tier (0-3), derived from `boost_count`
+        /// and the configured thresholds by the same recount path
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub boost_tier: Option<i32>,
     },
     "PartialServer"
 );
@@ -160,6 +170,8 @@ impl Server {
 
             analytics: false,
             banner: None,
+            boost_count: None,
+            boost_tier: None,
             categories: None,
             discoverable: false,
             discovery_requested: false,
@@ -237,6 +249,11 @@ impl Server {
         // and the far-side webhooks living in OTHER, surviving servers'
         // channels — must be severed here, before the channels are dropped.
         crate::ChannelFollow::cleanup_for_deleted_server(db, &self.id).await?;
+
+        // Boost cascade: return every allocated boost slot to its owner's
+        // inventory — otherwise the slots stay pinned to a dead server id
+        // forever and the owners can never re-spend them.
+        db.deallocate_all_server_boosts_for_server(&self.id).await?;
 
         EventV1::ServerDelete {
             id: self.id.clone(),

@@ -4,6 +4,9 @@ use rocket::Route;
 mod ban_create;
 mod ban_list;
 mod ban_remove;
+mod boost_add;
+mod boost_fetch;
+mod boost_remove;
 mod channel_create;
 mod emoji_list;
 mod invites_fetch;
@@ -51,6 +54,9 @@ pub fn routes() -> (Vec<Route>, OpenApi) {
         permissions_set::set_role_permission,
         permissions_set_default::set_default_server_permissions,
         emoji_list::list_emoji,
-        roles_edit_positions::edit_role_ranks
+        roles_edit_positions::edit_role_ranks,
+        boost_add::boost_add,
+        boost_remove::boost_remove,
+        boost_fetch::boost_fetch
     ]
 }

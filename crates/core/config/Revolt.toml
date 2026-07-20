@@ -67,6 +67,20 @@ client_id = ""
 client_secret = ""
 redirect_uri = ""
 
+[api.oauth.twitch]
+# Twitch CHANNEL LINKING (streaming connections, not login)
+enabled = false
+client_id = ""
+client_secret = ""
+redirect_uri = ""
+
+[api.oauth.youtube]
+# YouTube CHANNEL LINKING (not login) — may reuse the Google client creds
+enabled = false
+client_id = ""
+client_secret = ""
+redirect_uri = ""
+
 [api.security]
 # Authifier Shield API key
 authifier_shield_key = ""
@@ -245,6 +259,30 @@ mass_mentions_enabled = true
 # Server id that every newly-onboarded user is auto-joined to (landing-spot
 # server). Leave empty to disable. Set the real id in Revolt.overrides.toml.
 welcome_server = ""
+
+# --- Server boosts (Discord-style) ---
+# The feature ships DARK: all keys below default in code to the values shown,
+# with enabled = false. To turn it on, put the block in Revolt.overrides.toml
+# (keys MUST sit under an explicit [features.boosts] header — a bare key under
+# another table is silently ignored) and RESTART delta AND crond: config file
+# sources are frozen into the process at first access, so a toml edit alone
+# does nothing — and a pre-staged edit will silently activate on the next
+# incidental restart.
+#
+# [features.boosts]
+# enabled = false            # master switch: routes, perks, crond pruning
+# purchases_enabled = false  # v2 billing seam; advertisement-only in v1
+# tier_thresholds = [2, 7, 14]
+# max_per_user_per_server = 100
+# [features.boosts.tier1]
+# server_emoji = 200         # effective cap = max(global limit, tier override)
+# server_sounds = 48
+# [features.boosts.tier2]
+# server_emoji = 300
+# server_sounds = 72
+# [features.boosts.tier3]
+# server_emoji = 500
+# server_sounds = 96
 
 [features.limits]
 

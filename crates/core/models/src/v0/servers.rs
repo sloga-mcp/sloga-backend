@@ -85,6 +85,21 @@ auto_derived_partial!(
             serde(skip_serializing_if = "crate::if_false", default)
         )]
         pub discovery_requested: bool,
+
+        /// Number of active boost slots applied to this server
+        /// (server-computed; never client-writable)
+        #[cfg_attr(
+            feature = "serde",
+            serde(skip_serializing_if = "crate::if_zero_u32", default)
+        )]
+        pub boost_count: u32,
+        /// Boost perk tier (0-3) derived from `boost_count` and the
+        /// configured thresholds (server-computed; never client-writable)
+        #[cfg_attr(
+            feature = "serde",
+            serde(skip_serializing_if = "crate::if_zero_u32", default)
+        )]
+        pub boost_tier: u32,
     },
     "PartialServer"
 );

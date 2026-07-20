@@ -17,3 +17,4 @@ livekit.yml
 .idea
 
 updates/
+Revolt.test-overrides.toml

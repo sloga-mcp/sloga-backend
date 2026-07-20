@@ -68,6 +68,11 @@ auto_derived_partial!(
         #[serde(skip_serializing_if = "crate::if_false", default)]
         pub e2ee_enabled: bool,
 
+        /// Linked streaming channels (public denormalized copy; tokens live
+        /// ONLY in the private user_stream_connections collection)
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub connections: Option<Vec<UserConnection>>,
+
         /// Time until user is unsuspended
         #[serde(skip_serializing_if = "Option::is_none")]
         pub suspended_until: Option<Timestamp>,
@@ -88,10 +93,31 @@ auto_derived!(
         ProfileBackground,
         DisplayName,
         Pronouns,
+        Connections,
 
         // internal fields
         Suspension,
         None,
+    }
+
+    /// Platform of a linked streaming channel
+    pub enum ConnectionPlatform {
+        Twitch,
+        YouTube,
+    }
+
+    /// Public denormalized copy of a linked streaming channel; never
+    /// carries tokens
+    pub struct UserConnection {
+        pub platform: ConnectionPlatform,
+        pub handle: String,
+        pub display_name: String,
+        #[serde(skip_serializing_if = "crate::if_false", default)]
+        pub live: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub live_title: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub live_since: Option<Timestamp>,
     }
 
     /// User's relationship with another user (or themselves)
@@ -216,6 +242,7 @@ impl Default for User {
             privileged: Default::default(),
             bot: Default::default(),
             e2ee_enabled: Default::default(),
+            connections: Default::default(),
             suspended_until: Default::default(),
             last_acknowledged_policy_change: Timestamp::UNIX_EPOCH,
         }
@@ -740,6 +767,7 @@ impl User {
             }
             FieldsUser::DisplayName => self.display_name = None,
             FieldsUser::Pronouns => self.pronouns = None,
+            FieldsUser::Connections => self.connections = None,
             FieldsUser::Suspension => self.suspended_until = None,
             FieldsUser::None => {}
         }
@@ -846,6 +874,7 @@ impl User {
                 FieldsUser::StatusPresence,
                 FieldsUser::ProfileContent,
                 FieldsUser::ProfileBackground,
+                FieldsUser::Connections,
                 FieldsUser::Suspension,
             ],
         )
@@ -913,6 +942,17 @@ impl User {
         // so the per-server RSVP cascade never runs — drop every RSVP row the account
         // holds, or attendee lists would keep a ghost user id forever.
         db.delete_rsvps_for_user(&self.id).await?;
+
+        // Boost cascade: `clear_memberships` bypasses `Member::remove` too,
+        // so delete every slot this account owns here and recount the
+        // servers that held allocations — otherwise phantom boosts from a
+        // nonexistent user keep propping up perk tiers forever.
+        for server_id in db.delete_server_boosts_by_user(&self.id).await? {
+            crate::ServerBoost::recount_for_server(db, &server_id)
+                .await
+                .ok();
+        }
+
         self.clear_relationships(db).await?;
         db.delete_messages_by_user(&self.id).await?;
 
@@ -934,6 +974,11 @@ impl User {
         // must keep its recovery path), so the account-deletion cascade is
         // where they die — the ONLY implicit deletion of a backup (design §5).
         db.delete_all_e2ee_backups(&self.id).await?;
+
+        // Streaming connections hold YouTube refresh tokens — revoke
+        // (best-effort) and delete here or they outlive the account and the
+        // live poller keeps touching a deleted user.
+        crate::StreamConnection::delete_all_for_user(db, &self.id, true).await?;
 
         self.mark_deleted(db).await?;
 

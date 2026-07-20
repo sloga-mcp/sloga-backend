@@ -7,6 +7,9 @@ pub mod apple_complete;
 pub mod google_authorise;
 pub mod google_callback;
 pub mod google_complete;
+pub mod link;
+pub mod twitch_callback;
+pub mod youtube_callback;
 
 /// Redis key holding the PKCE verifier for an in-flight authorisation
 pub fn state_key(provider: &str, state: &str) -> String {
@@ -25,6 +28,8 @@ pub fn routes() -> (Vec<Route>, OpenApi) {
         google_complete::google_complete,
         apple_authorise::apple_authorise,
         apple_callback::apple_callback,
-        apple_complete::apple_complete
+        apple_complete::apple_complete,
+        twitch_callback::twitch_callback,
+        youtube_callback::youtube_callback
     ]
 }

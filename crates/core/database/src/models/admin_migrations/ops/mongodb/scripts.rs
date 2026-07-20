@@ -26,7 +26,7 @@ struct MigrationInfo {
     revision: i32,
 }
 
-pub const LATEST_REVISION: i32 = 63; // MUST BE +1 to last migration
+pub const LATEST_REVISION: i32 = 65; // MUST BE +1 to last migration
 
 pub async fn migrate_database(db: &MongoDb) {
     let migrations = db.col::<Document>("migrations");
@@ -2080,6 +2080,84 @@ pub async fn run_migrations(db: &MongoDb, revision: i32) -> i32 {
             })
             .await
             .expect("Failed to create servers discovery indexes.");
+    }
+
+    if revision <= 63 {
+        info!("Running migration [revision 63 / 19-07-2026]: Create user_stream_connections collection (streaming connections)");
+
+        // Private collection holding linked Twitch/YouTube channels +
+        // provider tokens (never exposed on User). Same idempotency
+        // contract as prior collection migrations; mirrors init.rs.
+        db.db()
+            .create_collection("user_stream_connections")
+            .await
+            .ok();
+
+        db.db()
+            .run_command(doc! {
+                "createIndexes": "user_stream_connections",
+                "indexes": [
+                    // Serves per-user fetch/sync/unlink + deletion cascade.
+                    {
+                        "key": {
+                            "user_id": 1_i32
+                        },
+                        "name": "user_id"
+                    },
+                    // Serves the live-status poller's per-platform scan.
+                    {
+                        "key": {
+                            "platform": 1_i32
+                        },
+                        "name": "platform"
+                    }
+                ]
+            })
+            .await
+            .expect("Failed to create user_stream_connections indexes.");
+    }
+
+    if revision <= 64 {
+        info!("Running migration [revision 64 / 19-07-2026]: Create server_boosts collection (server boosts)");
+
+        // One document per boost slot (user-owned, optionally allocated to
+        // a server). Same idempotency contract as prior collection
+        // migrations; mirrors init.rs.
+        db.db().create_collection("server_boosts").await.ok();
+
+        db.db()
+            .run_command(doc! {
+                "createIndexes": "server_boosts",
+                "indexes": [
+                    // Serves inventory fetch/count + account-deletion cascade.
+                    {
+                        "key": {
+                            "user_id": 1_i32
+                        },
+                        "name": "user_id"
+                    },
+                    // Serves per-server counts/lists + deletion cascade.
+                    // Sparse: unallocated slots have NO server_id field.
+                    {
+                        "key": {
+                            "server_id": 1_i32
+                        },
+                        "name": "server_id",
+                        "sparse": true
+                    },
+                    // Serves the crond expiry sweep ($lte scan). Sparse:
+                    // permanent slots have NO expires_at field.
+                    {
+                        "key": {
+                            "expires_at": 1_i32
+                        },
+                        "name": "expires_at",
+                        "sparse": true
+                    }
+                ]
+            })
+            .await
+            .expect("Failed to create server_boosts indexes.");
     }
 
     // Reminder to update LATEST_REVISION when adding new migrations.

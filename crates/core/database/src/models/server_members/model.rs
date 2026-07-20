@@ -288,6 +288,21 @@ impl Member {
             .await
             .ok();
 
+        // Boost cascade (Discord parity): a departing member's boosts return
+        // to their inventory. Best-effort like the RSVP cascade — a
+        // leave/kick/ban must never fail on boost cleanup; the crond
+        // self-heal recount is the safety net.
+        if let Ok(freed) = db
+            .deallocate_server_boosts(&self.id.user, &self.id.server, None)
+            .await
+        {
+            if freed > 0 {
+                crate::ServerBoost::recount_for_server(db, &self.id.server)
+                    .await
+                    .ok();
+            }
+        }
+
         EventV1::ServerMemberLeave {
             id: self.id.server.to_string(),
             user: self.id.user.to_string(),

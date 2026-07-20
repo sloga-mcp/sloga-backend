@@ -131,6 +131,16 @@ pub enum ErrorType {
     AlreadyInServer,
     CannotTimeoutYourself,
 
+    // ? Server boost errors
+    /// The caller does not have enough unallocated boost slots
+    NotEnoughBoosts {
+        available: usize,
+    },
+    /// The caller is at the per-user-per-server boost cap
+    TooManyBoosts {
+        max: usize,
+    },
+
     // ? Bot related errors
     ReachedMaximumBots,
     IsBot,

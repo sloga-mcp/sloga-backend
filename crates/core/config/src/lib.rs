@@ -292,12 +292,46 @@ pub struct ApiOauthApple {
     pub redirect_uri: String,
 }
 
+/// Twitch OAuth app used for CHANNEL LINKING (not login). No user tokens
+/// are stored; live checks use a client-credentials app token.
+#[derive(Deserialize, Debug, Clone, Default)]
+pub struct ApiOauthTwitch {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub client_id: String,
+    #[serde(default)]
+    pub client_secret: String,
+    #[serde(default)]
+    pub redirect_uri: String,
+}
+
+/// YouTube channel linking. May reuse the Google login OAuth client
+/// (same client_id/secret) with an extra redirect URI; youtube.readonly is
+/// a Google "sensitive" scope — consent-screen verification required or
+/// grants cap at 100 users.
+#[derive(Deserialize, Debug, Clone, Default)]
+pub struct ApiOauthYoutube {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub client_id: String,
+    #[serde(default)]
+    pub client_secret: String,
+    #[serde(default)]
+    pub redirect_uri: String,
+}
+
 #[derive(Deserialize, Debug, Clone, Default)]
 pub struct ApiOauth {
     #[serde(default)]
     pub google: ApiOauthGoogle,
     #[serde(default)]
     pub apple: ApiOauthApple,
+    #[serde(default)]
+    pub twitch: ApiOauthTwitch,
+    #[serde(default)]
+    pub youtube: ApiOauthYoutube,
 }
 
 /// A preconfigured global soundboard sound ("Sloga Sounds"), playable in any
@@ -539,6 +573,141 @@ impl Default for FeaturesAdvanced {
     }
 }
 
+/// Per-tier boost perk overrides. Every field is optional — `None` means
+/// "no change from the global limit". Effective limits are
+/// `max(global, override)` so an operator-raised global limit is never
+/// LOWERED by boosting.
+#[derive(Deserialize, Debug, Clone, Default)]
+pub struct BoostTierPerks {
+    #[serde(default)]
+    pub server_emoji: Option<usize>,
+    #[serde(default)]
+    pub server_sounds: Option<usize>,
+}
+
+/// Server-boost feature configuration.
+///
+/// Ships fully OFF (`enabled = false` compiled into the defaults; absent
+/// config keys cannot turn it on). NOTE: the config file sources are frozen
+/// into the process at first access — flipping `[features.boosts] enabled`
+/// in Revolt.overrides.toml requires RESTARTING delta AND crond (no rebuild,
+/// no migration). Do not stage the edit ahead of time: it will silently
+/// activate on the next incidental restart.
+#[derive(Deserialize, Debug, Clone)]
+pub struct BoostFeatures {
+    /// Master switch for the whole feature (routes, perks, crond pruning)
+    #[serde(default)]
+    pub enabled: bool,
+    /// Future billing seam: advertised to clients via the root route so
+    /// they know whether a purchase flow exists. NO server code path
+    /// consumes this in v1.
+    #[serde(default)]
+    pub purchases_enabled: bool,
+    /// Boosts required for tiers 1/2/3 (Discord parity defaults: 2/7/14)
+    #[serde(default = "BoostFeatures::default_tier_thresholds")]
+    pub tier_thresholds: [u32; 3],
+    /// Sanity cap on how many boosts one user may apply to one server
+    #[serde(default = "BoostFeatures::default_max_per_user_per_server")]
+    pub max_per_user_per_server: u32,
+    #[serde(default = "BoostFeatures::default_tier1")]
+    pub tier1: BoostTierPerks,
+    #[serde(default = "BoostFeatures::default_tier2")]
+    pub tier2: BoostTierPerks,
+    #[serde(default = "BoostFeatures::default_tier3")]
+    pub tier3: BoostTierPerks,
+}
+
+impl Default for BoostFeatures {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            purchases_enabled: false,
+            tier_thresholds: Self::default_tier_thresholds(),
+            max_per_user_per_server: Self::default_max_per_user_per_server(),
+            tier1: Self::default_tier1(),
+            tier2: Self::default_tier2(),
+            tier3: Self::default_tier3(),
+        }
+    }
+}
+
+impl BoostFeatures {
+    fn default_tier_thresholds() -> [u32; 3] {
+        [2, 7, 14]
+    }
+
+    fn default_max_per_user_per_server() -> u32 {
+        100
+    }
+
+    fn default_tier1() -> BoostTierPerks {
+        BoostTierPerks {
+            server_emoji: Some(200),
+            server_sounds: Some(48),
+        }
+    }
+
+    fn default_tier2() -> BoostTierPerks {
+        BoostTierPerks {
+            server_emoji: Some(300),
+            server_sounds: Some(72),
+        }
+    }
+
+    fn default_tier3() -> BoostTierPerks {
+        BoostTierPerks {
+            server_emoji: Some(500),
+            server_sounds: Some(96),
+        }
+    }
+
+    /// Tier (0-3) for a given active boost count. Thresholds are read in
+    /// ascending order; a misconfigured non-ascending array is clamped by
+    /// taking the highest tier whose threshold is met.
+    pub fn tier_for(&self, count: u32) -> u32 {
+        let mut tier = 0;
+        for (index, threshold) in self.tier_thresholds.iter().enumerate() {
+            if count >= *threshold {
+                tier = index as u32 + 1;
+            }
+        }
+        tier
+    }
+
+    /// Boosts required for the tier after `tier`, if any
+    pub fn next_tier_at(&self, tier: u32) -> Option<u32> {
+        self.tier_thresholds.get(tier as usize).copied()
+    }
+
+    fn perks_up_to(&self, tier: u32) -> impl Iterator<Item = &BoostTierPerks> {
+        [&self.tier1, &self.tier2, &self.tier3]
+            .into_iter()
+            .take(tier.min(3) as usize)
+    }
+
+    /// Effective per-server emoji cap for a tier: max(global, cumulative
+    /// tier overrides). Returns the global limit unchanged when the feature
+    /// is disabled.
+    pub fn effective_server_emoji(&self, global: usize, tier: u32) -> usize {
+        if !self.enabled {
+            return global;
+        }
+        self.perks_up_to(tier)
+            .filter_map(|perks| perks.server_emoji)
+            .fold(global, usize::max)
+    }
+
+    /// Effective per-server soundboard cap for a tier (same semantics)
+    pub fn effective_server_sounds(&self, global: usize, tier: u32) -> usize {
+        if !self.enabled {
+            return global;
+        }
+        self.perks_up_to(tier)
+            .filter_map(|perks| perks.server_sounds)
+            .fold(global, usize::max)
+    }
+}
+
 #[derive(Deserialize, Debug, Clone)]
 pub struct Features {
     pub limits: FeaturesLimitsCollection,
@@ -565,6 +734,11 @@ pub struct Features {
     /// behaviour. Existing users are unaffected (backfill separately).
     #[serde(default)]
     pub welcome_server: Option<String>,
+
+    /// Server-boost feature (ships dark; see BoostFeatures docs for the
+    /// flip-requires-restart caveat)
+    #[serde(default)]
+    pub boosts: BoostFeatures,
 
     #[serde(default)]
     pub advanced: FeaturesAdvanced,
@@ -715,5 +889,52 @@ mod tests {
     #[tokio::test]
     async fn it_works() {
         init().await;
+    }
+}
+
+#[cfg(test)]
+mod boost_tests {
+    use super::{BoostFeatures, BoostTierPerks};
+
+    #[test]
+    fn tier_thresholds() {
+        let boosts = BoostFeatures::default();
+        assert_eq!(boosts.tier_for(0), 0);
+        assert_eq!(boosts.tier_for(1), 0);
+        assert_eq!(boosts.tier_for(2), 1);
+        assert_eq!(boosts.tier_for(6), 1);
+        assert_eq!(boosts.tier_for(7), 2);
+        assert_eq!(boosts.tier_for(13), 2);
+        assert_eq!(boosts.tier_for(14), 3);
+        assert_eq!(boosts.tier_for(500), 3);
+
+        assert_eq!(boosts.next_tier_at(0), Some(2));
+        assert_eq!(boosts.next_tier_at(1), Some(7));
+        assert_eq!(boosts.next_tier_at(2), Some(14));
+        assert_eq!(boosts.next_tier_at(3), None);
+    }
+
+    #[test]
+    fn effective_limits_max_semantics() {
+        let mut boosts = BoostFeatures {
+            enabled: true,
+            ..Default::default()
+        };
+
+        // Tier override raises a low global cap...
+        assert_eq!(boosts.effective_server_emoji(100, 1), 200);
+        assert_eq!(boosts.effective_server_emoji(100, 3), 500);
+        // ...but never LOWERS an operator-raised one (max, not replace)
+        assert_eq!(boosts.effective_server_emoji(10_000, 3), 10_000);
+        // Tier 0 = global
+        assert_eq!(boosts.effective_server_emoji(100, 0), 100);
+
+        // A higher tier with no override inherits lower tiers' overrides
+        boosts.tier3 = BoostTierPerks::default();
+        assert_eq!(boosts.effective_server_emoji(100, 3), 300);
+
+        // Disabled => always global, stored tiers notwithstanding
+        boosts.enabled = false;
+        assert_eq!(boosts.effective_server_emoji(100, 3), 100);
     }
 }

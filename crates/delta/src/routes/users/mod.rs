@@ -3,12 +3,18 @@ use rocket::Route;
 
 mod add_friend;
 mod block_user;
+mod boost_grant;
+mod boost_revoke;
 mod change_username;
+mod connections_authorize;
+mod connections_complete;
+mod connections_unlink;
 mod edit_user;
 mod fetch_dms;
 mod fetch_profile;
 mod fetch_self;
 mod fetch_user;
+mod fetch_user_boosts;
 mod fetch_user_flags;
 mod find_mutual;
 mod get_default_avatar;
@@ -27,6 +33,10 @@ pub fn routes() -> (Vec<Route>, OpenApi) {
         change_username::change_username,
         get_default_avatar::default_avatar,
         fetch_profile::profile,
+        // Streaming connections
+        connections_authorize::connections_authorize,
+        connections_complete::connections_complete,
+        connections_unlink::connections_unlink,
         // Direct Messaging
         fetch_dms::direct_messages,
         open_dm::open_dm,
@@ -37,5 +47,9 @@ pub fn routes() -> (Vec<Route>, OpenApi) {
         block_user::block,
         unblock_user::unblock,
         send_friend_request::send_friend_request,
+        // Server Boosts
+        fetch_user_boosts::fetch_user_boosts,
+        boost_grant::boost_grant,
+        boost_revoke::boost_revoke,
     ]
 }

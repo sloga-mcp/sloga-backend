@@ -38,12 +38,16 @@ pub async fn create_emoji(
                 .await
                 .throw_if_lacking_channel_permission(ChannelPermission::ManageCustomisation)?;
 
-            // Check that we haven't hit the emoji limit
+            // Check that we haven't hit the emoji limit (boost tiers can
+            // raise the global cap; with boosts disabled this resolves to
+            // the global limit unchanged)
+            let max_emoji = config.features.boosts.effective_server_emoji(
+                config.features.limits.global.server_emoji,
+                server.boost_tier.unwrap_or_default() as u32,
+            );
             let emojis = db.fetch_emoji_by_parent_id(&server.id).await?;
-            if emojis.len() >= config.features.limits.global.server_emoji {
-                return Err(create_error!(TooManyEmoji {
-                    max: config.features.limits.global.server_emoji,
-                }));
+            if emojis.len() >= max_emoji {
+                return Err(create_error!(TooManyEmoji { max: max_emoji }));
             }
         }
         v0::EmojiParent::Detached => return Err(create_error!(InvalidOperation)),

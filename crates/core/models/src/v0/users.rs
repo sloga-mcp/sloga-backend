@@ -85,6 +85,13 @@ auto_derived_partial!(
         )]
         pub e2ee_enabled: bool,
 
+        /// Linked streaming channels (Twitch / YouTube), public by design
+        #[cfg_attr(
+            feature = "serde",
+            serde(skip_serializing_if = "Vec::is_empty", default)
+        )]
+        pub connections: Vec<UserConnection>,
+
         /// Current session user's relationship with this user
         pub relationship: RelationshipStatus,
         /// Whether this user is currently online
@@ -104,9 +111,41 @@ auto_derived!(
         ProfileBackground,
         DisplayName,
         Pronouns,
+        Connections,
 
         /// Internal field, ignore this.
         Internal,
+    }
+
+    /// Platform of a linked streaming channel
+    pub enum ConnectionPlatform {
+        Twitch,
+        YouTube,
+    }
+
+    /// A streaming channel the user linked via OAuth.
+    ///
+    /// Public/promotional by design; never carries tokens (those live in a
+    /// private collection server-side).
+    pub struct UserConnection {
+        /// Which platform the channel is on
+        pub platform: ConnectionPlatform,
+        /// Channel handle (Twitch login / YouTube @handle) used to build the URL
+        pub handle: String,
+        /// Channel display name
+        pub display_name: String,
+        /// Whether the channel is currently live
+        #[cfg_attr(
+            feature = "serde",
+            serde(skip_serializing_if = "crate::if_false", default)
+        )]
+        pub live: bool,
+        /// Title of the current stream, if live
+        #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+        pub live_title: Option<String>,
+        /// When the current stream started, if live
+        #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+        pub live_since: Option<Timestamp>,
     }
 
     /// User's relationship with another user (or themselves)
@@ -286,6 +325,24 @@ auto_derived!(
         /// Fields to remove from user object
         #[cfg_attr(feature = "serde", serde(default))]
         pub remove: Vec<FieldsUser>,
+    }
+
+    /// Response to beginning a streaming-channel link: the provider
+    /// authorize URL the client should navigate to
+    pub struct ResponseConnectionAuthorize {
+        pub url: String,
+    }
+
+    /// Complete a streaming-channel link with the one-time handoff code
+    /// issued by the OAuth callback
+    #[cfg_attr(feature = "validator", derive(Validate))]
+    pub struct DataConnectionComplete {
+        /// Platform key ("twitch" / "youtube")
+        #[cfg_attr(feature = "validator", validate(length(min = 1, max = 16)))]
+        pub platform: String,
+        /// One-time handoff code from the callback redirect
+        #[cfg_attr(feature = "validator", validate(length(min = 1, max = 64)))]
+        pub code: String,
     }
 
     /// User flag reponse
