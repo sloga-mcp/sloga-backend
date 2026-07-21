@@ -2,4 +2,4 @@
 #MISE description="Run voice ingress daemon (LiveKit webhooks)"
 set -e
 
-cargo run --bin revolt-voice-ingress
+cargo run --release --bin revolt-voice-ingress

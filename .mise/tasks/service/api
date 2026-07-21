@@ -2,4 +2,4 @@
 #MISE description="Run API server"
 set -e
 
-cargo run --bin revolt-delta
+cargo run --release --bin revolt-delta
