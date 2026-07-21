@@ -25,7 +25,24 @@ pub struct TestHarness {
 }
 
 impl TestHarness {
+    /// Database name used by production. The harness must never touch it.
+    const PRODUCTION_DATABASE: &'static str = "revolt";
+
     pub async fn new() -> TestHarness {
+        // `web()` builds its database through `DatabaseInfo::Auto`, which only
+        // routes to a throwaway `revolt_test_*` database when `TEST_DB` is set.
+        // With the variable unset it silently falls through to the configured
+        // production MongoDB instead — a plain `cargo test -p revolt-delta`
+        // then writes accounts, users, sessions and servers straight into live
+        // data (this is exactly how ~41 test accounts and 77 test servers ended
+        // up in production). Fail loudly instead of polluting prod.
+        assert!(
+            std::env::var("TEST_DB").is_ok(),
+            "`TEST_DB` is not set — refusing to run: `DatabaseInfo::Auto` would \
+             connect this harness to the PRODUCTION database. Set \
+             `TEST_DB=REFERENCE` (mock) or `TEST_DB=MONGODB` (throwaway db)."
+        );
+
         let client = Client::tracked(crate::web().await)
             .await
             .expect("valid rocket instance");
@@ -66,6 +83,18 @@ impl TestHarness {
             .state::<Database>()
             .expect("`Database`")
             .clone();
+
+        // Belt-and-braces: check the database we actually resolved to, not just
+        // the environment variable. A stray `TEST_DB` value or a config
+        // override could still land the harness on live data.
+        if let Database::MongoDb(mongo) = &db {
+            assert_ne!(
+                mongo.1,
+                Self::PRODUCTION_DATABASE,
+                "refusing to run: harness resolved to the PRODUCTION database. \
+                 Expected a throwaway `revolt_test_*` database."
+            );
+        }
 
         let amqp = AMQP::new_auto().await;
 
