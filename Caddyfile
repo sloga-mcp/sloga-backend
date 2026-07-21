@@ -2,7 +2,31 @@
 # Upstreams use 127.0.0.1 (caddy + all backends share one WSL netns). Do NOT hardcode the
 # WSL eth0 IP here — it changes with WSL networking mode (was 127.0.0.1 under NAT; the
 # switch to mirrored mode on 2026-07-08 made that IP unreachable → every route 502'd).
+
+# Global logging — redact credentials BEFORE they reach disk.
+# Session tokens ride in the /ws query string (the browser WebSocket API cannot
+# set request headers, so the token has to go in the URL) and in X-Session-Token
+# on REST calls. Without this filter, every error entry writes a live, replayable
+# session token into /var/log/caddy.log — anyone who can read that file can hijack
+# those sessions. `wrap json` preserves the existing on-disk log format.
+{
+    log {
+        format filter {
+            wrap json
+            fields {
+                request>uri query {
+                    replace token REDACTED
+                }
+                request>headers>X-Session-Token delete
+                request>headers>Authorization delete
+                request>headers>Cookie delete
+            }
+        }
+    }
+}
+
 :80 {
+
     # WebSocket (Bonfire)
     handle /ws {
         reverse_proxy 127.0.0.1:14703
