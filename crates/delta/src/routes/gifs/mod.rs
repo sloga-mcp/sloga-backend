@@ -12,7 +12,7 @@
 //! cached in-memory to stay well inside provider quotas.
 
 use std::collections::HashMap;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
 use revolt_config::config;
@@ -32,29 +32,118 @@ static CACHE: OnceLock<Mutex<HashMap<String, (Instant, Value)>>> = OnceLock::new
 const TTL_BROWSE: Duration = Duration::from_secs(30 * 60);
 const TTL_SEARCH: Duration = Duration::from_secs(10 * 60);
 
+/// Hard cap on retained provider responses.
+///
+/// The cache key embeds the caller's search string, so an unbounded map let any
+/// authenticated account mint entries without limit. It also grew forever under
+/// ORDINARY use, because the TTL only ever gated whether an entry was *served*
+/// — nothing removed one. Delta is a single process, so that is an eventual OOM
+/// of the whole REST API, not just of the GIF picker.
+const MAX_CACHE_ENTRIES: usize = 512;
+
+/// Longest accepted search query. Mirrors the discovery directory's cap and
+/// keeps a single cache key from being arbitrarily large.
+const MAX_QUERY_LENGTH: usize = 64;
+
+/// Lock the cache, recovering a poisoned mutex rather than panicking: the
+/// guarded section only touches a `HashMap`, and a single panic elsewhere while
+/// holding the lock would otherwise fail *every* subsequent GIF request for the
+/// remaining life of the process.
+fn lock_cache() -> MutexGuard<'static, HashMap<String, (Instant, Value)>> {
+    CACHE
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 /// Fetch a provider URL with an in-memory TTL cache. Provider failures
 /// resolve to `None` so the picker degrades to an empty pane instead of an
 /// error toast (the beta GIPHY tier is tightly rate limited).
 async fn cached_fetch(url: String, ttl: Duration) -> Option<Value> {
-    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-
-    if let Some((at, value)) = cache
-        .lock()
-        .expect("gif cache poisoned")
-        .get(&url)
-        .cloned()
-    {
+    if let Some((at, value)) = lock_cache().get(&url).cloned() {
         if at.elapsed() < ttl {
             return Some(value);
         }
     }
 
     let value: Value = reqwest::get(&url).await.ok()?.json().await.ok()?;
-    cache
-        .lock()
-        .expect("gif cache poisoned")
-        .insert(url, (Instant::now(), value.clone()));
+
+    {
+        let mut cache = lock_cache();
+        make_room(&mut cache);
+        cache.insert(url, (Instant::now(), value.clone()));
+    }
+
     Some(value)
+}
+
+/// Ensure there is room for one more entry, keeping the map at or below
+/// `MAX_CACHE_ENTRIES`. Split out from `cached_fetch` so the bound is
+/// regression-testable without touching the network.
+fn make_room(cache: &mut HashMap<String, (Instant, Value)>) {
+    // Reclaim anything already past the longest TTL we hand out...
+    if cache.len() >= MAX_CACHE_ENTRIES {
+        cache.retain(|_, (at, _)| at.elapsed() < TTL_BROWSE);
+    }
+
+    // ...and if that was not enough (a burst of fresh entries), drop the
+    // oldest. Bounded on both paths.
+    if cache.len() >= MAX_CACHE_ENTRIES {
+        let oldest = cache
+            .iter()
+            .min_by_key(|(_, (at, _))| *at)
+            .map(|(key, _)| key.clone());
+        if let Some(oldest) = oldest {
+            cache.remove(&oldest);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The cache must stay bounded no matter how many distinct keys arrive.
+    /// Before this bound existed, every unique search string added a permanent
+    /// entry — an authenticated memory-exhaustion vector, and a slow leak even
+    /// under ordinary use.
+    #[test]
+    fn cache_stays_bounded_under_unique_keys() {
+        let mut cache: HashMap<String, (Instant, Value)> = HashMap::new();
+
+        for i in 0..(MAX_CACHE_ENTRIES * 3) {
+            make_room(&mut cache);
+            cache.insert(format!("https://example.invalid/?q={i}"), (Instant::now(), json!({})));
+            assert!(
+                cache.len() <= MAX_CACHE_ENTRIES,
+                "cache exceeded its cap at insert {i}: {}",
+                cache.len()
+            );
+        }
+
+        assert_eq!(cache.len(), MAX_CACHE_ENTRIES);
+    }
+
+    /// Eviction must take the OLDEST entry, so a hot key survives a burst.
+    #[test]
+    fn make_room_evicts_the_oldest_entry() {
+        let mut cache: HashMap<String, (Instant, Value)> = HashMap::new();
+
+        let oldest = Instant::now();
+        cache.insert("oldest".to_owned(), (oldest, json!({})));
+        for i in 0..(MAX_CACHE_ENTRIES - 1) {
+            cache.insert(format!("k{i}"), (Instant::now(), json!({})));
+        }
+        assert_eq!(cache.len(), MAX_CACHE_ENTRIES);
+
+        make_room(&mut cache);
+
+        assert!(
+            !cache.contains_key("oldest"),
+            "eviction must remove the oldest entry first"
+        );
+        assert_eq!(cache.len(), MAX_CACHE_ENTRIES - 1);
+    }
 }
 
 fn provider_url(endpoint: &str, params: &[(&str, &str)]) -> Option<String> {
@@ -181,7 +270,11 @@ pub async fn trending(_user: User, locale: Option<String>, limit: Option<u32>) -
 pub async fn search(_user: User, locale: Option<String>, query: String) -> Json<Value> {
     let _ = locale;
     let key = &config().await.api.gifs.giphy_key;
-    if key.is_empty() || query.trim().is_empty() {
+    let query = query.trim();
+
+    // Over-long queries are dropped rather than truncated: a truncated query
+    // would still mint a distinct cache entry, which is the thing being bounded.
+    if key.is_empty() || query.is_empty() || query.len() > MAX_QUERY_LENGTH {
         return Json(json!({ "results": [] }));
     }
 
@@ -189,7 +282,7 @@ pub async fn search(_user: User, locale: Option<String>, query: String) -> Json<
         "search",
         &[
             ("api_key", key),
-            ("q", query.trim()),
+            ("q", query),
             ("limit", "30"),
             ("rating", "pg-13"),
         ],
