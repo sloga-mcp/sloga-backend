@@ -19,14 +19,14 @@ use serde_json::json;
 use ulid::Ulid;
 
 auto_derived_partial!(
-    /// # Use
+    /// # User
     pub struct User {
         /// Unique Id
         #[serde(rename = "_id")]
         pub id: String,
         /// Username
         pub username: String,
-        /// Discriminato
+        /// Discriminator
         pub discriminator: String,
         /// Display name
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -106,7 +106,7 @@ auto_derived!(
         YouTube,
     }
 
-    /// Public denormalized copy of a linked streaming channel; neve
+    /// Public denormalized copy of a linked streaming channel; never
     /// carries tokens
     pub struct UserConnection {
         pub platform: ConnectionPlatform,
@@ -131,7 +131,7 @@ auto_derived!(
         BlockedOther,
     }
 
-    /// Relationship entry indicating current status with other use
+    /// Relationship entry indicating current status with other user
     pub struct Relationship {
         #[serde(rename = "_id")]
         pub id: String,
@@ -251,7 +251,7 @@ impl Default for User {
 
 #[allow(clippy::disallowed_methods)]
 impl User {
-    /// Create a new use
+    /// Create a new user
     pub async fn create<I, D>(
         db: &Database,
         username: String,
@@ -281,7 +281,7 @@ impl User {
         Ok(user)
     }
 
-    /// Get limits for this use
+    /// Get limits for this user
     pub async fn limits(&self) -> FeaturesLimits {
         let config = config().await;
         if ulid::Ulid::from_str(&self.id)
@@ -291,13 +291,13 @@ impl User {
             .expect("time went backwards")
             <= Duration::from_secs(3600u64 * config.features.limits.global.new_user_hours as u64)
         {
-            config.features.limits.new_use
+            config.features.limits.new_user
         } else {
             config.features.limits.default
         }
     }
 
-    /// Get the relationship with another use
+    /// Get the relationship with another user
     pub fn relationship_with(&self, user_b: &str) -> RelationshipStatus {
         if self.id == user_b {
             return RelationshipStatus::User;
@@ -315,7 +315,7 @@ impl User {
     pub fn is_friends_with(&self, user_b: &str) -> bool {
         matches!(
             self.relationship_with(user_b),
-            RelationshipStatus::Friend | RelationshipStatus::Use
+            RelationshipStatus::Friend | RelationshipStatus::User
         )
     }
 
@@ -333,7 +333,7 @@ impl User {
                 .is_empty())
     }
 
-    /// Check if this user can acquire another serve
+    /// Check if this user can acquire another server
     pub async fn can_acquire_server(&self, db: &Database) -> Result<()> {
         // Called BEFORE the join/create: a user already AT the limit must be
         // rejected (`<=` allowed limit+1 servers).
@@ -436,7 +436,7 @@ impl User {
         }
     }
 
-    /// Helper function to fetch many users as a mutually connected use
+    /// Helper function to fetch many users as a mutually connected user
     /// (while optimising the online ID query)
     pub async fn fetch_many_ids_as_mutuals(
         db: &Database,
@@ -542,7 +542,7 @@ impl User {
         }
     }
 
-    /// Set a relationship to another use
+    /// Set a relationship to another user
     pub async fn set_relationship(
         &mut self,
         db: &Database,
@@ -677,7 +677,7 @@ impl User {
         }
     }
 
-    /// Block another use
+    /// Block another user
     pub async fn block_user(&mut self, db: &Database, target: &mut User) -> Result<()> {
         match self.relationship_with(&target.id) {
             RelationshipStatus::User | RelationshipStatus::Blocked => Err(create_error!(NoEffect)),
@@ -705,7 +705,7 @@ impl User {
         }
     }
 
-    /// Unblock another use
+    /// Unblock another user
     pub async fn unblock_user(&mut self, db: &Database, target: &mut User) -> Result<()> {
         match self.relationship_with(&target.id) {
             RelationshipStatus::Blocked => match target.relationship_with(&self.id) {
@@ -796,7 +796,7 @@ impl User {
         }
     }
 
-    /// Suspend the use
+    /// Suspend the user
     ///
     /// - If a duration is specified, the user will be automatically unsuspended after the given time.
     /// - If a reason is specified, an email will be sent.
@@ -853,7 +853,7 @@ impl User {
         Ok(())
     }
 
-    /// Unsuspend the use
+    /// Unsuspend the user
     pub async fn unsuspend(&mut self, db: &Database) -> Result<()> {
         // Re-enable the account so the user can log in again
         let mut account = db.fetch_account(&self.id).await?;
@@ -872,7 +872,7 @@ impl User {
         .await
     }
 
-    /// Permanently ban the use
+    /// Permanently ban the user
     ///
     /// - If a reason is specified, an email will be sent.
     pub async fn ban(&mut self, _db: &Database, _reason: Option<String>) -> Result<()> {
@@ -918,7 +918,7 @@ impl User {
         badges
     }
 
-    /// Removes all relationships which include the use
+    /// Removes all relationships which include the user
     pub async fn clear_relationships(&self, db: &Database) -> Result<()> {
         let user_ids = self
             .relations

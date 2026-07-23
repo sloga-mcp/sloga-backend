@@ -53,7 +53,7 @@ Before contributing, read the crate layout above and the setup steps below.
 Before getting started, you'll want to install:
 
 - mise
-- Docke
+- Docker
 - Git
 - mold (optional, faster compilation)
 
