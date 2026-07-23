@@ -10,6 +10,8 @@
   [![License](https://img.shields.io/github/license/stoatchat/stoatchat?style=flat-square&logoColor=white)](https://github.com/stoatchat/stoatchat/blob/main/LICENSE)
 </h1>
 The services and libraries that power the Acutest service.<br/>
+Deployed as <b><a href="https://sloga.gg">Sloga</a></b> — game chat for guilds and clans, with opt-in end-to-end encrypted DMs and calls.<br/>
+Downloads and details: <a href="https://sloga.gg">sloga.gg</a><br/>
 <br/>
 
 > **Acutest is a fork of [Stoat](https://github.com/stoatchat/stoatchat)** (itself a fork of
@@ -50,7 +52,7 @@ Before contributing, make yourself familiar with [our contribution guidelines](h
 Before getting started, you'll want to install:
 
 - mise
-- Docker
+- Docke
 - Git
 - mold (optional, faster compilation)
 
