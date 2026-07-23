@@ -19,14 +19,14 @@ use serde_json::json;
 use ulid::Ulid;
 
 auto_derived_partial!(
-    /// # User
+    /// # Use
     pub struct User {
         /// Unique Id
         #[serde(rename = "_id")]
         pub id: String,
         /// Username
         pub username: String,
-        /// Discriminator
+        /// Discriminato
         pub discriminator: String,
         /// Display name
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -106,7 +106,7 @@ auto_derived!(
         YouTube,
     }
 
-    /// Public denormalized copy of a linked streaming channel; never
+    /// Public denormalized copy of a linked streaming channel; neve
     /// carries tokens
     pub struct UserConnection {
         pub platform: ConnectionPlatform,
@@ -131,7 +131,7 @@ auto_derived!(
         BlockedOther,
     }
 
-    /// Relationship entry indicating current status with other user
+    /// Relationship entry indicating current status with other use
     pub struct Relationship {
         #[serde(rename = "_id")]
         pub id: String,
@@ -251,7 +251,7 @@ impl Default for User {
 
 #[allow(clippy::disallowed_methods)]
 impl User {
-    /// Create a new user
+    /// Create a new use
     pub async fn create<I, D>(
         db: &Database,
         username: String,
@@ -281,7 +281,7 @@ impl User {
         Ok(user)
     }
 
-    /// Get limits for this user
+    /// Get limits for this use
     pub async fn limits(&self) -> FeaturesLimits {
         let config = config().await;
         if ulid::Ulid::from_str(&self.id)
@@ -291,13 +291,13 @@ impl User {
             .expect("time went backwards")
             <= Duration::from_secs(3600u64 * config.features.limits.global.new_user_hours as u64)
         {
-            config.features.limits.new_user
+            config.features.limits.new_use
         } else {
             config.features.limits.default
         }
     }
 
-    /// Get the relationship with another user
+    /// Get the relationship with another use
     pub fn relationship_with(&self, user_b: &str) -> RelationshipStatus {
         if self.id == user_b {
             return RelationshipStatus::User;
@@ -315,7 +315,7 @@ impl User {
     pub fn is_friends_with(&self, user_b: &str) -> bool {
         matches!(
             self.relationship_with(user_b),
-            RelationshipStatus::Friend | RelationshipStatus::User
+            RelationshipStatus::Friend | RelationshipStatus::Use
         )
     }
 
@@ -333,7 +333,7 @@ impl User {
                 .is_empty())
     }
 
-    /// Check if this user can acquire another server
+    /// Check if this user can acquire another serve
     pub async fn can_acquire_server(&self, db: &Database) -> Result<()> {
         // Called BEFORE the join/create: a user already AT the limit must be
         // rejected (`<=` allowed limit+1 servers).
@@ -352,7 +352,30 @@ impl User {
     fn validate_username(username: &str) -> Result<()> {
         let username_lowercase = username.to_lowercase();
 
-        const BLOCKED_USERNAMES: &[&str] = &["admin", "revolt", "stoat", "acutest"];
+        // Reserved so nobody can impersonate the platform or its staff.
+        //
+        // Matching is EXACT against the lowercased name, so near-misses have to
+        // be listed individually — blocking "admin" does not block
+        // "adminsloga". sanitise_username() runs before this at both call
+        // sites, so homoglyph spellings are normalised before we compare.
+        //
+        // revolt/stoat/acutest are kept: they are the upstream projects and the
+        // original working name, and impersonating those is just as confusing.
+        const BLOCKED_USERNAMES: &[&str] = &[
+            "admin",
+            "administrator",
+            "moderator",
+            "sloga",
+            "slogaadmin",
+            "adminsloga",
+            "slogaadministrator",
+            "administratorsloga",
+            "slogamod",
+            "slogallc",
+            "revolt",
+            "stoat",
+            "acutest",
+        ];
 
         if BLOCKED_USERNAMES.contains(&username_lowercase.as_str())
             || BLOCKED_USERNAME_PATTERNS.is_match(username)
@@ -413,7 +436,7 @@ impl User {
         }
     }
 
-    /// Helper function to fetch many users as a mutually connected user
+    /// Helper function to fetch many users as a mutually connected use
     /// (while optimising the online ID query)
     pub async fn fetch_many_ids_as_mutuals(
         db: &Database,
@@ -519,7 +542,7 @@ impl User {
         }
     }
 
-    /// Set a relationship to another user
+    /// Set a relationship to another use
     pub async fn set_relationship(
         &mut self,
         db: &Database,
@@ -654,7 +677,7 @@ impl User {
         }
     }
 
-    /// Block another user
+    /// Block another use
     pub async fn block_user(&mut self, db: &Database, target: &mut User) -> Result<()> {
         match self.relationship_with(&target.id) {
             RelationshipStatus::User | RelationshipStatus::Blocked => Err(create_error!(NoEffect)),
@@ -682,7 +705,7 @@ impl User {
         }
     }
 
-    /// Unblock another user
+    /// Unblock another use
     pub async fn unblock_user(&mut self, db: &Database, target: &mut User) -> Result<()> {
         match self.relationship_with(&target.id) {
             RelationshipStatus::Blocked => match target.relationship_with(&self.id) {
@@ -773,7 +796,7 @@ impl User {
         }
     }
 
-    /// Suspend the user
+    /// Suspend the use
     ///
     /// - If a duration is specified, the user will be automatically unsuspended after the given time.
     /// - If a reason is specified, an email will be sent.
@@ -830,7 +853,7 @@ impl User {
         Ok(())
     }
 
-    /// Unsuspend the user
+    /// Unsuspend the use
     pub async fn unsuspend(&mut self, db: &Database) -> Result<()> {
         // Re-enable the account so the user can log in again
         let mut account = db.fetch_account(&self.id).await?;
@@ -849,7 +872,7 @@ impl User {
         .await
     }
 
-    /// Permanently ban the user
+    /// Permanently ban the use
     ///
     /// - If a reason is specified, an email will be sent.
     pub async fn ban(&mut self, _db: &Database, _reason: Option<String>) -> Result<()> {
@@ -895,7 +918,7 @@ impl User {
         badges
     }
 
-    /// Removes all relationships which include the user
+    /// Removes all relationships which include the use
     pub async fn clear_relationships(&self, db: &Database) -> Result<()> {
         let user_ids = self
             .relations
@@ -992,17 +1015,36 @@ mod tests {
 
     #[test]
     fn username_validation_blocked_names() {
-        let username_admin = "Admin";
-        let username_revolt = "Revolt";
-        let username_stoat = "Stoat";
-        let username_acutest = "Acutest";
-        let username_allowed = "Allowed";
+        // Mixed case on purpose: matching is done on the lowercased name.
+        for blocked in [
+            "Admin",
+            "Administrator",
+            "Moderator",
+            "Sloga",
+            "SlogaAdmin",
+            "adminsloga",
+            "slogaadministrator",
+            "AdministratorSloga",
+            "slogamod",
+            "SlogaLLC",
+            "Revolt",
+            "Stoat",
+            "Acutest",
+        ] {
+            assert!(
+                User::validate_username(blocked).is_err(),
+                "expected {blocked:?} to be reserved"
+            );
+        }
 
-        assert!(User::validate_username(username_admin).is_err());
-        assert!(User::validate_username(username_revolt).is_err());
-        assert!(User::validate_username(username_stoat).is_err());
-        assert!(User::validate_username(username_acutest).is_err());
-        assert!(User::validate_username(username_allowed).is_ok());
+        // Names that merely contain a reserved word are still allowed; the
+        // match is exact, and over-blocking would catch innocent usernames.
+        for allowed in ["Allowed", "Slogan", "SlogaFan", "modest"] {
+            assert!(
+                User::validate_username(allowed).is_ok(),
+                "expected {allowed:?} to be allowed"
+            );
+        }
     }
 
     #[test]
