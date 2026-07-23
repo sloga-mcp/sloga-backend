@@ -223,6 +223,6 @@ TEST_DB=MONGODB cargo nextest run
 
 ## License
 
-The Acutest backend is generally licensed under the [GNU Affero General Public License v3.0](https://github.com/sloga-mcp/sloga-backend/blob/main/LICENSE).
+The Sloga backend is generally licensed under the [GNU Affero General Public License v3.0](https://github.com/sloga-mcp/sloga-backend/blob/main/LICENSE).
 
 **Individual crates may supply their own licenses!**

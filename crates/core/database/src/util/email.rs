@@ -103,19 +103,19 @@ pub async fn email_templates() -> Templates {
     } else if config.production {
         Templates {
             verify: Template {
-                title: "Verify your Acutest account.".into(),
+                title: "Verify your Sloga account.".into(),
                 text: include_str!("../../templates/verify.txt").into(),
                 url: format!("{}/login/verify/", config.hosts.app),
                 html: Some(include_str!("../../templates/verify.html").into()),
             },
             reset: Template {
-                title: "Reset your Acutest password.".into(),
+                title: "Reset your Sloga password.".into(),
                 text: include_str!("../../templates/reset.txt").into(),
                 url: format!("{}/login/reset/", config.hosts.app),
                 html: Some(include_str!("../../templates/reset.html").into()),
             },
             reset_existing: Template {
-                title: "You already have a Acutest account, reset your password.".into(),
+                title: "You already have a Sloga account, reset your password.".into(),
                 text: include_str!("../../templates/reset-existing.txt").into(),
                 url: format!("{}/login/reset/", config.hosts.app),
                 html: Some(include_str!("../../templates/reset-existing.html").into()),

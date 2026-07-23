@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-#MISE description="Build the Acutest Developers website"
+#MISE description="Build the Sloga Developers website"
 #MISE depends=["docs:install"]
 #MISE dir="{{config_root}}/docs"
 set -e

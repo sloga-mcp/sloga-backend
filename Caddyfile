@@ -1,4 +1,4 @@
-# Acutest reverse proxy
+# Sloga reverse proxy
 # Upstreams use 127.0.0.1 (caddy + all backends share one WSL netns). Do NOT hardcode the
 # WSL eth0 IP here — it changes with WSL networking mode (was 127.0.0.1 under NAT; the
 # switch to mirrored mode on 2026-07-08 made that IP unreachable → every route 502'd).

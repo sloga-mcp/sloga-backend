@@ -1,5 +1,5 @@
 name: Bug Report
-description: Report a bug in Acutest — please fill out every required field to help us triage quickly.
+description: Report a bug in Sloga — please fill out every required field to help us triage quickly.
 title: "[Bug]: "
 labels:
   - bug
@@ -10,7 +10,7 @@ body:
   - type: markdown
     attributes:
       value: |
-        **Thank you for taking the time to report a bug for Acutest!**
+        **Thank you for taking the time to report a bug for Sloga!**
 
         Please follow the instructions below and provide as much detail as possible to help us understand and reproduce the issue.
 
@@ -21,7 +21,7 @@ body:
       label: Pre-flight checklist
       description: Please confirm all of the following before submitting.
       options:
-        - label: I am on the latest available version of Acutest.
+        - label: I am on the latest available version of Sloga.
           required: true
         - label: I searched existing issues and did not find a duplicate.
           required: true
@@ -49,7 +49,7 @@ body:
         Provide a numbered list of every step needed to trigger the bug.
         The clearer this is, the faster we can fix it.
       placeholder: |
-        1. Log in to Acutest on the web client.
+        1. Log in to Sloga on the web client.
         2. Open a direct message conversation.
         3. Ask the other person to send a message.
         4. Observe that the message does not appear without reloading.
@@ -71,10 +71,10 @@ body:
     id: platform
     attributes:
       label: Client / platform
-      description: Which Acutest client are you using?
+      description: Which Sloga client are you using?
       options:
         - Web (browser)
-        - Acutest for Desktop
+        - Sloga for Desktop
         - Android
         - iOS
         - Self-hosted server
@@ -89,7 +89,7 @@ body:
       description: >
         Find this in **Settings**. For the web client, include the build
         number shown in the footer or About page.
-      placeholder: "e.g. Acutest for Desktop 1.3.0 or 0.2.1 (2025-10-10)"
+      placeholder: "e.g. Sloga for Desktop 1.3.0 or 0.2.1 (2025-10-10)"
     validations:
       required: true
 
@@ -99,7 +99,7 @@ body:
     attributes:
       label: OS / browser details
       description: Your operating system and, for web bugs, your browser and its version.
-      placeholder: "e.g. Windows 11, Chrome 121  or  macOS 14.3, Acutest for Desktop 1.3.0  or  Android 14"
+      placeholder: "e.g. Windows 11, Chrome 121  or  macOS 14.3, Sloga for Desktop 1.3.0  or  Android 14"
     validations:
       required: true
 
