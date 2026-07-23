@@ -93,5 +93,50 @@ http://sloga.gg {
     # reaches existing installs. Do not remove while any deb client is in the
     # wild. (Quote the target: a bare # starts a Caddyfile comment.)
     redir /download "/#downloads" 302
+
+    # ---- Download counting -------------------------------------------------
+    # /dl/* are the STABLE public download links. index.html's buttons point
+    # here instead of at the version-pinned /updates/ CDN paths, so a release
+    # only has to change the four targets below — not the site HTML.
+    #
+    # Every /dl/* hit is logged to /var/log/caddy-downloads.log so totals can be
+    # counted server-side (no JS, so ad blockers cannot suppress it). log_skip
+    # keeps ordinary page requests OUT of the log — only /dl/* is recorded.
+    #
+    # The log is deliberately IP-FREE: the filter drops the entire header map
+    # (CF-Connecting-IP and friends live there) plus remote_ip/client_ip,
+    # because the published privacy policy claims Sloga keeps no IP logs.
+    # Do NOT remove those delete lines or re-add headers without rewording the
+    # policy first — that claim is load-bearing.
+    #
+    # Auto-updaters fetch /updates/* DIRECTLY and never pass through /dl/*, so
+    # these counts are human downloads, not update churn.
+    @dl path /dl/*
+    @notdl not path /dl/*
+    log_skip @notdl
+    log {
+        output file /var/log/caddy-downloads.log {
+            mode 644
+            roll_size 10mb
+            roll_keep 20
+        }
+        format filter {
+            wrap json
+            fields {
+                request>headers delete
+                request>remote_ip delete
+                request>remote_port delete
+                request>client_ip delete
+                request>tls delete
+                resp_headers delete
+            }
+        }
+    }
+    header @dl Cache-Control "no-store"
+    redir /dl/windows       "https://app.sloga.gg/updates/desktop/Sloga_0.9.0_x64-setup.exe" 302
+    redir /dl/linux-deb     "https://app.sloga.gg/updates/desktop-linux/Sloga-0.2.0-linux-amd64.deb" 302
+    redir /dl/linux-appimage "https://app.sloga.gg/updates/desktop-linux/Sloga-0.2.0-linux-x86_64.AppImage" 302
+    redir /dl/android       "https://app.sloga.gg/updates/android/sloga-1.8.0.apk" 302
+
     file_server
 }
