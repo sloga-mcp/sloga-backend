@@ -87,5 +87,11 @@
 # Marketing site — sloga.gg apex (host-matched; app.sloga.gg + localhost still hit the :80 block above)
 http://sloga.gg {
     root * /home/mcp/sloga-website
+    # The Linux .deb updater's "Open download page" button opens /download.
+    # That URL is COMPILED INTO already-installed 0.1.0+ clients, so shipping a
+    # corrected constant cannot fix them — this redirect is the only thing that
+    # reaches existing installs. Do not remove while any deb client is in the
+    # wild. (Quote the target: a bare # starts a Caddyfile comment.)
+    redir /download "/#downloads" 302
     file_server
 }
