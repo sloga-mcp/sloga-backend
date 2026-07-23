@@ -1,23 +1,24 @@
 <div align="center">
 <h1>
-  Acutest Backend
+  Sloga Backend
   
-  [![Stars](https://img.shields.io/github/stars/stoatchat/stoatchat?style=flat-square&logoColor=white)](https://github.com/stoatchat/stoatchat/stargazers)
-  [![Forks](https://img.shields.io/github/forks/stoatchat/stoatchat?style=flat-square&logoColor=white)](https://github.com/stoatchat/stoatchat/network/members)
-  [![Pull Requests](https://img.shields.io/github/issues-pr/stoatchat/stoatchat?style=flat-square&logoColor=white)](https://github.com/stoatchat/stoatchat/pulls)
-  [![Issues](https://img.shields.io/github/issues/stoatchat/stoatchat?style=flat-square&logoColor=white)](https://github.com/stoatchat/stoatchat/issues)
-  [![Contributors](https://img.shields.io/github/contributors/stoatchat/stoatchat?style=flat-square&logoColor=white)](https://github.com/stoatchat/stoatchat/graphs/contributors)
-  [![License](https://img.shields.io/github/license/stoatchat/stoatchat?style=flat-square&logoColor=white)](https://github.com/stoatchat/stoatchat/blob/main/LICENSE)
+  [![Stars](https://img.shields.io/github/stars/sloga-mcp/sloga-backend?style=flat-square&logoColor=white)](https://github.com/sloga-mcp/sloga-backend/stargazers)
+  [![Forks](https://img.shields.io/github/forks/sloga-mcp/sloga-backend?style=flat-square&logoColor=white)](https://github.com/sloga-mcp/sloga-backend/network/members)
+  [![Pull Requests](https://img.shields.io/github/issues-pr/sloga-mcp/sloga-backend?style=flat-square&logoColor=white)](https://github.com/sloga-mcp/sloga-backend/pulls)
+  [![Issues](https://img.shields.io/github/issues/sloga-mcp/sloga-backend?style=flat-square&logoColor=white)](https://github.com/sloga-mcp/sloga-backend/issues)
+  [![Contributors](https://img.shields.io/github/contributors/sloga-mcp/sloga-backend?style=flat-square&logoColor=white)](https://github.com/sloga-mcp/sloga-backend/graphs/contributors)
+  [![License](https://img.shields.io/github/license/sloga-mcp/sloga-backend?style=flat-square&logoColor=white)](https://github.com/sloga-mcp/sloga-backend/blob/main/LICENSE)
 </h1>
-The services and libraries that power the Acutest service.<br/>
+The services and libraries that power <b><a href="https://app.sloga.gg">Sloga</a></b> — game chat for guilds and clans, with opt-in end-to-end encrypted DMs and calls.<br/>
 Deployed as <b><a href="https://sloga.gg">Sloga</a></b> — game chat for guilds and clans, with opt-in end-to-end encrypted DMs and calls.<br/>
 Downloads and details: <a href="https://sloga.gg">sloga.gg</a><br/>
 <br/>
 
-> **Acutest is a fork of [Stoat](https://github.com/stoatchat/stoatchat)** (itself a fork of
-> Revolt), rebranded as Acutest. It remains licensed under the GNU Affero General Public
-> License v3.0. Internal crates retain their upstream `revolt-*` names; only the product
-> branding has changed. The status badges above still point at the upstream repository.
+> **Sloga is a fork of [Stoat](https://github.com/stoatchat/stoatchat)** (itself a fork of
+> Revolt). It remains licensed under the GNU Affero General Public License v3.0.
+> Internal crate names, the `Revolt.toml` config files and the database name keep thei
+> upstream spelling on purpose — renaming them breaks running deployments. Only the
+> product branding is Sloga.
 <br/>
 
 | Crate              | Path                                               | Description                         |                                                                                                                                                                                                                                                                                                           |
@@ -47,7 +48,7 @@ Rust 1.86.0 or higher.
 
 ## Development Guide
 
-Before contributing, make yourself familiar with [our contribution guidelines](https://developers.stoat.chat/developing/contrib/) and the [technical documentation for this project](https://developers.stoat.chat/).
+Before contributing, read the crate layout above and the setup steps below.
 
 Before getting started, you'll want to install:
 
@@ -67,7 +68,7 @@ As a heads-up, the development environment uses the following ports:
 | Redis                     |      6379      |
 | MinIO                     |     14009      |
 | Maildev                   | 14025<br>14080 |
-| Revolt Web App            |     14701      |
+| Sloga Web App             |     14701      |
 | RabbitMQ                  | 5672<br>15672  |
 | `crates/delta`            |     14702      |
 | `crates/bonfire`          |     14703      |
@@ -78,8 +79,8 @@ As a heads-up, the development environment uses the following ports:
 Now you can clone and build the project:
 
 ```bash
-git clone https://github.com/stoatchat/stoatchat stoat-backend
-cd stoat-backend
+git clone https://github.com/sloga-mcp/sloga-backend sloga-backend
+cd sloga-backend
 mise install
 mise build
 ```
@@ -165,9 +166,9 @@ You can start a web client by doing the following in another terminal:
 corepack enable
 
 # clone the web client and run it:
-git clone --recursive https://github.com/stoatchat/for-web stoat-web
-cd stoat-web
-# refer to stoat-web/README.md for startup, creating an account and loging in
+git clone --recursive https://github.com/sloga-mcp/sloga-frontend sloga-web
+cd sloga-web
+# refer to sloga-web/README.md for startup, creating an account and logging in
 ```
 
 When signing up, go to http://localhost:14080 to find confirmation/password reset emails.
@@ -203,7 +204,7 @@ Tag and push a new release by running:
 just release
 ```
 
-If you have bumped the crate versions, proceed to [GitHub releases](https://github.com/stoatchat/stoatchat/releases/new) to create a changelog.
+If you have bumped the crate versions, proceed to [GitHub releases](https://github.com/sloga-mcp/sloga-backend/releases/new) to create a changelog.
 
 ## Testing
 
@@ -222,6 +223,6 @@ TEST_DB=MONGODB cargo nextest run
 
 ## License
 
-The Acutest backend is generally licensed under the [GNU Affero General Public License v3.0](https://github.com/stoatchat/stoatchat/blob/main/LICENSE).
+The Acutest backend is generally licensed under the [GNU Affero General Public License v3.0](https://github.com/sloga-mcp/sloga-backend/blob/main/LICENSE).
 
 **Individual crates may supply their own licenses!**
