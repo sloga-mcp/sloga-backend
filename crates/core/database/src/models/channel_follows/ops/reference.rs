@@ -10,12 +10,15 @@ impl AbstractChannelFollows for ReferenceDb {
     async fn insert_channel_follow(&self, follow: &ChannelFollow) -> Result<()> {
         let mut rows = self.channel_follows.lock().await;
         // Parity with the Mongo unique {source_channel, target_channel} index:
-        // reject a duplicate pair (not just a duplicate id).
+        // reject a duplicate pair (not just a duplicate id), with the same
+        // `NoEffect` domain error the duplicate-key rejection maps to there.
+        // Single Mutex = check and insert are atomic, so this is a real
+        // guard and not the caller's TOCTOU probe repeated.
         if rows.values().any(|row| {
             row.source_channel == follow.source_channel
                 && row.target_channel == follow.target_channel
         }) {
-            return Err(create_database_error!("insert", "channel_follows"));
+            return Err(create_error!(NoEffect));
         }
         if rows.insert(follow.id.to_string(), follow.clone()).is_some() {
             Err(create_database_error!("insert", "channel_follows"))

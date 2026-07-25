@@ -9,6 +9,14 @@ mod reference;
 #[async_trait]
 pub trait AbstractChannelFollows: Sync + Send {
     /// Insert a new channel follow.
+    ///
+    /// ENFORCES (source_channel, target_channel) uniqueness: a pair that is
+    /// already followed fails with `NoEffect` on BOTH drivers (Mongo's unique
+    /// `source_target` index; an explicit guard under the reference driver's
+    /// map mutex). delta's `fetch_follow_by_source_and_target` probe is a
+    /// friendly idempotent early return, NOT the guard — two concurrent
+    /// requests both pass it, and only this insert stops the second one from
+    /// minting a duplicate follow and a second fan-out webhook.
     async fn insert_channel_follow(&self, follow: &ChannelFollow) -> Result<()>;
 
     /// Fetch a follow by its id.
@@ -51,6 +59,7 @@ pub trait AbstractChannelFollows: Sync + Send {
 mod tests {
     use super::AbstractChannelFollows;
     use crate::ChannelFollow;
+    use revolt_result::ErrorType;
 
     fn follow(id: &str, source: &str, target: &str, webhook: &str) -> ChannelFollow {
         ChannelFollow {
@@ -68,6 +77,10 @@ mod tests {
     #[tokio::test]
     async fn crud_and_lookups() {
         database_test!(|db| async move {
+            // Mongo's (source, target) uniqueness is an index; `database_test!`
+            // hands us an un-migrated database, so install it here.
+            create_source_target_index(&db).await;
+
             let a = follow(
                 "01FOLLOWA000000000000000001",
                 "01SOURCE0000000000000000001",
@@ -152,12 +165,23 @@ mod tests {
             );
 
             // Duplicate (source, target) pair is rejected on both drivers
-            // (Mongo unique index; reference explicit guard).
+            // (Mongo unique index; reference explicit guard) as the same
+            // domain error, so the follow route can branch on it instead of
+            // reading a raw driver failure.
             let dup = ChannelFollow {
                 id: "01FOLLOWDUP00000000000000001".to_string(),
                 ..b.clone()
             };
-            assert!(db.insert_channel_follow(&dup).await.is_err());
+            let error = db
+                .insert_channel_follow(&dup)
+                .await
+                .expect_err("a duplicate (source, target) pair must be rejected");
+            assert!(
+                matches!(error.error_type, ErrorType::NoEffect),
+                "expected NoEffect, got {:?}",
+                error.error_type
+            );
+            assert!(db.fetch_follow(&dup.id).await.is_err());
         });
     }
 
@@ -199,5 +223,40 @@ mod tests {
                 .unwrap()
                 .is_empty());
         });
+    }
+
+    /// Install the unique `source_target` index that makes one follow per
+    /// (source, target) pair on MongoDB.
+    ///
+    /// `database_test!` connects to a fresh database with no migrations run,
+    /// so without this the Mongo driver would silently accept a duplicate
+    /// follow and the uniqueness contract would go untested. This spec MUST
+    /// stay identical to the one in `admin_migrations/ops/mongodb/scripts.rs`
+    /// (revision 60) and `init.rs`. The reference driver enforces the same
+    /// rule in code, so it needs no setup.
+    async fn create_source_target_index(db: &crate::Database) {
+        match db {
+            crate::Database::Reference(_) => {}
+            #[cfg(feature = "mongodb")]
+            crate::Database::MongoDb(mongo) => {
+                mongo
+                    .db()
+                    .run_command(bson::doc! {
+                        "createIndexes": "channel_follows",
+                        "indexes": [
+                            {
+                                "key": {
+                                    "source_channel": 1_i32,
+                                    "target_channel": 1_i32
+                                },
+                                "name": "source_target",
+                                "unique": true
+                            }
+                        ]
+                    })
+                    .await
+                    .expect("failed to create source_target index");
+            }
+        }
     }
 }

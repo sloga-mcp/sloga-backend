@@ -10,8 +10,28 @@ static COL: &str = "channel_follows";
 
 #[async_trait]
 impl AbstractChannelFollows for MongoDb {
+    /// Insert a new channel follow, enforcing (source, target) uniqueness.
     async fn insert_channel_follow(&self, follow: &ChannelFollow) -> Result<()> {
-        query!(self, insert_one, COL, &follow).map(|_| ())
+        // The unique `source_target` index is what actually serializes
+        // concurrent follow requests — delta's fetch-then-insert probe is a
+        // TOCTOU and two simultaneous follows of the same source from the
+        // same target both pass it. A duplicate-key rejection here is that
+        // race resolving, not a database fault, so it becomes `NoEffect`:
+        // the follow already exists, so this insert changed nothing.
+        //
+        // The only unique indexes on this collection are `_id` (a fresh ULID
+        // per follow, so it never collides in practice) and `source_target`,
+        // which makes 11000 unambiguous.
+        self.col::<ChannelFollow>(COL)
+            .insert_one(follow)
+            .await
+            .map(|_| ())
+            .map_err(|error| match *error.kind {
+                mongodb::error::ErrorKind::Write(mongodb::error::WriteFailure::WriteError(
+                    ref write_error,
+                )) if write_error.code == 11000 => create_error!(NoEffect),
+                _ => create_database_error!("insert_one", COL),
+            })
     }
 
     async fn fetch_follow(&self, id: &str) -> Result<ChannelFollow> {
