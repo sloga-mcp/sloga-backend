@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use futures::StreamExt;
 use rand::Rng;
@@ -315,38 +315,85 @@ impl TestHarness {
         }
     }
 
+    /// Read the mail delta just sent to `mailbox` out of maildev, and pull the
+    /// `[[CODE]]` token out of its body.
+    ///
+    /// Requires `[api.smtp]` to point at the maildev container from
+    /// `compose.yml` (host `localhost`, port 14025, no TLS, user/pass
+    /// `smtp`/`smtp` — maildev runs with `MAILDEV_INCOMING_USER`/`_PASS` set,
+    /// so an unauthenticated transport is rejected at SMTP time).
+    ///
+    /// LANDMINE: maildev 3.x moved the REST API under `/api`
+    /// (`GET /api/email`, `DELETE /api/email/:id`). maildev 1.x/2.x served
+    /// bare `/email` and `/delete/:id`, which is what this used to call —
+    /// `compose.yml` pins the floating `maildev/maildev` tag, so the image
+    /// silently rolled forward and every path started 404ing. The mail was
+    /// being delivered fine the whole time; only these two URLs were wrong.
+    /// If this starts failing again, curl `http://localhost:14080/api/healthz`
+    /// and re-check the route table before suspecting the send path.
     pub async fn assert_email(&self, mailbox: &str) -> (Mail, String) {
-        // Wait a moment for maildev to catch the email
-
-        tokio::time::sleep(Duration::from_secs(1)).await;
+        const MAILDEV_API: &str = "http://localhost:14080/api";
 
         let client = reqwest::Client::new();
-        let results = client
-            .get("http://localhost:14080/email")
-            .send()
-            .await
-            .unwrap()
-            .json::<Vec<Mail>>()
-            .await
-            .unwrap();
-
         let re = regex::Regex::new(r"\[\[([A-Za-z0-9_-]*)\]\]").unwrap();
 
-        for entry in results.into_iter().rev() {
-            if entry.envelope.to[0].address == mailbox {
-                client
-                    .delete(format!("http://localhost:14080/delete/{}", &entry.id))
-                    .send()
-                    .await
-                    .unwrap();
+        // Poll instead of sleeping a flat second. Delivery is normally well
+        // under 100ms, but the send is a *blocking* lettre call and the suite
+        // runs many test processes at once, so a fixed wait is a coin flip on
+        // a loaded machine.
+        let deadline = Instant::now() + Duration::from_secs(15);
 
-                let code = re.captures_iter(&entry.text).next().unwrap()[1].to_string();
+        loop {
+            let results = client
+                .get(format!("{MAILDEV_API}/email"))
+                .send()
+                .await
+                .expect("maildev unreachable on :14080 — is `stoatchat-maildev-1` running?")
+                .json::<Vec<Mail>>()
+                .await
+                .expect("maildev did not return `Vec<Mail>` — did the API shape change?");
+
+            // Every mail addressed to this mailbox, newest first. Mailboxes are
+            // unique per test, so anything else sitting here is a leftover from
+            // an earlier run — maildev persists mail across runs, and until the
+            // URLs above were fixed nothing was ever deleted. Take the newest
+            // and delete the whole set so the next run starts clean.
+            let mut matches = results
+                .into_iter()
+                .filter(|entry| entry.envelope.to.iter().any(|to| to.address == mailbox))
+                .collect::<Vec<_>>();
+
+            matches.sort_by(|a, b| b.time.cmp(&a.time));
+
+            if !matches.is_empty() {
+                for entry in &matches {
+                    client
+                        .delete(format!("{MAILDEV_API}/email/{}", &entry.id))
+                        .send()
+                        .await
+                        .unwrap();
+                }
+
+                let entry = matches.swap_remove(0);
+                let code = re
+                    .captures_iter(&entry.text)
+                    .next()
+                    .unwrap_or_else(|| {
+                        panic!("no `[[CODE]]` token in mail to {mailbox}: {:?}", entry.text)
+                    })[1]
+                    .to_string();
 
                 return (entry, code);
             }
-        }
 
-        panic!("Email not found.")
+            assert!(
+                Instant::now() < deadline,
+                "no email delivered to {} within 15s",
+                mailbox
+            );
+
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
     }
 
     pub async fn wait_for_message(&mut self, channel_id: &str) -> v0::Message {
@@ -368,6 +415,8 @@ impl TestHarness {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Mail {
     pub id: String,
+    /// RFC 3339, always UTC — compared lexicographically to order mail.
+    pub time: String,
     pub envelope: MailEnvelope,
     pub subject: String,
     pub text: String,

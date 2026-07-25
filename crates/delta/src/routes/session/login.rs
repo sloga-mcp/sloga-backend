@@ -191,7 +191,7 @@ mod tests {
     async fn success() {
         let mut harness = TestHarness::new().await;
 
-        Account::new(
+        let account = Account::new(
             &harness.db,
             "example@validemail.com".into(),
             "password_insecure".into(),
@@ -200,7 +200,18 @@ mod tests {
         .await
         .unwrap();
 
-        harness.wait_for_event("global", |_| true).await;
+        // Both waits below MUST match on this account. The harness
+        // psubscribes `*` against a SHARED redis, so `global` also carries
+        // events published by every other test process nextest is running in
+        // parallel — with a `|_| true` predicate this wait swallowed a
+        // neighbouring test's account/session event, leaving our own
+        // CreateAccount queued, and the CreateSession assertion at the bottom
+        // then popped that stale CreateAccount and failed.
+        harness
+            .wait_for_event("global", |event| {
+                matches!(event, EventV1::CreateAccount { account: created } if created.id == account.id)
+            })
+            .await;
 
         let res = harness.client
             .post("/auth/session/login")
@@ -218,7 +229,12 @@ mod tests {
         assert_eq!(res.status(), Status::Ok);
         assert!(res.into_json::<v0::Session>().await.is_some());
 
-        let event = harness.wait_for_event("global", |_| true).await;
+        let event = harness
+            .wait_for_event("global", |event| {
+                matches!(event, EventV1::CreateSession { session } if session.user_id == account.id)
+            })
+            .await;
+
         if !matches!(event, EventV1::CreateSession { .. }) {
             panic!("Received incorrect event type. {:?}", event);
         }

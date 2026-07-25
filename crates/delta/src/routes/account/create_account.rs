@@ -102,7 +102,13 @@ mod tests {
         drop(res);
 
         harness
-            .wait_for_event("global", |e| matches!(e, EventV1::CreateAccount { .. }))
+            // Match on the address, not just the variant: `global` on the
+            // shared redis also carries CreateAccount from every other test
+            // process, so a bare variant check can pass on someone else's
+            // event. See the note in routes::session::login::tests::success.
+            .wait_for_event("global", |e| {
+                matches!(e, EventV1::CreateAccount { account } if account.email == "success@validemail.com")
+            })
             .await;
     }
 
