@@ -7,6 +7,7 @@ mod channel_invites;
 mod channel_unreads;
 mod channel_webhooks;
 mod channels;
+mod discord_import_jobs;
 mod e2ee;
 mod emojis;
 mod file_hashes;
@@ -44,6 +45,7 @@ pub use channel_invites::*;
 pub use channel_unreads::*;
 pub use channel_webhooks::*;
 pub use channels::*;
+pub use discord_import_jobs::*;
 pub use e2ee::*;
 pub use emojis::*;
 pub use file_hashes::*;
@@ -89,6 +91,7 @@ pub trait AbstractDatabase:
     + channel_invites::AbstractChannelInvites
     + channel_unreads::AbstractChannelUnreads
     + channel_webhooks::AbstractWebhooks
+    + discord_import_jobs::AbstractDiscordImportJobs
     + e2ee::AbstractE2EE
     + emojis::AbstractEmojis
     + mls::AbstractMls

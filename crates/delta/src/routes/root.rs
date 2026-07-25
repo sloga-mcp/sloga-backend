@@ -66,6 +66,8 @@ pub struct RevoltFeatures {
     pub oauth_twitch: bool,
     /// Whether YouTube channel linking is enabled
     pub oauth_youtube: bool,
+    /// Whether importing a server from Discord is enabled
+    pub import_discord: bool,
     /// Whether this server is invite only
     pub invite_only: bool,
     /// File server service configuration
@@ -226,6 +228,7 @@ pub async fn root() -> Result<Json<RevoltConfig>> {
             oauth_apple: config.api.oauth.apple.enabled,
             oauth_twitch: config.api.oauth.twitch.enabled,
             oauth_youtube: config.api.oauth.youtube.enabled,
+            import_discord: config.api.import.discord.enabled,
             invite_only: config.api.registration.invite_only,
             autumn: Feature {
                 enabled: !config.hosts.autumn.is_empty(),

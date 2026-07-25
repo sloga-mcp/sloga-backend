@@ -53,6 +53,7 @@ impl<'r> Responder<'r, 'static> for Error {
             ErrorType::Banned => Status::Forbidden,
             ErrorType::AlreadyInServer => Status::Conflict,
             ErrorType::CannotTimeoutYourself => Status::BadRequest,
+            ErrorType::ImportAlreadyInProgress => Status::Conflict,
 
             ErrorType::TooManyServers { .. } => Status::BadRequest,
             ErrorType::TooManyEmbeds { .. } => Status::BadRequest,

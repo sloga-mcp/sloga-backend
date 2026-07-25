@@ -615,6 +615,36 @@ pub enum EventV1 {
         channel: String,
         reason: String,
     },
+
+    /// A Discord import advanced a stage. Published ONLY on the requesting
+    /// user's private topic — an in-progress import is nobody else's
+    /// business, and the half-built server is not yet visible to anyone.
+    /// `stage` is the `ImportStage` variant name.
+    DiscordImportProgress {
+        job_id: String,
+        stage: String,
+        done: u32,
+        total: u32,
+    },
+
+    /// A Discord import finished. Carries the created server and the
+    /// invite minted for it. Requesting user's private topic only; the
+    /// server itself becomes visible through the normal `ServerCreate`
+    /// path, which MUST be emitted before this event.
+    DiscordImportComplete {
+        job_id: String,
+        server_id: String,
+        invite_code: String,
+    },
+
+    /// A Discord import failed permanently (bad template, provider
+    /// unreachable, worker died and the heartbeat sweeper reaped it).
+    /// `error` is a user-safe message, never a raw provider/internal
+    /// error. Requesting user's private topic only.
+    DiscordImportFailed {
+        job_id: String,
+        error: String,
+    },
 }
 
 impl EventV1 {

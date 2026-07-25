@@ -81,6 +81,12 @@ client_id = ""
 client_secret = ""
 redirect_uri = ""
 
+[api.import.discord]
+# Import a Discord community into Sloga.
+# Primary path is a server-template link, which hits a PUBLIC unauthenticated
+# Discord endpoint — no credentials of any kind are required to enable this.
+enabled = false
+
 [api.security]
 # Authifier Shield API key
 authifier_shield_key = ""

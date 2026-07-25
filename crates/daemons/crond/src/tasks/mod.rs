@@ -1,5 +1,6 @@
 pub mod delete_accounts;
 pub mod acks;
+pub mod discord_import;
 pub mod event_reminders;
 pub mod file_deletion;
 pub mod poll_expiry;

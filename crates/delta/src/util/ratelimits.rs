@@ -178,6 +178,11 @@ impl<'a> RatelimitResolver<Request<'a>> for DeltaRatelimits {
                 // headroom above the shared "any" bucket (server-side caching
                 // keeps the upstream provider quota safe regardless).
                 ("gifs", _, _) => ("gifs", None),
+                // Starting an import kicks off a whole server build — keep it
+                // tight. Job polling is only a reconnect fallback (progress
+                // normally arrives over the WebSocket) so it stays modest too.
+                ("import", Some("discord"), Method::Post) => ("import_start", None),
+                ("import", _, _) => ("import", None),
                 _ => ("any", None),
             }
         } else {
@@ -200,6 +205,8 @@ impl<'a> RatelimitResolver<Request<'a>> for DeltaRatelimits {
             "safety" => 15,
             "safety_report" => 3,
             "gifs" => 30,
+            "import_start" => 5,
+            "import" => 30,
             "e2ee_fetch_keys" => 10,
             "e2ee_messages" => 30,
             "e2ee_backup_get" => 3,

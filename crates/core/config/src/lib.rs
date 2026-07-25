@@ -322,6 +322,25 @@ pub struct ApiOauthYoutube {
     pub redirect_uri: String,
 }
 
+/// Import an existing community into Sloga.
+///
+/// The primary path (server templates) hits a PUBLIC, unauthenticated
+/// Discord endpoint (`GET /guilds/templates/{code}`), so it needs no
+/// credentials at all — `enabled` is the whole config. The optional bot
+/// upgrade (emojis/icon/banner) adds client_id/client_secret/bot_token
+/// later; those belong in Revolt.overrides.toml, never here.
+#[derive(Deserialize, Debug, Clone, Default)]
+pub struct ApiImportDiscord {
+    #[serde(default)]
+    pub enabled: bool,
+}
+
+#[derive(Deserialize, Debug, Clone, Default)]
+pub struct ApiImport {
+    #[serde(default)]
+    pub discord: ApiImportDiscord,
+}
+
 #[derive(Deserialize, Debug, Clone, Default)]
 pub struct ApiOauth {
     #[serde(default)]
@@ -397,6 +416,8 @@ pub struct Api {
     pub gifs: ApiGifs,
     #[serde(default)]
     pub apps: ApiApps,
+    #[serde(default)]
+    pub import: ApiImport,
 }
 
 #[derive(Deserialize, Debug, Clone)]

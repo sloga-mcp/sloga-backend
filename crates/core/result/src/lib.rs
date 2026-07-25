@@ -116,6 +116,8 @@ pub enum ErrorType {
     TooManyServers {
         max: usize,
     },
+    /// A server import is already queued or running for this user
+    ImportAlreadyInProgress,
     TooManyEmoji {
         max: usize,
     },

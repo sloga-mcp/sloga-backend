@@ -190,6 +190,10 @@ pub async fn create_database(db: &MongoDb) {
         .await
         .expect("Failed to create server_boosts collection.");
 
+    db.create_collection("discord_import_jobs")
+        .await
+        .expect("Failed to create discord_import_jobs collection.");
+
     db.run_command(doc! {
         "createIndexes": "users",
         "indexes": [
@@ -527,6 +531,45 @@ pub async fn create_database(db: &MongoDb) {
     })
     .await
     .expect("Failed to create server_boosts index.");
+
+    db.run_command(doc! {
+        "createIndexes": "discord_import_jobs",
+        "indexes": [
+            // ENFORCES one active import per user; delta's read-then-insert
+            // check is a TOCTOU on its own. Partial, so only non-terminal
+            // rows are constrained and a user's finished imports never block
+            // a new one. `insert_discord_import_job` maps the resulting
+            // 11000 to ImportAlreadyInProgress.
+            // NB: $in inside partialFilterExpression needs MongoDB 6.0+.
+            {
+                "key": {
+                    "user_id": 1_i32
+                },
+                "name": "active_user_id",
+                "unique": true,
+                "partialFilterExpression": {
+                    "status": { "$in": ["Queued", "Running"] }
+                }
+            },
+            // Serves user-scoped lookups over terminal rows too.
+            {
+                "key": {
+                    "user_id": 1_i32
+                },
+                "name": "user_id"
+            },
+            // Serves the claim worker's Queued pick and the sweeper's
+            // non-terminal + stale-heartbeat scan.
+            {
+                "key": {
+                    "status": 1_i32
+                },
+                "name": "status"
+            }
+        ]
+    })
+    .await
+    .expect("Failed to create discord_import_jobs index.");
 
     db.run_command(doc! {
         "createIndexes": "servers",

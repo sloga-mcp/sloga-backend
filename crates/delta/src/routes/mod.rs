@@ -27,6 +27,7 @@ mod account;
 mod session;
 mod mfa;
 mod oauth;
+mod import;
 
 pub fn mount(config: Settings, mut rocket: Rocket<Build>) -> Rocket<Build> {
     let settings = OpenApiSettings::default();
@@ -49,6 +50,7 @@ pub fn mount(config: Settings, mut rocket: Rocket<Build>) -> Rocket<Build> {
             "/mls" => mls::routes(),
             "/events" => events::routes(),
             "/gifs" => gifs::routes(),
+            "/import" => import::routes(),
             "/auth/account" => account::routes(),
             "/auth/session" => session::routes(),
             "/auth/oauth" => oauth::routes(),
@@ -77,6 +79,7 @@ pub fn mount(config: Settings, mut rocket: Rocket<Build>) -> Rocket<Build> {
             "/mls" => mls::routes(),
             "/events" => events::routes(),
             "/gifs" => gifs::routes(),
+            "/import" => import::routes(),
             "/auth/account" => account::routes(),
             "/auth/session" => session::routes(),
             "/auth/oauth" => oauth::routes(),

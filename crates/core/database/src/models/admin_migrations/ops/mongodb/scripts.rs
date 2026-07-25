@@ -26,7 +26,7 @@ struct MigrationInfo {
     revision: i32,
 }
 
-pub const LATEST_REVISION: i32 = 65; // MUST BE +1 to last migration
+pub const LATEST_REVISION: i32 = 66; // MUST BE +1 to last migration
 
 pub async fn migrate_database(db: &MongoDb) {
     let migrations = db.col::<Document>("migrations");
@@ -2158,6 +2158,60 @@ pub async fn run_migrations(db: &MongoDb, revision: i32) -> i32 {
             })
             .await
             .expect("Failed to create server_boosts indexes.");
+    }
+
+    if revision <= 65 {
+        info!("Running migration [revision 65 / 25-07-2026]: Create discord_import_jobs collection (Discord server import)");
+
+        // One document per import attempt, driven by the crond claim
+        // worker. Same idempotency contract as prior collection
+        // migrations; mirrors init.rs.
+        db.db().create_collection("discord_import_jobs").await.ok();
+
+        db.db()
+            .run_command(doc! {
+                "createIndexes": "discord_import_jobs",
+                "indexes": [
+                    // ENFORCES one active import per user. delta's
+                    // read-then-insert check is a TOCTOU — N concurrent
+                    // requests all read "no active job" and would each
+                    // create a server + invite. Partial, so the unique
+                    // constraint applies only to non-terminal rows and a
+                    // user's finished imports never block a new one.
+                    // `insert_discord_import_job` maps the resulting 11000
+                    // to ImportAlreadyInProgress.
+                    // NB: $in inside partialFilterExpression needs MongoDB
+                    // 6.0+.
+                    {
+                        "key": {
+                            "user_id": 1_i32
+                        },
+                        "name": "active_user_id",
+                        "unique": true,
+                        "partialFilterExpression": {
+                            "status": { "$in": ["Queued", "Running"] }
+                        }
+                    },
+                    // Serves the one-active-import-per-user lookup for
+                    // terminal rows too (job history by user).
+                    {
+                        "key": {
+                            "user_id": 1_i32
+                        },
+                        "name": "user_id"
+                    },
+                    // Serves the claim worker's Queued pick and the
+                    // sweeper's non-terminal + stale-heartbeat scan.
+                    {
+                        "key": {
+                            "status": 1_i32
+                        },
+                        "name": "status"
+                    }
+                ]
+            })
+            .await
+            .expect("Failed to create discord_import_jobs indexes.");
     }
 
     // Reminder to update LATEST_REVISION when adding new migrations.
