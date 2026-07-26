@@ -35,6 +35,90 @@ pub async fn delete_from_s3(bucket_id: &str, path: &str) -> Result<()> {
     report_internal_error!(storage.delete_file(bucket_id, path).await)
 }
 
+async fn storage() -> S3Storage<EncryptionKey> {
+    let encryption = implementation::EncryptionKey::from_config().await;
+    implementation::S3Storage::from_config(encryption).await
+}
+
+/// Begin a multipart upload, returning the S3 upload id to persist
+pub async fn create_multipart_in_s3(bucket_id: &str, path: &str) -> Result<String> {
+    report_internal_error!(storage().await.create_multipart(bucket_id, path).await)
+}
+
+/// Upload one (already-encrypted) part of a multipart upload, returning its ETag
+pub async fn upload_part_to_s3(
+    bucket_id: &str,
+    path: &str,
+    upload_id: &str,
+    part_number: i32,
+    ciphertext: Vec<u8>,
+) -> Result<String> {
+    report_internal_error!(
+        storage()
+            .await
+            .upload_part(bucket_id, path, upload_id, part_number, ciphertext)
+            .await
+    )
+}
+
+/// Assemble a multipart upload from recorded `(part_number, etag)` pairs
+pub async fn complete_multipart_in_s3(
+    bucket_id: &str,
+    path: &str,
+    upload_id: &str,
+    parts: &[(i32, String)],
+) -> Result<()> {
+    report_internal_error!(
+        storage()
+            .await
+            .complete_multipart(bucket_id, path, upload_id, parts)
+            .await
+    )
+}
+
+/// Abort a multipart upload (a missing upload counts as success)
+pub async fn abort_multipart_in_s3(bucket_id: &str, path: &str, upload_id: &str) -> Result<()> {
+    report_internal_error!(
+        storage()
+            .await
+            .abort_multipart(bucket_id, path, upload_id)
+            .await
+    )
+}
+
+/// Whether an object exists at `path`
+pub async fn object_exists_in_s3(bucket_id: &str, path: &str) -> Result<bool> {
+    report_internal_error!(storage().await.object_exists(bucket_id, path).await)
+}
+
+/// Stream an object's raw (still-encrypted) bytes
+pub async fn fetch_stream_from_s3(
+    bucket_id: &str,
+    path: &str,
+) -> Result<aws_sdk_s3::primitives::ByteStream> {
+    report_internal_error!(storage().await.fetch_stream(bucket_id, path).await)
+}
+
+/// Stream an inclusive byte range of an object's raw bytes
+pub async fn fetch_range_from_s3(
+    bucket_id: &str,
+    path: &str,
+    start: u64,
+    end_inclusive: u64,
+) -> Result<aws_sdk_s3::primitives::ByteStream> {
+    report_internal_error!(
+        storage()
+            .await
+            .fetch_range(bucket_id, path, start, end_inclusive)
+            .await
+    )
+}
+
+/// Idempotently apply the abort-incomplete-multipart lifecycle rule to a bucket
+pub async fn ensure_bucket_lifecycle(bucket_id: &str) -> Result<()> {
+    report_internal_error!(storage().await.ensure_bucket_lifecycle(bucket_id).await)
+}
+
 /// Determine size of image at temp file
 pub fn image_size(f: &NamedTempFile) -> Option<(usize, usize)> {
     let media = MediaImpl::new(Files {

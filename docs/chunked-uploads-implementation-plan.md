@@ -228,7 +228,7 @@ Test: vitest for the part/retry/reconcile state machine with mocked transport; m
 ## 11. Open questions (defaults will be used unless overridden)
 
 1. **Completed-session retention**: keep completed rows until the 48 h `expires_at` (for complete-idempotency), or a shorter TTL? Default: reuse 48 h.
-2. **`mc ilm` exact syntax** for the pinned `minio/mc` image — verify at implementation time; the in-code SDK rule is authoritative regardless.
+2. ~~**`mc ilm` exact syntax**~~ **RESOLVED during Stage 0 (2026-07-26): MinIO does not support `AbortIncompleteMultipartUpload` ILM rules at all** — it rejects the rule XML as InvalidArgument, and current `mc` has no abort-incomplete flag. MinIO's equivalent is the server-level `api stale_uploads_expiry` setting, whose **default of 24 h would have purged live day-2 resumable uploads** (the same TTL inversion as amendment 3, via a different mechanism). **Applied to prod: `mc admin config set <alias> api stale_uploads_expiry=72h`** (persisted in MinIO's config backend; verified `stale_uploads_expiry=72h`). `ensure_bucket_lifecycle` still attempts the real ILM rule for AWS-compatible stores and treats MinIO's InvalidArgument as success with an informative log. Any future MinIO reinstall must re-apply the 72 h setting — it is part of the ship gate.
 3. **Ratelimit numbers** (`upload_part` = 30 etc.) — sanity pass against `revolt_ratelimits` window semantics during implementation.
 4. **Legacy-cache bypass threshold** (16 MiB proposed) — tunable constant; no config plumbing unless wanted in `Revolt.toml`.
 

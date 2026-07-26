@@ -47,3 +47,6 @@ webp = { workspace = true }
 
 [dev-dependencies]
 uuid = { workspace = true, features = ["v4"] }
+# "stream" unlocks aead::stream for the differential test proving
+# SegmentedStreamCipher is byte-identical to EncryptorBE32
+aes-gcm = { workspace = true, features = ["stream"] }
