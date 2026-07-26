@@ -21,6 +21,7 @@ mod soundboard;
 mod stream_connections;
 mod stickers;
 mod thread_members;
+mod upload_sessions;
 mod policy_changes;
 mod ratelimit_events;
 mod safety_reports;
@@ -59,6 +60,7 @@ pub use soundboard::*;
 pub use stream_connections::*;
 pub use stickers::*;
 pub use thread_members::*;
+pub use upload_sessions::*;
 pub use policy_changes::*;
 pub use ratelimit_events::*;
 pub use safety_reports::*;
@@ -99,6 +101,7 @@ pub trait AbstractDatabase:
     + files::AbstractAttachments
     + stickers::AbstractStickers
     + thread_members::AbstractThreadMembers
+    + upload_sessions::AbstractUploadSessions
     + interactions::AbstractInteractions
     + messages::AbstractMessages
     + polls::AbstractPolls

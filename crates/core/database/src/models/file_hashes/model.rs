@@ -20,6 +20,19 @@ auto_derived_partial!(
         pub path: String,
         /// Cryptographic nonce used to encrypt this file
         pub iv: String,
+        /// On-S3 storage format version.
+        ///
+        /// ABSENT (`None`) = legacy whole-file AES-256-GCM in one shot (or
+        /// plaintext passthrough when `iv` is empty) — every row written
+        /// before chunked uploads, and every small single-POST upload since.
+        /// The legacy read path must stay for as long as such rows exist.
+        ///
+        /// `Some(2)` = segmented STREAM-AEAD: 1 MiB AES-256-GCM segments
+        /// under the nonce schedule `prefix(7) ‖ BE32(i) ‖ last_flag`, with
+        /// `iv` holding the base64 7-byte prefix and `size` the PLAINTEXT
+        /// size. Never renumber; add new versions additively.
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        pub format_version: Option<u32>,
 
         /// Parsed metadata of this file
         pub metadata: Metadata,

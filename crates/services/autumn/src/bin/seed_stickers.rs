@@ -100,6 +100,7 @@ async fn main() {
                     bucket_id: config.files.s3.default_bucket.clone(),
                     path: hash_hex.clone(),
                     iv: String::new(),
+                    format_version: None, // legacy whole-file GCM format
                     metadata: Metadata::Image {
                         width: w as isize,
                         height: h as isize,

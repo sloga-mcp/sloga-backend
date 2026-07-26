@@ -371,6 +371,7 @@ async fn upload_file(
         bucket_id: config.files.s3.default_bucket,
         path: format!("{original_hash:02x}"),
         iv: String::new(), // indicates file is not uploaded yet
+        format_version: None, // legacy whole-file GCM format
 
         metadata,
         content_type: mime_type,

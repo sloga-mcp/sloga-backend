@@ -11,7 +11,7 @@ use crate::{
     RatelimitEvent, ReminderSent,
     ReminderSentKey, Report, ScheduledMessage, Server, ServerBan, ServerBoost, Snapshot, SoundboardSound,
     Sticker, StreamConnection, ThreadMember,
-    ThreadMemberCompositeKey, User, UserSettings, Webhook, Account, AccountInvite, Session,
+    ThreadMemberCompositeKey, UploadSession, User, UserSettings, Webhook, Account, AccountInvite, Session,
     MFATicket
 };
 
@@ -37,6 +37,7 @@ database_derived!(
         pub thread_members: Arc<Mutex<HashMap<ThreadMemberCompositeKey, ThreadMember>>>,
         pub file_hashes: Arc<Mutex<HashMap<String, FileHash>>>,
         pub files: Arc<Mutex<HashMap<String, File>>>,
+        pub upload_sessions: Arc<Mutex<HashMap<String, UploadSession>>>,
         pub messages: Arc<Mutex<HashMap<String, Message>>>,
         pub polls: Arc<Mutex<HashMap<String, Poll>>>,
         pub poll_votes: Arc<Mutex<HashMap<String, PollVote>>>,
