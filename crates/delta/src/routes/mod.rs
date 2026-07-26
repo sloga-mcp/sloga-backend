@@ -20,6 +20,7 @@ mod push;
 mod root;
 mod safety;
 mod servers;
+mod softres;
 mod sync;
 mod users;
 mod webhooks;
@@ -51,6 +52,7 @@ pub fn mount(config: Settings, mut rocket: Rocket<Build>) -> Rocket<Build> {
             "/events" => events::routes(),
             "/gifs" => gifs::routes(),
             "/import" => import::routes(),
+            "/softres" => softres::routes(),
             "/auth/account" => account::routes(),
             "/auth/session" => session::routes(),
             "/auth/oauth" => oauth::routes(),
@@ -80,6 +82,7 @@ pub fn mount(config: Settings, mut rocket: Rocket<Build>) -> Rocket<Build> {
             "/events" => events::routes(),
             "/gifs" => gifs::routes(),
             "/import" => import::routes(),
+            "/softres" => softres::routes(),
             "/auth/account" => account::routes(),
             "/auth/session" => session::routes(),
             "/auth/oauth" => oauth::routes(),
@@ -196,7 +199,8 @@ fn custom_openapi_spec() -> OpenApi {
             "name": "Miscellaneous",
             "tags": [
               "Sync",
-              "Web Push"
+              "Web Push",
+              "Soft Reserves"
             ]
           }
         ]),
@@ -390,6 +394,13 @@ fn custom_openapi_spec() -> OpenApi {
                 name: "Calendar".to_owned(),
                 description: Some(
                     "Server calendar events, recurrence, and RSVP invitations".to_owned(),
+                ),
+                ..Default::default()
+            },
+            Tag {
+                name: "Soft Reserves".to_owned(),
+                description: Some(
+                    "Static raid loot catalog for soft-reserve sheets".to_owned(),
                 ),
                 ..Default::default()
             },

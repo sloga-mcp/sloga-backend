@@ -1,0 +1,4373 @@
+[
+ {
+  "id": 41085,
+  "name": "Hateful Gladiator's Chain Armor",
+  "quality": 4,
+  "boss": "Archavon the Stone Watcher",
+  "allowable_classes": [
+   "hunter"
+  ]
+ },
+ {
+  "id": 41141,
+  "name": "Hateful Gladiator's Chain Gauntlets",
+  "quality": 4,
+  "boss": "Archavon the Stone Watcher",
+  "allowable_classes": [
+   "hunter"
+  ]
+ },
+ {
+  "id": 41203,
+  "name": "Hateful Gladiator's Chain Leggings",
+  "quality": 4,
+  "boss": "Archavon the Stone Watcher",
+  "allowable_classes": [
+   "hunter"
+  ]
+ },
+ {
+  "id": 41771,
+  "name": "Hateful Gladiator's Dragonhide Gloves",
+  "quality": 4,
+  "boss": "Archavon the Stone Watcher",
+  "allowable_classes": [
+   "druid"
+  ]
+ },
+ {
+  "id": 41665,
+  "name": "Hateful Gladiator's Dragonhide Legguards",
+  "quality": 4,
+  "boss": "Archavon the Stone Watcher",
+  "allowable_classes": [
+   "druid"
+  ]
+ },
+ {
+  "id": 41659,
+  "name": "Hateful Gladiator's Dragonhide Robes",
+  "quality": 4,
+  "boss": "Archavon the Stone Watcher",
+  "allowable_classes": [
+   "druid"
+  ]
+ },
+ {
+  "id": 40781,
+  "name": "Hateful Gladiator's Dreadplate Chestpiece",
+  "quality": 4,
+  "boss": "Archavon the Stone Watcher",
+  "allowable_classes": [
+   "deathknight"
+  ]
+ },
+ {
+  "id": 40803,
+  "name": "Hateful Gladiator's Dreadplate Gauntlets",
+  "quality": 4,
+  "boss": "Archavon the Stone Watcher",
+  "allowable_classes": [
+   "deathknight"
+  ]
+ },
+ {
+  "id": 40841,
+  "name": "Hateful Gladiator's Dreadplate Legguards",
+  "quality": 4,
+  "boss": "Archavon the Stone Watcher",
+  "allowable_classes": [
+   "deathknight"
+  ]
+ },
+ {
+  "id": 42015,
+  "name": "Hateful Gladiator's Felweave Handguards",
+  "quality": 4,
+  "boss": "Archavon the Stone Watcher",
+  "allowable_classes": [
+   "warlock"
+  ]
+ },
+ {
+  "id": 42001,
+  "name": "Hateful Gladiator's Felweave Raiment",
+  "quality": 4,
+  "boss": "Archavon the Stone Watcher",
+  "allowable_classes": [
+   "warlock"
+  ]
+ },
+ {
+  "id": 42003,
+  "name": "Hateful Gladiator's Felweave Trousers",
+  "quality": 4,
+  "boss": "Archavon the Stone Watcher",
+  "allowable_classes": [
+   "warlock"
+  ]
+ },
+ {
+  "id": 41284,
+  "name": "Hateful Gladiator's Kodohide Gloves",
+  "quality": 4,
+  "boss": "Archavon the Stone Watcher",
+  "allowable_classes": [
+   "druid"
+  ]
+ },
+ {
+  "id": 41296,
+  "name": "Hateful Gladiator's Kodohide Legguards",
+  "quality": 4,
+  "boss": "Archavon the Stone Watcher",
+  "allowable_classes": [
+   "druid"
+  ]
+ },
+ {
+  "id": 41308,
+  "name": "Hateful Gladiator's Kodohide Robes",
+  "quality": 4,
+  "boss": "Archavon the Stone Watcher",
+  "allowable_classes": [
+   "druid"
+  ]
+ },
+ {
+  "id": 41765,
+  "name": "Hateful Gladiator's Leather Gloves",
+  "quality": 4,
+  "boss": "Archavon the Stone Watcher",
+  "allowable_classes": [
+   "rogue"
+  ]
+ },
+ {
+  "id": 41653,
+  "name": "Hateful Gladiator's Leather Legguards",
+  "quality": 4,
+  "boss": "Archavon the Stone Watcher",
+  "allowable_classes": [
+   "rogue"
+  ]
+ },
+ {
+  "id": 41135,
+  "name": "Hateful Gladiator's Linked Gauntlets",
+  "quality": 4,
+  "boss": "Archavon the Stone Watcher",
+  "allowable_classes": [
+   "shaman"
+  ]
+ },
+ {
+  "id": 41162,
+  "name": "Hateful Gladiator's Linked Leggings",
+  "quality": 4,
+  "boss": "Archavon the Stone Watcher",
+  "allowable_classes": [
+   "shaman"
+  ]
+ },
+ {
+  "id": 40989,
+  "name": "Hateful Gladiator's Mail Armor",
+  "quality": 4,
+  "boss": "Archavon the Stone Watcher",
+  "allowable_classes": [
+   "shaman"
+  ]
+ },
+ {
+  "id": 41005,
+  "name": "Hateful Gladiator's Mail Gauntlets",
+  "quality": 4,
+  "boss": "Archavon the Stone Watcher",
+  "allowable_classes": [
+   "shaman"
+  ]
+ },
+ {
+  "id": 41031,
+  "name": "Hateful Gladiator's Mail Leggings",
+  "quality": 4,
+  "boss": "Archavon the Stone Watcher",
+  "allowable_classes": [
+   "shaman"
+  ]
+ },
+ {
+  "id": 41872,
+  "name": "Hateful Gladiator's Mooncloth Gloves",
+  "quality": 4,
+  "boss": "Archavon the Stone Watcher",
+  "allowable_classes": [
+   "priest"
+  ]
+ },
+ {
+  "id": 41862,
+  "name": "Hateful Gladiator's Mooncloth Leggings",
+  "quality": 4,
+  "boss": "Archavon the Stone Watcher",
+  "allowable_classes": [
+   "priest"
+  ]
+ },
+ {
+  "id": 41857,
+  "name": "Hateful Gladiator's Mooncloth Robe",
+  "quality": 4,
+  "boss": "Archavon the Stone Watcher",
+  "allowable_classes": [
+   "priest"
+  ]
+ },
+ {
+  "id": 40904,
+  "name": "Hateful Gladiator's Ornamented Chestguard",
+  "quality": 4,
+  "boss": "Archavon the Stone Watcher",
+  "allowable_classes": [
+   "paladin"
+  ]
+ },
+ {
+  "id": 40925,
+  "name": "Hateful Gladiator's Ornamented Gloves",
+  "quality": 4,
+  "boss": "Archavon the Stone Watcher",
+  "allowable_classes": [
+   "paladin"
+  ]
+ },
+ {
+  "id": 40937,
+  "name": "Hateful Gladiator's Ornamented Legplates",
+  "quality": 4,
+  "boss": "Archavon the Stone Watcher",
+  "allowable_classes": [
+   "paladin"
+  ]
+ },
+ {
+  "id": 40783,
+  "name": "Hateful Gladiator's Plate Chestpiece",
+  "quality": 4,
+  "boss": "Archavon the Stone Watcher",
+  "allowable_classes": [
+   "warrior"
+  ]
+ },
+ {
+  "id": 40801,
+  "name": "Hateful Gladiator's Plate Gauntlets",
+  "quality": 4,
+  "boss": "Archavon the Stone Watcher",
+  "allowable_classes": [
+   "warrior"
+  ]
+ },
+ {
+  "id": 40840,
+  "name": "Hateful Gladiator's Plate Legguards",
+  "quality": 4,
+  "boss": "Archavon the Stone Watcher",
+  "allowable_classes": [
+   "warrior"
+  ]
+ },
+ {
+  "id": 40988,
+  "name": "Hateful Gladiator's Ringmail Armor",
+  "quality": 4,
+  "boss": "Archavon the Stone Watcher",
+  "allowable_classes": [
+   "shaman"
+  ]
+ },
+ {
+  "id": 40999,
+  "name": "Hateful Gladiator's Ringmail Gauntlets",
+  "quality": 4,
+  "boss": "Archavon the Stone Watcher",
+  "allowable_classes": [
+   "shaman"
+  ]
+ },
+ {
+  "id": 41025,
+  "name": "Hateful Gladiator's Ringmail Leggings",
+  "quality": 4,
+  "boss": "Archavon the Stone Watcher",
+  "allowable_classes": [
+   "shaman"
+  ]
+ },
+ {
+  "id": 41938,
+  "name": "Hateful Gladiator's Satin Gloves",
+  "quality": 4,
+  "boss": "Archavon the Stone Watcher",
+  "allowable_classes": [
+   "priest"
+  ]
+ },
+ {
+  "id": 41925,
+  "name": "Hateful Gladiator's Satin Leggings",
+  "quality": 4,
+  "boss": "Archavon the Stone Watcher",
+  "allowable_classes": [
+   "priest"
+  ]
+ },
+ {
+  "id": 41919,
+  "name": "Hateful Gladiator's Satin Robe",
+  "quality": 4,
+  "boss": "Archavon the Stone Watcher",
+  "allowable_classes": [
+   "priest"
+  ]
+ },
+ {
+  "id": 40782,
+  "name": "Hateful Gladiator's Scaled Chestpiece",
+  "quality": 4,
+  "boss": "Archavon the Stone Watcher",
+  "allowable_classes": [
+   "paladin"
+  ]
+ },
+ {
+  "id": 40802,
+  "name": "Hateful Gladiator's Scaled Gauntlets",
+  "quality": 4,
+  "boss": "Archavon the Stone Watcher",
+  "allowable_classes": [
+   "paladin"
+  ]
+ },
+ {
+  "id": 40842,
+  "name": "Hateful Gladiator's Scaled Legguards",
+  "quality": 4,
+  "boss": "Archavon the Stone Watcher",
+  "allowable_classes": [
+   "paladin"
+  ]
+ },
+ {
+  "id": 41969,
+  "name": "Hateful Gladiator's Silk Handguards",
+  "quality": 4,
+  "boss": "Archavon the Stone Watcher",
+  "allowable_classes": [
+   "mage"
+  ]
+ },
+ {
+  "id": 41950,
+  "name": "Hateful Gladiator's Silk Raiment",
+  "quality": 4,
+  "boss": "Archavon the Stone Watcher",
+  "allowable_classes": [
+   "mage"
+  ]
+ },
+ {
+  "id": 41957,
+  "name": "Hateful Gladiator's Silk Trousers",
+  "quality": 4,
+  "boss": "Archavon the Stone Watcher",
+  "allowable_classes": [
+   "mage"
+  ]
+ },
+ {
+  "id": 41291,
+  "name": "Hateful Gladiator's Wyrmhide Gloves",
+  "quality": 4,
+  "boss": "Archavon the Stone Watcher",
+  "allowable_classes": [
+   "druid"
+  ]
+ },
+ {
+  "id": 41302,
+  "name": "Hateful Gladiator's Wyrmhide Legguards",
+  "quality": 4,
+  "boss": "Archavon the Stone Watcher",
+  "allowable_classes": [
+   "druid"
+  ]
+ },
+ {
+  "id": 41314,
+  "name": "Hateful Gladiator's Wyrmhide Robes",
+  "quality": 4,
+  "boss": "Archavon the Stone Watcher",
+  "allowable_classes": [
+   "druid"
+  ]
+ },
+ {
+  "id": 39558,
+  "name": "Heroes' Bonescythe Breastplate",
+  "quality": 4,
+  "boss": "Archavon the Stone Watcher",
+  "allowable_classes": [
+   "rogue"
+  ]
+ },
+ {
+  "id": 39560,
+  "name": "Heroes' Bonescythe Gauntlets",
+  "quality": 4,
+  "boss": "Archavon the Stone Watcher",
+  "allowable_classes": [
+   "rogue"
+  ]
+ },
+ {
+  "id": 39564,
+  "name": "Heroes' Bonescythe Legplates",
+  "quality": 4,
+  "boss": "Archavon the Stone Watcher",
+  "allowable_classes": [
+   "rogue"
+  ]
+ },
+ {
+  "id": 39582,
+  "name": "Heroes' Cryptstalker Handguards",
+  "quality": 4,
+  "boss": "Archavon the Stone Watcher",
+  "allowable_classes": [
+   "hunter"
+  ]
+ },
+ {
+  "id": 39580,
+  "name": "Heroes' Cryptstalker Legguards",
+  "quality": 4,
+  "boss": "Archavon the Stone Watcher",
+  "allowable_classes": [
+   "hunter"
+  ]
+ },
+ {
+  "id": 39579,
+  "name": "Heroes' Cryptstalker Tunic",
+  "quality": 4,
+  "boss": "Archavon the Stone Watcher",
+  "allowable_classes": [
+   "hunter"
+  ]
+ },
+ {
+  "id": 39606,
+  "name": "Heroes' Dreadnaught Battleplate",
+  "quality": 4,
+  "boss": "Archavon the Stone Watcher",
+  "allowable_classes": [
+   "warrior"
+  ]
+ },
+ {
+  "id": 39611,
+  "name": "Heroes' Dreadnaught Breastplate",
+  "quality": 4,
+  "boss": "Archavon the Stone Watcher",
+  "allowable_classes": [
+   "warrior"
+  ]
+ },
+ {
+  "id": 39609,
+  "name": "Heroes' Dreadnaught Gauntlets",
+  "quality": 4,
+  "boss": "Archavon the Stone Watcher",
+  "allowable_classes": [
+   "warrior"
+  ]
+ },
+ {
+  "id": 39622,
+  "name": "Heroes' Dreadnaught Handguards",
+  "quality": 4,
+  "boss": "Archavon the Stone Watcher",
+  "allowable_classes": [
+   "warrior"
+  ]
+ },
+ {
+  "id": 39612,
+  "name": "Heroes' Dreadnaught Legguards",
+  "quality": 4,
+  "boss": "Archavon the Stone Watcher",
+  "allowable_classes": [
+   "warrior"
+  ]
+ },
+ {
+  "id": 39607,
+  "name": "Heroes' Dreadnaught Legplates",
+  "quality": 4,
+  "boss": "Archavon the Stone Watcher",
+  "allowable_classes": [
+   "warrior"
+  ]
+ },
+ {
+  "id": 39544,
+  "name": "Heroes' Dreamwalker Gloves",
+  "quality": 4,
+  "boss": "Archavon the Stone Watcher",
+  "allowable_classes": [
+   "druid"
+  ]
+ },
+ {
+  "id": 39557,
+  "name": "Heroes' Dreamwalker Handgrips",
+  "quality": 4,
+  "boss": "Archavon the Stone Watcher",
+  "allowable_classes": [
+   "druid"
+  ]
+ },
+ {
+  "id": 39543,
+  "name": "Heroes' Dreamwalker Handguards",
+  "quality": 4,
+  "boss": "Archavon the Stone Watcher",
+  "allowable_classes": [
+   "druid"
+  ]
+ },
+ {
+  "id": 39539,
+  "name": "Heroes' Dreamwalker Leggings",
+  "quality": 4,
+  "boss": "Archavon the Stone Watcher",
+  "allowable_classes": [
+   "druid"
+  ]
+ },
+ {
+  "id": 39555,
+  "name": "Heroes' Dreamwalker Legguards",
+  "quality": 4,
+  "boss": "Archavon the Stone Watcher",
+  "allowable_classes": [
+   "druid"
+  ]
+ },
+ {
+  "id": 39554,
+  "name": "Heroes' Dreamwalker Raiments",
+  "quality": 4,
+  "boss": "Archavon the Stone Watcher",
+  "allowable_classes": [
+   "druid"
+  ]
+ },
+ {
+  "id": 39538,
+  "name": "Heroes' Dreamwalker Robe",
+  "quality": 4,
+  "boss": "Archavon the Stone Watcher",
+  "allowable_classes": [
+   "druid"
+  ]
+ },
+ {
+  "id": 39546,
+  "name": "Heroes' Dreamwalker Trousers",
+  "quality": 4,
+  "boss": "Archavon the Stone Watcher",
+  "allowable_classes": [
+   "druid"
+  ]
+ },
+ {
+  "id": 39547,
+  "name": "Heroes' Dreamwalker Vestments",
+  "quality": 4,
+  "boss": "Archavon the Stone Watcher",
+  "allowable_classes": [
+   "druid"
+  ]
+ },
+ {
+  "id": 39597,
+  "name": "Heroes' Earthshatter Chestguard",
+  "quality": 4,
+  "boss": "Archavon the Stone Watcher",
+  "allowable_classes": [
+   "shaman"
+  ]
+ },
+ {
+  "id": 39593,
+  "name": "Heroes' Earthshatter Gloves",
+  "quality": 4,
+  "boss": "Archavon the Stone Watcher",
+  "allowable_classes": [
+   "shaman"
+  ]
+ },
+ {
+  "id": 39591,
+  "name": "Heroes' Earthshatter Handguards",
+  "quality": 4,
+  "boss": "Archavon the Stone Watcher",
+  "allowable_classes": [
+   "shaman"
+  ]
+ },
+ {
+  "id": 39592,
+  "name": "Heroes' Earthshatter Hauberk",
+  "quality": 4,
+  "boss": "Archavon the Stone Watcher",
+  "allowable_classes": [
+   "shaman"
+  ]
+ },
+ {
+  "id": 39595,
+  "name": "Heroes' Earthshatter Kilt",
+  "quality": 4,
+  "boss": "Archavon the Stone Watcher",
+  "allowable_classes": [
+   "shaman"
+  ]
+ },
+ {
+  "id": 39589,
+  "name": "Heroes' Earthshatter Legguards",
+  "quality": 4,
+  "boss": "Archavon the Stone Watcher",
+  "allowable_classes": [
+   "shaman"
+  ]
+ },
+ {
+  "id": 39588,
+  "name": "Heroes' Earthshatter Tunic",
+  "quality": 4,
+  "boss": "Archavon the Stone Watcher",
+  "allowable_classes": [
+   "shaman"
+  ]
+ },
+ {
+  "id": 39495,
+  "name": "Heroes' Frostfire Gloves",
+  "quality": 4,
+  "boss": "Archavon the Stone Watcher",
+  "allowable_classes": [
+   "mage"
+  ]
+ },
+ {
+  "id": 39493,
+  "name": "Heroes' Frostfire Leggings",
+  "quality": 4,
+  "boss": "Archavon the Stone Watcher",
+  "allowable_classes": [
+   "mage"
+  ]
+ },
+ {
+  "id": 39492,
+  "name": "Heroes' Frostfire Robe",
+  "quality": 4,
+  "boss": "Archavon the Stone Watcher",
+  "allowable_classes": [
+   "mage"
+  ]
+ },
+ {
+  "id": 39519,
+  "name": "Heroes' Gloves of Faith",
+  "quality": 4,
+  "boss": "Archavon the Stone Watcher",
+  "allowable_classes": [
+   "priest"
+  ]
+ },
+ {
+  "id": 39530,
+  "name": "Heroes' Handwraps of Faith",
+  "quality": 4,
+  "boss": "Archavon the Stone Watcher",
+  "allowable_classes": [
+   "priest"
+  ]
+ },
+ {
+  "id": 39517,
+  "name": "Heroes' Leggings of Faith",
+  "quality": 4,
+  "boss": "Archavon the Stone Watcher",
+  "allowable_classes": [
+   "priest"
+  ]
+ },
+ {
+  "id": 39528,
+  "name": "Heroes' Pants of Faith",
+  "quality": 4,
+  "boss": "Archavon the Stone Watcher",
+  "allowable_classes": [
+   "priest"
+  ]
+ },
+ {
+  "id": 39500,
+  "name": "Heroes' Plagueheart Gloves",
+  "quality": 4,
+  "boss": "Archavon the Stone Watcher",
+  "allowable_classes": [
+   "warlock"
+  ]
+ },
+ {
+  "id": 39498,
+  "name": "Heroes' Plagueheart Leggings",
+  "quality": 4,
+  "boss": "Archavon the Stone Watcher",
+  "allowable_classes": [
+   "warlock"
+  ]
+ },
+ {
+  "id": 39497,
+  "name": "Heroes' Plagueheart Robe",
+  "quality": 4,
+  "boss": "Archavon the Stone Watcher",
+  "allowable_classes": [
+   "warlock"
+  ]
+ },
+ {
+  "id": 39523,
+  "name": "Heroes' Raiments of Faith",
+  "quality": 4,
+  "boss": "Archavon the Stone Watcher",
+  "allowable_classes": [
+   "priest"
+  ]
+ },
+ {
+  "id": 39638,
+  "name": "Heroes' Redemption Breastplate",
+  "quality": 4,
+  "boss": "Archavon the Stone Watcher",
+  "allowable_classes": [
+   "paladin"
+  ]
+ },
+ {
+  "id": 39633,
+  "name": "Heroes' Redemption Chestpiece",
+  "quality": 4,
+  "boss": "Archavon the Stone Watcher",
+  "allowable_classes": [
+   "paladin"
+  ]
+ },
+ {
+  "id": 39634,
+  "name": "Heroes' Redemption Gauntlets",
+  "quality": 4,
+  "boss": "Archavon the Stone Watcher",
+  "allowable_classes": [
+   "paladin"
+  ]
+ },
+ {
+  "id": 39632,
+  "name": "Heroes' Redemption Gloves",
+  "quality": 4,
+  "boss": "Archavon the Stone Watcher",
+  "allowable_classes": [
+   "paladin"
+  ]
+ },
+ {
+  "id": 39630,
+  "name": "Heroes' Redemption Greaves",
+  "quality": 4,
+  "boss": "Archavon the Stone Watcher",
+  "allowable_classes": [
+   "paladin"
+  ]
+ },
+ {
+  "id": 39639,
+  "name": "Heroes' Redemption Handguards",
+  "quality": 4,
+  "boss": "Archavon the Stone Watcher",
+  "allowable_classes": [
+   "paladin"
+  ]
+ },
+ {
+  "id": 39641,
+  "name": "Heroes' Redemption Legguards",
+  "quality": 4,
+  "boss": "Archavon the Stone Watcher",
+  "allowable_classes": [
+   "paladin"
+  ]
+ },
+ {
+  "id": 39636,
+  "name": "Heroes' Redemption Legplates",
+  "quality": 4,
+  "boss": "Archavon the Stone Watcher",
+  "allowable_classes": [
+   "paladin"
+  ]
+ },
+ {
+  "id": 39629,
+  "name": "Heroes' Redemption Tunic",
+  "quality": 4,
+  "boss": "Archavon the Stone Watcher",
+  "allowable_classes": [
+   "paladin"
+  ]
+ },
+ {
+  "id": 39515,
+  "name": "Heroes' Robe of Faith",
+  "quality": 4,
+  "boss": "Archavon the Stone Watcher",
+  "allowable_classes": [
+   "priest"
+  ]
+ },
+ {
+  "id": 39617,
+  "name": "Heroes' Scourgeborne Battleplate",
+  "quality": 4,
+  "boss": "Archavon the Stone Watcher",
+  "allowable_classes": [
+   "deathknight"
+  ]
+ },
+ {
+  "id": 39623,
+  "name": "Heroes' Scourgeborne Chestguard",
+  "quality": 4,
+  "boss": "Archavon the Stone Watcher",
+  "allowable_classes": [
+   "deathknight"
+  ]
+ },
+ {
+  "id": 39618,
+  "name": "Heroes' Scourgeborne Gauntlets",
+  "quality": 4,
+  "boss": "Archavon the Stone Watcher",
+  "allowable_classes": [
+   "deathknight"
+  ]
+ },
+ {
+  "id": 39624,
+  "name": "Heroes' Scourgeborne Handguards",
+  "quality": 4,
+  "boss": "Archavon the Stone Watcher",
+  "allowable_classes": [
+   "deathknight"
+  ]
+ },
+ {
+  "id": 39626,
+  "name": "Heroes' Scourgeborne Legguards",
+  "quality": 4,
+  "boss": "Archavon the Stone Watcher",
+  "allowable_classes": [
+   "deathknight"
+  ]
+ },
+ {
+  "id": 39620,
+  "name": "Heroes' Scourgeborne Legplates",
+  "quality": 4,
+  "boss": "Archavon the Stone Watcher",
+  "allowable_classes": [
+   "deathknight"
+  ]
+ },
+ {
+  "id": 43959,
+  "name": "Reins of the Grand Black War Mammoth",
+  "quality": 4,
+  "boss": "Archavon the Stone Watcher / Emalon the Storm Watcher / Koralon the Flame Watcher / Toravon the Ice Watcher"
+ },
+ {
+  "id": 44083,
+  "name": "Reins of the Grand Black War Mammoth",
+  "quality": 4,
+  "boss": "Archavon the Stone Watcher / Emalon the Storm Watcher / Koralon the Flame Watcher / Toravon the Ice Watcher"
+ },
+ {
+  "id": 41639,
+  "name": "Deadly Gladiator's Armwraps of Dominance",
+  "quality": 4,
+  "boss": "Emalon the Storm Watcher",
+  "allowable_classes": [
+   "rogue",
+   "druid"
+  ]
+ },
+ {
+  "id": 41624,
+  "name": "Deadly Gladiator's Armwraps of Salvation",
+  "quality": 4,
+  "boss": "Emalon the Storm Watcher",
+  "allowable_classes": [
+   "rogue",
+   "druid"
+  ]
+ },
+ {
+  "id": 41839,
+  "name": "Deadly Gladiator's Armwraps of Triumph",
+  "quality": 4,
+  "boss": "Emalon the Storm Watcher",
+  "allowable_classes": [
+   "rogue",
+   "druid"
+  ]
+ },
+ {
+  "id": 42114,
+  "name": "Deadly Gladiator's Band of Ascendancy",
+  "quality": 4,
+  "boss": "Emalon the Storm Watcher"
+ },
+ {
+  "id": 42115,
+  "name": "Deadly Gladiator's Band of Victory",
+  "quality": 4,
+  "boss": "Emalon the Storm Watcher"
+ },
+ {
+  "id": 41629,
+  "name": "Deadly Gladiator's Belt of Dominance",
+  "quality": 4,
+  "boss": "Emalon the Storm Watcher",
+  "allowable_classes": [
+   "rogue",
+   "druid"
+  ]
+ },
+ {
+  "id": 41616,
+  "name": "Deadly Gladiator's Belt of Salvation",
+  "quality": 4,
+  "boss": "Emalon the Storm Watcher",
+  "allowable_classes": [
+   "rogue",
+   "druid"
+  ]
+ },
+ {
+  "id": 41831,
+  "name": "Deadly Gladiator's Belt of Triumph",
+  "quality": 4,
+  "boss": "Emalon the Storm Watcher",
+  "allowable_classes": [
+   "rogue",
+   "druid"
+  ]
+ },
+ {
+  "id": 41634,
+  "name": "Deadly Gladiator's Boots of Dominance",
+  "quality": 4,
+  "boss": "Emalon the Storm Watcher",
+  "allowable_classes": [
+   "rogue",
+   "druid"
+  ]
+ },
+ {
+  "id": 41620,
+  "name": "Deadly Gladiator's Boots of Salvation",
+  "quality": 4,
+  "boss": "Emalon the Storm Watcher",
+  "allowable_classes": [
+   "rogue",
+   "druid"
+  ]
+ },
+ {
+  "id": 41835,
+  "name": "Deadly Gladiator's Boots of Triumph",
+  "quality": 4,
+  "boss": "Emalon the Storm Watcher",
+  "allowable_classes": [
+   "rogue",
+   "druid"
+  ]
+ },
+ {
+  "id": 40982,
+  "name": "Deadly Gladiator's Bracers of Salvation",
+  "quality": 4,
+  "boss": "Emalon the Storm Watcher",
+  "allowable_classes": [
+   "paladin"
+  ]
+ },
+ {
+  "id": 40888,
+  "name": "Deadly Gladiator's Bracers of Triumph",
+  "quality": 4,
+  "boss": "Emalon the Storm Watcher",
+  "allowable_classes": [
+   "warrior",
+   "paladin",
+   "deathknight"
+  ]
+ },
+ {
+  "id": 41142,
+  "name": "Deadly Gladiator's Chain Gauntlets",
+  "quality": 4,
+  "boss": "Emalon the Storm Watcher",
+  "allowable_classes": [
+   "hunter"
+  ]
+ },
+ {
+  "id": 41204,
+  "name": "Deadly Gladiator's Chain Leggings",
+  "quality": 4,
+  "boss": "Emalon the Storm Watcher",
+  "allowable_classes": [
+   "hunter"
+  ]
+ },
+ {
+  "id": 42064,
+  "name": "Deadly Gladiator's Cloak of Ascendancy",
+  "quality": 4,
+  "boss": "Emalon the Storm Watcher"
+ },
+ {
+  "id": 42066,
+  "name": "Deadly Gladiator's Cloak of Deliverance",
+  "quality": 4,
+  "boss": "Emalon the Storm Watcher"
+ },
+ {
+  "id": 42062,
+  "name": "Deadly Gladiator's Cloak of Dominance",
+  "quality": 4,
+  "boss": "Emalon the Storm Watcher"
+ },
+ {
+  "id": 42065,
+  "name": "Deadly Gladiator's Cloak of Salvation",
+  "quality": 4,
+  "boss": "Emalon the Storm Watcher"
+ },
+ {
+  "id": 42063,
+  "name": "Deadly Gladiator's Cloak of Subjugation",
+  "quality": 4,
+  "boss": "Emalon the Storm Watcher"
+ },
+ {
+  "id": 42067,
+  "name": "Deadly Gladiator's Cloak of Triumph",
+  "quality": 4,
+  "boss": "Emalon the Storm Watcher"
+ },
+ {
+  "id": 42068,
+  "name": "Deadly Gladiator's Cloak of Victory",
+  "quality": 4,
+  "boss": "Emalon the Storm Watcher"
+ },
+ {
+  "id": 41897,
+  "name": "Deadly Gladiator's Cord of Dominance",
+  "quality": 4,
+  "boss": "Emalon the Storm Watcher",
+  "allowable_classes": [
+   "priest",
+   "mage",
+   "warlock"
+  ]
+ },
+ {
+  "id": 41880,
+  "name": "Deadly Gladiator's Cord of Salvation",
+  "quality": 4,
+  "boss": "Emalon the Storm Watcher",
+  "allowable_classes": [
+   "priest",
+   "mage",
+   "warlock"
+  ]
+ },
+ {
+  "id": 41908,
+  "name": "Deadly Gladiator's Cuffs of Dominance",
+  "quality": 4,
+  "boss": "Emalon the Storm Watcher",
+  "allowable_classes": [
+   "priest",
+   "mage",
+   "warlock"
+  ]
+ },
+ {
+  "id": 41892,
+  "name": "Deadly Gladiator's Cuffs of Salvation",
+  "quality": 4,
+  "boss": "Emalon the Storm Watcher",
+  "allowable_classes": [
+   "priest",
+   "mage",
+   "warlock"
+  ]
+ },
+ {
+  "id": 41772,
+  "name": "Deadly Gladiator's Dragonhide Gloves",
+  "quality": 4,
+  "boss": "Emalon the Storm Watcher",
+  "allowable_classes": [
+   "druid"
+  ]
+ },
+ {
+  "id": 41666,
+  "name": "Deadly Gladiator's Dragonhide Legguards",
+  "quality": 4,
+  "boss": "Emalon the Storm Watcher",
+  "allowable_classes": [
+   "druid"
+  ]
+ },
+ {
+  "id": 40806,
+  "name": "Deadly Gladiator's Dreadplate Gauntlets",
+  "quality": 4,
+  "boss": "Emalon the Storm Watcher",
+  "allowable_classes": [
+   "deathknight"
+  ]
+ },
+ {
+  "id": 40845,
+  "name": "Deadly Gladiator's Dreadplate Legguards",
+  "quality": 4,
+  "boss": "Emalon the Storm Watcher",
+  "allowable_classes": [
+   "deathknight"
+  ]
+ },
+ {
+  "id": 42016,
+  "name": "Deadly Gladiator's Felweave Handguards",
+  "quality": 4,
+  "boss": "Emalon the Storm Watcher",
+  "allowable_classes": [
+   "warlock"
+  ]
+ },
+ {
+  "id": 42004,
+  "name": "Deadly Gladiator's Felweave Trousers",
+  "quality": 4,
+  "boss": "Emalon the Storm Watcher",
+  "allowable_classes": [
+   "warlock"
+  ]
+ },
+ {
+  "id": 40974,
+  "name": "Deadly Gladiator's Girdle of Salvation",
+  "quality": 4,
+  "boss": "Emalon the Storm Watcher",
+  "allowable_classes": [
+   "paladin"
+  ]
+ },
+ {
+  "id": 40879,
+  "name": "Deadly Gladiator's Girdle of Triumph",
+  "quality": 4,
+  "boss": "Emalon the Storm Watcher",
+  "allowable_classes": [
+   "warrior",
+   "paladin",
+   "deathknight"
+  ]
+ },
+ {
+  "id": 40975,
+  "name": "Deadly Gladiator's Greaves of Salvation",
+  "quality": 4,
+  "boss": "Emalon the Storm Watcher",
+  "allowable_classes": [
+   "paladin"
+  ]
+ },
+ {
+  "id": 40880,
+  "name": "Deadly Gladiator's Greaves of Triumph",
+  "quality": 4,
+  "boss": "Emalon the Storm Watcher",
+  "allowable_classes": [
+   "warrior",
+   "paladin",
+   "deathknight"
+  ]
+ },
+ {
+  "id": 41286,
+  "name": "Deadly Gladiator's Kodohide Gloves",
+  "quality": 4,
+  "boss": "Emalon the Storm Watcher",
+  "allowable_classes": [
+   "druid"
+  ]
+ },
+ {
+  "id": 41297,
+  "name": "Deadly Gladiator's Kodohide Legguards",
+  "quality": 4,
+  "boss": "Emalon the Storm Watcher",
+  "allowable_classes": [
+   "druid"
+  ]
+ },
+ {
+  "id": 41766,
+  "name": "Deadly Gladiator's Leather Gloves",
+  "quality": 4,
+  "boss": "Emalon the Storm Watcher",
+  "allowable_classes": [
+   "rogue"
+  ]
+ },
+ {
+  "id": 41654,
+  "name": "Deadly Gladiator's Leather Legguards",
+  "quality": 4,
+  "boss": "Emalon the Storm Watcher",
+  "allowable_classes": [
+   "rogue"
+  ]
+ },
+ {
+  "id": 41136,
+  "name": "Deadly Gladiator's Linked Gauntlets",
+  "quality": 4,
+  "boss": "Emalon the Storm Watcher",
+  "allowable_classes": [
+   "shaman"
+  ]
+ },
+ {
+  "id": 41198,
+  "name": "Deadly Gladiator's Linked Leggings",
+  "quality": 4,
+  "boss": "Emalon the Storm Watcher",
+  "allowable_classes": [
+   "shaman"
+  ]
+ },
+ {
+  "id": 41006,
+  "name": "Deadly Gladiator's Mail Gauntlets",
+  "quality": 4,
+  "boss": "Emalon the Storm Watcher",
+  "allowable_classes": [
+   "shaman"
+  ]
+ },
+ {
+  "id": 41032,
+  "name": "Deadly Gladiator's Mail Leggings",
+  "quality": 4,
+  "boss": "Emalon the Storm Watcher",
+  "allowable_classes": [
+   "shaman"
+  ]
+ },
+ {
+  "id": 41873,
+  "name": "Deadly Gladiator's Mooncloth Gloves",
+  "quality": 4,
+  "boss": "Emalon the Storm Watcher",
+  "allowable_classes": [
+   "priest"
+  ]
+ },
+ {
+  "id": 41863,
+  "name": "Deadly Gladiator's Mooncloth Leggings",
+  "quality": 4,
+  "boss": "Emalon the Storm Watcher",
+  "allowable_classes": [
+   "priest"
+  ]
+ },
+ {
+  "id": 40926,
+  "name": "Deadly Gladiator's Ornamented Gloves",
+  "quality": 4,
+  "boss": "Emalon the Storm Watcher",
+  "allowable_classes": [
+   "paladin"
+  ]
+ },
+ {
+  "id": 40938,
+  "name": "Deadly Gladiator's Ornamented Legplates",
+  "quality": 4,
+  "boss": "Emalon the Storm Watcher",
+  "allowable_classes": [
+   "paladin"
+  ]
+ },
+ {
+  "id": 42030,
+  "name": "Deadly Gladiator's Pendant of Ascendancy",
+  "quality": 4,
+  "boss": "Emalon the Storm Watcher"
+ },
+ {
+  "id": 42032,
+  "name": "Deadly Gladiator's Pendant of Deliverance",
+  "quality": 4,
+  "boss": "Emalon the Storm Watcher"
+ },
+ {
+  "id": 42029,
+  "name": "Deadly Gladiator's Pendant of Dominance",
+  "quality": 4,
+  "boss": "Emalon the Storm Watcher"
+ },
+ {
+  "id": 42033,
+  "name": "Deadly Gladiator's Pendant of Salvation",
+  "quality": 4,
+  "boss": "Emalon the Storm Watcher"
+ },
+ {
+  "id": 42031,
+  "name": "Deadly Gladiator's Pendant of Subjugation",
+  "quality": 4,
+  "boss": "Emalon the Storm Watcher"
+ },
+ {
+  "id": 42028,
+  "name": "Deadly Gladiator's Pendant of Victory",
+  "quality": 4,
+  "boss": "Emalon the Storm Watcher"
+ },
+ {
+  "id": 40804,
+  "name": "Deadly Gladiator's Plate Gauntlets",
+  "quality": 4,
+  "boss": "Emalon the Storm Watcher",
+  "allowable_classes": [
+   "warrior"
+  ]
+ },
+ {
+  "id": 40844,
+  "name": "Deadly Gladiator's Plate Legguards",
+  "quality": 4,
+  "boss": "Emalon the Storm Watcher",
+  "allowable_classes": [
+   "warrior"
+  ]
+ },
+ {
+  "id": 41000,
+  "name": "Deadly Gladiator's Ringmail Gauntlets",
+  "quality": 4,
+  "boss": "Emalon the Storm Watcher",
+  "allowable_classes": [
+   "shaman"
+  ]
+ },
+ {
+  "id": 41026,
+  "name": "Deadly Gladiator's Ringmail Leggings",
+  "quality": 4,
+  "boss": "Emalon the Storm Watcher",
+  "allowable_classes": [
+   "shaman"
+  ]
+ },
+ {
+  "id": 41074,
+  "name": "Deadly Gladiator's Sabatons of Dominance",
+  "quality": 4,
+  "boss": "Emalon the Storm Watcher",
+  "allowable_classes": [
+   "hunter",
+   "shaman"
+  ]
+ },
+ {
+  "id": 41054,
+  "name": "Deadly Gladiator's Sabatons of Salvation",
+  "quality": 4,
+  "boss": "Emalon the Storm Watcher",
+  "allowable_classes": [
+   "hunter",
+   "shaman"
+  ]
+ },
+ {
+  "id": 41229,
+  "name": "Deadly Gladiator's Sabatons of Triumph",
+  "quality": 4,
+  "boss": "Emalon the Storm Watcher",
+  "allowable_classes": [
+   "hunter",
+   "shaman"
+  ]
+ },
+ {
+  "id": 41939,
+  "name": "Deadly Gladiator's Satin Gloves",
+  "quality": 4,
+  "boss": "Emalon the Storm Watcher",
+  "allowable_classes": [
+   "priest"
+  ]
+ },
+ {
+  "id": 41926,
+  "name": "Deadly Gladiator's Satin Leggings",
+  "quality": 4,
+  "boss": "Emalon the Storm Watcher",
+  "allowable_classes": [
+   "priest"
+  ]
+ },
+ {
+  "id": 40805,
+  "name": "Deadly Gladiator's Scaled Gauntlets",
+  "quality": 4,
+  "boss": "Emalon the Storm Watcher",
+  "allowable_classes": [
+   "paladin"
+  ]
+ },
+ {
+  "id": 40846,
+  "name": "Deadly Gladiator's Scaled Legguards",
+  "quality": 4,
+  "boss": "Emalon the Storm Watcher",
+  "allowable_classes": [
+   "paladin"
+  ]
+ },
+ {
+  "id": 41970,
+  "name": "Deadly Gladiator's Silk Handguards",
+  "quality": 4,
+  "boss": "Emalon the Storm Watcher",
+  "allowable_classes": [
+   "mage"
+  ]
+ },
+ {
+  "id": 41958,
+  "name": "Deadly Gladiator's Silk Trousers",
+  "quality": 4,
+  "boss": "Emalon the Storm Watcher",
+  "allowable_classes": [
+   "mage"
+  ]
+ },
+ {
+  "id": 41902,
+  "name": "Deadly Gladiator's Treads of Dominance",
+  "quality": 4,
+  "boss": "Emalon the Storm Watcher",
+  "allowable_classes": [
+   "priest",
+   "mage",
+   "warlock"
+  ]
+ },
+ {
+  "id": 41884,
+  "name": "Deadly Gladiator's Treads of Salvation",
+  "quality": 4,
+  "boss": "Emalon the Storm Watcher",
+  "allowable_classes": [
+   "priest",
+   "mage",
+   "warlock"
+  ]
+ },
+ {
+  "id": 41069,
+  "name": "Deadly Gladiator's Waistguard of Dominance",
+  "quality": 4,
+  "boss": "Emalon the Storm Watcher",
+  "allowable_classes": [
+   "hunter",
+   "shaman"
+  ]
+ },
+ {
+  "id": 41048,
+  "name": "Deadly Gladiator's Waistguard of Salvation",
+  "quality": 4,
+  "boss": "Emalon the Storm Watcher",
+  "allowable_classes": [
+   "hunter",
+   "shaman"
+  ]
+ },
+ {
+  "id": 41234,
+  "name": "Deadly Gladiator's Waistguard of Triumph",
+  "quality": 4,
+  "boss": "Emalon the Storm Watcher",
+  "allowable_classes": [
+   "hunter",
+   "shaman"
+  ]
+ },
+ {
+  "id": 41064,
+  "name": "Deadly Gladiator's Wristguards of Dominance",
+  "quality": 4,
+  "boss": "Emalon the Storm Watcher",
+  "allowable_classes": [
+   "hunter",
+   "shaman"
+  ]
+ },
+ {
+  "id": 41059,
+  "name": "Deadly Gladiator's Wristguards of Salvation",
+  "quality": 4,
+  "boss": "Emalon the Storm Watcher",
+  "allowable_classes": [
+   "hunter",
+   "shaman"
+  ]
+ },
+ {
+  "id": 41224,
+  "name": "Deadly Gladiator's Wristguards of Triumph",
+  "quality": 4,
+  "boss": "Emalon the Storm Watcher",
+  "allowable_classes": [
+   "hunter",
+   "shaman"
+  ]
+ },
+ {
+  "id": 41292,
+  "name": "Deadly Gladiator's Wyrmhide Gloves",
+  "quality": 4,
+  "boss": "Emalon the Storm Watcher",
+  "allowable_classes": [
+   "druid"
+  ]
+ },
+ {
+  "id": 41303,
+  "name": "Deadly Gladiator's Wyrmhide Legguards",
+  "quality": 4,
+  "boss": "Emalon the Storm Watcher",
+  "allowable_classes": [
+   "druid"
+  ]
+ },
+ {
+  "id": 45376,
+  "name": "Valorous Aegis Gauntlets",
+  "quality": 4,
+  "boss": "Emalon the Storm Watcher",
+  "allowable_classes": [
+   "paladin"
+  ]
+ },
+ {
+  "id": 45370,
+  "name": "Valorous Aegis Gloves",
+  "quality": 4,
+  "boss": "Emalon the Storm Watcher",
+  "allowable_classes": [
+   "paladin"
+  ]
+ },
+ {
+  "id": 45371,
+  "name": "Valorous Aegis Greaves",
+  "quality": 4,
+  "boss": "Emalon the Storm Watcher",
+  "allowable_classes": [
+   "paladin"
+  ]
+ },
+ {
+  "id": 45383,
+  "name": "Valorous Aegis Handguards",
+  "quality": 4,
+  "boss": "Emalon the Storm Watcher",
+  "allowable_classes": [
+   "paladin"
+  ]
+ },
+ {
+  "id": 45384,
+  "name": "Valorous Aegis Legguards",
+  "quality": 4,
+  "boss": "Emalon the Storm Watcher",
+  "allowable_classes": [
+   "paladin"
+  ]
+ },
+ {
+  "id": 45379,
+  "name": "Valorous Aegis Legplates",
+  "quality": 4,
+  "boss": "Emalon the Storm Watcher",
+  "allowable_classes": [
+   "paladin"
+  ]
+ },
+ {
+  "id": 45341,
+  "name": "Valorous Darkruned Gauntlets",
+  "quality": 4,
+  "boss": "Emalon the Storm Watcher",
+  "allowable_classes": [
+   "deathknight"
+  ]
+ },
+ {
+  "id": 45337,
+  "name": "Valorous Darkruned Handguards",
+  "quality": 4,
+  "boss": "Emalon the Storm Watcher",
+  "allowable_classes": [
+   "deathknight"
+  ]
+ },
+ {
+  "id": 45338,
+  "name": "Valorous Darkruned Legguards",
+  "quality": 4,
+  "boss": "Emalon the Storm Watcher",
+  "allowable_classes": [
+   "deathknight"
+  ]
+ },
+ {
+  "id": 45343,
+  "name": "Valorous Darkruned Legplates",
+  "quality": 4,
+  "boss": "Emalon the Storm Watcher",
+  "allowable_classes": [
+   "deathknight"
+  ]
+ },
+ {
+  "id": 45419,
+  "name": "Valorous Deathbringer Gloves",
+  "quality": 4,
+  "boss": "Emalon the Storm Watcher",
+  "allowable_classes": [
+   "warlock"
+  ]
+ },
+ {
+  "id": 45420,
+  "name": "Valorous Deathbringer Leggings",
+  "quality": 4,
+  "boss": "Emalon the Storm Watcher",
+  "allowable_classes": [
+   "warlock"
+  ]
+ },
+ {
+  "id": 45387,
+  "name": "Valorous Gloves of Sanctification",
+  "quality": 4,
+  "boss": "Emalon the Storm Watcher",
+  "allowable_classes": [
+   "priest"
+  ]
+ },
+ {
+  "id": 45392,
+  "name": "Valorous Handwraps of Sanctification",
+  "quality": 4,
+  "boss": "Emalon the Storm Watcher",
+  "allowable_classes": [
+   "priest"
+  ]
+ },
+ {
+  "id": 46131,
+  "name": "Valorous Kirin Tor Gauntlets",
+  "quality": 4,
+  "boss": "Emalon the Storm Watcher",
+  "allowable_classes": [
+   "mage"
+  ]
+ },
+ {
+  "id": 45367,
+  "name": "Valorous Kirin Tor Leggings",
+  "quality": 4,
+  "boss": "Emalon the Storm Watcher",
+  "allowable_classes": [
+   "mage"
+  ]
+ },
+ {
+  "id": 45388,
+  "name": "Valorous Leggings of Sanctification",
+  "quality": 4,
+  "boss": "Emalon the Storm Watcher",
+  "allowable_classes": [
+   "priest"
+  ]
+ },
+ {
+  "id": 45351,
+  "name": "Valorous Nightsong Gloves",
+  "quality": 4,
+  "boss": "Emalon the Storm Watcher",
+  "allowable_classes": [
+   "druid"
+  ]
+ },
+ {
+  "id": 45355,
+  "name": "Valorous Nightsong Handgrips",
+  "quality": 4,
+  "boss": "Emalon the Storm Watcher",
+  "allowable_classes": [
+   "druid"
+  ]
+ },
+ {
+  "id": 45345,
+  "name": "Valorous Nightsong Handguards",
+  "quality": 4,
+  "boss": "Emalon the Storm Watcher",
+  "allowable_classes": [
+   "druid"
+  ]
+ },
+ {
+  "id": 45347,
+  "name": "Valorous Nightsong Leggings",
+  "quality": 4,
+  "boss": "Emalon the Storm Watcher",
+  "allowable_classes": [
+   "druid"
+  ]
+ },
+ {
+  "id": 45357,
+  "name": "Valorous Nightsong Legguards",
+  "quality": 4,
+  "boss": "Emalon the Storm Watcher",
+  "allowable_classes": [
+   "druid"
+  ]
+ },
+ {
+  "id": 45353,
+  "name": "Valorous Nightsong Trousers",
+  "quality": 4,
+  "boss": "Emalon the Storm Watcher",
+  "allowable_classes": [
+   "druid"
+  ]
+ },
+ {
+  "id": 45394,
+  "name": "Valorous Pants of Sanctification",
+  "quality": 4,
+  "boss": "Emalon the Storm Watcher",
+  "allowable_classes": [
+   "priest"
+  ]
+ },
+ {
+  "id": 45360,
+  "name": "Valorous Scourgestalker Handguards",
+  "quality": 4,
+  "boss": "Emalon the Storm Watcher",
+  "allowable_classes": [
+   "hunter"
+  ]
+ },
+ {
+  "id": 45362,
+  "name": "Valorous Scourgestalker Legguards",
+  "quality": 4,
+  "boss": "Emalon the Storm Watcher",
+  "allowable_classes": [
+   "hunter"
+  ]
+ },
+ {
+  "id": 45430,
+  "name": "Valorous Siegebreaker Gauntlets",
+  "quality": 4,
+  "boss": "Emalon the Storm Watcher",
+  "allowable_classes": [
+   "warrior"
+  ]
+ },
+ {
+  "id": 45426,
+  "name": "Valorous Siegebreaker Handguards",
+  "quality": 4,
+  "boss": "Emalon the Storm Watcher",
+  "allowable_classes": [
+   "warrior"
+  ]
+ },
+ {
+  "id": 45427,
+  "name": "Valorous Siegebreaker Legguards",
+  "quality": 4,
+  "boss": "Emalon the Storm Watcher",
+  "allowable_classes": [
+   "warrior"
+  ]
+ },
+ {
+  "id": 45432,
+  "name": "Valorous Siegebreaker Legplates",
+  "quality": 4,
+  "boss": "Emalon the Storm Watcher",
+  "allowable_classes": [
+   "warrior"
+  ]
+ },
+ {
+  "id": 45397,
+  "name": "Valorous Terrorblade Gauntlets",
+  "quality": 4,
+  "boss": "Emalon the Storm Watcher",
+  "allowable_classes": [
+   "rogue"
+  ]
+ },
+ {
+  "id": 45399,
+  "name": "Valorous Terrorblade Legplates",
+  "quality": 4,
+  "boss": "Emalon the Storm Watcher",
+  "allowable_classes": [
+   "rogue"
+  ]
+ },
+ {
+  "id": 45406,
+  "name": "Valorous Worldbreaker Gloves",
+  "quality": 4,
+  "boss": "Emalon the Storm Watcher",
+  "allowable_classes": [
+   "shaman"
+  ]
+ },
+ {
+  "id": 45414,
+  "name": "Valorous Worldbreaker Grips",
+  "quality": 4,
+  "boss": "Emalon the Storm Watcher",
+  "allowable_classes": [
+   "shaman"
+  ]
+ },
+ {
+  "id": 45401,
+  "name": "Valorous Worldbreaker Handguards",
+  "quality": 4,
+  "boss": "Emalon the Storm Watcher",
+  "allowable_classes": [
+   "shaman"
+  ]
+ },
+ {
+  "id": 45409,
+  "name": "Valorous Worldbreaker Kilt",
+  "quality": 4,
+  "boss": "Emalon the Storm Watcher",
+  "allowable_classes": [
+   "shaman"
+  ]
+ },
+ {
+  "id": 45403,
+  "name": "Valorous Worldbreaker Legguards",
+  "quality": 4,
+  "boss": "Emalon the Storm Watcher",
+  "allowable_classes": [
+   "shaman"
+  ]
+ },
+ {
+  "id": 45416,
+  "name": "Valorous Worldbreaker War-Kilt",
+  "quality": 4,
+  "boss": "Emalon the Storm Watcher",
+  "allowable_classes": [
+   "shaman"
+  ]
+ },
+ {
+  "id": 41640,
+  "name": "Furious Gladiator's Armwraps of Dominance",
+  "quality": 4,
+  "boss": "Koralon the Flame Watcher",
+  "allowable_classes": [
+   "rogue",
+   "druid"
+  ]
+ },
+ {
+  "id": 41625,
+  "name": "Furious Gladiator's Armwraps of Salvation",
+  "quality": 4,
+  "boss": "Koralon the Flame Watcher",
+  "allowable_classes": [
+   "rogue",
+   "druid"
+  ]
+ },
+ {
+  "id": 41840,
+  "name": "Furious Gladiator's Armwraps of Triumph",
+  "quality": 4,
+  "boss": "Koralon the Flame Watcher",
+  "allowable_classes": [
+   "rogue",
+   "druid"
+  ]
+ },
+ {
+  "id": 42116,
+  "name": "Furious Gladiator's Band of Dominance",
+  "quality": 4,
+  "boss": "Koralon the Flame Watcher"
+ },
+ {
+  "id": 42117,
+  "name": "Furious Gladiator's Band of Triumph",
+  "quality": 4,
+  "boss": "Koralon the Flame Watcher"
+ },
+ {
+  "id": 41630,
+  "name": "Furious Gladiator's Belt of Dominance",
+  "quality": 4,
+  "boss": "Koralon the Flame Watcher",
+  "allowable_classes": [
+   "rogue",
+   "druid"
+  ]
+ },
+ {
+  "id": 41617,
+  "name": "Furious Gladiator's Belt of Salvation",
+  "quality": 4,
+  "boss": "Koralon the Flame Watcher",
+  "allowable_classes": [
+   "rogue",
+   "druid"
+  ]
+ },
+ {
+  "id": 41832,
+  "name": "Furious Gladiator's Belt of Triumph",
+  "quality": 4,
+  "boss": "Koralon the Flame Watcher",
+  "allowable_classes": [
+   "rogue",
+   "druid"
+  ]
+ },
+ {
+  "id": 41635,
+  "name": "Furious Gladiator's Boots of Dominance",
+  "quality": 4,
+  "boss": "Koralon the Flame Watcher",
+  "allowable_classes": [
+   "rogue",
+   "druid"
+  ]
+ },
+ {
+  "id": 41621,
+  "name": "Furious Gladiator's Boots of Salvation",
+  "quality": 4,
+  "boss": "Koralon the Flame Watcher",
+  "allowable_classes": [
+   "rogue",
+   "druid"
+  ]
+ },
+ {
+  "id": 41836,
+  "name": "Furious Gladiator's Boots of Triumph",
+  "quality": 4,
+  "boss": "Koralon the Flame Watcher",
+  "allowable_classes": [
+   "rogue",
+   "druid"
+  ]
+ },
+ {
+  "id": 40983,
+  "name": "Furious Gladiator's Bracers of Salvation",
+  "quality": 4,
+  "boss": "Koralon the Flame Watcher",
+  "allowable_classes": [
+   "warrior",
+   "paladin"
+  ]
+ },
+ {
+  "id": 40889,
+  "name": "Furious Gladiator's Bracers of Triumph",
+  "quality": 4,
+  "boss": "Koralon the Flame Watcher",
+  "allowable_classes": [
+   "warrior",
+   "paladin",
+   "deathknight"
+  ]
+ },
+ {
+  "id": 41143,
+  "name": "Furious Gladiator's Chain Gauntlets",
+  "quality": 4,
+  "boss": "Koralon the Flame Watcher",
+  "allowable_classes": [
+   "hunter"
+  ]
+ },
+ {
+  "id": 41205,
+  "name": "Furious Gladiator's Chain Leggings",
+  "quality": 4,
+  "boss": "Koralon the Flame Watcher",
+  "allowable_classes": [
+   "hunter"
+  ]
+ },
+ {
+  "id": 42071,
+  "name": "Furious Gladiator's Cloak of Ascendancy",
+  "quality": 4,
+  "boss": "Koralon the Flame Watcher"
+ },
+ {
+  "id": 42073,
+  "name": "Furious Gladiator's Cloak of Deliverance",
+  "quality": 4,
+  "boss": "Koralon the Flame Watcher"
+ },
+ {
+  "id": 42069,
+  "name": "Furious Gladiator's Cloak of Dominance",
+  "quality": 4,
+  "boss": "Koralon the Flame Watcher"
+ },
+ {
+  "id": 42072,
+  "name": "Furious Gladiator's Cloak of Salvation",
+  "quality": 4,
+  "boss": "Koralon the Flame Watcher"
+ },
+ {
+  "id": 42070,
+  "name": "Furious Gladiator's Cloak of Subjugation",
+  "quality": 4,
+  "boss": "Koralon the Flame Watcher"
+ },
+ {
+  "id": 42074,
+  "name": "Furious Gladiator's Cloak of Triumph",
+  "quality": 4,
+  "boss": "Koralon the Flame Watcher"
+ },
+ {
+  "id": 42075,
+  "name": "Furious Gladiator's Cloak of Victory",
+  "quality": 4,
+  "boss": "Koralon the Flame Watcher"
+ },
+ {
+  "id": 41898,
+  "name": "Furious Gladiator's Cord of Dominance",
+  "quality": 4,
+  "boss": "Koralon the Flame Watcher",
+  "allowable_classes": [
+   "priest",
+   "mage",
+   "warlock"
+  ]
+ },
+ {
+  "id": 41881,
+  "name": "Furious Gladiator's Cord of Salvation",
+  "quality": 4,
+  "boss": "Koralon the Flame Watcher",
+  "allowable_classes": [
+   "priest",
+   "mage",
+   "warlock"
+  ]
+ },
+ {
+  "id": 41909,
+  "name": "Furious Gladiator's Cuffs of Dominance",
+  "quality": 4,
+  "boss": "Koralon the Flame Watcher",
+  "allowable_classes": [
+   "priest",
+   "mage",
+   "warlock"
+  ]
+ },
+ {
+  "id": 41893,
+  "name": "Furious Gladiator's Cuffs of Salvation",
+  "quality": 4,
+  "boss": "Koralon the Flame Watcher",
+  "allowable_classes": [
+   "priest",
+   "mage",
+   "warlock"
+  ]
+ },
+ {
+  "id": 41773,
+  "name": "Furious Gladiator's Dragonhide Gloves",
+  "quality": 4,
+  "boss": "Koralon the Flame Watcher",
+  "allowable_classes": [
+   "druid"
+  ]
+ },
+ {
+  "id": 41667,
+  "name": "Furious Gladiator's Dragonhide Legguards",
+  "quality": 4,
+  "boss": "Koralon the Flame Watcher",
+  "allowable_classes": [
+   "druid"
+  ]
+ },
+ {
+  "id": 40809,
+  "name": "Furious Gladiator's Dreadplate Gauntlets",
+  "quality": 4,
+  "boss": "Koralon the Flame Watcher",
+  "allowable_classes": [
+   "deathknight"
+  ]
+ },
+ {
+  "id": 40848,
+  "name": "Furious Gladiator's Dreadplate Legguards",
+  "quality": 4,
+  "boss": "Koralon the Flame Watcher",
+  "allowable_classes": [
+   "deathknight"
+  ]
+ },
+ {
+  "id": 42017,
+  "name": "Furious Gladiator's Felweave Handguards",
+  "quality": 4,
+  "boss": "Koralon the Flame Watcher",
+  "allowable_classes": [
+   "warlock"
+  ]
+ },
+ {
+  "id": 42005,
+  "name": "Furious Gladiator's Felweave Trousers",
+  "quality": 4,
+  "boss": "Koralon the Flame Watcher",
+  "allowable_classes": [
+   "warlock"
+  ]
+ },
+ {
+  "id": 40976,
+  "name": "Furious Gladiator's Girdle of Salvation",
+  "quality": 4,
+  "boss": "Koralon the Flame Watcher",
+  "allowable_classes": [
+   "warrior",
+   "paladin"
+  ]
+ },
+ {
+  "id": 40881,
+  "name": "Furious Gladiator's Girdle of Triumph",
+  "quality": 4,
+  "boss": "Koralon the Flame Watcher",
+  "allowable_classes": [
+   "warrior",
+   "paladin",
+   "deathknight"
+  ]
+ },
+ {
+  "id": 40977,
+  "name": "Furious Gladiator's Greaves of Salvation",
+  "quality": 4,
+  "boss": "Koralon the Flame Watcher",
+  "allowable_classes": [
+   "warrior",
+   "paladin"
+  ]
+ },
+ {
+  "id": 40882,
+  "name": "Furious Gladiator's Greaves of Triumph",
+  "quality": 4,
+  "boss": "Koralon the Flame Watcher",
+  "allowable_classes": [
+   "warrior",
+   "paladin",
+   "deathknight"
+  ]
+ },
+ {
+  "id": 41287,
+  "name": "Furious Gladiator's Kodohide Gloves",
+  "quality": 4,
+  "boss": "Koralon the Flame Watcher",
+  "allowable_classes": [
+   "druid"
+  ]
+ },
+ {
+  "id": 41298,
+  "name": "Furious Gladiator's Kodohide Legguards",
+  "quality": 4,
+  "boss": "Koralon the Flame Watcher",
+  "allowable_classes": [
+   "druid"
+  ]
+ },
+ {
+  "id": 41767,
+  "name": "Furious Gladiator's Leather Gloves",
+  "quality": 4,
+  "boss": "Koralon the Flame Watcher",
+  "allowable_classes": [
+   "rogue"
+  ]
+ },
+ {
+  "id": 41655,
+  "name": "Furious Gladiator's Leather Legguards",
+  "quality": 4,
+  "boss": "Koralon the Flame Watcher",
+  "allowable_classes": [
+   "rogue"
+  ]
+ },
+ {
+  "id": 41137,
+  "name": "Furious Gladiator's Linked Gauntlets",
+  "quality": 4,
+  "boss": "Koralon the Flame Watcher",
+  "allowable_classes": [
+   "shaman"
+  ]
+ },
+ {
+  "id": 41199,
+  "name": "Furious Gladiator's Linked Leggings",
+  "quality": 4,
+  "boss": "Koralon the Flame Watcher",
+  "allowable_classes": [
+   "shaman"
+  ]
+ },
+ {
+  "id": 41007,
+  "name": "Furious Gladiator's Mail Gauntlets",
+  "quality": 4,
+  "boss": "Koralon the Flame Watcher",
+  "allowable_classes": [
+   "shaman"
+  ]
+ },
+ {
+  "id": 41033,
+  "name": "Furious Gladiator's Mail Leggings",
+  "quality": 4,
+  "boss": "Koralon the Flame Watcher",
+  "allowable_classes": [
+   "shaman"
+  ]
+ },
+ {
+  "id": 41874,
+  "name": "Furious Gladiator's Mooncloth Gloves",
+  "quality": 4,
+  "boss": "Koralon the Flame Watcher",
+  "allowable_classes": [
+   "priest"
+  ]
+ },
+ {
+  "id": 41864,
+  "name": "Furious Gladiator's Mooncloth Leggings",
+  "quality": 4,
+  "boss": "Koralon the Flame Watcher",
+  "allowable_classes": [
+   "priest"
+  ]
+ },
+ {
+  "id": 40927,
+  "name": "Furious Gladiator's Ornamented Gloves",
+  "quality": 4,
+  "boss": "Koralon the Flame Watcher",
+  "allowable_classes": [
+   "paladin"
+  ]
+ },
+ {
+  "id": 40939,
+  "name": "Furious Gladiator's Ornamented Legplates",
+  "quality": 4,
+  "boss": "Koralon the Flame Watcher",
+  "allowable_classes": [
+   "paladin"
+  ]
+ },
+ {
+  "id": 42037,
+  "name": "Furious Gladiator's Pendant of Ascendancy",
+  "quality": 4,
+  "boss": "Koralon the Flame Watcher"
+ },
+ {
+  "id": 42039,
+  "name": "Furious Gladiator's Pendant of Deliverance",
+  "quality": 4,
+  "boss": "Koralon the Flame Watcher"
+ },
+ {
+  "id": 42036,
+  "name": "Furious Gladiator's Pendant of Dominance",
+  "quality": 4,
+  "boss": "Koralon the Flame Watcher"
+ },
+ {
+  "id": 42040,
+  "name": "Furious Gladiator's Pendant of Salvation",
+  "quality": 4,
+  "boss": "Koralon the Flame Watcher"
+ },
+ {
+  "id": 42038,
+  "name": "Furious Gladiator's Pendant of Subjugation",
+  "quality": 4,
+  "boss": "Koralon the Flame Watcher"
+ },
+ {
+  "id": 46373,
+  "name": "Furious Gladiator's Pendant of Sundering",
+  "quality": 4,
+  "boss": "Koralon the Flame Watcher"
+ },
+ {
+  "id": 42034,
+  "name": "Furious Gladiator's Pendant of Triumph",
+  "quality": 4,
+  "boss": "Koralon the Flame Watcher"
+ },
+ {
+  "id": 42035,
+  "name": "Furious Gladiator's Pendant of Victory",
+  "quality": 4,
+  "boss": "Koralon the Flame Watcher"
+ },
+ {
+  "id": 40807,
+  "name": "Furious Gladiator's Plate Gauntlets",
+  "quality": 4,
+  "boss": "Koralon the Flame Watcher",
+  "allowable_classes": [
+   "warrior"
+  ]
+ },
+ {
+  "id": 40847,
+  "name": "Furious Gladiator's Plate Legguards",
+  "quality": 4,
+  "boss": "Koralon the Flame Watcher",
+  "allowable_classes": [
+   "warrior"
+  ]
+ },
+ {
+  "id": 41001,
+  "name": "Furious Gladiator's Ringmail Gauntlets",
+  "quality": 4,
+  "boss": "Koralon the Flame Watcher",
+  "allowable_classes": [
+   "shaman"
+  ]
+ },
+ {
+  "id": 41027,
+  "name": "Furious Gladiator's Ringmail Leggings",
+  "quality": 4,
+  "boss": "Koralon the Flame Watcher",
+  "allowable_classes": [
+   "shaman"
+  ]
+ },
+ {
+  "id": 41075,
+  "name": "Furious Gladiator's Sabatons of Dominance",
+  "quality": 4,
+  "boss": "Koralon the Flame Watcher",
+  "allowable_classes": [
+   "hunter",
+   "shaman"
+  ]
+ },
+ {
+  "id": 41055,
+  "name": "Furious Gladiator's Sabatons of Salvation",
+  "quality": 4,
+  "boss": "Koralon the Flame Watcher",
+  "allowable_classes": [
+   "hunter",
+   "shaman"
+  ]
+ },
+ {
+  "id": 41230,
+  "name": "Furious Gladiator's Sabatons of Triumph",
+  "quality": 4,
+  "boss": "Koralon the Flame Watcher",
+  "allowable_classes": [
+   "hunter",
+   "shaman"
+  ]
+ },
+ {
+  "id": 41940,
+  "name": "Furious Gladiator's Satin Gloves",
+  "quality": 4,
+  "boss": "Koralon the Flame Watcher",
+  "allowable_classes": [
+   "priest"
+  ]
+ },
+ {
+  "id": 41927,
+  "name": "Furious Gladiator's Satin Leggings",
+  "quality": 4,
+  "boss": "Koralon the Flame Watcher",
+  "allowable_classes": [
+   "priest"
+  ]
+ },
+ {
+  "id": 40808,
+  "name": "Furious Gladiator's Scaled Gauntlets",
+  "quality": 4,
+  "boss": "Koralon the Flame Watcher",
+  "allowable_classes": [
+   "paladin"
+  ]
+ },
+ {
+  "id": 40849,
+  "name": "Furious Gladiator's Scaled Legguards",
+  "quality": 4,
+  "boss": "Koralon the Flame Watcher",
+  "allowable_classes": [
+   "paladin"
+  ]
+ },
+ {
+  "id": 41971,
+  "name": "Furious Gladiator's Silk Handguards",
+  "quality": 4,
+  "boss": "Koralon the Flame Watcher",
+  "allowable_classes": [
+   "mage"
+  ]
+ },
+ {
+  "id": 41959,
+  "name": "Furious Gladiator's Silk Trousers",
+  "quality": 4,
+  "boss": "Koralon the Flame Watcher",
+  "allowable_classes": [
+   "mage"
+  ]
+ },
+ {
+  "id": 41903,
+  "name": "Furious Gladiator's Slippers of Dominance",
+  "quality": 4,
+  "boss": "Koralon the Flame Watcher",
+  "allowable_classes": [
+   "priest",
+   "mage",
+   "warlock"
+  ]
+ },
+ {
+  "id": 41885,
+  "name": "Furious Gladiator's Slippers of Salvation",
+  "quality": 4,
+  "boss": "Koralon the Flame Watcher",
+  "allowable_classes": [
+   "priest",
+   "mage",
+   "warlock"
+  ]
+ },
+ {
+  "id": 41070,
+  "name": "Furious Gladiator's Waistguard of Dominance",
+  "quality": 4,
+  "boss": "Koralon the Flame Watcher",
+  "allowable_classes": [
+   "hunter",
+   "shaman"
+  ]
+ },
+ {
+  "id": 41051,
+  "name": "Furious Gladiator's Waistguard of Salvation",
+  "quality": 4,
+  "boss": "Koralon the Flame Watcher",
+  "allowable_classes": [
+   "hunter",
+   "shaman"
+  ]
+ },
+ {
+  "id": 41235,
+  "name": "Furious Gladiator's Waistguard of Triumph",
+  "quality": 4,
+  "boss": "Koralon the Flame Watcher",
+  "allowable_classes": [
+   "hunter",
+   "shaman"
+  ]
+ },
+ {
+  "id": 41065,
+  "name": "Furious Gladiator's Wristguards of Dominance",
+  "quality": 4,
+  "boss": "Koralon the Flame Watcher",
+  "allowable_classes": [
+   "hunter",
+   "shaman"
+  ]
+ },
+ {
+  "id": 41060,
+  "name": "Furious Gladiator's Wristguards of Salvation",
+  "quality": 4,
+  "boss": "Koralon the Flame Watcher",
+  "allowable_classes": [
+   "hunter",
+   "shaman"
+  ]
+ },
+ {
+  "id": 41225,
+  "name": "Furious Gladiator's Wristguards of Triumph",
+  "quality": 4,
+  "boss": "Koralon the Flame Watcher",
+  "allowable_classes": [
+   "hunter",
+   "shaman"
+  ]
+ },
+ {
+  "id": 41293,
+  "name": "Furious Gladiator's Wyrmhide Gloves",
+  "quality": 4,
+  "boss": "Koralon the Flame Watcher",
+  "allowable_classes": [
+   "druid"
+  ]
+ },
+ {
+  "id": 41304,
+  "name": "Furious Gladiator's Wyrmhide Legguards",
+  "quality": 4,
+  "boss": "Koralon the Flame Watcher",
+  "allowable_classes": [
+   "druid"
+  ]
+ },
+ {
+  "id": 48244,
+  "name": "Garona's Gauntlets of Conquest",
+  "quality": 4,
+  "boss": "Koralon the Flame Watcher",
+  "allowable_classes": [
+   "rogue"
+  ]
+ },
+ {
+  "id": 48246,
+  "name": "Garona's Legplates of Conquest",
+  "quality": 4,
+  "boss": "Koralon the Flame Watcher",
+  "allowable_classes": [
+   "rogue"
+  ]
+ },
+ {
+  "id": 47802,
+  "name": "Gul'dan's Gloves of Conquest",
+  "quality": 4,
+  "boss": "Koralon the Flame Watcher",
+  "allowable_classes": [
+   "warlock"
+  ]
+ },
+ {
+  "id": 47800,
+  "name": "Gul'dan's Leggings of Conquest",
+  "quality": 4,
+  "boss": "Koralon the Flame Watcher",
+  "allowable_classes": [
+   "warlock"
+  ]
+ },
+ {
+  "id": 48387,
+  "name": "Hellscream's Gauntlets of Conquest",
+  "quality": 4,
+  "boss": "Koralon the Flame Watcher",
+  "allowable_classes": [
+   "warrior"
+  ]
+ },
+ {
+  "id": 48457,
+  "name": "Hellscream's Handguards of Conquest",
+  "quality": 4,
+  "boss": "Koralon the Flame Watcher",
+  "allowable_classes": [
+   "warrior"
+  ]
+ },
+ {
+  "id": 48459,
+  "name": "Hellscream's Legguards of Conquest",
+  "quality": 4,
+  "boss": "Koralon the Flame Watcher",
+  "allowable_classes": [
+   "warrior"
+  ]
+ },
+ {
+  "id": 48389,
+  "name": "Hellscream's Legplates of Conquest",
+  "quality": 4,
+  "boss": "Koralon the Flame Watcher",
+  "allowable_classes": [
+   "warrior"
+  ]
+ },
+ {
+  "id": 47783,
+  "name": "Kel'Thuzad's Gloves of Conquest",
+  "quality": 4,
+  "boss": "Koralon the Flame Watcher",
+  "allowable_classes": [
+   "warlock"
+  ]
+ },
+ {
+  "id": 47785,
+  "name": "Kel'Thuzad's Leggings of Conquest",
+  "quality": 4,
+  "boss": "Koralon the Flame Watcher",
+  "allowable_classes": [
+   "warlock"
+  ]
+ },
+ {
+  "id": 47752,
+  "name": "Khadgar's Gauntlets of Conquest",
+  "quality": 4,
+  "boss": "Koralon the Flame Watcher",
+  "allowable_classes": [
+   "mage"
+  ]
+ },
+ {
+  "id": 47750,
+  "name": "Khadgar's Leggings of Conquest",
+  "quality": 4,
+  "boss": "Koralon the Flame Watcher",
+  "allowable_classes": [
+   "mage"
+  ]
+ },
+ {
+  "id": 48502,
+  "name": "Koltira's Gauntlets of Conquest",
+  "quality": 4,
+  "boss": "Koralon the Flame Watcher",
+  "allowable_classes": [
+   "deathknight"
+  ]
+ },
+ {
+  "id": 48559,
+  "name": "Koltira's Handguards of Conquest",
+  "quality": 4,
+  "boss": "Koralon the Flame Watcher",
+  "allowable_classes": [
+   "deathknight"
+  ]
+ },
+ {
+  "id": 48561,
+  "name": "Koltira's Legguards of Conquest",
+  "quality": 4,
+  "boss": "Koralon the Flame Watcher",
+  "allowable_classes": [
+   "deathknight"
+  ]
+ },
+ {
+  "id": 48504,
+  "name": "Koltira's Legplates of Conquest",
+  "quality": 4,
+  "boss": "Koralon the Flame Watcher",
+  "allowable_classes": [
+   "deathknight"
+  ]
+ },
+ {
+  "id": 48630,
+  "name": "Liadrin's Gauntlets of Conquest",
+  "quality": 4,
+  "boss": "Koralon the Flame Watcher",
+  "allowable_classes": [
+   "paladin"
+  ]
+ },
+ {
+  "id": 48598,
+  "name": "Liadrin's Gloves of Conquest",
+  "quality": 4,
+  "boss": "Koralon the Flame Watcher",
+  "allowable_classes": [
+   "paladin"
+  ]
+ },
+ {
+  "id": 48596,
+  "name": "Liadrin's Greaves of Conquest",
+  "quality": 4,
+  "boss": "Koralon the Flame Watcher",
+  "allowable_classes": [
+   "paladin"
+  ]
+ },
+ {
+  "id": 48653,
+  "name": "Liadrin's Handguards of Conquest",
+  "quality": 4,
+  "boss": "Koralon the Flame Watcher",
+  "allowable_classes": [
+   "paladin"
+  ]
+ },
+ {
+  "id": 48655,
+  "name": "Liadrin's Legguards of Conquest",
+  "quality": 4,
+  "boss": "Koralon the Flame Watcher",
+  "allowable_classes": [
+   "paladin"
+  ]
+ },
+ {
+  "id": 48628,
+  "name": "Liadrin's Legplates of Conquest",
+  "quality": 4,
+  "boss": "Koralon the Flame Watcher",
+  "allowable_classes": [
+   "paladin"
+  ]
+ },
+ {
+  "id": 48162,
+  "name": "Malfurion's Gloves of Conquest",
+  "quality": 4,
+  "boss": "Koralon the Flame Watcher",
+  "allowable_classes": [
+   "druid"
+  ]
+ },
+ {
+  "id": 48213,
+  "name": "Malfurion's Handgrips of Conquest",
+  "quality": 4,
+  "boss": "Koralon the Flame Watcher",
+  "allowable_classes": [
+   "druid"
+  ]
+ },
+ {
+  "id": 48132,
+  "name": "Malfurion's Handguards of Conquest",
+  "quality": 4,
+  "boss": "Koralon the Flame Watcher",
+  "allowable_classes": [
+   "druid"
+  ]
+ },
+ {
+  "id": 48130,
+  "name": "Malfurion's Leggings of Conquest",
+  "quality": 4,
+  "boss": "Koralon the Flame Watcher",
+  "allowable_classes": [
+   "druid"
+  ]
+ },
+ {
+  "id": 48215,
+  "name": "Malfurion's Legguards of Conquest",
+  "quality": 4,
+  "boss": "Koralon the Flame Watcher",
+  "allowable_classes": [
+   "druid"
+  ]
+ },
+ {
+  "id": 48160,
+  "name": "Malfurion's Trousers of Conquest",
+  "quality": 4,
+  "boss": "Koralon the Flame Watcher",
+  "allowable_classes": [
+   "druid"
+  ]
+ },
+ {
+  "id": 48312,
+  "name": "Nobundo's Gloves of Conquest",
+  "quality": 4,
+  "boss": "Koralon the Flame Watcher",
+  "allowable_classes": [
+   "shaman"
+  ]
+ },
+ {
+  "id": 48342,
+  "name": "Nobundo's Grips of Conquest",
+  "quality": 4,
+  "boss": "Koralon the Flame Watcher",
+  "allowable_classes": [
+   "shaman"
+  ]
+ },
+ {
+  "id": 48284,
+  "name": "Nobundo's Handguards of Conquest",
+  "quality": 4,
+  "boss": "Koralon the Flame Watcher",
+  "allowable_classes": [
+   "shaman"
+  ]
+ },
+ {
+  "id": 48314,
+  "name": "Nobundo's Kilt of Conquest",
+  "quality": 4,
+  "boss": "Koralon the Flame Watcher",
+  "allowable_classes": [
+   "shaman"
+  ]
+ },
+ {
+  "id": 48282,
+  "name": "Nobundo's Legguards of Conquest",
+  "quality": 4,
+  "boss": "Koralon the Flame Watcher",
+  "allowable_classes": [
+   "shaman"
+  ]
+ },
+ {
+  "id": 48344,
+  "name": "Nobundo's War-Kilt of Conquest",
+  "quality": 4,
+  "boss": "Koralon the Flame Watcher",
+  "allowable_classes": [
+   "shaman"
+  ]
+ },
+ {
+  "id": 48183,
+  "name": "Runetotem's Gloves of Conquest",
+  "quality": 4,
+  "boss": "Koralon the Flame Watcher",
+  "allowable_classes": [
+   "druid"
+  ]
+ },
+ {
+  "id": 48192,
+  "name": "Runetotem's Handgrips of Conquest",
+  "quality": 4,
+  "boss": "Koralon the Flame Watcher",
+  "allowable_classes": [
+   "druid"
+  ]
+ },
+ {
+  "id": 48153,
+  "name": "Runetotem's Handguards of Conquest",
+  "quality": 4,
+  "boss": "Koralon the Flame Watcher",
+  "allowable_classes": [
+   "druid"
+  ]
+ },
+ {
+  "id": 48155,
+  "name": "Runetotem's Leggings of Conquest",
+  "quality": 4,
+  "boss": "Koralon the Flame Watcher",
+  "allowable_classes": [
+   "druid"
+  ]
+ },
+ {
+  "id": 48190,
+  "name": "Runetotem's Legguards of Conquest",
+  "quality": 4,
+  "boss": "Koralon the Flame Watcher",
+  "allowable_classes": [
+   "druid"
+  ]
+ },
+ {
+  "id": 48185,
+  "name": "Runetotem's Trousers of Conquest",
+  "quality": 4,
+  "boss": "Koralon the Flame Watcher",
+  "allowable_classes": [
+   "druid"
+  ]
+ },
+ {
+  "id": 47773,
+  "name": "Sunstrider's Gauntlets of Conquest",
+  "quality": 4,
+  "boss": "Koralon the Flame Watcher",
+  "allowable_classes": [
+   "mage"
+  ]
+ },
+ {
+  "id": 47775,
+  "name": "Sunstrider's Leggings of Conquest",
+  "quality": 4,
+  "boss": "Koralon the Flame Watcher",
+  "allowable_classes": [
+   "mage"
+  ]
+ },
+ {
+  "id": 48480,
+  "name": "Thassarian's Gauntlets of Conquest",
+  "quality": 4,
+  "boss": "Koralon the Flame Watcher",
+  "allowable_classes": [
+   "deathknight"
+  ]
+ },
+ {
+  "id": 48537,
+  "name": "Thassarian's Handguards of Conquest",
+  "quality": 4,
+  "boss": "Koralon the Flame Watcher",
+  "allowable_classes": [
+   "deathknight"
+  ]
+ },
+ {
+  "id": 48533,
+  "name": "Thassarian's Legguards of Conquest",
+  "quality": 4,
+  "boss": "Koralon the Flame Watcher",
+  "allowable_classes": [
+   "deathknight"
+  ]
+ },
+ {
+  "id": 48476,
+  "name": "Thassarian's Legplates of Conquest",
+  "quality": 4,
+  "boss": "Koralon the Flame Watcher",
+  "allowable_classes": [
+   "deathknight"
+  ]
+ },
+ {
+  "id": 48337,
+  "name": "Thrall's Gloves of Conquest",
+  "quality": 4,
+  "boss": "Koralon the Flame Watcher",
+  "allowable_classes": [
+   "shaman"
+  ]
+ },
+ {
+  "id": 48367,
+  "name": "Thrall's Grips of Conquest",
+  "quality": 4,
+  "boss": "Koralon the Flame Watcher",
+  "allowable_classes": [
+   "shaman"
+  ]
+ },
+ {
+  "id": 48296,
+  "name": "Thrall's Handguards of Conquest",
+  "quality": 4,
+  "boss": "Koralon the Flame Watcher",
+  "allowable_classes": [
+   "shaman"
+  ]
+ },
+ {
+  "id": 48339,
+  "name": "Thrall's Kilt of Conquest",
+  "quality": 4,
+  "boss": "Koralon the Flame Watcher",
+  "allowable_classes": [
+   "shaman"
+  ]
+ },
+ {
+  "id": 48298,
+  "name": "Thrall's Legguards of Conquest",
+  "quality": 4,
+  "boss": "Koralon the Flame Watcher",
+  "allowable_classes": [
+   "shaman"
+  ]
+ },
+ {
+  "id": 48369,
+  "name": "Thrall's War-Kilt of Conquest",
+  "quality": 4,
+  "boss": "Koralon the Flame Watcher",
+  "allowable_classes": [
+   "shaman"
+  ]
+ },
+ {
+  "id": 48603,
+  "name": "Turalyon's Gauntlets of Conquest",
+  "quality": 4,
+  "boss": "Koralon the Flame Watcher",
+  "allowable_classes": [
+   "paladin"
+  ]
+ },
+ {
+  "id": 48574,
+  "name": "Turalyon's Gloves of Conquest",
+  "quality": 4,
+  "boss": "Koralon the Flame Watcher",
+  "allowable_classes": [
+   "paladin"
+  ]
+ },
+ {
+  "id": 48568,
+  "name": "Turalyon's Greaves of Conquest",
+  "quality": 4,
+  "boss": "Koralon the Flame Watcher",
+  "allowable_classes": [
+   "paladin"
+  ]
+ },
+ {
+  "id": 48633,
+  "name": "Turalyon's Handguards of Conquest",
+  "quality": 4,
+  "boss": "Koralon the Flame Watcher",
+  "allowable_classes": [
+   "paladin"
+  ]
+ },
+ {
+  "id": 48635,
+  "name": "Turalyon's Legguards of Conquest",
+  "quality": 4,
+  "boss": "Koralon the Flame Watcher",
+  "allowable_classes": [
+   "paladin"
+  ]
+ },
+ {
+  "id": 48605,
+  "name": "Turalyon's Legplates of Conquest",
+  "quality": 4,
+  "boss": "Koralon the Flame Watcher",
+  "allowable_classes": [
+   "paladin"
+  ]
+ },
+ {
+  "id": 48222,
+  "name": "VanCleef's Gauntlets of Conquest",
+  "quality": 4,
+  "boss": "Koralon the Flame Watcher",
+  "allowable_classes": [
+   "rogue"
+  ]
+ },
+ {
+  "id": 48220,
+  "name": "VanCleef's Legplates of Conquest",
+  "quality": 4,
+  "boss": "Koralon the Flame Watcher",
+  "allowable_classes": [
+   "rogue"
+  ]
+ },
+ {
+  "id": 47982,
+  "name": "Velen's Gloves of Conquest",
+  "quality": 4,
+  "boss": "Koralon the Flame Watcher",
+  "allowable_classes": [
+   "priest"
+  ]
+ },
+ {
+  "id": 48072,
+  "name": "Velen's Handwraps of Conquest",
+  "quality": 4,
+  "boss": "Koralon the Flame Watcher",
+  "allowable_classes": [
+   "priest"
+  ]
+ },
+ {
+  "id": 47980,
+  "name": "Velen's Leggings of Conquest",
+  "quality": 4,
+  "boss": "Koralon the Flame Watcher",
+  "allowable_classes": [
+   "priest"
+  ]
+ },
+ {
+  "id": 48074,
+  "name": "Velen's Pants of Conquest",
+  "quality": 4,
+  "boss": "Koralon the Flame Watcher",
+  "allowable_classes": [
+   "priest"
+  ]
+ },
+ {
+  "id": 48254,
+  "name": "Windrunner's Handguards of Conquest",
+  "quality": 4,
+  "boss": "Koralon the Flame Watcher",
+  "allowable_classes": [
+   "hunter"
+  ]
+ },
+ {
+  "id": 48276,
+  "name": "Windrunner's Handguards of Conquest",
+  "quality": 4,
+  "boss": "Koralon the Flame Watcher",
+  "allowable_classes": [
+   "hunter"
+  ]
+ },
+ {
+  "id": 48252,
+  "name": "Windrunner's Legguards of Conquest",
+  "quality": 4,
+  "boss": "Koralon the Flame Watcher",
+  "allowable_classes": [
+   "hunter"
+  ]
+ },
+ {
+  "id": 48278,
+  "name": "Windrunner's Legguards of Conquest",
+  "quality": 4,
+  "boss": "Koralon the Flame Watcher",
+  "allowable_classes": [
+   "hunter"
+  ]
+ },
+ {
+  "id": 48375,
+  "name": "Wrynn's Gauntlets of Conquest",
+  "quality": 4,
+  "boss": "Koralon the Flame Watcher",
+  "allowable_classes": [
+   "warrior"
+  ]
+ },
+ {
+  "id": 48449,
+  "name": "Wrynn's Handguards of Conquest",
+  "quality": 4,
+  "boss": "Koralon the Flame Watcher",
+  "allowable_classes": [
+   "warrior"
+  ]
+ },
+ {
+  "id": 48445,
+  "name": "Wrynn's Legguards of Conquest",
+  "quality": 4,
+  "boss": "Koralon the Flame Watcher",
+  "allowable_classes": [
+   "warrior"
+  ]
+ },
+ {
+  "id": 48373,
+  "name": "Wrynn's Legplates of Conquest",
+  "quality": 4,
+  "boss": "Koralon the Flame Watcher",
+  "allowable_classes": [
+   "warrior"
+  ]
+ },
+ {
+  "id": 48067,
+  "name": "Zabra's Gloves of Conquest",
+  "quality": 4,
+  "boss": "Koralon the Flame Watcher",
+  "allowable_classes": [
+   "priest"
+  ]
+ },
+ {
+  "id": 48097,
+  "name": "Zabra's Handwraps of Conquest",
+  "quality": 4,
+  "boss": "Koralon the Flame Watcher",
+  "allowable_classes": [
+   "priest"
+  ]
+ },
+ {
+  "id": 48069,
+  "name": "Zabra's Leggings of Conquest",
+  "quality": 4,
+  "boss": "Koralon the Flame Watcher",
+  "allowable_classes": [
+   "priest"
+  ]
+ },
+ {
+  "id": 48099,
+  "name": "Zabra's Pants of Conquest",
+  "quality": 4,
+  "boss": "Koralon the Flame Watcher",
+  "allowable_classes": [
+   "priest"
+  ]
+ },
+ {
+  "id": 50114,
+  "name": "Ahn'Kahar Blood Hunter's Handguards",
+  "quality": 4,
+  "boss": "Toravon the Ice Watcher",
+  "allowable_classes": [
+   "hunter"
+  ]
+ },
+ {
+  "id": 50116,
+  "name": "Ahn'Kahar Blood Hunter's Legguards",
+  "quality": 4,
+  "boss": "Toravon the Ice Watcher",
+  "allowable_classes": [
+   "hunter"
+  ]
+ },
+ {
+  "id": 50275,
+  "name": "Bloodmage Gloves",
+  "quality": 4,
+  "boss": "Toravon the Ice Watcher",
+  "allowable_classes": [
+   "mage"
+  ]
+ },
+ {
+  "id": 50277,
+  "name": "Bloodmage Leggings",
+  "quality": 4,
+  "boss": "Toravon the Ice Watcher",
+  "allowable_classes": [
+   "mage"
+  ]
+ },
+ {
+  "id": 50766,
+  "name": "Crimson Acolyte Gloves",
+  "quality": 4,
+  "boss": "Toravon the Ice Watcher",
+  "allowable_classes": [
+   "priest"
+  ]
+ },
+ {
+  "id": 50391,
+  "name": "Crimson Acolyte Handwraps",
+  "quality": 4,
+  "boss": "Toravon the Ice Watcher",
+  "allowable_classes": [
+   "priest"
+  ]
+ },
+ {
+  "id": 50769,
+  "name": "Crimson Acolyte Leggings",
+  "quality": 4,
+  "boss": "Toravon the Ice Watcher",
+  "allowable_classes": [
+   "priest"
+  ]
+ },
+ {
+  "id": 50393,
+  "name": "Crimson Acolyte Pants",
+  "quality": 4,
+  "boss": "Toravon the Ice Watcher",
+  "allowable_classes": [
+   "priest"
+  ]
+ },
+ {
+  "id": 50240,
+  "name": "Dark Coven Gloves",
+  "quality": 4,
+  "boss": "Toravon the Ice Watcher",
+  "allowable_classes": [
+   "warlock"
+  ]
+ },
+ {
+  "id": 50242,
+  "name": "Dark Coven Leggings",
+  "quality": 4,
+  "boss": "Toravon the Ice Watcher",
+  "allowable_classes": [
+   "warlock"
+  ]
+ },
+ {
+  "id": 50842,
+  "name": "Frost Witch's Gloves",
+  "quality": 4,
+  "boss": "Toravon the Ice Watcher",
+  "allowable_classes": [
+   "shaman"
+  ]
+ },
+ {
+  "id": 50831,
+  "name": "Frost Witch's Grips",
+  "quality": 4,
+  "boss": "Toravon the Ice Watcher",
+  "allowable_classes": [
+   "shaman"
+  ]
+ },
+ {
+  "id": 50836,
+  "name": "Frost Witch's Handguards",
+  "quality": 4,
+  "boss": "Toravon the Ice Watcher",
+  "allowable_classes": [
+   "shaman"
+  ]
+ },
+ {
+  "id": 50844,
+  "name": "Frost Witch's Kilt",
+  "quality": 4,
+  "boss": "Toravon the Ice Watcher",
+  "allowable_classes": [
+   "shaman"
+  ]
+ },
+ {
+  "id": 50838,
+  "name": "Frost Witch's Legguards",
+  "quality": 4,
+  "boss": "Toravon the Ice Watcher",
+  "allowable_classes": [
+   "shaman"
+  ]
+ },
+ {
+  "id": 50833,
+  "name": "Frost Witch's War-Kilt",
+  "quality": 4,
+  "boss": "Toravon the Ice Watcher",
+  "allowable_classes": [
+   "shaman"
+  ]
+ },
+ {
+  "id": 50107,
+  "name": "Lasherweave Gauntlets",
+  "quality": 4,
+  "boss": "Toravon the Ice Watcher",
+  "allowable_classes": [
+   "druid"
+  ]
+ },
+ {
+  "id": 50822,
+  "name": "Lasherweave Gloves",
+  "quality": 4,
+  "boss": "Toravon the Ice Watcher",
+  "allowable_classes": [
+   "druid"
+  ]
+ },
+ {
+  "id": 50827,
+  "name": "Lasherweave Handgrips",
+  "quality": 4,
+  "boss": "Toravon the Ice Watcher",
+  "allowable_classes": [
+   "druid"
+  ]
+ },
+ {
+  "id": 50825,
+  "name": "Lasherweave Legguards",
+  "quality": 4,
+  "boss": "Toravon the Ice Watcher",
+  "allowable_classes": [
+   "druid"
+  ]
+ },
+ {
+  "id": 50109,
+  "name": "Lasherweave Legplates",
+  "quality": 4,
+  "boss": "Toravon the Ice Watcher",
+  "allowable_classes": [
+   "druid"
+  ]
+ },
+ {
+  "id": 50820,
+  "name": "Lasherweave Trousers",
+  "quality": 4,
+  "boss": "Toravon the Ice Watcher",
+  "allowable_classes": [
+   "druid"
+  ]
+ },
+ {
+  "id": 50327,
+  "name": "Lightsworn Gauntlets",
+  "quality": 4,
+  "boss": "Toravon the Ice Watcher",
+  "allowable_classes": [
+   "paladin"
+  ]
+ },
+ {
+  "id": 50868,
+  "name": "Lightsworn Gloves",
+  "quality": 4,
+  "boss": "Toravon the Ice Watcher",
+  "allowable_classes": [
+   "paladin"
+  ]
+ },
+ {
+  "id": 50866,
+  "name": "Lightsworn Greaves",
+  "quality": 4,
+  "boss": "Toravon the Ice Watcher",
+  "allowable_classes": [
+   "paladin"
+  ]
+ },
+ {
+  "id": 50863,
+  "name": "Lightsworn Handguards",
+  "quality": 4,
+  "boss": "Toravon the Ice Watcher",
+  "allowable_classes": [
+   "paladin"
+  ]
+ },
+ {
+  "id": 50861,
+  "name": "Lightsworn Legguards",
+  "quality": 4,
+  "boss": "Toravon the Ice Watcher",
+  "allowable_classes": [
+   "paladin"
+  ]
+ },
+ {
+  "id": 50325,
+  "name": "Lightsworn Legplates",
+  "quality": 4,
+  "boss": "Toravon the Ice Watcher",
+  "allowable_classes": [
+   "paladin"
+  ]
+ },
+ {
+  "id": 41641,
+  "name": "Relentless Gladiator's Armwraps of Dominance",
+  "quality": 4,
+  "boss": "Toravon the Ice Watcher",
+  "allowable_classes": [
+   "rogue",
+   "druid"
+  ]
+ },
+ {
+  "id": 41626,
+  "name": "Relentless Gladiator's Armwraps of Salvation",
+  "quality": 4,
+  "boss": "Toravon the Ice Watcher",
+  "allowable_classes": [
+   "rogue",
+   "druid"
+  ]
+ },
+ {
+  "id": 41841,
+  "name": "Relentless Gladiator's Armwraps of Triumph",
+  "quality": 4,
+  "boss": "Toravon the Ice Watcher",
+  "allowable_classes": [
+   "rogue",
+   "druid"
+  ]
+ },
+ {
+  "id": 42118,
+  "name": "Relentless Gladiator's Band of Ascendancy",
+  "quality": 4,
+  "boss": "Toravon the Ice Watcher"
+ },
+ {
+  "id": 42119,
+  "name": "Relentless Gladiator's Band of Victory",
+  "quality": 4,
+  "boss": "Toravon the Ice Watcher"
+ },
+ {
+  "id": 41631,
+  "name": "Relentless Gladiator's Belt of Dominance",
+  "quality": 4,
+  "boss": "Toravon the Ice Watcher",
+  "allowable_classes": [
+   "rogue",
+   "druid"
+  ]
+ },
+ {
+  "id": 41618,
+  "name": "Relentless Gladiator's Belt of Salvation",
+  "quality": 4,
+  "boss": "Toravon the Ice Watcher",
+  "allowable_classes": [
+   "rogue",
+   "druid"
+  ]
+ },
+ {
+  "id": 41833,
+  "name": "Relentless Gladiator's Belt of Triumph",
+  "quality": 4,
+  "boss": "Toravon the Ice Watcher",
+  "allowable_classes": [
+   "rogue",
+   "druid"
+  ]
+ },
+ {
+  "id": 41636,
+  "name": "Relentless Gladiator's Boots of Dominance",
+  "quality": 4,
+  "boss": "Toravon the Ice Watcher",
+  "allowable_classes": [
+   "rogue",
+   "druid"
+  ]
+ },
+ {
+  "id": 41622,
+  "name": "Relentless Gladiator's Boots of Salvation",
+  "quality": 4,
+  "boss": "Toravon the Ice Watcher",
+  "allowable_classes": [
+   "rogue",
+   "druid"
+  ]
+ },
+ {
+  "id": 41837,
+  "name": "Relentless Gladiator's Boots of Triumph",
+  "quality": 4,
+  "boss": "Toravon the Ice Watcher",
+  "allowable_classes": [
+   "rogue",
+   "druid"
+  ]
+ },
+ {
+  "id": 40984,
+  "name": "Relentless Gladiator's Bracers of Salvation",
+  "quality": 4,
+  "boss": "Toravon the Ice Watcher",
+  "allowable_classes": [
+   "warrior",
+   "paladin"
+  ]
+ },
+ {
+  "id": 40890,
+  "name": "Relentless Gladiator's Bracers of Triumph",
+  "quality": 4,
+  "boss": "Toravon the Ice Watcher",
+  "allowable_classes": [
+   "warrior",
+   "paladin",
+   "deathknight"
+  ]
+ },
+ {
+  "id": 41144,
+  "name": "Relentless Gladiator's Chain Gauntlets",
+  "quality": 4,
+  "boss": "Toravon the Ice Watcher",
+  "allowable_classes": [
+   "hunter"
+  ]
+ },
+ {
+  "id": 41206,
+  "name": "Relentless Gladiator's Chain Leggings",
+  "quality": 4,
+  "boss": "Toravon the Ice Watcher",
+  "allowable_classes": [
+   "hunter"
+  ]
+ },
+ {
+  "id": 42078,
+  "name": "Relentless Gladiator's Cloak of Ascendancy",
+  "quality": 4,
+  "boss": "Toravon the Ice Watcher"
+ },
+ {
+  "id": 42080,
+  "name": "Relentless Gladiator's Cloak of Deliverance",
+  "quality": 4,
+  "boss": "Toravon the Ice Watcher"
+ },
+ {
+  "id": 42076,
+  "name": "Relentless Gladiator's Cloak of Dominance",
+  "quality": 4,
+  "boss": "Toravon the Ice Watcher"
+ },
+ {
+  "id": 42079,
+  "name": "Relentless Gladiator's Cloak of Salvation",
+  "quality": 4,
+  "boss": "Toravon the Ice Watcher"
+ },
+ {
+  "id": 42077,
+  "name": "Relentless Gladiator's Cloak of Subjugation",
+  "quality": 4,
+  "boss": "Toravon the Ice Watcher"
+ },
+ {
+  "id": 42081,
+  "name": "Relentless Gladiator's Cloak of Triumph",
+  "quality": 4,
+  "boss": "Toravon the Ice Watcher"
+ },
+ {
+  "id": 42082,
+  "name": "Relentless Gladiator's Cloak of Victory",
+  "quality": 4,
+  "boss": "Toravon the Ice Watcher"
+ },
+ {
+  "id": 41899,
+  "name": "Relentless Gladiator's Cord of Dominance",
+  "quality": 4,
+  "boss": "Toravon the Ice Watcher",
+  "allowable_classes": [
+   "priest",
+   "mage",
+   "warlock"
+  ]
+ },
+ {
+  "id": 41882,
+  "name": "Relentless Gladiator's Cord of Salvation",
+  "quality": 4,
+  "boss": "Toravon the Ice Watcher",
+  "allowable_classes": [
+   "priest",
+   "mage",
+   "warlock"
+  ]
+ },
+ {
+  "id": 41910,
+  "name": "Relentless Gladiator's Cuffs of Dominance",
+  "quality": 4,
+  "boss": "Toravon the Ice Watcher",
+  "allowable_classes": [
+   "priest",
+   "mage",
+   "warlock"
+  ]
+ },
+ {
+  "id": 41894,
+  "name": "Relentless Gladiator's Cuffs of Salvation",
+  "quality": 4,
+  "boss": "Toravon the Ice Watcher",
+  "allowable_classes": [
+   "priest",
+   "mage",
+   "warlock"
+  ]
+ },
+ {
+  "id": 41774,
+  "name": "Relentless Gladiator's Dragonhide Gloves",
+  "quality": 4,
+  "boss": "Toravon the Ice Watcher",
+  "allowable_classes": [
+   "druid"
+  ]
+ },
+ {
+  "id": 41668,
+  "name": "Relentless Gladiator's Dragonhide Legguards",
+  "quality": 4,
+  "boss": "Toravon the Ice Watcher",
+  "allowable_classes": [
+   "druid"
+  ]
+ },
+ {
+  "id": 40811,
+  "name": "Relentless Gladiator's Dreadplate Gauntlets",
+  "quality": 4,
+  "boss": "Toravon the Ice Watcher",
+  "allowable_classes": [
+   "deathknight"
+  ]
+ },
+ {
+  "id": 40851,
+  "name": "Relentless Gladiator's Dreadplate Legguards",
+  "quality": 4,
+  "boss": "Toravon the Ice Watcher",
+  "allowable_classes": [
+   "deathknight"
+  ]
+ },
+ {
+  "id": 42018,
+  "name": "Relentless Gladiator's Felweave Handguards",
+  "quality": 4,
+  "boss": "Toravon the Ice Watcher",
+  "allowable_classes": [
+   "warlock"
+  ]
+ },
+ {
+  "id": 42006,
+  "name": "Relentless Gladiator's Felweave Trousers",
+  "quality": 4,
+  "boss": "Toravon the Ice Watcher",
+  "allowable_classes": [
+   "warlock"
+  ]
+ },
+ {
+  "id": 40978,
+  "name": "Relentless Gladiator's Girdle of Salvation",
+  "quality": 4,
+  "boss": "Toravon the Ice Watcher",
+  "allowable_classes": [
+   "warrior",
+   "paladin"
+  ]
+ },
+ {
+  "id": 40883,
+  "name": "Relentless Gladiator's Girdle of Triumph",
+  "quality": 4,
+  "boss": "Toravon the Ice Watcher",
+  "allowable_classes": [
+   "warrior",
+   "paladin",
+   "deathknight"
+  ]
+ },
+ {
+  "id": 40979,
+  "name": "Relentless Gladiator's Greaves of Salvation",
+  "quality": 4,
+  "boss": "Toravon the Ice Watcher",
+  "allowable_classes": [
+   "warrior",
+   "paladin"
+  ]
+ },
+ {
+  "id": 40884,
+  "name": "Relentless Gladiator's Greaves of Triumph",
+  "quality": 4,
+  "boss": "Toravon the Ice Watcher",
+  "allowable_classes": [
+   "warrior",
+   "paladin",
+   "deathknight"
+  ]
+ },
+ {
+  "id": 41288,
+  "name": "Relentless Gladiator's Kodohide Gloves",
+  "quality": 4,
+  "boss": "Toravon the Ice Watcher",
+  "allowable_classes": [
+   "druid"
+  ]
+ },
+ {
+  "id": 41299,
+  "name": "Relentless Gladiator's Kodohide Legguards",
+  "quality": 4,
+  "boss": "Toravon the Ice Watcher",
+  "allowable_classes": [
+   "druid"
+  ]
+ },
+ {
+  "id": 41768,
+  "name": "Relentless Gladiator's Leather Gloves",
+  "quality": 4,
+  "boss": "Toravon the Ice Watcher",
+  "allowable_classes": [
+   "rogue"
+  ]
+ },
+ {
+  "id": 41656,
+  "name": "Relentless Gladiator's Leather Legguards",
+  "quality": 4,
+  "boss": "Toravon the Ice Watcher",
+  "allowable_classes": [
+   "rogue"
+  ]
+ },
+ {
+  "id": 41138,
+  "name": "Relentless Gladiator's Linked Gauntlets",
+  "quality": 4,
+  "boss": "Toravon the Ice Watcher",
+  "allowable_classes": [
+   "shaman"
+  ]
+ },
+ {
+  "id": 41200,
+  "name": "Relentless Gladiator's Linked Leggings",
+  "quality": 4,
+  "boss": "Toravon the Ice Watcher",
+  "allowable_classes": [
+   "shaman"
+  ]
+ },
+ {
+  "id": 41008,
+  "name": "Relentless Gladiator's Mail Gauntlets",
+  "quality": 4,
+  "boss": "Toravon the Ice Watcher",
+  "allowable_classes": [
+   "shaman"
+  ]
+ },
+ {
+  "id": 41034,
+  "name": "Relentless Gladiator's Mail Leggings",
+  "quality": 4,
+  "boss": "Toravon the Ice Watcher",
+  "allowable_classes": [
+   "shaman"
+  ]
+ },
+ {
+  "id": 41875,
+  "name": "Relentless Gladiator's Mooncloth Gloves",
+  "quality": 4,
+  "boss": "Toravon the Ice Watcher",
+  "allowable_classes": [
+   "priest"
+  ]
+ },
+ {
+  "id": 41865,
+  "name": "Relentless Gladiator's Mooncloth Leggings",
+  "quality": 4,
+  "boss": "Toravon the Ice Watcher",
+  "allowable_classes": [
+   "priest"
+  ]
+ },
+ {
+  "id": 40928,
+  "name": "Relentless Gladiator's Ornamented Gloves",
+  "quality": 4,
+  "boss": "Toravon the Ice Watcher",
+  "allowable_classes": [
+   "paladin"
+  ]
+ },
+ {
+  "id": 40940,
+  "name": "Relentless Gladiator's Ornamented Legplates",
+  "quality": 4,
+  "boss": "Toravon the Ice Watcher",
+  "allowable_classes": [
+   "paladin"
+  ]
+ },
+ {
+  "id": 42044,
+  "name": "Relentless Gladiator's Pendant of Ascendancy",
+  "quality": 4,
+  "boss": "Toravon the Ice Watcher"
+ },
+ {
+  "id": 42046,
+  "name": "Relentless Gladiator's Pendant of Deliverance",
+  "quality": 4,
+  "boss": "Toravon the Ice Watcher"
+ },
+ {
+  "id": 42043,
+  "name": "Relentless Gladiator's Pendant of Dominance",
+  "quality": 4,
+  "boss": "Toravon the Ice Watcher"
+ },
+ {
+  "id": 42047,
+  "name": "Relentless Gladiator's Pendant of Salvation",
+  "quality": 4,
+  "boss": "Toravon the Ice Watcher"
+ },
+ {
+  "id": 42045,
+  "name": "Relentless Gladiator's Pendant of Subjugation",
+  "quality": 4,
+  "boss": "Toravon the Ice Watcher"
+ },
+ {
+  "id": 46374,
+  "name": "Relentless Gladiator's Pendant of Sundering",
+  "quality": 4,
+  "boss": "Toravon the Ice Watcher"
+ },
+ {
+  "id": 42041,
+  "name": "Relentless Gladiator's Pendant of Triumph",
+  "quality": 4,
+  "boss": "Toravon the Ice Watcher"
+ },
+ {
+  "id": 42042,
+  "name": "Relentless Gladiator's Pendant of Victory",
+  "quality": 4,
+  "boss": "Toravon the Ice Watcher"
+ },
+ {
+  "id": 40810,
+  "name": "Relentless Gladiator's Plate Gauntlets",
+  "quality": 4,
+  "boss": "Toravon the Ice Watcher",
+  "allowable_classes": [
+   "warrior"
+  ]
+ },
+ {
+  "id": 40850,
+  "name": "Relentless Gladiator's Plate Legguards",
+  "quality": 4,
+  "boss": "Toravon the Ice Watcher",
+  "allowable_classes": [
+   "warrior"
+  ]
+ },
+ {
+  "id": 41002,
+  "name": "Relentless Gladiator's Ringmail Gauntlets",
+  "quality": 4,
+  "boss": "Toravon the Ice Watcher",
+  "allowable_classes": [
+   "shaman"
+  ]
+ },
+ {
+  "id": 41028,
+  "name": "Relentless Gladiator's Ringmail Leggings",
+  "quality": 4,
+  "boss": "Toravon the Ice Watcher",
+  "allowable_classes": [
+   "shaman"
+  ]
+ },
+ {
+  "id": 41076,
+  "name": "Relentless Gladiator's Sabatons of Dominance",
+  "quality": 4,
+  "boss": "Toravon the Ice Watcher",
+  "allowable_classes": [
+   "hunter",
+   "shaman"
+  ]
+ },
+ {
+  "id": 41056,
+  "name": "Relentless Gladiator's Sabatons of Salvation",
+  "quality": 4,
+  "boss": "Toravon the Ice Watcher",
+  "allowable_classes": [
+   "hunter",
+   "shaman"
+  ]
+ },
+ {
+  "id": 41231,
+  "name": "Relentless Gladiator's Sabatons of Triumph",
+  "quality": 4,
+  "boss": "Toravon the Ice Watcher",
+  "allowable_classes": [
+   "hunter",
+   "shaman"
+  ]
+ },
+ {
+  "id": 41941,
+  "name": "Relentless Gladiator's Satin Gloves",
+  "quality": 4,
+  "boss": "Toravon the Ice Watcher",
+  "allowable_classes": [
+   "priest"
+  ]
+ },
+ {
+  "id": 41928,
+  "name": "Relentless Gladiator's Satin Leggings",
+  "quality": 4,
+  "boss": "Toravon the Ice Watcher",
+  "allowable_classes": [
+   "priest"
+  ]
+ },
+ {
+  "id": 40812,
+  "name": "Relentless Gladiator's Scaled Gauntlets",
+  "quality": 4,
+  "boss": "Toravon the Ice Watcher",
+  "allowable_classes": [
+   "paladin"
+  ]
+ },
+ {
+  "id": 40852,
+  "name": "Relentless Gladiator's Scaled Legguards",
+  "quality": 4,
+  "boss": "Toravon the Ice Watcher",
+  "allowable_classes": [
+   "paladin"
+  ]
+ },
+ {
+  "id": 41972,
+  "name": "Relentless Gladiator's Silk Handguards",
+  "quality": 4,
+  "boss": "Toravon the Ice Watcher",
+  "allowable_classes": [
+   "mage"
+  ]
+ },
+ {
+  "id": 41960,
+  "name": "Relentless Gladiator's Silk Trousers",
+  "quality": 4,
+  "boss": "Toravon the Ice Watcher",
+  "allowable_classes": [
+   "mage"
+  ]
+ },
+ {
+  "id": 41904,
+  "name": "Relentless Gladiator's Treads of Dominance",
+  "quality": 4,
+  "boss": "Toravon the Ice Watcher",
+  "allowable_classes": [
+   "priest",
+   "mage",
+   "warlock"
+  ]
+ },
+ {
+  "id": 41886,
+  "name": "Relentless Gladiator's Treads of Salvation",
+  "quality": 4,
+  "boss": "Toravon the Ice Watcher",
+  "allowable_classes": [
+   "priest",
+   "mage",
+   "warlock"
+  ]
+ },
+ {
+  "id": 41071,
+  "name": "Relentless Gladiator's Waistguard of Dominance",
+  "quality": 4,
+  "boss": "Toravon the Ice Watcher",
+  "allowable_classes": [
+   "hunter",
+   "shaman"
+  ]
+ },
+ {
+  "id": 41052,
+  "name": "Relentless Gladiator's Waistguard of Salvation",
+  "quality": 4,
+  "boss": "Toravon the Ice Watcher",
+  "allowable_classes": [
+   "hunter",
+   "shaman"
+  ]
+ },
+ {
+  "id": 41236,
+  "name": "Relentless Gladiator's Waistguard of Triumph",
+  "quality": 4,
+  "boss": "Toravon the Ice Watcher",
+  "allowable_classes": [
+   "hunter",
+   "shaman"
+  ]
+ },
+ {
+  "id": 41066,
+  "name": "Relentless Gladiator's Wristguards of Dominance",
+  "quality": 4,
+  "boss": "Toravon the Ice Watcher",
+  "allowable_classes": [
+   "hunter",
+   "shaman"
+  ]
+ },
+ {
+  "id": 41061,
+  "name": "Relentless Gladiator's Wristguards of Salvation",
+  "quality": 4,
+  "boss": "Toravon the Ice Watcher",
+  "allowable_classes": [
+   "hunter",
+   "shaman"
+  ]
+ },
+ {
+  "id": 41226,
+  "name": "Relentless Gladiator's Wristguards of Triumph",
+  "quality": 4,
+  "boss": "Toravon the Ice Watcher",
+  "allowable_classes": [
+   "hunter",
+   "shaman"
+  ]
+ },
+ {
+  "id": 41294,
+  "name": "Relentless Gladiator's Wyrmhide Gloves",
+  "quality": 4,
+  "boss": "Toravon the Ice Watcher",
+  "allowable_classes": [
+   "druid"
+  ]
+ },
+ {
+  "id": 41305,
+  "name": "Relentless Gladiator's Wyrmhide Legguards",
+  "quality": 4,
+  "boss": "Toravon the Ice Watcher",
+  "allowable_classes": [
+   "druid"
+  ]
+ },
+ {
+  "id": 50095,
+  "name": "Scourgelord Gauntlets",
+  "quality": 4,
+  "boss": "Toravon the Ice Watcher",
+  "allowable_classes": [
+   "deathknight"
+  ]
+ },
+ {
+  "id": 50856,
+  "name": "Scourgelord Handguards",
+  "quality": 4,
+  "boss": "Toravon the Ice Watcher",
+  "allowable_classes": [
+   "deathknight"
+  ]
+ },
+ {
+  "id": 50854,
+  "name": "Scourgelord Legguards",
+  "quality": 4,
+  "boss": "Toravon the Ice Watcher",
+  "allowable_classes": [
+   "deathknight"
+  ]
+ },
+ {
+  "id": 50097,
+  "name": "Scourgelord Legplates",
+  "quality": 4,
+  "boss": "Toravon the Ice Watcher",
+  "allowable_classes": [
+   "deathknight"
+  ]
+ },
+ {
+  "id": 50088,
+  "name": "Shadowblade Gauntlets",
+  "quality": 4,
+  "boss": "Toravon the Ice Watcher",
+  "allowable_classes": [
+   "rogue"
+  ]
+ },
+ {
+  "id": 50090,
+  "name": "Shadowblade Legplates",
+  "quality": 4,
+  "boss": "Toravon the Ice Watcher",
+  "allowable_classes": [
+   "rogue"
+  ]
+ },
+ {
+  "id": 50079,
+  "name": "Ymirjar Lord's Gauntlets",
+  "quality": 4,
+  "boss": "Toravon the Ice Watcher",
+  "allowable_classes": [
+   "warrior"
+  ]
+ },
+ {
+  "id": 50849,
+  "name": "Ymirjar Lord's Handguards",
+  "quality": 4,
+  "boss": "Toravon the Ice Watcher",
+  "allowable_classes": [
+   "warrior"
+  ]
+ },
+ {
+  "id": 50847,
+  "name": "Ymirjar Lord's Legguards",
+  "quality": 4,
+  "boss": "Toravon the Ice Watcher",
+  "allowable_classes": [
+   "warrior"
+  ]
+ },
+ {
+  "id": 50081,
+  "name": "Ymirjar Lord's Legplates",
+  "quality": 4,
+  "boss": "Toravon the Ice Watcher",
+  "allowable_classes": [
+   "warrior"
+  ]
+ }
+]

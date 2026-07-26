@@ -1,0 +1,144 @@
+[
+ {
+  "id": 43994,
+  "name": "Belabored Legplates",
+  "quality": 4,
+  "boss": "Sartharion"
+ },
+ {
+  "id": 43990,
+  "name": "Blade-Scarred Tunic",
+  "quality": 4,
+  "boss": "Sartharion"
+ },
+ {
+  "id": 43998,
+  "name": "Chestguard of Flagrant Prowess",
+  "quality": 4,
+  "boss": "Sartharion"
+ },
+ {
+  "id": 40427,
+  "name": "Circle of Arcane Streams",
+  "quality": 4,
+  "boss": "Sartharion"
+ },
+ {
+  "id": 40429,
+  "name": "Crimson Steel",
+  "quality": 4,
+  "boss": "Sartharion"
+ },
+ {
+  "id": 43345,
+  "name": "Dragon Hide Bag",
+  "quality": 4,
+  "boss": "Sartharion"
+ },
+ {
+  "id": 43995,
+  "name": "Enamored Cowl",
+  "quality": 4,
+  "boss": "Sartharion"
+ },
+ {
+  "id": 43988,
+  "name": "Gale-Proof Cloak",
+  "quality": 4,
+  "boss": "Sartharion"
+ },
+ {
+  "id": 40613,
+  "name": "Gloves of the Lost Conqueror",
+  "quality": 4,
+  "boss": "Sartharion",
+  "allowable_classes": [
+   "paladin",
+   "priest",
+   "warlock"
+  ]
+ },
+ {
+  "id": 40614,
+  "name": "Gloves of the Lost Protector",
+  "quality": 4,
+  "boss": "Sartharion",
+  "allowable_classes": [
+   "warrior",
+   "hunter",
+   "shaman"
+  ]
+ },
+ {
+  "id": 40615,
+  "name": "Gloves of the Lost Vanquisher",
+  "quality": 4,
+  "boss": "Sartharion",
+  "allowable_classes": [
+   "rogue",
+   "deathknight",
+   "mage",
+   "druid"
+  ]
+ },
+ {
+  "id": 43993,
+  "name": "Greatring of Collision",
+  "quality": 4,
+  "boss": "Sartharion"
+ },
+ {
+  "id": 43991,
+  "name": "Legguards of Composure",
+  "quality": 4,
+  "boss": "Sartharion"
+ },
+ {
+  "id": 40430,
+  "name": "Majestic Dragon Figurine",
+  "quality": 4,
+  "boss": "Sartharion"
+ },
+ {
+  "id": 43986,
+  "name": "Reins of the Black Drake",
+  "quality": 4,
+  "boss": "Sartharion"
+ },
+ {
+  "id": 43989,
+  "name": "Remembrance Girdle",
+  "quality": 4,
+  "boss": "Sartharion"
+ },
+ {
+  "id": 43996,
+  "name": "Sabatons of Firmament",
+  "quality": 4,
+  "boss": "Sartharion"
+ },
+ {
+  "id": 43347,
+  "name": "Satchel of Spoils",
+  "quality": 4,
+  "boss": "Sartharion"
+ },
+ {
+  "id": 40426,
+  "name": "Signet of the Accord",
+  "quality": 4,
+  "boss": "Sartharion"
+ },
+ {
+  "id": 40428,
+  "name": "Titan's Outlook",
+  "quality": 4,
+  "boss": "Sartharion"
+ },
+ {
+  "id": 43992,
+  "name": "Volitant Amulet",
+  "quality": 4,
+  "boss": "Sartharion"
+ }
+]

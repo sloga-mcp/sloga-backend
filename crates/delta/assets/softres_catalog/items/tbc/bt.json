@@ -1,0 +1,799 @@
+[
+ {
+  "id": 32242,
+  "name": "Boots of Oceanic Fury",
+  "quality": 4,
+  "boss": "High Warlord Naj'entus"
+ },
+ {
+  "id": 32232,
+  "name": "Eternium Shell Bracers",
+  "quality": 4,
+  "boss": "High Warlord Naj'entus"
+ },
+ {
+  "id": 32234,
+  "name": "Fists of Mukoa",
+  "quality": 4,
+  "boss": "High Warlord Naj'entus"
+ },
+ {
+  "id": 32240,
+  "name": "Guise of the Tidal Lurker",
+  "quality": 4,
+  "boss": "High Warlord Naj'entus"
+ },
+ {
+  "id": 32248,
+  "name": "Halberd of Desolation",
+  "quality": 4,
+  "boss": "High Warlord Naj'entus"
+ },
+ {
+  "id": 32241,
+  "name": "Helm of Soothing Currents",
+  "quality": 4,
+  "boss": "High Warlord Naj'entus"
+ },
+ {
+  "id": 32377,
+  "name": "Mantle of Darkness",
+  "quality": 4,
+  "boss": "High Warlord Naj'entus"
+ },
+ {
+  "id": 32243,
+  "name": "Pearl Inlaid Boots",
+  "quality": 4,
+  "boss": "High Warlord Naj'entus"
+ },
+ {
+  "id": 32238,
+  "name": "Ring of Calming Waves",
+  "quality": 4,
+  "boss": "High Warlord Naj'entus"
+ },
+ {
+  "id": 32247,
+  "name": "Ring of Captured Storms",
+  "quality": 4,
+  "boss": "High Warlord Naj'entus"
+ },
+ {
+  "id": 32236,
+  "name": "Rising Tide",
+  "quality": 4,
+  "boss": "High Warlord Naj'entus"
+ },
+ {
+  "id": 32239,
+  "name": "Slippers of the Seacaller",
+  "quality": 4,
+  "boss": "High Warlord Naj'entus"
+ },
+ {
+  "id": 32237,
+  "name": "The Maelstrom's Fury",
+  "quality": 4,
+  "boss": "High Warlord Naj'entus"
+ },
+ {
+  "id": 32245,
+  "name": "Tide-stomper's Greaves",
+  "quality": 4,
+  "boss": "High Warlord Naj'entus"
+ },
+ {
+  "id": 33117,
+  "name": "Jack-o'-Lantern",
+  "quality": 3,
+  "boss": "High Warlord Naj'entus / Supremus / Shade of Akama / Teron Gorefiend / Gurtogg Bloodboil / Mother Shahraz / The Illidari Council / Illidan Stormrage"
+ },
+ {
+  "id": 32261,
+  "name": "Band of the Abyssal Lord",
+  "quality": 4,
+  "boss": "Supremus"
+ },
+ {
+  "id": 32259,
+  "name": "Bands of the Coming Storm",
+  "quality": 4,
+  "boss": "Supremus"
+ },
+ {
+  "id": 32260,
+  "name": "Choker of Endless Nightmares",
+  "quality": 4,
+  "boss": "Supremus"
+ },
+ {
+  "id": 32255,
+  "name": "Felstone Bulwark",
+  "quality": 4,
+  "boss": "Supremus"
+ },
+ {
+  "id": 32257,
+  "name": "Idol of the White Stag",
+  "quality": 4,
+  "boss": "Supremus"
+ },
+ {
+  "id": 32253,
+  "name": "Legionkiller",
+  "quality": 4,
+  "boss": "Supremus"
+ },
+ {
+  "id": 32258,
+  "name": "Naturalist's Preserving Cinch",
+  "quality": 4,
+  "boss": "Supremus"
+ },
+ {
+  "id": 32252,
+  "name": "Nether Shadow Tunic",
+  "quality": 4,
+  "boss": "Supremus"
+ },
+ {
+  "id": 32250,
+  "name": "Pauldrons of Abyssal Fury",
+  "quality": 4,
+  "boss": "Supremus"
+ },
+ {
+  "id": 32262,
+  "name": "Syphon of the Nathrezim",
+  "quality": 4,
+  "boss": "Supremus"
+ },
+ {
+  "id": 32254,
+  "name": "The Brutalizer",
+  "quality": 4,
+  "boss": "Supremus"
+ },
+ {
+  "id": 32256,
+  "name": "Waistwrap of Infinity",
+  "quality": 4,
+  "boss": "Supremus"
+ },
+ {
+  "id": 32251,
+  "name": "Wraps of Precise Flight",
+  "quality": 4,
+  "boss": "Supremus"
+ },
+ {
+  "id": 32273,
+  "name": "Amice of Brilliant Light",
+  "quality": 4,
+  "boss": "Shade of Akama"
+ },
+ {
+  "id": 32361,
+  "name": "Blind-Seers Icon",
+  "quality": 4,
+  "boss": "Shade of Akama"
+ },
+ {
+  "id": 32276,
+  "name": "Flashfire Girdle",
+  "quality": 4,
+  "boss": "Shade of Akama"
+ },
+ {
+  "id": 32270,
+  "name": "Focused Mana Bindings",
+  "quality": 4,
+  "boss": "Shade of Akama"
+ },
+ {
+  "id": 32278,
+  "name": "Grips of Silent Justice",
+  "quality": 4,
+  "boss": "Shade of Akama"
+ },
+ {
+  "id": 32271,
+  "name": "Kilt of Immortal Nature",
+  "quality": 4,
+  "boss": "Shade of Akama"
+ },
+ {
+  "id": 32268,
+  "name": "Myrmidon's Treads",
+  "quality": 4,
+  "boss": "Shade of Akama"
+ },
+ {
+  "id": 32263,
+  "name": "Praetorian's Legguards",
+  "quality": 4,
+  "boss": "Shade of Akama"
+ },
+ {
+  "id": 32266,
+  "name": "Ring of Deceitful Intent",
+  "quality": 4,
+  "boss": "Shade of Akama"
+ },
+ {
+  "id": 32265,
+  "name": "Shadow-walker's Cord",
+  "quality": 4,
+  "boss": "Shade of Akama"
+ },
+ {
+  "id": 32264,
+  "name": "Shoulders of the Hidden Predator",
+  "quality": 4,
+  "boss": "Shade of Akama"
+ },
+ {
+  "id": 32275,
+  "name": "Spiritwalker Gauntlets",
+  "quality": 4,
+  "boss": "Shade of Akama"
+ },
+ {
+  "id": 32279,
+  "name": "The Seeker's Wristguards",
+  "quality": 4,
+  "boss": "Shade of Akama"
+ },
+ {
+  "id": 32513,
+  "name": "Wristbands of Divine Influence",
+  "quality": 4,
+  "boss": "Shade of Akama"
+ },
+ {
+  "id": 32328,
+  "name": "Botanist's Gloves of Growth",
+  "quality": 4,
+  "boss": "Teron Gorefiend"
+ },
+ {
+  "id": 32329,
+  "name": "Cowl of Benevolence",
+  "quality": 4,
+  "boss": "Teron Gorefiend"
+ },
+ {
+  "id": 32280,
+  "name": "Gauntlets of Enforcement",
+  "quality": 4,
+  "boss": "Teron Gorefiend"
+ },
+ {
+  "id": 32512,
+  "name": "Girdle of Lordaeron's Fallen",
+  "quality": 4,
+  "boss": "Teron Gorefiend"
+ },
+ {
+  "id": 32324,
+  "name": "Insidious Bands",
+  "quality": 4,
+  "boss": "Teron Gorefiend"
+ },
+ {
+  "id": 32325,
+  "name": "Rifle of the Stoic Guardian",
+  "quality": 4,
+  "boss": "Teron Gorefiend"
+ },
+ {
+  "id": 32327,
+  "name": "Robe of the Shadow Council",
+  "quality": 4,
+  "boss": "Teron Gorefiend"
+ },
+ {
+  "id": 32323,
+  "name": "Shadowmoon Destroyer's Drape",
+  "quality": 4,
+  "boss": "Teron Gorefiend"
+ },
+ {
+  "id": 32510,
+  "name": "Softstep Boots of Tracking",
+  "quality": 4,
+  "boss": "Teron Gorefiend"
+ },
+ {
+  "id": 32348,
+  "name": "Soul Cleaver",
+  "quality": 4,
+  "boss": "Teron Gorefiend"
+ },
+ {
+  "id": 32330,
+  "name": "Totem of Ancestral Guidance",
+  "quality": 4,
+  "boss": "Teron Gorefiend"
+ },
+ {
+  "id": 32326,
+  "name": "Twisted Blades of Zarak",
+  "quality": 4,
+  "boss": "Teron Gorefiend"
+ },
+ {
+  "id": 32339,
+  "name": "Belt of Primal Majesty",
+  "quality": 4,
+  "boss": "Gurtogg Bloodboil"
+ },
+ {
+  "id": 32338,
+  "name": "Blood-cursed Shoulderpads",
+  "quality": 4,
+  "boss": "Gurtogg Bloodboil"
+ },
+ {
+  "id": 32340,
+  "name": "Garments of Temperance",
+  "quality": 4,
+  "boss": "Gurtogg Bloodboil"
+ },
+ {
+  "id": 32342,
+  "name": "Girdle of Mighty Resolve",
+  "quality": 4,
+  "boss": "Gurtogg Bloodboil"
+ },
+ {
+  "id": 32333,
+  "name": "Girdle of Stability",
+  "quality": 4,
+  "boss": "Gurtogg Bloodboil"
+ },
+ {
+  "id": 32341,
+  "name": "Leggings of Divine Retribution",
+  "quality": 4,
+  "boss": "Gurtogg Bloodboil"
+ },
+ {
+  "id": 32269,
+  "name": "Messenger of Fate",
+  "quality": 4,
+  "boss": "Gurtogg Bloodboil"
+ },
+ {
+  "id": 32501,
+  "name": "Shadowmoon Insignia",
+  "quality": 4,
+  "boss": "Gurtogg Bloodboil"
+ },
+ {
+  "id": 32337,
+  "name": "Shroud of Forgiveness",
+  "quality": 4,
+  "boss": "Gurtogg Bloodboil"
+ },
+ {
+  "id": 32344,
+  "name": "Staff of Immaculate Recovery",
+  "quality": 4,
+  "boss": "Gurtogg Bloodboil"
+ },
+ {
+  "id": 32335,
+  "name": "Unstoppable Aggressor's Ring",
+  "quality": 4,
+  "boss": "Gurtogg Bloodboil"
+ },
+ {
+  "id": 32334,
+  "name": "Vest of Mounting Assault",
+  "quality": 4,
+  "boss": "Gurtogg Bloodboil"
+ },
+ {
+  "id": 32343,
+  "name": "Wand of Prismatic Focus",
+  "quality": 4,
+  "boss": "Gurtogg Bloodboil"
+ },
+ {
+  "id": 32346,
+  "name": "Boneweave Girdle",
+  "quality": 4,
+  "boss": "Reliquary of Souls"
+ },
+ {
+  "id": 32354,
+  "name": "Crown of Empowered Fate",
+  "quality": 4,
+  "boss": "Reliquary of Souls"
+ },
+ {
+  "id": 32345,
+  "name": "Dreadboots of the Legion",
+  "quality": 4,
+  "boss": "Reliquary of Souls"
+ },
+ {
+  "id": 32351,
+  "name": "Elunite Empowered Bracers",
+  "quality": 4,
+  "boss": "Reliquary of Souls"
+ },
+ {
+  "id": 32353,
+  "name": "Gloves of Unfailing Faith",
+  "quality": 4,
+  "boss": "Reliquary of Souls"
+ },
+ {
+  "id": 32347,
+  "name": "Grips of Damnation",
+  "quality": 4,
+  "boss": "Reliquary of Souls"
+ },
+ {
+  "id": 32363,
+  "name": "Naaru-Blessed Life Rod",
+  "quality": 4,
+  "boss": "Reliquary of Souls"
+ },
+ {
+  "id": 32352,
+  "name": "Naturewarden's Treads",
+  "quality": 4,
+  "boss": "Reliquary of Souls"
+ },
+ {
+  "id": 32362,
+  "name": "Pendant of Titans",
+  "quality": 4,
+  "boss": "Reliquary of Souls"
+ },
+ {
+  "id": 32517,
+  "name": "The Wavemender's Mantle",
+  "quality": 4,
+  "boss": "Reliquary of Souls"
+ },
+ {
+  "id": 32332,
+  "name": "Torch of the Damned",
+  "quality": 4,
+  "boss": "Reliquary of Souls"
+ },
+ {
+  "id": 32350,
+  "name": "Touch of Inspiration",
+  "quality": 4,
+  "boss": "Reliquary of Souls"
+ },
+ {
+  "id": 32349,
+  "name": "Translucent Spellthread Necklace",
+  "quality": 4,
+  "boss": "Reliquary of Souls"
+ },
+ {
+  "id": 32369,
+  "name": "Blade of Savagery",
+  "quality": 4,
+  "boss": "Mother Shahraz"
+ },
+ {
+  "id": 32365,
+  "name": "Heartshatter Breastplate",
+  "quality": 4,
+  "boss": "Mother Shahraz"
+ },
+ {
+  "id": 32367,
+  "name": "Leggings of Devastation",
+  "quality": 4,
+  "boss": "Mother Shahraz"
+ },
+ {
+  "id": 32370,
+  "name": "Nadina's Pendant of Purity",
+  "quality": 4,
+  "boss": "Mother Shahraz"
+ },
+ {
+  "id": 31101,
+  "name": "Pauldrons of the Forgotten Conqueror",
+  "quality": 4,
+  "boss": "Mother Shahraz",
+  "allowable_classes": [
+   "paladin",
+   "priest",
+   "warlock"
+  ]
+ },
+ {
+  "id": 31103,
+  "name": "Pauldrons of the Forgotten Protector",
+  "quality": 4,
+  "boss": "Mother Shahraz",
+  "allowable_classes": [
+   "warrior",
+   "hunter",
+   "shaman"
+  ]
+ },
+ {
+  "id": 31102,
+  "name": "Pauldrons of the Forgotten Vanquisher",
+  "quality": 4,
+  "boss": "Mother Shahraz",
+  "allowable_classes": [
+   "rogue",
+   "mage",
+   "druid"
+  ]
+ },
+ {
+  "id": 32366,
+  "name": "Shadowmaster's Boots",
+  "quality": 4,
+  "boss": "Mother Shahraz"
+ },
+ {
+  "id": 32368,
+  "name": "Tome of the Lightbringer",
+  "quality": 4,
+  "boss": "Mother Shahraz"
+ },
+ {
+  "id": 32519,
+  "name": "Belt of Divine Guidance",
+  "quality": 4,
+  "boss": "The Illidari Council"
+ },
+ {
+  "id": 32331,
+  "name": "Cloak of the Illidari Council",
+  "quality": 4,
+  "boss": "The Illidari Council"
+ },
+ {
+  "id": 32376,
+  "name": "Forest Prowler's Helm",
+  "quality": 4,
+  "boss": "The Illidari Council"
+ },
+ {
+  "id": 32373,
+  "name": "Helm of the Illidari Shatterer",
+  "quality": 4,
+  "boss": "The Illidari Council"
+ },
+ {
+  "id": 31098,
+  "name": "Leggings of the Forgotten Conqueror",
+  "quality": 4,
+  "boss": "The Illidari Council",
+  "allowable_classes": [
+   "paladin",
+   "priest",
+   "warlock"
+  ]
+ },
+ {
+  "id": 31100,
+  "name": "Leggings of the Forgotten Protector",
+  "quality": 4,
+  "boss": "The Illidari Council",
+  "allowable_classes": [
+   "warrior",
+   "hunter",
+   "shaman"
+  ]
+ },
+ {
+  "id": 31099,
+  "name": "Leggings of the Forgotten Vanquisher",
+  "quality": 4,
+  "boss": "The Illidari Council",
+  "allowable_classes": [
+   "rogue",
+   "mage",
+   "druid"
+  ]
+ },
+ {
+  "id": 32505,
+  "name": "Madness of the Betrayer",
+  "quality": 4,
+  "boss": "The Illidari Council"
+ },
+ {
+  "id": 32518,
+  "name": "Veil of Turning Leaves",
+  "quality": 4,
+  "boss": "The Illidari Council"
+ },
+ {
+  "id": 32336,
+  "name": "Black Bow of the Betrayer",
+  "quality": 4,
+  "boss": "Illidan Stormrage"
+ },
+ {
+  "id": 32375,
+  "name": "Bulwark of Azzinoth",
+  "quality": 4,
+  "boss": "Illidan Stormrage"
+ },
+ {
+  "id": 31089,
+  "name": "Chestguard of the Forgotten Conqueror",
+  "quality": 4,
+  "boss": "Illidan Stormrage",
+  "allowable_classes": [
+   "paladin",
+   "priest",
+   "warlock"
+  ]
+ },
+ {
+  "id": 31091,
+  "name": "Chestguard of the Forgotten Protector",
+  "quality": 4,
+  "boss": "Illidan Stormrage",
+  "allowable_classes": [
+   "warrior",
+   "hunter",
+   "shaman"
+  ]
+ },
+ {
+  "id": 31090,
+  "name": "Chestguard of the Forgotten Vanquisher",
+  "quality": 4,
+  "boss": "Illidan Stormrage",
+  "allowable_classes": [
+   "rogue",
+   "mage",
+   "druid"
+  ]
+ },
+ {
+  "id": 32525,
+  "name": "Cowl of the Illidari High Lord",
+  "quality": 4,
+  "boss": "Illidan Stormrage"
+ },
+ {
+  "id": 32500,
+  "name": "Crystal Spire of Karabor",
+  "quality": 4,
+  "boss": "Illidan Stormrage"
+ },
+ {
+  "id": 32235,
+  "name": "Cursed Vision of Sargeras",
+  "quality": 4,
+  "boss": "Illidan Stormrage"
+ },
+ {
+  "id": 32521,
+  "name": "Faceplate of the Impenetrable",
+  "quality": 4,
+  "boss": "Illidan Stormrage"
+ },
+ {
+  "id": 32496,
+  "name": "Memento of Tyrande",
+  "quality": 4,
+  "boss": "Illidan Stormrage"
+ },
+ {
+  "id": 32471,
+  "name": "Shard of Azzinoth",
+  "quality": 4,
+  "boss": "Illidan Stormrage"
+ },
+ {
+  "id": 32524,
+  "name": "Shroud of the Highborne",
+  "quality": 4,
+  "boss": "Illidan Stormrage"
+ },
+ {
+  "id": 32497,
+  "name": "Stormrage Signet Ring",
+  "quality": 4,
+  "boss": "Illidan Stormrage"
+ },
+ {
+  "id": 32483,
+  "name": "The Skull of Gul'dan",
+  "quality": 4,
+  "boss": "Illidan Stormrage"
+ },
+ {
+  "id": 32837,
+  "name": "Warglaive of Azzinoth",
+  "quality": 5,
+  "boss": "Illidan Stormrage",
+  "allowable_classes": [
+   "warrior",
+   "rogue"
+  ]
+ },
+ {
+  "id": 32838,
+  "name": "Warglaive of Azzinoth",
+  "quality": 5,
+  "boss": "Illidan Stormrage",
+  "allowable_classes": [
+   "warrior",
+   "rogue"
+  ]
+ },
+ {
+  "id": 32374,
+  "name": "Zhar'doom, Greatstaff of the Devourer",
+  "quality": 4,
+  "boss": "Illidan Stormrage"
+ },
+ {
+  "id": 32526,
+  "name": "Band of Devastation",
+  "quality": 4,
+  "boss": "Trash"
+ },
+ {
+  "id": 32528,
+  "name": "Blessed Band of Karabor",
+  "quality": 4,
+  "boss": "Trash"
+ },
+ {
+  "id": 32606,
+  "name": "Girdle of the Lightbearer",
+  "quality": 4,
+  "boss": "Trash"
+ },
+ {
+  "id": 34011,
+  "name": "Illidari Runeshield",
+  "quality": 4,
+  "boss": "Trash"
+ },
+ {
+  "id": 32608,
+  "name": "Pillager's Gauntlets",
+  "quality": 4,
+  "boss": "Trash"
+ },
+ {
+  "id": 32527,
+  "name": "Ring of Ancient Knowledge",
+  "quality": 4,
+  "boss": "Trash"
+ },
+ {
+  "id": 34012,
+  "name": "Shroud of the Final Stand",
+  "quality": 4,
+  "boss": "Trash"
+ },
+ {
+  "id": 32943,
+  "name": "Swiftsteel Bludgeon",
+  "quality": 4,
+  "boss": "Trash"
+ },
+ {
+  "id": 32593,
+  "name": "Treads of the Den Mother",
+  "quality": 4,
+  "boss": "Trash"
+ }
+]

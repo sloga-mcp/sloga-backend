@@ -1,0 +1,794 @@
+[
+ {
+  "id": 47608,
+  "name": "Acidmaw Boots",
+  "quality": 4,
+  "boss": "Northrend Beasts"
+ },
+ {
+  "id": 47853,
+  "name": "Acidmaw Treads",
+  "quality": 4,
+  "boss": "Northrend Beasts"
+ },
+ {
+  "id": 47610,
+  "name": "Armbands of the Northern Stalker",
+  "quality": 4,
+  "boss": "Northrend Beasts"
+ },
+ {
+  "id": 47615,
+  "name": "Belt of the Frozen Reach",
+  "quality": 4,
+  "boss": "Northrend Beasts"
+ },
+ {
+  "id": 47859,
+  "name": "Belt of the Impaler",
+  "quality": 4,
+  "boss": "Northrend Beasts"
+ },
+ {
+  "id": 47850,
+  "name": "Bracers of the Northern Stalker",
+  "quality": 4,
+  "boss": "Northrend Beasts"
+ },
+ {
+  "id": 47578,
+  "name": "Carnivorous Band",
+  "quality": 4,
+  "boss": "Northrend Beasts"
+ },
+ {
+  "id": 47607,
+  "name": "Collar of Ceaseless Torment",
+  "quality": 4,
+  "boss": "Northrend Beasts"
+ },
+ {
+  "id": 47849,
+  "name": "Collar of Unending Torment",
+  "quality": 4,
+  "boss": "Northrend Beasts"
+ },
+ {
+  "id": 47611,
+  "name": "Dreadscale Armguards",
+  "quality": 4,
+  "boss": "Northrend Beasts"
+ },
+ {
+  "id": 47852,
+  "name": "Dreadscale Bracers",
+  "quality": 4,
+  "boss": "Northrend Beasts"
+ },
+ {
+  "id": 47851,
+  "name": "Gauntlets of Mounting Anger",
+  "quality": 4,
+  "boss": "Northrend Beasts"
+ },
+ {
+  "id": 47609,
+  "name": "Gauntlets of Rising Anger",
+  "quality": 4,
+  "boss": "Northrend Beasts"
+ },
+ {
+  "id": 47858,
+  "name": "Girdle of the Frozen Reach",
+  "quality": 4,
+  "boss": "Northrend Beasts"
+ },
+ {
+  "id": 47614,
+  "name": "Girdle of the Impaler",
+  "quality": 4,
+  "boss": "Northrend Beasts"
+ },
+ {
+  "id": 47854,
+  "name": "Gormok's Band",
+  "quality": 4,
+  "boss": "Northrend Beasts"
+ },
+ {
+  "id": 47855,
+  "name": "Icehowl Binding",
+  "quality": 4,
+  "boss": "Northrend Beasts"
+ },
+ {
+  "id": 47617,
+  "name": "Icehowl Cinch",
+  "quality": 4,
+  "boss": "Northrend Beasts"
+ },
+ {
+  "id": 47857,
+  "name": "Pauldrons of the Glacial Wilds",
+  "quality": 4,
+  "boss": "Northrend Beasts"
+ },
+ {
+  "id": 47860,
+  "name": "Pauldrons of the Spirit Walker",
+  "quality": 4,
+  "boss": "Northrend Beasts"
+ },
+ {
+  "id": 47612,
+  "name": "Rod of Imprisoned Souls",
+  "quality": 4,
+  "boss": "Northrend Beasts"
+ },
+ {
+  "id": 47856,
+  "name": "Scepter of Imprisoned Souls",
+  "quality": 4,
+  "boss": "Northrend Beasts"
+ },
+ {
+  "id": 47616,
+  "name": "Shoulderguards of the Spirit Walker",
+  "quality": 4,
+  "boss": "Northrend Beasts"
+ },
+ {
+  "id": 47613,
+  "name": "Shoulderpads of the Glacial Wilds",
+  "quality": 4,
+  "boss": "Northrend Beasts"
+ },
+ {
+  "id": 47619,
+  "name": "Amulet of Binding Elements",
+  "quality": 4,
+  "boss": "Lord Jaraxxus"
+ },
+ {
+  "id": 47680,
+  "name": "Armguards of the Nether Lord",
+  "quality": 4,
+  "boss": "Lord Jaraxxus"
+ },
+ {
+  "id": 47869,
+  "name": "Armplates of the Nether Lord",
+  "quality": 4,
+  "boss": "Lord Jaraxxus"
+ },
+ {
+  "id": 47863,
+  "name": "Belt of the Bloodhoof Emissary",
+  "quality": 4,
+  "boss": "Lord Jaraxxus"
+ },
+ {
+  "id": 47870,
+  "name": "Belt of the Nether Champion",
+  "quality": 4,
+  "boss": "Lord Jaraxxus"
+ },
+ {
+  "id": 47669,
+  "name": "Belt of the Winter Solstice",
+  "quality": 4,
+  "boss": "Lord Jaraxxus"
+ },
+ {
+  "id": 49235,
+  "name": "Boots of Tortured Space",
+  "quality": 4,
+  "boss": "Lord Jaraxxus"
+ },
+ {
+  "id": 47866,
+  "name": "Darkspear Ritual Binding",
+  "quality": 4,
+  "boss": "Lord Jaraxxus"
+ },
+ {
+  "id": 47676,
+  "name": "Dirk of the Night Watch",
+  "quality": 4,
+  "boss": "Lord Jaraxxus"
+ },
+ {
+  "id": 47679,
+  "name": "Endurance of the Infernal",
+  "quality": 4,
+  "boss": "Lord Jaraxxus"
+ },
+ {
+  "id": 47663,
+  "name": "Felspark Bindings",
+  "quality": 4,
+  "boss": "Lord Jaraxxus"
+ },
+ {
+  "id": 47861,
+  "name": "Felspark Bracers",
+  "quality": 4,
+  "boss": "Lord Jaraxxus"
+ },
+ {
+  "id": 47862,
+  "name": "Firestorm Band",
+  "quality": 4,
+  "boss": "Lord Jaraxxus"
+ },
+ {
+  "id": 47618,
+  "name": "Firestorm Ring",
+  "quality": 4,
+  "boss": "Lord Jaraxxus"
+ },
+ {
+  "id": 47872,
+  "name": "Fortitude of the Infernal",
+  "quality": 4,
+  "boss": "Lord Jaraxxus"
+ },
+ {
+  "id": 47621,
+  "name": "Girdle of the Farseer",
+  "quality": 4,
+  "boss": "Lord Jaraxxus"
+ },
+ {
+  "id": 47711,
+  "name": "Girdle of the Nether Champion",
+  "quality": 4,
+  "boss": "Lord Jaraxxus"
+ },
+ {
+  "id": 47620,
+  "name": "Leggings of the Demonic Messenger",
+  "quality": 4,
+  "boss": "Lord Jaraxxus"
+ },
+ {
+  "id": 47865,
+  "name": "Legwraps of the Demonic Messenger",
+  "quality": 4,
+  "boss": "Lord Jaraxxus"
+ },
+ {
+  "id": 47871,
+  "name": "Orcish Deathblade",
+  "quality": 4,
+  "boss": "Lord Jaraxxus"
+ },
+ {
+  "id": 47864,
+  "name": "Pendant of Binding Elements",
+  "quality": 4,
+  "boss": "Lord Jaraxxus"
+ },
+ {
+  "id": 47868,
+  "name": "Planestalker Band",
+  "quality": 4,
+  "boss": "Lord Jaraxxus"
+ },
+ {
+  "id": 47703,
+  "name": "Planestalker Signet",
+  "quality": 4,
+  "boss": "Lord Jaraxxus"
+ },
+ {
+  "id": 49236,
+  "name": "Sabatons of Tortured Space",
+  "quality": 4,
+  "boss": "Lord Jaraxxus"
+ },
+ {
+  "id": 47683,
+  "name": "Sentinel Scouting Greaves",
+  "quality": 4,
+  "boss": "Lord Jaraxxus"
+ },
+ {
+  "id": 47867,
+  "name": "Warsong Poacher's Greaves",
+  "quality": 4,
+  "boss": "Lord Jaraxxus"
+ },
+ {
+  "id": 47728,
+  "name": "Binding Light",
+  "quality": 4,
+  "boss": "Faction Champions"
+ },
+ {
+  "id": 47880,
+  "name": "Binding Stone",
+  "quality": 4,
+  "boss": "Faction Champions"
+ },
+ {
+  "id": 47724,
+  "name": "Blade of the Silver Disciple",
+  "quality": 4,
+  "boss": "Faction Champions"
+ },
+ {
+  "id": 47882,
+  "name": "Eitrigg's Oath",
+  "quality": 4,
+  "boss": "Faction Champions"
+ },
+ {
+  "id": 47717,
+  "name": "Faceplate of the Silver Champion",
+  "quality": 4,
+  "boss": "Faction Champions"
+ },
+ {
+  "id": 47727,
+  "name": "Fervor of the Frostborn",
+  "quality": 4,
+  "boss": "Faction Champions"
+ },
+ {
+  "id": 47879,
+  "name": "Fetish of Volatile Power",
+  "quality": 4,
+  "boss": "Faction Champions"
+ },
+ {
+  "id": 47719,
+  "name": "Gloves of the Silver Assassin",
+  "quality": 4,
+  "boss": "Faction Champions"
+ },
+ {
+  "id": 47718,
+  "name": "Helm of the Silver Ranger",
+  "quality": 4,
+  "boss": "Faction Champions"
+ },
+ {
+  "id": 47720,
+  "name": "Pauldrons of the Silver Defender",
+  "quality": 4,
+  "boss": "Faction Champions"
+ },
+ {
+  "id": 47721,
+  "name": "Sandals of the Silver Magus",
+  "quality": 4,
+  "boss": "Faction Champions"
+ },
+ {
+  "id": 47878,
+  "name": "Sunreaver Assassin's Gloves",
+  "quality": 4,
+  "boss": "Faction Champions"
+ },
+ {
+  "id": 47876,
+  "name": "Sunreaver Champion's Faceplate",
+  "quality": 4,
+  "boss": "Faction Champions"
+ },
+ {
+  "id": 47877,
+  "name": "Sunreaver Defender's Pauldrons",
+  "quality": 4,
+  "boss": "Faction Champions"
+ },
+ {
+  "id": 47874,
+  "name": "Sunreaver Disciple's Blade",
+  "quality": 4,
+  "boss": "Faction Champions"
+ },
+ {
+  "id": 47873,
+  "name": "Sunreaver Magus' Sandals",
+  "quality": 4,
+  "boss": "Faction Champions"
+ },
+ {
+  "id": 47875,
+  "name": "Sunreaver Ranger's Helm",
+  "quality": 4,
+  "boss": "Faction Champions"
+ },
+ {
+  "id": 47726,
+  "name": "Talisman of Volatile Power",
+  "quality": 4,
+  "boss": "Faction Champions"
+ },
+ {
+  "id": 47881,
+  "name": "Vengeance of the Forsaken",
+  "quality": 4,
+  "boss": "Faction Champions"
+ },
+ {
+  "id": 47725,
+  "name": "Victor's Call",
+  "quality": 4,
+  "boss": "Faction Champions"
+ },
+ {
+  "id": 47739,
+  "name": "Armor of Shifting Shadows",
+  "quality": 4,
+  "boss": "Twin Val'kyr"
+ },
+ {
+  "id": 47888,
+  "name": "Band of the Twin Val'kyr",
+  "quality": 4,
+  "boss": "Twin Val'kyr"
+ },
+ {
+  "id": 49231,
+  "name": "Boots of the Grieving Soul",
+  "quality": 4,
+  "boss": "Twin Val'kyr"
+ },
+ {
+  "id": 47742,
+  "name": "Chalice of Benedictus",
+  "quality": 4,
+  "boss": "Twin Val'kyr"
+ },
+ {
+  "id": 47890,
+  "name": "Darkbane Amulet",
+  "quality": 4,
+  "boss": "Twin Val'kyr"
+ },
+ {
+  "id": 47747,
+  "name": "Darkbane Pendant",
+  "quality": 4,
+  "boss": "Twin Val'kyr"
+ },
+ {
+  "id": 47884,
+  "name": "Edge of Agony",
+  "quality": 4,
+  "boss": "Twin Val'kyr"
+ },
+ {
+  "id": 47743,
+  "name": "Enlightenment",
+  "quality": 4,
+  "boss": "Twin Val'kyr"
+ },
+ {
+  "id": 47745,
+  "name": "Gloves of Looming Shadow",
+  "quality": 4,
+  "boss": "Twin Val'kyr"
+ },
+ {
+  "id": 47744,
+  "name": "Gloves of the Azure Prophet",
+  "quality": 4,
+  "boss": "Twin Val'kyr"
+ },
+ {
+  "id": 47885,
+  "name": "Greaves of the Lingering Vortex",
+  "quality": 4,
+  "boss": "Twin Val'kyr"
+ },
+ {
+  "id": 47891,
+  "name": "Helm of the High Mesa",
+  "quality": 4,
+  "boss": "Twin Val'kyr"
+ },
+ {
+  "id": 47746,
+  "name": "Helm of the Snowy Grotto",
+  "quality": 4,
+  "boss": "Twin Val'kyr"
+ },
+ {
+  "id": 47736,
+  "name": "Icefall Blade",
+  "quality": 4,
+  "boss": "Twin Val'kyr"
+ },
+ {
+  "id": 47892,
+  "name": "Illumination",
+  "quality": 4,
+  "boss": "Twin Val'kyr"
+ },
+ {
+  "id": 47913,
+  "name": "Lightbane Focus",
+  "quality": 4,
+  "boss": "Twin Val'kyr"
+ },
+ {
+  "id": 47889,
+  "name": "Looming Shadow Wraps",
+  "quality": 4,
+  "boss": "Twin Val'kyr"
+ },
+ {
+  "id": 47700,
+  "name": "Loop of the Twin Val'kyr",
+  "quality": 4,
+  "boss": "Twin Val'kyr"
+ },
+ {
+  "id": 47886,
+  "name": "Nemesis Blade",
+  "quality": 4,
+  "boss": "Twin Val'kyr"
+ },
+ {
+  "id": 47737,
+  "name": "Reckoning",
+  "quality": 4,
+  "boss": "Twin Val'kyr"
+ },
+ {
+  "id": 47738,
+  "name": "Sabatons of the Lingering Vortex",
+  "quality": 4,
+  "boss": "Twin Val'kyr"
+ },
+ {
+  "id": 49232,
+  "name": "Sandals of the Grieving Soul",
+  "quality": 4,
+  "boss": "Twin Val'kyr"
+ },
+ {
+  "id": 47893,
+  "name": "Sen'jin Ritualist Gloves",
+  "quality": 4,
+  "boss": "Twin Val'kyr"
+ },
+ {
+  "id": 47740,
+  "name": "The Diplomat",
+  "quality": 4,
+  "boss": "Twin Val'kyr"
+ },
+ {
+  "id": 47887,
+  "name": "Vest of Shifting Shadows",
+  "quality": 4,
+  "boss": "Twin Val'kyr"
+ },
+ {
+  "id": 47883,
+  "name": "Widebarrel Flintlock",
+  "quality": 4,
+  "boss": "Twin Val'kyr"
+ },
+ {
+  "id": 47910,
+  "name": "Aegis of the Coliseum",
+  "quality": 4,
+  "boss": "Anub'arak"
+ },
+ {
+  "id": 47911,
+  "name": "Anguish",
+  "quality": 4,
+  "boss": "Anub'arak"
+ },
+ {
+  "id": 47899,
+  "name": "Ardent Guard",
+  "quality": 4,
+  "boss": "Anub'arak"
+ },
+ {
+  "id": 47809,
+  "name": "Argent Resolve",
+  "quality": 4,
+  "boss": "Anub'arak"
+ },
+ {
+  "id": 47741,
+  "name": "Baelgun's Heavy Crossbow",
+  "quality": 4,
+  "boss": "Anub'arak"
+ },
+ {
+  "id": 47909,
+  "name": "Belt of the Eternal",
+  "quality": 4,
+  "boss": "Anub'arak"
+ },
+ {
+  "id": 47905,
+  "name": "Blackhorn Bludgeon",
+  "quality": 4,
+  "boss": "Anub'arak"
+ },
+ {
+  "id": 47835,
+  "name": "Bulwark of the Royal Guard",
+  "quality": 4,
+  "boss": "Anub'arak"
+ },
+ {
+  "id": 47811,
+  "name": "Chestguard of the Warden",
+  "quality": 4,
+  "boss": "Anub'arak"
+ },
+ {
+  "id": 47837,
+  "name": "Cinch of the Undying",
+  "quality": 4,
+  "boss": "Anub'arak"
+ },
+ {
+  "id": 47815,
+  "name": "Cold Convergence",
+  "quality": 4,
+  "boss": "Anub'arak"
+ },
+ {
+  "id": 47810,
+  "name": "Crusader's Glory",
+  "quality": 4,
+  "boss": "Anub'arak"
+ },
+ {
+  "id": 47907,
+  "name": "Darkmaw Crossbow",
+  "quality": 4,
+  "boss": "Anub'arak"
+ },
+ {
+  "id": 47834,
+  "name": "Fordragon Blades",
+  "quality": 4,
+  "boss": "Anub'arak"
+ },
+ {
+  "id": 47903,
+  "name": "Forsaken Bonecarver",
+  "quality": 4,
+  "boss": "Anub'arak"
+ },
+ {
+  "id": 47898,
+  "name": "Frostblade Hatchet",
+  "quality": 4,
+  "boss": "Anub'arak"
+ },
+ {
+  "id": 47897,
+  "name": "Helm of the Crypt Lord",
+  "quality": 4,
+  "boss": "Anub'arak"
+ },
+ {
+  "id": 47813,
+  "name": "Helmet of the Crypt Lord",
+  "quality": 4,
+  "boss": "Anub'arak"
+ },
+ {
+  "id": 47902,
+  "name": "Legplates of Redeemed Blood",
+  "quality": 4,
+  "boss": "Anub'arak"
+ },
+ {
+  "id": 47836,
+  "name": "Legplates of the Immortal Spider",
+  "quality": 4,
+  "boss": "Anub'arak"
+ },
+ {
+  "id": 47830,
+  "name": "Legplates of the Silver Hand",
+  "quality": 4,
+  "boss": "Anub'arak"
+ },
+ {
+  "id": 47894,
+  "name": "Mace of the Earthborn Chieftain",
+  "quality": 4,
+  "boss": "Anub'arak"
+ },
+ {
+  "id": 47901,
+  "name": "Pauldrons of the Shadow Hunter",
+  "quality": 4,
+  "boss": "Anub'arak"
+ },
+ {
+  "id": 47829,
+  "name": "Pauldrons of the Timeless Hunter",
+  "quality": 4,
+  "boss": "Anub'arak"
+ },
+ {
+  "id": 47900,
+  "name": "Perdition",
+  "quality": 4,
+  "boss": "Anub'arak"
+ },
+ {
+  "id": 47895,
+  "name": "Pride of the Kor'kron",
+  "quality": 4,
+  "boss": "Anub'arak"
+ },
+ {
+  "id": 47906,
+  "name": "Robes of the Sleepless",
+  "quality": 4,
+  "boss": "Anub'arak"
+ },
+ {
+  "id": 47904,
+  "name": "Shoulderpads of the Snow Bandit",
+  "quality": 4,
+  "boss": "Anub'arak"
+ },
+ {
+  "id": 47832,
+  "name": "Spaulders of the Snow Bandit",
+  "quality": 4,
+  "boss": "Anub'arak"
+ },
+ {
+  "id": 47896,
+  "name": "Stoneskin Chestplate",
+  "quality": 4,
+  "boss": "Anub'arak"
+ },
+ {
+  "id": 47908,
+  "name": "Sunwalker Legguards",
+  "quality": 4,
+  "boss": "Anub'arak"
+ },
+ {
+  "id": 47816,
+  "name": "The Grinder",
+  "quality": 4,
+  "boss": "Anub'arak"
+ },
+ {
+  "id": 47808,
+  "name": "The Lion's Maw",
+  "quality": 4,
+  "boss": "Anub'arak"
+ },
+ {
+  "id": 47838,
+  "name": "Vestments of the Sleepless",
+  "quality": 4,
+  "boss": "Anub'arak"
+ },
+ {
+  "id": 47812,
+  "name": "Vigilant Ward",
+  "quality": 4,
+  "boss": "Anub'arak"
+ },
+ {
+  "id": 47814,
+  "name": "Westfall Saber",
+  "quality": 4,
+  "boss": "Anub'arak"
+ }
+]

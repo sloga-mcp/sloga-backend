@@ -1,0 +1,656 @@
+[
+ {
+  "id": 21500,
+  "name": "Belt of the Inquisition",
+  "quality": 3,
+  "boss": "Kurinnaxx"
+ },
+ {
+  "id": 21503,
+  "name": "Belt of the Sand Reaver",
+  "quality": 3,
+  "boss": "Kurinnaxx"
+ },
+ {
+  "id": 21498,
+  "name": "Qiraji Sacrificial Dagger",
+  "quality": 4,
+  "boss": "Kurinnaxx"
+ },
+ {
+  "id": 21502,
+  "name": "Sand Reaver Wristguards",
+  "quality": 3,
+  "boss": "Kurinnaxx"
+ },
+ {
+  "id": 21501,
+  "name": "Toughened Silithid Hide Gloves",
+  "quality": 3,
+  "boss": "Kurinnaxx"
+ },
+ {
+  "id": 21499,
+  "name": "Vestments of the Shifting Sands",
+  "quality": 4,
+  "boss": "Kurinnaxx"
+ },
+ {
+  "id": 20885,
+  "name": "Qiraji Martial Drape",
+  "quality": 3,
+  "boss": "Kurinnaxx / General Rajaxx / Buru the Gorger / Ayamiss the Hunter",
+  "allowable_classes": [
+   "warrior",
+   "rogue",
+   "priest",
+   "mage"
+  ]
+ },
+ {
+  "id": 20889,
+  "name": "Qiraji Regal Drape",
+  "quality": 3,
+  "boss": "Kurinnaxx / General Rajaxx / Buru the Gorger / Ayamiss the Hunter",
+  "allowable_classes": [
+   "paladin",
+   "hunter",
+   "shaman",
+   "warlock",
+   "druid"
+  ]
+ },
+ {
+  "id": 20888,
+  "name": "Qiraji Ceremonial Ring",
+  "quality": 3,
+  "boss": "Kurinnaxx / General Rajaxx / Moam / Buru the Gorger / Ayamiss the Hunter",
+  "allowable_classes": [
+   "hunter",
+   "rogue",
+   "priest",
+   "warlock"
+  ]
+ },
+ {
+  "id": 21294,
+  "name": "Book of Healing Touch XI",
+  "quality": 3,
+  "boss": "Kurinnaxx / General Rajaxx / Moam / Buru the Gorger / Ayamiss the Hunter / Ossirian the Unscarred",
+  "allowable_classes": [
+   "druid"
+  ]
+ },
+ {
+  "id": 21296,
+  "name": "Book of Rejuvenation XI",
+  "quality": 3,
+  "boss": "Kurinnaxx / General Rajaxx / Moam / Buru the Gorger / Ayamiss the Hunter / Ossirian the Unscarred",
+  "allowable_classes": [
+   "druid"
+  ]
+ },
+ {
+  "id": 21295,
+  "name": "Book of Starfire VII",
+  "quality": 3,
+  "boss": "Kurinnaxx / General Rajaxx / Moam / Buru the Gorger / Ayamiss the Hunter / Ossirian the Unscarred",
+  "allowable_classes": [
+   "druid"
+  ]
+ },
+ {
+  "id": 21284,
+  "name": "Codex of Greater Heal V",
+  "quality": 3,
+  "boss": "Kurinnaxx / General Rajaxx / Moam / Buru the Gorger / Ayamiss the Hunter / Ossirian the Unscarred",
+  "allowable_classes": [
+   "priest"
+  ]
+ },
+ {
+  "id": 21287,
+  "name": "Codex of Prayer of Healing V",
+  "quality": 3,
+  "boss": "Kurinnaxx / General Rajaxx / Moam / Buru the Gorger / Ayamiss the Hunter / Ossirian the Unscarred",
+  "allowable_classes": [
+   "priest"
+  ]
+ },
+ {
+  "id": 21285,
+  "name": "Codex of Renew X",
+  "quality": 3,
+  "boss": "Kurinnaxx / General Rajaxx / Moam / Buru the Gorger / Ayamiss the Hunter / Ossirian the Unscarred",
+  "allowable_classes": [
+   "priest"
+  ]
+ },
+ {
+  "id": 21283,
+  "name": "Grimoire of Corruption VII",
+  "quality": 3,
+  "boss": "Kurinnaxx / General Rajaxx / Moam / Buru the Gorger / Ayamiss the Hunter / Ossirian the Unscarred",
+  "allowable_classes": [
+   "warlock"
+  ]
+ },
+ {
+  "id": 21282,
+  "name": "Grimoire of Immolate VIII",
+  "quality": 3,
+  "boss": "Kurinnaxx / General Rajaxx / Moam / Buru the Gorger / Ayamiss the Hunter / Ossirian the Unscarred",
+  "allowable_classes": [
+   "warlock"
+  ]
+ },
+ {
+  "id": 21281,
+  "name": "Grimoire of Shadow Bolt X",
+  "quality": 3,
+  "boss": "Kurinnaxx / General Rajaxx / Moam / Buru the Gorger / Ayamiss the Hunter / Ossirian the Unscarred",
+  "allowable_classes": [
+   "warlock"
+  ]
+ },
+ {
+  "id": 21307,
+  "name": "Guide: Aspect of the Hawk VII",
+  "quality": 3,
+  "boss": "Kurinnaxx / General Rajaxx / Moam / Buru the Gorger / Ayamiss the Hunter / Ossirian the Unscarred",
+  "allowable_classes": [
+   "hunter"
+  ]
+ },
+ {
+  "id": 21304,
+  "name": "Guide: Multi-Shot V",
+  "quality": 3,
+  "boss": "Kurinnaxx / General Rajaxx / Moam / Buru the Gorger / Ayamiss the Hunter / Ossirian the Unscarred",
+  "allowable_classes": [
+   "hunter"
+  ]
+ },
+ {
+  "id": 21306,
+  "name": "Guide: Serpent Sting IX",
+  "quality": 3,
+  "boss": "Kurinnaxx / General Rajaxx / Moam / Buru the Gorger / Ayamiss the Hunter / Ossirian the Unscarred",
+  "allowable_classes": [
+   "hunter"
+  ]
+ },
+ {
+  "id": 21300,
+  "name": "Handbook of Backstab IX",
+  "quality": 3,
+  "boss": "Kurinnaxx / General Rajaxx / Moam / Buru the Gorger / Ayamiss the Hunter / Ossirian the Unscarred",
+  "allowable_classes": [
+   "rogue"
+  ]
+ },
+ {
+  "id": 21302,
+  "name": "Handbook of Deadly Poison V",
+  "quality": 3,
+  "boss": "Kurinnaxx / General Rajaxx / Moam / Buru the Gorger / Ayamiss the Hunter / Ossirian the Unscarred",
+  "allowable_classes": [
+   "rogue"
+  ]
+ },
+ {
+  "id": 21303,
+  "name": "Handbook of Feint V",
+  "quality": 3,
+  "boss": "Kurinnaxx / General Rajaxx / Moam / Buru the Gorger / Ayamiss the Hunter / Ossirian the Unscarred",
+  "allowable_classes": [
+   "rogue"
+  ]
+ },
+ {
+  "id": 21289,
+  "name": "Libram: Blessing of Might VII",
+  "quality": 3,
+  "boss": "Kurinnaxx / General Rajaxx / Moam / Buru the Gorger / Ayamiss the Hunter / Ossirian the Unscarred",
+  "allowable_classes": [
+   "paladin"
+  ]
+ },
+ {
+  "id": 21288,
+  "name": "Libram: Blessing of Wisdom VI",
+  "quality": 3,
+  "boss": "Kurinnaxx / General Rajaxx / Moam / Buru the Gorger / Ayamiss the Hunter / Ossirian the Unscarred",
+  "allowable_classes": [
+   "paladin"
+  ]
+ },
+ {
+  "id": 21290,
+  "name": "Libram: Holy Light IX",
+  "quality": 3,
+  "boss": "Kurinnaxx / General Rajaxx / Moam / Buru the Gorger / Ayamiss the Hunter / Ossirian the Unscarred",
+  "allowable_classes": [
+   "paladin"
+  ]
+ },
+ {
+  "id": 21298,
+  "name": "Manual of Battle Shout VII",
+  "quality": 3,
+  "boss": "Kurinnaxx / General Rajaxx / Moam / Buru the Gorger / Ayamiss the Hunter / Ossirian the Unscarred",
+  "allowable_classes": [
+   "warrior"
+  ]
+ },
+ {
+  "id": 21297,
+  "name": "Manual of Heroic Strike IX",
+  "quality": 3,
+  "boss": "Kurinnaxx / General Rajaxx / Moam / Buru the Gorger / Ayamiss the Hunter / Ossirian the Unscarred",
+  "allowable_classes": [
+   "warrior"
+  ]
+ },
+ {
+  "id": 21299,
+  "name": "Manual of Revenge VI",
+  "quality": 3,
+  "boss": "Kurinnaxx / General Rajaxx / Moam / Buru the Gorger / Ayamiss the Hunter / Ossirian the Unscarred",
+  "allowable_classes": [
+   "warrior"
+  ]
+ },
+ {
+  "id": 20884,
+  "name": "Qiraji Magisterial Ring",
+  "quality": 3,
+  "boss": "Kurinnaxx / General Rajaxx / Moam / Buru the Gorger / Ayamiss the Hunter / Ossirian the Unscarred",
+  "allowable_classes": [
+   "warrior",
+   "paladin",
+   "shaman",
+   "mage",
+   "druid"
+  ]
+ },
+ {
+  "id": 21293,
+  "name": "Tablet of Grace of Air Totem III",
+  "quality": 3,
+  "boss": "Kurinnaxx / General Rajaxx / Moam / Buru the Gorger / Ayamiss the Hunter / Ossirian the Unscarred",
+  "allowable_classes": [
+   "shaman"
+  ]
+ },
+ {
+  "id": 21291,
+  "name": "Tablet of Healing Wave X",
+  "quality": 3,
+  "boss": "Kurinnaxx / General Rajaxx / Moam / Buru the Gorger / Ayamiss the Hunter / Ossirian the Unscarred",
+  "allowable_classes": [
+   "shaman"
+  ]
+ },
+ {
+  "id": 21292,
+  "name": "Tablet of Strength of Earth Totem V",
+  "quality": 3,
+  "boss": "Kurinnaxx / General Rajaxx / Moam / Buru the Gorger / Ayamiss the Hunter / Ossirian the Unscarred",
+  "allowable_classes": [
+   "shaman"
+  ]
+ },
+ {
+  "id": 21280,
+  "name": "Tome of Arcane Missiles VIII",
+  "quality": 3,
+  "boss": "Kurinnaxx / General Rajaxx / Moam / Buru the Gorger / Ayamiss the Hunter / Ossirian the Unscarred",
+  "allowable_classes": [
+   "mage"
+  ]
+ },
+ {
+  "id": 21279,
+  "name": "Tome of Fireball XII",
+  "quality": 3,
+  "boss": "Kurinnaxx / General Rajaxx / Moam / Buru the Gorger / Ayamiss the Hunter / Ossirian the Unscarred",
+  "allowable_classes": [
+   "mage"
+  ]
+ },
+ {
+  "id": 21214,
+  "name": "Tome of Frostbolt XI",
+  "quality": 3,
+  "boss": "Kurinnaxx / General Rajaxx / Moam / Buru the Gorger / Ayamiss the Hunter / Ossirian the Unscarred",
+  "allowable_classes": [
+   "mage"
+  ]
+ },
+ {
+  "id": 21497,
+  "name": "Boots of the Qiraji General",
+  "quality": 3,
+  "boss": "General Rajaxx"
+ },
+ {
+  "id": 21493,
+  "name": "Boots of the Vanguard",
+  "quality": 4,
+  "boss": "General Rajaxx"
+ },
+ {
+  "id": 21496,
+  "name": "Bracers of Qiraji Command",
+  "quality": 3,
+  "boss": "General Rajaxx"
+ },
+ {
+  "id": 21495,
+  "name": "Legplates of the Qiraji Command",
+  "quality": 3,
+  "boss": "General Rajaxx"
+ },
+ {
+  "id": 21492,
+  "name": "Manslayer of the Qiraji",
+  "quality": 4,
+  "boss": "General Rajaxx"
+ },
+ {
+  "id": 21494,
+  "name": "Southwind's Grasp",
+  "quality": 3,
+  "boss": "General Rajaxx"
+ },
+ {
+  "id": 21474,
+  "name": "Chitinous Shoulderguards",
+  "quality": 3,
+  "boss": "Moam"
+ },
+ {
+  "id": 21470,
+  "name": "Cloak of the Savior",
+  "quality": 3,
+  "boss": "Moam"
+ },
+ {
+  "id": 21472,
+  "name": "Dustwind Turban",
+  "quality": 4,
+  "boss": "Moam"
+ },
+ {
+  "id": 21473,
+  "name": "Eye of Moam",
+  "quality": 3,
+  "boss": "Moam"
+ },
+ {
+  "id": 21469,
+  "name": "Gauntlets of Southwind",
+  "quality": 3,
+  "boss": "Moam"
+ },
+ {
+  "id": 21475,
+  "name": "Legplates of the Destroyer",
+  "quality": 3,
+  "boss": "Moam"
+ },
+ {
+  "id": 21468,
+  "name": "Mantle of Maz'Nadir",
+  "quality": 3,
+  "boss": "Moam"
+ },
+ {
+  "id": 21476,
+  "name": "Obsidian Scaled Leggings",
+  "quality": 3,
+  "boss": "Moam"
+ },
+ {
+  "id": 22220,
+  "name": "Plans: Black Grasp of the Destroyer",
+  "quality": 3,
+  "boss": "Moam"
+ },
+ {
+  "id": 21477,
+  "name": "Ring of Fury",
+  "quality": 3,
+  "boss": "Moam"
+ },
+ {
+  "id": 21455,
+  "name": "Southwind Helm",
+  "quality": 3,
+  "boss": "Moam"
+ },
+ {
+  "id": 21471,
+  "name": "Talon of Furious Concentration",
+  "quality": 4,
+  "boss": "Moam"
+ },
+ {
+  "id": 21467,
+  "name": "Thick Silithid Chestguard",
+  "quality": 4,
+  "boss": "Moam"
+ },
+ {
+  "id": 21479,
+  "name": "Gauntlets of the Immovable",
+  "quality": 4,
+  "boss": "Moam / Ayamiss the Hunter"
+ },
+ {
+  "id": 20890,
+  "name": "Qiraji Ornate Hilt",
+  "quality": 4,
+  "boss": "Moam / Buru the Gorger / Ayamiss the Hunter / Ossirian the Unscarred",
+  "allowable_classes": [
+   "priest",
+   "mage",
+   "warlock",
+   "druid"
+  ]
+ },
+ {
+  "id": 20886,
+  "name": "Qiraji Spiked Hilt",
+  "quality": 4,
+  "boss": "Moam / Buru the Gorger / Ayamiss the Hunter / Ossirian the Unscarred",
+  "allowable_classes": [
+   "warrior",
+   "paladin",
+   "hunter",
+   "rogue",
+   "shaman"
+  ]
+ },
+ {
+  "id": 21485,
+  "name": "Buru's Skull Fragment",
+  "quality": 4,
+  "boss": "Buru the Gorger"
+ },
+ {
+  "id": 21488,
+  "name": "Fetish of Chitinous Spikes",
+  "quality": 3,
+  "boss": "Buru the Gorger"
+ },
+ {
+  "id": 21486,
+  "name": "Gloves of the Swarm",
+  "quality": 4,
+  "boss": "Buru the Gorger"
+ },
+ {
+  "id": 21489,
+  "name": "Quicksand Waders",
+  "quality": 3,
+  "boss": "Buru the Gorger"
+ },
+ {
+  "id": 21491,
+  "name": "Scaled Bracers of the Gorger",
+  "quality": 3,
+  "boss": "Buru the Gorger"
+ },
+ {
+  "id": 21490,
+  "name": "Slime Kickers",
+  "quality": 3,
+  "boss": "Buru the Gorger"
+ },
+ {
+  "id": 21487,
+  "name": "Slimy Scaled Gauntlets",
+  "quality": 4,
+  "boss": "Buru the Gorger"
+ },
+ {
+  "id": 21481,
+  "name": "Boots of the Desert Protector",
+  "quality": 3,
+  "boss": "Ayamiss the Hunter"
+ },
+ {
+  "id": 21482,
+  "name": "Boots of the Fiery Sands",
+  "quality": 3,
+  "boss": "Ayamiss the Hunter"
+ },
+ {
+  "id": 21478,
+  "name": "Bow of Taut Sinew",
+  "quality": 4,
+  "boss": "Ayamiss the Hunter"
+ },
+ {
+  "id": 21484,
+  "name": "Helm of Regrowth",
+  "quality": 3,
+  "boss": "Ayamiss the Hunter"
+ },
+ {
+  "id": 21483,
+  "name": "Ring of the Desert Winds",
+  "quality": 3,
+  "boss": "Ayamiss the Hunter"
+ },
+ {
+  "id": 21480,
+  "name": "Scaled Silithid Gauntlets",
+  "quality": 3,
+  "boss": "Ayamiss the Hunter"
+ },
+ {
+  "id": 21466,
+  "name": "Stinger of Ayamiss",
+  "quality": 4,
+  "boss": "Ayamiss the Hunter"
+ },
+ {
+  "id": 21457,
+  "name": "Bracers of Brutality",
+  "quality": 4,
+  "boss": "Ossirian the Unscarred"
+ },
+ {
+  "id": 21459,
+  "name": "Crossbow of Imminent Doom",
+  "quality": 4,
+  "boss": "Ossirian the Unscarred"
+ },
+ {
+  "id": 21458,
+  "name": "Gauntlets of New Life",
+  "quality": 4,
+  "boss": "Ossirian the Unscarred"
+ },
+ {
+  "id": 21462,
+  "name": "Gloves of Dark Wisdom",
+  "quality": 4,
+  "boss": "Ossirian the Unscarred"
+ },
+ {
+  "id": 21220,
+  "name": "Head of Ossirian the Unscarred",
+  "quality": 4,
+  "boss": "Ossirian the Unscarred"
+ },
+ {
+  "id": 21460,
+  "name": "Helm of Domination",
+  "quality": 4,
+  "boss": "Ossirian the Unscarred"
+ },
+ {
+  "id": 21461,
+  "name": "Leggings of the Black Blizzard",
+  "quality": 4,
+  "boss": "Ossirian the Unscarred"
+ },
+ {
+  "id": 21453,
+  "name": "Mantle of the Horusath",
+  "quality": 4,
+  "boss": "Ossirian the Unscarred"
+ },
+ {
+  "id": 21463,
+  "name": "Ossirian's Binding",
+  "quality": 4,
+  "boss": "Ossirian the Unscarred"
+ },
+ {
+  "id": 21454,
+  "name": "Runic Stone Shoulders",
+  "quality": 4,
+  "boss": "Ossirian the Unscarred"
+ },
+ {
+  "id": 21715,
+  "name": "Sand Polished Hammer",
+  "quality": 4,
+  "boss": "Ossirian the Unscarred"
+ },
+ {
+  "id": 21456,
+  "name": "Sandstorm Cloak",
+  "quality": 4,
+  "boss": "Ossirian the Unscarred"
+ },
+ {
+  "id": 21464,
+  "name": "Shackles of the Unscarred",
+  "quality": 4,
+  "boss": "Ossirian the Unscarred"
+ },
+ {
+  "id": 21452,
+  "name": "Staff of the Ruins",
+  "quality": 4,
+  "boss": "Ossirian the Unscarred"
+ },
+ {
+  "id": 12717,
+  "name": "Plans: Lionheart Helm",
+  "quality": 4,
+  "boss": "Trash"
+ },
+ {
+  "id": 12720,
+  "name": "Plans: Stronghold Gauntlets",
+  "quality": 4,
+  "boss": "Trash"
+ }
+]

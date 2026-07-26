@@ -158,6 +158,10 @@ pub enum ErrorType {
     // ? Poll errors
     PollClosed,
 
+    // ? Soft-reserve errors
+    /// Raid id not present in the static loot catalog
+    UnknownRaid,
+
     // ? Scheduled message errors
     TooManyScheduledMessages {
         max: usize,

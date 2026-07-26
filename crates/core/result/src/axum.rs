@@ -71,6 +71,7 @@ impl IntoResponse for Error {
             ErrorType::InteractionExpired => StatusCode::GONE,
             ErrorType::InteractionAlreadyResponded => StatusCode::CONFLICT,
             ErrorType::PollClosed => StatusCode::GONE,
+            ErrorType::UnknownRaid => StatusCode::BAD_REQUEST,
             ErrorType::TooManyScheduledMessages { .. } => StatusCode::BAD_REQUEST,
             ErrorType::NotAnAnnouncementChannel => StatusCode::BAD_REQUEST,
             ErrorType::AlreadyCrossposted => StatusCode::BAD_REQUEST,

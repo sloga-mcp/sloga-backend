@@ -1,0 +1,194 @@
+[
+ {
+  "id": "naxx10",
+  "edition": "wrath",
+  "name": "Naxxramas (10)",
+  "slots": 10,
+  "size": 10,
+  "difficulty": "normal"
+ },
+ {
+  "id": "naxx25",
+  "edition": "wrath",
+  "name": "Naxxramas (25)",
+  "slots": 25,
+  "size": 25,
+  "difficulty": "normal"
+ },
+ {
+  "id": "os10",
+  "edition": "wrath",
+  "name": "The Obsidian Sanctum (10)",
+  "slots": 10,
+  "size": 10,
+  "difficulty": "normal"
+ },
+ {
+  "id": "os25",
+  "edition": "wrath",
+  "name": "The Obsidian Sanctum (25)",
+  "slots": 25,
+  "size": 25,
+  "difficulty": "normal"
+ },
+ {
+  "id": "eoe10",
+  "edition": "wrath",
+  "name": "The Eye of Eternity (10)",
+  "slots": 10,
+  "size": 10,
+  "difficulty": "normal"
+ },
+ {
+  "id": "eoe25",
+  "edition": "wrath",
+  "name": "The Eye of Eternity (25)",
+  "slots": 25,
+  "size": 25,
+  "difficulty": "normal"
+ },
+ {
+  "id": "voa10",
+  "edition": "wrath",
+  "name": "Vault of Archavon (10)",
+  "slots": 10,
+  "size": 10,
+  "difficulty": "normal"
+ },
+ {
+  "id": "voa25",
+  "edition": "wrath",
+  "name": "Vault of Archavon (25)",
+  "slots": 25,
+  "size": 25,
+  "difficulty": "normal"
+ },
+ {
+  "id": "ulduar10",
+  "edition": "wrath",
+  "name": "Ulduar (10)",
+  "slots": 10,
+  "size": 10,
+  "difficulty": "normal"
+ },
+ {
+  "id": "ulduar25",
+  "edition": "wrath",
+  "name": "Ulduar (25)",
+  "slots": 25,
+  "size": 25,
+  "difficulty": "normal"
+ },
+ {
+  "id": "toc10",
+  "edition": "wrath",
+  "name": "Trial of the Crusader (10)",
+  "slots": 10,
+  "size": 10,
+  "difficulty": "normal"
+ },
+ {
+  "id": "toc25",
+  "edition": "wrath",
+  "name": "Trial of the Crusader (25)",
+  "slots": 25,
+  "size": 25,
+  "difficulty": "normal"
+ },
+ {
+  "id": "toc10hc",
+  "edition": "wrath",
+  "name": "Trial of the Crusader (10 Heroic)",
+  "slots": 10,
+  "size": 10,
+  "difficulty": "heroic"
+ },
+ {
+  "id": "toc25hc",
+  "edition": "wrath",
+  "name": "Trial of the Crusader (25 Heroic)",
+  "slots": 25,
+  "size": 25,
+  "difficulty": "heroic"
+ },
+ {
+  "id": "onyxia10",
+  "edition": "wrath",
+  "name": "Onyxia's Lair (10)",
+  "slots": 10,
+  "size": 10,
+  "difficulty": "normal"
+ },
+ {
+  "id": "onyxia25",
+  "edition": "wrath",
+  "name": "Onyxia's Lair (25)",
+  "slots": 25,
+  "size": 25,
+  "difficulty": "normal"
+ },
+ {
+  "id": "icc10",
+  "edition": "wrath",
+  "name": "Icecrown Citadel (10)",
+  "slots": 10,
+  "size": 10,
+  "difficulty": "normal"
+ },
+ {
+  "id": "icc25",
+  "edition": "wrath",
+  "name": "Icecrown Citadel (25)",
+  "slots": 25,
+  "size": 25,
+  "difficulty": "normal"
+ },
+ {
+  "id": "icc10hc",
+  "edition": "wrath",
+  "name": "Icecrown Citadel (10 Heroic)",
+  "slots": 10,
+  "size": 10,
+  "difficulty": "heroic"
+ },
+ {
+  "id": "icc25hc",
+  "edition": "wrath",
+  "name": "Icecrown Citadel (25 Heroic)",
+  "slots": 25,
+  "size": 25,
+  "difficulty": "heroic"
+ },
+ {
+  "id": "rs10",
+  "edition": "wrath",
+  "name": "The Ruby Sanctum (10)",
+  "slots": 10,
+  "size": 10,
+  "difficulty": "normal"
+ },
+ {
+  "id": "rs25",
+  "edition": "wrath",
+  "name": "The Ruby Sanctum (25)",
+  "slots": 25,
+  "size": 25,
+  "difficulty": "normal"
+ },
+ {
+  "id": "rs10hc",
+  "edition": "wrath",
+  "name": "The Ruby Sanctum (10 Heroic)",
+  "slots": 10,
+  "size": 10,
+  "difficulty": "heroic"
+ },
+ {
+  "id": "rs25hc",
+  "edition": "wrath",
+  "name": "The Ruby Sanctum (25 Heroic)",
+  "slots": 25,
+  "size": 25,
+  "difficulty": "heroic"
+ }
+]

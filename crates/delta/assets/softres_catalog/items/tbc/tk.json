@@ -1,0 +1,413 @@
+[
+ {
+  "id": 29949,
+  "name": "Arcanite Steam-Pistol",
+  "quality": 4,
+  "boss": "Al'ar"
+ },
+ {
+  "id": 29922,
+  "name": "Band of Al'ar",
+  "quality": 4,
+  "boss": "Al'ar"
+ },
+ {
+  "id": 29948,
+  "name": "Claw of the Phoenix",
+  "quality": 4,
+  "boss": "Al'ar"
+ },
+ {
+  "id": 29921,
+  "name": "Fire Crest Breastplate",
+  "quality": 4,
+  "boss": "Al'ar"
+ },
+ {
+  "id": 29947,
+  "name": "Gloves of the Searing Grip",
+  "quality": 4,
+  "boss": "Al'ar"
+ },
+ {
+  "id": 29918,
+  "name": "Mindstorm Wristbands",
+  "quality": 4,
+  "boss": "Al'ar"
+ },
+ {
+  "id": 29924,
+  "name": "Netherbane",
+  "quality": 4,
+  "boss": "Al'ar"
+ },
+ {
+  "id": 29920,
+  "name": "Phoenix-Ring of Rebirth",
+  "quality": 4,
+  "boss": "Al'ar"
+ },
+ {
+  "id": 29925,
+  "name": "Phoenix-Wing Cloak",
+  "quality": 4,
+  "boss": "Al'ar"
+ },
+ {
+  "id": 29923,
+  "name": "Talisman of the Sun King",
+  "quality": 4,
+  "boss": "Al'ar"
+ },
+ {
+  "id": 30448,
+  "name": "Talon of Al'ar",
+  "quality": 4,
+  "boss": "Al'ar",
+  "allowable_classes": [
+   "hunter"
+  ]
+ },
+ {
+  "id": 32944,
+  "name": "Talon of the Phoenix",
+  "quality": 4,
+  "boss": "Al'ar"
+ },
+ {
+  "id": 30447,
+  "name": "Tome of Fiery Redemption",
+  "quality": 4,
+  "boss": "Al'ar",
+  "allowable_classes": [
+   "paladin"
+  ]
+ },
+ {
+  "id": 33117,
+  "name": "Jack-o'-Lantern",
+  "quality": 3,
+  "boss": "Al'ar / High Astromancer Solarian / Kael'thas Sunstrider"
+ },
+ {
+  "id": 29986,
+  "name": "Cowl of the Grand Engineer",
+  "quality": 4,
+  "boss": "Void Reaver"
+ },
+ {
+  "id": 30619,
+  "name": "Fel Reaver's Piston",
+  "quality": 4,
+  "boss": "Void Reaver"
+ },
+ {
+  "id": 29983,
+  "name": "Fel-Steel Warhelm",
+  "quality": 4,
+  "boss": "Void Reaver"
+ },
+ {
+  "id": 29984,
+  "name": "Girdle of Zaetar",
+  "quality": 4,
+  "boss": "Void Reaver"
+ },
+ {
+  "id": 30248,
+  "name": "Pauldrons of the Vanquished Champion",
+  "quality": 4,
+  "boss": "Void Reaver",
+  "allowable_classes": [
+   "paladin",
+   "rogue",
+   "shaman"
+  ]
+ },
+ {
+  "id": 30249,
+  "name": "Pauldrons of the Vanquished Defender",
+  "quality": 4,
+  "boss": "Void Reaver",
+  "allowable_classes": [
+   "warrior",
+   "priest",
+   "druid"
+  ]
+ },
+ {
+  "id": 30250,
+  "name": "Pauldrons of the Vanquished Hero",
+  "quality": 4,
+  "boss": "Void Reaver",
+  "allowable_classes": [
+   "hunter",
+   "mage",
+   "warlock"
+  ]
+ },
+ {
+  "id": 29985,
+  "name": "Void Reaver Greaves",
+  "quality": 4,
+  "boss": "Void Reaver"
+ },
+ {
+  "id": 30450,
+  "name": "Warp-Spring Coil",
+  "quality": 4,
+  "boss": "Void Reaver",
+  "allowable_classes": [
+   "rogue"
+  ]
+ },
+ {
+  "id": 32515,
+  "name": "Wristguards of Determination",
+  "quality": 4,
+  "boss": "Void Reaver"
+ },
+ {
+  "id": 32267,
+  "name": "Boots of the Resilient",
+  "quality": 4,
+  "boss": "High Astromancer Solarian"
+ },
+ {
+  "id": 29981,
+  "name": "Ethereum Life-Staff",
+  "quality": 4,
+  "boss": "High Astromancer Solarian"
+ },
+ {
+  "id": 29965,
+  "name": "Girdle of the Righteous Path",
+  "quality": 4,
+  "boss": "High Astromancer Solarian"
+ },
+ {
+  "id": 29950,
+  "name": "Greaves of the Bloodwarder",
+  "quality": 4,
+  "boss": "High Astromancer Solarian"
+ },
+ {
+  "id": 29962,
+  "name": "Heartrazor",
+  "quality": 4,
+  "boss": "High Astromancer Solarian"
+ },
+ {
+  "id": 30446,
+  "name": "Solarian's Sapphire",
+  "quality": 4,
+  "boss": "High Astromancer Solarian",
+  "allowable_classes": [
+   "warrior"
+  ]
+ },
+ {
+  "id": 29977,
+  "name": "Star-Soul Breeches",
+  "quality": 4,
+  "boss": "High Astromancer Solarian"
+ },
+ {
+  "id": 29951,
+  "name": "Star-Strider Boots",
+  "quality": 4,
+  "boss": "High Astromancer Solarian"
+ },
+ {
+  "id": 29972,
+  "name": "Trousers of the Astromancer",
+  "quality": 4,
+  "boss": "High Astromancer Solarian"
+ },
+ {
+  "id": 29966,
+  "name": "Vambraces of Ending",
+  "quality": 4,
+  "boss": "High Astromancer Solarian"
+ },
+ {
+  "id": 30449,
+  "name": "Void Star Talisman",
+  "quality": 4,
+  "boss": "High Astromancer Solarian",
+  "allowable_classes": [
+   "warlock"
+  ]
+ },
+ {
+  "id": 29982,
+  "name": "Wand of the Forgotten Star",
+  "quality": 4,
+  "boss": "High Astromancer Solarian"
+ },
+ {
+  "id": 29976,
+  "name": "Worldstorm Gauntlets",
+  "quality": 4,
+  "boss": "High Astromancer Solarian"
+ },
+ {
+  "id": 32458,
+  "name": "Ashes of Al'ar",
+  "quality": 4,
+  "boss": "Kael'thas Sunstrider"
+ },
+ {
+  "id": 29997,
+  "name": "Band of the Ranger-General",
+  "quality": 4,
+  "boss": "Kael'thas Sunstrider"
+ },
+ {
+  "id": 30236,
+  "name": "Chestguard of the Vanquished Champion",
+  "quality": 4,
+  "boss": "Kael'thas Sunstrider",
+  "allowable_classes": [
+   "paladin",
+   "rogue",
+   "shaman"
+  ]
+ },
+ {
+  "id": 30237,
+  "name": "Chestguard of the Vanquished Defender",
+  "quality": 4,
+  "boss": "Kael'thas Sunstrider",
+  "allowable_classes": [
+   "warrior",
+   "priest",
+   "druid"
+  ]
+ },
+ {
+  "id": 30238,
+  "name": "Chestguard of the Vanquished Hero",
+  "quality": 4,
+  "boss": "Kael'thas Sunstrider",
+  "allowable_classes": [
+   "hunter",
+   "mage",
+   "warlock"
+  ]
+ },
+ {
+  "id": 29990,
+  "name": "Crown of the Sun",
+  "quality": 4,
+  "boss": "Kael'thas Sunstrider"
+ },
+ {
+  "id": 29987,
+  "name": "Gauntlets of the Sun King",
+  "quality": 4,
+  "boss": "Kael'thas Sunstrider"
+ },
+ {
+  "id": 29995,
+  "name": "Leggings of Murderous Intent",
+  "quality": 4,
+  "boss": "Kael'thas Sunstrider"
+ },
+ {
+  "id": 30183,
+  "name": "Nether Vortex",
+  "quality": 4,
+  "boss": "Kael'thas Sunstrider"
+ },
+ {
+  "id": 29996,
+  "name": "Rod of the Sun King",
+  "quality": 4,
+  "boss": "Kael'thas Sunstrider"
+ },
+ {
+  "id": 29992,
+  "name": "Royal Cloak of the Sunstriders",
+  "quality": 4,
+  "boss": "Kael'thas Sunstrider"
+ },
+ {
+  "id": 29998,
+  "name": "Royal Gauntlets of Silvermoon",
+  "quality": 4,
+  "boss": "Kael'thas Sunstrider"
+ },
+ {
+  "id": 29991,
+  "name": "Sunhawk Leggings",
+  "quality": 4,
+  "boss": "Kael'thas Sunstrider"
+ },
+ {
+  "id": 29989,
+  "name": "Sunshower Light Cloak",
+  "quality": 4,
+  "boss": "Kael'thas Sunstrider"
+ },
+ {
+  "id": 29994,
+  "name": "Thalassian Wildercloak",
+  "quality": 4,
+  "boss": "Kael'thas Sunstrider"
+ },
+ {
+  "id": 29988,
+  "name": "The Nexus Key",
+  "quality": 4,
+  "boss": "Kael'thas Sunstrider"
+ },
+ {
+  "id": 29993,
+  "name": "Twinblade of the Phoenix",
+  "quality": 4,
+  "boss": "Kael'thas Sunstrider"
+ },
+ {
+  "id": 32405,
+  "name": "Verdant Sphere",
+  "quality": 4,
+  "boss": "Kael'thas Sunstrider"
+ },
+ {
+  "id": 30026,
+  "name": "Bands of the Celestial Archer",
+  "quality": 4,
+  "boss": "Trash"
+ },
+ {
+  "id": 30029,
+  "name": "Bark-Gloves of Ancient Wisdom",
+  "quality": 4,
+  "boss": "Trash"
+ },
+ {
+  "id": 30020,
+  "name": "Fire-Cord of the Magus",
+  "quality": 4,
+  "boss": "Trash"
+ },
+ {
+  "id": 30030,
+  "name": "Girdle of Fallen Stars",
+  "quality": 4,
+  "boss": "Trash"
+ },
+ {
+  "id": 30024,
+  "name": "Mantle of the Elven Kings",
+  "quality": 4,
+  "boss": "Trash"
+ },
+ {
+  "id": 30028,
+  "name": "Seventh Ring of the Tirisfalen",
+  "quality": 4,
+  "boss": "Trash"
+ }
+]

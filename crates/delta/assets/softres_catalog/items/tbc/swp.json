@@ -1,0 +1,653 @@
+[
+ {
+  "id": 34166,
+  "name": "Band of Lucent Beams",
+  "quality": 4,
+  "boss": "Kalecgos"
+ },
+ {
+  "id": 34169,
+  "name": "Breeches of Natural Aggression",
+  "quality": 4,
+  "boss": "Kalecgos"
+ },
+ {
+  "id": 34164,
+  "name": "Dragonscale-Encrusted Longblade",
+  "quality": 4,
+  "boss": "Kalecgos"
+ },
+ {
+  "id": 34165,
+  "name": "Fang of Kalecgos",
+  "quality": 4,
+  "boss": "Kalecgos"
+ },
+ {
+  "id": 34167,
+  "name": "Legplates of the Holy Juggernaut",
+  "quality": 4,
+  "boss": "Kalecgos"
+ },
+ {
+  "id": 34170,
+  "name": "Pantaloons of Calming Strife",
+  "quality": 4,
+  "boss": "Kalecgos"
+ },
+ {
+  "id": 34168,
+  "name": "Starstalker Legguards",
+  "quality": 4,
+  "boss": "Kalecgos"
+ },
+ {
+  "id": 33117,
+  "name": "Jack-o'-Lantern",
+  "quality": 3,
+  "boss": "Kalecgos / Brutallus / Felmyst / Eredar Twins / M'uru / Kil'jaeden"
+ },
+ {
+  "id": 34664,
+  "name": "Sunmote",
+  "quality": 3,
+  "boss": "Kalecgos / Brutallus / Felmyst / Eredar Twins / M'uru / Kil'jaeden"
+ },
+ {
+  "id": 34848,
+  "name": "Bracers of the Forgotten Conqueror",
+  "quality": 4,
+  "boss": "Kalecgos / Eredar Twins",
+  "allowable_classes": [
+   "paladin",
+   "priest",
+   "warlock"
+  ]
+ },
+ {
+  "id": 34851,
+  "name": "Bracers of the Forgotten Protector",
+  "quality": 4,
+  "boss": "Kalecgos / Eredar Twins",
+  "allowable_classes": [
+   "warrior",
+   "hunter",
+   "shaman"
+  ]
+ },
+ {
+  "id": 34852,
+  "name": "Bracers of the Forgotten Vanquisher",
+  "quality": 4,
+  "boss": "Kalecgos / Eredar Twins",
+  "allowable_classes": [
+   "rogue",
+   "mage",
+   "druid"
+  ]
+ },
+ {
+  "id": 34177,
+  "name": "Clutch of Demise",
+  "quality": 4,
+  "boss": "Brutallus"
+ },
+ {
+  "id": 34178,
+  "name": "Collar of the Pit Lord",
+  "quality": 4,
+  "boss": "Brutallus"
+ },
+ {
+  "id": 34180,
+  "name": "Felfury Legplates",
+  "quality": 4,
+  "boss": "Brutallus"
+ },
+ {
+  "id": 34179,
+  "name": "Heart of the Pit",
+  "quality": 4,
+  "boss": "Brutallus"
+ },
+ {
+  "id": 34181,
+  "name": "Leggings of Calamity",
+  "quality": 4,
+  "boss": "Brutallus"
+ },
+ {
+  "id": 34176,
+  "name": "Reign of Misery",
+  "quality": 4,
+  "boss": "Brutallus"
+ },
+ {
+  "id": 34853,
+  "name": "Belt of the Forgotten Conqueror",
+  "quality": 4,
+  "boss": "Brutallus / Eredar Twins",
+  "allowable_classes": [
+   "paladin",
+   "priest",
+   "warlock"
+  ]
+ },
+ {
+  "id": 34854,
+  "name": "Belt of the Forgotten Protector",
+  "quality": 4,
+  "boss": "Brutallus / Eredar Twins",
+  "allowable_classes": [
+   "warrior",
+   "hunter",
+   "shaman"
+  ]
+ },
+ {
+  "id": 34855,
+  "name": "Belt of the Forgotten Vanquisher",
+  "quality": 4,
+  "boss": "Brutallus / Eredar Twins",
+  "allowable_classes": [
+   "rogue",
+   "mage",
+   "druid"
+  ]
+ },
+ {
+  "id": 34352,
+  "name": "Borderland Fortress Grips",
+  "quality": 4,
+  "boss": "Felmyst"
+ },
+ {
+  "id": 34184,
+  "name": "Brooch of the Highborne",
+  "quality": 4,
+  "boss": "Felmyst"
+ },
+ {
+  "id": 34186,
+  "name": "Chain Links of the Tumultuous Storm",
+  "quality": 4,
+  "boss": "Felmyst"
+ },
+ {
+  "id": 34182,
+  "name": "Grand Magister's Staff of Torrents",
+  "quality": 4,
+  "boss": "Felmyst"
+ },
+ {
+  "id": 34188,
+  "name": "Leggings of the Immortal Night",
+  "quality": 4,
+  "boss": "Felmyst"
+ },
+ {
+  "id": 34185,
+  "name": "Sword Breaker's Bulwark",
+  "quality": 4,
+  "boss": "Felmyst"
+ },
+ {
+  "id": 34856,
+  "name": "Boots of the Forgotten Conqueror",
+  "quality": 4,
+  "boss": "Felmyst / Eredar Twins",
+  "allowable_classes": [
+   "paladin",
+   "priest",
+   "warlock"
+  ]
+ },
+ {
+  "id": 34857,
+  "name": "Boots of the Forgotten Protector",
+  "quality": 4,
+  "boss": "Felmyst / Eredar Twins",
+  "allowable_classes": [
+   "warrior",
+   "hunter",
+   "shaman"
+  ]
+ },
+ {
+  "id": 34858,
+  "name": "Boots of the Forgotten Vanquisher",
+  "quality": 4,
+  "boss": "Felmyst / Eredar Twins",
+  "allowable_classes": [
+   "rogue",
+   "mage",
+   "druid"
+  ]
+ },
+ {
+  "id": 34210,
+  "name": "Amice of the Convoker",
+  "quality": 4,
+  "boss": "Eredar Twins"
+ },
+ {
+  "id": 34204,
+  "name": "Amulet of Unfettered Magics",
+  "quality": 4,
+  "boss": "Eredar Twins"
+ },
+ {
+  "id": 34199,
+  "name": "Archon's Gavel",
+  "quality": 4,
+  "boss": "Eredar Twins"
+ },
+ {
+  "id": 34189,
+  "name": "Band of Ruinous Delight",
+  "quality": 4,
+  "boss": "Eredar Twins"
+ },
+ {
+  "id": 34206,
+  "name": "Book of Highborne Hymns",
+  "quality": 4,
+  "boss": "Eredar Twins"
+ },
+ {
+  "id": 34190,
+  "name": "Crimson Paragon's Cover",
+  "quality": 4,
+  "boss": "Eredar Twins"
+ },
+ {
+  "id": 34208,
+  "name": "Equilibrium Epaulets",
+  "quality": 4,
+  "boss": "Eredar Twins"
+ },
+ {
+  "id": 34196,
+  "name": "Golden Bow of Quel'Thalas",
+  "quality": 4,
+  "boss": "Eredar Twins"
+ },
+ {
+  "id": 34203,
+  "name": "Grip of Mannoroth",
+  "quality": 4,
+  "boss": "Eredar Twins"
+ },
+ {
+  "id": 34194,
+  "name": "Mantle of the Golden Forest",
+  "quality": 4,
+  "boss": "Eredar Twins"
+ },
+ {
+  "id": 34192,
+  "name": "Pauldrons of Perseverance",
+  "quality": 4,
+  "boss": "Eredar Twins"
+ },
+ {
+  "id": 34202,
+  "name": "Shawl of Wonderment",
+  "quality": 4,
+  "boss": "Eredar Twins"
+ },
+ {
+  "id": 34197,
+  "name": "Shiv of Exsanguination",
+  "quality": 4,
+  "boss": "Eredar Twins"
+ },
+ {
+  "id": 34195,
+  "name": "Shoulderpads of Vehemence",
+  "quality": 4,
+  "boss": "Eredar Twins"
+ },
+ {
+  "id": 34205,
+  "name": "Shroud of Redeemed Souls",
+  "quality": 4,
+  "boss": "Eredar Twins"
+ },
+ {
+  "id": 35290,
+  "name": "Sin'dorei Pendant of Conquest",
+  "quality": 4,
+  "boss": "Eredar Twins"
+ },
+ {
+  "id": 35291,
+  "name": "Sin'dorei Pendant of Salvation",
+  "quality": 4,
+  "boss": "Eredar Twins"
+ },
+ {
+  "id": 35292,
+  "name": "Sin'dorei Pendant of Triumph",
+  "quality": 4,
+  "boss": "Eredar Twins"
+ },
+ {
+  "id": 34209,
+  "name": "Spaulders of Reclamation",
+  "quality": 4,
+  "boss": "Eredar Twins"
+ },
+ {
+  "id": 34193,
+  "name": "Spaulders of the Thalassian Savior",
+  "quality": 4,
+  "boss": "Eredar Twins"
+ },
+ {
+  "id": 34198,
+  "name": "Stanchion of Primal Instinct",
+  "quality": 4,
+  "boss": "Eredar Twins"
+ },
+ {
+  "id": 34231,
+  "name": "Aegis of Angelic Fortune",
+  "quality": 4,
+  "boss": "M'uru"
+ },
+ {
+  "id": 34427,
+  "name": "Blackened Naaru Sliver",
+  "quality": 4,
+  "boss": "M'uru"
+ },
+ {
+  "id": 34232,
+  "name": "Fel Conquerer Raiments",
+  "quality": 4,
+  "boss": "M'uru"
+ },
+ {
+  "id": 34229,
+  "name": "Garments of Serene Shores",
+  "quality": 4,
+  "boss": "M'uru"
+ },
+ {
+  "id": 34240,
+  "name": "Gauntlets of the Soothed Soul",
+  "quality": 4,
+  "boss": "M'uru"
+ },
+ {
+  "id": 34430,
+  "name": "Glimmering Naaru Sliver",
+  "quality": 4,
+  "boss": "M'uru"
+ },
+ {
+  "id": 34211,
+  "name": "Harness of Carnal Instinct",
+  "quality": 4,
+  "boss": "M'uru"
+ },
+ {
+  "id": 34216,
+  "name": "Heroic Judicator's Chestguard",
+  "quality": 4,
+  "boss": "M'uru"
+ },
+ {
+  "id": 34214,
+  "name": "Muramasa",
+  "quality": 4,
+  "boss": "M'uru"
+ },
+ {
+  "id": 34213,
+  "name": "Ring of Hardened Resolve",
+  "quality": 4,
+  "boss": "M'uru"
+ },
+ {
+  "id": 34230,
+  "name": "Ring of Omnipotence",
+  "quality": 4,
+  "boss": "M'uru"
+ },
+ {
+  "id": 34233,
+  "name": "Robes of Faltered Light",
+  "quality": 4,
+  "boss": "M'uru"
+ },
+ {
+  "id": 34234,
+  "name": "Shadowed Gauntlets of Paroxysm",
+  "quality": 4,
+  "boss": "M'uru"
+ },
+ {
+  "id": 34429,
+  "name": "Shifting Naaru Sliver",
+  "quality": 4,
+  "boss": "M'uru"
+ },
+ {
+  "id": 35282,
+  "name": "Sin'dorei Band of Dominance",
+  "quality": 4,
+  "boss": "M'uru"
+ },
+ {
+  "id": 35283,
+  "name": "Sin'dorei Band of Salvation",
+  "quality": 4,
+  "boss": "M'uru"
+ },
+ {
+  "id": 35284,
+  "name": "Sin'dorei Band of Triumph",
+  "quality": 4,
+  "boss": "M'uru"
+ },
+ {
+  "id": 34428,
+  "name": "Steely Naaru Sliver",
+  "quality": 4,
+  "boss": "M'uru"
+ },
+ {
+  "id": 34212,
+  "name": "Sunglow Vest",
+  "quality": 4,
+  "boss": "M'uru"
+ },
+ {
+  "id": 34228,
+  "name": "Vicious Hawkstrider Hauberk",
+  "quality": 4,
+  "boss": "M'uru"
+ },
+ {
+  "id": 34215,
+  "name": "Warharness of Reckless Fury",
+  "quality": 4,
+  "boss": "M'uru"
+ },
+ {
+  "id": 34247,
+  "name": "Apolyon, the Soul-Render",
+  "quality": 4,
+  "boss": "Kil'jaeden"
+ },
+ {
+  "id": 34341,
+  "name": "Borderland Paingrips",
+  "quality": 4,
+  "boss": "Kil'jaeden"
+ },
+ {
+  "id": 34241,
+  "name": "Cloak of Unforgivable Sin",
+  "quality": 4,
+  "boss": "Kil'jaeden"
+ },
+ {
+  "id": 34333,
+  "name": "Coif of Alleria",
+  "quality": 4,
+  "boss": "Kil'jaeden"
+ },
+ {
+  "id": 34245,
+  "name": "Cover of Ursol the Wise",
+  "quality": 4,
+  "boss": "Kil'jaeden"
+ },
+ {
+  "id": 34332,
+  "name": "Cowl of Gul'dan",
+  "quality": 4,
+  "boss": "Kil'jaeden"
+ },
+ {
+  "id": 34339,
+  "name": "Cowl of Light's Purity",
+  "quality": 4,
+  "boss": "Kil'jaeden"
+ },
+ {
+  "id": 34345,
+  "name": "Crown of Anasterian",
+  "quality": 4,
+  "boss": "Kil'jaeden"
+ },
+ {
+  "id": 34329,
+  "name": "Crux of the Apocalypse",
+  "quality": 4,
+  "boss": "Kil'jaeden"
+ },
+ {
+  "id": 34340,
+  "name": "Dark Conjuror's Collar",
+  "quality": 4,
+  "boss": "Kil'jaeden"
+ },
+ {
+  "id": 34244,
+  "name": "Duplicitous Guise",
+  "quality": 4,
+  "boss": "Kil'jaeden"
+ },
+ {
+  "id": 34337,
+  "name": "Golden Staff of the Sin'dorei",
+  "quality": 4,
+  "boss": "Kil'jaeden"
+ },
+ {
+  "id": 34335,
+  "name": "Hammer of Sanctification",
+  "quality": 4,
+  "boss": "Kil'jaeden"
+ },
+ {
+  "id": 34331,
+  "name": "Hand of the Deceiver",
+  "quality": 4,
+  "boss": "Kil'jaeden"
+ },
+ {
+  "id": 34344,
+  "name": "Handguards of Defiled Worlds",
+  "quality": 4,
+  "boss": "Kil'jaeden"
+ },
+ {
+  "id": 34342,
+  "name": "Handguards of the Dawn",
+  "quality": 4,
+  "boss": "Kil'jaeden"
+ },
+ {
+  "id": 34243,
+  "name": "Helm of Burning Righteousness",
+  "quality": 4,
+  "boss": "Kil'jaeden"
+ },
+ {
+  "id": 34336,
+  "name": "Sunflare",
+  "quality": 4,
+  "boss": "Kil'jaeden"
+ },
+ {
+  "id": 34242,
+  "name": "Tattered Cape of Antonidas",
+  "quality": 4,
+  "boss": "Kil'jaeden"
+ },
+ {
+  "id": 34343,
+  "name": "Thalassian Ranger Gauntlets",
+  "quality": 4,
+  "boss": "Kil'jaeden"
+ },
+ {
+  "id": 34334,
+  "name": "Thori'dal, the Stars' Fury",
+  "quality": 5,
+  "boss": "Kil'jaeden"
+ },
+ {
+  "id": 34349,
+  "name": "Blade of Life's Inevitability",
+  "quality": 4,
+  "boss": "Trash"
+ },
+ {
+  "id": 34350,
+  "name": "Gauntlets of the Ancient Shadowmoon",
+  "quality": 4,
+  "boss": "Trash"
+ },
+ {
+  "id": 34346,
+  "name": "Mounting Vengeance",
+  "quality": 4,
+  "boss": "Trash"
+ },
+ {
+  "id": 35733,
+  "name": "Ring of Harmonic Beauty",
+  "quality": 4,
+  "boss": "Trash"
+ },
+ {
+  "id": 34183,
+  "name": "Shivering Felspine",
+  "quality": 4,
+  "boss": "Trash"
+ },
+ {
+  "id": 34351,
+  "name": "Tranquil Majesty Wraps",
+  "quality": 4,
+  "boss": "Trash"
+ },
+ {
+  "id": 34348,
+  "name": "Wand of Cleansing Light",
+  "quality": 4,
+  "boss": "Trash"
+ },
+ {
+  "id": 34347,
+  "name": "Wand of the Demonsoul",
+  "quality": 4,
+  "boss": "Trash"
+ }
+]

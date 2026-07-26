@@ -1,0 +1,545 @@
+[
+ {
+  "id": 33055,
+  "name": "Band of Vile Aggression",
+  "quality": 4,
+  "boss": "Hydross the Unstable"
+ },
+ {
+  "id": 30047,
+  "name": "Blackfathom Warbands",
+  "quality": 4,
+  "boss": "Hydross the Unstable"
+ },
+ {
+  "id": 30050,
+  "name": "Boots of the Shifting Nightmare",
+  "quality": 4,
+  "boss": "Hydross the Unstable"
+ },
+ {
+  "id": 30048,
+  "name": "Brighthelm of Justice",
+  "quality": 4,
+  "boss": "Hydross the Unstable"
+ },
+ {
+  "id": 30049,
+  "name": "Fathomstone",
+  "quality": 4,
+  "boss": "Hydross the Unstable"
+ },
+ {
+  "id": 30051,
+  "name": "Idol of the Crescent Goddess",
+  "quality": 4,
+  "boss": "Hydross the Unstable"
+ },
+ {
+  "id": 30664,
+  "name": "Living Root of the Wildheart",
+  "quality": 4,
+  "boss": "Hydross the Unstable",
+  "allowable_classes": [
+   "druid"
+  ]
+ },
+ {
+  "id": 30053,
+  "name": "Pauldrons of the Wardancer",
+  "quality": 4,
+  "boss": "Hydross the Unstable"
+ },
+ {
+  "id": 30054,
+  "name": "Ranger-General's Chestguard",
+  "quality": 4,
+  "boss": "Hydross the Unstable"
+ },
+ {
+  "id": 30052,
+  "name": "Ring of Lethality",
+  "quality": 4,
+  "boss": "Hydross the Unstable"
+ },
+ {
+  "id": 30056,
+  "name": "Robe of Hateful Echoes",
+  "quality": 4,
+  "boss": "Hydross the Unstable"
+ },
+ {
+  "id": 30629,
+  "name": "Scarab of Displacement",
+  "quality": 4,
+  "boss": "Hydross the Unstable"
+ },
+ {
+  "id": 30055,
+  "name": "Shoulderpads of the Stranger",
+  "quality": 4,
+  "boss": "Hydross the Unstable"
+ },
+ {
+  "id": 32516,
+  "name": "Wraps of Purification",
+  "quality": 4,
+  "boss": "Hydross the Unstable"
+ },
+ {
+  "id": 33117,
+  "name": "Jack-o'-Lantern",
+  "quality": 3,
+  "boss": "Hydross the Unstable / Leotheras the Blind / Fathom-Lord Karathress / Lady Vashj"
+ },
+ {
+  "id": 30061,
+  "name": "Ancestral Ring of Conquest",
+  "quality": 4,
+  "boss": "The Lurker Below"
+ },
+ {
+  "id": 30060,
+  "name": "Boots of Effortless Striking",
+  "quality": 4,
+  "boss": "The Lurker Below"
+ },
+ {
+  "id": 30057,
+  "name": "Bracers of Eradication",
+  "quality": 4,
+  "boss": "The Lurker Below"
+ },
+ {
+  "id": 30059,
+  "name": "Choker of Animalistic Fury",
+  "quality": 4,
+  "boss": "The Lurker Below"
+ },
+ {
+  "id": 30064,
+  "name": "Cord of Screaming Terrors",
+  "quality": 4,
+  "boss": "The Lurker Below"
+ },
+ {
+  "id": 30665,
+  "name": "Earring of Soulful Meditation",
+  "quality": 4,
+  "boss": "The Lurker Below",
+  "allowable_classes": [
+   "priest"
+  ]
+ },
+ {
+  "id": 30065,
+  "name": "Glowing Breastplate of Truth",
+  "quality": 4,
+  "boss": "The Lurker Below"
+ },
+ {
+  "id": 30062,
+  "name": "Grove-Bands of Remulos",
+  "quality": 4,
+  "boss": "The Lurker Below"
+ },
+ {
+  "id": 30063,
+  "name": "Libram of Absolute Truth",
+  "quality": 4,
+  "boss": "The Lurker Below"
+ },
+ {
+  "id": 30058,
+  "name": "Mallet of the Tides",
+  "quality": 4,
+  "boss": "The Lurker Below"
+ },
+ {
+  "id": 30066,
+  "name": "Tempest-Strider Boots",
+  "quality": 4,
+  "boss": "The Lurker Below"
+ },
+ {
+  "id": 33054,
+  "name": "The Seal of Danzalar",
+  "quality": 4,
+  "boss": "The Lurker Below"
+ },
+ {
+  "id": 30067,
+  "name": "Velvet Boots of the Guardian",
+  "quality": 4,
+  "boss": "The Lurker Below"
+ },
+ {
+  "id": 30097,
+  "name": "Coral-Barbed Shoulderpads",
+  "quality": 4,
+  "boss": "Leotheras the Blind"
+ },
+ {
+  "id": 30095,
+  "name": "Fang of the Leviathan",
+  "quality": 4,
+  "boss": "Leotheras the Blind"
+ },
+ {
+  "id": 30096,
+  "name": "Girdle of the Invulnerable",
+  "quality": 4,
+  "boss": "Leotheras the Blind"
+ },
+ {
+  "id": 30239,
+  "name": "Gloves of the Vanquished Champion",
+  "quality": 4,
+  "boss": "Leotheras the Blind",
+  "allowable_classes": [
+   "paladin",
+   "rogue",
+   "shaman"
+  ]
+ },
+ {
+  "id": 30240,
+  "name": "Gloves of the Vanquished Defender",
+  "quality": 4,
+  "boss": "Leotheras the Blind",
+  "allowable_classes": [
+   "warrior",
+   "priest",
+   "druid"
+  ]
+ },
+ {
+  "id": 30241,
+  "name": "Gloves of the Vanquished Hero",
+  "quality": 4,
+  "boss": "Leotheras the Blind",
+  "allowable_classes": [
+   "hunter",
+   "mage",
+   "warlock"
+  ]
+ },
+ {
+  "id": 30092,
+  "name": "Orca-Hide Boots",
+  "quality": 4,
+  "boss": "Leotheras the Blind"
+ },
+ {
+  "id": 30091,
+  "name": "True-Aim Stalker Bands",
+  "quality": 4,
+  "boss": "Leotheras the Blind"
+ },
+ {
+  "id": 30627,
+  "name": "Tsunami Talisman",
+  "quality": 4,
+  "boss": "Leotheras the Blind"
+ },
+ {
+  "id": 30101,
+  "name": "Bloodsea Brigand's Vest",
+  "quality": 4,
+  "boss": "Fathom-Lord Karathress"
+ },
+ {
+  "id": 30663,
+  "name": "Fathom-Brooch of the Tidewalker",
+  "quality": 4,
+  "boss": "Fathom-Lord Karathress",
+  "allowable_classes": [
+   "shaman"
+  ]
+ },
+ {
+  "id": 30099,
+  "name": "Frayed Tether of the Drowned",
+  "quality": 4,
+  "boss": "Fathom-Lord Karathress"
+ },
+ {
+  "id": 30245,
+  "name": "Leggings of the Vanquished Champion",
+  "quality": 4,
+  "boss": "Fathom-Lord Karathress",
+  "allowable_classes": [
+   "paladin",
+   "rogue",
+   "shaman"
+  ]
+ },
+ {
+  "id": 30246,
+  "name": "Leggings of the Vanquished Defender",
+  "quality": 4,
+  "boss": "Fathom-Lord Karathress",
+  "allowable_classes": [
+   "warrior",
+   "priest",
+   "druid"
+  ]
+ },
+ {
+  "id": 30247,
+  "name": "Leggings of the Vanquished Hero",
+  "quality": 4,
+  "boss": "Fathom-Lord Karathress",
+  "allowable_classes": [
+   "hunter",
+   "mage",
+   "warlock"
+  ]
+ },
+ {
+  "id": 30626,
+  "name": "Sextant of Unstable Currents",
+  "quality": 4,
+  "boss": "Fathom-Lord Karathress"
+ },
+ {
+  "id": 30100,
+  "name": "Soul-Strider Boots",
+  "quality": 4,
+  "boss": "Fathom-Lord Karathress"
+ },
+ {
+  "id": 30090,
+  "name": "World Breaker",
+  "quality": 4,
+  "boss": "Fathom-Lord Karathress"
+ },
+ {
+  "id": 33058,
+  "name": "Band of the Vigilant",
+  "quality": 4,
+  "boss": "Morogrim Tidewalker"
+ },
+ {
+  "id": 30068,
+  "name": "Girdle of the Tidal Call",
+  "quality": 4,
+  "boss": "Morogrim Tidewalker"
+ },
+ {
+  "id": 30075,
+  "name": "Gnarled Chestpiece of the Ancients",
+  "quality": 4,
+  "boss": "Morogrim Tidewalker"
+ },
+ {
+  "id": 30079,
+  "name": "Illidari Shoulderpads",
+  "quality": 4,
+  "boss": "Morogrim Tidewalker"
+ },
+ {
+  "id": 30080,
+  "name": "Luminescent Rod of the Naaru",
+  "quality": 4,
+  "boss": "Morogrim Tidewalker"
+ },
+ {
+  "id": 30085,
+  "name": "Mantle of the Tireless Tracker",
+  "quality": 4,
+  "boss": "Morogrim Tidewalker"
+ },
+ {
+  "id": 30084,
+  "name": "Pauldrons of the Argent Sentinel",
+  "quality": 4,
+  "boss": "Morogrim Tidewalker"
+ },
+ {
+  "id": 30008,
+  "name": "Pendant of the Lost Ages",
+  "quality": 4,
+  "boss": "Morogrim Tidewalker"
+ },
+ {
+  "id": 30098,
+  "name": "Razor-Scale Battlecloak",
+  "quality": 4,
+  "boss": "Morogrim Tidewalker"
+ },
+ {
+  "id": 30083,
+  "name": "Ring of Sundered Souls",
+  "quality": 4,
+  "boss": "Morogrim Tidewalker"
+ },
+ {
+  "id": 30720,
+  "name": "Serpent-Coil Braid",
+  "quality": 4,
+  "boss": "Morogrim Tidewalker",
+  "allowable_classes": [
+   "mage"
+  ]
+ },
+ {
+  "id": 30082,
+  "name": "Talon of Azshara",
+  "quality": 4,
+  "boss": "Morogrim Tidewalker"
+ },
+ {
+  "id": 30081,
+  "name": "Warboots of Obliteration",
+  "quality": 4,
+  "boss": "Morogrim Tidewalker"
+ },
+ {
+  "id": 30106,
+  "name": "Belt of One-Hundred Deaths",
+  "quality": 4,
+  "boss": "Lady Vashj"
+ },
+ {
+  "id": 30104,
+  "name": "Cobra-Lash Boots",
+  "quality": 4,
+  "boss": "Lady Vashj"
+ },
+ {
+  "id": 30110,
+  "name": "Coral Band of the Revived",
+  "quality": 4,
+  "boss": "Lady Vashj"
+ },
+ {
+  "id": 30103,
+  "name": "Fang of Vashj",
+  "quality": 4,
+  "boss": "Lady Vashj"
+ },
+ {
+  "id": 30112,
+  "name": "Glorious Gauntlets of Crestfall",
+  "quality": 4,
+  "boss": "Lady Vashj"
+ },
+ {
+  "id": 30242,
+  "name": "Helm of the Vanquished Champion",
+  "quality": 4,
+  "boss": "Lady Vashj",
+  "allowable_classes": [
+   "paladin",
+   "rogue",
+   "shaman"
+  ]
+ },
+ {
+  "id": 30243,
+  "name": "Helm of the Vanquished Defender",
+  "quality": 4,
+  "boss": "Lady Vashj",
+  "allowable_classes": [
+   "warrior",
+   "priest",
+   "druid"
+  ]
+ },
+ {
+  "id": 30244,
+  "name": "Helm of the Vanquished Hero",
+  "quality": 4,
+  "boss": "Lady Vashj",
+  "allowable_classes": [
+   "hunter",
+   "mage",
+   "warlock"
+  ]
+ },
+ {
+  "id": 30102,
+  "name": "Krakken-Heart Breastplate",
+  "quality": 4,
+  "boss": "Lady Vashj"
+ },
+ {
+  "id": 30108,
+  "name": "Lightfathom Scepter",
+  "quality": 4,
+  "boss": "Lady Vashj"
+ },
+ {
+  "id": 30183,
+  "name": "Nether Vortex",
+  "quality": 4,
+  "boss": "Lady Vashj"
+ },
+ {
+  "id": 30621,
+  "name": "Prism of Inner Calm",
+  "quality": 4,
+  "boss": "Lady Vashj"
+ },
+ {
+  "id": 30109,
+  "name": "Ring of Endless Coils",
+  "quality": 4,
+  "boss": "Lady Vashj"
+ },
+ {
+  "id": 30111,
+  "name": "Runetotem's Mantle",
+  "quality": 4,
+  "boss": "Lady Vashj"
+ },
+ {
+  "id": 30105,
+  "name": "Serpent Spine Longbow",
+  "quality": 4,
+  "boss": "Lady Vashj"
+ },
+ {
+  "id": 30107,
+  "name": "Vestments of the Sea-Witch",
+  "quality": 4,
+  "boss": "Lady Vashj"
+ },
+ {
+  "id": 30027,
+  "name": "Boots of Courage Unending",
+  "quality": 4,
+  "boss": "Trash"
+ },
+ {
+  "id": 30022,
+  "name": "Pendant of the Perilous",
+  "quality": 4,
+  "boss": "Trash"
+ },
+ {
+  "id": 30025,
+  "name": "Serpentshrine Shuriken",
+  "quality": 4,
+  "boss": "Trash"
+ },
+ {
+  "id": 30620,
+  "name": "Spyglass of the Hidden Fleet",
+  "quality": 4,
+  "boss": "Trash"
+ },
+ {
+  "id": 30023,
+  "name": "Totem of the Maelstrom",
+  "quality": 4,
+  "boss": "Trash"
+ },
+ {
+  "id": 30021,
+  "name": "Wildfury Greatstaff",
+  "quality": 4,
+  "boss": "Trash"
+ }
+]

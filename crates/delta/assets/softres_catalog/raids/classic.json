@@ -1,0 +1,44 @@
+[
+ {
+  "id": "mc",
+  "edition": "classic",
+  "name": "Molten Core",
+  "slots": 40
+ },
+ {
+  "id": "onyxia",
+  "edition": "classic",
+  "name": "Onyxia's Lair",
+  "slots": 40
+ },
+ {
+  "id": "bwl",
+  "edition": "classic",
+  "name": "Blackwing Lair",
+  "slots": 40
+ },
+ {
+  "id": "zg",
+  "edition": "classic",
+  "name": "Zul'Gurub",
+  "slots": 20
+ },
+ {
+  "id": "aq20",
+  "edition": "classic",
+  "name": "Ruins of Ahn'Qiraj",
+  "slots": 20
+ },
+ {
+  "id": "aq40",
+  "edition": "classic",
+  "name": "Temple of Ahn'Qiraj",
+  "slots": 40
+ },
+ {
+  "id": "naxx",
+  "edition": "classic",
+  "name": "Naxxramas",
+  "slots": 40
+ }
+]

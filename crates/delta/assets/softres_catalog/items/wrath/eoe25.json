@@ -1,0 +1,131 @@
+[
+ {
+  "id": 40558,
+  "name": "Arcanic Tramplers",
+  "quality": 4,
+  "boss": "Malygos"
+ },
+ {
+  "id": 40194,
+  "name": "Blanketing Robes of Snow",
+  "quality": 4,
+  "boss": "Malygos"
+ },
+ {
+  "id": 40543,
+  "name": "Blue Aspect Helm",
+  "quality": 4,
+  "boss": "Malygos"
+ },
+ {
+  "id": 40592,
+  "name": "Boots of Healing Energies",
+  "quality": 4,
+  "boss": "Malygos"
+ },
+ {
+  "id": 40539,
+  "name": "Chestguard of the Recluse",
+  "quality": 4,
+  "boss": "Malygos"
+ },
+ {
+  "id": 40590,
+  "name": "Elevated Lair Pauldrons",
+  "quality": 4,
+  "boss": "Malygos"
+ },
+ {
+  "id": 40541,
+  "name": "Frosted Adroit Handguards",
+  "quality": 4,
+  "boss": "Malygos"
+ },
+ {
+  "id": 40562,
+  "name": "Hood of Rationality",
+  "quality": 4,
+  "boss": "Malygos"
+ },
+ {
+  "id": 40561,
+  "name": "Leash of Heedless Magic",
+  "quality": 4,
+  "boss": "Malygos"
+ },
+ {
+  "id": 40560,
+  "name": "Leggings of the Wanton Spellcaster",
+  "quality": 4,
+  "boss": "Malygos"
+ },
+ {
+  "id": 40589,
+  "name": "Legplates of Sovereignty",
+  "quality": 4,
+  "boss": "Malygos"
+ },
+ {
+  "id": 40532,
+  "name": "Living Ice Crystals",
+  "quality": 4,
+  "boss": "Malygos"
+ },
+ {
+  "id": 40555,
+  "name": "Mantle of Dissemination",
+  "quality": 4,
+  "boss": "Malygos"
+ },
+ {
+  "id": 40531,
+  "name": "Mark of Norgannon",
+  "quality": 4,
+  "boss": "Malygos"
+ },
+ {
+  "id": 40591,
+  "name": "Melancholy Sabatons",
+  "quality": 4,
+  "boss": "Malygos"
+ },
+ {
+  "id": 43952,
+  "name": "Reins of the Azure Drake",
+  "quality": 4,
+  "boss": "Malygos"
+ },
+ {
+  "id": 40594,
+  "name": "Spaulders of Catatonia",
+  "quality": 4,
+  "boss": "Malygos"
+ },
+ {
+  "id": 40588,
+  "name": "Tunic of the Artifact Guardian",
+  "quality": 4,
+  "boss": "Malygos"
+ },
+ {
+  "id": 40566,
+  "name": "Unravelling Strands of Sanity",
+  "quality": 4,
+  "boss": "Malygos"
+ },
+ {
+  "id": 40547,
+  "name": "Valorous Dreadnaught Legguards",
+  "quality": 4,
+  "boss": "Malygos",
+  "allowable_classes": [
+   "warrior"
+  ]
+ },
+ {
+  "id": 40564,
+  "name": "Winter Spectacle Gloves",
+  "quality": 4,
+  "boss": "Malygos"
+ }
+]

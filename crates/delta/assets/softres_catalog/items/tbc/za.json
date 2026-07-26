@@ -1,0 +1,464 @@
+[
+ {
+  "id": 33211,
+  "name": "Bladeangel's Money Belt",
+  "quality": 4,
+  "boss": "Nalorakk"
+ },
+ {
+  "id": 33640,
+  "name": "Fury",
+  "quality": 4,
+  "boss": "Nalorakk"
+ },
+ {
+  "id": 33285,
+  "name": "Fury of the Ursine",
+  "quality": 4,
+  "boss": "Nalorakk"
+ },
+ {
+  "id": 33191,
+  "name": "Jungle Stompers",
+  "quality": 4,
+  "boss": "Nalorakk"
+ },
+ {
+  "id": 33327,
+  "name": "Mask of Introspection",
+  "quality": 4,
+  "boss": "Nalorakk"
+ },
+ {
+  "id": 33206,
+  "name": "Pauldrons of Primal Fury",
+  "quality": 4,
+  "boss": "Nalorakk"
+ },
+ {
+  "id": 33203,
+  "name": "Robes of Heavenly Purpose",
+  "quality": 4,
+  "boss": "Nalorakk"
+ },
+ {
+  "id": 33307,
+  "name": "Formula: Enchant Weapon - Executioner",
+  "quality": 3,
+  "boss": "Nalorakk / Akil'zon / Jan'alai / Halazzi / Hex Lord Malacrass / Zul'jin"
+ },
+ {
+  "id": 33117,
+  "name": "Jack-o'-Lantern",
+  "quality": 3,
+  "boss": "Nalorakk / Akil'zon / Jan'alai / Halazzi / Hex Lord Malacrass / Zul'jin"
+ },
+ {
+  "id": 33214,
+  "name": "Akil'zon's Talonblade",
+  "quality": 4,
+  "boss": "Akil'zon"
+ },
+ {
+  "id": 33283,
+  "name": "Amani Punisher",
+  "quality": 4,
+  "boss": "Akil'zon"
+ },
+ {
+  "id": 33215,
+  "name": "Bloodstained Elven Battlevest",
+  "quality": 4,
+  "boss": "Akil'zon"
+ },
+ {
+  "id": 33281,
+  "name": "Brooch of Nature's Mercy",
+  "quality": 4,
+  "boss": "Akil'zon"
+ },
+ {
+  "id": 33216,
+  "name": "Chestguard of Hidden Purpose",
+  "quality": 4,
+  "boss": "Akil'zon"
+ },
+ {
+  "id": 33286,
+  "name": "Mojo-mender's Mask",
+  "quality": 4,
+  "boss": "Akil'zon"
+ },
+ {
+  "id": 33293,
+  "name": "Signet of Ancient Magics",
+  "quality": 4,
+  "boss": "Akil'zon"
+ },
+ {
+  "id": 33328,
+  "name": "Arrow-fall Chestguard",
+  "quality": 4,
+  "boss": "Jan'alai"
+ },
+ {
+  "id": 33326,
+  "name": "Bulwark of the Amani Empire",
+  "quality": 4,
+  "boss": "Jan'alai"
+ },
+ {
+  "id": 33332,
+  "name": "Enamelled Disc of Mojo",
+  "quality": 4,
+  "boss": "Jan'alai"
+ },
+ {
+  "id": 33357,
+  "name": "Footpads of Madness",
+  "quality": 4,
+  "boss": "Jan'alai"
+ },
+ {
+  "id": 33356,
+  "name": "Helm of Natural Regeneration",
+  "quality": 4,
+  "boss": "Jan'alai"
+ },
+ {
+  "id": 33329,
+  "name": "Shadowtooth Trollskin Cuirass",
+  "quality": 4,
+  "boss": "Jan'alai"
+ },
+ {
+  "id": 33354,
+  "name": "Wub's Cursed Hexblade",
+  "quality": 4,
+  "boss": "Jan'alai"
+ },
+ {
+  "id": 33533,
+  "name": "Avalanche Leggings",
+  "quality": 4,
+  "boss": "Halazzi"
+ },
+ {
+  "id": 33317,
+  "name": "Robe of Departed Spirits",
+  "quality": 4,
+  "boss": "Halazzi"
+ },
+ {
+  "id": 33322,
+  "name": "Shimmer-pelt Vest",
+  "quality": 4,
+  "boss": "Halazzi"
+ },
+ {
+  "id": 33300,
+  "name": "Shoulderpads of Dancing Blades",
+  "quality": 4,
+  "boss": "Halazzi"
+ },
+ {
+  "id": 33303,
+  "name": "Skullshatter Warboots",
+  "quality": 4,
+  "boss": "Halazzi"
+ },
+ {
+  "id": 33299,
+  "name": "Spaulders of the Advocate",
+  "quality": 4,
+  "boss": "Halazzi"
+ },
+ {
+  "id": 33297,
+  "name": "The Savage's Choker",
+  "quality": 4,
+  "boss": "Halazzi"
+ },
+ {
+  "id": 33421,
+  "name": "Battleworn Tuskguard",
+  "quality": 4,
+  "boss": "Hex Lord Malacrass"
+ },
+ {
+  "id": 33592,
+  "name": "Cloak of Ancient Rituals",
+  "quality": 4,
+  "boss": "Hex Lord Malacrass"
+ },
+ {
+  "id": 33432,
+  "name": "Coif of the Jungle Stalker",
+  "quality": 4,
+  "boss": "Hex Lord Malacrass"
+ },
+ {
+  "id": 33389,
+  "name": "Dagger of Bad Mojo",
+  "quality": 4,
+  "boss": "Hex Lord Malacrass"
+ },
+ {
+  "id": 33446,
+  "name": "Girdle of Stromgarde's Hope",
+  "quality": 4,
+  "boss": "Hex Lord Malacrass"
+ },
+ {
+  "id": 33388,
+  "name": "Heartless",
+  "quality": 4,
+  "boss": "Hex Lord Malacrass"
+ },
+ {
+  "id": 33464,
+  "name": "Hex Lord's Voodoo Pauldrons",
+  "quality": 4,
+  "boss": "Hex Lord Malacrass"
+ },
+ {
+  "id": 33829,
+  "name": "Hex Shrunken Head",
+  "quality": 4,
+  "boss": "Hex Lord Malacrass"
+ },
+ {
+  "id": 33453,
+  "name": "Hood of Hexing",
+  "quality": 4,
+  "boss": "Hex Lord Malacrass"
+ },
+ {
+  "id": 33463,
+  "name": "Hood of the Third Eye",
+  "quality": 4,
+  "boss": "Hex Lord Malacrass"
+ },
+ {
+  "id": 33298,
+  "name": "Prowler's Strikeblade",
+  "quality": 4,
+  "boss": "Hex Lord Malacrass"
+ },
+ {
+  "id": 33465,
+  "name": "Staff of Primal Fury",
+  "quality": 4,
+  "boss": "Hex Lord Malacrass"
+ },
+ {
+  "id": 34029,
+  "name": "Tiny Voodoo Mask",
+  "quality": 4,
+  "boss": "Hex Lord Malacrass"
+ },
+ {
+  "id": 33828,
+  "name": "Tome of Diabolic Remedy",
+  "quality": 4,
+  "boss": "Hex Lord Malacrass"
+ },
+ {
+  "id": 33474,
+  "name": "Ancient Amani Longbow",
+  "quality": 4,
+  "boss": "Zul'jin"
+ },
+ {
+  "id": 33830,
+  "name": "Ancient Aqir Artifact",
+  "quality": 4,
+  "boss": "Zul'jin"
+ },
+ {
+  "id": 33831,
+  "name": "Berserker's Call",
+  "quality": 4,
+  "boss": "Zul'jin"
+ },
+ {
+  "id": 33467,
+  "name": "Blade of Twisted Visions",
+  "quality": 4,
+  "boss": "Zul'jin"
+ },
+ {
+  "id": 33102,
+  "name": "Blood of Zul'jin",
+  "quality": 4,
+  "boss": "Zul'jin"
+ },
+ {
+  "id": 33473,
+  "name": "Chestguard of the Warlord",
+  "quality": 4,
+  "boss": "Zul'jin"
+ },
+ {
+  "id": 33476,
+  "name": "Cleaver of the Unforgiving",
+  "quality": 4,
+  "boss": "Zul'jin"
+ },
+ {
+  "id": 33468,
+  "name": "Dark Blessing",
+  "quality": 4,
+  "boss": "Zul'jin"
+ },
+ {
+  "id": 33479,
+  "name": "Grimgrin Faceguard",
+  "quality": 4,
+  "boss": "Zul'jin"
+ },
+ {
+  "id": 33469,
+  "name": "Hauberk of the Empire's Champion",
+  "quality": 4,
+  "boss": "Zul'jin"
+ },
+ {
+  "id": 33478,
+  "name": "Jin'rohk, The Great Apocalypse",
+  "quality": 4,
+  "boss": "Zul'jin"
+ },
+ {
+  "id": 33466,
+  "name": "Loop of Cursed Bones",
+  "quality": 4,
+  "boss": "Zul'jin"
+ },
+ {
+  "id": 33471,
+  "name": "Two-toed Sandals",
+  "quality": 4,
+  "boss": "Zul'jin"
+ },
+ {
+  "id": 33494,
+  "name": "Amani Divining Staff",
+  "quality": 4,
+  "boss": "Timed Run Reward"
+ },
+ {
+  "id": 33809,
+  "name": "Amani War Bear",
+  "quality": 4,
+  "boss": "Timed Run Reward"
+ },
+ {
+  "id": 33590,
+  "name": "Cloak of Fiends",
+  "quality": 4,
+  "boss": "Timed Run Reward"
+ },
+ {
+  "id": 33480,
+  "name": "Cord of Braided Troll Hair",
+  "quality": 4,
+  "boss": "Timed Run Reward"
+ },
+ {
+  "id": 33971,
+  "name": "Elunite Imbued Leggings",
+  "quality": 4,
+  "boss": "Timed Run Reward"
+ },
+ {
+  "id": 33483,
+  "name": "Life-step Belt",
+  "quality": 4,
+  "boss": "Timed Run Reward"
+ },
+ {
+  "id": 33497,
+  "name": "Mana Attuned Band",
+  "quality": 4,
+  "boss": "Timed Run Reward"
+ },
+ {
+  "id": 33489,
+  "name": "Mantle of Ill Intent",
+  "quality": 4,
+  "boss": "Timed Run Reward"
+ },
+ {
+  "id": 33481,
+  "name": "Pauldrons of Stone Resolve",
+  "quality": 4,
+  "boss": "Timed Run Reward"
+ },
+ {
+  "id": 33495,
+  "name": "Rage",
+  "quality": 4,
+  "boss": "Timed Run Reward"
+ },
+ {
+  "id": 33591,
+  "name": "Shadowcaster's Drape",
+  "quality": 4,
+  "boss": "Timed Run Reward"
+ },
+ {
+  "id": 33805,
+  "name": "Shadowhunter's Treads",
+  "quality": 4,
+  "boss": "Timed Run Reward"
+ },
+ {
+  "id": 33500,
+  "name": "Signet of Eternal Life",
+  "quality": 4,
+  "boss": "Timed Run Reward"
+ },
+ {
+  "id": 33496,
+  "name": "Signet of Primal Wrath",
+  "quality": 4,
+  "boss": "Timed Run Reward"
+ },
+ {
+  "id": 33499,
+  "name": "Signet of the Last Defender",
+  "quality": 4,
+  "boss": "Timed Run Reward"
+ },
+ {
+  "id": 33498,
+  "name": "Signet of the Quiet Forest",
+  "quality": 4,
+  "boss": "Timed Run Reward"
+ },
+ {
+  "id": 33490,
+  "name": "Staff of Dark Mending",
+  "quality": 4,
+  "boss": "Timed Run Reward"
+ },
+ {
+  "id": 33492,
+  "name": "Trollbane",
+  "quality": 4,
+  "boss": "Timed Run Reward"
+ },
+ {
+  "id": 33491,
+  "name": "Tuskbreaker",
+  "quality": 4,
+  "boss": "Timed Run Reward"
+ },
+ {
+  "id": 33493,
+  "name": "Umbral Shiv",
+  "quality": 4,
+  "boss": "Timed Run Reward"
+ }
+]

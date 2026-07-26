@@ -1,0 +1,286 @@
+[
+ {
+  "id": 49308,
+  "name": "Antique Cornerstone Grimoire",
+  "quality": 4,
+  "boss": "Onyxia"
+ },
+ {
+  "id": 49294,
+  "name": "Ashen Sack of Gems",
+  "quality": 4,
+  "boss": "Onyxia"
+ },
+ {
+  "id": 49322,
+  "name": "Bloodfang Mask",
+  "quality": 4,
+  "boss": "Onyxia",
+  "allowable_classes": [
+   "rogue"
+  ]
+ },
+ {
+  "id": 49316,
+  "name": "Circlet of Transcendence",
+  "quality": 4,
+  "boss": "Onyxia",
+  "allowable_classes": [
+   "priest"
+  ]
+ },
+ {
+  "id": 49331,
+  "name": "Coif of Ten Storms",
+  "quality": 4,
+  "boss": "Onyxia",
+  "allowable_classes": [
+   "shaman"
+  ]
+ },
+ {
+  "id": 49317,
+  "name": "Coronet of Transcendence",
+  "quality": 4,
+  "boss": "Onyxia",
+  "allowable_classes": [
+   "priest"
+  ]
+ },
+ {
+  "id": 49330,
+  "name": "Cowl of Ten Storms",
+  "quality": 4,
+  "boss": "Onyxia",
+  "allowable_classes": [
+   "shaman"
+  ]
+ },
+ {
+  "id": 49319,
+  "name": "Dragonstalker's Helmet",
+  "quality": 4,
+  "boss": "Onyxia",
+  "allowable_classes": [
+   "hunter"
+  ]
+ },
+ {
+  "id": 49297,
+  "name": "Empowered Deathbringer",
+  "quality": 4,
+  "boss": "Onyxia"
+ },
+ {
+  "id": 49295,
+  "name": "Enlarged Onyxia Hide Backpack",
+  "quality": 4,
+  "boss": "Onyxia"
+ },
+ {
+  "id": 49306,
+  "name": "Eskhandar's Choker",
+  "quality": 4,
+  "boss": "Onyxia"
+ },
+ {
+  "id": 49320,
+  "name": "Faceguard of Wrath",
+  "quality": 4,
+  "boss": "Onyxia",
+  "allowable_classes": [
+   "warrior"
+  ]
+ },
+ {
+  "id": 49307,
+  "name": "Fluttering Sapphiron Drape",
+  "quality": 4,
+  "boss": "Onyxia"
+ },
+ {
+  "id": 49333,
+  "name": "Frostforged Helmet",
+  "quality": 4,
+  "boss": "Onyxia",
+  "allowable_classes": [
+   "deathknight"
+  ]
+ },
+ {
+  "id": 49332,
+  "name": "Frostforged Ringhelm",
+  "quality": 4,
+  "boss": "Onyxia",
+  "allowable_classes": [
+   "deathknight"
+  ]
+ },
+ {
+  "id": 49329,
+  "name": "Gaze of Ten Storms",
+  "quality": 4,
+  "boss": "Onyxia",
+  "allowable_classes": [
+   "shaman"
+  ]
+ },
+ {
+  "id": 49303,
+  "name": "Gleaming Quel'Serrar",
+  "quality": 4,
+  "boss": "Onyxia",
+  "allowable_classes": [
+   "warrior",
+   "paladin",
+   "deathknight"
+  ]
+ },
+ {
+  "id": 49298,
+  "name": "Glinting Azuresong Mageblade",
+  "quality": 4,
+  "boss": "Onyxia"
+ },
+ {
+  "id": 49321,
+  "name": "Greathelm of Wrath",
+  "quality": 4,
+  "boss": "Onyxia",
+  "allowable_classes": [
+   "warrior"
+  ]
+ },
+ {
+  "id": 49323,
+  "name": "Judgement Cover",
+  "quality": 4,
+  "boss": "Onyxia",
+  "allowable_classes": [
+   "paladin"
+  ]
+ },
+ {
+  "id": 49325,
+  "name": "Judgement Helm",
+  "quality": 4,
+  "boss": "Onyxia",
+  "allowable_classes": [
+   "paladin"
+  ]
+ },
+ {
+  "id": 49324,
+  "name": "Judgement Helmet",
+  "quality": 4,
+  "boss": "Onyxia",
+  "allowable_classes": [
+   "paladin"
+  ]
+ },
+ {
+  "id": 49299,
+  "name": "Keen Obsidian Edged Blade",
+  "quality": 4,
+  "boss": "Onyxia"
+ },
+ {
+  "id": 49315,
+  "name": "Nemesis Skullcover",
+  "quality": 4,
+  "boss": "Onyxia",
+  "allowable_classes": [
+   "warlock"
+  ]
+ },
+ {
+  "id": 49318,
+  "name": "Netherwind Hood",
+  "quality": 4,
+  "boss": "Onyxia",
+  "allowable_classes": [
+   "mage"
+  ]
+ },
+ {
+  "id": 49463,
+  "name": "Purified Shard of the Flame",
+  "quality": 4,
+  "boss": "Onyxia"
+ },
+ {
+  "id": 49310,
+  "name": "Purified Shard of the Scale",
+  "quality": 4,
+  "boss": "Onyxia"
+ },
+ {
+  "id": 49302,
+  "name": "Reclaimed Shadowstrike",
+  "quality": 4,
+  "boss": "Onyxia"
+ },
+ {
+  "id": 49636,
+  "name": "Reins of the Onyxian Drake",
+  "quality": 4,
+  "boss": "Onyxia"
+ },
+ {
+  "id": 49309,
+  "name": "Runed Ring of Binding",
+  "quality": 4,
+  "boss": "Onyxia"
+ },
+ {
+  "id": 49437,
+  "name": "Rusted Gutgore Ripper",
+  "quality": 4,
+  "boss": "Onyxia"
+ },
+ {
+  "id": 49304,
+  "name": "Sharpened Fang of the Mystics",
+  "quality": 4,
+  "boss": "Onyxia"
+ },
+ {
+  "id": 49296,
+  "name": "Singed Vis'kag the Bloodletter",
+  "quality": 4,
+  "boss": "Onyxia"
+ },
+ {
+  "id": 49305,
+  "name": "Snub-Nose Blastershot Launcher",
+  "quality": 4,
+  "boss": "Onyxia"
+ },
+ {
+  "id": 49327,
+  "name": "Stormrage Antlers",
+  "quality": 4,
+  "boss": "Onyxia",
+  "allowable_classes": [
+   "druid"
+  ]
+ },
+ {
+  "id": 49328,
+  "name": "Stormrage Helm",
+  "quality": 4,
+  "boss": "Onyxia",
+  "allowable_classes": [
+   "druid"
+  ]
+ },
+ {
+  "id": 49326,
+  "name": "Stormrage Hood",
+  "quality": 4,
+  "boss": "Onyxia",
+  "allowable_classes": [
+   "druid"
+  ]
+ }
+]

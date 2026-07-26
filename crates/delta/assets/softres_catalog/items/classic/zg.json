@@ -1,0 +1,722 @@
+[
+ {
+  "id": 19906,
+  "name": "Blooddrenched Footpads",
+  "quality": 3,
+  "boss": "High Priest Venoxis"
+ },
+ {
+  "id": 19903,
+  "name": "Fang of Venoxis",
+  "quality": 4,
+  "boss": "High Priest Venoxis"
+ },
+ {
+  "id": 19904,
+  "name": "Runed Bloodstained Hauberk",
+  "quality": 4,
+  "boss": "High Priest Venoxis"
+ },
+ {
+  "id": 19905,
+  "name": "Zanzil's Band",
+  "quality": 3,
+  "boss": "High Priest Venoxis"
+ },
+ {
+  "id": 19900,
+  "name": "Zulian Stone Axe",
+  "quality": 3,
+  "boss": "High Priest Venoxis"
+ },
+ {
+  "id": 19907,
+  "name": "Zulian Tigerhide Cloak",
+  "quality": 3,
+  "boss": "High Priest Venoxis"
+ },
+ {
+  "id": 22721,
+  "name": "Band of Servitude",
+  "quality": 4,
+  "boss": "High Priest Venoxis / High Priestess Jeklik / High Priestess Mar'li / High Priest Thekal / High Priestess Arlokk"
+ },
+ {
+  "id": 22716,
+  "name": "Belt of Untapped Power",
+  "quality": 3,
+  "boss": "High Priest Venoxis / High Priestess Jeklik / High Priestess Mar'li / High Priest Thekal / High Priestess Arlokk"
+ },
+ {
+  "id": 22718,
+  "name": "Blooddrenched Mask",
+  "quality": 3,
+  "boss": "High Priest Venoxis / High Priestess Jeklik / High Priestess Mar'li / High Priest Thekal / High Priestess Arlokk"
+ },
+ {
+  "id": 22711,
+  "name": "Cloak of the Hakkari Worshipers",
+  "quality": 3,
+  "boss": "High Priest Venoxis / High Priestess Jeklik / High Priestess Mar'li / High Priest Thekal / High Priestess Arlokk"
+ },
+ {
+  "id": 22715,
+  "name": "Gloves of the Tormented",
+  "quality": 3,
+  "boss": "High Priest Venoxis / High Priestess Jeklik / High Priestess Mar'li / High Priest Thekal / High Priestess Arlokk"
+ },
+ {
+  "id": 22712,
+  "name": "Might of the Tribe",
+  "quality": 3,
+  "boss": "High Priest Venoxis / High Priestess Jeklik / High Priestess Mar'li / High Priest Thekal / High Priestess Arlokk"
+ },
+ {
+  "id": 22714,
+  "name": "Sacrificial Gauntlets",
+  "quality": 3,
+  "boss": "High Priest Venoxis / High Priestess Jeklik / High Priestess Mar'li / High Priest Thekal / High Priestess Arlokk"
+ },
+ {
+  "id": 22722,
+  "name": "Seal of the Gurubashi Berserker",
+  "quality": 4,
+  "boss": "High Priest Venoxis / High Priestess Jeklik / High Priestess Mar'li / High Priest Thekal / High Priestess Arlokk"
+ },
+ {
+  "id": 22720,
+  "name": "Zulian Headdress",
+  "quality": 3,
+  "boss": "High Priest Venoxis / High Priestess Jeklik / High Priestess Mar'li / High Priest Thekal / High Priestess Arlokk"
+ },
+ {
+  "id": 22713,
+  "name": "Zulian Scepter of Rites",
+  "quality": 3,
+  "boss": "High Priest Venoxis / High Priestess Jeklik / High Priestess Mar'li / High Priest Thekal / High Priestess Arlokk"
+ },
+ {
+  "id": 19724,
+  "name": "Primal Hakkari Aegis",
+  "quality": 4,
+  "boss": "High Priest Venoxis / High Priestess Jeklik / High Priestess Mar'li / High Priest Thekal / High Priestess Arlokk / Bloodlord Mandokir / Jin'do the Hexxer",
+  "allowable_classes": [
+   "hunter",
+   "rogue",
+   "priest"
+  ]
+ },
+ {
+  "id": 19717,
+  "name": "Primal Hakkari Armsplint",
+  "quality": 4,
+  "boss": "High Priest Venoxis / High Priestess Jeklik / High Priestess Mar'li / High Priest Thekal / High Priestess Arlokk / Bloodlord Mandokir / Jin'do the Hexxer",
+  "allowable_classes": [
+   "warrior",
+   "rogue",
+   "shaman"
+  ]
+ },
+ {
+  "id": 19716,
+  "name": "Primal Hakkari Bindings",
+  "quality": 4,
+  "boss": "High Priest Venoxis / High Priestess Jeklik / High Priestess Mar'li / High Priest Thekal / High Priestess Arlokk / Bloodlord Mandokir / Jin'do the Hexxer",
+  "allowable_classes": [
+   "paladin",
+   "hunter",
+   "mage"
+  ]
+ },
+ {
+  "id": 19719,
+  "name": "Primal Hakkari Girdle",
+  "quality": 4,
+  "boss": "High Priest Venoxis / High Priestess Jeklik / High Priestess Mar'li / High Priest Thekal / High Priestess Arlokk / Bloodlord Mandokir / Jin'do the Hexxer",
+  "allowable_classes": [
+   "warrior",
+   "rogue",
+   "shaman"
+  ]
+ },
+ {
+  "id": 19723,
+  "name": "Primal Hakkari Kossack",
+  "quality": 4,
+  "boss": "High Priest Venoxis / High Priestess Jeklik / High Priestess Mar'li / High Priest Thekal / High Priestess Arlokk / Bloodlord Mandokir / Jin'do the Hexxer",
+  "allowable_classes": [
+   "warrior",
+   "mage",
+   "warlock"
+  ]
+ },
+ {
+  "id": 19720,
+  "name": "Primal Hakkari Sash",
+  "quality": 4,
+  "boss": "High Priest Venoxis / High Priestess Jeklik / High Priestess Mar'li / High Priest Thekal / High Priestess Arlokk / Bloodlord Mandokir / Jin'do the Hexxer",
+  "allowable_classes": [
+   "priest",
+   "warlock",
+   "druid"
+  ]
+ },
+ {
+  "id": 19721,
+  "name": "Primal Hakkari Shawl",
+  "quality": 4,
+  "boss": "High Priest Venoxis / High Priestess Jeklik / High Priestess Mar'li / High Priest Thekal / High Priestess Arlokk / Bloodlord Mandokir / Jin'do the Hexxer",
+  "allowable_classes": [
+   "paladin",
+   "hunter",
+   "mage"
+  ]
+ },
+ {
+  "id": 19718,
+  "name": "Primal Hakkari Stanchion",
+  "quality": 4,
+  "boss": "High Priest Venoxis / High Priestess Jeklik / High Priestess Mar'li / High Priest Thekal / High Priestess Arlokk / Bloodlord Mandokir / Jin'do the Hexxer",
+  "allowable_classes": [
+   "priest",
+   "warlock",
+   "druid"
+  ]
+ },
+ {
+  "id": 19722,
+  "name": "Primal Hakkari Tabard",
+  "quality": 4,
+  "boss": "High Priest Venoxis / High Priestess Jeklik / High Priestess Mar'li / High Priest Thekal / High Priestess Arlokk / Bloodlord Mandokir / Jin'do the Hexxer",
+  "allowable_classes": [
+   "paladin",
+   "shaman",
+   "druid"
+  ]
+ },
+ {
+  "id": 19928,
+  "name": "Animist's Spaulders",
+  "quality": 3,
+  "boss": "High Priestess Jeklik"
+ },
+ {
+  "id": 19918,
+  "name": "Jeklik's Crusher",
+  "quality": 4,
+  "boss": "High Priestess Jeklik"
+ },
+ {
+  "id": 19923,
+  "name": "Jeklik's Opaline Talisman",
+  "quality": 3,
+  "boss": "High Priestess Jeklik"
+ },
+ {
+  "id": 20265,
+  "name": "Peacekeeper Boots",
+  "quality": 3,
+  "boss": "High Priestess Jeklik"
+ },
+ {
+  "id": 19920,
+  "name": "Primalist's Band",
+  "quality": 3,
+  "boss": "High Priestess Jeklik"
+ },
+ {
+  "id": 20262,
+  "name": "Seafury Boots",
+  "quality": 3,
+  "boss": "High Priestess Jeklik"
+ },
+ {
+  "id": 19915,
+  "name": "Zulian Defender",
+  "quality": 3,
+  "boss": "High Priestess Jeklik"
+ },
+ {
+  "id": 19925,
+  "name": "Band of Jin",
+  "quality": 3,
+  "boss": "High Priestess Mar'li"
+ },
+ {
+  "id": 19919,
+  "name": "Bloodstained Greaves",
+  "quality": 3,
+  "boss": "High Priestess Mar'li"
+ },
+ {
+  "id": 20032,
+  "name": "Flowing Ritual Robes",
+  "quality": 4,
+  "boss": "High Priestess Mar'li"
+ },
+ {
+  "id": 19930,
+  "name": "Mar'li's Eye",
+  "quality": 3,
+  "boss": "High Priestess Mar'li"
+ },
+ {
+  "id": 19927,
+  "name": "Mar'li's Touch",
+  "quality": 4,
+  "boss": "High Priestess Mar'li"
+ },
+ {
+  "id": 19871,
+  "name": "Talisman of Protection",
+  "quality": 3,
+  "boss": "High Priestess Mar'li"
+ },
+ {
+  "id": 19897,
+  "name": "Betrayer's Boots",
+  "quality": 4,
+  "boss": "High Priest Thekal"
+ },
+ {
+  "id": 20266,
+  "name": "Peacekeeper Leggings",
+  "quality": 3,
+  "boss": "High Priest Thekal"
+ },
+ {
+  "id": 19899,
+  "name": "Ritualistic Legguards",
+  "quality": 3,
+  "boss": "High Priest Thekal"
+ },
+ {
+  "id": 20260,
+  "name": "Seafury Leggings",
+  "quality": 3,
+  "boss": "High Priest Thekal"
+ },
+ {
+  "id": 19898,
+  "name": "Seal of Jin",
+  "quality": 3,
+  "boss": "High Priest Thekal"
+ },
+ {
+  "id": 19902,
+  "name": "Swift Zulian Tiger",
+  "quality": 4,
+  "boss": "High Priest Thekal"
+ },
+ {
+  "id": 19896,
+  "name": "Thekal's Grasp",
+  "quality": 4,
+  "boss": "High Priest Thekal"
+ },
+ {
+  "id": 19901,
+  "name": "Zulian Slicer",
+  "quality": 3,
+  "boss": "High Priest Thekal"
+ },
+ {
+  "id": 19910,
+  "name": "Arlokk's Grasp",
+  "quality": 4,
+  "boss": "High Priestess Arlokk"
+ },
+ {
+  "id": 19922,
+  "name": "Arlokk's Hoodoo Stick",
+  "quality": 3,
+  "boss": "High Priestess Arlokk"
+ },
+ {
+  "id": 19913,
+  "name": "Bloodsoaked Greaves",
+  "quality": 3,
+  "boss": "High Priestess Arlokk"
+ },
+ {
+  "id": 19912,
+  "name": "Overlord's Onyx Band",
+  "quality": 3,
+  "boss": "High Priestess Arlokk"
+ },
+ {
+  "id": 19914,
+  "name": "Panther Hide Sack",
+  "quality": 3,
+  "boss": "High Priestess Arlokk"
+ },
+ {
+  "id": 19909,
+  "name": "Will of Arlokk",
+  "quality": 4,
+  "boss": "High Priestess Arlokk"
+ },
+ {
+  "id": 19877,
+  "name": "Animist's Leggings",
+  "quality": 3,
+  "boss": "Bloodlord Mandokir"
+ },
+ {
+  "id": 19869,
+  "name": "Blooddrenched Grips",
+  "quality": 3,
+  "boss": "Bloodlord Mandokir"
+ },
+ {
+  "id": 19867,
+  "name": "Bloodlord's Defender",
+  "quality": 4,
+  "boss": "Bloodlord Mandokir"
+ },
+ {
+  "id": 19878,
+  "name": "Bloodsoaked Pauldrons",
+  "quality": 3,
+  "boss": "Bloodlord Mandokir"
+ },
+ {
+  "id": 19895,
+  "name": "Bloodtinged Kilt",
+  "quality": 3,
+  "boss": "Bloodlord Mandokir"
+ },
+ {
+  "id": 19870,
+  "name": "Hakkari Loa Cloak",
+  "quality": 3,
+  "boss": "Bloodlord Mandokir"
+ },
+ {
+  "id": 19874,
+  "name": "Halberd of Smiting",
+  "quality": 4,
+  "boss": "Bloodlord Mandokir"
+ },
+ {
+  "id": 20038,
+  "name": "Mandokir's Sting",
+  "quality": 4,
+  "boss": "Bloodlord Mandokir"
+ },
+ {
+  "id": 19873,
+  "name": "Overlord's Crimson Band",
+  "quality": 3,
+  "boss": "Bloodlord Mandokir"
+ },
+ {
+  "id": 19863,
+  "name": "Primalist's Seal",
+  "quality": 3,
+  "boss": "Bloodlord Mandokir"
+ },
+ {
+  "id": 19872,
+  "name": "Swift Razzashi Raptor",
+  "quality": 4,
+  "boss": "Bloodlord Mandokir"
+ },
+ {
+  "id": 19866,
+  "name": "Warblade of the Hakkari",
+  "quality": 4,
+  "boss": "Bloodlord Mandokir"
+ },
+ {
+  "id": 19893,
+  "name": "Zanzil's Seal",
+  "quality": 3,
+  "boss": "Bloodlord Mandokir"
+ },
+ {
+  "id": 22637,
+  "name": "Primal Hakkari Idol",
+  "quality": 3,
+  "boss": "Bloodlord Mandokir / Jin'do the Hexxer"
+ },
+ {
+  "id": 19968,
+  "name": "Fiery Retributer",
+  "quality": 3,
+  "boss": "Edge of Madness"
+ },
+ {
+  "id": 19962,
+  "name": "Gri'lek's Carver",
+  "quality": 3,
+  "boss": "Edge of Madness"
+ },
+ {
+  "id": 19961,
+  "name": "Gri'lek's Grinder",
+  "quality": 3,
+  "boss": "Edge of Madness"
+ },
+ {
+  "id": 19993,
+  "name": "Hoodoo Hunting Bow",
+  "quality": 3,
+  "boss": "Edge of Madness"
+ },
+ {
+  "id": 19963,
+  "name": "Pitchfork of Madness",
+  "quality": 3,
+  "boss": "Edge of Madness"
+ },
+ {
+  "id": 19964,
+  "name": "Renataki's Soul Conduit",
+  "quality": 3,
+  "boss": "Edge of Madness"
+ },
+ {
+  "id": 19967,
+  "name": "Thoughtblighter",
+  "quality": 3,
+  "boss": "Edge of Madness"
+ },
+ {
+  "id": 19965,
+  "name": "Wushoolay's Poker",
+  "quality": 3,
+  "boss": "Edge of Madness"
+ },
+ {
+  "id": 19945,
+  "name": "Foror's Eyepatch",
+  "quality": 4,
+  "boss": "Gahz'ranka"
+ },
+ {
+  "id": 19947,
+  "name": "Nat Pagle's Broken Reel",
+  "quality": 3,
+  "boss": "Gahz'ranka"
+ },
+ {
+  "id": 19944,
+  "name": "Nat Pagle's Fish Terminator",
+  "quality": 4,
+  "boss": "Gahz'ranka"
+ },
+ {
+  "id": 19946,
+  "name": "Tigule's Harpoon",
+  "quality": 3,
+  "boss": "Gahz'ranka"
+ },
+ {
+  "id": 22739,
+  "name": "Tome of Polymorph: Turtle",
+  "quality": 3,
+  "boss": "Gahz'ranka",
+  "allowable_classes": [
+   "mage"
+  ]
+ },
+ {
+  "id": 19892,
+  "name": "Animist's Boots",
+  "quality": 3,
+  "boss": "Jin'do the Hexxer"
+ },
+ {
+  "id": 19889,
+  "name": "Blooddrenched Leggings",
+  "quality": 3,
+  "boss": "Jin'do the Hexxer"
+ },
+ {
+  "id": 19894,
+  "name": "Bloodsoaked Gauntlets",
+  "quality": 3,
+  "boss": "Jin'do the Hexxer"
+ },
+ {
+  "id": 19875,
+  "name": "Bloodstained Coif",
+  "quality": 3,
+  "boss": "Jin'do the Hexxer"
+ },
+ {
+  "id": 19887,
+  "name": "Bloodstained Legplates",
+  "quality": 3,
+  "boss": "Jin'do the Hexxer"
+ },
+ {
+  "id": 19929,
+  "name": "Bloodtinged Gloves",
+  "quality": 3,
+  "boss": "Jin'do the Hexxer"
+ },
+ {
+  "id": 19891,
+  "name": "Jin'do's Bag of Whammies",
+  "quality": 4,
+  "boss": "Jin'do the Hexxer"
+ },
+ {
+  "id": 19885,
+  "name": "Jin'do's Evil Eye",
+  "quality": 4,
+  "boss": "Jin'do the Hexxer"
+ },
+ {
+  "id": 19890,
+  "name": "Jin'do's Hexxer",
+  "quality": 4,
+  "boss": "Jin'do the Hexxer"
+ },
+ {
+  "id": 19884,
+  "name": "Jin'do's Judgement",
+  "quality": 4,
+  "boss": "Jin'do the Hexxer"
+ },
+ {
+  "id": 19888,
+  "name": "Overlord's Embrace",
+  "quality": 3,
+  "boss": "Jin'do the Hexxer"
+ },
+ {
+  "id": 19886,
+  "name": "The Hexxer's Cover",
+  "quality": 3,
+  "boss": "Jin'do the Hexxer"
+ },
+ {
+  "id": 19862,
+  "name": "Aegis of the Blood God",
+  "quality": 4,
+  "boss": "Hakkar"
+ },
+ {
+  "id": 19852,
+  "name": "Ancient Hakkari Manslayer",
+  "quality": 4,
+  "boss": "Hakkar"
+ },
+ {
+  "id": 19864,
+  "name": "Bloodcaller",
+  "quality": 4,
+  "boss": "Hakkar"
+ },
+ {
+  "id": 19855,
+  "name": "Bloodsoaked Legplates",
+  "quality": 4,
+  "boss": "Hakkar"
+ },
+ {
+  "id": 19857,
+  "name": "Cloak of Consumption",
+  "quality": 4,
+  "boss": "Hakkar"
+ },
+ {
+  "id": 19859,
+  "name": "Fang of the Faceless",
+  "quality": 4,
+  "boss": "Hakkar"
+ },
+ {
+  "id": 19853,
+  "name": "Gurubashi Dwarf Destroyer",
+  "quality": 4,
+  "boss": "Hakkar"
+ },
+ {
+  "id": 19802,
+  "name": "Heart of Hakkar",
+  "quality": 4,
+  "boss": "Hakkar"
+ },
+ {
+  "id": 20264,
+  "name": "Peacekeeper Gauntlets",
+  "quality": 4,
+  "boss": "Hakkar"
+ },
+ {
+  "id": 20257,
+  "name": "Seafury Gauntlets",
+  "quality": 4,
+  "boss": "Hakkar"
+ },
+ {
+  "id": 19876,
+  "name": "Soul Corrupter's Necklace",
+  "quality": 4,
+  "boss": "Hakkar"
+ },
+ {
+  "id": 19856,
+  "name": "The Eye of Hakkar",
+  "quality": 4,
+  "boss": "Hakkar"
+ },
+ {
+  "id": 19861,
+  "name": "Touch of Chaos",
+  "quality": 4,
+  "boss": "Hakkar"
+ },
+ {
+  "id": 19865,
+  "name": "Warblade of the Hakkari",
+  "quality": 4,
+  "boss": "Hakkar"
+ },
+ {
+  "id": 19854,
+  "name": "Zin'rokh, Destroyer of Worlds",
+  "quality": 4,
+  "boss": "Hakkar"
+ },
+ {
+  "id": 14558,
+  "name": "Lady Maye's Pendant",
+  "quality": 4,
+  "boss": "Trash"
+ },
+ {
+  "id": 14511,
+  "name": "Pattern: Gloves of Spell Mastery",
+  "quality": 4,
+  "boss": "Trash"
+ },
+ {
+  "id": 12728,
+  "name": "Plans: Invulnerable Mail",
+  "quality": 4,
+  "boss": "Trash"
+ },
+ {
+  "id": 12717,
+  "name": "Plans: Lionheart Helm",
+  "quality": 4,
+  "boss": "Trash"
+ },
+ {
+  "id": 12720,
+  "name": "Plans: Stronghold Gauntlets",
+  "quality": 4,
+  "boss": "Trash"
+ },
+ {
+  "id": 14557,
+  "name": "The Lion Horn of Stormwind",
+  "quality": 4,
+  "boss": "Trash"
+ }
+]

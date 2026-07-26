@@ -1,0 +1,286 @@
+[
+ {
+  "id": 49490,
+  "name": "Antediluvian Cornerstone Grimoire",
+  "quality": 4,
+  "boss": "Onyxia"
+ },
+ {
+  "id": 49294,
+  "name": "Ashen Sack of Gems",
+  "quality": 4,
+  "boss": "Onyxia"
+ },
+ {
+  "id": 49482,
+  "name": "Aurora of Transcendence",
+  "quality": 4,
+  "boss": "Onyxia",
+  "allowable_classes": [
+   "priest"
+  ]
+ },
+ {
+  "id": 49477,
+  "name": "Bloodfang Hood",
+  "quality": 4,
+  "boss": "Onyxia",
+  "allowable_classes": [
+   "rogue"
+  ]
+ },
+ {
+  "id": 49495,
+  "name": "Burnished Quel'Serrar",
+  "quality": 4,
+  "boss": "Onyxia",
+  "allowable_classes": [
+   "warrior",
+   "paladin",
+   "deathknight"
+  ]
+ },
+ {
+  "id": 49469,
+  "name": "Crown of Ten Storms",
+  "quality": 4,
+  "boss": "Onyxia",
+  "allowable_classes": [
+   "shaman"
+  ]
+ },
+ {
+  "id": 49480,
+  "name": "Dragonstalker's Helm",
+  "quality": 4,
+  "boss": "Onyxia",
+  "allowable_classes": [
+   "hunter"
+  ]
+ },
+ {
+  "id": 49295,
+  "name": "Enlarged Onyxia Hide Backpack",
+  "quality": 4,
+  "boss": "Onyxia"
+ },
+ {
+  "id": 49492,
+  "name": "Eskhandar's Links",
+  "quality": 4,
+  "boss": "Onyxia"
+ },
+ {
+  "id": 49491,
+  "name": "Flowing Sapphiron Drape",
+  "quality": 4,
+  "boss": "Onyxia"
+ },
+ {
+  "id": 49467,
+  "name": "Frostforged Greathelm",
+  "quality": 4,
+  "boss": "Onyxia",
+  "allowable_classes": [
+   "deathknight"
+  ]
+ },
+ {
+  "id": 49466,
+  "name": "Frostforged Helm",
+  "quality": 4,
+  "boss": "Onyxia",
+  "allowable_classes": [
+   "deathknight"
+  ]
+ },
+ {
+  "id": 49483,
+  "name": "Halo of Transcendence",
+  "quality": 4,
+  "boss": "Onyxia",
+  "allowable_classes": [
+   "priest"
+  ]
+ },
+ {
+  "id": 49468,
+  "name": "Helm of Ten Storms",
+  "quality": 4,
+  "boss": "Onyxia",
+  "allowable_classes": [
+   "shaman"
+  ]
+ },
+ {
+  "id": 49479,
+  "name": "Helm of Wrath",
+  "quality": 4,
+  "boss": "Onyxia",
+  "allowable_classes": [
+   "warrior"
+  ]
+ },
+ {
+  "id": 49470,
+  "name": "Helmet of Ten Storms",
+  "quality": 4,
+  "boss": "Onyxia",
+  "allowable_classes": [
+   "shaman"
+  ]
+ },
+ {
+  "id": 49478,
+  "name": "Helmet of Wrath",
+  "quality": 4,
+  "boss": "Onyxia",
+  "allowable_classes": [
+   "warrior"
+  ]
+ },
+ {
+  "id": 49494,
+  "name": "Honed Fang of the Mystics",
+  "quality": 4,
+  "boss": "Onyxia"
+ },
+ {
+  "id": 49476,
+  "name": "Judgement Crown",
+  "quality": 4,
+  "boss": "Onyxia",
+  "allowable_classes": [
+   "paladin"
+  ]
+ },
+ {
+  "id": 49475,
+  "name": "Judgement Heaume",
+  "quality": 4,
+  "boss": "Onyxia",
+  "allowable_classes": [
+   "paladin"
+  ]
+ },
+ {
+  "id": 49474,
+  "name": "Judgement Hood",
+  "quality": 4,
+  "boss": "Onyxia",
+  "allowable_classes": [
+   "paladin"
+  ]
+ },
+ {
+  "id": 49484,
+  "name": "Nemesis Skullcap",
+  "quality": 4,
+  "boss": "Onyxia",
+  "allowable_classes": [
+   "warlock"
+  ]
+ },
+ {
+  "id": 49481,
+  "name": "Netherwind Crown",
+  "quality": 4,
+  "boss": "Onyxia",
+  "allowable_classes": [
+   "mage"
+  ]
+ },
+ {
+  "id": 49499,
+  "name": "Polished Azuresong Mageblade",
+  "quality": 4,
+  "boss": "Onyxia"
+ },
+ {
+  "id": 49500,
+  "name": "Raging Deathbringer",
+  "quality": 4,
+  "boss": "Onyxia"
+ },
+ {
+  "id": 49496,
+  "name": "Reinforced Shadowstrike",
+  "quality": 4,
+  "boss": "Onyxia"
+ },
+ {
+  "id": 49636,
+  "name": "Reins of the Onyxian Drake",
+  "quality": 4,
+  "boss": "Onyxia"
+ },
+ {
+  "id": 49493,
+  "name": "Rifled Blastershot Launcher",
+  "quality": 4,
+  "boss": "Onyxia"
+ },
+ {
+  "id": 49498,
+  "name": "Sharpened Obsidian Edged Blade",
+  "quality": 4,
+  "boss": "Onyxia"
+ },
+ {
+  "id": 49464,
+  "name": "Shiny Shard of the Flame",
+  "quality": 4,
+  "boss": "Onyxia"
+ },
+ {
+  "id": 49488,
+  "name": "Shiny Shard of the Scale",
+  "quality": 4,
+  "boss": "Onyxia"
+ },
+ {
+  "id": 49489,
+  "name": "Signified Ring of Binding",
+  "quality": 4,
+  "boss": "Onyxia"
+ },
+ {
+  "id": 49473,
+  "name": "Stormrage Cover",
+  "quality": 4,
+  "boss": "Onyxia",
+  "allowable_classes": [
+   "druid"
+  ]
+ },
+ {
+  "id": 49471,
+  "name": "Stormrage Coverlet",
+  "quality": 4,
+  "boss": "Onyxia",
+  "allowable_classes": [
+   "druid"
+  ]
+ },
+ {
+  "id": 49472,
+  "name": "Stormrage Crown",
+  "quality": 4,
+  "boss": "Onyxia",
+  "allowable_classes": [
+   "druid"
+  ]
+ },
+ {
+  "id": 49465,
+  "name": "Tarnished Gutgore Ripper",
+  "quality": 4,
+  "boss": "Onyxia"
+ },
+ {
+  "id": 49501,
+  "name": "Tempered Vis'kag the Bloodletter",
+  "quality": 4,
+  "boss": "Onyxia"
+ }
+]

@@ -74,6 +74,7 @@ impl<'r> Responder<'r, 'static> for Error {
             ErrorType::InteractionExpired => Status::Gone,
             ErrorType::InteractionAlreadyResponded => Status::Conflict,
             ErrorType::PollClosed => Status::Gone,
+            ErrorType::UnknownRaid => Status::BadRequest,
             ErrorType::TooManyScheduledMessages { .. } => Status::BadRequest,
             ErrorType::NotAnAnnouncementChannel => Status::BadRequest,
             ErrorType::AlreadyCrossposted => Status::BadRequest,

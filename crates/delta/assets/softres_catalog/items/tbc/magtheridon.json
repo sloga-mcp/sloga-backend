@@ -1,0 +1,131 @@
+[
+ {
+  "id": 29458,
+  "name": "Aegis of the Vindicator",
+  "quality": 4,
+  "boss": "Magtheridon"
+ },
+ {
+  "id": 29754,
+  "name": "Chestguard of the Fallen Champion",
+  "quality": 4,
+  "boss": "Magtheridon",
+  "allowable_classes": [
+   "paladin",
+   "rogue",
+   "shaman"
+  ]
+ },
+ {
+  "id": 29753,
+  "name": "Chestguard of the Fallen Defender",
+  "quality": 4,
+  "boss": "Magtheridon",
+  "allowable_classes": [
+   "warrior",
+   "priest",
+   "druid"
+  ]
+ },
+ {
+  "id": 29755,
+  "name": "Chestguard of the Fallen Hero",
+  "quality": 4,
+  "boss": "Magtheridon",
+  "allowable_classes": [
+   "hunter",
+   "mage",
+   "warlock"
+  ]
+ },
+ {
+  "id": 28777,
+  "name": "Cloak of the Pit Stalker",
+  "quality": 4,
+  "boss": "Magtheridon"
+ },
+ {
+  "id": 28782,
+  "name": "Crystalheart Pulse-Staff",
+  "quality": 4,
+  "boss": "Magtheridon"
+ },
+ {
+  "id": 28783,
+  "name": "Eredar Wand of Obliteration",
+  "quality": 4,
+  "boss": "Magtheridon"
+ },
+ {
+  "id": 28789,
+  "name": "Eye of Magtheridon",
+  "quality": 4,
+  "boss": "Magtheridon"
+ },
+ {
+  "id": 28779,
+  "name": "Girdle of the Endless Pit",
+  "quality": 4,
+  "boss": "Magtheridon"
+ },
+ {
+  "id": 28774,
+  "name": "Glaive of the Pit",
+  "quality": 4,
+  "boss": "Magtheridon"
+ },
+ {
+  "id": 33117,
+  "name": "Jack-o'-Lantern",
+  "quality": 3,
+  "boss": "Magtheridon"
+ },
+ {
+  "id": 28781,
+  "name": "Karaborian Talisman",
+  "quality": 4,
+  "boss": "Magtheridon"
+ },
+ {
+  "id": 28776,
+  "name": "Liar's Tongue Gloves",
+  "quality": 4,
+  "boss": "Magtheridon"
+ },
+ {
+  "id": 32385,
+  "name": "Magtheridon's Head",
+  "quality": 4,
+  "boss": "Magtheridon"
+ },
+ {
+  "id": 32386,
+  "name": "Magtheridon's Head",
+  "quality": 4,
+  "boss": "Magtheridon"
+ },
+ {
+  "id": 34845,
+  "name": "Pit Lord's Satchel",
+  "quality": 4,
+  "boss": "Magtheridon"
+ },
+ {
+  "id": 28780,
+  "name": "Soul-Eater's Handwraps",
+  "quality": 4,
+  "boss": "Magtheridon"
+ },
+ {
+  "id": 28778,
+  "name": "Terror Pit Girdle",
+  "quality": 4,
+  "boss": "Magtheridon"
+ },
+ {
+  "id": 28775,
+  "name": "Thundering Greathelm",
+  "quality": 4,
+  "boss": "Magtheridon"
+ }
+]

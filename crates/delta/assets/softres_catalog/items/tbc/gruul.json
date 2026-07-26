@@ -1,0 +1,188 @@
+[
+ {
+  "id": 28799,
+  "name": "Belt of Divine Inspiration",
+  "quality": 4,
+  "boss": "High King Maulgar"
+ },
+ {
+  "id": 28795,
+  "name": "Bladespire Warbands",
+  "quality": 4,
+  "boss": "High King Maulgar"
+ },
+ {
+  "id": 28797,
+  "name": "Brute Cloak of the Ogre-Magi",
+  "quality": 4,
+  "boss": "High King Maulgar"
+ },
+ {
+  "id": 28800,
+  "name": "Hammer of the Naaru",
+  "quality": 4,
+  "boss": "High King Maulgar"
+ },
+ {
+  "id": 28796,
+  "name": "Malefic Mask of the Shadows",
+  "quality": 4,
+  "boss": "High King Maulgar"
+ },
+ {
+  "id": 28801,
+  "name": "Maulgar's Warhelm",
+  "quality": 4,
+  "boss": "High King Maulgar"
+ },
+ {
+  "id": 29763,
+  "name": "Pauldrons of the Fallen Champion",
+  "quality": 4,
+  "boss": "High King Maulgar",
+  "allowable_classes": [
+   "paladin",
+   "rogue",
+   "shaman"
+  ]
+ },
+ {
+  "id": 29764,
+  "name": "Pauldrons of the Fallen Defender",
+  "quality": 4,
+  "boss": "High King Maulgar",
+  "allowable_classes": [
+   "warrior",
+   "priest",
+   "druid"
+  ]
+ },
+ {
+  "id": 29762,
+  "name": "Pauldrons of the Fallen Hero",
+  "quality": 4,
+  "boss": "High King Maulgar",
+  "allowable_classes": [
+   "hunter",
+   "mage",
+   "warlock"
+  ]
+ },
+ {
+  "id": 33117,
+  "name": "Jack-o'-Lantern",
+  "quality": 3,
+  "boss": "High King Maulgar / Gruul the Dragonkiller"
+ },
+ {
+  "id": 28825,
+  "name": "Aldori Legacy Defender",
+  "quality": 4,
+  "boss": "Gruul the Dragonkiller"
+ },
+ {
+  "id": 28794,
+  "name": "Axe of the Gronn Lords",
+  "quality": 4,
+  "boss": "Gruul the Dragonkiller"
+ },
+ {
+  "id": 28802,
+  "name": "Bloodmaw Magus-Blade",
+  "quality": 4,
+  "boss": "Gruul the Dragonkiller"
+ },
+ {
+  "id": 28804,
+  "name": "Collar of Cho'gall",
+  "quality": 4,
+  "boss": "Gruul the Dragonkiller"
+ },
+ {
+  "id": 28803,
+  "name": "Cowl of Nature's Breath",
+  "quality": 4,
+  "boss": "Gruul the Dragonkiller"
+ },
+ {
+  "id": 28830,
+  "name": "Dragonspine Trophy",
+  "quality": 4,
+  "boss": "Gruul the Dragonkiller"
+ },
+ {
+  "id": 28823,
+  "name": "Eye of Gruul",
+  "quality": 4,
+  "boss": "Gruul the Dragonkiller"
+ },
+ {
+  "id": 28824,
+  "name": "Gauntlets of Martial Perfection",
+  "quality": 4,
+  "boss": "Gruul the Dragonkiller"
+ },
+ {
+  "id": 28827,
+  "name": "Gauntlets of the Dragonslayer",
+  "quality": 4,
+  "boss": "Gruul the Dragonkiller"
+ },
+ {
+  "id": 28828,
+  "name": "Gronn-Stitched Girdle",
+  "quality": 4,
+  "boss": "Gruul the Dragonkiller"
+ },
+ {
+  "id": 29766,
+  "name": "Leggings of the Fallen Champion",
+  "quality": 4,
+  "boss": "Gruul the Dragonkiller",
+  "allowable_classes": [
+   "paladin",
+   "rogue",
+   "shaman"
+  ]
+ },
+ {
+  "id": 29767,
+  "name": "Leggings of the Fallen Defender",
+  "quality": 4,
+  "boss": "Gruul the Dragonkiller",
+  "allowable_classes": [
+   "warrior",
+   "priest",
+   "druid"
+  ]
+ },
+ {
+  "id": 29765,
+  "name": "Leggings of the Fallen Hero",
+  "quality": 4,
+  "boss": "Gruul the Dragonkiller",
+  "allowable_classes": [
+   "hunter",
+   "mage",
+   "warlock"
+  ]
+ },
+ {
+  "id": 28826,
+  "name": "Shuriken of Negation",
+  "quality": 4,
+  "boss": "Gruul the Dragonkiller"
+ },
+ {
+  "id": 28822,
+  "name": "Teeth of Gruul",
+  "quality": 4,
+  "boss": "Gruul the Dragonkiller"
+ },
+ {
+  "id": 28810,
+  "name": "Windshear Boots",
+  "quality": 4,
+  "boss": "Gruul the Dragonkiller"
+ }
+]

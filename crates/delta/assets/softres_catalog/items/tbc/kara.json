@@ -1,0 +1,908 @@
+[
+ {
+  "id": 28453,
+  "name": "Bracers of the White Stag",
+  "quality": 4,
+  "boss": "Attumen the Huntsman"
+ },
+ {
+  "id": 30480,
+  "name": "Fiery Warhorse's Reins",
+  "quality": 4,
+  "boss": "Attumen the Huntsman"
+ },
+ {
+  "id": 28505,
+  "name": "Gauntlets of Renewed Hope",
+  "quality": 4,
+  "boss": "Attumen the Huntsman"
+ },
+ {
+  "id": 28506,
+  "name": "Gloves of Dexterous Manipulation",
+  "quality": 4,
+  "boss": "Attumen the Huntsman"
+ },
+ {
+  "id": 28508,
+  "name": "Gloves of Saintly Blessings",
+  "quality": 4,
+  "boss": "Attumen the Huntsman"
+ },
+ {
+  "id": 28507,
+  "name": "Handwraps of Flowing Thought",
+  "quality": 4,
+  "boss": "Attumen the Huntsman"
+ },
+ {
+  "id": 28477,
+  "name": "Harbinger Bands",
+  "quality": 4,
+  "boss": "Attumen the Huntsman"
+ },
+ {
+  "id": 23809,
+  "name": "Schematic: Stabilized Eternium Scope",
+  "quality": 3,
+  "boss": "Attumen the Huntsman"
+ },
+ {
+  "id": 28510,
+  "name": "Spectral Band of Innervation",
+  "quality": 4,
+  "boss": "Attumen the Huntsman"
+ },
+ {
+  "id": 28454,
+  "name": "Stalker's War Bands",
+  "quality": 4,
+  "boss": "Attumen the Huntsman"
+ },
+ {
+  "id": 28504,
+  "name": "Steelhawk Crossbow",
+  "quality": 4,
+  "boss": "Attumen the Huntsman"
+ },
+ {
+  "id": 28502,
+  "name": "Vambraces of Courage",
+  "quality": 4,
+  "boss": "Attumen the Huntsman"
+ },
+ {
+  "id": 28503,
+  "name": "Whirlwind Bracers",
+  "quality": 4,
+  "boss": "Attumen the Huntsman"
+ },
+ {
+  "id": 28509,
+  "name": "Worgen Claw Necklace",
+  "quality": 4,
+  "boss": "Attumen the Huntsman"
+ },
+ {
+  "id": 33117,
+  "name": "Jack-o'-Lantern",
+  "quality": 3,
+  "boss": "Attumen the Huntsman / Moroes / Opera Event / Terestian Illhoof / Shade of Aran / Netherspite / Prince Malchezaar / Nightbane"
+ },
+ {
+  "id": 28567,
+  "name": "Belt of Gale Force",
+  "quality": 4,
+  "boss": "Moroes"
+ },
+ {
+  "id": 28569,
+  "name": "Boots of Valiance",
+  "quality": 4,
+  "boss": "Moroes"
+ },
+ {
+  "id": 28530,
+  "name": "Brooch of Unquenchable Fury",
+  "quality": 4,
+  "boss": "Moroes"
+ },
+ {
+  "id": 28566,
+  "name": "Crimson Girdle of the Indomitable",
+  "quality": 4,
+  "boss": "Moroes"
+ },
+ {
+  "id": 28545,
+  "name": "Edgewalker Longboots",
+  "quality": 4,
+  "boss": "Moroes"
+ },
+ {
+  "id": 28524,
+  "name": "Emerald Ripper",
+  "quality": 4,
+  "boss": "Moroes"
+ },
+ {
+  "id": 22559,
+  "name": "Formula: Enchant Weapon - Mongoose",
+  "quality": 3,
+  "boss": "Moroes"
+ },
+ {
+  "id": 28568,
+  "name": "Idol of the Avian Heart",
+  "quality": 4,
+  "boss": "Moroes"
+ },
+ {
+  "id": 28528,
+  "name": "Moroes' Lucky Pocket Watch",
+  "quality": 4,
+  "boss": "Moroes"
+ },
+ {
+  "id": 28565,
+  "name": "Nethershard Girdle",
+  "quality": 4,
+  "boss": "Moroes"
+ },
+ {
+  "id": 28529,
+  "name": "Royal Cloak of Arathi Kings",
+  "quality": 4,
+  "boss": "Moroes"
+ },
+ {
+  "id": 28570,
+  "name": "Shadow-Cloak of Dalaran",
+  "quality": 4,
+  "boss": "Moroes"
+ },
+ {
+  "id": 28525,
+  "name": "Signet of Unshakable Faith",
+  "quality": 4,
+  "boss": "Moroes"
+ },
+ {
+  "id": 28511,
+  "name": "Bands of Indwelling",
+  "quality": 4,
+  "boss": "Maiden of Virtue"
+ },
+ {
+  "id": 28515,
+  "name": "Bands of Nefarious Deeds",
+  "quality": 4,
+  "boss": "Maiden of Virtue"
+ },
+ {
+  "id": 28516,
+  "name": "Barbed Choker of Discipline",
+  "quality": 4,
+  "boss": "Maiden of Virtue"
+ },
+ {
+  "id": 28517,
+  "name": "Boots of Foretelling",
+  "quality": 4,
+  "boss": "Maiden of Virtue"
+ },
+ {
+  "id": 28512,
+  "name": "Bracers of Justice",
+  "quality": 4,
+  "boss": "Maiden of Virtue"
+ },
+ {
+  "id": 28514,
+  "name": "Bracers of Maliciousness",
+  "quality": 4,
+  "boss": "Maiden of Virtue"
+ },
+ {
+  "id": 28520,
+  "name": "Gloves of Centering",
+  "quality": 4,
+  "boss": "Maiden of Virtue"
+ },
+ {
+  "id": 28519,
+  "name": "Gloves of Quickening",
+  "quality": 4,
+  "boss": "Maiden of Virtue"
+ },
+ {
+  "id": 28518,
+  "name": "Iron Gauntlets of the Maiden",
+  "quality": 4,
+  "boss": "Maiden of Virtue"
+ },
+ {
+  "id": 28521,
+  "name": "Mitts of the Treemender",
+  "quality": 4,
+  "boss": "Maiden of Virtue"
+ },
+ {
+  "id": 28522,
+  "name": "Shard of the Virtuous",
+  "quality": 4,
+  "boss": "Maiden of Virtue"
+ },
+ {
+  "id": 28523,
+  "name": "Totem of Healing Rains",
+  "quality": 4,
+  "boss": "Maiden of Virtue"
+ },
+ {
+  "id": 28589,
+  "name": "Beastmaw Pauldrons",
+  "quality": 4,
+  "boss": "Opera Event"
+ },
+ {
+  "id": 28583,
+  "name": "Big Bad Wolf's Head",
+  "quality": 4,
+  "boss": "Opera Event"
+ },
+ {
+  "id": 28584,
+  "name": "Big Bad Wolf's Paw",
+  "quality": 4,
+  "boss": "Opera Event"
+ },
+ {
+  "id": 28572,
+  "name": "Blade of the Unrequited",
+  "quality": 4,
+  "boss": "Opera Event"
+ },
+ {
+  "id": 28588,
+  "name": "Blue Diamond Witchwand",
+  "quality": 4,
+  "boss": "Opera Event"
+ },
+ {
+  "id": 28573,
+  "name": "Despair",
+  "quality": 4,
+  "boss": "Opera Event"
+ },
+ {
+  "id": 28591,
+  "name": "Earthsoul Leggings",
+  "quality": 4,
+  "boss": "Opera Event"
+ },
+ {
+  "id": 28593,
+  "name": "Eternium Greathelm",
+  "quality": 4,
+  "boss": "Opera Event"
+ },
+ {
+  "id": 28587,
+  "name": "Legacy",
+  "quality": 4,
+  "boss": "Opera Event"
+ },
+ {
+  "id": 28592,
+  "name": "Libram of Souls Redeemed",
+  "quality": 4,
+  "boss": "Opera Event"
+ },
+ {
+  "id": 28578,
+  "name": "Masquerade Gown",
+  "quality": 4,
+  "boss": "Opera Event"
+ },
+ {
+  "id": 28582,
+  "name": "Red Riding Hood's Cloak",
+  "quality": 4,
+  "boss": "Opera Event"
+ },
+ {
+  "id": 28590,
+  "name": "Ribbon of Sacrifice",
+  "quality": 4,
+  "boss": "Opera Event"
+ },
+ {
+  "id": 28579,
+  "name": "Romulo's Poison Vial",
+  "quality": 4,
+  "boss": "Opera Event"
+ },
+ {
+  "id": 28585,
+  "name": "Ruby Slippers",
+  "quality": 4,
+  "boss": "Opera Event"
+ },
+ {
+  "id": 28594,
+  "name": "Trial-Fire Trousers",
+  "quality": 4,
+  "boss": "Opera Event"
+ },
+ {
+  "id": 28586,
+  "name": "Wicked Witch's Hat",
+  "quality": 4,
+  "boss": "Opera Event"
+ },
+ {
+  "id": 28581,
+  "name": "Wolfslayer Sniper Rifle",
+  "quality": 4,
+  "boss": "Opera Event"
+ },
+ {
+  "id": 28631,
+  "name": "Dragon-Quake Shoulderguards",
+  "quality": 4,
+  "boss": "The Curator"
+ },
+ {
+  "id": 28647,
+  "name": "Forest Wind Shoulderpads",
+  "quality": 4,
+  "boss": "The Curator"
+ },
+ {
+  "id": 28649,
+  "name": "Garona's Signet Ring",
+  "quality": 4,
+  "boss": "The Curator"
+ },
+ {
+  "id": 29757,
+  "name": "Gloves of the Fallen Champion",
+  "quality": 4,
+  "boss": "The Curator",
+  "allowable_classes": [
+   "paladin",
+   "rogue",
+   "shaman"
+  ]
+ },
+ {
+  "id": 29758,
+  "name": "Gloves of the Fallen Defender",
+  "quality": 4,
+  "boss": "The Curator",
+  "allowable_classes": [
+   "warrior",
+   "priest",
+   "druid"
+  ]
+ },
+ {
+  "id": 29756,
+  "name": "Gloves of the Fallen Hero",
+  "quality": 4,
+  "boss": "The Curator",
+  "allowable_classes": [
+   "hunter",
+   "mage",
+   "warlock"
+  ]
+ },
+ {
+  "id": 28612,
+  "name": "Pauldrons of the Solace-Giver",
+  "quality": 4,
+  "boss": "The Curator"
+ },
+ {
+  "id": 28633,
+  "name": "Staff of Infinite Mysteries",
+  "quality": 4,
+  "boss": "The Curator"
+ },
+ {
+  "id": 28621,
+  "name": "Wrynn Dynasty Greaves",
+  "quality": 4,
+  "boss": "The Curator"
+ },
+ {
+  "id": 28662,
+  "name": "Breastplate of the Lightbinder",
+  "quality": 4,
+  "boss": "Terestian Illhoof"
+ },
+ {
+  "id": 28652,
+  "name": "Cincture of Will",
+  "quality": 4,
+  "boss": "Terestian Illhoof"
+ },
+ {
+  "id": 28655,
+  "name": "Cord of Nature's Sustenance",
+  "quality": 4,
+  "boss": "Terestian Illhoof"
+ },
+ {
+  "id": 28657,
+  "name": "Fool's Bane",
+  "quality": 4,
+  "boss": "Terestian Illhoof"
+ },
+ {
+  "id": 22561,
+  "name": "Formula: Enchant Weapon - Soulfrost",
+  "quality": 3,
+  "boss": "Terestian Illhoof"
+ },
+ {
+  "id": 28660,
+  "name": "Gilded Thorium Cloak",
+  "quality": 4,
+  "boss": "Terestian Illhoof"
+ },
+ {
+  "id": 28656,
+  "name": "Girdle of the Prowler",
+  "quality": 4,
+  "boss": "Terestian Illhoof"
+ },
+ {
+  "id": 28654,
+  "name": "Malefic Girdle",
+  "quality": 4,
+  "boss": "Terestian Illhoof"
+ },
+ {
+  "id": 28661,
+  "name": "Mender's Heart-Ring",
+  "quality": 4,
+  "boss": "Terestian Illhoof"
+ },
+ {
+  "id": 28653,
+  "name": "Shadowvine Cloak of Infusion",
+  "quality": 4,
+  "boss": "Terestian Illhoof"
+ },
+ {
+  "id": 28658,
+  "name": "Terestian's Stranglestaff",
+  "quality": 4,
+  "boss": "Terestian Illhoof"
+ },
+ {
+  "id": 28785,
+  "name": "The Lightning Capacitor",
+  "quality": 4,
+  "boss": "Terestian Illhoof"
+ },
+ {
+  "id": 28659,
+  "name": "Xavian Stiletto",
+  "quality": 4,
+  "boss": "Terestian Illhoof"
+ },
+ {
+  "id": 28728,
+  "name": "Aran's Soothing Sapphire",
+  "quality": 4,
+  "boss": "Shade of Aran"
+ },
+ {
+  "id": 28663,
+  "name": "Boots of the Incorrupt",
+  "quality": 4,
+  "boss": "Shade of Aran"
+ },
+ {
+  "id": 28670,
+  "name": "Boots of the Infernal Coven",
+  "quality": 4,
+  "boss": "Shade of Aran"
+ },
+ {
+  "id": 28672,
+  "name": "Drape of the Dark Reavers",
+  "quality": 4,
+  "boss": "Shade of Aran"
+ },
+ {
+  "id": 22560,
+  "name": "Formula: Enchant Weapon - Sunfire",
+  "quality": 3,
+  "boss": "Shade of Aran"
+ },
+ {
+  "id": 28726,
+  "name": "Mantle of the Mind Flayer",
+  "quality": 4,
+  "boss": "Shade of Aran"
+ },
+ {
+  "id": 28666,
+  "name": "Pauldrons of the Justice-Seeker",
+  "quality": 4,
+  "boss": "Shade of Aran"
+ },
+ {
+  "id": 28727,
+  "name": "Pendant of the Violet Eye",
+  "quality": 4,
+  "boss": "Shade of Aran"
+ },
+ {
+  "id": 28669,
+  "name": "Rapscallion Boots",
+  "quality": 4,
+  "boss": "Shade of Aran"
+ },
+ {
+  "id": 28674,
+  "name": "Saberclaw Talisman",
+  "quality": 4,
+  "boss": "Shade of Aran"
+ },
+ {
+  "id": 28675,
+  "name": "Shermanar Great-Ring",
+  "quality": 4,
+  "boss": "Shade of Aran"
+ },
+ {
+  "id": 28671,
+  "name": "Steelspine Faceguard",
+  "quality": 4,
+  "boss": "Shade of Aran"
+ },
+ {
+  "id": 28673,
+  "name": "Tirisfal Wand of Ascendancy",
+  "quality": 4,
+  "boss": "Shade of Aran"
+ },
+ {
+  "id": 28732,
+  "name": "Cowl of Defiance",
+  "quality": 4,
+  "boss": "Netherspite"
+ },
+ {
+  "id": 28735,
+  "name": "Earthblood Chestguard",
+  "quality": 4,
+  "boss": "Netherspite"
+ },
+ {
+  "id": 28733,
+  "name": "Girdle of Truth",
+  "quality": 4,
+  "boss": "Netherspite"
+ },
+ {
+  "id": 28734,
+  "name": "Jewel of Infinite Possibilities",
+  "quality": 4,
+  "boss": "Netherspite"
+ },
+ {
+  "id": 28743,
+  "name": "Mantle of Abrahmis",
+  "quality": 4,
+  "boss": "Netherspite"
+ },
+ {
+  "id": 28730,
+  "name": "Mithril Band of the Unscarred",
+  "quality": 4,
+  "boss": "Netherspite"
+ },
+ {
+  "id": 28742,
+  "name": "Pantaloons of Repentance",
+  "quality": 4,
+  "boss": "Netherspite"
+ },
+ {
+  "id": 28740,
+  "name": "Rip-Flayer Leggings",
+  "quality": 4,
+  "boss": "Netherspite"
+ },
+ {
+  "id": 28731,
+  "name": "Shining Chain of the Afterworld",
+  "quality": 4,
+  "boss": "Netherspite"
+ },
+ {
+  "id": 28741,
+  "name": "Skulker's Greaves",
+  "quality": 4,
+  "boss": "Netherspite"
+ },
+ {
+  "id": 28729,
+  "name": "Spiteblade",
+  "quality": 4,
+  "boss": "Netherspite"
+ },
+ {
+  "id": 28744,
+  "name": "Uni-Mind Headdress",
+  "quality": 4,
+  "boss": "Netherspite"
+ },
+ {
+  "id": 28747,
+  "name": "Battlescar Boots",
+  "quality": 4,
+  "boss": "Chess Event"
+ },
+ {
+  "id": 28755,
+  "name": "Bladed Shoulderpads of the Merciless",
+  "quality": 4,
+  "boss": "Chess Event"
+ },
+ {
+  "id": 28746,
+  "name": "Fiend Slayer Boots",
+  "quality": 4,
+  "boss": "Chess Event"
+ },
+ {
+  "id": 28752,
+  "name": "Forestlord Striders",
+  "quality": 4,
+  "boss": "Chess Event"
+ },
+ {
+  "id": 28750,
+  "name": "Girdle of Treachery",
+  "quality": 4,
+  "boss": "Chess Event"
+ },
+ {
+  "id": 28756,
+  "name": "Headdress of the High Potentate",
+  "quality": 4,
+  "boss": "Chess Event"
+ },
+ {
+  "id": 28751,
+  "name": "Heart-Flame Leggings",
+  "quality": 4,
+  "boss": "Chess Event"
+ },
+ {
+  "id": 28749,
+  "name": "King's Defender",
+  "quality": 4,
+  "boss": "Chess Event"
+ },
+ {
+  "id": 28748,
+  "name": "Legplates of the Innocent",
+  "quality": 4,
+  "boss": "Chess Event"
+ },
+ {
+  "id": 28745,
+  "name": "Mithril Chain of Heroism",
+  "quality": 4,
+  "boss": "Chess Event"
+ },
+ {
+  "id": 28753,
+  "name": "Ring of Recurrence",
+  "quality": 4,
+  "boss": "Chess Event"
+ },
+ {
+  "id": 28754,
+  "name": "Triptych Shield of the Ancients",
+  "quality": 4,
+  "boss": "Chess Event"
+ },
+ {
+  "id": 28762,
+  "name": "Adornment of Stolen Souls",
+  "quality": 4,
+  "boss": "Prince Malchezaar"
+ },
+ {
+  "id": 28764,
+  "name": "Farstrider Wildercloak",
+  "quality": 4,
+  "boss": "Prince Malchezaar"
+ },
+ {
+  "id": 28773,
+  "name": "Gorehowl",
+  "quality": 4,
+  "boss": "Prince Malchezaar"
+ },
+ {
+  "id": 29760,
+  "name": "Helm of the Fallen Champion",
+  "quality": 4,
+  "boss": "Prince Malchezaar",
+  "allowable_classes": [
+   "paladin",
+   "rogue",
+   "shaman"
+  ]
+ },
+ {
+  "id": 29761,
+  "name": "Helm of the Fallen Defender",
+  "quality": 4,
+  "boss": "Prince Malchezaar",
+  "allowable_classes": [
+   "warrior",
+   "priest",
+   "druid"
+  ]
+ },
+ {
+  "id": 29759,
+  "name": "Helm of the Fallen Hero",
+  "quality": 4,
+  "boss": "Prince Malchezaar",
+  "allowable_classes": [
+   "hunter",
+   "mage",
+   "warlock"
+  ]
+ },
+ {
+  "id": 28763,
+  "name": "Jade Ring of the Everliving",
+  "quality": 4,
+  "boss": "Prince Malchezaar"
+ },
+ {
+  "id": 28771,
+  "name": "Light's Justice",
+  "quality": 4,
+  "boss": "Prince Malchezaar"
+ },
+ {
+  "id": 28768,
+  "name": "Malchazeen",
+  "quality": 4,
+  "boss": "Prince Malchezaar"
+ },
+ {
+  "id": 28770,
+  "name": "Nathrezim Mindblade",
+  "quality": 4,
+  "boss": "Prince Malchezaar"
+ },
+ {
+  "id": 28757,
+  "name": "Ring of a Thousand Marks",
+  "quality": 4,
+  "boss": "Prince Malchezaar"
+ },
+ {
+  "id": 28766,
+  "name": "Ruby Drape of the Mysticant",
+  "quality": 4,
+  "boss": "Prince Malchezaar"
+ },
+ {
+  "id": 28765,
+  "name": "Stainless Cloak of the Pure Hearted",
+  "quality": 4,
+  "boss": "Prince Malchezaar"
+ },
+ {
+  "id": 28772,
+  "name": "Sunfury Bow of the Phoenix",
+  "quality": 4,
+  "boss": "Prince Malchezaar"
+ },
+ {
+  "id": 28767,
+  "name": "The Decapitator",
+  "quality": 4,
+  "boss": "Prince Malchezaar"
+ },
+ {
+  "id": 28601,
+  "name": "Chestguard of the Conniver",
+  "quality": 4,
+  "boss": "Nightbane"
+ },
+ {
+  "id": 28611,
+  "name": "Dragonheart Flameshield",
+  "quality": 4,
+  "boss": "Nightbane"
+ },
+ {
+  "id": 28609,
+  "name": "Emberspur Talisman",
+  "quality": 4,
+  "boss": "Nightbane"
+ },
+ {
+  "id": 28610,
+  "name": "Ferocious Swift-Kickers",
+  "quality": 4,
+  "boss": "Nightbane"
+ },
+ {
+  "id": 28608,
+  "name": "Ironstriders of Urgency",
+  "quality": 4,
+  "boss": "Nightbane"
+ },
+ {
+  "id": 28604,
+  "name": "Nightstaff of the Everliving",
+  "quality": 4,
+  "boss": "Nightbane"
+ },
+ {
+  "id": 28597,
+  "name": "Panzar'Thar Breastplate",
+  "quality": 4,
+  "boss": "Nightbane"
+ },
+ {
+  "id": 28602,
+  "name": "Robe of the Elder Scribes",
+  "quality": 4,
+  "boss": "Nightbane"
+ },
+ {
+  "id": 28599,
+  "name": "Scaled Breastplate of Carnage",
+  "quality": 4,
+  "boss": "Nightbane"
+ },
+ {
+  "id": 28606,
+  "name": "Shield of Impenetrable Darkness",
+  "quality": 4,
+  "boss": "Nightbane"
+ },
+ {
+  "id": 28600,
+  "name": "Stonebough Jerkin",
+  "quality": 4,
+  "boss": "Nightbane"
+ },
+ {
+  "id": 28603,
+  "name": "Talisman of Nightbane",
+  "quality": 4,
+  "boss": "Nightbane"
+ },
+ {
+  "id": 21903,
+  "name": "Pattern: Soulcloth Shoulders",
+  "quality": 4,
+  "boss": "Trash"
+ },
+ {
+  "id": 21904,
+  "name": "Pattern: Soulcloth Vest",
+  "quality": 4,
+  "boss": "Trash"
+ }
+]

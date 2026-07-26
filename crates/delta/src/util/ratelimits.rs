@@ -183,6 +183,12 @@ impl<'a> RatelimitResolver<Request<'a>> for DeltaRatelimits {
                 // normally arrives over the WebSocket) so it stays modest too.
                 ("import", Some("discord"), Method::Post) => ("import_start", None),
                 ("import", _, _) => ("import", None),
+                // Static loot-catalog reads (cheap, client-cached for a day)
+                // get headroom above the shared "any" bucket. The sheet and
+                // reserve routes are channel-scoped and are bounded by the
+                // channels/messaging buckets plus their own arm when they
+                // land in a later slice.
+                ("softres", _, _) => ("softres_catalog", None),
                 _ => ("any", None),
             }
         } else {
@@ -225,6 +231,7 @@ impl<'a> RatelimitResolver<Request<'a>> for DeltaRatelimits {
             "interaction_respond" => 30,
             "message_interact" => 20,
             "bot_commands" => 10,
+            "softres_catalog" => 20,
             _ => 20,
         }
     }

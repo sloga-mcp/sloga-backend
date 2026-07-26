@@ -1,0 +1,813 @@
+[
+ {
+  "id": 21702,
+  "name": "Amulet of Foul Warding",
+  "quality": 4,
+  "boss": "The Prophet Skeram"
+ },
+ {
+  "id": 21699,
+  "name": "Barrage Shoulders",
+  "quality": 4,
+  "boss": "The Prophet Skeram"
+ },
+ {
+  "id": 21708,
+  "name": "Beetle Scaled Wristguards",
+  "quality": 4,
+  "boss": "The Prophet Skeram"
+ },
+ {
+  "id": 21705,
+  "name": "Boots of the Fallen Prophet",
+  "quality": 4,
+  "boss": "The Prophet Skeram"
+ },
+ {
+  "id": 21704,
+  "name": "Boots of the Redeemed Prophecy",
+  "quality": 4,
+  "boss": "The Prophet Skeram"
+ },
+ {
+  "id": 21706,
+  "name": "Boots of the Unwavering Will",
+  "quality": 4,
+  "boss": "The Prophet Skeram"
+ },
+ {
+  "id": 21814,
+  "name": "Breastplate of Annihilation",
+  "quality": 4,
+  "boss": "The Prophet Skeram"
+ },
+ {
+  "id": 21701,
+  "name": "Cloak of Concentrated Hatred",
+  "quality": 4,
+  "boss": "The Prophet Skeram"
+ },
+ {
+  "id": 21703,
+  "name": "Hammer of Ji'zhi",
+  "quality": 4,
+  "boss": "The Prophet Skeram"
+ },
+ {
+  "id": 21698,
+  "name": "Leggings of Immersion",
+  "quality": 4,
+  "boss": "The Prophet Skeram"
+ },
+ {
+  "id": 21700,
+  "name": "Pendant of the Qiraji Guardian",
+  "quality": 4,
+  "boss": "The Prophet Skeram"
+ },
+ {
+  "id": 22222,
+  "name": "Plans: Thick Obsidian Breastplate",
+  "quality": 3,
+  "boss": "The Prophet Skeram"
+ },
+ {
+  "id": 21707,
+  "name": "Ring of Swarming Thought",
+  "quality": 4,
+  "boss": "The Prophet Skeram"
+ },
+ {
+  "id": 21128,
+  "name": "Staff of the Qiraji Prophets",
+  "quality": 4,
+  "boss": "The Prophet Skeram"
+ },
+ {
+  "id": 21232,
+  "name": "Imperial Qiraji Armaments",
+  "quality": 4,
+  "boss": "The Prophet Skeram / Bug Trio / Battleguard Sartura / Fankriss the Unyielding / Viscidus / Princess Huhuran / Twin Emperors / Ouro"
+ },
+ {
+  "id": 21237,
+  "name": "Imperial Qiraji Regalia",
+  "quality": 4,
+  "boss": "The Prophet Skeram / Bug Trio / Battleguard Sartura / Fankriss the Unyielding / Viscidus / Princess Huhuran / Twin Emperors / Ouro"
+ },
+ {
+  "id": 21690,
+  "name": "Angelista's Charm",
+  "quality": 4,
+  "boss": "Bug Trio"
+ },
+ {
+  "id": 21695,
+  "name": "Angelista's Touch",
+  "quality": 4,
+  "boss": "Bug Trio"
+ },
+ {
+  "id": 21682,
+  "name": "Bile-Covered Gauntlets",
+  "quality": 4,
+  "boss": "Bug Trio"
+ },
+ {
+  "id": 21688,
+  "name": "Boots of the Fallen Hero",
+  "quality": 4,
+  "boss": "Bug Trio"
+ },
+ {
+  "id": 21697,
+  "name": "Cape of the Trinity",
+  "quality": 4,
+  "boss": "Bug Trio"
+ },
+ {
+  "id": 21689,
+  "name": "Gloves of Ebru",
+  "quality": 4,
+  "boss": "Bug Trio"
+ },
+ {
+  "id": 21693,
+  "name": "Guise of the Devourer",
+  "quality": 4,
+  "boss": "Bug Trio"
+ },
+ {
+  "id": 21686,
+  "name": "Mantle of Phrenic Power",
+  "quality": 4,
+  "boss": "Bug Trio"
+ },
+ {
+  "id": 21683,
+  "name": "Mantle of the Desert Crusade",
+  "quality": 4,
+  "boss": "Bug Trio"
+ },
+ {
+  "id": 21684,
+  "name": "Mantle of the Desert's Fury",
+  "quality": 4,
+  "boss": "Bug Trio"
+ },
+ {
+  "id": 21691,
+  "name": "Ooze-ridden Gauntlets",
+  "quality": 4,
+  "boss": "Bug Trio"
+ },
+ {
+  "id": 21685,
+  "name": "Petrified Scarab",
+  "quality": 4,
+  "boss": "Bug Trio"
+ },
+ {
+  "id": 21681,
+  "name": "Ring of the Devoured",
+  "quality": 4,
+  "boss": "Bug Trio"
+ },
+ {
+  "id": 21696,
+  "name": "Robes of the Triumvirate",
+  "quality": 4,
+  "boss": "Bug Trio"
+ },
+ {
+  "id": 21694,
+  "name": "Ternary Mantle",
+  "quality": 4,
+  "boss": "Bug Trio"
+ },
+ {
+  "id": 21692,
+  "name": "Triad Girdle",
+  "quality": 4,
+  "boss": "Bug Trio"
+ },
+ {
+  "id": 21687,
+  "name": "Ukko's Ring of Darkness",
+  "quality": 4,
+  "boss": "Bug Trio"
+ },
+ {
+  "id": 21680,
+  "name": "Vest of Swift Execution",
+  "quality": 4,
+  "boss": "Bug Trio"
+ },
+ {
+  "id": 21603,
+  "name": "Wand of Qiraji Nobility",
+  "quality": 4,
+  "boss": "Bug Trio"
+ },
+ {
+  "id": 21670,
+  "name": "Badge of the Swarmguard",
+  "quality": 4,
+  "boss": "Battleguard Sartura"
+ },
+ {
+  "id": 21669,
+  "name": "Creeping Vine Helm",
+  "quality": 4,
+  "boss": "Battleguard Sartura"
+ },
+ {
+  "id": 21674,
+  "name": "Gauntlets of Steadfast Determination",
+  "quality": 4,
+  "boss": "Battleguard Sartura"
+ },
+ {
+  "id": 21672,
+  "name": "Gloves of Enforcement",
+  "quality": 4,
+  "boss": "Battleguard Sartura"
+ },
+ {
+  "id": 21676,
+  "name": "Leggings of the Festering Swarm",
+  "quality": 4,
+  "boss": "Battleguard Sartura"
+ },
+ {
+  "id": 21667,
+  "name": "Legplates of Blazing Light",
+  "quality": 4,
+  "boss": "Battleguard Sartura"
+ },
+ {
+  "id": 21678,
+  "name": "Necklace of Purity",
+  "quality": 4,
+  "boss": "Battleguard Sartura"
+ },
+ {
+  "id": 21648,
+  "name": "Recomposed Boots",
+  "quality": 4,
+  "boss": "Battleguard Sartura"
+ },
+ {
+  "id": 21671,
+  "name": "Robes of the Battleguard",
+  "quality": 4,
+  "boss": "Battleguard Sartura"
+ },
+ {
+  "id": 21666,
+  "name": "Sartura's Might",
+  "quality": 4,
+  "boss": "Battleguard Sartura"
+ },
+ {
+  "id": 21668,
+  "name": "Scaled Leggings of Qiraji Fury",
+  "quality": 4,
+  "boss": "Battleguard Sartura"
+ },
+ {
+  "id": 21673,
+  "name": "Silithid Claw",
+  "quality": 4,
+  "boss": "Battleguard Sartura"
+ },
+ {
+  "id": 21675,
+  "name": "Thick Qirajihide Belt",
+  "quality": 4,
+  "boss": "Battleguard Sartura"
+ },
+ {
+  "id": 21650,
+  "name": "Ancient Qiraji Ripper",
+  "quality": 4,
+  "boss": "Fankriss the Unyielding"
+ },
+ {
+  "id": 21635,
+  "name": "Barb of the Sand Reaver",
+  "quality": 4,
+  "boss": "Fankriss the Unyielding"
+ },
+ {
+  "id": 21664,
+  "name": "Barbed Choker",
+  "quality": 4,
+  "boss": "Fankriss the Unyielding"
+ },
+ {
+  "id": 21627,
+  "name": "Cloak of Untold Secrets",
+  "quality": 4,
+  "boss": "Fankriss the Unyielding"
+ },
+ {
+  "id": 21647,
+  "name": "Fetish of the Sand Reaver",
+  "quality": 4,
+  "boss": "Fankriss the Unyielding"
+ },
+ {
+  "id": 21645,
+  "name": "Hive Tunneler's Boots",
+  "quality": 4,
+  "boss": "Fankriss the Unyielding"
+ },
+ {
+  "id": 22402,
+  "name": "Libram of Grace",
+  "quality": 4,
+  "boss": "Fankriss the Unyielding"
+ },
+ {
+  "id": 21665,
+  "name": "Mantle of Wicked Revenge",
+  "quality": 4,
+  "boss": "Fankriss the Unyielding"
+ },
+ {
+  "id": 21639,
+  "name": "Pauldrons of the Unrelenting",
+  "quality": 4,
+  "boss": "Fankriss the Unyielding"
+ },
+ {
+  "id": 21663,
+  "name": "Robes of the Guardian Saint",
+  "quality": 4,
+  "boss": "Fankriss the Unyielding"
+ },
+ {
+  "id": 21651,
+  "name": "Scaled Sand Reaver Leggings",
+  "quality": 4,
+  "boss": "Fankriss the Unyielding"
+ },
+ {
+  "id": 21652,
+  "name": "Silithid Carapace Chestguard",
+  "quality": 4,
+  "boss": "Fankriss the Unyielding"
+ },
+ {
+  "id": 22396,
+  "name": "Totem of Life",
+  "quality": 4,
+  "boss": "Fankriss the Unyielding"
+ },
+ {
+  "id": 21624,
+  "name": "Gauntlets of Kalimdor",
+  "quality": 4,
+  "boss": "Viscidus"
+ },
+ {
+  "id": 21623,
+  "name": "Gauntlets of the Righteous Champion",
+  "quality": 4,
+  "boss": "Viscidus"
+ },
+ {
+  "id": 22399,
+  "name": "Idol of Health",
+  "quality": 4,
+  "boss": "Viscidus"
+ },
+ {
+  "id": 21677,
+  "name": "Ring of the Qiraji Fury",
+  "quality": 4,
+  "boss": "Viscidus"
+ },
+ {
+  "id": 21625,
+  "name": "Scarab Brooch",
+  "quality": 4,
+  "boss": "Viscidus"
+ },
+ {
+  "id": 21622,
+  "name": "Sharpened Silithid Femur",
+  "quality": 4,
+  "boss": "Viscidus"
+ },
+ {
+  "id": 21626,
+  "name": "Slime-coated Leggings",
+  "quality": 4,
+  "boss": "Viscidus"
+ },
+ {
+  "id": 20928,
+  "name": "Qiraji Bindings of Command",
+  "quality": 4,
+  "boss": "Viscidus / Princess Huhuran",
+  "allowable_classes": [
+   "warrior",
+   "hunter",
+   "rogue",
+   "priest"
+  ]
+ },
+ {
+  "id": 20932,
+  "name": "Qiraji Bindings of Dominance",
+  "quality": 4,
+  "boss": "Viscidus / Princess Huhuran",
+  "allowable_classes": [
+   "paladin",
+   "shaman",
+   "mage",
+   "warlock",
+   "druid"
+  ]
+ },
+ {
+  "id": 21621,
+  "name": "Cloak of the Golden Hive",
+  "quality": 4,
+  "boss": "Princess Huhuran"
+ },
+ {
+  "id": 21619,
+  "name": "Gloves of the Messiah",
+  "quality": 4,
+  "boss": "Princess Huhuran"
+ },
+ {
+  "id": 21618,
+  "name": "Hive Defiler Wristguards",
+  "quality": 4,
+  "boss": "Princess Huhuran"
+ },
+ {
+  "id": 21616,
+  "name": "Huhuran's Stinger",
+  "quality": 4,
+  "boss": "Princess Huhuran"
+ },
+ {
+  "id": 21620,
+  "name": "Ring of the Martyr",
+  "quality": 4,
+  "boss": "Princess Huhuran"
+ },
+ {
+  "id": 21617,
+  "name": "Wasphide Gauntlets",
+  "quality": 4,
+  "boss": "Princess Huhuran"
+ },
+ {
+  "id": 21608,
+  "name": "Amulet of Vek'nilash",
+  "quality": 4,
+  "boss": "Twin Emperors"
+ },
+ {
+  "id": 21606,
+  "name": "Belt of the Fallen Emperor",
+  "quality": 4,
+  "boss": "Twin Emperors"
+ },
+ {
+  "id": 21600,
+  "name": "Boots of Epiphany",
+  "quality": 4,
+  "boss": "Twin Emperors"
+ },
+ {
+  "id": 21604,
+  "name": "Bracelets of Royal Redemption",
+  "quality": 4,
+  "boss": "Twin Emperors"
+ },
+ {
+  "id": 20735,
+  "name": "Formula: Enchant Cloak - Subtlety",
+  "quality": 3,
+  "boss": "Twin Emperors"
+ },
+ {
+  "id": 20726,
+  "name": "Formula: Enchant Gloves - Threat",
+  "quality": 3,
+  "boss": "Twin Emperors"
+ },
+ {
+  "id": 21605,
+  "name": "Gloves of the Hidden Temple",
+  "quality": 4,
+  "boss": "Twin Emperors"
+ },
+ {
+  "id": 21607,
+  "name": "Grasp of the Fallen Emperor",
+  "quality": 4,
+  "boss": "Twin Emperors"
+ },
+ {
+  "id": 21679,
+  "name": "Kalimdor's Revenge",
+  "quality": 4,
+  "boss": "Twin Emperors"
+ },
+ {
+  "id": 21602,
+  "name": "Qiraji Execution Bracers",
+  "quality": 4,
+  "boss": "Twin Emperors"
+ },
+ {
+  "id": 21609,
+  "name": "Regenerating Belt of Vek'nilash",
+  "quality": 4,
+  "boss": "Twin Emperors"
+ },
+ {
+  "id": 21601,
+  "name": "Ring of Emperor Vek'lor",
+  "quality": 4,
+  "boss": "Twin Emperors"
+ },
+ {
+  "id": 21598,
+  "name": "Royal Qiraji Belt",
+  "quality": 4,
+  "boss": "Twin Emperors"
+ },
+ {
+  "id": 21597,
+  "name": "Royal Scepter of Vek'lor",
+  "quality": 4,
+  "boss": "Twin Emperors"
+ },
+ {
+  "id": 20930,
+  "name": "Vek'lor's Diadem",
+  "quality": 4,
+  "boss": "Twin Emperors",
+  "allowable_classes": [
+   "paladin",
+   "hunter",
+   "rogue",
+   "shaman",
+   "druid"
+  ]
+ },
+ {
+  "id": 21599,
+  "name": "Vek'lor's Gloves of Devastation",
+  "quality": 4,
+  "boss": "Twin Emperors"
+ },
+ {
+  "id": 20926,
+  "name": "Vek'nilash's Circlet",
+  "quality": 4,
+  "boss": "Twin Emperors",
+  "allowable_classes": [
+   "warrior",
+   "priest",
+   "mage",
+   "warlock"
+  ]
+ },
+ {
+  "id": 21611,
+  "name": "Burrower Bracers",
+  "quality": 4,
+  "boss": "Ouro"
+ },
+ {
+  "id": 21615,
+  "name": "Don Rigoberto's Lost Hat",
+  "quality": 4,
+  "boss": "Ouro"
+ },
+ {
+  "id": 23570,
+  "name": "Jom Gabbar",
+  "quality": 4,
+  "boss": "Ouro"
+ },
+ {
+  "id": 23557,
+  "name": "Larvae of the Great Worm",
+  "quality": 4,
+  "boss": "Ouro"
+ },
+ {
+  "id": 20927,
+  "name": "Ouro's Intact Hide",
+  "quality": 4,
+  "boss": "Ouro",
+  "allowable_classes": [
+   "warrior",
+   "rogue",
+   "priest",
+   "mage"
+  ]
+ },
+ {
+  "id": 20931,
+  "name": "Skin of the Great Sandworm",
+  "quality": 4,
+  "boss": "Ouro",
+  "allowable_classes": [
+   "paladin",
+   "hunter",
+   "shaman",
+   "warlock",
+   "druid"
+  ]
+ },
+ {
+  "id": 23558,
+  "name": "The Burrower's Shell",
+  "quality": 4,
+  "boss": "Ouro"
+ },
+ {
+  "id": 21610,
+  "name": "Wormscale Blocker",
+  "quality": 4,
+  "boss": "Ouro"
+ },
+ {
+  "id": 21586,
+  "name": "Belt of Never-ending Agony",
+  "quality": 4,
+  "boss": "C'Thun"
+ },
+ {
+  "id": 20929,
+  "name": "Carapace of the Old God",
+  "quality": 4,
+  "boss": "C'Thun",
+  "allowable_classes": [
+   "warrior",
+   "paladin",
+   "hunter",
+   "rogue",
+   "shaman"
+  ]
+ },
+ {
+  "id": 21583,
+  "name": "Cloak of Clarity",
+  "quality": 4,
+  "boss": "C'Thun"
+ },
+ {
+  "id": 22731,
+  "name": "Cloak of the Devoured",
+  "quality": 4,
+  "boss": "C'Thun"
+ },
+ {
+  "id": 21134,
+  "name": "Dark Edge of Insanity",
+  "quality": 4,
+  "boss": "C'Thun"
+ },
+ {
+  "id": 21585,
+  "name": "Dark Storm Gauntlets",
+  "quality": 4,
+  "boss": "C'Thun"
+ },
+ {
+  "id": 21126,
+  "name": "Death's Sting",
+  "quality": 4,
+  "boss": "C'Thun"
+ },
+ {
+  "id": 21221,
+  "name": "Eye of C'Thun",
+  "quality": 4,
+  "boss": "C'Thun"
+ },
+ {
+  "id": 22730,
+  "name": "Eyestalk Waist Cord",
+  "quality": 4,
+  "boss": "C'Thun"
+ },
+ {
+  "id": 21581,
+  "name": "Gauntlets of Annihilation",
+  "quality": 4,
+  "boss": "C'Thun"
+ },
+ {
+  "id": 21582,
+  "name": "Grasp of the Old God",
+  "quality": 4,
+  "boss": "C'Thun"
+ },
+ {
+  "id": 20933,
+  "name": "Husk of the Old God",
+  "quality": 4,
+  "boss": "C'Thun",
+  "allowable_classes": [
+   "priest",
+   "mage",
+   "warlock",
+   "druid"
+  ]
+ },
+ {
+  "id": 22732,
+  "name": "Mark of C'Thun",
+  "quality": 4,
+  "boss": "C'Thun"
+ },
+ {
+  "id": 21596,
+  "name": "Ring of the Godslayer",
+  "quality": 4,
+  "boss": "C'Thun"
+ },
+ {
+  "id": 21839,
+  "name": "Scepter of the False Prophet",
+  "quality": 4,
+  "boss": "C'Thun"
+ },
+ {
+  "id": 21579,
+  "name": "Vanquished Tentacle of C'Thun",
+  "quality": 4,
+  "boss": "C'Thun"
+ },
+ {
+  "id": 21837,
+  "name": "Anubisath Warhammer",
+  "quality": 4,
+  "boss": "Trash"
+ },
+ {
+  "id": 21838,
+  "name": "Garb of Royal Ascension",
+  "quality": 4,
+  "boss": "Trash"
+ },
+ {
+  "id": 21888,
+  "name": "Gloves of the Immortal",
+  "quality": 4,
+  "boss": "Trash"
+ },
+ {
+  "id": 21889,
+  "name": "Gloves of the Redeemed Prophecy",
+  "quality": 4,
+  "boss": "Trash",
+  "allowable_classes": [
+   "paladin"
+  ]
+ },
+ {
+  "id": 21856,
+  "name": "Neretzek, The Blood Drinker",
+  "quality": 4,
+  "boss": "Trash"
+ },
+ {
+  "id": 12728,
+  "name": "Plans: Invulnerable Mail",
+  "quality": 4,
+  "boss": "Trash"
+ },
+ {
+  "id": 12720,
+  "name": "Plans: Stronghold Gauntlets",
+  "quality": 4,
+  "boss": "Trash"
+ },
+ {
+  "id": 21836,
+  "name": "Ritssyn's Ring of Chaos",
+  "quality": 4,
+  "boss": "Trash"
+ },
+ {
+  "id": 21891,
+  "name": "Shard of the Fallen Star",
+  "quality": 4,
+  "boss": "Trash"
+ }
+]

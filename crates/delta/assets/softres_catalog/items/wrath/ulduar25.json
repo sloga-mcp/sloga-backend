@@ -1,0 +1,1522 @@
+[
+ {
+  "id": 45135,
+  "name": "Boots of Fiery Resolution",
+  "quality": 4,
+  "boss": "Flame Leviathan"
+ },
+ {
+  "id": 45117,
+  "name": "Constructor's Handwraps",
+  "quality": 4,
+  "boss": "Flame Leviathan"
+ },
+ {
+  "id": 45119,
+  "name": "Embrace of the Leviathan",
+  "quality": 4,
+  "boss": "Flame Leviathan"
+ },
+ {
+  "id": 45116,
+  "name": "Freya's Choker of Warding",
+  "quality": 4,
+  "boss": "Flame Leviathan"
+ },
+ {
+  "id": 45109,
+  "name": "Gloves of the Fiery Behemoth",
+  "quality": 4,
+  "boss": "Flame Leviathan"
+ },
+ {
+  "id": 45113,
+  "name": "Glowing Ring of Reclamation",
+  "quality": 4,
+  "boss": "Flame Leviathan"
+ },
+ {
+  "id": 45132,
+  "name": "Golden Saronite Dragon",
+  "quality": 4,
+  "boss": "Flame Leviathan"
+ },
+ {
+  "id": 45107,
+  "name": "Iron Riveted War Helm",
+  "quality": 4,
+  "boss": "Flame Leviathan"
+ },
+ {
+  "id": 45115,
+  "name": "Leviathan Fueling Manual",
+  "quality": 4,
+  "boss": "Flame Leviathan"
+ },
+ {
+  "id": 45108,
+  "name": "Mechanist's Bindings",
+  "quality": 4,
+  "boss": "Flame Leviathan"
+ },
+ {
+  "id": 45111,
+  "name": "Mimiron's Inferno Couplings",
+  "quality": 4,
+  "boss": "Flame Leviathan"
+ },
+ {
+  "id": 45133,
+  "name": "Pendant of Fiery Havoc",
+  "quality": 4,
+  "boss": "Flame Leviathan"
+ },
+ {
+  "id": 45134,
+  "name": "Plated Leggings of Ruination",
+  "quality": 4,
+  "boss": "Flame Leviathan"
+ },
+ {
+  "id": 45086,
+  "name": "Rising Sun",
+  "quality": 4,
+  "boss": "Flame Leviathan"
+ },
+ {
+  "id": 45136,
+  "name": "Shoulderpads of Dormant Energies",
+  "quality": 4,
+  "boss": "Flame Leviathan"
+ },
+ {
+  "id": 45114,
+  "name": "Steamcaller's Totem",
+  "quality": 4,
+  "boss": "Flame Leviathan"
+ },
+ {
+  "id": 45118,
+  "name": "Steamworker's Goggles",
+  "quality": 4,
+  "boss": "Flame Leviathan"
+ },
+ {
+  "id": 45106,
+  "name": "Strength of the Automaton",
+  "quality": 4,
+  "boss": "Flame Leviathan"
+ },
+ {
+  "id": 45112,
+  "name": "The Leviathan's Coil",
+  "quality": 4,
+  "boss": "Flame Leviathan"
+ },
+ {
+  "id": 45110,
+  "name": "Titanguard",
+  "quality": 4,
+  "boss": "Flame Leviathan"
+ },
+ {
+  "id": 45087,
+  "name": "Runed Orb",
+  "quality": 3,
+  "boss": "Flame Leviathan / Ignis the Furnace Master / Razorscale / XT-002 Deconstructor / Assembly of Iron / Kologarn / Auriaya / Hodir / Thorim / Freya / Mimiron / General Vezax / Yogg-Saron"
+ },
+ {
+  "id": 45038,
+  "name": "Fragment of Val'anyr",
+  "quality": 5,
+  "boss": "Flame Leviathan / Ignis the Furnace Master / Razorscale / XT-002 Deconstructor / Assembly of Iron / Kologarn / Auriaya / Hodir / Thorim / Freya / Mimiron / General Vezax / Yogg-Saron / Algalon the Observer",
+  "allowable_classes": [
+   "paladin",
+   "priest",
+   "shaman",
+   "druid"
+  ]
+ },
+ {
+  "id": 45166,
+  "name": "Charred Saronite Greaves",
+  "quality": 4,
+  "boss": "Ignis the Furnace Master"
+ },
+ {
+  "id": 45157,
+  "name": "Cindershard Ring",
+  "quality": 4,
+  "boss": "Ignis the Furnace Master"
+ },
+ {
+  "id": 45162,
+  "name": "Flamestalker Boots",
+  "quality": 4,
+  "boss": "Ignis the Furnace Master"
+ },
+ {
+  "id": 45185,
+  "name": "Flamewrought Cinch",
+  "quality": 4,
+  "boss": "Ignis the Furnace Master"
+ },
+ {
+  "id": 45161,
+  "name": "Girdle of Embers",
+  "quality": 4,
+  "boss": "Ignis the Furnace Master"
+ },
+ {
+  "id": 45158,
+  "name": "Heart of Iron",
+  "quality": 4,
+  "boss": "Ignis the Furnace Master"
+ },
+ {
+  "id": 45164,
+  "name": "Helm of the Furnace Master",
+  "quality": 4,
+  "boss": "Ignis the Furnace Master"
+ },
+ {
+  "id": 45171,
+  "name": "Intensity",
+  "quality": 4,
+  "boss": "Ignis the Furnace Master"
+ },
+ {
+  "id": 45167,
+  "name": "Lifeforge Breastplate",
+  "quality": 4,
+  "boss": "Ignis the Furnace Master"
+ },
+ {
+  "id": 45168,
+  "name": "Pyrelight Circle",
+  "quality": 4,
+  "boss": "Ignis the Furnace Master"
+ },
+ {
+  "id": 45170,
+  "name": "Scepter of Creation",
+  "quality": 4,
+  "boss": "Ignis the Furnace Master"
+ },
+ {
+  "id": 45186,
+  "name": "Soot-Covered Mantle",
+  "quality": 4,
+  "boss": "Ignis the Furnace Master"
+ },
+ {
+  "id": 45169,
+  "name": "Totem of the Dancing Flame",
+  "quality": 4,
+  "boss": "Ignis the Furnace Master"
+ },
+ {
+  "id": 45165,
+  "name": "Worldcarver",
+  "quality": 4,
+  "boss": "Ignis the Furnace Master"
+ },
+ {
+  "id": 45187,
+  "name": "Wristguards of the Firetender",
+  "quality": 4,
+  "boss": "Ignis the Furnace Master"
+ },
+ {
+  "id": 45151,
+  "name": "Belt of the Fallen Wyrm",
+  "quality": 4,
+  "boss": "Razorscale"
+ },
+ {
+  "id": 45149,
+  "name": "Bracers of the Broodmother",
+  "quality": 4,
+  "boss": "Razorscale"
+ },
+ {
+  "id": 45150,
+  "name": "Collar of the Wyrmhunter",
+  "quality": 4,
+  "boss": "Razorscale"
+ },
+ {
+  "id": 45139,
+  "name": "Dragonslayer's Brace",
+  "quality": 4,
+  "boss": "Razorscale"
+ },
+ {
+  "id": 45138,
+  "name": "Drape of the Drakerider",
+  "quality": 4,
+  "boss": "Razorscale"
+ },
+ {
+  "id": 45147,
+  "name": "Guiding Star",
+  "quality": 4,
+  "boss": "Razorscale"
+ },
+ {
+  "id": 45510,
+  "name": "Libram of Discord",
+  "quality": 4,
+  "boss": "Razorscale"
+ },
+ {
+  "id": 45148,
+  "name": "Living Flame",
+  "quality": 4,
+  "boss": "Razorscale"
+ },
+ {
+  "id": 45141,
+  "name": "Proto-hide Leggings",
+  "quality": 4,
+  "boss": "Razorscale"
+ },
+ {
+  "id": 45140,
+  "name": "Razorscale Shoulderguards",
+  "quality": 4,
+  "boss": "Razorscale"
+ },
+ {
+  "id": 45142,
+  "name": "Remorse",
+  "quality": 4,
+  "boss": "Razorscale"
+ },
+ {
+  "id": 45143,
+  "name": "Saronite Mesh Legguards",
+  "quality": 4,
+  "boss": "Razorscale"
+ },
+ {
+  "id": 45146,
+  "name": "Shackles of the Odalisque",
+  "quality": 4,
+  "boss": "Razorscale"
+ },
+ {
+  "id": 45144,
+  "name": "Sigil of Deflection",
+  "quality": 4,
+  "boss": "Razorscale"
+ },
+ {
+  "id": 45137,
+  "name": "Veranus' Bane",
+  "quality": 4,
+  "boss": "Razorscale"
+ },
+ {
+  "id": 45260,
+  "name": "Boots of Hasty Revival",
+  "quality": 4,
+  "boss": "XT-002 Deconstructor"
+ },
+ {
+  "id": 45249,
+  "name": "Brass-lined Boots",
+  "quality": 4,
+  "boss": "XT-002 Deconstructor"
+ },
+ {
+  "id": 45445,
+  "name": "Breastplate of the Devoted",
+  "quality": 4,
+  "boss": "XT-002 Deconstructor"
+ },
+ {
+  "id": 45443,
+  "name": "Charm of Meticulous Timing",
+  "quality": 4,
+  "boss": "XT-002 Deconstructor"
+ },
+ {
+  "id": 45248,
+  "name": "Clockwork Legplates",
+  "quality": 4,
+  "boss": "XT-002 Deconstructor"
+ },
+ {
+  "id": 45250,
+  "name": "Crazed Construct Ring",
+  "quality": 4,
+  "boss": "XT-002 Deconstructor"
+ },
+ {
+  "id": 45444,
+  "name": "Gloves of the Steady Hand",
+  "quality": 4,
+  "boss": "XT-002 Deconstructor"
+ },
+ {
+  "id": 45246,
+  "name": "Golem-Shard Sticker",
+  "quality": 4,
+  "boss": "XT-002 Deconstructor"
+ },
+ {
+  "id": 45446,
+  "name": "Grasps of Reason",
+  "quality": 4,
+  "boss": "XT-002 Deconstructor"
+ },
+ {
+  "id": 45252,
+  "name": "Horologist's Wristguards",
+  "quality": 4,
+  "boss": "XT-002 Deconstructor"
+ },
+ {
+  "id": 45253,
+  "name": "Mantle of Wavering Calm",
+  "quality": 4,
+  "boss": "XT-002 Deconstructor"
+ },
+ {
+  "id": 45257,
+  "name": "Quartz Crystal Wand",
+  "quality": 4,
+  "boss": "XT-002 Deconstructor"
+ },
+ {
+  "id": 45259,
+  "name": "Quartz-studded Harness",
+  "quality": 4,
+  "boss": "XT-002 Deconstructor"
+ },
+ {
+  "id": 45258,
+  "name": "Sandals of Rash Temperament",
+  "quality": 4,
+  "boss": "XT-002 Deconstructor"
+ },
+ {
+  "id": 45251,
+  "name": "Shoulderplates of the Deconstructor",
+  "quality": 4,
+  "boss": "XT-002 Deconstructor"
+ },
+ {
+  "id": 45254,
+  "name": "Sigil of the Vengeful Heart",
+  "quality": 4,
+  "boss": "XT-002 Deconstructor"
+ },
+ {
+  "id": 45247,
+  "name": "Signet of the Earthshaker",
+  "quality": 4,
+  "boss": "XT-002 Deconstructor"
+ },
+ {
+  "id": 45442,
+  "name": "Sorthalis, Hammer of the Watchers",
+  "quality": 4,
+  "boss": "XT-002 Deconstructor"
+ },
+ {
+  "id": 45255,
+  "name": "Thunderfall Totem",
+  "quality": 4,
+  "boss": "XT-002 Deconstructor"
+ },
+ {
+  "id": 45256,
+  "name": "Twisted Visage",
+  "quality": 4,
+  "boss": "XT-002 Deconstructor"
+ },
+ {
+  "id": 45226,
+  "name": "Ancient Iron Heaume",
+  "quality": 4,
+  "boss": "Assembly of Iron"
+ },
+ {
+  "id": 45857,
+  "name": "Archivum Data Disc",
+  "quality": 4,
+  "boss": "Assembly of Iron"
+ },
+ {
+  "id": 45241,
+  "name": "Belt of Colossal Rage",
+  "quality": 4,
+  "boss": "Assembly of Iron"
+ },
+ {
+  "id": 45242,
+  "name": "Drape of Mortal Downfall",
+  "quality": 4,
+  "boss": "Assembly of Iron"
+ },
+ {
+  "id": 45224,
+  "name": "Drape of the Lithe",
+  "quality": 4,
+  "boss": "Assembly of Iron"
+ },
+ {
+  "id": 45244,
+  "name": "Greaves of Swift Vengeance",
+  "quality": 4,
+  "boss": "Assembly of Iron"
+ },
+ {
+  "id": 45228,
+  "name": "Handguards of the Enclave",
+  "quality": 4,
+  "boss": "Assembly of Iron"
+ },
+ {
+  "id": 45193,
+  "name": "Insurmountable Fervor",
+  "quality": 4,
+  "boss": "Assembly of Iron"
+ },
+ {
+  "id": 45227,
+  "name": "Iron-studded Mantle",
+  "quality": 4,
+  "boss": "Assembly of Iron"
+ },
+ {
+  "id": 45238,
+  "name": "Overload Legwraps",
+  "quality": 4,
+  "boss": "Assembly of Iron"
+ },
+ {
+  "id": 45237,
+  "name": "Phaelia's Vestments of the Sprouting Seed",
+  "quality": 4,
+  "boss": "Assembly of Iron"
+ },
+ {
+  "id": 45235,
+  "name": "Radiant Seal",
+  "quality": 4,
+  "boss": "Assembly of Iron"
+ },
+ {
+  "id": 45240,
+  "name": "Raiments of the Iron Council",
+  "quality": 4,
+  "boss": "Assembly of Iron"
+ },
+ {
+  "id": 45234,
+  "name": "Rapture",
+  "quality": 4,
+  "boss": "Assembly of Iron"
+ },
+ {
+  "id": 45232,
+  "name": "Runed Ironhide Boots",
+  "quality": 4,
+  "boss": "Assembly of Iron"
+ },
+ {
+  "id": 45239,
+  "name": "Runeshaper's Gloves",
+  "quality": 4,
+  "boss": "Assembly of Iron"
+ },
+ {
+  "id": 45243,
+  "name": "Sapphire Amulet of Renewal",
+  "quality": 4,
+  "boss": "Assembly of Iron"
+ },
+ {
+  "id": 45245,
+  "name": "Shoulderpads of the Intruder",
+  "quality": 4,
+  "boss": "Assembly of Iron"
+ },
+ {
+  "id": 45225,
+  "name": "Steelbreaker's Embrace",
+  "quality": 4,
+  "boss": "Assembly of Iron"
+ },
+ {
+  "id": 45233,
+  "name": "Stormrune Edge",
+  "quality": 4,
+  "boss": "Assembly of Iron"
+ },
+ {
+  "id": 45236,
+  "name": "Unblinking Eye",
+  "quality": 4,
+  "boss": "Assembly of Iron"
+ },
+ {
+  "id": 45607,
+  "name": "Fang of Oblivion",
+  "quality": 4,
+  "boss": "Assembly of Iron / Algalon the Observer"
+ },
+ {
+  "id": 45275,
+  "name": "Bracers of Unleashed Magic",
+  "quality": 4,
+  "boss": "Kologarn"
+ },
+ {
+  "id": 45264,
+  "name": "Decimator's Armguards",
+  "quality": 4,
+  "boss": "Kologarn"
+ },
+ {
+  "id": 45261,
+  "name": "Giant's Bane",
+  "quality": 4,
+  "boss": "Kologarn"
+ },
+ {
+  "id": 45268,
+  "name": "Gloves of the Pythonic Guardian",
+  "quality": 4,
+  "boss": "Kologarn"
+ },
+ {
+  "id": 45273,
+  "name": "Handwraps of Plentiful Recovery",
+  "quality": 4,
+  "boss": "Kologarn"
+ },
+ {
+  "id": 45270,
+  "name": "Idol of the Crying Wind",
+  "quality": 4,
+  "boss": "Kologarn"
+ },
+ {
+  "id": 45271,
+  "name": "Ironmender",
+  "quality": 4,
+  "boss": "Kologarn"
+ },
+ {
+  "id": 45274,
+  "name": "Leggings of the Stoneweaver",
+  "quality": 4,
+  "boss": "Kologarn"
+ },
+ {
+  "id": 45266,
+  "name": "Malice",
+  "quality": 4,
+  "boss": "Kologarn"
+ },
+ {
+  "id": 45262,
+  "name": "Necklace of Unerring Mettle",
+  "quality": 4,
+  "boss": "Kologarn"
+ },
+ {
+  "id": 45272,
+  "name": "Robes of the Umbral Brute",
+  "quality": 4,
+  "boss": "Kologarn"
+ },
+ {
+  "id": 45267,
+  "name": "Saronite Plated Legguards",
+  "quality": 4,
+  "boss": "Kologarn"
+ },
+ {
+  "id": 45265,
+  "name": "Shoulderpads of the Monolith",
+  "quality": 4,
+  "boss": "Kologarn"
+ },
+ {
+  "id": 45269,
+  "name": "Unfaltering Armguards",
+  "quality": 4,
+  "boss": "Kologarn"
+ },
+ {
+  "id": 45263,
+  "name": "Wrathstone",
+  "quality": 4,
+  "boss": "Kologarn"
+ },
+ {
+  "id": 45440,
+  "name": "Amice of the Stoic Watch",
+  "quality": 4,
+  "boss": "Auriaya"
+ },
+ {
+  "id": 45319,
+  "name": "Cloak of the Makers",
+  "quality": 4,
+  "boss": "Auriaya"
+ },
+ {
+  "id": 45435,
+  "name": "Cowl of the Absolute",
+  "quality": 4,
+  "boss": "Auriaya"
+ },
+ {
+  "id": 45325,
+  "name": "Gloves of the Stonereaper",
+  "quality": 4,
+  "boss": "Auriaya"
+ },
+ {
+  "id": 45434,
+  "name": "Greaves of the Rockmender",
+  "quality": 4,
+  "boss": "Auriaya"
+ },
+ {
+  "id": 45436,
+  "name": "Libram of the Resolute",
+  "quality": 4,
+  "boss": "Auriaya"
+ },
+ {
+  "id": 45326,
+  "name": "Platinum Band of the Aesir",
+  "quality": 4,
+  "boss": "Auriaya"
+ },
+ {
+  "id": 45438,
+  "name": "Ring of the Faithful Servant",
+  "quality": 4,
+  "boss": "Auriaya"
+ },
+ {
+  "id": 45437,
+  "name": "Runescribed Blade",
+  "quality": 4,
+  "boss": "Auriaya"
+ },
+ {
+  "id": 45441,
+  "name": "Sandals of the Ancient Keeper",
+  "quality": 4,
+  "boss": "Auriaya"
+ },
+ {
+  "id": 45320,
+  "name": "Shoulderplates of the Eternal",
+  "quality": 4,
+  "boss": "Auriaya"
+ },
+ {
+  "id": 45327,
+  "name": "Siren's Cry",
+  "quality": 4,
+  "boss": "Auriaya"
+ },
+ {
+  "id": 45315,
+  "name": "Stonerender",
+  "quality": 4,
+  "boss": "Auriaya"
+ },
+ {
+  "id": 45334,
+  "name": "Unbreakable Chestguard",
+  "quality": 4,
+  "boss": "Auriaya"
+ },
+ {
+  "id": 45439,
+  "name": "Unwavering Stare",
+  "quality": 4,
+  "boss": "Auriaya"
+ },
+ {
+  "id": 45632,
+  "name": "Breastplate of the Wayward Conqueror",
+  "quality": 4,
+  "boss": "Hodir",
+  "allowable_classes": [
+   "paladin",
+   "priest",
+   "warlock"
+  ]
+ },
+ {
+  "id": 45633,
+  "name": "Breastplate of the Wayward Protector",
+  "quality": 4,
+  "boss": "Hodir",
+  "allowable_classes": [
+   "warrior",
+   "hunter",
+   "shaman"
+  ]
+ },
+ {
+  "id": 45634,
+  "name": "Breastplate of the Wayward Vanquisher",
+  "quality": 4,
+  "boss": "Hodir",
+  "allowable_classes": [
+   "rogue",
+   "deathknight",
+   "mage",
+   "druid"
+  ]
+ },
+ {
+  "id": 45454,
+  "name": "Frost-bound Chain Bracers",
+  "quality": 4,
+  "boss": "Hodir"
+ },
+ {
+  "id": 45452,
+  "name": "Frostplate Greaves",
+  "quality": 4,
+  "boss": "Hodir"
+ },
+ {
+  "id": 45451,
+  "name": "Frozen Loop",
+  "quality": 4,
+  "boss": "Hodir"
+ },
+ {
+  "id": 45450,
+  "name": "Northern Barrier",
+  "quality": 4,
+  "boss": "Hodir"
+ },
+ {
+  "id": 45453,
+  "name": "Winter's Icy Embrace",
+  "quality": 4,
+  "boss": "Hodir"
+ },
+ {
+  "id": 45467,
+  "name": "Belt of the Betrayed",
+  "quality": 4,
+  "boss": "Thorim"
+ },
+ {
+  "id": 45638,
+  "name": "Crown of the Wayward Conqueror",
+  "quality": 4,
+  "boss": "Thorim",
+  "allowable_classes": [
+   "paladin",
+   "priest",
+   "warlock"
+  ]
+ },
+ {
+  "id": 45639,
+  "name": "Crown of the Wayward Protector",
+  "quality": 4,
+  "boss": "Thorim",
+  "allowable_classes": [
+   "warrior",
+   "hunter",
+   "shaman"
+  ]
+ },
+ {
+  "id": 45640,
+  "name": "Crown of the Wayward Vanquisher",
+  "quality": 4,
+  "boss": "Thorim",
+  "allowable_classes": [
+   "rogue",
+   "deathknight",
+   "mage",
+   "druid"
+  ]
+ },
+ {
+  "id": 45473,
+  "name": "Embrace of the Gladiator",
+  "quality": 4,
+  "boss": "Thorim"
+ },
+ {
+  "id": 45471,
+  "name": "Fate's Clutch",
+  "quality": 4,
+  "boss": "Thorim"
+ },
+ {
+  "id": 45468,
+  "name": "Leggings of Lost Love",
+  "quality": 4,
+  "boss": "Thorim"
+ },
+ {
+  "id": 45474,
+  "name": "Pauldrons of the Combatant",
+  "quality": 4,
+  "boss": "Thorim"
+ },
+ {
+  "id": 45466,
+  "name": "Scale of Fates",
+  "quality": 4,
+  "boss": "Thorim"
+ },
+ {
+  "id": 45469,
+  "name": "Sif's Promise",
+  "quality": 4,
+  "boss": "Thorim"
+ },
+ {
+  "id": 45463,
+  "name": "Vulmir, the Northern Tempest",
+  "quality": 4,
+  "boss": "Thorim"
+ },
+ {
+  "id": 45472,
+  "name": "Warhelm of the Champion",
+  "quality": 4,
+  "boss": "Thorim"
+ },
+ {
+  "id": 45470,
+  "name": "Wisdom's Hold",
+  "quality": 4,
+  "boss": "Thorim"
+ },
+ {
+  "id": 45570,
+  "name": "Skyforge Crossbow",
+  "quality": 4,
+  "boss": "Thorim / Algalon the Observer"
+ },
+ {
+  "id": 46110,
+  "name": "Alchemist's Cache",
+  "quality": 3,
+  "boss": "Freya"
+ },
+ {
+  "id": 45484,
+  "name": "Bladetwister",
+  "quality": 4,
+  "boss": "Freya"
+ },
+ {
+  "id": 45483,
+  "name": "Boots of the Servant",
+  "quality": 4,
+  "boss": "Freya"
+ },
+ {
+  "id": 45485,
+  "name": "Bronze Pendant of the Vanir",
+  "quality": 4,
+  "boss": "Freya"
+ },
+ {
+  "id": 45486,
+  "name": "Drape of the Sullen Goddess",
+  "quality": 4,
+  "boss": "Freya"
+ },
+ {
+  "id": 45481,
+  "name": "Gauntlets of Ruthless Reprisal",
+  "quality": 4,
+  "boss": "Freya"
+ },
+ {
+  "id": 45487,
+  "name": "Handguards of Revitalization",
+  "quality": 4,
+  "boss": "Freya"
+ },
+ {
+  "id": 45488,
+  "name": "Leggings of the Enslaved Idol",
+  "quality": 4,
+  "boss": "Freya"
+ },
+ {
+  "id": 45482,
+  "name": "Leggings of the Lifetender",
+  "quality": 4,
+  "boss": "Freya"
+ },
+ {
+  "id": 45653,
+  "name": "Legplates of the Wayward Conqueror",
+  "quality": 4,
+  "boss": "Freya",
+  "allowable_classes": [
+   "paladin",
+   "priest",
+   "warlock"
+  ]
+ },
+ {
+  "id": 45654,
+  "name": "Legplates of the Wayward Protector",
+  "quality": 4,
+  "boss": "Freya",
+  "allowable_classes": [
+   "warrior",
+   "hunter",
+   "shaman"
+  ]
+ },
+ {
+  "id": 45655,
+  "name": "Legplates of the Wayward Vanquisher",
+  "quality": 4,
+  "boss": "Freya",
+  "allowable_classes": [
+   "rogue",
+   "deathknight",
+   "mage",
+   "druid"
+  ]
+ },
+ {
+  "id": 45480,
+  "name": "Nymph Heart Charm",
+  "quality": 4,
+  "boss": "Freya"
+ },
+ {
+  "id": 45479,
+  "name": "The Lifebinder",
+  "quality": 4,
+  "boss": "Freya"
+ },
+ {
+  "id": 45613,
+  "name": "Dreambinder",
+  "quality": 4,
+  "boss": "Freya / Algalon the Observer"
+ },
+ {
+  "id": 45663,
+  "name": "Armbands of Bedlam",
+  "quality": 4,
+  "boss": "Mimiron"
+ },
+ {
+  "id": 45493,
+  "name": "Asimov's Drape",
+  "quality": 4,
+  "boss": "Mimiron"
+ },
+ {
+  "id": 45495,
+  "name": "Conductive Seal",
+  "quality": 4,
+  "boss": "Mimiron"
+ },
+ {
+  "id": 45497,
+  "name": "Crown of Luminescence",
+  "quality": 4,
+  "boss": "Mimiron"
+ },
+ {
+  "id": 45494,
+  "name": "Delirium's Touch",
+  "quality": 4,
+  "boss": "Mimiron"
+ },
+ {
+  "id": 45641,
+  "name": "Gauntlets of the Wayward Conqueror",
+  "quality": 4,
+  "boss": "Mimiron",
+  "allowable_classes": [
+   "paladin",
+   "priest",
+   "warlock"
+  ]
+ },
+ {
+  "id": 45642,
+  "name": "Gauntlets of the Wayward Protector",
+  "quality": 4,
+  "boss": "Mimiron",
+  "allowable_classes": [
+   "warrior",
+   "hunter",
+   "shaman"
+  ]
+ },
+ {
+  "id": 45643,
+  "name": "Gauntlets of the Wayward Vanquisher",
+  "quality": 4,
+  "boss": "Mimiron",
+  "allowable_classes": [
+   "rogue",
+   "deathknight",
+   "mage",
+   "druid"
+  ]
+ },
+ {
+  "id": 45489,
+  "name": "Insanity's Grip",
+  "quality": 4,
+  "boss": "Mimiron"
+ },
+ {
+  "id": 45492,
+  "name": "Malleable Steelweave Mantle",
+  "quality": 4,
+  "boss": "Mimiron"
+ },
+ {
+  "id": 45490,
+  "name": "Pandora's Plea",
+  "quality": 4,
+  "boss": "Mimiron"
+ },
+ {
+  "id": 45496,
+  "name": "Titanskin Cloak",
+  "quality": 4,
+  "boss": "Mimiron"
+ },
+ {
+  "id": 45491,
+  "name": "Waistguard of the Creator",
+  "quality": 4,
+  "boss": "Mimiron"
+ },
+ {
+  "id": 45620,
+  "name": "Starshard Edge",
+  "quality": 4,
+  "boss": "Mimiron / Algalon the Observer"
+ },
+ {
+  "id": 45505,
+  "name": "Belt of Clinging Hope",
+  "quality": 4,
+  "boss": "General Vezax"
+ },
+ {
+  "id": 45508,
+  "name": "Belt of the Darkspeaker",
+  "quality": 4,
+  "boss": "General Vezax"
+ },
+ {
+  "id": 45513,
+  "name": "Boots of the Forgotten Depths",
+  "quality": 4,
+  "boss": "General Vezax"
+ },
+ {
+  "id": 45501,
+  "name": "Boots of the Underdweller",
+  "quality": 4,
+  "boss": "General Vezax"
+ },
+ {
+  "id": 45504,
+  "name": "Darkcore Leggings",
+  "quality": 4,
+  "boss": "General Vezax"
+ },
+ {
+  "id": 45518,
+  "name": "Flare of the Heavens",
+  "quality": 4,
+  "boss": "General Vezax"
+ },
+ {
+  "id": 45512,
+  "name": "Grips of the Unbroken",
+  "quality": 4,
+  "boss": "General Vezax"
+ },
+ {
+  "id": 45520,
+  "name": "Handwraps of the Vigilant",
+  "quality": 4,
+  "boss": "General Vezax"
+ },
+ {
+  "id": 45502,
+  "name": "Helm of the Faceless",
+  "quality": 4,
+  "boss": "General Vezax"
+ },
+ {
+  "id": 45509,
+  "name": "Idol of the Corruptor",
+  "quality": 4,
+  "boss": "General Vezax"
+ },
+ {
+  "id": 45145,
+  "name": "Libram of the Sacred Shield",
+  "quality": 4,
+  "boss": "General Vezax"
+ },
+ {
+  "id": 45498,
+  "name": "Lotrafen, Spear of the Damned",
+  "quality": 4,
+  "boss": "General Vezax"
+ },
+ {
+  "id": 45514,
+  "name": "Mantle of the Unknowing",
+  "quality": 4,
+  "boss": "General Vezax"
+ },
+ {
+  "id": 45503,
+  "name": "Metallic Loop of the Sufferer",
+  "quality": 4,
+  "boss": "General Vezax"
+ },
+ {
+  "id": 45517,
+  "name": "Pendulum of Infinity",
+  "quality": 4,
+  "boss": "General Vezax"
+ },
+ {
+  "id": 45515,
+  "name": "Ring of the Vacant Eye",
+  "quality": 4,
+  "boss": "General Vezax"
+ },
+ {
+  "id": 45511,
+  "name": "Scepter of Lost Souls",
+  "quality": 4,
+  "boss": "General Vezax"
+ },
+ {
+  "id": 45507,
+  "name": "The General's Heart",
+  "quality": 4,
+  "boss": "General Vezax"
+ },
+ {
+  "id": 45519,
+  "name": "Vestments of the Blind Denizen",
+  "quality": 4,
+  "boss": "General Vezax"
+ },
+ {
+  "id": 45516,
+  "name": "Voldrethar, Dark Blade of Oblivion",
+  "quality": 4,
+  "boss": "General Vezax"
+ },
+ {
+  "id": 45522,
+  "name": "Blood of the Old God",
+  "quality": 4,
+  "boss": "Yogg-Saron"
+ },
+ {
+  "id": 45524,
+  "name": "Chestguard of Insidious Intent",
+  "quality": 4,
+  "boss": "Yogg-Saron"
+ },
+ {
+  "id": 45531,
+  "name": "Chestguard of the Fallen God",
+  "quality": 4,
+  "boss": "Yogg-Saron"
+ },
+ {
+  "id": 45532,
+  "name": "Cowl of Dark Whispers",
+  "quality": 4,
+  "boss": "Yogg-Saron"
+ },
+ {
+  "id": 45533,
+  "name": "Dark Edge of Depravity",
+  "quality": 4,
+  "boss": "Yogg-Saron"
+ },
+ {
+  "id": 45521,
+  "name": "Earthshaper",
+  "quality": 4,
+  "boss": "Yogg-Saron"
+ },
+ {
+  "id": 45523,
+  "name": "Garona's Guise",
+  "quality": 4,
+  "boss": "Yogg-Saron"
+ },
+ {
+  "id": 45525,
+  "name": "Godbane Signet",
+  "quality": 4,
+  "boss": "Yogg-Saron"
+ },
+ {
+  "id": 45536,
+  "name": "Legguards of Cunning Deception",
+  "quality": 4,
+  "boss": "Yogg-Saron"
+ },
+ {
+  "id": 45656,
+  "name": "Mantle of the Wayward Conqueror",
+  "quality": 4,
+  "boss": "Yogg-Saron",
+  "allowable_classes": [
+   "paladin",
+   "priest",
+   "warlock"
+  ]
+ },
+ {
+  "id": 45657,
+  "name": "Mantle of the Wayward Protector",
+  "quality": 4,
+  "boss": "Yogg-Saron",
+  "allowable_classes": [
+   "warrior",
+   "hunter",
+   "shaman"
+  ]
+ },
+ {
+  "id": 45658,
+  "name": "Mantle of the Wayward Vanquisher",
+  "quality": 4,
+  "boss": "Yogg-Saron",
+  "allowable_classes": [
+   "rogue",
+   "deathknight",
+   "mage",
+   "druid"
+  ]
+ },
+ {
+  "id": 45693,
+  "name": "Mimiron's Head",
+  "quality": 4,
+  "boss": "Yogg-Saron"
+ },
+ {
+  "id": 45530,
+  "name": "Sanity's Bond",
+  "quality": 4,
+  "boss": "Yogg-Saron"
+ },
+ {
+  "id": 45534,
+  "name": "Seal of the Betrayed King",
+  "quality": 4,
+  "boss": "Yogg-Saron"
+ },
+ {
+  "id": 45529,
+  "name": "Shawl of Haunted Memories",
+  "quality": 4,
+  "boss": "Yogg-Saron"
+ },
+ {
+  "id": 45535,
+  "name": "Show of Faith",
+  "quality": 4,
+  "boss": "Yogg-Saron"
+ },
+ {
+  "id": 45527,
+  "name": "Soulscribe",
+  "quality": 4,
+  "boss": "Yogg-Saron"
+ },
+ {
+  "id": 45537,
+  "name": "Treads of the False Oracle",
+  "quality": 4,
+  "boss": "Yogg-Saron"
+ },
+ {
+  "id": 45610,
+  "name": "Boundless Gaze",
+  "quality": 4,
+  "boss": "Algalon the Observer"
+ },
+ {
+  "id": 45587,
+  "name": "Bulwark of Algalon",
+  "quality": 4,
+  "boss": "Algalon the Observer"
+ },
+ {
+  "id": 45609,
+  "name": "Comet's Trail",
+  "quality": 4,
+  "boss": "Algalon the Observer"
+ },
+ {
+  "id": 45612,
+  "name": "Constellus",
+  "quality": 4,
+  "boss": "Algalon the Observer"
+ },
+ {
+  "id": 45617,
+  "name": "Cosmos",
+  "quality": 4,
+  "boss": "Algalon the Observer"
+ },
+ {
+  "id": 45594,
+  "name": "Legplates of the Endless Void",
+  "quality": 4,
+  "boss": "Algalon the Observer"
+ },
+ {
+  "id": 45665,
+  "name": "Pharos Gloves",
+  "quality": 4,
+  "boss": "Algalon the Observer"
+ },
+ {
+  "id": 45615,
+  "name": "Planewalker Treads",
+  "quality": 4,
+  "boss": "Algalon the Observer"
+ },
+ {
+  "id": 46053,
+  "name": "Reply-Code Alpha",
+  "quality": 4,
+  "boss": "Algalon the Observer"
+ },
+ {
+  "id": 45599,
+  "name": "Sabatons of Lifeless Night",
+  "quality": 4,
+  "boss": "Algalon the Observer"
+ },
+ {
+  "id": 45611,
+  "name": "Solar Bindings",
+  "quality": 4,
+  "boss": "Algalon the Observer"
+ },
+ {
+  "id": 45616,
+  "name": "Star-beaded Clutch",
+  "quality": 4,
+  "boss": "Algalon the Observer"
+ },
+ {
+  "id": 45619,
+  "name": "Starwatcher's Binding",
+  "quality": 4,
+  "boss": "Algalon the Observer"
+ },
+ {
+  "id": 45548,
+  "name": "Belt of the Sleeper",
+  "quality": 4,
+  "boss": "Trash"
+ },
+ {
+  "id": 45540,
+  "name": "Bladebearer's Signet",
+  "quality": 4,
+  "boss": "Trash"
+ },
+ {
+  "id": 45605,
+  "name": "Daschal's Bite",
+  "quality": 4,
+  "boss": "Trash"
+ },
+ {
+  "id": 45542,
+  "name": "Greaves of the Stonewarder",
+  "quality": 4,
+  "boss": "Trash"
+ },
+ {
+  "id": 45549,
+  "name": "Grips of Chaos",
+  "quality": 4,
+  "boss": "Trash"
+ },
+ {
+  "id": 46138,
+  "name": "Idol of the Flourishing Life",
+  "quality": 4,
+  "boss": "Trash"
+ },
+ {
+  "id": 45544,
+  "name": "Leggings of the Tortured Earth",
+  "quality": 4,
+  "boss": "Trash"
+ },
+ {
+  "id": 45539,
+  "name": "Pendant of Focused Energies",
+  "quality": 4,
+  "boss": "Trash"
+ },
+ {
+  "id": 45547,
+  "name": "Relic Hunter's Cord",
+  "quality": 4,
+  "boss": "Trash"
+ },
+ {
+  "id": 45543,
+  "name": "Shoulders of Misfortune",
+  "quality": 4,
+  "boss": "Trash"
+ },
+ {
+  "id": 45541,
+  "name": "Shroud of Alteration",
+  "quality": 4,
+  "boss": "Trash"
+ },
+ {
+  "id": 45538,
+  "name": "Titanstone Pendant",
+  "quality": 4,
+  "boss": "Trash"
+ }
+]

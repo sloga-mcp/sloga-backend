@@ -1,0 +1,1025 @@
+[
+ {
+  "id": 19336,
+  "name": "Arcane Infused Gem",
+  "quality": 4,
+  "boss": "Razorgore the Untamed",
+  "allowable_classes": [
+   "hunter"
+  ]
+ },
+ {
+  "id": 16926,
+  "name": "Bindings of Transcendence",
+  "quality": 4,
+  "boss": "Razorgore the Untamed",
+  "allowable_classes": [
+   "priest"
+  ]
+ },
+ {
+  "id": 16911,
+  "name": "Bloodfang Bracers",
+  "quality": 4,
+  "boss": "Razorgore the Untamed",
+  "allowable_classes": [
+   "rogue"
+  ]
+ },
+ {
+  "id": 16959,
+  "name": "Bracelets of Wrath",
+  "quality": 4,
+  "boss": "Razorgore the Untamed",
+  "allowable_classes": [
+   "warrior"
+  ]
+ },
+ {
+  "id": 16943,
+  "name": "Bracers of Ten Storms",
+  "quality": 4,
+  "boss": "Razorgore the Untamed",
+  "allowable_classes": [
+   "shaman"
+  ]
+ },
+ {
+  "id": 16935,
+  "name": "Dragonstalker's Bracers",
+  "quality": 4,
+  "boss": "Razorgore the Untamed",
+  "allowable_classes": [
+   "hunter"
+  ]
+ },
+ {
+  "id": 19369,
+  "name": "Gloves of Rapid Evolution",
+  "quality": 4,
+  "boss": "Razorgore the Untamed"
+ },
+ {
+  "id": 16951,
+  "name": "Judgement Bindings",
+  "quality": 4,
+  "boss": "Razorgore the Untamed",
+  "allowable_classes": [
+   "paladin"
+  ]
+ },
+ {
+  "id": 19370,
+  "name": "Mantle of the Blackwing Cabal",
+  "quality": 4,
+  "boss": "Razorgore the Untamed"
+ },
+ {
+  "id": 16934,
+  "name": "Nemesis Bracers",
+  "quality": 4,
+  "boss": "Razorgore the Untamed",
+  "allowable_classes": [
+   "warlock"
+  ]
+ },
+ {
+  "id": 16918,
+  "name": "Netherwind Bindings",
+  "quality": 4,
+  "boss": "Razorgore the Untamed",
+  "allowable_classes": [
+   "mage"
+  ]
+ },
+ {
+  "id": 19335,
+  "name": "Spineshatter",
+  "quality": 4,
+  "boss": "Razorgore the Untamed"
+ },
+ {
+  "id": 16904,
+  "name": "Stormrage Bracers",
+  "quality": 4,
+  "boss": "Razorgore the Untamed",
+  "allowable_classes": [
+   "druid"
+  ]
+ },
+ {
+  "id": 19337,
+  "name": "The Black Book",
+  "quality": 4,
+  "boss": "Razorgore the Untamed",
+  "allowable_classes": [
+   "warlock"
+  ]
+ },
+ {
+  "id": 19334,
+  "name": "The Untamed Blade",
+  "quality": 4,
+  "boss": "Razorgore the Untamed"
+ },
+ {
+  "id": 16944,
+  "name": "Belt of Ten Storms",
+  "quality": 4,
+  "boss": "Vaelastrasz the Corrupt",
+  "allowable_classes": [
+   "shaman"
+  ]
+ },
+ {
+  "id": 16925,
+  "name": "Belt of Transcendence",
+  "quality": 4,
+  "boss": "Vaelastrasz the Corrupt",
+  "allowable_classes": [
+   "priest"
+  ]
+ },
+ {
+  "id": 16910,
+  "name": "Bloodfang Belt",
+  "quality": 4,
+  "boss": "Vaelastrasz the Corrupt",
+  "allowable_classes": [
+   "rogue"
+  ]
+ },
+ {
+  "id": 19346,
+  "name": "Dragonfang Blade",
+  "quality": 4,
+  "boss": "Vaelastrasz the Corrupt"
+ },
+ {
+  "id": 16936,
+  "name": "Dragonstalker's Belt",
+  "quality": 4,
+  "boss": "Vaelastrasz the Corrupt",
+  "allowable_classes": [
+   "hunter"
+  ]
+ },
+ {
+  "id": 19372,
+  "name": "Helm of Endless Rage",
+  "quality": 4,
+  "boss": "Vaelastrasz the Corrupt"
+ },
+ {
+  "id": 16952,
+  "name": "Judgement Belt",
+  "quality": 4,
+  "boss": "Vaelastrasz the Corrupt",
+  "allowable_classes": [
+   "paladin"
+  ]
+ },
+ {
+  "id": 19339,
+  "name": "Mind Quickening Gem",
+  "quality": 4,
+  "boss": "Vaelastrasz the Corrupt",
+  "allowable_classes": [
+   "mage"
+  ]
+ },
+ {
+  "id": 16933,
+  "name": "Nemesis Belt",
+  "quality": 4,
+  "boss": "Vaelastrasz the Corrupt",
+  "allowable_classes": [
+   "warlock"
+  ]
+ },
+ {
+  "id": 16818,
+  "name": "Netherwind Belt",
+  "quality": 4,
+  "boss": "Vaelastrasz the Corrupt",
+  "allowable_classes": [
+   "mage"
+  ]
+ },
+ {
+  "id": 19371,
+  "name": "Pendant of the Fallen Dragon",
+  "quality": 4,
+  "boss": "Vaelastrasz the Corrupt"
+ },
+ {
+  "id": 19348,
+  "name": "Red Dragonscale Protector",
+  "quality": 4,
+  "boss": "Vaelastrasz the Corrupt"
+ },
+ {
+  "id": 19340,
+  "name": "Rune of Metamorphosis",
+  "quality": 4,
+  "boss": "Vaelastrasz the Corrupt",
+  "allowable_classes": [
+   "druid"
+  ]
+ },
+ {
+  "id": 16903,
+  "name": "Stormrage Belt",
+  "quality": 4,
+  "boss": "Vaelastrasz the Corrupt",
+  "allowable_classes": [
+   "druid"
+  ]
+ },
+ {
+  "id": 16960,
+  "name": "Waistband of Wrath",
+  "quality": 4,
+  "boss": "Vaelastrasz the Corrupt",
+  "allowable_classes": [
+   "warrior"
+  ]
+ },
+ {
+  "id": 19373,
+  "name": "Black Brood Pauldrons",
+  "quality": 4,
+  "boss": "Broodlord Lashlayer"
+ },
+ {
+  "id": 16906,
+  "name": "Bloodfang Boots",
+  "quality": 4,
+  "boss": "Broodlord Lashlayer",
+  "allowable_classes": [
+   "rogue"
+  ]
+ },
+ {
+  "id": 16919,
+  "name": "Boots of Transcendence",
+  "quality": 4,
+  "boss": "Broodlord Lashlayer",
+  "allowable_classes": [
+   "priest"
+  ]
+ },
+ {
+  "id": 19374,
+  "name": "Bracers of Arcane Accuracy",
+  "quality": 4,
+  "boss": "Broodlord Lashlayer"
+ },
+ {
+  "id": 16941,
+  "name": "Dragonstalker's Greaves",
+  "quality": 4,
+  "boss": "Broodlord Lashlayer",
+  "allowable_classes": [
+   "hunter"
+  ]
+ },
+ {
+  "id": 16949,
+  "name": "Greaves of Ten Storms",
+  "quality": 4,
+  "boss": "Broodlord Lashlayer",
+  "allowable_classes": [
+   "shaman"
+  ]
+ },
+ {
+  "id": 19350,
+  "name": "Heartstriker",
+  "quality": 4,
+  "boss": "Broodlord Lashlayer"
+ },
+ {
+  "id": 16957,
+  "name": "Judgement Sabatons",
+  "quality": 4,
+  "boss": "Broodlord Lashlayer",
+  "allowable_classes": [
+   "paladin"
+  ]
+ },
+ {
+  "id": 19341,
+  "name": "Lifegiving Gem",
+  "quality": 4,
+  "boss": "Broodlord Lashlayer",
+  "allowable_classes": [
+   "warrior"
+  ]
+ },
+ {
+  "id": 19351,
+  "name": "Maladath, Runed Blade of the Black Flight",
+  "quality": 4,
+  "boss": "Broodlord Lashlayer"
+ },
+ {
+  "id": 16927,
+  "name": "Nemesis Boots",
+  "quality": 4,
+  "boss": "Broodlord Lashlayer",
+  "allowable_classes": [
+   "warlock"
+  ]
+ },
+ {
+  "id": 16912,
+  "name": "Netherwind Boots",
+  "quality": 4,
+  "boss": "Broodlord Lashlayer",
+  "allowable_classes": [
+   "mage"
+  ]
+ },
+ {
+  "id": 16965,
+  "name": "Sabatons of Wrath",
+  "quality": 4,
+  "boss": "Broodlord Lashlayer",
+  "allowable_classes": [
+   "warrior"
+  ]
+ },
+ {
+  "id": 16898,
+  "name": "Stormrage Boots",
+  "quality": 4,
+  "boss": "Broodlord Lashlayer",
+  "allowable_classes": [
+   "druid"
+  ]
+ },
+ {
+  "id": 19342,
+  "name": "Venomous Totem",
+  "quality": 4,
+  "boss": "Broodlord Lashlayer",
+  "allowable_classes": [
+   "rogue"
+  ]
+ },
+ {
+  "id": 19399,
+  "name": "Black Ash Robe",
+  "quality": 4,
+  "boss": "Firemaw"
+ },
+ {
+  "id": 19365,
+  "name": "Claw of the Black Drake",
+  "quality": 4,
+  "boss": "Firemaw"
+ },
+ {
+  "id": 19398,
+  "name": "Cloak of Firemaw",
+  "quality": 4,
+  "boss": "Firemaw"
+ },
+ {
+  "id": 19400,
+  "name": "Firemaw's Clutch",
+  "quality": 4,
+  "boss": "Firemaw"
+ },
+ {
+  "id": 19402,
+  "name": "Legguards of the Fallen Crusader",
+  "quality": 4,
+  "boss": "Firemaw"
+ },
+ {
+  "id": 19344,
+  "name": "Natural Alignment Crystal",
+  "quality": 4,
+  "boss": "Firemaw",
+  "allowable_classes": [
+   "shaman"
+  ]
+ },
+ {
+  "id": 19401,
+  "name": "Primalist's Linked Legguards",
+  "quality": 4,
+  "boss": "Firemaw"
+ },
+ {
+  "id": 19343,
+  "name": "Scrolls of Blinding Light",
+  "quality": 4,
+  "boss": "Firemaw",
+  "allowable_classes": [
+   "paladin"
+  ]
+ },
+ {
+  "id": 16907,
+  "name": "Bloodfang Gloves",
+  "quality": 4,
+  "boss": "Firemaw / Ebonroc / Flamegor",
+  "allowable_classes": [
+   "rogue"
+  ]
+ },
+ {
+  "id": 16940,
+  "name": "Dragonstalker's Gauntlets",
+  "quality": 4,
+  "boss": "Firemaw / Ebonroc / Flamegor",
+  "allowable_classes": [
+   "hunter"
+  ]
+ },
+ {
+  "id": 19353,
+  "name": "Drake Talon Cleaver",
+  "quality": 4,
+  "boss": "Firemaw / Ebonroc / Flamegor"
+ },
+ {
+  "id": 19394,
+  "name": "Drake Talon Pauldrons",
+  "quality": 4,
+  "boss": "Firemaw / Ebonroc / Flamegor"
+ },
+ {
+  "id": 16948,
+  "name": "Gauntlets of Ten Storms",
+  "quality": 4,
+  "boss": "Firemaw / Ebonroc / Flamegor",
+  "allowable_classes": [
+   "shaman"
+  ]
+ },
+ {
+  "id": 16964,
+  "name": "Gauntlets of Wrath",
+  "quality": 4,
+  "boss": "Firemaw / Ebonroc / Flamegor",
+  "allowable_classes": [
+   "warrior"
+  ]
+ },
+ {
+  "id": 16920,
+  "name": "Handguards of Transcendence",
+  "quality": 4,
+  "boss": "Firemaw / Ebonroc / Flamegor",
+  "allowable_classes": [
+   "priest"
+  ]
+ },
+ {
+  "id": 16956,
+  "name": "Judgement Gauntlets",
+  "quality": 4,
+  "boss": "Firemaw / Ebonroc / Flamegor",
+  "allowable_classes": [
+   "paladin"
+  ]
+ },
+ {
+  "id": 16928,
+  "name": "Nemesis Gloves",
+  "quality": 4,
+  "boss": "Firemaw / Ebonroc / Flamegor",
+  "allowable_classes": [
+   "warlock"
+  ]
+ },
+ {
+  "id": 16913,
+  "name": "Netherwind Gloves",
+  "quality": 4,
+  "boss": "Firemaw / Ebonroc / Flamegor",
+  "allowable_classes": [
+   "mage"
+  ]
+ },
+ {
+  "id": 19395,
+  "name": "Rejuvenating Gem",
+  "quality": 4,
+  "boss": "Firemaw / Ebonroc / Flamegor"
+ },
+ {
+  "id": 19397,
+  "name": "Ring of Blackrock",
+  "quality": 4,
+  "boss": "Firemaw / Ebonroc / Flamegor"
+ },
+ {
+  "id": 19355,
+  "name": "Shadow Wing Focus Staff",
+  "quality": 4,
+  "boss": "Firemaw / Ebonroc / Flamegor"
+ },
+ {
+  "id": 16899,
+  "name": "Stormrage Handguards",
+  "quality": 4,
+  "boss": "Firemaw / Ebonroc / Flamegor",
+  "allowable_classes": [
+   "druid"
+  ]
+ },
+ {
+  "id": 19396,
+  "name": "Taut Dragonhide Belt",
+  "quality": 4,
+  "boss": "Firemaw / Ebonroc / Flamegor"
+ },
+ {
+  "id": 19345,
+  "name": "Aegis of Preservation",
+  "quality": 4,
+  "boss": "Ebonroc",
+  "allowable_classes": [
+   "priest"
+  ]
+ },
+ {
+  "id": 19403,
+  "name": "Band of Forced Concentration",
+  "quality": 4,
+  "boss": "Ebonroc"
+ },
+ {
+  "id": 19368,
+  "name": "Dragonbreath Hand Cannon",
+  "quality": 4,
+  "boss": "Ebonroc"
+ },
+ {
+  "id": 19406,
+  "name": "Drake Fang Talisman",
+  "quality": 4,
+  "boss": "Ebonroc"
+ },
+ {
+  "id": 19407,
+  "name": "Ebony Flame Gloves",
+  "quality": 4,
+  "boss": "Ebonroc"
+ },
+ {
+  "id": 19405,
+  "name": "Malfurion's Blessed Bulwark",
+  "quality": 4,
+  "boss": "Ebonroc"
+ },
+ {
+  "id": 19432,
+  "name": "Circle of Applied Force",
+  "quality": 4,
+  "boss": "Flamegor"
+ },
+ {
+  "id": 19367,
+  "name": "Dragon's Touch",
+  "quality": 4,
+  "boss": "Flamegor"
+ },
+ {
+  "id": 19433,
+  "name": "Emberweave Leggings",
+  "quality": 4,
+  "boss": "Flamegor"
+ },
+ {
+  "id": 19357,
+  "name": "Herald of Woe",
+  "quality": 4,
+  "boss": "Flamegor"
+ },
+ {
+  "id": 19430,
+  "name": "Shroud of Pure Thought",
+  "quality": 4,
+  "boss": "Flamegor"
+ },
+ {
+  "id": 19431,
+  "name": "Styleen's Impeding Scarab",
+  "quality": 4,
+  "boss": "Flamegor"
+ },
+ {
+  "id": 19388,
+  "name": "Angelista's Grasp",
+  "quality": 4,
+  "boss": "Chromaggus"
+ },
+ {
+  "id": 19361,
+  "name": "Ashjre'thul, Crossbow of Smiting",
+  "quality": 4,
+  "boss": "Chromaggus"
+ },
+ {
+  "id": 16832,
+  "name": "Bloodfang Spaulders",
+  "quality": 4,
+  "boss": "Chromaggus",
+  "allowable_classes": [
+   "rogue"
+  ]
+ },
+ {
+  "id": 19387,
+  "name": "Chromatic Boots",
+  "quality": 4,
+  "boss": "Chromaggus"
+ },
+ {
+  "id": 19352,
+  "name": "Chromatically Tempered Sword",
+  "quality": 4,
+  "boss": "Chromaggus"
+ },
+ {
+  "id": 19347,
+  "name": "Claw of Chromaggus",
+  "quality": 4,
+  "boss": "Chromaggus"
+ },
+ {
+  "id": 16937,
+  "name": "Dragonstalker's Spaulders",
+  "quality": 4,
+  "boss": "Chromaggus",
+  "allowable_classes": [
+   "hunter"
+  ]
+ },
+ {
+  "id": 19349,
+  "name": "Elementium Reinforced Bulwark",
+  "quality": 4,
+  "boss": "Chromaggus"
+ },
+ {
+  "id": 19386,
+  "name": "Elementium Threaded Cloak",
+  "quality": 4,
+  "boss": "Chromaggus"
+ },
+ {
+  "id": 19385,
+  "name": "Empowered Leggings",
+  "quality": 4,
+  "boss": "Chromaggus"
+ },
+ {
+  "id": 16945,
+  "name": "Epaulets of Ten Storms",
+  "quality": 4,
+  "boss": "Chromaggus",
+  "allowable_classes": [
+   "shaman"
+  ]
+ },
+ {
+  "id": 19392,
+  "name": "Girdle of the Fallen Crusader",
+  "quality": 4,
+  "boss": "Chromaggus"
+ },
+ {
+  "id": 16953,
+  "name": "Judgement Spaulders",
+  "quality": 4,
+  "boss": "Chromaggus",
+  "allowable_classes": [
+   "paladin"
+  ]
+ },
+ {
+  "id": 16932,
+  "name": "Nemesis Spaulders",
+  "quality": 4,
+  "boss": "Chromaggus",
+  "allowable_classes": [
+   "warlock"
+  ]
+ },
+ {
+  "id": 16917,
+  "name": "Netherwind Mantle",
+  "quality": 4,
+  "boss": "Chromaggus",
+  "allowable_classes": [
+   "mage"
+  ]
+ },
+ {
+  "id": 16924,
+  "name": "Pauldrons of Transcendence",
+  "quality": 4,
+  "boss": "Chromaggus",
+  "allowable_classes": [
+   "priest"
+  ]
+ },
+ {
+  "id": 16961,
+  "name": "Pauldrons of Wrath",
+  "quality": 4,
+  "boss": "Chromaggus",
+  "allowable_classes": [
+   "warrior"
+  ]
+ },
+ {
+  "id": 19393,
+  "name": "Primalist's Linked Waistguard",
+  "quality": 4,
+  "boss": "Chromaggus"
+ },
+ {
+  "id": 19391,
+  "name": "Shimmering Geta",
+  "quality": 4,
+  "boss": "Chromaggus"
+ },
+ {
+  "id": 16902,
+  "name": "Stormrage Pauldrons",
+  "quality": 4,
+  "boss": "Chromaggus",
+  "allowable_classes": [
+   "druid"
+  ]
+ },
+ {
+  "id": 19390,
+  "name": "Taut Dragonhide Gloves",
+  "quality": 4,
+  "boss": "Chromaggus"
+ },
+ {
+  "id": 19389,
+  "name": "Taut Dragonhide Shoulderpads",
+  "quality": 4,
+  "boss": "Chromaggus"
+ },
+ {
+  "id": 19376,
+  "name": "Archimtiros' Ring of Reckoning",
+  "quality": 4,
+  "boss": "Nefarian"
+ },
+ {
+  "id": 19364,
+  "name": "Ashkandi, Greatsword of the Brotherhood",
+  "quality": 4,
+  "boss": "Nefarian"
+ },
+ {
+  "id": 16905,
+  "name": "Bloodfang Chestpiece",
+  "quality": 4,
+  "boss": "Nefarian",
+  "allowable_classes": [
+   "rogue"
+  ]
+ },
+ {
+  "id": 19381,
+  "name": "Boots of the Shadow Flame",
+  "quality": 4,
+  "boss": "Nefarian"
+ },
+ {
+  "id": 16950,
+  "name": "Breastplate of Ten Storms",
+  "quality": 4,
+  "boss": "Nefarian",
+  "allowable_classes": [
+   "shaman"
+  ]
+ },
+ {
+  "id": 16966,
+  "name": "Breastplate of Wrath",
+  "quality": 4,
+  "boss": "Nefarian",
+  "allowable_classes": [
+   "warrior"
+  ]
+ },
+ {
+  "id": 19378,
+  "name": "Cloak of the Brood Lord",
+  "quality": 4,
+  "boss": "Nefarian"
+ },
+ {
+  "id": 19363,
+  "name": "Crul'shorukh, Edge of Chaos",
+  "quality": 4,
+  "boss": "Nefarian"
+ },
+ {
+  "id": 16942,
+  "name": "Dragonstalker's Breastplate",
+  "quality": 4,
+  "boss": "Nefarian",
+  "allowable_classes": [
+   "hunter"
+  ]
+ },
+ {
+  "id": 19002,
+  "name": "Head of Nefarian",
+  "quality": 4,
+  "boss": "Nefarian"
+ },
+ {
+  "id": 19003,
+  "name": "Head of Nefarian",
+  "quality": 4,
+  "boss": "Nefarian"
+ },
+ {
+  "id": 16958,
+  "name": "Judgement Breastplate",
+  "quality": 4,
+  "boss": "Nefarian",
+  "allowable_classes": [
+   "paladin"
+  ]
+ },
+ {
+  "id": 19360,
+  "name": "Lok'amir il Romathis",
+  "quality": 4,
+  "boss": "Nefarian"
+ },
+ {
+  "id": 19375,
+  "name": "Mish'undare, Circlet of the Mind Flayer",
+  "quality": 4,
+  "boss": "Nefarian"
+ },
+ {
+  "id": 19379,
+  "name": "Neltharion's Tear",
+  "quality": 4,
+  "boss": "Nefarian"
+ },
+ {
+  "id": 16931,
+  "name": "Nemesis Robes",
+  "quality": 4,
+  "boss": "Nefarian",
+  "allowable_classes": [
+   "warlock"
+  ]
+ },
+ {
+  "id": 16916,
+  "name": "Netherwind Robes",
+  "quality": 4,
+  "boss": "Nefarian",
+  "allowable_classes": [
+   "mage"
+  ]
+ },
+ {
+  "id": 19377,
+  "name": "Prestor's Talisman of Connivery",
+  "quality": 4,
+  "boss": "Nefarian"
+ },
+ {
+  "id": 19382,
+  "name": "Pure Elementium Band",
+  "quality": 4,
+  "boss": "Nefarian"
+ },
+ {
+  "id": 16923,
+  "name": "Robes of Transcendence",
+  "quality": 4,
+  "boss": "Nefarian",
+  "allowable_classes": [
+   "priest"
+  ]
+ },
+ {
+  "id": 19356,
+  "name": "Staff of the Shadow Flame",
+  "quality": 4,
+  "boss": "Nefarian"
+ },
+ {
+  "id": 16897,
+  "name": "Stormrage Chestguard",
+  "quality": 4,
+  "boss": "Nefarian",
+  "allowable_classes": [
+   "druid"
+  ]
+ },
+ {
+  "id": 19380,
+  "name": "Therazane's Link",
+  "quality": 4,
+  "boss": "Nefarian"
+ },
+ {
+  "id": 19434,
+  "name": "Band of Dark Dominion",
+  "quality": 4,
+  "boss": "Trash"
+ },
+ {
+  "id": 19437,
+  "name": "Boots of Pure Thought",
+  "quality": 4,
+  "boss": "Trash"
+ },
+ {
+  "id": 19436,
+  "name": "Cloak of Draconic Might",
+  "quality": 4,
+  "boss": "Trash"
+ },
+ {
+  "id": 19362,
+  "name": "Doom's Edge",
+  "quality": 4,
+  "boss": "Trash"
+ },
+ {
+  "id": 19354,
+  "name": "Draconic Avenger",
+  "quality": 4,
+  "boss": "Trash"
+ },
+ {
+  "id": 19358,
+  "name": "Draconic Maul",
+  "quality": 4,
+  "boss": "Trash"
+ },
+ {
+  "id": 18562,
+  "name": "Elementium Ore",
+  "quality": 4,
+  "boss": "Trash"
+ },
+ {
+  "id": 19435,
+  "name": "Essence Gatherer",
+  "quality": 4,
+  "boss": "Trash"
+ },
+ {
+  "id": 19439,
+  "name": "Interlaced Shadow Jerkin",
+  "quality": 4,
+  "boss": "Trash"
+ },
+ {
+  "id": 14511,
+  "name": "Pattern: Gloves of Spell Mastery",
+  "quality": 4,
+  "boss": "Trash"
+ },
+ {
+  "id": 12728,
+  "name": "Plans: Invulnerable Mail",
+  "quality": 4,
+  "boss": "Trash"
+ },
+ {
+  "id": 12720,
+  "name": "Plans: Stronghold Gauntlets",
+  "quality": 4,
+  "boss": "Trash"
+ },
+ {
+  "id": 19438,
+  "name": "Ringo's Blizzard Boots",
+  "quality": 4,
+  "boss": "Trash"
+ },
+ {
+  "id": 14557,
+  "name": "The Lion Horn of Stormwind",
+  "quality": 4,
+  "boss": "Trash"
+ }
+]

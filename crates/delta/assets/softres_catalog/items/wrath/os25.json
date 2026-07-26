@@ -1,0 +1,168 @@
+[
+ {
+  "id": 44004,
+  "name": "Bountiful Gauntlets",
+  "quality": 4,
+  "boss": "Sartharion"
+ },
+ {
+  "id": 40453,
+  "name": "Chestplate of the Great Aspects",
+  "quality": 4,
+  "boss": "Sartharion"
+ },
+ {
+  "id": 40437,
+  "name": "Concealment Shoulderpads",
+  "quality": 4,
+  "boss": "Sartharion"
+ },
+ {
+  "id": 40438,
+  "name": "Council Chamber Epaulets",
+  "quality": 4,
+  "boss": "Sartharion"
+ },
+ {
+  "id": 40446,
+  "name": "Dragon Brood Legguards",
+  "quality": 4,
+  "boss": "Sartharion"
+ },
+ {
+  "id": 43345,
+  "name": "Dragon Hide Bag",
+  "quality": 4,
+  "boss": "Sartharion"
+ },
+ {
+  "id": 44000,
+  "name": "Dragonstorm Breastplate",
+  "quality": 4,
+  "boss": "Sartharion"
+ },
+ {
+  "id": 40431,
+  "name": "Fury of the Five Flights",
+  "quality": 4,
+  "boss": "Sartharion"
+ },
+ {
+  "id": 40628,
+  "name": "Gauntlets of the Lost Conqueror",
+  "quality": 4,
+  "boss": "Sartharion",
+  "allowable_classes": [
+   "paladin",
+   "priest",
+   "warlock"
+  ]
+ },
+ {
+  "id": 40629,
+  "name": "Gauntlets of the Lost Protector",
+  "quality": 4,
+  "boss": "Sartharion",
+  "allowable_classes": [
+   "warrior",
+   "hunter",
+   "shaman"
+  ]
+ },
+ {
+  "id": 40630,
+  "name": "Gauntlets of the Lost Vanquisher",
+  "quality": 4,
+  "boss": "Sartharion",
+  "allowable_classes": [
+   "rogue",
+   "deathknight",
+   "mage",
+   "druid"
+  ]
+ },
+ {
+  "id": 44007,
+  "name": "Headpiece of Reconciliation",
+  "quality": 4,
+  "boss": "Sartharion"
+ },
+ {
+  "id": 40451,
+  "name": "Hyaline Helm of the Sniper",
+  "quality": 4,
+  "boss": "Sartharion"
+ },
+ {
+  "id": 40432,
+  "name": "Illustration of the Dragon Soul",
+  "quality": 4,
+  "boss": "Sartharion"
+ },
+ {
+  "id": 43346,
+  "name": "Large Satchel of Spoils",
+  "quality": 4,
+  "boss": "Sartharion"
+ },
+ {
+  "id": 44011,
+  "name": "Leggings of the Honored",
+  "quality": 4,
+  "boss": "Sartharion"
+ },
+ {
+  "id": 40439,
+  "name": "Mantle of the Eternal Sentinel",
+  "quality": 4,
+  "boss": "Sartharion"
+ },
+ {
+  "id": 44006,
+  "name": "Obsidian Greathelm",
+  "quality": 4,
+  "boss": "Sartharion"
+ },
+ {
+  "id": 44005,
+  "name": "Pennant Cloak",
+  "quality": 4,
+  "boss": "Sartharion"
+ },
+ {
+  "id": 43954,
+  "name": "Reins of the Twilight Drake",
+  "quality": 4,
+  "boss": "Sartharion"
+ },
+ {
+  "id": 40455,
+  "name": "Staff of Restraint",
+  "quality": 4,
+  "boss": "Sartharion"
+ },
+ {
+  "id": 44002,
+  "name": "The Sanctum's Flowing Vestments",
+  "quality": 4,
+  "boss": "Sartharion"
+ },
+ {
+  "id": 44008,
+  "name": "Unsullied Cuffs",
+  "quality": 4,
+  "boss": "Sartharion"
+ },
+ {
+  "id": 44003,
+  "name": "Upstanding Spaulders",
+  "quality": 4,
+  "boss": "Sartharion"
+ },
+ {
+  "id": 40433,
+  "name": "Wyrmrest Band",
+  "quality": 4,
+  "boss": "Sartharion"
+ }
+]

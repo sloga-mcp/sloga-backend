@@ -1,0 +1,500 @@
+[
+ {
+  "id": 30862,
+  "name": "Blessed Adamantite Bracers",
+  "quality": 4,
+  "boss": "Rage Winterchill"
+ },
+ {
+  "id": 30866,
+  "name": "Blood-stained Pauldrons",
+  "quality": 4,
+  "boss": "Rage Winterchill"
+ },
+ {
+  "id": 30871,
+  "name": "Bracers of Martyrdom",
+  "quality": 4,
+  "boss": "Rage Winterchill"
+ },
+ {
+  "id": 30864,
+  "name": "Bracers of the Pathfinder",
+  "quality": 4,
+  "boss": "Rage Winterchill"
+ },
+ {
+  "id": 30872,
+  "name": "Chronicle of Dark Secrets",
+  "quality": 4,
+  "boss": "Rage Winterchill"
+ },
+ {
+  "id": 30870,
+  "name": "Cuffs of Devastation",
+  "quality": 4,
+  "boss": "Rage Winterchill"
+ },
+ {
+  "id": 30863,
+  "name": "Deadly Cuffs",
+  "quality": 4,
+  "boss": "Rage Winterchill"
+ },
+ {
+  "id": 30861,
+  "name": "Furious Shackles",
+  "quality": 4,
+  "boss": "Rage Winterchill"
+ },
+ {
+  "id": 30869,
+  "name": "Howling Wind Bracers",
+  "quality": 4,
+  "boss": "Rage Winterchill"
+ },
+ {
+  "id": 30868,
+  "name": "Rejuvenating Bracers",
+  "quality": 4,
+  "boss": "Rage Winterchill"
+ },
+ {
+  "id": 30873,
+  "name": "Stillwater Boots",
+  "quality": 4,
+  "boss": "Rage Winterchill"
+ },
+ {
+  "id": 30865,
+  "name": "Tracker's Blade",
+  "quality": 4,
+  "boss": "Rage Winterchill"
+ },
+ {
+  "id": 32285,
+  "name": "Design: Flashing Crimson Spinel",
+  "quality": 4,
+  "boss": "Rage Winterchill / Anetheron / Kaz'rogal / Azgalor / Archimonde"
+ },
+ {
+  "id": 32296,
+  "name": "Design: Great Lionseye",
+  "quality": 4,
+  "boss": "Rage Winterchill / Anetheron / Kaz'rogal / Azgalor / Archimonde"
+ },
+ {
+  "id": 32303,
+  "name": "Design: Inscribed Pyrestone",
+  "quality": 4,
+  "boss": "Rage Winterchill / Anetheron / Kaz'rogal / Azgalor / Archimonde"
+ },
+ {
+  "id": 32295,
+  "name": "Design: Mystic Lionseye",
+  "quality": 4,
+  "boss": "Rage Winterchill / Anetheron / Kaz'rogal / Azgalor / Archimonde"
+ },
+ {
+  "id": 32298,
+  "name": "Design: Shifting Shadowsong Amethyst",
+  "quality": 4,
+  "boss": "Rage Winterchill / Anetheron / Kaz'rogal / Azgalor / Archimonde"
+ },
+ {
+  "id": 32297,
+  "name": "Design: Sovereign Shadowsong Amethyst",
+  "quality": 4,
+  "boss": "Rage Winterchill / Anetheron / Kaz'rogal / Azgalor / Archimonde"
+ },
+ {
+  "id": 32289,
+  "name": "Design: Stormy Empyrean Sapphire",
+  "quality": 4,
+  "boss": "Rage Winterchill / Anetheron / Kaz'rogal / Azgalor / Archimonde"
+ },
+ {
+  "id": 32307,
+  "name": "Design: Veiled Pyrestone",
+  "quality": 4,
+  "boss": "Rage Winterchill / Anetheron / Kaz'rogal / Azgalor / Archimonde"
+ },
+ {
+  "id": 33117,
+  "name": "Jack-o'-Lantern",
+  "quality": 3,
+  "boss": "Rage Winterchill / Anetheron / Kaz'rogal / Azgalor / Archimonde"
+ },
+ {
+  "id": 30888,
+  "name": "Anetheron's Noose",
+  "quality": 4,
+  "boss": "Anetheron"
+ },
+ {
+  "id": 30885,
+  "name": "Archbishop's Slippers",
+  "quality": 4,
+  "boss": "Anetheron"
+ },
+ {
+  "id": 30882,
+  "name": "Bastion of Light",
+  "quality": 4,
+  "boss": "Anetheron"
+ },
+ {
+  "id": 30881,
+  "name": "Blade of Infamy",
+  "quality": 4,
+  "boss": "Anetheron"
+ },
+ {
+  "id": 30879,
+  "name": "Don Alejandro's Money Belt",
+  "quality": 4,
+  "boss": "Anetheron"
+ },
+ {
+  "id": 30886,
+  "name": "Enchanted Leather Sandals",
+  "quality": 4,
+  "boss": "Anetheron"
+ },
+ {
+  "id": 30878,
+  "name": "Glimmering Steel Mantle",
+  "quality": 4,
+  "boss": "Anetheron"
+ },
+ {
+  "id": 30887,
+  "name": "Golden Links of Restoration",
+  "quality": 4,
+  "boss": "Anetheron"
+ },
+ {
+  "id": 30884,
+  "name": "Hatefury Mantle",
+  "quality": 4,
+  "boss": "Anetheron"
+ },
+ {
+  "id": 30883,
+  "name": "Pillar of Ferocity",
+  "quality": 4,
+  "boss": "Anetheron"
+ },
+ {
+  "id": 30880,
+  "name": "Quickstrider Moccasins",
+  "quality": 4,
+  "boss": "Anetheron"
+ },
+ {
+  "id": 30874,
+  "name": "The Unbreakable Will",
+  "quality": 4,
+  "boss": "Anetheron"
+ },
+ {
+  "id": 30895,
+  "name": "Angelista's Sash",
+  "quality": 4,
+  "boss": "Kaz'rogal"
+ },
+ {
+  "id": 30892,
+  "name": "Beast-tamer's Shoulders",
+  "quality": 4,
+  "boss": "Kaz'rogal"
+ },
+ {
+  "id": 30915,
+  "name": "Belt of Seething Fury",
+  "quality": 4,
+  "boss": "Kaz'rogal"
+ },
+ {
+  "id": 30914,
+  "name": "Belt of the Crescent Moon",
+  "quality": 4,
+  "boss": "Kaz'rogal"
+ },
+ {
+  "id": 30891,
+  "name": "Black Featherlight Boots",
+  "quality": 4,
+  "boss": "Kaz'rogal"
+ },
+ {
+  "id": 30894,
+  "name": "Blue Suede Shoes",
+  "quality": 4,
+  "boss": "Kaz'rogal"
+ },
+ {
+  "id": 30918,
+  "name": "Hammer of Atonement",
+  "quality": 4,
+  "boss": "Kaz'rogal"
+ },
+ {
+  "id": 30889,
+  "name": "Kaz'rogal's Hardened Heart",
+  "quality": 4,
+  "boss": "Kaz'rogal"
+ },
+ {
+  "id": 30916,
+  "name": "Leggings of Channeled Elements",
+  "quality": 4,
+  "boss": "Kaz'rogal"
+ },
+ {
+  "id": 30917,
+  "name": "Razorfury Mantle",
+  "quality": 4,
+  "boss": "Kaz'rogal"
+ },
+ {
+  "id": 30893,
+  "name": "Sun-touched Chain Leggings",
+  "quality": 4,
+  "boss": "Kaz'rogal"
+ },
+ {
+  "id": 30919,
+  "name": "Valestalker Girdle",
+  "quality": 4,
+  "boss": "Kaz'rogal"
+ },
+ {
+  "id": 30901,
+  "name": "Boundless Agony",
+  "quality": 4,
+  "boss": "Azgalor"
+ },
+ {
+  "id": 30900,
+  "name": "Bow-stitched Leggings",
+  "quality": 4,
+  "boss": "Azgalor"
+ },
+ {
+  "id": 30899,
+  "name": "Don Rodrigo's Poncho",
+  "quality": 4,
+  "boss": "Azgalor"
+ },
+ {
+  "id": 30897,
+  "name": "Girdle of Hope",
+  "quality": 4,
+  "boss": "Azgalor"
+ },
+ {
+  "id": 30896,
+  "name": "Glory of the Defender",
+  "quality": 4,
+  "boss": "Azgalor"
+ },
+ {
+  "id": 31092,
+  "name": "Gloves of the Forgotten Conqueror",
+  "quality": 4,
+  "boss": "Azgalor",
+  "allowable_classes": [
+   "paladin",
+   "priest",
+   "warlock"
+  ]
+ },
+ {
+  "id": 31094,
+  "name": "Gloves of the Forgotten Protector",
+  "quality": 4,
+  "boss": "Azgalor",
+  "allowable_classes": [
+   "warrior",
+   "hunter",
+   "shaman"
+  ]
+ },
+ {
+  "id": 31093,
+  "name": "Gloves of the Forgotten Vanquisher",
+  "quality": 4,
+  "boss": "Azgalor",
+  "allowable_classes": [
+   "rogue",
+   "mage",
+   "druid"
+  ]
+ },
+ {
+  "id": 30898,
+  "name": "Shady Dealer's Pantaloons",
+  "quality": 4,
+  "boss": "Azgalor"
+ },
+ {
+  "id": 30909,
+  "name": "Antonidas's Aegis of Rapt Concentration",
+  "quality": 4,
+  "boss": "Archimonde"
+ },
+ {
+  "id": 30908,
+  "name": "Apostle of Argus",
+  "quality": 4,
+  "boss": "Archimonde"
+ },
+ {
+  "id": 30906,
+  "name": "Bristleblitz Striker",
+  "quality": 4,
+  "boss": "Archimonde"
+ },
+ {
+  "id": 30902,
+  "name": "Cataclysm's Edge",
+  "quality": 4,
+  "boss": "Archimonde"
+ },
+ {
+  "id": 31097,
+  "name": "Helm of the Forgotten Conqueror",
+  "quality": 4,
+  "boss": "Archimonde",
+  "allowable_classes": [
+   "paladin",
+   "priest",
+   "warlock"
+  ]
+ },
+ {
+  "id": 31095,
+  "name": "Helm of the Forgotten Protector",
+  "quality": 4,
+  "boss": "Archimonde",
+  "allowable_classes": [
+   "warrior",
+   "hunter",
+   "shaman"
+  ]
+ },
+ {
+  "id": 31096,
+  "name": "Helm of the Forgotten Vanquisher",
+  "quality": 4,
+  "boss": "Archimonde",
+  "allowable_classes": [
+   "rogue",
+   "mage",
+   "druid"
+  ]
+ },
+ {
+  "id": 30912,
+  "name": "Leggings of Eternity",
+  "quality": 4,
+  "boss": "Archimonde"
+ },
+ {
+  "id": 30903,
+  "name": "Legguards of Endless Rage",
+  "quality": 4,
+  "boss": "Archimonde"
+ },
+ {
+  "id": 30907,
+  "name": "Mail of Fevered Pursuit",
+  "quality": 4,
+  "boss": "Archimonde"
+ },
+ {
+  "id": 30905,
+  "name": "Midnight Chestguard",
+  "quality": 4,
+  "boss": "Archimonde"
+ },
+ {
+  "id": 30913,
+  "name": "Robes of Rhonin",
+  "quality": 4,
+  "boss": "Archimonde"
+ },
+ {
+  "id": 30904,
+  "name": "Savior's Grasp",
+  "quality": 4,
+  "boss": "Archimonde"
+ },
+ {
+  "id": 30911,
+  "name": "Scepter of Purification",
+  "quality": 4,
+  "boss": "Archimonde"
+ },
+ {
+  "id": 30910,
+  "name": "Tempest of Chaos",
+  "quality": 4,
+  "boss": "Archimonde"
+ },
+ {
+  "id": 32609,
+  "name": "Boots of the Divine Light",
+  "quality": 4,
+  "boss": "Trash"
+ },
+ {
+  "id": 32592,
+  "name": "Chestguard of Relentless Storms",
+  "quality": 4,
+  "boss": "Trash"
+ },
+ {
+  "id": 32591,
+  "name": "Choker of Serrated Blades",
+  "quality": 4,
+  "boss": "Trash"
+ },
+ {
+  "id": 32946,
+  "name": "Claw of Molten Fury",
+  "quality": 4,
+  "boss": "Trash"
+ },
+ {
+  "id": 32945,
+  "name": "Fist of Molten Fury",
+  "quality": 4,
+  "boss": "Trash"
+ },
+ {
+  "id": 34009,
+  "name": "Hammer of Judgement",
+  "quality": 4,
+  "boss": "Trash"
+ },
+ {
+  "id": 32589,
+  "name": "Hellfire-Encased Pendant",
+  "quality": 4,
+  "boss": "Trash"
+ },
+ {
+  "id": 32590,
+  "name": "Nethervoid Cloak",
+  "quality": 4,
+  "boss": "Trash"
+ },
+ {
+  "id": 34010,
+  "name": "Pepe's Shroud of Pacification",
+  "quality": 4,
+  "boss": "Trash"
+ }
+]

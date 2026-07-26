@@ -1,0 +1,1039 @@
+[
+ {
+  "id": 22939,
+  "name": "Band of Unanswered Prayers",
+  "quality": 4,
+  "boss": "Anub'Rekhan"
+ },
+ {
+  "id": 22938,
+  "name": "Cryptfiend Silk Cloak",
+  "quality": 4,
+  "boss": "Anub'Rekhan"
+ },
+ {
+  "id": 22937,
+  "name": "Gem of Nerubis",
+  "quality": 4,
+  "boss": "Anub'Rekhan"
+ },
+ {
+  "id": 22935,
+  "name": "Touch of Frost",
+  "quality": 4,
+  "boss": "Anub'Rekhan"
+ },
+ {
+  "id": 22936,
+  "name": "Wristguards of Vengeance",
+  "quality": 4,
+  "boss": "Anub'Rekhan"
+ },
+ {
+  "id": 22369,
+  "name": "Desecrated Bindings",
+  "quality": 4,
+  "boss": "Anub'Rekhan / Grand Widow Faerlina / Gluth",
+  "allowable_classes": [
+   "priest",
+   "mage",
+   "warlock"
+  ]
+ },
+ {
+  "id": 22355,
+  "name": "Desecrated Bracers",
+  "quality": 4,
+  "boss": "Anub'Rekhan / Grand Widow Faerlina / Gluth",
+  "allowable_classes": [
+   "warrior",
+   "rogue"
+  ]
+ },
+ {
+  "id": 22362,
+  "name": "Desecrated Wristguards",
+  "quality": 4,
+  "boss": "Anub'Rekhan / Grand Widow Faerlina / Gluth",
+  "allowable_classes": [
+   "paladin",
+   "hunter",
+   "shaman",
+   "druid"
+  ]
+ },
+ {
+  "id": 22726,
+  "name": "Splinter of Atiesh",
+  "quality": 5,
+  "boss": "Anub'Rekhan / Grand Widow Faerlina / Maexxna / Noth the Plaguebringer / Heigan the Unclean / Loatheb / Instructor Razuvious / Gothik the Harvester / The Four Horsemen / Patchwerk / Grobbulus / Gluth / Thaddius",
+  "allowable_classes": [
+   "priest",
+   "mage",
+   "warlock",
+   "druid"
+  ]
+ },
+ {
+  "id": 22940,
+  "name": "Icebane Pauldrons",
+  "quality": 4,
+  "boss": "Grand Widow Faerlina"
+ },
+ {
+  "id": 22943,
+  "name": "Malice Stone Pendant",
+  "quality": 4,
+  "boss": "Grand Widow Faerlina"
+ },
+ {
+  "id": 22941,
+  "name": "Polar Shoulder Pads",
+  "quality": 4,
+  "boss": "Grand Widow Faerlina"
+ },
+ {
+  "id": 22942,
+  "name": "The Widow's Embrace",
+  "quality": 4,
+  "boss": "Grand Widow Faerlina"
+ },
+ {
+  "id": 22806,
+  "name": "Widow's Remorse",
+  "quality": 4,
+  "boss": "Grand Widow Faerlina"
+ },
+ {
+  "id": 23220,
+  "name": "Crystal Webbed Robe",
+  "quality": 4,
+  "boss": "Maexxna"
+ },
+ {
+  "id": 22357,
+  "name": "Desecrated Gauntlets",
+  "quality": 4,
+  "boss": "Maexxna",
+  "allowable_classes": [
+   "warrior",
+   "rogue"
+  ]
+ },
+ {
+  "id": 22371,
+  "name": "Desecrated Gloves",
+  "quality": 4,
+  "boss": "Maexxna",
+  "allowable_classes": [
+   "priest",
+   "mage",
+   "warlock"
+  ]
+ },
+ {
+  "id": 22364,
+  "name": "Desecrated Handguards",
+  "quality": 4,
+  "boss": "Maexxna",
+  "allowable_classes": [
+   "paladin",
+   "hunter",
+   "shaman",
+   "druid"
+  ]
+ },
+ {
+  "id": 22954,
+  "name": "Kiss of the Spider",
+  "quality": 4,
+  "boss": "Maexxna"
+ },
+ {
+  "id": 22804,
+  "name": "Maexxna's Fang",
+  "quality": 4,
+  "boss": "Maexxna"
+ },
+ {
+  "id": 22947,
+  "name": "Pendant of Forgotten Names",
+  "quality": 4,
+  "boss": "Maexxna"
+ },
+ {
+  "id": 22807,
+  "name": "Wraith Blade",
+  "quality": 4,
+  "boss": "Maexxna"
+ },
+ {
+  "id": 23031,
+  "name": "Band of the Inevitable",
+  "quality": 4,
+  "boss": "Noth the Plaguebringer"
+ },
+ {
+  "id": 23030,
+  "name": "Cloak of the Scourge",
+  "quality": 4,
+  "boss": "Noth the Plaguebringer"
+ },
+ {
+  "id": 23028,
+  "name": "Hailstone Band",
+  "quality": 4,
+  "boss": "Noth the Plaguebringer"
+ },
+ {
+  "id": 22816,
+  "name": "Hatchet of Sundered Bone",
+  "quality": 4,
+  "boss": "Noth the Plaguebringer"
+ },
+ {
+  "id": 23006,
+  "name": "Libram of Light",
+  "quality": 4,
+  "boss": "Noth the Plaguebringer"
+ },
+ {
+  "id": 23029,
+  "name": "Noth's Frigid Heart",
+  "quality": 4,
+  "boss": "Noth the Plaguebringer"
+ },
+ {
+  "id": 23005,
+  "name": "Totem of Flowing Water",
+  "quality": 4,
+  "boss": "Noth the Plaguebringer"
+ },
+ {
+  "id": 22370,
+  "name": "Desecrated Belt",
+  "quality": 4,
+  "boss": "Noth the Plaguebringer / Heigan the Unclean / Gluth",
+  "allowable_classes": [
+   "priest",
+   "mage",
+   "warlock"
+  ]
+ },
+ {
+  "id": 22363,
+  "name": "Desecrated Girdle",
+  "quality": 4,
+  "boss": "Noth the Plaguebringer / Heigan the Unclean / Gluth",
+  "allowable_classes": [
+   "paladin",
+   "hunter",
+   "shaman",
+   "druid"
+  ]
+ },
+ {
+  "id": 22356,
+  "name": "Desecrated Waistguard",
+  "quality": 4,
+  "boss": "Noth the Plaguebringer / Heigan the Unclean / Gluth",
+  "allowable_classes": [
+   "warrior",
+   "rogue"
+  ]
+ },
+ {
+  "id": 23019,
+  "name": "Icebane Helmet",
+  "quality": 4,
+  "boss": "Heigan the Unclean"
+ },
+ {
+  "id": 23033,
+  "name": "Icy Scale Coif",
+  "quality": 4,
+  "boss": "Heigan the Unclean"
+ },
+ {
+  "id": 23068,
+  "name": "Legplates of Carnage",
+  "quality": 4,
+  "boss": "Heigan the Unclean"
+ },
+ {
+  "id": 23036,
+  "name": "Necklace of Necropsy",
+  "quality": 4,
+  "boss": "Heigan the Unclean"
+ },
+ {
+  "id": 23035,
+  "name": "Preceptor's Hat",
+  "quality": 4,
+  "boss": "Heigan the Unclean"
+ },
+ {
+  "id": 23038,
+  "name": "Band of Unnatural Forces",
+  "quality": 4,
+  "boss": "Loatheb"
+ },
+ {
+  "id": 22800,
+  "name": "Brimstone Staff",
+  "quality": 4,
+  "boss": "Loatheb"
+ },
+ {
+  "id": 22366,
+  "name": "Desecrated Leggings",
+  "quality": 4,
+  "boss": "Loatheb",
+  "allowable_classes": [
+   "priest",
+   "mage",
+   "warlock"
+  ]
+ },
+ {
+  "id": 22359,
+  "name": "Desecrated Legguards",
+  "quality": 4,
+  "boss": "Loatheb",
+  "allowable_classes": [
+   "paladin",
+   "hunter",
+   "shaman",
+   "druid"
+  ]
+ },
+ {
+  "id": 22352,
+  "name": "Desecrated Legplates",
+  "quality": 4,
+  "boss": "Loatheb",
+  "allowable_classes": [
+   "warrior",
+   "rogue"
+  ]
+ },
+ {
+  "id": 23042,
+  "name": "Loatheb's Reflection",
+  "quality": 4,
+  "boss": "Loatheb"
+ },
+ {
+  "id": 23037,
+  "name": "Ring of Spiritual Fervor",
+  "quality": 4,
+  "boss": "Loatheb"
+ },
+ {
+  "id": 23039,
+  "name": "The Eye of Nerub",
+  "quality": 4,
+  "boss": "Loatheb"
+ },
+ {
+  "id": 23219,
+  "name": "Girdle of the Mentor",
+  "quality": 4,
+  "boss": "Instructor Razuvious"
+ },
+ {
+  "id": 23014,
+  "name": "Iblis, Blade of the Fallen Seraph",
+  "quality": 4,
+  "boss": "Instructor Razuvious"
+ },
+ {
+  "id": 23004,
+  "name": "Idol of Longevity",
+  "quality": 4,
+  "boss": "Instructor Razuvious"
+ },
+ {
+  "id": 23018,
+  "name": "Signet of the Fallen Defender",
+  "quality": 4,
+  "boss": "Instructor Razuvious"
+ },
+ {
+  "id": 23017,
+  "name": "Veil of Eclipse",
+  "quality": 4,
+  "boss": "Instructor Razuvious"
+ },
+ {
+  "id": 23009,
+  "name": "Wand of the Whispering Dead",
+  "quality": 4,
+  "boss": "Instructor Razuvious"
+ },
+ {
+  "id": 22365,
+  "name": "Desecrated Boots",
+  "quality": 4,
+  "boss": "Instructor Razuvious / Gothik the Harvester / Gluth",
+  "allowable_classes": [
+   "paladin",
+   "hunter",
+   "shaman",
+   "druid"
+  ]
+ },
+ {
+  "id": 22358,
+  "name": "Desecrated Sabatons",
+  "quality": 4,
+  "boss": "Instructor Razuvious / Gothik the Harvester / Gluth",
+  "allowable_classes": [
+   "warrior",
+   "rogue"
+  ]
+ },
+ {
+  "id": 22372,
+  "name": "Desecrated Sandals",
+  "quality": 4,
+  "boss": "Instructor Razuvious / Gothik the Harvester / Gluth",
+  "allowable_classes": [
+   "priest",
+   "mage",
+   "warlock"
+  ]
+ },
+ {
+  "id": 23073,
+  "name": "Boots of Displacement",
+  "quality": 4,
+  "boss": "Gothik the Harvester"
+ },
+ {
+  "id": 23032,
+  "name": "Glacial Headdress",
+  "quality": 4,
+  "boss": "Gothik the Harvester"
+ },
+ {
+  "id": 23020,
+  "name": "Polar Helmet",
+  "quality": 4,
+  "boss": "Gothik the Harvester"
+ },
+ {
+  "id": 23023,
+  "name": "Sadist's Collar",
+  "quality": 4,
+  "boss": "Gothik the Harvester"
+ },
+ {
+  "id": 23021,
+  "name": "The Soul Harvester's Bindings",
+  "quality": 4,
+  "boss": "Gothik the Harvester"
+ },
+ {
+  "id": 22691,
+  "name": "Corrupted Ashbringer",
+  "quality": 4,
+  "boss": "The Four Horsemen"
+ },
+ {
+  "id": 22349,
+  "name": "Desecrated Breastplate",
+  "quality": 4,
+  "boss": "The Four Horsemen",
+  "allowable_classes": [
+   "warrior",
+   "rogue"
+  ]
+ },
+ {
+  "id": 22351,
+  "name": "Desecrated Robe",
+  "quality": 4,
+  "boss": "The Four Horsemen",
+  "allowable_classes": [
+   "priest",
+   "mage",
+   "warlock"
+  ]
+ },
+ {
+  "id": 22350,
+  "name": "Desecrated Tunic",
+  "quality": 4,
+  "boss": "The Four Horsemen",
+  "allowable_classes": [
+   "paladin",
+   "hunter",
+   "shaman",
+   "druid"
+  ]
+ },
+ {
+  "id": 23071,
+  "name": "Leggings of Apocalypse",
+  "quality": 4,
+  "boss": "The Four Horsemen"
+ },
+ {
+  "id": 22809,
+  "name": "Maul of the Redeemed Crusader",
+  "quality": 4,
+  "boss": "The Four Horsemen"
+ },
+ {
+  "id": 23025,
+  "name": "Seal of the Damned",
+  "quality": 4,
+  "boss": "The Four Horsemen"
+ },
+ {
+  "id": 22811,
+  "name": "Soulstring",
+  "quality": 4,
+  "boss": "The Four Horsemen"
+ },
+ {
+  "id": 23027,
+  "name": "Warmth of Forgiveness",
+  "quality": 4,
+  "boss": "The Four Horsemen"
+ },
+ {
+  "id": 22961,
+  "name": "Band of Reanimation",
+  "quality": 4,
+  "boss": "Patchwerk"
+ },
+ {
+  "id": 22960,
+  "name": "Cloak of Suturing",
+  "quality": 4,
+  "boss": "Patchwerk"
+ },
+ {
+  "id": 22815,
+  "name": "Severance",
+  "quality": 4,
+  "boss": "Patchwerk"
+ },
+ {
+  "id": 22818,
+  "name": "The Plague Bearer",
+  "quality": 4,
+  "boss": "Patchwerk"
+ },
+ {
+  "id": 22820,
+  "name": "Wand of Fates",
+  "quality": 4,
+  "boss": "Patchwerk"
+ },
+ {
+  "id": 22354,
+  "name": "Desecrated Pauldrons",
+  "quality": 4,
+  "boss": "Patchwerk / Grobbulus / Gluth",
+  "allowable_classes": [
+   "warrior",
+   "rogue"
+  ]
+ },
+ {
+  "id": 22368,
+  "name": "Desecrated Shoulderpads",
+  "quality": 4,
+  "boss": "Patchwerk / Grobbulus / Gluth",
+  "allowable_classes": [
+   "priest",
+   "mage",
+   "warlock"
+  ]
+ },
+ {
+  "id": 22361,
+  "name": "Desecrated Spaulders",
+  "quality": 4,
+  "boss": "Patchwerk / Grobbulus / Gluth",
+  "allowable_classes": [
+   "paladin",
+   "hunter",
+   "shaman",
+   "druid"
+  ]
+ },
+ {
+  "id": 22968,
+  "name": "Glacial Mantle",
+  "quality": 4,
+  "boss": "Grobbulus"
+ },
+ {
+  "id": 22967,
+  "name": "Icy Scale Spaulders",
+  "quality": 4,
+  "boss": "Grobbulus"
+ },
+ {
+  "id": 22803,
+  "name": "Midnight Haze",
+  "quality": 4,
+  "boss": "Grobbulus"
+ },
+ {
+  "id": 22988,
+  "name": "The End of Dreams",
+  "quality": 4,
+  "boss": "Grobbulus"
+ },
+ {
+  "id": 22810,
+  "name": "Toxin Injector",
+  "quality": 4,
+  "boss": "Grobbulus"
+ },
+ {
+  "id": 22813,
+  "name": "Claymore of Unholy Might",
+  "quality": 4,
+  "boss": "Gluth"
+ },
+ {
+  "id": 23075,
+  "name": "Death's Bargain",
+  "quality": 4,
+  "boss": "Gluth"
+ },
+ {
+  "id": 22994,
+  "name": "Digested Hand of Power",
+  "quality": 4,
+  "boss": "Gluth"
+ },
+ {
+  "id": 22981,
+  "name": "Gluth's Missing Collar",
+  "quality": 4,
+  "boss": "Gluth"
+ },
+ {
+  "id": 22983,
+  "name": "Rime Covered Mantle",
+  "quality": 4,
+  "boss": "Gluth"
+ },
+ {
+  "id": 22367,
+  "name": "Desecrated Circlet",
+  "quality": 4,
+  "boss": "Thaddius",
+  "allowable_classes": [
+   "priest",
+   "mage",
+   "warlock"
+  ]
+ },
+ {
+  "id": 22360,
+  "name": "Desecrated Headpiece",
+  "quality": 4,
+  "boss": "Thaddius",
+  "allowable_classes": [
+   "paladin",
+   "hunter",
+   "shaman",
+   "druid"
+  ]
+ },
+ {
+  "id": 22353,
+  "name": "Desecrated Helmet",
+  "quality": 4,
+  "boss": "Thaddius",
+  "allowable_classes": [
+   "warrior",
+   "rogue"
+  ]
+ },
+ {
+  "id": 23001,
+  "name": "Eye of Diminution",
+  "quality": 4,
+  "boss": "Thaddius"
+ },
+ {
+  "id": 23070,
+  "name": "Leggings of Polarity",
+  "quality": 4,
+  "boss": "Thaddius"
+ },
+ {
+  "id": 23000,
+  "name": "Plated Abomination Ribcage",
+  "quality": 4,
+  "boss": "Thaddius"
+ },
+ {
+  "id": 22801,
+  "name": "Spire of Twilight",
+  "quality": 4,
+  "boss": "Thaddius"
+ },
+ {
+  "id": 22808,
+  "name": "The Castigator",
+  "quality": 4,
+  "boss": "Thaddius"
+ },
+ {
+  "id": 23242,
+  "name": "Claw of the Frost Wyrm",
+  "quality": 4,
+  "boss": "Sapphiron"
+ },
+ {
+  "id": 23050,
+  "name": "Cloak of the Necropolis",
+  "quality": 4,
+  "boss": "Sapphiron"
+ },
+ {
+  "id": 23047,
+  "name": "Eye of the Dead",
+  "quality": 4,
+  "boss": "Sapphiron"
+ },
+ {
+  "id": 23549,
+  "name": "Fortitude of the Scourge",
+  "quality": 4,
+  "boss": "Sapphiron"
+ },
+ {
+  "id": 23040,
+  "name": "Glyph of Deflection",
+  "quality": 4,
+  "boss": "Sapphiron"
+ },
+ {
+  "id": 23548,
+  "name": "Might of the Scourge",
+  "quality": 4,
+  "boss": "Sapphiron"
+ },
+ {
+  "id": 23545,
+  "name": "Power of the Scourge",
+  "quality": 4,
+  "boss": "Sapphiron"
+ },
+ {
+  "id": 23547,
+  "name": "Resilience of the Scourge",
+  "quality": 4,
+  "boss": "Sapphiron"
+ },
+ {
+  "id": 23049,
+  "name": "Sapphiron's Left Eye",
+  "quality": 4,
+  "boss": "Sapphiron"
+ },
+ {
+  "id": 23048,
+  "name": "Sapphiron's Right Eye",
+  "quality": 4,
+  "boss": "Sapphiron"
+ },
+ {
+  "id": 23045,
+  "name": "Shroud of Dominion",
+  "quality": 4,
+  "boss": "Sapphiron"
+ },
+ {
+  "id": 23041,
+  "name": "Slayer's Crest",
+  "quality": 4,
+  "boss": "Sapphiron"
+ },
+ {
+  "id": 23043,
+  "name": "The Face of Death",
+  "quality": 4,
+  "boss": "Sapphiron"
+ },
+ {
+  "id": 23046,
+  "name": "The Restrained Essence of Sapphiron",
+  "quality": 4,
+  "boss": "Sapphiron"
+ },
+ {
+  "id": 23060,
+  "name": "Bonescythe Ring",
+  "quality": 4,
+  "boss": "Kel'Thuzad",
+  "allowable_classes": [
+   "rogue"
+  ]
+ },
+ {
+  "id": 22821,
+  "name": "Doomfinger",
+  "quality": 4,
+  "boss": "Kel'Thuzad"
+ },
+ {
+  "id": 23062,
+  "name": "Frostfire Ring",
+  "quality": 4,
+  "boss": "Kel'Thuzad",
+  "allowable_classes": [
+   "mage"
+  ]
+ },
+ {
+  "id": 23057,
+  "name": "Gem of Trapped Innocents",
+  "quality": 4,
+  "boss": "Kel'Thuzad"
+ },
+ {
+  "id": 23054,
+  "name": "Gressil, Dawn of Ruin",
+  "quality": 4,
+  "boss": "Kel'Thuzad"
+ },
+ {
+  "id": 23056,
+  "name": "Hammer of the Twisting Nether",
+  "quality": 4,
+  "boss": "Kel'Thuzad"
+ },
+ {
+  "id": 22802,
+  "name": "Kingsfall",
+  "quality": 4,
+  "boss": "Kel'Thuzad"
+ },
+ {
+  "id": 22798,
+  "name": "Might of Menethil",
+  "quality": 4,
+  "boss": "Kel'Thuzad"
+ },
+ {
+  "id": 22812,
+  "name": "Nerubian Slavemaker",
+  "quality": 4,
+  "boss": "Kel'Thuzad"
+ },
+ {
+  "id": 23063,
+  "name": "Plagueheart Ring",
+  "quality": 4,
+  "boss": "Kel'Thuzad",
+  "allowable_classes": [
+   "warlock"
+  ]
+ },
+ {
+  "id": 23061,
+  "name": "Ring of Faith",
+  "quality": 4,
+  "boss": "Kel'Thuzad",
+  "allowable_classes": [
+   "priest"
+  ]
+ },
+ {
+  "id": 23066,
+  "name": "Ring of Redemption",
+  "quality": 4,
+  "boss": "Kel'Thuzad",
+  "allowable_classes": [
+   "paladin"
+  ]
+ },
+ {
+  "id": 23064,
+  "name": "Ring of The Dreamwalker",
+  "quality": 4,
+  "boss": "Kel'Thuzad",
+  "allowable_classes": [
+   "druid"
+  ]
+ },
+ {
+  "id": 23067,
+  "name": "Ring of the Cryptstalker",
+  "quality": 4,
+  "boss": "Kel'Thuzad",
+  "allowable_classes": [
+   "hunter"
+  ]
+ },
+ {
+  "id": 23059,
+  "name": "Ring of the Dreadnaught",
+  "quality": 4,
+  "boss": "Kel'Thuzad",
+  "allowable_classes": [
+   "warrior"
+  ]
+ },
+ {
+  "id": 23065,
+  "name": "Ring of the Earthshatterer",
+  "quality": 4,
+  "boss": "Kel'Thuzad",
+  "allowable_classes": [
+   "shaman"
+  ]
+ },
+ {
+  "id": 22819,
+  "name": "Shield of Condemnation",
+  "quality": 4,
+  "boss": "Kel'Thuzad"
+ },
+ {
+  "id": 22799,
+  "name": "Soulseeker",
+  "quality": 4,
+  "boss": "Kel'Thuzad"
+ },
+ {
+  "id": 23053,
+  "name": "Stormrage's Talisman of Seething",
+  "quality": 4,
+  "boss": "Kel'Thuzad"
+ },
+ {
+  "id": 23577,
+  "name": "The Hungering Cold",
+  "quality": 4,
+  "boss": "Kel'Thuzad"
+ },
+ {
+  "id": 22520,
+  "name": "The Phylactery of Kel'Thuzad",
+  "quality": 4,
+  "boss": "Kel'Thuzad"
+ },
+ {
+  "id": 23666,
+  "name": "Belt of the Grand Crusader",
+  "quality": 4,
+  "boss": "Trash",
+  "allowable_classes": [
+   "paladin"
+  ]
+ },
+ {
+  "id": 23226,
+  "name": "Ghoul Skin Tunic",
+  "quality": 4,
+  "boss": "Trash"
+ },
+ {
+  "id": 23663,
+  "name": "Girdle of Elemental Fury",
+  "quality": 4,
+  "boss": "Trash"
+ },
+ {
+  "id": 23044,
+  "name": "Harbinger of Doom",
+  "quality": 4,
+  "boss": "Trash"
+ },
+ {
+  "id": 23665,
+  "name": "Leggings of Elemental Fury",
+  "quality": 4,
+  "boss": "Trash",
+  "allowable_classes": [
+   "shaman"
+  ]
+ },
+ {
+  "id": 23668,
+  "name": "Leggings of the Grand Crusader",
+  "quality": 4,
+  "boss": "Trash",
+  "allowable_classes": [
+   "paladin"
+  ]
+ },
+ {
+  "id": 23221,
+  "name": "Misplaced Servo Arm",
+  "quality": 4,
+  "boss": "Trash"
+ },
+ {
+  "id": 23069,
+  "name": "Necro-Knight's Garb",
+  "quality": 4,
+  "boss": "Trash",
+  "allowable_classes": [
+   "priest",
+   "mage",
+   "warlock"
+  ]
+ },
+ {
+  "id": 14511,
+  "name": "Pattern: Gloves of Spell Mastery",
+  "quality": 4,
+  "boss": "Trash"
+ },
+ {
+  "id": 23664,
+  "name": "Pauldrons of Elemental Fury",
+  "quality": 4,
+  "boss": "Trash",
+  "allowable_classes": [
+   "shaman"
+  ]
+ },
+ {
+  "id": 12728,
+  "name": "Plans: Invulnerable Mail",
+  "quality": 4,
+  "boss": "Trash"
+ },
+ {
+  "id": 12720,
+  "name": "Plans: Stronghold Gauntlets",
+  "quality": 4,
+  "boss": "Trash"
+ },
+ {
+  "id": 23237,
+  "name": "Ring of the Eternal Flame",
+  "quality": 4,
+  "boss": "Trash"
+ },
+ {
+  "id": 23667,
+  "name": "Spaulders of the Grand Crusader",
+  "quality": 4,
+  "boss": "Trash",
+  "allowable_classes": [
+   "paladin"
+  ]
+ },
+ {
+  "id": 23238,
+  "name": "Stygian Buckler",
+  "quality": 4,
+  "boss": "Trash"
+ }
+]

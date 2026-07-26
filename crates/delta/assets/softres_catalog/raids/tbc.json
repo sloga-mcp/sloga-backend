@@ -1,0 +1,56 @@
+[
+ {
+  "id": "kara",
+  "edition": "tbc",
+  "name": "Karazhan",
+  "slots": 10
+ },
+ {
+  "id": "gruul",
+  "edition": "tbc",
+  "name": "Gruul's Lair",
+  "slots": 25
+ },
+ {
+  "id": "magtheridon",
+  "edition": "tbc",
+  "name": "Magtheridon's Lair",
+  "slots": 25
+ },
+ {
+  "id": "ssc",
+  "edition": "tbc",
+  "name": "Serpentshrine Cavern",
+  "slots": 25
+ },
+ {
+  "id": "tk",
+  "edition": "tbc",
+  "name": "Tempest Keep",
+  "slots": 25
+ },
+ {
+  "id": "hyjal",
+  "edition": "tbc",
+  "name": "Mount Hyjal",
+  "slots": 25
+ },
+ {
+  "id": "bt",
+  "edition": "tbc",
+  "name": "Black Temple",
+  "slots": 25
+ },
+ {
+  "id": "za",
+  "edition": "tbc",
+  "name": "Zul'Aman",
+  "slots": 10
+ },
+ {
+  "id": "swp",
+  "edition": "tbc",
+  "name": "Sunwell Plateau",
+  "slots": 25
+ }
+]

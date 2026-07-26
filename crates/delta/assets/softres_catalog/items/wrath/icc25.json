@@ -1,0 +1,906 @@
+[
+ {
+  "id": 49949,
+  "name": "Band of the Bone Colossus",
+  "quality": 4,
+  "boss": "Lord Marrowgar"
+ },
+ {
+  "id": 49975,
+  "name": "Bone Sentinel's Amulet",
+  "quality": 4,
+  "boss": "Lord Marrowgar"
+ },
+ {
+  "id": 49960,
+  "name": "Bracers of Dark Reckoning",
+  "quality": 4,
+  "boss": "Lord Marrowgar"
+ },
+ {
+  "id": 50415,
+  "name": "Bryntroll, the Bone Arbiter",
+  "quality": 4,
+  "boss": "Lord Marrowgar"
+ },
+ {
+  "id": 49976,
+  "name": "Bulwark of Smouldering Steel",
+  "quality": 4,
+  "boss": "Lord Marrowgar"
+ },
+ {
+  "id": 49978,
+  "name": "Crushing Coldwraith Belt",
+  "quality": 4,
+  "boss": "Lord Marrowgar"
+ },
+ {
+  "id": 49950,
+  "name": "Frostbitten Fur Boots",
+  "quality": 4,
+  "boss": "Lord Marrowgar"
+ },
+ {
+  "id": 49968,
+  "name": "Frozen Bonespike",
+  "quality": 4,
+  "boss": "Lord Marrowgar"
+ },
+ {
+  "id": 49951,
+  "name": "Gendarme's Cuirass",
+  "quality": 4,
+  "boss": "Lord Marrowgar"
+ },
+ {
+  "id": 49979,
+  "name": "Handguards of Winter's Respite",
+  "quality": 4,
+  "boss": "Lord Marrowgar"
+ },
+ {
+  "id": 49964,
+  "name": "Legguards of Lost Hope",
+  "quality": 4,
+  "boss": "Lord Marrowgar"
+ },
+ {
+  "id": 49977,
+  "name": "Loop of the Endless Labyrinth",
+  "quality": 4,
+  "boss": "Lord Marrowgar"
+ },
+ {
+  "id": 49967,
+  "name": "Marrowgar's Frigid Eye",
+  "quality": 4,
+  "boss": "Lord Marrowgar"
+ },
+ {
+  "id": 49980,
+  "name": "Rusted Bonespike Pauldrons",
+  "quality": 4,
+  "boss": "Lord Marrowgar"
+ },
+ {
+  "id": 49952,
+  "name": "Snowserpent Mail Helm",
+  "quality": 4,
+  "boss": "Lord Marrowgar"
+ },
+ {
+  "id": 49908,
+  "name": "Primordial Saronite",
+  "quality": 3,
+  "boss": "Lord Marrowgar / Lady Deathwhisper / Gunship Battle / Deathbringer Saurfang / Festergut / Rotface / Professor Putricide / Blood Prince Council / Blood-Queen Lana'thel / Valithria Dreamwalker / Sindragosa / The Lich King"
+ },
+ {
+  "id": 49989,
+  "name": "Ahn'kahar Onyx Neckguard",
+  "quality": 4,
+  "boss": "Lady Deathwhisper"
+ },
+ {
+  "id": 49983,
+  "name": "Blood-Soaked Saronite Stompers",
+  "quality": 4,
+  "boss": "Lady Deathwhisper"
+ },
+ {
+  "id": 49986,
+  "name": "Broken Ram Skull Helm",
+  "quality": 4,
+  "boss": "Lady Deathwhisper"
+ },
+ {
+  "id": 49987,
+  "name": "Cultist's Bloodsoaked Spaulders",
+  "quality": 4,
+  "boss": "Lady Deathwhisper"
+ },
+ {
+  "id": 49996,
+  "name": "Deathwhisper Raiment",
+  "quality": 4,
+  "boss": "Lady Deathwhisper"
+ },
+ {
+  "id": 49995,
+  "name": "Fallen Lord's Handguards",
+  "quality": 4,
+  "boss": "Lady Deathwhisper"
+ },
+ {
+  "id": 49982,
+  "name": "Heartpierce",
+  "quality": 4,
+  "boss": "Lady Deathwhisper"
+ },
+ {
+  "id": 49985,
+  "name": "Juggernaut Band",
+  "quality": 4,
+  "boss": "Lady Deathwhisper"
+ },
+ {
+  "id": 49988,
+  "name": "Leggings of Northern Lights",
+  "quality": 4,
+  "boss": "Lady Deathwhisper"
+ },
+ {
+  "id": 49993,
+  "name": "Necrophotic Greaves",
+  "quality": 4,
+  "boss": "Lady Deathwhisper"
+ },
+ {
+  "id": 49992,
+  "name": "Nibelung",
+  "quality": 4,
+  "boss": "Lady Deathwhisper"
+ },
+ {
+  "id": 49990,
+  "name": "Ring of Maddening Whispers",
+  "quality": 4,
+  "boss": "Lady Deathwhisper"
+ },
+ {
+  "id": 49991,
+  "name": "Shoulders of Mercy Killing",
+  "quality": 4,
+  "boss": "Lady Deathwhisper"
+ },
+ {
+  "id": 49994,
+  "name": "The Lady's Brittle Bracers",
+  "quality": 4,
+  "boss": "Lady Deathwhisper"
+ },
+ {
+  "id": 50034,
+  "name": "Zod's Repeating Longbow",
+  "quality": 4,
+  "boss": "Lady Deathwhisper"
+ },
+ {
+  "id": 50359,
+  "name": "Althor's Abacus",
+  "quality": 4,
+  "boss": "Gunship Battle"
+ },
+ {
+  "id": 50005,
+  "name": "Amulet of the Silent Eulogy",
+  "quality": 4,
+  "boss": "Gunship Battle"
+ },
+ {
+  "id": 50003,
+  "name": "Boneguard Commander's Pauldrons",
+  "quality": 4,
+  "boss": "Gunship Battle"
+ },
+ {
+  "id": 50009,
+  "name": "Boots of Unnatural Growth",
+  "quality": 4,
+  "boss": "Gunship Battle"
+ },
+ {
+  "id": 50006,
+  "name": "Corp'rethar Ceremonial Crown",
+  "quality": 4,
+  "boss": "Gunship Battle"
+ },
+ {
+  "id": 50352,
+  "name": "Corpse Tongue Coin",
+  "quality": 4,
+  "boss": "Gunship Battle"
+ },
+ {
+  "id": 50011,
+  "name": "Gunship Captain's Mittens",
+  "quality": 4,
+  "boss": "Gunship Battle"
+ },
+ {
+  "id": 50001,
+  "name": "Ikfirus's Sack of Wonder",
+  "quality": 4,
+  "boss": "Gunship Battle"
+ },
+ {
+  "id": 50002,
+  "name": "Polar Bear Claw Bracers",
+  "quality": 4,
+  "boss": "Gunship Battle"
+ },
+ {
+  "id": 50008,
+  "name": "Ring of Rapid Ascent",
+  "quality": 4,
+  "boss": "Gunship Battle"
+ },
+ {
+  "id": 50000,
+  "name": "Scourge Hunter's Vambraces",
+  "quality": 4,
+  "boss": "Gunship Battle"
+ },
+ {
+  "id": 50411,
+  "name": "Scourgeborne Waraxe",
+  "quality": 4,
+  "boss": "Gunship Battle"
+ },
+ {
+  "id": 49998,
+  "name": "Shadowvault Slayer's Cloak",
+  "quality": 4,
+  "boss": "Gunship Battle"
+ },
+ {
+  "id": 49999,
+  "name": "Skeleton Lord's Circle",
+  "quality": 4,
+  "boss": "Gunship Battle"
+ },
+ {
+  "id": 50010,
+  "name": "Waistband of Righteous Fury",
+  "quality": 4,
+  "boss": "Gunship Battle"
+ },
+ {
+  "id": 50015,
+  "name": "Belt of the Blood Nova",
+  "quality": 4,
+  "boss": "Deathbringer Saurfang"
+ },
+ {
+  "id": 50412,
+  "name": "Bloodvenom Blade",
+  "quality": 4,
+  "boss": "Deathbringer Saurfang"
+ },
+ {
+  "id": 50362,
+  "name": "Deathbringer's Will",
+  "quality": 4,
+  "boss": "Deathbringer Saurfang"
+ },
+ {
+  "id": 50014,
+  "name": "Greatcloak of the Turned Champion",
+  "quality": 4,
+  "boss": "Deathbringer Saurfang"
+ },
+ {
+  "id": 50333,
+  "name": "Toskk's Maximized Wristguards",
+  "quality": 4,
+  "boss": "Deathbringer Saurfang"
+ },
+ {
+  "id": 52027,
+  "name": "Conqueror's Mark of Sanctification",
+  "quality": 4,
+  "boss": "Deathbringer Saurfang / Professor Putricide / Blood-Queen Lana'thel / Sindragosa / The Lich King",
+  "allowable_classes": [
+   "paladin",
+   "priest",
+   "warlock"
+  ]
+ },
+ {
+  "id": 52026,
+  "name": "Protector's Mark of Sanctification",
+  "quality": 4,
+  "boss": "Deathbringer Saurfang / Professor Putricide / Blood-Queen Lana'thel / Sindragosa / The Lich King",
+  "allowable_classes": [
+   "warrior",
+   "hunter",
+   "shaman"
+  ]
+ },
+ {
+  "id": 52025,
+  "name": "Vanquisher's Mark of Sanctification",
+  "quality": 4,
+  "boss": "Deathbringer Saurfang / Professor Putricide / Blood-Queen Lana'thel / Sindragosa / The Lich King",
+  "allowable_classes": [
+   "rogue",
+   "deathknight",
+   "mage",
+   "druid"
+  ]
+ },
+ {
+  "id": 50036,
+  "name": "Belt of Broken Bones",
+  "quality": 4,
+  "boss": "Festergut"
+ },
+ {
+  "id": 50035,
+  "name": "Black Bruise",
+  "quality": 4,
+  "boss": "Festergut"
+ },
+ {
+  "id": 50038,
+  "name": "Carapace of Forgotten Kings",
+  "quality": 4,
+  "boss": "Festergut"
+ },
+ {
+  "id": 50040,
+  "name": "Distant Land",
+  "quality": 4,
+  "boss": "Festergut"
+ },
+ {
+  "id": 50060,
+  "name": "Faceplate of the Forgotten",
+  "quality": 4,
+  "boss": "Festergut"
+ },
+ {
+  "id": 50037,
+  "name": "Fleshrending Gauntlets",
+  "quality": 4,
+  "boss": "Festergut"
+ },
+ {
+  "id": 50042,
+  "name": "Gangrenous Leggings",
+  "quality": 4,
+  "boss": "Festergut"
+ },
+ {
+  "id": 50061,
+  "name": "Holiday's Grace",
+  "quality": 4,
+  "boss": "Festergut"
+ },
+ {
+  "id": 50059,
+  "name": "Horrific Flesh Epaulets",
+  "quality": 4,
+  "boss": "Festergut"
+ },
+ {
+  "id": 50041,
+  "name": "Leather of Stitched Scourge Parts",
+  "quality": 4,
+  "boss": "Festergut"
+ },
+ {
+  "id": 50063,
+  "name": "Lingering Illness",
+  "quality": 4,
+  "boss": "Festergut"
+ },
+ {
+  "id": 50414,
+  "name": "Might of Blight",
+  "quality": 4,
+  "boss": "Festergut"
+ },
+ {
+  "id": 50413,
+  "name": "Nerub'ar Stalker's Cord",
+  "quality": 4,
+  "boss": "Festergut"
+ },
+ {
+  "id": 50062,
+  "name": "Plague Scientist's Boots",
+  "quality": 4,
+  "boss": "Festergut"
+ },
+ {
+  "id": 50056,
+  "name": "Plaguebringer's Stained Pants",
+  "quality": 4,
+  "boss": "Festergut"
+ },
+ {
+  "id": 50064,
+  "name": "Unclean Surgical Gloves",
+  "quality": 4,
+  "boss": "Festergut"
+ },
+ {
+  "id": 50021,
+  "name": "Aldriana's Gloves of Secrecy",
+  "quality": 4,
+  "boss": "Rotface"
+ },
+ {
+  "id": 50023,
+  "name": "Bile-Encrusted Medallion",
+  "quality": 4,
+  "boss": "Rotface"
+ },
+ {
+  "id": 50024,
+  "name": "Blightborne Warplate",
+  "quality": 4,
+  "boss": "Rotface"
+ },
+ {
+  "id": 50030,
+  "name": "Bloodsunder's Bracers",
+  "quality": 4,
+  "boss": "Rotface"
+ },
+ {
+  "id": 50033,
+  "name": "Corpse-Impaling Spike",
+  "quality": 4,
+  "boss": "Rotface"
+ },
+ {
+  "id": 50032,
+  "name": "Death Surgeon's Sleeves",
+  "quality": 4,
+  "boss": "Rotface"
+ },
+ {
+  "id": 50353,
+  "name": "Dislodged Foreign Object",
+  "quality": 4,
+  "boss": "Rotface"
+ },
+ {
+  "id": 50022,
+  "name": "Dual-Bladed Pauldrons",
+  "quality": 4,
+  "boss": "Rotface"
+ },
+ {
+  "id": 50026,
+  "name": "Helm of the Elder Moon",
+  "quality": 4,
+  "boss": "Rotface"
+ },
+ {
+  "id": 50020,
+  "name": "Raging Behemoth's Shoulderplates",
+  "quality": 4,
+  "boss": "Rotface"
+ },
+ {
+  "id": 50016,
+  "name": "Rib Spreader",
+  "quality": 4,
+  "boss": "Rotface"
+ },
+ {
+  "id": 50027,
+  "name": "Rot-Resistant Breastplate",
+  "quality": 4,
+  "boss": "Rotface"
+ },
+ {
+  "id": 50025,
+  "name": "Seal of Many Mouths",
+  "quality": 4,
+  "boss": "Rotface"
+ },
+ {
+  "id": 50028,
+  "name": "Trauma",
+  "quality": 4,
+  "boss": "Rotface"
+ },
+ {
+  "id": 50019,
+  "name": "Winding Sheet",
+  "quality": 4,
+  "boss": "Rotface"
+ },
+ {
+  "id": 50067,
+  "name": "Astrylian's Sutured Cinch",
+  "quality": 4,
+  "boss": "Professor Putricide"
+ },
+ {
+  "id": 50179,
+  "name": "Last Word",
+  "quality": 4,
+  "boss": "Professor Putricide"
+ },
+ {
+  "id": 50069,
+  "name": "Professor's Bloodied Smock",
+  "quality": 4,
+  "boss": "Professor Putricide"
+ },
+ {
+  "id": 50068,
+  "name": "Rigormortis",
+  "quality": 4,
+  "boss": "Professor Putricide"
+ },
+ {
+  "id": 50351,
+  "name": "Tiny Abomination in a Jar",
+  "quality": 4,
+  "boss": "Professor Putricide"
+ },
+ {
+  "id": 50175,
+  "name": "Crypt Keeper's Bracers",
+  "quality": 4,
+  "boss": "Blood Prince Council"
+ },
+ {
+  "id": 49919,
+  "name": "Cryptmaker",
+  "quality": 4,
+  "boss": "Blood Prince Council"
+ },
+ {
+  "id": 50073,
+  "name": "Geistlord's Punishment Sack",
+  "quality": 4,
+  "boss": "Blood Prince Council"
+ },
+ {
+  "id": 50174,
+  "name": "Incarnadine Band of Mending",
+  "quality": 4,
+  "boss": "Blood Prince Council"
+ },
+ {
+  "id": 50184,
+  "name": "Keleseth's Seducer",
+  "quality": 4,
+  "boss": "Blood Prince Council"
+ },
+ {
+  "id": 50072,
+  "name": "Landsoul's Horned Greathelm",
+  "quality": 4,
+  "boss": "Blood Prince Council"
+ },
+ {
+  "id": 50177,
+  "name": "Mail of Crimson Coins",
+  "quality": 4,
+  "boss": "Blood Prince Council"
+ },
+ {
+  "id": 50074,
+  "name": "Royal Crimson Cloak",
+  "quality": 4,
+  "boss": "Blood Prince Council"
+ },
+ {
+  "id": 50176,
+  "name": "San'layn Ritualist Gloves",
+  "quality": 4,
+  "boss": "Blood Prince Council"
+ },
+ {
+  "id": 50172,
+  "name": "Sanguine Silk Robes",
+  "quality": 4,
+  "boss": "Blood Prince Council"
+ },
+ {
+  "id": 50173,
+  "name": "Shadow Silk Spindle",
+  "quality": 4,
+  "boss": "Blood Prince Council"
+ },
+ {
+  "id": 50171,
+  "name": "Shoulders of Frost-Tipped Thorns",
+  "quality": 4,
+  "boss": "Blood Prince Council"
+ },
+ {
+  "id": 50075,
+  "name": "Taldaram's Plated Fists",
+  "quality": 4,
+  "boss": "Blood Prince Council"
+ },
+ {
+  "id": 50071,
+  "name": "Treads of the Wasteland",
+  "quality": 4,
+  "boss": "Blood Prince Council"
+ },
+ {
+  "id": 50170,
+  "name": "Valanar's Other Signet Ring",
+  "quality": 4,
+  "boss": "Blood Prince Council"
+ },
+ {
+  "id": 50354,
+  "name": "Bauble of True Blood",
+  "quality": 4,
+  "boss": "Blood-Queen Lana'thel"
+ },
+ {
+  "id": 50182,
+  "name": "Blood Queen's Crimson Choker",
+  "quality": 4,
+  "boss": "Blood-Queen Lana'thel"
+ },
+ {
+  "id": 50178,
+  "name": "Bloodfall",
+  "quality": 4,
+  "boss": "Blood-Queen Lana'thel"
+ },
+ {
+  "id": 50181,
+  "name": "Dying Light",
+  "quality": 4,
+  "boss": "Blood-Queen Lana'thel"
+ },
+ {
+  "id": 50065,
+  "name": "Icecrown Glacial Wall",
+  "quality": 4,
+  "boss": "Blood-Queen Lana'thel"
+ },
+ {
+  "id": 50180,
+  "name": "Lana'thel's Chain of Flagellation",
+  "quality": 4,
+  "boss": "Blood-Queen Lana'thel"
+ },
+ {
+  "id": 50188,
+  "name": "Anub'ar Stalker's Gloves",
+  "quality": 4,
+  "boss": "Valithria Dreamwalker"
+ },
+ {
+  "id": 50416,
+  "name": "Boots of the Funeral March",
+  "quality": 4,
+  "boss": "Valithria Dreamwalker"
+ },
+ {
+  "id": 50417,
+  "name": "Bracers of Eternal Dreaming",
+  "quality": 4,
+  "boss": "Valithria Dreamwalker"
+ },
+ {
+  "id": 50187,
+  "name": "Coldwraith Links",
+  "quality": 4,
+  "boss": "Valithria Dreamwalker"
+ },
+ {
+  "id": 50185,
+  "name": "Devium's Eternally Cold Ring",
+  "quality": 4,
+  "boss": "Valithria Dreamwalker"
+ },
+ {
+  "id": 50205,
+  "name": "Frostbinder's Shredded Cape",
+  "quality": 4,
+  "boss": "Valithria Dreamwalker"
+ },
+ {
+  "id": 50186,
+  "name": "Frostbrood Sapphire Ring",
+  "quality": 4,
+  "boss": "Valithria Dreamwalker"
+ },
+ {
+  "id": 50190,
+  "name": "Grinning Skull Greatboots",
+  "quality": 4,
+  "boss": "Valithria Dreamwalker"
+ },
+ {
+  "id": 50199,
+  "name": "Leggings of Dying Candles",
+  "quality": 4,
+  "boss": "Valithria Dreamwalker"
+ },
+ {
+  "id": 50183,
+  "name": "Lungbreaker",
+  "quality": 4,
+  "boss": "Valithria Dreamwalker"
+ },
+ {
+  "id": 50472,
+  "name": "Nightmare Ender",
+  "quality": 4,
+  "boss": "Valithria Dreamwalker"
+ },
+ {
+  "id": 50195,
+  "name": "Noose of Malachite",
+  "quality": 4,
+  "boss": "Valithria Dreamwalker"
+ },
+ {
+  "id": 50418,
+  "name": "Robe of the Waking Nightmare",
+  "quality": 4,
+  "boss": "Valithria Dreamwalker"
+ },
+ {
+  "id": 50192,
+  "name": "Scourge Reaver's Legplates",
+  "quality": 4,
+  "boss": "Valithria Dreamwalker"
+ },
+ {
+  "id": 50202,
+  "name": "Snowstorm Helm",
+  "quality": 4,
+  "boss": "Valithria Dreamwalker"
+ },
+ {
+  "id": 50424,
+  "name": "Memory of Malygos",
+  "quality": 4,
+  "boss": "Sindragosa"
+ },
+ {
+  "id": 50360,
+  "name": "Phylactery of the Nameless Lich",
+  "quality": 4,
+  "boss": "Sindragosa"
+ },
+ {
+  "id": 50421,
+  "name": "Sindragosa's Cruel Claw",
+  "quality": 4,
+  "boss": "Sindragosa"
+ },
+ {
+  "id": 50361,
+  "name": "Sindragosa's Flawless Fang",
+  "quality": 4,
+  "boss": "Sindragosa"
+ },
+ {
+  "id": 50423,
+  "name": "Sundial of Eternal Dusk",
+  "quality": 4,
+  "boss": "Sindragosa"
+ },
+ {
+  "id": 50429,
+  "name": "Archus, Greatstaff of Antonidas",
+  "quality": 4,
+  "boss": "The Lich King"
+ },
+ {
+  "id": 50427,
+  "name": "Bloodsurge, Kel'Thuzad's Blade of Agony",
+  "quality": 4,
+  "boss": "The Lich King"
+ },
+ {
+  "id": 49981,
+  "name": "Fal'inrush, Defender of Quel'thalas",
+  "quality": 4,
+  "boss": "The Lich King"
+ },
+ {
+  "id": 50070,
+  "name": "Glorenzelg, High-Blade of the Silver Hand",
+  "quality": 4,
+  "boss": "The Lich King"
+ },
+ {
+  "id": 50012,
+  "name": "Havoc's Call, Blade of Lordaeron Kings",
+  "quality": 4,
+  "boss": "The Lich King"
+ },
+ {
+  "id": 50426,
+  "name": "Heaven's Fall, Kryss of a Thousand Lies",
+  "quality": 4,
+  "boss": "The Lich King"
+ },
+ {
+  "id": 49997,
+  "name": "Mithrios, Bronzebeard's Legacy",
+  "quality": 4,
+  "boss": "The Lich King"
+ },
+ {
+  "id": 50425,
+  "name": "Oathbinder, Charge of the Ranger-General",
+  "quality": 4,
+  "boss": "The Lich King"
+ },
+ {
+  "id": 50428,
+  "name": "Royal Scepter of Terenas II",
+  "quality": 4,
+  "boss": "The Lich King"
+ },
+ {
+  "id": 51315,
+  "name": "Sealed Chest",
+  "quality": 4,
+  "boss": "The Lich King"
+ },
+ {
+  "id": 50451,
+  "name": "Belt of the Lonely Noble",
+  "quality": 4,
+  "boss": "Trash"
+ },
+ {
+  "id": 50447,
+  "name": "Harbinger's Bone Band",
+  "quality": 4,
+  "boss": "Trash"
+ },
+ {
+  "id": 50450,
+  "name": "Leggings of Dubious Charms",
+  "quality": 4,
+  "boss": "Trash"
+ },
+ {
+  "id": 50453,
+  "name": "Ring of Rotting Sinew",
+  "quality": 4,
+  "boss": "Trash"
+ },
+ {
+  "id": 50444,
+  "name": "Rowan's Rifle of Silver Bullets",
+  "quality": 4,
+  "boss": "Trash"
+ },
+ {
+  "id": 50449,
+  "name": "Stiffened Corpse Shoulderpads",
+  "quality": 4,
+  "boss": "Trash"
+ },
+ {
+  "id": 50452,
+  "name": "Wodin's Lucky Necklace",
+  "quality": 4,
+  "boss": "Trash"
+ }
+]

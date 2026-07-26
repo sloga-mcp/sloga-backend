@@ -1,0 +1,1488 @@
+[
+ {
+  "id": 39702,
+  "name": "Arachnoid Gold Band",
+  "quality": 4,
+  "boss": "Anub'Rekhan"
+ },
+ {
+  "id": 39701,
+  "name": "Dawnwalkers",
+  "quality": 4,
+  "boss": "Anub'Rekhan"
+ },
+ {
+  "id": 39712,
+  "name": "Gemmed Wand of the Nerubians",
+  "quality": 4,
+  "boss": "Anub'Rekhan"
+ },
+ {
+  "id": 39720,
+  "name": "Leggings of Atrophy",
+  "quality": 4,
+  "boss": "Anub'Rekhan"
+ },
+ {
+  "id": 39719,
+  "name": "Mantle of the Locusts",
+  "quality": 4,
+  "boss": "Anub'Rekhan"
+ },
+ {
+  "id": 39704,
+  "name": "Pauldrons of Unnatural Death",
+  "quality": 4,
+  "boss": "Anub'Rekhan"
+ },
+ {
+  "id": 39703,
+  "name": "Rescinding Grips",
+  "quality": 4,
+  "boss": "Anub'Rekhan"
+ },
+ {
+  "id": 39706,
+  "name": "Sabatons of Sudden Reprisal",
+  "quality": 4,
+  "boss": "Anub'Rekhan"
+ },
+ {
+  "id": 39721,
+  "name": "Sash of the Parlor",
+  "quality": 4,
+  "boss": "Anub'Rekhan"
+ },
+ {
+  "id": 39716,
+  "name": "Shield of Assimilation",
+  "quality": 4,
+  "boss": "Anub'Rekhan"
+ },
+ {
+  "id": 39722,
+  "name": "Swarm Bindings",
+  "quality": 4,
+  "boss": "Anub'Rekhan"
+ },
+ {
+  "id": 39714,
+  "name": "Webbed Death",
+  "quality": 4,
+  "boss": "Anub'Rekhan"
+ },
+ {
+  "id": 39718,
+  "name": "Corpse Scarab Handguards",
+  "quality": 4,
+  "boss": "Anub'Rekhan / Gluth"
+ },
+ {
+  "id": 39717,
+  "name": "Inexorable Sabatons",
+  "quality": 4,
+  "boss": "Anub'Rekhan / Gluth"
+ },
+ {
+  "id": 40071,
+  "name": "Chains of Adoration",
+  "quality": 4,
+  "boss": "Anub'Rekhan / Grand Widow Faerlina / Noth the Plaguebringer / Instructor Razuvious / Patchwerk"
+ },
+ {
+  "id": 40065,
+  "name": "Fool's Trial",
+  "quality": 4,
+  "boss": "Anub'Rekhan / Grand Widow Faerlina / Noth the Plaguebringer / Instructor Razuvious / Patchwerk"
+ },
+ {
+  "id": 40069,
+  "name": "Heritage",
+  "quality": 4,
+  "boss": "Anub'Rekhan / Grand Widow Faerlina / Noth the Plaguebringer / Instructor Razuvious / Patchwerk"
+ },
+ {
+  "id": 40080,
+  "name": "Lost Jewel",
+  "quality": 4,
+  "boss": "Anub'Rekhan / Grand Widow Faerlina / Noth the Plaguebringer / Instructor Razuvious / Patchwerk"
+ },
+ {
+  "id": 40075,
+  "name": "Ruthlessness",
+  "quality": 4,
+  "boss": "Anub'Rekhan / Grand Widow Faerlina / Noth the Plaguebringer / Instructor Razuvious / Patchwerk"
+ },
+ {
+  "id": 40107,
+  "name": "Sand-Worn Band",
+  "quality": 4,
+  "boss": "Anub'Rekhan / Grand Widow Faerlina / Noth the Plaguebringer / Instructor Razuvious / Patchwerk"
+ },
+ {
+  "id": 40108,
+  "name": "Seized Beauty",
+  "quality": 4,
+  "boss": "Anub'Rekhan / Grand Widow Faerlina / Noth the Plaguebringer / Instructor Razuvious / Patchwerk"
+ },
+ {
+  "id": 40074,
+  "name": "Strong-Handed Ring",
+  "quality": 4,
+  "boss": "Anub'Rekhan / Grand Widow Faerlina / Noth the Plaguebringer / Instructor Razuvious / Patchwerk"
+ },
+ {
+  "id": 40064,
+  "name": "Thunderstorm Amulet",
+  "quality": 4,
+  "boss": "Anub'Rekhan / Grand Widow Faerlina / Noth the Plaguebringer / Instructor Razuvious / Patchwerk"
+ },
+ {
+  "id": 39734,
+  "name": "Atonement Greaves",
+  "quality": 4,
+  "boss": "Grand Widow Faerlina"
+ },
+ {
+  "id": 39735,
+  "name": "Belt of False Dignity",
+  "quality": 4,
+  "boss": "Grand Widow Faerlina"
+ },
+ {
+  "id": 39729,
+  "name": "Bracers of the Tyrant",
+  "quality": 4,
+  "boss": "Grand Widow Faerlina"
+ },
+ {
+  "id": 39726,
+  "name": "Callous-Hearted Gauntlets",
+  "quality": 4,
+  "boss": "Grand Widow Faerlina"
+ },
+ {
+  "id": 39724,
+  "name": "Cult's Chestguard",
+  "quality": 4,
+  "boss": "Grand Widow Faerlina"
+ },
+ {
+  "id": 39727,
+  "name": "Dislocating Handguards",
+  "quality": 4,
+  "boss": "Grand Widow Faerlina"
+ },
+ {
+  "id": 39725,
+  "name": "Epaulets of the Grieving Servant",
+  "quality": 4,
+  "boss": "Grand Widow Faerlina"
+ },
+ {
+  "id": 39732,
+  "name": "Faerlina's Madness",
+  "quality": 4,
+  "boss": "Grand Widow Faerlina"
+ },
+ {
+  "id": 39723,
+  "name": "Fire-Scorched Greathelm",
+  "quality": 4,
+  "boss": "Grand Widow Faerlina"
+ },
+ {
+  "id": 39757,
+  "name": "Idol of Worship",
+  "quality": 4,
+  "boss": "Grand Widow Faerlina"
+ },
+ {
+  "id": 39731,
+  "name": "Punctilious Bindings",
+  "quality": 4,
+  "boss": "Grand Widow Faerlina"
+ },
+ {
+  "id": 39728,
+  "name": "Totem of Misery",
+  "quality": 4,
+  "boss": "Grand Widow Faerlina"
+ },
+ {
+  "id": 39756,
+  "name": "Tunic of Prejudice",
+  "quality": 4,
+  "boss": "Grand Widow Faerlina"
+ },
+ {
+  "id": 39730,
+  "name": "Widow's Fury",
+  "quality": 4,
+  "boss": "Grand Widow Faerlina"
+ },
+ {
+  "id": 39733,
+  "name": "Gloves of Token Respect",
+  "quality": 4,
+  "boss": "Grand Widow Faerlina / Gluth"
+ },
+ {
+  "id": 39759,
+  "name": "Ablative Chitin Girdle",
+  "quality": 4,
+  "boss": "Maexxna"
+ },
+ {
+  "id": 39764,
+  "name": "Bindings of the Hapless Prey",
+  "quality": 4,
+  "boss": "Maexxna"
+ },
+ {
+  "id": 40062,
+  "name": "Digested Silken Robes",
+  "quality": 4,
+  "boss": "Maexxna"
+ },
+ {
+  "id": 40060,
+  "name": "Distorted Limbs",
+  "quality": 4,
+  "boss": "Maexxna"
+ },
+ {
+  "id": 39761,
+  "name": "Infectious Skitterer Leggings",
+  "quality": 4,
+  "boss": "Maexxna"
+ },
+ {
+  "id": 40063,
+  "name": "Mantle of Shattered Kinship",
+  "quality": 4,
+  "boss": "Maexxna"
+ },
+ {
+  "id": 39766,
+  "name": "Matriarch's Spawn",
+  "quality": 4,
+  "boss": "Maexxna"
+ },
+ {
+  "id": 40061,
+  "name": "Quivering Tunic",
+  "quality": 4,
+  "boss": "Maexxna"
+ },
+ {
+  "id": 39765,
+  "name": "Sinner's Bindings",
+  "quality": 4,
+  "boss": "Maexxna"
+ },
+ {
+  "id": 39758,
+  "name": "The Jawbone",
+  "quality": 4,
+  "boss": "Maexxna"
+ },
+ {
+  "id": 39762,
+  "name": "Torn Web Wrapping",
+  "quality": 4,
+  "boss": "Maexxna"
+ },
+ {
+  "id": 39767,
+  "name": "Undiminished Battleplate",
+  "quality": 4,
+  "boss": "Maexxna"
+ },
+ {
+  "id": 39763,
+  "name": "Wraith Strike",
+  "quality": 4,
+  "boss": "Maexxna"
+ },
+ {
+  "id": 39768,
+  "name": "Cowl of the Perished",
+  "quality": 4,
+  "boss": "Maexxna / Gluth"
+ },
+ {
+  "id": 39760,
+  "name": "Helm of Diminished Pride",
+  "quality": 4,
+  "boss": "Maexxna / Gluth"
+ },
+ {
+  "id": 40250,
+  "name": "Aged Winter Cloak",
+  "quality": 4,
+  "boss": "Maexxna / Heigan the Unclean / Gothik the Harvester / Grobbulus"
+ },
+ {
+  "id": 40254,
+  "name": "Cloak of Averted Crisis",
+  "quality": 4,
+  "boss": "Maexxna / Heigan the Unclean / Gothik the Harvester / Grobbulus"
+ },
+ {
+  "id": 40252,
+  "name": "Cloak of the Shadowed Sun",
+  "quality": 4,
+  "boss": "Maexxna / Heigan the Unclean / Gothik the Harvester / Grobbulus"
+ },
+ {
+  "id": 40257,
+  "name": "Defender's Code",
+  "quality": 4,
+  "boss": "Maexxna / Heigan the Unclean / Gothik the Harvester / Grobbulus"
+ },
+ {
+  "id": 40255,
+  "name": "Dying Curse",
+  "quality": 4,
+  "boss": "Maexxna / Heigan the Unclean / Gothik the Harvester / Grobbulus"
+ },
+ {
+  "id": 40258,
+  "name": "Forethought Talisman",
+  "quality": 4,
+  "boss": "Maexxna / Heigan the Unclean / Gothik the Harvester / Grobbulus"
+ },
+ {
+  "id": 40256,
+  "name": "Grim Toll",
+  "quality": 4,
+  "boss": "Maexxna / Heigan the Unclean / Gothik the Harvester / Grobbulus"
+ },
+ {
+  "id": 40253,
+  "name": "Shawl of the Old Maid",
+  "quality": 4,
+  "boss": "Maexxna / Heigan the Unclean / Gothik the Harvester / Grobbulus"
+ },
+ {
+  "id": 40251,
+  "name": "Shroud of Luminosity",
+  "quality": 4,
+  "boss": "Maexxna / Heigan the Unclean / Gothik the Harvester / Grobbulus"
+ },
+ {
+  "id": 40192,
+  "name": "Accursed Spine",
+  "quality": 4,
+  "boss": "Noth the Plaguebringer"
+ },
+ {
+  "id": 40189,
+  "name": "Angry Dread",
+  "quality": 4,
+  "boss": "Noth the Plaguebringer"
+ },
+ {
+  "id": 40198,
+  "name": "Bands of Impurity",
+  "quality": 4,
+  "boss": "Noth the Plaguebringer"
+ },
+ {
+  "id": 40200,
+  "name": "Belt of Potent Chanting",
+  "quality": 4,
+  "boss": "Noth the Plaguebringer"
+ },
+ {
+  "id": 40184,
+  "name": "Crippled Treads",
+  "quality": 4,
+  "boss": "Noth the Plaguebringer"
+ },
+ {
+  "id": 40197,
+  "name": "Gloves of the Fallen Wizard",
+  "quality": 4,
+  "boss": "Noth the Plaguebringer"
+ },
+ {
+  "id": 40196,
+  "name": "Legguards of the Undisturbed",
+  "quality": 4,
+  "boss": "Noth the Plaguebringer"
+ },
+ {
+  "id": 40187,
+  "name": "Poignant Sabatons",
+  "quality": 4,
+  "boss": "Noth the Plaguebringer"
+ },
+ {
+  "id": 40190,
+  "name": "Spinning Fate",
+  "quality": 4,
+  "boss": "Noth the Plaguebringer"
+ },
+ {
+  "id": 40186,
+  "name": "Thrusting Bands",
+  "quality": 4,
+  "boss": "Noth the Plaguebringer"
+ },
+ {
+  "id": 40188,
+  "name": "Gauntlets of the Disobedient",
+  "quality": 4,
+  "boss": "Noth the Plaguebringer / Gluth"
+ },
+ {
+  "id": 40191,
+  "name": "Libram of Radiance",
+  "quality": 4,
+  "boss": "Noth the Plaguebringer / Gluth"
+ },
+ {
+  "id": 40602,
+  "name": "Robes of Mutation",
+  "quality": 4,
+  "boss": "Noth the Plaguebringer / Gluth"
+ },
+ {
+  "id": 40185,
+  "name": "Shoulderguards of Opportunity",
+  "quality": 4,
+  "boss": "Noth the Plaguebringer / Gluth"
+ },
+ {
+  "id": 40193,
+  "name": "Tunic of Masked Suffering",
+  "quality": 4,
+  "boss": "Noth the Plaguebringer / Gluth"
+ },
+ {
+  "id": 40210,
+  "name": "Chestguard of Bitter Charms",
+  "quality": 4,
+  "boss": "Heigan the Unclean"
+ },
+ {
+  "id": 40208,
+  "name": "Cryptfiend's Bite",
+  "quality": 4,
+  "boss": "Heigan the Unclean"
+ },
+ {
+  "id": 40237,
+  "name": "Eruption-Scarred Boots",
+  "quality": 4,
+  "boss": "Heigan the Unclean"
+ },
+ {
+  "id": 40238,
+  "name": "Gloves of the Dancing Bear",
+  "quality": 4,
+  "boss": "Heigan the Unclean"
+ },
+ {
+  "id": 40234,
+  "name": "Heigan's Putrid Vestments",
+  "quality": 4,
+  "boss": "Heigan the Unclean"
+ },
+ {
+  "id": 40235,
+  "name": "Helm of Pilgrimage",
+  "quality": 4,
+  "boss": "Heigan the Unclean"
+ },
+ {
+  "id": 40201,
+  "name": "Leggings of Colossal Strides",
+  "quality": 4,
+  "boss": "Heigan the Unclean"
+ },
+ {
+  "id": 40236,
+  "name": "Serene Echoes",
+  "quality": 4,
+  "boss": "Heigan the Unclean"
+ },
+ {
+  "id": 40207,
+  "name": "Sigil of Awareness",
+  "quality": 4,
+  "boss": "Heigan the Unclean"
+ },
+ {
+  "id": 40233,
+  "name": "The Undeath Carrier",
+  "quality": 4,
+  "boss": "Heigan the Unclean"
+ },
+ {
+  "id": 40209,
+  "name": "Bindings of the Decrepit",
+  "quality": 4,
+  "boss": "Heigan the Unclean / Gluth"
+ },
+ {
+  "id": 40203,
+  "name": "Breastplate of Tormented Rage",
+  "quality": 4,
+  "boss": "Heigan the Unclean / Gluth"
+ },
+ {
+  "id": 40206,
+  "name": "Iron-Spring Jumpers",
+  "quality": 4,
+  "boss": "Heigan the Unclean / Gluth"
+ },
+ {
+  "id": 40204,
+  "name": "Legguards of the Apostle",
+  "quality": 4,
+  "boss": "Heigan the Unclean / Gluth"
+ },
+ {
+  "id": 40205,
+  "name": "Stalk-Skin Belt",
+  "quality": 4,
+  "boss": "Heigan the Unclean / Gluth"
+ },
+ {
+  "id": 40246,
+  "name": "Boots of Impetuous Ideals",
+  "quality": 4,
+  "boss": "Loatheb"
+ },
+ {
+  "id": 40245,
+  "name": "Fading Glow",
+  "quality": 4,
+  "boss": "Loatheb"
+ },
+ {
+  "id": 40243,
+  "name": "Footwraps of Vile Deceit",
+  "quality": 4,
+  "boss": "Loatheb"
+ },
+ {
+  "id": 40241,
+  "name": "Girdle of Unity",
+  "quality": 4,
+  "boss": "Loatheb"
+ },
+ {
+  "id": 40240,
+  "name": "Greaves of Turbulence",
+  "quality": 4,
+  "boss": "Loatheb"
+ },
+ {
+  "id": 40239,
+  "name": "The Hand of Nerub",
+  "quality": 4,
+  "boss": "Loatheb"
+ },
+ {
+  "id": 40244,
+  "name": "The Impossible Dream",
+  "quality": 4,
+  "boss": "Loatheb"
+ },
+ {
+  "id": 40249,
+  "name": "Vest of Vitality",
+  "quality": 4,
+  "boss": "Loatheb"
+ },
+ {
+  "id": 40247,
+  "name": "Cowl of Innocent Delight",
+  "quality": 4,
+  "boss": "Loatheb / Gluth"
+ },
+ {
+  "id": 40242,
+  "name": "Grotesque Handgrips",
+  "quality": 4,
+  "boss": "Loatheb / Gluth"
+ },
+ {
+  "id": 40637,
+  "name": "Mantle of the Lost Conqueror",
+  "quality": 4,
+  "boss": "Loatheb / Gluth",
+  "allowable_classes": [
+   "paladin",
+   "priest",
+   "warlock"
+  ]
+ },
+ {
+  "id": 40638,
+  "name": "Mantle of the Lost Protector",
+  "quality": 4,
+  "boss": "Loatheb / Gluth",
+  "allowable_classes": [
+   "warrior",
+   "hunter",
+   "shaman"
+  ]
+ },
+ {
+  "id": 40639,
+  "name": "Mantle of the Lost Vanquisher",
+  "quality": 4,
+  "boss": "Loatheb / Gluth",
+  "allowable_classes": [
+   "rogue",
+   "deathknight",
+   "mage",
+   "druid"
+  ]
+ },
+ {
+  "id": 40324,
+  "name": "Bands of Mutual Respect",
+  "quality": 4,
+  "boss": "Instructor Razuvious"
+ },
+ {
+  "id": 40325,
+  "name": "Bindings of the Expansive Mind",
+  "quality": 4,
+  "boss": "Instructor Razuvious"
+ },
+ {
+  "id": 40306,
+  "name": "Bracers of the Unholy Knight",
+  "quality": 4,
+  "boss": "Instructor Razuvious"
+ },
+ {
+  "id": 40323,
+  "name": "Esteemed Bindings",
+  "quality": 4,
+  "boss": "Instructor Razuvious"
+ },
+ {
+  "id": 40320,
+  "name": "Faithful Steel Sabatons",
+  "quality": 4,
+  "boss": "Instructor Razuvious"
+ },
+ {
+  "id": 40316,
+  "name": "Gauntlets of Guiding Touch",
+  "quality": 4,
+  "boss": "Instructor Razuvious"
+ },
+ {
+  "id": 40317,
+  "name": "Girdle of Razuvious",
+  "quality": 4,
+  "boss": "Instructor Razuvious"
+ },
+ {
+  "id": 40327,
+  "name": "Girdle of Recuperation",
+  "quality": 4,
+  "boss": "Instructor Razuvious"
+ },
+ {
+  "id": 40321,
+  "name": "Idol of the Shooting Star",
+  "quality": 4,
+  "boss": "Instructor Razuvious"
+ },
+ {
+  "id": 40318,
+  "name": "Legplates of Double Strikes",
+  "quality": 4,
+  "boss": "Instructor Razuvious"
+ },
+ {
+  "id": 40315,
+  "name": "Shoulderpads of Secret Arts",
+  "quality": 4,
+  "boss": "Instructor Razuvious"
+ },
+ {
+  "id": 40305,
+  "name": "Spaulders of Egotism",
+  "quality": 4,
+  "boss": "Instructor Razuvious"
+ },
+ {
+  "id": 40322,
+  "name": "Totem of Dueling",
+  "quality": 4,
+  "boss": "Instructor Razuvious"
+ },
+ {
+  "id": 40326,
+  "name": "Boots of Forlorn Wishes",
+  "quality": 4,
+  "boss": "Instructor Razuvious / Gluth"
+ },
+ {
+  "id": 40319,
+  "name": "Chestpiece of Suspicion",
+  "quality": 4,
+  "boss": "Instructor Razuvious / Gluth"
+ },
+ {
+  "id": 40338,
+  "name": "Bindings of Yearning",
+  "quality": 4,
+  "boss": "Gothik the Harvester"
+ },
+ {
+  "id": 40330,
+  "name": "Bracers of Unrelenting Attack",
+  "quality": 4,
+  "boss": "Gothik the Harvester"
+ },
+ {
+  "id": 40334,
+  "name": "Burdened Shoulderplates",
+  "quality": 4,
+  "boss": "Gothik the Harvester"
+ },
+ {
+  "id": 40339,
+  "name": "Gothik's Cowl",
+  "quality": 4,
+  "boss": "Gothik the Harvester"
+ },
+ {
+  "id": 40340,
+  "name": "Helm of Unleashed Energy",
+  "quality": 4,
+  "boss": "Gothik the Harvester"
+ },
+ {
+  "id": 40328,
+  "name": "Helm of Vital Protection",
+  "quality": 4,
+  "boss": "Gothik the Harvester"
+ },
+ {
+  "id": 40329,
+  "name": "Hood of the Exodus",
+  "quality": 4,
+  "boss": "Gothik the Harvester"
+ },
+ {
+  "id": 40342,
+  "name": "Idol of Awakening",
+  "quality": 4,
+  "boss": "Gothik the Harvester"
+ },
+ {
+  "id": 40331,
+  "name": "Leggings of Failed Escape",
+  "quality": 4,
+  "boss": "Gothik the Harvester"
+ },
+ {
+  "id": 40333,
+  "name": "Leggings of Fleeting Moments",
+  "quality": 4,
+  "boss": "Gothik the Harvester"
+ },
+ {
+  "id": 40337,
+  "name": "Libram of Resurgence",
+  "quality": 4,
+  "boss": "Gothik the Harvester"
+ },
+ {
+  "id": 40336,
+  "name": "Life and Death",
+  "quality": 4,
+  "boss": "Gothik the Harvester"
+ },
+ {
+  "id": 40341,
+  "name": "Shackled Cinch",
+  "quality": 4,
+  "boss": "Gothik the Harvester"
+ },
+ {
+  "id": 40335,
+  "name": "Touch of Horror",
+  "quality": 4,
+  "boss": "Gothik the Harvester"
+ },
+ {
+  "id": 40332,
+  "name": "Abetment Bracers",
+  "quality": 4,
+  "boss": "Gothik the Harvester / Gluth"
+ },
+ {
+  "id": 40343,
+  "name": "Armageddon",
+  "quality": 4,
+  "boss": "The Four Horsemen"
+ },
+ {
+  "id": 40345,
+  "name": "Broken Promise",
+  "quality": 4,
+  "boss": "The Four Horsemen"
+ },
+ {
+  "id": 40348,
+  "name": "Damnation",
+  "quality": 4,
+  "boss": "The Four Horsemen"
+ },
+ {
+  "id": 40346,
+  "name": "Final Voyage",
+  "quality": 4,
+  "boss": "The Four Horsemen"
+ },
+ {
+  "id": 40349,
+  "name": "Gloves of Peaceful Death",
+  "quality": 4,
+  "boss": "The Four Horsemen"
+ },
+ {
+  "id": 40344,
+  "name": "Helm of the Grave",
+  "quality": 4,
+  "boss": "The Four Horsemen"
+ },
+ {
+  "id": 40352,
+  "name": "Leggings of Voracious Shadows",
+  "quality": 4,
+  "boss": "The Four Horsemen"
+ },
+ {
+  "id": 40286,
+  "name": "Mantle of the Corrupted",
+  "quality": 4,
+  "boss": "The Four Horsemen"
+ },
+ {
+  "id": 40347,
+  "name": "Zeliek's Gauntlets",
+  "quality": 4,
+  "boss": "The Four Horsemen"
+ },
+ {
+  "id": 40625,
+  "name": "Breastplate of the Lost Conqueror",
+  "quality": 4,
+  "boss": "The Four Horsemen / Gluth",
+  "allowable_classes": [
+   "paladin",
+   "priest",
+   "warlock"
+  ]
+ },
+ {
+  "id": 40626,
+  "name": "Breastplate of the Lost Protector",
+  "quality": 4,
+  "boss": "The Four Horsemen / Gluth",
+  "allowable_classes": [
+   "warrior",
+   "hunter",
+   "shaman"
+  ]
+ },
+ {
+  "id": 40627,
+  "name": "Breastplate of the Lost Vanquisher",
+  "quality": 4,
+  "boss": "The Four Horsemen / Gluth",
+  "allowable_classes": [
+   "rogue",
+   "deathknight",
+   "mage",
+   "druid"
+  ]
+ },
+ {
+  "id": 40350,
+  "name": "Urn of Lost Memories",
+  "quality": 4,
+  "boss": "The Four Horsemen / Gluth"
+ },
+ {
+  "id": 40265,
+  "name": "Arrowsong",
+  "quality": 4,
+  "boss": "Patchwerk"
+ },
+ {
+  "id": 40269,
+  "name": "Boots of Persuasion",
+  "quality": 4,
+  "boss": "Patchwerk"
+ },
+ {
+  "id": 40261,
+  "name": "Crude Discolored Battlegrips",
+  "quality": 4,
+  "boss": "Patchwerk"
+ },
+ {
+  "id": 40263,
+  "name": "Fleshless Girdle",
+  "quality": 4,
+  "boss": "Patchwerk"
+ },
+ {
+  "id": 40272,
+  "name": "Girdle of the Gambit",
+  "quality": 4,
+  "boss": "Patchwerk"
+ },
+ {
+  "id": 40262,
+  "name": "Gloves of Calculated Risk",
+  "quality": 4,
+  "boss": "Patchwerk"
+ },
+ {
+  "id": 40266,
+  "name": "Hero's Surrender",
+  "quality": 4,
+  "boss": "Patchwerk"
+ },
+ {
+  "id": 40268,
+  "name": "Libram of Tolerance",
+  "quality": 4,
+  "boss": "Patchwerk"
+ },
+ {
+  "id": 40271,
+  "name": "Sash of Solitude",
+  "quality": 4,
+  "boss": "Patchwerk"
+ },
+ {
+  "id": 40264,
+  "name": "Split Greathammer",
+  "quality": 4,
+  "boss": "Patchwerk"
+ },
+ {
+  "id": 40273,
+  "name": "Surplus Limb",
+  "quality": 4,
+  "boss": "Patchwerk"
+ },
+ {
+  "id": 40267,
+  "name": "Totem of Hex",
+  "quality": 4,
+  "boss": "Patchwerk"
+ },
+ {
+  "id": 40260,
+  "name": "Belt of the Tortured",
+  "quality": 4,
+  "boss": "Patchwerk / Gluth"
+ },
+ {
+  "id": 40270,
+  "name": "Boots of Septic Wounds",
+  "quality": 4,
+  "boss": "Patchwerk / Gluth"
+ },
+ {
+  "id": 40259,
+  "name": "Waistguard of Divine Grace",
+  "quality": 4,
+  "boss": "Patchwerk / Gluth"
+ },
+ {
+  "id": 40274,
+  "name": "Bracers of Liberation",
+  "quality": 4,
+  "boss": "Grobbulus"
+ },
+ {
+  "id": 40279,
+  "name": "Chestguard of the Exhausted",
+  "quality": 4,
+  "boss": "Grobbulus"
+ },
+ {
+  "id": 40287,
+  "name": "Cowl of Vanity",
+  "quality": 4,
+  "boss": "Grobbulus"
+ },
+ {
+  "id": 40275,
+  "name": "Depraved Linked Belt",
+  "quality": 4,
+  "boss": "Grobbulus"
+ },
+ {
+  "id": 40285,
+  "name": "Desecrated Past",
+  "quality": 4,
+  "boss": "Grobbulus"
+ },
+ {
+  "id": 40283,
+  "name": "Fallout Impervious Tunic",
+  "quality": 4,
+  "boss": "Grobbulus"
+ },
+ {
+  "id": 40278,
+  "name": "Girdle of Chivalry",
+  "quality": 4,
+  "boss": "Grobbulus"
+ },
+ {
+  "id": 40351,
+  "name": "Mantle of the Fatigued Sage",
+  "quality": 4,
+  "boss": "Grobbulus"
+ },
+ {
+  "id": 40280,
+  "name": "Origin of Nightmares",
+  "quality": 4,
+  "boss": "Grobbulus"
+ },
+ {
+  "id": 40284,
+  "name": "Plague Igniter",
+  "quality": 4,
+  "boss": "Grobbulus"
+ },
+ {
+  "id": 40282,
+  "name": "Slime Stream Bands",
+  "quality": 4,
+  "boss": "Grobbulus"
+ },
+ {
+  "id": 40288,
+  "name": "Spaulders of Incoherence",
+  "quality": 4,
+  "boss": "Grobbulus"
+ },
+ {
+  "id": 40277,
+  "name": "Tunic of Indulgence",
+  "quality": 4,
+  "boss": "Grobbulus"
+ },
+ {
+  "id": 40281,
+  "name": "Twilight Mist",
+  "quality": 4,
+  "boss": "Grobbulus"
+ },
+ {
+  "id": 40289,
+  "name": "Sympathetic Amice",
+  "quality": 4,
+  "boss": "Grobbulus / Gluth"
+ },
+ {
+  "id": 40302,
+  "name": "Benefactor's Gauntlets",
+  "quality": 4,
+  "boss": "Gluth / Thaddius"
+ },
+ {
+  "id": 40296,
+  "name": "Cover of Silence",
+  "quality": 4,
+  "boss": "Gluth / Thaddius"
+ },
+ {
+  "id": 40634,
+  "name": "Legplates of the Lost Conqueror",
+  "quality": 4,
+  "boss": "Gluth / Thaddius",
+  "allowable_classes": [
+   "paladin",
+   "priest",
+   "warlock"
+  ]
+ },
+ {
+  "id": 40635,
+  "name": "Legplates of the Lost Protector",
+  "quality": 4,
+  "boss": "Gluth / Thaddius",
+  "allowable_classes": [
+   "warrior",
+   "hunter",
+   "shaman"
+  ]
+ },
+ {
+  "id": 40636,
+  "name": "Legplates of the Lost Vanquisher",
+  "quality": 4,
+  "boss": "Gluth / Thaddius",
+  "allowable_classes": [
+   "rogue",
+   "deathknight",
+   "mage",
+   "druid"
+  ]
+ },
+ {
+  "id": 40297,
+  "name": "Sabatons of Endurance",
+  "quality": 4,
+  "boss": "Gluth / Thaddius"
+ },
+ {
+  "id": 40303,
+  "name": "Wraps of the Persecuted",
+  "quality": 4,
+  "boss": "Gluth / Thaddius"
+ },
+ {
+  "id": 40301,
+  "name": "Cincture of Polarity",
+  "quality": 4,
+  "boss": "Thaddius"
+ },
+ {
+  "id": 40298,
+  "name": "Faceguard of the Succumbed",
+  "quality": 4,
+  "boss": "Thaddius"
+ },
+ {
+  "id": 40304,
+  "name": "Headpiece of Fungal Bloom",
+  "quality": 4,
+  "boss": "Thaddius"
+ },
+ {
+  "id": 40299,
+  "name": "Pauldrons of the Abandoned",
+  "quality": 4,
+  "boss": "Thaddius"
+ },
+ {
+  "id": 40294,
+  "name": "Riveted Abomination Leggings",
+  "quality": 4,
+  "boss": "Thaddius"
+ },
+ {
+  "id": 40300,
+  "name": "Spire of Sunset",
+  "quality": 4,
+  "boss": "Thaddius"
+ },
+ {
+  "id": 40371,
+  "name": "Bandit's Insignia",
+  "quality": 4,
+  "boss": "Sapphiron"
+ },
+ {
+  "id": 40363,
+  "name": "Bone-Inlaid Legguards",
+  "quality": 4,
+  "boss": "Sapphiron"
+ },
+ {
+  "id": 40367,
+  "name": "Boots of the Great Construct",
+  "quality": 4,
+  "boss": "Sapphiron"
+ },
+ {
+  "id": 40365,
+  "name": "Breastplate of Frozen Pain",
+  "quality": 4,
+  "boss": "Sapphiron"
+ },
+ {
+  "id": 40378,
+  "name": "Ceaseless Pity",
+  "quality": 4,
+  "boss": "Sapphiron"
+ },
+ {
+  "id": 40374,
+  "name": "Cosmic Lights",
+  "quality": 4,
+  "boss": "Sapphiron"
+ },
+ {
+  "id": 40373,
+  "name": "Extract of Necromantic Power",
+  "quality": 4,
+  "boss": "Sapphiron"
+ },
+ {
+  "id": 40370,
+  "name": "Gatekeeper",
+  "quality": 4,
+  "boss": "Sapphiron"
+ },
+ {
+  "id": 40362,
+  "name": "Gloves of Fast Reactions",
+  "quality": 4,
+  "boss": "Sapphiron"
+ },
+ {
+  "id": 40380,
+  "name": "Gloves of Grandeur",
+  "quality": 4,
+  "boss": "Sapphiron"
+ },
+ {
+  "id": 44577,
+  "name": "Heroic Key to the Focusing Iris",
+  "quality": 4,
+  "boss": "Sapphiron"
+ },
+ {
+  "id": 40369,
+  "name": "Icy Blast Amulet",
+  "quality": 4,
+  "boss": "Sapphiron"
+ },
+ {
+  "id": 40379,
+  "name": "Legguards of the Boneyard",
+  "quality": 4,
+  "boss": "Sapphiron"
+ },
+ {
+  "id": 40376,
+  "name": "Legwraps of the Defeated Dragon",
+  "quality": 4,
+  "boss": "Sapphiron"
+ },
+ {
+  "id": 40368,
+  "name": "Murder",
+  "quality": 4,
+  "boss": "Sapphiron"
+ },
+ {
+  "id": 40377,
+  "name": "Noble Birthright Pauldrons",
+  "quality": 4,
+  "boss": "Sapphiron"
+ },
+ {
+  "id": 40366,
+  "name": "Platehelm of the Great Wyrm",
+  "quality": 4,
+  "boss": "Sapphiron"
+ },
+ {
+  "id": 40375,
+  "name": "Ring of Decaying Beauty",
+  "quality": 4,
+  "boss": "Sapphiron"
+ },
+ {
+  "id": 40372,
+  "name": "Rune of Repulsion",
+  "quality": 4,
+  "boss": "Sapphiron"
+ },
+ {
+  "id": 40382,
+  "name": "Soul of the Dead",
+  "quality": 4,
+  "boss": "Sapphiron"
+ },
+ {
+  "id": 40381,
+  "name": "Sympathy",
+  "quality": 4,
+  "boss": "Sapphiron"
+ },
+ {
+  "id": 40384,
+  "name": "Betrayer of Humanity",
+  "quality": 4,
+  "boss": "Kel'Thuzad"
+ },
+ {
+  "id": 40387,
+  "name": "Boundless Ambition",
+  "quality": 4,
+  "boss": "Kel'Thuzad"
+ },
+ {
+  "id": 40383,
+  "name": "Calamity's Grasp",
+  "quality": 4,
+  "boss": "Kel'Thuzad"
+ },
+ {
+  "id": 40405,
+  "name": "Cape of the Unworthy Wizard",
+  "quality": 4,
+  "boss": "Kel'Thuzad"
+ },
+ {
+  "id": 40631,
+  "name": "Crown of the Lost Conqueror",
+  "quality": 4,
+  "boss": "Kel'Thuzad",
+  "allowable_classes": [
+   "paladin",
+   "priest",
+   "warlock"
+  ]
+ },
+ {
+  "id": 40632,
+  "name": "Crown of the Lost Protector",
+  "quality": 4,
+  "boss": "Kel'Thuzad",
+  "allowable_classes": [
+   "warrior",
+   "hunter",
+   "shaman"
+  ]
+ },
+ {
+  "id": 40633,
+  "name": "Crown of the Lost Vanquisher",
+  "quality": 4,
+  "boss": "Kel'Thuzad",
+  "allowable_classes": [
+   "rogue",
+   "deathknight",
+   "mage",
+   "druid"
+  ]
+ },
+ {
+  "id": 40403,
+  "name": "Drape of the Deadly Foe",
+  "quality": 4,
+  "boss": "Kel'Thuzad"
+ },
+ {
+  "id": 40385,
+  "name": "Envoy of Mortality",
+  "quality": 4,
+  "boss": "Kel'Thuzad"
+ },
+ {
+  "id": 40388,
+  "name": "Journey's End",
+  "quality": 4,
+  "boss": "Kel'Thuzad"
+ },
+ {
+  "id": 40402,
+  "name": "Last Laugh",
+  "quality": 4,
+  "boss": "Kel'Thuzad"
+ },
+ {
+  "id": 40398,
+  "name": "Leggings of Mortal Arrogance",
+  "quality": 4,
+  "boss": "Kel'Thuzad"
+ },
+ {
+  "id": 40399,
+  "name": "Signet of Manifested Pain",
+  "quality": 4,
+  "boss": "Kel'Thuzad"
+ },
+ {
+  "id": 40386,
+  "name": "Sinister Revenge",
+  "quality": 4,
+  "boss": "Kel'Thuzad"
+ },
+ {
+  "id": 40396,
+  "name": "The Turning Tide",
+  "quality": 4,
+  "boss": "Kel'Thuzad"
+ },
+ {
+  "id": 40395,
+  "name": "Torch of Holy Fire",
+  "quality": 4,
+  "boss": "Kel'Thuzad"
+ },
+ {
+  "id": 40401,
+  "name": "Voice of Reason",
+  "quality": 4,
+  "boss": "Kel'Thuzad"
+ },
+ {
+  "id": 40400,
+  "name": "Wall of Terror",
+  "quality": 4,
+  "boss": "Kel'Thuzad"
+ },
+ {
+  "id": 40409,
+  "name": "Boots of the Escaped Captive",
+  "quality": 4,
+  "boss": "Trash"
+ },
+ {
+  "id": 40408,
+  "name": "Haunting Call",
+  "quality": 4,
+  "boss": "Trash"
+ },
+ {
+  "id": 40406,
+  "name": "Inevitable Defeat",
+  "quality": 4,
+  "boss": "Trash"
+ },
+ {
+  "id": 40412,
+  "name": "Ousted Bead Necklace",
+  "quality": 4,
+  "boss": "Trash"
+ },
+ {
+  "id": 40410,
+  "name": "Shadow of the Ghoul",
+  "quality": 4,
+  "boss": "Trash"
+ },
+ {
+  "id": 40414,
+  "name": "Shoulderguards of the Undaunted",
+  "quality": 4,
+  "boss": "Trash"
+ },
+ {
+  "id": 40407,
+  "name": "Silent Crusader",
+  "quality": 4,
+  "boss": "Trash"
+ }
+]

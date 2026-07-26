@@ -1,0 +1,212 @@
+[
+ {
+  "id": 17067,
+  "name": "Ancient Cornerstone Grimoire",
+  "quality": 4,
+  "boss": "Onyxia"
+ },
+ {
+  "id": 13030,
+  "name": "Basilisk Bone",
+  "quality": 3,
+  "boss": "Onyxia"
+ },
+ {
+  "id": 13046,
+  "name": "Blanchard's Stout",
+  "quality": 3,
+  "boss": "Onyxia"
+ },
+ {
+  "id": 16908,
+  "name": "Bloodfang Hood",
+  "quality": 4,
+  "boss": "Onyxia",
+  "allowable_classes": [
+   "rogue"
+  ]
+ },
+ {
+  "id": 13009,
+  "name": "Cow King's Hide",
+  "quality": 3,
+  "boss": "Onyxia"
+ },
+ {
+  "id": 17068,
+  "name": "Deathbringer",
+  "quality": 4,
+  "boss": "Onyxia"
+ },
+ {
+  "id": 16939,
+  "name": "Dragonstalker's Helm",
+  "quality": 4,
+  "boss": "Onyxia",
+  "allowable_classes": [
+   "hunter"
+  ]
+ },
+ {
+  "id": 13125,
+  "name": "Elven Chain Boots",
+  "quality": 3,
+  "boss": "Onyxia"
+ },
+ {
+  "id": 2564,
+  "name": "Elven Spirit Claws",
+  "quality": 3,
+  "boss": "Onyxia"
+ },
+ {
+  "id": 18205,
+  "name": "Eskhandar's Collar",
+  "quality": 4,
+  "boss": "Onyxia"
+ },
+ {
+  "id": 13139,
+  "name": "Guttbuster",
+  "quality": 3,
+  "boss": "Onyxia"
+ },
+ {
+  "id": 16921,
+  "name": "Halo of Transcendence",
+  "quality": 4,
+  "boss": "Onyxia",
+  "allowable_classes": [
+   "priest"
+  ]
+ },
+ {
+  "id": 18422,
+  "name": "Head of Onyxia",
+  "quality": 4,
+  "boss": "Onyxia"
+ },
+ {
+  "id": 18423,
+  "name": "Head of Onyxia",
+  "quality": 4,
+  "boss": "Onyxia"
+ },
+ {
+  "id": 16963,
+  "name": "Helm of Wrath",
+  "quality": 4,
+  "boss": "Onyxia",
+  "allowable_classes": [
+   "warrior"
+  ]
+ },
+ {
+  "id": 16947,
+  "name": "Helmet of Ten Storms",
+  "quality": 4,
+  "boss": "Onyxia",
+  "allowable_classes": [
+   "shaman"
+  ]
+ },
+ {
+  "id": 13085,
+  "name": "Horizon Choker",
+  "quality": 3,
+  "boss": "Onyxia"
+ },
+ {
+  "id": 16955,
+  "name": "Judgement Crown",
+  "quality": 4,
+  "boss": "Onyxia",
+  "allowable_classes": [
+   "paladin"
+  ]
+ },
+ {
+  "id": 18705,
+  "name": "Mature Black Dragon Sinew",
+  "quality": 4,
+  "boss": "Onyxia",
+  "allowable_classes": [
+   "hunter"
+  ]
+ },
+ {
+  "id": 16929,
+  "name": "Nemesis Skullcap",
+  "quality": 4,
+  "boss": "Onyxia",
+  "allowable_classes": [
+   "warlock"
+  ]
+ },
+ {
+  "id": 16914,
+  "name": "Netherwind Crown",
+  "quality": 4,
+  "boss": "Onyxia",
+  "allowable_classes": [
+   "mage"
+  ]
+ },
+ {
+  "id": 18813,
+  "name": "Ring of Binding",
+  "quality": 4,
+  "boss": "Onyxia"
+ },
+ {
+  "id": 17078,
+  "name": "Sapphiron Drape",
+  "quality": 4,
+  "boss": "Onyxia"
+ },
+ {
+  "id": 17064,
+  "name": "Shard of the Scale",
+  "quality": 4,
+  "boss": "Onyxia"
+ },
+ {
+  "id": 7734,
+  "name": "Six Demon Bag",
+  "quality": 3,
+  "boss": "Onyxia"
+ },
+ {
+  "id": 16900,
+  "name": "Stormrage Cover",
+  "quality": 4,
+  "boss": "Onyxia",
+  "allowable_classes": [
+   "druid"
+  ]
+ },
+ {
+  "id": 17075,
+  "name": "Vis'kag the Bloodletter",
+  "quality": 4,
+  "boss": "Onyxia"
+ },
+ {
+  "id": 13065,
+  "name": "Wand of Allistarj",
+  "quality": 3,
+  "boss": "Onyxia"
+ },
+ {
+  "id": 13066,
+  "name": "Wyrmslayer Spaulders",
+  "quality": 3,
+  "boss": "Onyxia"
+ },
+ {
+  "id": 12728,
+  "name": "Plans: Invulnerable Mail",
+  "quality": 4,
+  "boss": "Trash"
+ }
+]

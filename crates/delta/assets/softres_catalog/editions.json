@@ -1,0 +1,17 @@
+[
+ {
+  "id": "classic",
+  "name": "Classic Era",
+  "sort": 0
+ },
+ {
+  "id": "tbc",
+  "name": "The Burning Crusade",
+  "sort": 1
+ },
+ {
+  "id": "wrath",
+  "name": "Wrath of the Lich King",
+  "sort": 2
+ }
+]
