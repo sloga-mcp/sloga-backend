@@ -264,45 +264,36 @@ struct RolePlan {
 /// unicode_emoji`. Order therefore has to come from the array, and the array's
 /// direction is not documented anywhere.
 ///
-/// Rather than assume, this checks: **`roles[0]` must be NAMED `@everyone`.**
+/// # ✅ SETTLED LIVE, 2026-07-26 — the array is position-ascending
 ///
-/// That **rules out a descending array** — and only that. `@everyone` is
-/// definitionally the least-authoritative role (position 0), so a
-/// position-descending array would put it last and `roles[0]` would be the top
-/// role under some other name; the check refuses. Anything else returns
+/// Verified against a purpose-built guild (`vDDxZKQKXpPf`) whose roles were
+/// *created* `Admin, Member, Mod` and then *ranked* `Admin > Mod > Member` —
+/// deliberately two different permutations, so the serialization can only match
+/// one. Discord returned `[@everyone, Member, Mod, Admin]`: **least
+/// authoritative first**. Creation order would have given
+/// `[@everyone, Admin, Member, Mod]`.
+///
+/// So reversing the array is the correct inversion, and the long-standing
+/// "maybe it's creation/snowflake order" worry is closed. Pinned by
+/// `tests::real_multi_role_template_with_a_private_channel`.
+///
+/// # The guard, which stays anyway
+///
+/// **`roles[0]` must be named `@everyone`, with placeholder id 0.** These are
+/// two independent facts, not one fact checked twice: the same live payload
+/// shows role ids are `0, 2, 3, 4` — **not** array indices, and not contiguous.
+/// (An earlier round of review reasoned that ids *were* indices and that the id
+/// half was therefore a tautology; real data says otherwise.)
+///
+/// The name is still the half that discriminates direction. `@everyone` is
+/// definitionally the least-authoritative role, so a position-descending array
+/// would put it last and `roles[0]` would be the top role under another name —
+/// which is the case worth refusing, because the placeholder-0 match would
+/// otherwise consume that role as `@everyone` and write its permissions,
+/// plausibly `ADMINISTRATOR`, server-wide. This feature hands the user an
+/// invite link and tells them to post it publicly; everyone who accepted would
+/// be an administrator. Anything unexpected returns
 /// [`PlanError::UnexpectedRoleOrder`] and the import fails.
-///
-/// It does **not** establish that the array is ascending. See "What this still
-/// does NOT settle" below — the earlier version of this comment claimed it did,
-/// and that overclaim survived two audit rounds precisely because it reads as
-/// airtight.
-///
-/// **It has to be the name.** Checking the placeholder id instead is a
-/// tautology: ids are handed out in serialization order, so the id-0 role is
-/// always the first element no matter which way the array runs. The id is kept
-/// only as corroboration.
-///
-/// # What this still does NOT settle
-///
-/// "`@everyone` first" is *jointly* implied by position-ascending **and** by
-/// the array simply being ordered by role **snowflake**, i.e. creation order —
-/// `@everyone`'s id is the guild id, the oldest in every guild. So observing it
-/// discriminates nothing between those two, and the remaining roles would then
-/// be reversed on a false premise.
-///
-/// Under creation order nothing escalates: `default_permissions` still comes
-/// from the genuine `@everyone`, and every role keeps its own mapped bits, so
-/// **nobody gains a permission they should not have**. What breaks is the
-/// *ranking* — oldest role gets rank 0 — which inverts rank-gated moderation
-/// (an admin cannot kick a member), flips channel-override precedence for
-/// multi-role users, and makes the role cap drop the oldest roles rather than
-/// the weakest. HIGH on correctness, not a security cliff.
-///
-/// Distinguishing the two needs a real template from a guild where creation
-/// order and authority order **differ**; no unit test can do it. Note the
-/// asymmetry in how the two failures surface: a descending array is
-/// self-announcing (the import refuses loudly), whereas creation order is
-/// silent and shows up later as "my moderators can't kick anyone".
 ///
 /// Getting this wrong is not merely an inverted hierarchy. Because `@everyone`
 /// is what becomes `Server.default_permissions`, mistaking the *top* role for
@@ -343,11 +334,11 @@ fn plan_roles(roles: &[TemplateRole]) -> Result<RolePlan, PlanError> {
     // this and `plan_overwrites`' `everyone_id` becomes load-bearing —
     // `plan_overwrites_matches_a_non_zero_everyone_id` is what guards it.
     //
-    // Note also that this half is a total-outage switch, not a degrade: it is a
-    // tautology while Discord's placeholder counter walks roles before channels,
-    // and if that ever changes EVERY import fails with "please report this".
-    // That is the intended fail-closed posture, but the failure rate goes to
-    // 100%, so it needs to be visible wherever this job is monitored.
+    // Both halves are total-outage switches, not degrades: if Discord ever
+    // changes how it names or numbers this role, EVERY import fails with
+    // "please report this". That is the intended fail-closed posture for a
+    // permission importer, but the failure rate goes to 100% rather than
+    // degrading, so it needs to be visible wherever this job is monitored.
     if everyone.name.trim() != EVERYONE_NAME || everyone.id.0 != EVERYONE_PLACEHOLDER {
         return Err(PlanError::UnexpectedRoleOrder);
     }
@@ -1286,6 +1277,128 @@ mod tests {
 
         assert_eq!(channel.default_permissions.unwrap().deny & view, view);
         assert_eq!(channel.role_overrides[0].1.allow & view, view);
+    }
+
+    /// **The template that settled the ordering question.** Captured live
+    /// 2026-07-26 from a purpose-built guild (`vDDxZKQKXpPf`) whose roles were
+    /// created in the order `Admin, Member, Mod` and then ranked
+    /// `Admin > Mod > Member` — two different permutations, so the serialized
+    /// array can only match one of them.
+    ///
+    /// It came back `[@everyone, Member, Mod, Admin]`: **position-ascending**,
+    /// least-authoritative first. Creation order would have been
+    /// `[@everyone, Admin, Member, Mod]`. The rank inversion is correct.
+    ///
+    /// Three further facts this payload establishes, none of them guessable:
+    ///
+    /// 1. **Role placeholder ids are NOT array indices** — they are `0, 2, 3, 4`
+    ///    here, with a gap. Any reasoning of the form "the id-0 role is
+    ///    necessarily `roles[0]`" is false.
+    /// 2. **Roles and channels are SEPARATE id namespaces that overlap** — role
+    ///    3 is `Mod` while channel 3 is `general`. Merging the two lookup maps
+    ///    would silently cross-wire permissions to channels.
+    /// 3. Overwrite `type` arrives as an **integer** while `allow`/`deny` arrive
+    ///    as **strings**, in the same object. Both scalar forms, in one payload.
+    #[test]
+    fn real_multi_role_template_with_a_private_channel() {
+        let payload = r#"{
+            "code": "vDDxZKQKXpPf",
+            "name": "Test",
+            "serialized_source_guild": {
+                "name": "Import Test",
+                "description": null,
+                "system_channel_id": 3,
+                "roles": [
+                    {"id":0,"name":"@everyone","permissions":"2248473465835073","color":0,"hoist":false},
+                    {"id":2,"name":"Member","permissions":"0","color":0,"hoist":false},
+                    {"id":3,"name":"Mod","permissions":"0","color":0,"hoist":false},
+                    {"id":4,"name":"Admin","permissions":"0","color":0,"hoist":false}
+                ],
+                "channels": [
+                    {"id":1,"type":0,"name":"mod-chat","position":1,"parent_id":null,
+                     "permission_overwrites":[
+                        {"id":3,"type":0,"allow":"1024","deny":"0"},
+                        {"id":0,"type":0,"allow":"0","deny":"1040"}
+                     ]},
+                    {"id":2,"type":4,"name":"Text Channels","position":0,"parent_id":null,
+                     "permission_overwrites":[]},
+                    {"id":3,"type":0,"name":"general","position":0,"parent_id":2,
+                     "permission_overwrites":[]},
+                    {"id":4,"type":4,"name":"Voice Channels","position":0,"parent_id":null,
+                     "permission_overwrites":[]},
+                    {"id":5,"type":2,"name":"General","position":0,"parent_id":4,
+                     "permission_overwrites":[]}
+                ]
+            }
+        }"#;
+
+        let plan = plan_import(&serde_json::from_str(payload).unwrap());
+
+        assert_eq!(plan.server_name, "Import Test");
+
+        // THE ANSWER: most authoritative first, so index 0 becomes Sloga rank 0.
+        assert_eq!(
+            plan.roles
+                .iter()
+                .map(|role| role.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Admin", "Mod", "Member"],
+            "Discord serializes template roles position-ascending; reversing the \
+             array is the correct inversion"
+        );
+
+        // Ids carry through as given — not renumbered, not assumed contiguous.
+        assert_eq!(plan.roles[0].template_id, PlaceholderId("4".to_string()));
+        assert_eq!(plan.roles[2].template_id, PlaceholderId("2".to_string()));
+
+        let mod_chat = plan
+            .channels
+            .iter()
+            .find(|channel| channel.name == "mod-chat")
+            .expect("mod-chat");
+
+        // The @everyone overwrite (role id 0) becomes the channel default, and
+        // it really does deny ViewChannel — the channel stays private.
+        let default = mod_chat.default_permissions.expect("@everyone overwrite");
+        assert_eq!(
+            default.deny & ChannelPermission::ViewChannel as u64,
+            ChannelPermission::ViewChannel as u64
+        );
+        // deny was "1040" = VIEW_CHANNEL | MANAGE_CHANNELS, so both map across.
+        assert_eq!(
+            default.deny & ChannelPermission::ManageChannel as u64,
+            ChannelPermission::ManageChannel as u64
+        );
+        assert_eq!(default.allow, 0);
+
+        // ...and Mod (role id 3, NOT channel id 3 which is `general`) gets it back.
+        assert_eq!(mod_chat.role_overrides.len(), 1);
+        assert_eq!(mod_chat.role_overrides[0].0, PlaceholderId("3".to_string()));
+        assert_eq!(
+            mod_chat.role_overrides[0].1.allow,
+            ChannelPermission::ViewChannel as u64
+        );
+
+        // Nothing was skipped or refused.
+        assert!(
+            plan.skipped.is_empty(),
+            "unexpected skip notes: {:?}",
+            plan.skipped
+        );
+        assert_eq!(plan.skipped_channel_count, 0);
+
+        // Two categories, three real channels; the system channel resolves
+        // through the CHANNEL namespace to `general`, not to role id 3.
+        assert_eq!(plan.categories.len(), 2);
+        assert_eq!(plan.channels.len(), 3);
+        assert_eq!(plan.system_channel, Some(PlaceholderId("3".to_string())));
+        assert_eq!(
+            plan.channels
+                .iter()
+                .find(|channel| channel.template_id == PlaceholderId("3".to_string()))
+                .map(|channel| channel.name.as_str()),
+            Some("general")
+        );
     }
 
     /// A real payload from Discord's own "Blank Server" template
