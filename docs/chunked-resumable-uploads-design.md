@@ -1,6 +1,6 @@
 # Chunked / Resumable Uploads — Design & Staged Plan
 
-**Status:** IMPLEMENTED (2026-07-26) — superseded by ,
+**Status:** IMPLEMENTED (2026-07-26) — superseded by `chunked-uploads-implementation-plan.md`,
 which carries the audited, as-built decisions (5 GB ceiling, Phases 1+2 shipped together,
 versioned STREAM-AEAD v2 from the start; Phase 3 below is DROPPED, the §9 crypto column is
 stale). This document remains as the original investigation record.
