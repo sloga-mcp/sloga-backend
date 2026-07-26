@@ -56,7 +56,9 @@ pub async fn router() -> Router<AppState> {
     let config = config().await;
 
     let cors = CorsLayer::new()
-        .allow_methods([Method::POST])
+        // PUT/GET/DELETE are load-bearing for chunked uploads: without them
+        // the browser preflight kills every part PUT, status GET and abort
+        .allow_methods([Method::POST, Method::PUT, Method::GET, Method::DELETE])
         .allow_headers(AllowHeaders::mirror_request())
         .expose_headers(vec![
             "X-RateLimit-Limit".try_into().unwrap(),
@@ -77,6 +79,32 @@ pub async fn router() -> Router<AppState> {
                 .layer(DefaultBodyLimit::max(crate::e2ee::E2EE_BLOB_BODY_LIMIT)),
         )
         .route("/e2ee/:blob_id", get(crate::e2ee::fetch_blob))
+        // Chunked/resumable uploads. The literal `upload` segment wins over
+        // the `/:tag/:file_id` parameter route (axum static-over-param
+        // precedence), and file ids are 42-char nanoids so `upload` can
+        // never be a real file id.
+        .route(
+            "/:tag/upload/create",
+            post(crate::upload::create_upload).options(options),
+        )
+        .route(
+            "/:tag/upload/:session_id",
+            get(crate::upload::get_upload_session)
+                .delete(crate::upload::abort_upload)
+                .options(options),
+        )
+        .route(
+            "/:tag/upload/:session_id/part/:part_number",
+            axum::routing::put(crate::upload::upload_part)
+                .options(options)
+                // One chunk + slack, NOT the multi-GB global limit — a
+                // misbehaving client cannot stream an unbounded body here
+                .layer(DefaultBodyLimit::max(crate::upload::PART_BODY_LIMIT)),
+        )
+        .route(
+            "/:tag/upload/:session_id/complete",
+            post(crate::upload::complete_upload).options(options),
+        )
         .route(
             "/:tag",
             post(upload_file)
@@ -175,7 +203,7 @@ pub struct UploadPayload {
 #[derive(Serialize, Debug, ToSchema)]
 pub struct UploadResponse {
     /// ID to attach uploaded file to object
-    id: String,
+    pub id: String,
 }
 
 /// Upload a file

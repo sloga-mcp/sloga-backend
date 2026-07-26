@@ -9,6 +9,7 @@ publish = false
 # ID generation
 ulid = { workspace = true }
 nanoid = { workspace = true }
+base64 = { workspace = true }
 
 # Media processing
 webp = { workspace = true }

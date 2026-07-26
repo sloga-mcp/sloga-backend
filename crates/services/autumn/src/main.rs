@@ -19,6 +19,7 @@ pub mod exif;
 pub mod metadata;
 pub mod mime_type;
 mod ratelimits;
+mod upload;
 mod utils;
 pub mod video;
 
@@ -45,6 +46,11 @@ async fn main() -> Result<(), std::io::Error> {
             api::upload_file,
             api::fetch_preview,
             api::fetch_file,
+            upload::create_upload,
+            upload::upload_part,
+            upload::get_upload_session,
+            upload::complete_upload,
+            upload::abort_upload,
             e2ee::upload_blob,
             e2ee::fetch_blob
         ),
@@ -56,6 +62,9 @@ async fn main() -> Result<(), std::io::Error> {
                 api::Tag,
                 api::UploadPayload,
                 api::UploadResponse,
+                upload::CreateUploadPayload,
+                upload::CreateUploadResponse,
+                upload::UploadSessionStatus,
                 e2ee::BlobUploadPayload,
                 e2ee::BlobUploadResponse
             )
@@ -86,6 +95,16 @@ async fn main() -> Result<(), std::io::Error> {
     // Connect to the database
     let db = DatabaseInfo::Auto.connect().await.unwrap();
     let ratelimits = ratelimiter::RatelimitStorage::new(ratelimits::AutumnRatelimits);
+
+    // Ensure orphaned multipart uploads get reaped server-side (ship gate
+    // for chunked uploads). On MinIO this is a no-op with a log line — its
+    // `api stale_uploads_expiry` setting (72h in prod) is the real backstop.
+    {
+        let bucket = revolt_config::config().await.files.s3.default_bucket;
+        if let Err(error) = revolt_files::ensure_bucket_lifecycle(&bucket).await {
+            tracing::warn!("could not apply bucket lifecycle to {bucket}: {error:?}");
+        }
+    }
 
     let state = AppState {
         database: db,

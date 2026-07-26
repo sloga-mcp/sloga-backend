@@ -232,6 +232,16 @@ pub enum ErrorType {
         max: usize,
     },
     FileTypeNotAllowed,
+    // ? Chunked upload errors
+    /// Another request holds this part / the session state forbids this
+    /// operation right now (retry after a status GET)
+    UploadSessionConflict,
+    ///  called before every part was recorded
+    UploadIncomplete,
+    /// Per-user cap on concurrently open upload sessions
+    TooManyUploadSessions {
+        max: usize,
+    },
     ImageProcessingFailed,
     NoEmbedData,
 
