@@ -161,6 +161,27 @@ pub enum ErrorType {
     // ? Soft-reserve errors
     /// Raid id not present in the static loot catalog
     UnknownRaid,
+    /// Edition id not present in the static loot catalog
+    UnknownEdition,
+    /// A sheet's raids must all belong to its declared edition
+    SoftResMixedEditions,
+    /// More raids on one sheet than allowed
+    TooManySoftResRaids {
+        max: usize,
+    },
+    /// The sheet is locked — reserves can no longer change
+    SoftResLocked,
+    /// One or more item ids are not reservable on this sheet (not in the
+    /// sheet's raids, hard-reserved, or duplicated when not allowed)
+    SoftResInvalidItems,
+    /// The sheet restricts reserves to classes that can use the item
+    SoftResClassRestricted,
+    /// The per-item reserve cap has been reached for an item
+    SoftResItemCapReached,
+    /// Recurring events cannot be linked to a sheet (v1)
+    SoftResRecurringEvent,
+    /// The event already has a linked sheet (one sheet per event)
+    SoftResEventAlreadyLinked,
 
     // ? Scheduled message errors
     TooManyScheduledMessages {

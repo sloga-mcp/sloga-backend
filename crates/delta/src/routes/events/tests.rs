@@ -1659,3 +1659,543 @@ async fn attachment_cap_enforced() {
         "the over-cap edit left its file unclaimed and re-usable"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Soft-reserve sheet ↔ event linkage (softres slice 2)
+// ---------------------------------------------------------------------------
+
+/// Create a server-wide event through the API and return it.
+async fn make_event(
+    harness: &TestHarness,
+    session_token: &str,
+    server_id: &str,
+    body: serde_json::Value,
+) -> v0::Event {
+    let response = harness
+        .client
+        .post(format!("/events/server/{server_id}"))
+        .header(Header::new("x-session-token", session_token.to_string()))
+        .header(ContentType::JSON)
+        .body(body.to_string())
+        .dispatch()
+        .await;
+    assert_eq!(response.status(), Status::Ok);
+    response.into_json::<v0::Event>().await.expect("event")
+}
+
+#[rocket::async_test]
+async fn softres_link_requires_event_manage_and_one_sheet_per_event() {
+    let harness = TestHarness::new().await;
+    let (_, session, owner) = harness.new_user().await;
+    let (_, member_session, member) = harness.new_user().await;
+    let server = make_server(&harness, &owner).await;
+    Member::create(&harness.db, &server, &member, None)
+        .await
+        .expect("member");
+    let channel = harness.new_channel(&server).await;
+
+    let start = 1_900_000_000_000_i64;
+    let event = make_event(
+        &harness,
+        &session.token,
+        &server.id,
+        json!({ "title": "Raid Night", "start": start, "timezone": "UTC" }),
+    )
+    .await;
+
+    let sheet_body = json!({
+        "title": "MC softres",
+        "edition": "classic",
+        "raids": ["mc"],
+        "event_id": event.id,
+        "lock_at_event_start": true
+    });
+
+    // A plain member (no event-manage rights) cannot claim the event's
+    // sheet slot.
+    let response = harness
+        .client
+        .post(format!("/channels/{}/softres", channel.id()))
+        .header(Header::new(
+            "x-session-token",
+            member_session.token.to_string(),
+        ))
+        .header(ContentType::JSON)
+        .body(sheet_body.to_string())
+        .dispatch()
+        .await;
+    assert_eq!(
+        response.status(),
+        Status::Forbidden,
+        "view-level linking must be rejected"
+    );
+
+    // The event creator links fine; locks_at snapshots the event start.
+    let response = harness
+        .client
+        .post(format!("/channels/{}/softres", channel.id()))
+        .header(Header::new("x-session-token", session.token.to_string()))
+        .header(ContentType::JSON)
+        .body(sheet_body.to_string())
+        .dispatch()
+        .await;
+    assert_eq!(response.status(), Status::Ok);
+    let message: v0::Message = response.into_json().await.expect("`Message`");
+    let sheet_id = message.softres.expect("softres").id;
+
+    // The events-side lookup resolves for a plain member and carries the
+    // snapshot.
+    let response = harness
+        .client
+        .get(format!("/events/event/{}/softres", event.id))
+        .header(Header::new(
+            "x-session-token",
+            member_session.token.to_string(),
+        ))
+        .dispatch()
+        .await;
+    assert_eq!(response.status(), Status::Ok);
+    let state: v0::SoftRes = response.into_json().await.expect("`SoftRes`");
+    assert_eq!(state.id, sheet_id);
+    assert_eq!(state.event_id.as_deref(), Some(event.id.as_str()));
+    assert_eq!(state.locks_at, Some(start));
+    assert!(!state.locked, "future start must not pre-lock");
+
+    // One sheet per event: a second create 409s.
+    let response = harness
+        .client
+        .post(format!("/channels/{}/softres", channel.id()))
+        .header(Header::new("x-session-token", session.token.to_string()))
+        .header(ContentType::JSON)
+        .body(sheet_body.to_string())
+        .dispatch()
+        .await;
+    assert_eq!(
+        response.status(),
+        Status::Conflict,
+        "the event's sheet slot is unique"
+    );
+}
+
+#[rocket::async_test]
+async fn softres_link_rejects_recurring_cancelled_and_born_locked() {
+    let harness = TestHarness::new().await;
+    let (_, session, owner) = harness.new_user().await;
+    let server = make_server(&harness, &owner).await;
+    let channel = harness.new_channel(&server).await;
+
+    // Recurring event → SoftResRecurringEvent.
+    let recurring = make_event(
+        &harness,
+        &session.token,
+        &server.id,
+        json!({
+            "title": "Weekly Raid",
+            "start": 1_900_000_000_000_i64,
+            "timezone": "UTC",
+            "recurrence": {
+                "freq": "Weekly",
+                "interval": 1,
+                "end": { "type": "Count", "count": 4 }
+            }
+        }),
+    )
+    .await;
+
+    let body = |event_id: &str, lock: bool| {
+        json!({
+            "title": "sheet",
+            "edition": "classic",
+            "raids": ["mc"],
+            "event_id": event_id,
+            "lock_at_event_start": lock
+        })
+    };
+
+    let response = harness
+        .client
+        .post(format!("/channels/{}/softres", channel.id()))
+        .header(Header::new("x-session-token", session.token.to_string()))
+        .header(ContentType::JSON)
+        .body(body(&recurring.id, false).to_string())
+        .dispatch()
+        .await;
+    assert_eq!(
+        response.status(),
+        Status::BadRequest,
+        "recurring events cannot be linked in v1"
+    );
+
+    // Cancelled event → rejected.
+    let cancelled = make_event(
+        &harness,
+        &session.token,
+        &server.id,
+        json!({ "title": "Called off", "start": 1_900_000_000_000_i64, "timezone": "UTC" }),
+    )
+    .await;
+    let response = harness
+        .client
+        .delete(format!("/events/event/{}", cancelled.id))
+        .header(Header::new("x-session-token", session.token.to_string()))
+        .dispatch()
+        .await;
+    assert!(response.status().code < 300, "cancel should succeed");
+    let response = harness
+        .client
+        .post(format!("/channels/{}/softres", channel.id()))
+        .header(Header::new("x-session-token", session.token.to_string()))
+        .header(ContentType::JSON)
+        .body(body(&cancelled.id, false).to_string())
+        .dispatch()
+        .await;
+    assert_ne!(
+        response.status(),
+        Status::Ok,
+        "cancelled events cannot be linked"
+    );
+
+    // Past-start event: linking is fine, but lock_at_event_start would be
+    // born-locked and is rejected.
+    let past = make_event(
+        &harness,
+        &session.token,
+        &server.id,
+        json!({ "title": "Yesterday", "start": 1_000_000_000_000_i64, "timezone": "UTC" }),
+    )
+    .await;
+    let response = harness
+        .client
+        .post(format!("/channels/{}/softres", channel.id()))
+        .header(Header::new("x-session-token", session.token.to_string()))
+        .header(ContentType::JSON)
+        .body(body(&past.id, true).to_string())
+        .dispatch()
+        .await;
+    assert_ne!(
+        response.status(),
+        Status::Ok,
+        "a born-locked sheet is useless and must be rejected"
+    );
+    let response = harness
+        .client
+        .post(format!("/channels/{}/softres", channel.id()))
+        .header(Header::new("x-session-token", session.token.to_string()))
+        .header(ContentType::JSON)
+        .body(body(&past.id, false).to_string())
+        .dispatch()
+        .await;
+    assert_eq!(
+        response.status(),
+        Status::Ok,
+        "linking a past event without auto-lock is allowed"
+    );
+    let message: v0::Message = response.into_json().await.expect("`Message`");
+    assert!(message.softres.is_some());
+}
+
+#[rocket::async_test]
+async fn cancelling_an_event_locks_its_sheet_idempotently() {
+    let harness = TestHarness::new().await;
+    let (_, session, owner) = harness.new_user().await;
+    let server = make_server(&harness, &owner).await;
+    let channel = harness.new_channel(&server).await;
+
+    let event = make_event(
+        &harness,
+        &session.token,
+        &server.id,
+        json!({ "title": "Raid Night", "start": 1_900_000_000_000_i64, "timezone": "UTC" }),
+    )
+    .await;
+
+    let response = harness
+        .client
+        .post(format!("/channels/{}/softres", channel.id()))
+        .header(Header::new("x-session-token", session.token.to_string()))
+        .header(ContentType::JSON)
+        .body(
+            json!({
+                "title": "sheet",
+                "edition": "classic",
+                "raids": ["mc"],
+                "event_id": event.id
+            })
+            .to_string(),
+        )
+        .dispatch()
+        .await;
+    assert_eq!(response.status(), Status::Ok);
+    let message: v0::Message = response.into_json().await.expect("`Message`");
+    let sheet_id = message.softres.expect("softres").id;
+
+    // Cancel the event → the hook locks the sheet.
+    let response = harness
+        .client
+        .delete(format!("/events/event/{}", event.id))
+        .header(Header::new("x-session-token", session.token.to_string()))
+        .dispatch()
+        .await;
+    assert!(response.status().code < 300);
+
+    let response = harness
+        .client
+        .get(format!("/channels/{}/softres/{}", channel.id(), sheet_id))
+        .header(Header::new("x-session-token", session.token.to_string()))
+        .dispatch()
+        .await;
+    assert_eq!(response.status(), Status::Ok);
+    let state: v0::SoftRes = response.into_json().await.expect("`SoftRes`");
+    assert!(state.locked, "cancel hook must lock the sheet");
+
+    // A re-issued cancel stays 2xx and the sheet (not deleted!) stays
+    // locked and still resolves through the events-side lookup.
+    let response = harness
+        .client
+        .delete(format!("/events/event/{}", event.id))
+        .header(Header::new("x-session-token", session.token.to_string()))
+        .dispatch()
+        .await;
+    assert!(response.status().code < 300, "cancel is idempotent");
+
+    let response = harness
+        .client
+        .get(format!("/events/event/{}/softres", event.id))
+        .header(Header::new("x-session-token", session.token.to_string()))
+        .dispatch()
+        .await;
+    assert_eq!(
+        response.status(),
+        Status::Ok,
+        "a cancelled event's sheet still resolves"
+    );
+}
+
+#[rocket::async_test]
+async fn event_softres_lookup_is_gated_and_oracle_free() {
+    use revolt_permissions::ChannelPermission;
+
+    let harness = TestHarness::new().await;
+    let (_, session, owner) = harness.new_user().await;
+    let (_, member_session, member) = harness.new_user().await;
+    let server = make_server(&harness, &owner).await;
+    Member::create(&harness.db, &server, &member, None)
+        .await
+        .expect("member");
+    let channel = harness.new_channel(&server).await;
+
+    let event = make_event(
+        &harness,
+        &session.token,
+        &server.id,
+        json!({ "title": "Raid Night", "start": 1_900_000_000_000_i64, "timezone": "UTC" }),
+    )
+    .await;
+
+    // No sheet yet → 404.
+    let response = harness
+        .client
+        .get(format!("/events/event/{}/softres", event.id))
+        .header(Header::new(
+            "x-session-token",
+            member_session.token.to_string(),
+        ))
+        .dispatch()
+        .await;
+    assert_eq!(response.status(), Status::NotFound);
+
+    // Owner links a sheet in the channel.
+    let response = harness
+        .client
+        .post(format!("/channels/{}/softres", channel.id()))
+        .header(Header::new("x-session-token", session.token.to_string()))
+        .header(ContentType::JSON)
+        .body(
+            json!({
+                "title": "sheet",
+                "edition": "classic",
+                "raids": ["mc"],
+                "event_id": event.id
+            })
+            .to_string(),
+        )
+        .dispatch()
+        .await;
+    assert_eq!(response.status(), Status::Ok);
+
+    // Member can see it while the channel is visible…
+    let response = harness
+        .client
+        .get(format!("/events/event/{}/softres", event.id))
+        .header(Header::new(
+            "x-session-token",
+            member_session.token.to_string(),
+        ))
+        .dispatch()
+        .await;
+    assert_eq!(response.status(), Status::Ok);
+
+    // …then the channel denies ViewChannel to default members: the
+    // event stays visible (server-wide) but the sheet must 404 exactly
+    // like "no sheet" — event visibility never overrides sheet-channel
+    // visibility, and the two cases must be indistinguishable.
+    let response = harness
+        .client
+        .put(format!("/channels/{}/permissions/default", channel.id()))
+        .header(Header::new("x-session-token", session.token.to_string()))
+        .header(ContentType::JSON)
+        .body(
+            json!({
+                "permissions": {
+                    "allow": 0,
+                    "deny": ChannelPermission::ViewChannel as u64
+                }
+            })
+            .to_string(),
+        )
+        .dispatch()
+        .await;
+    assert_eq!(response.status(), Status::Ok, "perm update failed");
+
+    let response = harness
+        .client
+        .get(format!("/events/event/{}/softres", event.id))
+        .header(Header::new(
+            "x-session-token",
+            member_session.token.to_string(),
+        ))
+        .dispatch()
+        .await;
+    assert_eq!(
+        response.status(),
+        Status::NotFound,
+        "hidden channel must read as no-sheet (no existence oracle)"
+    );
+
+    // A non-member cannot resolve anything through the event route.
+    let (_, outsider_session, _) = harness.new_user().await;
+    let response = harness
+        .client
+        .get(format!("/events/event/{}/softres", event.id))
+        .header(Header::new(
+            "x-session-token",
+            outsider_session.token.to_string(),
+        ))
+        .dispatch()
+        .await;
+    assert_ne!(response.status(), Status::Ok);
+}
+
+#[rocket::async_test]
+async fn lock_at_event_start_toggle_rearms_and_clears() {
+    let harness = TestHarness::new().await;
+    let (_, session, owner) = harness.new_user().await;
+    let server = make_server(&harness, &owner).await;
+    let channel = harness.new_channel(&server).await;
+
+    let start = 1_900_000_000_000_i64;
+    let event = make_event(
+        &harness,
+        &session.token,
+        &server.id,
+        json!({ "title": "Raid Night", "start": start, "timezone": "UTC" }),
+    )
+    .await;
+
+    // Sheet linked WITHOUT auto-lock.
+    let response = harness
+        .client
+        .post(format!("/channels/{}/softres", channel.id()))
+        .header(Header::new("x-session-token", session.token.to_string()))
+        .header(ContentType::JSON)
+        .body(
+            json!({
+                "title": "sheet",
+                "edition": "classic",
+                "raids": ["mc"],
+                "event_id": event.id
+            })
+            .to_string(),
+        )
+        .dispatch()
+        .await;
+    assert_eq!(response.status(), Status::Ok);
+    let message: v0::Message = response.into_json().await.expect("`Message`");
+    let sheet_id = message.softres.expect("softres").id;
+
+    // Toggle ON → snapshots locks_at from the event.
+    let response = harness
+        .client
+        .patch(format!("/channels/{}/softres/{}", channel.id(), sheet_id))
+        .header(Header::new("x-session-token", session.token.to_string()))
+        .header(ContentType::JSON)
+        .body(json!({ "lock_at_event_start": true }).to_string())
+        .dispatch()
+        .await;
+    assert_eq!(response.status(), Status::Ok);
+    let state: v0::SoftRes = response.into_json().await.expect("`SoftRes`");
+    assert_eq!(state.locks_at, Some(start));
+
+    // Unlock clears the auto-lock state entirely…
+    let response = harness
+        .client
+        .delete(format!(
+            "/channels/{}/softres/{}/lock",
+            channel.id(),
+            sheet_id
+        ))
+        .header(Header::new("x-session-token", session.token.to_string()))
+        .dispatch()
+        .await;
+    assert_eq!(response.status(), Status::Ok);
+    let state: v0::SoftRes = response.into_json().await.expect("`SoftRes`");
+    assert_eq!(state.locks_at, None, "unlock clears the snapshot");
+
+    // …and toggling ON again re-arms rather than silently no-opping.
+    let response = harness
+        .client
+        .patch(format!("/channels/{}/softres/{}", channel.id(), sheet_id))
+        .header(Header::new("x-session-token", session.token.to_string()))
+        .header(ContentType::JSON)
+        .body(json!({ "lock_at_event_start": true }).to_string())
+        .dispatch()
+        .await;
+    assert_eq!(response.status(), Status::Ok);
+    let state: v0::SoftRes = response.into_json().await.expect("`SoftRes`");
+    assert_eq!(state.locks_at, Some(start), "re-arming must re-snapshot");
+
+    // Toggle OFF clears the snapshot.
+    let response = harness
+        .client
+        .patch(format!("/channels/{}/softres/{}", channel.id(), sheet_id))
+        .header(Header::new("x-session-token", session.token.to_string()))
+        .header(ContentType::JSON)
+        .body(json!({ "lock_at_event_start": false }).to_string())
+        .dispatch()
+        .await;
+    assert_eq!(response.status(), Status::Ok);
+    let state: v0::SoftRes = response.into_json().await.expect("`SoftRes`");
+    assert_eq!(state.locks_at, None);
+
+    // After the event is cancelled, re-arming is rejected.
+    let response = harness
+        .client
+        .delete(format!("/events/event/{}", event.id))
+        .header(Header::new("x-session-token", session.token.to_string()))
+        .dispatch()
+        .await;
+    assert!(response.status().code < 300);
+    let response = harness
+        .client
+        .patch(format!("/channels/{}/softres/{}", channel.id(), sheet_id))
+        .header(Header::new("x-session-token", session.token.to_string()))
+        .header(ContentType::JSON)
+        .body(json!({ "lock_at_event_start": true }).to_string())
+        .dispatch()
+        .await;
+    assert_ne!(
+        response.status(),
+        Status::Ok,
+        "re-arming against a cancelled event must fail"
+    );
+}

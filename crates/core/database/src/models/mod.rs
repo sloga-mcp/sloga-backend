@@ -17,6 +17,7 @@ mod messages;
 mod mls;
 mod polls;
 mod scheduled_messages;
+mod softres;
 mod soundboard;
 mod stream_connections;
 mod stickers;
@@ -56,6 +57,7 @@ pub use messages::*;
 pub use mls::*;
 pub use polls::*;
 pub use scheduled_messages::*;
+pub use softres::*;
 pub use soundboard::*;
 pub use stream_connections::*;
 pub use stickers::*;
@@ -106,6 +108,7 @@ pub trait AbstractDatabase:
     + messages::AbstractMessages
     + polls::AbstractPolls
     + scheduled_messages::AbstractScheduledMessages
+    + softres::AbstractSoftRes
     + soundboard::AbstractSoundboard
     + stream_connections::AbstractStreamConnections
     + policy_changes::AbstractPolicyChange

@@ -53,6 +53,20 @@ impl<'a> RatelimitResolver<Request<'a>> for DeltaRatelimits {
                         return ("poll_vote", Some(id));
                     }
 
+                    // Reserve set/retract (PUT+DELETE …/softres/<id>/reserve)
+                    // gets its own bucket to bound reserve-flip WS fan-out.
+                    // The trailing literal segment MUST be checked: a bare
+                    // method+extra match would drag DELETE …/softres/<id>/lock
+                    // (manage-gated unlock) into the tight bucket. (Segment
+                    // index shifts by one under the legacy "0.8" prefix.)
+                    if matches!(request.method(), Method::Put | Method::Delete)
+                        && extra == Some("softres")
+                        && request.routed_segment(if versioned { 5 } else { 4 })
+                            == Some("reserve")
+                    {
+                        return ("softres_reserve", Some(id));
+                    }
+
                     // Scheduled-message routes (POST/GET
                     // …/scheduled_messages, DELETE …/scheduled_messages/
                     // <id>) manage a queue rather than creating live
@@ -114,6 +128,20 @@ impl<'a> RatelimitResolver<Request<'a>> for DeltaRatelimits {
                             if seg3 != Some("fetch") && seg4 != Some("end") {
                                 return ("messaging", Some(id));
                             }
+                        }
+
+                        // Sheet creation creates a message → messaging bucket
+                        // (poll/roll precedent). Only the BARE create
+                        // (POST …/softres, no further segment) is a message
+                        // send; the bulk state fetch (POST …/softres/fetch)
+                        // and manual lock (POST …/softres/<id>/lock) fall
+                        // through to the channels bucket.
+                        if extra == Some("softres")
+                            && request
+                                .routed_segment(if versioned { 4 } else { 3 })
+                                .is_none()
+                        {
+                            return ("messaging", Some(id));
                         }
 
                         // Thread creation is bounded per parent channel to cap
@@ -186,8 +214,8 @@ impl<'a> RatelimitResolver<Request<'a>> for DeltaRatelimits {
                 // Static loot-catalog reads (cheap, client-cached for a day)
                 // get headroom above the shared "any" bucket. The sheet and
                 // reserve routes are channel-scoped and are bounded by the
-                // channels/messaging buckets plus their own arm when they
-                // land in a later slice.
+                // channels/messaging buckets plus the softres_reserve arm
+                // above.
                 ("softres", _, _) => ("softres_catalog", None),
                 _ => ("any", None),
             }
@@ -224,6 +252,7 @@ impl<'a> RatelimitResolver<Request<'a>> for DeltaRatelimits {
             "forum_post_create" => 5,
             "interaction_create" => 10,
             "poll_vote" => 10,
+            "softres_reserve" => 10,
             "message_schedule" => 10,
             "soundboard" => 4,
             "follow" => 2,

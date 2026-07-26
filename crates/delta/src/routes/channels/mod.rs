@@ -43,6 +43,11 @@ mod poll_vote;
 mod poll_voters;
 mod scheduled_message_delete;
 mod scheduled_messages_list;
+mod softres_create;
+mod softres_export;
+mod softres_fetch;
+mod softres_manage;
+mod softres_reserve;
 mod thread_create;
 mod thread_list;
 mod thread_members;
@@ -109,5 +114,14 @@ pub fn routes() -> (Vec<Route>, OpenApi) {
         poll_fetch::polls_fetch_bulk,
         poll_voters::poll_voters,
         poll_end::poll_end,
+        softres_create::softres_create,
+        softres_reserve::softres_reserve,
+        softres_reserve::softres_unreserve,
+        softres_fetch::softres_fetch,
+        softres_fetch::softres_fetch_bulk,
+        softres_manage::softres_edit,
+        softres_manage::softres_lock,
+        softres_manage::softres_unlock,
+        softres_export::softres_export,
     ]
 }

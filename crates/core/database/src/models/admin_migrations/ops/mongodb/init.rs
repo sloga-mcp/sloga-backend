@@ -170,6 +170,14 @@ pub async fn create_database(db: &MongoDb) {
         .await
         .expect("Failed to create poll_votes collection.");
 
+    db.create_collection("softres_sheets")
+        .await
+        .expect("Failed to create softres_sheets collection.");
+
+    db.create_collection("softres_reserves")
+        .await
+        .expect("Failed to create softres_reserves collection.");
+
     db.create_collection("scheduled_messages")
         .await
         .expect("Failed to create scheduled_messages collection.");
@@ -397,6 +405,80 @@ pub async fn create_database(db: &MongoDb) {
     })
     .await
     .expect("Failed to create poll_votes index.");
+
+    db.run_command(doc! {
+        "createIndexes": "softres_sheets",
+        "indexes": [
+            // One sheet per message; serves the message-deletion cascade.
+            {
+                "key": {
+                    "message": 1_i32
+                },
+                "name": "message",
+                "unique": true
+            },
+            // Enforces one sheet per calendar event (the create route's
+            // check is a TOCTOU; the race's loser fails here and is
+            // mapped to SoftResEventAlreadyLinked). Sparse: un-linked
+            // sheets have NO event field.
+            {
+                "key": {
+                    "event": 1_i32
+                },
+                "name": "event",
+                "unique": true,
+                "sparse": true
+            },
+            // Serves the channel-deletion cascade.
+            {
+                "key": {
+                    "channel": 1_i32
+                },
+                "name": "channel"
+            },
+            // Serves the server-deletion cascade. Sparse: DM/group sheets
+            // have NO server field.
+            {
+                "key": {
+                    "server": 1_i32
+                },
+                "name": "server",
+                "sparse": true
+            }
+        ]
+    })
+    .await
+    .expect("Failed to create softres_sheets index.");
+
+    db.run_command(doc! {
+        "createIndexes": "softres_reserves",
+        "indexes": [
+            // Serves the full-sheet fetch (render/export).
+            {
+                "key": {
+                    "sheet": 1_i32
+                },
+                "name": "sheet"
+            },
+            // Multikey (items is an array): serves the per-item cap count.
+            {
+                "key": {
+                    "sheet": 1_i32,
+                    "items": 1_i32
+                },
+                "name": "sheet_items"
+            },
+            // Serves the channel-deletion cascade.
+            {
+                "key": {
+                    "channel": 1_i32
+                },
+                "name": "channel"
+            }
+        ]
+    })
+    .await
+    .expect("Failed to create softres_reserves index.");
 
     db.run_command(doc! {
         "createIndexes": "scheduled_messages",

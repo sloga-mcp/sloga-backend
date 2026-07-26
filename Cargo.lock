@@ -7389,6 +7389,7 @@ dependencies = [
  "chrono",
  "dashmap",
  "ed25519-dalek",
+ "flate2",
  "futures",
  "impl_ops",
  "iso8601-timestamp",

@@ -1,14 +1,16 @@
 use revolt_result::Error;
 use serde::{Deserialize, Serialize};
 
+use std::collections::HashMap;
+
 use revolt_models::v0::{
     AppendMessage, Channel, ChannelFollow, ChannelSlowmode, ChannelUnread, ChannelVoiceState, E2EEMessage,
     Emoji, Event, EventRsvp, FieldsChannel, FieldsMember, FieldsMessage, FieldsRole, FieldsServer, FieldsUser,
     FieldsWebhook, Interaction, Member, MemberCompositeKey, Message, PartialChannel, PartialEmoji,
     PartialMember, PartialMessage, PartialRole, PartialServer, PartialSticker, PartialUser,
     PartialSoundboardSound, PartialUserVoiceState, PartialWebhook, PolicyChange, PollAnswerCount,
-    RemovalIntention, Report, ScheduledMessage, Server, SoundboardSound, Sticker, User,
-    UserSettings, UserVoiceState, Webhook,
+    RemovalIntention, Report, ScheduledMessage, Server, SoftRes, SoftResReserve, SoundboardSound,
+    Sticker, User, UserSettings, UserVoiceState, Webhook,
 };
 
 use crate::{Account, Database, Session};
@@ -551,6 +553,40 @@ pub enum EventV1 {
         message_id: String,
         counts: Vec<PollAnswerCount>,
         total_votes: i64,
+    },
+
+    /// A soft-reserve sheet's reserve rows changed (set, replaced or
+    /// retracted). Published on the channel topic — the topic is the
+    /// authorization boundary. For HIDDEN sheets both `reserve` AND
+    /// `changed_item_counts` are omitted (`total_reserves` only): the
+    /// per-item aggregates are exactly the signal `hidden` hides, and the
+    /// channel topic has one audience — leaders refetch over REST. For
+    /// visible sheets `changed_item_counts` carries only the CHANGED
+    /// items' new absolute counts (the delta the write computed anyway),
+    /// which clients merge — never the full map.
+    SoftresReserveUpdate {
+        id: String,
+        channel_id: String,
+        message_id: String,
+        total_reserves: i64,
+        #[serde(skip_serializing_if = "HashMap::is_empty", default)]
+        changed_item_counts: HashMap<String, u32>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        reserve: Option<SoftResReserve>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        removed_user: Option<String>,
+    },
+
+    /// A soft-reserve sheet's settings or lock state changed (edit, lock,
+    /// unlock, or event-cancellation lock). The embedded `sheet` is the
+    /// PUBLIC-gated model (reserves / item_counts omitted when hidden,
+    /// even for the leader, who refetches) — the ungated form must never
+    /// reach the channel topic.
+    SoftresSheetUpdate {
+        id: String,
+        channel_id: String,
+        message_id: String,
+        sheet: SoftRes,
     },
 
     /// A calendar event was created. Published on the event's channel topic when

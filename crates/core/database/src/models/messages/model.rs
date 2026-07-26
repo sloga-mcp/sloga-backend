@@ -108,6 +108,13 @@ auto_derived_partial!(
         #[serde(skip_serializing_if = "Option::is_none")]
         pub poll: Option<v0::PollDefinition>,
 
+        /// Immutable soft-reserve sheet definition when this message
+        /// carries one. Server-set only (by the soft-res create route);
+        /// the regular send path never accepts it. Mutable sheet state
+        /// lives in `softres_sheets`.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub softres: Option<v0::SoftResDefinition>,
+
         /// Immutable snapshot of another message this message forwards.
         /// Server-set only (by the forward route, which verifies read
         /// access on the source) — absent from `DataMessageSend` and
@@ -342,6 +349,7 @@ impl Default for Message {
             components: None,
             sticker_ids: None,
             poll: None,
+            softres: None,
             forwarded: None,
             crosspost: None,
         }
@@ -1231,6 +1239,13 @@ impl Message {
                 .await?;
         }
 
+        // Cascade: a soft-res sheet message takes its sheet (and reserve
+        // rows) with it. Gated on the embedded definition like polls.
+        if self.softres.is_some() {
+            db.delete_softres_for_messages(std::slice::from_ref(&self.id))
+                .await?;
+        }
+
         db.delete_message(&self.id).await?;
 
         EventV1::MessageDelete {
@@ -1254,6 +1269,7 @@ impl Message {
 
         // Cascade before the messages go (single query for the whole batch).
         db.delete_polls_for_messages(&valid_ids).await?;
+        db.delete_softres_for_messages(&valid_ids).await?;
 
         db.delete_messages(channel, &valid_ids).await?;
         EventV1::BulkMessageDelete {
@@ -1283,6 +1299,7 @@ impl Message {
             .collect();
         if !all_ids.is_empty() {
             db.delete_polls_for_messages(&all_ids).await?;
+            db.delete_softres_for_messages(&all_ids).await?;
         }
 
         for (channel_id, message_ids) in deleted_groups {

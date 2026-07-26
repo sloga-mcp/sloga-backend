@@ -393,6 +393,21 @@ pub async fn edit_event(
     Ok(Json(wire))
 }
 
+/// Lock the soft-res sheet linked to a cancelled event, if any — a
+/// cancelled raid freezes its sheet. Best-effort (a sheet-side failure
+/// must never fail a cancel), exactly-once via the atomic lock flip (it
+/// may lose to a concurrent manual lock; the sheet ends up locked either
+/// way), and only the winner fans out the update.
+async fn lock_linked_softres_sheet(db: &Database, event_id: &str) {
+    if let Ok(Some(sheet)) = db.fetch_sheet_by_event(event_id).await {
+        if let Ok(true) = db.set_sheet_locked_if_unlocked(&sheet.id).await {
+            if let Ok(fresh) = db.fetch_sheet(&sheet.id).await {
+                let _ = crate::util::softres::publish_sheet_update(db, fresh).await;
+            }
+        }
+    }
+}
+
 /// # Cancel Event
 ///
 /// Soft-cancel an event (terminal). RSVP rows are retained so attendees can still
@@ -414,6 +429,11 @@ pub async fn cancel_event(
     // this, each retry/double-cancel would re-notify every attendee (cancel is terminal,
     // design §7); the cancel path has no per-send marker like reminders do.
     if event.cancelled {
+        // Still heal the linked soft-res sheet: a sheet created in the
+        // cancel's fetch→insert race window can exist unlocked against an
+        // already-cancelled event, and only a retried cancel passes here.
+        // The lock arbitration is exactly-once, so repeats are free.
+        lock_linked_softres_sheet(db, &event.id).await;
         return Ok(EmptyResponse);
     }
 
@@ -431,6 +451,11 @@ pub async fn cancel_event(
     }
     .p(topic)
     .await;
+
+    // A cancelled raid freezes its soft-res sheet: lock the linked sheet
+    // (if any) exactly once and fan the update out. This is the only
+    // events→softres coupling and it runs AFTER the cancel commits.
+    lock_linked_softres_sheet(db, &event.id).await;
 
     // Notify Going attendees AFTER the cancel commits (finding H6). The soft-cancel keeps
     // the RSVP rows, so the notify-list is intact when gathered here — and notifying only

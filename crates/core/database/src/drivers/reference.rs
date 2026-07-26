@@ -9,7 +9,8 @@ use crate::{
     EventRsvpKey, File, FileHash, Interaction, Invite, Member, MemberCompositeKey, Message,
     MlsCommit, MlsGroup, MlsJoinIntent, MlsKeyPackage, PolicyChange, Poll, PollVote,
     RatelimitEvent, ReminderSent,
-    ReminderSentKey, Report, ScheduledMessage, Server, ServerBan, ServerBoost, Snapshot, SoundboardSound,
+    ReminderSentKey, Report, ScheduledMessage, Server, ServerBan, ServerBoost, Snapshot,
+    SoftResReserveRow, SoftResSheet, SoundboardSound,
     Sticker, StreamConnection, ThreadMember,
     ThreadMemberCompositeKey, UploadSession, User, UserSettings, Webhook, Account, AccountInvite, Session,
     MFATicket
@@ -41,6 +42,8 @@ database_derived!(
         pub messages: Arc<Mutex<HashMap<String, Message>>>,
         pub polls: Arc<Mutex<HashMap<String, Poll>>>,
         pub poll_votes: Arc<Mutex<HashMap<String, PollVote>>>,
+        pub softres_sheets: Arc<Mutex<HashMap<String, SoftResSheet>>>,
+        pub softres_reserves: Arc<Mutex<HashMap<String, SoftResReserveRow>>>,
         pub scheduled_messages: Arc<Mutex<HashMap<String, ScheduledMessage>>>,
         pub stream_connections: Arc<Mutex<HashMap<String, StreamConnection>>>,
         pub policy_changes: Arc<Mutex<HashMap<String, PolicyChange>>>,

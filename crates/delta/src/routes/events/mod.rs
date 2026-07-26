@@ -13,6 +13,7 @@ use rocket::Route;
 mod events_crud;
 mod import;
 mod rsvp;
+mod softres_lookup;
 #[cfg(test)]
 mod tests;
 
@@ -231,5 +232,6 @@ pub fn routes() -> (Vec<Route>, OpenApi) {
         rsvp::uninvite_from_event,
         rsvp::set_rsvp,
         rsvp::fetch_attendees,
+        softres_lookup::fetch_event_softres,
     ]
 }

@@ -366,6 +366,12 @@ impl MongoDb {
             .await
             .map_err(|_| create_database_error!("delete_many", "polls"))?;
 
+        // Delete soft-res sheets and their reserve rows (same wholesale
+        // rule as polls: the per-message cascade never runs on this
+        // path). Reuses the one cascade implementation rather than
+        // inlining a second copy that could drift.
+        crate::AbstractSoftRes::delete_softres_for_server(self, server_id).await?;
+
         // Delete scheduled messages targeting the server's channels so they
         // don't sit as pending rows that can only fail at fire time. Rows
         // carry `server`, so this also covers thread-targeted rows.

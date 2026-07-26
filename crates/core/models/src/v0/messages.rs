@@ -11,7 +11,7 @@ use rocket::{FromForm, FromFormField};
 
 use iso8601_timestamp::Timestamp;
 
-use super::{Channel, Embed, File, Member, MessageInteraction, MessageWebhook, PollDefinition, User, Webhook, RE_COLOUR};
+use super::{Channel, Embed, File, Member, MessageInteraction, MessageWebhook, PollDefinition, SoftResDefinition, User, Webhook, RE_COLOUR};
 
 auto_derived_partial!(
     /// Message
@@ -109,6 +109,16 @@ auto_derived_partial!(
         /// poll state (counts / closed) is fetched and pushed separately.
         #[serde(skip_serializing_if = "Option::is_none")]
         pub poll: Option<PollDefinition>,
+
+        /// Immutable soft-reserve sheet definition when this message
+        /// carries one.
+        ///
+        /// Server-set only (by the soft-res create route, together with
+        /// the `SoftRes` flag) — the regular send path never accepts it.
+        /// Mutable sheet state (reserves / lock) is fetched and pushed
+        /// separately.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub softres: Option<SoftResDefinition>,
 
         /// Immutable snapshot of another message this message forwards.
         ///
@@ -551,6 +561,11 @@ auto_derived!(
         /// by the crosspost endpoint; a message bearing it can never be
         /// crossposted again (loop prevention).
         IsCrosspost = 8,
+        /// This message carries a soft-reserve sheet. Set only by the
+        /// soft-res create route together with the embedded definition —
+        /// the send path rejects raw flags above bit 2, so the flag (and
+        /// the sheet card it triggers) cannot be forged.
+        SoftRes = 9,
     }
 
     /// Optional fields on message

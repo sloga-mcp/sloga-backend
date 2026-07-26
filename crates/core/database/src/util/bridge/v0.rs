@@ -713,6 +713,7 @@ impl crate::Message {
             components: self.components,
             sticker_ids: self.sticker_ids,
             poll: self.poll,
+            softres: self.softres,
             forwarded: self.forwarded.map(Into::into),
             crosspost: self.crosspost,
         }
@@ -767,6 +768,7 @@ impl From<crate::PartialMessage> for PartialMessage {
             components: value.components,
             sticker_ids: value.sticker_ids,
             poll: value.poll,
+            softres: value.softres,
             forwarded: value.forwarded.map(Into::into),
             crosspost: value.crosspost,
         }

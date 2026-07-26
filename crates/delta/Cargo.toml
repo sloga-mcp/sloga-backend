@@ -20,6 +20,7 @@ log = { workspace = true }
 dashmap = { workspace = true }
 linkify = { workspace = true }
 once_cell = { workspace = true }
+flate2 = { workspace = true }
 
 # Lang. Utilities
 regex = { workspace = true }

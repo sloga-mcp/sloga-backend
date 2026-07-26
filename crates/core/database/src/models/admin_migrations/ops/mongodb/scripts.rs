@@ -26,7 +26,7 @@ struct MigrationInfo {
     revision: i32,
 }
 
-pub const LATEST_REVISION: i32 = 66; // MUST BE +1 to last migration
+pub const LATEST_REVISION: i32 = 67; // MUST BE +1 to last migration
 
 pub async fn migrate_database(db: &MongoDb) {
     let migrations = db.col::<Document>("migrations");
@@ -2212,6 +2212,95 @@ pub async fn run_migrations(db: &MongoDb, revision: i32) -> i32 {
             })
             .await
             .expect("Failed to create discord_import_jobs indexes.");
+    }
+
+    if revision <= 66 {
+        info!("Running migration [revision 66 / 26-07-2026]: Create softres_sheets / softres_reserves collections (soft-reserve loot sheets)");
+
+        // Same idempotency contract as prior collection migrations;
+        // mirrors init.rs. The unique specs here MUST stay identical to
+        // the copies in init.rs and the softres ops tests.
+        db.db().create_collection("softres_sheets").await.ok();
+        db.db().create_collection("softres_reserves").await.ok();
+
+        db.db()
+            .run_command(doc! {
+                "createIndexes": "softres_sheets",
+                "indexes": [
+                    // One sheet per message; serves the message-deletion
+                    // cascade.
+                    {
+                        "key": {
+                            "message": 1_i32
+                        },
+                        "name": "message",
+                        "unique": true
+                    },
+                    // ENFORCES one sheet per calendar event — delta's
+                    // create-time check is a TOCTOU and the loser of the
+                    // concurrent double-link race must fail here (mapped
+                    // to SoftResEventAlreadyLinked). Sparse: un-linked
+                    // sheets have NO event field.
+                    {
+                        "key": {
+                            "event": 1_i32
+                        },
+                        "name": "event",
+                        "unique": true,
+                        "sparse": true
+                    },
+                    // Serves the channel-deletion cascade.
+                    {
+                        "key": {
+                            "channel": 1_i32
+                        },
+                        "name": "channel"
+                    },
+                    // Serves the server-deletion cascade. Sparse: DM/group
+                    // sheets have NO server field.
+                    {
+                        "key": {
+                            "server": 1_i32
+                        },
+                        "name": "server",
+                        "sparse": true
+                    }
+                ]
+            })
+            .await
+            .expect("Failed to create softres_sheets indexes.");
+
+        db.db()
+            .run_command(doc! {
+                "createIndexes": "softres_reserves",
+                "indexes": [
+                    // Serves the full-sheet fetch (render/export).
+                    {
+                        "key": {
+                            "sheet": 1_i32
+                        },
+                        "name": "sheet"
+                    },
+                    // Multikey (items is an array): serves the per-item
+                    // cap count.
+                    {
+                        "key": {
+                            "sheet": 1_i32,
+                            "items": 1_i32
+                        },
+                        "name": "sheet_items"
+                    },
+                    // Serves the channel-deletion cascade.
+                    {
+                        "key": {
+                            "channel": 1_i32
+                        },
+                        "name": "channel"
+                    }
+                ]
+            })
+            .await
+            .expect("Failed to create softres_reserves indexes.");
     }
 
     // Reminder to update LATEST_REVISION when adding new migrations.
