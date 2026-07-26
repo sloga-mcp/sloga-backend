@@ -1,6 +1,9 @@
 # Chunked / Resumable Uploads — Design & Staged Plan
 
-**Status:** Draft for review. No code yet.
+**Status:** IMPLEMENTED (2026-07-26) — superseded by ,
+which carries the audited, as-built decisions (5 GB ceiling, Phases 1+2 shipped together,
+versioned STREAM-AEAD v2 from the start; Phase 3 below is DROPPED, the §9 crypto column is
+stale). This document remains as the original investigation record.
 **Author:** drafted 2026-07-20.
 **Problem:** Attachments larger than ~100 MB cannot be uploaded. Config advertises 5 GB
 (`Revolt.overrides.toml` `body_limit_size` / `file_upload_size_limit` = 5_000_000_000),

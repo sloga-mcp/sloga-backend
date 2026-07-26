@@ -1,6 +1,6 @@
 # Chunked/Resumable Uploads + Streaming Downloads — Implementation Plan
 
-**Status:** APPROVED with audit amendments — see §12, which overrides earlier sections where they conflict.
+**Status:** Stages 0–5 IMPLEMENTED and committed (backend  6f90d6d0..26284f3d, frontend  355cfcda); §12 amendments applied. Remaining: release deploy + the §9 live-smoke checklist.
 **Drafted:** 2026-07-26, against `acutest` @ 7cd69b56 (tag `pre-chunked-uploads-20260726`). Audited by code-reviewer 2026-07-26 (14 findings, verdict: implement with fixes).
 **Implements:** `docs/chunked-resumable-uploads-design.md` with the settled decisions applied: 5 GB ceiling, Phases 1+2 shipped together, versioned STREAM-AEAD (v2) at-rest format from day one, legacy whole-GCM read path preserved (absence of version field = legacy), claim-once `File` minting unchanged, 32 MiB chunks, MinIO `AbortIncompleteMultipartUpload` lifecycle + `UploadSession` TTL sweep as hard ship gates.
 
