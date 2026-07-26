@@ -165,6 +165,7 @@ impl SoftResSheet {
         now_ms: i64,
     ) -> v0::SoftRes {
         let locked = self.is_locked_now(now_ms);
+        let definition = self.definition();
         let total_reserves = rows.len() as i64;
         let my_reserve = rows
             .iter()
@@ -188,6 +189,7 @@ impl SoftResSheet {
 
         v0::SoftRes {
             id: self.id,
+            definition,
             message_id: self.message,
             channel_id: self.channel,
             event_id: self.event,

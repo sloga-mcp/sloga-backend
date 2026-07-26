@@ -132,6 +132,12 @@ auto_derived!(
         /// Sheet id
         #[serde(rename = "_id")]
         pub id: String,
+        /// The sheet's CURRENT definition and settings. Unlike the
+        /// creation-time snapshot embedded in the carrying message (stale
+        /// after edits by design), this copy is rebuilt on every fetch /
+        /// fan-out — clients must prefer it once hydrated, or an edited
+        /// title would never become visible anywhere.
+        pub definition: SoftResDefinition,
         /// Id of the message carrying this sheet
         pub message_id: String,
         /// Id of the channel the sheet was created in
