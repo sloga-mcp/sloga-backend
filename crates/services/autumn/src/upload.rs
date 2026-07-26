@@ -866,6 +866,45 @@ mod tests {
                 .unwrap()
         );
 
+        // ...and streams back byte-identical through the v2 download path
+        let mut expect = part_1.clone();
+        expect.extend_from_slice(&part_2);
+        let response = crate::download::serve_v2(&hash, None).await.unwrap();
+        assert_eq!(response.status(), 200);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(body.len(), total);
+        assert!(body[..] == expect[..], "full stream must round-trip");
+
+        // Range crossing the part boundary (also crosses segments)
+        let start = revolt_files::CHUNK_SIZE - 100;
+        let end = revolt_files::CHUNK_SIZE + 99;
+        let response = crate::download::serve_v2(&hash, Some(&format!("bytes={start}-{end}")))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 206);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(body[..] == expect[start..=end], "range must round-trip");
+
+        // Suffix range (video players use these)
+        let response = crate::download::serve_v2(&hash, Some("bytes=-100"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 206);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(body[..] == expect[total - 100..], "suffix range must round-trip");
+
+        // Out-of-bounds start is 416
+        let response = crate::download::serve_v2(&hash, Some(&format!("bytes={total}-")))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 416);
+
         // Second identical upload dedupes onto the same hash and drops its
         // own parts
         let created_2 = create_upload(

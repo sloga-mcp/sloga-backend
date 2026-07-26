@@ -137,13 +137,21 @@ lazy_static! {
         .build();
 }
 
-/// Retrieve hash information and file data by given hash
+/// Objects above this size are served without inserting into [`S3_CACHE`] —
+/// a burst of large legacy fetches must not evict the whole cache. (v2
+/// chunked objects never reach this path at all; they stream.)
+const CACHE_INSERT_MAX_SIZE: isize = 16 * 1024 * 1024;
+
+/// Retrieve hash information and file data by given hash (LEGACY formats
+/// only — v2 objects are streamed by `download::serve_v2`, never buffered)
 async fn retrieve_file_by_hash(hash: &FileHash) -> Result<Vec<u8>> {
     if let Some(data) = S3_CACHE.get(&hash.id).await {
         data
     } else {
         let data = fetch_from_s3(&hash.bucket_id, &hash.path, &hash.iv).await;
-        S3_CACHE.insert(hash.id.to_owned(), data.clone()).await;
+        if hash.size <= CACHE_INSERT_MAX_SIZE {
+            S3_CACHE.insert(hash.id.to_owned(), data.clone()).await;
+        }
         data
     }
 }
@@ -617,6 +625,7 @@ async fn fetch_preview(
 )]
 async fn fetch_file(
     State(db): State<Database>,
+    headers: axum::http::HeaderMap,
     Path((tag, file_id, file_name)): Path<(Tag, String, String)>,
 ) -> Result<Response> {
     let tag: &'static str = tag.clone().into();
@@ -649,15 +658,22 @@ async fn fetch_file(
     }
 
     let hash = file.as_hash(&db).await?;
-    retrieve_file_by_hash(&hash).await.map(|data| {
-        (
-            [
-                (header::CONTENT_TYPE, hash.content_type),
-                (header::CONTENT_DISPOSITION, "attachment".to_owned()),
-                (header::CACHE_CONTROL, CACHE_CONTROL.to_owned()),
-            ],
-            data,
-        )
-            .into_response()
-    })
+    let range = headers
+        .get(header::RANGE)
+        .and_then(|value| value.to_str().ok());
+
+    match hash.format_version {
+        // v2 segmented objects stream (multi-GB safe) with Range support
+        Some(2) => crate::download::serve_v2(&hash, range).await,
+        Some(other) => {
+            tracing::error!("unknown FileHash format_version {other} for {}", hash.id);
+            Err(create_error!(InternalError))
+        }
+        // Legacy whole-file objects: buffered exactly as before (bounded
+        // ≤ ~100 MB by the historical upload wall), now with Range support
+        None => {
+            let data = retrieve_file_by_hash(&hash).await?;
+            crate::download::serve_legacy_buffer(&hash, data, range)
+        }
+    }
 }

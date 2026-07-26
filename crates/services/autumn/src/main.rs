@@ -14,6 +14,7 @@ use utoipa_scalar::{Scalar, Servable as ScalarServable};
 
 mod api;
 pub mod clamav;
+mod download;
 mod e2ee;
 pub mod exif;
 pub mod metadata;
