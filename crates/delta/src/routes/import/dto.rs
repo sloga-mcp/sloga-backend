@@ -17,6 +17,11 @@ pub struct ImportSummaryResponse {
     pub channels_created: u32,
     pub categories_created: u32,
     pub channels_skipped: u32,
+    /// Roles recreated. The Discord `@everyone` role is **not** counted — it
+    /// is not a Sloga role; its permissions become the server's defaults.
+    pub roles_created: u32,
+    /// Roles in the template that were not recreated (cap, or failed insert)
+    pub roles_skipped: u32,
     /// Human-readable notes about anything deliberately not imported
     pub notes: Vec<String>,
 }
@@ -59,6 +64,8 @@ impl From<DiscordImportJob> for ImportJobResponse {
                 channels_created: summary.channels_created,
                 categories_created: summary.categories_created,
                 channels_skipped: summary.channels_skipped,
+                roles_created: summary.roles_created,
+                roles_skipped: summary.roles_skipped,
                 notes: summary.notes,
             }),
         }

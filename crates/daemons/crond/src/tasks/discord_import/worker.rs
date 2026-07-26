@@ -15,21 +15,26 @@
 //! worker must abandon it immediately — including rolling back the half-built
 //! server. That is what makes sweeper-side cleanup safe.
 
+use std::collections::HashMap;
 use std::time::Duration;
 
 use iso8601_timestamp::Timestamp;
 use revolt_config::config;
 use revolt_database::{
     events::client::EventV1, Category, Channel, Database, DiscordImportJob, DiscordImportSummary,
-    ImportStage, ImportStatus, Invite, Member, PartialChannel, PartialServer, Server,
+    ImportStage, ImportStatus, Invite, Member, PartialChannel, PartialServer, Role, Server,
     SystemMessageChannels, User, AMQP,
 };
 use revolt_models::v0;
-use revolt_result::Result;
+use revolt_permissions::OverrideField;
+use revolt_result::{ErrorType, Result};
 use tokio::time::sleep;
 
-use super::mapper::{plan_import, ImportPlan, PlannedChannelKind};
+use super::mapper::{plan_import, ImportPlan, PlannedChannelKind, PlannedOverride};
 use super::template::{self, TemplateFetchError};
+
+/// Template placeholder role id → the real Sloga role id it became.
+type RoleMap = HashMap<String, String>;
 
 /// How often we look for queued work. Deliberately much tighter than the
 /// 60s house tick: a human is staring at a progress bar waiting for this.
@@ -106,8 +111,8 @@ pub async fn task(db: Database, _amqp: AMQP) -> Result<()> {
 async fn sweep_stale(db: &Database) -> Result<()> {
     // NB: `iso8601_timestamp::Duration` is `time::Duration`, not
     // `std::time::Duration` — same name, different types.
-    let Some(cutoff) =
-        Timestamp::now_utc().checked_sub(iso8601_timestamp::Duration::seconds(HEARTBEAT_TIMEOUT_SECS))
+    let Some(cutoff) = Timestamp::now_utc()
+        .checked_sub(iso8601_timestamp::Duration::seconds(HEARTBEAT_TIMEOUT_SECS))
     else {
         // Fail closed: a cutoff of "now" would reap every healthy import.
         log::error!("could not compute import sweeper cutoff; skipping sweep");
@@ -124,14 +129,41 @@ async fn sweep_stale(db: &Database) -> Result<()> {
         // Clean up a server the dead worker created but never gave anyone
         // membership of. Without this it is invisible (bonfire builds the
         // server list from memberships), undeletable (server_delete requires a
-        // membership row), and free (the quota counts memberships) — an
-        // orphan that accumulates one per deploy-during-import.
-        let orphan = job.server_id.clone().filter(|_| {
-            matches!(
-                job.stage,
-                ImportStage::Fetching | ImportStage::Server | ImportStage::Channels
-            )
-        });
+        // membership row), and free (the quota counts memberships) — an orphan
+        // that accumulates one per deploy-during-import.
+        //
+        // Ask the database whether the membership row exists rather than
+        // inferring it from the stage. The stage is written BEFORE the work it
+        // names, so a job stalled at `Membership` has not necessarily got one —
+        // and a stage-name list silently stops covering new stages the moment
+        // somebody adds one without editing it here.
+        //
+        // ONLY `NotFound` means "no membership row". Treating every error as
+        // one would let a single Mongo blip delete a server that is fully built
+        // and live: `Server::delete` cascades channels, messages, events and
+        // boosts and broadcasts `ServerDelete`, with no undo. It would also
+        // never surface in development, because `query!` unwraps in debug
+        // builds — the mappable-error path exists only in release.
+        //
+        // Leaving an orphan behind is cheap and recoverable; deleting a real
+        // server is neither. So anything ambiguous skips the rollback.
+        let orphan = match &job.server_id {
+            Some(server_id) => match db.fetch_member(server_id, &job.user_id).await {
+                Ok(_) => None,
+                Err(error) if matches!(error.error_type, ErrorType::NotFound) => {
+                    Some(server_id.clone())
+                }
+                Err(error) => {
+                    log::error!(
+                        "could not determine membership for reaped import {} \
+                         (server {server_id}); leaving the server in place: {error:?}",
+                        job.id
+                    );
+                    None
+                }
+            },
+            None => None,
+        };
 
         let reaped = fail_job(
             db,
@@ -189,7 +221,10 @@ async fn progress(
             return false;
         }
         Err(error) => {
-            log::error!("failed to persist import progress for {}: {error:?}", job.id)
+            log::error!(
+                "failed to persist import progress for {}: {error:?}",
+                job.id
+            )
         }
         Ok(true) => {}
     }
@@ -270,7 +305,12 @@ async fn import(db: &Database, job: &mut DiscordImportJob) -> std::result::Resul
         .await
         .map_err(|error: TemplateFetchError| ImportAbort::Failed(error.user_message()))?;
 
-    let plan = plan_import(&fetched);
+    // The mapper refuses templates whose permission shape it cannot read with
+    // certainty, rather than guessing — see `mapper::PlanError`.
+    let plan = plan_import(&fetched).map_err(|error| {
+        log::warn!("refusing discord template for job {}: {error:?}", job.id);
+        ImportAbort::Failed(error.user_message())
+    })?;
     let total = plan.total_steps().max(1);
 
     // 2. Create the server shell.
@@ -344,10 +384,19 @@ async fn build_server(
     plan: &ImportPlan,
     total: u32,
 ) -> std::result::Result<(), ImportAbort> {
-    // 3. Channels.
-    let (channels, mut summary) = create_channels(db, &mut server, plan, job, total).await?;
+    // 3. Roles, before channels — per-channel overwrites are keyed by role id.
+    let (roles, roles_created, roles_skipped, role_notes) =
+        create_roles(db, job, &mut server, plan).await?;
 
-    // 4. Categories + system messages, persisted AND applied in memory.
+    // 4. Channels, with their permission overwrites resolved against `roles`.
+    let (channels, mut summary) =
+        create_channels(db, &mut server, plan, job, total, &roles).await?;
+    summary.roles_created = roles_created;
+    summary.roles_skipped = roles_skipped;
+    summary.notes.extend(role_notes);
+
+    // 5. Categories + system messages + the imported `@everyone` baseline,
+    // persisted AND applied in memory.
     //
     // This matters beyond persistence: `ServerCreate` (emitted by
     // `Member::create` below) snapshots the IN-MEMORY server, so anything
@@ -372,13 +421,22 @@ async fn build_server(
         .update(
             db,
             PartialServer {
-                channels: Some(created_channels.iter().map(|c| c.id().to_string()).collect()),
+                channels: Some(
+                    created_channels
+                        .iter()
+                        .map(|c| c.id().to_string())
+                        .collect(),
+                ),
                 categories: if categories.is_empty() {
                     None
                 } else {
                     Some(categories)
                 },
                 system_messages,
+                // The Discord `@everyone` role is not a Sloga role — its
+                // permissions are the server baseline. `Server::create` seeded
+                // this with Sloga's own default, which we now replace.
+                default_permissions: Some(plan.default_permissions as i64),
                 ..Default::default()
             },
             vec![],
@@ -386,7 +444,7 @@ async fn build_server(
         .await
         .map_err(|_| ImportAbort::Failed(generic_failure()))?;
 
-    // 5. Membership — LOAD-BEARING, and the single easiest thing to get wrong.
+    // 6. Membership — LOAD-BEARING, and the single easiest thing to get wrong.
     //
     // `Server::create` writes the server document and emits NOTHING.
     // `Member::create` is the sole writer of the `server_members` row and the
@@ -394,9 +452,9 @@ async fn build_server(
     // their memberships, so skipping this produces an import that "succeeds"
     // and then vanishes from the client on the next reconnect.
     //
-    // It must also run AFTER the server struct is fully populated (step 4) and
-    // BEFORE the completion event (step 7), so the client has the server
-    // cached by the time it navigates to it.
+    // It must also run AFTER the server struct is fully populated (steps 3-5,
+    // roles included) and BEFORE the completion event (step 8), so the client
+    // has the server cached by the time it navigates to it.
     if !progress(db, job, ImportStage::Membership, total, total).await {
         return Err(ImportAbort::Superseded);
     }
@@ -405,7 +463,7 @@ async fn build_server(
         .await
         .map_err(|_| ImportAbort::Failed(generic_failure()))?;
 
-    // 6. Welcome invite — the actual payload of this feature ("paste this in
+    // 7. Welcome invite — the actual payload of this feature ("paste this in
     // your Discord"). Best-effort: a server without an invite is still a
     // successful import, and the user can mint one by hand.
     if !progress(db, job, ImportStage::Invite, total, total).await {
@@ -415,7 +473,7 @@ async fn build_server(
     let invite_code = mint_invite(db, owner, plan, &channels).await;
     job.invite_code = invite_code.clone();
 
-    // 7. Done.
+    // 8. Done.
     job.status = ImportStatus::Completed;
     job.stage = ImportStage::Done;
     job.done = total;
@@ -444,6 +502,112 @@ async fn build_server(
     Ok(())
 }
 
+/// Recreate the template's roles.
+///
+/// Returns the placeholder-id → real-id map that channel overwrites resolve
+/// against, the created count, and any notes for the summary.
+async fn create_roles(
+    db: &Database,
+    job: &mut DiscordImportJob,
+    server: &mut Server,
+    plan: &ImportPlan,
+) -> std::result::Result<(RoleMap, u32, u32, Vec<String>), ImportAbort> {
+    let role_limit = config().await.features.limits.global.server_roles;
+    let mut roles: RoleMap = HashMap::new();
+    let mut notes: Vec<String> = Vec::new();
+    let mut created = 0u32;
+    let mut failed = 0u32;
+
+    // `plan.roles` is ordered most-authoritative-first, so truncating the tail
+    // drops the *least* powerful roles. Capping beats failing: a guild over the
+    // limit still gets an import, with the shortfall stated in the summary
+    // (plan §7).
+    let importable = plan.roles.len().min(role_limit);
+    let over_limit = plan.roles.len() - importable;
+
+    // The roles stage reports against its OWN item count, not the channel
+    // total: reusing the channel denominator made a 60-role, 6-channel guild
+    // render "0 / 6" for the whole phase and then jump — the stall-then-jump
+    // the slice-0 audit already fixed once (#9).
+    let role_total = importable as u32;
+
+    if !progress(db, job, ImportStage::Roles, 0, role_total).await {
+        return Err(ImportAbort::Superseded);
+    }
+
+    for planned in plan.roles[..importable].iter() {
+        let role = Role {
+            id: ulid::Ulid::new().to_string(),
+            name: planned.name.clone(),
+            // Discord role permissions are pure grants — deny exists only in
+            // channel overwrites — so `d` is always 0 here. The wire type is
+            // u64 and the stored type i64; this is the cast.
+            permissions: OverrideField {
+                a: planned.permissions as i64,
+                d: 0,
+            },
+            colour: planned.colour.clone(),
+            hoist: planned.hoist,
+            // The mapper already performed the Discord-position-DESC →
+            // Sloga-rank-ASC inversion; this is only the numbering. Ranks count
+            // successes, not loop iterations, so a failed insert leaves no gap.
+            rank: created as i64,
+            icon: None,
+        };
+
+        if let Err(error) = db.insert_role(&server.id, &role).await {
+            // One bad role must not cost the user the whole server.
+            log::warn!("skipping role during import: {error:?}");
+            failed += 1;
+            continue;
+        }
+
+        roles.insert(planned.template_id.0.clone(), role.id.clone());
+
+        // LOAD-BEARING. `insert_role` writes the database and nothing else,
+        // while `ServerCreate` — emitted later by `Member::create` — snapshots
+        // the IN-MEMORY server (`server_members/model.rs`, `server.clone()`).
+        // Skip this line and the import "succeeds" with a client that shows a
+        // server with no roles at all until the user reloads. Same class of
+        // bug as the missing `Member::create` the first audit caught.
+        server.roles.insert(role.id.clone(), role);
+        created += 1;
+
+        // Report successes, matching how `rank` is assigned — counting loop
+        // iterations would run the bar ahead of reality after a failed insert.
+        if !progress(db, job, ImportStage::Roles, created, role_total).await {
+            return Err(ImportAbort::Superseded);
+        }
+    }
+
+    if failed > 0 {
+        notes.push(format!(
+            "{failed} role(s) couldn't be created and were skipped."
+        ));
+    }
+
+    if over_limit > 0 {
+        notes.push(format!(
+            "{over_limit} role(s) weren't imported — this server hit the {role_limit}-role limit. \
+             The roles with the least authority were dropped first."
+        ));
+    }
+
+    Ok((roles, created, failed + over_limit as u32, notes))
+}
+
+/// Turn a mapped override into the stored representation.
+///
+/// The wire/permission side of Sloga speaks u64 (`Override { allow, deny }`);
+/// what lands in the database is i64 (`OverrideField { a, d }`). This is that
+/// cast, in one place.
+fn stored_override(planned: &PlannedOverride) -> OverrideField {
+    OverrideField {
+        a: planned.allow as i64,
+        d: planned.deny as i64,
+    }
+}
+
 /// Create every planned channel, returning them paired with their template id
 /// so categories and the system channel can be resolved afterwards.
 async fn create_channels(
@@ -452,6 +616,7 @@ async fn create_channels(
     plan: &ImportPlan,
     job: &mut DiscordImportJob,
     total: u32,
+    roles: &RoleMap,
 ) -> std::result::Result<(Vec<(String, Channel)>, DiscordImportSummary), ImportAbort> {
     let mut created: Vec<(String, Channel)> = Vec::new();
     let mut skipped = 0u32;
@@ -463,6 +628,10 @@ async fn create_channels(
     // Enforce it here instead, capping rather than hard-failing (plan §7).
     let channel_limit = config().await.features.limits.global.server_channels;
     let mut over_limit = 0u32;
+    // Overwrites whose target role never made it into the server.
+    let mut dropped_overrides = 0u32;
+    // Channels created, but whose slowmode/permissions write failed.
+    let mut settings_failed = 0u32;
 
     for (index, planned) in plan.channels.iter().enumerate() {
         if created.len() >= channel_limit {
@@ -512,20 +681,58 @@ async fn create_channels(
 
         match result {
             Ok(mut channel) => {
-                // Slowmode isn't part of the creation DTO, so apply it after.
-                if let Some(seconds) = slowmode {
-                    if let Err(error) = channel
-                        .update(
-                            db,
-                            PartialChannel {
-                                slowmode: Some(seconds),
-                                ..Default::default()
-                            },
-                            vec![],
-                        )
-                        .await
-                    {
-                        log::warn!("could not apply slowmode during import: {error:?}");
+                // Neither slowmode nor the permission overwrites are part of
+                // the creation DTO, so they land in a single follow-up update.
+                // `Channel::update` applies the partial in memory as well as
+                // persisting it, which is what keeps the structs handed to
+                // `Member::create` — and therefore `ServerCreate` — accurate.
+                let role_permissions: HashMap<String, OverrideField> = planned
+                    .role_overrides
+                    .iter()
+                    // A role dropped by the cap (or absent from the template)
+                    // has no id to key on; its overwrite is skipped rather
+                    // than written against a dangling id.
+                    .filter_map(|(template_id, override_)| {
+                        roles
+                            .get(&template_id.0)
+                            .map(|role_id| (role_id.clone(), stored_override(override_)))
+                    })
+                    .collect();
+
+                // Count what failed to RESOLVE, not `len - map.len()`: the
+                // mapper already rejects duplicate entries for one role, but
+                // deriving the count from the map's size would silently absorb
+                // any future duplicate into this figure and misreport it as a
+                // dropped role reference.
+                dropped_overrides += planned
+                    .role_overrides
+                    .iter()
+                    .filter(|(template_id, _)| !roles.contains_key(&template_id.0))
+                    .count() as u32;
+
+                // Leaving `default_permissions` unset means "inherit the
+                // server default", which is exactly right for a channel
+                // Discord had no `@everyone` overwrite on. Writing an empty
+                // override instead would pin it.
+                let default_permissions = planned.default_permissions.as_ref().map(stored_override);
+
+                let partial = PartialChannel {
+                    slowmode,
+                    default_permissions,
+                    role_permissions: (!role_permissions.is_empty()).then_some(role_permissions),
+                    ..Default::default()
+                };
+
+                let needs_update = partial.slowmode.is_some()
+                    || partial.default_permissions.is_some()
+                    || partial.role_permissions.is_some();
+
+                if needs_update {
+                    if let Err(error) = channel.update(db, partial, vec![]).await {
+                        // The channel exists and is usable; losing its
+                        // permissions is worth a note, not the whole import.
+                        log::warn!("could not apply channel settings during import: {error:?}");
+                        settings_failed += 1;
                     }
                 }
 
@@ -555,12 +762,29 @@ async fn create_channels(
         ));
     }
 
+    if settings_failed > 0 {
+        notes.push(format!(
+            "{settings_failed} channel(s) were created but their Discord permissions couldn't be \
+             applied — check them in channel settings."
+        ));
+    }
+
+    if dropped_overrides > 0 {
+        notes.push(format!(
+            "{dropped_overrides} channel permission(s) referenced a role that wasn't imported and \
+             were skipped."
+        ));
+    }
+
     let summary = DiscordImportSummary {
         channels_created: created.len() as u32,
         categories_created: 0, // set by the caller once categories are built
         // Everything the user didn't get, so this can't contradict the notes
         // rendered beside it.
         channels_skipped: skipped + over_limit + plan.skipped_channel_count,
+        // Both set by the caller; roles are created before this runs.
+        roles_created: 0,
+        roles_skipped: 0,
         notes,
     };
 
@@ -613,12 +837,7 @@ async fn mint_invite(
 ) -> Option<String> {
     // Voice channels are `TextChannel` with `voice: Some(..)`, so a naive
     // TextChannel match would happily drop new members into a voice room.
-    let is_text = |channel: &&Channel| {
-        matches!(
-            channel,
-            Channel::TextChannel { voice: None, .. }
-        )
-    };
+    let is_text = |channel: &&Channel| matches!(channel, Channel::TextChannel { voice: None, .. });
 
     // Prefer the guild's own system channel, else the first real text channel.
     let target = plan
@@ -639,5 +858,221 @@ async fn mint_invite(
             log::warn!("could not mint import invite: {error:?}");
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::template::GuildTemplate;
+    use super::*;
+    use revolt_database::DatabaseInfo;
+    use revolt_permissions::ChannelPermission;
+
+    /// Two ranked roles, one private channel, one public one.
+    const FIXTURE: &str = r#"{
+        "code": "test",
+        "name": "Test Template",
+        "serialized_source_guild": {
+            "name": "Test Guild",
+            "roles": [
+                {"id": 0, "name": "@everyone", "permissions": "3072"},
+                {"id": 1, "name": "Member", "permissions": "0", "color": 0},
+                {"id": 2, "name": "Moderator", "permissions": "8192",
+                 "color": 1752220, "hoist": true},
+                {"id": 3, "name": "Admin", "permissions": "8"}
+            ],
+            "channels": [
+                {"id": 10, "type": 4, "name": "STAFF", "position": 0},
+                {"id": 11, "type": 0, "name": "mod-chat", "position": 0, "parent_id": 10,
+                 "permission_overwrites": [
+                    {"id": "0", "type": 0, "allow": "0", "deny": "1024"},
+                    {"id": "2", "type": 0, "allow": "1024", "deny": "0"}
+                 ]},
+                {"id": 12, "type": 0, "name": "general", "position": 1,
+                 "permission_overwrites": []}
+            ]
+        }
+    }"#;
+
+    // `insert_user` is disallowed in favour of `Object::create()`, but the real
+    // account-creation flow is an authifier concern this test has no business
+    // dragging in — it needs a user row and nothing else.
+    #[allow(clippy::disallowed_methods)]
+    async fn make_owner(db: &Database) -> User {
+        let user = User {
+            id: ulid::Ulid::new().to_string(),
+            username: "importer".to_string(),
+            discriminator: "0001".to_string(),
+            ..Default::default()
+        };
+        db.insert_user(&user).await.unwrap();
+        user
+    }
+
+    /// **The invariant this whole slice turns on.**
+    ///
+    /// `db.insert_role` writes the database and nothing else, while
+    /// `ServerCreate` — the only event that ever tells a client the server
+    /// exists — is built by `Member::create` from the IN-MEMORY `Server`
+    /// struct. So every role has to be inserted into `server.roles` as well,
+    /// and the same goes for the channel structs' permission fields.
+    ///
+    /// Drop any of that and the import "succeeds" while the client renders a
+    /// server with no roles until the user reloads. It is precisely the bug the
+    /// slice-0 audit caught in its `Member::create` form, and no amount of
+    /// testing the pure mapper can see it — it lives entirely in the worker.
+    #[tokio::test]
+    async fn in_memory_server_carries_roles_and_permissions_for_server_create() {
+        let db = DatabaseInfo::Reference.connect().await.unwrap();
+        let owner = make_owner(&db).await;
+
+        let template: GuildTemplate = serde_json::from_str(FIXTURE).unwrap();
+        let plan = plan_import(&template).unwrap();
+
+        let (mut server, _) = Server::create(
+            &db,
+            v0::DataCreateServer {
+                name: plan.server_name.clone(),
+                description: None,
+                nsfw: None,
+            },
+            &owner,
+            false,
+        )
+        .await
+        .unwrap();
+
+        let mut job = DiscordImportJob::new(owner.id.clone(), "test".to_string());
+        db.insert_discord_import_job(&job).await.unwrap();
+
+        let (roles, created, skipped, _notes) =
+            match create_roles(&db, &mut job, &mut server, &plan).await {
+                Ok(result) => result,
+                Err(_) => panic!("create_roles aborted"),
+            };
+
+        assert_eq!(created, 3, "every non-@everyone role should be created");
+        assert_eq!(skipped, 0);
+
+        // THE ASSERTION. Deliberately NOT `db.fetch_server(...)`: the database
+        // was always right. It is the in-memory struct — the one `ServerCreate`
+        // snapshots — that would be empty.
+        assert_eq!(
+            server.roles.len(),
+            3,
+            "roles reached the database but not the in-memory server; \
+             ServerCreate would ship a server with no roles"
+        );
+
+        // Rank inversion survives into real rows: Admin is last in Discord's
+        // ascending array, so it is the most authoritative, so it must hold
+        // Sloga rank 0 — and the ranks must run 0,1,2 with no gaps.
+        let ordered = server.ordered_roles();
+        assert_eq!(
+            ordered
+                .iter()
+                .map(|(_, role)| (role.name.as_str(), role.rank))
+                .collect::<Vec<_>>(),
+            vec![("Admin", 0), ("Moderator", 1), ("Member", 2)]
+        );
+
+        let moderator = &ordered[1].1;
+        assert!(moderator.hoist);
+        assert_eq!(moderator.colour.as_deref(), Some("#1ABC9C"));
+        // Moderator held MANAGE_MESSAGES (Discord bit 13 = 8192).
+        assert!(moderator.permissions.a & (ChannelPermission::ManageMessages as i64) != 0);
+
+        let total = plan.total_steps().max(1);
+        let (channels, summary) =
+            match create_channels(&db, &mut server, &plan, &mut job, total, &roles).await {
+                Ok(result) => result,
+                Err(_) => panic!("create_channels aborted"),
+            };
+
+        assert_eq!(channels.len(), 2);
+        assert_eq!(summary.channels_created, 2);
+
+        let named = |wanted: &str| {
+            channels
+                .iter()
+                .map(|(_, channel)| channel)
+                .find(|channel| match channel {
+                    Channel::TextChannel { name, .. } => name == wanted,
+                    _ => false,
+                })
+                .unwrap_or_else(|| panic!("{wanted} should have been created"))
+        };
+
+        // These are the exact structs handed to `Member::create`, so the
+        // overwrites have to be ON them, not merely persisted.
+        match named("mod-chat") {
+            Channel::TextChannel {
+                default_permissions,
+                role_permissions,
+                ..
+            } => {
+                let default = default_permissions.expect("@everyone overwrite must be applied");
+                assert_eq!(
+                    default.d & (ChannelPermission::ViewChannel as i64),
+                    ChannelPermission::ViewChannel as i64,
+                    "the private channel must stay private"
+                );
+                let moderator_id = roles.get("2").expect("moderator id mapping");
+                assert!(
+                    role_permissions.contains_key(moderator_id),
+                    "the Moderator overwrite must be keyed by its REAL role id"
+                );
+
+                // Discord's ADMINISTRATOR bypass, materialised: the Admin role
+                // carries no overwrite in the template (it needs none on
+                // Discord) but must be granted access here, or the imported
+                // admins cannot see the private channel at all. Only the OWNER
+                // bypasses on Sloga — which is why a one-account smoke test
+                // would never notice.
+                let admin_id = roles.get("3").expect("admin id mapping");
+                let admin_grant = role_permissions
+                    .get(admin_id)
+                    .expect("admin must be granted access to the restricted channel");
+                assert_eq!(admin_grant.a, ChannelPermission::GrantAllSafe as i64);
+                assert_eq!(admin_grant.d, 0);
+
+                assert_eq!(role_permissions.len(), 2);
+            }
+            _ => panic!("expected a text channel"),
+        }
+
+        // A channel Discord had no overwrites on must be left inheriting, not
+        // pinned to an empty override.
+        match named("general") {
+            Channel::TextChannel {
+                default_permissions,
+                role_permissions,
+                ..
+            } => {
+                assert!(default_permissions.is_none());
+                assert!(role_permissions.is_empty());
+            }
+            _ => panic!("expected a text channel"),
+        }
+
+        // And the imported @everyone baseline must land on the struct too — it
+        // rides `Server::update`, which applies the partial before it writes.
+        server
+            .update(
+                &db,
+                PartialServer {
+                    default_permissions: Some(plan.default_permissions as i64),
+                    ..Default::default()
+                },
+                vec![],
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(server.default_permissions, plan.default_permissions as i64);
+        assert!(
+            server.default_permissions & (ChannelPermission::ChangeAvatar as i64) != 0,
+            "Sloga baseline grants must survive onto the struct ServerCreate ships"
+        );
     }
 }

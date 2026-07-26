@@ -5,11 +5,13 @@
 //! `Queued` job; this task claims it, does the work, and heart-beats progress
 //! over the user's private WebSocket topic.
 //!
-//! Slice 0 imports the server name, categories and channels. Roles and
-//! permissions are slice 1; emojis and the server icon need the optional bot
+//! Slice 0 imported the server name, categories and channels; slice 1 adds
+//! roles, the `@everyone` → `default_permissions` rule and per-channel
+//! permission overwrites. Emojis and the server icon need the optional bot
 //! upgrade (slice 2) because guild templates do not carry them.
 
 pub mod mapper;
+pub mod permissions;
 pub mod template;
 mod worker;
 

@@ -20,11 +20,19 @@ auto_derived!(
     /// Coarse progress stage, surfaced to the user as a progress label.
     ///
     /// Ordered as the worker walks them: fetch the Discord template, create
-    /// the server, recreate categories/channels, join the owner, mint the
-    /// invite, done.
+    /// the server, recreate roles, recreate categories/channels, join the
+    /// owner, mint the invite, done.
+    ///
+    /// Variants are ADDITIVE — clients treat the wire value as an opaque
+    /// label precisely so a stage introduced by a later slice cannot break a
+    /// deployed build. Never rename one: a stored job would stop
+    /// deserializing.
     pub enum ImportStage {
         Fetching,
         Server,
+        /// Roles are created before channels because per-channel permission
+        /// overwrites are keyed by role id.
+        Roles,
         Channels,
         Membership,
         Invite,
@@ -43,6 +51,21 @@ auto_derived!(
         pub categories_created: u32,
         /// Channels present in the template that were not recreated
         pub channels_skipped: u32,
+        /// Roles recreated (the Discord `@everyone` role is NOT one of these
+        /// — it becomes the server's `default_permissions`)
+        ///
+        /// `#[serde(default)]` because slice 0 rows predate this field and
+        /// `auto_derived!` adds no defaults of its own: without it, reading
+        /// any job written before slice 1 would fail outright.
+        #[serde(default)]
+        pub roles_created: u32,
+        /// Roles present in the template that were not recreated (over the
+        /// per-server cap, or failed to insert)
+        ///
+        /// Exists so the count and the prose note beside it cannot disagree —
+        /// the same rule `channels_skipped` follows.
+        #[serde(default)]
+        pub roles_skipped: u32,
         /// Human-readable "what we skipped" lines
         pub notes: Vec<String>,
     }
@@ -123,6 +146,7 @@ impl ImportStage {
         match self {
             ImportStage::Fetching => "Fetching",
             ImportStage::Server => "Server",
+            ImportStage::Roles => "Roles",
             ImportStage::Channels => "Channels",
             ImportStage::Membership => "Membership",
             ImportStage::Invite => "Invite",

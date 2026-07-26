@@ -100,6 +100,8 @@ mod tests {
                 channels_created: 3,
                 categories_created: 1,
                 channels_skipped: 2,
+                roles_created: 4,
+                roles_skipped: 1,
                 notes: vec!["skipped 2 stage channels".to_string()],
             });
             db.insert_discord_import_job(&row).await.unwrap();

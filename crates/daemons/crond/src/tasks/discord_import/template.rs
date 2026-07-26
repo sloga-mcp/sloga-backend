@@ -74,6 +74,19 @@ impl std::fmt::Display for PlaceholderId {
     }
 }
 
+impl PlaceholderId {
+    /// Sort key that orders these as the integers they are.
+    ///
+    /// They are stored as `String` so both wire forms key the same map, but
+    /// sorting them lexicographically puts `"10"` before `"2"` — which shows
+    /// up the moment a guild has ten or more channels and the positions tie
+    /// (real templates tie constantly: Discord's own "Blank Server" gives all
+    /// four of its channels `position: 0`).
+    pub fn sort_key(&self) -> (i64, &str) {
+        (self.0.parse::<i64>().unwrap_or(i64::MAX), self.0.as_str())
+    }
+}
+
 impl<'de> Deserialize<'de> for PlaceholderId {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         #[derive(Deserialize)]
@@ -166,8 +179,6 @@ pub struct SerializedGuild {
     pub afk_channel_id: Option<PlaceholderId>,
 }
 
-/// Roles are parsed in slice 0 (so the payload round-trips) but not yet
-/// mapped — slice 1 owns roles + the permission table.
 #[derive(Deserialize, Debug, Clone)]
 pub struct TemplateRole {
     pub id: PlaceholderId,
@@ -175,12 +186,23 @@ pub struct TemplateRole {
     pub name: String,
     #[serde(default)]
     pub permissions: DiscordBits,
+    /// Discord's 24-bit RGB integer; `0` means "no colour".
     #[serde(default)]
     pub color: i64,
     #[serde(default)]
     pub hoist: bool,
     #[serde(default)]
     pub mentionable: bool,
+    /// **Templates do not carry this.** Verified live on 2026-07-25 against
+    /// Discord's own "Blank Server" template (`2TffvPucqHkN`), whose role
+    /// object has exactly `id, name, permissions, color, colors, hoist,
+    /// mentionable, icon, unicode_emoji`.
+    ///
+    /// Read anyway, so that if Discord ever starts sending it the mapper
+    /// prefers the authoritative value over the array-order inference it
+    /// otherwise has to make (see `mapper::plan_roles`).
+    #[serde(default)]
+    pub position: Option<i64>,
 }
 
 #[derive(Deserialize, Debug, Clone)]
