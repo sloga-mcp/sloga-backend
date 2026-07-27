@@ -20,6 +20,36 @@ use revolt_result::{create_error, Result};
 use rocket::{form::validate::Contains, serde::json::Json, State};
 use validator::Validate;
 
+/// Whether an edit can change the member's effective voice permissions, and so
+/// requires their LiveKit participant to be re-synced afterwards.
+///
+/// The server-mute / server-deafen overrides (`can_publish`, `can_receive`) are
+/// the obvious case, but they are not the only one:
+///
+/// - `roles` feeds `get_our_server_role_overrides` / `get_our_channel_role_overrides`,
+///   so granting or stripping a role moves Speak, Listen and Video.
+/// - `timeout` restricts the member down to `ALLOW_IN_TIMEOUT` (ViewChannel +
+///   ReadMessageHistory), dropping Speak, Listen and Video entirely.
+///
+/// Neither used to trigger a sync, so stripping a voice-granting role or timing
+/// a member out left the SFU honouring the stale grant until something else
+/// happened to sync the channel.
+fn edit_affects_voice_permissions(data: &v0::DataMemberEdit) -> bool {
+    data.can_publish.is_some()
+        || data.can_receive.is_some()
+        || data.roles.is_some()
+        || data.timeout.is_some()
+        || data.remove.iter().any(|field| {
+            matches!(
+                field,
+                FieldsMember::CanPublish
+                    | FieldsMember::CanReceive
+                    | FieldsMember::Roles
+                    | FieldsMember::Timeout
+            )
+        })
+}
+
 /// # Edit Member
 ///
 /// Edit a member by their id.
@@ -41,7 +71,7 @@ pub async fn edit(
     })?;
 
     // Fetch server and member
-    let mut server = server_id.as_server(db).await?;
+    let server = server_id.as_server(db).await?;
     let target_user = member_id.as_user(db).await?;
     let mut member = member_id.as_member(db, &server.id).await?;
 
@@ -177,7 +207,12 @@ pub async fn edit(
         let added_roles: Vec<&&String> = new_roles.difference(&current_roles).collect();
 
         for role_id in added_roles {
-            if let Some(role) = server.roles.remove(*role_id) {
+            // `get`, never `remove`: this same `server` is handed to the voice
+            // permission sync below, and taking the role out of the local copy
+            // made `get_our_server_role_overrides` skip the role that was just
+            // granted — the sync would compute, and push to LiveKit, the
+            // permissions the member had BEFORE the edit.
+            if let Some(role) = server.roles.get(*role_id) {
                 if role.rank <= our_ranking {
                     return Err(create_error!(NotElevated));
                 }
@@ -186,6 +221,9 @@ pub async fn edit(
             }
         }
     }
+
+    // Decide this before `data` is destructured below.
+    let affects_voice_permissions = edit_affects_voice_permissions(&data);
 
     // Apply edits to the member object
     let v0::DataMemberEdit {
@@ -294,17 +332,25 @@ pub async fn edit(
             .private(target_user.id.clone())
             .await;
         };
-    } else if can_publish.is_some() || can_receive.is_some() || remove.contains(FieldsMember::CanPublish) || remove.contains(FieldsMember::CanReceive) {
+    } else if affects_voice_permissions && !remove.contains(&FieldsMember::VoiceChannel) {
+        // Skipped when the member is being disconnected outright just below —
+        // syncing a participant we are about to evict is pointless, and a
+        // failing sync would abort the request before the eviction ran.
         if let Some(channel) = get_user_voice_channel_in_server(&target_user.id, &server.id).await?
         {
             let node = get_channel_node(&channel).await?.unwrap();
             let channel = Reference::from_unchecked(&channel).as_channel(db).await?;
 
+            // Sync the TARGET being edited, not the acting moderator. Passing
+            // `&user` here synced the moderator's own participant, and since
+            // `sync_user_voice_permissions` early-returns for a user with no
+            // voice state it usually did nothing at all — server-mute and
+            // server-deafen never reached the target's SFU participant.
             sync_user_voice_permissions(
                 db,
                 voice_client,
                 &node,
-                &user,
+                &target_user,
                 &channel,
                 Some(&server),
                 None,
@@ -337,16 +383,17 @@ pub async fn edit(
 #[cfg(test)]
 mod test {
     use crate::util::test::TestHarness;
-    use iso8601_timestamp::Timestamp;
+    use iso8601_timestamp::{Duration, Timestamp};
     use revolt_database::{
         voice::{
-            create_voice_state, delete_channel_voice_state, set_channel_node, update_voice_state,
-            UserVoiceChannel, MAX_VIDEO_PARTICIPANTS,
+            create_voice_state, delete_channel_voice_state, get_voice_state, set_channel_node,
+            update_voice_state, UserVoiceChannel, MAX_VIDEO_PARTICIPANTS,
         },
-        Channel, Member, MlsGroup, MlsGroupCreateOutcome, MlsMemberDevice, Server, User,
-        MAX_MLS_GROUP_MEMBERS,
+        Channel, Member, MlsGroup, MlsGroupCreateOutcome, MlsMemberDevice, PartialServer, Server,
+        User, MAX_MLS_GROUP_MEMBERS,
     };
     use revolt_models::v0;
+    use revolt_permissions::{ChannelPermission, OverrideField};
     use rocket::http::{ContentType, Header, Status};
 
     async fn voice_channel(harness: &TestHarness, server: &Server, name: &str) -> Channel {
@@ -566,5 +613,299 @@ mod test {
         delete_channel_voice_state(&dest_uvc, &synthetic)
             .await
             .expect("cleanup dest");
+    }
+
+    // ---- voice permission sync on member edit ----------------------------
+    //
+    // The sync's LiveKit leg cannot be exercised without a live SFU, but it
+    // runs AFTER `update_voice_state`, so the redis voice state is a faithful
+    // observable for "did the sync run, and against whom". `is_publishing` is
+    // recomputed as `voice_state.is_publishing && can_speak`, so a member
+    // seeded as publishing flips to false exactly when a sync that saw their
+    // real permissions ran against them — and stays true when the sync was
+    // skipped, or was aimed at the wrong user, or read a stale permission set.
+
+    /// Node these tests pin their voice channels to.
+    ///
+    /// Deliberately NOT a node in `Revolt.toml`: `update_permissions` resolves
+    /// the node name before it touches the network, so an unknown one turns the
+    /// unreachable-SFU call into an immediate `UnknownNode` instead of a ~25s
+    /// DNS/connect stall — which sat right on nextest's 50s kill threshold.
+    /// Everything these tests assert on happens before that point.
+    const ABSENT_NODE: &str = "test-node-with-no-sfu";
+
+    /// PATCH the target member with an arbitrary body, acting as `mod_token`.
+    async fn edit_member<'a>(
+        harness: &'a TestHarness,
+        mod_token: &str,
+        server_id: &str,
+        target_id: &str,
+        body: serde_json::Value,
+    ) -> rocket::local::asynchronous::LocalResponse<'a> {
+        harness
+            .client
+            .patch(format!("/servers/{server_id}/members/{target_id}"))
+            .header(ContentType::JSON)
+            .header(Header::new("x-session-token", mod_token.to_string()))
+            .body(body.to_string())
+            .dispatch()
+            .await
+    }
+
+    /// Connect `user_id` to `channel` as a publishing participant on a node.
+    async fn connect_publishing(channel: &Channel, user_id: &str) -> UserVoiceChannel {
+        let uvc = UserVoiceChannel::from_channel(channel);
+
+        create_voice_state(&uvc, user_id, Timestamp::now_utc())
+            .await
+            .expect("voice state");
+        update_voice_state(
+            &uvc,
+            user_id,
+            &v0::PartialUserVoiceState {
+                is_publishing: Some(true),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("publishing flag");
+        set_channel_node(channel.id(), ABSENT_NODE)
+            .await
+            .expect("node");
+
+        uvc
+    }
+
+    async fn is_publishing(uvc: &UserVoiceChannel, user_id: &str) -> bool {
+        get_voice_state(uvc, user_id)
+            .await
+            .expect("voice state read")
+            .expect("voice state present")
+            .is_publishing
+    }
+
+    /// Server owner + a plain member connected and publishing in a voice channel.
+    async fn muted_member_harness() -> (TestHarness, String, Server, User, UserVoiceChannel) {
+        let harness = TestHarness::new().await;
+        let (_a, session_a, user_a) = harness.new_user().await; // moderator = owner
+        let (_b, _session_b, user_b) = harness.new_user().await; // target
+        let (server, _channels) = harness.new_server(&user_a).await;
+        Member::create(&harness.db, &server, &user_b, None)
+            .await
+            .expect("member");
+
+        let channel = voice_channel(&harness, &server, "Voice").await;
+        let uvc = connect_publishing(&channel, &user_b.id).await;
+
+        (harness, session_a.token, server, user_b, uvc)
+    }
+
+    #[rocket::async_test]
+    async fn server_mute_syncs_the_target_not_the_moderator() {
+        let (harness, token, server, target, uvc) = muted_member_harness().await;
+
+        edit_member(
+            &harness,
+            &token,
+            &server.id,
+            &target.id,
+            serde_json::json!({ "can_publish": false }),
+        )
+        .await;
+
+        assert!(
+            !is_publishing(&uvc, &target.id).await,
+            "server-mute must sync the TARGET's participant — passing the acting \
+             moderator early-returned on their missing voice state, so the mute \
+             never reached the target's SFU participant"
+        );
+
+        delete_channel_voice_state(&uvc, &[target.id.clone()])
+            .await
+            .expect("cleanup");
+    }
+
+    #[rocket::async_test]
+    async fn granting_a_voice_denying_role_syncs_the_target() {
+        let (harness, token, server, target, uvc) = muted_member_harness().await;
+
+        // A role that takes Speak away from whoever holds it.
+        let role = harness
+            .new_role(
+                &server,
+                1,
+                Some(OverrideField {
+                    a: 0,
+                    d: ChannelPermission::Speak as i64,
+                }),
+            )
+            .await;
+
+        edit_member(
+            &harness,
+            &token,
+            &server.id,
+            &target.id,
+            serde_json::json!({ "roles": [role.id] }),
+        )
+        .await;
+
+        // Two regressions in one: role edits did not trigger a sync at all, and
+        // the rank check `remove`d the added role from the local server copy —
+        // so even once triggered the sync computed the pre-edit permissions.
+        assert!(
+            !is_publishing(&uvc, &target.id).await,
+            "a role change must re-sync voice permissions, and the sync must see \
+             the role that was just granted"
+        );
+
+        delete_channel_voice_state(&uvc, &[target.id.clone()])
+            .await
+            .expect("cleanup");
+    }
+
+    #[rocket::async_test]
+    async fn stripping_a_voice_granting_role_syncs_the_target() {
+        let harness = TestHarness::new().await;
+        let (_a, session_a, user_a) = harness.new_user().await;
+        let (_b, _session_b, user_b) = harness.new_user().await;
+        let (mut server, _channels) = harness.new_server(&user_a).await;
+
+        // Speak comes from a role here, not from the server default, so taking
+        // the role away is observable.
+        server
+            .update(
+                &harness.db,
+                PartialServer {
+                    default_permissions: Some(
+                        (ChannelPermission::ViewChannel
+                            + ChannelPermission::ReadMessageHistory
+                            + ChannelPermission::Connect
+                            + ChannelPermission::Listen) as i64,
+                    ),
+                    ..Default::default()
+                },
+                Vec::new(),
+            )
+            .await
+            .expect("default permissions");
+
+        let role = harness
+            .new_role(
+                &server,
+                1,
+                Some(OverrideField {
+                    a: ChannelPermission::Speak as i64,
+                    d: 0,
+                }),
+            )
+            .await;
+        Member::create(&harness.db, &server, &user_b, None)
+            .await
+            .expect("member");
+
+        let channel = voice_channel(&harness, &server, "Voice").await;
+        let uvc = connect_publishing(&channel, &user_b.id).await;
+
+        edit_member(
+            &harness,
+            &session_a.token,
+            &server.id,
+            &user_b.id,
+            serde_json::json!({ "roles": [role.id] }),
+        )
+        .await;
+        assert!(
+            is_publishing(&uvc, &user_b.id).await,
+            "the granted role allows Speak, so the sync must leave them publishing"
+        );
+
+        edit_member(
+            &harness,
+            &session_a.token,
+            &server.id,
+            &user_b.id,
+            serde_json::json!({ "roles": [] }),
+        )
+        .await;
+        assert!(
+            !is_publishing(&uvc, &user_b.id).await,
+            "stripping the role that granted Speak must re-sync the target — it \
+             used to leave the SFU honouring the revoked grant"
+        );
+
+        delete_channel_voice_state(&uvc, &[user_b.id.clone()])
+            .await
+            .expect("cleanup");
+    }
+
+    #[rocket::async_test]
+    async fn timing_a_member_out_syncs_their_voice_permissions() {
+        let (harness, token, server, target, uvc) = muted_member_harness().await;
+
+        let until = Timestamp::now_utc()
+            .checked_add(Duration::hours(1))
+            .expect("timeout timestamp");
+
+        edit_member(
+            &harness,
+            &token,
+            &server.id,
+            &target.id,
+            serde_json::json!({ "timeout": until }),
+        )
+        .await;
+
+        // A timeout restricts down to ALLOW_IN_TIMEOUT, which has no Speak.
+        assert!(
+            !is_publishing(&uvc, &target.id).await,
+            "timing a member out must re-sync their voice permissions — they \
+             used to keep publishing to the SFU for the whole timeout"
+        );
+
+        delete_channel_voice_state(&uvc, &[target.id.clone()])
+            .await
+            .expect("cleanup");
+    }
+
+    // ---- which edits require a sync (pure) -------------------------------
+
+    fn member_edit(body: serde_json::Value) -> v0::DataMemberEdit {
+        serde_json::from_value(body).expect("valid DataMemberEdit")
+    }
+
+    #[test]
+    fn voice_affecting_edits_trigger_a_sync() {
+        for body in [
+            serde_json::json!({ "can_publish": false }),
+            serde_json::json!({ "can_receive": false }),
+            serde_json::json!({ "roles": [] }),
+            serde_json::json!({ "timeout": Timestamp::now_utc() }),
+            serde_json::json!({ "remove": ["CanPublish"] }),
+            serde_json::json!({ "remove": ["CanReceive"] }),
+            serde_json::json!({ "remove": ["Roles"] }),
+            serde_json::json!({ "remove": ["Timeout"] }),
+            serde_json::json!({ "nickname": "nick", "remove": ["Timeout"] }),
+        ] {
+            assert!(
+                super::edit_affects_voice_permissions(&member_edit(body.clone())),
+                "{body} changes effective voice permissions and must trigger a sync"
+            );
+        }
+    }
+
+    #[test]
+    fn non_voice_edits_do_not_trigger_a_sync() {
+        for body in [
+            serde_json::json!({}),
+            serde_json::json!({ "nickname": "nick" }),
+            serde_json::json!({ "pronouns": "they/them" }),
+            serde_json::json!({ "remove": ["Nickname", "Pronouns", "Avatar"] }),
+        ] {
+            assert!(
+                !super::edit_affects_voice_permissions(&member_edit(body.clone())),
+                "{body} cannot change voice permissions and must not sync"
+            );
+        }
     }
 }
