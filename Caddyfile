@@ -32,6 +32,13 @@
         reverse_proxy 127.0.0.1:14703
     }
 
+    # LiveKit RoomService admin API: server-side only (delta/voice-ingress
+    # reach LiveKit directly, never through this proxy) — auth-gated by the
+    # API secret, but there is no reason to expose the admin surface at all.
+    handle /livekit/twirp/* {
+        respond 403
+    }
+
     # LiveKit voice (strip /livekit prefix, handles both /livekit and /livekit/*)
     handle /livekit* {
         uri strip_prefix /livekit
