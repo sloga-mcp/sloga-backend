@@ -94,12 +94,27 @@ macro_rules! database_test {
 
         db.drop_database().await;
 
+        // The trailing `drop_database()` below never runs when the test body
+        // panics; this guard covers the unwind path.
+        //
+        // It cannot cover the other leak: the database is named after this
+        // invocation's line number, so moving the call orphans the old
+        // database under a name no later run will ever regenerate. Sweep
+        // those with `scripts/drop-test-databases.sh`.
+        let guard = $crate::test_teardown::TestDatabaseGuard::arm(&db).await;
+
         #[allow(clippy::redundant_closure_call)]
         (|$db: $crate::Database| $test)(db.clone()).await;
 
-        db.drop_database().await
+        db.drop_database().await;
+        guard.disarm();
     };
 }
+
+/// Deleting the throwaway databases the test harnesses create. Gated so that
+/// nothing able to drop a database is linked into a production binary.
+#[cfg(any(test, feature = "test-teardown"))]
+pub mod test_teardown;
 
 mod models;
 pub mod util;

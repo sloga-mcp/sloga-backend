@@ -20,6 +20,11 @@ pub struct TestHarness {
     pub client: Client,
     pub db: Database,
     pub amqp: AMQP,
+    /// Connection string this harness resolved to, kept so `Drop` can
+    /// reconnect and delete the throwaway database. `None` on the reference
+    /// driver, which leaves nothing behind. Captured at construction because
+    /// `Drop` cannot await `config()`.
+    mongo_uri: Option<String>,
     events_rx: tokio::sync::mpsc::UnboundedReceiver<(String, EventV1)>,
     event_buffer: Vec<(String, EventV1)>,
 }
@@ -96,12 +101,20 @@ impl TestHarness {
             );
         }
 
+        // Read the URI now so `Drop` can reconnect without awaiting. This is
+        // the same value `DatabaseInfo::MongoDb` connected with above.
+        let mongo_uri = match &db {
+            Database::MongoDb(_) => Some(revolt_config::config().await.database.mongodb),
+            _ => None,
+        };
+
         let amqp = AMQP::new_auto().await;
 
         TestHarness {
             client,
             db,
             amqp,
+            mongo_uri,
             events_rx,
             event_buffer: vec![],
         }
@@ -409,6 +422,45 @@ impl TestHarness {
             EventV1::Message(message) => message,
             _ => unreachable!(),
         }
+    }
+}
+
+impl Drop for TestHarness {
+    /// Delete the throwaway database this harness created.
+    ///
+    /// `DatabaseInfo::Auto` mints a fresh `revolt_test_<n>` per harness and
+    /// nothing ever removed them, so they accumulated across every run. At
+    /// 1191 leftovers (observed 2026-07-27) mongod was slow enough that
+    /// harness boot alone blew nextest's 50s kill threshold and the whole
+    /// delta suite failed at once, looking exactly like a mass code
+    /// regression.
+    ///
+    /// `Drop` rather than a `harness.teardown().await` call at the end of each
+    /// test: a failing assertion unwinds, so an explicit call would be skipped
+    /// by precisely the runs whose databases most need collecting — and it
+    /// would have to be added to, and never forgotten by, every test.
+    ///
+    /// Not a complete fix on its own. nextest SIGKILLs a test that overruns
+    /// `terminate-after`, and a killed process runs no destructors, so a
+    /// timing-out test still leaks. `scripts/drop-test-databases.sh` sweeps
+    /// whatever survives.
+    fn drop(&mut self) {
+        let Database::MongoDb(mongo) = &self.db else {
+            return;
+        };
+
+        let Some(uri) = &self.mongo_uri else {
+            return;
+        };
+
+        // Same invariant as `new()`: never, under any circumstances, drop
+        // production. `drop_test_database_blocking` re-checks this against its
+        // own allow-list, but the guard belongs at the call site too.
+        if mongo.1 == Self::PRODUCTION_DATABASE {
+            return;
+        }
+
+        revolt_database::test_teardown::drop_test_database_blocking(uri, &mongo.1);
     }
 }
 

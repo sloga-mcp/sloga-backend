@@ -26,6 +26,12 @@ axum-impl = ["axum", "revolt-result/axum", "utoipa"]
 redis-is-patched = ["revolt-presence/redis-is-patched"]
 voice = ["livekit-api", "livekit-protocol", "livekit-runtime"]
 
+# Delete the throwaway `revolt_test_*` databases the test harnesses create.
+# Off by default so no code able to drop a database is linked into a
+# production binary; delta enables it from its `[dev-dependencies]`, which the
+# v3 resolver keeps out of non-test builds.
+test-teardown = ["mongodb", "tokio/rt", "tokio/time"]
+
 # Default Features
 default = ["mongodb", "tokio-runtime", "tasks"]
 
@@ -114,3 +120,9 @@ handlebars = { workspace = true }
 
 # Web Requests
 reqwest = { workspace = true, features = ["json", "form"] }
+
+[dev-dependencies]
+# `#[tokio::test]` and the `database_test!` teardown guard need these; without
+# them the crate's tests only build when another workspace crate happens to
+# unify the features in (`cargo check -p revolt-database` would not).
+tokio = { workspace = true, features = ["rt", "macros", "time"] }

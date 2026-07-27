@@ -221,6 +221,35 @@ TEST_DB=REFERENCE cargo nextest run
 TEST_DB=MONGODB cargo nextest run
 ```
 
+### Leftover test databases
+
+With `TEST_DB=MONGODB` every harness creates a throwaway database — a
+`revolt_test_<n>` per `TestHarness::new()`, and a `crates_<path>:<line>` per
+`database_test!`. Both delete their own database when they finish, whether the
+test passed or panicked.
+
+Two cases still leave databases behind:
+
+- A test that nextest SIGKILLs for overrunning `terminate-after`
+  (`.config/nextest.toml`) runs no destructors.
+- `database_test!` names its database after its own line number, so **moving
+  an invocation orphans the old database** — no later run regenerates that
+  name, so nothing will ever collect it.
+
+Sweep both with:
+
+```sh
+scripts/drop-test-databases.sh
+```
+
+Worth doing if the suite starts failing broadly for no apparent reason: at 1191
+leftover databases mongod was slow enough that harness startup alone exceeded
+the 50s kill threshold, and a full delta run failed across unrelated modules in
+a way that looked like a mass code regression. `scripts/drop-test-databases.sh
+--dry-run` lists what is there without touching anything. The sweep only ever
+matches the two harness naming patterns, so the production `revolt` database is
+never a candidate.
+
 ## License
 
 The Sloga backend is generally licensed under the [GNU Affero General Public License v3.0](https://github.com/sloga-mcp/sloga-backend/blob/main/LICENSE).

@@ -94,6 +94,10 @@ livekit-protocol = { workspace = true }
 [dev-dependencies]
 revolt-config = { workspace = true, features = ["test"] }
 ed25519-dalek = { workspace = true }
+# `TestHarness`'s `Drop` deletes the throwaway database it created. Declared
+# here rather than in `[dependencies]` so the teardown path is not compiled
+# into the delta binary.
+revolt-database = { workspace = true, features = ["test-teardown"] }
 
 [build-dependencies]
 vergen = { workspace = true }
