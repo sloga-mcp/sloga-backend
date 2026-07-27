@@ -444,6 +444,12 @@ pub enum EventV1 {
         to: String,
         state: UserVoiceState,
     },
+    /// Back-compat: `data` may carry the additive `screen_video` flag
+    /// (screen VIDEO track live, source 3 only) alongside the historical
+    /// `screensharing` flag (either screen track live — video OR audio,
+    /// semantics unchanged). Consumers that need "there is actually video
+    /// to look at" must read `screen_video` and treat its absence as false
+    /// (older servers never send it).
     UserVoiceStateUpdate {
         id: String,
         channel_id: String,

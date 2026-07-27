@@ -382,8 +382,18 @@ auto_derived_partial!(
         pub joined_at: Timestamp,
         pub is_receiving: bool,
         pub is_publishing: bool,
+        /// True while EITHER a screen-video (source 3) or screen-audio
+        /// (source 4) track is live — the two are conflated, so this flag can
+        /// read true with no video published at all. Kept as-is for wire
+        /// back-compat; anything that needs "screen video is actually live"
+        /// must gate on `screen_video` instead.
         pub screensharing: bool,
         pub camera: bool,
+        /// True only while a screen VIDEO track (source 3) is live. Additive
+        /// field (remote-control plan §1): absent in payloads from older
+        /// servers, hence the default.
+        #[serde(default)]
+        pub screen_video: bool,
     },
     "PartialUserVoiceState"
 );
