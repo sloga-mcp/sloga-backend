@@ -283,7 +283,6 @@ async fn sweep(
                     format!("is_receiving:{unique_key}"),
                     format!("screensharing:{unique_key}"),
                     format!("camera:{unique_key}"),
-                    format!("screen_video:{unique_key}"),
                     unique_key.clone(),
                 ])
                 .await

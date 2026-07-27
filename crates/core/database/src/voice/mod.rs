@@ -37,8 +37,6 @@ pub const MAX_VIDEO_PARTICIPANTS: usize = 30;
 /// cap's enable leg. Camera = 1, ScreenShare(video) = 3. ScreenShareAudio = 4
 /// maps to the `screensharing` flag too (see `count_video_participants`) but is
 /// audio-only, so it is NOT refused by the enable leg — a deliberate asymmetry.
-/// Source 3 alone drives the `screen_video` flag, which exists precisely
-/// because `screensharing` conflates the two (remote-control plan §1).
 pub fn is_video_source(source: i32) -> bool {
     matches!(source, 1 /* Camera */ | 3 /* ScreenShare */)
 }
@@ -53,9 +51,6 @@ pub fn is_video_source(source: i32) -> bool {
 /// NB: the `screensharing` flag is set for BOTH screen-video (source 3) and
 /// screen-audio (source 4), so an audio-only screenshare conservatively consumes
 /// a video slot here. That is the safe direction (cap slightly stricter).
-/// Deliberately NOT switched to the stricter `screen_video` flag: states
-/// created before that key existed lack it, and the conservative over-count
-/// is the desired behaviour for the cap anyway.
 pub async fn count_video_participants(channel: &UserVoiceChannel) -> Result<usize> {
     let Some(members) = get_voice_channel_members(channel).await? else {
         return Ok(0);
@@ -410,7 +405,6 @@ pub async fn create_voice_state(
         is_publishing: false,
         screensharing: false,
         camera: false,
-        screen_video: false,
     };
 
     Pipeline::new()
@@ -436,10 +430,6 @@ pub async fn create_voice_state(
             voice_state.screensharing,
         )
         .set(format!("camera:{unique_key}"), voice_state.camera)
-        .set(
-            format!("screen_video:{unique_key}"),
-            voice_state.screen_video,
-        )
         .query_async::<_, ()>(&mut get_connection().await?.into_inner())
         .await
         .to_internal_error()?;
@@ -463,7 +453,6 @@ pub async fn delete_voice_state(channel: &UserVoiceChannel, user_id: &str) -> Re
             format!("is_receiving:{unique_key}"),
             format!("screensharing:{unique_key}"),
             format!("camera:{unique_key}"),
-            format!("screen_video:{unique_key}"),
             unique_key.clone(),
         ])
         .query_async(&mut get_connection().await?.into_inner())
@@ -490,7 +479,6 @@ pub async fn delete_channel_voice_state(
             format!("is_receiving:{unique_key}"),
             format!("screensharing:{unique_key}"),
             format!("camera:{unique_key}"),
-            format!("screen_video:{unique_key}"),
             unique_key.clone(),
         ]);
     }
@@ -519,20 +507,8 @@ pub async fn update_voice_state_tracks(
             is_publishing: Some(added),
             ..Default::default()
         },
-        // `screensharing` keeps its historical conflated meaning (either
-        // screen track flips it), so existing consumers see no change. The
-        // additive `screen_video` flag tracks source 3 ONLY: without it, a
-        // screen-audio unmute after the video track ended reads as "still
-        // screensharing" with nothing to see, and stopping only screen audio
-        // flips the flag false mid-share (remote-control plan §1 blocker).
-        /* TrackSource::ScreenShare */
-        3 => PartialUserVoiceState {
-            screensharing: Some(added),
-            screen_video: Some(added),
-            ..Default::default()
-        },
-        /* TrackSource::ScreenShareAudio */
-        4 => PartialUserVoiceState {
+        /* TrackSource::ScreenShare | TrackSource::ScreenShareAudio */
+        3 | 4 => PartialUserVoiceState {
             screensharing: Some(added),
             ..Default::default()
         },
@@ -573,10 +549,6 @@ pub async fn update_voice_state(
         pipeline.set(format!("screensharing:{unique_key}"), screensharing);
     }
 
-    if let Some(screen_video) = &partial.screen_video {
-        pipeline.set(format!("screen_video:{unique_key}"), screen_video);
-    }
-
     pipeline
         .query_async(&mut get_connection().await?.into_inner())
         .await
@@ -602,14 +574,7 @@ pub async fn get_voice_state(
         channel.server_id.as_ref().unwrap_or(&channel.id)
     );
 
-    let (joined_at, is_publishing, is_receiving, screensharing, camera, screen_video): (
-        Option<i64>,
-        Option<bool>,
-        Option<bool>,
-        Option<bool>,
-        Option<bool>,
-        Option<bool>,
-    ) = get_connection()
+    let (joined_at, is_publishing, is_receiving, screensharing, camera) = get_connection()
         .await?
         .mget(&[
             format!("joined_at:{unique_key}"),
@@ -617,7 +582,6 @@ pub async fn get_voice_state(
             format!("is_receiving:{unique_key}"),
             format!("screensharing:{unique_key}"),
             format!("camera:{unique_key}"),
-            format!("screen_video:{unique_key}"),
         ])
         .await
         .to_internal_error()?;
@@ -644,11 +608,6 @@ pub async fn get_voice_state(
             is_publishing,
             screensharing,
             camera,
-            // States created before this key existed lack it; a missing key
-            // must NOT invalidate the whole state (get_channel_voice_state
-            // deletes states it cannot read), so it defaults false rather
-            // than joining the required tuple above.
-            screen_video: screen_video.unwrap_or(false),
         })),
         _ => Ok(None),
     }
@@ -1090,36 +1049,14 @@ mod tests {
     use super::*;
     use iso8601_timestamp::Timestamp;
 
-    /// One runtime shared by every Redis-backed test in this module.
-    /// `redis_kiss` pools connections in a GLOBAL mobc pool, but each
-    /// `#[tokio::test]` spins up its own runtime — a connection created on
-    /// test A's runtime goes back to the pool when A finishes, its I/O
-    /// registration dies with A's runtime, and test B then draws a dead
-    /// connection (intermittent `InternalError` from any mget). Driving all
-    /// Redis tests on one process-lifetime runtime removes that failure mode.
-    fn rt() -> &'static tokio::runtime::Runtime {
-        static RT: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
-        RT.get_or_init(|| {
-            tokio::runtime::Builder::new_multi_thread()
-                .worker_threads(1)
-                .enable_all()
-                .build()
-                .unwrap()
-        })
-    }
-
     // Redis-backed (mirrors the mls delta-test pattern, which also drives live
     // Redis voice state). Verifies count_video_participants over the ACTUAL key
     // composition — including the SERVER voice channel case (server_id present),
     // where the per-member flags key by server id, not channel id (audit
     // ME-MED-2: composing `{user}:{channel_id}` there would miss every flag and
     // read 0, failing the D12 cap OPEN).
-    #[test]
-    fn count_video_participants_counts_camera_or_screenshare_on_server_channel() {
-        rt().block_on(count_video_participants_case())
-    }
-
-    async fn count_video_participants_case() {
+    #[tokio::test]
+    async fn count_video_participants_counts_camera_or_screenshare_on_server_channel() {
         // Unique ids so parallel test runs don't collide on shared Redis.
         let suffix = ulid::Ulid::new().to_string();
         let channel = UserVoiceChannel {
@@ -1165,94 +1102,5 @@ mod tests {
             .await
             .expect("cleanup");
         assert_eq!(count_video_participants(&channel).await.unwrap(), 0);
-    }
-
-    // The remote-control plan §1 blocker sequence: `screensharing` conflates
-    // screen VIDEO (source 3) with screen AUDIO (source 4), so after the video
-    // track ends, a routine screen-audio unmute reads as "screensharing" with
-    // nothing published to look at. `screen_video` must track source 3 only —
-    // in BOTH directions (audio-only events never set OR clear it).
-    #[test]
-    fn screen_video_tracks_video_source_only() {
-        rt().block_on(screen_video_case())
-    }
-
-    async fn screen_video_case() {
-        let suffix = ulid::Ulid::new().to_string();
-        let channel = UserVoiceChannel {
-            id: format!("chan{suffix}"),
-            server_id: Some(format!("srv{suffix}")),
-        };
-        let user = format!("user{suffix}");
-
-        create_voice_state(&channel, &user, Timestamp::now_utc())
-            .await
-            .expect("seed voice state");
-
-        let state = get_voice_state(&channel, &user).await.unwrap().unwrap();
-        assert!(!state.screensharing);
-        assert!(!state.screen_video);
-
-        // Share screen with audio: both tracks publish.
-        update_voice_state_tracks(&channel, &user, true, 3)
-            .await
-            .unwrap();
-        update_voice_state_tracks(&channel, &user, true, 4)
-            .await
-            .unwrap();
-        let state = get_voice_state(&channel, &user).await.unwrap().unwrap();
-        assert!(state.screensharing);
-        assert!(state.screen_video);
-
-        // The screen VIDEO track ends...
-        update_voice_state_tracks(&channel, &user, false, 3)
-            .await
-            .unwrap();
-        // ...then the screen AUDIO track unmutes, which LiveKit does
-        // routinely. The conflated flag reads true again — no video is live.
-        update_voice_state_tracks(&channel, &user, true, 4)
-            .await
-            .unwrap();
-        let state = get_voice_state(&channel, &user).await.unwrap().unwrap();
-        assert!(state.screensharing, "historical conflated flag: unchanged");
-        assert!(
-            !state.screen_video,
-            "audio unmute must not resurrect the video flag"
-        );
-
-        // Inverse leg: with a healthy video+audio share, stopping ONLY the
-        // screen audio flips the conflated flag false; the video flag must
-        // keep reporting the still-live video track.
-        update_voice_state_tracks(&channel, &user, true, 3)
-            .await
-            .unwrap();
-        update_voice_state_tracks(&channel, &user, false, 4)
-            .await
-            .unwrap();
-        let state = get_voice_state(&channel, &user).await.unwrap().unwrap();
-        assert!(!state.screensharing, "historical conflated flag: unchanged");
-        assert!(
-            state.screen_video,
-            "stopping screen audio must not clear the video flag"
-        );
-
-        // Back-compat: a voice state created before the key existed (delete
-        // it to simulate) still hydrates, with screen_video defaulting false
-        // rather than invalidating the whole state.
-        let unique_key = format!("{user}:srv{suffix}");
-        get_connection()
-            .await
-            .unwrap()
-            .del::<_, ()>(format!("screen_video:{unique_key}"))
-            .await
-            .unwrap();
-        let state = get_voice_state(&channel, &user)
-            .await
-            .unwrap()
-            .expect("missing screen_video key must not invalidate the state");
-        assert!(!state.screen_video);
-
-        delete_voice_state(&channel, &user).await.expect("cleanup");
-        assert!(get_voice_state(&channel, &user).await.unwrap().is_none());
     }
 }
