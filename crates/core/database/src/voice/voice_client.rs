@@ -13,7 +13,7 @@ use revolt_permissions::{ChannelPermission, PermissionValue};
 use revolt_result::{create_error, Result, ToRevoltError};
 use std::{collections::HashMap, time::Duration};
 
-use super::get_allowed_sources;
+use super::{get_allowed_sources, track_source_grant_name};
 
 #[derive(Debug)]
 pub struct RoomClient {
@@ -97,11 +97,14 @@ impl VoiceClient {
             .with_ttl(Duration::from_secs(10))
             .with_grants(VideoGrants {
                 room_join: true,
-                can_publish: true,
+                // An EMPTY canPublishSources claim means "no restriction" to
+                // LiveKit (auth/grants.go), so a source-less member (Connect
+                // without Speak/Video) must be denied publishing outright
+                can_publish: !allowed_sources.is_empty(),
                 can_publish_data: false,
                 can_publish_sources: allowed_sources
                     .into_iter()
-                    .map(ToString::to_string)
+                    .map(|source| track_source_grant_name(source).to_string())
                     .collect(),
                 can_subscribe: permissions.has_channel_permission(ChannelPermission::Listen),
                 room: channel.id().to_string(),

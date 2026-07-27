@@ -7,7 +7,7 @@ use crate::{
     Database, Server, MAX_MLS_GROUP_MEMBERS,
 };
 use iso8601_timestamp::{Duration, Timestamp};
-use livekit_protocol::ParticipantPermission;
+use livekit_protocol::{ParticipantPermission, TrackSource};
 use redis_kiss::{
     get_connection as _get_connection,
     redis::{FromRedisValue, Pipeline, RedisError, RedisWrite, ToRedisArgs, Value},
@@ -356,18 +356,35 @@ pub async fn get_user_voice_channel_in_server(
 pub fn get_allowed_sources(
     limits: &FeaturesLimits,
     permissions: PermissionValue,
-) -> Vec<&'static str> {
+) -> Vec<TrackSource> {
     let mut allowed_sources = Vec::new();
 
     if permissions.has(ChannelPermission::Speak as u64) {
-        allowed_sources.push("microphone")
+        allowed_sources.push(TrackSource::Microphone)
     };
 
     if permissions.has(ChannelPermission::Video as u64) && limits.video {
-        allowed_sources.extend(["camera", "screen_share", "screen_share_audio"]);
+        allowed_sources.extend([
+            TrackSource::Camera,
+            TrackSource::ScreenShare,
+            TrackSource::ScreenShareAudio,
+        ]);
     };
 
     allowed_sources
+}
+
+/// The wire name a `TrackSource` takes in a join token's `canPublishSources`
+/// claim — LiveKit's `sourceToString` (auth/grants.go), NOT `as_str_name`,
+/// whose UPPER_CASE protobuf names the server won't match.
+pub fn track_source_grant_name(source: TrackSource) -> &'static str {
+    match source {
+        TrackSource::Camera => "camera",
+        TrackSource::Microphone => "microphone",
+        TrackSource::ScreenShare => "screen_share",
+        TrackSource::ScreenShareAudio => "screen_share_audio",
+        TrackSource::Unknown => "unknown",
+    }
 }
 
 pub async fn create_voice_state(
@@ -672,21 +689,51 @@ pub async fn sync_voice_permissions(
 /// is an untrusted injection surface for E2EE call machinery (media-E2EE
 /// plan §0.4) — a permission sync must never silently re-grant it. This
 /// previously re-granted `can_speak` on every sync.
+///
+/// `can_publish_sources` must carry the SAME source list the join token
+/// computes (`get_allowed_sources`): LiveKit treats an EMPTY list as "no
+/// restriction" (`VideoGrant.GetCanPublishSource`, auth/grants.go), and
+/// `UpdateFromPermission` replaces the whole grant — so the previous
+/// `..Default::default()` empty vec silently re-granted camera and
+/// screenshare to Video-less members on every sync. For the same reason an
+/// empty list may only ever be sent alongside `can_publish: false`.
 pub fn voice_participant_permissions(
     can_listen: bool,
-    can_speak: bool,
+    allowed_sources: &[TrackSource],
 ) -> ParticipantPermission {
     ParticipantPermission {
         can_subscribe: can_listen,
-        can_publish: can_speak,
+        can_publish: !allowed_sources.is_empty(),
         can_publish_data: false,
+        can_publish_sources: allowed_sources.iter().map(|s| *s as i32).collect(),
         ..Default::default()
     }
 }
 
 #[cfg(test)]
 mod permission_tests {
-    use super::{user_id_from_participant_identity, voice_participant_permissions};
+    use livekit_protocol::TrackSource;
+    use revolt_config::FeaturesLimits;
+    use revolt_permissions::{ChannelPermission, PermissionValue};
+
+    use super::{
+        get_allowed_sources, user_id_from_participant_identity, voice_participant_permissions,
+    };
+
+    fn limits_with_video(video: bool) -> FeaturesLimits {
+        FeaturesLimits {
+            outgoing_friend_requests: 0,
+            bots: 0,
+            message_length: 0,
+            message_attachments: 0,
+            servers: 0,
+            voice_quality: 0,
+            video,
+            video_resolution: [0, 0],
+            video_aspect_ratio: [0.0, 0.0],
+            file_upload_size_limit: Default::default(),
+        }
+    }
 
     #[test]
     fn participant_identity_parse_recovers_user_id() {
@@ -705,14 +752,67 @@ mod permission_tests {
     #[test]
     fn permission_sync_never_regrants_data_publishing() {
         for can_listen in [false, true] {
-            for can_speak in [false, true] {
-                let permissions = voice_participant_permissions(can_listen, can_speak);
+            for sources in [&[][..], &[TrackSource::Microphone][..]] {
+                let permissions = voice_participant_permissions(can_listen, sources);
                 assert!(
                     !permissions.can_publish_data,
                     "data publishing must stay revoked (media-E2EE plan §0.4)"
                 );
                 assert_eq!(permissions.can_subscribe, can_listen);
-                assert_eq!(permissions.can_publish, can_speak);
+                assert_eq!(permissions.can_publish, !sources.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn permission_sync_never_regrants_video_publishing() {
+        for can_speak in [false, true] {
+            for has_video_permission in [false, true] {
+                for video_limit in [false, true] {
+                    let mut bits = ChannelPermission::Listen as u64;
+                    if can_speak {
+                        bits |= ChannelPermission::Speak as u64;
+                    }
+                    if has_video_permission {
+                        bits |= ChannelPermission::Video as u64;
+                    }
+
+                    let sources = get_allowed_sources(
+                        &limits_with_video(video_limit),
+                        PermissionValue::from_raw(bits),
+                    );
+                    let permissions = voice_participant_permissions(true, &sources);
+
+                    let can_video = has_video_permission && video_limit;
+                    for video_source in [
+                        TrackSource::Camera,
+                        TrackSource::ScreenShare,
+                        TrackSource::ScreenShareAudio,
+                    ] {
+                        assert_eq!(
+                            permissions
+                                .can_publish_sources
+                                .contains(&(video_source as i32)),
+                            can_video,
+                            "sync must grant {video_source:?} iff Video permission + limit \
+                             (speak={can_speak}, video_perm={has_video_permission}, limit={video_limit})"
+                        );
+                    }
+                    assert_eq!(
+                        permissions
+                            .can_publish_sources
+                            .contains(&(TrackSource::Microphone as i32)),
+                        can_speak
+                    );
+
+                    // LiveKit reads an empty can_publish_sources as "no
+                    // restriction", so an empty list may only ever ship
+                    // behind can_publish: false
+                    assert_eq!(permissions.can_publish, !sources.is_empty());
+                    if permissions.can_publish_sources.is_empty() {
+                        assert!(!permissions.can_publish);
+                    }
+                }
             }
         }
     }
@@ -772,6 +872,7 @@ pub async fn sync_user_voice_permissions(
             limits.video && permissions.has_channel_permission(ChannelPermission::Video);
         let can_speak = permissions.has_channel_permission(ChannelPermission::Speak);
         let can_listen = permissions.has_channel_permission(ChannelPermission::Listen);
+        let allowed_sources = get_allowed_sources(&limits, permissions);
 
         update_event.camera = voice_state.camera.then_some(can_video);
         update_event.screensharing = voice_state.screensharing.then_some(can_video);
@@ -784,7 +885,7 @@ pub async fn sync_user_voice_permissions(
                 node,
                 user,
                 channel_id,
-                voice_participant_permissions(can_listen, can_speak),
+                voice_participant_permissions(can_listen, &allowed_sources),
             )
             .await?;
 
