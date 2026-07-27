@@ -8,6 +8,7 @@ use std::net::Ipv4Addr;
 
 mod api;
 mod guard;
+mod reconcile;
 
 #[rocket::main]
 async fn main() -> Result<(), rocket::Error> {
@@ -17,6 +18,12 @@ async fn main() -> Result<(), rocket::Error> {
 
     let database = DatabaseInfo::Auto.connect().await.unwrap();
     let voice_client = VoiceClient::from_revolt_config().await;
+
+    // Webhooks alone can't keep voice state truthful — a LiveKit restart
+    // never delivers the participant_left/room_finished events for the
+    // rooms it lost, stranding "in a call" state forever. The sweep
+    // replays them. See reconcile.rs.
+    rocket::tokio::spawn(reconcile::run(database.clone(), amqp.clone()));
 
     let _rocket = build()
         .manage(database)
