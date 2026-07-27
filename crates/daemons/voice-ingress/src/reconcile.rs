@@ -18,8 +18,14 @@
 //! dismissal, and the MLS group close), and LiveKit's own stale routing
 //! entries are dropped so `ListRooms`/`DeleteRoom` behave again.
 //!
-//! Fail-safe: an empty `nodes` hash (LiveKit never registered on this
-//! Redis) skips the sweep entirely rather than judging liveness blind.
+//! Safety posture (review 103fdca8): destruction requires BOTH persistence
+//! and re-verification. A node must look dead across TWO consecutive sweeps
+//! (~5 min apart — LiveKit itself tolerates 30s of staleness, and ghosts
+//! are hours old, so there is zero urgency), and every destructive step
+//! re-reads the relevant state immediately before acting so a join racing
+//! the sweep is never torn down. An empty `nodes` hash (LiveKit never
+//! registered on this Redis) skips the sweep entirely rather than judging
+//! liveness blind.
 
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
@@ -43,7 +49,8 @@ async fn get_connection() -> Result<Conn> {
 }
 
 /// How often the sweep runs. Ghosts are user-visible ("X is in a call"
-/// forever), so minutes — not hours.
+/// forever), so minutes — not hours. Teardown needs two consecutive
+/// sweeps, so effective time-to-clean is ~2x this.
 const SWEEP_INTERVAL: Duration = Duration::from_secs(300);
 
 /// Gap between the two `nodes` reads. LiveKit heartbeats every few
@@ -56,47 +63,102 @@ const STARTUP_DELAY: Duration = Duration::from_secs(30);
 
 pub async fn run(db: Database, amqp: AMQP) {
     rocket::tokio::time::sleep(STARTUP_DELAY).await;
+
+    // Nodes that looked dead LAST sweep (review MAJOR 1): a single frozen
+    // 10s window can be a stats-goroutine or Redis stall — LiveKit itself
+    // only distrusts a node after 30s. Only a node frozen across two
+    // sweeps (5+ minutes) is treated as dead.
+    let mut suspects: HashSet<String> = HashSet::new();
+
     loop {
-        if let Err(e) = sweep(&db, &amqp).await {
-            log::error!("voice reconciliation sweep failed: {e:?}");
+        match sweep(&db, &amqp, &suspects).await {
+            Ok(next_suspects) => suspects = next_suspects,
+            Err(e) => {
+                log::error!("voice reconciliation sweep failed: {e:?}");
+                // Keep the old suspect set — a transient error must not
+                // reset the two-sweep confirmation clock.
+            }
         }
         rocket::tokio::time::sleep(SWEEP_INTERVAL).await;
     }
 }
 
-/// Room names (= channel ids) currently backed by a live LiveKit node,
-/// plus the full routing map for the LiveKit-side cleanup. `None` when
-/// liveness cannot be judged (no registered nodes) — callers must skip.
-async fn live_rooms() -> Result<Option<(HashSet<String>, HashMap<String, String>)>> {
-    let mut conn = get_connection().await?;
+struct Liveness {
+    /// Nodes confirmed dead (suspect last sweep AND frozen/absent now).
+    dead_nodes: HashSet<String>,
+    /// Nodes to suspect going into the next sweep.
+    suspects: HashSet<String>,
+    /// room -> node routing snapshot (for candidate discovery only; every
+    /// destructive step re-reads the live entry before acting).
+    room_node_map: HashMap<String, String>,
+}
 
-    let first: HashMap<String, Vec<u8>> = conn.hgetall("nodes").await.to_internal_error()?;
+/// `None` when liveness cannot be judged (no registered nodes).
+async fn read_liveness(prev_suspects: &HashSet<String>) -> Result<Option<Liveness>> {
+    // Separate connections on purpose: holding a pooled connection across
+    // the 10s gap could starve webhook handling under pool pressure.
+    let first: HashMap<String, Vec<u8>> = get_connection()
+        .await?
+        .hgetall("nodes")
+        .await
+        .to_internal_error()?;
     if first.is_empty() {
         return Ok(None);
     }
 
     rocket::tokio::time::sleep(HEARTBEAT_GAP).await;
 
-    let second: HashMap<String, Vec<u8>> = conn.hgetall("nodes").await.to_internal_error()?;
+    let mut conn = get_connection().await?;
+    let second: HashMap<String, Vec<u8>> =
+        conn.hgetall("nodes").await.to_internal_error()?;
 
-    // Dead = present in both reads with identical bytes. A node that
-    // appeared between reads counts as live (conservative).
-    let live_nodes: HashSet<&String> = second
+    // Frozen = present in both reads with identical bytes. A node that
+    // appeared or changed between reads is live.
+    let frozen: HashSet<String> = second
         .iter()
-        .filter(|(id, bytes)| first.get(*id) != Some(bytes))
-        .map(|(id, _)| id)
+        .filter(|(id, bytes)| first.get(*id) == Some(bytes))
+        .map(|(id, _)| id.clone())
         .collect();
 
     let room_node_map: HashMap<String, String> =
         conn.hgetall("room_node_map").await.to_internal_error()?;
 
-    let live = room_node_map
-        .iter()
-        .filter(|(_, node)| live_nodes.contains(node))
-        .map(|(room, _)| room.clone())
+    // A routing entry can also point at a node that no longer appears in
+    // the `nodes` hash at all — same two-sweep rule applies.
+    let absent: HashSet<String> = room_node_map
+        .values()
+        .filter(|node| !second.contains_key(*node))
+        .cloned()
         .collect();
 
-    Ok(Some((live, room_node_map)))
+    let suspects: HashSet<String> = frozen.union(&absent).cloned().collect();
+    let dead_nodes: HashSet<String> = suspects
+        .intersection(prev_suspects)
+        .cloned()
+        .collect();
+
+    Ok(Some(Liveness {
+        dead_nodes,
+        suspects,
+        room_node_map,
+    }))
+}
+
+/// Re-read a channel's routing entry and decide whether it is STILL safe
+/// to treat as a ghost (review MAJOR 2): a mapping that exists and points
+/// at a non-dead node means the room is live (possibly re-created since
+/// the snapshot — exactly the ghost-rejoin race). `create_room` registers
+/// the mapping before any client can connect, so a live call always has a
+/// readable entry.
+async fn still_ghost(conn: &mut Conn, channel_id: &str, dead: &HashSet<String>) -> Result<bool> {
+    let node: Option<String> = conn
+        .hget("room_node_map", channel_id)
+        .await
+        .to_internal_error()?;
+    Ok(match node {
+        None => true,
+        Some(node) => dead.contains(&node),
+    })
 }
 
 async fn scan_keys(conn: &mut Conn, pattern: &str) -> Result<Vec<String>> {
@@ -111,31 +173,49 @@ async fn scan_keys(conn: &mut Conn, pattern: &str) -> Result<Vec<String>> {
     Ok(out)
 }
 
-async fn sweep(db: &Database, amqp: &AMQP) -> Result<()> {
-    let Some((live, room_node_map)) = live_rooms().await? else {
+async fn sweep(
+    db: &Database,
+    amqp: &AMQP,
+    prev_suspects: &HashSet<String>,
+) -> Result<HashSet<String>> {
+    let Some(liveness) = read_liveness(prev_suspects).await? else {
         log::debug!("no LiveKit nodes registered; skipping reconciliation sweep");
-        return Ok(());
+        return Ok(HashSet::new());
     };
+    let dead = &liveness.dead_nodes;
 
     let mut conn = get_connection().await?;
+
+    // Ghost candidates from the snapshot; each is re-verified against the
+    // CURRENT routing entry immediately before teardown.
+    let is_candidate = |channel_id: &str| -> bool {
+        match liveness.room_node_map.get(channel_id) {
+            None => true,
+            Some(node) => dead.contains(node),
+        }
+    };
 
     // 1. Channels with a visible member roster whose room has no live node.
     let mut reconciled = 0usize;
     for key in scan_keys(&mut conn, "vc_members:*").await? {
         let channel_id = key.trim_start_matches("vc_members:").to_string();
-        if live.contains(&channel_id) {
+        if !is_candidate(&channel_id) {
             continue;
         }
-        if let Err(e) = reconcile_channel(db, amqp, &mut conn, &channel_id).await {
-            log::error!("failed to reconcile ghost channel {channel_id}: {e:?}");
-        } else {
-            reconciled += 1;
+        match still_ghost(&mut conn, &channel_id, dead).await {
+            Ok(false) => continue, // re-created since the snapshot — live
+            Ok(true) => match reconcile_channel(db, amqp, &mut conn, &channel_id).await {
+                Ok(()) => reconciled += 1,
+                Err(e) => log::error!("failed to reconcile ghost channel {channel_id}: {e:?}"),
+            },
+            Err(e) => log::error!("ghost re-check failed for {channel_id}: {e:?}"),
         }
     }
 
     // 2. Per-user membership entries pointing at dead rooms (covers state
     //    whose vc_members set is already gone). Silent — anything a client
-    //    could see was announced in step 1.
+    //    could see was announced in step 1. Per-item containment: one
+    //    poisoned entry must not block the rest of the sweep forever.
     let mut user_entries = 0usize;
     let users: Vec<String> = scan_keys(&mut conn, "vc:*")
         .await?
@@ -143,67 +223,116 @@ async fn sweep(db: &Database, amqp: &AMQP) -> Result<()> {
         .map(|k| k.trim_start_matches("vc:").to_string())
         .collect();
     for user_id in &users {
-        for entry in get_user_voice_channels(user_id).await? {
-            if live.contains(&entry.id) {
+        let entries = match get_user_voice_channels(user_id).await {
+            Ok(entries) => entries,
+            Err(e) => {
+                log::error!("could not read vc:{user_id}: {e:?}");
                 continue;
             }
-            delete_voice_state(&entry, user_id).await?;
-            delete_voice_participant_identity(&entry.id, user_id).await?;
-            user_entries += 1;
+        };
+        for entry in entries {
+            if !is_candidate(&entry.id) {
+                continue;
+            }
+            let result: Result<()> = async {
+                if !still_ghost(&mut conn, &entry.id, dead).await? {
+                    return Ok(());
+                }
+                delete_voice_state(&entry, user_id).await?;
+                delete_voice_participant_identity(&entry.id, user_id).await?;
+                // Step 1 clears this for rostered channels; entries seen
+                // only here would otherwise leak it permanently.
+                conn.del::<_, ()>(format!("node:{}", entry.id))
+                    .await
+                    .to_internal_error()?;
+                user_entries += 1;
+                Ok(())
+            }
+            .await;
+            if let Err(e) = result {
+                log::error!("failed to clear stale entry {} for {user_id}: {e:?}", entry.id);
+            }
         }
     }
 
     // 3. Stray per-user keys with no surviving vc: entry. create_voice_state
-    //    writes joined_at and the vc: entry in one pipeline, so a joined_at
-    //    whose (user, parent) matches no current entry is pure debris.
-    let mut valid: HashSet<(String, String)> = HashSet::new();
-    for user_id in &users {
-        for entry in get_user_voice_channels(user_id).await? {
-            let parent = entry.server_id.clone().unwrap_or_else(|| entry.id.clone());
-            valid.insert((user_id.clone(), parent));
-        }
-    }
+    //    writes the vc: entry BEFORE joined_at in one pipeline, so any
+    //    observed joined_at from a live join has a readable vc: entry —
+    //    re-fetching the user's entries at deletion time (review MAJOR 3)
+    //    fully closes the race with a join that happened mid-sweep.
     let mut strays = 0usize;
     for key in scan_keys(&mut conn, "joined_at:*").await? {
-        let unique_key = key.trim_start_matches("joined_at:");
+        let unique_key = key.trim_start_matches("joined_at:").to_string();
         // ULIDs contain no ':' — first segment is the user id.
         let Some((user_id, parent)) = unique_key.split_once(':') else {
             continue;
         };
-        if valid.contains(&(user_id.to_string(), parent.to_string())) {
-            continue;
+        let result: Result<()> = async {
+            let fresh = get_user_voice_channels(user_id).await?;
+            if fresh
+                .iter()
+                .any(|e| e.server_id.as_deref().unwrap_or(&e.id) == parent)
+            {
+                return Ok(()); // a current entry claims this key set
+            }
+            get_connection()
+                .await?
+                .del::<_, ()>(&[
+                    format!("joined_at:{unique_key}"),
+                    format!("is_publishing:{unique_key}"),
+                    format!("is_receiving:{unique_key}"),
+                    format!("screensharing:{unique_key}"),
+                    format!("camera:{unique_key}"),
+                    unique_key.clone(),
+                ])
+                .await
+                .to_internal_error()?;
+            strays += 1;
+            Ok(())
         }
-        conn.del::<_, ()>(&[
-            format!("joined_at:{unique_key}"),
-            format!("is_publishing:{unique_key}"),
-            format!("is_receiving:{unique_key}"),
-            format!("screensharing:{unique_key}"),
-            format!("camera:{unique_key}"),
-            unique_key.to_string(),
-        ])
-        .await
-        .to_internal_error()?;
-        strays += 1;
+        .await;
+        if let Err(e) = result {
+            log::error!("failed to clear stray voice keys {unique_key}: {e:?}");
+        }
     }
 
-    // 4. LiveKit's own stale routing entries. Only ever touches rooms whose
-    //    node is dead — live rooms are LiveKit's business.
+    // 4. LiveKit's own stale routing entries. Only rooms still mapped to a
+    //    CONFIRMED-dead node at deletion time — a rejoin since the snapshot
+    //    rewrote the mapping to a live node and must be left alone.
     let mut livekit_ghosts = 0usize;
-    for (room, _) in room_node_map.iter().filter(|(r, _)| !live.contains(*r)) {
-        conn.hdel::<_, _, ()>("rooms", room).await.to_internal_error()?;
-        conn.hdel::<_, _, ()>("room_internal", room)
+    for (room, snapshot_node) in liveness
+        .room_node_map
+        .iter()
+        .filter(|(_, node)| dead.contains(*node))
+    {
+        let result: Result<()> = async {
+            let current: Option<String> = conn
+                .hget("room_node_map", room)
+                .await
+                .to_internal_error()?;
+            if current.as_ref() != Some(snapshot_node) {
+                return Ok(()); // re-created (or already gone) — not ours
+            }
+            conn.hdel::<_, _, ()>("rooms", room).await.to_internal_error()?;
+            conn.hdel::<_, _, ()>("room_internal", room)
+                .await
+                .to_internal_error()?;
+            conn.hdel::<_, _, ()>("room_node_map", room)
+                .await
+                .to_internal_error()?;
+            conn.del::<_, ()>(&[
+                format!("room_participants:{room}"),
+                format!("agent_dispatch:{room}"),
+            ])
             .await
             .to_internal_error()?;
-        conn.hdel::<_, _, ()>("room_node_map", room)
-            .await
-            .to_internal_error()?;
-        conn.del::<_, ()>(&[
-            format!("room_participants:{room}"),
-            format!("agent_dispatch:{room}"),
-        ])
-        .await
-        .to_internal_error()?;
-        livekit_ghosts += 1;
+            livekit_ghosts += 1;
+            Ok(())
+        }
+        .await;
+        if let Err(e) = result {
+            log::error!("failed to clear LiveKit routing for ghost {room}: {e:?}");
+        }
     }
 
     if reconciled + user_entries + strays + livekit_ghosts > 0 {
@@ -211,7 +340,7 @@ async fn sweep(db: &Database, amqp: &AMQP) -> Result<()> {
             "voice reconciliation: {reconciled} ghost channel(s), {user_entries} stale membership entrie(s), {strays} stray key set(s), {livekit_ghosts} LiveKit routing entrie(s) cleared"
         );
     }
-    Ok(())
+    Ok(liveness.suspects)
 }
 
 /// Tear one ghost channel down the way the missed webhooks would have:
@@ -231,7 +360,8 @@ async fn reconcile_channel(
 
     // The per-user keys are parented on server_id-or-channel-id; recover the
     // stored shape from a member's own vc: entry, then the DB, then assume a
-    // DM (server-less) channel.
+    // DM (server-less) channel. A wrong shape self-heals: the mis-keyed
+    // deletes no-op and steps 2-3 catch the residue via the stored entries.
     let mut channel = None;
     for member in &members {
         if let Some(entry) = get_user_voice_channels(member)
@@ -282,7 +412,8 @@ async fn reconcile_channel(
     }
 
     // Media E2EE: mirror room_finished so members wipe state and the crond
-    // sweep reclaims the group.
+    // sweep reclaims the group (fetch returns only OPEN groups — a close
+    // that already happened makes this a no-op).
     if let Some(group) = db.fetch_open_mls_group_for_channel(channel_id).await? {
         db.close_mls_group(&group.id).await?;
     }
