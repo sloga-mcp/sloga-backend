@@ -640,17 +640,5 @@
   "name": "Staff of the Ruins",
   "quality": 4,
   "boss": "Ossirian the Unscarred"
- },
- {
-  "id": 12717,
-  "name": "Plans: Lionheart Helm",
-  "quality": 4,
-  "boss": "Trash"
- },
- {
-  "id": 12720,
-  "name": "Plans: Stronghold Gauntlets",
-  "quality": 4,
-  "boss": "Trash"
  }
 ]

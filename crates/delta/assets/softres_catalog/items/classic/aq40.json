@@ -760,6 +760,12 @@
   "boss": "Trash"
  },
  {
+  "id": 21218,
+  "name": "Blue Qiraji Resonating Crystal",
+  "quality": 3,
+  "boss": "Trash"
+ },
+ {
   "id": 21838,
   "name": "Garb of Royal Ascension",
   "quality": 4,
@@ -781,21 +787,21 @@
   ]
  },
  {
+  "id": 21323,
+  "name": "Green Qiraji Resonating Crystal",
+  "quality": 3,
+  "boss": "Trash"
+ },
+ {
   "id": 21856,
   "name": "Neretzek, The Blood Drinker",
   "quality": 4,
   "boss": "Trash"
  },
  {
-  "id": 12728,
-  "name": "Plans: Invulnerable Mail",
-  "quality": 4,
-  "boss": "Trash"
- },
- {
-  "id": 12720,
-  "name": "Plans: Stronghold Gauntlets",
-  "quality": 4,
+  "id": 21321,
+  "name": "Red Qiraji Resonating Crystal",
+  "quality": 3,
   "boss": "Trash"
  },
  {
@@ -808,6 +814,12 @@
   "id": 21891,
   "name": "Shard of the Fallen Star",
   "quality": 4,
+  "boss": "Trash"
+ },
+ {
+  "id": 21324,
+  "name": "Yellow Qiraji Resonating Crystal",
+  "quality": 3,
   "boss": "Trash"
  }
 ]

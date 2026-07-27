@@ -750,6 +750,12 @@
   "boss": "Auriaya"
  },
  {
+  "id": 45460,
+  "name": "Bindings of Winter Gale",
+  "quality": 4,
+  "boss": "Hodir"
+ },
+ {
   "id": 45632,
   "name": "Breastplate of the Wayward Conqueror",
   "quality": 4,
@@ -784,6 +790,18 @@
   ]
  },
  {
+  "id": 45461,
+  "name": "Drape of Icy Intent",
+  "quality": 4,
+  "boss": "Hodir"
+ },
+ {
+  "id": 45459,
+  "name": "Frigid Strength of Hodir",
+  "quality": 4,
+  "boss": "Hodir"
+ },
+ {
   "id": 45454,
   "name": "Frost-bound Chain Bracers",
   "quality": 4,
@@ -802,8 +820,20 @@
   "boss": "Hodir"
  },
  {
+  "id": 45462,
+  "name": "Gloves of the Frozen Glade",
+  "quality": 4,
+  "boss": "Hodir"
+ },
+ {
   "id": 45450,
   "name": "Northern Barrier",
+  "quality": 4,
+  "boss": "Hodir"
+ },
+ {
+  "id": 45457,
+  "name": "Staff of Endless Winter",
   "quality": 4,
   "boss": "Hodir"
  },

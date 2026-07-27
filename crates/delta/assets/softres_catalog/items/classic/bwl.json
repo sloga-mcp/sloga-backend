@@ -993,32 +993,8 @@
   "boss": "Trash"
  },
  {
-  "id": 14511,
-  "name": "Pattern: Gloves of Spell Mastery",
-  "quality": 4,
-  "boss": "Trash"
- },
- {
-  "id": 12728,
-  "name": "Plans: Invulnerable Mail",
-  "quality": 4,
-  "boss": "Trash"
- },
- {
-  "id": 12720,
-  "name": "Plans: Stronghold Gauntlets",
-  "quality": 4,
-  "boss": "Trash"
- },
- {
   "id": 19438,
   "name": "Ringo's Blizzard Boots",
-  "quality": 4,
-  "boss": "Trash"
- },
- {
-  "id": 14557,
-  "name": "The Lion Horn of Stormwind",
   "quality": 4,
   "boss": "Trash"
  }

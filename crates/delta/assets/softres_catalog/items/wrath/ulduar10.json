@@ -228,20 +228,8 @@
   "boss": "XT-002 Deconstructor"
  },
  {
-  "id": 45445,
-  "name": "Breastplate of the Devoted",
-  "quality": 4,
-  "boss": "XT-002 Deconstructor"
- },
- {
   "id": 45867,
   "name": "Breastplate of the Stoneshaper",
-  "quality": 4,
-  "boss": "XT-002 Deconstructor"
- },
- {
-  "id": 45443,
-  "name": "Charm of Meticulous Timing",
   "quality": 4,
   "boss": "XT-002 Deconstructor"
  },
@@ -266,18 +254,6 @@
  {
   "id": 45679,
   "name": "Gloves of Taut Grip",
-  "quality": 4,
-  "boss": "XT-002 Deconstructor"
- },
- {
-  "id": 45444,
-  "name": "Gloves of the Steady Hand",
-  "quality": 4,
-  "boss": "XT-002 Deconstructor"
- },
- {
-  "id": 45446,
-  "name": "Grasps of Reason",
   "quality": 4,
   "boss": "XT-002 Deconstructor"
  },
@@ -314,12 +290,6 @@
  {
   "id": 45871,
   "name": "Seal of Ulduar",
-  "quality": 4,
-  "boss": "XT-002 Deconstructor"
- },
- {
-  "id": 45442,
-  "name": "Sorthalis, Hammer of the Watchers",
   "quality": 4,
   "boss": "XT-002 Deconstructor"
  },
@@ -564,8 +534,8 @@
   "boss": "Hodir"
  },
  {
-  "id": 45454,
-  "name": "Frost-bound Chain Bracers",
+  "id": 45464,
+  "name": "Cowl of Icy Breaths",
   "quality": 4,
   "boss": "Hodir"
  },
@@ -1256,18 +1226,6 @@
   "boss": "Trash"
  },
  {
-  "id": 45548,
-  "name": "Belt of the Sleeper",
-  "quality": 4,
-  "boss": "Trash"
- },
- {
-  "id": 45540,
-  "name": "Bladebearer's Signet",
-  "quality": 4,
-  "boss": "Trash"
- },
- {
   "id": 46351,
   "name": "Bloodcrush Cudgel",
   "quality": 4,
@@ -1292,12 +1250,6 @@
   "boss": "Trash"
  },
  {
-  "id": 45605,
-  "name": "Daschal's Bite",
-  "quality": 4,
-  "boss": "Trash"
- },
- {
   "id": 46341,
   "name": "Drape of the Spellweaver",
   "quality": 4,
@@ -1316,68 +1268,14 @@
   "boss": "Trash"
  },
  {
-  "id": 45542,
-  "name": "Greaves of the Stonewarder",
-  "quality": 4,
-  "boss": "Trash"
- },
- {
-  "id": 45549,
-  "name": "Grips of Chaos",
-  "quality": 4,
-  "boss": "Trash"
- },
- {
   "id": 46344,
   "name": "Iceshear Mantle",
   "quality": 4,
   "boss": "Trash"
  },
  {
-  "id": 46138,
-  "name": "Idol of the Flourishing Life",
-  "quality": 4,
-  "boss": "Trash"
- },
- {
-  "id": 45544,
-  "name": "Leggings of the Tortured Earth",
-  "quality": 4,
-  "boss": "Trash"
- },
- {
-  "id": 45539,
-  "name": "Pendant of Focused Energies",
-  "quality": 4,
-  "boss": "Trash"
- },
- {
   "id": 46350,
   "name": "Pillar of Fortitude",
-  "quality": 4,
-  "boss": "Trash"
- },
- {
-  "id": 45547,
-  "name": "Relic Hunter's Cord",
-  "quality": 4,
-  "boss": "Trash"
- },
- {
-  "id": 45543,
-  "name": "Shoulders of Misfortune",
-  "quality": 4,
-  "boss": "Trash"
- },
- {
-  "id": 45541,
-  "name": "Shroud of Alteration",
-  "quality": 4,
-  "boss": "Trash"
- },
- {
-  "id": 45538,
-  "name": "Titanstone Pendant",
   "quality": 4,
   "boss": "Trash"
  }

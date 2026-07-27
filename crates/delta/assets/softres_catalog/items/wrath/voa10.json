@@ -153,6 +153,24 @@
   ]
  },
  {
+  "id": 41648,
+  "name": "Hateful Gladiator's Leather Tunic",
+  "quality": 4,
+  "boss": "Archavon the Stone Watcher",
+  "allowable_classes": [
+   "rogue"
+  ]
+ },
+ {
+  "id": 41079,
+  "name": "Hateful Gladiator's Linked Armor",
+  "quality": 4,
+  "boss": "Archavon the Stone Watcher",
+  "allowable_classes": [
+   "shaman"
+  ]
+ },
+ {
   "id": 41135,
   "name": "Hateful Gladiator's Linked Gauntlets",
   "quality": 4,
@@ -621,6 +639,15 @@
   ]
  },
  {
+  "id": 39601,
+  "name": "Heroes' Earthshatter Grips",
+  "quality": 4,
+  "boss": "Archavon the Stone Watcher",
+  "allowable_classes": [
+   "shaman"
+  ]
+ },
+ {
   "id": 39591,
   "name": "Heroes' Earthshatter Handguards",
   "quality": 4,
@@ -659,6 +686,15 @@
  {
   "id": 39588,
   "name": "Heroes' Earthshatter Tunic",
+  "quality": 4,
+  "boss": "Archavon the Stone Watcher",
+  "allowable_classes": [
+   "shaman"
+  ]
+ },
+ {
+  "id": 39603,
+  "name": "Heroes' Earthshatter War-Kilt",
   "quality": 4,
   "boss": "Archavon the Stone Watcher",
   "allowable_classes": [
@@ -1375,6 +1411,12 @@
  {
   "id": 42031,
   "name": "Deadly Gladiator's Pendant of Subjugation",
+  "quality": 4,
+  "boss": "Emalon the Storm Watcher"
+ },
+ {
+  "id": 42027,
+  "name": "Deadly Gladiator's Pendant of Triumph",
   "quality": 4,
   "boss": "Emalon the Storm Watcher"
  },

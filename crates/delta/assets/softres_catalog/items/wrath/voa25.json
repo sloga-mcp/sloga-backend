@@ -765,15 +765,6 @@
   ]
  },
  {
-  "id": 40420,
-  "name": "Valorous Plagueheart Gloves",
-  "quality": 4,
-  "boss": "Archavon the Stone Watcher",
-  "allowable_classes": [
-   "warlock"
-  ]
- },
- {
   "id": 40422,
   "name": "Valorous Plagueheart Leggings",
   "quality": 4,
@@ -1546,6 +1537,15 @@
  {
   "id": 40809,
   "name": "Furious Gladiator's Dreadplate Gauntlets",
+  "quality": 4,
+  "boss": "Emalon the Storm Watcher",
+  "allowable_classes": [
+   "deathknight"
+  ]
+ },
+ {
+  "id": 40848,
+  "name": "Furious Gladiator's Dreadplate Legguards",
   "quality": 4,
   "boss": "Emalon the Storm Watcher",
   "allowable_classes": [

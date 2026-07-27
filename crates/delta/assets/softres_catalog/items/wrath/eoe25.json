@@ -114,15 +114,6 @@
   "boss": "Malygos"
  },
  {
-  "id": 40547,
-  "name": "Valorous Dreadnaught Legguards",
-  "quality": 4,
-  "boss": "Malygos",
-  "allowable_classes": [
-   "warrior"
-  ]
- },
- {
   "id": 40564,
   "name": "Winter Spectacle Gloves",
   "quality": 4,
