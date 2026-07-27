@@ -917,6 +917,7 @@ pub async fn sync_user_voice_permissions(
 
         update_event.camera = voice_state.camera.then_some(can_video);
         update_event.screensharing = voice_state.screensharing.then_some(can_video);
+        update_event.screen_video = voice_state.screen_video.then_some(can_video);
         update_event.is_publishing = voice_state.is_publishing.then_some(can_speak);
 
         update_voice_state(&user_voice_channel, &user.id, &update_event).await?;
