@@ -79,16 +79,48 @@ Filtering rules (see constants in `generate.py`):
 
 - boss loot: quality ≥ 3 (rare) — ZG/AQ20 bosses drop meaningful blues;
   trash: quality ≥ 4 (epic).
+- mounts (item class 15, subclass 5) bypass every quality/ilvl filter — a
+  mount is the archetypal soft-reserve item. 1.12 item data predates the
+  Mount subclass, so the rare-quality AQ40 crystals are `CURATED_ADD`
+  entries instead.
 - quest-flagged drops are skipped (negative chance in MaNGOS dumps,
-  `QuestRequired` in TDB).
+  `QuestRequired` in TDB). Positive-chance quest STARTERS (Head of
+  Onyxia/Nefarian, Heart of Hakkar, Magtheridon's Head, Blood of Zul'jin,
+  Verdant Sphere, the Focusing Iris keys, …) are deliberately KEPT: they
+  are one-per-kill contested drops that raid leads do soft-reserve, and
+  softres.it lists them too. The Wrath Onyxia heads stay excluded by id
+  (pre-ship decision).
 - gems (item class 3) are excluded — several TBC/Wrath bosses reference
   ~100-entry shared epic-gem lists.
 - reference rows below 1% chance are skipped (shared world-drop lists).
 - reference lists wired into ≥ 8 loot tables whose contents include
   recipes are treated as world-drop lists and skipped (the vmangos
-  "boss drops a random world epic/recipe" mechanic).
-- currency-style items (badges/emblems/Stone Keeper's Shards) are
-  excluded by id (`EXCLUDED_ITEMS` in `raids.py`).
+  "boss drops a random world epic/recipe" mechanic). Sub-1% DIRECT rows
+  can't be chance-filtered without losing legit rare mounts, so the
+  handful of classic world drops wired directly into raid-trash tables
+  are excluded by id instead.
+- currency-style items (badges/emblems/Stone Keeper's Shards) and the
+  condition-free Hallow's End boss drop are excluded by id
+  (`EXCLUDED_ITEMS` in `raids.py`).
+- `trash_max_ilvl` caps a wrath trash sweep per mode — Ulduar's trash
+  templates carry the 25-player BoE reference list on their base
+  (10-player) table.
+
+## Curated deltas (`CURATED_ADD` / `CURATED_REMOVE` in `raids.py`)
+
+The world DBs are community reconstructions with verified errors: TDB
+wires XT-002's 25-hard items into the 10-man table, lacks any loot row
+for Hodir's 25-hard Rare Cache of Winter contents and six real VoA
+drops, and has two items that never drop (a vendor-only VoA glove, a VoA
+item in Alexstrasza's Gift). These are patched per raid via
+`CURATED_REMOVE` (ids dropped from one raid only) and `CURATED_ADD`
+(raid → boss label → ids, metadata resolved from `item_template`). Every
+entry cites its evidence inline; the 2026-07 full-catalog verification
+pass (all 40 raids spot-checked against wowhead/wowtbc/wotlkdb + archived
+2010 wowhead) is the baseline. Known-and-accepted source quirks NOT
+patched: ToGC-10 carries the blacksmithing Plans but not the
+tailoring/LW Patterns (TDB asymmetry, sub-1% recipes either way), and
+ICC-25H drops both normal and heroic Marks (era-correct 3.3.5 behavior).
 
 ## Curation helpers
 

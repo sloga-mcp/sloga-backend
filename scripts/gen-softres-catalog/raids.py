@@ -38,6 +38,86 @@ EXCLUDED_ITEMS = {
     43228,  # Stone Keeper's Shard
     49643,  # Head of Onyxia (Alliance quest starter, Wrath)
     49644,  # Head of Onyxia (Horde quest starter, Wrath)
+    # Sub-1% DIRECT world-drop rows on classic raid trash. The shared
+    # reference-list heuristic can't see these (they are direct item rows,
+    # deliberately never chance-filtered so real rare mounts survive);
+    # wowhead attributes them to generic world pools, not the raids.
+    12717,  # Plans: Lionheart Helm
+    12720,  # Plans: Stronghold Gauntlets
+    12728,  # Plans: Invulnerable Mail
+    14511,  # Pattern: Gloves of Spell Mastery
+    14557,  # The Lion Horn of Stormwind
+    14558,  # Lady Maye's Pendant
+    # Hallow's End holiday drop wired condition-free into every TBC boss
+    # table — unobtainable outside the event.
+    33117,  # Jack-o'-Lantern
+}
+
+# Per-raid curated deltas over the generated data — the world DBs are
+# community reconstructions and carry verified errors. Every entry cites
+# its evidence; keep these short and prefer fixing the pipeline when a
+# whole class of items is wrong.
+#
+# CURATED_REMOVE: item ids dropped from one raid (they stay in others).
+CURATED_REMOVE = {
+    # TDB puts XT-002's five 25-hard-mode ilvl-239 items in the 10-man
+    # base loot table too (they correctly live in DifficultyEntry1's
+    # table for ulduar25); wowhead/wowtbc attribute them to 25-hard only.
+    # 45454 (Frost-bound Chain Bracers, ilvl 226) is a Hodir-25 normal
+    # drop TDB also placed in the 10-man Rare Cache of Winter (194200).
+    "ulduar10": {45442, 45443, 45444, 45445, 45446, 45454},
+    # Valorous Dreadnaught Legguards (ilvl 213, Archavon's) sit in
+    # Alexstrasza's Gift 25 (go 193967) — the lone 213 row among 226s;
+    # wowhead attributes it to VoA only.
+    "eoe25": {40547},
+    # Valorous Plagueheart Gloves: token-vendor only — zero drops in
+    # ~2.9k recorded Archavon-25 kills on wowhead classic and no
+    # dropped-by on archived 2010 wowhead.
+    "voa25": {40420},
+}
+
+# CURATED_ADD: raid id -> boss label -> item ids the source DB verifiably
+# drops there but has NO loot row for (metadata resolves from
+# item_template). All verified against wowhead per-mode drop data.
+CURATED_ADD = {
+    # The Qiraji Resonating Crystal mounts are RARE-quality direct rows on
+    # ten spawned AQ40 trash creatures (1.1–17.5% in vmangos), but 1.12
+    # item data has no Mount subclass (they are class 15/0 junk, like the
+    # Swift Zulian Tiger), so the epic-quality trash floor drops them and
+    # no subclass exemption can see them. A mount is the archetypal
+    # soft-reserve item — pin them explicitly.
+    "aq40": {"Trash": [
+        21218,  # Blue Qiraji Resonating Crystal
+        21321,  # Red Qiraji Resonating Crystal
+        21323,  # Green Qiraji Resonating Crystal
+        21324,  # Yellow Qiraji Resonating Crystal
+    ]},
+    # TDB's 10-man Rare Cache of Winter lacks Hodir-10's normal cloth
+    # head (present on wowhead/wowtbc 10-normal tables).
+    "ulduar10": {"Hodir": [45464]},  # Cowl of Icy Breaths
+    # Hodir's five 25-hard-mode ilvl-239 Rare Cache items exist in
+    # item_template but in no TDB loot table at all.
+    "ulduar25": {"Hodir": [
+        45457,  # Staff of Endless Winter
+        45459,  # Frigid Strength of Hodir
+        45460,  # Bindings of Winter Gale
+        45461,  # Drape of Icy Intent
+        45462,  # Gloves of the Frozen Glade
+    ]},
+    # VoA drops absent from TDB, confirmed on wowhead classic per-mode
+    # kill statistics (each also on archived 2010 wowhead):
+    "voa10": {
+        "Archavon the Stone Watcher": [
+            39601,  # Heroes' Earthshatter Grips
+            39603,  # Heroes' Earthshatter War-Kilt
+            41079,  # Hateful Gladiator's Linked Armor
+            41648,  # Hateful Gladiator's Leather Tunic
+        ],
+        "Emalon the Storm Watcher": [42027],  # Deadly Gladiator's Pendant of Triumph
+    },
+    "voa25": {
+        "Emalon the Storm Watcher": [40848],  # Furious Gladiator's Dreadplate Legguards
+    },
 }
 
 
@@ -244,7 +324,8 @@ TBC_RAIDS = [
 ]
 
 
-def _wrath(base_id, name, map_id, bosses, modes, per_mode_gos=None, trash_min_ilvl=0):
+def _wrath(base_id, name, map_id, bosses, modes, per_mode_gos=None, trash_min_ilvl=0,
+           trash_max_ilvl_by_mode=None):
     """Expand one Wrath instance into its size/difficulty raid entries.
 
     `modes` maps raid-id suffix -> (mode, slots, difficulty).
@@ -252,6 +333,9 @@ def _wrath(base_id, name, map_id, bosses, modes, per_mode_gos=None, trash_min_il
     for chest-loot encounters, whose entries differ per variant.
     `trash_min_ilvl` floors the trash sweep — TDB trash tables reference
     low-level world BoE drop lists that would otherwise pollute the raid.
+    `trash_max_ilvl_by_mode` optionally caps the sweep per mode — Ulduar's
+    trash templates carry the 25-player BoE reference on their BASE
+    (10-player) table, so the 10-man sweep needs a ceiling.
     """
     out = []
     for suffix, (mode, slots, difficulty) in modes.items():
@@ -281,6 +365,7 @@ def _wrath(base_id, name, map_id, bosses, modes, per_mode_gos=None, trash_min_il
             "difficulty": difficulty,
             "bosses": entry_bosses,
             "trash_min_ilvl": trash_min_ilvl,
+            "trash_max_ilvl": (trash_max_ilvl_by_mode or {}).get(mode, 0),
         })
     return out
 
@@ -428,7 +513,8 @@ WRATH_RAIDS = (
         _boss("Koralon the Flame Watcher", "Koralon the Flame Watcher"),
         _boss("Toravon the Ice Watcher", "Toravon the Ice Watcher"),
     ], _N10_25, trash_min_ilvl=213)
-    + _wrath("ulduar", "Ulduar", 603, _ULDUAR_BOSSES, _N10_25, _ULDUAR_GOS, trash_min_ilvl=219)
+    + _wrath("ulduar", "Ulduar", 603, _ULDUAR_BOSSES, _N10_25, _ULDUAR_GOS, trash_min_ilvl=219,
+             trash_max_ilvl_by_mode={0: 219})
     + _wrath("toc", "Trial of the Crusader", 649, _TOC_BOSSES, _ALL_MODES, _TOC_GOS,
              trash_min_ilvl=232)
     + _wrath("onyxia", "Onyxia's Lair", 249, [_boss("Onyxia", "Onyxia")], _N10_25,

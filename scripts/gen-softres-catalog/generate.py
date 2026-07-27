@@ -229,6 +229,13 @@ TRASH_MIN_QUALITY = 4  # epic — keeps map-wide sweeps from dredging junk
 # rolled or banked, never soft-reserved, and they would drown the picker.
 EXCLUDED_ITEM_CLASSES = {3}
 
+# Mount items (class Miscellaneous, subclass Mount) bypass every quality and
+# item-level filter — a mount is the archetypal soft-reserve item. NOTE:
+# 1.12 item data predates the Mount subclass (vanilla mounts are 15/0
+# junk), so classic-only rare-quality mounts (the AQ40 crystals) are
+# CURATED_ADD entries instead.
+MOUNT_ITEM = (15, 5)
+
 
 def pick(cols, row, *names, default=None):
     for n in names:
@@ -285,8 +292,10 @@ class Edition:
                     pick(cols, r, "allowable_class", "AllowableClass"),
                     pick(cols, r, "class"),
                     pick(cols, r, "item_level", "ItemLevel"),
+                    pick(cols, r, "subclass", "SubClass"),
                 )
-        # entry -> (name, quality, allowable_class_mask, item_class, item_level)
+        # entry -> (name, quality, allowable_class_mask, item_class, item_level,
+        #           item_subclass)
         self.items = {e: v[1:] for e, v in items.items()}
 
         # creature_template
@@ -566,17 +575,20 @@ def collect_raid(edition: Edition, raid, warn: Warnings) -> list[dict]:
     found: dict[int, dict] = {}
     boss_creature_entries: set[int] = set()
 
+    removed = raid_config.CURATED_REMOVE.get(raid["id"], set())
+
     def add_items(item_ids: set[int], label: str | None, min_quality: int):
         for item_id in sorted(item_ids):
             item = edition.items.get(item_id)
             if item is None:
                 continue
-            name, quality, _mask, iclass, _ilvl = item
-            if quality is None or quality < min_quality:
+            name, quality, _mask, iclass, _ilvl, subclass = item
+            is_mount = (iclass, subclass) == MOUNT_ITEM
+            if not is_mount and (quality is None or quality < min_quality):
                 continue
             if iclass in EXCLUDED_ITEM_CLASSES:
                 continue
-            if item_id in raid_config.EXCLUDED_ITEMS:
+            if item_id in raid_config.EXCLUDED_ITEMS or item_id in removed:
                 continue
             slot = found.setdefault(item_id, {"bosses": [], "trash": False})
             if label is None:
@@ -623,6 +635,7 @@ def collect_raid(edition: Edition, raid, warn: Warnings) -> list[dict]:
     # low-level world BoE references that no quality filter can catch.
     if raid.get("trash", True):
         floor = raid.get("trash_min_ilvl", 0)
+        ceiling = raid.get("trash_max_ilvl", 0)
         for entry in sorted(edition.spawns_by_map.get(map_id, set())):
             if entry in boss_creature_entries or entry not in edition.creatures:
                 continue
@@ -631,17 +644,32 @@ def collect_raid(edition: Edition, raid, warn: Warnings) -> list[dict]:
             if not loot_id:
                 continue
             item_ids = resolve_loot(edition, edition.creature_loot, loot_id)
-            if floor:
+            if floor or ceiling:
                 item_ids = {
                     i for i in item_ids
                     if (info := edition.items.get(i)) is not None
-                    and (info[4] or 0) >= floor
+                    and ((info[3], info[5]) == MOUNT_ITEM
+                         or ((info[4] or 0) >= floor
+                             and (not ceiling or (info[4] or 0) <= ceiling)))
                 }
             add_items(item_ids, None, TRASH_MIN_QUALITY)
 
+    # Curated additions: items the source DB verifiably drops in this raid
+    # but has no loot row for (see raids.py for the per-item evidence).
+    for label, ids in raid_config.CURATED_ADD.get(raid["id"], {}).items():
+        for item_id in ids:
+            if item_id not in edition.items:
+                warn.add(f"{raid['id']}: curated item {item_id} not in item_template")
+                continue
+            slot = found.setdefault(item_id, {"bosses": [], "trash": False})
+            if label == "Trash":
+                slot["trash"] = True
+            elif label not in slot["bosses"]:
+                slot["bosses"].append(label)
+
     out = []
     for item_id, slot in found.items():
-        name, quality, mask, _iclass, _ilvl = edition.items[item_id]
+        name, quality, mask, _iclass, _ilvl, _subclass = edition.items[item_id]
         if slot["bosses"]:
             boss_label = " / ".join(slot["bosses"])
         else:
@@ -793,7 +821,7 @@ def dump_loot(dump_path: str, edition_id: str, spec: str) -> None:
     for item_id in sorted(resolve_loot(edition, table, loot_id)):
         info = edition.items.get(item_id)
         if info:
-            name, quality, _mask, iclass, ilvl = info
+            name, quality, _mask, iclass, ilvl, _subclass = info
             print(f"{item_id}\t{name!r}\tq={quality}\tclass={iclass}\tilvl={ilvl}")
 
 
@@ -893,7 +921,7 @@ def main() -> int:
                 for r in rows:
                     if pick(cols, r, "entry", "Entry") == int(loot_id):
                         item = pick(cols, r, "item", "Item")
-                        info = edition.items.get(item, ("?", "?", None, "?", "?"))
+                        info = edition.items.get(item, ("?", "?", None, "?", "?", "?"))
                         print(
                             f"item={item}"
                             f"\tchance={pick(cols, r, 'ChanceOrQuestChance', 'Chance')}"
