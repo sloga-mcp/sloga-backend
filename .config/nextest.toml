@@ -1,2 +1,38 @@
+[test-groups]
+# The account-credential tests (change_email, change_password) argon2-hash
+# passwords in the route under test on top of the usual harness cost, and
+# adjacent scheduling starts all 8 at once. They were the suite's reliable
+# first casualties: every one passes in isolation (~9s) but together they
+# contended straight through the old 50s kill cap. Cap how many run
+# concurrently instead of letting them stampede.
+account-credential-heavy = { max-threads = 2 }
+
 [profile.default]
-slow-timeout = { period = "5s", terminate-after = 10 }
+# 120s kill cap (was 5s/10 = 50s). Under default parallelism this 8-core box
+# (which also runs the prod services) boots 8 rocket instances + 8 throwaway
+# Mongo databases at once, and a typical test then takes 40-50s wall — a
+# 2026-07-27 full run had 51/51 passes flagged slow with peaks at 49s, and
+# whichever tests landed worst in the scheduling crossed 50s and were killed
+# (load-dependent, so the victim set changed run to run). 120s keeps a genuine
+# hang detectable without killing load-dependent stragglers.
+slow-timeout = { period = "10s", terminate-after = 12 }
+
+[[profile.default.overrides]]
+filter = 'package(revolt-delta) & (test(routes::account::change_email) | test(routes::account::change_password))'
+test-group = 'account-credential-heavy'
+
+[[profile.default.overrides]]
+# Bulk "cap" tests: each mass-inserts rows to prove a numeric limit (import
+# scan cap, one-time-key cap, member cap, MLS caps), so their duration scales
+# with mongod latency and suite load. Observed 72-99s in the 2026-07-27 full
+# run with the import test crossing 120s. 300s keeps hangs detectable;
+# anything new that mass-inserts to a cap belongs in this list.
+filter = '''
+package(revolt-delta) & (
+    test(=routes::events::tests::import_paginates_and_truncates)
+  | test(=routes::e2ee::tests::one_time_key_cap_counts_upserts_correctly)
+  | test(=routes::servers::server_join::test::join_rejected_at_server_cap)
+  | test(=routes::mls::tests::publish_validates_binding_caps_and_immutability)
+)
+'''
+slow-timeout = { period = "15s", terminate-after = 20 }

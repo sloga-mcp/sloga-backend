@@ -1146,6 +1146,7 @@ async fn import_requires_viewable_in_server_channel() {
 /// this test rather than pass it.
 #[rocket::async_test]
 async fn import_paginates_and_truncates() {
+    use futures::StreamExt;
     use revolt_database::Message;
     use ulid::Ulid;
 
@@ -1168,13 +1169,28 @@ async fn import_paginates_and_truncates() {
         .expect("owner member");
     let channel_id = channels[0].id().to_string();
 
-    let insert = |content: String| {
+    // 2120 sequentially-awaited inserts made this test's wall time scale with
+    // per-op mongod latency: ~30s alone, >300s (killed) while the rest of the
+    // suite loads the box. Inserts here fan out 16-at-a-time instead — but the
+    // scan-order assertions below depend on ID order, and `Ulid::new()` only
+    // sorts correctly when sequential awaits space the timestamps (same-ms
+    // ULIDs order randomly). So every message gets an explicit ULID minted
+    // from a per-message millisecond: `seq` IS the order, independent of
+    // insert completion order.
+    let base_ms: u64 = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
+        - 3_600_000;
+    let mk_id = |seq: u64| Ulid::from_parts(base_ms + seq, seq as u128).to_string();
+
+    let insert = |id: String, content: String| {
         let db = harness.db.clone();
         let channel = channel_id.clone();
         let author = owner.id.clone();
         async move {
             db.insert_message(&Message {
-                id: Ulid::new().to_string(),
+                id,
                 channel,
                 author,
                 content: Some(content),
@@ -1184,17 +1200,32 @@ async fn import_paginates_and_truncates() {
             .expect("message");
         }
     };
+    let insert_batch = |batch: Vec<(String, String)>| async {
+        futures::stream::iter(batch.into_iter().map(|(id, content)| insert(id, content)))
+            .buffer_unordered(16)
+            .collect::<Vec<_>>()
+            .await;
+    };
 
     // 120 messages spanning two scan pages (page size 100, newest-first): a tagged
-    // message among the OLDEST (first inserted → only reachable via the second
-    // page / cursor advance) and one among the newest.
-    insert(r##"[ACUTEST_EVENT]:{"title":"Oldest","start":"2030-01-01T10:00:00.000Z"}"##.to_string())
-        .await;
-    for i in 0..118 {
-        insert(format!("filler {i}")).await;
-    }
-    insert(r##"[ACUTEST_EVENT]:{"title":"Newest","start":"2030-02-01T10:00:00.000Z"}"##.to_string())
-        .await;
+    // message with the OLDEST id (only reachable via the second page / cursor
+    // advance) and one with the newest.
+    insert(
+        mk_id(0),
+        r##"[ACUTEST_EVENT]:{"title":"Oldest","start":"2030-01-01T10:00:00.000Z"}"##.to_string(),
+    )
+    .await;
+    insert_batch(
+        (0..118)
+            .map(|i| (mk_id(1 + i), format!("filler {i}")))
+            .collect(),
+    )
+    .await;
+    insert(
+        mk_id(119),
+        r##"[ACUTEST_EVENT]:{"title":"Newest","start":"2030-02-01T10:00:00.000Z"}"##.to_string(),
+    )
+    .await;
 
     let result = harness
         .client
@@ -1213,10 +1244,15 @@ async fn import_paginates_and_truncates() {
 
     // Bury the history under more messages than the scan cap: the re-run stops at
     // the cap (newest-first), reports truncation, and never reaches the two
-    // already-imported tags at the oldest end.
-    for i in 0..2000 {
-        insert(format!("burying filler {i}")).await;
-    }
+    // already-imported tags at the oldest end. Every burying id sorts strictly
+    // after `mk_id(119)` — the 2000-message scan must cover exactly this batch
+    // and nothing older, or `skipped_duplicates` picks up the "Newest" tag.
+    insert_batch(
+        (0..2000)
+            .map(|i| (mk_id(120 + i), format!("burying filler {i}")))
+            .collect(),
+    )
+    .await;
     let result = harness
         .client
         .post(format!("/events/server/{}/import", server.id))
