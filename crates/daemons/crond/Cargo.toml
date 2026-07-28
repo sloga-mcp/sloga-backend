@@ -41,7 +41,14 @@ iso8601-timestamp = { workspace = true, features = ["serde", "bson"] }
 # side-effects — the "tasks" feature (push/ack/embed queues) and "mongodb"
 # are default features today, but are spelled out so a future
 # default-features change cannot silently degrade scheduled sends.
-revolt-database = { workspace = true, features = ["tasks", "mongodb"] }
+#
+# "voice" is required by `stream_live` and `prune_remote_control_grants`, both
+# of which import `revolt_database::voice`. It used to be absent and the crate
+# still built, because `cargo build --bin revolt-crond` from the workspace root
+# unifies features across the default members and delta turns "voice" on. That
+# made `cargo build -p revolt-crond` fail on its own with an unresolved import —
+# which is the form the house rule uses for service pre-builds.
+revolt-database = { workspace = true, features = ["tasks", "mongodb", "voice"] }
 revolt-result = { workspace = true }
 revolt-config = { workspace = true }
 revolt-files = { workspace = true }
