@@ -6,6 +6,13 @@
 # contended straight through the old 50s kill cap. Cap how many run
 # concurrently instead of letting them stampede.
 account-credential-heavy = { max-threads = 2 }
+# Same stampede shape, next generation: every remote-control route test
+# boots a full rocket + a server + a voice channel + THREE users via
+# server_call(), and adjacent scheduling starts all 8 at once. Measured
+# 2026-07-28: ~9s in isolation, 43s as a group of 8, 110-120s inside the
+# full suite — where accept_fails_closed_when_sfu_refuses crossed the
+# 120s kill cap. Cap the stampede instead of raising the global cap.
+remote-control-heavy = { max-threads = 2 }
 
 [profile.default]
 # 120s kill cap (was 5s/10 = 50s). Under default parallelism this 8-core box
@@ -20,6 +27,10 @@ slow-timeout = { period = "10s", terminate-after = 12 }
 [[profile.default.overrides]]
 filter = 'package(revolt-delta) & (test(routes::account::change_email) | test(routes::account::change_password))'
 test-group = 'account-credential-heavy'
+
+[[profile.default.overrides]]
+filter = 'package(revolt-delta) & test(routes::channels::remote_control::)'
+test-group = 'remote-control-heavy'
 
 [[profile.default.overrides]]
 # Bulk "cap" tests: each mass-inserts rows to prove a numeric limit (import
