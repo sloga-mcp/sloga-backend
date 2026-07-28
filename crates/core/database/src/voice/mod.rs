@@ -815,25 +815,34 @@ mod permission_tests {
     }
 
     #[test]
-    fn remote_control_grant_carries_full_set_and_flips_only_data() {
+    fn remote_control_permissions_flip_exactly_one_field() {
         use super::remote_control_participant_permissions;
 
+        // Media-E2EE plan §0.4 amendment, test 2 (subsumes slice 1's
+        // `remote_control_grant_carries_full_set_and_flips_only_data`).
         // UpdateParticipantOptions replaces the WHOLE ParticipantPermission
         // message: the grant path must differ from the sync path in exactly
-        // one field, or the controller goes mute/deaf on grant.
+        // one field, or the controller goes mute/deaf on grant. Full
+        // cross-product of can_listen x every subset of the publishable
+        // sources; the struct-update comparison covers every field,
+        // including ones ParticipantPermission grows later.
+        let all_sources = [
+            TrackSource::Microphone,
+            TrackSource::Camera,
+            TrackSource::ScreenShare,
+            TrackSource::ScreenShareAudio,
+        ];
         for can_listen in [false, true] {
-            for sources in [
-                &[][..],
-                &[TrackSource::Microphone][..],
-                &[
-                    TrackSource::Microphone,
-                    TrackSource::Camera,
-                    TrackSource::ScreenShare,
-                    TrackSource::ScreenShareAudio,
-                ][..],
-            ] {
-                let granted = remote_control_participant_permissions(can_listen, sources);
-                let baseline = voice_participant_permissions(can_listen, sources);
+            for mask in 0u8..1 << all_sources.len() {
+                let sources: Vec<TrackSource> = all_sources
+                    .iter()
+                    .enumerate()
+                    .filter(|(bit, _)| mask & 1 << bit != 0)
+                    .map(|(_, source)| *source)
+                    .collect();
+
+                let granted = remote_control_participant_permissions(can_listen, &sources);
+                let baseline = voice_participant_permissions(can_listen, &sources);
 
                 assert!(granted.can_publish_data);
                 assert_eq!(
@@ -842,7 +851,8 @@ mod permission_tests {
                         ..granted
                     },
                     baseline,
-                    "the grant may differ from the sync baseline ONLY in can_publish_data"
+                    "the grant may differ from the sync baseline ONLY in can_publish_data \
+                     (can_listen={can_listen}, sources={sources:?})"
                 );
             }
         }
@@ -913,6 +923,289 @@ mod permission_tests {
                     }
                 }
             }
+        }
+    }
+
+    // ---- source-contract tests (media-E2EE plan §0.4 amendment, 3 & 4) ----
+    //
+    // What bounds the data-publish surface is not a runtime property but the
+    // SHAPE of the code: how many call sites can mint the remote-control
+    // permission set, and what every other SFU permission push carries. The
+    // desktop shell's `assert_remote_control_injection_contract`
+    // (src-tauri/build.rs) is the house precedent for holding a shape like
+    // that in CI; these two tests do the same for the backend workspace.
+
+    /// The workspace `crates/` directory, resolved from this crate's
+    /// manifest so the scan works from any test runner cwd.
+    fn workspace_crates_dir() -> std::path::PathBuf {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .ancestors()
+            .nth(3)
+            .expect("workspace root above crates/core/database")
+            .join("crates");
+        // Fail loudly if the layout moves — a scan over nothing asserts
+        // nothing.
+        assert!(
+            dir.join("delta").is_dir(),
+            "{} does not look like the workspace crates directory",
+            dir.display()
+        );
+        dir
+    }
+
+    fn rust_sources(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        for entry in std::fs::read_dir(dir).expect("read workspace directory") {
+            let path = entry.expect("read workspace directory entry").path();
+            if path.is_dir() {
+                // target/ holds build products, never our sources
+                if path.file_name().is_some_and(|name| name == "target") {
+                    continue;
+                }
+                rust_sources(&path, out);
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                out.push(path);
+            }
+        }
+    }
+
+    /// Remove every `#[cfg(test)]`-gated item from `source` so the scans
+    /// below see only code that ships. Matching is TEXTUAL: the attribute,
+    /// then either a brace-matched body or a bodyless item ending in `;`
+    /// (trait method declarations). Test-module authors must therefore keep
+    /// braces BALANCED inside test-code strings and comments — no unpaired
+    /// brace characters, no format escape without its counterpart. Getting
+    /// that wrong cannot pass silently: both scans below assert their known
+    /// call sites are FOUND, so an over-strip that eats shipping code fails
+    /// the run.
+    fn strip_test_items(source: &str) -> String {
+        const ATTR: &str = "#[cfg(test)]";
+        let mut shipping = String::with_capacity(source.len());
+        let mut rest = source;
+        while let Some(attr) = rest.find(ATTR) {
+            shipping.push_str(&rest[..attr]);
+            let after = &rest[attr + ATTR.len()..];
+
+            let mut depth = 0i64;
+            let mut item_end = after.len(); // unterminated item runs to EOF
+            for (i, ch) in after.char_indices() {
+                match ch {
+                    ';' if depth == 0 => {
+                        item_end = i + 1;
+                        break;
+                    }
+                    '{' => depth += 1,
+                    '}' => {
+                        depth -= 1;
+                        assert!(depth >= 0, "unbalanced braces after {ATTR}");
+                        if depth == 0 {
+                            item_end = i + 1;
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            rest = &after[item_end..];
+        }
+        shipping.push_str(rest);
+        shipping
+    }
+
+    /// Every shipping Rust source in the workspace, as
+    /// (crates/-relative path, cfg(test)-stripped text).
+    fn shipping_sources() -> Vec<(String, String)> {
+        let crates_dir = workspace_crates_dir();
+        let mut files = Vec::new();
+        rust_sources(&crates_dir, &mut files);
+        assert!(
+            files.len() > 300,
+            "suspiciously small workspace scan ({} files) — asserting over nothing",
+            files.len()
+        );
+        files
+            .iter()
+            .map(|path| {
+                let text = std::fs::read_to_string(path)
+                    .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
+                let rel = path
+                    .strip_prefix(&crates_dir)
+                    .expect("scanned file outside crates/")
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                (rel, strip_test_items(&text))
+            })
+            .collect()
+    }
+
+    /// Byte offsets of call sites of `needle` (an identifier followed by
+    /// `(`) in stripped source — the definition line, `use` imports, and
+    /// comment lines are not callers.
+    fn call_sites(shipping: &str, needle: &str) -> Vec<usize> {
+        shipping
+            .match_indices(needle)
+            .map(|(at, _)| at)
+            .filter(|at| {
+                let line_start = shipping[..*at].rfind('\n').map_or(0, |nl| nl + 1);
+                let before_match = &shipping[line_start..*at];
+                let trimmed = before_match.trim_start();
+                // ends_with, not contains: only the definition itself is
+                // exempt, never a call that happens to share a line with
+                // `fn `
+                !before_match.ends_with("fn ")
+                    && !trimmed.starts_with("//")
+                    && !trimmed.starts_with("use ")
+            })
+            .collect()
+    }
+
+    #[test]
+    fn remote_control_permissions_have_exactly_one_caller() {
+        // §0.4 amendment test 3 — the one that preserves the ORIGINAL
+        // invariant's meaning. `permission_sync_never_regrants_data_publishing`
+        // stood for "no participant in any room holds can_publish_data";
+        // `remote_control_participant_permissions` reopens that per grant,
+        // so the property is now carried by CARDINALITY: exactly one
+        // non-test call site in the workspace may mint the RC set, and it
+        // is `control_respond`, behind an accepted offer. The SFU grant is
+        // per-IDENTITY with no per-topic scoping — a granted controller can
+        // publish on ANY data topic, including "captions" — so this single
+        // call site is what bounds that surface.
+        const NEEDLE: &str = "remote_control_participant_permissions(";
+        const CALLER_FILE: &str = "delta/src/routes/channels/remote_control.rs";
+
+        let sources = shipping_sources();
+        let callers: Vec<(&str, usize)> = sources
+            .iter()
+            .flat_map(|(rel, shipping)| {
+                call_sites(shipping, NEEDLE)
+                    .into_iter()
+                    .map(move |at| (rel.as_str(), at))
+            })
+            .collect();
+
+        assert_eq!(
+            callers.iter().map(|(rel, _)| *rel).collect::<Vec<_>>(),
+            vec![CALLER_FILE],
+            "remote_control_participant_permissions must have exactly ONE \
+             non-test caller in the workspace (control_respond, behind an \
+             accepted offer). A second caller is a second code path that \
+             grants data publishing — re-read media-E2EE plan §0.4 before \
+             adding one"
+        );
+
+        // ... and that one caller sits inside control_respond's body.
+        let (_, at) = callers[0];
+        let shipping = &sources
+            .iter()
+            .find(|(rel, _)| rel == CALLER_FILE)
+            .expect("the caller file was just found above")
+            .1;
+        let fn_start = shipping
+            .find("fn control_respond")
+            .expect("control_respond left the file — move this contract with it");
+        let fn_end = fn_start
+            + shipping[fn_start..]
+                .find("\npub async fn ")
+                .unwrap_or(shipping.len() - fn_start);
+        assert!(
+            (fn_start..fn_end).contains(&at),
+            "the single remote_control_participant_permissions call site \
+             moved out of control_respond — only an ACCEPTED offer may mint \
+             the RC permission set"
+        );
+    }
+
+    #[test]
+    fn remote_control_teardown_restores_the_sync_permission_set() {
+        // §0.4 amendment test 4: every SFU permission push in the
+        // workspace carries the sync set (voice_participant_permissions) —
+        // the grant in control_respond is the ONE sanctioned exception
+        // (previous test). In particular every teardown path RESTORES the
+        // sync set: pushing the RC variant on teardown would re-grant data
+        // publishing at the exact moment the code believes it revoked it.
+        const PUSHES: [&str; 2] = [".update_permissions(", ".update_permissions_identity("];
+        const SYNC: &str = "voice_participant_permissions(";
+        const GRANT: &str = "remote_control_participant_permissions(";
+        // The typed transport: its `new_permissions` parameter is
+        // caller-supplied, so it is the one file exempt from the
+        // constructor-inline rule below.
+        const TRANSPORT_FILE: &str = "core/database/src/voice/voice_client.rs";
+        const GRANT_FILE: &str = "delta/src/routes/channels/remote_control.rs";
+
+        let mut sync_pushes: Vec<&str> = Vec::new();
+        let mut grant_pushes: Vec<&str> = Vec::new();
+        let mut saw_transport = false;
+
+        let sources = shipping_sources();
+        for (rel, shipping) in &sources {
+            if rel == TRANSPORT_FILE {
+                saw_transport = true;
+                continue;
+            }
+            for needle in PUSHES {
+                for (at, _) in shipping.match_indices(needle) {
+                    // The permission argument lives inside this call's
+                    // parentheses; classify by which constructor appears
+                    // there. Same textual-matching discipline as
+                    // strip_test_items.
+                    let open = at + needle.len() - 1;
+                    let mut depth = 0i64;
+                    let mut close = None;
+                    for (i, ch) in shipping[open..].char_indices() {
+                        match ch {
+                            '(' => depth += 1,
+                            ')' => {
+                                depth -= 1;
+                                if depth == 0 {
+                                    close = Some(open + i);
+                                    break;
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    let args = &shipping
+                        [open..close.expect("unbalanced parens in a permission push")];
+
+                    match (args.contains(SYNC), args.contains(GRANT)) {
+                        (true, false) => sync_pushes.push(rel.as_str()),
+                        (false, true) => grant_pushes.push(rel.as_str()),
+                        _ => panic!(
+                            "unclassifiable SFU permission push in {rel} — pass \
+                             voice_participant_permissions or (in control_respond \
+                             only) remote_control_participant_permissions INLINE \
+                             so this contract can see it"
+                        ),
+                    }
+                }
+            }
+        }
+
+        assert!(
+            saw_transport,
+            "{TRANSPORT_FILE} moved — update this contract's exclusion"
+        );
+        assert_eq!(
+            grant_pushes,
+            vec![GRANT_FILE],
+            "exactly one SFU push may carry the RC permission set: the \
+             accept in control_respond"
+        );
+        // The known restore paths must all be present and classified as
+        // sync. This doubles as the loud-failure guard on strip_test_items:
+        // the sync push in voice/mod.rs sits AFTER this very test module,
+        // so an over-strip would make it vanish from the scan and fail
+        // here.
+        for expected in [
+            "core/database/src/voice/mod.rs",            // permission-sync push
+            "core/database/src/voice/remote_control.rs", // active revoke leg of teardown
+            GRANT_FILE, // raced-teardown undo in control_respond
+        ] {
+            assert!(
+                sync_pushes.contains(&expected),
+                "expected a voice_participant_permissions push in {expected} — \
+                 if the restore path moved, move this inventory with it"
+            );
         }
     }
 }

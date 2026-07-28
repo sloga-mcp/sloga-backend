@@ -152,6 +152,73 @@ conflicting text elsewhere in this doc; each is folded into its home section:
   machinery may ever consume LiveKit data-channel input (`DataReceived` and friends) — the data
   channel is treated as an untrusted injection surface. Encrypting the data channel
   (`dcEncryptionEnabled` exists in 2.15.13) stays Deferred with this risk documented.
+- **AMENDMENT (2026-07-28, remote-control plan §2 rev 9) — one narrow, named carve-out to the
+  client no-consume rule above, plus the cardinality of the `can_publish_data` regrant.**
+  The rule as written is "no E2EE or call-state machinery may ever consume LiveKit data-channel
+  input". Remote control is call-state machinery doing exactly that, so it needs saying out loud
+  rather than being quietly excepted:
+  - **What may be consumed:** opaque **sealed bytes on topic `"rc"`**, and nothing else. The
+    design commitment that MLS/DS key distribution never rides the data channel is
+    **unchanged** — remote control carries no key material on this path; its key agreement runs
+    over the REST/`EventV1` control routes.
+  - **JS parses nothing.** The renderer may read `topic` and `participant.identity` **from the
+    server-attested LiveKit event object** — that is a *filter*, not a state mutation, and
+    `liveCaptions.ts:83-95` is the precedent for taking identity from the participant object
+    rather than the payload — and then forwards the payload bytes to native unexamined. It may
+    not read a single byte of the payload, **including the header**: not the version, not the
+    direction, not `rc_session_id`. Everything a receiver reads before authenticating is covered
+    by the AEAD's AAD, and reading it in JS would put an unauthenticated parser in front of the
+    one that is authenticated.
+  - **Unauthenticated bytes may not mutate any client state.** A packet that fails to open is
+    dropped silently, with no user-visible and no metric effect — a counter a hostile SFU can
+    drive is an oracle. The only permitted defence against a flood is a bounded, silent drop
+    queue in native. Note the consequence, which is deliberate: because that bound is checked
+    before the session lookup, a saturating flood also drops legitimate packets, producing a
+    reliable-stream gap and a LOUD teardown. That is fail-closed and correct — a hostile SFU can
+    drop packets anyway — and it must not be "fixed" by making gaps quiet.
+  - **🔴 CARDINALITY of the regrant, stated explicitly because it is the real dependency.**
+    `voice_participant_permissions` hardcodes `can_publish_data: false` and this section leans on
+    that. Remote control reopens it for one identity per grant, and with one grant per sharer
+    permitted (remote-control plan §0.7) that is **up to ~30 granted identities in a 30-person
+    room**. `ParticipantPermission` has **no per-topic scoping**, so each of those identities may
+    publish on **any** topic — including `"captions"`, which `liveCaptions.ts:83-95` ingests with
+    the topic string as its only gate — and to any `destinationIdentities`. So the flood surface
+    is reachable by an ordinary **co-participant holding a grant**, not only by the SFU.
+  - **The compensating control is ACTIVE revocation only.** Do not describe the voice-ingress
+    data kick as a backstop anywhere: it fires on `track_published` with `TrackType::Data`, and
+    datagrams publish no track (already recorded above, and independently measured 2026-07-27 —
+    0 of 100 packets delivered on a default token, with `publishData()` resolving cleanly). What
+    bounds the surface is that a grant exists only while the sharer is heartbeating an
+    **authenticated** native session, and that every teardown path either pushes
+    `voice_participant_permissions` (data false) or ejects the participant.
+  - **The invariant test is RE-EXPRESSED, not weakened — and it is currently weakened by
+    omission.** `permission_sync_never_regrants_data_publishing` (`voice/mod.rs`) still asserts
+    `voice_participant_permissions(..).can_publish_data == false` and still passes — **because
+    remote control added a second function, `remote_control_participant_permissions`, that the
+    test cannot see.** The property it stood for ("no participant in any room holds
+    `can_publish_data`") is therefore untested today. Four tests replace the one:
+    1. **Keep `permission_sync_never_regrants_data_publishing` verbatim.** Rename nothing. It
+       still means "the sync path never grants".
+    2. **`remote_control_permissions_flip_exactly_one_field`** — over the full cross-product of
+       `can_listen` × `allowed_sources`, the RC variant must equal `voice_participant_permissions`
+       field for field **except** `can_publish_data == true`. Catches the `..Default::default()`
+       mute-and-deafen regression and any future field drift.
+    3. **`remote_control_permissions_have_exactly_one_caller`** — a source-level assertion (the
+       desktop shell's `build.rs` is the precedent for this style) that
+       `remote_control_participant_permissions` has exactly one non-test caller in the workspace,
+       in `control_respond`. **This is the test that actually preserves the original invariant's
+       meaning:** no code path other than an accepted control grant can grant data publishing.
+    4. **`remote_control_teardown_restores_the_sync_permission_set`** — every teardown path calls
+       `update_permissions` with `voice_participant_permissions`, never with the RC variant.
+
+    **Status: all four tests are in CI as of 2026-07-28** (`voice/mod.rs`, `permission_tests`).
+    Test 2 subsumed slice 1's `remote_control_grant_carries_full_set_and_flips_only_data`
+    (renamed to the name above, widened to the full source cross-product). Tests 3 and 4 are
+    source-level scans over the workspace in the desktop `build.rs` style; each of their
+    assertions was negative-tested (probe caller / probe RC push / variable-arg push /
+    caller moved out of `control_respond` all fail the run). Scan discipline the scans
+    impose: permission pushes pass their constructor INLINE, and test-code strings/comments
+    keep braces balanced (the cfg(test) stripper matches braces textually).
 - Federation/multi-node MLS DS coordination beyond what the single logical DB already provides.
 - Restoring any call state from key backup (calls are ephemeral; §5.5).
 
