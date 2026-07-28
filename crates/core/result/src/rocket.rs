@@ -117,6 +117,8 @@ impl<'r> Responder<'r, 'static> for Error {
             ErrorType::AlreadyConnected => Status::BadRequest,
             ErrorType::NotConnected => Status::BadRequest,
             ErrorType::UnknownNode => Status::BadRequest,
+            ErrorType::RemoteControlOfferPending => Status::Conflict,
+            ErrorType::RemoteControlGrantActive => Status::Conflict,
             ErrorType::FeatureDisabled { .. } => Status::BadRequest,
 
             ErrorType::ProxyError => Status::BadRequest,

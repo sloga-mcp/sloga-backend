@@ -53,6 +53,39 @@ impl<'a> RatelimitResolver<Request<'a>> for DeltaRatelimits {
                         return ("poll_vote", Some(id));
                     }
 
+                    // Remote control needs TWO buckets, and this arm must
+                    // sit ABOVE the POST-only block below: all four routes
+                    // collapse onto extra == Some("control"), and PUT
+                    // …/control/offers/<id>/respond and DELETE
+                    // …/control/<grant_id> never reach that block, so they
+                    // would otherwise fall through to the plain channels
+                    // bucket. The heartbeat is sharer-driven at a
+                    // single-digit-second cadence — sharing one tight
+                    // bucket with `offer` would starve it and expire live
+                    // grants mid-control.
+                    if extra == Some("control") {
+                        // The sharer's consent heartbeat, and the DELETE
+                        // release, share the GENEROUS bucket. The release
+                        // is a teardown — being ratelimited out of ending
+                        // a control session is strictly worse than being
+                        // ratelimited out of starting one — and a caller
+                        // who has just spent the tight bucket on offers is
+                        // exactly the caller most likely to need it.
+                        if matches!(request.method(), Method::Delete)
+                            || (request.method() == Method::Post
+                                && request.routed_segment(if versioned { 4 } else { 3 })
+                                    == Some("heartbeat"))
+                        {
+                            return ("remote_control_heartbeat", Some(id));
+                        }
+
+                        // POST …/control/offer and PUT …/respond: deliberate,
+                        // user-paced actions, held to the tight bucket.
+                        if matches!(request.method(), Method::Post | Method::Put) {
+                            return ("remote_control_offer", Some(id));
+                        }
+                    }
+
                     // Reserve set/retract (PUT+DELETE …/softres/<id>/reserve)
                     // gets its own bucket to bound reserve-flip WS fan-out.
                     // The trailing literal segment MUST be checked: a bare
@@ -255,6 +288,14 @@ impl<'a> RatelimitResolver<Request<'a>> for DeltaRatelimits {
             "softres_reserve" => 10,
             "message_schedule" => 10,
             "soundboard" => 4,
+            // Offer + respond are deliberate, user-paced actions.
+            "remote_control_offer" => 2,
+            // Heartbeat + release. The heartbeat is SHARER-driven consent
+            // re-assertion on a single-digit-second TTL and the bucket
+            // window is 10s, so this must comfortably exceed the send rate
+            // or grants would expire mid-control on a ratelimit rather
+            // than on lost consent.
+            "remote_control_heartbeat" => 30,
             "follow" => 2,
             "discover" => 20,
             "interaction_respond" => 30,

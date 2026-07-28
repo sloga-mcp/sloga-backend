@@ -64,14 +64,14 @@ pub async fn delete(
             let user_voice_channel = UserVoiceChannel::from_channel(&channel);
 
             if is_in_voice_channel(&user.id, &user_voice_channel).await? {
-                remove_user_from_voice_channel(voice_client, &user_voice_channel, &user.id).await?;
+                remove_user_from_voice_channel(db, voice_client, &user_voice_channel, &user.id).await?;
             };
         }
         Channel::TextChannel { .. } => {
             permissions.throw_if_lacking_channel_permission(ChannelPermission::ManageChannel)?;
             channel.delete(db).await?;
 
-            delete_voice_channel(voice_client, &UserVoiceChannel::from_channel(&channel)).await?;
+            delete_voice_channel(db, voice_client, &UserVoiceChannel::from_channel(&channel)).await?;
         }
         Channel::Forum { .. } => {
             permissions.throw_if_lacking_channel_permission(ChannelPermission::ManageChannel)?;

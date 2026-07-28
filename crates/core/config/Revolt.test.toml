@@ -15,6 +15,7 @@ webhooks_enabled = true
 e2ee_enabled = true
 media_e2ee_enabled = true
 events_enabled = true
+remote_control = true
 
 [api.smtp]
 host = "localhost"

@@ -115,6 +115,8 @@ impl IntoResponse for Error {
             ErrorType::NotInVoiceChannel => StatusCode::BAD_REQUEST,
             ErrorType::AlreadyConnected => StatusCode::BAD_REQUEST,
             ErrorType::UnknownNode => StatusCode::BAD_REQUEST,
+            ErrorType::RemoteControlOfferPending => StatusCode::CONFLICT,
+            ErrorType::RemoteControlGrantActive => StatusCode::CONFLICT,
             ErrorType::InvalidFlagValue => StatusCode::BAD_REQUEST,
             ErrorType::FeatureDisabled { .. } => StatusCode::BAD_REQUEST,
 

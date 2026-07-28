@@ -26,7 +26,7 @@ struct MigrationInfo {
     revision: i32,
 }
 
-pub const LATEST_REVISION: i32 = 67; // MUST BE +1 to last migration
+pub const LATEST_REVISION: i32 = 68; // MUST BE +1 to last migration
 
 pub async fn migrate_database(db: &MongoDb) {
     let migrations = db.col::<Document>("migrations");
@@ -2301,6 +2301,40 @@ pub async fn run_migrations(db: &MongoDb, revision: i32) -> i32 {
             })
             .await
             .expect("Failed to create softres_reserves indexes.");
+    }
+
+    if revision <= 67 {
+        info!("Running migration [revision 67 / 27-07-2026]: Create remote_control_audit collection (remote-control grant lifecycle audit)");
+
+        // Same idempotency contract as prior collection migrations;
+        // mirrors init.rs — keep the index specs identical there.
+        db.db().create_collection("remote_control_audit").await.ok();
+
+        db.db()
+            .run_command(doc! {
+                "createIndexes": "remote_control_audit",
+                "indexes": [
+                    // Serves per-channel audit review.
+                    {
+                        "key": {
+                            "channel_id": 1_i32,
+                            "created_at": 1_i32
+                        },
+                        "name": "channel_created"
+                    },
+                    // Serves the abuse lookup — rows pivoted on the account
+                    // that was (or would have been) given control.
+                    {
+                        "key": {
+                            "controller_id": 1_i32,
+                            "created_at": 1_i32
+                        },
+                        "name": "controller"
+                    }
+                ]
+            })
+            .await
+            .expect("Failed to create remote_control_audit indexes.");
     }
 
     // Reminder to update LATEST_REVISION when adding new migrations.

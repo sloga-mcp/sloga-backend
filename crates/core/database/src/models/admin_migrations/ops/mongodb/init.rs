@@ -178,6 +178,10 @@ pub async fn create_database(db: &MongoDb) {
         .await
         .expect("Failed to create softres_reserves collection.");
 
+    db.create_collection("remote_control_audit")
+        .await
+        .expect("Failed to create remote_control_audit collection.");
+
     db.create_collection("scheduled_messages")
         .await
         .expect("Failed to create scheduled_messages collection.");
@@ -1043,6 +1047,32 @@ pub async fn create_database(db: &MongoDb) {
     })
     .await
     .expect("Failed to create mls_join_intents index.");
+
+    db.run_command(doc! {
+        "createIndexes": "remote_control_audit",
+        "indexes": [
+            // Serves per-channel audit review, newest first (the _id ULID
+            // is chronological but created_at is the documented axis).
+            {
+                "key": {
+                    "channel_id": 1_i32,
+                    "created_at": 1_i32
+                },
+                "name": "channel_created"
+            },
+            // Serves the abuse lookup — rows pivoted on the account that
+            // was (or would have been) given control.
+            {
+                "key": {
+                    "controller_id": 1_i32,
+                    "created_at": 1_i32
+                },
+                "name": "controller"
+            }
+        ]
+    })
+    .await
+    .expect("Failed to create remote_control_audit index.");
 
     info!("Created database.");
 }

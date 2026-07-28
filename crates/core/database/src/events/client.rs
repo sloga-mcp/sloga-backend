@@ -461,6 +461,72 @@ pub enum EventV1 {
         to: String,
         token: String,
     },
+
+    /// Remote control (remote-control plan §1): a sharer offered control of
+    /// their machine to a named participant. Addressed PRIVATELY to the
+    /// target only — the channel topic's authorization boundary is
+    /// ViewChannel, not call membership, so offers must never fan out there.
+    /// Carries the sharer's ephemeral public key and control-session id as
+    /// opaque base64 (slice-3 key agreement; the server never interprets
+    /// them). NOTE `EventV1::private` reaches every session of the target,
+    /// including off-call devices — the accept route is what enforces that
+    /// the responding party is the live participant.
+    RemoteControlOffered {
+        channel_id: String,
+        offer_id: String,
+        sharer_id: String,
+        target_id: String,
+        sharer_ephemeral_pub: String,
+        rc_session_id: String,
+    },
+
+    /// Remote control: the target declined an offer. Addressed PRIVATELY to
+    /// the sharer only (a public decline would be a shaming vector).
+    RemoteControlDeclined {
+        channel_id: String,
+        offer_id: String,
+        sharer_id: String,
+        target_id: String,
+    },
+
+    /// Remote control: the target accepted and the SFU grant is live.
+    /// Addressed PRIVATELY to the SHARER only — this is the return path of
+    /// the key exchange (the controller's ephemeral public key rides here;
+    /// without it the sharer can never derive the session key, plan §1
+    /// rev 8). The sharer's native layer matches it against the
+    /// `rc_session_id` it minted. NEVER put this on the channel topic.
+    RemoteControlAccepted {
+        channel_id: String,
+        offer_id: String,
+        grant_id: String,
+        sharer_id: String,
+        controller_id: String,
+        controller_ephemeral_pub: String,
+    },
+
+    /// Remote control: REDACTED channel-topic visibility event — third
+    /// parties in the channel see that a control session is active and
+    /// between whom (§8 third-party visibility), and nothing else: no grant
+    /// id, no key material, no actionable fields. Emitted once per grant
+    /// (at accept), so it needs no further coalescing. Keyed per grant by
+    /// (channel_id, sharer_id) — at most one active grant per sharer per
+    /// channel — which is what `RemoteControlEnded` clears.
+    RemoteControlActive {
+        channel_id: String,
+        sharer_id: String,
+        controller_id: String,
+    },
+
+    /// Remote control: a grant ended. Channel topic, keyed like
+    /// `RemoteControlActive` so clients clear the active indicator by
+    /// (channel_id, sharer_id). `reason` is one of: "released",
+    /// "revoked_by_moderator", "expired", "permissions_changed",
+    /// "participant_left", "call_ended", "reconnected", "disabled".
+    RemoteControlEnded {
+        channel_id: String,
+        sharer_id: String,
+        reason: String,
+    },
     /// User's active slowmodes
     UserSlowmodes {
         slowmodes: Vec<ChannelSlowmode>,

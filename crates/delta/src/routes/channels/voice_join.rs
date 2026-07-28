@@ -115,6 +115,26 @@ pub async fn call(
         // should only ever loop once but just to cover our backs.
 
         for previous_channel in get_user_voice_channels(&user.id).await? {
+            // Reconnect ends any remote-control grant (plan §1): this path
+            // removes the participant and the fresh token below is minted
+            // with `can_publish_data: false`, so a controller's capability
+            // silently dies here while Redis would keep reading "active".
+            // Terminate explicitly — and never "helpfully" re-grant on
+            // rejoin.
+            revolt_database::voice::remote_control::release_remote_control_for_user(
+                db,
+                voice_client,
+                &previous_channel,
+                &user.id,
+                "reconnected",
+                // The old participant is still connected here — the
+                // removal below is explicitly best-effort ("if this errors
+                // its just a mismatching state - ignore"), so the
+                // capability must be revoked rather than assumed gone.
+                false,
+            )
+            .await;
+
             if let Some(node) = get_channel_node(&previous_channel.id).await? {
                 // if this errors its just a mismatching state - ignore and proceed to still delete our state
                 let _ = voice_client

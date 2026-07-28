@@ -25,7 +25,7 @@ pub async fn delete_bot(
 
     bot.delete(db).await?;
 
-    remove_user_from_voice_channels(voice_client, &bot.id).await?;
+    remove_user_from_voice_channels(db, voice_client, &bot.id).await?;
 
     Ok(EmptyResponse)
 }

@@ -208,6 +208,22 @@ pub async fn ingress(
                 server_id: server_id.clone(),
             };
 
+            // Remote-control release hook (plan §1). This is the ONE path
+            // that may skip the controller-side revoke: the SFU has told
+            // us the participant is already gone, so their capability went
+            // with it and a revoke would be a guaranteed-failing round
+            // trip. As SHARER their controller is still connected, and
+            // that leg always revokes regardless.
+            revolt_database::voice::remote_control::release_remote_control_for_user(
+                db,
+                voice_client,
+                &channel,
+                user_id,
+                "participant_left",
+                true,
+            )
+            .await;
+
             delete_voice_state(&channel, user_id).await?;
             delete_voice_participant_identity(channel_id, user_id).await?;
 
@@ -335,6 +351,20 @@ pub async fn ingress(
                 if disconnect {
                     log::debug!("Removing user {user_id} from channel {channel_id} {event:?} due to forbidden track.");
 
+                    // This removal is ingress-initiated and best-effort
+                    // (its error is discarded just below), so the
+                    // capability is actively revoked rather than assumed
+                    // moot.
+                    revolt_database::voice::remote_control::release_remote_control_for_user(
+                        db,
+                        voice_client,
+                        &channel,
+                        user_id,
+                        "participant_left",
+                        false,
+                    )
+                    .await;
+
                     let _ = voice_client.remove_user(node, user_id, channel_id).await;
                     delete_voice_state(&channel, user_id).await?;
 
@@ -371,6 +401,25 @@ pub async fn ingress(
             )
             .await?;
 
+            // Remote control: the sharer's screen VIDEO track just ended
+            // (source 3 only — a screen-AUDIO event never touches this
+            // flag). Control over a screen the controller can no longer
+            // see is worse than no control, so end the grant here rather
+            // than waiting for the sharer's heartbeat to notice. This is
+            // the server-authoritative signal; the heartbeat re-check is
+            // the backstop for a sharer who simply stops heartbeating.
+            if partial.screen_video == Some(false) {
+                revolt_database::voice::remote_control::release_remote_control_for_user(
+                    db,
+                    voice_client,
+                    &channel,
+                    user_id,
+                    "screenshare_ended",
+                    false,
+                )
+                .await;
+            }
+
             EventV1::UserVoiceStateUpdate {
                 id: user_id.clone(),
                 channel_id: channel_id.clone(),
@@ -386,6 +435,22 @@ pub async fn ingress(
                 id: channel_id.clone(),
                 server_id: server_id.clone(),
             };
+
+            // Remote-control release hook: the room is gone, so no SFU
+            // capability survives — end every grant in the channel (records
+            // + events). This is also the backstop against grants leaked by
+            // missed participant_left webhooks.
+            revolt_database::voice::remote_control::release_remote_control_for_channel(
+                db,
+                voice_client,
+                channel_id,
+                "call_ended",
+                // The SFU has told us the room is finished: every
+                // capability in it is already gone, so records and events
+                // only. This is the only caller that may skip the revoke.
+                false,
+            )
+            .await;
 
             delete_channel_voice_state(&channel, &[]).await?;
             clear_voice_participant_identities(channel_id).await?;

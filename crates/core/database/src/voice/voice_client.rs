@@ -141,21 +141,55 @@ impl VoiceClient {
         channel_id: &str,
         new_permissions: ParticipantPermission,
     ) -> Result<ParticipantInfo> {
-        let room = self.get_node(node)?;
-
         // LiveKit addresses participants by identity, which may be
         // device-qualified — resolve through the ingress-maintained mapping
         let identity = super::get_voice_participant_identity(channel_id, &user.id).await?;
 
+        self.update_permissions_identity(node, &identity, channel_id, new_permissions)
+            .await
+    }
+
+    /// Update a participant addressed by an EXACT SFU identity the caller
+    /// already holds. The remote-control revoke path uses this with the
+    /// identity captured at accept time: re-resolving through
+    /// `get_voice_participant_identity` at revoke time could fall back to
+    /// the bare user id (its documented failure mode is a silent no-op for
+    /// device-qualified participants), and a revoke that silently no-ops is
+    /// exactly what the plan forbids.
+    pub async fn update_permissions_identity(
+        &self,
+        node: &str,
+        identity: &str,
+        channel_id: &str,
+        new_permissions: ParticipantPermission,
+    ) -> Result<ParticipantInfo> {
+        let room = self.get_node(node)?;
+
         room.client
             .update_participant(
                 channel_id,
-                &identity,
+                identity,
                 UpdateParticipantOptions {
                     permission: Some(new_permissions),
                     ..Default::default()
                 },
             )
+            .await
+            .to_internal_error()
+    }
+
+    /// Remove a participant addressed by an EXACT SFU identity (the
+    /// remote-control eject-on-revoke-failure escalation)
+    pub async fn remove_identity(
+        &self,
+        node: &str,
+        identity: &str,
+        channel_id: &str,
+    ) -> Result<()> {
+        let room = self.get_node(node)?;
+
+        room.client
+            .remove_participant(channel_id, identity)
             .await
             .to_internal_error()
     }

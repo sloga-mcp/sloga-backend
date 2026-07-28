@@ -34,6 +34,7 @@ mod message_search;
 mod message_send;
 mod message_unpin;
 mod message_unreact;
+mod remote_control;
 mod permissions_set;
 mod permissions_set_default;
 mod poll_create;
@@ -89,6 +90,10 @@ pub fn routes() -> (Vec<Route>, OpenApi) {
         voice_join::call,
         voice_stop_ring::stop_ring,
         soundboard_trigger::trigger_sound,
+        remote_control::control_offer,
+        remote_control::control_respond,
+        remote_control::control_release,
+        remote_control::control_heartbeat,
         permissions_set::set_role_permissions,
         permissions_set_default::set_default_channel_permissions,
         message_react::react_message,

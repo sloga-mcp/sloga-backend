@@ -12,6 +12,7 @@ pub mod prune_expired_boosts;
 pub mod prune_interactions;
 pub mod prune_members;
 pub mod prune_mfa_tickets;
+pub mod prune_remote_control_grants;
 pub mod prune_mls_groups;
 pub mod prune_mls_key_packages;
 pub mod prune_upload_sessions;

@@ -750,6 +750,16 @@ pub struct Features {
     #[serde(default)]
     pub events_enabled: bool,
 
+    /// Operator flag for remote desktop control during screen share
+    /// (remote-control plan §1). Ships dark: defaults false. NOT a kill
+    /// switch — `config()` is cached per process, so flipping it false
+    /// makes the routes refuse (`FeatureDisabled`, 400) on restart but
+    /// revokes nothing by itself; the crond reaper
+    /// (`prune_remote_control_grants`) additionally mass-revokes every
+    /// live grant when it observes the flag off.
+    #[serde(default)]
+    pub remote_control: bool,
+
     /// Optional server id that every newly-onboarded user is automatically
     /// added to (a "Welcome" / landing-spot server). Empty/unset disables the
     /// behaviour. Existing users are unaffected (backfill separately).

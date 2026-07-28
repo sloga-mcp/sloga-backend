@@ -18,6 +18,7 @@ use revolt_models::v0::{self, PartialUserVoiceState, UserVoiceState};
 use revolt_permissions::{calculate_channel_permissions, ChannelPermission, PermissionValue};
 use revolt_result::{create_error, Result, ToRevoltError};
 
+pub mod remote_control;
 mod voice_client;
 pub use voice_client::VoiceClient;
 
@@ -751,6 +752,29 @@ pub fn voice_participant_permissions(
     }
 }
 
+/// The ONE sanctioned exception to the rule above: the permission set a
+/// remote-control grant pushes for the CONTROLLER identity (remote-control
+/// plan §0.3(A)) — the full recomputed set with only `can_publish_data`
+/// flipped. `UpdateParticipantOptions` replaces the entire
+/// `ParticipantPermission` message, so building this from
+/// `..Default::default()` instead would mute and deafen the controller the
+/// instant they are granted control.
+///
+/// Scope caveat (plan §0.3/H-2): the SFU grant is per-IDENTITY, not
+/// per-topic — the granted participant can publish on ANY data topic,
+/// including "captions". That is why the offer route hard-rejects
+/// `target == caller` (a self-offer would be a self-service grant) and why
+/// every teardown path must actively revoke.
+pub fn remote_control_participant_permissions(
+    can_listen: bool,
+    allowed_sources: &[TrackSource],
+) -> ParticipantPermission {
+    ParticipantPermission {
+        can_publish_data: true,
+        ..voice_participant_permissions(can_listen, allowed_sources)
+    }
+}
+
 #[cfg(test)]
 mod permission_tests {
     use livekit_protocol::TrackSource;
@@ -788,6 +812,40 @@ mod permission_tests {
             user_id_from_participant_identity(&format!("{user}:{device}")),
             user
         );
+    }
+
+    #[test]
+    fn remote_control_grant_carries_full_set_and_flips_only_data() {
+        use super::remote_control_participant_permissions;
+
+        // UpdateParticipantOptions replaces the WHOLE ParticipantPermission
+        // message: the grant path must differ from the sync path in exactly
+        // one field, or the controller goes mute/deaf on grant.
+        for can_listen in [false, true] {
+            for sources in [
+                &[][..],
+                &[TrackSource::Microphone][..],
+                &[
+                    TrackSource::Microphone,
+                    TrackSource::Camera,
+                    TrackSource::ScreenShare,
+                    TrackSource::ScreenShareAudio,
+                ][..],
+            ] {
+                let granted = remote_control_participant_permissions(can_listen, sources);
+                let baseline = voice_participant_permissions(can_listen, sources);
+
+                assert!(granted.can_publish_data);
+                assert_eq!(
+                    livekit_protocol::ParticipantPermission {
+                        can_publish_data: false,
+                        ..granted
+                    },
+                    baseline,
+                    "the grant may differ from the sync baseline ONLY in can_publish_data"
+                );
+            }
+        }
     }
 
     #[test]
@@ -931,6 +989,26 @@ pub async fn sync_user_voice_permissions(
             )
             .await?;
 
+        // Remote-control sync-teardown hook (plan §1): the push above sends
+        // `can_publish_data: false` unconditionally, so if this user is the
+        // CONTROLLER of an active grant their SFU capability was just
+        // killed — and if they are the SHARER, their eligibility may have
+        // changed. Either way Redis must not keep reading "active" while
+        // the capability is gone or suspect (the sharer's indicator would
+        // lie about who has access to their machine): tear the grant down
+        // and tell the channel. Server-asserted state may only ever REVOKE
+        // a session, never sustain one, so tearing down on every
+        // permission-affecting sync is the safe direction by design.
+        remote_control::release_remote_control_for_user(
+            db,
+            voice_client,
+            &user_voice_channel,
+            &user.id,
+            "permissions_changed",
+            false,
+        )
+        .await;
+
         if update_event != before {
             EventV1::UserVoiceStateUpdate {
                 id: user.id.clone(),
@@ -994,21 +1072,43 @@ pub async fn get_call_notification_recipients(
 }
 
 pub async fn remove_user_from_voice_channels(
+    db: &Database,
     voice_client: &VoiceClient,
     user_id: &str,
 ) -> Result<()> {
     for channel in get_user_voice_channels(user_id).await? {
-        remove_user_from_voice_channel(voice_client, &channel, user_id).await?;
+        remove_user_from_voice_channel(db, voice_client, &channel, user_id).await?;
     }
 
     Ok(())
 }
 
 pub async fn remove_user_from_voice_channel(
+    db: &Database,
     voice_client: &VoiceClient,
     channel: &UserVoiceChannel,
     user_id: &str,
 ) -> Result<()> {
+    // Remote-control release hook (plan §1): these admin paths remove the
+    // participant INSIDE delta and would race a webhook-only hook, so any
+    // grant involving this user is ended here, before the removal.
+    //
+    // `false`: the removal below is best-effort (its error is discarded,
+    // it is skipped entirely when the channel has no node, and the
+    // identity it resolves can silently no-op for a device-qualified
+    // participant). Assuming it works and merely deleting the records
+    // would be how a `can_publish_data` capability outlives everything
+    // able to revoke it — so the capability is actively revoked first.
+    remote_control::release_remote_control_for_user(
+        db,
+        voice_client,
+        channel,
+        user_id,
+        "participant_left",
+        false,
+    )
+    .await;
+
     if let Some(node) = get_channel_node(&channel.id).await? {
         let _ = voice_client.remove_user(&node, user_id, &channel.id).await;
     }
@@ -1019,10 +1119,25 @@ pub async fn remove_user_from_voice_channel(
 }
 
 pub async fn delete_voice_channel(
+    db: &Database,
     voice_client: &VoiceClient,
     channel: &UserVoiceChannel,
 ) -> Result<()> {
     if let Some(users) = get_voice_channel_members(channel).await? {
+        // The whole room is going away — end every grant in it first. The
+        // room still EXISTS at this point and `delete_room` below can
+        // fail, so the capabilities are actively revoked rather than
+        // assumed moot: "the room is about to go" is not the same as "the
+        // room is gone".
+        remote_control::release_remote_control_for_channel(
+            db,
+            voice_client,
+            &channel.id,
+            "call_ended",
+            true,
+        )
+        .await;
+
         let node = get_channel_node(&channel.id).await?.unwrap();
         voice_client.delete_room(&node, &channel.id).await?;
 

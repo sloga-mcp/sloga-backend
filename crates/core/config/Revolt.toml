@@ -265,6 +265,13 @@ mass_mentions_enabled = true
 # Server id that every newly-onboarded user is auto-joined to (landing-spot
 # server). Leave empty to disable. Set the real id in Revolt.overrides.toml.
 welcome_server = ""
+# Remote desktop control during screen share (remote-control plan). Ships
+# DARK: leave false here; flip in Revolt.overrides.toml (the bare key must
+# sit under a [features] header there) and RESTART delta AND crond. Flipping
+# it back off makes the routes refuse (FeatureDisabled, 400) on restart but
+# revokes nothing by itself — the crond reaper mass-revokes live grants when
+# it observes the flag off, so crond must be restarted too.
+remote_control = false
 
 # --- Server boosts (Discord-style) ---
 # The feature ships DARK: all keys below default in code to the values shown,

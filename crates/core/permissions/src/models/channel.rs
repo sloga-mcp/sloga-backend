@@ -95,6 +95,16 @@ pub enum ChannelPermission {
     Listen = 1 << 36,
     /// Use the server soundboard in a voice call
     UseSoundboard = 1 << 40,
+    /// Offer remote control of one's own machine while screen sharing
+    /// (remote-control plan §1). Checked on the SHARER — it governs who may
+    /// offer their own desktop, not who may control someone else's. Note the
+    /// bit does not restrain server owners or privileged/staff accounts:
+    /// `GrantAllSafe` covers bits 0-51 and privileged users short-circuit
+    /// before any channel-type handling, so for them it is auto-granted —
+    /// a self-risk decision under the sharer-initiated model, not
+    /// third-party exposure. DMs and group DMs do not consult this bit at
+    /// all (see the eligibility rule in delta's remote_control routes).
+    UseRemoteControl = 1 << 41,
 
     // * Channel permissions two electric boogaloo
     /// Mention everyone and online members
@@ -103,7 +113,8 @@ pub enum ChannelPermission {
     MentionRoles = 1 << 38,
 
     // * Misc. permissions
-    // % Bits 39 to 52: free area
+    // % Bits 42 to 52: free area
+    // % (39 = BypassSlowmode, 40 = UseSoundboard, 41 = UseRemoteControl)
     // % Bits 53 to 64: do not use
 
     // * Grant all permissions

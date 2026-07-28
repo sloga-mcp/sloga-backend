@@ -449,7 +449,7 @@ pub async fn edit(
         .await?;
 
     if channel.voice().is_none() {
-        delete_voice_channel(voice_client, &UserVoiceChannel::from_channel(&channel)).await?;
+        delete_voice_channel(db, voice_client, &UserVoiceChannel::from_channel(&channel)).await?;
     }
 
     Ok(Json(channel.into()))

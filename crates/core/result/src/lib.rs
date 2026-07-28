@@ -250,6 +250,14 @@ pub enum ErrorType {
     AlreadyConnected,
     NotConnected,
     UnknownNode,
+    // ? Remote control errors
+    /// The sharer already has a pending control offer in this channel — a
+    /// second offer must not silently overwrite the first while the target's
+    /// dialog is open (remote-control plan §1)
+    RemoteControlOfferPending,
+    /// A party already holds an active control grant (at most one grant per
+    /// sharer per channel, and at most one per controller across channels)
+    RemoteControlGrantActive,
     // ? Micro-service errors
     ProxyError,
     FileTooSmall,

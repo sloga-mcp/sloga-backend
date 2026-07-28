@@ -25,6 +25,7 @@ mod thread_members;
 mod upload_sessions;
 mod policy_changes;
 mod ratelimit_events;
+mod remote_control_audit;
 mod safety_reports;
 mod safety_snapshots;
 mod server_bans;
@@ -65,6 +66,7 @@ pub use thread_members::*;
 pub use upload_sessions::*;
 pub use policy_changes::*;
 pub use ratelimit_events::*;
+pub use remote_control_audit::*;
 pub use safety_reports::*;
 pub use safety_snapshots::*;
 pub use server_bans::*;
@@ -113,6 +115,7 @@ pub trait AbstractDatabase:
     + stream_connections::AbstractStreamConnections
     + policy_changes::AbstractPolicyChange
     + ratelimit_events::AbstractRatelimitEvents
+    + remote_control_audit::AbstractRemoteControlAudit
     + safety_reports::AbstractReport
     + safety_snapshots::AbstractSnapshot
     + server_bans::AbstractServerBans

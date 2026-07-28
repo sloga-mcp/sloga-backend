@@ -319,6 +319,23 @@ pub async fn edit(
                 )
                 .await?;
 
+            // Remote-control release hook (plan §1: the moderator voice-move
+            // calls `remove_user` directly, bypassing
+            // `remove_user_from_voice_channel`, and additionally re-tokens
+            // the target into a DIFFERENT room while any grant stays keyed
+            // to the old channel — so it must release explicitly here).
+            revolt_database::voice::remote_control::release_remote_control_for_user(
+                db,
+                voice_client,
+                &old_user_voice_channel,
+                &target_user.id,
+                "revoked_by_moderator",
+                // The participant is still in the old room right now — the
+                // removal happens below and can fail, so revoke actively.
+                false,
+            )
+            .await;
+
             voice_client
                 .remove_user(&old_node, &target_user.id, &channel)
                 .await?;
@@ -363,6 +380,23 @@ pub async fn edit(
         if let Some(channel) = get_user_voice_channel_in_server(&target_user.id, &server.id).await?
         {
             let node = get_channel_node(&channel).await?.unwrap();
+
+            // Remote-control release hook (plan §1: the moderator disconnect
+            // also calls `remove_user` directly and would race a
+            // webhook-only hook).
+            revolt_database::voice::remote_control::release_remote_control_for_user(
+                db,
+                voice_client,
+                &UserVoiceChannel {
+                    id: channel.clone(),
+                    server_id: Some(server.id.clone()),
+                },
+                &target_user.id,
+                "revoked_by_moderator",
+                // Still connected at this point; the disconnect is below.
+                false,
+            )
+            .await;
 
             // Disconnect the TARGET being removed, not the acting moderator
             // (matches the move branch above; the earlier `user.id` here kicked

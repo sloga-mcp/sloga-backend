@@ -66,6 +66,7 @@ pub async fn ban(
         // If the member is in a voice channel while banned kick them from the voice channel
         if let Some(channel_id) = get_user_voice_channel_in_server(target.id, &server.id).await? {
             remove_user_from_voice_channel(
+                db,
                 voice_client,
                 &UserVoiceChannel {
                     id: channel_id,

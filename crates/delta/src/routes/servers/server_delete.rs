@@ -30,6 +30,7 @@ pub async fn delete(
     if server.owner == user.id {
         for channel_id in &server.channels {
             delete_voice_channel(
+                db,
                 voice_client,
                 &UserVoiceChannel {
                     id: channel_id.clone(),
@@ -43,6 +44,7 @@ pub async fn delete(
     } else {
         if let Some(channel_id) = get_user_voice_channel_in_server(&user.id, &server.id).await? {
             remove_user_from_voice_channel(
+                db,
                 voice_client,
                 &UserVoiceChannel {
                     id: channel_id,

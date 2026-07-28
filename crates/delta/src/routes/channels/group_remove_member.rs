@@ -55,7 +55,7 @@ pub async fn remove_member(
     let user_voice_channel = UserVoiceChannel::from_channel(&channel);
 
     if is_in_voice_channel(member_id.id, &user_voice_channel).await? {
-        remove_user_from_voice_channel(voice_client, &user_voice_channel, member_id.id).await?;
+        remove_user_from_voice_channel(db, voice_client, &user_voice_channel, member_id.id).await?;
     };
 
     Ok(EmptyResponse)

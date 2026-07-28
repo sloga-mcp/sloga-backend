@@ -68,6 +68,8 @@ pub struct RevoltFeatures {
     pub oauth_youtube: bool,
     /// Whether importing a server from Discord is enabled
     pub import_discord: bool,
+    /// Whether remote desktop control during screen share is enabled
+    pub remote_control: bool,
     /// Whether this server is invite only
     pub invite_only: bool,
     /// File server service configuration
@@ -229,6 +231,11 @@ pub async fn root() -> Result<Json<RevoltConfig>> {
             oauth_twitch: config.api.oauth.twitch.enabled,
             oauth_youtube: config.api.oauth.youtube.enabled,
             import_discord: config.api.import.discord.enabled,
+            // Unlike the flags above (per-service config), this comes from
+            // `features` — the real Features flags are otherwise not
+            // surfaced in RevoltFeatures at all, so this is net-new
+            // plumbing, not a mirror of an existing pattern.
+            remote_control: config.features.remote_control,
             invite_only: config.api.registration.invite_only,
             autumn: Feature {
                 enabled: !config.hosts.autumn.is_empty(),
