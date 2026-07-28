@@ -27,11 +27,12 @@ pub async fn calculate_user_permissions<P: PermissionQuery>(query: &mut P) -> Pe
     }
 
     if query.have_mutual_connection().await {
-        permissions = UserPermission::Access as u64 + UserPermission::ViewProfile as u64;
-
-        if query.user_is_bot().await || query.are_we_a_bot().await {
-            permissions += UserPermission::SendMessage as u64;
-        }
+        // Sharing a server or group is enough to open a DM, matching what
+        // the client offers on member profiles; friendship is only required
+        // when there is no mutual connection at all.
+        permissions = UserPermission::Access as u64
+            + UserPermission::ViewProfile as u64
+            + UserPermission::SendMessage as u64;
 
         permissions.into()
     } else {

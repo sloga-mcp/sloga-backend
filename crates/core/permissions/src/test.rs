@@ -103,6 +103,103 @@ async fn validate_user_permissions() {
 }
 
 #[tokio::test]
+async fn validate_mutual_connection_allows_dm() {
+    /// Scenario in which we share a server with a user we are not friends
+    /// with: they can be messaged, matching the actions the client offers
+    /// on member profiles
+    struct Scenario {}
+    let mut query = Scenario {};
+
+    let perms = calculate_user_permissions(&mut query).await;
+    assert!(perms.has_user_permission(crate::UserPermission::Access));
+    assert!(perms.has_user_permission(crate::UserPermission::ViewProfile));
+    assert!(perms.has_user_permission(crate::UserPermission::SendMessage));
+
+    #[async_trait]
+    impl PermissionQuery for Scenario {
+        async fn are_we_privileged(&mut self) -> bool {
+            false
+        }
+
+        async fn are_we_a_bot(&mut self) -> bool {
+            false
+        }
+
+        async fn are_the_users_same(&mut self) -> bool {
+            false
+        }
+
+        async fn user_relationship(&mut self) -> RelationshipStatus {
+            RelationshipStatus::None
+        }
+
+        async fn user_is_bot(&mut self) -> bool {
+            false
+        }
+
+        async fn have_mutual_connection(&mut self) -> bool {
+            true
+        }
+
+        async fn are_we_server_owner(&mut self) -> bool {
+            unreachable!()
+        }
+
+        async fn are_we_a_member(&mut self) -> bool {
+            unreachable!()
+        }
+
+        async fn get_default_server_permissions(&mut self) -> u64 {
+            unreachable!()
+        }
+
+        async fn get_our_server_role_overrides(&mut self) -> Vec<Override> {
+            unreachable!()
+        }
+
+        async fn are_we_timed_out(&mut self) -> bool {
+            unreachable!()
+        }
+
+        async fn do_we_have_publish_overwrites(&mut self) -> bool {
+            unreachable!()
+        }
+
+        async fn do_we_have_receive_overwrites(&mut self) -> bool {
+            unreachable!()
+        }
+
+        async fn get_channel_type(&mut self) -> ChannelType {
+            unreachable!()
+        }
+
+        async fn get_default_channel_permissions(&mut self) -> Override {
+            unreachable!()
+        }
+
+        async fn get_our_channel_role_overrides(&mut self) -> Vec<Override> {
+            unreachable!()
+        }
+
+        async fn do_we_own_the_channel(&mut self) -> bool {
+            unreachable!()
+        }
+
+        async fn are_we_part_of_the_channel(&mut self) -> bool {
+            unreachable!()
+        }
+
+        async fn set_recipient_as_user(&mut self) {
+            unreachable!()
+        }
+
+        async fn set_server_from_channel(&mut self) {
+            unreachable!()
+        }
+    }
+}
+
+#[tokio::test]
 async fn validate_group_permissions() {
     /// Scenario in which we are in a group channel with only talking permission
     struct Scenario {}
