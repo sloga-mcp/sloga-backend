@@ -908,6 +908,9 @@ mod tests {
             nsfw: false,
             analytics: false,
             discoverable: false,
+            discovery_requested: false,
+            boost_count: None,
+            boost_tier: None,
         };
 
         // Hidden: channel override denies ViewChannel for everyone.
