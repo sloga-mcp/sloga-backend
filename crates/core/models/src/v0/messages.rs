@@ -211,6 +211,16 @@ auto_derived!(
             by: String,
             name: String,
         },
+        /// A participant started recording the call (call-recording plan §1).
+        ///
+        /// The durable half of the consent story: the in-call banner is gone
+        /// the moment the call ends, so without this there is no record that a
+        /// recording ever happened. `by` is the recorder.
+        #[serde(rename = "call_recording_started")]
+        CallRecordingStarted { by: String },
+        /// A participant stopped recording the call.
+        #[serde(rename = "call_recording_stopped")]
+        CallRecordingStopped { by: String },
     }
 
     /// Name and / or avatar override information
@@ -820,6 +830,12 @@ impl From<SystemMessage> for String {
             SystemMessage::MessageUnpinned { .. } => "Message unpinned.".to_string(),
             SystemMessage::CallStarted { .. } => "Call started.".to_string(),
             SystemMessage::ThreadCreated { .. } => "Thread created.".to_string(),
+            SystemMessage::CallRecordingStarted { .. } => {
+                "Call recording started.".to_string()
+            }
+            SystemMessage::CallRecordingStopped { .. } => {
+                "Call recording stopped.".to_string()
+            }
         }
     }
 }

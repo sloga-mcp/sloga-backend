@@ -412,6 +412,7 @@ pub async fn create_voice_state(
         screensharing: false,
         camera: false,
         screen_video: false,
+        recording: false,
     };
 
     Pipeline::new()
@@ -441,6 +442,10 @@ pub async fn create_voice_state(
             format!("screen_video:{unique_key}"),
             voice_state.screen_video,
         )
+        // A fresh join never inherits a recording flag: the key is written
+        // false here so a stale `recording:` left by a crashed process cannot
+        // make a new participant appear to be recording.
+        .set(format!("recording:{unique_key}"), voice_state.recording)
         .query_async::<_, ()>(&mut get_connection().await?.into_inner())
         .await
         .to_internal_error()?;
@@ -465,6 +470,10 @@ pub async fn delete_voice_state(channel: &UserVoiceChannel, user_id: &str) -> Re
             format!("screensharing:{unique_key}"),
             format!("camera:{unique_key}"),
             format!("screen_video:{unique_key}"),
+            // Leaving the call ends any recording claim with it — this is the
+            // load-bearing teardown for a recorder who drops without pressing
+            // stop (a crash, a closed laptop, a network loss).
+            format!("recording:{unique_key}"),
             unique_key.clone(),
         ])
         .query_async(&mut get_connection().await?.into_inner())
@@ -492,6 +501,7 @@ pub async fn delete_channel_voice_state(
             format!("screensharing:{unique_key}"),
             format!("camera:{unique_key}"),
             format!("screen_video:{unique_key}"),
+            format!("recording:{unique_key}"),
             unique_key.clone(),
         ]);
     }
@@ -578,6 +588,10 @@ pub async fn update_voice_state(
         pipeline.set(format!("screen_video:{unique_key}"), screen_video);
     }
 
+    if let Some(recording) = &partial.recording {
+        pipeline.set(format!("recording:{unique_key}"), recording);
+    }
+
     pipeline
         .query_async(&mut get_connection().await?.into_inner())
         .await
@@ -603,8 +617,9 @@ pub async fn get_voice_state(
         channel.server_id.as_ref().unwrap_or(&channel.id)
     );
 
-    let (joined_at, is_publishing, is_receiving, screensharing, camera, screen_video): (
+    let (joined_at, is_publishing, is_receiving, screensharing, camera, screen_video, recording): (
         Option<i64>,
+        Option<bool>,
         Option<bool>,
         Option<bool>,
         Option<bool>,
@@ -619,6 +634,7 @@ pub async fn get_voice_state(
             format!("screensharing:{unique_key}"),
             format!("camera:{unique_key}"),
             format!("screen_video:{unique_key}"),
+            format!("recording:{unique_key}"),
         ])
         .await
         .to_internal_error()?;
@@ -650,6 +666,10 @@ pub async fn get_voice_state(
             // deletes states it cannot read), so it defaults false rather
             // than joining the required tuple above.
             screen_video: screen_video.unwrap_or(false),
+            // Same rule, and fail-closed in the useful direction: an
+            // unreadable recording key reads as "not recording" rather than
+            // dropping the participant's whole voice state.
+            recording: recording.unwrap_or(false),
         })),
         _ => Ok(None),
     }
@@ -1270,6 +1290,22 @@ pub async fn sync_user_voice_permissions(
         update_event.screensharing = voice_state.screensharing.then_some(can_video);
         update_event.screen_video = voice_state.screen_video.then_some(can_video);
         update_event.is_publishing = voice_state.is_publishing.then_some(can_speak);
+
+        // `recording` is DELIBERATELY not synced down here, unlike every flag
+        // above and unlike the remote-control teardown below. Revoking
+        // `RecordCall` mid-call cannot stop a recording that is already
+        // running: the recorder is a MediaRecorder in the participant's own
+        // client, holding tracks it has already been sent, and no
+        // server-asserted state reaches it. Clearing the flag would therefore
+        // not end the recording — it would only delete the indicator that
+        // says one is happening, leaving everyone else in the call believing
+        // they are unrecorded while the file keeps growing. A stale-true flag
+        // over-warns; a cleared one lies. This is the opposite direction from
+        // remote control (where the server genuinely holds the capability and
+        // revoking it genuinely ends the session) and the asymmetry is the
+        // whole point: revoke the bit to stop the NEXT recording.
+
+
 
         update_voice_state(&user_voice_channel, &user.id, &update_event).await?;
 

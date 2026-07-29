@@ -394,6 +394,20 @@ auto_derived_partial!(
         /// servers, hence the default.
         #[serde(default)]
         pub screen_video: bool,
+        /// True while this participant has a local call recording running
+        /// (call-recording plan §1). Additive field, hence the default.
+        ///
+        /// Unlike every other flag here this one is CLIENT-CLAIMED — it is
+        /// written by the recording routes, not by voice-ingress, because the
+        /// recording happens in the participant's own client and the SFU
+        /// cannot observe it. So it is a self-report: true means "this client
+        /// said it is recording". A client that records without saying so
+        /// leaves this false, and nothing server-side can tell. It rides on
+        /// voice state rather than a one-shot event specifically so that a
+        /// LATE JOINER learns of an in-progress recording from the same roster
+        /// read that tells them who is in the call.
+        #[serde(default)]
+        pub recording: bool,
     },
     "PartialUserVoiceState"
 );

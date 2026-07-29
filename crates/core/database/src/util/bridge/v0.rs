@@ -801,6 +801,12 @@ impl From<crate::SystemMessage> for SystemMessage {
             crate::SystemMessage::ThreadCreated { id, by, name } => {
                 Self::ThreadCreated { id, by, name }
             }
+            crate::SystemMessage::CallRecordingStarted { by } => {
+                Self::CallRecordingStarted { by }
+            }
+            crate::SystemMessage::CallRecordingStopped { by } => {
+                Self::CallRecordingStopped { by }
+            }
         }
     }
 }

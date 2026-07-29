@@ -105,6 +105,20 @@ pub enum ChannelPermission {
     /// third-party exposure. DMs and group DMs do not consult this bit at
     /// all (see the eligibility rule in delta's remote_control routes).
     UseRemoteControl = 1 << 41,
+    /// Record a voice call to one's own machine (call-recording plan §1).
+    ///
+    /// Deliberately NOT in `DEFAULT_PERMISSION`: recording is the one voice
+    /// action whose output OUTLIVES the call, so a server owner opts into it
+    /// per-role rather than discovering it was on. DMs and group DMs do not
+    /// consult this bit at all — same reason as `UseRemoteControl`: non-owners
+    /// of existing groups hold only ViewChannel + ReadMessageHistory, so a bit
+    /// check would pass for the group owner and fail for every other member.
+    ///
+    /// Honesty note: this bit governs who may press OUR button and light the
+    /// in-call recording indicator. It cannot stop a participant recording by
+    /// other means (OBS, a phone), and nothing in this codebase can. It is an
+    /// attribution and consent signal, not an enforcement boundary.
+    RecordCall = 1 << 42,
 
     // * Channel permissions two electric boogaloo
     /// Mention everyone and online members
@@ -113,8 +127,9 @@ pub enum ChannelPermission {
     MentionRoles = 1 << 38,
 
     // * Misc. permissions
-    // % Bits 42 to 52: free area
-    // % (39 = BypassSlowmode, 40 = UseSoundboard, 41 = UseRemoteControl)
+    // % Bits 43 to 52: free area
+    // % (39 = BypassSlowmode, 40 = UseSoundboard, 41 = UseRemoteControl,
+    // %  42 = RecordCall)
     // % Bits 53 to 64: do not use
 
     // * Grant all permissions

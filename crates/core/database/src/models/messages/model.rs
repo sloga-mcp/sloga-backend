@@ -176,6 +176,10 @@ auto_derived!(
             by: String,
             name: String,
         },
+        #[serde(rename = "call_recording_started")]
+        CallRecordingStarted { by: String },
+        #[serde(rename = "call_recording_stopped")]
+        CallRecordingStopped { by: String },
     }
 
     /// Name and / or avatar override information
@@ -1071,6 +1075,10 @@ impl Message {
                             }
                             v0::SystemMessage::CallStarted { by, .. } => users.push(by.clone()),
                             v0::SystemMessage::ThreadCreated { by, .. } => users.push(by.clone()),
+                            v0::SystemMessage::CallRecordingStarted { by }
+                            | v0::SystemMessage::CallRecordingStopped { by } => {
+                                users.push(by.clone())
+                            }
                         }
                     }
                     users
