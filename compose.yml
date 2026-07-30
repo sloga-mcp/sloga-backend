@@ -97,8 +97,8 @@ services:
     logging:
       driver: json-file
       options:
-        max-size: "10m"
-        max-file: "1"
+        max-size: "50m"
+        max-file: "5"
 
 volumes:
   rabbit_data:
