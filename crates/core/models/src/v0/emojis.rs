@@ -6,8 +6,12 @@ use validator::Validate;
 
 /// Regex for valid emoji names
 ///
-/// Alphanumeric and underscores
-pub static RE_EMOJI: Lazy<Regex> = Lazy::new(|| Regex::new(r"^[a-z0-9_]+$").unwrap());
+/// Alphanumeric (either case) and underscores.
+///
+/// Case is preserved but never load-bearing: messages reference custom emoji by
+/// id (`:<ULID>:`), so the name is only ever a label to display and search on,
+/// and both search paths already fold case.
+pub static RE_EMOJI: Lazy<Regex> = Lazy::new(|| Regex::new(r"^[a-zA-Z0-9_]+$").unwrap());
 
 auto_derived!(
     /// Emoji
@@ -73,3 +77,25 @@ auto_derived!(
         pub name: Option<String>,
     }
 );
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn emoji_names_accept_either_case() {
+        // uppercase is the common case for acronyms and stream emotes; it used
+        // to be rejected, and the only thing the client could show for it was
+        // validator's raw error dump
+        for name in ["PBG", "pbg", "PogChamp", "party_parrot", "sloga2", "_"] {
+            assert!(RE_EMOJI.is_match(name), "{name} should be accepted");
+        }
+    }
+
+    #[test]
+    fn emoji_names_reject_everything_else() {
+        for name in ["", "party parrot", "cool-face", "sad.face", "🎉", ":tada:"] {
+            assert!(!RE_EMOJI.is_match(name), "{name} should be rejected");
+        }
+    }
+}
