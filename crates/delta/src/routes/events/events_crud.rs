@@ -4,7 +4,7 @@ use revolt_database::{
     occurrences_in_window,
     util::permissions::DatabasePermissionQuery,
     util::reference::Reference,
-    CalendarEvent, Database, File, FieldsCalendarEvent, PartialCalendarEvent, RsvpStatus, User,
+    CalendarEvent, Database, FieldsCalendarEvent, File, PartialCalendarEvent, RsvpStatus, User,
     AMQP, MAX_EVENT_ATTACHMENTS,
 };
 use revolt_models::v0;
@@ -279,6 +279,27 @@ pub async fn edit_event(
     }
     super::authorize_manage(db, &user, &event).await?;
 
+    // ----- validate a channel move up front (before ANY mutation) --------------
+    // Same gate as create: the target channel must belong to the event's server
+    // and the caller must be able to view it. The fetched channel is reused for
+    // the RSVP prune after the edit persists.
+    let new_channel = match &data.channel {
+        Some(channel_id) => {
+            let channel = db.fetch_channel(channel_id).await?;
+            if channel.server() != Some(event.server.as_str()) {
+                return Err(create_error!(InvalidOperation));
+            }
+            let mut query = DatabasePermissionQuery::new(db, &user).channel(&channel);
+            calculate_channel_permissions(&mut query)
+                .await
+                .throw_if_lacking_channel_permission(ChannelPermission::ViewChannel)?;
+            Some(channel)
+        }
+        None => None,
+    };
+    let old_channel = event.channel.clone();
+    let pre_edit = event.clone();
+
     // ----- resolve the attachment plan (slice G) -------------------------------
     // Attachments are NOT time-affecting and must never clear recurrence exceptions,
     // so they are handled separately from the event-field edit below. The cap is
@@ -293,8 +314,7 @@ pub async fn edit_event(
     let attachments_changed = clear_all || !add_ids.is_empty() || !detach_ids.is_empty();
 
     let existing = event.attachments.clone().unwrap_or_default();
-    let detach: std::collections::HashSet<&str> =
-        detach_ids.iter().map(|s| s.as_str()).collect();
+    let detach: std::collections::HashSet<&str> = detach_ids.iter().map(|s| s.as_str()).collect();
     // Existing files kept after removals (unchanged when nothing about attachments changed).
     let kept: Vec<File> = if clear_all {
         Vec::new()
@@ -328,6 +348,7 @@ pub async fn edit_event(
         timezone: data.timezone,
         recurrence: data.recurrence.map(super::recurrence_from_wire),
         color: data.color,
+        channel: data.channel,
         ..Default::default()
     };
     let remove: Vec<FieldsCalendarEvent> = data
@@ -382,13 +403,59 @@ pub async fn edit_event(
         }
     }
 
+    // ----- fan-out ---------------------------------------------------------------
+    // A channel change moves the event between real-time topics (the topic IS the
+    // authorization boundary). The OLD audience is told the event moved — but with
+    // the pre-edit content plus only the new channel pointer, so a same-PATCH
+    // title/description edit never reaches users who just lost visibility. Clients
+    // drop events whose channel they cannot resolve.
+    let channel_changed = old_channel != event.channel;
+    if channel_changed {
+        let mut moved = pre_edit;
+        moved.channel = event.channel.clone();
+        let old_topic = old_channel.unwrap_or_else(|| moved.server.clone());
+        EventV1::CalendarEventUpdate {
+            event: super::event_to_wire(moved),
+        }
+        .p(old_topic)
+        .await;
+    }
+
     let topic = super::event_topic(&event);
-    let wire = super::event_to_wire(event);
+    let wire = super::event_to_wire(event.clone());
     EventV1::CalendarEventUpdate {
         event: wire.clone(),
     }
     .p(topic)
     .await;
+
+    // ----- RSVP prune on a narrowing move ---------------------------------------
+    // Users who cannot view the new channel would otherwise be stranded: still
+    // `Going`, still reminded every occurrence, unable to open the event. Drop
+    // their rows (same semantics as uninvite; the reminder daemon then skips
+    // them). A widening move (channel cleared) strands nobody — skip.
+    if channel_changed {
+        if let Some(channel) = &new_channel {
+            if let Ok(rsvps) = db.fetch_rsvps_for_event(&event.id).await {
+                for rsvp in rsvps {
+                    let uid = rsvp.id.user;
+                    let visible = match db.fetch_user(&uid).await {
+                        Ok(target) => {
+                            let mut query =
+                                DatabasePermissionQuery::new(db, &target).channel(channel);
+                            calculate_channel_permissions(&mut query)
+                                .await
+                                .has_channel_permission(ChannelPermission::ViewChannel)
+                        }
+                        Err(_) => false,
+                    };
+                    if !visible {
+                        db.delete_rsvp(&event.id, &uid).await.ok();
+                    }
+                }
+            }
+        }
+    }
 
     Ok(Json(wire))
 }
@@ -479,6 +546,8 @@ pub async fn cancel_event(
                 title: event.title.clone(),
                 kind: CalendarEventNotification::Cancelled,
                 occurrence_start: None,
+                channel_id: event.channel.clone(),
+                offset_ms: None,
             })
             .await
             .ok();

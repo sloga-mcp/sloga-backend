@@ -93,6 +93,15 @@ pub struct CalendarEventPayload {
     /// For `Reminder`: the specific occurrence start (ms epoch); absent otherwise
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub occurrence_start: Option<i64>,
+    /// The event's channel id, when channel-scoped — lets clients deep-link
+    /// straight to it (e.g. "Join channel" for a voice-channel event). Still an
+    /// opaque id, never channel contents.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channel_id: Option<String>,
+    /// For `Reminder`: the lead offset this firing represents (ms before the
+    /// occurrence; 0 = at start). Explicit so wording never guesses from clocks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub offset_ms: Option<i64>,
 }
 
 impl CalendarEventPayload {
@@ -108,10 +117,16 @@ impl CalendarEventPayload {
                 "Event cancelled".to_string(),
                 format!("{} was cancelled", self.title),
             ),
-            CalendarEventNotification::Reminder => (
-                "Upcoming event".to_string(),
-                format!("{} is starting soon", self.title),
-            ),
+            CalendarEventNotification::Reminder => match self.offset_ms {
+                Some(0) => (
+                    "Event started".to_string(),
+                    format!("{} has started", self.title),
+                ),
+                _ => (
+                    "Upcoming event".to_string(),
+                    format!("{} is starting soon", self.title),
+                ),
+            },
         }
     }
 }

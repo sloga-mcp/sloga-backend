@@ -230,6 +230,11 @@ auto_derived!(
         #[cfg_attr(feature = "validator", validate(length(max = 32)))]
         #[serde(default)]
         pub color: Option<String>,
+        /// Move the event to a different channel (the visibility anchor). The channel
+        /// must belong to the event's server and the caller must hold `ViewChannel`
+        /// there. Unset via `remove: ["Channel"]`; if both are present, the set wins.
+        #[serde(default)]
+        pub channel: Option<String>,
         /// Attachment file ids to ADD (uploaded to the `attachments` bucket, claimed
         /// server-side). The resulting total (kept + added) is capped at
         /// `MAX_EVENT_ATTACHMENTS` server-side; this per-request add-list is capped here.

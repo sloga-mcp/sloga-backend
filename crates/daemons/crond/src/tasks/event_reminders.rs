@@ -101,6 +101,8 @@ pub async fn task(db: Database, amqp: AMQP) -> Result<()> {
                                 title: event.title.clone(),
                                 kind: CalendarEventNotification::Reminder,
                                 occurrence_start: Some(occurrence),
+                                channel_id: event.channel.clone(),
+                                offset_ms: Some(offset),
                             };
                             if let Err(err) = amqp.calendar_event_notify(&payload).await {
                                 // At-most-once: the marker stays, so we do not retry.

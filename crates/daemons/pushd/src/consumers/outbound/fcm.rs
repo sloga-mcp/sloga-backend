@@ -60,6 +60,8 @@ pub enum NotificationData {
         title: String,
         kind: String,
         occurrence_start: Option<i64>,
+        channel_id: Option<String>,
+        offset_ms: Option<i64>,
     },
 }
 
@@ -134,6 +136,8 @@ impl NotificationData {
                 title,
                 kind,
                 occurrence_start,
+                channel_id,
+                offset_ms,
             } => {
                 data.insert("event_id".to_string(), Value::String(event_id));
                 data.insert("server_id".to_string(), Value::String(server_id));
@@ -144,6 +148,15 @@ impl NotificationData {
                     data.insert(
                         "occurrence_start".to_string(),
                         Value::String(occurrence_start.to_string()),
+                    );
+                }
+                if let Some(channel_id) = channel_id {
+                    data.insert("channel_id".to_string(), Value::String(channel_id));
+                }
+                if let Some(offset_ms) = offset_ms {
+                    data.insert(
+                        "offset_ms".to_string(),
+                        Value::String(offset_ms.to_string()),
                     );
                 }
             }
@@ -164,11 +177,7 @@ pub struct FcmOutboundConsumer {
 
 #[async_trait]
 impl Consumer for FcmOutboundConsumer {
-    async fn create(
-        db: Database,
-        connection: Arc<Connection>,
-        channel: Arc<AMQPChannel>,
-    ) -> Self {
+    async fn create(db: Database, connection: Arc<Connection>, channel: Arc<AMQPChannel>) -> Self {
         let config = revolt_config::config().await;
 
         Self {
@@ -316,6 +325,8 @@ impl Consumer for FcmOutboundConsumer {
                     title: alert.title,
                     kind: alert.kind.as_str().to_string(),
                     occurrence_start: alert.occurrence_start,
+                    channel_id: alert.channel_id,
+                    offset_ms: alert.offset_ms,
                 };
 
                 let msg = Message {

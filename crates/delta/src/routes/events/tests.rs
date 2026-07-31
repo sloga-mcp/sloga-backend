@@ -2235,3 +2235,378 @@ async fn lock_at_event_start_toggle_rearms_and_clears() {
         "re-arming against a cancelled event must fail"
     );
 }
+
+/// A PATCH may move an event into a channel (validated like create), and a
+/// narrowing move prunes the RSVP rows of users who cannot view the new channel —
+/// otherwise they would stay `Going` (and reminded) for an event they cannot open.
+#[rocket::async_test]
+async fn edit_moves_event_into_channel_and_prunes_blind_rsvps() {
+    use revolt_database::{Channel, PartialChannel};
+    use revolt_permissions::{ChannelPermission, OverrideField};
+
+    let harness = TestHarness::new().await;
+    let (_, owner_session, owner) = harness.new_user().await;
+    let (_, guest_session, guest) = harness.new_user().await;
+
+    let (server, channels) = Server::create(
+        &harness.db,
+        DataCreateServer {
+            name: "Movable".to_string(),
+            description: None,
+            nsfw: None,
+        },
+        &owner,
+        true, // create the default "General" text channel
+    )
+    .await
+    .expect("server");
+    Member::create(&harness.db, &server, &owner, None)
+        .await
+        .expect("owner member");
+    Member::create(&harness.db, &server, &guest, None)
+        .await
+        .expect("guest member");
+
+    // Deny ViewChannel by default on the channel; the owner bypasses, the guest can't see it.
+    let mut channel = channels
+        .into_iter()
+        .find(|c| matches!(c, Channel::TextChannel { .. }))
+        .expect("text channel");
+    let channel_id = channel.id().to_string();
+    channel
+        .update(
+            &harness.db,
+            PartialChannel {
+                default_permissions: Some(OverrideField {
+                    a: 0,
+                    d: ChannelPermission::ViewChannel as i64,
+                }),
+                ..Default::default()
+            },
+            vec![],
+        )
+        .await
+        .expect("deny view");
+
+    // Server-wide event; guest is invited and Going.
+    let event = harness
+        .client
+        .post(format!("/events/server/{}", server.id))
+        .header(Header::new(
+            "x-session-token",
+            owner_session.token.to_string(),
+        ))
+        .header(ContentType::JSON)
+        .body(
+            json!({ "title": "Raid", "start": 1_900_000_000_000_i64, "timezone": "UTC" })
+                .to_string(),
+        )
+        .dispatch()
+        .await
+        .into_json::<v0::Event>()
+        .await
+        .expect("event");
+    harness
+        .client
+        .post(format!("/events/event/{}/invites", event.id))
+        .header(Header::new(
+            "x-session-token",
+            owner_session.token.to_string(),
+        ))
+        .header(ContentType::JSON)
+        .body(json!({ "users": [guest.id] }).to_string())
+        .dispatch()
+        .await;
+    let response = harness
+        .client
+        .put(format!("/events/event/{}/rsvp", event.id))
+        .header(Header::new(
+            "x-session-token",
+            guest_session.token.to_string(),
+        ))
+        .header(ContentType::JSON)
+        .body(json!({ "status": "Going" }).to_string())
+        .dispatch()
+        .await;
+    assert_eq!(response.status(), Status::Ok);
+
+    // The guest (a plain member, not the creator) cannot move the event into a
+    // channel they cannot view — same gate as create.
+    let response = harness
+        .client
+        .patch(format!("/events/event/{}", event.id))
+        .header(Header::new(
+            "x-session-token",
+            guest_session.token.to_string(),
+        ))
+        .header(ContentType::JSON)
+        .body(json!({ "channel": channel_id }).to_string())
+        .dispatch()
+        .await;
+    assert_ne!(
+        response.status(),
+        Status::Ok,
+        "a non-manager must not move the event at all"
+    );
+
+    // The owner moves the event into the restricted channel.
+    let response = harness
+        .client
+        .patch(format!("/events/event/{}", event.id))
+        .header(Header::new(
+            "x-session-token",
+            owner_session.token.to_string(),
+        ))
+        .header(ContentType::JSON)
+        .body(json!({ "channel": channel_id }).to_string())
+        .dispatch()
+        .await;
+    assert_eq!(response.status(), Status::Ok);
+    let moved = response.into_json::<v0::Event>().await.expect("moved");
+    assert_eq!(moved.channel.as_deref(), Some(channel_id.as_str()));
+
+    // The guest's Going row was pruned by the narrowing move.
+    let attendees = harness
+        .client
+        .get(format!("/events/event/{}/attendees", event.id))
+        .header(Header::new(
+            "x-session-token",
+            owner_session.token.to_string(),
+        ))
+        .dispatch()
+        .await
+        .into_json::<v0::AttendeesResponse>()
+        .await
+        .expect("attendees");
+    assert!(
+        attendees.attendees.is_empty(),
+        "a Going row must not survive a move to a channel its user cannot view"
+    );
+
+    // And the guest can no longer fetch the event.
+    let response = harness
+        .client
+        .get(format!("/events/event/{}", event.id))
+        .header(Header::new(
+            "x-session-token",
+            guest_session.token.to_string(),
+        ))
+        .dispatch()
+        .await;
+    assert_ne!(response.status(), Status::Ok);
+}
+
+/// A cross-server channel is rejected as an edit target.
+#[rocket::async_test]
+async fn edit_rejects_cross_server_channel() {
+    let harness = TestHarness::new().await;
+    let (_, owner_session, owner) = harness.new_user().await;
+
+    let server = make_server(&harness, &owner).await;
+    let (_, foreign_channels) = Server::create(
+        &harness.db,
+        DataCreateServer {
+            name: "Elsewhere".to_string(),
+            description: None,
+            nsfw: None,
+        },
+        &owner,
+        true,
+    )
+    .await
+    .expect("foreign server");
+    let foreign_channel = foreign_channels
+        .first()
+        .expect("foreign channel")
+        .id()
+        .to_string();
+
+    let event = harness
+        .client
+        .post(format!("/events/server/{}", server.id))
+        .header(Header::new(
+            "x-session-token",
+            owner_session.token.to_string(),
+        ))
+        .header(ContentType::JSON)
+        .body(
+            json!({ "title": "Local", "start": 1_900_000_000_000_i64, "timezone": "UTC" })
+                .to_string(),
+        )
+        .dispatch()
+        .await
+        .into_json::<v0::Event>()
+        .await
+        .expect("event");
+
+    let response = harness
+        .client
+        .patch(format!("/events/event/{}", event.id))
+        .header(Header::new(
+            "x-session-token",
+            owner_session.token.to_string(),
+        ))
+        .header(ContentType::JSON)
+        .body(json!({ "channel": foreign_channel }).to_string())
+        .dispatch()
+        .await;
+    assert_ne!(
+        response.status(),
+        Status::Ok,
+        "a channel from another server must be rejected"
+    );
+
+    // The event is untouched.
+    let ctx = harness
+        .client
+        .get(format!("/events/event/{}", event.id))
+        .header(Header::new(
+            "x-session-token",
+            owner_session.token.to_string(),
+        ))
+        .dispatch()
+        .await
+        .into_json::<v0::EventWithContext>()
+        .await
+        .expect("context");
+    assert_eq!(ctx.event.channel, None);
+}
+
+/// A `Going` attendee who loses ViewChannel (permission change, not a move — so the
+/// prune never ran) can still withdraw: `NotGoing` needs only live membership.
+/// Re-accepting (`Going`) stays behind the view gate.
+#[rocket::async_test]
+async fn notgoing_escape_survives_lost_view() {
+    use revolt_database::{Channel, PartialChannel};
+    use revolt_permissions::{ChannelPermission, OverrideField};
+
+    let harness = TestHarness::new().await;
+    let (_, owner_session, owner) = harness.new_user().await;
+    let (_, guest_session, guest) = harness.new_user().await;
+
+    let (server, channels) = Server::create(
+        &harness.db,
+        DataCreateServer {
+            name: "Escape".to_string(),
+            description: None,
+            nsfw: None,
+        },
+        &owner,
+        true,
+    )
+    .await
+    .expect("server");
+    Member::create(&harness.db, &server, &owner, None)
+        .await
+        .expect("owner member");
+    Member::create(&harness.db, &server, &guest, None)
+        .await
+        .expect("guest member");
+
+    let mut channel = channels
+        .into_iter()
+        .find(|c| matches!(c, Channel::TextChannel { .. }))
+        .expect("text channel");
+    let channel_id = channel.id().to_string();
+
+    // Channel-scoped event while the channel is still visible to everyone.
+    let event = harness
+        .client
+        .post(format!("/events/server/{}", server.id))
+        .header(Header::new(
+            "x-session-token",
+            owner_session.token.to_string(),
+        ))
+        .header(ContentType::JSON)
+        .body(
+            json!({
+                "title": "Sync",
+                "start": 1_900_000_000_000_i64,
+                "timezone": "UTC",
+                "channel": channel_id
+            })
+            .to_string(),
+        )
+        .dispatch()
+        .await
+        .into_json::<v0::Event>()
+        .await
+        .expect("event");
+    harness
+        .client
+        .post(format!("/events/event/{}/invites", event.id))
+        .header(Header::new(
+            "x-session-token",
+            owner_session.token.to_string(),
+        ))
+        .header(ContentType::JSON)
+        .body(json!({ "users": [guest.id] }).to_string())
+        .dispatch()
+        .await;
+    let response = harness
+        .client
+        .put(format!("/events/event/{}/rsvp", event.id))
+        .header(Header::new(
+            "x-session-token",
+            guest_session.token.to_string(),
+        ))
+        .header(ContentType::JSON)
+        .body(json!({ "status": "Going" }).to_string())
+        .dispatch()
+        .await;
+    assert_eq!(response.status(), Status::Ok);
+
+    // Now deny ViewChannel — a permission change, not an event edit.
+    channel
+        .update(
+            &harness.db,
+            PartialChannel {
+                default_permissions: Some(OverrideField {
+                    a: 0,
+                    d: ChannelPermission::ViewChannel as i64,
+                }),
+                ..Default::default()
+            },
+            vec![],
+        )
+        .await
+        .expect("deny view");
+
+    // Withdrawing still works…
+    let response = harness
+        .client
+        .put(format!("/events/event/{}/rsvp", event.id))
+        .header(Header::new(
+            "x-session-token",
+            guest_session.token.to_string(),
+        ))
+        .header(ContentType::JSON)
+        .body(json!({ "status": "NotGoing" }).to_string())
+        .dispatch()
+        .await;
+    assert_eq!(
+        response.status(),
+        Status::Ok,
+        "NotGoing must not require ViewChannel"
+    );
+    let rsvp = response.into_json::<v0::EventRsvp>().await.expect("rsvp");
+    assert!(matches!(rsvp.status, v0::RsvpStatus::NotGoing));
+
+    // …but re-accepting is still gated on view.
+    let response = harness
+        .client
+        .put(format!("/events/event/{}/rsvp", event.id))
+        .header(Header::new(
+            "x-session-token",
+            guest_session.token.to_string(),
+        ))
+        .header(ContentType::JSON)
+        .body(json!({ "status": "Going" }).to_string())
+        .dispatch()
+        .await;
+    assert_ne!(
+        response.status(),
+        Status::Ok,
+        "Going must stay behind the view gate"
+    );
+}

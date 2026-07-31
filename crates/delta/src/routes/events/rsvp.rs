@@ -3,7 +3,7 @@ use revolt_database::{
     events::rabbit::{CalendarEventNotification, CalendarEventPayload},
     util::permissions::DatabasePermissionQuery,
     util::reference::Reference,
-    Database, EventRsvp, User, AMQP,
+    Database, EventRsvp, RsvpStatus, User, AMQP,
 };
 use revolt_models::v0;
 use revolt_permissions::{calculate_channel_permissions, ChannelPermission};
@@ -65,7 +65,10 @@ pub async fn invite_to_event(
                 return Err(create_error!(NotFound));
             }
         }
-        for member in db.fetch_all_members_with_roles(&event.server, &roles).await? {
+        for member in db
+            .fetch_all_members_with_roles(&event.server, &roles)
+            .await?
+        {
             invitees.insert(member.id.user);
         }
     }
@@ -124,6 +127,8 @@ pub async fn invite_to_event(
                 title: event.title.clone(),
                 kind: CalendarEventNotification::Invited,
                 occurrence_start: None,
+                channel_id: event.channel.clone(),
+                offset_ms: None,
             })
             .await
             .ok();
@@ -177,7 +182,17 @@ pub async fn set_rsvp(
 
     // RSVP authority must track LIVE membership/permission, not a stale invite row
     // (a removed/banned user, or one who lost ViewChannel, must not keep attending).
-    super::authorize_view(db, &user, &event).await?;
+    // EXCEPTION: the withdraw transition (`NotGoing`) needs only live membership — a
+    // user who lost view (e.g. the event moved to a channel they cannot see) must
+    // always be able to escape `Going` and its reminder pushes.
+    let target_status = super::status_from_wire(data.into_inner().status);
+    if matches!(target_status, RsvpStatus::NotGoing) {
+        db.fetch_member(&event.server, &user.id)
+            .await
+            .map_err(|_| create_error!(NotFound))?;
+    } else {
+        super::authorize_view(db, &user, &event).await?;
+    }
 
     // Only invited users may RSVP: they must already have a row (design §6/§7).
     let mut rsvp = db
@@ -185,7 +200,6 @@ pub async fn set_rsvp(
         .await
         .map_err(|_| create_error!(NotFound))?;
 
-    let target_status = super::status_from_wire(data.into_inner().status);
     rsvp.apply_response(target_status)?; // rejects a `Pending` target (finding L1)
     db.update_rsvp(&rsvp).await?;
 

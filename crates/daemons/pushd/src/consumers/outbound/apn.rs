@@ -90,6 +90,10 @@ struct CalendarEventPayload<'a> {
     kind: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     occurrence_start: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    channel_id: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    offset_ms: Option<i64>,
 }
 
 impl<'a> PayloadLike for CalendarEventPayload<'a> {
@@ -152,11 +156,7 @@ impl ApnsOutboundConsumer {
 
 #[async_trait]
 impl Consumer for ApnsOutboundConsumer {
-    async fn create(
-        db: Database,
-        connection: Arc<Connection>,
-        channel: Arc<AMQPChannel>,
-    ) -> Self {
+    async fn create(db: Database, connection: Arc<Connection>, channel: Arc<AMQPChannel>) -> Self {
         let config = revolt_config::config().await;
 
         if config.pushd.apn.pkcs8.is_empty()
@@ -398,6 +398,8 @@ impl Consumer for ApnsOutboundConsumer {
                     server_id: &alert.server_id,
                     kind: alert.kind.as_str(),
                     occurrence_start: alert.occurrence_start,
+                    channel_id: alert.channel_id.as_deref(),
+                    offset_ms: alert.offset_ms,
                 };
 
                 debug!(

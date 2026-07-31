@@ -27,11 +27,7 @@ pub struct VapidOutboundConsumer {
 
 #[async_trait]
 impl Consumer for VapidOutboundConsumer {
-    async fn create(
-        db: Database,
-        connection: Arc<Connection>,
-        channel: Arc<AMQPChannel>,
-    ) -> Self {
+    async fn create(db: Database, connection: Arc<Connection>, channel: Arc<AMQPChannel>) -> Self {
         let config = revolt_config::config().await;
 
         if config.pushd.vapid.private_key.is_empty() || config.pushd.vapid.public_key.is_empty() {
@@ -147,6 +143,8 @@ impl Consumer for VapidOutboundConsumer {
                     "server_id": alert.server_id,
                     "kind": alert.kind.as_str(),
                     "occurrence_start": alert.occurrence_start,
+                    "channel_id": alert.channel_id,
+                    "offset_ms": alert.offset_ms,
                 }))?
             }
             PayloadKind::BadgeUpdate(_) => {
