@@ -436,22 +436,33 @@ pub async fn edit_event(
     // them). A widening move (channel cleared) strands nobody — skip.
     if channel_changed {
         if let Some(channel) = &new_channel {
-            if let Ok(rsvps) = db.fetch_rsvps_for_event(&event.id).await {
-                for rsvp in rsvps {
-                    let uid = rsvp.id.user;
-                    let visible = match db.fetch_user(&uid).await {
-                        Ok(target) => {
-                            let mut query =
-                                DatabasePermissionQuery::new(db, &target).channel(channel);
-                            calculate_channel_permissions(&mut query)
-                                .await
-                                .has_channel_permission(ChannelPermission::ViewChannel)
+            // Best-effort (the move itself already committed) but never silent:
+            // a half-run prune revives the stranded-Going reminders, so every
+            // failure is captured. The NotGoing membership-only escape in
+            // `set_rsvp` caps the damage either way.
+            match db.fetch_rsvps_for_event(&event.id).await {
+                Ok(rsvps) => {
+                    for rsvp in rsvps {
+                        let uid = rsvp.id.user;
+                        let visible = match db.fetch_user(&uid).await {
+                            Ok(target) => {
+                                let mut query =
+                                    DatabasePermissionQuery::new(db, &target).channel(channel);
+                                calculate_channel_permissions(&mut query)
+                                    .await
+                                    .has_channel_permission(ChannelPermission::ViewChannel)
+                            }
+                            Err(_) => false,
+                        };
+                        if !visible {
+                            if let Err(error) = db.delete_rsvp(&event.id, &uid).await {
+                                revolt_config::capture_error(&error);
+                            }
                         }
-                        Err(_) => false,
-                    };
-                    if !visible {
-                        db.delete_rsvp(&event.id, &uid).await.ok();
                     }
+                }
+                Err(error) => {
+                    revolt_config::capture_error(&error);
                 }
             }
         }
