@@ -484,20 +484,48 @@ pub async fn control_respond(
     }))
 }
 
+/// Map the client-supplied teardown cause onto the fixed audit vocabulary.
+///
+/// The live matrix found `released` conflating five materially different
+/// events — sharer revoke, controller release, panic key, connection loss,
+/// process kill — leaving the audit unable to say whether the machine's
+/// owner yanked control back or someone hit the kill switch. The party
+/// ending its own session is the only one that knows why, so the cause is
+/// client-INFORMED — but server-CONTROLLED: only these exact strings are
+/// accepted, anything else falls back to the caller's role, and nothing a
+/// client sends is ever echoed into the audit verbatim.
+fn release_audit_reason(cause: Option<&str>, is_sharer: bool) -> &'static str {
+    match cause {
+        Some("panic") => "panic",
+        Some("connection_lost") => "connection_lost",
+        Some("anti_cheat") => "anti_cheat",
+        Some("indicator_hidden") => "indicator_hidden",
+        Some("max_lifetime") => "max_lifetime",
+        Some("display_topology_changed") => "display_topology_changed",
+        Some("calibration_rejected") => "calibration_rejected",
+        _ if is_sharer => "revoked_by_sharer",
+        _ => "released_by_controller",
+    }
+}
+
 /// # Release Control Grant
 ///
 /// End an active control grant. Grant-addressed; either party may release,
 /// and a moderator holding `MuteMembers` in the channel may revoke (the
 /// explicit moderator override — revoking a data-publish capability is a
 /// mute-shaped action).
+///
+/// `cause` refines the audit reason (see [`release_audit_reason`]); absent
+/// or unrecognised, the reason defaults by the caller's role.
 #[openapi(tag = "Remote Control")]
-#[delete("/<target>/control/<grant_id>")]
+#[delete("/<target>/control/<grant_id>?<cause>")]
 pub async fn control_release(
     db: &State<Database>,
     voice_client: &State<VoiceClient>,
     user: User,
     target: Reference<'_>,
     grant_id: String,
+    cause: Option<&str>,
 ) -> Result<EmptyResponse> {
     require_remote_control_enabled().await?;
 
@@ -512,7 +540,7 @@ pub async fn control_release(
     }
 
     let reason = if user.id == grant.sharer_id || user.id == grant.controller_id {
-        "released"
+        release_audit_reason(cause, user.id == grant.sharer_id)
     } else {
         let mut query = perms(db, &user).channel(&channel);
         let permissions = calculate_channel_permissions(&mut query).await;
@@ -599,6 +627,42 @@ mod test {
 
     // 32 zero bytes, unpadded standard base64
     const KEY32: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+
+    /// Pure predicate — no DB. The audit vocabulary is a fixed allowlist;
+    /// anything a client invents must collapse to the caller's role, or the
+    /// audit trail becomes client-authored prose.
+    #[test]
+    fn release_audit_reason_maps_causes_and_defaults_by_role() {
+        use super::release_audit_reason;
+
+        // Role defaults — the split `released` never made.
+        assert_eq!(release_audit_reason(None, true), "revoked_by_sharer");
+        assert_eq!(release_audit_reason(None, false), "released_by_controller");
+
+        // The refinements either party may assert about its own teardown.
+        for cause in [
+            "panic",
+            "connection_lost",
+            "anti_cheat",
+            "indicator_hidden",
+            "max_lifetime",
+            "display_topology_changed",
+            "calibration_rejected",
+        ] {
+            assert_eq!(release_audit_reason(Some(cause), true), cause);
+            assert_eq!(release_audit_reason(Some(cause), false), cause);
+        }
+
+        // Unknown strings NEVER pass through — including the old collapsed
+        // value, prose, and near-misses.
+        for junk in ["released", "expired", "Panic", "panic ", "owned lol", ""] {
+            assert_eq!(release_audit_reason(Some(junk), true), "revoked_by_sharer");
+            assert_eq!(
+                release_audit_reason(Some(junk), false),
+                "released_by_controller"
+            );
+        }
+    }
 
     async fn voice_channel(
         harness: &TestHarness,
