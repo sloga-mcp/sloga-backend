@@ -326,13 +326,31 @@ pub struct ApiOauthYoutube {
 ///
 /// The primary path (server templates) hits a PUBLIC, unauthenticated
 /// Discord endpoint (`GET /guilds/templates/{code}`), so it needs no
-/// credentials at all — `enabled` is the whole config. The optional bot
-/// upgrade (emojis/icon/banner) adds client_id/client_secret/bot_token
-/// later; those belong in Revolt.overrides.toml, never here.
+/// credentials at all — `enabled` gates it alone. The sticker step is the
+/// bot upgrade: it needs a Discord application whose bot the importing
+/// user adds to their guild. Both keys belong in Revolt.overrides.toml,
+/// never in the baked config.
 #[derive(Deserialize, Debug, Clone, Default)]
 pub struct ApiImportDiscord {
     #[serde(default)]
     pub enabled: bool,
+    /// Discord application id of the importer bot. Public by nature — it
+    /// appears verbatim in the bot-invite URL shown to users. Empty =
+    /// sticker import off.
+    #[serde(default)]
+    pub client_id: String,
+    /// Bot token. SECRET: read only where the outbound Discord API call is
+    /// made, never logged, never surfaced in any response body.
+    #[serde(default)]
+    pub bot_token: String,
+}
+
+impl ApiImportDiscord {
+    /// Whether the optional sticker-import step is available. The template
+    /// import can be on while this is off; never the reverse.
+    pub fn stickers_enabled(&self) -> bool {
+        self.enabled && !self.client_id.is_empty() && !self.bot_token.is_empty()
+    }
 }
 
 #[derive(Deserialize, Debug, Clone, Default)]

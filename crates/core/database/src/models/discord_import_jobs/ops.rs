@@ -102,6 +102,8 @@ mod tests {
                 channels_skipped: 2,
                 roles_created: 4,
                 roles_skipped: 1,
+                stickers_created: None,
+                stickers_skipped: None,
                 notes: vec!["skipped 2 stage channels".to_string()],
             });
             db.insert_discord_import_job(&row).await.unwrap();
@@ -129,10 +131,66 @@ mod tests {
                 row.updated_at
             );
 
+            // Slice-2 fields on a template job: absent, and read back as the
+            // defaults old rows rely on.
+            assert_eq!(fetched.kind, crate::ImportJobKind::Template);
+            assert_eq!(fetched.source_guild_id, None);
+            assert_eq!(fetched.parent_job_id, None);
+            assert_eq!(fetched.summary.as_ref().unwrap().stickers_created, None);
+
             assert!(db
                 .fetch_discord_import_job("01JOB0000000000000000000000")
                 .await
                 .is_err());
+        });
+    }
+
+    /// A sticker-kind job's slice-2 fields survive both drivers, and the
+    /// birth invariants (`stage: Stickers`, EMPTY `template_code` — what
+    /// makes the row illegible/inert to pre-slice-2 binaries) hold.
+    #[tokio::test]
+    async fn sticker_job_round_trip() {
+        database_test!(|db| async move {
+            let user = "01USER00000000000000000STK0";
+            let mut parent = job(user, "tmpl-parent");
+            parent.status = ImportStatus::Completed;
+            parent.stage = ImportStage::Done;
+            parent.server_id = Some("01SERVER0000000000000000000".to_string());
+            parent.source_guild_id = Some("1530784817975660565".to_string());
+            db.insert_discord_import_job(&parent).await.unwrap();
+
+            let mut row = DiscordImportJob::new_stickers(&parent);
+            row.summary = Some(DiscordImportSummary {
+                channels_created: 0,
+                categories_created: 0,
+                channels_skipped: 0,
+                roles_created: 0,
+                roles_skipped: 0,
+                stickers_created: Some(5),
+                stickers_skipped: Some(2),
+                notes: vec!["2 sticker(s) were too large".to_string()],
+            });
+            db.insert_discord_import_job(&row).await.unwrap();
+
+            let fetched = db.fetch_discord_import_job(&row.id).await.unwrap();
+            assert_eq!(fetched.kind, crate::ImportJobKind::Stickers);
+            assert_eq!(fetched.stage, ImportStage::Stickers);
+            assert_eq!(
+                fetched.template_code, "",
+                "must NEVER copy the parent's code"
+            );
+            assert_eq!(fetched.parent_job_id.as_deref(), Some(parent.id.as_str()));
+            assert_eq!(
+                fetched.source_guild_id.as_deref(),
+                Some("1530784817975660565")
+            );
+            assert_eq!(
+                fetched.server_id.as_deref(),
+                Some("01SERVER0000000000000000000")
+            );
+            let summary = fetched.summary.unwrap();
+            assert_eq!(summary.stickers_created, Some(5));
+            assert_eq!(summary.stickers_skipped, Some(2));
         });
     }
 

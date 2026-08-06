@@ -52,6 +52,8 @@ revolt-database = { workspace = true, features = ["tasks", "mongodb", "voice"] }
 revolt-result = { workspace = true }
 revolt-config = { workspace = true }
 revolt-files = { workspace = true }
+nanoid = { workspace = true }
+sha2 = { workspace = true }
 revolt-permissions = { workspace = true }
 revolt-presence = { workspace = true }
 revolt-models = { workspace = true }

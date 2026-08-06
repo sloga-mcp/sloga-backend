@@ -22,8 +22,8 @@ use iso8601_timestamp::Timestamp;
 use revolt_config::config;
 use revolt_database::{
     events::client::EventV1, Category, Channel, Database, DiscordImportJob, DiscordImportSummary,
-    ImportStage, ImportStatus, Invite, Member, PartialChannel, PartialServer, Role, Server,
-    SystemMessageChannels, User, AMQP,
+    ImportJobKind, ImportStage, ImportStatus, Invite, Member, PartialChannel, PartialServer, Role,
+    Server, SystemMessageChannels, User, AMQP,
 };
 use revolt_models::v0;
 use revolt_permissions::OverrideField;
@@ -57,8 +57,8 @@ const SWEEP_EVERY_N_TICKS: u32 = 10;
 /// completion write.
 const HEARTBEAT_TIMEOUT_SECS: i64 = 300;
 
-/// Why an import stopped early.
-enum ImportAbort {
+/// Why an import stopped early. Shared with the sticker worker.
+pub(super) enum ImportAbort {
     /// Genuine failure; the string is user-safe and gets stored + pushed.
     Failed(String),
     /// Another actor finalized this job while we held it. Do not write
@@ -147,7 +147,18 @@ async fn sweep_stale(db: &Database) -> Result<()> {
         //
         // Leaving an orphan behind is cheap and recoverable; deleting a real
         // server is neither. So anything ambiguous skips the rollback.
+        //
+        // KIND GATE, load-bearing: only a TEMPLATE job can ever have built the
+        // server it points at. A sticker job's `server_id` is a fully-built,
+        // LIVE server inherited from its parent — and if its owner happens to
+        // have left that server, the membership probe below answers NotFound
+        // and the ungated rollback would delete the whole thing, cascades and
+        // all, to reap a job whose worst real failure is "some stickers
+        // missing". Guarded by
+        // `reaped_sticker_job_never_rolls_back_the_server`.
+        let rollback_eligible = matches!(job.kind, ImportJobKind::Template);
         let orphan = match &job.server_id {
+            Some(_) if !rollback_eligible => None,
             Some(server_id) => match db.fetch_member(server_id, &job.user_id).await {
                 Ok(_) => None,
                 Err(error) if matches!(error.error_type, ErrorType::NotFound) => {
@@ -203,7 +214,7 @@ async fn rollback_server(db: &Database, server_id: &str) {
 /// Returns `false` if the job is no longer ours — see the ownership invariant
 /// in the module docs. Transient database errors return `true`: losing one
 /// heartbeat write is not grounds to abandon a running import.
-async fn progress(
+pub(super) async fn progress(
     db: &Database,
     job: &mut DiscordImportJob,
     stage: ImportStage,
@@ -273,16 +284,25 @@ async fn fail_job(db: &Database, job: &mut DiscordImportJob, message: String) ->
 /// Generic failure text. Anything the user could act on gets a specific
 /// message at the call site; this is the catch-all and must never leak
 /// internals.
-fn generic_failure() -> String {
+pub(super) fn generic_failure() -> String {
     "Something went wrong while importing your server. Please try again.".to_string()
 }
 
 async fn run_job(db: &Database, mut job: DiscordImportJob) {
-    match import(db, &mut job).await {
+    // Kind dispatch. The two paths share the job/progress/failure machinery
+    // but almost nothing else — in particular the sticker path NEVER rolls
+    // a server back (its `server_id` is a live server it did not build).
+    let result = match job.kind {
+        ImportJobKind::Template => import(db, &mut job).await,
+        ImportJobKind::Stickers => super::stickers::import_stickers(db, &mut job).await,
+    };
+
+    match result {
         Ok(()) => {}
         Err(ImportAbort::Superseded) => {
             // Deliberately silent: whoever finalized the job already informed
-            // the user, and any server we built was rolled back below.
+            // the user, and (for a template job) any server we built was
+            // rolled back below.
         }
         Err(ImportAbort::Failed(message)) => {
             fail_job(db, &mut job, message).await;
@@ -304,6 +324,17 @@ async fn import(db: &Database, job: &mut DiscordImportJob) -> std::result::Resul
     let fetched = template::fetch_template(&job.template_code)
         .await
         .map_err(|error: TemplateFetchError| ImportAbort::Failed(error.user_message()))?;
+
+    // Remember which guild this template came from — the optional sticker
+    // step needs it later, and only the template payload knows. Validated as
+    // a numeric snowflake HERE, because downstream it is interpolated into a
+    // bot-authenticated API URL (same hygiene as template codes; a value
+    // that fails the parse is dropped, not stored).
+    job.source_guild_id = fetched
+        .source_guild_id
+        .as_deref()
+        .filter(|id| id.parse::<u64>().is_ok())
+        .map(String::from);
 
     // The mapper refuses templates whose permission shape it cannot read with
     // certainty, rather than guessing — see `mapper::PlanError`.
@@ -785,6 +816,9 @@ async fn create_channels(
         // Both set by the caller; roles are created before this runs.
         roles_created: 0,
         roles_skipped: 0,
+        // Template jobs have no sticker counts — None keeps them off the wire.
+        stickers_created: None,
+        stickers_skipped: None,
         notes,
     };
 
@@ -1073,6 +1107,149 @@ mod tests {
         assert!(
             server.default_permissions & (ChannelPermission::ChangeAvatar as i64) != 0,
             "Sloga baseline grants must survive onto the struct ServerCreate ships"
+        );
+    }
+
+    /// **The one place slice 2 could destroy data — negative-controlled.**
+    ///
+    /// A sticker job's `server_id` is a LIVE server inherited from its
+    /// Completed parent. If its owner has since LEFT that server, the
+    /// sweeper's membership probe answers NotFound — the exact signal that,
+    /// for a template job, means "half-built orphan, roll it back". Without
+    /// the kind gate, reaping a stale sticker job would `Server::delete` a
+    /// fully-built server (cascading channels, messages, events, no undo) to
+    /// clean up a job whose worst real failure is "some stickers missing".
+    ///
+    /// The template control at the end is what makes this a real test:
+    /// remove the `ImportJobKind::Template` gate in `sweep_stale` and the
+    /// sticker half fails; break the orphan cleanup entirely and the
+    /// template half fails.
+    #[tokio::test]
+    async fn reaped_sticker_job_never_rolls_back_the_server() {
+        let db = DatabaseInfo::Reference.connect().await.unwrap();
+        let owner = make_owner(&db).await;
+
+        // A server the owner holds NO membership row for — for a template
+        // job this is the orphan condition; for a sticker job it just means
+        // the owner left after importing.
+        let (server, _) = Server::create(
+            &db,
+            v0::DataCreateServer {
+                name: "Imported".to_string(),
+                description: None,
+                nsfw: None,
+            },
+            &owner,
+            false,
+        )
+        .await
+        .unwrap();
+
+        // A Completed parent to spawn the sticker job from, exactly as the
+        // delta route does.
+        let mut parent = DiscordImportJob::new(owner.id.clone(), "tmpl".to_string());
+        parent.status = ImportStatus::Completed;
+        parent.stage = ImportStage::Done;
+        parent.server_id = Some(server.id.clone());
+        parent.source_guild_id = Some("1530784817975660565".to_string());
+        db.insert_discord_import_job(&parent).await.unwrap();
+
+        // The sticker job goes stale (its worker died mid-batch).
+        let mut sticker_job = DiscordImportJob::new_stickers(&parent);
+        sticker_job.status = ImportStatus::Running;
+        sticker_job.updated_at = Timestamp::now_utc()
+            .checked_sub(iso8601_timestamp::Duration::hours(1))
+            .unwrap();
+        db.insert_discord_import_job(&sticker_job).await.unwrap();
+
+        sweep_stale(&db).await.unwrap();
+
+        // Reaped, yes — but the server MUST survive.
+        assert_eq!(
+            db.fetch_discord_import_job(&sticker_job.id)
+                .await
+                .unwrap()
+                .status,
+            ImportStatus::Failed,
+            "the stale sticker job itself must be reaped"
+        );
+        db.fetch_server(&server.id)
+            .await
+            .expect("a reaped sticker job must NEVER take the live server with it");
+
+        // CONTROL: the identical situation on a TEMPLATE job must still roll
+        // the orphan back — proving the gate above is the kind check, not a
+        // broken cleanup.
+        let mut template_job = DiscordImportJob::new(
+            "01USER0000000000000000STKT".to_string(),
+            "tmpl2".to_string(),
+        );
+        template_job.status = ImportStatus::Running;
+        template_job.server_id = Some(server.id.clone());
+        template_job.updated_at = Timestamp::now_utc()
+            .checked_sub(iso8601_timestamp::Duration::hours(1))
+            .unwrap();
+        db.insert_discord_import_job(&template_job).await.unwrap();
+
+        sweep_stale(&db).await.unwrap();
+
+        assert!(
+            db.fetch_server(&server.id).await.is_err(),
+            "control: the ungated template path must still clean up orphans"
+        );
+    }
+
+    /// Audit #5's pin: a sticker job that FAILS must not touch the server it
+    /// points at. The failure here is the cheapest one to arrange (the
+    /// feature flag is off in the test config, so the worker fails at its
+    /// time-of-use check), but the invariant it pins is structural: no
+    /// failure path of the sticker kind may route into `rollback_server`.
+    #[tokio::test]
+    async fn failed_sticker_job_leaves_the_server_alone() {
+        let db = DatabaseInfo::Reference.connect().await.unwrap();
+        let owner = make_owner(&db).await;
+
+        let (server, _) = Server::create(
+            &db,
+            v0::DataCreateServer {
+                name: "Imported".to_string(),
+                description: None,
+                nsfw: None,
+            },
+            &owner,
+            false,
+        )
+        .await
+        .unwrap();
+
+        let mut parent = DiscordImportJob::new(owner.id.clone(), "tmpl".to_string());
+        parent.status = ImportStatus::Completed;
+        parent.stage = ImportStage::Done;
+        parent.server_id = Some(server.id.clone());
+        parent.source_guild_id = Some("1530784817975660565".to_string());
+        db.insert_discord_import_job(&parent).await.unwrap();
+
+        let mut sticker_job = DiscordImportJob::new_stickers(&parent);
+        sticker_job.status = ImportStatus::Running;
+        db.insert_discord_import_job(&sticker_job).await.unwrap();
+
+        run_job(&db, sticker_job.clone()).await;
+
+        let stored = db.fetch_discord_import_job(&sticker_job.id).await.unwrap();
+        assert_eq!(
+            stored.status,
+            ImportStatus::Failed,
+            "with the bot upgrade unconfigured the job must fail cleanly"
+        );
+        assert!(stored.error.is_some());
+
+        db.fetch_server(&server.id)
+            .await
+            .expect("a failed sticker job must never roll the live server back");
+        assert_eq!(
+            stored.server_id.as_deref(),
+            Some(server.id.as_str()),
+            "the job must keep pointing at the server it was for"
         );
     }
 }

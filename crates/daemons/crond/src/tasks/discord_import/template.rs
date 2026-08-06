@@ -16,8 +16,8 @@ use std::time::Duration;
 
 use serde::{Deserialize, Deserializer};
 
-const DISCORD_API: &str = "https://discord.com/api/v10";
-const FETCH_TIMEOUT: Duration = Duration::from_secs(30);
+pub(super) const DISCORD_API: &str = "https://discord.com/api/v10";
+pub(super) const FETCH_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Discord error code for a template that does not resolve.
 const ERR_UNKNOWN_TEMPLATE: i64 = 10057;

@@ -68,6 +68,11 @@ pub struct RevoltFeatures {
     pub oauth_youtube: bool,
     /// Whether importing a server from Discord is enabled
     pub import_discord: bool,
+    /// When the optional sticker-import step is available, the Discord
+    /// application id of the importer bot (the client builds the bot-invite
+    /// URL from it). Absent when the bot upgrade is not configured.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub import_discord_stickers: Option<String>,
     /// Whether remote desktop control during screen share is enabled
     pub remote_control: bool,
     /// Whether this server is invite only
@@ -231,6 +236,14 @@ pub async fn root() -> Result<Json<RevoltConfig>> {
             oauth_twitch: config.api.oauth.twitch.enabled,
             oauth_youtube: config.api.oauth.youtube.enabled,
             import_discord: config.api.import.discord.enabled,
+            // The client_id is public by nature (it appears verbatim in the
+            // bot-invite URL); the bot token never leaves the server.
+            import_discord_stickers: config
+                .api
+                .import
+                .discord
+                .stickers_enabled()
+                .then(|| config.api.import.discord.client_id.clone()),
             // Unlike the flags above (per-service config), this comes from
             // `features` — the real Features flags are otherwise not
             // surfaced in RevoltFeatures at all, so this is net-new

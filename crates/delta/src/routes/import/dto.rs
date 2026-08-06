@@ -4,9 +4,9 @@
 //! it carries fields the client has no business seeing (`user_id`). This is the
 //! deliberate public projection.
 //!
-//! `status` and `stage` are emitted as plain strings on purpose: later slices
-//! add stages (roles, emojis, …) and a client with a closed enum would break on
-//! an unknown value. Treat them as opaque labels.
+//! `status`, `stage` and `kind` are emitted as plain strings on purpose: later
+//! slices add stages/kinds and a client with a closed enum would break on an
+//! unknown value. Treat them as opaque labels.
 
 use revolt_database::DiscordImportJob;
 use serde::Serialize;
@@ -22,6 +22,13 @@ pub struct ImportSummaryResponse {
     pub roles_created: u32,
     /// Roles in the template that were not recreated (cap, or failed insert)
     pub roles_skipped: u32,
+    /// Stickers recreated — present only on sticker-import jobs
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stickers_created: Option<u32>,
+    /// Stickers not recreated (unsupported format, over the cap, oversize,
+    /// name collision, or failed download) — present only on sticker jobs
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stickers_skipped: Option<u32>,
     /// Human-readable notes about anything deliberately not imported
     pub notes: Vec<String>,
 }
@@ -34,8 +41,19 @@ pub struct ImportJobResponse {
     pub status: String,
     /// Current phase; treat as an opaque label
     pub stage: String,
+    /// What kind of import this is (`Template`, `Stickers`, …); treat as an
+    /// opaque label like `stage`
+    pub kind: String,
     pub done: u32,
     pub total: u32,
+    /// Discord guild the template came from — what the client builds the
+    /// bot-invite URL from when offering the sticker step
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_guild_id: Option<String>,
+    /// For a sticker job, the Completed template job it was spawned from
+    /// (what a client-side "Try again" re-POSTs against)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_job_id: Option<String>,
     /// Present once the server exists
     #[serde(skip_serializing_if = "Option::is_none")]
     pub server_id: Option<String>,
@@ -55,8 +73,11 @@ impl From<DiscordImportJob> for ImportJobResponse {
             job_id: job.id,
             status: job.status.as_variant_str().to_string(),
             stage: job.stage.as_variant_str().to_string(),
+            kind: job.kind.as_variant_str().to_string(),
             done: job.done,
             total: job.total,
+            source_guild_id: job.source_guild_id,
+            parent_job_id: job.parent_job_id,
             server_id: job.server_id,
             invite_code: job.invite_code,
             error: job.error,
@@ -66,6 +87,8 @@ impl From<DiscordImportJob> for ImportJobResponse {
                 channels_skipped: summary.channels_skipped,
                 roles_created: summary.roles_created,
                 roles_skipped: summary.roles_skipped,
+                stickers_created: summary.stickers_created,
+                stickers_skipped: summary.stickers_skipped,
                 notes: summary.notes,
             }),
         }
