@@ -833,20 +833,28 @@ mod tests {
         assert_eq!(plan.skipped_total(), 10);
     }
 
-    /// A real captured payload gets pinned here during the live smoke, the
-    /// way the template parser pins `2TffvPucqHkN` — Discord's docs have
-    /// been wrong about scalar types before.
+    /// REAL payload captured live 2026-08-06 from
+    /// `GET /guilds/1530784817975660565/stickers` (the Import Test guild),
+    /// the way the template parser pins `2TffvPucqHkN` — Discord's docs
+    /// have been wrong about scalar types before. Facts worth keeping:
+    /// `description` arrives as an EMPTY STRING (not null), `tags` is an
+    /// emoji snowflake (not a keyword), and a `user` object rides along.
     #[test]
-    fn doc_shaped_payload_parses() {
-        let payload = r#"[
-            {"id": "749054660769218631", "name": "Wave", "tags": "wumpus",
-             "type": 2, "format_type": 1, "description": "Wumpus waves",
-             "asset": "", "available": true, "guild_id": "112233"}
-        ]"#;
+    fn real_captured_payload_parses_and_plans() {
+        let payload = r#"[{"id":"1534903197930360952","name":"Sloga Logo","tags":"1534903157140754522","type":2,"format_type":1,"description":"","asset":"","available":true,"guild_id":"1530784817975660565","user":{"id":"237728279405133824","username":"jcs_netherspite","avatar":"e37d7eae57febd30b2e7b6f4991fff8a","discriminator":"0","public_flags":0,"flags":0,"banner":null,"accent_color":null,"global_name":"Ding","avatar_decoration_data":null,"collectibles":null,"display_name_styles":null,"banner_color":null,"clan":null,"primary_guild":null}}]"#;
         let stickers: Vec<GuildSticker> = serde_json::from_str(payload).unwrap();
         assert_eq!(stickers.len(), 1);
-        assert_eq!(stickers[0].name, "Wave");
+        assert_eq!(stickers[0].name, "Sloga Logo");
         assert_eq!(stickers[0].format_type, 1);
         assert_eq!(stickers[0].available, Some(true));
+
+        let plan = plan_stickers(stickers, &HashSet::new(), 0, 60);
+        assert_eq!(plan.planned.len(), 1);
+        assert_eq!(plan.planned[0].discord_id, 1534903197930360952);
+        // The empty-string description must collapse to None, not create a
+        // sticker with a blank description.
+        assert_eq!(plan.planned[0].description, None);
+        // This exact plan produced "Imported 1 stickers." in the live smoke.
+        assert_eq!(plan.skipped_total(), 0);
     }
 }

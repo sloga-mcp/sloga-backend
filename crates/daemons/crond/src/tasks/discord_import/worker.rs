@@ -1203,8 +1203,12 @@ mod tests {
     /// server it points at, nor the stickers already created.
     ///
     /// Two legs, both network-free:
-    /// 1. FAILED — the flag is off in the test config, so the worker fails
-    ///    at its time-of-use check. Server + pre-created sticker survive.
+    /// 1. FAILED — the job carries a non-numeric `source_guild_id`, so the
+    ///    worker fails at its snowflake re-validation. Deliberately NOT the
+    ///    feature-flag check: this box's real config has the bot keys
+    ///    installed, and a test that leans on ambient config goes live (and
+    ///    completes!) the day the flag turns on. Server + pre-created
+    ///    sticker survive.
     /// 2. STALE SNAPSHOT — another actor already finalized the job, and a
     ///    worker holding the old Running snapshot runs it. The terminal
     ///    state must not be clobbered and nothing may be rolled back —
@@ -1255,9 +1259,11 @@ mod tests {
         parent.source_guild_id = Some("1530784817975660565".to_string());
         db.insert_discord_import_job(&parent).await.unwrap();
 
-        // Leg 1: genuine failure.
+        // Leg 1: genuine failure — the invalid guild id fails the worker's
+        // snowflake re-validation before anything can leave the process.
         let mut sticker_job = DiscordImportJob::new_stickers(&parent);
         sticker_job.status = ImportStatus::Running;
+        sticker_job.source_guild_id = Some("not-a-snowflake".to_string());
         db.insert_discord_import_job(&sticker_job).await.unwrap();
 
         run_job(&db, sticker_job.clone()).await;
@@ -1266,7 +1272,7 @@ mod tests {
         assert_eq!(
             stored.status,
             ImportStatus::Failed,
-            "with the bot upgrade unconfigured the job must fail cleanly"
+            "an unusable guild id must fail the job cleanly"
         );
         assert!(stored.error.is_some());
 
@@ -1288,6 +1294,10 @@ mod tests {
         // touch anything.
         let mut second = DiscordImportJob::new_stickers(&parent);
         second.status = ImportStatus::Running;
+        // Also non-numeric: whichever path the worker takes with the stale
+        // snapshot (fail or Superseded), it must stay off the network and
+        // the assertions below hold either way.
+        second.source_guild_id = Some("not-a-snowflake".to_string());
         db.insert_discord_import_job(&second).await.unwrap();
 
         let stale_snapshot = second.clone();
