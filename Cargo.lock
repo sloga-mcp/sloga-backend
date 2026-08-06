@@ -7302,6 +7302,7 @@ dependencies = [
  "iso8601-timestamp",
  "lapin",
  "log",
+ "nanoid",
  "redis-kiss",
  "reqwest 0.13.4",
  "revolt-config",
@@ -7314,6 +7315,7 @@ dependencies = [
  "revolt_optional_struct",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "tokio",
  "ulid",
 ]

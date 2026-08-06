@@ -134,7 +134,8 @@ pub async fn import_discord_template(
         return Err(create_error!(CantCreateServers));
     }
 
-    let code = extract_template_code(&data.template).ok_or_else(|| create_error!(InvalidOperation))?;
+    let code =
+        extract_template_code(&data.template).ok_or_else(|| create_error!(InvalidOperation))?;
 
     // Fail fast on the server quota rather than after doing all the work —
     // the worker enforces it again at creation time.
@@ -191,7 +192,13 @@ mod tests {
 
     #[test]
     fn returns_none_for_empty_and_hostonly_input() {
-        for input in ["", "   ", "https://discord.new/", "discord.new", "discord.com"] {
+        for input in [
+            "",
+            "   ",
+            "https://discord.new/",
+            "discord.new",
+            "discord.com",
+        ] {
             assert!(
                 extract_template_code(input).is_none(),
                 "expected None for {input:?}"
