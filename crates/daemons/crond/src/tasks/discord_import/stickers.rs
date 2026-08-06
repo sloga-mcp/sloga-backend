@@ -122,8 +122,14 @@ async fn fetch_guild_stickers(
     guild_id: u64,
     bot_token: &str,
 ) -> Result<Vec<GuildSticker>, StickerFetchError> {
+    // Tight redirect policy + https-only (plan §6): this client carries the
+    // bot token, so it must never be walked off to another scheme or into a
+    // redirect chain. (reqwest strips Authorization cross-host anyway; this
+    // makes the posture explicit.)
     let client = reqwest::Client::builder()
         .timeout(FETCH_TIMEOUT)
+        .redirect(reqwest::redirect::Policy::limited(2))
+        .https_only(true)
         .build()
         .map_err(|e| StickerFetchError::Network(e.to_string()))?;
 
@@ -378,6 +384,11 @@ async fn store_sticker_file(
     let config = config().await;
     let hash_hex = format!("{:02x}", sha2::Sha256::digest(buf));
 
+    // ACCEPTED RESIDUAL: content-addressed reuse means byte-identical media
+    // uploaded earlier through autumn keeps ITS hash metadata (e.g. an APNG
+    // autumn sniffed as image/png) — the Sticker row's `format` is still
+    // correct (it comes from format_type), only serving metadata can be
+    // stale, and only for byte-identical prior uploads.
     let file_hash = match db.fetch_attachment_hash(&hash_hex).await {
         Ok(hash) if !hash.iv.is_empty() => hash,
         _ => {
@@ -399,7 +410,12 @@ async fn store_sticker_file(
                 content_type: planned.content_type.to_owned(),
                 size: (buf.len() + AUTHENTICATION_TAG_SIZE_BYTES) as isize,
             };
-            db.insert_attachment_hash(&fresh).await.map_err(|_| ())?;
+            // Duplicate-insert errors are IGNORED on purpose, exactly like the
+            // seeder: a crashed earlier attempt can leave a `{iv: ""}` hash
+            // row behind, and failing here would wedge that sticker forever —
+            // every retry would re-insert, hit the duplicate id, and error.
+            // The heal is to fall through and (re)upload + set the nonce.
+            let _ = db.insert_attachment_hash(&fresh).await;
             let nonce = upload_to_s3(&fresh.bucket_id, &fresh.id, buf)
                 .await
                 .map_err(|_| ())?;
@@ -537,8 +553,12 @@ pub(super) async fn import_stickers(
         return Err(ImportAbort::Superseded);
     }
 
+    // Same tight policy as the list fetch (plan §6): the CDN 302s at most
+    // once to a media host, and nothing here may ever leave https.
     let client = reqwest::Client::builder()
         .timeout(FETCH_TIMEOUT)
+        .redirect(reqwest::redirect::Policy::limited(2))
+        .https_only(true)
         .build()
         .map_err(|_| ImportAbort::Failed(generic_failure()))?;
 

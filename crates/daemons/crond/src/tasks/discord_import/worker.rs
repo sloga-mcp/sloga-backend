@@ -1199,11 +1199,23 @@ mod tests {
         );
     }
 
-    /// Audit #5's pin: a sticker job that FAILS must not touch the server it
-    /// points at. The failure here is the cheapest one to arrange (the
-    /// feature flag is off in the test config, so the worker fails at its
-    /// time-of-use check), but the invariant it pins is structural: no
-    /// failure path of the sticker kind may route into `rollback_server`.
+    /// Audit #5's pin: no failure path of the sticker kind may touch the
+    /// server it points at, nor the stickers already created.
+    ///
+    /// Two legs, both network-free:
+    /// 1. FAILED — the flag is off in the test config, so the worker fails
+    ///    at its time-of-use check. Server + pre-created sticker survive.
+    /// 2. STALE SNAPSHOT — another actor already finalized the job, and a
+    ///    worker holding the old Running snapshot runs it. The terminal
+    ///    state must not be clobbered and nothing may be rolled back —
+    ///    this is the same save-if-active discipline whose TEMPLATE-side
+    ///    counterpart deliberately DOES roll a server back (worker::import's
+    ///    Superseded arm), which is exactly the refactor hazard this pins.
+    ///
+    /// Honest limitation: a batch-interior Superseded (mid-download) needs a
+    /// live Discord response and can't run here; the reachable-in-test legs
+    /// plus `reaped_sticker_job_never_rolls_back_the_server` cover every
+    /// rollback entry point that exists today.
     #[tokio::test]
     async fn failed_sticker_job_leaves_the_server_alone() {
         let db = DatabaseInfo::Reference.connect().await.unwrap();
@@ -1222,6 +1234,20 @@ mod tests {
         .await
         .unwrap();
 
+        // A sticker a previous (partially successful) run already created —
+        // a retry gone wrong must not cost the user what they already have.
+        let existing_sticker = revolt_database::Sticker {
+            id: "stickerstickerstickersticker00000000000000".to_string(),
+            server_id: server.id.clone(),
+            creator_id: owner.id.clone(),
+            name: "already-imported".to_string(),
+            description: None,
+            file_id: "stickerstickerstickersticker00000000000000".to_string(),
+            format: revolt_database::StickerFormat::PNG,
+            nsfw: false,
+        };
+        existing_sticker.create(&db).await.unwrap();
+
         let mut parent = DiscordImportJob::new(owner.id.clone(), "tmpl".to_string());
         parent.status = ImportStatus::Completed;
         parent.stage = ImportStage::Done;
@@ -1229,6 +1255,7 @@ mod tests {
         parent.source_guild_id = Some("1530784817975660565".to_string());
         db.insert_discord_import_job(&parent).await.unwrap();
 
+        // Leg 1: genuine failure.
         let mut sticker_job = DiscordImportJob::new_stickers(&parent);
         sticker_job.status = ImportStatus::Running;
         db.insert_discord_import_job(&sticker_job).await.unwrap();
@@ -1246,10 +1273,41 @@ mod tests {
         db.fetch_server(&server.id)
             .await
             .expect("a failed sticker job must never roll the live server back");
+        db.fetch_sticker(&existing_sticker.id)
+            .await
+            .expect("previously imported stickers must survive a failed retry");
         assert_eq!(
             stored.server_id.as_deref(),
             Some(server.id.as_str()),
             "the job must keep pointing at the server it was for"
         );
+
+        // Leg 2: stale snapshot of an already-finalized job. Another actor
+        // (a second crond's sweeper, in real life) completed it; running the
+        // old Running snapshot must neither clobber the terminal state nor
+        // touch anything.
+        let mut second = DiscordImportJob::new_stickers(&parent);
+        second.status = ImportStatus::Running;
+        db.insert_discord_import_job(&second).await.unwrap();
+
+        let stale_snapshot = second.clone();
+        second.status = ImportStatus::Completed;
+        second.stage = ImportStage::Done;
+        assert!(db.save_discord_import_job_if_active(&second).await.unwrap());
+
+        run_job(&db, stale_snapshot).await;
+
+        let stored = db.fetch_discord_import_job(&second.id).await.unwrap();
+        assert_eq!(
+            stored.status,
+            ImportStatus::Completed,
+            "a stale worker must not write Failed over a finalized sticker job"
+        );
+        db.fetch_server(&server.id)
+            .await
+            .expect("the stale-snapshot path must not roll the server back either");
+        db.fetch_sticker(&existing_sticker.id)
+            .await
+            .expect("nor may it touch existing stickers");
     }
 }
