@@ -114,6 +114,15 @@ impl<'a> RatelimitResolver<Request<'a>> for DeltaRatelimits {
                         return ("soundboard", Some(id));
                     }
 
+                    // Live captions are speech-paced rather than user-paced —
+                    // one request per finalized utterance — so they need their
+                    // own generous bucket. Sharing `soundboard` (4/10s) would
+                    // silently swallow captions the moment anyone spoke in
+                    // short sentences.
+                    if request.method() == Method::Post && extra == Some("captions") {
+                        return ("captions", Some(id));
+                    }
+
                     // Following an announcement channel creates a webhook in
                     // the target and fans events to two server topics — bound
                     // it separately (both POST create and DELETE unfollow live
@@ -288,6 +297,12 @@ impl<'a> RatelimitResolver<Request<'a>> for DeltaRatelimits {
             "softres_reserve" => 10,
             "message_schedule" => 10,
             "soundboard" => 4,
+            // One request per FINALIZED utterance (interims never leave the
+            // speaker's screen). Rapid short utterances — "yes", "right",
+            // "okay" — can finalize about once a second, and the bucket window
+            // is 10s, so this leaves roughly 3x headroom over natural speech
+            // while still bounding a hostile client.
+            "captions" => 30,
             // Offer + respond are deliberate, user-paced actions.
             "remote_control_offer" => 2,
             // Heartbeat + release. The heartbeat is SHARER-driven consent

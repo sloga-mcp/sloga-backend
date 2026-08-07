@@ -1,5 +1,6 @@
 mod bots;
 mod call_recording;
+mod captions;
 mod discover;
 mod calendar_events;
 mod channel_follows;
@@ -35,6 +36,7 @@ mod sessions;
 
 pub use bots::*;
 pub use call_recording::*;
+pub use captions::*;
 pub use discover::*;
 pub use calendar_events::*;
 pub use channel_follows::*;

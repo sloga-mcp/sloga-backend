@@ -2,6 +2,7 @@ use revolt_rocket_okapi::revolt_okapi::openapi3::OpenApi;
 use rocket::Route;
 
 mod call_recording;
+mod captions_send;
 mod channel_ack;
 mod channel_delete;
 mod channel_edit;
@@ -91,6 +92,7 @@ pub fn routes() -> (Vec<Route>, OpenApi) {
         voice_join::call,
         voice_stop_ring::stop_ring,
         soundboard_trigger::trigger_sound,
+        captions_send::send_caption,
         call_recording::recording_start,
         call_recording::recording_stop,
         remote_control::control_offer,

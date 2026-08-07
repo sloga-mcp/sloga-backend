@@ -311,6 +311,30 @@ pub enum EventV1 {
         emoji: Option<String>,
     },
 
+    /// One finalized live caption from a speaker in a voice call.
+    ///
+    /// Fanned to the call's CURRENT PARTICIPANTS over their private topics,
+    /// deliberately NOT to the channel topic: the channel topic's
+    /// authorization boundary is ViewChannel, so a text-channel lurker who
+    /// never joined the call would otherwise receive a live transcript of it.
+    /// Same reasoning as the remote-control offer events.
+    ///
+    /// Transient — never persisted. `identity` is the speaker's SFU identity
+    /// (device-qualified on E2EE-capable calls), resolved server-side so a
+    /// client can key the caption straight onto the right participant tile
+    /// and cannot address someone else's.
+    CallCaption {
+        channel_id: String,
+        /// Speaker's LiveKit identity — what the participant tiles are keyed by
+        identity: String,
+        /// Speaker's user id (identity minus any device qualifier)
+        user_id: String,
+        /// Transcript text, clamped to the client's display cap
+        text: String,
+        /// BCP-47 language the speaker was recognized in
+        lang: String,
+    },
+
     /// New report
     ReportCreate(Report),
     /// New channel
