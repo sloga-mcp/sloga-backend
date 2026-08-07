@@ -1,6 +1,9 @@
 use iso8601_timestamp::Timestamp;
 use revolt_database::FieldsUser;
-use revolt_database::{util::reference::Reference, Database, File, PartialUser, User, UserActivity};
+use revolt_database::{
+    util::{name_filter::contains_blocked_slur, reference::Reference},
+    Database, File, PartialUser, User, UserActivity,
+};
 use revolt_models::v0;
 use revolt_result::{create_error, Result};
 use rocket::serde::json::Json;
@@ -28,6 +31,14 @@ pub async fn edit(
     // Filter out invalid edit fields
     if !user.privileged && (data.badges.is_some() || data.flags.is_some()) {
         return Err(create_error!(NotPrivileged));
+    }
+
+    // Display names get the same slur filter as usernames — they are what
+    // everyone actually reads.
+    if let Some(display_name) = &data.display_name {
+        if contains_blocked_slur(display_name) {
+            return Err(create_error!(DisallowedName));
+        }
     }
 
     // If we want to edit a different user than self, ensure we have
@@ -197,6 +208,49 @@ mod tests {
             .expect("`activity`");
         assert_eq!(activity.name, "Celeste".to_string());
         assert!(activity.started_at.is_some());
+    }
+
+    #[rocket::async_test]
+    async fn reject_slur_in_display_name() {
+        let harness = TestHarness::new().await;
+        let (_, session, _) = harness.new_user().await;
+
+        // Leetspeak and separator padding are folded before matching, so this
+        // is rejected the same way the plain spelling is.
+        let response = TestHarness::with_session(
+            session,
+            harness
+                .client
+                .patch("/users/@me")
+                .header(ContentType::JSON)
+                .body(json!({ "display_name": "n1gg3r" }).to_string()),
+        )
+        .await;
+
+        assert_eq!(response.status(), Status::BadRequest);
+    }
+
+    #[rocket::async_test]
+    async fn allow_display_name_that_merely_looks_like_one() {
+        let harness = TestHarness::new().await;
+        let (_, session, _) = harness.new_user().await;
+
+        // "Spicy" contains a blocked whole word and "Nigerian" is one `g` short
+        // of one — neither may cost somebody their name.
+        let response = TestHarness::with_session(
+            session,
+            harness
+                .client
+                .patch("/users/@me")
+                .header(ContentType::JSON)
+                .body(json!({ "display_name": "Spicy Nigerian Chef" }).to_string()),
+        )
+        .await;
+
+        assert_eq!(response.status(), Status::Ok);
+
+        let user = response.into_json::<v0::User>().await.expect("`User`");
+        assert_eq!(user.display_name, Some("Spicy Nigerian Chef".to_string()));
     }
 
     #[rocket::async_test]

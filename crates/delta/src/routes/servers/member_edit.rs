@@ -3,6 +3,7 @@ use std::collections::HashSet;
 use revolt_database::{
     events::client::EventV1,
     util::{
+        name_filter::contains_blocked_slur,
         permissions::{perms, DatabasePermissionQuery},
         reference::Reference,
     },
@@ -69,6 +70,14 @@ pub async fn edit(
             error: error.to_string()
         })
     })?;
+
+    // A nickname is the display name everyone in the server reads, so it gets
+    // the same slur filter as usernames and display names.
+    if let Some(nickname) = &data.nickname {
+        if contains_blocked_slur(nickname) {
+            return Err(create_error!(DisallowedName));
+        }
+    }
 
     // Fetch server and member
     let server = server_id.as_server(db).await?;
@@ -900,6 +909,51 @@ mod test {
         delete_channel_voice_state(&uvc, &[target.id.clone()])
             .await
             .expect("cleanup");
+    }
+
+    // ---- nickname slur filter --------------------------------------------
+
+    #[rocket::async_test]
+    async fn reject_slur_in_nickname() {
+        let harness = TestHarness::new().await;
+        let (_, session, user) = harness.new_user().await;
+        let (server, _channels) = harness.new_server(&user).await;
+        Member::create(&harness.db, &server, &user, None)
+            .await
+            .expect("member");
+
+        // Punctuation between the letters is stripped before matching.
+        let response = edit_member(
+            &harness,
+            &session.token,
+            &server.id,
+            &user.id,
+            serde_json::json!({ "nickname": "F.A.G." }),
+        )
+        .await;
+
+        assert_eq!(response.status(), Status::BadRequest);
+    }
+
+    #[rocket::async_test]
+    async fn allow_ordinary_nickname() {
+        let harness = TestHarness::new().await;
+        let (_, session, user) = harness.new_user().await;
+        let (server, _channels) = harness.new_server(&user).await;
+        Member::create(&harness.db, &server, &user, None)
+            .await
+            .expect("member");
+
+        let response = edit_member(
+            &harness,
+            &session.token,
+            &server.id,
+            &user.id,
+            serde_json::json!({ "nickname": "Spicy Chef" }),
+        )
+        .await;
+
+        assert_eq!(response.status(), Status::Ok);
     }
 
     // ---- which edits require a sync (pure) -------------------------------

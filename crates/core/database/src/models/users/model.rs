@@ -3,6 +3,7 @@ use std::{collections::HashSet, str::FromStr, time::Duration};
 use crate::{
     events::client::EventV1,
     util::email::{email_templates, send_email},
+    util::name_filter::contains_blocked_slur,
     Database, File, RatelimitEvent, AMQP,
 };
 
@@ -348,7 +349,8 @@ impl User {
 
     /// Validate a username
     ///
-    /// This will check if the username is a blocked name or contains a blocked pattern.
+    /// This will check if the username is a blocked name, contains a blocked
+    /// pattern, or contains a slur.
     fn validate_username(username: &str) -> Result<()> {
         let username_lowercase = username.to_lowercase();
 
@@ -379,6 +381,7 @@ impl User {
 
         if BLOCKED_USERNAMES.contains(&username_lowercase.as_str())
             || BLOCKED_USERNAME_PATTERNS.is_match(username)
+            || contains_blocked_slur(username)
         {
             return Err(create_error!(InvalidUsername));
         }
@@ -1089,6 +1092,14 @@ mod tests {
 
         assert_ne!(username_homoglyphs, username_homoglyphs_sanitised);
         assert_eq!("funny", username_homoglyphs_sanitised);
+    }
+
+    #[test]
+    fn username_validation_slurs() {
+        // The filter itself is covered in `util::name_filter`; this pins the
+        // fact that usernames actually go through it.
+        assert!(User::validate_username("N1gg3r").is_err());
+        assert!(User::validate_username("Spicy").is_ok());
     }
 
     #[tokio::test]

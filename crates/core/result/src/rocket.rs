@@ -18,6 +18,7 @@ impl<'r> Responder<'r, 'static> for Error {
 
             ErrorType::UnknownUser => Status::NotFound,
             ErrorType::InvalidUsername => Status::BadRequest,
+            ErrorType::DisallowedName => Status::BadRequest,
             ErrorType::UsernameTaken => Status::Conflict,
             ErrorType::DiscriminatorChangeRatelimited => Status::TooManyRequests,
             ErrorType::AlreadyFriends => Status::Conflict,

@@ -7,6 +7,7 @@ pub mod email;
 mod funcs;
 pub mod idempotency;
 pub mod ip;
+pub mod name_filter;
 pub mod password;
 pub mod permissions;
 pub mod reference;

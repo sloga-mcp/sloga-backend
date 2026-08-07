@@ -16,6 +16,7 @@ impl IntoResponse for Error {
 
             ErrorType::UnknownUser => StatusCode::NOT_FOUND,
             ErrorType::InvalidUsername => StatusCode::BAD_REQUEST,
+            ErrorType::DisallowedName => StatusCode::BAD_REQUEST,
             ErrorType::UsernameTaken => StatusCode::CONFLICT,
             ErrorType::DiscriminatorChangeRatelimited => StatusCode::TOO_MANY_REQUESTS,
             ErrorType::AlreadyFriends => StatusCode::CONFLICT,

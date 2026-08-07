@@ -63,6 +63,9 @@ pub enum ErrorType {
     // ? User related errors
     UsernameTaken,
     InvalidUsername,
+    /// A display name or server nickname contains something we don't allow
+    /// people to be called on the platform
+    DisallowedName,
     DiscriminatorChangeRatelimited,
     UnknownUser,
     AlreadyFriends,
