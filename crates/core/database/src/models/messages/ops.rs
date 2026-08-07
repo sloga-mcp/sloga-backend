@@ -8,6 +8,15 @@ use crate::{AppendMessage, FieldsMessage, Message, MessageQuery, PartialMessage}
 mod mongodb;
 mod reference;
 
+/// What a channel's unread tail looks like, for the sidebar badge.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct UnreadSummary {
+    /// Messages after the read pointer, saturating at `UNREAD_COUNT_CAP`
+    pub count: u32,
+    /// Whether any of them carries an attachment
+    pub attachments: bool,
+}
+
 #[async_trait]
 pub trait AbstractMessages: Sync + Send {
     /// Insert a new message into the database
@@ -47,6 +56,18 @@ pub trait AbstractMessages: Sync + Send {
     /// filter only scans one hour of one channel.
     async fn count_crossposts_since(&self, channel: &str, min_id: &str) -> Result<usize>;
 
+    /// Summarise the messages sitting after a user's read pointer in a channel:
+    /// how many there are (stopping at `UNREAD_COUNT_CAP`) and whether any of
+    /// them carries an attachment. `after_id` is exclusive; `None` means the
+    /// channel was never acknowledged, so everything counts. `channel` + `_id`
+    /// lead the predicate, and the count is capped, so this stays an index-only
+    /// scan of at most one cap's worth of entries per channel.
+    async fn summarise_unread(
+        &self,
+        channel: &str,
+        after_id: Option<&str>,
+    ) -> Result<UnreadSummary>;
+
     /// Delete a message from the database by its id
     async fn delete_message(&self, id: &str) -> Result<()>;
 
@@ -68,6 +89,28 @@ pub trait AbstractMessages: Sync + Send {
 mod tests {
     use crate::{Message, PartialMessage};
     use revolt_models::v0;
+
+    /// Minimal attachment — only its presence matters to the unread summary.
+    fn attachment_file(seed: u64) -> crate::File {
+        crate::File {
+            id: format!("01FILE{seed:021}"),
+            tag: "attachments".to_string(),
+            filename: "note.txt".to_string(),
+            hash: None,
+            uploaded_at: None,
+            uploader_id: None,
+            used_for: None,
+            deleted: None,
+            reported: None,
+            metadata: crate::Metadata::File,
+            content_type: "text/plain".to_string(),
+            size: 1,
+            message_id: None,
+            user_id: None,
+            server_id: None,
+            object_id: None,
+        }
+    }
 
     fn button(id: &str) -> v0::Component {
         v0::Component::Button {
@@ -174,6 +217,79 @@ mod tests {
             assert_eq!(
                 db.count_crossposts_since(channel, &tighter).await.unwrap(),
                 6
+            );
+        });
+    }
+
+    #[tokio::test]
+    async fn summarise_unread_scopes_by_channel_and_read_pointer() {
+        database_test!(|db| async move {
+            use revolt_models::v0::UNREAD_COUNT_CAP;
+
+            let channel = "01CHANUNREAD0000000000000001";
+            let other_channel = "01CHANUNREAD0000000000000002";
+
+            let mk = |ms: u64, rand: u128, chan: &str, attachment: bool| Message {
+                id: ulid::Ulid::from_parts(ms, rand).to_string(),
+                channel: chan.to_string(),
+                author: "01USER000000000000000000000".to_string(),
+                content: Some("hello".to_string()),
+                attachments: attachment.then(|| vec![attachment_file(ms)]),
+                ..Default::default()
+            };
+
+            // Five plain messages at ms 1000, 2000 .. 5000.
+            for i in 0..5u64 {
+                db.insert_message(&mk(1_000 + i * 1_000, 1, channel, false))
+                    .await
+                    .unwrap();
+            }
+            // Another channel's traffic must not leak in.
+            db.insert_message(&mk(3_000, 9, other_channel, true))
+                .await
+                .unwrap();
+
+            // No read pointer — everything in the channel counts.
+            let all = db.summarise_unread(channel, None).await.unwrap();
+            assert_eq!(all.count, 5);
+            assert!(!all.attachments);
+
+            // The pointer is exclusive: acking ms 3000 leaves 4000 and 5000.
+            let pointer = ulid::Ulid::from_parts(3_000, 1).to_string();
+            let tail = db.summarise_unread(channel, Some(&pointer)).await.unwrap();
+            assert_eq!(tail.count, 2);
+            assert!(!tail.attachments);
+
+            // An attachment anywhere in the tail raises the flag, and one
+            // before the pointer does not.
+            db.insert_message(&mk(500, 2, channel, true)).await.unwrap();
+            db.insert_message(&mk(4_500, 3, channel, true))
+                .await
+                .unwrap();
+            assert!(
+                db.summarise_unread(channel, Some(&pointer))
+                    .await
+                    .unwrap()
+                    .attachments
+            );
+            let late = ulid::Ulid::from_parts(4_600, 0).to_string();
+            assert!(
+                !db.summarise_unread(channel, Some(&late))
+                    .await
+                    .unwrap()
+                    .attachments
+            );
+
+            // The count saturates rather than walking the whole tail.
+            let deep = "01CHANUNREAD0000000000000003";
+            for i in 0..(UNREAD_COUNT_CAP as u64 + 5) {
+                db.insert_message(&mk(10_000 + i, 1, deep, false))
+                    .await
+                    .unwrap();
+            }
+            assert_eq!(
+                db.summarise_unread(deep, None).await.unwrap().count,
+                UNREAD_COUNT_CAP
             );
         });
     }

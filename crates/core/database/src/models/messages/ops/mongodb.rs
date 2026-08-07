@@ -2,7 +2,7 @@ use bson::{to_bson, Document};
 use futures::try_join;
 use futures::StreamExt;
 use mongodb::options::FindOptions;
-use revolt_models::v0::MessageSort;
+use revolt_models::v0::{MessageSort, UNREAD_COUNT_CAP};
 use revolt_result::Result;
 use std::collections::{HashMap, HashSet};
 use std::time::SystemTime;
@@ -13,7 +13,7 @@ use crate::{
     MessageTimePeriod, MongoDb, PartialMessage,
 };
 
-use super::AbstractMessages;
+use super::{AbstractMessages, UnreadSummary};
 
 static COL: &str = "messages";
 
@@ -254,6 +254,65 @@ impl AbstractMessages for MongoDb {
             }
         )
         .map(|count| count as usize)
+    }
+
+    /// Summarise the unread tail of a channel.
+    ///
+    /// One aggregation, bounded by `$limit`: `channel` + `_id` lead the match so
+    /// the sort is served straight off the index, and the group only ever sees a
+    /// cap's worth of documents — a channel with 50k unread messages costs the
+    /// same as one with 100.
+    async fn summarise_unread(
+        &self,
+        channel: &str,
+        after_id: Option<&str>,
+    ) -> Result<UnreadSummary> {
+        let mut filter = doc! { "channel": channel };
+        if let Some(after_id) = after_id {
+            filter.insert("_id", doc! { "$gt": after_id });
+        }
+
+        let mut cursor = self
+            .col::<Document>(COL)
+            .aggregate(vec![
+                doc! { "$match": filter },
+                doc! { "$sort": { "_id": 1 } },
+                doc! { "$limit": UNREAD_COUNT_CAP as i64 },
+                doc! { "$group": {
+                    "_id": null,
+                    "count": { "$sum": 1 },
+                    "attachments": { "$max": {
+                        "$cond": [
+                            { "$gt": [ { "$size": { "$ifNull": [ "$attachments", [] ] } }, 0 ] },
+                            1,
+                            0
+                        ]
+                    } }
+                } },
+            ])
+            .await
+            .map_err(|_| create_database_error!("aggregate", COL))?;
+
+        // Empty tail — the group stage emits nothing at all.
+        let Some(doc) = cursor.next().await else {
+            return Ok(UnreadSummary::default());
+        };
+
+        let doc = doc.map_err(|_| create_database_error!("aggregate", COL))?;
+
+        // `$sum`/`$max` are Int32 at this scale, but read either width rather
+        // than silently reporting zero if the server ever widens them.
+        let int = |key: &str| {
+            doc.get_i32(key)
+                .map(i64::from)
+                .or_else(|_| doc.get_i64(key))
+                .unwrap_or_default()
+        };
+
+        Ok(UnreadSummary {
+            count: int("count").clamp(0, UNREAD_COUNT_CAP as i64) as u32,
+            attachments: int("attachments") > 0,
+        })
     }
 
     /// Add a new reaction to a message

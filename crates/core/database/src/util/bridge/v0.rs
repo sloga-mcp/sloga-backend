@@ -89,6 +89,10 @@ impl From<crate::ChannelUnread> for ChannelUnread {
             id: value.id.into(),
             last_id: value.last_id,
             mentions: value.mentions.unwrap_or_default(),
+            // Counting the unread tail needs the messages collection, so it is
+            // stamped on afterwards by `util::unreads::fetch_unreads_with_summary`.
+            count: 0,
+            attachments: false,
         }
     }
 }

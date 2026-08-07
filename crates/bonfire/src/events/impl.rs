@@ -5,6 +5,7 @@ use redis_kiss::AsyncCommands;
 use revolt_database::{
     events::client::{EventV1, ReadyPayloadFields},
     util::permissions::DatabasePermissionQuery,
+    util::unreads::fetch_unreads_with_summary,
     voice::{get_channel_voice_state, UserVoiceChannel},
     Channel, Database, Member, MemberCompositeKey, Presence, RelationshipStatus,
 };
@@ -304,15 +305,10 @@ impl State {
             None
         };
 
-        // Fetch channel unreads
+        // Fetch channel unreads, each stamped with its unread-tail summary so
+        // the sidebar can draw a count rather than a bare dot
         let channel_unreads = if fields.channel_unreads {
-            Some(
-                db.fetch_unreads(&user.id)
-                    .await?
-                    .into_iter()
-                    .map(|unread| unread.into())
-                    .collect(),
-            )
+            Some(fetch_unreads_with_summary(db, &user.id).await?)
         } else {
             None
         };

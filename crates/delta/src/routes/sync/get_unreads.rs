@@ -1,3 +1,4 @@
+use revolt_database::util::unreads::fetch_unreads_with_summary;
 use revolt_database::{Database, User};
 use revolt_models::v0;
 use revolt_result::Result;
@@ -10,8 +11,5 @@ use rocket::State;
 #[openapi(tag = "Sync")]
 #[get("/unreads")]
 pub async fn unreads(db: &State<Database>, user: User) -> Result<Json<Vec<v0::ChannelUnread>>> {
-    db.fetch_unreads(&user.id)
-        .await
-        .map(|v| v.into_iter().map(|u| u.into()).collect())
-        .map(Json)
+    fetch_unreads_with_summary(db, &user.id).await.map(Json)
 }

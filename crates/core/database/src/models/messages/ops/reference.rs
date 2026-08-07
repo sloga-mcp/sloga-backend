@@ -3,14 +3,14 @@ use crate::{
     ReferenceDb,
 };
 use futures::future::try_join_all;
-use revolt_models::v0::MessageSort;
+use revolt_models::v0::{MessageSort, UNREAD_COUNT_CAP};
 use indexmap::IndexSet;
 use revolt_result::Result;
 use std::collections::HashMap;
 use std::time::SystemTime;
 use ulid::Ulid;
 
-use super::AbstractMessages;
+use super::{AbstractMessages, UnreadSummary};
 
 #[async_trait]
 impl AbstractMessages for ReferenceDb {
@@ -180,6 +180,34 @@ impl AbstractMessages for ReferenceDb {
                     && message.flags.is_some_and(|flags| flags & mask == mask)
             })
             .count())
+    }
+
+    /// Summarise the unread tail of a channel.
+    async fn summarise_unread(
+        &self,
+        channel: &str,
+        after_id: Option<&str>,
+    ) -> Result<UnreadSummary> {
+        let messages = self.messages.lock().await;
+        let mut tail = messages
+            .values()
+            .filter(|message| {
+                message.channel == channel
+                    && after_id.is_none_or(|after_id| message.id.as_str() > after_id)
+            })
+            .collect::<Vec<_>>();
+
+        // ULIDs sort lexicographically by creation time, so this is the same
+        // window Mongo's `$sort` + `$limit` sees.
+        tail.sort_by(|a, b| a.id.cmp(&b.id));
+        tail.truncate(UNREAD_COUNT_CAP as usize);
+
+        Ok(UnreadSummary {
+            count: tail.len() as u32,
+            attachments: tail
+                .iter()
+                .any(|message| message.attachments.as_ref().is_some_and(|a| !a.is_empty())),
+        })
     }
 
     /// Add a new reaction to a message
