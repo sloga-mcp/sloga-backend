@@ -118,6 +118,19 @@ const WORD_TERMS: &[&str] = &[
     "trannie",
 ];
 
+/// Innocent words that contain a substring term outright, removed from the
+/// dense form before it is matched.
+///
+/// `snigger` — to laugh quietly — contains the n-word, and a scan of 175k
+/// dictionary words turned it up as the only English word that does. Removing
+/// the innocent spelling rather than exempting the whole name keeps
+/// `sniggernigger` blocked; only this word is taken out of the running.
+///
+/// `niggard` (stingy, unrelated etymology) is deliberately NOT here: it is
+/// archaic enough that a name built on it is far more likely to be the
+/// deniable spelling of the slur than the adjective.
+const EXEMPT_SUBSTRINGS: &[&str] = &["snigger"];
+
 /// Terms stretched into patterns that tolerate repeated letters, so `niiigggerrr`
 /// is caught while `Niger` — one `g` where the term has two — is not.
 static SUBSTRING_PATTERN: Lazy<Regex> = Lazy::new(|| {
@@ -141,7 +154,14 @@ static WORD_PATTERN: Lazy<Regex> = Lazy::new(|| {
 pub fn contains_blocked_slur(name: &str) -> bool {
     let folded = fold(name);
 
-    SUBSTRING_PATTERN.is_match(&folded.dense)
+    let mut dense = folded.dense;
+    for exempt in EXEMPT_SUBSTRINGS {
+        if dense.contains(exempt) {
+            dense = dense.replace(exempt, "");
+        }
+    }
+
+    SUBSTRING_PATTERN.is_match(&dense)
         || folded.words.iter().any(|word| WORD_PATTERN.is_match(word))
 }
 
@@ -153,6 +173,13 @@ struct FoldedName {
     /// The name split on separators and camelCase humps. The dense form is
     /// included as a candidate as well, so `F.A.G.` is caught even though it
     /// splits into three single letters.
+    ///
+    /// Empty for a name written entirely in another script, which cannot be
+    /// spelling a Latin word on purpose. decancer transliterates Cyrillic щоб
+    /// — Ukrainian for "so that" — onto `wog`, and the whole-word terms are
+    /// short enough (three and four letters) that such a collision is far more
+    /// often an accident than an evasion. The substring terms are long and
+    /// specific, so they keep running against every script.
     words: Vec<String>,
 }
 
@@ -167,6 +194,10 @@ fn fold(name: &str) -> FoldedName {
     let cured = decancer::cure(name, options)
         .map(|cured| cured.to_string())
         .unwrap_or_else(|_| name.to_owned());
+
+    // Read off the ORIGINAL, not the cured form: by the time decancer is done,
+    // щоб is already the ASCII string `wog`.
+    let is_latin = name.chars().any(|character| character.is_ascii_alphabetic());
 
     let mut words: Vec<String> = Vec::new();
     let mut current = String::new();
@@ -205,6 +236,10 @@ fn fold(name: &str) -> FoldedName {
     let dense = words.concat();
     if words.len() > 1 {
         words.push(dense.clone());
+    }
+
+    if !is_latin {
+        words.clear();
     }
 
     FoldedName { dense, words }
@@ -327,6 +362,33 @@ mod tests {
             "transgender",
         ] {
             assert!(!contains_blocked_slur(name), "{name} should be allowed");
+        }
+    }
+
+    #[test]
+    fn allows_words_a_dictionary_scan_turned_up() {
+        // Found by running 175k dictionary words and every locale catalog
+        // through the filter. `snigger` is the only English word that contains
+        // a substring term outright; `щоб` is Ukrainian for "so that", which
+        // decancer transliterates onto `wog`.
+        for name in [
+            "snigger",
+            "sniggered",
+            "sniggering",
+            "Sniggers",
+            "щоб",
+            "Щоб",
+        ] {
+            assert!(!contains_blocked_slur(name), "{name} should be allowed");
+        }
+    }
+
+    #[test]
+    fn exemptions_do_not_open_a_hole() {
+        // Removing the innocent word must not carry the slur out with it, and
+        // a transliterated word next to a Latin one must still be checked.
+        for name in ["sniggernigger", "snigger faggot", "щоб wog", "wog щоб"] {
+            assert!(contains_blocked_slur(name), "{name} should be blocked");
         }
     }
 
