@@ -140,7 +140,7 @@ http://sloga.gg {
         }
     }
     header @dl Cache-Control "no-store"
-    redir /dl/windows       "https://app.sloga.gg/updates/desktop/Sloga_0.18.0_x64-setup.exe" 302
+    redir /dl/windows       "https://app.sloga.gg/updates/desktop/Sloga_0.19.0_x64-setup.exe" 302
     redir /dl/linux-deb     "https://app.sloga.gg/updates/desktop-linux/Sloga-0.10.0-linux-amd64.deb" 302
     redir /dl/linux-appimage "https://app.sloga.gg/updates/desktop-linux/Sloga-0.10.0-linux-x86_64.AppImage" 302
     redir /dl/android       "https://app.sloga.gg/updates/android/sloga-1.14.0.apk" 302
