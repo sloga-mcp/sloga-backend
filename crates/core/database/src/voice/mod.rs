@@ -44,6 +44,17 @@ pub fn is_video_source(source: i32) -> bool {
     matches!(source, 1 /* Camera */ | 3 /* ScreenShare */)
 }
 
+/// Whether a LiveKit `TrackSource` int is SCREENSHARE VIDEO specifically
+/// (source 3) — as opposed to a camera, which is the other video source.
+///
+/// The distinction matters for limit enforcement: a camera's aspect ratio is
+/// a property of the capture device and a strange one is a bypass attempt,
+/// whereas a screenshare's is simply whatever the user's monitor or window
+/// is. See the aspect-ratio branch in voice-ingress `api.rs`.
+pub fn is_screenshare_video(source: i32) -> bool {
+    source == 3
+}
+
 /// Count the current members of a voice channel who have video active — camera
 /// OR screensharing. Reads the per-member Redis flags under the SAME key
 /// composition the rest of this module uses: `{user_id}:{server_id | channel_id}`

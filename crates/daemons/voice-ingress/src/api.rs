@@ -8,7 +8,8 @@ use revolt_database::{
         clear_voice_participant_identities, create_voice_state, delete_channel_voice_state,
         delete_voice_state, delete_voice_participant_identity, get_user_moved_from_voice,
         get_user_moved_to_voice, get_user_voice_channels, get_voice_channel_members,
-        is_video_source, mls_cap_would_refuse, set_voice_participant_identity,
+        is_screenshare_video, is_video_source, mls_cap_would_refuse,
+        set_voice_participant_identity,
         update_voice_state_tracks, user_id_from_participant_identity, video_roster_over_cap,
         RoomMetadata, UserVoiceChannel, VoiceClient, MAX_VIDEO_PARTICIPANTS,
     },
@@ -19,6 +20,18 @@ use rocket::{post, State};
 use rocket_empty::EmptyResponse;
 
 use crate::guard::AuthHeader;
+
+/// Aspect-ratio sanity band for SCREENSHARE video, used instead of the
+/// configured `video_aspect_ratio` (which is sized for cameras).
+///
+/// A screenshare is whatever shape the user's monitor or window is, and the
+/// camera band — `[0.3, 2.5]` in production — rejects perfectly ordinary
+/// hardware: a 32:9 ultrawide is 3.56, and so is any side-by-side two-monitor
+/// share (3840x1080). Five 16:9 displays in a row is 8.89. This band exists
+/// only to reject the degenerate shapes the check was written for; the
+/// pixel-area limit is what actually bounds cost, and it still applies.
+const SCREENSHARE_ASPECT_MIN: f32 = 0.1;
+const SCREENSHARE_ASPECT_MAX: f32 = 10.0;
 
 #[post("/<node>", data = "<body>")]
 pub async fn ingress(
@@ -323,9 +336,12 @@ pub async fn ingress(
 
             if event.event == "track_published" {
                 let mut disconnect = false;
+                let mut mute_offending = false;
 
                 if track.r#type == TrackType::Data as i32 {
-                    log::debug!("User published data");
+                    log::warn!(
+                        "User {user_id} published data — removing from channel {channel_id}."
+                    );
                     disconnect = true;
                 };
 
@@ -335,15 +351,41 @@ pub async fn ingress(
                         && track.width * track.height
                             > user_limits.video_resolution[0] * user_limits.video_resolution[1]
                     {
-                        log::debug!("User published video with out of bounds resolution");
+                        log::warn!(
+                            "User {user_id} published video over the resolution limit ({}x{}) — removing from channel {channel_id}.",
+                            track.width,
+                            track.height
+                        );
                         disconnect = true;
                     };
 
-                    if user_limits.video_aspect_ratio[0] != user_limits.video_aspect_ratio[1]
+                    let aspect = track.width as f32 / track.height as f32;
+
+                    // A screenshare's aspect ratio is whatever the user's
+                    // DISPLAY is, so holding it to the camera band ejects
+                    // people for owning an ultrawide or spanning two monitors
+                    // — both 3.56 against a 2.5 ceiling. That is not abuse,
+                    // and it removed a real user from two calls ~60ms after
+                    // publish on 2026-08-08. Screenshares get the wide sanity
+                    // band instead, and a violation MUTES the track rather
+                    // than removing the member from the call: the same
+                    // remedy, for the same reason, as the video cap below.
+                    if is_screenshare_video(track.source) {
+                        if !(SCREENSHARE_ASPECT_MIN..=SCREENSHARE_ASPECT_MAX).contains(&aspect) {
+                            log::warn!(
+                                "Muting screenshare from user {user_id} in channel {channel_id}: aspect {aspect} outside {SCREENSHARE_ASPECT_MIN}..={SCREENSHARE_ASPECT_MAX} ({}x{}).",
+                                track.width,
+                                track.height
+                            );
+                            mute_offending = true;
+                        };
+                    } else if user_limits.video_aspect_ratio[0] != user_limits.video_aspect_ratio[1]
                         && !(user_limits.video_aspect_ratio[0]..=user_limits.video_aspect_ratio[1])
-                            .contains(&(track.width as f32 / track.height as f32))
+                            .contains(&aspect)
                     {
-                        log::debug!("User published video with out of bounds aspect ratio");
+                        log::warn!(
+                            "User {user_id} published camera video with out of bounds aspect ratio ({aspect}) — removing from channel {channel_id}."
+                        );
                         disconnect = true;
                     };
                 };
@@ -367,6 +409,18 @@ pub async fn ingress(
 
                     let _ = voice_client.remove_user(node, user_id, channel_id).await;
                     delete_voice_state(&channel, user_id).await?;
+
+                    return Ok(EmptyResponse);
+                };
+
+                // Out-of-band screenshare: refuse the TRACK, keep the MEMBER.
+                // Muting enforces the limit just as well (the track is never
+                // forwarded) without the disproportionate remedy of ejecting
+                // someone mid-call over the shape of their monitor.
+                if mute_offending {
+                    let _ = voice_client
+                        .mute_track(node, user_id, channel_id, &track.sid)
+                        .await;
 
                     return Ok(EmptyResponse);
                 };
