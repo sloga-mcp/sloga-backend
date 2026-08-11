@@ -345,6 +345,25 @@ pub async fn ingress(
                     disconnect = true;
                 };
 
+                // The `unknown` (0) source is granted to speakers ONLY to carry
+                // the whisper AUDIO track (a second audio track fenced to one
+                // recipient by subscription permissions). A non-audio track
+                // declaring source `unknown` is a bypass attempt: the video-cap
+                // and per-source permission gates below key on the declared
+                // source (`is_video_source` excludes 0), so an `unknown`-source
+                // VIDEO track would otherwise dodge both the roster cap and the
+                // Video-permission requirement, and it is invisible in voice
+                // state (source 0 → default partial). No stock client ever does
+                // this, so treat it like a data publish and eject.
+                if track.source == 0 /* TrackSource::Unknown */
+                    && track.r#type != TrackType::Audio as i32
+                {
+                    log::warn!(
+                        "User {user_id} published a non-audio track on the whisper source — removing from channel {channel_id}."
+                    );
+                    disconnect = true;
+                };
+
                 if track.r#type == TrackType::Video as i32 {
                     if user_limits.video_resolution[0] != 0
                         && user_limits.video_resolution[1] != 0
