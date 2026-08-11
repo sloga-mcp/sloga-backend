@@ -377,7 +377,16 @@ pub fn get_allowed_sources(
     let mut allowed_sources = Vec::new();
 
     if permissions.has(ChannelPermission::Speak as u64) {
-        allowed_sources.push(TrackSource::Microphone)
+        // `Unknown` carries the whisper track (a second audio track named
+        // `whisper:<user_id>`, SFU-restricted to its target by the publisher's
+        // subscription permissions). Granted alongside the microphone because
+        // whispering is speaking; it deliberately maps to the no-op arm of
+        // `update_voice_state_tracks` (track 0), so publishing/unpublishing a
+        // whisper never flips `is_publishing` under the primary mic. Flows
+        // into the live permission-sync paths automatically — they rebuild
+        // from this same slice (see the lockstep note on
+        // `voice_participant_permissions`).
+        allowed_sources.extend([TrackSource::Microphone, TrackSource::Unknown])
     };
 
     if permissions.has(ChannelPermission::Video as u64) && limits.video {
