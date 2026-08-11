@@ -237,9 +237,20 @@ impl AbstractUsers for MongoDb {
         user_id: &str,
         target_id: &str,
         relationship: &RelationshipStatus,
+        note: Option<&str>,
     ) -> Result<()> {
         if let RelationshipStatus::None = relationship {
             return self.pull_relationship(user_id, target_id).await;
+        }
+
+        // Entry is built by hand, not serde: keep in sync with Relationship
+        let mut entry = doc! {
+            "_id": target_id,
+            "status": format!("{relationship:?}")
+        };
+
+        if let Some(note) = note {
+            entry.insert("note", note);
         }
 
         self.col::<User>(COL)
@@ -267,12 +278,7 @@ impl AbstractUsers for MongoDb {
                                         []
                                     ]
                                 },
-                                [
-                                    {
-                                        "_id": target_id,
-                                        "status": format!("{relationship:?}")
-                                    }
-                                ]
+                                [entry]
                             ]
                         }
                     }

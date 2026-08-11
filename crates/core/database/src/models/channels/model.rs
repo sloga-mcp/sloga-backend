@@ -73,6 +73,10 @@ auto_derived!(
             /// Whether this group is marked as not safe for work
             #[serde(skip_serializing_if = "crate::if_false", default)]
             nsfw: bool,
+            /// Whether clients should hide this group behind a
+            /// click-to-reveal spoiler gate
+            #[serde(skip_serializing_if = "crate::if_false", default)]
+            spoiler: bool,
 
             /// Voice call configuration for this group (limits, on/off)
             #[serde(skip_serializing_if = "Option::is_none")]
@@ -112,6 +116,10 @@ auto_derived!(
             /// Whether this channel is marked as not safe for work
             #[serde(skip_serializing_if = "crate::if_false", default)]
             nsfw: bool,
+            /// Whether clients should hide this channel behind a
+            /// click-to-reveal spoiler gate
+            #[serde(skip_serializing_if = "crate::if_false", default)]
+            spoiler: bool,
 
             /// Voice Information for when this channel is also a voice channel
             #[serde(skip_serializing_if = "Option::is_none")]
@@ -202,6 +210,10 @@ auto_derived!(
             /// Whether this channel is marked as not safe for work
             #[serde(skip_serializing_if = "crate::if_false", default)]
             nsfw: bool,
+            /// Whether clients should hide this channel behind a
+            /// click-to-reveal spoiler gate
+            #[serde(skip_serializing_if = "crate::if_false", default)]
+            spoiler: bool,
 
             /// Tags that can be applied to posts in this forum
             #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -263,6 +275,8 @@ auto_derived!(
         pub icon: Option<File>,
         #[serde(skip_serializing_if = "Option::is_none")]
         pub nsfw: Option<bool>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub spoiler: Option<bool>,
         #[serde(skip_serializing_if = "Option::is_none")]
         pub active: Option<bool>,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -351,6 +365,7 @@ impl Channel {
                 default_permissions: None,
                 role_permissions: HashMap::new(),
                 nsfw: data.nsfw.unwrap_or(false),
+                spoiler: data.spoiler.unwrap_or(false),
                 voice: data.voice.map(|voice| voice.into()),
                 slowmode: None,
                 announcement: data.announcement.filter(|v| *v),
@@ -365,6 +380,7 @@ impl Channel {
                 default_permissions: None,
                 role_permissions: HashMap::new(),
                 nsfw: data.nsfw.unwrap_or(false),
+                spoiler: data.spoiler.unwrap_or(false),
                 voice: Some(data.voice.unwrap_or_default().into()),
                 slowmode: None,
                 announcement: None,
@@ -379,6 +395,7 @@ impl Channel {
                 default_permissions: None,
                 role_permissions: HashMap::new(),
                 nsfw: data.nsfw.unwrap_or(false),
+                spoiler: data.spoiler.unwrap_or(false),
                 tags: vec![],
                 require_tag: false,
                 default_sort: ForumSortOrder::default(),
@@ -666,6 +683,7 @@ impl Channel {
             permissions: None,
 
             nsfw: data.nsfw.unwrap_or(false),
+            spoiler: data.spoiler.unwrap_or(false),
 
             voice: None,
         };
@@ -992,6 +1010,7 @@ impl Channel {
                 description,
                 icon,
                 nsfw,
+                spoiler,
                 permissions,
                 voice,
                 ..
@@ -1016,6 +1035,10 @@ impl Channel {
                     *nsfw = v;
                 }
 
+                if let Some(v) = partial.spoiler {
+                    *spoiler = v;
+                }
+
                 if let Some(v) = partial.permissions {
                     permissions.replace(v);
                 }
@@ -1029,6 +1052,7 @@ impl Channel {
                 description,
                 icon,
                 nsfw,
+                spoiler,
                 default_permissions,
                 role_permissions,
                 voice,
@@ -1050,6 +1074,10 @@ impl Channel {
 
                 if let Some(v) = partial.nsfw {
                     *nsfw = v;
+                }
+
+                if let Some(v) = partial.spoiler {
+                    *spoiler = v;
                 }
 
                 if let Some(v) = partial.role_permissions {
@@ -1105,6 +1133,7 @@ impl Channel {
                 description,
                 icon,
                 nsfw,
+                spoiler,
                 default_permissions,
                 role_permissions,
                 last_message_id,
@@ -1127,6 +1156,10 @@ impl Channel {
 
                 if let Some(v) = partial.nsfw {
                     *nsfw = v;
+                }
+
+                if let Some(v) = partial.spoiler {
+                    *spoiler = v;
                 }
 
                 if let Some(v) = partial.role_permissions {
@@ -1414,6 +1447,7 @@ mod tests {
             last_message_id: None,
             permissions: None,
             nsfw: false,
+            spoiler: false,
             voice,
         };
 

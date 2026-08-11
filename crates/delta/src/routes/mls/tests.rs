@@ -123,6 +123,7 @@ async fn voice_channel_with_members(
             name: "Voice".to_string(),
             description: None,
             nsfw: Some(false),
+            spoiler: None,
             voice: Some(v0::VoiceInformation {
                 max_users: None,
                 disabled: false,
@@ -825,6 +826,7 @@ async fn blocked_pair_in_shared_channel_cannot_claim() {
             &mut user_b.clone(),
             revolt_database::RelationshipStatus::Blocked,
             revolt_database::RelationshipStatus::BlockedOther,
+            None,
         )
         .await
         .expect("block");

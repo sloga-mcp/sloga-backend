@@ -216,6 +216,7 @@ impl TestHarness {
                 name: "Test Channel".to_string(),
                 description: None,
                 nsfw: Some(false),
+                spoiler: None,
                 voice: None,
                 announcement: None,
             },

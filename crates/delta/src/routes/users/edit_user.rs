@@ -67,6 +67,7 @@ pub async fn edit(
         && data.badges.is_none()
         && data.flags.is_none()
         && data.e2ee_enabled.is_none()
+        && data.profile_visibility.is_none()
         && data.remove.is_empty()
     {
         return Ok(Json(user.into_self(false).await));
@@ -107,6 +108,7 @@ pub async fn edit(
         // UI hint only: E2EE capability is always derived from published,
         // signature-verified key bundles, never from this flag
         e2ee_enabled: data.e2ee_enabled,
+        profile_visibility: data.profile_visibility.map(Into::into),
         ..Default::default()
     };
 

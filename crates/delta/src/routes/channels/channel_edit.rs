@@ -50,6 +50,7 @@ pub async fn edit(
         && data.description.is_none()
         && data.icon.is_none()
         && data.nsfw.is_none()
+        && data.spoiler.is_none()
         && data.owner.is_none()
         && data.voice.is_none()
         && data.slowmode.is_none()
@@ -83,6 +84,17 @@ pub async fn edit(
 
     // Applied tags only make sense on forum-post threads.
     if data.applied_tags.is_some() && !matches!(channel, Channel::Thread { .. }) {
+        return Err(create_error!(InvalidOperation));
+    }
+
+    // The spoiler flag exists on groups, text channels and forums; reject it
+    // elsewhere instead of silently dropping it.
+    if data.spoiler.is_some()
+        && !matches!(
+            channel,
+            Channel::Group { .. } | Channel::TextChannel { .. } | Channel::Forum { .. }
+        )
+    {
         return Err(create_error!(InvalidOperation));
     }
 
@@ -150,6 +162,7 @@ pub async fn edit(
             description,
             icon,
             nsfw,
+            spoiler,
             voice,
             ..
         } => {
@@ -192,6 +205,11 @@ pub async fn edit(
             if let Some(new_nsfw) = data.nsfw {
                 *nsfw = new_nsfw;
                 partial.nsfw = Some(new_nsfw);
+            }
+
+            if let Some(new_spoiler) = data.spoiler {
+                *spoiler = new_spoiler;
+                partial.spoiler = Some(new_spoiler);
             }
 
             if let Some(new_voice) = data.voice {
@@ -261,6 +279,7 @@ pub async fn edit(
             description,
             icon,
             nsfw,
+            spoiler,
             voice,
             slowmode,
             announcement,
@@ -305,6 +324,11 @@ pub async fn edit(
             if let Some(new_nsfw) = data.nsfw {
                 *nsfw = new_nsfw;
                 partial.nsfw = Some(new_nsfw);
+            }
+
+            if let Some(new_spoiler) = data.spoiler {
+                *spoiler = new_spoiler;
+                partial.spoiler = Some(new_spoiler);
             }
 
             if let Some(new_voice) = data.voice {
@@ -375,6 +399,7 @@ pub async fn edit(
             description,
             icon,
             nsfw,
+            spoiler,
             tags,
             require_tag,
             default_sort,
@@ -419,6 +444,11 @@ pub async fn edit(
             if let Some(new_nsfw) = data.nsfw {
                 *nsfw = new_nsfw;
                 partial.nsfw = Some(new_nsfw);
+            }
+
+            if let Some(new_spoiler) = data.spoiler {
+                *spoiler = new_spoiler;
+                partial.spoiler = Some(new_spoiler);
             }
 
             if let Some(new_tags) = data.tags {
@@ -508,4 +538,46 @@ fn validate_forum_tags(
     }
 
     Ok(resolved)
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::util::test::TestHarness;
+    use revolt_models::v0;
+    use rocket::http::{ContentType, Status};
+
+    #[rocket::async_test]
+    async fn spoiler_only_edit_is_not_a_no_op() {
+        let harness = TestHarness::new().await;
+        let (_, session, user) = harness.new_user().await;
+        let (server, _channels) = harness.new_server(&user).await;
+        let channel = harness.new_channel(&server).await;
+
+        // A request that ONLY flips the spoiler flag must be applied — this
+        // guards the early no-op return at the top of the route.
+        let response = TestHarness::with_session(
+            session,
+            harness
+                .client
+                .patch(format!("/channels/{}", channel.id()))
+                .header(ContentType::JSON)
+                .body(json!({ "spoiler": true }).to_string()),
+        )
+        .await;
+        assert_eq!(response.status(), Status::Ok);
+
+        let edited = response.into_json::<v0::Channel>().await.expect("channel");
+        assert!(matches!(edited, v0::Channel::TextChannel { spoiler: true, .. }));
+
+        // And it persisted, not just echoed.
+        let stored = harness
+            .db
+            .fetch_channel(channel.id())
+            .await
+            .expect("channel");
+        assert!(matches!(
+            stored,
+            revolt_database::Channel::TextChannel { spoiler: true, .. }
+        ));
+    }
 }

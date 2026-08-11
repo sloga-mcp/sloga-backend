@@ -67,6 +67,13 @@ auto_derived!(
                 serde(skip_serializing_if = "crate::if_false", default)
             )]
             nsfw: bool,
+            /// Whether clients should hide this group behind a
+            /// click-to-reveal spoiler gate
+            #[cfg_attr(
+                feature = "serde",
+                serde(skip_serializing_if = "crate::if_false", default)
+            )]
+            spoiler: bool,
 
             /// Voice call configuration for this group (limits, on/off)
             #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
@@ -112,6 +119,13 @@ auto_derived!(
                 serde(skip_serializing_if = "crate::if_false", default)
             )]
             nsfw: bool,
+            /// Whether clients should hide this channel behind a
+            /// click-to-reveal spoiler gate
+            #[cfg_attr(
+                feature = "serde",
+                serde(skip_serializing_if = "crate::if_false", default)
+            )]
+            spoiler: bool,
 
             /// Voice Information for when this channel is also a voice channel
             #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
@@ -222,6 +236,13 @@ auto_derived!(
                 serde(skip_serializing_if = "crate::if_false", default)
             )]
             nsfw: bool,
+            /// Whether clients should hide this channel behind a
+            /// click-to-reveal spoiler gate
+            #[cfg_attr(
+                feature = "serde",
+                serde(skip_serializing_if = "crate::if_false", default)
+            )]
+            spoiler: bool,
 
             /// Tags that can be applied to posts in this forum
             #[cfg_attr(
@@ -298,6 +319,8 @@ auto_derived!(
         #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
         pub nsfw: Option<bool>,
         #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+        pub spoiler: Option<bool>,
+        #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
         pub active: Option<bool>,
         #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
         pub permissions: Option<i64>,
@@ -362,6 +385,10 @@ auto_derived!(
 
         /// Whether this channel is age-restricted
         pub nsfw: Option<bool>,
+
+        /// Whether clients should hide this channel behind a
+        /// click-to-reveal spoiler gate
+        pub spoiler: Option<bool>,
 
         /// Whether this channel is archived
         pub archived: Option<bool>,
@@ -431,6 +458,10 @@ auto_derived!(
         /// Whether this group is age-restricted
         #[serde(skip_serializing_if = "Option::is_none")]
         pub nsfw: Option<bool>,
+        /// Whether clients should hide this group behind a
+        /// click-to-reveal spoiler gate
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub spoiler: Option<bool>,
     }
 
     /// Create new thread
@@ -507,6 +538,11 @@ auto_derived!(
         /// Whether this channel is age restricted
         #[serde(skip_serializing_if = "Option::is_none")]
         pub nsfw: Option<bool>,
+
+        /// Whether clients should hide this channel behind a
+        /// click-to-reveal spoiler gate
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub spoiler: Option<bool>,
 
         /// Voice Information for when this channel is also a voice channel
         #[serde(skip_serializing_if = "Option::is_none")]

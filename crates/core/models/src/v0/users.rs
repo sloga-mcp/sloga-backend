@@ -92,8 +92,17 @@ auto_derived_partial!(
         )]
         pub connections: Vec<UserConnection>,
 
+        /// Who may fetch the user's profile page; only ever present on the
+        /// session user's own object
+        #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+        pub profile_visibility: Option<ProfileVisibility>,
+
         /// Current session user's relationship with this user
         pub relationship: RelationshipStatus,
+        /// Note the user attached to their pending friend request, only
+        /// ever present for the receiving session user
+        #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+        pub relationship_note: Option<String>,
         /// Whether this user is currently online
         pub online: bool,
     },
@@ -168,6 +177,16 @@ auto_derived!(
         BlockedOther,
     }
 
+    /// Who may fetch a user's profile page
+    #[derive(Default)]
+    pub enum ProfileVisibility {
+        /// Anyone who can already see the user (default)
+        #[default]
+        Everyone,
+        /// Friends only
+        Friends,
+    }
+
     /// Relationship entry indicating current status with other user
     pub struct Relationship {
         /// Other user's Id
@@ -175,6 +194,9 @@ auto_derived!(
         pub user_id: String,
         /// Relationship status with them
         pub status: RelationshipStatus,
+        /// Note they attached to their pending friend request
+        #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+        pub note: Option<String>,
     }
 
     /// Presence status
@@ -322,6 +344,10 @@ auto_derived!(
         #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
         pub e2ee_enabled: Option<bool>,
 
+        /// Who may fetch the user's profile page
+        #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+        pub profile_visibility: Option<ProfileVisibility>,
+
         /// Fields to remove from user object
         #[cfg_attr(feature = "serde", serde(default))]
         pub remove: Vec<FieldsUser>,
@@ -369,9 +395,14 @@ auto_derived!(
     }
 
     /// User lookup information
+    #[cfg_attr(feature = "validator", derive(Validate))]
     pub struct DataSendFriendRequest {
         /// Username and discriminator combo separated by #
         pub username: String,
+        /// Note to attach to the friend request
+        #[cfg_attr(feature = "validator", validate(length(min = 1, max = 200)))]
+        #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+        pub note: Option<String>,
     }
 );
 

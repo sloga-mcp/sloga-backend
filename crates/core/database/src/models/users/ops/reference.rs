@@ -160,6 +160,7 @@ impl AbstractUsers for ReferenceDb {
         user_id: &str,
         target_id: &str,
         relationship: &RelationshipStatus,
+        note: Option<&str>,
     ) -> Result<()> {
         if let RelationshipStatus::User | RelationshipStatus::None = &relationship {
             self.pull_relationship(user_id, target_id).await
@@ -172,6 +173,7 @@ impl AbstractUsers for ReferenceDb {
             let relation = Relationship {
                 id: target_id.to_string(),
                 status: relationship.clone(),
+                note: note.map(str::to_string),
             };
 
             if let Some(relations) = &mut user.relations {

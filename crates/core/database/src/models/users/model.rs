@@ -51,6 +51,10 @@ auto_derived_partial!(
         /// User's profile page
         #[serde(skip_serializing_if = "Option::is_none")]
         pub profile: Option<UserProfile>,
+        /// Who may fetch the user's profile page; absent means everyone
+        /// who can already see the user
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub profile_visibility: Option<ProfileVisibility>,
 
         /// Enum of user flags
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -132,11 +136,23 @@ auto_derived!(
         BlockedOther,
     }
 
+    /// Who may fetch a user's profile page
+    pub enum ProfileVisibility {
+        /// Anyone who can already see the user (default)
+        Everyone,
+        /// Friends only
+        Friends,
+    }
+
     /// Relationship entry indicating current status with other user
     pub struct Relationship {
         #[serde(rename = "_id")]
         pub id: String,
         pub status: RelationshipStatus,
+        /// Note attached to the friend request, only ever present on the
+        /// receiving side of a pending request
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub note: Option<String>,
     }
 
     /// Presence status
@@ -239,6 +255,7 @@ impl Default for User {
             badges: Default::default(),
             status: Default::default(),
             profile: Default::default(),
+            profile_visibility: Default::default(),
             flags: Default::default(),
             privileged: Default::default(),
             bot: Default::default(),
@@ -551,8 +568,10 @@ impl User {
         db: &Database,
         user_b: &User,
         status: RelationshipStatus,
+        note: Option<String>,
     ) -> Result<()> {
-        db.set_relationship(&self.id, &user_b.id, &status).await?;
+        db.set_relationship(&self.id, &user_b.id, &status, note.as_deref())
+            .await?;
 
         if let RelationshipStatus::None | RelationshipStatus::User = status {
             if let Some(relations) = &mut self.relations {
@@ -562,6 +581,7 @@ impl User {
             let relation = Relationship {
                 id: user_b.id.to_string(),
                 status,
+                note,
             };
 
             if let Some(relations) = &mut self.relations {
@@ -576,15 +596,18 @@ impl User {
     }
 
     /// Apply a certain relationship between two users
+    ///
+    /// The note, if any, lands on the target's side of the relationship.
     pub async fn apply_relationship(
         &mut self,
         db: &Database,
         target: &mut User,
         local: RelationshipStatus,
         remote: RelationshipStatus,
+        note: Option<String>,
     ) -> Result<()> {
-        target.set_relationship(db, self, remote).await?;
-        self.set_relationship(db, target, local).await?;
+        target.set_relationship(db, self, remote, note).await?;
+        self.set_relationship(db, target, local, None).await?;
 
         EventV1::UserRelationship {
             id: target.id.clone(),
@@ -604,11 +627,15 @@ impl User {
     }
 
     /// Add another user as a friend
+    ///
+    /// The note, if any, is attached to the target's incoming request and
+    /// is discarded again once the request leaves the pending state.
     pub async fn add_friend(
         &mut self,
         db: &Database,
         amqp: &AMQP,
         target: &mut User,
+        note: Option<String>,
     ) -> Result<()> {
         match self.relationship_with(&target.id) {
             RelationshipStatus::User => Err(create_error!(NoEffect)),
@@ -625,6 +652,7 @@ impl User {
                     target,
                     RelationshipStatus::Friend,
                     RelationshipStatus::Friend,
+                    None,
                 )
                 .await
             }
@@ -656,6 +684,7 @@ impl User {
                     target,
                     RelationshipStatus::Outgoing,
                     RelationshipStatus::Incoming,
+                    note,
                 )
                 .await
             }
@@ -673,6 +702,7 @@ impl User {
                     target,
                     RelationshipStatus::None,
                     RelationshipStatus::None,
+                    None,
                 )
                 .await
             }
@@ -690,6 +720,7 @@ impl User {
                     target,
                     RelationshipStatus::Blocked,
                     RelationshipStatus::Blocked,
+                    None,
                 )
                 .await
             }
@@ -702,6 +733,7 @@ impl User {
                     target,
                     RelationshipStatus::Blocked,
                     RelationshipStatus::BlockedOther,
+                    None,
                 )
                 .await
             }
@@ -718,6 +750,7 @@ impl User {
                         target,
                         RelationshipStatus::BlockedOther,
                         RelationshipStatus::Blocked,
+                        None,
                     )
                     .await
                 }
@@ -727,6 +760,7 @@ impl User {
                         target,
                         RelationshipStatus::None,
                         RelationshipStatus::None,
+                        None,
                     )
                     .await
                 }

@@ -172,6 +172,7 @@ impl From<crate::Channel> for Channel {
                 last_message_id,
                 permissions,
                 nsfw,
+                spoiler,
                 voice,
             } => Channel::Group {
                 id,
@@ -183,6 +184,7 @@ impl From<crate::Channel> for Channel {
                 last_message_id,
                 permissions,
                 nsfw,
+                spoiler,
                 voice: voice.map(|voice| voice.into()),
             },
             crate::Channel::TextChannel {
@@ -195,6 +197,7 @@ impl From<crate::Channel> for Channel {
                 default_permissions,
                 role_permissions,
                 nsfw,
+                spoiler,
                 voice,
                 slowmode,
                 announcement,
@@ -208,6 +211,7 @@ impl From<crate::Channel> for Channel {
                 default_permissions,
                 role_permissions,
                 nsfw,
+                spoiler,
                 voice: voice.map(|voice| voice.into()),
                 slowmode,
                 announcement,
@@ -249,6 +253,7 @@ impl From<crate::Channel> for Channel {
                 default_permissions,
                 role_permissions,
                 nsfw,
+                spoiler,
                 tags,
                 require_tag,
                 default_sort,
@@ -262,6 +267,7 @@ impl From<crate::Channel> for Channel {
                 default_permissions,
                 role_permissions,
                 nsfw,
+                spoiler,
                 tags: tags.into_iter().map(|tag| tag.into()).collect(),
                 require_tag,
                 default_sort: default_sort.into(),
@@ -296,6 +302,7 @@ impl From<Channel> for crate::Channel {
                 last_message_id,
                 permissions,
                 nsfw,
+                spoiler,
                 voice,
             } => crate::Channel::Group {
                 id,
@@ -307,6 +314,7 @@ impl From<Channel> for crate::Channel {
                 last_message_id,
                 permissions,
                 nsfw,
+                spoiler,
                 voice: voice.map(|voice| voice.into()),
             },
             Channel::TextChannel {
@@ -319,6 +327,7 @@ impl From<Channel> for crate::Channel {
                 default_permissions,
                 role_permissions,
                 nsfw,
+                spoiler,
                 voice,
                 slowmode,
                 announcement,
@@ -332,6 +341,7 @@ impl From<Channel> for crate::Channel {
                 default_permissions,
                 role_permissions,
                 nsfw,
+                spoiler,
                 voice: voice.map(|voice| voice.into()),
                 slowmode,
                 announcement,
@@ -373,6 +383,7 @@ impl From<Channel> for crate::Channel {
                 default_permissions,
                 role_permissions,
                 nsfw,
+                spoiler,
                 tags,
                 require_tag,
                 default_sort,
@@ -386,6 +397,7 @@ impl From<Channel> for crate::Channel {
                 default_permissions,
                 role_permissions,
                 nsfw,
+                spoiler,
                 tags: tags.into_iter().map(|tag| tag.into()).collect(),
                 require_tag,
                 default_sort: default_sort.into(),
@@ -442,6 +454,7 @@ impl From<crate::PartialChannel> for PartialChannel {
             description: value.description,
             icon: value.icon.map(|file| file.into()),
             nsfw: value.nsfw,
+            spoiler: value.spoiler,
             active: value.active,
             permissions: value.permissions,
             role_permissions: value.role_permissions,
@@ -470,6 +483,7 @@ impl From<PartialChannel> for crate::PartialChannel {
             description: value.description,
             icon: value.icon.map(|file| file.into()),
             nsfw: value.nsfw,
+            spoiler: value.spoiler,
             active: value.active,
             permissions: value.permissions,
             role_permissions: value.role_permissions,
@@ -1322,33 +1336,35 @@ impl crate::User {
         P: Into<Option<&'a crate::User>>,
     {
         let perspective = perspective.into();
-        let (relationship, can_see_profile) = if self.bot.is_some() {
-            (RelationshipStatus::None, true)
+        let (relationship, relationship_note, can_see_profile) = if self.bot.is_some() {
+            (RelationshipStatus::None, None, true)
         } else if let Some(perspective) = perspective {
             let mut query = DatabasePermissionQuery::new(db, perspective).user(&self);
 
             if perspective.id == self.id {
-                (RelationshipStatus::User, true)
+                (RelationshipStatus::User, None, true)
             } else {
+                let relation = perspective
+                    .relations
+                    .as_ref()
+                    .and_then(|relations| {
+                        relations
+                            .iter()
+                            .find(|relationship| relationship.id == self.id)
+                    });
+
                 (
-                    perspective
-                        .relations
-                        .as_ref()
-                        .map(|relations| {
-                            relations
-                                .iter()
-                                .find(|relationship| relationship.id == self.id)
-                                .map(|relationship| relationship.status.clone().into())
-                                .unwrap_or_default()
-                        })
+                    relation
+                        .map(|relationship| relationship.status.clone().into())
                         .unwrap_or_default(),
+                    relation.and_then(|relationship| relationship.note.clone()),
                     calculate_user_permissions(&mut query)
                         .await
                         .has_user_permission(UserPermission::ViewProfile),
                 )
             }
         } else {
-            (RelationshipStatus::None, false)
+            (RelationshipStatus::None, None, false)
         };
 
         let badges = self.get_badges().await;
@@ -1398,7 +1414,9 @@ impl crate::User {
             privileged: self.privileged,
             bot: self.bot.map(|bot| bot.into()),
             e2ee_enabled: self.e2ee_enabled,
+            profile_visibility: None,
             relationship,
+            relationship_note,
             id: self.id,
         }
     }
@@ -1411,29 +1429,34 @@ impl crate::User {
         P: Into<Option<&'a crate::User>>,
     {
         let perspective = perspective.into();
-        let (relationship, can_see_profile) = if self.bot.is_some() {
-            (RelationshipStatus::None, true)
+        let (relationship, relationship_note, can_see_profile) = if self.bot.is_some() {
+            (RelationshipStatus::None, None, true)
         } else if let Some(perspective) = perspective {
             if perspective.id == self.id {
-                (RelationshipStatus::User, true)
+                (RelationshipStatus::User, None, true)
             } else {
-                let relationship = perspective
+                let relation = perspective
                     .relations
                     .as_ref()
-                    .map(|relations| {
+                    .and_then(|relations| {
                         relations
                             .iter()
                             .find(|relationship| relationship.id == self.id)
-                            .map(|relationship| relationship.status.clone().into())
-                            .unwrap_or_default()
-                    })
+                    });
+
+                let relationship: RelationshipStatus = relation
+                    .map(|relationship| relationship.status.clone().into())
                     .unwrap_or_default();
 
                 let can_see_profile = relationship != RelationshipStatus::BlockedOther;
-                (relationship, can_see_profile)
+                (
+                    relationship,
+                    relation.and_then(|relationship| relationship.note.clone()),
+                    can_see_profile,
+                )
             }
         } else {
-            (RelationshipStatus::None, false)
+            (RelationshipStatus::None, None, false)
         };
 
         let badges = self.get_badges().await;
@@ -1471,7 +1494,9 @@ impl crate::User {
             privileged: self.privileged,
             bot: self.bot.map(|bot| bot.into()),
             e2ee_enabled: self.e2ee_enabled,
+            profile_visibility: None,
             relationship,
+            relationship_note,
             id: self.id,
         }
     }
@@ -1505,7 +1530,9 @@ impl crate::User {
             privileged: self.privileged,
             bot: self.bot.map(|bot| bot.into()),
             e2ee_enabled: self.e2ee_enabled,
+            profile_visibility: None,
             relationship: RelationshipStatus::None, // events client will populate this from cache
+            relationship_note: None,
             id: self.id,
         }
     }
@@ -1546,7 +1573,9 @@ impl crate::User {
             privileged: self.privileged,
             bot: self.bot.map(|bot| bot.into()),
             e2ee_enabled: self.e2ee_enabled,
+            profile_visibility: self.profile_visibility.map(Into::into),
             relationship: RelationshipStatus::User,
+            relationship_note: None,
             id: self.id,
         }
     }
@@ -1572,6 +1601,7 @@ impl From<User> for crate::User {
             badges: Some(value.badges as i32),
             status: value.status.map(Into::into),
             profile: None,
+            profile_visibility: value.profile_visibility.map(Into::into),
             connections: None,
             flags: Some(value.flags as i32),
             privileged: value.privileged,
@@ -1606,7 +1636,9 @@ impl From<crate::PartialUser> for PartialUser {
             privileged: value.privileged,
             bot: value.bot.map(|bot| bot.into()),
             e2ee_enabled: value.e2ee_enabled,
+            profile_visibility: None,
             relationship: None,
+            relationship_note: None,
             online: None,
             id: value.id,
         }
@@ -1664,11 +1696,30 @@ impl From<crate::RelationshipStatus> for RelationshipStatus {
     }
 }
 
+impl From<crate::ProfileVisibility> for ProfileVisibility {
+    fn from(value: crate::ProfileVisibility) -> Self {
+        match value {
+            crate::ProfileVisibility::Everyone => ProfileVisibility::Everyone,
+            crate::ProfileVisibility::Friends => ProfileVisibility::Friends,
+        }
+    }
+}
+
+impl From<ProfileVisibility> for crate::ProfileVisibility {
+    fn from(value: ProfileVisibility) -> Self {
+        match value {
+            ProfileVisibility::Everyone => crate::ProfileVisibility::Everyone,
+            ProfileVisibility::Friends => crate::ProfileVisibility::Friends,
+        }
+    }
+}
+
 impl From<crate::Relationship> for Relationship {
     fn from(value: crate::Relationship) -> Self {
         Self {
             user_id: value.id,
             status: value.status.into(),
+            note: value.note,
         }
     }
 }

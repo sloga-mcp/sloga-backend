@@ -677,6 +677,7 @@ mod test {
                 name: name.to_string(),
                 description: None,
                 nsfw: Some(false),
+                spoiler: None,
                 voice: Some(v0::VoiceInformation {
                     max_users: None,
                     disabled: false,
@@ -1035,6 +1036,7 @@ mod test {
                 icon: None,
                 users: [user_b.id.clone()].into(),
                 nsfw: None,
+                spoiler: None,
             },
             user_a.id.clone(),
         )

@@ -66,6 +66,7 @@ mod test {
             &mut other_user,
             RelationshipStatus::Friend,
             RelationshipStatus::Friend,
+            None,
         )
         .await
         .unwrap();

@@ -117,6 +117,7 @@ async fn make_dm_eligible(harness: &TestHarness, user_a: &User, user_b: &User) {
             &mut user_b.clone(),
             revolt_database::RelationshipStatus::Friend,
             revolt_database::RelationshipStatus::Friend,
+            None,
         )
         .await
         .expect("friendship");
@@ -312,6 +313,7 @@ async fn make_group(harness: &TestHarness, owner: &User, member: &User) -> Strin
             icon: None,
             users: std::iter::once(member.id.clone()).collect(),
             nsfw: None,
+            spoiler: None,
         },
         owner.id.clone(),
     )

@@ -210,6 +210,7 @@ mod test {
                 name: "Voice".to_string(),
                 description: None,
                 nsfw: Some(false),
+                spoiler: None,
                 voice: Some(v0::VoiceInformation {
                     max_users: None,
                     disabled: false,

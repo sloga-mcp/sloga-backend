@@ -73,6 +73,8 @@ pub enum ErrorType {
     Blocked,
     BlockedByOther,
     NotFriends,
+    /// The user limits their profile to friends only
+    ProfileIsPrivate,
     TooManyPendingFriendRequests {
         max: usize,
     },

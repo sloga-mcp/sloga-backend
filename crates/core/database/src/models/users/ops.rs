@@ -48,6 +48,7 @@ pub trait AbstractUsers: Sync + Send {
         user_id: &str,
         target_id: &str,
         relationship: &RelationshipStatus,
+        note: Option<&str>,
     ) -> Result<()>;
 
     /// Remove relationship with another user
