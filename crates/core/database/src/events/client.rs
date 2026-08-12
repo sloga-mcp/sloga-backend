@@ -531,10 +531,14 @@ pub enum EventV1 {
     /// Remote control: REDACTED channel-topic visibility event — third
     /// parties in the channel see that a control session is active and
     /// between whom (§8 third-party visibility), and nothing else: no grant
-    /// id, no key material, no actionable fields. Emitted once per grant
-    /// (at accept), so it needs no further coalescing. Keyed per grant by
-    /// (channel_id, sharer_id) — at most one active grant per sharer per
-    /// channel — which is what `RemoteControlEnded` clears.
+    /// id, no key material, no actionable fields. Emitted on the channel
+    /// topic once per grant (at accept), and re-sent per-socket at Ready
+    /// time for any grant still live (`remote_control_active_snapshot`,
+    /// sessions whose Ready included `voice_states` only) — clients must
+    /// treat re-delivery of the same triple as idempotent.
+    /// Keyed per grant by (channel_id, sharer_id) — at most one active
+    /// grant per sharer per channel — which is what `RemoteControlEnded`
+    /// clears.
     RemoteControlActive {
         channel_id: String,
         sharer_id: String,

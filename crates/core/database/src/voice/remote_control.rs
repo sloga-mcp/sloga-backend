@@ -474,6 +474,54 @@ pub async fn remote_control_grants_in_channel(
     Ok(grants)
 }
 
+/// Redacted snapshot of the live grants across a set of channels, as
+/// re-sendable `RemoteControlActive` events — the Ready-time backfill for
+/// the channel-topic visibility pair. The event is otherwise emitted only
+/// once, at accept, so a session that connects after that moment (or
+/// reconnects — clients deliberately drop their visibility state with the
+/// socket) would see nothing until the next grant. Re-delivering the same
+/// redacted shape lets clients rebuild idempotently.
+///
+/// Best-effort by design: a Redis hiccup here must never cost the caller a
+/// connection, so per-channel failures are logged and skipped (the cost is
+/// a missing badge until the next event — the fail-safe direction). The
+/// caller is responsible for having applied the ViewChannel visibility
+/// filter to `channel_ids` before asking.
+pub async fn remote_control_active_snapshot(channel_ids: &[&str]) -> Vec<EventV1> {
+    let mut events = Vec::new();
+
+    for channel_id in channel_ids {
+        // O(1) EXISTS gate first — ~all live calls hold no grant.
+        match channel_has_remote_control_grants(channel_id).await {
+            Ok(true) => {}
+            Ok(false) => continue,
+            Err(error) => {
+                log::warn!(
+                    "remote control: snapshot grant-set probe failed for {channel_id}: {error:?}"
+                );
+                continue;
+            }
+        }
+
+        match remote_control_grants_in_channel(channel_id).await {
+            Ok(grants) => {
+                for grant in grants {
+                    events.push(EventV1::RemoteControlActive {
+                        channel_id: grant.channel_id,
+                        sharer_id: grant.sharer_id,
+                        controller_id: grant.controller_id,
+                    });
+                }
+            }
+            Err(error) => log::warn!(
+                "remote control: snapshot grant enumeration failed for {channel_id}: {error:?}"
+            ),
+        }
+    }
+
+    events
+}
+
 /// Expiry-index members whose deadline has passed (the reaper's work list)
 pub async fn expired_remote_control_members(now: i64) -> Result<Vec<String>> {
     get_connection()
@@ -810,6 +858,46 @@ mod tests {
             delete_remote_control_offer(&first).await.unwrap();
             assert!(create_remote_control_offer(&second).await.unwrap());
             delete_remote_control_offer(&second).await.unwrap();
+        })
+    }
+
+    #[test]
+    fn snapshot_reflects_live_grants_only() {
+        rt().block_on(async {
+            let suffix = ulid::Ulid::new().to_string();
+            let grant = grant(&suffix);
+            let channel_id = grant.channel_id.as_str();
+
+            // No grant yet — and a channel Redis has never seen contributes
+            // nothing rather than erroring.
+            assert!(remote_control_active_snapshot(&[channel_id]).await.is_empty());
+
+            assert_eq!(
+                create_remote_control_grant(&grant).await.unwrap(),
+                RemoteControlGrantOutcome::Created
+            );
+
+            let events =
+                remote_control_active_snapshot(&[channel_id, "nosuchchannel"]).await;
+            assert_eq!(events.len(), 1);
+            match &events[0] {
+                EventV1::RemoteControlActive {
+                    channel_id,
+                    sharer_id,
+                    controller_id,
+                } => {
+                    assert_eq!(channel_id, &grant.channel_id);
+                    assert_eq!(sharer_id, &grant.sharer_id);
+                    // The redacted event carries the bare controller id,
+                    // never the SFU identity or the grant id.
+                    assert_eq!(controller_id, &grant.controller_id);
+                }
+                other => panic!("expected RemoteControlActive, got {other:?}"),
+            }
+
+            // Record teardown empties the snapshot with it.
+            delete_remote_control_grant_records(&grant).await.unwrap();
+            assert!(remote_control_active_snapshot(&[channel_id]).await.is_empty());
         })
     }
 

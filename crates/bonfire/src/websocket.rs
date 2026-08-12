@@ -17,6 +17,7 @@ use revolt_config::report_internal_error;
 use revolt_database::{
     events::{client::EventV1, server::ClientMessage},
     iso8601_timestamp::Timestamp,
+    voice::remote_control::remote_control_active_snapshot,
     Database, User, UserHint,
 };
 use revolt_presence::{create_session, delete_session};
@@ -151,6 +152,37 @@ pub async fn client(db: &'static Database, stream: TcpStream, addr: SocketAddr) 
         let event = EventV1::UserSlowmodes { slowmodes };
         if report_internal_error!(write.send(config.encode(&event)).await).is_err() {
             return;
+        }
+    }
+
+    // Backfill the channel-topic remote-control visibility pair: clients
+    // source their "who is controlling" state from the
+    // `RemoteControlActive`/`Ended` events and drop it with the socket, so a
+    // session connecting after a grant went active would show nothing until
+    // the next grant. Re-send the same redacted event for every live grant,
+    // to this socket only. The candidate set is the Ready payload's own
+    // voice states — already ViewChannel-filtered, and a grant cannot outlive
+    // its call. Gated on the same flag as the delta routes: with remote
+    // control disabled the reaper is mass-revoking whatever remains, and a
+    // fresh session must not re-light a badge that is being torn down.
+    // (Same caveat as every other Ready datum: an Ended fired between this
+    // read and the pubsub listener attaching below is not replayed; the
+    // frontend clears the map on the next reconnect.)
+    if revolt_config::config().await.features.remote_control {
+        if let EventV1::Ready {
+            voice_states: Some(voice_states),
+            ..
+        } = &ready_payload
+        {
+            let channel_ids: Vec<&str> = voice_states
+                .iter()
+                .map(|voice_state| voice_state.id.as_str())
+                .collect();
+            for event in remote_control_active_snapshot(&channel_ids).await {
+                if report_internal_error!(write.send(config.encode(&event)).await).is_err() {
+                    return;
+                }
+            }
         }
     }
 
