@@ -79,6 +79,20 @@ impl<'a> RatelimitResolver<Request<'a>> for DeltaRatelimits {
                             return ("remote_control_heartbeat", Some(id));
                         }
 
+                        // POST …/control/request ("ask for a turn") gets its
+                        // own bucket, checked BEFORE the offer arm below
+                        // swallows every remaining POST. It must not share
+                        // `remote_control_offer` (2/10s) in either direction:
+                        // a spectator's raised hands must never spend the
+                        // SHARER's offer budget mid-rotation, and one asker
+                        // re-asking must not be able to drain it either.
+                        if request.method() == Method::Post
+                            && request.routed_segment(if versioned { 4 } else { 3 })
+                                == Some("request")
+                        {
+                            return ("control_request", Some(id));
+                        }
+
                         // POST …/control/offer and PUT …/respond: deliberate,
                         // user-paced actions, held to the tight bucket.
                         if matches!(request.method(), Method::Post | Method::Put) {
@@ -305,6 +319,11 @@ impl<'a> RatelimitResolver<Request<'a>> for DeltaRatelimits {
             "captions" => 30,
             // Offer + respond are deliberate, user-paced actions.
             "remote_control_offer" => 2,
+            // "Ask for a turn": user-paced, and request spam at a streamer
+            // is the obvious abuse of a social feature. 3 in the window
+            // allows a legitimate re-ask after a missed one without letting
+            // a heckler keep the sharer's request list churning.
+            "control_request" => 3,
             // Heartbeat + release. The heartbeat is SHARER-driven consent
             // re-assertion on a single-digit-second TTL and the bucket
             // window is 10s, so this must comfortably exceed the send rate

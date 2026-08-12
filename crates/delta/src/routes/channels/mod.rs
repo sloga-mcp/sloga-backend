@@ -4,6 +4,7 @@ use rocket::Route;
 mod call_recording;
 mod captions_send;
 mod channel_ack;
+mod control_request;
 mod channel_delete;
 mod channel_edit;
 mod channel_fetch;
@@ -36,6 +37,7 @@ mod message_search;
 mod message_send;
 mod message_unpin;
 mod message_unreact;
+mod rc_capable;
 mod remote_control;
 mod permissions_set;
 mod permissions_set_default;
@@ -99,6 +101,8 @@ pub fn routes() -> (Vec<Route>, OpenApi) {
         remote_control::control_respond,
         remote_control::control_release,
         remote_control::control_heartbeat,
+        control_request::control_request,
+        rc_capable::rc_capable_announce,
         permissions_set::set_role_permissions,
         permissions_set_default::set_default_channel_permissions,
         message_react::react_message,

@@ -433,6 +433,7 @@ pub async fn create_voice_state(
         camera: false,
         screen_video: false,
         recording: false,
+        rc_capable: false,
     };
 
     Pipeline::new()
@@ -466,6 +467,10 @@ pub async fn create_voice_state(
         // false here so a stale `recording:` left by a crashed process cannot
         // make a new participant appear to be recording.
         .set(format!("recording:{unique_key}"), voice_state.recording)
+        // Same discipline for the capability claim: each join starts from
+        // "not claimed" and the client re-announces, so a stale key cannot
+        // mark a web session as able to receive control.
+        .set(format!("rc_capable:{unique_key}"), voice_state.rc_capable)
         .query_async::<_, ()>(&mut get_connection().await?.into_inner())
         .await
         .to_internal_error()?;
@@ -494,6 +499,7 @@ pub async fn delete_voice_state(channel: &UserVoiceChannel, user_id: &str) -> Re
             // load-bearing teardown for a recorder who drops without pressing
             // stop (a crash, a closed laptop, a network loss).
             format!("recording:{unique_key}"),
+            format!("rc_capable:{unique_key}"),
             unique_key.clone(),
         ])
         .query_async(&mut get_connection().await?.into_inner())
@@ -522,6 +528,7 @@ pub async fn delete_channel_voice_state(
             format!("camera:{unique_key}"),
             format!("screen_video:{unique_key}"),
             format!("recording:{unique_key}"),
+            format!("rc_capable:{unique_key}"),
             unique_key.clone(),
         ]);
     }
@@ -612,6 +619,10 @@ pub async fn update_voice_state(
         pipeline.set(format!("recording:{unique_key}"), recording);
     }
 
+    if let Some(rc_capable) = &partial.rc_capable {
+        pipeline.set(format!("rc_capable:{unique_key}"), rc_capable);
+    }
+
     pipeline
         .query_async(&mut get_connection().await?.into_inner())
         .await
@@ -637,8 +648,19 @@ pub async fn get_voice_state(
         channel.server_id.as_ref().unwrap_or(&channel.id)
     );
 
-    let (joined_at, is_publishing, is_receiving, screensharing, camera, screen_video, recording): (
+    #[allow(clippy::type_complexity)]
+    let (
+        joined_at,
+        is_publishing,
+        is_receiving,
+        screensharing,
+        camera,
+        screen_video,
+        recording,
+        rc_capable,
+    ): (
         Option<i64>,
+        Option<bool>,
         Option<bool>,
         Option<bool>,
         Option<bool>,
@@ -655,6 +677,7 @@ pub async fn get_voice_state(
             format!("camera:{unique_key}"),
             format!("screen_video:{unique_key}"),
             format!("recording:{unique_key}"),
+            format!("rc_capable:{unique_key}"),
         ])
         .await
         .to_internal_error()?;
@@ -690,6 +713,10 @@ pub async fn get_voice_state(
             // unreadable recording key reads as "not recording" rather than
             // dropping the participant's whole voice state.
             recording: recording.unwrap_or(false),
+            // Same rule again: absent (states created before this key
+            // existed, or a lost key) reads as "capability not claimed",
+            // never as a dropped participant.
+            rc_capable: rc_capable.unwrap_or(false),
         })),
         _ => Ok(None),
     }

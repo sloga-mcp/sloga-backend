@@ -46,4 +46,19 @@ auto_derived!(
         #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
         pub grant_id: Option<String>,
     }
+
+    /// Ask a streaming participant for a control turn (pass-the-controller
+    /// plan §2.4 "ask for a turn").
+    ///
+    /// Carries ONLY the addressee. The requester's identity is stamped
+    /// server-side from the authenticated user — a request body is never an
+    /// identity source, or anyone could put words (or raised hands) in
+    /// someone else's name. The relayed event is a suggestion the sharer's
+    /// client shows; it grants nothing and joins no queue by itself.
+    pub struct DataControlRequest {
+        /// User id of the participant being asked (the sharer). Must be a
+        /// live participant of this call publishing screen video; never the
+        /// caller themselves.
+        pub sharer: String,
+    }
 );

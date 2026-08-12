@@ -44,7 +44,7 @@ use rocket_empty::EmptyResponse;
 /// kill switch: `config()` is cached, so flipping the flag off makes these
 /// routes refuse (`FeatureDisabled`, 400) on restart but revokes nothing —
 /// the crond reaper does the mass revoke when it observes the flag off.
-async fn require_remote_control_enabled() -> Result<()> {
+pub(crate) async fn require_remote_control_enabled() -> Result<()> {
     if !revolt_config::config().await.features.remote_control {
         return Err(create_error!(FeatureDisabled {
             feature: "remote_control".to_string()

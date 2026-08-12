@@ -439,6 +439,23 @@ auto_derived_partial!(
         /// read that tells them who is in the call.
         #[serde(default)]
         pub recording: bool,
+        /// True while this participant's client says it can RECEIVE remote
+        /// control (pass-the-controller plan §2.3 option A). Additive field,
+        /// hence the default.
+        ///
+        /// CLIENT-CLAIMED, like `recording`: written by the `rc_capable`
+        /// route, not by voice-ingress, because only the client knows whether
+        /// it is a desktop build with a working native injection layer.
+        /// Nothing server-side can verify the claim, and nothing may treat it
+        /// as one — it exists so a rotation queue can mark who a control
+        /// offer could ever reach, instead of discovering it via a 90s offer
+        /// timeout. A false claim buys nothing: the offer still dies at the
+        /// TTL, and every real grant still passes the native arm dialog on
+        /// the sharer's machine. Rides on voice state (not a one-shot event)
+        /// so a LATE JOINER learns it from the same roster read that tells
+        /// them who is in the call.
+        #[serde(default)]
+        pub rc_capable: bool,
     },
     "PartialUserVoiceState"
 );

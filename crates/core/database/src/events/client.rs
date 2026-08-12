@@ -576,6 +576,26 @@ pub enum EventV1 {
         sharer_id: String,
         reason: String,
     },
+
+    /// Remote control: a call participant asked a streaming participant for
+    /// a control turn (pass-the-controller plan §2.4 "ask for a turn").
+    /// Addressed PRIVATELY to the SHARER only — a raised hand is between the
+    /// asker and the streamer, and the channel topic's boundary is
+    /// ViewChannel, not call membership.
+    ///
+    /// `requester_id` is stamped server-side from the authenticated caller,
+    /// never taken from the request body. Even so, the event is a
+    /// SUGGESTION: it grants nothing, enters no queue by itself, and every
+    /// actual turn still passes the native arm dialog on the sharer's
+    /// machine. Like `RemoteControlOffered`, `EventV1::private` reaches
+    /// every session of the sharer including off-call devices — receiving
+    /// clients must scope to the call they are actually in.
+    CallControlRequest {
+        channel_id: String,
+        requester_id: String,
+        sharer_id: String,
+    },
+
     /// User's active slowmodes
     UserSlowmodes {
         slowmodes: Vec<ChannelSlowmode>,
