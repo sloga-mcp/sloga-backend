@@ -700,6 +700,8 @@ async fn create_channels(
                 name: planned.name.clone(),
                 description: planned.description.clone(),
                 nsfw: Some(planned.nsfw),
+                // Discord has no equivalent flag to import from.
+                spoiler: None,
                 voice,
                 announcement,
             },
