@@ -547,9 +547,30 @@ pub enum EventV1 {
 
     /// Remote control: a grant ended. Channel topic, keyed like
     /// `RemoteControlActive` so clients clear the active indicator by
-    /// (channel_id, sharer_id). `reason` is one of: "released",
-    /// "revoked_by_moderator", "expired", "permissions_changed",
-    /// "participant_left", "call_ended", "reconnected", "disabled".
+    /// (channel_id, sharer_id).
+    ///
+    /// 🔴 `reason` is an OPEN vocabulary — treat it as an opaque string.
+    /// Clients MUST clear on any value and must never switch over a fixed
+    /// set: this enumeration was stale for several additions before it was
+    /// rewritten, and a client that only recognises known values leaves a
+    /// stale "X is controlling" claim on screen the first time a new one
+    /// appears. The same computed string is stamped into the audit row, so
+    /// it is descriptive, not a protocol.
+    ///
+    /// As of 2026-08-12 the values are, by origin:
+    /// - client-informed via `?cause=`, re-validated server-side against a
+    ///   fixed allowlist (`release_audit_reason`): "panic",
+    ///   "connection_lost", "anti_cheat", "indicator_hidden",
+    ///   "max_lifetime", "display_topology_changed", "calibration_rejected",
+    ///   "turn_ended" (a "pass the controller" rotation handoff, NOT a yank);
+    /// - role defaults when the cause is absent or unrecognised:
+    ///   "revoked_by_sharer", "released_by_controller";
+    /// - server-decided: "revoked_by_moderator", "screenshare_ended",
+    ///   "participant_left", "permissions_changed", "reconnected",
+    ///   "call_ended", and from the reaper "expired" / "disabled".
+    ///
+    /// ("released" is gone — it was the single collapsed value the
+    /// sharer/controller split replaced.)
     RemoteControlEnded {
         channel_id: String,
         sharer_id: String,

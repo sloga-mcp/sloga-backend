@@ -503,6 +503,13 @@ fn release_audit_reason(cause: Option<&str>, is_sharer: bool) -> &'static str {
         Some("max_lifetime") => "max_lifetime",
         Some("display_topology_changed") => "display_topology_changed",
         Some("calibration_rejected") => "calibration_rejected",
+        // A rotation handoff ("pass the controller"), not a yank. Without
+        // its own cause a turn ending would fall back to
+        // `revoked_by_sharer`, which is the string that means the machine's
+        // owner took control back — so the audit could not tell a friendly
+        // handoff from someone pulling the plug on a controller. The
+        // streamer's client sends this on turn expiry and on "Next".
+        Some("turn_ended") => "turn_ended",
         _ if is_sharer => "revoked_by_sharer",
         _ => "released_by_controller",
     }
@@ -648,6 +655,7 @@ mod test {
             "max_lifetime",
             "display_topology_changed",
             "calibration_rejected",
+            "turn_ended",
         ] {
             assert_eq!(release_audit_reason(Some(cause), true), cause);
             assert_eq!(release_audit_reason(Some(cause), false), cause);
@@ -655,7 +663,21 @@ mod test {
 
         // Unknown strings NEVER pass through — including the old collapsed
         // value, prose, and near-misses.
-        for junk in ["released", "expired", "Panic", "panic ", "owned lol", ""] {
+        // `turn_ended ` / `Turn_ended` are here for the same reason `panic `
+        // is: the client must send the EXACT literal or the rotation is
+        // recorded as a revoke, and a near-miss is the likeliest way for
+        // that to happen silently.
+        for junk in [
+            "released",
+            "expired",
+            "Panic",
+            "panic ",
+            "owned lol",
+            "",
+            "turn_ended ",
+            "Turn_ended",
+            "turnended",
+        ] {
             assert_eq!(release_audit_reason(Some(junk), true), "revoked_by_sharer");
             assert_eq!(
                 release_audit_reason(Some(junk), false),
