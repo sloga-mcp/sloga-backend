@@ -1,6 +1,8 @@
 use revolt_rocket_okapi::revolt_okapi::openapi3::OpenApi;
 use rocket::Route;
 
+mod annotations_consent;
+mod annotations_send;
 mod call_recording;
 mod captions_send;
 mod channel_ack;
@@ -95,6 +97,10 @@ pub fn routes() -> (Vec<Route>, OpenApi) {
         voice_stop_ring::stop_ring,
         soundboard_trigger::trigger_sound,
         captions_send::send_caption,
+        annotations_send::send_annotation,
+        annotations_consent::annotation_allow,
+        annotations_consent::annotation_revoke,
+        annotations_consent::annotation_consent_fetch,
         call_recording::recording_start,
         call_recording::recording_stop,
         remote_control::control_offer,

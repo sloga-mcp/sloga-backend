@@ -18,6 +18,7 @@ use revolt_models::v0::{self, PartialUserVoiceState, UserVoiceState};
 use revolt_permissions::{calculate_channel_permissions, ChannelPermission, PermissionValue};
 use revolt_result::{create_error, Result, ToRevoltError};
 
+pub mod annotations;
 pub mod remote_control;
 mod voice_client;
 pub use voice_client::VoiceClient;

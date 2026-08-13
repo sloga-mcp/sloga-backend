@@ -137,6 +137,27 @@ impl<'a> RatelimitResolver<Request<'a>> for DeltaRatelimits {
                         return ("captions", Some(id));
                     }
 
+                    // Annotation strokes are pointer-paced — the client
+                    // coalesces to ≤10 Hz, so a live drawing session runs at
+                    // ~100 requests per 10s window and needs its OWN generous
+                    // bucket. The consent routes (…/annotations/allow) are
+                    // user-paced list management and must NOT share it in
+                    // either direction: a drawing helper must not spend the
+                    // sharer's revoke budget, and the tight consent bucket
+                    // must not swallow mid-stroke sends. Neither may fall
+                    // through to the plain channels bucket (20/10s), which a
+                    // steady drawing hand would exhaust in two seconds.
+                    if extra == Some("annotations") {
+                        if request.routed_segment(if versioned { 4 } else { 3 })
+                            == Some("allow")
+                        {
+                            return ("annotations_consent", Some(id));
+                        }
+                        if request.method() == Method::Post {
+                            return ("annotations", Some(id));
+                        }
+                    }
+
                     // Following an announcement channel creates a webhook in
                     // the target and fans events to two server topics — bound
                     // it separately (both POST create and DELETE unfollow live
@@ -317,6 +338,17 @@ impl<'a> RatelimitResolver<Request<'a>> for DeltaRatelimits {
             // is 10s, so this leaves roughly 3x headroom over natural speech
             // while still bounding a hostile client.
             "captions" => 30,
+            // Annotation stroke batches. The client coalesces pointer
+            // samples to ≤10 Hz, so a continuous drawing hand is exactly
+            // 100 per 10s window — 180 leaves ~1.8x headroom so a burst or
+            // a late coalescing tick never tears a visible gap mid-stroke
+            // (plan §2.3: 100 would have ZERO headroom), while still
+            // bounding a hostile client to well under fan-out-melting rates.
+            "annotations" => 180,
+            // Consent list management (allow/revoke/fetch): user-paced,
+            // and the revoke is a safety action — the bucket must never be
+            // small enough to lock a sharer out of clearing consent.
+            "annotations_consent" => 10,
             // Offer + respond are deliberate, user-paced actions.
             "remote_control_offer" => 2,
             // "Ask for a turn": user-paced, and request spam at a streamer

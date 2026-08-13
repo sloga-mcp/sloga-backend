@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 use revolt_models::v0::{
-    AppendMessage, Channel, ChannelFollow, ChannelSlowmode, ChannelUnread, ChannelVoiceState, E2EEMessage,
+    AnnotationStroke, AppendMessage, Channel, ChannelFollow, ChannelSlowmode, ChannelUnread, ChannelVoiceState, E2EEMessage,
     Emoji, Event, EventRsvp, FieldsChannel, FieldsMember, FieldsMessage, FieldsRole, FieldsServer, FieldsUser,
     FieldsWebhook, Interaction, Member, MemberCompositeKey, Message, PartialChannel, PartialEmoji,
     PartialMember, PartialMessage, PartialRole, PartialServer, PartialSticker, PartialUser,
@@ -333,6 +333,49 @@ pub enum EventV1 {
         text: String,
         /// BCP-47 language the speaker was recognized in
         lang: String,
+    },
+
+    /// A batch of annotation strokes drawn on a screen-sharer's surface
+    /// (tech-support-mode plan §2).
+    ///
+    /// OTHER-addressed, unlike `CallCaption` (which describes the sender's
+    /// own speech): the annotator draws on the TARGET's surface, so both
+    /// ends are stamped/validated server-side — the annotator from the
+    /// authenticated caller, the target checked to be a live screen-sharer
+    /// who has allowlisted this annotator. Fanned to the call's current
+    /// participants over private topics for the same reason captions are.
+    /// Transient — strokes are relayed, rendered, faded, never persisted.
+    /// A stroke is a picture, never an input event (plan §0.3).
+    CallAnnotation {
+        channel_id: String,
+        /// Annotator's LiveKit identity, resolved server-side — what the
+        /// "✏️ is drawing" attribution is keyed by. The server ASSERTS this;
+        /// the transport cannot prove it (§0.2 honesty rule), so client copy
+        /// must not present it as verified.
+        annotator_identity: String,
+        /// Annotator's user id (stamped from the authenticated caller)
+        annotator_id: String,
+        /// Identity of the sharer whose surface is drawn on, resolved
+        /// server-side — what receivers key the overlay's tile by
+        target_identity: String,
+        /// The sharer's user id (validated: live screen-sharer here)
+        target_id: String,
+        /// Strokes since the annotator's last coalescing tick
+        strokes: Vec<AnnotationStroke>,
+        /// Monotonic per-annotator sequence, so receivers can drop batches
+        /// that arrive after a clear
+        seq: u32,
+    },
+
+    /// A sharer's draw-consent allowlist changed (tech-support-mode plan
+    /// §2.4). `allowed` is the COMPLETE new list: empty means revoked —
+    /// receivers drop that sharer's rendered strokes immediately (revoke is
+    /// the phishing backstop; the fade is not) and hide the draw affordance.
+    /// Fanned to the call's current participants over private topics.
+    CallAnnotationConsent {
+        channel_id: String,
+        sharer_id: String,
+        allowed: Vec<String>,
     },
 
     /// New report
