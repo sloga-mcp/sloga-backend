@@ -13,7 +13,10 @@ use revolt_database::{
     events::client::EventV1,
     util::{permissions::perms, reference::Reference},
     voice::{
-        annotations::{add_allowed_annotator, clear_allowed_annotators, get_allowed_annotators},
+        annotations::{
+            add_allowed_annotator, clear_allowed_annotators, count_allowed_annotators,
+            get_allowed_annotators, MAX_ALLOWED_ANNOTATORS,
+        },
         get_voice_channel_members, get_voice_state, is_in_voice_channel, UserVoiceChannel,
     },
     Database, User,
@@ -104,6 +107,18 @@ pub async fn annotation_allow(
     if !sharing {
         return Err(create_error!(FailedValidation {
             error: "caller is not publishing screen video".to_string()
+        }));
+    }
+
+    // The allowlist is capped (rev-3 review): its size is the only
+    // server-side bound on aggregate stroke fan-out, so it must not scale
+    // with channel population. §2.4's model is a helper or two, not an
+    // audience. (SCARD-then-SADD races at worst one entry past the cap —
+    // the caller is a single ratelimited sharer, not an adversary against
+    // their own list.)
+    if count_allowed_annotators(channel.id(), &user.id).await? >= MAX_ALLOWED_ANNOTATORS {
+        return Err(create_error!(FailedValidation {
+            error: "annotator allowlist is full".to_string()
         }));
     }
 
@@ -280,8 +295,9 @@ mod test {
         assert_eq!(body.sharers[0].sharer_id, user_a.id);
         assert_eq!(body.sharers[0].allowed, vec![user_b.id.clone()]);
 
-        // Share stops — the revoke must still work (the backstop never
-        // depends on a live share).
+        // Share stops — consent is scoped to the share it was granted on,
+        // so the allowlist AUTO-clears right here (rev-3 review: without
+        // this, re-sharing hours later silently resurrects old grants).
         update_voice_state(
             &uvc,
             &user_a.id,
@@ -293,7 +309,16 @@ mod test {
         )
         .await
         .expect("share stop");
+        assert!(
+            !is_annotator_allowed(channel.id(), &user_a.id, &user_b.id)
+                .await
+                .expect("allowlist read"),
+            "share stop must clear draw consent"
+        );
 
+        // The explicit revoke must STILL work after the share ended (the
+        // backstop never depends on a live share) — here it is a no-op on
+        // an already-cleared list, and still 204.
         let response = harness
             .client
             .delete(format!("/channels/{}/annotations/allow", channel.id()))

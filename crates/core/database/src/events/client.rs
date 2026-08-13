@@ -362,8 +362,10 @@ pub enum EventV1 {
         target_id: String,
         /// Strokes since the annotator's last coalescing tick
         strokes: Vec<AnnotationStroke>,
-        /// Monotonic per-annotator sequence, so receivers can drop batches
-        /// that arrive after a clear
+        /// Batch counter, monotonic within one capture session. Diagnostic
+        /// ordering info only — receivers do NOT enforce it (a remounted
+        /// capture legitimately restarts at 1); the revoke path drops ink
+        /// by consent state, not by sequence.
         seq: u32,
     },
 

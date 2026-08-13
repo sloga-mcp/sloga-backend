@@ -472,6 +472,10 @@ pub async fn create_voice_state(
         // "not claimed" and the client re-announces, so a stale key cannot
         // mark a web session as able to receive control.
         .set(format!("rc_capable:{unique_key}"), voice_state.rc_capable)
+        // And for draw consent: a fresh join never inherits an annotation
+        // allowlist a crashed/stale session left behind (rev-3 review — a
+        // resurrected list silently re-grants drawing on the next share).
+        .del(format!("annotations_allow:{}:{}", &channel.id, user_id))
         .query_async::<_, ()>(&mut get_connection().await?.into_inner())
         .await
         .to_internal_error()?;
@@ -501,6 +505,9 @@ pub async fn delete_voice_state(channel: &UserVoiceChannel, user_id: &str) -> Re
             // stop (a crash, a closed laptop, a network loss).
             format!("recording:{unique_key}"),
             format!("rc_capable:{unique_key}"),
+            // Draw consent dies with the voice state: an allowlist must not
+            // outlive the call it was granted in (rev-3 review).
+            format!("annotations_allow:{}:{}", &channel.id, user_id),
             unique_key.clone(),
         ])
         .query_async(&mut get_connection().await?.into_inner())
@@ -530,6 +537,8 @@ pub async fn delete_channel_voice_state(
             format!("screen_video:{unique_key}"),
             format!("recording:{unique_key}"),
             format!("rc_capable:{unique_key}"),
+            // Draw consent dies with the call (rev-3 review).
+            format!("annotations_allow:{}:{}", &channel.id, user_id),
             unique_key.clone(),
         ]);
     }
@@ -625,9 +634,35 @@ pub async fn update_voice_state(
     }
 
     pipeline
-        .query_async(&mut get_connection().await?.into_inner())
+        .query_async::<_, ()>(&mut get_connection().await?.into_inner())
         .await
-        .to_internal_error()
+        .to_internal_error()?;
+
+    // Draw consent is scoped to the SHARE it was granted on (rev-3 review):
+    // when the screen-video publication ends, the sharer's annotation
+    // allowlist ends with it — otherwise the next share in this channel
+    // silently resurrects grants the sharer no longer remembers making.
+    // The consent event fans only if a list actually existed, so ordinary
+    // share stops (the overwhelmingly common case) cost nothing extra; it
+    // is what flips remote clients' draw affordances off and drops any
+    // still-rendered ink at once.
+    if partial.screen_video == Some(false)
+        && annotations::clear_allowed_annotators(&channel.id, user_id).await?
+    {
+        if let Some(members) = get_voice_channel_members(channel).await? {
+            for member_id in members {
+                crate::events::client::EventV1::CallAnnotationConsent {
+                    channel_id: channel.id.clone(),
+                    sharer_id: user_id.to_string(),
+                    allowed: Vec::new(),
+                }
+                .private(member_id)
+                .await;
+            }
+        }
+    }
+
+    Ok(())
 }
 
 pub async fn get_voice_channel_members(channel: &UserVoiceChannel) -> Result<Option<Vec<String>>> {

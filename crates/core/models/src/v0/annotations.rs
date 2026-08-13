@@ -46,8 +46,9 @@ auto_derived!(
         /// ratelimit bucket bounds a hostile client).
         #[cfg_attr(feature = "validator", validate(length(min = 1, max = 8)))]
         pub strokes: Vec<AnnotationStroke>,
-        /// Monotonic per-annotator sequence number so receivers can drop
-        /// late-arriving batches after a clear.
+        /// Batch counter, monotonic within one capture session. Diagnostic
+        /// ordering info only — receivers do not enforce it (a remounted
+        /// capture legitimately restarts at 1).
         pub seq: u32,
     }
 

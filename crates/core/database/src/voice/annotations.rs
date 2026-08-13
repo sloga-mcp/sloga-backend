@@ -7,13 +7,20 @@
 //! client toggle — and it is the only thing the annotation feature stores;
 //! strokes themselves are relayed and forgotten, like captions.
 //!
+//! CONSENT IS SCOPED TO THE SHARE IT WAS GRANTED ON (review finding, rev 3):
+//! the allowlist is cleared when the sharer's `screen_video` goes false, when
+//! their voice state is deleted (leave/call end), and on a fresh join —
+//! the same stale-key discipline `recording:`/`rc_capable:` follow. Without
+//! those clears, re-sharing hours later in the same channel would silently
+//! resurrect every old grant the sharer no longer remembers making.
+//!
 //! Unlike remote-control grants (`remote_control.rs`), passive Redis TTL is
-//! the right expiry here: a consent entry going stale fails CLOSED (the next
-//! send is refused), whereas a grant record vanishing fails OPEN (nothing
-//! left to revoke). No reaper, no expiry index — the TTL is garbage
-//! collection, not enforcement. Enforcement also re-checks on every send
-//! that the target is publishing screen video RIGHT NOW, so an allowlist
-//! outliving a share grants nothing.
+//! the right LAST-RESORT expiry here: a consent entry going stale fails
+//! CLOSED (the next send is refused), whereas a grant record vanishing fails
+//! OPEN (nothing left to revoke). No reaper, no expiry index — the TTL is
+//! garbage collection behind the lifecycle clears above, not enforcement.
+//! Enforcement also re-checks on every send that the target is publishing
+//! screen video RIGHT NOW.
 
 use redis_kiss::AsyncCommands;
 use revolt_result::{Result, ToRevoltError};
@@ -36,6 +43,13 @@ pub const ANNOTATION_PALETTE_SIZE: u8 = 5;
 
 /// Stroke width classes — width indexes must be `<` this.
 pub const ANNOTATION_WIDTH_CLASSES: u8 = 3;
+
+/// Most annotators one sharer may allowlist at once. §2.4's spirit is "a
+/// named participant" — helpers, not an audience — and the review promoted
+/// this to a security control: the allowlist size is the only server-side
+/// bound on the aggregate stroke fan-out (N annotators × 18 req/s ×
+/// members-1 publishes), so it must not scale with channel population.
+pub const MAX_ALLOWED_ANNOTATORS: usize = 8;
 
 fn allow_key(channel_id: &str, sharer_id: &str) -> String {
     format!("annotations_allow:{channel_id}:{sharer_id}")
@@ -63,14 +77,26 @@ pub async fn add_allowed_annotator(
 
 /// The one-action revoke (plan §2.4): drop the sharer's WHOLE allowlist.
 /// Deliberately not per-user — the backstop against a live phishing overlay
-/// must be a single act, not list management.
-pub async fn clear_allowed_annotators(channel_id: &str, sharer_id: &str) -> Result<()> {
+/// must be a single act, not list management. Returns whether a list
+/// existed, so lifecycle callers can skip fanning a consent event nobody
+/// needs.
+pub async fn clear_allowed_annotators(channel_id: &str, sharer_id: &str) -> Result<bool> {
     let mut conn = get_connection().await?;
-    let _: () = conn
+    let removed: i64 = conn
         .del(allow_key(channel_id, sharer_id))
         .await
         .to_internal_error()?;
-    Ok(())
+    Ok(removed > 0)
+}
+
+/// Current allowlist size (0 if none) — the PUT route's cap input.
+pub async fn count_allowed_annotators(channel_id: &str, sharer_id: &str) -> Result<usize> {
+    let mut conn = get_connection().await?;
+    let count: i64 = conn
+        .scard(allow_key(channel_id, sharer_id))
+        .await
+        .to_internal_error()?;
+    Ok(count.max(0) as usize)
 }
 
 /// Is `annotator_id` currently allowed to draw on `sharer_id`'s screen?
