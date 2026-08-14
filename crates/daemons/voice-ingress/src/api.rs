@@ -365,10 +365,17 @@ pub async fn ingress(
                 };
 
                 if track.r#type == TrackType::Video as i32 {
+                    // Widened before multiplying: both sides are u32, and a
+                    // client-declared 65536x65536 wraps to exactly 0 in
+                    // release, clearing this check and the aspect band below
+                    // (its ratio is a perfectly ordinary 1.0).
+                    let area = track.width as u64 * track.height as u64;
+                    let limit_area = user_limits.video_resolution[0] as u64
+                        * user_limits.video_resolution[1] as u64;
+
                     if user_limits.video_resolution[0] != 0
                         && user_limits.video_resolution[1] != 0
-                        && track.width * track.height
-                            > user_limits.video_resolution[0] * user_limits.video_resolution[1]
+                        && area > limit_area
                     {
                         log::warn!(
                             "User {user_id} published video over the resolution limit ({}x{}) — removing from channel {channel_id}.",
@@ -378,34 +385,43 @@ pub async fn ingress(
                         disconnect = true;
                     };
 
-                    let aspect = track.width as f32 / track.height as f32;
+                    // A zero on either axis makes `aspect` NaN, and NaN lies
+                    // outside every RangeInclusive, so a track that arrives
+                    // without dimensions would read as a violation and eject
+                    // its publisher. Missing dimensions are not evidence of a
+                    // bad shape — skip the band rather than guess.
+                    if track.width > 0 && track.height > 0 {
+                        let aspect = track.width as f32 / track.height as f32;
 
-                    // A screenshare's aspect ratio is whatever the user's
-                    // DISPLAY is, so holding it to the camera band ejects
-                    // people for owning an ultrawide or spanning two monitors
-                    // — both 3.56 against a 2.5 ceiling. That is not abuse,
-                    // and it removed a real user from two calls ~60ms after
-                    // publish on 2026-08-08. Screenshares get the wide sanity
-                    // band instead, and a violation MUTES the track rather
-                    // than removing the member from the call: the same
-                    // remedy, for the same reason, as the video cap below.
-                    if is_screenshare_video(track.source) {
-                        if !(SCREENSHARE_ASPECT_MIN..=SCREENSHARE_ASPECT_MAX).contains(&aspect) {
+                        // A screenshare's aspect ratio is whatever the user's
+                        // DISPLAY is, so holding it to the camera band ejects
+                        // people for owning an ultrawide or spanning two monitors
+                        // — both 3.56 against a 2.5 ceiling. That is not abuse,
+                        // and it removed a real user from two calls ~60ms after
+                        // publish on 2026-08-08. Screenshares get the wide sanity
+                        // band instead, and a violation MUTES the track rather
+                        // than removing the member from the call: the same
+                        // remedy, for the same reason, as the video cap below.
+                        if is_screenshare_video(track.source) {
+                            if !(SCREENSHARE_ASPECT_MIN..=SCREENSHARE_ASPECT_MAX).contains(&aspect) {
+                                log::warn!(
+                                    "Muting screenshare from user {user_id} in channel {channel_id}: aspect {aspect} outside {SCREENSHARE_ASPECT_MIN}..={SCREENSHARE_ASPECT_MAX} ({}x{}).",
+                                    track.width,
+                                    track.height
+                                );
+                                mute_offending = true;
+                            };
+                        } else if user_limits.video_aspect_ratio[0]
+                            != user_limits.video_aspect_ratio[1]
+                            && !(user_limits.video_aspect_ratio[0]
+                                ..=user_limits.video_aspect_ratio[1])
+                                .contains(&aspect)
+                        {
                             log::warn!(
-                                "Muting screenshare from user {user_id} in channel {channel_id}: aspect {aspect} outside {SCREENSHARE_ASPECT_MIN}..={SCREENSHARE_ASPECT_MAX} ({}x{}).",
-                                track.width,
-                                track.height
+                                "User {user_id} published camera video with out of bounds aspect ratio ({aspect}) — removing from channel {channel_id}."
                             );
-                            mute_offending = true;
+                            disconnect = true;
                         };
-                    } else if user_limits.video_aspect_ratio[0] != user_limits.video_aspect_ratio[1]
-                        && !(user_limits.video_aspect_ratio[0]..=user_limits.video_aspect_ratio[1])
-                            .contains(&aspect)
-                    {
-                        log::warn!(
-                            "User {user_id} published camera video with out of bounds aspect ratio ({aspect}) — removing from channel {channel_id}."
-                        );
-                        disconnect = true;
                     };
                 };
 

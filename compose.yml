@@ -85,6 +85,14 @@ services:
       MAILDEV_INCOMING_PASS: smtp
 
   livekit:
+    # Fork, and voice-ingress depends on it being one: `track_muted` /
+    # `track_unmuted` are not upstream webhooks (upstream sends only
+    # `track_published` / `track_unpublished` for tracks). Those two events are
+    # what keeps a member's camera/screenshare flags accurate in voice state,
+    # and they are what releases remote control when a sharer MUTES their
+    # screen rather than unpublishing it. Swapping this for an upstream
+    # livekit-server would stop both silently — the webhook simply never
+    # arrives, so nothing errors and nothing logs.
     image: ghcr.io/stoatchat/livekit-server:v1.9.13
     command: --config /etc/livekit.yml
     ports:
