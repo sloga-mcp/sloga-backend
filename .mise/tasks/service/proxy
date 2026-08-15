@@ -2,4 +2,19 @@
 #MISE description="Run proxy server"
 set -e
 
+# Own our log fd instead of leaving output on the stdout pipe mise hands us.
+# That pipe belongs to the supervisor: when the supervisor exits, its read end
+# closes and every later log line is silently discarded while this service
+# keeps running and serving traffic. That is exactly what happened on
+# 2026-08-14 -- seven services ran for hours with no observability at all,
+# which blocked a support investigation. A file fd has no such shared fate.
+#
+# The path is deliberately overridable: this repo file stays machine-neutral
+# and start-sloga.sh sets SLOGA_LOG_DIR for this box.
+LOG_DIR="${SLOGA_LOG_DIR:-/tmp}"
+mkdir -p "$LOG_DIR"
+# printed BEFORE the redirect, so the supervisor log still says where to look
+echo "[proxy] service log -> $LOG_DIR/sloga-january.log"
+exec >> "$LOG_DIR/sloga-january.log" 2>&1
+
 cargo run --release --bin revolt-january
