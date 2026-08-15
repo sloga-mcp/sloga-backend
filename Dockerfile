@@ -1,5 +1,9 @@
 # Build Stage
-FROM --platform="${BUILDPLATFORM}" rust:1.92.0-slim-bookworm
+#
+# Trixie, not bookworm: AVIF decoding needs libdav1d, and the `dav1d` crate requires
+# >= 1.3.0. Bookworm ships 1.0.0 and bookworm-backports has nothing newer, so the build
+# fails there outright. Trixie ships 1.5.1.
+FROM --platform="${BUILDPLATFORM}" rust:1.92.0-slim-trixie
 USER 0:0
 WORKDIR /home/rust/src
 
@@ -11,7 +15,8 @@ RUN apt-get update && \
     apt-get install -y \
     make \
     pkg-config \
-    libssl-dev:"${TARGETARCH}"
+    libssl-dev:"${TARGETARCH}" \
+    libdav1d-dev:"${TARGETARCH}"
 COPY scripts/build-image-layer.sh /tmp/
 RUN sh /tmp/build-image-layer.sh tools
 

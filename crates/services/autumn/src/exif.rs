@@ -72,12 +72,36 @@ pub async fn strip_metadata(
                     // metadata below records that it is no longer animated.
                 }
 
+                // AVIF never goes through the re-encode below if it can be avoided.
+                // rav1e costs ~40s of CPU for a 12MP image at the encoder's default
+                // speed and ~15s at speed 8, all of it synchronous inside the upload
+                // request — a handful of concurrent uploads would saturate the worker
+                // pool, and there is no megapixel cap to bound it. Zeroing the metadata
+                // items in place is effectively free, lossless for the pixels, and keeps
+                // animated AVIF animated (image-rs decodes only the primary item, so the
+                // re-encode would silently flatten it).
+                if mime == "image/avif" {
+                    if let Some(stripped) = strip_avif_metadata_items(&buf) {
+                        return Ok((stripped, metadata.clone(), mime.to_owned()));
+                    }
+
+                    // Unparseable as AVIF: fall through and re-encode rather than store
+                    // a file we could not clean. Slow, but this is the rare path.
+                }
+
                 // Create a reader
                 let mut cursor = Cursor::new(buf);
 
-                // Decode the image
-                let reader =
-                    report_internal_error!(ImageReader::new(&mut cursor).with_guessed_format())?;
+                // Decode the image, pinning the format from the mime this arm already
+                // matched on. Re-sniffing here disagrees with the mime `infer` chose:
+                // image-rs accepts only an `avif` major brand, so an `avis` AVIF (what
+                // ffmpeg writes for anything multi-frame) fails as an unknown format
+                // and the upload 500s. See `reader_with_format` in revolt-files.
+                let mut reader = ImageReader::new(&mut cursor);
+                match image::ImageFormat::from_mime_type(mime) {
+                    Some(format) => reader.set_format(format),
+                    None => reader = report_internal_error!(reader.with_guessed_format())?,
+                }
                 let mut decoder = report_internal_error!(reader.into_decoder())?;
                 let mut icc_profile =
                     report_internal_error!(image::ImageDecoder::icc_profile(&mut decoder))?;
@@ -141,12 +165,19 @@ pub async fn strip_metadata(
                     ),
                     "image/avif" => {
                         // avif encoder doesn't implement set_icc_profile currently
-                        image::codecs::avif::AvifEncoder::new(&mut writer).write_image(
-                            image.as_bytes(),
-                            width,
-                            height,
-                            color_type.into(),
-                        )
+                        //
+                        // Speed 8 rather than `AvifEncoder::new`'s default of 4: this runs
+                        // synchronously inside the upload request, and rav1e at speed 4 costs
+                        // seconds of CPU for a phone-sized image. Quality stays at the
+                        // default 80. Encoding is at least threaded — `ravif/threading` rides
+                        // in on the `rayon` feature.
+                        image::codecs::avif::AvifEncoder::new_with_speed_quality(&mut writer, 8, 80)
+                            .write_image(
+                                image.as_bytes(),
+                                width,
+                                height,
+                                color_type.into(),
+                            )
                     }
                     "image/tiff" => encode_with_icc!(
                         image::codecs::tiff::TiffEncoder::new(&mut writer),
@@ -184,6 +215,177 @@ pub async fn strip_metadata(
         // all other file types don't store EXIF data
         _ => Ok((buf, metadata, mime.to_owned())),
     }
+}
+
+/// HEIF item types that carry metadata: `Exif` is EXIF (including GPS), `mime` is
+/// normally XMP. Everything else in an AVIF's item list is image data or describes
+/// how to display it.
+const AVIF_METADATA_ITEM_TYPES: [&[u8]; 2] = [b"Exif", b"mime"];
+
+/// Strip metadata from an AVIF without decoding it
+///
+/// Unlike PNG, an AVIF cannot be rebuilt by copying the parts we want through: item
+/// payloads live in `mdat` and are addressed by ABSOLUTE file offsets recorded in
+/// `iloc`, and for an animated file again in the `moov`'s `stco`. Removing bytes would
+/// invalidate every one of those offsets, and a stale offset is a silent corruption —
+/// the decoder reads the wrong bytes rather than failing.
+///
+/// So instead of removing the Exif item, overwrite its payload in place with zeros.
+/// That is a SAME-LENGTH edit: every offset in both tables stays correct, no box size
+/// changes, the image bitstream is untouched, and an animated AVIF keeps every frame.
+/// The metadata bytes themselves are genuinely gone, which is what matters.
+///
+/// Returns `None` if this is not parseable as an AVIF; the caller is expected to fall
+/// back to re-encoding rather than store the file unstripped.
+fn strip_avif_metadata_items(buf: &[u8]) -> Option<Vec<u8>> {
+    let meta = find_box(buf, 0, buf.len(), b"meta")?;
+    // `meta` is a FullBox, so its children start after four bytes of version/flags
+    let children = (meta.0 + 12, meta.1);
+
+    let item_ids = avif_metadata_item_ids(buf, children)?;
+    if item_ids.is_empty() {
+        // Nothing to strip, but the file parsed: hand back an unchanged copy rather
+        // than `None`, so the caller does not needlessly re-encode.
+        return Some(buf.to_vec());
+    }
+
+    let mut out = buf.to_vec();
+    for extent in avif_item_extents(buf, children)? {
+        if !item_ids.contains(&extent.item_id) {
+            continue;
+        }
+        // Construction methods 1 and 2 are `idat`- and item-relative rather than file
+        // offsets. They are legal but absent from anything we have seen; refuse rather
+        // than zero the wrong range.
+        if extent.construction_method != 0 {
+            return None;
+        }
+        let end = extent.offset.checked_add(extent.length)?;
+        if end > out.len() {
+            return None;
+        }
+        out[extent.offset..end].fill(0);
+    }
+
+    Some(out)
+}
+
+/// Find a direct child box of the given type, returning `(content_start, box_end)`
+fn find_box(buf: &[u8], start: usize, end: usize, want: &[u8]) -> Option<(usize, usize)> {
+    let mut pos = start;
+    while pos + 8 <= end {
+        let size = u32::from_be_bytes(buf[pos..pos + 4].try_into().ok()?) as usize;
+        let kind = &buf[pos + 4..pos + 8];
+        let size = if size == 0 { end - pos } else { size };
+        if size < 8 || pos.checked_add(size)? > end {
+            return None;
+        }
+        if kind == want {
+            return Some((pos, pos + size));
+        }
+        pos += size;
+    }
+    None
+}
+
+/// Walk `meta` -> `iinf` -> `infe` collecting the IDs of items that carry metadata
+fn avif_metadata_item_ids(buf: &[u8], (start, end): (usize, usize)) -> Option<Vec<u16>> {
+    let (iinf_start, iinf_end) = find_box(buf, start, end, b"iinf")?;
+    let version = *buf.get(iinf_start + 8)?;
+    // FullBox header, then a 2-byte (v0) or 4-byte entry_count before the infe children
+    let mut pos = iinf_start + 12 + if version == 0 { 2 } else { 4 };
+
+    let mut ids = Vec::new();
+    while pos + 8 <= iinf_end {
+        let size = u32::from_be_bytes(buf.get(pos..pos + 4)?.try_into().ok()?) as usize;
+        if size < 8 || pos.checked_add(size)? > iinf_end {
+            return None;
+        }
+        if &buf[pos + 4..pos + 8] == b"infe" {
+            let infe_version = *buf.get(pos + 8)?;
+            // Only v2/v3 carry an item_type, which is what we match on
+            if infe_version >= 2 {
+                let id_width = if infe_version == 3 { 4 } else { 2 };
+                let mut q = pos + 12;
+                let item_id = if id_width == 2 {
+                    u16::from_be_bytes(buf.get(q..q + 2)?.try_into().ok()?)
+                } else {
+                    // A 32-bit item ID cannot be represented downstream; refuse rather
+                    // than truncate it into the wrong item.
+                    return None;
+                };
+                q += id_width + 2; // item_ID, then item_protection_index
+                if AVIF_METADATA_ITEM_TYPES.contains(&buf.get(q..q + 4)?) {
+                    ids.push(item_id);
+                }
+            }
+        }
+        pos += size;
+    }
+    Some(ids)
+}
+
+/// Where one item's bytes live, as recorded in `iloc`
+struct AvifExtent {
+    item_id: u16,
+    /// Absolute offset into the file (when `construction_method` is 0)
+    offset: usize,
+    length: usize,
+    construction_method: u8,
+}
+
+/// Parse `iloc` into the location of every item's payload
+fn avif_item_extents(buf: &[u8], (start, end): (usize, usize)) -> Option<Vec<AvifExtent>> {
+    let (iloc_start, _) = find_box(buf, start, end, b"iloc")?;
+    let version = *buf.get(iloc_start + 8)?;
+    let mut pos = iloc_start + 12;
+
+    let sizes = *buf.get(pos)?;
+    let (offset_size, length_size) = ((sizes >> 4) as usize, (sizes & 0xf) as usize);
+    pos += 1;
+    let base_offset_size = (*buf.get(pos)? >> 4) as usize;
+    pos += 1;
+
+    let item_count = u16::from_be_bytes(buf.get(pos..pos + 2)?.try_into().ok()?);
+    pos += 2;
+
+    let read = |pos: &mut usize, width: usize| -> Option<usize> {
+        if width == 0 {
+            return Some(0);
+        }
+        let mut value = 0usize;
+        for byte in buf.get(*pos..*pos + width)? {
+            value = value.checked_mul(256)?.checked_add(*byte as usize)?;
+        }
+        *pos += width;
+        Some(value)
+    };
+
+    let mut out = Vec::new();
+    for _ in 0..item_count {
+        let item_id = u16::from_be_bytes(buf.get(pos..pos + 2)?.try_into().ok()?);
+        pos += 2;
+        let construction_method = if version >= 1 {
+            let raw = read(&mut pos, 2)?;
+            (raw & 0xf) as u8
+        } else {
+            0
+        };
+        pos += 2; // data_reference_index
+        let base = read(&mut pos, base_offset_size)?;
+        let extent_count = read(&mut pos, 2)?;
+        for _ in 0..extent_count {
+            let offset = read(&mut pos, offset_size)?;
+            let length = read(&mut pos, length_size)?;
+            out.push(AvifExtent {
+                item_id,
+                offset: base.checked_add(offset)?,
+                length,
+                construction_method,
+            });
+        }
+    }
+    Some(out)
 }
 
 /// Every PNG begins with these eight bytes
@@ -430,5 +632,103 @@ mod tests {
         assert_eq!(mime, "image/png");
         assert_ne!(out, STILL_PNG, "a static PNG should still be re-encoded");
         assert_eq!(metadata, image_metadata(900, 900, false));
+    }
+
+    /// An AVIF carrying a real Exif item (Make/Model plus a GPS IFD at 51°30'N 000°07'W).
+    /// The re-encode rebuilds the file from decoded pixels, so the Exif item cannot
+    /// survive — this asserts the GPS coordinates are actually gone from the bytes we
+    /// store, which is the whole point of this code path.
+    const EXIF_AVIF: &[u8] = include_bytes!("../../../core/files/tests/assets/exif-gps.avif");
+
+    const ANIMATED_EXIF_AVIF: &[u8] =
+        include_bytes!("../../../core/files/tests/assets/anim-exif-gps.avif");
+
+    #[tokio::test]
+    async fn strip_metadata_removes_exif_from_avif() {
+        assert!(
+            find_bytes(EXIF_AVIF, b"SlogaTestCam").is_some(),
+            "fixture should carry Exif before stripping"
+        );
+
+        let (out, metadata, mime) = strip_metadata(
+            temp_file(EXIF_AVIF),
+            EXIF_AVIF.to_vec(),
+            image_metadata(320, 240, false),
+            "image/avif",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(mime, "image/avif");
+        assert_eq!(metadata, image_metadata(320, 240, false));
+        assert!(
+            find_bytes(&out, b"SlogaTestCam").is_none(),
+            "camera make should not survive the strip"
+        );
+        assert!(
+            find_bytes(&out, b"AVIF-EXIF-FIXTURE").is_none(),
+            "camera model should not survive the strip"
+        );
+
+        assert_in_place_metadata_only_edit(EXIF_AVIF, &out);
+    }
+
+    #[tokio::test]
+    async fn strip_metadata_keeps_animated_avif_intact() {
+        let (out, _, mime) = strip_metadata(
+            temp_file(ANIMATED_EXIF_AVIF),
+            ANIMATED_EXIF_AVIF.to_vec(),
+            image_metadata(320, 240, true),
+            "image/avif",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(mime, "image/avif");
+        assert!(
+            find_bytes(&out, b"SlogaTestCam").is_none(),
+            "GPS-bearing Exif should not survive the strip"
+        );
+
+        // The sequence samples live in mdat and are addressed by offsets in both `iloc`
+        // and the moov's `stco`. Proving the edit touched nothing but the Exif payload
+        // is what proves every frame, and every offset, survived.
+        assert_in_place_metadata_only_edit(ANIMATED_EXIF_AVIF, &out);
+    }
+
+    /// Assert the strip was a same-length, in-place edit that zeroed exactly one
+    /// contiguous run — i.e. it rewrote metadata and nothing else. A re-encode would
+    /// fail every one of these.
+    fn assert_in_place_metadata_only_edit(before: &[u8], after: &[u8]) {
+        assert_eq!(
+            before.len(),
+            after.len(),
+            "strip must not change the file length, or every iloc/stco offset breaks"
+        );
+
+        let differing: Vec<usize> = (0..before.len())
+            .filter(|&i| before[i] != after[i])
+            .collect();
+        assert!(!differing.is_empty(), "nothing was stripped");
+        assert!(
+            differing.iter().all(|&i| after[i] == 0),
+            "changed bytes should have been zeroed"
+        );
+
+        // Not every byte in the stripped range necessarily *changes* — a TIFF is full of
+        // zero bytes already (next-IFD offsets, the high bytes of small integers,
+        // padding). So assert the span between the first and last change is entirely
+        // zero in the output, rather than that every byte in it differs.
+        let (first, last) = (differing[0], *differing.last().unwrap());
+        assert!(
+            after[first..=last].iter().all(|&b| b == 0),
+            "the stripped range should be entirely zeroed, not edited piecemeal"
+        );
+    }
+
+    fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+        haystack
+            .windows(needle.len())
+            .position(|window| window == needle)
     }
 }

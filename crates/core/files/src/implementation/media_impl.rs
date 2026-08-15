@@ -2,11 +2,92 @@ use anyhow::Result;
 use image::{AnimationDecoder, DynamicImage, ImageBuffer, ImageReader};
 use jxl_oxide::integration::JxlDecoder;
 use revolt_config::report_internal_error;
-use std::io::{BufRead, Read, Seek};
+use std::io::{BufRead, Read, Seek, SeekFrom};
 use tempfile::NamedTempFile;
 use tiny_skia::Pixmap;
 
 use crate::{MediaError, MediaRepository};
+
+/// Pin the decoder to the mime type we already determined, sniffing only when the
+/// mime is one image-rs has no mapping for (e.g. our JXL shim).
+///
+/// Sniffing a second time is not merely redundant, it disagrees with the first pass.
+/// `infer` picks the mime and accepts an AVIF whose ISOBMFF major brand is `avif` OR
+/// `avis`; `imagesize` additionally accepts `mif1`/`miaf`. image-rs matches only a
+/// literal `avif` at bytes 8..12, so anything else is reported as an unknown format
+/// before the decoder is reached. ffmpeg writes `avis` for every multi-frame AVIF, so
+/// without this the common case of an animated AVIF fails as "not an image" — which
+/// surfaces to the user as a 500, not as a rejected upload.
+fn reader_with_format<R: BufRead + Seek>(
+    reader: ImageReader<R>,
+    mime: &str,
+) -> std::io::Result<ImageReader<R>> {
+    let mut reader = reader;
+    match image::ImageFormat::from_mime_type(mime) {
+        Some(format) => {
+            reader.set_format(format);
+            Ok(reader)
+        }
+        None => reader.with_guessed_format(),
+    }
+}
+
+/// Whether an ISOBMFF file (AVIF, HEIF) carries an image sequence rather than a single
+/// still, detected by the presence of a top-level `moov` box.
+///
+/// This cannot be answered by decoding: image-rs implements `AnimationDecoder` for GIF,
+/// WebP and APNG only, and its AVIF decoder reads just the primary item. An animated AVIF
+/// carries BOTH — a still primary item in `meta`/`mdat` and the sequence in `moov` — so
+/// decoding it succeeds and silently yields one frame. Walking the top-level boxes is the
+/// only way to tell the two apart, and it is cheap: the header of each box gives its size,
+/// so this seeks rather than reads.
+fn isobmff_has_moov<R: Read + Seek>(reader: &mut R) -> bool {
+    let Ok(total) = reader.seek(SeekFrom::End(0)) else {
+        return false;
+    };
+
+    let mut pos: u64 = 0;
+    while pos.saturating_add(8) <= total {
+        if reader.seek(SeekFrom::Start(pos)).is_err() {
+            return false;
+        }
+
+        let mut header = [0u8; 8];
+        if reader.read_exact(&mut header).is_err() {
+            return false;
+        }
+
+        let kind = &header[4..8];
+        if kind == b"moov" {
+            return true;
+        }
+
+        let mut size = u32::from_be_bytes([header[0], header[1], header[2], header[3]]) as u64;
+        let mut header_len: u64 = 8;
+        if size == 1 {
+            // 64-bit size follows the type
+            let mut extended = [0u8; 8];
+            if reader.read_exact(&mut extended).is_err() {
+                return false;
+            }
+            size = u64::from_be_bytes(extended);
+            header_len = 16;
+        } else if size == 0 {
+            // Runs to end of file, so there is nothing after it
+            return false;
+        }
+
+        if size < header_len {
+            return false;
+        }
+        match pos.checked_add(size) {
+            Some(next) => pos = next,
+            None => return false,
+        }
+    }
+
+    false
+}
 
 pub struct MediaImpl {
     config: revolt_config::Files,
@@ -55,6 +136,11 @@ impl MediaRepository for MediaImpl {
                 let reader = std::io::BufReader::new(file);
                 let decoder = image::codecs::webp::WebPDecoder::new(reader).ok()?;
                 Some(decoder.has_animation())
+            }
+            "image/avif" => {
+                let file = std::fs::File::open(f.path()).ok()?;
+                let mut reader = std::io::BufReader::new(file);
+                Some(isobmff_has_moov(&mut reader))
             }
             _ => Some(false),
         }
@@ -124,9 +210,9 @@ impl MediaRepository for MediaImpl {
                 ))
             }
             _ => {
-                let image: ImageReader<&mut R> = image::ImageReader::new(reader)
-                    .with_guessed_format()
-                    .map_err(|e| MediaError::from(anyhow::anyhow!(e)))?;
+                let image: ImageReader<&mut R> =
+                    reader_with_format(image::ImageReader::new(reader), mime)
+                        .map_err(|e| MediaError::from(anyhow::anyhow!(e)))?;
 
                 let image: Result<DynamicImage, MediaError> = image
                     .decode()
@@ -144,8 +230,7 @@ impl MediaRepository for MediaImpl {
                 .inspect_err(|err| tracing::error!("Failed to read JXL! {err:?}"))
                 .is_ok(),
             _ => !matches!(
-                image::ImageReader::new(reader)
-                    .with_guessed_format()
+                reader_with_format(image::ImageReader::new(reader), mime)
                     .inspect_err(|err| tracing::error!("Failed to read image! {err:?}"))
                     .map(|f| f.decode()),
                 Err(_) | Ok(Err(_))
@@ -391,5 +476,79 @@ mod tests {
         f.write_all(include_bytes!("../../tests/assets/anim-icos.gif"))
             .unwrap();
         assert_eq!(media.is_animated(&f, "image/gif"), Some(true));
+    }
+
+    #[tokio::test]
+    async fn asset_test_avif() {
+        let media = MediaImpl::from_config().await;
+        let buf = include_bytes!("../../tests/assets/dice.avif");
+        assert_eq!(media.image_size_vec(buf, "image/avif"), Some((320, 240)));
+
+        let mut reader = Cursor::new(buf);
+        let image = media.decode_image(&mut reader, "image/avif").unwrap();
+        media.create_thumbnail(image, "attachments");
+    }
+
+    /// An AVIF whose ISOBMFF major brand is `avis` rather than `avif` — which is what
+    /// ffmpeg writes for anything multi-frame.
+    ///
+    /// This is the regression test for the sniffer mismatch: `infer` picks `image/avif`
+    /// for this file and `imagesize` reads its dimensions, but image-rs' own sniffer
+    /// matches only a literal `avif` major brand. Before `reader_with_format` pinned the
+    /// format, `decode_image` reported it as an unknown format and the upload 500'd.
+    #[tokio::test]
+    async fn asset_test_avif_avis_major_brand_still_decodes() {
+        let media = MediaImpl::from_config().await;
+        let buf = include_bytes!("../../tests/assets/anim-icos.avif");
+        assert_eq!(&buf[8..12], b"avis", "fixture should have an avis major brand");
+        assert_eq!(media.image_size_vec(buf, "image/avif"), Some((320, 240)));
+
+        let mut reader = Cursor::new(buf);
+        let image = media.decode_image(&mut reader, "image/avif").unwrap();
+        media.create_thumbnail(image, "attachments");
+    }
+
+    /// Detected from the `moov` box, not by decoding — decoding an animated AVIF reads
+    /// only its still primary item and succeeds with a single frame, so it cannot tell
+    /// the two apart. Getting this right is what makes the serve path redirect to the
+    /// original so the sequence actually plays, instead of thumbnailing one frame.
+    #[tokio::test]
+    async fn asset_test_animated_avif_is_animated() {
+        let media = MediaImpl::from_config().await;
+        let mut f = NamedTempFile::new().unwrap();
+        f.write_all(include_bytes!("../../tests/assets/anim-icos.avif"))
+            .unwrap();
+        assert_eq!(media.is_animated(&f, "image/avif"), Some(true));
+    }
+
+    #[tokio::test]
+    async fn asset_test_avif_is_not_animated() {
+        let media = MediaImpl::from_config().await;
+        let mut f = NamedTempFile::new().unwrap();
+        f.write_all(include_bytes!("../../tests/assets/dice.avif"))
+            .unwrap();
+        assert_eq!(media.is_animated(&f, "image/avif"), Some(false));
+    }
+
+    /// An animated AVIF that also carries an Exif item: the extra item must not confuse
+    /// the box walk, since `meta` grows and `mdat` moves.
+    #[tokio::test]
+    async fn asset_test_animated_avif_with_exif_is_animated() {
+        let media = MediaImpl::from_config().await;
+        let mut f = NamedTempFile::new().unwrap();
+        f.write_all(include_bytes!("../../tests/assets/anim-exif-gps.avif"))
+            .unwrap();
+        assert_eq!(media.is_animated(&f, "image/avif"), Some(true));
+    }
+
+    #[tokio::test]
+    async fn asset_test_avif_with_exif_decodes() {
+        let media = MediaImpl::from_config().await;
+        let buf = include_bytes!("../../tests/assets/exif-gps.avif");
+        assert_eq!(media.image_size_vec(buf, "image/avif"), Some((320, 240)));
+
+        let mut reader = Cursor::new(buf);
+        let image = media.decode_image(&mut reader, "image/avif").unwrap();
+        media.create_thumbnail(image, "attachments");
     }
 }

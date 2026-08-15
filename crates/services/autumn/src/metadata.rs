@@ -1,7 +1,7 @@
 use std::io::Cursor;
 
 use crate::utils::apply_icc_profile;
-use image::{GenericImageView, ImageError, ImageReader};
+use image::{GenericImageView, ImageReader};
 use revolt_database::Metadata;
 use revolt_files::{image_size, is_animated, video_size};
 use tempfile::NamedTempFile;
@@ -29,7 +29,15 @@ pub fn generate_metadata(f: &NamedTempFile, mime_type: &str) -> Metadata {
                 width: width as isize,
                 height: height as isize,
                 thumbhash: (|| {
-                    let reader = ImageReader::open(f).ok()?.with_guessed_format().ok()?;
+                    // Pin the format from the mime rather than re-sniffing: image-rs
+                    // only recognises an `avif` major brand, so an `avis`/`mif1` AVIF
+                    // that infer and imagesize both accepted would silently yield no
+                    // thumbhash here. See `reader_with_format` in revolt-files.
+                    let mut reader = ImageReader::open(f).ok()?;
+                    match image::ImageFormat::from_mime_type(mime_type) {
+                        Some(format) => reader.set_format(format),
+                        None => reader = reader.with_guessed_format().ok()?,
+                    }
                     let mut decoder = reader.into_decoder().ok()?;
                     let icc_profile = image::ImageDecoder::icc_profile(&mut decoder)
                         .ok()
