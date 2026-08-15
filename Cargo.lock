@@ -7200,6 +7200,7 @@ dependencies = [
  "axum-macros",
  "axum_typed_multipart",
  "base64 0.21.7",
+ "crc32fast",
  "ffprobe",
  "image",
  "imagesize",
