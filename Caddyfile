@@ -155,3 +155,6 @@ http://sloga.gg {
 
     file_server
 }
+
+# Machine-local site blocks (not tracked; glob = no error when empty)
+import /home/mcp/caddy-local/*.caddy
