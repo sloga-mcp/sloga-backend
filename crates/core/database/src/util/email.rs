@@ -139,19 +139,25 @@ pub async fn email_templates() -> Templates {
                 title: "Verify your account.".into(),
                 text: include_str!("../../templates/verify.whitelabel.txt").into(),
                 url: format!("{}/login/verify/", config.hosts.app),
-                html: None,
+                // The .whitelabel.txt above stays the plain-text alternative; the
+                // HTML part carries the Sloga logo. Both templates are branded and
+                // their legal footer names Sloga Technologies LLC. deletion and
+                // suspension stay text-only -- their .html still carries the
+                // upstream Revolt Platforms Ltd. footer, so do NOT wire them up
+                // without fixing that first.
+                html: Some(include_str!("../../templates/verify.html").into()),
             },
             reset: Template {
                 title: "Reset your password.".into(),
                 text: include_str!("../../templates/reset.whitelabel.txt").into(),
                 url: format!("{}/login/reset/", config.hosts.app),
-                html: None,
+                html: Some(include_str!("../../templates/reset.html").into()),
             },
             reset_existing: Template {
                 title: "Reset your password.".into(),
                 text: include_str!("../../templates/reset.whitelabel.txt").into(),
                 url: format!("{}/login/reset/", config.hosts.app),
-                html: None,
+                html: Some(include_str!("../../templates/reset-existing.html").into()),
             },
             deletion: Template {
                 title: "Confirm account deletion.".into(),
