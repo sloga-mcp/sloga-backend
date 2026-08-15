@@ -165,6 +165,10 @@ auto_derived!(
         Focus,
         /// User is busy / will not receive any notifications
         Busy,
+        /// User is looking for a group to play with
+        LookingForGroup,
+        /// User is in a group and looking for more players
+        LookingForMore,
         /// User appears to be offline
         Invisible,
     }
