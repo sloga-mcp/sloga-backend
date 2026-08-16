@@ -91,17 +91,114 @@ pub fn validate_from_metadata(
             {
                 return Metadata::File;
             }
-        } else if matches!(
-            // Check if we can read using image-rs crate
-            image::ImageReader::new(reader)
-                .with_guessed_format()
-                .inspect_err(|err| tracing::error!("Failed to read image! {err:?}"))
-                .map(|f| f.decode()),
-            Err(_) | Ok(Err(_))
-        ) {
-            return Metadata::File;
+        } else {
+            // Pin the format from the mime for the same reason as `generate_metadata`
+            // above: re-sniffing rejects an `avis`/`mif1` AVIF that infer already
+            // accepted. NOTE: nothing calls this function today, so this arm is
+            // untested -- it is pinned for consistency so the trap is not reintroduced
+            // the day someone wires it up.
+            let mut probe = image::ImageReader::new(reader);
+            let probe = match image::ImageFormat::from_mime_type(mime_type) {
+                Some(format) => {
+                    probe.set_format(format);
+                    Ok(probe)
+                }
+                None => probe
+                    .with_guessed_format()
+                    .inspect_err(|err| tracing::error!("Failed to read image! {err:?}")),
+            };
+
+            if matches!(probe.map(|f| f.decode()), Err(_) | Ok(Err(_))) {
+                return Metadata::File;
+            }
         }
     }
 
     metadata
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    fn temp_file(bytes: &[u8]) -> NamedTempFile {
+        let mut f = NamedTempFile::new().unwrap();
+        f.write_all(bytes).unwrap();
+        f.flush().unwrap();
+        f
+    }
+
+    /// The blur-up placeholder. Before AVIF decoding was enabled this silently came
+    /// back `None` -- a soft failure that shows up as an image popping in without its
+    /// blur, which is easy to miss. Assert it is actually produced.
+    #[test]
+    fn avif_metadata_includes_a_thumbhash() {
+        let f = temp_file(include_bytes!(
+            "../../../core/files/tests/assets/dice.avif"
+        ));
+
+        match generate_metadata(&f, "image/avif") {
+            Metadata::Image {
+                width,
+                height,
+                thumbhash,
+                animated,
+            } => {
+                assert_eq!((width, height), (320, 240));
+                assert!(thumbhash.is_some(), "AVIF should produce a thumbhash");
+                assert_eq!(animated, Some(false));
+            }
+            other => panic!("expected Metadata::Image, got {other:?}"),
+        }
+    }
+
+    /// The `avis`-major-brand file, through the real metadata path rather than the
+    /// decoder directly: dimensions come from imagesize, the thumbhash from image-rs,
+    /// and `animated` from the moov walk. All three have to agree.
+    #[test]
+    fn animated_avif_metadata_is_complete() {
+        let f = temp_file(include_bytes!(
+            "../../../core/files/tests/assets/anim-icos.avif"
+        ));
+
+        match generate_metadata(&f, "image/avif") {
+            Metadata::Image {
+                width,
+                height,
+                thumbhash,
+                animated,
+            } => {
+                assert_eq!((width, height), (320, 240));
+                assert!(
+                    thumbhash.is_some(),
+                    "an avis-major AVIF should still produce a thumbhash"
+                );
+                assert_eq!(animated, Some(true));
+            }
+            other => panic!("expected Metadata::Image, got {other:?}"),
+        }
+    }
+
+    /// Control: a format that always worked, so a failure above is about AVIF rather
+    /// than about `generate_metadata` being broken generally.
+    #[test]
+    fn png_metadata_includes_a_thumbhash() {
+        let f = temp_file(include_bytes!(
+            "../../../core/files/tests/assets/test.png"
+        ));
+
+        match generate_metadata(&f, "image/png") {
+            Metadata::Image {
+                width,
+                height,
+                thumbhash,
+                ..
+            } => {
+                assert_eq!((width, height), (900, 900));
+                assert!(thumbhash.is_some());
+            }
+            other => panic!("expected Metadata::Image, got {other:?}"),
+        }
+    }
 }
