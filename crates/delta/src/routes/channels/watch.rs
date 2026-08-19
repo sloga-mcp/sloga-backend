@@ -546,6 +546,63 @@ mod test {
             .expect("teardown");
     }
 
+    /// `ManageChannel` override: a plain member (B, default permissions —
+    /// which now carry `UseWatchTogether`) hosts; the owner (A, GrantAllSafe)
+    /// may drive and end it without being host.
+    #[rocket::async_test]
+    async fn watch_session_manager_override() {
+        let (harness, channel, uvc, user_a, token_a, user_b, token_b, _user_c, _token_c) =
+            setup().await;
+
+        let response = harness
+            .client
+            .post(format!("/channels/{}/watch", channel.id()))
+            .header(ContentType::JSON)
+            .header(Header::new("x-session-token", token_b.clone()))
+            .body(yt("YE7VzlLtp-4").to_string())
+            .dispatch()
+            .await;
+        assert_eq!(response.status(), Status::Ok);
+        let created: v0::WatchSessionResponse =
+            response.into_json().await.expect("create response");
+        assert_eq!(created.session.host_id, user_b.id);
+
+        // Owner pauses at 30 s: allowed.
+        let response = harness
+            .client
+            .patch(format!("/channels/{}/watch", channel.id()))
+            .header(ContentType::JSON)
+            .header(Header::new("x-session-token", token_a.clone()))
+            .body(
+                serde_json::json!({ "playing": false, "position_ms": 30000, "rate_permille": 1000 })
+                    .to_string(),
+            )
+            .dispatch()
+            .await;
+        assert_eq!(response.status(), Status::Ok);
+        let updated: v0::WatchSessionResponse =
+            response.into_json().await.expect("update response");
+        assert_eq!(updated.session.host_id, user_b.id, "override must not steal host");
+        assert_eq!(updated.session.position_ms, 30000);
+
+        // Owner ends: allowed.
+        let response = harness
+            .client
+            .delete(format!("/channels/{}/watch", channel.id()))
+            .header(Header::new("x-session-token", token_a.clone()))
+            .dispatch()
+            .await;
+        assert_eq!(response.status(), Status::NoContent);
+        assert!(fetch_watch_session(channel.id())
+            .await
+            .expect("session read")
+            .is_none());
+
+        delete_channel_voice_state(&uvc, &[user_a.id.clone(), user_b.id.clone()])
+            .await
+            .expect("teardown");
+    }
+
     /// The load-bearing teardown: the host's voice state going away (any
     /// leave path — they all pass through `delete_voice_state`) ends the
     /// session; a VIEWER leaving does not.

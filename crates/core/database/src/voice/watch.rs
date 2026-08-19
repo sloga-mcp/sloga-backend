@@ -100,12 +100,23 @@ pub async fn create_watch_session(
 }
 
 pub async fn fetch_watch_session(channel_id: &str) -> Result<Option<WatchSession>> {
-    let raw: Option<String> = get_connection()
-        .await?
-        .get(session_key(channel_id))
-        .await
-        .to_internal_error()?;
-    Ok(raw.and_then(|raw| serde_json::from_str(&raw).ok()))
+    let mut conn = get_connection().await?;
+    let raw: Option<String> = conn.get(session_key(channel_id)).await.to_internal_error()?;
+    let Some(raw) = raw else { return Ok(None) };
+    match serde_json::from_str::<WatchSession>(&raw) {
+        Ok(session) => Ok(Some(session)),
+        Err(error) => {
+            // A key this binary cannot read (a shape change across a deploy)
+            // must not wedge the channel until the TTL: `create` would 409
+            // on it and `end` could never find a host to authorize. Drop it.
+            log::warn!("watch: dropping undeserializable session for {channel_id}: {error}");
+            let _: () = conn
+                .del(&[session_key(channel_id), seq_key(channel_id)])
+                .await
+                .to_internal_error()?;
+            Ok(None)
+        }
+    }
 }
 
 /// Apply a host-owned state change: `apply` mutates the stored session, then
