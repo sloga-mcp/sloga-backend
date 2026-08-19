@@ -263,6 +263,12 @@ pub enum ErrorType {
     /// A party already holds an active control grant (at most one grant per
     /// sharer per channel, and at most one per controller across channels)
     RemoteControlGrantActive,
+    // ? Watch-together errors
+    /// This voice channel already has a watch-together session (one per
+    /// channel; end it or let the host swap the item)
+    WatchSessionExists,
+    /// Only the session host (or a channel manager) may drive playback
+    NotWatchHost,
     // ? Micro-service errors
     ProxyError,
     FileTooSmall,

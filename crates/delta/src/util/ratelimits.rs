@@ -158,6 +158,15 @@ impl<'a> RatelimitResolver<Request<'a>> for DeltaRatelimits {
                         }
                     }
 
+                    // Watch-together control writes are host-paced but bursty:
+                    // a 5 s heartbeat plus seek-scrubbing the client debounces
+                    // to ≤4/s is ~40 per 10 s window, well past the plain
+                    // channels bucket — a scrubbing host would be 429'd
+                    // mid-seek. Own bucket (plan §1.1).
+                    if extra == Some("watch") {
+                        return ("watch", Some(id));
+                    }
+
                     // Following an announcement channel creates a webhook in
                     // the target and fans events to two server topics — bound
                     // it separately (both POST create and DELETE unfollow live
@@ -349,6 +358,11 @@ impl<'a> RatelimitResolver<Request<'a>> for DeltaRatelimits {
             // and the revoke is a safety action — the bucket must never be
             // small enough to lock a sharer out of clearing consent.
             "annotations_consent" => 10,
+            // Watch-together: heartbeat (2/10s) + scrub bursts (≤4/s,
+            // client-debounced) + the occasional GET/DELETE. 60 leaves ~1.5x
+            // headroom over a continuous scrub; fan-out is one small event
+            // per call member per write, so a hostile host is bounded.
+            "watch" => 60,
             // Offer + respond are deliberate, user-paced actions.
             "remote_control_offer" => 2,
             // "Ask for a turn": user-paced, and request spam at a streamer

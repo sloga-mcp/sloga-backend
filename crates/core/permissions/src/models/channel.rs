@@ -119,6 +119,15 @@ pub enum ChannelPermission {
     /// other means (OBS, a phone), and nothing in this codebase can. It is an
     /// attribution and consent signal, not an enforcement boundary.
     RecordCall = 1 << 42,
+    /// Start and drive a watch-together session in a voice call (watch-
+    /// together plan §1.3). Gates STARTING and CONTROLLING playback only;
+    /// VIEWING is gated on `Connect` alone, like annotations — a listen-only
+    /// participant is exactly who watches. In `DEFAULT_PERMISSION` (nothing
+    /// outlives the call, unlike `RecordCall`) AND backfilled onto existing
+    /// servers by migration revision 68 — the constant alone reaches only
+    /// servers created after it. DMs and group DMs do not consult this bit
+    /// (same reason as `UseRemoteControl`).
+    UseWatchTogether = 1 << 43,
 
     // * Channel permissions two electric boogaloo
     /// Mention everyone and online members
@@ -127,9 +136,9 @@ pub enum ChannelPermission {
     MentionRoles = 1 << 38,
 
     // * Misc. permissions
-    // % Bits 43 to 52: free area
+    // % Bits 44 to 52: free area
     // % (39 = BypassSlowmode, 40 = UseSoundboard, 41 = UseRemoteControl,
-    // %  42 = RecordCall)
+    // %  42 = RecordCall, 43 = UseWatchTogether)
     // % Bits 53 to 64: do not use
 
     // * Grant all permissions
@@ -166,6 +175,7 @@ pub static DEFAULT_PERMISSION: Lazy<u64> = Lazy::new(|| {
             + ChannelPermission::Listen
             + ChannelPermission::Video
             + ChannelPermission::UseSoundboard
+            + ChannelPermission::UseWatchTogether
     )
 });
 

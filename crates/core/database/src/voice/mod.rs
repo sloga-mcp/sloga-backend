@@ -20,6 +20,7 @@ use revolt_result::{create_error, Result, ToRevoltError};
 
 pub mod annotations;
 pub mod remote_control;
+pub mod watch;
 mod voice_client;
 pub use voice_client::VoiceClient;
 
@@ -490,6 +491,11 @@ pub async fn delete_voice_state(channel: &UserVoiceChannel, user_id: &str) -> Re
         channel.server_id.as_ref().unwrap_or(&channel.id)
     );
 
+    // Watch-together dies with the HOST's voice state (plan §1): this is the
+    // one chokepoint every leave path shares, and it runs BEFORE the SREM
+    // below so the end event still reaches the departing host's own devices.
+    watch::end_watch_session_if_host(channel, user_id).await;
+
     Pipeline::new()
         .srem(format!("vc_members:{}", &channel.id), user_id)
         .srem(format!("vc:{user_id}"), channel)
@@ -520,6 +526,9 @@ pub async fn delete_channel_voice_state(
     user_ids: &[String],
 ) -> Result<()> {
     let parent_id = channel.server_id.as_ref().unwrap_or(&channel.id);
+
+    // The whole call is going — end any watch-together session with it.
+    watch::end_watch_session_for_channel(channel).await;
 
     let mut pipeline = Pipeline::new();
     pipeline.del(format!("vc_members:{}", &channel.id));

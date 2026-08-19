@@ -121,6 +121,8 @@ impl<'r> Responder<'r, 'static> for Error {
             ErrorType::UnknownNode => Status::BadRequest,
             ErrorType::RemoteControlOfferPending => Status::Conflict,
             ErrorType::RemoteControlGrantActive => Status::Conflict,
+            ErrorType::WatchSessionExists => Status::Conflict,
+            ErrorType::NotWatchHost => Status::Forbidden,
             ErrorType::FeatureDisabled { .. } => Status::BadRequest,
 
             ErrorType::ProxyError => Status::BadRequest,

@@ -10,7 +10,7 @@ use revolt_models::v0::{
     PartialMember, PartialMessage, PartialRole, PartialServer, PartialSticker, PartialUser,
     PartialSoundboardSound, PartialUserVoiceState, PartialWebhook, PolicyChange, PollAnswerCount,
     RemovalIntention, Report, ScheduledMessage, Server, SoftRes, SoftResReserve, SoundboardSound,
-    Sticker, User, UserSettings, UserVoiceState, Webhook,
+    Sticker, User, UserSettings, UserVoiceState, WatchSession, Webhook,
 };
 
 use crate::{Account, Database, Session};
@@ -378,6 +378,28 @@ pub enum EventV1 {
         channel_id: String,
         sharer_id: String,
         allowed: Vec<String>,
+    },
+
+    /// A voice channel's watch-together session was created or its control
+    /// state changed (watch-together plan §1.2). Carries the COMPLETE session
+    /// every time — idempotent and small; receivers apply it iff
+    /// `session.seq` is greater than the last one they applied for the same
+    /// `session.id`, and derive the timeline from `position_ms`/`position_at`
+    /// (server-stamped). Fanned to the call's current participants over
+    /// private topics, never the channel topic — what the call is watching is
+    /// call business, not ViewChannel business. Sloga relays only this
+    /// control state; the media itself never touches a Sloga server.
+    WatchSessionUpdate {
+        channel_id: String,
+        session: WatchSession,
+    },
+
+    /// The watch-together session ended (host stopped it, host left the
+    /// call, call ended, or a moderator ended it). Receivers tear the player
+    /// down regardless of `id` mismatch — `id` is diagnostic.
+    WatchSessionEnd {
+        channel_id: String,
+        id: String,
     },
 
     /// New report

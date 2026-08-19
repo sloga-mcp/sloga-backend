@@ -26,7 +26,7 @@ struct MigrationInfo {
     revision: i32,
 }
 
-pub const LATEST_REVISION: i32 = 68; // MUST BE +1 to last migration
+pub const LATEST_REVISION: i32 = 69; // MUST BE +1 to last migration
 
 pub async fn migrate_database(db: &MongoDb) {
     let migrations = db.col::<Document>("migrations");
@@ -2335,6 +2335,28 @@ pub async fn run_migrations(db: &MongoDb, revision: i32) -> i32 {
             })
             .await
             .expect("Failed to create remote_control_audit indexes.");
+    }
+
+    if revision <= 68 {
+        info!("Running migration [revision 68 / 19-08-2026]: Add UseWatchTogether to servers' default permissions");
+
+        // `DEFAULT_PERMISSION` is stored onto `Server.default_permissions` at
+        // creation and read back from there, so the constant alone reaches
+        // only NEW servers (revision-48 shape). Same $bit or, same
+        // idempotency: re-running it is a no-op.
+        db.col::<Document>("servers")
+            .update_many(
+                doc! {},
+                doc! {
+                    "$bit": {
+                        "default_permissions": {
+                            "or": ChannelPermission::UseWatchTogether as i64
+                        },
+                    }
+                },
+            )
+            .await
+            .expect("Failed to add UseWatchTogether to default_permissions");
     }
 
     // Reminder to update LATEST_REVISION when adding new migrations.

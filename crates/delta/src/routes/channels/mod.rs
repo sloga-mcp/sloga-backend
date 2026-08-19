@@ -61,6 +61,7 @@ mod thread_members;
 mod soundboard_trigger;
 mod voice_join;
 mod voice_stop_ring;
+mod watch;
 mod webhook_create;
 mod webhook_fetch_all;
 
@@ -109,6 +110,10 @@ pub fn routes() -> (Vec<Route>, OpenApi) {
         remote_control::control_heartbeat,
         control_request::control_request,
         rc_capable::rc_capable_announce,
+        watch::watch_create,
+        watch::watch_update,
+        watch::watch_end,
+        watch::watch_fetch,
         permissions_set::set_role_permissions,
         permissions_set_default::set_default_channel_permissions,
         message_react::react_message,

@@ -119,6 +119,8 @@ impl IntoResponse for Error {
             ErrorType::UnknownNode => StatusCode::BAD_REQUEST,
             ErrorType::RemoteControlOfferPending => StatusCode::CONFLICT,
             ErrorType::RemoteControlGrantActive => StatusCode::CONFLICT,
+            ErrorType::WatchSessionExists => StatusCode::CONFLICT,
+            ErrorType::NotWatchHost => StatusCode::FORBIDDEN,
             ErrorType::InvalidFlagValue => StatusCode::BAD_REQUEST,
             ErrorType::FeatureDisabled { .. } => StatusCode::BAD_REQUEST,
 
