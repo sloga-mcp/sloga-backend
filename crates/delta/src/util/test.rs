@@ -16,6 +16,45 @@ use rocket::local::asynchronous::{Client, LocalRequest, LocalResponse};
 use rocket::tokio;
 use serde::{Deserialize, Serialize};
 
+/// One process-lifetime runtime shared by every Redis-backed test.
+///
+/// `redis_kiss` pools connections in a GLOBAL mobc pool, but
+/// `#[rocket::async_test]` builds a fresh tokio runtime per test, and a
+/// pooled connection is registered with the I/O driver of whichever runtime
+/// created it. With per-test runtimes that poisons the pool two ways:
+///
+///  * test A finishes, its runtime drops, and a connection it returned dies
+///    in the pool — mobc's PING-on-checkout (on by default) catches this one;
+///  * test B checks a connection out while A is still running (the PING
+///    passes), then A's runtime drops MID-QUERY — the op fails with
+///    `InternalError` from whatever Redis call was in flight, and no
+///    checkout-time health check can catch it.
+///
+/// Driving every Redis-touching test on this one immortal runtime removes
+/// both: pool connections are only ever registered to an I/O driver that
+/// lives as long as the process. Mirrors the fix in the
+/// `crates/core/database/src/voice/mod.rs` tests.
+///
+/// Usage — instead of `#[rocket::async_test] async fn name() { … }`:
+///
+/// ```ignore
+/// #[test]
+/// fn name() {
+///     crate::util::test::rt().block_on(name_case())
+/// }
+///
+/// async fn name_case() { … }
+/// ```
+pub fn rt() -> &'static tokio::runtime::Runtime {
+    static RT: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
+    RT.get_or_init(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+    })
+}
+
 pub struct TestHarness {
     pub client: Client,
     pub db: Database,

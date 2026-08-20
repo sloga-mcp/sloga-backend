@@ -361,8 +361,16 @@ mod test {
     /// create → 409 on a second create → host PATCH bumps seq and stamps
     /// position_at → viewer GET sees it → non-host PATCH 403 → viewer
     /// DELETE 403 → host DELETE 204 → GET 404.
-    #[rocket::async_test]
-    async fn watch_session_lifecycle() {
+    // These tests run on the shared runtime from `util::test::rt` (see its
+    // doc comment): they drive live Redis voice state through the global
+    // `redis_kiss` pool, and per-test runtimes intermittently poison that
+    // pool with connections whose I/O driver has died.
+    #[test]
+    fn watch_session_lifecycle() {
+        crate::util::test::rt().block_on(watch_session_lifecycle_case())
+    }
+
+    async fn watch_session_lifecycle_case() {
         let (harness, channel, uvc, user_a, token_a, user_b, token_b, _user_c, _token_c) =
             setup().await;
 
@@ -480,8 +488,12 @@ mod test {
 
     /// Guards: a member not in the call can neither start nor read; a bad
     /// video id is rejected; an out-of-range rate is rejected.
-    #[rocket::async_test]
-    async fn watch_session_guards() {
+    #[test]
+    fn watch_session_guards() {
+        crate::util::test::rt().block_on(watch_session_guards_case())
+    }
+
+    async fn watch_session_guards_case() {
         let (harness, channel, uvc, user_a, token_a, user_b, _token_b, _user_c, token_c) =
             setup().await;
 
@@ -549,8 +561,12 @@ mod test {
     /// `ManageChannel` override: a plain member (B, default permissions —
     /// which now carry `UseWatchTogether`) hosts; the owner (A, GrantAllSafe)
     /// may drive and end it without being host.
-    #[rocket::async_test]
-    async fn watch_session_manager_override() {
+    #[test]
+    fn watch_session_manager_override() {
+        crate::util::test::rt().block_on(watch_session_manager_override_case())
+    }
+
+    async fn watch_session_manager_override_case() {
         let (harness, channel, uvc, user_a, token_a, user_b, token_b, _user_c, _token_c) =
             setup().await;
 
@@ -606,8 +622,12 @@ mod test {
     /// The load-bearing teardown: the host's voice state going away (any
     /// leave path — they all pass through `delete_voice_state`) ends the
     /// session; a VIEWER leaving does not.
-    #[rocket::async_test]
-    async fn watch_session_ends_when_host_leaves() {
+    #[test]
+    fn watch_session_ends_when_host_leaves() {
+        crate::util::test::rt().block_on(watch_session_ends_when_host_leaves_case())
+    }
+
+    async fn watch_session_ends_when_host_leaves_case() {
         let (harness, channel, uvc, user_a, token_a, user_b, _token_b, _user_c, _token_c) =
             setup().await;
 
@@ -644,8 +664,12 @@ mod test {
     /// the call's members, never the channel topic — a member of the same
     /// server who is not in the call (a text-channel-only account) must see
     /// nothing at all, while a call member sees update AND end.
-    #[rocket::async_test]
-    async fn watch_events_fan_to_call_members_only() {
+    #[test]
+    fn watch_events_fan_to_call_members_only() {
+        crate::util::test::rt().block_on(watch_events_fan_to_call_members_only_case())
+    }
+
+    async fn watch_events_fan_to_call_members_only_case() {
         use revolt_database::events::client::EventV1;
         use rocket::futures::StreamExt;
 
