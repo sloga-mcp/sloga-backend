@@ -49,8 +49,12 @@ mod test {
     /// cache — so the ids are pre-generated here and the bot rows are
     /// inserted manually afterwards (`Bot::create` mints its own id).
     /// Process isolation comes from nextest.
-    #[rocket::async_test]
-    async fn catalog_serves_public_bots_and_skips_bad_entries() {
+    #[test]
+    fn catalog_serves_public_bots_and_skips_bad_entries() {
+        crate::util::test::rt().block_on(catalog_serves_public_bots_and_skips_bad_entries_case())
+    }
+
+    async fn catalog_serves_public_bots_and_skips_bad_entries_case() {
         let public_id = Ulid::new().to_string();
         let private_id = Ulid::new().to_string();
         let dangling_id = Ulid::new().to_string();

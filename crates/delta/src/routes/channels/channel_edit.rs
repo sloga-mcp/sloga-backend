@@ -546,8 +546,12 @@ mod tests {
     use revolt_models::v0;
     use rocket::http::{ContentType, Status};
 
-    #[rocket::async_test]
-    async fn spoiler_only_edit_is_not_a_no_op() {
+    #[test]
+    fn spoiler_only_edit_is_not_a_no_op() {
+        crate::util::test::rt().block_on(spoiler_only_edit_is_not_a_no_op_case())
+    }
+
+    async fn spoiler_only_edit_is_not_a_no_op_case() {
         let harness = TestHarness::new().await;
         let (_, session, user) = harness.new_user().await;
         let (server, _channels) = harness.new_server(&user).await;

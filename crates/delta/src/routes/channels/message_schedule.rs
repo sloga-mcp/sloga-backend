@@ -261,8 +261,12 @@ mod test {
             + offset
     }
 
-    #[rocket::async_test]
-    async fn schedule_inserts_pending_row() {
+    #[test]
+    fn schedule_inserts_pending_row() {
+        crate::util::test::rt().block_on(schedule_inserts_pending_row_case())
+    }
+
+    async fn schedule_inserts_pending_row_case() {
         let harness = TestHarness::new().await;
         let (_, session, user) = harness.new_user().await;
         let (server, _) = harness.new_server(&user).await;
@@ -303,8 +307,12 @@ mod test {
         assert_eq!(rows.len(), 1);
     }
 
-    #[rocket::async_test]
-    async fn schedule_rejects_bad_windows_and_shapes() {
+    #[test]
+    fn schedule_rejects_bad_windows_and_shapes() {
+        crate::util::test::rt().block_on(schedule_rejects_bad_windows_and_shapes_case())
+    }
+
+    async fn schedule_rejects_bad_windows_and_shapes_case() {
         let harness = TestHarness::new().await;
         let (_, session, user) = harness.new_user().await;
         let (server, _) = harness.new_server(&user).await;
@@ -335,8 +343,12 @@ mod test {
         }
     }
 
-    #[rocket::async_test]
-    async fn schedule_enforces_pending_caps() {
+    #[test]
+    fn schedule_enforces_pending_caps() {
+        crate::util::test::rt().block_on(schedule_enforces_pending_caps_case())
+    }
+
+    async fn schedule_enforces_pending_caps_case() {
         let harness = TestHarness::new().await;
         let (_, session, user) = harness.new_user().await;
         let (server, _) = harness.new_server(&user).await;

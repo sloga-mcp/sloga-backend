@@ -261,8 +261,12 @@ mod test {
 
     /// Grant → visible in GET → one-action revoke clears it, and the revoke
     /// works even after the share has stopped.
-    #[rocket::async_test]
-    async fn consent_grant_fetch_and_revoke_lifecycle() {
+    #[test]
+    fn consent_grant_fetch_and_revoke_lifecycle() {
+        crate::util::test::rt().block_on(consent_grant_fetch_and_revoke_lifecycle_case())
+    }
+
+    async fn consent_grant_fetch_and_revoke_lifecycle_case() {
         let (harness, channel, uvc, user_a, token_a, user_b) = setup().await;
 
         // Grant B.
@@ -339,8 +343,12 @@ mod test {
 
     /// The grant guards: no self-allow, no allowing an absent user, and no
     /// granting while not streaming.
-    #[rocket::async_test]
-    async fn consent_grant_guards() {
+    #[test]
+    fn consent_grant_guards() {
+        crate::util::test::rt().block_on(consent_grant_guards_case())
+    }
+
+    async fn consent_grant_guards_case() {
         let (harness, channel, uvc, user_a, token_a, user_b) = setup().await;
 
         // Self-allow: refused.

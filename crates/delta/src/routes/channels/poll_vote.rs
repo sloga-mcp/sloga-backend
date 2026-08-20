@@ -247,8 +247,12 @@ mod test {
         response.into_json().await.expect("`Message`")
     }
 
-    #[rocket::async_test]
-    async fn vote_replace_and_retract_adjust_counts() {
+    #[test]
+    fn vote_replace_and_retract_adjust_counts() {
+        crate::util::test::rt().block_on(vote_replace_and_retract_adjust_counts_case())
+    }
+
+    async fn vote_replace_and_retract_adjust_counts_case() {
         let harness = TestHarness::new().await;
         let (_, session, user) = harness.new_user().await;
         let (server, _) = harness.new_server(&user).await;
@@ -304,8 +308,12 @@ mod test {
         assert_eq!(poll.total_votes, Some(0));
     }
 
-    #[rocket::async_test]
-    async fn vote_validation_rejects_bad_ballots() {
+    #[test]
+    fn vote_validation_rejects_bad_ballots() {
+        crate::util::test::rt().block_on(vote_validation_rejects_bad_ballots_case())
+    }
+
+    async fn vote_validation_rejects_bad_ballots_case() {
         let harness = TestHarness::new().await;
         let (_, session, user) = harness.new_user().await;
         let (server, _) = harness.new_server(&user).await;
@@ -334,8 +342,12 @@ mod test {
         }
     }
 
-    #[rocket::async_test]
-    async fn multiselect_ballot_counts_every_selection_once() {
+    #[test]
+    fn multiselect_ballot_counts_every_selection_once() {
+        crate::util::test::rt().block_on(multiselect_ballot_counts_every_selection_once_case())
+    }
+
+    async fn multiselect_ballot_counts_every_selection_once_case() {
         let harness = TestHarness::new().await;
         let (_, session, user) = harness.new_user().await;
         let (server, _) = harness.new_server(&user).await;

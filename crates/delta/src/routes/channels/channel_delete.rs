@@ -94,8 +94,12 @@ mod test {
     use revolt_models::v0::DataCreateGroup;
     use rocket::http::{Header, Status};
 
-    #[rocket::async_test]
-    async fn success_delete_group() {
+    #[test]
+    fn success_delete_group() {
+        crate::util::test::rt().block_on(success_delete_group_case())
+    }
+
+    async fn success_delete_group_case() {
         let mut harness = TestHarness::new().await;
         let (_, session, user) = harness.new_user().await;
 
@@ -131,8 +135,12 @@ mod test {
     // TEST: no effect with saved messages
     // TEST: DM set to inactive
 
-    #[rocket::async_test]
-    async fn success_delete_channel() {
+    #[test]
+    fn success_delete_channel() {
+        crate::util::test::rt().block_on(success_delete_channel_case())
+    }
+
+    async fn success_delete_channel_case() {
         let mut harness = TestHarness::new().await;
         let (_, session, user) = harness.new_user().await;
         let (_, channels) = harness.new_server(&user).await;

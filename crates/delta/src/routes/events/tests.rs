@@ -55,8 +55,12 @@ async fn upload_attachment(harness: &TestHarness, filename: &str, uploader: &Use
     id
 }
 
-#[rocket::async_test]
-async fn create_and_fetch_event() {
+#[test]
+fn create_and_fetch_event() {
+    crate::util::test::rt().block_on(create_and_fetch_event_case())
+}
+
+async fn create_and_fetch_event_case() {
     let harness = TestHarness::new().await;
     let (_, session, owner) = harness.new_user().await;
     let server = make_server(&harness, &owner).await;
@@ -100,8 +104,12 @@ async fn create_and_fetch_event() {
     assert!(ctx.my_rsvp.is_none());
 }
 
-#[rocket::async_test]
-async fn invite_accept_and_non_invited_rejected() {
+#[test]
+fn invite_accept_and_non_invited_rejected() {
+    crate::util::test::rt().block_on(invite_accept_and_non_invited_rejected_case())
+}
+
+async fn invite_accept_and_non_invited_rejected_case() {
     let harness = TestHarness::new().await;
     let (_, owner_session, owner) = harness.new_user().await;
     let (_, guest_session, guest) = harness.new_user().await;
@@ -183,8 +191,12 @@ async fn invite_accept_and_non_invited_rejected() {
 }
 
 /// Cancelling an event is terminal: RSVPs are then rejected, and the event reports cancelled.
-#[rocket::async_test]
-async fn cancel_is_terminal() {
+#[test]
+fn cancel_is_terminal() {
+    crate::util::test::rt().block_on(cancel_is_terminal_case())
+}
+
+async fn cancel_is_terminal_case() {
     let harness = TestHarness::new().await;
     let (_, owner_session, owner) = harness.new_user().await;
     let (_, guest_session, guest) = harness.new_user().await;
@@ -247,8 +259,12 @@ async fn cancel_is_terminal() {
 }
 
 /// A plain member who is neither creator nor a manager cannot edit an event.
-#[rocket::async_test]
-async fn non_manager_cannot_edit() {
+#[test]
+fn non_manager_cannot_edit() {
+    crate::util::test::rt().block_on(non_manager_cannot_edit_case())
+}
+
+async fn non_manager_cannot_edit_case() {
     let harness = TestHarness::new().await;
     let (_, owner_session, owner) = harness.new_user().await;
     let (_, guest_session, guest) = harness.new_user().await;
@@ -282,8 +298,12 @@ async fn non_manager_cannot_edit() {
 
 /// Re-inviting a user who already accepted is a no-op — it must not reset their status
 /// (finding H5) or double-count them.
-#[rocket::async_test]
-async fn reinvite_is_noop() {
+#[test]
+fn reinvite_is_noop() {
+    crate::util::test::rt().block_on(reinvite_is_noop_case())
+}
+
+async fn reinvite_is_noop_case() {
     let harness = TestHarness::new().await;
     let (_, owner_session, owner) = harness.new_user().await;
     let (_, guest_session, guest) = harness.new_user().await;
@@ -347,8 +367,12 @@ async fn reinvite_is_noop() {
 /// Finding H6: soft-cancel must retain the `Going` RSVP rows so the cancel-notify
 /// list is intact (pushd delivers the cancel to those attendees by user id). After a
 /// cancel, an attendee who accepted is still counted `Going`.
-#[rocket::async_test]
-async fn cancel_retains_going_rows_for_notify() {
+#[test]
+fn cancel_retains_going_rows_for_notify() {
+    crate::util::test::rt().block_on(cancel_retains_going_rows_for_notify_case())
+}
+
+async fn cancel_retains_going_rows_for_notify_case() {
     let harness = TestHarness::new().await;
     let (_, owner_session, owner) = harness.new_user().await;
     let (_, guest_session, guest) = harness.new_user().await;
@@ -424,8 +448,12 @@ async fn cancel_retains_going_rows_for_notify() {
 
 /// Finding C1: an event scoped to a channel the caller cannot view must be invisible
 /// to them in the list, and inviting such a member must be skipped.
-#[rocket::async_test]
-async fn channel_scoped_event_hidden_from_non_viewer() {
+#[test]
+fn channel_scoped_event_hidden_from_non_viewer() {
+    crate::util::test::rt().block_on(channel_scoped_event_hidden_from_non_viewer_case())
+}
+
+async fn channel_scoped_event_hidden_from_non_viewer_case() {
     use revolt_database::{Channel, PartialChannel};
     use revolt_permissions::{ChannelPermission, OverrideField};
 
@@ -559,8 +587,12 @@ async fn channel_scoped_event_hidden_from_non_viewer() {
 /// Slice F (0.1-A): a role invite expands to the role's CURRENT holders server-side,
 /// dedups against explicit user ids, hard-fails on an unknown role, and rejects an
 /// empty request. A removed holder is not re-invited (their cascaded row stays gone).
-#[rocket::async_test]
-async fn role_invite_expands_and_dedups() {
+#[test]
+fn role_invite_expands_and_dedups() {
+    crate::util::test::rt().block_on(role_invite_expands_and_dedups_case())
+}
+
+async fn role_invite_expands_and_dedups_case() {
     use revolt_database::{PartialMember, RemovalIntention, Role};
     use revolt_permissions::OverrideField;
     use ulid::Ulid;
@@ -701,8 +733,12 @@ async fn role_invite_expands_and_dedups() {
 
 /// Slice F (F4a): removing a member cascades their RSVP rows for THAT server only —
 /// their rows on another server survive.
-#[rocket::async_test]
-async fn member_removal_cascades_rsvps_per_server() {
+#[test]
+fn member_removal_cascades_rsvps_per_server() {
+    crate::util::test::rt().block_on(member_removal_cascades_rsvps_per_server_case())
+}
+
+async fn member_removal_cascades_rsvps_per_server_case() {
     use revolt_database::RemovalIntention;
 
     let harness = TestHarness::new().await;
@@ -771,8 +807,12 @@ async fn member_removal_cascades_rsvps_per_server() {
 
 /// Slice F (F4b): a creator who is no longer a member (kicked/banned) loses manage
 /// authority — edit, cancel and invite are all rejected for their still-valid session.
-#[rocket::async_test]
-async fn removed_creator_loses_manage() {
+#[test]
+fn removed_creator_loses_manage() {
+    crate::util::test::rt().block_on(removed_creator_loses_manage_case())
+}
+
+async fn removed_creator_loses_manage_case() {
     use revolt_database::RemovalIntention;
 
     let harness = TestHarness::new().await;
@@ -848,8 +888,12 @@ async fn removed_creator_loses_manage() {
 
 /// Slice F (0.2-A): a cancelled series stays in the list (clients render it
 /// struck-through) with its occurrences expanded; RSVPing it stays rejected.
-#[rocket::async_test]
-async fn cancelled_event_still_listed() {
+#[test]
+fn cancelled_event_still_listed() {
+    crate::util::test::rt().block_on(cancelled_event_still_listed_case())
+}
+
+async fn cancelled_event_still_listed_case() {
     let harness = TestHarness::new().await;
     let (_, owner_session, owner) = harness.new_user().await;
     let server = make_server(&harness, &owner).await;
@@ -894,8 +938,12 @@ async fn cancelled_event_still_listed() {
 /// takes the creator from the message author (spoof-proof), imports date-only starts
 /// as all-day, degrades a dead voiceId to no channel, counts invalid rows without
 /// storing them, and dedups by source message id so a re-run imports nothing.
-#[rocket::async_test]
-async fn import_legacy_events_end_to_end() {
+#[test]
+fn import_legacy_events_end_to_end() {
+    crate::util::test::rt().block_on(import_legacy_events_end_to_end_case())
+}
+
+async fn import_legacy_events_end_to_end_case() {
     use revolt_database::Message;
     use ulid::Ulid;
 
@@ -1030,8 +1078,12 @@ async fn import_legacy_events_end_to_end() {
 
 /// Slice F (F5 gates): the import source channel must belong to the server, and a
 /// manager without ViewChannel on it must be rejected (no private-channel exfil).
-#[rocket::async_test]
-async fn import_requires_viewable_in_server_channel() {
+#[test]
+fn import_requires_viewable_in_server_channel() {
+    crate::util::test::rt().block_on(import_requires_viewable_in_server_channel_case())
+}
+
+async fn import_requires_viewable_in_server_channel_case() {
     use revolt_database::{Channel, PartialChannel, PartialMember, Role};
     use revolt_permissions::{ChannelPermission, OverrideField};
     use ulid::Ulid;
@@ -1144,8 +1196,12 @@ async fn import_requires_viewable_in_server_channel() {
 /// messages on different pages, and a channel larger than `MAX_IMPORT_SCAN` stops
 /// at the cap with `truncated` set. A cursor regression (no progress) would hang
 /// this test rather than pass it.
-#[rocket::async_test]
-async fn import_paginates_and_truncates() {
+#[test]
+fn import_paginates_and_truncates() {
+    crate::util::test::rt().block_on(import_paginates_and_truncates_case())
+}
+
+async fn import_paginates_and_truncates_case() {
     use futures::StreamExt;
     use revolt_database::Message;
     use ulid::Ulid;
@@ -1277,8 +1333,12 @@ async fn import_paginates_and_truncates() {
 /// soft-delete of an in-timeout member is unimplemented), so this test is
 /// Mongo-gated and runs in the WSL MONGODB pass; the invite loop's `fetch_member`
 /// re-check is the only filter (`fetch_all_members_with_roles` does not apply it).
-#[rocket::async_test]
-async fn pending_deletion_member_not_invitable() {
+#[test]
+fn pending_deletion_member_not_invitable() {
+    crate::util::test::rt().block_on(pending_deletion_member_not_invitable_case())
+}
+
+async fn pending_deletion_member_not_invitable_case() {
     use revolt_database::mongodb::bson::{doc, Document};
     use revolt_database::{Database, PartialMember, Role};
     use revolt_permissions::OverrideField;
@@ -1392,8 +1452,12 @@ async fn pending_deletion_member_not_invitable() {
 /// Slice G: an event created with attachment file ids claims those files (bad ids
 /// fail), carries them on the wire, and — because attachments inherit the event's
 /// view rule — is visible to any other member who can see the event.
-#[rocket::async_test]
-async fn create_with_attachments_visible_to_members() {
+#[test]
+fn create_with_attachments_visible_to_members() {
+    crate::util::test::rt().block_on(create_with_attachments_visible_to_members_case())
+}
+
+async fn create_with_attachments_visible_to_members_case() {
     let harness = TestHarness::new().await;
     let (_, owner_session, owner) = harness.new_user().await;
     let (_, member_session, member) = harness.new_user().await;
@@ -1469,8 +1533,12 @@ async fn create_with_attachments_visible_to_members() {
 /// with NO file side effects: the detached file stays referenced and undeleted, and the
 /// would-be new file stays unclaimed (re-usable). Guards the "validate/persist the event
 /// before mutating any files" ordering.
-#[rocket::async_test]
-async fn edit_validation_failure_leaves_attachments_untouched() {
+#[test]
+fn edit_validation_failure_leaves_attachments_untouched() {
+    crate::util::test::rt().block_on(edit_validation_failure_leaves_attachments_untouched_case())
+}
+
+async fn edit_validation_failure_leaves_attachments_untouched_case() {
     let harness = TestHarness::new().await;
     let (_, owner_session, owner) = harness.new_user().await;
     let server = make_server(&harness, &owner).await;
@@ -1547,8 +1615,12 @@ async fn edit_validation_failure_leaves_attachments_untouched() {
 /// Slice G: the edit path adds and detaches files (detached files are marked deleted),
 /// and `remove: ["Attachments"]` clears the whole set — all without disturbing the
 /// rest of the event.
-#[rocket::async_test]
-async fn edit_add_remove_and_clear_attachments() {
+#[test]
+fn edit_add_remove_and_clear_attachments() {
+    crate::util::test::rt().block_on(edit_add_remove_and_clear_attachments_case())
+}
+
+async fn edit_add_remove_and_clear_attachments_case() {
     let harness = TestHarness::new().await;
     let (_, owner_session, owner) = harness.new_user().await;
     let server = make_server(&harness, &owner).await;
@@ -1621,8 +1693,12 @@ async fn edit_add_remove_and_clear_attachments() {
 /// Slice G: the attachment count is capped at `MAX_EVENT_ATTACHMENTS` (10) on create
 /// (DTO validation) and on the post-edit total — and an over-cap edit has NO side
 /// effects (its would-be new file is left unclaimed and re-usable).
-#[rocket::async_test]
-async fn attachment_cap_enforced() {
+#[test]
+fn attachment_cap_enforced() {
+    crate::util::test::rt().block_on(attachment_cap_enforced_case())
+}
+
+async fn attachment_cap_enforced_case() {
     let harness = TestHarness::new().await;
     let (_, owner_session, owner) = harness.new_user().await;
     let server = make_server(&harness, &owner).await;
@@ -1719,8 +1795,12 @@ async fn make_event(
     response.into_json::<v0::Event>().await.expect("event")
 }
 
-#[rocket::async_test]
-async fn softres_link_requires_event_manage_and_one_sheet_per_event() {
+#[test]
+fn softres_link_requires_event_manage_and_one_sheet_per_event() {
+    crate::util::test::rt().block_on(softres_link_requires_event_manage_and_one_sheet_per_event_case())
+}
+
+async fn softres_link_requires_event_manage_and_one_sheet_per_event_case() {
     let harness = TestHarness::new().await;
     let (_, session, owner) = harness.new_user().await;
     let (_, member_session, member) = harness.new_user().await;
@@ -1813,8 +1893,12 @@ async fn softres_link_requires_event_manage_and_one_sheet_per_event() {
     );
 }
 
-#[rocket::async_test]
-async fn softres_link_rejects_recurring_cancelled_and_born_locked() {
+#[test]
+fn softres_link_rejects_recurring_cancelled_and_born_locked() {
+    crate::util::test::rt().block_on(softres_link_rejects_recurring_cancelled_and_born_locked_case())
+}
+
+async fn softres_link_rejects_recurring_cancelled_and_born_locked_case() {
     let harness = TestHarness::new().await;
     let (_, session, owner) = harness.new_user().await;
     let server = make_server(&harness, &owner).await;
@@ -1930,8 +2014,12 @@ async fn softres_link_rejects_recurring_cancelled_and_born_locked() {
     assert!(message.softres.is_some());
 }
 
-#[rocket::async_test]
-async fn cancelling_an_event_locks_its_sheet_idempotently() {
+#[test]
+fn cancelling_an_event_locks_its_sheet_idempotently() {
+    crate::util::test::rt().block_on(cancelling_an_event_locks_its_sheet_idempotently_case())
+}
+
+async fn cancelling_an_event_locks_its_sheet_idempotently_case() {
     let harness = TestHarness::new().await;
     let (_, session, owner) = harness.new_user().await;
     let server = make_server(&harness, &owner).await;
@@ -2007,8 +2095,12 @@ async fn cancelling_an_event_locks_its_sheet_idempotently() {
     );
 }
 
-#[rocket::async_test]
-async fn event_softres_lookup_is_gated_and_oracle_free() {
+#[test]
+fn event_softres_lookup_is_gated_and_oracle_free() {
+    crate::util::test::rt().block_on(event_softres_lookup_is_gated_and_oracle_free_case())
+}
+
+async fn event_softres_lookup_is_gated_and_oracle_free_case() {
     use revolt_permissions::ChannelPermission;
 
     let harness = TestHarness::new().await;
@@ -2122,8 +2214,12 @@ async fn event_softres_lookup_is_gated_and_oracle_free() {
     assert_ne!(response.status(), Status::Ok);
 }
 
-#[rocket::async_test]
-async fn lock_at_event_start_toggle_rearms_and_clears() {
+#[test]
+fn lock_at_event_start_toggle_rearms_and_clears() {
+    crate::util::test::rt().block_on(lock_at_event_start_toggle_rearms_and_clears_case())
+}
+
+async fn lock_at_event_start_toggle_rearms_and_clears_case() {
     let harness = TestHarness::new().await;
     let (_, session, owner) = harness.new_user().await;
     let server = make_server(&harness, &owner).await;
@@ -2239,8 +2335,12 @@ async fn lock_at_event_start_toggle_rearms_and_clears() {
 /// A PATCH may move an event into a channel (validated like create), and a
 /// narrowing move prunes the RSVP rows of users who cannot view the new channel —
 /// otherwise they would stay `Going` (and reminded) for an event they cannot open.
-#[rocket::async_test]
-async fn edit_moves_event_into_channel_and_prunes_blind_rsvps() {
+#[test]
+fn edit_moves_event_into_channel_and_prunes_blind_rsvps() {
+    crate::util::test::rt().block_on(edit_moves_event_into_channel_and_prunes_blind_rsvps_case())
+}
+
+async fn edit_moves_event_into_channel_and_prunes_blind_rsvps_case() {
     use revolt_database::{Channel, PartialChannel};
     use revolt_permissions::{ChannelPermission, OverrideField};
 
@@ -2397,8 +2497,12 @@ async fn edit_moves_event_into_channel_and_prunes_blind_rsvps() {
 }
 
 /// A cross-server channel is rejected as an edit target.
-#[rocket::async_test]
-async fn edit_rejects_cross_server_channel() {
+#[test]
+fn edit_rejects_cross_server_channel() {
+    crate::util::test::rt().block_on(edit_rejects_cross_server_channel_case())
+}
+
+async fn edit_rejects_cross_server_channel_case() {
     let harness = TestHarness::new().await;
     let (_, owner_session, owner) = harness.new_user().await;
 
@@ -2475,8 +2579,12 @@ async fn edit_rejects_cross_server_channel() {
 /// A `Going` attendee who loses ViewChannel (permission change, not a move — so the
 /// prune never ran) can still withdraw: `NotGoing` needs only live membership.
 /// Re-accepting (`Going`) stays behind the view gate.
-#[rocket::async_test]
-async fn notgoing_escape_survives_lost_view() {
+#[test]
+fn notgoing_escape_survives_lost_view() {
+    crate::util::test::rt().block_on(notgoing_escape_survives_lost_view_case())
+}
+
+async fn notgoing_escape_survives_lost_view_case() {
     use revolt_database::{Channel, PartialChannel};
     use revolt_permissions::{ChannelPermission, OverrideField};
 

@@ -83,8 +83,12 @@ mod test {
     use revolt_models::v0::{self, FieldsBot};
     use rocket::http::{ContentType, Header, Status};
 
-    #[rocket::async_test]
-    async fn edit_bot() {
+    #[test]
+    fn edit_bot() {
+        crate::util::test::rt().block_on(edit_bot_case())
+    }
+
+    async fn edit_bot_case() {
         let harness = TestHarness::new().await;
         let (_, session, user) = harness.new_user().await;
 

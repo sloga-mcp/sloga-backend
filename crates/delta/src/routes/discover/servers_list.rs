@@ -56,8 +56,12 @@ mod test {
     /// filters return an empty directory and empty admin queue while the
     /// reference driver stays green. Run under `TEST_DB=MONGODB` (WSL) to
     /// exercise the `$ne` filters against real sparse documents.
-    #[rocket::async_test]
-    async fn directory_and_queue_survive_sparse_booleans() {
+    #[test]
+    fn directory_and_queue_survive_sparse_booleans() {
+        crate::util::test::rt().block_on(directory_and_queue_survive_sparse_booleans_case())
+    }
+
+    async fn directory_and_queue_survive_sparse_booleans_case() {
         let harness = TestHarness::new().await;
         let (_, _, owner) = harness.new_user().await;
         let (_, plain_session, _) = harness.new_user().await;

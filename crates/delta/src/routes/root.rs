@@ -338,15 +338,23 @@ mod test {
     use crate::rocket;
     use rocket::http::Status;
 
-    #[rocket::async_test]
-    async fn hello_world() {
+    #[test]
+    fn hello_world() {
+        crate::util::test::rt().block_on(hello_world_case())
+    }
+
+    async fn hello_world_case() {
         let harness = crate::util::test::TestHarness::new().await;
         let response = harness.client.get("/").dispatch().await;
         assert_eq!(response.status(), Status::Ok);
     }
 
-    #[rocket::async_test]
-    async fn hello_world_concurrent() {
+    #[test]
+    fn hello_world_concurrent() {
+        crate::util::test::rt().block_on(hello_world_concurrent_case())
+    }
+
+    async fn hello_world_concurrent_case() {
         let harness = crate::util::test::TestHarness::new().await;
         let response = harness.client.get("/").dispatch().await;
         assert_eq!(response.status(), Status::Ok);

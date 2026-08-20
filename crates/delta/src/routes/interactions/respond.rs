@@ -316,8 +316,12 @@ mod test {
         }
     }
 
-    #[rocket::async_test]
-    async fn respond_flow_token_replay_and_expiry() {
+    #[test]
+    fn respond_flow_token_replay_and_expiry() {
+        crate::util::test::rt().block_on(respond_flow_token_replay_and_expiry_case())
+    }
+
+    async fn respond_flow_token_replay_and_expiry_case() {
         let harness = TestHarness::new().await;
         let (_, _session, user) = harness.new_user().await;
         let (server, _) = harness.new_server(&user).await;
@@ -425,8 +429,12 @@ mod test {
         assert_eq!(response.status(), Status::Gone);
     }
 
-    #[rocket::async_test]
-    async fn respond_rechecks_bot_standing_at_response_time() {
+    #[test]
+    fn respond_rechecks_bot_standing_at_response_time() {
+        crate::util::test::rt().block_on(respond_rechecks_bot_standing_at_response_time_case())
+    }
+
+    async fn respond_rechecks_bot_standing_at_response_time_case() {
         let harness = TestHarness::new().await;
         let (_, _session, user) = harness.new_user().await;
         let (server, _) = harness.new_server(&user).await;
@@ -479,8 +487,12 @@ mod test {
         );
     }
 
-    #[rocket::async_test]
-    async fn regular_send_cannot_forge_interaction_flag() {
+    #[test]
+    fn regular_send_cannot_forge_interaction_flag() {
+        crate::util::test::rt().block_on(regular_send_cannot_forge_interaction_flag_case())
+    }
+
+    async fn regular_send_cannot_forge_interaction_flag_case() {
         let harness = TestHarness::new().await;
         let (_, session, user) = harness.new_user().await;
         let (server, _) = harness.new_server(&user).await;
@@ -578,8 +590,12 @@ mod test {
         }
     }
 
-    #[rocket::async_test]
-    async fn component_respond_edit_and_followup_paths() {
+    #[test]
+    fn component_respond_edit_and_followup_paths() {
+        crate::util::test::rt().block_on(component_respond_edit_and_followup_paths_case())
+    }
+
+    async fn component_respond_edit_and_followup_paths_case() {
         let harness = TestHarness::new().await;
         let (_, _session, user) = harness.new_user().await;
         let (server, _) = harness.new_server(&user).await;
@@ -753,8 +769,12 @@ mod test {
         );
     }
 
-    #[rocket::async_test]
-    async fn component_edit_of_deleted_message_does_not_burn_the_slot() {
+    #[test]
+    fn component_edit_of_deleted_message_does_not_burn_the_slot() {
+        crate::util::test::rt().block_on(component_edit_of_deleted_message_does_not_burn_the_slot_case())
+    }
+
+    async fn component_edit_of_deleted_message_does_not_burn_the_slot_case() {
         let harness = TestHarness::new().await;
         let (_, _session, user) = harness.new_user().await;
         let (server, _) = harness.new_server(&user).await;
@@ -798,8 +818,12 @@ mod test {
         assert_eq!(response.status(), Status::Ok);
     }
 
-    #[rocket::async_test]
-    async fn component_edit_rechecks_bot_standing_at_response_time() {
+    #[test]
+    fn component_edit_rechecks_bot_standing_at_response_time() {
+        crate::util::test::rt().block_on(component_edit_rechecks_bot_standing_at_response_time_case())
+    }
+
+    async fn component_edit_rechecks_bot_standing_at_response_time_case() {
         let harness = TestHarness::new().await;
         let (_, _session, user) = harness.new_user().await;
         let (server, _) = harness.new_server(&user).await;
@@ -868,8 +892,12 @@ mod test {
         );
     }
 
-    #[rocket::async_test]
-    async fn ephemeral_respond_is_delivery_only() {
+    #[test]
+    fn ephemeral_respond_is_delivery_only() {
+        crate::util::test::rt().block_on(ephemeral_respond_is_delivery_only_case())
+    }
+
+    async fn ephemeral_respond_is_delivery_only_case() {
         let harness = TestHarness::new().await;
         let (_, _session, user) = harness.new_user().await;
         let (server, _) = harness.new_server(&user).await;
@@ -960,8 +988,12 @@ mod test {
         assert_eq!(response.status(), Status::Conflict);
     }
 
-    #[rocket::async_test]
-    async fn ephemeral_component_respond_replies_without_flag() {
+    #[test]
+    fn ephemeral_component_respond_replies_without_flag() {
+        crate::util::test::rt().block_on(ephemeral_component_respond_replies_without_flag_case())
+    }
+
+    async fn ephemeral_component_respond_replies_without_flag_case() {
         let harness = TestHarness::new().await;
         let (_, _session, user) = harness.new_user().await;
         let (server, _) = harness.new_server(&user).await;
@@ -1033,8 +1065,12 @@ mod test {
         );
     }
 
-    #[rocket::async_test]
-    async fn ephemeral_respond_delivers_only_to_invoker_private_topic() {
+    #[test]
+    fn ephemeral_respond_delivers_only_to_invoker_private_topic() {
+        crate::util::test::rt().block_on(ephemeral_respond_delivers_only_to_invoker_private_topic_case())
+    }
+
+    async fn ephemeral_respond_delivers_only_to_invoker_private_topic_case() {
         let mut harness = TestHarness::new().await;
         let (_, session, user) = harness.new_user().await;
         let (server, _) = harness.new_server(&user).await;
@@ -1117,8 +1153,12 @@ mod test {
         });
     }
 
-    #[rocket::async_test]
-    async fn ephemeral_respond_rechecks_bot_standing_at_response_time() {
+    #[test]
+    fn ephemeral_respond_rechecks_bot_standing_at_response_time() {
+        crate::util::test::rt().block_on(ephemeral_respond_rechecks_bot_standing_at_response_time_case())
+    }
+
+    async fn ephemeral_respond_rechecks_bot_standing_at_response_time_case() {
         let harness = TestHarness::new().await;
         let (_, _session, user) = harness.new_user().await;
         let (server, _) = harness.new_server(&user).await;

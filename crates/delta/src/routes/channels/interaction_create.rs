@@ -185,8 +185,12 @@ mod test {
         response.into_json().await.expect("`Command`")
     }
 
-    #[rocket::async_test]
-    async fn invoke_rejects_saved_messages_and_offline_bot() {
+    #[test]
+    fn invoke_rejects_saved_messages_and_offline_bot() {
+        crate::util::test::rt().block_on(invoke_rejects_saved_messages_and_offline_bot_case())
+    }
+
+    async fn invoke_rejects_saved_messages_and_offline_bot_case() {
         let harness = TestHarness::new().await;
         let (_, session, user) = harness.new_user().await;
         let (server, _) = harness.new_server(&user).await;
@@ -240,8 +244,12 @@ mod test {
         assert_eq!(error["type"], "BotOffline");
     }
 
-    #[rocket::async_test]
-    async fn invoke_enforces_scope_membership_and_option_schema() {
+    #[test]
+    fn invoke_enforces_scope_membership_and_option_schema() {
+        crate::util::test::rt().block_on(invoke_enforces_scope_membership_and_option_schema_case())
+    }
+
+    async fn invoke_enforces_scope_membership_and_option_schema_case() {
         let harness = TestHarness::new().await;
         let (_, session, user) = harness.new_user().await;
         let (server, _) = harness.new_server(&user).await;
@@ -340,8 +348,12 @@ mod test {
         assert_eq!(error["type"], "BotOffline");
     }
 
-    #[rocket::async_test]
-    async fn invoke_in_thread_auto_joins_invoker() {
+    #[test]
+    fn invoke_in_thread_auto_joins_invoker() {
+        crate::util::test::rt().block_on(invoke_in_thread_auto_joins_invoker_case())
+    }
+
+    async fn invoke_in_thread_auto_joins_invoker_case() {
         let harness = TestHarness::new().await;
         let (_, session, user) = harness.new_user().await;
         let (server, _) = harness.new_server(&user).await;

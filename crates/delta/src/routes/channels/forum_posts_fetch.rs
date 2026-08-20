@@ -120,8 +120,12 @@ mod test {
     use revolt_models::v0;
     use rocket::http::{ContentType, Header, Status};
 
-    #[rocket::async_test]
-    async fn posts_list_pages_and_inlines_starters() {
+    #[test]
+    fn posts_list_pages_and_inlines_starters() {
+        crate::util::test::rt().block_on(posts_list_pages_and_inlines_starters_case())
+    }
+
+    async fn posts_list_pages_and_inlines_starters_case() {
         let harness = TestHarness::new().await;
         let (_, session, user) = harness.new_user().await;
         let (mut server, _) = harness.new_server(&user).await;

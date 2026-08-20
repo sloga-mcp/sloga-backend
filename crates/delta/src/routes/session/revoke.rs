@@ -32,8 +32,12 @@ mod tests {
     use revolt_result::ErrorType;
     use rocket::http::{Header, Status};
 
-    #[rocket::async_test]
-    async fn success() {
+    #[test]
+    fn success() {
+        crate::util::test::rt().block_on(success_case())
+    }
+
+    async fn success_case() {
         let harness = TestHarness::new().await;
         let (account, session, _) = harness.new_user().await;
 
@@ -58,8 +62,12 @@ mod tests {
         ));
     }
 
-    #[rocket::async_test]
-    async fn success_mfa() {
+    #[test]
+    fn success_mfa() {
+        crate::util::test::rt().block_on(success_mfa_case())
+    }
+
+    async fn success_mfa_case() {
         let harness = TestHarness::new().await;
         let (mut account, session, _) = harness.new_user().await;
 
@@ -91,8 +99,12 @@ mod tests {
         ));
     }
 
-    #[rocket::async_test]
-    async fn fail_mfa() {
+    #[test]
+    fn fail_mfa() {
+        crate::util::test::rt().block_on(fail_mfa_case())
+    }
+
+    async fn fail_mfa_case() {
         let harness = TestHarness::new().await;
         let (mut account, session, _) = harness.new_user().await;
 

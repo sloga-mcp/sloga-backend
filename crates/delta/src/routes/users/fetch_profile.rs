@@ -50,8 +50,12 @@ mod tests {
     use revolt_database::{BotInformation, Member, PartialUser, ProfileVisibility};
     use rocket::http::{ContentType, Status};
 
-    #[rocket::async_test]
-    async fn bots_are_exempt_from_friends_only_visibility() {
+    #[test]
+    fn bots_are_exempt_from_friends_only_visibility() {
+        crate::util::test::rt().block_on(bots_are_exempt_from_friends_only_visibility_case())
+    }
+
+    async fn bots_are_exempt_from_friends_only_visibility_case() {
         // ViewProfile on the bot comes from the mutual-server path, which
         // only exists on the Mongo driver.
         if std::env::var("TEST_DB").map(|v| v == "MONGODB") != Ok(true) {
@@ -97,8 +101,12 @@ mod tests {
         assert_eq!(response.status(), Status::Ok);
     }
 
-    #[rocket::async_test]
-    async fn friends_only_profile_needs_friendship() {
+    #[test]
+    fn friends_only_profile_needs_friendship() {
+        crate::util::test::rt().block_on(friends_only_profile_needs_friendship_case())
+    }
+
+    async fn friends_only_profile_needs_friendship_case() {
         // The mutual-server permission path only exists on the Mongo driver
         // (the reference driver has no mutual-server query), so the
         // baseline and the distinct-error assertions are Mongo-only; the

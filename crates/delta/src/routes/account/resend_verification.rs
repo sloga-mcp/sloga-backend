@@ -68,8 +68,12 @@ mod tests {
     use rocket::http::{ContentType, Status};
     use revolt_result::{Error, ErrorType};
 
-    #[rocket::async_test]
-    async fn success() {
+    #[test]
+    fn success() {
+        crate::util::test::rt().block_on(success_case())
+    }
+
+    async fn success_case() {
         let harness = TestHarness::new().await;
 
         let mut account = Account::new(
@@ -111,8 +115,12 @@ mod tests {
         assert_eq!(res.status(), Status::Ok);
     }
 
-    #[rocket::async_test]
-    async fn success_unknown() {
+    #[test]
+    fn success_unknown() {
+        crate::util::test::rt().block_on(success_unknown_case())
+    }
+
+    async fn success_unknown_case() {
         let harness = TestHarness::new().await;
 
         let res = harness.client
@@ -130,8 +138,12 @@ mod tests {
         assert_eq!(res.status(), Status::NoContent);
     }
 
-    #[rocket::async_test]
-    async fn fail_bad_email() {
+    #[test]
+    fn fail_bad_email() {
+        crate::util::test::rt().block_on(fail_bad_email_case())
+    }
+
+    async fn fail_bad_email_case() {
         let harness = TestHarness::new().await;
 
         let res = harness.client

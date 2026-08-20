@@ -93,8 +93,12 @@ mod test {
     use rocket::http::{ContentType, Header, Status};
     use serde_json::json;
 
-    #[rocket::async_test]
-    async fn review_report_flow() {
+    #[test]
+    fn review_report_flow() {
+        crate::util::test::rt().block_on(review_report_flow_case())
+    }
+
+    async fn review_report_flow_case() {
         let harness = TestHarness::new().await;
         let (_, reporter_session, reporter) = harness.new_user().await;
         let (_, _, author) = harness.new_user().await;

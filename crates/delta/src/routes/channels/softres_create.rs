@@ -296,8 +296,12 @@ mod test {
     use rocket::http::{ContentType, Header, Status};
     use serde_json::json;
 
-    #[rocket::async_test]
-    async fn create_sheet_creates_flagged_message_with_definition() {
+    #[test]
+    fn create_sheet_creates_flagged_message_with_definition() {
+        crate::util::test::rt().block_on(create_sheet_creates_flagged_message_with_definition_case())
+    }
+
+    async fn create_sheet_creates_flagged_message_with_definition_case() {
         let harness = TestHarness::new().await;
         let (_, session, user) = harness.new_user().await;
         let (server, _) = harness.new_server(&user).await;
@@ -344,8 +348,12 @@ mod test {
         assert!(content.contains("Sunday MC"), "unexpected content: {content}");
     }
 
-    #[rocket::async_test]
-    async fn create_sheet_rejects_invalid_shapes() {
+    #[test]
+    fn create_sheet_rejects_invalid_shapes() {
+        crate::util::test::rt().block_on(create_sheet_rejects_invalid_shapes_case())
+    }
+
+    async fn create_sheet_rejects_invalid_shapes_case() {
         let harness = TestHarness::new().await;
         let (_, session, user) = harness.new_user().await;
         let (server, _) = harness.new_server(&user).await;
@@ -396,8 +404,12 @@ mod test {
         }
     }
 
-    #[rocket::async_test]
-    async fn regular_send_cannot_forge_softres_flag() {
+    #[test]
+    fn regular_send_cannot_forge_softres_flag() {
+        crate::util::test::rt().block_on(regular_send_cannot_forge_softres_flag_case())
+    }
+
+    async fn regular_send_cannot_forge_softres_flag_case() {
         let harness = TestHarness::new().await;
         let (_, session, user) = harness.new_user().await;
         let (server, _) = harness.new_server(&user).await;

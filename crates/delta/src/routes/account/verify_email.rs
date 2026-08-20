@@ -48,8 +48,12 @@ mod tests {
     use revolt_models::v0;
     use revolt_result::{Error, ErrorType};
     
-    #[rocket::async_test]
-    async fn success() {
+    #[test]
+    fn success() {
+        crate::util::test::rt().block_on(success_case())
+    }
+
+    async fn success_case() {
         let harness = TestHarness::new().await;
         let (mut account, _, _) = harness.new_user().await;
 
@@ -89,8 +93,12 @@ mod tests {
         }
     }
 
-    #[rocket::async_test]
-    async fn fail_invalid_token() {
+    #[test]
+    fn fail_invalid_token() {
+        crate::util::test::rt().block_on(fail_invalid_token_case())
+    }
+
+    async fn fail_invalid_token_case() {
         let harness = TestHarness::new().await;
 
         let res = harness.client.post("/auth/account/verify/token").dispatch().await;

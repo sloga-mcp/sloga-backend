@@ -68,8 +68,12 @@ mod test {
     use revolt_models::v0;
     use rocket::http::{Header, Status};
 
-    #[rocket::async_test]
-    async fn success_remove_member() {
+    #[test]
+    fn success_remove_member() {
+        crate::util::test::rt().block_on(success_remove_member_case())
+    }
+
+    async fn success_remove_member_case() {
         let mut harness = TestHarness::new().await;
         let (_, session, mut user) = harness.new_user().await;
         let (_, _, mut other_user) = harness.new_user().await;
@@ -140,8 +144,12 @@ mod test {
         );
     }
 
-    #[rocket::async_test]
-    async fn fail_not_in_group() {
+    #[test]
+    fn fail_not_in_group() {
+        crate::util::test::rt().block_on(fail_not_in_group_case())
+    }
+
+    async fn fail_not_in_group_case() {
         let harness = TestHarness::new().await;
         let (_, session, user) = harness.new_user().await;
         let (_, _, other_user) = harness.new_user().await;
@@ -173,8 +181,12 @@ mod test {
         // assert_eq!(response.status(), Status::NotFound);
     }
 
-    #[rocket::async_test]
-    async fn fail_not_group_owner() {
+    #[test]
+    fn fail_not_group_owner() {
+        crate::util::test::rt().block_on(fail_not_group_owner_case())
+    }
+
+    async fn fail_not_group_owner_case() {
         let harness = TestHarness::new().await;
         let (_, _, user) = harness.new_user().await;
         let (_, session, other_user) = harness.new_user().await;

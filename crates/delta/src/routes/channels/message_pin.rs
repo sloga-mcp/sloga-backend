@@ -83,8 +83,12 @@ mod test {
     use revolt_models::v0::{self, SystemMessage};
     use rocket::http::{Header, Status};
 
-    #[rocket::async_test]
-    async fn pin_message() {
+    #[test]
+    fn pin_message() {
+        crate::util::test::rt().block_on(pin_message_case())
+    }
+
+    async fn pin_message_case() {
         let mut harness = TestHarness::new().await;
         let (_, session, user) = harness.new_user().await;
 

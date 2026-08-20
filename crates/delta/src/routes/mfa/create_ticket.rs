@@ -48,8 +48,12 @@ mod tests {
     use revolt_models::v0;
     use revolt_result::{Error, ErrorType};
 
-    #[rocket::async_test]
-    async fn success() {
+    #[test]
+    fn success() {
+        crate::util::test::rt().block_on(success_case())
+    }
+
+    async fn success_case() {
         let harness = TestHarness::new().await;
         let (_, session, _) = harness.new_user().await;
 
@@ -69,8 +73,12 @@ mod tests {
         assert!(res.into_json::<v0::MFATicket>().await.unwrap().validated);
     }
 
-    #[rocket::async_test]
-    async fn success_totp() {
+    #[test]
+    fn success_totp() {
+        crate::util::test::rt().block_on(success_totp_case())
+    }
+
+    async fn success_totp_case() {
         let harness = TestHarness::new().await;
         let (mut account, session, _) = harness.new_user().await;
 
@@ -97,8 +105,12 @@ mod tests {
         assert!(res.into_json::<v0::MFATicket>().await.is_some());
     }
 
-    #[rocket::async_test]
-    async fn failure_totp() {
+    #[test]
+    fn failure_totp() {
+        crate::util::test::rt().block_on(failure_totp_case())
+    }
+
+    async fn failure_totp_case() {
         let harness = TestHarness::new().await;
         let (mut account, session, _) = harness.new_user().await;
 
@@ -126,8 +138,12 @@ mod tests {
         ));
     }
 
-    #[rocket::async_test]
-    async fn failure_no_totp() {
+    #[test]
+    fn failure_no_totp() {
+        crate::util::test::rt().block_on(failure_no_totp_case())
+    }
+
+    async fn failure_no_totp_case() {
         let harness = TestHarness::new().await;
         let (mut account, session, _) = harness.new_user().await;
 

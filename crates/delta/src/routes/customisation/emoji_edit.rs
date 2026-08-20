@@ -58,8 +58,12 @@ mod test {
     use rocket::http::{ContentType, Header, Status};
     use ulid::Ulid;
 
-    #[rocket::async_test]
-    async fn edit_emoji_name_as_creator() {
+    #[test]
+    fn edit_emoji_name_as_creator() {
+        crate::util::test::rt().block_on(edit_emoji_name_as_creator_case())
+    }
+
+    async fn edit_emoji_name_as_creator_case() {
         let harness = TestHarness::new().await;
         let (_, session, user) = harness.new_user().await;
         let (server, _) = harness.new_server(&user).await;
@@ -97,8 +101,12 @@ mod test {
         assert_eq!(edited.name, "renamed_emoji");
     }
 
-    #[rocket::async_test]
-    async fn reject_invalid_emoji_name() {
+    #[test]
+    fn reject_invalid_emoji_name() {
+        crate::util::test::rt().block_on(reject_invalid_emoji_name_case())
+    }
+
+    async fn reject_invalid_emoji_name_case() {
         let harness = TestHarness::new().await;
         let (_, session, user) = harness.new_user().await;
         let (server, _) = harness.new_server(&user).await;
@@ -133,8 +141,12 @@ mod test {
         assert_eq!(response.status(), Status::BadRequest);
     }
 
-    #[rocket::async_test]
-    async fn reject_edit_for_detached_emoji() {
+    #[test]
+    fn reject_edit_for_detached_emoji() {
+        crate::util::test::rt().block_on(reject_edit_for_detached_emoji_case())
+    }
+
+    async fn reject_edit_for_detached_emoji_case() {
         let harness = TestHarness::new().await;
         let (_, session, user) = harness.new_user().await;
 
@@ -166,8 +178,12 @@ mod test {
         assert_eq!(response.status(), Status::Unauthorized);
     }
 
-    #[rocket::async_test]
-    async fn reject_edit_for_creator_without_manage_customisation() {
+    #[test]
+    fn reject_edit_for_creator_without_manage_customisation() {
+        crate::util::test::rt().block_on(reject_edit_for_creator_without_manage_customisation_case())
+    }
+
+    async fn reject_edit_for_creator_without_manage_customisation_case() {
         let harness = TestHarness::new().await;
         let (_, _, owner) = harness.new_user().await;
         let (_, creator_session, creator) = harness.new_user().await;

@@ -35,8 +35,12 @@ mod test {
     use revolt_models::v0;
     use rocket::http::{ContentType, Header, Status};
 
-    #[rocket::async_test]
-    async fn create_bot() {
+    #[test]
+    fn create_bot() {
+        crate::util::test::rt().block_on(create_bot_case())
+    }
+
+    async fn create_bot_case() {
         let harness = TestHarness::new().await;
         let (_, session, _) = harness.new_user().await;
 

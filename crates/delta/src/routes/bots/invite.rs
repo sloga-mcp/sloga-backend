@@ -70,8 +70,12 @@ mod test {
     use revolt_models::v0::{self, DataCreateServer};
     use rocket::http::{ContentType, Header, Status};
 
-    #[rocket::async_test]
-    async fn invite_bot_to_group() {
+    #[test]
+    fn invite_bot_to_group() {
+        crate::util::test::rt().block_on(invite_bot_to_group_case())
+    }
+
+    async fn invite_bot_to_group_case() {
         let mut harness = TestHarness::new().await;
         let (_, session, user) = harness.new_user().await;
 
@@ -122,8 +126,12 @@ mod test {
         }
     }
 
-    #[rocket::async_test]
-    async fn invite_bot_to_server() {
+    #[test]
+    fn invite_bot_to_server() {
+        crate::util::test::rt().block_on(invite_bot_to_server_case())
+    }
+
+    async fn invite_bot_to_server_case() {
         let mut harness = TestHarness::new().await;
         let (_, session, user) = harness.new_user().await;
 

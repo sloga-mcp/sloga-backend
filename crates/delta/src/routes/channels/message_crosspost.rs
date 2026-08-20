@@ -181,8 +181,12 @@ mod test {
     use rocket::http::{ContentType, Header, Status};
     use serde_json::json;
 
-    #[rocket::async_test]
-    async fn crosspost_flags_origin_and_prevents_reposting() {
+    #[test]
+    fn crosspost_flags_origin_and_prevents_reposting() {
+        crate::util::test::rt().block_on(crosspost_flags_origin_and_prevents_reposting_case())
+    }
+
+    async fn crosspost_flags_origin_and_prevents_reposting_case() {
         let harness = TestHarness::new().await;
         let (_, session, user) = harness.new_user().await;
         let (server, channels) = harness.new_server(&user).await;
@@ -253,8 +257,12 @@ mod test {
         );
     }
 
-    #[rocket::async_test]
-    async fn regular_send_cannot_forge_crosspost_flags() {
+    #[test]
+    fn regular_send_cannot_forge_crosspost_flags() {
+        crate::util::test::rt().block_on(regular_send_cannot_forge_crosspost_flags_case())
+    }
+
+    async fn regular_send_cannot_forge_crosspost_flags_case() {
         let harness = TestHarness::new().await;
         let (_, session, user) = harness.new_user().await;
         let (server, _) = harness.new_server(&user).await;

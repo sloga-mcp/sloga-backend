@@ -233,8 +233,12 @@ mod test {
     use rocket::http::{ContentType, Header, Status};
     use serde_json::json;
 
-    #[rocket::async_test]
-    async fn report_message_with_reporter_snapshot() {
+    #[test]
+    fn report_message_with_reporter_snapshot() {
+        crate::util::test::rt().block_on(report_message_with_reporter_snapshot_case())
+    }
+
+    async fn report_message_with_reporter_snapshot_case() {
         let harness = TestHarness::new().await;
         let (_, session, reporter) = harness.new_user().await;
         let (_, _, author) = harness.new_user().await;
@@ -320,8 +324,12 @@ mod test {
         )));
     }
 
-    #[rocket::async_test]
-    async fn report_message_requires_snapshot() {
+    #[test]
+    fn report_message_requires_snapshot() {
+        crate::util::test::rt().block_on(report_message_requires_snapshot_case())
+    }
+
+    async fn report_message_requires_snapshot_case() {
         let harness = TestHarness::new().await;
         let (_, session, _) = harness.new_user().await;
         let (_, _, author) = harness.new_user().await;
@@ -350,8 +358,12 @@ mod test {
         assert_eq!(response.status(), Status::BadRequest);
     }
 
-    #[rocket::async_test]
-    async fn cannot_report_own_message() {
+    #[test]
+    fn cannot_report_own_message() {
+        crate::util::test::rt().block_on(cannot_report_own_message_case())
+    }
+
+    async fn cannot_report_own_message_case() {
         let harness = TestHarness::new().await;
         let (_, session, author) = harness.new_user().await;
 
@@ -387,8 +399,12 @@ mod test {
         assert_eq!(response.status(), Status::BadRequest);
     }
 
-    #[rocket::async_test]
-    async fn report_succeeds_with_moderator_present() {
+    #[test]
+    fn report_succeeds_with_moderator_present() {
+        crate::util::test::rt().block_on(report_succeeds_with_moderator_present_case())
+    }
+
+    async fn report_succeeds_with_moderator_present_case() {
         // Filing a report while a privileged moderator exists must still
         // return NoContent: report notification delivery (the global-topic
         // broadcast consumed by moderator sessions) must never block or fail
@@ -443,8 +459,12 @@ mod test {
         assert_eq!(response.status(), Status::NoContent);
     }
 
-    #[rocket::async_test]
-    async fn report_deleted_message_still_accepted() {
+    #[test]
+    fn report_deleted_message_still_accepted() {
+        crate::util::test::rt().block_on(report_deleted_message_still_accepted_case())
+    }
+
+    async fn report_deleted_message_still_accepted_case() {
         // The reporter-supplied snapshot must stand alone: reporting must
         // work even when the server cannot produce its own copy (deleted
         // message now, E2EE conversations later).

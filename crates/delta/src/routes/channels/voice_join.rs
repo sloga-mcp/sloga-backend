@@ -278,8 +278,12 @@ mod test {
         );
     }
 
-    #[rocket::async_test]
-    async fn video_cap_refuses_overflow_join_despite_force_disconnect() {
+    #[test]
+    fn video_cap_refuses_overflow_join_despite_force_disconnect() {
+        crate::util::test::rt().block_on(video_cap_refuses_overflow_join_despite_force_disconnect_case())
+    }
+
+    async fn video_cap_refuses_overflow_join_despite_force_disconnect_case() {
         let harness = TestHarness::new().await;
         let (_account_a, _session_a, user_a) = harness.new_user().await;
         let (_account_b, session_b, user_b) = harness.new_user().await;
@@ -336,8 +340,12 @@ mod test {
             .expect("cleanup");
     }
 
-    #[rocket::async_test]
-    async fn mls_cap_refuses_overflow_join_despite_force_disconnect() {
+    #[test]
+    fn mls_cap_refuses_overflow_join_despite_force_disconnect() {
+        crate::util::test::rt().block_on(mls_cap_refuses_overflow_join_despite_force_disconnect_case())
+    }
+
+    async fn mls_cap_refuses_overflow_join_despite_force_disconnect_case() {
         let harness = TestHarness::new().await;
         let (_account_a, _session_a, user_a) = harness.new_user().await;
         let (_account_b, session_b, user_b) = harness.new_user().await;
@@ -393,8 +401,12 @@ mod test {
     /// `mls_cap_would_refuse`): after a join is recorded they must detect the
     /// overflow the check-then-act join leg could let race past — but stay
     /// inert at/below the cap so the legitimate cap-th member is never evicted.
-    #[rocket::async_test]
-    async fn ingress_backstop_predicates_fire_only_over_cap() {
+    #[test]
+    fn ingress_backstop_predicates_fire_only_over_cap() {
+        crate::util::test::rt().block_on(ingress_backstop_predicates_fire_only_over_cap_case())
+    }
+
+    async fn ingress_backstop_predicates_fire_only_over_cap_case() {
         let harness = TestHarness::new().await;
         let (_account_a, _session_a, user_a) = harness.new_user().await;
         let (_account_b, _session_b, user_b) = harness.new_user().await;

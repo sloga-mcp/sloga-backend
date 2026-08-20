@@ -63,8 +63,12 @@ mod test {
     use rocket::http::{ContentType, Header, Status};
     use serde_json::json;
 
-    #[rocket::async_test]
-    async fn voters_list_is_author_gated() {
+    #[test]
+    fn voters_list_is_author_gated() {
+        crate::util::test::rt().block_on(voters_list_is_author_gated_case())
+    }
+
+    async fn voters_list_is_author_gated_case() {
         let harness = TestHarness::new().await;
         let (_, session, user) = harness.new_user().await;
         let (_, other_session, other_user) = harness.new_user().await;

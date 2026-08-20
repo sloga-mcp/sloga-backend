@@ -45,8 +45,12 @@ mod tests {
     use revolt_models::v0;
     use rocket::http::{ContentType, Header, Status};
 
-    #[rocket::async_test]
-    async fn success() {
+    #[test]
+    fn success() {
+        crate::util::test::rt().block_on(success_case())
+    }
+
+    async fn success_case() {
         overwrite_config(|config| config.api.smtp.host = "".to_string()).await;
 
         let harness = TestHarness::new().await;
@@ -73,8 +77,12 @@ mod tests {
         assert_eq!(account.email, "validexample@valid.com");
     }
 
-    #[rocket::async_test]
-    async fn success_smtp() {
+    #[test]
+    fn success_smtp() {
+        crate::util::test::rt().block_on(success_smtp_case())
+    }
+
+    async fn success_smtp_case() {
         let harness = TestHarness::new().await;
         let (account, session, _) = harness.new_user().await;
 
@@ -115,8 +123,12 @@ mod tests {
         )
     }
 
-    #[rocket::async_test]
-    async fn success_mfa() {
+    #[test]
+    fn success_mfa() {
+        crate::util::test::rt().block_on(success_mfa_case())
+    }
+
+    async fn success_mfa_case() {
         overwrite_config(|config| config.api.smtp.host = "".to_string()).await;
 
         let harness = TestHarness::new().await;
@@ -154,8 +166,12 @@ mod tests {
         assert_eq!(account.email, "validexample@valid.com");
     }
 
-    #[rocket::async_test]
-    async fn fail_mfa() {
+    #[test]
+    fn fail_mfa() {
+        crate::util::test::rt().block_on(fail_mfa_case())
+    }
+
+    async fn fail_mfa_case() {
         overwrite_config(|config| config.api.smtp.host = "".to_string()).await;
 
         let harness = TestHarness::new().await;

@@ -123,8 +123,12 @@ async fn make_dm_eligible(harness: &TestHarness, user_a: &User, user_b: &User) {
         .expect("friendship");
 }
 
-#[rocket::async_test]
-async fn publish_requires_mfa_for_new_device_only() {
+#[test]
+fn publish_requires_mfa_for_new_device_only() {
+    crate::util::test::rt().block_on(publish_requires_mfa_for_new_device_only_case())
+}
+
+async fn publish_requires_mfa_for_new_device_only_case() {
     let harness = TestHarness::new().await;
     let (account, session, _) = harness.new_user().await;
 
@@ -184,8 +188,12 @@ async fn publish_requires_mfa_for_new_device_only() {
     assert_eq!(response.status(), Status::BadRequest);
 }
 
-#[rocket::async_test]
-async fn publish_rejects_bad_signatures() {
+#[test]
+fn publish_rejects_bad_signatures() {
+    crate::util::test::rt().block_on(publish_rejects_bad_signatures_case())
+}
+
+async fn publish_rejects_bad_signatures_case() {
     let harness = TestHarness::new().await;
     let (account, session, _) = harness.new_user().await;
 
@@ -227,8 +235,12 @@ async fn publish_rejects_bad_signatures() {
     assert_eq!(response.status(), Status::BadRequest);
 }
 
-#[rocket::async_test]
-async fn fetch_consumes_one_time_keys_and_never_returns_empty() {
+#[test]
+fn fetch_consumes_one_time_keys_and_never_returns_empty() {
+    crate::util::test::rt().block_on(fetch_consumes_one_time_keys_and_never_returns_empty_case())
+}
+
+async fn fetch_consumes_one_time_keys_and_never_returns_empty_case() {
     let harness = TestHarness::new().await;
     let (account_a, session_a, user_a) = harness.new_user().await;
     let (account_b, session_b, user_b) = harness.new_user().await;
@@ -266,8 +278,12 @@ async fn fetch_consumes_one_time_keys_and_never_returns_empty() {
     assert_eq!(bundle.devices[0].fallback_key.key_id, "fallback0");
 }
 
-#[rocket::async_test]
-async fn blocked_user_cannot_fetch_keys_or_devices() {
+#[test]
+fn blocked_user_cannot_fetch_keys_or_devices() {
+    crate::util::test::rt().block_on(blocked_user_cannot_fetch_keys_or_devices_case())
+}
+
+async fn blocked_user_cannot_fetch_keys_or_devices_case() {
     let harness = TestHarness::new().await;
     let (account_a, session_a, user_a) = harness.new_user().await;
     let (account_b, session_b, user_b) = harness.new_user().await;
@@ -322,8 +338,12 @@ async fn make_group(harness: &TestHarness, owner: &User, member: &User) -> Strin
     channel.id().to_string()
 }
 
-#[rocket::async_test]
-async fn group_comembers_can_fetch_and_send_without_friendship() {
+#[test]
+fn group_comembers_can_fetch_and_send_without_friendship() {
+    crate::util::test::rt().block_on(group_comembers_can_fetch_and_send_without_friendship_case())
+}
+
+async fn group_comembers_can_fetch_and_send_without_friendship_case() {
     let harness = TestHarness::new().await;
     let (account_a, session_a, user_a) = harness.new_user().await;
     let (account_b, session_b, user_b) = harness.new_user().await;
@@ -378,8 +398,12 @@ async fn group_comembers_can_fetch_and_send_without_friendship() {
     ));
 }
 
-#[rocket::async_test]
-async fn non_member_stranger_is_refused() {
+#[test]
+fn non_member_stranger_is_refused() {
+    crate::util::test::rt().block_on(non_member_stranger_is_refused_case())
+}
+
+async fn non_member_stranger_is_refused_case() {
     let harness = TestHarness::new().await;
     let (account_a, session_a, user_a) = harness.new_user().await;
     let (account_b, session_b, user_b) = harness.new_user().await;
@@ -401,8 +425,12 @@ async fn non_member_stranger_is_refused() {
     let _ = user_a;
 }
 
-#[rocket::async_test]
-async fn blocked_pair_in_a_group_can_deliver_but_not_fetch() {
+#[test]
+fn blocked_pair_in_a_group_can_deliver_but_not_fetch() {
+    crate::util::test::rt().block_on(blocked_pair_in_a_group_can_deliver_but_not_fetch_case())
+}
+
+async fn blocked_pair_in_a_group_can_deliver_but_not_fetch_case() {
     let harness = TestHarness::new().await;
     let (account_a, session_a, user_a) = harness.new_user().await;
     let (account_b, session_b, user_b) = harness.new_user().await;
@@ -457,8 +485,12 @@ async fn blocked_pair_in_a_group_can_deliver_but_not_fetch() {
     ));
 }
 
-#[rocket::async_test]
-async fn send_stamps_sender_and_reports_per_device_status() {
+#[test]
+fn send_stamps_sender_and_reports_per_device_status() {
+    crate::util::test::rt().block_on(send_stamps_sender_and_reports_per_device_status_case())
+}
+
+async fn send_stamps_sender_and_reports_per_device_status_case() {
     let harness = TestHarness::new().await;
     let (account_a, session_a, user_a) = harness.new_user().await;
     let (account_b, session_b, user_b) = harness.new_user().await;
@@ -546,8 +578,12 @@ async fn send_stamps_sender_and_reports_per_device_status() {
     assert_eq!(response.status(), Status::BadRequest);
 }
 
-#[rocket::async_test]
-async fn queue_depth_cap_reports_queue_full() {
+#[test]
+fn queue_depth_cap_reports_queue_full() {
+    crate::util::test::rt().block_on(queue_depth_cap_reports_queue_full_case())
+}
+
+async fn queue_depth_cap_reports_queue_full_case() {
     let harness = TestHarness::new().await;
     let (account_a, session_a, user_a) = harness.new_user().await;
     let (account_b, session_b, user_b) = harness.new_user().await;
@@ -635,8 +671,12 @@ async fn queue_depth_cap_reports_queue_full() {
     ));
 }
 
-#[rocket::async_test]
-async fn revoke_device_is_mfa_gated_and_cascades() {
+#[test]
+fn revoke_device_is_mfa_gated_and_cascades() {
+    crate::util::test::rt().block_on(revoke_device_is_mfa_gated_and_cascades_case())
+}
+
+async fn revoke_device_is_mfa_gated_and_cascades_case() {
     let harness = TestHarness::new().await;
     let (account, session, user) = harness.new_user().await;
 
@@ -678,8 +718,12 @@ async fn revoke_device_is_mfa_gated_and_cascades() {
     );
 }
 
-#[rocket::async_test]
-async fn queue_depth_cap_holds_within_a_single_request() {
+#[test]
+fn queue_depth_cap_holds_within_a_single_request() {
+    crate::util::test::rt().block_on(queue_depth_cap_holds_within_a_single_request_case())
+}
+
+async fn queue_depth_cap_holds_within_a_single_request_case() {
     let harness = TestHarness::new().await;
     let (account_a, session_a, user_a) = harness.new_user().await;
     let (account_b, session_b, user_b) = harness.new_user().await;
@@ -758,8 +802,12 @@ async fn queue_depth_cap_holds_within_a_single_request() {
     );
 }
 
-#[rocket::async_test]
-async fn one_time_key_cap_counts_upserts_correctly() {
+#[test]
+fn one_time_key_cap_counts_upserts_correctly() {
+    crate::util::test::rt().block_on(one_time_key_cap_counts_upserts_correctly_case())
+}
+
+async fn one_time_key_cap_counts_upserts_correctly_case() {
     let harness = TestHarness::new().await;
     let (account, session, _user) = harness.new_user().await;
 
@@ -820,8 +868,12 @@ async fn one_time_key_cap_counts_upserts_correctly() {
 /// routes that consume key material or act as a device. Own-device listing
 /// and MFA-gated revocation stay reachable — that's the lost-device
 /// recovery path.
-#[rocket::async_test]
-async fn unbound_session_is_refused_on_e2ee_routes() {
+#[test]
+fn unbound_session_is_refused_on_e2ee_routes() {
+    crate::util::test::rt().block_on(unbound_session_is_refused_on_e2ee_routes_case())
+}
+
+async fn unbound_session_is_refused_on_e2ee_routes_case() {
     let harness = TestHarness::new().await;
     let (account_a, session_a, user_a) = harness.new_user().await;
     let (account_b, session_b, user_b) = harness.new_user().await;
@@ -923,8 +975,12 @@ async fn unbound_session_is_refused_on_e2ee_routes() {
 /// and the old session loses it. (The claim verification itself is
 /// signature-tested in the database crate; here we exercise the rebind's
 /// effect on the route gates.)
-#[rocket::async_test]
-async fn device_claim_rebind_moves_route_access_between_sessions() {
+#[test]
+fn device_claim_rebind_moves_route_access_between_sessions() {
+    crate::util::test::rt().block_on(device_claim_rebind_moves_route_access_between_sessions_case())
+}
+
+async fn device_claim_rebind_moves_route_access_between_sessions_case() {
     let harness = TestHarness::new().await;
     let (account_a, session_a, user_a) = harness.new_user().await;
     let (account_b, session_b, user_b) = harness.new_user().await;
@@ -1009,8 +1065,12 @@ async fn put_backup(
         .status()
 }
 
-#[rocket::async_test]
-async fn backup_roundtrip_and_generation_monotonic() {
+#[test]
+fn backup_roundtrip_and_generation_monotonic() {
+    crate::util::test::rt().block_on(backup_roundtrip_and_generation_monotonic_case())
+}
+
+async fn backup_roundtrip_and_generation_monotonic_case() {
     let harness = TestHarness::new().await;
     let (account, session, user) = harness.new_user().await;
     let device = publish_device(&harness, &account.id, &session.token, 2).await;
@@ -1080,8 +1140,12 @@ async fn backup_roundtrip_and_generation_monotonic() {
     assert_eq!(body.backups[0].device_id, device.device_id);
 }
 
-#[rocket::async_test]
-async fn backup_get_requires_mfa_and_binds_to_user() {
+#[test]
+fn backup_get_requires_mfa_and_binds_to_user() {
+    crate::util::test::rt().block_on(backup_get_requires_mfa_and_binds_to_user_case())
+}
+
+async fn backup_get_requires_mfa_and_binds_to_user_case() {
     let harness = TestHarness::new().await;
     let (account, session, user) = harness.new_user().await;
     let device = publish_device(&harness, &account.id, &session.token, 1).await;
@@ -1116,8 +1180,12 @@ async fn backup_get_requires_mfa_and_binds_to_user() {
     assert_eq!(response.status(), Status::Unauthorized);
 }
 
-#[rocket::async_test]
-async fn backup_put_rejects_generation_and_kdf_and_binding_tampering() {
+#[test]
+fn backup_put_rejects_generation_and_kdf_and_binding_tampering() {
+    crate::util::test::rt().block_on(backup_put_rejects_generation_and_kdf_and_binding_tampering_case())
+}
+
+async fn backup_put_rejects_generation_and_kdf_and_binding_tampering_case() {
     let harness = TestHarness::new().await;
     let (account, session, user) = harness.new_user().await;
     let device = publish_device(&harness, &account.id, &session.token, 1).await;
@@ -1166,8 +1234,12 @@ async fn backup_put_rejects_generation_and_kdf_and_binding_tampering() {
     );
 }
 
-#[rocket::async_test]
-async fn backup_put_requires_a_device_bound_session() {
+#[test]
+fn backup_put_requires_a_device_bound_session() {
+    crate::util::test::rt().block_on(backup_put_requires_a_device_bound_session_case())
+}
+
+async fn backup_put_requires_a_device_bound_session_case() {
     let harness = TestHarness::new().await;
     let (account, session, user) = harness.new_user().await;
     let device = publish_device(&harness, &account.id, &session.token, 1).await;
@@ -1191,8 +1263,12 @@ async fn backup_put_requires_a_device_bound_session() {
     );
 }
 
-#[rocket::async_test]
-async fn backup_survives_device_revocation_but_dies_with_account() {
+#[test]
+fn backup_survives_device_revocation_but_dies_with_account() {
+    crate::util::test::rt().block_on(backup_survives_device_revocation_but_dies_with_account_case())
+}
+
+async fn backup_survives_device_revocation_but_dies_with_account_case() {
     let harness = TestHarness::new().await;
     let (account, session, mut user) = harness.new_user().await;
     let device = publish_device(&harness, &account.id, &session.token, 1).await;
@@ -1233,8 +1309,12 @@ async fn backup_survives_device_revocation_but_dies_with_account() {
         .is_none());
 }
 
-#[rocket::async_test]
-async fn backup_delete_requires_mfa_and_scopes_to_user() {
+#[test]
+fn backup_delete_requires_mfa_and_scopes_to_user() {
+    crate::util::test::rt().block_on(backup_delete_requires_mfa_and_scopes_to_user_case())
+}
+
+async fn backup_delete_requires_mfa_and_scopes_to_user_case() {
     let harness = TestHarness::new().await;
     let (account, session, user) = harness.new_user().await;
     let device = publish_device(&harness, &account.id, &session.token, 1).await;
@@ -1280,8 +1360,12 @@ async fn backup_delete_requires_mfa_and_scopes_to_user() {
         .is_none());
 }
 
-#[rocket::async_test]
-async fn replace_one_time_keys_replaces_only_with_a_nonempty_batch() {
+#[test]
+fn replace_one_time_keys_replaces_only_with_a_nonempty_batch() {
+    crate::util::test::rt().block_on(replace_one_time_keys_replaces_only_with_a_nonempty_batch_case())
+}
+
+async fn replace_one_time_keys_replaces_only_with_a_nonempty_batch_case() {
     let harness = TestHarness::new().await;
     let (account, session, _user) = harness.new_user().await;
     let device = publish_device(&harness, &account.id, &session.token, 3).await;
@@ -1338,8 +1422,12 @@ async fn replace_one_time_keys_replaces_only_with_a_nonempty_batch() {
     );
 }
 
-#[rocket::async_test]
-async fn second_publish_same_session_revokes_predecessor() {
+#[test]
+fn second_publish_same_session_revokes_predecessor() {
+    crate::util::test::rt().block_on(second_publish_same_session_revokes_predecessor_case())
+}
+
+async fn second_publish_same_session_revokes_predecessor_case() {
     // Device-lifecycle fixes §2: a first publication from a session sweeps
     // any OTHER identity row bound to the SAME session — the wipe→re-enable
     // flow's stale predecessor is provably a dead store. A fresh session

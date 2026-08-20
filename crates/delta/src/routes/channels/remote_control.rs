@@ -857,8 +857,12 @@ mod test {
     // same user in the same channel — REJECTED requests count too. That is
     // why these legs are split across tests rather than chained.
 
-    #[rocket::async_test]
-    async fn offer_rejects_self_and_a_target_outside_the_call() {
+    #[test]
+    fn offer_rejects_self_and_a_target_outside_the_call() {
+        crate::util::test::rt().block_on(offer_rejects_self_and_a_target_outside_the_call_case())
+    }
+
+    async fn offer_rejects_self_and_a_target_outside_the_call_case() {
         let (harness, _server, channel, uvc, (token_a, user_a), (_, user_b), (_, user_c)) =
             server_call().await;
 
@@ -876,8 +880,12 @@ mod test {
         cleanup(&uvc, &[&user_a, &user_b, &user_c]).await;
     }
 
-    #[rocket::async_test]
-    async fn offer_gates_on_screen_video_not_the_conflated_flag() {
+    #[test]
+    fn offer_gates_on_screen_video_not_the_conflated_flag() {
+        crate::util::test::rt().block_on(offer_gates_on_screen_video_not_the_conflated_flag_case())
+    }
+
+    async fn offer_gates_on_screen_video_not_the_conflated_flag_case() {
         let (harness, _server, channel, uvc, (token_a, user_a), (_, user_b), (_, user_c)) =
             server_call().await;
 
@@ -922,8 +930,12 @@ mod test {
         cleanup(&uvc, &[&user_a, &user_b, &user_c]).await;
     }
 
-    #[rocket::async_test]
-    async fn offer_pending_uniqueness_and_decline_flow() {
+    #[test]
+    fn offer_pending_uniqueness_and_decline_flow() {
+        crate::util::test::rt().block_on(offer_pending_uniqueness_and_decline_flow_case())
+    }
+
+    async fn offer_pending_uniqueness_and_decline_flow_case() {
         let (harness, _server, channel, uvc, (token_a, user_a), (token_b, user_b), (token_c, user_c)) =
             server_call().await;
 
@@ -946,8 +958,12 @@ mod test {
         cleanup(&uvc, &[&user_a, &user_b, &user_c]).await;
     }
 
-    #[rocket::async_test]
-    async fn declining_frees_the_sharers_pending_slot() {
+    #[test]
+    fn declining_frees_the_sharers_pending_slot() {
+        crate::util::test::rt().block_on(declining_frees_the_sharers_pending_slot_case())
+    }
+
+    async fn declining_frees_the_sharers_pending_slot_case() {
         let (harness, _server, channel, uvc, (token_a, user_a), (token_b, user_b), (_, user_c)) =
             server_call().await;
 
@@ -970,8 +986,12 @@ mod test {
         cleanup(&uvc, &[&user_a, &user_b, &user_c]).await;
     }
 
-    #[rocket::async_test]
-    async fn accept_fails_closed_when_sfu_refuses() {
+    #[test]
+    fn accept_fails_closed_when_sfu_refuses() {
+        crate::util::test::rt().block_on(accept_fails_closed_when_sfu_refuses_case())
+    }
+
+    async fn accept_fails_closed_when_sfu_refuses_case() {
         let (harness, _server, channel, uvc, (token_a, user_a), (token_b, user_b), (_, user_c)) =
             server_call().await;
 
@@ -998,8 +1018,12 @@ mod test {
         cleanup(&uvc, &[&user_a, &user_b, &user_c]).await;
     }
 
-    #[rocket::async_test]
-    async fn server_channel_gates_the_sharer_on_the_bit() {
+    #[test]
+    fn server_channel_gates_the_sharer_on_the_bit() {
+        crate::util::test::rt().block_on(server_channel_gates_the_sharer_on_the_bit_case())
+    }
+
+    async fn server_channel_gates_the_sharer_on_the_bit_case() {
         let (harness, server, channel, uvc, (_token_a, user_a), (token_b, user_b), (_, user_c)) =
             server_call().await;
 
@@ -1044,8 +1068,12 @@ mod test {
         cleanup(&uvc, &[&user_a, &user_b, &user_c]).await;
     }
 
-    #[rocket::async_test]
-    async fn group_dm_does_not_gate_on_the_bit() {
+    #[test]
+    fn group_dm_does_not_gate_on_the_bit() {
+        crate::util::test::rt().block_on(group_dm_does_not_gate_on_the_bit_case())
+    }
+
+    async fn group_dm_does_not_gate_on_the_bit_case() {
         let harness = TestHarness::new().await;
         let (_a, session_a, user_a) = harness.new_user().await; // group OWNER
         let (_b, session_b, user_b) = harness.new_user().await; // plain member
@@ -1105,8 +1133,12 @@ mod test {
         cleanup(&uvc, &[&user_a, &user_b]).await;
     }
 
-    #[rocket::async_test]
-    async fn offers_expire_with_the_pending_marker() {
+    #[test]
+    fn offers_expire_with_the_pending_marker() {
+        crate::util::test::rt().block_on(offers_expire_with_the_pending_marker_case())
+    }
+
+    async fn offers_expire_with_the_pending_marker_case() {
         // Not a live-expiry test (90s is too long for a suite) — assert the
         // constant stays "short" per the plan so a stalled dialog cannot
         // hold the sharer's pending slot indefinitely.

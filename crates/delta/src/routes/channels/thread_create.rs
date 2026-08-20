@@ -85,8 +85,12 @@ mod test {
     use revolt_permissions::{ChannelPermission, OverrideField};
     use revolt_result::ErrorType;
 
-    #[rocket::async_test]
-    async fn create_thread_auto_joins_creator_and_delegates_permissions() {
+    #[test]
+    fn create_thread_auto_joins_creator_and_delegates_permissions() {
+        crate::util::test::rt().block_on(create_thread_auto_joins_creator_and_delegates_permissions_case())
+    }
+
+    async fn create_thread_auto_joins_creator_and_delegates_permissions_case() {
         let harness = TestHarness::new().await;
         let (_, _, user) = harness.new_user().await;
         let (server, _channels) = harness.new_server(&user).await;
@@ -139,8 +143,12 @@ mod test {
     /// built from the THREAD's id, must not panic, and must evaluate the
     /// PARENT channel's overrides (a member denied ViewChannel on the parent
     /// must not be pushed for a thread mass mention).
-    #[rocket::async_test]
-    async fn thread_mass_mention_visibility_uses_parent_overrides() {
+    #[test]
+    fn thread_mass_mention_visibility_uses_parent_overrides() {
+        crate::util::test::rt().block_on(thread_mass_mention_visibility_uses_parent_overrides_case())
+    }
+
+    async fn thread_mass_mention_visibility_uses_parent_overrides_case() {
         let harness = TestHarness::new().await;
         let (_, _, owner) = harness.new_user().await;
         let (_, _, outsider) = harness.new_user().await;
@@ -198,8 +206,12 @@ mod test {
         );
     }
 
-    #[rocket::async_test]
-    async fn thread_cannot_double_anchor_a_message() {
+    #[test]
+    fn thread_cannot_double_anchor_a_message() {
+        crate::util::test::rt().block_on(thread_cannot_double_anchor_a_message_case())
+    }
+
+    async fn thread_cannot_double_anchor_a_message_case() {
         let harness = TestHarness::new().await;
         let (_, _, user) = harness.new_user().await;
         let (server, channels) = harness.new_server(&user).await;

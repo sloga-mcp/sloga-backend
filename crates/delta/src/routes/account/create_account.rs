@@ -80,8 +80,12 @@ mod tests {
     use revolt_result::{Error, ErrorType};
     use rocket::http::{ContentType, Status};
 
-    #[rocket::async_test]
-    async fn success() {
+    #[test]
+    fn success() {
+        crate::util::test::rt().block_on(success_case())
+    }
+
+    async fn success_case() {
         let mut harness = TestHarness::new().await;
 
         let res = harness
@@ -112,8 +116,12 @@ mod tests {
             .await;
     }
 
-    #[rocket::async_test]
-    async fn fail_invalid_email() {
+    #[test]
+    fn fail_invalid_email() {
+        crate::util::test::rt().block_on(fail_invalid_email_case())
+    }
+
+    async fn fail_invalid_email_case() {
         let harness = TestHarness::new().await;
 
         let res = harness
@@ -137,8 +145,12 @@ mod tests {
         ));
     }
 
-    #[rocket::async_test]
-    async fn fail_invalid_password() {
+    #[test]
+    fn fail_invalid_password() {
+        crate::util::test::rt().block_on(fail_invalid_password_case())
+    }
+
+    async fn fail_invalid_password_case() {
         let harness = TestHarness::new().await;
 
         let res = harness
@@ -162,8 +174,12 @@ mod tests {
         ));
     }
 
-    #[rocket::async_test]
-    async fn fail_invalid_invite() {
+    #[test]
+    fn fail_invalid_invite() {
+        crate::util::test::rt().block_on(fail_invalid_invite_case())
+    }
+
+    async fn fail_invalid_invite_case() {
         overwrite_config(|config| config.api.registration.invite_only = true).await;
 
         let harness = TestHarness::new().await;
@@ -190,8 +206,12 @@ mod tests {
         ));
     }
 
-    #[rocket::async_test]
-    async fn success_valid_invite() {
+    #[test]
+    fn success_valid_invite() {
+        crate::util::test::rt().block_on(success_valid_invite_case())
+    }
+
+    async fn success_valid_invite_case() {
         overwrite_config(|config| config.api.registration.invite_only = true).await;
 
         let harness = TestHarness::new().await;
@@ -230,8 +250,12 @@ mod tests {
         assert!(invite.used);
     }
 
-    #[rocket::async_test]
-    async fn fail_missing_captcha() {
+    #[test]
+    fn fail_missing_captcha() {
+        crate::util::test::rt().block_on(fail_missing_captcha_case())
+    }
+
+    async fn fail_missing_captcha_case() {
         overwrite_config(|config| {
             config.api.security.captcha.hcaptcha_key =
                 "0x0000000000000000000000000000000000000000".to_string()
@@ -261,8 +285,12 @@ mod tests {
         ));
     }
 
-    #[rocket::async_test]
-    async fn fail_captcha_invalid() {
+    #[test]
+    fn fail_captcha_invalid() {
+        crate::util::test::rt().block_on(fail_captcha_invalid_case())
+    }
+
+    async fn fail_captcha_invalid_case() {
         overwrite_config(|config| {
             config.api.security.captcha.hcaptcha_key =
                 "0x0000000000000000000000000000000000000000".to_string()
@@ -293,8 +321,12 @@ mod tests {
         ));
     }
 
-    #[rocket::async_test]
-    async fn success_captcha_valid() {
+    #[test]
+    fn success_captcha_valid() {
+        crate::util::test::rt().block_on(success_captcha_valid_case())
+    }
+
+    async fn success_captcha_valid_case() {
         overwrite_config(|config| {
             config.api.security.captcha.hcaptcha_key =
                 "0x0000000000000000000000000000000000000000".to_string()
@@ -321,8 +353,12 @@ mod tests {
         assert_eq!(res.status(), Status::NoContent);
     }
 
-    #[rocket::async_test]
-    async fn success_smtp_sent() {
+    #[test]
+    fn success_smtp_sent() {
+        crate::util::test::rt().block_on(success_smtp_sent_case())
+    }
+
+    async fn success_smtp_sent_case() {
         let harness = TestHarness::new().await;
 
         let res = harness

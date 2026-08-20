@@ -192,8 +192,12 @@ mod test {
 
     /// The membership + live-stream refusals — three asks, each flipping one
     /// condition, which sits exactly at the 3/10s bucket ceiling.
-    #[rocket::async_test]
-    async fn control_request_gates_membership_and_share() {
+    #[test]
+    fn control_request_gates_membership_and_share() {
+        crate::util::test::rt().block_on(control_request_gates_membership_and_share_case())
+    }
+
+    async fn control_request_gates_membership_and_share_case() {
         let (harness, channel, uvc, user_a, token_b, user_b) = setup().await;
 
         // Requester not in the call: refused.
@@ -224,8 +228,12 @@ mod test {
 
     /// The self-request refusal and the honest relay — two asks, both with a
     /// live stream present, in a fresh harness so the bucket is clean.
-    #[rocket::async_test]
-    async fn control_request_rejects_self_then_relays() {
+    #[test]
+    fn control_request_rejects_self_then_relays() {
+        crate::util::test::rt().block_on(control_request_rejects_self_then_relays_case())
+    }
+
+    async fn control_request_rejects_self_then_relays_case() {
         let (harness, channel, uvc, user_a, token_b, user_b) = setup().await;
 
         create_voice_state(&uvc, &user_a.id, Timestamp::now_utc())

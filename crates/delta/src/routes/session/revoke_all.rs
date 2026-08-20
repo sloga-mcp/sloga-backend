@@ -35,8 +35,12 @@ mod tests {
     use revolt_database::{MFATicket, Totp};
     use rocket::http::{Header, Status};
 
-    #[rocket::async_test]
-    async fn success() {
+    #[test]
+    fn success() {
+        crate::util::test::rt().block_on(success_case())
+    }
+
+    async fn success_case() {
         let harness = TestHarness::new().await;
         let (account, session, _) = harness.new_user().await;
 
@@ -65,8 +69,12 @@ mod tests {
             .is_empty());
     }
 
-    #[rocket::async_test]
-    async fn success_not_including_self() {
+    #[test]
+    fn success_not_including_self() {
+        crate::util::test::rt().block_on(success_not_including_self_case())
+    }
+
+    async fn success_not_including_self_case() {
         let harness = TestHarness::new().await;
         let (account, session, _) = harness.new_user().await;
 
@@ -97,8 +105,12 @@ mod tests {
         assert_eq!(sessions[0].id, session.id);
     }
 
-    #[rocket::async_test]
-    async fn success_mfa() {
+    #[test]
+    fn success_mfa() {
+        crate::util::test::rt().block_on(success_mfa_case())
+    }
+
+    async fn success_mfa_case() {
         let harness = TestHarness::new().await;
         let (mut account, session, _) = harness.new_user().await;
 
@@ -134,8 +146,12 @@ mod tests {
             .is_empty());
     }
 
-    #[rocket::async_test]
-    async fn success_not_including_self_mfa() {
+    #[test]
+    fn success_not_including_self_mfa() {
+        crate::util::test::rt().block_on(success_not_including_self_mfa_case())
+    }
+
+    async fn success_not_including_self_mfa_case() {
         let harness = TestHarness::new().await;
         let (mut account, session, _) = harness.new_user().await;
 
@@ -173,8 +189,12 @@ mod tests {
         assert_eq!(sessions[0].id, session.id);
     }
 
-    #[rocket::async_test]
-    async fn fail_mfa() {
+    #[test]
+    fn fail_mfa() {
+        crate::util::test::rt().block_on(fail_mfa_case())
+    }
+
+    async fn fail_mfa_case() {
         let harness = TestHarness::new().await;
         let (mut account, session, _) = harness.new_user().await;
 

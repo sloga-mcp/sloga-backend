@@ -143,8 +143,12 @@ mod tests {
     use crate::util::test::TestHarness;
     use rocket::http::Status;
 
-    #[rocket::async_test]
-    async fn callback_redirects_with_error_when_disabled() {
+    #[test]
+    fn callback_redirects_with_error_when_disabled() {
+        crate::util::test::rt().block_on(callback_redirects_with_error_when_disabled_case())
+    }
+
+    async fn callback_redirects_with_error_when_disabled_case() {
         let harness = TestHarness::new().await;
 
         let res = harness

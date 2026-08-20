@@ -187,8 +187,12 @@ mod tests {
     use revolt_models::v0;
     use revolt_result::{Error, ErrorType};
 
-    #[rocket::async_test]
-    async fn success() {
+    #[test]
+    fn success() {
+        crate::util::test::rt().block_on(success_case())
+    }
+
+    async fn success_case() {
         let mut harness = TestHarness::new().await;
 
         let account = Account::new(
@@ -240,8 +244,12 @@ mod tests {
         }
     }
 
-    #[rocket::async_test]
-    async fn success_totp_mfa() {
+    #[test]
+    fn success_totp_mfa() {
+        crate::util::test::rt().block_on(success_totp_mfa_case())
+    }
+
+    async fn success_totp_mfa_case() {
         let harness = TestHarness::new().await;
         let (mut account, _, _) = harness.new_user().await;
 
@@ -300,8 +308,12 @@ mod tests {
         }
     }
 
-    #[rocket::async_test]
-    async fn success_totp_stored_mfa() {
+    #[test]
+    fn success_totp_stored_mfa() {
+        crate::util::test::rt().block_on(success_totp_stored_mfa_case())
+    }
+
+    async fn success_totp_stored_mfa_case() {
         let harness = TestHarness::new().await;
         let (mut account, _, _) = harness.new_user().await;
 
@@ -335,8 +347,12 @@ mod tests {
         assert!(serde_json::from_str::<v0::Session>(&res.into_string().await.unwrap()).is_ok());
     }
 
-    #[rocket::async_test]
-    async fn fail_totp_invalid_mfa() {
+    #[test]
+    fn fail_totp_invalid_mfa() {
+        crate::util::test::rt().block_on(fail_totp_invalid_mfa_case())
+    }
+
+    async fn fail_totp_invalid_mfa_case() {
         let harness = TestHarness::new().await;
         let (mut account, _, _) = harness.new_user().await;
 
@@ -394,8 +410,12 @@ mod tests {
         }
     }
 
-    #[rocket::async_test]
-    async fn fail_invalid_user() {
+    #[test]
+    fn fail_invalid_user() {
+        crate::util::test::rt().block_on(fail_invalid_user_case())
+    }
+
+    async fn fail_invalid_user_case() {
         let harness = TestHarness::new().await;
 
         let res = harness.client
@@ -416,8 +436,12 @@ mod tests {
         ));
     }
 
-    #[rocket::async_test]
-    async fn fail_disabled_account() {
+    #[test]
+    fn fail_disabled_account() {
+        crate::util::test::rt().block_on(fail_disabled_account_case())
+    }
+
+    async fn fail_disabled_account_case() {
         let harness = TestHarness::new().await;
 
         let mut account = Account::new(
@@ -457,8 +481,12 @@ mod tests {
         ));
     }
 
-    #[rocket::async_test]
-    async fn fail_unverified_account() {
+    #[test]
+    fn fail_unverified_account() {
+        crate::util::test::rt().block_on(fail_unverified_account_case())
+    }
+
+    async fn fail_unverified_account_case() {
         let harness = TestHarness::new().await;
 
         let mut account = Account::new(
@@ -497,8 +525,12 @@ mod tests {
         ));
     }
 
-    #[rocket::async_test]
-    async fn fail_locked_account() {
+    #[test]
+    fn fail_locked_account() {
+        crate::util::test::rt().block_on(fail_locked_account_case())
+    }
+
+    async fn fail_locked_account_case() {
         let harness = TestHarness::new().await;
 
         let mut account = Account::new(

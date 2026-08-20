@@ -527,8 +527,12 @@ mod test {
         );
     }
 
-    #[rocket::async_test]
-    async fn move_into_full_mls_call_refused_and_member_exempt() {
+    #[test]
+    fn move_into_full_mls_call_refused_and_member_exempt() {
+        crate::util::test::rt().block_on(move_into_full_mls_call_refused_and_member_exempt_case())
+    }
+
+    async fn move_into_full_mls_call_refused_and_member_exempt_case() {
         let harness = TestHarness::new().await;
         let (_a, session_a, user_a) = harness.new_user().await; // moderator = server owner
         let (_b, _session_b, user_b) = harness.new_user().await; // target being moved
@@ -601,8 +605,12 @@ mod test {
             .expect("cleanup");
     }
 
-    #[rocket::async_test]
-    async fn move_into_full_video_call_refused() {
+    #[test]
+    fn move_into_full_video_call_refused() {
+        crate::util::test::rt().block_on(move_into_full_video_call_refused_case())
+    }
+
+    async fn move_into_full_video_call_refused_case() {
         let harness = TestHarness::new().await;
         let (_a, session_a, user_a) = harness.new_user().await;
         let (_b, _session_b, user_b) = harness.new_user().await;
@@ -744,8 +752,12 @@ mod test {
         (harness, session_a.token, server, user_b, uvc)
     }
 
-    #[rocket::async_test]
-    async fn server_mute_syncs_the_target_not_the_moderator() {
+    #[test]
+    fn server_mute_syncs_the_target_not_the_moderator() {
+        crate::util::test::rt().block_on(server_mute_syncs_the_target_not_the_moderator_case())
+    }
+
+    async fn server_mute_syncs_the_target_not_the_moderator_case() {
         let (harness, token, server, target, uvc) = muted_member_harness().await;
 
         edit_member(
@@ -769,8 +781,12 @@ mod test {
             .expect("cleanup");
     }
 
-    #[rocket::async_test]
-    async fn granting_a_voice_denying_role_syncs_the_target() {
+    #[test]
+    fn granting_a_voice_denying_role_syncs_the_target() {
+        crate::util::test::rt().block_on(granting_a_voice_denying_role_syncs_the_target_case())
+    }
+
+    async fn granting_a_voice_denying_role_syncs_the_target_case() {
         let (harness, token, server, target, uvc) = muted_member_harness().await;
 
         // A role that takes Speak away from whoever holds it.
@@ -808,8 +824,12 @@ mod test {
             .expect("cleanup");
     }
 
-    #[rocket::async_test]
-    async fn stripping_a_voice_granting_role_syncs_the_target() {
+    #[test]
+    fn stripping_a_voice_granting_role_syncs_the_target() {
+        crate::util::test::rt().block_on(stripping_a_voice_granting_role_syncs_the_target_case())
+    }
+
+    async fn stripping_a_voice_granting_role_syncs_the_target_case() {
         let harness = TestHarness::new().await;
         let (_a, session_a, user_a) = harness.new_user().await;
         let (_b, _session_b, user_b) = harness.new_user().await;
@@ -883,8 +903,12 @@ mod test {
             .expect("cleanup");
     }
 
-    #[rocket::async_test]
-    async fn timing_a_member_out_syncs_their_voice_permissions() {
+    #[test]
+    fn timing_a_member_out_syncs_their_voice_permissions() {
+        crate::util::test::rt().block_on(timing_a_member_out_syncs_their_voice_permissions_case())
+    }
+
+    async fn timing_a_member_out_syncs_their_voice_permissions_case() {
         let (harness, token, server, target, uvc) = muted_member_harness().await;
 
         let until = Timestamp::now_utc()
@@ -914,8 +938,12 @@ mod test {
 
     // ---- nickname slur filter --------------------------------------------
 
-    #[rocket::async_test]
-    async fn reject_slur_in_nickname() {
+    #[test]
+    fn reject_slur_in_nickname() {
+        crate::util::test::rt().block_on(reject_slur_in_nickname_case())
+    }
+
+    async fn reject_slur_in_nickname_case() {
         let harness = TestHarness::new().await;
         let (_, session, user) = harness.new_user().await;
         let (server, _channels) = harness.new_server(&user).await;
@@ -936,8 +964,12 @@ mod test {
         assert_eq!(response.status(), Status::BadRequest);
     }
 
-    #[rocket::async_test]
-    async fn allow_ordinary_nickname() {
+    #[test]
+    fn allow_ordinary_nickname() {
+        crate::util::test::rt().block_on(allow_ordinary_nickname_case())
+    }
+
+    async fn allow_ordinary_nickname_case() {
         let harness = TestHarness::new().await;
         let (_, session, user) = harness.new_user().await;
         let (server, _channels) = harness.new_server(&user).await;

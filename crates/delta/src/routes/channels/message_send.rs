@@ -168,8 +168,12 @@ mod test {
     use revolt_permissions::{ChannelPermission, OverrideField};
     use revolt_result::ErrorType;
 
-    #[rocket::async_test]
-    async fn message_mention_constraints() {
+    #[test]
+    fn message_mention_constraints() {
+        crate::util::test::rt().block_on(message_mention_constraints_case())
+    }
+
+    async fn message_mention_constraints_case() {
         let harness = TestHarness::new().await;
         let (_, _, user) = harness.new_user().await;
         let (_, _, second_user) = harness.new_user().await;
@@ -383,8 +387,12 @@ mod test {
         );
     }
 
-    #[rocket::async_test]
-    async fn message_reply() {
+    #[test]
+    fn message_reply() {
+        crate::util::test::rt().block_on(message_reply_case())
+    }
+
+    async fn message_reply_case() {
         let harness = TestHarness::new().await;
         let (_, _, user) = harness.new_user().await;
         let (server, channels) = harness.new_server(&user).await;
@@ -550,8 +558,12 @@ mod test {
         .expect_err("Created message with missing reply and none fail");
     }
 
-    #[rocket::async_test]
-    async fn mass_mentions_test() {
+    #[test]
+    fn mass_mentions_test() {
+        crate::util::test::rt().block_on(mass_mentions_test_case())
+    }
+
+    async fn mass_mentions_test_case() {
         let harness = TestHarness::new().await;
         let (_, _, user) = harness.new_user().await;
         let (_, _, other_user) = harness.new_user().await;

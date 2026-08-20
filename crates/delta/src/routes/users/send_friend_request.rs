@@ -71,8 +71,12 @@ mod tests {
     use revolt_models::v0;
     use rocket::http::{ContentType, Status};
 
-    #[rocket::async_test]
-    async fn note_rides_the_request_and_dies_on_accept() {
+    #[test]
+    fn note_rides_the_request_and_dies_on_accept() {
+        crate::util::test::rt().block_on(note_rides_the_request_and_dies_on_accept_case())
+    }
+
+    async fn note_rides_the_request_and_dies_on_accept_case() {
         let harness = TestHarness::new().await;
         let (_, session_a, user_a) = harness.new_user().await;
         let (_, session_b, user_b) = harness.new_user().await;
@@ -138,8 +142,12 @@ mod tests {
         assert!(relation.note.is_none());
     }
 
-    #[rocket::async_test]
-    async fn whitespace_only_note_is_treated_as_absent() {
+    #[test]
+    fn whitespace_only_note_is_treated_as_absent() {
+        crate::util::test::rt().block_on(whitespace_only_note_is_treated_as_absent_case())
+    }
+
+    async fn whitespace_only_note_is_treated_as_absent_case() {
         let harness = TestHarness::new().await;
         let (_, session_a, user_a) = harness.new_user().await;
         let (_, _, user_b) = harness.new_user().await;
@@ -171,8 +179,12 @@ mod tests {
         assert!(relation.note.is_none());
     }
 
-    #[rocket::async_test]
-    async fn slur_in_note_is_rejected() {
+    #[test]
+    fn slur_in_note_is_rejected() {
+        crate::util::test::rt().block_on(slur_in_note_is_rejected_case())
+    }
+
+    async fn slur_in_note_is_rejected_case() {
         let harness = TestHarness::new().await;
         let (_, session_a, _) = harness.new_user().await;
         let (_, _, user_b) = harness.new_user().await;
@@ -195,8 +207,12 @@ mod tests {
         assert_eq!(response.status(), Status::BadRequest);
     }
 
-    #[rocket::async_test]
-    async fn overlong_note_is_rejected() {
+    #[test]
+    fn overlong_note_is_rejected() {
+        crate::util::test::rt().block_on(overlong_note_is_rejected_case())
+    }
+
+    async fn overlong_note_is_rejected_case() {
         let harness = TestHarness::new().await;
         let (_, session_a, _) = harness.new_user().await;
         let (_, _, user_b) = harness.new_user().await;

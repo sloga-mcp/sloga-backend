@@ -103,8 +103,12 @@ mod test {
 
     use super::super::softres_reserve::test::create_sheet;
 
-    #[rocket::async_test]
-    async fn fetch_is_channel_scoped_and_bulk_returns_page() {
+    #[test]
+    fn fetch_is_channel_scoped_and_bulk_returns_page() {
+        crate::util::test::rt().block_on(fetch_is_channel_scoped_and_bulk_returns_page_case())
+    }
+
+    async fn fetch_is_channel_scoped_and_bulk_returns_page_case() {
         let harness = TestHarness::new().await;
         let (_, session, user) = harness.new_user().await;
         // NOT a member of the server below

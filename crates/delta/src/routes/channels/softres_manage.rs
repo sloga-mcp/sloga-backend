@@ -207,8 +207,12 @@ mod test {
 
     use super::super::softres_reserve::test::create_sheet;
 
-    #[rocket::async_test]
-    async fn edit_lock_and_unlock_flow() {
+    #[test]
+    fn edit_lock_and_unlock_flow() {
+        crate::util::test::rt().block_on(edit_lock_and_unlock_flow_case())
+    }
+
+    async fn edit_lock_and_unlock_flow_case() {
         let harness = TestHarness::new().await;
         let (_, session, user) = harness.new_user().await;
         let (_, other_session, other_user) = harness.new_user().await;

@@ -81,8 +81,12 @@ mod test {
         }
     }
 
-    #[rocket::async_test]
-    async fn cancel_is_author_only_and_pending_only() {
+    #[test]
+    fn cancel_is_author_only_and_pending_only() {
+        crate::util::test::rt().block_on(cancel_is_author_only_and_pending_only_case())
+    }
+
+    async fn cancel_is_author_only_and_pending_only_case() {
         let harness = TestHarness::new().await;
         let (_, session, user) = harness.new_user().await;
         let (_, other_session, other_user) = harness.new_user().await;

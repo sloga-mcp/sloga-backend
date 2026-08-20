@@ -21,8 +21,12 @@ mod tests {
     use revolt_result::ErrorType;
     use rocket::http::{Header, Status};
 
-    #[rocket::async_test]
-    async fn success() {
+    #[test]
+    fn success() {
+        crate::util::test::rt().block_on(success_case())
+    }
+
+    async fn success_case() {
         let mut harness = TestHarness::new().await;
         let (_, session, _) = harness.new_user().await;
 
@@ -55,8 +59,12 @@ mod tests {
         }
     }
 
-    #[rocket::async_test]
-    async fn fail_invalid_session() {
+    #[test]
+    fn fail_invalid_session() {
+        crate::util::test::rt().block_on(fail_invalid_session_case())
+    }
+
+    async fn fail_invalid_session_case() {
         let harness = TestHarness::new().await;
 
         let res = harness.client
@@ -68,8 +76,12 @@ mod tests {
         assert_eq!(res.status(), Status::Unauthorized);
     }
 
-    #[rocket::async_test]
-    async fn fail_no_session() {
+    #[test]
+    fn fail_no_session() {
+        crate::util::test::rt().block_on(fail_no_session_case())
+    }
+
+    async fn fail_no_session_case() {
         let harness = TestHarness::new().await;
 
         let res = harness.client.post("/auth/session/logout").dispatch().await;

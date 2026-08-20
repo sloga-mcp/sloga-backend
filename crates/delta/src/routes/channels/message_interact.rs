@@ -243,8 +243,12 @@ mod test {
         message
     }
 
-    #[rocket::async_test]
-    async fn interact_validates_and_fans_out() {
+    #[test]
+    fn interact_validates_and_fans_out() {
+        crate::util::test::rt().block_on(interact_validates_and_fans_out_case())
+    }
+
+    async fn interact_validates_and_fans_out_case() {
         let harness = TestHarness::new().await;
         let (_, session, user) = harness.new_user().await;
         let (server, _) = harness.new_server(&user).await;
@@ -331,8 +335,12 @@ mod test {
         revolt_presence::delete_session(&bot.id, presence_session).await;
     }
 
-    #[rocket::async_test]
-    async fn interact_rejects_non_bot_targets_and_kicked_bots() {
+    #[test]
+    fn interact_rejects_non_bot_targets_and_kicked_bots() {
+        crate::util::test::rt().block_on(interact_rejects_non_bot_targets_and_kicked_bots_case())
+    }
+
+    async fn interact_rejects_non_bot_targets_and_kicked_bots_case() {
         let harness = TestHarness::new().await;
         let (_, session, user) = harness.new_user().await;
         let (server, _) = harness.new_server(&user).await;
@@ -390,8 +398,12 @@ mod test {
         assert_eq!(response.status(), Status::NotFound);
     }
 
-    #[rocket::async_test]
-    async fn components_are_bot_only_on_send() {
+    #[test]
+    fn components_are_bot_only_on_send() {
+        crate::util::test::rt().block_on(components_are_bot_only_on_send_case())
+    }
+
+    async fn components_are_bot_only_on_send_case() {
         let harness = TestHarness::new().await;
         let (_, session, user) = harness.new_user().await;
         let (server, _) = harness.new_server(&user).await;
@@ -456,8 +468,12 @@ mod test {
         );
     }
 
-    #[rocket::async_test]
-    async fn interact_requires_view_channel() {
+    #[test]
+    fn interact_requires_view_channel() {
+        crate::util::test::rt().block_on(interact_requires_view_channel_case())
+    }
+
+    async fn interact_requires_view_channel_case() {
         let harness = TestHarness::new().await;
         let (_, _owner_session, owner) = harness.new_user().await;
         let (_, viewer_session, viewer) = harness.new_user().await;

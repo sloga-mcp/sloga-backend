@@ -237,8 +237,12 @@ mod test {
 
     /// Audit MAJOR 5: server_edit has no membership precondition, so every
     /// discovery arm must fail closed on its own.
-    #[rocket::async_test]
-    async fn discovery_gating_fail_closed() {
+    #[test]
+    fn discovery_gating_fail_closed() {
+        crate::util::test::rt().block_on(discovery_gating_fail_closed_case())
+    }
+
+    async fn discovery_gating_fail_closed_case() {
         let harness = TestHarness::new().await;
         let (_, owner_session, owner) = harness.new_user().await;
         let (_, member_session, member_user) = harness.new_user().await;

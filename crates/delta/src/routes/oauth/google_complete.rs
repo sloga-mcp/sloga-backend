@@ -44,8 +44,12 @@ mod tests {
     use revolt_result::{Error, ErrorType};
     use rocket::http::{ContentType, Status};
 
-    #[rocket::async_test]
-    async fn fail_unknown_handoff_code() {
+    #[test]
+    fn fail_unknown_handoff_code() {
+        crate::util::test::rt().block_on(fail_unknown_handoff_code_case())
+    }
+
+    async fn fail_unknown_handoff_code_case() {
         let harness = TestHarness::new().await;
 
         let res = harness
@@ -63,8 +67,12 @@ mod tests {
         ));
     }
 
-    #[rocket::async_test]
-    async fn fail_authorise_when_disabled() {
+    #[test]
+    fn fail_authorise_when_disabled() {
+        crate::util::test::rt().block_on(fail_authorise_when_disabled_case())
+    }
+
+    async fn fail_authorise_when_disabled_case() {
         let harness = TestHarness::new().await;
 
         // Config defaults ship with oauth disabled

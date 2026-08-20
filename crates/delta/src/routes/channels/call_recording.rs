@@ -314,8 +314,12 @@ mod test {
     /// The flag must round-trip through voice state — this is the leg that
     /// makes a LATE JOINER see an in-progress recording, since the joiner
     /// learns from the roster read and never sees the start event.
-    #[rocket::async_test]
-    async fn recording_flag_round_trips_through_voice_state() {
+    #[test]
+    fn recording_flag_round_trips_through_voice_state() {
+        crate::util::test::rt().block_on(recording_flag_round_trips_through_voice_state_case())
+    }
+
+    async fn recording_flag_round_trips_through_voice_state_case() {
         let harness = TestHarness::new().await;
         let (_, session, user) = harness.new_user().await;
         let (server, _channels) = harness.new_server(&user).await;
@@ -356,8 +360,12 @@ mod test {
     }
 
     /// A user who is not in the call cannot light (or clear) the indicator.
-    #[rocket::async_test]
-    async fn a_non_participant_cannot_claim_to_be_recording() {
+    #[test]
+    fn a_non_participant_cannot_claim_to_be_recording() {
+        crate::util::test::rt().block_on(a_non_participant_cannot_claim_to_be_recording_case())
+    }
+
+    async fn a_non_participant_cannot_claim_to_be_recording_case() {
         let harness = TestHarness::new().await;
         let (_, session_a, user_a) = harness.new_user().await;
         let (_, session_b, user_b) = harness.new_user().await;
@@ -387,8 +395,12 @@ mod test {
 
     /// Server channels gate on bit 42, and it is NOT in `DEFAULT_PERMISSION`
     /// — a plain member cannot record until a role grants it.
-    #[rocket::async_test]
-    async fn server_channel_gates_on_the_record_bit() {
+    #[test]
+    fn server_channel_gates_on_the_record_bit() {
+        crate::util::test::rt().block_on(server_channel_gates_on_the_record_bit_case())
+    }
+
+    async fn server_channel_gates_on_the_record_bit_case() {
         let harness = TestHarness::new().await;
         let (_, _session_a, user_a) = harness.new_user().await;
         let (_, session_b, user_b) = harness.new_user().await;
@@ -442,8 +454,12 @@ mod test {
 
     /// Revoking the bit mid-recording must not strand the indicator on: stop
     /// does not re-check the permission.
-    #[rocket::async_test]
-    async fn stop_works_after_the_bit_is_revoked() {
+    #[test]
+    fn stop_works_after_the_bit_is_revoked() {
+        crate::util::test::rt().block_on(stop_works_after_the_bit_is_revoked_case())
+    }
+
+    async fn stop_works_after_the_bit_is_revoked_case() {
         let harness = TestHarness::new().await;
         let (_, session, user) = harness.new_user().await;
         let (server, _channels) = harness.new_server(&user).await;
@@ -473,8 +489,12 @@ mod test {
 
     /// A group DM does not consult the bit at all — a non-owner member must
     /// be able to record (the H-5 rule remote control follows).
-    #[rocket::async_test]
-    async fn group_dm_does_not_gate_on_the_bit() {
+    #[test]
+    fn group_dm_does_not_gate_on_the_bit() {
+        crate::util::test::rt().block_on(group_dm_does_not_gate_on_the_bit_case())
+    }
+
+    async fn group_dm_does_not_gate_on_the_bit_case() {
         let harness = TestHarness::new().await;
         let (_, _session_a, user_a) = harness.new_user().await;
         let (_, session_b, user_b) = harness.new_user().await;
@@ -523,8 +543,12 @@ mod test {
 
     /// Leaving the call clears the claim, so a recorder who drops without
     /// pressing stop does not leave a permanent warning on the channel.
-    #[rocket::async_test]
-    async fn leaving_the_call_clears_the_recording_claim() {
+    #[test]
+    fn leaving_the_call_clears_the_recording_claim() {
+        crate::util::test::rt().block_on(leaving_the_call_clears_the_recording_claim_case())
+    }
+
+    async fn leaving_the_call_clears_the_recording_claim_case() {
         let harness = TestHarness::new().await;
         let (_, session, user) = harness.new_user().await;
         let (server, _channels) = harness.new_server(&user).await;

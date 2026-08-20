@@ -79,8 +79,12 @@ mod test {
     };
     use rocket::http::Status;
 
-    #[rocket::async_test]
-    async fn success_fetch_group_invite() {
+    #[test]
+    fn success_fetch_group_invite() {
+        crate::util::test::rt().block_on(success_fetch_group_invite_case())
+    }
+
+    async fn success_fetch_group_invite_case() {
         let harness = TestHarness::new().await;
         let (_, session, user) = harness.new_user().await;
 
@@ -128,8 +132,12 @@ mod test {
         }
     }
 
-    #[rocket::async_test]
-    async fn fail_fetch_missing_invite() {
+    #[test]
+    fn fail_fetch_missing_invite() {
+        crate::util::test::rt().block_on(fail_fetch_missing_invite_case())
+    }
+
+    async fn fail_fetch_missing_invite_case() {
         let harness = TestHarness::new().await;
         let response = harness
             .client
@@ -139,8 +147,12 @@ mod test {
         assert_eq!(response.status(), Status::NotFound);
     }
 
-    #[rocket::async_test]
-    async fn success_fetch_text_channel_invite() {
+    #[test]
+    fn success_fetch_text_channel_invite() {
+        crate::util::test::rt().block_on(success_fetch_text_channel_invite_case())
+    }
+
+    async fn success_fetch_text_channel_invite_case() {
         let harness = TestHarness::new().await;
         let (_, session, user) = harness.new_user().await;
         let (_, channels) = harness.new_server(&user).await;
@@ -180,8 +192,12 @@ mod test {
         };
     }
 
-    #[rocket::async_test]
-    async fn success_fetch_voice_channel_invite() {
+    #[test]
+    fn success_fetch_voice_channel_invite() {
+        crate::util::test::rt().block_on(success_fetch_voice_channel_invite_case())
+    }
+
+    async fn success_fetch_voice_channel_invite_case() {
         let harness = TestHarness::new().await;
         let (_, session, user) = harness.new_user().await;
         let (server, _) = harness.new_server(&user).await;

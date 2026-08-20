@@ -176,8 +176,12 @@ mod tests {
     use revolt_models::v0;
     use rocket::http::{ContentType, Status};
 
-    #[rocket::async_test]
-    async fn set_game_activity() {
+    #[test]
+    fn set_game_activity() {
+        crate::util::test::rt().block_on(set_game_activity_case())
+    }
+
+    async fn set_game_activity_case() {
         let harness = TestHarness::new().await;
         let (_, session, _) = harness.new_user().await;
 
@@ -212,8 +216,12 @@ mod tests {
         assert!(activity.started_at.is_some());
     }
 
-    #[rocket::async_test]
-    async fn reject_slur_in_display_name() {
+    #[test]
+    fn reject_slur_in_display_name() {
+        crate::util::test::rt().block_on(reject_slur_in_display_name_case())
+    }
+
+    async fn reject_slur_in_display_name_case() {
         let harness = TestHarness::new().await;
         let (_, session, _) = harness.new_user().await;
 
@@ -232,8 +240,12 @@ mod tests {
         assert_eq!(response.status(), Status::BadRequest);
     }
 
-    #[rocket::async_test]
-    async fn allow_display_name_that_merely_looks_like_one() {
+    #[test]
+    fn allow_display_name_that_merely_looks_like_one() {
+        crate::util::test::rt().block_on(allow_display_name_that_merely_looks_like_one_case())
+    }
+
+    async fn allow_display_name_that_merely_looks_like_one_case() {
         let harness = TestHarness::new().await;
         let (_, session, _) = harness.new_user().await;
 
@@ -255,8 +267,12 @@ mod tests {
         assert_eq!(user.display_name, Some("Spicy Nigerian Chef".to_string()));
     }
 
-    #[rocket::async_test]
-    async fn clear_game_activity() {
+    #[test]
+    fn clear_game_activity() {
+        crate::util::test::rt().block_on(clear_game_activity_case())
+    }
+
+    async fn clear_game_activity_case() {
         let harness = TestHarness::new().await;
         let (_, session, _) = harness.new_user().await;
 

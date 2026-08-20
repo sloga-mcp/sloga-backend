@@ -312,8 +312,12 @@ pub mod test {
         response.into_json().await.expect("`Message`")
     }
 
-    #[rocket::async_test]
-    async fn reserve_replace_and_retract() {
+    #[test]
+    fn reserve_replace_and_retract() {
+        crate::util::test::rt().block_on(reserve_replace_and_retract_case())
+    }
+
+    async fn reserve_replace_and_retract_case() {
         let harness = TestHarness::new().await;
         let (_, session, user) = harness.new_user().await;
         let (server, _) = harness.new_server(&user).await;
@@ -407,8 +411,12 @@ pub mod test {
         assert!(state.my_reserve.is_none());
     }
 
-    #[rocket::async_test]
-    async fn reserve_validation_rejects_bad_rows() {
+    #[test]
+    fn reserve_validation_rejects_bad_rows() {
+        crate::util::test::rt().block_on(reserve_validation_rejects_bad_rows_case())
+    }
+
+    async fn reserve_validation_rejects_bad_rows_case() {
         let harness = TestHarness::new().await;
         let (_, session, user) = harness.new_user().await;
         let (server, _) = harness.new_server(&user).await;
@@ -464,8 +472,12 @@ pub mod test {
         }
     }
 
-    #[rocket::async_test]
-    async fn per_item_cap_blocks_the_overflowing_reserve() {
+    #[test]
+    fn per_item_cap_blocks_the_overflowing_reserve() {
+        crate::util::test::rt().block_on(per_item_cap_blocks_the_overflowing_reserve_case())
+    }
+
+    async fn per_item_cap_blocks_the_overflowing_reserve_case() {
         let harness = TestHarness::new().await;
         let (_, session, user) = harness.new_user().await;
         let (_, other_session, other_user) = harness.new_user().await;
@@ -568,8 +580,12 @@ pub mod test {
         assert_eq!(response.status(), Status::Ok);
     }
 
-    #[rocket::async_test]
-    async fn hidden_sheet_gates_reserves_but_not_own_row() {
+    #[test]
+    fn hidden_sheet_gates_reserves_but_not_own_row() {
+        crate::util::test::rt().block_on(hidden_sheet_gates_reserves_but_not_own_row_case())
+    }
+
+    async fn hidden_sheet_gates_reserves_but_not_own_row_case() {
         let harness = TestHarness::new().await;
         let (_, session, user) = harness.new_user().await;
         let (_, other_session, other_user) = harness.new_user().await;

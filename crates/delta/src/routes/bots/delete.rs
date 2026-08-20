@@ -36,8 +36,12 @@ mod test {
     use revolt_database::{events::client::EventV1, Bot};
     use rocket::http::{Header, Status};
 
-    #[rocket::async_test]
-    async fn delete_bot() {
+    #[test]
+    fn delete_bot() {
+        crate::util::test::rt().block_on(delete_bot_case())
+    }
+
+    async fn delete_bot_case() {
         let mut harness = TestHarness::new().await;
         let (_, session, user) = harness.new_user().await;
 

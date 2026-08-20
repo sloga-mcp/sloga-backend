@@ -201,8 +201,12 @@ mod test {
     use rocket::http::{ContentType, Header, Status};
     use serde_json::json;
 
-    #[rocket::async_test]
-    async fn command_crud_and_ownership() {
+    #[test]
+    fn command_crud_and_ownership() {
+        crate::util::test::rt().block_on(command_crud_and_ownership_case())
+    }
+
+    async fn command_crud_and_ownership_case() {
         let harness = TestHarness::new().await;
         let (_, session, user) = harness.new_user().await;
         let (_, other_session, _) = harness.new_user().await;
@@ -303,8 +307,12 @@ mod test {
     /// A bot may manage its OWN commands with its bot token (hosted bots
     /// self-sync on boot); other bots' tokens and non-owner sessions stay
     /// locked out.
-    #[rocket::async_test]
-    async fn bot_manages_own_commands() {
+    #[test]
+    fn bot_manages_own_commands() {
+        crate::util::test::rt().block_on(bot_manages_own_commands_case())
+    }
+
+    async fn bot_manages_own_commands_case() {
         let harness = TestHarness::new().await;
         let (_, _, owner) = harness.new_user().await;
         let (_, other_session, other_user) = harness.new_user().await;

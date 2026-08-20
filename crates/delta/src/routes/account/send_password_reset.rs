@@ -60,8 +60,12 @@ mod tests {
     use revolt_models::v0;
     use rocket::http::{ContentType, Status};
 
-    #[rocket::async_test]
-    async fn success() {
+    #[test]
+    fn success() {
+        crate::util::test::rt().block_on(success_case())
+    }
+
+    async fn success_case() {
         let harness = TestHarness::new().await;
 
         Account::new(

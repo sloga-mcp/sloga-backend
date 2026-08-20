@@ -58,8 +58,12 @@ mod test {
     use rocket::http::{ContentType, Header, Status};
     use serde_json::json;
 
-    #[rocket::async_test]
-    async fn end_poll_finalises_results_and_rejects_votes() {
+    #[test]
+    fn end_poll_finalises_results_and_rejects_votes() {
+        crate::util::test::rt().block_on(end_poll_finalises_results_and_rejects_votes_case())
+    }
+
+    async fn end_poll_finalises_results_and_rejects_votes_case() {
         let harness = TestHarness::new().await;
         let (_, session, user) = harness.new_user().await;
         let (_, other_session, other_user) = harness.new_user().await;

@@ -54,8 +54,12 @@ mod test {
             .status()
     }
 
-    #[rocket::async_test]
-    async fn join_gated_on_discoverable_and_bans() {
+    #[test]
+    fn join_gated_on_discoverable_and_bans() {
+        crate::util::test::rt().block_on(join_gated_on_discoverable_and_bans_case())
+    }
+
+    async fn join_gated_on_discoverable_and_bans_case() {
         let harness = TestHarness::new().await;
         let (_, _, owner) = harness.new_user().await;
         let (_, joiner_session, joiner) = harness.new_user().await;
@@ -121,8 +125,12 @@ mod test {
 
     /// Regression: `can_acquire_server` used `count <= limit`, letting a
     /// user AT the cap join one more (limit+1 servers total).
-    #[rocket::async_test]
-    async fn join_rejected_at_server_cap() {
+    #[test]
+    fn join_rejected_at_server_cap() {
+        crate::util::test::rt().block_on(join_rejected_at_server_cap_case())
+    }
+
+    async fn join_rejected_at_server_cap_case() {
         let harness = TestHarness::new().await;
         let (_, _, owner) = harness.new_user().await;
         let (_, joiner_session, joiner) = harness.new_user().await;

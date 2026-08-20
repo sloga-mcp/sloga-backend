@@ -194,8 +194,12 @@ mod test {
         .expect("forum created")
     }
 
-    #[rocket::async_test]
-    async fn create_post_creates_thread_and_pinned_starter() {
+    #[test]
+    fn create_post_creates_thread_and_pinned_starter() {
+        crate::util::test::rt().block_on(create_post_creates_thread_and_pinned_starter_case())
+    }
+
+    async fn create_post_creates_thread_and_pinned_starter_case() {
         let harness = TestHarness::new().await;
         let (_, session, user) = harness.new_user().await;
         let (mut server, _) = harness.new_server(&user).await;
@@ -250,8 +254,12 @@ mod test {
         );
     }
 
-    #[rocket::async_test]
-    async fn create_post_enforces_tag_rules() {
+    #[test]
+    fn create_post_enforces_tag_rules() {
+        crate::util::test::rt().block_on(create_post_enforces_tag_rules_case())
+    }
+
+    async fn create_post_enforces_tag_rules_case() {
         let harness = TestHarness::new().await;
         let (_, session, user) = harness.new_user().await;
         let (mut server, _) = harness.new_server(&user).await;
@@ -325,8 +333,12 @@ mod test {
         assert_eq!(response.status(), Status::Ok);
     }
 
-    #[rocket::async_test]
-    async fn direct_message_send_to_forum_is_rejected() {
+    #[test]
+    fn direct_message_send_to_forum_is_rejected() {
+        crate::util::test::rt().block_on(direct_message_send_to_forum_is_rejected_case())
+    }
+
+    async fn direct_message_send_to_forum_is_rejected_case() {
         let harness = TestHarness::new().await;
         let (_, session, user) = harness.new_user().await;
         let (mut server, _) = harness.new_server(&user).await;

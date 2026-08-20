@@ -30,8 +30,12 @@ mod test {
     use revolt_database::{Bot, PartialBot};
     use revolt_models::v0;
 
-    #[rocket::async_test]
-    async fn fetch_public() {
+    #[test]
+    fn fetch_public() {
+        crate::util::test::rt().block_on(fetch_public_case())
+    }
+
+    async fn fetch_public_case() {
         let harness = TestHarness::new().await;
         let (_, _, user) = harness.new_user().await;
 

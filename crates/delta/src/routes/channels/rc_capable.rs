@@ -176,8 +176,12 @@ mod test {
     /// The claim must round-trip through voice state — that is the leg that
     /// lets a LATE-OPENED queue panel see who can take a turn, since the
     /// panel reads the roster, not the announce event.
-    #[rocket::async_test]
-    async fn rc_capable_requires_call_membership_and_persists() {
+    #[test]
+    fn rc_capable_requires_call_membership_and_persists() {
+        crate::util::test::rt().block_on(rc_capable_requires_call_membership_and_persists_case())
+    }
+
+    async fn rc_capable_requires_call_membership_and_persists_case() {
         let harness = TestHarness::new().await;
         let (_, session, user) = harness.new_user().await;
         let (server, _channels) = harness.new_server(&user).await;

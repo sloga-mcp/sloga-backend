@@ -174,8 +174,12 @@ async fn post_json<'a>(
         .await
 }
 
-#[rocket::async_test]
-async fn full_flow_create_join_commit_fanout() {
+#[test]
+fn full_flow_create_join_commit_fanout() {
+    crate::util::test::rt().block_on(full_flow_create_join_commit_fanout_case())
+}
+
+async fn full_flow_create_join_commit_fanout_case() {
     let mut harness = TestHarness::new().await;
     let (account_a, session_a, user_a) = harness.new_user().await;
     let (account_b, session_b, user_b) = harness.new_user().await;
@@ -447,8 +451,12 @@ async fn full_flow_create_join_commit_fanout() {
     assert_eq!(response.status(), Status::NotFound);
 }
 
-#[rocket::async_test]
-async fn rejoin_affordance_flags_and_solo_close() {
+#[test]
+fn rejoin_affordance_flags_and_solo_close() {
+    crate::util::test::rt().block_on(rejoin_affordance_flags_and_solo_close_case())
+}
+
+async fn rejoin_affordance_flags_and_solo_close_case() {
     let mut harness = TestHarness::new().await;
     let (account_a, session_a, user_a) = harness.new_user().await;
     let (account_b, session_b, user_b) = harness.new_user().await;
@@ -609,8 +617,12 @@ async fn rejoin_affordance_flags_and_solo_close() {
     }
 }
 
-#[rocket::async_test]
-async fn voice_participant_identity_mapping_round_trips() {
+#[test]
+fn voice_participant_identity_mapping_round_trips() {
+    crate::util::test::rt().block_on(voice_participant_identity_mapping_round_trips_case())
+}
+
+async fn voice_participant_identity_mapping_round_trips_case() {
     use revolt_database::voice::{
         clear_voice_participant_identities, delete_voice_participant_identity,
         get_voice_participant_identity, set_voice_participant_identity,
@@ -658,8 +670,12 @@ async fn voice_participant_identity_mapping_round_trips() {
     );
 }
 
-#[rocket::async_test]
-async fn strangers_without_shared_channel_cannot_claim_or_create() {
+#[test]
+fn strangers_without_shared_channel_cannot_claim_or_create() {
+    crate::util::test::rt().block_on(strangers_without_shared_channel_cannot_claim_or_create_case())
+}
+
+async fn strangers_without_shared_channel_cannot_claim_or_create_case() {
     let harness = TestHarness::new().await;
     let (account_a, session_a, user_a) = harness.new_user().await;
     let (account_b, session_b, user_b) = harness.new_user().await;
@@ -774,8 +790,12 @@ async fn strangers_without_shared_channel_cannot_claim_or_create() {
     ));
 }
 
-#[rocket::async_test]
-async fn blocked_pair_in_shared_channel_cannot_claim() {
+#[test]
+fn blocked_pair_in_shared_channel_cannot_claim() {
+    crate::util::test::rt().block_on(blocked_pair_in_shared_channel_cannot_claim_case())
+}
+
+async fn blocked_pair_in_shared_channel_cannot_claim_case() {
     let harness = TestHarness::new().await;
     let (account_a, session_a, user_a) = harness.new_user().await;
     let (account_b, session_b, user_b) = harness.new_user().await;
@@ -854,8 +874,12 @@ async fn blocked_pair_in_shared_channel_cannot_claim() {
     ));
 }
 
-#[rocket::async_test]
-async fn publish_validates_binding_caps_and_immutability() {
+#[test]
+fn publish_validates_binding_caps_and_immutability() {
+    crate::util::test::rt().block_on(publish_validates_binding_caps_and_immutability_case())
+}
+
+async fn publish_validates_binding_caps_and_immutability_case() {
     let harness = TestHarness::new().await;
     let (account, session, user) = harness.new_user().await;
 
@@ -954,8 +978,12 @@ async fn post_put_publish<'a>(
         .await
 }
 
-#[rocket::async_test]
-async fn join_intent_signature_one_device_and_rate_limit() {
+#[test]
+fn join_intent_signature_one_device_and_rate_limit() {
+    crate::util::test::rt().block_on(join_intent_signature_one_device_and_rate_limit_case())
+}
+
+async fn join_intent_signature_one_device_and_rate_limit_case() {
     let harness = TestHarness::new().await;
     let (account_a, session_a, user_a) = harness.new_user().await;
     let (account_b, session_b, user_b) = harness.new_user().await;
@@ -1064,8 +1092,12 @@ async fn join_intent_signature_one_device_and_rate_limit() {
     assert_eq!(response.status(), Status::TooManyRequests);
 }
 
-#[rocket::async_test]
-async fn commit_size_caps_and_welcome_pairing() {
+#[test]
+fn commit_size_caps_and_welcome_pairing() {
+    crate::util::test::rt().block_on(commit_size_caps_and_welcome_pairing_case())
+}
+
+async fn commit_size_caps_and_welcome_pairing_case() {
     let harness = TestHarness::new().await;
     let (account_a, session_a, user_a) = harness.new_user().await;
     let (account_b, session_b, user_b) = harness.new_user().await;
@@ -1207,8 +1239,12 @@ async fn commit_size_caps_and_welcome_pairing() {
     assert_eq!(response.status(), Status::UnprocessableEntity);
 }
 
-#[rocket::async_test]
-async fn fanout_skips_devices_over_queue_budget() {
+#[test]
+fn fanout_skips_devices_over_queue_budget() {
+    crate::util::test::rt().block_on(fanout_skips_devices_over_queue_budget_case())
+}
+
+async fn fanout_skips_devices_over_queue_budget_case() {
     let harness = TestHarness::new().await;
     let (account_a, session_a, user_a) = harness.new_user().await;
     let (account_b, session_b, user_b) = harness.new_user().await;
@@ -1358,8 +1394,12 @@ async fn seed_group_with_members(
     assert_eq!(response.status(), Status::Ok, "seed commit must win");
 }
 
-#[rocket::async_test]
-async fn ctl_messages_member_gated_capped_and_fanned_out() {
+#[test]
+fn ctl_messages_member_gated_capped_and_fanned_out() {
+    crate::util::test::rt().block_on(ctl_messages_member_gated_capped_and_fanned_out_case())
+}
+
+async fn ctl_messages_member_gated_capped_and_fanned_out_case() {
     let harness = TestHarness::new().await;
     let (account_a, session_a, user_a) = harness.new_user().await;
     let (account_b, session_b, user_b) = harness.new_user().await;
@@ -1491,8 +1531,12 @@ async fn ctl_messages_member_gated_capped_and_fanned_out() {
     assert_eq!(limited.status(), Status::TooManyRequests);
 }
 
-#[rocket::async_test]
-async fn open_group_probe_access_and_absence() {
+#[test]
+fn open_group_probe_access_and_absence() {
+    crate::util::test::rt().block_on(open_group_probe_access_and_absence_case())
+}
+
+async fn open_group_probe_access_and_absence_case() {
     let harness = TestHarness::new().await;
     let (account_a, session_a, user_a) = harness.new_user().await;
     let (_account_s, session_s, _user_s) = harness.new_user().await; // stranger
@@ -1548,8 +1592,12 @@ async fn open_group_probe_access_and_absence() {
     );
 }
 
-#[rocket::async_test]
-async fn join_intent_call_full_boundary_and_rejoin_exemption() {
+#[test]
+fn join_intent_call_full_boundary_and_rejoin_exemption() {
+    crate::util::test::rt().block_on(join_intent_call_full_boundary_and_rejoin_exemption_case())
+}
+
+async fn join_intent_call_full_boundary_and_rejoin_exemption_case() {
     let harness = TestHarness::new().await;
     let (account_a, session_a, user_a) = harness.new_user().await;
     let (account_b, session_b, user_b) = harness.new_user().await;
@@ -1670,8 +1718,12 @@ async fn join_intent_call_full_boundary_and_rejoin_exemption() {
     );
 }
 
-#[rocket::async_test]
-async fn flag_off_rejects_every_route() {
+#[test]
+fn flag_off_rejects_every_route() {
+    crate::util::test::rt().block_on(flag_off_rejects_every_route_case())
+}
+
+async fn flag_off_rejects_every_route_case() {
     // overwrite_config is once-per-process and must run BEFORE the harness
     // primes the config cache (the create_account.rs test convention) —
     // process isolation comes from nextest; under plain `cargo test` this

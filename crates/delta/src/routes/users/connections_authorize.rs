@@ -115,8 +115,12 @@ mod tests {
     use revolt_result::{Error, ErrorType};
     use rocket::http::Status;
 
-    #[rocket::async_test]
-    async fn fail_authorize_when_disabled() {
+    #[test]
+    fn fail_authorize_when_disabled() {
+        crate::util::test::rt().block_on(fail_authorize_when_disabled_case())
+    }
+
+    async fn fail_authorize_when_disabled_case() {
         let harness = TestHarness::new().await;
         let (_, session, _) = harness.new_user().await;
 
@@ -134,8 +138,12 @@ mod tests {
         }
     }
 
-    #[rocket::async_test]
-    async fn fail_authorize_unknown_platform() {
+    #[test]
+    fn fail_authorize_unknown_platform() {
+        crate::util::test::rt().block_on(fail_authorize_unknown_platform_case())
+    }
+
+    async fn fail_authorize_unknown_platform_case() {
         let harness = TestHarness::new().await;
         let (_, session, _) = harness.new_user().await;
 

@@ -44,8 +44,12 @@ mod test {
     use revolt_models::v0::DataCreateGroup;
     use rocket::http::{Header, Status};
 
-    #[rocket::async_test]
-    async fn success_ack_channel() {
+    #[test]
+    fn success_ack_channel() {
+        crate::util::test::rt().block_on(success_ack_channel_case())
+    }
+
+    async fn success_ack_channel_case() {
         let mut harness = TestHarness::new().await;
         let (_, session, user) = harness.new_user().await;
 

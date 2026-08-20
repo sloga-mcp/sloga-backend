@@ -258,8 +258,12 @@ mod test {
     /// Membership, live-stream and CONSENT refusals, in gate order. The
     /// consent refusal is the §2.4 enforcement point: everything else about
     /// the request is valid, only the allowlist entry is missing.
-    #[rocket::async_test]
-    async fn annotation_gates_membership_share_and_consent() {
+    #[test]
+    fn annotation_gates_membership_share_and_consent() {
+        crate::util::test::rt().block_on(annotation_gates_membership_share_and_consent_case())
+    }
+
+    async fn annotation_gates_membership_share_and_consent_case() {
         let (harness, channel, uvc, user_a, token_b, user_b) = setup().await;
 
         // Annotator not in the call: refused.
@@ -307,8 +311,12 @@ mod test {
 
     /// The allowed path relays; self-annotation and malformed strokes are
     /// refused even WITH consent (validation is not a consent question).
-    #[rocket::async_test]
-    async fn annotation_relays_when_allowed_and_validates_strokes() {
+    #[test]
+    fn annotation_relays_when_allowed_and_validates_strokes() {
+        crate::util::test::rt().block_on(annotation_relays_when_allowed_and_validates_strokes_case())
+    }
+
+    async fn annotation_relays_when_allowed_and_validates_strokes_case() {
         let (harness, channel, uvc, user_a, token_b, user_b) = setup().await;
 
         create_voice_state(&uvc, &user_a.id, Timestamp::now_utc())

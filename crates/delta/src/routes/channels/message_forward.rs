@@ -270,8 +270,12 @@ mod test {
     use rocket::http::{ContentType, Header, Status};
     use serde_json::json;
 
-    #[rocket::async_test]
-    async fn forward_carries_snapshot_and_requires_source_read() {
+    #[test]
+    fn forward_carries_snapshot_and_requires_source_read() {
+        crate::util::test::rt().block_on(forward_carries_snapshot_and_requires_source_read_case())
+    }
+
+    async fn forward_carries_snapshot_and_requires_source_read_case() {
         let harness = TestHarness::new().await;
         let (_, session, user) = harness.new_user().await;
         let (server, channels) = harness.new_server(&user).await;
@@ -307,8 +311,12 @@ mod test {
         assert!(snapshot.original_sent_at > 0);
     }
 
-    #[rocket::async_test]
-    async fn forward_of_forward_keeps_first_hop_provenance() {
+    #[test]
+    fn forward_of_forward_keeps_first_hop_provenance() {
+        crate::util::test::rt().block_on(forward_of_forward_keeps_first_hop_provenance_case())
+    }
+
+    async fn forward_of_forward_keeps_first_hop_provenance_case() {
         let harness = TestHarness::new().await;
         let (_, session, user) = harness.new_user().await;
         let (server, channels) = harness.new_server(&user).await;
@@ -354,8 +362,12 @@ mod test {
         assert_eq!(snapshot.channel_id, source_channel.id());
     }
 
-    #[rocket::async_test]
-    async fn forward_denied_without_source_visibility() {
+    #[test]
+    fn forward_denied_without_source_visibility() {
+        crate::util::test::rt().block_on(forward_denied_without_source_visibility_case())
+    }
+
+    async fn forward_denied_without_source_visibility_case() {
         let harness = TestHarness::new().await;
         let (_, _, owner) = harness.new_user().await;
         let (_, other_session, other_user) = harness.new_user().await;
@@ -400,8 +412,12 @@ mod test {
         );
     }
 
-    #[rocket::async_test]
-    async fn regular_send_cannot_forge_forwarded_snapshot() {
+    #[test]
+    fn regular_send_cannot_forge_forwarded_snapshot() {
+        crate::util::test::rt().block_on(regular_send_cannot_forge_forwarded_snapshot_case())
+    }
+
+    async fn regular_send_cannot_forge_forwarded_snapshot_case() {
         let harness = TestHarness::new().await;
         let (_, session, user) = harness.new_user().await;
         let (server, _) = harness.new_server(&user).await;

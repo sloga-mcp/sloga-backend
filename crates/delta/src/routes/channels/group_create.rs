@@ -46,8 +46,12 @@ mod test {
     use revolt_models::v0;
     use rocket::http::{ContentType, Header, Status};
 
-    #[rocket::async_test]
-    async fn create_group() {
+    #[test]
+    fn create_group() {
+        crate::util::test::rt().block_on(create_group_case())
+    }
+
+    async fn create_group_case() {
         let mut harness = TestHarness::new().await;
         let (_, session, user) = harness.new_user().await;
 

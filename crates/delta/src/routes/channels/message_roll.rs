@@ -121,8 +121,12 @@ mod test {
     use rocket::http::{ContentType, Header, Status};
     use serde_json::json;
 
-    #[rocket::async_test]
-    async fn roll_dice_creates_flagged_message() {
+    #[test]
+    fn roll_dice_creates_flagged_message() {
+        crate::util::test::rt().block_on(roll_dice_creates_flagged_message_case())
+    }
+
+    async fn roll_dice_creates_flagged_message_case() {
         let harness = TestHarness::new().await;
         let (_, session, user) = harness.new_user().await;
         let (server, _) = harness.new_server(&user).await;
@@ -165,8 +169,12 @@ mod test {
         assert!((5..=15).contains(&total), "total out of range: {total}");
     }
 
-    #[rocket::async_test]
-    async fn roll_dice_rejects_invalid_notation() {
+    #[test]
+    fn roll_dice_rejects_invalid_notation() {
+        crate::util::test::rt().block_on(roll_dice_rejects_invalid_notation_case())
+    }
+
+    async fn roll_dice_rejects_invalid_notation_case() {
         let harness = TestHarness::new().await;
         let (_, session, user) = harness.new_user().await;
         let (server, _) = harness.new_server(&user).await;
@@ -190,8 +198,12 @@ mod test {
         }
     }
 
-    #[rocket::async_test]
-    async fn regular_send_cannot_forge_dice_flag() {
+    #[test]
+    fn regular_send_cannot_forge_dice_flag() {
+        crate::util::test::rt().block_on(regular_send_cannot_forge_dice_flag_case())
+    }
+
+    async fn regular_send_cannot_forge_dice_flag_case() {
         let harness = TestHarness::new().await;
         let (_, session, user) = harness.new_user().await;
         let (server, _) = harness.new_server(&user).await;

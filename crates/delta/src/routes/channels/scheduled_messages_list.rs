@@ -68,8 +68,12 @@ mod test {
         }
     }
 
-    #[rocket::async_test]
-    async fn list_is_strictly_author_scoped() {
+    #[test]
+    fn list_is_strictly_author_scoped() {
+        crate::util::test::rt().block_on(list_is_strictly_author_scoped_case())
+    }
+
+    async fn list_is_strictly_author_scoped_case() {
         let harness = TestHarness::new().await;
         let (_, session, user) = harness.new_user().await;
         let (_, _, other_user) = harness.new_user().await;

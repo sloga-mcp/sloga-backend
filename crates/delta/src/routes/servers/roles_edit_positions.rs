@@ -87,8 +87,12 @@ mod test {
 
     use crate::util::test::TestHarness;
 
-    #[rocket::async_test]
-    async fn edit_role_rankings() {
+    #[test]
+    fn edit_role_rankings() {
+        crate::util::test::rt().block_on(edit_role_rankings_case())
+    }
+
+    async fn edit_role_rankings_case() {
         let harness = TestHarness::new().await;
 
         fixture!(harness.db, "server_with_many_roles",

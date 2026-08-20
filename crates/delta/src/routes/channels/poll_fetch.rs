@@ -128,8 +128,12 @@ mod test {
     use rocket::http::{ContentType, Header, Status};
     use serde_json::json;
 
-    #[rocket::async_test]
-    async fn results_hidden_until_vote_and_public_after_close() {
+    #[test]
+    fn results_hidden_until_vote_and_public_after_close() {
+        crate::util::test::rt().block_on(results_hidden_until_vote_and_public_after_close_case())
+    }
+
+    async fn results_hidden_until_vote_and_public_after_close_case() {
         let harness = TestHarness::new().await;
         let (_, session, user) = harness.new_user().await;
         let (_, other_session, other_user) = harness.new_user().await;
@@ -228,8 +232,12 @@ mod test {
         assert_eq!(other_user.id, other_user.id);
     }
 
-    #[rocket::async_test]
-    async fn outsider_and_cross_channel_access_rejected() {
+    #[test]
+    fn outsider_and_cross_channel_access_rejected() {
+        crate::util::test::rt().block_on(outsider_and_cross_channel_access_rejected_case())
+    }
+
+    async fn outsider_and_cross_channel_access_rejected_case() {
         let harness = TestHarness::new().await;
         let (_, session, user) = harness.new_user().await;
         // NOT a member of the server below
@@ -299,8 +307,12 @@ mod test {
         );
     }
 
-    #[rocket::async_test]
-    async fn bulk_fetch_gates_per_poll() {
+    #[test]
+    fn bulk_fetch_gates_per_poll() {
+        crate::util::test::rt().block_on(bulk_fetch_gates_per_poll_case())
+    }
+
+    async fn bulk_fetch_gates_per_poll_case() {
         let harness = TestHarness::new().await;
         let (_, session, user) = harness.new_user().await;
         let (server, _) = harness.new_server(&user).await;
