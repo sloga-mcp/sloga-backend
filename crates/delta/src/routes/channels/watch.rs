@@ -639,4 +639,102 @@ mod test {
             .expect("session read")
             .is_none());
     }
+
+    /// Fan-out boundary (plan §1.2): watch events ride the PRIVATE topics of
+    /// the call's members, never the channel topic — a member of the same
+    /// server who is not in the call (a text-channel-only account) must see
+    /// nothing at all, while a call member sees update AND end.
+    #[rocket::async_test]
+    async fn watch_events_fan_to_call_members_only() {
+        use revolt_database::events::client::EventV1;
+        use rocket::futures::StreamExt;
+
+        let (harness, channel, uvc, user_a, token_a, user_b, _token_b, user_c, _token_c) =
+            setup().await;
+        let topic_b = format!("{}!", user_b.id);
+        let topic_c = format!("{}!", user_c.id);
+
+        // Subscribe BEFORE any watch traffic so nothing is missed.
+        let mut pubsub = redis_kiss::open_pubsub_connection()
+            .await
+            .expect("pubsub connection");
+        pubsub.subscribe(&topic_b).await.expect("subscribe b");
+        pubsub.subscribe(&topic_c).await.expect("subscribe c");
+
+        // create → fans an update; host PATCH → fans an update; host
+        // DELETE → fans an end.
+        let response = harness
+            .client
+            .post(format!("/channels/{}/watch", channel.id()))
+            .header(ContentType::JSON)
+            .header(Header::new("x-session-token", token_a.clone()))
+            .body(yt("YE7VzlLtp-4").to_string())
+            .dispatch()
+            .await;
+        assert_eq!(response.status(), Status::Ok);
+        let created: v0::WatchSessionResponse =
+            response.into_json().await.expect("create response");
+        let response = harness
+            .client
+            .patch(format!("/channels/{}/watch", channel.id()))
+            .header(ContentType::JSON)
+            .header(Header::new("x-session-token", token_a.clone()))
+            .body(
+                serde_json::json!({ "playing": true, "position_ms": 1000, "rate_permille": 1000 })
+                    .to_string(),
+            )
+            .dispatch()
+            .await;
+        assert_eq!(response.status(), Status::Ok);
+        let response = harness
+            .client
+            .delete(format!("/channels/{}/watch", channel.id()))
+            .header(Header::new("x-session-token", token_a.clone()))
+            .dispatch()
+            .await;
+        assert_eq!(response.status(), Status::NoContent);
+
+        // Drain until quiet. ANY message on C's topic is the leak this test
+        // exists to catch; on B's topic, count the watch events for this
+        // session (unrelated traffic on the shared Redis is ignored). The
+        // final 2 s quiet window after the last expected event doubles as
+        // the chance for a trailing leak to C to surface.
+        let mut b_updates = 0u32;
+        let mut b_ends = 0u32;
+        {
+            let mut stream = pubsub.on_message();
+            while let Ok(Some(msg)) =
+                tokio::time::timeout(std::time::Duration::from_secs(2), stream.next()).await
+            {
+                let topic = msg.get_channel_name().to_string();
+                assert_ne!(
+                    topic, topic_c,
+                    "watch event leaked to a server member who is not in the call"
+                );
+                if topic != topic_b {
+                    continue;
+                }
+                match redis_kiss::decode_payload::<EventV1>(&msg) {
+                    Ok(EventV1::WatchSessionUpdate { session, .. })
+                        if session.id == created.session.id =>
+                    {
+                        b_updates += 1;
+                    }
+                    Ok(EventV1::WatchSessionEnd { id, .. }) if id == created.session.id => {
+                        b_ends += 1;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        assert!(
+            b_updates >= 2,
+            "call member must receive the create and PATCH updates, got {b_updates}"
+        );
+        assert_eq!(b_ends, 1, "call member must receive the end event");
+
+        delete_channel_voice_state(&uvc, &[user_a.id.clone(), user_b.id.clone()])
+            .await
+            .expect("teardown");
+    }
 }

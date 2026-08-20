@@ -212,3 +212,101 @@ pub async fn end_watch_session_for_channel(channel: &UserVoiceChannel) {
         Err(error) => log::warn!("watch: failed to end session for {}: {error:?}", channel.id),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use revolt_models::v0::WatchMedia;
+
+    /// One runtime shared by every Redis-backed test in this module — same
+    /// rationale as the voice/mod.rs tests: `redis_kiss` pools connections
+    /// in a GLOBAL mobc pool, and a connection created on one
+    /// per-test runtime dies with it, poisoning the next test's draw.
+    fn rt() -> &'static tokio::runtime::Runtime {
+        static RT: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
+        RT.get_or_init(|| {
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .enable_all()
+                .build()
+                .unwrap()
+        })
+    }
+
+    fn media() -> WatchMedia {
+        WatchMedia::YouTube {
+            video_id: "YE7VzlLtp-4".to_string(),
+            title: None,
+        }
+    }
+
+    /// TTL discipline (plan §1): create arms the TTL, every write re-arms
+    /// it, and a lapsed session is simply GONE — fetch reports None
+    /// (passive GC, no event) and the channel is free for a fresh create
+    /// rather than wedged on a stale key until an operator intervenes.
+    #[test]
+    fn watch_session_ttl_expiry() {
+        rt().block_on(ttl_case())
+    }
+
+    async fn ttl_case() {
+        // Unique id so parallel runs against the shared Redis don't collide.
+        let channel_id = ulid::Ulid::new().to_string();
+        let created = create_watch_session(&channel_id, "host", media())
+            .await
+            .expect("create")
+            .expect("fresh channel must accept a session");
+
+        let mut conn = get_connection().await.expect("redis");
+        let ttl: i64 = conn.ttl(session_key(&channel_id)).await.expect("ttl");
+        assert!(
+            ttl > 0 && ttl <= WATCH_SESSION_TTL_SECS as i64,
+            "create must arm the session TTL, got {ttl}"
+        );
+        let seq_ttl: i64 = conn.ttl(seq_key(&channel_id)).await.expect("seq ttl");
+        assert!(
+            seq_ttl > 0 && seq_ttl <= WATCH_SESSION_TTL_SECS as i64,
+            "the seq counter must not be immortal, got {seq_ttl}"
+        );
+
+        // Every write re-arms: shrink the TTL, write, and it is full again.
+        let _: () = conn
+            .expire(session_key(&channel_id), 5)
+            .await
+            .expect("shrink");
+        let updated = update_watch_session(&channel_id, |s| s.playing = true)
+            .await
+            .expect("update")
+            .expect("session still there");
+        assert!(updated.seq > created.seq);
+        let ttl: i64 = conn.ttl(session_key(&channel_id)).await.expect("ttl");
+        assert!(ttl > 5, "a write must refresh the TTL, got {ttl}");
+
+        // Lapse both keys: the session is gone with no event (passive GC) …
+        let _: () = conn
+            .pexpire(session_key(&channel_id), 1)
+            .await
+            .expect("lapse session");
+        let _: () = conn
+            .pexpire(seq_key(&channel_id), 1)
+            .await
+            .expect("lapse seq");
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            fetch_watch_session(&channel_id)
+                .await
+                .expect("fetch")
+                .is_none(),
+            "an expired session must read as absent"
+        );
+
+        // … and the channel is NOT wedged: SET NX succeeds again.
+        let recreated = create_watch_session(&channel_id, "host", media())
+            .await
+            .expect("re-create")
+            .expect("expiry must free the channel for a fresh session");
+        assert_ne!(recreated.id, created.id);
+
+        delete_watch_session(&channel_id).await.expect("cleanup");
+    }
+}
