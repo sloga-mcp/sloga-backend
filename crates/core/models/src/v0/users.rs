@@ -460,6 +460,22 @@ auto_derived_partial!(
         /// them who is in the call.
         #[serde(default)]
         pub rc_capable: bool,
+        /// True while this participant has the channel's watch-together
+        /// session attached (watch-together plan §7.3, 4b). Additive field,
+        /// hence the default.
+        ///
+        /// CLIENT-CLAIMED, like `recording`/`rc_capable`: written by the
+        /// `watching` route, not by voice-ingress — only the client knows
+        /// whether its player is actually up. It is a bare roster boolean:
+        /// WHAT is being watched stays on the private watch fan-out; this
+        /// flag only says "in a watch party", which is the same visibility
+        /// class as `screensharing`/`recording` and is what lets the channel
+        /// list hint at a party without joining the call. The server refuses
+        /// a true claim when the channel has no session, and session
+        /// teardown clears the flag for every member, so it cannot outlive
+        /// the party it advertises.
+        #[serde(default)]
+        pub watching: bool,
     },
     "PartialUserVoiceState"
 );

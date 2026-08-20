@@ -114,6 +114,8 @@ pub fn routes() -> (Vec<Route>, OpenApi) {
         watch::watch_update,
         watch::watch_end,
         watch::watch_fetch,
+        watch::watch_host,
+        watch::watching_set,
         permissions_set::set_role_permissions,
         permissions_set_default::set_default_channel_permissions,
         message_react::react_message,

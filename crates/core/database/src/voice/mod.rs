@@ -436,6 +436,7 @@ pub async fn create_voice_state(
         screen_video: false,
         recording: false,
         rc_capable: false,
+        watching: false,
     };
 
     Pipeline::new()
@@ -473,6 +474,10 @@ pub async fn create_voice_state(
         // "not claimed" and the client re-announces, so a stale key cannot
         // mark a web session as able to receive control.
         .set(format!("rc_capable:{unique_key}"), voice_state.rc_capable)
+        // And for the watch-party roster flag: a fresh join never inherits a
+        // stale `watching:` claim — the client re-announces when it actually
+        // attaches a session.
+        .set(format!("watching:{unique_key}"), voice_state.watching)
         // And for draw consent: a fresh join never inherits an annotation
         // allowlist a crashed/stale session left behind (rev-3 review — a
         // resurrected list silently re-grants drawing on the next share).
@@ -511,6 +516,7 @@ pub async fn delete_voice_state(channel: &UserVoiceChannel, user_id: &str) -> Re
             // stop (a crash, a closed laptop, a network loss).
             format!("recording:{unique_key}"),
             format!("rc_capable:{unique_key}"),
+            format!("watching:{unique_key}"),
             // Draw consent dies with the voice state: an allowlist must not
             // outlive the call it was granted in (rev-3 review).
             format!("annotations_allow:{}:{}", &channel.id, user_id),
@@ -546,6 +552,7 @@ pub async fn delete_channel_voice_state(
             format!("screen_video:{unique_key}"),
             format!("recording:{unique_key}"),
             format!("rc_capable:{unique_key}"),
+            format!("watching:{unique_key}"),
             // Draw consent dies with the call (rev-3 review).
             format!("annotations_allow:{}:{}", &channel.id, user_id),
             unique_key.clone(),
@@ -642,6 +649,10 @@ pub async fn update_voice_state(
         pipeline.set(format!("rc_capable:{unique_key}"), rc_capable);
     }
 
+    if let Some(watching) = &partial.watching {
+        pipeline.set(format!("watching:{unique_key}"), watching);
+    }
+
     pipeline
         .query_async::<_, ()>(&mut get_connection().await?.into_inner())
         .await
@@ -703,8 +714,10 @@ pub async fn get_voice_state(
         screen_video,
         recording,
         rc_capable,
+        watching,
     ): (
         Option<i64>,
+        Option<bool>,
         Option<bool>,
         Option<bool>,
         Option<bool>,
@@ -723,6 +736,7 @@ pub async fn get_voice_state(
             format!("screen_video:{unique_key}"),
             format!("recording:{unique_key}"),
             format!("rc_capable:{unique_key}"),
+            format!("watching:{unique_key}"),
         ])
         .await
         .to_internal_error()?;
@@ -762,6 +776,9 @@ pub async fn get_voice_state(
             // existed, or a lost key) reads as "capability not claimed",
             // never as a dropped participant.
             rc_capable: rc_capable.unwrap_or(false),
+            // Same rule: absent reads as "not in a watch party", never as a
+            // dropped participant.
+            watching: watching.unwrap_or(false),
         })),
         _ => Ok(None),
     }
@@ -1702,6 +1719,57 @@ mod tests {
             .await
             .expect("cleanup");
         assert_eq!(count_video_participants(&channel).await.unwrap(), 0);
+    }
+
+    // The `watching` roster flag (watch-together plan §7.3, 4b): created
+    // false with the voice state, set/cleared through the partial-update
+    // path, gone with the state — and a state written before the key existed
+    // still reads (the additive-key rule, `get_voice_state`'s non-required
+    // tuple).
+    #[test]
+    fn watching_flag_lifecycle() {
+        rt().block_on(watching_flag_case())
+    }
+
+    async fn watching_flag_case() {
+        let suffix = ulid::Ulid::new().to_string();
+        let channel = UserVoiceChannel {
+            id: format!("chan{suffix}"),
+            server_id: Some(format!("srv{suffix}")),
+        };
+        let user = format!("user{suffix}");
+
+        create_voice_state(&channel, &user, Timestamp::now_utc())
+            .await
+            .expect("seed voice state");
+        let state = get_voice_state(&channel, &user).await.unwrap().unwrap();
+        assert!(!state.watching, "a fresh join never inherits the flag");
+
+        update_voice_state(
+            &channel,
+            &user,
+            &v0::PartialUserVoiceState {
+                watching: Some(true),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let state = get_voice_state(&channel, &user).await.unwrap().unwrap();
+        assert!(state.watching);
+
+        // An absent additive key must read false, never drop the state
+        // (states created before the key existed).
+        let mut conn = get_connection().await.unwrap();
+        let _: () = conn
+            .del(format!("watching:{user}:srv{suffix}"))
+            .await
+            .unwrap();
+        let state = get_voice_state(&channel, &user).await.unwrap().unwrap();
+        assert!(!state.watching, "absent key reads false, not a dropped state");
+
+        delete_voice_state(&channel, &user).await.expect("cleanup");
+        assert!(get_voice_state(&channel, &user).await.unwrap().is_none());
     }
 
     // The remote-control plan §1 blocker sequence: `screensharing` conflates

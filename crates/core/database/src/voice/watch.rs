@@ -23,7 +23,9 @@
 //! host-unreachable and re-GETs.
 
 use redis_kiss::AsyncCommands;
-use revolt_models::v0::{WatchMedia, WatchSession, WATCH_RATE_NORMAL_PERMILLE};
+use revolt_models::v0::{
+    PartialUserVoiceState, WatchMedia, WatchSession, WATCH_RATE_NORMAL_PERMILLE,
+};
 use revolt_result::{Result, ToRevoltError};
 
 use crate::events::client::EventV1;
@@ -184,6 +186,48 @@ pub async fn fan_watch_end(channel: &UserVoiceChannel, session_id: &str) {
     }
 }
 
+/// The session is over → nobody in the channel is "watching" any more.
+/// Clears every member's `watching:` roster key and fans the partial on the
+/// CHANNEL topic (the flag's visibility class — see the `watching` route),
+/// so a viewer whose client wedged mid-party cannot advertise a phantom one
+/// for the rest of their call (§7.3 rev-2 review). Best-effort, like the
+/// teardown it rides on. Public: the delta DELETE route ends sessions
+/// without passing through the leave-teardown helpers and must clear too.
+pub async fn clear_watching_flags(channel: &UserVoiceChannel) {
+    let Ok(Some(members)) = get_voice_channel_members(channel).await else {
+        return;
+    };
+    let Ok(mut conn) = get_connection().await else {
+        return;
+    };
+    let parent_id = channel.server_id.as_ref().unwrap_or(&channel.id);
+    for member_id in members {
+        let key = format!("watching:{member_id}:{parent_id}");
+        // Only members whose flag was actually set fan an update — an
+        // ordinary session end in a call where nobody claimed the flag
+        // (older clients) costs nothing extra.
+        let was: Option<bool> = conn.get(&key).await.ok().flatten();
+        if was != Some(true) {
+            continue;
+        }
+        if let Err(error) = conn.set::<_, _, ()>(&key, false).await {
+            log::warn!("watch: failed clearing watching flag in {}: {error:?}", channel.id);
+            continue;
+        }
+        EventV1::UserVoiceStateUpdate {
+            id: member_id.clone(),
+            channel_id: channel.id.clone(),
+            data: PartialUserVoiceState {
+                id: Some(member_id),
+                watching: Some(false),
+                ..Default::default()
+            },
+        }
+        .p(channel.id.clone())
+        .await;
+    }
+}
+
 /// Lifecycle hook: the host's voice state is going away → the session ends.
 /// Called from `delete_voice_state` BEFORE the member is removed from
 /// `vc_members`, so the departing host's own sessions still get the end
@@ -198,6 +242,7 @@ pub async fn end_watch_session_if_host(channel: &UserVoiceChannel, user_id: &str
                 log::warn!("watch: failed to end session on host leave in {}: {error:?}", channel.id);
             }
             fan_watch_end(channel, &session.id).await;
+            clear_watching_flags(channel).await;
         }
         Ok(_) => {}
         Err(error) => log::warn!("watch: session probe failed for {}: {error:?}", channel.id),
@@ -207,7 +252,13 @@ pub async fn end_watch_session_if_host(channel: &UserVoiceChannel, user_id: &str
 /// Lifecycle hook: the whole call is being torn down.
 pub async fn end_watch_session_for_channel(channel: &UserVoiceChannel) {
     match delete_watch_session(&channel.id).await {
-        Ok(Some(session)) => fan_watch_end(channel, &session.id).await,
+        Ok(Some(session)) => {
+            fan_watch_end(channel, &session.id).await;
+            // The per-member flag keys are deleted with the voice states by
+            // the caller; clearing here additionally fans the partials for
+            // any client that outlives the teardown race.
+            clear_watching_flags(channel).await;
+        }
         Ok(None) => {}
         Err(error) => log::warn!("watch: failed to end session for {}: {error:?}", channel.id),
     }

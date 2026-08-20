@@ -19,12 +19,13 @@
 //! drive, or read, a call you are not in.
 
 use revolt_database::{
+    events::client::EventV1,
     util::{permissions::perms, reference::Reference},
     voice::{
-        is_in_voice_channel,
+        get_voice_state, is_in_voice_channel, update_voice_state,
         watch::{
-            create_watch_session, delete_watch_session, fan_watch_end, fan_watch_update,
-            fetch_watch_session, now_ms, update_watch_session,
+            clear_watching_flags, create_watch_session, delete_watch_session, fan_watch_end,
+            fan_watch_update, fetch_watch_session, now_ms, update_watch_session,
         },
         UserVoiceChannel,
     },
@@ -171,6 +172,162 @@ pub async fn watch_update(
     Ok(respond(session))
 }
 
+/// # Hand Off Watch Session Host
+///
+/// Give the session to a new host. Caller must be the current host or hold
+/// `ManageChannel`. The target must be in the call RIGHT NOW (a host outside
+/// the call would orphan the leave-teardown) and, in server channels, hold
+/// `UseWatchTogether` themselves — a handoff must not launder the control
+/// permission (DMs / group DMs stay exempt, the start-permission table).
+/// The playing timeline is advanced to the server clock before the swap so
+/// the write rewinds nothing. Same-host handoff is an idempotent no-op.
+#[openapi(tag = "Voice")]
+#[put("/<target>/watch/host", data = "<data>")]
+pub async fn watch_host(
+    db: &State<Database>,
+    user: User,
+    target: Reference<'_>,
+    data: Json<v0::DataWatchHost>,
+) -> Result<Json<v0::WatchSessionResponse>> {
+    let data = data.into_inner();
+    let channel = target.as_channel(db).await?;
+    let (voice_channel, permissions) = require_call_participant(db, &user, &channel).await?;
+
+    let existing = fetch_watch_session(channel.id())
+        .await?
+        .ok_or_else(|| create_error!(NotFound))?;
+    require_control(&user, &existing, &permissions)?;
+
+    if existing.host_id == data.user {
+        // Nothing to write — and no seq minted for a no-op.
+        return Ok(respond(existing));
+    }
+
+    let new_host = Reference::from_unchecked(&data.user).as_user(db).await?;
+    // A bot can hold voice state in two channels of one server under ONE
+    // colliding key, and could never drive the session anyway.
+    if new_host.bot.is_some() {
+        return Err(create_error!(IsBot));
+    }
+    if !is_in_voice_channel(&new_host.id, &voice_channel).await? {
+        return Err(create_error!(NotInVoiceChannel));
+    }
+    // The TARGET's permission set, not the caller's.
+    let mut target_query = perms(db, &new_host).channel(&channel);
+    let target_permissions = calculate_channel_permissions(&mut target_query).await;
+    require_start_permission(&channel, &target_permissions)?;
+
+    let new_host_id = new_host.id.clone();
+    let swap = |session: &mut v0::WatchSession| {
+        // update_watch_session re-stamps position_at AFTER this closure
+        // runs; a playing timeline must be advanced first or the re-stamp
+        // rewinds it by the gap since the last write.
+        session.advance_to(now_ms());
+        session.host_id = new_host_id.clone();
+    };
+
+    let mut session = update_watch_session(channel.id(), swap.clone())
+        .await?
+        .ok_or_else(|| create_error!(NotFound))?;
+
+    // GET→mutate→SETEX is not atomic: a stale in-flight heartbeat from the
+    // OLD host can overwrite this write, and unlike playing/position nothing
+    // ever re-writes host_id — a silently reverted handoff would persist.
+    // Verify against the store and retry once (bounded; no WATCH/Lua, the
+    // house rule). The inverse interleaving — this write clobbering a
+    // just-written pause — self-heals within one heartbeat from the new host.
+    let stored = fetch_watch_session(channel.id())
+        .await?
+        .ok_or_else(|| create_error!(NotFound))?;
+    if stored.host_id != new_host.id {
+        update_watch_session(channel.id(), swap)
+            .await?
+            .ok_or_else(|| create_error!(NotFound))?;
+        let stored = fetch_watch_session(channel.id())
+            .await?
+            .ok_or_else(|| create_error!(NotFound))?;
+        if stored.host_id != new_host.id {
+            return Err(create_error!(InternalError));
+        }
+        session = stored;
+    }
+
+    fan_watch_update(&voice_channel, &session).await;
+    Ok(respond(session))
+}
+
+/// # Set Watching Flag
+///
+/// Set or clear the caller's `watching` roster flag — "this participant has
+/// the channel's watch session attached". A bare boolean on the CHANNEL
+/// topic (the `screensharing`/`recording` visibility class): people outside
+/// the call learn that a watch party exists, never what it plays — the
+/// session itself stays on the private fan-out. Client-claimed both ways
+/// (attach and detach); a true claim is refused while the channel has no
+/// session, and session teardown clears the flag for every member, so the
+/// hint cannot outlive the party. Idempotent.
+#[openapi(tag = "Voice")]
+#[put("/<target>/watching", data = "<data>")]
+pub async fn watching_set(
+    db: &State<Database>,
+    user: User,
+    target: Reference<'_>,
+    data: Json<v0::DataSetWatching>,
+) -> Result<EmptyResponse> {
+    let data = data.into_inner();
+    let channel = target.as_channel(db).await?;
+
+    // The rc_capable rule: per-member voice flags key `{user}:{server}`,
+    // which COLLIDES for a bot in two voice channels of one server.
+    if user.bot.is_some() {
+        return Err(create_error!(IsBot));
+    }
+
+    let (voice_channel, _permissions) = require_call_participant(db, &user, &channel).await?;
+
+    // Server-authoritative floor: a client can never advertise a party that
+    // does not exist (§7.3 rev-2 review). Clearing is always allowed.
+    if data.watching && fetch_watch_session(channel.id()).await?.is_none() {
+        return Err(create_error!(NotFound));
+    }
+
+    // Idempotent against the DESIRED value — a retrying client must not fan
+    // a duplicate roster update at the channel.
+    let already = get_voice_state(&voice_channel, &user.id)
+        .await?
+        .is_some_and(|state| state.watching == data.watching);
+    if already {
+        return Ok(EmptyResponse);
+    }
+
+    // State before event (the recording/rc_capable discipline): the event is
+    // the fast path, the voice state is what a late joiner's roster read
+    // must already agree with.
+    update_voice_state(
+        &voice_channel,
+        &user.id,
+        &v0::PartialUserVoiceState {
+            watching: Some(data.watching),
+            ..Default::default()
+        },
+    )
+    .await?;
+
+    EventV1::UserVoiceStateUpdate {
+        id: user.id.clone(),
+        channel_id: channel.id().to_string(),
+        data: v0::PartialUserVoiceState {
+            id: Some(user.id.clone()),
+            watching: Some(data.watching),
+            ..Default::default()
+        },
+    }
+    .p(channel.id().to_string())
+    .await;
+
+    Ok(EmptyResponse)
+}
+
 /// # End Watch Session
 ///
 /// End this channel's session and tell the call. Host or `ManageChannel`.
@@ -189,6 +346,9 @@ pub async fn watch_end(
         require_control(&user, &existing, &permissions)?;
         if let Some(session) = delete_watch_session(channel.id()).await? {
             fan_watch_end(&voice_channel, &session.id).await;
+            // The party is over → nobody in the channel is "watching" any
+            // more (the leave-teardown helpers do the same).
+            clear_watching_flags(&voice_channel).await;
         }
     }
 
@@ -758,6 +918,432 @@ mod test {
         assert_eq!(b_ends, 1, "call member must receive the end event");
 
         delete_channel_voice_state(&uvc, &[user_a.id.clone(), user_b.id.clone()])
+            .await
+            .expect("teardown");
+    }
+
+    fn host_body(user: &str) -> String {
+        serde_json::json!({ "user": user }).to_string()
+    }
+
+    /// Handoff lifecycle: host hands to a viewer → control follows, the
+    /// PLAYING timeline advances (never rewinds), leave-teardown follows the
+    /// NEW host, same-host handoff is a no-op, and a manager can hand off
+    /// without being host.
+    #[test]
+    fn watch_host_handoff_lifecycle() {
+        crate::util::test::rt().block_on(watch_host_handoff_lifecycle_case())
+    }
+
+    async fn watch_host_handoff_lifecycle_case() {
+        let (harness, channel, uvc, user_a, token_a, user_b, token_b, _user_c, _token_c) =
+            setup().await;
+
+        let response = harness
+            .client
+            .post(format!("/channels/{}/watch", channel.id()))
+            .header(ContentType::JSON)
+            .header(Header::new("x-session-token", token_a.clone()))
+            .body(yt("YE7VzlLtp-4").to_string())
+            .dispatch()
+            .await;
+        assert_eq!(response.status(), Status::Ok);
+
+        // Play from 60 s so the handoff has a moving timeline to preserve.
+        let response = harness
+            .client
+            .patch(format!("/channels/{}/watch", channel.id()))
+            .header(ContentType::JSON)
+            .header(Header::new("x-session-token", token_a.clone()))
+            .body(
+                serde_json::json!({ "playing": true, "position_ms": 60000, "rate_permille": 1000 })
+                    .to_string(),
+            )
+            .dispatch()
+            .await;
+        assert_eq!(response.status(), Status::Ok);
+        let playing: v0::WatchSessionResponse =
+            response.into_json().await.expect("update response");
+
+        // Host hands to the viewer.
+        let response = harness
+            .client
+            .put(format!("/channels/{}/watch/host", channel.id()))
+            .header(ContentType::JSON)
+            .header(Header::new("x-session-token", token_a.clone()))
+            .body(host_body(&user_b.id))
+            .dispatch()
+            .await;
+        assert_eq!(response.status(), Status::Ok);
+        let handed: v0::WatchSessionResponse =
+            response.into_json().await.expect("handoff response");
+        assert_eq!(handed.session.host_id, user_b.id);
+        assert_eq!(handed.session.id, playing.session.id);
+        assert!(handed.session.seq > playing.session.seq);
+        assert!(handed.session.playing, "handoff must not pause");
+        assert!(
+            handed.session.position_ms >= playing.session.position_ms,
+            "a playing timeline must advance across handoff, never rewind"
+        );
+        assert!(handed.session.position_at >= playing.session.position_at);
+
+        // The old host may no longer drive…
+        let response = harness
+            .client
+            .patch(format!("/channels/{}/watch", channel.id()))
+            .header(ContentType::JSON)
+            .header(Header::new("x-session-token", token_a.clone()))
+            .body(
+                serde_json::json!({ "playing": false, "position_ms": 0, "rate_permille": 1000 })
+                    .to_string(),
+            )
+            .dispatch()
+            .await;
+        // …except A is the server owner (ManageChannel), so drive via the
+        // override is still allowed — the HOST though must be B now.
+        assert_eq!(response.status(), Status::Ok);
+        let driven: v0::WatchSessionResponse =
+            response.into_json().await.expect("override response");
+        assert_eq!(driven.session.host_id, user_b.id, "override must not steal host");
+
+        // The new host drives.
+        let response = harness
+            .client
+            .patch(format!("/channels/{}/watch", channel.id()))
+            .header(ContentType::JSON)
+            .header(Header::new("x-session-token", token_b.clone()))
+            .body(
+                serde_json::json!({ "playing": true, "position_ms": 5000, "rate_permille": 1000 })
+                    .to_string(),
+            )
+            .dispatch()
+            .await;
+        assert_eq!(response.status(), Status::Ok);
+
+        // Same-host handoff: idempotent, no seq minted.
+        let before = fetch_watch_session(channel.id())
+            .await
+            .expect("session read")
+            .expect("session");
+        let response = harness
+            .client
+            .put(format!("/channels/{}/watch/host", channel.id()))
+            .header(ContentType::JSON)
+            .header(Header::new("x-session-token", token_b.clone()))
+            .body(host_body(&user_b.id))
+            .dispatch()
+            .await;
+        assert_eq!(response.status(), Status::Ok);
+        let same: v0::WatchSessionResponse =
+            response.into_json().await.expect("idempotent response");
+        assert_eq!(same.session.seq, before.seq, "no-op must not mint seq");
+
+        // Leave semantics follow the CURRENT host: the old host leaving no
+        // longer ends the session; the new host leaving does.
+        delete_voice_state(&uvc, &user_a.id)
+            .await
+            .expect("old host leave");
+        assert!(
+            fetch_watch_session(channel.id())
+                .await
+                .expect("session read")
+                .is_some(),
+            "old host's leave must not end a handed-off session"
+        );
+        delete_voice_state(&uvc, &user_b.id)
+            .await
+            .expect("new host leave");
+        assert!(fetch_watch_session(channel.id())
+            .await
+            .expect("session read")
+            .is_none());
+    }
+
+    /// Handoff guards: target not in the call; caller neither host nor
+    /// manager; and the permission-laundering case — a target IN the call
+    /// but WITHOUT `UseWatchTogether` must be refused in a server channel,
+    /// while a group DM (no voice bits at all) accepts handoff.
+    #[test]
+    fn watch_host_handoff_guards() {
+        crate::util::test::rt().block_on(watch_host_handoff_guards_case())
+    }
+
+    async fn watch_host_handoff_guards_case() {
+        use revolt_database::PartialServer;
+        use revolt_permissions::ChannelPermission;
+
+        let harness = TestHarness::new().await;
+        let (_, session_a, user_a) = harness.new_user().await;
+        let (_, session_b, user_b) = harness.new_user().await;
+        let (_, _session_c, user_c) = harness.new_user().await;
+        let (mut server, _channels) = harness.new_server(&user_a).await;
+        Member::create(&harness.db, &server, &user_b, None)
+            .await
+            .expect("member b");
+        Member::create(&harness.db, &server, &user_c, None)
+            .await
+            .expect("member c");
+        let channel = voice_channel(&harness, &server, "Voice").await;
+        let uvc = UserVoiceChannel::from_channel(&channel);
+        create_voice_state(&uvc, &user_a.id, Timestamp::now_utc())
+            .await
+            .expect("voice state a");
+        create_voice_state(&uvc, &user_b.id, Timestamp::now_utc())
+            .await
+            .expect("voice state b");
+        let token_a = session_a.token;
+        let token_b = session_b.token;
+
+        let response = harness
+            .client
+            .post(format!("/channels/{}/watch", channel.id()))
+            .header(ContentType::JSON)
+            .header(Header::new("x-session-token", token_a.clone()))
+            .body(yt("YE7VzlLtp-4").to_string())
+            .dispatch()
+            .await;
+        assert_eq!(response.status(), Status::Ok);
+
+        // Target not in the call.
+        let response = harness
+            .client
+            .put(format!("/channels/{}/watch/host", channel.id()))
+            .header(ContentType::JSON)
+            .header(Header::new("x-session-token", token_a.clone()))
+            .body(host_body(&user_c.id))
+            .dispatch()
+            .await;
+        assert_eq!(response.status(), Status::BadRequest);
+
+        // Caller is neither host nor manager.
+        let response = harness
+            .client
+            .put(format!("/channels/{}/watch/host", channel.id()))
+            .header(ContentType::JSON)
+            .header(Header::new("x-session-token", token_b.clone()))
+            .body(host_body(&user_b.id))
+            .dispatch()
+            .await;
+        assert_eq!(response.status(), Status::Forbidden);
+
+        // Strip `UseWatchTogether` from the default role: the target is in
+        // the call but the permission table would refuse them control —
+        // handoff must refuse too (the laundering test).
+        let stripped =
+            (server.default_permissions as u64) & !(ChannelPermission::UseWatchTogether as u64);
+        server
+            .update(
+                &harness.db,
+                PartialServer {
+                    default_permissions: Some(stripped as i64),
+                    ..Default::default()
+                },
+                vec![],
+            )
+            .await
+            .expect("strip permission");
+        let response = harness
+            .client
+            .put(format!("/channels/{}/watch/host", channel.id()))
+            .header(ContentType::JSON)
+            .header(Header::new("x-session-token", token_a.clone()))
+            .body(host_body(&user_b.id))
+            .dispatch()
+            .await;
+        assert_eq!(
+            response.status(),
+            Status::Forbidden,
+            "handoff must not launder UseWatchTogether"
+        );
+
+        delete_channel_voice_state(&uvc, &[user_a.id.clone(), user_b.id.clone()])
+            .await
+            .expect("teardown");
+
+        // Group DM: no voice bits exist — handoff succeeds on Connect alone.
+        // Groups create with calling off; the owner turns it on.
+        let mut group = Channel::create_group(
+            &harness.db,
+            v0::DataCreateGroup {
+                name: "watch group".to_string(),
+                description: None,
+                icon: None,
+                users: std::collections::HashSet::from([user_b.id.clone()]),
+                nsfw: None,
+                spoiler: None,
+            },
+            user_a.id.clone(),
+        )
+        .await
+        .expect("group");
+        group
+            .update(
+                &harness.db,
+                revolt_database::PartialChannel {
+                    voice: Some(revolt_database::VoiceInformation {
+                        max_users: None,
+                        disabled: false,
+                    }),
+                    ..Default::default()
+                },
+                vec![],
+            )
+            .await
+            .expect("enable group calling");
+        let guvc = UserVoiceChannel::from_channel(&group);
+        create_voice_state(&guvc, &user_a.id, Timestamp::now_utc())
+            .await
+            .expect("group voice a");
+        create_voice_state(&guvc, &user_b.id, Timestamp::now_utc())
+            .await
+            .expect("group voice b");
+        let response = harness
+            .client
+            .post(format!("/channels/{}/watch", group.id()))
+            .header(ContentType::JSON)
+            .header(Header::new("x-session-token", token_a.clone()))
+            .body(yt("YE7VzlLtp-4").to_string())
+            .dispatch()
+            .await;
+        assert_eq!(response.status(), Status::Ok);
+        let response = harness
+            .client
+            .put(format!("/channels/{}/watch/host", group.id()))
+            .header(ContentType::JSON)
+            .header(Header::new("x-session-token", token_a.clone()))
+            .body(host_body(&user_b.id))
+            .dispatch()
+            .await;
+        assert_eq!(
+            response.status(),
+            Status::Ok,
+            "group members hold no voice bits — handoff must stay Connect-only there"
+        );
+
+        delete_channel_voice_state(&guvc, &[user_a.id.clone(), user_b.id.clone()])
+            .await
+            .expect("group teardown");
+    }
+
+    /// The `watching` roster flag: refused while no session exists, set and
+    /// cleared by the claim route, cleared for EVERY member when the session
+    /// ends (host DELETE and host-leave both).
+    #[test]
+    fn watching_flag_roundtrip() {
+        crate::util::test::rt().block_on(watching_flag_roundtrip_case())
+    }
+
+    async fn watching_flag_roundtrip_case() {
+        use revolt_database::voice::get_voice_state;
+
+        let (harness, channel, uvc, user_a, token_a, user_b, token_b, _user_c, _token_c) =
+            setup().await;
+        let watching = |value: bool| serde_json::json!({ "watching": value }).to_string();
+
+        // No session yet: a true claim is refused, a clear is fine.
+        let response = harness
+            .client
+            .put(format!("/channels/{}/watching", channel.id()))
+            .header(ContentType::JSON)
+            .header(Header::new("x-session-token", token_b.clone()))
+            .body(watching(true))
+            .dispatch()
+            .await;
+        assert_eq!(
+            response.status(),
+            Status::NotFound,
+            "cannot advertise a party that does not exist"
+        );
+        let response = harness
+            .client
+            .put(format!("/channels/{}/watching", channel.id()))
+            .header(ContentType::JSON)
+            .header(Header::new("x-session-token", token_b.clone()))
+            .body(watching(false))
+            .dispatch()
+            .await;
+        assert_eq!(response.status(), Status::NoContent);
+
+        // Start a session; the viewer claims, clears, claims again.
+        let response = harness
+            .client
+            .post(format!("/channels/{}/watch", channel.id()))
+            .header(ContentType::JSON)
+            .header(Header::new("x-session-token", token_a.clone()))
+            .body(yt("YE7VzlLtp-4").to_string())
+            .dispatch()
+            .await;
+        assert_eq!(response.status(), Status::Ok);
+
+        for (value, expect) in [(true, true), (true, true), (false, false), (true, true)] {
+            let response = harness
+                .client
+                .put(format!("/channels/{}/watching", channel.id()))
+                .header(ContentType::JSON)
+                .header(Header::new("x-session-token", token_b.clone()))
+                .body(watching(value))
+                .dispatch()
+                .await;
+            assert_eq!(response.status(), Status::NoContent);
+            let state = get_voice_state(&uvc, &user_b.id)
+                .await
+                .expect("state read")
+                .expect("state");
+            assert_eq!(state.watching, expect);
+        }
+
+        // Host DELETE ends the session → every member's flag clears.
+        let response = harness
+            .client
+            .delete(format!("/channels/{}/watch", channel.id()))
+            .header(Header::new("x-session-token", token_a.clone()))
+            .dispatch()
+            .await;
+        assert_eq!(response.status(), Status::NoContent);
+        // NB: the route DELETE path does not enumerate members itself — the
+        // clearing rides the database end-helpers, which the route calls
+        // through delete_watch_session + fan; assert the flag is gone.
+        let state = get_voice_state(&uvc, &user_b.id)
+            .await
+            .expect("state read")
+            .expect("state");
+        assert!(
+            !state.watching,
+            "session end must clear every member's watching flag"
+        );
+
+        // Same through the host-LEAVE teardown.
+        let response = harness
+            .client
+            .post(format!("/channels/{}/watch", channel.id()))
+            .header(ContentType::JSON)
+            .header(Header::new("x-session-token", token_a.clone()))
+            .body(yt("YE7VzlLtp-4").to_string())
+            .dispatch()
+            .await;
+        assert_eq!(response.status(), Status::Ok);
+        let response = harness
+            .client
+            .put(format!("/channels/{}/watching", channel.id()))
+            .header(ContentType::JSON)
+            .header(Header::new("x-session-token", token_b.clone()))
+            .body(watching(true))
+            .dispatch()
+            .await;
+        assert_eq!(response.status(), Status::NoContent);
+        delete_voice_state(&uvc, &user_a.id)
+            .await
+            .expect("host leave");
+        let state = get_voice_state(&uvc, &user_b.id)
+            .await
+            .expect("state read")
+            .expect("state");
+        assert!(
+            !state.watching,
+            "host-leave teardown must clear the watching flags too"
+        );
+
+        delete_channel_voice_state(&uvc, &[user_b.id.clone()])
             .await
             .expect("teardown");
     }

@@ -106,4 +106,85 @@ auto_derived!(
         #[serde(skip_serializing_if = "Option::is_none")]
         pub media: Option<WatchMedia>,
     }
+
+    /// Hand the session to a new host (watch-together plan §7.3, 4a). The
+    /// target must be in the call and, in server channels, hold
+    /// `UseWatchTogether` — handoff must not launder the control permission.
+    pub struct DataWatchHost {
+        /// User id of the new host
+        pub user: String,
+    }
+
+    /// Set the caller's `watching` roster flag (watch-together plan §7.3,
+    /// 4b). Unlike `rc_capable` this claim goes BOTH ways — a client
+    /// announces attach AND detach — so the body carries the desired value.
+    pub struct DataSetWatching {
+        pub watching: bool,
+    }
 );
+
+impl WatchSession {
+    /// Advance the stored timeline to `now` — the server-side twin of the
+    /// client's `expected_position` formula. Used by writes that mutate
+    /// NON-timeline fields (host handoff): `update_watch_session` re-stamps
+    /// `position_at` after the closure runs, which silently REWINDS a
+    /// playing session unless `position_ms` is advanced to match first.
+    /// Paused sessions are untouched.
+    pub fn advance_to(&mut self, now_ms: u64) {
+        if self.playing {
+            let elapsed = now_ms.saturating_sub(self.position_at) as u128;
+            let advance = elapsed * self.rate_permille as u128 / 1000;
+            self.position_ms = self.position_ms.saturating_add(advance as u64);
+            self.position_at = now_ms;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn session(playing: bool) -> WatchSession {
+        WatchSession {
+            id: "01H0000000000000000000TEST".to_string(),
+            channel_id: "channel".to_string(),
+            host_id: "host".to_string(),
+            media: WatchMedia::YouTube {
+                video_id: "dQw4w9WgXcQ".to_string(),
+                title: None,
+            },
+            playing,
+            position_ms: 60_000,
+            position_at: 1_000_000,
+            rate_permille: 1500,
+            seq: 7,
+            started_at: 900_000,
+        }
+    }
+
+    #[test]
+    fn advance_to_moves_a_playing_timeline_at_rate() {
+        let mut s = session(true);
+        // 10 s of wall clock at 1.5× = 15 s of content.
+        s.advance_to(1_010_000);
+        assert_eq!(s.position_ms, 75_000);
+        assert_eq!(s.position_at, 1_010_000);
+    }
+
+    #[test]
+    fn advance_to_is_a_noop_while_paused() {
+        let mut s = session(false);
+        s.advance_to(1_010_000);
+        assert_eq!(s.position_ms, 60_000);
+        assert_eq!(s.position_at, 1_000_000);
+    }
+
+    #[test]
+    fn advance_to_never_rewinds_on_a_clock_step() {
+        let mut s = session(true);
+        // A server clock that reads BEFORE position_at (an NTP step) must
+        // not underflow or rewind.
+        s.advance_to(999_000);
+        assert_eq!(s.position_ms, 60_000);
+    }
+}
