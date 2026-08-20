@@ -160,11 +160,16 @@ impl TestHarness {
     }
 
     pub fn rand_string() -> String {
+        // Consonants only. These strings become usernames, and User::create
+        // runs them through the name filter, which matches folded LETTER
+        // sequences — digits unleet onto letters (0→o, 1→i, 3→e, 4→a, …), so
+        // a random alphanumeric name occasionally spells a blocked substring
+        // and the harness dies with InvalidUsername. Every term in the
+        // blocklists contains a vowel; a vowel-free name can never match.
+        const SAFE: &[u8] = b"bcdfghjkmnpqrstvwxz";
         let mut rng = rand::thread_rng();
-        (&mut rng)
-            .sample_iter(rand::distributions::Alphanumeric)
-            .take(20)
-            .map(char::from)
+        (0..20)
+            .map(|_| SAFE[rng.gen_range(0..SAFE.len())] as char)
             .collect()
     }
 
