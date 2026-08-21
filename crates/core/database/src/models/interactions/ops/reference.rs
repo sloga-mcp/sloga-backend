@@ -1,6 +1,8 @@
 use revolt_result::Result;
 
 use crate::Interaction;
+use crate::InteractionKind;
+use crate::ModalValue;
 use crate::ReferenceDb;
 
 use super::AbstractInteractions;
@@ -42,6 +44,20 @@ impl AbstractInteractions for ReferenceDb {
         }
     }
 
+    /// Atomically record a modal submission, claiming the single submit slot.
+    /// The mutex makes check-and-set atomic on this driver.
+    async fn try_submit_modal(&self, id: &str, values: &[ModalValue]) -> Result<bool> {
+        let mut interactions = self.interactions.lock().await;
+        match interactions.get_mut(id) {
+            Some(interaction) if !interaction.submitted => {
+                interaction.submitted = true;
+                interaction.submitted_values = values.to_vec();
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+
     /// Delete all interactions addressed to a bot (bot-deletion cascade).
     async fn delete_interactions_by_bot(&self, bot_id: &str) -> Result<()> {
         let mut interactions = self.interactions.lock().await;
@@ -53,6 +69,18 @@ impl AbstractInteractions for ReferenceDb {
     async fn delete_interactions_before(&self, cutoff_id: &str) -> Result<()> {
         let mut interactions = self.interactions.lock().await;
         interactions.retain(|id, _| id.as_str() >= cutoff_id);
+        Ok(())
+    }
+
+    /// Same, restricted to one kind.
+    async fn delete_interactions_of_kind_before(
+        &self,
+        kind: InteractionKind,
+        cutoff_id: &str,
+    ) -> Result<()> {
+        let mut interactions = self.interactions.lock().await;
+        interactions
+            .retain(|id, row| row.kind != kind || id.as_str() >= cutoff_id);
         Ok(())
     }
 }

@@ -245,13 +245,41 @@ impl<'a> RatelimitResolver<Request<'a>> for DeltaRatelimits {
                         // Command invocations wake a bot per call — bound
                         // the spam separately from plain messaging.
                         if let Some("interactions") = extra {
+                            // Autocomplete is KEYSTROKE-paced, not
+                            // user-paced, and must not share the invocation
+                            // bucket in either direction: typing an argument
+                            // would otherwise exhaust the budget and 429 the
+                            // command the user was composing. (Segment index
+                            // shifts by one under the legacy "0.8" prefix.)
+                            if request.routed_segment(if versioned { 4 } else { 3 })
+                                == Some("autocomplete")
+                            {
+                                return ("interaction_autocomplete", Some(id));
+                            }
+
                             return ("interaction_create", Some(id));
                         }
                     }
 
                     ("channels", Some(id))
                 }
-                ("interactions", _, _) => ("interaction_respond", None),
+                ("interactions", _, _) => {
+                    // The bot's side of the same keystroke-paced exchange
+                    // gets its OWN bucket, not the asking side's: bot-token
+                    // requests carry no session, so they are keyed by IP —
+                    // one counter for every user of every bot on that host.
+                    // Sized against the asking side's per-user-per-channel
+                    // budget times a plausible number of concurrent typists,
+                    // which is safe because this side is already bounded by
+                    // something stricter than a counter: every request must
+                    // present an unused single-use token for an interaction
+                    // the server itself created less than a minute earlier.
+                    if extra == Some("autocomplete") {
+                        return ("interaction_autocomplete_respond", None);
+                    }
+
+                    ("interaction_respond", None)
+                }
                 // Public unauthenticated directory (identity falls back to
                 // IP for sessionless requests) — dedicated bucket so a burst
                 // against /discover can't starve the shared "any" bucket.
@@ -337,6 +365,16 @@ impl<'a> RatelimitResolver<Request<'a>> for DeltaRatelimits {
             "thread_create" => 5,
             "forum_post_create" => 5,
             "interaction_create" => 10,
+            // Asking side, keyed per user per channel. The client debounces
+            // to ~3/s, so a continuously typing hand is about 30 per 10s
+            // window; 40 leaves headroom for a burst without letting a
+            // hostile client hammer a bot on every character.
+            "interaction_autocomplete" => 40,
+            // Answering side, keyed per HOST (bot tokens carry no session).
+            // One counter serves every concurrent typist of every bot on the
+            // box, so the asking side's 40 would starve a popular bot at two
+            // simultaneous users. Generous by design — see the resolver.
+            "interaction_autocomplete_respond" => 250,
             "poll_vote" => 10,
             "softres_reserve" => 10,
             "message_schedule" => 10,

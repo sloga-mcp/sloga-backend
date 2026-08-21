@@ -244,6 +244,10 @@ mod tests {
                 custom_id: None,
                 values: Vec::new(),
                 options: Default::default(),
+                focused_option: None,
+                modal: None,
+                submitted_values: Vec::new(),
+                submitted: false,
                 responded: false,
             })
             .await

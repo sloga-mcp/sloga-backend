@@ -4,9 +4,9 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 use revolt_models::v0::{
-    AnnotationStroke, AppendMessage, Channel, ChannelFollow, ChannelSlowmode, ChannelUnread, ChannelVoiceState, E2EEMessage,
+    AnnotationStroke, AppendMessage, Channel, ChannelFollow, ChannelSlowmode, ChannelUnread, ChannelVoiceState, CommandChoice, E2EEMessage,
     Emoji, Event, EventRsvp, FieldsChannel, FieldsMember, FieldsMessage, FieldsRole, FieldsServer, FieldsUser,
-    FieldsWebhook, Interaction, Member, MemberCompositeKey, Message, PartialChannel, PartialEmoji,
+    FieldsWebhook, Interaction, Member, MemberCompositeKey, Message, Modal, PartialChannel, PartialEmoji,
     PartialMember, PartialMessage, PartialRole, PartialServer, PartialSticker, PartialUser,
     PartialSoundboardSound, PartialUserVoiceState, PartialWebhook, PolicyChange, PollAnswerCount,
     RemovalIntention, Report, ScheduledMessage, Server, SoftRes, SoftResReserve, SoundboardSound,
@@ -835,6 +835,28 @@ pub enum EventV1 {
     /// notifications, or unread tracking. Gone on reload by design.
     InteractionEphemeralMessage {
         message: Message,
+    },
+
+    /// Suggestions a bot returned for the option the user is typing.
+    /// Published ONLY on the invoking user's private topic — nobody else
+    /// has any use for a half-typed argument.
+    InteractionAutocompleteResult {
+        interaction_id: String,
+        choices: Vec<CommandChoice>,
+    },
+
+    /// A bot asked the invoking user to fill in a form. Published ONLY on
+    /// that user's private topic.
+    ///
+    /// `interaction_id` is a FRESH interaction to submit the filled form
+    /// against — deliberately not the one being answered, whose response
+    /// slot this consumed. It carries no response token: the user
+    /// authenticates the submission with their own session, and the bot
+    /// only receives the token once the form comes back.
+    InteractionModalOpen {
+        interaction_id: String,
+        source_id: String,
+        modal: Modal,
     },
 
     /// A message was scheduled for later delivery. Published ONLY on the

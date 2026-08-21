@@ -128,6 +128,10 @@ pub async fn interaction_create(
         custom_id: None,
         values: Vec::new(),
         options: data.options,
+        focused_option: None,
+        modal: None,
+        submitted_values: Vec::new(),
+        submitted: false,
         responded: false,
     };
 

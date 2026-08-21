@@ -38,6 +38,9 @@ auto_derived!(
         /// Fixed set of allowed values (String/Integer kinds only)
         #[serde(skip_serializing_if = "Vec::is_empty", default)]
         pub choices: Vec<CommandChoice>,
+        /// Ask the bot for suggestions as the user types this option
+        #[serde(skip_serializing_if = "crate::if_false", default)]
+        pub autocomplete: bool,
     }
 );
 
@@ -113,6 +116,7 @@ impl From<v0::CommandOption> for CommandOption {
             kind: value.kind.into(),
             required: value.required,
             choices: value.choices.into_iter().map(Into::into).collect(),
+            autocomplete: value.autocomplete,
         }
     }
 }
@@ -125,6 +129,7 @@ impl From<CommandOption> for v0::CommandOption {
             kind: value.kind.into(),
             required: value.required,
             choices: value.choices.into_iter().map(Into::into).collect(),
+            autocomplete: value.autocomplete,
         }
     }
 }

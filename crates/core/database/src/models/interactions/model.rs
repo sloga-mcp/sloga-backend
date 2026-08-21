@@ -6,6 +6,14 @@ use revolt_result::{create_error, Result};
 /// How long an interaction may be responded to after creation.
 pub const INTERACTION_TTL_MS: u64 = 15 * 60 * 1000;
 
+/// How long an autocomplete round-trip stays answerable.
+///
+/// Far shorter than the general window on purpose: suggestions for a caret
+/// that moved on are useless, and autocomplete is the one interaction kind a
+/// user creates by typing, so a 15-minute row per keystroke burst would be a
+/// needless amount of live state.
+pub const AUTOCOMPLETE_TTL_MS: u64 = 60 * 1000;
+
 /// Length of the response token in bytes (hex-encoded to 64 chars).
 pub const INTERACTION_TOKEN_BYTES: usize = 32;
 
@@ -56,12 +64,42 @@ auto_derived!(
         /// Submitted select values (Component kind, selects only)
         #[serde(skip_serializing_if = "Vec::is_empty", default)]
         pub values: Vec<String>,
-        /// Supplied option values, validated against the command's schema
+        /// Supplied option values. Schema-validated for `Command`; partial
+        /// input for `Autocomplete`; submitted fields for `ModalSubmit`.
         #[serde(skip_serializing_if = "HashMap::is_empty", default)]
         pub options: HashMap<String, String>,
+        /// Option the user is currently typing (`Autocomplete` kind)
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub focused_option: Option<String>,
+        /// The form shown to the user (`ModalSubmit` kind).
+        ///
+        /// Stored so the submission is validated against what the bot
+        /// actually asked for, rather than against anything the submitting
+        /// client echoes back.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub modal: Option<v0::Modal>,
+        /// Values the user typed into the modal.
+        ///
+        /// A list of pairs rather than a map because the keys are bot-chosen
+        /// strings, and a stored map would turn them into document field
+        /// names — where a `.` or a leading `$` is a storage hazard. They are
+        /// folded back into a map for the bot at wire time.
+        #[serde(skip_serializing_if = "Vec::is_empty", default)]
+        pub submitted_values: Vec<ModalValue>,
+        /// Whether the user has already submitted the modal (single-use)
+        #[serde(skip_serializing_if = "crate::if_false", default)]
+        pub submitted: bool,
         /// Whether the bot has already responded (single-use)
         #[serde(skip_serializing_if = "crate::if_false", default)]
         pub responded: bool,
+    }
+
+    /// One filled-in modal field
+    pub struct ModalValue {
+        /// Id of the text input this value came from
+        pub custom_id: String,
+        /// What the user typed
+        pub value: String,
     }
 
     /// Interaction context carried on a response message ("used /cmd")
@@ -109,14 +147,29 @@ impl Interaction {
             .unwrap_or(0)
     }
 
+    /// How long this interaction stays answerable, by kind.
+    pub fn ttl_ms(&self) -> u64 {
+        match self.kind {
+            InteractionKind::Autocomplete => AUTOCOMPLETE_TTL_MS,
+            _ => INTERACTION_TTL_MS,
+        }
+    }
+
     /// Whether the response window has closed.
     pub fn is_expired(&self, now_ms: u64) -> bool {
-        now_ms.saturating_sub(self.created_at_ms()) > INTERACTION_TTL_MS
+        now_ms.saturating_sub(self.created_at_ms()) > self.ttl_ms()
     }
 
     /// Wire representation, delivered ONLY on the bot's private topic
     /// (it carries the response token).
     pub fn into_wire(self) -> v0::Interaction {
+        // Modal submissions reach the bot as ordinary option values, keyed by
+        // the input ids it chose — the pair-list is a storage detail.
+        let mut options = self.options;
+        for submitted in self.submitted_values {
+            options.insert(submitted.custom_id, submitted.value);
+        }
+
         v0::Interaction {
             id: self.id,
             kind: match self.kind {
@@ -133,7 +186,8 @@ impl Interaction {
             command_name: self.command_name,
             custom_id: self.custom_id,
             values: self.values,
-            options: self.options,
+            options,
+            focused_option: self.focused_option,
             token: self.token,
         }
     }
@@ -167,6 +221,10 @@ mod tests {
             custom_id: None,
             values: Vec::new(),
             options: Default::default(),
+            focused_option: None,
+            modal: None,
+            submitted_values: Vec::new(),
+            submitted: false,
             responded: false,
         }
     }
@@ -187,5 +245,19 @@ mod tests {
         let row = interaction(&id, "t");
         assert!(!row.is_expired(1_000_000 + INTERACTION_TTL_MS));
         assert!(row.is_expired(1_000_000 + INTERACTION_TTL_MS + 1));
+    }
+
+    #[test]
+    fn autocomplete_expires_on_its_own_shorter_clock() {
+        let id = ulid::Ulid::from_parts(1_000_000, 0).to_string();
+        let mut row = interaction(&id, "t");
+        row.kind = InteractionKind::Autocomplete;
+
+        assert!(!row.is_expired(1_000_000 + AUTOCOMPLETE_TTL_MS));
+        assert!(row.is_expired(1_000_000 + AUTOCOMPLETE_TTL_MS + 1));
+
+        // Still well inside the window every other kind would be using
+        assert!(AUTOCOMPLETE_TTL_MS < INTERACTION_TTL_MS);
+        assert!(row.is_expired(1_000_000 + INTERACTION_TTL_MS));
     }
 }

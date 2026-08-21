@@ -1,5 +1,6 @@
 pub mod boosts;
 pub mod dice;
+pub mod interactions;
 pub mod polls;
 pub mod ratelimits;
 pub mod slowmode;

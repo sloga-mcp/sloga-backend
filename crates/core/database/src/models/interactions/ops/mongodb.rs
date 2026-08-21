@@ -2,6 +2,8 @@ use bson::Document;
 use revolt_result::Result;
 
 use crate::Interaction;
+use crate::InteractionKind;
+use crate::ModalValue;
 use crate::MongoDb;
 
 use super::AbstractInteractions;
@@ -39,6 +41,31 @@ impl AbstractInteractions for MongoDb {
             .map_err(|_| create_database_error!("update_one", COL))
     }
 
+    /// Atomically record a modal submission, claiming the single submit slot.
+    async fn try_submit_modal(&self, id: &str, values: &[ModalValue]) -> Result<bool> {
+        // Same "not true" match as the response claim: `submitted: false` is
+        // stored as a MISSING key.
+        let values = bson::to_bson(values)
+            .map_err(|_| create_database_error!("to_bson", "submitted_values"))?;
+
+        self.col::<Document>(COL)
+            .update_one(
+                doc! {
+                    "_id": id,
+                    "submitted": { "$ne": true }
+                },
+                doc! {
+                    "$set": {
+                        "submitted": true,
+                        "submitted_values": values
+                    }
+                },
+            )
+            .await
+            .map(|result| result.modified_count == 1)
+            .map_err(|_| create_database_error!("update_one", COL))
+    }
+
     /// Delete all interactions addressed to a bot (bot-deletion cascade).
     async fn delete_interactions_by_bot(&self, bot_id: &str) -> Result<()> {
         self.col::<Document>(COL)
@@ -54,6 +81,24 @@ impl AbstractInteractions for MongoDb {
     async fn delete_interactions_before(&self, cutoff_id: &str) -> Result<()> {
         self.col::<Document>(COL)
             .delete_many(doc! {
+                "_id": { "$lt": cutoff_id }
+            })
+            .await
+            .map(|_| ())
+            .map_err(|_| create_database_error!("delete_many", COL))
+    }
+
+    /// Same, restricted to one kind.
+    async fn delete_interactions_of_kind_before(
+        &self,
+        kind: InteractionKind,
+        cutoff_id: &str,
+    ) -> Result<()> {
+        let kind = bson::to_bson(&kind).map_err(|_| create_database_error!("to_bson", "kind"))?;
+
+        self.col::<Document>(COL)
+            .delete_many(doc! {
+                "kind": kind,
                 "_id": { "$lt": cutoff_id }
             })
             .await

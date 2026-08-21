@@ -16,6 +16,7 @@ mod follow_delete;
 mod followers_fetch;
 mod forum_post_create;
 mod forum_posts_fetch;
+mod interaction_autocomplete;
 mod interaction_create;
 mod message_crosspost;
 mod group_add_member;
@@ -133,6 +134,7 @@ pub fn routes() -> (Vec<Route>, OpenApi) {
         forum_posts_fetch::fetch_forum_posts,
         command_list::fetch_channel_commands,
         interaction_create::interaction_create,
+        interaction_autocomplete::interaction_autocomplete,
         message_interact::message_interact,
         poll_create::poll_create,
         poll_vote::poll_vote,

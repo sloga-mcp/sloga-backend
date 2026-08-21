@@ -145,6 +145,10 @@ pub async fn message_interact(
         custom_id: Some(data.custom_id),
         values: data.values,
         options: Default::default(),
+        focused_option: None,
+        modal: None,
+        submitted_values: Vec::new(),
+        submitted: false,
         responded: false,
     };
 

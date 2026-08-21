@@ -55,12 +55,22 @@ pub async fn interaction_respond(
     }
     interaction.assert_token(&data.token)?;
 
-    // Command (slice 1) and Component (slice 2) interactions accept message
-    // responses; autocomplete / modal kinds are later slices.
+    // Every kind whose answer is a message lands here. Autocomplete is
+    // answered on its own route: its reply is a list of suggestions for one
+    // user's dropdown, not a message anyone else ever sees.
     if !matches!(
         interaction.kind,
-        InteractionKind::Command | InteractionKind::Component
+        InteractionKind::Command | InteractionKind::Component | InteractionKind::ModalSubmit
     ) {
+        return Err(create_error!(InvalidOperation));
+    }
+
+    // A form is only answerable once it has actually been filled in.
+    // Unreachable today — a submission's token first reaches the bot on
+    // submission — but it is the only thing standing between a bot and a
+    // server-attributed "used /cmd" message for a form nobody submitted, and
+    // the two slots are deliberately independent.
+    if matches!(interaction.kind, InteractionKind::ModalSubmit) && !interaction.submitted {
         return Err(create_error!(InvalidOperation));
     }
 
@@ -75,11 +85,14 @@ pub async fn interaction_respond(
         }
     }
 
-    // Editing is only meaningful for component interactions — it targets the
-    // message the clicked component lives on.
+    // Editing targets the message the interaction came from, so it needs
+    // one: a component click, or a modal opened from a component click
+    // (which carries the host message forward).
     if data.edit
-        && (!matches!(interaction.kind, InteractionKind::Component)
-            || interaction.message_id.is_none())
+        && (!matches!(
+            interaction.kind,
+            InteractionKind::Component | InteractionKind::ModalSubmit
+        ) || interaction.message_id.is_none())
     {
         return Err(create_error!(InvalidOperation));
     }
@@ -201,7 +214,13 @@ pub async fn interaction_respond(
         .map(|member| member.clone().into_owned().into());
 
     let mut message = match interaction.kind {
-        InteractionKind::Command => {
+        // A modal submission inherits the command name from the interaction
+        // that opened it, so a form filled in mid-command still attributes
+        // to the command the user actually typed. Submissions opened from a
+        // component click carry no command name and fall to the arm below.
+        InteractionKind::Command | InteractionKind::ModalSubmit
+            if interaction.command_name.is_some() =>
+        {
             // Exact DiceRoll pattern: the flag is set here, server-side, and
             // the regular send path rejects client-supplied flag values
             // above 7 — flag + command_context prove "used /cmd".
@@ -221,7 +240,7 @@ pub async fn interaction_respond(
         // Component follow-ups are plain bot messages; provenance comes
         // from replying to the message the component lives on ("used /cmd"
         // is reserved for actual command invocations).
-        InteractionKind::Component => Message {
+        InteractionKind::Component | InteractionKind::ModalSubmit => Message {
             replies: interaction.message_id.clone().map(|id| vec![id]),
             ..Default::default()
         },
@@ -312,6 +331,10 @@ mod test {
             custom_id: None,
             values: Vec::new(),
             options: Default::default(),
+            focused_option: None,
+            modal: None,
+            submitted_values: Vec::new(),
+            submitted: false,
             responded: false,
         }
     }
@@ -586,6 +609,10 @@ mod test {
             custom_id: Some("btn_a".to_string()),
             values: Vec::new(),
             options: Default::default(),
+            focused_option: None,
+            modal: None,
+            submitted_values: Vec::new(),
+            submitted: false,
             responded: false,
         }
     }
