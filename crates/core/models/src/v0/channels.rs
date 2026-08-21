@@ -616,6 +616,23 @@ auto_derived!(
         pub device_id: Option<String>,
     }
 
+    /// Ask for a token for a native screen-share leg
+    ///
+    /// The leg is a SECOND, publish-only LiveKit participant owned by the
+    /// device that is already in the call: no web runtime on Android exposes
+    /// screen capture, and a native MediaProjection capture cannot be handed
+    /// to the WebView's WebRTC stack as a track.
+    pub struct DataScreenLeg {
+        /// E2EE device id the leg is being minted for.
+        ///
+        /// Must be a registered E2EE device of the calling user whose session
+        /// is bound to it, AND must be the device that currently holds the
+        /// call's participant identity — the leg identity is derived from the
+        /// live primary mapping, never from this field. Absent means the
+        /// primary joined without a device id (a bare, non-E2EE identity).
+        pub device_id: Option<String>,
+    }
+
     pub struct ChannelSlowmode {
         pub channel_id: String,
         pub duration: u64,

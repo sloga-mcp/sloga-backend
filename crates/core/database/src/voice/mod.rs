@@ -22,7 +22,7 @@ pub mod annotations;
 pub mod remote_control;
 pub mod watch;
 mod voice_client;
-pub use voice_client::VoiceClient;
+pub use voice_client::{screen_leg_participant_permissions, VoiceClient};
 
 async fn get_connection() -> Result<Conn> {
     _get_connection()
@@ -270,6 +270,123 @@ pub async fn clear_voice_participant_identities(channel_id: &str) -> Result<()> 
         .to_internal_error()
 }
 
+/// The THIRD segment of a participant identity, if any — `"screen"` for a
+/// screen leg (android-screen-share plan §2.2).
+///
+/// A leg is a second, publish-only SFU participant owned by a primary: the
+/// native Android publisher, which cannot hand its MediaProjection capture to
+/// the WebView's sealed WebRTC stack. `splitn(3, ..)` deliberately stops at
+/// three, so a fourth segment lands inside the third and never reads as a leg.
+pub fn participant_leg(identity: &str) -> Option<&str> {
+    identity.splitn(3, ':').nth(2)
+}
+
+/// Whether a participant identity belongs to a screen leg. Everything
+/// server-side treats a leg as a HELPER of its owner, never a member: it gets
+/// no voice state, no identity mapping and no roster slot (plan §2.3).
+pub fn is_screen_leg(identity: &str) -> bool {
+    participant_leg(identity) == Some("screen")
+}
+
+/// The leg identity for a primary participant identity — a PURE FUNCTION of
+/// the primary, so every "...and also the leg" operation can derive its target
+/// without storing one.
+///
+/// A bare (non-device-qualified) primary gets an EMPTY device segment so the
+/// result always has THREE segments: `"{primary}:screen"` on a bare `user`
+/// would yield `user:screen`, which every parser reads as device = `"screen"`
+/// — including `member_edit`'s `strip_prefix("{user}:")` (rev-2 review
+/// §0-R.3).
+pub fn screen_leg_identity(primary: &str) -> String {
+    if primary.contains(':') {
+        format!("{primary}:screen")
+    } else {
+        format!("{primary}::screen")
+    }
+}
+
+/// Record a live screen leg: HASH `vc_leg:{channel_id}`, field `user_id` ->
+/// the leg participant's SFU sid (voice-ingress, on leg join).
+///
+/// Mirrors `voice_identity:{channel_id}` and carries NO TTL — no voice key
+/// has one, and a TTL'd marker would silently stop guarding a long share.
+/// Cleaned by HDEL in [`delete_voice_state`] and DEL in
+/// [`delete_channel_voice_state`], the two chokepoints every leave /
+/// reconcile / `room_finished` path already shares.
+///
+/// The sid is what makes the leave leg idempotent under re-share: a leg that
+/// left AFTER a newer one replaced it must not clear the new share's flags.
+pub async fn record_screen_leg(channel_id: &str, user_id: &str, sid: &str) -> Result<()> {
+    get_connection()
+        .await?
+        .hset(format!("vc_leg:{channel_id}"), user_id, sid)
+        .await
+        .to_internal_error()
+}
+
+/// The sid of the screen leg currently recorded for a user, if any
+pub async fn get_screen_leg_sid(channel_id: &str, user_id: &str) -> Result<Option<String>> {
+    get_connection()
+        .await?
+        .hget(format!("vc_leg:{channel_id}"), user_id)
+        .await
+        .to_internal_error()
+}
+
+/// Forget a user's screen-leg marker
+pub async fn delete_screen_leg(channel_id: &str, user_id: &str) -> Result<()> {
+    get_connection()
+        .await?
+        .hdel(format!("vc_leg:{channel_id}"), user_id)
+        .await
+        .to_internal_error()
+}
+
+/// A screen leg left the SFU (voice-ingress `participant_left`, plan §2.3).
+/// Returns the voice-state delta to announce, or `None` when the event must
+/// be ignored entirely.
+///
+/// Two guards, in this order — the order is the point:
+///
+/// 1. **Voice state FIRST.** If the owner has no voice state in this channel
+///    the primary already left and `delete_voice_state` ran. `update_voice_state`
+///    SETs `screensharing:` / `screen_video:` unconditionally, so writing here
+///    would resurrect two TTL-less keys nothing will ever clean, fan a
+///    spurious `UserVoiceStateUpdate` for a departed user, and fire a
+///    `clear_allowed_annotators` broadcast (rev-2 review §0-R.13).
+/// 2. **Then the sid.** A marker that no longer names this participant means a
+///    NEWER leg replaced it (the SFU evicts the older connection on a
+///    same-identity join); clearing the flags would blank the live share.
+///
+/// LiveKit does not reliably emit `track_unpublished` for a participant that
+/// simply vanished, so this is what actually clears the "X is sharing" badge.
+/// Deliberately NOT here: `delete_voice_state` (the owner is still in the
+/// call) and any remote-control release (the sharer's primary is still
+/// connected).
+pub async fn screen_leg_left(
+    channel: &UserVoiceChannel,
+    user_id: &str,
+    sid: &str,
+) -> Result<Option<PartialUserVoiceState>> {
+    if get_voice_state(channel, user_id).await?.is_none() {
+        return Ok(None);
+    }
+
+    if get_screen_leg_sid(&channel.id, user_id).await?.as_deref() != Some(sid) {
+        return Ok(None);
+    }
+
+    // Source 3 clears BOTH `screensharing` and `screen_video`; source 4 is the
+    // screen-audio half of the same share (slice 4). Its partial is subsumed
+    // by source 3's, which is what the caller announces.
+    let partial = update_voice_state_tracks(channel, user_id, false, 3).await?;
+    update_voice_state_tracks(channel, user_id, false, 4).await?;
+
+    delete_screen_leg(&channel.id, user_id).await?;
+
+    Ok(Some(partial))
+}
+
 pub async fn set_channel_node(channel_id: &str, node: &str) -> Result<()> {
     get_connection()
         .await?
@@ -504,6 +621,10 @@ pub async fn delete_voice_state(channel: &UserVoiceChannel, user_id: &str) -> Re
     Pipeline::new()
         .srem(format!("vc_members:{}", &channel.id), user_id)
         .srem(format!("vc:{user_id}"), channel)
+        // A screen leg cannot outlive the voice state it hangs off: this is
+        // the chokepoint every leave / reconcile path shares, so the marker
+        // dies here rather than needing its own TTL (plan §2.3).
+        .hdel(format!("vc_leg:{}", &channel.id), user_id)
         .del(&[
             format!("joined_at:{unique_key}"),
             format!("is_publishing:{unique_key}"),
@@ -539,6 +660,9 @@ pub async fn delete_channel_voice_state(
     let mut pipeline = Pipeline::new();
     pipeline.del(format!("vc_members:{}", &channel.id));
     pipeline.del(format!("node:{}", &channel.id));
+    // Covers `room_finished` and `reconcile_channel`, which pass no user ids:
+    // the whole call is gone, so every screen-leg marker goes with it.
+    pipeline.del(format!("vc_leg:{}", &channel.id));
 
     for user_id in user_ids {
         let unique_key = format!("{user_id}:{parent_id}");
@@ -941,6 +1065,51 @@ mod permission_tests {
             user_id_from_participant_identity(&format!("{user}:{device}")),
             user
         );
+    }
+
+    /// The leg identity grammar (android-screen-share plan §2.2 / §0-R.3).
+    /// Three segments ALWAYS: `"{primary}:screen"` on a bare primary yields
+    /// the two-segment `user:screen`, which every existing parser reads as
+    /// device = "screen" — `member_edit`'s `strip_prefix("{user}:")` included.
+    #[test]
+    fn screen_leg_identity_always_has_three_segments() {
+        use super::{is_screen_leg, participant_leg, screen_leg_identity};
+
+        let user = "01KX7HASD9FHBYA3XGKA5YACYX";
+        let device = "4208aa7e9ff58761b2d7a5d6c45f7383";
+        let qualified = format!("{user}:{device}");
+
+        let leg = screen_leg_identity(&qualified);
+        assert_eq!(leg, format!("{user}:{device}:screen"));
+
+        let bare_leg = screen_leg_identity(user);
+        assert_eq!(bare_leg, format!("{user}::screen"));
+        assert_eq!(bare_leg.split(':').count(), 3);
+        assert_eq!(
+            bare_leg.split(':').nth(1),
+            Some(""),
+            "a bare primary gets an EMPTY device segment, not a device named \"screen\""
+        );
+
+        for identity in [&leg, &bare_leg] {
+            assert!(is_screen_leg(identity));
+            assert_eq!(participant_leg(identity), Some("screen"));
+            // Every existing parser takes segment 0 (user) or 1 (device) and
+            // survives a third — the property the whole design rests on.
+            assert_eq!(user_id_from_participant_identity(identity), user);
+        }
+
+        // One- and two-segment identities are PRIMARIES, never legs.
+        assert_eq!(participant_leg(user), None);
+        assert!(!is_screen_leg(user));
+        assert_eq!(participant_leg(&qualified), None);
+        assert!(!is_screen_leg(&qualified));
+
+        // A fourth segment lands INSIDE the third (splitn stops at three), so
+        // `user:dev:screen:anything` is not a leg.
+        let overlong = format!("{user}:{device}:screen:extra");
+        assert_eq!(participant_leg(&overlong), Some("screen:extra"));
+        assert!(!is_screen_leg(&overlong));
     }
 
     #[test]
@@ -1859,5 +2028,141 @@ mod tests {
 
         delete_voice_state(&channel, &user).await.expect("cleanup");
         assert!(get_voice_state(&channel, &user).await.unwrap().is_none());
+    }
+
+    // The screen-leg marker (`vc_leg:{channel}`) and the two leave guards
+    // (android-screen-share plan §2.3). There is no voice-ingress test infra
+    // (zero `#[cfg(test)]`, `VoiceClient` wraps a concrete `RoomClient` with
+    // no trait to fake), so this is where the leg's state logic is actually
+    // proven; the SFU-side removals are covered only by the live leg §10.1.
+    //
+    // The ORDER of the guards is the whole point: the voice-state guard must
+    // run BEFORE any write, or a leg leaving after its owner resurrects
+    // TTL-less `screensharing:` / `screen_video:` keys nothing will ever clean
+    // up, plus a spurious update event for a departed user (§0-R.13).
+    #[test]
+    fn screen_leg_marker_lifecycle_and_leave_guards() {
+        rt().block_on(screen_leg_marker_case())
+    }
+
+    async fn screen_leg_marker_case() {
+        let suffix = ulid::Ulid::new().to_string();
+        let channel = UserVoiceChannel {
+            id: format!("chan{suffix}"),
+            server_id: Some(format!("srv{suffix}")),
+        };
+        let user = format!("user{suffix}");
+        let unique_key = format!("{user}:srv{suffix}");
+
+        create_voice_state(&channel, &user, Timestamp::now_utc())
+            .await
+            .expect("seed voice state");
+
+        // The leg joins and publishes: the marker is the leg's, the FLAGS are
+        // the owner's — a leg never gets voice state of its own.
+        record_screen_leg(&channel.id, &user, "SID_ONE").await.unwrap();
+        update_voice_state_tracks(&channel, &user, true, 3)
+            .await
+            .unwrap();
+        assert_eq!(
+            get_screen_leg_sid(&channel.id, &user)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("SID_ONE")
+        );
+
+        // Sid guard: a leave from a participant the marker no longer names is
+        // an OLDER leg that a re-share already replaced (the SFU evicts the
+        // earlier connection on a same-identity join). Acting on it would
+        // blank the live share's badge.
+        assert!(screen_leg_left(&channel, &user, "SID_ZERO")
+            .await
+            .unwrap()
+            .is_none());
+        let state = get_voice_state(&channel, &user).await.unwrap().unwrap();
+        assert!(
+            state.screen_video,
+            "a superseded leg's late leave must not clear a live share"
+        );
+        assert_eq!(
+            get_screen_leg_sid(&channel.id, &user)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("SID_ONE"),
+            "...nor drop the live leg's marker"
+        );
+
+        // The real leave clears BOTH flags, drops the marker, and hands back
+        // the delta to announce (LiveKit does not reliably send
+        // track_unpublished for a participant that vanished).
+        let partial = screen_leg_left(&channel, &user, "SID_ONE")
+            .await
+            .unwrap()
+            .expect("the owning leg's leave must yield a voice-state delta");
+        assert_eq!(partial.screensharing, Some(false));
+        assert_eq!(partial.screen_video, Some(false));
+        let state = get_voice_state(&channel, &user).await.unwrap().unwrap();
+        assert!(!state.screensharing);
+        assert!(!state.screen_video);
+        assert!(get_screen_leg_sid(&channel.id, &user)
+            .await
+            .unwrap()
+            .is_none());
+
+        // Idempotent: a duplicate delivery finds no marker and does nothing.
+        assert!(screen_leg_left(&channel, &user, "SID_ONE")
+            .await
+            .unwrap()
+            .is_none());
+
+        // `delete_voice_state` is the chokepoint every leave / reconcile path
+        // shares, and the marker hash has NO TTL — a field it failed to clean
+        // would outlive the call forever.
+        record_screen_leg(&channel.id, &user, "SID_TWO").await.unwrap();
+        delete_voice_state(&channel, &user).await.expect("leave");
+        assert!(get_screen_leg_sid(&channel.id, &user)
+            .await
+            .unwrap()
+            .is_none());
+
+        // Owner gone, and a marker deliberately re-seeded so the SID guard
+        // alone would let this through: the voice-state guard must fire first
+        // and write nothing at all.
+        record_screen_leg(&channel.id, &user, "SID_THREE")
+            .await
+            .unwrap();
+        assert!(screen_leg_left(&channel, &user, "SID_THREE")
+            .await
+            .unwrap()
+            .is_none());
+
+        let mut conn = get_connection().await.unwrap();
+        let (screensharing, screen_video): (Option<bool>, Option<bool>) = conn
+            .mget(&[
+                format!("screensharing:{unique_key}"),
+                format!("screen_video:{unique_key}"),
+            ])
+            .await
+            .unwrap();
+        assert!(
+            screensharing.is_none() && screen_video.is_none(),
+            "a leg leaving after its owner must not resurrect TTL-less voice-state keys"
+        );
+
+        // `delete_channel_voice_state` (room_finished / reconcile_channel,
+        // which pass no user ids) drops the whole per-channel hash.
+        delete_channel_voice_state(&channel, &[user.clone()])
+            .await
+            .expect("cleanup");
+        let leg_hash_exists: bool = conn
+            .exists(format!("vc_leg:{}", &channel.id))
+            .await
+            .unwrap();
+        assert!(
+            !leg_hash_exists,
+            "the per-channel leg hash must not outlive the call"
+        );
     }
 }

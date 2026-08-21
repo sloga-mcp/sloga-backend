@@ -8,7 +8,8 @@ use revolt_database::{
         clear_voice_participant_identities, create_voice_state, delete_channel_voice_state,
         delete_voice_state, delete_voice_participant_identity, get_user_moved_from_voice,
         get_user_moved_to_voice, get_user_voice_channels, get_voice_channel_members,
-        is_screenshare_video, is_video_source, mls_cap_would_refuse,
+        get_voice_state, is_screen_leg, is_screenshare_video, is_video_source,
+        mls_cap_would_refuse, record_screen_leg, screen_leg_identity, screen_leg_left,
         set_voice_participant_identity,
         update_voice_state_tracks, user_id_from_participant_identity, video_roster_over_cap,
         RoomMetadata, UserVoiceChannel, VoiceClient, MAX_VIDEO_PARTICIPANTS,
@@ -78,6 +79,254 @@ pub async fn ingress(
             Some(serde_json::from_str::<RoomMetadata>(&room.metadata).to_internal_error()?)
         }
         _ => None,
+    };
+
+    // A SCREEN LEG (identity `{user}:{device}:screen`, android-screen-share
+    // plan §2.3) is a HELPER of the user it belongs to, never a member of the
+    // call: no voice state, no identity mapping (that map is per USER and
+    // `remove_user` / `update_permissions` / the RC revoke all resolve through
+    // it — a leg writing there would redirect every moderation action at the
+    // phone), no roster slot, no join/leave events and no ring. Everything it
+    // touches hangs off its OWNER's voice state, which is why every branch
+    // below checks that state first.
+    //
+    // Deliberately NOT gated on `features.screen_leg`: the route ships dark
+    // while the viewer-side rollout lands, but a hand-minted probe leg still
+    // has to be handled correctly (plan §0.8).
+    if identity.is_some_and(|identity| is_screen_leg(identity)) {
+        let identity = identity.to_internal_error()?;
+        let channel_id = channel_id.to_internal_error()?;
+        let user_id = user_id.to_internal_error()?;
+
+        match event.event.as_str() {
+            "participant_joined" => {
+                let channel = UserVoiceChannel {
+                    id: channel_id.clone(),
+                    server_id: room_metadata.to_internal_error()?.server,
+                };
+
+                // Orphan sanity check. The route refuses to mint a leg for a
+                // user who is not in the call, so an owner with no voice state
+                // here means a stale or hand-minted leg — eject it rather than
+                // leave a participant nobody can attribute (viewer-side it
+                // reads as a non-enrolled stranger and downgrades the call).
+                // Nothing else is touched: the owner may be in another channel.
+                if get_voice_state(&channel, user_id).await?.is_none() {
+                    log::warn!("Removing orphan screen leg {identity} from channel {channel_id}: owner has no voice state here.");
+                    let _ = voice_client
+                        .remove_identity(node, identity, channel_id)
+                        .await;
+                    return Ok(EmptyResponse);
+                }
+
+                let sid = &event.participant.as_ref().to_internal_error()?.sid;
+
+                record_screen_leg(channel_id, user_id, sid).await?;
+            }
+            "participant_left" => {
+                let channel = UserVoiceChannel {
+                    id: channel_id.clone(),
+                    server_id: room_metadata.to_internal_error()?.server,
+                };
+
+                let sid = &event.participant.as_ref().to_internal_error()?.sid;
+
+                // This is what actually clears the "X is sharing" badge:
+                // LiveKit does not reliably emit `track_unpublished` for a
+                // participant that simply vanished (process death, swipe-away,
+                // SFU timeout). Both guards — owner voice state FIRST, then
+                // the sid — live in `screen_leg_left`; `None` means the event
+                // must be ignored entirely. No `delete_voice_state` (the owner
+                // is still in the call) and no remote-control release (their
+                // primary is still connected).
+                if let Some(partial) = screen_leg_left(&channel, user_id, sid).await? {
+                    EventV1::UserVoiceStateUpdate {
+                        id: user_id.clone(),
+                        channel_id: channel_id.clone(),
+                        data: partial,
+                    }
+                    .p(channel_id.clone())
+                    .await;
+                }
+            }
+            "track_published" | "track_unpublished" | "track_unmuted" | "track_muted" => {
+                let track = event.track.as_ref().to_internal_error()?;
+
+                // Track events carry no room metadata; recover the channel
+                // from the OWNER's voice state. Unrecoverable means there is
+                // nothing to update — answer 200, because a 500 here buys a
+                // LiveKit retry storm and no useful state.
+                let channel = match room_metadata {
+                    Some(metadata) => UserVoiceChannel {
+                        id: channel_id.clone(),
+                        server_id: metadata.server,
+                    },
+                    None => match get_user_voice_channels(user_id)
+                        .await?
+                        .into_iter()
+                        .find(|channel| &channel.id == channel_id)
+                    {
+                        Some(channel) => channel,
+                        None => return Ok(EmptyResponse),
+                    },
+                };
+
+                // Voice-state guard, as on every leg path: with the owner gone
+                // `update_voice_state_tracks` would SET `screensharing:` /
+                // `screen_video:` for a user who has left, and nothing would
+                // ever clean those keys up (plan §0-R.13).
+                if get_voice_state(&channel, user_id).await?.is_none() {
+                    return Ok(EmptyResponse);
+                }
+
+                let user = Reference::from_unchecked(user_id).as_user(db).await?;
+
+                let user_limits = user.limits().await;
+
+                // The SAME limit rules as a primary publisher — but every
+                // remedy addresses the LEG identity, so enforcement can never
+                // eject or mute the MEMBER over what their phone published.
+                if event.event == "track_published" {
+                    let mut disconnect = false;
+                    let mut mute_offending = false;
+
+                    if track.r#type == TrackType::Data as i32 {
+                        log::warn!("Screen leg {identity} published data — removing it from channel {channel_id}.");
+                        disconnect = true;
+                    };
+
+                    if track.r#type != TrackType::Audio as i32
+                        && track.source == 0
+                    /* TrackSource::Unknown */
+                    {
+                        log::warn!("Screen leg {identity} published a non-audio track on the whisper source — removing it from channel {channel_id}.");
+                        disconnect = true;
+                    };
+
+                    if track.r#type == TrackType::Video as i32 {
+                        let area = track.width as u64 * track.height as u64;
+                        let limit_area = user_limits.video_resolution[0] as u64
+                            * user_limits.video_resolution[1] as u64;
+
+                        if user_limits.video_resolution[0] != 0
+                            && user_limits.video_resolution[1] != 0
+                            && area > limit_area
+                        {
+                            log::warn!(
+                                "Screen leg {identity} published video over the resolution limit ({}x{}) — removing it from channel {channel_id}.",
+                                track.width,
+                                track.height
+                            );
+                            disconnect = true;
+                        };
+
+                        if track.width > 0 && track.height > 0 {
+                            let aspect = track.width as f32 / track.height as f32;
+
+                            // A phone panel is 20:9 in landscape and 9:20 in
+                            // portrait (0.45), both comfortably inside the
+                            // screenshare band — which is why the leg's own
+                            // quality table caps the long side rather than
+                            // relying on this.
+                            if is_screenshare_video(track.source) {
+                                if !(SCREENSHARE_ASPECT_MIN..=SCREENSHARE_ASPECT_MAX)
+                                    .contains(&aspect)
+                                {
+                                    log::warn!(
+                                        "Muting screen leg {identity} in channel {channel_id}: aspect {aspect} outside {SCREENSHARE_ASPECT_MIN}..={SCREENSHARE_ASPECT_MAX} ({}x{}).",
+                                        track.width,
+                                        track.height
+                                    );
+                                    mute_offending = true;
+                                };
+                            } else if user_limits.video_aspect_ratio[0]
+                                != user_limits.video_aspect_ratio[1]
+                                && !(user_limits.video_aspect_ratio[0]
+                                    ..=user_limits.video_aspect_ratio[1])
+                                    .contains(&aspect)
+                            {
+                                log::warn!("Screen leg {identity} published video with out of bounds aspect ratio ({aspect}) — removing it from channel {channel_id}.");
+                                disconnect = true;
+                            };
+                        };
+                    };
+
+                    if disconnect {
+                        // Eject the LEG, never the member. No
+                        // `delete_voice_state` — the user never left the call
+                        // — and no remote-control release, since their primary
+                        // is still connected and may still be sharing from it.
+                        let _ = voice_client
+                            .remove_identity(node, identity, channel_id)
+                            .await;
+
+                        return Ok(EmptyResponse);
+                    };
+
+                    if mute_offending {
+                        let _ = voice_client
+                            .mute_track_identity(node, identity, channel_id, &track.sid)
+                            .await;
+
+                        return Ok(EmptyResponse);
+                    };
+
+                    // D12 video cap. A leg never reaches `vc_members`, so it
+                    // consumes no roster slot of its own — the count it is
+                    // measured against is the same one the route checked.
+                    if is_video_source(track.source) {
+                        let members = get_voice_channel_members(&channel)
+                            .await?
+                            .map(|m| m.len())
+                            .unwrap_or(0);
+                        if members > MAX_VIDEO_PARTICIPANTS {
+                            log::debug!("Muting over-cap screen leg track {} for {identity} in channel {channel_id} (>{MAX_VIDEO_PARTICIPANTS} present).", track.sid);
+                            let _ = voice_client
+                                .mute_track_identity(node, identity, channel_id, &track.sid)
+                                .await;
+                            return Ok(EmptyResponse);
+                        };
+                    };
+                };
+
+                // The leg's tracks ARE the user's share: this sets
+                // `screen_video` / `screensharing` on the OWNER's voice state,
+                // which is the "X is sharing" signal every client renders. One
+                // slot per user, exactly as for a desktop share.
+                let partial = update_voice_state_tracks(
+                    &channel,
+                    user_id,
+                    event.event == "track_published" || event.event == "track_unmuted",
+                    track.source,
+                )
+                .await?;
+
+                // Unchanged from the primary path: control over a screen the
+                // controller can no longer see is worse than no control.
+                if partial.screen_video == Some(false) {
+                    revolt_database::voice::remote_control::release_remote_control_for_user(
+                        db,
+                        voice_client,
+                        &channel,
+                        user_id,
+                        "screenshare_ended",
+                        false,
+                    )
+                    .await;
+                }
+
+                EventV1::UserVoiceStateUpdate {
+                    id: user_id.clone(),
+                    channel_id: channel_id.clone(),
+                    data: partial,
+                }
+                .p(channel_id.clone())
+                .await;
+            }
+            _ => {}
+        };
+
+        return Ok(EmptyResponse);
     };
 
     match event.event.as_str() {
@@ -236,6 +485,22 @@ pub async fn ingress(
                 true,
             )
             .await;
+
+            // A phone leg must not outlive the WebView that owns it. This
+            // addresses the SFU with a target derived from the EVENT identity,
+            // so it still works when the identity MAPPING is already gone —
+            // the documented gap in the derive-from-mapping path (plan §2.2),
+            // which makes this hook load-bearing rather than redundant.
+            //
+            // 🔴 There is no grace here: a WebView full reconnect (wifi →
+            // cellular) fires this event, so it also ends the share. The phone
+            // reports `stopped{disconnected}` and offers "share again" (plan
+            // §7.5); an ingress leave grace is a follow-up, not v1.
+            if let Some(identity) = identity {
+                let _ = voice_client
+                    .remove_identity(node, &screen_leg_identity(identity), channel_id)
+                    .await;
+            };
 
             delete_voice_state(&channel, user_id).await?;
             delete_voice_participant_identity(channel_id, user_id).await?;

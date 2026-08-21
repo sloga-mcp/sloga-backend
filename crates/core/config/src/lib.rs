@@ -778,6 +778,18 @@ pub struct Features {
     #[serde(default)]
     pub remote_control: bool,
 
+    /// Operator flag for the native Android screen-share leg
+    /// (`POST /channels/{id}/screen_leg`, android-screen-share plan §0.8).
+    /// Ships DARK: an un-updated viewer has no frame key for the leg's
+    /// `{user}:{device}:screen` identity and latches NOT-ENCRYPTED for the
+    /// rest of the call, so the flag stays false until the viewer-side
+    /// changes are live on every surface (plan §0.1). `config()` is cached
+    /// per process, so flipping it requires a delta restart. voice-ingress
+    /// is deliberately NOT gated on it — a hand-minted probe leg still
+    /// needs its webhook branches.
+    #[serde(default)]
+    pub screen_leg: bool,
+
     /// Optional server id that every newly-onboarded user is automatically
     /// added to (a "Welcome" / landing-spot server). Empty/unset disables the
     /// behaviour. Existing users are unaffected (backfill separately).

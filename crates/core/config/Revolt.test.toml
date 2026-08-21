@@ -16,6 +16,7 @@ e2ee_enabled = true
 media_e2ee_enabled = true
 events_enabled = true
 remote_control = true
+screen_leg = true
 
 [api.smtp]
 host = "localhost"

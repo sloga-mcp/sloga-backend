@@ -61,6 +61,7 @@ mod thread_list;
 mod thread_members;
 mod soundboard_trigger;
 mod voice_join;
+mod voice_screen_leg;
 mod voice_stop_ring;
 mod watch;
 mod webhook_create;
@@ -96,6 +97,7 @@ pub fn routes() -> (Vec<Route>, OpenApi) {
         group_add_member::add_member,
         group_remove_member::remove_member,
         voice_join::call,
+        voice_screen_leg::screen_leg,
         voice_stop_ring::stop_ring,
         soundboard_trigger::trigger_sound,
         captions_send::send_caption,

@@ -14,6 +14,38 @@ use revolt_result::{create_error, Result};
 
 use rocket::{serde::json::Json, State};
 
+/// Device-qualified join (media E2EE, plan Q4): the claimed device must be a
+/// registered E2EE device of the calling user AND the calling session must be
+/// bound to it — a stolen web token cannot then impersonate a device identity
+/// on the SFU. A bare join (no device id) is the pre-E2EE path and passes.
+///
+/// Shared by `join_call` and `screen_leg` (android-screen-share plan §2.1
+/// step 5) rather than copied: a duplicated security check drifts, and the
+/// leg's identity is derived from a device claim exactly as the primary's is.
+pub(crate) async fn assert_device_bound_session(
+    db: &Database,
+    user: &User,
+    session: &Session,
+    device_id: Option<&str>,
+) -> Result<()> {
+    let Some(device_id) = device_id else {
+        return Ok(());
+    };
+
+    crate::routes::mls::require_media_e2ee_enabled().await?;
+
+    let identity = db
+        .fetch_e2ee_identity(&user.id, device_id)
+        .await
+        .map_err(|_| {
+            create_error!(FailedValidation {
+                error: "joining device is not registered".to_string()
+            })
+        })?;
+
+    identity.assert_bound_session(&session.id)
+}
+
 /// # Join Call
 ///
 /// Asks the voice server for a token to join the call.
@@ -42,23 +74,7 @@ pub async fn call(
         return Err(create_error!(IsBot));
     }
 
-    // Device-qualified join (media E2EE, plan Q4): the claimed device must
-    // be a registered E2EE device of the calling user AND the session must
-    // be bound to it — a stolen web token cannot impersonate a device
-    // identity on the SFU.
-    if let Some(device_id) = &device_id {
-        crate::routes::mls::require_media_e2ee_enabled().await?;
-
-        let identity = db
-            .fetch_e2ee_identity(&user.id, device_id)
-            .await
-            .map_err(|_| {
-                create_error!(FailedValidation {
-                    error: "joining device is not registered".to_string()
-                })
-            })?;
-        identity.assert_bound_session(&session.id)?;
-    }
+    assert_device_bound_session(db, &user, &session, device_id.as_deref()).await?;
 
     let channel = target.as_channel(db).await?;
 

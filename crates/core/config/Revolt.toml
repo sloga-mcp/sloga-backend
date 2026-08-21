@@ -272,6 +272,17 @@ welcome_server = ""
 # revokes nothing by itself — the crond reaper mass-revokes live grants when
 # it observes the flag off, so crond must be restarted too.
 remote_control = false
+# Native Android screen-share leg (android-screen-share plan §0.8): the
+# `POST /channels/{id}/screen_leg` route that mints a publish-only token for a
+# second SFU participant, `{user}:{device}:screen`. Ships DARK and MUST stay
+# dark until the viewer-side changes are live on every surface: an un-updated
+# viewer has no frame key for the leg identity, takes a missing-key decrypt
+# error outside any rotation window, and LATCHES NOT-ENCRYPTED for the rest of
+# the call (plan §0.1). Flip in Revolt.overrides.toml under an explicit
+# [features] header and RESTART delta — config file sources are frozen into the
+# process at first access. voice-ingress is intentionally NOT gated on this
+# flag: its leg branches must run for a hand-minted probe leg.
+screen_leg = false
 
 # --- Server boosts (Discord-style) ---
 # The feature ships DARK: all keys below default in code to the values shown,
