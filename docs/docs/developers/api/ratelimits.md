@@ -16,8 +16,14 @@ There are distinct buckets that you may be calling against, none of these affect
 |  `PATCH` | `/users/:id`                |   2   |
 |          | `/users/:id/default_avatar` |  255  |
 |          | `/bots`                     |  10   |
+|          | `/bots/:id/commands`        |  10   |
 |          | `/channels`                 |  15   |
 |   `POST` | `/channels/:id/messages`    |  10   |
+|   `POST` | `/channels/:id/interactions` |  10   |
+|   `POST` | `/channels/:id/interactions/autocomplete` |  40   |
+|   `POST` | `/channels/:id/messages/:id/interact` |  20   |
+|          | `/interactions/:id/respond` |  30   |
+|          | `/interactions/:id/autocomplete` |  40   |
 |          | `/servers`                  |   5   |
 |          | `/auth`                     |   3   |
 | `DELETE` | `/auth`                     |  255  |
@@ -39,7 +45,9 @@ There are multiple headers you can use to figure out when you can and cannot sen
 
 ## Rate Limited Response
 
-When you receive `429 Too Many Requests`, you will also receive a JSON body with the schema:
+When you receive `429 Too Many Requests`, read `X-RateLimit-Reset-After` to find out how long to wait. It is present on every response, including the 429 itself.
+
+**Do not rely on the response body.** The main API sends the wait in the headers only; the body of a 429 is not part of the contract and should not be parsed. The file upload service does return a JSON body alongside the headers:
 
 ```typescript
 interface Response {

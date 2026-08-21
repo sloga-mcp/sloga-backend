@@ -13,3 +13,5 @@ Then you may provide these through either:
 | User  | `X-Session-Token` |
 
 When dealing with an authenticated route.
+
+If you are building a bot, start with [Bots](../bots/index.md).

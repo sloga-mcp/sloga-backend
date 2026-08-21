@@ -566,6 +566,74 @@ Emoji has been deleted.
 }
 ```
 
+### InteractionCreate
+
+A user ran a slash command, used a component, or submitted a form addressed to your bot. Only ever sent to the bot the interaction is for, because it carries the single-use response token.
+
+```json
+{
+  "type": "InteractionCreate",
+  "interaction": {
+    "_id": "{interaction_id}",
+    "kind": "Command",
+    "channel_id": "{channel_id}",
+    "user_id": "{user_id}",
+    "bot_id": "{bot_id}",
+    "command_name": "{command_name}",
+    "options": {..},
+    "token": "{token}"
+  }
+}
+```
+
+- `kind` is one of `Command`, `Component`, `Autocomplete` or `ModalSubmit`.
+- `custom_id`, `values`, `message_id`, `command_id` and `focused_option` are present depending on the kind.
+- See [Interactions](../bots/interactions.md) for how to respond.
+
+### InteractionEphemeralMessage
+
+A bot replied to your interaction privately. The message is never stored — it exists only as this event, and is gone on reload.
+
+```json
+{
+  "type": "InteractionEphemeralMessage",
+  "message": {..}
+}
+```
+
+- Only sent to the user who triggered the interaction.
+
+### InteractionAutocompleteResult
+
+A bot returned suggestions for the command option you are typing.
+
+```json
+{
+  "type": "InteractionAutocompleteResult",
+  "interaction_id": "{interaction_id}",
+  "choices": [{..}]
+}
+```
+
+- Only sent to the user who requested the suggestions.
+- `interaction_id` matches the one returned when the autocomplete was requested; ignore results for a request you have moved on from.
+
+### InteractionModalOpen
+
+A bot asked you to fill in a form.
+
+```json
+{
+  "type": "InteractionModalOpen",
+  "interaction_id": "{interaction_id}",
+  "source_id": "{interaction_id}",
+  "modal": {..}
+}
+```
+
+- Only sent to the user the form is for.
+- `interaction_id` is a **new** interaction to submit the completed form against; `source_id` is the interaction that opened it, so a pending command can be resolved.
+
 ### Auth
 
 Forwarded events from [Authifier](https://github.com/authifier/authifier), currently only session deletion events are forwarded.
