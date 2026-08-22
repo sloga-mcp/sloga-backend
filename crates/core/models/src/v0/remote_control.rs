@@ -19,6 +19,26 @@ auto_derived!(
         /// Control-session id minted by the sharer's native layer: base64
         /// (standard, no padding), exactly 32 bytes decoded. Opaque bytes.
         pub rc_session_id: String,
+        /// Which class of input this session carries: `kbm` (mouse and
+        /// keyboard) or `gamepad` (a virtual controller — couch co-op
+        /// §2.2). **Absent means `kbm`**, which is what every client that
+        /// predates the class sends.
+        ///
+        /// 🔴 **DISPLAY-ONLY, NEVER AN ENFORCEMENT INPUT.** The
+        /// authoritative class is the one bound into the two ends' HKDF
+        /// transcript, which their verification code covers; this copy
+        /// exists so third parties in the channel can be shown the right
+        /// badge. The server could lie about it and the two ends would be
+        /// unaffected — which is the design, not a gap.
+        #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+        pub input_class: Option<String>,
+        /// Control-protocol version the sharer's native layer speaks.
+        /// Relayed verbatim so the target's native layer can refuse a skew
+        /// at accept time with a legible message, instead of deriving a
+        /// transcript that cannot match and presenting as a MITM ten
+        /// seconds later. **Absent means v1.**
+        #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+        pub protocol_version: Option<u8>,
     }
 
     /// Response to a control offer (target only, offer-addressed)
@@ -30,6 +50,11 @@ auto_derived!(
         /// (hard reject otherwise); ignored on decline.
         #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
         pub controller_ephemeral_pub: Option<String>,
+        /// Control-protocol version the CONTROLLER's native layer speaks,
+        /// relayed to the sharer so it can refuse a skew before its arming
+        /// dialog and before it burns the session id. **Absent means v1.**
+        #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+        pub protocol_version: Option<u8>,
     }
 
     /// A created control offer

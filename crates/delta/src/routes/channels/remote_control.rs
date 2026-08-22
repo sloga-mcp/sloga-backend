@@ -25,8 +25,9 @@ use revolt_database::{
             create_remote_control_grant, create_remote_control_offer,
             delete_remote_control_grant_records, delete_remote_control_offer,
             end_remote_control_grant, fetch_remote_control_grant, fetch_remote_control_grant_by_id,
-            fetch_remote_control_offer, heartbeat_remote_control_grant, remote_control_party_busy,
-            RemoteControlGrant, RemoteControlGrantOutcome, RemoteControlOffer,
+            fetch_remote_control_offer, heartbeat_remote_control_grant, is_known_input_class,
+            remote_control_party_busy, RemoteControlGrant, RemoteControlGrantOutcome,
+            RemoteControlOffer, INPUT_CLASS_KBM,
         },
         remote_control_participant_permissions, voice_participant_permissions, UserVoiceChannel,
         VoiceClient,
@@ -213,6 +214,19 @@ pub async fn control_offer(
     require_opaque_32("sharer_ephemeral_pub", &data.sharer_ephemeral_pub)?;
     require_opaque_32("rc_session_id", &data.rc_session_id)?;
 
+    // Absent is `kbm` — every client that predates couch co-op. An unknown
+    // value is REFUSED rather than relayed: the string is fanned out to
+    // every client in the channel, and since it is advisory anyway there is
+    // nothing to gain by passing through one we cannot name.
+    let input_class = data
+        .input_class
+        .unwrap_or_else(|| INPUT_CLASS_KBM.to_string());
+    if !is_known_input_class(&input_class) {
+        return Err(create_error!(FailedValidation {
+            error: "input_class must be kbm or gamepad".to_string()
+        }));
+    }
+
     let channel = target.as_channel(db).await?;
     let target_user = Reference::from_unchecked(&data.target).as_user(db).await?;
 
@@ -232,6 +246,8 @@ pub async fn control_offer(
         target_id: target_user.id.clone(),
         sharer_ephemeral_pub: data.sharer_ephemeral_pub,
         rc_session_id: data.rc_session_id,
+        input_class,
+        protocol_version: data.protocol_version,
     };
 
     if !create_remote_control_offer(&offer).await? {
@@ -257,6 +273,8 @@ pub async fn control_offer(
         target_id: offer.target_id.clone(),
         sharer_ephemeral_pub: offer.sharer_ephemeral_pub.clone(),
         rc_session_id: offer.rc_session_id.clone(),
+        input_class: Some(offer.input_class.clone()),
+        protocol_version: offer.protocol_version,
     }
     .private(target_user.id.clone())
     .await;
@@ -360,6 +378,11 @@ pub async fn control_respond(
         sharer_id: offer.sharer_id.clone(),
         controller_id: user.id.clone(),
         controller_identity,
+        // Carried from the OFFER, never from the respond body: the class
+        // was fixed when the sharer chose what to hand over, and a
+        // responder that could restate it would be relabelling someone
+        // else's consent in every third party's UI.
+        input_class: offer.input_class.clone(),
     };
 
     // Record-first ordering fails closed: a record without a capability is
@@ -463,6 +486,7 @@ pub async fn control_respond(
         sharer_id: grant.sharer_id.clone(),
         controller_id: grant.controller_id.clone(),
         controller_ephemeral_pub,
+        controller_protocol_version: data.protocol_version,
     }
     .private(grant.sharer_id.clone())
     .await;
@@ -475,6 +499,7 @@ pub async fn control_respond(
         channel_id: grant.channel_id.clone(),
         sharer_id: grant.sharer_id.clone(),
         controller_id: grant.controller_id.clone(),
+        input_class: Some(grant.input_class.clone()),
     }
     .p(grant.channel_id.clone())
     .await;

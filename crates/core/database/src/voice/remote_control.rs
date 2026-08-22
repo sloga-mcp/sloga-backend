@@ -97,6 +97,41 @@ pub struct RemoteControlOffer {
     pub sharer_ephemeral_pub: String,
     /// Opaque base64: control-session id minted by the sharer's native layer
     pub rc_session_id: String,
+    /// `kbm` or `gamepad` (couch co-op §2.2). Defaulted rather than
+    /// `Option` so every consumer reads a class: records written before the
+    /// field existed deserialize as `kbm`, which is what they were.
+    ///
+    /// 🔴 **ADVISORY. DISPLAY-ONLY. NEVER AN ENFORCEMENT INPUT.** The
+    /// authoritative class is bound into the two ends' HKDF transcript and
+    /// covered by the verification code they compare. This copy exists so
+    /// the channel can show the right badge, and the server being able to
+    /// lie about it changes nothing on either end — that is the design.
+    #[serde(default = "default_input_class")]
+    pub input_class: String,
+    /// The sharer's control-protocol version, relayed so the target can
+    /// refuse a skew legibly at accept time. Absent means v1.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protocol_version: Option<u8>,
+}
+
+/// Serde default for [`RemoteControlOffer::input_class`] and
+/// [`RemoteControlGrant::input_class`]: a record with no class predates the
+/// field, and every such record is mouse-and-keyboard.
+fn default_input_class() -> String {
+    INPUT_CLASS_KBM.to_string()
+}
+
+/// The two classes the server will relay. Unknown values are refused at the
+/// route rather than passed through: this string is fanned out to every
+/// client in the channel, and the authoritative copy lives in the
+/// transcript anyway, so there is nothing to gain by relaying strings we
+/// cannot name.
+pub const INPUT_CLASS_KBM: &str = "kbm";
+pub const INPUT_CLASS_GAMEPAD: &str = "gamepad";
+
+/// Is this a class this server knows how to relay?
+pub fn is_known_input_class(value: &str) -> bool {
+    matches!(value, INPUT_CLASS_KBM | INPUT_CLASS_GAMEPAD)
 }
 
 /// An active control grant — the record tracking a live scoped
@@ -117,6 +152,11 @@ pub struct RemoteControlGrant {
     /// could therefore silently no-op for a device-qualified participant,
     /// so the revoke path must address the identity stored here.
     pub controller_identity: String,
+    /// Carried from the offer so the Ready-time snapshot can rebuild the
+    /// classed badge for a client that connects mid-session. Advisory and
+    /// display-only, exactly like the offer's copy.
+    #[serde(default = "default_input_class")]
+    pub input_class: String,
 }
 
 impl RemoteControlGrant {
@@ -510,6 +550,11 @@ pub async fn remote_control_active_snapshot(channel_ids: &[&str]) -> Vec<EventV1
                         channel_id: grant.channel_id,
                         sharer_id: grant.sharer_id,
                         controller_id: grant.controller_id,
+                        // The backfill has to carry the class too, or a
+                        // client that reconnects mid-session rebuilds a
+                        // badge that says the wrong thing about what is
+                        // being shared.
+                        input_class: Some(grant.input_class),
                     });
                 }
             }
@@ -803,6 +848,8 @@ mod tests {
             target_id: format!("target{suffix}"),
             sharer_ephemeral_pub: "c2hhcmVyLXB1Yg".to_string(),
             rc_session_id: "c2Vzc2lvbi1pZA".to_string(),
+            input_class: INPUT_CLASS_GAMEPAD.to_string(),
+            protocol_version: Some(2),
         }
     }
 
@@ -815,6 +862,57 @@ mod tests {
             sharer_id: format!("sharer{suffix}"),
             controller_id: format!("ctl{suffix}"),
             controller_identity: format!("ctl{suffix}:deadbeef"),
+            input_class: INPUT_CLASS_GAMEPAD.to_string(),
+        }
+    }
+
+    /// 🔴 **Records written before couch co-op existed must still
+    /// deserialize, and they must read as `kbm`.**
+    ///
+    /// The grant and offer records are JSON in Redis with no migration
+    /// step, so a session that was live across the deploy comes back
+    /// through `serde` with no `input_class` at all. Defaulting is what
+    /// keeps the reaper and the snapshot working on those rows — and `kbm`
+    /// is not a guess, it is what every one of them factually is.
+    #[test]
+    fn records_without_a_class_deserialize_as_kbm() {
+        let legacy_grant = r#"{
+            "id": "GRANTLEGACY",
+            "channel_id": "chan",
+            "server_id": null,
+            "node": "worldwide",
+            "sharer_id": "sharer",
+            "controller_id": "ctl",
+            "controller_identity": "ctl:deadbeef"
+        }"#;
+        let parsed: RemoteControlGrant = serde_json::from_str(legacy_grant).expect("legacy grant");
+        assert_eq!(parsed.input_class, INPUT_CLASS_KBM);
+
+        let legacy_offer = r#"{
+            "id": "OFFERLEGACY",
+            "channel_id": "chan",
+            "server_id": null,
+            "sharer_id": "sharer",
+            "target_id": "target",
+            "sharer_ephemeral_pub": "c2hhcmVyLXB1Yg",
+            "rc_session_id": "c2Vzc2lvbi1pZA"
+        }"#;
+        let parsed: RemoteControlOffer = serde_json::from_str(legacy_offer).expect("legacy offer");
+        assert_eq!(parsed.input_class, INPUT_CLASS_KBM);
+        // Absent version is v1 by construction — v1 is exactly the set of
+        // builds that could not send it.
+        assert_eq!(parsed.protocol_version, None);
+    }
+
+    /// Only the two classes this server knows are relayable. The route
+    /// refuses anything else rather than fanning an unrecognised string out
+    /// to every client in the channel.
+    #[test]
+    fn only_known_input_classes_are_relayable() {
+        assert!(is_known_input_class(INPUT_CLASS_KBM));
+        assert!(is_known_input_class(INPUT_CLASS_GAMEPAD));
+        for unknown in ["", "KBM", "pad", "gamepad ", "kbm\u{0000}"] {
+            assert!(!is_known_input_class(unknown), "{unknown:?} was relayable");
         }
     }
 
@@ -885,12 +983,18 @@ mod tests {
                     channel_id,
                     sharer_id,
                     controller_id,
+                    input_class,
                 } => {
                     assert_eq!(channel_id, &grant.channel_id);
                     assert_eq!(sharer_id, &grant.sharer_id);
                     // The redacted event carries the bare controller id,
                     // never the SFU identity or the grant id.
                     assert_eq!(controller_id, &grant.controller_id);
+                    // …and the class survives the Redis round trip, which
+                    // is the whole reason the grant record carries it: a
+                    // client that connects mid-session rebuilds its badge
+                    // from here and from nothing else.
+                    assert_eq!(input_class.as_deref(), Some(INPUT_CLASS_GAMEPAD));
                 }
                 other => panic!("expected RemoteControlActive, got {other:?}"),
             }

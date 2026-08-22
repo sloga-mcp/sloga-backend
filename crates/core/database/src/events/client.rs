@@ -569,6 +569,18 @@ pub enum EventV1 {
         target_id: String,
         sharer_ephemeral_pub: String,
         rc_session_id: String,
+        /// `kbm` or `gamepad` (couch co-op §2.2). ADVISORY — the class the
+        /// two ends actually derive under is bound into their HKDF
+        /// transcript; this is what the target's native layer is told to
+        /// bind, and if the server lied the two transcripts would simply
+        /// not match and the session would fail closed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        input_class: Option<String>,
+        /// The sharer's control-protocol version. Relayed so the target
+        /// refuses a skew at accept time with a legible message rather than
+        /// deriving a transcript that can never match. Absent means v1.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        protocol_version: Option<u8>,
     },
 
     /// Remote control: the target declined an offer. Addressed PRIVATELY to
@@ -593,6 +605,11 @@ pub enum EventV1 {
         sharer_id: String,
         controller_id: String,
         controller_ephemeral_pub: String,
+        /// The CONTROLLER's control-protocol version, so the sharer can
+        /// refuse a skew before its arming dialog and before it burns the
+        /// session id. Absent means v1.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        controller_protocol_version: Option<u8>,
     },
 
     /// Remote control: REDACTED channel-topic visibility event — third
@@ -610,6 +627,14 @@ pub enum EventV1 {
         channel_id: String,
         sharer_id: String,
         controller_id: String,
+        /// `kbm` or `gamepad`, so the channel badge can say which. Purely
+        /// cosmetic: this event is already the REDACTED one and carries
+        /// nothing actionable. A client that does not recognise the value
+        /// must fall back to the classless wording rather than hiding the
+        /// badge — a control session it cannot label is still a control
+        /// session third parties are entitled to see.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        input_class: Option<String>,
     },
 
     /// Remote control: a grant ended. Channel topic, keyed like
