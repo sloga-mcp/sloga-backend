@@ -535,6 +535,14 @@ fn release_audit_reason(cause: Option<&str>, is_sharer: bool) -> &'static str {
         // handoff from someone pulling the plug on a controller. The
         // streamer's client sends this on turn expiry and on "Next".
         Some("turn_ended") => "turn_ended",
+        // Couch co-op: the sharer's native layer tore the session down
+        // because a frame arrived for the OTHER input class than the one
+        // bound into the transcript. Without its own cause it falls back to
+        // `revoked_by_sharer` — the string that means the machine's owner
+        // took control back — so the audit would record a peer sending
+        // something its own consent does not cover as an ordinary revoke,
+        // which is the one reading that hides it.
+        Some("input_class_mismatch") => "input_class_mismatch",
         _ if is_sharer => "revoked_by_sharer",
         _ => "released_by_controller",
     }
@@ -681,6 +689,7 @@ mod test {
             "display_topology_changed",
             "calibration_rejected",
             "turn_ended",
+            "input_class_mismatch",
         ] {
             assert_eq!(release_audit_reason(Some(cause), true), cause);
             assert_eq!(release_audit_reason(Some(cause), false), cause);
@@ -800,6 +809,32 @@ mod test {
                 serde_json::json!({
                     "accept": accept,
                     "controller_ephemeral_pub": KEY32,
+                })
+                .to_string(),
+            )
+            .dispatch()
+            .await
+    }
+
+    async fn offer_with_class<'a>(
+        harness: &'a TestHarness,
+        token: &str,
+        channel_id: &str,
+        target_id: &str,
+        input_class: &str,
+    ) -> rocket::local::asynchronous::LocalResponse<'a> {
+        harness
+            .client
+            .post(format!("/channels/{channel_id}/control/offer"))
+            .header(ContentType::JSON)
+            .header(Header::new("x-session-token", token.to_string()))
+            .body(
+                serde_json::json!({
+                    "target": target_id,
+                    "sharer_ephemeral_pub": KEY32,
+                    "rc_session_id": KEY32,
+                    "input_class": input_class,
+                    "protocol_version": 2,
                 })
                 .to_string(),
             )
@@ -1156,6 +1191,52 @@ mod test {
         assert_ne!(response.status(), Status::Forbidden);
 
         cleanup(&uvc, &[&user_a, &user_b]).await;
+    }
+
+    /// Couch co-op §2.2/§2.3: the class rides the offer, is REFUSED when
+    /// it is not one this server can name, and is stored on the record the
+    /// accept path and the Ready-time snapshot both read.
+    ///
+    /// The refusal is what keeps the relay honest. The string fans out to
+    /// every client in the channel on `RemoteControlActive`, and it is
+    /// advisory anyway — the authoritative class is bound into the two ends'
+    /// HKDF transcript — so there is nothing to gain by passing through a
+    /// value we cannot name, and a UI that renders an arbitrary server
+    /// string is a surface nobody asked for.
+    ///
+    /// NB exactly TWO offer requests, and the INVALID one first: the bucket
+    /// is 2-per-10s keyed by (user, channel) and counts rejections, and the
+    /// class check sits ahead of the pending marker so a refused offer
+    /// leaves no marker behind for the second to trip over.
+    #[test]
+    fn offer_refuses_an_unknown_input_class_and_stores_a_known_one() {
+        crate::util::test::rt()
+            .block_on(offer_refuses_an_unknown_input_class_and_stores_a_known_one_case())
+    }
+
+    async fn offer_refuses_an_unknown_input_class_and_stores_a_known_one_case() {
+        let (harness, _server, channel, uvc, (token_a, user_a), (_, user_b), (_, user_c)) =
+            server_call().await;
+
+        let response =
+            offer_with_class(&harness, &token_a, channel.id(), &user_b.id, "banana").await;
+        assert_error(response, Status::BadRequest, "FailedValidation").await;
+
+        let response =
+            offer_with_class(&harness, &token_a, channel.id(), &user_b.id, "gamepad").await;
+        let offer_id = offer_id_of(response).await;
+
+        let stored = fetch_remote_control_offer(&offer_id)
+            .await
+            .unwrap()
+            .expect("the offer record");
+        assert_eq!(stored.input_class, "gamepad");
+        // Relayed verbatim so the target's native layer can refuse a skew
+        // at accept time instead of deriving a transcript that can never
+        // match its peer's.
+        assert_eq!(stored.protocol_version, Some(2));
+
+        cleanup(&uvc, &[&user_a, &user_b, &user_c]).await;
     }
 
     #[test]
