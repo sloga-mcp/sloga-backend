@@ -55,6 +55,19 @@ auto_derived!(
         /// dialog and before it burns the session id. **Absent means v1.**
         #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
         pub protocol_version: Option<u8>,
+        /// The input class the CONTROLLER actually bound into its HKDF
+        /// transcript, echoed back so the sharer can compare it against the
+        /// class its own offer pinned.
+        ///
+        /// 🔴 This is the leg that makes a RELAYED class checkable. The
+        /// class is the one field the server is allowed to touch, so it is
+        /// the one field a hostile or buggy relay can flip; a flip is
+        /// already fail-closed (the transcripts diverge and nothing opens)
+        /// but presents as ten seconds of silence ending in
+        /// `never_authenticated`, i.e. the MITM symptom. Without this echo
+        /// the sharer has nothing to compare and the check cannot fire.
+        #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+        pub input_class: Option<String>,
     }
 
     /// A created control offer

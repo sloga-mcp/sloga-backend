@@ -354,6 +354,19 @@ pub async fn control_respond(
     })?;
     require_opaque_32("controller_ephemeral_pub", &controller_ephemeral_pub)?;
 
+    // Validated on the same rule as the offer's: unknown values are refused
+    // rather than relayed, because this string is echoed to the sharer's
+    // native layer and is the only bound on it. Absent is fine — that is a
+    // controller that predates the class, which the sharer's own version
+    // check refuses on its own terms.
+    if let Some(class) = data.input_class.as_deref() {
+        if !is_known_input_class(class) {
+            return Err(create_error!(FailedValidation {
+                error: "input_class must be kbm or gamepad".to_string()
+            }));
+        }
+    }
+
     // Re-run the FULL offer predicate with the roles fixed as recorded:
     // sharer still publishing screen video, both still live participants,
     // sharer still holds the bit, feature still on.
@@ -487,6 +500,7 @@ pub async fn control_respond(
         controller_id: grant.controller_id.clone(),
         controller_ephemeral_pub,
         controller_protocol_version: data.protocol_version,
+        controller_input_class: data.input_class.clone(),
     }
     .private(grant.sharer_id.clone())
     .await;

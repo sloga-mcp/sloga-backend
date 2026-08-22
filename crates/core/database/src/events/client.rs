@@ -610,6 +610,11 @@ pub enum EventV1 {
         /// session id. Absent means v1.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         controller_protocol_version: Option<u8>,
+        /// The input class the CONTROLLER bound, so the sharer can refuse a
+        /// class that moved between the offer and the accept — the one
+        /// field this server relays and could therefore have changed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        controller_input_class: Option<String>,
     },
 
     /// Remote control: REDACTED channel-topic visibility event — third
