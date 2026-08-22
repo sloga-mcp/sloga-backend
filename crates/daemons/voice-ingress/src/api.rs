@@ -8,7 +8,7 @@ use revolt_database::{
         clear_voice_participant_identities, create_voice_state, delete_channel_voice_state,
         delete_voice_state, delete_voice_participant_identity, get_user_moved_from_voice,
         get_user_moved_to_voice, get_user_voice_channels, get_voice_channel_members,
-        get_voice_state, is_screen_leg, is_screenshare_video, is_video_source,
+        get_screen_leg_sid, get_voice_state, is_screen_leg, is_screenshare_video, is_video_source,
         mls_cap_would_refuse, record_screen_leg, screen_leg_identity, screen_leg_left,
         set_voice_participant_identity,
         update_voice_state_tracks, user_id_from_participant_identity, video_roster_over_cap,
@@ -176,6 +176,39 @@ pub async fn ingress(
                 // `screen_video:` for a user who has left, and nothing would
                 // ever clean those keys up (plan §0-R.13).
                 if get_voice_state(&channel, user_id).await?.is_none() {
+                    return Ok(EmptyResponse);
+                }
+
+                // Sid guard, the same one `screen_leg_left` applies and in the
+                // same order (voice state first, then the sid). A user's leg
+                // marker is per USER, so a NEWER leg overwrites it while an
+                // older one may still be draining: without this, the old leg's
+                // `track_unpublished` on its way out runs
+                // `update_voice_state_tracks(.., false, ..)` and blanks
+                // `screensharing`/`screen_video` for a share that is still
+                // live on the new leg — announcing it to the channel, and
+                // tripping the remote-control release hook, which keys on
+                // `screen_video == Some(false)`.
+                //
+                // Found by the §10.1 live leg (plan §13.4 F1), which isolated
+                // it with a matched pair: a stale leg that HAD published drove
+                // the flags to 0/0 mid-share, while one that never published —
+                // and so emitted no track event — left them at 1/1 because
+                // `screen_leg_left` already guards this way.
+                // A marker that is ABSENT deliberately allows the event
+                // through. Webhook delivery is not ordered — a leg's first
+                // `track_published` can beat its own `participant_joined`, and
+                // `record_screen_leg` runs in the latter — so refusing on
+                // `None` would mean a share whose join webhook was merely slow
+                // never lights the badge at all. Only a marker naming a
+                // DIFFERENT participant proves this event came from a leg that
+                // has already been superseded.
+                let sid = &event.participant.as_ref().to_internal_error()?.sid;
+
+                if get_screen_leg_sid(channel_id, user_id)
+                    .await?
+                    .is_some_and(|marker| marker != *sid)
+                {
                     return Ok(EmptyResponse);
                 }
 
@@ -496,10 +529,21 @@ pub async fn ingress(
             // cellular) fires this event, so it also ends the share. The phone
             // reports `stopped{disconnected}` and offers "share again" (plan
             // §7.5); an ingress leave grace is a follow-up, not v1.
+            //
+            // Addressed through the raw room client rather than
+            // `remove_identity`, which applies `to_internal_error()` and so
+            // LOGS before this caller discards the result. Every ordinary
+            // leave reaches here and almost nobody has a leg, so that put one
+            // `ERROR … "participant not found"` in the log per voice leave and
+            // buried real errors (plan §13.4 F2). `remove_user` already takes
+            // this shape for the same reason.
             if let Some(identity) = identity {
-                let _ = voice_client
-                    .remove_identity(node, &screen_leg_identity(identity), channel_id)
-                    .await;
+                if let Ok(room) = voice_client.get_node(node) {
+                    let _ = room
+                        .client
+                        .remove_participant(channel_id, &screen_leg_identity(identity))
+                        .await;
+                };
             };
 
             delete_voice_state(&channel, user_id).await?;
