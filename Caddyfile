@@ -45,6 +45,23 @@
         reverse_proxy 127.0.0.1:7880
     }
 
+    # LiveKit webhooks from REMOTE media nodes -> voice-ingress (:8500). The NJ
+    # node posts to host.docker.internal:8500 directly and never comes through
+    # here. Double-gated: source IP via CF-Connecting-IP (the tunnel means
+    # remote_ip is always Cloudflare) AND LiveKit's signed Authorization JWT,
+    # which voice-ingress verifies against that node's key before acting.
+    @lk_webhook_brazil {
+        path /voice-ingress/brazil
+        header CF-Connecting-IP 216.238.121.92
+    }
+    handle @lk_webhook_brazil {
+        rewrite * /brazil
+        reverse_proxy 127.0.0.1:8500
+    }
+    handle /voice-ingress/* {
+        respond 403
+    }
+
     # File/media server (Autumn)
     handle_path /media/* {
         reverse_proxy 127.0.0.1:14704
