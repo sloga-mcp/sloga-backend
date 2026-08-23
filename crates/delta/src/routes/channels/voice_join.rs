@@ -113,11 +113,21 @@ pub async fn call(
     let existing_node = get_channel_node(channel.id()).await?;
     let has_existing_node = existing_node.is_some(); // we move existing_node in the next statement so this is the quickest way to know if we need to set it.
 
-    let node = existing_node
-        .or(node)
-        .ok_or_else(|| create_error!(UnknownNode))?;
-
     let config = config().await;
+
+    // A server-level voice region only decides where a room is OPENED; it
+    // must never move a live room out from under its participants.
+    let server_region = match channel.server() {
+        Some(server_id) if !has_existing_node => {
+            db.fetch_server(server_id).await?.voice_region
+        }
+        _ => None,
+    };
+
+    let node = resolve_join_node(existing_node, server_region, node, |candidate| {
+        config.hosts.livekit.contains_key(candidate)
+    })
+    .ok_or_else(|| create_error!(UnknownNode))?;
 
     let node_host = config
         .hosts
@@ -193,6 +203,23 @@ pub async fn call(
         token,
         url: node_host.clone(),
     }))
+}
+
+/// Which LiveKit node a join lands on, in priority order:
+/// 1. the node the room is already pinned to (first joiner decided),
+/// 2. the server's configured voice region — only if that node is still
+///    configured, so a region naming a decommissioned node degrades to
+///    Auto instead of bricking the server's voice channels,
+/// 3. the client's latency pick.
+pub(crate) fn resolve_join_node(
+    existing_node: Option<String>,
+    server_region: Option<String>,
+    requested: Option<String>,
+    is_configured: impl Fn(&str) -> bool,
+) -> Option<String> {
+    existing_node
+        .or_else(|| server_region.filter(|region| is_configured(region)))
+        .or(requested)
 }
 
 // NB: these tests share the process-global redis_kiss connection, so (like
@@ -518,5 +545,207 @@ mod test {
         delete_channel_voice_state(&voice_channel, &seeded)
             .await
             .expect("cleanup");
+    }
+
+    // ---- server voice region -------------------------------------------
+
+    /// Pure resolution order: pinned room > server region > client pick,
+    /// with a region naming an unconfigured node degrading to the client
+    /// pick rather than failing the join.
+    #[test]
+    fn resolve_join_node_priority() {
+        use super::resolve_join_node;
+        let configured = |node: &str| node == "brazil" || node == "worldwide";
+        let s = |v: &str| Some(v.to_string());
+
+        // no room yet: the server's region beats the client's latency pick
+        assert_eq!(
+            resolve_join_node(None, s("brazil"), s("worldwide"), configured),
+            s("brazil")
+        );
+        // a live room keeps its node even against a (newer) server region
+        assert_eq!(
+            resolve_join_node(s("worldwide"), s("brazil"), s("brazil"), configured),
+            s("worldwide")
+        );
+        // no region (Auto): the client's pick
+        assert_eq!(
+            resolve_join_node(None, None, s("brazil"), configured),
+            s("brazil")
+        );
+        // region names a decommissioned node: fall through to the client
+        assert_eq!(
+            resolve_join_node(None, s("moon"), s("worldwide"), configured),
+            s("worldwide")
+        );
+        // nothing to go on at all
+        assert_eq!(resolve_join_node(None, None, None, configured), None);
+    }
+
+    async fn edit_server_region(
+        harness: &TestHarness,
+        session_token: &str,
+        server_id: &str,
+        body: serde_json::Value,
+    ) -> (Status, String) {
+        let response = harness
+            .client
+            .patch(format!("/servers/{server_id}"))
+            .header(ContentType::JSON)
+            .header(Header::new("x-session-token", session_token.to_string()))
+            .body(body.to_string())
+            .dispatch()
+            .await;
+        let status = response.status();
+        (status, response.into_string().await.unwrap_or_default())
+    }
+
+    /// The server region only applies where a room is OPENED: with no room
+    /// the join lands on the region's node; with a pinned room the pin wins
+    /// and the region is ignored. A fake node on a closed port makes the
+    /// "region won" outcome observable without a live LiveKit: the join gets
+    /// past node resolution (no 400 UnknownNode) and fails on the SFU call
+    /// instead, while the pinned bogus node fails AT resolution.
+    #[test]
+    fn server_region_decides_where_a_room_opens() {
+        crate::util::test::rt().block_on(server_region_decides_where_a_room_opens_case())
+    }
+
+    async fn server_region_decides_where_a_room_opens_case() {
+        // overwrite_config is once-per-process and must run BEFORE the
+        // harness primes the config cache (nextest isolates processes)
+        revolt_config::overwrite_config(|settings| {
+            settings.api.livekit.nodes.insert(
+                "testregion".to_string(),
+                revolt_config::LiveKitNode {
+                    url: "http://127.0.0.1:1".to_string(),
+                    lat: 0.0,
+                    lon: 0.0,
+                    key: "testkey".to_string(),
+                    secret: "testsecret-testsecret-testsecret".to_string(),
+                    private: true,
+                    remote: false,
+                },
+            );
+            settings
+                .hosts
+                .livekit
+                .insert("testregion".to_string(), "ws://127.0.0.1:1".to_string());
+        })
+        .await;
+
+        let mut harness = TestHarness::new().await;
+        let (_account, session, owner) = harness.new_user().await;
+        let channel = voice_channel(&harness, &owner, &[]).await;
+        let server_id = channel.server().expect("server channel").to_string();
+
+        // unknown region is rejected on edit, and nothing is stored
+        let (status, body) = edit_server_region(
+            &harness,
+            &session.token,
+            &server_id,
+            serde_json::json!({ "voice_region": "atlantis" }),
+        )
+        .await;
+        assert_eq!(status, Status::BadRequest);
+        assert!(body.contains("UnknownNode"), "{}", body);
+        assert_eq!(
+            harness.db.fetch_server(&server_id).await.unwrap().voice_region,
+            None
+        );
+
+        // a configured region is stored, returned, and fanned out
+        let (status, body) = edit_server_region(
+            &harness,
+            &session.token,
+            &server_id,
+            serde_json::json!({ "voice_region": "testregion" }),
+        )
+        .await;
+        assert_eq!(status, Status::Ok, "{body}");
+        let returned: v0::Server = serde_json::from_str(&body).unwrap();
+        assert_eq!(returned.voice_region.as_deref(), Some("testregion"));
+        harness
+            .wait_for_event(&server_id, |event| {
+                matches!(
+                    event,
+                    revolt_database::events::client::EventV1::ServerUpdate { data, .. }
+                        if data.voice_region.as_deref() == Some("testregion")
+                )
+            })
+            .await;
+
+        // no room yet + no client node: the region decides, so the join
+        // gets PAST node resolution and dies on the (unreachable) SFU
+        {
+            let response = join_call(&harness, &session.token, &channel.id(), false).await;
+            assert_eq!(
+                response.status(),
+                Status::InternalServerError,
+                "region must resolve the node when no room exists"
+            );
+        }
+
+        // a room pinned elsewhere keeps its node: the bogus pin is not a
+        // configured host, so resolution itself fails — proving the region
+        // was NOT consulted
+        revolt_database::voice::set_channel_node(channel.id(), "pinned-elsewhere")
+            .await
+            .expect("pin");
+        {
+            let response = join_call(&harness, &session.token, &channel.id(), false).await;
+            assert_past_caps(response).await;
+        }
+        revolt_database::voice::delete_channel_node(channel.id())
+            .await
+            .expect("unpin");
+
+        // removing the field returns the server to Auto
+        let (status, body) = edit_server_region(
+            &harness,
+            &session.token,
+            &server_id,
+            serde_json::json!({ "remove": ["VoiceRegion"] }),
+        )
+        .await;
+        assert_eq!(status, Status::Ok, "{body}");
+        let returned: v0::Server = serde_json::from_str(&body).unwrap();
+        assert_eq!(returned.voice_region, None);
+        harness
+            .wait_for_event(&server_id, |event| {
+                matches!(
+                    event,
+                    revolt_database::events::client::EventV1::ServerUpdate { clear, .. }
+                        if clear.contains(&v0::FieldsServer::VoiceRegion)
+                )
+            })
+            .await;
+
+        // back on Auto with no client pick there is nothing to resolve
+        let response = join_call(&harness, &session.token, &channel.id(), false).await;
+        assert_past_caps(response).await;
+    }
+
+    /// ManageServer gates the region like every other server setting.
+    #[test]
+    fn server_region_requires_manage_server() {
+        crate::util::test::rt().block_on(server_region_requires_manage_server_case())
+    }
+
+    async fn server_region_requires_manage_server_case() {
+        let harness = TestHarness::new().await;
+        let (_account, _owner_session, owner) = harness.new_user().await;
+        let (_account_b, member_session, member) = harness.new_user().await;
+        let channel = voice_channel(&harness, &owner, &[&member]).await;
+        let server_id = channel.server().expect("server channel").to_string();
+
+        let (status, _) = edit_server_region(
+            &harness,
+            &member_session.token,
+            &server_id,
+            serde_json::json!({ "voice_region": "worldwide" }),
+        )
+        .await;
+        assert_eq!(status, Status::Forbidden);
     }
 }

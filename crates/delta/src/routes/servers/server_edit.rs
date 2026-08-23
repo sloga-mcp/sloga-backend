@@ -45,6 +45,7 @@ pub async fn edit(
         && data.analytics.is_none()
         && data.discoverable.is_none()
         && data.discovery_requested.is_none()
+        && data.voice_region.is_none()
         && data.owner.is_none()
         && data.remove.is_empty()
     {
@@ -55,9 +56,24 @@ pub async fn edit(
         || data.banner.is_some()
         || data.system_messages.is_some()
         || data.analytics.is_some()
+        || data.voice_region.is_some()
         || !data.remove.is_empty()
     {
         permissions.throw_if_lacking_channel_permission(ChannelPermission::ManageServer)?;
+    }
+
+    // A voice region must name a configured LiveKit node; "Auto" is expressed
+    // by removing the field, never by a sentinel value.
+    if let Some(voice_region) = &data.voice_region {
+        if !revolt_config::config()
+            .await
+            .api
+            .livekit
+            .nodes
+            .contains_key(voice_region)
+        {
+            return Err(create_error!(UnknownNode));
+        }
     }
 
     // Check we are the server owner or privileged if changing sensitive fields
@@ -111,6 +127,7 @@ pub async fn edit(
         discoverable,
         discovery_requested,
         analytics,
+        voice_region,
         owner,
         remove,
     } = data;
@@ -134,6 +151,7 @@ pub async fn edit(
         discoverable,
         discovery_requested,
         analytics,
+        voice_region,
         owner: owner.clone(),
         ..Default::default()
     };

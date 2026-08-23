@@ -905,6 +905,7 @@ mod tests {
             analytics: false,
             discoverable: false,
             discovery_requested: false,
+            voice_region: None,
             boost_count: None,
             boost_tier: None,
         };

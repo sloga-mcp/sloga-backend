@@ -75,6 +75,13 @@ auto_derived_partial!(
         /// and the configured thresholds by the same recount path
         #[serde(skip_serializing_if = "Option::is_none")]
         pub boost_tier: Option<i32>,
+
+        /// Preferred LiveKit node for this server's voice channels (a key of
+        /// `config.api.livekit.nodes`). Consulted only when a room is opened:
+        /// an already-pinned room keeps its node. Absent = Auto (the client
+        /// picks by latency).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub voice_region: Option<String>,
     },
     "PartialServer"
 );
@@ -141,6 +148,7 @@ auto_derived!(
         SystemMessages,
         Icon,
         Banner,
+        VoiceRegion,
     }
 
     /// Optional fields on server object
@@ -179,6 +187,7 @@ impl Server {
             icon: None,
             roles: HashMap::new(),
             system_messages: None,
+            voice_region: None,
         };
 
         let channels: Vec<Channel> = if create_default_channels {
@@ -272,6 +281,7 @@ impl Server {
             FieldsServer::SystemMessages => self.system_messages = None,
             FieldsServer::Icon => self.icon = None,
             FieldsServer::Banner => self.banner = None,
+            FieldsServer::VoiceRegion => self.voice_region = None,
         }
     }
 

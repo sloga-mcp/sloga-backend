@@ -100,6 +100,11 @@ auto_derived_partial!(
             serde(skip_serializing_if = "crate::if_zero_u32", default)
         )]
         pub boost_tier: u32,
+
+        /// Preferred voice node for this server's voice channels (a node name
+        /// advertised under `features.livekit.nodes`); absent = automatic
+        #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+        pub voice_region: Option<String>,
     },
     "PartialServer"
 );
@@ -143,6 +148,7 @@ auto_derived!(
         SystemMessages,
         Icon,
         Banner,
+        VoiceRegion,
     }
 
     /// Optional fields on server object
@@ -279,6 +285,10 @@ auto_derived!(
         ///
         /// Must be enabled in order to show up on [Revolt Discover](https://rvlt.gg).
         pub analytics: Option<bool>,
+
+        /// Preferred voice node (a name advertised under `features.livekit.nodes`).
+        /// Remove `VoiceRegion` to return to automatic selection.
+        pub voice_region: Option<String>,
 
         /// User id of the new owner
         pub owner: Option<String>,

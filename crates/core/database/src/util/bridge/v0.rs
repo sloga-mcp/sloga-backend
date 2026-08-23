@@ -1097,6 +1097,7 @@ impl From<crate::Server> for Server {
             discovery_requested: value.discovery_requested,
             boost_count: value.boost_count.unwrap_or_default() as u32,
             boost_tier: value.boost_tier.unwrap_or_default() as u32,
+            voice_region: value.voice_region,
         }
     }
 }
@@ -1128,6 +1129,7 @@ impl From<Server> for crate::Server {
             discovery_requested: value.discovery_requested,
             boost_count: Some(value.boost_count as i32),
             boost_tier: Some(value.boost_tier as i32),
+            voice_region: value.voice_region,
         }
     }
 }
@@ -1157,6 +1159,7 @@ impl From<crate::PartialServer> for PartialServer {
             discovery_requested: value.discovery_requested,
             boost_count: value.boost_count.map(|v| v as u32),
             boost_tier: value.boost_tier.map(|v| v as u32),
+            voice_region: value.voice_region,
         }
     }
 }
@@ -1186,6 +1189,7 @@ impl From<PartialServer> for crate::PartialServer {
             discovery_requested: value.discovery_requested,
             boost_count: value.boost_count.map(|v| v as i32),
             boost_tier: value.boost_tier.map(|v| v as i32),
+            voice_region: value.voice_region,
         }
     }
 }
@@ -1198,6 +1202,7 @@ impl From<crate::FieldsServer> for FieldsServer {
             crate::FieldsServer::Description => FieldsServer::Description,
             crate::FieldsServer::Icon => FieldsServer::Icon,
             crate::FieldsServer::SystemMessages => FieldsServer::SystemMessages,
+            crate::FieldsServer::VoiceRegion => FieldsServer::VoiceRegion,
         }
     }
 }
@@ -1210,6 +1215,7 @@ impl From<FieldsServer> for crate::FieldsServer {
             FieldsServer::Description => crate::FieldsServer::Description,
             FieldsServer::Icon => crate::FieldsServer::Icon,
             FieldsServer::SystemMessages => crate::FieldsServer::SystemMessages,
+            FieldsServer::VoiceRegion => crate::FieldsServer::VoiceRegion,
         }
     }
 }
