@@ -252,6 +252,13 @@ pub struct LiveKitNode {
     // whether to hide the node in the nodes list
     #[serde(default)]
     pub private: bool,
+
+    // The node runs against its own Redis (a different region), so this
+    // deployment's LiveKit `nodes` / `room_node_map` hashes never describe
+    // it. The voice-ingress ghost sweep must not judge channels pinned to
+    // such a node: to the local Redis they always look unrouted.
+    #[serde(default)]
+    pub remote: bool,
 }
 
 #[derive(Deserialize, Debug, Clone)]

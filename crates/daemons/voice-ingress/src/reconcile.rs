@@ -35,8 +35,8 @@ use revolt_database::{
     events::client::EventV1,
     voice::{
         clear_voice_participant_identities, delete_channel_voice_state,
-        delete_voice_participant_identity, delete_voice_state, get_user_voice_channels,
-        UserVoiceChannel,
+        delete_voice_participant_identity, delete_voice_state, get_channel_node,
+        get_user_voice_channels, UserVoiceChannel,
     },
     Database, AMQP,
 };
@@ -161,6 +161,33 @@ async fn still_ghost(conn: &mut Conn, channel_id: &str, dead: &HashSet<String>) 
     })
 }
 
+/// Names of nodes configured `remote = true`: they register on their own
+/// Redis, so nothing in the local `nodes` / `room_node_map` hashes can vouch
+/// for their rooms. Channels pinned to one are outside this sweep's
+/// jurisdiction entirely — judging them would tear down every live call on
+/// that node within two sweeps.
+async fn remote_nodes() -> HashSet<String> {
+    revolt_config::config()
+        .await
+        .api
+        .livekit
+        .nodes
+        .iter()
+        .filter(|(_, node)| node.remote)
+        .map(|(name, _)| name.clone())
+        .collect()
+}
+
+/// Whether the channel's Sloga-side node pin names a remote node. A missing
+/// or unreadable pin is NOT treated as remote: the existing ghost rules own
+/// that case, exactly as before.
+async fn pinned_to_remote(channel_id: &str, remote: &HashSet<String>) -> bool {
+    if remote.is_empty() {
+        return false;
+    }
+    matches!(get_channel_node(channel_id).await, Ok(Some(node)) if remote.contains(&node))
+}
+
 async fn scan_keys(conn: &mut Conn, pattern: &str) -> Result<Vec<String>> {
     let mut out = Vec::new();
     let mut iter = conn
@@ -183,6 +210,7 @@ async fn sweep(
         return Ok(HashSet::new());
     };
     let dead = &liveness.dead_nodes;
+    let remote = remote_nodes().await;
 
     let mut conn = get_connection().await?;
 
@@ -199,7 +227,7 @@ async fn sweep(
     let mut reconciled = 0usize;
     for key in scan_keys(&mut conn, "vc_members:*").await? {
         let channel_id = key.trim_start_matches("vc_members:").to_string();
-        if !is_candidate(&channel_id) {
+        if !is_candidate(&channel_id) || pinned_to_remote(&channel_id, &remote).await {
             continue;
         }
         match still_ghost(&mut conn, &channel_id, dead).await {
@@ -231,7 +259,7 @@ async fn sweep(
             }
         };
         for entry in entries {
-            if !is_candidate(&entry.id) {
+            if !is_candidate(&entry.id) || pinned_to_remote(&entry.id, &remote).await {
                 continue;
             }
             let result: Result<()> = async {
