@@ -118,6 +118,7 @@ auto_derived!(
         StatusActivity,
         ProfileContent,
         ProfileBackground,
+        ProfileLinks,
         DisplayName,
         Pronouns,
         Connections,
@@ -246,6 +247,49 @@ auto_derived!(
         pub started_at: Option<Timestamp>,
     }
 
+    /// Platform of a self-declared game-account link
+    pub enum LinkPlatform {
+        /// Steam
+        Steam,
+        /// Epic Games
+        EpicGames,
+        /// Rockstar Games (Social Club)
+        Rockstar,
+        /// Ubisoft Connect
+        UbisoftConnect,
+        /// Activision Id
+        Activision,
+        /// Battle.net
+        BattleNet,
+        /// Xbox gamertag
+        Xbox,
+        /// PlayStation Network Id
+        PlayStation,
+        /// Nintendo friend code
+        Nintendo,
+        /// Riot Id
+        RiotGames,
+        /// EA App Id
+        EaApp,
+        /// GOG Galaxy
+        Gog,
+        /// Grinding Gear Games (Path of Exile / Path of Exile 2)
+        GrindingGearGames,
+    }
+
+    /// A self-declared game-account handle shown on the profile.
+    ///
+    /// Display-only strings — no verification, no OAuth (unlike streaming
+    /// connections). Clients render them copy-to-clipboard.
+    #[cfg_attr(feature = "validator", derive(Validate))]
+    pub struct ProfileLink {
+        /// Platform the handle belongs to
+        pub platform: LinkPlatform,
+        /// Account handle / player Id on that platform
+        #[cfg_attr(feature = "validator", validate(length(min = 1, max = 64)))]
+        pub handle: String,
+    }
+
     /// User's profile
     #[derive(Default)]
     #[cfg_attr(feature = "validator", derive(Validate))]
@@ -257,6 +301,12 @@ auto_derived!(
         /// Background visible on user's profile
         #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
         pub background: Option<File>,
+        /// Self-declared game-account links
+        #[cfg_attr(
+            feature = "serde",
+            serde(skip_serializing_if = "Vec::is_empty", default)
+        )]
+        pub links: Vec<ProfileLink>,
     }
 
     /// User badge bitfield
@@ -310,6 +360,15 @@ auto_derived!(
         #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
         #[cfg_attr(feature = "validator", validate(length(min = 1, max = 128)))]
         pub background: Option<String>,
+        /// New game-account links.
+        ///
+        /// Replaces the whole list when present (unlike content/background's
+        /// per-field merge); an empty list clears it. At most 12 entries
+        /// (enforced at the route — the nested derive can't carry a length
+        /// rule alongside it).
+        #[cfg_attr(feature = "validator", validate)]
+        #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+        pub links: Option<Vec<ProfileLink>>,
     }
 
     /// New user information

@@ -339,6 +339,7 @@ impl IntoDocumentPath for FieldsUser {
             FieldsUser::Avatar => "avatar",
             FieldsUser::ProfileBackground => "profile.background",
             FieldsUser::ProfileContent => "profile.content",
+            FieldsUser::ProfileLinks => "profile.links",
             FieldsUser::StatusPresence => "status.presence",
             FieldsUser::StatusActivity => "status.activity",
             FieldsUser::StatusText => "status.text",

@@ -32,6 +32,7 @@ mod server_bans;
 mod server_boosts;
 mod server_members;
 mod servers;
+mod user_respect;
 mod user_settings;
 mod users;
 mod accounts;
@@ -73,6 +74,7 @@ pub use server_bans::*;
 pub use server_boosts::*;
 pub use server_members::*;
 pub use servers::*;
+pub use user_respect::*;
 pub use user_settings::*;
 pub use users::*;
 pub use accounts::*;
@@ -122,6 +124,7 @@ pub trait AbstractDatabase:
     + server_boosts::AbstractServerBoosts
     + server_members::AbstractServerMembers
     + servers::AbstractServers
+    + user_respect::AbstractUserRespect
     + user_settings::AbstractUserSettings
     + users::AbstractUsers
     + accounts::AbstractAccounts

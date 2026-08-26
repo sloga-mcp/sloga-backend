@@ -21,7 +21,7 @@ pub async fn edit(
     target: Reference<'_>,
     data: Json<v0::DataEditUser>,
 ) -> Result<Json<v0::User>> {
-    let data = data.into_inner();
+    let mut data = data.into_inner();
     data.validate().map_err(|error| {
         create_error!(FailedValidation {
             error: error.to_string()
@@ -38,6 +38,38 @@ pub async fn edit(
     if let Some(display_name) = &data.display_name {
         if contains_blocked_slur(display_name) {
             return Err(create_error!(DisallowedName));
+        }
+    }
+
+    // Game-account links: cap, hygiene, slur filter. Handles are read by
+    // strangers on the profile card, so they get the display-name treatment.
+    // (Per-handle length is the nested derive's job; validator 0.16 cannot
+    // carry a list-length rule alongside it, hence the explicit cap here.)
+    if let Some(links) = data.profile.as_mut().and_then(|profile| profile.links.as_mut()) {
+        if links.len() > 12 {
+            return Err(create_error!(FailedValidation {
+                error: "links: at most 12 entries".to_string()
+            }));
+        }
+
+        for link in links.iter_mut() {
+            link.handle = link
+                .handle
+                .chars()
+                .filter(|c| !c.is_control())
+                .collect::<String>()
+                .trim()
+                .to_string();
+
+            if link.handle.is_empty() {
+                return Err(create_error!(FailedValidation {
+                    error: "links: handle must not be empty".to_string()
+                }));
+            }
+
+            if contains_blocked_slur(&link.handle) {
+                return Err(create_error!(DisallowedName));
+            }
         }
     }
 
@@ -155,6 +187,12 @@ pub async fn edit(
         if let Some(background) = profile.background {
             new_profile.background =
                 Some(File::use_background(db, &background, &user.id, &user.id).await?);
+        }
+
+        // Links replace wholesale (an empty list clears) — a partial merge
+        // of a list has no sane semantics.
+        if let Some(links) = profile.links {
+            new_profile.links = links.into_iter().map(Into::into).collect();
         }
 
         partial.profile = Some(new_profile);

@@ -20,6 +20,9 @@ mod find_mutual;
 mod get_default_avatar;
 mod open_dm;
 mod remove_friend;
+mod respect_delete;
+mod respect_fetch;
+mod respect_set;
 mod send_friend_request;
 mod unblock_user;
 
@@ -51,5 +54,9 @@ pub fn routes() -> (Vec<Route>, OpenApi) {
         fetch_user_boosts::fetch_user_boosts,
         boost_grant::boost_grant,
         boost_revoke::boost_revoke,
+        // Respect (profile wall)
+        respect_set::respect_set,
+        respect_fetch::respect_fetch,
+        respect_delete::respect_delete,
     ]
 }

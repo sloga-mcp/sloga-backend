@@ -96,6 +96,7 @@ auto_derived!(
         StatusActivity,
         ProfileContent,
         ProfileBackground,
+        ProfileLinks,
         DisplayName,
         Pronouns,
         Connections,
@@ -196,6 +197,34 @@ auto_derived!(
         pub started_at: Option<Timestamp>,
     }
 
+    /// Platform of a self-declared game-account link
+    pub enum LinkPlatform {
+        Steam,
+        EpicGames,
+        Rockstar,
+        UbisoftConnect,
+        Activision,
+        BattleNet,
+        Xbox,
+        PlayStation,
+        Nintendo,
+        RiotGames,
+        EaApp,
+        Gog,
+        GrindingGearGames,
+    }
+
+    /// A self-declared game-account handle shown on the profile.
+    ///
+    /// Display-only strings — no verification, no OAuth (unlike streaming
+    /// connections, which live in their own private collection).
+    pub struct ProfileLink {
+        /// Platform the handle belongs to
+        pub platform: LinkPlatform,
+        /// Account handle / player Id on that platform
+        pub handle: String,
+    }
+
     /// User's profile
     #[derive(Default)]
     pub struct UserProfile {
@@ -205,6 +234,9 @@ auto_derived!(
         /// Background visible on user's profile
         #[serde(skip_serializing_if = "Option::is_none")]
         pub background: Option<File>,
+        /// Self-declared game-account links
+        #[serde(skip_serializing_if = "Vec::is_empty", default)]
+        pub links: Vec<ProfileLink>,
     }
 
     /// Bot information for if the user is a bot
@@ -726,7 +758,9 @@ impl User {
                     RelationshipStatus::Blocked,
                     None,
                 )
-                .await
+                .await?;
+
+                db.delete_respect_between(&self.id, &target.id).await
             }
             RelationshipStatus::None
             | RelationshipStatus::Friend
@@ -739,7 +773,12 @@ impl User {
                     RelationshipStatus::BlockedOther,
                     None,
                 )
-                .await
+                .await?;
+
+                // A block is hostile: neither party's respect stays on the
+                // other's wall. (A plain unfriend keeps entries — friendly
+                // drift — and either party can still delete their side.)
+                db.delete_respect_between(&self.id, &target.id).await
             }
         }
     }
@@ -827,6 +866,11 @@ impl User {
             FieldsUser::ProfileBackground => {
                 if let Some(x) = self.profile.as_mut() {
                     x.background = None;
+                }
+            }
+            FieldsUser::ProfileLinks => {
+                if let Some(x) = self.profile.as_mut() {
+                    x.links = Vec::new();
                 }
             }
             FieldsUser::DisplayName => self.display_name = None,
@@ -938,6 +982,12 @@ impl User {
                 FieldsUser::StatusPresence,
                 FieldsUser::ProfileContent,
                 FieldsUser::ProfileBackground,
+                // Links, display name and pronouns are PII the same way the
+                // bio is — a deleted account must not keep advertising its
+                // Steam handle or name.
+                FieldsUser::ProfileLinks,
+                FieldsUser::DisplayName,
+                FieldsUser::Pronouns,
                 FieldsUser::Connections,
                 FieldsUser::Suspension,
             ],
@@ -1018,6 +1068,13 @@ impl User {
         }
 
         self.clear_relationships(db).await?;
+
+        // Respect cascade: drop every wall entry the account appears in, on
+        // either side — rows on a deleted target's wall would be
+        // undeletable, and rows authored by the account would ghost-attribute
+        // "Deleted User" forever.
+        db.delete_respect_involving(&self.id).await?;
+
         db.delete_messages_by_user(&self.id).await?;
 
         // E2EE cascade: remove all device identities, prekeys and queued

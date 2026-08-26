@@ -1657,6 +1657,7 @@ impl From<FieldsUser> for crate::FieldsUser {
             FieldsUser::Avatar => crate::FieldsUser::Avatar,
             FieldsUser::ProfileBackground => crate::FieldsUser::ProfileBackground,
             FieldsUser::ProfileContent => crate::FieldsUser::ProfileContent,
+            FieldsUser::ProfileLinks => crate::FieldsUser::ProfileLinks,
             FieldsUser::StatusPresence => crate::FieldsUser::StatusPresence,
             FieldsUser::StatusActivity => crate::FieldsUser::StatusActivity,
             FieldsUser::StatusText => crate::FieldsUser::StatusText,
@@ -1675,6 +1676,7 @@ impl From<crate::FieldsUser> for FieldsUser {
             crate::FieldsUser::Avatar => FieldsUser::Avatar,
             crate::FieldsUser::ProfileBackground => FieldsUser::ProfileBackground,
             crate::FieldsUser::ProfileContent => FieldsUser::ProfileContent,
+            crate::FieldsUser::ProfileLinks => FieldsUser::ProfileLinks,
             crate::FieldsUser::StatusPresence => FieldsUser::StatusPresence,
             crate::FieldsUser::StatusActivity => FieldsUser::StatusActivity,
             crate::FieldsUser::StatusText => FieldsUser::StatusText,
@@ -1852,11 +1854,70 @@ impl From<UserConnection> for crate::UserConnection {
     }
 }
 
+impl From<crate::LinkPlatform> for LinkPlatform {
+    fn from(value: crate::LinkPlatform) -> Self {
+        match value {
+            crate::LinkPlatform::Steam => LinkPlatform::Steam,
+            crate::LinkPlatform::EpicGames => LinkPlatform::EpicGames,
+            crate::LinkPlatform::Rockstar => LinkPlatform::Rockstar,
+            crate::LinkPlatform::UbisoftConnect => LinkPlatform::UbisoftConnect,
+            crate::LinkPlatform::Activision => LinkPlatform::Activision,
+            crate::LinkPlatform::BattleNet => LinkPlatform::BattleNet,
+            crate::LinkPlatform::Xbox => LinkPlatform::Xbox,
+            crate::LinkPlatform::PlayStation => LinkPlatform::PlayStation,
+            crate::LinkPlatform::Nintendo => LinkPlatform::Nintendo,
+            crate::LinkPlatform::RiotGames => LinkPlatform::RiotGames,
+            crate::LinkPlatform::EaApp => LinkPlatform::EaApp,
+            crate::LinkPlatform::Gog => LinkPlatform::Gog,
+            crate::LinkPlatform::GrindingGearGames => LinkPlatform::GrindingGearGames,
+        }
+    }
+}
+
+impl From<LinkPlatform> for crate::LinkPlatform {
+    fn from(value: LinkPlatform) -> Self {
+        match value {
+            LinkPlatform::Steam => crate::LinkPlatform::Steam,
+            LinkPlatform::EpicGames => crate::LinkPlatform::EpicGames,
+            LinkPlatform::Rockstar => crate::LinkPlatform::Rockstar,
+            LinkPlatform::UbisoftConnect => crate::LinkPlatform::UbisoftConnect,
+            LinkPlatform::Activision => crate::LinkPlatform::Activision,
+            LinkPlatform::BattleNet => crate::LinkPlatform::BattleNet,
+            LinkPlatform::Xbox => crate::LinkPlatform::Xbox,
+            LinkPlatform::PlayStation => crate::LinkPlatform::PlayStation,
+            LinkPlatform::Nintendo => crate::LinkPlatform::Nintendo,
+            LinkPlatform::RiotGames => crate::LinkPlatform::RiotGames,
+            LinkPlatform::EaApp => crate::LinkPlatform::EaApp,
+            LinkPlatform::Gog => crate::LinkPlatform::Gog,
+            LinkPlatform::GrindingGearGames => crate::LinkPlatform::GrindingGearGames,
+        }
+    }
+}
+
+impl From<crate::ProfileLink> for ProfileLink {
+    fn from(value: crate::ProfileLink) -> Self {
+        ProfileLink {
+            platform: value.platform.into(),
+            handle: value.handle,
+        }
+    }
+}
+
+impl From<ProfileLink> for crate::ProfileLink {
+    fn from(value: ProfileLink) -> Self {
+        crate::ProfileLink {
+            platform: value.platform.into(),
+            handle: value.handle,
+        }
+    }
+}
+
 impl From<crate::UserProfile> for UserProfile {
     fn from(value: crate::UserProfile) -> Self {
         UserProfile {
             content: value.content,
             background: value.background.map(|file| file.into()),
+            links: value.links.into_iter().map(Into::into).collect(),
         }
     }
 }
@@ -1866,6 +1927,7 @@ impl From<UserProfile> for crate::UserProfile {
         crate::UserProfile {
             content: value.content,
             background: value.background.map(|file| file.into()),
+            links: value.links.into_iter().map(Into::into).collect(),
         }
     }
 }

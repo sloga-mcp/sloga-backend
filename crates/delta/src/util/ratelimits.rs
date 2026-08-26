@@ -27,6 +27,14 @@ impl<'a> RatelimitResolver<Request<'a>> for DeltaRatelimits {
             let method = request.method();
             match (segment, resource, method) {
                 ("users", target, Method::Patch) => ("user_edit", target),
+                // Respect wall writes (PUT …/respect, DELETE …/respect/<author>)
+                // get their own bucket, keyed per wall — writing is a
+                // deliberate, user-paced action, and a spammer must not be
+                // able to churn someone else's wall at the generic users
+                // rate. This arm must sit ABOVE the ("users", _, _) fallback.
+                ("users", target, Method::Put | Method::Delete) if extra == Some("respect") => {
+                    ("respect", target)
+                }
                 ("users", _, _) => {
                     if let Some("default_avatar") = extra {
                         return ("default_avatar", None);
@@ -415,6 +423,10 @@ impl<'a> RatelimitResolver<Request<'a>> for DeltaRatelimits {
             // than on lost consent.
             "remote_control_heartbeat" => 30,
             "follow" => 2,
+            // Respect wall writes: user-paced (write or edit one entry,
+            // occasionally curate). 5 per 10s window is generous for a human
+            // and bounding for a script.
+            "respect" => 5,
             "discover" => 20,
             "interaction_respond" => 30,
             "message_interact" => 20,

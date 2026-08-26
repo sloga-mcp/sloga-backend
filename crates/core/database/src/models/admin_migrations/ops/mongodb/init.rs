@@ -198,6 +198,10 @@ pub async fn create_database(db: &MongoDb) {
         .await
         .expect("Failed to create user_stream_connections collection.");
 
+    db.create_collection("user_respect")
+        .await
+        .expect("Failed to create user_respect collection.");
+
     db.create_collection("server_boosts")
         .await
         .expect("Failed to create server_boosts collection.");
@@ -547,6 +551,34 @@ pub async fn create_database(db: &MongoDb) {
     })
     .await
     .expect("Failed to create channel_follows index.");
+
+    db.run_command(doc! {
+        "createIndexes": "user_respect",
+        "indexes": [
+            // ENFORCES one entry per (target, author) pair; also serves the
+            // wall fetch via the target prefix. MUST stay identical to the
+            // copies in scripts.rs (revision 69) and the user_respect ops
+            // tests.
+            {
+                "key": {
+                    "target_id": 1_i32,
+                    "author_id": 1_i32
+                },
+                "name": "target_author",
+                "unique": true
+            },
+            // Serves the account-deletion cascade's author side and the
+            // block cascade.
+            {
+                "key": {
+                    "author_id": 1_i32
+                },
+                "name": "author"
+            }
+        ]
+    })
+    .await
+    .expect("Failed to create user_respect index.");
 
     db.run_command(doc! {
         "createIndexes": "sounds",

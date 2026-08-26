@@ -26,7 +26,7 @@ struct MigrationInfo {
     revision: i32,
 }
 
-pub const LATEST_REVISION: i32 = 69; // MUST BE +1 to last migration
+pub const LATEST_REVISION: i32 = 70; // MUST BE +1 to last migration
 
 pub async fn migrate_database(db: &MongoDb) {
     let migrations = db.col::<Document>("migrations");
@@ -2357,6 +2357,44 @@ pub async fn run_migrations(db: &MongoDb, revision: i32) -> i32 {
             )
             .await
             .expect("Failed to add UseWatchTogether to default_permissions");
+    }
+
+    if revision <= 69 {
+        info!("Running migration [revision 69 / 25-08-2026]: Create user_respect collection (profile respect wall)");
+
+        // Same idempotency contract as prior collection migrations;
+        // mirrors init.rs. The unique spec here MUST stay identical to
+        // the copies in init.rs and the user_respect ops tests.
+        db.db().create_collection("user_respect").await.ok();
+
+        db.db()
+            .run_command(doc! {
+                "createIndexes": "user_respect",
+                "indexes": [
+                    // ENFORCES one entry per (target, author) pair — delta's
+                    // upsert probe is a TOCTOU and the loser of a concurrent
+                    // first-write race must fail here (mapped to NoEffect).
+                    // Also serves the wall fetch via the target prefix.
+                    {
+                        "key": {
+                            "target_id": 1_i32,
+                            "author_id": 1_i32
+                        },
+                        "name": "target_author",
+                        "unique": true
+                    },
+                    // Serves the account-deletion cascade's author side and
+                    // the block cascade.
+                    {
+                        "key": {
+                            "author_id": 1_i32
+                        },
+                        "name": "author"
+                    }
+                ]
+            })
+            .await
+            .expect("Failed to create user_respect indexes.");
     }
 
     // Reminder to update LATEST_REVISION when adding new migrations.
