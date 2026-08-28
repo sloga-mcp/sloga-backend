@@ -19,6 +19,7 @@ fn high_priority() -> Option<AndroidConfig> {
     })
 }
 use lapin::{message::Delivery, Channel as AMQPChannel, Connection};
+use log::info;
 use revolt_config::config;
 use revolt_database::{events::rabbit::*, Database};
 use serde_json::Value;
@@ -346,6 +347,22 @@ impl Consumer for FcmOutboundConsumer {
 
         match resp {
             Err(FcmError::Auth) => {
+                // fcm_v1 maps any failure to mint OUR service-account OAuth
+                // token to Error::Auth — it says nothing about the device
+                // token, so the subscription must survive it. Removing it here
+                // silently killed push (messages AND call rings) for healthy
+                // sessions whenever Google auth blipped.
+                bail!("FCM service-account authentication failed (subscription kept)");
+            }
+            // A dead registration token (app uninstalled, data cleared, token
+            // rotated away) is permanent: FCM answers 404 UNREGISTERED. Drop
+            // the subscription so every future notification isn't burned on it.
+            Err(FcmError::FCM(ref msg)) if msg.contains("UNREGISTERED") => {
+                info!(
+                    "Removing FCM subscription id {:} (user: {:}) due to unregistered token",
+                    &payload.session_id, &payload.user_id
+                );
+
                 if let Err(err) = self
                     .db
                     .remove_push_subscription_by_session_id(&payload.session_id)

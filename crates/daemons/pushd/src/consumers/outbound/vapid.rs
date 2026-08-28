@@ -166,7 +166,15 @@ impl Consumer for VapidOutboundConsumer {
         let msg = builder.build()?;
 
         match self.client.send(msg).await {
-            Err(WebPushError::Unauthorized) => {
+            // EndpointNotValid/EndpointNotFound are the push service saying
+            // this subscription is permanently gone (browser profile cleared,
+            // subscription expired) — without removal, pushd re-sends to the
+            // dead endpoint on every notification forever.
+            Err(
+                WebPushError::Unauthorized
+                | WebPushError::EndpointNotValid
+                | WebPushError::EndpointNotFound,
+            ) => {
                 if let Err(err) = self
                     .db
                     .remove_push_subscription_by_session_id(&payload.session_id)
