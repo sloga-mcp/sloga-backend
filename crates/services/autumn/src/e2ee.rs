@@ -34,10 +34,23 @@ use utoipa::ToSchema;
 
 use revolt_database::util::permissions::DatabasePermissionQuery;
 
-/// Maximum ciphertext size per blob: 20 MiB of plaintext (attachment
-/// parity) plus headroom for the streaming-AEAD header and per-chunk
-/// authentication tags.
-pub const MAX_E2EE_BLOB_SIZE: usize = 21 * 1024 * 1024;
+/// Maximum ciphertext size per blob: 90 MB of plaintext plus headroom for
+/// the streaming-AEAD header and per-chunk authentication tags.
+///
+/// 🔴 The ceiling here is the CDN, not the crypto. This route is a single
+/// POST, and the CDN in front of the API returns 413 AT THE EDGE for any
+/// request body over 100 MB — the file never reaches this service and the
+/// upload appears to freeze at a low percentage rather than failing. So
+/// `E2EE_BLOB_BODY_LIMIT` (this plus multipart overhead) must stay under the
+/// 95 MB line the client encodes as `MAX_UPLOAD_REQUEST_SIZE`. Raising this
+/// past that does not raise the real limit; it only moves the failure to the
+/// edge, where it is much harder to diagnose.
+///
+/// Going meaningfully above this requires the blob route to adopt the chunked
+/// upload machinery in `upload.rs` (each part its own sub-100 MB request),
+/// which is a later phase. `blob_size_cap_covers_stream_overhead` pins both
+/// ends of this arithmetic.
+pub const MAX_E2EE_BLOB_SIZE: usize = 91_000_000;
 
 /// Body limit for the upload route (multipart overhead on top of the blob)
 pub const E2EE_BLOB_BODY_LIMIT: usize = MAX_E2EE_BLOB_SIZE + 64 * 1024;
@@ -351,10 +364,19 @@ mod tests {
 
     #[test]
     fn blob_size_cap_covers_stream_overhead() {
-        // 20 MiB of plaintext in 1 MiB STREAM chunks: 20 tags + header
-        let plaintext_cap: usize = 20 * 1024 * 1024;
+        // 90 MB of plaintext in 1 MiB STREAM chunks: one 16-byte tag per
+        // chunk plus the 12-byte header (4 magic + 1 version + 7 nonce).
+        // Must equal e2ee-core's MAX_ATTACHMENT_PLAINTEXT.
+        let plaintext_cap: usize = 90_000_000;
         let worst_case = 12 + plaintext_cap + plaintext_cap.div_ceil(1024 * 1024) * 16;
         assert!(worst_case <= MAX_E2EE_BLOB_SIZE);
         assert!(MAX_E2EE_BLOB_SIZE < E2EE_BLOB_BODY_LIMIT);
+
+        // 🔴 The CDN returns 413 at the edge above 100 MB, and the client
+        // encodes a 95 MB safety line as MAX_UPLOAD_REQUEST_SIZE. The whole
+        // REQUEST — blob plus multipart overhead — has to fit under it, or
+        // uploads at the cap hang instead of succeeding. This is the
+        // assertion that actually keeps the feature working.
+        assert!(E2EE_BLOB_BODY_LIMIT < 95_000_000);
     }
 }
