@@ -66,6 +66,8 @@ pub struct RevoltFeatures {
     pub oauth_twitch: bool,
     /// Whether YouTube channel linking is enabled
     pub oauth_youtube: bool,
+    /// Whether Kick channel linking is enabled
+    pub oauth_kick: bool,
     /// Whether importing a server from Discord is enabled
     pub import_discord: bool,
     /// When the optional sticker-import step is available, the Discord
@@ -235,6 +237,7 @@ pub async fn root() -> Result<Json<RevoltConfig>> {
             oauth_apple: config.api.oauth.apple.enabled,
             oauth_twitch: config.api.oauth.twitch.enabled,
             oauth_youtube: config.api.oauth.youtube.enabled,
+            oauth_kick: config.api.oauth.kick.enabled,
             import_discord: config.api.import.discord.enabled,
             // The client_id is public by nature (it appears verbatim in the
             // bot-invite URL); the bot token never leaves the server.

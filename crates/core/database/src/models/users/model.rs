@@ -110,6 +110,7 @@ auto_derived!(
     pub enum ConnectionPlatform {
         Twitch,
         YouTube,
+        Kick,
     }
 
     /// Public denormalized copy of a linked streaming channel; never

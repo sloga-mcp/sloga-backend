@@ -7,6 +7,7 @@ pub mod apple_complete;
 pub mod google_authorise;
 pub mod google_callback;
 pub mod google_complete;
+pub mod kick_callback;
 pub mod link;
 pub mod twitch_callback;
 pub mod youtube_callback;
@@ -30,6 +31,7 @@ pub fn routes() -> (Vec<Route>, OpenApi) {
         apple_callback::apple_callback,
         apple_complete::apple_complete,
         twitch_callback::twitch_callback,
-        youtube_callback::youtube_callback
+        youtube_callback::youtube_callback,
+        kick_callback::kick_callback
     ]
 }

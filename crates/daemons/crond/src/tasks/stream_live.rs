@@ -1,4 +1,5 @@
-//! Live-status poller for linked streaming channels (Twitch / YouTube).
+//! Live-status poller for linked streaming channels (Twitch / YouTube /
+//! Kick).
 //!
 //! On every live↔offline flip (or title change) the denormalized
 //! `User.connections` field is rebuilt via `StreamConnection::
@@ -13,6 +14,9 @@
 //! (1 quota unit vs 100 for search.list), checked every 5th tick —
 //! ~288 units/user/day against the default 10k/day quota (~30 linked
 //! users; WebSub is the upgrade path beyond that).
+//! Kick: same shape as Twitch — one app access token (client credentials,
+//! cached in Redis), `public/v1/channels` batched 50 ids per call, checked
+//! every tick. No user tokens, so no failure/auto-unlink accounting.
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -38,6 +42,7 @@ const MAX_POLL_FAILURES: u32 = 12;
 const NOTIFY_HYSTERESIS_MINS: i64 = 30;
 
 const TWITCH_APP_TOKEN_KEY: &str = "oauth:twitch:app_token";
+const KICK_APP_TOKEN_KEY: &str = "oauth:kick:app_token";
 
 pub async fn task(db: Database, amqp: AMQP) -> Result<()> {
     let mut tick: u64 = 0;
@@ -48,6 +53,12 @@ pub async fn task(db: Database, amqp: AMQP) -> Result<()> {
         if config.api.oauth.twitch.enabled {
             if let Err(error) = poll_twitch(&db, &amqp).await {
                 log::error!("twitch live poll failed: {error:?}");
+            }
+        }
+
+        if config.api.oauth.kick.enabled {
+            if let Err(error) = poll_kick(&db, &amqp).await {
+                log::error!("kick live poll failed: {error:?}");
             }
         }
 
@@ -130,6 +141,7 @@ async fn notify_friends(db: &Database, amqp: &AMQP, connection: &StreamConnectio
     let platform_label = match connection.platform {
         ConnectionPlatform::Twitch => "Twitch",
         ConnectionPlatform::YouTube => "YouTube",
+        ConnectionPlatform::Kick => "Kick",
     };
     let streamer_name = streamer
         .display_name
@@ -299,6 +311,179 @@ async fn poll_twitch(db: &Database, amqp: &AMQP) -> Result<()> {
         for row in chunk {
             let mut connection = row.clone();
             let observed = live_by_channel.get(&connection.channel_id).cloned();
+            apply_live_state(db, amqp, &mut connection, observed).await;
+        }
+    }
+
+    Ok(())
+}
+
+// -------------------------------------------------------------------------
+// Kick
+// -------------------------------------------------------------------------
+
+#[derive(serde::Deserialize)]
+struct KickTokenResponse {
+    access_token: String,
+    expires_in: u64,
+}
+
+#[derive(serde::Deserialize)]
+struct KickChannelsResponse {
+    #[serde(default)]
+    data: Vec<KickChannel>,
+}
+
+#[derive(serde::Deserialize)]
+struct KickChannel {
+    broadcaster_user_id: u64,
+    #[serde(default)]
+    stream_title: Option<String>,
+    #[serde(default)]
+    stream: Option<KickStream>,
+}
+
+#[derive(serde::Deserialize)]
+struct KickStream {
+    #[serde(default)]
+    is_live: bool,
+    #[serde(default)]
+    start_time: Option<String>,
+}
+
+/// Client-credentials app token, cached in Redis with an early-expiry margin
+async fn kick_app_token(force_refresh: bool) -> Option<String> {
+    let mut conn = get_connection().await.ok()?.into_inner();
+
+    if !force_refresh {
+        if let Ok(Some(token)) = conn.get::<_, Option<String>>(KICK_APP_TOKEN_KEY).await {
+            return Some(token);
+        }
+    }
+
+    let config = revolt_config::config().await;
+    let kick = &config.api.oauth.kick;
+
+    let response = reqwest::Client::new()
+        .post("https://id.kick.com/oauth/token")
+        .form(&[
+            ("client_id", kick.client_id.as_str()),
+            ("client_secret", kick.client_secret.as_str()),
+            ("grant_type", "client_credentials"),
+        ])
+        .send()
+        .await
+        .ok()?;
+
+    if !response.status().is_success() {
+        return None;
+    }
+
+    let tokens: KickTokenResponse = response.json().await.ok()?;
+
+    let _: Option<String> = conn
+        .set_options(
+            KICK_APP_TOKEN_KEY,
+            &tokens.access_token,
+            redis::SetOptions::default()
+                .with_expiration(redis::SetExpiry::EX(tokens.expires_in.saturating_sub(300) as usize)),
+        )
+        .await
+        .ok();
+
+    Some(tokens.access_token)
+}
+
+async fn poll_kick(db: &Database, amqp: &AMQP) -> Result<()> {
+    let rows = db
+        .fetch_stream_connections_by_platform(&ConnectionPlatform::Kick)
+        .await?;
+    if rows.is_empty() {
+        return Ok(());
+    }
+
+    let Some(mut token) = kick_app_token(false).await else {
+        log::warn!("could not obtain kick app token");
+        return Ok(());
+    };
+
+    for chunk in rows.chunks(50) {
+        let ids: Vec<(&str, &str)> = chunk
+            .iter()
+            .map(|row| ("broadcaster_user_id", row.channel_id.as_str()))
+            .collect();
+
+        let mut response = reqwest::Client::new()
+            .get("https://api.kick.com/public/v1/channels")
+            .query(&ids)
+            .bearer_auth(&token)
+            .send()
+            .await
+            .map_err(|_| revolt_result::create_error!(InternalError))?;
+
+        // Expired app token — refresh once and retry the batch
+        if response.status() == reqwest::StatusCode::UNAUTHORIZED {
+            let Some(fresh) = kick_app_token(true).await else {
+                return Ok(());
+            };
+            token = fresh;
+            response = reqwest::Client::new()
+                .get("https://api.kick.com/public/v1/channels")
+                .query(&ids)
+                .bearer_auth(&token)
+                .send()
+                .await
+                .map_err(|_| revolt_result::create_error!(InternalError))?;
+        }
+
+        if !response.status().is_success() {
+            log::warn!("kick channels returned {}", response.status());
+            continue;
+        }
+
+        let channels: KickChannelsResponse = response
+            .json()
+            .await
+            .map_err(|_| revolt_result::create_error!(InternalError))?;
+
+        // title + parsed start (None = missing/unparseable), keyed by id
+        let live_by_channel: HashMap<String, (Option<String>, Option<Timestamp>)> = channels
+            .data
+            .into_iter()
+            .filter(|channel| channel.stream.as_ref().is_some_and(|s| s.is_live))
+            .map(|channel| {
+                let started_at = channel
+                    .stream
+                    .as_ref()
+                    .and_then(|s| s.start_time.as_deref())
+                    .and_then(Timestamp::parse);
+                (
+                    channel.broadcaster_user_id.to_string(),
+                    (
+                        channel
+                            .stream_title
+                            .filter(|title| !title.is_empty())
+                            .map(truncate_title),
+                        started_at,
+                    ),
+                )
+            })
+            .collect();
+
+        for row in chunk {
+            let mut connection = row.clone();
+            let observed = live_by_channel
+                .get(&connection.channel_id)
+                .map(|(title, started_at)| StreamLiveState {
+                    title: title.clone(),
+                    // If Kick's start_time didn't parse, keep the timestamp
+                    // we already have for an ongoing stream — a fresh
+                    // now_utc() every tick would trip apply_live_state's
+                    // change gate (save + fan-out) once a minute for nothing
+                    started_at: started_at
+                        .or_else(|| connection.live.as_ref().map(|live| live.started_at))
+                        .unwrap_or_else(Timestamp::now_utc),
+                });
             apply_live_state(db, amqp, &mut connection, observed).await;
         }
     }

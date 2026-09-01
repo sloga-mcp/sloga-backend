@@ -1,4 +1,5 @@
-//! Shared plumbing for the streaming-channel LINK flow (Twitch / YouTube).
+//! Shared plumbing for the streaming-channel LINK flow (Twitch / YouTube /
+//! Kick).
 //!
 //! This is a *connect* flow, not a login flow: the initiating user is
 //! already authenticated. Because session auth is a header (not a cookie)
@@ -25,7 +26,7 @@ use rocket::response::Redirect;
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct LinkState {
     pub user_id: String,
-    /// PKCE verifier (YouTube only)
+    /// PKCE verifier (YouTube and Kick; Twitch does not use PKCE)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub verifier: Option<String>,
 }
@@ -34,7 +35,7 @@ pub struct LinkState {
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct LinkHandoff {
     pub user_id: String,
-    /// Platform key ("twitch" / "youtube")
+    /// Platform key ("twitch" / "youtube" / "kick")
     pub platform: String,
     pub channel_id: String,
     pub handle: String,
@@ -161,5 +162,14 @@ pub fn youtube_redirect_uri(
         format!("{}/auth/oauth/youtube/callback", api_host)
     } else {
         youtube.redirect_uri.clone()
+    }
+}
+
+/// Resolve the Kick redirect URI, defaulting to the public API host
+pub fn kick_redirect_uri(kick: &revolt_config::ApiOauthKick, api_host: &str) -> String {
+    if kick.redirect_uri.is_empty() {
+        format!("{}/auth/oauth/kick/callback", api_host)
+    } else {
+        kick.redirect_uri.clone()
     }
 }

@@ -1,4 +1,4 @@
-//! Begin linking a streaming channel (Twitch / YouTube)
+//! Begin linking a streaming channel (Twitch / YouTube / Kick)
 //! POST /users/@me/connections/<platform>/authorize
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
@@ -102,6 +102,45 @@ pub async fn connections_authorize(
                 .append_pair("prompt", "consent");
             url.to_string()
         }
+        "kick" => {
+            let kick = &config.api.oauth.kick;
+            if !kick.enabled || kick.client_id.is_empty() {
+                return Err(create_error!(OperationFailed));
+            }
+
+            // Kick's OAuth 2.1 mandates PKCE even for confidential clients
+            let verifier = nanoid!(64);
+            let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
+
+            link::store_link_state(
+                "kick",
+                &state,
+                &link::LinkState {
+                    user_id: user.id.clone(),
+                    verifier: Some(verifier),
+                },
+            )
+            .await
+            .ok_or_else(|| create_error!(InternalError))?;
+
+            let mut url = url::Url::parse("https://id.kick.com/oauth/authorize")
+                .expect("valid authorisation endpoint");
+            url.query_pairs_mut()
+                .append_pair("client_id", &kick.client_id)
+                .append_pair(
+                    "redirect_uri",
+                    &link::kick_redirect_uri(kick, &config.hosts.api),
+                )
+                .append_pair("response_type", "code")
+                // channel:read for the broadcaster id + slug, user:read for
+                // the display name; the one-shot token is revoked right
+                // after those two fetches
+                .append_pair("scope", "user:read channel:read")
+                .append_pair("state", &state)
+                .append_pair("code_challenge", &challenge)
+                .append_pair("code_challenge_method", "S256");
+            url.to_string()
+        }
         _ => return Err(create_error!(InvalidOperation)),
     };
 
@@ -126,7 +165,7 @@ mod tests {
 
         // Config defaults (and Revolt.test-overrides.toml) ship with both
         // providers disabled
-        for platform in ["twitch", "youtube"] {
+        for platform in ["twitch", "youtube", "kick"] {
             let res = TestHarness::with_session(
                 session.clone(),
                 harness
@@ -151,7 +190,7 @@ mod tests {
             session,
             harness
                 .client
-                .post("/users/@me/connections/kick/authorize"),
+                .post("/users/@me/connections/rumble/authorize"),
         )
         .await;
 

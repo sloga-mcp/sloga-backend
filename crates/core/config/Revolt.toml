@@ -81,6 +81,13 @@ client_id = ""
 client_secret = ""
 redirect_uri = ""
 
+[api.oauth.kick]
+# Kick CHANNEL LINKING (streaming connections, not login)
+enabled = false
+client_id = ""
+client_secret = ""
+redirect_uri = ""
+
 [api.import.discord]
 # Import a Discord community into Sloga.
 # Primary path is a server-template link, which hits a PUBLIC unauthenticated

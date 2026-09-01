@@ -131,6 +131,7 @@ auto_derived!(
     pub enum ConnectionPlatform {
         Twitch,
         YouTube,
+        Kick,
     }
 
     /// A streaming channel the user linked via OAuth.
@@ -140,7 +141,7 @@ auto_derived!(
     pub struct UserConnection {
         /// Which platform the channel is on
         pub platform: ConnectionPlatform,
-        /// Channel handle (Twitch login / YouTube @handle) used to build the URL
+        /// Channel handle (Twitch login / YouTube @handle / Kick slug) used to build the URL
         pub handle: String,
         /// Channel display name
         pub display_name: String,

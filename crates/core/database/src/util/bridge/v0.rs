@@ -1815,6 +1815,7 @@ impl From<crate::ConnectionPlatform> for ConnectionPlatform {
         match value {
             crate::ConnectionPlatform::Twitch => ConnectionPlatform::Twitch,
             crate::ConnectionPlatform::YouTube => ConnectionPlatform::YouTube,
+            crate::ConnectionPlatform::Kick => ConnectionPlatform::Kick,
         }
     }
 }
@@ -1824,6 +1825,7 @@ impl From<ConnectionPlatform> for crate::ConnectionPlatform {
         match value {
             ConnectionPlatform::Twitch => crate::ConnectionPlatform::Twitch,
             ConnectionPlatform::YouTube => crate::ConnectionPlatform::YouTube,
+            ConnectionPlatform::Kick => crate::ConnectionPlatform::Kick,
         }
     }
 }

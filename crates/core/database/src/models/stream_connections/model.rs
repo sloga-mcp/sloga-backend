@@ -28,13 +28,15 @@ auto_derived!(
         pub user_id: String,
         /// Which platform the channel is on
         pub platform: ConnectionPlatform,
-        /// Provider channel id (Twitch user id / YouTube channel id)
+        /// Provider channel id (Twitch user id / YouTube channel id /
+        /// Kick broadcaster user id)
         pub channel_id: String,
-        /// Channel handle (Twitch login / YouTube @handle) for URLs
+        /// Channel handle (Twitch login / YouTube @handle / Kick slug) for URLs
         pub handle: String,
         /// Channel display name
         pub display_name: String,
-        /// OAuth refresh token (YouTube only; Twitch stores NO user tokens)
+        /// OAuth refresh token (YouTube only; Twitch and Kick store NO
+        /// user tokens)
         #[serde(skip_serializing_if = "Option::is_none")]
         pub refresh_token: Option<String>,
         /// Cached short-lived access token (YouTube only)
@@ -62,6 +64,7 @@ impl ConnectionPlatform {
         match self {
             ConnectionPlatform::Twitch => "twitch",
             ConnectionPlatform::YouTube => "youtube",
+            ConnectionPlatform::Kick => "kick",
         }
     }
 
@@ -72,6 +75,7 @@ impl ConnectionPlatform {
         match self {
             ConnectionPlatform::Twitch => "Twitch",
             ConnectionPlatform::YouTube => "YouTube",
+            ConnectionPlatform::Kick => "Kick",
         }
     }
 
@@ -79,6 +83,7 @@ impl ConnectionPlatform {
         match value {
             "twitch" => Some(ConnectionPlatform::Twitch),
             "youtube" => Some(ConnectionPlatform::YouTube),
+            "kick" => Some(ConnectionPlatform::Kick),
             _ => None,
         }
     }

@@ -329,6 +329,22 @@ pub struct ApiOauthYoutube {
     pub redirect_uri: String,
 }
 
+/// Kick channel linking (not login). Same posture as Twitch: no user
+/// tokens are stored — the one-shot token is revoked after the identity
+/// fetch and live checks use a client-credentials app token. Kick's OAuth
+/// 2.1 endpoints require PKCE even for confidential clients.
+#[derive(Deserialize, Debug, Clone, Default)]
+pub struct ApiOauthKick {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub client_id: String,
+    #[serde(default)]
+    pub client_secret: String,
+    #[serde(default)]
+    pub redirect_uri: String,
+}
+
 /// Import an existing community into Sloga.
 ///
 /// The primary path (server templates) hits a PUBLIC, unauthenticated
@@ -376,6 +392,8 @@ pub struct ApiOauth {
     pub twitch: ApiOauthTwitch,
     #[serde(default)]
     pub youtube: ApiOauthYoutube,
+    #[serde(default)]
+    pub kick: ApiOauthKick,
 }
 
 /// A preconfigured global soundboard sound ("Sloga Sounds"), playable in any
