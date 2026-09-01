@@ -145,6 +145,11 @@ async fn callback_inner(
             ("token", tokens.access_token.as_str()),
             ("token_hint_type", "access_token"),
         ])
+        // Kick expects this even though the parameters ride the query string
+        .header(
+            reqwest::header::CONTENT_TYPE,
+            "application/x-www-form-urlencoded",
+        )
         .send()
         .await;
 
