@@ -134,6 +134,13 @@ pub trait AbstractMls: Sync + Send {
         intent: &MlsJoinIntent,
     ) -> Result<Option<MlsJoinIntent>>;
 
+    /// Fetch every stored join intent for a group. Serves the dual-reload
+    /// close check (rejoin plan §5): admission consumes a device's intent
+    /// row (`insert_mls_commit` deletes intents for added devices), so an
+    /// intent held by a CURRENT member means that device is mid-rejoin.
+    async fn fetch_mls_join_intents_for_group(&self, group_id: &str)
+        -> Result<Vec<MlsJoinIntent>>;
+
     /// Sweep groups closed before `closed_threshold` or created before
     /// `created_threshold` (call groups are ephemeral — plan §2.5), along
     /// with their commits and join intents. Returns how many groups went.

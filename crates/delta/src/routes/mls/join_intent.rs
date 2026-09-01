@@ -3,7 +3,8 @@ use std::collections::HashSet;
 use iso8601_timestamp::Timestamp;
 use revolt_database::{
     events::client::EventV1, is_valid_device_id, is_valid_key_package_ref,
-    mls_join_intent_payload, Database, MlsJoinIntent, Session, User, MAX_MLS_GROUP_MEMBERS,
+    mls_join_intent_payload, Database, MlsJoinIntent, MlsMemberDevice, Session, User,
+    MAX_MLS_GROUP_MEMBERS,
 };
 use revolt_models::v0;
 use revolt_result::{create_error, Result};
@@ -12,7 +13,28 @@ use rocket_empty::EmptyResponse;
 
 use crate::routes::e2ee::MAX_SIGNATURE_LENGTH;
 
-use super::MIN_JOIN_INTENT_INTERVAL_SECONDS;
+use super::{MIN_JOIN_INTENT_INTERVAL_SECONDS, REJOIN_OUTSTANDING_WINDOW_SECONDS};
+
+/// Whether EVERY member device of the group holds an outstanding join
+/// intent — i.e. every member is itself mid-rejoin, so no member is left
+/// who could serve anyone (the dual-reload deadlock, rejoin plan §5).
+/// "Outstanding" = (re)broadcast within [`REJOIN_OUTSTANDING_WINDOW_SECONDS`]
+/// of `now`; `created_at` is upserted on every re-broadcast, so an actively
+/// rejoining device always qualifies and an abandoned row ages out.
+pub(crate) fn all_member_devices_rejoining(
+    members: &[MlsMemberDevice],
+    intents: &[MlsJoinIntent],
+    now: Timestamp,
+) -> bool {
+    members.iter().all(|member| {
+        intents.iter().any(|intent| {
+            intent.user_id == member.user_id
+                && intent.device_id == member.device_id
+                && now.duration_since(intent.created_at).whole_seconds()
+                    <= REJOIN_OUTSTANDING_WINDOW_SECONDS
+        })
+    })
+}
 
 /// # Signal MLS Join Intent
 ///
@@ -146,9 +168,34 @@ pub async fn join_intent(
             .duration_since(previous.created_at)
             .whole_seconds();
         if elapsed < MIN_JOIN_INTENT_INTERVAL_SECONDS {
+            // Restore the previous row: a slowmode-REJECTED re-broadcast
+            // must not refresh the freshness stamp the dual-reload close
+            // below reads, or a member spamming sub-interval intents could
+            // keep its own row perpetually "outstanding" and steer a peer's
+            // legitimate rejoin into a group close. (Griefing only — the
+            // peers converge encrypted via CREATE — but cheap to refuse.)
+            // A row has a single writer (its own device), so this restore
+            // can only race that device's own requests.
+            db.upsert_mls_join_intent(&previous).await?;
             return Err(create_error!(InSlowmode {
                 retry_after: (MIN_JOIN_INTENT_INTERVAL_SECONDS - elapsed).max(1) as u64
             }));
+        }
+    }
+
+    // Dual-reload deadlock (rejoin plan §5): a rejoin is only ever served
+    // by a member that still HOLDS the group — but if every member device
+    // is itself mid-rejoin (each wiped its local state), nobody is left to
+    // serve anyone and the group is unrecoverable. Generalize the
+    // solo-close above: close the group so each device's next establish
+    // takes the CREATE path. Checked after the upsert (this device's own
+    // fresh intent must count) and after slowmode (a replay cannot probe
+    // faster than a legitimate re-broadcast).
+    if rejoin {
+        let intents = db.fetch_mls_join_intents_for_group(&group.id).await?;
+        if all_member_devices_rejoining(&group.members, &intents, intent.created_at) {
+            db.close_mls_group(&group.id).await?;
+            return Ok(EmptyResponse);
         }
     }
 

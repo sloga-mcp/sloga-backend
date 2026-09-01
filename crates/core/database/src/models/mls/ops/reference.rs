@@ -331,6 +331,20 @@ impl crate::AbstractMls for ReferenceDb {
         });
         group.members.extend(commit.added.iter().cloned());
 
+        // Admission consumes the joiner's intent row (dual-reload close,
+        // rejoin plan §5) — lock order groups → commits → intents matches
+        // the sweep
+        if !commit.added.is_empty() {
+            let mut intents = self.mls_join_intents.lock().await;
+            for added in &commit.added {
+                intents.remove(&MlsJoinIntent::composite_id(
+                    &commit.group_id,
+                    &added.user_id,
+                    &added.device_id,
+                ));
+            }
+        }
+
         Ok(MlsCommitOutcome::Won)
     }
 
@@ -358,6 +372,18 @@ impl crate::AbstractMls for ReferenceDb {
     ) -> Result<Option<MlsJoinIntent>> {
         let mut intents = self.mls_join_intents.lock().await;
         Ok(intents.insert(intent.id.clone(), intent.clone()))
+    }
+
+    async fn fetch_mls_join_intents_for_group(
+        &self,
+        group_id: &str,
+    ) -> Result<Vec<MlsJoinIntent>> {
+        let intents = self.mls_join_intents.lock().await;
+        Ok(intents
+            .values()
+            .filter(|intent| intent.group_id == group_id)
+            .cloned()
+            .collect())
     }
 
     async fn sweep_mls_groups(

@@ -54,7 +54,8 @@ impl MongoDb {
             .retain(|member| !commit.removed.iter().any(|removed| removed == member));
         updated.members.extend(commit.added.iter().cloned());
 
-        self.col::<MlsGroup>(COL_GROUPS)
+        let applied = self
+            .col::<MlsGroup>(COL_GROUPS)
             .replace_one(
                 doc! {
                     "_id": &group.id,
@@ -65,7 +66,29 @@ impl MongoDb {
             )
             .await
             .map_err(|_| create_database_error!("replace_one", COL_GROUPS))
-            .map(|result| result.matched_count > 0)
+            .map(|result| result.matched_count > 0)?;
+
+        // Admission consumes the joiner's intent row: without this, every
+        // member would retain its original pre-admit intent and the
+        // dual-reload close (rejoin plan §5) could misread a freshly
+        // admitted member as "still rejoining". Idempotent, so safe under
+        // the repair path; a delayed repair deleting a device's NEWER
+        // rejoin intent only defers the close check one re-broadcast.
+        if applied && !commit.added.is_empty() {
+            let added_ids: Vec<String> = commit
+                .added
+                .iter()
+                .map(|added| {
+                    MlsJoinIntent::composite_id(&group.id, &added.user_id, &added.device_id)
+                })
+                .collect();
+            self.col::<MlsJoinIntent>(COL_JOIN_INTENTS)
+                .delete_many(doc! { "_id": { "$in": added_ids } })
+                .await
+                .map_err(|_| create_database_error!("delete_many", COL_JOIN_INTENTS))?;
+        }
+
+        Ok(applied)
     }
 
     /// Fetch a group and lazily repair its `current_epoch`/roster mirror
@@ -534,6 +557,20 @@ impl AbstractMls for MongoDb {
             )
             .await
             .map_err(|_| create_database_error!("find_one_and_replace", COL_JOIN_INTENTS))
+    }
+
+    async fn fetch_mls_join_intents_for_group(
+        &self,
+        group_id: &str,
+    ) -> Result<Vec<MlsJoinIntent>> {
+        Ok(self
+            .col::<MlsJoinIntent>(COL_JOIN_INTENTS)
+            .find(doc! { "group_id": group_id })
+            .await
+            .map_err(|_| create_database_error!("find", COL_JOIN_INTENTS))?
+            .filter_map(|s| async { s.ok() })
+            .collect::<Vec<MlsJoinIntent>>()
+            .await)
     }
 
     async fn sweep_mls_groups(

@@ -618,6 +618,219 @@ async fn rejoin_affordance_flags_and_solo_close_case() {
 }
 
 #[test]
+fn rejoin_outstanding_policy_requires_every_member_fresh() {
+    use iso8601_timestamp::{Duration, Timestamp};
+    use revolt_database::{MlsJoinIntent, MlsMemberDevice};
+
+    use super::join_intent::all_member_devices_rejoining;
+    use super::REJOIN_OUTSTANDING_WINDOW_SECONDS;
+
+    fn member(user: &str, device: &str) -> MlsMemberDevice {
+        MlsMemberDevice {
+            user_id: user.to_string(),
+            device_id: device.to_string(),
+        }
+    }
+
+    fn intent(now: Timestamp, user: &str, device: &str, age_seconds: i64) -> MlsJoinIntent {
+        MlsJoinIntent {
+            id: MlsJoinIntent::composite_id("g", user, device),
+            group_id: "g".to_string(),
+            user_id: user.to_string(),
+            device_id: device.to_string(),
+            key_package_ref: "ref0".to_string(),
+            signature: "c2ln".to_string(),
+            created_at: now.checked_sub(Duration::seconds(age_seconds)).unwrap(),
+        }
+    }
+
+    let now = Timestamp::now_utc();
+    let members = [member("a", "d1"), member("b", "d2")];
+
+    // Every member device actively re-broadcasting → deadlocked
+    assert!(all_member_devices_rejoining(
+        &members,
+        &[intent(now, "a", "d1", 0), intent(now, "b", "d2", 9)],
+        now
+    ));
+
+    // One member holds no intent — it can still serve → not deadlocked
+    assert!(!all_member_devices_rejoining(
+        &members,
+        &[intent(now, "a", "d1", 0)],
+        now
+    ));
+
+    // An abandoned (stale) row does not count as outstanding
+    assert!(!all_member_devices_rejoining(
+        &members,
+        &[
+            intent(now, "a", "d1", 0),
+            intent(now, "b", "d2", REJOIN_OUTSTANDING_WINDOW_SECONDS + 1)
+        ],
+        now
+    ));
+
+    // A different device of the same user does not cover the member device
+    assert!(!all_member_devices_rejoining(
+        &members,
+        &[intent(now, "a", "d1", 0), intent(now, "b", "d9", 0)],
+        now
+    ));
+}
+
+#[test]
+fn dual_reload_rejoin_closes_group() {
+    crate::util::test::rt().block_on(dual_reload_rejoin_closes_group_case())
+}
+
+async fn dual_reload_rejoin_closes_group_case() {
+    let mut harness = TestHarness::new().await;
+    let (account_a, session_a, user_a) = harness.new_user().await;
+    let (account_b, session_b, user_b) = harness.new_user().await;
+
+    let channel = voice_channel_with_members(&harness, &user_a, &[&user_b]).await;
+    let device_a = enroll_mls_device(
+        &harness,
+        &account_a.id,
+        &user_a.id,
+        &session_a.token,
+        &["a0"],
+        Some("alast"),
+    )
+    .await;
+    let device_b = enroll_mls_device(
+        &harness,
+        &account_b.id,
+        &user_b.id,
+        &session_b.token,
+        &["b0"],
+        Some("blast"),
+    )
+    .await;
+
+    let gid = group_id(5);
+    {
+        let response = post_json(
+            &harness,
+            &session_a,
+            "/mls/groups".to_string(),
+            serde_json::to_string(&v0::DataCreateMlsGroup {
+                group_id: gid.clone(),
+                channel_id: channel.id().to_string(),
+                device_id: device_a.device.device_id.clone(),
+                supersedes: None,
+            })
+            .unwrap(),
+        )
+        .await;
+        assert_eq!(response.status(), Status::Ok);
+    }
+
+    // B signals a NORMAL pre-admit join intent, storing an intent row
+    {
+        let response = post_json(
+            &harness,
+            &session_b,
+            format!("/mls/groups/{gid}/join_intent"),
+            serde_json::to_string(&v0::DataMlsJoinIntent {
+                device_id: device_b.device.device_id.clone(),
+                key_package_ref: "b0".to_string(),
+                signature: device_b.join_signature(&user_b.id, &gid, "b0"),
+            })
+            .unwrap(),
+        )
+        .await;
+        assert_eq!(response.status(), Status::NoContent);
+    }
+
+    // A admits B at epoch 1 — admission consumes B's intent row
+    {
+        let response = post_json(
+            &harness,
+            &session_a,
+            format!("/mls/groups/{gid}/commits"),
+            serde_json::to_string(&v0::DataSubmitMlsCommit {
+                device_id: device_a.device.device_id.clone(),
+                epoch: 1,
+                commit: STANDARD_NO_PAD.encode(b"add b"),
+                welcome: Some(STANDARD_NO_PAD.encode(b"welcome b")),
+                added: vec![v0::MlsMemberDevice {
+                    user_id: user_b.id.clone(),
+                    device_id: device_b.device.device_id.clone(),
+                }],
+                removed: vec![],
+            })
+            .unwrap(),
+        )
+        .await;
+        assert_eq!(response.status(), Status::Ok);
+    }
+
+    // A rejoins (reload). B's pre-admit intent was consumed by the Add, so
+    // B does NOT read as mid-rejoin: the group must stay open and the
+    // rejoin must fan out for B to serve.
+    {
+        let response = post_json(
+            &harness,
+            &session_a,
+            format!("/mls/groups/{gid}/join_intent"),
+            serde_json::to_string(&v0::DataMlsJoinIntent {
+                device_id: device_a.device.device_id.clone(),
+                key_package_ref: "a0".to_string(),
+                signature: device_a.join_signature(&user_a.id, &gid, "a0"),
+            })
+            .unwrap(),
+        )
+        .await;
+        assert_eq!(response.status(), Status::NoContent);
+    }
+    let group = harness.db.fetch_mls_group(&gid).await.unwrap();
+    assert!(
+        group.open,
+        "a consumed pre-admit intent must not count toward the dual-reload close"
+    );
+
+    // B rejoins too — now EVERY member device is mid-rejoin, nobody is
+    // left to serve anyone: the DS closes the group (dual-reload deadlock)
+    {
+        let response = post_json(
+            &harness,
+            &session_b,
+            format!("/mls/groups/{gid}/join_intent"),
+            serde_json::to_string(&v0::DataMlsJoinIntent {
+                device_id: device_b.device.device_id.clone(),
+                key_package_ref: "b0".to_string(),
+                signature: device_b.join_signature(&user_b.id, &gid, "b0"),
+            })
+            .unwrap(),
+        )
+        .await;
+        assert_eq!(response.status(), Status::NoContent);
+    }
+    let group = harness.db.fetch_mls_group(&gid).await.unwrap();
+    assert!(!group.open, "dual-reload deadlock must close the group");
+
+    // Both sides now converge via CREATE: a further intent 404s (open ==
+    // false), which the joiner surfaces as not_found → re-establish
+    {
+        let response = post_json(
+            &harness,
+            &session_a,
+            format!("/mls/groups/{gid}/join_intent"),
+            serde_json::to_string(&v0::DataMlsJoinIntent {
+                device_id: device_a.device.device_id.clone(),
+                key_package_ref: "a0".to_string(),
+                signature: device_a.join_signature(&user_a.id, &gid, "a0"),
+            })
+            .unwrap(),
+        )
+        .await;
+        assert_eq!(response.status(), Status::NotFound);
+    }
+}
+
+#[test]
 fn voice_participant_identity_mapping_round_trips() {
     crate::util::test::rt().block_on(voice_participant_identity_mapping_round_trips_case())
 }

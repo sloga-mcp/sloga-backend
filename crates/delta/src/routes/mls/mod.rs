@@ -65,6 +65,24 @@ pub const MAX_COMMITS_PER_FETCH: i64 = 100;
 /// joiner-side retry runs at 10 s (plan §1.4), so half that is generous
 pub const MIN_JOIN_INTENT_INTERVAL_SECONDS: i64 = 5;
 
+/// How recently a member device's join intent must have been (re)broadcast
+/// to count as an OUTSTANDING rejoin for the dual-reload close (rejoin
+/// plan §5): an actively rejoining device re-broadcasts every 10 s, so
+/// three missed beats means it is not actively rejoining. Admission
+/// consumes intent rows (`insert_mls_commit` deletes intents for added
+/// devices), so this window only ever measures rejoin re-broadcasts — or a
+/// post-add straggler, which goes stale within one window.
+///
+/// 🔴 The aging is LOAD-BEARING beyond convenience (implementation audit):
+/// the Mongo driver's group-update and intent-delete are not atomic (a
+/// crash between them, or a loser-side repair that skips the delete, can
+/// leave a consumed row behind), and a joiner re-broadcasting between its
+/// Add and its Welcome briefly re-creates its row — in both shapes it is
+/// this window expiring, not the delete, that keeps the row from feeding a
+/// false close. Do not shrink it below the client's re-broadcast beat, and
+/// do not remove the aging check.
+pub const REJOIN_OUTSTANDING_WINDOW_SECONDS: i64 = 30;
+
 /// KeyPackage claims allowed per (claimer, target device) per minute. Racing
 /// admitters cost one claim each per contested join (plan §1.4) and the
 /// admitter stagger keeps races rare, so a small budget suffices.

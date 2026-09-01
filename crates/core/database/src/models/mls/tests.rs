@@ -650,6 +650,69 @@ async fn group_sweep_cascades_to_commits_and_intents() {
 }
 
 #[tokio::test]
+async fn admission_consumes_the_added_devices_join_intent() {
+    database_test!(|db| async move {
+        let creator = device("alice", 1);
+        let joiner = device("bob", 2);
+
+        let make_intent = |group_id: &str| MlsJoinIntent {
+            id: MlsJoinIntent::composite_id(group_id, &joiner.user_id, &joiner.device_id),
+            group_id: group_id.to_string(),
+            user_id: joiner.user_id.clone(),
+            device_id: joiner.device_id.clone(),
+            key_package_ref: "ref0".to_string(),
+            signature: "c2ln".to_string(),
+            created_at: Timestamp::now_utc(),
+        };
+
+        let group = make_group(&group_id(1), "channel_consume_a", &creator);
+        db.create_mls_group(&group, None).await.unwrap();
+        db.upsert_mls_join_intent(&make_intent(&group.id)).await.unwrap();
+
+        // The same device's intent on ANOTHER group must survive the Add
+        let other = make_group(&group_id(2), "channel_consume_b", &creator);
+        db.create_mls_group(&other, None).await.unwrap();
+        db.upsert_mls_join_intent(&make_intent(&other.id)).await.unwrap();
+
+        assert_eq!(
+            db.fetch_mls_join_intents_for_group(&group.id)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+
+        // The commit that ADDS the joiner consumes its intent row —
+        // afterwards, an intent held by a member can only mean a rejoin
+        let outcome = db
+            .insert_mls_commit(&make_commit(
+                &group.id,
+                1,
+                &creator,
+                vec![joiner.clone()],
+                vec![],
+                "add bob",
+            ))
+            .await
+            .unwrap();
+        assert!(matches!(outcome, MlsCommitOutcome::Won));
+
+        assert!(db
+            .fetch_mls_join_intents_for_group(&group.id)
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            db.fetch_mls_join_intents_for_group(&other.id)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+    });
+}
+
+#[tokio::test]
 async fn envelope_byte_budget_is_summed_per_device() {
     database_test!(|db| async move {
         let make_envelope = |size: usize| E2EEEnvelope {
