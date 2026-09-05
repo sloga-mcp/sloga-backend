@@ -21,7 +21,14 @@ static REVOLT_SOURCE_LIST: LazyLock<HashSet<String>> = LazyLock::new(|| {
 
 /// Strip special characters and aliases from emails
 pub fn normalise_email(original: String) -> String {
-    let split = SPLIT.captures(&original).unwrap();
+    // Total, never panicking: `login` normalises BEFORE it validates, so an
+    // address with no "@" reached the unwrap below and answered the most-hit
+    // unauthenticated route with a 500 (audit 2026-09-05 L3). There is nothing
+    // to normalise in a string that is not an addr-spec — lower-case it and
+    // let the caller's own validation reject it.
+    let Some(split) = SPLIT.captures(&original) else {
+        return original.to_lowercase();
+    };
     let mut clean = SYMBOL_RE
         .replace_all(split.get(1).unwrap().as_str(), "")
         .to_string();

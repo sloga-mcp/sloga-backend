@@ -79,6 +79,21 @@ impl Fairing for RatelimitFairing {
 
     async fn on_request(&self, request: &mut Request<'_>, _: &mut Data<'_>) {
         use rocket::outcome::Outcome;
+
+        // A CORS preflight is browser-generated, carries no credentials and no
+        // body, and performs no action — so it must never consume a bucket.
+        // Counting it made every cross-origin call cost TWO slots: the client
+        // sends X-Session-Token, which is not a CORS-safelisted header, so
+        // every /auth request is preflighted. That is what exhausted the auth
+        // bucket, and because the slot ran out on the PREFLIGHT the browser
+        // reported it as a CORS failure rather than a 429 — the symptom that
+        // led to the limit being raised to 255 instead of the cause being
+        // fixed. Exempting preflights here restores real brute-force
+        // protection at a sane limit with double the effective headroom.
+        if request.method() == Method::Options {
+            return;
+        }
+
         if let Outcome::Error(_) = request.guard::<Ratelimiter>().await {
             info!(
                 "User rate-limited on route {}! (IP = {:?})",
@@ -92,6 +107,15 @@ impl Fairing for RatelimitFairing {
     }
 
     async fn on_response<'r>(&self, request: &'r Request<'_>, response: &mut Response<'r>) {
+        // Mirrors the preflight exemption in on_request: evaluating the guard
+        // here would resolve — and therefore CONSUME — the bucket the request
+        // phase deliberately skipped, undoing the exemption entirely. A
+        // preflight response needs no X-RateLimit-* headers; the real request
+        // that follows carries them.
+        if request.method() == Method::Options {
+            return;
+        }
+
         let guard = request.guard::<Ratelimiter>().await;
         let (Outcome::Success(ratelimiter) | Outcome::Error((_, ratelimiter))) = guard else {
             unreachable!()
