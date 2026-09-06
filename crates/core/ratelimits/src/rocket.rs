@@ -1,3 +1,7 @@
+use std::collections::hash_map::RandomState;
+use std::hash::{BuildHasher, Hash, Hasher};
+use std::sync::OnceLock;
+
 use async_trait::async_trait;
 use log::info;
 use rocket::fairing::{Fairing, Info, Kind};
@@ -7,9 +11,9 @@ use rocket::request::{FromRequest, Outcome};
 use rocket::serde::json::Json;
 use rocket::{Data, Request, Response, State};
 
+use revolt_database::{Session, util::ip::rocket::to_real_ip};
 use revolt_rocket_okapi::r#gen::OpenApiGenerator;
 use revolt_rocket_okapi::request::{OpenApiFromRequest, RequestHeaderInput};
-use revolt_database::{Session, util::ip::rocket::to_real_ip};
 
 use crate::ratelimiter::RequestKind;
 use crate::ratelimiter::{RatelimitInformation, Ratelimiter};
@@ -65,6 +69,23 @@ impl OpenApiFromRequest<'_> for Ratelimiter {
     }
 }
 
+/// Pseudonymous tag for a rate-limited client.
+///
+/// The 429 log line used to print the caller's address, which put every
+/// rate-limited visitor's IP into the API log for as long as the file lived,
+/// while the privacy page promises that addresses are never written to log
+/// files. An operator still needs to tell one client hammering a route apart
+/// from many clients each hitting it once, so the address is replaced by a
+/// keyed hash. The key is drawn at random when the process starts, lives only
+/// in memory and is discarded on restart, so the tag is stable for the life of
+/// the process and cannot be turned back into an address from the log alone.
+fn client_tag(address: &str) -> String {
+    static KEY: OnceLock<RandomState> = OnceLock::new();
+    let mut hasher = KEY.get_or_init(RandomState::new).build_hasher();
+    address.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
+}
+
 /// Attach ratelimiter to the Rocket application
 pub struct RatelimitFairing;
 
@@ -96,9 +117,9 @@ impl Fairing for RatelimitFairing {
 
         if let Outcome::Error(_) = request.guard::<Ratelimiter>().await {
             info!(
-                "User rate-limited on route {}! (IP = {:?})",
+                "User rate-limited on route {}! (client {})",
                 request.uri(),
-                to_real_ip(request).await
+                client_tag(&to_real_ip(request).await)
             );
 
             request.set_method(Method::Get);
@@ -161,4 +182,18 @@ fn ratelimit_info(info: RatelimitInformation) -> Json<RatelimitInformation> {
 
 pub fn routes() -> Vec<rocket::Route> {
     rocket::routes![ratelimit_info]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::client_tag;
+
+    #[test]
+    fn client_tag_is_stable_within_a_process_and_distinct_between_clients() {
+        let tag = client_tag("203.0.113.7");
+        assert_eq!(tag, client_tag("203.0.113.7"));
+        assert_ne!(tag, client_tag("203.0.113.8"));
+        assert_eq!(tag.len(), 16);
+        assert!(tag.chars().all(|c| c.is_ascii_hexdigit()));
+    }
 }

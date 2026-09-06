@@ -20,6 +20,21 @@
                 request>headers>X-Session-Token delete
                 request>headers>Authorization delete
                 request>headers>Cookie delete
+                # Client addresses (audit 2026-09-06). An http.log.error entry
+                # stores the whole request, and behind the tunnel the visitor's
+                # address arrives in these headers, so every backend hiccup was
+                # writing caller IPs to disk. The privacy page promises that
+                # addresses are never written to log files; keep that true here.
+                # remote_ip is also a top-level field on admin/tls entries.
+                request>headers>Cf-Connecting-Ip delete
+                request>headers>X-Forwarded-For delete
+                request>headers>True-Client-Ip delete
+                request>headers>Cf-Pseudo-Ipv4 delete
+                request>headers>Cf-Ipcountry delete
+                request>headers>User-Agent delete
+                request>remote_ip replace REDACTED
+                request>client_ip replace REDACTED
+                remote_ip replace REDACTED
             }
         }
     }
@@ -72,6 +87,14 @@
         reverse_proxy 127.0.0.1:14705
     }
 
+    # Prometheus metrics are operator-only telemetry (route templates,
+    # per-status latency histograms, account/login counters). Delta mounts
+    # them at /metrics, which /api strips to — so block the public path here,
+    # ahead of the /api/* proxy below (handle blocks match in source order).
+    handle /api/metrics* {
+        respond 403
+    }
+
     # REST API (Delta) — proxied under /api, prefix stripped
     handle_path /api/* {
         reverse_proxy 127.0.0.1:14702
@@ -90,27 +113,94 @@
         file_server
     }
 
-    # Unicode-emoji SVG packs — proxied to the upstream pack host so the client
-    # only ever requests them from the app origin (E2EE 6.2b: the desktop shell
-    # CSP img-src has no external host; also the no-CDN policy). Keeps the
-    # /emoji prefix (handle, not handle_path). Full self-hosting (vendor the
-    # SVGs to disk + file_server) can replace the upstream later with no client
-    # change. See VITE_EMOJI_URL / unicodeEmojiUrl.
+    # Unicode-emoji SVG packs — SELF-HOSTED since 2026-09-05. These were
+    # reverse-proxied to static.stoat.chat, which left emoji rendering
+    # dependent on upstream-operated infrastructure we do not control.
+    #
+    # The client needed no change at all: it has always requested these from
+    # THIS origin (VITE_EMOJI_URL=https://app.sloga.gg/emoji), so the swap is
+    # server-side only — no rebuild, no release, no CSP change. Nothing is
+    # cache-busted either, because the URLs are identical.
+    #
+    # Files live at <root>/emoji/<pack>/<codepoint>.svg, which is exactly the
+    # request path, so this stays `handle` (NOT handle_path) and the root maps
+    # 1:1. All six packs the client can request are present
+    # (fluent-3d/-color/-flat, mutant, noto, twemoji); re-mirror or fill gaps
+    # with /home/mcp/emoji-build/mirror.sh <pack>.
     handle /emoji/* {
-        reverse_proxy https://static.stoat.chat {
-            header_up Host static.stoat.chat
-        }
+        root * /home/mcp/emoji-packs
+        encode zstd gzip
+
+        # Served same-origin, an SVG opened DIRECTLY (not via <img>) renders as
+        # a document in app.sloga.gg, so a script inside one would run as us.
+        # The mirrored files were scanned and carry no active content; this is
+        # the belt-and-braces that keeps that true even if a future re-mirror
+        # pulls something hostile. The upstream proxy had no such protection.
+        header Content-Security-Policy "default-src 'none'; style-src 'unsafe-inline'; sandbox"
+        header X-Content-Type-Options "nosniff"
+        # Immutable by construction: the filename IS the codepoint, and the
+        # client additionally cache-busts with ?v=. Upstream sent max-age=14400.
+        header Cache-Control "public, max-age=31536000, immutable"
+
+        file_server
     }
 
-    # Frontend — proxy to Vite dev server
+    # Frontend — SPA static files (dist)
     handle {
-        reverse_proxy 127.0.0.1:5174
+        root * /home/mcp/frontend/packages/client/dist
+        encode gzip
+
+        # Security headers for the web client (audit 2026-09-05 H3). The CSP is
+        # the policy proven against this same bundle on Android
+        # (scripts/injectAndroidCsp.mjs) — on web `'self'` IS app.sloga.gg, so
+        # the img/media/connect app.sloga.gg entries are already covered by
+        # 'self'; kept verbatim for parity. Deltas vs the meta-CSP: this HTTP
+        # header can and does add `frame-ancestors 'none'` (a meta tag cannot),
+        # which the app never needs to be framed to work. script-src carries NO
+        # 'unsafe-inline' — the served index.html has zero inline scripts
+        # (verified 2026-09-05). Any XSS foothold therefore has no CSP-blessed
+        # exfil sink, and the session token in browser storage stays behind it.
+        header {
+            Content-Security-Policy "default-src 'none'; script-src 'self' 'wasm-unsafe-eval' https://hcaptcha.com https://*.hcaptcha.com https://static.cloudflareinsights.com; style-src 'self' 'unsafe-inline' https://hcaptcha.com https://*.hcaptcha.com; img-src 'self' data: blob: https://app.sloga.gg; media-src 'self' blob: https://app.sloga.gg; font-src 'self' data:; connect-src 'self' blob: https://app.sloga.gg wss://app.sloga.gg https://*.sloga.gg wss://*.sloga.gg https://translate.googleapis.com https://api.drand.sh https://hcaptcha.com https://*.hcaptcha.com https://cloudflareinsights.com; worker-src 'self' blob:; manifest-src 'self'; frame-src https://hcaptcha.com https://*.hcaptcha.com https://www.youtube.com https://www.youtube-nocookie.com https://player.twitch.tv https://open.spotify.com https://w.soundcloud.com https://bandcamp.com https://new.lightspeed.tv; object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
+            X-Content-Type-Options "nosniff"
+            X-Frame-Options "DENY"
+            Referrer-Policy "strict-origin-when-cross-origin"
+            Permissions-Policy "camera=(self), microphone=(self), display-capture=(self), geolocation=(), payment=()"
+            Strict-Transport-Security "max-age=31536000"
+            -Server
+        }
+
+        try_files {path} /index.html
+        file_server
     }
 }
 
 # Marketing site — sloga.gg apex (host-matched; app.sloga.gg + localhost still hit the :80 block above)
 http://sloga.gg {
     root * /home/mcp/sloga-website
+
+    # Security headers for the marketing site (audit 2026-09-05 H3). The site is
+    # static and holds no session — so the CSP keeps 'unsafe-inline' for the
+    # inline lang-redirect bootstrap and the logo animations, and allows the
+    # discover page to fetch app.sloga.gg (the API) and load its media. The
+    # high-value, low-risk protections still apply: no framing, no plugins, no
+    # base-tag hijack, MIME-sniffing off, HSTS.
+    header {
+        Content-Security-Policy "default-src 'self'; script-src 'self' 'unsafe-inline' https://static.cloudflareinsights.com; style-src 'self' 'unsafe-inline'; img-src 'self' data: https://app.sloga.gg; font-src 'self' data:; connect-src 'self' https://app.sloga.gg https://cloudflareinsights.com; frame-ancestors 'none'; base-uri 'none'; object-src 'none'; form-action 'self'"
+        X-Content-Type-Options "nosniff"
+        X-Frame-Options "DENY"
+        Referrer-Policy "strict-origin-when-cross-origin"
+        Strict-Transport-Security "max-age=31536000"
+        -Server
+    }
+
+    # Repo documentation is not site content. The live directory IS the source
+    # folder, so README.md was served at the site root, describing the layout
+    # and the deploy recipe (audit 2026-09-05 L8). Blocked here rather than
+    # deleted, so a re-sync from the git source cannot quietly restore it.
+    @repodocs path /README.md /readme.md
+    respond @repodocs 404
+
     # The Linux .deb updater's "Open download page" button opens /download.
     # That URL is COMPILED INTO already-installed 0.1.0+ clients, so shipping a
     # corrected constant cannot fix them — this redirect is the only thing that
@@ -157,10 +247,10 @@ http://sloga.gg {
         }
     }
     header @dl Cache-Control "no-store"
-    redir /dl/windows       "https://app.sloga.gg/updates/desktop/Sloga_0.47.0_x64-setup.exe" 302
-    redir /dl/linux-deb     "https://app.sloga.gg/updates/desktop-linux/Sloga-0.33.0-linux-amd64.deb" 302
-    redir /dl/linux-appimage "https://app.sloga.gg/updates/desktop-linux/Sloga-0.33.0-linux-x86_64.AppImage" 302
-    redir /dl/android       "https://app.sloga.gg/updates/android/sloga-1.43.0.apk" 302
+    redir /dl/windows       "https://app.sloga.gg/updates/desktop/Sloga_0.57.0_x64-setup.exe" 302
+    redir /dl/linux-deb     "https://app.sloga.gg/updates/desktop-linux/Sloga-0.57.0-linux-amd64.deb" 302
+    redir /dl/linux-appimage "https://app.sloga.gg/updates/desktop-linux/Sloga-0.57.0-linux-x86_64.AppImage" 302
+    redir /dl/android       "https://app.sloga.gg/updates/android/sloga-0.57.0.apk" 302
 
     # Short, stable URL for the account-deletion page. Google Play requires a web
     # URL where a user can request account + data deletion without reinstalling
