@@ -306,6 +306,23 @@ impl<'a> RatelimitResolver<Request<'a>> for DeltaRatelimits {
                 // Bundle fetches are keyed by target user: probing one
                 // user's keys can't be amortised across targets
                 ("e2ee", Some("keys"), Method::Get) => ("e2ee_fetch_keys", extra),
+                // Signed device listings get their own bucket, sized for the
+                // bursts a client legitimately produces rather than for a
+                // user-paced action. A session reads its OWN listing twice
+                // on every connect (post-claim reconcile + one-time-key
+                // replenish), once more per own-device event, once per DM
+                // opened, and a media call reconciles every roster user on
+                // establish, on each join request it admits and on each
+                // Welcome/Add it processes. A fresh enrollment fans its own
+                // DeviceCreate back at the enrolling session on top of all
+                // that. Sharing the 10-per-window `e2ee` bucket with the key
+                // publish and backup routes let a fresh enrollment answer 429
+                // to the reconcile that pins a peer's leaf (observed live
+                // 2026-09-06), and a failed reconcile is swallowed on the
+                // call plane: the peer stays unverifiable and the admit is
+                // refused. The listing is a cheap eligibility-gated read, so
+                // headroom costs nothing.
+                ("e2ee", Some("devices"), Method::Get) => ("e2ee_devices", None),
                 ("e2ee", Some("messages"), Method::Post) => ("e2ee_messages", None),
                 // The MFA-gated key-backup RESTORE fetch (`GET /e2ee/backup`)
                 // gets a tight dedicated bucket — it is rare. The metadata
@@ -319,6 +336,19 @@ impl<'a> RatelimitResolver<Request<'a>> for DeltaRatelimits {
                     }
                 }
                 ("e2ee", _, _) => ("e2ee", None),
+                // The MLS delivery service used to fall through to the shared
+                // `any` bucket (20 per window), competing with every unmapped
+                // startup route (sync, push, onboard, invites, custom). A
+                // two-party call bring-up alone is an open-group probe, a
+                // group create, a join intent re-broadcast every 10 s, a
+                // KeyPackage claim, one or two commits and the startup
+                // KeyPackage publish; a churny three-party call with rejoins
+                // doubles that. Own bucket so a call cannot be 429'd into a
+                // wedge by unrelated traffic in the same window, and vice
+                // versa. Per-target claim budgets, the join-intent slowmode
+                // and the ctl burst cap bound abuse of the individual routes
+                // independently of this counter.
+                ("mls", _, _) => ("mls", None),
                 // Event creation (keyed per server) and invites (keyed per event) get
                 // tight dedicated buckets — invites fan out to notifications in slice D.
                 ("events", Some("server"), Method::Post) => ("events_create", extra),
@@ -367,6 +397,15 @@ impl<'a> RatelimitResolver<Request<'a>> for DeltaRatelimits {
             "e2ee_messages" => 30,
             "e2ee_backup_get" => 3,
             "e2ee" => 10,
+            // Device listings: see the resolver. Two reads per connect, one
+            // per own-device event, one per DM open, ~two per roster user per
+            // call join on each side. 30 leaves ~3x headroom over a fresh
+            // enrollment that immediately joins a call.
+            "e2ee_devices" => 30,
+            // MLS delivery service: see the resolver. A two-party bring-up is
+            // ~6 requests; 30 covers a three-party call with rejoin churn
+            // inside one window without touching the per-route caps.
+            "mls" => 30,
             "events_create" => 10,
             "events_invite" => 5,
             "events" => 30,
@@ -434,5 +473,148 @@ impl<'a> RatelimitResolver<Request<'a>> for DeltaRatelimits {
             "softres_catalog" => 20,
             _ => 20,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Bucket resolution for the E2EE and MLS routes, driven through the real
+    //! fairing on a database-free Rocket: no session header, so the guard
+    //! keys on the (empty) client address, and the limits are read back from
+    //! the `X-RateLimit-*` headers the fairing stamps. The resolver runs in
+    //! `on_request`, BEFORE routing, so `routed_segment` counts from the
+    //! path root exactly as it does in the service.
+    use super::DeltaRatelimits;
+    use revolt_ratelimits::rocket::{RatelimitFairing, RatelimitStorage};
+    use rocket::http::Status;
+    use rocket::local::blocking::{Client, LocalResponse};
+
+    #[rocket::get("/devices/<_target>")]
+    fn devices(_target: &str) -> &'static str {
+        "[]"
+    }
+
+    #[rocket::put("/keys")]
+    fn keys() -> &'static str {
+        "{}"
+    }
+
+    #[rocket::get("/backup/status")]
+    fn backup_status() -> &'static str {
+        "{}"
+    }
+
+    #[rocket::post("/groups/<_group>/join_intent")]
+    fn join_intent(_group: &str) -> &'static str {
+        "{}"
+    }
+
+    #[rocket::put("/key_packages")]
+    fn key_packages() -> &'static str {
+        "{}"
+    }
+
+    #[rocket::get("/settings")]
+    fn sync_settings() -> &'static str {
+        "{}"
+    }
+
+    fn client() -> Client {
+        let rocket = rocket::build()
+            .manage(RatelimitStorage::new(DeltaRatelimits))
+            .attach(RatelimitFairing)
+            .mount("/", revolt_ratelimits::rocket::routes())
+            .mount("/e2ee", rocket::routes![devices, keys, backup_status])
+            .mount("/mls", rocket::routes![join_intent, key_packages])
+            .mount("/sync", rocket::routes![sync_settings]);
+        Client::untracked(rocket).expect("rocket builds without a database")
+    }
+
+    fn limit(response: &LocalResponse<'_>) -> u32 {
+        response
+            .headers()
+            .get_one("X-RateLimit-Limit")
+            .expect("the fairing stamps a limit")
+            .parse()
+            .expect("numeric limit")
+    }
+
+    fn bucket(response: &LocalResponse<'_>) -> String {
+        response
+            .headers()
+            .get_one("X-RateLimit-Bucket")
+            .expect("the fairing stamps a bucket key")
+            .to_string()
+    }
+
+    #[test]
+    fn device_listings_have_their_own_generous_bucket() {
+        let client = client();
+        let devices = client.get("/e2ee/devices/01ABC").dispatch();
+        assert_eq!(devices.status(), Status::Ok);
+        assert_eq!(limit(&devices), 30);
+
+        let keys = client.put("/e2ee/keys").dispatch();
+        assert_eq!(limit(&keys), 10);
+        assert_ne!(
+            bucket(&devices),
+            bucket(&keys),
+            "a listing read must not spend the key-publish budget"
+        );
+
+        let status = client.get("/e2ee/backup/status").dispatch();
+        assert_eq!(
+            bucket(&status),
+            bucket(&keys),
+            "backup status stays on the plain e2ee bucket"
+        );
+    }
+
+    #[test]
+    fn device_listings_for_different_users_share_one_counter() {
+        let client = client();
+        let a = client.get("/e2ee/devices/01AAA").dispatch();
+        let b = client.get("/e2ee/devices/01BBB").dispatch();
+        assert_eq!(bucket(&a), bucket(&b));
+    }
+
+    #[test]
+    fn mls_routes_leave_the_shared_any_bucket() {
+        let client = client();
+        let intent = client.post("/mls/groups/01GRP/join_intent").dispatch();
+        assert_eq!(intent.status(), Status::Ok);
+        assert_eq!(limit(&intent), 30);
+
+        let packages = client.put("/mls/key_packages").dispatch();
+        assert_eq!(bucket(&packages), bucket(&intent));
+
+        let any = client.get("/sync/settings").dispatch();
+        assert_eq!(limit(&any), 20);
+        assert_ne!(
+            bucket(&any),
+            bucket(&intent),
+            "unmapped startup traffic must not compete with the call bring-up"
+        );
+    }
+
+    #[test]
+    fn exhausting_device_listings_leaves_key_publish_untouched() {
+        let client = client();
+        for _ in 0..30 {
+            assert_eq!(
+                client.get("/e2ee/devices/01ABC").dispatch().status(),
+                Status::Ok
+            );
+        }
+        let limited = client.get("/e2ee/devices/01ABC").dispatch();
+        assert_eq!(limited.status(), Status::TooManyRequests);
+
+        let keys = client.put("/e2ee/keys").dispatch();
+        assert_eq!(keys.status(), Status::Ok);
+        assert_eq!(
+            keys.headers().get_one("X-RateLimit-Remaining"),
+            Some("9"),
+            "the e2ee bucket has spent exactly this one request"
+        );
     }
 }
