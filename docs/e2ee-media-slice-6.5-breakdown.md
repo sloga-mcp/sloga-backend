@@ -672,14 +672,15 @@ frontend-code-reviewer (FE-):
   is not E2EE-capable — web without a bridge, "Encrypt my calls" off, E2EE PROVEN off
   on this device — is not an E2EE call and asserts no gate. "Proven off" is narrow
   (MINOR-3, 2026-09-06): a LOADED status snapshot with `enabled: false`. The bridge
-  writes that snapshot in exactly two places — at boot, in `#onReady`'s
-  not-provisioned branch (via `#setDisabledStatus`, which opens no engine, so
-  key-backup restore stays the first E2EE op on a fresh install), and after a wipe —
-  so a never-provisioned device and a wiped device read identically. No runtime fault
-  produces it: native `e2ee_status` reports `enabled: false` only from the filesystem
-  not-provisioned fast path (`Shell::status`) or an opened store with no account row
-  (`E2ee::status`, never enabled), and a provisioned store that fails to open THROWS,
-  leaving the snapshot untouched. An UNKNOWN status — the snapshot never written
+  writes that snapshot only from the side-effect-free provisioning check — at boot,
+  in `#onReady`'s not-provisioned branch (and in the boot-race history fetch's
+  `#ensureBootStatus`, which can resolve first), via `#setDisabledStatus`, which opens
+  no engine, so key-backup restore stays the first E2EE op on a fresh install; and
+  after a wipe — so a never-provisioned device and a wiped device read identically.
+  No runtime fault produces it: native `e2ee_status` reports `enabled: false` only from
+  the filesystem not-provisioned fast path (`Shell::status`) or an opened store with no
+  account row (`E2ee::status`, never enabled), and a provisioned store that fails to open
+  THROWS, leaving the snapshot untouched. An UNKNOWN status — the snapshot never written
   because the boot query has not resolved yet, or threw — is therefore NOT proven off:
   such a shell stays capable and holds the gate loud, since it cannot be told from an
   enrolled device (`e2eeProvenOff` in `rtc/mlsSessionSetupPolicy.ts`; undefined,
