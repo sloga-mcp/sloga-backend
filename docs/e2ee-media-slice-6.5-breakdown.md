@@ -310,7 +310,24 @@ Entry/exit transitions:
 - **T0c `negotiating → mixed`**: mix classified (post-grace) before enable ⇒ gate swaps
   `negotiating`→`mixed`; banner. (Closes FE-1's mixed-from-start plaintext hole: the
   never-enabled session STILL pauses.)
-- **T0d fail-safe resume (FE-1, bounded availability escape):** if after
+- **T0d fail-safe hold (fail-closed; the FE-1 availability escape below is WITHDRAWN
+  2026-09-06, user decision):** if after `NEGOTIATING_FAILSAFE_MS = 5 s` the session has
+  produced NO Delivery-Service verdict (no create/join response — slow, rate limited, or
+  unreachable), the `negotiating` publish gate is HELD and the state goes amber
+  RE-SECURING, whatever the open-group probe says (`open` / `pending` / `none` /
+  `ratelimited` — the probe only names the hold in the log). The gate is never released
+  without a DS verdict. The hold is bounded by the transport's per-request deadline
+  (`MLS_REQUEST_DEADLINE_MS` = 45 s over the whole request, 429 waits included, on every
+  `/mls/` route and the join path's roster listing) plus the existing loud ladder (the join
+  loop's bounded broadcasts, `MAX_REESTABLISH`, the 240 s self-enrolment backstop): a
+  request the DS never answers throws, and the session goes loud → NOT-ENCRYPTED chip +
+  the ME-10 Leave / Stay-unencrypted choice, where "Stay" is the user's explicit consent to
+  plaintext. Rationale: the escape's premise ("no verdict + no group ⇒ unreachable") was
+  never provable from the client — a slow create, a transport waiting out a 429 (up to three
+  waits of ~10 s) and a probe whose own MLS budget was spent all looked like unreachability
+  at 5 s, and each released plaintext to the SFU under NO chip (a `starting` session renders
+  as nothing) for as long as the DS took to answer.
+  ~~**T0d fail-safe resume (FE-1, bounded availability escape):** if after
   `NEGOTIATING_FAILSAFE_MS = 5 s` the session has produced NO verdict (DS unreachable)
   **AND the channel's open-group probe has completed with 404/feature-off — or errored
   (R2-6: the probe and the DS share an origin, so they fail together; probe-error ⇒
@@ -318,7 +335,8 @@ Entry/exit transitions:
   reason and keep negotiating in the background — documented plaintext-availability
   tradeoff, policy-tested. If a completed probe says an open group EXISTS, the gate
   stays asserted and the state goes loud RE-SECURING (bounded → the ME-10
-  Leave/Stay-unencrypted choice) — an E2EE-known call never auto-resumes plaintext.
+  Leave/Stay-unencrypted choice) — an E2EE-known call never auto-resumes plaintext.~~
+  *(Kept for history; superseded by the fail-closed hold above.)*
 - **T1 `e2ee → mixed`**: reconcile classifies a non-enrolled identity present ≥ the 3 s
   grace ⇒ pause + banner + chip together (grace per judgment call 5; publishing during
   the grace stays ENCRYPTED).
@@ -543,7 +561,10 @@ shipping it.
 
 - Invariant 1: T3/T5 native confirm is the only plaintext-resume; T4 never resumes;
   Decline holds the pause; the publish gate covers LATE publications; the never-enabled
-  paths (T0c/T0d) pause; fail-safe resume only with no open group known.
+  paths (T0c/T0d) pause; ~~fail-safe resume only with no open group known~~ *(WITHDRAWN
+  2026-09-06, user decision: there is NO fail-safe resume — the gate is never released
+  without a DS verdict; 5 s no-verdict → RE-SECURING hold, bounded by the per-request
+  deadline + the loud ladder → NOT-ENCRYPTED + Leave/Stay).*
 - Confirm order: E2EE-off strictly before resume.
 - D1 closed: dialog roster native-computed, raw ids rendered, empty-set still prompts.
 - Announce: native-gated on `downgrade_confirmed`; re-announce bounded by the server
@@ -628,7 +649,12 @@ frontend-code-reviewer (FE-):
 - R2-4 MED: capable-but-failed construction in an E2EE-known call must gate + offer
   Leave/Stay, not just latch a chip (chip spec).
 - R2-5 LOW: assert `negotiating` before `room.connect` + sweep on empty→non-empty.
-- R2-6 LOW: T0d requires a COMPLETED probe verdict; probe-error ⇒ resume ratified.
+- R2-6 LOW: ~~T0d requires a COMPLETED probe verdict; probe-error ⇒ resume ratified.~~
+  *(WITHDRAWN 2026-09-06, user decision — the resume itself is gone: the publish gate is
+  never released without a DS verdict, so no probe verdict (completed, errored, pending or
+  rate limited) releases anything; 5 s no-verdict → RE-SECURING hold, bounded by the
+  per-request deadline + the existing loud ladder → NOT-ENCRYPTED + Leave/Stay. The probe
+  survives only as chip attribution and the hold's log reason.)*
 - R2-7 LOW: `pausePublishing`/`resumePublishing` gain a reason parameter.
 - R2-8 LOW: share-modal direct pause/resume REPLACED by gate-owner calls.
 Round-2 verdict on the folds themselves: architecture right, interleavings compose
@@ -645,10 +671,16 @@ media-e2ee gate findings (all fixed):
   (native `mls_call_clear_downgrade_confirmed`, 4 sync points); the session clears
   the grant in the T6 viaSuccessor branch before migrating; new adversarial test
   `downgrade_grant_clears_explicitly_on_reupgrade` (19/19 green).
-- G-M2 LOW: T0d fail-safe conflated pending/completed probe → tri-state
+- G-M2 LOW: ~~T0d fail-safe conflated pending/completed probe → tri-state
   (`"open"|"none"|"pending"`) `channelHasOpenGroup` dep; PENDING holds the gate and
   re-arms the fail-safe (bounded, `MAX_FAILSAFE_REARMS=2`); "none" is a COMPLETED
-  verdict (error arm ratified, same origin).
+  verdict (error arm ratified, same origin).~~ *(WITHDRAWN 2026-09-06, user decision —
+  the release this distinction gated is gone, and with it the re-arm: `MAX_FAILSAFE_REARMS`
+  no longer exists, the fail-safe fires once at 5 s and its only outcomes are `ignore`
+  (a DS verdict or a loud latch already exists) and `resecure` (hold the gate, amber).
+  The probe dep survives as `"open"|"none"|"pending"|"ratelimited"` for chip attribution
+  and the hold's log reason only; bounded by the per-request deadline + the loud ladder →
+  NOT-ENCRYPTED + Leave/Stay.)*
 - G-M3 LOW (informational): confirm returns Ok(()) and the announce is a separate
   confirm-gated command — RATIFIED as an intentional simplification of the plan's
   "returns announce ciphertext" wording (single responsibility; announce still
