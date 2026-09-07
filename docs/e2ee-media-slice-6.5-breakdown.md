@@ -224,7 +224,7 @@ fine print), A3 (cap-refusal UX), safety-number roster entry point (§1.3).
    trusted enumeration, a non-enrolled participant — the one-account downgrade-prompt
    lever A3 rejects. **Generalized (ME-10):** ANY terminal loud failure of an E2EE-known
    call (retry-exhaustion RE-SECURING → failed, not just call_full) surfaces a blocking
-   choice — "Leave call" (primary) / "Stay unencrypted" (native confirm, T3) — so no
+   choice — "Leave call" (primary) / "Stay unencrypted" (native confirm, T3; in-app press only in the no-group R2-4 hold — plan §5 invariant 1 amendment 2026-09-07) — so no
    failure mode leaves a keyless participant silently parked in the SFU. Residual: a
    malicious client ignores all of this; prompt-never-suppress remains the actual
    invariant. **Mix-classification grace (FE-4):** a freshly-joined SFU identity does
@@ -310,7 +310,24 @@ Entry/exit transitions:
 - **T0c `negotiating → mixed`**: mix classified (post-grace) before enable ⇒ gate swaps
   `negotiating`→`mixed`; banner. (Closes FE-1's mixed-from-start plaintext hole: the
   never-enabled session STILL pauses.)
-- **T0d fail-safe resume (FE-1, bounded availability escape):** if after
+- **T0d fail-safe hold (fail-closed; the FE-1 availability escape below is WITHDRAWN
+  2026-09-06, user decision):** if after `NEGOTIATING_FAILSAFE_MS = 5 s` the session has
+  produced NO Delivery-Service verdict (no create/join response — slow, rate limited, or
+  unreachable), the `negotiating` publish gate is HELD and the state goes amber
+  RE-SECURING, whatever the open-group probe says (`open` / `pending` / `none` /
+  `ratelimited` — the probe only names the hold in the log). The gate is never released
+  without a DS verdict. The hold is bounded by the transport's per-request deadline
+  (`MLS_REQUEST_DEADLINE_MS` = 45 s over the whole request, 429 waits included, on every
+  `/mls/` route and the join path's roster listing) plus the existing loud ladder (the join
+  loop's bounded broadcasts, `MAX_REESTABLISH`, the 240 s self-enrolment backstop): a
+  request the DS never answers throws, and the session goes loud → NOT-ENCRYPTED chip +
+  the ME-10 Leave / Stay-unencrypted choice, where "Stay" is the user's explicit consent to
+  plaintext. Rationale: the escape's premise ("no verdict + no group ⇒ unreachable") was
+  never provable from the client — a slow create, a transport waiting out a 429 (up to three
+  waits of ~10 s) and a probe whose own MLS budget was spent all looked like unreachability
+  at 5 s, and each released plaintext to the SFU under NO chip (a `starting` session renders
+  as nothing) for as long as the DS took to answer.
+  ~~**T0d fail-safe resume (FE-1, bounded availability escape):** if after
   `NEGOTIATING_FAILSAFE_MS = 5 s` the session has produced NO verdict (DS unreachable)
   **AND the channel's open-group probe has completed with 404/feature-off — or errored
   (R2-6: the probe and the DS share an origin, so they fail together; probe-error ⇒
@@ -318,7 +335,8 @@ Entry/exit transitions:
   reason and keep negotiating in the background — documented plaintext-availability
   tradeoff, policy-tested. If a completed probe says an open group EXISTS, the gate
   stays asserted and the state goes loud RE-SECURING (bounded → the ME-10
-  Leave/Stay-unencrypted choice) — an E2EE-known call never auto-resumes plaintext.
+  Leave/Stay-unencrypted choice) — an E2EE-known call never auto-resumes plaintext.~~
+  *(Kept for history; superseded by the fail-closed hold above.)*
 - **T1 `e2ee → mixed`**: reconcile classifies a non-enrolled identity present ≥ the 3 s
   grace ⇒ pause + banner + chip together (grace per judgment call 5; publishing during
   the grace stays ENCRYPTED).
@@ -400,12 +418,21 @@ Binding callbacks that set multiple signals wrap them in `batch()` (FE-8).
 "not_encrypted"  — LOUD: mode "mixed"/"interlude"/"call_full"; session "failed";
                    MediaEncryptionState "loud"; latched callEncryptionError; OR
                    (ME-7/FE-7) toggle-on + capable shell + session missing/failed
-                   construction (every no-session arm in state.tsx now LATCHES a
-                   structured error — **and when `callChannelHasOpenGroup` says the
-                   call is E2EE, those arms ALSO assert the publish gate and surface
-                   the ME-10 Leave/Stay choice (R2-4): a capable-but-failed client in
-                   an E2EE-known call must not publish plaintext behind a mere loud
-                   chip**); OR toggle-OFF self in a channel whose open-group probe
+                   construction (every no-session arm in state.tsx LATCHES a
+                   structured error — **and, R2-4 as revised 2026-09-06 (user
+                   decision, the T0d rule): EVERY capable no-session arm keeps the
+                   `negotiating` publish gate held and surfaces the ME-10 Leave/Stay
+                   choice, whatever `callChannelHasOpenGroup` says — the former
+                   "only when the call is E2EE-known" condition is WITHDRAWN, since a
+                   capable shell with no session can never get a DS verdict and the
+                   gate is never released without one. The probe survives as chip
+                   attribution only; `rtc/mlsSessionSetupPolicy.ts` holds the rule.
+                   "Capable" excludes E2EE PROVEN off on this device, and only that:
+                   a LOADED status snapshot with `enabled: false`, written at boot
+                   for a never-provisioned device and after a wipe. An unknown
+                   snapshot (boot query unresolved, or it threw) is NOT proven off:
+                   the shell stays capable and holds**);
+                   OR toggle-OFF self in a channel whose open-group probe
                    says the call is E2EE (§0.2 #9 self-attribution).
 ```
 
@@ -543,7 +570,10 @@ shipping it.
 
 - Invariant 1: T3/T5 native confirm is the only plaintext-resume; T4 never resumes;
   Decline holds the pause; the publish gate covers LATE publications; the never-enabled
-  paths (T0c/T0d) pause; fail-safe resume only with no open group known.
+  paths (T0c/T0d) pause; ~~fail-safe resume only with no open group known~~ *(WITHDRAWN
+  2026-09-06, user decision: there is NO fail-safe resume — the gate is never released
+  without a DS verdict; 5 s no-verdict → RE-SECURING hold, bounded by the per-request
+  deadline + the loud ladder → NOT-ENCRYPTED + Leave/Stay).*
 - Confirm order: E2EE-off strictly before resume.
 - D1 closed: dialog roster native-computed, raw ids rendered, empty-set still prompts.
 - Announce: native-gated on `downgrade_confirmed`; re-announce bounded by the server
@@ -625,10 +655,43 @@ frontend-code-reviewer (FE-):
   per-participant bookkeeping (chip spec).
 - R2-3 MED: `participantsVersion` must also bump on track publication events (chip
   inputs).
-- R2-4 MED: capable-but-failed construction in an E2EE-known call must gate + offer
-  Leave/Stay, not just latch a chip (chip spec).
+- R2-4 MED: ~~capable-but-failed construction in an E2EE-known call must gate + offer
+  Leave/Stay, not just latch a chip (chip spec).~~
+  *(WITHDRAWN 2026-09-06, user decision — the same rule as R2-6: the publish gate is
+  never released without a DS verdict, and a capable shell with no session can never
+  get one, so the "E2EE-known" (open-group probe) condition is gone. EVERY
+  E2EE-capable shell whose session fails to construct — no E2EE identity on the bridge
+  yet, an unknown signed-in user, the SFU minting an identity that does not name this
+  device, the key provider gone, the native key-change listener not registering within
+  the 45 s per-request deadline — keeps the `negotiating` reason the R2-5 pre-connect
+  assertion put there, latches the structured error, and renders the existing loud
+  state: NOT-ENCRYPTED chip + the Leave / Stay-unencrypted banner. "Stay" is the only
+  release (`local_confirm` semantics; with no group the native roster dialog has
+  nothing to compute, so the banner press itself is the consent). The probe survives
+  only as chip attribution. Pure policy: `rtc/mlsSessionSetupPolicy.ts`. A shell that
+  is not E2EE-capable — web without a bridge, "Encrypt my calls" off, E2EE PROVEN off
+  on this device — is not an E2EE call and asserts no gate. "Proven off" is narrow
+  (MINOR-3, 2026-09-06): a LOADED status snapshot with `enabled: false`. The bridge
+  writes that snapshot only from the side-effect-free provisioning check — at boot,
+  in `#onReady`'s not-provisioned branch (and in the boot-race history fetch's
+  `#ensureBootStatus`, which can resolve first), via `#setDisabledStatus`, which opens
+  no engine, so key-backup restore stays the first E2EE op on a fresh install; and
+  after a wipe — so a never-provisioned device and a wiped device read identically.
+  No runtime fault produces it: native `e2ee_status` reports `enabled: false` only from
+  the filesystem not-provisioned fast path (`Shell::status`) or an opened store with no
+  account row (`E2ee::status`, never enabled), and a provisioned store that fails to open
+  THROWS, leaving the snapshot untouched. An UNKNOWN status — the snapshot never written
+  because the boot query has not resolved yet, or threw — is therefore NOT proven off:
+  such a shell stays capable and holds the gate loud, since it cannot be told from an
+  enrolled device (`e2eeProvenOff` in `rtc/mlsSessionSetupPolicy.ts`; undefined,
+  missing and `enabled: true` all read "not proven off").)*
 - R2-5 LOW: assert `negotiating` before `room.connect` + sweep on empty→non-empty.
-- R2-6 LOW: T0d requires a COMPLETED probe verdict; probe-error ⇒ resume ratified.
+- R2-6 LOW: ~~T0d requires a COMPLETED probe verdict; probe-error ⇒ resume ratified.~~
+  *(WITHDRAWN 2026-09-06, user decision — the resume itself is gone: the publish gate is
+  never released without a DS verdict, so no probe verdict (completed, errored, pending or
+  rate limited) releases anything; 5 s no-verdict → RE-SECURING hold, bounded by the
+  per-request deadline + the existing loud ladder → NOT-ENCRYPTED + Leave/Stay. The probe
+  survives only as chip attribution and the hold's log reason.)*
 - R2-7 LOW: `pausePublishing`/`resumePublishing` gain a reason parameter.
 - R2-8 LOW: share-modal direct pause/resume REPLACED by gate-owner calls.
 Round-2 verdict on the folds themselves: architecture right, interleavings compose
@@ -645,10 +708,16 @@ media-e2ee gate findings (all fixed):
   (native `mls_call_clear_downgrade_confirmed`, 4 sync points); the session clears
   the grant in the T6 viaSuccessor branch before migrating; new adversarial test
   `downgrade_grant_clears_explicitly_on_reupgrade` (19/19 green).
-- G-M2 LOW: T0d fail-safe conflated pending/completed probe → tri-state
+- G-M2 LOW: ~~T0d fail-safe conflated pending/completed probe → tri-state
   (`"open"|"none"|"pending"`) `channelHasOpenGroup` dep; PENDING holds the gate and
   re-arms the fail-safe (bounded, `MAX_FAILSAFE_REARMS=2`); "none" is a COMPLETED
-  verdict (error arm ratified, same origin).
+  verdict (error arm ratified, same origin).~~ *(WITHDRAWN 2026-09-06, user decision —
+  the release this distinction gated is gone, and with it the re-arm: `MAX_FAILSAFE_REARMS`
+  no longer exists, the fail-safe fires once at 5 s and its only outcomes are `ignore`
+  (a DS verdict or a loud latch already exists) and `resecure` (hold the gate, amber).
+  The probe dep survives as `"open"|"none"|"pending"|"ratelimited"` for chip attribution
+  and the hold's log reason only; bounded by the per-request deadline + the loud ladder →
+  NOT-ENCRYPTED + Leave/Stay.)*
 - G-M3 LOW (informational): confirm returns Ok(()) and the announce is a separate
   confirm-gated command — RATIFIED as an intentional simplification of the plan's
   "returns announce ciphertext" wording (single responsibility; announce still
