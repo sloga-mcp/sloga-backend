@@ -922,6 +922,15 @@ The six text invariants (PLAN:11-37) carry as follows:
    E2EE shows a blocking visible state or refuses; the ONLY path to publishing plaintext media in
    an E2EE-eligible call is an explicit, blocking, per-device native confirmation. No silent
    per-participant plaintext hole, ever — downgrade is whole-call and visible.
+   **Amendment 2026-09-07 (user sign-off, R2-4 sweep):** when NO MLS group exists for the call
+   (session construction failed — no bridge/key provider/device identity, or the SFU minted the
+   wrong identity), the per-device native confirmation is replaced by the in-app "Stay
+   unencrypted" press on the NOT-ENCRYPTED banner. Rationale: with no group there is no
+   announce oracle for a spoofed consent to reach, and the publish gate is in-app either way;
+   the press still requires a red chip + an explicit banner choice, and the confirmed state is
+   shown as such. The group-less NATIVE confirm is a follow-up slice, after which this exception
+   is withdrawn. Code: `rtc/mlsSessionSetupPolicy.ts` (`canConfirmNoSessionPlaintext`),
+   `rtc/state.tsx` `#confirmNoSessionPlaintext`.
 2. **Capability from keys, not flags.** Call E2EE eligibility derives solely from
    signature-verified KeyPackages bound to pinned identities. `media_e2ee_enabled` is a UI/route
    hint. A peer once seen enrolled is pinned as enrolled; later KeyPackage absence is an alert

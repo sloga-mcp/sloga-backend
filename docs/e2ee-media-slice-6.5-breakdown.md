@@ -224,7 +224,7 @@ fine print), A3 (cap-refusal UX), safety-number roster entry point (§1.3).
    trusted enumeration, a non-enrolled participant — the one-account downgrade-prompt
    lever A3 rejects. **Generalized (ME-10):** ANY terminal loud failure of an E2EE-known
    call (retry-exhaustion RE-SECURING → failed, not just call_full) surfaces a blocking
-   choice — "Leave call" (primary) / "Stay unencrypted" (native confirm, T3) — so no
+   choice — "Leave call" (primary) / "Stay unencrypted" (native confirm, T3; in-app press only in the no-group R2-4 hold — plan §5 invariant 1 amendment 2026-09-07) — so no
    failure mode leaves a keyless participant silently parked in the SFU. Residual: a
    malicious client ignores all of this; prompt-never-suppress remains the actual
    invariant. **Mix-classification grace (FE-4):** a freshly-joined SFU identity does
