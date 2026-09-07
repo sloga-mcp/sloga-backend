@@ -397,15 +397,40 @@ impl<'a> RatelimitResolver<Request<'a>> for DeltaRatelimits {
             "e2ee_messages" => 30,
             "e2ee_backup_get" => 3,
             "e2ee" => 10,
-            // Device listings: see the resolver. Two reads per connect, one
-            // per own-device event, one per DM open, ~two per roster user per
-            // call join on each side. 30 leaves ~3x headroom over a fresh
-            // enrollment that immediately joins a call.
-            "e2ee_devices" => 30,
-            // MLS delivery service: see the resolver. A two-party bring-up is
-            // ~6 requests; 30 covers a three-party call with rejoin churn
-            // inside one window without touching the per-route caps.
-            "mls" => 30,
+            // Device listings: see the resolver. The admitter's roster
+            // reconcile fetches EVERY distinct non-self user in the SFU
+            // roster on every join request, not just the joiner, so a
+            // ten-member call whose members all arrive inside one window
+            // costs the lowest-leaf admitter 1+2+...+9 = 45 listings, plus
+            // its two own-listing reads on connect, the DeviceCreate echo of
+            // a fresh enrollment, one leaf-verify reconcile per Welcome/Add
+            // that arrives unpinned (<= 9) and a 5 s admit re-drive that
+            // repeats the roster fetch (<= 9): about 66. The previous 30
+            // covered a three-party call and 429'd a five-party one. 120
+            // leaves ~1.8x headroom; the read is cheap, eligibility-gated
+            // and keyed per session.
+            //
+            // Together with the MLS bucket below this covers about TWELVE
+            // members all arriving inside one 10 s window; the listing
+            // bucket binds first (a fourteen-member burst is ~120
+            // listings, the MLS bucket only runs out near twenty). The
+            // roster ceiling is MAX_MLS_GROUP_MEMBERS = 100 and the video
+            // cap 30, so a larger call is possible and past the covered
+            // size it degrades VISIBLY, never silently: the admit whose
+            // listing was refused aborts as `listing_unavailable`, the
+            // roster reconcile reports that joiner non-enrolled, and the
+            // client shows the mixed-call banner with publishing paused
+            // until the 5 s admit re-drive lands in a later window.
+            "e2ee_devices" => 120,
+            // MLS delivery service: see the resolver. The busiest member of
+            // a ten-member bring-up is the lowest-leaf admitter: probe +
+            // create + KeyPackage publish (3), then a claim and a commit per
+            // joiner (18), plus a rebase resubmit for every arbitration it
+            // loses (<= 9) — about 30 inside one window when everyone
+            // arrives at once, which the previous 30 had no headroom over.
+            // 60 leaves 2x; the per-target claim budget, the join-intent
+            // slowmode and the ctl burst cap still bound each route.
+            "mls" => 60,
             "events_create" => 10,
             "events_invite" => 5,
             "events" => 30,
@@ -552,7 +577,7 @@ mod tests {
         let client = client();
         let devices = client.get("/e2ee/devices/01ABC").dispatch();
         assert_eq!(devices.status(), Status::Ok);
-        assert_eq!(limit(&devices), 30);
+        assert_eq!(limit(&devices), 120);
 
         let keys = client.put("/e2ee/keys").dispatch();
         assert_eq!(limit(&keys), 10);
@@ -583,7 +608,7 @@ mod tests {
         let client = client();
         let intent = client.post("/mls/groups/01GRP/join_intent").dispatch();
         assert_eq!(intent.status(), Status::Ok);
-        assert_eq!(limit(&intent), 30);
+        assert_eq!(limit(&intent), 60);
 
         let packages = client.put("/mls/key_packages").dispatch();
         assert_eq!(bucket(&packages), bucket(&intent));
@@ -600,7 +625,7 @@ mod tests {
     #[test]
     fn exhausting_device_listings_leaves_key_publish_untouched() {
         let client = client();
-        for _ in 0..30 {
+        for _ in 0..120 {
             assert_eq!(
                 client.get("/e2ee/devices/01ABC").dispatch().status(),
                 Status::Ok
@@ -615,6 +640,45 @@ mod tests {
             keys.headers().get_one("X-RateLimit-Remaining"),
             Some("9"),
             "the e2ee bucket has spent exactly this one request"
+        );
+    }
+
+    #[test]
+    fn a_ten_member_bring_up_fits_one_window() {
+        // The sizing math from `resolve_bucket_limit`: the lowest-leaf
+        // admitter of a ten-member call reads about 66 device listings and
+        // makes about 30 delivery-service calls inside one window. Every one
+        // of them must answer 200, with headroom left in both buckets.
+        let client = client();
+        for _ in 0..66 {
+            assert_eq!(
+                client.get("/e2ee/devices/01ABC").dispatch().status(),
+                Status::Ok
+            );
+        }
+        for _ in 0..30 {
+            assert_eq!(
+                client
+                    .post("/mls/groups/01GRP/join_intent")
+                    .dispatch()
+                    .status(),
+                Status::Ok
+            );
+        }
+
+        let devices = client.get("/e2ee/devices/01ABC").dispatch();
+        assert_eq!(devices.status(), Status::Ok);
+        assert_eq!(
+            devices.headers().get_one("X-RateLimit-Remaining"),
+            Some("53"),
+            "67 of 120 listings spent"
+        );
+        let packages = client.put("/mls/key_packages").dispatch();
+        assert_eq!(packages.status(), Status::Ok);
+        assert_eq!(
+            packages.headers().get_one("X-RateLimit-Remaining"),
+            Some("29"),
+            "31 of 60 delivery-service calls spent"
         );
     }
 }
