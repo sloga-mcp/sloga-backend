@@ -426,7 +426,12 @@ Binding callbacks that set multiple signals wrap them in `batch()` (FE-8).
                    "only when the call is E2EE-known" condition is WITHDRAWN, since a
                    capable shell with no session can never get a DS verdict and the
                    gate is never released without one. The probe survives as chip
-                   attribution only; `rtc/mlsSessionSetupPolicy.ts` holds the rule**);
+                   attribution only; `rtc/mlsSessionSetupPolicy.ts` holds the rule.
+                   "Capable" excludes E2EE PROVEN off on this device, and only that:
+                   a LOADED status snapshot with `enabled: false`, written at boot
+                   for a never-provisioned device and after a wipe. An unknown
+                   snapshot (boot query unresolved, or it threw) is NOT proven off:
+                   the shell stays capable and holds**);
                    OR toggle-OFF self in a channel whose open-group probe
                    says the call is E2EE (§0.2 #9 self-attribution).
 ```
@@ -664,8 +669,21 @@ frontend-code-reviewer (FE-):
   release (`local_confirm` semantics; with no group the native roster dialog has
   nothing to compute, so the banner press itself is the consent). The probe survives
   only as chip attribution. Pure policy: `rtc/mlsSessionSetupPolicy.ts`. A shell that
-  is not E2EE-capable — web without a bridge, "Encrypt my calls" off, E2EE proven off
-  on the device — is not an E2EE call and asserts no gate.)*
+  is not E2EE-capable — web without a bridge, "Encrypt my calls" off, E2EE PROVEN off
+  on this device — is not an E2EE call and asserts no gate. "Proven off" is narrow
+  (MINOR-3, 2026-09-06): a LOADED status snapshot with `enabled: false`. The bridge
+  writes that snapshot in exactly two places — at boot, in `#onReady`'s
+  not-provisioned branch (via `#setDisabledStatus`, which opens no engine, so
+  key-backup restore stays the first E2EE op on a fresh install), and after a wipe —
+  so a never-provisioned device and a wiped device read identically. No runtime fault
+  produces it: native `e2ee_status` reports `enabled: false` only from the filesystem
+  not-provisioned fast path (`Shell::status`) or an opened store with no account row
+  (`E2ee::status`, never enabled), and a provisioned store that fails to open THROWS,
+  leaving the snapshot untouched. An UNKNOWN status — the snapshot never written
+  because the boot query has not resolved yet, or threw — is therefore NOT proven off:
+  such a shell stays capable and holds the gate loud, since it cannot be told from an
+  enrolled device (`e2eeProvenOff` in `rtc/mlsSessionSetupPolicy.ts`; undefined,
+  missing and `enabled: true` all read "not proven off").)*
 - R2-5 LOW: assert `negotiating` before `room.connect` + sweep on empty→non-empty.
 - R2-6 LOW: ~~T0d requires a COMPLETED probe verdict; probe-error ⇒ resume ratified.~~
   *(WITHDRAWN 2026-09-06, user decision — the resume itself is gone: the publish gate is
