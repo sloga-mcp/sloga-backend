@@ -409,6 +409,18 @@ impl<'a> RatelimitResolver<Request<'a>> for DeltaRatelimits {
             // covered a three-party call and 429'd a five-party one. 120
             // leaves ~1.8x headroom; the read is cheap, eligibility-gated
             // and keyed per session.
+            //
+            // Together with the MLS bucket below this covers about TWELVE
+            // members all arriving inside one 10 s window; the listing
+            // bucket binds first (a fourteen-member burst is ~120
+            // listings, the MLS bucket only runs out near twenty). The
+            // roster ceiling is MAX_MLS_GROUP_MEMBERS = 100 and the video
+            // cap 30, so a larger call is possible and past the covered
+            // size it degrades VISIBLY, never silently: the admit whose
+            // listing was refused aborts as `listing_unavailable`, the
+            // roster reconcile reports that joiner non-enrolled, and the
+            // client shows the mixed-call banner with publishing paused
+            // until the 5 s admit re-drive lands in a later window.
             "e2ee_devices" => 120,
             // MLS delivery service: see the resolver. The busiest member of
             // a ten-member bring-up is the lowest-leaf admitter: probe +
