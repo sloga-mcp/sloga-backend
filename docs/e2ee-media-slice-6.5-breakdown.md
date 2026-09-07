@@ -418,12 +418,16 @@ Binding callbacks that set multiple signals wrap them in `batch()` (FE-8).
 "not_encrypted"  — LOUD: mode "mixed"/"interlude"/"call_full"; session "failed";
                    MediaEncryptionState "loud"; latched callEncryptionError; OR
                    (ME-7/FE-7) toggle-on + capable shell + session missing/failed
-                   construction (every no-session arm in state.tsx now LATCHES a
-                   structured error — **and when `callChannelHasOpenGroup` says the
-                   call is E2EE, those arms ALSO assert the publish gate and surface
-                   the ME-10 Leave/Stay choice (R2-4): a capable-but-failed client in
-                   an E2EE-known call must not publish plaintext behind a mere loud
-                   chip**); OR toggle-OFF self in a channel whose open-group probe
+                   construction (every no-session arm in state.tsx LATCHES a
+                   structured error — **and, R2-4 as revised 2026-09-06 (user
+                   decision, the T0d rule): EVERY capable no-session arm keeps the
+                   `negotiating` publish gate held and surfaces the ME-10 Leave/Stay
+                   choice, whatever `callChannelHasOpenGroup` says — the former
+                   "only when the call is E2EE-known" condition is WITHDRAWN, since a
+                   capable shell with no session can never get a DS verdict and the
+                   gate is never released without one. The probe survives as chip
+                   attribution only; `rtc/mlsSessionSetupPolicy.ts` holds the rule**);
+                   OR toggle-OFF self in a channel whose open-group probe
                    says the call is E2EE (§0.2 #9 self-attribution).
 ```
 
@@ -646,8 +650,22 @@ frontend-code-reviewer (FE-):
   per-participant bookkeeping (chip spec).
 - R2-3 MED: `participantsVersion` must also bump on track publication events (chip
   inputs).
-- R2-4 MED: capable-but-failed construction in an E2EE-known call must gate + offer
-  Leave/Stay, not just latch a chip (chip spec).
+- R2-4 MED: ~~capable-but-failed construction in an E2EE-known call must gate + offer
+  Leave/Stay, not just latch a chip (chip spec).~~
+  *(WITHDRAWN 2026-09-06, user decision — the same rule as R2-6: the publish gate is
+  never released without a DS verdict, and a capable shell with no session can never
+  get one, so the "E2EE-known" (open-group probe) condition is gone. EVERY
+  E2EE-capable shell whose session fails to construct — no E2EE identity on the bridge
+  yet, an unknown signed-in user, the SFU minting an identity that does not name this
+  device, the key provider gone, the native key-change listener not registering within
+  the 45 s per-request deadline — keeps the `negotiating` reason the R2-5 pre-connect
+  assertion put there, latches the structured error, and renders the existing loud
+  state: NOT-ENCRYPTED chip + the Leave / Stay-unencrypted banner. "Stay" is the only
+  release (`local_confirm` semantics; with no group the native roster dialog has
+  nothing to compute, so the banner press itself is the consent). The probe survives
+  only as chip attribution. Pure policy: `rtc/mlsSessionSetupPolicy.ts`. A shell that
+  is not E2EE-capable — web without a bridge, "Encrypt my calls" off, E2EE proven off
+  on the device — is not an E2EE call and asserts no gate.)*
 - R2-5 LOW: assert `negotiating` before `room.connect` + sweep on empty→non-empty.
 - R2-6 LOW: ~~T0d requires a COMPLETED probe verdict; probe-error ⇒ resume ratified.~~
   *(WITHDRAWN 2026-09-06, user decision — the resume itself is gone: the publish gate is
