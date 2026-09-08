@@ -114,6 +114,8 @@ pub struct ApnsOutboundConsumer {
     connection: Arc<Connection>,
     channel: Arc<AMQPChannel>,
     client: Client,
+    /// Bundle identifier of the iOS app, read once at startup.
+    topic: String,
 }
 
 impl ApnsOutboundConsumer {
@@ -166,6 +168,10 @@ impl Consumer for ApnsOutboundConsumer {
             panic!("Missing APN keys.");
         }
 
+        if config.pushd.apn.topic.is_empty() {
+            panic!("Missing APN topic (must be the iOS bundle identifier).");
+        }
+
         let endpoint = if config.pushd.apn.sandbox {
             Endpoint::Sandbox
         } else {
@@ -191,6 +197,7 @@ impl Consumer for ApnsOutboundConsumer {
             connection,
             channel,
             client,
+            topic: config.pushd.apn.topic.clone(),
         }
     }
 
@@ -206,7 +213,7 @@ impl Consumer for ApnsOutboundConsumer {
             apns_push_type: Some(PushType::Alert),
             apns_expiration: None,
             apns_priority: Some(Priority::High),
-            apns_topic: Some("chat.revolt.app"),
+            apns_topic: Some(&self.topic),
             apns_collapse_id: None,
         };
 
