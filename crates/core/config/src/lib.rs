@@ -211,6 +211,9 @@ pub struct PushApn {
     pub pkcs8: String,
     pub key_id: String,
     pub team_id: String,
+    /// APNs topic — must equal the iOS app's bundle identifier, or Apple
+    /// rejects every push with `TopicDisallowed` and nothing is delivered.
+    pub topic: String,
 }
 
 #[derive(Deserialize, Debug, Clone)]

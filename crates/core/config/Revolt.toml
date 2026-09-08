@@ -184,6 +184,9 @@ queue = "notifications.outbound.apn"
 pkcs8 = ""
 key_id = ""
 team_id = ""
+# Must match the iOS bundle identifier exactly. A mismatch is not an error you
+# will see on the device: APNs returns TopicDisallowed and the push is dropped.
+topic = "gg.sloga.app"
 
 [january]
 blocked_domains = []
