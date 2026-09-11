@@ -12,7 +12,7 @@ Any channel that is "call-capable" can host a voice/video call:
 | Channel type | Call-capable? |
 | ------------ | ------------- |
 | Direct message | Always |
-| Group | Off by default; an owner enables calling |
+| Group | On by default; members with `ManageChannel` can turn calling off |
 | Server text/voice channel | When voice information is set on the channel |
 | Saved messages | Never |
 
@@ -47,9 +47,10 @@ setup.
 
 ## Group call configuration
 
-Group calling is **off by default**. A group's owner (or any member with
-`ManageChannel`) configures it through `PATCH /channels/{groupId}` using the
-`voice` object.
+Group calling is **on by default**, with no participant limit. A group always
+reports a `voice` object; calling is off only while it carries
+`"disabled": true`. A group's owner (or any member with `ManageChannel`)
+configures it through `PATCH /channels/{groupId}` using the `voice` object.
 
 ### Turn calling on
 
@@ -58,7 +59,8 @@ PATCH /channels/{groupId}
 { "voice": {} }
 ```
 
-Sending an empty `voice` object enables calling with no participant limit.
+Sending an empty `voice` object enables calling with no participant limit. This
+is only needed to turn calling back on after it was turned off.
 
 ### Limit the number of participants
 
@@ -80,15 +82,15 @@ PATCH /channels/{groupId}
 While disabled, the channel reports as not call-capable and `join_call` returns
 `NotAVoiceChannel`; any active call is torn down.
 
-### Reset to defaults (calling off)
+### Reset to defaults (calling on)
 
 ```http
 PATCH /channels/{groupId}
 { "remove": ["Voice"] }
 ```
 
-This clears the voice configuration, returning the group to the default state
-where calling is off.
+This resets the voice configuration to the default: calling on, no participant
+limit. The update is reported as `voice: {}`, not as a cleared field.
 
 ## Voice state
 

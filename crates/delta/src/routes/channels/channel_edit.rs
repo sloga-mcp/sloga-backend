@@ -181,7 +181,12 @@ pub async fn edit(
                         icon.take();
                     }
                     v0::FieldsChannel::Voice => {
-                        voice.take();
+                        // Resetting returns the group to the default (calling
+                        // on, no limit). Write that as an explicit empty
+                        // configuration instead of clearing the field, because
+                        // clients treat a cleared `voice` as "no calls here".
+                        *voice = Some(Default::default());
+                        partial.voice = Some(Default::default());
                     }
                     _ => {}
                 }
@@ -470,11 +475,18 @@ pub async fn edit(
         _ => return Err(create_error!(InvalidOperation)),
     };
 
+    // A group's voice reset was written as a default configuration above, so
+    // it must not also be cleared.
+    let is_group = matches!(channel, Channel::Group { .. });
     channel
         .update(
             db,
             partial,
-            data.remove.into_iter().map(|f| f.into()).collect(),
+            data.remove
+                .into_iter()
+                .filter(|field| !(is_group && matches!(field, v0::FieldsChannel::Voice)))
+                .map(|f| f.into())
+                .collect(),
         )
         .await?;
 

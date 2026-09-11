@@ -1161,7 +1161,8 @@ mod test {
             .expect("teardown");
 
         // Group DM: no voice bits exist — handoff succeeds on Connect alone.
-        // Groups create with calling off; the owner turns it on.
+        // Groups are callable by default; the explicit configuration below
+        // keeps the test independent of that default.
         let mut group = Channel::create_group(
             &harness.db,
             v0::DataCreateGroup {

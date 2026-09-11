@@ -1167,7 +1167,8 @@ mod test {
         .await
         .expect("group");
 
-        // Groups have calling OFF by default; the owner turns it on.
+        // Groups are callable by default; this stores an explicit
+        // configuration so the test does not depend on that default.
         group
             .update(
                 &harness.db,

@@ -849,12 +849,14 @@ impl Channel {
         match self {
             // DMs are always call-capable.
             Self::DirectMessage { .. } => Some(Cow::Owned(VoiceInformation::default())),
-            // Groups have calling OFF by default; an owner turns it on (and may
-            // set limits via max_users). Setting `disabled` keeps any saved
-            // configuration while turning calling back off.
+            // Groups have calling ON by default: an unconfigured group is
+            // call-capable with no limit. An owner may set limits via max_users,
+            // and setting `disabled` turns calling off while keeping any saved
+            // configuration.
             Self::Group { voice, .. } => match voice {
+                None => Some(Cow::Owned(VoiceInformation::default())),
                 Some(voice) if !voice.disabled => Some(Cow::Borrowed(voice)),
-                _ => None,
+                Some(_) => None,
             },
             // Server channels are voice channels only when voice info is present
             // and not explicitly disabled.
@@ -1451,10 +1453,33 @@ mod tests {
             voice,
         };
 
-        // Default group (unconfigured): calling is OFF, so join_call is refused.
-        assert!(group(None).voice().is_none());
+        // Default group (unconfigured): calling is ON with no limit.
+        assert!(group(None).voice().is_some());
+        assert_eq!(group(None).voice().unwrap().max_users, None);
 
-        // Owner turns calling on (no limit).
+        // Clients decide whether to show calls from the `voice` object on the
+        // wire, so an unconfigured group must still carry one.
+        match revolt_models::v0::Channel::from(group(None)) {
+            revolt_models::v0::Channel::Group { voice, .. } => {
+                let voice = voice.expect("an unconfigured group reports voice");
+                assert!(!voice.disabled);
+                assert_eq!(voice.max_users, None);
+            }
+            _ => unreachable!(),
+        }
+
+        // A group whose owner turned calling off reports it as disabled.
+        match revolt_models::v0::Channel::from(group(Some(VoiceInformation {
+            max_users: None,
+            disabled: true,
+        }))) {
+            revolt_models::v0::Channel::Group { voice, .. } => {
+                assert!(voice.expect("a disabled group reports voice").disabled);
+            }
+            _ => unreachable!(),
+        }
+
+        // Owner configures calling explicitly (no limit).
         let enabled = group(Some(VoiceInformation {
             max_users: None,
             disabled: false,

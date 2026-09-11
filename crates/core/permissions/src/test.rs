@@ -511,8 +511,8 @@ async fn validate_dm_allows_video_calls() {
 async fn validate_default_group_grants_video_permission() {
     /// Scenario in which we are a non-owner member of a group with default
     /// permissions (`permissions: None`). The default falls back to the DM
-    /// permission set, so members hold the Connect/Speak/Video permissions —
-    /// these are used once an owner turns calling on for the group.
+    /// permission set, so members hold the Connect/Speak/Video permissions
+    /// that group calls (on by default) rely on.
     struct Scenario {}
     let mut query = Scenario {};
 

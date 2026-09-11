@@ -185,7 +185,9 @@ impl From<crate::Channel> for Channel {
                 permissions,
                 nsfw,
                 spoiler,
-                voice: voice.map(|voice| voice.into()),
+                // Calling is on for an unconfigured group, and clients read
+                // call availability from this object, so always send one.
+                voice: Some(voice.unwrap_or_default().into()),
             },
             crate::Channel::TextChannel {
                 id,
