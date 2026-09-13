@@ -344,7 +344,21 @@ new_user_hours = 72
 
 # Maximum permissible body size in bytes for uploads
 # (should be greater than any one file upload limit)
-body_limit_size = 20_000_000
+#
+# This governs ONLY the legacy single-POST route (/:tag). The chunked-upload
+# part route sets its own limit of one chunk + slack, so this value does not
+# gate chunked uploads. It MUST stay above CHUNK_SIZE (32 MiB) regardless:
+# create_upload rejects anything at or below one chunk as FileTooSmall, so a
+# body limit under 32 MiB leaves every file between the two limits with no
+# usable route at all.
+#
+# NOTE for self-hosters: the single-POST route buffers the whole file in RAM
+# before encrypting it, so a body limit this large is only safe behind
+# something that caps request bodies first (the sloga.gg deploy sits behind a
+# Cloudflare tunnel, which rejects bodies over ~100 MB at the edge). With no
+# such edge in front, lower this to ~100_000_000 - anything larger should be
+# taking the chunked route anyway.
+body_limit_size = 5_000_000_000
 
 # If any userids are entered here, only those users will be able to create servers.
 # Leave empty to allow all users to create servers
@@ -382,7 +396,11 @@ video_aspect_ratio = [0.3, 2.5]
 
 [features.limits.new_user.file_upload_size_limit]
 # Maximum file size limits (in bytes)
-attachments = 20_000_000
+#
+# Attachments are the one tag with a chunked-upload path, so this is the
+# ceiling for chunked uploads and must stay well above CHUNK_SIZE (32 MiB) -
+# see body_limit_size above. Every other tag is single-POST only.
+attachments = 5_000_000_000
 avatars = 4_000_000
 backgrounds = 6_000_000
 icons = 2_500_000
@@ -423,7 +441,11 @@ video_aspect_ratio = [0.3, 2.5]
 
 [features.limits.default.file_upload_size_limit]
 # Maximum file size limits (in bytes)
-attachments = 20_000_000
+#
+# Attachments are the one tag with a chunked-upload path, so this is the
+# ceiling for chunked uploads and must stay well above CHUNK_SIZE (32 MiB) -
+# see body_limit_size above. Every other tag is single-POST only.
+attachments = 5_000_000_000
 avatars = 4_000_000
 backgrounds = 6_000_000
 icons = 2_500_000

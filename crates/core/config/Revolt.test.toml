@@ -28,13 +28,17 @@ port = 14025
 use_tls = false
 
 
-# Chunked uploads only engage ABOVE one 32 MiB chunk (create_upload rejects
-# anything at or below a chunk with FileTooSmall), so the base config 20 MB
-# attachment limit leaves an empty window: every chunked upload is rejected,
-# FileTooSmall below a chunk and FileTooLarge above it. Production and
-# docs/chunked-resumable-uploads-design.md both run the 5 GB ceiling, but it
-# lives in the gitignored Revolt.overrides.toml, so without it here the
-# chunked-upload tests only pass on a box that happens to have that file.
+# Pin the upload ceiling for tests. These now match the committed
+# Revolt.toml, so this block raises nothing - it exists to stop a developer
+# machine local Revolt.overrides.toml from lowering the limit out from under
+# the chunked-upload tests, the same way the [api.smtp] block above keeps
+# deploy mail config out of the email tests. Overrides load BEFORE this file,
+# so pinning here wins.
+#
+# The tests need headroom above CHUNK_SIZE (32 MiB): create_upload rejects
+# anything at or below one chunk as FileTooSmall and anything above the limit
+# as FileTooLarge, so a limit under 32 MiB leaves an empty window and every
+# chunked upload fails.
 [features.limits.global]
 body_limit_size = 5_000_000_000
 
