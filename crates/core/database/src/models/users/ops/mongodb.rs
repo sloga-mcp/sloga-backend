@@ -69,6 +69,39 @@ impl AbstractUsers for MongoDb {
             .await)
     }
 
+    /// Fetch every user with at least one stored badge bit, positive bitfield only
+    async fn fetch_badged_users(&self) -> Result<Vec<User>> {
+        // `$gt: 0` carries three loads, each in the fail-closed direction:
+        //
+        //  * `badges` is sparse — `Option<i32>` with `skip_serializing_if =
+        //    Option::is_none`, so a user with no badges has NO `badges` field.
+        //    A bare `{"badges": {"$ne": 0}}` MATCHES those absent-field
+        //    documents (a missing field compares as null, and null != 0) — the
+        //    same class of bug as the sparse-boolean directory regression noted
+        //    in `delta/src/routes/discover/servers_list.rs`. A missing field is
+        //    not > 0, and BSON comparison operators are type-bracketed, so
+        //    `$gt` rejects an explicit null too.
+        //  * A NEGATIVE bitfield is excluded at the source: -1 sign-extends to
+        //    0xFFFFFFFF in a caller's `as u32` bit test, which has EVERY badge
+        //    bit set, including FoundingStreamer.
+        //  * `$gt: 0` is the shape a future
+        //    `partialFilterExpression: {badges: {$gt: 0}}` index could serve;
+        //    `$nin` is not provably a subset of one. That index is tracked
+        //    separately and is deliberately NOT added here.
+        //
+        // No bit filtering here on purpose: `$bits*` operators cannot use an
+        // index, so the caller bitmask-tests this (small) set in Rust.
+        self.find_with_options::<_, User>(
+            COL,
+            doc! {
+                "badges": { "$gt": 0 }
+            },
+            FindOptions::builder().sort(doc! { "_id": -1 }).build(),
+        )
+        .await
+        .map_err(|_| create_database_error!("find", COL))
+    }
+
     /// Fetch all discriminators in use for a username
     async fn fetch_discriminators_in_use(&self, username: &str) -> Result<Vec<String>> {
         #[derive(Deserialize)]

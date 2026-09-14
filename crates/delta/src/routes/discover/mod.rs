@@ -8,6 +8,7 @@ mod apps_list;
 mod requests_list;
 mod server_fetch;
 mod servers_list;
+mod streamers_list;
 
 /// Fixed page size for all discovery listings — never client-supplied.
 pub const PAGE_SIZE: i64 = 20;
@@ -19,7 +20,8 @@ pub fn routes() -> (Vec<Route>, OpenApi) {
         servers_list::list,
         server_fetch::fetch,
         requests_list::requests,
-        apps_list::apps
+        apps_list::apps,
+        streamers_list::streamers
     ]
 }
 

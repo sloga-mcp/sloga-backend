@@ -1,4 +1,4 @@
-use super::{File, Metadata, PublicBot};
+use super::{File, Metadata, PublicBot, UserConnection};
 
 auto_derived!(
     /// Sanitized file DTO for fully public (unauthenticated) endpoints.
@@ -92,6 +92,47 @@ auto_derived!(
     pub struct AppCatalogResponse {
         /// Catalog entries, in operator-configured order
         pub apps: Vec<AppCatalogEntry>,
+    }
+
+    /// Public card for a founding streamer.
+    ///
+    /// Strict whitelist. The anonymous `GET /discover/streamers` route cannot
+    /// reuse the normal user bridge: that bridge gates `connections` behind
+    /// `can_see_profile`, which is false for an anonymous perspective, so the
+    /// standard payload would ship `connections: []`. This DTO therefore names
+    /// every field explicitly — never add relations, flags, badges, status,
+    /// bot, e2ee_enabled, privileged, profile_visibility or relationship here.
+    pub struct StreamerCard {
+        /// User Id
+        #[cfg_attr(feature = "serde", serde(rename = "_id"))]
+        pub id: String,
+        /// Username
+        pub username: String,
+        /// Discriminator
+        pub discriminator: String,
+        /// Display name
+        #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+        pub display_name: Option<String>,
+        /// Avatar attachment
+        ///
+        /// `PublicFile`, the same whitelist `DiscoverableServer` uses for its
+        /// icon — a raw `v0::File` would leak the uploader's `user_id`.
+        #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+        pub avatar: Option<PublicFile>,
+        /// Linked streaming channels (Twitch / YouTube / Kick)
+        ///
+        /// Always serialized, `[]` when empty (no `skip_serializing_if`) —
+        /// matching `DiscoverResponse`'s `servers`, so the client never has to
+        /// handle an absent key. `default` only makes the deserialize side
+        /// tolerant of a `User`-shaped payload; it changes no emitted JSON.
+        #[cfg_attr(feature = "serde", serde(default))]
+        pub connections: Vec<UserConnection>,
+    }
+
+    /// Response for the public founding-streamer listing
+    pub struct StreamersResponse {
+        /// Founding streamers
+        pub streamers: Vec<StreamerCard>,
     }
 );
 

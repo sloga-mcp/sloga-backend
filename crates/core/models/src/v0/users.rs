@@ -353,6 +353,8 @@ auto_derived!(
         ReservedRelevantJokeBadge1 = 512,
         /// Low resolution troll face
         ReservedRelevantJokeBadge2 = 1024,
+        /// Streamer in Sloga's Founding Streamer program
+        FoundingStreamer = 2048,
         /// Joined through a friend's referral
         Welcomed = 4096,
         /// Referred friends to Sloga
