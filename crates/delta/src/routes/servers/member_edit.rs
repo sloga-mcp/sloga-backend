@@ -140,14 +140,39 @@ pub async fn edit(
     // Applying AND lifting a server mute are both moderation actions, so both
     // need MuteMembers. The `remove` shape resets the field to its default
     // (`true`) just as surely as `can_publish: true` does, and it used to pass
-    // through unchecked — and because a self-edit skips the rank check below,
-    // that let a muted member lift their own mute with one PATCH.
+    // through unchecked.
+    //
+    // The permission alone is not enough, because the rank check below is
+    // SKIPPED for a self-edit: a moderator who holds MuteMembers and has been
+    // server-muted would otherwise lift their own mute. Nobody moderates
+    // themselves here, in either direction — same rule the timeout block above
+    // applies with `CannotTimeoutYourself`.
     if data.can_publish.is_some() || data.remove.contains(&FieldsMember::CanPublish) {
+        if member.id.user == user.id {
+            return Err(create_error!(InvalidOperation));
+        }
+
         permissions.throw_if_lacking_channel_permission(ChannelPermission::MuteMembers)?;
     }
 
     if data.can_receive.is_some() || data.remove.contains(&FieldsMember::CanReceive) {
+        if member.id.user == user.id {
+            return Err(create_error!(InvalidOperation));
+        }
+
         permissions.throw_if_lacking_channel_permission(ChannelPermission::DeafenMembers)?;
+    }
+
+    // `can_publish: false` alongside `remove: ["CanPublish"]` asks to set and
+    // clear one field in a single edit. The two drivers disagree about the
+    // result (Mongo rejects a conflicting $set/$unset pair outright; the
+    // reference driver applies the remove first and succeeds), and the event
+    // that would go out contradicts the response body. Refuse it the same way
+    // the `voice_channel` collision below is refused.
+    if (data.can_publish.is_some() && data.remove.contains(&FieldsMember::CanPublish))
+        || (data.can_receive.is_some() && data.remove.contains(&FieldsMember::CanReceive))
+    {
+        return Err(create_error!(InvalidOperation));
     }
 
     if data.voice_channel.is_some() && data.remove.contains(&FieldsMember::VoiceChannel) {
@@ -980,8 +1005,11 @@ mod test {
             "the owner holds both permissions"
         );
 
-        // The member holds neither MuteMembers nor DeafenMembers, so neither
-        // clear may be accepted.
+        // The member may not lift it. Refused as InvalidOperation rather than
+        // MissingPermission because the no-self-moderation rule is checked
+        // first and holds regardless of permissions — see
+        // `a_moderator_cannot_lift_their_own_mute` for the case where the
+        // actor DOES hold them.
         for field in ["CanPublish", "CanReceive"] {
             let response = edit_member(
                 &harness,
@@ -993,8 +1021,9 @@ mod test {
             .await;
             assert_eq!(
                 response.status(),
-                Status::Forbidden,
-                "clearing {field} lifts a moderation action and must need the                  same permission that applied it — a muted member could                  otherwise un-mute themselves"
+                Status::BadRequest,
+                "clearing {field} lifts a moderation action against yourself \
+                 and must be refused"
             );
         }
 
@@ -1012,6 +1041,198 @@ mod test {
             !member.can_receive,
             "the deafen must survive the refused clear"
         );
+    }
+
+    #[test]
+    fn clearing_another_members_mute_needs_the_permission() {
+        crate::util::test::rt().block_on(clearing_another_members_mute_needs_the_permission_case())
+    }
+
+    /// The permission half of the same gate, against a THIRD party so the
+    /// no-self-moderation rule cannot mask it: a member holding neither
+    /// permission gets MissingPermission on the `remove` shape, which used to
+    /// pass through the route entirely unchecked.
+    async fn clearing_another_members_mute_needs_the_permission_case() {
+        let harness = TestHarness::new().await;
+        let (_a, session_a, user_a) = harness.new_user().await; // owner
+        let (_b, _session_b, user_b) = harness.new_user().await; // muted target
+        let (_c, session_c, user_c) = harness.new_user().await; // bystander
+        let (server, _channels) = harness.new_server(&user_a).await;
+        for user in [&user_b, &user_c] {
+            Member::create(&harness.db, &server, user, None)
+                .await
+                .expect("member");
+        }
+
+        edit_member(
+            &harness,
+            &session_a.token,
+            &server.id,
+            &user_b.id,
+            serde_json::json!({ "can_publish": false, "can_receive": false }),
+        )
+        .await;
+
+        for field in ["CanPublish", "CanReceive"] {
+            let response = edit_member(
+                &harness,
+                &session_c.token,
+                &server.id,
+                &user_b.id,
+                serde_json::json!({ "remove": [field] }),
+            )
+            .await;
+            assert_eq!(
+                response.status(),
+                Status::Forbidden,
+                "clearing {field} on someone else needs the permission that \
+                 applied it"
+            );
+        }
+
+        let member = harness
+            .db
+            .fetch_member(&server.id, &user_b.id)
+            .await
+            .expect("member read");
+        assert!(
+            !member.can_publish,
+            "the mute must survive the refused clear"
+        );
+        assert!(
+            !member.can_receive,
+            "the deafen must survive the refused clear"
+        );
+    }
+
+    #[test]
+    fn a_moderator_cannot_lift_their_own_mute() {
+        crate::util::test::rt().block_on(a_moderator_cannot_lift_their_own_mute_case())
+    }
+
+    /// The permission check alone does not close the self-unmute path: the
+    /// rank check is skipped for a self-edit, so a moderator who HOLDS
+    /// MuteMembers and has been muted would otherwise lift it themselves.
+    /// This is the case the "holds neither permission" test cannot reach.
+    async fn a_moderator_cannot_lift_their_own_mute_case() {
+        let harness = TestHarness::new().await;
+        let (_a, session_a, user_a) = harness.new_user().await; // owner
+        let (_b, session_b, user_b) = harness.new_user().await; // moderator
+        let (server, _channels) = harness.new_server(&user_a).await;
+
+        // A role that grants the moderator both voice-moderation permissions.
+        let role = harness
+            .new_role(
+                &server,
+                1,
+                Some(OverrideField {
+                    a: ChannelPermission::MuteMembers as i64
+                        + ChannelPermission::DeafenMembers as i64,
+                    d: 0,
+                }),
+            )
+            .await;
+        Member::create(&harness.db, &server, &user_b, None)
+            .await
+            .expect("member");
+        let response = edit_member(
+            &harness,
+            &session_a.token,
+            &server.id,
+            &user_b.id,
+            serde_json::json!({ "roles": [role.id] }),
+        )
+        .await;
+        assert_eq!(response.status(), Status::Ok, "owner may assign the role");
+
+        // Owner mutes and deafens the moderator.
+        let response = edit_member(
+            &harness,
+            &session_a.token,
+            &server.id,
+            &user_b.id,
+            serde_json::json!({ "can_publish": false, "can_receive": false }),
+        )
+        .await;
+        assert_eq!(response.status(), Status::Ok);
+
+        // Every shape the moderator could reach for, holding the permission.
+        for body in [
+            serde_json::json!({ "can_publish": true }),
+            serde_json::json!({ "remove": ["CanPublish"] }),
+            serde_json::json!({ "can_receive": true }),
+            serde_json::json!({ "remove": ["CanReceive"] }),
+        ] {
+            let response = edit_member(
+                &harness,
+                &session_b.token,
+                &server.id,
+                &user_b.id,
+                body.clone(),
+            )
+            .await;
+            assert_eq!(
+                response.status(),
+                Status::BadRequest,
+                "{body} is a self-edit of a moderation action and must be \
+                 refused even though the actor holds the permission"
+            );
+        }
+
+        let member = harness
+            .db
+            .fetch_member(&server.id, &user_b.id)
+            .await
+            .expect("member read");
+        assert!(!member.can_publish, "the mute must still stand");
+        assert!(!member.can_receive, "the deafen must still stand");
+    }
+
+    #[test]
+    fn setting_and_clearing_one_override_at_once_is_refused() {
+        crate::util::test::rt()
+            .block_on(setting_and_clearing_one_override_at_once_is_refused_case())
+    }
+
+    /// Set-and-clear in one edit resolves differently per driver (Mongo
+    /// rejects the conflicting $set/$unset; the reference driver applies the
+    /// remove first) and emits an event contradicting the response body.
+    async fn setting_and_clearing_one_override_at_once_is_refused_case() {
+        let harness = TestHarness::new().await;
+        let (_a, session_a, user_a) = harness.new_user().await;
+        let (_b, _session_b, user_b) = harness.new_user().await;
+        let (server, _channels) = harness.new_server(&user_a).await;
+        Member::create(&harness.db, &server, &user_b, None)
+            .await
+            .expect("member");
+
+        for body in [
+            serde_json::json!({ "can_publish": false, "remove": ["CanPublish"] }),
+            serde_json::json!({ "can_receive": false, "remove": ["CanReceive"] }),
+        ] {
+            let response = edit_member(
+                &harness,
+                &session_a.token,
+                &server.id,
+                &user_b.id,
+                body.clone(),
+            )
+            .await;
+            assert_eq!(
+                response.status(),
+                Status::BadRequest,
+                "{body} sets and clears the same field and must be refused"
+            );
+        }
+
+        // Nothing was applied on the way to the refusal.
+        let member = harness
+            .db
+            .fetch_member(&server.id, &user_b.id)
+            .await
+            .expect("member read");
+        assert!(member.can_publish);
+        assert!(member.can_receive);
     }
 
     #[test]
