@@ -137,11 +137,16 @@ pub async fn edit(
         permissions.throw_if_lacking_channel_permission(ChannelPermission::TimeoutMembers)?;
     }
 
-    if data.can_publish.is_some() {
+    // Applying AND lifting a server mute are both moderation actions, so both
+    // need MuteMembers. The `remove` shape resets the field to its default
+    // (`true`) just as surely as `can_publish: true` does, and it used to pass
+    // through unchecked — and because a self-edit skips the rank check below,
+    // that let a muted member lift their own mute with one PATCH.
+    if data.can_publish.is_some() || data.remove.contains(&FieldsMember::CanPublish) {
         permissions.throw_if_lacking_channel_permission(ChannelPermission::MuteMembers)?;
     }
 
-    if data.can_receive.is_some() {
+    if data.can_receive.is_some() || data.remove.contains(&FieldsMember::CanReceive) {
         permissions.throw_if_lacking_channel_permission(ChannelPermission::DeafenMembers)?;
     }
 
@@ -428,6 +433,7 @@ mod test {
     use crate::util::test::TestHarness;
     use iso8601_timestamp::{Duration, Timestamp};
     use revolt_database::{
+        events::client::EventV1,
         voice::{
             create_voice_state, delete_channel_voice_state, get_voice_state, set_channel_node,
             update_voice_state, UserVoiceChannel, MAX_VIDEO_PARTICIPANTS,
@@ -934,6 +940,190 @@ mod test {
         delete_channel_voice_state(&uvc, &[target.id.clone()])
             .await
             .expect("cleanup");
+    }
+
+    // ---- clearing a voice override is a moderation action ----------------
+    //
+    // `can_publish` / `can_receive` are server-mute and server-deafen. Setting
+    // them false is permission-checked, but RESETTING them to true travels as
+    // `remove: ["CanPublish"]`, which used to pass through the route with no
+    // permission check at all — and self-edits skip the rank check, so a muted
+    // member could lift their own mute with a single PATCH. These pin the
+    // check onto the clear path, in both directions.
+
+    #[test]
+    fn muted_member_cannot_clear_their_own_mute() {
+        crate::util::test::rt().block_on(muted_member_cannot_clear_their_own_mute_case())
+    }
+
+    async fn muted_member_cannot_clear_their_own_mute_case() {
+        let harness = TestHarness::new().await;
+        let (_a, session_a, user_a) = harness.new_user().await; // owner
+        let (_b, session_b, user_b) = harness.new_user().await; // target
+        let (server, _channels) = harness.new_server(&user_a).await;
+        Member::create(&harness.db, &server, &user_b, None)
+            .await
+            .expect("member");
+
+        // Owner server-mutes and server-deafens the member.
+        let response = edit_member(
+            &harness,
+            &session_a.token,
+            &server.id,
+            &user_b.id,
+            serde_json::json!({ "can_publish": false, "can_receive": false }),
+        )
+        .await;
+        assert_eq!(
+            response.status(),
+            Status::Ok,
+            "the owner holds both permissions"
+        );
+
+        // The member holds neither MuteMembers nor DeafenMembers, so neither
+        // clear may be accepted.
+        for field in ["CanPublish", "CanReceive"] {
+            let response = edit_member(
+                &harness,
+                &session_b.token,
+                &server.id,
+                &user_b.id,
+                serde_json::json!({ "remove": [field] }),
+            )
+            .await;
+            assert_eq!(
+                response.status(),
+                Status::Forbidden,
+                "clearing {field} lifts a moderation action and must need the                  same permission that applied it — a muted member could                  otherwise un-mute themselves"
+            );
+        }
+
+        // The override is still in place on the stored member.
+        let member = harness
+            .db
+            .fetch_member(&server.id, &user_b.id)
+            .await
+            .expect("member read");
+        assert!(
+            !member.can_publish,
+            "the mute must survive the refused clear"
+        );
+        assert!(
+            !member.can_receive,
+            "the deafen must survive the refused clear"
+        );
+    }
+
+    #[test]
+    fn moderator_can_clear_the_mute_they_applied() {
+        crate::util::test::rt().block_on(moderator_can_clear_the_mute_they_applied_case())
+    }
+
+    async fn moderator_can_clear_the_mute_they_applied_case() {
+        let harness = TestHarness::new().await;
+        let (_a, session_a, user_a) = harness.new_user().await; // owner
+        let (_b, _session_b, user_b) = harness.new_user().await; // target
+        let (server, _channels) = harness.new_server(&user_a).await;
+        Member::create(&harness.db, &server, &user_b, None)
+            .await
+            .expect("member");
+
+        edit_member(
+            &harness,
+            &session_a.token,
+            &server.id,
+            &user_b.id,
+            serde_json::json!({ "can_publish": false, "can_receive": false }),
+        )
+        .await;
+
+        // Both shapes a client may use to lift it: the explicit `true`, and
+        // the `remove` clear.
+        let response = edit_member(
+            &harness,
+            &session_a.token,
+            &server.id,
+            &user_b.id,
+            serde_json::json!({ "can_publish": true }),
+        )
+        .await;
+        assert_eq!(response.status(), Status::Ok);
+
+        let response = edit_member(
+            &harness,
+            &session_a.token,
+            &server.id,
+            &user_b.id,
+            serde_json::json!({ "remove": ["CanReceive"] }),
+        )
+        .await;
+        assert_eq!(response.status(), Status::Ok);
+
+        let member = harness
+            .db
+            .fetch_member(&server.id, &user_b.id)
+            .await
+            .expect("member read");
+        assert!(member.can_publish, "the explicit true must lift the mute");
+        assert!(member.can_receive, "the clear must lift the deafen");
+    }
+
+    #[test]
+    fn lifting_a_mute_is_announced_to_the_server() {
+        crate::util::test::rt().block_on(lifting_a_mute_is_announced_to_the_server_case())
+    }
+
+    /// Clients render the mute badge from `ServerMemberUpdate`, so the event
+    /// must carry the value in BOTH directions. `Member::can_publish` is
+    /// `skip_serializing_if = "is_true"`, which would drop the un-mute from
+    /// the wire and leave every other client showing the member as muted
+    /// forever; this pins that the partial does not inherit that behaviour.
+    async fn lifting_a_mute_is_announced_to_the_server_case() {
+        let mut harness = TestHarness::new().await;
+        let (_a, session_a, user_a) = harness.new_user().await;
+        let (_b, _session_b, user_b) = harness.new_user().await;
+        let (server, _channels) = harness.new_server(&user_a).await;
+        Member::create(&harness.db, &server, &user_b, None)
+            .await
+            .expect("member");
+
+        edit_member(
+            &harness,
+            &session_a.token,
+            &server.id,
+            &user_b.id,
+            serde_json::json!({ "can_publish": false }),
+        )
+        .await;
+
+        let target = user_b.id.clone();
+        harness
+            .wait_for_event(&server.id, |event| match event {
+                EventV1::ServerMemberUpdate { id, data, .. } => {
+                    id.user == target && data.can_publish == Some(false)
+                }
+                _ => false,
+            })
+            .await;
+
+        edit_member(
+            &harness,
+            &session_a.token,
+            &server.id,
+            &user_b.id,
+            serde_json::json!({ "can_publish": true }),
+        )
+        .await;
+
+        let target = user_b.id.clone();
+        harness
+            .wait_for_event(&server.id, |event| match event {
+                EventV1::ServerMemberUpdate { id, data, .. } => {
+                    id.user == target && data.can_publish == Some(true)
+                }
+                _ => false,
+            })
+            .await;
     }
 
     // ---- nickname slur filter --------------------------------------------
