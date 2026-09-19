@@ -44,6 +44,16 @@ pub async fn edit(
     } else {
         // Thread creators still need to be able to view the parent channel.
         permissions.throw_if_lacking_channel_permission(ChannelPermission::ViewChannel)?;
+
+        // A creator who can no longer post may not pin their thread open (or
+        // otherwise retune when it auto-archives). Creators who also hold
+        // ManageChannel (e.g. moderators in a read-only forum) are exempt:
+        // they may make this edit on anyone's thread anyway.
+        if data.auto_archive_minutes.is_some()
+            && !permissions.has_channel_permission(ChannelPermission::ManageChannel)
+        {
+            permissions.throw_if_lacking_channel_permission(ChannelPermission::SendMessage)?;
+        }
     }
 
     if data.name.is_none()
@@ -58,6 +68,8 @@ pub async fn edit(
         && data.tags.is_none()
         && data.require_tag.is_none()
         && data.default_sort.is_none()
+        && data.default_auto_archive_minutes.is_none()
+        && data.auto_archive_minutes.is_none()
         && data.applied_tags.is_none()
         && data.announcement.is_none()
         && data.remove.is_empty()
@@ -85,6 +97,27 @@ pub async fn edit(
     // Applied tags only make sense on forum-post threads.
     if data.applied_tags.is_some() && !matches!(channel, Channel::Thread { .. }) {
         return Err(create_error!(InvalidOperation));
+    }
+
+    // The per-forum default auto-archive duration only exists on forums.
+    if data.default_auto_archive_minutes.is_some() && !matches!(channel, Channel::Forum { .. }) {
+        return Err(create_error!(InvalidOperation));
+    }
+
+    // A concrete auto-archive duration only exists on threads / forum posts.
+    if data.auto_archive_minutes.is_some() && !matches!(channel, Channel::Thread { .. }) {
+        return Err(create_error!(InvalidOperation));
+    }
+
+    // Auto-archive durations must be one of the fixed allowed values
+    // (validated before any write).
+    for minutes in [data.auto_archive_minutes, data.default_auto_archive_minutes]
+        .iter()
+        .flatten()
+    {
+        if !Channel::ALLOWED_AUTO_ARCHIVE_MINUTES.contains(minutes) {
+            return Err(create_error!(InvalidProperty));
+        }
     }
 
     // The spoiler flag exists on groups, text channels and forums; reject it
@@ -355,6 +388,7 @@ pub async fn edit(
             name,
             archived,
             archived_timestamp,
+            auto_archive_minutes,
             applied_tags,
             ..
         } => {
@@ -375,6 +409,11 @@ pub async fn edit(
                     archived_timestamp.replace(timestamp.clone());
                     partial.archived_timestamp = Some(timestamp);
                 }
+            }
+
+            if let Some(new_auto_archive_minutes) = data.auto_archive_minutes {
+                *auto_archive_minutes = new_auto_archive_minutes;
+                partial.auto_archive_minutes = Some(new_auto_archive_minutes);
             }
 
             if let Some(new_applied_tags) = data.applied_tags {
@@ -408,6 +447,7 @@ pub async fn edit(
             tags,
             require_tag,
             default_sort,
+            default_auto_archive_minutes,
             ..
         } => {
             if data.remove.contains(&v0::FieldsChannel::Icon) {
@@ -470,6 +510,11 @@ pub async fn edit(
             if let Some(new_default_sort) = data.default_sort {
                 *default_sort = new_default_sort.clone().into();
                 partial.default_sort = Some(new_default_sort.into());
+            }
+
+            if let Some(new_default_auto_archive_minutes) = data.default_auto_archive_minutes {
+                *default_auto_archive_minutes = new_default_auto_archive_minutes;
+                partial.default_auto_archive_minutes = Some(new_default_auto_archive_minutes);
             }
         }
         _ => return Err(create_error!(InvalidOperation)),
@@ -595,5 +640,434 @@ mod tests {
             stored,
             revolt_database::Channel::TextChannel { spoiler: true, .. }
         ));
+    }
+
+    /// A server (owned by `owner`) with a forum, a plain member `creator`
+    /// who authored one post in it, and a second plain member `outsider`.
+    struct ForumFixture {
+        harness: TestHarness,
+        server: revolt_database::Server,
+        owner_session: revolt_database::Session,
+        forum: revolt_database::Channel,
+        creator_session: revolt_database::Session,
+        post: revolt_database::Channel,
+        outsider_session: revolt_database::Session,
+    }
+
+    async fn forum_fixture() -> ForumFixture {
+        let harness = TestHarness::new().await;
+        let (_, owner_session, owner) = harness.new_user().await;
+        let (_, creator_session, creator) = harness.new_user().await;
+        let (_, outsider_session, outsider) = harness.new_user().await;
+        let (mut server, _) = harness.new_server(&owner).await;
+
+        revolt_database::Member::create(&harness.db, &server, &creator, None)
+            .await
+            .expect("creator joins");
+        revolt_database::Member::create(&harness.db, &server, &outsider, None)
+            .await
+            .expect("outsider joins");
+
+        let forum = revolt_database::Channel::create_server_channel(
+            &harness.db,
+            &mut server,
+            v0::DataCreateServerChannel {
+                channel_type: v0::LegacyServerChannelType::Forum,
+                name: "forum".to_string(),
+                ..Default::default()
+            },
+            true,
+        )
+        .await
+        .expect("forum created");
+
+        let post = revolt_database::Channel::create_forum_post(
+            &harness.db,
+            &forum,
+            &creator,
+            "a post".to_string(),
+            vec![],
+            None,
+        )
+        .await
+        .expect("post created");
+
+        ForumFixture {
+            harness,
+            server,
+            owner_session,
+            forum,
+            creator_session,
+            post,
+            outsider_session,
+        }
+    }
+
+    /// Give `user_id` a server role granting ManageChannel.
+    async fn grant_manage_channel(fx: &ForumFixture, user_id: &str) {
+        let role = fx
+            .harness
+            .new_role(
+                &fx.server,
+                1,
+                Some(revolt_permissions::OverrideField {
+                    a: revolt_permissions::ChannelPermission::ManageChannel as i64,
+                    d: 0,
+                }),
+            )
+            .await;
+        let mut member = fx
+            .harness
+            .db
+            .fetch_member(&fx.server.id, user_id)
+            .await
+            .expect("member");
+        member
+            .update(
+                &fx.harness.db,
+                revolt_database::PartialMember {
+                    roles: Some(vec![role.id.clone()]),
+                    ..Default::default()
+                },
+                vec![],
+            )
+            .await
+            .expect("grant ManageChannel role");
+    }
+
+    /// Make the forum read-only: SendMessage denied for everyone by default.
+    async fn deny_send_message_on_forum(fx: &ForumFixture) {
+        let mut forum = fx.forum.clone();
+        forum
+            .update(
+                &fx.harness.db,
+                revolt_database::PartialChannel {
+                    default_permissions: Some(revolt_permissions::OverrideField {
+                        a: 0,
+                        d: revolt_permissions::ChannelPermission::SendMessage as i64,
+                    }),
+                    ..Default::default()
+                },
+                vec![],
+            )
+            .await
+            .expect("deny SendMessage on the forum");
+    }
+
+    async fn patch<'a>(
+        harness: &'a TestHarness,
+        session: &revolt_database::Session,
+        channel_id: &str,
+        body: serde_json::Value,
+    ) -> rocket::local::asynchronous::LocalResponse<'a> {
+        TestHarness::with_session(
+            session.clone(),
+            harness
+                .client
+                .patch(format!("/channels/{}", channel_id))
+                .header(ContentType::JSON)
+                .body(body.to_string()),
+        )
+        .await
+    }
+
+    async fn assert_error(
+        response: rocket::local::asynchronous::LocalResponse<'_>,
+        status: Status,
+        needle: &str,
+    ) {
+        assert_eq!(response.status(), status);
+        let body = response.into_string().await.unwrap_or_default();
+        assert!(body.contains(needle), "expected {}, got {}", needle, body);
+    }
+
+    async fn stored_post_minutes(harness: &TestHarness, id: &str) -> u32 {
+        match harness.db.fetch_channel(id).await.expect("post") {
+            revolt_database::Channel::Thread {
+                auto_archive_minutes,
+                ..
+            } => auto_archive_minutes,
+            other => panic!("expected a thread, got {:?}", other),
+        }
+    }
+
+    async fn stored_forum_default(harness: &TestHarness, id: &str) -> u32 {
+        match harness.db.fetch_channel(id).await.expect("forum") {
+            revolt_database::Channel::Forum {
+                default_auto_archive_minutes,
+                ..
+            } => default_auto_archive_minutes,
+            other => panic!("expected a forum, got {:?}", other),
+        }
+    }
+
+    /// (a) + (g): the post's creator can pin their own post open with a body
+    /// carrying ONLY `auto_archive_minutes` (not swallowed by the no-op check);
+    /// it persists and fans out in the ChannelUpdate partial.
+    #[test]
+    fn creator_sets_auto_archive_on_own_post() {
+        crate::util::test::rt().block_on(creator_sets_auto_archive_on_own_post_case())
+    }
+
+    async fn creator_sets_auto_archive_on_own_post_case() {
+        let mut fx = forum_fixture().await;
+        assert_ne!(
+            stored_post_minutes(&fx.harness, fx.post.id()).await,
+            0,
+            "fixture must not already be Never"
+        );
+
+        let response = patch(
+            &fx.harness,
+            &fx.creator_session,
+            fx.post.id(),
+            json!({ "auto_archive_minutes": 0 }),
+        )
+        .await;
+        assert_eq!(response.status(), Status::Ok);
+        let edited = response.into_json::<v0::Channel>().await.expect("channel");
+        assert!(matches!(
+            edited,
+            v0::Channel::Thread {
+                auto_archive_minutes: 0,
+                ..
+            }
+        ));
+
+        assert_eq!(stored_post_minutes(&fx.harness, fx.post.id()).await, 0);
+
+        let post_id = fx.post.id().to_string();
+        fx.harness
+            .wait_for_event(&fx.server.id, |event| {
+                matches!(
+                    event,
+                    revolt_database::events::client::EventV1::ChannelUpdate { id, data, .. }
+                        if id == &post_id && data.auto_archive_minutes == Some(0)
+                )
+            })
+            .await;
+    }
+
+    /// (b): a creator who lost SendMessage may not retune auto-archive.
+    #[test]
+    fn creator_without_send_message_cannot_set_auto_archive() {
+        crate::util::test::rt()
+            .block_on(creator_without_send_message_cannot_set_auto_archive_case())
+    }
+
+    async fn creator_without_send_message_cannot_set_auto_archive_case() {
+        let fx = forum_fixture().await;
+        deny_send_message_on_forum(&fx).await;
+
+        let before = stored_post_minutes(&fx.harness, fx.post.id()).await;
+        let response = patch(
+            &fx.harness,
+            &fx.creator_session,
+            fx.post.id(),
+            json!({ "auto_archive_minutes": 0 }),
+        )
+        .await;
+        assert_error(response, Status::Forbidden, "MissingPermission").await;
+        assert_eq!(stored_post_minutes(&fx.harness, fx.post.id()).await, before);
+
+        // The creator can still perform other own-thread edits (rename).
+        let response = patch(
+            &fx.harness,
+            &fx.creator_session,
+            fx.post.id(),
+            json!({ "name": "renamed" }),
+        )
+        .await;
+        assert_eq!(response.status(), Status::Ok);
+    }
+
+    /// (c): a non-creator without ManageChannel cannot touch the post.
+    #[test]
+    fn non_creator_cannot_set_auto_archive() {
+        crate::util::test::rt().block_on(non_creator_cannot_set_auto_archive_case())
+    }
+
+    async fn non_creator_cannot_set_auto_archive_case() {
+        let fx = forum_fixture().await;
+        let before = stored_post_minutes(&fx.harness, fx.post.id()).await;
+        let response = patch(
+            &fx.harness,
+            &fx.outsider_session,
+            fx.post.id(),
+            json!({ "auto_archive_minutes": 0 }),
+        )
+        .await;
+        assert_error(response, Status::Forbidden, "MissingPermission").await;
+        assert_eq!(stored_post_minutes(&fx.harness, fx.post.id()).await, before);
+    }
+
+    /// (d): the forum default is ManageChannel-gated.
+    #[test]
+    fn forum_default_auto_archive_requires_manage_channel() {
+        crate::util::test::rt().block_on(forum_default_auto_archive_requires_manage_channel_case())
+    }
+
+    async fn forum_default_auto_archive_requires_manage_channel_case() {
+        let fx = forum_fixture().await;
+
+        // Plain members (including a post creator) cannot change it.
+        for session in [&fx.outsider_session, &fx.creator_session] {
+            let response = patch(
+                &fx.harness,
+                session,
+                fx.forum.id(),
+                json!({ "default_auto_archive_minutes": 129600 }),
+            )
+            .await;
+            assert_error(response, Status::Forbidden, "MissingPermission").await;
+        }
+        assert_ne!(
+            stored_forum_default(&fx.harness, fx.forum.id()).await,
+            129600
+        );
+
+        let response = patch(
+            &fx.harness,
+            &fx.owner_session,
+            fx.forum.id(),
+            json!({ "default_auto_archive_minutes": 129600 }),
+        )
+        .await;
+        assert_eq!(response.status(), Status::Ok);
+        assert_eq!(
+            stored_forum_default(&fx.harness, fx.forum.id()).await,
+            129600
+        );
+    }
+
+    /// (e): values outside the allowlist are rejected before any write.
+    #[test]
+    fn auto_archive_outside_allowlist_is_rejected() {
+        crate::util::test::rt().block_on(auto_archive_outside_allowlist_is_rejected_case())
+    }
+
+    async fn auto_archive_outside_allowlist_is_rejected_case() {
+        let fx = forum_fixture().await;
+        let before = stored_post_minutes(&fx.harness, fx.post.id()).await;
+
+        let response = patch(
+            &fx.harness,
+            &fx.creator_session,
+            fx.post.id(),
+            json!({ "auto_archive_minutes": 30 }),
+        )
+        .await;
+        assert_error(response, Status::BadRequest, "InvalidProperty").await;
+        assert_eq!(stored_post_minutes(&fx.harness, fx.post.id()).await, before);
+
+        let forum_before = stored_forum_default(&fx.harness, fx.forum.id()).await;
+        let response = patch(
+            &fx.harness,
+            &fx.owner_session,
+            fx.forum.id(),
+            json!({ "default_auto_archive_minutes": 30 }),
+        )
+        .await;
+        assert_error(response, Status::BadRequest, "InvalidProperty").await;
+        assert_eq!(
+            stored_forum_default(&fx.harness, fx.forum.id()).await,
+            forum_before
+        );
+    }
+
+    /// (f): each field is rejected on the wrong channel type.
+    #[test]
+    fn auto_archive_fields_rejected_on_wrong_channel_type() {
+        crate::util::test::rt().block_on(auto_archive_fields_rejected_on_wrong_channel_type_case())
+    }
+
+    async fn auto_archive_fields_rejected_on_wrong_channel_type_case() {
+        let fx = forum_fixture().await;
+
+        // Forum default on a post.
+        let response = patch(
+            &fx.harness,
+            &fx.owner_session,
+            fx.post.id(),
+            json!({ "default_auto_archive_minutes": 60 }),
+        )
+        .await;
+        assert_error(response, Status::BadRequest, "InvalidOperation").await;
+
+        // Concrete duration on the forum itself.
+        let response = patch(
+            &fx.harness,
+            &fx.owner_session,
+            fx.forum.id(),
+            json!({ "auto_archive_minutes": 60 }),
+        )
+        .await;
+        assert_error(response, Status::BadRequest, "InvalidOperation").await;
+
+        // Concrete duration on a plain text channel.
+        let text = fx.harness.new_channel(&fx.server).await;
+        let response = patch(
+            &fx.harness,
+            &fx.owner_session,
+            text.id(),
+            json!({ "auto_archive_minutes": 60 }),
+        )
+        .await;
+        assert_error(response, Status::BadRequest, "InvalidOperation").await;
+
+        // (j) Forum default on a plain text channel.
+        let response = patch(
+            &fx.harness,
+            &fx.owner_session,
+            text.id(),
+            json!({ "default_auto_archive_minutes": 60 }),
+        )
+        .await;
+        assert_error(response, Status::BadRequest, "InvalidOperation").await;
+    }
+
+    /// (h): in a read-only forum (SendMessage denied for everyone), a post
+    /// creator who holds ManageChannel may still retune their own post.
+    #[test]
+    fn creator_with_manage_channel_is_exempt_from_send_message_gate() {
+        crate::util::test::rt()
+            .block_on(creator_with_manage_channel_is_exempt_from_send_message_gate_case())
+    }
+
+    async fn creator_with_manage_channel_is_exempt_from_send_message_gate_case() {
+        let fx = forum_fixture().await;
+        grant_manage_channel(&fx, &fx.creator_session.user_id).await;
+        deny_send_message_on_forum(&fx).await;
+
+        let response = patch(
+            &fx.harness,
+            &fx.creator_session,
+            fx.post.id(),
+            json!({ "auto_archive_minutes": 0 }),
+        )
+        .await;
+        assert_eq!(response.status(), Status::Ok);
+        assert_eq!(stored_post_minutes(&fx.harness, fx.post.id()).await, 0);
+    }
+
+    /// (i): a non-creator holding ManageChannel may set a post's duration.
+    #[test]
+    fn manager_can_set_auto_archive_on_others_post() {
+        crate::util::test::rt().block_on(manager_can_set_auto_archive_on_others_post_case())
+    }
+
+    async fn manager_can_set_auto_archive_on_others_post_case() {
+        let fx = forum_fixture().await;
+        grant_manage_channel(&fx, &fx.outsider_session.user_id).await;
+
+        let response = patch(
+            &fx.harness,
+            &fx.outsider_session,
+            fx.post.id(),
+            json!({ "auto_archive_minutes": 43200 }),
+        )
+        .await;
+        assert_eq!(response.status(), Status::Ok);
+        assert_eq!(stored_post_minutes(&fx.harness, fx.post.id()).await, 43200);
     }
 }

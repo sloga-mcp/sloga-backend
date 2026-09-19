@@ -259,6 +259,7 @@ impl From<crate::Channel> for Channel {
                 tags,
                 require_tag,
                 default_sort,
+                default_auto_archive_minutes,
             } => Channel::Forum {
                 id,
                 server,
@@ -273,6 +274,7 @@ impl From<crate::Channel> for Channel {
                 tags: tags.into_iter().map(|tag| tag.into()).collect(),
                 require_tag,
                 default_sort: default_sort.into(),
+                default_auto_archive_minutes,
             },
         }
     }
@@ -389,6 +391,7 @@ impl From<Channel> for crate::Channel {
                 tags,
                 require_tag,
                 default_sort,
+                default_auto_archive_minutes,
             } => crate::Channel::Forum {
                 id,
                 server,
@@ -403,6 +406,7 @@ impl From<Channel> for crate::Channel {
                 tags: tags.into_iter().map(|tag| tag.into()).collect(),
                 require_tag,
                 default_sort: default_sort.into(),
+                default_auto_archive_minutes,
             },
         }
     }
@@ -471,6 +475,8 @@ impl From<crate::PartialChannel> for PartialChannel {
                 .map(|tags| tags.into_iter().map(|tag| tag.into()).collect()),
             require_tag: value.require_tag,
             default_sort: value.default_sort.map(|sort| sort.into()),
+            auto_archive_minutes: value.auto_archive_minutes,
+            default_auto_archive_minutes: value.default_auto_archive_minutes,
             applied_tags: value.applied_tags,
             announcement: value.announcement,
         }
@@ -500,6 +506,8 @@ impl From<PartialChannel> for crate::PartialChannel {
                 .map(|tags| tags.into_iter().map(|tag| tag.into()).collect()),
             require_tag: value.require_tag,
             default_sort: value.default_sort.map(|sort| sort.into()),
+            auto_archive_minutes: value.auto_archive_minutes,
+            default_auto_archive_minutes: value.default_auto_archive_minutes,
             applied_tags: value.applied_tags,
             announcement: value.announcement,
         }

@@ -173,7 +173,8 @@ auto_derived!(
             #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
             archived_timestamp: Option<String>,
             /// Minutes of inactivity after which this thread auto-archives
-            /// (one of 60 / 1440 / 4320 / 10080)
+            /// (one of 0 / 60 / 1440 / 4320 / 10080 / 43200 / 129600;
+            /// 0 = Never)
             #[cfg_attr(
                 feature = "serde",
                 serde(default = "default_auto_archive_minutes")
@@ -259,6 +260,14 @@ auto_derived!(
             /// Default ordering of the post browse view
             #[cfg_attr(feature = "serde", serde(default))]
             default_sort: ForumSortOrder,
+            /// Default auto-archive duration for new posts in this forum, in
+            /// minutes (one of 0 / 60 / 1440 / 4320 / 10080 / 43200 / 129600;
+            /// 0 = Never)
+            #[cfg_attr(
+                feature = "serde",
+                serde(default = "default_forum_auto_archive_minutes")
+            )]
+            default_auto_archive_minutes: u32,
         },
     }
 
@@ -345,6 +354,10 @@ auto_derived!(
         #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
         pub default_sort: Option<ForumSortOrder>,
         #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+        pub auto_archive_minutes: Option<u32>,
+        #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+        pub default_auto_archive_minutes: Option<u32>,
+        #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
         pub applied_tags: Option<Vec<String>>,
         #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
         pub announcement: Option<bool>,
@@ -410,6 +423,16 @@ auto_derived!(
         /// Default ordering of a forum's post browse view
         pub default_sort: Option<ForumSortOrder>,
 
+        /// Minutes of inactivity after which this thread / forum post
+        /// auto-archives (threads and forum posts only; one of
+        /// 0 / 60 / 1440 / 4320 / 10080 / 43200 / 129600; 0 = Never)
+        pub auto_archive_minutes: Option<u32>,
+
+        /// Default auto-archive duration for new posts in a forum, in minutes
+        /// (forum channels only; one of
+        /// 0 / 60 / 1440 / 4320 / 10080 / 43200 / 129600; 0 = Never)
+        pub default_auto_archive_minutes: Option<u32>,
+
         /// Ids of forum tags applied to this post (forum-post threads only;
         /// replaces the whole set)
         pub applied_tags: Option<Vec<String>>,
@@ -472,7 +495,8 @@ auto_derived!(
         #[cfg_attr(feature = "validator", validate(length(min = 1, max = 32)))]
         pub name: String,
         /// Minutes of inactivity after which the thread auto-archives
-        /// (one of 60 / 1440 / 4320 / 10080, defaults to 1440)
+        /// (one of 0 / 60 / 1440 / 4320 / 10080 / 43200 / 129600;
+        /// 0 = Never; omitted = 1440)
         pub auto_archive_minutes: Option<u32>,
     }
 
@@ -498,7 +522,8 @@ auto_derived!(
         #[cfg_attr(feature = "serde", serde(default))]
         pub tags: Vec<String>,
         /// Minutes of inactivity after which the post auto-archives
-        /// (one of 60 / 1440 / 4320 / 10080, defaults to 1440)
+        /// (one of 0 / 60 / 1440 / 4320 / 10080 / 43200 / 129600;
+        /// 0 = Never; omitted = the forum's default_auto_archive_minutes)
         pub auto_archive_minutes: Option<u32>,
         /// Starter message of the post
         pub message: super::DataMessageSend,
@@ -643,6 +668,11 @@ auto_derived!(
 /// Default auto-archive duration for threads, in minutes
 pub(crate) fn default_auto_archive_minutes() -> u32 {
     1440
+}
+
+/// Default auto-archive duration for new posts in a forum, in minutes
+pub(crate) fn default_forum_auto_archive_minutes() -> u32 {
+    10080
 }
 
 impl Channel {

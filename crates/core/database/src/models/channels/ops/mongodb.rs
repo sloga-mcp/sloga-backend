@@ -63,7 +63,9 @@ impl AbstractChannels for MongoDb {
             COL,
             doc! {
                 "channel_type": "Thread",
-                "archived": { "$ne": true }
+                "archived": { "$ne": true },
+                // Skip "Never" threads; legacy docs lacking the field still match (default 1440)
+                "auto_archive_minutes": { "$ne": Channel::AUTO_ARCHIVE_NEVER as i64 }
             }
         )
     }

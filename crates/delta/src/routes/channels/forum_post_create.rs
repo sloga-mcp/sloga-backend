@@ -354,4 +354,183 @@ mod test {
             .await;
         assert_eq!(response.status(), Status::BadRequest);
     }
+
+    /// POST a forum post over HTTP, optionally with an explicit
+    /// `auto_archive_minutes`.
+    async fn post_forum_post<'c>(
+        harness: &'c TestHarness,
+        token: &str,
+        forum: &Channel,
+        title: &str,
+        auto_archive_minutes: Option<u32>,
+    ) -> rocket::local::asynchronous::LocalResponse<'c> {
+        let mut body = json!({ "title": title, "message": { "content": "hi" } });
+        if let Some(minutes) = auto_archive_minutes {
+            body["auto_archive_minutes"] = json!(minutes);
+        }
+        harness
+            .client
+            .post(format!("/channels/{}/posts", forum.id()))
+            .header(Header::new("x-session-token", token.to_string()))
+            .header(ContentType::JSON)
+            .body(body.to_string())
+            .dispatch()
+            .await
+    }
+
+    /// Extract `(id, auto_archive_minutes)` from a successful create response.
+    async fn post_archive_minutes(
+        response: rocket::local::asynchronous::LocalResponse<'_>,
+    ) -> (String, u32) {
+        assert_eq!(response.status(), Status::Ok);
+        let body: v0::ForumPostResponse =
+            response.into_json().await.expect("forum post response");
+        match body.post {
+            v0::Channel::Thread {
+                id,
+                auto_archive_minutes,
+                ..
+            } => (id, auto_archive_minutes),
+            other => panic!("expected a thread, got {:?}", other),
+        }
+    }
+
+    /// The stored thread's `auto_archive_minutes`.
+    async fn stored_archive_minutes(harness: &TestHarness, id: &str) -> u32 {
+        match harness.db.fetch_channel(id).await.expect("stored post") {
+            Channel::Thread {
+                auto_archive_minutes,
+                ..
+            } => auto_archive_minutes,
+            other => panic!("expected a thread, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn create_post_uses_forum_default_auto_archive() {
+        crate::util::test::rt().block_on(create_post_uses_forum_default_auto_archive_case())
+    }
+
+    async fn create_post_uses_forum_default_auto_archive_case() {
+        let harness = TestHarness::new().await;
+        let (_, session, user) = harness.new_user().await;
+        let (mut server, _) = harness.new_server(&user).await;
+        let mut forum = new_forum(&harness, &mut server).await;
+
+        // Fresh forum → the built-in forum default (7 days).
+        let response = post_forum_post(&harness, &session.token, &forum, "a", None).await;
+        let (id, minutes) = post_archive_minutes(response).await;
+        assert_eq!(minutes, 10080);
+        assert_eq!(stored_archive_minutes(&harness, &id).await, 10080);
+
+        // Configured forum default is inherited by posts that omit it.
+        forum
+            .update(
+                &harness.db,
+                revolt_database::PartialChannel {
+                    default_auto_archive_minutes: Some(129600),
+                    ..Default::default()
+                },
+                vec![],
+            )
+            .await
+            .expect("configure forum default");
+
+        let response = post_forum_post(&harness, &session.token, &forum, "b", None).await;
+        let (id, minutes) = post_archive_minutes(response).await;
+        assert_eq!(minutes, 129600);
+        assert_eq!(stored_archive_minutes(&harness, &id).await, 129600);
+    }
+
+    #[test]
+    fn create_post_validates_explicit_auto_archive() {
+        crate::util::test::rt().block_on(create_post_validates_explicit_auto_archive_case())
+    }
+
+    async fn create_post_validates_explicit_auto_archive_case() {
+        let harness = TestHarness::new().await;
+        let (_, session, user) = harness.new_user().await;
+        let (mut server, _) = harness.new_server(&user).await;
+        let forum = new_forum(&harness, &mut server).await;
+
+        // 0 = Never, and the new 90-day option, are both accepted and stored.
+        for minutes in [0u32, 129600] {
+            let response =
+                post_forum_post(&harness, &session.token, &forum, "ok", Some(minutes)).await;
+            let (id, returned) = post_archive_minutes(response).await;
+            assert_eq!(returned, minutes);
+            assert_eq!(stored_archive_minutes(&harness, &id).await, minutes);
+        }
+
+        // Off-allowlist durations are rejected.
+        let response = post_forum_post(&harness, &session.token, &forum, "bad", Some(30)).await;
+        assert_eq!(response.status(), Status::BadRequest);
+        let error: serde_json::Value = response.into_json().await.expect("error body");
+        assert_eq!(error["type"], "InvalidProperty");
+    }
+
+    #[test]
+    fn create_post_is_exempt_from_thread_cap() {
+        crate::util::test::rt().block_on(create_post_is_exempt_from_thread_cap_case())
+    }
+
+    async fn create_post_is_exempt_from_thread_cap_case() {
+        let harness = TestHarness::new().await;
+        let (_, session, user) = harness.new_user().await;
+        let (mut server, _) = harness.new_server(&user).await;
+        let forum = new_forum(&harness, &mut server).await;
+
+        // Fill the forum up to the per-channel thread cap directly (the HTTP
+        // route is rate-limited), all of them active.
+        let cap = revolt_config::config()
+            .await
+            .features
+            .limits
+            .global
+            .threads_per_channel;
+        for i in 0..cap {
+            Channel::create_forum_post(
+                &harness.db,
+                &forum,
+                &user,
+                format!("post {i}"),
+                vec![],
+                None,
+            )
+            .await
+            .expect("direct post created");
+        }
+
+        // One more post over HTTP still succeeds: forums are uncapped.
+        let response = post_forum_post(&harness, &session.token, &forum, "over", None).await;
+        assert_eq!(response.status(), Status::Ok);
+    }
+
+    #[test]
+    fn never_archive_post_is_not_an_active_thread() {
+        crate::util::test::rt().block_on(never_archive_post_is_not_an_active_thread_case())
+    }
+
+    async fn never_archive_post_is_not_an_active_thread_case() {
+        let harness = TestHarness::new().await;
+        let (_, session, user) = harness.new_user().await;
+        let (mut server, _) = harness.new_server(&user).await;
+        let forum = new_forum(&harness, &mut server).await;
+
+        let response = post_forum_post(&harness, &session.token, &forum, "never", Some(0)).await;
+        let (never_id, _) = post_archive_minutes(response).await;
+        let response = post_forum_post(&harness, &session.token, &forum, "day", Some(1440)).await;
+        let (day_id, _) = post_archive_minutes(response).await;
+
+        let active: Vec<String> = harness
+            .db
+            .fetch_active_threads()
+            .await
+            .expect("active threads")
+            .iter()
+            .map(|channel| channel.id().to_string())
+            .collect();
+        assert!(!active.contains(&never_id));
+        assert!(active.contains(&day_id));
+    }
 }

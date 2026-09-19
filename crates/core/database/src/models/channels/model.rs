@@ -162,7 +162,7 @@ auto_derived!(
             #[serde(skip_serializing_if = "Option::is_none")]
             archived_timestamp: Option<String>,
             /// Minutes of inactivity after which this thread auto-archives
-            /// (one of 60 / 1440 / 4320 / 10080)
+            /// (one of 60 / 1440 / 4320 / 10080 / 43200 / 129600, or 0 = Never)
             #[serde(default = "Channel::default_auto_archive_minutes")]
             auto_archive_minutes: u32,
 
@@ -224,6 +224,11 @@ auto_derived!(
             /// Default ordering of the post browse view
             #[serde(default)]
             default_sort: ForumSortOrder,
+            /// Auto-archive duration (minutes) applied to new posts that do
+            /// not specify one (one of `Channel::ALLOWED_AUTO_ARCHIVE_MINUTES`,
+            /// 0 = Never)
+            #[serde(default = "Channel::default_forum_auto_archive_minutes")]
+            default_auto_archive_minutes: u32,
         },
     }
 
@@ -301,6 +306,10 @@ auto_derived!(
         pub require_tag: Option<bool>,
         #[serde(skip_serializing_if = "Option::is_none")]
         pub default_sort: Option<ForumSortOrder>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub auto_archive_minutes: Option<u32>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub default_auto_archive_minutes: Option<u32>,
         #[serde(skip_serializing_if = "Option::is_none")]
         pub applied_tags: Option<Vec<String>>,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -399,6 +408,7 @@ impl Channel {
                 tags: vec![],
                 require_tag: false,
                 default_sort: ForumSortOrder::default(),
+                default_auto_archive_minutes: Channel::default_forum_auto_archive_minutes(),
             },
         };
 
@@ -429,8 +439,18 @@ impl Channel {
         1440
     }
 
+    /// Default auto-archive duration for new forum posts, in minutes
+    /// (used when a forum document predates the per-forum default)
+    pub fn default_forum_auto_archive_minutes() -> u32 {
+        10080
+    }
+
+    /// Sentinel auto-archive duration meaning the thread never auto-archives
+    pub const AUTO_ARCHIVE_NEVER: u32 = 0;
+
     /// Allowed auto-archive durations for threads, in minutes
-    pub const ALLOWED_AUTO_ARCHIVE_MINUTES: [u32; 4] = [60, 1440, 4320, 10080];
+    /// (0 = Never, 1h, 1d, 3d, 7d, 30d, 90d)
+    pub const ALLOWED_AUTO_ARCHIVE_MINUTES: [u32; 7] = [0, 60, 1440, 4320, 10080, 43200, 129600];
 
     /// Create a new thread under a server text channel
     ///
@@ -566,27 +586,22 @@ impl Channel {
     ) -> Result<Channel> {
         // Posts may only exist under forum channels; this is also the E2EE
         // fail-closed gate (encrypted DMs / groups can never host one).
-        let (parent_id, server_id) = match forum {
-            Channel::Forum { id, server, .. } => (id.clone(), server.clone()),
+        let (parent_id, server_id, forum_default_auto_archive_minutes) = match forum {
+            Channel::Forum {
+                id,
+                server,
+                default_auto_archive_minutes,
+                ..
+            } => (id.clone(), server.clone(), *default_auto_archive_minutes),
             _ => return Err(create_error!(InvalidOperation)),
         };
 
-        // Enforce the per-channel active post cap (shared with threads).
-        let config = config().await;
-        let max_threads = config.features.limits.global.threads_per_channel;
-        let active_posts = db
-            .fetch_threads_by_parent(&parent_id)
-            .await?
-            .into_iter()
-            .filter(|thread| !matches!(thread, Channel::Thread { archived: true, .. }))
-            .count();
-        if active_posts >= max_threads {
-            return Err(create_error!(TooManyChannels { max: max_threads }));
-        }
+        // Forum posts are intentionally exempt from `threads_per_channel`
+        // (user decision); the forum_post_create ratelimit bucket bounds spam.
 
-        // Validate the auto-archive duration.
+        // Validate the auto-archive duration (falling back to the forum default).
         let auto_archive_minutes =
-            auto_archive_minutes.unwrap_or_else(Channel::default_auto_archive_minutes);
+            auto_archive_minutes.unwrap_or(forum_default_auto_archive_minutes);
         if !Channel::ALLOWED_AUTO_ARCHIVE_MINUTES.contains(&auto_archive_minutes) {
             return Err(create_error!(InvalidProperty));
         }
@@ -1107,6 +1122,7 @@ impl Channel {
                 archived,
                 archived_timestamp,
                 last_message_id,
+                auto_archive_minutes,
                 applied_tags,
                 ..
             } => {
@@ -1126,6 +1142,10 @@ impl Channel {
                     last_message_id.replace(v);
                 }
 
+                if let Some(v) = partial.auto_archive_minutes {
+                    *auto_archive_minutes = v;
+                }
+
                 if let Some(v) = partial.applied_tags {
                     *applied_tags = v;
                 }
@@ -1142,6 +1162,7 @@ impl Channel {
                 tags,
                 require_tag,
                 default_sort,
+                default_auto_archive_minutes,
                 ..
             } => {
                 if let Some(v) = partial.name {
@@ -1186,6 +1207,10 @@ impl Channel {
 
                 if let Some(v) = partial.default_sort {
                     *default_sort = v;
+                }
+
+                if let Some(v) = partial.default_auto_archive_minutes {
+                    *default_auto_archive_minutes = v;
                 }
             }
         }

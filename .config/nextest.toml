@@ -38,12 +38,16 @@ test-group = 'remote-control-heavy'
 # with mongod latency and suite load. Observed 72-99s in the 2026-07-27 full
 # run with the import test crossing 120s. 300s keeps hangs detectable;
 # anything new that mass-inserts to a cap belongs in this list.
+# create_post_is_exempt_from_thread_cap inserts threads_per_channel (100)
+# forum posts to prove posts skip the thread cap: ~73s alone on MONGODB, so
+# the 120s default has no headroom under full-suite load.
 filter = '''
 package(revolt-delta) & (
     test(=routes::events::tests::import_paginates_and_truncates)
   | test(=routes::e2ee::tests::one_time_key_cap_counts_upserts_correctly)
   | test(=routes::servers::server_join::test::join_rejected_at_server_cap)
   | test(=routes::mls::tests::publish_validates_binding_caps_and_immutability)
+  | test(=routes::channels::forum_post_create::test::create_post_is_exempt_from_thread_cap)
 )
 '''
 slow-timeout = { period = "15s", terminate-after = 20 }

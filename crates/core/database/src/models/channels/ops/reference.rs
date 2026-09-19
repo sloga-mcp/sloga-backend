@@ -62,7 +62,14 @@ impl AbstractChannels for ReferenceDb {
         let channels = self.channels.lock().await;
         Ok(channels
             .values()
-            .filter(|channel| matches!(channel, Channel::Thread { archived: false, .. }))
+            // Threads set to "Never" (0) are never auto-archive candidates
+            .filter(|channel| {
+                matches!(
+                    channel,
+                    Channel::Thread { archived: false, auto_archive_minutes, .. }
+                        if *auto_archive_minutes != Channel::AUTO_ARCHIVE_NEVER
+                )
+            })
             .cloned()
             .collect())
     }

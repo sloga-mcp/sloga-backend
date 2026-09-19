@@ -243,6 +243,8 @@ mod test {
             tags: None,
             require_tag: None,
             default_sort: None,
+            auto_archive_minutes: None,
+            default_auto_archive_minutes: None,
             applied_tags: None,
             announcement: None,
         };
