@@ -173,8 +173,7 @@ auto_derived!(
             #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
             archived_timestamp: Option<String>,
             /// Minutes of inactivity after which this thread auto-archives
-            /// (one of 0 / 60 / 1440 / 4320 / 10080 / 43200 / 129600;
-            /// 0 = Never)
+            /// (0 = Never, otherwise 1 up to two years)
             #[cfg_attr(
                 feature = "serde",
                 serde(default = "default_auto_archive_minutes")
@@ -261,8 +260,8 @@ auto_derived!(
             #[cfg_attr(feature = "serde", serde(default))]
             default_sort: ForumSortOrder,
             /// Default auto-archive duration for new posts in this forum, in
-            /// minutes (one of 0 / 60 / 1440 / 4320 / 10080 / 43200 / 129600;
-            /// 0 = Never)
+            /// minutes (0 = Never, otherwise 1 up to two years; see
+            /// `Channel::is_valid_auto_archive_minutes`)
             #[cfg_attr(
                 feature = "serde",
                 serde(default = "default_forum_auto_archive_minutes")
@@ -424,13 +423,12 @@ auto_derived!(
         pub default_sort: Option<ForumSortOrder>,
 
         /// Minutes of inactivity after which this thread / forum post
-        /// auto-archives (threads and forum posts only; one of
-        /// 0 / 60 / 1440 / 4320 / 10080 / 43200 / 129600; 0 = Never)
+        /// auto-archives (threads and forum posts only;
+        /// 0 = Never, otherwise 1 up to two years)
         pub auto_archive_minutes: Option<u32>,
 
         /// Default auto-archive duration for new posts in a forum, in minutes
-        /// (forum channels only; one of
-        /// 0 / 60 / 1440 / 4320 / 10080 / 43200 / 129600; 0 = Never)
+        /// (forum channels only; 0 = Never, otherwise 1 up to two years)
         pub default_auto_archive_minutes: Option<u32>,
 
         /// Ids of forum tags applied to this post (forum-post threads only;
@@ -495,8 +493,7 @@ auto_derived!(
         #[cfg_attr(feature = "validator", validate(length(min = 1, max = 32)))]
         pub name: String,
         /// Minutes of inactivity after which the thread auto-archives
-        /// (one of 0 / 60 / 1440 / 4320 / 10080 / 43200 / 129600;
-        /// 0 = Never; omitted = 1440)
+        /// (0 = Never, otherwise 1 up to two years; omitted = 1440)
         pub auto_archive_minutes: Option<u32>,
     }
 
@@ -522,8 +519,8 @@ auto_derived!(
         #[cfg_attr(feature = "serde", serde(default))]
         pub tags: Vec<String>,
         /// Minutes of inactivity after which the post auto-archives
-        /// (one of 0 / 60 / 1440 / 4320 / 10080 / 43200 / 129600;
-        /// 0 = Never; omitted = the forum's default_auto_archive_minutes)
+        /// (0 = Never, otherwise 1 up to two years; omitted = the forum's
+        /// default_auto_archive_minutes)
         pub auto_archive_minutes: Option<u32>,
         /// Starter message of the post
         pub message: super::DataMessageSend,

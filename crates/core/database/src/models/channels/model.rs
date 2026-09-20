@@ -162,7 +162,7 @@ auto_derived!(
             #[serde(skip_serializing_if = "Option::is_none")]
             archived_timestamp: Option<String>,
             /// Minutes of inactivity after which this thread auto-archives
-            /// (one of 60 / 1440 / 4320 / 10080 / 43200 / 129600, or 0 = Never)
+            /// (0 = Never, otherwise 1 up to two years)
             #[serde(default = "Channel::default_auto_archive_minutes")]
             auto_archive_minutes: u32,
 
@@ -225,7 +225,7 @@ auto_derived!(
             #[serde(default)]
             default_sort: ForumSortOrder,
             /// Auto-archive duration (minutes) applied to new posts that do
-            /// not specify one (one of `Channel::ALLOWED_AUTO_ARCHIVE_MINUTES`,
+            /// not specify one (see `Channel::is_valid_auto_archive_minutes`,
             /// 0 = Never)
             #[serde(default = "Channel::default_forum_auto_archive_minutes")]
             default_auto_archive_minutes: u32,
@@ -448,9 +448,23 @@ impl Channel {
     /// Sentinel auto-archive duration meaning the thread never auto-archives
     pub const AUTO_ARCHIVE_NEVER: u32 = 0;
 
-    /// Allowed auto-archive durations for threads, in minutes
-    /// (0 = Never, 1h, 1d, 3d, 7d, 30d, 90d)
-    pub const ALLOWED_AUTO_ARCHIVE_MINUTES: [u32; 7] = [0, 60, 1440, 4320, 10080, 43200, 129600];
+    /// Longest auto-archive duration that can be set, in minutes.
+    ///
+    /// Two years, taking a year as 365 days: 2 * 365 * 24 * 60.
+    pub const MAX_AUTO_ARCHIVE_MINUTES: u32 = 1_051_200;
+
+    /// Whether `minutes` is an acceptable auto-archive duration.
+    ///
+    /// This replaced a fixed allow-list of seven values. Operators asked to be
+    /// able to pick any duration between a minute and two years, so the set of
+    /// legal values is now a range and the durations a client offers are a
+    /// convenience rather than the contract. `0` stays the "never" sentinel,
+    /// which is why it is admitted separately instead of widening the range
+    /// down to zero.
+    pub fn is_valid_auto_archive_minutes(minutes: u32) -> bool {
+        minutes == Channel::AUTO_ARCHIVE_NEVER
+            || (1..=Channel::MAX_AUTO_ARCHIVE_MINUTES).contains(&minutes)
+    }
 
     /// Create a new thread under a server text channel
     ///
@@ -488,7 +502,7 @@ impl Channel {
         let auto_archive_minutes = data
             .auto_archive_minutes
             .unwrap_or_else(Channel::default_auto_archive_minutes);
-        if !Channel::ALLOWED_AUTO_ARCHIVE_MINUTES.contains(&auto_archive_minutes) {
+        if !Channel::is_valid_auto_archive_minutes(auto_archive_minutes) {
             return Err(create_error!(InvalidProperty));
         }
 
@@ -602,7 +616,7 @@ impl Channel {
         // Validate the auto-archive duration (falling back to the forum default).
         let auto_archive_minutes =
             auto_archive_minutes.unwrap_or(forum_default_auto_archive_minutes);
-        if !Channel::ALLOWED_AUTO_ARCHIVE_MINUTES.contains(&auto_archive_minutes) {
+        if !Channel::is_valid_auto_archive_minutes(auto_archive_minutes) {
             return Err(create_error!(InvalidProperty));
         }
 

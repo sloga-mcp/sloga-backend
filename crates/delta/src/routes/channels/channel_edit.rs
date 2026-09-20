@@ -109,13 +109,13 @@ pub async fn edit(
         return Err(create_error!(InvalidOperation));
     }
 
-    // Auto-archive durations must be one of the fixed allowed values
+    // Auto-archive durations must fall in the accepted range, 0 meaning never
     // (validated before any write).
     for minutes in [data.auto_archive_minutes, data.default_auto_archive_minutes]
         .iter()
         .flatten()
     {
-        if !Channel::ALLOWED_AUTO_ARCHIVE_MINUTES.contains(minutes) {
+        if !Channel::is_valid_auto_archive_minutes(*minutes) {
             return Err(create_error!(InvalidProperty));
         }
     }
