@@ -259,6 +259,7 @@ impl From<crate::Channel> for Channel {
                 tags,
                 require_tag,
                 default_sort,
+                force_sort,
                 default_auto_archive_minutes,
             } => Channel::Forum {
                 id,
@@ -274,6 +275,7 @@ impl From<crate::Channel> for Channel {
                 tags: tags.into_iter().map(|tag| tag.into()).collect(),
                 require_tag,
                 default_sort: default_sort.into(),
+                force_sort,
                 default_auto_archive_minutes,
             },
         }
@@ -391,6 +393,7 @@ impl From<Channel> for crate::Channel {
                 tags,
                 require_tag,
                 default_sort,
+                force_sort,
                 default_auto_archive_minutes,
             } => crate::Channel::Forum {
                 id,
@@ -406,6 +409,7 @@ impl From<Channel> for crate::Channel {
                 tags: tags.into_iter().map(|tag| tag.into()).collect(),
                 require_tag,
                 default_sort: default_sort.into(),
+                force_sort,
                 default_auto_archive_minutes,
             },
         }
@@ -439,6 +443,7 @@ impl From<crate::ForumSortOrder> for ForumSortOrder {
         match value {
             crate::ForumSortOrder::LatestActivity => ForumSortOrder::LatestActivity,
             crate::ForumSortOrder::CreationDate => ForumSortOrder::CreationDate,
+            crate::ForumSortOrder::Alphabetical => ForumSortOrder::Alphabetical,
         }
     }
 }
@@ -448,6 +453,7 @@ impl From<ForumSortOrder> for crate::ForumSortOrder {
         match value {
             ForumSortOrder::LatestActivity => crate::ForumSortOrder::LatestActivity,
             ForumSortOrder::CreationDate => crate::ForumSortOrder::CreationDate,
+            ForumSortOrder::Alphabetical => crate::ForumSortOrder::Alphabetical,
         }
     }
 }
@@ -475,6 +481,7 @@ impl From<crate::PartialChannel> for PartialChannel {
                 .map(|tags| tags.into_iter().map(|tag| tag.into()).collect()),
             require_tag: value.require_tag,
             default_sort: value.default_sort.map(|sort| sort.into()),
+            force_sort: value.force_sort,
             auto_archive_minutes: value.auto_archive_minutes,
             default_auto_archive_minutes: value.default_auto_archive_minutes,
             applied_tags: value.applied_tags,
@@ -506,6 +513,7 @@ impl From<PartialChannel> for crate::PartialChannel {
                 .map(|tags| tags.into_iter().map(|tag| tag.into()).collect()),
             require_tag: value.require_tag,
             default_sort: value.default_sort.map(|sort| sort.into()),
+            force_sort: value.force_sort,
             auto_archive_minutes: value.auto_archive_minutes,
             default_auto_archive_minutes: value.default_auto_archive_minutes,
             applied_tags: value.applied_tags,

@@ -1,6 +1,6 @@
 use revolt_database::{
     util::{permissions::DatabasePermissionQuery, reference::Reference},
-    Channel, Database, User,
+    Channel, Database, ForumSortOrder, User,
 };
 use revolt_models::v0;
 use revolt_permissions::{calculate_channel_permissions, ChannelPermission};
@@ -49,6 +49,9 @@ enum ForumSort {
 ///
 /// `sort` is `latest_activity` (default), `creation_date` or `alphabetical`;
 /// `alphabetical` lists A-Z (ascending), the other two list newest first.
+/// A forum with `force_sort` set ignores `sort` and answers in its own
+/// `default_sort` — an unreadable `sort` is still rejected, so a client that
+/// asks for nonsense hears about it either way.
 /// `tag` filters to
 /// posts carrying the given tag id; `archived=true` lists archived posts
 /// instead of active ones; `before` is a cursor on the sort key, except under
@@ -79,11 +82,29 @@ pub async fn fetch_forum_posts(
         .await
         .throw_if_lacking_channel_permission(ChannelPermission::ViewChannel)?;
 
-    let order = match sort.as_deref() {
+    let requested = match sort.as_deref() {
         None | Some("latest_activity") => ForumSort::LatestActivity,
         Some("creation_date") => ForumSort::CreationDate,
         Some("alphabetical") => ForumSort::Alphabetical,
         _ => return Err(create_error!(InvalidProperty)),
+    };
+
+    // A forum can impose its order on everyone (an info board wants one
+    // listing, not a per-member preference). Enforced here rather than left to
+    // the client: a forced order that any caller can sort away from is not a
+    // forced order. The requested value is still parsed above, so a malformed
+    // `sort` is rejected whether or not this forum forces one.
+    let order = match &channel {
+        Channel::Forum {
+            default_sort,
+            force_sort: true,
+            ..
+        } => match default_sort {
+            ForumSortOrder::LatestActivity => ForumSort::LatestActivity,
+            ForumSortOrder::CreationDate => ForumSort::CreationDate,
+            ForumSortOrder::Alphabetical => ForumSort::Alphabetical,
+        },
+        _ => requested,
     };
 
     // A-Z reads in ascending order; the time-based orders read newest first.
@@ -366,6 +387,159 @@ mod test {
             .client
             .get(format!("/channels/{}/posts?sort=nonsense", forum.id()))
             .header(Header::new("x-session-token", session.token.to_string()))
+            .dispatch()
+            .await;
+        assert_ne!(response.status(), Status::Ok);
+    }
+
+    #[test]
+    fn forced_sort_overrides_what_the_caller_asks_for() {
+        crate::util::test::rt().block_on(forced_sort_overrides_what_the_caller_asks_for_case())
+    }
+
+    async fn forced_sort_overrides_what_the_caller_asks_for_case() {
+        let harness = TestHarness::new().await;
+        let (_, session, user) = harness.new_user().await;
+        let (mut server, _) = harness.new_server(&user).await;
+        let forum = Channel::create_server_channel(
+            &harness.db,
+            &mut server,
+            v0::DataCreateServerChannel {
+                channel_type: v0::LegacyServerChannelType::Forum,
+                name: "forum".to_string(),
+                ..Default::default()
+            },
+            true,
+        )
+        .await
+        .expect("forum created");
+
+        for title in ["Cherry", "apple", "Banana"] {
+            let response = harness
+                .client
+                .post(format!("/channels/{}/posts", forum.id()))
+                .header(Header::new("x-session-token", session.token.to_string()))
+                .header(ContentType::JSON)
+                .body(
+                    json!({
+                        "title": title,
+                        "message": { "content": "starter" }
+                    })
+                    .to_string(),
+                )
+                .dispatch()
+                .await;
+            assert_eq!(response.status(), Status::Ok);
+        }
+
+        let names = |body: &v0::ForumPostsResponse| -> Vec<String> {
+            body.posts
+                .iter()
+                .map(|post| match post {
+                    v0::Channel::Thread { name, .. } => name.clone(),
+                    other => panic!("expected thread, got {:?}", other),
+                })
+                .collect()
+        };
+
+        // Control: before the forum forces anything, an explicit
+        // `creation_date` is honoured. Without this the assertion below could
+        // pass on a forum that was already answering alphabetically.
+        let response = harness
+            .client
+            .get(format!(
+                "/channels/{}/posts?sort=creation_date",
+                forum.id()
+            ))
+            .header(Header::new("x-session-token", session.token.to_string()))
+            .dispatch()
+            .await;
+        let body: v0::ForumPostsResponse = response.into_json().await.expect("unforced");
+        let unforced = names(&body);
+        assert_ne!(unforced, vec!["apple", "Banana", "Cherry"]);
+
+        let response = harness
+            .client
+            .patch(format!("/channels/{}", forum.id()))
+            .header(Header::new("x-session-token", session.token.to_string()))
+            .header(ContentType::JSON)
+            .body(
+                json!({
+                    "default_sort": "Alphabetical",
+                    "force_sort": true
+                })
+                .to_string(),
+            )
+            .dispatch()
+            .await;
+        assert_eq!(response.status(), Status::Ok);
+
+        // The same request now answers in the forum's order, not the
+        // caller's. A forced order a client can sort away from is not forced.
+        let response = harness
+            .client
+            .get(format!(
+                "/channels/{}/posts?sort=creation_date",
+                forum.id()
+            ))
+            .header(Header::new("x-session-token", session.token.to_string()))
+            .dispatch()
+            .await;
+        assert_eq!(response.status(), Status::Ok);
+        let body: v0::ForumPostsResponse = response.into_json().await.expect("forced");
+        assert_eq!(names(&body), vec!["apple", "Banana", "Cherry"]);
+
+        // Forcing an order does not make a malformed one acceptable.
+        let response = harness
+            .client
+            .get(format!("/channels/{}/posts?sort=nonsense", forum.id()))
+            .header(Header::new("x-session-token", session.token.to_string()))
+            .dispatch()
+            .await;
+        assert_ne!(response.status(), Status::Ok);
+
+        // Releasing the lock hands the choice back to the caller.
+        let response = harness
+            .client
+            .patch(format!("/channels/{}", forum.id()))
+            .header(Header::new("x-session-token", session.token.to_string()))
+            .header(ContentType::JSON)
+            .body(json!({ "force_sort": false }).to_string())
+            .dispatch()
+            .await;
+        assert_eq!(response.status(), Status::Ok);
+
+        let response = harness
+            .client
+            .get(format!(
+                "/channels/{}/posts?sort=creation_date",
+                forum.id()
+            ))
+            .header(Header::new("x-session-token", session.token.to_string()))
+            .dispatch()
+            .await;
+        let body: v0::ForumPostsResponse = response.into_json().await.expect("released");
+        assert_eq!(names(&body), unforced);
+    }
+
+    #[test]
+    fn force_sort_is_rejected_on_a_non_forum() {
+        crate::util::test::rt().block_on(force_sort_is_rejected_on_a_non_forum_case())
+    }
+
+    async fn force_sort_is_rejected_on_a_non_forum_case() {
+        let harness = TestHarness::new().await;
+        let (_, session, user) = harness.new_user().await;
+        let (mut server, channels) = harness.new_server(&user).await;
+        let _ = &mut server;
+        let text = channels.first().expect("a default text channel");
+
+        let response = harness
+            .client
+            .patch(format!("/channels/{}", text.id()))
+            .header(Header::new("x-session-token", session.token.to_string()))
+            .header(ContentType::JSON)
+            .body(json!({ "force_sort": true }).to_string())
             .dispatch()
             .await;
         assert_ne!(response.status(), Status::Ok);

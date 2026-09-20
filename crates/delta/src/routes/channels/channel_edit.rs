@@ -68,6 +68,7 @@ pub async fn edit(
         && data.tags.is_none()
         && data.require_tag.is_none()
         && data.default_sort.is_none()
+        && data.force_sort.is_none()
         && data.default_auto_archive_minutes.is_none()
         && data.auto_archive_minutes.is_none()
         && data.applied_tags.is_none()
@@ -88,7 +89,10 @@ pub async fn edit(
     // Forum configuration fields only ever apply to forum channels; reject
     // them anywhere else (mirrors the group-only owner rejection below)
     // instead of silently dropping them.
-    if (data.tags.is_some() || data.require_tag.is_some() || data.default_sort.is_some())
+    if (data.tags.is_some()
+        || data.require_tag.is_some()
+        || data.default_sort.is_some()
+        || data.force_sort.is_some())
         && !matches!(channel, Channel::Forum { .. })
     {
         return Err(create_error!(InvalidOperation));
@@ -447,6 +451,7 @@ pub async fn edit(
             tags,
             require_tag,
             default_sort,
+            force_sort,
             default_auto_archive_minutes,
             ..
         } => {
@@ -510,6 +515,11 @@ pub async fn edit(
             if let Some(new_default_sort) = data.default_sort {
                 *default_sort = new_default_sort.clone().into();
                 partial.default_sort = Some(new_default_sort.into());
+            }
+
+            if let Some(new_force_sort) = data.force_sort {
+                *force_sort = new_force_sort;
+                partial.force_sort = Some(new_force_sort);
             }
 
             if let Some(new_default_auto_archive_minutes) = data.default_auto_archive_minutes {

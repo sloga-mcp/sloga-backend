@@ -259,6 +259,13 @@ auto_derived!(
             /// Default ordering of the post browse view
             #[cfg_attr(feature = "serde", serde(default))]
             default_sort: ForumSortOrder,
+            /// Whether `default_sort` is imposed on every reader rather than
+            /// being the order the browse view merely opens on
+            #[cfg_attr(
+                feature = "serde",
+                serde(skip_serializing_if = "crate::if_false", default)
+            )]
+            force_sort: bool,
             /// Default auto-archive duration for new posts in this forum, in
             /// minutes (0 = Never, otherwise 1 up to two years; see
             /// `Channel::is_valid_auto_archive_minutes`)
@@ -295,6 +302,8 @@ auto_derived!(
         LatestActivity,
         /// Most recently created post first
         CreationDate,
+        /// By post title, 0-9 then A-Z
+        Alphabetical,
     }
 
     /// Voice information for a channel
@@ -352,6 +361,8 @@ auto_derived!(
         pub require_tag: Option<bool>,
         #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
         pub default_sort: Option<ForumSortOrder>,
+        #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+        pub force_sort: Option<bool>,
         #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
         pub auto_archive_minutes: Option<u32>,
         #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
@@ -421,6 +432,12 @@ auto_derived!(
 
         /// Default ordering of a forum's post browse view
         pub default_sort: Option<ForumSortOrder>,
+
+        /// Whether to impose `default_sort` on every reader of this forum
+        /// (forum channels only). An info board is the case this exists for:
+        /// the operator wants one listing everybody sees, not a default each
+        /// member can sort away from.
+        pub force_sort: Option<bool>,
 
         /// Minutes of inactivity after which this thread / forum post
         /// auto-archives (threads and forum posts only;

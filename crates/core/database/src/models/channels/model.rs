@@ -224,6 +224,10 @@ auto_derived!(
             /// Default ordering of the post browse view
             #[serde(default)]
             default_sort: ForumSortOrder,
+            /// Whether `default_sort` is imposed on every reader rather than
+            /// being the order the browse view merely opens on
+            #[serde(skip_serializing_if = "crate::if_false", default)]
+            force_sort: bool,
             /// Auto-archive duration (minutes) applied to new posts that do
             /// not specify one (see `Channel::is_valid_auto_archive_minutes`,
             /// 0 = Never)
@@ -254,6 +258,8 @@ auto_derived!(
         LatestActivity,
         /// Most recently created post first
         CreationDate,
+        /// By post title, 0-9 then A-Z
+        Alphabetical,
     }
 
     #[derive(Default)]
@@ -306,6 +312,8 @@ auto_derived!(
         pub require_tag: Option<bool>,
         #[serde(skip_serializing_if = "Option::is_none")]
         pub default_sort: Option<ForumSortOrder>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub force_sort: Option<bool>,
         #[serde(skip_serializing_if = "Option::is_none")]
         pub auto_archive_minutes: Option<u32>,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -408,6 +416,7 @@ impl Channel {
                 tags: vec![],
                 require_tag: false,
                 default_sort: ForumSortOrder::default(),
+                force_sort: false,
                 default_auto_archive_minutes: Channel::default_forum_auto_archive_minutes(),
             },
         };
