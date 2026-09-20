@@ -20,13 +20,39 @@ fn activity_key(channel: &Channel) -> &str {
     }
 }
 
+/// Sort key for ordering posts alphabetically.
+///
+/// Names are not unique and the cursor pages on this key, so a bare name would
+/// let two identically named posts skip or repeat each other across a page
+/// boundary. Appending the id makes the key total. NUL sorts below every
+/// printable byte, so it can only break ties, never reorder distinct names.
+fn alphabetical_key(channel: &Channel) -> String {
+    let name = match channel {
+        Channel::Thread { name, .. } => name.as_str(),
+        _ => "",
+    };
+
+    format!("{}\0{}", name.to_lowercase(), channel.id())
+}
+
+/// How a forum's posts are ordered.
+#[derive(Clone, Copy, PartialEq)]
+enum ForumSort {
+    LatestActivity,
+    CreationDate,
+    Alphabetical,
+}
+
 /// # Fetch Forum Posts
 ///
 /// Fetch the posts of a forum channel.
 ///
-/// `sort` is `latest_activity` (default) or `creation_date`; `tag` filters to
+/// `sort` is `latest_activity` (default), `creation_date` or `alphabetical`;
+/// `alphabetical` lists A-Z (ascending), the other two list newest first.
+/// `tag` filters to
 /// posts carrying the given tag id; `archived=true` lists archived posts
-/// instead of active ones; `before` is a cursor on the sort key; `limit`
+/// instead of active ones; `before` is a cursor on the sort key, except under
+/// `alphabetical` where it is the last post's id; `limit`
 /// (1-100, default 50) bounds the page size. Pass `include_starters=true` to
 /// also receive each post's starter message (its id equals the post's id).
 #[openapi(tag = "Forums")]
@@ -53,17 +79,21 @@ pub async fn fetch_forum_posts(
         .await
         .throw_if_lacking_channel_permission(ChannelPermission::ViewChannel)?;
 
-    let by_creation = match sort.as_deref() {
-        None | Some("latest_activity") => false,
-        Some("creation_date") => true,
+    let order = match sort.as_deref() {
+        None | Some("latest_activity") => ForumSort::LatestActivity,
+        Some("creation_date") => ForumSort::CreationDate,
+        Some("alphabetical") => ForumSort::Alphabetical,
         _ => return Err(create_error!(InvalidProperty)),
     };
 
+    // A-Z reads in ascending order; the time-based orders read newest first.
+    let ascending = order == ForumSort::Alphabetical;
+
     let sort_key = |post: &Channel| -> String {
-        if by_creation {
-            post.id().to_string()
-        } else {
-            activity_key(post).to_string()
+        match order {
+            ForumSort::CreationDate => post.id().to_string(),
+            ForumSort::LatestActivity => activity_key(post).to_string(),
+            ForumSort::Alphabetical => alphabetical_key(post),
         }
     };
 
@@ -83,11 +113,37 @@ pub async fn fetch_forum_posts(
 
     // The cursor pages on the same key the list is sorted by, otherwise
     // pagination skips or duplicates entries.
-    if let Some(before) = before {
-        posts.retain(|post| sort_key(post) < before);
+    //
+    // For the time-based orders the caller passes that key directly, as it
+    // always has. For A-Z it passes the last post's *id* instead, which is
+    // resolved to a key here: the alphabetical key embeds a NUL separator and
+    // there is no safe way to spell that in a query string. Resolving it here
+    // also spares clients from having to reproduce the key format.
+    let cursor = match (&before, ascending) {
+        (Some(before), true) => posts
+            .iter()
+            .find(|post| post.id() == before)
+            .map(|post| sort_key(post)),
+        (Some(before), false) => Some(before.clone()),
+        (None, _) => None,
+    };
+
+    // An unresolvable A-Z cursor (the post was deleted, or the tag filter
+    // excludes it) yields the first page rather than an error, which is the
+    // same thing a stale time cursor does.
+    if let Some(cursor) = cursor {
+        if ascending {
+            posts.retain(|post| sort_key(post) > cursor);
+        } else {
+            posts.retain(|post| sort_key(post) < cursor);
+        }
     }
 
-    posts.sort_by(|a, b| sort_key(b).cmp(&sort_key(a)));
+    if ascending {
+        posts.sort_by(|a, b| sort_key(a).cmp(&sort_key(b)));
+    } else {
+        posts.sort_by(|a, b| sort_key(b).cmp(&sort_key(a)));
+    }
 
     let limit = limit.unwrap_or(50).clamp(1, 100) as usize;
     posts.truncate(limit);
@@ -196,5 +252,122 @@ mod test {
             .await;
         let page: v0::ForumPostsResponse = response.into_json().await.expect("page 1");
         assert_eq!(page.posts.len(), 2);
+    }
+    #[test]
+    fn posts_sort_alphabetically() {
+        crate::util::test::rt().block_on(posts_sort_alphabetically_case())
+    }
+
+    async fn posts_sort_alphabetically_case() {
+        let harness = TestHarness::new().await;
+        let (_, session, user) = harness.new_user().await;
+        let (mut server, _) = harness.new_server(&user).await;
+        let forum = Channel::create_server_channel(
+            &harness.db,
+            &mut server,
+            v0::DataCreateServerChannel {
+                channel_type: v0::LegacyServerChannelType::Forum,
+                name: "forum".to_string(),
+                ..Default::default()
+            },
+            true,
+        )
+        .await
+        .expect("forum created");
+
+        // Created out of alphabetical order and in mixed case, so a pass
+        // cannot be explained by creation order or by a case-sensitive sort
+        // that happens to agree.
+        for title in ["Cherry", "apple", "Banana"] {
+            let response = harness
+                .client
+                .post(format!("/channels/{}/posts", forum.id()))
+                .header(Header::new("x-session-token", session.token.to_string()))
+                .header(ContentType::JSON)
+                .body(
+                    json!({
+                        "title": title,
+                        "message": { "content": "starter" }
+                    })
+                    .to_string(),
+                )
+                .dispatch()
+                .await;
+            assert_eq!(response.status(), Status::Ok);
+        }
+
+        let names = |body: &v0::ForumPostsResponse| -> Vec<String> {
+            body.posts
+                .iter()
+                .map(|post| match post {
+                    v0::Channel::Thread { name, .. } => name.clone(),
+                    other => panic!("expected thread, got {:?}", other),
+                })
+                .collect()
+        };
+
+        let response = harness
+            .client
+            .get(format!("/channels/{}/posts?sort=alphabetical", forum.id()))
+            .header(Header::new("x-session-token", session.token.to_string()))
+            .dispatch()
+            .await;
+        assert_eq!(response.status(), Status::Ok);
+        let body: v0::ForumPostsResponse = response.into_json().await.expect("alphabetical");
+        let alphabetical = names(&body);
+        assert_eq!(alphabetical, vec!["apple", "Banana", "Cherry"]);
+
+        // Control: the default order is newest-first, so it must NOT match.
+        // Without this an always-alphabetical bug would pass the assert above.
+        let response = harness
+            .client
+            .get(format!("/channels/{}/posts", forum.id()))
+            .header(Header::new("x-session-token", session.token.to_string()))
+            .dispatch()
+            .await;
+        let body: v0::ForumPostsResponse = response.into_json().await.expect("default order");
+        assert_ne!(names(&body), alphabetical);
+
+        // Paging A-Z: the cursor is the last post's id, and the next page must
+        // continue rather than repeat.
+        let response = harness
+            .client
+            .get(format!(
+                "/channels/{}/posts?sort=alphabetical&limit=2",
+                forum.id()
+            ))
+            .header(Header::new("x-session-token", session.token.to_string()))
+            .dispatch()
+            .await;
+        let body: v0::ForumPostsResponse = response.into_json().await.expect("page 1");
+        let page_one = names(&body);
+        assert_eq!(page_one, vec!["apple", "Banana"]);
+
+        let last_id = match body.posts.last().expect("a second post") {
+            v0::Channel::Thread { id, .. } => id.clone(),
+            other => panic!("expected thread, got {:?}", other),
+        };
+
+        let response = harness
+            .client
+            .get(format!(
+                "/channels/{}/posts?sort=alphabetical&before={}",
+                forum.id(),
+                last_id
+            ))
+            .header(Header::new("x-session-token", session.token.to_string()))
+            .dispatch()
+            .await;
+        let body: v0::ForumPostsResponse = response.into_json().await.expect("page 2");
+        assert_eq!(names(&body), vec!["Cherry"]);
+
+        // An unknown sort is rejected rather than silently defaulted.
+        let response = harness
+            .client
+            .get(format!("/channels/{}/posts?sort=nonsense", forum.id()))
+            .header(Header::new("x-session-token", session.token.to_string()))
+            .dispatch()
+            .await;
+        assert_ne!(response.status(), Status::Ok);
     }
 }
