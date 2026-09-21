@@ -303,6 +303,69 @@ impl Server {
         }
     }
 
+    /// Allowed AFK idle timeouts, in SECONDS.
+    ///
+    /// 1/5/15/30/60 minutes, matching Discord's choices. A closed preset set
+    /// rather than a free range: the client renders a select from it, and no
+    /// caller can ask for a 1-second timeout that would have a sweep move
+    /// every member on every tick.
+    pub const AFK_TIMEOUT_CHOICES: [u32; 5] = [60, 300, 900, 1800, 3600];
+
+    /// Resolve and validate a proposed AFK channel for this server.
+    ///
+    /// Shared by every writer of `afk_channel_id` so the three conditions live
+    /// in exactly one place. Returns the resolved channel because callers need
+    /// it to drive `sync_voice_permissions` on the incoming designation.
+    ///
+    /// Fails closed on all three cases:
+    /// - the id does not resolve -> `UnknownChannel`
+    /// - the channel is not in this server, including a channel with no server
+    ///   at all (DM, group, saved messages) -> `UnknownChannel`, matching the
+    ///   cross-server check on `member_edit`'s move path
+    /// - the channel is not a voice channel -> `InvalidProperty`
+    ///
+    /// There is no `VoiceChannel` type - migration 46 removed it. A voice
+    /// channel is a `TextChannel` carrying `voice: Some(..)`, and
+    /// `Channel::voice()` is the only discriminator. It also returns `None`
+    /// when `voice.disabled` is set, which is the behaviour we want here: a
+    /// channel with calling turned off must not be designated AFK.
+    ///
+    /// This validates at write time only. The pointer can still go stale
+    /// afterwards (the channel can be deleted, or lose its voice information),
+    /// so every reader must resolve-then-check rather than trust it.
+    pub async fn validate_afk_channel(
+        db: &Database,
+        server_id: &str,
+        channel_id: &str,
+    ) -> Result<Channel> {
+        let channel = db
+            .fetch_channel(channel_id)
+            .await
+            .map_err(|_| create_error!(UnknownChannel))?;
+
+        if channel.server().is_none_or(|id| id != server_id) {
+            return Err(create_error!(UnknownChannel));
+        }
+
+        if channel.voice().is_none() {
+            return Err(create_error!(InvalidProperty));
+        }
+
+        Ok(channel)
+    }
+
+    /// Validate a proposed AFK idle timeout against `AFK_TIMEOUT_CHOICES`.
+    ///
+    /// Anything outside the preset set is rejected; there is no clamping, so a
+    /// bad value never lands as a silently different one.
+    pub fn validate_afk_timeout(timeout: u32) -> Result<()> {
+        if Server::AFK_TIMEOUT_CHOICES.contains(&timeout) {
+            Ok(())
+        } else {
+            Err(create_error!(InvalidProperty))
+        }
+    }
+
     /// Ordered roles list
     pub fn ordered_roles(&self) -> Vec<(String, Role)> {
         let mut ordered_roles = self.roles.clone().into_iter().collect::<Vec<_>>();

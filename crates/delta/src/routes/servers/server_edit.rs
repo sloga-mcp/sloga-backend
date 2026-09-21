@@ -2,7 +2,8 @@ use std::collections::HashSet;
 
 use revolt_database::{
     util::{permissions::DatabasePermissionQuery, reference::Reference},
-    Database, File, PartialServer, User, ValidatedTicket,
+    voice::{sync_voice_permissions, VoiceClient},
+    Database, File, PartialServer, Server, User, ValidatedTicket,
 };
 use revolt_models::v0;
 use revolt_permissions::{calculate_server_permissions, ChannelPermission};
@@ -17,6 +18,7 @@ use validator::Validate;
 #[patch("/<target>", data = "<data>")]
 pub async fn edit(
     db: &State<Database>,
+    voice_client: &State<VoiceClient>,
     user: User,
     target: Reference<'_>,
     data: Json<v0::DataEditServer>,
@@ -46,6 +48,8 @@ pub async fn edit(
         && data.discoverable.is_none()
         && data.discovery_requested.is_none()
         && data.voice_region.is_none()
+        && data.afk_channel_id.is_none()
+        && data.afk_timeout.is_none()
         && data.owner.is_none()
         && data.remove.is_empty()
     {
@@ -57,6 +61,8 @@ pub async fn edit(
         || data.system_messages.is_some()
         || data.analytics.is_some()
         || data.voice_region.is_some()
+        || data.afk_channel_id.is_some()
+        || data.afk_timeout.is_some()
         || !data.remove.is_empty()
     {
         permissions.throw_if_lacking_channel_permission(ChannelPermission::ManageServer)?;
@@ -75,6 +81,30 @@ pub async fn edit(
             return Err(create_error!(UnknownNode));
         }
     }
+
+    // The AFK designation must resolve to a voice channel in THIS server.
+    // Validated here, before the destructure, mirroring the voice_region check
+    // directly above. The resolved channel is kept so the A5 re-sync at the end
+    // of this route does not have to fetch it a second time.
+    let incoming_afk_channel = if let Some(afk_channel_id) = &data.afk_channel_id {
+        Some(Server::validate_afk_channel(db, &server.id, afk_channel_id).await?)
+    } else {
+        None
+    };
+
+    // Idle timeout is a closed preset set, in SECONDS. Never clamped, so a
+    // rejected value can never land as a silently different one.
+    if let Some(afk_timeout) = data.afk_timeout {
+        Server::validate_afk_timeout(afk_timeout)?;
+    }
+
+    // Captured BEFORE the update mutates `server`, so the A5 re-sync below can
+    // still reach the OUTGOING channel. Note clearing never travels in the
+    // partial: `Server` derives OptionalStruct with opt_some_priority and these
+    // fields are already Option<T>, so the generated assigner is a `replace()`
+    // and writing `afk_channel_id: None` into the partial is a silent no-op.
+    // A clear must arrive as FieldsServer::AfkChannel in `remove`.
+    let previous_afk_channel_id = server.afk_channel_id.clone();
 
     // Check we are the server owner or privileged if changing sensitive fields
     if data.owner.is_some() {
@@ -128,6 +158,8 @@ pub async fn edit(
         discovery_requested,
         analytics,
         voice_region,
+        afk_channel_id,
+        afk_timeout,
         owner,
         remove,
     } = data;
@@ -152,6 +184,8 @@ pub async fn edit(
         discovery_requested,
         analytics,
         voice_region,
+        afk_channel_id,
+        afk_timeout,
         owner: owner.clone(),
         ..Default::default()
     };
@@ -225,6 +259,38 @@ pub async fn edit(
     server
         .update(db, partial, remove.into_iter().map(Into::into).collect())
         .await?;
+
+    // A5: re-sync voice permissions on BOTH sides of a designation change.
+    // Without this, flagging an already-occupied channel is inert until some
+    // unrelated role or permission edit happens to trigger a sync.
+    //
+    // `role_id: None` means every member currently in the room, which is what a
+    // server-level designation change affects.
+    //
+    // This is a no-op for AFK purposes until the publish gate lands:
+    // `sync_user_voice_permissions` derives its state from permission bits, and
+    // the AFK designation is deliberately kept outside the permission system.
+    // Wired now so the gate is live the moment it exists.
+
+    // Outgoing - the channel that is no longer AFK. Resolve-then-check: the
+    // stored pointer may already be stale (channel deleted, or it has since
+    // lost its voice information) and the designation change is already
+    // committed, so a channel that will not resolve is skipped rather than
+    // turned into a late failure on a write that already succeeded.
+    if let Some(previous) = &previous_afk_channel_id {
+        if server.afk_channel_id.as_ref() != Some(previous) {
+            if let Ok(channel) = db.fetch_channel(previous).await {
+                sync_voice_permissions(db, voice_client, &channel, Some(&server), None).await?;
+            }
+        }
+    }
+
+    // Incoming - already resolved and validated above.
+    if let Some(channel) = &incoming_afk_channel {
+        if previous_afk_channel_id.as_deref() != Some(channel.id()) {
+            sync_voice_permissions(db, voice_client, channel, Some(&server), None).await?;
+        }
+    }
 
     Ok(Json(server.into()))
 }
