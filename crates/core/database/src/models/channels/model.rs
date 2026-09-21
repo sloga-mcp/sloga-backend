@@ -1404,6 +1404,26 @@ impl Channel {
         // injecting crosspost copies.
         crate::ChannelFollow::cleanup_for_deleted_channel(db, &id).await?;
 
+        // Cascade: a channel that is its server's designated AFK channel takes
+        // the designation with it. The pointer lives on the SERVER document, so
+        // delete_channel has no way to notice; left behind it names a channel
+        // that no longer exists, and the idle sweep would move members into
+        // nothing. Scoped to TextChannel because that is the only variant that
+        // can carry voice information, and so the only one that can ever be
+        // designated; the helper no-ops unless the pointer is this channel.
+        //
+        // Deliberately ABOVE the driver split: Reference::delete_channel does
+        // almost none of MongoDb::delete_channel's cleanup (it does not even
+        // pull the id out of Server.channels), so a driver-level clear would
+        // pass under TEST_DB=MONGODB and silently do nothing under REFERENCE.
+        //
+        // Runs before the ChannelDelete broadcast and before db.delete_channel,
+        // like the cascades above, so a failure aborts the deletion without
+        // having announced it.
+        if let Channel::TextChannel { server, .. } = self {
+            Server::clear_afk_channel_if_pointing_at(db, server, &id).await?;
+        }
+
         EventV1::ChannelDelete { id: id.clone() }.p(id).await;
         // TODO: missing functionality:
         // - group invites

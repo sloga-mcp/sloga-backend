@@ -259,6 +259,7 @@ mod test {
                     disabled: false,
                 }),
                 announcement: None,
+                ..Default::default()
             },
             true,
         )

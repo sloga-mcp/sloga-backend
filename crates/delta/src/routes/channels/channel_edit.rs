@@ -1,7 +1,7 @@
 use revolt_database::{
     util::{permissions::DatabasePermissionQuery, reference::Reference},
     voice::{delete_voice_channel, UserVoiceChannel, VoiceClient},
-    Channel, Database, File, PartialChannel, SystemMessage, User, AMQP,
+    Channel, Database, File, PartialChannel, Server, SystemMessage, User, AMQP,
 };
 use revolt_models::v0;
 use revolt_permissions::{calculate_channel_permissions, ChannelPermission};
@@ -546,6 +546,26 @@ pub async fn edit(
         .await?;
 
     if channel.voice().is_none() {
+        // Pointer integrity: this PATCH may have just removed the channel's
+        // voice information (remove: ["Voice"]) or disabled calling on it
+        // (voice.disabled) - Channel::voice() returns None for both - which
+        // tears the room down while Server.afk_channel_id may still point
+        // here. This route never touches the server document, so without the
+        // clear the designation survives as a pointer to what is now a plain
+        // text channel. This block also runs for channels that never had
+        // voice, so the clear is conditional: the helper compares the server's
+        // current pointer and no-ops unless it is this channel.
+        //
+        // Ordered BEFORE the teardown on purpose. channel.update above has
+        // already committed the voice removal, so the stale window is open
+        // from that point and clearing first closes it as early as possible.
+        // The reverse ordering would, on a teardown failure, leave the
+        // designation pointing at a channel whose room is already destroyed -
+        // exactly the defect being closed.
+        if let Channel::TextChannel { server, id, .. } = &channel {
+            Server::clear_afk_channel_if_pointing_at(db, server, id).await?;
+        }
+
         delete_voice_channel(db, voice_client, &UserVoiceChannel::from_channel(&channel)).await?;
     }
 

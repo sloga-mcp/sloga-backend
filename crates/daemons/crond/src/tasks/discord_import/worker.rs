@@ -704,6 +704,10 @@ async fn create_channels(
                 spoiler: None,
                 voice,
                 announcement,
+                // Discord's `afk_channel_id` is a guild-level pointer, not a
+                // per-channel flag, so there is nothing per-channel to map here
+                // and the import never designates an AFK channel.
+                ..Default::default()
             },
             // Don't let the model push ids / emit ChannelCreate: the server
             // document is written once in step 4, and nobody is subscribed to

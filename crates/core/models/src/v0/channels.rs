@@ -590,6 +590,29 @@ auto_derived!(
         /// Whether this text channel is created as an announcement channel
         #[serde(skip_serializing_if = "Option::is_none")]
         pub announcement: Option<bool>,
+
+        /// Whether this channel is created as this server's AFK voice channel
+        ///
+        /// Voice channels only. A `true` here on a Text or Forum channel is
+        /// rejected rather than silently dropped. Requires `ManageServer` on
+        /// top of the create-channel route's `ManageChannel`, because the
+        /// designation is stored on the SERVER (`Server.afk_channel_id`), not
+        /// on the channel.
+        ///
+        /// This is a route-level field. The DB-layer
+        /// `Channel::create_server_channel` never reads it, so every other
+        /// caller of that function silently ignores it.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub afk: Option<bool>,
+
+        /// Idle timeout in SECONDS before a member is moved to this channel
+        ///
+        /// Constrained to `Server::AFK_TIMEOUT_CHOICES`. Only read when
+        /// `afk` is `true`; supplied on its own it is ignored, so a request
+        /// that does not ask for the AFK designation behaves exactly as it did
+        /// before this field existed.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub afk_timeout: Option<u32>,
     }
 
     /// New default permissions

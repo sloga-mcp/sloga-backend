@@ -263,6 +263,7 @@ impl TestHarness {
                 spoiler: None,
                 voice: None,
                 announcement: None,
+                ..Default::default()
             },
             true,
         )

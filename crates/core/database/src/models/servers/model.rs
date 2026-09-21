@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 
 use revolt_models::v0::{self, DataCreateServerChannel};
 use revolt_permissions::{OverrideField, DEFAULT_PERMISSION_SERVER};
-use revolt_result::Result;
+use revolt_result::{ErrorType, Result};
 use ulid::Ulid;
 
 use crate::{events::client::EventV1, Channel, Database, File, User};
@@ -364,6 +364,65 @@ impl Server {
         } else {
             Err(create_error!(InvalidProperty))
         }
+    }
+
+    /// Clear this server's AFK designation, but only if it currently points at
+    /// `channel_id`.
+    ///
+    /// D1 stores the AFK channel as a server-level pointer, which is what makes
+    /// "exactly one AFK channel per server" unrepresentable rather than merely
+    /// enforced by code. The accepted cost of that shape is that routes which
+    /// never touch the server document can invalidate the pointer: deleting the
+    /// channel, or removing/disabling its voice information. Both of those
+    /// paths funnel through here so the "is this still ours?" comparison and
+    /// the clear itself live in exactly one place.
+    ///
+    /// The clear MUST go through `FieldsServer::AfkChannel` /
+    /// `FieldsServer::AfkTimeout` in the `remove` vector. `Server` is declared
+    /// inside `auto_derived_partial!` with `opt_some_priority`, and because
+    /// `afk_channel_id` is already an `Option<T>` the generated partial field
+    /// stays `Option<T>` and the generated assigner reads
+    /// `if let Some(v) = partial.afk_channel_id { self.afk_channel_id.replace(v) }`.
+    /// Writing `afk_channel_id: None` into a `PartialServer` is therefore a
+    /// silent no-op. `Server::update` also carries `remove` into the
+    /// `EventV1::ServerUpdate` `clear` array, so going through `remove` is what
+    /// fans the clear out to clients. This is the `voice_region` precedent.
+    ///
+    /// The timeout is cleared alongside the channel: it only has meaning
+    /// relative to a destination, so leaving it set would orphan it.
+    ///
+    /// Takes ids rather than a `&Server` or `&mut Server` because neither
+    /// caller has a server in hand - `Channel::delete` and `channel_edit` both
+    /// hold only a channel - and `Server::update` needs an owned `&mut Server`
+    /// anyway. A borrowed parameter would force both callers to do the fetch
+    /// themselves and then repeat the equality check.
+    ///
+    /// A server that no longer resolves is a no-op rather than an error: there
+    /// is no pointer left to go stale, and letting a concurrently deleted
+    /// server abort a channel deletion would be a new failure mode, not a
+    /// safety gain. Every other database error still propagates.
+    pub async fn clear_afk_channel_if_pointing_at(
+        db: &Database,
+        server_id: &str,
+        channel_id: &str,
+    ) -> Result<()> {
+        let mut server = match db.fetch_server(server_id).await {
+            Ok(server) => server,
+            Err(error) if matches!(error.error_type, ErrorType::NotFound) => return Ok(()),
+            Err(error) => return Err(error),
+        };
+
+        if server.afk_channel_id.as_deref() != Some(channel_id) {
+            return Ok(());
+        }
+
+        server
+            .update(
+                db,
+                PartialServer::default(),
+                vec![FieldsServer::AfkChannel, FieldsServer::AfkTimeout],
+            )
+            .await
     }
 
     /// Ordered roles list
