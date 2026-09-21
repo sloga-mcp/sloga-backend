@@ -707,7 +707,16 @@ async fn create_channels(
                 // Discord's `afk_channel_id` is a guild-level pointer, not a
                 // per-channel flag, so there is nothing per-channel to map here
                 // and the import never designates an AFK channel.
-                ..Default::default()
+                //
+                // Spelled out rather than covered by `..Default::default()`.
+                // This literal is exhaustive on purpose: it is the tripwire
+                // that forces whoever adds a field to
+                // `DataCreateServerChannel` to decide what the Discord import
+                // should do with it, instead of silently inheriting a default.
+                // A spread here would have made that decision invisibly, and
+                // the decision is the point.
+                afk: None,
+                afk_timeout: None,
             },
             // Don't let the model push ids / emit ChannelCreate: the server
             // document is written once in step 4, and nobody is subscribed to

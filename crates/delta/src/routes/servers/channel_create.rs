@@ -49,16 +49,10 @@ pub async fn create_server_channel(
     if designate_afk {
         permissions.throw_if_lacking_channel_permission(ChannelPermission::ManageServer)?;
 
-        // There is no `VoiceChannel` type - a voice channel is a `TextChannel`
-        // carrying `voice: Some(..)`, and only the `Voice` arm of
-        // `create_server_channel` produces one. The `Voice` arm drops
-        // `announcement` silently as the precedent for "this flag applies to
-        // one flavour only"; we mirror the intent but reject loudly, because
-        // this control was asked for explicitly and a silent drop would leave
-        // the caller believing the server had an AFK channel when it does not.
-        if !matches!(data.channel_type, v0::LegacyServerChannelType::Voice) {
-            return Err(create_error!(InvalidProperty));
-        }
+        // Same rule `Server::validate_afk_channel` applies to an existing
+        // channel, evaluated against the request body because the channel does
+        // not exist yet. See `validate_afk_creation_shape`.
+        validate_afk_creation_shape(&data)?;
 
         // Closed preset set, in SECONDS, shared with `server_edit`. Never
         // clamped, so a rejected value can never land as a silently different
@@ -71,11 +65,16 @@ pub async fn create_server_channel(
     let channel = Channel::create_server_channel(db, &mut server, data, true).await?;
 
     if designate_afk {
-        // `Server::validate_afk_channel` is deliberately NOT called here. It
-        // exists to prove an id resolves to a voice channel in this server;
-        // we just created this channel through the `Voice` arm against this
-        // very server, so both properties hold by construction and a re-fetch
-        // would only re-read what we already hold.
+        // `Server::validate_afk_channel` is deliberately NOT called here, but
+        // its rule IS enforced - up front, by `validate_afk_creation_shape`,
+        // against the request body. Calling the resolving helper at this point
+        // would give the same verdict one step too late: the channel is already
+        // persisted and already announced, so a rejection here would leave the
+        // orphan that checking up front exists to prevent (audit MEDIUM-9).
+        //
+        // Only the "is it in this server" half holds by construction. The
+        // "is it a voice channel" half does not - see
+        // `validate_afk_creation_shape` for why.
         //
         // This is a SECOND `ServerUpdate`: `create_server_channel` already
         // emitted one for `server.channels`. Folding the two into one would
@@ -105,4 +104,127 @@ pub async fn create_server_channel(
     }
 
     Ok(Json(channel.into()))
+}
+
+/// Would the channel this request is about to create actually be a valid AFK
+/// target?
+///
+/// `Server::validate_afk_channel` is the shared rule for an *existing*
+/// channel: it must resolve, it must be in this server, and it must satisfy
+/// `Channel::voice().is_some()`. Creation cannot call it - there is no channel
+/// to resolve yet, and calling it after the create is exactly what audit
+/// MEDIUM-9 forbids - so the same rule is evaluated against the request body
+/// instead, before anything is persisted.
+///
+/// The "in this server" half genuinely does hold by construction:
+/// `Channel::create_server_channel` only ever builds against the server this
+/// route already resolved.
+///
+/// The "is a voice channel" half does NOT hold by construction, which an
+/// earlier revision of this route asserted in a comment and skipped the check
+/// on. There is no `VoiceChannel` type; a voice channel is a `TextChannel`
+/// carrying `voice: Some(..)`, and `Channel::voice()` (channels/model.rs)
+/// returns `None` when that `VoiceInformation` has `disabled: true`. The
+/// `Voice` arm of `create_server_channel` reads
+/// `voice: Some(data.voice.unwrap_or_default().into())` - it *preserves* a
+/// client-supplied `disabled: true`. So a body of
+/// `{"type":"Voice","afk":true,"voice":{"disabled":true}}` created a channel
+/// the repo's own discriminator classifies as NOT a voice channel, and
+/// designated it AFK anyway - while `server_edit` rejected the identical
+/// designation with `InvalidProperty`. Two writers, two validity rules, the
+/// weaker one on the create path. Nothing downstream rescues it either: the
+/// pointer-integrity clear in `channel_edit` fires on a de-voicing edit, and
+/// for a channel born disabled no such edit ever happens.
+///
+/// `InvalidProperty` on both arms, matching the sibling rejection inside
+/// `Server::validate_afk_channel`. Rejected loudly rather than silently
+/// dropped (which is how the `Voice` arm treats `announcement`): the caller
+/// asked for this control explicitly, and a silent drop would leave them
+/// believing the server has an AFK channel when it does not.
+fn validate_afk_creation_shape(data: &v0::DataCreateServerChannel) -> Result<()> {
+    if !matches!(data.channel_type, v0::LegacyServerChannelType::Voice) {
+        return Err(create_error!(InvalidProperty));
+    }
+
+    if data.voice.as_ref().is_some_and(|voice| voice.disabled) {
+        return Err(create_error!(InvalidProperty));
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_afk_creation_shape;
+    use revolt_models::v0;
+    use revolt_result::ErrorType;
+
+    fn data(
+        channel_type: v0::LegacyServerChannelType,
+        voice: Option<v0::VoiceInformation>,
+    ) -> v0::DataCreateServerChannel {
+        v0::DataCreateServerChannel {
+            channel_type,
+            name: "AFK".to_string(),
+            afk: Some(true),
+            voice,
+            ..Default::default()
+        }
+    }
+
+    /// Wave-2 audit finding 1 (HIGH). Regression test.
+    ///
+    /// The `Voice` arm of `create_server_channel` preserves a client-supplied
+    /// `voice.disabled`, and `Channel::voice()` returns `None` for a disabled
+    /// one - so this body used to produce a channel that is not a voice
+    /// channel and designate it AFK regardless. `server_edit` rejects the
+    /// identical designation with `InvalidProperty`; so does this now.
+    #[test]
+    fn afk_rejects_a_disabled_voice_channel() {
+        let error = validate_afk_creation_shape(&data(
+            v0::LegacyServerChannelType::Voice,
+            Some(v0::VoiceInformation {
+                max_users: None,
+                disabled: true,
+            }),
+        ))
+        .expect_err("a disabled voice channel is not a voice channel");
+
+        assert!(matches!(error.error_type, ErrorType::InvalidProperty));
+    }
+
+    /// The enabled and absent cases must still be accepted, or the rejection
+    /// above would read as a pass while having broken the feature outright.
+    #[test]
+    fn afk_accepts_an_enabled_voice_channel() {
+        assert!(validate_afk_creation_shape(&data(
+            v0::LegacyServerChannelType::Voice,
+            Some(v0::VoiceInformation {
+                max_users: Some(5),
+                disabled: false,
+            }),
+        ))
+        .is_ok());
+
+        assert!(
+            validate_afk_creation_shape(&data(v0::LegacyServerChannelType::Voice, None)).is_ok()
+        );
+    }
+
+    /// Behaviour pin - this arm shipped in wave 2 and is unchanged here. Only
+    /// the `Voice` arm of `create_server_channel` can produce a channel with
+    /// voice information, so `afk: true` on a Text or Forum channel is
+    /// rejected rather than silently dropped.
+    #[test]
+    fn afk_rejects_non_voice_channel_types() {
+        for channel_type in [
+            v0::LegacyServerChannelType::Text,
+            v0::LegacyServerChannelType::Forum,
+        ] {
+            let error = validate_afk_creation_shape(&data(channel_type, None))
+                .expect_err("only the Voice arm can produce a voice channel");
+
+            assert!(matches!(error.error_type, ErrorType::InvalidProperty));
+        }
+    }
 }

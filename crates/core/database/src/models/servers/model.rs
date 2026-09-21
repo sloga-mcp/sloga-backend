@@ -388,8 +388,26 @@ impl Server {
     /// `EventV1::ServerUpdate` `clear` array, so going through `remove` is what
     /// fans the clear out to clients. This is the `voice_region` precedent.
     ///
-    /// The timeout is cleared alongside the channel: it only has meaning
-    /// relative to a destination, so leaving it set would orphan it.
+    /// THE RULE FOR THE PAIR, stated once here because four writers touch it
+    /// and they used to disagree: **`afk_timeout` is meaningless without
+    /// `afk_channel_id`.** It names how long a member idles before being moved
+    /// to the AFK channel, so with no channel designated there is nothing for
+    /// it to mean. Concretely:
+    ///
+    /// - clearing the channel clears the timeout - this helper, and the
+    ///   `remove: ["AfkChannel"]` path in `server_edit`, which appends
+    ///   `AfkTimeout` to `remove` for exactly this reason;
+    /// - setting a timeout requires a channel to be designated once the edit
+    ///   lands, either already on the server or arriving in the same request -
+    ///   `server_edit::validate_afk_edit` rejects the rest with
+    ///   `InvalidProperty`;
+    /// - `channel_create` with `afk: true` always designates a channel, so any
+    ///   timeout it writes (or any timeout the server already carried) has a
+    ///   destination by construction.
+    ///
+    /// Nothing enforces the rule at the database layer - `PartialServer` can
+    /// still carry a timeout on its own - so it is an invariant the route
+    /// layer maintains, not one the type system holds.
     ///
     /// Takes ids rather than a `&Server` or `&mut Server` because neither
     /// caller has a server in hand - `Channel::delete` and `channel_edit` both
@@ -606,9 +624,14 @@ impl SystemMessageChannels {
 
 #[cfg(test)]
 mod tests {
+    use revolt_models::v0::{self, DataCreateServer, DataCreateServerChannel};
     use revolt_permissions::{calculate_server_permissions, ChannelPermission};
+    use revolt_result::ErrorType;
 
-    use crate::{fixture, util::permissions::DatabasePermissionQuery};
+    use crate::{
+        fixture, util::permissions::DatabasePermissionQuery, Channel, Database, FieldsChannel,
+        PartialChannel, PartialServer, Server, User,
+    };
 
     #[tokio::test]
     async fn permissions() {
@@ -633,6 +656,339 @@ mod tests {
             assert!(!calculate_server_permissions(&mut query)
                 .await
                 .has_channel_permission(ChannelPermission::BanMembers));
+        });
+    }
+
+    // ---------------------------------------------------------------------
+    // AFK designation.
+    //
+    // Wave 2 shipped the writers and the two cascades with no tests at all.
+    // These pin the rules that have no other guard, in particular the delete
+    // cascade: the plan put `Server::clear_afk_channel_if_pointing_at` ABOVE
+    // the driver split precisely because `Reference::delete_channel` does
+    // almost none of `MongoDb::delete_channel`'s cleanup, and a future
+    // refactor pushing the clear back down into `ops/mongodb.rs` would pass on
+    // Mongo and silently do nothing on Reference. These run under
+    // TEST_DB=REFERENCE, which is the half that would break.
+    // ---------------------------------------------------------------------
+
+    async fn new_server(db: &Database, owner_name: &str) -> Server {
+        let owner = User::create(db, owner_name.to_string(), None, None)
+            .await
+            .expect("`User`");
+
+        Server::create(
+            db,
+            DataCreateServer {
+                name: "Server".to_string(),
+                description: None,
+                nsfw: None,
+            },
+            &owner,
+            false,
+        )
+        .await
+        .expect("`Server`")
+        .0
+    }
+
+    async fn new_channel(
+        db: &Database,
+        server: &mut Server,
+        name: &str,
+        channel_type: v0::LegacyServerChannelType,
+        voice: Option<v0::VoiceInformation>,
+    ) -> Channel {
+        Channel::create_server_channel(
+            db,
+            server,
+            DataCreateServerChannel {
+                channel_type,
+                name: name.to_string(),
+                voice,
+                ..Default::default()
+            },
+            true,
+        )
+        .await
+        .expect("`Channel`")
+    }
+
+    async fn designate(db: &Database, server: &mut Server, channel_id: &str) {
+        server
+            .update(
+                db,
+                PartialServer {
+                    afk_channel_id: Some(channel_id.to_string()),
+                    afk_timeout: Some(300),
+                    ..Default::default()
+                },
+                vec![],
+            )
+            .await
+            .expect("designation");
+    }
+
+    /// `Server::validate_afk_channel` is the shared rule for every writer of
+    /// `afk_channel_id`. All four rejection arms, plus the accepting case so a
+    /// blanket refusal cannot read as a pass.
+    ///
+    /// The DM case is why the checks are ordered server-first: `Channel::voice()`
+    /// returns `Some` for a DM (they are always callable), so a voice-first
+    /// check would wave a DM straight through. Asserted below rather than
+    /// assumed.
+    #[tokio::test]
+    async fn validate_afk_channel_rejects_everything_that_is_not_ours() {
+        database_test!(|db| async move {
+            let mut server = new_server(&db, "AfkValidateOwner").await;
+            let mut other_server = new_server(&db, "AfkValidateOther").await;
+
+            let voice = new_channel(
+                &db,
+                &mut server,
+                "Voice",
+                v0::LegacyServerChannelType::Voice,
+                None,
+            )
+            .await;
+            let text = new_channel(
+                &db,
+                &mut server,
+                "Text",
+                v0::LegacyServerChannelType::Text,
+                None,
+            )
+            .await;
+            let disabled = new_channel(
+                &db,
+                &mut server,
+                "Disabled",
+                v0::LegacyServerChannelType::Voice,
+                Some(v0::VoiceInformation {
+                    max_users: None,
+                    disabled: true,
+                }),
+            )
+            .await;
+            let elsewhere = new_channel(
+                &db,
+                &mut other_server,
+                "Voice",
+                v0::LegacyServerChannelType::Voice,
+                None,
+            )
+            .await;
+
+            let a = User::create(&db, "AfkDmOne".to_string(), None, None)
+                .await
+                .expect("`User`");
+            let b = User::create(&db, "AfkDmTwo".to_string(), None, None)
+                .await
+                .expect("`User`");
+            let dm = Channel::create_dm(&db, &a, &b).await.expect("`Channel`");
+
+            // The premise of the check ORDER: a DM is a callable channel, so
+            // only the "is it in this server" test can reject it.
+            assert!(dm.voice().is_some());
+            assert!(dm.server().is_none());
+
+            // An id that does not resolve at all.
+            let error = Server::validate_afk_channel(&db, &server.id, "01ARZ3NDEKTSV4RRFFQ69G5FAV")
+                .await
+                .expect_err("an unknown id is not a designation");
+            assert!(matches!(error.error_type, ErrorType::UnknownChannel));
+
+            // A DM - no server at all.
+            let error = Server::validate_afk_channel(&db, &server.id, dm.id())
+                .await
+                .expect_err("a DM is not in any server");
+            assert!(matches!(error.error_type, ErrorType::UnknownChannel));
+
+            // A voice channel in a DIFFERENT server.
+            let error = Server::validate_afk_channel(&db, &server.id, elsewhere.id())
+                .await
+                .expect_err("a channel in another server is not ours to designate");
+            assert!(matches!(error.error_type, ErrorType::UnknownChannel));
+
+            // A plain text channel in this server.
+            let error = Server::validate_afk_channel(&db, &server.id, text.id())
+                .await
+                .expect_err("a text channel has no voice information");
+            assert!(matches!(error.error_type, ErrorType::InvalidProperty));
+
+            // A voice channel in this server with calling turned off.
+            // `Channel::voice()` returns None for a disabled one, which is the
+            // whole discriminator.
+            assert!(disabled.voice().is_none());
+            let error = Server::validate_afk_channel(&db, &server.id, disabled.id())
+                .await
+                .expect_err("a disabled voice channel is not a voice channel");
+            assert!(matches!(error.error_type, ErrorType::InvalidProperty));
+
+            // And the one that should work.
+            let resolved = Server::validate_afk_channel(&db, &server.id, voice.id())
+                .await
+                .expect("a voice channel in this server is a valid designation");
+            assert_eq!(resolved.id(), voice.id());
+        });
+    }
+
+    /// The timeout preset set is closed and never clamped, so a rejected value
+    /// can never land as a silently different one.
+    #[tokio::test]
+    async fn validate_afk_timeout_accepts_only_the_presets() {
+        for timeout in Server::AFK_TIMEOUT_CHOICES {
+            assert!(Server::validate_afk_timeout(timeout).is_ok());
+        }
+
+        // Zero, a value just off a preset, and something absurd.
+        for timeout in [0, 1, 59, 61, 299, 3601, u32::MAX] {
+            let error = Server::validate_afk_timeout(timeout)
+                .expect_err("out-of-set timeouts are rejected, not clamped");
+            assert!(matches!(error.error_type, ErrorType::InvalidProperty));
+        }
+    }
+
+    /// Delete cascade. `Server.afk_channel_id` lives on the server document,
+    /// so `delete_channel` has no way to notice it; left behind it names a
+    /// channel that no longer exists. The clear sits in `Channel::delete`,
+    /// above the driver split - this test is what stops it being pushed back
+    /// down into `MongoDb::delete_channel`, where REFERENCE would silently
+    /// lose it.
+    ///
+    /// The timeout goes with the channel: it is meaningless on its own.
+    #[tokio::test]
+    async fn deleting_the_afk_channel_clears_the_designation() {
+        database_test!(|db| async move {
+            let mut server = new_server(&db, "AfkDeleteOwner").await;
+            let voice = new_channel(
+                &db,
+                &mut server,
+                "AFK",
+                v0::LegacyServerChannelType::Voice,
+                None,
+            )
+            .await;
+
+            designate(&db, &mut server, voice.id()).await;
+            let fetched = db.fetch_server(&server.id).await.expect("`Server`");
+            assert_eq!(fetched.afk_channel_id.as_deref(), Some(voice.id()));
+            assert_eq!(fetched.afk_timeout, Some(300));
+
+            voice.delete(&db).await.expect("delete");
+
+            let fetched = db.fetch_server(&server.id).await.expect("`Server`");
+            assert_eq!(fetched.afk_channel_id, None);
+            assert_eq!(fetched.afk_timeout, None);
+        });
+    }
+
+    /// The other half of the cascade: the clear is conditional on the pointer
+    /// naming THIS channel. Without this, a cascade written as an
+    /// unconditional clear would pass the test above and quietly un-designate
+    /// the AFK channel every time any other channel in the server was deleted.
+    #[tokio::test]
+    async fn deleting_an_unrelated_channel_leaves_the_designation_alone() {
+        database_test!(|db| async move {
+            let mut server = new_server(&db, "AfkDeleteOtherOwner").await;
+            let afk = new_channel(
+                &db,
+                &mut server,
+                "AFK",
+                v0::LegacyServerChannelType::Voice,
+                None,
+            )
+            .await;
+            let bystander = new_channel(
+                &db,
+                &mut server,
+                "General",
+                v0::LegacyServerChannelType::Text,
+                None,
+            )
+            .await;
+
+            designate(&db, &mut server, afk.id()).await;
+
+            bystander.delete(&db).await.expect("delete");
+
+            let fetched = db.fetch_server(&server.id).await.expect("`Server`");
+            assert_eq!(fetched.afk_channel_id.as_deref(), Some(afk.id()));
+            assert_eq!(fetched.afk_timeout, Some(300));
+        });
+    }
+
+    /// De-voicing cascade, at the model layer.
+    ///
+    /// HONESTY NOTE: this exercises the helper and the `channel.voice().is_none()`
+    /// condition that `channel_edit` branches on, in the same order
+    /// `channel_edit` runs them - it does NOT exercise the route wiring
+    /// itself, which needs the Rocket harness (redis + rabbitmq) and could not
+    /// be run on this box. Both shapes `channel_edit` can produce are covered:
+    /// `remove: ["Voice"]` and `voice: { disabled: true }`.
+    #[tokio::test]
+    async fn de_voicing_the_afk_channel_clears_the_designation() {
+        database_test!(|db| async move {
+            for remove_outright in [true, false] {
+                let mut server = new_server(
+                    &db,
+                    if remove_outright {
+                        "AfkDevoiceRemove"
+                    } else {
+                        "AfkDevoiceDisable"
+                    },
+                )
+                .await;
+                let mut afk = new_channel(
+                    &db,
+                    &mut server,
+                    "AFK",
+                    v0::LegacyServerChannelType::Voice,
+                    None,
+                )
+                .await;
+
+                designate(&db, &mut server, afk.id()).await;
+
+                if remove_outright {
+                    afk.update(&db, PartialChannel::default(), vec![FieldsChannel::Voice])
+                        .await
+                        .expect("de-voice");
+                } else {
+                    afk.update(
+                        &db,
+                        PartialChannel {
+                            voice: Some(crate::VoiceInformation {
+                                max_users: None,
+                                disabled: true,
+                            }),
+                            ..Default::default()
+                        },
+                        vec![],
+                    )
+                    .await
+                    .expect("disable calling");
+                }
+
+                // This is the condition `channel_edit` branches on.
+                assert!(afk.voice().is_none());
+
+                let Channel::TextChannel {
+                    server: server_id,
+                    id,
+                    ..
+                } = &afk
+                else {
+                    panic!("a server voice channel is a TextChannel carrying voice information");
+                };
+                Server::clear_afk_channel_if_pointing_at(&db, server_id, id)
+                    .await
+                    .expect("clear");
+
+                let fetched = db.fetch_server(&server.id).await.expect("`Server`");
+                assert_eq!(fetched.afk_channel_id, None);
+                assert_eq!(fetched.afk_timeout, None);
+            }
         });
     }
 }

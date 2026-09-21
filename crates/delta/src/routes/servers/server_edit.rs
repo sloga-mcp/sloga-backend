@@ -82,6 +82,13 @@ pub async fn edit(
         }
     }
 
+    // Shape rules for the AFK pair that need no database round-trip: the
+    // set-and-remove collision, and "a timeout is meaningless without a
+    // channel". Runs BEFORE the resolving validation below so a request that
+    // is self-contradictory is refused on its own terms rather than on
+    // whichever half happened to be looked up first.
+    validate_afk_edit(server.afk_channel_id.as_deref(), &data)?;
+
     // The AFK designation must resolve to a voice channel in THIS server.
     // Validated here, before the destructure, mirroring the voice_region check
     // directly above. The resolved channel is kept so the A5 re-sync at the end
@@ -161,8 +168,21 @@ pub async fn edit(
         afk_channel_id,
         afk_timeout,
         owner,
-        remove,
+        mut remove,
     } = data;
+
+    // One rule, four writers: `AfkTimeout` is meaningless without
+    // `AfkChannel`. `validate_afk_edit` enforces the "setting a timeout needs
+    // a channel" half by rejection; this is the other half, which has to be an
+    // action rather than a rejection because clearing the channel is a
+    // perfectly valid request that simply must not leave an orphan timeout
+    // behind. `Server::clear_afk_channel_if_pointing_at` clears both for the
+    // same reason - see its doc comment, which states the rule once.
+    if remove.contains(&v0::FieldsServer::AfkChannel)
+        && !remove.contains(&v0::FieldsServer::AfkTimeout)
+    {
+        remove.push(v0::FieldsServer::AfkTimeout);
+    }
 
     // Any explicit transition of `discoverable` clears the pending request:
     // approval consumes it, delisting withdraws it. Set server-side, never
@@ -295,11 +315,66 @@ pub async fn edit(
     Ok(Json(server.into()))
 }
 
+/// The AFK edit rules that need no database round-trip.
+///
+/// Two defects, one place:
+///
+/// 1. SET-AND-REMOVE COLLISION. `{"afk_channel_id":"X","remove":["AfkChannel"]}`
+///    asks to set and clear one field in a single edit, and the two drivers
+///    disagree about the result. `MongoDb` builds one
+///    `{"$set":.., "$unset":..}` document with no de-duplication
+///    (`drivers/mongodb.rs`) and Mongo rejects the conflicting path outright;
+///    `Reference` applies `remove_field` first and then `apply_options`, so it
+///    lands on `Some("X")`. Either way the `ServerUpdate` that fans out
+///    carries the set AND the clear and contradicts itself. `member_edit`
+///    refuses exactly this class - for `CanPublish`, `CanReceive` and
+///    `VoiceChannel` - with `InvalidOperation`, and documents the reasoning;
+///    this is the same refusal, for the same reason, on the same grounds.
+///
+/// 2. ORPHAN TIMEOUT. `afk_timeout` has meaning only relative to a
+///    destination, so it is refused unless a channel is designated once this
+///    edit lands: either one is arriving in this same request, or the server
+///    already has one and this request is not removing it. `InvalidProperty`,
+///    matching how `Server::validate_afk_timeout` rejects an out-of-set value.
+///
+/// The other half of rule 2 - clearing the channel clears the timeout - is an
+/// action rather than a rejection and lives at the call site, because clearing
+/// the channel is a perfectly valid request that simply must not leave an
+/// orphan behind. `Server::clear_afk_channel_if_pointing_at` states the whole
+/// rule once in its doc comment; this is one of its four writers.
+///
+/// `voice_region` has the same collision gap today. That is a second instance
+/// of the same bug, deliberately left out of scope here - not a reason to
+/// think the gap is acceptable.
+fn validate_afk_edit(
+    current_afk_channel_id: Option<&str>,
+    data: &v0::DataEditServer,
+) -> Result<()> {
+    if (data.afk_channel_id.is_some() && data.remove.contains(&v0::FieldsServer::AfkChannel))
+        || (data.afk_timeout.is_some() && data.remove.contains(&v0::FieldsServer::AfkTimeout))
+    {
+        return Err(create_error!(InvalidOperation));
+    }
+
+    if data.afk_timeout.is_some() {
+        let designated_after_this_edit = data.afk_channel_id.is_some()
+            || (current_afk_channel_id.is_some()
+                && !data.remove.contains(&v0::FieldsServer::AfkChannel));
+
+        if !designated_after_this_edit {
+            return Err(create_error!(InvalidProperty));
+        }
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod test {
     use crate::util::test::TestHarness;
     use revolt_database::{Member, PartialUser, Server, Session};
     use revolt_models::v0;
+    use revolt_result::ErrorType;
     use rocket::http::{ContentType, Header, Status};
 
     async fn edit(
@@ -444,5 +519,92 @@ mod test {
         let fetched = harness.db.fetch_server(&server.id).await.unwrap();
         assert!(!fetched.discoverable);
         assert!(!fetched.discovery_requested);
+    }
+
+    /// Wave-2 audit finding 2 (MEDIUM). Regression test.
+    ///
+    /// Setting and removing the same field in one edit diverged by driver:
+    /// Mongo rejected the conflicting `$set`/`$unset` path pair, the reference
+    /// driver landed on the set value, and the event carried both. Refused
+    /// here the way `member_edit` refuses its three equivalents.
+    #[test]
+    fn afk_set_and_remove_in_one_edit_is_refused() {
+        for body in [
+            json!({ "afk_channel_id": "01ARZ3NDEKTSV4RRFFQ69G5FAV", "remove": ["AfkChannel"] }),
+            json!({ "afk_timeout": 300, "remove": ["AfkTimeout"] }),
+            // Both pairs at once, plus an unrelated field, still refused.
+            json!({
+                "name": "Somewhere",
+                "afk_channel_id": "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+                "afk_timeout": 300,
+                "remove": ["AfkChannel", "AfkTimeout"]
+            }),
+        ] {
+            let data: v0::DataEditServer = serde_json::from_value(body).expect("`DataEditServer`");
+            let error = super::validate_afk_edit(None, &data)
+                .expect_err("set-and-remove of one field must be refused");
+
+            assert!(matches!(error.error_type, ErrorType::InvalidOperation));
+        }
+    }
+
+    /// Wave-2 audit finding 4 (LOW). Regression test for one half of the rule:
+    /// `AfkTimeout` is meaningless without `AfkChannel`, so a timeout is only
+    /// accepted when a channel is designated once the edit lands.
+    #[test]
+    fn afk_timeout_requires_a_designated_channel() {
+        // No channel on the server, none arriving.
+        let data: v0::DataEditServer =
+            serde_json::from_value(json!({ "afk_timeout": 300 })).expect("`DataEditServer`");
+        let error = super::validate_afk_edit(None, &data)
+            .expect_err("a timeout with no destination is meaningless");
+        assert!(matches!(error.error_type, ErrorType::InvalidProperty));
+
+        // A channel is being cleared in the same edit, so none remains.
+        let data: v0::DataEditServer =
+            serde_json::from_value(json!({ "afk_timeout": 300, "remove": ["AfkChannel"] }))
+                .expect("`DataEditServer`");
+        let error = super::validate_afk_edit(Some("01ARZ3NDEKTSV4RRFFQ69G5FAV"), &data)
+            .expect_err("clearing the channel leaves the timeout orphaned");
+        assert!(matches!(error.error_type, ErrorType::InvalidProperty));
+
+        // Channel arriving in the same request: accepted.
+        let data: v0::DataEditServer = serde_json::from_value(
+            json!({ "afk_channel_id": "01ARZ3NDEKTSV4RRFFQ69G5FAV", "afk_timeout": 300 }),
+        )
+        .expect("`DataEditServer`");
+        assert!(super::validate_afk_edit(None, &data).is_ok());
+
+        // Channel already designated and not being removed: accepted.
+        let data: v0::DataEditServer =
+            serde_json::from_value(json!({ "afk_timeout": 300 })).expect("`DataEditServer`");
+        assert!(super::validate_afk_edit(Some("01ARZ3NDEKTSV4RRFFQ69G5FAV"), &data).is_ok());
+    }
+
+    /// Guard against the two rules above turning into a blanket refusal:
+    /// edits that say nothing about AFK must pass through untouched, and so
+    /// must a plain designation or a plain clear.
+    #[test]
+    fn afk_rules_leave_unrelated_edits_alone() {
+        for (current, body) in [
+            (None, json!({})),
+            (None, json!({ "name": "Somewhere" })),
+            (None, json!({ "remove": ["Banner", "Icon"] })),
+            (
+                None,
+                json!({ "afk_channel_id": "01ARZ3NDEKTSV4RRFFQ69G5FAV" }),
+            ),
+            (
+                Some("01ARZ3NDEKTSV4RRFFQ69G5FAV"),
+                json!({ "remove": ["AfkChannel"] }),
+            ),
+            (
+                Some("01ARZ3NDEKTSV4RRFFQ69G5FAV"),
+                json!({ "remove": ["AfkTimeout"] }),
+            ),
+        ] {
+            let data: v0::DataEditServer = serde_json::from_value(body).expect("`DataEditServer`");
+            assert!(super::validate_afk_edit(current, &data).is_ok());
+        }
     }
 }
