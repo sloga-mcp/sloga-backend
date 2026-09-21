@@ -263,6 +263,8 @@ impl IntoDocumentPath for FieldsServer {
             FieldsServer::Icon => "icon",
             FieldsServer::SystemMessages => "system_messages",
             FieldsServer::VoiceRegion => "voice_region",
+            FieldsServer::AfkChannel => "afk_channel_id",
+            FieldsServer::AfkTimeout => "afk_timeout",
         })
     }
 }

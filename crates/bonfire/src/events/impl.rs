@@ -908,6 +908,8 @@ mod tests {
             voice_region: None,
             boost_count: None,
             boost_tier: None,
+            afk_channel_id: None,
+            afk_timeout: None,
         };
 
         // Hidden: channel override denies ViewChannel for everyone.

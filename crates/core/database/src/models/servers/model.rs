@@ -82,6 +82,18 @@ auto_derived_partial!(
         /// picks by latency).
         #[serde(skip_serializing_if = "Option::is_none")]
         pub voice_region: Option<String>,
+
+        /// Id of this server's AFK voice channel, if one is designated.
+        /// At most one per server — the pointer lives here rather than as a
+        /// per-channel flag so "exactly one" is unrepresentable otherwise.
+        /// May go stale (the channel can be deleted or lose its voice
+        /// information), so every reader must resolve-then-check.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub afk_channel_id: Option<String>,
+        /// Idle timeout in SECONDS before a member is moved to the AFK
+        /// channel. Absent = no auto-move.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub afk_timeout: Option<u32>,
     },
     "PartialServer"
 );
@@ -149,6 +161,8 @@ auto_derived!(
         Icon,
         Banner,
         VoiceRegion,
+        AfkChannel,
+        AfkTimeout,
     }
 
     /// Optional fields on server object
@@ -188,6 +202,8 @@ impl Server {
             roles: HashMap::new(),
             system_messages: None,
             voice_region: None,
+            afk_channel_id: None,
+            afk_timeout: None,
         };
 
         let channels: Vec<Channel> = if create_default_channels {
@@ -282,6 +298,8 @@ impl Server {
             FieldsServer::Icon => self.icon = None,
             FieldsServer::Banner => self.banner = None,
             FieldsServer::VoiceRegion => self.voice_region = None,
+            FieldsServer::AfkChannel => self.afk_channel_id = None,
+            FieldsServer::AfkTimeout => self.afk_timeout = None,
         }
     }
 
