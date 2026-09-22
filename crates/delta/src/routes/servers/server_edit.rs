@@ -2,7 +2,7 @@ use std::collections::HashSet;
 
 use revolt_database::{
     util::{permissions::DatabasePermissionQuery, reference::Reference},
-    voice::{sync_voice_permissions, VoiceClient},
+    voice::{sync_afk_designation_change, VoiceClient},
     Database, File, PartialServer, Server, User, ValidatedTicket,
 };
 use revolt_models::v0;
@@ -284,33 +284,21 @@ pub async fn edit(
     // Without this, flagging an already-occupied channel is inert until some
     // unrelated role or permission edit happens to trigger a sync.
     //
-    // `role_id: None` means every member currently in the room, which is what a
-    // server-level designation change affects.
+    // Shared with `channel_create`, which writes the same server field and
+    // used to do none of this. The two failure modes the helper keeps apart -
+    // a swallowed resolve on the outgoing side, a propagating `?` on the sync
+    // itself - are documented on it.
     //
-    // This is a no-op for AFK purposes until the publish gate lands:
-    // `sync_user_voice_permissions` derives its state from permission bits, and
-    // the AFK designation is deliberately kept outside the permission system.
-    // Wired now so the gate is live the moment it exists.
-
-    // Outgoing - the channel that is no longer AFK. Resolve-then-check: the
-    // stored pointer may already be stale (channel deleted, or it has since
-    // lost its voice information) and the designation change is already
-    // committed, so a channel that will not resolve is skipped rather than
-    // turned into a late failure on a write that already succeeded.
-    if let Some(previous) = &previous_afk_channel_id {
-        if server.afk_channel_id.as_ref() != Some(previous) {
-            if let Ok(channel) = db.fetch_channel(previous).await {
-                sync_voice_permissions(db, voice_client, &channel, Some(&server), None).await?;
-            }
-        }
-    }
-
-    // Incoming - already resolved and validated above.
-    if let Some(channel) = &incoming_afk_channel {
-        if previous_afk_channel_id.as_deref() != Some(channel.id()) {
-            sync_voice_permissions(db, voice_client, channel, Some(&server), None).await?;
-        }
-    }
+    // `server` is passed POST-update on purpose: the gate reads
+    // `afk_channel_id` off it.
+    sync_afk_designation_change(
+        db,
+        voice_client,
+        &server,
+        previous_afk_channel_id.as_deref(),
+        incoming_afk_channel.as_ref(),
+    )
+    .await?;
 
     Ok(Json(server.into()))
 }

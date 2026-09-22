@@ -1082,6 +1082,83 @@ pub async fn sync_voice_permissions(
     Ok(())
 }
 
+/// Re-sync voice permissions on BOTH sides of an AFK designation change.
+///
+/// `Server.afk_channel_id` has two writers - `server_edit` (the designation
+/// is moved or cleared) and `channel_create` (a channel is born designated) -
+/// and the enforcement gate reads the designation off the server document, not
+/// off any per-participant state. So the moment the pointer moves, everyone
+/// already sitting in a room on either side of the move is holding a LiveKit
+/// grant that no longer matches the server. Occupants of the OUTGOING channel
+/// stay muted at the SFU until some unrelated role edit happens to trigger a
+/// sync; occupants of the INCOMING channel keep publishing. Neither heals on
+/// its own.
+///
+/// This lives here rather than beside either route because the two routes are
+/// sibling modules - a helper in one imported by the other is how the rule
+/// ends up with a preferred owner and a second, divergent copy. It is also the
+/// only layer that has both halves already: `sync_voice_permissions` is right
+/// above, and `VoiceClient` is re-exported from this module, so both routes
+/// already import from here.
+///
+/// `server` must be the POST-update document. The gate reads
+/// `server.afk_channel_id` off the `&Server` passed down, so handing it the
+/// updated server re-syncs the outgoing channel's occupants to their ungated
+/// source set and the incoming channel's to an empty one in a single pass,
+/// with no extra fetches.
+///
+/// `sync_voice_permissions` early-returns when a channel has no LiveKit node,
+/// so calling this on idle channels - which is the common case, and always the
+/// case for a just-created one - costs one Redis read per side.
+///
+/// TWO DELIBERATELY DIFFERENT FAILURE MODES, preserved from the `server_edit`
+/// implementation this was factored out of:
+///
+/// - the OUTGOING channel is resolved here and a resolve failure is SWALLOWED.
+///   The stored pointer may already be stale (the channel was deleted, or lost
+///   its voice information) and the designation write has already committed,
+///   so a channel that will not resolve is skipped rather than turned into a
+///   late failure on a write that already succeeded.
+/// - the INCOMING channel is passed in already resolved, because both callers
+///   validate it BEFORE the write - `server_edit` via
+///   `Server::validate_afk_channel`, `channel_create` by having just created
+///   it. There is nothing to swallow.
+///
+/// Sync failures themselves propagate with `?` after the write has committed,
+/// matching `roles_edit.rs` and both `permissions_set.rs` call sites.
+///
+/// Both sides are guarded on the designation having actually MOVED, so a
+/// no-op edit that re-sends the same `afk_channel_id` does not walk the room.
+///
+/// `role_id: None` on both calls means every member currently in the room,
+/// which is what a server-level designation change affects - it is not scoped
+/// to a role the way the `roles_edit` and `permissions_set` syncs are.
+pub async fn sync_afk_designation_change(
+    db: &Database,
+    voice_client: &VoiceClient,
+    server: &Server,
+    previous_afk_channel_id: Option<&str>,
+    incoming_afk_channel: Option<&Channel>,
+) -> Result<()> {
+    // Outgoing - the channel that is no longer AFK. Resolve-then-check.
+    if let Some(previous) = previous_afk_channel_id {
+        if server.afk_channel_id.as_deref() != Some(previous) {
+            if let Ok(channel) = db.fetch_channel(previous).await {
+                sync_voice_permissions(db, voice_client, &channel, Some(server), None).await?;
+            }
+        }
+    }
+
+    // Incoming - already resolved and validated by the caller.
+    if let Some(channel) = incoming_afk_channel {
+        if previous_afk_channel_id != Some(channel.id()) {
+            sync_voice_permissions(db, voice_client, channel, Some(server), None).await?;
+        }
+    }
+
+    Ok(())
+}
+
 /// The LiveKit participant permissions a channel-permission sync grants.
 ///
 /// Data publishing stays revoked UNCONDITIONALLY: the join token grants
@@ -2003,6 +2080,141 @@ mod permission_tests {
             "the Android screen leg hard-codes can_publish: true plus both \
              screen sources and never consults get_allowed_sources — it must \
              carry its own AFK gate"
+        );
+    }
+
+    /// The braced body of a block whose opening brace sits at byte `open`,
+    /// exclusive of the braces themselves. Same textual, brace-matching
+    /// discipline as `strip_test_items`: callers must keep braces BALANCED
+    /// inside strings and comments in the code being scanned.
+    fn braced_body(shipping: &str, open: usize) -> &str {
+        let mut depth = 0i64;
+        for (i, ch) in shipping[open..].char_indices() {
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return &shipping[open + 1..open + i];
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("unbalanced braces in a block at byte {open}");
+    }
+
+    /// Wave-3b. REGRESSION TEST for the sync seam, and a STRUCTURAL one -
+    /// read what it does and does not prove before trusting it.
+    ///
+    /// It proves: every route that writes `Server.afk_channel_id` into a
+    /// `PartialServer` also calls `sync_afk_designation_change`, and nothing
+    /// else in the workspace calls that helper. That is exactly the shape of
+    /// the defect it exists for. `server_edit` re-synced both sides of a
+    /// designation change from the day the field landed; `channel_create`
+    /// wrote the same field and took no `voice_client` at all, so once the
+    /// enforcement gate went in, creating a new AFK channel left the
+    /// occupants of the old one muted at the SFU indefinitely. Two writers of
+    /// one server-level invariant with different post-write behaviour.
+    ///
+    /// It does NOT prove that the re-sync reaches the SFU, that the POST-update
+    /// server document is the one handed to the helper, or that a participant's
+    /// grant actually changes. None of that is reachable from a unit test here:
+    /// `sync_voice_permissions` goes through `get_channel_node`, which is a
+    /// Redis read, and the delta Rocket harness cannot boot on this box. Only a
+    /// live two-seat leg settles those.
+    ///
+    /// The scan is scoped to `delta/src/routes/` deliberately. The bridge
+    /// conversions in `util/bridge/v0.rs` also mention `afk_channel_id` inside
+    /// a `PartialServer` literal and are mechanical field-for-field copies,
+    /// not writers; and the route layer is the only layer that holds a
+    /// `VoiceClient` to sync with.
+    ///
+    /// KNOWN FALSE NEGATIVE, stated rather than papered over: the writer scan
+    /// only recognises the field inside a `PartialServer` struct literal. A
+    /// route that built the partial some other way - `PartialServer::default()`
+    /// then a field assignment, or a spread from a partial constructed
+    /// elsewhere - would write the designation without this test noticing.
+    /// Both current writers use the literal form, and so does every other
+    /// `PartialServer` construction in the route layer.
+    #[test]
+    fn every_afk_designation_writer_resyncs_both_sides() {
+        // The opening brace is written as an escape so `strip_test_items`,
+        // which brace-matches this very module to cut it out of the scan,
+        // still sees balanced braces here. A bare opening brace in a string
+        // literal inside a test module silently over-strips the file and breaks
+        // the sibling contract tests - which is exactly what it did.
+        const PARTIAL: &str = "PartialServer \u{7b}";
+        const FIELD: &str = "afk_channel_id";
+        const SYNC: &str = "sync_afk_designation_change(";
+        const ROUTES: &str = "delta/src/routes/";
+        // Sorted. A third writer of this field is a third chance to leave a
+        // room stuck; adding one means wiring this call too.
+        const EXPECTED: [&str; 2] = [
+            "delta/src/routes/servers/channel_create.rs",
+            "delta/src/routes/servers/server_edit.rs",
+        ];
+
+        let sources = shipping_sources();
+        let mut writers: Vec<&str> = Vec::new();
+
+        for (rel, shipping) in &sources {
+            if !rel.starts_with(ROUTES) {
+                continue;
+            }
+
+            for at in shipping.match_indices(PARTIAL).map(|(at, _)| at) {
+                // the opening brace of the struct literal
+                let open = at + PARTIAL.len() - 1;
+                if braced_body(shipping, open).contains(FIELD) {
+                    writers.push(rel.as_str());
+                }
+            }
+        }
+
+        writers.sort_unstable();
+        writers.dedup();
+        assert_eq!(
+            writers, EXPECTED,
+            "the inventory of routes writing Server.afk_channel_id changed"
+        );
+
+        for rel in &writers {
+            let shipping = &sources
+                .iter()
+                .find(|(candidate, _)| candidate == rel)
+                .expect("the writer was just found in this same scan")
+                .1;
+            assert!(
+                !call_sites(shipping, SYNC).is_empty(),
+                "{rel} writes Server.afk_channel_id but never calls \
+                 sync_afk_designation_change. The designation moves, the \
+                 enforcement gate reads it off the server document, and \
+                 everyone already sitting in the OUTGOING channel keeps the \
+                 LiveKit grant they were minted - muted at the SFU with no \
+                 UserVoiceStateUpdate until some unrelated role edit happens \
+                 to trigger a sync"
+            );
+        }
+
+        // ...and nothing else calls it. The helper exists because the rule
+        // had two divergent copies; a caller outside the writer set would
+        // mean it has grown a third meaning.
+        // `call_sites` already excludes the definition line itself, so the
+        // defining file is scanned like any other.
+        let mut callers: Vec<&str> = sources
+            .iter()
+            .flat_map(|(rel, shipping)| {
+                call_sites(shipping, SYNC)
+                    .into_iter()
+                    .map(move |_| rel.as_str())
+            })
+            .collect();
+        callers.sort_unstable();
+        callers.dedup();
+        assert_eq!(
+            callers, EXPECTED,
+            "sync_afk_designation_change gained or lost a caller"
         );
     }
 }

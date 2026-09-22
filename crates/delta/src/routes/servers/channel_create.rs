@@ -1,5 +1,9 @@
 use revolt_database::util::permissions::DatabasePermissionQuery;
-use revolt_database::{util::reference::Reference, Channel, Database, PartialServer, Server, User};
+use revolt_database::{
+    util::reference::Reference,
+    voice::{sync_afk_designation_change, VoiceClient},
+    Channel, Database, PartialServer, Server, User,
+};
 use revolt_models::v0;
 use revolt_permissions::{calculate_server_permissions, ChannelPermission};
 use revolt_result::{create_error, Result};
@@ -15,6 +19,7 @@ use validator::Validate;
 #[post("/<server>/channels", data = "<data>")]
 pub async fn create_server_channel(
     db: &State<Database>,
+    voice_client: &State<VoiceClient>,
     user: User,
     server: Reference<'_>,
     data: Json<v0::DataCreateServerChannel>,
@@ -90,6 +95,11 @@ pub async fn create_server_channel(
         // already `Option<T>`, so the generated assigner is a `replace()` and
         // writing `None` here would be a silent no-op. Clearing must go
         // through `FieldsServer::AfkChannel` / `FieldsServer::AfkTimeout`.
+
+        // Captured BEFORE the update mutates `server`, so the re-sync below
+        // can still reach the OUTGOING channel.
+        let previous_afk_channel_id = server.afk_channel_id.clone();
+
         server
             .update(
                 db,
@@ -101,6 +111,31 @@ pub async fn create_server_channel(
                 vec![],
             )
             .await?;
+
+        // A5: the designation just moved, so re-sync BOTH sides. This route
+        // writes the same server-level field `server_edit` does, and used to
+        // stop at the write - which, once the enforcement gate landed, left
+        // the occupants of the OUTGOING channel muted at the SFU with no
+        // `UserVoiceStateUpdate` until some unrelated role edit happened to
+        // trigger a sync. Over-restrictive rather than a leak, and invisible
+        // to the people stuck in it.
+        //
+        // `server` is the POST-update document, which is what makes one pass
+        // enough: the gate reads `afk_channel_id` off it, so the old channel's
+        // occupants resolve to their ungated sources and the new channel's to
+        // an empty set. The incoming channel was just created, so it has no
+        // LiveKit node and `sync_voice_permissions` early-returns on it - the
+        // work that matters here is the outgoing side. Passed anyway rather
+        // than special-cased, so this route and `server_edit` call the helper
+        // the same way.
+        sync_afk_designation_change(
+            db,
+            voice_client,
+            &server,
+            previous_afk_channel_id.as_deref(),
+            Some(&channel),
+        )
+        .await?;
     }
 
     Ok(Json(channel.into()))
