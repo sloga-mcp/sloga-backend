@@ -13,7 +13,7 @@ use revolt_permissions::{ChannelPermission, PermissionValue};
 use revolt_result::{create_error, Result, ToRevoltError};
 use std::{collections::HashMap, time::Duration};
 
-use super::{get_allowed_sources, track_source_grant_name};
+use super::{get_allowed_sources, track_source_grant_name, AfkGate};
 
 #[derive(Debug)]
 pub struct RoomClient {
@@ -76,7 +76,16 @@ impl VoiceClient {
         let room = self.get_node(node)?;
 
         let limits = user.limits().await;
-        let allowed_sources = get_allowed_sources(&limits, permissions);
+        // No `Server` is in hand here — `create_token` is called from
+        // `voice_join`, the moderator move and the RC paths, none of which can
+        // be changed from this lane — so the gate resolves the designation
+        // itself. One `fetch_server` per token mint (a join or a move), never
+        // per participant of a call.
+        let allowed_sources = get_allowed_sources(
+            &limits,
+            permissions,
+            AfkGate::resolve(db, channel, None).await?,
+        );
 
         // Device-qualified identity (media E2EE, plan Q4): per-device frame
         // keys require an injective identity → (user, device) mapping, and
@@ -133,6 +142,16 @@ impl VoiceClient {
     /// untrusted injection surface for the E2EE call machinery). Name and
     /// metadata match the primary so a viewer resolving either way sees the
     /// same user.
+    ///
+    /// Because the grant is spelled out rather than derived, this is the FIFTH
+    /// publish-rights path and the AFK gate does NOT reach it through
+    /// `get_allowed_sources` (AFK-channel plan D2). It is gated here, on its
+    /// own, or a phone screen-shares into the AFK channel while every WebView
+    /// in the room is refused. Refusing outright rather than minting an empty
+    /// grant: a leg exists only to publish, and an empty `canPublishSources`
+    /// means "no restriction" to LiveKit — minting one would invert the
+    /// meaning of the token (the same reasoning the route applies to the
+    /// video feature limit).
     pub async fn create_screen_leg_token(
         &self,
         node: &str,
@@ -141,6 +160,15 @@ impl VoiceClient {
         identity: &str,
         channel: &Channel,
     ) -> Result<String> {
+        if AfkGate::resolve(db, channel, None)
+            .await?
+            .denies_publishing()
+        {
+            return Err(create_error!(MissingPermission {
+                permission: ChannelPermission::Video.to_string()
+            }));
+        }
+
         let room = self.get_node(node)?;
 
         AccessToken::with_api_key(&room.node.key, &room.node.secret)

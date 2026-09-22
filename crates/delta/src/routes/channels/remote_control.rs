@@ -29,8 +29,8 @@ use revolt_database::{
             remote_control_party_busy, RemoteControlGrant, RemoteControlGrantOutcome,
             RemoteControlOffer, INPUT_CLASS_KBM,
         },
-        remote_control_participant_permissions, voice_participant_permissions, UserVoiceChannel,
-        VoiceClient,
+        remote_control_participant_permissions, voice_participant_permissions, AfkGate,
+        UserVoiceChannel, VoiceClient,
     },
     Channel, Database, RemoteControlAuditEntry, User,
 };
@@ -414,7 +414,18 @@ pub async fn control_respond(
     let mut query = perms(db, &user).channel(&channel);
     let permissions = calculate_channel_permissions(&mut query).await;
     let limits = user.limits().await;
-    let allowed_sources = get_allowed_sources(&limits, permissions);
+    // AFK gate (plan D2 / audit CRITICAL-1). THE attack this closes: a member
+    // sits in the AFK channel with no publish rights, accepts a remote-control
+    // offer, and this push hands back `can_publish: true` with Microphone,
+    // Camera, ScreenShare and ScreenShareAudio — the server mute defeated by
+    // an in-product button, no modified client required. `allowed_sources`
+    // feeds BOTH pushes below (the grant and the raced-teardown undo), so
+    // gating it here covers the accept and its rollback together.
+    let allowed_sources = get_allowed_sources(
+        &limits,
+        permissions,
+        AfkGate::resolve(db, &channel, None).await?,
+    );
     let can_listen = permissions.has_channel_permission(ChannelPermission::Listen);
 
     if let Err(error) = voice_client

@@ -717,7 +717,16 @@ async fn revoke_controller_capability(
     let mut query = DatabasePermissionQuery::new(db, &controller).channel(&channel);
     let permissions = calculate_channel_permissions(&mut query).await;
     let limits = controller.limits().await;
-    let allowed_sources = super::get_allowed_sources(&limits, permissions);
+    // AFK gate (plan D2 / audit CRITICAL-1). This is the RC teardown leg: it
+    // RE-PUSHES a freshly recomputed source set, so an ungated recompute here
+    // would hand every publish source back the moment control was revoked —
+    // the mute defeated by revoking the very thing that defeated it. No server
+    // document is in hand, so the gate fetches its own.
+    let allowed_sources = super::get_allowed_sources(
+        &limits,
+        permissions,
+        super::AfkGate::resolve(db, &channel, None).await?,
+    );
     let can_listen = permissions.has_channel_permission(ChannelPermission::Listen);
 
     voice_client

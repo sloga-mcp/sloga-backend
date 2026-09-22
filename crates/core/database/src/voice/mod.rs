@@ -489,10 +489,115 @@ pub async fn get_user_voice_channel_in_server(
     conn.get(&unique_key).await.to_internal_error()
 }
 
+/// The AFK gate (AFK-channel plan D2 / audit CRITICAL-1).
+///
+/// Enforcement of the AFK designation is a HARD GATE applied AFTER the
+/// permission calculus, never a permission denial.
+/// `calculate_channel_permissions` returns `GrantAllSafe` for privileged
+/// accounts and, through `calculate_server_permissions`, short-circuits for
+/// the server OWNER — both before any override is read. An AFK-as-permission
+/// implementation would therefore leave the owner and every staff account
+/// publishing freely in the AFK channel.
+///
+/// The gate is carried as a VALUE rather than a `bool` parameter, and the
+/// value lives in its own module so that its single field is private to that
+/// module — `voice::voice_client` and `voice::remote_control` are siblings of
+/// `voice::afk`, not descendants, so they cannot build `AfkGate(false)` even
+/// though they live in the same crate. The only shipping constructor is
+/// [`AfkGate::resolve`], which performs the lookup itself. That is the
+/// structural defence against audit CRITICAL-1: a call site under compile
+/// pressure has no `false` to reach for, because there is no value of any
+/// argument to `resolve` that weakens the gate — passing `None` for the
+/// server makes it fetch the server instead of trusting the caller.
+mod afk {
+    use crate::{models::Channel, Database, Server};
+    use revolt_result::Result;
+
+    /// Proof that a channel's AFK status has been resolved against its server.
+    ///
+    /// Deliberately NOT `Default`, NOT `From<bool>`, and with no public field:
+    /// possession of one of these means the lookup happened.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct AfkGate(bool);
+
+    impl AfkGate {
+        /// Resolve whether `channel` is its server's designated AFK channel.
+        ///
+        /// `server` is an OPTIMISATION, not an opt-out: when the caller
+        /// already holds the right server document (the permission-sync path,
+        /// which runs this once per participant) it is used directly, and
+        /// otherwise — including when a caller passes a server belonging to
+        /// some other server id — the document is fetched. That is what keeps
+        /// `sync_voice_permissions` free of a per-participant fetch while
+        /// leaving every other call site correct with `None`.
+        ///
+        /// Fails CLOSED by propagating: a server that cannot be read aborts
+        /// the mint or the sync rather than falling through to a permissive
+        /// default.
+        ///
+        /// The designation is honoured as written even if the pointer has gone
+        /// stale (the channel lost its voice information, say). A stale
+        /// pointer can only ever deny publishing in a channel nobody can call
+        /// in; resolving it the other way would be a bypass.
+        pub async fn resolve(
+            db: &Database,
+            channel: &Channel,
+            server: Option<&Server>,
+        ) -> Result<Self> {
+            // DMs, groups and saved messages have no server and therefore no
+            // AFK designation.
+            let Some(server_id) = channel.server() else {
+                return Ok(Self(false));
+            };
+
+            let designated = match server {
+                Some(server) if server.id == server_id => server.afk_channel_id.clone(),
+                _ => db.fetch_server(server_id).await?.afk_channel_id,
+            };
+
+            Ok(Self(designated.as_deref() == Some(channel.id())))
+        }
+
+        /// Whether this channel's AFK designation denies ALL publishing.
+        pub fn denies_publishing(self) -> bool {
+            self.0
+        }
+
+        /// Test-only escape hatch so the unit tests below can exercise both
+        /// sides of the gate without a database. Gated out of every shipping
+        /// build by the attribute below, and the textual contract test
+        /// `afk_gate_has_no_opt_out_at_any_call_site` additionally proves that
+        /// no shipping source anywhere in the workspace reaches for it.
+        #[cfg(test)]
+        pub fn from_raw_for_tests(is_afk: bool) -> Self {
+            Self(is_afk)
+        }
+    }
+}
+
+pub use afk::AfkGate;
+
 pub fn get_allowed_sources(
     limits: &FeaturesLimits,
     permissions: PermissionValue,
+    afk: AfkGate,
 ) -> Vec<TrackSource> {
+    // The AFK gate (D2). Applied BEFORE anything is collected and after the
+    // permission calculus has already run, so it binds the server owner and
+    // privileged accounts that `calculate_channel_permissions` waves through
+    // with `GrantAllSafe`.
+    //
+    // An empty list is the correct and only safe return: LiveKit reads an
+    // empty `can_publish_sources` as "no restriction" (auth/grants.go), and
+    // BOTH consumers of this slice — `voice_participant_permissions` and
+    // `VoiceClient::create_token` — derive `can_publish` as
+    // `!allowed_sources.is_empty()`, so the empty list can only ever ship
+    // alongside `can_publish: false`. That pairing is pinned by
+    // `afk_channel_yields_empty_sources_and_no_publish`.
+    if afk.denies_publishing() {
+        return Vec::new();
+    }
+
     let mut allowed_sources = Vec::new();
 
     if permissions.has(ChannelPermission::Speak as u64) {
@@ -1036,7 +1141,19 @@ mod permission_tests {
 
     use super::{
         get_allowed_sources, user_id_from_participant_identity, voice_participant_permissions,
+        AfkGate,
     };
+
+    /// A resolved "this is not the AFK channel" gate, for the tests that are
+    /// about something other than AFK.
+    fn not_afk() -> AfkGate {
+        AfkGate::from_raw_for_tests(false)
+    }
+
+    /// A resolved "this IS the AFK channel" gate.
+    fn afk() -> AfkGate {
+        AfkGate::from_raw_for_tests(true)
+    }
 
     fn limits_with_video(video: bool) -> FeaturesLimits {
         FeaturesLimits {
@@ -1187,6 +1304,7 @@ mod permission_tests {
                     let sources = get_allowed_sources(
                         &limits_with_video(video_limit),
                         PermissionValue::from_raw(bits),
+                        not_afk(),
                     );
                     let permissions = voice_participant_permissions(true, &sources);
 
@@ -1356,6 +1474,27 @@ mod permission_tests {
             .collect()
     }
 
+    /// The argument text of a call whose opening `(` sits at byte `open`,
+    /// exclusive of the parentheses themselves. Same textual, paren-matching
+    /// discipline as `strip_test_items`: callers must keep parentheses
+    /// BALANCED inside strings and comments in the code being scanned.
+    fn call_args(shipping: &str, open: usize) -> &str {
+        let mut depth = 0i64;
+        for (i, ch) in shipping[open..].char_indices() {
+            match ch {
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return &shipping[open + 1..open + i];
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("unbalanced parens in a call at byte {open}");
+    }
+
     #[test]
     fn remote_control_permissions_have_exactly_one_caller() {
         // §0.4 amendment test 3 — the one that preserves the ORIGINAL
@@ -1506,6 +1645,366 @@ mod permission_tests {
             );
         }
     }
+
+    // ---- the AFK gate (AFK-channel plan D2 / audit CRITICAL-1) ----
+
+    /// The gate at the level the SFU sees it: under an AFK designation NO
+    /// permission bit and NO feature limit can put a source back, and the
+    /// empty list it produces may only ever ship alongside
+    /// `can_publish: false`.
+    ///
+    /// That pairing is the whole safety property. LiveKit reads an empty
+    /// `can_publish_sources` as "no restriction"
+    /// (`VideoGrant.GetCanPublishSource`, auth/grants.go), so an empty list
+    /// shipped with `can_publish: true` grants EVERYTHING — the exact
+    /// inversion of what the gate is for. Both consumers derive
+    /// `can_publish` as `!allowed_sources.is_empty()`; this pins that they
+    /// keep doing so.
+    #[test]
+    fn afk_channel_yields_empty_sources_and_no_publish() {
+        use super::remote_control_participant_permissions;
+
+        let privileged = PermissionValue::from_raw(u64::MAX);
+        let cases = [
+            PermissionValue::from_raw(0),
+            PermissionValue::from_raw(ChannelPermission::Listen as u64),
+            PermissionValue::from_raw(
+                ChannelPermission::Listen as u64
+                    | ChannelPermission::Speak as u64
+                    | ChannelPermission::Video as u64,
+            ),
+            // What `calculate_channel_permissions` hands a privileged account
+            // and, through `calculate_server_permissions`, the server owner:
+            // every bit, decided before any override is read. This is why D2
+            // forbids implementing AFK as a permission denial.
+            PermissionValue::from_raw(ChannelPermission::GrantAllSafe as u64),
+            privileged,
+        ];
+
+        for permissions in cases {
+            for video_limit in [false, true] {
+                let limits = limits_with_video(video_limit);
+                let sources = get_allowed_sources(&limits, permissions, afk());
+
+                assert!(
+                    sources.is_empty(),
+                    "the AFK gate must drop every source (raw permissions \
+                     {:?}, video limit {video_limit})",
+                    permissions.has_channel_permission(ChannelPermission::Speak)
+                );
+
+                // The join token's own derivation
+                // (voice_client.rs::create_token) is literally
+                // `can_publish: !allowed_sources.is_empty()`, so an empty
+                // list there is `can_publish: false` by construction.
+                let token_can_publish = !sources.is_empty();
+                assert!(!token_can_publish);
+
+                for can_listen in [false, true] {
+                    let sync = voice_participant_permissions(can_listen, &sources);
+                    assert!(!sync.can_publish);
+                    assert!(sync.can_publish_sources.is_empty());
+                    assert!(!sync.can_publish_data);
+                    // Listening is NOT gated: an AFK member still hears the
+                    // channel, they just cannot publish into it.
+                    assert_eq!(sync.can_subscribe, can_listen);
+
+                    // The remote-control accept path — audit CRITICAL-1. This
+                    // is the set `control_respond` pushes, and ungated it is
+                    // how a member in the AFK channel unmutes themselves with
+                    // an in-product button.
+                    let granted = remote_control_participant_permissions(can_listen, &sources);
+                    assert!(
+                        !granted.can_publish,
+                        "accepting a remote-control offer must not re-grant publishing in the AFK channel"
+                    );
+                    assert!(granted.can_publish_sources.is_empty());
+                }
+            }
+        }
+
+        // Control: the same maximal permissions WITHOUT the gate do produce
+        // sources, so nothing above passes for the wrong reason.
+        let ungated = get_allowed_sources(&limits_with_video(true), privileged, not_afk());
+        assert!(
+            ungated.contains(&TrackSource::Microphone)
+                && ungated.contains(&TrackSource::Camera)
+                && ungated.contains(&TrackSource::ScreenShare)
+                && ungated.contains(&TrackSource::ScreenShareAudio),
+            "control: an undesignated channel still grants every source"
+        );
+        assert!(voice_participant_permissions(true, &ungated).can_publish);
+    }
+
+    /// Audit MEDIUM-7: under AFK the permission-sync must actually EMIT a
+    /// `UserVoiceStateUpdate`.
+    ///
+    /// The fan-out in `sync_user_voice_permissions` is guarded by
+    /// `if update_event != before`. Because D2 deliberately puts AFK outside
+    /// the permission system, the permission bits are unchanged under an AFK
+    /// designation — so if the roster flags were still computed from those
+    /// bits, every field would stay `None`, the guard would hold and nothing
+    /// would be sent. The SFU would kill the tracks while every other client
+    /// kept rendering a camera tile and a speaking indicator.
+    ///
+    /// HONEST SCOPE: this reproduces the four expressions
+    /// `sync_user_voice_permissions` uses; it does not call it, because that
+    /// function needs Redis voice state and a LiveKit node. It pins the shape
+    /// of the fix, not the delivery — only a live two-seat leg proves seat B's
+    /// roster actually drops the tile.
+    #[test]
+    fn afk_sync_forces_the_roster_flags_false_so_an_event_is_emitted() {
+        use super::PartialUserVoiceState;
+
+        // A privileged account with every bit and the video limit on, in the
+        // AFK channel: the hardest case for the gate.
+        let allowed_sources = get_allowed_sources(
+            &limits_with_video(true),
+            PermissionValue::from_raw(u64::MAX),
+            afk(),
+        );
+        let can_video = allowed_sources.contains(&TrackSource::Camera);
+        let can_speak = allowed_sources.contains(&TrackSource::Microphone);
+        assert!(!can_video && !can_speak);
+
+        let mut update_event = PartialUserVoiceState {
+            id: Some("01KX7HASD9FHBYA3XGKA5YACYX".to_string()),
+            ..Default::default()
+        };
+        let before = update_event.clone();
+
+        // A participant who is, right now, publishing on camera and sharing
+        // their screen — the state the roster is currently rendering.
+        update_event.camera = true.then_some(can_video);
+        update_event.screensharing = true.then_some(can_video);
+        update_event.screen_video = true.then_some(can_video);
+        update_event.is_publishing = true.then_some(can_speak);
+
+        assert_eq!(update_event.camera, Some(false));
+        assert_eq!(update_event.screensharing, Some(false));
+        assert_eq!(update_event.screen_video, Some(false));
+        assert_eq!(update_event.is_publishing, Some(false));
+        assert_ne!(
+            update_event, before,
+            "MEDIUM-7: the fan-out is guarded by `update_event != before`, so \
+             a gate that leaves every field None emits nothing at all and the \
+             roster keeps showing a camera tile for someone the SFU has \
+             already silenced"
+        );
+    }
+
+    /// The D2 regression, end to end against a real database: the SERVER
+    /// OWNER in the AFK channel gets no publish sources.
+    ///
+    /// The owner is the case an AFK-as-permission implementation cannot
+    /// reach — `calculate_server_permissions` short-circuits for them before
+    /// any override is read — so this is the test that distinguishes a real
+    /// gate from a permission denial. It also covers both resolution paths
+    /// (supplied server document vs. fetched) and asserts the gate binds
+    /// ONLY the designated channel.
+    #[tokio::test]
+    async fn afk_gate_binds_the_server_owner() {
+        use crate::{
+            util::permissions::DatabasePermissionQuery, Channel, PartialServer, Server, User,
+        };
+        use revolt_models::v0::{
+            DataCreateServer, DataCreateServerChannel, LegacyServerChannelType,
+        };
+        use revolt_permissions::calculate_channel_permissions;
+
+        database_test!(|db| async move {
+            let owner = User::create(&db, "AfkGateOwner".to_string(), None, None)
+                .await
+                .expect("`User`");
+
+            let mut server = Server::create(
+                &db,
+                DataCreateServer {
+                    name: "AfkGateServer".to_string(),
+                    description: None,
+                    nsfw: None,
+                },
+                &owner,
+                false,
+            )
+            .await
+            .expect("`Server`")
+            .0;
+
+            let voice_channel = |name: &str| {
+                let name = name.to_string();
+                DataCreateServerChannel {
+                    channel_type: LegacyServerChannelType::Voice,
+                    name,
+                    ..Default::default()
+                }
+            };
+
+            let afk_channel =
+                Channel::create_server_channel(&db, &mut server, voice_channel("AFK"), true)
+                    .await
+                    .expect("`Channel`");
+            let normal_channel =
+                Channel::create_server_channel(&db, &mut server, voice_channel("General"), true)
+                    .await
+                    .expect("`Channel`");
+
+            let mut query = DatabasePermissionQuery::new(&db, &owner).channel(&afk_channel);
+            let permissions = calculate_channel_permissions(&mut query).await;
+            assert!(
+                permissions.has_channel_permission(ChannelPermission::Speak)
+                    && permissions.has_channel_permission(ChannelPermission::Video),
+                "the owner holds every bit — that is exactly why the gate \
+                 cannot be built as a permission denial (D2)"
+            );
+
+            let limits = owner.limits().await;
+
+            // Control, before the designation exists: the owner publishes
+            // normally, so the assertion below cannot pass vacuously.
+            let ungated = get_allowed_sources(
+                &limits,
+                permissions,
+                AfkGate::resolve(&db, &afk_channel, Some(&server))
+                    .await
+                    .expect("gate"),
+            );
+            assert!(
+                !ungated.is_empty(),
+                "control: an undesignated voice channel grants the owner sources"
+            );
+
+            server
+                .update(
+                    &db,
+                    PartialServer {
+                        afk_channel_id: Some(afk_channel.id().to_string()),
+                        afk_timeout: Some(300),
+                        ..Default::default()
+                    },
+                    vec![],
+                )
+                .await
+                .expect("designation");
+
+            // Both resolution paths: `Some(&server)` is the permission-sync
+            // path (no fetch), `None` is every token-minting path.
+            for server_arg in [Some(&server), None] {
+                let gate = AfkGate::resolve(&db, &afk_channel, server_arg)
+                    .await
+                    .expect("gate");
+                assert!(gate.denies_publishing());
+                assert!(
+                    get_allowed_sources(&limits, permissions, gate).is_empty(),
+                    "D2 regression: the server OWNER may not publish in the AFK channel"
+                );
+
+                let other = AfkGate::resolve(&db, &normal_channel, server_arg)
+                    .await
+                    .expect("gate");
+                assert!(
+                    !other.denies_publishing(),
+                    "the gate must bind ONLY the designated channel"
+                );
+                assert!(!get_allowed_sources(&limits, permissions, other).is_empty());
+            }
+        });
+    }
+
+    /// The structural defence against audit CRITICAL-1 recurring.
+    ///
+    /// The draft of this feature claimed `get_allowed_sources` was "the
+    /// single helper feeding both the join token and the live re-sync". It
+    /// is not: there are FOUR production call sites, and the two that were
+    /// missed are the remote-control grant and revoke paths — the ones that
+    /// let a member in the AFK channel unmute themselves by accepting an
+    /// offer. The failure mode is not exotic: a lane that changes the
+    /// signature and cannot touch those files takes the cheapest fix
+    /// available to it.
+    ///
+    /// So the gate is a VALUE with no public constructor other than
+    /// `AfkGate::resolve`, and this test pins the remaining textual half:
+    /// every call site constructs one INLINE (the same discipline
+    /// `remote_control_teardown_restores_the_sync_permission_set` applies to
+    /// permission constructors), the inventory of call sites is fixed, the
+    /// test-only constructor appears in no shipping source, and the FIFTH
+    /// publish-rights path — the Android screen leg, which hard-codes its
+    /// grant and never consults the helper — carries its own gate.
+    #[test]
+    fn afk_gate_has_no_opt_out_at_any_call_site() {
+        const NEEDLE: &str = "get_allowed_sources(";
+        const CONSTRUCTOR: &str = "AfkGate::resolve(";
+        const LEG_FILE: &str = "core/database/src/voice/voice_client.rs";
+        // Sorted. Every one of these is a path that mints or re-pushes
+        // publish rights; adding a fifth means deciding, deliberately, that
+        // it is gated too.
+        const EXPECTED: [&str; 4] = [
+            "core/database/src/voice/mod.rs", // sync_user_voice_permissions
+            "core/database/src/voice/remote_control.rs", // RC revoke
+            LEG_FILE,                         // the join token
+            "delta/src/routes/channels/remote_control.rs", // RC grant
+        ];
+
+        let sources = shipping_sources();
+        let mut callers: Vec<&str> = Vec::new();
+
+        for (rel, shipping) in &sources {
+            for at in call_sites(shipping, NEEDLE) {
+                let args = call_args(shipping, at + NEEDLE.len() - 1);
+                assert!(
+                    args.contains(CONSTRUCTOR),
+                    "the get_allowed_sources call site in {rel} does not \
+                     construct its AfkGate inline — pass \
+                     `AfkGate::resolve(db, channel, server).await?` directly \
+                     as the argument so this contract can see it. There is \
+                     no other shipping constructor, and that is deliberate: \
+                     audit CRITICAL-1 is what happens when a call site can \
+                     opt out of this gate"
+                );
+                callers.push(rel.as_str());
+            }
+        }
+
+        callers.sort_unstable();
+        callers.dedup();
+        assert_eq!(
+            callers, EXPECTED,
+            "the inventory of publish-rights paths changed. Four production \
+             call sites feed LiveKit grants through get_allowed_sources; a \
+             new one is a new way to publish in the AFK channel"
+        );
+
+        for (rel, shipping) in &sources {
+            assert!(
+                !shipping.contains("from_raw_for_tests("),
+                "{rel} reaches for the test-only AfkGate constructor — that \
+                 is the caller-supplied bool D2 forbids"
+            );
+        }
+
+        // The fifth path. `create_screen_leg_token` spells its grant out
+        // instead of deriving it (its own doc comment says so), so the scan
+        // above cannot see it: a phone would screen-share into the AFK
+        // channel while every WebView in the room was refused.
+        let leg = &sources
+            .iter()
+            .find(|(rel, _)| rel == LEG_FILE)
+            .expect("the screen-leg token file moved — move this contract with it")
+            .1;
+        let fn_start = leg
+            .find("fn create_screen_leg_token")
+            .expect("create_screen_leg_token left the file — move this contract with it");
+        let fn_end = fn_start
+            + leg[fn_start..]
+                .find("\n    pub async fn ")
+                .unwrap_or(leg.len() - fn_start);
+        assert!(
+            leg[fn_start..fn_end].contains(CONSTRUCTOR),
+            "the Android screen leg hard-codes can_publish: true plus both \
+             screen sources and never consults get_allowed_sources — it must \
+             carry its own AFK gate"
+        );
+    }
 }
 
 pub async fn sync_user_voice_permissions(
@@ -1558,11 +2057,41 @@ pub async fn sync_user_voice_permissions(
 
         let before = update_event.clone();
 
-        let can_video =
-            limits.video && permissions.has_channel_permission(ChannelPermission::Video);
-        let can_speak = permissions.has_channel_permission(ChannelPermission::Speak);
         let can_listen = permissions.has_channel_permission(ChannelPermission::Listen);
-        let allowed_sources = get_allowed_sources(&limits, permissions);
+        // The AFK gate is resolved HERE, once, from the `server` this function
+        // was already handed — `sync_voice_permissions` calls us once per
+        // participant of the channel, so resolving it from the database per
+        // participant would put an extra `fetch_server` on every member of
+        // every call on every role edit. `AfkGate::resolve` uses the supplied
+        // document when it is the right one and fetches only when it is not,
+        // which is why the server-less callers below can still pass `None`
+        // without weakening anything.
+        let allowed_sources = get_allowed_sources(
+            &limits,
+            permissions,
+            AfkGate::resolve(db, channel, server).await?,
+        );
+
+        // Audit MEDIUM-7. `can_video` / `can_speak` are DERIVED FROM THE GATED
+        // SOURCE LIST rather than recomputed from permission bits, and that is
+        // load-bearing, not tidiness.
+        //
+        // D2 deliberately puts AFK outside the permission system, so under an
+        // AFK designation the bits are unchanged, every field of
+        // `update_event` would stay `None`, `update_event == before` holds and
+        // the fan-out at the bottom of this function emits NOTHING. The SFU
+        // would kill the tracks while every other client kept rendering a
+        // camera tile and a speaking indicator for someone now silent and
+        // dark, until an unrelated resync happened.
+        //
+        // Reading them off `allowed_sources` cannot drift from the gate: the
+        // list contains `Camera` iff (Video permission && video limit) and
+        // `Microphone` iff Speak — exactly the two expressions this replaced —
+        // and is empty under AFK, which forces `camera` / `screensharing` /
+        // `screen_video` / `is_publishing` to `Some(false)` for anyone who
+        // currently has them set and so makes the roster update.
+        let can_video = allowed_sources.contains(&TrackSource::Camera);
+        let can_speak = allowed_sources.contains(&TrackSource::Microphone);
 
         update_event.camera = voice_state.camera.then_some(can_video);
         update_event.screensharing = voice_state.screensharing.then_some(can_video);
