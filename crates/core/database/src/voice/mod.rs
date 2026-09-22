@@ -1210,6 +1210,77 @@ pub fn remote_control_participant_permissions(
     }
 }
 
+/// The baseline a permission sync's roster update is compared against: a
+/// `PartialUserVoiceState` carrying nothing but the participant's id.
+///
+/// `sync_user_voice_permissions` fans out only `if update_event != before`,
+/// so this value is what "nothing changed, emit nothing" literally means.
+/// It is a named function rather than an inline literal so that the
+/// regression test for [`roster_flags`] can compare against the SAME
+/// baseline the production guard uses instead of re-typing it.
+pub(crate) fn roster_baseline(user_id: &str) -> PartialUserVoiceState {
+    PartialUserVoiceState {
+        id: Some(user_id.to_string()),
+        ..Default::default()
+    }
+}
+
+/// The roster half of a permission sync: given the participant's CURRENT
+/// voice state and the source list the AFK gate has already been applied to,
+/// produce the `PartialUserVoiceState` to persist and fan out.
+///
+/// Audit MEDIUM-7, and the remediation of audit HIGH-1 on that fix.
+///
+/// `can_video` / `can_speak` are DERIVED FROM THE GATED SOURCE LIST rather
+/// than recomputed from permission bits, and that is load-bearing, not
+/// tidiness. D2 deliberately puts AFK outside the permission system, so under
+/// an AFK designation the bits are unchanged; recomputing from them would
+/// leave every field `None`, `update_event == before` would hold and the
+/// fan-out would emit NOTHING. The SFU would kill the tracks while every
+/// other client kept rendering a camera tile and a speaking indicator for
+/// someone now silent and dark, until an unrelated resync happened.
+///
+/// Reading them off `allowed_sources` cannot drift from the gate: the list
+/// contains `Camera` iff (Video permission && video limit) and `Microphone`
+/// iff Speak — exactly the two expressions this replaced — and is EMPTY under
+/// AFK, which forces `camera` / `screensharing` / `screen_video` /
+/// `is_publishing` to `Some(false)` for anyone who currently has them set and
+/// so makes the roster update.
+///
+/// This lives in a function called by BOTH `sync_user_voice_permissions` and
+/// its regression test on purpose. The previous test re-typed these four
+/// expressions, so reverting the production derivation to the permission-bit
+/// form left it green — the defect it is named for would have shipped.
+///
+/// `recording` is DELIBERATELY absent, unlike every flag above and unlike the
+/// remote-control teardown. Revoking `RecordCall` mid-call cannot stop a
+/// recording that is already running: the recorder is a MediaRecorder in the
+/// participant's own client, holding tracks it has already been sent, and no
+/// server-asserted state reaches it. Clearing the flag would therefore not end
+/// the recording — it would only delete the indicator that says one is
+/// happening, leaving everyone else in the call believing they are unrecorded
+/// while the file keeps growing. A stale-true flag over-warns; a cleared one
+/// lies. This is the opposite direction from remote control (where the server
+/// genuinely holds the capability and revoking it genuinely ends the session)
+/// and the asymmetry is the whole point: revoke the bit to stop the NEXT
+/// recording.
+pub(crate) fn roster_flags(
+    user_id: &str,
+    allowed_sources: &[TrackSource],
+    state: &UserVoiceState,
+) -> PartialUserVoiceState {
+    let can_video = allowed_sources.contains(&TrackSource::Camera);
+    let can_speak = allowed_sources.contains(&TrackSource::Microphone);
+
+    PartialUserVoiceState {
+        camera: state.camera.then_some(can_video),
+        screensharing: state.screensharing.then_some(can_video),
+        screen_video: state.screen_video.then_some(can_video),
+        is_publishing: state.is_publishing.then_some(can_speak),
+        ..roster_baseline(user_id)
+    }
+}
+
 #[cfg(test)]
 mod permission_tests {
     use livekit_protocol::TrackSource;
@@ -1217,8 +1288,8 @@ mod permission_tests {
     use revolt_permissions::{ChannelPermission, PermissionValue};
 
     use super::{
-        get_allowed_sources, user_id_from_participant_identity, voice_participant_permissions,
-        AfkGate,
+        get_allowed_sources, roster_baseline, roster_flags, user_id_from_participant_identity,
+        voice_participant_permissions, AfkGate, Timestamp, UserVoiceState,
     };
 
     /// A resolved "this is not the AFK channel" gate, for the tests that are
@@ -1470,7 +1541,13 @@ mod permission_tests {
     /// that wrong cannot pass silently: both scans below assert their known
     /// call sites are FOUND, so an over-strip that eats shipping code fails
     /// the run.
-    fn strip_test_items(source: &str) -> String {
+    ///
+    /// Audit LOW-2 (wave-3 completion audit): an item whose braces never
+    /// balance used to run silently to EOF, which SILENTLY DELETES every
+    /// shipping line below it — in this file, the entire second half. A
+    /// scanner that truncates on malformed input is a false-PASS generator,
+    /// so it now panics instead, naming the file and what to do about it.
+    fn strip_test_items(rel: &str, source: &str) -> String {
         const ATTR: &str = "#[cfg(test)]";
         let mut shipping = String::with_capacity(source.len());
         let mut rest = source;
@@ -1479,25 +1556,35 @@ mod permission_tests {
             let after = &rest[attr + ATTR.len()..];
 
             let mut depth = 0i64;
-            let mut item_end = after.len(); // unterminated item runs to EOF
+            let mut item_end = None;
             for (i, ch) in after.char_indices() {
                 match ch {
                     ';' if depth == 0 => {
-                        item_end = i + 1;
+                        item_end = Some(i + 1);
                         break;
                     }
                     '{' => depth += 1,
                     '}' => {
                         depth -= 1;
-                        assert!(depth >= 0, "unbalanced braces after {ATTR}");
+                        assert!(depth >= 0, "unbalanced braces after {ATTR} in {rel}");
                         if depth == 0 {
-                            item_end = i + 1;
+                            item_end = Some(i + 1);
                             break;
                         }
                     }
                     _ => {}
                 }
             }
+            let item_end = item_end.unwrap_or_else(|| {
+                panic!(
+                    "a `{ATTR}` item in {rel} is never closed — it ran to end \
+                     of file. Either a brace is genuinely unbalanced, or a \
+                     test string or comment contains an unpaired brace (write \
+                     it as the \\u escape instead). Truncating here would \
+                     silently delete every shipping line below it from this \
+                     scan"
+                )
+            });
             rest = &after[item_end..];
         }
         shipping.push_str(rest);
@@ -1525,7 +1612,8 @@ mod permission_tests {
                     .expect("scanned file outside crates/")
                     .to_string_lossy()
                     .replace('\\', "/");
-                (rel, strip_test_items(&text))
+                let shipping = strip_test_items(&rel, &text);
+                (rel, shipping)
             })
             .collect()
     }
@@ -1813,6 +1901,24 @@ mod permission_tests {
         assert!(voice_participant_permissions(true, &ungated).can_publish);
     }
 
+    /// A participant who is, right now, publishing on the microphone, on
+    /// camera and on a screen share — the state the roster is rendering when
+    /// the designation lands on their channel.
+    fn publishing_everything(id: &str) -> UserVoiceState {
+        UserVoiceState {
+            id: id.to_string(),
+            joined_at: Timestamp::UNIX_EPOCH,
+            is_receiving: true,
+            is_publishing: true,
+            screensharing: true,
+            camera: true,
+            screen_video: true,
+            recording: true,
+            rc_capable: false,
+            watching: false,
+        }
+    }
+
     /// Audit MEDIUM-7: under AFK the permission-sync must actually EMIT a
     /// `UserVoiceStateUpdate`.
     ///
@@ -1824,14 +1930,21 @@ mod permission_tests {
     /// would be sent. The SFU would kill the tracks while every other client
     /// kept rendering a camera tile and a speaking indicator.
     ///
-    /// HONEST SCOPE: this reproduces the four expressions
-    /// `sync_user_voice_permissions` uses; it does not call it, because that
-    /// function needs Redis voice state and a LiveKit node. It pins the shape
-    /// of the fix, not the delivery — only a live two-seat leg proves seat B's
-    /// roster actually drops the tile.
+    /// Audit HIGH-1 (wave-3 completion audit): the first version of this test
+    /// RE-TYPED the four expressions instead of calling them. The auditor
+    /// reverted the production derivation to the permission-bit form and the
+    /// suite stayed byte-identically green — the defect this test is named for
+    /// would have shipped. It now calls `roster_flags` and `roster_baseline`,
+    /// the same two functions `sync_user_voice_permissions` calls, and holds no
+    /// copy of their logic at all.
+    ///
+    /// HONEST SCOPE: it exercises the derivation, not the delivery. It does not
+    /// call `sync_user_voice_permissions` itself, which needs Redis voice state
+    /// and a LiveKit node; only a live two-seat leg proves seat B's roster
+    /// actually drops the tile.
     #[test]
     fn afk_sync_forces_the_roster_flags_false_so_an_event_is_emitted() {
-        use super::PartialUserVoiceState;
+        const ID: &str = "01KX7HASD9FHBYA3XGKA5YACYX";
 
         // A privileged account with every bit and the video limit on, in the
         // AFK channel: the hardest case for the gate.
@@ -1840,22 +1953,11 @@ mod permission_tests {
             PermissionValue::from_raw(u64::MAX),
             afk(),
         );
-        let can_video = allowed_sources.contains(&TrackSource::Camera);
-        let can_speak = allowed_sources.contains(&TrackSource::Microphone);
-        assert!(!can_video && !can_speak);
+        assert!(allowed_sources.is_empty());
 
-        let mut update_event = PartialUserVoiceState {
-            id: Some("01KX7HASD9FHBYA3XGKA5YACYX".to_string()),
-            ..Default::default()
-        };
-        let before = update_event.clone();
-
-        // A participant who is, right now, publishing on camera and sharing
-        // their screen — the state the roster is currently rendering.
-        update_event.camera = true.then_some(can_video);
-        update_event.screensharing = true.then_some(can_video);
-        update_event.screen_video = true.then_some(can_video);
-        update_event.is_publishing = true.then_some(can_speak);
+        let state = publishing_everything(ID);
+        let before = roster_baseline(ID);
+        let update_event = roster_flags(ID, &allowed_sources, &state);
 
         assert_eq!(update_event.camera, Some(false));
         assert_eq!(update_event.screensharing, Some(false));
@@ -1868,6 +1970,39 @@ mod permission_tests {
              roster keeps showing a camera tile for someone the SFU has \
              already silenced"
         );
+
+        // `recording` stays out of the sync even though this participant has
+        // it set — clearing it would delete the indicator without stopping the
+        // recorder, which runs in the participant's own client. See
+        // `roster_flags`.
+        assert_eq!(update_event.recording, None);
+
+        // Control 1: the SAME participant in an UNDESIGNATED channel keeps
+        // every flag true, so the assertions above cannot pass for the wrong
+        // reason (e.g. a `roster_flags` that always writes false).
+        let ungated = get_allowed_sources(
+            &limits_with_video(true),
+            PermissionValue::from_raw(u64::MAX),
+            not_afk(),
+        );
+        let unchanged = roster_flags(ID, &ungated, &state);
+        assert_eq!(unchanged.camera, Some(true));
+        assert_eq!(unchanged.screensharing, Some(true));
+        assert_eq!(unchanged.screen_video, Some(true));
+        assert_eq!(unchanged.is_publishing, Some(true));
+
+        // Control 2: a participant publishing NOTHING produces exactly the
+        // baseline even under the gate — there is nothing to correct, so the
+        // guard correctly suppresses the event. This is what `!=` has to mean
+        // for the assertion above to carry weight.
+        let idle = UserVoiceState {
+            is_publishing: false,
+            screensharing: false,
+            camera: false,
+            screen_video: false,
+            ..publishing_everything(ID)
+        };
+        assert_eq!(roster_flags(ID, &allowed_sources, &idle), before);
     }
 
     /// The D2 regression, end to end against a real database: the SERVER
@@ -1879,15 +2014,25 @@ mod permission_tests {
     /// gate from a permission denial. It also covers both resolution paths
     /// (supplied server document vs. fetched) and asserts the gate binds
     /// ONLY the designated channel.
+    ///
+    /// Audit LOW-6 (wave-3 completion audit): this test used to assert the
+    /// owner held `Speak`/`Video` on a FRESH server with no overrides, which
+    /// is true with or without the short-circuit — so it demonstrated nothing
+    /// about D2's premise. It now DENIES `Speak` to the default role on the
+    /// channel itself, shows an ordinary member actually loses it there, and
+    /// only then shows the owner keeps it regardless. That is the
+    /// short-circuit observed rather than asserted, and it is why the mute has
+    /// to be a hard gate applied after the calculus.
     #[tokio::test]
     async fn afk_gate_binds_the_server_owner() {
         use crate::{
-            util::permissions::DatabasePermissionQuery, Channel, PartialServer, Server, User,
+            util::permissions::DatabasePermissionQuery, Channel, Member, PartialChannel,
+            PartialServer, Server, User,
         };
         use revolt_models::v0::{
             DataCreateServer, DataCreateServerChannel, LegacyServerChannelType,
         };
-        use revolt_permissions::calculate_channel_permissions;
+        use revolt_permissions::{calculate_channel_permissions, OverrideField};
 
         database_test!(|db| async move {
             let owner = User::create(&db, "AfkGateOwner".to_string(), None, None)
@@ -1917,7 +2062,7 @@ mod permission_tests {
                 }
             };
 
-            let afk_channel =
+            let mut afk_channel =
                 Channel::create_server_channel(&db, &mut server, voice_channel("AFK"), true)
                     .await
                     .expect("`Channel`");
@@ -1926,13 +2071,63 @@ mod permission_tests {
                     .await
                     .expect("`Channel`");
 
+            // An ordinary member, to show what a permission denial DOES bind.
+            let member_user = User::create(&db, "AfkGateMember".to_string(), None, None)
+                .await
+                .expect("`User`");
+            Member::create(&db, &server, &member_user, None)
+                .await
+                .expect("`Member`");
+
+            // Control, before the override: the default role does grant Speak,
+            // so losing it below is the override doing work and not the
+            // server's defaults.
+            let mut member_query =
+                DatabasePermissionQuery::new(&db, &member_user).channel(&afk_channel);
+            assert!(
+                calculate_channel_permissions(&mut member_query)
+                    .await
+                    .has_channel_permission(ChannelPermission::Speak),
+                "control: the default role grants Speak on a fresh voice channel"
+            );
+
+            // Deny Speak to the DEFAULT ROLE on the AFK channel itself — the
+            // closest thing the permission system has to "AFK as a permission".
+            afk_channel
+                .update(
+                    &db,
+                    PartialChannel {
+                        default_permissions: Some(OverrideField {
+                            a: 0,
+                            d: ChannelPermission::Speak as i64,
+                        }),
+                        ..Default::default()
+                    },
+                    vec![],
+                )
+                .await
+                .expect("channel override");
+
+            let mut member_query =
+                DatabasePermissionQuery::new(&db, &member_user).channel(&afk_channel);
+            assert!(
+                !calculate_channel_permissions(&mut member_query)
+                    .await
+                    .has_channel_permission(ChannelPermission::Speak),
+                "the channel override must actually deny Speak to an ordinary \
+                 member — otherwise the owner assertion below proves nothing"
+            );
+
             let mut query = DatabasePermissionQuery::new(&db, &owner).channel(&afk_channel);
             let permissions = calculate_channel_permissions(&mut query).await;
             assert!(
                 permissions.has_channel_permission(ChannelPermission::Speak)
                     && permissions.has_channel_permission(ChannelPermission::Video),
-                "the owner holds every bit — that is exactly why the gate \
-                 cannot be built as a permission denial (D2)"
+                "D2, DEMONSTRATED: the same override that just stripped Speak \
+                 from an ordinary member leaves the OWNER holding it, because \
+                 `calculate_channel_permissions` returns GrantAllSafe for the \
+                 server owner before any override is read. That is exactly why \
+                 the AFK mute cannot be built as a permission denial"
             );
 
             let limits = owner.limits().await;
@@ -2007,25 +2202,34 @@ mod permission_tests {
     /// test-only constructor appears in no shipping source, and the FIFTH
     /// publish-rights path — the Android screen leg, which hard-codes its
     /// grant and never consults the helper — carries its own gate.
+    ///
+    /// Audit LOW-2 (wave-3 completion audit): the inventory used to
+    /// `dedup()` to a set of FILES, which collapses a file to one entry and
+    /// so cannot see a SECOND call site added to an already-listed file. The
+    /// realistic case is this very file, the one lane file with shipping code
+    /// BELOW its test module. It now pins a COUNT PER FILE, so a second site
+    /// anywhere is a failure, not a silent pass.
     #[test]
     fn afk_gate_has_no_opt_out_at_any_call_site() {
         const NEEDLE: &str = "get_allowed_sources(";
         const CONSTRUCTOR: &str = "AfkGate::resolve(";
         const LEG_FILE: &str = "core/database/src/voice/voice_client.rs";
-        // Sorted. Every one of these is a path that mints or re-pushes
-        // publish rights; adding a fifth means deciding, deliberately, that
-        // it is gated too.
-        const EXPECTED: [&str; 4] = [
-            "core/database/src/voice/mod.rs", // sync_user_voice_permissions
-            "core/database/src/voice/remote_control.rs", // RC revoke
-            LEG_FILE,                         // the join token
-            "delta/src/routes/channels/remote_control.rs", // RC grant
+        // Sorted, and with the number of call sites each file is allowed to
+        // hold. Every one of these is a path that mints or re-pushes publish
+        // rights; adding a fifth — or a second one inside a file already
+        // here — means deciding, deliberately, that it is gated too.
+        const EXPECTED: [(&str, usize); 4] = [
+            ("core/database/src/voice/mod.rs", 1), // sync_user_voice_permissions
+            ("core/database/src/voice/remote_control.rs", 1), // RC revoke
+            (LEG_FILE, 1),                        // the join token
+            ("delta/src/routes/channels/remote_control.rs", 1), // RC grant
         ];
 
         let sources = shipping_sources();
-        let mut callers: Vec<&str> = Vec::new();
+        let mut callers: Vec<(&str, usize)> = Vec::new();
 
         for (rel, shipping) in &sources {
+            let mut count = 0usize;
             for at in call_sites(shipping, NEEDLE) {
                 let args = call_args(shipping, at + NEEDLE.len() - 1);
                 assert!(
@@ -2038,17 +2242,20 @@ mod permission_tests {
                      audit CRITICAL-1 is what happens when a call site can \
                      opt out of this gate"
                 );
-                callers.push(rel.as_str());
+                count += 1;
+            }
+            if count > 0 {
+                callers.push((rel.as_str(), count));
             }
         }
 
         callers.sort_unstable();
-        callers.dedup();
         assert_eq!(
             callers, EXPECTED,
             "the inventory of publish-rights paths changed. Four production \
-             call sites feed LiveKit grants through get_allowed_sources; a \
-             new one is a new way to publish in the AFK channel"
+             call sites, one per file, feed LiveKit grants through \
+             get_allowed_sources; a new one — including a second one in a \
+             file already listed — is a new way to publish in the AFK channel"
         );
 
         for (rel, shipping) in &sources {
@@ -2262,13 +2469,6 @@ pub async fn sync_user_voice_permissions(
         let permissions = calculate_channel_permissions(&mut query).await;
         let limits = user.limits().await;
 
-        let mut update_event = PartialUserVoiceState {
-            id: Some(user.id.clone()),
-            ..Default::default()
-        };
-
-        let before = update_event.clone();
-
         let can_listen = permissions.has_channel_permission(ChannelPermission::Listen);
         // The AFK gate is resolved HERE, once, from the `server` this function
         // was already handed — `sync_voice_permissions` calls us once per
@@ -2284,47 +2484,14 @@ pub async fn sync_user_voice_permissions(
             AfkGate::resolve(db, channel, server).await?,
         );
 
-        // Audit MEDIUM-7. `can_video` / `can_speak` are DERIVED FROM THE GATED
-        // SOURCE LIST rather than recomputed from permission bits, and that is
-        // load-bearing, not tidiness.
-        //
-        // D2 deliberately puts AFK outside the permission system, so under an
-        // AFK designation the bits are unchanged, every field of
-        // `update_event` would stay `None`, `update_event == before` holds and
-        // the fan-out at the bottom of this function emits NOTHING. The SFU
-        // would kill the tracks while every other client kept rendering a
-        // camera tile and a speaking indicator for someone now silent and
-        // dark, until an unrelated resync happened.
-        //
-        // Reading them off `allowed_sources` cannot drift from the gate: the
-        // list contains `Camera` iff (Video permission && video limit) and
-        // `Microphone` iff Speak — exactly the two expressions this replaced —
-        // and is empty under AFK, which forces `camera` / `screensharing` /
-        // `screen_video` / `is_publishing` to `Some(false)` for anyone who
-        // currently has them set and so makes the roster update.
-        let can_video = allowed_sources.contains(&TrackSource::Camera);
-        let can_speak = allowed_sources.contains(&TrackSource::Microphone);
-
-        update_event.camera = voice_state.camera.then_some(can_video);
-        update_event.screensharing = voice_state.screensharing.then_some(can_video);
-        update_event.screen_video = voice_state.screen_video.then_some(can_video);
-        update_event.is_publishing = voice_state.is_publishing.then_some(can_speak);
-
-        // `recording` is DELIBERATELY not synced down here, unlike every flag
-        // above and unlike the remote-control teardown below. Revoking
-        // `RecordCall` mid-call cannot stop a recording that is already
-        // running: the recorder is a MediaRecorder in the participant's own
-        // client, holding tracks it has already been sent, and no
-        // server-asserted state reaches it. Clearing the flag would therefore
-        // not end the recording — it would only delete the indicator that
-        // says one is happening, leaving everyone else in the call believing
-        // they are unrecorded while the file keeps growing. A stale-true flag
-        // over-warns; a cleared one lies. This is the opposite direction from
-        // remote control (where the server genuinely holds the capability and
-        // revoking it genuinely ends the session) and the asymmetry is the
-        // whole point: revoke the bit to stop the NEXT recording.
-
-
+        // Audit MEDIUM-7, and the remediation of audit HIGH-1 on it. The four
+        // roster flags are derived from the GATED source list, in a function
+        // the regression test calls too — see `roster_flags`, which carries
+        // the whole rationale (including why `recording` is not synced here).
+        // Nothing may be re-typed at this call site: a copy here is exactly
+        // what let the permission-bit derivation ship green once already.
+        let before = roster_baseline(&user.id);
+        let update_event = roster_flags(&user.id, &allowed_sources, &voice_state);
 
         update_voice_state(&user_voice_channel, &user.id, &update_event).await?;
 
