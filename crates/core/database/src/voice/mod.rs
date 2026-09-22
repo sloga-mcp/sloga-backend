@@ -13,7 +13,7 @@ use redis_kiss::{
     redis::{FromRedisValue, Pipeline, RedisError, RedisWrite, ToRedisArgs, Value},
     AsyncCommands, Conn,
 };
-use revolt_config::FeaturesLimits;
+use revolt_config::{config, FeaturesLimits};
 use revolt_models::v0::{self, PartialUserVoiceState, UserVoiceState};
 use revolt_permissions::{calculate_channel_permissions, ChannelPermission, PermissionValue};
 use revolt_result::{create_error, Result, ToRevoltError};
@@ -1043,16 +1043,392 @@ pub async fn get_channel_voice_state(
     }
 }
 
-pub async fn move_user(user: &str, from_channel_id: &str, to_channel_id: &str) -> Result<()> {
-    get_connection()
-        .await?
-        .smove(
-            format!("vc_members:{from_channel_id}"),
-            format!("vc_members:{to_channel_id}"),
-            user,
+/// What a server-authoritative voice move actually did.
+///
+/// The two non-`Moved` arms are ordinary outcomes, not failures: the callers
+/// that matter are a moderator route (where "they already left" is a no-op,
+/// not a 500) and the AFK sweep (which runs on a timer against a population
+/// that is shifting under it). Raising on either would turn a lost race into
+/// an error the caller has to special-case back into success.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VoiceMoveOutcome {
+    /// The target was moved. `node` is the LiveKit node the destination room
+    /// lives on, `from` the channel they were pulled out of.
+    Moved { node: String, from: String },
+    /// The target holds no voice state in the destination's server, or the
+    /// channel they are recorded in has no LiveKit node behind it any more.
+    NotConnected,
+    /// The target is already sitting in the destination.
+    AlreadyPresent,
+}
+
+/// The side-effect-free half of a voice move: everything that can refuse it,
+/// and nothing that can change anything.
+///
+/// Kept separate from the move itself so callers can refuse BEFORE they
+/// mutate. `member_edit` relies on this: it validates here, then writes the
+/// member document, then moves — so a refusal leaves the member untouched.
+///
+/// That only holds because the route refuses to combine `voice_channel` with
+/// the fields that move these very permissions (`roles`, `timeout`,
+/// `can_publish`, `can_receive`). Combined, the pre-flight and the move read
+/// two DIFFERENT member documents — the move re-reads it deliberately, so the
+/// token is minted from permissions that are current — and the second reading
+/// can refuse after the first has already committed the edit. A refusal that
+/// leaves a member timed out but not moved is not "untouched".
+///
+/// Returns what the gates already had to compute, so the move does not
+/// recompute it. The destination `PermissionValue` in particular is used at
+/// both permission gates, at the `max_users` exemption and again to mint the
+/// token; it used to be calculated twice, 130 lines apart, which is how the
+/// two copies came to disagree about whose permissions they were.
+#[derive(Debug)]
+struct VoiceMoveAdmission {
+    /// The TARGET's permissions on the DESTINATION channel.
+    permissions: PermissionValue,
+}
+
+/// Whether a destination's `max_users` cap refuses `target_id`.
+///
+/// Pure, and deliberately so: the roster read that feeds it needs Redis,
+/// which the unit tests do not have, while the decision itself is the part
+/// that was wrong and is worth pinning.
+///
+/// `members` is the destination's live roster; `target_manages_channel` is
+/// the `ManageChannel` exemption the join front door grants.
+fn occupancy_cap_refuses(
+    members: &[String],
+    max_users: usize,
+    target_id: &str,
+    target_manages_channel: bool,
+) -> bool {
+    // Already in the room: admitting them cannot grow the roster, so the cap
+    // has nothing to say about them. `video_cap_would_refuse` and
+    // `mls_cap_would_refuse` have both carried this exemption from the day
+    // they landed; the occupancy cap did not, and that asymmetry is the whole
+    // defect. An AFK channel with `max_users: 5` holding five idle members
+    // refused every one of those five, on every sweep tick, because
+    // `5 >= 5` was answered before anyone asked whether they were already
+    // there — and on the route it turned "move X to where X already is" into
+    // a 400 the moment the channel was capped and full.
+    if members.iter().any(|member| member == target_id) {
+        return false;
+    }
+
+    members.len() >= max_users && !target_manages_channel
+}
+
+async fn admit_voice_move(
+    db: &Database,
+    target: &User,
+    destination: &Channel,
+) -> Result<VoiceMoveAdmission> {
+    // Server channels only. This is the one thing keeping the move primitive
+    // off DMs and Groups, both of which report `server() == None` — and a DM
+    // is an E2EE two-seat call that nothing may drag a third party into.
+    if destination.server().is_none() {
+        return Err(create_error!(UnknownChannel));
+    }
+
+    // The destination must actually be a voice channel. The join front door
+    // has always checked this (`voice_join`); the move path never did, so a
+    // moderator could "move" someone into a text channel and the code below
+    // would happily open a LiveKit room named after it.
+    let Some(voice_info) = destination.voice() else {
+        return Err(create_error!(NotAVoiceChannel));
+    };
+
+    // Evaluated against the TARGET, not whoever asked for the move. The
+    // acting user's Connect is not the question — they are not the one who
+    // ends up in the room — and a daemon sweep has no acting user at all.
+    // Note the query is built from `(db, target)` with no `.member(...)`:
+    // `DatabasePermissionQuery` fetches the member lazily, so this reads the
+    // member document as it stands NOW, including an edit the caller just
+    // committed. Handing it a caller-supplied `Member` would mint the token
+    // from pre-edit permissions.
+    let mut query = DatabasePermissionQuery::new(db, target).channel(destination);
+    let permissions = calculate_channel_permissions(&mut query).await;
+
+    // `ViewChannel` is required alongside `Connect`, and it is about what
+    // happens AFTER the move lands rather than about the move itself: bonfire
+    // filters a channel the user cannot view out of `Ready`, so the client's
+    // `channels.get(to)` comes back undefined and the move UI tells them to
+    // open a channel that structurally is not there — out of the call they
+    // were in, with no route back.
+    //
+    // A move is not a join: the target never chose this destination, so the
+    // gate has to hold for them rather than merely be representable to them.
+    // As the calculus stands today this is implied: the server-channel arm
+    // revokes every bit once `ViewChannel` is missing, so this adds no
+    // refusal that `Connect` does not already produce. It is here to state
+    // the rule the client behaviour actually depends on, and to keep the
+    // gate correct if that implication ever stops holding.
+    permissions.throw_if_lacking_channel_permission(ChannelPermission::ViewChannel)?;
+    permissions.throw_if_lacking_channel_permission(ChannelPermission::Connect)?;
+
+    // The same occupancy cap the join front door enforces, with the same
+    // `ManageChannel` exemption. Without it a move walks straight past a
+    // limit a join is refused at — and since the route skips its
+    // `MoveMembers` check when you move YOURSELF, that was reachable by any
+    // member, not just a moderator.
+    //
+    // Only difference from the join leg: the members read is skipped when
+    // the channel has no cap, because there is nothing to compare it to.
+    //
+    // The decision itself lives in `occupancy_cap_refuses`, which carries the
+    // already-present exemption the other two caps have always had. `None`
+    // here still means "no roster recorded", which is not a full room.
+    if let Some(max_users) = voice_info.max_users {
+        let refused = get_voice_channel_members(&UserVoiceChannel::from_channel(destination))
+            .await?
+            .is_some_and(|members| {
+                occupancy_cap_refuses(
+                    &members,
+                    max_users,
+                    &target.id,
+                    permissions.has(ChannelPermission::ManageChannel as u64),
+                )
+            });
+
+        if refused {
+            return Err(create_error!(CannotJoinCall));
+        }
+    }
+
+    Ok(VoiceMoveAdmission { permissions })
+}
+
+/// Every refusal a voice move can raise, with no side effects, so a caller
+/// can run them before it mutates anything.
+///
+/// `move_user_to_voice_channel` runs the identical set — it goes through the
+/// same `admit_voice_move` and the same `assert_call_caps_admit` — so this is
+/// a pre-flight, never a substitute for it. Nothing here is a TOCTOU-free
+/// promise: the caps in particular are check-then-act, with the voice-ingress
+/// backstop closing the admission race.
+pub async fn assert_voice_move_admissible(
+    db: &Database,
+    target: &User,
+    destination: &Channel,
+) -> Result<()> {
+    admit_voice_move(db, target, destination).await?;
+
+    // Call-admission caps (D12 video-participant cap + T-20 MLS SFU-token
+    // coupling), enforced against the DESTINATION for the TARGET. A
+    // privileged door must not bypass a cap the front door enforces.
+    assert_call_caps_admit(
+        db,
+        &UserVoiceChannel::from_channel(destination),
+        &target.id,
+    )
+    .await
+}
+
+/// Move `target` into `destination`, server-authoritatively.
+///
+/// FOUR ARGUMENTS, ALL DAEMON-CONSTRUCTIBLE, AND DELIBERATELY SO. There is no
+/// `Member`, no `Server`, no acting user and no Rocket type here:
+///
+/// - the member document is fetched lazily by the permission query (see
+///   `admit_voice_move`), so a caller cannot accidentally hand over a stale
+///   one and mint a token from permissions that no longer apply;
+/// - `server_id` is derived from `destination.server()` and `None` is a hard
+///   `UnknownChannel`. It is NOT a parameter, because a parameter is how a
+///   future caller passes `None` and points this at a DM or a Group;
+/// - there is no acting user because the AFK sweep does not have one.
+///
+/// The caller decides whether the move is *allowed by policy* (the route
+/// checks `MoveMembers` and ranking; the sweep checks idleness). This decides
+/// whether it is *possible and safe*, and returns what it did.
+pub async fn move_user_to_voice_channel(
+    db: &Database,
+    voice_client: &VoiceClient,
+    target: &User,
+    destination: &Channel,
+) -> Result<VoiceMoveOutcome> {
+    // Derived here, never passed in, for the reason in the doc comment above
+    // — and derived BEFORE admission rather than taken out of it, so that the
+    // "they are already there" answer below can be given without running any
+    // admission work at all. A DM or a Group still cannot reach a line past
+    // this point.
+    let Some(server_id) = destination.server() else {
+        return Err(create_error!(UnknownChannel));
+    };
+
+    let Some(from) = get_user_voice_channel_in_server(&target.id, server_id).await? else {
+        return Ok(VoiceMoveOutcome::NotConnected);
+    };
+
+    // Source == destination. Without this the code below evicts the target
+    // from the very room it is putting them back into: `remove_user` runs
+    // against a node that is now also the destination's node, so the user is
+    // kicked out of the call they were already happily in. Harmless-looking
+    // on a moderator route (nobody moves someone to where they are), fatal on
+    // a timer: the AFK sweep's population is idle members and its destination
+    // is where idle members already sit, so every tick would re-kick the
+    // entire AFK channel.
+    //
+    // Decided BEFORE `admit_voice_move`, not after it: a member who is
+    // already in the destination must not have to be admissible to it all
+    // over again. Sitting in a capped, full AFK channel used to answer
+    // `CannotJoinCall` for every occupant on every tick — the caps were asked
+    // before anyone asked whether there was anything to do. The cap itself
+    // now exempts an occupant as well, because the route's side-effect-free
+    // pre-flight reaches the cap without ever reaching this line.
+    if from == destination.id() {
+        return Ok(VoiceMoveOutcome::AlreadyPresent);
+    }
+
+    let VoiceMoveAdmission { permissions } = admit_voice_move(db, target, destination).await?;
+
+    let destination_channel = UserVoiceChannel::from_channel(destination);
+
+    assert_call_caps_admit(db, &destination_channel, &target.id).await?;
+
+    // NOT an unwrap. `{user}:{server}` and `node:{channel}` are separate keys
+    // with no shared lifetime, so a room that finished or was reconciled away
+    // leaves the per-user pointer behind with no node key to match it. As an
+    // unwrap that was a 500 on the route and, in crond, a panic that
+    // `cron_task_wrapper` catches by sleeping 60s — one stale key taking the
+    // whole sweep down, over and over. A pointer with no node means the call
+    // is gone, which is exactly `NotConnected`.
+    let Some(old_node) = get_channel_node(&from).await? else {
+        return Ok(VoiceMoveOutcome::NotConnected);
+    };
+
+    // A destination that has no room yet is co-located with the source.
+    // Decided here, WRITTEN further down: `set_channel_node` is the first
+    // thing this function makes durable, and it used to run two statements
+    // ahead of the node resolution that can refuse — so an unknown node left
+    // the destination pinned to a node the move then declined to use.
+    let existing_node = get_channel_node(destination.id()).await?;
+    let new_node = existing_node.clone().unwrap_or_else(|| old_node.clone());
+
+    // Resolved BEFORE anything destructive happens — and now genuinely so.
+    // An unknown node has to refuse while the target is still in their
+    // original room, with no state written on the way out: resolving it after
+    // the eviction would leave them kicked out of one call and holding no way
+    // into the other.
+    let config = config().await;
+    let url = config
+        .hosts
+        .livekit
+        .get(&new_node)
+        .ok_or_else(|| create_error!(UnknownNode))?
+        .clone();
+
+    // First write. Everything above this line is side-effect free.
+    if existing_node.is_none() {
+        set_channel_node(destination.id(), &new_node).await?;
+    }
+
+    let source_channel = UserVoiceChannel {
+        id: from.clone(),
+        server_id: destination_channel.server_id.clone(),
+    };
+
+    set_user_moved_from_voice(&from, &destination_channel, &target.id).await?;
+    set_user_moved_to_voice(destination.id(), &source_channel, &target.id).await?;
+
+    voice_client.create_room(&new_node, destination).await?;
+
+    // Preserve a device-qualified identity across the move: the target's
+    // device suffix is recovered from the old channel's ingress-maintained
+    // mapping (the server itself never knows which device is in a call).
+    //
+    // It is also what the event below carries, so the session this token was
+    // minted for is the only one that redeems it — see the emit site.
+    let old_identity = get_voice_participant_identity(&from, &target.id).await?;
+    let device_id = old_identity
+        .strip_prefix(&format!("{}:", target.id))
+        .map(str::to_string);
+
+    let token = voice_client
+        .create_token(
+            &new_node,
+            db,
+            target,
+            permissions,
+            destination,
+            device_id.as_deref(),
         )
-        .await
-        .to_internal_error()
+        .await?;
+
+    // Remote-control release hook (plan §1): this path calls `remove_user`
+    // directly, bypassing `remove_user_from_voice_channel`, and additionally
+    // re-tokens the target into a DIFFERENT room while any grant stays keyed
+    // to the old channel — so it must release explicitly here.
+    remote_control::release_remote_control_for_user(
+        db,
+        voice_client,
+        &source_channel,
+        &target.id,
+        "revoked_by_moderator",
+        // The participant is still in the old room right now. Nothing below
+        // reliably ends that: `remove_user` can fail, and on the reordered
+        // path the client may instead tear the old room down itself on its
+        // way into the new one. Neither is something a grant may be left
+        // waiting on, so revoke actively.
+        false,
+    )
+    .await;
+
+    // EMITTED BEFORE THE EVICTION, AND THE ORDER IS THE FIX.
+    //
+    // `remove_user` is a LiveKit `RemoveParticipant`, which puts a `Leave`
+    // straight down the client's signalling socket. This event has to travel
+    // LiveKit -> delta -> Redis publish -> bonfire -> the client's socket:
+    // at least two more hops. Emitting it second therefore guaranteed the
+    // client was out of CONNECTED before its own move token arrived, and its
+    // addressing gate dropped the move in silence — the member landed
+    // nowhere, which is the shipped bug this exists to repair.
+    //
+    // The failure mode this creates, stated rather than left to be
+    // discovered: if the emit succeeds and `remove_user` then fails, the
+    // target holds a valid token for the destination and no eviction has
+    // happened. That is acceptable, and strictly better than the inverse. A
+    // client can only be in one call, so connecting with the token tears down
+    // its own old room, which is what `remove_user` was trying to achieve;
+    // the worst case is a stale participant in the source room until that
+    // teardown reaches the SFU, and the remote-control grant above has
+    // already been revoked actively for exactly this reason. The `?` below
+    // still reports the failure to the caller, so the route does not claim a
+    // clean move. The old order's failure mode was worse and more common: the
+    // eviction succeeded, the emit never ran, and the target sat disconnected
+    // from everything with no token at all.
+    //
+    // This does not by itself close the race — the client half of it is an
+    // acceptance window for a token that arrives just after a drop from
+    // `from`. It removes the GUARANTEED loss and makes the ordinary path
+    // work; the window is what covers the reordering being lost to
+    // scheduling.
+    // `device_id` is EXACTLY the suffix handed to `create_token` above, on
+    // the wire. `private` reaches every session the target has, so without it
+    // each session has only a local guess at whether the token is its own —
+    // and the guess is satisfiable by an ordinary event, so two sessions can
+    // reach for one single-mint token and the SFU evicts whichever loses the
+    // duplicate-identity race. `None` is honest rather than permissive: no
+    // mapping was recorded for the source room, and the client is told to say
+    // so rather than assume the token is addressed to it.
+    EventV1::UserMoveVoiceChannel {
+        node: new_node.clone(),
+        url,
+        device_id,
+        from: from.clone(),
+        to: destination.id().to_string(),
+        token,
+    }
+    .private(target.id.clone())
+    .await;
+
+    voice_client
+        .remove_user(&old_node, &target.id, &from)
+        .await?;
+
+    Ok(VoiceMoveOutcome::Moved {
+        node: new_node,
+        from,
+    })
 }
 
 pub async fn sync_voice_permissions(
@@ -2423,6 +2799,471 @@ mod permission_tests {
             callers, EXPECTED,
             "sync_afk_designation_change gained or lost a caller"
         );
+    }
+
+    /// The route both mover-side gates live in.
+    const MEMBER_EDIT: &str = "delta/src/routes/servers/member_edit.rs";
+
+    /// The self-move exemption both gates are written under, verbatim.
+    ///
+    /// Pinned as TEXT because both of its plausible one-token reversals are
+    /// invisible to everything else that runs: flipping `!=` to `==` leaves a
+    /// gate that only ever fires on a self-move, i.e. never on the action it
+    /// exists to refuse, and no compiler, lint or executable test says a word.
+    const EXEMPTION: &str = "member.id.user != user.id";
+
+    /// The nearest enclosing `if` condition before byte `at`, as written.
+    ///
+    /// Textual, like the rest of this scanner: it reads back to the last
+    /// `if ` and returns what sits between that and the call, minus the
+    /// opening brace. Both gates are therefore written with their exemption
+    /// as the INNERMOST condition and no comment between it and the call —
+    /// if that changes, this stops being able to see the guard, and the
+    /// assertion below says so rather than passing vacuously.
+    fn nearest_guard(shipping: &str, at: usize) -> &str {
+        const IF: &str = "if ";
+        let before = &shipping[..at];
+        let start = before
+            .rfind(IF)
+            .unwrap_or_else(|| panic!("no enclosing `if` before byte {at} in the scanned source"));
+
+        // The brace is an escape, never a literal, for the same reason the
+        // gate scan below writes its one that way: `strip_test_items`
+        // brace-matches this very module out of its own scan.
+        before[start + IF.len()..]
+            .trim_end()
+            .trim_end_matches('\u{7b}')
+            .trim_end()
+    }
+
+    /// Wave-5a. STRUCTURAL pin on one of the member-move route's MOVER-side
+    /// gates — shared by the destination gate and the source gate, which have
+    /// the same shape and the same ways of being reverted.
+    ///
+    /// `admit_voice_move` answers for the TARGET and deliberately knows
+    /// nothing about an acting user — the AFK sweep has none. Whether the
+    /// person who ASKED for the move may reach into a channel is route
+    /// policy, and it has to be evaluated channel-scoped: the route's other
+    /// `MoveMembers` check is computed server-scoped and never reads a
+    /// channel override, so a role denied on a private voice channel passes
+    /// it anyway. That gate was deleted once already, and nothing caught it,
+    /// because the delta route harness needs RabbitMQ and cannot boot on the
+    /// build box — which is exactly why the pin lives over here, in a suite
+    /// that runs.
+    ///
+    /// It proves: `member_edit` still defines the gate, it is still called
+    /// exactly once, its body still computes channel-scoped permissions and
+    /// demands both `MoveMembers` and `ViewChannel`, the call still passes
+    /// the ACTING user (`&user`) and the channel the gate is named for, and
+    /// the call still sits under the self-move exemption written the right
+    /// way round.
+    ///
+    /// The last two are why the arguments and the guard are compared
+    /// LITERALLY rather than merely searched for. A re-audit ran both
+    /// one-token reverts against the presence-only version of this pin —
+    /// `!=` to `==`, and `&user` to `&target_user` — and every gate in the
+    /// tree stayed green: the first makes the gate run only for the case it
+    /// exempts, the second asks whether the person being moved may move
+    /// themselves, which they always may. Nothing else in the workspace can
+    /// see either.
+    ///
+    /// It does NOT prove that the gate runs before the member is mutated, or
+    /// that any particular request is refused.
+    /// `move_is_refused_when_the_mover_is_denied_the_destination` and
+    /// `move_is_refused_when_the_mover_is_denied_the_source` cover those,
+    /// wherever the route harness can run.
+    fn assert_member_edit_gates_the_mover(gate: &str, expected_args: [&str; 3], end: &str) {
+        const REQUIRED: [&str; 3] = [
+            "calculate_channel_permissions(",
+            "ChannelPermission::MoveMembers",
+            "ChannelPermission::ViewChannel",
+        ];
+
+        let sources = shipping_sources();
+        let shipping = &sources
+            .iter()
+            .find(|(rel, _)| rel == MEMBER_EDIT)
+            .unwrap_or_else(|| panic!("{MEMBER_EDIT} is not in the workspace scan"))
+            .1;
+
+        let definition = shipping.find(&format!("fn {gate}")).unwrap_or_else(|| {
+            panic!(
+                "{MEMBER_EDIT} no longer defines a mover-side {end} gate. The \
+                 server-scoped MoveMembers check is not a substitute: it never \
+                 reads a channel override, so a moderator denied on a private \
+                 voice channel can still reach into it"
+            )
+        });
+
+        // `call_sites` skips the `fn` line, so the definition is not a call.
+        let calls = call_sites(shipping, gate);
+        assert_eq!(
+            calls.len(),
+            1,
+            "the mover-side {end} gate must be called exactly once in \
+             {MEMBER_EDIT} — an uncalled gate is the same defect with more code"
+        );
+
+        // The opening brace is written as an escape for the same reason
+        // `every_afk_designation_writer_resyncs_both_sides` writes its one
+        // that way: `strip_test_items` brace-matches this very module to cut
+        // it out of the scan, and a lone brace here silently over-strips the
+        // file and breaks every sibling contract test.
+        let open = definition
+            + shipping[definition..]
+                .find('\u{7b}')
+                .expect("the gate has a body");
+        let body = braced_body(shipping, open);
+
+        for needle in REQUIRED {
+            assert!(
+                body.contains(needle),
+                "the mover-side {end} gate in {MEMBER_EDIT} no longer mentions \
+                 {needle}. It has to compute the acting user's permissions \
+                 against the {end} channel and demand both MoveMembers and \
+                 ViewChannel there"
+            );
+        }
+
+        // The call's argument list, verbatim. `&user` is the acting user;
+        // `&target_user` is the person being moved, and a gate pointed at
+        // them asks whether they may move themselves, which is always yes.
+        let args: Vec<&str> = call_args(shipping, calls[0] + gate.len() - 1)
+            .split(',')
+            .map(str::trim)
+            .filter(|argument| !argument.is_empty())
+            .collect();
+        assert_eq!(
+            args,
+            expected_args.to_vec(),
+            "the mover-side {end} gate in {MEMBER_EDIT} is no longer called \
+             with the acting user and the {end} channel. It must evaluate the \
+             person who ASKED for the move, not the person being moved"
+        );
+
+        // ...and it still only runs when there is somebody to moderate.
+        assert_eq!(
+            nearest_guard(shipping, calls[0]),
+            EXEMPTION,
+            "the mover-side {end} gate in {MEMBER_EDIT} is no longer guarded by \
+             `{EXEMPTION}`. Reversed, the gate runs ONLY for a self-move and \
+             never for the action it exists to refuse; removed, it refuses \
+             members leaving their own call"
+        );
+    }
+
+    #[test]
+    fn the_member_move_route_gates_the_mover_on_the_destination_channel() {
+        assert_member_edit_gates_the_mover(
+            "assert_mover_may_move_into(",
+            ["db", "&user", "&channel"],
+            "destination",
+        );
+    }
+
+    /// The other end of the same action, and the one that was missing.
+    ///
+    /// Gating only the destination let a moderator denied on a private voice
+    /// channel pull members OUT of it into a channel they do control, and
+    /// distinguish `NotConnected` from a success to learn who was in it. The
+    /// server-scoped `MoveMembers` check reads no channel override at either
+    /// end, so the reasoning is symmetric and so is the gate.
+    #[test]
+    fn the_member_move_route_gates_the_mover_on_the_source_channel() {
+        assert_member_edit_gates_the_mover(
+            "assert_mover_may_move_out_of(",
+            ["db", "&user", "&source"],
+            "source",
+        );
+    }
+
+    // ---- the occupancy cap's already-present exemption --------------------
+
+    /// The `max_users` cap must not refuse somebody who is already in the
+    /// room it is capping.
+    ///
+    /// The two other call-admission caps (`video_cap_would_refuse`,
+    /// `mls_cap_would_refuse`) have carried this exemption from the day they
+    /// landed; the occupancy cap did not. An AFK channel with `max_users: 5`
+    /// holding five idle members answered `CannotJoinCall` for all five, on
+    /// every sweep tick, and on the route it turned "move X to where X
+    /// already is" into a 400 as soon as the channel was capped and full.
+    #[test]
+    fn the_occupancy_cap_exempts_somebody_already_in_the_room() {
+        const MAX: usize = 5;
+        let occupants: Vec<String> = (0..MAX).map(|i| format!("occupant-{i}")).collect();
+
+        // A newcomer at the cap is refused...
+        assert!(super::occupancy_cap_refuses(
+            &occupants, MAX, "newcomer", false
+        ));
+
+        // ...and waved in by ManageChannel, as at the join front door.
+        assert!(!super::occupancy_cap_refuses(
+            &occupants, MAX, "newcomer", true
+        ));
+
+        // Every occupant is exempt: admitting them cannot grow the roster.
+        for occupant in &occupants {
+            assert!(
+                !super::occupancy_cap_refuses(&occupants, MAX, occupant, false),
+                "an occupant of the destination must not be refused by the \
+                 destination's own occupancy cap"
+            );
+        }
+
+        // Below the cap, nobody is refused.
+        assert!(!super::occupancy_cap_refuses(
+            &occupants[..MAX - 1],
+            MAX,
+            "newcomer",
+            false
+        ));
+    }
+
+    // ---- the voice-move admission gates ----------------------------------
+    //
+    // These exercise `admit_voice_move`, the side-effect-free half of
+    // `move_user_to_voice_channel`, against a real database and the real
+    // permission calculus. They stop short of the call-admission caps and of
+    // the move itself: both read Redis, which these tests do not have,
+    // whereas every gate below is answerable from the channel document and
+    // the calculus alone.
+
+    /// A server, its owner, and one ordinary member of it.
+    #[cfg(test)]
+    async fn voice_move_fixture(
+        db: &crate::Database,
+    ) -> (crate::Server, crate::User, crate::User) {
+        use crate::{Member, Server, User};
+        use revolt_models::v0::DataCreateServer;
+
+        let owner = User::create(db, "VoiceMoveOwner".to_string(), None, None)
+            .await
+            .expect("`User`");
+
+        let server = Server::create(
+            db,
+            DataCreateServer {
+                name: "VoiceMoveServer".to_string(),
+                description: None,
+                nsfw: None,
+            },
+            &owner,
+            false,
+        )
+        .await
+        .expect("`Server`")
+        .0;
+
+        let member_user = User::create(db, "VoiceMoveMember".to_string(), None, None)
+            .await
+            .expect("`User`");
+        Member::create(db, &server, &member_user, None)
+            .await
+            .expect("`Member`");
+
+        (server, owner, member_user)
+    }
+
+    /// A destination that is not a voice channel must be refused.
+    ///
+    /// The join front door has always checked this; the move path never did,
+    /// and its only fixture happened to be a real voice channel, so nothing
+    /// ever noticed. A text-channel destination reached the LiveKit machinery
+    /// and opened a room named after a text channel.
+    #[tokio::test]
+    async fn moving_into_a_text_channel_is_refused() {
+        use crate::Channel;
+        use revolt_models::v0::{DataCreateServerChannel, LegacyServerChannelType};
+        use revolt_result::ErrorType;
+
+        database_test!(|db| async move {
+            let (mut server, _owner, member_user) = voice_move_fixture(&db).await;
+
+            let make = |channel_type, name: &str| DataCreateServerChannel {
+                channel_type,
+                name: name.to_string(),
+                ..Default::default()
+            };
+
+            let voice = Channel::create_server_channel(
+                &db,
+                &mut server,
+                make(LegacyServerChannelType::Voice, "Voice"),
+                true,
+            )
+            .await
+            .expect("`Channel`");
+
+            let text = Channel::create_server_channel(
+                &db,
+                &mut server,
+                make(LegacyServerChannelType::Text, "General"),
+                true,
+            )
+            .await
+            .expect("`Channel`");
+
+            // Control: the same member, the same server, a real voice
+            // channel — admissible. So the refusal below is about the channel
+            // type and nothing else.
+            super::admit_voice_move(&db, &member_user, &voice)
+                .await
+                .expect("control: a plain member may be moved into a voice channel");
+
+            let refused = super::admit_voice_move(&db, &member_user, &text)
+                .await
+                .expect_err("a text channel is not somewhere anyone can be moved");
+            assert!(
+                matches!(refused.error_type, ErrorType::NotAVoiceChannel),
+                "expected NotAVoiceChannel, got {:?}",
+                refused.error_type
+            );
+        });
+    }
+
+    /// `Connect` is evaluated against the TARGET, never against whoever asked
+    /// for the move.
+    ///
+    /// It used to be calculated from the acting user's query, so a
+    /// moderator's own Connect waved the target into a channel the target is
+    /// denied — and a sweep, which has no acting user at all, had nothing to
+    /// evaluate. The OWNER stands in for the moderator here on purpose: the
+    /// calculus short-circuits to GrantAllSafe for them before any override is
+    /// read, so a mover-side check passes unconditionally and this test is
+    /// unpinnable any other way.
+    #[tokio::test]
+    async fn connect_is_evaluated_against_the_target_not_the_mover() {
+        use crate::{util::permissions::DatabasePermissionQuery, Channel, PartialChannel};
+        use revolt_models::v0::{DataCreateServerChannel, LegacyServerChannelType};
+        use revolt_permissions::{calculate_channel_permissions, OverrideField};
+        use revolt_result::ErrorType;
+
+        database_test!(|db| async move {
+            let (mut server, owner, member_user) = voice_move_fixture(&db).await;
+
+            let mut destination = Channel::create_server_channel(
+                &db,
+                &mut server,
+                DataCreateServerChannel {
+                    channel_type: LegacyServerChannelType::Voice,
+                    name: "Restricted".to_string(),
+                    ..Default::default()
+                },
+                true,
+            )
+            .await
+            .expect("`Channel`");
+
+            // Control, before the override: the member is admissible, so the
+            // refusal below is the override doing the work.
+            super::admit_voice_move(&db, &member_user, &destination)
+                .await
+                .expect("control: the member may be moved here before the denial");
+
+            destination
+                .update(
+                    &db,
+                    PartialChannel {
+                        default_permissions: Some(OverrideField {
+                            a: 0,
+                            d: ChannelPermission::Connect as i64,
+                        }),
+                        ..Default::default()
+                    },
+                    vec![],
+                )
+                .await
+                .expect("channel override");
+
+            // The mover's own standing is untouched: the owner still holds
+            // Connect here, which is exactly what made the old check pass.
+            let mut owner_query = DatabasePermissionQuery::new(&db, &owner).channel(&destination);
+            assert!(
+                calculate_channel_permissions(&mut owner_query)
+                    .await
+                    .has_channel_permission(ChannelPermission::Connect),
+                "control: the owner is waved through by GrantAllSafe, so a \
+                 mover-side Connect check could not refuse this move"
+            );
+
+            let refused = super::admit_voice_move(&db, &member_user, &destination)
+                .await
+                .expect_err("the TARGET is denied Connect on the destination");
+            assert!(
+                matches!(refused.error_type, ErrorType::MissingPermission { .. }),
+                "expected MissingPermission, got {:?}",
+                refused.error_type
+            );
+        });
+    }
+
+    /// A target who cannot VIEW the destination is never moved into it.
+    ///
+    /// AN OUTCOME PIN, NOT A CONTROL FOR THE `ViewChannel` GATE — read that
+    /// before trusting it as one. On a server channel the permission calculus
+    /// revokes every bit once `ViewChannel` is missing, so `Connect` is gone
+    /// for the same member and deleting the explicit `ViewChannel` line from
+    /// `admit_voice_move` leaves this test green. What it holds is the
+    /// OUTCOME the client depends on: bonfire filters an unviewable channel
+    /// out of `Ready`, so a target moved into one is told to open a channel
+    /// their client does not have — out of the call they were in, with no
+    /// route back. The move is not a join; they never chose this destination,
+    /// so nothing may leave them there.
+    #[tokio::test]
+    async fn moving_a_target_who_cannot_view_the_destination_is_refused() {
+        use crate::{Channel, PartialChannel};
+        use revolt_models::v0::{DataCreateServerChannel, LegacyServerChannelType};
+        use revolt_permissions::OverrideField;
+        use revolt_result::ErrorType;
+
+        database_test!(|db| async move {
+            let (mut server, _owner, member_user) = voice_move_fixture(&db).await;
+
+            let mut destination = Channel::create_server_channel(
+                &db,
+                &mut server,
+                DataCreateServerChannel {
+                    channel_type: LegacyServerChannelType::Voice,
+                    name: "Hidden".to_string(),
+                    ..Default::default()
+                },
+                true,
+            )
+            .await
+            .expect("`Channel`");
+
+            // Control, before the override: admissible, so the refusal below
+            // is the override doing the work.
+            super::admit_voice_move(&db, &member_user, &destination)
+                .await
+                .expect("control: the member may be moved here before the denial");
+
+            destination
+                .update(
+                    &db,
+                    PartialChannel {
+                        default_permissions: Some(OverrideField {
+                            a: 0,
+                            d: ChannelPermission::ViewChannel as i64,
+                        }),
+                        ..Default::default()
+                    },
+                    vec![],
+                )
+                .await
+                .expect("channel override");
+
+            let refused = super::admit_voice_move(&db, &member_user, &destination)
+                .await
+                .expect_err("the TARGET cannot view the destination");
+            assert!(
+                matches!(refused.error_type, ErrorType::MissingPermission { .. }),
+                "expected MissingPermission, got {:?}",
+                refused.error_type
+            );
+        });
     }
 }
 

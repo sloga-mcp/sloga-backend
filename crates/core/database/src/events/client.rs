@@ -546,8 +546,62 @@ pub enum EventV1 {
         channel_id: String,
         data: PartialUserVoiceState,
     },
+    /// A moderator (or a server-side sweep) moved this user from one voice
+    /// channel to another, and minted them a fresh SFU token for the
+    /// destination.
+    ///
+    /// TWO STRING FIELDS THAT LOOK SYNONYMOUS AND ARE NOT — do not collapse
+    /// them into one:
+    ///
+    /// - `node` is the LiveKit node NAME, i.e. a key into
+    ///   `config.api.livekit.nodes`. It is retained for wire parity with the
+    ///   shape clients have consumed since this event existed, and it is NOT
+    ///   connectable. A client cannot turn it into a URL either: `root.rs`
+    ///   filters `private` nodes out of what it advertises, so a name-to-URL
+    ///   lookup on the client is structurally unable to resolve a self-hosted
+    ///   private node.
+    /// - `url` is the `wss://` address the client actually dials — it is what
+    ///   `room.connect()` takes, and it is resolved server-side at the emit
+    ///   site from the same `config.hosts.livekit` map the join leg uses.
+    ///
+    /// Addressed PRIVATELY to the moved user, which means `EventV1::private`
+    /// reaches EVERY session that user has — including devices that are not
+    /// in the call and never were. A consumer that acts on this event
+    /// unconditionally therefore drags an idle second device into a voice
+    /// channel it was never in and publishes its microphone, and both devices
+    /// then race for a single-mint token (the token below is minted once, for
+    /// one participant identity). Clients must gate on "am I the device
+    /// currently in `from`" before connecting.
+    ///
+    /// `device_id` IS THAT GATE, and it is the field that stops two of the
+    /// user's sessions racing for one token. It is the device suffix of the
+    /// participant identity the token was minted for, recovered server-side
+    /// from the source room's ingress mapping at the emit site. A client MUST
+    /// compare it against its own device id and act on the event ONLY on a
+    /// match; every other session of that user has to ignore the event
+    /// outright, however plausible its own local state makes it look.
+    ///
+    /// `None` means the server could not identify the device — no ingress
+    /// mapping has been recorded for the source room, or the call predates
+    /// provisioning — and only then does the client fall back to its weaker
+    /// local test ("was I just dropped from `from` a moment ago"). That test
+    /// is a heuristic over client-local state and an ordinary event satisfies
+    /// it: a user moving their own call from desktop to phone makes the join
+    /// leg evict the desktop, so the idle desktop records a drop from `from`
+    /// and will accept any move that lands in the window that follows. Absent
+    /// is the degraded case, never the intended one.
     UserMoveVoiceChannel {
         node: String,
+        url: String,
+        /// Device suffix of the identity `token` was minted for, or `None`
+        /// when the server could not identify it. Absent means
+        /// "unidentified", never "any device".
+        ///
+        /// Absent rather than `null` on the wire, matching every other
+        /// optional field on this enum — and `default` so a payload minted
+        /// before this field existed still deserializes.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        device_id: Option<String>,
         from: String,
         to: String,
         token: String,
