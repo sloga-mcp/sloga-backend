@@ -198,13 +198,24 @@ pub async fn raise_if_in_voice(user: &User, channel: &UserVoiceChannel) -> Resul
 /// SFU actually knows. User ids are ULIDs and never contain `:`, so the
 /// user id is always the segment before the first `:`.
 ///
-/// The map is keyed per USER (not per device): this is correct because the
-/// MLS delivery service enforces one device per user per call (plan §1.5),
-/// so a user has at most one participant identity in a channel at a time.
-/// Reconciling the map against the live SFU participant set (for the
-/// Redis-eviction / missed-webhook case, where a stale/absent mapping makes
-/// a kick target a bare id the SFU no longer knows) is the roster-
-/// reconciliation work in 6.4; until then `get_voice_participant_identity`
+/// 🔴 The map is keyed per USER, not per connection, and the premise that used
+/// to be written here — that the MLS delivery service's one-device-per-user
+/// rule (plan §1.5) makes that lossless — DOES NOT HOLD. The MLS rule binds
+/// only ENROLLED seats, and LiveKit evicts only on a DUPLICATE identity, so
+/// `{user}` and `{user}:{device}` coexist happily in one room. Two sessions get
+/// in because `raise_if_in_voice` tests `vc:{user}`, a set written by
+/// voice-ingress from a webhook rather than by the join route, so two joins
+/// inside the round-trip window both read it empty. The HSET below is then
+/// last-writer-wins, decided by webhook ordering.
+///
+/// So a lookup here answers "ONE identity this user was last seen under in this
+/// channel", never "the identities this user holds". Anything that has to be
+/// correct for an account sitting in a room twice — the voice-move eviction —
+/// must enumerate `VoiceClient::list_participants` instead; see
+/// `eviction_targets`. Reconciling the map against the live SFU participant
+/// set (for the Redis-eviction / missed-webhook case, where a stale/absent
+/// mapping makes a kick target a bare id the SFU no longer knows) is the
+/// roster-reconciliation work in 6.4; until then `get_voice_participant_identity`
 /// logs when it falls back so a silently-missed moderation action is at
 /// least visible in logs.
 pub fn user_id_from_participant_identity(identity: &str) -> &str {
@@ -730,6 +741,37 @@ pub async fn delete_voice_state(channel: &UserVoiceChannel, user_id: &str) -> Re
         // the chokepoint every leave / reconcile path shares, so the marker
         // dies here rather than needing its own TTL (plan §2.3).
         .hdel(format!("vc_leg:{}", &channel.id), user_id)
+        // Neither can the identity mapping, and for the same reason. Two of
+        // the three places that used to clear it did so by calling
+        // `delete_voice_participant_identity` on the line after this function
+        // — voice-ingress `participant_left` and the reconcile sweep — which
+        // meant every OTHER caller left it standing. The one that matters is
+        // `voice_join`'s `force_disconnect` loop: it evicts the user from the
+        // previous channel and deletes their voice state, then leaves
+        // `voice_identity:{previous}` pointing at a connection that is gone
+        // until an ingress webhook arrives to say so. Anything resolving an
+        // identity in that window gets the stale one, which is one of the two
+        // independent sources of the stale mappings that make a voice move
+        // evict the wrong connection.
+        //
+        // Safe at every caller, because every one of them either has already
+        // used the identity or never needed it: the ingress leave paths and
+        // the reconcile sweep call `delete_voice_participant_identity`
+        // immediately after this (now redundant, still harmless — HDEL is
+        // idempotent); `remove_user_from_voice_channel`, `voice_join`'s
+        // force-disconnect and the ingress admission backstop all issue their
+        // `remove_user` BEFORE reaching here, and that is the call that reads
+        // the mapping; and `get_channel_voice_state`'s roster repair is
+        // clearing a member whose voice state is already gone. Nothing in the
+        // workspace reads `get_voice_participant_identity` for a user after
+        // tearing their voice state down.
+        //
+        // The hash can hold only ONE field per user, so clearing it on one
+        // connection's departure cannot discard a mapping that some other live
+        // connection of theirs was relying on — there was never anywhere for a
+        // second one to live. That is the same limitation the eviction leg of
+        // `move_user_to_voice_channel` exists to work around.
+        .hdel(format!("voice_identity:{}", &channel.id), user_id)
         .del(&[
             format!("joined_at:{unique_key}"),
             format!("is_publishing:{unique_key}"),
@@ -768,6 +810,17 @@ pub async fn delete_channel_voice_state(
     // Covers `room_finished` and `reconcile_channel`, which pass no user ids:
     // the whole call is gone, so every screen-leg marker goes with it.
     pipeline.del(format!("vc_leg:{}", &channel.id));
+    // And every identity mapping, for the same reason and by the same DEL.
+    // Note this is unconditional on `user_ids` exactly as the three keys above
+    // it are: this function already treats the call as gone wholesale, whatever
+    // subset of members the caller happened to name (`delete_voice_channel`
+    // names the roster, `room_finished` and `reconcile_channel` name nobody),
+    // so a per-user HDEL here would be the odd one out and would leak the rest.
+    // Identical in effect to `clear_voice_participant_identities`, which the
+    // two ingress callers invoke on the following line and may keep doing —
+    // DEL is idempotent, and their explicit call is what covers the paths that
+    // do not come through here.
+    pipeline.del(format!("voice_identity:{}", &channel.id));
 
     for user_id in user_ids {
         let unique_key = format!("{user_id}:{parent_id}");
@@ -1054,6 +1107,15 @@ pub async fn get_channel_voice_state(
 pub enum VoiceMoveOutcome {
     /// The target was moved. `node` is the LiveKit node the destination room
     /// lives on, `from` the channel they were pulled out of.
+    ///
+    /// Precisely: ONE connection of theirs — the one the minted token names —
+    /// is now addressed to the destination, and every other connection the SFU
+    /// reported for that account in `from` was ejected from the call rather
+    /// than moved. An account normally holds exactly one, so normally those are
+    /// the same sentence; they come apart when two sessions raced the join
+    /// front door, and the eviction leg of `move_user_to_voice_channel` says
+    /// why that resolves this way. The variant carries no eviction count on
+    /// purpose — it is a transport detail no caller can act on.
     Moved { node: String, from: String },
     /// The target holds no voice state in the destination's server, or the
     /// channel they are recorded in has no LiveKit node behind it any more.
@@ -1222,6 +1284,89 @@ pub async fn assert_voice_move_admissible(
         &target.id,
     )
     .await
+}
+
+/// One SFU participant a move has to eject from the source room.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct VoiceEviction {
+    /// The exact identity to hand `remove_identity`.
+    identity: String,
+    /// Whether the SFU itself named this identity in its participant list.
+    ///
+    /// The distinction decides what a failed removal MEANS. A reported
+    /// identity is a connection the SFU has just told us is in the room, so
+    /// failing to remove it is a genuine failure and the move must not be
+    /// reported clean. A derived screen leg is speculative — almost nobody has
+    /// one, and asking for a participant that does not exist is the ordinary
+    /// answer — so its failure is discarded, exactly as `VoiceClient::remove_user`
+    /// discards the same call.
+    reported: bool,
+}
+
+/// Every eviction needed to clear `user_id` out of a room whose live
+/// participant identities are `identities`, in the order they must be issued.
+///
+/// Pure, and deliberately so: the participant list it consumes comes from a
+/// LiveKit RPC that the unit tests have no way to answer, while the selection
+/// itself is the part that was wrong and is worth pinning. The same split
+/// `occupancy_cap_refuses` already uses.
+///
+/// Two properties it exists to hold:
+///
+/// - **Every connection, not the mapped one.** The predicate is
+///   `user_id_from_participant_identity`, so a bare `{user}` and a
+///   device-qualified `{user}:{device}` of the same account both select — which
+///   is the entire point, since those two are not duplicate identities to
+///   LiveKit and can therefore sit in one room together.
+/// - **Legs go with their owners, and a leg is never mistaken for an owner.**
+///   A reported leg is evicted on its own account; a leg is additionally
+///   DERIVED from each reported primary, because a leg that joined after the
+///   listing was taken is not in it and would otherwise keep streaming into a
+///   room its owner has left. Deriving from a leg is refused outright:
+///   `screen_leg_identity("{user}:{device}:screen")` invents a fourth segment
+///   the SFU has never heard of, and issuing it would be a removal aimed at
+///   nothing while the real leg stayed up.
+///
+/// Legs are emitted BEFORE their primary, the order `remove_user` already uses:
+/// the leg is a helper of the primary, and tearing the owner down first is what
+/// leaves an orphan publishing.
+fn eviction_targets<I: IntoIterator<Item = String>>(
+    identities: I,
+    user_id: &str,
+) -> Vec<VoiceEviction> {
+    let mut targets: Vec<VoiceEviction> = Vec::new();
+
+    // Linear scans over a call roster — a handful of entries, and correctness
+    // here is worth more than a hash set's constant factor.
+    fn push(targets: &mut Vec<VoiceEviction>, identity: String, reported: bool) {
+        if let Some(existing) = targets
+            .iter_mut()
+            .find(|target| target.identity == identity)
+        {
+            // A derived leg that the SFU also reported is REPORTED: the
+            // stronger claim wins, so a removal we know must succeed is never
+            // downgraded to best-effort by the order the list happened to
+            // arrive in.
+            existing.reported |= reported;
+            return;
+        }
+
+        targets.push(VoiceEviction { identity, reported });
+    }
+
+    for identity in identities {
+        if user_id_from_participant_identity(&identity) != user_id {
+            continue;
+        }
+
+        if !is_screen_leg(&identity) {
+            push(&mut targets, screen_leg_identity(&identity), false);
+        }
+
+        push(&mut targets, identity, true);
+    }
+
+    targets
 }
 
 /// Move `target` into `destination`, server-authoritatively.
@@ -1421,9 +1566,123 @@ pub async fn move_user_to_voice_channel(
     .private(target.id.clone())
     .await;
 
-    voice_client
-        .remove_user(&old_node, &target.id, &from)
-        .await?;
+    // EVICT EVERY CONNECTION THE TARGET HOLDS IN THE SOURCE, not merely the one
+    // the identity mapping happens to name.
+    //
+    // `voice_identity:{channel}` is a HASH WHOSE FIELD IS THE BARE USER ID —
+    // one entry per account, not per connection — and its doc comment justifies
+    // that with the MLS delivery service's one-device-per-user rule. That rule
+    // binds only ENROLLED seats. LiveKit evicts only on a DUPLICATE identity,
+    // and `{user}` and `{user}:{device}` are not duplicates, so two sessions of
+    // one account can and do sit in the same room. `raise_if_in_voice` does not
+    // stop them either: it reads `vc:{user}`, a set written by voice-ingress
+    // from a webhook rather than by the join route, so two joins inside the
+    // round-trip window both read an empty set and both mint. Which of the two
+    // the hash ends up naming is then decided by webhook ordering, because
+    // HSET is last-writer-wins.
+    //
+    // Evicting only the mapped identity is how a move leaves a live connection
+    // behind, and the wreckage is worse than "one stale participant": the
+    // `participant_left` for the connection that WAS evicted runs
+    // `delete_voice_state` and `delete_voice_participant_identity`, both keyed
+    // by user id, so the account vanishes from `vc_members:{from}` entirely
+    // while the other connection is still publishing its microphone into the
+    // source room. Absent from every roster, and unkickable — a second
+    // `remove_user` resolves through the now-empty mapping to the bare user id
+    // and no-ops against an SFU that knows a device-qualified one. So the SFU's
+    // own participant list is the authority here; Redis cannot be.
+    //
+    // WHAT THE MOVED USER ACTUALLY LANDS AS. The token above was minted for
+    // exactly ONE identity — `old_identity` — and the `device_id` carried by
+    // the event just emitted is that identity's suffix, which is what tells a
+    // session whether the token is addressed to it. So the honest description
+    // of this leg is: the connection the token names moves, and any OTHER
+    // connection of the same account is dropped out of the call rather than
+    // moved. That is deliberate, and it is the right answer even when the
+    // listing shows a connection the token was not minted for. Leaving one
+    // behind is the defect; a duplicate connection is one that should never
+    // have been admitted, and its user reaches the destination through the
+    // front door, which re-mints properly. Only one token exists, so handing
+    // every connection its own is not on the table here.
+    //
+    // The outcome below still reports `Moved` and reports it unchanged. Adding
+    // an eviction count to it would describe a transport detail no caller can
+    // act on, and `Moved`'s meaning — "the target is now in the destination" —
+    // is as true of one surviving connection as it ever was. What changed is
+    // stated on the variant itself.
+    match voice_client.list_participants(&old_node, &from).await {
+        Ok(participants) => {
+            let evictions = eviction_targets(
+                participants
+                    .into_iter()
+                    .map(|participant| participant.identity),
+                &target.id,
+            );
+
+            // EVERY eviction is attempted before ANY failure is returned. One
+            // connection refusing to go is not a reason to leave the rest
+            // connected — leaving one connected is the whole defect — so the
+            // first real failure is remembered and raised at the end. The
+            // caller therefore still never hears a clean answer about a move
+            // that did not finish evicting, which is the contract the single
+            // `remove_user(..).await?` had here before.
+            let mut failure = None;
+
+            for eviction in evictions {
+                match voice_client
+                    .remove_identity(&old_node, &eviction.identity, &from)
+                    .await
+                {
+                    Ok(()) => {}
+                    // A derived leg that does not exist is the ordinary case,
+                    // not an error (see `VoiceEviction::reported`).
+                    Err(_) if !eviction.reported => {}
+                    Err(error) => {
+                        log::warn!(
+                            "failed to evict {} (a connection of {}) from {from} during a voice move: {error:?}",
+                            eviction.identity,
+                            target.id
+                        );
+                        failure.get_or_insert(error);
+                    }
+                }
+            }
+
+            if let Some(error) = failure {
+                return Err(error);
+            }
+        }
+        // FALLBACK, NOT A REFUSAL — and the reasoning is about ordering.
+        //
+        // `list_participants` is a network RPC issued AFTER the move event has
+        // already gone out. That emit cannot be withdrawn, and the target
+        // already holds a valid destination token. Failing the whole move here
+        // would report an error AND leave every connection sitting in the
+        // source room; falling back to the single `remove_user` reports the
+        // same error only if the removal itself also fails, and otherwise
+        // clears at least the mapped connection — which is precisely the
+        // behaviour that shipped before this fix, so the fallback is a
+        // regression to the old state rather than to no state at all.
+        //
+        // What the fallback CANNOT do is see a second connection, so it is
+        // logged rather than swallowed: a move completed without the SFU's
+        // participant list is a move that may have left a ghost behind, and
+        // that has to be visible to whoever reads the logs afterwards. The
+        // removal keeps the `?` it always had.
+        Err(error) => {
+            log::warn!(
+                "could not list participants of {from} on {old_node} while moving {} ({error:?}); \
+                 falling back to evicting only the mapped identity — if that account holds a \
+                 second connection here it stays in the room, publishing, and absent from the \
+                 roster once its sibling's participant_left lands",
+                target.id
+            );
+
+            voice_client
+                .remove_user(&old_node, &target.id, &from)
+                .await?;
+        }
+    }
 
     Ok(VoiceMoveOutcome::Moved {
         node: new_node,
@@ -1706,6 +1965,239 @@ mod permission_tests {
             user_id_from_participant_identity(&format!("{user}:{device}")),
             user
         );
+    }
+
+    // ---- the voice-move eviction filter ----
+    //
+    // WHAT THESE CANNOT COVER. The filter's input is a LiveKit
+    // `ListParticipants` response and its output is a sequence of
+    // `RemoveParticipant` calls, neither of which exists on a build box with no
+    // SFU; the delta route harness that would drive the move end to end needs
+    // RabbitMQ and cannot boot here either. So the RPC round trip itself — that
+    // the SFU really does report two connections for one account, and really
+    // does honour the removals — is NOT proven by anything below and has to be
+    // proven on a live leg.
+    //
+    // What IS proven is the whole of the decision: given a participant list,
+    // exactly which identities get removed and in what order. That is the part
+    // that was wrong.
+
+    /// Two connections of one account — a bare identity and a device-qualified
+    /// one — are the same user to the filter, which is the property the fix
+    /// rests on. To LiveKit they are not duplicates, which is how they came to
+    /// be in the room together.
+    #[test]
+    fn eviction_targets_group_a_bare_and_a_device_qualified_connection() {
+        use super::{eviction_targets, is_screen_leg};
+
+        let user = "01KX7HASD9FHBYA3XGKA5YACYX";
+        let device = "4208aa7e9ff58761b2d7a5d6c45f7383";
+        let qualified = format!("{user}:{device}");
+
+        let evicted: Vec<String> = eviction_targets(
+            [user.to_string(), qualified.clone()],
+            user,
+        )
+        .into_iter()
+        // The derived legs have their own test; here we are asking about the
+        // primaries.
+        .filter(|target| !is_screen_leg(&target.identity))
+        .map(|target| target.identity)
+        .collect();
+
+        assert_eq!(
+            evicted,
+            vec![user.to_string(), qualified],
+            "both connections of one account must be evicted — evicting only \
+             the one the identity mapping names is the defect"
+        );
+    }
+
+    /// Screen legs. Every primary contributes a DERIVED leg (best-effort,
+    /// because a leg that joined after the listing is not in it); a leg the SFU
+    /// reported is evicted on its own account and never treated as a primary,
+    /// so no fourth-segment identity is ever issued; and a leg always precedes
+    /// its owner, because tearing the owner down first orphans it.
+    #[test]
+    fn eviction_targets_take_every_leg_and_never_derive_a_leg_from_a_leg() {
+        use super::eviction_targets;
+
+        let user = "01KX7HASD9FHBYA3XGKA5YACYX";
+        let device = "4208aa7e9ff58761b2d7a5d6c45f7383";
+        let qualified = format!("{user}:{device}");
+        let bare_leg = format!("{user}::screen");
+        let qualified_leg = format!("{qualified}:screen");
+
+        // The SFU reports the bare primary's leg but not the qualified one's.
+        let evicted = eviction_targets(
+            [bare_leg.clone(), user.to_string(), qualified.clone()],
+            user,
+        );
+
+        let identities: Vec<String> = evicted
+            .iter()
+            .map(|target| target.identity.clone())
+            .collect();
+        assert_eq!(
+            identities,
+            vec![
+                bare_leg.clone(),
+                user.to_string(),
+                qualified_leg.clone(),
+                qualified.clone(),
+            ],
+            "each leg must be evicted immediately before the primary that owns \
+             it, and a reported leg must not be re-derived into a fourth segment"
+        );
+
+        for target in &evicted {
+            assert!(
+                !target.identity.contains("screen:screen")
+                    && target.identity.matches("screen").count() <= 1,
+                "a leg was derived from a leg: {} names a participant the SFU \
+                 has never heard of, so the real leg would stay up",
+                target.identity
+            );
+        }
+
+        // A reported identity is a connection the SFU has just named, so its
+        // removal failing is a real failure; a derived one is speculative.
+        let reported: Vec<(String, bool)> = evicted
+            .iter()
+            .map(|target| (target.identity.clone(), target.reported))
+            .collect();
+        assert_eq!(
+            reported,
+            vec![
+                (bare_leg, true),
+                (user.to_string(), true),
+                (qualified_leg, false),
+                (qualified, true),
+            ],
+            "only the derived leg may be best-effort — discarding the failure \
+             of a removal the SFU said was needed is how a ghost survives"
+        );
+    }
+
+    /// The filter is scoped to ONE account. A different user in the same room
+    /// is untouched even when their id shares a prefix with the target's: the
+    /// comparison is on the whole first segment, never a prefix, and a move
+    /// that ejected a bystander would be a far louder bug than the one being
+    /// fixed.
+    #[test]
+    fn eviction_targets_are_scoped_to_the_one_user() {
+        use super::eviction_targets;
+
+        let user = "01KX7HASD9FHBYA3XGKA5YACYX";
+        let other = "01KX7HASD9FHBYA3XGKA5YACYZ";
+        // Not a real ULID; it is here precisely because it is a prefix of the
+        // target's id, which is what a `starts_with` comparison would swallow.
+        let prefix = "01KX7HASD9FHBYA3XGKA5YACY";
+
+        let evicted = eviction_targets(
+            [
+                user.to_string(),
+                other.to_string(),
+                format!("{other}:4208aa7e9ff58761b2d7a5d6c45f7383"),
+                format!("{other}::screen"),
+                prefix.to_string(),
+            ],
+            user,
+        );
+
+        assert_eq!(
+            evicted
+                .iter()
+                .map(|target| target.identity.clone())
+                .collect::<Vec<String>>(),
+            vec![format!("{user}::screen"), user.to_string()],
+            "only the target's own connections, and its derived leg, may be \
+             evicted"
+        );
+
+        // And nothing at all is selected for a user who is not in the room.
+        assert!(
+            eviction_targets([other.to_string()], user).is_empty(),
+            "a listing with no connection of the target selects nothing"
+        );
+    }
+
+    /// STRUCTURAL pin, standing in for a test that cannot run here: both
+    /// voice-state teardown chokepoints clear `voice_identity:`.
+    ///
+    /// The behavioural version of this needs Redis, and the Redis-backed tests
+    /// in this crate are the eight that fail on a build box with no server. So
+    /// what is pinned instead is the shape — that the two functions every
+    /// leave, reconcile, force-disconnect and room-teardown path funnels
+    /// through both name the key.
+    ///
+    /// It matters because the mapping used to be cleared only by the callers
+    /// that happened to remember: voice-ingress `participant_left` and the
+    /// reconcile sweep call `delete_voice_participant_identity` on the line
+    /// after `delete_voice_state`, and every other caller — `voice_join`'s
+    /// `force_disconnect` loop above all — did not. The mapping left standing
+    /// there is one of the two independent sources of the stale identities
+    /// that made a voice move evict the wrong connection.
+    ///
+    /// It does NOT prove the key is cleared for the right user, nor that the
+    /// pipeline runs: only that neither teardown has quietly dropped it again.
+    ///
+    /// The needles are the KEY CONSTRUCTION, not the key name, and comment
+    /// lines are skipped — both because the first draft of this test searched
+    /// the body for the bare string `voice_identity:` and its known-bad control
+    /// stayed GREEN: the prose explaining why the clear is there mentions the
+    /// key, so deleting the clear left the assertion satisfied by a comment
+    /// about the clear. A scan that its own mutation cannot turn red is
+    /// decoration.
+    #[test]
+    fn both_voice_state_teardowns_clear_the_identity_mapping() {
+        const FILE: &str = "core/database/src/voice/mod.rs";
+        // Per-teardown, because they clear it with different commands: one
+        // member leaving is an HDEL of their field, a whole call ending is a
+        // DEL of the hash.
+        const TEARDOWNS: [(&str, &str); 2] = [
+            ("fn delete_voice_state", ".hdel(format!(\"voice_identity:"),
+            (
+                "fn delete_channel_voice_state",
+                ".del(format!(\"voice_identity:",
+            ),
+        ];
+
+        let sources = shipping_sources();
+        let shipping = &sources
+            .iter()
+            .find(|(rel, _)| rel == FILE)
+            .expect("this very file is not in the workspace scan")
+            .1;
+
+        for (teardown, command) in TEARDOWNS {
+            let definition = shipping
+                .find(teardown)
+                .unwrap_or_else(|| panic!("{FILE} no longer defines `{teardown}`"));
+
+            // The opening brace is written as an escape for the same reason
+            // every other scan in this module writes its one that way:
+            // `strip_test_items` brace-matches this module out of its own
+            // scan, and a lone brace here would silently over-strip the file.
+            let open = definition
+                + shipping[definition..]
+                    .find('\u{7b}')
+                    .expect("the teardown has a body");
+
+            let cleared = braced_body(shipping, open).lines().any(|line| {
+                let trimmed = line.trim_start();
+                !trimmed.starts_with("//") && trimmed.contains(command)
+            });
+
+            assert!(
+                cleared,
+                "`{teardown}` no longer issues `{command}`. It is the \
+                 chokepoint the leave / reconcile / force-disconnect paths \
+                 share, and a mapping that outlives the voice state it \
+                 described is a stale identity that moderation and the voice \
+                 move will resolve to and act on"
+            );
+        }
     }
 
     /// The leg identity grammar (android-screen-share plan §2.2 / §0-R.3).

@@ -297,6 +297,44 @@ impl VoiceClient {
             .to_internal_error()
     }
 
+    /// Every participant the SFU currently reports in a room, identities and
+    /// all.
+    ///
+    /// The SFU's own list is the only authority on how many connections an
+    /// account actually holds in a call. The server-side records are not:
+    /// `voice_identity:{channel_id}` is a hash keyed by BARE user id, so it can
+    /// represent at most one connection per account, and `vc_members` is a set
+    /// of user ids with the same limitation. Where a decision has to be correct
+    /// for a user sitting in a room TWICE — the voice-move eviction — it has to
+    /// be made against this, not against Redis.
+    ///
+    /// Read-only, so unlike the removal helpers below it has no best-effort
+    /// half: the caller gets the whole list or the transport error, and decides
+    /// what an unanswered SFU means for its own operation.
+    pub async fn list_participants(
+        &self,
+        node: &str,
+        channel_id: &str,
+    ) -> Result<Vec<ParticipantInfo>> {
+        let room = self.get_node(node)?;
+
+        room.client
+            .list_participants(channel_id)
+            .await
+            .to_internal_error()
+    }
+
+    /// Remove ONE connection of `user_id` — the one the identity mapping names
+    /// — plus its screen leg.
+    ///
+    /// Exactly one, and that is a real limitation rather than a turn of phrase.
+    /// `get_voice_participant_identity` reads a hash field keyed by bare user
+    /// id, so an account holding two connections in the same room (which the
+    /// SFU permits: `{user}` and `{user}:{device}` are not duplicate
+    /// identities) has only one of them represented there, and this leaves the
+    /// other connected. Callers that must clear an account out of a room
+    /// COMPLETELY have to enumerate [`Self::list_participants`] instead; see
+    /// the eviction leg of `move_user_to_voice_channel`.
     pub async fn remove_user(&self, node: &str, user_id: &str, channel_id: &str) -> Result<()> {
         let room = self.get_node(node)?;
 
