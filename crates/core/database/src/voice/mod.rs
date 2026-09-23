@@ -1,4 +1,10 @@
-use std::fmt::{Display, Write};
+use std::{
+    fmt::{Display, Write},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        LazyLock,
+    },
+};
 
 use crate::{
     events::client::EventV1,
@@ -7,10 +13,12 @@ use crate::{
     Database, Server, MAX_MLS_GROUP_MEMBERS,
 };
 use iso8601_timestamp::{Duration, Timestamp};
-use livekit_protocol::{ParticipantPermission, TrackSource};
+use livekit_protocol::{ParticipantInfo, ParticipantPermission, TrackSource};
 use redis_kiss::{
     get_connection as _get_connection,
-    redis::{FromRedisValue, Pipeline, RedisError, RedisWrite, ToRedisArgs, Value},
+    redis::{
+        ErrorKind, FromRedisValue, Pipeline, RedisError, RedisWrite, Script, ToRedisArgs, Value,
+    },
     AsyncCommands, Conn,
 };
 use revolt_config::{config, FeaturesLimits};
@@ -211,8 +219,9 @@ pub async fn raise_if_in_voice(user: &User, channel: &UserVoiceChannel) -> Resul
 /// So a lookup here answers "ONE identity this user was last seen under in this
 /// channel", never "the identities this user holds". Anything that has to be
 /// correct for an account sitting in a room twice — the voice-move eviction —
-/// must enumerate `VoiceClient::list_participants` instead; see
-/// `eviction_targets`. Reconciling the map against the live SFU participant
+/// must ask the SFU for its participant list instead, as the voice move does
+/// through `VoiceClient::list_participants_if_present`; see
+/// `select_move_connection` and `eviction_targets`. Reconciling the map against the live SFU participant
 /// set (for the Redis-eviction / missed-webhook case, where a stale/absent
 /// mapping makes a kick target a bare id the SFU no longer knows) is the
 /// roster-reconciliation work in 6.4; until then `get_voice_participant_identity`
@@ -242,11 +251,7 @@ pub async fn set_voice_participant_identity(
 /// bare user id (web / pre-E2EE participants join with an unqualified
 /// identity, and so do participants whose mapping is gone)
 pub async fn get_voice_participant_identity(channel_id: &str, user_id: &str) -> Result<String> {
-    let stored: Option<String> = get_connection()
-        .await?
-        .hget(format!("voice_identity:{channel_id}"), user_id)
-        .await
-        .to_internal_error()?;
+    let stored = stored_voice_participant_identity(channel_id, user_id).await?;
 
     Ok(stored.unwrap_or_else(|| {
         // No recorded identity: fall back to the bare user id. This is
@@ -260,6 +265,25 @@ pub async fn get_voice_participant_identity(channel_id: &str, user_id: &str) -> 
         );
         user_id.to_string()
     }))
+}
+
+/// The identity mapping EXACTLY as recorded: `None` when no mapping exists,
+/// with none of `get_voice_participant_identity`'s bare-id fallback.
+///
+/// The voice move needs the difference. It treats the mapping as a
+/// preference among the connections the SFU actually lists, and a fallback
+/// bare id would read as "the mapping names the bare seat" when it names
+/// nothing at all — steering the choice toward a bare connection for no
+/// reason, and hiding the "mapping absent" case from its log.
+async fn stored_voice_participant_identity(
+    channel_id: &str,
+    user_id: &str,
+) -> Result<Option<String>> {
+    get_connection()
+        .await?
+        .hget(format!("voice_identity:{channel_id}"), user_id)
+        .await
+        .to_internal_error()
 }
 
 /// Forget a participant's identity mapping (voice-ingress, on leave)
@@ -722,57 +746,168 @@ pub async fn create_voice_state(
     Ok(voice_state)
 }
 
-pub async fn delete_voice_state(channel: &UserVoiceChannel, user_id: &str) -> Result<()> {
+/// Lua source of [`DELETE_VOICE_STATE`]: the WHOLE of one user's voice-state
+/// teardown in one channel, as one atomic step.
+///
+/// Argument layout. [`voice_state_teardown_input`] builds it and nothing else
+/// does, so the two change together or not at all (both are pinned by value
+/// in the tests):
+///
+/// - `KEYS[1]`: the per-server pointer `{user}:{parent}`. Its value is the id
+///   of the channel the user's per-server state belongs to.
+/// - `KEYS[2]`: `vc_members:{channel}`, a set of user ids.
+/// - `KEYS[3]`: `vc:{user}`, the user's set of `UserVoiceChannel` strings.
+/// - `KEYS[4]`: `vc_leg:{channel}`, a hash keyed by user id.
+/// - `KEYS[5]`: `voice_identity:{channel}`, a hash keyed by user id.
+/// - `KEYS[6]`: `annotations_allow:{channel}:{user}`, deleted whole.
+/// - `KEYS[7..]`: the nine per-server flags keyed by the pointer
+///   (`joined_at:`, `is_publishing:`, `is_receiving:`, `screensharing:`,
+///   `camera:`, `screen_video:`, `recording:`, `rc_capable:`, `watching:`).
+/// - `ARGV[1]`: the id of the channel being left, compared with the pointer.
+/// - `ARGV[2]`: the user id. It is the member removed from `KEYS[2]` and the
+///   field removed from `KEYS[4]` and `KEYS[5]`.
+/// - `ARGV[3]`: this channel as `vc:{user}` stores it, which is
+///   `UserVoiceChannel`'s `Display`: the channel id, then `-` and the server
+///   id when there is one.
+///
+/// `KEYS[2]` to `KEYS[6]` are PER-CHANNEL and always go. `KEYS[1]` and
+/// `KEYS[7..]` are PER-SERVER and go UNLESS the pointer names a DIFFERENT
+/// channel. A missing pointer reads as Lua `false` and falls through to the
+/// delete: with no pointer there is nothing newer to protect, and the flags
+/// are orphans. Returns 1 when the per-server state was deleted, 0 when it
+/// was kept.
+const DELETE_VOICE_STATE_LUA: &str = r"
+redis.call('SREM', KEYS[2], ARGV[2])
+redis.call('SREM', KEYS[3], ARGV[3])
+redis.call('HDEL', KEYS[4], ARGV[2])
+redis.call('HDEL', KEYS[5], ARGV[2])
+redis.call('DEL', KEYS[6])
+local pointer = redis.call('GET', KEYS[1])
+if pointer and pointer ~= ARGV[1] then
+    return 0
+end
+redis.call('DEL', KEYS[1], unpack(KEYS, 7))
+return 1
+";
+
+/// [`delete_voice_state`]'s Redis work, as one compare-and-delete script.
+///
+/// THE FIRST LUA SCRIPT IN THIS REPOSITORY, and here because nothing else
+/// gives this check-then-act atomically. The per-server keys
+/// (`{user}:{parent}` and the flags keyed by it) are shared by EVERY channel
+/// of a server, so a leave from channel A that lands after the same user's
+/// join to channel B would otherwise delete B's live state: a move's
+/// destination `participant_joined` routinely races a sibling connection's
+/// source `participant_left`, and the loser of that race used to wipe the
+/// destination — an invisible publisher in B, whom the roster repair in
+/// `get_channel_voice_state` then drops from `vc_members:{B}` outright.
+///
+/// ONE script for both halves, not a pipeline for the per-channel keys and a
+/// script for the per-server ones. Two round trips left a gap between them in
+/// which a same-channel re-join could write fresh per-channel state that the
+/// second step then left orphaned, or a fresh pointer that the second step
+/// then deleted (Wave 5b-1 audit L-6).
+///
+/// Why not WATCH/MULTI: WATCH is per-CONNECTION state, and connections here
+/// come from a shared mobc pool. A WATCH left armed (or a MULTI half-built)
+/// on a pooled connection by an error path leaks into whatever borrows that
+/// connection next, and nothing in `redis_kiss` resets it. A script is
+/// atomic on the server with no client-side state at all.
+///
+/// Every key goes in `KEYS[]`, none is built inside the script — the Redis
+/// contract for scripts. That is NOT enough for Redis Cluster, and nothing
+/// here makes it enough: the 15 keys carry no shared hash tag, so they span
+/// hash slots, and a Cluster rejects every invocation with CROSSSLOT before
+/// the script runs. [`delete_voice_state`] then takes its fallback on EVERY
+/// leave, and the late-leave race this script exists to close (Wave 5b-1
+/// H-1) is silently open again — the only trace is one ERROR line per
+/// process. THIS SCRIPT REQUIRES A SINGLE-NODE Redis / KeyDB, which is what
+/// is deployed. Under Cluster it degrades to the fallback; making it work
+/// there would take hash-tagged keys across every reader and writer of them.
+/// Nor is the fallback itself Cluster-safe: its one multi-key DEL spans the
+/// same slots, and this module talks to Redis through a plain, non-cluster
+/// connection throughout, so a Cluster deployment is unsupported by the
+/// voice state layer as a whole, not by this script alone.
+///
+/// `Script` sends EVALSHA and loads the source on NOSCRIPT. A server that
+/// provably will not run it at all is handled by [`delete_voice_state`]'s
+/// fallback; see [`teardown_script_error_allows_fallback`] for what counts.
+static DELETE_VOICE_STATE: LazyLock<Script> = LazyLock::new(|| Script::new(DELETE_VOICE_STATE_LUA));
+
+/// The `KEYS[]` and `ARGV[]` of one [`DELETE_VOICE_STATE`] invocation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct VoiceStateTeardownInput {
+    keys: Vec<String>,
+    args: Vec<String>,
+}
+
+/// Build [`DELETE_VOICE_STATE`]'s arguments in the layout documented on
+/// [`DELETE_VOICE_STATE_LUA`].
+///
+/// Pure, so the layout is pinned by value. It has to be: a script handed the
+/// wrong key or argument does not fail, it deletes nothing (or the wrong
+/// thing) and returns normally.
+fn voice_state_teardown_input(
+    channel: &UserVoiceChannel,
+    user_id: &str,
+) -> VoiceStateTeardownInput {
     let unique_key = format!(
         "{}:{}",
         &user_id,
         channel.server_id.as_ref().unwrap_or(&channel.id)
     );
 
-    // Watch-together dies with the HOST's voice state (plan §1): this is the
-    // one chokepoint every leave path shares, and it runs BEFORE the SREM
-    // below so the end event still reaches the departing host's own devices.
-    watch::end_watch_session_if_host(channel, user_id).await;
-
-    Pipeline::new()
-        .srem(format!("vc_members:{}", &channel.id), user_id)
-        .srem(format!("vc:{user_id}"), channel)
-        // A screen leg cannot outlive the voice state it hangs off: this is
-        // the chokepoint every leave / reconcile path shares, so the marker
-        // dies here rather than needing its own TTL (plan §2.3).
-        .hdel(format!("vc_leg:{}", &channel.id), user_id)
-        // Neither can the identity mapping, and for the same reason. Two of
-        // the three places that used to clear it did so by calling
-        // `delete_voice_participant_identity` on the line after this function
-        // — voice-ingress `participant_left` and the reconcile sweep — which
-        // meant every OTHER caller left it standing. The one that matters is
-        // `voice_join`'s `force_disconnect` loop: it evicts the user from the
-        // previous channel and deletes their voice state, then leaves
-        // `voice_identity:{previous}` pointing at a connection that is gone
-        // until an ingress webhook arrives to say so. Anything resolving an
-        // identity in that window gets the stale one, which is one of the two
-        // independent sources of the stale mappings that make a voice move
-        // evict the wrong connection.
-        //
-        // Safe at every caller, because every one of them either has already
-        // used the identity or never needed it: the ingress leave paths and
-        // the reconcile sweep call `delete_voice_participant_identity`
-        // immediately after this (now redundant, still harmless — HDEL is
-        // idempotent); `remove_user_from_voice_channel`, `voice_join`'s
-        // force-disconnect and the ingress admission backstop all issue their
-        // `remove_user` BEFORE reaching here, and that is the call that reads
-        // the mapping; and `get_channel_voice_state`'s roster repair is
-        // clearing a member whose voice state is already gone. Nothing in the
-        // workspace reads `get_voice_participant_identity` for a user after
-        // tearing their voice state down.
-        //
-        // The hash can hold only ONE field per user, so clearing it on one
-        // connection's departure cannot discard a mapping that some other live
-        // connection of theirs was relying on — there was never anywhere for a
-        // second one to live. That is the same limitation the eviction leg of
-        // `move_user_to_voice_channel` exists to work around.
-        .hdel(format!("voice_identity:{}", &channel.id), user_id)
-        .del(&[
+    VoiceStateTeardownInput {
+        keys: vec![
+            // KEYS[1]: the pointer. The script reads it, then deletes it with
+            // the flags unless it names a different channel.
+            unique_key.clone(),
+            // KEYS[2] to KEYS[6]: per-channel, always deleted.
+            format!("vc_members:{}", &channel.id),
+            format!("vc:{user_id}"),
+            // A screen leg cannot outlive the voice state it hangs off: this is
+            // the chokepoint every leave / reconcile path shares, so the marker
+            // dies here rather than needing its own TTL (plan §2.3).
+            format!("vc_leg:{}", &channel.id),
+            // Neither can the identity mapping, and for the same reason. Two of
+            // the three places that used to clear it did so by calling
+            // `delete_voice_participant_identity` on the line after
+            // `delete_voice_state` — voice-ingress `participant_left` and the
+            // reconcile sweep — which meant every OTHER caller left it
+            // standing. The one that matters is `voice_join`'s
+            // `force_disconnect` loop: it evicts the user from the previous
+            // channel and deletes their voice state, then leaves
+            // `voice_identity:{previous}` pointing at a connection that is gone
+            // until an ingress webhook arrives to say so. Anything resolving an
+            // identity in that window gets the stale one, which is one of the
+            // two independent sources of the stale mappings that make a voice
+            // move evict the wrong connection.
+            //
+            // Safe at every caller, because every one of them either has
+            // already used the identity or never needed it: the ingress leave
+            // paths and the reconcile sweep call
+            // `delete_voice_participant_identity` immediately after this (now
+            // redundant, still harmless — HDEL is idempotent);
+            // `remove_user_from_voice_channel`, `voice_join`'s force-disconnect
+            // and the ingress admission backstop all issue their `remove_user`
+            // BEFORE reaching here, and that is the call that reads the
+            // mapping; and `get_channel_voice_state`'s roster repair is clearing
+            // a member whose voice state is already gone. Nothing in the
+            // workspace reads `get_voice_participant_identity` for a user after
+            // tearing their voice state down.
+            //
+            // The hash can hold only ONE field per user, so clearing it on one
+            // connection's departure cannot discard a mapping that some other
+            // live connection of theirs was relying on — there was never
+            // anywhere for a second one to live. That is the same limitation
+            // the eviction leg of `move_user_to_voice_channel` exists to work
+            // around.
+            format!("voice_identity:{}", &channel.id),
+            // Draw consent dies with the voice state: an allowlist must not
+            // outlive the call it was granted in (rev-3 review). Keyed by THIS
+            // channel, so it is per-channel, not per-server.
+            format!("annotations_allow:{}:{}", &channel.id, user_id),
+            // KEYS[7..]: per-server, deleted with the pointer.
             format!("joined_at:{unique_key}"),
             format!("is_publishing:{unique_key}"),
             format!("is_receiving:{unique_key}"),
@@ -781,12 +916,231 @@ pub async fn delete_voice_state(channel: &UserVoiceChannel, user_id: &str) -> Re
             format!("screen_video:{unique_key}"),
             // Leaving the call ends any recording claim with it — this is the
             // load-bearing teardown for a recorder who drops without pressing
-            // stop (a crash, a closed laptop, a network loss).
+            // stop (a crash, a closed laptop, a network loss). Unless the user
+            // is now in another channel of this server, in which case the flag
+            // is THAT call's and not this one's to clear.
             format!("recording:{unique_key}"),
             format!("rc_capable:{unique_key}"),
             format!("watching:{unique_key}"),
-            // Draw consent dies with the voice state: an allowlist must not
-            // outlive the call it was granted in (rev-3 review).
+        ],
+        args: vec![
+            // ARGV[1]: compared with the pointer's value.
+            channel.id.clone(),
+            // ARGV[2]: the member / field in KEYS[2], KEYS[4] and KEYS[5].
+            user_id.to_string(),
+            // ARGV[3]: the member in KEYS[3], written exactly as
+            // `create_voice_state`'s `sadd` writes it.
+            channel.to_string(),
+        ],
+    }
+}
+
+/// Tear down ONE user's voice state in `channel`.
+///
+/// The keys it touches have two different scopes:
+///
+/// - PER-CHANNEL state (`vc_members:{channel}`, this channel's entry in
+///   `vc:{user}`, the `vc_leg:` and `voice_identity:` fields, the
+///   `annotations_allow:` list) describes membership of THIS channel only, so
+///   it always goes.
+/// - PER-SERVER state (the `{user}:{parent}` pointer and every flag keyed by
+///   it) is shared across the server's channels, and goes only if the
+///   pointer does not name a different channel.
+///
+/// Both halves are ONE script invocation, [`DELETE_VOICE_STATE`]; see there
+/// for why it is a script and why it is one.
+///
+/// Two things are not in the script:
+///
+/// - The watch-together session end. It publishes an event rather than
+///   deleting a key, and it runs FIRST, as it always has.
+/// - The FALLBACK. If the server answers the invocation with an error that
+///   PROVES the script never ran — EVALSHA renamed away or ACL-denied, a
+///   NOSCRIPT that survives redis-rs's own reload, a CROSSSLOT under Cluster;
+///   the exact set is [`teardown_script_error_allows_fallback`] —
+///   [`delete_voice_state_unconditionally`] runs instead: the teardown as it
+///   was before the script existed. That brings back the late-leave race the
+///   script closes (a stale leave from the source can wipe a moved user's
+///   destination state), but every leave keeps working. Without it a server
+///   that cannot run Lua would fail EVERY leave, and voice-ingress
+///   `participant_left` would then skip its identity cleanup and its
+///   `VoiceChannelLeave` event on the `?`. Such a server fails the same way
+///   on every call, so the condition is logged at ERROR once per process
+///   ([`TEARDOWN_FALLBACK_LOGGED`]) and at DEBUG after that. The latch
+///   changes the LOGGING only: the fallback itself runs on every such call.
+/// - Every OTHER error is RETURNED, with no fallback and no retry. A
+///   transport error in particular (a dropped connection, a timeout) says
+///   nothing about whether the script ran, and it may well have: a late
+///   leave after a move returns 0 and KEEPS the destination's state, and if
+///   that reply is then lost, an unconditional delete here would wipe
+///   exactly what the script just decided to keep. The pre-script pipeline
+///   failed on a dead connection too, so this is no regression for callers.
+///
+/// Guarded by CHANNEL, not by connection: a late leave from the same channel
+/// the user has since rejoined still clears it (pre-existing, out of scope).
+pub async fn delete_voice_state(channel: &UserVoiceChannel, user_id: &str) -> Result<()> {
+    // Watch-together dies with the HOST's voice state (plan §1): this is the
+    // one chokepoint every leave path shares, and it runs BEFORE the script
+    // below so the end event still reaches the departing host's own devices.
+    // Per-channel — the session is keyed by this channel — so unconditional.
+    watch::end_watch_session_if_host(channel, user_id).await;
+
+    let input = voice_state_teardown_input(channel, user_id);
+    let mut invocation = DELETE_VOICE_STATE.prepare_invoke();
+    for key in &input.keys {
+        invocation.key(key);
+    }
+    for arg in &input.args {
+        invocation.arg(arg);
+    }
+
+    let outcome = {
+        let mut conn = get_connection().await?.into_inner();
+        invocation.invoke_async::<_, i64>(&mut conn).await
+    };
+
+    match outcome {
+        Ok(0) => {
+            log::info!(
+                "voice state teardown for {user_id} in {} kept the per-server state: \
+                 {} already names another channel (a late leave after a move)",
+                channel.id,
+                input.keys[0]
+            );
+            Ok(())
+        }
+        Ok(_) => Ok(()),
+        Err(error) if teardown_script_error_allows_fallback(&error) => {
+            // Logging only: the fallback below runs whatever the latch says.
+            if TEARDOWN_FALLBACK_LOGGED.swap(true, Ordering::Relaxed) {
+                log::debug!(
+                    "voice state teardown script refused for {user_id} in {}: {error}; \
+                     unconditional teardown",
+                    channel.id
+                );
+            } else {
+                log::error!(
+                    "voice state teardown script refused for {user_id} in {}: {error}; \
+                     falling back to the unconditional teardown, which does not protect a \
+                     newer channel's per-server state. This server will not run the \
+                     script, so every leave takes this path; logged once per process",
+                    channel.id
+                );
+            }
+            delete_voice_state_unconditionally(channel, user_id).await
+        }
+        Err(error) => {
+            log::warn!(
+                "voice state teardown script for {user_id} in {} got no usable reply; it \
+                 may have run, so there is no fallback",
+                channel.id
+            );
+            Err(error).to_internal_error()
+        }
+    }
+}
+
+/// Latch for [`delete_voice_state`]'s fallback log line: ERROR the first time
+/// a server refuses the script, DEBUG every time after. A server that refuses
+/// it refuses it on EVERY leave, and one ERROR per leave buries everything
+/// else in the log. It never gates the fallback itself.
+static TEARDOWN_FALLBACK_LOGGED: AtomicBool = AtomicBool::new(false);
+
+/// Whether a failed [`DELETE_VOICE_STATE`] invocation may fall back to
+/// [`delete_voice_state_unconditionally`]: `true` ONLY for a server reply
+/// that proves the script never ran.
+///
+/// The failure this guards against is the fallback UNDOING the script. A
+/// late leave after a move runs the script, which returns 0 and keeps the
+/// destination's per-server state; if that reply is then lost, the error
+/// seen here is a transport one, and an unconditional delete would wipe
+/// what the script just kept (Wave 5b-1 H-1, via audit NEW-4). So the rule
+/// is an ALLOWLIST, and everything off it is returned to the caller:
+///
+/// - `NOSCRIPT`: redis-rs's `invoke_async` has already reloaded the source
+///   and retried once (redis-rs `script.rs`), so a NOSCRIPT that reaches
+///   here survived the reload. The script is not there to run.
+/// - `CROSSSLOT`: a Cluster rejects the multi-slot invocation before it runs
+///   (see [`DELETE_VOICE_STATE`]).
+/// - `ERR unknown command ...`: EVALSHA (or the SCRIPT LOAD behind it) is
+///   renamed away, which is how scripting is disabled on a stock Redis /
+///   KeyDB. Checked on the reply's DETAIL, because `ErrorKind::ResponseError`
+///   alone is not a server reply: redis-rs also uses that kind for a reply
+///   it could not PARSE, and a garbled reply may be the script's answer.
+/// - `NOPERM` naming EVALSHA, EVAL or SCRIPT: an ACL refused the command
+///   itself. A NOPERM naming anything else was raised from INSIDE a running
+///   script and does not qualify.
+///
+/// Returned, among others: every IO error (dropped connection, timeout,
+/// refusal), any other `ERR` (a Lua runtime error means the script RAN), a
+/// `TypeError` (a reply arrived that was not an integer, so the script
+/// ran), and every other server code (LOADING, BUSY, READONLY, MOVED, ...),
+/// which the pipeline fallback would fail on just the same.
+fn teardown_script_error_allows_fallback(error: &RedisError) -> bool {
+    // No reply, or a torn one: the script may have run. Checked before the
+    // kind, and whatever the kind says.
+    if error.is_io_error() || error.is_connection_dropped() || error.is_timeout() {
+        return false;
+    }
+
+    let detail = error
+        .detail()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+
+    match error.kind() {
+        ErrorKind::NoScriptError | ErrorKind::CrossSlot => true,
+        ErrorKind::ResponseError => detail.starts_with("unknown command"),
+        ErrorKind::ExtensionError => {
+            error.code() == Some("NOPERM")
+                && [
+                    "'evalsha' command",
+                    "'eval' command",
+                    "'script' command",
+                    "'script|load' command",
+                ]
+                .iter()
+                .any(|command| detail.contains(command))
+        }
+        _ => false,
+    }
+}
+
+/// The FALLBACK for [`delete_voice_state`], and ONLY that: the teardown
+/// exactly as it was before [`DELETE_VOICE_STATE`] existed. Same keys, same
+/// commands, and every per-server key deleted unconditionally.
+///
+/// Kept verbatim so a Redis that will not run the script degrades to the old
+/// behaviour rather than to a broken leave. Do not call it from anywhere else:
+/// it deletes a newer channel's per-server state after a move, which is the
+/// defect the script exists to fix. The reasons for each key are on
+/// [`voice_state_teardown_input`].
+async fn delete_voice_state_unconditionally(
+    channel: &UserVoiceChannel,
+    user_id: &str,
+) -> Result<()> {
+    let unique_key = format!(
+        "{}:{}",
+        &user_id,
+        channel.server_id.as_ref().unwrap_or(&channel.id)
+    );
+
+    Pipeline::new()
+        .srem(format!("vc_members:{}", &channel.id), user_id)
+        .srem(format!("vc:{user_id}"), channel)
+        .hdel(format!("vc_leg:{}", &channel.id), user_id)
+        .hdel(format!("voice_identity:{}", &channel.id), user_id)
+        .del(&[
+            format!("joined_at:{unique_key}"),
+            format!("is_publishing:{unique_key}"),
+            format!("is_receiving:{unique_key}"),
+            format!("screensharing:{unique_key}"),
+            format!("camera:{unique_key}"),
+            format!("screen_video:{unique_key}"),
+            format!("recording:{unique_key}"),
+            format!("rc_capable:{unique_key}"),
+            format!("watching:{unique_key}"),
             format!("annotations_allow:{}:{}", &channel.id, user_id),
             unique_key.clone(),
         ])
@@ -1108,17 +1462,29 @@ pub enum VoiceMoveOutcome {
     /// The target was moved. `node` is the LiveKit node the destination room
     /// lives on, `from` the channel they were pulled out of.
     ///
-    /// Precisely: ONE connection of theirs — the one the minted token names —
-    /// is now addressed to the destination, and every other connection the SFU
-    /// reported for that account in `from` was ejected from the call rather
-    /// than moved. An account normally holds exactly one, so normally those are
-    /// the same sentence; they come apart when two sessions raced the join
-    /// front door, and the eviction leg of `move_user_to_voice_channel` says
-    /// why that resolves this way. The variant carries no eviction count on
-    /// purpose — it is a transport detail no caller can act on.
+    /// Precisely: ONE connection of theirs — the one chosen from the SFU's
+    /// participant list for `from`, which the minted token and the event both
+    /// name — is now addressed to the destination, and every connection that
+    /// list reported for that account in `from` was removed from it (the
+    /// moved one included; "already gone" counts as removed). Any other
+    /// connection was therefore ejected from the call rather than moved. An
+    /// account normally holds exactly one, so normally those are the same
+    /// sentence; they come apart when two sessions raced the join front door,
+    /// and the eviction leg of `move_user_to_voice_channel` says why that
+    /// resolves this way.
+    ///
+    /// There is no degraded path behind this variant: a listing that fails
+    /// fails the move before anything is written, and a real failure to
+    /// remove any LISTED connection is returned as an error (only a derived,
+    /// unlisted screen leg is best-effort), so `Moved` is only ever reported
+    /// for a move whose every listed connection was removed or already gone.
+    /// The variant carries no eviction count on purpose — it is a transport
+    /// detail no caller can act on.
     Moved { node: String, from: String },
-    /// The target holds no voice state in the destination's server, or the
-    /// channel they are recorded in has no LiveKit node behind it any more.
+    /// The target holds no voice state in the destination's server; or the
+    /// channel they are recorded in has no LiveKit node behind it any more;
+    /// or the SFU says that room does not exist, or lists no connection of
+    /// theirs in it. Always answered before the move writes anything.
     NotConnected,
     /// The target is already sitting in the destination.
     AlreadyPresent,
@@ -1289,18 +1655,61 @@ pub async fn assert_voice_move_admissible(
 /// One SFU participant a move has to eject from the source room.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct VoiceEviction {
-    /// The exact identity to hand `remove_identity`.
+    /// The exact identity to hand `VoiceClient::remove_identity_if_present`.
     identity: String,
     /// Whether the SFU itself named this identity in its participant list.
     ///
-    /// The distinction decides what a failed removal MEANS. A reported
-    /// identity is a connection the SFU has just told us is in the room, so
-    /// failing to remove it is a genuine failure and the move must not be
-    /// reported clean. A derived screen leg is speculative — almost nobody has
-    /// one, and asking for a participant that does not exist is the ordinary
-    /// answer — so its failure is discarded, exactly as `VoiceClient::remove_user`
-    /// discards the same call.
+    /// The distinction decides what a failed removal MEANS. "Not in the room"
+    /// is never a failure for either kind — `remove_identity_if_present`
+    /// answers it as `Ok(false)`, with no error, no log and no Sentry event —
+    /// so this only matters for a REAL failure (the SFU errored or could not
+    /// be reached). A reported identity is a connection the SFU has just told
+    /// us is in the room, so a real failure to remove it fails the move. A
+    /// derived screen leg is speculative — almost nobody has one — so a real
+    /// failure on it does not. Either way the failure is logged at WARN
+    /// twice, once by `remove_identity_if_present` and once by the move with
+    /// the target and this classification, and never reported to Sentry;
+    /// [`eviction_result`] then fails the move on a reported one and discards
+    /// a derived one.
     reported: bool,
+}
+
+/// What a move's evictions amount to, once EVERY one has been attempted.
+///
+/// `Ok(true)` (removed) and `Ok(false)` (not in the room) are both success,
+/// for either kind of eviction: "not in the room" is the expected answer for
+/// the moving connection, which leaves `from` on the move event by design and
+/// often beats its own removal to the SFU, and the ordinary answer for a
+/// derived leg nobody has. Counting it as a failure turned a committed,
+/// successful move into a 500.
+///
+/// An `Err` on a REPORTED eviction fails the move; an `Err` on a derived,
+/// unreported leg is discarded (see [`VoiceEviction::reported`]). When
+/// several fail, the FIRST reported failure is the one returned.
+///
+/// Takes the outcomes after the fact rather than deciding inside the loop,
+/// so the loop has no early exit to grow: every removal is issued before
+/// this runs. Pure and generic over the error, so the rule is pinned without
+/// an SFU.
+fn eviction_result<E>(
+    outcomes: impl IntoIterator<Item = (VoiceEviction, std::result::Result<bool, E>)>,
+) -> std::result::Result<(), E> {
+    let mut failure = None;
+
+    for (eviction, outcome) in outcomes {
+        match outcome {
+            Ok(_) => {}
+            Err(_) if !eviction.reported => {}
+            Err(error) => {
+                failure.get_or_insert(error);
+            }
+        }
+    }
+
+    match failure {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
 }
 
 /// Every eviction needed to clear `user_id` out of a room whose live
@@ -1367,6 +1776,107 @@ fn eviction_targets<I: IntoIterator<Item = String>>(
     }
 
     targets
+}
+
+/// Which of the target's connections in the source room a move MOVES.
+///
+/// `participants` is the SFU's own list for the source room;
+/// `mapped_identity` is what `voice_identity:{from}` names for the target, if
+/// anything. A candidate is a PRIMARY of the target — its identity's user
+/// segment is `target_id` and it is not a screen leg (a leg is a helper of
+/// its owner and is never the thing that moves). Among candidates, in order:
+///
+/// 1. the mapped identity, if the SFU lists it as a primary — the ingress
+///    mapping and the SFU agree, which is the ordinary case;
+/// 2. else a primary carrying a non-empty `"conn"` nonce, so the event can
+///    address exactly that connection;
+/// 3. else the most recently joined (`joined_at_ms`) — the newest connection
+///    is the one the user is most plausibly looking at;
+/// 4. else the lexically smallest identity, so the answer never depends on
+///    the order the SFU happened to list them in.
+///
+/// `None` means the SFU reports no primary of the target in the room, and
+/// the move must answer `NotConnected` before writing anything.
+///
+/// Pure: the list comes from an RPC the unit tests cannot answer, while the
+/// choice is the part that was wrong (a stale mapping used to be trusted
+/// over the SFU, so the token addressed a connection that was gone).
+fn select_move_connection<'a>(
+    participants: &'a [ParticipantInfo],
+    target_id: &str,
+    mapped_identity: Option<&str>,
+) -> Option<&'a ParticipantInfo> {
+    let primaries = participants.iter().filter(|participant| {
+        user_id_from_participant_identity(&participant.identity) == target_id
+            && !is_screen_leg(&participant.identity)
+    });
+
+    if let Some(mapped) = mapped_identity {
+        if let Some(listed) = primaries
+            .clone()
+            .find(|participant| participant.identity == mapped)
+        {
+            return Some(listed);
+        }
+    }
+
+    // `min_by` under an ordering where "preferred" sorts FIRST: a nonce
+    // before none, a later join before an earlier one, then the smaller
+    // identity. Identities are unique within a room, so the last key never
+    // ties and the answer is independent of list order.
+    primaries.min_by(|a, b| {
+        conn_nonce_of(b)
+            .is_some()
+            .cmp(&conn_nonce_of(a).is_some())
+            .then_with(|| b.joined_at_ms.cmp(&a.joined_at_ms))
+            .then_with(|| a.identity.cmp(&b.identity))
+    })
+}
+
+/// The per-connection nonce a participant's token carried, as the SFU
+/// reports it — the `"conn"` attribute minted by `VoiceClient::create_token`.
+///
+/// Empty is `None`: an empty nonce addresses nothing, and putting one on the
+/// wire would let a client with an equally empty attribute read it as a
+/// match. Pure, so the empty rule is pinned without an SFU.
+fn conn_nonce_of(participant: &ParticipantInfo) -> Option<String> {
+    participant
+        .attributes
+        .get(voice_client::CONN_NONCE_ATTRIBUTE)
+        .filter(|nonce| !nonce.is_empty())
+        .cloned()
+}
+
+/// How a move addresses the connection it moves: both fields of the
+/// `UserMoveVoiceChannel` event's addressing gate, and the device the token
+/// is minted for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MoveAddressing {
+    /// The device suffix of the moving connection's identity: `D` for
+    /// `{user}:D`, `None` for a bare `{user}`. Handed to `create_token`, so
+    /// the token's identity is exactly the moving connection's.
+    device_id: Option<String>,
+    /// The moving connection's own `"conn"` nonce, per [`conn_nonce_of`].
+    conn_nonce: Option<String>,
+}
+
+/// The addressing for moving `moving`, a connection of `target_id`.
+///
+/// ONE function for both fields, called once with the connection
+/// [`select_move_connection`] chose, so the two cannot come from different
+/// places. Each could silently drift on its own: a `device_id` taken from the
+/// Redis mapping instead of from `moving` addresses a connection the SFU no
+/// longer lists, and a `conn_nonce` of `None` switches the client-side nonce
+/// gate off on every seat. Neither fails anything; both just address the
+/// wrong session or none. Pure, so both rules are pinned by value.
+fn move_addressing(moving: &ParticipantInfo, target_id: &str) -> MoveAddressing {
+    MoveAddressing {
+        device_id: moving
+            .identity
+            .strip_prefix(&format!("{target_id}:"))
+            .map(str::to_string),
+        conn_nonce: conn_nonce_of(moving),
+    }
 }
 
 /// Move `target` into `destination`, server-authoritatively.
@@ -1462,6 +1972,106 @@ pub async fn move_user_to_voice_channel(
         .ok_or_else(|| create_error!(UnknownNode))?
         .clone();
 
+    // THE SFU'S OWN LIST OF THE SOURCE ROOM, read BEFORE ANYTHING IS WRITTEN.
+    //
+    // One RPC answers three questions, and each has to be answered against
+    // the SFU rather than against Redis:
+    //
+    // - WHICH CONNECTION MOVES (`select_move_connection`). The identity
+    //   mapping is a hash keyed by bare user id — one identity per account —
+    //   and it goes stale. Trusting it used to mean: a mapping naming a
+    //   device connection that had left, while a bare connection of the same
+    //   account was live, minted the token for the departed identity,
+    //   addressed the event to it (so the live session ignored it), evicted
+    //   the live one and reported `Moved`. The user was dropped from the call
+    //   and the moderator was told it worked.
+    // - WHICH NONCE ADDRESSES IT (`conn_nonce_of`), carried on the event.
+    // - WHICH CONNECTIONS GO (`eviction_targets`), used after the emit.
+    //
+    // Why before the first WRITE and not merely before the mint: the
+    // `moved_from` / `moved_to` markers below relabel the target's next
+    // Leave and Join for as long as they live, and `set_channel_node` pins
+    // the destination. A move that wrote those and then answered
+    // `NotConnected` would leave them standing to mislabel unrelated events.
+    //
+    // A FAILED LIST FAILS THE MOVE, with nothing written, minted or emitted.
+    // It used to fall back to a single mapped removal, and the only reason
+    // for that was that the list ran AFTER the emit, when the move could no
+    // longer be withdrawn. Here it can be, so the error propagates: the route
+    // reports it and a timer sweep retries on its next tick, instead of
+    // completing a move that cannot see a second connection.
+    //
+    // A ROOM THE SFU SAYS DOES NOT EXIST is not a failure, though: it is an
+    // answer, and the answer is that nobody is connected to it. The room
+    // finished (or was reconciled away) and Redis has not caught up yet.
+    // `list_participants_if_present` reports that as `None`, and the move
+    // answers `NotConnected`, still before any write. Treating it as an
+    // error made every sweep tick against such a pointer a 500 and a Sentry
+    // event until the pointer was cleaned up.
+    //
+    // The mapping is read raw, as a PREFERENCE only: an absent mapping is
+    // `None`, never an error, because the list is authoritative and a
+    // mapping the ingress has not written yet (or has already cleared) says
+    // nothing about which listed connection to move. A Redis failure on that
+    // read still errors, before any write, like every read above it.
+    let mapped_identity = stored_voice_participant_identity(&from, &target.id).await?;
+    let Some(participants) = voice_client
+        .list_participants_if_present(&old_node, &from)
+        .await?
+    else {
+        log::info!(
+            "voice move of {} from {from}: the SFU has no such room; not connected",
+            target.id
+        );
+        return Ok(VoiceMoveOutcome::NotConnected);
+    };
+
+    let Some(moving) =
+        select_move_connection(&participants, &target.id, mapped_identity.as_deref())
+    else {
+        // Redis still has them in `from`; the SFU does not. The connection
+        // is gone and its `participant_left` has not landed yet. Nothing to
+        // move and nothing written: the same answer as a pointer whose room
+        // has no node.
+        log::info!(
+            "voice move of {} from {from}: the SFU lists no connection of theirs; not connected",
+            target.id
+        );
+        return Ok(VoiceMoveOutcome::NotConnected);
+    };
+
+    match mapped_identity.as_deref() {
+        Some(mapped) if mapped != moving.identity => log::warn!(
+            "voice move of {} from {from}: the identity mapping names {mapped}, which the SFU \
+             does not list as a connection of theirs; moving {} instead",
+            target.id,
+            moving.identity
+        ),
+        None => log::info!(
+            "voice move of {} from {from}: no identity mapping recorded; moving {} as listed \
+             by the SFU",
+            target.id,
+            moving.identity
+        ),
+        Some(_) => {}
+    }
+
+    // Both addressing fields come from the CHOSEN connection, `moving`, and
+    // from nothing else — never from the Redis mapping, which is only a
+    // preference above. The device id is `moving`'s device suffix, so the
+    // token is minted for its identity: a device-qualified seat keeps its
+    // identity (and its E2EE device binding) across the move, and a bare seat
+    // stays bare. The nonce is `moving`'s SOURCE nonce — never the new
+    // token's, which is minted inside `create_token` below.
+    let addressing = move_addressing(moving, &target.id);
+    // And every connection that has to leave `from`, from the same list.
+    let evictions = eviction_targets(
+        participants
+            .iter()
+            .map(|participant| participant.identity.clone()),
+        &target.id,
+    );
+
     // First write. Everything above this line is side-effect free.
     if existing_node.is_none() {
         set_channel_node(destination.id(), &new_node).await?;
@@ -1477,17 +2087,11 @@ pub async fn move_user_to_voice_channel(
 
     voice_client.create_room(&new_node, destination).await?;
 
-    // Preserve a device-qualified identity across the move: the target's
-    // device suffix is recovered from the old channel's ingress-maintained
-    // mapping (the server itself never knows which device is in a call).
-    //
-    // It is also what the event below carries, so the session this token was
-    // minted for is the only one that redeems it — see the emit site.
-    let old_identity = get_voice_participant_identity(&from, &target.id).await?;
-    let device_id = old_identity
-        .strip_prefix(&format!("{}:", target.id))
-        .map(str::to_string);
-
+    // Minted for the connection chosen above: `addressing.device_id` is that
+    // connection's device suffix (`None` for a bare seat), so the token's
+    // identity is exactly the chosen one's. The event below carries the same
+    // suffix plus the chosen connection's nonce, so the session this token
+    // was minted for is the only one that redeems it — see the emit site.
     let token = voice_client
         .create_token(
             &new_node,
@@ -1495,14 +2099,14 @@ pub async fn move_user_to_voice_channel(
             target,
             permissions,
             destination,
-            device_id.as_deref(),
+            addressing.device_id.as_deref(),
         )
         .await?;
 
-    // Remote-control release hook (plan §1): this path calls `remove_user`
-    // directly, bypassing `remove_user_from_voice_channel`, and additionally
-    // re-tokens the target into a DIFFERENT room while any grant stays keyed
-    // to the old channel — so it must release explicitly here.
+    // Remote-control release hook (plan §1): this path removes participants
+    // from the SFU directly, bypassing `remove_user_from_voice_channel`, and
+    // additionally re-tokens the target into a DIFFERENT room while any grant
+    // stays keyed to the old channel — so it must release explicitly here.
     remote_control::release_remote_control_for_user(
         db,
         voice_client,
@@ -1510,17 +2114,17 @@ pub async fn move_user_to_voice_channel(
         &target.id,
         "revoked_by_moderator",
         // The participant is still in the old room right now. Nothing below
-        // reliably ends that: `remove_user` can fail, and on the reordered
-        // path the client may instead tear the old room down itself on its
-        // way into the new one. Neither is something a grant may be left
-        // waiting on, so revoke actively.
+        // reliably ends that: a removal can fail, and on the reordered path
+        // the client may instead tear the old room down itself on its way
+        // into the new one. Neither is something a grant may be left waiting
+        // on, so revoke actively.
         false,
     )
     .await;
 
     // EMITTED BEFORE THE EVICTION, AND THE ORDER IS THE FIX.
     //
-    // `remove_user` is a LiveKit `RemoveParticipant`, which puts a `Leave`
+    // A removal is a LiveKit `RemoveParticipant`, which puts a `Leave`
     // straight down the client's signalling socket. This event has to travel
     // LiveKit -> delta -> Redis publish -> bonfire -> the client's socket:
     // at least two more hops. Emitting it second therefore guaranteed the
@@ -1529,16 +2133,16 @@ pub async fn move_user_to_voice_channel(
     // nowhere, which is the shipped bug this exists to repair.
     //
     // The failure mode this creates, stated rather than left to be
-    // discovered: if the emit succeeds and `remove_user` then fails, the
-    // target holds a valid token for the destination and no eviction has
+    // discovered: if the emit succeeds and a removal then fails, the target
+    // holds a valid token for the destination and that eviction has not
     // happened. That is acceptable, and strictly better than the inverse. A
     // client can only be in one call, so connecting with the token tears down
-    // its own old room, which is what `remove_user` was trying to achieve;
-    // the worst case is a stale participant in the source room until that
+    // its own old room, which is what the removal was trying to achieve; the
+    // worst case is a stale participant in the source room until that
     // teardown reaches the SFU, and the remote-control grant above has
-    // already been revoked actively for exactly this reason. The `?` below
-    // still reports the failure to the caller, so the route does not claim a
-    // clean move. The old order's failure mode was worse and more common: the
+    // already been revoked actively for exactly this reason. The failure is
+    // still returned to the caller, so the route does not claim a clean
+    // move. The old order's failure mode was worse and more common: the
     // eviction succeeded, the emit never ran, and the target sat disconnected
     // from everything with no token at all.
     //
@@ -1547,18 +2151,29 @@ pub async fn move_user_to_voice_channel(
     // `from`. It removes the GUARANTEED loss and makes the ordinary path
     // work; the window is what covers the reordering being lost to
     // scheduling.
-    // `device_id` is EXACTLY the suffix handed to `create_token` above, on
-    // the wire. `private` reaches every session the target has, so without it
-    // each session has only a local guess at whether the token is its own —
-    // and the guess is satisfiable by an ordinary event, so two sessions can
-    // reach for one single-mint token and the SFU evicts whichever loses the
-    // duplicate-identity race. `None` is honest rather than permissive: no
-    // mapping was recorded for the source room, and the client is told to say
-    // so rather than assume the token is addressed to it.
+    //
+    // THE ADDRESSING GATE. `private` reaches every session the target has,
+    // so without one each session has only a local guess at whether the
+    // token is its own — and the guess is satisfiable by an ordinary event,
+    // so two sessions can reach for one single-mint token and the SFU evicts
+    // whichever loses the duplicate-identity race. Both fields describe the
+    // connection `select_move_connection` chose from the SFU's list:
+    //
+    // - `conn_nonce` IS the gate when present: that connection's `"conn"`
+    //   token attribute, which names exactly one connection — including a
+    //   bare seat, which a device id cannot name at all.
+    // - `device_id` is EXACTLY the suffix handed to `create_token` above. It
+    //   is the gate when the nonce is absent, and it drives the client's
+    //   E2EE identity assertion either way.
+    //
+    // `None` for both is honest rather than permissive: the chosen
+    // connection is bare and the SFU reported no nonce for it, and the client
+    // is told so rather than left to assume the token is addressed to it.
     EventV1::UserMoveVoiceChannel {
         node: new_node.clone(),
         url,
-        device_id,
+        device_id: addressing.device_id,
+        conn_nonce: addressing.conn_nonce,
         from: from.clone(),
         to: destination.id().to_string(),
         token,
@@ -1593,96 +2208,61 @@ pub async fn move_user_to_voice_channel(
     // own participant list is the authority here; Redis cannot be.
     //
     // WHAT THE MOVED USER ACTUALLY LANDS AS. The token above was minted for
-    // exactly ONE identity — `old_identity` — and the `device_id` carried by
-    // the event just emitted is that identity's suffix, which is what tells a
-    // session whether the token is addressed to it. So the honest description
-    // of this leg is: the connection the token names moves, and any OTHER
-    // connection of the same account is dropped out of the call rather than
-    // moved. That is deliberate, and it is the right answer even when the
-    // listing shows a connection the token was not minted for. Leaving one
-    // behind is the defect; a duplicate connection is one that should never
-    // have been admitted, and its user reaches the destination through the
-    // front door, which re-mints properly. Only one token exists, so handing
-    // every connection its own is not on the table here.
+    // exactly ONE identity — the connection `select_move_connection` chose
+    // from the SFU's list — and the event just emitted names that connection
+    // by its nonce (and its device suffix), which is what tells a session
+    // whether the token is addressed to it. So the honest description of
+    // this leg is: the chosen connection moves, and every OTHER connection of
+    // the same account that the list reported is dropped out of the call
+    // rather than moved. That is deliberate. Leaving one behind is the
+    // defect; a duplicate connection is one that should never have been
+    // admitted, and its user reaches the destination through the front door,
+    // which re-mints properly. Only one token exists, so handing every
+    // connection its own is not on the table here.
+    //
+    // The evictions come from the SAME list the moving connection was chosen
+    // from, so the two cannot disagree about which connections exist. That
+    // includes the moving connection itself: it is removed from `from` like
+    // the rest, and normally has already left on the event by the time the
+    // removal lands.
     //
     // The outcome below still reports `Moved` and reports it unchanged. Adding
     // an eviction count to it would describe a transport detail no caller can
     // act on, and `Moved`'s meaning — "the target is now in the destination" —
     // is as true of one surviving connection as it ever was. What changed is
     // stated on the variant itself.
-    match voice_client.list_participants(&old_node, &from).await {
-        Ok(participants) => {
-            let evictions = eviction_targets(
-                participants
-                    .into_iter()
-                    .map(|participant| participant.identity),
-                &target.id,
-            );
+    //
+    // EVERY eviction is attempted before ANY failure is returned. One
+    // connection refusing to go is not a reason to leave the rest connected —
+    // leaving one connected is the whole defect — so the loop below never
+    // returns early: it records every outcome, and `eviction_result` decides
+    // afterwards what they amount to. The caller therefore never hears a
+    // clean answer about a move that did not finish evicting.
+    let mut outcomes = Vec::with_capacity(evictions.len());
 
-            // EVERY eviction is attempted before ANY failure is returned. One
-            // connection refusing to go is not a reason to leave the rest
-            // connected — leaving one connected is the whole defect — so the
-            // first real failure is remembered and raised at the end. The
-            // caller therefore still never hears a clean answer about a move
-            // that did not finish evicting, which is the contract the single
-            // `remove_user(..).await?` had here before.
-            let mut failure = None;
+    for eviction in evictions {
+        let outcome = voice_client
+            .remove_identity_if_present(&old_node, &eviction.identity, &from)
+            .await;
 
-            for eviction in evictions {
-                match voice_client
-                    .remove_identity(&old_node, &eviction.identity, &from)
-                    .await
-                {
-                    Ok(()) => {}
-                    // A derived leg that does not exist is the ordinary case,
-                    // not an error (see `VoiceEviction::reported`).
-                    Err(_) if !eviction.reported => {}
-                    Err(error) => {
-                        log::warn!(
-                            "failed to evict {} (a connection of {}) from {from} during a voice move: {error:?}",
-                            eviction.identity,
-                            target.id
-                        );
-                        failure.get_or_insert(error);
-                    }
-                }
-            }
-
-            if let Some(error) = failure {
-                return Err(error);
-            }
-        }
-        // FALLBACK, NOT A REFUSAL — and the reasoning is about ordering.
-        //
-        // `list_participants` is a network RPC issued AFTER the move event has
-        // already gone out. That emit cannot be withdrawn, and the target
-        // already holds a valid destination token. Failing the whole move here
-        // would report an error AND leave every connection sitting in the
-        // source room; falling back to the single `remove_user` reports the
-        // same error only if the removal itself also fails, and otherwise
-        // clears at least the mapped connection — which is precisely the
-        // behaviour that shipped before this fix, so the fallback is a
-        // regression to the old state rather than to no state at all.
-        //
-        // What the fallback CANNOT do is see a second connection, so it is
-        // logged rather than swallowed: a move completed without the SFU's
-        // participant list is a move that may have left a ghost behind, and
-        // that has to be visible to whoever reads the logs afterwards. The
-        // removal keeps the `?` it always had.
-        Err(error) => {
+        if let Err(error) = &outcome {
             log::warn!(
-                "could not list participants of {from} on {old_node} while moving {} ({error:?}); \
-                 falling back to evicting only the mapped identity — if that account holds a \
-                 second connection here it stays in the room, publishing, and absent from the \
-                 roster once its sibling's participant_left lands",
-                target.id
+                "failed to evict {} (a connection of {}, {}) from {from} during a voice move: \
+                 {error:?}",
+                eviction.identity,
+                target.id,
+                if eviction.reported {
+                    "listed by the SFU, so the move fails"
+                } else {
+                    "a derived screen leg, so the failure is discarded"
+                }
             );
-
-            voice_client
-                .remove_user(&old_node, &target.id, &from)
-                .await?;
         }
+
+        outcomes.push((eviction, outcome));
     }
+
+    eviction_result(outcomes)?;
 
     Ok(VoiceMoveOutcome::Moved {
         node: new_node,
@@ -1994,16 +2574,13 @@ mod permission_tests {
         let device = "4208aa7e9ff58761b2d7a5d6c45f7383";
         let qualified = format!("{user}:{device}");
 
-        let evicted: Vec<String> = eviction_targets(
-            [user.to_string(), qualified.clone()],
-            user,
-        )
-        .into_iter()
-        // The derived legs have their own test; here we are asking about the
-        // primaries.
-        .filter(|target| !is_screen_leg(&target.identity))
-        .map(|target| target.identity)
-        .collect();
+        let evicted: Vec<String> = eviction_targets([user.to_string(), qualified.clone()], user)
+            .into_iter()
+            // The derived legs have their own test; here we are asking about the
+            // primaries.
+            .filter(|target| !is_screen_leg(&target.identity))
+            .map(|target| target.identity)
+            .collect();
 
         assert_eq!(
             evicted,
@@ -2122,14 +2699,1034 @@ mod permission_tests {
         );
     }
 
-    /// STRUCTURAL pin, standing in for a test that cannot run here: both
-    /// voice-state teardown chokepoints clear `voice_identity:`.
+    /// A reported leg listed AFTER its owner: the owner's pass derives the
+    /// leg first (best-effort), and the SFU's own report of it must then
+    /// upgrade it to REPORTED. The sibling test lists the leg first, which
+    /// can never tell whether the upgrade happens at all.
+    #[test]
+    fn eviction_targets_upgrade_a_derived_leg_the_sfu_also_reported() {
+        use super::eviction_targets;
+
+        let user = "01KX7HASD9FHBYA3XGKA5YACYX";
+        let leg = format!("{user}::screen");
+
+        let evicted: Vec<(String, bool)> = eviction_targets([user.to_string(), leg.clone()], user)
+            .into_iter()
+            .map(|target| (target.identity, target.reported))
+            .collect();
+
+        assert_eq!(
+            evicted,
+            vec![(leg, true), (user.to_string(), true)],
+            "the SFU reported this leg, so failing to remove it is a real \
+             failure — the order it arrived in must not downgrade it"
+        );
+    }
+
+    /// A REAL prefix: the target's id is a proper prefix of a bystander's.
+    /// A `starts_with` comparison would select the bystander; the whole
+    /// first segment must match instead.
+    #[test]
+    fn eviction_targets_do_not_take_a_user_whose_id_extends_the_target() {
+        use super::eviction_targets;
+
+        // Not a real ULID — it is here because it is a prefix of `other`.
+        let user = "01KX7HASD9FHBYA3XGKA5YACY";
+        let other = "01KX7HASD9FHBYA3XGKA5YACYX";
+
+        let evicted: Vec<String> = eviction_targets(
+            [
+                other.to_string(),
+                format!("{other}:4208aa7e9ff58761b2d7a5d6c45f7383"),
+                format!("{other}::screen"),
+                user.to_string(),
+            ],
+            user,
+        )
+        .into_iter()
+        .map(|target| target.identity)
+        .collect();
+
+        assert_eq!(
+            evicted,
+            vec![format!("{user}::screen"), user.to_string()],
+            "a user whose id merely starts with the target's is a bystander"
+        );
+    }
+
+    // ---- choosing which connection a move MOVES, and its nonce ----
+
+    /// A participant as the SFU would list it. The nonce attribute is set
+    /// under the string LITERAL `"conn"`, never the constant, so drifting
+    /// the constant reddens here (the client matches the literal too).
+    fn listed(identity: &str, joined_at_ms: i64, nonce: Option<&str>) -> super::ParticipantInfo {
+        super::ParticipantInfo {
+            identity: identity.to_string(),
+            joined_at_ms,
+            attributes: nonce
+                .map(|nonce| [("conn".to_string(), nonce.to_string())].into())
+                .unwrap_or_default(),
+            ..Default::default()
+        }
+    }
+
+    fn chosen(
+        participants: &[super::ParticipantInfo],
+        target: &str,
+        mapped: Option<&str>,
+    ) -> Option<String> {
+        super::select_move_connection(participants, target, mapped)
+            .map(|participant| participant.identity.clone())
+    }
+
+    /// The mapped identity wins when the SFU lists it — even listed second,
+    /// and even though every other rule would pick the other connection
+    /// (it has a nonce and joined later; the mapped one has neither).
+    #[test]
+    fn move_selection_prefers_the_mapped_identity_when_listed() {
+        let user = "01KX7HASD9FHBYA3XGKA5YACYX";
+        let device = format!("{user}:D1");
+        let participants = [
+            listed(user, 2_000, Some("N-BARE")),
+            listed(&device, 1_000, None),
+        ];
+
+        assert_eq!(
+            chosen(&participants, user, Some(&device)).as_deref(),
+            Some(device.as_str()),
+            "the ingress mapping agrees with the SFU here — trust it"
+        );
+    }
+
+    /// A screen leg is never the connection that moves: not when it is
+    /// listed before its owner, not when it is the most attractive by every
+    /// ranking rule, and not even when the mapping names it.
+    #[test]
+    fn move_selection_never_chooses_a_screen_leg() {
+        let user = "01KX7HASD9FHBYA3XGKA5YACYX";
+        let device = format!("{user}:D1");
+        let leg = format!("{device}:screen");
+        let participants = [
+            listed(&leg, 9_000, Some("N-LEG")),
+            listed(&device, 1_000, None),
+        ];
+
+        assert_eq!(
+            chosen(&participants, user, None).as_deref(),
+            Some(device.as_str())
+        );
+        assert_eq!(
+            chosen(&participants, user, Some(&leg)).as_deref(),
+            Some(device.as_str()),
+            "a mapping that names a leg is not a primary"
+        );
+    }
+
+    /// No primary of the target in the list: nothing to move. Legs of the
+    /// target and connections of other users do not count.
+    #[test]
+    fn move_selection_without_a_primary_is_none() {
+        let user = "01KX7HASD9FHBYA3XGKA5YACYX";
+        let other = "01KX7HASD9FHBYA3XGKA5YACYZ";
+
+        assert_eq!(chosen(&[], user, None), None);
+        assert_eq!(
+            chosen(
+                &[
+                    listed(&format!("{user}::screen"), 5_000, Some("N-LEG")),
+                    listed(other, 6_000, Some("N-OTHER")),
+                    listed(&format!("{other}:D9"), 7_000, Some("N-OTHER-2")),
+                ],
+                user,
+                Some(user),
+            ),
+            None,
+            "only a primary of the target may be moved"
+        );
+    }
+
+    /// Mapping absent from the list (stale: D1 has gone): fall back to the
+    /// primary that carries a non-empty nonce — an EMPTY nonce addresses
+    /// nothing, so it ranks with "none", even when it joined last.
+    #[test]
+    fn move_selection_falls_back_to_the_primary_with_a_nonce() {
+        let user = "01KX7HASD9FHBYA3XGKA5YACYX";
+        let stale = format!("{user}:D1");
+        let participants = [
+            listed(&format!("{user}:D2"), 9_000, Some("")),
+            listed(user, 1_000, Some("N-BARE")),
+            listed(&format!("{user}:D3"), 8_000, None),
+        ];
+
+        assert_eq!(
+            chosen(&participants, user, Some(&stale)).as_deref(),
+            Some(user),
+            "a stale mapping must not be trusted over the SFU"
+        );
+        assert_eq!(chosen(&participants, user, None).as_deref(), Some(user));
+    }
+
+    /// Ties on the nonce rule: the most recent join wins, then the lexically
+    /// smallest identity — and neither answer depends on list order.
+    #[test]
+    fn move_selection_tie_breaks_by_join_time_then_identity() {
+        let user = "01KX7HASD9FHBYA3XGKA5YACYX";
+        let a = format!("{user}:A");
+        let b = format!("{user}:B");
+
+        let by_join = [listed(&a, 1_000, Some("N1")), listed(&b, 2_000, Some("N2"))];
+        assert_eq!(chosen(&by_join, user, None).as_deref(), Some(b.as_str()));
+        let mut reversed = by_join.clone();
+        reversed.reverse();
+        assert_eq!(chosen(&reversed, user, None).as_deref(), Some(b.as_str()));
+
+        let by_identity = [listed(&b, 1_000, None), listed(&a, 1_000, None)];
+        assert_eq!(
+            chosen(&by_identity, user, None).as_deref(),
+            Some(a.as_str())
+        );
+        let mut reversed = by_identity.clone();
+        reversed.reverse();
+        assert_eq!(chosen(&reversed, user, None).as_deref(), Some(a.as_str()));
+    }
+
+    /// The nonce read off a listed participant: absent or EMPTY is `None`,
+    /// present is its value. Set under the literal `"conn"` by `listed`.
+    #[test]
+    fn conn_nonce_of_reads_the_conn_attribute_and_treats_empty_as_none() {
+        use super::conn_nonce_of;
+
+        assert_eq!(
+            conn_nonce_of(&listed("u", 0, Some("V1StGXR8_Z5jdHi6B-myT"))).as_deref(),
+            Some("V1StGXR8_Z5jdHi6B-myT")
+        );
+        assert_eq!(
+            conn_nonce_of(&listed("u", 0, Some(""))),
+            None,
+            "an empty nonce addresses nothing and must never reach the wire"
+        );
+        assert_eq!(conn_nonce_of(&listed("u", 0, None)), None);
+
+        // Another attribute is not the nonce.
+        let mut other = listed("u", 0, None);
+        other
+            .attributes
+            .insert("leg".to_string(), "screen".to_string());
+        assert_eq!(conn_nonce_of(&other), None);
+    }
+
+    /// `move_user_to_voice_channel`'s body as SHIPPING code: the braced body,
+    /// with comment lines dropped so prose that names a call can never
+    /// satisfy (or trip) an ordering assertion.
+    fn move_body_code() -> String {
+        const FILE: &str = "core/database/src/voice/mod.rs";
+        const DEFINITION: &str = "pub async fn move_user_to_voice_channel(";
+
+        let sources = shipping_sources();
+        let shipping = &sources
+            .iter()
+            .find(|(rel, _)| rel == FILE)
+            .expect("this very file is not in the workspace scan")
+            .1;
+
+        let definition = shipping
+            .find(DEFINITION)
+            .unwrap_or_else(|| panic!("{FILE} no longer defines `{DEFINITION}`"));
+        // Escaped brace: see `both_voice_state_teardowns_clear_the_identity_mapping`.
+        let open = definition
+            + shipping[definition..]
+                .find('\u{7b}')
+                .expect("the move has a body");
+
+        braced_body(shipping, open)
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn first(body: &str, needle: &str) -> usize {
+        body.find(needle)
+            .unwrap_or_else(|| panic!("`move_user_to_voice_channel` no longer calls `{needle}`"))
+    }
+
+    /// P-3: the SFU listing precedes EVERY write and the mint. A listing
+    /// after the `moved_from` / `moved_to` markers would let a
+    /// `NotConnected` (or a failed list) leave them standing to relabel the
+    /// target's next Leave and Join; after the mint, a stale mapping would
+    /// address the token to a connection that is gone.
+    #[test]
+    fn the_move_lists_the_source_room_before_any_write() {
+        let body = move_body_code();
+        let list = first(&body, "list_participants_if_present(");
+
+        for write in [
+            "set_channel_node(",
+            "set_user_moved_from_voice(",
+            "set_user_moved_to_voice(",
+            "create_room(",
+            ".create_token(",
+        ] {
+            assert!(
+                list < first(&body, write),
+                "`list_participants_if_present(` must precede `{write}` in \
+                 `move_user_to_voice_channel` — a refusal, a gone room or a \
+                 failed listing has to leave nothing written and nothing minted"
+            );
+        }
+    }
+
+    /// S-c: a room the SFU says does not exist is `NotConnected`, not a 500.
+    /// The move lists through `list_participants_if_present` — the call that
+    /// classifies a Twirp `not_found` as `None` — and binds the list with a
+    /// `let ... else` whose `else` is the `NotConnected` return. That is the
+    /// only listing `VoiceClient` has; this test keeps a plain
+    /// `.list_participants(` call from ever coming back into the move,
+    /// because a plain listing would turn a gone room into an error — a 500
+    /// plus a Sentry event on every sweep tick.
+    #[test]
+    fn the_move_answers_a_gone_source_room_with_not_connected() {
+        let body = move_body_code();
+        let flat = body.split_whitespace().collect::<Vec<_>>().join(" ");
+
+        assert!(
+            !body.contains(".list_participants("),
+            "the move lists through `list_participants(` again — a room the \
+             SFU no longer has becomes a 500 and a Sentry event per sweep tick"
+        );
+        assert!(
+            flat.contains(
+                "let Some(participants) = voice_client \
+                 .list_participants_if_present(&old_node, &from) .await? else"
+            ),
+            "the listing must bind `Some(participants)`, so a gone room \
+             (`None`) takes the `else`"
+        );
+
+        let listing = first(&flat, ".list_participants_if_present(");
+        let else_keyword = listing + first(&flat[listing..], ".await? else");
+        let open = else_keyword + first(&flat[else_keyword..], "\u{7b}");
+        let else_arm = braced_body(&flat, open);
+        assert!(
+            else_arm
+                .trim()
+                .ends_with("return Ok(VoiceMoveOutcome::NotConnected);"),
+            "the `else` of the listing must answer `NotConnected`, and nothing \
+             else: {else_arm}"
+        );
+    }
+
+    /// P-2 (Wave 5a CRITICAL-1): the move event goes out strictly before the
+    /// first removal, and no removal path that bypasses the SFU's listing or
+    /// its NotFound classification is left in the move.
+    #[test]
+    fn the_move_emits_before_it_evicts_and_only_through_the_listing() {
+        let body = move_body_code();
+
+        assert!(
+            first(&body, ".private(target.id") < first(&body, "remove_identity_if_present("),
+            "the move event must be emitted BEFORE the first removal: a Leave \
+             reaches the client ahead of a later event, and a client already \
+             out of CONNECTED drops its own move"
+        );
+
+        for banned in ["remove_user(", "remove_identity("] {
+            assert!(
+                !body.contains(banned),
+                "`move_user_to_voice_channel` calls `{banned}` — it must evict \
+                 only the listed connections, through `remove_identity_if_present`"
+            );
+        }
+    }
+
+    /// T-gap: the move evicts through `eviction_targets` and
+    /// `remove_identity_if_present`. Reverting it to a single mapped removal
+    /// left every earlier test green.
+    ///
+    /// NEW-1 (Stage 5 re-audit): naming the two calls was not enough. Each of
+    /// these one-token edits compiled and shipped green, and each is a move
+    /// that reports `Moved` while connections of the target keep publishing
+    /// into the source room:
+    ///
+    /// - evicting on `&new_node` — on a cross-node move the removal goes to
+    ///   the wrong SFU, which has no such room and evicts nothing;
+    /// - evicting from `destination.id()` rather than `&from` — the wrong
+    ///   room, the one the target is being moved INTO;
+    /// - feeding `eviction_targets` only the chosen connection
+    ///   (`std::iter::once(moving.identity.clone())`) — every sibling stays.
+    ///
+    /// So the ARGUMENTS are pinned exactly, whitespace-flattened with comment
+    /// lines dropped: the node and room the source was LISTED from are the
+    /// node and room evicted from, and the eviction set is built from the
+    /// WHOLE listing.
+    #[test]
+    fn the_move_evicts_every_listed_connection() {
+        let body = move_body_code();
+        let flat = body.split_whitespace().collect::<Vec<_>>().join(" ");
+
+        // `old_node` is the SOURCE's node, bound once and never rebound.
+        first(
+            &flat,
+            "let Some(old_node) = get_channel_node(&from).await? else",
+        );
+        assert_eq!(
+            flat.matches("Some(old_node)").count(),
+            1,
+            "`old_node` must be bound exactly once, to the source's node"
+        );
+        for rebind in ["let old_node", "let mut old_node"] {
+            assert!(
+                !flat.contains(rebind),
+                "`old_node` is rebound (`{rebind}`), so the node evicted on may \
+                 no longer be the node the source was listed on"
+            );
+        }
+
+        // The listing is taken from that node and the source room, and binds
+        // `participants`, which nothing rebinds.
+        assert_eq!(
+            flat.matches(".list_participants_if_present(").count(),
+            1,
+            "the move must list the source room exactly once"
+        );
+        first(
+            &flat,
+            "let Some(participants) = voice_client \
+             .list_participants_if_present(&old_node, &from) .await? else",
+        );
+        for rebind in ["let participants", "let mut participants"] {
+            assert!(
+                !flat.contains(rebind),
+                "`participants` is rebound (`{rebind}`), so the eviction set \
+                 may no longer be the listing"
+            );
+        }
+
+        // The eviction set is built from the FULL listing, for the target.
+        assert_eq!(
+            flat.matches("eviction_targets(").count(),
+            1,
+            "the move must compute its eviction set exactly once"
+        );
+        first(
+            &flat,
+            "let evictions = eviction_targets( participants .iter() \
+             .map(|participant| participant.identity.clone()), &target.id, );",
+        );
+
+        // And every one of them is removed from the node and room it was
+        // listed in, inside the loop over that set.
+        assert_eq!(
+            flat.matches("remove_identity_if_present(").count(),
+            1,
+            "the move must evict through exactly one removal call"
+        );
+        let for_at = first(&flat, "for eviction in evictions ");
+        let open = for_at + first(&flat[for_at..], "\u{7b}");
+        let loop_body = braced_body(&flat, open);
+        assert!(
+            loop_body.contains(
+                "voice_client .remove_identity_if_present(&old_node, &eviction.identity, &from) \
+                 .await;"
+            ),
+            "each eviction must be removed from the SOURCE node and room it was \
+             listed in (`&old_node`, `&from`), by its own identity: {loop_body}"
+        );
+    }
+
+    /// B-1 + M-4: both addressing fields of the move event, and the device
+    /// the token is minted for, come from ONE `move_addressing` call on the
+    /// connection `select_move_connection` chose. Each revert this guards is
+    /// a one-token edit that compiles and fails nothing else: `conn_nonce:
+    /// None` switches the client's nonce gate off on every seat, and a
+    /// `device_id` from the Redis mapping addresses a connection the SFU no
+    /// longer lists.
+    #[test]
+    fn the_move_event_addresses_the_connection_it_chose() {
+        let body = move_body_code();
+        let flat = body.split_whitespace().collect::<Vec<_>>().join(" ");
+
+        assert!(
+            flat.contains(
+                "let Some(moving) = select_move_connection(&participants, &target.id, \
+                 mapped_identity.as_deref())"
+            ),
+            "`moving` must be the connection chosen from the SFU's list"
+        );
+        assert_eq!(
+            flat.matches("move_addressing(").count(),
+            1,
+            "the addressing must be computed exactly once"
+        );
+        let addressing = first(
+            &flat,
+            "let addressing = move_addressing(moving, &target.id);",
+        );
+        assert!(
+            addressing < first(&flat, ".create_token("),
+            "the addressing must exist before the token is minted from it"
+        );
+
+        // The token is minted for the addressed device.
+        let mint = first(&flat, ".create_token(");
+        let mint_args = &flat[mint..mint + first(&flat[mint..], ".await?")];
+        assert!(
+            mint_args.contains("addressing.device_id.as_deref()"),
+            "the token must be minted for `addressing.device_id`: {mint_args}"
+        );
+
+        // The event literal's two addressing fields, and nothing else feeding
+        // them.
+        let literal_at = first(&flat, "EventV1::UserMoveVoiceChannel");
+        let open = literal_at + first(&flat[literal_at..], "\u{7b}");
+        let literal = braced_body(&flat, open);
+        let fields: Vec<&str> = literal.split(',').map(str::trim).collect();
+        assert!(
+            fields.contains(&"device_id: addressing.device_id"),
+            "the event's `device_id` must be `addressing.device_id`: {literal}"
+        );
+        assert!(
+            fields.contains(&"conn_nonce: addressing.conn_nonce"),
+            "the event's `conn_nonce` must be `addressing.conn_nonce`: {literal}"
+        );
+        assert!(
+            !literal.contains("mapped_identity") && !literal.contains("None"),
+            "the event literal must not address from the mapping, nor hard-code \
+             an absent field: {literal}"
+        );
+    }
+
+    /// `move_addressing` by value: the device suffix and the nonce both come
+    /// from the participant it is handed, and only from it.
+    #[test]
+    fn move_addressing_reads_the_moving_connection() {
+        use super::{move_addressing, MoveAddressing};
+
+        let user = "01KX7HASD9FHBYA3XGKA5YACYX";
+
+        assert_eq!(
+            move_addressing(&listed(user, 0, Some("N-BARE")), user),
+            MoveAddressing {
+                device_id: None,
+                conn_nonce: Some("N-BARE".to_string()),
+            },
+            "a bare seat has no device suffix, and its nonce is what names it"
+        );
+        assert_eq!(
+            move_addressing(&listed(&format!("{user}:D1"), 0, Some("N-D1")), user),
+            MoveAddressing {
+                device_id: Some("D1".to_string()),
+                conn_nonce: Some("N-D1".to_string()),
+            }
+        );
+        assert_eq!(
+            move_addressing(&listed(&format!("{user}:D2"), 0, Some("")), user),
+            MoveAddressing {
+                device_id: Some("D2".to_string()),
+                conn_nonce: None,
+            },
+            "an empty nonce addresses nothing"
+        );
+        assert_eq!(
+            move_addressing(&listed(&format!("{user}:D3"), 0, None), user),
+            MoveAddressing {
+                device_id: Some("D3".to_string()),
+                conn_nonce: None,
+            }
+        );
+    }
+
+    /// B-3: what the evictions amount to. `Ok(true)` and `Ok(false)` succeed
+    /// for either kind; an `Err` on a LISTED connection fails the move (the
+    /// first such error is the one returned); an `Err` on a derived leg does
+    /// not.
+    #[test]
+    fn eviction_result_fails_only_on_a_listed_connection() {
+        use super::{eviction_result, VoiceEviction};
+
+        fn listed_one(identity: &str) -> VoiceEviction {
+            VoiceEviction {
+                identity: identity.to_string(),
+                reported: true,
+            }
+        }
+        fn derived_leg(identity: &str) -> VoiceEviction {
+            VoiceEviction {
+                identity: identity.to_string(),
+                reported: false,
+            }
+        }
+
+        assert_eq!(
+            eviction_result::<&str>([
+                (derived_leg("u::screen"), Ok(false)),
+                (listed_one("u"), Ok(false)),
+                (listed_one("u:D1"), Ok(true)),
+            ]),
+            Ok(()),
+            "removed and already-gone are both success"
+        );
+        assert_eq!(
+            eviction_result([
+                (derived_leg("u:D1:screen"), Err("leg 500")),
+                (listed_one("u:D1"), Ok(true)),
+            ]),
+            Ok(()),
+            "a derived leg's failure is discarded"
+        );
+        assert_eq!(
+            eviction_result([
+                (derived_leg("u::screen"), Ok(false)),
+                (listed_one("u"), Err("primary 500")),
+                (listed_one("u:D1"), Ok(true)),
+            ]),
+            Err("primary 500"),
+            "a listed connection that could not be removed fails the move, \
+             even when a later removal succeeds"
+        );
+        assert_eq!(
+            eviction_result([
+                (derived_leg("u::screen"), Err("leg 500")),
+                (listed_one("u"), Err("first listed 500")),
+                (listed_one("u:D1"), Err("second listed 500")),
+            ]),
+            Err("first listed 500"),
+            "the FIRST listed failure is returned, never a discarded leg's"
+        );
+        assert_eq!(eviction_result::<&str>([]), Ok(()));
+    }
+
+    /// B-3, the loop half: every removal is issued before the outcome is
+    /// decided. The eviction loop has no early exit (no `?` operator, no
+    /// `return`, no `break`), and `eviction_result` runs after it, on every
+    /// outcome. The `?` needles are the operator's shapes, not a bare `?`,
+    /// because the loop's log line formats with `:?`.
+    #[test]
+    fn the_move_attempts_every_eviction_before_deciding() {
+        let body = move_body_code();
+
+        let loop_at = first(&body, "for eviction in evictions");
+        let open = loop_at + first(&body[loop_at..], "\u{7b}");
+        let loop_body = braced_body(&body, open);
+        for exit in [".await?", ")?", "return", "break"] {
+            assert!(
+                !loop_body.contains(exit),
+                "the eviction loop contains `{exit}` — one failed removal must \
+                 not leave the remaining connections in the room: {loop_body}"
+            );
+        }
+        assert!(
+            loop_body.contains("outcomes.push((eviction, outcome));"),
+            "every outcome must be recorded: {loop_body}"
+        );
+
+        let decided = first(&body, "eviction_result(outcomes)?;");
+        assert!(
+            decided > open + loop_body.len(),
+            "`eviction_result` must run after the loop, on every outcome"
+        );
+    }
+
+    // ---- `delete_voice_state`: one script, one fallback ----
+    //
+    // What these cannot prove: that Redis executes the script as read. The
+    // Redis-backed `delete_voice_state_keeps_per_server_state_after_a_move`
+    // owns that, and it is compile-only on a box without Redis (owed to CI).
+
+    /// A shipping function's braced body, comment lines dropped, with every
+    /// run of whitespace collapsed to one space so a needle does not depend
+    /// on line wrapping.
+    fn flat_fn_body(shipping: &str, definition: &str) -> String {
+        let at = shipping
+            .find(definition)
+            .unwrap_or_else(|| panic!("mod.rs no longer defines `{definition}`"));
+        // Escaped brace: see `both_voice_state_teardowns_clear_the_identity_mapping`.
+        let open = at + shipping[at..].find('\u{7b}').expect("a body");
+
+        braced_body(shipping, open)
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join(" ")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    fn this_file_shipping() -> String {
+        const FILE: &str = "core/database/src/voice/mod.rs";
+
+        shipping_sources()
+            .into_iter()
+            .find(|(rel, _)| rel == FILE)
+            .expect("this very file is not in the workspace scan")
+            .1
+    }
+
+    /// B-2: the script's Lua source, EXACTLY. Every line is a decision that a
+    /// one-token edit reverses without failing anything else: the compare
+    /// (`~=` keeps a newer channel's per-server state; `==` would keep it for
+    /// the channel being left), the slot each command reads, and each
+    /// per-channel delete. A literal copy on purpose: changing the script has
+    /// to mean changing this, deliberately, alongside the layout test below.
+    #[test]
+    fn delete_voice_state_script_source_is_pinned() {
+        let expected = [
+            "",
+            "redis.call('SREM', KEYS[2], ARGV[2])",
+            "redis.call('SREM', KEYS[3], ARGV[3])",
+            "redis.call('HDEL', KEYS[4], ARGV[2])",
+            "redis.call('HDEL', KEYS[5], ARGV[2])",
+            "redis.call('DEL', KEYS[6])",
+            "local pointer = redis.call('GET', KEYS[1])",
+            "if pointer and pointer ~= ARGV[1] then",
+            "    return 0",
+            "end",
+            "redis.call('DEL', KEYS[1], unpack(KEYS, 7))",
+            "return 1",
+            "",
+        ]
+        .join("\n");
+
+        assert_eq!(
+            super::DELETE_VOICE_STATE_LUA,
+            expected,
+            "the voice-state teardown script changed; if that is deliberate, \
+             change this copy and the layout test with it"
+        );
+        assert!(
+            this_file_shipping().contains("LazyLock::new(|| Script::new(DELETE_VOICE_STATE_LUA))"),
+            "the static script must be built from the source pinned above"
+        );
+    }
+
+    /// B-2: the script's `KEYS[]` and `ARGV[]`, by value, in the slots the
+    /// Lua source reads. A wrong argument does not error — `ARGV[1]` set to
+    /// the user id compares a channel id with a user id, never matches, and
+    /// silently keeps every per-server key forever.
+    #[test]
+    fn delete_voice_state_script_input_is_pinned() {
+        use super::{
+            voice_state_teardown_input, ToRedisArgs, UserVoiceChannel, VoiceStateTeardownInput,
+        };
+
+        let channel = UserVoiceChannel {
+            id: "CHAN".to_string(),
+            server_id: Some("SRV".to_string()),
+        };
+        let strings =
+            |items: &[&str]| -> Vec<String> { items.iter().map(|item| item.to_string()).collect() };
+
+        assert_eq!(
+            voice_state_teardown_input(&channel, "USER"),
+            VoiceStateTeardownInput {
+                keys: strings(&[
+                    "USER:SRV",                    // KEYS[1], the pointer
+                    "vc_members:CHAN",             // KEYS[2]
+                    "vc:USER",                     // KEYS[3]
+                    "vc_leg:CHAN",                 // KEYS[4]
+                    "voice_identity:CHAN",         // KEYS[5]
+                    "annotations_allow:CHAN:USER", // KEYS[6]
+                    "joined_at:USER:SRV",          // KEYS[7..], the flags
+                    "is_publishing:USER:SRV",
+                    "is_receiving:USER:SRV",
+                    "screensharing:USER:SRV",
+                    "camera:USER:SRV",
+                    "screen_video:USER:SRV",
+                    "recording:USER:SRV",
+                    "rc_capable:USER:SRV",
+                    "watching:USER:SRV",
+                ]),
+                // ARGV[1] the channel, ARGV[2] the user, ARGV[3] the `vc:` member
+                args: strings(&["CHAN", "USER", "CHAN-SRV"]),
+            }
+        );
+
+        // `ARGV[3]` must be the member `create_voice_state` SADDs into
+        // `vc:{user}` byte for byte, or the SREM removes nothing.
+        let input = voice_state_teardown_input(&channel, "USER");
+        assert_eq!(
+            channel.to_redis_args(),
+            vec![input.args[2].as_bytes().to_vec()]
+        );
+
+        // No server (a DM or group call): the pointer and the flags key on the
+        // channel itself, and `vc:` stores the bare channel id.
+        let direct = UserVoiceChannel {
+            id: "DM".to_string(),
+            server_id: None,
+        };
+        let input = voice_state_teardown_input(&direct, "USER");
+        assert_eq!(input.keys[0], "USER:DM");
+        assert_eq!(input.keys[6], "joined_at:USER:DM");
+        assert_eq!(input.args, strings(&["DM", "USER", "DM"]));
+    }
+
+    /// B-2 + M-5 + L-6: `delete_voice_state` feeds the script ONLY from the
+    /// pinned input, writes nothing to Redis outside the script, keeps the
+    /// watch-session end first, and on a script error logs at ERROR and runs
+    /// the unconditional fallback — which is the pre-script delete set.
+    #[test]
+    fn delete_voice_state_runs_the_script_and_falls_back_on_error() {
+        let shipping = this_file_shipping();
+        let body = flat_fn_body(&shipping, "pub async fn delete_voice_state(");
+        let at = |needle: &str| {
+            body.find(needle)
+                .unwrap_or_else(|| panic!("`delete_voice_state` no longer has `{needle}`: {body}"))
+        };
+
+        at("let input = voice_state_teardown_input(channel, user_id);");
+        at("let mut invocation = DELETE_VOICE_STATE.prepare_invoke();");
+        at("for key in &input.keys \u{7b} invocation.key(key); \u{7d}");
+        at("for arg in &input.args \u{7b} invocation.arg(arg); \u{7d}");
+        assert_eq!(body.matches(".key(").count(), 1, "one `.key(` only: {body}");
+        assert_eq!(body.matches(".arg(").count(), 1, "one `.arg(` only: {body}");
+
+        // L-6: every delete happens inside the one script.
+        for write in ["Pipeline", ".srem(", ".hdel(", ".del(", ".query_async("] {
+            assert!(
+                !body.contains(write),
+                "`delete_voice_state` writes `{write}` outside the script — a \
+                 second round trip is a window for a re-join to be deleted"
+            );
+        }
+
+        let invoke = at("invocation.invoke_async::<_, i64>(&mut conn).await");
+        assert!(
+            at("watch::end_watch_session_if_host(channel, user_id).await;") < invoke,
+            "the watch session must still end BEFORE the state is deleted"
+        );
+
+        // M-5, narrowed by NEW-4: only an error the classifier accepts falls
+        // back, and that arm falls back unconditionally — the latch inside it
+        // picks the log level and nothing else.
+        let fallback_arm_at = invoke
+            + body[invoke..]
+                .find("Err(error) if teardown_script_error_allows_fallback(&error) => ")
+                .expect("a guarded fallback arm");
+        let open = fallback_arm_at
+            + body[fallback_arm_at..]
+                .find('\u{7b}')
+                .expect("a braced arm");
+        let fallback_arm = braced_body(&body, open).trim();
+        assert!(
+            fallback_arm.starts_with(
+                "if TEARDOWN_FALLBACK_LOGGED.swap(true, Ordering::Relaxed) \u{7b} log::debug!("
+            ),
+            "the fallback must open with the log-once latch, DEBUG once latched: \
+             {fallback_arm}"
+        );
+        assert!(
+            fallback_arm.contains("\u{7d} else \u{7b} log::error!("),
+            "the first fallback in a process must be logged at ERROR: {fallback_arm}"
+        );
+        assert!(
+            fallback_arm
+                .ends_with("\u{7d} delete_voice_state_unconditionally(channel, user_id).await"),
+            "the fallback must run AFTER the latch's if/else, outside both \
+             branches, and return what it returns — the latch changes logging, \
+             never whether the fallback runs: {fallback_arm}"
+        );
+        assert!(
+            !fallback_arm.contains("return"),
+            "nothing in the fallback arm may return before the fallback runs: \
+             {fallback_arm}"
+        );
+        assert!(
+            shipping
+                .contains("static TEARDOWN_FALLBACK_LOGGED: AtomicBool = AtomicBool::new(false);"),
+            "the log-once latch is gone"
+        );
+
+        // NEW-4: every other error is RETURNED, with no fallback and no retry.
+        let other_arm_at = open
+            + body[open..]
+                .find("Err(error) => ")
+                .expect("an unguarded Err arm");
+        let open = other_arm_at + body[other_arm_at..].find('\u{7b}').expect("a braced arm");
+        let other_arm = braced_body(&body, open).trim();
+        assert!(
+            other_arm.ends_with("Err(error).to_internal_error()"),
+            "an error the classifier rejects must be returned: {other_arm}"
+        );
+        for banned in [
+            "delete_voice_state_unconditionally(",
+            "invoke_async",
+            "DELETE_VOICE_STATE",
+        ] {
+            assert!(
+                !other_arm.contains(banned),
+                "an error the classifier rejects must not fall back or retry \
+                 (`{banned}`): {other_arm}"
+            );
+        }
+        assert_eq!(
+            call_sites(&shipping, "delete_voice_state_unconditionally(").len(),
+            1,
+            "the unconditional teardown is the script's fallback and nothing \
+             else: it wipes a newer channel's per-server state after a move"
+        );
+
+        // The fallback is the pre-script delete set, every key unconditional.
+        let fallback = flat_fn_body(&shipping, "async fn delete_voice_state_unconditionally(");
+        for needle in [
+            "Pipeline::new()",
+            ".srem(format!(\"vc_members:{}\", &channel.id), user_id)",
+            ".srem(format!(\"vc:{user_id}\"), channel)",
+            ".hdel(format!(\"vc_leg:{}\", &channel.id), user_id)",
+            ".hdel(format!(\"voice_identity:{}\", &channel.id), user_id)",
+            ".del(&[ format!(\"joined_at:{unique_key}\"), \
+             format!(\"is_publishing:{unique_key}\"), \
+             format!(\"is_receiving:{unique_key}\"), \
+             format!(\"screensharing:{unique_key}\"), \
+             format!(\"camera:{unique_key}\"), \
+             format!(\"screen_video:{unique_key}\"), \
+             format!(\"recording:{unique_key}\"), \
+             format!(\"rc_capable:{unique_key}\"), \
+             format!(\"watching:{unique_key}\"), \
+             format!(\"annotations_allow:{}:{}\", &channel.id, user_id), \
+             unique_key.clone(), ])",
+        ] {
+            assert!(
+                fallback.contains(needle),
+                "the fallback no longer issues `{needle}`: {fallback}"
+            );
+        }
+    }
+
+    /// NEW-4: which script failures may fall back to the unconditional
+    /// teardown. Only a server reply proving the script never ran; above all
+    /// NOT a transport error, after which the script may have run, kept a
+    /// moved user's destination state, and lost its reply.
+    ///
+    /// Each class is built twice where it can be: from the `(ErrorKind, desc,
+    /// detail)` constructors, and from WIRE BYTES through redis-rs's own
+    /// parser, so the classifier is held to the errors the connection
+    /// actually produces rather than to this test's idea of them.
+    #[test]
+    fn teardown_script_falls_back_only_when_the_script_provably_never_ran() {
+        use super::teardown_script_error_allows_fallback as allows;
+        use redis_kiss::redis::{parse_redis_value, ErrorKind, RedisError};
+        use std::io;
+
+        const SERVER: &str = "An error was signalled by the server";
+        let server =
+            |kind: ErrorKind, detail: &str| RedisError::from((kind, SERVER, detail.to_string()));
+        let wire = |reply: &str| parse_redis_value(reply.as_bytes()).expect_err("an error reply");
+        let io = |kind: io::ErrorKind| RedisError::from(io::Error::from(kind));
+
+        // The script never ran: fall back.
+        for (case, error) in [
+            (
+                "EVALSHA renamed away",
+                server(
+                    ErrorKind::ResponseError,
+                    "unknown command 'EVALSHA', with args beginning with: 'abc' ",
+                ),
+            ),
+            (
+                "EVALSHA renamed away, off the wire",
+                wire("-ERR unknown command `EVALSHA`, with args beginning with: \r\n"),
+            ),
+            (
+                "NOSCRIPT after the reload",
+                server(
+                    ErrorKind::NoScriptError,
+                    "No matching script. Please use EVAL.",
+                ),
+            ),
+            (
+                "NOSCRIPT, off the wire",
+                wire("-NOSCRIPT No matching script. Please use EVAL.\r\n"),
+            ),
+            (
+                "CROSSSLOT",
+                server(
+                    ErrorKind::CrossSlot,
+                    "Keys in request don't hash to the same slot",
+                ),
+            ),
+            (
+                "CROSSSLOT, off the wire",
+                wire("-CROSSSLOT Keys in request don't hash to the same slot\r\n"),
+            ),
+            (
+                "an ACL refusing EVALSHA",
+                wire("-NOPERM User default has no permissions to run the 'evalsha' command\r\n"),
+            ),
+            (
+                "an ACL refusing SCRIPT LOAD",
+                wire(
+                    "-NOPERM User default has no permissions to run the 'script|load' command\r\n",
+                ),
+            ),
+        ] {
+            assert!(allows(&error), "{case} must fall back: {error}");
+        }
+
+        // A garbled reply is `ResponseError` too — the reason the classifier
+        // reads the detail rather than trusting the kind.
+        let garbled = parse_redis_value(b"?not a reply\r\n").expect_err("a parse error");
+        assert_eq!(garbled.kind(), ErrorKind::ResponseError, "{garbled}");
+
+        // The script may have run, or did: returned, never a fallback.
+        for (case, error) in [
+            ("a connection reset", io(io::ErrorKind::ConnectionReset)),
+            ("a broken pipe", io(io::ErrorKind::BrokenPipe)),
+            ("EOF mid-reply", io(io::ErrorKind::UnexpectedEof)),
+            ("a timeout", io(io::ErrorKind::TimedOut)),
+            ("a refused connection", io(io::ErrorKind::ConnectionRefused)),
+            (
+                "an IoError kind",
+                RedisError::from((ErrorKind::IoError, "io")),
+            ),
+            ("a garbled reply", garbled),
+            (
+                "a reply that is not an integer",
+                RedisError::from((
+                    ErrorKind::TypeError,
+                    "Response was of incompatible type",
+                    "Response type not integer compatible.".to_string(),
+                )),
+            ),
+            (
+                "a Lua runtime error (Redis 6)",
+                wire("-ERR Error running script (call to f_abc): @user_script:1: WRONGTYPE\r\n"),
+            ),
+            (
+                "a Lua runtime error (Redis 7)",
+                wire("-WRONGTYPE Operation against a key script: abc, on @user_script:1.\r\n"),
+            ),
+            (
+                "a NOPERM from inside the script",
+                wire("-NOPERM User default has no permissions to run the 'del' command\r\n"),
+            ),
+            ("a bare ERR", wire("-ERR\r\n")),
+            (
+                "LOADING",
+                wire("-LOADING Redis is loading the dataset in memory\r\n"),
+            ),
+            ("BUSY", wire("-BUSY Redis is busy running a script.\r\n")),
+            (
+                "READONLY",
+                wire("-READONLY You can't write against a read only replica.\r\n"),
+            ),
+            ("MOVED", wire("-MOVED 3999 127.0.0.1:6381\r\n")),
+        ] {
+            assert!(
+                !allows(&error),
+                "{case} must be returned, not fall back: {error}"
+            );
+        }
+    }
+
+    /// STRUCTURAL pin, standing in for a test that cannot run here: every
+    /// voice-state teardown path clears `voice_identity:` — the script, the
+    /// script's fallback, and the whole-call teardown.
     ///
     /// The behavioural version of this needs Redis, and the Redis-backed tests
-    /// in this crate are the eight that fail on a build box with no server. So
-    /// what is pinned instead is the shape — that the two functions every
-    /// leave, reconcile, force-disconnect and room-teardown path funnels
-    /// through both name the key.
+    /// in this crate are the ones that fail on a build box with no server. So
+    /// what is pinned instead is the shape.
     ///
     /// It matters because the mapping used to be cleared only by the callers
     /// that happened to remember: voice-ingress `participant_left` and the
@@ -2139,41 +3736,64 @@ mod permission_tests {
     /// there is one of the two independent sources of the stale identities
     /// that made a voice move evict the wrong connection.
     ///
-    /// It does NOT prove the key is cleared for the right user, nor that the
-    /// pipeline runs: only that neither teardown has quietly dropped it again.
+    /// Each path has its own needle, and each is proven red by its own
+    /// mutation: dropping the script's HDEL line, and dropping the fallback's
+    /// `.hdel`, each fail here on their own.
     ///
-    /// The needles are the KEY CONSTRUCTION, not the key name, and comment
-    /// lines are skipped — both because the first draft of this test searched
-    /// the body for the bare string `voice_identity:` and its known-bad control
-    /// stayed GREEN: the prose explaining why the clear is there mentions the
-    /// key, so deleting the clear left the assertion satisfied by a comment
-    /// about the clear. A scan that its own mutation cannot turn red is
-    /// decoration.
+    /// The fallback needles are the KEY CONSTRUCTION, not the key name, and
+    /// comment lines are skipped — both because the first draft of this test
+    /// searched the body for the bare string `voice_identity:` and its
+    /// known-bad control stayed GREEN: the prose explaining why the clear is
+    /// there mentions the key, so deleting the clear left the assertion
+    /// satisfied by a comment about the clear. A scan that its own mutation
+    /// cannot turn red is decoration.
     #[test]
     fn both_voice_state_teardowns_clear_the_identity_mapping() {
-        const FILE: &str = "core/database/src/voice/mod.rs";
-        // Per-teardown, because they clear it with different commands: one
-        // member leaving is an HDEL of their field, a whole call ending is a
-        // DEL of the hash.
+        use super::{voice_state_teardown_input, UserVoiceChannel, DELETE_VOICE_STATE_LUA};
+
+        // The script path: KEYS[5] is this channel's mapping, ARGV[2] the
+        // user's field in it, and the script HDELs exactly that.
+        let input = voice_state_teardown_input(
+            &UserVoiceChannel {
+                id: "CHAN".to_string(),
+                server_id: Some("SRV".to_string()),
+            },
+            "USER",
+        );
+        assert_eq!(input.keys[4], "voice_identity:CHAN", "KEYS[5]");
+        assert_eq!(input.args[1], "USER", "ARGV[2]");
+        assert!(
+            DELETE_VOICE_STATE_LUA
+                .lines()
+                .any(|line| line.trim() == "redis.call('HDEL', KEYS[5], ARGV[2])"),
+            "the teardown script no longer clears the identity mapping"
+        );
+
+        let shipping = this_file_shipping();
+        assert!(
+            flat_fn_body(&shipping, "pub async fn delete_voice_state(")
+                .contains("voice_state_teardown_input(channel, user_id)"),
+            "`delete_voice_state` no longer runs the script with the input above"
+        );
+
+        // The fallback and the whole-call teardown, per-teardown, because
+        // they clear it with different commands: one member leaving is an
+        // HDEL of their field, a whole call ending is a DEL of the hash.
         const TEARDOWNS: [(&str, &str); 2] = [
-            ("fn delete_voice_state", ".hdel(format!(\"voice_identity:"),
             (
-                "fn delete_channel_voice_state",
+                "async fn delete_voice_state_unconditionally(",
+                ".hdel(format!(\"voice_identity:",
+            ),
+            (
+                "pub async fn delete_channel_voice_state(",
                 ".del(format!(\"voice_identity:",
             ),
         ];
 
-        let sources = shipping_sources();
-        let shipping = &sources
-            .iter()
-            .find(|(rel, _)| rel == FILE)
-            .expect("this very file is not in the workspace scan")
-            .1;
-
         for (teardown, command) in TEARDOWNS {
             let definition = shipping
                 .find(teardown)
-                .unwrap_or_else(|| panic!("{FILE} no longer defines `{teardown}`"));
+                .unwrap_or_else(|| panic!("mod.rs no longer defines `{teardown}`"));
 
             // The opening brace is written as an escape for the same reason
             // every other scan in this module writes its one that way:
@@ -2184,7 +3804,7 @@ mod permission_tests {
                     .find('\u{7b}')
                     .expect("the teardown has a body");
 
-            let cleared = braced_body(shipping, open).lines().any(|line| {
+            let cleared = braced_body(&shipping, open).lines().any(|line| {
                 let trimmed = line.trim_start();
                 !trimmed.starts_with("//") && trimmed.contains(command)
             });
@@ -4404,6 +6024,193 @@ mod tests {
         assert!(
             !leg_hash_exists,
             "the per-channel leg hash must not outlive the call"
+        );
+    }
+
+    // H-1 (AFK Wave 5b-1). COMPILE-ONLY ON A BOX WITHOUT REDIS, OWED TO CI:
+    // like the other Redis-backed tests here it fails at its first
+    // `get_connection` with `InternalError` when no server is reachable.
+    //
+    // `delete_voice_state` keeps the per-server pointer and flags when the
+    // pointer names a DIFFERENT channel (a late leave from the source after
+    // the destination's join), and deletes them when it names this channel
+    // or nothing. Per-channel state (`vc_members`, the `vc:` entry, the
+    // `vc_leg` and `voice_identity` fields, `annotations_allow`) goes in
+    // every case, and another channel's per-channel state is never touched.
+    #[test]
+    fn delete_voice_state_keeps_per_server_state_after_a_move() {
+        rt().block_on(delete_voice_state_after_a_move_case())
+    }
+
+    /// Give `user` a value in every per-channel key the teardown script
+    /// clears, beyond the two `create_voice_state` already writes.
+    async fn seed_per_channel_voice_state(conn: &mut Conn, channel: &UserVoiceChannel, user: &str) {
+        let _: () = conn
+            .hset(format!("vc_leg:{}", channel.id), user, "SID")
+            .await
+            .unwrap();
+        let _: () = conn
+            .hset(
+                format!("voice_identity:{}", channel.id),
+                user,
+                format!("{user}:D1"),
+            )
+            .await
+            .unwrap();
+        let _: () = conn
+            .sadd(
+                format!("annotations_allow:{}:{user}", channel.id),
+                "ANNOTATOR",
+            )
+            .await
+            .unwrap();
+    }
+
+    /// Every per-channel key of `user` in `channel` is gone.
+    async fn assert_per_channel_voice_state_gone(
+        conn: &mut Conn,
+        channel: &UserVoiceChannel,
+        user: &str,
+        case: &str,
+    ) {
+        let member: bool = conn
+            .sismember(format!("vc_members:{}", channel.id), user)
+            .await
+            .unwrap();
+        let listed: bool = conn.sismember(format!("vc:{user}"), channel).await.unwrap();
+        let leg: bool = conn
+            .hexists(format!("vc_leg:{}", channel.id), user)
+            .await
+            .unwrap();
+        let identity: bool = conn
+            .hexists(format!("voice_identity:{}", channel.id), user)
+            .await
+            .unwrap();
+        let annotations: bool = conn
+            .exists(format!("annotations_allow:{}:{user}", channel.id))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            (member, listed, leg, identity, annotations),
+            (false, false, false, false, false),
+            "{case}: per-channel state must go unconditionally \
+             (vc_members, vc:, vc_leg, voice_identity, annotations_allow)"
+        );
+    }
+
+    async fn delete_voice_state_after_a_move_case() {
+        let suffix = ulid::Ulid::new().to_string();
+        let server = format!("srv{suffix}");
+        let source = UserVoiceChannel {
+            id: format!("chanA{suffix}"),
+            server_id: Some(server.clone()),
+        };
+        let destination = UserVoiceChannel {
+            id: format!("chanB{suffix}"),
+            server_id: Some(server.clone()),
+        };
+        let user = format!("user{suffix}");
+        let unique_key = format!("{user}:{server}");
+        let flag_keys: Vec<String> = [
+            "joined_at",
+            "is_publishing",
+            "is_receiving",
+            "screensharing",
+            "camera",
+            "screen_video",
+            "recording",
+            "rc_capable",
+            "watching",
+        ]
+        .iter()
+        .map(|flag| format!("{flag}:{unique_key}"))
+        .collect();
+
+        let mut conn = get_connection().await.expect("redis");
+
+        // Case 1 — the pointer names ANOTHER channel. The user joined the
+        // source, then the destination (pointer -> destination, flags are the
+        // destination's), and the source's leave lands late.
+        create_voice_state(&source, &user, Timestamp::now_utc())
+            .await
+            .expect("seed source");
+        create_voice_state(&destination, &user, Timestamp::now_utc())
+            .await
+            .expect("seed destination");
+        update_voice_state_tracks(&destination, &user, true, 2)
+            .await
+            .unwrap();
+        seed_per_channel_voice_state(&mut conn, &source, &user).await;
+        seed_per_channel_voice_state(&mut conn, &destination, &user).await;
+
+        delete_voice_state(&source, &user)
+            .await
+            .expect("late leave");
+        assert_per_channel_voice_state_gone(&mut conn, &source, &user, "pointer elsewhere").await;
+        let still_in_destination: bool = conn
+            .sismember(format!("vc_members:{}", destination.id), &user)
+            .await
+            .unwrap();
+        let destination_identity: bool = conn
+            .hexists(format!("voice_identity:{}", destination.id), &user)
+            .await
+            .unwrap();
+        assert!(
+            still_in_destination && destination_identity,
+            "a leave from the source must not touch the destination's per-channel state"
+        );
+
+        let pointer: Option<String> = conn.get(&unique_key).await.unwrap();
+        assert_eq!(
+            pointer.as_deref(),
+            Some(destination.id.as_str()),
+            "a late leave from the source must not clear the destination's pointer"
+        );
+        let state = get_voice_state(&destination, &user)
+            .await
+            .unwrap()
+            .expect("the destination's voice state must survive a late source leave");
+        assert!(state.is_publishing, "...flags included");
+        let in_source: bool = conn
+            .sismember(format!("vc_members:{}", source.id), &user)
+            .await
+            .unwrap();
+        assert!(
+            !in_source,
+            "per-channel membership of the source still goes"
+        );
+        let channels = get_user_voice_channels(&user).await.unwrap();
+        assert!(
+            channels.iter().all(|channel| channel.id != source.id),
+            "the source leaves vc:{{user}} unconditionally"
+        );
+
+        // Case 2 — the pointer names THIS channel: everything goes.
+        delete_voice_state(&destination, &user)
+            .await
+            .expect("leave");
+        assert_per_channel_voice_state_gone(&mut conn, &destination, &user, "pointer here").await;
+        let pointer: Option<String> = conn.get(&unique_key).await.unwrap();
+        assert_eq!(pointer, None);
+        let flags: Vec<Option<String>> = conn.mget(&flag_keys).await.unwrap();
+        assert!(
+            flags.iter().all(Option::is_none),
+            "a leave from the channel the pointer names clears every flag: {flags:?}"
+        );
+
+        // Case 3 — no pointer at all: the flags are orphans and go.
+        create_voice_state(&source, &user, Timestamp::now_utc())
+            .await
+            .expect("reseed");
+        seed_per_channel_voice_state(&mut conn, &source, &user).await;
+        let _: () = conn.del(&unique_key).await.unwrap();
+        delete_voice_state(&source, &user).await.expect("leave");
+        assert_per_channel_voice_state_gone(&mut conn, &source, &user, "no pointer").await;
+        let flags: Vec<Option<String>> = conn.mget(&flag_keys).await.unwrap();
+        assert!(
+            flags.iter().all(Option::is_none),
+            "a nil pointer must delete, never keep: {flags:?}"
         );
     }
 }

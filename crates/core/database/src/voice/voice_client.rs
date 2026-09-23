@@ -5,7 +5,10 @@ use crate::{
 };
 use livekit_api::{
     access_token::{AccessToken, VideoGrants},
-    services::room::{CreateRoomOptions, RoomClient as InnerRoomClient, UpdateParticipantOptions},
+    services::{
+        room::{CreateRoomOptions, RoomClient as InnerRoomClient, UpdateParticipantOptions},
+        ServiceError, TwirpError, TwirpErrorCode,
+    },
 };
 use livekit_protocol::{ParticipantInfo, ParticipantPermission, Room, TrackSource};
 use revolt_config::{config, LiveKitNode};
@@ -14,6 +17,43 @@ use revolt_result::{create_error, Result, ToRevoltError};
 use std::{collections::HashMap, time::Duration};
 
 use super::{get_allowed_sources, track_source_grant_name, AfkGate};
+
+/// Token attribute carrying a per-CONNECTION nonce, minted fresh by
+/// [`VoiceClient::create_token`] on every call.
+///
+/// It is an addressing label for server-ordered moves: the SFU reports it
+/// back through [`VoiceClient::list_participants_if_present`], so a move can
+/// name exactly the connection it is moving, and the client compares it
+/// against its own `localParticipant.attributes` to tell "this move is for
+/// me" from "this move is for my other seat".
+///
+/// Token attributes are broadcast to every co-participant in the room, which
+/// is why the value is an opaque random id (no timestamp, no device detail).
+/// It is an addressing label, NEVER a capability: nothing may be granted or
+/// authorized on the strength of it, and it is never accepted from a client
+/// body — only ever minted here, server-side.
+///
+/// It must NEVER be folded into the identity string. Identities are parsed
+/// by segment count (`participant_leg`'s `splitn(3, ':')`, `is_screen_leg`,
+/// the client's `isDeviceQualified`), and a third segment would turn every
+/// primary into something those parsers read as a screen leg.
+pub const CONN_NONCE_ATTRIBUTE: &str = "conn";
+
+/// Whether a LiveKit service error is the SFU's structured "not found" reply
+/// (for `RemoveParticipant`: that identity is not in the room).
+///
+/// Deliberately narrow. Only a decoded Twirp error body whose code is
+/// `not_found` qualifies; every other Twirp code is a real failure, and so is
+/// a 404 whose body is NOT a Twirp JSON error (a proxy's HTML page, say) —
+/// that one surfaces as `TwirpError::Request` from the failed JSON decode and
+/// must stay an error, or an unreachable SFU would read as "already gone".
+pub fn is_twirp_not_found(err: &ServiceError) -> bool {
+    matches!(
+        err,
+        ServiceError::Twirp(TwirpError::Twirp(TwirpErrorCode { code, .. }))
+            if code == TwirpErrorCode::NOT_FOUND
+    )
+}
 
 #[derive(Debug)]
 pub struct RoomClient {
@@ -76,11 +116,13 @@ impl VoiceClient {
         let room = self.get_node(node)?;
 
         let limits = user.limits().await;
-        // No `Server` is in hand here — `create_token` is called from
-        // `voice_join`, the moderator move and the RC paths, none of which can
-        // be changed from this lane — so the gate resolves the designation
-        // itself. One `fetch_server` per token mint (a join or a move), never
-        // per participant of a call.
+        // No `Server` is in hand here — `create_token` is called only from
+        // `voice_join` and the server-ordered move
+        // (`move_user_to_voice_channel`); the remote-control paths never mint,
+        // they act on existing participants through
+        // `update_permissions_identity` — so the gate resolves the
+        // designation itself. One `fetch_server` per token mint (a join or a
+        // move), never per participant of a call.
         let allowed_sources = get_allowed_sources(
             &limits,
             permissions,
@@ -97,12 +139,21 @@ impl VoiceClient {
             None => user.id.clone(),
         };
 
+        // Fresh per-connection nonce on EVERY mint — see
+        // `CONN_NONCE_ATTRIBUTE`. Carried as an attribute, never in the
+        // identity.
+        let conn_nonce = nanoid::nanoid!();
+
         AccessToken::with_api_key(&room.node.key, &room.node.secret)
             .with_name(&format!("{}#{}", user.username, user.discriminator))
             .with_identity(&identity)
             .with_metadata(
                 &serde_json::to_string(&user.clone().into(db, None).await).to_internal_error()?,
             )
+            // `with_attributes` REPLACES the whole attribute map, so this must
+            // stay the ONLY call on this builder; any future attribute joins
+            // this array rather than getting a second call.
+            .with_attributes([(CONN_NONCE_ATTRIBUTE, conn_nonce.as_str())])
             .with_ttl(Duration::from_secs(10))
             .with_grants(VideoGrants {
                 room_join: true,
@@ -297,31 +348,81 @@ impl VoiceClient {
             .to_internal_error()
     }
 
+    /// Remove a participant addressed by an EXACT SFU identity, treating
+    /// "not in the room" as an answer rather than a failure.
+    ///
+    /// `Ok(true)`: the SFU removed it. `Ok(false)`: the SFU says no such
+    /// participant (see [`is_twirp_not_found`]) — for an eviction that is the
+    /// outcome wanted, e.g. a moved connection that already left on the move
+    /// event. `Err`: anything else, including a non-JSON 404.
+    ///
+    /// Goes through the raw room client (the voice-ingress `participant_left`
+    /// precedent) rather than [`Self::remove_identity`], whose
+    /// `to_internal_error()` logs at ERROR and reports to Sentry before the
+    /// caller can classify the result — one event per evicted connection per
+    /// move. A real failure is logged here at WARN only; the caller decides
+    /// what it means for its operation.
+    pub async fn remove_identity_if_present(
+        &self,
+        node: &str,
+        identity: &str,
+        room: &str,
+    ) -> Result<bool> {
+        let livekit = self.get_node(node)?;
+
+        match livekit.client.remove_participant(room, identity).await {
+            Ok(()) => Ok(true),
+            Err(error) if is_twirp_not_found(&error) => Ok(false),
+            Err(error) => {
+                log::warn!("failed to remove SFU participant {identity} from room {room}: {error}");
+                Err(create_error!(InternalError))
+            }
+        }
+    }
+
     /// Every participant the SFU currently reports in a room, identities and
-    /// all.
+    /// all, treating "the SFU has no such room" as an answer rather than a
+    /// failure.
     ///
     /// The SFU's own list is the only authority on how many connections an
     /// account actually holds in a call. The server-side records are not:
     /// `voice_identity:{channel_id}` is a hash keyed by BARE user id, so it can
     /// represent at most one connection per account, and `vc_members` is a set
     /// of user ids with the same limitation. Where a decision has to be correct
-    /// for a user sitting in a room TWICE — the voice-move eviction — it has to
-    /// be made against this, not against Redis.
+    /// for a user sitting in a room TWICE — the voice-move eviction, and any
+    /// future multi-connection eviction (kick, ban) — it has to be made against
+    /// this, not against Redis.
     ///
-    /// Read-only, so unlike the removal helpers below it has no best-effort
-    /// half: the caller gets the whole list or the transport error, and decides
-    /// what an unanswered SFU means for its own operation.
-    pub async fn list_participants(
+    /// `Ok(Some(list))`: the SFU's participants. `Ok(None)`: the SFU says the
+    /// room does not exist (a Twirp `not_found`, see [`is_twirp_not_found`]),
+    /// so nobody is connected to it. `Err`: anything else, including a
+    /// non-JSON 404; an unknown node is `get_node`'s `UnknownNode`. Read-only,
+    /// so unlike the removal helpers below it has no best-effort half: the
+    /// caller decides what an unanswered SFU means for its own operation.
+    ///
+    /// This is deliberately the ONLY participant listing on `VoiceClient`.
+    /// A room the SFU no longer has must read as "not connected", not as a
+    /// 500 plus a Sentry event on every sweep tick. Like
+    /// [`Self::remove_identity_if_present`] it goes through the raw room
+    /// client, because `to_internal_error()` logs at ERROR and reports to
+    /// Sentry before the caller can classify the result; a real failure is
+    /// logged here at WARN only. Do not add a plain `to_internal_error()`
+    /// listing beside it.
+    pub async fn list_participants_if_present(
         &self,
         node: &str,
-        channel_id: &str,
-    ) -> Result<Vec<ParticipantInfo>> {
-        let room = self.get_node(node)?;
+        room: &str,
+    ) -> Result<Option<Vec<ParticipantInfo>>> {
+        let livekit = self.get_node(node)?;
 
-        room.client
-            .list_participants(channel_id)
-            .await
-            .to_internal_error()
+        match livekit.client.list_participants(room).await {
+            Ok(participants) => Ok(Some(participants)),
+            Err(error) if is_twirp_not_found(&error) => Ok(None),
+            Err(error) => {
+                log::warn!("failed to list SFU participants of room {room}: {error}");
+                Err(create_error!(InternalError))
+            }
+        }
     }
 
     /// Remove ONE connection of `user_id` — the one the identity mapping names
@@ -333,20 +434,29 @@ impl VoiceClient {
     /// SFU permits: `{user}` and `{user}:{device}` are not duplicate
     /// identities) has only one of them represented there, and this leaves the
     /// other connected. Callers that must clear an account out of a room
-    /// COMPLETELY have to enumerate [`Self::list_participants`] instead; see
-    /// the eviction leg of `move_user_to_voice_channel`.
+    /// COMPLETELY have to enumerate [`Self::list_participants_if_present`]
+    /// instead, and evict each listed connection with
+    /// [`Self::remove_identity_if_present`]; see the eviction leg of
+    /// `move_user_to_voice_channel`. Use the `_if_present` listing, never a
+    /// raw `to_internal_error()` one: it reads a room the SFU no longer has
+    /// as "not connected" (`Ok(None)`), where a plain listing turns it into a
+    /// 500 plus a Sentry event.
     pub async fn remove_user(&self, node: &str, user_id: &str, channel_id: &str) -> Result<()> {
         let room = self.get_node(node)?;
 
         // Resolve the (possibly device-qualified) identity the SFU knows
         let identity = super::get_voice_participant_identity(channel_id, user_id).await?;
 
-        // A screen leg is a helper of the primary, so EVERY removal path takes
-        // it too: moderator kick, voice move, ban, member/server/channel
-        // delete, the join-time `force_disconnect`, the ingress admission
-        // backstop and the forbidden-track eject all land here. Without this a
-        // kicked user's phone keeps streaming into the call it was removed
-        // from. Best-effort — most users have no leg (plan §2.4).
+        // A screen leg is a helper of the primary, so EVERY removal path that
+        // lands here takes it too: the moderator voice disconnect
+        // (`member_edit`); through `remove_user_from_voice_channel(s)` the
+        // ban, member kick, `server_delete`, `channel_delete`, group member
+        // removal and bot deletion; the join-time `force_disconnect`; the
+        // ingress admission backstop and the forbidden-track eject. The voice
+        // move does NOT come through here — it evicts each connection the SFU
+        // lists via `remove_identity_if_present`. Without this a kicked
+        // user's phone keeps streaming into the call it was removed from.
+        // Best-effort — most users have no leg (plan §2.4).
         let _ = room
             .client
             .remove_participant(channel_id, &super::screen_leg_identity(&identity))
@@ -534,6 +644,455 @@ mod screen_leg_permission_tests {
                     );
                 }
             }
+        }
+    }
+}
+
+/// The per-connection nonce and the classifying removal (AFK Wave 5b-1).
+///
+/// No Redis, Mongo or real SFU: the tokens are minted by the real
+/// `create_token` / `create_screen_leg_token` against a saved-messages channel
+/// (no server, so the AFK gate never reads the database) and the Reference
+/// driver, and the removal is driven against a one-shot loopback HTTP stub
+/// that answers the way a LiveKit Twirp endpoint (or a proxy in front of one)
+/// would.
+#[cfg(test)]
+mod conn_nonce_and_removal_tests {
+    use super::{is_twirp_not_found, VoiceClient};
+    use crate::{
+        models::{Channel, User},
+        Database,
+    };
+    use livekit_api::{
+        access_token::{AccessTokenError, Claims},
+        services::{ServiceError, TwirpError, TwirpErrorCode},
+    };
+    use livekit_protocol::ParticipantInfo;
+    use revolt_config::LiveKitNode;
+    use revolt_permissions::{ChannelPermission, PermissionValue};
+    use revolt_result::ErrorType;
+    use std::{
+        collections::{BTreeMap, HashMap, HashSet},
+        io::{Read, Write},
+        net::TcpListener,
+        thread::JoinHandle,
+    };
+
+    const NODE: &str = "test-node";
+
+    fn voice_client(url: &str) -> VoiceClient {
+        VoiceClient::new(HashMap::from([(
+            NODE.to_string(),
+            LiveKitNode {
+                url: url.to_string(),
+                lat: 0.0,
+                lon: 0.0,
+                key: "testkey".to_string(),
+                secret: "testsecret-testsecret-testsecret".to_string(),
+                private: true,
+                remote: false,
+            },
+        )]))
+    }
+
+    fn fixture() -> (Database, User, Channel) {
+        let user = User {
+            id: ulid::Ulid::new().to_string(),
+            username: "mover".to_string(),
+            discriminator: "0001".to_string(),
+            ..Default::default()
+        };
+        let channel = Channel::SavedMessages {
+            id: ulid::Ulid::new().to_string(),
+            user: user.id.clone(),
+        };
+
+        (Database::Reference(Default::default()), user, channel)
+    }
+
+    /// Accept ONE connection on a loopback port, read the whole request
+    /// (head plus `content-length` body, so closing never resets an unread
+    /// request), answer with the given status / content type / body, and hand
+    /// back the request head for inspection.
+    fn serve_once(
+        status_line: &'static str,
+        content_type: &'static str,
+        body: impl Into<Vec<u8>>,
+    ) -> (String, JoinHandle<String>) {
+        let body: Vec<u8> = body.into();
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let addr = listener.local_addr().expect("local addr");
+
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let mut request = Vec::new();
+            let mut chunk = [0u8; 4096];
+            let head = loop {
+                let read = stream.read(&mut chunk).expect("read request");
+                assert!(read > 0, "client closed before sending a full request");
+                request.extend_from_slice(&chunk[..read]);
+
+                if let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let head = String::from_utf8_lossy(&request[..end]).to_string();
+                    let length = head
+                        .lines()
+                        .find_map(|line| {
+                            line.to_ascii_lowercase()
+                                .strip_prefix("content-length:")
+                                .map(|value| value.trim().to_string())
+                        })
+                        .and_then(|value| value.parse::<usize>().ok())
+                        .unwrap_or(0);
+
+                    if request.len() >= end + 4 + length {
+                        break head;
+                    }
+                }
+            };
+
+            let mut response = format!(
+                "{status_line}\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\n\
+                 connection: close\r\n\r\n",
+                body.len()
+            )
+            .into_bytes();
+            response.extend_from_slice(&body);
+            stream.write_all(&response).expect("write response");
+            head
+        });
+
+        (format!("http://{addr}"), handle)
+    }
+
+    fn twirp(code: &str) -> ServiceError {
+        ServiceError::Twirp(TwirpError::Twirp(TwirpErrorCode {
+            code: code.to_string(),
+            msg: "stub".to_string(),
+        }))
+    }
+
+    /// Every `create_token` call carries its OWN non-empty nonce under the
+    /// `conn` attribute, as the only attribute, and never in the identity:
+    /// the identity keeps at most two `:` segments and is exactly what it was
+    /// before the nonce existed.
+    ///
+    /// The attribute is read by the string LITERAL `"conn"`, not through
+    /// `CONN_NONCE_ATTRIBUTE`, so drifting the constant reddens here instead
+    /// of silently moving both sides together (the client matches `"conn"`).
+    #[tokio::test]
+    async fn create_token_mints_a_fresh_nonce_per_call_outside_the_identity() {
+        let (db, user, channel) = fixture();
+        let voice = voice_client("http://127.0.0.1:1");
+        let permissions = PermissionValue::from_raw(
+            ChannelPermission::Connect as u64
+                | ChannelPermission::Speak as u64
+                | ChannelPermission::Listen as u64,
+        );
+
+        let mut nonces = HashSet::new();
+        let mints = [
+            (None, user.id.clone()),
+            (Some("DEVICE"), format!("{}:DEVICE", user.id)),
+            (Some("DEVICE"), format!("{}:DEVICE", user.id)),
+        ];
+
+        for (device_id, expected_identity) in mints {
+            let token = voice
+                .create_token(NODE, &db, &user, permissions, &channel, device_id)
+                .await
+                .expect("create_token");
+            let claims = Claims::from_unverified(&token).expect("decode token");
+
+            let nonce = claims
+                .attributes
+                .get("conn")
+                .unwrap_or_else(|| panic!("no `conn` attribute: {:?}", claims.attributes));
+            assert!(!nonce.is_empty(), "the nonce must never be empty");
+            assert!(
+                !nonce.contains(':'),
+                "the nonce must not look like an identity segment: {nonce}"
+            );
+            assert_eq!(
+                claims.attributes.keys().collect::<Vec<_>>(),
+                vec!["conn"],
+                "the primary token carries exactly one attribute"
+            );
+            assert!(
+                nonces.insert(nonce.clone()),
+                "two mints produced the same nonce {nonce}"
+            );
+
+            assert_eq!(claims.sub, expected_identity, "identity is unchanged");
+            assert!(
+                claims.sub.split(':').count() <= 2,
+                "the identity grew a third segment: {}",
+                claims.sub
+            );
+        }
+
+        assert_eq!(nonces.len(), 3);
+    }
+
+    /// The screen-leg token is untouched by the nonce: its attributes are
+    /// exactly `{leg: screen, platform: android}` — no `conn`, nothing else.
+    #[tokio::test]
+    async fn screen_leg_token_attributes_are_exactly_leg_and_platform() {
+        let (db, user, channel) = fixture();
+        let voice = voice_client("http://127.0.0.1:1");
+        let identity = super::super::screen_leg_identity(&format!("{}:DEVICE", user.id));
+
+        let token = voice
+            .create_screen_leg_token(NODE, &db, &user, &identity, &channel)
+            .await
+            .expect("create_screen_leg_token");
+        let claims = Claims::from_unverified(&token).expect("decode token");
+
+        let attributes: BTreeMap<&str, &str> = claims
+            .attributes
+            .iter()
+            .map(|(key, value)| (key.as_str(), value.as_str()))
+            .collect();
+        assert_eq!(
+            attributes,
+            BTreeMap::from([("leg", "screen"), ("platform", "android")])
+        );
+    }
+
+    /// Only a decoded Twirp `not_found` counts as "not in the room".
+    #[test]
+    fn is_twirp_not_found_accepts_only_the_not_found_code() {
+        assert!(is_twirp_not_found(&twirp(TwirpErrorCode::NOT_FOUND)));
+
+        for code in [
+            TwirpErrorCode::INTERNAL,
+            TwirpErrorCode::PERMISSION_DENIED,
+            TwirpErrorCode::UNAVAILABLE,
+            TwirpErrorCode::BAD_ROUTE,
+            TwirpErrorCode::UNKNOWN,
+        ] {
+            assert!(!is_twirp_not_found(&twirp(code)), "{code} is not not_found");
+        }
+
+        assert!(!is_twirp_not_found(&ServiceError::AccessToken(
+            AccessTokenError::InvalidKeys
+        )));
+        assert!(!is_twirp_not_found(&ServiceError::Env(
+            std::env::VarError::NotPresent
+        )));
+    }
+
+    /// A 404 whose body is not a Twirp JSON error (a proxy page) surfaces from
+    /// the real client as `TwirpError::Request` — and is NOT "not found".
+    #[tokio::test]
+    async fn non_json_404_is_a_request_error_not_not_found() {
+        let (url, server) =
+            serve_once("HTTP/1.1 404 Not Found", "text/plain", "404 page not found");
+        let voice = voice_client(&url);
+
+        let error = voice
+            .get_node(NODE)
+            .expect("node")
+            .client
+            .remove_participant("room", "user")
+            .await
+            .expect_err("a 404 is never success");
+        server.join().expect("stub server");
+
+        assert!(
+            matches!(error, ServiceError::Twirp(TwirpError::Request(_))),
+            "expected TwirpError::Request, got {error:?}"
+        );
+        assert!(!is_twirp_not_found(&error));
+    }
+
+    /// Success -> `Ok(true)`, a Twirp `not_found` -> `Ok(false)`, every other
+    /// failure -> `Err(InternalError)`, and an unknown node -> the same
+    /// `UnknownNode` that `get_node` returns. Each request goes to the SFU's
+    /// `RemoveParticipant` endpoint.
+    #[tokio::test]
+    async fn remove_identity_if_present_classifies_the_sfu_answer() {
+        async fn remove(
+            status_line: &'static str,
+            content_type: &'static str,
+            body: &'static str,
+        ) -> revolt_result::Result<bool> {
+            let (url, server) = serve_once(status_line, content_type, body);
+            let result = voice_client(&url)
+                .remove_identity_if_present(NODE, "user:DEVICE", "room")
+                .await;
+            let head = server.join().expect("stub server");
+            assert!(
+                head.starts_with("POST /twirp/livekit.RoomService/RemoveParticipant "),
+                "unexpected request: {head}"
+            );
+            result
+        }
+
+        assert!(matches!(
+            remove("HTTP/1.1 200 OK", "application/protobuf", "").await,
+            Ok(true)
+        ));
+
+        assert!(matches!(
+            remove(
+                "HTTP/1.1 404 Not Found",
+                "application/json",
+                r#"{"code":"not_found","msg":"participant not found"}"#,
+            )
+            .await,
+            Ok(false)
+        ));
+
+        for (status_line, content_type, body) in [
+            (
+                "HTTP/1.1 500 Internal Server Error",
+                "application/json",
+                r#"{"code":"internal","msg":"boom"}"#,
+            ),
+            (
+                "HTTP/1.1 403 Forbidden",
+                "application/json",
+                r#"{"code":"permission_denied","msg":"no"}"#,
+            ),
+            ("HTTP/1.1 404 Not Found", "text/plain", "404 page not found"),
+        ] {
+            match remove(status_line, content_type, body).await {
+                Err(error) => assert!(
+                    matches!(error.error_type, ErrorType::InternalError),
+                    "{status_line}: {error:?}"
+                ),
+                Ok(removed) => panic!("{status_line} {body} must be an error, got Ok({removed})"),
+            }
+        }
+
+        match voice_client("http://127.0.0.1:1")
+            .remove_identity_if_present("no-such-node", "user", "room")
+            .await
+        {
+            Err(error) => assert!(
+                matches!(error.error_type, ErrorType::UnknownNode),
+                "{error:?}"
+            ),
+            Ok(removed) => panic!("an unknown node must be an error, got Ok({removed})"),
+        }
+    }
+
+    /// Protobuf wire bytes of a `ListParticipantsResponse` holding one
+    /// participant with `identity` and the single attribute `conn`.
+    ///
+    /// A Twirp 200 is protobuf, not JSON: the client decodes it with prost
+    /// (livekit-api `TwirpClient::request`), so a JSON body would be a decode
+    /// error. `prost` is not a dependency of this crate, so the bytes are
+    /// spelled out here; the test that decodes them through the real client
+    /// and checks every field is what proves they are right.
+    fn list_participants_response(identity: &str, conn: &str) -> Vec<u8> {
+        // Length-delimited field: key byte (tag << 3 | wire type 2), a
+        // one-byte varint length, then the payload.
+        fn field(tag: u8, payload: &[u8]) -> Vec<u8> {
+            assert!(tag < 16 && payload.len() < 0x80, "single-byte varints only");
+            let mut out = vec![(tag << 3) | 2, payload.len() as u8];
+            out.extend_from_slice(payload);
+            out
+        }
+
+        // map<string, string> entry: key = 1, value = 2
+        let entry = [field(1, b"conn"), field(2, conn.as_bytes())].concat();
+        // ParticipantInfo: identity = 2, attributes = 15
+        let participant = [field(2, identity.as_bytes()), field(15, &entry)].concat();
+        // ListParticipantsResponse: participants = 1
+        field(1, &participant)
+    }
+
+    /// Success -> `Ok(Some(list))` carrying what the SFU reported (identity
+    /// and `conn` attribute included), an empty 200 -> `Ok(Some([]))` (the
+    /// room exists, nobody is in it), a Twirp `not_found` -> `Ok(None)` (no
+    /// such room), every other failure -> `Err(InternalError)`, and an
+    /// unknown node -> `get_node`'s `UnknownNode`. Each request goes to the
+    /// SFU's `ListParticipants` endpoint.
+    #[tokio::test]
+    async fn list_participants_if_present_classifies_the_sfu_answer() {
+        async fn list(
+            status_line: &'static str,
+            content_type: &'static str,
+            body: impl Into<Vec<u8>>,
+        ) -> revolt_result::Result<Option<Vec<ParticipantInfo>>> {
+            let (url, server) = serve_once(status_line, content_type, body);
+            let result = voice_client(&url)
+                .list_participants_if_present(NODE, "room")
+                .await;
+            let head = server.join().expect("stub server");
+            assert!(
+                head.starts_with("POST /twirp/livekit.RoomService/ListParticipants "),
+                "unexpected request: {head}"
+            );
+            result
+        }
+
+        match list(
+            "HTTP/1.1 200 OK",
+            "application/protobuf",
+            list_participants_response("user:DEVICE", "n1"),
+        )
+        .await
+        {
+            Ok(Some(participants)) => {
+                assert_eq!(participants.len(), 1, "{participants:?}");
+                assert_eq!(participants[0].identity, "user:DEVICE");
+                assert_eq!(
+                    participants[0].attributes,
+                    HashMap::from([("conn".to_string(), "n1".to_string())])
+                );
+            }
+            other => panic!("a 200 must be Ok(Some(..)), got {other:?}"),
+        }
+
+        match list("HTTP/1.1 200 OK", "application/protobuf", Vec::new()).await {
+            Ok(Some(participants)) => assert!(participants.is_empty(), "{participants:?}"),
+            other => panic!("an empty 200 must be Ok(Some([])), got {other:?}"),
+        }
+
+        match list(
+            "HTTP/1.1 404 Not Found",
+            "application/json",
+            r#"{"code":"not_found","msg":"requested room does not exist"}"#,
+        )
+        .await
+        {
+            Ok(None) => {}
+            other => panic!("a Twirp not_found must be Ok(None), got {other:?}"),
+        }
+
+        for (status_line, content_type, body) in [
+            (
+                "HTTP/1.1 500 Internal Server Error",
+                "application/json",
+                r#"{"code":"internal","msg":"boom"}"#,
+            ),
+            (
+                "HTTP/1.1 403 Forbidden",
+                "application/json",
+                r#"{"code":"permission_denied","msg":"no"}"#,
+            ),
+            ("HTTP/1.1 404 Not Found", "text/plain", "404 page not found"),
+        ] {
+            match list(status_line, content_type, body).await {
+                Err(error) => assert!(
+                    matches!(error.error_type, ErrorType::InternalError),
+                    "{status_line}: {error:?}"
+                ),
+                Ok(listed) => panic!("{status_line} {body} must be an error, got Ok({listed:?})"),
+            }
+        }
+
+        match voice_client("http://127.0.0.1:1")
+            .list_participants_if_present("no-such-node", "room")
+            .await
+        {
+            Err(error) => assert!(
+                matches!(error.error_type, ErrorType::UnknownNode),
+                "{error:?}"
+            ),
+            Ok(listed) => panic!("an unknown node must be an error, got Ok({listed:?})"),
         }
     }
 }

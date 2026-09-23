@@ -570,38 +570,61 @@ pub enum EventV1 {
     /// unconditionally therefore drags an idle second device into a voice
     /// channel it was never in and publishes its microphone, and both devices
     /// then race for a single-mint token (the token below is minted once, for
-    /// one participant identity). Clients must gate on "am I the device
-    /// currently in `from`" before connecting.
+    /// one participant identity). Clients must gate on "am I THE CONNECTION
+    /// being moved out of `from`" before connecting — addressed by
+    /// `conn_nonce` when the event carries one, by `device_id` otherwise.
     ///
-    /// `device_id` IS THAT GATE, and it is the field that stops two of the
-    /// user's sessions racing for one token. It is the device suffix of the
-    /// participant identity the token was minted for, recovered server-side
-    /// from the source room's ingress mapping at the emit site. A client MUST
-    /// compare it against its own device id and act on the event ONLY on a
-    /// match; every other session of that user has to ignore the event
-    /// outright, however plausible its own local state makes it look.
+    /// Two fields form that gate, and they stop two of the user's sessions
+    /// racing for one token. Both describe the ONE source connection the
+    /// server chose to move, read at the emit site from the SFU's own
+    /// participant list for `from` (not from a Redis mapping):
     ///
-    /// `None` means the server could not identify the device — no ingress
-    /// mapping has been recorded for the source room, or the call predates
-    /// provisioning — and only then does the client fall back to its weaker
-    /// local test ("was I just dropped from `from` a moment ago"). That test
-    /// is a heuristic over client-local state and an ordinary event satisfies
-    /// it: a user moving their own call from desktop to phone makes the join
-    /// leg evict the desktop, so the idle desktop records a drop from `from`
-    /// and will accept any move that lands in the window that follows. Absent
-    /// is the degraded case, never the intended one.
+    /// - `conn_nonce`, when present, IS THE GATE. It is the `"conn"` token
+    ///   attribute of that connection, minted fresh on every token, so it
+    ///   names exactly one connection of the user — including a bare seat,
+    ///   which a device id cannot name at all. A client compares it against
+    ///   its own connection's attribute and acts ONLY on a match; every
+    ///   other session of that user ignores the event
+    ///   (or, if it is itself connected to `from`, treats it as "moved
+    ///   elsewhere" and expects to be evicted).
+    /// - `device_id` is the gate only when `conn_nonce` is absent. It is the
+    ///   device suffix of the chosen connection's identity, and the token is
+    ///   minted for that same identity, so it ALSO drives the client's E2EE
+    ///   identity assertion whether or not the nonce is present.
+    ///
+    /// Both `None` means the chosen connection is a bare seat whose SFU
+    /// record carries no nonce (the SFU does not propagate token attributes,
+    /// or the connection predates the nonce). Only then does the client fall
+    /// back to its weaker local test ("was I just dropped from `from` a
+    /// moment ago"). That test is a heuristic over client-local state and an
+    /// ordinary event satisfies it: a user moving their own call from desktop
+    /// to phone makes the join leg evict the desktop, so the idle desktop
+    /// records a drop from `from` and will accept any move that lands in the
+    /// window that follows. Absent is the degraded case, never the intended
+    /// one.
     UserMoveVoiceChannel {
         node: String,
         url: String,
         /// Device suffix of the identity `token` was minted for, or `None`
-        /// when the server could not identify it. Absent means
-        /// "unidentified", never "any device".
+        /// when that identity is a bare one. Absent means "unidentified",
+        /// never "any device".
         ///
         /// Absent rather than `null` on the wire, matching every other
         /// optional field on this enum — and `default` so a payload minted
         /// before this field existed still deserializes.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         device_id: Option<String>,
+        /// The SOURCE connection's per-connection nonce: the `"conn"` token
+        /// attribute of the connection being moved, as the SFU reported it in
+        /// `from` at move time. It addresses exactly one connection of the
+        /// user. NEVER the new token's nonce — that one is minted inside
+        /// `token` and only becomes visible once the destination is joined.
+        ///
+        /// Absent when the SFU reported none (or an empty one) for that
+        /// connection; the client then gates on `device_id` as before.
+        /// Serialized exactly like `device_id`, for the same reasons.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        conn_nonce: Option<String>,
         from: String,
         to: String,
         token: String,
