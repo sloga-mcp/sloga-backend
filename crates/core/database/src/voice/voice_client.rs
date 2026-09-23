@@ -397,8 +397,9 @@ impl VoiceClient {
     /// room does not exist (a Twirp `not_found`, see [`is_twirp_not_found`]),
     /// so nobody is connected to it. `Err`: anything else, including a
     /// non-JSON 404; an unknown node is `get_node`'s `UnknownNode`. Read-only,
-    /// so unlike the removal helpers below it has no best-effort half: the
-    /// caller decides what an unanswered SFU means for its own operation.
+    /// so unlike [`Self::remove_user`], whose screen-leg removal is
+    /// best-effort, it has no best-effort half: the caller decides what an
+    /// unanswered SFU means for its own operation.
     ///
     /// This is deliberately the ONLY participant listing on `VoiceClient`.
     /// A room the SFU no longer has must read as "not connected", not as a

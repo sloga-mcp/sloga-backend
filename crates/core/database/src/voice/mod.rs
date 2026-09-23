@@ -950,7 +950,7 @@ fn voice_state_teardown_input(
 /// Both halves are ONE script invocation, [`DELETE_VOICE_STATE`]; see there
 /// for why it is a script and why it is one.
 ///
-/// Two things are not in the script:
+/// Outside the script, in this function:
 ///
 /// - The watch-together session end. It publishes an event rather than
 ///   deleting a key, and it runs FIRST, as it always has.
@@ -1031,8 +1031,9 @@ pub async fn delete_voice_state(channel: &UserVoiceChannel, user_id: &str) -> Re
         }
         Err(error) => {
             log::warn!(
-                "voice state teardown script for {user_id} in {} got no usable reply; it \
-                 may have run, so there is no fallback",
+                "voice state teardown script for {user_id} in {} failed: {error}; not a \
+                 refusal that proves it never ran and that the fallback could answer, so \
+                 the error is returned",
                 channel.id
             );
             Err(error).to_internal_error()
@@ -1067,9 +1068,10 @@ static TEARDOWN_FALLBACK_LOGGED: AtomicBool = AtomicBool::new(false);
 ///   KeyDB. Checked on the reply's DETAIL, because `ErrorKind::ResponseError`
 ///   alone is not a server reply: redis-rs also uses that kind for a reply
 ///   it could not PARSE, and a garbled reply may be the script's answer.
-/// - `NOPERM` naming EVALSHA, EVAL or SCRIPT: an ACL refused the command
-///   itself. A NOPERM naming anything else was raised from INSIDE a running
-///   script and does not qualify.
+/// - `NOPERM` naming EVALSHA or SCRIPT: an ACL refused the command itself.
+///   Those are the only two commands redis-rs sends here (EVALSHA, and
+///   SCRIPT LOAD on a NOSCRIPT). A NOPERM naming anything else was raised
+///   from INSIDE a running script and does not qualify.
 ///
 /// Returned, among others: every IO error (dropped connection, timeout,
 /// refusal), any other `ERR` (a Lua runtime error means the script RAN), a
@@ -1078,8 +1080,10 @@ static TEARDOWN_FALLBACK_LOGGED: AtomicBool = AtomicBool::new(false);
 /// which the pipeline fallback would fail on just the same.
 fn teardown_script_error_allows_fallback(error: &RedisError) -> bool {
     // No reply, or a torn one: the script may have run. Checked before the
-    // kind, and whatever the kind says.
-    if error.is_io_error() || error.is_connection_dropped() || error.is_timeout() {
+    // kind, and whatever the kind says. `is_io_error` covers every transport
+    // failure: redis-rs's `is_connection_dropped` and `is_timeout` only ever
+    // match a subset of the same `IoError`.
+    if error.is_io_error() {
         return false;
     }
 
@@ -1096,7 +1100,6 @@ fn teardown_script_error_allows_fallback(error: &RedisError) -> bool {
             error.code() == Some("NOPERM")
                 && [
                     "'evalsha' command",
-                    "'eval' command",
                     "'script' command",
                     "'script|load' command",
                 ]
@@ -3141,10 +3144,37 @@ mod permission_tests {
     /// None` switches the client's nonce gate off on every seat, and a
     /// `device_id` from the Redis mapping addresses a connection the SFU no
     /// longer lists.
+    ///
+    /// R3-2: the preference handed to `select_move_connection` is the
+    /// mapping of the SOURCE room for the TARGET, bound once. Each of these
+    /// compiles and reads the wrong mapping or none: the two arguments
+    /// swapped (a key named after the user, a field named after the room),
+    /// the mapping read for `destination.id()` instead of `&from`, and the
+    /// read replaced with `None`.
+    ///
+    /// The event literal's `from` / `to` are pinned for the same reason:
+    /// `to: from.clone()` compiles and names the room being left as the
+    /// destination.
     #[test]
     fn the_move_event_addresses_the_connection_it_chose() {
         let body = move_body_code();
         let flat = body.split_whitespace().collect::<Vec<_>>().join(" ");
+
+        first(
+            &flat,
+            "let mapped_identity = stored_voice_participant_identity(&from, &target.id).await?;",
+        );
+        assert_eq!(
+            flat.matches("let mapped_identity").count(),
+            1,
+            "`mapped_identity` must be bound exactly once, to the source room's \
+             mapping for the target"
+        );
+        assert!(
+            !flat.contains("let mut mapped_identity"),
+            "`mapped_identity` must not be mutable: the preference is the \
+             mapping as read, nothing else"
+        );
 
         assert!(
             flat.contains(
@@ -3190,9 +3220,56 @@ mod permission_tests {
             "the event's `conn_nonce` must be `addressing.conn_nonce`: {literal}"
         );
         assert!(
+            fields.contains(&"from: from.clone()"),
+            "the event's `from` must be the source room: {literal}"
+        );
+        assert!(
+            fields.contains(&"to: destination.id().to_string()"),
+            "the event's `to` must be the destination room: {literal}"
+        );
+        assert!(
             !literal.contains("mapped_identity") && !literal.contains("None"),
             "the event literal must not address from the mapping, nor hard-code \
              an absent field: {literal}"
+        );
+    }
+
+    /// Same class as R3-2: the raw mapping read is the ingress write's
+    /// mirror, `voice_identity:{channel}` keyed and the BARE user id as the
+    /// field (`set_voice_participant_identity`'s `hset`). With key and field
+    /// swapped it compiles and reads a key the ingress never writes, so the
+    /// move loses its preference.
+    #[test]
+    fn the_raw_identity_read_mirrors_the_ingress_write() {
+        let shipping = this_file_shipping();
+        let body = flat_fn_body(&shipping, "async fn stored_voice_participant_identity(");
+
+        assert!(
+            body.contains(".hget(format!(\"voice_identity:\u{7b}channel_id\u{7d}\"), user_id)"),
+            "`stored_voice_participant_identity` must read field `user_id` of \
+             `voice_identity:{{channel_id}}`, as the ingress writes it: {body}"
+        );
+    }
+
+    /// I-16: the source == destination guard answers `AlreadyPresent` before
+    /// `admit_voice_move` runs. Pinned on `move_body_code` (the braced body,
+    /// comment lines dropped). Deleting the guard re-kicks every AFK
+    /// occupant on every sweep tick; `!=` refuses every real move; moving it
+    /// below admission makes an occupant of a full, capped AFK channel
+    /// answer `CannotJoinCall` on every tick.
+    #[test]
+    fn the_move_answers_already_present_before_admission() {
+        let body = move_body_code();
+        let flat = body.split_whitespace().collect::<Vec<_>>().join(" ");
+
+        let guard = first(
+            &flat,
+            "if from == destination.id() \u{7b} \
+             return Ok(VoiceMoveOutcome::AlreadyPresent); \u{7d}",
+        );
+        assert!(
+            guard < first(&flat, "admit_voice_move("),
+            "the source == destination guard must precede `admit_voice_move(`"
         );
     }
 
@@ -3660,6 +3737,23 @@ mod permission_tests {
                     "-NOPERM User default has no permissions to run the 'script|load' command\r\n",
                 ),
             ),
+            // R3-3. The wording of every case marked "Redis 6 / KeyDB" (two
+            // here, two in the returned set) is INFERRED from upstream Redis
+            // 6.x source, not observed on a live server.
+            (
+                "an ACL refusing EVALSHA (Redis 6 / KeyDB wording)",
+                wire(
+                    "-NOPERM this user has no permissions to run the 'evalsha' command or its \
+                     subcommand\r\n",
+                ),
+            ),
+            (
+                "an ACL refusing SCRIPT (Redis 6 / KeyDB wording)",
+                wire(
+                    "-NOPERM this user has no permissions to run the 'script' command or its \
+                     subcommand\r\n",
+                ),
+            ),
         ] {
             assert!(allows(&error), "{case} must fall back: {error}");
         }
@@ -3671,6 +3765,26 @@ mod permission_tests {
 
         // The script may have run, or did: returned, never a fallback.
         for (case, error) in [
+            // R3-3, wording INFERRED from Redis 6.x source (see above): an ACL
+            // key denial, and an ACL denial raised by a command the running
+            // script called. Neither names EVALSHA or SCRIPT. First in the
+            // list so a classifier broadened to match on "no permissions"
+            // alone is reported against the case that exposes it.
+            (
+                "an ACL key denial (Redis 6 / KeyDB wording)",
+                wire(
+                    "-NOPERM this user has no permissions to access one of the keys used as \
+                     arguments\r\n",
+                ),
+            ),
+            (
+                "an ACL denial inside the script (Redis 6 / KeyDB wording)",
+                wire(
+                    "-ERR Error running script (call to f_abc): @user_script:1: \
+                     @user_script: 1: The user executing the script can't run this command \
+                     or subcommand\r\n",
+                ),
+            ),
             ("a connection reset", io(io::ErrorKind::ConnectionReset)),
             ("a broken pipe", io(io::ErrorKind::BrokenPipe)),
             ("EOF mid-reply", io(io::ErrorKind::UnexpectedEof)),

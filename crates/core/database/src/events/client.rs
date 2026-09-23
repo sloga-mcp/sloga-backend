@@ -1065,3 +1065,56 @@ impl EventV1 {
         self.p("global".to_string()).await;
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::EventV1;
+
+    fn move_event(conn_nonce: Option<&str>) -> EventV1 {
+        EventV1::UserMoveVoiceChannel {
+            node: "node".to_string(),
+            url: "wss://node".to_string(),
+            device_id: None,
+            conn_nonce: conn_nonce.map(str::to_string),
+            from: "FROM".to_string(),
+            to: "TO".to_string(),
+            token: "token".to_string(),
+        }
+    }
+
+    /// The move's addressing nonce is on the wire as `conn_nonce` when
+    /// present and absent (not `null`) when not, as the field's doc says. A
+    /// `rename` on the field, or losing `skip_serializing_if`, compiles: the
+    /// first moves the nonce to a key the client does not read, the second
+    /// sends `null` where every other optional field on this enum is absent.
+    #[test]
+    fn the_move_event_carries_conn_nonce_only_when_present() {
+        let present = serde_json::to_value(move_event(Some("n0nce"))).expect("serializes");
+        assert_eq!(
+            present.get("conn_nonce").and_then(|value| value.as_str()),
+            Some("n0nce"),
+            "a present nonce must be on the wire as `conn_nonce`: {present}"
+        );
+
+        let absent = serde_json::to_value(move_event(None)).expect("serializes");
+        assert!(
+            absent.get("conn_nonce").is_none(),
+            "an absent nonce must be absent from the wire, not null: {absent}"
+        );
+        assert_eq!(
+            absent.get("type").and_then(|value| value.as_str()),
+            Some("UserMoveVoiceChannel"),
+            "{absent}"
+        );
+
+        // And back: both shapes deserialize to the nonce they were built from.
+        for (value, expected) in [(present, Some("n0nce")), (absent, None)] {
+            match serde_json::from_value::<EventV1>(value).expect("deserializes") {
+                EventV1::UserMoveVoiceChannel { conn_nonce, .. } => {
+                    assert_eq!(conn_nonce.as_deref(), expected)
+                }
+                other => panic!("round-tripped to another event: {other:?}"),
+            }
+        }
+    }
+}
