@@ -177,6 +177,39 @@ pub struct SerializedGuild {
     pub system_channel_id: Option<PlaceholderId>,
     #[serde(default)]
     pub afk_channel_id: Option<PlaceholderId>,
+    /// Idle seconds before Discord moves a member to the AFK channel.
+    ///
+    /// Verified live 2026-09-23 against Discord's own "Blank Server" template
+    /// (`2TffvPucqHkN`): it arrives as an integer, `"afk_timeout":300`, and it
+    /// is present even when `afk_channel_id` is `null`. The guild always has a
+    /// timeout; only the channel is optional. So this value means nothing on
+    /// its own, and the mapper keeps it only alongside a surviving AFK channel.
+    ///
+    /// Parsed leniently (see [`lenient_seconds`]): a strict integer field that
+    /// met a string or a float would fail the WHOLE template, costing the user
+    /// their server over a setting the importer can simply leave unset.
+    #[serde(default, deserialize_with = "lenient_seconds")]
+    pub afk_timeout: Option<u64>,
+}
+
+/// A non-negative whole number of seconds, as an integer or a numeric string.
+/// Anything else (null, negative, fractional, junk) becomes `None` rather than
+/// an error. Never rounds and never clamps: a value that is not exactly a
+/// whole number of seconds is not guessed at.
+fn lenient_seconds<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<u64>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Raw {
+        Num(u64),
+        Str(String),
+        Other(serde::de::IgnoredAny),
+    }
+
+    Ok(match Option::<Raw>::deserialize(deserializer)? {
+        Some(Raw::Num(n)) => Some(n),
+        Some(Raw::Str(s)) => s.trim().parse::<u64>().ok(),
+        Some(Raw::Other(_)) | None => None,
+    })
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -441,5 +474,53 @@ mod tests {
             template.serialized_source_guild.system_channel_id,
             Some(PlaceholderId("2".to_string()))
         );
+    }
+
+    /// The head of `serialized_source_guild` exactly as Discord's "Blank
+    /// Server" template (`2TffvPucqHkN`) returned it live on 2026-09-23: an
+    /// integer timeout beside a null AFK channel.
+    #[test]
+    fn afk_fields_parse_in_the_live_shape() {
+        let guild: SerializedGuild = serde_json::from_str(
+            r#"{"name":"Blank Server","description":null,"region":"us-west",
+                "verification_level":0,"default_message_notifications":0,
+                "explicit_content_filter":0,"preferred_locale":"en-US",
+                "afk_channel_id":null,"afk_timeout":300,"system_channel_id":2,
+                "system_channel_flags":0,"roles":[],"channels":[]}"#,
+        )
+        .unwrap();
+        assert_eq!(guild.afk_channel_id, None);
+        assert_eq!(guild.afk_timeout, Some(300));
+
+        let designated: SerializedGuild =
+            serde_json::from_str(r#"{"afk_channel_id":4,"afk_timeout":900}"#).unwrap();
+        assert_eq!(
+            designated.afk_channel_id,
+            Some(PlaceholderId("4".to_string()))
+        );
+        assert_eq!(designated.afk_timeout, Some(900));
+    }
+
+    /// Landmine A-6 again: an unexpected `afk_timeout` form must cost the user
+    /// the setting, never the import. Every one of these must still parse.
+    #[test]
+    fn a_malformed_afk_timeout_degrades_to_none_rather_than_failing() {
+        for (raw, expected) in [
+            (r#""300""#, Some(300)),
+            ("null", None),
+            ("-60", None),
+            ("300.5", None),
+            (r#""five minutes""#, None),
+            ("[300]", None),
+        ] {
+            let guild: SerializedGuild =
+                serde_json::from_str(&format!(r#"{{"afk_timeout":{raw}}}"#))
+                    .unwrap_or_else(|error| panic!("afk_timeout {raw} failed the parse: {error}"));
+            assert_eq!(guild.afk_timeout, expected, "afk_timeout {raw}");
+        }
+
+        // Absent entirely, as in every fixture that predates the field.
+        let absent: SerializedGuild = serde_json::from_str("{}").unwrap();
+        assert_eq!(absent.afk_timeout, None);
     }
 }

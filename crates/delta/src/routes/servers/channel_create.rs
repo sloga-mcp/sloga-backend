@@ -2,7 +2,7 @@ use revolt_database::util::permissions::DatabasePermissionQuery;
 use revolt_database::{
     util::reference::Reference,
     voice::{sync_afk_designation_change, VoiceClient},
-    Channel, Database, PartialServer, Server, User,
+    Channel, Database, FieldsServer, PartialServer, Server, User,
 };
 use revolt_models::v0;
 use revolt_permissions::{calculate_server_permissions, ChannelPermission};
@@ -46,10 +46,11 @@ pub async fn create_server_channel(
     // created and already announced to everybody, leaving an orphan behind.
     // Check first, create second.
     let designate_afk = data.afk == Some(true);
-    // Only read alongside `afk: true`. Without this filter an `afk_timeout`
-    // sent on its own would change behaviour for requests that do not ask for
-    // the designation at all.
-    let afk_timeout = data.afk_timeout.filter(|_| designate_afk);
+    // The timeout half of the designation, including "Never" (audit A7),
+    // decided here so a malformed combination is refused before anything is
+    // persisted. See `afk_create_timeout`.
+    let (afk_timeout, clear_afk_timeout) =
+        afk_create_timeout(designate_afk, data.afk_timeout, data.afk_timeout_never)?;
 
     if designate_afk {
         permissions.throw_if_lacking_channel_permission(ChannelPermission::ManageServer)?;
@@ -90,11 +91,14 @@ pub async fn create_server_channel(
         // failed midway would leave a channel that is in no server's channel
         // list and was never announced. Two events, deliberately.
         //
-        // This only ever SETS. A clear cannot travel in a partial: `Server`
-        // derives OptionalStruct with `opt_some_priority` and both fields are
-        // already `Option<T>`, so the generated assigner is a `replace()` and
-        // writing `None` here would be a silent no-op. Clearing must go
-        // through `FieldsServer::AfkChannel` / `FieldsServer::AfkTimeout`.
+        // A clear cannot travel in a partial: `Server` derives OptionalStruct
+        // with `opt_some_priority` and both fields are already `Option<T>`, so
+        // the generated assigner is a `replace()` and writing `None` here
+        // would be a silent no-op. "Never" therefore clears the server's
+        // timeout through `FieldsServer::AfkTimeout` in this same update,
+        // which `Server::update` publishes as the `clear` of its one
+        // `ServerUpdate`, exactly as `server_edit`'s removal is. Every other
+        // request keeps an empty remove list.
 
         // Captured BEFORE the update mutates `server`, so the re-sync below
         // can still reach the OUTGOING channel.
@@ -108,7 +112,11 @@ pub async fn create_server_channel(
                     afk_timeout,
                     ..Default::default()
                 },
-                vec![],
+                if clear_afk_timeout {
+                    vec![FieldsServer::AfkTimeout]
+                } else {
+                    vec![]
+                },
             )
             .await?;
 
@@ -188,9 +196,40 @@ fn validate_afk_creation_shape(data: &v0::DataCreateServerChannel) -> Result<()>
     Ok(())
 }
 
+/// The timeout half of a creation-time AFK designation (audit A7): the value
+/// to write, and whether the server's existing timeout must be cleared in the
+/// same update.
+///
+/// - `afk_timeout_never: true` ("Never") is only meaningful when the request
+///   designates and names no timeout; it clears whatever timeout the server
+///   already holds. Any other use of it is refused with `InvalidProperty`, the
+///   variant this route already uses for AFK validation
+///   (`validate_afk_creation_shape`, `Server::validate_afk_timeout`), rather
+///   than guessed at.
+/// - Otherwise `afk_timeout` is only read alongside `afk: true`, so one sent on
+///   its own changes nothing for a request that does not designate, and
+///   nothing is cleared: an `afk: true` with no timeout keeps the server's.
+fn afk_create_timeout(
+    designate_afk: bool,
+    afk_timeout: Option<u32>,
+    never: Option<bool>,
+) -> Result<(Option<u32>, bool)> {
+    if never == Some(true) {
+        if !designate_afk {
+            return Err(create_error!(InvalidProperty));
+        }
+        if afk_timeout.is_some() {
+            return Err(create_error!(InvalidProperty));
+        }
+        return Ok((None, true));
+    }
+
+    Ok((afk_timeout.filter(|_| designate_afk), false))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::validate_afk_creation_shape;
+    use super::{afk_create_timeout, validate_afk_creation_shape};
     use revolt_models::v0;
     use revolt_result::ErrorType;
 
@@ -261,5 +300,201 @@ mod tests {
 
             assert!(matches!(error.error_type, ErrorType::InvalidProperty));
         }
+    }
+
+    // ---- "Never" on create (audit A7) ------------------------------------
+
+    fn refused(designate: bool, timeout: Option<u32>, never: Option<bool>) -> bool {
+        match afk_create_timeout(designate, timeout, never) {
+            Err(error) => matches!(error.error_type, ErrorType::InvalidProperty),
+            Ok(_) => false,
+        }
+    }
+
+    fn decided(designate: bool, timeout: Option<u32>, never: Option<bool>) -> (Option<u32>, bool) {
+        afk_create_timeout(designate, timeout, never).expect("accepted")
+    }
+
+    #[test]
+    fn never_with_a_timeout_is_refused() {
+        assert!(refused(true, Some(300), Some(true)));
+    }
+
+    #[test]
+    fn never_without_the_designation_is_refused() {
+        assert!(refused(false, None, Some(true)));
+        assert!(refused(false, Some(300), Some(true)));
+    }
+
+    #[test]
+    fn never_with_the_designation_clears_the_timeout() {
+        assert_eq!(decided(true, None, Some(true)), (None, true));
+    }
+
+    /// Every other path keeps an empty remove list: a numeric timeout sets,
+    /// no timeout keeps the server's, and a timeout without `afk: true` is
+    /// ignored exactly as before.
+    #[test]
+    fn everything_else_clears_nothing() {
+        assert_eq!(decided(true, Some(300), None), (Some(300), false));
+        assert_eq!(decided(true, Some(300), Some(false)), (Some(300), false));
+        assert_eq!(decided(true, None, None), (None, false));
+        assert_eq!(decided(false, Some(300), None), (None, false));
+        assert_eq!(decided(false, None, None), (None, false));
+    }
+
+    /// `create_server_channel`'s body, comment lines dropped and whitespace
+    /// collapsed.
+    fn route_body() -> String {
+        const SOURCE: &str = include_str!("channel_create.rs");
+        let at = SOURCE
+            .find("pub async fn create_server_channel(")
+            .expect("the route is defined");
+        let open = at + SOURCE[at..].find('\u{7b}').expect("a body");
+        let mut depth = 0usize;
+        let mut close = None;
+        for (i, ch) in SOURCE[open..].char_indices() {
+            match ch {
+                '\u{7b}' => depth += 1,
+                '\u{7d}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        close = Some(open + i);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        SOURCE[open..=close.expect("a closed body")]
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join(" ")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    /// The route decides through `afk_create_timeout` before the channel
+    /// exists, and hands its clear to the SAME update that sets the
+    /// designation, so the one `ServerUpdate` carries both.
+    #[test]
+    fn the_route_uses_the_decision_in_the_designating_update() {
+        let body = route_body();
+        let at = |needle: &str| {
+            body.find(needle)
+                .unwrap_or_else(|| panic!("the route lost `{}`: {}", needle, body))
+        };
+
+        let decide = at("let (afk_timeout, clear_afk_timeout) = \
+             afk_create_timeout(designate_afk, data.afk_timeout, data.afk_timeout_never)?;");
+        assert!(decide < at("Channel::create_server_channel("), "{}", body);
+        assert!(
+            !body.contains(".filter(|_| designate_afk)"),
+            "the timeout must come from `afk_create_timeout` alone: {}",
+            body
+        );
+
+        let update = at(
+            "PartialServer \u{7b} afk_channel_id: Some(channel.id().to_string()), \
+             afk_timeout, ..Default::default() \u{7d}, \
+             if clear_afk_timeout \u{7b} vec![FieldsServer::AfkTimeout] \u{7d} \
+             else \u{7b} vec![] \u{7d}, )",
+        );
+        assert!(decide < update, "{}", body);
+        assert_eq!(
+            body.matches(".update(").count(),
+            1,
+            "one server update, carrying both the designation and the clear: {}",
+            body
+        );
+    }
+
+    // ---- behavior (needs RabbitMQ) ---------------------------------------
+    //
+    // Compile-only on a box without RabbitMQ: `TestHarness::new` connects to
+    // it, so this fails before it asserts anything there, like every other
+    // route test in this crate.
+
+    #[test]
+    fn never_on_create_clears_the_servers_timeout() {
+        crate::util::test::rt().block_on(never_on_create_clears_the_servers_timeout_case())
+    }
+
+    async fn never_on_create_clears_the_servers_timeout_case() {
+        use crate::util::test::TestHarness;
+        use revolt_database::{events::client::EventV1, PartialServer};
+        use rocket::http::{ContentType, Header, Status};
+
+        let mut harness = TestHarness::new().await;
+        let (_, session, owner) = harness.new_user().await;
+        let (mut server, _channels) = harness.new_server(&owner).await;
+        server
+            .update(
+                &harness.db,
+                PartialServer {
+                    afk_timeout: Some(300),
+                    ..Default::default()
+                },
+                vec![],
+            )
+            .await
+            .expect("seed a timeout");
+
+        async fn create(
+            harness: &TestHarness,
+            token: &str,
+            server_id: &str,
+            body: serde_json::Value,
+        ) -> Status {
+            harness
+                .client
+                .post(format!("/servers/{}/channels", server_id))
+                .header(ContentType::JSON)
+                .header(Header::new("x-session-token", token.to_string()))
+                .body(body.to_string())
+                .dispatch()
+                .await
+                .status()
+        }
+
+        // Never together with a timeout is refused.
+        let status = create(
+            &harness,
+            &session.token,
+            &server.id,
+            serde_json::json!({
+                "type": "Voice", "name": "AFK", "afk": true,
+                "afk_timeout": 600, "afk_timeout_never": true
+            }),
+        )
+        .await;
+        assert_eq!(status, Status::BadRequest);
+
+        let status = create(
+            &harness,
+            &session.token,
+            &server.id,
+            serde_json::json!({
+                "type": "Voice", "name": "AFK", "afk": true, "afk_timeout_never": true
+            }),
+        )
+        .await;
+        assert_eq!(status, Status::Ok);
+        let stored = harness.db.fetch_server(&server.id).await.expect("server");
+        assert!(stored.afk_channel_id.is_some());
+        assert_eq!(stored.afk_timeout, None);
+
+        let server_id = server.id.clone();
+        harness
+            .wait_for_event(&server_id, |event| {
+                matches!(
+                    event,
+                    EventV1::ServerUpdate { clear, .. }
+                        if clear.contains(&v0::FieldsServer::AfkTimeout)
+                )
+            })
+            .await;
     }
 }

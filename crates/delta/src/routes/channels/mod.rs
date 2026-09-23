@@ -1,6 +1,7 @@
 use revolt_rocket_okapi::revolt_okapi::openapi3::OpenApi;
 use rocket::Route;
 
+mod afk_idle;
 mod annotations_consent;
 mod annotations_send;
 mod call_recording;
@@ -113,6 +114,8 @@ pub fn routes() -> (Vec<Route>, OpenApi) {
         remote_control::control_heartbeat,
         control_request::control_request,
         rc_capable::rc_capable_announce,
+        afk_idle::afk_idle_set,
+        afk_idle::afk_idle_clear,
         watch::watch_create,
         watch::watch_update,
         watch::watch_end,

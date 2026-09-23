@@ -2,9 +2,10 @@ use revolt_config::config;
 use revolt_database::{
     util::{permissions::perms, reference::Reference},
     voice::{
-        assert_call_caps_admit, delete_voice_state, get_channel_node, get_user_voice_channels,
-        get_voice_channel_members, raise_if_in_voice, set_call_notification_recipients,
-        set_channel_node, UserVoiceChannel, VoiceClient,
+        assert_call_caps_admit, delete_voice_state, get_channel_node,
+        get_user_voice_channel_in_server, get_user_voice_channels, get_voice_channel_members,
+        raise_if_in_voice, set_call_notification_recipients, set_channel_node, UserVoiceChannel,
+        VoiceClient,
     },
     Database, Session, User,
 };
@@ -68,6 +69,7 @@ pub async fn call(
         force_disconnect,
         recipients,
         device_id,
+        rejoin,
     } = data.into_inner();
 
     if user.bot.is_some() && force_disconnect == Some(true) {
@@ -136,6 +138,34 @@ pub async fn call(
         .ok_or_else(|| create_error!(UnknownNode))?
         .clone();
 
+    // An automatic rejoin must not take the seat back from a connection
+    // that is live in another channel (AFK plan Wave 5b-2 S-b, Stage 1
+    // I-10): a sibling that was offline when this user was moved would
+    // otherwise force-disconnect the moved seat out of its destination.
+    // Checked before anything below is torn down. `vc:{user}` alone can be
+    // stale after a lost `participant_left` (P2-3), so a listed channel only
+    // counts while its `{user}:{server}` pointer still names it; that
+    // pointer is keyed by the channel id itself for a DM or group
+    // (`create_voice_state`).
+    if rejoin == Some(true) {
+        let mut previous = Vec::new();
+        for previous_channel in get_user_voice_channels(&user.id).await? {
+            let pointer = get_user_voice_channel_in_server(
+                &user.id,
+                previous_channel
+                    .server_id
+                    .as_deref()
+                    .unwrap_or(&previous_channel.id),
+            )
+            .await?;
+            previous.push((previous_channel.id, pointer));
+        }
+
+        if rejoin_conflict(&previous, channel.id()) {
+            return Err(create_error!(AlreadyConnected));
+        }
+    }
+
     if force_disconnect == Some(true) {
         // Finds and disconnects any existing voice connections by the user,
         // should only ever loop once but just to cover our backs.
@@ -203,6 +233,17 @@ pub async fn call(
         token,
         url: node_host.clone(),
     }))
+}
+
+/// Whether a rejoin to `target` would take the seat from a live connection
+/// elsewhere. `prev` is every channel in `vc:{user}` with the value of its
+/// `{user}:{server}` pointer. A channel is a conflict only when it is not the
+/// target AND its pointer still names it: an entry whose pointer is gone, or
+/// names another channel, is a stale leftover of a lost leave.
+fn rejoin_conflict(prev: &[(String, Option<String>)], target: &str) -> bool {
+    prev.iter().any(|(channel_id, pointer)| {
+        channel_id != target && pointer.as_deref() == Some(channel_id.as_str())
+    })
 }
 
 /// Which LiveKit node a join lands on, in priority order:
@@ -296,6 +337,7 @@ mod test {
                     force_disconnect: Some(force_disconnect),
                     recipients: None,
                     device_id: None,
+                    rejoin: None,
                 })
                 .unwrap(),
             )
@@ -546,6 +588,112 @@ mod test {
         delete_channel_voice_state(&voice_channel, &seeded)
             .await
             .expect("cleanup");
+    }
+
+    // ---- rejoin preemption (AFK plan Wave 5b-2 S-b) ----------------------
+
+    #[test]
+    fn rejoin_conflict_counts_only_a_live_other_channel() {
+        use super::rejoin_conflict;
+        let entry = |id: &str, pointer: Option<&str>| (id.to_string(), pointer.map(str::to_string));
+
+        // Live in another channel: the seat a moderator or the sweep moved.
+        assert!(rejoin_conflict(&[entry("B", Some("B"))], "A"));
+        // The target itself is never a conflict (a same-channel reconnect).
+        assert!(!rejoin_conflict(&[entry("A", Some("A"))], "A"));
+        // In no channel at all.
+        assert!(!rejoin_conflict(&[], "A"));
+        // P2-3: a stale `vc:` entry whose pointer already names the target
+        // (the moved seat's own rejoin after a lost leave of `from`).
+        assert!(!rejoin_conflict(&[entry("B", Some("A"))], "A"));
+        assert!(!rejoin_conflict(
+            &[entry("B", Some("A")), entry("A", Some("A"))],
+            "A"
+        ));
+        // An entry whose pointer is gone.
+        assert!(!rejoin_conflict(&[entry("B", None)], "A"));
+        // One live conflict among stale entries is still a conflict.
+        assert!(rejoin_conflict(
+            &[entry("C", None), entry("B", Some("B"))],
+            "A"
+        ));
+    }
+
+    /// `call`'s body, comment lines dropped and whitespace collapsed.
+    fn call_body() -> String {
+        const SOURCE: &str = include_str!("voice_join.rs");
+        let at = SOURCE
+            .find("pub async fn call(")
+            .expect("voice_join.rs no longer defines `call`");
+        let open = at + SOURCE[at..].find('\u{7b}').expect("a body");
+        let mut depth = 0usize;
+        let mut close = None;
+        for (i, ch) in SOURCE[open..].char_indices() {
+            match ch {
+                '\u{7b}' => depth += 1,
+                '\u{7d}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        close = Some(open + i);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        SOURCE[open..=close.expect("a closed body")]
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join(" ")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    /// S-b: the rejoin refusal runs before anything is torn down. Moved
+    /// below the force branch, a sibling's rejoin would already have kicked
+    /// the moved seat out of its destination by the time it was refused.
+    #[test]
+    fn rejoin_check_precedes_every_side_effect() {
+        let body = call_body();
+        let at = |needle: &str| {
+            body.find(needle)
+                .unwrap_or_else(|| panic!("`call` lost `{}`: {}", needle, body))
+        };
+
+        let guard = at("if rejoin == Some(true)");
+        // P2-3: the pointer is read per listed channel, keyed by its server
+        // (or by the channel itself for a DM or group).
+        let pointer = at(
+            "get_user_voice_channel_in_server( &user.id, previous_channel \
+             .server_id .as_deref() .unwrap_or(&previous_channel.id), )",
+        );
+        let check = at("if rejoin_conflict(&previous, channel.id())");
+        let refuse = at("return Err(create_error!(AlreadyConnected));");
+        assert!(
+            guard < pointer && pointer < check && check < refuse,
+            "{}",
+            body
+        );
+
+        for effect in [
+            "if force_disconnect == Some(true)",
+            "release_remote_control_for_user(",
+            "remove_user(",
+            "delete_voice_state(",
+            "create_token(",
+            "create_room(",
+            "set_channel_node(",
+            "set_call_notification_recipients(",
+        ] {
+            assert!(
+                refuse < at(effect),
+                "`{}` runs before the rejoin refusal: {}",
+                effect,
+                body
+            );
+        }
     }
 
     // ---- server voice region -------------------------------------------

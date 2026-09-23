@@ -446,6 +446,13 @@ async fn build_server(
             user_banned: Some(channel_id),
         });
 
+    // Discord's AFK channel is a guild-level pointer, so it lands here with the
+    // rest of the server document, never on the channel-create DTO (see the
+    // `afk: None` literal in `create_channels`). A brand-new server has nobody
+    // in voice, so there are no occupants whose grants the designation would
+    // need re-syncing (`sync_afk_designation_change` is for live servers).
+    let (afk_channel_id, afk_timeout) = afk_designation(plan, &channels);
+
     let created_channels: Vec<Channel> = channels.iter().map(|(_, c)| c.clone()).collect();
 
     server
@@ -468,6 +475,8 @@ async fn build_server(
                 // permissions are the server baseline. `Server::create` seeded
                 // this with Sloga's own default, which we now replace.
                 default_permissions: Some(plan.default_permissions as i64),
+                afk_channel_id,
+                afk_timeout,
                 ..Default::default()
             },
             vec![],
@@ -705,8 +714,12 @@ async fn create_channels(
                 voice,
                 announcement,
                 // Discord's `afk_channel_id` is a guild-level pointer, not a
-                // per-channel flag, so there is nothing per-channel to map here
-                // and the import never designates an AFK channel.
+                // per-channel flag, so there is nothing per-channel to map here.
+                // The designation is written onto the server in step 5
+                // (`afk_designation`). Do not "fix" this to `Some(true)`:
+                // `create_server_channel` never reads `afk` (only delta's
+                // channel_create route does), so that would silently do
+                // nothing.
                 //
                 // Spelled out rather than covered by `..Default::default()`.
                 // This literal is exhaustive on purpose: it is the tripwire
@@ -717,6 +730,9 @@ async fn create_channels(
                 // the decision is the point.
                 afk: None,
                 afk_timeout: None,
+                // The import never designates through this path (it does so in
+                // step 5), so there is no timeout here to clear either.
+                afk_timeout_never: None,
             },
             // Don't let the model push ids / emit ChannelCreate: the server
             // document is written once in step 4, and nobody is subscribed to
@@ -845,6 +861,26 @@ fn resolve_channel_id(channels: &[(String, Channel)], template_id: &str) -> Opti
         .iter()
         .find(|(id, _)| id == template_id)
         .map(|(_, channel)| channel.id().to_string())
+}
+
+/// The AFK designation step 5 writes: the real id the planned AFK channel got,
+/// and its timeout.
+///
+/// The mapper already kept only a voice channel and a preset timeout. What it
+/// cannot know is whether that channel was actually created (the channel cap,
+/// or a failed insert), and a pointer to a channel that does not exist is
+/// worse than none. The timeout drops with the channel: every Sloga writer
+/// refuses a timeout with no channel to move people to.
+fn afk_designation(
+    plan: &ImportPlan,
+    channels: &[(String, Channel)],
+) -> (Option<String>, Option<u32>) {
+    let afk_channel_id = plan
+        .afk_channel
+        .as_ref()
+        .and_then(|wanted| resolve_channel_id(channels, &wanted.0));
+    let afk_timeout = afk_channel_id.as_ref().and(plan.afk_timeout);
+    (afk_channel_id, afk_timeout)
 }
 
 /// Build the category list from the plan, translating template placeholder ids
@@ -1334,5 +1370,133 @@ mod tests {
         db.fetch_sticker(&existing_sticker.id)
             .await
             .expect("nor may it touch existing stickers");
+    }
+
+    /// A text channel and a voice channel, with the voice channel designated
+    /// as the guild's AFK channel on a 15-minute timeout.
+    const AFK_FIXTURE: &str = r#"{
+        "code": "afk",
+        "name": "AFK Template",
+        "serialized_source_guild": {
+            "name": "AFK Guild",
+            "afk_channel_id": 2,
+            "afk_timeout": 900,
+            "roles": [{"id": 0, "name": "@everyone", "permissions": "3148800"}],
+            "channels": [
+                {"id": 1, "type": 0, "name": "general", "position": 0},
+                {"id": 2, "type": 2, "name": "AFK", "position": 1}
+            ]
+        }
+    }"#;
+
+    /// The designation has to reach the stored server document, and the only
+    /// path there is step 5's `PartialServer`. Runs the real `build_server`
+    /// (every step, including `Member::create` and the invite) on the
+    /// Reference driver and reads the server back.
+    #[tokio::test]
+    async fn import_designates_the_afk_channel_on_the_stored_server() {
+        let db = DatabaseInfo::Reference.connect().await.unwrap();
+        let owner = make_owner(&db).await;
+
+        let template: GuildTemplate = serde_json::from_str(AFK_FIXTURE).unwrap();
+        let plan = plan_import(&template).unwrap();
+        assert!(
+            plan.afk_channel.is_some(),
+            "fixture must plan a designation"
+        );
+
+        let (server, _) = Server::create(
+            &db,
+            v0::DataCreateServer {
+                name: plan.server_name.clone(),
+                description: None,
+                nsfw: None,
+            },
+            &owner,
+            false,
+        )
+        .await
+        .unwrap();
+        let server_id = server.id.clone();
+
+        let mut job = DiscordImportJob::new(owner.id.clone(), "afk".to_string());
+        db.insert_discord_import_job(&job).await.unwrap();
+
+        let total = plan.total_steps().max(1);
+        if build_server(&db, &mut job, &owner, server, &plan, total)
+            .await
+            .is_err()
+        {
+            panic!("build_server aborted");
+        }
+
+        let stored = db.fetch_server(&server_id).await.unwrap();
+
+        // Find the channel the AFK placeholder became, by what it IS rather
+        // than by trusting the pointer under test.
+        let mut voice_id = None;
+        for id in &stored.channels {
+            let channel = db.fetch_channel(id).await.unwrap();
+            if let Channel::TextChannel { name, .. } = &channel {
+                if name == "AFK" && channel.voice().is_some() {
+                    voice_id = Some(id.clone());
+                }
+            }
+        }
+        let voice_id = voice_id.expect("the AFK voice channel should have been created");
+
+        assert_eq!(
+            stored.afk_channel_id.as_deref(),
+            Some(voice_id.as_str()),
+            "step 5 must write the imported AFK channel onto the server"
+        );
+        assert_eq!(stored.afk_timeout, Some(900));
+    }
+
+    /// The mapper cannot know whether its AFK channel was actually created. If
+    /// it was not (the channel cap, a failed insert), neither the pointer nor
+    /// a now-orphaned timeout may be written.
+    #[test]
+    fn afk_designation_needs_the_channel_to_have_been_created() {
+        let template: GuildTemplate = serde_json::from_str(AFK_FIXTURE).unwrap();
+        let plan = plan_import(&template).unwrap();
+        assert_eq!(plan.afk_timeout, Some(900));
+
+        assert_eq!(afk_designation(&plan, &[]), (None, None));
+    }
+
+    /// `create_server_channel` never reads `afk`; only delta's channel_create
+    /// route does. So flipping this literal to `Some(true)` would compile, pass
+    /// every behavioral test, and designate nothing, while the exhaustive
+    /// literal (no `..Default::default()`) is the tripwire for new fields.
+    #[test]
+    fn channel_create_dto_keeps_its_explicit_afk_none() {
+        let source = include_str!("worker.rs");
+        let production = &source[..source.find("#[cfg(test)]").expect("test module")];
+        let start = production
+            .find("Channel::create_server_channel(")
+            .expect("create_channels must call create_server_channel");
+        let dto = &production[start..];
+        let dto = &dto[..dto.find(".await").expect("the call is awaited")];
+        // Code only: the comment beside the literal names
+        // `..Default::default()` in prose.
+        let dto = dto
+            .lines()
+            .map(|line| line.split("//").next().unwrap_or(""))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(
+            dto.contains("afk: None,"),
+            "the `afk: None` literal is gone"
+        );
+        assert!(
+            dto.contains("afk_timeout: None,"),
+            "the `afk_timeout: None` literal is gone"
+        );
+        assert!(
+            !dto.contains("..Default::default()"),
+            "the channel-create DTO must stay an exhaustive literal"
+        );
     }
 }

@@ -815,6 +815,22 @@ pub struct Features {
     #[serde(default)]
     pub screen_leg: bool,
 
+    /// Kill switch for AFK auto-move (AFK-channel plan, D-5b2-3). ON by
+    /// default, and the default lives in the embedded `Revolt.toml`:
+    /// `#[serde(default)]` alone would make it `false`. Turn it off with
+    /// `REVOLT__FEATURES__AFK_AUTO_MOVE=false` (double underscores) or under
+    /// `[features]` in `Revolt.overrides.toml`, then RESTART delta AND crond:
+    /// config sources are frozen into each process at first access, so
+    /// neither the route nor the sweep's per-tick read ever sees a value
+    /// other than the one it started with. Off stops both halves: delta
+    /// refuses new idle claims (`PUT /channels/<id>/afk_idle` answers
+    /// `InvalidOperation`; withdrawing one still works), and the crond sweep
+    /// reads, claims and moves nothing. Claims already stored expire with
+    /// their TTL; the index entries they leave are dropped once the sweep is
+    /// back on.
+    #[serde(default)]
+    pub afk_auto_move: bool,
+
     /// Optional server id that every newly-onboarded user is automatically
     /// added to (a "Welcome" / landing-spot server). Empty/unset disables the
     /// behaviour. Existing users are unaffected (backfill separately).
@@ -1022,5 +1038,58 @@ mod boost_tests {
         // Disabled => always global, stored tiers notwithstanding
         boosts.enabled = false;
         assert_eq!(boosts.effective_server_emoji(100, 3), 100);
+    }
+}
+
+#[cfg(test)]
+mod afk_auto_move_tests {
+    use config::{Config, Environment, File, FileFormat};
+
+    use super::Settings;
+
+    fn embedded() -> File<config::FileSourceString, FileFormat> {
+        File::from_str(include_str!("../Revolt.toml"), FileFormat::Toml)
+    }
+
+    /// The AFK sweep's kill switch is ON unless an operator turns it off.
+    /// `#[serde(default)]` on a `bool` is `false`, so the `true` has to come
+    /// from the embedded `Revolt.toml`, the first source every process loads.
+    #[test]
+    fn the_embedded_default_turns_the_sweep_on() {
+        let settings: Settings = Config::builder()
+            .add_source(embedded())
+            .build()
+            .expect("the embedded Revolt.toml builds")
+            .try_deserialize()
+            .expect("the embedded Revolt.toml deserializes");
+
+        assert!(settings.features.afk_auto_move);
+    }
+
+    /// And the documented override turns it off (double underscores). The
+    /// environment source is configured exactly as `CONFIG_BUILDER` does,
+    /// with the variable supplied in-process rather than set on the test
+    /// process.
+    #[test]
+    fn the_environment_override_turns_the_sweep_off() {
+        let settings: Settings = Config::builder()
+            .add_source(embedded())
+            .add_source(
+                Environment::with_prefix("REVOLT")
+                    .separator("__")
+                    .source(Some(
+                        [(
+                            "REVOLT__FEATURES__AFK_AUTO_MOVE".to_string(),
+                            "false".to_string(),
+                        )]
+                        .into(),
+                    )),
+            )
+            .build()
+            .expect("the config builds")
+            .try_deserialize()
+            .expect("the config deserializes");
+
+        assert!(!settings.features.afk_auto_move);
     }
 }

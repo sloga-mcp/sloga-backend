@@ -26,6 +26,7 @@ use revolt_models::v0::{self, PartialUserVoiceState, UserVoiceState};
 use revolt_permissions::{calculate_channel_permissions, ChannelPermission, PermissionValue};
 use revolt_result::{create_error, Result, ToRevoltError};
 
+pub mod afk_idle;
 pub mod annotations;
 pub mod remote_control;
 pub mod watch;
@@ -454,30 +455,18 @@ pub async fn get_user_voice_channels(user_id: &str) -> Result<Vec<UserVoiceChann
         .to_internal_error()
 }
 
-pub async fn set_user_moved_from_voice(
-    old_channel_id: &str,
-    new_channel: &UserVoiceChannel,
-    user_id: &str,
-) -> Result<()> {
-    get_connection()
-        .await?
-        .set_ex(
-            format!("moved_from:{user_id}:{old_channel_id}"),
-            new_channel,
-            10,
-        )
-        .await
-        .to_internal_error()
-}
+/// Lifetime of the voice move's `moved_to` marker, in seconds. Exported so the
+/// AFK sweep, whose per-member move claim must outlive the marker (Wave 5b-2
+/// sweep contract), asserts that against this constant rather than against a
+/// literal that could drift from it.
+pub const MOVED_TO_MARKER_TTL_SECS: usize = 10;
 
-pub async fn get_user_moved_from_voice(channel_id: &str, user_id: &str) -> Result<Option<String>> {
-    get_connection()
-        .await?
-        .get_del(format!("moved_from:{user_id}:{channel_id}"))
-        .await
-        .to_internal_error()
-}
-
+/// The voice move's ONE marker: for [`MOVED_TO_MARKER_TTL_SECS`], the target's
+/// next join to `new_channel_id` is announced as a `VoiceChannelMove` from
+/// `old_channel` instead of a `VoiceChannelJoin`. A label only. There is no
+/// counterpart for the source any more: its Leave is always published (Wave
+/// 5b-2 M4-b), so a move whose destination join never comes cannot leave a
+/// ghost on the other clients' rosters.
 pub async fn set_user_moved_to_voice(
     new_channel_id: &str,
     old_channel: &UserVoiceChannel,
@@ -488,7 +477,7 @@ pub async fn set_user_moved_to_voice(
         .set_ex(
             format!("moved_to:{user_id}:{new_channel_id}"),
             old_channel,
-            10,
+            MOVED_TO_MARKER_TTL_SECS,
         )
         .await
         .to_internal_error()
@@ -739,6 +728,16 @@ pub async fn create_voice_state(
         // allowlist a crashed/stale session left behind (rev-3 review — a
         // resurrected list silently re-grants drawing on the next share).
         .del(format!("annotations_allow:{}:{}", &channel.id, user_id))
+        // And for the AFK idle claim (Wave 5b-2 I-2): a claim left by the
+        // previous call (it lives up to its TTL after a leave) must not carry
+        // over into this one and count the old call's idle time. The sweep's
+        // `since >= joined_at` check is the second guard. Keyed per server
+        // like the flags above; the key is not in the teardown script, so
+        // this DEL and its TTL are its cleanup.
+        .del(afk_idle::afk_since_key(
+            user_id,
+            channel.server_id.as_ref().unwrap_or(&channel.id),
+        ))
         .query_async::<_, ()>(&mut get_connection().await?.into_inner())
         .await
         .to_internal_error()?;
@@ -1070,8 +1069,11 @@ static TEARDOWN_FALLBACK_LOGGED: AtomicBool = AtomicBool::new(false);
 ///   it could not PARSE, and a garbled reply may be the script's answer.
 /// - `NOPERM` naming EVALSHA or SCRIPT: an ACL refused the command itself.
 ///   Those are the only two commands redis-rs sends here (EVALSHA, and
-///   SCRIPT LOAD on a NOSCRIPT). A NOPERM naming anything else was raised
-///   from INSIDE a running script and does not qualify.
+///   SCRIPT LOAD on a NOSCRIPT). Any other NOPERM does not qualify. It is
+///   either a key denial, which Redis checks before EVALSHA runs, or a denial
+///   of a command the running script called. Either way the fallback would
+///   touch the same keys with the same commands as the same user, and would
+///   be refused as well.
 ///
 /// Returned, among others: every IO error (dropped connection, timeout,
 /// refusal), any other `ERR` (a Lua runtime error means the script RAN), a
@@ -1898,17 +1900,52 @@ fn move_addressing(moving: &ParticipantInfo, target_id: &str) -> MoveAddressing 
 /// The caller decides whether the move is *allowed by policy* (the route
 /// checks `MoveMembers` and ranking; the sweep checks idleness). This decides
 /// whether it is *possible and safe*, and returns what it did.
+///
+/// Moves the target from wherever they are in the destination's server. A
+/// caller whose decision was made about one particular source channel uses
+/// [`move_user_to_voice_channel_expecting`] instead.
 pub async fn move_user_to_voice_channel(
     db: &Database,
     voice_client: &VoiceClient,
     target: &User,
     destination: &Channel,
 ) -> Result<VoiceMoveOutcome> {
-    // Derived here, never passed in, for the reason in the doc comment above
-    // — and derived BEFORE admission rather than taken out of it, so that the
-    // "they are already there" answer below can be given without running any
-    // admission work at all. A DM or a Group still cannot reach a line past
-    // this point.
+    move_user_to_voice_channel_expecting(db, voice_client, target, destination, None).await
+}
+
+/// Whether the target has left the source channel a caller decided about:
+/// `expected_from` names that channel (`None` = no expectation), `from` is
+/// what the `{user}:{server}` pointer names now.
+fn source_moved_on(expected_from: Option<&str>, from: &str) -> bool {
+    expected_from.is_some_and(|expected| expected != from)
+}
+
+/// [`move_user_to_voice_channel`], for a caller that decided the move about a
+/// particular SOURCE channel (Wave 5b-2 audit A2).
+///
+/// The AFK sweep decides from an idle claim naming the channel the member was
+/// idle in, and between that read and this call the member may deliberately
+/// switch to another channel of the server. Without an expectation the move
+/// re-derives `from` from the pointer and moves them out of the channel they
+/// just chose. With `expected_from: Some(x)` a pointer that no longer names
+/// `x` answers `NotConnected` BEFORE any listing, write or mint: from the
+/// caller's point of view the member it meant is no longer connected there.
+///
+/// This narrows the window to the few reads between this check and the SFU
+/// listing; it does not close it. `None` behaves exactly as
+/// [`move_user_to_voice_channel`], which is implemented by calling this.
+pub async fn move_user_to_voice_channel_expecting(
+    db: &Database,
+    voice_client: &VoiceClient,
+    target: &User,
+    destination: &Channel,
+    expected_from: Option<&str>,
+) -> Result<VoiceMoveOutcome> {
+    // Derived here, never passed in, for the reason in
+    // `move_user_to_voice_channel`'s doc comment — and derived BEFORE
+    // admission rather than taken out of it, so that the "they are already
+    // there" answer below can be given without running any admission work at
+    // all. A DM or a Group still cannot reach a line past this point.
     let Some(server_id) = destination.server() else {
         return Err(create_error!(UnknownChannel));
     };
@@ -1917,14 +1954,23 @@ pub async fn move_user_to_voice_channel(
         return Ok(VoiceMoveOutcome::NotConnected);
     };
 
+    // The caller's source is gone (see the doc comment): nothing listed,
+    // written or minted. First of all the answers, ahead of the source ==
+    // destination guard as well: whatever else is true, the premise the
+    // caller decided on no longer holds.
+    if source_moved_on(expected_from, &from) {
+        return Ok(VoiceMoveOutcome::NotConnected);
+    }
+
     // Source == destination. Without this the code below evicts the target
-    // from the very room it is putting them back into: `remove_user` runs
-    // against a node that is now also the destination's node, so the user is
-    // kicked out of the call they were already happily in. Harmless-looking
-    // on a moderator route (nobody moves someone to where they are), fatal on
-    // a timer: the AFK sweep's population is idle members and its destination
-    // is where idle members already sit, so every tick would re-kick the
-    // entire AFK channel.
+    // from the very room it is putting them back into: every connection of
+    // theirs that the SFU lists in `from` goes through
+    // `remove_identity_if_present`, and `from` is now also the destination,
+    // so the user is kicked out of the call they were already happily in.
+    // Harmless-looking on a moderator route (nobody moves someone to where
+    // they are), fatal on a timer: the AFK sweep's population is idle members
+    // and its destination is where idle members already sit, so every tick
+    // would re-kick the entire AFK channel.
     //
     // Decided BEFORE `admit_voice_move`, not after it: a member who is
     // already in the destination must not have to be admissible to it all
@@ -1991,11 +2037,11 @@ pub async fn move_user_to_voice_channel(
     // - WHICH NONCE ADDRESSES IT (`conn_nonce_of`), carried on the event.
     // - WHICH CONNECTIONS GO (`eviction_targets`), used after the emit.
     //
-    // Why before the first WRITE and not merely before the mint: the
-    // `moved_from` / `moved_to` markers below relabel the target's next
-    // Leave and Join for as long as they live, and `set_channel_node` pins
-    // the destination. A move that wrote those and then answered
-    // `NotConnected` would leave them standing to mislabel unrelated events.
+    // Why before the first WRITE and not merely before the mint:
+    // `set_channel_node` pins the destination, and the `moved_to` marker
+    // further down relabels the target's next Join for as long as it lives.
+    // A move that wrote either and then answered `NotConnected` would leave
+    // it standing to mislead unrelated joins.
     //
     // A FAILED LIST FAILS THE MOVE, with nothing written, minted or emitted.
     // It used to fall back to a single mapped removal, and the only reason
@@ -2085,9 +2131,6 @@ pub async fn move_user_to_voice_channel(
         server_id: destination_channel.server_id.clone(),
     };
 
-    set_user_moved_from_voice(&from, &destination_channel, &target.id).await?;
-    set_user_moved_to_voice(destination.id(), &source_channel, &target.id).await?;
-
     voice_client.create_room(&new_node, destination).await?;
 
     // Minted for the connection chosen above: `addressing.device_id` is that
@@ -2124,6 +2167,29 @@ pub async fn move_user_to_voice_channel(
         false,
     )
     .await;
+
+    // The Join label (Wave 5b-2 M4-a). Written HERE, after the room, the
+    // mint and the release and immediately before the emit, so a move that
+    // fails before the target is sent anything leaves no marker to mislabel
+    // their next ordinary join (it used to be written before `create_room`
+    // and `create_token`, both behind a `?`). The evictions below can still
+    // fail the move, but by then the token is out and the join it labels is
+    // the one the move asked for.
+    //
+    // BEST-EFFORT, no `?`: by now the remote-control grant has been revoked,
+    // and the marker only picks `VoiceChannelMove` over `VoiceChannelJoin`
+    // for the destination's roster; the source's Leave is published
+    // regardless. Failing the move over it would strand the target with a
+    // revoked grant and no token.
+    if let Err(error) = set_user_moved_to_voice(destination.id(), &source_channel, &target.id).await
+    {
+        log::warn!(
+            "voice move of {} from {from}: the move marker was not written ({error}); \
+             their join to {} will be announced as a join, not a move",
+            target.id,
+            destination.id()
+        );
+    }
 
     // EMITTED BEFORE THE EVICTION, AND THE ORDER IS THE FIX.
     //
@@ -2302,9 +2368,20 @@ pub async fn sync_voice_permissions(
 
 /// Re-sync voice permissions on BOTH sides of an AFK designation change.
 ///
-/// `Server.afk_channel_id` has two writers - `server_edit` (the designation
-/// is moved or cleared) and `channel_create` (a channel is born designated) -
-/// and the enforcement gate reads the designation off the server document, not
+/// `Server.afk_channel_id` has four writers. The two ROUTES call this:
+/// `server_edit` (the designation is moved or cleared) and `channel_create` (a
+/// channel is born designated). The other two deliberately do not:
+///
+/// - the Discord import worker, which writes the designation in step 5 into a
+///   server it created moments ago, before step 6 creates any membership. No
+///   member exists yet, so nobody can be in its voice channels and there is
+///   no grant to re-sync;
+/// - the revision-70 migration (the "afk"-named-channel backfill), which runs
+///   at deploy with no `VoiceClient` to sync through. Members already sitting
+///   in a backfilled channel keep the grant they were minted until they
+///   rejoin; the migration's own comment records that.
+///
+/// The enforcement gate reads the designation off the server document, not
 /// off any per-participant state. So the moment the pointer moves, everyone
 /// already sitting in a room on either side of the move is holding a LiveKit
 /// grant that no longer matches the server. Occupants of the OUTGOING channel
@@ -2918,12 +2995,18 @@ mod permission_tests {
         assert_eq!(conn_nonce_of(&other), None);
     }
 
-    /// `move_user_to_voice_channel`'s body as SHIPPING code: the braced body,
-    /// with comment lines dropped so prose that names a call can never
-    /// satisfy (or trip) an ordering assertion.
+    /// The voice move's body as SHIPPING code: the braced body, with comment
+    /// lines dropped so prose that names a call can never satisfy (or trip)
+    /// an ordering assertion.
+    ///
+    /// The body lives in `move_user_to_voice_channel_expecting` (Wave 5b-2
+    /// A2); `move_user_to_voice_channel` only delegates to it, and
+    /// `the_plain_move_delegates_with_no_expectation` pins that it does
+    /// nothing else. Every pin that reads this therefore reads the one body
+    /// both callers run.
     fn move_body_code() -> String {
         const FILE: &str = "core/database/src/voice/mod.rs";
-        const DEFINITION: &str = "pub async fn move_user_to_voice_channel(";
+        const DEFINITION: &str = "pub async fn move_user_to_voice_channel_expecting(";
 
         let sources = shipping_sources();
         let shipping = &sources
@@ -2954,9 +3037,9 @@ mod permission_tests {
     }
 
     /// P-3: the SFU listing precedes EVERY write and the mint. A listing
-    /// after the `moved_from` / `moved_to` markers would let a
-    /// `NotConnected` (or a failed list) leave them standing to relabel the
-    /// target's next Leave and Join; after the mint, a stale mapping would
+    /// after `set_channel_node` or the `moved_to` marker would let a
+    /// `NotConnected` (or a failed list) leave them standing, the marker to
+    /// relabel the target's next Join; after the mint, a stale mapping would
     /// address the token to a connection that is gone.
     #[test]
     fn the_move_lists_the_source_room_before_any_write() {
@@ -2965,7 +3048,6 @@ mod permission_tests {
 
         for write in [
             "set_channel_node(",
-            "set_user_moved_from_voice(",
             "set_user_moved_to_voice(",
             "create_room(",
             ".create_token(",
@@ -2975,6 +3057,214 @@ mod permission_tests {
                 "`list_participants_if_present(` must precede `{write}` in \
                  `move_user_to_voice_channel` — a refusal, a gone room or a \
                  failed listing has to leave nothing written and nothing minted"
+            );
+        }
+    }
+
+    /// M4-a (Wave 5b-2): the `moved_to` marker is written after the mint and
+    /// after the remote-control release, and before the emit, and nothing
+    /// between the write and the emit can fail the move. Each mutation this
+    /// catches compiles and ships green otherwise:
+    ///
+    /// - the write moved back above `.create_token(` (or above the release):
+    ///   a mint that fails leaves a marker that relabels the target's next
+    ///   ordinary join as a move, for 10 s;
+    /// - a `?` on the write (`.await?;`): a Redis hiccup fails a move whose
+    ///   remote-control grant has already been revoked, with no token sent.
+    #[test]
+    fn the_move_marks_the_join_after_the_mint_and_before_the_emit() {
+        let body = move_body_code();
+        let flat = body.split_whitespace().collect::<Vec<_>>().join(" ");
+
+        assert_eq!(
+            flat.matches("set_user_moved_to_voice(").count(),
+            1,
+            "the move must write its marker exactly once"
+        );
+        let marker = first(&flat, "set_user_moved_to_voice(");
+        let emit = first(&flat, ".private(target.id");
+
+        assert!(
+            first(&flat, ".create_token(") < marker,
+            "the marker must be written AFTER `.create_token(`"
+        );
+        assert!(
+            first(&flat, "release_remote_control_for_user(") < marker,
+            "the marker must be written AFTER the remote-control release"
+        );
+        assert!(
+            marker < first(&flat, "EventV1::UserMoveVoiceChannel") && marker < emit,
+            "the marker must be written BEFORE the move event is emitted"
+        );
+
+        let window = &flat[marker..emit];
+        assert!(
+            !window.contains('?'),
+            "nothing between the marker write and the emit may carry a `?` — \
+             the write is best-effort: {window}"
+        );
+        assert!(
+            window.starts_with(
+                "set_user_moved_to_voice(destination.id(), &source_channel, &target.id).await \
+                 \u{7b}"
+            ),
+            "the marker names the destination and the SOURCE channel, and its \
+             result is inspected, not propagated: {window}"
+        );
+    }
+
+    /// I-19 (Wave 5b-2): the move itself has no bot check. Bots can be in
+    /// voice and a moderator may move one; the AFK route refuses bots and the
+    /// sweep skips them, each at its own layer. A bot check here would make
+    /// the moderator route refuse a move it allows today.
+    #[test]
+    fn the_move_does_not_look_at_bots() {
+        let body = move_body_code();
+
+        assert!(
+            !body.contains(".bot"),
+            "`move_user_to_voice_channel` reads `.bot` — the bot policy \
+             belongs to its callers, not to the move"
+        );
+    }
+
+    /// A2 (5b-2.1 audit): the expectation, by value. No expectation never
+    /// refuses; an expectation refuses exactly when the pointer names some
+    /// other channel.
+    #[test]
+    fn a_move_expecting_a_source_refuses_only_when_the_pointer_left_it() {
+        use super::source_moved_on;
+
+        assert!(!source_moved_on(None, "A"), "no expectation, no refusal");
+        assert!(!source_moved_on(Some("A"), "A"), "still in the source");
+        assert!(
+            source_moved_on(Some("A"), "B"),
+            "moved on to another channel"
+        );
+    }
+
+    /// A2 (5b-2.1 audit): the expectation is checked right after the pointer
+    /// is read and BEFORE anything else the move does, so a member who moved
+    /// on is answered `NotConnected` with nothing listed, admitted, written,
+    /// minted or emitted. Mutations: the check deleted, its `return` changed,
+    /// or the check moved below the listing or any write.
+    #[test]
+    fn the_move_checks_its_expected_source_before_anything_else() {
+        let body = move_body_code();
+        let flat = body.split_whitespace().collect::<Vec<_>>().join(" ");
+
+        const CHECK: &str = "if source_moved_on(expected_from, &from) \u{7b} \
+                             return Ok(VoiceMoveOutcome::NotConnected); \u{7d}";
+        assert_eq!(
+            flat.matches(CHECK).count(),
+            1,
+            "the move must check its expected source exactly once, answering \
+             `NotConnected`: {flat}"
+        );
+        let check = first(&flat, CHECK);
+
+        assert!(
+            first(&flat, "let Some(from) = get_user_voice_channel_in_server(") < check,
+            "the check compares against the pointer, so it follows the read"
+        );
+        for later in [
+            "if from == destination.id()",
+            "admit_voice_move(",
+            "list_participants_if_present(",
+            "set_channel_node(",
+            "create_room(",
+            ".create_token(",
+            "release_remote_control_for_user(",
+            "set_user_moved_to_voice(",
+            ".private(target.id",
+            "remove_identity_if_present(",
+        ] {
+            assert!(
+                check < first(&flat, later),
+                "the expected-source check must precede `{later}`"
+            );
+        }
+    }
+
+    /// A2 (5b-2.1 audit): the four-argument move keeps its signature (the
+    /// moderator route calls it) and is exactly a delegation with no
+    /// expectation. Mutations: an expectation passed (`Some(..)`), or any
+    /// other statement added to its body.
+    #[test]
+    fn the_plain_move_delegates_with_no_expectation() {
+        let shipping = this_file_shipping();
+
+        assert!(
+            shipping.contains(
+                "pub async fn move_user_to_voice_channel(\n    db: &Database,\n    \
+                 voice_client: &VoiceClient,\n    target: &User,\n    \
+                 destination: &Channel,\n) -> Result<VoiceMoveOutcome> \u{7b}"
+            ),
+            "`move_user_to_voice_channel` must keep its four-argument signature"
+        );
+        let body = flat_fn_body(&shipping, "pub async fn move_user_to_voice_channel(");
+        assert_eq!(
+            body.trim(),
+            "move_user_to_voice_channel_expecting(db, voice_client, target, destination, None).await",
+            "`move_user_to_voice_channel` must only delegate, with no expectation"
+        );
+    }
+
+    /// B10 (5b-2.1 audit): the move marker's lifetime is a named constant, at
+    /// 10 s, and it is what `set_user_moved_to_voice` actually passes. The AFK
+    /// sweep asserts its claim TTL against this constant.
+    #[test]
+    fn the_move_marker_lives_ten_seconds() {
+        assert_eq!(super::MOVED_TO_MARKER_TTL_SECS, 10);
+
+        let shipping = this_file_shipping();
+        let body = flat_fn_body(&shipping, "pub async fn set_user_moved_to_voice(");
+        assert!(
+            body.contains(
+                ".set_ex( format!(\"moved_to:\u{7b}user_id\u{7d}:\u{7b}new_channel_id\u{7d}\"), \
+                 old_channel, MOVED_TO_MARKER_TTL_SECS, )"
+            ),
+            "`set_user_moved_to_voice` must expire the marker after \
+             `MOVED_TO_MARKER_TTL_SECS`: {body}"
+        );
+    }
+
+    /// B8 (5b-2.1 audit): the idle reads and the clear pass (user, server) in
+    /// that order to builders pinned by value in afk_idle.rs, and the due read
+    /// passes `now_ms` as its upper bound. The async wrappers need Redis to
+    /// run, so their call sites are pinned on their text. Mutation: any
+    /// argument pair swapped.
+    #[test]
+    fn the_idle_reads_and_clear_pass_user_then_server() {
+        const FILE: &str = "core/database/src/voice/afk_idle.rs";
+        let shipping = shipping_sources()
+            .into_iter()
+            .find(|(rel, _)| rel == FILE)
+            .expect("afk_idle.rs is not in the workspace scan")
+            .1;
+
+        for (definition, call) in [
+            (
+                "pub async fn read_idle_state(",
+                "idle_state_read_cmd(user_id, server_id)",
+            ),
+            (
+                "pub async fn clear_afk_since(",
+                "afk_since_clear_pipeline(user_id, server_id)",
+            ),
+            (
+                "pub async fn get_afk_since(",
+                "afk_since_key(user_id, server_id)",
+            ),
+            (
+                "pub async fn due_idle_members(",
+                "afk_idle_due_cmd(now_ms, limit)",
+            ),
+        ] {
+            let body = flat_fn_body(&shipping, definition);
+            assert!(
+                body.contains(call),
+                "`{definition}` must call `{call}`: {body}"
             );
         }
     }
@@ -3249,6 +3539,111 @@ mod permission_tests {
             "`stored_voice_participant_identity` must read field `user_id` of \
              `voice_identity:{{channel_id}}`, as the ingress writes it: {body}"
         );
+    }
+
+    /// A0-3 (5b-2.0 audit): the write side of the same mapping. Renaming the
+    /// `hset` key compiles and ships green, and then every reader above
+    /// resolves nothing: the move loses its preference and every kick or
+    /// permission update falls back to the bare user id.
+    #[test]
+    fn the_ingress_identity_write_is_the_key_the_readers_use() {
+        let shipping = this_file_shipping();
+        let body = flat_fn_body(&shipping, "pub async fn set_voice_participant_identity(");
+
+        assert!(
+            body.contains(
+                ".hset(format!(\"voice_identity:\u{7b}channel_id\u{7d}\"), user_id, identity)"
+            ),
+            "`set_voice_participant_identity` must write field `user_id` of \
+             `voice_identity:{{channel_id}}`: {body}"
+        );
+    }
+
+    /// I-2 (Wave 5b-2): every join deletes the AFK idle claim, inside
+    /// `create_voice_state`'s pipeline, through the one key builder. Without
+    /// it a claim from the previous call (live for up to its TTL) carries
+    /// over into the next one, and the sweep's `since >= joined_at` check is
+    /// left as the only guard against moving an active member.
+    #[test]
+    fn a_join_deletes_the_idle_claim() {
+        let shipping = this_file_shipping();
+        let body = flat_fn_body(&shipping, "pub async fn create_voice_state(");
+
+        let at = |needle: &str| {
+            body.find(needle)
+                .unwrap_or_else(|| panic!("`create_voice_state` lost `{needle}`: {body}"))
+        };
+        let pipeline = at("Pipeline::new()");
+        let run = at(".query_async");
+        let delete = at(".del(afk_idle::afk_since_key( user_id, \
+             channel.server_id.as_ref().unwrap_or(&channel.id), ))");
+        assert!(
+            pipeline < delete && delete < run,
+            "the claim DEL must be part of the join pipeline: {body}"
+        );
+    }
+
+    /// The one afk_idle.rs function that writes a claim, pinned on its
+    /// shipping text: the since arithmetic is `afk_since_ms` with the join
+    /// clamp, the write is decided by `afk_since_write` and issued by
+    /// `afk_since_write_cmd`, and the index entry is re-added with
+    /// `afk_idle_add_cmd` (ZADD NX). The builders' exact commands (`SET … NX
+    /// EX 180`, `ZADD afk_idle NX …`) are pinned by value in afk_idle.rs.
+    #[test]
+    fn a_claim_is_written_through_the_pinned_builders() {
+        const FILE: &str = "core/database/src/voice/afk_idle.rs";
+        let shipping = shipping_sources()
+            .into_iter()
+            .find(|(rel, _)| rel == FILE)
+            .expect("afk_idle.rs is not in the workspace scan")
+            .1;
+        let body = flat_fn_body(&shipping, "pub async fn set_afk_since(");
+
+        for needle in [
+            "idle_state_keys(user_id, server_id)",
+            ".mget(&[key.as_str(), joined_at_key.as_str()])",
+            "afk_since_ms(now_ms(), idle_for, joined_at_ms)",
+            "afk_since_write(existing_claim.as_ref(), channel_id)",
+            "afk_since_write_cmd(write, &key, &fresh)",
+            "afk_idle_add_cmd( &afk_idle_member(user_id, server_id), since_ms + INDEX_FIRST_LOOK_MS, )",
+        ] {
+            assert!(body.contains(needle), "`set_afk_since` lost `{needle}`: {body}");
+        }
+
+        let write_cmd = flat_fn_body(&shipping, "fn afk_since_write_cmd(");
+        for needle in [
+            "SetExpiry::EX(AFK_SINCE_TTL_SECS as usize)",
+            "ExistenceCheck::NX",
+            "ExistenceCheck::XX",
+        ] {
+            assert!(
+                write_cmd.contains(needle),
+                "`afk_since_write_cmd` lost `{needle}`: {write_cmd}"
+            );
+        }
+        let add_cmd = flat_fn_body(&shipping, "fn afk_idle_add_cmd(");
+        assert!(
+            add_cmd.contains("cmd(\"ZADD\")") && add_cmd.contains(".arg(\"NX\")"),
+            "`afk_idle_add_cmd` must be a raw ZADD NX: {add_cmd}"
+        );
+    }
+
+    /// M4-b (Wave 5b-2): the `moved_from` marker is gone end to end. It
+    /// suppressed the source's Leave, and when no destination join followed
+    /// (a dropped event, a refused connect) the old roster kept a ghost on
+    /// every other client. Reintroducing it anywhere in the workspace fails
+    /// here; the ingress half is pinned in voice-ingress `api.rs`.
+    #[test]
+    fn the_moved_from_marker_is_gone() {
+        for (rel, shipping) in shipping_sources() {
+            for needle in ["moved_from:", "_moved_from_voice("] {
+                assert!(
+                    !shipping.contains(needle),
+                    "{rel} contains `{needle}` — the source's Leave must never \
+                     be suppressed again"
+                );
+            }
+        }
     }
 
     /// I-16: the source == destination guard answers `AlreadyPresent` before
@@ -3767,9 +4162,12 @@ mod permission_tests {
         for (case, error) in [
             // R3-3, wording INFERRED from Redis 6.x source (see above): an ACL
             // key denial, and an ACL denial raised by a command the running
-            // script called. Neither names EVALSHA or SCRIPT. First in the
-            // list so a classifier broadened to match on "no permissions"
-            // alone is reported against the case that exposes it.
+            // script called. Neither names EVALSHA or SCRIPT. The key denial
+            // is checked before EVALSHA runs, so it is not returned because
+            // the script ran: it is returned because the fallback touches the
+            // same keys and would be refused too. First in the list so a
+            // classifier broadened to match on "no permissions" alone is
+            // reported against the case that exposes it.
             (
                 "an ACL key denial (Redis 6 / KeyDB wording)",
                 wire(
@@ -6326,5 +6724,116 @@ mod tests {
             flags.iter().all(Option::is_none),
             "a nil pointer must delete, never keep: {flags:?}"
         );
+    }
+
+    // AFK idle claims (Wave 5b-2). COMPILE-ONLY ON A BOX WITHOUT REDIS, OWED
+    // TO CI: like the other Redis-backed tests here it fails at its first
+    // `get_connection` with `InternalError` when no server is reachable.
+    //
+    // The claim's whole Redis life: created with a TTL and an index entry,
+    // refreshed without moving `since`, replaced for another channel, read
+    // back through `read_idle_state` against a real voice state, requeued
+    // (XX) and cleared, and deleted by the next join.
+    #[test]
+    fn afk_idle_claim_lifecycle() {
+        rt().block_on(afk_idle_claim_lifecycle_case())
+    }
+
+    /// The member's score in the AFK idle index, if it has one.
+    async fn afk_idle_score(conn: &mut Conn, member: &str) -> Option<i64> {
+        let score: Option<f64> = conn
+            .zscore(afk_idle::AFK_IDLE_INDEX_KEY, member)
+            .await
+            .unwrap();
+        score.map(|score| score as i64)
+    }
+
+    async fn afk_idle_claim_lifecycle_case() {
+        use afk_idle::*;
+
+        let suffix = ulid::Ulid::new().to_string();
+        let server = format!("srv{suffix}");
+        let channel = UserVoiceChannel {
+            id: format!("chanA{suffix}"),
+            server_id: Some(server.clone()),
+        };
+        let other = format!("chanB{suffix}");
+        let user = format!("user{suffix}");
+        let member = afk_idle_member(&user, &server);
+        let mut conn = get_connection().await.expect("redis");
+
+        create_voice_state(&channel, &user, Timestamp::now_utc())
+            .await
+            .expect("seed voice state");
+        let state = read_idle_state(&user, &server).await.unwrap();
+        assert_eq!(state.claim, None);
+        assert_eq!(state.pointer.as_deref(), Some(channel.id.as_str()));
+        assert!(state.joined_at_ms.is_some());
+        assert!(!state.screensharing && !state.camera && !state.recording);
+
+        // Create: SET NX EX, and an index entry one minute after `since`.
+        set_afk_since(&user, &server, &channel.id, 120)
+            .await
+            .unwrap();
+        let created = get_afk_since(&user, &server).await.unwrap().expect("claim");
+        assert_eq!(created.channel_id, channel.id);
+        assert!(
+            created.since_ms >= state.joined_at_ms.unwrap(),
+            "clamped to the join"
+        );
+        let ttl: i64 = conn.ttl(afk_since_key(&user, &server)).await.unwrap();
+        assert!(ttl > 0 && ttl <= AFK_SINCE_TTL_SECS as i64, "ttl {ttl}");
+        assert_eq!(
+            afk_idle_score(&mut conn, &member).await,
+            Some(created.since_ms + 60_000)
+        );
+
+        // Refresh: same channel, `since` does not move, nor does the score.
+        set_afk_since(&user, &server, &channel.id, 0).await.unwrap();
+        assert_eq!(
+            get_afk_since(&user, &server).await.unwrap(),
+            Some(created.clone())
+        );
+        assert_eq!(
+            afk_idle_score(&mut conn, &member).await,
+            Some(created.since_ms + 60_000)
+        );
+
+        // Replace: another channel, a fresh claim; the index keeps its score.
+        set_afk_since(&user, &server, &other, 0).await.unwrap();
+        let replaced = get_afk_since(&user, &server).await.unwrap().expect("claim");
+        assert_eq!(replaced.channel_id, other);
+        assert!(replaced.since_ms >= created.since_ms);
+
+        // The sweep's view, and its index operations.
+        assert!(due_idle_members(created.since_ms + 60_000, 100_000)
+            .await
+            .unwrap()
+            .contains(&member));
+        requeue_idle_member(&member, 42).await.unwrap();
+        assert_eq!(afk_idle_score(&mut conn, &member).await, Some(42));
+        drop_idle_member(&member).await.unwrap();
+        requeue_idle_member(&member, 43).await.unwrap();
+        assert_eq!(
+            afk_idle_score(&mut conn, &member).await,
+            None,
+            "XX never re-creates"
+        );
+
+        // Clear: the key and the index entry.
+        set_afk_since(&user, &server, &channel.id, 0).await.unwrap();
+        clear_afk_since(&user, &server).await.unwrap();
+        assert_eq!(get_afk_since(&user, &server).await.unwrap(), None);
+        assert_eq!(afk_idle_score(&mut conn, &member).await, None);
+
+        // A join deletes the claim (I-2).
+        set_afk_since(&user, &server, &channel.id, 0).await.unwrap();
+        create_voice_state(&channel, &user, Timestamp::now_utc())
+            .await
+            .expect("rejoin");
+        assert_eq!(get_afk_since(&user, &server).await.unwrap(), None);
+
+        drop_idle_member(&member).await.unwrap();
+        delete_voice_state(&channel, &user).await.expect("cleanup");
     }
 }

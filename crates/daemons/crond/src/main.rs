@@ -64,5 +64,6 @@ async fn main() {
         cron_task_wrapper(prune_expired_boosts::task, db.clone(), amqp.clone()),
         cron_task_wrapper(stream_live::task, db.clone(), amqp.clone()),
         cron_task_wrapper(discord_import::task, db.clone(), amqp.clone()),
+        cron_task_wrapper(afk_sweep::task, db.clone(), amqp.clone()),
     );
 }

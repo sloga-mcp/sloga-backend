@@ -26,7 +26,7 @@ struct MigrationInfo {
     revision: i32,
 }
 
-pub const LATEST_REVISION: i32 = 70; // MUST BE +1 to last migration
+pub const LATEST_REVISION: i32 = 71; // MUST BE +1 to last migration
 
 pub async fn migrate_database(db: &MongoDb) {
     let migrations = db.col::<Document>("migrations");
@@ -2397,6 +2397,402 @@ pub async fn run_migrations(db: &MongoDb, revision: i32) -> i32 {
             .expect("Failed to create user_respect indexes.");
     }
 
+    if revision <= 70 {
+        info!("Running migration [revision 70 / 23-09-2026]: Designate a server's lone voice channel named afk as its AFK channel");
+
+        // Before the AFK channel was a server setting, the client treated any
+        // channel whose lower-cased name is "afk" as one (join muted). This
+        // points `Server.afk_channel_id` at that channel wherever the choice
+        // is unambiguous; `afk_backfill_designation` holds the rule.
+        //
+        // Designation only: nothing is deleted and no idle timeout is set,
+        // so no backfilled server starts auto-moving anyone. It is still a
+        // behavior change - the old client only joined such a channel
+        // muted, while a designation is a hard publish gate at the SFU that
+        // binds the owner too.
+        //
+        // No voice re-sync (this bypasses `sync_afk_designation_change`):
+        // members already sitting in a backfilled channel at deploy keep the
+        // grant they were minted until they rejoin.
+        //
+        // One pass over voice-carrying channels grouped by server (the
+        // revision 13 channel cursor), then one pass over undesignated
+        // servers (the revision 49 server cursor). `channels.server` has no
+        // index, so a query per server would scan the collection per server.
+        let mut voice_channels: HashMap<String, Vec<crate::Channel>> = HashMap::new();
+        // Servers with a voice channel we could not decode: "exactly one"
+        // cannot be decided for them, so they are skipped (fail closed).
+        let mut undecodable: HashSet<String> = HashSet::new();
+
+        let mut channels = db
+            .col::<Document>("channels")
+            .find(doc! { "voice": { "$exists": true } })
+            .await
+            .expect("Failed to fetch voice channels for the AFK backfill.");
+
+        while let Some(result) = channels.next().await {
+            // A cursor error must abort, not end the scan early: a missed
+            // second match would turn an ambiguous server into a designated one.
+            let document = result.expect("Failed to read a channel for the AFK backfill.");
+            let server_id = document.get_str("server").ok().map(str::to_string);
+
+            match from_document::<crate::Channel>(document) {
+                Ok(channel) => {
+                    if let Some(server_id) = channel.server() {
+                        voice_channels
+                            .entry(server_id.to_string())
+                            .or_default()
+                            .push(channel);
+                    }
+                }
+                Err(error) => {
+                    if let Some(server_id) = server_id {
+                        warn!("AFK backfill: skipping server {server_id}, a channel failed to decode: {error}");
+                        undecodable.insert(server_id);
+                    }
+                }
+            }
+        }
+
+        let servers = db.col::<Document>("servers");
+        let mut cursor = servers
+            .find(doc! { "afk_channel_id": { "$exists": false } })
+            .with_options(
+                FindOptions::builder()
+                    .projection(doc! { "_id": 1_i32, "afk_channel_id": 1_i32 })
+                    .build(),
+            )
+            .await
+            .expect("Failed to fetch servers for the AFK backfill.");
+
+        let mut designated = 0_u32;
+        while let Some(result) = cursor.next().await {
+            let document = result.expect("Failed to read a server for the AFK backfill.");
+            let server_id = document
+                .get_str("_id")
+                .expect("Server document without a string _id.")
+                .to_string();
+
+            if undecodable.contains(&server_id) {
+                continue;
+            }
+
+            let Some(channels) = voice_channels.get(&server_id) else {
+                continue;
+            };
+
+            let Some(channel_id) = afk_backfill_designation(
+                &server_id,
+                document.contains_key("afk_channel_id"),
+                channels,
+            ) else {
+                continue;
+            };
+
+            // The "does not exist" condition is repeated in the update's
+            // filter so a designation made between the read above and this
+            // write (server_edit, channel_create) is never overwritten.
+            let outcome = servers
+                .update_one(
+                    doc! { "_id": &server_id, "afk_channel_id": { "$exists": false } },
+                    doc! { "$set": { "afk_channel_id": &channel_id } },
+                )
+                .await
+                .expect("Failed to designate an AFK channel.");
+
+            if outcome.modified_count == 1 {
+                designated += 1;
+                info!("AFK backfill: server {server_id} -> channel {channel_id}");
+            }
+        }
+
+        info!("AFK backfill: designated {designated} server(s).");
+    }
+
     // Reminder to update LATEST_REVISION when adding new migrations.
     LATEST_REVISION.max(revision)
+}
+
+/// Revision 70 (the A11 backfill): which channel, if any, becomes a server's
+/// AFK channel. Pure, so every case is unit-tested without a database.
+///
+/// Designates only when the server has no `afk_channel_id` yet and EXACTLY one
+/// of its channels is both
+/// - a voice channel by the predicate `Server::validate_afk_channel` applies:
+///   `Channel::server()` names this server and `Channel::voice()` is `Some`
+///   (a `TextChannel` whose `voice` is present and not disabled), and
+/// - named "afk" case-insensitively, exactly as the old client matched it:
+///   `channel.name?.toLowerCase() === "afk"` (frontend `96158a82`,
+///   `rtc/state.tsx:2982` and `ServerSidebar.tsx:1038`).
+///
+/// Two or more matches designate nothing: the old client treated them all as
+/// AFK, and picking one would be a guess. The result never sets `afk_timeout`.
+fn afk_backfill_designation(
+    server_id: &str,
+    already_designated: bool,
+    channels: &[crate::Channel],
+) -> Option<String> {
+    if already_designated {
+        return None;
+    }
+
+    let mut matches = channels.iter().filter(|channel| {
+        channel.server() == Some(server_id)
+            && channel.voice().is_some()
+            && matches!(
+                channel,
+                crate::Channel::TextChannel { name, .. } if name.to_lowercase() == "afk"
+            )
+    });
+
+    let only = matches.next()?;
+    if matches.next().is_some() {
+        return None;
+    }
+
+    Some(only.id().to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{Channel, VoiceInformation};
+
+    // Braces in string needles are written as escapes: the voice suite's
+    // `strip_test_items` brace-matches this module out of its workspace scan.
+    const SOURCE: &str = include_str!("scripts.rs");
+    const OPEN: char = '\u{7b}';
+    const CLOSE: char = '\u{7d}';
+
+    fn channel(id: &str, server: &str, name: &str, voice: Option<VoiceInformation>) -> Channel {
+        Channel::TextChannel {
+            id: id.to_string(),
+            server: server.to_string(),
+            name: name.to_string(),
+            description: None,
+            icon: None,
+            last_message_id: None,
+            default_permissions: None,
+            role_permissions: HashMap::new(),
+            nsfw: false,
+            spoiler: false,
+            voice,
+            slowmode: None,
+            announcement: None,
+        }
+    }
+
+    fn voice(id: &str, name: &str) -> Channel {
+        channel(id, "S", name, Some(VoiceInformation::default()))
+    }
+
+    /// Everything above this test module: the shipping source.
+    fn shipping() -> &'static str {
+        let end = SOURCE
+            .find("#[cfg(test)]")
+            .expect("the test module attribute");
+        &SOURCE[..end]
+    }
+
+    /// Text from the brace at `open` through its matching close.
+    fn braced(text: &str, open: usize) -> &str {
+        let mut depth = 0i64;
+        for (i, ch) in text[open..].char_indices() {
+            if ch == OPEN {
+                depth += 1;
+            } else if ch == CLOSE {
+                depth -= 1;
+                if depth == 0 {
+                    return &text[open..=open + i];
+                }
+            }
+        }
+        panic!("unbalanced braces from byte {open}");
+    }
+
+    /// The `if revision <= 70` block of `run_migrations`.
+    fn backfill_block() -> &'static str {
+        let needle = format!("if revision <= 70 {OPEN}");
+        let at = shipping()
+            .find(&needle)
+            .expect("the revision 70 migration block");
+        braced(shipping(), at + needle.len() - 1)
+    }
+
+    /// The body of `afk_backfill_designation`.
+    fn designation_fn() -> &'static str {
+        let at = shipping()
+            .find("fn afk_backfill_designation(")
+            .expect("the selection fn");
+        let open = at + shipping()[at..].find(OPEN).expect("its body");
+        braced(shipping(), open)
+    }
+
+    #[test]
+    fn upper_case_afk_is_designated() {
+        let channels = [voice("A", "AFK"), voice("B", "General")];
+        assert_eq!(
+            afk_backfill_designation("S", false, &channels).as_deref(),
+            Some("A")
+        );
+    }
+
+    #[test]
+    fn lower_case_afk_is_designated() {
+        let channels = [voice("B", "General"), voice("A", "afk")];
+        assert_eq!(
+            afk_backfill_designation("S", false, &channels).as_deref(),
+            Some("A")
+        );
+    }
+
+    #[test]
+    fn kelvin_sign_lower_cases_to_afk_as_it_did_in_the_client() {
+        // U+212A lower-cases to "k" under both JS `toLowerCase` and Rust
+        // `to_lowercase`, so the old client matched this name too.
+        let channels = [voice("A", "AF\u{212A}")];
+        assert_eq!(
+            afk_backfill_designation("S", false, &channels).as_deref(),
+            Some("A")
+        );
+    }
+
+    #[test]
+    fn names_that_only_contain_afk_are_not_matched() {
+        let channels = [
+            voice("A", " afk"),
+            voice("B", "afk-room"),
+            voice("C", "AFK 2"),
+        ];
+        assert_eq!(afk_backfill_designation("S", false, &channels), None);
+    }
+
+    #[test]
+    fn two_matches_designate_nothing() {
+        let channels = [voice("A", "afk"), voice("B", "AFK")];
+        assert_eq!(afk_backfill_designation("S", false, &channels), None);
+    }
+
+    #[test]
+    fn a_text_channel_named_afk_is_not_designated() {
+        let channels = [channel("A", "S", "afk", None)];
+        assert_eq!(afk_backfill_designation("S", false, &channels), None);
+    }
+
+    #[test]
+    fn a_voice_channel_with_voice_disabled_is_not_designated() {
+        let disabled = VoiceInformation {
+            max_users: None,
+            disabled: true,
+        };
+        let channels = [channel("A", "S", "afk", Some(disabled))];
+        assert_eq!(afk_backfill_designation("S", false, &channels), None);
+    }
+
+    #[test]
+    fn a_disabled_afk_channel_does_not_make_an_enabled_one_ambiguous() {
+        let disabled = VoiceInformation {
+            max_users: None,
+            disabled: true,
+        };
+        let channels = [channel("A", "S", "afk", Some(disabled)), voice("B", "AFK")];
+        assert_eq!(
+            afk_backfill_designation("S", false, &channels).as_deref(),
+            Some("B")
+        );
+    }
+
+    #[test]
+    fn another_servers_channel_is_not_designated() {
+        let channels = [channel("A", "T", "afk", Some(VoiceInformation::default()))];
+        assert_eq!(afk_backfill_designation("S", false, &channels), None);
+    }
+
+    #[test]
+    fn an_already_designated_server_is_untouched() {
+        let channels = [voice("A", "afk")];
+        assert_eq!(afk_backfill_designation("S", true, &channels), None);
+    }
+
+    #[test]
+    fn latest_revision_is_71() {
+        assert_eq!(LATEST_REVISION, 71, "the AFK backfill is revision 70");
+    }
+
+    #[test]
+    fn backfill_is_the_last_migration_and_guarded_by_revision_70() {
+        let guards: Vec<i32> = shipping()
+            .match_indices("if revision <= ")
+            .map(|(at, needle)| {
+                let digits: String = shipping()[at + needle.len()..]
+                    .chars()
+                    .take_while(char::is_ascii_digit)
+                    .collect();
+                digits.parse().expect("a numeric revision guard")
+            })
+            .collect();
+        assert_eq!(
+            guards.iter().filter(|guard| **guard == 70).count(),
+            1,
+            "exactly one `if revision <= 70` block"
+        );
+        assert_eq!(
+            guards.iter().max(),
+            Some(&(LATEST_REVISION - 1)),
+            "LATEST_REVISION MUST BE +1 to the last migration"
+        );
+        assert!(
+            backfill_block().contains("afk_backfill_designation("),
+            "the migration must select through the tested pure fn"
+        );
+    }
+
+    #[test]
+    fn backfill_update_never_overwrites_a_designation() {
+        let block: String = backfill_block()
+            .chars()
+            .filter(|ch| !ch.is_whitespace())
+            .collect();
+        assert_eq!(block.matches(".update_one(").count(), 1, "one write");
+        let at = block.find(".update_one(").expect("the write");
+        let open = at + block[at..].find(OPEN).expect("the update filter");
+        let filter = braced(&block, open);
+        let guard = format!("\"afk_channel_id\":{OPEN}\"$exists\":false{CLOSE}");
+        assert!(
+            filter.contains(&guard),
+            "the update filter must require afk_channel_id not to exist: {filter}"
+        );
+        let update = &block[open + filter.len()..];
+        let set = format!("\"$set\":{OPEN}\"afk_channel_id\":");
+        assert!(update.contains(&set), "$set on afk_channel_id: {update}");
+    }
+
+    #[test]
+    fn backfill_never_mentions_the_timeout() {
+        assert!(
+            !backfill_block().contains("afk_timeout"),
+            "the backfill must never set afk_timeout"
+        );
+        assert!(
+            !designation_fn().contains("afk_timeout"),
+            "the selection must never read or set afk_timeout"
+        );
+    }
+
+    #[test]
+    fn backfill_never_deletes() {
+        for needle in [
+            "$unset",
+            "delete_",
+            "drop",
+            "$pull",
+            "update_many",
+            "replace_one",
+        ] {
+            assert!(
+                !backfill_block().contains(needle),
+                "the backfill must only $set one field; found {needle}"
+            );
+        }
+    }
 }

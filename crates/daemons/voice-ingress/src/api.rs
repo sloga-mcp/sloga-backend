@@ -6,8 +6,8 @@ use revolt_database::{
     util::reference::Reference,
     voice::{
         clear_voice_participant_identities, create_voice_state, delete_channel_voice_state,
-        delete_voice_state, delete_voice_participant_identity, get_user_moved_from_voice,
-        get_user_moved_to_voice, get_user_voice_channels, get_voice_channel_members,
+        delete_voice_state, delete_voice_participant_identity, get_user_moved_to_voice,
+        get_user_voice_channels, get_voice_channel_members,
         get_screen_leg_sid, get_voice_state, is_screen_leg, is_screenshare_video, is_video_source,
         mls_cap_would_refuse, record_screen_leg, screen_leg_identity, screen_leg_left,
         set_voice_participant_identity,
@@ -408,17 +408,18 @@ pub async fn ingress(
                 delete_voice_participant_identity(channel_id, user_id).await?;
                 // Drain any pending move marker for THIS channel so a rejoin
                 // within its TTL isn't mis-announced as a VoiceChannelMove from
-                // the old channel (the moved_from marker belongs to the old
-                // channel's participant_left, so it is left untouched).
+                // the old channel.
                 let _ = get_user_moved_to_voice(channel_id, user_id).await;
                 return Ok(EmptyResponse);
             }
 
-            // Only publish one event when a user is moved from one channel to another.
-            if let Some(moved_from) = get_user_moved_to_voice(channel_id, user_id).await? {
+            // A join the voice move marked is announced as a move from the
+            // source. The source's Leave has already gone out on its own
+            // (see `participant_left`), and a Move after it is harmless.
+            if let Some(source_channel) = get_user_moved_to_voice(channel_id, user_id).await? {
                 EventV1::VoiceChannelMove {
                     user: user_id.to_string(),
-                    from: moved_from.id,
+                    from: source_channel.id,
                     to: channel_id.to_string(),
                     state: voice_state,
                 }
@@ -560,18 +561,21 @@ pub async fn ingress(
                 }
             }
 
-            // Dont send leave event when a user is moved
-            if get_user_moved_from_voice(channel_id, user_id)
-                .await?
-                .is_none()
-            {
-                EventV1::VoiceChannelLeave {
-                    id: channel_id.clone(),
-                    user: user_id.clone(),
-                }
-                .p(channel_id.clone())
-                .await;
-            };
+            // Published on EVERY leave, a voice move's included (Wave 5b-2
+            // M4-b). A move used to suppress this and leave the destination's
+            // Move event to take the user off the source roster, so when no
+            // destination join followed (a dropped event, a refused connect,
+            // a session that never redeemed its token) every other client
+            // kept a ghost in the source channel. Redis was already right;
+            // only the event was missing. The cost is a brief Leave-then-Move
+            // on the other clients' rosters (stoat.js applies a Leave per
+            // channel, and a Move after it is idempotent: Wave 5b-2 Stage 2).
+            EventV1::VoiceChannelLeave {
+                id: channel_id.clone(),
+                user: user_id.clone(),
+            }
+            .p(channel_id.clone())
+            .await;
 
             // See above for why this is commented out
 
@@ -864,4 +868,89 @@ pub async fn ingress(
     };
 
     Ok(EmptyResponse)
+}
+
+#[cfg(test)]
+mod tests {
+    /// This file as it ships: everything above its test module.
+    fn shipping() -> &'static str {
+        const SOURCE: &str = include_str!("api.rs");
+        let tests_at = SOURCE
+            .find("#[cfg(test)]\nmod tests")
+            .expect("api.rs has a test module");
+        &SOURCE[..tests_at]
+    }
+
+    /// M4-b (Wave 5b-2): the MEMBER `participant_left` arm publishes its
+    /// `VoiceChannelLeave` unconditionally — at the arm's own brace depth,
+    /// inside no `if`, `match` or loop, with no early `return` ahead of it.
+    /// Mutation this catches: the Leave put back under any conditional (the
+    /// old `moved_from` check, or any other), which compiles and ships green
+    /// and brings back the ghost a move left on every other client's roster
+    /// when no destination join followed. The `?`s ahead of it (the teardown
+    /// and the member read) are unchanged: a failed teardown still answers
+    /// 500 and LiveKit retries the webhook.
+    #[test]
+    fn a_member_leave_is_always_published() {
+        let shipping = shipping();
+        assert!(
+            !shipping.contains("moved_from"),
+            "the moved_from marker is back in the ingress"
+        );
+
+        // The member arm is the LAST `"participant_left" =>` in the file; the
+        // first belongs to the screen-leg branch, which publishes no Leave.
+        let arm = shipping
+            .rfind("\"participant_left\" => \u{7b}")
+            .expect("the member participant_left arm");
+        let open = arm + shipping[arm..].find('\u{7b}').unwrap();
+        let mut depth = 0i64;
+        let mut body_end = None;
+        for (i, ch) in shipping[open..].char_indices() {
+            match ch {
+                '\u{7b}' => depth += 1,
+                '\u{7d}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        body_end = Some(open + i);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let body: String = shipping[open + 1..body_end.expect("a closed arm")]
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let leave = body
+            .find("EventV1::VoiceChannelLeave")
+            .expect("the member arm must publish a VoiceChannelLeave");
+        let before = &body[..leave];
+        let opened = before.matches('\u{7b}').count();
+        let closed = before.matches('\u{7d}').count();
+        assert_eq!(
+            opened, closed,
+            "the Leave must be published at the arm's own depth, under no \
+             conditional: {body}"
+        );
+        assert!(
+            !before.contains("return"),
+            "nothing before the Leave may return early and skip it: {body}"
+        );
+
+        let flat = body[leave..]
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            flat.starts_with(
+                "EventV1::VoiceChannelLeave \u{7b} id: channel_id.clone(), \
+                 user: user_id.clone(), \u{7d} .p(channel_id.clone()) .await;"
+            ),
+            "the Leave must be published to the channel it names: {flat}"
+        );
+    }
 }
