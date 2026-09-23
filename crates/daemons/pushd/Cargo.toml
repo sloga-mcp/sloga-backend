@@ -21,7 +21,7 @@ web-push = { workspace = true }
 isahc = { workspace = true, features = ["json"] }
 revolt_a2 = { workspace = true, features = ["ring"] }
 redis-kiss = { workspace = true, default-features = false, features = ["tokio-runtime"] }
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["net"] }
 async-trait = { workspace = true }
 ulid = { workspace = true }
 

@@ -5,7 +5,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use lapin::{message::Delivery, Channel, Connection};
 use log::debug;
-use revolt_database::{events::rabbit::*, Database};
+use revolt_database::{events::rabbit::*, Database, PushSubscriptionKind};
 
 #[derive(Clone)]
 #[allow(unused)]
@@ -62,16 +62,23 @@ impl Consumer for MessageConsumer {
                         extras: HashMap::new(),
                     };
 
-                    let routing_key = match sub.endpoint.as_str() {
-                        "apn" => &config.pushd.apn.queue,
-                        "fcm" => &config.pushd.fcm.queue,
-                        endpoint => {
-                            sendable.extras.insert("p256dh".to_string(), sub.p256dh);
-                            sendable
-                                .extras
-                                .insert("endpoint".to_string(), endpoint.to_string());
+                    let routing_key = if sub.kind == Some(PushSubscriptionKind::UnifiedPush) {
+                        sendable.extras.insert("p256dh".to_string(), sub.p256dh);
+                        sendable.extras.insert("endpoint".to_string(), sub.endpoint);
 
-                            &config.pushd.vapid.queue
+                        &config.pushd.unifiedpush.queue
+                    } else {
+                        match sub.endpoint.as_str() {
+                            "apn" => &config.pushd.apn.queue,
+                            "fcm" => &config.pushd.fcm.queue,
+                            endpoint => {
+                                sendable.extras.insert("p256dh".to_string(), sub.p256dh);
+                                sendable
+                                    .extras
+                                    .insert("endpoint".to_string(), endpoint.to_string());
+
+                                &config.pushd.vapid.queue
+                            }
                         }
                     };
 

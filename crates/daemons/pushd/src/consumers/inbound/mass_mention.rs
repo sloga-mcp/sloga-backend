@@ -10,7 +10,7 @@ use async_trait::async_trait;
 use lapin::{message::Delivery, Channel, Connection};
 use revolt_database::{
     events::rabbit::*, util::bulk_permissions::BulkDatabasePermissionQuery, Database, Member,
-    MessageFlagsValue,
+    MessageFlagsValue, PushSubscriptionKind,
 };
 use revolt_models::v0::{MessageFlags, PushNotification};
 use revolt_result::ToRevoltError;
@@ -45,16 +45,23 @@ impl MassMessageConsumer {
                         extras: HashMap::new(),
                     };
 
-                    let routing_key = match sub.endpoint.as_str() {
-                        "apn" => &config.pushd.apn.queue,
-                        "fcm" => &config.pushd.fcm.queue,
-                        endpoint => {
-                            sendable.extras.insert("p256dh".to_string(), sub.p256dh);
-                            sendable
-                                .extras
-                                .insert("endpoint".to_string(), endpoint.to_string());
+                    let routing_key = if sub.kind == Some(PushSubscriptionKind::UnifiedPush) {
+                        sendable.extras.insert("p256dh".to_string(), sub.p256dh);
+                        sendable.extras.insert("endpoint".to_string(), sub.endpoint);
 
-                            &config.pushd.vapid.queue
+                        &config.pushd.unifiedpush.queue
+                    } else {
+                        match sub.endpoint.as_str() {
+                            "apn" => &config.pushd.apn.queue,
+                            "fcm" => &config.pushd.fcm.queue,
+                            endpoint => {
+                                sendable.extras.insert("p256dh".to_string(), sub.p256dh);
+                                sendable
+                                    .extras
+                                    .insert("endpoint".to_string(), endpoint.to_string());
+
+                                &config.pushd.vapid.queue
+                            }
                         }
                     };
 

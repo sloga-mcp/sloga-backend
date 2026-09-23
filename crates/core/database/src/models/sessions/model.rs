@@ -41,6 +41,17 @@ auto_derived!(
         pub endpoint: String,
         pub p256dh: String,
         pub auth: String,
+
+        /// Delivery mechanism, absent for browser Web Push subscriptions
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub kind: Option<PushSubscriptionKind>,
+    }
+
+    /// Push subscription delivery mechanism
+    #[serde(rename_all = "lowercase")]
+    pub enum PushSubscriptionKind {
+        /// UnifiedPush distributor endpoint
+        UnifiedPush,
     }
 );
 
@@ -68,5 +79,36 @@ impl Session {
         .await;
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{PushSubscriptionKind, WebPushSubscription};
+
+    #[test]
+    fn subscription_without_kind_loads_and_saves_without_kind() {
+        let sub: WebPushSubscription =
+            serde_json::from_str(r#"{"endpoint":"e","p256dh":"p","auth":"a"}"#).unwrap();
+        assert_eq!(sub.kind, None);
+
+        let value = serde_json::to_value(&sub).unwrap();
+        assert!(value.get("kind").is_none());
+    }
+
+    #[test]
+    fn unifiedpush_kind_round_trips_as_lowercase() {
+        let sub = WebPushSubscription {
+            endpoint: "e".to_string(),
+            p256dh: "p".to_string(),
+            auth: "a".to_string(),
+            kind: Some(PushSubscriptionKind::UnifiedPush),
+        };
+
+        let value = serde_json::to_value(&sub).unwrap();
+        assert_eq!(value["kind"], "unifiedpush");
+
+        let back: WebPushSubscription = serde_json::from_value(value).unwrap();
+        assert_eq!(back, sub);
     }
 }

@@ -2146,6 +2146,7 @@ impl From<crate::WebPushSubscription> for WebPushSubscription {
             endpoint: value.endpoint,
             p256dh: value.p256dh,
             auth: value.auth,
+            kind: value.kind.map(Into::into),
         }
     }
 }
@@ -2156,6 +2157,23 @@ impl From<WebPushSubscription> for crate::WebPushSubscription {
             endpoint: value.endpoint,
             p256dh: value.p256dh,
             auth: value.auth,
+            kind: value.kind.map(Into::into),
+        }
+    }
+}
+
+impl From<crate::PushSubscriptionKind> for PushSubscriptionKind {
+    fn from(value: crate::PushSubscriptionKind) -> Self {
+        match value {
+            crate::PushSubscriptionKind::UnifiedPush => PushSubscriptionKind::UnifiedPush,
+        }
+    }
+}
+
+impl From<PushSubscriptionKind> for crate::PushSubscriptionKind {
+    fn from(value: PushSubscriptionKind) -> Self {
+        match value {
+            PushSubscriptionKind::UnifiedPush => crate::PushSubscriptionKind::UnifiedPush,
         }
     }
 }
