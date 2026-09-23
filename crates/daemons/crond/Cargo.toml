@@ -37,10 +37,13 @@ serde = { workspace = true }
 iso8601-timestamp = { workspace = true, features = ["serde", "bson"] }
 
 # Core
-# Scheduled-message delivery runs Message::create_from_api with FULL live
-# side-effects — the "tasks" feature (push/ack/embed queues) and "mongodb"
-# are default features today, but are spelled out so a future
-# default-features change cannot silently degrade scheduled sends.
+# `tasks` compiles the enqueue calls in `Message::send` (last_message_id /
+# mention+push / embed queues). The queues are process-local statics; the side
+# effects happen only because `main.rs` starts
+# `revolt_database::tasks::start_workers` in this same process. Removing either
+# the feature or that call silently drops them. "tasks" and "mongodb" are
+# default features today but are spelled out so a future default-features
+# change cannot silently degrade crond.
 #
 # "voice" is required by `stream_live` and `prune_remote_control_grants`, both
 # of which import `revolt_database::voice`. It used to be absent and the crate
