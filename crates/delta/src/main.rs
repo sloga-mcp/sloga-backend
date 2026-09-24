@@ -101,11 +101,17 @@ pub async fn web() -> Rocket<Build> {
         })
 }
 
-#[launch]
-async fn rocket() -> _ {
-    // Configure logging and environment
+#[rocket::main]
+async fn main() -> Result<(), rocket::Error> {
+    // Configure logging and environment. The Sentry guard this binds must
+    // outlive launch(), so it has to live in main rather than a #[launch] fn.
     revolt_config::configure!(api);
 
     // Start web server
-    web().await
+    if let Err(error) = web().await.launch().await {
+        error.pretty_print();
+        return Err(error);
+    }
+
+    Ok(())
 }
