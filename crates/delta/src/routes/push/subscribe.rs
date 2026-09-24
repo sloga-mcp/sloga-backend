@@ -45,6 +45,19 @@ fn validate_unifiedpush(data: &v0::WebPushSubscription) -> Result<()> {
         }));
     }
 
+    // Printable ASCII only, checked before parsing: the URL parser drops
+    // tabs and encodes spaces, controls and non-ASCII hosts, so the stored
+    // string could otherwise differ from what pushd's HTTP client sees.
+    if !data
+        .endpoint
+        .bytes()
+        .all(|byte| matches!(byte, 0x21..=0x7E))
+    {
+        return Err(create_error!(FailedValidation {
+            error: "endpoint must be printable ASCII without spaces".to_string()
+        }));
+    }
+
     let endpoint = url::Url::parse(&data.endpoint).map_err(|_| {
         create_error!(FailedValidation {
             error: "endpoint must be a valid URL".to_string()
@@ -238,7 +251,39 @@ mod tests {
     #[test]
     fn rejects_unparseable_endpoint() {
         assert_rejected(&v0::WebPushSubscription {
-            endpoint: "not a url".to_string(),
+            endpoint: "not-a-url".to_string(),
+            ..valid()
+        });
+    }
+
+    #[test]
+    fn rejects_endpoint_with_space() {
+        assert_rejected(&v0::WebPushSubscription {
+            endpoint: "https://push.example.com/U P?token=abc".to_string(),
+            ..valid()
+        });
+    }
+
+    #[test]
+    fn rejects_endpoint_with_tab() {
+        assert_rejected(&v0::WebPushSubscription {
+            endpoint: "https://push.example.com/U\tP?token=abc".to_string(),
+            ..valid()
+        });
+    }
+
+    #[test]
+    fn rejects_endpoint_with_delete_control() {
+        assert_rejected(&v0::WebPushSubscription {
+            endpoint: "https://push.example.com/U\u{7f}P?token=abc".to_string(),
+            ..valid()
+        });
+    }
+
+    #[test]
+    fn rejects_endpoint_with_non_ascii_host() {
+        assert_rejected(&v0::WebPushSubscription {
+            endpoint: "https://ex\u{e4}mple.com/x".to_string(),
             ..valid()
         });
     }

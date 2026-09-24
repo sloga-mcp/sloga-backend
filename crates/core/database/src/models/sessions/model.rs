@@ -112,3 +112,58 @@ mod tests {
         assert_eq!(back, sub);
     }
 }
+
+#[cfg(all(test, feature = "mongodb"))]
+mod bson_tests {
+    use bson::{from_document, from_slice, to_document, to_vec, Document};
+
+    use super::{PushSubscriptionKind, WebPushSubscription};
+
+    fn subscription(kind: Option<PushSubscriptionKind>) -> WebPushSubscription {
+        WebPushSubscription {
+            endpoint: "e".to_string(),
+            p256dh: "p".to_string(),
+            auth: "a".to_string(),
+            kind,
+        }
+    }
+
+    /// Decode as a `Document` and as the raw bytes a MongoDB cursor reads
+    fn decode(document: Document) -> WebPushSubscription {
+        let bytes = to_vec(&document).unwrap();
+        let raw: WebPushSubscription = from_slice(&bytes).unwrap();
+
+        let decoded: WebPushSubscription = from_document(document).unwrap();
+        assert_eq!(raw, decoded);
+        decoded
+    }
+
+    #[test]
+    fn unifiedpush_kind_round_trips_through_bson() {
+        let sub = subscription(Some(PushSubscriptionKind::UnifiedPush));
+
+        let document = to_document(&sub).unwrap();
+        assert_eq!(document.get_str("kind"), Ok("unifiedpush"));
+        assert_eq!(decode(document), sub);
+    }
+
+    #[test]
+    fn browser_subscription_has_no_kind_key_in_bson() {
+        let sub = subscription(None);
+
+        let document = to_document(&sub).unwrap();
+        assert!(!document.contains_key("kind"));
+        assert_eq!(decode(document), sub);
+    }
+
+    #[test]
+    fn stored_subscription_without_kind_loads_from_bson() {
+        let document = doc! {
+            "endpoint": "e",
+            "p256dh": "p",
+            "auth": "a"
+        };
+
+        assert_eq!(decode(document), subscription(None));
+    }
+}
