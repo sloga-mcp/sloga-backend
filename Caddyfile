@@ -73,6 +73,14 @@
         rewrite * /brazil
         reverse_proxy 127.0.0.1:8500
     }
+    @lk_webhook_singapore {
+        path /voice-ingress/singapore
+        header CF-Connecting-IP 45.32.115.231
+    }
+    handle @lk_webhook_singapore {
+        rewrite * /singapore
+        reverse_proxy 127.0.0.1:8500
+    }
     handle /voice-ingress/* {
         respond 403
     }
@@ -247,10 +255,12 @@ http://sloga.gg {
         }
     }
     header @dl Cache-Control "no-store"
-    redir /dl/windows       "https://app.sloga.gg/updates/desktop/Sloga_0.57.0_x64-setup.exe" 302
-    redir /dl/linux-deb     "https://app.sloga.gg/updates/desktop-linux/Sloga-0.58.0-linux-amd64.deb" 302
-    redir /dl/linux-appimage "https://app.sloga.gg/updates/desktop-linux/Sloga-0.58.0-linux-x86_64.AppImage" 302
-    redir /dl/android       "https://app.sloga.gg/updates/android/sloga-0.57.0.apk" 302
+    redir /dl/windows       "https://app.sloga.gg/updates/desktop/Sloga_0.62.0_x64-setup.exe" 302
+    redir /dl/linux-deb     "https://app.sloga.gg/updates/desktop-linux/Sloga-0.62.0-linux-amd64.deb" 302
+    redir /dl/linux-appimage "https://app.sloga.gg/updates/desktop-linux/Sloga-0.62.0-linux-x86_64.AppImage" 302
+    redir /dl/android       "https://app.sloga.gg/updates/android/sloga-0.62.0.apk" 302
+    redir /dl/macos-apple-silicon "https://app.sloga.gg/updates/desktop-macos/Sloga-0.62.0-macos-arm64.dmg" 302
+    redir /dl/macos-intel   "https://app.sloga.gg/updates/desktop-macos/Sloga-0.62.0-macos-x64.dmg" 302
 
     # Short, stable URL for the account-deletion page. Google Play requires a web
     # URL where a user can request account + data deletion without reinstalling
