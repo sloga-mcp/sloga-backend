@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     fmt::{Display, Write},
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -31,7 +32,10 @@ pub mod annotations;
 pub mod remote_control;
 pub mod watch;
 mod voice_client;
-pub use voice_client::{screen_leg_participant_permissions, VoiceClient};
+pub use voice_client::{
+    screen_leg_participant_permissions, VoiceClient, MOVE_TOKEN_TTL, SFU_BREAKER_WINDOW,
+    SFU_CALL_TIMEOUT,
+};
 
 async fn get_connection() -> Result<Conn> {
     _get_connection()
@@ -748,11 +752,13 @@ pub async fn create_voice_state(
 }
 
 /// Lua source of [`DELETE_VOICE_STATE`]: the WHOLE of one user's voice-state
-/// teardown in one channel, as one atomic step.
+/// teardown in one channel, as one atomic step — or, in the per-connection
+/// mode, the decision whether this departure tears anything down at all.
 ///
-/// Argument layout. [`voice_state_teardown_input`] builds it and nothing else
-/// does, so the two change together or not at all (both are pinned by value
-/// in the tests):
+/// Argument layout. [`voice_state_teardown_input`] builds it (whole-user
+/// mode) and [`voice_connection_teardown_input`] derives the per-connection
+/// form from it; nothing else does, so they change together or not at all
+/// (all are pinned by value in the tests):
 ///
 /// - `KEYS[1]`: the per-server pointer `{user}:{parent}`. Its value is the id
 ///   of the channel the user's per-server state belongs to.
@@ -761,23 +767,116 @@ pub async fn create_voice_state(
 /// - `KEYS[4]`: `vc_leg:{channel}`, a hash keyed by user id.
 /// - `KEYS[5]`: `voice_identity:{channel}`, a hash keyed by user id.
 /// - `KEYS[6]`: `annotations_allow:{channel}:{user}`, deleted whole.
-/// - `KEYS[7..]`: the nine per-server flags keyed by the pointer
+/// - `KEYS[7]`: `vc_conns:{channel}`, the connection record: a hash of
+///   LiveKit participant sid -> full identity, shared by EVERY user of the
+///   channel (see [`voice_connections_key`]). Never deleted whole here.
+/// - `KEYS[8..]`: the nine per-server flags keyed by the pointer
 ///   (`joined_at:`, `is_publishing:`, `is_receiving:`, `screensharing:`,
 ///   `camera:`, `screen_video:`, `recording:`, `rc_capable:`, `watching:`).
 /// - `ARGV[1]`: the id of the channel being left, compared with the pointer.
 /// - `ARGV[2]`: the user id. It is the member removed from `KEYS[2]` and the
-///   field removed from `KEYS[4]` and `KEYS[5]`.
+///   field removed from `KEYS[4]` and `KEYS[5]`, and it decides which entries
+///   of `KEYS[7]` are this user's: a value equal to it, or starting with it
+///   and `:` (a device-qualified identity). Never a bare prefix, so user `u`
+///   never owns `uu:B`.
 /// - `ARGV[3]`: this channel as `vc:{user}` stores it, which is
 ///   `UserVoiceChannel`'s `Display`: the channel id, then `-` and the server
 ///   id when there is one.
+/// - `ARGV[4]`: the MODE, `user`, `connection` or `connections`. Anything
+///   else is an error reply with nothing touched, so a wiring slip fails
+///   closed instead of silently picking a teardown.
+/// - `ARGV[5]`: `connection` mode, the departing connection's sid, and
+///   EXACTLY that one argument: any other ARGV count in `connection` mode is
+///   an error reply with nothing touched.
+/// - `ARGV[5..]`: `connections` mode (S-3 WA-R), the sids to remove, zero or
+///   more, in any order. A duplicate is harmless (the second HGET finds
+///   nothing).
 ///
-/// `KEYS[2]` to `KEYS[6]` are PER-CHANNEL and always go. `KEYS[1]` and
-/// `KEYS[7..]` are PER-SERVER and go UNLESS the pointer names a DIFFERENT
-/// channel. A missing pointer reads as Lua `false` and falls through to the
-/// delete: with no pointer there is nothing newer to protect, and the flags
-/// are orphans. Returns 1 when the per-server state was deleted, 0 when it
-/// was kept.
+/// The mode decides only what happens to `KEYS[7]` before the teardown:
+///
+/// - `user` (reconcile of a dead node, legacy paths with no listing, roster
+///   repair): EVERY entry of this user is HDELed FIRST, and then the teardown
+///   runs. There is no survivor branch in this mode at all (S-3 P2-10): a
+///   whole-user removal that could answer "a sibling is still here" would
+///   leave exactly the connection the caller is removing. It also erases a
+///   sibling that recorded after the caller last looked at the SFU (S-3
+///   WA-1), which is why every teardown that decides from an SFU listing
+///   uses `connections` mode instead.
+/// - `connection` (one LiveKit participant left): its sid is HDELed if its
+///   recorded identity belongs to this user. A sid recorded as ANOTHER
+///   user's is an error reply BEFORE any write (S-3 WA-6), not a silent
+///   delete of someone else's entry. A sid with no record is a no-op. Then
+///   the survivor scan: if ANOTHER entry of this user is still recorded, the
+///   mapping `KEYS[5]` is re-pointed at that identity and the script returns
+///   2 with NOTHING torn down. Only when none is left does the teardown run.
+///   A channel with no record at all (connections that joined before the
+///   record existed) finds no survivor and tears down exactly as before.
+/// - `connections` (S-3 WA-R: a teardown that decided from an SFU listing):
+///   each given sid is HDELed ONLY if its recorded identity belongs to this
+///   user. A sid recorded as another user's is skipped and counted as
+///   FOREIGN, a sid with no record is skipped and counted as UNKNOWN. Then
+///   the SAME survivor scan as `connection` mode, so a sibling recorded after
+///   the caller's listing keeps the state. With no sids at all it is a pure
+///   survivor check: 2 when the user has any recorded entry, else the
+///   teardown.
+///
+/// The teardown: `KEYS[2]` to `KEYS[6]` are PER-CHANNEL and always go.
+/// `KEYS[1]` and `KEYS[8..]` are PER-SERVER and go UNLESS the pointer names a
+/// DIFFERENT channel. A missing pointer reads as Lua `false` and falls
+/// through to the delete: with no pointer there is nothing newer to protect,
+/// and the flags are orphans.
+///
+/// Returns, in `user` and `connection` mode, an integer: 1 when the
+/// per-server state was deleted, 0 when it was kept, 2 (connection mode
+/// only) when a sibling connection survives and nothing was torn down. In
+/// `connections` mode the same code comes back as the first element of a
+/// three-integer array `{code, foreign, unknown}`, the two skip counts for
+/// the caller's log line.
 const DELETE_VOICE_STATE_LUA: &str = r"
+local prefix = ARGV[2] .. ':'
+local foreign = 0
+local unknown = 0
+local function answer(code)
+    if ARGV[4] == 'connections' then
+        return {code, foreign, unknown}
+    end
+    return code
+end
+if ARGV[4] == 'connection' and #ARGV ~= 5 then
+    return redis.error_reply('ERR voice state teardown: connection mode takes one sid')
+end
+if ARGV[4] == 'connection' or ARGV[4] == 'connections' then
+    for i = 5, #ARGV do
+        local identity = redis.call('HGET', KEYS[7], ARGV[i])
+        if not identity then
+            unknown = unknown + 1
+        elseif identity == ARGV[2] or string.sub(identity, 1, #prefix) == prefix then
+            redis.call('HDEL', KEYS[7], ARGV[i])
+        elseif ARGV[4] == 'connection' then
+            return redis.error_reply('ERR voice state teardown: foreign connection')
+        else
+            foreign = foreign + 1
+        end
+    end
+    local identities = redis.call('HVALS', KEYS[7])
+    for i = 1, #identities do
+        local identity = identities[i]
+        if identity == ARGV[2] or string.sub(identity, 1, #prefix) == prefix then
+            redis.call('HSET', KEYS[5], ARGV[2], identity)
+            return answer(2)
+        end
+    end
+elseif ARGV[4] == 'user' then
+    local entries = redis.call('HGETALL', KEYS[7])
+    for i = 1, #entries, 2 do
+        local identity = entries[i + 1]
+        if identity == ARGV[2] or string.sub(identity, 1, #prefix) == prefix then
+            redis.call('HDEL', KEYS[7], entries[i])
+        end
+    end
+else
+    return redis.error_reply('ERR voice state teardown: bad mode')
+end
 redis.call('SREM', KEYS[2], ARGV[2])
 redis.call('SREM', KEYS[3], ARGV[3])
 redis.call('HDEL', KEYS[4], ARGV[2])
@@ -785,10 +884,10 @@ redis.call('HDEL', KEYS[5], ARGV[2])
 redis.call('DEL', KEYS[6])
 local pointer = redis.call('GET', KEYS[1])
 if pointer and pointer ~= ARGV[1] then
-    return 0
+    return answer(0)
 end
-redis.call('DEL', KEYS[1], unpack(KEYS, 7))
-return 1
+redis.call('DEL', KEYS[1], unpack(KEYS, 8))
+return answer(1)
 ";
 
 /// [`delete_voice_state`]'s Redis work, as one compare-and-delete script.
@@ -817,7 +916,7 @@ return 1
 ///
 /// Every key goes in `KEYS[]`, none is built inside the script — the Redis
 /// contract for scripts. That is NOT enough for Redis Cluster, and nothing
-/// here makes it enough: the 15 keys carry no shared hash tag, so they span
+/// here makes it enough: the 16 keys carry no shared hash tag, so they span
 /// hash slots, and a Cluster rejects every invocation with CROSSSLOT before
 /// the script runs. [`delete_voice_state`] then takes its fallback on EVERY
 /// leave, and the late-leave race this script exists to close (Wave 5b-1
@@ -908,7 +1007,11 @@ fn voice_state_teardown_input(
             // outlive the call it was granted in (rev-3 review). Keyed by THIS
             // channel, so it is per-channel, not per-server.
             format!("annotations_allow:{}:{}", &channel.id, user_id),
-            // KEYS[7..]: per-server, deleted with the pointer.
+            // KEYS[7]: the connection record. Per-channel and SHARED by every
+            // user in the call, so the script only ever removes this user's
+            // entries from it, never the key (S-3 D-1).
+            voice_connections_key(channel),
+            // KEYS[8..]: per-server, deleted with the pointer.
             format!("joined_at:{unique_key}"),
             format!("is_publishing:{unique_key}"),
             format!("is_receiving:{unique_key}"),
@@ -932,8 +1035,77 @@ fn voice_state_teardown_input(
             // ARGV[3]: the member in KEYS[3], written exactly as
             // `create_voice_state`'s `sadd` writes it.
             channel.to_string(),
+            // ARGV[4]: whole-user mode. Every entry of this user leaves the
+            // connection record first, and no sibling can keep the state.
+            TEARDOWN_MODE_USER.to_string(),
         ],
     }
+}
+
+/// `ARGV[4]` of a whole-user [`DELETE_VOICE_STATE`] invocation.
+const TEARDOWN_MODE_USER: &str = "user";
+
+/// `ARGV[4]` of a per-connection [`DELETE_VOICE_STATE`] invocation.
+const TEARDOWN_MODE_CONNECTION: &str = "connection";
+
+/// `ARGV[4]` of a set-mode [`DELETE_VOICE_STATE`] invocation (S-3 WA-R).
+const TEARDOWN_MODE_CONNECTIONS: &str = "connections";
+
+/// What [`DELETE_VOICE_STATE`] returns in connection mode (and as the first
+/// element in set mode) when another connection of the user is still
+/// recorded and nothing was torn down.
+const TEARDOWN_SURVIVOR: i64 = 2;
+
+/// The DETAIL of [`DELETE_VOICE_STATE`]'s error reply when connection mode is
+/// handed a sid recorded as ANOTHER user's connection (S-3 WA-6). The reply
+/// comes before any write.
+const TEARDOWN_FOREIGN_CONNECTION: &str = "voice state teardown: foreign connection";
+
+/// Whether a failed [`DELETE_VOICE_STATE`] invocation is the script's own
+/// WA-6 refusal: a server reply (never a transport error) whose detail names
+/// a foreign connection. Only picks the log line; the caller returns an
+/// error either way.
+fn teardown_refused_a_foreign_connection(error: &RedisError) -> bool {
+    !error.is_io_error()
+        && error.kind() == ErrorKind::ResponseError
+        && error
+            .detail()
+            .is_some_and(|detail| detail.trim().starts_with(TEARDOWN_FOREIGN_CONNECTION))
+}
+
+/// [`DELETE_VOICE_STATE`]'s arguments for ONE connection's departure: the
+/// whole-user layout from [`voice_state_teardown_input`], with the mode
+/// switched to `connection` and the departing sid as `ARGV[5]`.
+///
+/// Derived rather than written out again, so the key list cannot drift
+/// between the two modes. Pure and pinned by value.
+fn voice_connection_teardown_input(
+    channel: &UserVoiceChannel,
+    user_id: &str,
+    sid: &str,
+) -> VoiceStateTeardownInput {
+    let mut input = voice_state_teardown_input(channel, user_id);
+    input.args[3] = TEARDOWN_MODE_CONNECTION.to_string();
+    input.args.push(sid.to_string());
+    input
+}
+
+/// [`DELETE_VOICE_STATE`]'s arguments for a SET of connections (S-3 WA-R):
+/// the whole-user layout from [`voice_state_teardown_input`], with the mode
+/// switched to `connections` and the sids appended as `ARGV[5..]`, in the
+/// order given. An empty `sids` leaves `ARGV` at four entries.
+///
+/// Derived, like [`voice_connection_teardown_input`], so the key list cannot
+/// drift between the modes. Pure and pinned by value.
+fn voice_connections_teardown_input(
+    channel: &UserVoiceChannel,
+    user_id: &str,
+    sids: &[String],
+) -> VoiceStateTeardownInput {
+    let mut input = voice_state_teardown_input(channel, user_id);
+    input.args[3] = TEARDOWN_MODE_CONNECTIONS.to_string();
+    input.args.extend(sids.iter().cloned());
+    input
 }
 
 /// Tear down ONE user's voice state in `channel`.
@@ -977,8 +1149,20 @@ fn voice_state_teardown_input(
 ///   exactly what the script just decided to keep. The pre-script pipeline
 ///   failed on a dead connection too, so this is no regression for callers.
 ///
-/// Guarded by CHANNEL, not by connection: a late leave from the same channel
-/// the user has since rejoined still clears it (pre-existing, out of scope).
+/// This is the WHOLE-USER teardown: the script runs in `user` mode, so every
+/// connection of this user leaves the `vc_conns:{channel}` record first and
+/// no sibling can keep the state (S-3 P2-10). One LiveKit participant leaving
+/// is [`delete_voice_connection`] instead, which is what keeps a surviving
+/// connection's state when only one of several leaves.
+///
+/// Do NOT call this after deciding from an SFU listing (moderation removal,
+/// disconnect, force-disconnect, a Survivor confirmation): a sibling that
+/// records AFTER the listing had its record answer "state exists" and so
+/// created none of its own, and this erases the state it relies on. It is
+/// left live, stateless and unrecorded (S-3 WA-1). Those callers use
+/// [`delete_voice_connections`] with the sids they know about. What remains
+/// here: reconcile of a dead node (no live sibling possible), legacy paths
+/// with no listing, the roster repair, and the whole-call teardown.
 pub async fn delete_voice_state(channel: &UserVoiceChannel, user_id: &str) -> Result<()> {
     // Watch-together dies with the HOST's voice state (plan §1): this is the
     // one chokepoint every leave path shares, and it runs BEFORE the script
@@ -1114,15 +1298,31 @@ fn teardown_script_error_allows_fallback(error: &RedisError) -> bool {
     }
 }
 
-/// The FALLBACK for [`delete_voice_state`], and ONLY that: the teardown
-/// exactly as it was before [`DELETE_VOICE_STATE`] existed. Same keys, same
-/// commands, and every per-server key deleted unconditionally.
+/// The FALLBACK for [`delete_voice_state`] (and, through
+/// [`delete_voice_connection_unconditionally`], for a connection that turned
+/// out to be the user's last), and ONLY that: the teardown exactly as it was
+/// before [`DELETE_VOICE_STATE`] existed. Same keys, same commands, and every
+/// per-server key deleted unconditionally.
 ///
 /// Kept verbatim so a Redis that will not run the script degrades to the old
 /// behavior rather than to a broken leave. Do not call it from anywhere else:
 /// it deletes a newer channel's per-server state after a move, which is the
 /// defect the script exists to fix. The reasons for each key are on
 /// [`voice_state_teardown_input`].
+///
+/// One addition, DEGRADED like the rest of this function: every entry of
+/// this user leaves the `vc_conns:{channel}` record first, as the script's
+/// `user` mode does. Here it is a read and then an HDEL, not atomic with each
+/// other or with the pipeline below, so a sibling recorded in between keeps
+/// its entry while its voice state still goes.
+///
+/// DEGRADED for the connection fallbacks too (S-3 WA-2): when
+/// [`delete_voice_connection_unconditionally`] or
+/// [`delete_voice_connections_unconditionally`] reach this after their own
+/// survivor read found none, a sibling that records between that read and
+/// the pipeline below loses its state here, the WA-1 outcome the script
+/// closes. The window is a few round trips wide and exists only on a server
+/// that refuses the script.
 async fn delete_voice_state_unconditionally(
     channel: &UserVoiceChannel,
     user_id: &str,
@@ -1132,6 +1332,22 @@ async fn delete_voice_state_unconditionally(
         &user_id,
         channel.server_id.as_ref().unwrap_or(&channel.id)
     );
+
+    let mut conn = get_connection().await?;
+    let connections: BTreeMap<String, String> = conn
+        .hgetall(voice_connections_key(channel))
+        .await
+        .to_internal_error()?;
+    let theirs: Vec<&String> = connections
+        .iter()
+        .filter(|(_, identity)| user_id_from_participant_identity(identity) == user_id)
+        .map(|(sid, _)| sid)
+        .collect();
+    if !theirs.is_empty() {
+        conn.hdel::<_, _, ()>(voice_connections_key(channel), theirs)
+            .await
+            .to_internal_error()?;
+    }
 
     Pipeline::new()
         .srem(format!("vc_members:{}", &channel.id), user_id)
@@ -1154,6 +1370,628 @@ async fn delete_voice_state_unconditionally(
         .query_async(&mut get_connection().await?.into_inner())
         .await
         .to_internal_error()
+}
+
+// ---- the per-connection record (AFK S-3 D-1) ----
+//
+// Voice state is keyed per USER, but the SFU admits several connections per
+// user (`{user}`, `{user}:{device}`), so a leave used to tear the user's
+// state down while a sibling connection was still live: the survivor kept a
+// stale grant and vanished from every roster. The record below is what lets a
+// leave tell "the last connection went" from "one of several went".
+
+/// The connection record of a channel: HASH `vc_conns:{channel_id}`, field =
+/// LiveKit participant sid, value = the participant's full identity.
+///
+/// ONE hash per CHANNEL, shared by every user in it (S-3 P2-1):
+///
+/// - Per CHANNEL, not per server: a connection keeps its identity across a
+///   move, so under a per-server key the late `participant_left` of a moved
+///   connection in the SOURCE would find its own destination entry and read
+///   it as a surviving sibling, keeping source state that must go (the H-1
+///   race reborn).
+/// - Per channel, not per USER: `room_finished` and the reconcile sweep call
+///   [`delete_channel_voice_state`] with no user ids at all, so a per-user key
+///   would be unreachable there and leak. This one is DELed with the call.
+/// - Keyed by SID, not identity: a duplicate bare `{user}` reconnect is the
+///   same identity with a new sid, and the OLD one's leave must not delete
+///   the new one's entry.
+///
+/// Carries NO TTL, like every voice key. Cleaned by the per-connection HDEL
+/// in [`delete_voice_connection`], the set HDEL in
+/// [`delete_voice_connections`], the whole-user HDEL in
+/// [`delete_voice_state`] and the DEL in [`delete_channel_voice_state`].
+/// Screen legs are never recorded ([`record_voice_connection`] refuses them).
+/// Deploy note: a KeyDB ACL must allow the `vc_conns:` prefix.
+fn voice_connections_key(channel: &UserVoiceChannel) -> String {
+    format!("vc_conns:{}", &channel.id)
+}
+
+/// Lua source of [`RECORD_VOICE_CONNECTION`]: record one connection and say
+/// whether the user already holds voice state in this channel, atomically.
+///
+/// - `KEYS[1]`: `vc_conns:{channel}` ([`voice_connections_key`]).
+/// - `KEYS[2]`: `vc_members:{channel}`.
+/// - `ARGV[1]`: the connection's sid, the field.
+/// - `ARGV[2]`: its full identity, the value.
+/// - `ARGV[3]`: the user id, looked up in `KEYS[2]`.
+///
+/// Returns 1 when the user has NO voice state in this channel (the caller
+/// creates it), 0 when they do (the caller refreshes the mapping hint only).
+/// The answer is the voice state, NOT `HLEN == 1` (S-3 P2-1): a stale sid
+/// left by a missed leave would make a real join read as a second connection
+/// and never get state, and a moderator teardown racing a sibling join would
+/// leave the sibling stateless for good.
+const RECORD_VOICE_CONNECTION_LUA: &str = r"
+redis.call('HSET', KEYS[1], ARGV[1], ARGV[2])
+if redis.call('SISMEMBER', KEYS[2], ARGV[3]) == 1 then
+    return 0
+end
+return 1
+";
+
+/// A script for the same reason [`DELETE_VOICE_STATE`] is one (MULTI/WATCH
+/// leak state on a pooled connection; see there), and like it a single-node
+/// Redis / KeyDB script. `Script` sends EVALSHA and loads on NOSCRIPT.
+static RECORD_VOICE_CONNECTION: LazyLock<Script> =
+    LazyLock::new(|| Script::new(RECORD_VOICE_CONNECTION_LUA));
+
+/// The `KEYS[]` and `ARGV[]` of one [`RECORD_VOICE_CONNECTION`] invocation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct VoiceConnectionRecordInput {
+    keys: Vec<String>,
+    args: Vec<String>,
+}
+
+/// Build [`RECORD_VOICE_CONNECTION`]'s arguments in the layout documented on
+/// [`RECORD_VOICE_CONNECTION_LUA`]. Pure, so the layout is pinned by value.
+fn voice_connection_record_input(
+    channel: &UserVoiceChannel,
+    user_id: &str,
+    sid: &str,
+    identity: &str,
+) -> VoiceConnectionRecordInput {
+    VoiceConnectionRecordInput {
+        keys: vec![
+            voice_connections_key(channel),
+            format!("vc_members:{}", &channel.id),
+        ],
+        args: vec![sid.to_string(), identity.to_string(), user_id.to_string()],
+    }
+}
+
+/// Latch for [`record_voice_connection`]'s fallback log line; the same
+/// once-per-process rule as [`TEARDOWN_FALLBACK_LOGGED`].
+static RECORD_FALLBACK_LOGGED: AtomicBool = AtomicBool::new(false);
+
+/// Record one LiveKit connection of `user_id` in `channel` (voice-ingress,
+/// `participant_joined`, after the Connect re-check).
+///
+/// Returns `true` when the user has NO voice state in this channel yet: the
+/// caller runs the flag-resetting [`create_voice_state`] and announces the
+/// join. `false` means a sibling connection already holds the state: the
+/// caller refreshes the identity mapping hint only, with no flag reset (F-15)
+/// and no second join event.
+///
+/// `identity` must be a PRIMARY of `user_id` (`{user}` or `{user}:{device}`).
+/// A screen leg, or an identity of another user, is refused with an error
+/// and nothing is written: a leg is a helper with no voice state (plan §2.3)
+/// and a recorded one would read as a surviving sibling on its owner's leave.
+///
+/// If the server provably will not run the script (the
+/// [`teardown_script_error_allows_fallback`] set), the same two commands run
+/// as a plain pipeline instead: not atomic, which only widens the window the
+/// script closes. Recording is idempotent, so that is safe to repeat.
+pub async fn record_voice_connection(
+    channel: &UserVoiceChannel,
+    user_id: &str,
+    sid: &str,
+    identity: &str,
+) -> Result<bool> {
+    if is_screen_leg(identity) || user_id_from_participant_identity(identity) != user_id {
+        log::error!(
+            "refusing to record connection {sid} of {user_id} in {}: {identity} is not a \
+             primary identity of that user",
+            channel.id
+        );
+        return Err(create_error!(InternalError));
+    }
+
+    let input = voice_connection_record_input(channel, user_id, sid, identity);
+    let mut invocation = RECORD_VOICE_CONNECTION.prepare_invoke();
+    for key in &input.keys {
+        invocation.key(key);
+    }
+    for arg in &input.args {
+        invocation.arg(arg);
+    }
+
+    let outcome = {
+        let mut conn = get_connection().await?.into_inner();
+        invocation.invoke_async::<_, i64>(&mut conn).await
+    };
+
+    match outcome {
+        Ok(first) => Ok(first == 1),
+        Err(error) if teardown_script_error_allows_fallback(&error) => {
+            if RECORD_FALLBACK_LOGGED.swap(true, Ordering::Relaxed) {
+                log::debug!(
+                    "connection record script refused for {user_id} in {}: {error}; pipeline",
+                    channel.id
+                );
+            } else {
+                log::error!(
+                    "connection record script refused for {user_id} in {}: {error}; falling \
+                     back to a non-atomic pipeline. This server will not run the script, so \
+                     every join takes this path; logged once per process",
+                    channel.id
+                );
+            }
+            let (_, member): ((), bool) = Pipeline::new()
+                .hset(&input.keys[0], sid, identity)
+                .sismember(&input.keys[1], user_id)
+                .query_async(&mut get_connection().await?.into_inner())
+                .await
+                .to_internal_error()?;
+            Ok(!member)
+        }
+        Err(error) => Err(error).to_internal_error(),
+    }
+}
+
+/// What one connection's departure amounted to, per [`delete_voice_connection`]
+/// (or a set of them, per [`delete_voice_connections`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectionLeave {
+    /// It was the user's last recorded connection in the channel (or the
+    /// channel has no record of them at all): their voice state was torn
+    /// down exactly as [`delete_voice_state`] tears it down, pointer guard
+    /// included. The caller announces the leave.
+    Last,
+    /// Another connection of the user is still recorded: NOTHING was torn
+    /// down, and the identity mapping now names that connection. The caller
+    /// must not announce a leave, and must not HDEL the mapping (that would
+    /// undo the re-point, S-3 P2-4). The record can hold a stale sid, so
+    /// voice-ingress confirms a `Survivor` against the SFU (S-3 P2-1).
+    Survivor,
+}
+
+/// Another recorded connection of `user_id` than `sid`, if any, from the
+/// `vc_conns:{channel}` hash as read (field = sid, value = identity).
+///
+/// Ownership is `user_id_from_participant_identity`, the same rule the
+/// script spells as "equal, or starts with the user and `:`". Pure.
+fn another_connection_of<'a>(
+    connections: &'a BTreeMap<String, String>,
+    user_id: &str,
+    sid: &str,
+) -> Option<&'a str> {
+    connections
+        .iter()
+        .find(|(field, identity)| {
+            field.as_str() != sid && user_id_from_participant_identity(identity) == user_id
+        })
+        .map(|(_, identity)| identity.as_str())
+}
+
+/// A recorded connection of `user_id` whose sid is NOT in `sids`, if any.
+/// The set-mode twin of [`another_connection_of`], same ownership rule. Pure.
+fn another_connection_outside<'a>(
+    connections: &'a BTreeMap<String, String>,
+    user_id: &str,
+    sids: &[String],
+) -> Option<&'a str> {
+    connections
+        .iter()
+        .find(|(field, identity)| {
+            !sids.contains(*field) && user_id_from_participant_identity(identity) == user_id
+        })
+        .map(|(_, identity)| identity.as_str())
+}
+
+/// The connections of `user_id` recorded in `channel`, as `(sid, identity)`
+/// pairs from `vc_conns:{channel}`, ordered by sid (S-3 WA-R).
+///
+/// Ownership is `user_id_from_participant_identity`: the identity equals the
+/// user id or starts with it and `:`, never a bare prefix, so user `u` never
+/// owns `uu:B`. Screen legs are never recorded, so none appear. Read-only.
+///
+/// ORDERING RULE (binding on every caller that also lists the SFU): read
+/// this BEFORE the SFU listing, never after. The difference "recorded but not
+/// listed" is what a caller treats as stale and deletes. Read after the
+/// listing, a sibling that records between the listing and this read looks
+/// stale and is deleted while live: S-3 WA-1 again. Read before, such a
+/// sibling is in neither set, so it is never named, and
+/// [`delete_voice_connections`]'s survivor scan keeps its state. The two
+/// shapes:
+///
+/// - Survivor confirmation: `recorded` (first), then the listing, then
+///   `delete_voice_connections(recorded − listed)`.
+/// - Removal (moderation, disconnect, force-disconnect): `recorded` (first),
+///   then `remove_user_if_present_sids`, then
+///   `delete_voice_connections(returned ∪ (recorded − returned))`.
+pub async fn recorded_voice_connections(
+    channel: &UserVoiceChannel,
+    user_id: &str,
+) -> Result<Vec<(String, String)>> {
+    let recorded: BTreeMap<String, String> = get_connection()
+        .await?
+        .hgetall(voice_connections_key(channel))
+        .await
+        .to_internal_error()?;
+    Ok(recorded
+        .into_iter()
+        .filter(|(_, identity)| user_id_from_participant_identity(identity.as_str()) == user_id)
+        .collect())
+}
+
+/// ONE LiveKit connection of `user_id` left `channel` (voice-ingress
+/// `participant_left`, and the ingress enforcement sites that evict exactly
+/// one connection).
+///
+/// [`DELETE_VOICE_STATE`] in `connection` mode: the sid leaves the record,
+/// and if another connection of the user is still recorded the answer is
+/// [`ConnectionLeave::Survivor`] with NOTHING torn down and the mapping
+/// re-pointed at the survivor. Otherwise [`ConnectionLeave::Last`], after
+/// exactly the teardown [`delete_voice_state`] runs. An unknown sid while a
+/// sibling is recorded is a `Survivor` too; a user the record has never seen
+/// (connected before it existed) is a `Last`, as before S-3.
+///
+/// Watch-together (S-3 P2-4): the session ends with the HOST's voice state,
+/// and it has to end BEFORE the teardown so the end event still reaches the
+/// departing host's own devices. So the record is PEEKED first, read-only,
+/// and the session is ended only when this sid is the user's last. The
+/// script then re-decides atomically. A sibling that joins between the peek
+/// and the script makes the peek's "last" wrong in the revoke direction only
+/// (the session ends early), which is accepted.
+///
+/// A sid recorded as ANOTHER user's connection is refused with
+/// `Err(InternalError)` and NOTHING written (S-3 WA-6): checked on the peek
+/// first, so the watch session is not ended either, and again atomically by
+/// the script, whose error reply comes before its first write. A sid with no
+/// record at all is not refused: the HDEL is a no-op and the survivor scan
+/// decides, as before.
+///
+/// Errors and the fallback follow [`delete_voice_state`] exactly: only a
+/// refusal that proves the script never ran falls back, to
+/// [`delete_voice_connection_unconditionally`]; every other error is
+/// returned.
+pub async fn delete_voice_connection(
+    channel: &UserVoiceChannel,
+    user_id: &str,
+    sid: &str,
+) -> Result<ConnectionLeave> {
+    let recorded: BTreeMap<String, String> = get_connection()
+        .await?
+        .hgetall(voice_connections_key(channel))
+        .await
+        .to_internal_error()?;
+    let foreign = recorded
+        .get(sid)
+        .filter(|identity| user_id_from_participant_identity(identity) != user_id);
+    if let Some(identity) = foreign {
+        log::error!(
+            "refusing to remove connection {sid} for {user_id} in {}: it is recorded as \
+             {identity}, another user's connection; nothing written",
+            channel.id
+        );
+        return Err(create_error!(InternalError));
+    }
+    if another_connection_of(&recorded, user_id, sid).is_none() {
+        watch::end_watch_session_if_host(channel, user_id).await;
+    }
+
+    let input = voice_connection_teardown_input(channel, user_id, sid);
+    let mut invocation = DELETE_VOICE_STATE.prepare_invoke();
+    for key in &input.keys {
+        invocation.key(key);
+    }
+    for arg in &input.args {
+        invocation.arg(arg);
+    }
+
+    let outcome = {
+        let mut conn = get_connection().await?.into_inner();
+        invocation.invoke_async::<_, i64>(&mut conn).await
+    };
+
+    match outcome {
+        Ok(TEARDOWN_SURVIVOR) => Ok(ConnectionLeave::Survivor),
+        Ok(0) => {
+            log::info!(
+                "voice state teardown for {user_id} in {} (connection {sid}) kept the \
+                 per-server state: {} already names another channel (a late leave after a move)",
+                channel.id,
+                input.keys[0]
+            );
+            Ok(ConnectionLeave::Last)
+        }
+        Ok(_) => Ok(ConnectionLeave::Last),
+        Err(error) if teardown_refused_a_foreign_connection(&error) => {
+            log::error!(
+                "refusing to remove connection {sid} for {user_id} in {}: the script found \
+                 it recorded as another user's connection (recorded after the peek); nothing \
+                 written",
+                channel.id
+            );
+            Err(create_error!(InternalError))
+        }
+        Err(error) if teardown_script_error_allows_fallback(&error) => {
+            // Logging only: the fallback below runs whatever the latch says.
+            if TEARDOWN_FALLBACK_LOGGED.swap(true, Ordering::Relaxed) {
+                log::debug!(
+                    "voice state teardown script refused for {user_id} in {} (connection \
+                     {sid}): {error}; non-atomic fallback",
+                    channel.id
+                );
+            } else {
+                log::error!(
+                    "voice state teardown script refused for {user_id} in {} (connection \
+                     {sid}): {error}; falling back to the non-atomic teardown. This server \
+                     will not run the script, so every leave takes this path; logged once per \
+                     process",
+                    channel.id
+                );
+            }
+            delete_voice_connection_unconditionally(channel, user_id, sid).await
+        }
+        Err(error) => {
+            log::warn!(
+                "voice state teardown script for {user_id} in {} (connection {sid}) failed: \
+                 {error}; not a refusal that proves it never ran, so the error is returned",
+                channel.id
+            );
+            Err(error).to_internal_error()
+        }
+    }
+}
+
+/// The FALLBACK for [`delete_voice_connection`], and ONLY that. DEGRADED:
+/// the sid's HDEL, the survivor read and the re-point (or the teardown) are
+/// separate round trips, so a sibling recorded or removed in between can make
+/// the answer stale, and the teardown itself is
+/// [`delete_voice_state_unconditionally`], which does not protect a newer
+/// channel's per-server state after a move (and, S-3 WA-2, can erase a
+/// sibling recorded after the survivor read; see there).
+///
+/// The WA-6 refusal holds here too, from a separate read: a sid recorded as
+/// another user's is `Err(InternalError)` before any write.
+async fn delete_voice_connection_unconditionally(
+    channel: &UserVoiceChannel,
+    user_id: &str,
+    sid: &str,
+) -> Result<ConnectionLeave> {
+    let mut conn = get_connection().await?;
+    let recorded_as: Option<String> = conn
+        .hget(voice_connections_key(channel), sid)
+        .await
+        .to_internal_error()?;
+    if let Some(identity) =
+        recorded_as.filter(|recorded| user_id_from_participant_identity(recorded) != user_id)
+    {
+        log::error!(
+            "refusing to remove connection {sid} for {user_id} in {} (fallback): it is \
+             recorded as {identity}, another user's connection; nothing written",
+            channel.id
+        );
+        return Err(create_error!(InternalError));
+    }
+    conn.hdel::<_, _, ()>(voice_connections_key(channel), sid)
+        .await
+        .to_internal_error()?;
+    let connections: BTreeMap<String, String> = conn
+        .hgetall(voice_connections_key(channel))
+        .await
+        .to_internal_error()?;
+
+    if let Some(survivor) = another_connection_of(&connections, user_id, sid) {
+        conn.hset::<_, _, _, ()>(format!("voice_identity:{}", &channel.id), user_id, survivor)
+            .await
+            .to_internal_error()?;
+        return Ok(ConnectionLeave::Survivor);
+    }
+
+    delete_voice_state_unconditionally(channel, user_id).await?;
+    Ok(ConnectionLeave::Last)
+}
+
+/// A SET of `user_id`'s connections is gone from `channel`, as decided by a
+/// caller that listed the SFU (S-3 WA-R: moderation removal, disconnect,
+/// force-disconnect, voice-ingress's Survivor confirmation).
+///
+/// [`DELETE_VOICE_STATE`] in `connections` mode, atomically:
+///
+/// - each sid in `sids` leaves `vc_conns:{channel}` ONLY if its recorded
+///   identity belongs to `user_id` (equal to it, or it and `:` as a prefix).
+///   A sid recorded as another user's is skipped and counted FOREIGN, and a
+///   sid with no record is skipped and counted UNKNOWN; neither is an error,
+///   and a nonzero FOREIGN count is logged at WARN (the caller handed over a
+///   sid that is not this user's);
+/// - then the survivor scan of [`delete_voice_connection`]: if ANY other
+///   entry of the user is still recorded, the mapping is re-pointed at it and
+///   the answer is [`ConnectionLeave::Survivor`] with NOTHING torn down.
+///   Otherwise [`ConnectionLeave::Last`], after exactly the teardown
+///   [`delete_voice_state`] runs, pointer guard included.
+///
+/// That survivor scan is the WA-1 fix. A sibling that recorded after the
+/// caller's listing is in no set the caller could build, so it is never
+/// named here, and it keeps the state its own record relied on. A whole-user
+/// [`delete_voice_state`] in the same place erases it.
+///
+/// EMPTY `sids`: a pure survivor check, deliberately. `Survivor` (mapping
+/// re-pointed, nothing torn down) when the user has any recorded entry in
+/// this channel, else `Last` with the full teardown. The latter is what a
+/// removal of a user the record has never seen (a legacy connection, or one
+/// whose state outlived every connection) needs.
+///
+/// ORDERING RULE (binding on every caller): the sids come from a
+/// [`recorded_voice_connections`] read taken BEFORE the SFU listing, never
+/// after, so the only sids named are ones the caller KNOWS about:
+///
+/// - Survivor confirmation: `recorded_voice_connections` (first), then
+///   `list_participants_reported`, then `stale = recorded − listed`, then
+///   `delete_voice_connections(stale)`.
+/// - Removal: `recorded_voice_connections` (first), then
+///   `remove_user_if_present_sids`, then
+///   `delete_voice_connections(returned ∪ (recorded − returned))`.
+///
+/// Read after the listing, a sibling that records in between is "recorded
+/// but not listed", gets named as stale, and is deleted while live: WA-1.
+///
+/// Watch-together follows [`delete_voice_connection`]: the record is peeked
+/// read-only, and the session ends BEFORE the script only when no entry of
+/// the user would remain outside `sids`. The script re-decides atomically;
+/// a sibling recorded between the peek and the script ends the session early
+/// (the revoke direction), which is accepted.
+///
+/// Errors and the fallback follow [`delete_voice_state`] exactly: only a
+/// refusal that proves the script never ran falls back, to the DEGRADED
+/// [`delete_voice_connections_unconditionally`]; every other error is
+/// returned.
+pub async fn delete_voice_connections(
+    channel: &UserVoiceChannel,
+    user_id: &str,
+    sids: &[String],
+) -> Result<ConnectionLeave> {
+    let recorded: BTreeMap<String, String> = get_connection()
+        .await?
+        .hgetall(voice_connections_key(channel))
+        .await
+        .to_internal_error()?;
+    if another_connection_outside(&recorded, user_id, sids).is_none() {
+        watch::end_watch_session_if_host(channel, user_id).await;
+    }
+
+    let input = voice_connections_teardown_input(channel, user_id, sids);
+    let mut invocation = DELETE_VOICE_STATE.prepare_invoke();
+    for key in &input.keys {
+        invocation.key(key);
+    }
+    for arg in &input.args {
+        invocation.arg(arg);
+    }
+
+    let outcome = {
+        let mut conn = get_connection().await?.into_inner();
+        invocation.invoke_async::<_, (i64, i64, i64)>(&mut conn).await
+    };
+
+    match outcome {
+        Ok((code, foreign, unknown)) => {
+            if foreign > 0 {
+                log::warn!(
+                    "voice state teardown for {user_id} in {}: skipped {foreign} sid(s) recorded \
+                     as another user's connection and {unknown} with no record, of {} given",
+                    channel.id,
+                    sids.len()
+                );
+            } else if unknown > 0 {
+                log::debug!(
+                    "voice state teardown for {user_id} in {}: {unknown} of {} sid(s) had no \
+                     record (legacy, or already gone)",
+                    channel.id,
+                    sids.len()
+                );
+            }
+            match code {
+                TEARDOWN_SURVIVOR => Ok(ConnectionLeave::Survivor),
+                0 => {
+                    log::info!(
+                        "voice state teardown for {user_id} in {} ({} connection(s)) kept the \
+                         per-server state: {} already names another channel (a late leave after \
+                         a move)",
+                        channel.id,
+                        sids.len(),
+                        input.keys[0]
+                    );
+                    Ok(ConnectionLeave::Last)
+                }
+                _ => Ok(ConnectionLeave::Last),
+            }
+        }
+        Err(error) if teardown_script_error_allows_fallback(&error) => {
+            // Logging only: the fallback below runs whatever the latch says.
+            if TEARDOWN_FALLBACK_LOGGED.swap(true, Ordering::Relaxed) {
+                log::debug!(
+                    "voice state teardown script refused for {user_id} in {} ({} \
+                     connection(s)): {error}; non-atomic fallback",
+                    channel.id,
+                    sids.len()
+                );
+            } else {
+                log::error!(
+                    "voice state teardown script refused for {user_id} in {} ({} \
+                     connection(s)): {error}; falling back to the non-atomic teardown. This \
+                     server will not run the script, so every leave takes this path; logged \
+                     once per process",
+                    channel.id,
+                    sids.len()
+                );
+            }
+            delete_voice_connections_unconditionally(channel, user_id, sids).await
+        }
+        Err(error) => {
+            log::warn!(
+                "voice state teardown script for {user_id} in {} ({} connection(s)) failed: \
+                 {error}; not a refusal that proves it never ran, so the error is returned",
+                channel.id,
+                sids.len()
+            );
+            Err(error).to_internal_error()
+        }
+    }
+}
+
+/// The FALLBACK for [`delete_voice_connections`], and ONLY that. DEGRADED,
+/// exactly as [`delete_voice_connection_unconditionally`] is (S-3 WA-2): the
+/// ownership read, the HDEL, the survivor read and the re-point (or the
+/// teardown) are separate round trips, so a sibling recorded or removed in
+/// between can make the answer stale; and the teardown is
+/// [`delete_voice_state_unconditionally`], which does not protect a newer
+/// channel's per-server state after a move and can erase a sibling recorded
+/// after the survivor read (the WA-1 outcome, in a window of a few round
+/// trips, on a server that refuses the script).
+///
+/// Same rules as the script otherwise: only sids recorded as this user's
+/// are HDELed (foreign and unknown ones are skipped), then any remaining
+/// entry of the user is a `Survivor`.
+async fn delete_voice_connections_unconditionally(
+    channel: &UserVoiceChannel,
+    user_id: &str,
+    sids: &[String],
+) -> Result<ConnectionLeave> {
+    let mut conn = get_connection().await?;
+    let recorded: BTreeMap<String, String> = conn
+        .hgetall(voice_connections_key(channel))
+        .await
+        .to_internal_error()?;
+    let theirs: Vec<&String> = sids
+        .iter()
+        .filter(|sid| {
+            recorded
+                .get(*sid)
+                .is_some_and(|identity| user_id_from_participant_identity(identity) == user_id)
+        })
+        .collect();
+    if !theirs.is_empty() {
+        conn.hdel::<_, _, ()>(voice_connections_key(channel), theirs)
+            .await
+            .to_internal_error()?;
+    }
+    let connections: BTreeMap<String, String> = conn
+        .hgetall(voice_connections_key(channel))
+        .await
+        .to_internal_error()?;
+
+    if let Some(survivor) = another_connection_outside(&connections, user_id, sids) {
+        conn.hset::<_, _, _, ()>(format!("voice_identity:{}", &channel.id), user_id, survivor)
+            .await
+            .to_internal_error()?;
+        return Ok(ConnectionLeave::Survivor);
+    }
+
+    delete_voice_state_unconditionally(channel, user_id).await?;
+    Ok(ConnectionLeave::Last)
 }
 
 pub async fn delete_channel_voice_state(
@@ -1182,6 +2020,10 @@ pub async fn delete_channel_voice_state(
     // DEL is idempotent, and their explicit call is what covers the paths that
     // do not come through here.
     pipeline.del(format!("voice_identity:{}", &channel.id));
+    // And the whole connection record (S-3 D-1), for the same reason again:
+    // `room_finished` and `reconcile_channel` name nobody, and this DEL is
+    // the only thing that reaches the entries they leave behind (P2-1).
+    pipeline.del(voice_connections_key(channel));
 
     for user_id in user_ids {
         let unique_key = format!("{user_id}:{parent_id}");
@@ -1654,6 +2496,51 @@ pub async fn assert_voice_move_admissible(
     assert_call_caps_admit(db, &UserVoiceChannel::from_channel(destination), &target.id).await
 }
 
+/// Whether `user_id` may STILL connect to `channel_id`, re-checked when the
+/// SFU reports the connection (voice-ingress `participant_joined`, S-3 D-3).
+///
+/// A join token lives for seconds, and a ban, kick or Connect denial that
+/// lands between the mint and the SFU join is otherwise never seen: the
+/// connection arrives with a grant minted before the change.
+///
+/// The query is built EXACTLY as [`admit_voice_move`] and the join route
+/// build theirs: `(db, user)` plus the channel, with the member fetched
+/// LAZILY by the calculus. An explicit member lookup here would refuse every
+/// DM and Group caller, who have no member document, and would hand the
+/// calculus a document instead of the current one. The calculus covers every
+/// kind of channel: a DM or Group participant, the server owner (GrantAllSafe)
+/// and a bot with Connect are allowed; a non-member or a member denied
+/// Connect is not.
+///
+/// A user or channel that no longer exists is `Ok(false)`: nobody may be
+/// connected to a deleted channel, and a deleted account holds nothing.
+/// Any other read failure is returned, and the caller fails CLOSED on it.
+pub async fn voice_connect_still_allowed(
+    db: &Database,
+    channel_id: &str,
+    user_id: &str,
+) -> Result<bool> {
+    let user = match db.fetch_user(user_id).await {
+        Ok(user) => user,
+        Err(error) if matches!(error.error_type, revolt_result::ErrorType::NotFound) => {
+            return Ok(false)
+        }
+        Err(error) => return Err(error),
+    };
+    let channel = match db.fetch_channel(channel_id).await {
+        Ok(channel) => channel,
+        Err(error) if matches!(error.error_type, revolt_result::ErrorType::NotFound) => {
+            return Ok(false)
+        }
+        Err(error) => return Err(error),
+    };
+
+    let mut query = DatabasePermissionQuery::new(db, &user).channel(&channel);
+    Ok(calculate_channel_permissions(&mut query)
+        .await
+        .has_channel_permission(ChannelPermission::Connect))
+}
+
 /// One SFU participant a move has to eject from the source room.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct VoiceEviction {
@@ -1780,6 +2667,32 @@ fn eviction_targets<I: IntoIterator<Item = String>>(
     targets
 }
 
+/// A room's SFU roster grouped by OWNING USER: user id -> every identity of
+/// theirs the SFU listed, in listed order (S-3 D-4). Screen legs are KEPT,
+/// under their owner: the permission sync pushes a leg its own
+/// leg-restricted grant, so it has to see them.
+///
+/// Ownership is `user_id_from_participant_identity`, never a string prefix:
+/// `uu:B` belongs to `uu`, not to `u`. Pure; consumed by the roster-driven
+/// permission sync.
+// Wired into `sync_voice_permissions` by S-3 lane B1; until then only the
+// tests call it.
+#[allow(dead_code)]
+pub(crate) fn roster_connections(
+    identities: impl IntoIterator<Item = String>,
+) -> BTreeMap<String, Vec<String>> {
+    let mut roster: BTreeMap<String, Vec<String>> = BTreeMap::new();
+
+    for identity in identities {
+        roster
+            .entry(user_id_from_participant_identity(&identity).to_string())
+            .or_default()
+            .push(identity);
+    }
+
+    roster
+}
+
 /// Which of the target's connections in the source room a move MOVES.
 ///
 /// `participants` is the SFU's own list for the source room;
@@ -1881,9 +2794,19 @@ fn move_addressing(moving: &ParticipantInfo, target_id: &str) -> MoveAddressing 
     }
 }
 
-/// Move `target` into `destination`, server-authoritatively.
+/// Whether the target has left the source channel a caller decided about:
+/// `expected_from` names that channel (`None` = no expectation), `from` is
+/// what the `{user}:{server}` pointer names now.
+fn source_moved_on(expected_from: Option<&str>, from: &str) -> bool {
+    expected_from.is_some_and(|expected| expected != from)
+}
+
+/// Move `target` into `destination`, server-authoritatively, for a caller
+/// that decided the move about a particular SOURCE channel (Wave 5b-2 audit
+/// A2). The only move entry point: the four-argument form that expected no
+/// source had no production caller left and was deleted (S-3 RB-1).
 ///
-/// FOUR ARGUMENTS, ALL DAEMON-CONSTRUCTIBLE, AND DELIBERATELY SO. There is no
+/// EVERY ARGUMENT IS DAEMON-CONSTRUCTIBLE, AND DELIBERATELY SO. There is no
 /// `Member`, no `Server`, no acting user and no Rocket type here:
 ///
 /// - the member document is fetched lazily by the permission query (see
@@ -1898,42 +2821,19 @@ fn move_addressing(moving: &ParticipantInfo, target_id: &str) -> MoveAddressing 
 /// checks `MoveMembers` and ranking; the sweep checks idleness). This decides
 /// whether it is *possible and safe*, and returns what it did.
 ///
-/// Moves the target from wherever they are in the destination's server. A
-/// caller whose decision was made about one particular source channel uses
-/// [`move_user_to_voice_channel_expecting`] instead, and today both
-/// production callers do: the moderator route (`member_edit`, since AFK
-/// Stage 6 F-A3) and the AFK sweep. This four-argument form has no
-/// production caller left.
-pub async fn move_user_to_voice_channel(
-    db: &Database,
-    voice_client: &VoiceClient,
-    target: &User,
-    destination: &Channel,
-) -> Result<VoiceMoveOutcome> {
-    move_user_to_voice_channel_expecting(db, voice_client, target, destination, None).await
-}
-
-/// Whether the target has left the source channel a caller decided about:
-/// `expected_from` names that channel (`None` = no expectation), `from` is
-/// what the `{user}:{server}` pointer names now.
-fn source_moved_on(expected_from: Option<&str>, from: &str) -> bool {
-    expected_from.is_some_and(|expected| expected != from)
-}
-
-/// [`move_user_to_voice_channel`], for a caller that decided the move about a
-/// particular SOURCE channel (Wave 5b-2 audit A2).
-///
 /// The AFK sweep decides from an idle claim naming the channel the member was
 /// idle in, and between that read and this call the member may deliberately
 /// switch to another channel of the server. Without an expectation the move
 /// re-derives `from` from the pointer and moves them out of the channel they
 /// just chose. With `expected_from: Some(x)` a pointer that no longer names
-/// `x` answers `NotConnected` BEFORE any listing, write or mint: from the
-/// caller's point of view the member it meant is no longer connected there.
+/// `x` answers `NotConnected` BEFORE any admission, listing, write or mint:
+/// from the caller's point of view the member it meant is no longer
+/// connected there. A target already sitting in the destination is answered
+/// `AlreadyPresent` ahead of that check (S-3 RA-2).
 ///
 /// This narrows the window to the few reads between this check and the SFU
-/// listing; it does not close it. `None` behaves exactly as
-/// [`move_user_to_voice_channel`], which is implemented by calling this.
+/// listing; it does not close it. `None` means no expectation: the target is
+/// moved from wherever the pointer says they are.
 pub async fn move_user_to_voice_channel_expecting(
     db: &Database,
     voice_client: &VoiceClient,
@@ -1941,8 +2841,8 @@ pub async fn move_user_to_voice_channel_expecting(
     destination: &Channel,
     expected_from: Option<&str>,
 ) -> Result<VoiceMoveOutcome> {
-    // Derived here, never passed in, for the reason in
-    // `move_user_to_voice_channel`'s doc comment — and derived BEFORE
+    // Derived here, never passed in, for the reason in this function's doc
+    // comment — and derived BEFORE
     // admission rather than taken out of it, so that the "they are already
     // there" answer below can be given without running any admission work at
     // all. A DM or a Group still cannot reach a line past this point.
@@ -1954,17 +2854,19 @@ pub async fn move_user_to_voice_channel_expecting(
         return Ok(VoiceMoveOutcome::NotConnected);
     };
 
-    // The caller's source is gone (see the doc comment): nothing listed,
-    // written or minted. First of all the answers, ahead of the source ==
-    // destination guard as well: whatever else is true, the premise the
-    // caller decided on no longer holds.
-    if source_moved_on(expected_from, &from) {
-        return Ok(VoiceMoveOutcome::NotConnected);
-    }
-
-    // Source == destination. Without this the code below evicts the target
-    // from the very room it is putting them back into: every connection of
-    // theirs that the SFU lists in `from` goes through
+    // Source == destination: the FIRST answer, ahead of the expected-source
+    // check below (S-3 RA-2). A moderator who moves someone to where they
+    // already are asked for an end state that already holds, and the route
+    // answers `AlreadyPresent` as a 200 no-op. With the expectation checked
+    // first, a target who had moved on from the authorized source INTO the
+    // destination answered `NotConnected` — a 400 for a move whose result
+    // was already true. Both answers are pre-write, so the order changes the
+    // answer only, never a side effect; the AFK sweep maps both to the same
+    // clear.
+    //
+    // Without this guard at all, the code below evicts the target from the
+    // very room it is putting them back into: every connection of theirs
+    // that the SFU lists in `from` goes through
     // `remove_identity_if_present`, and `from` is now also the destination,
     // so the user is kicked out of the call they were already happily in.
     // Harmless-looking on a moderator route (nobody moves someone to where
@@ -1981,6 +2883,14 @@ pub async fn move_user_to_voice_channel_expecting(
     // pre-flight reaches the cap without ever reaching this line.
     if from == destination.id() {
         return Ok(VoiceMoveOutcome::AlreadyPresent);
+    }
+
+    // The caller's source is gone (see the doc comment): nothing admitted,
+    // listed, written or minted. Checked right after the source ==
+    // destination guard and before every other step: whatever else is true,
+    // the premise the caller decided on no longer holds.
+    if source_moved_on(expected_from, &from) {
+        return Ok(VoiceMoveOutcome::NotConnected);
     }
 
     let VoiceMoveAdmission { permissions } = admit_voice_move(db, target, destination).await?;
@@ -3164,10 +4074,9 @@ mod permission_tests {
     /// an ordering assertion.
     ///
     /// The body lives in `move_user_to_voice_channel_expecting` (Wave 5b-2
-    /// A2); `move_user_to_voice_channel` only delegates to it, and
-    /// `the_plain_move_delegates_with_no_expectation` pins that it does
-    /// nothing else. Every pin that reads this therefore reads the one body
-    /// every move runs, through either entry point.
+    /// A2), the only move entry point since the four-argument delegating form
+    /// was deleted (S-3 RB-1). Every pin that reads this therefore reads the
+    /// one body every move runs.
     fn move_body_code() -> String {
         const FILE: &str = "core/database/src/voice/mod.rs";
         const DEFINITION: &str = "pub async fn move_user_to_voice_channel_expecting(";
@@ -3307,32 +4216,54 @@ mod permission_tests {
         );
     }
 
-    /// A2 (5b-2.1 audit): the expectation is checked right after the pointer
-    /// is read and BEFORE anything else the move does, so a member who moved
-    /// on is answered `NotConnected` with nothing listed, admitted, written,
-    /// minted or emitted. Mutations: the check deleted, its `return` changed,
-    /// or the check moved below the listing or any write.
+    /// A2 (5b-2.1 audit), INVERTED by S-3 RA-2: the expectation is checked
+    /// right after the source == destination guard and BEFORE everything
+    /// else the move does, so a member who moved on is answered
+    /// `NotConnected` with nothing admitted, listed, written, minted or
+    /// emitted — while a target already sitting in the destination is
+    /// answered `AlreadyPresent` first, whatever the expectation says. It
+    /// used to pin the check ABOVE the guard, which made a moderator's move
+    /// of a target already in the destination a 400. Mutations: the check
+    /// deleted, its `return` changed, the check moved back above the guard,
+    /// or moved below admission, the listing or any write.
     #[test]
-    fn the_move_checks_its_expected_source_before_anything_else() {
+    fn the_move_checks_its_expected_source_right_after_already_present() {
         let body = move_body_code();
         let flat = body.split_whitespace().collect::<Vec<_>>().join(" ");
 
         const CHECK: &str = "if source_moved_on(expected_from, &from) \u{7b} \
                              return Ok(VoiceMoveOutcome::NotConnected); \u{7d}";
+        const GUARD: &str = "if from == destination.id() \u{7b} \
+                             return Ok(VoiceMoveOutcome::AlreadyPresent); \u{7d}";
         assert_eq!(
             flat.matches(CHECK).count(),
             1,
             "the move must check its expected source exactly once, answering \
              `NotConnected`: {flat}"
         );
+        assert_eq!(
+            flat.matches(GUARD).count(),
+            1,
+            "the move must answer `AlreadyPresent` exactly once: {flat}"
+        );
         let check = first(&flat, CHECK);
+        let guard = first(&flat, GUARD);
 
         assert!(
-            first(&flat, "let Some(from) = get_user_voice_channel_in_server(") < check,
-            "the check compares against the pointer, so it follows the read"
+            first(&flat, "let Some(from) = get_user_voice_channel_in_server(") < guard,
+            "the guard compares against the pointer, so it follows the read"
+        );
+        assert!(
+            guard < check,
+            "RA-2: `AlreadyPresent` must be answered BEFORE the expected-source \
+             check, or a target already in the destination is a 400"
+        );
+        assert_eq!(
+            flat[guard + GUARD.len()..check].trim(),
+            "",
+            "nothing may run between the guard and the expected-source check"
         );
         for later in [
-            "if from == destination.id()",
             "admit_voice_move(",
             "list_participants_if_present(",
             "set_channel_node(",
@@ -3348,32 +4279,6 @@ mod permission_tests {
                 "the expected-source check must precede `{later}`"
             );
         }
-    }
-
-    /// A2 (5b-2.1 audit): the four-argument move keeps its signature and is
-    /// exactly a delegation with no expectation. No production code calls it
-    /// any more: since AFK Stage 6 F-A3 the moderator route (`member_edit`)
-    /// calls `move_user_to_voice_channel_expecting` with the source it
-    /// authorized, as the AFK sweep already did. Mutations: an expectation
-    /// passed (`Some(..)`), or any other statement added to its body.
-    #[test]
-    fn the_plain_move_delegates_with_no_expectation() {
-        let shipping = this_file_shipping();
-
-        assert!(
-            shipping.contains(
-                "pub async fn move_user_to_voice_channel(\n    db: &Database,\n    \
-                 voice_client: &VoiceClient,\n    target: &User,\n    \
-                 destination: &Channel,\n) -> Result<VoiceMoveOutcome> \u{7b}"
-            ),
-            "`move_user_to_voice_channel` must keep its four-argument signature"
-        );
-        let body = flat_fn_body(&shipping, "pub async fn move_user_to_voice_channel(");
-        assert_eq!(
-            body.trim(),
-            "move_user_to_voice_channel_expecting(db, voice_client, target, destination, None).await",
-            "`move_user_to_voice_channel` must only delegate, with no expectation"
-        );
     }
 
     /// B10 (5b-2.1 audit): the move marker's lifetime is a named constant, at
@@ -3489,7 +4394,17 @@ mod permission_tests {
              out of CONNECTED drops its own move"
         );
 
-        for banned in ["remove_user(", "remove_identity("] {
+        // `remove_user_if_present(` (S-3 D-2) lists the room itself: the move
+        // keeps its own pre-write listing and must evict from THAT, never
+        // from a second, later one. `remove_user_if_present_sids(` (S-3
+        // WA-R) is the same listing returning sids, and the needle above does
+        // not match it, so it is banned by name.
+        for banned in [
+            "remove_user(",
+            "remove_identity(",
+            "remove_user_if_present(",
+            "remove_user_if_present_sids(",
+        ] {
             assert!(
                 !body.contains(banned),
                 "`move_user_to_voice_channel` calls `{banned}` — it must evict \
@@ -4375,10 +5290,70 @@ mod permission_tests {
     /// the channel being left), the slot each command reads, and each
     /// per-channel delete. A literal copy on purpose: changing the script has
     /// to mean changing this, deliberately, alongside the layout test below.
+    ///
+    /// S-3 D-1 added the two modes in front of the teardown: `connection`
+    /// (HDEL the sid, then a survivor of this user re-points the mapping and
+    /// returns 2 with nothing torn down) and `user` (HDEL every entry of this
+    /// user FIRST, no survivor branch, P2-10), plus the error reply for any
+    /// other mode; and moved the flags from `KEYS[7..]` to `KEYS[8..]` to make
+    /// room for `vc_conns:{channel}` at `KEYS[7]`. `unpack(KEYS, 7)` would now
+    /// DEL the whole connection record of every user in the call.
+    ///
+    /// S-3 WA-R changed it again, deliberately: the `connections` (set) mode
+    /// shares connection mode's loop and survivor scan (WA-1); the loop HDELs
+    /// a sid only when its RECORDED identity is the user's, and in connection
+    /// mode a foreign one is an error reply before any write (WA-6), with the
+    /// connection mode held to exactly one sid so that stays true; the
+    /// returns go through `answer`, which adds the skip counts in set mode
+    /// only, so the two older modes still return a bare integer.
     #[test]
     fn delete_voice_state_script_source_is_pinned() {
         let expected = [
             "",
+            "local prefix = ARGV[2] .. ':'",
+            "local foreign = 0",
+            "local unknown = 0",
+            "local function answer(code)",
+            "    if ARGV[4] == 'connections' then",
+            "        return \u{7b}code, foreign, unknown\u{7d}",
+            "    end",
+            "    return code",
+            "end",
+            "if ARGV[4] == 'connection' and #ARGV ~= 5 then",
+            "    return redis.error_reply('ERR voice state teardown: connection mode takes one sid')",
+            "end",
+            "if ARGV[4] == 'connection' or ARGV[4] == 'connections' then",
+            "    for i = 5, #ARGV do",
+            "        local identity = redis.call('HGET', KEYS[7], ARGV[i])",
+            "        if not identity then",
+            "            unknown = unknown + 1",
+            "        elseif identity == ARGV[2] or string.sub(identity, 1, #prefix) == prefix then",
+            "            redis.call('HDEL', KEYS[7], ARGV[i])",
+            "        elseif ARGV[4] == 'connection' then",
+            "            return redis.error_reply('ERR voice state teardown: foreign connection')",
+            "        else",
+            "            foreign = foreign + 1",
+            "        end",
+            "    end",
+            "    local identities = redis.call('HVALS', KEYS[7])",
+            "    for i = 1, #identities do",
+            "        local identity = identities[i]",
+            "        if identity == ARGV[2] or string.sub(identity, 1, #prefix) == prefix then",
+            "            redis.call('HSET', KEYS[5], ARGV[2], identity)",
+            "            return answer(2)",
+            "        end",
+            "    end",
+            "elseif ARGV[4] == 'user' then",
+            "    local entries = redis.call('HGETALL', KEYS[7])",
+            "    for i = 1, #entries, 2 do",
+            "        local identity = entries[i + 1]",
+            "        if identity == ARGV[2] or string.sub(identity, 1, #prefix) == prefix then",
+            "            redis.call('HDEL', KEYS[7], entries[i])",
+            "        end",
+            "    end",
+            "else",
+            "    return redis.error_reply('ERR voice state teardown: bad mode')",
+            "end",
             "redis.call('SREM', KEYS[2], ARGV[2])",
             "redis.call('SREM', KEYS[3], ARGV[3])",
             "redis.call('HDEL', KEYS[4], ARGV[2])",
@@ -4386,10 +5361,10 @@ mod permission_tests {
             "redis.call('DEL', KEYS[6])",
             "local pointer = redis.call('GET', KEYS[1])",
             "if pointer and pointer ~= ARGV[1] then",
-            "    return 0",
+            "    return answer(0)",
             "end",
-            "redis.call('DEL', KEYS[1], unpack(KEYS, 7))",
-            "return 1",
+            "redis.call('DEL', KEYS[1], unpack(KEYS, 8))",
+            "return answer(1)",
             "",
         ]
         .join("\n");
@@ -4433,7 +5408,8 @@ mod permission_tests {
                     "vc_leg:CHAN",                 // KEYS[4]
                     "voice_identity:CHAN",         // KEYS[5]
                     "annotations_allow:CHAN:USER", // KEYS[6]
-                    "joined_at:USER:SRV",          // KEYS[7..], the flags
+                    "vc_conns:CHAN",               // KEYS[7], per CHANNEL
+                    "joined_at:USER:SRV",          // KEYS[8..], the flags
                     "is_publishing:USER:SRV",
                     "is_receiving:USER:SRV",
                     "screensharing:USER:SRV",
@@ -4443,9 +5419,42 @@ mod permission_tests {
                     "rc_capable:USER:SRV",
                     "watching:USER:SRV",
                 ]),
-                // ARGV[1] the channel, ARGV[2] the user, ARGV[3] the `vc:` member
-                args: strings(&["CHAN", "USER", "CHAN-SRV"]),
+                // ARGV[1] the channel, ARGV[2] the user, ARGV[3] the `vc:`
+                // member, ARGV[4] whole-user mode
+                args: strings(&["CHAN", "USER", "CHAN-SRV", "user"]),
             }
+        );
+
+        // One connection's departure: the SAME keys, the mode switched and
+        // the sid appended as ARGV[5]. A per-server connection key would read
+        // "vc_conns:SRV" here and fail.
+        let mut connection = voice_state_teardown_input(&channel, "USER");
+        connection.args[3] = "connection".to_string();
+        connection.args.push("SID".to_string());
+        assert_eq!(
+            super::voice_connection_teardown_input(&channel, "USER", "SID"),
+            connection
+        );
+        assert_eq!(connection.keys[6], "vc_conns:CHAN");
+        assert_eq!(
+            connection.args.len(),
+            5,
+            "connection mode carries exactly one sid; the script refuses any other count"
+        );
+
+        // S-3 WA-R set mode: the SAME keys, the mode `connections`, and the
+        // sids as ARGV[5..] in the order given. An empty set is the bare
+        // four arguments, which the script reads as a survivor check.
+        let mut set = voice_state_teardown_input(&channel, "USER");
+        set.args[3] = "connections".to_string();
+        set.args.extend(strings(&["S2", "S1"]));
+        assert_eq!(
+            super::voice_connections_teardown_input(&channel, "USER", &strings(&["S2", "S1"])),
+            set
+        );
+        assert_eq!(
+            super::voice_connections_teardown_input(&channel, "USER", &[]).args,
+            strings(&["CHAN", "USER", "CHAN-SRV", "connections"])
         );
 
         // `ARGV[3]` must be the member `create_voice_state` SADDs into
@@ -4464,8 +5473,246 @@ mod permission_tests {
         };
         let input = voice_state_teardown_input(&direct, "USER");
         assert_eq!(input.keys[0], "USER:DM");
-        assert_eq!(input.keys[6], "joined_at:USER:DM");
-        assert_eq!(input.args, strings(&["DM", "USER", "DM"]));
+        assert_eq!(input.keys[6], "vc_conns:DM");
+        assert_eq!(input.keys[7], "joined_at:USER:DM");
+        assert_eq!(input.args, strings(&["DM", "USER", "DM", "user"]));
+    }
+
+    /// S-3 D-1: the record script's source and its `KEYS[]` / `ARGV[]` by
+    /// value. The answer is `SISMEMBER vc_members:{channel} user == 0` — the
+    /// voice state — and NOT `HLEN == 1` (P2-1: a stale sid would make a real
+    /// join invisible). The keys are per CHANNEL.
+    #[test]
+    fn record_voice_connection_script_is_pinned() {
+        use super::{
+            voice_connection_record_input, UserVoiceChannel, VoiceConnectionRecordInput,
+            RECORD_VOICE_CONNECTION_LUA,
+        };
+
+        assert_eq!(
+            RECORD_VOICE_CONNECTION_LUA,
+            [
+                "",
+                "redis.call('HSET', KEYS[1], ARGV[1], ARGV[2])",
+                "if redis.call('SISMEMBER', KEYS[2], ARGV[3]) == 1 then",
+                "    return 0",
+                "end",
+                "return 1",
+                "",
+            ]
+            .join("\n")
+        );
+        assert!(
+            this_file_shipping()
+                .contains("LazyLock::new(|| Script::new(RECORD_VOICE_CONNECTION_LUA))"),
+            "the static record script must be built from the source pinned above"
+        );
+
+        let strings =
+            |items: &[&str]| -> Vec<String> { items.iter().map(|item| item.to_string()).collect() };
+        assert_eq!(
+            voice_connection_record_input(
+                &UserVoiceChannel {
+                    id: "CHAN".to_string(),
+                    server_id: Some("SRV".to_string()),
+                },
+                "USER",
+                "SID",
+                "USER:DEV",
+            ),
+            VoiceConnectionRecordInput {
+                keys: strings(&["vc_conns:CHAN", "vc_members:CHAN"]),
+                args: strings(&["SID", "USER:DEV", "USER"]),
+            }
+        );
+
+        // The one record builder feeds the one invocation.
+        let body = flat_fn_body(&this_file_shipping(), "pub async fn record_voice_connection(");
+        for needle in [
+            "let input = voice_connection_record_input(channel, user_id, sid, identity);",
+            "let mut invocation = RECORD_VOICE_CONNECTION.prepare_invoke();",
+            "for key in &input.keys \u{7b} invocation.key(key); \u{7d}",
+            "for arg in &input.args \u{7b} invocation.arg(arg); \u{7d}",
+            "Ok(first) => Ok(first == 1),",
+        ] {
+            assert!(body.contains(needle), "`record_voice_connection` lost `{needle}`: {body}");
+        }
+    }
+
+    /// S-3 D-1 + P2-4: `delete_voice_connection` peeks the record READ-ONLY,
+    /// ends the watch session only when this sid is the user's last, and
+    /// only then runs the script in connection mode; `Survivor` is the
+    /// script's 2 and nothing else; the fallback is the degraded
+    /// per-connection one, and every other error is returned.
+    #[test]
+    fn delete_voice_connection_peeks_then_runs_the_script() {
+        let shipping = this_file_shipping();
+        let body = flat_fn_body(&shipping, "pub async fn delete_voice_connection(");
+        let at = |needle: &str| {
+            body.find(needle).unwrap_or_else(|| {
+                panic!("`delete_voice_connection` no longer has `{needle}`: {body}")
+            })
+        };
+
+        let peek = at(".hgetall(voice_connections_key(channel))");
+        let guard = at(
+            "if another_connection_of(&recorded, user_id, sid).is_none() \u{7b} \
+             watch::end_watch_session_if_host(channel, user_id).await; \u{7d}",
+        );
+        let input = at("let input = voice_connection_teardown_input(channel, user_id, sid);");
+        let invoke = at("invocation.invoke_async::<_, i64>(&mut conn).await");
+        assert!(peek < guard && guard < input && input < invoke, "{body}");
+        assert_eq!(
+            body.matches("end_watch_session_if_host(").count(),
+            1,
+            "the watch session ends in exactly one place, behind the peek: {body}"
+        );
+        for write in [".hdel(", ".hset(", ".del(", "Pipeline", ".query_async("] {
+            assert!(
+                !body[..invoke].contains(write),
+                "`delete_voice_connection` writes `{write}` before the script: {body}"
+            );
+        }
+
+        at("Ok(TEARDOWN_SURVIVOR) => Ok(ConnectionLeave::Survivor),");
+        at("Ok(_) => Ok(ConnectionLeave::Last),");
+        assert_eq!(super::TEARDOWN_SURVIVOR, 2);
+        assert_eq!(body.matches("ConnectionLeave::Survivor").count(), 1, "{body}");
+        let fallback = at("Err(error) if teardown_script_error_allows_fallback(&error) => ");
+        assert!(
+            body[fallback..].contains("\u{7d} delete_voice_connection_unconditionally(channel, user_id, sid).await \u{7d} Err(error) => "),
+            "the per-connection fallback must run after the latch: {body}"
+        );
+        assert!(
+            body.trim_end()
+                .ends_with("Err(error).to_internal_error() \u{7d} \u{7d}"),
+            "every other error is returned: {body}"
+        );
+        assert_eq!(
+            call_sites(&shipping, "delete_voice_connection_unconditionally(").len(),
+            1,
+            "the degraded per-connection teardown is the script's fallback and nothing else"
+        );
+
+        // S-3 WA-6: a sid recorded as another user's is refused on the peek,
+        // BEFORE the watch session can end, with an error and no write; the
+        // script's own refusal maps to an error too, ahead of the fallback.
+        let refuse = at(".filter(|identity| user_id_from_participant_identity(identity) != user_id);");
+        assert!(peek < refuse && refuse < guard, "{body}");
+        assert!(
+            body[refuse..guard].contains("return Err(create_error!(InternalError));"),
+            "{body}"
+        );
+        let script_refusal = at("Err(error) if teardown_refused_a_foreign_connection(&error) => ");
+        assert!(script_refusal < fallback, "{body}");
+        assert!(
+            body[script_refusal..fallback].contains("Err(create_error!(InternalError))"),
+            "{body}"
+        );
+    }
+
+    /// S-3 WA-R: `delete_voice_connections` is `delete_voice_connection`'s
+    /// shape in set mode: peek READ-ONLY, end the watch session only when no
+    /// entry of the user would remain outside the set, then the script in
+    /// `connections` mode, fed only by the pinned set input; a survivor is
+    /// the script's 2 and nothing else; the degraded set fallback runs after
+    /// the latch; every other error is returned.
+    #[test]
+    fn delete_voice_connections_peeks_then_runs_the_set_script() {
+        let shipping = this_file_shipping();
+        let body = flat_fn_body(&shipping, "pub async fn delete_voice_connections(");
+        let at = |needle: &str| {
+            body.find(needle).unwrap_or_else(|| {
+                panic!("`delete_voice_connections` no longer has `{needle}`: {body}")
+            })
+        };
+
+        let peek = at(".hgetall(voice_connections_key(channel))");
+        let guard = at(
+            "if another_connection_outside(&recorded, user_id, sids).is_none() \u{7b} \
+             watch::end_watch_session_if_host(channel, user_id).await; \u{7d}",
+        );
+        let input = at("let input = voice_connections_teardown_input(channel, user_id, sids);");
+        let invoke = at("invocation.invoke_async::<_, (i64, i64, i64)>(&mut conn).await");
+        assert!(peek < guard && guard < input && input < invoke, "{body}");
+        at("for key in &input.keys \u{7b} invocation.key(key); \u{7d}");
+        at("for arg in &input.args \u{7b} invocation.arg(arg); \u{7d}");
+        assert_eq!(body.matches("end_watch_session_if_host(").count(), 1, "{body}");
+        for write in [".hdel(", ".hset(", ".del(", "Pipeline", ".query_async("] {
+            assert!(
+                !body.contains(write),
+                "`delete_voice_connections` writes `{write}` outside the script: {body}"
+            );
+        }
+
+        at("TEARDOWN_SURVIVOR => Ok(ConnectionLeave::Survivor),");
+        at("_ => Ok(ConnectionLeave::Last),");
+        assert_eq!(body.matches("ConnectionLeave::Survivor").count(), 1, "{body}");
+        let fallback = at("Err(error) if teardown_script_error_allows_fallback(&error) => ");
+        assert!(
+            body[fallback..].contains(
+                "\u{7d} delete_voice_connections_unconditionally(channel, user_id, sids).await \
+                 \u{7d} Err(error) => "
+            ),
+            "the set fallback must run after the latch: {body}"
+        );
+        assert!(
+            body.trim_end()
+                .ends_with("Err(error).to_internal_error() \u{7d} \u{7d}"),
+            "every other error is returned: {body}"
+        );
+        assert_eq!(
+            call_sites(&shipping, "delete_voice_connections_unconditionally(").len(),
+            1,
+            "the degraded set teardown is the script's fallback and nothing else"
+        );
+
+        // The set fallback: this user's recorded sids only, then the same
+        // survivor rule, then the unconditional teardown.
+        let set_fallback =
+            flat_fn_body(&shipping, "async fn delete_voice_connections_unconditionally(");
+        assert!(
+            set_fallback.contains(
+                ".is_some_and(|identity| user_id_from_participant_identity(identity) == user_id)"
+            ),
+            "{set_fallback}"
+        );
+        assert!(
+            set_fallback.ends_with(
+                "delete_voice_state_unconditionally(channel, user_id).await?; \
+                 Ok(ConnectionLeave::Last)"
+            ),
+            "{set_fallback}"
+        );
+    }
+
+    /// S-3 D-4: `roster_connections` by value. Grouped by the OWNING user as
+    /// `user_id_from_participant_identity` reads it — never by a string
+    /// prefix, so `uu:B` is not `u`'s — and legs kept under their owner, in
+    /// listed order. Mutation: grouping by `starts_with(user)` without the
+    /// `:`.
+    #[test]
+    fn roster_connections_groups_by_owner_and_keeps_legs() {
+        use super::roster_connections;
+
+        let roster = roster_connections(
+            ["u", "u:A", "uu:B", "u:A:screen", "v::screen", "v", "uu"]
+                .map(str::to_string),
+        );
+        let strings =
+            |items: &[&str]| -> Vec<String> { items.iter().map(|item| item.to_string()).collect() };
+
+        assert_eq!(
+            roster,
+            [
+                ("u".to_string(), strings(&["u", "u:A", "u:A:screen"])),
+                ("uu".to_string(), strings(&["uu:B", "uu"])),
+                ("v".to_string(), strings(&["v::screen", "v"])),
+            ]
+            .into_iter()
+            .collect()
+        );
+        assert!(roster_connections(Vec::<String>::new()).is_empty());
     }
 
     /// B-2 + M-5 + L-6: `delete_voice_state` feeds the script ONLY from the
@@ -4566,15 +5813,47 @@ mod permission_tests {
                  (`{banned}`): {other_arm}"
             );
         }
+        // S-3 D-1: TWO call sites, and both are fallbacks of the same
+        // script — this arm, and the per-connection fallback when the leaving
+        // connection turns out to be the user's last. S-3 WA-R adds the THIRD,
+        // the set-mode fallback in the same position (pinned in
+        // `delete_voice_connections_peeks_then_runs_the_set_script`). Each is
+        // pinned where it sits.
         assert_eq!(
             call_sites(&shipping, "delete_voice_state_unconditionally(").len(),
-            1,
+            3,
             "the unconditional teardown is the script's fallback and nothing \
              else: it wipes a newer channel's per-server state after a move"
         );
+        let per_connection_fallback =
+            flat_fn_body(&shipping, "async fn delete_voice_connection_unconditionally(");
+        assert!(
+            per_connection_fallback.ends_with(
+                "delete_voice_state_unconditionally(channel, user_id).await?; \
+                 Ok(ConnectionLeave::Last)"
+            ),
+            "the per-connection fallback reaches the unconditional teardown only \
+             once no survivor is recorded: {per_connection_fallback}"
+        );
 
-        // The fallback is the pre-script delete set, every key unconditional.
+        // The fallback is the pre-script delete set, every key unconditional,
+        // after this user's entries leave the connection record (S-3 D-1).
         let fallback = flat_fn_body(&shipping, "async fn delete_voice_state_unconditionally(");
+        let record_hdel = fallback
+            .find("conn.hdel::<_, _, ()>(voice_connections_key(channel), theirs)")
+            .unwrap_or_else(|| {
+                panic!("the fallback no longer clears this user's connections: {fallback}")
+            });
+        assert!(
+            fallback.contains(
+                ".filter(|(_, identity)| user_id_from_participant_identity(identity) == user_id)"
+            ),
+            "the fallback must clear THIS user's connections only: {fallback}"
+        );
+        assert!(
+            record_hdel < fallback.find("Pipeline::new()").expect("the pipeline"),
+            "the connection record is cleared FIRST: {fallback}"
+        );
         for needle in [
             "Pipeline::new()",
             ".srem(format!(\"vc_members:{}\", &channel.id), user_id)",
@@ -7286,12 +8565,20 @@ mod tests {
     }
 
     /// Give `user` a value in every per-channel key the teardown script
-    /// clears, beyond the two `create_voice_state` already writes.
+    /// clears, beyond the two `create_voice_state` already writes — including
+    /// two entries in the connection record (S-3 D-1), which the whole-user
+    /// teardown must clear both of.
     async fn seed_per_channel_voice_state(conn: &mut Conn, channel: &UserVoiceChannel, user: &str) {
         let _: () = conn
             .hset(format!("vc_leg:{}", channel.id), user, "SID")
             .await
             .unwrap();
+        for (sid, identity) in [("CONN_A", user.to_string()), ("CONN_B", format!("{user}:D1"))] {
+            let _: () = conn
+                .hset(format!("vc_conns:{}", channel.id), format!("{sid}{user}"), identity)
+                .await
+                .unwrap();
+        }
         let _: () = conn
             .hset(
                 format!("voice_identity:{}", channel.id),
@@ -7333,12 +8620,20 @@ mod tests {
             .exists(format!("annotations_allow:{}:{user}", channel.id))
             .await
             .unwrap();
+        let connections: std::collections::BTreeMap<String, String> = conn
+            .hgetall(format!("vc_conns:{}", channel.id))
+            .await
+            .unwrap();
+        let recorded = connections
+            .values()
+            .any(|recorded| user_id_from_participant_identity(recorded) == user);
 
         assert_eq!(
-            (member, listed, leg, identity, annotations),
-            (false, false, false, false, false),
+            (member, listed, leg, identity, annotations, recorded),
+            (false, false, false, false, false, false),
             "{case}: per-channel state must go unconditionally \
-             (vc_members, vc:, vc_leg, voice_identity, annotations_allow)"
+             (vc_members, vc:, vc_leg, voice_identity, annotations_allow, and \
+             every vc_conns entry of the user)"
         );
     }
 
@@ -7399,9 +8694,14 @@ mod tests {
             .hexists(format!("voice_identity:{}", destination.id), &user)
             .await
             .unwrap();
+        let destination_connections: u64 = conn
+            .hlen(format!("vc_conns:{}", destination.id))
+            .await
+            .unwrap();
         assert!(
-            still_in_destination && destination_identity,
-            "a leave from the source must not touch the destination's per-channel state"
+            still_in_destination && destination_identity && destination_connections == 2,
+            "a leave from the source must not touch the destination's per-channel state \
+             (connection record included)"
         );
 
         let pointer: Option<String> = conn.get(&unique_key).await.unwrap();
@@ -7632,5 +8932,1442 @@ mod tests {
         clear_afk_since(&user, &server).await.unwrap();
         drop_idle_member(&member).await.unwrap();
         delete_voice_state(&channel, &user).await.expect("cleanup");
+    }
+
+    // ---- the per-connection record (AFK S-3 D-1) ----
+    //
+    // Every case below drives the REAL functions against Redis on the shared
+    // runtime, with ULID-suffixed ids, and leaves nothing behind.
+
+    /// A fresh server voice channel and user id for one case.
+    fn connection_case_ids(tag: &str) -> (UserVoiceChannel, String, String) {
+        let suffix = ulid::Ulid::new().to_string();
+        let server = format!("srv{tag}{suffix}");
+        (
+            UserVoiceChannel {
+                id: format!("chan{tag}{suffix}"),
+                server_id: Some(server.clone()),
+            },
+            format!("user{tag}{suffix}"),
+            server,
+        )
+    }
+
+    async fn recorded_connections(
+        conn: &mut Conn,
+        channel: &UserVoiceChannel,
+    ) -> std::collections::BTreeMap<String, String> {
+        conn.hgetall(format!("vc_conns:{}", channel.id))
+            .await
+            .unwrap()
+    }
+
+    async fn is_voice_member(conn: &mut Conn, channel: &UserVoiceChannel, user: &str) -> bool {
+        conn.sismember(format!("vc_members:{}", channel.id), user)
+            .await
+            .unwrap()
+    }
+
+    /// Every per-server key of `user` under `server`: the pointer and the
+    /// nine flags.
+    fn per_server_keys(user: &str, server: &str) -> Vec<String> {
+        let unique_key = format!("{user}:{server}");
+        let mut keys: Vec<String> = [
+            "joined_at",
+            "is_publishing",
+            "is_receiving",
+            "screensharing",
+            "camera",
+            "screen_video",
+            "recording",
+            "rc_capable",
+            "watching",
+        ]
+        .iter()
+        .map(|flag| format!("{flag}:{unique_key}"))
+        .collect();
+        keys.push(unique_key);
+        keys
+    }
+
+    /// T1 + F-15: two connections of one user in one channel. The second
+    /// join does not reset the state; the first leave keeps the state, the
+    /// membership and the flags and re-points the mapping at the survivor;
+    /// the second leave tears everything down. Mutation n1 (the script's
+    /// survivor branch removed) turns the first leave into a teardown.
+    #[test]
+    fn a_surviving_connection_keeps_the_voice_state() {
+        rt().block_on(a_surviving_connection_keeps_the_voice_state_case())
+    }
+
+    async fn a_surviving_connection_keeps_the_voice_state_case() {
+        let (channel, user, server) = connection_case_ids("T1");
+        let (first, second) = (format!("{user}:D1"), format!("{user}:D2"));
+        let mut conn = get_connection().await.expect("redis");
+
+        assert!(
+            record_voice_connection(&channel, &user, "SID1", &first)
+                .await
+                .unwrap(),
+            "the first connection has no voice state yet"
+        );
+        create_voice_state(&channel, &user, Timestamp::now_utc())
+            .await
+            .unwrap();
+        set_voice_participant_identity(&channel.id, &user, &first)
+            .await
+            .unwrap();
+        assert!(
+            !record_voice_connection(&channel, &user, "SID2", &second)
+                .await
+                .unwrap(),
+            "the second connection joins a user who already holds state: no reset (F-15)"
+        );
+        update_voice_state(
+            &channel,
+            &user,
+            &PartialUserVoiceState {
+                camera: Some(true),
+                recording: Some(true),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            delete_voice_connection(&channel, &user, "SID1")
+                .await
+                .unwrap(),
+            ConnectionLeave::Survivor
+        );
+        let state = get_voice_state(&channel, &user)
+            .await
+            .unwrap()
+            .expect("the surviving connection keeps the voice state");
+        assert!(state.camera && state.recording, "...flags included");
+        assert!(is_voice_member(&mut conn, &channel, &user).await);
+        assert!(get_user_voice_channels(&user).await.unwrap().contains(&channel));
+        assert_eq!(
+            stored_voice_participant_identity(&channel.id, &user)
+                .await
+                .unwrap(),
+            Some(second.clone()),
+            "the mapping is re-pointed at the surviving connection"
+        );
+        assert_eq!(
+            recorded_connections(&mut conn, &channel).await,
+            [("SID2".to_string(), second.clone())].into_iter().collect()
+        );
+
+        assert_eq!(
+            delete_voice_connection(&channel, &user, "SID2")
+                .await
+                .unwrap(),
+            ConnectionLeave::Last
+        );
+        assert!(get_voice_state(&channel, &user).await.unwrap().is_none());
+        assert!(!is_voice_member(&mut conn, &channel, &user).await);
+        assert!(!get_user_voice_channels(&user).await.unwrap().contains(&channel));
+        assert_eq!(
+            stored_voice_participant_identity(&channel.id, &user)
+                .await
+                .unwrap(),
+            None
+        );
+        let record_exists: bool = conn
+            .exists(format!("vc_conns:{}", channel.id))
+            .await
+            .unwrap();
+        assert!(!record_exists, "the last connection's entry is gone");
+        let left: Vec<Option<String>> = conn.mget(per_server_keys(&user, &server)).await.unwrap();
+        assert!(left.iter().all(Option::is_none), "{left:?}");
+    }
+
+    /// T2, the ownership rule, and the legacy path. An unknown sid while a
+    /// connection of the user is recorded tears nothing down. A connection of
+    /// ANOTHER user whose id merely extends this one's is not a survivor.
+    /// A user the record has never seen (connected before it existed) leaves
+    /// with today's teardown.
+    #[test]
+    fn an_unknown_sid_keeps_and_a_lookalike_user_does_not() {
+        rt().block_on(an_unknown_sid_keeps_and_a_lookalike_user_does_not_case())
+    }
+
+    async fn an_unknown_sid_keeps_and_a_lookalike_user_does_not_case() {
+        let (channel, user, _) = connection_case_ids("T2");
+        let lookalike = format!("{user}X");
+        let legacy = format!("{user}L");
+        let mut conn = get_connection().await.expect("redis");
+
+        assert!(record_voice_connection(&channel, &user, "SIDA", &user)
+            .await
+            .unwrap());
+        create_voice_state(&channel, &user, Timestamp::now_utc())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            delete_voice_connection(&channel, &user, "SID_UNKNOWN")
+                .await
+                .unwrap(),
+            ConnectionLeave::Survivor,
+            "an unknown sid must not tear down a recorded, live connection"
+        );
+        assert!(get_voice_state(&channel, &user).await.unwrap().is_some());
+        assert!(recorded_connections(&mut conn, &channel)
+            .await
+            .contains_key("SIDA"));
+
+        let lookalike_identity = format!("{lookalike}:D");
+        assert!(
+            record_voice_connection(&channel, &lookalike, "SIDX", &lookalike_identity)
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            delete_voice_connection(&channel, &user, "SIDA")
+                .await
+                .unwrap(),
+            ConnectionLeave::Last,
+            "`{{user}}X:D` is another user's connection, not a survivor of `{{user}}`"
+        );
+        assert!(get_voice_state(&channel, &user).await.unwrap().is_none());
+        assert_eq!(
+            recorded_connections(&mut conn, &channel).await,
+            [("SIDX".to_string(), lookalike_identity)]
+                .into_iter()
+                .collect(),
+            "only the leaving user's entries go"
+        );
+
+        create_voice_state(&channel, &legacy, Timestamp::now_utc())
+            .await
+            .unwrap();
+        assert_eq!(
+            delete_voice_connection(&channel, &legacy, "SID_LEGACY")
+                .await
+                .unwrap(),
+            ConnectionLeave::Last,
+            "no record at all is a last connection, as before S-3"
+        );
+        assert!(get_voice_state(&channel, &legacy).await.unwrap().is_none());
+        assert!(!is_voice_member(&mut conn, &channel, &legacy).await);
+
+        delete_channel_voice_state(&channel, &[lookalike])
+            .await
+            .expect("cleanup");
+    }
+
+    /// T-late: a connection keeps its identity across a move. The late
+    /// `participant_left` of its SOURCE connection is the source's last,
+    /// tears the source down, and leaves the destination's record, membership
+    /// and state alone. Mutation n5 (the record keyed per server): the source
+    /// leave finds the destination entry, answers `Survivor` and keeps the
+    /// source state.
+    #[test]
+    fn a_late_source_leave_leaves_the_destination_alone() {
+        rt().block_on(a_late_source_leave_leaves_the_destination_alone_case())
+    }
+
+    async fn a_late_source_leave_leaves_the_destination_alone_case() {
+        let (source, user, server) = connection_case_ids("TL");
+        let destination = UserVoiceChannel {
+            id: format!("{}D", source.id),
+            server_id: Some(server),
+        };
+        let identity = format!("{user}:D1");
+        let mut conn = get_connection().await.expect("redis");
+
+        assert!(record_voice_connection(&source, &user, "SID_S", &identity)
+            .await
+            .unwrap());
+        create_voice_state(&source, &user, Timestamp::now_utc())
+            .await
+            .unwrap();
+        assert!(
+            record_voice_connection(&destination, &user, "SID_D", &identity)
+                .await
+                .unwrap(),
+            "the moved connection has no state in the destination yet"
+        );
+        create_voice_state(&destination, &user, Timestamp::now_utc())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            delete_voice_connection(&source, &user, "SID_S")
+                .await
+                .unwrap(),
+            ConnectionLeave::Last
+        );
+        assert!(!is_voice_member(&mut conn, &source, &user).await);
+        assert!(is_voice_member(&mut conn, &destination, &user).await);
+        assert_eq!(
+            recorded_connections(&mut conn, &destination).await,
+            [("SID_D".to_string(), identity.clone())]
+                .into_iter()
+                .collect()
+        );
+        assert!(
+            get_voice_state(&destination, &user)
+                .await
+                .unwrap()
+                .is_some(),
+            "the destination's state survives the late source leave"
+        );
+        assert_eq!(
+            get_user_voice_channel_in_server(&user, destination.server_id.as_ref().unwrap())
+                .await
+                .unwrap(),
+            Some(destination.id.clone())
+        );
+
+        delete_voice_state(&destination, &user)
+            .await
+            .expect("cleanup");
+    }
+
+    /// P2-1: "first" is decided on the voice state, never on the record's
+    /// size. A stale sid then a rejoin still creates state (mutation n2,
+    /// `HLEN == 1`, answers false); `delete_channel_voice_state` with no user
+    /// ids — the `room_finished` / reconcile shape — clears the record
+    /// (mutation n4).
+    ///
+    /// S-3 WA-R removed a third segment from here: a moderator's whole-user
+    /// teardown between a sibling's record and its create, followed by the
+    /// sibling's "next record" returning `true`. It re-recorded the same sid,
+    /// which production never does (`participant_joined` fires once per
+    /// sid), so it passed while the race it named was open (WA-1). The race
+    /// is pinned, one record per sid, by
+    /// `a_sibling_recorded_after_the_listing_keeps_the_state`.
+    #[test]
+    fn a_stale_record_never_hides_a_join() {
+        rt().block_on(a_stale_record_never_hides_a_join_case())
+    }
+
+    async fn a_stale_record_never_hides_a_join_case() {
+        let (channel, user, _) = connection_case_ids("P21");
+        let mut conn = get_connection().await.expect("redis");
+
+        // A missed leave left a stale entry behind.
+        let _: () = conn
+            .hset(format!("vc_conns:{}", channel.id), "SID_STALE", &user)
+            .await
+            .unwrap();
+        assert!(
+            record_voice_connection(&channel, &user, "SID_NEW", &user)
+                .await
+                .unwrap(),
+            "a user with no voice state is a first connection, whatever the record holds"
+        );
+        create_voice_state(&channel, &user, Timestamp::now_utc())
+            .await
+            .unwrap();
+
+        delete_channel_voice_state(&channel, &[]).await.unwrap();
+        let record_exists: bool = conn
+            .exists(format!("vc_conns:{}", channel.id))
+            .await
+            .unwrap();
+        assert!(
+            !record_exists,
+            "the whole-call teardown with no user ids must DEL the connection record"
+        );
+
+        delete_channel_voice_state(&channel, &[user.clone()])
+            .await
+            .expect("cleanup");
+    }
+
+    /// S-3 WA-1, one record per sid as in production. Connection A records
+    /// and gets state; the caller reads the record (the step every
+    /// listing-driven teardown takes FIRST); connection B then records,
+    /// answering `false` because state exists, so B never creates its own;
+    /// the caller then removes exactly what it knew about, `[A]`. B must keep
+    /// the state, the membership and its entry, and the mapping must name B.
+    ///
+    /// The pre-WA-R shape, a whole-user `delete_voice_state` in place of the
+    /// set call, leaves B live, stateless and unrecorded: this test is red
+    /// against it (mutation w4). Mutation w2 (set mode skips the survivor
+    /// scan) is red here too.
+    #[test]
+    fn a_sibling_recorded_after_the_listing_keeps_the_state() {
+        rt().block_on(a_sibling_recorded_after_the_listing_keeps_the_state_case())
+    }
+
+    async fn a_sibling_recorded_after_the_listing_keeps_the_state_case() {
+        let (channel, user, server) = connection_case_ids("WA1");
+        let (sibling_a, sibling_b) = (format!("{user}:A"), format!("{user}:B"));
+        let mut conn = get_connection().await.expect("redis");
+
+        assert!(record_voice_connection(&channel, &user, "SID_A", &sibling_a)
+            .await
+            .unwrap());
+        create_voice_state(&channel, &user, Timestamp::now_utc())
+            .await
+            .unwrap();
+        set_voice_participant_identity(&channel.id, &user, &sibling_a)
+            .await
+            .unwrap();
+
+        // The caller's snapshot, read BEFORE its listing.
+        let recorded = recorded_voice_connections(&channel, &user).await.unwrap();
+        assert_eq!(recorded, vec![("SID_A".to_string(), sibling_a.clone())]);
+        let known: Vec<String> = recorded.into_iter().map(|(sid, _)| sid).collect();
+
+        // B joins after the listing: state exists, so B creates none.
+        assert!(
+            !record_voice_connection(&channel, &user, "SID_B", &sibling_b)
+                .await
+                .unwrap(),
+            "B joins a user who already holds state"
+        );
+
+        let leave = delete_voice_connections(&channel, &user, &known).await.unwrap();
+
+        assert_eq!(leave, ConnectionLeave::Survivor);
+        assert!(
+            get_voice_state(&channel, &user).await.unwrap().is_some(),
+            "B relied on the existing state; it must survive the removal of A"
+        );
+        assert!(is_voice_member(&mut conn, &channel, &user).await);
+        assert!(get_user_voice_channels(&user).await.unwrap().contains(&channel));
+        assert_eq!(
+            recorded_connections(&mut conn, &channel).await,
+            [("SID_B".to_string(), sibling_b.clone())].into_iter().collect(),
+            "A's entry goes, B's stays"
+        );
+        assert_eq!(
+            stored_voice_participant_identity(&channel.id, &user)
+                .await
+                .unwrap(),
+            Some(sibling_b.clone()),
+            "the mapping names the survivor"
+        );
+        let flags: Vec<Option<String>> = conn.mget(per_server_keys(&user, &server)).await.unwrap();
+        assert!(
+            flags.iter().any(Option::is_some),
+            "the per-server state is kept: {flags:?}"
+        );
+
+        delete_voice_state(&channel, &user).await.expect("cleanup");
+    }
+
+    /// S-3 WA-R set mode, the ownership rule (WA-6 for sets): a sid recorded
+    /// as another user's is skipped, never HDELed, including a user whose id
+    /// merely extends this one's (`{user}X:D`). With the user's own
+    /// connection still recorded that is a `Survivor`; naming the user's own
+    /// sid alongside the foreign one is the `Last`, and the other user keeps
+    /// their entry and state throughout. Mutation w1 (set mode HDELs any
+    /// given sid) deletes the other user's entry.
+    #[test]
+    fn a_set_teardown_never_removes_another_users_connection() {
+        rt().block_on(a_set_teardown_never_removes_another_users_connection_case())
+    }
+
+    async fn a_set_teardown_never_removes_another_users_connection_case() {
+        let (channel, user, _) = connection_case_ids("WAF");
+        let other = format!("{user}X");
+        let other_identity = format!("{other}:D");
+        let mut conn = get_connection().await.expect("redis");
+
+        assert!(record_voice_connection(&channel, &user, "SID_U", &user)
+            .await
+            .unwrap());
+        create_voice_state(&channel, &user, Timestamp::now_utc())
+            .await
+            .unwrap();
+        assert!(
+            record_voice_connection(&channel, &other, "SID_O", &other_identity)
+                .await
+                .unwrap()
+        );
+        create_voice_state(&channel, &other, Timestamp::now_utc())
+            .await
+            .unwrap();
+        let both: std::collections::BTreeMap<String, String> = [
+            ("SID_O".to_string(), other_identity.clone()),
+            ("SID_U".to_string(), user.clone()),
+        ]
+        .into_iter()
+        .collect();
+
+        assert_eq!(
+            delete_voice_connections(&channel, &user, &["SID_O".to_string()])
+                .await
+                .unwrap(),
+            ConnectionLeave::Survivor,
+            "a foreign sid is skipped, and the user's own connection is still recorded"
+        );
+        assert_eq!(recorded_connections(&mut conn, &channel).await, both);
+        assert!(get_voice_state(&channel, &user).await.unwrap().is_some());
+
+        assert_eq!(
+            delete_voice_connections(
+                &channel,
+                &user,
+                &["SID_O".to_string(), "SID_U".to_string(), "SID_NONE".to_string()]
+            )
+            .await
+            .unwrap(),
+            ConnectionLeave::Last
+        );
+        assert!(get_voice_state(&channel, &user).await.unwrap().is_none());
+        assert!(!is_voice_member(&mut conn, &channel, &user).await);
+        assert_eq!(
+            recorded_connections(&mut conn, &channel).await,
+            [("SID_O".to_string(), other_identity.clone())]
+                .into_iter()
+                .collect(),
+            "the other user's entry is never removed"
+        );
+        assert!(get_voice_state(&channel, &other).await.unwrap().is_some());
+        assert!(is_voice_member(&mut conn, &channel, &other).await);
+
+        delete_channel_voice_state(&channel, &[other])
+            .await
+            .expect("cleanup");
+    }
+
+    /// S-3 WA-R set mode: naming every recorded sid of the user is the
+    /// `Last` with the full teardown (state, membership, mapping, the
+    /// per-server keys, the user's entries). And the EMPTY set, pinned as a
+    /// survivor check: `Survivor` with nothing removed when the user has a
+    /// recorded entry, `Last` with the full teardown when they have none (a
+    /// legacy connection).
+    #[test]
+    fn a_set_teardown_of_every_connection_is_the_last_and_an_empty_set_checks() {
+        rt().block_on(a_set_teardown_of_every_connection_is_the_last_and_an_empty_set_checks_case())
+    }
+
+    async fn a_set_teardown_of_every_connection_is_the_last_and_an_empty_set_checks_case() {
+        let (channel, user, server) = connection_case_ids("WAL");
+        let legacy = format!("{user}L");
+        let mut conn = get_connection().await.expect("redis");
+
+        for (sid, identity) in [("SID_1", user.clone()), ("SID_2", format!("{user}:D"))] {
+            record_voice_connection(&channel, &user, sid, &identity)
+                .await
+                .unwrap();
+        }
+        create_voice_state(&channel, &user, Timestamp::now_utc())
+            .await
+            .unwrap();
+        set_voice_participant_identity(&channel.id, &user, &user)
+            .await
+            .unwrap();
+
+        // Empty set, the user recorded: a survivor check, nothing removed.
+        assert_eq!(
+            delete_voice_connections(&channel, &user, &[]).await.unwrap(),
+            ConnectionLeave::Survivor
+        );
+        assert!(get_voice_state(&channel, &user).await.unwrap().is_some());
+        assert_eq!(recorded_connections(&mut conn, &channel).await.len(), 2);
+
+        assert_eq!(
+            delete_voice_connections(
+                &channel,
+                &user,
+                &["SID_2".to_string(), "SID_1".to_string()]
+            )
+            .await
+            .unwrap(),
+            ConnectionLeave::Last
+        );
+        assert!(get_voice_state(&channel, &user).await.unwrap().is_none());
+        assert!(!is_voice_member(&mut conn, &channel, &user).await);
+        assert!(!get_user_voice_channels(&user).await.unwrap().contains(&channel));
+        assert_eq!(
+            stored_voice_participant_identity(&channel.id, &user)
+                .await
+                .unwrap(),
+            None
+        );
+        assert!(recorded_connections(&mut conn, &channel).await.is_empty());
+        let left: Vec<Option<String>> = conn.mget(per_server_keys(&user, &server)).await.unwrap();
+        assert!(left.iter().all(Option::is_none), "{left:?}");
+
+        // Empty set, the user never recorded: the full teardown.
+        create_voice_state(&channel, &legacy, Timestamp::now_utc())
+            .await
+            .unwrap();
+        assert_eq!(
+            delete_voice_connections(&channel, &legacy, &[]).await.unwrap(),
+            ConnectionLeave::Last
+        );
+        assert!(get_voice_state(&channel, &legacy).await.unwrap().is_none());
+        assert!(!is_voice_member(&mut conn, &channel, &legacy).await);
+    }
+
+    /// S-3 WA-6: connection mode refuses a sid recorded as ANOTHER user's
+    /// with an error and nothing written: both users' entries and states
+    /// intact, and the caller's watch session NOT ended (the Rust peek
+    /// refuses before the session end; mutation w3a removes that check).
+    /// The script refuses on its own too, before any write (mutation w3b),
+    /// and so does the degraded fallback. A sid with no record at all is
+    /// still not refused.
+    #[test]
+    fn a_connection_teardown_refuses_another_users_sid() {
+        rt().block_on(a_connection_teardown_refuses_another_users_sid_case())
+    }
+
+    async fn a_connection_teardown_refuses_another_users_sid_case() {
+        let (channel, user, _) = connection_case_ids("WA6");
+        let other = format!("{user}O");
+        let mut conn = get_connection().await.expect("redis");
+
+        // The caller holds state with NO recorded connection (legacy) and
+        // hosts a watch session, so without the peek's refusal the peek
+        // would read "last" and end the session before the script refused.
+        create_voice_state(&channel, &user, Timestamp::now_utc())
+            .await
+            .unwrap();
+        let session = watch::create_watch_session(
+            &channel.id,
+            &user,
+            v0::WatchMedia::YouTube {
+                video_id: "YE7VzlLtp-4".to_string(),
+                title: None,
+            },
+        )
+        .await
+        .unwrap()
+        .expect("a fresh channel accepts a session");
+        assert!(record_voice_connection(&channel, &other, "SID_O", &other)
+            .await
+            .unwrap());
+        create_voice_state(&channel, &other, Timestamp::now_utc())
+            .await
+            .unwrap();
+        let only_other: std::collections::BTreeMap<String, String> =
+            [("SID_O".to_string(), other.clone())].into_iter().collect();
+
+        async fn untouched(
+            conn: &mut Conn,
+            channel: &UserVoiceChannel,
+            user: &str,
+            other: &str,
+            only_other: &std::collections::BTreeMap<String, String>,
+            what: &str,
+        ) {
+            assert_eq!(&recorded_connections(conn, channel).await, only_other, "{what}");
+            assert!(get_voice_state(channel, user).await.unwrap().is_some(), "{what}");
+            assert!(get_voice_state(channel, other).await.unwrap().is_some(), "{what}");
+            assert!(is_voice_member(conn, channel, user).await, "{what}");
+            assert!(is_voice_member(conn, channel, other).await, "{what}");
+        }
+
+        assert!(
+            delete_voice_connection(&channel, &user, "SID_O")
+                .await
+                .is_err(),
+            "another user's sid must be refused, not deleted"
+        );
+        untouched(&mut conn, &channel, &user, &other, &only_other, "after the refusal").await;
+        assert_eq!(
+            watch::fetch_watch_session(&channel.id)
+                .await
+                .unwrap()
+                .map(|kept| kept.id),
+            Some(session.id.clone()),
+            "the refusal comes before the watch session could end"
+        );
+
+        // The script on its own: an error reply, nothing written.
+        let input = voice_connection_teardown_input(&channel, &user, "SID_O");
+        let mut invocation = DELETE_VOICE_STATE.prepare_invoke();
+        for key in &input.keys {
+            invocation.key(key);
+        }
+        for arg in &input.args {
+            invocation.arg(arg);
+        }
+        let refused = invocation
+            .invoke_async::<_, i64>(&mut get_connection().await.unwrap().into_inner())
+            .await;
+        assert!(
+            refused
+                .as_ref()
+                .is_err_and(teardown_refused_a_foreign_connection),
+            "{refused:?}"
+        );
+        untouched(&mut conn, &channel, &user, &other, &only_other, "after the script").await;
+
+        // The degraded fallback keeps the rule.
+        assert!(
+            delete_voice_connection_unconditionally(&channel, &user, "SID_O")
+                .await
+                .is_err()
+        );
+        untouched(&mut conn, &channel, &user, &other, &only_other, "after the fallback").await;
+
+        // No record at all is not a refusal: the survivor scan decides, and
+        // the caller has no recorded connection, so it is the `Last`.
+        assert_eq!(
+            delete_voice_connection(&channel, &user, "SID_NONE")
+                .await
+                .unwrap(),
+            ConnectionLeave::Last
+        );
+        assert!(get_voice_state(&channel, &user).await.unwrap().is_none());
+        assert_eq!(recorded_connections(&mut conn, &channel).await, only_other);
+
+        delete_channel_voice_state(&channel, &[other])
+            .await
+            .expect("cleanup");
+    }
+
+    /// S-3 WA-R: `recorded_voice_connections` returns exactly the user's
+    /// `(sid, identity)` pairs, ordered by sid: the bare and the
+    /// device-qualified identity, never a lookalike user's `{user}u:B`.
+    /// Mutation w5 (a bare `starts_with(user)`) includes it.
+    #[test]
+    fn the_recorded_connections_are_exactly_the_users() {
+        rt().block_on(the_recorded_connections_are_exactly_the_users_case())
+    }
+
+    async fn the_recorded_connections_are_exactly_the_users_case() {
+        let (channel, user, _) = connection_case_ids("RVC");
+        let lookalike = format!("{user}u");
+
+        for (sid, owner, identity) in [
+            ("SID_2", user.clone(), format!("{user}:D")),
+            ("SID_1", user.clone(), user.clone()),
+            ("SID_3", lookalike.clone(), format!("{lookalike}:B")),
+        ] {
+            record_voice_connection(&channel, &owner, sid, &identity)
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(
+            recorded_voice_connections(&channel, &user).await.unwrap(),
+            vec![
+                ("SID_1".to_string(), user.clone()),
+                ("SID_2".to_string(), format!("{user}:D")),
+            ]
+        );
+        assert_eq!(
+            recorded_voice_connections(&channel, &lookalike)
+                .await
+                .unwrap(),
+            vec![("SID_3".to_string(), format!("{lookalike}:B"))]
+        );
+        assert!(
+            recorded_voice_connections(&channel, "nobody")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        delete_channel_voice_state(&channel, &[]).await.expect("cleanup");
+    }
+
+    /// S-3 WA-R: the degraded set fallback, driven directly, keeps the
+    /// script's rules: a sibling outside the set survives (WA-1), a foreign
+    /// sid is skipped, and the whole set is the `Last`.
+    #[test]
+    fn the_degraded_set_fallback_keeps_the_rules() {
+        rt().block_on(the_degraded_set_fallback_keeps_the_rules_case())
+    }
+
+    async fn the_degraded_set_fallback_keeps_the_rules_case() {
+        let (channel, user, _) = connection_case_ids("FBS");
+        let other = format!("{user}O");
+        let (first, second) = (format!("{user}:A"), format!("{user}:B"));
+        let mut conn = get_connection().await.expect("redis");
+
+        record_voice_connection(&channel, &user, "SID_A", &first)
+            .await
+            .unwrap();
+        create_voice_state(&channel, &user, Timestamp::now_utc())
+            .await
+            .unwrap();
+        record_voice_connection(&channel, &user, "SID_B", &second)
+            .await
+            .unwrap();
+        record_voice_connection(&channel, &other, "SID_O", &other)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            delete_voice_connections_unconditionally(
+                &channel,
+                &user,
+                &["SID_A".to_string(), "SID_O".to_string()]
+            )
+            .await
+            .unwrap(),
+            ConnectionLeave::Survivor
+        );
+        assert!(get_voice_state(&channel, &user).await.unwrap().is_some());
+        assert_eq!(
+            stored_voice_participant_identity(&channel.id, &user)
+                .await
+                .unwrap(),
+            Some(second.clone())
+        );
+        assert_eq!(
+            recorded_connections(&mut conn, &channel).await,
+            [
+                ("SID_B".to_string(), second.clone()),
+                ("SID_O".to_string(), other.clone()),
+            ]
+            .into_iter()
+            .collect()
+        );
+
+        assert_eq!(
+            delete_voice_connections_unconditionally(&channel, &user, &["SID_B".to_string()])
+                .await
+                .unwrap(),
+            ConnectionLeave::Last
+        );
+        assert!(get_voice_state(&channel, &user).await.unwrap().is_none());
+        assert_eq!(
+            recorded_connections(&mut conn, &channel).await,
+            [("SID_O".to_string(), other.clone())].into_iter().collect()
+        );
+
+        delete_channel_voice_state(&channel, &[other])
+            .await
+            .expect("cleanup");
+    }
+
+    /// P2-10: the whole-user teardown with two connections recorded is a full
+    /// teardown — no survivor branch in that mode — and clears only this
+    /// user's entries. Mutation n3 (the user mode takes the survivor branch)
+    /// keeps the state. Also: an unknown mode is an error with nothing
+    /// touched.
+    #[test]
+    fn a_whole_user_teardown_ignores_siblings() {
+        rt().block_on(a_whole_user_teardown_ignores_siblings_case())
+    }
+
+    async fn a_whole_user_teardown_ignores_siblings_case() {
+        let (channel, user, server) = connection_case_ids("P210");
+        let other = format!("{user}O");
+        let mut conn = get_connection().await.expect("redis");
+
+        for (sid, identity) in [("SID_A", user.clone()), ("SID_B", format!("{user}:B"))] {
+            record_voice_connection(&channel, &user, sid, &identity)
+                .await
+                .unwrap();
+        }
+        create_voice_state(&channel, &user, Timestamp::now_utc())
+            .await
+            .unwrap();
+        record_voice_connection(&channel, &other, "SID_O", &other)
+            .await
+            .unwrap();
+        create_voice_state(&channel, &other, Timestamp::now_utc())
+            .await
+            .unwrap();
+
+        // A mode the script does not know is refused, and nothing moves.
+        let mut input = voice_state_teardown_input(&channel, &user);
+        input.args[3] = "bogus".to_string();
+        let mut invocation = DELETE_VOICE_STATE.prepare_invoke();
+        for key in &input.keys {
+            invocation.key(key);
+        }
+        for arg in &input.args {
+            invocation.arg(arg);
+        }
+        let refused = invocation
+            .invoke_async::<_, i64>(&mut get_connection().await.unwrap().into_inner())
+            .await;
+        assert!(refused.is_err(), "{refused:?}");
+        assert!(get_voice_state(&channel, &user).await.unwrap().is_some());
+        assert_eq!(recorded_connections(&mut conn, &channel).await.len(), 3);
+
+        delete_voice_state(&channel, &user).await.unwrap();
+        assert!(
+            get_voice_state(&channel, &user).await.unwrap().is_none(),
+            "a whole-user teardown never keeps a sibling's state"
+        );
+        assert!(!is_voice_member(&mut conn, &channel, &user).await);
+        let left: Vec<Option<String>> = conn.mget(per_server_keys(&user, &server)).await.unwrap();
+        assert!(left.iter().all(Option::is_none), "{left:?}");
+        assert_eq!(
+            recorded_connections(&mut conn, &channel).await,
+            [("SID_O".to_string(), other.clone())].into_iter().collect(),
+            "every entry of the user goes, and only theirs"
+        );
+        assert!(get_voice_state(&channel, &other).await.unwrap().is_some());
+
+        delete_channel_voice_state(&channel, &[other])
+            .await
+            .expect("cleanup");
+    }
+
+    /// P2-4: the watch session ends with the host's LAST connection, before
+    /// the teardown, and a host whose sibling connection survives keeps it.
+    /// Mutation n8 (the session ended on a survivor leave too) ends it early.
+    #[test]
+    fn the_watch_session_ends_with_the_hosts_last_connection() {
+        rt().block_on(the_watch_session_ends_with_the_hosts_last_connection_case())
+    }
+
+    async fn the_watch_session_ends_with_the_hosts_last_connection_case() {
+        let (channel, host, _) = connection_case_ids("P24");
+
+        for (sid, identity) in [("SID_A", format!("{host}:A")), ("SID_B", format!("{host}:B"))] {
+            record_voice_connection(&channel, &host, sid, &identity)
+                .await
+                .unwrap();
+        }
+        create_voice_state(&channel, &host, Timestamp::now_utc())
+            .await
+            .unwrap();
+        let session = watch::create_watch_session(
+            &channel.id,
+            &host,
+            v0::WatchMedia::YouTube {
+                video_id: "YE7VzlLtp-4".to_string(),
+                title: None,
+            },
+        )
+        .await
+        .unwrap()
+        .expect("a fresh channel accepts a session");
+
+        assert_eq!(
+            delete_voice_connection(&channel, &host, "SID_A")
+                .await
+                .unwrap(),
+            ConnectionLeave::Survivor
+        );
+        assert_eq!(
+            watch::fetch_watch_session(&channel.id)
+                .await
+                .unwrap()
+                .map(|kept| kept.id),
+            Some(session.id),
+            "a host whose other connection is still here keeps the session"
+        );
+
+        assert_eq!(
+            delete_voice_connection(&channel, &host, "SID_B")
+                .await
+                .unwrap(),
+            ConnectionLeave::Last
+        );
+        assert!(
+            watch::fetch_watch_session(&channel.id)
+                .await
+                .unwrap()
+                .is_none(),
+            "the host's last connection ends the session"
+        );
+    }
+
+    /// A watch host with two connections recorded, and a new watch
+    /// session in the channel. Returns the session id.
+    async fn watch_host_with_two_connections(channel: &UserVoiceChannel, host: &str) -> String {
+        for (sid, identity) in [("SID_A", format!("{host}:A")), ("SID_B", format!("{host}:B"))] {
+            record_voice_connection(channel, host, sid, &identity)
+                .await
+                .unwrap();
+        }
+        create_voice_state(channel, host, Timestamp::now_utc())
+            .await
+            .unwrap();
+        watch::create_watch_session(
+            &channel.id,
+            host,
+            v0::WatchMedia::YouTube {
+                video_id: "YE7VzlLtp-4".to_string(),
+                title: None,
+            },
+        )
+        .await
+        .unwrap()
+        .expect("a fresh channel accepts a session")
+        .id
+    }
+
+    /// S-3 RA2-4, set mode: a removal that names EVERY recorded connection
+    /// of a watch host is the host's last, so the Rust peek
+    /// (`another_connection_outside`) must end the session before the
+    /// script tears the state down. The script never touches the session
+    /// key, so only the peek can end it. Mutation x1 (the peek ignores
+    /// `sids`, so the host's own named connections look like survivors)
+    /// leaves the session orphaned after a `Last`.
+    #[test]
+    fn a_set_removal_of_every_host_connection_ends_the_watch_session() {
+        rt().block_on(a_set_removal_of_every_host_connection_ends_the_watch_session_case())
+    }
+
+    async fn a_set_removal_of_every_host_connection_ends_the_watch_session_case() {
+        let (channel, host, server) = connection_case_ids("RA24L");
+        let mut conn = get_connection().await.expect("redis");
+        let session = watch_host_with_two_connections(&channel, &host).await;
+        assert_eq!(
+            watch::fetch_watch_session(&channel.id)
+                .await
+                .unwrap()
+                .map(|live| live.id),
+            Some(session),
+            "control: the session is live before the removal"
+        );
+
+        assert_eq!(
+            delete_voice_connections(&channel, &host, &["SID_A".to_string(), "SID_B".to_string()])
+                .await
+                .unwrap(),
+            ConnectionLeave::Last
+        );
+        assert!(
+            watch::fetch_watch_session(&channel.id)
+                .await
+                .unwrap()
+                .is_none(),
+            "naming every connection of the host ends the watch session"
+        );
+        assert!(get_voice_state(&channel, &host).await.unwrap().is_none());
+        assert!(!is_voice_member(&mut conn, &channel, &host).await);
+        assert!(recorded_connections(&mut conn, &channel).await.is_empty());
+        let left: Vec<Option<String>> = conn.mget(per_server_keys(&host, &server)).await.unwrap();
+        assert!(left.iter().all(Option::is_none), "{left:?}");
+
+        delete_channel_voice_state(&channel, &[host])
+            .await
+            .expect("cleanup");
+    }
+
+    /// S-3 RA2-4, set mode, the other direction: a removal that names ONE of
+    /// a watch host's two recorded connections is a `Survivor`, and the host
+    /// keeps the session. A peek that ended it on any named sid would end it
+    /// early here.
+    #[test]
+    fn a_set_removal_of_one_host_connection_keeps_the_watch_session() {
+        rt().block_on(a_set_removal_of_one_host_connection_keeps_the_watch_session_case())
+    }
+
+    async fn a_set_removal_of_one_host_connection_keeps_the_watch_session_case() {
+        let (channel, host, _) = connection_case_ids("RA24S");
+        let mut conn = get_connection().await.expect("redis");
+        let session = watch_host_with_two_connections(&channel, &host).await;
+
+        assert_eq!(
+            delete_voice_connections(&channel, &host, &["SID_A".to_string()])
+                .await
+                .unwrap(),
+            ConnectionLeave::Survivor
+        );
+        assert_eq!(
+            watch::fetch_watch_session(&channel.id)
+                .await
+                .unwrap()
+                .map(|kept| kept.id),
+            Some(session),
+            "a host whose other connection is still recorded keeps the session"
+        );
+        assert!(get_voice_state(&channel, &host).await.unwrap().is_some());
+        assert_eq!(
+            recorded_connections(&mut conn, &channel).await,
+            [("SID_B".to_string(), format!("{host}:B"))]
+                .into_iter()
+                .collect()
+        );
+
+        delete_channel_voice_state(&channel, &[host])
+            .await
+            .expect("cleanup");
+    }
+
+    /// S-3 RA2 (unproven #2): connection mode takes exactly ONE sid. The
+    /// public `delete_voice_connection` cannot express two, so the script is
+    /// driven directly with a second sid appended to the connection-mode
+    /// input: it answers an error reply and writes nothing (both entries,
+    /// the state and the membership intact). The same input with one sid is
+    /// the control: it runs, and answers the survivor. Mutation x2 (the
+    /// `#ARGV ~= 5` guard removed) HDELs both and tears the state down.
+    #[test]
+    fn a_connection_mode_teardown_refuses_two_sids() {
+        rt().block_on(a_connection_mode_teardown_refuses_two_sids_case())
+    }
+
+    async fn a_connection_mode_teardown_refuses_two_sids_case() {
+        let (channel, user, _) = connection_case_ids("RA2N");
+        let (first, second) = (format!("{user}:A"), format!("{user}:B"));
+        let mut conn = get_connection().await.expect("redis");
+
+        for (sid, identity) in [("SID_A", first.clone()), ("SID_B", second.clone())] {
+            record_voice_connection(&channel, &user, sid, &identity)
+                .await
+                .unwrap();
+        }
+        create_voice_state(&channel, &user, Timestamp::now_utc())
+            .await
+            .unwrap();
+        let both: std::collections::BTreeMap<String, String> = [
+            ("SID_A".to_string(), first.clone()),
+            ("SID_B".to_string(), second.clone()),
+        ]
+        .into_iter()
+        .collect();
+
+        let invoke = |input: VoiceStateTeardownInput| async move {
+            let mut invocation = DELETE_VOICE_STATE.prepare_invoke();
+            for key in &input.keys {
+                invocation.key(key);
+            }
+            for arg in &input.args {
+                invocation.arg(arg);
+            }
+            invocation
+                .invoke_async::<_, i64>(&mut get_connection().await.unwrap().into_inner())
+                .await
+        };
+
+        let mut two = voice_connection_teardown_input(&channel, &user, "SID_A");
+        two.args.push("SID_B".to_string());
+        assert_eq!(two.args.len(), 6, "{two:?}");
+        let refused = invoke(two).await;
+        assert!(
+            refused.as_ref().is_err_and(|error| {
+                error.kind() == ErrorKind::ResponseError
+                    && error
+                        .detail()
+                        .is_some_and(|detail| detail.contains("connection mode takes one sid"))
+            }),
+            "{refused:?}"
+        );
+        assert_eq!(recorded_connections(&mut conn, &channel).await, both);
+        assert!(get_voice_state(&channel, &user).await.unwrap().is_some());
+        assert!(is_voice_member(&mut conn, &channel, &user).await);
+
+        // Control: the one-sid input runs, and B is the survivor.
+        assert_eq!(
+            invoke(voice_connection_teardown_input(&channel, &user, "SID_A"))
+                .await
+                .unwrap(),
+            TEARDOWN_SURVIVOR
+        );
+        assert_eq!(
+            recorded_connections(&mut conn, &channel).await,
+            [("SID_B".to_string(), second.clone())].into_iter().collect()
+        );
+        assert!(get_voice_state(&channel, &user).await.unwrap().is_some());
+
+        delete_channel_voice_state(&channel, &[user])
+            .await
+            .expect("cleanup");
+    }
+
+    /// The degraded fallbacks, driven directly (a server that refuses the
+    /// script is not reachable here): the per-connection one re-points at a
+    /// survivor and keeps the state, then tears down on the last; the
+    /// whole-user one clears every entry of the user and only theirs.
+    #[test]
+    fn the_degraded_fallbacks_keep_the_connection_rules() {
+        rt().block_on(the_degraded_fallbacks_keep_the_connection_rules_case())
+    }
+
+    async fn the_degraded_fallbacks_keep_the_connection_rules_case() {
+        let (channel, user, _) = connection_case_ids("FB");
+        let other = format!("{user}O");
+        let (first, second) = (format!("{user}:A"), format!("{user}:B"));
+        let mut conn = get_connection().await.expect("redis");
+
+        record_voice_connection(&channel, &user, "SID_A", &first)
+            .await
+            .unwrap();
+        record_voice_connection(&channel, &user, "SID_B", &second)
+            .await
+            .unwrap();
+        record_voice_connection(&channel, &other, "SID_O", &other)
+            .await
+            .unwrap();
+        create_voice_state(&channel, &user, Timestamp::now_utc())
+            .await
+            .unwrap();
+        set_voice_participant_identity(&channel.id, &user, &first)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            delete_voice_connection_unconditionally(&channel, &user, "SID_A")
+                .await
+                .unwrap(),
+            ConnectionLeave::Survivor
+        );
+        assert!(get_voice_state(&channel, &user).await.unwrap().is_some());
+        assert_eq!(
+            stored_voice_participant_identity(&channel.id, &user)
+                .await
+                .unwrap(),
+            Some(second.clone())
+        );
+        assert_eq!(
+            delete_voice_connection_unconditionally(&channel, &user, "SID_B")
+                .await
+                .unwrap(),
+            ConnectionLeave::Last
+        );
+        assert!(get_voice_state(&channel, &user).await.unwrap().is_none());
+
+        record_voice_connection(&channel, &user, "SID_C", &first)
+            .await
+            .unwrap();
+        record_voice_connection(&channel, &user, "SID_D", &second)
+            .await
+            .unwrap();
+        delete_voice_state_unconditionally(&channel, &user)
+            .await
+            .unwrap();
+        assert_eq!(
+            recorded_connections(&mut conn, &channel).await,
+            [("SID_O".to_string(), other.clone())].into_iter().collect()
+        );
+
+        delete_channel_voice_state(&channel, &[other])
+            .await
+            .expect("cleanup");
+    }
+
+    /// A screen leg, or another user's identity, is never recorded.
+    #[test]
+    fn only_a_primary_of_the_user_is_recorded() {
+        rt().block_on(only_a_primary_of_the_user_is_recorded_case())
+    }
+
+    async fn only_a_primary_of_the_user_is_recorded_case() {
+        let (channel, user, _) = connection_case_ids("LEG");
+        let mut conn = get_connection().await.expect("redis");
+
+        for identity in [
+            screen_leg_identity(&user),
+            screen_leg_identity(&format!("{user}:D")),
+            format!("{user}X"),
+            format!("{user}X:D"),
+        ] {
+            assert!(
+                record_voice_connection(&channel, &user, "SID", &identity)
+                    .await
+                    .is_err(),
+                "{identity} must not be recorded for {user}"
+            );
+        }
+        assert!(recorded_connections(&mut conn, &channel).await.is_empty());
+    }
+
+    /// S-3 RA-2, on the real move against the Reference database: the
+    /// pointer names D, the caller expected S. Moving to D is
+    /// `AlreadyPresent` (it used to be `NotConnected`, a 400); moving to a
+    /// third channel is still `NotConnected`. Both answers come before any
+    /// SFU call, so a `VoiceClient` with no nodes is enough. Mutation n6
+    /// (the order swapped back) answers the first `NotConnected`.
+    #[test]
+    fn a_move_to_where_the_target_already_is_is_already_present() {
+        rt().block_on(a_move_to_where_the_target_already_is_is_already_present_case())
+    }
+
+    async fn a_move_to_where_the_target_already_is_is_already_present_case() {
+        use crate::{Channel, Database, Member, Server, User};
+        use revolt_models::v0::{
+            DataCreateServer, DataCreateServerChannel, LegacyServerChannelType,
+        };
+
+        let db = Database::Reference(Default::default());
+        let owner = User::create(&db, "RaTwoOwner".to_string(), None, None)
+            .await
+            .expect("`User`");
+        let mut server = Server::create(
+            &db,
+            DataCreateServer {
+                name: "RaTwoServer".to_string(),
+                description: None,
+                nsfw: None,
+            },
+            &owner,
+            false,
+        )
+        .await
+        .expect("`Server`")
+        .0;
+        let mut voice = Vec::new();
+        for name in ["Source", "Destination", "Third"] {
+            voice.push(
+                Channel::create_server_channel(
+                    &db,
+                    &mut server,
+                    DataCreateServerChannel {
+                        channel_type: LegacyServerChannelType::Voice,
+                        name: name.to_string(),
+                        ..Default::default()
+                    },
+                    true,
+                )
+                .await
+                .expect("`Channel`"),
+            );
+        }
+        let (source, destination, third) = (&voice[0], &voice[1], &voice[2]);
+        let target = User::create(&db, "RaTwoTarget".to_string(), None, None)
+            .await
+            .expect("`User`");
+        Member::create(&db, &server, &target, None)
+            .await
+            .expect("`Member`");
+
+        let sitting_in = UserVoiceChannel::from_channel(destination);
+        create_voice_state(&sitting_in, &target.id, Timestamp::now_utc())
+            .await
+            .unwrap();
+        let voice_client = VoiceClient::new(Default::default());
+
+        assert_eq!(
+            move_user_to_voice_channel_expecting(
+                &db,
+                &voice_client,
+                &target,
+                destination,
+                Some(source.id()),
+            )
+            .await
+            .unwrap(),
+            VoiceMoveOutcome::AlreadyPresent,
+            "a target already in the destination is AlreadyPresent, whatever source was expected"
+        );
+        assert_eq!(
+            move_user_to_voice_channel_expecting(
+                &db,
+                &voice_client,
+                &target,
+                third,
+                Some(source.id()),
+            )
+            .await
+            .unwrap(),
+            VoiceMoveOutcome::NotConnected,
+            "control: a target who left the expected source is NotConnected for any other destination"
+        );
+
+        delete_voice_state(&sitting_in, &target.id)
+            .await
+            .expect("cleanup");
+    }
+
+    /// S-3 D-3 against the Reference database: the re-check answers exactly
+    /// what the join route's calculus answers. Allowed: a member with
+    /// Connect, a bot member with Connect, a Group participant, a DM
+    /// participant, the server OWNER under a Connect denial (GrantAllSafe).
+    /// Refused: a non-member, a member under the denial, a user outside the
+    /// DM. A missing user or channel is `Ok(false)`. Mutation n7 (an explicit
+    /// member lookup) refuses the DM and the Group.
+    #[test]
+    fn the_connect_recheck_follows_the_join_calculus() {
+        rt().block_on(the_connect_recheck_follows_the_join_calculus_case())
+    }
+
+    async fn the_connect_recheck_follows_the_join_calculus_case() {
+        use crate::{Bot, Channel, Database, Member, PartialBot, PartialChannel, Server, User};
+        use revolt_models::v0::{
+            DataCreateGroup, DataCreateServer, DataCreateServerChannel, LegacyServerChannelType,
+        };
+        use revolt_permissions::OverrideField;
+
+        let db = Database::Reference(Default::default());
+        let owner = User::create(&db, "RecheckOwner".to_string(), None, None)
+            .await
+            .expect("`User`");
+        let mut server = Server::create(
+            &db,
+            DataCreateServer {
+                name: "RecheckServer".to_string(),
+                description: None,
+                nsfw: None,
+            },
+            &owner,
+            false,
+        )
+        .await
+        .expect("`Server`")
+        .0;
+        let mut voice = Channel::create_server_channel(
+            &db,
+            &mut server,
+            DataCreateServerChannel {
+                channel_type: LegacyServerChannelType::Voice,
+                name: "Voice".to_string(),
+                ..Default::default()
+            },
+            true,
+        )
+        .await
+        .expect("`Channel`");
+        let member = User::create(&db, "RecheckMember".to_string(), None, None)
+            .await
+            .expect("`User`");
+        Member::create(&db, &server, &member, None)
+            .await
+            .expect("`Member`");
+        let outsider = User::create(&db, "RecheckOutsider".to_string(), None, None)
+            .await
+            .expect("`User`");
+        let (_, bot) = Bot::create(&db, "RecheckBot".to_string(), &owner, None::<PartialBot>)
+            .await
+            .expect("`Bot`");
+        Member::create(&db, &server, &bot, None)
+            .await
+            .expect("`Member`");
+
+        async fn allowed(db: &Database, channel_id: &str, user_id: &str) -> bool {
+            voice_connect_still_allowed(db, channel_id, user_id)
+                .await
+                .expect("the re-check reads")
+        }
+
+        assert!(allowed(&db, voice.id(), &member.id).await, "a member with Connect");
+        assert!(allowed(&db, voice.id(), &bot.id).await, "a bot member with Connect");
+        assert!(!allowed(&db, voice.id(), &outsider.id).await, "a non-member");
+
+        // A Group owned by the member with the outsider in it, then a DM
+        // between the two, whose mutual Group is what lets the DM speak.
+        let group = Channel::create_group(
+            &db,
+            DataCreateGroup {
+                name: "RecheckGroup".to_string(),
+                users: [outsider.id.clone()].into_iter().collect(),
+                ..Default::default()
+            },
+            member.id.clone(),
+        )
+        .await
+        .expect("`Group`");
+        assert!(allowed(&db, group.id(), &outsider.id).await, "a Group participant");
+        let dm = Channel::create_dm(&db, &member, &outsider)
+            .await
+            .expect("`DirectMessage`");
+        assert!(allowed(&db, dm.id(), &outsider.id).await, "a DM participant");
+        assert!(!allowed(&db, dm.id(), &owner.id).await, "control: not in the DM");
+
+        voice
+            .update(
+                &db,
+                PartialChannel {
+                    default_permissions: Some(OverrideField {
+                        a: 0,
+                        d: ChannelPermission::Connect as i64,
+                    }),
+                    ..Default::default()
+                },
+                vec![],
+            )
+            .await
+            .expect("channel override");
+        assert!(!allowed(&db, voice.id(), &member.id).await, "a member denied Connect");
+        assert!(
+            allowed(&db, voice.id(), &owner.id).await,
+            "the server owner is GrantAllSafe, before any override"
+        );
+
+        assert!(!allowed(&db, "01KX7J0000NOSUCHCHANNEL0000", &member.id).await);
+        assert!(!allowed(&db, voice.id(), "01KX7J0000NOSUCHUSER000000").await);
     }
 }
