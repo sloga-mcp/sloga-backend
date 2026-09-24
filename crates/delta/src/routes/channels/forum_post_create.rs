@@ -137,6 +137,7 @@ pub async fn create_forum_post(
         allow_mentions,
         Some(post_id.clone()),
         None,
+        true,
     )
     .await
     {
@@ -164,6 +165,14 @@ pub async fn create_forum_post(
         .await
     {
         revolt_config::capture_error(&error);
+    }
+
+    // The forum's last_message_id just moved to this post; ack it for the
+    // author so their own post doesn't light the forum up as unread.
+    if user.bot.is_none() {
+        if let Err(error) = forum.ack(&user.id, &message.id, amqp).await {
+            revolt_config::capture_error(&error);
+        }
     }
 
     Ok(Json(v0::ForumPostResponse {

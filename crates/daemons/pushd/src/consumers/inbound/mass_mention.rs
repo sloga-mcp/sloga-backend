@@ -152,13 +152,14 @@ impl Consumer for MassMessageConsumer {
                         // unread + push — @everyone must not leak into hidden
                         // channels (threads delegate visibility to their parent;
                         // the bulk query substitutes the parent already).
+                        // The author never mentions themselves.
                         let mut q = query.clone().members(&chunk);
                         let userids: Vec<String> = q
                             .members_can_see_channel()
                             .await
                             .iter()
                             .filter_map(|(uid, viewable)| {
-                                if *viewable {
+                                if *viewable && uid != &push.message.author {
                                     Some(uid.clone())
                                 } else {
                                     None
@@ -226,7 +227,10 @@ impl Consumer for MassMessageConsumer {
                             .await
                             .iter()
                             .filter_map(|(uid, viewable)| {
-                                if *viewable && !existing_mentions.contains(uid) {
+                                if *viewable
+                                    && !existing_mentions.contains(uid)
+                                    && uid != &push.message.author
+                                {
                                     Some(uid.clone())
                                 } else {
                                     None

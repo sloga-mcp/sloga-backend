@@ -391,6 +391,7 @@ impl Message {
             allow_mentions,
             None,
             None,
+            true,
         )
         .await
     }
@@ -407,6 +408,11 @@ impl Message {
     /// daemon uses this — its attachments were already claimed (against
     /// the scheduled row) at schedule time, so `File::use_attachment`
     /// (which only matches unclaimed files) would 404 on them.
+    ///
+    /// `ack_author` is forwarded to [`Message::send_with_ack_author`]:
+    /// whether sending also marks the channel read for its (user) author.
+    /// Interactive callers pass `true`; the scheduled-message daemon passes
+    /// a computed value, since the author is not present at delivery.
     #[allow(clippy::too_many_arguments)]
     pub async fn create_from_api_with_id(
         db: &Database,
@@ -422,6 +428,7 @@ impl Message {
         allow_mentions: bool,
         forced_id: Option<String>,
         resolved_attachments: Option<Vec<File>>,
+        ack_author: bool,
     ) -> Result<Message> {
         let config = config().await;
 
@@ -782,7 +789,16 @@ impl Message {
 
         // Send the message
         message
-            .send(db, amqp, author, user, member, &channel, generate_embeds)
+            .send_with_ack_author(
+                db,
+                amqp,
+                author,
+                user,
+                member,
+                &channel,
+                generate_embeds,
+                ack_author,
+            )
             .await?;
 
         Ok(message)
@@ -847,16 +863,51 @@ impl Message {
     }
 
     /// Send a message
+    ///
+    /// Marks the channel read for a (non-bot) user author; see
+    /// [`Message::send_with_ack_author`].
     #[allow(clippy::too_many_arguments)]
     pub async fn send(
         &mut self,
         db: &Database,
-        _amqp: Option<&AMQP>, // this is optional mostly for tests.
+        amqp: Option<&AMQP>, // this is optional mostly for tests.
         author: MessageAuthor<'_>,
         user: Option<v0::User>,
         member: Option<v0::Member>,
         channel: &Channel,
         generate_embeds: bool,
+    ) -> Result<()> {
+        self.send_with_ack_author(
+            db,
+            amqp,
+            author,
+            user,
+            member,
+            channel,
+            generate_embeds,
+            true,
+        )
+        .await
+    }
+
+    /// Send a message, choosing whether to mark the channel read for its author
+    ///
+    /// With `ack_author`, a non-bot user author gets a `ChannelAck` for this
+    /// message (needs `amqp`). [`Message::send`] always passes `true`; the
+    /// scheduled-message daemon passes a computed value, because the author is
+    /// absent at delivery and an unconditional ack could mark messages they
+    /// never saw as read.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn send_with_ack_author(
+        &mut self,
+        db: &Database,
+        amqp: Option<&AMQP>, // this is optional mostly for tests.
+        author: MessageAuthor<'_>,
+        user: Option<v0::User>,
+        member: Option<v0::Member>,
+        channel: &Channel,
+        generate_embeds: bool,
+        ack_author: bool,
     ) -> Result<()> {
         self.send_without_notifications(
             db,
@@ -867,6 +918,20 @@ impl Message {
             true,
         )
         .await?;
+
+        // Sending marks the channel read for its author, so their other
+        // sessions and the next cold load agree. Webhooks and system
+        // messages are excluded by the match, bots by the check below.
+        // Best-effort: the message is already stored and fanned out.
+        if ack_author {
+            if let (Some(amqp), MessageAuthor::User(u)) = (amqp, &author) {
+                if u.bot.is_none() {
+                    if let Err(e) = channel.ack(&u.id, &self.id, amqp).await {
+                        revolt_config::capture_error(&e);
+                    }
+                }
+            }
+        }
 
         let is_dm_or_group = matches!(
             channel,
@@ -916,7 +981,15 @@ impl Message {
 
                         targets
                     }
-                    Channel::TextChannel { .. } => self.mentions.clone().unwrap_or_default(),
+                    // Never notify the author of their own message (self-mention
+                    // or reply-ping of their own message).
+                    Channel::TextChannel { .. } => self
+                        .mentions
+                        .iter()
+                        .flatten()
+                        .filter(|uid| uid.as_str() != author.id())
+                        .cloned()
+                        .collect(),
                     _ => vec![],
                 };
 

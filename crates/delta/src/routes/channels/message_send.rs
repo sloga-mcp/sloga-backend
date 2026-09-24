@@ -160,6 +160,7 @@ mod test {
     use std::collections::HashMap;
 
     use crate::{rocket, util::test::TestHarness};
+    use revolt_database::{events::client::EventV1, Bot};
     use revolt_database::{
         util::{idempotency::IdempotencyKey, reference::Reference},
         Channel, Member, Message, MessageFlagsValue, PartialChannel, PartialMember, Role, Server,
@@ -167,6 +168,8 @@ mod test {
     use revolt_models::v0::{self, DataCreateServerChannel, MessageFlags};
     use revolt_permissions::{ChannelPermission, OverrideField};
     use revolt_result::ErrorType;
+    use rocket::http::{ContentType, Header, Status};
+    use serde_json::json;
 
     #[test]
     fn message_mention_constraints() {
@@ -761,5 +764,318 @@ mod test {
             message_with_mentions.role_mentions.is_some(),
             "Message has no role mentions"
         );
+    }
+
+    // Self-ack: sending marks the channel read for a human author.
+    //
+    // The negative tests below all pass `Some(&harness.amqp)`: the self-ack is
+    // gated on `amqp` being present, so `None` would pass them vacuously.
+
+    /// Publish a marker `ChannelAck` on `marker_user`'s private topic and wait
+    /// for it. The harness reads every topic through one `psubscribe("*")`
+    /// connection and redis pub/sub is FIFO on it, so once the marker is seen,
+    /// everything the send published before it (the `Message` fan-out and any
+    /// self-ack, both awaited inside `send`) is in the event buffer, where
+    /// `assert_no_buffered_event` can see it. Returns the marker's id.
+    async fn flush_with_marker(
+        harness: &mut TestHarness,
+        marker_user: &str,
+        channel_id: &str,
+    ) -> String {
+        let marker = ulid::Ulid::new().to_string();
+
+        EventV1::ChannelAck {
+            id: channel_id.to_string(),
+            user: marker_user.to_string(),
+            message_id: marker.clone(),
+        }
+        .private(marker_user.to_string())
+        .await;
+
+        harness
+            .wait_for_event(&format!("{marker_user}!"), |event| match event {
+                EventV1::ChannelAck { message_id, .. } => message_id == &marker,
+                _ => false,
+            })
+            .await;
+
+        marker
+    }
+
+    /// The send's own `Message` event reached the harness, so its publishes
+    /// were observable in this run. Served from the buffer after the marker.
+    async fn assert_fanned_out(harness: &mut TestHarness, channel_id: &str, message_id: &str) {
+        harness
+            .wait_for_event(channel_id, |event| match event {
+                EventV1::Message(message) => message.id == message_id,
+                _ => false,
+            })
+            .await;
+    }
+
+    /// Any `ChannelAck` other than the marker.
+    fn is_stray_ack(event: &EventV1, marker: &str) -> bool {
+        match event {
+            EventV1::ChannelAck { message_id, .. } => message_id.as_str() != marker,
+            _ => false,
+        }
+    }
+
+    fn plain_send(content: &str) -> v0::DataMessageSend {
+        v0::DataMessageSend {
+            content: Some(content.to_string()),
+            nonce: None,
+            attachments: None,
+            replies: None,
+            embeds: None,
+            masquerade: None,
+            interactions: None,
+            components: None,
+            sticker_ids: None,
+            flags: None,
+        }
+    }
+
+    /// A human author is acked on both send paths: the route
+    /// (`create_from_api` -> `send_with_ack_author(.., true)`) and the
+    /// `Message::send` wrapper that poll, forward, soft-response and `/roll`
+    /// use. The second half fails if `send` stops passing `true`.
+    #[test]
+    fn self_ack_route_acks_author() {
+        crate::util::test::rt().block_on(self_ack_route_acks_author_case())
+    }
+
+    async fn self_ack_route_acks_author_case() {
+        let mut harness = TestHarness::new().await;
+        let (_, session, user) = harness.new_user().await;
+        let (server, _) = harness.new_server(&user).await;
+        let channel = harness.new_channel(&server).await;
+
+        let response = harness
+            .client
+            .post(format!("/channels/{}/messages", channel.id()))
+            .header(Header::new("x-session-token", session.token.to_string()))
+            .header(ContentType::JSON)
+            .body(json!({ "content": "self ack" }).to_string())
+            .dispatch()
+            .await;
+        assert_eq!(response.status(), Status::Ok);
+        let message: v0::Message = response.into_json().await.expect("`Message`");
+
+        // Times out (and fails) after 30s if the send never acked the author.
+        let event = harness
+            .wait_for_event(&format!("{}!", user.id), |event| match event {
+                EventV1::ChannelAck { message_id, .. } => message_id == &message.id,
+                _ => false,
+            })
+            .await;
+
+        match event {
+            EventV1::ChannelAck {
+                id,
+                user: acked_user,
+                message_id,
+            } => {
+                assert_eq!(id, channel.id());
+                assert_eq!(acked_user, user.id);
+                assert_eq!(message_id, message.id);
+            }
+            _ => unreachable!(),
+        }
+
+        // The `Message::send` wrapper, as poll/forward/soft-response/roll call it.
+        let author: v0::User = user.clone().into(&harness.db, Some(&user)).await;
+        assert!(author.bot.is_none(), "precondition: the author is a human");
+
+        let mut sent = Message {
+            id: ulid::Ulid::new().to_string(),
+            channel: channel.id().to_string(),
+            author: user.id.clone(),
+            content: Some("self ack via send".to_string()),
+            ..Default::default()
+        };
+
+        sent.send(
+            &harness.db,
+            Some(&harness.amqp),
+            v0::MessageAuthor::User(&author),
+            Some(author.clone()),
+            None,
+            &channel,
+            false,
+        )
+        .await
+        .expect("Failed to send message");
+
+        // Its own ack: the route's ack above carries a different message id.
+        let event = harness
+            .wait_for_event(&format!("{}!", user.id), |event| match event {
+                EventV1::ChannelAck { message_id, .. } => message_id == &sent.id,
+                _ => false,
+            })
+            .await;
+
+        match event {
+            EventV1::ChannelAck {
+                id,
+                user: acked_user,
+                message_id,
+            } => {
+                assert_eq!(id, channel.id());
+                assert_eq!(acked_user, user.id);
+                assert_eq!(message_id, sent.id);
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn self_ack_skipped_when_opted_out() {
+        crate::util::test::rt().block_on(self_ack_skipped_when_opted_out_case())
+    }
+
+    async fn self_ack_skipped_when_opted_out_case() {
+        let mut harness = TestHarness::new().await;
+        let (_, _, user) = harness.new_user().await;
+        let (server, _) = harness.new_server(&user).await;
+        let channel = harness.new_channel(&server).await;
+
+        let author: v0::User = user.clone().into(&harness.db, Some(&user)).await;
+        assert!(author.bot.is_none(), "precondition: the author is a human");
+
+        let message = Message::create_from_api_with_id(
+            &harness.db,
+            Some(&harness.amqp),
+            channel.clone(),
+            plain_send("opted out"),
+            v0::MessageAuthor::User(&author),
+            Some(author.clone()),
+            None,
+            user.limits().await,
+            IdempotencyKey::unchecked_from_string("0".to_string()),
+            false,
+            true,
+            None,
+            None,
+            false,
+        )
+        .await
+        .expect("Failed to create message");
+
+        let marker = flush_with_marker(&mut harness, &user.id, channel.id()).await;
+        assert_fanned_out(&mut harness, channel.id(), &message.id).await;
+
+        harness.assert_no_buffered_event(&format!("{}!", user.id), |event| {
+            is_stray_ack(event, &marker)
+        });
+    }
+
+    #[test]
+    fn self_ack_skipped_for_webhook() {
+        crate::util::test::rt().block_on(self_ack_skipped_for_webhook_case())
+    }
+
+    async fn self_ack_skipped_for_webhook_case() {
+        let mut harness = TestHarness::new().await;
+        let (_, _, user) = harness.new_user().await;
+        let (server, _) = harness.new_server(&user).await;
+        let channel = harness.new_channel(&server).await;
+
+        let webhook = v0::Webhook {
+            id: ulid::Ulid::new().to_string(),
+            name: "Self-ack webhook".to_string(),
+            avatar: None,
+            creator_id: user.id.clone(),
+            channel_id: channel.id().to_string(),
+            permissions: 0,
+            token: None,
+        };
+
+        // Same shape as a crosspost copy (message_crosspost.rs).
+        let mut message = Message {
+            id: ulid::Ulid::new().to_string(),
+            channel: channel.id().to_string(),
+            author: webhook.id.clone(),
+            webhook: Some(webhook.clone().into()),
+            content: Some("from a webhook".to_string()),
+            ..Default::default()
+        };
+
+        message
+            .send(
+                &harness.db,
+                Some(&harness.amqp),
+                v0::MessageAuthor::Webhook(&webhook),
+                None,
+                None,
+                &channel,
+                false,
+            )
+            .await
+            .expect("Failed to send webhook message");
+
+        let marker = flush_with_marker(&mut harness, &user.id, channel.id()).await;
+        assert_fanned_out(&mut harness, channel.id(), &message.id).await;
+
+        // Neither the webhook's id nor its creator is acked.
+        for topic in [format!("{}!", webhook.id), format!("{}!", user.id)] {
+            harness.assert_no_buffered_event(&topic, |event| is_stray_ack(event, &marker));
+        }
+    }
+
+    #[test]
+    fn self_ack_skipped_for_bot() {
+        crate::util::test::rt().block_on(self_ack_skipped_for_bot_case())
+    }
+
+    async fn self_ack_skipped_for_bot_case() {
+        let mut harness = TestHarness::new().await;
+        let (_, _, owner) = harness.new_user().await;
+        let (server, _) = harness.new_server(&owner).await;
+        let channel = harness.new_channel(&server).await;
+
+        let (_, bot_user) = Bot::create(&harness.db, TestHarness::rand_string(), &owner, None)
+            .await
+            .expect("`Bot`");
+        let (bot_member, _) = Member::create(&harness.db, &server, &bot_user, None)
+            .await
+            .expect("bot member");
+
+        let author: v0::User = bot_user.clone().into(&harness.db, Some(&owner)).await;
+        assert!(
+            author.bot.is_some(),
+            "precondition: the author carries bot information"
+        );
+
+        let mut message = Message {
+            id: ulid::Ulid::new().to_string(),
+            channel: channel.id().to_string(),
+            author: bot_user.id.clone(),
+            content: Some("from a bot".to_string()),
+            ..Default::default()
+        };
+
+        // The pinned wrapper (always `ack_author = true`), as bot-driven
+        // sends like `/roll` and soft responses reach it.
+        message
+            .send(
+                &harness.db,
+                Some(&harness.amqp),
+                v0::MessageAuthor::User(&author),
+                Some(author.clone()),
+                Some(bot_member.into()),
+                &channel,
+                false,
+            )
+            .await
+            .expect("Failed to send bot message");
+
+        let marker = flush_with_marker(&mut harness, &owner.id, channel.id()).await;
+        assert_fanned_out(&mut harness, channel.id(), &message.id).await;
+
+        // Neither the bot nor its owner is acked.
+        for topic in [format!("{}!", bot_user.id), format!("{}!", owner.id)] {
+            harness.assert_no_buffered_event(&topic, |event| is_stray_ack(event, &marker));
+        }
     }
 }

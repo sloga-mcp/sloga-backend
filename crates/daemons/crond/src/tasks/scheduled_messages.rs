@@ -3,8 +3,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use revolt_database::{
     events::client::EventV1,
     util::{idempotency::IdempotencyKey, permissions::DatabasePermissionQuery},
-    Channel, Database, File, FileUsedForType, Message, ScheduledMessage, ScheduledMessageStatus,
-    User, AMQP,
+    Channel, Database, File, FileUsedForType, Message, MessageFilter, MessageQuery,
+    MessageTimePeriod, ScheduledMessage, ScheduledMessageStatus, User, AMQP,
 };
 use revolt_models::v0;
 use revolt_permissions::{calculate_channel_permissions, ChannelPermission, PermissionQuery};
@@ -126,6 +126,58 @@ async fn fail(db: &Database, row: &ScheduledMessage, reason: &str) {
     }
     .private(row.author.clone())
     .await;
+}
+
+/// Whether the author has already read everything in the channel.
+///
+/// A live send acks the channel for its author, but a scheduled delivery
+/// happens while the author is absent: acking unconditionally would mark
+/// messages other people sent in the meantime as read without the author
+/// ever seeing them. So the delivery only keeps the author caught up if they
+/// already were — their read pointer is at (or past) the newest message.
+///
+/// Reads the newest message itself rather than the channel's
+/// `last_message_id`, which crond never updates and delta debounces. Any
+/// error, a missing unread row or an unset pointer answers `false`: the
+/// channel then stays unread, which is the safe direction.
+async fn author_caught_up(db: &Database, user_id: &str, channel_id: &str) -> bool {
+    let last_read = match db.fetch_unread(user_id, channel_id).await {
+        Ok(Some(unread)) => unread.last_id,
+        Ok(None) => None,
+        Err(err) => {
+            revolt_config::capture_error(&err);
+            return false;
+        }
+    };
+
+    let newest = match db
+        .fetch_messages(MessageQuery {
+            limit: Some(1),
+            filter: MessageFilter {
+                channel: Some(channel_id.to_string()),
+                ..Default::default()
+            },
+            time_period: MessageTimePeriod::Absolute {
+                before: None,
+                after: None,
+                sort: Some(v0::MessageSort::Latest),
+            },
+        })
+        .await
+    {
+        Ok(messages) => messages.into_iter().next(),
+        Err(err) => {
+            revolt_config::capture_error(&err);
+            return false;
+        }
+    };
+
+    match newest {
+        // Nothing to have missed.
+        None => true,
+        // Ids are ULIDs, so string order is creation order.
+        Some(newest) => last_read.is_some_and(|last_read| last_read >= newest.id),
+    }
 }
 
 /// Attempt delivery of one claimed row. Any `Err` is a PERMANENT failure
@@ -287,6 +339,10 @@ async fn deliver(db: &Database, amqp: &AMQP, row: &ScheduledMessage) -> std::res
         None
     };
 
+    // Only move the author's read pointer if they were already caught up;
+    // see `author_caught_up`.
+    let ack_author = author_caught_up(db, &user.id, &row.channel).await;
+
     // The stored payload's nonce was already consumed at schedule time and
     // stripped; the row id doubles as the delivery nonce so clients can
     // correlate the arriving message with their pending entry.
@@ -304,6 +360,7 @@ async fn deliver(db: &Database, amqp: &AMQP, row: &ScheduledMessage) -> std::res
         allow_mentions,
         Some(message_id),
         Some(resolved),
+        ack_author,
     )
     .await
     .map_err(|error| format!("the message could not be sent ({:?})", error.error_type))?;
