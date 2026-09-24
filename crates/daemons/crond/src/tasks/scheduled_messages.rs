@@ -137,7 +137,7 @@ async fn fail(db: &Database, row: &ScheduledMessage, reason: &str) {
 /// already were — their read pointer is at (or past) the newest message.
 ///
 /// Reads the newest message itself rather than the channel's
-/// `last_message_id`, which crond never updates and delta debounces. Any
+/// `last_message_id`, which is written by a debounced worker and can lag. Any
 /// error, a missing unread row or an unset pointer answers `false`: the
 /// channel then stays unread, which is the safe direction.
 async fn author_caught_up(db: &Database, user_id: &str, channel_id: &str) -> bool {
