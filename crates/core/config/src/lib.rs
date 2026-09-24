@@ -182,6 +182,11 @@ pub struct PushVapid {
     pub queue: String,
     pub private_key: String,
     pub public_key: String,
+    /// Previous private key, tried once when a push service rejects the
+    /// primary (401/403) so dormant subscriptions survive a rotation.
+    /// Empty = fallback disabled. Defaulted so a config without it still boots.
+    #[serde(default)]
+    pub legacy_private_key: String,
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -1022,5 +1027,80 @@ mod boost_tests {
         // Disabled => always global, stored tiers notwithstanding
         boosts.enabled = false;
         assert_eq!(boosts.effective_server_emoji(100, 3), 100);
+    }
+}
+
+// Built the way CONFIG_BUILDER builds it: the embedded Revolt.toml first, then
+// a later TOML source standing in for Revolt.overrides.toml. Key fields are
+// compared with `assert!`, never `assert_eq!`, so a failure prints no values.
+#[cfg(test)]
+mod vapid_config_tests {
+    use super::Settings;
+    use config::{Config, File, FileFormat};
+
+    const DEFAULT_VAPID_QUEUE: &str = "notifications.outbound.vapid";
+
+    // Obviously fake placeholders; the merge does not care what they hold.
+    const OVERRIDES: &str = r#"
+[pushd.vapid]
+private_key = "fake-primary-private-key-placeholder"
+public_key = "fake-primary-public-key-placeholder"
+legacy_private_key = "fake-legacy-private-key-placeholder"
+"#;
+
+    #[test]
+    fn overrides_vapid_table_keeps_default_queue() {
+        let settings = Config::builder()
+            .add_source(File::from_str(
+                include_str!("../Revolt.toml"),
+                FileFormat::Toml,
+            ))
+            .add_source(File::from_str(OVERRIDES, FileFormat::Toml))
+            .build()
+            .expect("embedded defaults plus overrides must build")
+            .try_deserialize::<Settings>()
+            .expect("merged config must deserialize");
+
+        let vapid = &settings.pushd.vapid;
+        assert_eq!(vapid.queue, DEFAULT_VAPID_QUEUE);
+        assert!(
+            vapid.private_key == "fake-primary-private-key-placeholder",
+            "private_key did not take the override"
+        );
+        assert!(
+            vapid.public_key == "fake-primary-public-key-placeholder",
+            "public_key did not take the override"
+        );
+        assert!(
+            vapid.legacy_private_key == "fake-legacy-private-key-placeholder",
+            "legacy_private_key did not take the override"
+        );
+    }
+
+    #[test]
+    fn missing_legacy_private_key_defaults_to_empty() {
+        let without_legacy = include_str!("../Revolt.toml")
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("legacy_private_key"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let config = Config::builder()
+            .add_source(File::from_str(&without_legacy, FileFormat::Toml))
+            .build()
+            .expect("embedded defaults must build");
+
+        // The key must really be gone, or this test proves nothing.
+        assert!(config.get_string("pushd.vapid.legacy_private_key").is_err());
+
+        let settings = config
+            .try_deserialize::<Settings>()
+            .expect("a config without pushd.vapid.legacy_private_key must deserialize");
+
+        assert!(
+            settings.pushd.vapid.legacy_private_key.is_empty(),
+            "legacy_private_key must default to empty"
+        );
+        assert_eq!(settings.pushd.vapid.queue, DEFAULT_VAPID_QUEUE);
     }
 }

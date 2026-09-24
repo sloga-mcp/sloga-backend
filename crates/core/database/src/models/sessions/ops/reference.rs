@@ -89,6 +89,27 @@ impl AbstractSessions for ReferenceDb {
         Ok(())
     }
 
+    /// Remove push subscription for a session only if it still has the given endpoint
+    async fn remove_push_subscription_if_endpoint(
+        &self,
+        session_id: &str,
+        endpoint: &str,
+    ) -> Result<()> {
+        let mut sessions = self.sessions.lock().await;
+
+        if let Some(session) = sessions.get_mut(session_id) {
+            if session
+                .subscription
+                .as_ref()
+                .is_some_and(|subscription| subscription.endpoint == endpoint)
+            {
+                session.subscription = None;
+            }
+        };
+
+        Ok(())
+    }
+
     async fn update_session_last_seen(&self, session_id: &str, when: Timestamp) -> Result<()> {
         let mut sessions = self.sessions.lock().await;
 

@@ -157,9 +157,13 @@ ack_queue = "notifications.process.ack"                  # updates badges for ap
 
 
 [pushd.vapid]
+# Production keys go ONLY in Revolt.overrides.toml. These values are upstream Revolt's
+# public defaults; they are committed and therefore not secret.
 queue = "notifications.outbound.vapid"
 private_key = "LS0tLS1CRUdJTiBFQyBQUklWQVRFIEtFWS0tLS0tCk1IY0NBUUVFSUJSUWpyTWxLRnBiVWhsUHpUbERvcEliYk1yeVNrNXpKYzVYVzIxSjJDS3hvQW9HQ0NxR1NNNDkKQXdFSG9VUURRZ0FFWnkrQkg2TGJQZ2hEa3pEempXOG0rUXVPM3pCajRXT1phdkR6ZU00c0pqbmFwd1psTFE0WAp1ZDh2TzVodU94QWhMQlU3WWRldVovWHlBdFpWZmNyQi9BPT0KLS0tLS1FTkQgRUMgUFJJVkFURSBLRVktLS0tLQo"
 public_key = "BGcvgR-i2z4IQ5Mw841vJvkLjt8wY-FjmWrw83jOLCY52qcGZS0OF7nfLzuYbjsQISwVO2HXrmf18gLWVX3Kwfw="
+# Previous private key, tried once when the primary is rejected (401/403). Empty disables it.
+legacy_private_key = ""
 
 [pushd.fcm]
 queue = "notifications.outbound.fcm"

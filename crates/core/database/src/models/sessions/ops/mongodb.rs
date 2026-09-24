@@ -123,6 +123,29 @@ impl AbstractSessions for MongoDb {
             .map_err(|_| create_database_error!("update_one", COL))
     }
 
+    /// Remove push subscription for a session only if it still has the given endpoint
+    async fn remove_push_subscription_if_endpoint(
+        &self,
+        session_id: &str,
+        endpoint: &str,
+    ) -> Result<()> {
+        self.col::<Session>(COL)
+            .update_one(
+                doc! {
+                    "_id": session_id,
+                    "subscription.endpoint": endpoint
+                },
+                doc! {
+                    "$unset": {
+                        "subscription": 1
+                    }
+                },
+            )
+            .await
+            .map(|_| ())
+            .map_err(|_| create_database_error!("update_one", COL))
+    }
+
     async fn update_session_last_seen(&self, session_id: &str, when: Timestamp) -> Result<()> {
         self.col::<Session>(COL)
             .update_one(
