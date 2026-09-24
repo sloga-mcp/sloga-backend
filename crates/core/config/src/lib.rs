@@ -10,7 +10,7 @@ use serde::Deserialize;
 #[cfg(feature = "sentry")]
 pub use sentry::{capture_error, capture_message, Level};
 #[cfg(feature = "anyhow")]
-pub use sentry_anyhow::capture_anyhow;
+pub use sentry::integrations::anyhow::capture_anyhow;
 
 #[cfg(all(feature = "report-macros", feature = "sentry"))]
 #[macro_export]

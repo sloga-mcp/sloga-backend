@@ -33,7 +33,6 @@ tokio-util = { version = "0.7.18" }
 anyhow = "1.0.100"
 thiserror = "2.0.18"
 sentry = "0.31.5"
-sentry-anyhow = "0.38.1"
 
 # Data Validation
 regex = "1.12.3"

@@ -36,3 +36,6 @@ revolt_optional_struct = { workspace = true }
 serde = { workspace = true }
 iso8601-timestamp = { workspace = true, features = ["serde", "bson"] }
 base64 = { workspace = true }
+
+[dev-dependencies]
+sentry = { workspace = true, features = ["test"] }
