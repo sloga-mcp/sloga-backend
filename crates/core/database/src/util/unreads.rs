@@ -30,7 +30,8 @@ pub async fn fetch_unreads_with_summary(
         .collect::<Vec<_>>();
 
     let summaries = stream::iter(targets.into_iter().map(|(channel, last_id)| async move {
-        db.summarise_unread(&channel, last_id.as_deref()).await
+        db.summarise_unread(&channel, last_id.as_deref(), user_id)
+            .await
     }))
     .buffered(CONCURRENCY)
     .collect::<Vec<_>>()

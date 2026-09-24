@@ -8,6 +8,13 @@ use crate::{AppendMessage, FieldsMessage, Message, MessageQuery, PartialMessage}
 mod mongodb;
 mod reference;
 
+/// How far past the read pointer an unread summary looks before it gives up.
+/// The reader's own messages are skipped, so without this bound a channel
+/// full of them would be walked to its end on every connect. Ten caps' worth
+/// only undercounts a tail holding more than that many of the reader's own
+/// messages, and those clear on their next read or send.
+pub const UNREAD_SCAN_WINDOW: u32 = revolt_models::v0::UNREAD_COUNT_CAP * 10;
+
 /// What a channel's unread tail looks like, for the sidebar badge.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct UnreadSummary {
@@ -59,13 +66,16 @@ pub trait AbstractMessages: Sync + Send {
     /// Summarise the messages sitting after a user's read pointer in a channel:
     /// how many there are (stopping at `UNREAD_COUNT_CAP`) and whether any of
     /// them carries an attachment. `after_id` is exclusive; `None` means the
-    /// channel was never acknowledged, so everything counts. `channel` + `_id`
-    /// lead the predicate, and the count is capped, so this stays an index-only
-    /// scan of at most one cap's worth of entries per channel.
+    /// channel was never acknowledged, so everything counts. Messages `user`
+    /// wrote themselves never count: the client leaves them out of the live
+    /// count too, so a reload shows the same number. `channel` + `_id` lead
+    /// the predicate and the scan stops after `UNREAD_SCAN_WINDOW` entries, so
+    /// the cost per channel stays bounded however long the tail is.
     async fn summarise_unread(
         &self,
         channel: &str,
         after_id: Option<&str>,
+        user: &str,
     ) -> Result<UnreadSummary>;
 
     /// Delete a message from the database by its id
@@ -111,6 +121,10 @@ mod tests {
             object_id: None,
         }
     }
+
+    /// Whoever is reading the channel in the unread-summary tests. Not the
+    /// author of the fixture messages, so every one of them counts.
+    const READER: &str = "01READER00000000000000000000";
 
     fn button(id: &str) -> v0::Component {
         v0::Component::Button {
@@ -250,13 +264,16 @@ mod tests {
                 .unwrap();
 
             // No read pointer — everything in the channel counts.
-            let all = db.summarise_unread(channel, None).await.unwrap();
+            let all = db.summarise_unread(channel, None, READER).await.unwrap();
             assert_eq!(all.count, 5);
             assert!(!all.attachments);
 
             // The pointer is exclusive: acking ms 3000 leaves 4000 and 5000.
             let pointer = ulid::Ulid::from_parts(3_000, 1).to_string();
-            let tail = db.summarise_unread(channel, Some(&pointer)).await.unwrap();
+            let tail = db
+                .summarise_unread(channel, Some(&pointer), READER)
+                .await
+                .unwrap();
             assert_eq!(tail.count, 2);
             assert!(!tail.attachments);
 
@@ -267,14 +284,14 @@ mod tests {
                 .await
                 .unwrap();
             assert!(
-                db.summarise_unread(channel, Some(&pointer))
+                db.summarise_unread(channel, Some(&pointer), READER)
                     .await
                     .unwrap()
                     .attachments
             );
             let late = ulid::Ulid::from_parts(4_600, 0).to_string();
             assert!(
-                !db.summarise_unread(channel, Some(&late))
+                !db.summarise_unread(channel, Some(&late), READER)
                     .await
                     .unwrap()
                     .attachments
@@ -288,8 +305,124 @@ mod tests {
                     .unwrap();
             }
             assert_eq!(
-                db.summarise_unread(deep, None).await.unwrap().count,
+                db.summarise_unread(deep, None, READER).await.unwrap().count,
                 UNREAD_COUNT_CAP
+            );
+        });
+    }
+
+    #[tokio::test]
+    async fn summarise_unread_skips_the_readers_own_messages() {
+        database_test!(|db| async move {
+            let channel = "01CHANUNREAD0000000000000004";
+            let other = "01OTHERAUTHOR0000000000000";
+
+            let mk = |ms: u64, author: &str, attachment: bool| Message {
+                id: ulid::Ulid::from_parts(ms, 1).to_string(),
+                channel: channel.to_string(),
+                author: author.to_string(),
+                content: Some("hello".to_string()),
+                attachments: attachment.then(|| vec![attachment_file(ms)]),
+                ..Default::default()
+            };
+
+            // Past the pointer: two of someone else's, then two of the
+            // reader's own, one of which carries the only attachment.
+            db.insert_message(&mk(1_000, other, false)).await.unwrap();
+            db.insert_message(&mk(2_000, other, false)).await.unwrap();
+            db.insert_message(&mk(3_000, READER, true)).await.unwrap();
+            db.insert_message(&mk(4_000, READER, false)).await.unwrap();
+
+            let summary = db.summarise_unread(channel, None, READER).await.unwrap();
+            assert_eq!(summary.count, 2, "only the other author's messages count");
+            assert!(
+                !summary.attachments,
+                "an attachment on the reader's own message raises no flag"
+            );
+
+            // The same tail read by someone else counts everything.
+            let theirs = db.summarise_unread(channel, None, other).await.unwrap();
+            assert_eq!(theirs.count, 2, "the other author's own two drop out");
+            assert!(theirs.attachments);
+            let bystander = db
+                .summarise_unread(channel, None, "01BYSTANDER000000000000000")
+                .await
+                .unwrap();
+            assert_eq!(bystander.count, 4);
+
+            // A tail made only of the reader's own messages is empty.
+            let pointer = ulid::Ulid::from_parts(2_000, 1).to_string();
+            assert_eq!(
+                db.summarise_unread(channel, Some(&pointer), READER)
+                    .await
+                    .unwrap(),
+                Default::default()
+            );
+        });
+    }
+
+    #[tokio::test]
+    async fn summarise_unread_caps_count_and_scan_around_own_messages() {
+        database_test!(|db| async move {
+            use super::UNREAD_SCAN_WINDOW;
+            use revolt_models::v0::UNREAD_COUNT_CAP;
+
+            let other = "01OTHERAUTHOR0000000000000";
+            let mk = |ms: u64, chan: &str, author: &str| Message {
+                id: ulid::Ulid::from_parts(ms, 1).to_string(),
+                channel: chan.to_string(),
+                author: author.to_string(),
+                content: Some("hello".to_string()),
+                ..Default::default()
+            };
+
+            // The cap applies to the other author's messages, not to the raw
+            // tail: every third message is the reader's own, and there are
+            // still more than a cap's worth of the rest.
+            let mixed = "01CHANUNREAD0000000000000005";
+            for i in 0..(UNREAD_COUNT_CAP as u64 * 2) {
+                let author = if i % 3 == 0 { READER } else { other };
+                db.insert_message(&mk(1_000 + i, mixed, author))
+                    .await
+                    .unwrap();
+            }
+            assert_eq!(
+                db.summarise_unread(mixed, None, READER)
+                    .await
+                    .unwrap()
+                    .count,
+                UNREAD_COUNT_CAP
+            );
+
+            // Own messages ahead of a single foreign one still let it count.
+            let ahead = "01CHANUNREAD0000000000000006";
+            for i in 0..20u64 {
+                db.insert_message(&mk(5_000 + i, ahead, READER))
+                    .await
+                    .unwrap();
+            }
+            db.insert_message(&mk(6_000, ahead, other)).await.unwrap();
+            assert_eq!(
+                db.summarise_unread(ahead, None, READER)
+                    .await
+                    .unwrap()
+                    .count,
+                1
+            );
+
+            // The scan is bounded: a foreign message sitting behind a whole
+            // window of the reader's own is not reached, by design.
+            let deep = "01CHANUNREAD0000000000000007";
+            for i in 0..(UNREAD_SCAN_WINDOW as u64) {
+                db.insert_message(&mk(10_000 + i, deep, READER))
+                    .await
+                    .unwrap();
+            }
+            db.insert_message(&mk(20_000, deep, other)).await.unwrap();
+            assert_eq!(
+                db.summarise_unread(deep, None, READER).await.unwrap().count,
+                0,
+                "the scan stops after UNREAD_SCAN_WINDOW messages"
             );
         });
     }

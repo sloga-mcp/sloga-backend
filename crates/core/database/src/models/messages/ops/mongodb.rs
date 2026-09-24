@@ -13,7 +13,7 @@ use crate::{
     MessageTimePeriod, MongoDb, PartialMessage,
 };
 
-use super::{AbstractMessages, UnreadSummary};
+use super::{AbstractMessages, UnreadSummary, UNREAD_SCAN_WINDOW};
 
 static COL: &str = "messages";
 
@@ -258,14 +258,16 @@ impl AbstractMessages for MongoDb {
 
     /// Summarise the unread tail of a channel.
     ///
-    /// One aggregation, bounded by `$limit`: `channel` + `_id` lead the match so
-    /// the sort is served straight off the index, and the group only ever sees a
-    /// cap's worth of documents — a channel with 50k unread messages costs the
-    /// same as one with 100.
+    /// One aggregation, bounded twice: `channel` + `_id` lead the match so the
+    /// sort is served straight off the index, the scan stops after
+    /// `UNREAD_SCAN_WINDOW` messages, and the group only ever sees a cap's
+    /// worth of the rest — a channel with 50k unread messages costs the same
+    /// as one with a thousand.
     async fn summarise_unread(
         &self,
         channel: &str,
         after_id: Option<&str>,
+        user: &str,
     ) -> Result<UnreadSummary> {
         let mut filter = doc! { "channel": channel };
         if let Some(after_id) = after_id {
@@ -277,6 +279,9 @@ impl AbstractMessages for MongoDb {
             .aggregate(vec![
                 doc! { "$match": filter },
                 doc! { "$sort": { "_id": 1 } },
+                doc! { "$limit": UNREAD_SCAN_WINDOW as i64 },
+                // The reader's own messages are never unread to them.
+                doc! { "$match": { "author": { "$ne": user } } },
                 doc! { "$limit": UNREAD_COUNT_CAP as i64 },
                 doc! { "$group": {
                     "_id": null,
