@@ -26,10 +26,11 @@
 //! so they can neither starve nor be starved by the plain channels bucket.
 //!
 //! The DELETE also leaves a short tombstone (`withdraw_afk_since`, re-audit
-//! R-1). The client gives up waiting on a PUT after a few seconds, but Rocket
-//! keeps running the handler after the client has gone, so a stalled PUT can
-//! land AFTER the withdrawal that replaced it and re-create a claim nobody
-//! will ever withdraw; the sweep would then move a member who is active.
+//! R-1). The client gives up waiting on a PUT after 10 s
+//! (`AFK_IDLE_REQUEST_TIMEOUT_MS`), but Rocket keeps running the handler
+//! after the client has gone, so a stalled PUT can land AFTER the withdrawal
+//! that replaced it and re-create a claim nobody will ever withdraw; the
+//! sweep would then move a member who is active.
 //! While the tombstone stands, a claim PUT writes nothing (and still answers
 //! 204). Only the client's withdrawal leaves one: a PUT from inside the AFK
 //! channel clears with `clear_afk_since`, which leaves none, so sitting in the
@@ -68,6 +69,15 @@ pub async fn afk_idle_set(
     let v0::DataAfkIdle { idle_for } = data.into_inner();
     let channel = target.as_channel(db).await?;
 
+    // Shape before permission, ACCEPTED (AFK Stage 6 F-A6, operator ruling
+    // 2026-09-23). `NotAVoiceChannel` and the no-server `InvalidOperation`
+    // are answered before the `Connect` check below, so any account
+    // holding a channel id can learn whether it is a voice channel and
+    // whether it sits in a server. That is a LOW channel-type oracle, and it
+    // is kept: it reveals no content, no membership and no occupancy, it
+    // needs an id the caller already has (ids are ULIDs, not guessable), and
+    // `put_validates_in_the_contract_order` pins this order as the wire
+    // contract. Do not reorder without revisiting that ruling.
     if channel.voice().is_none() {
         return Err(create_error!(NotAVoiceChannel));
     }
@@ -162,7 +172,7 @@ pub async fn afk_idle_clear(
 #[cfg(test)]
 mod test {
     use crate::util::test::TestHarness;
-    use iso8601_timestamp::Timestamp;
+    use iso8601_timestamp::{Duration, Timestamp};
     use revolt_database::{
         voice::{
             afk_idle::get_afk_since, create_voice_state, delete_channel_voice_state,
@@ -467,6 +477,17 @@ mod test {
         (status, response.into_string().await.unwrap_or_default())
     }
 
+    /// A `joined_at` well before every `idle_for` this test claims. A claim
+    /// idle for longer than its seat has existed writes nothing (AFK Stage 6
+    /// F-A2, `afk_since_predates_join`), so a seat joined at `now` would turn
+    /// every "the claim is stored" below into a refusal, and every "nothing
+    /// is stored" into a pass for the wrong reason.
+    fn joined_long_ago() -> Timestamp {
+        Timestamp::now_utc()
+            .checked_sub(Duration::minutes(30))
+            .expect("a timestamp 30 minutes ago")
+    }
+
     async fn withdraw(harness: &TestHarness, token: &str, channel_id: &str) -> Status {
         harness
             .client
@@ -499,7 +520,7 @@ mod test {
 
         // In the call, but the server moves nobody yet.
         let lounge_seat = UserVoiceChannel::from_channel(&lounge);
-        create_voice_state(&lounge_seat, &user.id, Timestamp::now_utc())
+        create_voice_state(&lounge_seat, &user.id, joined_long_ago())
             .await
             .expect("voice state");
         let (status, body) = claim(&harness, &session.token, lounge.id(), 120).await;
@@ -530,7 +551,7 @@ mod test {
         // Joining another channel of the server moves the pointer: a claim
         // for the old channel no longer names the live seat.
         let other_seat = UserVoiceChannel::from_channel(&other);
-        create_voice_state(&other_seat, &user.id, Timestamp::now_utc())
+        create_voice_state(&other_seat, &user.id, joined_long_ago())
             .await
             .expect("voice state");
         let (status, body) = claim(&harness, &session.token, lounge.id(), 120).await;
@@ -558,7 +579,7 @@ mod test {
 
         // Idle in the AFK channel itself records nothing.
         let afk_seat = UserVoiceChannel::from_channel(&afk);
-        create_voice_state(&afk_seat, &user.id, Timestamp::now_utc())
+        create_voice_state(&afk_seat, &user.id, joined_long_ago())
             .await
             .expect("voice state");
         let (status, body) = claim(&harness, &session.token, afk.id(), 600).await;

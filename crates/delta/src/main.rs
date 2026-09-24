@@ -1,3 +1,9 @@
+// A dropped `Result` is a compile error in this crate, not a warning (AFK
+// Stage 6 F-B4). Every permission gate here is a
+// `throw_if_lacking_*(..)?;`, and without this a gate with its `?` deleted
+// still compiled - with a warning nobody reads - and checked nothing.
+#![deny(unused_must_use)]
+
 #[macro_use]
 extern crate rocket;
 #[macro_use]

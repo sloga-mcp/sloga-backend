@@ -1,3 +1,9 @@
+// AFK Stage 6 F-B4: a dropped `Result` is an error, not a warning. Deleting
+// the `?` from a `throw_if_lacking_*` authorization check (or from any other
+// fallible call) otherwise compiles, with one warning, into a check that
+// never refuses anything.
+#![deny(unused_must_use)]
+
 #[macro_use]
 extern crate serde;
 

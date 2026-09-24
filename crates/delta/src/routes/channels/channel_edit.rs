@@ -1100,4 +1100,81 @@ mod tests {
         assert_eq!(response.status(), Status::Ok);
         assert_eq!(stored_post_minutes(&fx.harness, fx.post.id()).await, 43200);
     }
+
+    // ---- AFK pointer integrity on de-voice (AFK Stage 6 F-B6) -------------
+
+    /// The braced block opening at byte `open` of `text` (inclusive).
+    fn braced(text: &str, open: usize) -> &str {
+        let mut depth = 0usize;
+        for (i, ch) in text[open..].char_indices() {
+            match ch {
+                '\u{7b}' => depth += 1,
+                '\u{7d}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return &text[open..=open + i];
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("unbalanced braces from byte {}", open);
+    }
+
+    /// `edit`'s body, comment lines dropped and whitespace collapsed.
+    fn route_body() -> String {
+        const SOURCE: &str = include_str!("channel_edit.rs");
+        let at = SOURCE
+            .find("pub async fn edit(")
+            .expect("the route is defined");
+        let open = at + SOURCE[at..].find('\u{7b}').expect("a body");
+        braced(SOURCE, open)
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join(" ")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    /// A PATCH that removes or disables a channel's voice tears the room
+    /// down, and this route never touches the server document - so the
+    /// server's AFK designation has to be cleared here, or it survives as a
+    /// pointer to what is now a plain text channel. The clear sits INSIDE the
+    /// de-voice block (it must not run on every edit) and BEFORE
+    /// `delete_voice_channel(` (a failed teardown must not leave the pointer
+    /// behind). Mutations: the clear deleted, or the two swapped.
+    #[test]
+    fn devoicing_clears_the_afk_designation_before_the_teardown() {
+        const DEVOICE: &str = "if channel.voice().is_none() \u{7b}";
+        const CLEAR: &str = "if let Channel::TextChannel \u{7b} server, id, .. \u{7d} = &channel \
+             \u{7b} Server::clear_afk_channel_if_pointing_at(db, server, id).await?; \u{7d}";
+        const TEARDOWN: &str = "delete_voice_channel(db, voice_client, \
+             &UserVoiceChannel::from_channel(&channel)).await?;";
+
+        let body = route_body();
+        assert_eq!(body.matches(DEVOICE).count(), 1, "{body}");
+        assert_eq!(
+            body.matches("clear_afk_channel_if_pointing_at(").count(),
+            1,
+            "the route clears the designation in exactly one place: {body}"
+        );
+
+        let block = braced(
+            &body,
+            body.find(DEVOICE).expect("counted above") + DEVOICE.len() - 1,
+        );
+        let clear = block
+            .find(CLEAR)
+            .unwrap_or_else(|| panic!("the de-voice block lost the AFK clear: {}", block));
+        let teardown = block
+            .find(TEARDOWN)
+            .unwrap_or_else(|| panic!("the de-voice block lost the teardown: {}", block));
+        assert!(
+            clear < teardown,
+            "the AFK clear must precede `delete_voice_channel(`: {}",
+            block
+        );
+    }
 }

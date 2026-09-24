@@ -7,7 +7,8 @@ use revolt_database::{
     },
     voice::{
         assert_voice_move_admissible, get_channel_node, get_user_voice_channel_in_server,
-        move_user_to_voice_channel, sync_user_voice_permissions, UserVoiceChannel, VoiceClient,
+        move_user_to_voice_channel_expecting, sync_user_voice_permissions, UserVoiceChannel,
+        VoiceClient, VoiceMoveOutcome,
     },
     Channel, Database, File, PartialMember, User,
 };
@@ -303,7 +304,15 @@ pub async fn edit(
         return Err(create_error!(NotElevated));
     }
 
-    if data.voice_channel.is_some() || data.remove.contains(&FieldsMember::VoiceChannel) {
+    // The channel the target is in, read ONCE, and the one the source-side
+    // gate below decides about. Every later use in the move path is this
+    // value, never a fresh read (AFK Stage 6 F-A3): a fresh read could name a
+    // channel the target switched to after the gate ran, one the mover was
+    // never checked against. `None` outside the voice shapes, and when the
+    // target is in no call in this server.
+    let voice_shape =
+        data.voice_channel.is_some() || data.remove.contains(&FieldsMember::VoiceChannel);
+    let source_id = if voice_shape {
         if !voice_client.is_enabled() {
             return Err(create_error!(LiveKitUnavailable));
         };
@@ -328,10 +337,9 @@ pub async fn edit(
         // `NotConnected` in its own place. An unresolvable source channel
         // propagates rather than being waved through: a gate whose subject
         // cannot be read refuses.
-        if let Some(source_id) =
-            get_user_voice_channel_in_server(&target_user.id, &server.id).await?
-        {
-            let source = Reference::from_unchecked(&source_id).as_channel(db).await?;
+        let source_id = get_user_voice_channel_in_server(&target_user.id, &server.id).await?;
+        if let Some(source_id) = &source_id {
+            let source = Reference::from_unchecked(source_id).as_channel(db).await?;
 
             // Self-move exemption, same as the destination gate: leaving a
             // call you are in is not exercising `MoveMembers` over anybody.
@@ -339,7 +347,11 @@ pub async fn edit(
                 assert_mover_may_move_out_of(db, &user, &source).await?;
             }
         }
-    }
+
+        source_id
+    } else {
+        None
+    };
 
     let new_voice_channel = if let Some(new_channel) = &data.voice_channel {
         // ensure the channel we are moving them to is in the server
@@ -379,14 +391,14 @@ pub async fn edit(
         // caps check was originally placed here for, and the property the
         // mover gates above share.
         //
-        // The property survives `move_user_to_voice_channel` re-deciding all
+        // The property survives `move_user_to_voice_channel_expecting` re-deciding all
         // of it AFTER the write only because a PATCH may not combine
         // `voice_channel` with the fields that change these permissions (see
         // the refusal above). Without that, the second reading could refuse
         // an edit the first admitted, leaving it applied and the move not
         // made.
         //
-        // `move_user_to_voice_channel` runs the identical set again when it
+        // `move_user_to_voice_channel_expecting` runs the identical set again when it
         // executes; this is the pre-flight that keeps the ordering guarantee,
         // not a substitute for it.
         assert_voice_move_admissible(db, &target_user, &channel).await?;
@@ -399,19 +411,18 @@ pub async fn edit(
         // rather than NotConnected. Both refuse, both leave the member
         // untouched.)
         //
-        // This re-reads the key the source-side gate already read. Deliberate:
-        // the gate has to run in the block the disconnect shape passes through
-        // too, and the two reads race nothing that was not already racing —
-        // `move_user_to_voice_channel` reads it a third time and is the only
-        // reader whose answer is acted upon.
-        if get_user_voice_channel_in_server(&target_user.id, &server.id)
-            .await?
-            .is_none()
-        {
-            Err(create_error!(NotConnected))?
+        // Answered from the source the gate above decided about, NOT from a
+        // fresh read (AFK Stage 6 F-A3). A fresh read here could find the
+        // target in a call they joined after the gate saw them in none, and
+        // the move would then pull them out of a channel the mover was never
+        // checked against. So a move always carries a gated source, and the
+        // move itself answers `NotConnected`, doing nothing, if the target
+        // has left it by the time it runs.
+        let Some(source_id) = source_id.clone() else {
+            return Err(create_error!(NotConnected));
         };
 
-        Some(channel)
+        Some((channel, source_id))
     } else {
         None
     };
@@ -481,20 +492,50 @@ pub async fn edit(
         .update(db, partial, remove.clone().into_iter().map(Into::into).collect())
         .await?;
 
-    if let Some(new_voice_channel) = new_voice_channel {
+    if let Some((new_voice_channel, source_id)) = new_voice_channel {
         // The move itself is server-authoritative and lives in the database
-        // layer, because the AFK sweep needs the same behaviour with no
+        // layer, because the AFK sweep needs the same behavior with no
         // acting user and no Rocket request to hang it off. Everything that
         // is route policy — LiveKit being enabled, `MoveMembers`, ranking —
         // has already been decided above; everything that is about the move
         // being possible and safe is decided in there.
         //
-        // `NotConnected` here is a race we lost (they left between the
-        // precondition above and now) and `AlreadyPresent` means there was
-        // nothing to do; neither is an error, and neither used to be
-        // distinguishable — the old inline code silently no-op'd on the
-        // first and evicted the member from their own call on the second.
-        move_user_to_voice_channel(db, voice_client, &target_user, &new_voice_channel).await?;
+        // EXPECTING the source the mover was gated on (AFK Stage 6 F-A3).
+        // The plain move re-derives the source from the pointer, so a target
+        // who switched channels after the gate would be pulled out of a
+        // channel the mover was never authorized over. With the expectation
+        // that switch answers `NotConnected` before anything is listed,
+        // written or minted.
+        //
+        // `AlreadyPresent` means there was nothing to do: the target is where
+        // they were asked to be, so a 200 is the truth. `NotConnected` means
+        // NO move happened - they left, or switched away from the gated
+        // source, after the precondition above - and it is answered as the
+        // `NotConnected` error the precondition itself gives (AFK Stage 6
+        // FU-C), never as a success. It used to be dropped here, which
+        // answered 200 for a move that did not happen. The member document
+        // above is already written by this point: any nickname, pronouns or
+        // avatar sent in the same PATCH stays applied, exactly as it does for
+        // every other error the move can raise from here (`UnknownNode`, a
+        // caps refusal). The fields that change the permissions a move is
+        // decided under cannot be in this PATCH at all (refused above).
+        //
+        // Matched exhaustively, so a new outcome has to be classified here.
+        // The old inline code could not tell these two apart at all: it
+        // silently no-op'd on the first and evicted the member from their own
+        // call on the second.
+        match move_user_to_voice_channel_expecting(
+            db,
+            voice_client,
+            &target_user,
+            &new_voice_channel,
+            Some(&source_id),
+        )
+        .await?
+        {
+            VoiceMoveOutcome::Moved { .. } | VoiceMoveOutcome::AlreadyPresent => {}
+            VoiceMoveOutcome::NotConnected => return Err(create_error!(NotConnected)),
+        }
     } else if affects_voice_permissions && !remove.contains(&FieldsMember::VoiceChannel) {
         // Skipped when the member is being disconnected outright just below —
         // syncing a participant we are about to evict is pointless, and a
@@ -523,38 +564,61 @@ pub async fn edit(
     };
 
     if remove.contains(&FieldsMember::VoiceChannel) {
-        if let Some(channel) = get_user_voice_channel_in_server(&target_user.id, &server.id).await?
-        {
-            let node = get_channel_node(&channel).await?.unwrap();
+        // EXACTLY the channel the source-side gate decided about, never a
+        // fresh read (AFK Stage 6 FU-B, the F-A3 race on the disconnect
+        // shape). A fresh read here could name a channel the target switched
+        // to after the gate ran, and the mover would kick them out of a call
+        // they were never checked against. Addressed to the gated source, a
+        // target who has since left it is no longer in the room this removes
+        // from, so their new call is untouched.
+        //
+        // No source at the gate: the target was in no call in this server,
+        // and clearing `VoiceChannel` is a no-op, as it always has been (the
+        // client's call-moderation policy relies on that). No node behind
+        // the source any more: the room is gone and nobody is in it to
+        // remove, so that is the same no-op rather than the panic an
+        // `unwrap` gave.
+        if let Some(channel) = &source_id {
+            if let Some(node) = get_channel_node(channel).await? {
+                // Remote-control release hook (plan §1: the moderator disconnect
+                // also calls `remove_user` directly and would race a
+                // webhook-only hook).
+                revolt_database::voice::remote_control::release_remote_control_for_user(
+                    db,
+                    voice_client,
+                    &UserVoiceChannel {
+                        id: channel.clone(),
+                        server_id: Some(server.id.clone()),
+                    },
+                    &target_user.id,
+                    "revoked_by_moderator",
+                    // Still connected at this point; the disconnect is below.
+                    false,
+                )
+                .await;
 
-            // Remote-control release hook (plan §1: the moderator disconnect
-            // also calls `remove_user` directly and would race a
-            // webhook-only hook).
-            revolt_database::voice::remote_control::release_remote_control_for_user(
-                db,
-                voice_client,
-                &UserVoiceChannel {
-                    id: channel.clone(),
-                    server_id: Some(server.id.clone()),
-                },
-                &target_user.id,
-                "revoked_by_moderator",
-                // Still connected at this point; the disconnect is below.
-                false,
-            )
-            .await;
-
-            // Disconnect the TARGET being removed, not the acting moderator
-            // (matches the move branch above; the earlier `user.id` here kicked
-            // the moderator out of their own call — 6.6 review finding 8).
-            //
-            // Whether the acting user may reach into this channel at all was
-            // decided in the pre-flight, before the member document was
-            // written — not here, where a refusal would be too late.
-            voice_client
-                .remove_user(&node, &target_user.id, &channel)
-                .await?;
-        };
+                // Disconnect the TARGET being removed, not the acting moderator
+                // (matches the move branch above; the earlier `user.id` here
+                // kicked the moderator out of their own call — 6.6 review
+                // finding 8).
+                //
+                // Whether the acting user may reach into this channel at all
+                // was decided in the pre-flight, before the member document was
+                // written — not here, where a refusal would be too late.
+                //
+                // `remove_user` stays the removal here: it is the one every
+                // moderation path shares (it takes the screen leg too, and its
+                // doc lists this route). It does not classify "not in this
+                // room" - the SFU's not_found goes through
+                // `to_internal_error()` - so a target who left the gated source
+                // between the gate and here gets a 500 rather than a no-op.
+                // Fail-closed, just noisy; a clean no-op needs a
+                // `remove_user_if_present` in the database crate.
+                voice_client
+                    .remove_user(&node, &target_user.id, channel)
+                    .await?;
+            }
+        }
     }
 
     Ok(Json(member.into()))
@@ -1553,12 +1617,187 @@ mod test {
         }
     }
 
+    // ---- the move expects the gated source (AFK Stage 6 F-A3, pure) -------
+
+    /// `edit`'s body, comment lines dropped and whitespace collapsed.
+    fn route_body() -> String {
+        const SOURCE: &str = include_str!("member_edit.rs");
+        let at = SOURCE
+            .find("pub async fn edit(")
+            .expect("the route is defined");
+        let open = at + SOURCE[at..].find('\u{7b}').expect("a body");
+        let mut depth = 0usize;
+        let mut close = None;
+        for (i, ch) in SOURCE[open..].char_indices() {
+            match ch {
+                '\u{7b}' => depth += 1,
+                '\u{7d}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        close = Some(open + i);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        SOURCE[open..=close.expect("a closed body")]
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join(" ")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    /// The source-side gate decides about the channel it read; the move must
+    /// act on that same channel. The plain `move_user_to_voice_channel`
+    /// re-derives the source from the pointer, so a target who switched
+    /// channels in between was pulled out of a channel the mover was never
+    /// authorized over. Pinned here: one pointer read before the move (the
+    /// gated one), the `NotConnected` precondition answered from it, and the
+    /// move EXPECTING it. Mutations: `None` for the expectation, the plain
+    /// move back, or a fresh pointer read in place of the gated source.
+    #[test]
+    fn the_move_expects_the_source_the_mover_was_gated_on() {
+        const READ: &str = "let source_id = \
+             get_user_voice_channel_in_server(&target_user.id, &server.id).await?;";
+        const GATE: &str = "if let Some(source_id) = &source_id \u{7b} \
+             let source = Reference::from_unchecked(source_id).as_channel(db).await?; \
+             if member.id.user != user.id \u{7b} \
+             assert_mover_may_move_out_of(db, &user, &source).await?; \u{7d} \u{7d}";
+        const CARRY: &str = "let Some(source_id) = source_id.clone() else \u{7b} \
+             return Err(create_error!(NotConnected)); \u{7d}; \
+             Some((channel, source_id))";
+        const MOVE: &str = "if let Some((new_voice_channel, source_id)) = new_voice_channel \
+             \u{7b} match move_user_to_voice_channel_expecting( db, voice_client, &target_user, \
+             &new_voice_channel, Some(&source_id), ) .await? \u{7b}";
+
+        let body = route_body();
+        let mut last = 0;
+        for needle in [READ, GATE, CARRY, MOVE] {
+            assert_eq!(
+                body.matches(needle).count(),
+                1,
+                "the route must carry `{needle}` exactly once: {body}"
+            );
+            let at = body.find(needle).expect("counted above");
+            assert!(last <= at, "`{}` is out of order: {}", needle, body);
+            last = at;
+        }
+
+        assert!(
+            !body.contains("move_user_to_voice_channel("),
+            "the route must not call the plain move, which expects no source: {}",
+            body
+        );
+        assert_eq!(
+            body[..last]
+                .matches("get_user_voice_channel_in_server(")
+                .count(),
+            1,
+            "the move path must read the pointer once, in the gate: a second \
+             read can name a channel the mover was never checked against: {body}"
+        );
+    }
+
+    /// AFK Stage 6 FU-C: a move that did not happen is never a 2xx. The
+    /// outcome is matched exhaustively; `NotConnected` (the target left or
+    /// switched away from the gated source after the precondition) answers
+    /// the same `NotConnected` error the precondition gives, and only
+    /// `Moved` / `AlreadyPresent` fall through to the 200. Mutations: the
+    /// `NotConnected` arm turned into `{}`, a `_ => {}` catch-all, or the
+    /// outcome dropped again with `.await?;`.
+    #[test]
+    fn a_move_that_did_not_happen_is_an_error() {
+        const OUTCOME: &str = "Some(&source_id), ) .await? \u{7b} \
+             VoiceMoveOutcome::Moved \u{7b} .. \u{7d} | VoiceMoveOutcome::AlreadyPresent => \u{7b}\u{7d} \
+             VoiceMoveOutcome::NotConnected => return Err(create_error!(NotConnected)), \u{7d}";
+
+        let body = route_body();
+        assert_eq!(
+            body.matches(OUTCOME).count(),
+            1,
+            "the move's outcome must be matched, with `NotConnected` an error: {body}"
+        );
+        assert_eq!(
+            body.matches("VoiceMoveOutcome::").count(),
+            3,
+            "exactly the three variants, no catch-all: {body}"
+        );
+    }
+
+    /// AFK Stage 6 FU-B: the disconnect shape removes the target from the
+    /// channel the source-side gate decided about, never from a fresh read.
+    /// A fresh read here could name a call the target switched to after the
+    /// gate, and the mover would kick them out of a channel they were never
+    /// checked against. Mutations: the fresh read put back, or the removal /
+    /// release addressed to anything but the gated source.
+    #[test]
+    fn the_disconnect_removes_from_the_gated_source_only() {
+        const OPEN: &str = "if remove.contains(&FieldsMember::VoiceChannel) \u{7b}";
+        const SOURCE: &str = "if let Some(channel) = &source_id \u{7b} \
+             if let Some(node) = get_channel_node(channel).await? \u{7b}";
+        const RELEASE: &str = "&UserVoiceChannel \u{7b} id: channel.clone(), \
+             server_id: Some(server.id.clone()), \u{7d}, &target_user.id, \
+             \"revoked_by_moderator\",";
+        const REMOVE: &str = "voice_client .remove_user(&node, &target_user.id, channel) .await?;";
+
+        let body = route_body();
+        assert_eq!(body.matches(OPEN).count(), 1, "{body}");
+        let open = body.find(OPEN).expect("counted above") + OPEN.len() - 1;
+        let mut depth = 0usize;
+        let mut close = None;
+        for (i, ch) in body[open..].char_indices() {
+            match ch {
+                '\u{7b}' => depth += 1,
+                '\u{7d}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        close = Some(open + i);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let block = &body[open..=close.expect("the disconnect block closes")];
+
+        let mut last = 0;
+        for needle in [SOURCE, RELEASE, REMOVE] {
+            let at = block
+                .find(needle)
+                .unwrap_or_else(|| panic!("the disconnect lost `{}`: {}", needle, block));
+            assert!(last <= at, "`{}` is out of order: {}", needle, block);
+            last = at;
+        }
+        assert!(
+            !block.contains("get_user_voice_channel_in_server("),
+            "the disconnect must not re-read the target's channel: {}",
+            block
+        );
+        assert_eq!(
+            block.matches(".remove_user(").count(),
+            1,
+            "one removal, from the gated source: {block}"
+        );
+    }
+
     // ---- what the move refuses past the caps gate ------------------------
     //
     // Until these, nothing exercised the move beyond `assert_call_caps_admit`
     // — both move tests above stop there, and the `voice_channel` fixture is a
     // real voice channel, which is why the destination was never checked to be
     // one at all.
+    //
+    // ---- behavior (needs RabbitMQ and Redis) ------------------------------
+    //
+    // Compile-only on a box without those services: `TestHarness::new`
+    // connects to RabbitMQ and the voice state lives in Redis (and, under
+    // `TEST_DB=MONGODB`, the documents in MongoDB), so each test in this
+    // section fails before it asserts anything there, like every other route
+    // test in this crate. Each carries the one-line label below as well.
 
     /// A voice channel with an explicit occupancy cap.
     async fn capped_voice_channel(
@@ -1624,6 +1863,7 @@ mod test {
         );
     }
 
+    // Compile-only without RabbitMQ and Redis: see the section note above.
     #[test]
     fn move_into_a_text_channel_is_refused() {
         crate::util::test::rt().block_on(move_into_a_text_channel_is_refused_case())
@@ -1657,6 +1897,7 @@ mod test {
             .expect("cleanup");
     }
 
+    // Compile-only without RabbitMQ and Redis: see the section note above.
     #[test]
     fn move_is_refused_when_the_target_lacks_connect() {
         crate::util::test::rt().block_on(move_is_refused_when_the_target_lacks_connect_case())
@@ -1709,9 +1950,11 @@ mod test {
             .expect("cleanup");
     }
 
+    // Compile-only without RabbitMQ and Redis: see the section note above.
     #[test]
     fn move_is_refused_when_the_mover_is_denied_the_destination() {
-        crate::util::test::rt().block_on(move_is_refused_when_the_mover_is_denied_the_destination_case())
+        crate::util::test::rt()
+            .block_on(move_is_refused_when_the_mover_is_denied_the_destination_case())
     }
 
     /// The mover's own standing on the DESTINATION, which the server-scoped
@@ -1825,9 +2068,11 @@ mod test {
             .expect("cleanup");
     }
 
+    // Compile-only without RabbitMQ and Redis: see the section note above.
     #[test]
     fn moving_a_member_to_the_channel_they_are_in_is_a_no_op() {
-        crate::util::test::rt().block_on(moving_a_member_to_the_channel_they_are_in_is_a_no_op_case())
+        crate::util::test::rt()
+            .block_on(moving_a_member_to_the_channel_they_are_in_is_a_no_op_case())
     }
 
     async fn moving_a_member_to_the_channel_they_are_in_is_a_no_op_case() {
@@ -1875,6 +2120,7 @@ mod test {
             .expect("cleanup");
     }
 
+    // Compile-only without RabbitMQ and Redis: see the section note above.
     #[test]
     fn move_into_a_full_channel_is_refused_unless_the_target_manages_it() {
         crate::util::test::rt()
@@ -1966,6 +2212,7 @@ mod test {
             .expect("cleanup managed");
     }
 
+    // Compile-only without RabbitMQ and Redis: see the section note above.
     #[test]
     fn move_is_refused_when_the_mover_is_denied_the_source() {
         crate::util::test::rt().block_on(move_is_refused_when_the_mover_is_denied_the_source_case())
@@ -2098,10 +2345,40 @@ mod test {
             .expect("cleanup");
     }
 
+    // Compile-only without RabbitMQ and Redis: see the section note above.
     #[test]
-    fn moving_and_editing_voice_permissions_in_one_patch_is_refused() {
-        crate::util::test::rt()
-            .block_on(moving_and_editing_voice_permissions_in_one_patch_is_refused_case())
+    fn moving_and_editing_roles_in_one_patch_is_refused() {
+        crate::util::test::rt().block_on(moving_and_editing_voice_permissions_case(|dest| {
+            vec![
+                serde_json::json!({ "voice_channel": dest, "roles": [] }),
+                serde_json::json!({ "voice_channel": dest, "remove": ["Roles"] }),
+            ]
+        }))
+    }
+
+    // Compile-only without RabbitMQ and Redis: see the section note above.
+    #[test]
+    fn moving_and_editing_the_timeout_in_one_patch_is_refused() {
+        crate::util::test::rt().block_on(moving_and_editing_voice_permissions_case(|dest| {
+            let until = Timestamp::now_utc()
+                .checked_add(Duration::hours(1))
+                .expect("timeout timestamp");
+            vec![
+                serde_json::json!({ "voice_channel": dest, "timeout": until }),
+                serde_json::json!({ "voice_channel": dest, "remove": ["Timeout"] }),
+            ]
+        }))
+    }
+
+    // Compile-only without RabbitMQ and Redis: see the section note above.
+    #[test]
+    fn moving_and_muting_or_deafening_in_one_patch_is_refused() {
+        crate::util::test::rt().block_on(moving_and_editing_voice_permissions_case(|dest| {
+            vec![
+                serde_json::json!({ "voice_channel": dest, "can_publish": false }),
+                serde_json::json!({ "voice_channel": dest, "can_receive": false }),
+            ]
+        }))
     }
 
     /// A move is decided twice — once side-effect free before the member
@@ -2112,7 +2389,18 @@ mod test {
     /// permissions, and timeout-and-move applies the timeout and then refuses
     /// the move, leaving a half-applied edit behind. Refusing the combination
     /// is what makes the route's ordering guarantee true.
-    async fn moving_and_editing_voice_permissions_in_one_patch_is_refused_case() {
+    ///
+    /// Split three ways (AFK Stage 6 FU-A). The `servers` ratelimit bucket
+    /// allows 5 requests per window per user and server, and it is kept per
+    /// Rocket instance, i.e. per `TestHarness`. The six bodies used to go
+    /// through one moderator on one server, and the sixth was answered 429
+    /// before it reached the route. Each test now sends two bodies plus the
+    /// control, three requests, on its own harness. The refusal is asserted
+    /// by ERROR TYPE as well as status: `UnknownNode`, which a move that got
+    /// past the refusal reaches, is also a 400.
+    async fn moving_and_editing_voice_permissions_case(
+        bodies: impl FnOnce(&str) -> Vec<serde_json::Value>,
+    ) {
         let harness = TestHarness::new().await;
         let (_a, session_a, user_a) = harness.new_user().await;
         let (_b, _session_b, user_b) = harness.new_user().await;
@@ -2125,18 +2413,7 @@ mod test {
         let destination = voice_channel(&harness, &server, "Dest").await;
         let source_uvc = connect_publishing(&source, &user_b.id).await;
 
-        let until = Timestamp::now_utc()
-            .checked_add(Duration::hours(1))
-            .expect("timeout timestamp");
-
-        for body in [
-            serde_json::json!({ "voice_channel": destination.id(), "roles": [] }),
-            serde_json::json!({ "voice_channel": destination.id(), "timeout": until }),
-            serde_json::json!({ "voice_channel": destination.id(), "can_publish": false }),
-            serde_json::json!({ "voice_channel": destination.id(), "can_receive": false }),
-            serde_json::json!({ "voice_channel": destination.id(), "remove": ["Roles"] }),
-            serde_json::json!({ "voice_channel": destination.id(), "remove": ["Timeout"] }),
-        ] {
+        for body in bodies(destination.id()) {
             let response = edit_member(
                 &harness,
                 &session_a.token,
@@ -2150,6 +2427,13 @@ mod test {
                 Status::BadRequest,
                 "{body} moves the member and changes the permissions the move \
                  is decided under, and must be refused"
+            );
+            let error = response.into_string().await.unwrap_or_default();
+            assert!(
+                error.contains("InvalidOperation"),
+                "{} must be refused as InvalidOperation, got {}",
+                body,
+                error
             );
         }
 

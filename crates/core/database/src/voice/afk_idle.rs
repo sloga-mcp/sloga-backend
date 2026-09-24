@@ -86,11 +86,15 @@ const REQUEUE_INFRA_MS: i64 = 30_000;
 /// Why 60 s: it is the shortest AFK timeout a server can choose
 /// (`Server::AFK_TIMEOUT_CHOICES`), and every withdrawal the client sends
 /// comes with a reset of its idle clock (activity, a tick gap, or the watch
-/// being disarmed all set its last-activity time to now). So no legitimate
-/// claim can follow its own withdrawal sooner than 60 s. A legitimate claim that
-/// arrives while a tomb stands anyway (a longer idle period that started
-/// before the tomb expired) is only delayed: the client's next refresh
-/// re-creates it with the true `since`, which is computed from `idle_for`.
+/// being disarmed all set its last-activity time to now). So the client
+/// cannot SEND a legitimate claim sooner than 60 s after the activity that
+/// caused the withdrawal. That is measured from the activity, not from the
+/// moment the DELETE lands: a DELETE that spends time in flight or in its
+/// retries plants a tomb that still stands for a full 60 s after it lands,
+/// and a legitimate claim can arrive inside that span. Such a claim (and any
+/// other legitimate claim that meets a standing tomb) is refused, and the
+/// outcome is only a delay: the client's next refresh re-creates it with the
+/// true `since`, which is computed from `idle_for`.
 ///
 /// Residual: a PUT stalled for longer than this after the DELETE still lands.
 pub const AFK_IDLE_TOMB_TTL_SECS: u64 = 60;
@@ -111,6 +115,77 @@ pub fn afk_idle_tomb_key(user_id: &str, server_id: &str) -> String {
 /// rule is pinned on its own.
 pub fn afk_since_blocked(tomb: bool) -> bool {
     tomb
+}
+
+/// How far a claim's `idle_for` may run past the member's time in the call
+/// (`now − joined_at`) before [`afk_since_predates_join`] refuses it, in ms.
+///
+/// What it has to absorb, for a claim that IS legitimate:
+///
+/// - Where `joined_at:` comes from. voice-ingress writes it in
+///   `create_voice_state` on the SFU's `participant_joined` webhook, and the
+///   VALUE is that event's `created_at`: stamped by the SFU when the
+///   participant joined, in WHOLE seconds, truncated. When the webhook is
+///   delivered does not enter into it (until it is delivered there is no
+///   `joined_at:` and the check does not apply), and the truncation puts
+///   `joined_at` up to 1 s EARLY, which only shrinks the excess.
+/// - Where the client's idle clock starts. `#startIdleWatch` sets
+///   `lastActivityAt` to now in the Room's `connected` listener
+///   (`state.tsx`), and `idlePolicy.ts` holds the clock at now while not
+///   connected. The Room and the SFU observe the same join handshake, so the
+///   client's clock starts on the order of a network round trip away from
+///   the SFU's stamp, in either direction. (Reasoned from the two code
+///   paths, not measured on a live leg.)
+/// - `idle_for` is rounded down to whole seconds by the client, and the
+///   request's own latency is added to `now`; both only shrink the excess.
+/// - Clock skew between the SFU node, which stamps `joined_at`, and this
+///   server, which reads `now`. An SFU clock running AHEAD grows the excess
+///   one for one. NTP keeps that to milliseconds; the slack leaves room for
+///   several seconds of it.
+///
+/// So a legitimate claim's excess is about a round trip plus the skew:
+/// under a second on synchronized hosts. 10 s covers that many times over.
+///
+/// Why not larger: the claim this exists to refuse (F-A2) is a stale refresh
+/// from a dropped connection that lands just after the same-channel rejoin.
+/// Its `idle_for` is at least the shortest timeout (60 s: the client claims
+/// only at the timeout), while `now − joined_at` is seconds, so it is refused
+/// for as long as it lands within `60 s − slack` of the rejoin — 50 s here,
+/// far longer than any request stays in flight.
+///
+/// 🔴 The excess of a connection is CONSTANT across its refreshes (both
+/// sides advance with the wall clock), so a slack smaller than the real gap
+/// would refuse every claim from that connection until its user is next
+/// active. That direction is safe (nobody is moved) but silent.
+///
+/// Known case of exactly that: a full SDK reconnect (a new SFU participant,
+/// so a new `participant_joined` and a new `joined_at`) that completes
+/// between two of the client's 5 s idle ticks. No tick sees the Room
+/// disconnected, so the idle clock is not restarted, and the connection's
+/// excess is the idle time it had before the reconnect: its claims are
+/// refused until the user is next active. The cure is client-side (restart
+/// the idle clock on the Room's reconnect events), not a larger slack.
+const AFK_CLAIM_JOIN_SLACK_MS: i64 = 10_000;
+
+/// Whether a claim says the member has been idle for longer than they have
+/// been in the call (AFK Stage 6 F-A2): `idle_for` exceeds `now − joined_at`
+/// by more than [`AFK_CLAIM_JOIN_SLACK_MS`]. Such a claim was measured on an
+/// earlier connection, typically a stale refresh from a dropped one that lands
+/// after the rejoin's `create_voice_state`, and it writes nothing: the clamp
+/// in [`afk_since_ms`] would otherwise turn it into `since = joined_at`, and
+/// an active member would be moved one timeout after the rejoin with no
+/// claim of their own to withdraw.
+///
+/// No `joined_at:` (not written yet, or unreadable) refuses nothing, which is
+/// the behavior before this check. The raw `idle_for` is compared, not the
+/// capped one: the cap bounds how far back `since` may go, and must not make
+/// an impossible claim look possible. Pure, and pinned by value.
+pub fn afk_since_predates_join(now_ms: i64, idle_for: u32, joined_at_ms: Option<i64>) -> bool {
+    let Some(joined_at_ms) = joined_at_ms else {
+        return false;
+    };
+
+    i64::from(idle_for) * 1000 > now_ms - joined_at_ms + AFK_CLAIM_JOIN_SLACK_MS
 }
 
 /// A parsed idle claim: the channel the member was idle in, and since when.
@@ -431,8 +506,15 @@ fn afk_since_withdraw_pipeline(user_id: &str, server_id: &str) -> Pipeline {
 ///
 /// Nothing at all is written while a withdrawal tombstone stands (see
 /// [`AFK_IDLE_TOMB_TTL_SECS`]): no SET, no EXPIRE, no ZADD, and the call still
-/// succeeds. The tomb is read before anything else, so the remaining race is
-/// only a withdrawal landing between that read and the writes below.
+/// succeeds. The tomb is read before anything else, and read AGAIN after the
+/// writes (N-1): a withdrawal whose tomb landed between the first read and
+/// the writes is found there, and the claim and its index entry just written
+/// are deleted. The withdrawal sets its tomb BEFORE it deletes, so a
+/// withdrawal the second read does not see has not deleted yet, and its own
+/// DEL and ZREM land after these writes.
+///
+/// Nothing is written either for a claim whose `idle_for` is longer than the
+/// member has been in the call (see [`afk_since_predates_join`]).
 ///
 /// `since` is stamped here, from `idle_for` and this server's clock, and
 /// clamped to `joined_at:`. A same-channel claim is only re-expired, so its
@@ -465,6 +547,15 @@ pub async fn set_afk_since(
     let joined_at_ms = joined_at.and_then(|value| value.parse::<i64>().ok());
     let existing_claim = existing.as_deref().and_then(parse_afk_since);
 
+    // One clock reading for both the refusal below and the stamp.
+    let now = now_ms();
+
+    // Idle for longer than they have been in the call: measured on an
+    // earlier connection (F-A2). Write nothing.
+    if afk_since_predates_join(now, idle_for, joined_at_ms) {
+        return Ok(());
+    }
+
     let write = if existing.is_some() && existing_claim.is_none() {
         AfkSinceWrite::Replace
     } else {
@@ -472,7 +563,7 @@ pub async fn set_afk_since(
     };
     let fresh = AfkIdleClaim {
         channel_id: channel_id.to_string(),
-        since_ms: afk_since_ms(now_ms(), idle_for, joined_at_ms),
+        since_ms: afk_since_ms(now, idle_for, joined_at_ms),
     };
     // The `since` that stands after this write: a refresh keeps the old one.
     let since_ms = match (write, &existing_claim) {
@@ -490,7 +581,22 @@ pub async fn set_afk_since(
     )
     .query_async::<_, ()>(&mut *conn)
     .await
-    .to_internal_error()
+    .to_internal_error()?;
+
+    // N-1: the tomb again, now that the claim is written. If a withdrawal
+    // planted one since the first read, take back what was just written.
+    let tomb_after_write: bool = afk_idle_tomb_read_cmd(user_id, server_id)
+        .query_async(&mut *conn)
+        .await
+        .to_internal_error()?;
+    if afk_since_blocked(tomb_after_write) {
+        afk_since_clear_pipeline(user_id, server_id)
+            .query_async::<_, ()>(&mut *conn)
+            .await
+            .to_internal_error()?;
+    }
+
+    Ok(())
 }
 
 /// The stored claim, if any (an unreadable value reads as none).
@@ -731,6 +837,149 @@ mod tests {
                 && !clear.contains("tomb")
                 && !clear.contains("withdraw"),
             "the plain clear must leave no tomb: {clear}"
+        );
+    }
+
+    /// N-1 (Stage 6): after the claim write and the index ZADD,
+    /// `set_afk_since` reads the tomb a SECOND time and, when it stands,
+    /// deletes the claim and its index entry through the same clear pipeline
+    /// the sweep uses (DEL + ZREM, pinned by value in
+    /// `the_member_read_and_clear_address_user_then_server`). Mutations: the
+    /// re-check deleted, moved above either write, its condition inverted, or
+    /// its clear swapped for anything else.
+    #[test]
+    fn a_tomb_planted_during_the_write_takes_the_claim_back() {
+        let set = shipping_fn_body("pub async fn set_afk_since(");
+        let at = |needle: &str| {
+            set.find(needle)
+                .unwrap_or_else(|| panic!("`set_afk_since` lost `{needle}`: {set}"))
+        };
+
+        const READ: &str = "afk_idle_tomb_read_cmd(user_id, server_id)";
+        assert_eq!(
+            set.matches(READ).count(),
+            2,
+            "the tomb is read exactly twice, before and after the writes: {set}"
+        );
+        let recheck = set.rfind(READ).expect("counted above");
+        for write in ["afk_since_write_cmd(", "afk_idle_add_cmd("] {
+            assert!(
+                at(write) < recheck,
+                "the second tomb read must follow `{write}`: {set}"
+            );
+        }
+
+        const TAKE_BACK: &str = "let tomb_after_write: bool = afk_idle_tomb_read_cmd(user_id, \
+             server_id) .query_async(&mut *conn) .await .to_internal_error()?; \
+             if afk_since_blocked(tomb_after_write) \u{7b} \
+             afk_since_clear_pipeline(user_id, server_id) .query_async::<_, ()>(&mut *conn) \
+             .await .to_internal_error()?; \u{7d}";
+        assert_eq!(
+            set.matches(TAKE_BACK).count(),
+            1,
+            "a standing tomb after the write must clear the claim and its entry: {set}"
+        );
+        assert!(at(TAKE_BACK) > at("afk_idle_add_cmd("));
+    }
+
+    /// F-A2 (Stage 6): a claim whose `idle_for` exceeds the member's time in
+    /// the call by more than the slack is refused; one within it, or with no
+    /// `joined_at` at all, is not. Mutations: `>` for `>=` (the exact-slack
+    /// case), the slack dropped or grown, the check reduced to `false`, or
+    /// the capped `idle_for` compared instead of the raw one.
+    #[test]
+    fn a_claim_idle_for_longer_than_the_call_is_refused() {
+        let joined = 1_758_600_000_000_i64;
+
+        assert_eq!(AFK_CLAIM_JOIN_SLACK_MS, 10_000);
+        // A claim from a fresh rejoin is refused for as long as it can be a
+        // stale refresh: its idle_for is at least the shortest timeout.
+        assert!(
+            AFK_CLAIM_JOIN_SLACK_MS
+                < i64::from(*crate::Server::AFK_TIMEOUT_CHOICES.iter().min().unwrap()) * 1000,
+            "a slack as long as the shortest timeout would let the stale claim through"
+        );
+
+        // No join time: nothing is refused, however long the claim.
+        for idle_for in [0, 60, 3600, u32::MAX] {
+            assert!(
+                !afk_since_predates_join(joined, idle_for, None),
+                "{idle_for}"
+            );
+        }
+
+        // In the call for 30 s.
+        let now = joined + 30_000;
+        assert!(!afk_since_predates_join(now, 0, Some(joined)));
+        assert!(!afk_since_predates_join(now, 30, Some(joined)));
+        assert!(
+            !afk_since_predates_join(now, 40, Some(joined)),
+            "exactly the slack past the join is still accepted"
+        );
+        assert!(
+            afk_since_predates_join(now, 41, Some(joined)),
+            "one second past the slack is refused"
+        );
+
+        // F-A2 itself: the rejoin 2 s ago, a stale refresh carrying 120 s.
+        assert!(afk_since_predates_join(joined + 2_000, 120, Some(joined)));
+        // ...and the shortest timeout's claim, landing 49 s after the rejoin.
+        assert!(afk_since_predates_join(joined + 49_000, 60, Some(joined)));
+
+        // The legitimate claim: the idle clock started 1 s before the SFU's
+        // stamp, and the member really has been idle the whole call.
+        let now = joined + 300_000;
+        assert!(!afk_since_predates_join(now, 301, Some(joined)));
+
+        // The raw idle_for is compared, not the 3600 s cap: a call of 3700 s
+        // cannot carry 5000 s of idle time.
+        assert!(afk_since_predates_join(
+            joined + 3_700_000,
+            5000,
+            Some(joined)
+        ));
+        assert!(!afk_since_predates_join(
+            joined + 3_700_000,
+            3700,
+            Some(joined)
+        ));
+    }
+
+    /// F-A2 (Stage 6): `set_afk_since` consults `afk_since_predates_join`
+    /// after it has read `joined_at:` and before it writes anything, with the
+    /// same `now` it stamps `since` from. Mutations: the stop deleted, moved
+    /// below a write, or fed another clock reading.
+    #[test]
+    fn a_claim_that_predates_the_join_writes_nothing() {
+        let set = shipping_fn_body("pub async fn set_afk_since(");
+        let at = |needle: &str| {
+            set.find(needle)
+                .unwrap_or_else(|| panic!("`set_afk_since` lost `{needle}`: {set}"))
+        };
+
+        const STOP: &str =
+            "if afk_since_predates_join(now, idle_for, joined_at_ms) \u{7b} return Ok(()); \u{7d}";
+        assert_eq!(set.matches(STOP).count(), 1, "exactly one join stop: {set}");
+        let stop = at(STOP);
+        assert!(at("let now = now_ms();") < stop);
+        assert!(
+            at(".mget(") < stop,
+            "the stop needs `joined_at:`, read by the MGET"
+        );
+        for later in [
+            "afk_since_write_cmd(",
+            "afk_idle_add_cmd(",
+            "afk_since_ms(now, idle_for, joined_at_ms)",
+        ] {
+            assert!(
+                stop < at(later),
+                "the join stop must precede `{later}`: {set}"
+            );
+        }
+        assert_eq!(
+            set.matches("now_ms()").count(),
+            1,
+            "one clock reading for the stop and the stamp: {set}"
         );
     }
 

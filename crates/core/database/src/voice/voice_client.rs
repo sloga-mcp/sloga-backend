@@ -117,12 +117,14 @@ impl VoiceClient {
 
         let limits = user.limits().await;
         // No `Server` is in hand here — `create_token` is called only from
-        // `voice_join` and the server-ordered move
-        // (`move_user_to_voice_channel`); the remote-control paths never mint,
-        // they act on existing participants through
-        // `update_permissions_identity` — so the gate resolves the
-        // designation itself. One `fetch_server` per token mint (a join or a
-        // move), never per participant of a call.
+        // the `voice_join` route (`call`) and the server-ordered move
+        // (`move_user_to_voice_channel_expecting`, which
+        // `move_user_to_voice_channel` delegates to); the remote-control
+        // paths never mint, they act on existing participants through
+        // `update_permissions_identity`, and the Android screen leg mints
+        // through `create_screen_leg_token` with its own gate — so the gate
+        // resolves the designation itself. One `fetch_server` per token mint
+        // (a join or a move), never per participant of a call.
         let allowed_sources = get_allowed_sources(
             &limits,
             permissions,
@@ -159,7 +161,9 @@ impl VoiceClient {
                 room_join: true,
                 // An EMPTY canPublishSources claim means "no restriction" to
                 // LiveKit (auth/grants.go), so a source-less member (Connect
-                // without Speak/Video) must be denied publishing outright
+                // without Speak/Video, or anyone in the AFK channel) must be
+                // denied publishing outright. Pinned on the minted token by
+                // `afk_mint_tests`.
                 can_publish: !allowed_sources.is_empty(),
                 can_publish_data: false,
                 can_publish_sources: allowed_sources
@@ -330,6 +334,168 @@ impl VoiceClient {
             )
             .await
             .to_internal_error()
+    }
+
+    /// [`Self::update_permissions`], treating "that participant is not in the
+    /// room" as an answer rather than a failure (AFK Stage 6 F-A1).
+    ///
+    /// `Ok(true)`: the SFU applied the new permissions to a primary connection
+    /// of the user. `Ok(false)`: the user has NO connection in the room, as
+    /// far as we can be sure (below). `Err`: anything else, including a
+    /// non-JSON 404, an unknown node, a failed identity lookup, and a failed
+    /// roster read.
+    ///
+    /// "Not found" is only an answer when the identity we addressed is the
+    /// participant's real one (AFK Stage 6 re-audit RA-1). voice-ingress
+    /// records every participant's identity, bare or device-qualified, on
+    /// `participant_joined`, before it creates the voice state, and deletes
+    /// it only with the voice state; so a sync that finds voice state
+    /// normally finds the mapping too. When the mapping is missing anyway
+    /// (evicted, or dropped by a teardown path that left the voice state),
+    /// the bare user id is only a GUESS, and a device-qualified participant
+    /// still publishing would answer not_found to it. So on that path the
+    /// SFU's own roster decides ([`not_found_answer`]): every primary
+    /// connection of the user it lists is pushed to, none listed is
+    /// `Ok(false)`, and a roster that cannot be read is an error.
+    ///
+    /// The screen leg gets the leg-specific set, best-effort, before its
+    /// primary, through the classifying push so that a user with no leg (the
+    /// common case) is not an ERROR log and a Sentry event on every sync
+    /// (RA-6); a real failure there still reports, from inside that push.
+    pub async fn update_permissions_if_present(
+        &self,
+        node: &str,
+        user: &User,
+        channel_id: &str,
+        new_permissions: ParticipantPermission,
+    ) -> Result<bool> {
+        let stored = super::stored_voice_participant_identity(channel_id, &user.id).await?;
+        let mapped = stored.is_some();
+        let identity = stored.unwrap_or_else(|| user.id.clone());
+
+        if self
+            .push_primary_and_leg(node, &identity, channel_id, &new_permissions)
+            .await?
+        {
+            return Ok(true);
+        }
+
+        let answer = match not_found_answer(&user.id, mapped, None) {
+            NotFoundAnswer::ReadRoster => {
+                let roster = self
+                    .list_participants_if_present(node, channel_id)
+                    .await
+                    .map(|listed| {
+                        listed.map(|participants| {
+                            participants
+                                .into_iter()
+                                .map(|participant| participant.identity)
+                                .collect::<Vec<_>>()
+                        })
+                    });
+                not_found_answer(&user.id, mapped, Some(roster))
+            }
+            answer => answer,
+        };
+
+        match answer {
+            NotFoundAnswer::Gone => Ok(false),
+            NotFoundAnswer::Failed(error) => Err(error),
+            NotFoundAnswer::PushTo(identities) => {
+                log::warn!(
+                    "voice identity mapping missing for {} in {channel_id}; the SFU lists \
+                     {identities:?}, pushing the permission sync there",
+                    user.id
+                );
+                let mut pushes = Vec::with_capacity(identities.len());
+                for identity in &identities {
+                    pushes.push(
+                        self.push_primary_and_leg(node, identity, channel_id, &new_permissions)
+                            .await,
+                    );
+                }
+                pushes_answer(pushes)
+            }
+            // `not_found_answer` never asks twice; fail closed if it ever does.
+            NotFoundAnswer::ReadRoster => {
+                log::error!(
+                    "permission sync of {} in {channel_id}: the roster was asked for twice",
+                    user.id
+                );
+                Err(create_error!(InternalError))
+            }
+        }
+    }
+
+    /// The leg-specific set to `identity`'s screen leg (best-effort, result
+    /// discarded), then `new_permissions` to `identity` itself, both through
+    /// the classifying push. The primary's answer is returned.
+    async fn push_primary_and_leg(
+        &self,
+        node: &str,
+        identity: &str,
+        channel_id: &str,
+        new_permissions: &ParticipantPermission,
+    ) -> Result<bool> {
+        let _ = self
+            .update_permissions_identity_if_present(
+                node,
+                &super::screen_leg_identity(identity),
+                channel_id,
+                screen_leg_participant_permissions(new_permissions),
+            )
+            .await;
+
+        self.update_permissions_identity_if_present(
+            node,
+            identity,
+            channel_id,
+            new_permissions.clone(),
+        )
+        .await
+    }
+
+    /// [`Self::update_permissions_identity`], treating "that participant is
+    /// not in the room" as an answer rather than a failure: `Ok(true)` the SFU
+    /// applied it, `Ok(false)` a Twirp `not_found` (see
+    /// [`is_twirp_not_found`]), `Err` anything else, including a non-JSON 404
+    /// and an unknown node.
+    ///
+    /// Goes through the raw room client so that the classification happens
+    /// BEFORE any reporting: `to_internal_error()` logs at ERROR and reports
+    /// to Sentry, and a participant that has already left is not an incident.
+    /// So only the not-found answer is quiet. A real failure goes through
+    /// `to_internal_error()` exactly as [`Self::update_permissions_identity`]
+    /// reports it: ERROR log, Sentry event, `InternalError` (AFK Stage 6
+    /// FU-2). A failed grant push is a security-relevant event (a member may
+    /// be left publishing where they should not), and must not be quieter
+    /// than it was before this function existed.
+    pub async fn update_permissions_identity_if_present(
+        &self,
+        node: &str,
+        identity: &str,
+        channel_id: &str,
+        new_permissions: ParticipantPermission,
+    ) -> Result<bool> {
+        let livekit = self.get_node(node)?;
+
+        match livekit
+            .client
+            .update_participant(
+                channel_id,
+                identity,
+                UpdateParticipantOptions {
+                    permission: Some(new_permissions),
+                    ..Default::default()
+                },
+            )
+            .await
+        {
+            Ok(_) => Ok(true),
+            Err(error) if is_twirp_not_found(&error) => Ok(false),
+            // A real failure: ERROR log + Sentry (see the doc comment).
+            Err(error) => Err::<bool, _>(error).to_internal_error(),
+        }
     }
 
     /// Remove a participant addressed by an EXACT SFU identity (the
@@ -523,6 +689,93 @@ impl VoiceClient {
             .delete_room(channel_id)
             .await
             .to_internal_error()
+    }
+}
+
+/// What a permission push that the SFU answered `not_found` amounts to (AFK
+/// Stage 6 re-audit RA-1). See [`not_found_answer`].
+#[derive(Debug, PartialEq, Eq)]
+enum NotFoundAnswer<E> {
+    /// The user has no connection in the room: skip them.
+    Gone,
+    /// The addressed identity was a guess; read the SFU's roster, then ask
+    /// again with it.
+    ReadRoster,
+    /// The roster lists these primary connections of the user: push to them.
+    PushTo(Vec<String>),
+    /// The roster could not be read: no answer, so an error.
+    Failed(E),
+}
+
+/// Decide what a `not_found` from the SFU means for `user_id`.
+///
+/// - `mapped`: the identity addressed was the one voice-ingress recorded for
+///   this user, i.e. the participant's real identity, so `not_found` is the
+///   truth: [`NotFoundAnswer::Gone`].
+/// - not `mapped`: the addressed identity was the bare-id FALLBACK, a guess.
+///   A device-qualified connection would answer `not_found` to it while
+///   still publishing, so only the SFU's roster can say. `roster: None`
+///   (not read yet) asks for it; a roster that failed to read is
+///   [`NotFoundAnswer::Failed`]; a room the SFU does not have
+///   (`Ok(None)`) or a roster listing no primary of the user is
+///   [`NotFoundAnswer::Gone`]; otherwise every listed primary of the user,
+///   bare or `{user}:{device}`, screen legs excluded, is
+///   [`NotFoundAnswer::PushTo`].
+///
+/// Pure, so each branch is pinned by value.
+fn not_found_answer<E>(
+    user_id: &str,
+    mapped: bool,
+    roster: Option<std::result::Result<Option<Vec<String>>, E>>,
+) -> NotFoundAnswer<E> {
+    if mapped {
+        return NotFoundAnswer::Gone;
+    }
+
+    match roster {
+        None => NotFoundAnswer::ReadRoster,
+        Some(Err(error)) => NotFoundAnswer::Failed(error),
+        Some(Ok(None)) => NotFoundAnswer::Gone,
+        Some(Ok(Some(identities))) => {
+            let primaries: Vec<String> = identities
+                .into_iter()
+                .filter(|identity| {
+                    super::user_id_from_participant_identity(identity) == user_id
+                        && !super::is_screen_leg(identity)
+                })
+                .collect();
+
+            if primaries.is_empty() {
+                NotFoundAnswer::Gone
+            } else {
+                NotFoundAnswer::PushTo(primaries)
+            }
+        }
+    }
+}
+
+/// What the pushes to the connections the roster listed amount to: the FIRST
+/// error when any failed (after all were tried), else `Ok(true)` if any
+/// landed, else `Ok(false)` (every listed connection left in the meantime).
+/// Pure.
+fn pushes_answer<E>(
+    pushes: impl IntoIterator<Item = std::result::Result<bool, E>>,
+) -> std::result::Result<bool, E> {
+    let mut failure = None;
+    let mut landed = false;
+
+    for push in pushes {
+        match push {
+            Ok(pushed) => landed |= pushed,
+            Err(error) => {
+                failure.get_or_insert(error);
+            }
+        }
+    }
+
+    match failure {
+        Some(error) => Err(error),
+        None => Ok(landed),
     }
 }
 
@@ -1095,5 +1348,486 @@ mod conn_nonce_and_removal_tests {
             ),
             Ok(listed) => panic!("an unknown node must be an error, got Ok({listed:?})"),
         }
+    }
+
+    /// A shipping `VoiceClient` method of this file, from its definition to
+    /// the end of its body, comment lines dropped and whitespace collapsed.
+    fn shipping_method(definition: &str) -> String {
+        const SOURCE: &str = include_str!("voice_client.rs");
+        let shipping = &SOURCE[..SOURCE
+            .find("#[cfg(test)]\nmod screen_leg_permission_tests")
+            .expect("the first test module")];
+        let at = shipping
+            .find(definition)
+            .unwrap_or_else(|| panic!("`{definition}` is not defined"));
+        let end = at
+            + shipping[at..]
+                .find("\n    }\n")
+                .expect("the end of its body");
+
+        shipping[at..end]
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join(" ")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    /// RA-1 (Stage 6 re-audit): `update_permissions_if_present` reads the
+    /// mapping WITHOUT the bare-id fallback, pushes to it, and on a miss
+    /// asks `not_found_answer` whether that miss is an answer: first with no
+    /// roster, then, if asked, with the SFU's roster. Its Redis lookup makes
+    /// it untestable by value here, so it is pinned on its text; the decision
+    /// itself is pinned by value below. Mutations: the lookup swapped for the
+    /// falling-back `get_voice_participant_identity`, `mapped` forced, the
+    /// roster never read, or a verdict mapped to the wrong result.
+    #[test]
+    fn update_permissions_if_present_consults_the_roster_on_a_guess() {
+        let body = shipping_method("pub async fn update_permissions_if_present(");
+        let at = |needle: &str| {
+            body.find(needle).unwrap_or_else(|| {
+                panic!("`update_permissions_if_present` lost `{needle}`: {body}")
+            })
+        };
+
+        assert!(
+            !body.contains("get_voice_participant_identity("),
+            "the falling-back lookup hides whether the identity is a guess: {body}"
+        );
+        let order = [
+            "let stored = super::stored_voice_participant_identity(channel_id, &user.id).await?;",
+            "let mapped = stored.is_some();",
+            ".push_primary_and_leg(node, &identity, channel_id, &new_permissions)",
+            "not_found_answer(&user.id, mapped, None)",
+            ".list_participants_if_present(node, channel_id)",
+            "not_found_answer(&user.id, mapped, Some(roster))",
+        ];
+        for pair in order.windows(2) {
+            assert!(
+                at(pair[0]) < at(pair[1]),
+                "`{}` must precede `{}`: {body}",
+                pair[0],
+                pair[1]
+            );
+        }
+        for verdict in [
+            "NotFoundAnswer::Gone => Ok(false),",
+            "NotFoundAnswer::Failed(error) => Err(error),",
+            "pushes_answer(pushes)",
+        ] {
+            at(verdict);
+        }
+    }
+
+    /// RA-6 (Stage 6 re-audit): the best-effort screen-leg push goes through
+    /// the CLASSIFYING push, so a member with no leg (almost everyone) is not
+    /// an ERROR log and a Sentry event on every sync. The primary goes
+    /// through it too. Mutation: either push routed back through the
+    /// collapsing `update_permissions_identity`.
+    #[test]
+    fn the_leg_and_the_primary_use_the_classifying_push() {
+        let body = shipping_method("async fn push_primary_and_leg(");
+
+        assert!(
+            body.contains(
+                "let _ = self .update_permissions_identity_if_present( node, \
+                 &super::screen_leg_identity(identity), channel_id, \
+                 screen_leg_participant_permissions(new_permissions), ) .await;"
+            ),
+            "the leg push must be the classifying one, its result discarded: {body}"
+        );
+        assert_eq!(
+            body.matches(".update_permissions_identity_if_present(")
+                .count(),
+            2,
+            "leg and primary: {body}"
+        );
+        assert!(
+            !body.contains(".update_permissions_identity("),
+            "no push here may go through the collapsing variant: {body}"
+        );
+    }
+
+    /// AFK Stage 6 FU-2: in `update_permissions_identity_if_present` only the
+    /// not-found answer is quiet. The real-failure arm goes through
+    /// `to_internal_error()` (ERROR log + Sentry, `#[track_caller]`), never a
+    /// bare `create_error!(InternalError)`, which reports nothing. The
+    /// reporting itself is not observable from a unit test, so it is pinned
+    /// on the text. Mutation: the arm turned back into a WARN log plus
+    /// `create_error!(InternalError)`, or reduced to the bare error.
+    #[test]
+    fn update_permissions_identity_if_present_reports_real_failures() {
+        const SOURCE: &str = include_str!("voice_client.rs");
+        let shipping = &SOURCE[..SOURCE
+            .find("#[cfg(test)]\nmod screen_leg_permission_tests")
+            .expect("the first test module")];
+        let at = shipping
+            .find("pub async fn update_permissions_identity_if_present(")
+            .expect("`update_permissions_identity_if_present` is defined");
+        let end = at
+            + shipping[at..]
+                .find("\n    }\n")
+                .expect("the end of its body");
+        let body = shipping[at..end]
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join(" ")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        const QUIET: &str = "Err(error) if is_twirp_not_found(&error) => Ok(false),";
+        const REPORTED: &str = "Err(error) => Err::<bool, _>(error).to_internal_error(),";
+        let quiet = body
+            .find(QUIET)
+            .unwrap_or_else(|| panic!("the not-found arm is gone: {body}"));
+        let reported = body
+            .find(REPORTED)
+            .unwrap_or_else(|| panic!("the real-failure arm must use to_internal_error(): {body}"));
+        assert!(
+            quiet < reported,
+            "not-found must be classified first: {body}"
+        );
+        assert!(
+            !body.contains("create_error!(InternalError)"),
+            "a bare InternalError reaches neither the ERROR log nor Sentry: {body}"
+        );
+    }
+
+    /// AFK Stage 6 F-A1: success -> `Ok(true)`, a Twirp `not_found` ->
+    /// `Ok(false)` (the connection is gone, the room-wide permission sync
+    /// skips it), every other failure -> `Err(InternalError)`, an unknown node
+    /// -> `UnknownNode`. Each request goes to the SFU's `UpdateParticipant`
+    /// endpoint.
+    #[tokio::test]
+    async fn update_permissions_identity_if_present_classifies_the_sfu_answer() {
+        async fn update(
+            status_line: &'static str,
+            content_type: &'static str,
+            body: &'static str,
+        ) -> revolt_result::Result<bool> {
+            let (url, server) = serve_once(status_line, content_type, body);
+            let result = voice_client(&url)
+                .update_permissions_identity_if_present(
+                    NODE,
+                    "user:DEVICE",
+                    "room",
+                    Default::default(),
+                )
+                .await;
+            let head = server.join().expect("stub server");
+            assert!(
+                head.starts_with("POST /twirp/livekit.RoomService/UpdateParticipant "),
+                "unexpected request: {head}"
+            );
+            result
+        }
+
+        assert!(matches!(
+            update("HTTP/1.1 200 OK", "application/protobuf", "").await,
+            Ok(true)
+        ));
+
+        assert!(matches!(
+            update(
+                "HTTP/1.1 404 Not Found",
+                "application/json",
+                r#"{"code":"not_found","msg":"participant not found"}"#,
+            )
+            .await,
+            Ok(false)
+        ));
+
+        for (status_line, content_type, body) in [
+            (
+                "HTTP/1.1 500 Internal Server Error",
+                "application/json",
+                r#"{"code":"internal","msg":"boom"}"#,
+            ),
+            (
+                "HTTP/1.1 403 Forbidden",
+                "application/json",
+                r#"{"code":"permission_denied","msg":"no"}"#,
+            ),
+            ("HTTP/1.1 404 Not Found", "text/plain", "404 page not found"),
+        ] {
+            match update(status_line, content_type, body).await {
+                Err(error) => assert!(
+                    matches!(error.error_type, ErrorType::InternalError),
+                    "{status_line}: {error:?}"
+                ),
+                Ok(updated) => panic!("{status_line} {body} must be an error, got Ok({updated})"),
+            }
+        }
+
+        match voice_client("http://127.0.0.1:1")
+            .update_permissions_identity_if_present(
+                "no-such-node",
+                "user",
+                "room",
+                Default::default(),
+            )
+            .await
+        {
+            Err(error) => assert!(
+                matches!(error.error_type, ErrorType::UnknownNode),
+                "{error:?}"
+            ),
+            Ok(updated) => panic!("an unknown node must be an error, got Ok({updated})"),
+        }
+    }
+}
+
+/// AFK Stage 6 F-B2: the Phase A gate on the JOIN/MOVE TOKEN itself.
+///
+/// `create_token` derives `can_publish` from the gated source list, and an
+/// empty `can_publish_sources` means "no restriction" to LiveKit
+/// (auth/grants.go). So the one line that turns the gate's empty list into a
+/// refusal is `can_publish: !allowed_sources.is_empty()`: `can_publish: true`
+/// there hands every member of the AFK channel a token that publishes
+/// EVERYTHING. The test in `voice/mod.rs` that checks the gate's source list
+/// cannot see that line, so it is pinned here, on the token the real
+/// `create_token` mints and signs.
+///
+/// Reference driver and a fake node: no SFU is ever contacted. Minting a
+/// token is local (the node's key and secret sign it), and the only database
+/// reads are the server fetch inside `AfkGate::resolve` and the user's
+/// metadata. The fixture's server and channel writes publish events, which
+/// reach Redis when one is up, so the test runs on the shared Redis-test
+/// runtime (`voice::tests::rt`) rather than a runtime of its own.
+#[cfg(test)]
+mod afk_mint_tests {
+    use super::VoiceClient;
+    use crate::{Channel, Database, PartialServer, Server, User};
+    use livekit_api::access_token::Claims;
+    use revolt_config::LiveKitNode;
+    use revolt_models::v0::{DataCreateServer, DataCreateServerChannel, LegacyServerChannelType};
+    use revolt_permissions::{ChannelPermission, PermissionValue};
+    use std::collections::HashMap;
+
+    const NODE: &str = "afk-mint-node";
+
+    #[test]
+    fn create_token_in_the_afk_channel_denies_publishing_outright() {
+        crate::voice::tests::rt()
+            .block_on(create_token_in_the_afk_channel_denies_publishing_outright_case())
+    }
+
+    async fn create_token_in_the_afk_channel_denies_publishing_outright_case() {
+        let db = Database::Reference(Default::default());
+
+        let owner = User::create(&db, "AfkMintOwner".to_string(), None, None)
+            .await
+            .expect("`User`");
+        let mut server = Server::create(
+            &db,
+            DataCreateServer {
+                name: "AfkMintServer".to_string(),
+                description: None,
+                nsfw: None,
+            },
+            &owner,
+            false,
+        )
+        .await
+        .expect("`Server`")
+        .0;
+
+        let voice_channel = |name: &str| DataCreateServerChannel {
+            channel_type: LegacyServerChannelType::Voice,
+            name: name.to_string(),
+            ..Default::default()
+        };
+        let afk_channel =
+            Channel::create_server_channel(&db, &mut server, voice_channel("AFK"), true)
+                .await
+                .expect("`Channel`");
+        let normal_channel =
+            Channel::create_server_channel(&db, &mut server, voice_channel("General"), true)
+                .await
+                .expect("`Channel`");
+
+        server
+            .update(
+                &db,
+                PartialServer {
+                    afk_channel_id: Some(afk_channel.id().to_string()),
+                    afk_timeout: Some(300),
+                    ..Default::default()
+                },
+                vec![],
+            )
+            .await
+            .expect("designation");
+
+        let voice = VoiceClient::new(HashMap::from([(
+            NODE.to_string(),
+            LiveKitNode {
+                url: "http://127.0.0.1:1".to_string(),
+                lat: 0.0,
+                lon: 0.0,
+                key: "afkmintkey".to_string(),
+                secret: "afkmintsecret-afkmintsecret-afkmint".to_string(),
+                private: true,
+                remote: false,
+            },
+        )]));
+
+        // The same member with the same permissions in both channels: Speak
+        // and Video (plus Connect and Listen), so the only difference between
+        // the two mints is the designation.
+        let permissions = PermissionValue::from_raw(
+            ChannelPermission::Connect as u64
+                | ChannelPermission::Speak as u64
+                | ChannelPermission::Video as u64
+                | ChannelPermission::Listen as u64,
+        );
+
+        let mut grants = Vec::new();
+        for channel in [&afk_channel, &normal_channel] {
+            let token = voice
+                .create_token(NODE, &db, &owner, permissions, channel, None)
+                .await
+                .expect("create_token");
+            let claims = Claims::from_unverified(&token).expect("decode token");
+            assert_eq!(claims.video.room, channel.id(), "the token names its room");
+            grants.push(claims.video);
+        }
+        let [afk, control]: [_; 2] = grants.try_into().expect("two mints");
+
+        assert!(
+            !afk.can_publish,
+            "Phase A regression: a token minted for the designated AFK channel \
+             must carry can_publish: false"
+        );
+        assert!(
+            afk.can_publish_sources.is_empty(),
+            "the AFK token must list no sources: {:?}",
+            afk.can_publish_sources
+        );
+        assert!(afk.can_subscribe, "AFK revokes publishing, never listening");
+
+        // Control: the undesignated channel, same member, same permissions.
+        assert!(
+            control.can_publish,
+            "control: an undesignated voice channel lets the member publish"
+        );
+        assert!(
+            control
+                .can_publish_sources
+                .iter()
+                .any(|source| source == "microphone"),
+            "control: Speak puts the microphone in the grant: {:?}",
+            control.can_publish_sources
+        );
+    }
+}
+
+/// AFK Stage 6 re-audit RA-1: when a `not_found` from the SFU is an answer.
+#[cfg(test)]
+mod not_found_answer_tests {
+    use super::{not_found_answer, pushes_answer, NotFoundAnswer};
+
+    const USER: &str = "01KX7HASD9FHBYA3XGKA5YACYX";
+
+    fn roster(identities: &[&str]) -> Option<Result<Option<Vec<String>>, &'static str>> {
+        Some(Ok(Some(
+            identities
+                .iter()
+                .map(|identity| identity.to_string())
+                .collect(),
+        )))
+    }
+
+    /// The addressed identity was the recorded one: `not_found` is the
+    /// truth, and no roster is needed or read.
+    #[test]
+    fn a_miss_on_the_recorded_identity_is_gone() {
+        assert_eq!(
+            not_found_answer::<&str>(USER, true, None),
+            NotFoundAnswer::Gone
+        );
+        assert_eq!(
+            not_found_answer(USER, true, roster(&[&format!("{USER}:DEVICE")])),
+            NotFoundAnswer::Gone,
+            "with a recorded identity the roster is not consulted"
+        );
+    }
+
+    /// The addressed identity was the bare-id guess: the roster decides.
+    #[test]
+    fn a_miss_on_the_guess_asks_the_roster() {
+        assert_eq!(
+            not_found_answer::<&str>(USER, false, None),
+            NotFoundAnswer::ReadRoster
+        );
+
+        // The user's device-qualified connection is still there: NOT gone.
+        let device = format!("{USER}:DEVICE");
+        assert_eq!(
+            not_found_answer(USER, false, roster(&["OTHERUSER", &device])),
+            NotFoundAnswer::PushTo(vec![device.clone()]),
+            "a device-qualified participant still publishing must be pushed to"
+        );
+
+        // Every primary of the user, in roster order; never a screen leg,
+        // never another user.
+        assert_eq!(
+            not_found_answer(
+                USER,
+                false,
+                roster(&[
+                    &format!("{USER}:DEVICE:screen"),
+                    &device,
+                    "OTHERUSER:DEVICE",
+                    USER,
+                ])
+            ),
+            NotFoundAnswer::PushTo(vec![device.clone(), USER.to_string()])
+        );
+
+        // Nobody of the user's: gone. Only their leg: gone too (a leg is a
+        // helper of a primary, and the primary is what the sync addresses).
+        assert_eq!(
+            not_found_answer(USER, false, roster(&["OTHERUSER", "OTHERUSER:D"])),
+            NotFoundAnswer::Gone
+        );
+        assert_eq!(
+            not_found_answer(USER, false, roster(&[&format!("{USER}::screen")])),
+            NotFoundAnswer::Gone
+        );
+        assert_eq!(
+            not_found_answer(USER, false, roster(&[])),
+            NotFoundAnswer::Gone
+        );
+
+        // The SFU has no such room: nobody is in it.
+        assert_eq!(
+            not_found_answer::<&str>(USER, false, Some(Ok(None))),
+            NotFoundAnswer::Gone
+        );
+
+        // The roster could not be read: no answer, so a failure.
+        assert_eq!(
+            not_found_answer(USER, false, Some(Err("list 500"))),
+            NotFoundAnswer::Failed("list 500")
+        );
+    }
+
+    /// The pushes to the listed connections: the first error wins, else any
+    /// landed push is `true`, else `false`.
+    #[test]
+    fn pushes_answer_returns_the_first_error_else_whether_any_landed() {
+        assert_eq!(pushes_answer::<&str>([]), Ok(false));
+        assert_eq!(pushes_answer::<&str>([Ok(false), Ok(false)]), Ok(false));
+        assert_eq!(pushes_answer::<&str>([Ok(false), Ok(true)]), Ok(true));
+        assert_eq!(pushes_answer::<&str>([Ok(true), Ok(false)]), Ok(true));
+        assert_eq!(
+            pushes_answer([Ok(true), Err("first"), Err("second")]),
+            Err("first")
+        );
     }
 }

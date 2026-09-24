@@ -285,7 +285,7 @@ mod tests {
         );
     }
 
-    /// Behaviour pin - this arm shipped in wave 2 and is unchanged here. Only
+    /// Behavior pin - this arm shipped in wave 2 and is unchanged here. Only
     /// the `Voice` arm of `create_server_channel` can produce a channel with
     /// voice information, so `afk: true` on a Text or Forum channel is
     /// rejected rather than silently dropped.
@@ -407,6 +407,45 @@ mod tests {
             body.matches(".update(").count(),
             1,
             "one server update, carrying both the designation and the clear: {}",
+            body
+        );
+    }
+
+    /// AFK Stage 6 F-B3: `afk: true` writes `Server.afk_channel_id`, a
+    /// SERVER-level field, so it needs `ManageServer` on top of the route's
+    /// own `ManageChannel` - otherwise a ManageChannel-only moderator can
+    /// designate the AFK channel, which hard-mutes everyone in it. And the
+    /// check has to run BEFORE `Channel::create_server_channel`, which
+    /// persists the channel and announces it to the whole server: a refusal
+    /// after it leaves an orphan behind. Mutations: `ManageChannel` in place
+    /// of `ManageServer`, the check deleted, or the check moved below the
+    /// create.
+    #[test]
+    fn designating_on_create_needs_manage_server_before_the_channel_exists() {
+        let body = route_body();
+        const GATE: &str = "if designate_afk \u{7b} \
+             permissions.throw_if_lacking_channel_permission(ChannelPermission::ManageServer)?;";
+
+        assert_eq!(
+            body.matches(GATE).count(),
+            1,
+            "`afk: true` must demand ManageServer exactly once, first thing in \
+             the designation block: {}",
+            body
+        );
+        assert_eq!(
+            body.matches("ChannelPermission::ManageServer").count(),
+            1,
+            "{}",
+            body
+        );
+        let gate = body.find(GATE).expect("counted above");
+        let create = body
+            .find("Channel::create_server_channel(")
+            .unwrap_or_else(|| panic!("the route no longer creates a channel: {}", body));
+        assert!(
+            gate < create,
+            "ManageServer must be checked BEFORE the channel is created: {}",
             body
         );
     }

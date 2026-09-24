@@ -529,7 +529,7 @@ pub async fn get_user_voice_channel_in_server(
 /// `voice::afk`, not descendants, so they cannot build `AfkGate(false)` even
 /// though they live in the same crate. The only shipping constructor is
 /// [`AfkGate::resolve`], which performs the lookup itself. That is the
-/// structural defence against audit CRITICAL-1: a call site under compile
+/// structural defense against audit CRITICAL-1: a call site under compile
 /// pressure has no `false` to reach for, because there is no value of any
 /// argument to `resolve` that weakens the gate — passing `None` for the
 /// server makes it fetch the server instead of trusting the caller.
@@ -547,7 +547,7 @@ mod afk {
     impl AfkGate {
         /// Resolve whether `channel` is its server's designated AFK channel.
         ///
-        /// `server` is an OPTIMISATION, not an opt-out: when the caller
+        /// `server` is an OPTIMIZATION, not an opt-out: when the caller
         /// already holds the right server document (the permission-sync path,
         /// which runs this once per participant) it is used directly, and
         /// otherwise — including when a caller passes a server belonging to
@@ -559,7 +559,7 @@ mod afk {
         /// the mint or the sync rather than falling through to a permissive
         /// default.
         ///
-        /// The designation is honoured as written even if the pointer has gone
+        /// The designation is honored as written even if the pointer has gone
         /// stale (the channel lost its voice information, say). A stale
         /// pointer can only ever deny publishing in a channel nobody can call
         /// in; resolving it the other way would be a bypass.
@@ -617,7 +617,9 @@ pub fn get_allowed_sources(
     // `VoiceClient::create_token` — derive `can_publish` as
     // `!allowed_sources.is_empty()`, so the empty list can only ever ship
     // alongside `can_publish: false`. That pairing is pinned by
-    // `afk_channel_yields_empty_sources_and_no_publish`.
+    // `afk_channel_yields_empty_sources_and_no_publish` for the sync and
+    // remote-control sets, and on a real minted token by `voice_client.rs`'s
+    // `afk_mint_tests`.
     if afk.denies_publishing() {
         return Vec::new();
     }
@@ -1117,7 +1119,7 @@ fn teardown_script_error_allows_fallback(error: &RedisError) -> bool {
 /// commands, and every per-server key deleted unconditionally.
 ///
 /// Kept verbatim so a Redis that will not run the script degrades to the old
-/// behaviour rather than to a broken leave. Do not call it from anywhere else:
+/// behavior rather than to a broken leave. Do not call it from anywhere else:
 /// it deletes a newer channel's per-server state after a move, which is the
 /// defect the script exists to fix. The reasons for each key are on
 /// [`voice_state_teardown_input`].
@@ -1594,7 +1596,7 @@ async fn admit_voice_move(
     // As the calculus stands today this is implied: the server-channel arm
     // revokes every bit once `ViewChannel` is missing, so this adds no
     // refusal that `Connect` does not already produce. It is here to state
-    // the rule the client behaviour actually depends on, and to keep the
+    // the rule the client behavior actually depends on, and to keep the
     // gate correct if that implication ever stops holding.
     permissions.throw_if_lacking_channel_permission(ChannelPermission::ViewChannel)?;
     permissions.throw_if_lacking_channel_permission(ChannelPermission::Connect)?;
@@ -1649,12 +1651,7 @@ pub async fn assert_voice_move_admissible(
     // Call-admission caps (D12 video-participant cap + T-20 MLS SFU-token
     // coupling), enforced against the DESTINATION for the TARGET. A
     // privileged door must not bypass a cap the front door enforces.
-    assert_call_caps_admit(
-        db,
-        &UserVoiceChannel::from_channel(destination),
-        &target.id,
-    )
-    .await
+    assert_call_caps_admit(db, &UserVoiceChannel::from_channel(destination), &target.id).await
 }
 
 /// One SFU participant a move has to eject from the source room.
@@ -1903,7 +1900,10 @@ fn move_addressing(moving: &ParticipantInfo, target_id: &str) -> MoveAddressing 
 ///
 /// Moves the target from wherever they are in the destination's server. A
 /// caller whose decision was made about one particular source channel uses
-/// [`move_user_to_voice_channel_expecting`] instead.
+/// [`move_user_to_voice_channel_expecting`] instead, and today both
+/// production callers do: the moderator route (`member_edit`, since AFK
+/// Stage 6 F-A3) and the AFK sweep. This four-argument form has no
+/// production caller left.
 pub async fn move_user_to_voice_channel(
     db: &Database,
     voice_client: &VoiceClient,
@@ -2194,7 +2194,7 @@ pub async fn move_user_to_voice_channel_expecting(
     // EMITTED BEFORE THE EVICTION, AND THE ORDER IS THE FIX.
     //
     // A removal is a LiveKit `RemoveParticipant`, which puts a `Leave`
-    // straight down the client's signalling socket. This event has to travel
+    // straight down the client's signaling socket. This event has to travel
     // LiveKit -> delta -> Redis publish -> bonfire -> the client's socket:
     // at least two more hops. Emitting it second therefore guaranteed the
     // client was out of CONNECTED before its own move token arrived, and its
@@ -2339,6 +2339,104 @@ pub async fn move_user_to_voice_channel_expecting(
     })
 }
 
+/// What one member's permission sync amounted to, as the room-wide sync
+/// records it (AFK Stage 6 F-A1).
+#[derive(Debug, PartialEq, Eq)]
+enum MemberSync<E> {
+    /// The new grant reached the SFU, or there was nothing to push for this
+    /// member (no voice state, or a role-scoped sync their roles do not
+    /// reach).
+    Synced,
+    /// The member is no longer there to sync: the user or member document
+    /// is gone, or the SFU has no such participant. Not a failure of the
+    /// room-wide sync. Carries the error [`sync_user_voice_permissions`]
+    /// has always returned for it, which that single-user entry point still
+    /// returns.
+    Gone(E),
+    /// Anything else.
+    Failed(E),
+}
+
+/// Sync every member in `members`, in order, and record each outcome.
+///
+/// The loop has no early exit: the per-member call returns a [`MemberSync`],
+/// not a `Result`, so there is no `?` to put on it, and one member's failure
+/// is recorded and logged while the rest are still synced.
+/// [`member_sync_result`] decides afterwards what the outcomes amount to.
+/// Generic over the per-member call so the tests drive THIS loop with a fake
+/// one; [`sync_voice_permissions`] hands it the real one.
+async fn sync_each_member<E, F, Fut>(
+    channel_id: &str,
+    members: Vec<String>,
+    mut sync_one: F,
+) -> Vec<MemberSync<E>>
+where
+    E: std::fmt::Debug,
+    F: FnMut(String) -> Fut,
+    Fut: std::future::Future<Output = MemberSync<E>>,
+{
+    let mut outcomes = Vec::with_capacity(members.len());
+
+    for user_id in members {
+        let outcome = sync_one(user_id.clone()).await;
+
+        match &outcome {
+            MemberSync::Synced => {}
+            MemberSync::Gone(_) => log::debug!(
+                "permission sync of {channel_id}: skipped {user_id}, who is no longer there"
+            ),
+            MemberSync::Failed(error) => log::warn!(
+                "permission sync of {channel_id}: failed for {user_id}, the remaining members \
+                 are still synced: {error:?}"
+            ),
+        }
+
+        outcomes.push(outcome);
+    }
+
+    outcomes
+}
+
+/// What a room-wide sync's outcomes amount to: `Ok` unless some member
+/// FAILED, and then the FIRST failure. A member who is [`MemberSync::Gone`]
+/// is skipped, not an error. Pure, the `eviction_result` shape.
+fn member_sync_result<E>(
+    outcomes: impl IntoIterator<Item = MemberSync<E>>,
+) -> std::result::Result<(), E> {
+    let mut failure = None;
+
+    for outcome in outcomes {
+        match outcome {
+            MemberSync::Synced | MemberSync::Gone(_) => {}
+            MemberSync::Failed(error) => {
+                failure.get_or_insert(error);
+            }
+        }
+    }
+
+    match failure {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
+}
+
+/// Re-sync the LiveKit grant of everyone in `channel`'s room (or, with
+/// `role_id`, everyone there holding that role).
+///
+/// EVERY member is tried (AFK Stage 6 F-A1). This used to `?` out on the first
+/// member that failed, and every member after it kept a grant that no longer
+/// matched the server: publishing in a channel just designated AFK, or still
+/// muted in the one that stopped being AFK. A member who has gone (user or
+/// member document deleted, or the SFU reports no such participant) is
+/// skipped; any other failure is logged, and the first one is returned once
+/// every member has been tried.
+///
+/// Callers: `sync_afk_designation_change`, and the role and permission
+/// routes (`roles_edit`, `roles_delete`, `roles_edit_positions`, both
+/// `permissions_set` and both `permissions_set_default`). Each of them calls
+/// this last, after its own write, with `?`: none acts on a partial sync,
+/// so trying every member before answering changes nothing for them except
+/// that later members are no longer left behind.
 pub async fn sync_voice_permissions(
     db: &Database,
     voice_client: &VoiceClient,
@@ -2351,26 +2449,49 @@ pub async fn sync_voice_permissions(
     let Some(node) = get_channel_node(channel.id()).await? else {
         return Ok(());
     };
+    let node = node.as_str();
 
-    for user_id in get_voice_channel_members(&user_voice_channel)
+    let members = get_voice_channel_members(&user_voice_channel)
         .await?
-        .iter()
-        .flatten()
-    {
-        let user = Reference::from_unchecked(user_id).as_user(db).await?;
+        .unwrap_or_default();
 
-        sync_user_voice_permissions(db, voice_client, &node, &user, channel, server, role_id)
-            .await?;
-    }
+    let outcomes = sync_each_member(channel.id(), members, move |user_id| async move {
+        sync_member_voice_permissions(db, voice_client, node, &user_id, channel, server, role_id)
+            .await
+    })
+    .await;
 
-    Ok(())
+    member_sync_result(outcomes)
+}
+
+/// One member of a room-wide sync, by user id, classified for
+/// [`member_sync_result`].
+async fn sync_member_voice_permissions(
+    db: &Database,
+    voice_client: &VoiceClient,
+    node: &str,
+    user_id: &str,
+    channel: &Channel,
+    server: Option<&Server>,
+    role_id: Option<&str>,
+) -> MemberSync<revolt_result::Error> {
+    let user = match Reference::from_unchecked(user_id).as_user(db).await {
+        Ok(user) => user,
+        Err(error) if matches!(error.error_type, revolt_result::ErrorType::NotFound) => {
+            return MemberSync::Gone(error)
+        }
+        Err(error) => return MemberSync::Failed(error),
+    };
+
+    sync_user_voice_permissions_classified(db, voice_client, node, &user, channel, server, role_id)
+        .await
 }
 
 /// Re-sync voice permissions on BOTH sides of an AFK designation change.
 ///
-/// `Server.afk_channel_id` has four writers. The two ROUTES call this:
+/// `Server.afk_channel_id` has five writers. The two ROUTES call this:
 /// `server_edit` (the designation is moved or cleared) and `channel_create` (a
-/// channel is born designated). The other two deliberately do not:
+/// channel is born designated). The other three deliberately do not:
 ///
 /// - the Discord import worker, which writes the designation in step 5 into a
 ///   server it created moments ago, before step 6 creates any membership. No
@@ -2379,7 +2500,14 @@ pub async fn sync_voice_permissions(
 /// - the revision-70 migration (the "afk"-named-channel backfill), which runs
 ///   at deploy with no `VoiceClient` to sync through. Members already sitting
 ///   in a backfilled channel keep the grant they were minted until they
-///   rejoin; the migration's own comment records that.
+///   rejoin; the migration's own comment records that;
+/// - `Server::clear_afk_channel_if_pointing_at`, which clears the designation
+///   when its channel is deleted (`Channel::delete`, from the
+///   `channel_delete` route) or stops being a voice channel (`channel_edit`).
+///   Both routes tear that channel's call down right there
+///   (`delete_voice_channel` deletes the room), so no room is left whose
+///   grants could disagree with the server, and nobody is left sitting in the
+///   outgoing channel to unmute. There is no incoming side.
 ///
 /// The enforcement gate reads the designation off the server document, not
 /// off any per-participant state. So the moment the pointer moves, everyone
@@ -2419,11 +2547,22 @@ pub async fn sync_voice_permissions(
 ///   `Server::validate_afk_channel`, `channel_create` by having just created
 ///   it. There is nothing to swallow.
 ///
-/// Sync failures themselves propagate with `?` after the write has committed,
-/// matching `roles_edit.rs` and both `permissions_set.rs` call sites.
+/// Sync failures themselves are returned after the write has committed,
+/// matching `roles_edit.rs` and both `permissions_set.rs` call sites, but
+/// only once BOTH sides have been tried (AFK Stage 6 FU-1): an outgoing
+/// failure used to `?` out before the incoming side, leaving the new AFK
+/// channel's occupants publishing. Now the outgoing result is recorded, the
+/// incoming side always runs, and [`designation_sync_result`] returns the
+/// first real error of the two. Within each side, every member is tried
+/// first as well (see [`sync_voice_permissions`]).
 ///
-/// Both sides are guarded on the designation having actually MOVED, so a
-/// no-op edit that re-sends the same `afk_channel_id` does not walk the room.
+/// Only the OUTGOING side is guarded on the designation having actually
+/// MOVED. When it has not moved, the outgoing channel IS the incoming one,
+/// and syncing it as "no longer AFK" would be wrong. The INCOMING side always
+/// syncs, so an admin who re-sends the same `afk_channel_id` walks the room
+/// again (AFK Stage 6 F-A1). That is the heal path after a sync that failed
+/// for some members: before every member was tried, a re-send was a no-op
+/// and the members left behind stayed publishing in the AFK channel.
 ///
 /// `role_id: None` on both calls means every member currently in the room,
 /// which is what a server-level designation change affects - it is not scoped
@@ -2435,23 +2574,48 @@ pub async fn sync_afk_designation_change(
     previous_afk_channel_id: Option<&str>,
     incoming_afk_channel: Option<&Channel>,
 ) -> Result<()> {
+    // Each side's result, recorded rather than `?`-returned, so that an
+    // outgoing failure never skips the incoming side (FU-1).
+    let mut sides = Vec::with_capacity(2);
+
     // Outgoing - the channel that is no longer AFK. Resolve-then-check.
     if let Some(previous) = previous_afk_channel_id {
         if server.afk_channel_id.as_deref() != Some(previous) {
             if let Ok(channel) = db.fetch_channel(previous).await {
-                sync_voice_permissions(db, voice_client, &channel, Some(server), None).await?;
+                let outgoing =
+                    sync_voice_permissions(db, voice_client, &channel, Some(server), None).await;
+                if let Err(error) = &outgoing {
+                    log::warn!(
+                        "AFK designation change on {}: the outgoing channel {previous} did not \
+                         fully re-sync, the incoming side still runs: {error:?}",
+                        server.id
+                    );
+                }
+                sides.push(outgoing);
             }
         }
     }
 
-    // Incoming - already resolved and validated by the caller.
+    // Incoming - already resolved and validated by the caller. Unguarded, so
+    // a re-send of the same designation re-syncs (see the doc comment).
     if let Some(channel) = incoming_afk_channel {
-        if previous_afk_channel_id != Some(channel.id()) {
-            sync_voice_permissions(db, voice_client, channel, Some(server), None).await?;
-        }
+        sides.push(sync_voice_permissions(db, voice_client, channel, Some(server), None).await);
     }
 
-    Ok(())
+    designation_sync_result(sides)
+}
+
+/// What the two sides of a designation change amount to: `Ok` when every
+/// side that ran succeeded, else the FIRST error, the outgoing side's when
+/// both failed. Pure, and the same rule as [`member_sync_result`], which it
+/// delegates to so the two cannot drift.
+fn designation_sync_result<E>(
+    sides: impl IntoIterator<Item = std::result::Result<(), E>>,
+) -> std::result::Result<(), E> {
+    member_sync_result(sides.into_iter().map(|side| match side {
+        Ok(()) => MemberSync::Synced,
+        Err(error) => MemberSync::Failed(error),
+    }))
 }
 
 /// The LiveKit participant permissions a channel-permission sync grants.
@@ -2635,7 +2799,7 @@ mod permission_tests {
     // SFU; the delta route harness that would drive the move end to end needs
     // RabbitMQ and cannot boot here either. So the RPC round trip itself — that
     // the SFU really does report two connections for one account, and really
-    // does honour the removals — is NOT proven by anything below and has to be
+    // does honor the removals — is NOT proven by anything below and has to be
     // proven on a live leg.
     //
     // What IS proven is the whole of the decision: given a participant list,
@@ -3003,7 +3167,7 @@ mod permission_tests {
     /// A2); `move_user_to_voice_channel` only delegates to it, and
     /// `the_plain_move_delegates_with_no_expectation` pins that it does
     /// nothing else. Every pin that reads this therefore reads the one body
-    /// both callers run.
+    /// every move runs, through either entry point.
     fn move_body_code() -> String {
         const FILE: &str = "core/database/src/voice/mod.rs";
         const DEFINITION: &str = "pub async fn move_user_to_voice_channel_expecting(";
@@ -3186,10 +3350,12 @@ mod permission_tests {
         }
     }
 
-    /// A2 (5b-2.1 audit): the four-argument move keeps its signature (the
-    /// moderator route calls it) and is exactly a delegation with no
-    /// expectation. Mutations: an expectation passed (`Some(..)`), or any
-    /// other statement added to its body.
+    /// A2 (5b-2.1 audit): the four-argument move keeps its signature and is
+    /// exactly a delegation with no expectation. No production code calls it
+    /// any more: since AFK Stage 6 F-A3 the moderator route (`member_edit`)
+    /// calls `move_user_to_voice_channel_expecting` with the source it
+    /// authorized, as the AFK sweep already did. Mutations: an expectation
+    /// passed (`Some(..)`), or any other statement added to its body.
     #[test]
     fn the_plain_move_delegates_with_no_expectation() {
         let shipping = this_file_shipping();
@@ -3602,7 +3768,9 @@ mod permission_tests {
         for needle in [
             "idle_state_keys(user_id, server_id)",
             ".mget(&[key.as_str(), joined_at_key.as_str()])",
-            "afk_since_ms(now_ms(), idle_for, joined_at_ms)",
+            // Stage 6 F-A2: one `now` for the join refusal and the stamp.
+            "let now = now_ms();",
+            "afk_since_ms(now, idle_for, joined_at_ms)",
             "afk_since_write(existing_claim.as_ref(), channel_id)",
             "afk_since_write_cmd(write, &key, &fresh)",
             "afk_idle_add_cmd( &afk_idle_member(user_id, server_id), since_ms + INDEX_FIRST_LOOK_MS, )",
@@ -3796,6 +3964,372 @@ mod permission_tests {
         assert!(
             decided > open + loop_body.len(),
             "`eviction_result` must run after the loop, on every outcome"
+        );
+    }
+
+    // ---- the room-wide permission sync (AFK Stage 6 F-A1) ----
+
+    /// What a room-wide sync's outcomes amount to: every member synced or
+    /// gone is `Ok`; any failure fails it, and the FIRST failure is the one
+    /// returned, however many follow.
+    #[test]
+    fn member_sync_result_skips_the_gone_and_returns_the_first_failure() {
+        use super::{member_sync_result, MemberSync};
+
+        assert_eq!(member_sync_result::<&str>([]), Ok(()));
+        assert_eq!(
+            member_sync_result::<&str>([MemberSync::Synced, MemberSync::Synced]),
+            Ok(()),
+            "all synced"
+        );
+        assert_eq!(
+            member_sync_result([
+                MemberSync::Gone("user deleted"),
+                MemberSync::Synced,
+                MemberSync::Gone("not in the room"),
+            ]),
+            Ok(()),
+            "a member who has gone is skipped, not an error"
+        );
+        assert_eq!(
+            member_sync_result([
+                MemberSync::Synced,
+                MemberSync::Failed("first 500"),
+                MemberSync::Gone("not in the room"),
+                MemberSync::Failed("second 500"),
+                MemberSync::Synced,
+            ]),
+            Err("first 500"),
+            "the FIRST real failure wins"
+        );
+    }
+
+    /// The loop half, driven through the SAME `sync_each_member`
+    /// `sync_voice_permissions` uses, with a fake per-member sync: a failure
+    /// on member 1 still pushes members 2, 3 and 4, in order, and a gone
+    /// member in between changes nothing.
+    #[tokio::test]
+    async fn a_failed_member_does_not_stop_the_room_sync() {
+        use super::{member_sync_result, sync_each_member, MemberSync};
+
+        let pushed = std::sync::Mutex::new(Vec::new());
+        let members = ["m1", "m2", "m3", "m4"].map(str::to_string).to_vec();
+
+        let outcomes = sync_each_member("room", members, |user_id: String| {
+            pushed.lock().unwrap().push(user_id.clone());
+            async move {
+                match user_id.as_str() {
+                    "m1" => MemberSync::Failed("m1 500"),
+                    "m2" => MemberSync::Gone("m2 not in the room"),
+                    "m3" => MemberSync::Failed("m3 500"),
+                    _ => MemberSync::Synced,
+                }
+            }
+        })
+        .await;
+
+        assert_eq!(
+            *pushed.lock().unwrap(),
+            ["m1", "m2", "m3", "m4"],
+            "every member must be tried, in order, whatever the one before \
+             it did — F-A1: an early return leaves every later member with \
+             a grant that no longer matches the server"
+        );
+        assert_eq!(
+            outcomes,
+            vec![
+                MemberSync::Failed("m1 500"),
+                MemberSync::Gone("m2 not in the room"),
+                MemberSync::Failed("m3 500"),
+                MemberSync::Synced,
+            ]
+        );
+        assert_eq!(member_sync_result(outcomes), Err("m1 500"));
+    }
+
+    /// The shipping half: `sync_voice_permissions` walks the room through
+    /// `sync_each_member` with no `?` on the per-member call and hands every
+    /// outcome to `member_sync_result`; `sync_each_member`'s loop has no
+    /// exit; and the two ways a member is gone (the user, then the member
+    /// document or the SFU participant) are classified at the step that
+    /// finds them out. Mutations: the old `for … ?` loop restored, an exit
+    /// added to the loop, the result decided by anything else, or either
+    /// `Gone` arm turned into a failure.
+    #[test]
+    fn the_room_sync_tries_every_member_before_deciding() {
+        let shipping = this_file_shipping();
+
+        let room = flat_fn_body(&shipping, "pub async fn sync_voice_permissions(");
+        assert!(
+            room.contains(
+                "let outcomes = sync_each_member(channel.id(), members, move |user_id| async move \
+                 \u{7b} sync_member_voice_permissions(db, voice_client, node, &user_id, channel, \
+                 server, role_id) .await \u{7d}) .await;"
+            ),
+            "`sync_voice_permissions` must walk the room through `sync_each_member`, \
+             with no `?` on the per-member call: {room}"
+        );
+        assert!(
+            room.ends_with(
+                "let outcomes = sync_each_member(channel.id(), members, move |user_id| async move \
+                 \u{7b} sync_member_voice_permissions(db, voice_client, node, &user_id, channel, \
+                 server, role_id) .await \u{7d}) .await; member_sync_result(outcomes)"
+            ),
+            "every outcome must go to `member_sync_result`, and its answer is the \
+             function's: {room}"
+        );
+        assert!(
+            !room.contains("sync_user_voice_permissions("),
+            "the room sync must not call the single-user entry point, whose \
+             `Err` for a gone member would fail the room: {room}"
+        );
+
+        let each = flat_fn_body(&shipping, "async fn sync_each_member<");
+        let loop_at = first(&each, "for user_id in members");
+        let loop_body = &each[loop_at..];
+        for exit in [".await?", ")?", "return", "break"] {
+            assert!(
+                !loop_body.contains(exit),
+                "the room-sync loop contains `{exit}`: {loop_body}"
+            );
+        }
+        assert!(loop_body.contains("outcomes.push(outcome);"), "{loop_body}");
+
+        let one = flat_fn_body(&shipping, "async fn sync_member_voice_permissions(");
+        assert!(
+            one.contains(
+                "Err(error) if matches!(error.error_type, revolt_result::ErrorType::NotFound) \
+                 => \u{7b} return MemberSync::Gone(error) \u{7d}"
+            ),
+            "a deleted user is skipped: {one}"
+        );
+
+        let push = flat_fn_body(&shipping, "async fn push_user_voice_permissions(");
+        assert!(
+            push.contains(
+                "Err(error) if matches!(error.error_type, revolt_result::ErrorType::NotFound) \
+                 => \u{7b} return Ok(MemberSync::Gone(error)) \u{7d}"
+            ),
+            "a deleted member is skipped: {push}"
+        );
+        assert!(
+            push.contains(
+                "let pushed = voice_client .update_permissions_if_present( node, user, \
+                 channel_id, voice_participant_permissions(can_listen, &allowed_sources), ) \
+                 .await?; if !pushed \u{7b} return Ok(MemberSync::Gone(create_error!(InternalError))); \u{7d}"
+            ),
+            "a participant the SFU no longer has is skipped: {push}"
+        );
+    }
+
+    /// RA-5 (Stage 6 re-audit): the single-user entry point answers a gone
+    /// member with the error it always returned, and LOGS it first: the
+    /// SFU-not-found `InternalError` is built without `to_internal_error()`,
+    /// so nothing else would. Mutations: the log deleted, or the arm merged
+    /// back into the silent `Gone | Failed` one.
+    #[test]
+    fn the_single_user_sync_logs_a_gone_member() {
+        let shipping = this_file_shipping();
+        let body = flat_fn_body(&shipping, "pub async fn sync_user_voice_permissions(");
+
+        assert!(
+            body.contains("MemberSync::Gone(error) => \u{7b} log::warn!("),
+            "a gone member must be logged: {body}"
+        );
+        let gone = first(&body, "MemberSync::Gone(error) => \u{7b} log::warn!(");
+        assert!(
+            body[gone..].contains("user.id, channel.id(), error.error_type ); Err(error) \u{7d}"),
+            "the log names the user and the channel, then the old error is returned: {body}"
+        );
+        assert!(
+            body.contains("MemberSync::Failed(error) => Err(error),"),
+            "{body}"
+        );
+    }
+
+    /// The two gone cases that need no Redis, end to end against the
+    /// Reference driver: a user id with no user document, and a user with no
+    /// member document in the server, are both `Gone` (skipped by the room
+    /// sync), and the single-user entry point still answers them with the
+    /// `NotFound` it always has. On the shared Redis-test runtime (see
+    /// `tests::rt`).
+    #[test]
+    fn a_deleted_user_or_member_is_gone_not_failed() {
+        super::tests::rt().block_on(a_deleted_user_or_member_is_gone_not_failed_case())
+    }
+
+    async fn a_deleted_user_or_member_is_gone_not_failed_case() {
+        use super::{
+            sync_member_voice_permissions, sync_user_voice_permissions, MemberSync, VoiceClient,
+        };
+        use crate::{Channel, Database, Server, User};
+        use revolt_models::v0::{
+            DataCreateServer, DataCreateServerChannel, LegacyServerChannelType,
+        };
+        use revolt_result::ErrorType;
+
+        let db = Database::Reference(Default::default());
+        let voice_client = VoiceClient::new(Default::default());
+
+        let owner = User::create(&db, "SyncGoneOwner".to_string(), None, None)
+            .await
+            .expect("`User`");
+        let mut server = Server::create(
+            &db,
+            DataCreateServer {
+                name: "SyncGoneServer".to_string(),
+                description: None,
+                nsfw: None,
+            },
+            &owner,
+            false,
+        )
+        .await
+        .expect("`Server`")
+        .0;
+        let channel = Channel::create_server_channel(
+            &db,
+            &mut server,
+            DataCreateServerChannel {
+                channel_type: LegacyServerChannelType::Voice,
+                name: "Lounge".to_string(),
+                ..Default::default()
+            },
+            true,
+        )
+        .await
+        .expect("`Channel`");
+
+        // No user document at all.
+        match sync_member_voice_permissions(
+            &db,
+            &voice_client,
+            "node",
+            "01KX7HASD9FHBYA3XGKA5YACYX",
+            &channel,
+            Some(&server),
+            None,
+        )
+        .await
+        {
+            MemberSync::Gone(error) => {
+                assert!(matches!(error.error_type, ErrorType::NotFound), "{error:?}")
+            }
+            other => panic!("a deleted user must be Gone, got {other:?}"),
+        }
+
+        // A user who is not (or no longer) a member of the server.
+        let stranger = User::create(&db, "SyncGoneStranger".to_string(), None, None)
+            .await
+            .expect("`User`");
+        match sync_member_voice_permissions(
+            &db,
+            &voice_client,
+            "node",
+            &stranger.id,
+            &channel,
+            Some(&server),
+            None,
+        )
+        .await
+        {
+            MemberSync::Gone(error) => {
+                assert!(matches!(error.error_type, ErrorType::NotFound), "{error:?}")
+            }
+            other => panic!("a deleted member must be Gone, got {other:?}"),
+        }
+
+        let error = sync_user_voice_permissions(
+            &db,
+            &voice_client,
+            "node",
+            &stranger,
+            &channel,
+            Some(&server),
+            None,
+        )
+        .await
+        .expect_err("the single-user entry point keeps its error");
+        assert!(matches!(error.error_type, ErrorType::NotFound), "{error:?}");
+    }
+
+    /// FU-1: what the two sides of a designation change amount to. Either
+    /// side failing fails the change, the FIRST (outgoing) error wins when
+    /// both fail, and a side that did not run changes nothing.
+    #[test]
+    fn designation_sync_result_returns_the_first_side_that_failed() {
+        use super::designation_sync_result;
+
+        assert_eq!(designation_sync_result::<&str>([]), Ok(()));
+        assert_eq!(designation_sync_result::<&str>([Ok(()), Ok(())]), Ok(()));
+        assert_eq!(
+            designation_sync_result([Ok(()), Err("incoming")]),
+            Err("incoming")
+        );
+        assert_eq!(
+            designation_sync_result([Err("outgoing"), Ok(())]),
+            Err("outgoing")
+        );
+        assert_eq!(
+            designation_sync_result([Err("outgoing"), Err("incoming")]),
+            Err("outgoing"),
+            "the outgoing error is the first one"
+        );
+    }
+
+    /// F-A1, the heal path: the INCOMING side of a designation change is
+    /// unguarded, so re-sending the same `afk_channel_id` walks the room
+    /// again; the OUTGOING side keeps its guard, because with the designation
+    /// unchanged the outgoing channel IS the incoming one.
+    ///
+    /// FU-1: an outgoing failure no longer skips the incoming side. Both
+    /// results are recorded, with no `?` on either sync call (nor anywhere
+    /// else in the body: the resolve failure stays swallowed by `if let Ok`),
+    /// the outgoing one first, and `designation_sync_result` decides.
+    ///
+    /// Mutations: the incoming side re-guarded on `previous != incoming`, the
+    /// outgoing guard dropped, or `?` restored on the outgoing call.
+    #[test]
+    fn a_resent_designation_resyncs_the_incoming_room() {
+        let shipping = this_file_shipping();
+        let body = flat_fn_body(&shipping, "pub async fn sync_afk_designation_change(");
+        let at = |needle: &str| {
+            body.find(needle)
+                .unwrap_or_else(|| panic!("`sync_afk_designation_change` lost `{needle}`: {body}"))
+        };
+
+        const OUTGOING: &str = "let outgoing = sync_voice_permissions(db, voice_client, &channel, \
+             Some(server), None).await;";
+        const INCOMING: &str = "if let Some(channel) = incoming_afk_channel \u{7b} \
+             sides.push(sync_voice_permissions(db, voice_client, channel, Some(server), None).await); \
+             \u{7d}";
+        assert!(
+            at(OUTGOING) < at("sides.push(outgoing);")
+                && at("sides.push(outgoing);") < at(INCOMING),
+            "the outgoing result is recorded, and only then the incoming side runs: {body}"
+        );
+        for exit in [".await?", ")?", "return"] {
+            assert!(
+                !body.contains(exit),
+                "`{exit}` in the designation sync: an outgoing failure would skip the \
+                 incoming side, and its occupants would keep publishing: {body}"
+            );
+        }
+        assert!(
+            body.ends_with("designation_sync_result(sides)"),
+            "both sides' results decide the answer: {body}"
+        );
+        assert!(
+            body.contains(
+                "if let Some(previous) = previous_afk_channel_id \u{7b} \
+                 if server.afk_channel_id.as_deref() != Some(previous) \u{7b}"
+            ),
+            "the outgoing side must stay guarded on the designation having moved: {body}"
+        );
+        assert_eq!(
+            body.matches("sync_voice_permissions(").count(),
+            2,
+            "one sync per side: {body}"
         );
     }
 
@@ -4236,7 +4770,7 @@ mod permission_tests {
     /// voice-state teardown path clears `voice_identity:` — the script, the
     /// script's fallback, and the whole-call teardown.
     ///
-    /// The behavioural version of this needs Redis, and the Redis-backed tests
+    /// The behavioral version of this needs Redis, and the Redis-backed tests
     /// in this crate are the ones that fail on a build box with no server. So
     /// what is pinned instead is the shape.
     ///
@@ -4725,7 +5259,15 @@ mod permission_tests {
         // (previous test). In particular every teardown path RESTORES the
         // sync set: pushing the RC variant on teardown would re-grant data
         // publishing at the exact moment the code believes it revoked it.
-        const PUSHES: [&str; 2] = [".update_permissions(", ".update_permissions_identity("];
+        // AFK Stage 6 F-A1 added the two classifying `_if_present` pushes;
+        // each is a needle of its own because none of these is a prefix of
+        // another once the `(` is included.
+        const PUSHES: [&str; 4] = [
+            ".update_permissions(",
+            ".update_permissions_identity(",
+            ".update_permissions_if_present(",
+            ".update_permissions_identity_if_present(",
+        ];
         const SYNC: &str = "voice_participant_permissions(";
         const GRANT: &str = "remote_control_participant_permissions(";
         // The typed transport: its `new_permissions` parameter is
@@ -4822,9 +5364,12 @@ mod permission_tests {
     /// `can_publish_sources` as "no restriction"
     /// (`VideoGrant.GetCanPublishSource`, auth/grants.go), so an empty list
     /// shipped with `can_publish: true` grants EVERYTHING — the exact
-    /// inversion of what the gate is for. Both consumers derive
-    /// `can_publish` as `!allowed_sources.is_empty()`; this pins that they
-    /// keep doing so.
+    /// inversion of what the gate is for. This pins the pairing for the
+    /// permission-sync and remote-control sets, by calling the functions that
+    /// build them. It does NOT pin the join/move token: `create_token` builds
+    /// its grant inline, and a copy of its expression here would stay green
+    /// whatever the mint did (AFK Stage 6 F-B2). The token is pinned on a
+    /// real mint, by `voice_client.rs`'s `afk_mint_tests`.
     #[test]
     fn afk_channel_yields_empty_sources_and_no_publish() {
         use super::remote_control_participant_permissions;
@@ -4857,13 +5402,6 @@ mod permission_tests {
                      {:?}, video limit {video_limit})",
                     permissions.has_channel_permission(ChannelPermission::Speak)
                 );
-
-                // The join token's own derivation
-                // (voice_client.rs::create_token) is literally
-                // `can_publish: !allowed_sources.is_empty()`, so an empty
-                // list there is `can_publish: false` by construction.
-                let token_can_publish = !sources.is_empty();
-                assert!(!token_can_publish);
 
                 for can_listen in [false, true] {
                     let sync = voice_participant_permissions(can_listen, &sources);
@@ -5183,7 +5721,112 @@ mod permission_tests {
         });
     }
 
-    /// The structural defence against audit CRITICAL-1 recurring.
+    /// AFK Stage 6 F-B8: `AfkGate::resolve` uses a supplied `&Server` ONLY
+    /// when it is the channel's own server, and otherwise fetches the right
+    /// one. Against the Reference driver, with server documents built as
+    /// values so each branch is observable:
+    ///
+    /// - a document with ANOTHER id is never read: it names the normal
+    ///   channel as AFK and not the real one, and the answers are the
+    ///   database's;
+    /// - a document with the channel's OWN id is used as given, with no
+    ///   fetch: a copy of the server from before the designation answers
+    ///   "not AFK" for the channel the database says is AFK.
+    ///
+    /// Mutations: the `server.id == server_id` guard dropped (the foreign
+    /// document is trusted), or the supplied document never used (always
+    /// fetch). On the shared Redis-test runtime (see `tests::rt`).
+    #[test]
+    fn afk_gate_uses_a_supplied_server_only_when_it_is_the_channels_own() {
+        super::tests::rt()
+            .block_on(afk_gate_uses_a_supplied_server_only_when_it_is_the_channels_own_case())
+    }
+
+    async fn afk_gate_uses_a_supplied_server_only_when_it_is_the_channels_own_case() {
+        use crate::{Channel, Database, PartialServer, Server, User};
+        use revolt_models::v0::{
+            DataCreateServer, DataCreateServerChannel, LegacyServerChannelType,
+        };
+
+        let db = Database::Reference(Default::default());
+        let owner = User::create(&db, "AfkGateGuardOwner".to_string(), None, None)
+            .await
+            .expect("`User`");
+        let mut server = Server::create(
+            &db,
+            DataCreateServer {
+                name: "AfkGateGuardServer".to_string(),
+                description: None,
+                nsfw: None,
+            },
+            &owner,
+            false,
+        )
+        .await
+        .expect("`Server`")
+        .0;
+        let voice_channel = |name: &str| DataCreateServerChannel {
+            channel_type: LegacyServerChannelType::Voice,
+            name: name.to_string(),
+            ..Default::default()
+        };
+        let afk_channel =
+            Channel::create_server_channel(&db, &mut server, voice_channel("AFK"), true)
+                .await
+                .expect("`Channel`");
+        let normal_channel =
+            Channel::create_server_channel(&db, &mut server, voice_channel("General"), true)
+                .await
+                .expect("`Channel`");
+
+        // Taken BEFORE the designation: the server's own id, no AFK channel.
+        let before_designation = server.clone();
+
+        server
+            .update(
+                &db,
+                PartialServer {
+                    afk_channel_id: Some(afk_channel.id().to_string()),
+                    ..Default::default()
+                },
+                vec![],
+            )
+            .await
+            .expect("designation");
+
+        // Another server's document, claiming the NORMAL channel is AFK.
+        let foreign = Server {
+            id: "01KX7J0000FOREIGNSERVER000".to_string(),
+            afk_channel_id: Some(normal_channel.id().to_string()),
+            ..server.clone()
+        };
+        async fn denies(db: &Database, channel: &Channel, supplied: Option<&Server>) -> bool {
+            AfkGate::resolve(db, channel, supplied)
+                .await
+                .expect("gate")
+                .denies_publishing()
+        }
+
+        assert!(
+            denies(&db, &afk_channel, Some(&foreign)).await,
+            "a foreign document must not be read: the database designates this channel"
+        );
+        assert!(
+            !denies(&db, &normal_channel, Some(&foreign)).await,
+            "a foreign document must not be read: it is the one naming this channel"
+        );
+
+        assert!(
+            !denies(&db, &afk_channel, Some(&before_designation)).await,
+            "the channel's own server, when supplied, is used as given (no fetch)"
+        );
+        assert!(
+            denies(&db, &afk_channel, Some(&server)).await && denies(&db, &afk_channel, None).await,
+            "control: the current document and the fetch both designate it"
+        );
+    }
+
+    /// The structural defense against audit CRITICAL-1 recurring.
     ///
     /// The draft of this feature claimed `get_allowed_sources` was "the
     /// single helper feeding both the join token and the live re-sync". It
@@ -5221,7 +5864,7 @@ mod permission_tests {
         const EXPECTED: [(&str, usize); 4] = [
             ("core/database/src/voice/mod.rs", 1), // sync_user_voice_permissions
             ("core/database/src/voice/remote_control.rs", 1), // RC revoke
-            (LEG_FILE, 1),                        // the join token
+            (LEG_FILE, 1),                         // the join token
             ("delta/src/routes/channels/remote_control.rs", 1), // RC grant
         ];
 
@@ -5322,7 +5965,7 @@ mod permission_tests {
     /// wrote the same field and took no `voice_client` at all, so once the
     /// enforcement gate went in, creating a new AFK channel left the
     /// occupants of the old one muted at the SFU indefinitely. Two writers of
-    /// one server-level invariant with different post-write behaviour.
+    /// one server-level invariant with different post-write behavior.
     ///
     /// It does NOT prove that the re-sync reaches the SFU, that the POST-update
     /// server document is the one handed to the helper, or that a participant's
@@ -5338,7 +5981,7 @@ mod permission_tests {
     /// `VoiceClient` to sync with.
     ///
     /// KNOWN FALSE NEGATIVE, stated rather than papered over: the writer scan
-    /// only recognises the field inside a `PartialServer` struct literal. A
+    /// only recognizes the field inside a `PartialServer` struct literal. A
     /// route that built the partial some other way - `PartialServer::default()`
     /// then a field assignment, or a spread from a partial constructed
     /// elsewhere - would write the designation without this test noticing.
@@ -5656,9 +6299,7 @@ mod permission_tests {
 
     /// A server, its owner, and one ordinary member of it.
     #[cfg(test)]
-    async fn voice_move_fixture(
-        db: &crate::Database,
-    ) -> (crate::Server, crate::User, crate::User) {
+    async fn voice_move_fixture(db: &crate::Database) -> (crate::Server, crate::User, crate::User) {
         use crate::{Member, Server, User};
         use revolt_models::v0::DataCreateServer;
 
@@ -5891,6 +6532,15 @@ mod permission_tests {
     }
 }
 
+/// Re-sync one user's LiveKit grant in `channel`.
+///
+/// A member who has gone (the member document is deleted, or the SFU has no
+/// such participant) is still an `Err` here, of the same type as before AFK
+/// Stage 6 F-A1 (`NotFound`, `InternalError`): this single-user entry point
+/// keeps its contract for its direct caller (`member_edit`). The room-wide
+/// [`sync_voice_permissions`] uses the classified form and skips such a
+/// member instead. A real SFU failure on the push is still logged at ERROR
+/// and reported to Sentry (`update_permissions_identity_if_present`).
 pub async fn sync_user_voice_permissions(
     db: &Database,
     voice_client: &VoiceClient,
@@ -5900,15 +6550,81 @@ pub async fn sync_user_voice_permissions(
     server: Option<&Server>,
     role_id: Option<&str>,
 ) -> Result<()> {
+    match sync_user_voice_permissions_classified(
+        db,
+        voice_client,
+        node,
+        user,
+        channel,
+        server,
+        role_id,
+    )
+    .await
+    {
+        MemberSync::Synced => Ok(()),
+        // The error this entry point returned before AFK Stage 6 F-A1
+        // (`NotFound` for a deleted member, `InternalError` for a
+        // participant the SFU does not have), but no longer a silent one:
+        // the `InternalError` is built here, not by `to_internal_error()`,
+        // so nothing else logs it (re-audit RA-5).
+        MemberSync::Gone(error) => {
+            log::warn!(
+                "permission sync of {} in {}: the member is no longer there to sync \
+                 ({:?}); answering with the error this entry point always returned",
+                user.id,
+                channel.id(),
+                error.error_type
+            );
+            Err(error)
+        }
+        MemberSync::Failed(error) => Err(error),
+    }
+}
+
+/// [`sync_user_voice_permissions`], with its outcome classified for the
+/// room-wide sync (see [`MemberSync`]).
+async fn sync_user_voice_permissions_classified(
+    db: &Database,
+    voice_client: &VoiceClient,
+    node: &str,
+    user: &User,
+    channel: &Channel,
+    server: Option<&Server>,
+    role_id: Option<&str>,
+) -> MemberSync<revolt_result::Error> {
+    match push_user_voice_permissions(db, voice_client, node, user, channel, server, role_id).await
+    {
+        Ok(outcome) => outcome,
+        Err(error) => MemberSync::Failed(error),
+    }
+}
+
+/// The body of [`sync_user_voice_permissions`]. Every `?` in it is a real
+/// failure; the two ways a member can be gone are returned as
+/// `Ok(MemberSync::Gone(..))`, each at the step that finds it out.
+async fn push_user_voice_permissions(
+    db: &Database,
+    voice_client: &VoiceClient,
+    node: &str,
+    user: &User,
+    channel: &Channel,
+    server: Option<&Server>,
+    role_id: Option<&str>,
+) -> Result<MemberSync<revolt_result::Error>> {
     let channel_id = channel.id();
     let server_id = server.as_ref().map(|s| s.id.as_str());
 
     let member = match server_id {
-        Some(server_id) => Some(
-            Reference::from_unchecked(&user.id)
-                .as_member(db, server_id)
-                .await?,
-        ),
+        Some(server_id) => match Reference::from_unchecked(&user.id)
+            .as_member(db, server_id)
+            .await
+        {
+            Ok(member) => Some(member),
+            Err(error) if matches!(error.error_type, revolt_result::ErrorType::NotFound) => {
+                return Ok(MemberSync::Gone(error))
+            }
+            Err(error) => return Err(error),
+        },
         None => None,
     };
 
@@ -5920,7 +6636,7 @@ pub async fn sync_user_voice_permissions(
         let user_voice_channel = UserVoiceChannel::from_channel(channel);
 
         let Some(voice_state) = get_voice_state(&user_voice_channel, &user.id).await? else {
-            return Ok(());
+            return Ok(MemberSync::Synced);
         };
 
         let mut query = DatabasePermissionQuery::new(db, user)
@@ -5960,14 +6676,22 @@ pub async fn sync_user_voice_permissions(
 
         update_voice_state(&user_voice_channel, &user.id, &update_event).await?;
 
-        voice_client
-            .update_permissions(
+        // The SFU reporting no such participant means the connection is
+        // already gone: no grant is left to correct, so the member is skipped
+        // rather than failing the sync (F-A1). It stops here, as the old `?`
+        // on this push stopped it, before the remote-control release and the
+        // fan-out.
+        let pushed = voice_client
+            .update_permissions_if_present(
                 node,
                 user,
                 channel_id,
                 voice_participant_permissions(can_listen, &allowed_sources),
             )
             .await?;
+        if !pushed {
+            return Ok(MemberSync::Gone(create_error!(InternalError)));
+        }
 
         // Remote-control sync-teardown hook (plan §1): the push above sends
         // `can_publish_data: false` unconditionally, so if this user is the
@@ -6000,7 +6724,7 @@ pub async fn sync_user_voice_permissions(
         };
     };
 
-    Ok(())
+    Ok(MemberSync::Synced)
 }
 
 pub async fn set_channel_call_started_system_message(
@@ -6193,7 +6917,14 @@ mod tests {
     /// registration dies with A's runtime, and test B then draws a dead
     /// connection (intermittent `InternalError` from any mget). Driving all
     /// Redis tests on one process-lifetime runtime removes that failure mode.
-    fn rt() -> &'static tokio::runtime::Runtime {
+    ///
+    /// Visible to the sibling test modules because a test that only touches
+    /// Redis INDIRECTLY (the event publishes inside `Server::create`,
+    /// `Channel::create_server_channel` and `Server::update`) poisons the pool
+    /// just the same when Redis is up. AFK Stage 6's database-backed tests run
+    /// here for that reason: as `#[tokio::test]`s they failed a Redis test in
+    /// 2 of 5 full runs, and 0 of 8 without them.
+    pub(super) fn rt() -> &'static tokio::runtime::Runtime {
         static RT: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
         RT.get_or_init(|| {
             tokio::runtime::Builder::new_multi_thread()
@@ -6733,7 +7464,12 @@ mod tests {
     // The claim's whole Redis life: created with a TTL and an index entry,
     // refreshed without moving `since`, replaced for another channel, read
     // back through `read_idle_state` against a real voice state, requeued
-    // (XX) and cleared, and deleted by the next join.
+    // (XX) and cleared, withdrawn under a tombstone that stops the next PUT
+    // until it is gone (N-4), refused when it claims more idle time than
+    // the call has lasted (F-A2), and deleted by the next join.
+    //
+    // The seed join is backdated ten minutes: a claim of 120 s against a
+    // join stamped "now" is exactly what F-A2 refuses.
     #[test]
     fn afk_idle_claim_lifecycle() {
         rt().block_on(afk_idle_claim_lifecycle_case())
@@ -6762,7 +7498,10 @@ mod tests {
         let member = afk_idle_member(&user, &server);
         let mut conn = get_connection().await.expect("redis");
 
-        create_voice_state(&channel, &user, Timestamp::now_utc())
+        let ten_minutes_ago = Timestamp::now_utc()
+            .checked_sub(Duration::minutes(10))
+            .expect("a timestamp ten minutes ago");
+        create_voice_state(&channel, &user, ten_minutes_ago)
             .await
             .expect("seed voice state");
         let state = read_idle_state(&user, &server).await.unwrap();
@@ -6826,6 +7565,46 @@ mod tests {
         assert_eq!(get_afk_since(&user, &server).await.unwrap(), None);
         assert_eq!(afk_idle_score(&mut conn, &member).await, None);
 
+        // N-4 — the withdrawal: the claim and its entry go, and a tombstone
+        // stands for at most AFK_IDLE_TOMB_TTL_SECS.
+        set_afk_since(&user, &server, &channel.id, 120)
+            .await
+            .unwrap();
+        assert!(get_afk_since(&user, &server).await.unwrap().is_some());
+        withdraw_afk_since(&user, &server).await.unwrap();
+        assert_eq!(get_afk_since(&user, &server).await.unwrap(), None);
+        assert_eq!(afk_idle_score(&mut conn, &member).await, None);
+        let tomb_ttl: i64 = conn.ttl(afk_idle_tomb_key(&user, &server)).await.unwrap();
+        assert!(
+            tomb_ttl > 0 && tomb_ttl <= AFK_IDLE_TOMB_TTL_SECS as i64,
+            "tomb ttl {tomb_ttl}"
+        );
+
+        // While it stands, a PUT succeeds and writes nothing: no claim, no
+        // index entry.
+        set_afk_since(&user, &server, &channel.id, 120)
+            .await
+            .unwrap();
+        assert_eq!(
+            get_afk_since(&user, &server).await.unwrap(),
+            None,
+            "a PUT under a tombstone writes nothing"
+        );
+        assert_eq!(afk_idle_score(&mut conn, &member).await, None);
+
+        // The tomb's expiry (deleted here rather than waited out) lets the
+        // next PUT write again.
+        let _: () = conn.del(afk_idle_tomb_key(&user, &server)).await.unwrap();
+        set_afk_since(&user, &server, &channel.id, 120)
+            .await
+            .unwrap();
+        assert!(
+            get_afk_since(&user, &server).await.unwrap().is_some(),
+            "with the tombstone gone the PUT writes again"
+        );
+        assert!(afk_idle_score(&mut conn, &member).await.is_some());
+        clear_afk_since(&user, &server).await.unwrap();
+
         // A join deletes the claim (I-2).
         set_afk_since(&user, &server, &channel.id, 0).await.unwrap();
         create_voice_state(&channel, &user, Timestamp::now_utc())
@@ -6833,6 +7612,24 @@ mod tests {
             .expect("rejoin");
         assert_eq!(get_afk_since(&user, &server).await.unwrap(), None);
 
+        // F-A2 — a claim of 120 s against a join stamped now (a stale
+        // refresh from before the rejoin) writes nothing; an honest one does.
+        // The join deletes the claim but not its index entry (the sweep
+        // drops that), so it is dropped here first to observe "no ZADD".
+        drop_idle_member(&member).await.unwrap();
+        set_afk_since(&user, &server, &channel.id, 120)
+            .await
+            .unwrap();
+        assert_eq!(
+            get_afk_since(&user, &server).await.unwrap(),
+            None,
+            "a claim idle for longer than the call writes nothing"
+        );
+        assert_eq!(afk_idle_score(&mut conn, &member).await, None);
+        set_afk_since(&user, &server, &channel.id, 0).await.unwrap();
+        assert!(get_afk_since(&user, &server).await.unwrap().is_some());
+
+        clear_afk_since(&user, &server).await.unwrap();
         drop_idle_member(&member).await.unwrap();
         delete_voice_state(&channel, &user).await.expect("cleanup");
     }

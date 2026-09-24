@@ -327,7 +327,7 @@ impl Server {
     /// There is no `VoiceChannel` type - migration 46 removed it. A voice
     /// channel is a `TextChannel` carrying `voice: Some(..)`, and
     /// `Channel::voice()` is the only discriminator. It also returns `None`
-    /// when `voice.disabled` is set, which is the behaviour we want here: a
+    /// when `voice.disabled` is set, which is the behavior we want here: a
     /// channel with calling turned off must not be designated AFK.
     ///
     /// This validates at write time only. The pointer can still go stale
@@ -388,11 +388,12 @@ impl Server {
     /// `EventV1::ServerUpdate` `clear` array, so going through `remove` is what
     /// fans the clear out to clients. This is the `voice_region` precedent.
     ///
-    /// THE RULE FOR THE PAIR, stated once here because four writers touch it
+    /// THE RULE FOR THE PAIR, stated once here because five writers touch it
     /// and they used to disagree: **`afk_timeout` is meaningless without
     /// `afk_channel_id`.** It names how long a member idles before being moved
     /// to the AFK channel, so with no channel designated there is nothing for
-    /// it to mean. Concretely:
+    /// it to mean. The five are this helper, `server_edit`, `channel_create`,
+    /// the Discord import worker and the revision-70 migration. Concretely:
     ///
     /// - clearing the channel clears the timeout - this helper, and the
     ///   `remove: ["AfkChannel"]` path in `server_edit`, which appends
@@ -403,7 +404,18 @@ impl Server {
     ///   `InvalidProperty`;
     /// - `channel_create` with `afk: true` always designates a channel, so any
     ///   timeout it writes (or any timeout the server already carried) has a
-    ///   destination by construction.
+    ///   destination by construction;
+    /// - the Discord import writes a timeout only alongside the AFK channel it
+    ///   maps, and the revision-70 migration writes the channel and never a
+    ///   timeout.
+    ///
+    /// Of the five, only the two routes re-sync live LiveKit grants
+    /// (`voice::sync_afk_designation_change`, whose doc says why the other
+    /// three need not). This helper needs no sync because both routes that
+    /// reach it tear the channel's call down right after it: `channel_delete`
+    /// (through `Channel::delete`) and `channel_edit`'s de-voice block each
+    /// call `delete_voice_channel`, so no room is left holding a grant minted
+    /// under the old designation.
     ///
     /// Nothing enforces the rule at the database layer - `PartialServer` can
     /// still carry a timeout on its own - so it is an invariant the route
