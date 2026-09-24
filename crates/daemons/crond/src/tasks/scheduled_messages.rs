@@ -487,8 +487,10 @@ mod tests {
     /// Phase 1 is the in-test known-bad control (no workers: nothing lands),
     /// phase 2 starts the workers and requires every witness to land.
     /// Witnesses: the last_message_id worker flips a DM `active` false → true
-    /// (the Reference driver never persists `last_message_id` on DM/Group),
-    /// and the ack worker records the recipient's mention of the delivered id.
+    /// (the DM-reopen side effect, which fires only when the delivered id
+    /// advances the pointer) and records the delivered id as the DM's
+    /// `last_message_id`, and the ack worker records the recipient's mention
+    /// of the delivered id.
     ///
     /// The queues are process statics, and other crond tests (the
     /// discord_import worker tests → `Member::create`) may enqueue into them.
@@ -581,6 +583,18 @@ mod tests {
         }
 
         assert!(dm_active(&db, dm.id()).await, "DM never went active");
+        // The worker sets `active` and `last_message_id` in one write, so the
+        // pointer has landed too; `dm_expected` holds exactly the delivered id.
+        match db.fetch_channel(dm.id()).await.expect("fetch dm") {
+            Channel::DirectMessage {
+                last_message_id, ..
+            } => assert_eq!(
+                last_message_id.map(|id| vec![id]),
+                dm_expected,
+                "DM last_message_id is not the delivered id"
+            ),
+            _ => panic!("fixture channel is not a DM"),
+        }
         assert_eq!(mentions(&db, &other.id, dm.id()).await, dm_expected);
         assert_eq!(mentions(&db, &other.id, group.id()).await, group_expected);
         // The author is never a recipient of their own message.

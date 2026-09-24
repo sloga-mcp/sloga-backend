@@ -1,5 +1,6 @@
 use std::time::Duration;
 
+use revolt_database::events::client::EventV1;
 use revolt_database::util::idempotency::IdempotencyKey;
 use revolt_database::util::permissions::DatabasePermissionQuery;
 use revolt_database::util::reference::Reference;
@@ -42,7 +43,10 @@ pub async fn create_forum_post(
     // fail-closed gate — DMs/groups can never be forums).
     let forum = target.as_channel(db).await?;
     let Channel::Forum {
-        tags, require_tag, ..
+        tags,
+        require_tag,
+        server,
+        ..
     } = &forum
     else {
         return Err(create_error!(InvalidOperation));
@@ -150,25 +154,37 @@ pub async fn create_forum_post(
 
     // Bump the forum's activity marker so the existing unread machinery
     // lights up for a new post (replies inside posts intentionally do NOT
-    // bump the forum). The post and starter already exist, so a failed bump
-    // must not fail the request — a retry would duplicate the post.
-    let mut forum = forum;
-    if let Err(error) = forum
-        .update(
-            db,
-            PartialChannel {
-                last_message_id: Some(message.id.clone()),
-                ..Default::default()
-            },
-            vec![],
-        )
+    // bump the forum). Only move it forward: two posts created together
+    // could otherwise land out of order. The post and starter already exist,
+    // so a failed bump must not fail the request — a retry would duplicate
+    // the post.
+    match db
+        .set_last_message_id_if_newer(forum.id(), &message.id, false)
         .await
     {
-        revolt_config::capture_error(&error);
+        Ok(true) => {
+            EventV1::ChannelUpdate {
+                id: forum.id().to_string(),
+                data: PartialChannel {
+                    last_message_id: Some(message.id.clone()),
+                    ..Default::default()
+                }
+                .into(),
+                clear: vec![],
+            }
+            .p(server.clone())
+            .await;
+        }
+        // A newer post already moved it (and broadcast it), or the forum is gone.
+        Ok(false) => {}
+        Err(error) => {
+            revolt_config::capture_error(&error);
+        }
     }
 
-    // The forum's last_message_id just moved to this post; ack it for the
-    // author so their own post doesn't light the forum up as unread.
+    // The forum's last_message_id is now at this post or a newer one; ack
+    // this post for the author so their own post doesn't light the forum up
+    // as unread.
     if user.bot.is_none() {
         if let Err(error) = forum.ack(&user.id, &message.id, amqp).await {
             revolt_config::capture_error(&error);
