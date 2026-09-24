@@ -40,7 +40,21 @@
     }
 }
 
+# Send plain-http visitors to https. http:// used to serve every page with a
+# 200, so a first visit (before HSTS is cached) ran unencrypted end to end.
+# Caddy always receives plain http here, from cloudflared on this box, so the
+# scheme the visitor used only arrives in X-Forwarded-Proto, which Cloudflare
+# sets. The match is exact on purpose: a request without the header (local
+# tooling, the NJ LiveKit node posting to :8500 directly) is never redirected,
+# so a missing header fails open instead of looping. 308 keeps the method and
+# body, so a POST that follows it still lands.
+(https_only) {
+    @plain_http header X-Forwarded-Proto http
+    redir @plain_http https://{host}{uri} 308
+}
+
 :80 {
+    import https_only
 
     # WebSocket (Bonfire)
     handle /ws {
@@ -185,6 +199,7 @@
 
 # Marketing site — sloga.gg apex (host-matched; app.sloga.gg + localhost still hit the :80 block above)
 http://sloga.gg {
+    import https_only
     root * /home/mcp/sloga-website
 
     # Security headers for the marketing site (audit 2026-09-05 H3). The site is
