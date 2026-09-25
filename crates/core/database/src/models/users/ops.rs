@@ -59,4 +59,50 @@ pub trait AbstractUsers: Sync + Send {
 
     /// Removes all relationships with the user from the list of users
     async fn clear_user_relationships(&self, target_id: &str, user_ids: Vec<String>) -> Result<()>;
+
+    /// Fetch the user whose supporter payer hashes contain the given hash
+    async fn fetch_user_by_payer_hmac(&self, hmac: &str) -> Result<Option<User>>;
+
+    /// Fetch all users with a referral count of at least `n`
+    async fn fetch_users_with_referral_count_at_least(&self, n: i32) -> Result<Vec<User>>;
+
+    /// Fetch all users welcomed between the given timestamps (in milliseconds)
+    ///
+    /// The window applies to the raw `welcomed_at` value; the caller is
+    /// responsible for offsetting it by the trial length.
+    async fn fetch_users_welcomed_between(&self, from_ms: i64, to_ms: i64) -> Result<Vec<User>>;
+
+    /// Fetch all users whose monthly supporter status ends between the given
+    /// timestamps (in milliseconds)
+    async fn fetch_users_monthly_until_between(
+        &self,
+        from_ms: i64,
+        to_ms: i64,
+    ) -> Result<Vec<User>>;
+
+    /// Fetch all users with a pending referral
+    async fn fetch_users_with_referral_pending(&self) -> Result<Vec<User>>;
+
+    /// Claim a payer hash for a user
+    ///
+    /// Ensures `supporter` exists (lifetime 0, no hashes, badges shown),
+    /// removes the hash from every other user's `supporter.payer_hmacs` and
+    /// adds it to this user's. Returns the ids of the users that lost it.
+    async fn claim_payer_hmac(&self, user_id: &str, hmac: &str) -> Result<Vec<String>>;
+
+    /// Set a user's supporter totals
+    ///
+    /// Ensures `supporter` exists, sets `lifetime_usd_cents` and sets or
+    /// unsets `monthly_until`.
+    async fn set_supporter_totals(
+        &self,
+        user_id: &str,
+        lifetime_usd_cents: i64,
+        monthly_until: Option<i64>,
+    ) -> Result<()>;
+
+    /// Set whether a user's supporter badges are shown
+    ///
+    /// Ensures `supporter` exists, then sets `show_badges`.
+    async fn set_supporter_show_badges(&self, user_id: &str, show: bool) -> Result<()>;
 }

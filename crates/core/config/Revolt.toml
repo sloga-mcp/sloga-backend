@@ -129,6 +129,14 @@ call_ring_duration = 30
 # Minimum allowed length of usernames
 min_username_length = 2
 
+[api.kofi]
+# Ko-fi webhook verification token (secret, set only in deployment overrides)
+verification_token = ""
+# HMAC key used to hash donor emails before storage (secret, set only in deployment overrides)
+email_hmac_key = ""
+# Public Ko-fi page that donation links point to
+page_url = "https://ko-fi.com/slogatech"
+
 [pushd]
 # this changes the names of the queues to not overlap 
 # prod/beta if they happen to be on the same exchange/instance.
@@ -438,6 +446,8 @@ banners = 6_000_000
 stickers = 500_000
 emojis = 500_000
 soundboard = 1_000_000
+
+# An optional [features.limits.perk] table overlays only file_upload_size_limit for users with the upload perk.
 
 [features.advanced]
 # The max amount of messages the rabbitmq provider/db mention adder job will delay for before forcing handling of a channel.

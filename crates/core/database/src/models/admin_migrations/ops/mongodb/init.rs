@@ -210,6 +210,22 @@ pub async fn create_database(db: &MongoDb) {
         .await
         .expect("Failed to create discord_import_jobs collection.");
 
+    db.create_collection("referrals")
+        .await
+        .expect("Failed to create referrals collection.");
+
+    db.create_collection("referral_codes")
+        .await
+        .expect("Failed to create referral_codes collection.");
+
+    db.create_collection("donations")
+        .await
+        .expect("Failed to create donations collection.");
+
+    db.create_collection("donation_claim_codes")
+        .await
+        .expect("Failed to create donation_claim_codes collection.");
+
     db.run_command(doc! {
         "createIndexes": "users",
         "indexes": [
@@ -688,6 +704,139 @@ pub async fn create_database(db: &MongoDb) {
     })
     .await
     .expect("Failed to create discord_import_jobs index.");
+
+    // Referrals and donation perks. Every spec below MUST stay identical to
+    // the copies in scripts.rs (revision 71).
+    db.run_command(doc! {
+        "createIndexes": "referrals",
+        "indexes": [
+            // Serves the per-referrer listing and counts by status.
+            {
+                "key": {
+                    "referrer": 1_i32,
+                    "status": 1_i32
+                },
+                "name": "referrer_status"
+            },
+            // Serves scans over all referrals in a given status.
+            {
+                "key": {
+                    "status": 1_i32
+                },
+                "name": "status"
+            }
+        ]
+    })
+    .await
+    .expect("Failed to create referrals index.");
+
+    db.run_command(doc! {
+        "createIndexes": "referral_codes",
+        "indexes": [
+            // ENFORCES one referral code per user.
+            {
+                "key": {
+                    "user": 1_i32
+                },
+                "name": "user",
+                "unique": true
+            }
+        ]
+    })
+    .await
+    .expect("Failed to create referral_codes index.");
+
+    db.run_command(doc! {
+        "createIndexes": "donations",
+        "indexes": [
+            // ENFORCES one donation row per webhook message_id, so a
+            // redelivered webhook cannot be recorded twice.
+            {
+                "key": {
+                    "message_id": 1_i32
+                },
+                "name": "message_id",
+                "unique": true
+            },
+            // Serves per-user donation lookups and the deletion cascade.
+            {
+                "key": {
+                    "user": 1_i32
+                },
+                "name": "user"
+            },
+            // Serves payer matching. Sparse: rows without a payer HMAC have
+            // NO payer_hmac field.
+            {
+                "key": {
+                    "payer_hmac": 1_i32
+                },
+                "name": "payer_hmac",
+                "sparse": true
+            }
+        ]
+    })
+    .await
+    .expect("Failed to create donations index.");
+
+    db.run_command(doc! {
+        "createIndexes": "donation_claim_codes",
+        "indexes": [
+            // Serves per-user claim code lookups and the deletion cascade.
+            {
+                "key": {
+                    "user": 1_i32
+                },
+                "name": "user"
+            }
+        ]
+    })
+    .await
+    .expect("Failed to create donation_claim_codes index.");
+
+    db.run_command(doc! {
+        "createIndexes": "users",
+        "indexes": [
+            // All sparse: most users carry none of these fields.
+            {
+                "key": {
+                    "supporter.payer_hmacs": 1_i32
+                },
+                "name": "supporter.payer_hmacs",
+                "sparse": true
+            },
+            {
+                "key": {
+                    "referral_pending": 1_i32
+                },
+                "name": "referral_pending",
+                "sparse": true
+            },
+            {
+                "key": {
+                    "welcomed_at": 1_i32
+                },
+                "name": "welcomed_at",
+                "sparse": true
+            },
+            {
+                "key": {
+                    "supporter.monthly_until": 1_i32
+                },
+                "name": "supporter.monthly_until",
+                "sparse": true
+            },
+            {
+                "key": {
+                    "referral_count": 1_i32
+                },
+                "name": "referral_count",
+                "sparse": true
+            }
+        ]
+    })
+    .await
+    .expect("Failed to create users referral and supporter indexes.");
 
     db.run_command(doc! {
         "createIndexes": "servers",

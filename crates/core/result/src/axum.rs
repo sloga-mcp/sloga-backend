@@ -64,6 +64,10 @@ impl IntoResponse for Error {
             ErrorType::NotEnoughBoosts { .. } => StatusCode::BAD_REQUEST,
             ErrorType::TooManyBoosts { .. } => StatusCode::BAD_REQUEST,
 
+            ErrorType::PerkRequired => StatusCode::FORBIDDEN,
+            ErrorType::InvalidReferralCode => StatusCode::BAD_REQUEST,
+            ErrorType::InvalidClaim => StatusCode::CONFLICT,
+
             ErrorType::ReachedMaximumBots => StatusCode::BAD_REQUEST,
             ErrorType::IsBot => StatusCode::BAD_REQUEST,
             ErrorType::IsNotBot => StatusCode::BAD_REQUEST,
