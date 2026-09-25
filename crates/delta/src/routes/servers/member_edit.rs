@@ -231,8 +231,11 @@ pub async fn edit(
     // Resolve our ranking
     let our_ranking = query.get_member_rank().unwrap_or(i64::MIN);
 
-    // Check that we have permissions to act against this member
+    // Check that we have permissions to act against this member. Platform
+    // staff resolve no member rank (`i64::MIN`), which now ties with the
+    // owner's, so they are exempt here to keep the reach they already had.
     if member.id.user != user.id
+        && !user.privileged
         && member.get_ranking(query.server_ref().as_ref().unwrap()) <= our_ranking
     {
         return Err(create_error!(NotElevated));
@@ -1186,6 +1189,125 @@ mod test {
             .expect("member read");
         assert!(!member.can_publish, "the mute must still stand");
         assert!(!member.can_receive, "the deafen must still stand");
+    }
+
+    #[test]
+    fn a_moderator_cannot_act_on_an_owner_with_no_roles() {
+        crate::util::test::rt()
+            .block_on(a_moderator_cannot_act_on_an_owner_with_no_roles_case())
+    }
+
+    /// An owner holding no roles used to rank `i64::MAX`, below every role,
+    /// so a moderator passed the rank check against them and could mute,
+    /// deafen or rename the owner of the server.
+    async fn a_moderator_cannot_act_on_an_owner_with_no_roles_case() {
+        let harness = TestHarness::new().await;
+        let (_a, session_a, user_a) = harness.new_user().await; // owner, no roles
+        let (_b, session_b, user_b) = harness.new_user().await; // moderator
+        let (server, _channels) = harness.new_server(&user_a).await;
+
+        // The harness inserts the server without the owner's membership,
+        // which a real server always has.
+        if harness.db.fetch_member(&server.id, &user_a.id).await.is_err() {
+            Member::create(&harness.db, &server, &user_a, None)
+                .await
+                .expect("owner member");
+        }
+
+        let role = harness
+            .new_role(
+                &server,
+                1,
+                Some(OverrideField {
+                    a: ChannelPermission::MuteMembers as i64
+                        + ChannelPermission::DeafenMembers as i64
+                        + ChannelPermission::ManageNicknames as i64,
+                    d: 0,
+                }),
+            )
+            .await;
+        Member::create(&harness.db, &server, &user_b, None)
+            .await
+            .expect("member");
+        let response = edit_member(
+            &harness,
+            &session_a.token,
+            &server.id,
+            &user_b.id,
+            serde_json::json!({ "roles": [role.id] }),
+        )
+        .await;
+        assert_eq!(response.status(), Status::Ok, "owner may assign the role");
+
+        let owner = harness
+            .db
+            .fetch_member(&server.id, &user_a.id)
+            .await
+            .expect("owner member");
+        assert!(owner.roles.is_empty(), "the owner must hold no roles here");
+
+        for body in [
+            serde_json::json!({ "can_publish": false }),
+            serde_json::json!({ "can_receive": false }),
+            serde_json::json!({ "nickname": "renamed" }),
+        ] {
+            let response = edit_member(
+                &harness,
+                &session_b.token,
+                &server.id,
+                &user_a.id,
+                body.clone(),
+            )
+            .await;
+            assert_eq!(
+                response.status(),
+                Status::Forbidden,
+                "{body} against the owner must be refused"
+            );
+            // MissingPermission is a 403 too, so pin the reason.
+            let error: revolt_result::Error =
+                response.into_json().await.expect("error body");
+            assert!(
+                matches!(error.error_type, revolt_result::ErrorType::NotElevated),
+                "{body} must fail on rank, not permission: {:?}",
+                error.error_type
+            );
+        }
+
+        let owner = harness
+            .db
+            .fetch_member(&server.id, &user_a.id)
+            .await
+            .expect("owner member");
+        assert!(owner.can_publish, "the owner must not be muted");
+        assert!(owner.can_receive, "the owner must not be deafened");
+        assert!(owner.nickname.is_none(), "the owner must not be renamed");
+
+        // The moderator still outranks an ordinary member with no roles, and
+        // each of the three edits above is one the role really grants.
+        let (_c, _session_c, user_c) = harness.new_user().await;
+        Member::create(&harness.db, &server, &user_c, None)
+            .await
+            .expect("member");
+        // One request carrying all three, so the moderator stays under the
+        // edit rate limit; it succeeds only if the role grants every one.
+        let response = edit_member(
+            &harness,
+            &session_b.token,
+            &server.id,
+            &user_c.id,
+            serde_json::json!({
+                "can_publish": false,
+                "can_receive": false,
+                "nickname": "renamed"
+            }),
+        )
+        .await;
+        assert_eq!(
+            response.status(),
+            Status::Ok,
+            "the same edits against a plain member must succeed"
+        );
     }
 
     #[test]
