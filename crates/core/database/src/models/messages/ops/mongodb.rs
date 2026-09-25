@@ -234,8 +234,15 @@ impl AbstractMessages for MongoDb {
                 query,
             )
             .await
-            .map(|_| ())
             .map_err(|_| create_database_error!("update_one", COL))
+            // The message may have been deleted while its embeds were being fetched.
+            .and_then(|result| {
+                if result.matched_count == 0 {
+                    Err(create_error!(NotFound))
+                } else {
+                    Ok(())
+                }
+            })
     }
 
     /// Count published (Crossposted-flagged) messages in a channel at/after

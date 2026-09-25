@@ -4,7 +4,7 @@ use futures::future::join_all;
 use linkify::{LinkFinder, LinkKind};
 use regex::Regex;
 use revolt_config::config;
-use revolt_result::Result;
+use revolt_result::{ErrorType, Result};
 
 use async_lock::Semaphore;
 use deadqueue::limited::Queue;
@@ -62,9 +62,9 @@ pub async fn worker(db: Database) {
             .await;
 
             if let Ok(embeds) = embeds {
-                if let Err(err) = Message::append(
+                match Message::append(
                     &db,
-                    task.id,
+                    task.id.clone(),
                     task.channel,
                     AppendMessage {
                         embeds: Some(embeds),
@@ -72,7 +72,14 @@ pub async fn worker(db: Database) {
                 )
                 .await
                 {
-                    error!("Encountered an error appending to message: {:?}", err);
+                    Ok(()) => {}
+                    Err(err) if matches!(err.error_type, ErrorType::NotFound) => debug!(
+                        "Message {} was deleted before its embeds resolved; dropping them",
+                        task.id
+                    ),
+                    Err(err) => {
+                        error!("Encountered an error appending to message: {:?}", err);
+                    }
                 }
             }
         });

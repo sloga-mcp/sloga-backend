@@ -426,4 +426,109 @@ mod tests {
             );
         });
     }
+
+    /// A message deleted while its embeds were being fetched must not get a
+    /// `MessageAppend`: clients would be told about embeds on a message that
+    /// no longer exists. Holds on both drivers, for an empty append as well
+    /// as a real one. Needs Redis at `REDIS_URI`.
+    #[tokio::test]
+    async fn append_to_missing_message_is_not_found_and_publishes_nothing() {
+        database_test!(|db| async move {
+            use crate::events::client::EventV1;
+            use crate::AppendMessage;
+            use futures::StreamExt;
+            use revolt_result::ErrorType;
+            use std::time::Duration;
+
+            // A fresh topic per run, so nothing else ever publishes to it.
+            let channel = ulid::Ulid::new().to_string();
+            let mut pubsub = redis_kiss::open_pubsub_connection()
+                .await
+                .expect("pubsub connection");
+            pubsub.subscribe(&channel).await.expect("subscribe");
+            let mut stream = pubsub.on_message();
+
+            let missing_id = ulid::Ulid::new().to_string();
+            let err = Message::append(
+                &db,
+                missing_id.clone(),
+                channel.clone(),
+                AppendMessage {
+                    embeds: Some(vec![v0::Embed::None]),
+                },
+            )
+            .await
+            .expect_err("append to a missing message must be NotFound");
+            assert!(matches!(err.error_type, ErrorType::NotFound), "{err:?}");
+            let fetched = db.fetch_message(&missing_id).await;
+            assert!(
+                matches!(&fetched, Err(e) if matches!(e.error_type, ErrorType::NotFound)),
+                "append must not create the message: {fetched:?}"
+            );
+
+            // An empty append may succeed or fail, but must stay silent.
+            let _ = Message::append(
+                &db,
+                missing_id.clone(),
+                channel.clone(),
+                AppendMessage {
+                    embeds: Some(vec![]),
+                },
+            )
+            .await;
+
+            // Positive control: a live message does get its event, which also
+            // proves the subscription is actually receiving.
+            let live = Message {
+                id: ulid::Ulid::new().to_string(),
+                channel: channel.clone(),
+                author: "01USER000000000000000000000".to_string(),
+                content: Some("hello".to_string()),
+                ..Default::default()
+            };
+            db.insert_message(&live).await.unwrap();
+            Message::append(
+                &db,
+                live.id.clone(),
+                channel.clone(),
+                AppendMessage {
+                    embeds: Some(vec![v0::Embed::None]),
+                },
+            )
+            .await
+            .expect("append to a live message");
+            let appended = db.fetch_message(&live.id).await.unwrap();
+            assert_eq!(appended.embeds.expect("embeds").len(), 1);
+
+            // Drain the topic: wait for the live event, then give anything
+            // trailing a second to show up.
+            let mut seen: Vec<(String, String)> = Vec::new();
+            let mut live_seen = false;
+            loop {
+                let wait = Duration::from_secs(if live_seen { 1 } else { 5 });
+                let msg = match tokio::time::timeout(wait, stream.next()).await {
+                    Ok(Some(msg)) => msg,
+                    Ok(None) => break,
+                    Err(_) if live_seen => break,
+                    Err(_) => panic!(
+                        "positive control: no MessageAppend received (is Redis at REDIS_URI up?)"
+                    ),
+                };
+                let event = redis_kiss::decode_payload::<EventV1>(&msg)
+                    .expect("undecodable payload on the channel topic");
+                match event {
+                    EventV1::MessageAppend { id, .. } => {
+                        live_seen |= id == live.id;
+                        seen.push(("MessageAppend".to_string(), id));
+                    }
+                    other => seen.push(("other".to_string(), format!("{other:?}"))),
+                }
+            }
+            assert_eq!(
+                seen,
+                vec![("MessageAppend".to_string(), live.id.clone())],
+                "ghost or unexpected events on the channel topic"
+            );
+        });
+    }
 }
