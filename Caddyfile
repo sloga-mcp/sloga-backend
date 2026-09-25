@@ -221,7 +221,9 @@ http://sloga.gg {
     # folder, so README.md was served at the site root, describing the layout
     # and the deploy recipe (audit 2026-09-05 L8). Blocked here rather than
     # deleted, so a re-sync from the git source cannot quietly restore it.
-    @repodocs path /README.md /readme.md
+    # tools/ is the same case: the build helpers (prerender-discover.py and
+    # the logo/og-image generator pages) were served publicly.
+    @repodocs path /README.md /readme.md /tools /tools/*
     respond @repodocs 404
 
     # The Linux .deb updater's "Open download page" button opens /download.
