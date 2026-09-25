@@ -4,6 +4,7 @@ use std::{
     io::Cursor,
     panic::{catch_unwind, AssertUnwindSafe},
     sync::Arc,
+    time::Duration,
 };
 
 use crate::utils::Consumer;
@@ -14,9 +15,14 @@ use base64::{
     engine::{self},
     Engine as _,
 };
+use isahc::{
+    config::{Configurable, RedirectPolicy},
+    HttpClient,
+};
 use lapin::{message::Delivery, Channel as AMQPChannel, Connection};
-use log::{error, info};
+use log::{error, info, warn};
 use revolt_database::{events::rabbit::*, util::format_display_name, Database};
+use revolt_models::v0::push_endpoint_allowed;
 use sha2::{Digest, Sha256};
 use web_push::{
     ContentEncoding, IsahcWebPushClient, SubscriptionInfo, SubscriptionKeys, VapidSignature,
@@ -216,6 +222,28 @@ where
     }
 }
 
+/// Longest a single push-service request may take, connect included
+const SEND_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Longest the TCP + TLS connect may take
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The HTTP client for web-push sends.
+///
+/// `IsahcWebPushClient::new()` never times out, so one endpoint that accepts
+/// the connection and never answers held a send (and its connection) forever.
+/// Redirects are never followed: a push service answers directly, and a
+/// redirect is the one way an allowed host could send us somewhere else.
+fn web_push_client(timeout: Duration, connect_timeout: Duration) -> IsahcWebPushClient {
+    HttpClient::builder()
+        .timeout(timeout)
+        .connect_timeout(connect_timeout)
+        .redirect_policy(RedirectPolicy::None)
+        .build()
+        .map(IsahcWebPushClient::from)
+        .expect("web-push HTTP client")
+}
+
 /// Parses the PEM and signs for this subscription, without panicking on a bad key
 fn sign(pem: &[u8], subscription: &SubscriptionInfo) -> Result<VapidSignature, WebPushError> {
     // The panic hook still runs, so a caught parser panic is still printed and sent to Sentry
@@ -288,7 +316,7 @@ impl Consumer for VapidOutboundConsumer {
             db,
             connection,
             channel,
-            client: IsahcWebPushClient::new().unwrap(),
+            client: web_push_client(SEND_TIMEOUT, CONNECT_TIMEOUT),
             pkey: web_push_private_key,
             legacy_pkey: match check.legacy {
                 Some(Ok((pem, _))) => Some(Arc::new(pem)),
@@ -305,12 +333,25 @@ impl Consumer for VapidOutboundConsumer {
     async fn consume(&self, delivery: Delivery) -> Result<()> {
         let payload: PayloadToService = serde_json::from_slice(&delivery.data)?;
 
+        let endpoint = payload
+            .extras
+            .get("endpoint")
+            .ok_or_else(|| anyhow!("missing endpoint"))?;
+
+        // delta refuses these at /push/subscribe; this catches anything stored
+        // before that check existed, so a stored subscription can never make
+        // this host POST to an internal address. The endpoint itself carries
+        // the subscription's secret, so it is never logged.
+        if !push_endpoint_allowed(endpoint) {
+            warn!(
+                "vapid: refusing a stored endpoint outside the push-service allowlist (session {})",
+                payload.session_id
+            );
+            return Ok(());
+        }
+
         let subscription = SubscriptionInfo {
-            endpoint: payload
-                .extras
-                .get("endpoint")
-                .ok_or_else(|| anyhow!("missing endpoint"))?
-                .clone(),
+            endpoint: endpoint.clone(),
             keys: SubscriptionKeys {
                 auth: payload.token,
                 p256dh: payload
@@ -692,6 +733,71 @@ mod tests {
             assert!(matches!(check.legacy, Some(Err(_))));
             assert!(check.suppress_401_removal);
         }
+    }
+
+    /// A bare web-push message to a local test endpoint
+    fn local_message(port: u16) -> web_push::WebPushMessage {
+        let subscription = SubscriptionInfo::new(
+            format!("http://127.0.0.1:{port}/push"),
+            SYNTHETIC_PUBLIC.to_string(),
+            "c2VjcmV0c2VjcmV0c2VjcmV0".to_string(),
+        );
+        WebPushMessageBuilder::new(&subscription)
+            .build()
+            .expect("message")
+    }
+
+    #[tokio::test]
+    async fn vapid_send_gives_up_on_a_silent_endpoint() {
+        // Accepts the connection, then never writes a byte
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        std::thread::spawn(move || {
+            let _held: Vec<_> = listener.incoming().take(1).collect();
+            std::thread::sleep(Duration::from_secs(30));
+        });
+
+        let client = web_push_client(Duration::from_millis(500), Duration::from_millis(500));
+        let started = std::time::Instant::now();
+        let result = tokio::time::timeout(Duration::from_secs(10), client.send(local_message(port)))
+            .await
+            .expect("the client must time out on its own");
+
+        assert!(result.is_err());
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[tokio::test]
+    async fn vapid_send_never_follows_a_redirect() {
+        // Where a redirect would lead; nothing may ever connect here
+        let target = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let target_port = target.local_addr().expect("addr").port();
+        target.set_nonblocking(true).expect("nonblocking");
+
+        let redirector = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = redirector.local_addr().expect("addr").port();
+        std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            if let Some(Ok(mut stream)) = redirector.incoming().next() {
+                let mut request = [0u8; 4096];
+                let _ = stream.read(&mut request);
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 307 Temporary Redirect\r\nLocation: http://127.0.0.1:{target_port}/push\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                );
+            }
+        });
+
+        let client = web_push_client(Duration::from_secs(5), Duration::from_secs(5));
+        let result = tokio::time::timeout(Duration::from_secs(15), client.send(local_message(port)))
+            .await
+            .expect("the client must answer on its own");
+
+        assert!(result.is_err());
+        assert!(matches!(
+            target.accept(),
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock
+        ));
     }
 
     #[test]
