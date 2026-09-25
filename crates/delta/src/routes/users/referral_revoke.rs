@@ -27,7 +27,19 @@ pub async fn revoke_referral(
         .fetch_referral(target.id)
         .await?
         .ok_or_else(|| create_error!(NotFound))?;
+    // Revoking again repairs a welcome left behind by an earlier revocation
+    // (a sweep write that landed after its last cleanup, or a cleanup that
+    // failed). Only a revocation with nothing left to clear is refused.
     if referral.status == ReferralStatus::Revoked {
+        if clear_invitee(db, &referral.id).await? {
+            log::info!(
+                "AUDIT referral_revoke: actor={} invitee={} referrer={} repeat revocation cleared a leftover welcome",
+                user.id,
+                referral.id,
+                referral.referrer
+            );
+            return Ok(EmptyResponse);
+        }
         return Err(create_error!(InvalidOperation));
     }
 
@@ -51,11 +63,19 @@ pub async fn revoke_referral(
     // it may have qualified and welcomed the invitee between the cleanup and
     // the status write. Now that the row reads Revoked the sweep can no
     // longer qualify them, so clear once more. Best-effort like the recount
-    // below: a leftover welcome is not repaired by the orphan pass.
+    // below: the orphan pass never repairs a leftover welcome (one from a
+    // failed cleanup here, or a sweep write already in flight that lands
+    // after it), but revoking the referral again does.
     match clear_invitee(db, &referral.id).await {
-        Ok(true) => log::warn!("referral_revoke: invitee was welcomed during revocation, cleared"),
+        Ok(true) => log::warn!(
+            "referral_revoke: invitee {} was welcomed during revocation, cleared",
+            referral.id
+        ),
         Ok(false) => {}
-        Err(error) => log::warn!("referral_revoke: second invitee cleanup failed: {error:?}"),
+        Err(error) => log::warn!(
+            "referral_revoke: second invitee cleanup failed for {}: {error:?}",
+            referral.id
+        ),
     }
 
     // Best-effort: the revocation has committed. The count is recomputed
@@ -286,6 +306,68 @@ mod test {
 
         let referrer = harness.db.fetch_user(&referrer.id).await.expect("referrer");
         assert_eq!(referrer.referral_count, Some(0));
+    }
+
+    #[test]
+    fn revoke_again_clears_a_late_welcome() {
+        crate::util::test::rt().block_on(revoke_again_clears_a_late_welcome_case())
+    }
+
+    async fn revoke_again_clears_a_late_welcome_case() {
+        let harness = TestHarness::new().await;
+        let (_, staff_session, mut staff) = harness.new_user().await;
+        let (_, _, referrer) = harness.new_user().await;
+        let (_, _, mut invitee) = harness.new_user().await;
+        promote(&harness, &mut staff).await;
+
+        assert!(Referral::create_for_invitee(
+            &harness.db,
+            &invitee.id,
+            &referrer.id,
+            ReferralSource::Code
+        )
+        .await
+        .expect("create referral"));
+
+        assert_eq!(
+            revoke(&harness, &staff_session.token, &invitee.id).await,
+            Status::NoContent
+        );
+        assert_eq!(
+            status_of(&harness, &invitee.id).await,
+            ReferralStatus::Revoked
+        );
+
+        // The sweep's welcome write lands after the revocation's cleanup
+        invitee
+            .update(
+                &harness.db,
+                PartialUser {
+                    welcomed_at: Some(now_ms()),
+                    ..Default::default()
+                },
+                vec![],
+            )
+            .await
+            .expect("late welcome");
+
+        assert_eq!(
+            revoke(&harness, &staff_session.token, &invitee.id).await,
+            Status::NoContent
+        );
+        let fetched = harness.db.fetch_user(&invitee.id).await.expect("invitee");
+        assert_eq!(fetched.welcomed_at, None);
+        assert_eq!(fetched.referral_pending, None);
+        assert_eq!(
+            status_of(&harness, &invitee.id).await,
+            ReferralStatus::Revoked
+        );
+
+        // Nothing left to clear
+        assert_eq!(
+            revoke(&harness, &staff_session.token, &invitee.id).await,
+            Status::BadRequest
+        );
     }
 
     #[test]
