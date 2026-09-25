@@ -212,6 +212,9 @@ impl AbstractChannels for ReferenceDb {
     async fn delete_channel(&self, channel: &Channel) -> Result<()> {
         let mut channels = self.channels.lock().await;
         if channels.remove(channel.id()).is_some() {
+            // Mirrors Mongo's unread purge; lock order is channels, then channel_unreads.
+            let mut unreads = self.channel_unreads.lock().await;
+            unreads.retain(|key, _| key.channel != channel.id());
             Ok(())
         } else {
             Err(create_error!(NotFound))

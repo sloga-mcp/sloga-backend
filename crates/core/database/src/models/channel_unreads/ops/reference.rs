@@ -14,7 +14,16 @@ impl AbstractChannelUnreads for ReferenceDb {
         user_id: &str,
         message_id: &str,
     ) -> Result<Option<ChannelUnread>> {
+        // Lock order is channels, then unreads (as in delete_channel). Both are
+        // held so a deleted channel can never get an unread row back.
+        let channels = self.channels.lock().await;
         let mut unreads = self.channel_unreads.lock().await;
+        if !channels.contains_key(channel_id) {
+            unreads.retain(|key, _| key.channel != channel_id);
+            warn!("Channel {channel_id} is gone; discarded its unread rows");
+            return Ok(None);
+        }
+
         let key = ChannelCompositeKey {
             channel: channel_id.to_string(),
             user: user_id.to_string(),
@@ -56,7 +65,15 @@ impl AbstractChannelUnreads for ReferenceDb {
         user_id: &str,
         message_ids: &[String],
     ) -> Result<()> {
+        // Same lock order and deleted-channel check as acknowledge_message.
+        let channels = self.channels.lock().await;
         let mut unreads = self.channel_unreads.lock().await;
+        if !channels.contains_key(channel_id) {
+            unreads.retain(|key, _| key.channel != channel_id);
+            warn!("Channel {channel_id} is gone; discarded its unread rows");
+            return Ok(());
+        }
+
         let key = ChannelCompositeKey {
             channel: channel_id.to_string(),
             user: user_id.to_string(),
@@ -85,7 +102,14 @@ impl AbstractChannelUnreads for ReferenceDb {
         user_ids: &[String],
         message_ids: &[String],
     ) -> Result<()> {
+        // Same lock order and deleted-channel check as acknowledge_message.
+        let channels = self.channels.lock().await;
         let mut unreads = self.channel_unreads.lock().await;
+        if !channels.contains_key(channel_id) {
+            unreads.retain(|key, _| key.channel != channel_id);
+            warn!("Channel {channel_id} is gone; discarded its unread rows");
+            return Ok(());
+        }
 
         for user_id in user_ids {
             let key = ChannelCompositeKey {
