@@ -495,6 +495,7 @@ mod tests {
     /// because the channel fetch fails.
     #[tokio::test]
     #[ignore = "needs a local RabbitMQ at the Revolt.test.toml address (AMQP::new_auto) and TEST_DB=REFERENCE"]
+    #[allow(clippy::disallowed_methods)]
     async fn ack_worker_survives_a_mass_mention_to_a_deleted_channel() {
         assert_eq!(std::env::var("TEST_DB").as_deref(), Ok("REFERENCE"));
 
@@ -505,6 +506,11 @@ mod tests {
         let x = new_id();
         let x_channel = text_channel(&x, &new_id());
         let y = new_id();
+        // Channel Y is inserted, because the unread writers drop writes for
+        // a channel that does not exist and Y's witness must land.
+        db.insert_channel(&thread(&y, &new_id(), &new_id()))
+            .await
+            .unwrap();
         let user = new_id();
 
         let m0 = Message {
