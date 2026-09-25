@@ -1053,7 +1053,7 @@ impl User {
     /// Bitfield of perks the user holds at `now_ms`
     ///
     /// The OR of the referral tiers, the donation tiers and the welcome
-    /// trial's name colour. A deleted account holds none.
+    /// trial's name color. A deleted account holds none.
     pub fn perks(&self, now_ms: i64) -> u32 {
         if self.is_deleted() {
             return 0;

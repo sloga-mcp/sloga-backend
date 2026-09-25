@@ -72,7 +72,7 @@ pub async fn assign_donation(
 /// # Revoke Donation
 ///
 /// Mark a Ko-fi donation as refunded or charged back, so it no longer counts
-/// towards anyone's supporter totals. Requires a privileged account.
+/// toward anyone's supporter totals. Requires a privileged account.
 #[openapi(tag = "Ko-fi")]
 #[post("/donations/<txn>/revoke")]
 pub async fn revoke_donation(
@@ -280,7 +280,7 @@ fn is_subscription_kind(kind: &str) -> bool {
 /// Convert an export timestamp to the RFC 3339 form `Donation::ingest`
 /// parses. Times without an offset are UTC. Day/month orders other than
 /// year-first are rejected rather than guessed.
-fn normalise_timestamp(value: &str) -> Option<String> {
+fn normalize_timestamp(value: &str) -> Option<String> {
     let value = value.trim();
     let at = if let Ok(at) = DateTime::parse_from_rfc3339(value) {
         at.with_timezone(&Utc)
@@ -312,7 +312,7 @@ fn row_payload(
     row: &[String],
     txn: &str,
 ) -> std::result::Result<KofiPayload, String> {
-    let timestamp = normalise_timestamp(cell(row, columns.time)).ok_or("unrecognized timestamp")?;
+    let timestamp = normalize_timestamp(cell(row, columns.time)).ok_or("unrecognized timestamp")?;
 
     let amount = cell(row, columns.amount);
     if parse_amount_cents(amount).is_none() {
@@ -546,39 +546,39 @@ mod tests {
     }
 
     #[test]
-    fn timestamps_normalise_to_rfc3339() {
+    fn timestamps_normalize_to_rfc3339() {
         assert_eq!(
-            normalise_timestamp("2026-09-01T12:00:00Z").as_deref(),
+            normalize_timestamp("2026-09-01T12:00:00Z").as_deref(),
             Some("2026-09-01T12:00:00.000Z")
         );
         assert_eq!(
-            normalise_timestamp("2026-09-01T14:00:00+02:00").as_deref(),
+            normalize_timestamp("2026-09-01T14:00:00+02:00").as_deref(),
             Some("2026-09-01T12:00:00.000Z")
         );
         assert_eq!(
-            normalise_timestamp(" 2024-01-15 14:32:05 ").as_deref(),
+            normalize_timestamp(" 2024-01-15 14:32:05 ").as_deref(),
             Some("2024-01-15T14:32:05.000Z")
         );
         assert_eq!(
-            normalise_timestamp("2024-01-15 14:32:05.250").as_deref(),
+            normalize_timestamp("2024-01-15 14:32:05.250").as_deref(),
             Some("2024-01-15T14:32:05.250Z")
         );
         assert_eq!(
-            normalise_timestamp("2024-01-15T14:32:05").as_deref(),
+            normalize_timestamp("2024-01-15T14:32:05").as_deref(),
             Some("2024-01-15T14:32:05.000Z")
         );
         assert_eq!(
-            normalise_timestamp("2024-01-15 14:32").as_deref(),
+            normalize_timestamp("2024-01-15 14:32").as_deref(),
             Some("2024-01-15T14:32:00.000Z")
         );
         assert_eq!(
-            normalise_timestamp("2024-01-15").as_deref(),
+            normalize_timestamp("2024-01-15").as_deref(),
             Some("2024-01-15T00:00:00.000Z")
         );
-        assert_eq!(normalise_timestamp("01/15/2024 14:32"), None);
-        assert_eq!(normalise_timestamp("15/01/2024"), None);
-        assert_eq!(normalise_timestamp("yesterday"), None);
-        assert_eq!(normalise_timestamp(""), None);
+        assert_eq!(normalize_timestamp("01/15/2024 14:32"), None);
+        assert_eq!(normalize_timestamp("15/01/2024"), None);
+        assert_eq!(normalize_timestamp("yesterday"), None);
+        assert_eq!(normalize_timestamp(""), None);
     }
 
     #[test]

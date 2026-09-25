@@ -163,7 +163,7 @@ pub async fn run_once(db: &Database, now_ms: i64, window_from_ms: i64) -> Result
     }
 
     // 4. Welcome trials that ended since the previous run lose their
-    //    colour without any write, so announce the computed values
+    //    color without any write, so announce the computed values
     let trial_ms = WELCOME_TRIAL_DAYS * DAY_MS;
     for user in db
         .fetch_users_welcomed_between(window_from_ms - trial_ms, now_ms - trial_ms)
@@ -425,7 +425,7 @@ mod tests {
         }
     }
 
-    // `insert_user` is disallowed in favour of `User::create`, which pulls
+    // `insert_user` is disallowed in favor of `User::create`, which pulls
     // in username allocation these tests have no use for
     #[allow(clippy::disallowed_methods)]
     async fn insert_user(db: &Database, user: User) {

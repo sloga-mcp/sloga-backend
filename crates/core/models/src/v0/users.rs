@@ -481,7 +481,19 @@ auto_derived!(
         pub profile: Option<DataUserProfile>,
         /// New name style
         ///
-        /// Each part requires the matching perk.
+        /// Merged with the stored style part by part (color, font, effect):
+        ///
+        /// - A part the user holds the perk for is taken from the request, so
+        ///   leaving it out clears it.
+        /// - A part the user does not hold the perk for (never held, or
+        ///   lapsed) keeps its stored value and can't be changed: leaving it
+        ///   out or resending the stored value is accepted, anything else
+        ///   fails with `PerkRequired`.
+        /// - `{}` therefore clears only the parts the user holds the perk for.
+        /// - A style left with no parts is removed.
+        /// - `remove: ["NameStyle"]` clears everything, locked parts included.
+        ///   Sent together with `name_style`, only the parts the user holds
+        ///   the perk for are set from the request.
         #[cfg_attr(feature = "validator", validate)]
         #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
         pub name_style: Option<NameStyle>,

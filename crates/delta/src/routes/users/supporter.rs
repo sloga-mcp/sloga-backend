@@ -61,7 +61,8 @@ pub async fn fetch_supporter(
 ///
 /// Get a code to include in a Ko-fi donation message so the donation is
 /// linked to your account. An unexpired code is returned again rather
-/// than replaced.
+/// than replaced. Returns NotFound when Ko-fi donations are not set up on
+/// this server.
 #[openapi(tag = "User Information")]
 #[post("/@me/supporter/code")]
 pub async fn create_supporter_code(
@@ -70,6 +71,15 @@ pub async fn create_supporter_code(
 ) -> Result<Json<v0::SupporterClaimCode>> {
     if user.bot.is_some() {
         return Err(create_error!(IsBot));
+    }
+
+    // Only the webhook ever redeems a code, and it refuses every call unless
+    // both secrets are set. Without them no code could link a donation, so
+    // none is handed out and the answer matches the claim route's.
+    let config = config().await;
+    let kofi = &config.api.kofi;
+    if kofi.verification_token.is_empty() || kofi.email_hmac_key.is_empty() {
+        return Err(create_error!(NotFound));
     }
 
     let now = now_ms();
@@ -180,4 +190,65 @@ pub async fn edit_supporter(
         .await;
 
     Ok(Json(supporter_summary(&user).await))
+}
+
+#[cfg(test)]
+mod test {
+    use crate::util::test::TestHarness;
+    use rocket::http::{ContentType, Status};
+    use serde_json::json;
+
+    #[test]
+    fn supporter_code_not_found_when_kofi_unconfigured() {
+        crate::util::test::rt().block_on(supporter_code_not_found_when_kofi_unconfigured_case())
+    }
+
+    async fn supporter_code_not_found_when_kofi_unconfigured_case() {
+        let harness = TestHarness::new().await;
+
+        // The test config leaves both Ko-fi secrets empty. With either one
+        // set, this test would not reach the not-configured path.
+        let kofi = revolt_config::config().await.api.kofi;
+        assert!(
+            kofi.verification_token.is_empty() && kofi.email_hmac_key.is_empty(),
+            "Ko-fi secrets are configured for this test run"
+        );
+
+        let (_, session, user) = harness.new_user().await;
+
+        // Claim route: the existing not-configured answer
+        let response = TestHarness::with_session(
+            session.clone(),
+            harness
+                .client
+                .post("/users/@me/supporter/claim")
+                .header(ContentType::JSON)
+                .body(json!({ "transaction_id": "txn-unconfigured" }).to_string()),
+        )
+        .await;
+        assert_eq!(response.status(), Status::NotFound);
+        let error = response
+            .into_json::<serde_json::Value>()
+            .await
+            .expect("claim error body");
+        assert_eq!(error["type"], "NotFound");
+
+        // Code route: the same answer, and no code is stored
+        let response =
+            TestHarness::with_session(session, harness.client.post("/users/@me/supporter/code"))
+                .await;
+        assert_eq!(response.status(), Status::NotFound);
+        let error = response
+            .into_json::<serde_json::Value>()
+            .await
+            .expect("code error body");
+        assert_eq!(error["type"], "NotFound");
+
+        let stored = harness
+            .db
+            .fetch_claim_code_by_user(&user.id)
+            .await
+            .expect("fetch claim code");
+        assert!(stored.is_none(), "no claim code may be handed out");
+    }
 }

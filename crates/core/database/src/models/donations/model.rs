@@ -127,7 +127,7 @@ static RE_CLAIM_CODE: Lazy<Regex> = Lazy::new(|| {
         .expect("claim code pattern is valid")
 });
 
-/// Hex HMAC-SHA256 of the normalised payer email, keyed with the server
+/// Hex HMAC-SHA256 of the normalized payer email, keyed with the server
 /// secret so the stored value cannot be reversed with a dictionary.
 pub fn payer_hmac(key: &str, email: &str) -> String {
     let mut mac =
@@ -739,7 +739,7 @@ mod tests {
     }
 
     #[test]
-    fn payer_hmac_is_normalised_and_keyed() {
+    fn payer_hmac_is_normalized_and_keyed() {
         let hmac = payer_hmac(KEY, "payer@example.com");
         assert_eq!(hmac.len(), 64);
         assert!(hmac

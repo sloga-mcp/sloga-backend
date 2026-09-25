@@ -455,7 +455,7 @@ mod tests {
         let harness = TestHarness::new().await;
         let (_, session, mut user) = harness.new_user().await;
 
-        // Even with the perk, anything that is not a plain colour (here a
+        // Even with the perk, anything that is not a plain color (here a
         // remote fetch every viewer's client would make) is refused.
         user.update(
             &harness.db,
@@ -490,7 +490,7 @@ mod tests {
         let harness = TestHarness::new().await;
         let (_, session, mut user) = harness.new_user().await;
 
-        // The welcome trial unlocks the name colour and nothing else.
+        // The welcome trial unlocks the name color and nothing else.
         user.update(
             &harness.db,
             PartialUser {
@@ -552,7 +552,7 @@ mod tests {
         let harness = TestHarness::new().await;
         let (_, session, mut user) = harness.new_user().await;
 
-        // The welcome trial covers the colour but not the font.
+        // The welcome trial covers the color but not the font.
         user.update(
             &harness.db,
             PartialUser {

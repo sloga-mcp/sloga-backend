@@ -21,7 +21,7 @@ pub const TIER_UPLOAD: u32 = 50;
 /// Qualified referrals needed for a staff-designed custom badge
 pub const TIER_CUSTOM_BADGE: u32 = 100;
 
-/// Lifetime USD cents for the Supporter badge ($10 = Ko-fi minimum)
+/// Lifetime USD cents for the Supporter badge ($10)
 pub const DONATION_SUPPORTER_CENTS: i64 = 1000;
 /// Lifetime USD cents for a custom name color
 pub const DONATION_NAME_COLOUR_CENTS: i64 = 2500;
@@ -224,7 +224,7 @@ mod tests {
         assert_eq!(perks_for_donations(5000, false), COLOUR | FONT);
         assert_eq!(perks_for_donations(9999, false), COLOUR | FONT);
         assert_eq!(perks_for_donations(10000, false), COLOUR | FONT | EFFECT);
-        // Monthly supporters get the colour regardless of lifetime
+        // Monthly supporters get the color regardless of lifetime
         assert_eq!(perks_for_donations(0, true), COLOUR);
         // Donations never grant the upload perk or the custom badge
         assert_eq!(perks_for_donations(i64::MAX, true) & (UPLOAD | CUSTOM), 0);
