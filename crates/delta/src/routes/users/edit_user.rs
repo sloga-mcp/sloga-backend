@@ -100,28 +100,49 @@ pub async fn edit(
     data.remove
         .retain(|field| field != &v0::FieldsUser::CustomBadge);
 
-    // Each part of a name style needs its own perk; a style with no parts
-    // clears it instead
+    // Each part of a name style needs its own perk. The request decides the
+    // parts the user holds the perk for; a locked part keeps its stored value
+    // so it comes back if the perk returns. A style left with no parts is
+    // cleared instead.
     if let Some(style) = data.name_style.take() {
-        if style.colour.is_none() && style.font.is_none() && style.effect.is_none() {
+        let perks = user.perks(now_ms());
+        let held = |perk: UserPerks| perks & perk as u32 != 0;
+
+        // Clearing the style in the same request leaves nothing to keep
+        let stored = if data.remove.contains(&v0::FieldsUser::NameStyle) {
+            None
+        } else {
+            user.name_style.clone()
+        };
+        let (stored_colour, stored_font, stored_effect) = match stored {
+            Some(stored) => (stored.colour, stored.font, stored.effect),
+            None => (None, None, None),
+        };
+
+        let merged = v0::NameStyle {
+            colour: merge_name_style_part(
+                held(UserPerks::NameColour),
+                style.colour,
+                stored_colour,
+            )?,
+            font: merge_name_style_part(held(UserPerks::NameFont), style.font, stored_font)?,
+            effect: merge_name_style_part(
+                held(UserPerks::NameEffect),
+                style.effect,
+                stored_effect,
+            )?,
+        };
+
+        if merged.colour.is_none() && merged.font.is_none() && merged.effect.is_none() {
             if !data.remove.contains(&v0::FieldsUser::NameStyle) {
                 data.remove.push(v0::FieldsUser::NameStyle);
             }
         } else {
-            let perks = user.perks(now_ms());
-            let missing = |perk: UserPerks| perks & perk as u32 == 0;
-            if (style.colour.is_some() && missing(UserPerks::NameColour))
-                || (style.font.is_some() && missing(UserPerks::NameFont))
-                || (style.effect.is_some() && missing(UserPerks::NameEffect))
-            {
-                return Err(create_error!(PerkRequired));
-            }
-
-            // The new style replaces the old one whole, and clearing the
-            // same field in one write conflicts on Mongo
+            // The merged style replaces the stored one whole, and clearing
+            // the same field in one write conflicts on Mongo
             data.remove
                 .retain(|field| field != &v0::FieldsUser::NameStyle);
-            data.name_style = Some(style);
+            data.name_style = Some(merged);
         }
     }
 
@@ -248,10 +269,30 @@ pub async fn edit(
     Ok(Json(user.into_self(false).await))
 }
 
+/// One part of a requested name style merged with the stored one
+///
+/// With the perk the request wins, including clearing the part. Without it
+/// the stored value stays, and a request to change it is refused.
+fn merge_name_style_part<T: PartialEq>(
+    held: bool,
+    requested: Option<T>,
+    stored: Option<T>,
+) -> Result<Option<T>> {
+    if held {
+        Ok(requested)
+    } else if requested.is_none() || requested == stored {
+        Ok(stored)
+    } else {
+        Err(create_error!(PerkRequired))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::util::test::TestHarness;
-    use revolt_database::{now_ms, CustomBadge, File, Metadata, PartialUser};
+    use revolt_database::{
+        now_ms, CustomBadge, File, Metadata, PartialUser, User, DAY_MS, WELCOME_TRIAL_DAYS,
+    };
     use revolt_models::v0;
     use rocket::http::{ContentType, Status};
 
@@ -536,6 +577,265 @@ mod tests {
         .await;
 
         assert_eq!(response.status(), Status::Forbidden);
+    }
+
+    fn style(colour: Option<&str>, font: Option<v0::NameFont>) -> Option<v0::NameStyle> {
+        Some(v0::NameStyle {
+            colour: colour.map(str::to_string),
+            font,
+            effect: None,
+        })
+    }
+
+    /// Give `user` the welcome trial's name color and a stored font whose
+    /// perk they no longer hold
+    async fn lock_stored_font(harness: &TestHarness, user: &mut User) {
+        user.update(
+            &harness.db,
+            PartialUser {
+                welcomed_at: Some(now_ms()),
+                name_style: style(None, Some(v0::NameFont::Serif)),
+                ..Default::default()
+            },
+            vec![],
+        )
+        .await
+        .expect("styled user");
+    }
+
+    async fn stored_name_style(harness: &TestHarness, user: &User) -> Option<v0::NameStyle> {
+        harness
+            .db
+            .fetch_user(&user.id)
+            .await
+            .expect("`User`")
+            .name_style
+    }
+
+    #[test]
+    fn name_style_save_keeps_locked_part() {
+        crate::util::test::rt().block_on(name_style_save_keeps_locked_part_case())
+    }
+
+    async fn name_style_save_keeps_locked_part_case() {
+        let harness = TestHarness::new().await;
+        let (_, session, mut user) = harness.new_user().await;
+        lock_stored_font(&harness, &mut user).await;
+
+        // Setting the color leaves the locked font in place, hidden from
+        // everyone until the perk returns
+        let response = TestHarness::with_session(
+            session.clone(),
+            harness
+                .client
+                .patch("/users/@me")
+                .header(ContentType::JSON)
+                .body(json!({ "name_style": { "colour": "#00ff00" } }).to_string()),
+        )
+        .await;
+
+        assert_eq!(response.status(), Status::Ok);
+        let edited = response.into_json::<v0::User>().await.expect("`User`");
+        assert_eq!(edited.name_style, style(Some("#00ff00"), None));
+        assert_eq!(
+            stored_name_style(&harness, &user).await,
+            style(Some("#00ff00"), Some(v0::NameFont::Serif))
+        );
+
+        // An empty style resets only what the user can still change
+        let response = TestHarness::with_session(
+            session,
+            harness
+                .client
+                .patch("/users/@me")
+                .header(ContentType::JSON)
+                .body(json!({ "name_style": {} }).to_string()),
+        )
+        .await;
+
+        assert_eq!(response.status(), Status::Ok);
+        let cleared = response.into_json::<v0::User>().await.expect("`User`");
+        assert_eq!(cleared.name_style, None);
+        assert_eq!(
+            stored_name_style(&harness, &user).await,
+            style(None, Some(v0::NameFont::Serif))
+        );
+    }
+
+    #[test]
+    fn name_style_locked_part_cannot_change() {
+        crate::util::test::rt().block_on(name_style_locked_part_cannot_change_case())
+    }
+
+    async fn name_style_locked_part_cannot_change_case() {
+        let harness = TestHarness::new().await;
+        let (_, session, mut user) = harness.new_user().await;
+        lock_stored_font(&harness, &mut user).await;
+
+        let response = TestHarness::with_session(
+            session.clone(),
+            harness
+                .client
+                .patch("/users/@me")
+                .header(ContentType::JSON)
+                .body(json!({ "name_style": { "colour": "#00ff00", "font": "Mono" } }).to_string()),
+        )
+        .await;
+
+        assert_eq!(response.status(), Status::Forbidden);
+        assert_eq!(
+            stored_name_style(&harness, &user).await,
+            style(None, Some(v0::NameFont::Serif))
+        );
+
+        // Sending the locked font back unchanged is fine
+        let response = TestHarness::with_session(
+            session,
+            harness
+                .client
+                .patch("/users/@me")
+                .header(ContentType::JSON)
+                .body(
+                    json!({ "name_style": { "colour": "#00ff00", "font": "Serif" } }).to_string(),
+                ),
+        )
+        .await;
+
+        assert_eq!(response.status(), Status::Ok);
+        assert_eq!(
+            stored_name_style(&harness, &user).await,
+            style(Some("#00ff00"), Some(v0::NameFont::Serif))
+        );
+    }
+
+    #[test]
+    fn remove_name_style_clears_locked_part() {
+        crate::util::test::rt().block_on(remove_name_style_clears_locked_part_case())
+    }
+
+    async fn remove_name_style_clears_locked_part_case() {
+        let harness = TestHarness::new().await;
+        let (_, session, mut user) = harness.new_user().await;
+        lock_stored_font(&harness, &mut user).await;
+
+        let response = TestHarness::with_session(
+            session.clone(),
+            harness
+                .client
+                .patch("/users/@me")
+                .header(ContentType::JSON)
+                .body(json!({ "name_style": { "colour": "#00ff00" } }).to_string()),
+        )
+        .await;
+
+        assert_eq!(response.status(), Status::Ok);
+        assert_eq!(
+            stored_name_style(&harness, &user).await,
+            style(Some("#00ff00"), Some(v0::NameFont::Serif))
+        );
+
+        // Removing the field outright still takes every part with it
+        let response = TestHarness::with_session(
+            session,
+            harness
+                .client
+                .patch("/users/@me")
+                .header(ContentType::JSON)
+                .body(json!({ "remove": ["NameStyle"] }).to_string()),
+        )
+        .await;
+
+        assert_eq!(response.status(), Status::Ok);
+        let cleared = response.into_json::<v0::User>().await.expect("`User`");
+        assert_eq!(cleared.name_style, None);
+        assert_eq!(stored_name_style(&harness, &user).await, None);
+    }
+
+    /// Store a color on `user` whose welcome trial has run out
+    async fn lapse_stored_colour(harness: &TestHarness, user: &mut User) {
+        user.update(
+            &harness.db,
+            PartialUser {
+                welcomed_at: Some(now_ms() - WELCOME_TRIAL_DAYS * DAY_MS - 1),
+                name_style: style(Some("#ff0000"), None),
+                ..Default::default()
+            },
+            vec![],
+        )
+        .await
+        .expect("lapsed user");
+    }
+
+    #[test]
+    fn name_style_keeps_lapsed_colour() {
+        crate::util::test::rt().block_on(name_style_keeps_lapsed_colour_case())
+    }
+
+    async fn name_style_keeps_lapsed_colour_case() {
+        let harness = TestHarness::new().await;
+        let (_, session, mut user) = harness.new_user().await;
+        lapse_stored_colour(&harness, &mut user).await;
+
+        // Resetting with no perks left touches nothing
+        let response = TestHarness::with_session(
+            session.clone(),
+            harness
+                .client
+                .patch("/users/@me")
+                .header(ContentType::JSON)
+                .body(json!({ "name_style": {} }).to_string()),
+        )
+        .await;
+
+        assert_eq!(response.status(), Status::Ok);
+        assert_eq!(
+            stored_name_style(&harness, &user).await,
+            style(Some("#ff0000"), None)
+        );
+
+        // Sending the locked color back unchanged is fine
+        let response = TestHarness::with_session(
+            session,
+            harness
+                .client
+                .patch("/users/@me")
+                .header(ContentType::JSON)
+                .body(json!({ "name_style": { "colour": "#ff0000" } }).to_string()),
+        )
+        .await;
+
+        assert_eq!(response.status(), Status::Ok);
+        assert_eq!(
+            stored_name_style(&harness, &user).await,
+            style(Some("#ff0000"), None)
+        );
+    }
+
+    #[test]
+    fn name_style_lapsed_colour_cannot_change() {
+        crate::util::test::rt().block_on(name_style_lapsed_colour_cannot_change_case())
+    }
+
+    async fn name_style_lapsed_colour_cannot_change_case() {
+        let harness = TestHarness::new().await;
+        let (_, session, mut user) = harness.new_user().await;
+        lapse_stored_colour(&harness, &mut user).await;
+
+        let response = TestHarness::with_session(
+            session,
+            harness
+                .client
+                .patch("/users/@me")
+                .header(ContentType::JSON)
+                .body(json!({ "name_style": { "colour": "#00ff00" } }).to_string()),
+        )
+        .await;
+
+        assert_eq!(response.status(), Status::Forbidden);
+        assert_eq!(
+            stored_name_style(&harness, &user).await,
+            style(Some("#ff0000"), None)
+        );
     }
 
     #[test]
