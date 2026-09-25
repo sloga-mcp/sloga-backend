@@ -470,7 +470,9 @@ impl Donation {
 
     /// Privileged: attribute a donation to a user, whatever its state. The
     /// payer HMAC moves to the new owner so renewals follow; a previous
-    /// owner is recomputed. `usd_cents`, when given, is stored as the row's
+    /// owner is recomputed. A row revoked while it had no owner has no payer
+    /// HMAC left to move, so that payer's renewals then need a claim code or
+    /// a transaction claim. `usd_cents`, when given, is stored as the row's
     /// USD value (how a non-USD payment counts); None keeps any value set
     /// by an earlier assign.
     pub async fn assign(
@@ -512,7 +514,9 @@ impl Donation {
     }
 
     /// Privileged: refund or chargeback. The row stays for the record; the
-    /// previous owner's totals are recomputed without it.
+    /// previous owner's totals are recomputed without it. A row with no
+    /// owner loses its payer HMAC here, since the retention sweep only
+    /// clears unmatched rows and would never reach a revoked one.
     pub async fn revoke(db: &Database, transaction_id: &str) -> Result<()> {
         let mut donation = db
             .fetch_donation(transaction_id)
@@ -520,6 +524,9 @@ impl Donation {
             .ok_or_else(|| create_error!(NotFound))?;
 
         donation.state = DonationState::Revoked;
+        if donation.user.is_none() {
+            donation.payer_hmac = None;
+        }
         db.update_donation(&donation).await?;
 
         if let Some(user_id) = &donation.user {
@@ -1429,5 +1436,72 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(error.error_type, ErrorType::NotFound));
+    }
+
+    #[tokio::test]
+    async fn revoke_drops_the_payer_hmac_only_from_unowned_rows() {
+        let db = reference_db();
+        insert_user(&db, "user_a").await;
+        issue_code(&db, "KOFI-7QM2XR", "user_a", now_ms()).await;
+
+        let unclaimed = Donation::ingest(
+            &db,
+            &payload("msg_1", "tx_1", "10.00", "USD", Some("b@example.com"), None),
+            KEY,
+        )
+        .await
+        .unwrap();
+        assert_eq!(unclaimed.state, DonationState::Unclaimed);
+        assert!(unclaimed.payer_hmac.is_some());
+
+        let review = Donation::ingest(
+            &db,
+            &payload("msg_2", "tx_2", "10.00", "EUR", Some("c@example.com"), None),
+            KEY,
+        )
+        .await
+        .unwrap();
+        assert_eq!(review.state, DonationState::NeedsReview);
+        assert!(review.payer_hmac.is_some());
+
+        let claimed = Donation::ingest(
+            &db,
+            &payload(
+                "msg_3",
+                "tx_3",
+                "10.00",
+                "USD",
+                Some("a@example.com"),
+                Some("KOFI-7QM2XR"),
+            ),
+            KEY,
+        )
+        .await
+        .unwrap();
+        assert_eq!(claimed.state, DonationState::Claimed);
+
+        // Refunded before anyone matched them: nothing links the hash to an
+        // account, so it goes with the revoke
+        for transaction_id in ["tx_1", "tx_2"] {
+            Donation::revoke(&db, transaction_id).await.unwrap();
+            let row = db.fetch_donation(transaction_id).await.unwrap().unwrap();
+            assert_eq!(row.state, DonationState::Revoked);
+            assert_eq!(row.user, None);
+            assert_eq!(row.payer_hmac, None);
+        }
+
+        // An owned row keeps its hash, and so does the owner's record, so
+        // their later payments still find them
+        Donation::revoke(&db, "tx_3").await.unwrap();
+        let row = db.fetch_donation("tx_3").await.unwrap().unwrap();
+        assert_eq!(row.state, DonationState::Revoked);
+        assert_eq!(row.user.as_deref(), Some("user_a"));
+        assert_eq!(row.payer_hmac, Some(payer_hmac(KEY, "a@example.com")));
+        let supporter = db.fetch_user("user_a").await.unwrap().supporter.unwrap();
+        assert_eq!(supporter.lifetime_usd_cents, 0);
+        assert_eq!(
+            supporter.payer_hmacs,
+            vec![payer_hmac(KEY, "a@example.com")]
+        );
     }
 }
