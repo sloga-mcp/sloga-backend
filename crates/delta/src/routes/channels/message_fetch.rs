@@ -1,6 +1,6 @@
 use revolt_database::{
     util::{permissions::DatabasePermissionQuery, reference::Reference},
-    Database, User,
+    Channel, Database, User,
 };
 use revolt_models::v0;
 use revolt_permissions::{calculate_channel_permissions, ChannelPermission};
@@ -22,9 +22,18 @@ pub async fn fetch(
     // Threads inherit their parent channel's permission overrides.
     let permission_channel = channel.permission_target(db).await?.into_owned();
     let mut query = DatabasePermissionQuery::new(db, &user).channel(&permission_channel);
-    calculate_channel_permissions(&mut query)
-        .await
-        .throw_if_lacking_channel_permission(ChannelPermission::ViewChannel)?;
+    let permissions = calculate_channel_permissions(&mut query).await;
+    permissions.throw_if_lacking_channel_permission(ChannelPermission::ViewChannel)?;
+
+    // Thread and forum-post listings hand out every thread's id (which is
+    // also its starter message's id) and its last_message_id to anyone with
+    // ViewChannel. Fetching those ids here would read history the member was
+    // denied, so threads need ReadMessageHistory, as message_query does. A
+    // plain channel keeps ViewChannel: ids there only come from messages the
+    // member already received live.
+    if matches!(channel, Channel::Thread { .. }) {
+        permissions.throw_if_lacking_channel_permission(ChannelPermission::ReadMessageHistory)?;
+    }
 
     let message = msg.as_message(db).await?;
     if message.channel != channel.id() {
