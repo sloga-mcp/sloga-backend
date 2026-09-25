@@ -4,7 +4,7 @@ use rocket::serde::json::Json;
 use rocket::State;
 use rocket_empty::EmptyResponse;
 use revolt_database::util::password::{hash_password, assert_safe};
-use revolt_database::{Database};
+use revolt_database::{Database, EmailVerification};
 use revolt_models::v0;
 use revolt_result::Result;
 
@@ -32,6 +32,14 @@ pub async fn password_reset(
     account.password = hash_password(data.password)?;
     account.password_reset = None;
     account.lockout = None;
+
+    // The token was mailed to `account.email`, so using it proves the same
+    // thing the verification link does. Without this an unverified account
+    // could reset its password and still be refused at login. A pending move
+    // to a new address is left alone: nothing here proves that address.
+    if let EmailVerification::Pending { .. } = account.verification {
+        account.verification = EmailVerification::Verified;
+    }
 
     // Commit to database
     account.save(db).await?;
