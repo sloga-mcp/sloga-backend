@@ -217,6 +217,34 @@ impl AbstractChannels for MongoDb {
         .map(|_| ())
     }
 
+    /// Set last_message_id only if newer; see the trait for semantics.
+    async fn set_last_message_id_if_newer(
+        &self,
+        channel_id: &str,
+        message_id: &str,
+        reopen_dm: bool,
+    ) -> Result<bool> {
+        let mut set = doc! { "last_message_id": message_id };
+        if reopen_dm {
+            set.insert("active", true);
+        }
+
+        self.col::<Document>(COL)
+            .update_one(
+                doc! {
+                    "_id": channel_id,
+                    "channel_type": { "$ne": "SavedMessages" },
+                    // `$not/$gte` matches a missing field, null, or a strictly
+                    // older id; a bare `$lt` would never set the first pointer.
+                    "last_message_id": { "$not": { "$gte": message_id } }
+                },
+                doc! { "$set": set },
+            )
+            .await
+            .map(|result| result.modified_count == 1)
+            .map_err(|_| create_database_error!("update_one", COL))
+    }
+
     // Remove a user from a group
     async fn remove_user_from_group(&self, channel: &str, user: &str) -> Result<()> {
         self.col::<Document>(COL)
