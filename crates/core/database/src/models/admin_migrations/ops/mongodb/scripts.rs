@@ -26,7 +26,7 @@ struct MigrationInfo {
     revision: i32,
 }
 
-pub const LATEST_REVISION: i32 = 70; // MUST BE +1 to last migration
+pub const LATEST_REVISION: i32 = 71; // MUST BE +1 to last migration
 
 pub async fn migrate_database(db: &MongoDb) {
     let migrations = db.col::<Document>("migrations");
@@ -2397,6 +2397,112 @@ pub async fn run_migrations(db: &MongoDb, revision: i32) -> i32 {
             .expect("Failed to create user_respect indexes.");
     }
 
+    if revision <= 70 {
+        info!("Running migration [revision 70 / 25-09-2026]: Add UseSoundboard to pre-soundboard servers' default permissions");
+
+        // UseSoundboard joined DEFAULT_PERMISSION with the soundboard itself
+        // (2026-07-14), but DEFAULT_PERMISSION is copied onto a server at
+        // creation, so servers made before that never got it and every
+        // member there hit 403 on the soundboard. Revision 61 only created
+        // the `sounds` collection.
+        //
+        // Unlike revision 68, this runs months after the bit existed, so a
+        // server created since then that lacks it had it taken away on
+        // purpose. Only servers created before 2026-07-15T00:00Z are touched:
+        // ULID ids sort by creation time, and 01KXHH5F00 is that instant's
+        // 10-character time prefix. `$bit or` only adds the bit and is a
+        // no-op on re-run.
+        db.col::<Document>("servers")
+            .update_many(
+                doc! { "_id": { "$lt": "01KXHH5F00" } },
+                doc! {
+                    "$bit": {
+                        "default_permissions": {
+                            "or": ChannelPermission::UseSoundboard as i64
+                        },
+                    }
+                },
+            )
+            .await
+            .expect("Failed to add UseSoundboard to default_permissions");
+    }
+
     // Reminder to update LATEST_REVISION when adding new migrations.
     LATEST_REVISION.max(revision)
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{
+        mongodb::bson::{doc, Document},
+        Database,
+    };
+    use revolt_permissions::ChannelPermission;
+
+    /// Revision 70 must add UseSoundboard to servers made before the
+    /// soundboard existed, and leave every later server exactly as it is:
+    /// one of those lacking the bit had it removed by its owner.
+    #[tokio::test]
+    async fn revision_70_backfills_soundboard_only_on_pre_soundboard_servers() {
+        // What `database_test!` does, by hand: the macro names the database
+        // after this file's path and line, which from this deep a path comes
+        // to 73 characters, past MongoDB's 63-character limit.
+        let db = crate::DatabaseInfo::Test("migration_rev70_soundboard".to_string())
+            .connect()
+            .await
+            .expect("Database connection failed.");
+        db.drop_database().await;
+        let guard = crate::test_teardown::TestDatabaseGuard::arm(&db).await;
+
+        {
+            #[allow(irrefutable_let_patterns)]
+            let Database::MongoDb(mongo) = db.clone()
+            else {
+                // The migration scripts are MongoDB-only.
+                db.drop_database().await;
+                guard.disarm();
+                return;
+            };
+
+            let bit = ChannelPermission::UseSoundboard as i64;
+            let servers = mongo.col::<Document>("servers");
+            servers
+                .insert_many(vec![
+                    // before the 2026-07-15 cutoff (01KXHH5F00), lacking it
+                    doc! { "_id": "01KX0000000000000000000000", "default_permissions": 1_i64 },
+                    // before the cutoff, already has it
+                    doc! { "_id": "01KX0000000000000000000001", "default_permissions": bit | 2 },
+                    // after the cutoff, lacking it on purpose
+                    doc! { "_id": "01KZ0000000000000000000000", "default_permissions": 1_i64 },
+                ])
+                .await
+                .expect("insert servers");
+
+            super::run_migrations(&mongo, 70).await;
+
+            let permissions = |id: &'static str| {
+                let servers = servers.clone();
+                async move {
+                    servers
+                        .find_one(doc! { "_id": id })
+                        .await
+                        .expect("find")
+                        .expect("server")
+                        .get_i64("default_permissions")
+                        .expect("i64")
+                }
+            };
+
+            assert_eq!(permissions("01KX0000000000000000000000").await, 1 | bit);
+            assert_eq!(permissions("01KX0000000000000000000001").await, bit | 2);
+            assert_eq!(
+                permissions("01KZ0000000000000000000000").await,
+                1,
+                "a server created after the soundboard shipped must be left alone"
+            );
+        }
+
+        db.drop_database().await;
+        guard.disarm();
+    }
 }
