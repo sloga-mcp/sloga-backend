@@ -7619,6 +7619,7 @@ dependencies = [
  "schemars",
  "serde",
  "serde_json",
+ "url",
  "utoipa",
  "validator",
 ]

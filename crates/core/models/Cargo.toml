@@ -29,6 +29,7 @@ regex = { workspace = true }
 indexmap = { workspace = true }
 once_cell = { workspace = true }
 num_enum = { workspace = true }
+url = { workspace = true }
 
 # Rocket
 rocket = { workspace = true, optional = true }
