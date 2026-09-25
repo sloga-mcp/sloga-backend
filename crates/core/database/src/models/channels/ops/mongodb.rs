@@ -330,7 +330,29 @@ impl AbstractChannels for MongoDb {
         .await?;
 
         // Delete the channel itself
-        query!(self, delete_one_by_id, COL, channel.id()).map(|_| ())
+        query!(self, delete_one_by_id, COL, channel.id())?;
+
+        // Purge unreads a second time, now that the channel is gone.
+        // A writer that raced the first purge checks the channel still
+        // exists after its write: if it saw the channel, its row was
+        // written before this purge and is removed here; if it did not,
+        // the writer removes its own row.
+        //
+        // The channel is already deleted and the caller publishes
+        // ChannelDelete next, so a failure here is logged, not returned.
+        if let Err(err) = self
+            .col::<Document>("channel_unreads")
+            .delete_many(doc! {
+                "_id.channel": &id
+            })
+            .await
+            .map_err(|_| create_database_error!("delete_many", "channel_unreads"))
+        {
+            error!("Failed to purge unreads for deleted channel {id}: {err:?}");
+            revolt_config::capture_error(&err);
+        }
+
+        Ok(())
     }
 }
 
