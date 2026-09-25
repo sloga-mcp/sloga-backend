@@ -1188,6 +1188,12 @@ impl Message {
         channel: String,
         append: AppendMessage,
     ) -> Result<()> {
+        // Nothing to add, and nothing for clients to hear about.
+        if append.embeds.as_ref().is_none_or(|v| v.is_empty()) {
+            return Ok(());
+        }
+
+        // NotFound if the message was deleted meanwhile, so no event goes out for it.
         db.append_message(&id, &append).await?;
 
         EventV1::MessageAppend {
