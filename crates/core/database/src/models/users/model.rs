@@ -13,7 +13,7 @@ use once_cell::sync::Lazy;
 use rand::seq::SliceRandom;
 use regex::{Regex, RegexBuilder};
 use revolt_config::{config, FeaturesLimits};
-use revolt_models::v0::{self, UserBadges, UserFlags};
+use revolt_models::v0::{self, UserBadges, UserFlags, UserPerks, USER_BADGES_DYNAMIC_MASK};
 use revolt_presence::filter_online;
 use revolt_result::{create_error, Result};
 use serde_json::json;
@@ -78,6 +78,27 @@ auto_derived_partial!(
         #[serde(skip_serializing_if = "Option::is_none")]
         pub connections: Option<Vec<UserConnection>>,
 
+        /// Chosen name styling; only the parts the user's current perks
+        /// allow are ever sent to clients
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub name_style: Option<v0::NameStyle>,
+        /// Custom profile badge, set by privileged routes only
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub custom_badge: Option<CustomBadge>,
+
+        /// Number of qualified referrals (recomputed, never incremented)
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub referral_count: Option<i32>,
+        /// Whether this user is a pending invitee whose activity is tracked
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub referral_pending: Option<bool>,
+        /// Epoch ms the user joined through a referral
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub welcomed_at: Option<i64>,
+        /// Donation state (private, never on the v0 user)
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub supporter: Option<Supporter>,
+
         /// Time until user is unsuspended
         #[serde(skip_serializing_if = "Option::is_none")]
         pub suspended_until: Option<Timestamp>,
@@ -100,9 +121,15 @@ auto_derived!(
         DisplayName,
         Pronouns,
         Connections,
+        NameStyle,
+        CustomBadge,
 
         // internal fields
         Suspension,
+        Supporter,
+        ReferralPending,
+        WelcomedAt,
+        ReferralCount,
         None,
     }
 
@@ -125,6 +152,30 @@ auto_derived!(
         pub live_title: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         pub live_since: Option<Timestamp>,
+    }
+
+    /// Donation state of a user
+    pub struct Supporter {
+        /// Sum of claimed USD donations, in cents
+        #[serde(default)]
+        pub lifetime_usd_cents: i64,
+        /// Epoch ms until which the monthly subscription counts as active
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub monthly_until: Option<i64>,
+        /// Keyed HMACs of the payer emails used to auto-attach renewals
+        #[serde(skip_serializing_if = "Vec::is_empty", default)]
+        pub payer_hmacs: Vec<String>,
+        /// Whether supporter badges are shown (on unless opted out)
+        #[serde(default = "show_badges_default")]
+        pub show_badges: bool,
+    }
+
+    /// Custom profile badge
+    pub struct CustomBadge {
+        /// Badge image
+        pub image: File,
+        /// Badge label
+        pub label: String,
     }
 
     /// User's relationship with another user (or themselves)
@@ -278,6 +329,11 @@ static BLOCKED_USERNAME_PATTERNS: Lazy<Regex> = Lazy::new(|| {
         .unwrap()
 });
 
+/// Supporter badges are shown unless the user opted out
+fn show_badges_default() -> bool {
+    true
+}
+
 #[allow(clippy::derivable_impls)]
 impl Default for User {
     fn default() -> Self {
@@ -298,6 +354,12 @@ impl Default for User {
             bot: Default::default(),
             e2ee_enabled: Default::default(),
             connections: Default::default(),
+            name_style: Default::default(),
+            custom_badge: Default::default(),
+            referral_count: Default::default(),
+            referral_pending: Default::default(),
+            welcomed_at: Default::default(),
+            supporter: Default::default(),
             suspended_until: Default::default(),
             last_acknowledged_policy_change: Timestamp::UNIX_EPOCH,
         }
@@ -339,6 +401,20 @@ impl User {
     /// Get limits for this user
     pub async fn limits(&self) -> FeaturesLimits {
         let config = config().await;
+
+        // The upload perk lays its sizes over `default`, so it also beats
+        // `new_user`; it stays off until the config has a `perk` table.
+        if let Some(perk) = &config.features.limits.perk {
+            if self.perks(crate::now_ms()) & UserPerks::UploadPerk as u32 != 0 {
+                let mut limits = config.features.limits.default.clone();
+                for (tag, size) in &perk.file_upload_size_limit {
+                    limits.file_upload_size_limit.insert(tag.clone(), *size);
+                }
+
+                return limits;
+            }
+        }
+
         if ulid::Ulid::from_str(&self.id)
             .expect("`ulid`")
             .datetime()
@@ -814,6 +890,30 @@ impl User {
         }
     }
 
+    /// Whether an update touches the inputs of the computed badges and perks,
+    /// and of the name style, as `(perk_inputs, style_inputs)`
+    ///
+    /// Badges, perks and name style are computed, so any change to their
+    /// inputs has to go out as the computed values, never the stored ones.
+    /// Flags count because a deleted account earns none of them.
+    fn perk_event_inputs(partial: &PartialUser, remove: &[FieldsUser]) -> (bool, bool) {
+        let style_inputs = partial.name_style.is_some()
+            || partial.referral_count.is_some()
+            || partial.welcomed_at.is_some()
+            || partial.supporter.is_some()
+            || partial.flags.is_some()
+            || remove.iter().any(|field| {
+                matches!(
+                    field,
+                    FieldsUser::Supporter | FieldsUser::WelcomedAt | FieldsUser::ReferralCount
+                )
+            });
+        let perk_inputs =
+            style_inputs || partial.badges.is_some() || partial.custom_badge.is_some();
+
+        (perk_inputs, style_inputs)
+    }
+
     /// Update user data
     pub async fn update(
         &mut self,
@@ -828,16 +928,182 @@ impl User {
         self.apply_options(partial.clone());
         db.update_user(&self.id, &partial, remove.clone()).await?;
 
+        let (perk_inputs, style_inputs) = Self::perk_event_inputs(&partial, &remove);
+
+        let now = crate::now_ms();
+        let mut clear: Vec<v0::FieldsUser> = remove.into_iter().map(|v| v.into()).collect();
+        let mut data: v0::PartialUser = partial.into();
+
+        if perk_inputs {
+            data.badges = Some(self.badges_at(now).await);
+            if style_inputs {
+                Self::put_name_style(&mut data, &mut clear, self.filtered_name_style(now));
+            }
+        }
+
+        // Perks are private to the owner, so they never ride the event that
+        // fans out to everyone who can see this user
+        data.perks = None;
+
         EventV1::UserUpdate {
             id: self.id.clone(),
-            data: partial.into(),
-            clear: remove.into_iter().map(|v| v.into()).collect(),
+            data,
+            clear,
             event_id: Some(Ulid::new().to_string()),
         }
         .p_user(self.id.clone(), db)
         .await;
 
+        if perk_inputs {
+            self.publish_private_perks(self.perks(now)).await;
+        }
+
         Ok(())
+    }
+
+    /// Emit the computed badges, name style and perks without writing
+    /// anything, for when a trial or subscription lapses on its own
+    pub async fn publish_perks_update(&self, db: &Database) {
+        let now = crate::now_ms();
+        self.publish_public_perks(db, self.badges_at(now).await, self.filtered_name_style(now))
+            .await;
+        self.publish_private_perks(self.perks(now)).await;
+    }
+
+    /// Like `publish_perks_update`, but each event only goes out if what it
+    /// carries differs from the snapshot taken before the change
+    pub async fn publish_perks_update_if_changed(
+        &self,
+        db: &Database,
+        before_badges: u32,
+        before_style: Option<v0::NameStyle>,
+        before_perks: u32,
+    ) {
+        let now = crate::now_ms();
+        let badges = self.badges_at(now).await;
+        let name_style = self.filtered_name_style(now);
+        if badges != before_badges || name_style != before_style {
+            self.publish_public_perks(db, badges, name_style).await;
+        }
+
+        let perks = self.perks(now);
+        if perks != before_perks {
+            self.publish_private_perks(perks).await;
+        }
+    }
+
+    /// Emit the computed badges and filtered name style to everyone who
+    /// can see this user
+    async fn publish_public_perks(
+        &self,
+        db: &Database,
+        badges: u32,
+        name_style: Option<v0::NameStyle>,
+    ) {
+        let mut data = v0::PartialUser {
+            badges: Some(badges),
+            ..Default::default()
+        };
+        let mut clear = Vec::new();
+        Self::put_name_style(&mut data, &mut clear, name_style);
+
+        EventV1::UserUpdate {
+            id: self.id.clone(),
+            data,
+            clear,
+            event_id: Some(Ulid::new().to_string()),
+        }
+        .p_user(self.id.clone(), db)
+        .await;
+    }
+
+    /// Emit the perks to the owner's sessions only
+    async fn publish_private_perks(&self, perks: u32) {
+        EventV1::UserUpdate {
+            id: self.id.clone(),
+            data: v0::PartialUser {
+                perks: Some(perks),
+                ..Default::default()
+            },
+            clear: vec![],
+            event_id: Some(Ulid::new().to_string()),
+        }
+        .private(self.id.clone())
+        .await;
+    }
+
+    /// Put the filtered name style on an outgoing user update, clearing it
+    /// when nothing is left
+    fn put_name_style(
+        data: &mut v0::PartialUser,
+        clear: &mut Vec<v0::FieldsUser>,
+        name_style: Option<v0::NameStyle>,
+    ) {
+        if name_style.is_none() && !clear.contains(&v0::FieldsUser::NameStyle) {
+            clear.push(v0::FieldsUser::NameStyle);
+        }
+        data.name_style = name_style;
+    }
+
+    /// Whether the account has been deleted
+    fn is_deleted(&self) -> bool {
+        self.flags.unwrap_or_default() & UserFlags::Deleted as i32 != 0
+    }
+
+    /// Bitfield of perks the user holds at `now_ms`
+    ///
+    /// The OR of the referral tiers, the donation tiers and the welcome
+    /// trial's name color. A deleted account holds none.
+    pub fn perks(&self, now_ms: i64) -> u32 {
+        if self.is_deleted() {
+            return 0;
+        }
+
+        let mut perks =
+            crate::perks_for_referrals(self.referral_count.unwrap_or_default().max(0) as u32);
+
+        if let Some(supporter) = &self.supporter {
+            perks |= crate::perks_for_donations(
+                supporter.lifetime_usd_cents,
+                supporter.monthly_until.is_some_and(|until| until > now_ms),
+            );
+        }
+
+        if let Some(welcomed_at) = self.welcomed_at {
+            if welcomed_at.saturating_add(crate::WELCOME_TRIAL_DAYS * crate::DAY_MS) > now_ms {
+                perks |= UserPerks::NameColour as u32;
+            }
+        }
+
+        perks
+    }
+
+    /// The parts of the stored name style the user's perks allow at
+    /// `now_ms`, or None if nothing is left
+    ///
+    /// The stored choice is kept, so it comes back if the perk returns.
+    pub fn filtered_name_style(&self, now_ms: i64) -> Option<v0::NameStyle> {
+        let style = self.name_style.as_ref()?;
+        let perks = self.perks(now_ms);
+        let allowed = |perk: UserPerks| perks & perk as u32 != 0;
+
+        let filtered = v0::NameStyle {
+            colour: style
+                .colour
+                .clone()
+                .filter(|_| allowed(UserPerks::NameColour)),
+            font: style.font.clone().filter(|_| allowed(UserPerks::NameFont)),
+            effect: style
+                .effect
+                .clone()
+                .filter(|_| allowed(UserPerks::NameEffect)),
+        };
+
+        if filtered.colour.is_none() && filtered.font.is_none() && filtered.effect.is_none() {
+            None
+        } else {
+            Some(filtered)
+        }
     }
 
     /// Remove a field from User object
@@ -877,7 +1143,13 @@ impl User {
             FieldsUser::DisplayName => self.display_name = None,
             FieldsUser::Pronouns => self.pronouns = None,
             FieldsUser::Connections => self.connections = None,
+            FieldsUser::NameStyle => self.name_style = None,
+            FieldsUser::CustomBadge => self.custom_badge = None,
             FieldsUser::Suspension => self.suspended_until = None,
+            FieldsUser::Supporter => self.supporter = None,
+            FieldsUser::ReferralPending => self.referral_pending = None,
+            FieldsUser::WelcomedAt => self.welcomed_at = None,
+            FieldsUser::ReferralCount => self.referral_count = None,
             FieldsUser::None => {}
         }
     }
@@ -991,6 +1263,12 @@ impl User {
                 FieldsUser::Pronouns,
                 FieldsUser::Connections,
                 FieldsUser::Suspension,
+                FieldsUser::NameStyle,
+                FieldsUser::CustomBadge,
+                FieldsUser::Supporter,
+                FieldsUser::ReferralPending,
+                FieldsUser::WelcomedAt,
+                FieldsUser::ReferralCount,
             ],
         )
         .await
@@ -998,14 +1276,48 @@ impl User {
 
     /// Gets the user's badges along with calculating any dynamic badges
     pub async fn get_badges(&self) -> u32 {
-        let config = config().await;
-        let badges = self.badges.unwrap_or_default() as u32;
+        self.badges_at(crate::now_ms()).await
+    }
 
-        if let Some(cutoff) = config.api.users.early_adopter_cutoff {
-            if Ulid::from_string(&self.id).unwrap().timestamp_ms() < cutoff {
-                return badges + UserBadges::EarlyAdopter as u32;
-            };
-        };
+    /// The user's badges at `now_ms`
+    async fn badges_at(&self, now_ms: i64) -> u32 {
+        let config = config().await;
+        self.compute_badges(config.api.users.early_adopter_cutoff, now_ms)
+    }
+
+    /// Stored badges with every dynamic bit stripped, then the dynamic
+    /// badges recomputed from scratch, so a stale stored copy of one can
+    /// never outlive what it was earned by
+    ///
+    /// A deleted account earns no dynamic badges.
+    fn compute_badges(&self, early_adopter_cutoff: Option<u64>, now_ms: i64) -> u32 {
+        let mut badges = (self.badges.unwrap_or_default() as u32) & !USER_BADGES_DYNAMIC_MASK;
+
+        if self.is_deleted() {
+            return badges;
+        }
+
+        if let Some(cutoff) = early_adopter_cutoff {
+            if Ulid::from_string(&self.id).is_ok_and(|id| id.timestamp_ms() < cutoff) {
+                badges |= UserBadges::EarlyAdopter as u32;
+            }
+        }
+
+        badges |=
+            crate::badges_for_referrals(self.referral_count.unwrap_or_default().max(0) as u32);
+
+        if self.welcomed_at.is_some() {
+            badges |= UserBadges::Welcomed as u32;
+        }
+
+        if let Some(supporter) = &self.supporter {
+            if supporter.show_badges {
+                badges |= crate::badges_for_donations(
+                    supporter.lifetime_usd_cents,
+                    supporter.monthly_until.is_some_and(|until| until > now_ms),
+                );
+            }
+        }
 
         badges
     }
@@ -1068,6 +1380,23 @@ impl User {
                 .ok();
         }
 
+        // Referral and donation cascade: the account's code goes, a referral
+        // it is still pending on as the invitee goes (settled ones stay, the
+        // referrer earned them), donations are unlinked with their payer
+        // HMACs wiped, and unused claim codes and the badge image go.
+        db.delete_referral_codes_by_user(&self.id).await?;
+        if let Some(referral) = db.fetch_referral(&self.id).await? {
+            if referral.status == crate::ReferralStatus::Pending {
+                db.delete_referral(&self.id).await?;
+            }
+        }
+        db.unlink_donations_by_user(&self.id).await?;
+        db.delete_claim_codes_by_user(&self.id).await?;
+        if let Some(badge) = &self.custom_badge {
+            // Best-effort: a vanished file row must not block the deletion
+            db.mark_attachment_as_deleted(&badge.image.id).await.ok();
+        }
+
         self.clear_relationships(db).await?;
 
         // Respect cascade: drop every wall entry the account appears in, on
@@ -1110,7 +1439,9 @@ impl User {
 
 #[cfg(test)]
 mod tests {
-    use crate::User;
+    use revolt_models::v0::{self, UserBadges, UserFlags, UserPerks, USER_BADGES_DYNAMIC_MASK};
+
+    use crate::{FieldsUser, PartialUser, Supporter, User};
 
     #[test]
     fn username_validation_blocked_names() {
@@ -1205,6 +1536,317 @@ mod tests {
         let username = User::sanitise_username(username_padding).await.unwrap();
 
         assert_eq!("a_", username);
+    }
+
+    const NOW: i64 = 1_800_000_000_000;
+
+    fn supporter(
+        lifetime_usd_cents: i64,
+        monthly_until: Option<i64>,
+        show_badges: bool,
+    ) -> Supporter {
+        Supporter {
+            lifetime_usd_cents,
+            monthly_until,
+            payer_hmacs: vec![],
+            show_badges,
+        }
+    }
+
+    fn full_style() -> v0::NameStyle {
+        v0::NameStyle {
+            colour: Some("#ff0000".to_string()),
+            font: Some(v0::NameFont::Mono),
+            effect: Some(v0::NameEffect::Glow),
+        }
+    }
+
+    #[test]
+    fn perks_none_by_default() {
+        assert_eq!(User::default().perks(NOW), 0);
+
+        // A corrupt negative count must not wrap into a huge tier
+        let user = User {
+            referral_count: Some(-5),
+            ..Default::default()
+        };
+        assert_eq!(user.perks(NOW), 0);
+    }
+
+    #[test]
+    fn perks_from_referrals() {
+        let user = User {
+            referral_count: Some(crate::TIER_NAME_COLOUR as i32),
+            ..Default::default()
+        };
+        assert_eq!(user.perks(NOW), UserPerks::NameColour as u32);
+
+        let user = User {
+            referral_count: Some(crate::TIER_NAME_COLOUR as i32 - 1),
+            ..Default::default()
+        };
+        assert_eq!(user.perks(NOW) & UserPerks::NameColour as u32, 0);
+    }
+
+    #[test]
+    fn perks_welcome_trial_expires() {
+        let trial = crate::WELCOME_TRIAL_DAYS * crate::DAY_MS;
+
+        let fresh = User {
+            welcomed_at: Some(NOW - trial + 1),
+            ..Default::default()
+        };
+        assert_eq!(fresh.perks(NOW), UserPerks::NameColour as u32);
+
+        let lapsed = User {
+            welcomed_at: Some(NOW - trial),
+            ..Default::default()
+        };
+        assert_eq!(lapsed.perks(NOW), 0);
+    }
+
+    #[test]
+    fn perks_from_monthly_support_lapse() {
+        let active = User {
+            supporter: Some(supporter(0, Some(NOW + 1), true)),
+            ..Default::default()
+        };
+        assert_ne!(active.perks(NOW) & UserPerks::NameColour as u32, 0);
+
+        let lapsed = User {
+            supporter: Some(supporter(0, Some(NOW), true)),
+            ..Default::default()
+        };
+        assert_eq!(lapsed.perks(NOW), 0);
+
+        // Hiding badges never takes perks away
+        let hidden = User {
+            supporter: Some(supporter(0, Some(NOW + 1), false)),
+            ..Default::default()
+        };
+        assert_eq!(hidden.perks(NOW), active.perks(NOW));
+    }
+
+    #[test]
+    fn name_style_filtered_by_perks() {
+        let no_perks = User {
+            name_style: Some(full_style()),
+            ..Default::default()
+        };
+        assert_eq!(no_perks.filtered_name_style(NOW), None);
+
+        let colour_only = User {
+            name_style: Some(full_style()),
+            referral_count: Some(crate::TIER_NAME_COLOUR as i32),
+            ..Default::default()
+        };
+        assert_eq!(
+            colour_only.filtered_name_style(NOW),
+            Some(v0::NameStyle {
+                colour: Some("#ff0000".to_string()),
+                font: None,
+                effect: None,
+            })
+        );
+
+        let everything = User {
+            name_style: Some(full_style()),
+            referral_count: Some(crate::TIER_NAME_EFFECT as i32),
+            ..Default::default()
+        };
+        assert_eq!(everything.filtered_name_style(NOW), Some(full_style()));
+
+        // A font alone, without the font perk, leaves nothing
+        let font_only = User {
+            name_style: Some(v0::NameStyle {
+                colour: None,
+                font: Some(v0::NameFont::Serif),
+                effect: None,
+            }),
+            referral_count: Some(crate::TIER_NAME_COLOUR as i32),
+            ..Default::default()
+        };
+        assert_eq!(font_only.filtered_name_style(NOW), None);
+
+        let unset = User {
+            referral_count: Some(crate::TIER_NAME_EFFECT as i32),
+            ..Default::default()
+        };
+        assert_eq!(unset.filtered_name_style(NOW), None);
+    }
+
+    #[test]
+    fn badges_strip_stored_dynamic_bits() {
+        let dynamic = UserBadges::Supporter as u32
+            | UserBadges::ActiveSupporter as u32
+            | UserBadges::EarlyAdopter as u32
+            | UserBadges::Welcomed as u32
+            | UserBadges::Recruiter as u32
+            | UserBadges::RecruiterElite as u32
+            | UserBadges::Patron as u32;
+        assert_eq!(dynamic, USER_BADGES_DYNAMIC_MASK);
+
+        let user = User {
+            id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_string(),
+            badges: Some((dynamic | UserBadges::Developer as u32) as i32),
+            ..Default::default()
+        };
+        assert_eq!(user.compute_badges(None, NOW), UserBadges::Developer as u32);
+    }
+
+    #[test]
+    fn badges_early_adopter_is_ored_not_added() {
+        // 01ARZ3NDEKTSV4RRFFQ69G5FAV was minted at 1469922850259 ms
+        let user = User {
+            id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_string(),
+            badges: Some(UserBadges::EarlyAdopter as i32),
+            ..Default::default()
+        };
+        assert_eq!(
+            user.compute_badges(Some(1_500_000_000_000), NOW),
+            UserBadges::EarlyAdopter as u32
+        );
+        assert_eq!(user.compute_badges(Some(1_400_000_000_000), NOW), 0);
+    }
+
+    #[test]
+    fn badges_computed_from_referrals_and_support() {
+        let user = User {
+            id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_string(),
+            referral_count: Some(crate::TIER_BADGE as i32),
+            welcomed_at: Some(0),
+            supporter: Some(supporter(crate::DONATION_PATRON_CENTS, Some(NOW + 1), true)),
+            ..Default::default()
+        };
+        let badges = user.compute_badges(None, NOW);
+        for bit in [
+            UserBadges::Recruiter,
+            UserBadges::Welcomed,
+            UserBadges::Supporter,
+            UserBadges::Patron,
+            UserBadges::ActiveSupporter,
+        ] {
+            assert_ne!(badges & bit as u32, 0);
+        }
+
+        // Opting out hides every donation badge but keeps the rest
+        let hidden = User {
+            supporter: Some(supporter(
+                crate::DONATION_PATRON_CENTS,
+                Some(NOW + 1),
+                false,
+            )),
+            ..user
+        };
+        assert_eq!(
+            hidden.compute_badges(None, NOW),
+            UserBadges::Recruiter as u32 | UserBadges::Welcomed as u32
+        );
+    }
+
+    #[test]
+    fn deleted_user_has_no_perks_or_computed_badges() {
+        let user = User {
+            id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_string(),
+            badges: Some((USER_BADGES_DYNAMIC_MASK | UserBadges::Developer as u32) as i32),
+            flags: Some(UserFlags::Deleted as i32),
+            name_style: Some(full_style()),
+            referral_count: Some(crate::TIER_CUSTOM_BADGE as i32),
+            welcomed_at: Some(NOW),
+            supporter: Some(supporter(crate::DONATION_PATRON_CENTS, Some(NOW + 1), true)),
+            ..Default::default()
+        };
+
+        assert_eq!(user.perks(NOW), 0);
+        assert_eq!(user.filtered_name_style(NOW), None);
+        // Stored non-dynamic badges still pass through the mask
+        assert_eq!(
+            user.compute_badges(Some(1_500_000_000_000), NOW),
+            UserBadges::Developer as u32
+        );
+
+        // Other flags leave everything alone
+        let suspended = User {
+            flags: Some(UserFlags::SuspendedUntil as i32),
+            ..user
+        };
+        assert_ne!(suspended.perks(NOW), 0);
+        assert_ne!(
+            suspended.compute_badges(None, NOW) & UserBadges::Recruiter as u32,
+            0
+        );
+    }
+
+    #[test]
+    fn perk_event_inputs_include_flags() {
+        let inputs =
+            |partial: PartialUser, remove: &[FieldsUser]| User::perk_event_inputs(&partial, remove);
+
+        // Deleting an account zeroes its perks and dynamic badges
+        assert_eq!(
+            inputs(
+                PartialUser {
+                    flags: Some(UserFlags::Deleted as i32),
+                    ..Default::default()
+                },
+                &[]
+            ),
+            (true, true)
+        );
+
+        // Unrelated fields emit nothing extra
+        assert_eq!(
+            inputs(
+                PartialUser {
+                    display_name: Some("Name".to_string()),
+                    ..Default::default()
+                },
+                &[FieldsUser::DisplayName]
+            ),
+            (false, false)
+        );
+
+        // Existing triggers are unchanged
+        assert_eq!(
+            inputs(
+                PartialUser {
+                    referral_count: Some(1),
+                    ..Default::default()
+                },
+                &[]
+            ),
+            (true, true)
+        );
+        assert_eq!(
+            inputs(Default::default(), &[FieldsUser::Supporter]),
+            (true, true)
+        );
+        assert_eq!(
+            inputs(
+                PartialUser {
+                    badges: Some(1),
+                    ..Default::default()
+                },
+                &[]
+            ),
+            (true, false)
+        );
+    }
+
+    #[test]
+    fn supporter_show_badges_defaults_on() {
+        let parsed: Supporter = serde_json::from_str(r#"{"lifetime_usd_cents":1000}"#).unwrap();
+        assert!(parsed.show_badges);
+        assert!(parsed.payer_hmacs.is_empty());
+        assert_eq!(parsed.monthly_until, None);
+
+        // A record created by an HMAC claim before any total was written
+        let parsed: Supporter =
+            serde_json::from_str(r#"{"payer_hmacs":["abc"],"show_badges":false}"#).unwrap();
+        assert_eq!(parsed.lifetime_usd_cents, 0);
+        assert_eq!(parsed.payer_hmacs, vec!["abc".to_string()]);
+        assert!(!parsed.show_badges);
+        assert_eq!(parsed.monthly_until, None);
     }
 
     #[tokio::test]

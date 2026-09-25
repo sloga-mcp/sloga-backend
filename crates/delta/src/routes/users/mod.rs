@@ -9,6 +9,7 @@ mod change_username;
 mod connections_authorize;
 mod connections_complete;
 mod connections_unlink;
+mod custom_badge;
 mod edit_user;
 mod fetch_dms;
 mod fetch_profile;
@@ -19,11 +20,14 @@ mod fetch_user_flags;
 mod find_mutual;
 mod get_default_avatar;
 mod open_dm;
+mod referral_revoke;
+mod referrals;
 mod remove_friend;
 mod respect_delete;
 mod respect_fetch;
 mod respect_set;
 mod send_friend_request;
+mod supporter;
 mod unblock_user;
 
 pub fn routes() -> (Vec<Route>, OpenApi) {
@@ -58,5 +62,14 @@ pub fn routes() -> (Vec<Route>, OpenApi) {
         respect_set::respect_set,
         respect_fetch::respect_fetch,
         respect_delete::respect_delete,
+        // Referrals and supporter perks
+        referrals::fetch_referrals,
+        supporter::fetch_supporter,
+        supporter::create_supporter_code,
+        supporter::claim_supporter,
+        supporter::edit_supporter,
+        custom_badge::set_custom_badge,
+        custom_badge::delete_custom_badge,
+        referral_revoke::revoke_referral,
     ]
 }

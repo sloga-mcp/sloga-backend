@@ -113,6 +113,9 @@ livekit-runtime = { workspace = true, features = ["tokio"], optional = true }
 # Security
 totp-lite = { workspace = true }
 rust-argon2 = { workspace = true }
+hmac = { workspace = true }
+sha2 = { workspace = true }
+subtle = { workspace = true }
 
 # Email
 lettre = { workspace = true }

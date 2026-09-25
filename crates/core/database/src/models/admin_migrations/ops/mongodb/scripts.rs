@@ -26,7 +26,7 @@ struct MigrationInfo {
     revision: i32,
 }
 
-pub const LATEST_REVISION: i32 = 71; // MUST BE +1 to last migration
+pub const LATEST_REVISION: i32 = 72; // MUST BE +1 to last migration
 
 pub async fn migrate_database(db: &MongoDb) {
     let migrations = db.col::<Document>("migrations");
@@ -2425,6 +2425,170 @@ pub async fn run_migrations(db: &MongoDb, revision: i32) -> i32 {
             )
             .await
             .expect("Failed to add UseSoundboard to default_permissions");
+    }
+
+    if revision <= 71 {
+        info!("Running migration [revision 71 / 25-09-2026]: Create referrals / referral_codes / donations / donation_claim_codes collections, add supporter indexes to users (referrals + donation perks)");
+
+        // Same idempotency contract as prior collection migrations;
+        // mirrors init.rs. The unique specs here MUST stay identical to
+        // the copies in init.rs.
+        db.db().create_collection("referrals").await.ok();
+        db.db().create_collection("referral_codes").await.ok();
+        db.db().create_collection("donations").await.ok();
+        db.db().create_collection("donation_claim_codes").await.ok();
+
+        db.db()
+            .run_command(doc! {
+                "createIndexes": "referrals",
+                "indexes": [
+                    // Serves the per-referrer counts by status (profile
+                    // tally and the weekly cap) via the referrer prefix.
+                    {
+                        "key": {
+                            "referrer": 1_i32,
+                            "status": 1_i32
+                        },
+                        "name": "referrer_status"
+                    },
+                    // Serves the crond sweep over Pending rows.
+                    {
+                        "key": {
+                            "status": 1_i32
+                        },
+                        "name": "status"
+                    }
+                ]
+            })
+            .await
+            .expect("Failed to create referrals indexes.");
+
+        db.db()
+            .run_command(doc! {
+                "createIndexes": "referral_codes",
+                "indexes": [
+                    // ENFORCES one code per user — the lazy create is a
+                    // TOCTOU and the loser of a concurrent first-fetch race
+                    // must fail here. Also serves the by-user lookup and
+                    // the account-deletion cascade.
+                    {
+                        "key": {
+                            "user": 1_i32
+                        },
+                        "name": "user",
+                        "unique": true
+                    }
+                ]
+            })
+            .await
+            .expect("Failed to create referral_codes indexes.");
+
+        db.db()
+            .run_command(doc! {
+                "createIndexes": "donations",
+                "indexes": [
+                    // ENFORCES webhook idempotency — Ko-fi retries deliver
+                    // the same message_id, and a concurrent redelivery must
+                    // fail here rather than record the donation twice.
+                    {
+                        "key": {
+                            "message_id": 1_i32
+                        },
+                        "name": "message_id",
+                        "unique": true
+                    },
+                    // Serves the supporter-total recompute and the
+                    // account-deletion unlink.
+                    {
+                        "key": {
+                            "user": 1_i32
+                        },
+                        "name": "user"
+                    },
+                    // Serves the claim-by-email match and the stale-HMAC
+                    // wipe. Sparse: rows with no email, or already
+                    // wiped, have NO payer_hmac field.
+                    {
+                        "key": {
+                            "payer_hmac": 1_i32
+                        },
+                        "name": "payer_hmac",
+                        "sparse": true
+                    }
+                ]
+            })
+            .await
+            .expect("Failed to create donations indexes.");
+
+        db.db()
+            .run_command(doc! {
+                "createIndexes": "donation_claim_codes",
+                "indexes": [
+                    // Serves the by-user lookup and the account-deletion
+                    // cascade.
+                    {
+                        "key": {
+                            "user": 1_i32
+                        },
+                        "name": "user"
+                    }
+                ]
+            })
+            .await
+            .expect("Failed to create donation_claim_codes indexes.");
+
+        // All sparse: each field is absent on almost every user, so the
+        // indexes hold only the few users that carry it.
+        db.db()
+            .run_command(doc! {
+                "createIndexes": "users",
+                "indexes": [
+                    // Multikey: serves attaching a renewal to its user by
+                    // payer HMAC.
+                    {
+                        "key": {
+                            "supporter.payer_hmacs": 1_i32
+                        },
+                        "name": "supporter.payer_hmacs",
+                        "sparse": true
+                    },
+                    // Serves the crond scan for users still owed a
+                    // referral verdict.
+                    {
+                        "key": {
+                            "referral_pending": 1_i32
+                        },
+                        "name": "referral_pending",
+                        "sparse": true
+                    },
+                    // Serves the welcome-trial expiry window scan.
+                    {
+                        "key": {
+                            "welcomed_at": 1_i32
+                        },
+                        "name": "welcomed_at",
+                        "sparse": true
+                    },
+                    // Serves the monthly-supporter lapse window scan.
+                    {
+                        "key": {
+                            "supporter.monthly_until": 1_i32
+                        },
+                        "name": "supporter.monthly_until",
+                        "sparse": true
+                    },
+                    // Serves the referral-milestone threshold scan.
+                    {
+                        "key": {
+                            "referral_count": 1_i32
+                        },
+                        "name": "referral_count",
+                        "sparse": true
+                    }
+                ]
+            })
+            .await
+            .expect("Failed to create users supporter indexes.");
     }
 
     // Reminder to update LATEST_REVISION when adding new migrations.

@@ -451,6 +451,30 @@ pub struct ApiGifs {
     pub giphy_key: String,
 }
 
+/// Ko-fi donation webhook. Both secrets belong in Revolt.overrides.toml,
+/// never in the baked config. An empty `verification_token` means every
+/// webhook call is refused.
+#[derive(Deserialize, Debug, Clone)]
+#[serde(default)]
+pub struct ApiKofi {
+    /// Shared token Ko-fi sends with each webhook, compared in constant time
+    pub verification_token: String,
+    /// Server secret keying the HMAC of payer emails (never a plain hash)
+    pub email_hmac_key: String,
+    /// Public Ko-fi page linked from the client
+    pub page_url: String,
+}
+
+impl Default for ApiKofi {
+    fn default() -> Self {
+        Self {
+            verification_token: String::new(),
+            email_hmac_key: String::new(),
+            page_url: "https://ko-fi.com/slogatech".to_string(),
+        }
+    }
+}
+
 #[derive(Deserialize, Debug, Clone)]
 pub struct Api {
     pub registration: ApiRegistration,
@@ -469,6 +493,8 @@ pub struct Api {
     pub apps: ApiApps,
     #[serde(default)]
     pub import: ApiImport,
+    #[serde(default)]
+    pub kofi: ApiKofi,
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -610,12 +636,26 @@ pub struct FeaturesLimits {
     pub file_upload_size_limit: HashMap<String, usize>,
 }
 
+/// Upload-perk overlay. Not a full limits block: only these upload sizes
+/// are laid over `default` for a user holding the upload perk.
+#[derive(Deserialize, Debug, Clone, Default)]
+pub struct PerkLimits {
+    #[serde(default)]
+    pub file_upload_size_limit: HashMap<String, usize>,
+}
+
 #[derive(Deserialize, Debug, Clone)]
 pub struct FeaturesLimitsCollection {
     pub global: GlobalLimits,
 
     pub new_user: FeaturesLimits,
     pub default: FeaturesLimits,
+
+    // Must stay a named field: serde matches named keys before `roles`
+    // collects the rest, and a partial `perk` table would not parse as a
+    // full `FeaturesLimits` role. Absent = the perk is off.
+    #[serde(default)]
+    pub perk: Option<PerkLimits>,
 
     #[serde(flatten)]
     pub roles: HashMap<String, FeaturesLimits>,
