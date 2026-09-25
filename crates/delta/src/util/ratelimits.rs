@@ -26,6 +26,13 @@ impl<'a> RatelimitResolver<Request<'a>> for DeltaRatelimits {
 
             let method = request.method();
             match (segment, resource, method) {
+                // The supporter-badge toggle (PATCH /users/@me/supporter)
+                // flips one flag and is not a profile edit, so it must not
+                // spend the tight user_edit budget. This arm must sit ABOVE
+                // the user_edit arm, which would otherwise swallow it.
+                ("users", Some("@me"), Method::Patch) if extra == Some("supporter") => {
+                    ("users", None)
+                }
                 ("users", target, Method::Patch) => ("user_edit", target),
                 // Respect wall writes (PUT …/respect, DELETE …/respect/<author>)
                 // get their own bucket, keyed per wall — writing is a
@@ -369,6 +376,17 @@ impl<'a> RatelimitResolver<Request<'a>> for DeltaRatelimits {
                 // channels/messaging buckets plus the softres_reserve arm
                 // above.
                 ("softres", _, _) => ("softres_catalog", None),
+                // Ko-fi's payment webhook and the privileged donation tools.
+                // The webhook carries no session, so it is keyed by the
+                // sender's address: deliveries from one Ko-fi server share a
+                // counter, which must not compete with the unmapped startup
+                // routes in the shared "any" bucket.
+                ("kofi", _, _) => ("kofi", None),
+                // Public referral-code lookups (sessionless callers are keyed
+                // by IP). The code space is small, so the bucket is tight
+                // and deliberately NOT keyed per code: walking codes must
+                // spend one counter.
+                ("referrals", _, _) => ("referrals", None),
                 _ => ("any", None),
             }
         } else {
@@ -496,6 +514,13 @@ impl<'a> RatelimitResolver<Request<'a>> for DeltaRatelimits {
             "message_interact" => 20,
             "bot_commands" => 10,
             "softres_catalog" => 20,
+            // One delivery per payment plus Ko-fi's retries after a failed
+            // one. 60 leaves room for a retry burst after an outage.
+            "kofi" => 60,
+            // The client checks a code once the field is complete, so 10 is
+            // ample for a human. It only slows a script walking the code
+            // space from one address; it does not bound a distributed one.
+            "referrals" => 10,
             _ => 20,
         }
     }
@@ -503,12 +528,13 @@ impl<'a> RatelimitResolver<Request<'a>> for DeltaRatelimits {
 
 #[cfg(test)]
 mod tests {
-    //! Bucket resolution for the E2EE and MLS routes, driven through the real
-    //! fairing on a database-free Rocket: no session header, so the guard
-    //! keys on the (empty) client address, and the limits are read back from
-    //! the `X-RateLimit-*` headers the fairing stamps. The resolver runs in
-    //! `on_request`, BEFORE routing, so `routed_segment` counts from the
-    //! path root exactly as it does in the service.
+    //! Bucket resolution for the E2EE, MLS, Ko-fi, referral and user-edit
+    //! routes, driven through the real fairing on a database-free Rocket: no
+    //! session header, so the guard keys on the (empty) client address, and
+    //! the limits are read back from the `X-RateLimit-*` headers the fairing
+    //! stamps. The resolver runs in `on_request`, BEFORE routing, so
+    //! `routed_segment` counts from the path root exactly as it does in the
+    //! service.
     use super::DeltaRatelimits;
     use revolt_ratelimits::rocket::{RatelimitFairing, RatelimitStorage};
     use rocket::http::Status;
@@ -544,6 +570,18 @@ mod tests {
         "{}"
     }
 
+    #[rocket::post("/webhook")]
+    fn kofi_webhook() {}
+
+    #[rocket::get("/codes/<_code>")]
+    fn referral_code(_code: &str) {}
+
+    #[rocket::patch("/<_target>")]
+    fn edit_user(_target: &str) {}
+
+    #[rocket::patch("/@me/supporter")]
+    fn edit_supporter() {}
+
     fn client() -> Client {
         let rocket = rocket::build()
             .manage(RatelimitStorage::new(DeltaRatelimits))
@@ -551,7 +589,10 @@ mod tests {
             .mount("/", revolt_ratelimits::rocket::routes())
             .mount("/e2ee", rocket::routes![devices, keys, backup_status])
             .mount("/mls", rocket::routes![join_intent, key_packages])
-            .mount("/sync", rocket::routes![sync_settings]);
+            .mount("/sync", rocket::routes![sync_settings])
+            .mount("/kofi", rocket::routes![kofi_webhook])
+            .mount("/referrals", rocket::routes![referral_code])
+            .mount("/users", rocket::routes![edit_user, edit_supporter]);
         Client::untracked(rocket).expect("rocket builds without a database")
     }
 
@@ -679,6 +720,81 @@ mod tests {
             packages.headers().get_one("X-RateLimit-Remaining"),
             Some("29"),
             "31 of 60 delivery-service calls spent"
+        );
+    }
+
+    #[test]
+    fn kofi_webhook_leaves_the_shared_any_bucket() {
+        let client = client();
+        let webhook = client.post("/kofi/webhook").dispatch();
+        assert_eq!(webhook.status(), Status::Ok);
+        assert_eq!(limit(&webhook), 60);
+
+        let any = client.get("/sync/settings").dispatch();
+        assert_ne!(
+            bucket(&any),
+            bucket(&webhook),
+            "payment deliveries must not compete with unmapped startup traffic"
+        );
+    }
+
+    #[test]
+    fn referral_code_lookups_share_one_tight_counter() {
+        let client = client();
+        let first = client.get("/referrals/codes/AAAA").dispatch();
+        assert_eq!(first.status(), Status::Ok);
+        assert_eq!(limit(&first), 10);
+
+        let second = client.get("/referrals/codes/BBBB").dispatch();
+        assert_eq!(
+            bucket(&first),
+            bucket(&second),
+            "walking the code space must spend one counter"
+        );
+
+        for n in 2..10 {
+            let path = format!("/referrals/codes/C{n:03}");
+            assert_eq!(client.get(path.as_str()).dispatch().status(), Status::Ok);
+        }
+        let limited = client.get("/referrals/codes/ZZZZ").dispatch();
+        assert_eq!(limited.status(), Status::TooManyRequests);
+
+        let webhook = client.post("/kofi/webhook").dispatch();
+        assert_eq!(
+            webhook.status(),
+            Status::Ok,
+            "exhausting code lookups leaves the Ko-fi bucket untouched"
+        );
+    }
+
+    #[test]
+    fn supporter_toggle_does_not_spend_the_profile_edit_budget() {
+        let client = client();
+        let toggle = client.patch("/users/@me/supporter").dispatch();
+        assert_eq!(toggle.status(), Status::Ok);
+        assert_eq!(limit(&toggle), 20);
+
+        let profile = client.patch("/users/@me").dispatch();
+        assert_eq!(profile.status(), Status::Ok);
+        assert_eq!(limit(&profile), 2);
+        assert_ne!(
+            bucket(&toggle),
+            bucket(&profile),
+            "the badge toggle must not share the profile-edit counter"
+        );
+
+        let other = client.patch("/users/01ABC").dispatch();
+        assert_eq!(limit(&other), 2, "editing by id stays on user_edit");
+
+        // Two profile saves exhaust the window; the toggle still answers.
+        assert_eq!(client.patch("/users/@me").dispatch().status(), Status::Ok);
+        assert_eq!(
+            client.patch("/users/@me").dispatch().status(),
+            Status::TooManyRequests
+        );
+        assert_eq!(
+            client.patch("/users/@me/supporter").dispatch().status(),
+            Status::Ok
         );
     }
 }

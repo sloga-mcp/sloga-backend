@@ -1,10 +1,11 @@
 use iso8601_timestamp::Timestamp;
 use revolt_database::FieldsUser;
 use revolt_database::{
+    now_ms,
     util::{name_filter::contains_blocked_slur, reference::Reference},
     Database, File, PartialUser, User, UserActivity,
 };
-use revolt_models::v0;
+use revolt_models::v0::{self, UserPerks, USER_BADGES_DYNAMIC_MASK};
 use revolt_result::{create_error, Result};
 use rocket::serde::json::Json;
 use rocket::State;
@@ -45,7 +46,11 @@ pub async fn edit(
     // strangers on the profile card, so they get the display-name treatment.
     // (Per-handle length is the nested derive's job; validator 0.16 cannot
     // carry a list-length rule alongside it, hence the explicit cap here.)
-    if let Some(links) = data.profile.as_mut().and_then(|profile| profile.links.as_mut()) {
+    if let Some(links) = data
+        .profile
+        .as_mut()
+        .and_then(|profile| profile.links.as_mut())
+    {
         if links.len() > 12 {
             return Err(create_error!(FailedValidation {
                 error: "links: at most 12 entries".to_string()
@@ -90,11 +95,42 @@ pub async fn edit(
         user = target_user;
     }
 
+    // Custom badges are staff-set and staff-cleared (that route also retires
+    // the image), so a request to drop one here is ignored
+    data.remove
+        .retain(|field| field != &v0::FieldsUser::CustomBadge);
+
+    // Each part of a name style needs its own perk; a style with no parts
+    // clears it instead
+    if let Some(style) = data.name_style.take() {
+        if style.colour.is_none() && style.font.is_none() && style.effect.is_none() {
+            if !data.remove.contains(&v0::FieldsUser::NameStyle) {
+                data.remove.push(v0::FieldsUser::NameStyle);
+            }
+        } else {
+            let perks = user.perks(now_ms());
+            let missing = |perk: UserPerks| perks & perk as u32 == 0;
+            if (style.colour.is_some() && missing(UserPerks::NameColour))
+                || (style.font.is_some() && missing(UserPerks::NameFont))
+                || (style.effect.is_some() && missing(UserPerks::NameEffect))
+            {
+                return Err(create_error!(PerkRequired));
+            }
+
+            // The new style replaces the old one whole, and clearing the
+            // same field in one write conflicts on Mongo
+            data.remove
+                .retain(|field| field != &v0::FieldsUser::NameStyle);
+            data.name_style = Some(style);
+        }
+    }
+
     // Exit out early if nothing is changed
     if data.display_name.is_none()
         && data.pronouns.is_none()
         && data.status.is_none()
         && data.profile.is_none()
+        && data.name_style.is_none()
         && data.avatar.is_none()
         && data.badges.is_none()
         && data.flags.is_none()
@@ -135,8 +171,12 @@ pub async fn edit(
     let mut partial: PartialUser = PartialUser {
         display_name: data.display_name,
         pronouns: data.pronouns,
-        badges: data.badges,
+        // Referral and supporter badges are computed on read, never stored
+        badges: data
+            .badges
+            .map(|badges| ((badges as u32) & !USER_BADGES_DYNAMIC_MASK) as i32),
         flags: data.flags,
+        name_style: data.name_style,
         // UI hint only: E2EE capability is always derived from published,
         // signature-verified key bundles, never from this flag
         e2ee_enabled: data.e2ee_enabled,
@@ -211,6 +251,7 @@ pub async fn edit(
 #[cfg(test)]
 mod tests {
     use crate::util::test::TestHarness;
+    use revolt_database::{now_ms, CustomBadge, File, Metadata, PartialUser};
     use revolt_models::v0;
     use rocket::http::{ContentType, Status};
 
@@ -340,5 +381,223 @@ mod tests {
 
         let user = response.into_json::<v0::User>().await.expect("`User`");
         assert_eq!(user.status.and_then(|status| status.activity), None);
+    }
+
+    #[test]
+    fn name_style_requires_perk() {
+        crate::util::test::rt().block_on(name_style_requires_perk_case())
+    }
+
+    async fn name_style_requires_perk_case() {
+        let harness = TestHarness::new().await;
+        let (_, session, _) = harness.new_user().await;
+
+        let response = TestHarness::with_session(
+            session,
+            harness
+                .client
+                .patch("/users/@me")
+                .header(ContentType::JSON)
+                .body(json!({ "name_style": { "colour": "#ff0000" } }).to_string()),
+        )
+        .await;
+
+        assert_eq!(response.status(), Status::Forbidden);
+    }
+
+    #[test]
+    fn name_style_rejects_non_colour_values() {
+        crate::util::test::rt().block_on(name_style_rejects_non_colour_values_case())
+    }
+
+    async fn name_style_rejects_non_colour_values_case() {
+        let harness = TestHarness::new().await;
+        let (_, session, mut user) = harness.new_user().await;
+
+        // Even with the perk, anything that is not a plain colour (here a
+        // remote fetch every viewer's client would make) is refused.
+        user.update(
+            &harness.db,
+            PartialUser {
+                welcomed_at: Some(now_ms()),
+                ..Default::default()
+            },
+            vec![],
+        )
+        .await
+        .expect("welcomed user");
+
+        let response = TestHarness::with_session(
+            session,
+            harness
+                .client
+                .patch("/users/@me")
+                .header(ContentType::JSON)
+                .body(json!({ "name_style": { "colour": "url(https://x)" } }).to_string()),
+        )
+        .await;
+
+        assert_eq!(response.status(), Status::BadRequest);
+    }
+
+    #[test]
+    fn set_and_clear_name_style() {
+        crate::util::test::rt().block_on(set_and_clear_name_style_case())
+    }
+
+    async fn set_and_clear_name_style_case() {
+        let harness = TestHarness::new().await;
+        let (_, session, mut user) = harness.new_user().await;
+
+        // The welcome trial unlocks the name colour and nothing else.
+        user.update(
+            &harness.db,
+            PartialUser {
+                welcomed_at: Some(now_ms()),
+                ..Default::default()
+            },
+            vec![],
+        )
+        .await
+        .expect("welcomed user");
+
+        // A request carrying only a name style must still be applied.
+        let response = TestHarness::with_session(
+            session.clone(),
+            harness
+                .client
+                .patch("/users/@me")
+                .header(ContentType::JSON)
+                .body(json!({ "name_style": { "colour": "#ff0000" } }).to_string()),
+        )
+        .await;
+
+        assert_eq!(response.status(), Status::Ok);
+        let edited = response.into_json::<v0::User>().await.expect("`User`");
+        assert_eq!(
+            edited.name_style,
+            Some(v0::NameStyle {
+                colour: Some("#ff0000".to_string()),
+                font: None,
+                effect: None,
+            })
+        );
+
+        // An empty style clears it.
+        let response = TestHarness::with_session(
+            session,
+            harness
+                .client
+                .patch("/users/@me")
+                .header(ContentType::JSON)
+                .body(json!({ "name_style": {} }).to_string()),
+        )
+        .await;
+
+        assert_eq!(response.status(), Status::Ok);
+        let cleared = response.into_json::<v0::User>().await.expect("`User`");
+        assert_eq!(cleared.name_style, None);
+
+        let stored = harness.db.fetch_user(&user.id).await.expect("`User`");
+        assert_eq!(stored.name_style, None);
+    }
+
+    #[test]
+    fn name_style_font_needs_its_own_perk() {
+        crate::util::test::rt().block_on(name_style_font_needs_its_own_perk_case())
+    }
+
+    async fn name_style_font_needs_its_own_perk_case() {
+        let harness = TestHarness::new().await;
+        let (_, session, mut user) = harness.new_user().await;
+
+        // The welcome trial covers the colour but not the font.
+        user.update(
+            &harness.db,
+            PartialUser {
+                welcomed_at: Some(now_ms()),
+                ..Default::default()
+            },
+            vec![],
+        )
+        .await
+        .expect("welcomed user");
+
+        let response = TestHarness::with_session(
+            session,
+            harness
+                .client
+                .patch("/users/@me")
+                .header(ContentType::JSON)
+                .body(
+                    json!({ "name_style": { "colour": "#ff0000", "font": "Serif" } }).to_string(),
+                ),
+        )
+        .await;
+
+        assert_eq!(response.status(), Status::Forbidden);
+    }
+
+    #[test]
+    fn remove_custom_badge_is_ignored() {
+        crate::util::test::rt().block_on(remove_custom_badge_is_ignored_case())
+    }
+
+    async fn remove_custom_badge_is_ignored_case() {
+        let harness = TestHarness::new().await;
+        let (_, session, mut user) = harness.new_user().await;
+
+        user.update(
+            &harness.db,
+            PartialUser {
+                custom_badge: Some(CustomBadge {
+                    image: File {
+                        id: ulid::Ulid::new().to_string(),
+                        tag: "custom_badges".to_string(),
+                        filename: "badge.png".to_string(),
+                        hash: None,
+                        uploaded_at: None,
+                        uploader_id: None,
+                        used_for: None,
+                        deleted: None,
+                        reported: None,
+                        metadata: Metadata::File,
+                        content_type: "image/png".to_string(),
+                        size: 10,
+                        message_id: None,
+                        user_id: None,
+                        server_id: None,
+                        object_id: None,
+                    },
+                    label: "Founder".to_string(),
+                }),
+                ..Default::default()
+            },
+            vec![],
+        )
+        .await
+        .expect("badged user");
+
+        // Only staff may take the badge away; the rest of the edit still lands.
+        let response = TestHarness::with_session(
+            session,
+            harness
+                .client
+                .patch("/users/@me")
+                .header(ContentType::JSON)
+                .body(
+                    json!({ "display_name": "Badge Keeper", "remove": ["CustomBadge"] })
+                        .to_string(),
+                ),
+        )
+        .await;
+
+        assert_eq!(response.status(), Status::Ok);
+        let edited = response.into_json::<v0::User>().await.expect("`User`");
+        assert_eq!(edited.display_name, Some("Badge Keeper".to_string()));
+        assert!(edited.custom_badge.is_some());
+
+        let stored = harness.db.fetch_user(&user.id).await.expect("`User`");
+        assert!(stored.custom_badge.is_some());
     }
 }

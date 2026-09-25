@@ -122,12 +122,22 @@ impl AbstractDonations for MongoDb {
     }
 
     async fn wipe_stale_payer_hmacs(&self, before_ms: i64) -> Result<u64> {
+        // Retention runs from when the row was stored, not from the payment
+        // date, so imported historical payments keep their HMAC for the full
+        // window. Rows stored before stored_at existed fall back to the
+        // payment date.
         self.col::<Document>(COL)
             .update_many(
                 doc! {
                     "state": { "$in": ["Unclaimed", "NeedsReview"] },
-                    "timestamp": { "$lt": before_ms },
-                    "payer_hmac": { "$exists": true }
+                    "payer_hmac": { "$exists": true },
+                    "$or": [
+                        { "stored_at": { "$lt": before_ms } },
+                        {
+                            "stored_at": { "$exists": false },
+                            "timestamp": { "$lt": before_ms }
+                        }
+                    ]
                 },
                 doc! {
                     "$unset": {

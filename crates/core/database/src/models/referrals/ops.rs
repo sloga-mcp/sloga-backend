@@ -26,6 +26,17 @@ pub trait AbstractReferrals: Sync + Send {
         qualified_at: Option<i64>,
     ) -> Result<()>;
 
+    /// Move a referral to a new status only while it is still Pending, setting
+    /// `qualified_at` when given and clearing the activity fields when the new
+    /// status is not Pending. Ok(true) if a Pending row was updated; Ok(false) if
+    /// the row is missing or has already left Pending.
+    async fn update_referral_status_if_pending(
+        &self,
+        invitee_id: &str,
+        status: ReferralStatus,
+        qualified_at: Option<i64>,
+    ) -> Result<bool>;
+
     /// Pending rows only. Adds `day` to active_days (set semantics), adds
     /// message_inc to message_count; if invite_creator is Some(c) and
     /// c != referrer, sets joined_via_invite = true.

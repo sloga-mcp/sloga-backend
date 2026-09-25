@@ -1,4 +1,7 @@
-use revolt_database::{util::reference::Reference, Channel, Database, Invite, Member, User, AMQP};
+use revolt_database::{
+    util::reference::Reference, Channel, Database, Invite, Member, Referral, ReferralActivity,
+    User, AMQP,
+};
 use revolt_models::v0::{self, InviteJoinResponse};
 use revolt_result::{create_error, Result};
 use rocket::{serde::json::Json, State};
@@ -22,9 +25,13 @@ pub async fn join(
 
     let invite = target.as_invite(db).await?;
     match &invite {
-        Invite::Server { server, .. } => {
+        Invite::Server {
+            server, creator, ..
+        } => {
             let server = db.fetch_server(server).await?;
             let (_, channels) = Member::create(db, &server, &user, None).await?;
+
+            Referral::record_activity(db, &user, ReferralActivity::InviteJoin { creator }).await;
 
             Ok(Json(InviteJoinResponse::Server {
                 channels: channels.into_iter().map(|c| c.into()).collect(),

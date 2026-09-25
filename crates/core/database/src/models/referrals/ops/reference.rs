@@ -5,6 +5,18 @@ use crate::{Referral, ReferralCode, ReferralStatus};
 
 use super::AbstractReferrals;
 
+/// Status write shared by the unconditional and Pending-only updates
+fn apply_status(referral: &mut Referral, status: ReferralStatus, qualified_at: Option<i64>) {
+    if let Some(qualified_at) = qualified_at {
+        referral.qualified_at = Some(qualified_at);
+    }
+    if status != ReferralStatus::Pending {
+        referral.active_days.clear();
+        referral.message_count = 0;
+    }
+    referral.status = status;
+}
+
 #[async_trait]
 impl AbstractReferrals for ReferenceDb {
     async fn insert_referral_if_absent(&self, referral: &Referral) -> Result<bool> {
@@ -39,16 +51,26 @@ impl AbstractReferrals for ReferenceDb {
     ) -> Result<()> {
         let mut referrals = self.referrals.lock().await;
         if let Some(referral) = referrals.get_mut(invitee_id) {
-            if let Some(qualified_at) = qualified_at {
-                referral.qualified_at = Some(qualified_at);
-            }
-            if status != ReferralStatus::Pending {
-                referral.active_days.clear();
-                referral.message_count = 0;
-            }
-            referral.status = status;
+            apply_status(referral, status, qualified_at);
         }
         Ok(())
+    }
+
+    async fn update_referral_status_if_pending(
+        &self,
+        invitee_id: &str,
+        status: ReferralStatus,
+        qualified_at: Option<i64>,
+    ) -> Result<bool> {
+        // The lock is held across the check and the write
+        let mut referrals = self.referrals.lock().await;
+        match referrals.get_mut(invitee_id) {
+            Some(referral) if referral.status == ReferralStatus::Pending => {
+                apply_status(referral, status, qualified_at);
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
     }
 
     async fn record_referral_activity(
@@ -268,5 +290,60 @@ mod tests {
             .await
             .unwrap();
         assert!(fetch(&db, "invitee").await.joined_via_invite);
+    }
+
+    #[tokio::test]
+    async fn status_if_pending_updates_a_pending_row() {
+        let db = db_with_pending("invitee", "referrer").await;
+        db.record_referral_activity("invitee", DAY0, 1, None)
+            .await
+            .unwrap();
+
+        let updated = db
+            .update_referral_status_if_pending("invitee", ReferralStatus::Qualified, Some(123))
+            .await
+            .unwrap();
+
+        assert!(updated);
+        let referral = fetch(&db, "invitee").await;
+        assert_eq!(referral.status, ReferralStatus::Qualified);
+        assert_eq!(referral.qualified_at, Some(123));
+        assert!(referral.active_days.is_empty());
+        assert_eq!(referral.message_count, 0);
+    }
+
+    #[tokio::test]
+    async fn status_if_pending_leaves_a_revoked_row_alone() {
+        let db = db_with_pending("invitee", "referrer").await;
+        db.update_referral_status("invitee", ReferralStatus::Revoked, None)
+            .await
+            .unwrap();
+        let before = fetch(&db, "invitee").await;
+
+        let updated = db
+            .update_referral_status_if_pending("invitee", ReferralStatus::Qualified, Some(123))
+            .await
+            .unwrap();
+
+        assert!(!updated);
+        let after = fetch(&db, "invitee").await;
+        assert_eq!(after, before);
+        assert_eq!(after.status, ReferralStatus::Revoked);
+        assert_eq!(after.qualified_at, None);
+    }
+
+    #[tokio::test]
+    async fn status_if_pending_on_a_missing_row_is_false() {
+        let db = db_with_pending("invitee", "referrer").await;
+        let before = fetch(&db, "invitee").await;
+
+        let updated = db
+            .update_referral_status_if_pending("somebody_else", ReferralStatus::Qualified, Some(1))
+            .await
+            .unwrap();
+
+        assert!(!updated);
+        assert!(db.fetch_referral("somebody_else").await.unwrap().is_none());
+        assert_eq!(fetch(&db, "invitee").await, before);
     }
 }

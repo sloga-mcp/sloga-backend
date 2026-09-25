@@ -13,10 +13,12 @@ mod events;
 mod gifs;
 mod interactions;
 mod invites;
+mod kofi;
 mod mls;
 mod onboard;
 mod policy;
 mod push;
+mod referrals;
 mod root;
 mod safety;
 mod servers;
@@ -60,6 +62,8 @@ pub fn mount(config: Settings, mut rocket: Rocket<Build>) -> Rocket<Build> {
             "/onboard" => onboard::routes(),
             "/policy" => policy::routes(),
             "/push" => push::routes(),
+            "/referrals" => referrals::routes(),
+            "/kofi" => kofi::routes(),
             "/sync" => sync::routes(),
             "/webhooks" => webhooks::routes()
         };
@@ -90,6 +94,8 @@ pub fn mount(config: Settings, mut rocket: Rocket<Build>) -> Rocket<Build> {
             "/onboard" => onboard::routes(),
             "/policy" => policy::routes(),
             "/push" => push::routes(),
+            "/referrals" => referrals::routes(),
+            "/kofi" => kofi::routes(),
             "/sync" => sync::routes()
         };
     }

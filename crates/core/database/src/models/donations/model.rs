@@ -49,6 +49,11 @@ auto_derived!(
         pub tier_name: Option<String>,
         /// When Ko-fi recorded the payment
         pub timestamp: i64,
+        /// Epoch ms the row was first stored (webhook or import); the payer HMAC
+        /// retention window starts here. Rows stored before this field existed
+        /// fall back to `timestamp`.
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        pub stored_at: Option<i64>,
         /// Account the donation counts towards
         #[serde(skip_serializing_if = "Option::is_none")]
         pub user: Option<String>,
@@ -108,7 +113,9 @@ pub struct KofiPayload {
 /// How long an issued claim code stays valid
 pub const CLAIM_CODE_TTL_DAYS: i64 = 30;
 
-/// How long an unmatched row keeps its payer HMAC
+/// How long an unmatched row keeps its payer HMAC, counted from when the row
+/// was stored (`stored_at`) rather than the Ko-fi payment date, so a backfill
+/// of old payments stays claimable for the full window
 pub const PAYER_HMAC_RETENTION_DAYS: i64 = 180;
 
 /// Crockford base32 (no I, L, O or U)
@@ -350,6 +357,7 @@ impl Donation {
             is_subscription: payload.is_subscription_payment,
             tier_name: payload.tier_name.clone(),
             timestamp: parse_timestamp_ms(&payload.timestamp).unwrap_or(now),
+            stored_at: Some(now_ms()),
             claimed_at: owner.as_ref().map(|_| now),
             user: owner,
             payer_hmac: payer,
@@ -782,6 +790,61 @@ mod tests {
         assert_eq!(first, again);
         assert_eq!(first.state, DonationState::Unclaimed);
         assert!(db.fetch_donation("tx_other").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn stored_at_is_set_once_on_insert() {
+        let db = reference_db();
+
+        let before = now_ms();
+        let first = Donation::ingest(
+            &db,
+            &payload("msg_1", "tx_1", "10.00", "USD", None, None),
+            KEY,
+        )
+        .await
+        .unwrap();
+        let after = now_ms();
+
+        // Stamped with the time it was stored, not the Ko-fi payment date
+        let stored_at = first.stored_at.expect("an inserted row has stored_at");
+        assert!((before..=after).contains(&stored_at));
+        assert_eq!(
+            first.timestamp,
+            parse_timestamp_ms("2026-09-01T12:00:00Z").unwrap()
+        );
+        assert_eq!(
+            db.fetch_donation("tx_1").await.unwrap().unwrap().stored_at,
+            Some(stored_at)
+        );
+
+        // Let the clock move so a restamp would show
+        std::thread::sleep(std::time::Duration::from_millis(5));
+
+        // A redelivery under the same message id keeps the original stamp
+        let replay = Donation::ingest(
+            &db,
+            &payload("msg_1", "tx_1", "10.00", "USD", None, None),
+            KEY,
+        )
+        .await
+        .unwrap();
+        assert_eq!(replay.stored_at, Some(stored_at));
+
+        // So does the same transaction under another message id
+        let duplicate = Donation::ingest(
+            &db,
+            &payload("msg_2", "tx_1", "10.00", "USD", None, None),
+            KEY,
+        )
+        .await
+        .unwrap();
+        assert_eq!(duplicate.message_id, "msg_1");
+        assert_eq!(duplicate.stored_at, Some(stored_at));
+        assert_eq!(
+            db.fetch_donation("tx_1").await.unwrap().unwrap().stored_at,
+            Some(stored_at)
+        );
     }
 
     #[tokio::test]

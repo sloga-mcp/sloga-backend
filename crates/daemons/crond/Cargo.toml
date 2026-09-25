@@ -60,3 +60,8 @@ sha2 = { workspace = true }
 revolt-permissions = { workspace = true }
 revolt-presence = { workspace = true }
 revolt-models = { workspace = true }
+
+[dev-dependencies]
+# `#[tokio::test]` needs these; without them the crate's tests only build when
+# another workspace crate happens to unify the features in.
+tokio = { workspace = true, features = ["rt", "macros", "time"] }

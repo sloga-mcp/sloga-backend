@@ -25,6 +25,33 @@ fn status_bson(status: &ReferralStatus) -> Result<Bson> {
     bson::to_bson(status).map_err(|_| create_database_error!("to_bson", COL))
 }
 
+/// Update document that moves a referral to `status`, setting
+/// `qualified_at` when given
+fn status_update(status: &ReferralStatus, qualified_at: Option<i64>) -> Result<Document> {
+    let mut set = doc! {
+        "status": status_bson(status)?
+    };
+    if let Some(qualified_at) = qualified_at {
+        set.insert("qualified_at", qualified_at);
+    }
+
+    let mut update = doc! {
+        "$set": set
+    };
+    // Per-day activity is only kept while it can still matter
+    if *status != ReferralStatus::Pending {
+        update.insert(
+            "$unset",
+            doc! {
+                "active_days": 1_i32,
+                "message_count": 1_i32
+            },
+        );
+    }
+
+    Ok(update)
+}
+
 #[async_trait]
 impl AbstractReferrals for MongoDb {
     async fn insert_referral_if_absent(&self, referral: &Referral) -> Result<bool> {
@@ -59,31 +86,36 @@ impl AbstractReferrals for MongoDb {
         status: ReferralStatus,
         qualified_at: Option<i64>,
     ) -> Result<()> {
-        let mut set = doc! {
-            "status": status_bson(&status)?
-        };
-        if let Some(qualified_at) = qualified_at {
-            set.insert("qualified_at", qualified_at);
-        }
-
-        let mut update = doc! {
-            "$set": set
-        };
-        // Per-day activity is only kept while it can still matter
-        if status != ReferralStatus::Pending {
-            update.insert(
-                "$unset",
-                doc! {
-                    "active_days": 1_i32,
-                    "message_count": 1_i32
-                },
-            );
-        }
+        let update = status_update(&status, qualified_at)?;
 
         self.col::<Document>(COL)
             .update_one(doc! { "_id": invitee_id }, update)
             .await
             .map(|_| ())
+            .map_err(|_| create_database_error!("update_one", COL))
+    }
+
+    async fn update_referral_status_if_pending(
+        &self,
+        invitee_id: &str,
+        status: ReferralStatus,
+        qualified_at: Option<i64>,
+    ) -> Result<bool> {
+        let update = status_update(&status, qualified_at)?;
+        let pending = status_bson(&ReferralStatus::Pending)?;
+
+        // A row that left Pending after it was read (e.g. revoked by staff)
+        // is not matched, so its newer status stands
+        self.col::<Document>(COL)
+            .update_one(
+                doc! {
+                    "_id": invitee_id,
+                    "status": pending
+                },
+                update,
+            )
+            .await
+            .map(|result| result.matched_count == 1)
             .map_err(|_| create_database_error!("update_one", COL))
     }
 

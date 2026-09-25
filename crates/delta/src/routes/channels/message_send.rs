@@ -1,11 +1,11 @@
 use std::time::Duration;
 
+use revolt_database::events::client::EventV1;
 use revolt_database::util::permissions::DatabasePermissionQuery;
 use revolt_database::{
     util::idempotency::IdempotencyKey, util::reference::Reference, Database, User,
 };
-use revolt_database::events::client::EventV1;
-use revolt_database::{Channel, Interactions, Message, AMQP};
+use revolt_database::{Channel, Interactions, Message, Referral, ReferralActivity, AMQP};
 use revolt_models::v0;
 use revolt_permissions::PermissionQuery;
 use revolt_permissions::{calculate_channel_permissions, ChannelPermission};
@@ -124,6 +124,9 @@ pub async fn message_send(
         None
     };
 
+    // Notes to self don't count towards a pending referral.
+    let counts_for_referral = !matches!(channel, Channel::SavedMessages { .. });
+
     let message = Message::create_from_api(
         db,
         Some(amqp),
@@ -138,6 +141,12 @@ pub async fn message_send(
         allow_mentions,
     )
     .await?;
+
+    // Recorded as soon as the message is stored, before the thread join
+    // below can fail the request.
+    if counts_for_referral {
+        Referral::record_activity(db, &user, ReferralActivity::Message).await;
+    }
 
     // Sending in a thread joins you to it (Discord parity), so you start
     // receiving its notifications.
@@ -165,6 +174,7 @@ mod test {
         util::{idempotency::IdempotencyKey, reference::Reference},
         Channel, Member, Message, MessageFlagsValue, PartialChannel, PartialMember, Role, Server,
     };
+    use revolt_database::{PartialUser, Referral, ReferralSource};
     use revolt_models::v0::{self, DataCreateServerChannel, MessageFlags};
     use revolt_permissions::{ChannelPermission, OverrideField};
     use revolt_result::ErrorType;
@@ -1077,5 +1087,77 @@ mod test {
         for topic in [format!("{}!", bot_user.id), format!("{}!", owner.id)] {
             harness.assert_no_buffered_event(&topic, |event| is_stray_ack(event, &marker));
         }
+    }
+
+    async fn referral_message_count(harness: &TestHarness, invitee_id: &str) -> i32 {
+        harness
+            .db
+            .fetch_referral(invitee_id)
+            .await
+            .expect("Failed to fetch referral")
+            .expect("Referral is missing")
+            .message_count
+    }
+
+    /// A pending invitee's accepted sends count towards the referral; notes
+    /// to self and rejected sends do not.
+    #[test]
+    fn referral_activity_recorded_on_send() {
+        crate::util::test::rt().block_on(referral_activity_recorded_on_send_case())
+    }
+
+    async fn referral_activity_recorded_on_send_case() {
+        let harness = TestHarness::new().await;
+        let (_, _, referrer) = harness.new_user().await;
+        let (_, session, mut user) = harness.new_user().await;
+
+        assert!(Referral::create_for_invitee(
+            &harness.db,
+            &user.id,
+            &referrer.id,
+            ReferralSource::Code
+        )
+        .await
+        .expect("Failed to create referral"));
+        user.update(
+            &harness.db,
+            PartialUser {
+                referral_pending: Some(true),
+                ..Default::default()
+            },
+            vec![],
+        )
+        .await
+        .expect("Failed to mark the referral pending");
+
+        let (server, _) = harness.new_server(&user).await;
+        let channel = harness.new_channel(&server).await;
+        let notes = Channel::SavedMessages {
+            id: ulid::Ulid::new().to_string(),
+            user: user.id.clone(),
+        };
+        harness.db.insert_channel(&notes).await.expect("notes");
+
+        let send = |channel_id: String, body: serde_json::Value| {
+            harness
+                .client
+                .post(format!("/channels/{channel_id}/messages"))
+                .header(Header::new("x-session-token", session.token.to_string()))
+                .header(ContentType::JSON)
+                .body(body.to_string())
+                .dispatch()
+        };
+
+        let response = send(notes.id().to_string(), json!({ "content": "note" })).await;
+        assert_eq!(response.status(), Status::Ok);
+        assert_eq!(referral_message_count(&harness, &user.id).await, 0);
+
+        let response = send(channel.id().to_string(), json!({})).await;
+        assert_ne!(response.status(), Status::Ok);
+        assert_eq!(referral_message_count(&harness, &user.id).await, 0);
+
+        let response = send(channel.id().to_string(), json!({ "content": "hello" })).await;
+        assert_eq!(response.status(), Status::Ok);
+        assert_eq!(referral_message_count(&harness, &user.id).await, 1);
     }
 }

@@ -27,8 +27,10 @@ pub trait AbstractDonations: Sync + Send {
     /// `payer_hmac`; rows where the user is only the claimant lose `claimant`
     async fn unlink_donations_by_user(&self, user_id: &str) -> Result<()>;
 
-    /// Unset `payer_hmac` on Unclaimed and NeedsReview rows older than
-    /// `before_ms`; returns how many rows were changed
+    /// Unset `payer_hmac` on Unclaimed and NeedsReview rows stored before
+    /// `before_ms`, judged by `stored_at` (set by `Donation::ingest`) or,
+    /// for rows stored before that field existed, the Ko-fi payment
+    /// `timestamp`; returns how many rows were changed
     async fn wipe_stale_payer_hmacs(&self, before_ms: i64) -> Result<u64>;
 
     /// Insert a claim code (a duplicate code is an error)

@@ -80,10 +80,15 @@ impl AbstractDonations for ReferenceDb {
         let mut donations = self.donations.lock().await;
         let mut wiped = 0;
         for row in donations.values_mut() {
+            // Retention runs from when the row was stored, so a backfilled
+            // old payment keeps its HMAC for the full window; older rows
+            // without `stored_at` fall back to the payment date
             if matches!(
                 row.state,
                 DonationState::Unclaimed | DonationState::NeedsReview
-            ) && row.timestamp < before_ms
+            ) && row
+                .stored_at
+                .map_or(row.timestamp < before_ms, |at| at < before_ms)
                 && row.payer_hmac.is_some()
             {
                 row.payer_hmac = None;
@@ -133,5 +138,61 @@ impl AbstractDonations for ReferenceDb {
         let before = codes.len();
         codes.retain(|_, c| c.created_at >= before_ms);
         Ok((before - codes.len()) as u64)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{Database, Donation, DonationState, ReferenceDb, DAY_MS};
+
+    const CUTOFF: i64 = 1_788_264_000_000;
+
+    fn unclaimed(id: &str, timestamp: i64, stored_at: Option<i64>) -> Donation {
+        Donation {
+            id: id.to_string(),
+            message_id: format!("msg_{id}"),
+            kind: "Donation".to_string(),
+            amount_cents: 1000,
+            currency: "USD".to_string(),
+            usd_cents_override: None,
+            is_subscription: false,
+            tier_name: None,
+            timestamp,
+            stored_at,
+            user: None,
+            claimed_at: None,
+            payer_hmac: Some(format!("hmac_{id}")),
+            claimant: None,
+            state: DonationState::Unclaimed,
+        }
+    }
+
+    async fn payer_hmac(db: &Database, id: &str) -> Option<String> {
+        db.fetch_donation(id).await.unwrap().unwrap().payer_hmac
+    }
+
+    #[tokio::test]
+    async fn stale_payer_hmacs_age_from_when_the_row_was_stored() {
+        // Always the in-memory driver: this test never touches MongoDB
+        let db = Database::Reference(ReferenceDb::default());
+        for row in [
+            // Imported long after the payment: still inside the window
+            unclaimed("backfilled", CUTOFF - 400 * DAY_MS, Some(CUTOFF + DAY_MS)),
+            // Stored before the cutoff: `stored_at` decides even though the
+            // payment date is inside the window
+            unclaimed("stored_early", CUTOFF + DAY_MS, Some(CUTOFF - DAY_MS)),
+            // Rows without `stored_at` age from the payment date
+            unclaimed("legacy_old", CUTOFF - DAY_MS, None),
+            unclaimed("legacy_recent", CUTOFF + DAY_MS, None),
+        ] {
+            assert!(db.insert_donation_if_absent(&row).await.unwrap());
+        }
+
+        assert_eq!(db.wipe_stale_payer_hmacs(CUTOFF).await.unwrap(), 2);
+
+        assert!(payer_hmac(&db, "backfilled").await.is_some());
+        assert!(payer_hmac(&db, "stored_early").await.is_none());
+        assert!(payer_hmac(&db, "legacy_old").await.is_none());
+        assert!(payer_hmac(&db, "legacy_recent").await.is_some());
     }
 }
