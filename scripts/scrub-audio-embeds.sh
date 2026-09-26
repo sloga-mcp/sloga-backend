@@ -75,6 +75,13 @@ SNAPSHOTS='{ $or: [
     { "content._leading_context.embeds.type": "Audio" }
 ] }'
 
+check_counts() {
+    if ! [[ "$1" =~ ^[0-9]+$ && "$2" =~ ^[0-9]+$ ]]; then
+        echo "could not count Audio embeds in '$DB'" >&2
+        exit 1
+    fi
+}
+
 count_all() {
     mongosh_run "
         const d = db.getSiblingDB('$DB');
@@ -83,7 +90,11 @@ count_all() {
     "
 }
 
-read -r messages snapshots <<< "$(count_all)"
+# A separate assignment, so a failed mongosh stops the script under `set -e`
+# instead of `read` swallowing it and reporting blank counts
+counts="$(count_all)"
+read -r messages snapshots <<< "$counts"
+check_counts "$messages" "$snapshots"
 
 if [ "$APPLY" -eq 0 ]; then
     echo "'$DB': $messages message(s) and $snapshots report snapshot(s) carry an Audio embed; re-run with --apply to remove them"
@@ -107,7 +118,9 @@ mongosh_run "
         { \$pull: { 'content._leading_context.\$[].embeds': audio } });
 " > /dev/null
 
-read -r messages_left snapshots_left <<< "$(count_all)"
+counts="$(count_all)"
+read -r messages_left snapshots_left <<< "$counts"
+check_counts "$messages_left" "$snapshots_left"
 
 echo "'$DB': removed Audio embeds from $messages message(s) and $snapshots report snapshot(s); $messages_left and $snapshots_left left"
 
