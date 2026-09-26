@@ -43,7 +43,12 @@ lazy_static! {
     static ref STREAM_CLIENT: Client = reqwest::Client::builder()
         .dns_resolver(CachedDnsResolver {})
         .connect_timeout(Duration::from_secs(5))
-        .read_timeout(Duration::from_secs(15))
+        // Some hosts take tens of seconds to send the first byte of a cold
+        // file (catbox measured up to 45.6 s). A stalled mid-stream read is
+        // still ended by the relay's 30 s STALL (the browser then resumes
+        // with a Range request), and every slot stays bounded by the
+        // wall-clock deadline.
+        .read_timeout(Duration::from_secs(60))
         .redirect(redirect::Policy::none())
         .no_gzip()
         .no_brotli()
