@@ -291,7 +291,10 @@ mod tests {
     #[test]
     fn none_embed_serializes_to_pinned_shape() {
         // `#[serde(other)]` must not change how None goes out on the wire
-        assert_eq!(serde_json::to_string(&Embed::None).unwrap(), r#"{"type":"None"}"#);
+        assert_eq!(
+            serde_json::to_string(&Embed::None).unwrap(),
+            r#"{"type":"None"}"#
+        );
     }
 
     #[test]
