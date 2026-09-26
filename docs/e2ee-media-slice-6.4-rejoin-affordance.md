@@ -254,13 +254,16 @@ admit — same cost as any join (cap accounting is the separate tracked issue).
 
 ## 8. Resume: a returning device keeps its group
 
-Status: DESIGNED, landing. Ships with the frontend branch
-`fix/mls-rejoin-resume-w2` (wave 2, the foundations, committed `918c246e`;
-wave 3, the resume itself, in progress). Not on frontend `main` yet: until
-that branch merges, every return takes §3's path. This section describes
-the designed behavior (join-latency "resume" plan, operator-approved
-2026-09-25). **No server, native or protocol change** — the resume uses two
-existing DS read routes.
+Status: LANDED on the frontend branch `fix/mls-rejoin-resume-w2` (wave 2,
+the foundations, committed `918c246e`; wave 3, the resume itself, landed
+after audit on 2026-09-26). Not on frontend `main` yet: until that branch
+merges, every return takes §3's path. This section describes the landed
+behavior (join-latency "resume" plan, operator-approved 2026-09-25). Two
+waits are bounded: the prefetch at 3 s (`RESUME_PREFETCH_WAIT_MS`; past
+it the device joins), and each delete the join path awaits at 5 s
+(`KEPT_DISCARD_WAIT_MS`; past it the establish goes LOUD, §8.5). **No
+server, native or protocol change** — the resume uses two existing DS
+read routes.
 
 ### 8.1 Why
 
@@ -313,7 +316,9 @@ poisoned/desync.
    commits fetch (`/mls/groups/<id>/commits?from_epoch=<local + 1>`,
    `commits_fetch.rs`), whose `current_epoch` is the DS's current epoch.
    Nothing is applied. A superseded connect aborts it and hands the claim
-   back.
+   back. The session waits at most 3 s (`RESUME_PREFETCH_WAIT_MS`) for
+   it; one not back by then reads as no prefetch, and is never read
+   later.
 2. **Decision** (pure `resumeDecision`, `mlsRejoinPolicy.ts`). Resume only
    if ALL hold: the open-group GET was for the intended channel and names
    the held group, and native's channel for it matches; native state
@@ -325,17 +330,26 @@ poisoned/desync.
 3. **DS verdict.** The open-group GET is a DS answer exactly as the
    create-409 is on the ladder, so it is this route's verdict; no epoch-0
    group is minted.
-4. **Catch up.** Under the session lock, each fetched commit goes through
+4. **Adopt, BEFORE the catch-up.** The startup wipe spares the candidate.
+   Then release the keep entry and take the group into the session (if
+   the group is already being deleted → join), then clear the downgrade
+   grant (a failed clear → join). From the release on, no keep timer can
+   delete the group, and a close deletes it rather than keeping it (only
+   a group joined in the live generation is kept). The grant is gone
+   before anything can enable: a reload never ran `dispose`, and native
+   outlived the page.
+5. **Catch up.** Under the session lock, each fetched commit goes through
    the same inbound path a live commit takes. Native apply is strictly
    consecutive; a `duplicate` (a drained copy already applied) is clean;
    the first commit that does not apply cleanly ends the catch-up. Then
-   native `callState` must show self present at `epoch == current_epoch`.
-   A `removed_self` arriving during establish is recorded and acted on only
-   if native confirms self absent — never replayed blindly.
-5. **Adopt.** Release the keep entry (only if the group is not already
-   being deleted), clear the downgrade grant, install every member's keys
-   at the current epoch, then the UNCHANGED fail-closed path: roster
-   consistency → enable → gate release.
+   native `callState` must show self present, `active`, at
+   `epoch == current_epoch`. A `removed_self` arriving during establish is
+   recorded and acted on only if native confirms self absent — never
+   replayed blindly. Any outcome other than caught up abandons the adopted
+   group through §8.5.
+6. **Go active.** Only once caught up: install every member's keys at the
+   current epoch, refresh the recency record, then the UNCHANGED
+   fail-closed path: roster consistency → enable → gate release.
 
 **Sent: nothing.** No join intent, no KeyPackage, no Welcome, no commit,
 and no self-Update (membership did not change; post-compromise security
@@ -344,9 +358,14 @@ still comes from the lowest leaf's 10-minute heartbeat).
 ### 8.4 What the DS and peers see; effect on §3
 
 - Two existing read routes, both already gated: `open_group` needs channel
-  access; the commits fetch needs a device-bound session AND current group
-  membership (NotFound otherwise) and returns at most
-  `MAX_COMMITS_PER_FETCH` (100) commits, far above the lag bound of 12.
+  access; the commits fetch needs a device-bound session, channel access,
+  and the caller's USER in the group's roster (NotFound otherwise) and
+  returns at most `MAX_COMMITS_PER_FETCH` (100) commits, far above the lag
+  bound of 12. That membership check is user-level, not device-level
+  (`member_device_of(&user.id)`, `commits_fetch.rs:49`): any rostered
+  device of the same account qualifies, so a device whose own leaf is
+  gone can still read the list. The device-level gate is a §8.6
+  follow-up.
 - **No join intent, so the DS never fans out `rejoin: true`**, no member
   runs `#serveRejoin`, and no Remove or Add is committed. The `rejoin` flag
   (§3.1) now fires only on the fallback.
@@ -358,15 +377,21 @@ still comes from the lowest leaf's 10-minute heartbeat).
 
 ### 8.5 Fallback: §3, unchanged
 
-On a `join` decision, a null prefetch, a prefetch that outlives its bound,
-or ANY catch-up outcome other than caught up, the device, in order: aborts
-the prefetch; deletes the kept group for the channel (awaited and bounded —
-a timeout fails LOUD, never falls through into the ladder); ensures its
-KeyPackages are published; runs today's create-or-join ladder from the
-top. It therefore arrives with wiped state, and §3 applies exactly as
-written — including §3.4's `rejoin` serve when its old leaf is still
-rostered. The two-commit ladder, `#serveRejoin`, `#removeStaleLeaf`,
-`JOINER_RETRY_MS` and `REJOIN_SERVE_SUPPRESS_MS` are not modified.
+On a `join` decision, a null or failed prefetch, a prefetch not back
+within its 3 s bound, a candidate already being deleted, a failed grant
+clear, or ANY catch-up outcome other than caught up, the device, in
+order: aborts the prefetch; lets go of the candidate, if there was one
+(keep entry, session, recency record), and deletes it; discards the
+channel's other kept groups; ensures its KeyPackages are published; runs
+today's create-or-join ladder from the top. Each delete is awaited and
+bounded at 5 s (`KEPT_DISCARD_WAIT_MS`). A delete that times out OR is
+rejected (a failed cleanup) fails LOUD — the establish refuses — and
+never falls through into the ladder, which could re-enter a group whose
+local delete is still running. It therefore arrives with wiped state,
+and §3 applies exactly as written — including §3.4's `rejoin` serve when
+its old leaf is still rostered. The two-commit ladder, `#serveRejoin`,
+`#removeStaleLeaf`, `JOINER_RETRY_MS` and `REJOIN_SERVE_SUPPRESS_MS` are
+not modified.
 
 ### 8.6 Security
 
@@ -385,9 +410,16 @@ rostered. The two-commit ladder, `#serveRejoin`, `#removeStaleLeaf`,
 - **Residuals / follow-ups:** a page that dies inside the 10 s leaves rows
   on disk until the next establish on that channel sweeps them (never
   resumed: no valid record); a background keep-expiry delete can race an
-  `e2ee_wipe` (fix is native). Follow-ups: a device-level + `group.open`
-  gate on the commits fetch; a client-requestable re-drain; a native
-  `GroupAlreadyExists` test; a boot-time kept-group sweep.
+  `e2ee_wipe` (fix is native); native `callState` (the prefetch probe and
+  the catch-up check) goes through `with_engine`, which creates a missing
+  store, so a wipe landing mid-connect could re-create the store the user
+  just destroyed. The normal flow does not reach it (the prefetch needs a
+  ready device, a device id and a keep entry or recency record, and a
+  wipe clears them all). Follow-ups: a device-level + `group.open` gate
+  on the commits fetch; a client-requestable re-drain; a native
+  `GroupAlreadyExists` test; a boot-time kept-group sweep; `callState`
+  through `with_engine_if_provisioned` (sloga-desktop
+  `e2ee-core/src/shell.rs:1047`).
 
 ### 8.7 Target
 
