@@ -6,7 +6,7 @@ use regex::Regex;
 use reqwest::{
     dns::{Addrs, Name, Resolve},
     header::{self, HeaderMap, HeaderValue, CONTENT_TYPE},
-    redirect, Client, Response,
+    redirect, Client, Response, StatusCode,
 };
 use revolt_config::{config, report_internal_error};
 use revolt_files::{create_thumbnail, decode_image, image_size_vec, is_valid_image, video_size};
@@ -33,17 +33,23 @@ lazy_static! {
     /// Request client for streamed audio relays (`/audio`)
     ///
     /// Same SSRF posture as `CLIENT` (cached resolver, no automatic redirects;
-    /// `Request::new_with` follows them manually and re-checks every hop), but
+    /// `Request::open` follows them manually and re-checks every hop), but
     /// no total timeout: a stream may legitimately run for minutes, so only
     /// connect and per-read stalls are bounded here and the wall-clock limit
-    /// is enforced by the relay. `Accept-Encoding: identity` because byte
-    /// ranges and sizes must refer to the raw file (no compression features
-    /// are enabled, so reqwest never decodes a body).
+    /// is enforced by the relay. Every response decoder is off and
+    /// `Accept-Encoding: identity` is sent, because byte ranges and sizes
+    /// must refer to the raw file. No proxy: a proxy would resolve the
+    /// upstream host itself, outside the resolver the blocklist checked.
     static ref STREAM_CLIENT: Client = reqwest::Client::builder()
         .dns_resolver(CachedDnsResolver {})
         .connect_timeout(Duration::from_secs(5))
         .read_timeout(Duration::from_secs(15))
         .redirect(redirect::Policy::none())
+        .no_gzip()
+        .no_brotli()
+        .no_deflate()
+        .no_zstd()
+        .no_proxy()
         .default_headers(HeaderMap::from_iter([(
             header::ACCEPT_ENCODING,
             HeaderValue::from_static("identity"),
@@ -314,8 +320,9 @@ impl Request {
             Ok(hit)
         } else {
             let request = Request::new_from_str(&url).await?;
-            let embed = match (request.mime.type_(), request.mime.subtype()) {
-                (_, mime::HTML) => {
+            let audio_embeds = config().await.january.audio_embeds;
+            let embed = match classify_embed(&request.mime, audio_embeds) {
+                EmbedKind::Website => {
                     let content_type = request
                         .response
                         .headers()
@@ -339,15 +346,19 @@ impl Request {
                         .map(Embed::Website)
                         .unwrap_or_default()
                 }
-                (mime::IMAGE, _) => Request::fetch_image_metadata(&url, Some(request))
+                EmbedKind::Image => Request::fetch_image_metadata(&url, Some(request))
                     .await
                     .map(|res| res.map(Embed::Image).unwrap_or_default())
                     .unwrap_or_default(),
-                (mime::VIDEO, _) => Request::fetch_video_metadata(&url, Some(request))
+                EmbedKind::Video => Request::fetch_video_metadata(&url, Some(request))
                     .await
                     .map(|res| res.map(Embed::Video).unwrap_or_default())
                     .unwrap_or_default(),
-                _ => Embed::None,
+                EmbedKind::Audio => Request::fetch_audio_metadata(&url, request)
+                    .await
+                    .map(|res| res.map(Embed::Audio).unwrap_or_default())
+                    .unwrap_or_default(),
+                EmbedKind::None => Embed::None,
             };
 
             EMBED_CACHE.insert(url.to_owned(), embed.clone()).await;
@@ -364,19 +375,62 @@ impl Request {
     /// it, and returns `Ok(None)` when either rejects or the total size
     /// exceeds `january.max_audio_bytes`.
     pub async fn fetch_audio_metadata(url: &str, request: Request) -> Result<Option<Audio>> {
-        let _ = (url, request, crate::audio::METADATA_READ_BYTES);
-        todo!("wave 3")
+        let Request { mut response, mime } = request;
+
+        let Some(content_type) = crate::audio::canonical_type(&mime) else {
+            return Ok(None);
+        };
+
+        let size = crate::audio::total_size(response.status(), response.headers());
+        let max_audio_bytes = config().await.january.max_audio_bytes as u64;
+        if size.is_some_and(|size| size > max_audio_bytes) {
+            return Ok(None);
+        }
+
+        // Only the head is needed for the magic check; the rest of the body
+        // is dropped unread
+        let mut head = Vec::new();
+        while head.len() < crate::audio::METADATA_READ_BYTES {
+            // Not logged: reqwest errors can carry the upstream URL
+            let Some(chunk) = response
+                .chunk()
+                .await
+                .map_err(|_| create_error!(ProxyError))?
+            else {
+                break;
+            };
+
+            let take = chunk
+                .len()
+                .min(crate::audio::METADATA_READ_BYTES - head.len());
+            head.extend_from_slice(&chunk[..take]);
+        }
+
+        if !crate::audio::sniff_ok(content_type, &head) {
+            return Ok(None);
+        }
+
+        Ok(Some(Audio {
+            url: url.to_owned(),
+            content_type: content_type.to_owned(),
+            size: size.and_then(|size| usize::try_from(size).ok()),
+            filename: Url::parse(url)
+                .ok()
+                .and_then(|url| crate::audio::filename_from_url(&url)),
+        }))
     }
 
     /// Open an upstream audio stream for the `/audio` relay
     ///
-    /// Parses `url`, opens it via
-    /// `Request::new_with(&STREAM_CLIENT, url, range)` (so every redirect hop
-    /// is SSRF-checked and re-sends `range`), and returns the opened upstream
-    /// (response + mime) WITHOUT reading the body.
+    /// Parses `url` and opens it with `STREAM_CLIENT` through the same
+    /// redirect loop as `Request::new_with` (so every hop is SSRF-checked and
+    /// re-sends `range`), accepting only 200, 206 and 416. Returns the opened
+    /// upstream (response + mime) WITHOUT reading the body; for a 416 the
+    /// mime is `application/octet-stream` whatever upstream sent. Logs
+    /// nothing.
     pub async fn open_audio_stream(url: &str, range: Option<HeaderValue>) -> Result<Request> {
-        let _ = (url, range, &*STREAM_CLIENT);
-        todo!("wave 3")
+        let url = Url::parse(url).map_err(|_| create_error!(ProxyError))?;
+        Request::open(&STREAM_CLIENT, url, range, accept_audio_stream).await
     }
 
     /// Send a new request to a service
@@ -386,11 +440,24 @@ impl Request {
 
     /// Send a new request to a service using `client`
     ///
-    /// Follows up to 5 redirects manually, checking every hop against
-    /// `url_is_blacklisted`. When `range` is set it is sent as the `Range`
-    /// header on every hop; nothing else from the caller's client request is
-    /// forwarded.
+    /// Accepts any 2xx; redirects and `range` are handled by `Request::open`.
     pub async fn new_with(client: &Client, url: Url, range: Option<HeaderValue>) -> Result<Request> {
+        Request::open(client, url, range, accept_success).await
+    }
+
+    /// Send a request with `client`, keeping the final response when
+    /// `accept` allows its status
+    ///
+    /// Follows up to 5 redirects manually, checking the initial URL and every
+    /// hop against `url_is_blacklisted`. When `range` is set it is sent as the
+    /// `Range` header on every hop; nothing else from the caller's client
+    /// request is forwarded. The mime is chosen by `mime_for_status`.
+    async fn open(
+        client: &Client,
+        url: Url,
+        range: Option<HeaderValue>,
+        accept: fn(StatusCode) -> bool,
+    ) -> Result<Request> {
         let mut url = url;
         let url_host_str = url.host_str().ok_or(create_error!(ProxyError))?.to_string();
 
@@ -451,7 +518,7 @@ impl Request {
                 }
             }
 
-            if !response.status().is_success() {
+            if !accept(response.status()) {
                 // The Debug output carries the upstream URL; only the legacy
                 // embed/proxy client logs it, stream relays must not.
                 if std::ptr::eq(client, &*CLIENT) {
@@ -460,16 +527,7 @@ impl Request {
                 return Err(create_error!(ProxyError));
             }
 
-            let content_type = response
-                .headers()
-                .get(CONTENT_TYPE)
-                .ok_or(create_error!(ProxyError))?
-                .to_str()
-                .map_err(|_| create_error!(ProxyError))?;
-
-            let mime: mime::Mime = content_type
-                .parse()
-                .map_err(|_| create_error!(ProxyError))?;
+            let mime = mime_for_status(response.status(), response.headers())?;
 
             return Ok(Request { response, mime });
         }
@@ -558,5 +616,348 @@ impl Request {
             ip: resolved_address,
             blocked: false,
         })
+    }
+}
+
+/// Final statuses `Request::new_with` accepts: any 2xx
+fn accept_success(status: StatusCode) -> bool {
+    status.is_success()
+}
+
+/// Final statuses `Request::open_audio_stream` accepts: 200 and 206 are
+/// relayed, 416 is passed through to the client
+fn accept_audio_stream(status: StatusCode) -> bool {
+    matches!(
+        status,
+        StatusCode::OK | StatusCode::PARTIAL_CONTENT | StatusCode::RANGE_NOT_SATISFIABLE
+    )
+}
+
+/// Mime of an accepted response
+///
+/// A 2xx must carry a parsable `Content-Type`. Any other accepted status
+/// (416 on the audio path) has no body to type, so the upstream
+/// `Content-Type` is ignored and `application/octet-stream` is used.
+fn mime_for_status(status: StatusCode, headers: &HeaderMap) -> Result<Mime> {
+    if !status.is_success() {
+        return Ok(mime::APPLICATION_OCTET_STREAM);
+    }
+
+    let content_type = headers
+        .get(CONTENT_TYPE)
+        .ok_or(create_error!(ProxyError))?
+        .to_str()
+        .map_err(|_| create_error!(ProxyError))?;
+
+    content_type
+        .parse()
+        .map_err(|_| create_error!(ProxyError))
+}
+
+/// Metadata path `Request::generate_embed` takes for a response
+#[derive(Debug, PartialEq, Eq)]
+enum EmbedKind {
+    Website,
+    Image,
+    Video,
+    Audio,
+    None,
+}
+
+/// Pick the metadata path for `mime`; audio types (and `application/ogg`)
+/// only get one while `january.audio_embeds` is on
+fn classify_embed(mime: &Mime, audio_embeds: bool) -> EmbedKind {
+    match (mime.type_(), mime.subtype()) {
+        (_, mime::HTML) => EmbedKind::Website,
+        (mime::IMAGE, _) => EmbedKind::Image,
+        (mime::VIDEO, _) => EmbedKind::Video,
+        (mime::AUDIO, _) | (mime::APPLICATION, mime::OGG) if audio_embeds => EmbedKind::Audio,
+        _ => EmbedKind::None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+
+    use reqwest::header::{HeaderName, CONTENT_LENGTH, CONTENT_RANGE};
+    use revolt_result::ErrorType;
+
+    use super::*;
+    use crate::audio::METADATA_READ_BYTES;
+
+    fn status(code: u16) -> StatusCode {
+        StatusCode::from_u16(code).expect("valid status")
+    }
+
+    fn mime(value: &str) -> Mime {
+        value.parse().expect("valid mime")
+    }
+
+    fn headers(pairs: &[(HeaderName, &str)]) -> HeaderMap {
+        pairs
+            .iter()
+            .map(|(name, value)| (name.clone(), HeaderValue::from_str(value).unwrap()))
+            .collect()
+    }
+
+    /// An opened request built in memory (no network): `chunks` are served in
+    /// order and every byte pulled from the body is added to the returned
+    /// counter
+    fn synthetic(
+        code: u16,
+        pairs: &[(HeaderName, &str)],
+        chunks: Vec<Vec<u8>>,
+    ) -> (Request, Arc<AtomicUsize>) {
+        let pulled = Arc::new(AtomicUsize::new(0));
+        let counter = pulled.clone();
+        let body = reqwest::Body::wrap_stream(futures::stream::iter(chunks.into_iter().map(
+            move |chunk| {
+                counter.fetch_add(chunk.len(), Ordering::SeqCst);
+                Ok::<_, std::io::Error>(chunk)
+            },
+        )));
+
+        let mut builder = axum::http::Response::builder().status(code);
+        for (name, value) in pairs {
+            builder = builder.header(name, *value);
+        }
+
+        let response: Response = builder.body(body).expect("valid response").into();
+        let mime = mime_for_status(response.status(), response.headers()).expect("mime");
+        (Request { response, mime }, pulled)
+    }
+
+    /// A 4 KiB chunk that starts with an ID3v2 tag header
+    fn id3_chunk() -> Vec<u8> {
+        let mut chunk = b"ID3\x04\x00\x00\x00\x00\x00\x00".to_vec();
+        chunk.resize(4096, 0);
+        chunk
+    }
+
+    const SONG: &str = "https://example.com/music/song.mp3";
+
+    #[test]
+    fn legacy_path_accepts_exactly_2xx() {
+        for code in 100..=599u16 {
+            assert_eq!(
+                accept_success(status(code)),
+                (200..300).contains(&code),
+                "status {code}"
+            );
+        }
+    }
+
+    #[test]
+    fn audio_stream_accepts_exactly_200_206_416() {
+        for code in 100..=599u16 {
+            assert_eq!(
+                accept_audio_stream(status(code)),
+                matches!(code, 200 | 206 | 416),
+                "status {code}"
+            );
+        }
+
+        for code in [204, 301, 500] {
+            assert!(!accept_audio_stream(status(code)), "status {code}");
+        }
+    }
+
+    #[test]
+    fn range_not_satisfiable_is_octet_stream_whatever_upstream_says() {
+        for pairs in [
+            vec![(CONTENT_TYPE, "audio/mpeg")],
+            vec![(CONTENT_TYPE, "text/html; charset=utf-8")],
+            vec![(CONTENT_TYPE, "not a mime")],
+            vec![],
+        ] {
+            assert_eq!(
+                mime_for_status(StatusCode::RANGE_NOT_SATISFIABLE, &headers(&pairs)).unwrap(),
+                mime::APPLICATION_OCTET_STREAM
+            );
+        }
+    }
+
+    #[test]
+    fn success_without_a_parsable_content_type_is_an_error() {
+        assert!(mime_for_status(StatusCode::OK, &HeaderMap::new()).is_err());
+        assert!(mime_for_status(StatusCode::PARTIAL_CONTENT, &HeaderMap::new()).is_err());
+        assert!(mime_for_status(
+            StatusCode::OK,
+            &headers(&[(CONTENT_TYPE, "not a mime")])
+        )
+        .is_err());
+
+        let mut opaque = HeaderMap::new();
+        opaque.insert(CONTENT_TYPE, HeaderValue::from_bytes(b"audio/\xff").unwrap());
+        assert!(mime_for_status(StatusCode::PARTIAL_CONTENT, &opaque).is_err());
+    }
+
+    #[test]
+    fn success_keeps_the_upstream_content_type() {
+        let parsed = mime_for_status(
+            StatusCode::PARTIAL_CONTENT,
+            &headers(&[(CONTENT_TYPE, "audio/mpeg; foo=bar")]),
+        )
+        .unwrap();
+        assert_eq!(parsed.essence_str(), "audio/mpeg");
+    }
+
+    #[test]
+    fn audio_types_route_to_audio_only_behind_the_flag() {
+        for value in ["audio/mpeg", "audio/ogg", "audio/x-wav", "application/ogg"] {
+            assert_eq!(classify_embed(&mime(value), true), EmbedKind::Audio, "{value}");
+            assert_eq!(classify_embed(&mime(value), false), EmbedKind::None, "{value}");
+        }
+    }
+
+    #[test]
+    fn other_types_route_as_before_whatever_the_flag() {
+        for flag in [false, true] {
+            for (value, kind) in [
+                ("text/html", EmbedKind::Website),
+                ("text/html; charset=utf-8", EmbedKind::Website),
+                ("image/png", EmbedKind::Image),
+                ("image/gif", EmbedKind::Image),
+                ("video/webm", EmbedKind::Video),
+                ("video/mp4", EmbedKind::Video),
+                ("application/octet-stream", EmbedKind::None),
+                ("application/json", EmbedKind::None),
+                ("text/plain", EmbedKind::None),
+            ] {
+                assert_eq!(classify_embed(&mime(value), flag), kind, "{value} flag={flag}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn audio_stream_refuses_blocklisted_hosts_before_connecting() {
+        for url in [
+            "http://127.0.0.1/a.mp3",
+            "http://10.1.2.3/a.mp3",
+            "http://192.168.1.1/a.mp3",
+            "http://169.254.169.254/latest",
+            "http://[::1]/a.mp3",
+        ] {
+            let error = Request::open_audio_stream(url, None)
+                .await
+                .err()
+                .expect("blocked");
+            assert!(
+                matches!(error.error_type, ErrorType::InvalidOperation),
+                "{url}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn audio_stream_refuses_unparsable_urls() {
+        for url in ["not a url", "", "data:audio/mpeg;base64,SUQz"] {
+            let error = Request::open_audio_stream(url, None)
+                .await
+                .err()
+                .expect("rejected");
+            assert!(matches!(error.error_type, ErrorType::ProxyError), "{url:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn audio_metadata_reads_at_most_the_metadata_window() {
+        // 1 MiB body: a `bytes()` read would pull all of it
+        let mut chunks = vec![id3_chunk()];
+        chunks.extend(std::iter::repeat_n(vec![0u8; 4096], 255));
+        let (request, pulled) = synthetic(200, &[(CONTENT_TYPE, "audio/mp3")], chunks);
+
+        let audio = Request::fetch_audio_metadata(SONG, request)
+            .await
+            .unwrap()
+            .expect("audio embed");
+
+        assert!(pulled.load(Ordering::SeqCst) <= METADATA_READ_BYTES);
+        assert_eq!(audio.url, SONG);
+        assert_eq!(audio.content_type, "audio/mpeg");
+        assert_eq!(audio.size, None);
+        assert_eq!(audio.filename.as_deref(), Some("song.mp3"));
+    }
+
+    #[tokio::test]
+    async fn audio_metadata_reports_the_full_size() {
+        let (request, _) = synthetic(
+            200,
+            &[(CONTENT_TYPE, "audio/mpeg"), (CONTENT_LENGTH, "4096")],
+            vec![id3_chunk()],
+        );
+        let audio = Request::fetch_audio_metadata(SONG, request).await.unwrap();
+        assert_eq!(audio.expect("audio embed").size, Some(4096));
+
+        let (request, _) = synthetic(
+            206,
+            &[
+                (CONTENT_TYPE, "audio/mpeg"),
+                (CONTENT_RANGE, "bytes 0-4095/1234567"),
+            ],
+            vec![id3_chunk()],
+        );
+        let audio = Request::fetch_audio_metadata(SONG, request).await.unwrap();
+        assert_eq!(audio.expect("audio embed").size, Some(1234567));
+    }
+
+    #[tokio::test]
+    async fn audio_metadata_rejects_oversize_files_without_reading() {
+        let limit = config().await.january.max_audio_bytes as u64;
+        let (request, pulled) = synthetic(
+            200,
+            &[
+                (CONTENT_TYPE, "audio/mpeg"),
+                (CONTENT_LENGTH, &(limit + 1).to_string()),
+            ],
+            vec![id3_chunk()],
+        );
+
+        assert!(Request::fetch_audio_metadata(SONG, request)
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(pulled.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn audio_metadata_rejects_unlisted_types_without_reading() {
+        for value in ["application/octet-stream", "video/mp4", "audio/x-unknown"] {
+            let (request, pulled) = synthetic(200, &[(CONTENT_TYPE, value)], vec![id3_chunk()]);
+            assert!(Request::fetch_audio_metadata(SONG, request)
+                .await
+                .unwrap()
+                .is_none());
+            assert_eq!(pulled.load(Ordering::SeqCst), 0, "{value}");
+        }
+    }
+
+    #[tokio::test]
+    async fn audio_metadata_rejects_bad_or_short_magic() {
+        for body in [vec![0u8; 4096], b"ID3".to_vec(), vec![]] {
+            let (request, _) = synthetic(200, &[(CONTENT_TYPE, "audio/mpeg")], vec![body]);
+            assert!(Request::fetch_audio_metadata(SONG, request)
+                .await
+                .unwrap()
+                .is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn audio_metadata_maps_application_ogg_to_audio_ogg() {
+        let mut chunk = b"OggS".to_vec();
+        chunk.resize(4096, 0);
+        let (request, _) = synthetic(200, &[(CONTENT_TYPE, "application/ogg")], vec![chunk]);
+
+        let audio = Request::fetch_audio_metadata("https://example.com/a/b/track.ogg", request)
+            .await
+            .unwrap()
+            .expect("audio embed");
+        assert_eq!(audio.content_type, "audio/ogg");
+        assert_eq!(audio.filename.as_deref(), Some("track.ogg"));
     }
 }
