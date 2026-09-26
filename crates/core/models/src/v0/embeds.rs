@@ -31,6 +31,20 @@ auto_derived!(
         pub height: usize,
     }
 
+    /// Audio
+    pub struct Audio {
+        /// URL to the original audio file
+        pub url: String,
+        /// Canonical MIME type of the audio
+        pub content_type: String,
+        /// Size of the audio file in bytes
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub size: Option<usize>,
+        /// Name of the audio file
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub filename: Option<String>,
+    }
+
     /// Type of remote Twitch content
     pub enum TwitchType {
         Channel,
@@ -160,7 +174,10 @@ auto_derived!(
         Image(Image),
         Video(Video),
         Text(Text),
+        Audio(Audio),
+        /// No embed; unknown embed types also decode to this
         #[default]
+        #[serde(other)]
         None,
     }
 );
@@ -205,5 +222,144 @@ impl WebsiteMetadata {
             && self.special.is_none()
             && self.video.is_none()
             && self.image.is_none()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const FULL: &str = r#"{"type":"Audio","url":"https://litter.catbox.moe/swkvyu.mp3","content_type":"audio/mpeg","size":8997375,"filename":"swkvyu.mp3"}"#;
+    const BARE: &str = r#"{"type":"Audio","url":"https://litter.catbox.moe/swkvyu.mp3","content_type":"audio/mpeg"}"#;
+
+    fn audio(size: Option<usize>, filename: Option<&str>) -> Embed {
+        Embed::Audio(Audio {
+            url: "https://litter.catbox.moe/swkvyu.mp3".to_string(),
+            content_type: "audio/mpeg".to_string(),
+            size,
+            filename: filename.map(str::to_string),
+        })
+    }
+
+    #[test]
+    fn audio_embed_serializes_to_pinned_shape() {
+        let full = audio(Some(8997375), Some("swkvyu.mp3"));
+        assert_eq!(serde_json::to_string(&full).unwrap(), FULL);
+
+        // optional fields are omitted entirely, never sent as null
+        let bare = audio(None, None);
+        assert_eq!(serde_json::to_string(&bare).unwrap(), BARE);
+    }
+
+    #[test]
+    fn audio_embed_round_trips() {
+        let full: Embed = serde_json::from_str(FULL).unwrap();
+        assert_eq!(full, audio(Some(8997375), Some("swkvyu.mp3")));
+
+        let bare: Embed = serde_json::from_str(BARE).unwrap();
+        assert_eq!(bare, audio(None, None));
+
+        for embed in [full, bare, audio(Some(1), None), audio(None, Some("a.ogg"))] {
+            let wire = serde_json::to_string(&embed).unwrap();
+            assert_eq!(serde_json::from_str::<Embed>(&wire).unwrap(), embed);
+        }
+
+        // content_type is always present on the wire
+        assert!(serde_json::from_str::<Embed>(
+            r#"{"type":"Audio","url":"https://litter.catbox.moe/swkvyu.mp3"}"#
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn unknown_embed_type_decodes_as_none() {
+        // a future embed type must degrade instead of failing the whole message
+        let embed: Embed = serde_json::from_str(r#"{"type":"Foo","x":1}"#).unwrap();
+        assert_eq!(embed, Embed::None);
+
+        let embeds: Vec<Embed> =
+            serde_json::from_str(&format!(r#"[{{"type":"Foo","x":1}},{FULL}]"#)).unwrap();
+        assert_eq!(
+            embeds,
+            vec![Embed::None, audio(Some(8997375), Some("swkvyu.mp3"))]
+        );
+
+        let none: Embed = serde_json::from_str(r#"{"type":"None"}"#).unwrap();
+        assert_eq!(none, Embed::None);
+    }
+
+    #[test]
+    fn none_embed_serializes_to_pinned_shape() {
+        // `#[serde(other)]` must not change how None goes out on the wire
+        assert_eq!(serde_json::to_string(&Embed::None).unwrap(), r#"{"type":"None"}"#);
+    }
+
+    #[test]
+    fn audio_embed_bson_round_trips() {
+        // messages are stored in and read back from Mongo as bson, not JSON
+        let full = audio(Some(8997375), Some("swkvyu.mp3"));
+        let doc = bson::to_document(&full).unwrap();
+        assert_eq!(doc.get_str("type").unwrap(), "Audio");
+        assert_eq!(
+            doc.get_str("url").unwrap(),
+            "https://litter.catbox.moe/swkvyu.mp3"
+        );
+        assert_eq!(doc.get_str("content_type").unwrap(), "audio/mpeg");
+        // bson has no unsigned type: usize is stored as a signed 64-bit integer
+        assert_eq!(doc.get("size"), Some(&bson::Bson::Int64(8997375)));
+        assert_eq!(doc.get_str("filename").unwrap(), "swkvyu.mp3");
+        assert_eq!(doc.len(), 5);
+        assert_eq!(bson::from_document::<Embed>(doc).unwrap(), full);
+
+        // optional fields are omitted entirely, never stored as null
+        let bare = audio(None, None);
+        let doc = bson::to_document(&bare).unwrap();
+        assert!(!doc.contains_key("size"));
+        assert!(!doc.contains_key("filename"));
+        assert_eq!(doc.len(), 3);
+        assert_eq!(bson::from_document::<Embed>(doc).unwrap(), bare);
+
+        for embed in [audio(Some(1), None), audio(None, Some("a.ogg"))] {
+            let doc = bson::to_document(&embed).unwrap();
+            assert_eq!(bson::from_document::<Embed>(doc).unwrap(), embed);
+        }
+
+        // a size written by another driver as Int32 still decodes
+        let doc = bson::doc! {
+            "type": "Audio",
+            "url": "https://litter.catbox.moe/swkvyu.mp3",
+            "content_type": "audio/mpeg",
+            "size": 42_i32,
+        };
+        assert_eq!(
+            bson::from_document::<Embed>(doc).unwrap(),
+            audio(Some(42), None)
+        );
+    }
+
+    #[test]
+    #[cfg(target_pointer_width = "64")]
+    fn audio_embed_bson_size_range() {
+        // the largest size bson can hold survives the round trip
+        let max = audio(Some(i64::MAX as usize), None);
+        let doc = bson::to_document(&max).unwrap();
+        assert_eq!(doc.get("size"), Some(&bson::Bson::Int64(i64::MAX)));
+        assert_eq!(bson::from_document::<Embed>(doc).unwrap(), max);
+
+        // anything above i64::MAX is refused by the encoder rather than wrapped
+        assert!(bson::to_document(&audio(Some(i64::MAX as usize + 1), None)).is_err());
+    }
+
+    #[test]
+    fn unknown_embed_type_decodes_as_none_from_bson() {
+        let embed: Embed = bson::from_document(bson::doc! { "type": "Foo", "x": 1 }).unwrap();
+        assert_eq!(embed, Embed::None);
+    }
+
+    #[test]
+    fn none_embed_bson_round_trips() {
+        let doc = bson::to_document(&Embed::None).unwrap();
+        assert_eq!(doc, bson::doc! { "type": "None" });
+        assert_eq!(bson::from_document::<Embed>(doc).unwrap(), Embed::None);
     }
 }

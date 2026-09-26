@@ -881,6 +881,7 @@ impl PushNotification {
         } else if let Some(text) = msg.embeds.as_ref().and_then(|embeds| match embeds.first() {
             Some(Embed::Image(_)) => Some("Sent an image".to_string()),
             Some(Embed::Video(_)) => Some("Sent a video".to_string()),
+            Some(Embed::Audio(_)) => Some("Sent an audio file".to_string()),
             Some(Embed::Text(e)) => e
                 .description
                 .clone()
