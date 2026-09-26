@@ -771,11 +771,11 @@ async fn revoke_controller_capability(
 /// the capability then died with that participant, so revoking it would
 /// only produce a guaranteed-failing round trip. Every other caller must
 /// pass `false`, INCLUDING the delta-initiated removals that are about
-/// to eject the user — those call `remove_user` best-effort (errors
-/// discarded, and the identity re-resolution behind it can silently no-op
-/// for a device-qualified participant), so deleting the records first on
-/// the assumption the removal will work is exactly how a capability
-/// survives with nothing left able to revoke it.
+/// to eject the user — their eviction (`remove_user_if_present_sids`, the
+/// voice move's own evictions, the force-disconnect's best-effort one) can
+/// still fail and leave the connection in the call, so deleting the records
+/// first on the assumption the removal will work is exactly how a
+/// capability survives with nothing left able to revoke it.
 pub async fn release_remote_control_for_user(
     db: &Database,
     voice_client: &VoiceClient,

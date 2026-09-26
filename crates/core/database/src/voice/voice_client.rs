@@ -131,7 +131,12 @@ struct UserEviction {
 
 #[derive(Debug)]
 pub struct RoomClient {
-    pub client: InnerRoomClient,
+    /// The raw LiveKit room client. PRIVATE (AFK S-3 D-5): every SFU call
+    /// goes through a [`VoiceClient`] method, and every one of those runs
+    /// under `VoiceClient::sfu`'s deadline and breaker. A caller outside this
+    /// file holding the raw client could issue a call with neither, so the
+    /// compiler refuses it.
+    client: InnerRoomClient,
     pub node: LiveKitNode,
 }
 
@@ -294,10 +299,10 @@ impl VoiceClient {
         let limits = user.limits().await;
         // No `Server` is in hand here — `create_token` is called only from
         // the `voice_join` route (`call`) and the server-ordered move
-        // (`move_user_to_voice_channel_expecting`, which
-        // `move_user_to_voice_channel` delegates to); the remote-control
-        // paths never mint, they act on existing participants through
-        // `update_permissions_identity`, and the Android screen leg mints
+        // (`move_user_to_voice_channel_expecting`, the only move entry
+        // point); the remote-control paths never mint, they act on existing
+        // participants through `update_permissions_identity`, and the
+        // Android screen leg mints
         // through `create_screen_leg_token` with its own gate — so the gate
         // resolves the designation itself. One `fetch_server` per token mint
         // (a join or a move), never per participant of a call.
@@ -486,129 +491,6 @@ impl VoiceClient {
         )
         .await
         .to_internal_error()
-    }
-
-    /// Push `new_permissions` to the connection the identity mapping names
-    /// for `user` (plus the leg-specific set to its derived screen leg),
-    /// treating "that participant is not in the room" as an answer rather
-    /// than a failure (AFK Stage 6 F-A1). Superseded by the roster-driven
-    /// [`Self::update_permissions_connections`] (AFK S-3 D-4); kept until its
-    /// callers migrate.
-    ///
-    /// `Ok(true)`: the SFU applied the new permissions to a primary connection
-    /// of the user. `Ok(false)`: the user has NO connection in the room, as
-    /// far as we can be sure (below). `Err`: anything else, including a
-    /// non-JSON 404, an unknown node, a failed identity lookup, and a failed
-    /// roster read.
-    ///
-    /// "Not found" is only an answer when the identity we addressed is the
-    /// participant's real one (AFK Stage 6 re-audit RA-1). voice-ingress
-    /// records every participant's identity, bare or device-qualified, on
-    /// `participant_joined`, before it creates the voice state, and deletes
-    /// it only with the voice state; so a sync that finds voice state
-    /// normally finds the mapping too. When the mapping is missing anyway
-    /// (evicted, or dropped by a teardown path that left the voice state),
-    /// the bare user id is only a GUESS, and a device-qualified participant
-    /// still publishing would answer not_found to it. So on that path the
-    /// SFU's own roster decides ([`not_found_answer`]): every primary
-    /// connection of the user it lists is pushed to, none listed is
-    /// `Ok(false)`, and a roster that cannot be read is an error.
-    ///
-    /// The screen leg gets the leg-specific set, best-effort, before its
-    /// primary, through the classifying push so that a user with no leg (the
-    /// common case) is not an ERROR log and a Sentry event on every sync
-    /// (RA-6); a real failure there still reports, from inside that push.
-    pub async fn update_permissions_if_present(
-        &self,
-        node: &str,
-        user: &User,
-        channel_id: &str,
-        new_permissions: ParticipantPermission,
-    ) -> Result<bool> {
-        let stored = super::stored_voice_participant_identity(channel_id, &user.id).await?;
-        let mapped = stored.is_some();
-        let identity = stored.unwrap_or_else(|| user.id.clone());
-
-        if self
-            .push_primary_and_leg(node, &identity, channel_id, &new_permissions)
-            .await?
-        {
-            return Ok(true);
-        }
-
-        let answer = match not_found_answer(&user.id, mapped, None) {
-            NotFoundAnswer::ReadRoster => {
-                let roster = self
-                    .list_participants_if_present(node, channel_id)
-                    .await
-                    .map(|listed| {
-                        listed.map(|participants| {
-                            participants
-                                .into_iter()
-                                .map(|participant| participant.identity)
-                                .collect::<Vec<_>>()
-                        })
-                    });
-                not_found_answer(&user.id, mapped, Some(roster))
-            }
-            answer => answer,
-        };
-
-        match answer {
-            NotFoundAnswer::Gone => Ok(false),
-            NotFoundAnswer::Failed(error) => Err(error),
-            NotFoundAnswer::PushTo(identities) => {
-                log::warn!(
-                    "voice identity mapping missing for {} in {channel_id}; the SFU lists \
-                     {identities:?}, pushing the permission sync there",
-                    user.id
-                );
-                let mut pushes = Vec::with_capacity(identities.len());
-                for identity in &identities {
-                    pushes.push(
-                        self.push_primary_and_leg(node, identity, channel_id, &new_permissions)
-                            .await,
-                    );
-                }
-                pushes_answer(pushes)
-            }
-            // `not_found_answer` never asks twice; fail closed if it ever does.
-            NotFoundAnswer::ReadRoster => {
-                log::error!(
-                    "permission sync of {} in {channel_id}: the roster was asked for twice",
-                    user.id
-                );
-                Err(create_error!(InternalError))
-            }
-        }
-    }
-
-    /// The leg-specific set to `identity`'s screen leg (best-effort, result
-    /// discarded), then `new_permissions` to `identity` itself, both through
-    /// the classifying push. The primary's answer is returned.
-    async fn push_primary_and_leg(
-        &self,
-        node: &str,
-        identity: &str,
-        channel_id: &str,
-        new_permissions: &ParticipantPermission,
-    ) -> Result<bool> {
-        let _ = self
-            .update_permissions_identity_if_present(
-                node,
-                &super::screen_leg_identity(identity),
-                channel_id,
-                screen_leg_participant_permissions(new_permissions),
-            )
-            .await;
-
-        self.update_permissions_identity_if_present(
-            node,
-            identity,
-            channel_id,
-            new_permissions.clone(),
-        )
-        .await
     }
 
     /// [`Self::update_permissions_identity`], treating "that participant is
@@ -997,17 +879,18 @@ impl VoiceClient {
     /// `voice_identity:{channel_id}` is a hash keyed by BARE user id, so it can
     /// represent at most one connection per account, and `vc_members` is a set
     /// of user ids with the same limitation. Where a decision has to be correct
-    /// for a user sitting in a room TWICE — the voice-move eviction, and any
-    /// future multi-connection eviction (kick, ban) — it has to be made against
-    /// this, not against Redis.
+    /// for a user sitting in a room TWICE — the voice-move eviction, and the
+    /// moderation removals through [`Self::remove_user_if_present_sids`]
+    /// (kick, ban, disconnect) — it has to be made against this, not against
+    /// Redis.
     ///
     /// `Ok(Some(list))`: the SFU's participants. `Ok(None)`: the SFU says the
     /// room does not exist (a Twirp `not_found`, see [`is_twirp_not_found`]),
     /// so nobody is connected to it. `Err`: anything else, including a
     /// non-JSON 404; an unknown node is `get_node`'s `UnknownNode`. Read-only,
-    /// so unlike [`Self::remove_user`], whose screen-leg removal is
-    /// best-effort, it has no best-effort half: the caller decides what an
-    /// unanswered SFU means for its own operation.
+    /// so unlike [`Self::remove_connection_if_present`], whose screen-leg
+    /// removal is best-effort, it has no best-effort half: the caller decides
+    /// what an unanswered SFU means for its own operation.
     ///
     /// A room the SFU no longer has must read as "not connected", not as a
     /// 500 plus a Sentry event on every sweep tick. Like
@@ -1033,83 +916,18 @@ impl VoiceClient {
         }
     }
 
-    /// Remove ONE connection of `user_id` — the one the identity mapping names
-    /// — plus its screen leg.
-    ///
-    /// Exactly one, and that is a real limitation rather than a turn of phrase.
-    /// `get_voice_participant_identity` reads a hash field keyed by bare user
-    /// id, so an account holding two connections in the same room (which the
-    /// SFU permits: `{user}` and `{user}:{device}` are not duplicate
-    /// identities) has only one of them represented there, and this leaves the
-    /// other connected. Callers that must clear an account out of a room
-    /// COMPLETELY use [`Self::remove_user_if_present`] (AFK S-3 D-2), which
-    /// evicts every connection the SFU lists; the voice move keeps its own
-    /// listing and evicts each connection with
-    /// [`Self::remove_identity_if_present`]. Deleted once its callers have
-    /// migrated (S-3 cleanup wave).
-    pub async fn remove_user(&self, node: &str, user_id: &str, channel_id: &str) -> Result<()> {
-        let room = self.get_node(node)?;
-
-        // Resolve the (possibly device-qualified) identity the SFU knows
-        let identity = super::get_voice_participant_identity(channel_id, user_id).await?;
-
-        // A screen leg is a helper of the primary, so EVERY removal path that
-        // lands here takes it too: the moderator voice disconnect
-        // (`member_edit`); through `remove_user_from_voice_channel(s)` the
-        // ban, member kick, `server_delete`, `channel_delete`, group member
-        // removal and bot deletion; the join-time `force_disconnect`; the
-        // ingress admission backstop and the forbidden-track eject. The voice
-        // move does NOT come through here — it evicts each connection the SFU
-        // lists via `remove_identity_if_present`. Without this a kicked
-        // user's phone keeps streaming into the call it was removed from.
-        // Best-effort — most users have no leg (plan §2.4).
-        let _ = self
-            .sfu(
-                node,
-                room.client
-                    .remove_participant(channel_id, &super::screen_leg_identity(&identity)),
-            )
-            .await;
-
-        self.sfu(node, room.client.remove_participant(channel_id, &identity))
-            .await
-            .to_internal_error()
-    }
-
-    /// Server-side mute one published track (media E2EE plan D12 video-cap
-    /// enable-leg): refuse an over-cap video track without kicking the member
-    /// from the whole call — they stay connected audio-only, matching the
-    /// client's "video is full, you're still connected" toast.
-    pub async fn mute_track(
-        &self,
-        node: &str,
-        user_id: &str,
-        channel_id: &str,
-        track_sid: &str,
-    ) -> Result<()> {
-        let room = self.get_node(node)?;
-
-        let identity = super::get_voice_participant_identity(channel_id, user_id).await?;
-
-        self.sfu(
-            node,
-            room.client
-                .mute_published_track(channel_id, &identity, track_sid, true),
-        )
-        .await
-        .map(|_| ())
-        .to_internal_error()
-    }
-
     /// Server-side mute one published track of a participant addressed by an
-    /// EXACT SFU identity — the leg-facing twin of [`Self::mute_track`]
-    /// (android-screen-share plan §2.4).
+    /// EXACT SFU identity (media E2EE plan D12 video-cap enable leg,
+    /// android-screen-share plan §2.4): an over-cap or forbidden track is
+    /// refused without kicking the connection from the whole call.
     ///
-    /// [`Self::mute_track`] resolves the PRIMARY through the identity
-    /// mapping, and a leg is deliberately absent from that mapping. Pointed
-    /// at a leg's track it would ask the SFU to mute a sid that belongs to a
-    /// different participant: LiveKit refuses, and the offending track stays
-    /// live.
+    /// The only track mute there is. Its mapping-resolving twin
+    /// (`mute_track`, which resolved the PRIMARY through the identity
+    /// mapping) was deleted in the S-3 cleanup: a leg is deliberately absent
+    /// from that mapping, so pointed at a leg's track it asked the SFU to
+    /// mute a sid that belonged to a different participant, LiveKit refused,
+    /// and the offending track stayed live. The caller passes the identity of
+    /// the connection that published the track (the event identity).
     pub async fn mute_track_identity(
         &self,
         node: &str,
@@ -1138,72 +956,10 @@ impl VoiceClient {
     }
 }
 
-/// What a permission push that the SFU answered `not_found` amounts to (AFK
-/// Stage 6 re-audit RA-1). See [`not_found_answer`].
-#[derive(Debug, PartialEq, Eq)]
-enum NotFoundAnswer<E> {
-    /// The user has no connection in the room: skip them.
-    Gone,
-    /// The addressed identity was a guess; read the SFU's roster, then ask
-    /// again with it.
-    ReadRoster,
-    /// The roster lists these primary connections of the user: push to them.
-    PushTo(Vec<String>),
-    /// The roster could not be read: no answer, so an error.
-    Failed(E),
-}
-
-/// Decide what a `not_found` from the SFU means for `user_id`.
-///
-/// - `mapped`: the identity addressed was the one voice-ingress recorded for
-///   this user, i.e. the participant's real identity, so `not_found` is the
-///   truth: [`NotFoundAnswer::Gone`].
-/// - not `mapped`: the addressed identity was the bare-id FALLBACK, a guess.
-///   A device-qualified connection would answer `not_found` to it while
-///   still publishing, so only the SFU's roster can say. `roster: None`
-///   (not read yet) asks for it; a roster that failed to read is
-///   [`NotFoundAnswer::Failed`]; a room the SFU does not have
-///   (`Ok(None)`) or a roster listing no primary of the user is
-///   [`NotFoundAnswer::Gone`]; otherwise every listed primary of the user,
-///   bare or `{user}:{device}`, screen legs excluded, is
-///   [`NotFoundAnswer::PushTo`].
-///
-/// Pure, so each branch is pinned by value.
-fn not_found_answer<E>(
-    user_id: &str,
-    mapped: bool,
-    roster: Option<std::result::Result<Option<Vec<String>>, E>>,
-) -> NotFoundAnswer<E> {
-    if mapped {
-        return NotFoundAnswer::Gone;
-    }
-
-    match roster {
-        None => NotFoundAnswer::ReadRoster,
-        Some(Err(error)) => NotFoundAnswer::Failed(error),
-        Some(Ok(None)) => NotFoundAnswer::Gone,
-        Some(Ok(Some(identities))) => {
-            let primaries: Vec<String> = identities
-                .into_iter()
-                .filter(|identity| {
-                    super::user_id_from_participant_identity(identity) == user_id
-                        && !super::is_screen_leg(identity)
-                })
-                .collect();
-
-            if primaries.is_empty() {
-                NotFoundAnswer::Gone
-            } else {
-                NotFoundAnswer::PushTo(primaries)
-            }
-        }
-    }
-}
-
-/// What the pushes to the connections the roster listed amount to: the FIRST
-/// error when any failed (after all were tried), else `Ok(true)` if any
-/// landed, else `Ok(false)` (every listed connection left in the meantime).
-/// Pure.
+/// What [`VoiceClient::update_permissions_connections`]'s pushes to the
+/// listed connections amount to: the FIRST error when any failed (after all
+/// were tried), else `Ok(true)` if any landed, else `Ok(false)` (every listed
+/// connection left in the meantime). Pure.
 fn pushes_answer<E>(
     pushes: impl IntoIterator<Item = std::result::Result<bool, E>>,
 ) -> std::result::Result<bool, E> {
@@ -2229,81 +1985,6 @@ mod conn_nonce_and_removal_tests {
             .join(" ")
     }
 
-    /// RA-1 (Stage 6 re-audit): `update_permissions_if_present` reads the
-    /// mapping WITHOUT the bare-id fallback, pushes to it, and on a miss
-    /// asks `not_found_answer` whether that miss is an answer: first with no
-    /// roster, then, if asked, with the SFU's roster. Its Redis lookup makes
-    /// it untestable by value here, so it is pinned on its text; the decision
-    /// itself is pinned by value below. Mutations: the lookup swapped for the
-    /// falling-back `get_voice_participant_identity`, `mapped` forced, the
-    /// roster never read, or a verdict mapped to the wrong result.
-    #[test]
-    fn update_permissions_if_present_consults_the_roster_on_a_guess() {
-        let body = shipping_method("pub async fn update_permissions_if_present(");
-        let at = |needle: &str| {
-            body.find(needle).unwrap_or_else(|| {
-                panic!("`update_permissions_if_present` lost `{needle}`: {body}")
-            })
-        };
-
-        assert!(
-            !body.contains("get_voice_participant_identity("),
-            "the falling-back lookup hides whether the identity is a guess: {body}"
-        );
-        let order = [
-            "let stored = super::stored_voice_participant_identity(channel_id, &user.id).await?;",
-            "let mapped = stored.is_some();",
-            ".push_primary_and_leg(node, &identity, channel_id, &new_permissions)",
-            "not_found_answer(&user.id, mapped, None)",
-            ".list_participants_if_present(node, channel_id)",
-            "not_found_answer(&user.id, mapped, Some(roster))",
-        ];
-        for pair in order.windows(2) {
-            assert!(
-                at(pair[0]) < at(pair[1]),
-                "`{}` must precede `{}`: {body}",
-                pair[0],
-                pair[1]
-            );
-        }
-        for verdict in [
-            "NotFoundAnswer::Gone => Ok(false),",
-            "NotFoundAnswer::Failed(error) => Err(error),",
-            "pushes_answer(pushes)",
-        ] {
-            at(verdict);
-        }
-    }
-
-    /// RA-6 (Stage 6 re-audit): the best-effort screen-leg push goes through
-    /// the CLASSIFYING push, so a member with no leg (almost everyone) is not
-    /// an ERROR log and a Sentry event on every sync. The primary goes
-    /// through it too. Mutation: either push routed back through the
-    /// collapsing `update_permissions_identity`.
-    #[test]
-    fn the_leg_and_the_primary_use_the_classifying_push() {
-        let body = shipping_method("async fn push_primary_and_leg(");
-
-        assert!(
-            body.contains(
-                "let _ = self .update_permissions_identity_if_present( node, \
-                 &super::screen_leg_identity(identity), channel_id, \
-                 screen_leg_participant_permissions(new_permissions), ) .await;"
-            ),
-            "the leg push must be the classifying one, its result discarded: {body}"
-        );
-        assert_eq!(
-            body.matches(".update_permissions_identity_if_present(")
-                .count(),
-            2,
-            "leg and primary: {body}"
-        );
-        assert!(
-            !body.contains(".update_permissions_identity("),
-            "no push here may go through the collapsing variant: {body}"
-        );
-    }
-
     /// AFK Stage 6 FU-2: in `update_permissions_identity_if_present` only the
     /// not-found answer is quiet. The real-failure arm goes through
     /// `to_internal_error()` (ERROR log + Sentry, `#[track_caller]`), never a
@@ -2580,96 +2261,12 @@ mod afk_mint_tests {
     }
 }
 
-/// AFK Stage 6 re-audit RA-1: when a `not_found` from the SFU is an answer.
+/// `pushes_answer`, by value. (The RA-1 `not_found_answer` decision that
+/// shared this module was deleted with `update_permissions_if_present` in
+/// the S-3 cleanup: nothing resolves a push through the mapping any more.)
 #[cfg(test)]
-mod not_found_answer_tests {
-    use super::{not_found_answer, pushes_answer, NotFoundAnswer};
-
-    const USER: &str = "01KX7HASD9FHBYA3XGKA5YACYX";
-
-    fn roster(identities: &[&str]) -> Option<Result<Option<Vec<String>>, &'static str>> {
-        Some(Ok(Some(
-            identities
-                .iter()
-                .map(|identity| identity.to_string())
-                .collect(),
-        )))
-    }
-
-    /// The addressed identity was the recorded one: `not_found` is the
-    /// truth, and no roster is needed or read.
-    #[test]
-    fn a_miss_on_the_recorded_identity_is_gone() {
-        assert_eq!(
-            not_found_answer::<&str>(USER, true, None),
-            NotFoundAnswer::Gone
-        );
-        assert_eq!(
-            not_found_answer(USER, true, roster(&[&format!("{USER}:DEVICE")])),
-            NotFoundAnswer::Gone,
-            "with a recorded identity the roster is not consulted"
-        );
-    }
-
-    /// The addressed identity was the bare-id guess: the roster decides.
-    #[test]
-    fn a_miss_on_the_guess_asks_the_roster() {
-        assert_eq!(
-            not_found_answer::<&str>(USER, false, None),
-            NotFoundAnswer::ReadRoster
-        );
-
-        // The user's device-qualified connection is still there: NOT gone.
-        let device = format!("{USER}:DEVICE");
-        assert_eq!(
-            not_found_answer(USER, false, roster(&["OTHERUSER", &device])),
-            NotFoundAnswer::PushTo(vec![device.clone()]),
-            "a device-qualified participant still publishing must be pushed to"
-        );
-
-        // Every primary of the user, in roster order; never a screen leg,
-        // never another user.
-        assert_eq!(
-            not_found_answer(
-                USER,
-                false,
-                roster(&[
-                    &format!("{USER}:DEVICE:screen"),
-                    &device,
-                    "OTHERUSER:DEVICE",
-                    USER,
-                ])
-            ),
-            NotFoundAnswer::PushTo(vec![device.clone(), USER.to_string()])
-        );
-
-        // Nobody of the user's: gone. Only their leg: gone too (a leg is a
-        // helper of a primary, and the primary is what the sync addresses).
-        assert_eq!(
-            not_found_answer(USER, false, roster(&["OTHERUSER", "OTHERUSER:D"])),
-            NotFoundAnswer::Gone
-        );
-        assert_eq!(
-            not_found_answer(USER, false, roster(&[&format!("{USER}::screen")])),
-            NotFoundAnswer::Gone
-        );
-        assert_eq!(
-            not_found_answer(USER, false, roster(&[])),
-            NotFoundAnswer::Gone
-        );
-
-        // The SFU has no such room: nobody is in it.
-        assert_eq!(
-            not_found_answer::<&str>(USER, false, Some(Ok(None))),
-            NotFoundAnswer::Gone
-        );
-
-        // The roster could not be read: no answer, so a failure.
-        assert_eq!(
-            not_found_answer(USER, false, Some(Err("list 500"))),
-            NotFoundAnswer::Failed("list 500")
-        );
-    }
+mod pushes_answer_tests {
+    use super::pushes_answer;
 
     /// The pushes to the listed connections: the first error wins, else any
     /// landed push is `true`, else `false`.
@@ -2689,8 +2286,8 @@ mod not_found_answer_tests {
 /// AFK S-3 Wave A1: removal of every connection, the roster-driven push, the
 /// reporting listing (RB-2), the SFU call deadline and the per-node breaker
 /// (D-2, D-4, D-5). Every behavioural test calls the REAL `VoiceClient`
-/// method against `sfu_stub`; the three that resolve the identity mapping
-/// run on the shared Redis-test runtime.
+/// method against `sfu_stub`. No method resolves the identity mapping any
+/// more (S-3 cleanup), so none needs Redis.
 #[cfg(test)]
 mod sfu_s3_tests {
     use super::{
@@ -3202,8 +2799,9 @@ mod sfu_s3_tests {
         }};
     }
 
-    /// Every SFU method that needs no Redis, against a node that accepts
-    /// and never answers.
+    /// Every SFU method (none needs Redis since the S-3 cleanup: see
+    /// `no_sfu_method_resolves_the_identity_mapping`), against a node that
+    /// accepts and never answers.
     #[tokio::test]
     async fn every_sfu_call_is_bounded_and_a_timeout_is_an_error() {
         let channel = Channel::SavedMessages {
@@ -3237,25 +2835,45 @@ mod sfu_s3_tests {
         deadline_case!("delete_room", DELETE_ROOM, voice => voice.delete_room(NODE, ROOM));
     }
 
-    /// The three methods that resolve the identity mapping first (Redis):
-    /// unique channel ids, so the lookup finds nothing and falls back to the
-    /// bare id, and the SFU call that follows is bounded too.
+    /// WA-7 / RA2-7, retargeted by the S-3 cleanup. This used to drive the
+    /// three methods that resolved the identity mapping before their SFU call
+    /// (`remove_user`, `mute_track`, `update_permissions_if_present`) through
+    /// the deadline on Redis. All three are deleted, so NO surviving method
+    /// resolves the mapping, and every SFU method is driven through the
+    /// deadline by `every_sfu_call_is_bounded_and_a_timeout_is_an_error`
+    /// above with no Redis at all. This pins that premise on the shipping
+    /// text: a method that reads the mapping (or the per-connection record)
+    /// before its SFU call is a method the Redis-free deadline test cannot
+    /// reach, and must come with a bounded test of its own. The floor on the
+    /// public async methods keeps the scan from passing over nothing.
     #[test]
-    fn the_mapping_resolving_sfu_calls_are_bounded_too() {
-        crate::voice::tests::rt().block_on(async {
-            let channel_id = ulid::Ulid::new().to_string();
-            let user = User {
-                id: ulid::Ulid::new().to_string(),
-                ..Default::default()
-            };
+    fn no_sfu_method_resolves_the_identity_mapping() {
+        const SOURCE: &str = include_str!("voice_client.rs");
+        let shipping = &SOURCE[..SOURCE
+            .find("#[cfg(test)]\nmod screen_leg_permission_tests")
+            .expect("the first test module")];
+        let code: String = shipping
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
 
-            deadline_case!("remove_user", REMOVE, voice =>
-                voice.remove_user(NODE, &user.id, &channel_id));
-            deadline_case!("mute_track", MUTE, voice =>
-                voice.mute_track(NODE, &user.id, &channel_id, "TR_1"));
-            deadline_case!("update_permissions_if_present", UPDATE, voice =>
-                voice.update_permissions_if_present(NODE, &user, &channel_id, Default::default()));
-        })
+        assert!(
+            code.matches("pub async fn ").count() >= 15,
+            "expected at least 15 public async methods: {}",
+            code.matches("pub async fn ").count()
+        );
+        for mapping in [
+            "voice_participant_identity(",
+            "recorded_voice_connections(",
+            "get_connection(",
+        ] {
+            assert!(
+                !code.contains(mapping),
+                "a `VoiceClient` method reads `{mapping}` before an SFU call: give it a \
+                 bounded test of its own, as the deleted mapping-resolving methods had"
+            );
+        }
     }
 
     // ---- D-5: the breaker ----
@@ -3421,9 +3039,10 @@ mod sfu_s3_tests {
     }
 
     /// Every room-client call in the shipping code sits inside the
-    /// arguments of a `.sfu(` call. Textual, so it also covers the methods
-    /// the tests above cannot reach without a live mapping; the count floor
-    /// keeps it from passing over nothing.
+    /// arguments of a `.sfu(` call. Textual, so it also covers any call the
+    /// behavioural tests above do not drive; the count floor keeps it from
+    /// passing over nothing. The floor is today's count, 8, since the S-3
+    /// cleanup deleted `remove_user` (two calls) and `mute_track` (one).
     #[test]
     fn every_room_client_call_goes_through_sfu() {
         const SOURCE: &str = include_str!("voice_client.rs");
@@ -3465,8 +3084,8 @@ mod sfu_s3_tests {
             .collect();
 
         assert!(
-            calls.len() >= 11,
-            "expected at least 11 room-client calls, found {}",
+            calls.len() >= 8,
+            "expected at least 8 room-client calls, found {}",
             calls.len()
         );
         for at in calls {

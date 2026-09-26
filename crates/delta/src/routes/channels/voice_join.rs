@@ -4,8 +4,8 @@ use revolt_database::{
     voice::{
         assert_call_caps_admit, delete_voice_connections, get_channel_node,
         get_user_voice_channel_in_server, get_user_voice_channels, get_voice_channel_members,
-        raise_if_in_voice, recorded_voice_connections, set_call_notification_recipients,
-        set_channel_node, UserVoiceChannel, VoiceClient,
+        raise_if_in_voice, recorded_voice_connections, removal_teardown_sids,
+        set_call_notification_recipients, set_channel_node, UserVoiceChannel, VoiceClient,
     },
     Database, Session, User,
 };
@@ -275,14 +275,20 @@ pub async fn call(
             //    connection recorded after step 1 that the listing did not
             //    see is in neither set, so the script answers `Survivor` and
             //    it keeps its state. The channel came from `vc:{user}`, so
-            //    the user holds state here and the teardown always runs.
-            let mut sids = evicted.unwrap_or_default();
-            for sid in recorded {
-                if !sids.contains(&sid) {
-                    sids.push(sid);
-                }
-            }
-            delete_voice_connections(&previous_channel, &user.id, &sids).await?;
+            //    the user holds state here and the teardown always runs. The
+            //    union is the database crate's own (`removal_teardown_sids`,
+            //    AFK S-3 WB-6), shared with `remove_user_from_voice_channel`.
+            //
+            //    No `VoiceChannelLeave` is published here for a teardown no
+            //    webhook announces (a ghost of an ended call): unlike the
+            //    moderation removals (AFK S-3 WB-8) this path stays as it
+            //    was, a recorded follow-up.
+            delete_voice_connections(
+                &previous_channel,
+                &user.id,
+                &removal_teardown_sids(evicted, recorded),
+            )
+            .await?;
         }
     } else {
         raise_if_in_voice(&user, &user_voice_channel).await?;
@@ -807,8 +813,8 @@ mod test {
     /// the set teardown of the evicted sids plus the recorded ones. Read
     /// after the listing, a sibling that records in between would look stale
     /// and be deleted while live (WA-1). A listing-decided path never runs
-    /// the whole-user teardown, never the mapping-resolved single eviction,
-    /// and never reads the per-server pointer.
+    /// the whole-user teardown, never the bool eviction that cannot name the
+    /// sids it evicted, and never reads the per-server pointer.
     ///
     /// Both failure arms skip THIS channel and go on to the next: a failed
     /// record read or a failed eviction tears nothing of the channel down
@@ -838,10 +844,11 @@ mod test {
         );
         let evict =
             once("remove_user_if_present_sids(&node, &user.id, &previous_channel.id) .await");
+        // AFK S-3 WB-6: the union is the database crate's
+        // `removal_teardown_sids`, not a copy of it.
         let teardown = once(
-            "let mut sids = evicted.unwrap_or_default(); for sid in recorded \u{7b} \
-             if !sids.contains(&sid) \u{7b} sids.push(sid); \u{7d} \u{7d} \
-             delete_voice_connections(&previous_channel, &user.id, &sids).await?;",
+            "delete_voice_connections( &previous_channel, &user.id, \
+             &removal_teardown_sids(evicted, recorded), ) .await?;",
         );
         assert!(
             loop_head < release && release < recorded && recorded < evict && evict < teardown,
@@ -849,9 +856,12 @@ mod test {
             block
         );
 
+        // `remove_user_if_present(` (the bool answer, which cannot name the
+        // sids the set teardown needs) replaces the `.remove_user(` ban,
+        // which went vacuous when the S-3 cleanup deleted that method.
         for banned in [
             "delete_voice_state(",
-            ".remove_user(",
+            "remove_user_if_present(",
             "get_user_voice_channel_in_server(",
         ] {
             assert!(

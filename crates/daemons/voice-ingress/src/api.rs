@@ -18,7 +18,7 @@ use revolt_database::{
     },
     Database, AMQP,
 };
-use revolt_models::v0::PartialUserVoiceState;
+use revolt_models::v0::{PartialUserVoiceState, UserVoiceState};
 use revolt_result::{Result, ToRevoltError};
 use rocket::{post, State};
 use rocket_empty::EmptyResponse;
@@ -86,10 +86,11 @@ pub async fn ingress(
 
     // A SCREEN LEG (identity `{user}:{device}:screen`, android-screen-share
     // plan §2.3) is a HELPER of the user it belongs to, never a member of the
-    // call: no voice state, no identity mapping (that map is per USER and
-    // `remove_user` / `update_permissions` / the RC revoke all resolve through
-    // it — a leg writing there would redirect every moderation action at the
-    // phone), no roster slot, no join/leave events and no ring. Everything it
+    // call: no voice state, no identity mapping (that map is per USER, and
+    // the remote-control, annotation, caption and screen-leg routes resolve
+    // the user's connection through it — a leg writing there would point
+    // them at the phone), no connection record, no roster slot, no
+    // join/leave events and no ring. Everything it
     // touches hangs off its OWNER's voice state, which is why every branch
     // below checks that state first.
     //
@@ -379,9 +380,7 @@ pub async fn ingress(
             let identity = identity.to_internal_error()?;
             let sid = &event.participant.as_ref().to_internal_error()?.sid;
 
-            let joined_at = Timestamp::UNIX_EPOCH
-                .checked_add(Duration::seconds(event.created_at))
-                .unwrap();
+            let joined_at = event_joined_at(event.created_at);
 
             // Connect re-check (AFK S-3 D-3), FIRST, before anything is
             // written. A join token lives for seconds, so a ban, kick or
@@ -436,30 +435,50 @@ pub async fn ingress(
             // first attempt wrote. Returning on every `false` left a live
             // user no roster shows, with no ring and no cap backstop.
             //
-            // So the record decides, read after this sid was recorded:
-            // - This sid the user's ONLY recorded connection: a retry of the
-            //   first. It runs the backstop and is announced, on the state
-            //   the first attempt wrote. That state is read, not re-created:
-            //   track events may have set flags since, and the reset would
-            //   wipe them (F-15). Only a missing state (a first attempt that
-            //   failed while writing it) is created.
-            // - Any other connection recorded: a sibling holds the state.
-            //   Only the mapping hint above is refreshed: no flag reset, no
-            //   second Join/Move or ring, and no backstop, since both caps
-            //   are membership-based and a second connection of a member
-            //   adds no member.
+            // `retried_join` decides (WBR-1), from the state and the record
+            // read after this sid was recorded:
+            // - A state whose `joined_at` is THIS event's: a retry. Only
+            //   `create_voice_state` writes `joined_at`, from the
+            //   `created_at` of the event that created the state, and a
+            //   retry resends the same event. It holds whatever else was
+            //   recorded meanwhile: a sibling that joined between the failed
+            //   attempt and its retry, the over-cap sibling a failed
+            //   backstop removal left behind, or a stale sid.
+            // - A state with any other `joined_at`: another connection
+            //   created it, and this is a second connection. A state from
+            //   before the record existed, or a ghost, is one of these too.
+            // - No state (a teardown between the record and this read, or a
+            //   state missing a key `get_voice_state` needs; the roster
+            //   membership the record checks is written LAST, RA2-5): a
+            //   retry only when this sid is the user's ONLY recorded
+            //   connection (`retried_first_connection`).
             //
-            // A sibling that records between a failed first attempt and its
-            // retry makes the retry read as a sibling, so that user stays
-            // unannounced: a recorded residual.
+            // A retry runs the backstop and is announced, on the state the
+            // first attempt wrote. That state is read, not re-created: track
+            // events may have set flags since, and the reset would wipe them
+            // (F-15). Only a missing state is created. A second connection
+            // refreshes only the mapping hint above: no flag reset, no
+            // second Join/Move or ring, and no backstop, since both caps are
+            // membership-based and a second connection of a member adds no
+            // member.
+            //
+            // `created_at` is in whole seconds, so a sibling whose own join
+            // event was created in the same second as the first connection's
+            // reads as a retry: a duplicate Join (or Move) and ring on a
+            // state every roster already shows, and a second run of the cap
+            // backstop, which removes the user only if the roster is over a
+            // cap at that moment (a residual, as narrow as that window).
+            // Correctness also rests on LiveKit resending an identical body
+            // on a retry (release blocker WB-5).
             let existing_state = if first_connection {
                 None
             } else {
                 let recorded = recorded_voice_connections(&channel, user_id).await?;
-                if !retried_first_connection(&recorded, sid) {
+                let state = get_voice_state(&channel, user_id).await?;
+                if !retried_join(state.as_ref(), joined_at, &recorded, sid) {
                     return Ok(EmptyResponse);
                 }
-                get_voice_state(&channel, user_id).await?
+                state
             };
 
             let voice_state = match existing_state {
@@ -498,8 +517,9 @@ pub async fn ingress(
                 // listing, then the set delete, never the whole-user
                 // `delete_voice_state`. Nothing is announced. A failure
                 // answers 500; its retry records this sid again next to the
-                // sibling's, reads as a sibling and does not re-run this
-                // backstop (a recorded residual, behind a second failure).
+                // sibling's, but the state still carries this event's
+                // `joined_at`, so it reads as a retry and re-runs this
+                // backstop (WBR-1).
                 match delete_voice_connection(&channel, user_id, sid).await? {
                     ConnectionLeave::Last => {}
                     ConnectionLeave::Survivor => {
@@ -537,14 +557,31 @@ pub async fn ingress(
             // Ring other recipients via push notification when the first
             // participant starts the call. Uses our own voice state (not
             // LiveKit's `num_participants`, which is unreliable — see #457).
-            let members = get_voice_channel_members(&channel).await?;
-            if members.map_or(0, |m| m.len()) <= 1 {
-                let now = joined_at.to_string();
-                if let Err(e) = amqp
-                    .dm_call_updated(user_id, channel_id, Some(&now), false, None)
-                    .await
-                {
-                    log::error!("failed to publish call ring push: {e:?}");
+            //
+            // Nothing after the announce above may answer 500 (WBR-2): the
+            // retry would announce the join a second time (a Move as a Join,
+            // since this attempt drained the marker), ring again, and re-run
+            // the cap backstop after the join went out. So a failed roster
+            // read is reported (ERROR + Sentry) and the ring is skipped: with
+            // the roster unknown, ringing could repeat on every join, and a
+            // missed ring costs less.
+            match get_voice_channel_members(&channel).await {
+                Ok(members) => {
+                    if members.map_or(0, |m| m.len()) <= 1 {
+                        let now = joined_at.to_string();
+                        if let Err(e) = amqp
+                            .dm_call_updated(user_id, channel_id, Some(&now), false, None)
+                            .await
+                        {
+                            log::error!("failed to publish call ring push: {e:?}");
+                        }
+                    }
+                }
+                Err(error) => {
+                    log::error!("Roster read after announcing {identity} in {channel_id} failed ({error}); the call ring is skipped.");
+                    // ERROR + Sentry with the cause; the join is already
+                    // announced, so the converted error is discarded.
+                    let _ = Err::<(), _>(error).to_internal_error();
                 }
             }
 
@@ -691,6 +728,31 @@ pub async fn ingress(
                 if !stale.is_empty() {
                     log::info!("Dropping {} stale connection record(s) of {user_id} in {channel_id} the SFU no longer lists.", stale.len());
                     leave = delete_voice_connections(&channel, user_id, &stale).await?;
+
+                    // The confirmation turned `Survivor` into `Last` (WB-10):
+                    // the stale connections were the user's only others, so
+                    // nothing of theirs is left in the call. The release at
+                    // the top of this arm ends a controller grant only when
+                    // THIS connection held it; one held by a stale
+                    // connection names that connection's identity, and would
+                    // outlive the user. So the whole-user release runs here.
+                    // It revokes (`participant_already_gone: false`): the
+                    // listing shows the recorded connections gone, not the
+                    // grant's controller identity (a bare `{user}` reconnect
+                    // reuses it), and revoking a participant who is gone
+                    // answers Ok (D-7). A failed set delete answers 500 before
+                    // this; the retry answers `Survivor` again and gets here.
+                    if leave == ConnectionLeave::Last {
+                        revolt_database::voice::remote_control::release_remote_control_for_user(
+                            db,
+                            voice_client,
+                            &channel,
+                            user_id,
+                            "participant_left",
+                            false,
+                        )
+                        .await;
+                    }
                 }
 
                 // Still a survivor: the departed connection's camera/share/mic
@@ -1063,21 +1125,62 @@ fn stale_connections(recorded: &[(String, String)], listed: &[ParticipantInfo]) 
         .collect()
 }
 
+/// The `joined_at` a `participant_joined` stamps on the voice state it
+/// creates: the event's `created_at`, in unix SECONDS, as a timestamp.
+///
+/// `create_voice_state` stores it as whole milliseconds and
+/// `get_voice_state` reads those back, so a whole-second value survives the
+/// round trip exactly, and a retried event (the same body, the same
+/// `created_at`) compares equal to the state its first attempt wrote
+/// ([`retried_join`], WBR-1). Anything finer than a millisecond added here
+/// would make that comparison never hold. Pure.
+fn event_joined_at(created_at: i64) -> Timestamp {
+    Timestamp::UNIX_EPOCH
+        .checked_add(Duration::seconds(created_at))
+        .unwrap()
+}
+
 /// Whether a `participant_joined` for the connection `sid`, whose record
 /// answered `false` (the user already holds voice state in the channel), is
-/// LiveKit retrying the user's FIRST connection rather than a second one
-/// (AFK S-3 WB-1). `recorded` is this user's `recorded_voice_connections`,
-/// read after `sid` was recorded. Pure.
+/// LiveKit retrying the join that created that state rather than a second
+/// connection (AFK S-3 WB-1, WBR-1). `state` is the user's voice state in
+/// the channel, `joined_at` this event's ([`event_joined_at`]), and
+/// `recorded` the user's `recorded_voice_connections`, both read after `sid`
+/// was recorded. Pure.
+///
+/// - A state decides alone: a retry exactly when its `joined_at` is this
+///   event's. Only `create_voice_state` writes `joined_at`, from the event
+///   that created the state, and a retry resends that event, so whatever
+///   else the record holds (a sibling recorded between the failed attempt
+///   and its retry, an over-cap sibling a failed backstop removal left, a
+///   stale sid) cannot hide a retry. A state some other event created (a
+///   sibling's, a state from before the record existed, a ghost) makes this
+///   a second connection, whatever the record holds.
+/// - No state: [`retried_first_connection`] decides from the record.
+fn retried_join(
+    state: Option<&UserVoiceState>,
+    joined_at: Timestamp,
+    recorded: &[(String, String)],
+    sid: &str,
+) -> bool {
+    match state {
+        Some(state) => state.joined_at == joined_at,
+        None => retried_first_connection(recorded, sid),
+    }
+}
+
+/// Whether a `participant_joined` for the connection `sid`, whose record
+/// answered `false`, is a retry of the user's FIRST connection when NO voice
+/// state is left to compare against (a teardown between the record and the
+/// read, or a state missing a key `get_voice_state` needs); [`retried_join`]
+/// consults it only then.
+/// `recorded` is this user's `recorded_voice_connections`, read after `sid`
+/// was recorded. Pure.
 ///
 /// A retry is `sid` as the user's ONLY recorded connection: no other
-/// connection can hold the state, so the join is announced on the state
-/// there is. Any other recorded sid is a sibling that holds the state. A
-/// record without `sid` (a teardown removed it since) is neither, and is not
-/// announced.
-///
-/// A state with no record at all (a connection from before the record
-/// existed, or a ghost) reads as a retry too: the join is announced on that
-/// state, the direction that shows a live user rather than hides one.
+/// connection can hold the state, so the state is created and the join
+/// announced. Any other recorded sid is a sibling. A record without `sid` (a
+/// teardown removed it since) is neither, and is not announced.
 fn retried_first_connection(recorded: &[(String, String)], sid: &str) -> bool {
     matches!(recorded, [(only, _)] if only == sid)
 }
@@ -1376,18 +1479,77 @@ mod tests {
 
     /// D-7 / P2-5: the connection-scoped remote-control release runs BEFORE
     /// the teardown, so it still runs when the teardown's `?` fails, and the
-    /// whole-user release is not used on this path. Mutation this catches:
-    /// the release moved after `delete_voice_connection`.
+    /// whole-user release is never what a single connection's leave runs: it
+    /// appears once, after the `Survivor` confirmation's set delete (WB-10,
+    /// pinned in full below). Mutations this catches: the release moved after
+    /// `delete_voice_connection`, and the whole-user release put back at the
+    /// top of the arm, which ends a controller grant held by the user's
+    /// OTHER, still-live connection.
     #[test]
     fn a_member_leave_releases_remote_control_before_the_teardown() {
         let body = member_arm("participant_left");
-        assert!(!body.contains("release_remote_control_for_user("), "{body}");
         let release = once(&body, "release_remote_control_for_connection(");
         let teardown = once(&body, "delete_voice_connection(");
         assert!(
             release < teardown,
             "the release must run before the teardown: {body}"
         );
+        let whole_user = once(&body, "release_remote_control_for_user(");
+        let set_delete = once(&body, "delete_voice_connections(&channel, user_id, &stale)");
+        assert!(
+            set_delete < whole_user,
+            "the whole-user release runs only after the set delete: {body}"
+        );
+    }
+
+    /// WB-10: when the `Survivor` confirmation's set delete answers `Last`,
+    /// no connection of the user is left, so the WHOLE-USER release runs
+    /// (with a revoke), under that condition alone and right after the set
+    /// delete. The per-connection release at the top of the arm ends a
+    /// controller grant only when the departing connection held it; one held
+    /// by a stale connection would otherwise outlive the user. Mutations this
+    /// catches: the release dropped, run without the `Last` condition (which
+    /// ends grants of a user still in the call), and told the participant is
+    /// already gone (which skips the revoke).
+    #[test]
+    fn a_survivor_confirmed_as_last_releases_remote_control_for_the_whole_user() {
+        let body = member_arm("participant_left");
+        once(
+            &body,
+            "leave = delete_voice_connections(&channel, user_id, &stale).await?; \
+             if leave == ConnectionLeave::Last \u{7b} \
+             revolt_database::voice::remote_control::release_remote_control_for_user( \
+             db, voice_client, &channel, user_id, \"participant_left\", false, ) .await; \
+             \u{7d} \u{7d}",
+        );
+    }
+
+    /// WBR-2: once the join is announced, nothing in the member join may
+    /// answer 500, since the retry would announce it again (a Move as a
+    /// Join), ring again and re-run the cap backstop after the announce. The
+    /// ring's roster read is matched, never `?`-propagated, and its failure
+    /// is reported through `to_internal_error` (ERROR + Sentry). Mutation
+    /// this catches: `get_voice_channel_members(&channel).await?` put back.
+    #[test]
+    fn nothing_after_the_join_announce_answers_500() {
+        let body = member_arm("participant_joined");
+        let announce = once(
+            &body,
+            "if let Some(source_channel) = get_user_moved_to_voice(channel_id, user_id).await? \u{7b}",
+        );
+        let after = &body[announce..];
+        let after = &after[after.find('\u{7b}').unwrap()..];
+        assert!(
+            !after.contains(".await?") && !after.contains(")?"),
+            "a `?` after the announce answers 500 and re-announces on retry: {after}"
+        );
+        let read = once(
+            after,
+            "match get_voice_channel_members(&channel).await \u{7b} Ok(members) => \u{7b}",
+        );
+        let failed = once(after, "Err(error) => \u{7b}");
+        let reported = once(after, "let _ = Err::<(), _>(error).to_internal_error();");
+        assert!(read < failed && failed < reported, "{after}");
     }
 
     /// The leg cleanup on a leave addresses ONLY the leg derived from the
@@ -1469,7 +1631,11 @@ mod tests {
             &body,
             "let existing_state = if first_connection \u{7b} None \u{7d} else \u{7b}",
         );
-        let reuse = once(&body, "get_voice_state(&channel, user_id).await? \u{7d};");
+        let reuse = once(
+            &body,
+            "let state = get_voice_state(&channel, user_id).await?;",
+        );
+        once(&body, "return Ok(EmptyResponse); \u{7d} state \u{7d};");
         let create = once(
             &body,
             "let voice_state = match existing_state \u{7b} \
@@ -1485,17 +1651,22 @@ mod tests {
         );
     }
 
-    /// WB-1: a `false` record answer is a retry of the first connection when
-    /// this sid is the user's only recorded connection
-    /// (`retried_first_connection`). The retry runs the cap backstop and is
-    /// announced. Only a genuine second connection returns early, and that
-    /// is the ONLY early return between the record and the backstop.
-    /// Mutations this catches: the unconditional early return restored
-    /// (`if !first_connection`), and the retry decision inverted at the call
-    /// site. Both leave a retried join live and invisible to every roster.
+    /// WB-1 as amended by WBR-1: a `false` record answer is decided by
+    /// `retried_join`, handed the state, THIS event's `joined_at` (the one
+    /// `event_joined_at` derives, the value `create_voice_state` stores), the
+    /// record and the sid. A retry runs the cap backstop and is announced.
+    /// Only a second connection returns early, and that is the ONLY early
+    /// return between the record and the backstop. Mutations this catches:
+    /// the unconditional early return restored (`if !first_connection`), the
+    /// decision inverted at the call site, and the route deciding by
+    /// `retried_first_connection` alone, which reads a retry with anything
+    /// else recorded as a sibling (the re-audit's residuals a, b and c-prime)
+    /// and a legacy or ghost state as a retry (residual c).
     #[test]
     fn a_retried_first_join_is_announced_and_runs_the_backstop() {
         let body = member_arm("participant_joined");
+        let stamped = once(&body, "let joined_at = event_joined_at(event.created_at);");
+        assert_eq!(body.matches("let joined_at").count(), 1, "{body}");
         let record = once(
             &body,
             "let first_connection = record_voice_connection(&channel, user_id, sid, identity).await?;",
@@ -1504,10 +1675,16 @@ mod tests {
             &body,
             "let existing_state = if first_connection \u{7b} None \u{7d} else \u{7b} \
              let recorded = recorded_voice_connections(&channel, user_id).await?; \
-             if !retried_first_connection(&recorded, sid) \u{7b} \
+             let state = get_voice_state(&channel, user_id).await?; \
+             if !retried_join(state.as_ref(), joined_at, &recorded, sid) \u{7b} \
              return Ok(EmptyResponse); \u{7d} \
-             get_voice_state(&channel, user_id).await? \u{7d};",
+             state \u{7d};",
         );
+        assert!(
+            !body.contains("retried_first_connection("),
+            "the route decides through `retried_join` only: {body}"
+        );
+        assert!(stamped < record, "{body}");
         let backstop = once(&body, "video_roster_over_cap(");
         let announce = once(&body, "EventV1::VoiceChannelJoin");
         assert!(
@@ -1567,24 +1744,38 @@ mod tests {
         );
     }
 
-    /// No ingress path resolves a connection through the identity mapping:
-    /// `remove_user` and `mute_track` both do, and address at most the one
-    /// connection the mapping names (S-3 D-2). Mutation this catches: either
-    /// call put back.
+    /// No ingress path resolves a connection through the identity mapping,
+    /// which names at most one connection of the user (S-3 D-1/D-2): every
+    /// remedy addresses the event's own identity, and the one whole-user
+    /// removal goes through `remove_user_from_voice_channel`, which reads
+    /// the record BEFORE it lists the SFU (the WA-R ordering rule). Mutations
+    /// this catches: a mapping read put back (`get_voice_participant_identity`),
+    /// and a direct `remove_user_if_present` / `remove_user_if_present_sids`
+    /// call, which lists and evicts with no record read ahead of it. (The
+    /// methods this test used to ban, `VoiceClient::remove_user` and
+    /// `mute_track`, no longer exist, so banning them here pinned nothing.)
     #[test]
     fn no_ingress_path_resolves_a_connection_through_the_mapping() {
         let dense = dense();
-        assert!(!dense.contains("remove_user("), "a `remove_user(` is back");
-        assert!(!dense.contains(".mute_track("), "a `.mute_track(` is back");
+        assert!(
+            !dense.contains("get_voice_participant_identity("),
+            "a mapping read is back"
+        );
+        assert!(
+            !dense.contains("remove_user_if_present"),
+            "a direct whole-user SFU removal is back"
+        );
     }
 
     /// Every SFU call goes behind `VoiceClient` (S-3 D-2/D-5: its timeout and
-    /// breaker). Mutation this catches: the raw `room.client` leg removal put
-    /// back on the leave path.
+    /// breaker). `RoomClient.client` is private now, so the old route to the
+    /// raw client is closed; what is left is this crate building its own
+    /// LiveKit room client. Mutations this catches: a `RoomClient` named here,
+    /// and a raw `remove_participant` call.
     #[test]
     fn no_ingress_path_calls_the_room_client_directly() {
         let dense = dense();
-        assert!(!dense.contains(".client."), "a raw room-client call is back");
+        assert!(!dense.contains("RoomClient"), "a raw room client is back");
         assert!(
             !dense.contains(".remove_participant("),
             "a raw `remove_participant` is back"
@@ -1614,9 +1805,13 @@ mod tests {
         );
     }
 
-    use super::{retried_first_connection, stale_connections, survivor_track_flags};
+    use super::{
+        create_voice_state, delete_channel_voice_state, event_joined_at, get_voice_state,
+        record_voice_connection, recorded_voice_connections, retried_first_connection,
+        retried_join, stale_connections, survivor_track_flags, UserVoiceChannel,
+    };
     use livekit_protocol::{ParticipantInfo, TrackInfo};
-    use revolt_models::v0::PartialUserVoiceState;
+    use revolt_models::v0::{PartialUserVoiceState, UserVoiceState};
 
     /// A listed participant publishing `(source, muted)` tracks.
     fn participant(identity: &str, sid: &str, tracks: &[(i32, bool)]) -> ParticipantInfo {
@@ -1693,6 +1888,227 @@ mod tests {
     fn a_sid_the_record_no_longer_holds_is_not_announced() {
         assert!(!retried_first_connection(&record(&[]), "PA_a"));
         assert!(!retried_first_connection(&record(&["PA_b"]), "PA_a"));
+    }
+
+    /// The `created_at` (unix seconds) of the join event that created the
+    /// state, and of a later join event.
+    const FIRST: i64 = 1_790_000_000;
+    const LATER: i64 = FIRST + 7;
+
+    /// A voice state as `create_voice_state` writes it for a join event
+    /// created at `created_at`.
+    fn state_of(created_at: i64) -> UserVoiceState {
+        UserVoiceState {
+            id: "u".to_string(),
+            joined_at: event_joined_at(created_at),
+            is_receiving: true,
+            is_publishing: false,
+            screensharing: false,
+            camera: false,
+            screen_video: false,
+            recording: false,
+            rc_capable: false,
+            watching: false,
+        }
+    }
+
+    #[test]
+    fn a_retry_matches_the_joined_at_its_first_attempt_wrote() {
+        let state = state_of(FIRST);
+        assert!(retried_join(
+            Some(&state),
+            event_joined_at(FIRST),
+            &record(&["PA_a"]),
+            "PA_a"
+        ));
+    }
+
+    /// Residual (a) of the Wave B re-audit: the backstop's removal after a
+    /// `Survivor` failed, so the over-cap sibling is still recorded next to
+    /// the retried connection. The retry must re-run the backstop.
+    #[test]
+    fn a_retry_after_a_failed_backstop_removal_is_still_a_retry() {
+        let state = state_of(FIRST);
+        assert!(retried_join(
+            Some(&state),
+            event_joined_at(FIRST),
+            &record(&["PA_a", "PA_b"]),
+            "PA_a"
+        ));
+    }
+
+    /// Residual (b): a sibling recorded between the first attempt's failure
+    /// and its retry. The retry is announced; the sibling's own join, a
+    /// later event, is not a retry.
+    #[test]
+    fn a_sibling_recorded_before_the_retry_does_not_hide_it() {
+        let state = state_of(FIRST);
+        let both = record(&["PA_a", "PA_b"]);
+        assert!(retried_join(
+            Some(&state),
+            event_joined_at(FIRST),
+            &both,
+            "PA_a"
+        ));
+        assert!(!retried_join(
+            Some(&state),
+            event_joined_at(LATER),
+            &both,
+            "PA_b"
+        ));
+    }
+
+    /// Residual (c-prime): a stale sid (a connection whose own leave never
+    /// arrived) recorded next to the retried connection.
+    #[test]
+    fn a_stale_recorded_sid_does_not_hide_a_retry() {
+        let state = state_of(FIRST);
+        assert!(retried_join(
+            Some(&state),
+            event_joined_at(FIRST),
+            &record(&["PA_a", "PA_stale"]),
+            "PA_a"
+        ));
+    }
+
+    /// Residual (c): a state no connection in the record created (one from
+    /// before the record existed, or a ghost), with this sid the only one
+    /// recorded. That is a second connection of a user every roster already
+    /// shows: not announced again, and the state's flags are not reset.
+    #[test]
+    fn a_legacy_or_ghost_state_is_not_a_retry() {
+        let ghost = state_of(FIRST);
+        assert!(!retried_join(
+            Some(&ghost),
+            event_joined_at(LATER),
+            &record(&["PA_c"]),
+            "PA_c"
+        ));
+        assert!(!retried_join(
+            Some(&ghost),
+            event_joined_at(LATER),
+            &record(&[]),
+            "PA_c"
+        ));
+    }
+
+    #[test]
+    fn a_second_connection_is_not_a_retry() {
+        let state = state_of(FIRST);
+        assert!(!retried_join(
+            Some(&state),
+            event_joined_at(LATER),
+            &record(&["PA_a", "PA_b"]),
+            "PA_b"
+        ));
+        assert!(!retried_join(
+            Some(&state),
+            event_joined_at(FIRST - 1),
+            &record(&["PA_b"]),
+            "PA_b"
+        ));
+    }
+
+    /// With no state left to compare against, the record decides
+    /// (`retried_first_connection`).
+    #[test]
+    fn with_no_state_the_record_decides() {
+        let at = event_joined_at(FIRST);
+        assert!(retried_join(None, at, &record(&["PA_a"]), "PA_a"));
+        assert!(!retried_join(None, at, &record(&["PA_a", "PA_b"]), "PA_a"));
+        assert!(!retried_join(None, at, &record(&["PA_b"]), "PA_a"));
+        assert!(!retried_join(None, at, &record(&[]), "PA_a"));
+    }
+
+    /// One process-lifetime runtime for the Redis-backed test below.
+    /// `redis_kiss` pools connections globally, and a pooled connection made
+    /// on a runtime that has since shut down is dead; the db crate's voice
+    /// tests share one runtime for the same reason.
+    fn rt() -> &'static rocket::tokio::runtime::Runtime {
+        static RT: std::sync::OnceLock<rocket::tokio::runtime::Runtime> =
+            std::sync::OnceLock::new();
+        RT.get_or_init(|| {
+            rocket::tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .enable_all()
+                .build()
+                .unwrap()
+        })
+    }
+
+    /// WBR-1 through the REAL storage path, on live Redis: the `joined_at` a
+    /// retried event derives (`event_joined_at`, seconds) compares EQUAL to
+    /// the one `create_voice_state` stored (milliseconds) and
+    /// `get_voice_state` read back, so the retry rule can hold; a sibling's
+    /// later event does not. Also WBR-7 (the Wave B audit's N1): recording
+    /// the same sid again once its first attempt wrote the state answers
+    /// `false` and leaves ONE record entry. Needs Redis, like the db crate's
+    /// voice tests. Everything is read before the cleanup and asserted
+    /// after it, so a failure leaves no keys behind.
+    #[test]
+    fn a_retried_join_matches_the_state_its_first_attempt_stored_in_redis() {
+        rt().block_on(async {
+            let channel = UserVoiceChannel {
+                id: format!("C2TEST{}", ulid::Ulid::new()),
+                server_id: None,
+            };
+            let user = format!("C2USER{}", ulid::Ulid::new());
+            let sibling = format!("{user}:B");
+            let created_at: i64 = 1_790_000_000;
+
+            // The first attempt: recorded with no state yet, then the state.
+            let first = record_voice_connection(&channel, &user, "PA_a", &user).await;
+            let created = create_voice_state(&channel, &user, event_joined_at(created_at)).await;
+            // Its retry records the same sid again; then a sibling records.
+            let retried = record_voice_connection(&channel, &user, "PA_a", &user).await;
+            let recorded_once = recorded_voice_connections(&channel, &user).await;
+            let second = record_voice_connection(&channel, &user, "PA_b", &sibling).await;
+            let recorded = recorded_voice_connections(&channel, &user).await;
+            let state = get_voice_state(&channel, &user).await;
+
+            let cleanup = delete_channel_voice_state(&channel, std::slice::from_ref(&user)).await;
+            let state_after = get_voice_state(&channel, &user).await;
+            let recorded_after = recorded_voice_connections(&channel, &user).await;
+
+            assert!(first.unwrap(), "no state yet: a first connection");
+            assert_eq!(created.unwrap().joined_at, event_joined_at(created_at));
+            assert!(!retried.unwrap(), "the retry finds the state (WBR-7)");
+            assert_eq!(
+                recorded_once.unwrap(),
+                vec![("PA_a".to_string(), user.clone())],
+                "the same sid recorded twice is ONE entry"
+            );
+            assert!(!second.unwrap(), "the sibling finds the state");
+
+            let recorded = recorded.unwrap();
+            assert_eq!(recorded.len(), 2, "{recorded:?}");
+            let state = state.unwrap().expect("the state the first attempt wrote");
+            assert_eq!(
+                state.joined_at,
+                event_joined_at(created_at),
+                "the stored joined_at must read back exactly"
+            );
+            assert!(
+                retried_join(Some(&state), event_joined_at(created_at), &recorded, "PA_a"),
+                "the retry is a retry, sibling recorded or not"
+            );
+            assert!(
+                !retried_join(
+                    Some(&state),
+                    event_joined_at(created_at + 1),
+                    &recorded,
+                    "PA_b"
+                ),
+                "a sibling created a second later is not"
+            );
+
+            cleanup.unwrap();
+            assert!(state_after.unwrap().is_none(), "the state is cleaned up");
+            assert!(
+                recorded_after.unwrap().is_empty(),
+                "the record is cleaned up"
+            );
+        });
     }
 
     #[test]

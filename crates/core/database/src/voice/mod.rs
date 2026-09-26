@@ -206,9 +206,10 @@ pub async fn raise_if_in_voice(user: &User, channel: &UserVoiceChannel) -> Resul
 /// LiveKit participant identities may be device-qualified
 /// (`{user_id}:{device_id}`, media-E2EE plan Q4), but server-side voice
 /// operations address participants by user id. voice-ingress records each
-/// participant's full identity here (a hash per channel) so
-/// `update_participant`/`remove_participant` can resolve the identity the
-/// SFU actually knows. User ids are ULIDs and never contain `:`, so the
+/// participant's full identity here (a hash per channel) so a server-side
+/// operation acting on ONE connection of a user (the remote-control accept,
+/// the Android screen leg, captions and annotations) can name the identity
+/// the SFU actually knows. User ids are ULIDs and never contain `:`, so the
 /// user id is always the segment before the first `:`.
 ///
 /// 🔴 The map is keyed per USER, not per connection, and the premise that used
@@ -223,15 +224,16 @@ pub async fn raise_if_in_voice(user: &User, channel: &UserVoiceChannel) -> Resul
 ///
 /// So a lookup here answers "ONE identity this user was last seen under in this
 /// channel", never "the identities this user holds". Anything that has to be
-/// correct for an account sitting in a room twice — the voice-move eviction —
-/// must ask the SFU for its participant list instead, as the voice move does
-/// through `VoiceClient::list_participants_if_present`; see
-/// `select_move_connection` and `eviction_targets`. Reconciling the map against the live SFU participant
-/// set (for the Redis-eviction / missed-webhook case, where a stale/absent
-/// mapping makes a kick target a bare id the SFU no longer knows) is the
-/// roster-reconciliation work in 6.4; until then `get_voice_participant_identity`
-/// logs when it falls back so a silently-missed moderation action is at
-/// least visible in logs.
+/// correct for an account sitting in a room twice asks the SFU for its
+/// participant list instead: the voice move through
+/// `VoiceClient::list_participants_if_present` (see `select_move_connection`
+/// and `eviction_targets`), the moderation removals (kick, ban, leave,
+/// disconnect, force-disconnect) through
+/// `VoiceClient::remove_user_if_present_sids`, and the permission syncs
+/// through `VoiceClient::list_participants_reported` (AFK S-3 D-2, D-4). No
+/// removal and no permission push resolves through this map any more; the
+/// methods that did (`remove_user`, `mute_track`,
+/// `update_permissions_if_present`) were deleted in the S-3 cleanup.
 pub fn user_id_from_participant_identity(identity: &str) -> &str {
     identity
         .split(':')
@@ -262,9 +264,10 @@ pub async fn get_voice_participant_identity(channel_id: &str, user_id: &str) -> 
         // No recorded identity: fall back to the bare user id. This is
         // correct for non-E2EE participants (their SFU identity IS the bare
         // user id), but for a device-qualified participant whose mapping was
-        // evicted/never-written it means a kick/permission update will match
-        // no SFU participant and silently no-op — surface it (plan §1.5,
-        // 6.4 roster reconciliation).
+        // evicted/never-written it means an operation addressed by it (the
+        // callers named on `user_id_from_participant_identity`) will match no
+        // SFU participant and silently no-op — surface it (plan §1.5, 6.4
+        // roster reconciliation).
         log::debug!(
             "voice identity mapping missing for {user_id} in {channel_id}; using bare user id (moderation of a device-qualified participant may not apply)"
         );
@@ -691,9 +694,15 @@ pub async fn create_voice_state(
         watching: false,
     };
 
+    // The two roster memberships (`vc_members:{channel}`, `vc:{user}`) are
+    // written LAST (AFK S-3 RA2-5). The pipeline is not a transaction, so a
+    // reader can run between its commands, and the roster repair in
+    // `get_channel_voice_state` tears down, whole-user, any member of
+    // `vc_members` whose state it cannot read. Written first, the membership
+    // exposed a half-created state to exactly that repair, which erased the
+    // join (and its connection record) mid-write. Written last, a reader
+    // that sees the membership also sees every key `get_voice_state` needs.
     Pipeline::new()
-        .sadd(format!("vc_members:{}", &channel.id), user_id)
-        .sadd(format!("vc:{user_id}"), channel)
         .set(&unique_key, &channel.id)
         .set(
             format!("joined_at:{unique_key}"),
@@ -744,6 +753,9 @@ pub async fn create_voice_state(
             user_id,
             channel.server_id.as_ref().unwrap_or(&channel.id),
         ))
+        // LAST: see the comment above the pipeline.
+        .sadd(format!("vc_members:{}", &channel.id), user_id)
+        .sadd(format!("vc:{user_id}"), channel)
         .query_async::<_, ()>(&mut get_connection().await?.into_inner())
         .await
         .to_internal_error()?;
@@ -983,25 +995,31 @@ fn voice_state_teardown_input(
             // two independent sources of the stale mappings that make a voice
             // move evict the wrong connection.
             //
-            // Safe at every caller, because every one of them either has
-            // already used the identity or never needed it: the ingress leave
-            // paths and the reconcile sweep call
+            // Safe at every caller, because none of them needs the identity
+            // after this: the reconcile sweep calls
             // `delete_voice_participant_identity` immediately after this (now
-            // redundant, still harmless — HDEL is idempotent);
-            // `remove_user_from_voice_channel`, `voice_join`'s force-disconnect
-            // and the ingress admission backstop all issue their `remove_user`
-            // BEFORE reaching here, and that is the call that reads the
-            // mapping; and `get_channel_voice_state`'s roster repair is clearing
-            // a member whose voice state is already gone. Nothing in the
-            // workspace reads `get_voice_participant_identity` for a user after
-            // tearing their voice state down.
+            // redundant, still harmless — HDEL is idempotent); voice-ingress
+            // `participant_left` runs the connection mode, which reaches this
+            // only on the user's LAST connection; the removals
+            // that decide from an SFU listing (`remove_user_from_voice_channel`
+            // and through it kick, ban, leave, channel and server deletion,
+            // group member removal, bot deletion and the voice-ingress cap
+            // backstop's `Survivor` arm; the moderator disconnect;
+            // `voice_join`'s force-disconnect) address every connection by the
+            // identity the SFU LISTED, never through this mapping, and they
+            // reach here only in the set or connection mode, where a surviving
+            // connection re-points the mapping instead of losing it; and
+            // `get_channel_voice_state`'s roster repair is clearing a member
+            // whose voice state is already gone. Nothing in the workspace reads
+            // `get_voice_participant_identity` for a user after tearing their
+            // voice state down.
             //
             // The hash can hold only ONE field per user, so clearing it on one
             // connection's departure cannot discard a mapping that some other
             // live connection of theirs was relying on — there was never
             // anywhere for a second one to live. That is the same limitation
-            // the eviction leg of `move_user_to_voice_channel` exists to work
-            // around.
+            // the eviction leg of `move_user_to_voice_channel_expecting` and
+            // `VoiceClient::remove_user_if_present_sids` exist to work around.
             format!("voice_identity:{}", &channel.id),
             // Draw consent dies with the voice state: an allowlist must not
             // outlive the call it was granted in (rev-3 review). Keyed by THIS
@@ -2319,8 +2337,8 @@ pub enum VoiceMoveOutcome {
     /// connection was therefore ejected from the call rather than moved. An
     /// account normally holds exactly one, so normally those are the same
     /// sentence; they come apart when two sessions raced the join front door,
-    /// and the eviction leg of `move_user_to_voice_channel` says why that
-    /// resolves this way.
+    /// and the eviction leg of `move_user_to_voice_channel_expecting` says
+    /// why that resolves this way.
     ///
     /// There is no degraded path behind this variant: a listing that fails
     /// fails the move before anything is written, and a real failure to
@@ -2478,9 +2496,9 @@ async fn admit_voice_move(
 /// Every refusal a voice move can raise, with no side effects, so a caller
 /// can run them before it mutates anything.
 ///
-/// `move_user_to_voice_channel` runs the identical set — it goes through the
-/// same `admit_voice_move` and the same `assert_call_caps_admit` — so this is
-/// a pre-flight, never a substitute for it. Nothing here is a TOCTOU-free
+/// `move_user_to_voice_channel_expecting` runs the identical set — it goes
+/// through the same `admit_voice_move` and the same `assert_call_caps_admit` —
+/// so this is a pre-flight, never a substitute for it. Nothing here is a TOCTOU-free
 /// promise: the caps in particular are check-then-act, with the voice-ingress
 /// backstop closing the admission race.
 pub async fn assert_voice_move_admissible(
@@ -2625,8 +2643,9 @@ fn eviction_result<E>(
 ///   the SFU has never heard of, and issuing it would be a removal aimed at
 ///   nothing while the real leg stayed up.
 ///
-/// Legs are emitted BEFORE their primary, the order `remove_user` already uses:
-/// the leg is a helper of the primary, and tearing the owner down first is what
+/// Legs are emitted BEFORE their primary, the order every removal of a
+/// connection uses (`VoiceClient::remove_connection_if_present` as well): the
+/// leg is a helper of the primary, and tearing the owner down first is what
 /// leaves an orphan publishing.
 fn eviction_targets<I: IntoIterator<Item = String>>(
     identities: I,
@@ -2793,10 +2812,11 @@ fn move_addressing(moving: &ParticipantInfo, target_id: &str) -> MoveAddressing 
 }
 
 /// Whether the target has left the source channel a caller decided about:
-/// `expected_from` names that channel (`None` = no expectation), `from` is
-/// what the `{user}:{server}` pointer names now.
-fn source_moved_on(expected_from: Option<&str>, from: &str) -> bool {
-    expected_from.is_some_and(|expected| expected != from)
+/// `expected_from` names that channel, `from` is what the `{user}:{server}`
+/// pointer names now. There is no "no expectation" any more (AFK S-3
+/// cleanup): every caller decides about one particular source.
+fn source_moved_on(expected_from: &str, from: &str) -> bool {
+    expected_from != from
 }
 
 /// Move `target` into `destination`, server-authoritatively, for a caller
@@ -2820,24 +2840,26 @@ fn source_moved_on(expected_from: Option<&str>, from: &str) -> bool {
 /// whether it is *possible and safe*, and returns what it did.
 ///
 /// The AFK sweep decides from an idle claim naming the channel the member was
-/// idle in, and between that read and this call the member may deliberately
-/// switch to another channel of the server. Without an expectation the move
-/// re-derives `from` from the pointer and moves them out of the channel they
-/// just chose. With `expected_from: Some(x)` a pointer that no longer names
-/// `x` answers `NotConnected` BEFORE any admission, listing, write or mint:
-/// from the caller's point of view the member it meant is no longer
-/// connected there. A target already sitting in the destination is answered
-/// `AlreadyPresent` ahead of that check (S-3 RA-2).
+/// idle in, and the moderator route from the source its gate checked; between
+/// that read and this call the member may deliberately switch to another
+/// channel of the server. Re-deriving `from` from the pointer alone would move
+/// them out of the channel they just chose. So `expected_from` is REQUIRED
+/// (AFK S-3 cleanup; it used to be an `Option` whose `None` meant "wherever
+/// the pointer says", and no caller passed `None` any more): a pointer that
+/// no longer names `expected_from` answers `NotConnected` BEFORE any
+/// admission, listing, write or mint. From the caller's point of view the
+/// member it meant is no longer connected there. A target already sitting in
+/// the destination is answered `AlreadyPresent` ahead of that check (S-3
+/// RA-2).
 ///
 /// This narrows the window to the few reads between this check and the SFU
-/// listing; it does not close it. `None` means no expectation: the target is
-/// moved from wherever the pointer says they are.
+/// listing; it does not close it.
 pub async fn move_user_to_voice_channel_expecting(
     db: &Database,
     voice_client: &VoiceClient,
     target: &User,
     destination: &Channel,
-    expected_from: Option<&str>,
+    expected_from: &str,
 ) -> Result<VoiceMoveOutcome> {
     // Derived here, never passed in, for the reason in this function's doc
     // comment — and derived BEFORE
@@ -3179,9 +3201,10 @@ pub async fn move_user_to_voice_channel_expecting(
     // `delete_voice_state` and `delete_voice_participant_identity`, both keyed
     // by user id, so the account vanishes from `vc_members:{from}` entirely
     // while the other connection is still publishing its microphone into the
-    // source room. Absent from every roster, and unkickable — a second
-    // `remove_user` resolves through the now-empty mapping to the bare user id
-    // and no-ops against an SFU that knows a device-qualified one. So the SFU's
+    // source room. Absent from every roster, and unkickable by a removal that
+    // resolved the mapping (the since-deleted `remove_user`): the now-empty
+    // mapping gave the bare user id, which no-ops against an SFU that knows a
+    // device-qualified one. So the SFU's
     // own participant list is the authority here; Redis cannot be.
     //
     // WHAT THE MOVED USER ACTUALLY LANDS AS. The token above was minted for
@@ -3372,13 +3395,16 @@ fn member_sync_result<E>(
 /// Accepted race, as before: a connection whose token was minted before the
 /// caller's write and which joins after this listing is not pushed.
 ///
-/// Callers: `sync_afk_designation_change`, [`sync_server_voice_permissions`],
-/// and the role and permission routes (`roles_edit`, `roles_delete`,
-/// `roles_edit_positions`, both `permissions_set` and both
-/// `permissions_set_default`). Each of them calls this last, after its own
-/// write, with `?`: none acts on a partial sync, so trying every member
-/// before answering changes nothing for them except that later members are
-/// no longer left behind.
+/// Callers: `sync_afk_designation_change`, [`sync_server_voice_permissions`]
+/// (one call per channel, for the server-scoped routes `roles_delete`,
+/// `roles_edit_positions` and the server `permissions_set` /
+/// `permissions_set_default`, AFK S-3 D-6), and the channel-scoped routes:
+/// the channel `permissions_set` and `permissions_set_default`. (`roles_edit`
+/// syncs nothing any more: its body cannot change a voice permission, AFK
+/// S-3 F-7.) Each route calls its sync last, after its own write, with `?`:
+/// none acts on a partial sync, so trying every member before answering
+/// changes nothing for them except that later members are no longer left
+/// behind.
 pub async fn sync_voice_permissions(
     db: &Database,
     voice_client: &VoiceClient,
@@ -3635,7 +3661,8 @@ async fn sync_server_channel_voice_permissions(
 ///   it. There is nothing to swallow.
 ///
 /// Sync failures themselves are returned after the write has committed,
-/// matching `roles_edit.rs` and both `permissions_set.rs` call sites, but
+/// matching every role and permission route's sync (see
+/// [`sync_voice_permissions`] and [`sync_server_voice_permissions`]), but
 /// only once BOTH sides have been tried (AFK Stage 6 FU-1): an outgoing
 /// failure used to `?` out before the incoming side, leaving the new AFK
 /// channel's occupants publishing. Now the outgoing result is recorded, the
@@ -3653,7 +3680,7 @@ async fn sync_server_channel_voice_permissions(
 ///
 /// `role_id: None` on both calls means every member currently in the room,
 /// which is what a server-level designation change affects - it is not scoped
-/// to a role the way the `roles_edit` and `permissions_set` syncs are.
+/// to a role the way the two `permissions_set` syncs are.
 pub async fn sync_afk_designation_change(
     db: &Database,
     voice_client: &VoiceClient,
@@ -4283,7 +4310,7 @@ mod permission_tests {
 
     fn first(body: &str, needle: &str) -> usize {
         body.find(needle)
-            .unwrap_or_else(|| panic!("`move_user_to_voice_channel` no longer calls `{needle}`"))
+            .unwrap_or_else(|| panic!("the voice move no longer calls `{needle}`"))
     }
 
     /// P-3: the SFU listing precedes EVERY write and the mint. A listing
@@ -4305,7 +4332,7 @@ mod permission_tests {
             assert!(
                 list < first(&body, write),
                 "`list_participants_if_present(` must precede `{write}` in \
-                 `move_user_to_voice_channel` — a refusal, a gone room or a \
+                 the voice move — a refusal, a gone room or a \
                  failed listing has to leave nothing written and nothing minted"
             );
         }
@@ -4373,24 +4400,21 @@ mod permission_tests {
 
         assert!(
             !body.contains(".bot"),
-            "`move_user_to_voice_channel` reads `.bot` — the bot policy \
+            "the voice move reads `.bot` — the bot policy \
              belongs to its callers, not to the move"
         );
     }
 
-    /// A2 (5b-2.1 audit): the expectation, by value. No expectation never
-    /// refuses; an expectation refuses exactly when the pointer names some
-    /// other channel.
+    /// A2 (5b-2.1 audit): the expectation, by value. It refuses exactly when
+    /// the pointer names some other channel. (The S-3 cleanup made the
+    /// expectation required, so the old "no expectation never refuses" case
+    /// no longer exists to be asked.)
     #[test]
     fn a_move_expecting_a_source_refuses_only_when_the_pointer_left_it() {
         use super::source_moved_on;
 
-        assert!(!source_moved_on(None, "A"), "no expectation, no refusal");
-        assert!(!source_moved_on(Some("A"), "A"), "still in the source");
-        assert!(
-            source_moved_on(Some("A"), "B"),
-            "moved on to another channel"
-        );
+        assert!(!source_moved_on("A", "A"), "still in the source");
+        assert!(source_moved_on("A", "B"), "moved on to another channel");
     }
 
     /// A2 (5b-2.1 audit), INVERTED by S-3 RA-2: the expectation is checked
@@ -4575,16 +4599,21 @@ mod permission_tests {
         // keeps its own pre-write listing and must evict from THAT, never
         // from a second, later one. `remove_user_if_present_sids(` (S-3
         // WA-R) is the same listing returning sids, and the needle above does
-        // not match it, so it is banned by name.
+        // not match it, so it is banned by name. `remove_connection_if_present(`
+        // (S-3 D-2) removes one connection with no listing at all, and derives
+        // a leg the listing may not have reported: the move evicts exactly the
+        // listed targets. (The mapping-resolved `remove_user(` that used to
+        // head this list was deleted in the S-3 cleanup; the workspace pin
+        // `the_deleted_sfu_methods_stay_gone` keeps it from coming back.)
         for banned in [
-            "remove_user(",
             "remove_identity(",
             "remove_user_if_present(",
             "remove_user_if_present_sids(",
+            "remove_connection_if_present(",
         ] {
             assert!(
                 !body.contains(banned),
-                "`move_user_to_voice_channel` calls `{banned}` — it must evict \
+                "the voice move calls `{banned}` — it must evict \
                  only the listed connections, through `remove_identity_if_present`"
             );
         }
@@ -4838,6 +4867,40 @@ mod permission_tests {
         assert!(
             pipeline < delete && delete < run,
             "the claim DEL must be part of the join pipeline: {body}"
+        );
+    }
+
+    /// AFK S-3 RA2-5: a join writes its two roster memberships LAST, right
+    /// before the pipeline runs, after every key `get_voice_state` reads. The
+    /// pipeline is not a transaction, so the roster repair in
+    /// `get_channel_voice_state` can read between its commands, and it tears
+    /// down (whole-user) any `vc_members` entry whose state it cannot read.
+    /// A membership written first exposes the half-written join to it. The
+    /// interleaving cannot be forced from a test, so the order is pinned on
+    /// the text. Mutation: the two `.sadd(` moved back to the head.
+    #[test]
+    fn a_join_writes_the_roster_memberships_last() {
+        let shipping = this_file_shipping();
+        let body = flat_fn_body(&shipping, "pub async fn create_voice_state(");
+
+        const TAIL: &str = ".sadd(format!(\"vc_members:\u{7b}\u{7d}\", &channel.id), user_id) \
+             .sadd(format!(\"vc:\u{7b}user_id\u{7d}\"), channel) .query_async";
+        assert_eq!(body.matches(TAIL).count(), 1, "{body}");
+        assert_eq!(body.matches(".sadd(").count(), 2, "{body}");
+
+        let memberships = first(&body, TAIL);
+        for write in [".set(", ".del("] {
+            let last = body
+                .rfind(write)
+                .unwrap_or_else(|| panic!("no `{write}`: {body}"));
+            assert!(
+                last < memberships,
+                "a `{write}` follows the roster memberships: {body}"
+            );
+        }
+        assert!(
+            body.matches(".set(").count() >= 10,
+            "the pointer and the nine flags: {body}"
         );
     }
 
@@ -5151,8 +5214,10 @@ mod permission_tests {
     /// S-3 D-4 (lane B1) retargeted the call shape: the per-member call now
     /// carries the member's share of the room's ONE listing, and the push is
     /// `update_permissions_connections` over every listed connection instead
-    /// of the mapping-resolving `update_permissions_if_present`, which the
-    /// sync no longer calls at all.
+    /// of the mapping-resolving `update_permissions_if_present`. The S-3
+    /// cleanup deleted that method, so the ban on it here went vacuous; it
+    /// is retargeted at the mapping itself (`voice_participant_identity(`,
+    /// which covers both the raw and the falling-back reader).
     #[test]
     fn the_room_sync_tries_every_member_before_deciding() {
         let shipping = this_file_shipping();
@@ -5237,7 +5302,7 @@ mod permission_tests {
             "a participant the SFU no longer has is skipped: {push}"
         );
         assert!(
-            !push.contains("update_permissions_if_present("),
+            !push.contains("voice_participant_identity("),
             "the sync must not resolve a connection through the identity mapping: {push}"
         );
         // D-4's outcome table: only NO connection at all ends the member
@@ -5384,6 +5449,13 @@ mod permission_tests {
     /// Mutations: the record read moved below the listing, the set delete
     /// replaced by `delete_voice_state`, the held user's error swallowed,
     /// the WB-2 split reverted to an unconditional `?`.
+    ///
+    /// The S-3 cleanup moved the teardown into the shared
+    /// `tear_down_removed_connections` (WB-8 adds its Leave there), which is
+    /// scanned with the removal bodies, and retargeted the vacuous
+    /// `.remove_user(` ban (the method is deleted) at the bool
+    /// `remove_user_if_present(`, which cannot name the sids a set teardown
+    /// needs.
     #[test]
     fn the_removal_reads_the_record_before_the_listing_and_deletes_only_what_it_knows() {
         let shipping = this_file_shipping();
@@ -5392,6 +5464,7 @@ mod permission_tests {
             "pub async fn remove_user_from_voice_channel(",
             "pub async fn remove_user_from_voice_channels(",
             "pub async fn remove_user_from_server_voice(",
+            "pub async fn tear_down_removed_connections(",
         ] {
             let body = flat_fn_body(&shipping, definition);
             assert!(
@@ -5399,8 +5472,26 @@ mod permission_tests {
                 "`{definition}` decides from a listing and must never run the whole-user \
                  teardown (WA-1): {body}"
             );
-            assert!(!body.contains(".remove_user("), "{definition}: {body}");
+            assert!(
+                !body.contains("remove_user_if_present("),
+                "{definition}: {body}"
+            );
         }
+
+        let teardown = flat_fn_body(&shipping, "pub async fn tear_down_removed_connections(");
+        assert!(
+            teardown.starts_with(
+                "let announced_by_webhook = evicted.as_ref().is_some_and(|sids| !sids.is_empty()); \
+                 let leave = delete_voice_connections(channel, user_id, \
+                 &removal_teardown_sids(evicted, recorded)) .await?;"
+            ),
+            "the teardown is the set delete of the known sids: {teardown}"
+        );
+        assert_eq!(
+            teardown.matches("delete_voice_connections(").count(),
+            1,
+            "{teardown}"
+        );
 
         let body = flat_fn_body(&shipping, "pub async fn remove_user_from_voice_channel(");
         assert!(
@@ -5432,21 +5523,21 @@ mod permission_tests {
         );
         assert!(
             first(&body, "remove_user_if_present_sids(")
-                < first(&body, "delete_voice_connections("),
+                < first(&body, "tear_down_removed_connections("),
             "{body}"
         );
         assert!(
             body.ends_with(
-                "delete_voice_connections(channel, user_id, &removal_teardown_sids(evicted, \
-                 recorded)).await?; Ok(())"
+                "tear_down_removed_connections(channel, user_id, evicted, recorded).await?; Ok(())"
             ),
-            "the teardown is the set delete of the known sids: {body}"
+            "the teardown is the shared set delete of the known sids: {body}"
         );
         assert_eq!(
-            body.matches("delete_voice_connections(").count(),
+            body.matches("tear_down_removed_connections(").count(),
             1,
             "{body}"
         );
+        assert!(!body.contains("delete_voice_connections("), "{body}");
         // P2-6 + RA2-1: the whole-channel skip needs all three: nothing in
         // Redis (record or state), and nothing listed.
         assert!(
@@ -7012,12 +7103,15 @@ mod permission_tests {
         // needles are now ALSO derived from the transport itself: every
         // `pub async fn update_permissions…` in its shipping code becomes a
         // needle, so a push method added there is scanned without anyone
-        // remembering to list it here. The literal list stays (Wave C prunes
-        // the ones whose method is gone).
-        const PUSHES: [&str; 5] = [
-            ".update_permissions(",
+        // remembering to list it here. The literal list stays for the push
+        // methods that exist. The S-3 cleanup pruned the two whose method is
+        // gone (`.update_permissions(`, deleted in S-3 RB-1, and
+        // `.update_permissions_if_present(`, deleted in the cleanup): no
+        // shipping line matched either any more, so they scanned nothing, and
+        // a method of either name that comes back in the transport becomes a
+        // needle through the derivation below anyway.
+        const PUSHES: [&str; 3] = [
             ".update_permissions_identity(",
-            ".update_permissions_if_present(",
             ".update_permissions_identity_if_present(",
             ".update_permissions_connections(",
         ];
@@ -7133,6 +7227,149 @@ mod permission_tests {
                 sync_pushes.contains(&expected),
                 "expected a voice_participant_permissions push in {expected} — \
                  if the restore path moved, move this inventory with it"
+            );
+        }
+    }
+
+    /// Every shipping file of the workspace with its comment lines dropped
+    /// and every run of whitespace collapsed to one space. With `squeeze`,
+    /// whitespace is removed altogether, so a needle survives any rustfmt
+    /// wrap (but `fn name(` then reads `fnname(`).
+    fn flat_shipping_sources(squeeze: bool) -> Vec<(String, String)> {
+        shipping_sources()
+            .into_iter()
+            .map(|(rel, shipping)| {
+                let code = shipping
+                    .lines()
+                    .filter(|line| !line.trim_start().starts_with("//"))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let flat = if squeeze {
+                    code.chars().filter(|ch| !ch.is_whitespace()).collect()
+                } else {
+                    code.split_whitespace().collect::<Vec<_>>().join(" ")
+                };
+                (rel, flat)
+            })
+            .collect()
+    }
+
+    /// AFK S-3 D-5 (cleanup): no shipping file outside the transport calls a
+    /// LiveKit room-client method. `RoomClient.client` is private, so the
+    /// compiler refuses `.client.` outside `voice_client.rs`; this covers the
+    /// other bypass, a file that builds or names its own
+    /// `livekit_api::services::room::RoomClient`. Either way the call would
+    /// run with no `SFU_CALL_TIMEOUT` and no breaker. The needles are the
+    /// room service's methods whose names no `VoiceClient` method shares
+    /// (`create_room` and `delete_room` are shared, so they are matched only
+    /// on a raw `.client.`), plus any path to, or construction of, the
+    /// LiveKit type itself.
+    #[test]
+    fn no_shipping_file_outside_the_transport_calls_the_room_client() {
+        const TRANSPORT_FILE: &str = "core/database/src/voice/voice_client.rs";
+        const ROOM_CLIENT: [&str; 16] = [
+            ".remove_participant(",
+            ".update_participant(",
+            ".mute_published_track(",
+            ".list_participants(",
+            ".list_rooms(",
+            ".get_participant(",
+            ".update_room_metadata(",
+            ".update_subscriptions(",
+            ".send_data(",
+            ".forward_participant(",
+            ".move_participant(",
+            ".client.create_room(",
+            ".client.delete_room(",
+            "services::room",
+            "room::RoomClient",
+            "RoomClient::",
+        ];
+
+        let sources = flat_shipping_sources(true);
+        let transport = &sources
+            .iter()
+            .find(|(rel, _)| rel == TRANSPORT_FILE)
+            .expect("the transport file moved: update this contract")
+            .1;
+        // Anti-vacuity: the transport itself makes these calls and builds
+        // the client, so the needles (squeezed as the scan squeezes) match
+        // real code.
+        for needle in [
+            ".remove_participant(",
+            ".update_participant(",
+            ".client.create_room(",
+            "RoomClient::",
+        ] {
+            assert!(
+                transport.contains(needle),
+                "`{needle}` no longer matches the transport, so it proves nothing elsewhere"
+            );
+        }
+
+        for (rel, compact) in &sources {
+            if rel == TRANSPORT_FILE {
+                continue;
+            }
+            for needle in ROOM_CLIENT {
+                assert!(
+                    !compact.contains(needle),
+                    "{rel} calls the LiveKit room client (`{needle}`) outside the transport: \
+                     go through a `VoiceClient` method, which runs under the D-5 deadline \
+                     and breaker"
+                );
+            }
+        }
+    }
+
+    /// AFK S-3 cleanup: the mapping-resolving SFU methods (`remove_user`,
+    /// `mute_track`, `update_permissions_if_present`) and the RA-1 machinery
+    /// behind the last one (`not_found_answer`, `NotFoundAnswer`,
+    /// `push_primary_and_leg`) are gone, and stay gone: nowhere in the
+    /// shipping workspace is any of them defined or called. Each resolved
+    /// ONE connection of a user through the identity mapping, which names at
+    /// most one; every caller now addresses the connections the SFU lists.
+    /// A name must stand alone: `remove_user_if_present(` or
+    /// `mute_track_identity(` never match.
+    #[test]
+    fn the_deleted_sfu_methods_stay_gone() {
+        const GONE: [&str; 6] = [
+            "remove_user(",
+            "mute_track(",
+            "update_permissions_if_present(",
+            "not_found_answer(",
+            "NotFoundAnswer",
+            "push_primary_and_leg(",
+        ];
+
+        // Collapsed, not squeezed: `fn remove_user(` must keep the space that
+        // makes the name stand alone.
+        let sources = flat_shipping_sources(false);
+        for (rel, flat) in &sources {
+            for name in GONE {
+                for (at, _) in flat.match_indices(name) {
+                    let before = flat[..at].chars().next_back();
+                    assert!(
+                        before.is_some_and(|ch| ch.is_ascii_alphanumeric() || ch == '_'),
+                        "`{name}` is back in {rel}"
+                    );
+                }
+            }
+        }
+        // Anti-vacuity: the live twins the scan must NOT match are there, in
+        // the form a definition of a deleted name would take.
+        let transport = &sources
+            .iter()
+            .find(|(rel, _)| rel == "core/database/src/voice/voice_client.rs")
+            .expect("the transport file moved: update this contract")
+            .1;
+        for twin in [
+            "pub async fn remove_user_if_present(",
+            "pub async fn mute_track_identity(",
+        ] {
+            assert!(
+                transport.contains(twin),
+                "`{twin}` is gone from the transport"
             );
         }
     }
@@ -8075,8 +8312,8 @@ mod permission_tests {
     // ---- the voice-move admission gates ----------------------------------
     //
     // These exercise `admit_voice_move`, the side-effect-free half of
-    // `move_user_to_voice_channel`, against a real database and the real
-    // permission calculus. They stop short of the call-admission caps and of
+    // `move_user_to_voice_channel_expecting`, against a real database and the
+    // real permission calculus. They stop short of the call-admission caps and of
     // the move itself: both read Redis, which these tests do not have,
     // whereas every gate below is answerable from the channel document and
     // the calculus alone.
@@ -8786,8 +9023,14 @@ fn removal_outcome(
 /// besides the connection record: membership of `vc_members:{channel}`,
 /// `channel` in `vc:{user}`, or the per-server pointer naming `channel`.
 /// One pipelined read. [`remove_user_from_voice_channel`] runs nothing for a
-/// user with none of these, no record and no listed connection.
-async fn holds_voice_state_in(channel: &UserVoiceChannel, user_id: &str) -> Result<bool> {
+/// user with none of these, no record and no listed connection, and the
+/// moderator disconnect (`member_edit`) makes the same skip through this
+/// same check (AFK S-3 WB-6).
+///
+/// The pointer is only ever COMPARED with `channel` here, never used to pick
+/// a channel: a caller that must act on one particular channel (the
+/// disconnect's gated source) stays on it.
+pub async fn holds_voice_state_in(channel: &UserVoiceChannel, user_id: &str) -> Result<bool> {
     let parent = channel.server_id.as_ref().unwrap_or(&channel.id);
 
     let (member, listed, pointer): (bool, bool, Option<String>) = Pipeline::new()
@@ -8806,8 +9049,10 @@ async fn holds_voice_state_in(channel: &UserVoiceChannel, user_id: &str) -> Resu
 /// `recorded` BEFORE that listing that the SFU did not list (stale), each
 /// once. `evicted` is `None` when there was no listing to evict from (no
 /// node pinned, or the SFU has no such room): the recorded sids alone.
-/// Pure.
-fn removal_teardown_sids(evicted: Option<Vec<String>>, recorded: Vec<String>) -> Vec<String> {
+/// Pure. Shared by every removal that decides from a listing: this crate's
+/// [`tear_down_removed_connections`] and `voice_join`'s force-disconnect
+/// (AFK S-3 WB-6), so the union cannot drift between them.
+pub fn removal_teardown_sids(evicted: Option<Vec<String>>, recorded: Vec<String>) -> Vec<String> {
     let mut sids = evicted.unwrap_or_default();
     for sid in recorded {
         if !sids.contains(&sid) {
@@ -8815,6 +9060,57 @@ fn removal_teardown_sids(evicted: Option<Vec<String>>, recorded: Vec<String>) ->
         }
     }
     sids
+}
+
+/// Whether a removal's teardown must publish the `VoiceChannelLeave` itself
+/// (AFK S-3 WB-8): exactly when it removed the user's LAST connection or
+/// state here (`Last`) and no SFU webhook will announce the departure.
+///
+/// A primary the removal evicted leaves the room, and its
+/// `participant_left` publishes the Leave from voice-ingress on `Last` (the
+/// record the teardown already deleted reads as no survivor there). With no
+/// primary evicted (no node pinned, a room the SFU no longer has, or a
+/// listing that named nothing of the user) nothing will ever leave the SFU,
+/// so no webhook follows, and without this every other client kept the
+/// ghost on its roster. Never on `Survivor`: the user is still in the call.
+/// Pure.
+fn removal_publishes_leave(leave: ConnectionLeave, announced_by_webhook: bool) -> bool {
+    leave == ConnectionLeave::Last && !announced_by_webhook
+}
+
+/// The teardown of a removal that decided from a listing (AFK S-3 D-2, as
+/// amended by WA-R / RA2-1): the set delete of
+/// `returned ∪ (recorded − returned)` ([`removal_teardown_sids`]), never the
+/// whole-user [`delete_voice_state`], then the `VoiceChannelLeave` when
+/// [`removal_publishes_leave`] says no webhook will announce it (WB-8).
+///
+/// `evicted` is what `remove_user_if_present_sids` returned (`None` with no
+/// listing), `recorded` the sids read BEFORE that listing (the ordering
+/// rule). Callers: [`remove_user_from_voice_channel`] and the moderator
+/// disconnect in `member_edit`. The caller has already decided the user
+/// holds something here, or that the listing named them.
+pub async fn tear_down_removed_connections(
+    channel: &UserVoiceChannel,
+    user_id: &str,
+    evicted: Option<Vec<String>>,
+    recorded: Vec<String>,
+) -> Result<ConnectionLeave> {
+    let announced_by_webhook = evicted.as_ref().is_some_and(|sids| !sids.is_empty());
+
+    let leave =
+        delete_voice_connections(channel, user_id, &removal_teardown_sids(evicted, recorded))
+            .await?;
+
+    if removal_publishes_leave(leave, announced_by_webhook) {
+        EventV1::VoiceChannelLeave {
+            id: channel.id.clone(),
+            user: user_id.to_string(),
+        }
+        .p(channel.id.clone())
+        .await;
+    }
+
+    Ok(leave)
 }
 
 /// Report a failed eviction from a call where Redis holds nothing of
@@ -8885,10 +9181,20 @@ fn report_unheld_eviction_failure(channel_id: &str, user_id: &str, error: revolt
 ///    failed: `remove_user_if_present_sids` answers both with one `Err`, so
 ///    they cannot be told apart here. That one is reported too.
 /// 4. `delete_voice_connections(returned ∪ (recorded − returned))`, or the
-///    recorded sids for a room the SFU no longer has. An EMPTY set is the
-///    script's pure survivor check: with nothing of the user recorded it is
-///    `Last` and the full teardown, which is what a user with state and no
-///    record (a legacy connection, or a ghost) needs.
+///    recorded sids for a room the SFU no longer has, through
+///    [`tear_down_removed_connections`]. An EMPTY set is the script's pure
+///    survivor check: with nothing of the user recorded it is `Last` and the
+///    full teardown, which is what a user with state and no record (a legacy
+///    connection, or a ghost) needs. A `Last` that no webhook will announce
+///    (nothing evicted: a ghost of an ended call, or of a room the SFU no
+///    longer has) publishes the `VoiceChannelLeave` here (AFK S-3 WB-8).
+///
+/// Callers: kick (`member_remove`), ban (`ban_create`) and leaving the server
+/// (`server_delete`), all three through [`remove_user_from_server_voice`];
+/// `channel_delete`; `group_remove_member`; bot deletion (through
+/// [`remove_user_from_voice_channels`]), and voice-ingress (the
+/// `participant_joined` cap backstop, when a sibling connection answers
+/// `Survivor`, AFK S-3 WB-3).
 ///
 /// SKIPPED ENTIRELY (P2-6 + RA2-1): a user with nothing recorded, no voice
 /// state here (step 2) and no connection listed gets no remote-control
@@ -8969,7 +9275,7 @@ pub async fn remove_user_from_voice_channel(
         .await;
     }
 
-    delete_voice_connections(channel, user_id, &removal_teardown_sids(evicted, recorded)).await?;
+    tear_down_removed_connections(channel, user_id, evicted, recorded).await?;
 
     Ok(())
 }
@@ -11100,7 +11406,7 @@ mod tests {
                 &voice_client,
                 &target,
                 destination,
-                Some(source.id()),
+                source.id(),
             )
             .await
             .unwrap(),
@@ -11113,7 +11419,7 @@ mod tests {
                 &voice_client,
                 &target,
                 third,
-                Some(source.id()),
+                source.id(),
             )
             .await
             .unwrap(),
@@ -12351,5 +12657,241 @@ mod tests {
         assert!(!joined_member, "the call the user is in is torn down");
         assert!(joined_record.is_empty(), "{joined_record:?}");
         assert!(left.iter().all(Option::is_none), "{left:?}");
+    }
+
+    // ---- AFK S-3 WB-8: the Leave no webhook will publish ----
+
+    /// The rule by value: a Leave only on `Last`, and only when no evicted
+    /// primary's `participant_left` will announce it. Mutations: the
+    /// webhook half dropped (a double Leave), the `Last` half dropped (a
+    /// Leave for a user who is still in the call).
+    #[test]
+    fn a_removal_publishes_the_leave_only_for_an_unannounced_last() {
+        use super::removal_publishes_leave;
+
+        assert!(removal_publishes_leave(ConnectionLeave::Last, false));
+        assert!(!removal_publishes_leave(ConnectionLeave::Last, true));
+        assert!(!removal_publishes_leave(ConnectionLeave::Survivor, false));
+        assert!(!removal_publishes_leave(ConnectionLeave::Survivor, true));
+    }
+
+    /// Run `removal` and count the `VoiceChannelLeave`s for `user` it
+    /// published on `channel`'s topic, through a subscription opened BEFORE
+    /// it runs. A marker Leave published after it bounds the read: pub/sub is
+    /// FIFO per subscription, so everything the removal published has
+    /// arrived once the marker has.
+    async fn leaves_published_by<Fut>(
+        channel: &UserVoiceChannel,
+        user: &str,
+        removal: Fut,
+    ) -> (Result<()>, usize)
+    where
+        Fut: std::future::Future<Output = Result<()>>,
+    {
+        use futures::StreamExt;
+        const MARKER: &str = "wb8-marker";
+
+        let mut pubsub = redis_kiss::open_pubsub_connection()
+            .await
+            .expect("pubsub connection");
+        pubsub.subscribe(&channel.id).await.expect("subscribe");
+
+        let result = removal.await;
+
+        EventV1::VoiceChannelLeave {
+            id: channel.id.clone(),
+            user: MARKER.to_string(),
+        }
+        .p(channel.id.clone())
+        .await;
+
+        let mut leaves = 0;
+        let mut stream = pubsub.on_message();
+        loop {
+            let message = tokio::time::timeout(std::time::Duration::from_secs(5), stream.next())
+                .await
+                .expect("the marker Leave must arrive within 5 s")
+                .expect("the subscription ended");
+            if let Ok(EventV1::VoiceChannelLeave { id, user: left }) =
+                redis_kiss::decode_payload::<EventV1>(&message)
+            {
+                if id != channel.id {
+                    continue;
+                }
+                if left == MARKER {
+                    break;
+                }
+                if left == user {
+                    leaves += 1;
+                }
+            }
+        }
+        (result, leaves)
+    }
+
+    /// WB-8 through the REAL `remove_user_from_voice_channel`: the teardown
+    /// publishes exactly one `VoiceChannelLeave` when it answers `Last` and
+    /// nothing was evicted (no webhook will follow): a ghost of an ended call
+    /// (no node), a room the SFU no longer has, a listing that names nothing
+    /// of the user. None when a listed primary was evicted (its
+    /// `participant_left` announces it), none on `Survivor` (a sibling
+    /// recorded after the removal's read keeps the user in the call), and
+    /// none when the user held nothing here. Before WB-8 the first three
+    /// published nothing and every other client kept the ghost. Mutations:
+    /// the publish removed (the three ghosts are silent); the rule reduced to
+    /// `Last` (the evicted case publishes); reduced to "nothing evicted" (the
+    /// survivor case publishes).
+    #[test]
+    fn a_removal_announces_the_leave_no_webhook_will() {
+        rt().block_on(a_removal_announces_the_leave_no_webhook_will_case())
+    }
+
+    async fn a_removal_announces_the_leave_no_webhook_will_case() {
+        let db = Database::Reference(Default::default());
+        let mut conn = get_connection().await.expect("redis");
+
+        /// `listing`: `None` = the SFU has no such room, `Some("user")` =
+        /// it lists the user's `SID_A`, anything else = it lists another
+        /// user only.
+        struct Case {
+            name: &'static str,
+            node: bool,
+            listing: Option<&'static str>,
+            recorded: bool,
+            state: bool,
+            late_sibling: bool,
+            leaves: usize,
+            member_after: bool,
+        }
+        let cases = [
+            Case {
+                name: "ghost of an ended call",
+                node: false,
+                listing: None,
+                recorded: true,
+                state: true,
+                late_sibling: false,
+                leaves: 1,
+                member_after: false,
+            },
+            Case {
+                name: "room the SFU no longer has",
+                node: true,
+                listing: None,
+                recorded: false,
+                state: true,
+                late_sibling: false,
+                leaves: 1,
+                member_after: false,
+            },
+            Case {
+                name: "listing names nothing of the user",
+                node: true,
+                listing: Some("other"),
+                recorded: true,
+                state: true,
+                late_sibling: false,
+                leaves: 1,
+                member_after: false,
+            },
+            Case {
+                name: "a listed primary was evicted",
+                node: true,
+                listing: Some("user"),
+                recorded: true,
+                state: true,
+                late_sibling: false,
+                leaves: 0,
+                member_after: false,
+            },
+            Case {
+                name: "a sibling recorded after the read survives",
+                node: true,
+                listing: Some("other"),
+                recorded: true,
+                state: true,
+                late_sibling: true,
+                leaves: 0,
+                member_after: true,
+            },
+            Case {
+                name: "the user held nothing here",
+                node: true,
+                listing: Some("other"),
+                recorded: false,
+                state: false,
+                late_sibling: false,
+                leaves: 0,
+                member_after: false,
+            },
+        ];
+
+        for case in cases {
+            let (channel, user, _) = connection_case_ids("W8");
+            let other = format!("other{user}");
+            if case.recorded {
+                assert!(record_voice_connection(&channel, &user, "SID_A", &user)
+                    .await
+                    .unwrap());
+            }
+            if case.state {
+                create_voice_state(&channel, &user, Timestamp::now_utc())
+                    .await
+                    .unwrap();
+            }
+            if case.node {
+                set_channel_node(&channel.id, stub::NODE).await.unwrap();
+            }
+
+            let listing = match case.listing {
+                None => None,
+                Some("user") => Some(stub::list_participants_response_sids(&[(
+                    "SID_A", &user, "",
+                )])),
+                Some(_) => Some(stub::list_participants_response_sids(&[(
+                    "SID_O", &other, "",
+                )])),
+            };
+            let sfu = {
+                let (channel, user) = (channel.clone(), user.clone());
+                let late_sibling = case.late_sibling;
+                stub::Stub::serve(move |path, _| match path {
+                    stub::LIST => {
+                        if late_sibling {
+                            // B joins now: after the removal's record read.
+                            let _ = rt().block_on(record_voice_connection(
+                                &channel,
+                                &user,
+                                "SID_B",
+                                &format!("{user}:B"),
+                            ));
+                        }
+                        match &listing {
+                            Some(listing) => stub::ok(listing.clone()),
+                            None => stub::not_found(),
+                        }
+                    }
+                    stub::REMOVE => stub::ok(Vec::new()),
+                    _ => stub::internal(),
+                })
+            };
+
+            let voice_client = stub::voice_client(sfu.url());
+            let (result, leaves) = leaves_published_by(
+                &channel,
+                &user,
+                remove_user_from_voice_channel(&db, &voice_client, &channel, &user),
+            )
+            .await;
+            sfu.finish();
+            let member = is_voice_member(&mut conn, &channel, &user).await;
+
+            delete_voice_state(&channel, &user).await.expect("cleanup");
+            delete_channel_node(&channel.id).await.expect("cleanup");
+
+            assert!(result.is_ok(), "{}: {result:?}", case.name);
+            assert_eq!(leaves, case.leaves, "{}: Leaves published", case.name);
+            assert_eq!(member, case.member_after, "{}: membership after", case.name);
+        }
     }
 }

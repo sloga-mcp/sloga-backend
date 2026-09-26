@@ -692,7 +692,7 @@ async fn process_candidate(
             voice_client,
             &user,
             &afk_channel,
-            Some(&fresh_claim.channel_id),
+            &fresh_claim.channel_id,
         ),
     )
     .await;
@@ -1044,20 +1044,22 @@ mod tests {
     }
 
     /// The one move call (audit A2: the variant that takes the expected
-    /// source). The plain `move_user_to_voice_channel(` must not appear.
+    /// source, the only move entry point since S-3 RB-1).
     const MOVE_CALL: &str = "move_user_to_voice_channel_expecting(";
 
+    /// The move is called once in the whole sweep, from `process_candidate`.
+    /// (The S-3 cleanup deleted the plain move, so the ban on it that used to
+    /// sit here matched nothing; it is retargeted at the file-wide call
+    /// count, which a second move call anywhere in the sweep turns red.)
     #[test]
     fn the_move_is_awaited_and_never_propagated() {
         let body = process_candidate_body();
 
         assert_eq!(body.matches(MOVE_CALL).count(), 1);
         assert_eq!(
-            code_only(production())
-                .matches("move_user_to_voice_channel(")
-                .count(),
-            0,
-            "the sweep moves only through the expecting variant"
+            code_only(production()).matches(MOVE_CALL).count(),
+            1,
+            "the sweep moves from exactly one place"
         );
         let after_call = &body[body.find(MOVE_CALL).unwrap()..];
         let after_await =
@@ -1226,9 +1228,11 @@ mod tests {
     }
 
     /// Audit A2: the move names the source it was decided about, taken from
-    /// the claim RE-READ under the move claim, never `None` (which would
-    /// re-derive the source from the pointer and move a member out of a
-    /// channel they switched to in between).
+    /// the claim RE-READ under the move claim, never the first read's (which
+    /// a member may have switched away from in between). The S-3 cleanup
+    /// made the expectation a required `&str`, so the `!call.contains("None")`
+    /// that used to guard against "no expectation" could no longer fail and
+    /// was deleted; the exact argument list below pins the source.
     #[test]
     fn the_move_expects_the_reread_claims_channel() {
         let body = process_candidate_body();
@@ -1236,11 +1240,8 @@ mod tests {
 
         assert_eq!(
             call,
-            format!(
-                "{MOVE_CALL}db,voice_client,&user,&afk_channel,Some(&fresh_claim.channel_id),)"
-            )
+            format!("{MOVE_CALL}db,voice_client,&user,&afk_channel,&fresh_claim.channel_id,)")
         );
-        assert!(!call.contains("None"));
 
         let fresh_claim = body
             .find("let Some(fresh_claim) = fresh.claim.as_ref() else")
@@ -1358,6 +1359,52 @@ mod tests {
         assert_eq!(
             requeue_score(AfkRequeue::Refused, 0, 60, 0),
             Some(AFK_REFUSAL_BACKOFF_SECS as i64 * 1000)
+        );
+    }
+
+    /// AFK S-3 D-5 (P2-7): the move's SFU budget, stated against the REAL
+    /// `pub` constants of the transport. A retyped `3` here would stay green
+    /// whatever the transport did.
+    ///
+    /// Every SFU call is bounded by `SFU_CALL_TIMEOUT`, and a node's breaker
+    /// trips after two consecutive timeouts and then fails its calls fast for
+    /// `SFU_BREAKER_WINDOW`. So a node costs a move at most two timeouts per
+    /// window, and the bounds hold ONLY with the breaker:
+    ///
+    /// - The whole move (one listing and the evictions on the source's node,
+    ///   one `create_room` on the destination's, the remote-control calls on
+    ///   the source's): at most two distinct nodes, two timeouts each, inside
+    ///   `AFK_MOVE_TIMEOUT`.
+    /// - Mint to emit: only the remote-control release sits between
+    ///   `create_token` and the event that hands the token over, up to four
+    ///   calls, all on the node the source call's grants were made on. One
+    ///   node, two timeouts, inside `MOVE_TOKEN_TTL`; and the window outlasts
+    ///   the token, so a breaker that trips inside it never lets a half-open
+    ///   probe add a third.
+    ///
+    /// The plan's text asked for `2 * 2 * SFU_CALL_TIMEOUT < MOVE_TOKEN_TTL`
+    /// for the second bound. That is FALSE at the contract values (12 s
+    /// against 10 s), so it is not pinned: it would describe grants of one
+    /// source call spread over two nodes, which a call's single node pin
+    /// does not produce. Recorded as a deviation in the Wave C report.
+    #[test]
+    fn the_move_fits_its_sfu_budget_with_the_breaker() {
+        use revolt_database::voice::{MOVE_TOKEN_TTL, SFU_BREAKER_WINDOW, SFU_CALL_TIMEOUT};
+
+        assert!(
+            2 * 2 * SFU_CALL_TIMEOUT < AFK_MOVE_TIMEOUT,
+            "two nodes x two timeouts must fit the move: {SFU_CALL_TIMEOUT:?} vs \
+             {AFK_MOVE_TIMEOUT:?}"
+        );
+        assert!(
+            2 * SFU_CALL_TIMEOUT < MOVE_TOKEN_TTL,
+            "one node x two timeouts must fit between mint and emit: {SFU_CALL_TIMEOUT:?} \
+             vs {MOVE_TOKEN_TTL:?}"
+        );
+        assert!(
+            SFU_BREAKER_WINDOW >= MOVE_TOKEN_TTL,
+            "a breaker tripped between mint and emit stays open for the token's life: \
+             {SFU_BREAKER_WINDOW:?} vs {MOVE_TOKEN_TTL:?}"
         );
     }
 
