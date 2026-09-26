@@ -7611,6 +7611,7 @@ dependencies = [
 name = "revolt-models"
 version = "0.13.7"
 dependencies = [
+ "bson",
  "indexmap 2.14.0",
  "iso8601-timestamp",
  "num_enum",

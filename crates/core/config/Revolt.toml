@@ -198,6 +198,14 @@ topic = "gg.sloga.app"
 
 [january]
 blocked_domains = []
+# Embed direct audio links with an inline player and serve `GET /audio`
+audio_embeds = false
+# Largest audio file (in bytes) that is embedded or relayed (50 MiB)
+max_audio_bytes = 52_428_800
+# Maximum number of concurrent `/audio` streams
+max_audio_streams = 32
+# Wall-clock limit (in seconds) for a single `/audio` stream
+max_audio_stream_secs = 600
 
 [files]
 # Encryption key for stored files
