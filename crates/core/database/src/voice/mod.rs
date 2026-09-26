@@ -532,6 +532,54 @@ pub fn track_source_grant_name(source: TrackSource) -> &'static str {
     }
 }
 
+/// Every per-call voice-state key scoped by the unique key
+/// `{user_id}:{server_id | channel_id}`, as the prefix before
+/// `:{unique_key}`. The ONE list the delete paths use: a key added to
+/// [`create_voice_state`] / [`update_voice_state`] / [`get_voice_state`] must
+/// be added here too, or it outlives the call (no voice key has a TTL).
+/// `voice_state_key_list_matches_create_update_and_get` pins that textually.
+const VOICE_STATE_KEY_PREFIXES: [&str; 9] = [
+    "joined_at",
+    "is_publishing",
+    "is_receiving",
+    "screensharing",
+    "camera",
+    "screen_video",
+    "recording",
+    "rc_capable",
+    "watching",
+];
+
+/// The unique-key-scoped voice-state keys for one user, in
+/// [`VOICE_STATE_KEY_PREFIXES`] order.
+fn voice_state_keys(unique_key: &str) -> Vec<String> {
+    VOICE_STATE_KEY_PREFIXES
+        .iter()
+        .map(|prefix| format!("{prefix}:{unique_key}"))
+        .collect()
+}
+
+/// Check-and-delete for the unique-key-scoped voice state, run as ONE Lua
+/// script so nothing can interleave between the GET and the DEL.
+///
+/// KEYS[1] is the unique key (its value is the channel the user currently
+/// holds state in), KEYS[2..] the keys scoped by it; ARGV[1] is the channel
+/// being left. The keys are dropped only when the unique key still names that
+/// channel, or is missing (nothing else claims the state, the pre-guard
+/// behaviour). Otherwise the user already holds state in ANOTHER channel of
+/// the same server, e.g. a move whose destination `participant_joined` was
+/// processed before the source `participant_left`, and that state is live.
+///
+/// Raw EVAL rather than `redis::Script`: `Script` sits behind the redis
+/// crate's `script` feature, which `redis_kiss` builds without.
+const DELETE_SCOPED_VOICE_STATE_LUA: &str = r"
+local current = redis.call('GET', KEYS[1])
+if current == false or current == ARGV[1] then
+    return redis.call('DEL', unpack(KEYS))
+end
+return 0
+";
+
 pub async fn create_voice_state(
     channel: &UserVoiceChannel,
     user_id: &str,
@@ -556,6 +604,11 @@ pub async fn create_voice_state(
         watching: false,
     };
 
+    // The unique key is SET before the keys it scopes. This pipeline is not
+    // MULTI, so `delete_voice_state`'s script for another channel of this
+    // server can run between any two of these commands: before this SET it
+    // deletes only the previous state (the keys below are then written
+    // fresh), after it the guard sees this channel and deletes nothing.
     Pipeline::new()
         .sadd(format!("vc_members:{}", &channel.id), user_id)
         .sadd(format!("vc:{user_id}"), channel)
@@ -618,6 +671,16 @@ pub async fn delete_voice_state(channel: &UserVoiceChannel, user_id: &str) -> Re
     // below so the end event still reaches the departing host's own devices.
     watch::end_watch_session_if_host(channel, user_id).await;
 
+    // The unique key and the state it scopes are shared by every channel of
+    // one server, so they go only if they still belong to THIS channel (see
+    // `DELETE_SCOPED_VOICE_STATE_LUA`). Leaving the call ends any recording
+    // claim with it: this is the load-bearing teardown for a recorder who
+    // drops without pressing stop (a crash, a closed laptop, a network loss).
+    let mut scoped_keys = Vec::with_capacity(VOICE_STATE_KEY_PREFIXES.len() + 1);
+    scoped_keys.push(unique_key.clone());
+    scoped_keys.extend(voice_state_keys(&unique_key));
+
+    // Everything keyed by the channel id goes unconditionally.
     Pipeline::new()
         .srem(format!("vc_members:{}", &channel.id), user_id)
         .srem(format!("vc:{user_id}"), channel)
@@ -625,24 +688,14 @@ pub async fn delete_voice_state(channel: &UserVoiceChannel, user_id: &str) -> Re
         // the chokepoint every leave / reconcile path shares, so the marker
         // dies here rather than needing its own TTL (plan §2.3).
         .hdel(format!("vc_leg:{}", &channel.id), user_id)
-        .del(&[
-            format!("joined_at:{unique_key}"),
-            format!("is_publishing:{unique_key}"),
-            format!("is_receiving:{unique_key}"),
-            format!("screensharing:{unique_key}"),
-            format!("camera:{unique_key}"),
-            format!("screen_video:{unique_key}"),
-            // Leaving the call ends any recording claim with it — this is the
-            // load-bearing teardown for a recorder who drops without pressing
-            // stop (a crash, a closed laptop, a network loss).
-            format!("recording:{unique_key}"),
-            format!("rc_capable:{unique_key}"),
-            format!("watching:{unique_key}"),
-            // Draw consent dies with the voice state: an allowlist must not
-            // outlive the call it was granted in (rev-3 review).
-            format!("annotations_allow:{}:{}", &channel.id, user_id),
-            unique_key.clone(),
-        ])
+        // Draw consent dies with the voice state: an allowlist must not
+        // outlive the call it was granted in (rev-3 review).
+        .del(format!("annotations_allow:{}:{}", &channel.id, user_id))
+        .cmd("EVAL")
+        .arg(DELETE_SCOPED_VOICE_STATE_LUA)
+        .arg(scoped_keys.len())
+        .arg(&scoped_keys)
+        .arg(&channel.id)
         .query_async(&mut get_connection().await?.into_inner())
         .await
         .to_internal_error()
@@ -667,20 +720,12 @@ pub async fn delete_channel_voice_state(
     for user_id in user_ids {
         let unique_key = format!("{user_id}:{parent_id}");
 
-        pipeline.srem(format!("vc:{user_id}"), channel).del(&[
-            format!("joined_at:{unique_key}"),
-            format!("is_publishing:{unique_key}"),
-            format!("is_receiving:{unique_key}"),
-            format!("screensharing:{unique_key}"),
-            format!("camera:{unique_key}"),
-            format!("screen_video:{unique_key}"),
-            format!("recording:{unique_key}"),
-            format!("rc_capable:{unique_key}"),
-            format!("watching:{unique_key}"),
-            // Draw consent dies with the call (rev-3 review).
-            format!("annotations_allow:{}:{}", &channel.id, user_id),
-            unique_key.clone(),
-        ]);
+        let mut keys = voice_state_keys(&unique_key);
+        // Draw consent dies with the call (rev-3 review).
+        keys.push(format!("annotations_allow:{}:{}", &channel.id, user_id));
+        keys.push(unique_key);
+
+        pipeline.srem(format!("vc:{user_id}"), channel).del(keys);
     }
 
     pipeline
@@ -2164,5 +2209,176 @@ mod tests {
             !leg_hash_exists,
             "the per-channel leg hash must not outlive the call"
         );
+    }
+
+    // A same-server channel switch (a moderator move, or the user hopping
+    // channels) whose SFU events arrive out of order: the destination's
+    // `participant_joined` is processed BEFORE the source's
+    // `participant_left`. The unique key `{user}:{server}` and every state
+    // key it scopes are shared by both channels, so the late source leave
+    // must leave the destination's live state alone, while the channel-keyed
+    // half of that leave still runs in full.
+    #[test]
+    fn source_leave_after_destination_join_keeps_destination_state() {
+        rt().block_on(source_leave_after_destination_join_case())
+    }
+
+    async fn source_leave_after_destination_join_case() {
+        let suffix = ulid::Ulid::new().to_string();
+        let server = format!("srv{suffix}");
+        let source = UserVoiceChannel {
+            id: format!("chanA{suffix}"),
+            server_id: Some(server.clone()),
+        };
+        let destination = UserVoiceChannel {
+            id: format!("chanB{suffix}"),
+            server_id: Some(server.clone()),
+        };
+        let user = format!("user{suffix}");
+        let unique_key = format!("{user}:{server}");
+        let source_allow = format!("annotations_allow:{}:{}", &source.id, &user);
+        let mut conn = get_connection().await.unwrap();
+
+        create_voice_state(&source, &user, Timestamp::now_utc())
+            .await
+            .expect("join source");
+        record_screen_leg(&source.id, &user, "SID_SOURCE")
+            .await
+            .unwrap();
+        let _: () = conn.sadd(&source_allow, "someone").await.unwrap();
+
+        // The destination join lands first and publishes a camera.
+        create_voice_state(&destination, &user, Timestamp::now_utc())
+            .await
+            .expect("join destination");
+        update_voice_state_tracks(&destination, &user, true, 1)
+            .await
+            .unwrap();
+
+        delete_voice_state(&source, &user)
+            .await
+            .expect("late source leave");
+
+        let state = get_voice_state(&destination, &user)
+            .await
+            .unwrap()
+            .expect("a late source leave must not wipe the destination's voice state");
+        assert!(state.camera, "...nor reset its flags");
+        assert_eq!(
+            get_user_voice_channel_in_server(&user, &server)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(destination.id.as_str()),
+            "...nor drop the unique key's channel mapping"
+        );
+        let scoped: Vec<Option<String>> = conn.mget(voice_state_keys(&unique_key)).await.unwrap();
+        assert!(
+            scoped.iter().all(Option::is_some),
+            "every destination-scoped key survives: {scoped:?}"
+        );
+
+        // The channel-keyed half of the source leave still ran.
+        assert!(!is_in_voice_channel(&user, &source).await.unwrap());
+        assert!(get_voice_channel_members(&source).await.unwrap().is_none());
+        assert!(get_screen_leg_sid(&source.id, &user)
+            .await
+            .unwrap()
+            .is_none());
+        let allow_exists: bool = conn.exists(&source_allow).await.unwrap();
+        assert!(
+            !allow_exists,
+            "the source's draw consent dies with the leave"
+        );
+        assert!(is_in_voice_channel(&user, &destination).await.unwrap());
+        assert_eq!(
+            get_voice_channel_members(&destination).await.unwrap(),
+            Some(vec![user.clone()])
+        );
+
+        // The destination's own leave owns the state and removes all of it.
+        delete_voice_state(&destination, &user)
+            .await
+            .expect("destination leave");
+        assert!(get_voice_state(&destination, &user)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(get_user_voice_channel_in_server(&user, &server)
+            .await
+            .unwrap()
+            .is_none());
+        let scoped: Vec<Option<String>> = conn.mget(voice_state_keys(&unique_key)).await.unwrap();
+        assert!(
+            scoped.iter().all(Option::is_none),
+            "every scoped key is gone: {scoped:?}"
+        );
+        assert!(!is_in_voice_channel(&user, &destination).await.unwrap());
+
+        // No unique key at all: nothing claims the scoped keys, so any leave
+        // still clears strays (the pre-guard behaviour, which the reconcile
+        // sweep's leaves rely on).
+        let _: () = conn
+            .set(format!("recording:{unique_key}"), true)
+            .await
+            .unwrap();
+        delete_voice_state(&source, &user)
+            .await
+            .expect("stray cleanup");
+        let stray: Option<bool> = conn.get(format!("recording:{unique_key}")).await.unwrap();
+        assert!(stray.is_none(), "an unclaimed stray key is still cleared");
+    }
+
+    /// `VOICE_STATE_KEY_PREFIXES` is the list both delete paths use: a key
+    /// written or read under the unique key elsewhere but missing from it
+    /// would survive every leave. Textual, like the permission contracts.
+    #[test]
+    fn voice_state_key_list_matches_create_update_and_get() {
+        let source = include_str!("mod.rs");
+        let prefixes_in = |fn_name: &str| -> Vec<String> {
+            let start = source
+                .find(&format!("pub async fn {fn_name}("))
+                .unwrap_or_else(|| panic!("{fn_name} left voice/mod.rs"));
+            let end = start
+                + 1
+                + source[start + 1..]
+                    .find("\npub async fn ")
+                    .expect("a following fn");
+            let body = &source[start..end];
+            body.match_indices(":{unique_key}\"")
+                .map(|(at, _)| {
+                    let open = body[..at].rfind('"').expect("a key literal") + 1;
+                    body[open..at].to_string()
+                })
+                .collect()
+        };
+        let listed: Vec<String> = VOICE_STATE_KEY_PREFIXES
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+
+        let mut created = prefixes_in("create_voice_state");
+        created.sort();
+        let mut listed_sorted = listed.clone();
+        listed_sorted.sort();
+        assert_eq!(
+            created, listed_sorted,
+            "create_voice_state must write exactly the listed keys"
+        );
+
+        assert_eq!(
+            prefixes_in("get_voice_state"),
+            listed,
+            "get_voice_state must read exactly the listed keys"
+        );
+
+        let updated = prefixes_in("update_voice_state");
+        assert!(!updated.is_empty(), "update_voice_state scan found nothing");
+        for prefix in updated {
+            assert!(
+                listed.contains(&prefix),
+                "update_voice_state writes `{prefix}`, missing from the list"
+            );
+        }
     }
 }

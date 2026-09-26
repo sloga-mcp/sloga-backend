@@ -550,7 +550,12 @@ pub enum EventV1 {
         node: String,
         from: String,
         to: String,
-        token: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        token: Option<String>,
+        /// Public LiveKit URL of the destination node, so the client can connect
+        /// with `token` directly
+        #[serde(skip_serializing_if = "Option::is_none")]
+        url: Option<String>,
     },
 
     /// Remote control (remote-control plan §1): a sharer offered control of
@@ -943,6 +948,11 @@ pub enum EventV1 {
     },
 }
 
+/// Redis topic that reaches exactly one session's bonfire connection
+pub fn session_topic(session_id: &str) -> String {
+    format!("session:{session_id}")
+}
+
 impl EventV1 {
     /// Publish helper wrapper
     pub async fn p(self, channel: String) {
@@ -978,6 +988,19 @@ impl EventV1 {
         self.p(format!("{id}!")).await;
     }
 
+    /// Publish event to a single session (only that session's bonfire connection receives it)
+    ///
+    /// Bots have an empty session id; publishing to `session:` would not
+    /// target any one connection, so an empty id publishes nothing.
+    pub async fn private_session(self, session_id: String) {
+        if session_id.is_empty() {
+            warn!("Refusing to publish a session event with an empty session id");
+            return;
+        }
+
+        self.p(session_topic(&session_id)).await;
+    }
+
     /// Publish server member event
     pub async fn server(self, id: String) {
         self.p(format!("{id}u")).await;
@@ -986,5 +1009,15 @@ impl EventV1 {
     /// Publish internal global event
     pub async fn global(self) {
         self.p("global".to_string()).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::session_topic;
+
+    #[test]
+    fn session_topic_prefixes_the_session_id() {
+        assert_eq!(session_topic("abc"), "session:abc");
     }
 }

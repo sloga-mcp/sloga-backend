@@ -560,18 +560,23 @@ pub async fn ingress(
                 }
             }
 
-            // Dont send leave event when a user is moved
-            if get_user_moved_from_voice(channel_id, user_id)
-                .await?
-                .is_none()
-            {
-                EventV1::VoiceChannelLeave {
-                    id: channel_id.clone(),
-                    user: user_id.clone(),
-                }
-                .p(channel_id.clone())
-                .await;
-            };
+            // A moderator move still announces the leave on the SOURCE topic.
+            // The VoiceChannelMove from participant_joined reaches only the
+            // destination topic, so without this Leave anyone who can see the
+            // source but not the destination keeps a ghost of the moved user,
+            // and a target that never rejoins leaves a ghost for everyone. A
+            // client subscribed to both gets Leave + Move; dropping the user
+            // from the source roster is correct under either event. The
+            // moved_from marker is still consumed so it cannot outlive this
+            // leave (the join side reads the separate moved_to marker).
+            let _ = get_user_moved_from_voice(channel_id, user_id).await;
+
+            EventV1::VoiceChannelLeave {
+                id: channel_id.clone(),
+                user: user_id.clone(),
+            }
+            .p(channel_id.clone())
+            .await;
 
             // See above for why this is commented out
 
