@@ -5,12 +5,12 @@ use pdk_ip_filter_lib::IpFilter;
 use regex::Regex;
 use reqwest::{
     dns::{Addrs, Name, Resolve},
-    header::{self, CONTENT_TYPE},
+    header::{self, HeaderMap, HeaderValue, CONTENT_TYPE},
     redirect, Client, Response,
 };
 use revolt_config::{config, report_internal_error};
 use revolt_files::{create_thumbnail, decode_image, image_size_vec, is_valid_image, video_size};
-use revolt_models::v0::{Embed, Image, ImageSize, Video};
+use revolt_models::v0::{Audio, Embed, Image, ImageSize, Video};
 use revolt_result::{create_error, Error, Result, ToRevoltError};
 use std::net::{IpAddr, SocketAddr};
 use std::{
@@ -27,6 +27,27 @@ lazy_static! {
         .timeout(Duration::from_secs(10)) // TODO config
         .connect_timeout(Duration::from_secs(5)) // TODO config
         .redirect(redirect::Policy::none())
+        .build()
+        .expect("reqwest Client");
+
+    /// Request client for streamed audio relays (`/audio`)
+    ///
+    /// Same SSRF posture as `CLIENT` (cached resolver, no automatic redirects;
+    /// `Request::new_with` follows them manually and re-checks every hop), but
+    /// no total timeout: a stream may legitimately run for minutes, so only
+    /// connect and per-read stalls are bounded here and the wall-clock limit
+    /// is enforced by the relay. `Accept-Encoding: identity` because byte
+    /// ranges and sizes must refer to the raw file (no compression features
+    /// are enabled, so reqwest never decodes a body).
+    static ref STREAM_CLIENT: Client = reqwest::Client::builder()
+        .dns_resolver(CachedDnsResolver {})
+        .connect_timeout(Duration::from_secs(5))
+        .read_timeout(Duration::from_secs(15))
+        .redirect(redirect::Policy::none())
+        .default_headers(HeaderMap::from_iter([(
+            header::ACCEPT_ENCODING,
+            HeaderValue::from_static("identity"),
+        )]))
         .build()
         .expect("reqwest Client");
 
@@ -135,6 +156,12 @@ pub struct Request {
 }
 
 impl Request {
+    /// Split an opened request into its upstream response and parsed
+    /// Content-Type (for callers outside this module, e.g. `/audio`)
+    pub fn into_parts(self) -> (Response, Mime) {
+        (self.response, self.mime)
+    }
+
     /// Proxy a given URL
     pub async fn proxy_file(url: &str) -> Result<(String, Vec<u8>)> {
         if let Some(hit) = PROXY_CACHE.get(url).await {
@@ -328,8 +355,42 @@ impl Request {
         }
     }
 
+    /// Fetch metadata for an audio file
+    ///
+    /// `request` is an already-opened upstream response for `url`. Reads at
+    /// most `crate::audio::METADATA_READ_BYTES` of the body via
+    /// `Response::chunk()` (never `bytes()`), requires
+    /// `crate::audio::canonical_type` and `crate::audio::sniff_ok` to accept
+    /// it, and returns `Ok(None)` when either rejects or the total size
+    /// exceeds `january.max_audio_bytes`.
+    pub async fn fetch_audio_metadata(url: &str, request: Request) -> Result<Option<Audio>> {
+        let _ = (url, request, crate::audio::METADATA_READ_BYTES);
+        todo!("wave 3")
+    }
+
+    /// Open an upstream audio stream for the `/audio` relay
+    ///
+    /// Parses `url`, opens it via
+    /// `Request::new_with(&STREAM_CLIENT, url, range)` (so every redirect hop
+    /// is SSRF-checked and re-sends `range`), and returns the opened upstream
+    /// (response + mime) WITHOUT reading the body.
+    pub async fn open_audio_stream(url: &str, range: Option<HeaderValue>) -> Result<Request> {
+        let _ = (url, range, &*STREAM_CLIENT);
+        todo!("wave 3")
+    }
+
     /// Send a new request to a service
     pub async fn new(url: Url) -> Result<Request> {
+        Request::new_with(&CLIENT, url, None).await
+    }
+
+    /// Send a new request to a service using `client`
+    ///
+    /// Follows up to 5 redirects manually, checking every hop against
+    /// `url_is_blacklisted`. When `range` is set it is sent as the `Range`
+    /// header on every hop; nothing else from the caller's client request is
+    /// forwarded.
+    pub async fn new_with(client: &Client, url: Url, range: Option<HeaderValue>) -> Result<Request> {
         let mut url = url;
         let url_host_str = url.host_str().ok_or(create_error!(ProxyError))?.to_string();
 
@@ -342,7 +403,7 @@ impl Request {
         let mut redirect_count = 0;
 
         loop {
-            let response = CLIENT
+            let mut builder = client
             .get(url.clone())
             .header(
                 "User-Agent",
@@ -352,7 +413,14 @@ impl Request {
                     "Mozilla/5.0 (compatible; January/2.0; +https://github.com/stoatchat/stoatchat)"
                 },
             )
-            .header("Accept-Language", "en-US,en;q=0.5")
+            .header("Accept-Language", "en-US,en;q=0.5");
+
+            // Set inside the loop so every redirect hop re-sends it
+            if let Some(range) = &range {
+                builder = builder.header(header::RANGE, range.clone());
+            }
+
+            let response = builder
             .send()
             .await
             .map_err(|_| create_error!(ProxyError))?;
@@ -384,7 +452,11 @@ impl Request {
             }
 
             if !response.status().is_success() {
-                tracing::error!("{:?}", response);
+                // The Debug output carries the upstream URL; only the legacy
+                // embed/proxy client logs it, stream relays must not.
+                if std::ptr::eq(client, &*CLIENT) {
+                    tracing::error!("{:?}", response);
+                }
                 return Err(create_error!(ProxyError));
             }
 
