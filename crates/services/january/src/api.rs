@@ -9,7 +9,7 @@ use std::{
 
 use axum::{
     body::{Body, Bytes},
-    extract::Query,
+    extract::{rejection::QueryRejection, Query},
     http::{HeaderMap, HeaderValue, StatusCode},
     response::IntoResponse,
     routing::get,
@@ -145,6 +145,7 @@ async fn embed(
     responses(
         (status = 200, description = "Audio stream"),
         (status = 206, description = "Partial audio stream"),
+        (status = 400, description = "Missing or malformed url"),
         (status = 404, description = "Audio embeds are disabled"),
         (status = 416, description = "Requested range not satisfiable upstream"),
         (status = 502, description = "Upstream unreachable, not an allowed audio file, or too large"),
@@ -152,13 +153,14 @@ async fn embed(
     )
 )]
 pub async fn audio(
-    Query(UrlQuery { url }): Query<UrlQuery>,
+    query: std::result::Result<Query<UrlQuery>, QueryRejection>,
     headers: HeaderMap,
 ) -> axum::response::Response {
     let config = revolt_config::config().await.january;
-    if !config.audio_embeds {
-        return StatusCode::NOT_FOUND.into_response();
-    }
+    let url = match audio_url(config.audio_embeds, query) {
+        Ok(url) => url,
+        Err(status) => return status.into_response(),
+    };
 
     let max_streams = config.max_audio_streams.min(Semaphore::MAX_PERMITS);
     let streams = AUDIO_STREAMS
@@ -210,6 +212,25 @@ pub async fn audio(
     *response.status_mut() = status;
     *response.headers_mut() = response_headers;
     response
+}
+
+/// The URL `/audio` should fetch, or the empty-bodied status to answer with
+///
+/// The query is taken as a `Result` so the flag is checked first: with audio
+/// embeds off the route is a 404 whatever the query, and only with them on
+/// does a missing or malformed `url` become a 400. The rejection itself is
+/// dropped unrendered, so nothing about the query is logged or echoed.
+fn audio_url(
+    enabled: bool,
+    query: std::result::Result<Query<UrlQuery>, QueryRejection>,
+) -> std::result::Result<String, StatusCode> {
+    if !enabled {
+        return Err(StatusCode::NOT_FOUND);
+    }
+    match query {
+        Ok(Query(UrlQuery { url })) => Ok(url),
+        Err(_) => Err(StatusCode::BAD_REQUEST),
+    }
 }
 
 /// What `/audio` does with an opened upstream, decided from its status,
@@ -392,6 +413,11 @@ fn not_satisfiable(upstream: &HeaderMap) -> axum::response::Response {
 /// Upstream chunks the relay may read ahead of a slow client
 const RELAY_BUFFER: usize = 4;
 
+/// Longest a relay waits on a single upstream read or client send before
+/// giving up its stream slot. A client that pauses playback longer than this
+/// re-requests with a `Range` when it resumes.
+const STALL: Duration = Duration::from_secs(30);
+
 type Item = std::result::Result<Bytes, io::Error>;
 
 /// Relay an upstream body to the client
@@ -400,8 +426,9 @@ type Item = std::result::Result<Bytes, io::Error>;
 /// channel of [`RELAY_BUFFER`] chunks, so the relay ends at `deadline` even
 /// when the client stops reading and the returned stream is never polled
 /// again. The task yields upstream chunks as-is, errors and ends once more
-/// than `cap` bytes would have been relayed, errors and ends at `deadline`,
-/// and exits as soon as the returned stream is dropped (client disconnect).
+/// than `cap` bytes would have been relayed, errors and ends at `deadline`
+/// or once the upstream or the client makes no progress for [`STALL`], and
+/// exits as soon as the returned stream is dropped (client disconnect).
 /// The permit and the upstream are released when the task exits. A relay
 /// that stops for any reason other than the upstream's clean end always
 /// ends with an error, so a truncated body never looks complete.
@@ -414,9 +441,24 @@ pub fn relay<S>(
 where
     S: futures::Stream<Item = reqwest::Result<Bytes>> + Send + Unpin + 'static,
 {
+    relay_with_stall(upstream, cap, permit, deadline, STALL)
+}
+
+/// [`relay`] with the stall bound as a parameter
+fn relay_with_stall<S>(
+    upstream: S,
+    cap: u64,
+    permit: OwnedSemaphorePermit,
+    deadline: Instant,
+    stall: Duration,
+) -> impl Stream<Item = Item> + Send + 'static
+where
+    S: Stream<Item = reqwest::Result<Bytes>> + Send + Unpin + 'static,
+{
     let (tx, rx) = mpsc::channel(RELAY_BUFFER);
     let finished = Arc::new(AtomicBool::new(false));
-    tokio::spawn(pump(upstream, cap, permit, deadline, tx, finished.clone()));
+    let limits = Limits { deadline, stall };
+    tokio::spawn(pump(upstream, cap, permit, limits, tx, finished.clone()));
 
     let receiver = Receiver {
         rx,
@@ -463,6 +505,8 @@ enum End {
     /// The receiver was dropped
     ClientGone,
     TimedOut,
+    /// A single wait on the upstream or the client outlasted the stall bound
+    Stalled,
     Failed(io::Error),
 }
 
@@ -470,17 +514,47 @@ fn time_limit_reached() -> io::Error {
     io::Error::new(io::ErrorKind::TimedOut, "stream time limit reached")
 }
 
+fn stalled() -> io::Error {
+    io::Error::new(io::ErrorKind::TimedOut, "stream stalled")
+}
+
+/// Time bounds of a relay
+#[derive(Clone, Copy)]
+struct Limits {
+    /// Wall-clock end of the whole relay
+    deadline: Instant,
+    /// Longest any single wait may take
+    stall: Duration,
+}
+
+impl Limits {
+    /// Run `future` until the deadline or, sooner, until the stall bound
+    /// runs out
+    async fn wait<F: std::future::Future>(self, future: F) -> std::result::Result<F::Output, End> {
+        let bound = Instant::now()
+            .checked_add(self.stall)
+            .map_or(self.deadline, |stall_at| stall_at.min(self.deadline));
+        timeout_at(bound, future).await.map_err(|_| {
+            if bound < self.deadline {
+                End::Stalled
+            } else {
+                End::TimedOut
+            }
+        })
+    }
+}
+
 async fn pump<S>(
     mut upstream: S,
     cap: u64,
     permit: OwnedSemaphorePermit,
-    deadline: Instant,
+    limits: Limits,
     tx: mpsc::Sender<Item>,
     finished: Arc<AtomicBool>,
 ) where
     S: Stream<Item = reqwest::Result<Bytes>> + Unpin,
 {
-    let end = forward(&mut upstream, cap, deadline, &tx).await;
+    let end = forward(&mut upstream, cap, limits, &tx).await;
 
     // Free the stream slot and the upstream connection before telling the
     // client how the relay ended
@@ -495,16 +569,19 @@ async fn pump<S>(
         End::TimedOut => {
             let _ = tx.try_send(Err(time_limit_reached()));
         }
+        End::Stalled => {
+            let _ = tx.try_send(Err(stalled()));
+        }
         End::Failed(error) => {
-            let _ = timeout_at(deadline, tx.send(Err(error))).await;
+            let _ = limits.wait(tx.send(Err(error))).await;
         }
     }
 }
 
 /// Move upstream chunks into `tx` until the upstream ends or fails, `cap`
-/// would be exceeded, `deadline` passes, or the receiver is dropped. Every
-/// wait is bounded by `deadline`.
-async fn forward<S>(upstream: &mut S, cap: u64, deadline: Instant, tx: &mpsc::Sender<Item>) -> End
+/// would be exceeded, the deadline passes, a single wait outlasts the stall
+/// bound, or the receiver is dropped. Every wait is bounded by `limits`.
+async fn forward<S>(upstream: &mut S, cap: u64, limits: Limits, tx: &mpsc::Sender<Item>) -> End
 where
     S: Stream<Item = reqwest::Result<Bytes>> + Unpin,
 {
@@ -512,14 +589,17 @@ where
     loop {
         // `timeout_at` polls its future before its timer, so an always-ready
         // upstream would otherwise keep flowing past the deadline
-        if Instant::now() >= deadline {
+        if Instant::now() >= limits.deadline {
             return End::TimedOut;
         }
 
         let next = {
             let closed = std::pin::pin!(tx.closed());
-            match timeout_at(deadline, futures::future::select(upstream.next(), closed)).await {
-                Err(_) => return End::TimedOut,
+            match limits
+                .wait(futures::future::select(upstream.next(), closed))
+                .await
+            {
+                Err(end) => return end,
                 Ok(Either::Right(_)) => return End::ClientGone,
                 Ok(Either::Left((next, _))) => next,
             }
@@ -538,10 +618,10 @@ where
         }
         remaining -= len;
 
-        match timeout_at(deadline, tx.send(Ok(chunk))).await {
+        match limits.wait(tx.send(Ok(chunk))).await {
             Ok(Ok(())) => {}
             Ok(Err(_)) => return End::ClientGone,
-            Err(_) => return End::TimedOut,
+            Err(end) => return end,
         }
     }
 }
@@ -768,6 +848,57 @@ mod tests {
         let (_, error, after) = split(items);
         assert!(error.is_some());
         assert_eq!(after, 0);
+    }
+
+    fn far() -> Instant {
+        Instant::now() + Duration::from_secs(600)
+    }
+
+    #[tokio::test]
+    async fn relay_releases_permit_after_a_stall_when_the_consumer_stops_reading() {
+        static CHUNK: [u8; 1024] = [7; 1024];
+        let (semaphore, permit) = semaphore();
+        // Plenty of data, always ready, deadline far away: only the stall
+        // bound can end this relay while the consumer isn't reading
+        let endless = futures::stream::repeat_with(|| Ok(Bytes::from_static(&CHUNK)));
+        let stall = Duration::from_millis(100);
+        let mut stream = Box::pin(relay_with_stall(endless, u64::MAX, permit, far(), stall));
+
+        assert!(matches!(stream.next().await, Some(Ok(_))));
+
+        // The consumer stays connected but never polls again
+        assert!(
+            released_within(&semaphore, Duration::from_secs(1)).await,
+            "a consumer that stops reading must not hold the permit until the deadline"
+        );
+
+        // Reading again later: whatever was buffered, then an error, then the end
+        let items: Vec<Item> = tokio::time::timeout(Duration::from_secs(10), stream.collect())
+            .await
+            .expect("relay must end after a stall");
+        let (_, error, after) = split(items);
+        assert!(error.is_some());
+        assert_eq!(after, 0);
+    }
+
+    #[tokio::test]
+    async fn relay_ends_after_a_stall_when_the_upstream_stops_sending() {
+        let (semaphore, permit) = semaphore();
+        let stalled = upstream(&[3]).chain(futures::stream::pending());
+        let stall = Duration::from_millis(100);
+
+        let items: Vec<Item> = tokio::time::timeout(
+            Duration::from_secs(10),
+            relay_with_stall(stalled, 100, permit, far(), stall).collect(),
+        )
+        .await
+        .expect("relay must end after a stall");
+
+        let (bytes, error, after) = split(items);
+        assert_eq!(bytes, expected(&[3]));
+        assert_eq!(error.map(|e| e.kind()), Some(std::io::ErrorKind::TimedOut));
+        assert_eq!(after, 0);
+        assert_eq!(semaphore.available_permits(), 1);
     }
 
     /// In-memory upstream yielding `chunks` as given
@@ -1097,6 +1228,65 @@ mod tests {
             .await
             .unwrap();
         assert!(body.is_empty());
+    }
+
+    /// Run the `/audio` query extractor on `uri` and decide with `enabled`
+    async fn decide_url(enabled: bool, uri: &str) -> std::result::Result<String, StatusCode> {
+        use axum::extract::FromRequestParts;
+
+        let (mut parts, _) = axum::http::Request::builder()
+            .uri(uri)
+            .body(())
+            .unwrap()
+            .into_parts();
+        let query =
+            <std::result::Result<Query<UrlQuery>, QueryRejection>>::from_request_parts(
+                &mut parts,
+                &(),
+            )
+            .await
+            .unwrap();
+        audio_url(enabled, query)
+    }
+
+    const BAD_QUERIES: [&str; 4] = [
+        "/audio",
+        "/audio?",
+        "/audio?link=https%3A%2F%2Fexample.com%2Fa.mp3",
+        "/audio?url=a&url=b",
+    ];
+
+    #[tokio::test]
+    async fn audio_url_is_404_when_disabled_whatever_the_query() {
+        for uri in BAD_QUERIES
+            .iter()
+            .chain(&["/audio?url=https%3A%2F%2Fexample.com%2Fa.mp3"])
+        {
+            assert_eq!(
+                decide_url(false, uri).await,
+                Err(StatusCode::NOT_FOUND),
+                "{uri}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn audio_url_is_400_for_a_missing_or_malformed_url_when_enabled() {
+        for uri in BAD_QUERIES {
+            assert_eq!(
+                decide_url(true, uri).await,
+                Err(StatusCode::BAD_REQUEST),
+                "{uri}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn audio_url_decodes_the_url_when_enabled() {
+        assert_eq!(
+            decide_url(true, "/audio?url=https%3A%2F%2Fexample.com%2Fa%20b.mp3").await,
+            Ok("https://example.com/a b.mp3".to_owned())
+        );
     }
 
     #[test]

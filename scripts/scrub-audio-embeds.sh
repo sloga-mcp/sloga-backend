@@ -15,8 +15,13 @@
 #
 # The links themselves stay in the message text; only the player goes away.
 #
+# Two collections store embeds: `messages`, and `safety_snapshots`, whose
+# message snapshots carry the reported message plus its prior and leading
+# context. Moderators lose a report's evidence if those are left behind.
+#
 # There is deliberately no default target. Name the database and exactly one
-# of --container or --uri.
+# of --container or --uri. Prefer --container: a --uri with credentials is
+# visible in the process list.
 #
 # Usage:
 #   scripts/scrub-audio-embeds.sh --db revolt --container stoatchat-database-1
@@ -63,25 +68,49 @@ if ! [[ "$DB" =~ ^[A-Za-z0-9_-]+$ ]]; then
     exit 2
 fi
 
-FILTER='{ "embeds.type": "Audio" }'
+MESSAGES='{ "embeds.type": "Audio" }'
+SNAPSHOTS='{ $or: [
+    { "content.embeds.type": "Audio" },
+    { "content._prior_context.embeds.type": "Audio" },
+    { "content._leading_context.embeds.type": "Audio" }
+] }'
 
-count=$(mongosh_run "db.getSiblingDB('$DB').messages.countDocuments($FILTER)")
+count_all() {
+    mongosh_run "
+        const d = db.getSiblingDB('$DB');
+        print(d.messages.countDocuments($MESSAGES) + ' ' +
+              d.safety_snapshots.countDocuments($SNAPSHOTS));
+    "
+}
+
+read -r messages snapshots <<< "$(count_all)"
 
 if [ "$APPLY" -eq 0 ]; then
-    echo "$count message(s) in '$DB' carry an Audio embed; re-run with --apply to remove them"
+    echo "'$DB': $messages message(s) and $snapshots report snapshot(s) carry an Audio embed; re-run with --apply to remove them"
     exit 0
 fi
 
-modified=$(mongosh_run "
-    db.getSiblingDB('$DB').messages
-      .updateMany($FILTER, { \$pull: { embeds: { type: 'Audio' } } })
-      .modifiedCount
-")
+mongosh_run "
+    const d = db.getSiblingDB('$DB');
+    const audio = { type: 'Audio' };
+    d.messages.updateMany($MESSAGES, { \$pull: { embeds: audio } });
+    // Each path gets its own filter: \$[] fails on a document whose array
+    // does not exist (user and server snapshots have no context arrays).
+    d.safety_snapshots.updateMany(
+        { 'content.embeds.type': 'Audio' },
+        { \$pull: { 'content.embeds': audio } });
+    d.safety_snapshots.updateMany(
+        { 'content._prior_context.embeds.type': 'Audio' },
+        { \$pull: { 'content._prior_context.\$[].embeds': audio } });
+    d.safety_snapshots.updateMany(
+        { 'content._leading_context.embeds.type': 'Audio' },
+        { \$pull: { 'content._leading_context.\$[].embeds': audio } });
+" > /dev/null
 
-remaining=$(mongosh_run "db.getSiblingDB('$DB').messages.countDocuments($FILTER)")
+read -r messages_left snapshots_left <<< "$(count_all)"
 
-echo "removed Audio embeds from $modified message(s) in '$DB'; $remaining left"
+echo "'$DB': removed Audio embeds from $messages message(s) and $snapshots report snapshot(s); $messages_left and $snapshots_left left"
 
-if [ "$remaining" != "0" ]; then
+if [ "$messages_left" != "0" ] || [ "$snapshots_left" != "0" ]; then
     exit 1
 fi
