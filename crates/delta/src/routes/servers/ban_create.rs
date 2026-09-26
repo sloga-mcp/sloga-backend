@@ -1,9 +1,6 @@
 use revolt_database::{
     util::{permissions::DatabasePermissionQuery, reference::Reference},
-    voice::{
-        get_user_voice_channel_in_server, remove_user_from_voice_channel, UserVoiceChannel,
-        VoiceClient,
-    },
+    voice::{remove_user_from_server_voice, VoiceClient},
     Database, Message, RemovalIntention, ServerBan, User,
 };
 use revolt_models::v0;
@@ -11,7 +8,7 @@ use std::time::{Duration, SystemTime};
 
 use revolt_database::events::client::EventV1;
 use revolt_permissions::{calculate_server_permissions, ChannelPermission};
-use revolt_result::{create_error, Result};
+use revolt_result::{create_error, ErrorType, Result};
 use rocket::{serde::json::Json, State};
 use ulid::Ulid;
 use validator::Validate;
@@ -51,32 +48,67 @@ pub async fn ban(
         .await
         .throw_if_lacking_channel_permission(ChannelPermission::BanMembers)?;
 
-    // If member exists, check privileges against them
-    if let Ok(member) = target.as_member(db, &server.id).await {
+    // The ban runs in this exact order (AFK S-3 D-2, P2-2):
+    //
+    // 1. The rank check, before anything is written, so a moderator who does
+    //    not outrank a member target is refused with nothing persisted. The
+    //    member read fails closed: only NotFound means "not a member". Any
+    //    other read error refuses the ban before anything is written, so it
+    //    can be retried, instead of skipping the rank check, persisting the
+    //    ban and leaving the membership in place.
+    // 2. The ban is persisted, BEFORE the membership is removed and before the
+    //    eviction: an eviction error then answers an error with the ban
+    //    already durable, instead of leaving a kick behind (S-3 F-4).
+    // 3. The membership is removed, if the target is a member.
+    // 4. The target is evicted from every call in the server, member or not.
+    // 5. Their recent messages are deleted, if asked.
+    //
+    // A retried ban re-runs steps 3 to 5, which is how an eviction that failed
+    // is completed: step 2 answers "already banned" as a success for that.
+    let member = match target.as_member(db, &server.id).await {
+        Ok(member) => Some(member),
+        Err(error) if !matches!(error.error_type, ErrorType::NotFound) => return Err(error),
+        Err(_) => None,
+    };
+    if let Some(member) = &member {
         if member.get_ranking(query.server_ref().as_ref().unwrap())
             <= query.get_member_rank().unwrap_or(i64::MIN)
         {
             return Err(create_error!(NotElevated));
         }
+    }
 
+    // "Already banned" is a success (P2-2): a duplicate insert errors on both
+    // drivers, so a plain create would answer a retry with an error before it
+    // could re-evict. The existing ban is returned as it is, with its original
+    // reason. A create that fails because a concurrent ban won the insert
+    // finds that ban on the second read; any other create failure finds
+    // nothing there and is answered.
+    let ban = match db.fetch_ban(&server.id, target.id).await {
+        Ok(existing) => existing,
+        Err(error) if matches!(error.error_type, ErrorType::NotFound) => {
+            match ServerBan::create(db, &server, target.id, data.reason).await {
+                Ok(ban) => ban,
+                Err(error) => db
+                    .fetch_ban(&server.id, target.id)
+                    .await
+                    .map_err(|_| error)?,
+            }
+        }
+        Err(error) => return Err(error),
+    };
+
+    if let Some(member) = member {
         member
             .remove(db, &server, RemovalIntention::Ban, false)
             .await?;
-
-        // If the member is in a voice channel while banned kick them from the voice channel
-        if let Some(channel_id) = get_user_voice_channel_in_server(target.id, &server.id).await? {
-            remove_user_from_voice_channel(
-                db,
-                voice_client,
-                &UserVoiceChannel {
-                    id: channel_id,
-                    server_id: Some(server.id.clone()),
-                },
-                target.id,
-            )
-            .await?;
-        }
     }
+
+    // Outside the member check (S-3 F-4): a hit-and-run spammer who already
+    // left can still hold a connection. Every call in the server is reached,
+    // not only the one the per-server pointer names (S-3 F-3).
+    remove_user_from_server_voice(db, voice_client, &server, target.id).await?;
+
     // We do this outside the member check so we can sweep hit-and-run spammers who already left.
     if let Some(seconds) = data.delete_message_seconds {
         if seconds > 0 {
@@ -86,8 +118,611 @@ pub async fn ban(
                 .await?;
         }
     }
-    ServerBan::create(db, &server, target.id, data.reason)
+
+    Ok(Json(ban.into()))
+}
+
+#[cfg(test)]
+mod test {
+    use crate::util::test::TestHarness;
+    use iso8601_timestamp::Timestamp;
+    use revolt_database::{
+        voice::{
+            create_voice_state, delete_channel_node, delete_channel_voice_state,
+            get_user_voice_channel_in_server, get_voice_channel_members, is_in_voice_channel,
+            record_voice_connection, recorded_voice_connections, set_channel_node,
+            UserVoiceChannel,
+        },
+        Channel, Member, PartialMember, Server,
+    };
+    use revolt_models::v0;
+    use revolt_permissions::{ChannelPermission, OverrideField};
+    use revolt_result::ErrorType;
+    use rocket::http::{ContentType, Header, Status};
+
+    // ---- behavior (needs RabbitMQ and Redis) ------------------------------
+    //
+    // Compile-only on a box without those services, like every other route
+    // test: `TestHarness::new` connects to RabbitMQ and the voice state lives
+    // in Redis. The eviction is observed through the ghost of an ended call:
+    // a channel with NO node pinned, which `remove_user_from_server_voice`
+    // reaches through the per-server pointer and tears down from the recorded
+    // connections, with no SFU involved.
+
+    /// A node name deliberately absent from `Revolt.toml`: an eviction
+    /// addressed to it fails with `UnknownNode` before any network.
+    const ABSENT_NODE: &str = "test-node-with-no-sfu";
+
+    async fn voice_channel(harness: &TestHarness, server: &Server, name: &str) -> Channel {
+        Channel::create_server_channel(
+            &harness.db,
+            &mut server.clone(),
+            v0::DataCreateServerChannel {
+                channel_type: v0::LegacyServerChannelType::Text,
+                name: name.to_string(),
+                description: None,
+                nsfw: Some(false),
+                spoiler: None,
+                voice: Some(v0::VoiceInformation {
+                    max_users: None,
+                    disabled: false,
+                }),
+                announcement: None,
+                ..Default::default()
+            },
+            true,
+        )
         .await
-        .map(Into::into)
-        .map(Json)
+        .expect("voice channel")
+    }
+
+    /// A join as voice-ingress records it: the connection first, then the
+    /// state, created only for the user's first connection.
+    async fn join_recorded(uvc: &UserVoiceChannel, user_id: &str, sid: &str, identity: &str) {
+        if record_voice_connection(uvc, user_id, sid, identity)
+            .await
+            .expect("record")
+        {
+            create_voice_state(uvc, user_id, Timestamp::now_utc())
+                .await
+                .expect("voice state");
+        }
+    }
+
+    /// Every trace of `user_id` in `uvc`: the recorded connections, `vc:`
+    /// membership, `vc_members:` membership, and the per-server pointer when
+    /// it names this channel.
+    async fn voice_traces(
+        uvc: &UserVoiceChannel,
+        user_id: &str,
+    ) -> (Vec<(String, String)>, bool, bool, bool) {
+        let recorded = recorded_voice_connections(uvc, user_id)
+            .await
+            .expect("recorded read");
+        let listed = is_in_voice_channel(user_id, uvc).await.expect("vc read");
+        let member = get_voice_channel_members(uvc)
+            .await
+            .expect("members read")
+            .is_some_and(|members| members.iter().any(|id| id == user_id));
+        let pointer = get_user_voice_channel_in_server(
+            user_id,
+            uvc.server_id.as_deref().expect("a server channel"),
+        )
+        .await
+        .expect("pointer read")
+        .as_deref()
+            == Some(uvc.id.as_str());
+        (recorded, listed, member, pointer)
+    }
+
+    async fn assert_ghost_present(uvc: &UserVoiceChannel, user_id: &str, sids: usize) {
+        let (recorded, listed, member, pointer) = voice_traces(uvc, user_id).await;
+        assert!(
+            recorded.len() == sids && listed && member && pointer,
+            "the ghost of {} must be in place: recorded {:?}, vc {}, vc_members {}, pointer {}",
+            user_id,
+            recorded,
+            listed,
+            member,
+            pointer
+        );
+    }
+
+    async fn assert_ghost_cleared(uvc: &UserVoiceChannel, user_id: &str) {
+        let (recorded, listed, member, pointer) = voice_traces(uvc, user_id).await;
+        assert!(
+            recorded.is_empty() && !listed && !member && !pointer,
+            "the ghost of {} must be torn down, left: recorded {:?}, vc {}, vc_members {}, \
+             pointer {}",
+            user_id,
+            recorded,
+            listed,
+            member,
+            pointer
+        );
+    }
+
+    async fn ban_user<'a>(
+        harness: &'a TestHarness,
+        token: &str,
+        server_id: &str,
+        target_id: &str,
+        reason: &str,
+    ) -> rocket::local::asynchronous::LocalResponse<'a> {
+        harness
+            .client
+            .put(format!("/servers/{server_id}/bans/{target_id}"))
+            .header(ContentType::JSON)
+            .header(Header::new("x-session-token", token.to_string()))
+            .body(serde_json::json!({ "reason": reason }).to_string())
+            .dispatch()
+            .await
+    }
+
+    async fn ban_answered(
+        response: rocket::local::asynchronous::LocalResponse<'_>,
+        what: &str,
+    ) -> v0::ServerBan {
+        assert_eq!(response.status(), Status::Ok, "{what} must succeed");
+        serde_json::from_str(&response.into_string().await.expect("a body"))
+            .expect("the ban is returned")
+    }
+
+    async fn assert_rejected(
+        response: rocket::local::asynchronous::LocalResponse<'_>,
+        status: Status,
+        error_type: &str,
+    ) {
+        assert_eq!(response.status(), status);
+        let body = response.into_string().await.unwrap_or_default();
+        assert!(
+            body.contains(error_type),
+            "expected a {} error, got: {}",
+            error_type,
+            body
+        );
+    }
+
+    // Compile-only without RabbitMQ and Redis: see the section note above.
+    #[test]
+    fn a_repeated_ban_succeeds_and_evicts_again() {
+        crate::util::test::rt().block_on(a_repeated_ban_succeeds_and_evicts_again_case())
+    }
+
+    /// AFK S-3 P2-2: banning a user who is already banned is a success that
+    /// re-runs the eviction, so a ban whose eviction failed can be completed
+    /// by retrying it. The duplicate insert errors on both drivers, which
+    /// used to answer the retry with an error before it reached the eviction.
+    /// The target is no longer a member on the second ban, so this also needs
+    /// the eviction outside the member check. The existing ban is returned,
+    /// its reason unchanged. Mutations: the create's error propagated with
+    /// `?`; the eviction moved back inside the member check; the eviction
+    /// removed.
+    async fn a_repeated_ban_succeeds_and_evicts_again_case() {
+        let harness = TestHarness::new().await;
+        let (_a, session_a, user_a) = harness.new_user().await; // owner
+        let (_b, _session_b, user_b) = harness.new_user().await; // target
+        let (server, _channels) = harness.new_server(&user_a).await;
+        Member::create(&harness.db, &server, &user_b, None)
+            .await
+            .expect("member");
+
+        let channel = voice_channel(&harness, &server, "Ended").await;
+        let uvc = UserVoiceChannel::from_channel(&channel);
+        join_recorded(&uvc, &user_b.id, "PA_ban_first", &user_b.id).await;
+        assert_ghost_present(&uvc, &user_b.id, 1).await;
+
+        let response = ban_user(&harness, &session_a.token, &server.id, &user_b.id, "first").await;
+        let ban = ban_answered(response, "the first ban").await;
+        assert_eq!(ban.id.user, user_b.id);
+        assert_eq!(ban.reason.as_deref(), Some("first"));
+        assert_ghost_cleared(&uvc, &user_b.id).await;
+        assert!(
+            harness
+                .db
+                .fetch_member(&server.id, &user_b.id)
+                .await
+                .is_err(),
+            "the banned target is no longer a member"
+        );
+
+        // The target reappears in the channel: a connection the first
+        // eviction did not reach, as after an eviction that failed.
+        join_recorded(
+            &uvc,
+            &user_b.id,
+            "PA_ban_again",
+            &format!("{}:DEV", user_b.id),
+        )
+        .await;
+        assert_ghost_present(&uvc, &user_b.id, 1).await;
+
+        let response = ban_user(&harness, &session_a.token, &server.id, &user_b.id, "second").await;
+        let ban = ban_answered(response, "banning an already banned user").await;
+        assert_eq!(ban.id.user, user_b.id);
+        assert_eq!(
+            ban.reason.as_deref(),
+            Some("first"),
+            "the existing ban is returned, not replaced"
+        );
+        assert_ghost_cleared(&uvc, &user_b.id).await;
+        assert_eq!(
+            harness
+                .db
+                .fetch_ban(&server.id, &user_b.id)
+                .await
+                .expect("the ban stands")
+                .reason
+                .as_deref(),
+            Some("first")
+        );
+
+        delete_channel_voice_state(&uvc, &[user_b.id.clone()])
+            .await
+            .expect("cleanup");
+    }
+
+    // Compile-only without RabbitMQ and Redis: see the section note above.
+    #[test]
+    fn a_moderator_not_above_the_target_cannot_ban_them() {
+        crate::util::test::rt().block_on(a_moderator_not_above_the_target_cannot_ban_them_case())
+    }
+
+    /// AFK S-3 P2-2, step 1: the rank check precedes every write. A moderator
+    /// holding BanMembers whose rank is not above the target's (the same
+    /// role here) is refused with NotElevated, and nothing happened: no ban,
+    /// the target still a member, their voice state untouched. Mutation: the
+    /// rank check moved below the ban persist.
+    async fn a_moderator_not_above_the_target_cannot_ban_them_case() {
+        let harness = TestHarness::new().await;
+        let (_a, _session_a, user_a) = harness.new_user().await; // owner
+        let (_m, session_m, user_m) = harness.new_user().await; // moderator
+        let (_b, _session_b, user_b) = harness.new_user().await; // target
+        let (server, _channels) = harness.new_server(&user_a).await;
+
+        let role = harness
+            .new_role(
+                &server,
+                1,
+                Some(OverrideField {
+                    a: ChannelPermission::BanMembers as i64,
+                    d: 0,
+                }),
+            )
+            .await;
+        for user in [&user_m, &user_b] {
+            let (mut member, _) = Member::create(&harness.db, &server, user, None)
+                .await
+                .expect("member");
+            member
+                .update(
+                    &harness.db,
+                    PartialMember {
+                        roles: Some(vec![role.id.clone()]),
+                        ..Default::default()
+                    },
+                    vec![],
+                )
+                .await
+                .expect("role");
+        }
+
+        let channel = voice_channel(&harness, &server, "Ended").await;
+        let uvc = UserVoiceChannel::from_channel(&channel);
+        join_recorded(&uvc, &user_b.id, "PA_rank", &user_b.id).await;
+
+        let response = ban_user(&harness, &session_m.token, &server.id, &user_b.id, "rank").await;
+        assert_rejected(response, Status::Forbidden, "NotElevated").await;
+
+        let ban = harness.db.fetch_ban(&server.id, &user_b.id).await;
+        assert!(
+            matches!(&ban, Err(error) if matches!(error.error_type, ErrorType::NotFound)),
+            "a refused ban must persist nothing: {:?}",
+            ban
+        );
+        assert!(
+            harness
+                .db
+                .fetch_member(&server.id, &user_b.id)
+                .await
+                .is_ok(),
+            "a refused ban must leave the target a member"
+        );
+        assert_ghost_present(&uvc, &user_b.id, 1).await;
+
+        delete_channel_voice_state(&uvc, &[user_b.id.clone()])
+            .await
+            .expect("cleanup");
+    }
+
+    // Compile-only without RabbitMQ and Redis: see the section note above.
+    #[test]
+    fn a_non_member_is_banned_and_evicted() {
+        crate::util::test::rt().block_on(a_non_member_is_banned_and_evicted_case())
+    }
+
+    /// AFK S-3 F-4: a hit-and-run user who is not a member but still holds a
+    /// connection in one of the server's calls is banned AND evicted. The
+    /// eviction used to sit inside the member check. Mutations: the eviction
+    /// moved back inside the member check; the eviction removed.
+    async fn a_non_member_is_banned_and_evicted_case() {
+        let harness = TestHarness::new().await;
+        let (_a, session_a, user_a) = harness.new_user().await; // owner
+        let (_b, _session_b, user_b) = harness.new_user().await; // never a member
+        let (server, _channels) = harness.new_server(&user_a).await;
+
+        let channel = voice_channel(&harness, &server, "Ended").await;
+        let uvc = UserVoiceChannel::from_channel(&channel);
+        join_recorded(&uvc, &user_b.id, "PA_hit_and_run", &user_b.id).await;
+        assert_ghost_present(&uvc, &user_b.id, 1).await;
+        assert!(harness
+            .db
+            .fetch_member(&server.id, &user_b.id)
+            .await
+            .is_err());
+
+        let response = ban_user(&harness, &session_a.token, &server.id, &user_b.id, "spam").await;
+        let ban = ban_answered(response, "banning a non-member").await;
+        assert_eq!(ban.id.user, user_b.id);
+        assert_ghost_cleared(&uvc, &user_b.id).await;
+        assert!(harness.db.fetch_ban(&server.id, &user_b.id).await.is_ok());
+
+        delete_channel_voice_state(&uvc, &[user_b.id.clone()])
+            .await
+            .expect("cleanup");
+    }
+
+    // Compile-only without RabbitMQ and Redis: see the section note above.
+    #[test]
+    fn a_failed_eviction_leaves_the_ban_durable_and_a_retry_evicts() {
+        crate::util::test::rt()
+            .block_on(a_failed_eviction_leaves_the_ban_durable_and_a_retry_evicts_case())
+    }
+
+    /// AFK S-3 F-4 + P2-2: the ban is persisted before the eviction, so an
+    /// eviction that fails answers an error with the ban already standing,
+    /// never a kick. The failed eviction tears nothing down. Once the cause
+    /// is gone, retrying the ban evicts. ABSENT_NODE makes the eviction fail
+    /// with UnknownNode before any network. Mutation: the ban persist moved
+    /// back below the eviction.
+    async fn a_failed_eviction_leaves_the_ban_durable_and_a_retry_evicts_case() {
+        let harness = TestHarness::new().await;
+        let (_a, session_a, user_a) = harness.new_user().await; // owner
+        let (_b, _session_b, user_b) = harness.new_user().await; // target
+        let (server, _channels) = harness.new_server(&user_a).await;
+        Member::create(&harness.db, &server, &user_b, None)
+            .await
+            .expect("member");
+
+        let channel = voice_channel(&harness, &server, "Live").await;
+        let uvc = UserVoiceChannel::from_channel(&channel);
+        join_recorded(&uvc, &user_b.id, "PA_live", &user_b.id).await;
+        set_channel_node(channel.id(), ABSENT_NODE)
+            .await
+            .expect("node");
+
+        let response = ban_user(&harness, &session_a.token, &server.id, &user_b.id, "live").await;
+        assert_rejected(response, Status::BadRequest, "UnknownNode").await;
+
+        assert!(
+            harness.db.fetch_ban(&server.id, &user_b.id).await.is_ok(),
+            "the ban must be durable before the eviction runs"
+        );
+        assert!(
+            harness
+                .db
+                .fetch_member(&server.id, &user_b.id)
+                .await
+                .is_err(),
+            "the membership is removed before the eviction runs"
+        );
+        assert_ghost_present(&uvc, &user_b.id, 1).await;
+
+        // The call ended: the retry reaches the ghost with no SFU involved.
+        delete_channel_node(channel.id()).await.expect("node gone");
+        let response = ban_user(&harness, &session_a.token, &server.id, &user_b.id, "retry").await;
+        ban_answered(response, "retrying the ban").await;
+        assert_ghost_cleared(&uvc, &user_b.id).await;
+
+        delete_channel_voice_state(&uvc, &[user_b.id.clone()])
+            .await
+            .expect("cleanup");
+    }
+
+    // ---- the ban's order, pinned on its text (AFK S-3 P2-2) ----------------
+
+    /// `ban`'s body, comment lines dropped and whitespace collapsed.
+    fn route_body() -> String {
+        const SOURCE: &str = include_str!("ban_create.rs");
+        let at = SOURCE
+            .find("pub async fn ban(")
+            .expect("the route is defined");
+        let open = at + SOURCE[at..].find('\u{7b}').expect("a body");
+        let mut depth = 0usize;
+        let mut close = None;
+        for (i, ch) in SOURCE[open..].char_indices() {
+            match ch {
+                '\u{7b}' => depth += 1,
+                '\u{7d}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        close = Some(open + i);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        SOURCE[open..=close.expect("a closed body")]
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join(" ")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    /// How many blocks enclose `at` in `body`, the body's own braces
+    /// included: 1 is a statement of the route itself, under no condition.
+    fn depth_at(body: &str, at: usize) -> usize {
+        body[..at].chars().fold(0usize, |depth, ch| match ch {
+            '\u{7b}' => depth + 1,
+            '\u{7d}' => depth - 1,
+            _ => depth,
+        })
+    }
+
+    const RANK: &str = "return Err(create_error!(NotElevated));";
+    const FETCH: &str = "let ban = match db.fetch_ban(&server.id, target.id).await \u{7b}";
+    const CREATE: &str = "ServerBan::create(db, &server, target.id, data.reason).await";
+    const REMOVE: &str = ".remove(db, &server, RemovalIntention::Ban, false) .await?;";
+    const EVICT: &str =
+        "remove_user_from_server_voice(db, voice_client, &server, target.id).await?;";
+    const PURGE: &str = "Message::bulk_delete_by_author_since(";
+
+    /// AFK S-3 D-2 / P2-2: rank check, ban persisted, membership removed,
+    /// eviction, message delete, in that order, each exactly once, and the
+    /// single-pointer removal gone. Mutations: the rank check moved below the
+    /// persist; the persist moved back to the end; the eviction moved before
+    /// the membership removal or removed.
+    #[test]
+    fn the_ban_runs_its_steps_in_order() {
+        let body = route_body();
+        let mut last = 0;
+        for needle in [RANK, FETCH, CREATE, REMOVE, EVICT, PURGE] {
+            assert_eq!(
+                body.matches(needle).count(),
+                1,
+                "the ban must carry `{needle}` exactly once: {body}"
+            );
+            let at = body.find(needle).expect("counted above");
+            assert!(last < at, "`{}` is out of order: {}", needle, body);
+            last = at;
+        }
+        for banned in [
+            "get_user_voice_channel_in_server(",
+            "remove_user_from_voice_channel(",
+        ] {
+            assert!(
+                !body.contains(banned),
+                "the ban must not call `{}`: {}",
+                banned,
+                body
+            );
+        }
+    }
+
+    /// AFK S-3 F-4: the eviction is a statement of the route itself, under no
+    /// condition, so a target who is not a member is evicted too. The rank
+    /// check and the membership removal are the ones under the member check.
+    /// Mutation: the eviction moved back inside the member check.
+    #[test]
+    fn the_ban_evicts_members_and_non_members_alike() {
+        let body = route_body();
+        let at = body.find(EVICT).expect("the ban evicts");
+        assert_eq!(
+            depth_at(&body, at),
+            1,
+            "the eviction must not sit inside any block: {body}"
+        );
+        assert!(
+            depth_at(&body, body.find(REMOVE).expect("the ban removes")) > 1,
+            "the membership removal is conditional on a member: {}",
+            body
+        );
+    }
+
+    /// AFK S-3 P2-2: an existing ban is the answer, not an error, and a
+    /// create that loses the insert race to a concurrent ban answers that
+    /// ban. The race arm cannot be driven deterministically through the
+    /// route, so it is held here on its text. Mutations: the create's error
+    /// returned without the second read; the existing ban's arm removed.
+    #[test]
+    fn an_existing_ban_is_the_answer() {
+        const EXISTING: &str = "Ok(existing) => existing,";
+        const ABSENT: &str =
+            "Err(error) if matches!(error.error_type, ErrorType::NotFound) => \u{7b}";
+        const RACE: &str = "match ServerBan::create(db, &server, target.id, data.reason).await \
+             \u{7b} Ok(ban) => ban, Err(error) => db .fetch_ban(&server.id, target.id) .await \
+             .map_err(|_| error)?, \u{7d}";
+        const OTHER: &str = "Err(error) => return Err(error), \u{7d};";
+        const ANSWER: &str = "Ok(Json(ban.into()))";
+
+        let body = route_body();
+        let mut last = 0;
+        for needle in [FETCH, EXISTING, ABSENT, RACE, OTHER, ANSWER] {
+            assert_eq!(
+                body.matches(needle).count(),
+                1,
+                "the ban must carry `{needle}` exactly once: {body}"
+            );
+            let at = body.find(needle).expect("counted above");
+            assert!(last < at, "`{}` is out of order: {}", needle, body);
+            last = at;
+        }
+        assert_eq!(
+            body.matches("ServerBan::create(").count(),
+            1,
+            "one create, inside the not-found arm: {body}"
+        );
+    }
+
+    /// AFK S-3 P2-2, step 1 fails closed: only a NotFound member read means
+    /// "not a member". Any other read error returns before the ban is
+    /// persisted, so a database failure can no longer skip the rank check,
+    /// persist the ban and leave the membership in place. A member read that
+    /// fails for any other reason cannot be forced through the route on
+    /// either driver without touching the database crate, so this is held on
+    /// its text. Mutations: the read turned back into `.ok()` or an
+    /// `if let Ok(`; the non-NotFound arm mapped to `None`; the guard dropped.
+    #[test]
+    fn a_failed_member_read_refuses_the_ban() {
+        const READ: &str = "let member = match target.as_member(db, &server.id).await \u{7b} \
+             Ok(member) => Some(member), Err(error) if !matches!(error.error_type, \
+             ErrorType::NotFound) => return Err(error), Err(_) => None, \u{7d};";
+
+        let body = route_body();
+        assert_eq!(
+            body.matches("as_member(").count(),
+            1,
+            "the ban reads the member once: {body}"
+        );
+        assert_eq!(
+            body.matches(READ).count(),
+            1,
+            "the member read must map only NotFound to None and return any \
+             other error: {}",
+            body
+        );
+        for banned in [".ok()", "if let Ok("] {
+            assert!(
+                !body.contains(banned),
+                "the ban must not swallow an error with `{}`: {}",
+                banned,
+                body
+            );
+        }
+        assert_eq!(
+            body.matches("=> None").count(),
+            1,
+            "only the not-found arm maps to None: {body}"
+        );
+
+        let read = body.find(READ).expect("counted above");
+        assert_eq!(
+            depth_at(&body, read),
+            1,
+            "the member read must not sit inside any block: {body}"
+        );
+        for later in [RANK, FETCH, CREATE] {
+            let at = body.find(later).expect("pinned by the_ban_runs_its_steps_in_order");
+            assert!(
+                read < at,
+                "the member read must return its error before `{}`: {}",
+                later,
+                body
+            );
+        }
+    }
 }

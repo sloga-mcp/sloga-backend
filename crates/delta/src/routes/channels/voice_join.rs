@@ -2,16 +2,16 @@ use revolt_config::config;
 use revolt_database::{
     util::{permissions::perms, reference::Reference},
     voice::{
-        assert_call_caps_admit, delete_voice_state, get_channel_node,
+        assert_call_caps_admit, delete_voice_connections, get_channel_node,
         get_user_voice_channel_in_server, get_user_voice_channels, get_voice_channel_members,
-        raise_if_in_voice, set_call_notification_recipients, set_channel_node, UserVoiceChannel,
-        VoiceClient,
+        raise_if_in_voice, recorded_voice_connections, set_call_notification_recipients,
+        set_channel_node, UserVoiceChannel, VoiceClient,
     },
     Database, Session, User,
 };
 use revolt_models::v0;
 use revolt_permissions::{calculate_channel_permissions, ChannelPermission};
-use revolt_result::{create_error, Result};
+use revolt_result::{create_error, Result, ToRevoltError};
 
 use rocket::{serde::json::Json, State};
 
@@ -168,8 +168,27 @@ pub async fn call(
 
     if force_disconnect == Some(true) {
         // Finds and disconnects any existing voice connections by the user,
-        // should only ever loop once but just to cover our backs.
-
+        // should only ever loop once but just to cover our backs. Every
+        // channel is tried: a failure in one never stops the next.
+        //
+        // Each channel follows the same removal rule as
+        // `remove_user_from_voice_channel` in the database crate (AFK S-3
+        // D-2, amended by WA-R / RA2-1): every connection of the user the SFU
+        // lists is evicted, then EXACTLY the connection records this removal
+        // knows about are deleted, through the set mode of the teardown
+        // script. It is spelled out here because this route's failures are
+        // best-effort: a channel whose removal cannot be decided is left as
+        // it is and the join still proceeds, so a dead SFU node or a stale
+        // entry can never lock a user out of rejoining.
+        //
+        // ORDERING RULE: the recorded connections are read BEFORE the SFU
+        // listing, never after. Read after, a sibling that records between
+        // the listing and the read looks stale (recorded but not listed) and
+        // is deleted while live (S-3 WA-1). Read before, such a sibling is in
+        // neither set, and `delete_voice_connections`' survivor scan keeps
+        // its state. This path decides from a listing, so it NEVER runs the
+        // whole-user `delete_voice_state`: that would erase the late
+        // sibling's state.
         for previous_channel in get_user_voice_channels(&user.id).await? {
             // Reconnect ends any remote-control grant (plan §1): this path
             // removes the participant and the fresh token below is minted
@@ -184,21 +203,86 @@ pub async fn call(
                 &user.id,
                 "reconnected",
                 // The old participant is still connected here — the
-                // removal below is explicitly best-effort ("if this errors
-                // its just a mismatching state - ignore"), so the
-                // capability must be revoked rather than assumed gone.
+                // removal below is best-effort (a failed eviction leaves it
+                // in place and the join proceeds), so the capability must
+                // be revoked rather than assumed gone.
                 false,
             )
             .await;
 
-            if let Some(node) = get_channel_node(&previous_channel.id).await? {
-                // if this errors its just a mismatching state - ignore and proceed to still delete our state
-                let _ = voice_client
-                    .remove_user(&node, &user.id, &previous_channel.id)
-                    .await;
+            // 1. The recorded sids, first. A failed read is never taken for
+            //    an empty set: nothing of this channel is evicted or torn
+            //    down (ERROR + Sentry through `to_internal_error`), and the
+            //    remaining channels are still tried. It is not propagated,
+            //    because the failure is this channel's cleanup, not the join
+            //    itself: whatever of it is live stays as it was, visible.
+            let recorded: Vec<String> =
+                match recorded_voice_connections(&previous_channel, &user.id)
+                    .await
+                    .to_internal_error()
+                {
+                    Ok(recorded) => recorded.into_iter().map(|(sid, _)| sid).collect(),
+                    Err(error) => {
+                        log::warn!(
+                            "force-disconnect of {} from {}: the connection records could not \
+                             be read, so nothing there is evicted or torn down: {error:?}",
+                            user.id,
+                            previous_channel.id
+                        );
+                        continue;
+                    }
+                };
+
+            // 2. ONE listing of the channel's room, every connection of the
+            //    user in it evicted (primaries and screen legs). `Ok(None)`:
+            //    the SFU has no such room. `Ok(Some(sids))`: the primaries
+            //    it listed and evicted, empty when it listed nothing of the
+            //    user. `Err`: a listed connection may still be live, so
+            //    NOTHING of this channel is torn down, and the survivor stays
+            //    visible and syncable. A failure of the SFU itself was
+            //    already reported (ERROR + Sentry) where it arose; a node
+            //    name no configuration knows (`UnknownNode`) is reported only
+            //    by the WARN below. Either way the join proceeds, as it always
+            //    has on a failed eviction here. No node pinned: the call has
+            //    ended, there is nothing to evict, and its ghost is torn down
+            //    below from the recorded sids.
+            let evicted = match get_channel_node(&previous_channel.id).await? {
+                Some(node) => match voice_client
+                    .remove_user_if_present_sids(&node, &user.id, &previous_channel.id)
+                    .await
+                {
+                    Ok(evicted) => evicted,
+                    Err(error) => {
+                        log::warn!(
+                            "force-disconnect of {} from {}: the eviction failed, so nothing \
+                             there is torn down and the join proceeds: {error:?}",
+                            user.id,
+                            previous_channel.id
+                        );
+                        continue;
+                    }
+                },
+                None => None,
             };
 
-            delete_voice_state(&previous_channel, &user.id).await?;
+            // 3. `returned ∪ (recorded − returned)`: every sid the eviction
+            //    returned, then every sid recorded BEFORE the listing that it
+            //    did not list (stale), each once. With no listing (no node,
+            //    or no room), the recorded sids alone. An EMPTY set is the
+            //    script's pure survivor check: with nothing of the user
+            //    recorded it is `Last` and the full teardown, which a legacy
+            //    connection or a ghost with state and no record needs. A
+            //    connection recorded after step 1 that the listing did not
+            //    see is in neither set, so the script answers `Survivor` and
+            //    it keeps its state. The channel came from `vc:{user}`, so
+            //    the user holds state here and the teardown always runs.
+            let mut sids = evicted.unwrap_or_default();
+            for sid in recorded {
+                if !sids.contains(&sid) {
+                    sids.push(sid);
+                }
+            }
+            delete_voice_connections(&previous_channel, &user.id, &sids).await?;
         }
     } else {
         raise_if_in_voice(&user, &user_voice_channel).await?;
@@ -273,8 +357,11 @@ mod test {
     use iso8601_timestamp::Timestamp;
     use revolt_database::{
         voice::{
-            create_voice_state, delete_channel_voice_state, mls_cap_would_refuse,
-            update_voice_state, video_roster_over_cap, UserVoiceChannel, MAX_VIDEO_PARTICIPANTS,
+            create_voice_state, delete_channel_node, delete_channel_voice_state, get_channel_node,
+            get_user_voice_channel_in_server, get_user_voice_channels, get_voice_channel_members,
+            is_in_voice_channel, mls_cap_would_refuse, record_voice_connection,
+            recorded_voice_connections, set_channel_node, update_voice_state,
+            video_roster_over_cap, UserVoiceChannel, MAX_VIDEO_PARTICIPANTS,
         },
         Channel, Member, MlsGroup, MlsGroupCreateOutcome, MlsMemberDevice, User,
         MAX_MLS_GROUP_MEMBERS,
@@ -677,11 +764,14 @@ mod test {
             body
         );
 
+        // The force-disconnect's side effects (AFK S-3 B5): the record read,
+        // the eviction and the set teardown all come after the refusal.
         for effect in [
             "if force_disconnect == Some(true)",
             "release_remote_control_for_user(",
-            "remove_user(",
-            "delete_voice_state(",
+            "recorded_voice_connections(",
+            "remove_user_if_present_sids(",
+            "delete_voice_connections(",
             "create_token(",
             "create_room(",
             "set_channel_node(",
@@ -693,6 +783,362 @@ mod test {
                 effect,
                 body
             );
+        }
+    }
+
+    // ---- force-disconnect (AFK S-3 B5) ----------------------------------
+
+    /// The force-disconnect block of `call`, as `call_body` flattens it.
+    fn force_disconnect_block() -> String {
+        let body = call_body();
+        let start = body
+            .find("if force_disconnect == Some(true)")
+            .expect("`call` lost its force-disconnect block");
+        let end = start
+            + body[start..]
+                .find("else \u{7b} raise_if_in_voice(")
+                .expect("the force-disconnect block lost its else arm");
+        body[start..end].to_string()
+    }
+
+    /// AFK S-3 D-2 (amended by WA-R / RA2-1) for the force-disconnect, per
+    /// previous channel: the remote-control release, then the recorded
+    /// connections, read BEFORE the one SFU listing the eviction takes, then
+    /// the set teardown of the evicted sids plus the recorded ones. Read
+    /// after the listing, a sibling that records in between would look stale
+    /// and be deleted while live (WA-1). A listing-decided path never runs
+    /// the whole-user teardown, never the mapping-resolved single eviction,
+    /// and never reads the per-server pointer.
+    ///
+    /// Both failure arms skip THIS channel and go on to the next: a failed
+    /// record read or a failed eviction tears nothing of the channel down
+    /// (no teardown on Err), and neither may leave the loop early.
+    ///
+    /// The listed arms (`Ok(Some)`, `Ok(None)`) need a live SFU and are
+    /// pinned here by text only. The no-node and eviction-Err arms are
+    /// driven for real in the two tests below.
+    #[test]
+    fn force_disconnect_removes_only_what_it_knows_about() {
+        let block = force_disconnect_block();
+        let once = |needle: &str| {
+            assert_eq!(
+                block.matches(needle).count(),
+                1,
+                "`{}` must appear exactly once in the force-disconnect block: {}",
+                needle,
+                block
+            );
+            block.find(needle).unwrap()
+        };
+
+        let loop_head = once("for previous_channel in get_user_voice_channels(&user.id).await?");
+        let release = once("release_remote_control_for_user(");
+        let recorded = once(
+            "recorded_voice_connections(&previous_channel, &user.id) .await .to_internal_error()",
+        );
+        let evict =
+            once("remove_user_if_present_sids(&node, &user.id, &previous_channel.id) .await");
+        let teardown = once(
+            "let mut sids = evicted.unwrap_or_default(); for sid in recorded \u{7b} \
+             if !sids.contains(&sid) \u{7b} sids.push(sid); \u{7d} \u{7d} \
+             delete_voice_connections(&previous_channel, &user.id, &sids).await?;",
+        );
+        assert!(
+            loop_head < release && release < recorded && recorded < evict && evict < teardown,
+            "the order must be release, recorded read, eviction, set teardown: {}",
+            block
+        );
+
+        for banned in [
+            "delete_voice_state(",
+            ".remove_user(",
+            "get_user_voice_channel_in_server(",
+        ] {
+            assert!(
+                !block.contains(banned),
+                "the force-disconnect decides from a listing and must not call `{}`: {}",
+                banned,
+                block
+            );
+        }
+
+        // Each failure arm: an Err arm between its step and the next one,
+        // whose only exit is `continue;`, reached before that next step.
+        for (step, next, what) in [
+            (recorded, evict, "record read"),
+            (evict, teardown, "eviction"),
+        ] {
+            let arm = step
+                + block[step..]
+                    .find("Err(error) =>")
+                    .unwrap_or_else(|| panic!("the {} lost its Err arm: {}", what, block));
+            let skip = arm
+                + block[arm..].find("continue;").unwrap_or_else(|| {
+                    panic!("the failed {} no longer skips the channel: {}", what, block)
+                });
+            assert!(
+                arm < next && skip < next,
+                "the failed {} must skip to the next channel before anything after it: {}",
+                what,
+                block
+            );
+            let arm_text = &block[arm + "Err(error) =>".len()..skip];
+            for banned in [
+                "=>",
+                "delete_voice_connections(",
+                "break",
+                "return",
+                ".await?",
+            ] {
+                assert!(
+                    !arm_text.contains(banned),
+                    "the failed {} arm must hold `{}` nowhere: {}",
+                    what,
+                    banned,
+                    arm_text
+                );
+            }
+        }
+    }
+
+    /// The observable end state of `user_id` in `uvc`: its connection
+    /// records, then whether it is in the user's channel set, in the
+    /// channel's member set, and named by the per-server pointer.
+    async fn voice_traces(
+        uvc: &UserVoiceChannel,
+        user_id: &str,
+    ) -> (Vec<(String, String)>, bool, bool, bool) {
+        let recorded = recorded_voice_connections(uvc, user_id)
+            .await
+            .expect("recorded read");
+        let listed = is_in_voice_channel(user_id, uvc).await.expect("vc read");
+        let member = get_voice_channel_members(uvc)
+            .await
+            .expect("members read")
+            .is_some_and(|members| members.iter().any(|id| id == user_id));
+        let pointer = get_user_voice_channel_in_server(
+            user_id,
+            uvc.server_id.as_deref().expect("a server channel"),
+        )
+        .await
+        .expect("pointer read")
+        .as_deref()
+            == Some(uvc.id.as_str());
+        (recorded, listed, member, pointer)
+    }
+
+    /// A join as voice-ingress records it: the connection first, then the
+    /// state, created only for the user's first connection.
+    async fn join_recorded(uvc: &UserVoiceChannel, user_id: &str, sid: &str, identity: &str) {
+        if record_voice_connection(uvc, user_id, sid, identity)
+            .await
+            .expect("record")
+        {
+            create_voice_state(uvc, user_id, Timestamp::now_utc())
+                .await
+                .expect("voice state");
+        }
+    }
+
+    /// A node name no configuration knows: every SFU call addressed to it
+    /// fails with `UnknownNode` before any network.
+    const ABSENT_NODE: &str = "test-node-with-no-sfu";
+
+    /// The node of the workspace `Revolt.toml`, configured in both
+    /// `hosts.livekit` and `api.livekit.nodes`, so a join pinned to it gets
+    /// past node resolution and past the force-disconnect. Its SFU address
+    /// does not resolve from a test run, so the join then fails at
+    /// `create_room` with 500, after everything these tests assert on.
+    const JOINABLE_NODE: &str = "worldwide";
+
+    /// POST join_call with force_disconnect into `target`, pinned to
+    /// JOINABLE_NODE. Asserts the answer came from past the force-disconnect
+    /// (the unreachable SFU's 500) and not from an error raised in it: an
+    /// eviction error there answers 400 `UnknownNode`.
+    async fn force_join_past_the_disconnect(
+        harness: &TestHarness,
+        session_token: &str,
+        target: &Channel,
+    ) {
+        set_channel_node(target.id(), JOINABLE_NODE)
+            .await
+            .expect("pin the target");
+        let response = join_call(harness, session_token, target.id(), true).await;
+        let status = response.status();
+        let body = response.into_string().await.unwrap_or_default();
+        delete_channel_node(target.id())
+            .await
+            .expect("unpin the target");
+        assert_eq!(
+            status,
+            Status::InternalServerError,
+            "the join must get past the force-disconnect to the (unreachable) SFU: {}",
+            body
+        );
+        assert!(!body.contains("UnknownNode"), "{}", body);
+    }
+
+    // Needs RabbitMQ and Redis, as every route test in this module does.
+    #[test]
+    fn force_disconnect_clears_the_ghost_of_every_ended_call() {
+        crate::util::test::rt().block_on(force_disconnect_clears_the_ghost_of_every_ended_call_case())
+    }
+
+    /// Two calls that ended without their webhooks (no node pinned) leave
+    /// the user on both rosters: one with two recorded connections, one
+    /// legacy (state, no record, which the empty set tears down as `Last`).
+    /// A force-disconnect join elsewhere tears both down from the recorded
+    /// sids, as the whole-user teardown did before. Mutations: the recorded
+    /// sids dropped from the set (the records survive, the script answers
+    /// `Survivor`, the first ghost stays); the teardown skipped.
+    async fn force_disconnect_clears_the_ghost_of_every_ended_call_case() {
+        let harness = TestHarness::new().await;
+        let (_account, session, user) = harness.new_user().await;
+
+        let recorded_call = voice_channel(&harness, &user, &[]).await;
+        let legacy_call = voice_channel(&harness, &user, &[]).await;
+        let target = voice_channel(&harness, &user, &[]).await;
+        let recorded_uvc = UserVoiceChannel::from_channel(&recorded_call);
+        let legacy_uvc = UserVoiceChannel::from_channel(&legacy_call);
+
+        join_recorded(&recorded_uvc, &user.id, "PA_ghost_bare", &user.id).await;
+        join_recorded(
+            &recorded_uvc,
+            &user.id,
+            "PA_ghost_device",
+            &format!("{}:DEV", user.id),
+        )
+        .await;
+        create_voice_state(&legacy_uvc, &user.id, Timestamp::now_utc())
+            .await
+            .expect("legacy voice state");
+
+        // The fixture holds what it claims to, and no node is pinned.
+        let (recorded, listed, member, pointer) = voice_traces(&recorded_uvc, &user.id).await;
+        assert_eq!(recorded.len(), 2, "two recorded connections");
+        assert!(listed && member && pointer, "the recorded ghost has state");
+        let (recorded, listed, member, pointer) = voice_traces(&legacy_uvc, &user.id).await;
+        assert!(recorded.is_empty(), "the legacy ghost has no record");
+        assert!(listed && member && pointer, "the legacy ghost has state");
+        for call in [&recorded_call, &legacy_call] {
+            assert!(
+                get_channel_node(call.id())
+                    .await
+                    .expect("node read")
+                    .is_none(),
+                "the call has ended: no node"
+            );
+        }
+
+        force_join_past_the_disconnect(&harness, &session.token, &target).await;
+
+        for uvc in [&recorded_uvc, &legacy_uvc] {
+            let (recorded, listed, member, pointer) = voice_traces(uvc, &user.id).await;
+            assert!(
+                recorded.is_empty() && !listed && !member && !pointer,
+                "the ghost in {} must be torn down, left: recorded {:?}, vc {}, \
+                 vc_members {}, pointer {}",
+                uvc.id,
+                recorded,
+                listed,
+                member,
+                pointer
+            );
+        }
+
+        for uvc in [&recorded_uvc, &legacy_uvc] {
+            delete_channel_voice_state(uvc, &[user.id.clone()])
+                .await
+                .expect("cleanup");
+        }
+    }
+
+    // Needs RabbitMQ and Redis, as every route test in this module does.
+    #[test]
+    fn a_failed_force_disconnect_eviction_tears_nothing_down() {
+        crate::util::test::rt().block_on(a_failed_force_disconnect_eviction_tears_nothing_down_case())
+    }
+
+    /// An eviction that fails may have left a listed connection live, so
+    /// NOTHING of that channel is torn down, and the join still proceeds: a
+    /// dead SFU node must not lock the user out of rejoining. The other
+    /// channel is still cleared. ABSENT_NODE makes the eviction fail with
+    /// `UnknownNode` before any network.
+    ///
+    /// The failing channel is the one the user's channel set lists FIRST
+    /// (the route walks it in the same order), so an early exit on the
+    /// failure cannot reach the second channel. Mutations: a teardown on the
+    /// Err arm (the failed channel's record and state go); `break` on it (the
+    /// second channel's ghost stays); `?` on it (400 `UnknownNode`).
+    async fn a_failed_force_disconnect_eviction_tears_nothing_down_case() {
+        let harness = TestHarness::new().await;
+        let (_account, session, user) = harness.new_user().await;
+
+        let first = voice_channel(&harness, &user, &[]).await;
+        let second = voice_channel(&harness, &user, &[]).await;
+        let target = voice_channel(&harness, &user, &[]).await;
+        join_recorded(
+            &UserVoiceChannel::from_channel(&first),
+            &user.id,
+            "PA_first",
+            &user.id,
+        )
+        .await;
+        join_recorded(
+            &UserVoiceChannel::from_channel(&second),
+            &user.id,
+            "PA_second",
+            &user.id,
+        )
+        .await;
+
+        // Assign the roles by the order the route will walk: the set's order
+        // is the server's, not the insertion order.
+        let walked = get_user_voice_channels(&user.id).await.expect("vc read");
+        assert_eq!(walked.len(), 2, "the user is in both calls");
+        let (failing, cleared) = (walked[0].clone(), walked[1].clone());
+        set_channel_node(&failing.id, ABSENT_NODE)
+            .await
+            .expect("node");
+        let failing_sid = if failing.id == first.id() {
+            "PA_first"
+        } else {
+            "PA_second"
+        };
+
+        force_join_past_the_disconnect(&harness, &session.token, &target).await;
+
+        let (recorded, listed, member, pointer) = voice_traces(&failing, &user.id).await;
+        assert_eq!(
+            recorded,
+            vec![(failing_sid.to_string(), user.id.clone())],
+            "a failed eviction must leave the record in place"
+        );
+        assert!(
+            listed && member && pointer,
+            "a failed eviction must leave the voice state in place: vc {}, vc_members {}, \
+             pointer {}",
+            listed,
+            member,
+            pointer
+        );
+
+        let (recorded, listed, member, pointer) = voice_traces(&cleared, &user.id).await;
+        assert!(
+            recorded.is_empty() && !listed && !member && !pointer,
+            "the channel after the failed one must still be cleared, left: recorded {:?}, \
+             vc {}, vc_members {}, pointer {}",
+            recorded,
+            listed,
+            member,
+            pointer
+        );
+
+        delete_channel_node(&failing.id).await.expect("unpin");
+        for uvc in [&failing, &cleared] {
+            delete_channel_voice_state(uvc, &[user.id.clone()])
+                .await
+                .expect("cleanup");
         }
     }
 

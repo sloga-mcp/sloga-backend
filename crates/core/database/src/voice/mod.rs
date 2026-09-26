@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fmt::{Display, Write},
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -2674,10 +2674,8 @@ fn eviction_targets<I: IntoIterator<Item = String>>(
 ///
 /// Ownership is `user_id_from_participant_identity`, never a string prefix:
 /// `uu:B` belongs to `uu`, not to `u`. Pure; consumed by the roster-driven
-/// permission sync.
-// Wired into `sync_voice_permissions` by S-3 lane B1; until then only the
-// tests call it.
-#[allow(dead_code)]
+/// permission sync ([`sync_voice_permissions`] and the single-user
+/// [`sync_user_voice_permissions`]).
 pub(crate) fn roster_connections(
     identities: impl IntoIterator<Item = String>,
 ) -> BTreeMap<String, Vec<String>> {
@@ -3250,15 +3248,17 @@ pub async fn move_user_to_voice_channel_expecting(
 }
 
 /// What one member's permission sync amounted to, as the room-wide sync
-/// records it (AFK Stage 6 F-A1).
+/// records it (AFK Stage 6 F-A1). Also one channel's outcome in the
+/// server-wide sync and in the removal walks (AFK S-3 D-2, D-6).
 #[derive(Debug, PartialEq, Eq)]
 enum MemberSync<E> {
     /// The new grant reached the SFU, or there was nothing to push for this
-    /// member (no voice state, or a role-scoped sync their roles do not
-    /// reach).
+    /// member (no voice state and no connection listed, or a role-scoped
+    /// sync their roles do not reach).
     Synced,
     /// The member is no longer there to sync: the user or member document
-    /// is gone, or the SFU has no such participant. Not a failure of the
+    /// is gone, or the SFU has no such participant (for a channel of the
+    /// server-wide sync: its document is gone). Not a failure of the
     /// room-wide sync. Carries the error [`sync_user_voice_permissions`]
     /// has always returned for it, which that single-user entry point still
     /// returns.
@@ -3267,37 +3267,42 @@ enum MemberSync<E> {
     Failed(E),
 }
 
-/// Sync every member in `members`, in order, and record each outcome.
+/// Sync every item in `items`, in order, and record each outcome: the
+/// members of one room ([`sync_voice_permissions`]), or the channels of one
+/// server ([`sync_server_voice_permissions`], AFK S-3 D-6). `scope` names
+/// the room or server in the log lines.
 ///
-/// The loop has no early exit: the per-member call returns a [`MemberSync`],
-/// not a `Result`, so there is no `?` to put on it, and one member's failure
+/// The loop has no early exit: the per-item call returns a [`MemberSync`],
+/// not a `Result`, so there is no `?` to put on it, and one item's failure
 /// is recorded and logged while the rest are still synced.
 /// [`member_sync_result`] decides afterwards what the outcomes amount to.
-/// Generic over the per-member call so the tests drive THIS loop with a fake
-/// one; [`sync_voice_permissions`] hands it the real one.
-async fn sync_each_member<E, F, Fut>(
-    channel_id: &str,
-    members: Vec<String>,
+/// Generic over the item and the per-item call so the tests drive THIS loop
+/// with a fake one; both callers hand it the real one. There is one loop,
+/// not one per caller, so the no-early-exit rule cannot drift between them.
+async fn sync_each_member<T, E, F, Fut>(
+    scope: &str,
+    items: Vec<T>,
     mut sync_one: F,
 ) -> Vec<MemberSync<E>>
 where
+    T: Display + Clone,
     E: std::fmt::Debug,
-    F: FnMut(String) -> Fut,
+    F: FnMut(T) -> Fut,
     Fut: std::future::Future<Output = MemberSync<E>>,
 {
-    let mut outcomes = Vec::with_capacity(members.len());
+    let mut outcomes = Vec::with_capacity(items.len());
 
-    for user_id in members {
-        let outcome = sync_one(user_id.clone()).await;
+    for item in items {
+        let outcome = sync_one(item.clone()).await;
 
         match &outcome {
             MemberSync::Synced => {}
-            MemberSync::Gone(_) => log::debug!(
-                "permission sync of {channel_id}: skipped {user_id}, who is no longer there"
-            ),
+            MemberSync::Gone(_) => {
+                log::debug!("permission sync of {scope}: skipped {item}, which is no longer there")
+            }
             MemberSync::Failed(error) => log::warn!(
-                "permission sync of {channel_id}: failed for {user_id}, the remaining members \
-                 are still synced: {error:?}"
+                "permission sync of {scope}: failed for {item}, the remaining ones are still \
+                 synced: {error:?}"
             ),
         }
 
@@ -3341,12 +3346,39 @@ fn member_sync_result<E>(
 /// skipped; any other failure is logged, and the first one is returned once
 /// every member has been tried.
 ///
-/// Callers: `sync_afk_designation_change`, and the role and permission
-/// routes (`roles_edit`, `roles_delete`, `roles_edit_positions`, both
-/// `permissions_set` and both `permissions_set_default`). Each of them calls
-/// this last, after its own write, with `?`: none acts on a partial sync,
-/// so trying every member before answering changes nothing for them except
-/// that later members are no longer left behind.
+/// ROSTER-DRIVEN (AFK S-3 D-4): the room is listed at the SFU ONCE, through
+/// [`VoiceClient::list_participants_reported`], and every listed identity
+/// is grouped under its owning user by [`roster_connections`]. The members
+/// synced are `vc_members:{channel}` UNION the users the SFU lists, sorted
+/// and deduplicated, and each one's grant goes to EVERY connection the
+/// listing names for them. Nothing is resolved through the identity mapping,
+/// which holds at most one connection per user. So:
+///
+/// - a user with a second device in the room gets the new grant on both;
+/// - a user the SFU lists who has NO voice state here (a connection left
+///   stateless, S-3 F-2) is pushed the grant anyway, with no state written
+///   and no roster event: see [`push_user_voice_permissions`];
+/// - a user with voice state whom the SFU does not list is gone.
+///
+/// A failed roster read fails the whole room ONCE, and no member is pushed;
+/// it is already ERROR + Sentry inside `list_participants_reported`. Every
+/// member with voice state STILL gets their roster flags written first
+/// ([`SyncConnections::Unlisted`], S-3 B1-R): the listing's error is
+/// returned after the walk, so a designation or role change lands in Redis
+/// even while the SFU cannot be read.
+/// A room the SFU does not have (`Ok(None)`) is an empty roster: members
+/// with voice state are then gone, and nothing is pushed.
+///
+/// Accepted race, as before: a connection whose token was minted before the
+/// caller's write and which joins after this listing is not pushed.
+///
+/// Callers: `sync_afk_designation_change`, [`sync_server_voice_permissions`],
+/// and the role and permission routes (`roles_edit`, `roles_delete`,
+/// `roles_edit_positions`, both `permissions_set` and both
+/// `permissions_set_default`). Each of them calls this last, after its own
+/// write, with `?`: none acts on a partial sync, so trying every member
+/// before answering changes nothing for them except that later members are
+/// no longer left behind.
 pub async fn sync_voice_permissions(
     db: &Database,
     voice_client: &VoiceClient,
@@ -3364,23 +3396,72 @@ pub async fn sync_voice_permissions(
     let members = get_voice_channel_members(&user_voice_channel)
         .await?
         .unwrap_or_default();
+    // A failed listing does NOT end the room here (S-3 B1-R): every member
+    // with voice state still gets their roster flags written, nothing is
+    // pushed, and the listing's error is the room's answer, once, after.
+    let (mut roster, listing_error) = match voice_client
+        .list_participants_reported(node, channel.id())
+        .await
+    {
+        Ok(listed) => (
+            roster_connections(
+                listed
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|participant| participant.identity),
+            ),
+            None,
+        ),
+        Err(error) => (BTreeMap::new(), Some(error)),
+    };
+    let listing_failed = listing_error.is_some();
+    let members: Vec<String> = members
+        .into_iter()
+        .chain(roster.keys().cloned())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
 
-    let outcomes = sync_each_member(channel.id(), members, move |user_id| async move {
-        sync_member_voice_permissions(db, voice_client, node, &user_id, channel, server, role_id)
+    let outcomes = sync_each_member(channel.id(), members, move |user_id| {
+        let connections = roster.remove(&user_id).unwrap_or_default();
+        async move {
+            let connections = if listing_failed {
+                SyncConnections::Unlisted
+            } else {
+                SyncConnections::Listed(&connections)
+            };
+            sync_member_voice_permissions(
+                db,
+                voice_client,
+                node,
+                &user_id,
+                connections,
+                channel,
+                server,
+                role_id,
+            )
             .await
+        }
     })
     .await;
 
-    member_sync_result(outcomes)
+    match listing_error {
+        Some(error) => Err(error),
+        None => member_sync_result(outcomes),
+    }
 }
 
-/// One member of a room-wide sync, by user id, classified for
-/// [`member_sync_result`].
+/// One member of a room-wide sync, by user id, with the connections the
+/// room's ONE listing names for them, classified for [`member_sync_result`].
+/// A user id that does not resolve to a user (a roster entry that is not an
+/// account, or a deleted one) is gone.
+#[allow(clippy::too_many_arguments)]
 async fn sync_member_voice_permissions(
     db: &Database,
     voice_client: &VoiceClient,
     node: &str,
     user_id: &str,
+    connections: SyncConnections<'_>,
     channel: &Channel,
     server: Option<&Server>,
     role_id: Option<&str>,
@@ -3393,8 +3474,104 @@ async fn sync_member_voice_permissions(
         Err(error) => return MemberSync::Failed(error),
     };
 
-    sync_user_voice_permissions_classified(db, voice_client, node, &user, channel, server, role_id)
-        .await
+    sync_user_voice_permissions_classified(
+        db,
+        voice_client,
+        node,
+        &user,
+        connections,
+        channel,
+        server,
+        role_id,
+    )
+    .await
+}
+
+/// Where a permission sync takes one user's SFU connections from (AFK S-3
+/// D-4). Either way they come from ONE listing of the room.
+#[derive(Debug, Clone, Copy)]
+enum SyncConnections<'a> {
+    /// The room-wide sync listed the room once for every member; these are
+    /// this user's identities from that listing (possibly none).
+    Listed(&'a [String]),
+    /// The single-user entry point: list the room itself, once, after the
+    /// member and role checks (so a user they rule out costs no SFU call)
+    /// and after the roster-flag write.
+    ListRoom,
+    /// The room-wide sync's one listing FAILED (S-3 B1-R): the member's
+    /// roster flags are still written, nothing is pushed, and the room
+    /// answers the listing's error once, after every member.
+    Unlisted,
+}
+
+/// Re-sync the LiveKit grant of everyone in every call of `server` (or,
+/// with `role_id`, everyone there holding that role), AFK S-3 D-6.
+///
+/// Every id in `server.channels` is tried, through the same no-early-exit
+/// loop as a room's members ([`sync_each_member`]), and
+/// [`member_sync_result`] decides: the FIRST failure is returned once every
+/// channel was tried. Per channel ([`sync_server_channel_voice_permissions`]):
+///
+/// - no LiveKit node pinned: no call there, skipped WITHOUT a database read;
+/// - the channel document is gone (`NotFound`): skipped;
+/// - any other fetch error, or a failed [`sync_voice_permissions`]: failed.
+///
+/// Each channel is fetched by id, not through `db.fetch_channels`, whose
+/// drivers disagree on missing ids. `server` is handed down to every room
+/// sync, so it must be the POST-update document the caller just wrote.
+pub async fn sync_server_voice_permissions(
+    db: &Database,
+    voice_client: &VoiceClient,
+    server: &Server,
+    role_id: Option<&str>,
+) -> Result<()> {
+    sync_server_channels(server, move |channel_id| async move {
+        sync_server_channel_voice_permissions(db, voice_client, server, &channel_id, role_id).await
+    })
+    .await
+}
+
+/// The walk of [`sync_server_voice_permissions`]: every id in
+/// `server.channels`, in order, through [`sync_each_member`], then
+/// [`member_sync_result`]. Generic over the per-channel call so the tests
+/// drive this walk with a fake one.
+async fn sync_server_channels<F, Fut>(server: &Server, sync_one: F) -> Result<()>
+where
+    F: FnMut(String) -> Fut,
+    Fut: std::future::Future<Output = MemberSync<revolt_result::Error>>,
+{
+    let outcomes = sync_each_member(&server.id, server.channels.clone(), sync_one).await;
+    member_sync_result(outcomes)
+}
+
+/// One channel of [`sync_server_voice_permissions`], classified for
+/// [`member_sync_result`]. The node pin is read FIRST: a channel with no
+/// call costs one Redis read and no database read.
+async fn sync_server_channel_voice_permissions(
+    db: &Database,
+    voice_client: &VoiceClient,
+    server: &Server,
+    channel_id: &str,
+    role_id: Option<&str>,
+) -> MemberSync<revolt_result::Error> {
+    match get_channel_node(channel_id).await {
+        Ok(Some(_)) => {}
+        Ok(None) => return MemberSync::Synced,
+        Err(error) => return MemberSync::Failed(error),
+    }
+
+    let channel = match db.fetch_channel(channel_id).await {
+        Ok(channel) => channel,
+        Err(error) if matches!(error.error_type, revolt_result::ErrorType::NotFound) => {
+            return MemberSync::Gone(error)
+        }
+        Err(error) => return MemberSync::Failed(error),
+    };
+
+    match sync_voice_permissions(db, voice_client, &channel, Some(server), role_id).await {
+        Ok(()) => MemberSync::Synced,
+        Err(error) => MemberSync::Failed(error),
+    }
 }
 
 /// Re-sync voice permissions on BOTH sides of an AFK designation change.
@@ -4970,28 +5147,52 @@ mod permission_tests {
     /// finds them out. Mutations: the old `for … ?` loop restored, an exit
     /// added to the loop, the result decided by anything else, or either
     /// `Gone` arm turned into a failure.
+    ///
+    /// S-3 D-4 (lane B1) retargeted the call shape: the per-member call now
+    /// carries the member's share of the room's ONE listing, and the push is
+    /// `update_permissions_connections` over every listed connection instead
+    /// of the mapping-resolving `update_permissions_if_present`, which the
+    /// sync no longer calls at all.
     #[test]
     fn the_room_sync_tries_every_member_before_deciding() {
         let shipping = this_file_shipping();
 
+        const WALK: &str = "let outcomes = sync_each_member(channel.id(), members, move |user_id| \
+             \u{7b} let connections = roster.remove(&user_id).unwrap_or_default(); async move \
+             \u{7b} let connections = if listing_failed \u{7b} SyncConnections::Unlisted \u{7d} \
+             else \u{7b} SyncConnections::Listed(&connections) \u{7d}; \
+             sync_member_voice_permissions( db, voice_client, node, &user_id, connections, \
+             channel, server, role_id, ) .await \u{7d} \u{7d}) .await;";
         let room = flat_fn_body(&shipping, "pub async fn sync_voice_permissions(");
         assert!(
-            room.contains(
-                "let outcomes = sync_each_member(channel.id(), members, move |user_id| async move \
-                 \u{7b} sync_member_voice_permissions(db, voice_client, node, &user_id, channel, \
-                 server, role_id) .await \u{7d}) .await;"
-            ),
+            room.contains(WALK),
             "`sync_voice_permissions` must walk the room through `sync_each_member`, \
              with no `?` on the per-member call: {room}"
         );
         assert!(
             room.ends_with(
-                "let outcomes = sync_each_member(channel.id(), members, move |user_id| async move \
-                 \u{7b} sync_member_voice_permissions(db, voice_client, node, &user_id, channel, \
-                 server, role_id) .await \u{7d}) .await; member_sync_result(outcomes)"
+                &(WALK.to_string()
+                    + " match listing_error \u{7b} Some(error) => Err(error), None => \
+                       member_sync_result(outcomes), \u{7d}")
             ),
             "every outcome must go to `member_sync_result`, and its answer is the \
-             function's: {room}"
+             function's, unless the room's listing failed, whose error is then the \
+             answer, AFTER every member: {room}"
+        );
+        // S-3 B1-R: a failed listing does not end the room before its members
+        // (their roster flags are still written); it is recorded, not `?`d.
+        assert!(
+            room.contains("Err(error) => (BTreeMap::new(), Some(error)),"),
+            "{room}"
+        );
+        assert!(
+            first(&room, ".list_participants_reported(") < first(&room, "sync_each_member("),
+            "{room}"
+        );
+        assert_eq!(
+            room.matches("return").count(),
+            1,
+            "the no-node exit only: {room}"
         );
         assert!(
             !room.contains("sync_user_voice_permissions("),
@@ -5000,7 +5201,7 @@ mod permission_tests {
         );
 
         let each = flat_fn_body(&shipping, "async fn sync_each_member<");
-        let loop_at = first(&each, "for user_id in members");
+        let loop_at = first(&each, "for item in items");
         let loop_body = &each[loop_at..];
         for exit in [".await?", ")?", "return", "break"] {
             assert!(
@@ -5029,11 +5230,68 @@ mod permission_tests {
         );
         assert!(
             push.contains(
-                "let pushed = voice_client .update_permissions_if_present( node, user, \
-                 channel_id, voice_participant_permissions(can_listen, &allowed_sources), ) \
+                "let pushed = voice_client .update_permissions_connections( node, channel_id, \
+                 connections, voice_participant_permissions(can_listen, &allowed_sources), ) \
                  .await?; if !pushed \u{7b} return Ok(MemberSync::Gone(create_error!(InternalError))); \u{7d}"
             ),
             "a participant the SFU no longer has is skipped: {push}"
+        );
+        assert!(
+            !push.contains("update_permissions_if_present("),
+            "the sync must not resolve a connection through the identity mapping: {push}"
+        );
+        // D-4's outcome table: only NO connection at all ends the member
+        // before the push; a stateless live connection goes on to be pushed.
+        assert!(
+            push.contains(
+                "if connections.is_empty() \u{7b} return Ok(match voice_state \u{7b} None => \
+                 MemberSync::Synced, Some(_) => MemberSync::Gone(create_error!(InternalError)), \
+                 \u{7d}); \u{7d}"
+            ),
+            "{push}"
+        );
+        // The only early `Synced` exits: no state with nothing to push to,
+        // and the room's failed listing (after the write).
+        assert!(
+            push.contains(
+                "if voice_state.is_none() && matches!( connections, \
+                 SyncConnections::Listed([]) | SyncConnections::Unlisted ) \u{7b} return \
+                 Ok(MemberSync::Synced); \u{7d}"
+            ),
+            "{push}"
+        );
+        assert!(
+            push.contains("SyncConnections::Unlisted => return Ok(MemberSync::Synced),"),
+            "{push}"
+        );
+        assert_eq!(
+            push.matches("return Ok(MemberSync::Synced)").count(),
+            2,
+            "{push}"
+        );
+        assert!(
+            first(&push, "if connections.is_empty()")
+                < first(&push, ".update_permissions_connections("),
+            "{push}"
+        );
+        // S-3 B1-R: the roster-flag write precedes EVERY SFU contact, the
+        // single-user listing included, and the event follows the push.
+        let write = first(
+            &push,
+            "update_voice_state(&user_voice_channel, &user.id, &update_event)",
+        );
+        assert!(
+            write < first(&push, ".list_participants_reported("),
+            "{push}"
+        );
+        assert!(
+            write < first(&push, ".update_permissions_connections("),
+            "{push}"
+        );
+        assert!(
+            first(&push, ".update_permissions_connections(")
+                < first(&push, "EventV1::UserVoiceStateUpdate"),
+            "{push}"
         );
     }
 
@@ -5062,6 +5320,209 @@ mod permission_tests {
         );
     }
 
+    /// S-3 D-6: the server-wide sync is the room sync's own loop over the
+    /// server's channels (no second loop to drift), and each channel checks
+    /// its node pin BEFORE any database read, fetches by id (never
+    /// `fetch_channels`, whose drivers disagree on missing ids), and counts a
+    /// deleted channel as gone. Mutations: a `?` or an exit in the walk, the
+    /// fetch moved above the node read, or the NotFound arm made a failure.
+    #[test]
+    fn the_server_sync_walks_every_channel_node_first() {
+        let shipping = this_file_shipping();
+
+        assert_eq!(
+            flat_fn_body(&shipping, "pub async fn sync_server_voice_permissions("),
+            "sync_server_channels(server, move |channel_id| async move \u{7b} \
+             sync_server_channel_voice_permissions(db, voice_client, server, &channel_id, \
+             role_id).await \u{7d}) .await"
+        );
+        assert_eq!(
+            flat_fn_body(&shipping, "async fn sync_server_channels<"),
+            "let outcomes = sync_each_member(&server.id, server.channels.clone(), sync_one).await; \
+             member_sync_result(outcomes)"
+        );
+
+        let one = flat_fn_body(&shipping, "async fn sync_server_channel_voice_permissions(");
+        assert!(
+            one.starts_with(
+                "match get_channel_node(channel_id).await \u{7b} Ok(Some(_)) => \u{7b}\u{7d} \
+                 Ok(None) => return MemberSync::Synced, Err(error) => return \
+                 MemberSync::Failed(error), \u{7d}"
+            ),
+            "the node pin is read first, and no call means no database read: {one}"
+        );
+        assert!(
+            first(&one, "get_channel_node(") < first(&one, "db.fetch_channel(channel_id)"),
+            "{one}"
+        );
+        assert!(!one.contains("fetch_channels("), "{one}");
+        assert!(
+            one.contains(
+                "Err(error) if matches!(error.error_type, revolt_result::ErrorType::NotFound) \
+                 => \u{7b} return MemberSync::Gone(error) \u{7d}"
+            ),
+            "a deleted channel is skipped, not a failure: {one}"
+        );
+        assert!(
+            one.ends_with(
+                "match sync_voice_permissions(db, voice_client, &channel, Some(server), \
+                 role_id).await \u{7b} Ok(()) => MemberSync::Synced, Err(error) => \
+                 MemberSync::Failed(error), \u{7d}"
+            ),
+            "{one}"
+        );
+    }
+
+    /// S-3 D-2 as amended by WA-R / RA2-1, the removal's ORDER: the record
+    /// is read BEFORE the SFU listing (read after, a sibling recorded in
+    /// between looks stale and is deleted while live: WA-1), a failed
+    /// eviction returns before any teardown, and the teardown is the SET
+    /// delete of the sids this removal knows. No whole-user
+    /// `delete_voice_state` in any of the three removal bodies: each decides
+    /// from a listing. WB-2 split the failed eviction by what Redis holds:
+    /// the error with something held, reported and Ok with nothing.
+    /// Mutations: the record read moved below the listing, the set delete
+    /// replaced by `delete_voice_state`, the held user's error swallowed,
+    /// the WB-2 split reverted to an unconditional `?`.
+    #[test]
+    fn the_removal_reads_the_record_before_the_listing_and_deletes_only_what_it_knows() {
+        let shipping = this_file_shipping();
+
+        for definition in [
+            "pub async fn remove_user_from_voice_channel(",
+            "pub async fn remove_user_from_voice_channels(",
+            "pub async fn remove_user_from_server_voice(",
+        ] {
+            let body = flat_fn_body(&shipping, definition);
+            assert!(
+                !body.contains("delete_voice_state("),
+                "`{definition}` decides from a listing and must never run the whole-user \
+                 teardown (WA-1): {body}"
+            );
+            assert!(!body.contains(".remove_user("), "{definition}: {body}");
+        }
+
+        let body = flat_fn_body(&shipping, "pub async fn remove_user_from_voice_channel(");
+        assert!(
+            first(&body, "recorded_voice_connections(")
+                < first(&body, "remove_user_if_present_sids("),
+            "ORDERING RULE: the record must be read before the SFU listing: {body}"
+        );
+        assert!(
+            first(&body, "holds_voice_state_in(") < first(&body, "remove_user_if_present_sids("),
+            "{body}"
+        );
+        assert!(
+            body.starts_with(
+                "let recorded: Vec<String> = recorded_voice_connections(channel, user_id) .await?"
+            ),
+            "the record is the first read, and a failed one aborts: {body}"
+        );
+        // WB-2: a failed eviction never reaches the teardown. With something
+        // of the user in Redis it is the answer; with nothing, it is reported
+        // and the channel answers Ok with no release and no script.
+        assert!(
+            body.contains(
+                "Some(node) => match voice_client .remove_user_if_present_sids(&node, user_id, \
+                 &channel.id) .await \u{7b} Ok(evicted) => evicted, Err(error) if holds_state => \
+                 return Err(error), Err(error) => \u{7b} report_unheld_eviction_failure(&channel.id, \
+                 user_id, error); return Ok(()); \u{7d} \u{7d}, None => None, \u{7d};"
+            ),
+            "a failed eviction returns before any teardown: {body}"
+        );
+        assert!(
+            first(&body, "remove_user_if_present_sids(")
+                < first(&body, "delete_voice_connections("),
+            "{body}"
+        );
+        assert!(
+            body.ends_with(
+                "delete_voice_connections(channel, user_id, &removal_teardown_sids(evicted, \
+                 recorded)).await?; Ok(())"
+            ),
+            "the teardown is the set delete of the known sids: {body}"
+        );
+        assert_eq!(
+            body.matches("delete_voice_connections(").count(),
+            1,
+            "{body}"
+        );
+        // P2-6 + RA2-1: the whole-channel skip needs all three: nothing in
+        // Redis (record or state), and nothing listed.
+        assert!(
+            body.contains(
+                "let holds_state = !recorded.is_empty() || holds_voice_state_in(channel, \
+                 user_id).await?;"
+            ),
+            "{body}"
+        );
+        assert!(
+            body.contains(
+                "if !holds_state \u{7b} if evicted.as_ref().is_none_or(Vec::is_empty) \u{7b} \
+                 return Ok(()); \u{7d}"
+            ),
+            "{body}"
+        );
+        // The skip above and the WB-2 arm: no other early success.
+        assert_eq!(body.matches("return Ok(())").count(), 2, "{body}");
+    }
+
+    /// S-3 D-2: the removal walks never exit early. Every channel is tried,
+    /// each outcome is recorded, and `member_sync_result` answers after all.
+    /// The server walk takes the pointer BEFORE the channels (their
+    /// teardowns delete it). Mutations: `?` on a per-channel removal, or an
+    /// exit added to either walk.
+    #[test]
+    fn the_removal_walks_try_every_channel() {
+        let shipping = this_file_shipping();
+
+        let bots = flat_fn_body(&shipping, "pub async fn remove_user_from_voice_channels(");
+        let walk = &bots[first(&bots, "for channel in channels")..];
+        for exit in ["?", "return", "break"] {
+            assert!(
+                !walk.contains(exit),
+                "`{exit}` in the bot removal walk: {walk}"
+            );
+        }
+        assert!(
+            walk.contains(
+                "let removed = remove_user_from_voice_channel(db, voice_client, &channel, \
+                 user_id).await; outcomes.push(removal_outcome(&channel.id, user_id, removed));"
+            ),
+            "{walk}"
+        );
+        assert!(bots.ends_with("member_sync_result(outcomes)"), "{bots}");
+
+        let server = flat_fn_body(&shipping, "pub async fn remove_user_from_server_voice(");
+        for exit in ["?", "return", "break"] {
+            assert!(
+                !server.contains(exit),
+                "`{exit}` in the server removal: a failure would leave the later calls \
+                 holding the user: {server}"
+            );
+        }
+        assert!(
+            first(&server, "get_user_voice_channel_in_server(")
+                < first(&server, "for channel_id in &server.channels"),
+            "{server}"
+        );
+        assert_eq!(
+            server.matches("outcomes.push(removal_outcome(").count(),
+            4,
+            "every step records its outcome: {server}"
+        );
+        // P2-6: the pointer's channel is removed too, node or no node,
+        // unless the walk already removed it.
+        assert!(
+            server.contains(
+                "if let Some(channel_id) = pointed.filter(|id| \
+                 !removed_from.contains(&id.as_str())) \u{7b}"
+            ),
+            "{server}"
+        );
+        assert!(server.ends_with("member_sync_result(outcomes)"), "{server}");
+    }
+
     /// The two gone cases that need no Redis, end to end against the
     /// Reference driver: a user id with no user document, and a user with no
     /// member document in the server, are both `Gone` (skipped by the room
@@ -5075,7 +5536,8 @@ mod permission_tests {
 
     async fn a_deleted_user_or_member_is_gone_not_failed_case() {
         use super::{
-            sync_member_voice_permissions, sync_user_voice_permissions, MemberSync, VoiceClient,
+            sync_member_voice_permissions, sync_user_voice_permissions, MemberSync,
+            SyncConnections, VoiceClient,
         };
         use crate::{Channel, Database, Server, User};
         use revolt_models::v0::{
@@ -5121,6 +5583,7 @@ mod permission_tests {
             &voice_client,
             "node",
             "01KX7HASD9FHBYA3XGKA5YACYX",
+            SyncConnections::Listed(&[]),
             &channel,
             Some(&server),
             None,
@@ -5133,7 +5596,9 @@ mod permission_tests {
             other => panic!("a deleted user must be Gone, got {other:?}"),
         }
 
-        // A user who is not (or no longer) a member of the server.
+        // A user who is not (or no longer) a member of the server, even one
+        // the SFU still lists (S-3 D-4): Gone at the member check, before any
+        // push (this client has no node, so a push would be a failure).
         let stranger = User::create(&db, "SyncGoneStranger".to_string(), None, None)
             .await
             .expect("`User`");
@@ -5142,6 +5607,7 @@ mod permission_tests {
             &voice_client,
             "node",
             &stranger.id,
+            SyncConnections::Listed(&[format!("{}:D1", stranger.id)]),
             &channel,
             Some(&server),
             None,
@@ -6541,12 +7007,21 @@ mod permission_tests {
         // AFK Stage 6 F-A1 added the two classifying `_if_present` pushes;
         // each is a needle of its own because none of these is a prefix of
         // another once the `(` is included.
-        const PUSHES: [&str; 4] = [
+        //
+        // S-3 D-4 (lane B1) added `update_permissions_connections`, and the
+        // needles are now ALSO derived from the transport itself: every
+        // `pub async fn update_permissions…` in its shipping code becomes a
+        // needle, so a push method added there is scanned without anyone
+        // remembering to list it here. The literal list stays (Wave C prunes
+        // the ones whose method is gone).
+        const PUSHES: [&str; 5] = [
             ".update_permissions(",
             ".update_permissions_identity(",
             ".update_permissions_if_present(",
             ".update_permissions_identity_if_present(",
+            ".update_permissions_connections(",
         ];
+        const PUSH_METHOD: &str = "pub async fn update_permissions";
         const SYNC: &str = "voice_participant_permissions(";
         const GRANT: &str = "remote_control_participant_permissions(";
         // The typed transport: its `new_permissions` parameter is
@@ -6560,12 +7035,42 @@ mod permission_tests {
         let mut saw_transport = false;
 
         let sources = shipping_sources();
+
+        let transport = &sources
+            .iter()
+            .find(|(rel, _)| rel == TRANSPORT_FILE)
+            .expect("the transport file moved — update this contract's exclusion")
+            .1;
+        let derived: Vec<String> = transport
+            .match_indices(PUSH_METHOD)
+            .map(|(at, _)| {
+                let name = &transport[at + "pub async fn ".len()..];
+                let end = name
+                    .find(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_'))
+                    .expect("a method name ends");
+                format!(".{}(", &name[..end])
+            })
+            .collect();
+        assert!(
+            derived
+                .iter()
+                .any(|needle| needle == ".update_permissions_connections("),
+            "the derivation found no push method in {TRANSPORT_FILE}, so it scans nothing \
+             of its own: {derived:?}"
+        );
+        let mut needles: Vec<String> = PUSHES.iter().map(|needle| needle.to_string()).collect();
+        for needle in derived {
+            if !needles.contains(&needle) {
+                needles.push(needle);
+            }
+        }
+
         for (rel, shipping) in &sources {
             if rel == TRANSPORT_FILE {
                 saw_transport = true;
                 continue;
             }
-            for needle in PUSHES {
+            for needle in needles.iter().map(String::as_str) {
                 for (at, _) in shipping.match_indices(needle) {
                     // The permission argument lives inside this call's
                     // parentheses; classify by which constructor appears
@@ -7813,13 +8318,21 @@ mod permission_tests {
 
 /// Re-sync one user's LiveKit grant in `channel`.
 ///
-/// A member who has gone (the member document is deleted, or the SFU has no
-/// such participant) is still an `Err` here, of the same type as before AFK
-/// Stage 6 F-A1 (`NotFound`, `InternalError`): this single-user entry point
-/// keeps its contract for its direct caller (`member_edit`). The room-wide
-/// [`sync_voice_permissions`] uses the classified form and skips such a
-/// member instead. A real SFU failure on the push is still logged at ERROR
-/// and reported to Sentry (`update_permissions_identity_if_present`).
+/// Roster-driven like [`sync_voice_permissions`] (AFK S-3 D-4), with the
+/// same outcome table, but through its OWN single listing of the room
+/// ([`SyncConnections::ListRoom`]): taken after the member and role checks,
+/// filtered to this user by [`roster_connections`], and the grant pushed to
+/// every connection it names. A failed listing is an `Err` (ERROR + Sentry
+/// inside `list_participants_reported`).
+///
+/// A member who has gone (the member document is deleted, or the SFU lists
+/// no connection of theirs) is still an `Err` here, of the same type as
+/// before AFK Stage 6 F-A1 (`NotFound`, `InternalError`): this single-user
+/// entry point keeps its contract for its direct caller (`member_edit`). The
+/// room-wide [`sync_voice_permissions`] uses the classified form and skips
+/// such a member instead. A real SFU failure on the push is still logged at
+/// ERROR and reported to Sentry (`update_permissions_identity_if_present`,
+/// under `update_permissions_connections`).
 pub async fn sync_user_voice_permissions(
     db: &Database,
     voice_client: &VoiceClient,
@@ -7834,6 +8347,7 @@ pub async fn sync_user_voice_permissions(
         voice_client,
         node,
         user,
+        SyncConnections::ListRoom,
         channel,
         server,
         role_id,
@@ -7862,16 +8376,28 @@ pub async fn sync_user_voice_permissions(
 
 /// [`sync_user_voice_permissions`], with its outcome classified for the
 /// room-wide sync (see [`MemberSync`]).
+#[allow(clippy::too_many_arguments)]
 async fn sync_user_voice_permissions_classified(
     db: &Database,
     voice_client: &VoiceClient,
     node: &str,
     user: &User,
+    connections: SyncConnections<'_>,
     channel: &Channel,
     server: Option<&Server>,
     role_id: Option<&str>,
 ) -> MemberSync<revolt_result::Error> {
-    match push_user_voice_permissions(db, voice_client, node, user, channel, server, role_id).await
+    match push_user_voice_permissions(
+        db,
+        voice_client,
+        node,
+        user,
+        connections,
+        channel,
+        server,
+        role_id,
+    )
+    .await
     {
         Ok(outcome) => outcome,
         Err(error) => MemberSync::Failed(error),
@@ -7879,13 +8405,36 @@ async fn sync_user_voice_permissions_classified(
 }
 
 /// The body of [`sync_user_voice_permissions`]. Every `?` in it is a real
-/// failure; the two ways a member can be gone are returned as
+/// failure; the ways a member can be gone are returned as
 /// `Ok(MemberSync::Gone(..))`, each at the step that finds it out.
+///
+/// The outcome table (AFK S-3 D-4), once the member and role checks pass:
+///
+/// | voice state | connections listed | outcome |
+/// |---|---|---|
+/// | no | none | `Synced`: nothing to push |
+/// | no | some | the grant is pushed to them, NO state is written, no roster event, WARN (heals F-2) |
+/// | yes | none | `Gone`: nothing is left to push to |
+/// | yes | some | the roster flags are written, then the grant is pushed to them |
+///
+/// A push every connection answers not_found (all left since the listing)
+/// is `Gone`; any other push failure is `Failed`. The push is ONE call over
+/// all of the user's connections; the remote-control teardown hook then runs
+/// ONCE for the user, after it and outside any per-connection loop.
+///
+/// ORDER (S-3 B1-R): the roster flags of a user WITH voice state are
+/// written before ANY SFU contact, the single-user listing included, so a
+/// failed listing or push still leaves the moderator's change in Redis. The
+/// table decides only what happens after that write. With the room's
+/// listing failed ([`SyncConnections::Unlisted`]) the write is all there is.
+/// The `UserVoiceStateUpdate` goes out only after a landed push.
+#[allow(clippy::too_many_arguments)]
 async fn push_user_voice_permissions(
     db: &Database,
     voice_client: &VoiceClient,
     node: &str,
     user: &User,
+    connections: SyncConnections<'_>,
     channel: &Channel,
     server: Option<&Server>,
     role_id: Option<&str>,
@@ -7914,9 +8463,18 @@ async fn push_user_voice_permissions(
     }) {
         let user_voice_channel = UserVoiceChannel::from_channel(channel);
 
-        let Some(voice_state) = get_voice_state(&user_voice_channel, &user.id).await? else {
+        let voice_state = get_voice_state(&user_voice_channel, &user.id).await?;
+
+        // No state, and nothing listed or no listing to take: nothing to
+        // write and nothing to push, so no permission read either.
+        if voice_state.is_none()
+            && matches!(
+                connections,
+                SyncConnections::Listed([]) | SyncConnections::Unlisted
+            )
+        {
             return Ok(MemberSync::Synced);
-        };
+        }
 
         let mut query = DatabasePermissionQuery::new(db, user)
             .channel(channel)
@@ -7950,21 +8508,78 @@ async fn push_user_voice_permissions(
         // the whole rationale (including why `recording` is not synced here).
         // Nothing may be re-typed at this call site: a copy here is exactly
         // what let the permission-bit derivation ship green once already.
+        //
+        // The roster flags are written BEFORE any SFU contact (S-3 B1-R).
+        // Redis is the server-side truth every client renders, so a
+        // moderator's server-mute, role change or timeout lands there even
+        // when the listing or the push below then fails, as it did before
+        // the sync became roster-driven. The event announcing the write is
+        // still sent only after a landed push (below), as it always was: a
+        // failed listing or push leaves the write in place and sends nothing.
         let before = roster_baseline(&user.id);
-        let update_event = roster_flags(&user.id, &allowed_sources, &voice_state);
+        let update_event = match &voice_state {
+            Some(voice_state) => {
+                let update_event = roster_flags(&user.id, &allowed_sources, voice_state);
+                update_voice_state(&user_voice_channel, &user.id, &update_event).await?;
+                Some(update_event)
+            }
+            None => None,
+        };
 
-        update_voice_state(&user_voice_channel, &user.id, &update_event).await?;
+        // The single-user entry point's own listing, the room-wide sync's
+        // share of its one listing otherwise, both AFTER the write.
+        let own_listing;
+        let connections: &[String] = match connections {
+            SyncConnections::Listed(connections) => connections,
+            SyncConnections::ListRoom => {
+                let listed = voice_client
+                    .list_participants_reported(node, channel_id)
+                    .await?
+                    .unwrap_or_default();
+                own_listing =
+                    roster_connections(listed.into_iter().map(|participant| participant.identity))
+                        .remove(&user.id)
+                        .unwrap_or_default();
+                &own_listing
+            }
+            // The room's listing failed: the flags are written, nothing is
+            // pushed, and `sync_voice_permissions` answers the listing's
+            // error for the room, once.
+            SyncConnections::Unlisted => return Ok(MemberSync::Synced),
+        };
 
-        // The SFU reporting no such participant means the connection is
-        // already gone: no grant is left to correct, so the member is skipped
-        // rather than failing the sync (F-A1). It stops here, as the old `?`
-        // on this push stopped it, before the remote-control release and the
+        if connections.is_empty() {
+            return Ok(match voice_state {
+                None => MemberSync::Synced,
+                // Voice state, but the SFU lists no connection of theirs:
+                // there is no grant left to correct (F-A1).
+                Some(_) => MemberSync::Gone(create_error!(InternalError)),
+            });
+        }
+
+        // S-3 F-2: live at the SFU with no voice state here. The grant still
+        // has to reach those connections (they would otherwise keep whatever
+        // they were minted), but there is no state to correct and nothing a
+        // roster renders, so nothing was written and nothing is sent.
+        if update_event.is_none() {
+            log::warn!(
+                "permission sync of {} in {channel_id}: the SFU lists {connections:?} but \
+                 there is no voice state; pushing the grant to them, writing no state",
+                user.id
+            );
+        }
+
+        // Every listed connection, each by its exact identity (a listed
+        // screen leg gets the leg-restricted set). All of them answering
+        // not_found means they have left since the listing: no grant is left
+        // to correct, so the member is skipped rather than failing the sync
+        // (F-A1). It stops here, before the remote-control release and the
         // fan-out.
         let pushed = voice_client
-            .update_permissions_if_present(
+            .update_permissions_connections(
                 node,
-                user,
                 channel_id,
+                connections,
                 voice_participant_permissions(can_listen, &allowed_sources),
             )
             .await?;
@@ -7982,6 +8597,10 @@ async fn push_user_voice_permissions(
         // and tell the channel. Server-asserted state may only ever REVOKE
         // a session, never sustain one, so tearing down on every
         // permission-affecting sync is the safe direction by design.
+        //
+        // ONCE per user, after the one push over all of their connections
+        // (S-3 D-4), and for a stateless live connection too: its push turned
+        // data publishing off just the same.
         remote_control::release_remote_control_for_user(
             db,
             voice_client,
@@ -7992,15 +8611,17 @@ async fn push_user_voice_permissions(
         )
         .await;
 
-        if update_event != before {
-            EventV1::UserVoiceStateUpdate {
-                id: user.id.clone(),
-                channel_id: channel_id.to_string(),
-                data: update_event,
-            }
-            .p(channel_id.to_string())
-            .await;
-        };
+        if let Some(update_event) = update_event {
+            if update_event != before {
+                EventV1::UserVoiceStateUpdate {
+                    id: user.id.clone(),
+                    channel_id: channel_id.to_string(),
+                    data: update_event,
+                }
+                .p(channel_id.to_string())
+                .await;
+            };
+        }
     };
 
     Ok(MemberSync::Synced)
@@ -8054,49 +8675,301 @@ pub async fn get_call_notification_recipients(
         .to_internal_error()
 }
 
+/// Remove `user_id` from every voice channel `vc:{user}` names (bots, when
+/// deleted). EVERY channel is tried, with no early exit (AFK S-3 D-2): one
+/// channel's failure is logged and recorded, the rest are still removed, and
+/// the FIRST failure is returned once all were tried
+/// ([`member_sync_result`]). Only a failed read of the channel set itself
+/// returns before any removal.
 pub async fn remove_user_from_voice_channels(
     db: &Database,
     voice_client: &VoiceClient,
     user_id: &str,
 ) -> Result<()> {
-    for channel in get_user_voice_channels(user_id).await? {
-        remove_user_from_voice_channel(db, voice_client, &channel, user_id).await?;
+    let channels = get_user_voice_channels(user_id).await?;
+
+    let mut outcomes = Vec::with_capacity(channels.len());
+    for channel in channels {
+        let removed = remove_user_from_voice_channel(db, voice_client, &channel, user_id).await;
+        outcomes.push(removal_outcome(&channel.id, user_id, removed));
     }
 
-    Ok(())
+    member_sync_result(outcomes)
 }
 
+/// Remove `user_id` from `server`'s calls (kick, ban, leaving the server;
+/// AFK S-3 D-2). NOT through the single `{user}:{server}` pointer, which
+/// names one channel at most: every id in `server.channels` that has a
+/// LiveKit node pinned (a call is running there) goes through
+/// [`remove_user_from_voice_channel`]. That reaches a user in a call they
+/// hold no voice state in (a bot, a join that lost the webhook race, a
+/// missed webhook) and a user who is not, or no longer, a member (the SFU
+/// is asked, not the member list). The channel with no call is skipped.
+///
+/// The channel the pointer names is ALSO torn down, even with no node pinned
+/// (a ghost left after its call ended), through the same function (its
+/// no-node branch), never a whole-user `delete_voice_state`. The pointer is
+/// read FIRST, because the walk's own teardowns delete it. A channel is
+/// never processed twice.
+///
+/// No early exit: every channel is tried, a failure is logged and recorded,
+/// and the FIRST failure is returned after all ([`member_sync_result`]).
+pub async fn remove_user_from_server_voice(
+    db: &Database,
+    voice_client: &VoiceClient,
+    server: &Server,
+    user_id: &str,
+) -> Result<()> {
+    let mut outcomes = Vec::with_capacity(server.channels.len() + 2);
+
+    let pointed = match get_user_voice_channel_in_server(user_id, &server.id).await {
+        Ok(pointed) => pointed,
+        Err(error) => {
+            outcomes.push(removal_outcome(&server.id, user_id, Err(error)));
+            None
+        }
+    };
+
+    let mut removed_from = Vec::with_capacity(server.channels.len());
+    for channel_id in &server.channels {
+        match get_channel_node(channel_id).await {
+            Ok(Some(_)) => {}
+            Ok(None) => continue,
+            Err(error) => {
+                outcomes.push(removal_outcome(channel_id, user_id, Err(error)));
+                continue;
+            }
+        }
+
+        let channel = UserVoiceChannel {
+            id: channel_id.clone(),
+            server_id: Some(server.id.clone()),
+        };
+        let removed = remove_user_from_voice_channel(db, voice_client, &channel, user_id).await;
+        outcomes.push(removal_outcome(channel_id, user_id, removed));
+        removed_from.push(channel_id.as_str());
+    }
+
+    if let Some(channel_id) = pointed.filter(|id| !removed_from.contains(&id.as_str())) {
+        let channel = UserVoiceChannel {
+            id: channel_id,
+            server_id: Some(server.id.clone()),
+        };
+        let removed = remove_user_from_voice_channel(db, voice_client, &channel, user_id).await;
+        outcomes.push(removal_outcome(&channel.id, user_id, removed));
+    }
+
+    member_sync_result(outcomes)
+}
+
+/// One channel's removal, recorded for [`member_sync_result`] by the
+/// removal walks, which never exit early. A failure is logged here; it has
+/// already been reported where it happened.
+fn removal_outcome(
+    channel_id: &str,
+    user_id: &str,
+    removed: Result<()>,
+) -> MemberSync<revolt_result::Error> {
+    match removed {
+        Ok(()) => MemberSync::Synced,
+        Err(error) => {
+            log::warn!(
+                "voice removal of {user_id}: failed in {channel_id}, the remaining channels are \
+                 still tried: {error:?}"
+            );
+            MemberSync::Failed(error)
+        }
+    }
+}
+
+/// Whether Redis holds ANY voice state of `user_id` tied to `channel`
+/// besides the connection record: membership of `vc_members:{channel}`,
+/// `channel` in `vc:{user}`, or the per-server pointer naming `channel`.
+/// One pipelined read. [`remove_user_from_voice_channel`] runs nothing for a
+/// user with none of these, no record and no listed connection.
+async fn holds_voice_state_in(channel: &UserVoiceChannel, user_id: &str) -> Result<bool> {
+    let parent = channel.server_id.as_ref().unwrap_or(&channel.id);
+
+    let (member, listed, pointer): (bool, bool, Option<String>) = Pipeline::new()
+        .sismember(format!("vc_members:{}", &channel.id), user_id)
+        .sismember(format!("vc:{user_id}"), channel)
+        .get(format!("{user_id}:{parent}"))
+        .query_async(&mut get_connection().await?.into_inner())
+        .await
+        .to_internal_error()?;
+
+    Ok(member || listed || pointer.as_deref() == Some(channel.id.as_str()))
+}
+
+/// The connection records a removal may delete: every sid the eviction
+/// returned (the user's primaries in its ONE listing), then every sid
+/// `recorded` BEFORE that listing that the SFU did not list (stale), each
+/// once. `evicted` is `None` when there was no listing to evict from (no
+/// node pinned, or the SFU has no such room): the recorded sids alone.
+/// Pure.
+fn removal_teardown_sids(evicted: Option<Vec<String>>, recorded: Vec<String>) -> Vec<String> {
+    let mut sids = evicted.unwrap_or_default();
+    for sid in recorded {
+        if !sids.contains(&sid) {
+            sids.push(sid);
+        }
+    }
+    sids
+}
+
+/// Report a failed eviction from a call where Redis holds nothing of
+/// `user_id` (AFK S-3 WB-2), which [`remove_user_from_voice_channel`] then
+/// answers with `Ok(())`: one ERROR log and one Sentry event per failure,
+/// plus one WARN naming the user and the skipped channel.
+///
+/// Every `InternalError` that `remove_user_if_present_sids` returns has
+/// already gone through `to_internal_error()` where it happened (the
+/// listing in `list_participants_reported`, the removals with the SFU's own
+/// error), so it is not reported a second time here. Any other error (the
+/// `UnknownNode` of a pin naming a node missing from the config) was
+/// reported nowhere, and goes through `to_internal_error()` here.
+fn report_unheld_eviction_failure(channel_id: &str, user_id: &str, error: revolt_result::Error) {
+    log::warn!(
+        "voice removal of {user_id}: the eviction from {channel_id} failed and Redis holds \
+         nothing of the user there, so the channel is skipped: {error:?}"
+    );
+    if !matches!(error.error_type, revolt_result::ErrorType::InternalError) {
+        let _ = Err::<(), _>(error).to_internal_error();
+    }
+}
+
+/// Remove `user_id` from `channel`: every connection of theirs the SFU
+/// lists is evicted, then EXACTLY the connection records this removal knows
+/// about are deleted, in the set mode of the teardown script (AFK S-3 D-2,
+/// amended by WA-R / RA2-1).
+///
+/// ORDERING RULE: [`recorded_voice_connections`] is read BEFORE any SFU
+/// listing, never after. Read after, a sibling that records between the
+/// listing and the read looks stale (recorded but not listed) and is deleted
+/// while live: S-3 WA-1 again. Read before, such a sibling is in neither
+/// set, so [`delete_voice_connections`]'s survivor scan keeps its state: a
+/// connection recorded after that read is a legitimate new join and survives
+/// with its state (kick and ban remove the membership first, so the join's
+/// Connect re-check refuses such joins).
+///
+/// This path decides from a listing, so it NEVER runs the whole-user
+/// [`delete_voice_state`]; that would erase the late sibling's state.
+///
+/// 1. The recorded sids. A failed read returns `Err` before any eviction; it
+///    is never taken for an empty set.
+/// 2. Whether Redis holds any other voice state of the user here
+///    ([`holds_voice_state_in`]; a failed read returns `Err` before any
+///    eviction too).
+/// 3. With a node pinned, `remove_user_if_present_sids`: ONE listing, every
+///    listed connection evicted. No node pinned: no eviction (a ghost of a
+///    call that has ended), the recorded sids alone. An `Err` (a failed
+///    listing, a failed removal, or a pin naming a node missing from the
+///    config) never tears anything down, and what it answers depends on
+///    step 2:
+///    - Redis holds something of the user here: the `Err` returns at once,
+///      so a listed connection that may still be live stays visible and
+///      syncable, and the caller can retry.
+///    - Redis holds nothing of the user here (AFK S-3 WB-2): the failure is
+///      reported once ([`report_unheld_eviction_failure`]) and the channel
+///      answers `Ok(())`, with no release and no script. The server walk
+///      sends every member of a server through every call in it, and a
+///      leave evicts before it removes the membership, so one call on a
+///      down or unknown node would otherwise fail every kick, ban and leave
+///      in that server, for users who were never in that call.
+///
+///    ACCEPTED RESIDUAL: a live connection the SFU has and Redis does not (a
+///    join that lost the webhook race, a missed webhook) on a node that
+///    cannot be listed is not evicted. Nothing could evict it while the node
+///    cannot be listed anyway, and the failure is reported. The same `Ok`
+///    covers such a connection when the listing succeeded and its removal
+///    failed: `remove_user_if_present_sids` answers both with one `Err`, so
+///    they cannot be told apart here. That one is reported too.
+/// 4. `delete_voice_connections(returned ∪ (recorded − returned))`, or the
+///    recorded sids for a room the SFU no longer has. An EMPTY set is the
+///    script's pure survivor check: with nothing of the user recorded it is
+///    `Last` and the full teardown, which is what a user with state and no
+///    record (a legacy connection, or a ghost) needs.
+///
+/// SKIPPED ENTIRELY (P2-6 + RA2-1): a user with nothing recorded, no voice
+/// state here (step 2) and no connection listed gets no remote-control
+/// release and no script, so walking every call of a server costs one
+/// listing per call, not a script per call. The skip is decided in two
+/// halves so that the release still PRECEDES the eviction whenever Redis
+/// shows the user here: that is known before the listing, so the release
+/// runs before it. When only the SFU knows of the user (a connection with
+/// no state), that is known only from the listing, which is also the
+/// eviction; the release then runs right after it, before the teardown.
+/// Such a connection's capability went with it; the release still clears
+/// the grant records and, where the user was the sharer, revokes their
+/// controller.
 pub async fn remove_user_from_voice_channel(
     db: &Database,
     voice_client: &VoiceClient,
     channel: &UserVoiceChannel,
     user_id: &str,
 ) -> Result<()> {
+    let recorded: Vec<String> = recorded_voice_connections(channel, user_id)
+        .await?
+        .into_iter()
+        .map(|(sid, _)| sid)
+        .collect();
+    let holds_state = !recorded.is_empty() || holds_voice_state_in(channel, user_id).await?;
+
     // Remote-control release hook (plan §1): these admin paths remove the
     // participant INSIDE delta and would race a webhook-only hook, so any
     // grant involving this user is ended here, before the removal.
     //
-    // `false`: the removal below is best-effort (its error is discarded,
-    // it is skipped entirely when the channel has no node, and the
-    // identity it resolves can silently no-op for a device-qualified
-    // participant). Assuming it works and merely deleting the records
-    // would be how a `can_publish_data` capability outlives everything
-    // able to revoke it — so the capability is actively revoked first.
-    remote_control::release_remote_control_for_user(
-        db,
-        voice_client,
-        channel,
-        user_id,
-        "participant_left",
-        false,
-    )
-    .await;
-
-    if let Some(node) = get_channel_node(&channel.id).await? {
-        let _ = voice_client.remove_user(&node, user_id, &channel.id).await;
+    // `false`: the eviction below can fail (and then nothing is torn down),
+    // so assuming it works and merely deleting the records would be how a
+    // `can_publish_data` capability outlives everything able to revoke it:
+    // the capability is actively revoked first.
+    if holds_state {
+        remote_control::release_remote_control_for_user(
+            db,
+            voice_client,
+            channel,
+            user_id,
+            "participant_left",
+            false,
+        )
+        .await;
     }
 
-    delete_voice_state(channel, user_id).await?;
+    let evicted = match get_channel_node(&channel.id).await? {
+        Some(node) => match voice_client
+            .remove_user_if_present_sids(&node, user_id, &channel.id)
+            .await
+        {
+            Ok(evicted) => evicted,
+            // A listed connection may still be live: nothing is torn down.
+            Err(error) if holds_state => return Err(error),
+            // WB-2: Redis holds nothing of the user here to tear down.
+            Err(error) => {
+                report_unheld_eviction_failure(&channel.id, user_id, error);
+                return Ok(());
+            }
+        },
+        None => None,
+    };
+
+    if !holds_state {
+        if evicted.as_ref().is_none_or(Vec::is_empty) {
+            // Nothing of the user here at all: no release, no script.
+            return Ok(());
+        }
+        // Known only from the listing: a live connection with no state.
+        remote_control::release_remote_control_for_user(
+            db,
+            voice_client,
+            channel,
+            user_id,
+            "participant_left",
+            false,
+        )
+        .await;
+    }
+
+    delete_voice_connections(channel, user_id, &removal_teardown_sids(evicted, recorded)).await?;
 
     Ok(())
 }
@@ -10369,5 +11242,1114 @@ mod tests {
 
         assert!(!allowed(&db, "01KX7J0000NOSUCHCHANNEL0000", &member.id).await);
         assert!(!allowed(&db, voice.id(), "01KX7J0000NOSUCHUSER000000").await);
+    }
+
+    // ---- S-3 lane B1: the roster-driven sync, the server-wide sync, and
+    // the removal that deletes only what it knows ----
+    //
+    // The REAL functions against Redis on the shared runtime, the mock SFU
+    // (`voice_client::sfu_stub`, whose ordered `(path, identity)` log is the
+    // observable) and the Reference database. ULID-suffixed ids throughout.
+
+    use super::voice_client::sfu_stub as stub;
+    use crate::{Channel, Database, Server, User};
+
+    fn sfu_requests(list: &[(&str, &str)]) -> Vec<(String, String)> {
+        list.iter()
+            .map(|(path, identity)| (path.to_string(), identity.to_string()))
+            .collect()
+    }
+
+    /// A stub listing `(sid, identity)` pairs, answering every
+    /// `UpdateParticipant` with a 200 (and keeping the permission it
+    /// carried) and anything else with a 500.
+    fn roster_stub(
+        roster: &[(&str, &str)],
+    ) -> (
+        stub::Stub,
+        std::sync::Arc<std::sync::Mutex<Vec<livekit_protocol::ParticipantPermission>>>,
+    ) {
+        let triples: Vec<(&str, &str, &str)> = roster
+            .iter()
+            .map(|(sid, identity)| (*sid, *identity, ""))
+            .collect();
+        let listing = stub::list_participants_response_sids(&triples);
+        let pushed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sfu = {
+            let pushed = pushed.clone();
+            stub::Stub::serve(move |path, body| match path {
+                stub::LIST => stub::ok(listing.clone()),
+                stub::UPDATE => {
+                    pushed
+                        .lock()
+                        .unwrap()
+                        .push(stub::permission(body).expect("an update carries a permission"));
+                    stub::ok(Vec::new())
+                }
+                _ => stub::internal(),
+            })
+        };
+        (sfu, pushed)
+    }
+
+    /// A stub listing `(sid, identity)` pairs and answering every
+    /// `RemoveParticipant` with `remove`.
+    fn eviction_stub(roster: &[(&str, &str)], remove: stub::Reply) -> stub::Stub {
+        let triples: Vec<(&str, &str, &str)> = roster
+            .iter()
+            .map(|(sid, identity)| (*sid, *identity, ""))
+            .collect();
+        stub::Stub::serve(stub::routes(vec![
+            (
+                stub::LIST,
+                stub::ok(stub::list_participants_response_sids(&triples)),
+            ),
+            (stub::REMOVE, remove),
+        ]))
+    }
+
+    /// A server with a voice channel and one member who is not its owner, in
+    /// a fresh Reference database.
+    async fn sync_fixture(tag: &str) -> (Database, Server, Channel, User) {
+        use crate::Member;
+        use revolt_models::v0::{
+            DataCreateServer, DataCreateServerChannel, LegacyServerChannelType,
+        };
+
+        let db = Database::Reference(Default::default());
+        let owner = User::create(&db, format!("B1Owner{tag}"), None, None)
+            .await
+            .expect("`User`");
+        let mut server = Server::create(
+            &db,
+            DataCreateServer {
+                name: format!("B1Server{tag}"),
+                description: None,
+                nsfw: None,
+            },
+            &owner,
+            false,
+        )
+        .await
+        .expect("`Server`")
+        .0;
+        let channel = Channel::create_server_channel(
+            &db,
+            &mut server,
+            DataCreateServerChannel {
+                channel_type: LegacyServerChannelType::Voice,
+                name: "Lounge".to_string(),
+                ..Default::default()
+            },
+            true,
+        )
+        .await
+        .expect("`Channel`");
+        let member = User::create(&db, format!("B1Member{tag}"), None, None)
+            .await
+            .expect("`User`");
+        Member::create(&db, &server, &member, None)
+            .await
+            .expect("`Member`");
+
+        (db, server, channel, member)
+    }
+
+    /// D-4: the mapping names `U:D1`, the SFU lists `[U, U:D1]`. The room
+    /// sync pushes BOTH, in listed order, after ONE listing, and both get
+    /// the same primary set. The pre-B1 sync resolved the mapping and
+    /// reached `U:D1` alone. Mutation b6 (the push handed only the first
+    /// connection) leaves `U:D1` unpushed.
+    #[test]
+    fn the_room_sync_pushes_every_listed_connection() {
+        rt().block_on(the_room_sync_pushes_every_listed_connection_case())
+    }
+
+    async fn the_room_sync_pushes_every_listed_connection_case() {
+        let (db, server, channel, member) = sync_fixture("R1").await;
+        let uvc = UserVoiceChannel::from_channel(&channel);
+        let device = format!("{}:D1", member.id);
+
+        set_channel_node(channel.id(), stub::NODE).await.unwrap();
+        assert!(
+            record_voice_connection(&uvc, &member.id, "SID_U", &member.id)
+                .await
+                .unwrap()
+        );
+        create_voice_state(&uvc, &member.id, Timestamp::now_utc())
+            .await
+            .unwrap();
+        assert!(
+            !record_voice_connection(&uvc, &member.id, "SID_D1", &device)
+                .await
+                .unwrap()
+        );
+        set_voice_participant_identity(channel.id(), &member.id, &device)
+            .await
+            .unwrap();
+
+        let (sfu, pushed) = roster_stub(&[("SID_U", &member.id), ("SID_D1", &device)]);
+        let result = sync_voice_permissions(
+            &db,
+            &stub::voice_client(sfu.url()),
+            &channel,
+            Some(&server),
+            None,
+        )
+        .await;
+        let seen = sfu.finish();
+
+        delete_voice_state(&uvc, &member.id).await.expect("cleanup");
+        delete_channel_node(channel.id()).await.expect("cleanup");
+
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(
+            seen,
+            sfu_requests(&[
+                (stub::LIST, ""),
+                (stub::UPDATE, &member.id),
+                (stub::UPDATE, &device),
+            ]),
+            "one listing, then every listed connection of the user"
+        );
+        let pushed = pushed.lock().unwrap();
+        assert_eq!(pushed.len(), 2);
+        assert_eq!(pushed[0], pushed[1], "both primaries get the same set");
+        assert!(
+            pushed[0].can_subscribe && !pushed[0].can_publish_data,
+            "{:?}",
+            pushed[0]
+        );
+    }
+
+    /// D-4 / F-2: a member the SFU lists who has NO voice state here and is
+    /// not in `vc_members` is pushed the grant, and nothing is written: no
+    /// state, no membership, no per-server key. Mutation b7 (that arm
+    /// answering `Synced` without the push) leaves them with whatever grant
+    /// they were minted.
+    #[test]
+    fn a_listed_user_with_no_voice_state_is_pushed_and_nothing_is_written() {
+        rt().block_on(a_listed_user_with_no_voice_state_is_pushed_and_nothing_is_written_case())
+    }
+
+    async fn a_listed_user_with_no_voice_state_is_pushed_and_nothing_is_written_case() {
+        let (db, server, channel, member) = sync_fixture("R2").await;
+        let uvc = UserVoiceChannel::from_channel(&channel);
+        let mut conn = get_connection().await.expect("redis");
+
+        set_channel_node(channel.id(), stub::NODE).await.unwrap();
+
+        let (sfu, pushed) = roster_stub(&[("SID_V", &member.id)]);
+        let result = sync_voice_permissions(
+            &db,
+            &stub::voice_client(sfu.url()),
+            &channel,
+            Some(&server),
+            None,
+        )
+        .await;
+        let seen = sfu.finish();
+        delete_channel_node(channel.id()).await.expect("cleanup");
+
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(
+            seen,
+            sfu_requests(&[(stub::LIST, ""), (stub::UPDATE, &member.id)]),
+            "the stateless live connection is pushed"
+        );
+        assert_eq!(pushed.lock().unwrap().len(), 1);
+        assert!(get_voice_state(&uvc, &member.id).await.unwrap().is_none());
+        assert!(!is_voice_member(&mut conn, &uvc, &member.id).await);
+        assert!(!get_user_voice_channels(&member.id)
+            .await
+            .unwrap()
+            .contains(&uvc));
+        let written: Vec<Option<String>> = conn
+            .mget(per_server_keys(&member.id, &server.id))
+            .await
+            .unwrap();
+        assert!(written.iter().all(Option::is_none), "{written:?}");
+    }
+
+    /// The single-user entry point lists the room ITSELF, once: `[U, U:D1]`
+    /// are both pushed. With voice state and nothing of theirs listed it
+    /// answers the `InternalError` it always answered for a participant the
+    /// SFU does not have, after the one listing and no push.
+    #[test]
+    fn the_single_user_sync_lists_the_room_itself() {
+        rt().block_on(the_single_user_sync_lists_the_room_itself_case())
+    }
+
+    async fn the_single_user_sync_lists_the_room_itself_case() {
+        let (db, server, channel, member) = sync_fixture("R3").await;
+        let uvc = UserVoiceChannel::from_channel(&channel);
+        let device = format!("{}:D1", member.id);
+
+        create_voice_state(&uvc, &member.id, Timestamp::now_utc())
+            .await
+            .unwrap();
+
+        let (sfu, _) = roster_stub(&[("SID_U", &member.id), ("SID_D1", &device)]);
+        let both = sync_user_voice_permissions(
+            &db,
+            &stub::voice_client(sfu.url()),
+            stub::NODE,
+            &member,
+            &channel,
+            Some(&server),
+            None,
+        )
+        .await;
+        let both_seen = sfu.finish();
+
+        let (sfu, _) = roster_stub(&[("SID_X", "01KX7J0000SOMEONEELSE00000")]);
+        let none = sync_user_voice_permissions(
+            &db,
+            &stub::voice_client(sfu.url()),
+            stub::NODE,
+            &member,
+            &channel,
+            Some(&server),
+            None,
+        )
+        .await;
+        let none_seen = sfu.finish();
+
+        delete_voice_state(&uvc, &member.id).await.expect("cleanup");
+
+        assert!(both.is_ok(), "{both:?}");
+        assert_eq!(
+            both_seen,
+            sfu_requests(&[
+                (stub::LIST, ""),
+                (stub::UPDATE, &member.id),
+                (stub::UPDATE, &device),
+            ])
+        );
+        assert!(
+            matches!(&none, Err(error) if matches!(error.error_type, revolt_result::ErrorType::InternalError)),
+            "{none:?}"
+        );
+        assert_eq!(none_seen, sfu_requests(&[(stub::LIST, "")]));
+    }
+
+    /// S-3 B1-R: the roster flags land in Redis BEFORE any SFU contact, so a
+    /// ListParticipants that answers 500 still leaves the change written.
+    /// The channel is the server's AFK channel (so a publishing member's
+    /// `is_publishing` must become false) and the member holds voice state.
+    /// Both entry points answer the listing's error, push nothing, and
+    /// still wrote the flag: the single-user one (the path `member_edit`
+    /// takes) and the room-wide one, which walks its members as `Unlisted`.
+    /// Mutations r1 (the single-user listing moved back above the write) and
+    /// r2 (the room returning on the failed listing before its members)
+    /// each leave `is_publishing` true.
+    #[test]
+    fn a_failed_listing_still_writes_the_roster_flags() {
+        rt().block_on(a_failed_listing_still_writes_the_roster_flags_case())
+    }
+
+    async fn a_failed_listing_still_writes_the_roster_flags_case() {
+        let (db, mut server, channel, member) = sync_fixture("L1").await;
+        server.afk_channel_id = Some(channel.id().to_string());
+        let uvc = UserVoiceChannel::from_channel(&channel);
+        let publishing = PartialUserVoiceState {
+            is_publishing: Some(true),
+            ..Default::default()
+        };
+
+        create_voice_state(&uvc, &member.id, Timestamp::now_utc())
+            .await
+            .unwrap();
+        set_channel_node(channel.id(), stub::NODE).await.unwrap();
+
+        update_voice_state(&uvc, &member.id, &publishing)
+            .await
+            .unwrap();
+        let sfu = stub::Stub::serve(stub::routes(vec![(stub::LIST, stub::internal())]));
+        let single = sync_user_voice_permissions(
+            &db,
+            &stub::voice_client(sfu.url()),
+            stub::NODE,
+            &member,
+            &channel,
+            Some(&server),
+            None,
+        )
+        .await;
+        let single_seen = sfu.finish();
+        let single_state = get_voice_state(&uvc, &member.id).await.unwrap();
+
+        update_voice_state(&uvc, &member.id, &publishing)
+            .await
+            .unwrap();
+        let sfu = stub::Stub::serve(stub::routes(vec![(stub::LIST, stub::internal())]));
+        let room = sync_voice_permissions(
+            &db,
+            &stub::voice_client(sfu.url()),
+            &channel,
+            Some(&server),
+            None,
+        )
+        .await;
+        let room_seen = sfu.finish();
+        let room_state = get_voice_state(&uvc, &member.id).await.unwrap();
+
+        delete_voice_state(&uvc, &member.id).await.expect("cleanup");
+        delete_channel_node(channel.id()).await.expect("cleanup");
+
+        assert!(
+            matches!(&single, Err(error) if matches!(error.error_type, revolt_result::ErrorType::InternalError)),
+            "single-user: the listing's error is the answer: {single:?}"
+        );
+        assert_eq!(single_seen, sfu_requests(&[(stub::LIST, "")]), "no push");
+        assert!(
+            !single_state.expect("state kept").is_publishing,
+            "single-user: the flag is written before the listing"
+        );
+        assert!(
+            matches!(&room, Err(error) if matches!(error.error_type, revolt_result::ErrorType::InternalError)),
+            "room: the listing's error is the answer: {room:?}"
+        );
+        assert_eq!(room_seen, sfu_requests(&[(stub::LIST, "")]), "no push");
+        assert!(
+            !room_state.expect("state kept").is_publishing,
+            "room: a member with state still gets the flag written"
+        );
+    }
+
+    /// D-6, the walk with a fake per-channel sync: ch1 fails, ch2 is gone,
+    /// ch3 fails, ch4 syncs. All four are tried, in order, and the FIRST
+    /// failure (ch1's) is the answer. Mutation b8 (an exit in the shared
+    /// loop on the first failure) stops at ch1.
+    #[test]
+    fn the_server_sync_tries_every_channel_and_returns_the_first_failure() {
+        rt().block_on(the_server_sync_tries_every_channel_and_returns_the_first_failure_case())
+    }
+
+    async fn the_server_sync_tries_every_channel_and_returns_the_first_failure_case() {
+        let (_, mut server, _, _) = sync_fixture("S1").await;
+        server.channels = ["ch1", "ch2", "ch3", "ch4"].map(str::to_string).to_vec();
+
+        let tried = std::sync::Mutex::new(Vec::new());
+        let result = sync_server_channels(&server, |channel_id: String| {
+            tried.lock().unwrap().push(channel_id.clone());
+            async move {
+                match channel_id.as_str() {
+                    "ch1" => MemberSync::Failed(revolt_result::create_error!(InvalidOperation)),
+                    "ch2" => MemberSync::Gone(revolt_result::create_error!(NotFound)),
+                    "ch3" => MemberSync::Failed(revolt_result::create_error!(InternalError)),
+                    _ => MemberSync::Synced,
+                }
+            }
+        })
+        .await;
+
+        assert_eq!(
+            *tried.lock().unwrap(),
+            ["ch1", "ch2", "ch3", "ch4"],
+            "every channel is tried, in order, whatever the one before it did"
+        );
+        match result {
+            Err(error) => assert!(
+                matches!(error.error_type, revolt_result::ErrorType::InvalidOperation),
+                "the FIRST failure is the answer: {error:?}"
+            ),
+            Ok(()) => panic!("two channels failed"),
+        }
+    }
+
+    /// D-6 wiring, end to end: a channel whose node is pinned but whose
+    /// document is gone is skipped (not a failure), a channel with no call
+    /// is skipped, and a live call is listed. Then a call whose listing
+    /// fails fails the sync, and the call after it is STILL listed.
+    #[test]
+    fn the_server_sync_skips_the_gone_and_the_idle_and_tries_every_call() {
+        rt().block_on(the_server_sync_skips_the_gone_and_the_idle_and_tries_every_call_case())
+    }
+
+    async fn the_server_sync_skips_the_gone_and_the_idle_and_tries_every_call_case() {
+        use revolt_models::v0::{DataCreateServerChannel, LegacyServerChannelType};
+
+        let (db, mut server, failing_call, _) = sync_fixture("S2").await;
+        let live_call = Channel::create_server_channel(
+            &db,
+            &mut server,
+            DataCreateServerChannel {
+                channel_type: LegacyServerChannelType::Voice,
+                name: "Second".to_string(),
+                ..Default::default()
+            },
+            true,
+        )
+        .await
+        .expect("`Channel`");
+        let suffix = ulid::Ulid::new().to_string();
+        let (gone, idle) = (format!("gone{suffix}"), format!("idle{suffix}"));
+
+        let failing = stub::Stub::serve(stub::routes(vec![(stub::LIST, stub::internal())]));
+        let healthy = stub::Stub::serve(stub::routes(vec![(
+            stub::LIST,
+            stub::ok(stub::list_participants_response_sids(&[])),
+        )]));
+        let voice_client = stub::voice_client_nodes(
+            &[("nodeF", failing.url()), ("nodeH", healthy.url())],
+            SFU_CALL_TIMEOUT,
+            SFU_BREAKER_WINDOW,
+        );
+        set_channel_node(failing_call.id(), "nodeF").await.unwrap();
+        set_channel_node(&gone, "nodeH").await.unwrap();
+        set_channel_node(live_call.id(), "nodeH").await.unwrap();
+
+        server.channels = vec![gone.clone(), idle.clone(), live_call.id().to_string()];
+        let skipped = sync_server_voice_permissions(&db, &voice_client, &server, None).await;
+        let skipped_seen = healthy.seen();
+
+        server.channels = vec![failing_call.id().to_string(), live_call.id().to_string()];
+        let failed = sync_server_voice_permissions(&db, &voice_client, &server, None).await;
+
+        for channel_id in [failing_call.id(), gone.as_str(), live_call.id()] {
+            delete_channel_node(channel_id).await.expect("cleanup");
+        }
+
+        assert!(
+            skipped.is_ok(),
+            "the gone and the idle channel are skipped: {skipped:?}"
+        );
+        assert_eq!(
+            skipped_seen,
+            sfu_requests(&[(stub::LIST, "")]),
+            "only the live call"
+        );
+        assert!(failed.is_err(), "{failed:?}");
+        assert_eq!(failing.finish(), sfu_requests(&[(stub::LIST, "")]));
+        assert_eq!(
+            healthy.finish(),
+            sfu_requests(&[(stub::LIST, ""), (stub::LIST, "")]),
+            "the call after the failing one is still synced"
+        );
+    }
+
+    /// D-2: `remove_user_from_server_voice` over two calls, the first
+    /// eviction failing. The second call is STILL tried and torn down; the
+    /// first keeps its state and record (no teardown on a failed eviction);
+    /// the answer is the failure. Mutation b4 (`?` on the per-channel
+    /// removal) never reaches the second call.
+    #[test]
+    fn the_server_removal_tries_every_call_after_a_failure() {
+        rt().block_on(the_server_removal_tries_every_call_after_a_failure_case())
+    }
+
+    async fn the_server_removal_tries_every_call_after_a_failure_case() {
+        let (db, mut server, _, _) = sync_fixture("X1").await;
+        let suffix = ulid::Ulid::new().to_string();
+        let user = format!("userX1{suffix}");
+        let first_call = UserVoiceChannel {
+            id: format!("chanX1a{suffix}"),
+            server_id: Some(server.id.clone()),
+        };
+        let second_call = UserVoiceChannel {
+            id: format!("chanX1b{suffix}"),
+            server_id: Some(server.id.clone()),
+        };
+        server.channels = vec![first_call.id.clone(), second_call.id.clone()];
+        let mut conn = get_connection().await.expect("redis");
+
+        for (channel, sid) in [(&first_call, "SID1"), (&second_call, "SID2")] {
+            assert!(record_voice_connection(channel, &user, sid, &user)
+                .await
+                .unwrap());
+            create_voice_state(channel, &user, Timestamp::now_utc())
+                .await
+                .unwrap();
+        }
+        set_channel_node(&first_call.id, "node1").await.unwrap();
+        set_channel_node(&second_call.id, "node2").await.unwrap();
+
+        let failing = eviction_stub(&[("SID1", &user)], stub::internal());
+        let healthy = eviction_stub(&[("SID2", &user)], stub::ok(Vec::new()));
+        let voice_client = stub::voice_client_nodes(
+            &[("node1", failing.url()), ("node2", healthy.url())],
+            SFU_CALL_TIMEOUT,
+            SFU_BREAKER_WINDOW,
+        );
+
+        let result = remove_user_from_server_voice(&db, &voice_client, &server, &user).await;
+        let (failing_seen, healthy_seen) = (failing.finish(), healthy.finish());
+
+        let first_member = is_voice_member(&mut conn, &first_call, &user).await;
+        let first_record = recorded_connections(&mut conn, &first_call).await;
+        let second_member = is_voice_member(&mut conn, &second_call, &user).await;
+        let second_record = recorded_connections(&mut conn, &second_call).await;
+
+        delete_voice_state(&first_call, &user)
+            .await
+            .expect("cleanup");
+        delete_voice_state(&second_call, &user)
+            .await
+            .expect("cleanup");
+        delete_channel_node(&first_call.id).await.expect("cleanup");
+        delete_channel_node(&second_call.id).await.expect("cleanup");
+
+        let evictions = sfu_requests(&[
+            (stub::LIST, ""),
+            (stub::REMOVE, &format!("{user}::screen")),
+            (stub::REMOVE, &user),
+        ]);
+        assert!(result.is_err(), "{result:?}");
+        assert_eq!(failing_seen, evictions);
+        assert_eq!(healthy_seen, evictions, "the second call is still tried");
+        assert!(!second_member, "the second call's state is torn down");
+        assert!(second_record.is_empty(), "{second_record:?}");
+        assert!(first_member, "no teardown after the failed eviction");
+        assert_eq!(
+            first_record,
+            [("SID1".to_string(), user.clone())].into_iter().collect()
+        );
+    }
+
+    /// D-2 / P2-6: the channel the per-server pointer names is torn down
+    /// even with no node pinned (a ghost whose call has ended), through the
+    /// removal's no-node branch, with no SFU call at all. Mutation b9 (the
+    /// pointer's channel dropped from the walk) leaves the ghost.
+    #[test]
+    fn the_server_removal_clears_the_pointer_ghost_without_a_node() {
+        rt().block_on(the_server_removal_clears_the_pointer_ghost_without_a_node_case())
+    }
+
+    async fn the_server_removal_clears_the_pointer_ghost_without_a_node_case() {
+        let (db, mut server, _, _) = sync_fixture("X2").await;
+        let suffix = ulid::Ulid::new().to_string();
+        let user = format!("userX2{suffix}");
+        let ghost = UserVoiceChannel {
+            id: format!("chanX2{suffix}"),
+            server_id: Some(server.id.clone()),
+        };
+        server.channels = vec![ghost.id.clone()];
+        let mut conn = get_connection().await.expect("redis");
+
+        create_voice_state(&ghost, &user, Timestamp::now_utc())
+            .await
+            .unwrap();
+
+        // No node anywhere: any SFU call would be an UnknownNode failure.
+        let result = remove_user_from_server_voice(
+            &db,
+            &VoiceClient::new(Default::default()),
+            &server,
+            &user,
+        )
+        .await;
+
+        let member = is_voice_member(&mut conn, &ghost, &user).await;
+        let left: Vec<Option<String>> =
+            conn.mget(per_server_keys(&user, &server.id)).await.unwrap();
+        delete_voice_state(&ghost, &user).await.expect("cleanup");
+
+        assert!(result.is_ok(), "{result:?}");
+        assert!(!member, "the ghost's membership is gone");
+        assert!(left.iter().all(Option::is_none), "{left:?}");
+        assert!(!get_user_voice_channels(&user)
+            .await
+            .unwrap()
+            .contains(&ghost));
+    }
+
+    /// WA-1 at the CALLER: connection A is recorded; the removal reads the
+    /// record; then sibling B records (answering "state exists", so it
+    /// creates none) and is NOT in the listing the SFU then returns. A is
+    /// evicted and its record deleted; B keeps the state, the membership,
+    /// its record and the mapping. Driven through the real
+    /// `remove_user_from_voice_channel`: the stub records B from inside its
+    /// listing handler, so B lands strictly after the removal's record read
+    /// and strictly before its teardown. Mutation b1 (the record read moved
+    /// below the listing) names B as stale and tears its state down.
+    #[test]
+    fn a_connection_recorded_after_the_removal_read_survives_it() {
+        rt().block_on(a_connection_recorded_after_the_removal_read_survives_it_case())
+    }
+
+    async fn a_connection_recorded_after_the_removal_read_survives_it_case() {
+        let (channel, user, server) = connection_case_ids("RW1");
+        let (a, b) = (format!("{user}:A"), format!("{user}:B"));
+        let db = Database::Reference(Default::default());
+        let mut conn = get_connection().await.expect("redis");
+
+        assert!(record_voice_connection(&channel, &user, "SID_A", &a)
+            .await
+            .unwrap());
+        create_voice_state(&channel, &user, Timestamp::now_utc())
+            .await
+            .unwrap();
+        set_voice_participant_identity(&channel.id, &user, &a)
+            .await
+            .unwrap();
+        set_channel_node(&channel.id, stub::NODE).await.unwrap();
+
+        let listing = stub::list_participants_response_sids(&[("SID_A", &a, "")]);
+        let late = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let sfu = {
+            let late = late.clone();
+            let (channel, user, b) = (channel.clone(), user.clone(), b.clone());
+            stub::Stub::serve(move |path, _| match path {
+                stub::LIST => {
+                    // B joins now: after the removal's record read, and
+                    // not in the listing answered below.
+                    let recorded =
+                        rt().block_on(record_voice_connection(&channel, &user, "SID_B", &b));
+                    *late.lock().unwrap() = Some(recorded.map_err(|error| format!("{error:?}")));
+                    stub::ok(listing.clone())
+                }
+                stub::REMOVE => stub::ok(Vec::new()),
+                _ => stub::internal(),
+            })
+        };
+
+        let result =
+            remove_user_from_voice_channel(&db, &stub::voice_client(sfu.url()), &channel, &user)
+                .await;
+        let seen = sfu.finish();
+
+        let state = get_voice_state(&channel, &user).await.unwrap();
+        let member = is_voice_member(&mut conn, &channel, &user).await;
+        let record = recorded_connections(&mut conn, &channel).await;
+        let mapping = stored_voice_participant_identity(&channel.id, &user)
+            .await
+            .unwrap();
+        let flags: Vec<Option<String>> = conn.mget(per_server_keys(&user, &server)).await.unwrap();
+
+        delete_voice_state(&channel, &user).await.expect("cleanup");
+        delete_channel_node(&channel.id).await.expect("cleanup");
+
+        assert_eq!(
+            *late.lock().unwrap(),
+            Some(Ok(false)),
+            "B joined a user who already held state, so it created none"
+        );
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(
+            seen,
+            sfu_requests(&[
+                (stub::LIST, ""),
+                (stub::REMOVE, &format!("{a}:screen")),
+                (stub::REMOVE, &a),
+            ]),
+            "only the listed connection is evicted"
+        );
+        assert!(
+            state.is_some(),
+            "B relied on the existing state; it must survive"
+        );
+        assert!(member);
+        assert_eq!(
+            record,
+            [("SID_B".to_string(), b.clone())].into_iter().collect(),
+            "A's record goes, B's stays"
+        );
+        assert_eq!(mapping, Some(b.clone()), "the mapping names the survivor");
+        assert!(flags.iter().any(Option::is_some), "{flags:?}");
+    }
+
+    /// D-2: a failed eviction (the SFU answers the listed connection's
+    /// removal with a 500) returns the error with NOTHING torn down: the
+    /// state, the membership and the record all stay, so the connection
+    /// that may still be live stays visible and syncable. Mutation b3 (the
+    /// eviction's error swallowed into "no listing") tears it all down.
+    #[test]
+    fn a_failed_eviction_tears_nothing_down() {
+        rt().block_on(a_failed_eviction_tears_nothing_down_case())
+    }
+
+    async fn a_failed_eviction_tears_nothing_down_case() {
+        let (channel, user, _) = connection_case_ids("RE1");
+        let a = format!("{user}:A");
+        let db = Database::Reference(Default::default());
+        let mut conn = get_connection().await.expect("redis");
+
+        assert!(record_voice_connection(&channel, &user, "SID_A", &a)
+            .await
+            .unwrap());
+        create_voice_state(&channel, &user, Timestamp::now_utc())
+            .await
+            .unwrap();
+        set_channel_node(&channel.id, stub::NODE).await.unwrap();
+
+        let sfu = eviction_stub(&[("SID_A", &a)], stub::internal());
+        let result =
+            remove_user_from_voice_channel(&db, &stub::voice_client(sfu.url()), &channel, &user)
+                .await;
+        let seen = sfu.finish();
+
+        let state = get_voice_state(&channel, &user).await.unwrap();
+        let member = is_voice_member(&mut conn, &channel, &user).await;
+        let record = recorded_connections(&mut conn, &channel).await;
+
+        delete_voice_state(&channel, &user).await.expect("cleanup");
+        delete_channel_node(&channel.id).await.expect("cleanup");
+
+        assert!(
+            matches!(&result, Err(error) if matches!(error.error_type, revolt_result::ErrorType::InternalError)),
+            "{result:?}"
+        );
+        assert_eq!(
+            seen,
+            sfu_requests(&[
+                (stub::LIST, ""),
+                (stub::REMOVE, &format!("{a}:screen")),
+                (stub::REMOVE, &a),
+            ])
+        );
+        assert!(state.is_some(), "no teardown after a failed eviction");
+        assert!(member);
+        assert_eq!(
+            record,
+            [("SID_A".to_string(), a.clone())].into_iter().collect()
+        );
+    }
+
+    /// P2-6 + RA2-1: a user the SFU does not list, who is not in
+    /// `vc_members`, holds no other voice state here and has nothing
+    /// recorded, gets NO remote-control release and NO script. Observable:
+    /// the SFU sees the listing and nothing else (the release would end the
+    /// seeded grant and revoke or eject its controller), the grant is still
+    /// stored, and the mapping field and the flag the script would delete
+    /// are still there. Mutation b10 (the skip removed) is red on all of it.
+    #[test]
+    fn a_user_with_nothing_here_gets_no_release_and_no_script() {
+        rt().block_on(a_user_with_nothing_here_gets_no_release_and_no_script_case())
+    }
+
+    async fn a_user_with_nothing_here_gets_no_release_and_no_script_case() {
+        use super::remote_control::{
+            create_remote_control_grant, delete_remote_control_grant_records,
+            fetch_remote_control_grant, RemoteControlGrant, RemoteControlGrantOutcome,
+            INPUT_CLASS_KBM,
+        };
+
+        let (channel, user, server) = connection_case_ids("RN1");
+        let other = format!("other{user}");
+        let db = Database::Reference(Default::default());
+        let mut conn = get_connection().await.expect("redis");
+        let flag = format!("camera:{user}:{server}");
+
+        set_channel_node(&channel.id, stub::NODE).await.unwrap();
+        set_voice_participant_identity(&channel.id, &user, &user)
+            .await
+            .unwrap();
+        conn.set::<_, _, ()>(&flag, true).await.unwrap();
+        let grant = RemoteControlGrant {
+            id: ulid::Ulid::new().to_string(),
+            channel_id: channel.id.clone(),
+            server_id: Some(server.clone()),
+            node: stub::NODE.to_string(),
+            sharer_id: user.clone(),
+            controller_id: other.clone(),
+            controller_identity: format!("{other}:DEV"),
+            input_class: INPUT_CLASS_KBM.to_string(),
+        };
+        assert_eq!(
+            create_remote_control_grant(&grant).await.unwrap(),
+            RemoteControlGrantOutcome::Created
+        );
+
+        let sfu = eviction_stub(&[("SID_O", &other)], stub::ok(Vec::new()));
+        let result =
+            remove_user_from_voice_channel(&db, &stub::voice_client(sfu.url()), &channel, &user)
+                .await;
+        let seen = sfu.finish();
+
+        let kept_grant = fetch_remote_control_grant(&channel.id, &user)
+            .await
+            .unwrap();
+        let mapping = stored_voice_participant_identity(&channel.id, &user)
+            .await
+            .unwrap();
+        let kept_flag: Option<String> = conn.get(&flag).await.unwrap();
+
+        delete_remote_control_grant_records(&grant)
+            .await
+            .expect("cleanup");
+        delete_voice_participant_identity(&channel.id, &user)
+            .await
+            .expect("cleanup");
+        conn.del::<_, ()>(&flag).await.expect("cleanup");
+        delete_channel_node(&channel.id).await.expect("cleanup");
+
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(seen, sfu_requests(&[(stub::LIST, "")]), "the listing only");
+        assert_eq!(kept_grant, Some(grant), "no remote-control release ran");
+        assert_eq!(mapping, Some(user.clone()), "no script ran");
+        assert!(kept_flag.is_some(), "no script ran");
+    }
+
+    /// A user WITH voice state and NOTHING recorded (a legacy connection, or
+    /// a ghost whose connections are all gone) is still torn down: the set
+    /// delete of an empty set is the script's pure survivor check, which
+    /// finds no entry and runs the full teardown. Both with no node pinned
+    /// (no SFU call at all) and with the room gone at the SFU (one listing).
+    #[test]
+    fn a_ghost_with_state_and_no_record_is_torn_down() {
+        rt().block_on(a_ghost_with_state_and_no_record_is_torn_down_case())
+    }
+
+    async fn a_ghost_with_state_and_no_record_is_torn_down_case() {
+        let db = Database::Reference(Default::default());
+        let mut conn = get_connection().await.expect("redis");
+
+        for room_gone in [false, true] {
+            let (channel, user, server) = connection_case_ids("RG1");
+            create_voice_state(&channel, &user, Timestamp::now_utc())
+                .await
+                .unwrap();
+
+            let sfu = stub::Stub::serve(stub::routes(vec![(stub::LIST, stub::not_found())]));
+            if room_gone {
+                set_channel_node(&channel.id, stub::NODE).await.unwrap();
+            }
+            let result = remove_user_from_voice_channel(
+                &db,
+                &stub::voice_client(sfu.url()),
+                &channel,
+                &user,
+            )
+            .await;
+            let seen = sfu.finish();
+
+            let member = is_voice_member(&mut conn, &channel, &user).await;
+            let left: Vec<Option<String>> =
+                conn.mget(per_server_keys(&user, &server)).await.unwrap();
+            delete_voice_state(&channel, &user).await.expect("cleanup");
+            delete_channel_node(&channel.id).await.expect("cleanup");
+
+            assert!(result.is_ok(), "room gone {room_gone}: {result:?}");
+            assert_eq!(
+                seen,
+                if room_gone {
+                    sfu_requests(&[(stub::LIST, "")])
+                } else {
+                    sfu_requests(&[])
+                },
+                "room gone {room_gone}"
+            );
+            assert!(!member, "room gone {room_gone}: the ghost is torn down");
+            assert!(
+                left.iter().all(Option::is_none),
+                "room gone {room_gone}: {left:?}"
+            );
+        }
+    }
+
+    /// WB-2: a failed eviction in a call where Redis holds NOTHING of the
+    /// user (no record, no voice state) answers Ok: the failure is reported
+    /// and there is nothing to tear down. Two causes, each through the real
+    /// function: the SFU answers the ONE listing with a 500, and the pin
+    /// names a node missing from the config (UnknownNode before any
+    /// network). Nothing is written: the mapping field and the flag the
+    /// script would delete are still there. Mutation wb2 (the unconditional
+    /// `?`) answers the error.
+    #[test]
+    fn a_failed_eviction_where_the_user_holds_nothing_answers_ok() {
+        rt().block_on(a_failed_eviction_where_the_user_holds_nothing_answers_ok_case())
+    }
+
+    async fn a_failed_eviction_where_the_user_holds_nothing_answers_ok_case() {
+        let db = Database::Reference(Default::default());
+        let mut conn = get_connection().await.expect("redis");
+
+        for unknown_node in [false, true] {
+            let (channel, user, server) = connection_case_ids("RU1");
+            let flag = format!("camera:{user}:{server}");
+            set_voice_participant_identity(&channel.id, &user, &user)
+                .await
+                .unwrap();
+            conn.set::<_, _, ()>(&flag, true).await.unwrap();
+
+            let sfu = stub::Stub::serve(stub::routes(vec![(stub::LIST, stub::internal())]));
+            let node = if unknown_node {
+                "node-missing-from-config"
+            } else {
+                stub::NODE
+            };
+            set_channel_node(&channel.id, node).await.unwrap();
+            let result = remove_user_from_voice_channel(
+                &db,
+                &stub::voice_client(sfu.url()),
+                &channel,
+                &user,
+            )
+            .await;
+            let seen = sfu.finish();
+
+            let mapping = stored_voice_participant_identity(&channel.id, &user)
+                .await
+                .unwrap();
+            let kept_flag: Option<String> = conn.get(&flag).await.unwrap();
+
+            delete_voice_participant_identity(&channel.id, &user)
+                .await
+                .expect("cleanup");
+            conn.del::<_, ()>(&flag).await.expect("cleanup");
+            delete_channel_node(&channel.id).await.expect("cleanup");
+
+            assert!(result.is_ok(), "unknown node {unknown_node}: {result:?}");
+            assert_eq!(
+                seen,
+                if unknown_node {
+                    sfu_requests(&[])
+                } else {
+                    sfu_requests(&[(stub::LIST, "")])
+                },
+                "unknown node {unknown_node}: the ONE listing and nothing else"
+            );
+            assert_eq!(
+                mapping,
+                Some(user.clone()),
+                "unknown node {unknown_node}: no script ran"
+            );
+            assert!(
+                kept_flag.is_some(),
+                "unknown node {unknown_node}: no script ran"
+            );
+        }
+    }
+
+    /// WB-2's other half: a user who DOES hold something here (a recorded
+    /// connection with its state, or the state alone) still gets the error
+    /// when the ONE listing fails, with NOTHING torn down: the state, the
+    /// membership and any record all stay. Mutation b3 (a held user's error
+    /// swallowed into no listing) tears it all down.
+    #[test]
+    fn a_failed_listing_where_the_user_holds_state_tears_nothing_down() {
+        rt().block_on(a_failed_listing_where_the_user_holds_state_tears_nothing_down_case())
+    }
+
+    async fn a_failed_listing_where_the_user_holds_state_tears_nothing_down_case() {
+        let db = Database::Reference(Default::default());
+        let mut conn = get_connection().await.expect("redis");
+
+        for recorded in [true, false] {
+            let (channel, user, _) = connection_case_ids("RH1");
+            if recorded {
+                assert!(record_voice_connection(&channel, &user, "SID_H", &user)
+                    .await
+                    .unwrap());
+            }
+            create_voice_state(&channel, &user, Timestamp::now_utc())
+                .await
+                .unwrap();
+            set_channel_node(&channel.id, stub::NODE).await.unwrap();
+
+            let sfu = stub::Stub::serve(stub::routes(vec![(stub::LIST, stub::internal())]));
+            let result = remove_user_from_voice_channel(
+                &db,
+                &stub::voice_client(sfu.url()),
+                &channel,
+                &user,
+            )
+            .await;
+            let seen = sfu.finish();
+
+            let state = get_voice_state(&channel, &user).await.unwrap();
+            let member = is_voice_member(&mut conn, &channel, &user).await;
+            let record = recorded_connections(&mut conn, &channel).await;
+
+            delete_voice_state(&channel, &user).await.expect("cleanup");
+            delete_channel_node(&channel.id).await.expect("cleanup");
+
+            assert!(
+                matches!(&result, Err(error) if matches!(error.error_type, revolt_result::ErrorType::InternalError)),
+                "recorded {recorded}: {result:?}"
+            );
+            assert_eq!(
+                seen,
+                sfu_requests(&[(stub::LIST, "")]),
+                "recorded {recorded}"
+            );
+            assert!(
+                state.is_some(),
+                "recorded {recorded}: no teardown after a failed listing"
+            );
+            assert!(member, "recorded {recorded}");
+            let expected: std::collections::BTreeMap<String, String> = if recorded {
+                [("SID_H".to_string(), user.clone())].into_iter().collect()
+            } else {
+                Default::default()
+            };
+            assert_eq!(record, expected, "recorded {recorded}");
+        }
+    }
+
+    /// WB-2 through the server walk: two calls, the user in the SECOND only,
+    /// the first call's node failing its listing. The walk answers Ok, the
+    /// second call is torn down, and the first saw its ONE listing and
+    /// nothing else. Mutation wb2 (the unconditional `?`) fails the whole
+    /// removal over a call the user was never in: every kick, ban and leave
+    /// in the server.
+    #[test]
+    fn the_server_removal_passes_a_failed_call_the_user_is_not_in() {
+        rt().block_on(the_server_removal_passes_a_failed_call_the_user_is_not_in_case())
+    }
+
+    async fn the_server_removal_passes_a_failed_call_the_user_is_not_in_case() {
+        let (db, mut server, _, _) = sync_fixture("X3").await;
+        let suffix = ulid::Ulid::new().to_string();
+        let user = format!("userX3{suffix}");
+        let elsewhere = UserVoiceChannel {
+            id: format!("chanX3a{suffix}"),
+            server_id: Some(server.id.clone()),
+        };
+        let joined = UserVoiceChannel {
+            id: format!("chanX3b{suffix}"),
+            server_id: Some(server.id.clone()),
+        };
+        server.channels = vec![elsewhere.id.clone(), joined.id.clone()];
+        let mut conn = get_connection().await.expect("redis");
+
+        assert!(record_voice_connection(&joined, &user, "SID2", &user)
+            .await
+            .unwrap());
+        create_voice_state(&joined, &user, Timestamp::now_utc())
+            .await
+            .unwrap();
+        set_channel_node(&elsewhere.id, "node1").await.unwrap();
+        set_channel_node(&joined.id, "node2").await.unwrap();
+
+        let failing = stub::Stub::serve(stub::routes(vec![(stub::LIST, stub::internal())]));
+        let healthy = eviction_stub(&[("SID2", &user)], stub::ok(Vec::new()));
+        let voice_client = stub::voice_client_nodes(
+            &[("node1", failing.url()), ("node2", healthy.url())],
+            SFU_CALL_TIMEOUT,
+            SFU_BREAKER_WINDOW,
+        );
+
+        let result = remove_user_from_server_voice(&db, &voice_client, &server, &user).await;
+        let (failing_seen, healthy_seen) = (failing.finish(), healthy.finish());
+
+        let joined_member = is_voice_member(&mut conn, &joined, &user).await;
+        let joined_record = recorded_connections(&mut conn, &joined).await;
+        let left: Vec<Option<String>> =
+            conn.mget(per_server_keys(&user, &server.id)).await.unwrap();
+
+        delete_voice_state(&joined, &user).await.expect("cleanup");
+        delete_channel_node(&elsewhere.id).await.expect("cleanup");
+        delete_channel_node(&joined.id).await.expect("cleanup");
+
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(
+            failing_seen,
+            sfu_requests(&[(stub::LIST, "")]),
+            "the call the user is not in: the ONE listing"
+        );
+        assert_eq!(
+            healthy_seen,
+            sfu_requests(&[
+                (stub::LIST, ""),
+                (stub::REMOVE, &format!("{user}::screen")),
+                (stub::REMOVE, &user),
+            ]),
+            "the call the user is in is still evicted"
+        );
+        assert!(!joined_member, "the call the user is in is torn down");
+        assert!(joined_record.is_empty(), "{joined_record:?}");
+        assert!(left.iter().all(Option::is_none), "{left:?}");
     }
 }

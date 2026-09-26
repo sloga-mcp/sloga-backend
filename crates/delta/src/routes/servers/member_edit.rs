@@ -6,9 +6,10 @@ use revolt_database::{
         reference::Reference,
     },
     voice::{
-        assert_voice_move_admissible, get_channel_node, get_user_voice_channel_in_server,
-        move_user_to_voice_channel_expecting, sync_user_voice_permissions, UserVoiceChannel,
-        VoiceClient, VoiceMoveOutcome,
+        assert_voice_move_admissible, delete_voice_connections, get_channel_node,
+        get_user_voice_channel_in_server, get_voice_channel_members, is_in_voice_channel,
+        move_user_to_voice_channel_expecting, recorded_voice_connections,
+        sync_user_voice_permissions, UserVoiceChannel, VoiceClient, VoiceMoveOutcome,
     },
     Channel, Database, File, PartialMember, User,
 };
@@ -329,8 +330,8 @@ pub async fn edit(
         //
         // Sits in this block, not in the move branch below, because the
         // disconnect shape reaches into the same channel the same way and is
-        // decided here too — its own `remove_user` runs after the member
-        // document has already been written.
+        // decided here too — its own eviction runs after the member document
+        // has already been written.
         //
         // No source means the target is in no call in this server; there is
         // nothing to be gated on, and the move branch below still answers
@@ -542,24 +543,30 @@ pub async fn edit(
         // failing sync would abort the request before the eviction ran.
         if let Some(channel) = get_user_voice_channel_in_server(&target_user.id, &server.id).await?
         {
-            let node = get_channel_node(&channel).await?.unwrap();
-            let channel = Reference::from_unchecked(&channel).as_channel(db).await?;
+            // No node behind the channel: the call ended between the pointer
+            // read and this one (AFK S-3 L-a). There is no participant left
+            // to sync and the edit itself is already written, so this is a
+            // no-op. It used to `unwrap` here and panic the request.
+            if let Some(node) = get_channel_node(&channel).await? {
+                let channel = Reference::from_unchecked(&channel).as_channel(db).await?;
 
-            // Sync the TARGET being edited, not the acting moderator. Passing
-            // `&user` here synced the moderator's own participant, and since
-            // `sync_user_voice_permissions` early-returns for a user with no
-            // voice state it usually did nothing at all — server-mute and
-            // server-deafen never reached the target's SFU participant.
-            sync_user_voice_permissions(
-                db,
-                voice_client,
-                &node,
-                &target_user,
-                &channel,
-                Some(&server),
-                None,
-            )
-            .await?;
+                // Sync the TARGET being edited, not the acting moderator.
+                // Passing `&user` here synced the moderator's own participant,
+                // and since `sync_user_voice_permissions` early-returns for a
+                // user with no voice state it usually did nothing at all —
+                // server-mute and server-deafen never reached the target's SFU
+                // participant.
+                sync_user_voice_permissions(
+                    db,
+                    voice_client,
+                    &node,
+                    &target_user,
+                    &channel,
+                    Some(&server),
+                    None,
+                )
+                .await?;
+            }
         };
     };
 
@@ -574,49 +581,136 @@ pub async fn edit(
         //
         // No source at the gate: the target was in no call in this server,
         // and clearing `VoiceChannel` is a no-op, as it always has been (the
-        // client's call-moderation policy relies on that). No node behind
-        // the source any more: the room is gone and nobody is in it to
-        // remove, so that is the same no-op rather than the panic an
-        // `unwrap` gave.
+        // client's call-moderation policy relies on that).
+        //
+        // With a source, the removal follows the same rule as
+        // `remove_user_from_voice_channel` in the database crate (AFK S-3
+        // D-2, amended by WA-R / RA2-1): every connection of the target the
+        // SFU lists is evicted, then EXACTLY the connection records this
+        // removal knows about are deleted, through the set mode of the
+        // teardown script. It is spelled out here rather than calling that
+        // function because the remote-control release carries this route's
+        // own reason, `revoked_by_moderator`.
+        //
+        // ORDERING RULE: the recorded connections are read BEFORE the SFU
+        // listing, never after. Read after, a sibling that records between
+        // the listing and the read looks stale (recorded but not listed) and
+        // is deleted while live (S-3 WA-1). Read before, such a sibling is in
+        // neither set, and `delete_voice_connections`' survivor scan keeps
+        // its state. This path decides from a listing, so it NEVER runs the
+        // whole-user `delete_voice_state`: that would erase the late
+        // sibling's state.
         if let Some(channel) = &source_id {
-            if let Some(node) = get_channel_node(channel).await? {
-                // Remote-control release hook (plan §1: the moderator disconnect
-                // also calls `remove_user` directly and would race a
-                // webhook-only hook).
-                revolt_database::voice::remote_control::release_remote_control_for_user(
-                    db,
-                    voice_client,
-                    &UserVoiceChannel {
-                        id: channel.clone(),
-                        server_id: Some(server.id.clone()),
-                    },
-                    &target_user.id,
-                    "revoked_by_moderator",
-                    // Still connected at this point; the disconnect is below.
-                    false,
-                )
-                .await;
+            let uvc = UserVoiceChannel {
+                id: channel.clone(),
+                server_id: Some(server.id.clone()),
+            };
 
-                // Disconnect the TARGET being removed, not the acting moderator
-                // (matches the move branch above; the earlier `user.id` here
-                // kicked the moderator out of their own call — 6.6 review
-                // finding 8).
-                //
-                // Whether the acting user may reach into this channel at all
-                // was decided in the pre-flight, before the member document was
-                // written — not here, where a refusal would be too late.
-                //
-                // `remove_user` stays the removal here: it is the one every
-                // moderation path shares (it takes the screen leg too, and its
-                // doc lists this route). It does not classify "not in this
-                // room" - the SFU's not_found goes through
-                // `to_internal_error()` - so a target who left the gated source
-                // between the gate and here gets a 500 rather than a no-op.
-                // Fail-closed, just noisy; a clean no-op needs a
-                // `remove_user_if_present` in the database crate.
-                voice_client
-                    .remove_user(&node, &target_user.id, channel)
-                    .await?;
+            // 1. The recorded sids, first. A failed read returns the error
+            //    before anything is evicted; it is never taken for an empty
+            //    set.
+            let recorded: Vec<String> = recorded_voice_connections(&uvc, &target_user.id)
+                .await?
+                .into_iter()
+                .map(|(sid, _)| sid)
+                .collect();
+
+            // Whether Redis ties the target to this channel in any other way,
+            // read before the listing as well. The database crate's own check
+            // (`holds_voice_state_in`) is private, so this reads the two sets
+            // through their public readers. It does not look at the
+            // per-server pointer, whose only reader is the one FU-B keeps out
+            // of this block. The pointer's only writer (`create_voice_state`)
+            // adds both set entries in the same pipeline, and every teardown
+            // that drops this channel from `vc:{user}` drops a pointer naming
+            // it too, so a pointer with neither entry is not a state the
+            // database crate leaves behind.
+            let holds_state = !recorded.is_empty()
+                || is_in_voice_channel(&target_user.id, &uvc).await?
+                || get_voice_channel_members(&uvc)
+                    .await?
+                    .is_some_and(|members| members.contains(&target_user.id));
+
+            // 2. The node behind the gated source. None: the call has ended
+            //    and there is nothing to evict, but a ghost of it (state or a
+            //    record) is still torn down below from the recorded sids, as
+            //    `remove_user_from_voice_channel` does. It used to be a no-op
+            //    here, which left such a ghost on every roster.
+            let node = get_channel_node(channel).await?;
+
+            // Remote-control release hook (plan §1: the moderator disconnect
+            // evicts the participant INSIDE delta and would race a
+            // webhook-only hook). Before the eviction, and actively revoking
+            // (`false`): the eviction below can fail, and then nothing is
+            // torn down, so a `can_publish_data` capability must not be
+            // assumed gone with it.
+            revolt_database::voice::remote_control::release_remote_control_for_user(
+                db,
+                voice_client,
+                &uvc,
+                &target_user.id,
+                "revoked_by_moderator",
+                // Still connected at this point; the disconnect is below.
+                false,
+            )
+            .await;
+
+            // Disconnect the TARGET being removed, not the acting moderator
+            // (matches the move branch above; the earlier `user.id` here
+            // kicked the moderator out of their own call — 6.6 review
+            // finding 8).
+            //
+            // Whether the acting user may reach into this channel at all was
+            // decided in the pre-flight, before the member document was
+            // written — not here, where a refusal would be too late.
+            //
+            // ONE listing of the gated source, every connection of the
+            // target in it evicted (primaries and screen legs). `Ok(None)`:
+            // the SFU has no such room. `Ok(Some(sids))`: the primaries it
+            // listed and evicted, empty when it listed nothing of the target;
+            // a target who left between the gate and here is that empty
+            // answer, not the 500 the old `remove_user` gave (F-13). `Err`: a
+            // listed connection may still be live, so the error is returned
+            // with NOTHING torn down, and the survivor stays visible and
+            // syncable.
+            let evicted = match &node {
+                Some(node) => {
+                    voice_client
+                        .remove_user_if_present_sids(node, &target_user.id, channel)
+                        .await?
+                }
+                None => None,
+            };
+
+            if !holds_state && evicted.as_ref().is_none_or(Vec::is_empty) {
+                // Nothing of the target here at all: nothing recorded, no
+                // state, nothing listed (they left between the gate and here).
+                // The end state already holds, so this answers 200 and runs no
+                // script, the skip `remove_user_from_voice_channel` makes.
+                log::info!(
+                    "voice disconnect of {} from {}: nothing recorded, listed or held there; \
+                     already out",
+                    target_user.id,
+                    channel
+                );
+            } else {
+                // 3. `returned ∪ (recorded − returned)`: every sid the
+                //    eviction returned, then every sid recorded BEFORE the
+                //    listing that it did not list (stale), each once. With no
+                //    listing (no node, or no room), the recorded sids alone.
+                //    An EMPTY set is the script's pure survivor check: with
+                //    nothing of the target recorded it is `Last` and the full
+                //    teardown, which a legacy connection or a ghost with state
+                //    and no record needs. A connection recorded after step 1
+                //    that the listing did not see is in neither set, so the
+                //    script answers `Survivor` and it keeps its state.
+                let mut sids = evicted.unwrap_or_default();
+                for sid in recorded {
+                    if !sids.contains(&sid) {
+                        sids.push(sid);
+                    }
+                }
+                delete_voice_connections(&uvc, &target_user.id, &sids).await?;
             }
         }
     }
@@ -635,7 +729,9 @@ mod test {
     use revolt_database::{
         events::client::EventV1,
         voice::{
-            create_voice_state, delete_channel_voice_state, get_voice_state, set_channel_node,
+            create_voice_state, delete_channel_voice_state, get_user_voice_channel_in_server,
+            get_voice_channel_members, get_voice_state, is_in_voice_channel,
+            record_voice_connection, recorded_voice_connections, set_channel_node,
             update_voice_state, UserVoiceChannel, MAX_VIDEO_PARTICIPANTS,
         },
         Channel, Member, MlsGroup, MlsGroupCreateOutcome, MlsMemberDevice, PartialServer, Server,
@@ -1732,17 +1828,45 @@ mod test {
     /// channel the source-side gate decided about, never from a fresh read.
     /// A fresh read here could name a call the target switched to after the
     /// gate, and the mover would kick them out of a channel they were never
-    /// checked against. Mutations: the fresh read put back, or the removal /
-    /// release addressed to anything but the gated source.
+    /// checked against.
+    ///
+    /// AFK S-3 F-13 (D-2, amended by WA-R / RA2-1): inside that block, the
+    /// recorded connections are read BEFORE the one SFU listing (a read after
+    /// it deletes a sibling that recorded in between, WA-1), a failed read or
+    /// a failed eviction is returned before anything is torn down, and the
+    /// teardown deletes exactly `returned ∪ (recorded − returned)` in set
+    /// mode, never the whole-user `delete_voice_state`. The remote-control
+    /// release keeps its reason and still precedes the eviction.
+    ///
+    /// Mutations: the fresh read put back; the release or the eviction
+    /// addressed to anything but the gated source; the recorded read moved
+    /// after the eviction; a `?` dropped from the recorded read or the
+    /// eviction; the set delete replaced by `delete_voice_state`; the
+    /// whole-user `.remove_user(` put back.
     #[test]
     fn the_disconnect_removes_from_the_gated_source_only() {
         const OPEN: &str = "if remove.contains(&FieldsMember::VoiceChannel) \u{7b}";
         const SOURCE: &str = "if let Some(channel) = &source_id \u{7b} \
-             if let Some(node) = get_channel_node(channel).await? \u{7b}";
-        const RELEASE: &str = "&UserVoiceChannel \u{7b} id: channel.clone(), \
-             server_id: Some(server.id.clone()), \u{7d}, &target_user.id, \
-             \"revoked_by_moderator\",";
-        const REMOVE: &str = "voice_client .remove_user(&node, &target_user.id, channel) .await?;";
+             let uvc = UserVoiceChannel \u{7b} id: channel.clone(), \
+             server_id: Some(server.id.clone()), \u{7d};";
+        const RECORDED: &str = "let recorded: Vec<String> = \
+             recorded_voice_connections(&uvc, &target_user.id) .await? \
+             .into_iter() .map(|(sid, _)| sid) .collect();";
+        const HOLDS: &str = "let holds_state = !recorded.is_empty() \
+             || is_in_voice_channel(&target_user.id, &uvc).await? \
+             || get_voice_channel_members(&uvc) .await? \
+             .is_some_and(|members| members.contains(&target_user.id));";
+        const NODE: &str = "let node = get_channel_node(channel).await?;";
+        const RELEASE: &str = "release_remote_control_for_user( db, voice_client, &uvc, \
+             &target_user.id, \"revoked_by_moderator\", false, ) .await;";
+        const EVICT: &str = "let evicted = match &node \u{7b} Some(node) => \u{7b} voice_client \
+             .remove_user_if_present_sids(node, &target_user.id, channel) .await? \u{7d} \
+             None => None, \u{7d};";
+        const SKIP: &str = "if !holds_state && evicted.as_ref().is_none_or(Vec::is_empty) \u{7b}";
+        const UNION: &str = "let mut sids = evicted.unwrap_or_default(); \
+             for sid in recorded \u{7b} if !sids.contains(&sid) \u{7b} sids.push(sid); \
+             \u{7d} \u{7d}";
+        const DELETE: &str = "delete_voice_connections(&uvc, &target_user.id, &sids).await?;";
 
         let body = route_body();
         assert_eq!(body.matches(OPEN).count(), 1, "{body}");
@@ -1765,23 +1889,74 @@ mod test {
         let block = &body[open..=close.expect("the disconnect block closes")];
 
         let mut last = 0;
-        for needle in [SOURCE, RELEASE, REMOVE] {
-            let at = block
-                .find(needle)
-                .unwrap_or_else(|| panic!("the disconnect lost `{}`: {}", needle, block));
-            assert!(last <= at, "`{}` is out of order: {}", needle, block);
+        for needle in [
+            SOURCE, RECORDED, HOLDS, NODE, RELEASE, EVICT, SKIP, UNION, DELETE,
+        ] {
+            assert_eq!(
+                block.matches(needle).count(),
+                1,
+                "the disconnect must carry `{needle}` exactly once: {block}"
+            );
+            let at = block.find(needle).expect("counted above");
+            assert!(last < at, "`{}` is out of order: {}", needle, block);
             last = at;
         }
-        assert!(
-            !block.contains("get_user_voice_channel_in_server("),
-            "the disconnect must not re-read the target's channel: {}",
-            block
-        );
+        for banned in [
+            "get_user_voice_channel_in_server(",
+            "delete_voice_state(",
+            ".remove_user(",
+            "remove_user_if_present(",
+            "remove_user_from_voice_channel(",
+        ] {
+            assert!(
+                !block.contains(banned),
+                "the disconnect must not call `{}`: {}",
+                banned,
+                block
+            );
+        }
         assert_eq!(
-            block.matches(".remove_user(").count(),
+            block.matches("remove_user_if_present_sids(").count(),
             1,
-            "one removal, from the gated source: {block}"
+            "one eviction, from the gated source: {block}"
         );
+        assert!(
+            !body.contains(".remove_user("),
+            "the whole-user `remove_user` is gone from the route: {}",
+            body
+        );
+    }
+
+    /// AFK S-3 L-a: a call that ends mid-request leaves no node behind the
+    /// channel, and the sync path used to `unwrap` that read and panic. No
+    /// node read in the route may be unwrapped. Each `get_channel_node(` is
+    /// read up to the end of its statement or the brace that opens its
+    /// block. Mutation: the `.unwrap()` put back on the sync path.
+    #[test]
+    fn no_node_read_in_the_route_is_unwrapped() {
+        let body = route_body();
+        let reads: Vec<&str> = body
+            .match_indices("get_channel_node(")
+            .map(|(at, _)| {
+                let rest = &body[at..];
+                let end = rest
+                    .find(|ch: char| ch == ';' || ch == '\u{7b}')
+                    .unwrap_or(rest.len());
+                &rest[..end]
+            })
+            .collect();
+        assert_eq!(
+            reads.len(),
+            2,
+            "the sync path and the disconnect each read the node once: {body}"
+        );
+        for read in reads {
+            assert!(
+                !read.contains(".unwrap()") && !read.contains(".expect("),
+                "a node read must answer `None` as a no-op, never unwrap it: {}",
+                read
+            );
+        }
     }
 
     // ---- what the move refuses past the caps gate ------------------------
@@ -2465,6 +2640,251 @@ mod test {
         );
 
         delete_channel_voice_state(&source_uvc, &[user_b.id.clone()])
+            .await
+            .expect("cleanup");
+    }
+
+    // ---- the disconnect's teardown (AFK S-3 F-13) ------------------------
+    //
+    // No SFU is reachable from here (the database crate's stub SFU is
+    // test-only inside that crate), so these drive the arms decided without
+    // a listing: no node pinned (a ghost of a call that has ended), and
+    // ABSENT_NODE, whose unknown name fails the eviction before any network.
+    // The listed arms are text-pinned in
+    // `the_disconnect_removes_from_the_gated_source_only`.
+
+    /// Every trace of `user_id` in `uvc` the teardown owns: the recorded
+    /// connections, `vc:` membership, `vc_members:` membership, and the
+    /// per-server pointer when it names this channel.
+    async fn voice_traces(
+        uvc: &UserVoiceChannel,
+        user_id: &str,
+    ) -> (Vec<(String, String)>, bool, bool, bool) {
+        let recorded = recorded_voice_connections(uvc, user_id)
+            .await
+            .expect("recorded read");
+        let listed = is_in_voice_channel(user_id, uvc).await.expect("vc read");
+        let member = get_voice_channel_members(uvc)
+            .await
+            .expect("members read")
+            .is_some_and(|members| members.iter().any(|id| id == user_id));
+        let pointer = get_user_voice_channel_in_server(
+            user_id,
+            uvc.server_id.as_deref().expect("a server channel"),
+        )
+        .await
+        .expect("pointer read")
+        .as_deref()
+            == Some(uvc.id.as_str());
+        (recorded, listed, member, pointer)
+    }
+
+    /// A join as voice-ingress records it: the connection first, then the
+    /// state, created only for the user's first connection.
+    async fn join_recorded(uvc: &UserVoiceChannel, user_id: &str, sid: &str, identity: &str) {
+        if record_voice_connection(uvc, user_id, sid, identity)
+            .await
+            .expect("record")
+        {
+            create_voice_state(uvc, user_id, Timestamp::now_utc())
+                .await
+                .expect("voice state");
+        }
+    }
+
+    // Compile-only without RabbitMQ and Redis: see the section note above.
+    #[test]
+    fn disconnecting_a_ghost_of_an_ended_call_clears_it() {
+        crate::util::test::rt().block_on(disconnecting_a_ghost_of_an_ended_call_clears_it_case())
+    }
+
+    /// A call that ended without its webhooks (no node pinned any more)
+    /// leaves the target on the roster. The disconnect used to be a no-op
+    /// here. It now tears down from the recorded sids, as
+    /// `remove_user_from_voice_channel` does: every recorded connection, two
+    /// of them here, and a legacy state with no record at all (the empty set,
+    /// which the script answers `Last`). Mutations: the recorded sids dropped
+    /// from the set (the records survive, so the script answers `Survivor`
+    /// and tears nothing down); the teardown skipped.
+    async fn disconnecting_a_ghost_of_an_ended_call_clears_it_case() {
+        let harness = TestHarness::new().await;
+        let (_a, session_a, user_a) = harness.new_user().await; // owner
+        let (_b, _session_b, user_b) = harness.new_user().await; // recorded ghost
+        let (_c, _session_c, user_c) = harness.new_user().await; // legacy ghost
+        let (server, _channels) = harness.new_server(&user_a).await;
+        for user in [&user_b, &user_c] {
+            Member::create(&harness.db, &server, user, None)
+                .await
+                .expect("member");
+        }
+
+        let channel = voice_channel(&harness, &server, "Ended").await;
+        let uvc = UserVoiceChannel::from_channel(&channel);
+        join_recorded(&uvc, &user_b.id, "PA_ghost_bare", &user_b.id).await;
+        join_recorded(
+            &uvc,
+            &user_b.id,
+            "PA_ghost_device",
+            &format!("{}:DEV", user_b.id),
+        )
+        .await;
+        create_voice_state(&uvc, &user_c.id, Timestamp::now_utc())
+            .await
+            .expect("legacy voice state");
+
+        // The fixture holds what it claims to, and no node is pinned.
+        let (recorded, listed, member, pointer) = voice_traces(&uvc, &user_b.id).await;
+        assert_eq!(recorded.len(), 2, "two recorded connections");
+        assert!(listed && member && pointer, "the recorded ghost has state");
+        let (recorded, listed, member, pointer) = voice_traces(&uvc, &user_c.id).await;
+        assert!(recorded.is_empty(), "the legacy ghost has no record");
+        assert!(listed && member && pointer, "the legacy ghost has state");
+        assert!(
+            revolt_database::voice::get_channel_node(channel.id())
+                .await
+                .expect("node read")
+                .is_none(),
+            "the call has ended: no node"
+        );
+
+        for target in [&user_b, &user_c] {
+            let response = edit_member(
+                &harness,
+                &session_a.token,
+                &server.id,
+                &target.id,
+                serde_json::json!({ "remove": ["VoiceChannel"] }),
+            )
+            .await;
+            assert_eq!(
+                response.status(),
+                Status::Ok,
+                "disconnecting a ghost of an ended call is a success"
+            );
+
+            let (recorded, listed, member, pointer) = voice_traces(&uvc, &target.id).await;
+            assert!(
+                recorded.is_empty() && !listed && !member && !pointer,
+                "the ghost of {} must be torn down, left: recorded {:?}, vc {}, \
+                 vc_members {}, pointer {}",
+                target.id,
+                recorded,
+                listed,
+                member,
+                pointer
+            );
+        }
+
+        delete_channel_voice_state(&uvc, &[user_b.id.clone(), user_c.id.clone()])
+            .await
+            .expect("cleanup");
+    }
+
+    // Compile-only without RabbitMQ and Redis: see the section note above.
+    #[test]
+    fn a_failed_disconnect_eviction_tears_nothing_down() {
+        crate::util::test::rt().block_on(a_failed_disconnect_eviction_tears_nothing_down_case())
+    }
+
+    /// An eviction that fails may have left a listed connection live, so the
+    /// error is answered and NOTHING is torn down: the target stays visible
+    /// and syncable. ABSENT_NODE makes the eviction fail with `UnknownNode`
+    /// before any network. Mutation: the eviction's error swallowed (the
+    /// teardown then runs from the recorded sids and answers 200).
+    async fn a_failed_disconnect_eviction_tears_nothing_down_case() {
+        let harness = TestHarness::new().await;
+        let (_a, session_a, user_a) = harness.new_user().await; // owner
+        let (_b, _session_b, user_b) = harness.new_user().await; // target
+        let (server, _channels) = harness.new_server(&user_a).await;
+        Member::create(&harness.db, &server, &user_b, None)
+            .await
+            .expect("member");
+
+        let channel = voice_channel(&harness, &server, "Live").await;
+        let uvc = UserVoiceChannel::from_channel(&channel);
+        join_recorded(&uvc, &user_b.id, "PA_live", &user_b.id).await;
+        set_channel_node(channel.id(), ABSENT_NODE)
+            .await
+            .expect("node");
+
+        let response = edit_member(
+            &harness,
+            &session_a.token,
+            &server.id,
+            &user_b.id,
+            serde_json::json!({ "remove": ["VoiceChannel"] }),
+        )
+        .await;
+        assert_rejected(response, Status::BadRequest, "UnknownNode").await;
+
+        let (recorded, listed, member, pointer) = voice_traces(&uvc, &user_b.id).await;
+        assert_eq!(
+            recorded,
+            vec![("PA_live".to_string(), user_b.id.clone())],
+            "a failed eviction must leave the record in place"
+        );
+        assert!(
+            listed && member && pointer,
+            "a failed eviction must leave the voice state in place: vc {}, \
+             vc_members {}, pointer {}",
+            listed,
+            member,
+            pointer
+        );
+
+        delete_channel_voice_state(&uvc, &[user_b.id.clone()])
+            .await
+            .expect("cleanup");
+    }
+
+    // Compile-only without RabbitMQ and Redis: see the section note above.
+    #[test]
+    fn a_voice_sync_after_the_call_ended_is_a_no_op() {
+        crate::util::test::rt().block_on(a_voice_sync_after_the_call_ended_is_a_no_op_case())
+    }
+
+    /// AFK S-3 L-a: the target's pointer names a channel whose call has ended
+    /// (no node), as when the call ends mid-request. The sync has nobody to
+    /// reach and the edit is already written, so the answer is 200. The node
+    /// read used to be unwrapped and panicked the request. Mutation: the
+    /// `.unwrap()` put back.
+    async fn a_voice_sync_after_the_call_ended_is_a_no_op_case() {
+        let harness = TestHarness::new().await;
+        let (_a, session_a, user_a) = harness.new_user().await; // owner
+        let (_b, _session_b, user_b) = harness.new_user().await; // target
+        let (server, _channels) = harness.new_server(&user_a).await;
+        Member::create(&harness.db, &server, &user_b, None)
+            .await
+            .expect("member");
+
+        let channel = voice_channel(&harness, &server, "Ended").await;
+        let uvc = UserVoiceChannel::from_channel(&channel);
+        create_voice_state(&uvc, &user_b.id, Timestamp::now_utc())
+            .await
+            .expect("voice state");
+
+        let response = edit_member(
+            &harness,
+            &session_a.token,
+            &server.id,
+            &user_b.id,
+            serde_json::json!({ "can_publish": false }),
+        )
+        .await;
+        assert_eq!(
+            response.status(),
+            Status::Ok,
+            "a mute whose call has ended must still be applied, and answered 200"
+        );
+
+        let member = harness
+            .db
+            .fetch_member(&server.id, &user_b.id)
+            .await
+            .expect("member read");
+        assert!(!member.can_publish, "the mute is written");
+
+        delete_channel_voice_state(&uvc, &[user_b.id.clone()])
             .await
             .expect("cleanup");
     }

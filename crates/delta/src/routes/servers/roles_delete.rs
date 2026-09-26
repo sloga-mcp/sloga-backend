@@ -1,6 +1,6 @@
 use revolt_database::{
     util::{permissions::DatabasePermissionQuery, reference::Reference},
-    voice::{sync_voice_permissions, VoiceClient},
+    voice::{sync_server_voice_permissions, VoiceClient},
     Database, User,
 };
 use revolt_permissions::{calculate_server_permissions, ChannelPermission};
@@ -39,11 +39,12 @@ pub async fn delete(
 
     role.delete(db, &server.id).await?;
 
-    for channel_id in &server.channels {
-        let channel = Reference::from_unchecked(channel_id).as_channel(db).await?;
-
-        sync_voice_permissions(db, voice_client, &channel, Some(&server), Some(&role_id)).await?;
-    }
+    // Everyone in every call re-syncs, not just the role's holders (AFK S-3
+    // F-8): on MongoDB `delete_role` has already pulled the role from every
+    // member, so a sync scoped to it would match nobody. `server` no longer
+    // holds the role, so each grant is computed without it. The helper tries
+    // every channel before answering its first failure (D-6).
+    sync_server_voice_permissions(db, voice_client, &server, None).await?;
 
     Ok(EmptyResponse)
 }
