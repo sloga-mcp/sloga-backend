@@ -44,10 +44,11 @@ lazy_static! {
         .dns_resolver(CachedDnsResolver {})
         .connect_timeout(Duration::from_secs(5))
         // Some hosts take tens of seconds to send the first byte of a cold
-        // file (catbox measured up to 45.6 s). A stalled mid-stream read is
-        // still ended by the relay's 30 s STALL (the browser then resumes
-        // with a Range request), and every slot stays bounded by the
-        // wall-clock deadline.
+        // file (catbox measured up to 45.6 s). This timeout therefore only
+        // bounds the wait for headers on each redirect hop and the sniff
+        // peek; on every later read the relay's 30 s STALL fires first (the
+        // browser then resumes with a Range request). Every slot stays
+        // bounded by the wall-clock deadline.
         .read_timeout(Duration::from_secs(60))
         .redirect(redirect::Policy::none())
         .no_gzip()
@@ -446,7 +447,11 @@ impl Request {
     /// Send a new request to a service using `client`
     ///
     /// Accepts any 2xx; redirects and `range` are handled by `Request::open`.
-    pub async fn new_with(client: &Client, url: Url, range: Option<HeaderValue>) -> Result<Request> {
+    pub async fn new_with(
+        client: &Client,
+        url: Url,
+        range: Option<HeaderValue>,
+    ) -> Result<Request> {
         Request::open(client, url, range, accept_success).await
     }
 
@@ -493,9 +498,9 @@ impl Request {
             }
 
             let response = builder
-            .send()
-            .await
-            .map_err(|_| create_error!(ProxyError))?;
+                .send()
+                .await
+                .map_err(|_| create_error!(ProxyError))?;
 
             if response.status().is_redirection() {
                 redirect_count += 1;
@@ -654,9 +659,7 @@ fn mime_for_status(status: StatusCode, headers: &HeaderMap) -> Result<Mime> {
         .to_str()
         .map_err(|_| create_error!(ProxyError))?;
 
-    content_type
-        .parse()
-        .map_err(|_| create_error!(ProxyError))
+    content_type.parse().map_err(|_| create_error!(ProxyError))
 }
 
 /// Metadata path `Request::generate_embed` takes for a response
@@ -790,14 +793,15 @@ mod tests {
     fn success_without_a_parsable_content_type_is_an_error() {
         assert!(mime_for_status(StatusCode::OK, &HeaderMap::new()).is_err());
         assert!(mime_for_status(StatusCode::PARTIAL_CONTENT, &HeaderMap::new()).is_err());
-        assert!(mime_for_status(
-            StatusCode::OK,
-            &headers(&[(CONTENT_TYPE, "not a mime")])
-        )
-        .is_err());
+        assert!(
+            mime_for_status(StatusCode::OK, &headers(&[(CONTENT_TYPE, "not a mime")])).is_err()
+        );
 
         let mut opaque = HeaderMap::new();
-        opaque.insert(CONTENT_TYPE, HeaderValue::from_bytes(b"audio/\xff").unwrap());
+        opaque.insert(
+            CONTENT_TYPE,
+            HeaderValue::from_bytes(b"audio/\xff").unwrap(),
+        );
         assert!(mime_for_status(StatusCode::PARTIAL_CONTENT, &opaque).is_err());
     }
 
@@ -814,8 +818,16 @@ mod tests {
     #[test]
     fn audio_types_route_to_audio_only_behind_the_flag() {
         for value in ["audio/mpeg", "audio/ogg", "audio/x-wav", "application/ogg"] {
-            assert_eq!(classify_embed(&mime(value), true), EmbedKind::Audio, "{value}");
-            assert_eq!(classify_embed(&mime(value), false), EmbedKind::None, "{value}");
+            assert_eq!(
+                classify_embed(&mime(value), true),
+                EmbedKind::Audio,
+                "{value}"
+            );
+            assert_eq!(
+                classify_embed(&mime(value), false),
+                EmbedKind::None,
+                "{value}"
+            );
         }
     }
 
@@ -833,7 +845,11 @@ mod tests {
                 ("application/json", EmbedKind::None),
                 ("text/plain", EmbedKind::None),
             ] {
-                assert_eq!(classify_embed(&mime(value), flag), kind, "{value} flag={flag}");
+                assert_eq!(
+                    classify_embed(&mime(value), flag),
+                    kind,
+                    "{value} flag={flag}"
+                );
             }
         }
     }

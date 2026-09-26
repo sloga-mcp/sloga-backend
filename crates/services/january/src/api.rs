@@ -1239,13 +1239,12 @@ mod tests {
             .body(())
             .unwrap()
             .into_parts();
-        let query =
-            <std::result::Result<Query<UrlQuery>, QueryRejection>>::from_request_parts(
-                &mut parts,
-                &(),
-            )
-            .await
-            .unwrap();
+        let query = <std::result::Result<Query<UrlQuery>, QueryRejection>>::from_request_parts(
+            &mut parts,
+            &(),
+        )
+        .await
+        .unwrap();
         audio_url(enabled, query)
     }
 
