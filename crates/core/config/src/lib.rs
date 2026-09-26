@@ -563,6 +563,14 @@ impl Pushd {
 #[derive(Deserialize, Debug, Clone)]
 pub struct January {
     pub blocked_domains: Vec<String>,
+    /// Emit Audio embeds for direct audio links and serve `GET /audio`
+    pub audio_embeds: bool,
+    /// Largest audio file (in bytes) that is embedded or relayed
+    pub max_audio_bytes: usize,
+    /// Maximum number of concurrent `/audio` streams
+    pub max_audio_streams: usize,
+    /// Wall-clock limit (in seconds) for a single `/audio` stream
+    pub max_audio_stream_secs: u64,
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -1145,5 +1153,56 @@ legacy_private_key = "fake-legacy-private-key-placeholder"
             "legacy_private_key must default to empty"
         );
         assert_eq!(settings.pushd.vapid.queue, DEFAULT_VAPID_QUEUE);
+    }
+}
+
+#[cfg(test)]
+mod january_tests {
+    use std::collections::HashMap;
+
+    use config::{builder::DefaultState, Config, ConfigBuilder, Environment, File, FileFormat};
+
+    use super::{January, Settings};
+
+    /// Only the bundled defaults, so no local override file can skew the result
+    fn bundled() -> ConfigBuilder<DefaultState> {
+        Config::builder().add_source(File::from_str(
+            include_str!("../Revolt.toml"),
+            FileFormat::Toml,
+        ))
+    }
+
+    #[test]
+    fn audio_embed_defaults() {
+        let settings: Settings = bundled().build().unwrap().try_deserialize().unwrap();
+
+        assert!(!settings.january.audio_embeds);
+        assert_eq!(settings.january.max_audio_bytes, 52_428_800);
+        assert_eq!(settings.january.max_audio_streams, 32);
+        assert_eq!(settings.january.max_audio_stream_secs, 600);
+    }
+
+    #[test]
+    fn audio_embeds_env_override() {
+        // Same environment source as CONFIG_BUILDER, fed from a map instead of
+        // the process environment so tests cannot race on global state
+        let vars = HashMap::from([(
+            "REVOLT__JANUARY__AUDIO_EMBEDS".to_owned(),
+            "true".to_owned(),
+        )]);
+
+        let january: January = bundled()
+            .add_source(
+                Environment::with_prefix("REVOLT")
+                    .separator("__")
+                    .source(Some(vars)),
+            )
+            .build()
+            .unwrap()
+            .get("january")
+            .unwrap();
+
+        assert!(january.audio_embeds);
+        assert_eq!(january.max_audio_bytes, 52_428_800);
     }
 }

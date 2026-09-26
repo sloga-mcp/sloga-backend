@@ -46,3 +46,6 @@ serde_json = { workspace = true }
 
 # Validation
 validator = { workspace = true, features = ["derive"], optional = true }
+
+[dev-dependencies]
+bson = { workspace = true }

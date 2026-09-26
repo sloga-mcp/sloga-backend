@@ -155,7 +155,8 @@ pub async fn generate(
             .await
             {
                 drop(guard);
-                response.json::<Embed>().await.ok()
+                let status_ok = response.status().is_success();
+                keep_embed(status_ok, response.json::<Embed>().await.ok())
             } else {
                 None
             }
@@ -174,5 +175,56 @@ pub async fn generate(
         Ok(embeds)
     } else {
         Err(create_error!(LabelMe))
+    }
+}
+
+/// Keep a january response only if it succeeded and carries a real embed.
+/// Unknown embed types decode as `Embed::None`, and so does january's
+/// `{"type":"NoEmbedData"}` error body, so `None` must be filtered out.
+fn keep_embed(status_ok: bool, embed: Option<Embed>) -> Option<Embed> {
+    if !status_ok {
+        return None;
+    }
+
+    embed.filter(|e| !matches!(e, Embed::None))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::keep_embed;
+    use revolt_models::v0::{Embed, Image, ImageSize};
+
+    fn image() -> Embed {
+        Embed::Image(Image {
+            url: "https://example.com/a.png".to_string(),
+            width: 1,
+            height: 1,
+            size: ImageSize::Large,
+        })
+    }
+
+    #[test]
+    fn non_success_status_is_dropped() {
+        assert!(keep_embed(false, Some(image())).is_none());
+    }
+
+    #[test]
+    fn none_embed_is_dropped() {
+        assert!(keep_embed(true, Some(Embed::None)).is_none());
+    }
+
+    #[test]
+    fn real_embed_is_kept() {
+        assert!(matches!(
+            keep_embed(true, Some(image())),
+            Some(Embed::Image(_))
+        ));
+    }
+
+    #[test]
+    fn january_error_body_is_dropped() {
+        let body = serde_json::from_str::<Embed>(r#"{"type":"NoEmbedData","location":"x"}"#).ok();
+        assert!(matches!(body, Some(Embed::None)));
+        assert!(keep_embed(true, body).is_none());
     }
 }

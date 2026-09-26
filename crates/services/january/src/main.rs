@@ -10,6 +10,7 @@ use utoipa::{
 use utoipa_scalar::{Scalar, Servable as ScalarServable};
 
 mod api;
+mod audio;
 pub mod requests;
 pub mod website_embed;
 
@@ -21,7 +22,7 @@ async fn main() -> Result<(), std::io::Error> {
     // Configure API schema
     #[derive(OpenApi)]
     #[openapi(
-        paths(api::root, api::proxy, api::embed),
+        paths(api::root, api::proxy, api::embed, api::audio),
         components(schemas(
             api::RootResponse,
             revolt_result::Error,
@@ -35,6 +36,7 @@ async fn main() -> Result<(), std::io::Error> {
             revolt_models::v0::Special,
             revolt_models::v0::WebsiteMetadata,
             revolt_models::v0::Text,
+            revolt_models::v0::Audio,
             revolt_models::v0::Embed
         ))
     )]
