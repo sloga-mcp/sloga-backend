@@ -263,7 +263,11 @@ waits are bounded: the prefetch at 3 s (`RESUME_PREFETCH_WAIT_MS`; past
 it the device joins), and each delete the join path awaits at 5 s
 (`KEPT_DISCARD_WAIT_MS`; past it the establish goes LOUD, §8.5). **No
 server, native or protocol change** — the resume uses two existing DS
-read routes.
+read routes. The final-audit fix pass (2026-09-26: install before
+active, the commit-window tail fetch, the fallback-cause line, the
+stale keys-changed fence) is committed on the same branch as `f3bf4dc8`,
+on top of wave 3. It changes §8.3 steps 5–6, §8.5 and §8.6, and those
+parts are checked against that commit.
 
 ### 8.1 Why
 
@@ -345,15 +349,59 @@ poisoned/desync.
    native `callState` must show self present, `active`, at
    `epoch == current_epoch`. A `removed_self` arriving during establish is
    recorded and acted on only if native confirms self absent — never
-   replayed blindly. Any outcome other than caught up abandons the adopted
-   group through §8.5.
-6. **Go active.** Only once caught up: install every member's keys at the
-   current epoch, refresh the recency record, then the UNCHANGED
-   fail-closed path: roster consistency → enable → gate release.
+   replayed blindly. If an envelope of the candidate group took a
+   non-terminal drop during the startup window, ONE tail fetch
+   (`#catchUpTail`) runs before that final check, and the epoch native
+   must show is then the tail's `current_epoch` (§8.6). Any outcome
+   other than caught up abandons the adopted group through §8.5.
+6. **Install, THEN go active.** Still inside `#catchUp`, under the
+   session lock, after the final native check,
+   `#installCaughtUpKeys(groupId, confirmed)` is AWAITED. It clears
+   `#lastInbound`, so the classifier falls to Remove-immediate and never
+   to an Add-grace that keeps the old send key. It then installs every member's keys, our own
+   send key included, at the confirmed epoch. `#lastOwnWon` is
+   deliberately left alone: the resume branch stages and wins no commit
+   of its own, and the send-key check below refuses a deferred install
+   whatever classified it. The install counts only if all three hold:
+   the install counter moved, the install fence (`#installEpoch`) is
+   still the confirmed epoch, and our own send key's epoch
+   (`#ownSendKeyEpoch`, set only once an awaited install resolves with
+   the fence still on that epoch) equals it. (With no local media
+   identity yet, it counts only if no key was ever installed: nothing
+   can publish.) The session, the generation and the group are
+   re-checked after the await. A failed check falls back to the join
+   ladder with cause `install_check_failed` (§8.5), never active. One
+   case is NOT quiet: if the install throws `MissingLocalFrameKeyError`
+   (native has no send key for us at that epoch), `#onRotationError`
+   latches loud (control origin) before the fallback runs. That fails
+   closed. Only after a counted install does `#startupResume` set
+   `#joinedGeneration`, call `#toActive()`, kick one reconcile (the
+   install's own kick was refused while not yet active), refresh the
+   recency record and log "resumed the held call group". Then the
+   UNCHANGED fail-closed path runs: roster consistency → enable → gate
+   release. At `d4472a26` the order was reversed (`#toActive()`, then an
+   un-awaited install). A keys-changed push for an intermediate epoch
+   landing mid-catch-up then made the explicit install an Add-grace, so
+   the gate could open for ~2 s on an earlier epoch's send key, a key
+   a member removed in the catch-up still held. The final audit
+   reproduced this (FA-B1).
+   **Live-leg readout (FAR-n1):** the `catchUpDone` and `resumed`
+   timeline stamps are written just BEFORE the install (to keep the join
+   timeline's stamp order), so a seat that fell back on
+   `install_check_failed` still shows `resumed` in its timeline. Judge a
+   leg by the cause line (§8.5) and the "resumed the held call group" log,
+   not by the stamps.
 
-**Sent: nothing.** No join intent, no KeyPackage, no Welcome, no commit,
-and no self-Update (membership did not change; post-compromise security
-still comes from the lowest leaf's 10-minute heartbeat).
+**Sent to the DS: no join intent, no Welcome, no commit, and no
+self-Update** (membership did not change; post-compromise security still
+comes from the lowest leaf's 10-minute heartbeat). The KeyPackage top-up
+is NOT skipped: `#ensureKeyPackages` runs beside every resume (in
+`start()`, whenever the host supplies a resume prefetch), not ahead of
+it. It is the same low-water enrollment a join runs, a native replenish
+that publishes a KeyPackage batch only when the DS count is below the
+watermark. The resume does not wait for it, and a failure beside a
+resume is logged, not loud. A fallback to the ladder awaits it
+before its first intent.
 
 ### 8.4 What the DS and peers see; effect on §3
 
@@ -379,7 +427,8 @@ still comes from the lowest leaf's 10-minute heartbeat).
 
 On a `join` decision, a null or failed prefetch, a prefetch not back
 within its 3 s bound, a candidate already being deleted, a failed grant
-clear, or ANY catch-up outcome other than caught up, the device, in
+clear, ANY catch-up outcome other than caught up, a failed key install
+(§8.3 step 6), or a failed tail fetch (§8.6), the device, in
 order: aborts the prefetch; lets go of the candidate, if there was one
 (keep entry, session, recency record), and deletes it; discards the
 channel's other kept groups; ensures its KeyPackages are published; runs
@@ -393,6 +442,71 @@ its old leaf is still rostered. The two-commit ladder, `#serveRejoin`,
 `#removeStaleLeaf`, `JOINER_RETRY_MS` and `REJOIN_SERVE_SUPPRESS_MS` are
 not modified.
 
+**The cause is logged.** Every startup establish that does not resume
+logs ONE `[mls]` info line (`#noResume`, `#resumeStopped`), which names
+the cause:
+
+```
+[mls] startup establish: no resume { cause, candidate, ...numbers }
+```
+
+`candidate` is the group id (or null). The numbers are ages, epochs,
+lag, counts and flags, never key material or a group secret. The
+`cause` values are (type `ResumeMissCause`):
+
+- prefetch: `prefetch_none`, `prefetch_failed`, `prefetch_timeout`;
+- the decision's rules, in `resumeDecision`'s order: `not_startup`,
+  `prefetch_stale`, `open_group_mismatch`, `channel_mismatch`,
+  `held_group_unusable`, `own_commit_pending`, `own_commit_fetched`,
+  `lag_out_of_range`, `commits_mismatch`, and `policy_join` (the policy
+  said join but no mirrored rule failed: the mirror has drifted);
+- adopt: `candidate_being_deleted`, `grant_clear_failed`;
+- catch-up: `catch_up_stopped`, `loud_foreign_drop`,
+  `native_unconfirmed`, `catch_up_threw`;
+- `tail_failed` (with `reason`: `threw`, a non-ok response kind, `lag`,
+  `short`, `own_commit` or `not_applied`);
+- `install_check_failed`;
+- `superseded`: the session closed or a newer establish took over. This
+  is the one cause that stops rather than falling back to the ladder.
+
+The rule cause is derived by `resumeJoinCause`, which re-walks
+`resumeDecision`'s rules to label the line; the decision itself stays
+`resumeDecision`'s, and `mlsRejoinPolicy.ts` is unchanged. At `d4472a26`
+a declined resume logged only the candidate, so a live leg could not tell
+which rule sent it to the ladder (FA-m3).
+
+**Stale keys-changed fence (FA-S2).** A fallback deletes the candidate,
+and the ladder may re-enter the SAME DS group id. Native keys-changed
+pushes for commits the old incarnation applied can still be in flight.
+After the group reset zeroes `#installEpoch`, both the group-id check
+and the epoch check would pass, and the frame-key read would hit the
+deleted row (re-securing, then loud). To stop that:
+
+- `#startupAppliedEpochs` records, per group, the highest epoch native
+  applied during the startup window. It is fed from every `processed`
+  outcome `#consume` sees, other groups' included, and cleared with the
+  window.
+- `#joinWithoutResume` sets `#staleKeysFence = { groupId, epoch }` AFTER
+  the group reset, and only if this page applied something for the
+  candidate.
+- `onLocalKeysChanged` drops a push for that group at or below the floor,
+  before anything else (it does not even retire the new incarnation's
+  pending grace), and logs
+  `[mls] keys-changed dropped: the deleted group's { groupId, epoch, floor }`.
+- The fence clears at the new incarnation's first install: the first
+  push above the floor that reaches the install and moves
+  `#installEpoch` past it. From there the monotonic epoch check covers
+  the rest.
+
+Why the new incarnation is always above the floor: native mints
+`group_id = sha256(channel_id || call_start_ulid)`, the DS accepts a
+commit only at `epoch == current_epoch + 1`, and swept groups are
+deleted, never reset. So a Welcome back into the same id comes after
+everything this device applied there. The fence applies to every
+fallback that deletes a candidate, including the older
+`catch_up_stopped` one (a catch-up that applied some commits before
+stopping), not only the new install and tail causes.
+
 ### 8.6 Security
 
 - **Fail closed, no speculative release.** Publishing on the held keys
@@ -403,8 +517,47 @@ not modified.
 - **Server can never grow a roster** — unchanged; the resume adds nobody.
 - **Hostile DS:** steering into an old group is blocked by the recency
   record and the channel binding; a padded or reordered commit list fails
-  the count and contiguity checks; a device resumed at epoch N while a peer
-  publishes at N+1 goes loud within the re-securing escalation bound.
+  the count and contiguity checks.
+- **A commit between the prefetch GET and the adopt.** A commit for the
+  candidate that lands after the prefetch's commits fetch but before the
+  adopt is pushed to the device while the candidate is not yet its
+  group. At `d4472a26` it was handled as another group's envelope. Native
+  was still behind it, so the disposition was non-terminal (a gap): the
+  envelope was left unacked and never retried, and the device could go
+  active one epoch behind. The audit reproduced ~30 s behind, healed
+  only by its own ghost timer (FA-M1). Now, while `#startupEstablish`
+  is set (from `start()`, before the sink registers, until the startup
+  establish returns), every foreign envelope that native does not ack
+  records its group in `#resumeForeignDrops: Set<string>`. The set is
+  cleared on every exit: the resume, each fallback, a stop, and the end
+  of the startup window. If the set holds the candidate, `#catchUp`
+  runs `#catchUpTail` under the session lock before the final native
+  check. It reads native's epoch and makes ONE
+  `mlsFetchCommits(candidate, nativeEpoch + 1)`. The answer must be ok,
+  must stay under `RESUME_MAX_LAG` of the held epoch, must be exactly
+  the missing epochs contiguous from `nativeEpoch + 1`, and must contain
+  none committed by this device. Each commit is applied through the same
+  `#consume(#synthEnvelope(...))` path and must apply cleanly. The final
+  check then requires native epoch == the tail's `current_epoch`. Any
+  failure falls back to the join ladder with cause `tail_failed` and a
+  `reason` (§8.5), never active behind. An empty record adds no
+  request, so the common case's latency is unchanged. With this on the
+  branch, the window is closed and is no longer a residual.
+- **The escalation bound needs peer media.** A device that is active at
+  epoch N while the group is at N+1 goes loud only when a peer's media
+  at N+1 reaches it and fails to decrypt. That decode missing key is the
+  only thing that arms the bound. Inside a rotation window or an
+  observed membership change, the result is a join-race hold, amber for
+  at most `JOIN_RACE_DEFER_MS` (20 s) and then loud. This path takes
+  precedence over the rotation window's `RESECURE_ESCALATE_MS` arm.
+  Outside those windows, the device goes loud at once. With no peer
+  publishing (for example, every peer muted), nothing fails to decode
+  and nothing escalates. Meanwhile the device publishes under epoch N,
+  whose key a member removed at N+1 still holds. So the bound is a
+  backstop, not the
+  guarantee. The guarantee is the catch-up, the tail fetch above, and
+  the final native check. The bound remains the only local signal
+  against a DS that withholds a commit from every fetch.
 - **Frame keys:** a resumed FrameCryptor reuses the epoch's frame key, so
   IV uniqueness rests on the random SSRC (recorded, accepted).
 - **Residuals / follow-ups:** a page that dies inside the 10 s leaves rows
@@ -415,7 +568,14 @@ not modified.
   store, so a wipe landing mid-connect could re-create the store the user
   just destroyed. The normal flow does not reach it (the prefetch needs a
   ready device, a device id and a keep entry or recency record, and a
-  wipe clears them all). Follow-ups: a device-level + `group.open` gate
+  wipe clears them all). The stale keys-changed fence (§8.5) has two
+  known gaps (FAR-m2), and both fail closed. First, its floor is captured
+  BEFORE the delete is awaited, so a commit native applies for the
+  candidate during that await pushes above the floor and is not
+  dropped. Second, the non-resume `#startupWipe` path sets no fence.
+  Either way, a stale push's frame-key read hits the deleted row and the
+  seat goes re-securing, then loud.
+  Follow-ups: a device-level + `group.open` gate
   on the commits fetch; a client-requestable re-drain; a native
   `GroupAlreadyExists` test; a boot-time kept-group sweep; `callState`
   through `with_engine_if_provisioned` (sloga-desktop
