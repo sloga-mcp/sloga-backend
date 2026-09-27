@@ -529,3 +529,232 @@ pub struct MailEnvelope {
 pub struct MailAddress {
     pub address: String,
 }
+
+/// `source` with its comments cut out, for the textual pins that stand in for
+/// a route test that cannot reach a line (no live LiveKit). A pin must not be
+/// satisfied by code that is commented out.
+///
+/// Cuts `// ...` to the end of the line, whole-line or trailing (doc comments
+/// too), and `/* ... */` blocks, nested as Rust nests them. Newlines stay, so
+/// the line structure survives. Literals are copied as they are, so a `//` or
+/// `/*` inside one (a URL) is not taken for a comment: strings and byte
+/// strings with their escapes, raw strings (`r"..."`, `r#"..."#`), and char
+/// literals (`'"'`, `'\''`, longer escapes), told from a lifetime by their
+/// closing quote.
+pub fn without_comments(source: &str) -> String {
+    fn is_ident(c: char) -> bool {
+        c.is_alphanumeric() || c == '_'
+    }
+
+    let chars: Vec<char> = source.chars().collect();
+    let char_at = |at: usize| chars.get(at).copied();
+    let mut out = String::with_capacity(source.len());
+    let mut at = 0;
+
+    while let Some(c) = char_at(at) {
+        match (c, char_at(at + 1)) {
+            ('/', Some('/')) => {
+                while char_at(at).is_some_and(|c| c != '\n') {
+                    at += 1;
+                }
+            }
+            ('/', Some('*')) => {
+                let mut depth = 0usize;
+                loop {
+                    match (char_at(at), char_at(at + 1)) {
+                        (Some('/'), Some('*')) => {
+                            depth += 1;
+                            at += 2;
+                        }
+                        (Some('*'), Some('/')) => {
+                            depth -= 1;
+                            at += 2;
+                            if depth == 0 {
+                                break;
+                            }
+                        }
+                        (Some('\n'), _) => {
+                            out.push('\n');
+                            at += 1;
+                        }
+                        (Some(_), _) => at += 1,
+                        (None, _) => panic!("an unclosed /* comment"),
+                    }
+                }
+            }
+            ('"', _) => {
+                out.push('"');
+                at += 1;
+                loop {
+                    let c = char_at(at).expect("an unclosed string literal");
+                    out.push(c);
+                    at += 1;
+                    match c {
+                        '\\' => {
+                            out.push(char_at(at).expect("an unclosed string literal"));
+                            at += 1;
+                        }
+                        '"' => break,
+                        _ => {}
+                    }
+                }
+            }
+            ('r', _)
+                if at == 0
+                    || !is_ident(chars[at - 1])
+                    || (chars[at - 1] == 'b' && (at == 1 || !is_ident(chars[at - 2]))) =>
+            {
+                let mut quote = at + 1;
+                while char_at(quote) == Some('#') {
+                    quote += 1;
+                }
+                if char_at(quote) != Some('"') {
+                    // `r` starting an identifier, or a raw identifier `r#name`
+                    out.push('r');
+                    at += 1;
+                    continue;
+                }
+                // The closing quote, followed by as many `#` as opened it
+                let hashes = quote - at - 1;
+                let mut close = quote + 1;
+                while !(char_at(close).expect("an unclosed raw string literal") == '"'
+                    && (1..=hashes).all(|offset| char_at(close + offset) == Some('#')))
+                {
+                    close += 1;
+                }
+                let end = close + hashes + 1;
+                out.extend(&chars[at..end]);
+                at = end;
+            }
+            ('\'', Some('\\')) => {
+                // An escaped char literal: `'\''`, `'\\'` and longer escapes
+                let close = (at + 3..chars.len())
+                    .find(|&close| chars[close] == '\'')
+                    .expect("an unclosed char literal");
+                out.extend(&chars[at..=close]);
+                at = close + 1;
+            }
+            ('\'', Some(_)) if char_at(at + 2) == Some('\'') => {
+                // A plain char literal, `'"'` included
+                out.extend(&chars[at..at + 3]);
+                at += 3;
+            }
+            _ => {
+                // Everything else, a lifetime's `'` included
+                out.push(c);
+                at += 1;
+            }
+        }
+    }
+
+    out
+}
+
+/// `code` with every whitespace character removed, so a textual pin matches
+/// whatever line breaks and indentation rustfmt picks.
+pub fn without_whitespace(code: &str) -> String {
+    code.chars().filter(|c| !c.is_whitespace()).collect()
+}
+
+/// Where the whole statement `statement` stands in `code`, both without
+/// whitespace ([`without_whitespace`]). It must appear exactly once, and on
+/// its own: right after a `;`, `{` or `}`. So a pin on `call(..).await?;`
+/// fails for `let _ = call(..).await?;`, `let _ = call(..).await;` and
+/// `call(..).await;` alike.
+pub fn statement_at(code: &str, statement: &str) -> usize {
+    assert!(
+        !statement.chars().any(char::is_whitespace) && statement.ends_with(';'),
+        "`{}` is not a whitespace-free statement",
+        statement
+    );
+    assert_eq!(
+        code.matches(statement).count(),
+        1,
+        "`{statement}` must appear exactly once"
+    );
+    let at = code.find(statement).expect("counted above");
+    let statement_start = code[..at].rfind([';', '{', '}']).map_or(0, |end| end + 1);
+    assert!(
+        statement_start == at && at > 0,
+        "`{statement}` must be a statement of its own, not the value of `{}`",
+        &code[statement_start..at]
+    );
+    at
+}
+
+#[test]
+fn without_comments_drops_line_and_block_comments_only() {
+    let stripped = without_comments(concat!(
+        "keep(1);\n",
+        "    // gone(2);\n",
+        "/// gone(3);\n",
+        "keep(4); /* gone(5); */ keep(6);\n",
+        "/*\ngone(7);\n*/\n",
+        "keep(8); // gone(9);\n",
+        "keep(10).await?; // gone(11) trailing\n",
+        "/* outer /* gone(12); */ gone(13); */ keep(14);\n",
+        "//! gone(15);\n",
+    ));
+    assert!(!stripped.contains("gone("), "{}", stripped);
+    for kept in [1, 4, 6, 8, 10, 14] {
+        assert!(stripped.contains(&format!("keep({kept})")), "{}", stripped);
+    }
+    assert!(stripped.contains("keep(10).await?;"), "{}", stripped);
+
+    // `//` and `/*` inside literals are not comments
+    let literals = concat!(
+        "let url = \"http://127.0.0.1:1\"; keep(1);\n",
+        "let raw = r#\"a // \"quoted\" /* b\"#; keep(2);\n",
+        "let raw = r\"c // d\"; keep(3);\n",
+        "let bytes = b\"e // f\"; keep(4);\n",
+        "let escaped = \"g \\\" // h\"; keep(5);\n",
+        "let quote = '\"'; keep(6); // gone(1);\n",
+        "let tick = '\\''; keep(7);\n",
+        "fn f<'a>(x: &'a str) -> &'a str { x } // gone(2);\n",
+        "let r#type = 1; keep(8); // gone(3);\n",
+    );
+    let stripped = without_comments(literals);
+    assert!(!stripped.contains("gone("), "{}", stripped);
+    for kept in 1..=8 {
+        assert!(stripped.contains(&format!("keep({kept})")), "{}", stripped);
+    }
+    for literal in [
+        "\"http://127.0.0.1:1\"",
+        "r#\"a // \"quoted\" /* b\"#",
+        "r\"c // d\"",
+        "b\"e // f\"",
+        "\"g \\\" // h\"",
+        "fn f<'a>(x: &'a str) -> &'a str { x }",
+    ] {
+        assert!(
+            stripped.contains(literal),
+            "`{}` lost: {}",
+            literal,
+            stripped
+        );
+    }
+    assert_eq!(stripped.lines().count(), literals.lines().count());
+}
+
+#[test]
+fn statement_at_needs_the_whole_statement_on_its_own() {
+    let code = without_whitespace("a();\n    call(x, y).await?;\n}");
+    assert_eq!(statement_at(&code, "call(x,y).await?;"), 4);
+
+    for (label, code) in [
+        ("discarded", "a(); let _ = call(x, y).await?;"),
+        ("discarded, no `?`", "a(); let _ = call(x, y).await;"),
+        ("assigned", "a(); r = call(x, y).await?;"),
+        ("returned", "a(); return call(x, y).await?;"),
+        ("no `?`", "a(); call(x, y).await;"),
+        ("twice", "a(); call(x, y).await?; call(x, y).await?;"),
+    ] {
+        let code = without_whitespace(code);
+        let caught = std::panic::catch_unwind(|| statement_at(&code, "call(x,y).await?;"));
+        assert!(
+            caught.is_err(),
+            "{}: must not count as the statement",
+            label
+        );
+    }
+}

@@ -36,7 +36,7 @@ use revolt_database::{
     voice::{
         clear_voice_participant_identities, delete_channel_voice_state,
         delete_voice_participant_identity, delete_voice_state, get_channel_node,
-        get_user_voice_channels, UserVoiceChannel,
+        get_user_voice_channels, voice_session_key, UserVoiceChannel,
     },
     Database, AMQP,
 };
@@ -268,9 +268,11 @@ async fn sweep(
                 }
                 delete_voice_state(&entry, user_id).await?;
                 delete_voice_participant_identity(&entry.id, user_id).await?;
-                // Step 1 clears this for rostered channels; entries seen
-                // only here would otherwise leak it permanently.
-                conn.del::<_, ()>(format!("node:{}", entry.id))
+                // Step 1 clears these for rostered channels; entries seen
+                // only here would otherwise leak them permanently. The
+                // session records are the whole dead call's: no leave drops
+                // one user's record.
+                conn.del::<_, ()>(&[format!("node:{}", entry.id), voice_session_key(&entry.id)])
                     .await
                     .to_internal_error()?;
                 user_entries += 1;
@@ -353,6 +355,9 @@ async fn sweep(
             conn.del::<_, ()>(&[
                 format!("room_participants:{room}"),
                 format!("agent_dispatch:{room}"),
+                // Sloga's own per-call key, named after the same room: the
+                // move session records of a call that is gone.
+                voice_session_key(room),
             ])
             .await
             .to_internal_error()?;
@@ -453,4 +458,69 @@ async fn reconcile_channel(
         members.len()
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod test {
+    /// This file's shipping source, line comments cut and whitespace removed.
+    /// Each line is cut at its first `//`, in a string or not: that only ever
+    /// removes text, so a pin that requires code can fail on a `//` inside a
+    /// string but never pass on code that is commented out. Block comments
+    /// are not handled, so the test refuses to run with one in the source.
+    fn shipping() -> String {
+        let source = include_str!("reconcile.rs");
+        let shipping = &source[..source.find("#[cfg(test)]").expect("test module")];
+        let code = shipping
+            .lines()
+            .map(|line| line.split("//").next().unwrap_or_default())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !code.contains("/*"),
+            "a block comment in reconcile.rs: teach this stripper about it"
+        );
+        code.chars().filter(|c| !c.is_whitespace()).collect()
+    }
+
+    /// The one `.del::<_, ()>(&[ ... ])` delete list that holds `anchor`.
+    fn delete_list<'a>(code: &'a str, anchor: &str) -> &'a str {
+        assert_eq!(
+            code.matches(anchor).count(),
+            1,
+            "`{anchor}` must anchor exactly one delete list"
+        );
+        let at = code.find(anchor).expect("counted above");
+        let open = code[..at]
+            .rfind(".del::<_,()>(&[")
+            .expect("a delete list before the anchor");
+        assert!(
+            !code[open..at].contains("])"),
+            "`{anchor}` is not inside a delete list"
+        );
+        let close = at + code[at..].find("])").expect("the end of the delete list");
+        &code[open..close]
+    }
+
+    /// No leave drops a user's move session record, so a dead call's records
+    /// go with the call. The sweep has two places that clear a dead call's
+    /// per-channel keys by hand, and both must take `voice_session:{channel}`
+    /// with them (lane 6a3), or the hash leaks forever: no voice key has a
+    /// TTL. Step 1 goes through `delete_channel_voice_state`, which drops it
+    /// itself (pinned in the database crate).
+    #[test]
+    fn both_dead_call_delete_lists_drop_the_session_records() {
+        let code = shipping();
+
+        let stale_entry = delete_list(&code, "format!(\"node:{}\",entry.id)");
+        assert!(
+            stale_entry.contains("voice_session_key(&entry.id)"),
+            "step 2 (stale membership entries) must drop the session records: {stale_entry}"
+        );
+
+        let livekit_ghost = delete_list(&code, "format!(\"room_participants:{room}\")");
+        assert!(
+            livekit_ghost.contains("voice_session_key(room)"),
+            "step 4 (LiveKit's ghost rooms) must drop the session records: {livekit_ghost}"
+        );
+    }
 }

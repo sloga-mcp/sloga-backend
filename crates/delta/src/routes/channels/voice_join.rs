@@ -2,9 +2,10 @@ use revolt_config::config;
 use revolt_database::{
     util::{permissions::perms, reference::Reference},
     voice::{
-        assert_call_caps_admit, delete_voice_state, get_channel_node, get_user_voice_channels,
-        get_voice_channel_members, raise_if_in_voice, set_call_notification_recipients,
-        set_channel_node, UserVoiceChannel, VoiceClient,
+        assert_call_caps_admit, delete_voice_state, drop_voice_participant_session,
+        get_channel_node, get_user_voice_channels, get_voice_channel_members, raise_if_in_voice,
+        set_call_notification_recipients, set_channel_node, set_voice_participant_session,
+        UserVoiceChannel, VoiceClient,
     },
     Database, Session, User,
 };
@@ -141,6 +142,15 @@ pub async fn call(
         // should only ever loop once but just to cover our backs.
 
         for previous_channel in get_user_voice_channels(&user.id).await? {
+            // The kicked participant's session no longer owns anything here,
+            // and the record written below is for THIS channel only, which
+            // may not be this one. Dropped before the removal, so a move in
+            // flight out of this channel fails its re-check instead of
+            // handing the session this join kicks a token for the
+            // destination (lane 6a4). A kick is not a reconnect: the reason
+            // a leave keeps the record does not apply.
+            drop_voice_participant_session(&previous_channel.id, &user.id).await?;
+
             // Reconnect ends any remote-control grant (plan §1): this path
             // removes the participant and the fresh token below is minted
             // with `can_publish_data: false`, so a controller's capability
@@ -198,6 +208,12 @@ pub async fn call(
             set_call_notification_recipients(channel.id(), &user.id, &recipients).await?;
         }
     }
+
+    // This session now owns the user's participant in this channel, bare or
+    // device-qualified. A move event goes to it alone, so a session this join
+    // kicked above cannot be told to rejoin somewhere (media-e2ee final audit
+    // F1). Recorded last, once nothing else can refuse the join.
+    set_voice_participant_session(channel.id(), &user.id, &session.id).await?;
 
     Ok(Json(v0::CreateVoiceUserResponse {
         token,
@@ -747,5 +763,212 @@ mod test {
         )
         .await;
         assert_eq!(status, Status::Forbidden);
+    }
+
+    /// `join_call`'s shipping source, comments and whitespace stripped
+    /// (`crate::util::test::{without_comments, without_whitespace}`).
+    fn join_call_body() -> String {
+        use crate::util::test::{without_comments, without_whitespace};
+
+        let source = include_str!("voice_join.rs");
+        let shipping = without_whitespace(&without_comments(
+            &source[..source.find("#[cfg(test)]").expect("test module")],
+        ));
+        let start = shipping
+            .find("pubasyncfncall(")
+            .expect("join_call left voice_join.rs");
+        let end = start
+            + shipping[start..]
+                .find("pub(crate)fnresolve_join_node(")
+                .expect("the fn after join_call");
+        shipping[start..end].to_string()
+    }
+
+    /// Every join records its session as the participant's owner, which is
+    /// where a move event goes (media-e2ee final audit F1). A route test
+    /// cannot see it: without a live LiveKit, `create_room` fails first. So
+    /// the whole statement is pinned textually, comments stripped: made
+    /// exactly once, on its own with its `.await?`, with THIS request's
+    /// session, after the `force_disconnect` loop and `create_room` (a
+    /// refused join must not take the record over), before the response.
+    #[test]
+    fn join_call_records_the_joining_session_after_every_refusal() {
+        use crate::util::test::statement_at;
+
+        let body = join_call_body();
+        assert_eq!(
+            body.matches("set_voice_participant_session(").count(),
+            1,
+            "join_call records the session exactly once"
+        );
+        let recorded_at = statement_at(
+            &body,
+            "set_voice_participant_session(channel.id(),&user.id,&session.id).await?;",
+        );
+
+        for earlier in [
+            "forprevious_channelinget_user_voice_channels(",
+            "raise_if_in_voice(",
+            ".create_token(",
+            ".create_room(",
+        ] {
+            let at = body
+                .find(earlier)
+                .unwrap_or_else(|| panic!("`{}` left join_call", earlier));
+            assert!(
+                at < recorded_at,
+                "the session is recorded only after `{}`",
+                earlier
+            );
+        }
+
+        let response = body
+            .find("Ok(Json(v0::CreateVoiceUserResponse")
+            .expect("join_call's response");
+        assert!(
+            recorded_at < response,
+            "the session is recorded before the response"
+        );
+    }
+
+    /// The `force_disconnect` loop drops the kicked channel's session record
+    /// before it removes the participant there (lane 6a4), pinned as a whole
+    /// statement inside the loop. The route test below sees the record go
+    /// but cannot see the order: its removal fails either way.
+    #[test]
+    fn a_kick_drops_the_kicked_channels_record_before_the_removal() {
+        use crate::util::test::statement_at;
+
+        let body = join_call_body();
+        let loop_start = body
+            .find("forprevious_channelinget_user_voice_channels(&user.id).await?{")
+            .expect("the force_disconnect loop");
+        let loop_end = body
+            .find("}else{raise_if_in_voice(")
+            .expect("the end of the force_disconnect branch");
+        let kick = &body[loop_start..loop_end];
+
+        assert_eq!(
+            body.matches("drop_voice_participant_session(").count(),
+            1,
+            "join_call drops a record only in the kick loop"
+        );
+        let dropped = statement_at(
+            kick,
+            "drop_voice_participant_session(&previous_channel.id,&user.id).await?;",
+        );
+        for later in [".remove_user(", "delete_voice_state("] {
+            let at = kick
+                .find(later)
+                .unwrap_or_else(|| panic!("`{}` left the kick loop", later));
+            assert!(dropped < at, "the record is dropped before `{}`", later);
+        }
+    }
+
+    /// A move in flight out of channel A must not reach a session a join
+    /// into ANOTHER channel kicked (lane 6a4): the kick drops A's record, so
+    /// the move's re-check refuses it. The join gets through node resolution
+    /// (both channels pinned to a configured node) and runs the kick loop.
+    /// Whatever the SFU call after it does (with no LiveKit reachable it
+    /// fails), A's record is already gone.
+    #[test]
+    fn a_kick_from_a_join_elsewhere_drops_the_kicked_channels_record() {
+        crate::util::test::rt().block_on(a_kick_from_a_join_elsewhere_case())
+    }
+
+    async fn a_kick_from_a_join_elsewhere_case() {
+        use revolt_database::voice::{
+            delete_channel_node, get_user_voice_channels, get_voice_participant_session,
+            set_channel_node, set_voice_participant_session,
+        };
+
+        let harness = TestHarness::new().await;
+        let (_account, session_w, user) = harness.new_user().await;
+        let (_account_o, _session_o, other) = harness.new_user().await;
+
+        let kicked = voice_channel(&harness, &user, &[&other]).await;
+        let joined = voice_channel(&harness, &user, &[]).await;
+        let kicked_voice = UserVoiceChannel::from_channel(&kicked);
+        let joined_voice = UserVoiceChannel::from_channel(&joined);
+
+        let config = revolt_config::config().await;
+        let mut nodes: Vec<&String> = config
+            .hosts
+            .livekit
+            .keys()
+            .filter(|node| config.api.livekit.nodes.contains_key(*node))
+            .collect();
+        nodes.sort();
+        let node = nodes
+            .first()
+            .expect("a configured LiveKit node, as every join_call route test needs")
+            .to_string();
+
+        // The user's desktop session "DESKTOP" owns the participant in A,
+        // and another user's record there must survive the kick.
+        create_voice_state(&kicked_voice, &user.id, Timestamp::now_utc())
+            .await
+            .expect("voice state");
+        set_voice_participant_session(kicked.id(), &user.id, "DESKTOP")
+            .await
+            .expect("record");
+        set_voice_participant_session(kicked.id(), &other.id, "OTHER")
+            .await
+            .expect("record");
+        set_channel_node(kicked.id(), &node).await.expect("pin");
+        set_channel_node(joined.id(), &node).await.expect("pin");
+
+        // Session W joins X with force_disconnect.
+        let response = join_call(&harness, &session_w.token, joined.id(), true).await;
+        let status = response.status();
+        let body = response.into_string().await.unwrap_or_default();
+        assert!(
+            !body.contains("UnknownNode"),
+            "the join must get past node resolution to the kick loop: {} {}",
+            status,
+            body
+        );
+
+        assert!(
+            !get_user_voice_channels(&user.id)
+                .await
+                .unwrap()
+                .iter()
+                .any(|channel| channel.id == kicked_voice.id),
+            "the kick loop ran: the voice state in A is gone ({} {})",
+            status,
+            body
+        );
+        assert_eq!(
+            get_voice_participant_session(kicked.id(), &user.id)
+                .await
+                .unwrap(),
+            None,
+            "the kick must drop A's record, or a move out of A still reaches DESKTOP"
+        );
+        assert_eq!(
+            get_voice_participant_session(kicked.id(), &other.id)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("OTHER"),
+            "only the kicked user's record goes"
+        );
+        if !status.class().is_success() {
+            assert_eq!(
+                get_voice_participant_session(joined.id(), &user.id)
+                    .await
+                    .unwrap(),
+                None,
+                "a refused join records nothing in X"
+            );
+        }
+
+        for (channel, voice) in [(&kicked, &kicked_voice), (&joined, &joined_voice)] {
+            delete_channel_node(channel.id()).await.expect("unpin");
+            delete_channel_voice_state(voice, &[user.id.clone()])
+                .await
+                .expect("cleanup");
+        }
     }
 }

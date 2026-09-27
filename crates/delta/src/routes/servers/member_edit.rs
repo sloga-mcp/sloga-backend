@@ -8,10 +8,11 @@ use revolt_database::{
         reference::Reference,
     },
     voice::{
-        assert_call_caps_admit, get_channel_node, get_user_voice_channel_in_server,
-        get_voice_channel_members, get_voice_participant_identity, set_channel_node,
+        assert_call_caps_admit, carry_voice_participant_session, get_channel_node,
+        get_user_voice_channel_in_server, get_voice_channel_members,
+        get_voice_participant_identity, get_voice_participant_session, set_channel_node,
         set_user_moved_from_voice, set_user_moved_to_voice, sync_user_voice_permissions,
-        UserVoiceChannel, VoiceClient,
+        voice_participant_session_is, UserVoiceChannel, VoiceClient,
     },
     Database, E2EEIdentity, File, PartialMember, Session, User,
 };
@@ -53,66 +54,72 @@ fn qualified_move_device<'a>(
 }
 
 /// Where a move's `UserMoveVoiceChannel` event goes, and whether it carries a
-/// token.
+/// token. Every delivery reaches ONE session at most: the one that owns the
+/// target's participant in the source channel. Never every session of the
+/// user.
 #[derive(Debug, PartialEq, Eq)]
 enum MoveDelivery {
-    /// Mint the token for `device_id` and publish only to `session_id`, the
-    /// session bound to that device.
+    /// Publish only to `session_id` with a token for `device_id`, or for the
+    /// bare identity when `None`. Only that session could have got the same
+    /// token from `join_call`.
     Session {
         session_id: String,
-        device_id: String,
+        device_id: Option<String>,
     },
-    /// Mint the bare-identity token and publish to every session of the user.
-    /// Any session of the user could get the same token from `join_call`.
-    User,
-    /// Mint nothing and publish without a token to every session of the user.
-    /// The client falls back to `join_call`, which enforces device binding.
-    UserNoToken,
-}
-
-/// The topic a move's `UserMoveVoiceChannel` event is published on.
-#[derive(Debug, PartialEq, Eq)]
-enum MoveTopic<'a> {
-    /// One session only (`EventV1::private_session`).
-    Session(&'a str),
-    /// Every session of the target (`EventV1::private`).
-    User,
+    /// Publish only to `session_id`, with no token. The client falls back to
+    /// `join_call`, which enforces device binding.
+    SessionNoToken { session_id: String },
+    /// Publish nothing: no session is known to own the participant (a join
+    /// from before the record existed). The move is done as a disconnect:
+    /// the target is taken out of the source and nothing else happens.
+    Nobody,
 }
 
 /// What the move route does with a [`MoveDelivery`]: the token it mints and
-/// the topic it publishes on. The route branches on nothing else.
+/// the session it publishes to. The route branches on nothing else.
 #[derive(Debug, PartialEq, Eq)]
 struct MoveTokenPlan<'a> {
     /// `None`: mint no token. `Some(None)`: mint the bare-identity token.
     /// `Some(Some(device))`: mint the token for `user:device`.
     mint: Option<Option<&'a str>>,
-    topic: MoveTopic<'a>,
+    /// The one session the event is published to, on its
+    /// `session_topic` (`EventV1::private_session`, the route's only
+    /// publish). `None`: publish nothing, and disconnect instead of moving.
+    session: Option<&'a str>,
 }
 
-/// Plan the token and topic of a move. A device-qualified token is minted
-/// only when the event goes to that device's bound session alone; every
-/// user-wide delivery carries a bare token or none.
+/// Plan the token and topic of a move. A token is minted only for a delivery
+/// that reaches exactly one session, and a device-qualified one only for the
+/// device that session is bound to.
 fn move_token_plan(delivery: &MoveDelivery) -> MoveTokenPlan<'_> {
     match delivery {
         MoveDelivery::Session {
             session_id,
             device_id,
         } => MoveTokenPlan {
-            mint: Some(Some(device_id.as_str())),
-            topic: MoveTopic::Session(session_id.as_str()),
+            mint: Some(device_id.as_deref()),
+            session: Some(session_id.as_str()),
         },
-        MoveDelivery::User => MoveTokenPlan {
-            mint: Some(None),
-            topic: MoveTopic::User,
-        },
-        MoveDelivery::UserNoToken => MoveTokenPlan {
+        MoveDelivery::SessionNoToken { session_id } => MoveTokenPlan {
             mint: None,
-            topic: MoveTopic::User,
+            session: Some(session_id.as_str()),
+        },
+        MoveDelivery::Nobody => MoveTokenPlan {
+            mint: None,
+            session: None,
         },
     }
 }
 
 /// Decide the delivery of a move's event.
+///
+/// `recorded_session` is the session that owns the target's participant in
+/// the SOURCE channel (`get_voice_participant_session`): the one whose
+/// `join_call` put it there, or that a previous move carried there. It is the
+/// only possible recipient. Without it the owner is unknown and nobody gets
+/// the event: sent to every session, it would reach a session the owner just
+/// kicked with `force_disconnect`, which then rejoins the destination and
+/// kicks the owner (media-e2ee final audit F1).
 ///
 /// `device` is the result of [`qualified_move_device`]. `bound_session` is the
 /// `last_session_id` of the target's E2EE identity row for that device, or
@@ -120,21 +127,63 @@ fn move_token_plan(delivery: &MoveDelivery) -> MoveTokenPlan<'_> {
 /// (`E2EEIdentity::revoke_device`), so a revoked device arrives here as `None`.
 ///
 /// A device-qualified token lets its holder act as that device on the SFU, so
-/// it goes only to the session `assert_bound_session` would accept for the
-/// device. Sent to every session of the user, a stolen web session would get
-/// a token `join_call` refuses it.
+/// it is minted only when the recorded session IS the session
+/// `assert_bound_session` accepts for the device. When they disagree (no row,
+/// a revoked device, a device re-bound to another session since the join),
+/// the recorded session gets the event without a token: its client then
+/// calls `join_call`, which checks the binding itself. A bare identity needs
+/// no binding, so the recorded session gets a bare token.
 ///
-/// An empty device suffix or session id fails closed to `UserNoToken`.
-fn move_event_delivery(device: Option<&str>, bound_session: Option<&str>) -> MoveDelivery {
-    match (device, bound_session) {
-        (None, _) => MoveDelivery::User,
-        (Some(device_id), Some(session_id)) if !device_id.is_empty() && !session_id.is_empty() => {
+/// An empty session id or device suffix fails closed.
+fn move_event_delivery(
+    recorded_session: Option<&str>,
+    device: Option<&str>,
+    bound_session: Option<&str>,
+) -> MoveDelivery {
+    let Some(session_id) = recorded_session.filter(|session_id| !session_id.is_empty()) else {
+        return MoveDelivery::Nobody;
+    };
+
+    match device {
+        None => MoveDelivery::Session {
+            session_id: session_id.to_string(),
+            device_id: None,
+        },
+        Some(device_id) if !device_id.is_empty() && bound_session == Some(session_id) => {
             MoveDelivery::Session {
                 session_id: session_id.to_string(),
-                device_id: device_id.to_string(),
+                device_id: Some(device_id.to_string()),
             }
         }
-        (Some(_), _) => MoveDelivery::UserNoToken,
+        Some(_) => MoveDelivery::SessionNoToken {
+            session_id: session_id.to_string(),
+        },
+    }
+}
+
+/// Whether a SELF-move may go ahead: only when the request comes from
+/// `recorded_session`, the session that owns the user's participant in the
+/// source channel (`get_voice_participant_session`).
+///
+/// The move event goes to that session alone ([`move_event_delivery`]), which
+/// obeys it. Any other session of the same user asking would steer the
+/// owning session into a channel it never chose: a stolen web session moving
+/// the victim's desktop. The device binding (`assert_bound_session`) only
+/// covers a device-qualified participant; this covers a bare one too.
+///
+/// `request_session` is the id of the calling session, or `None` when there
+/// is none (a bot) or it belongs to someone else. With no recorded session
+/// the owner is unknown and the move is refused, bare or device-qualified:
+/// its event would reach nobody ([`MoveDelivery::Nobody`]), so all it could
+/// do is kick the caller's own participant. The caller stays in the call and
+/// can rejoin, which records the session again. An empty id matches nothing.
+fn self_move_from_owning_session(
+    recorded_session: Option<&str>,
+    request_session: Option<&str>,
+) -> bool {
+    match (recorded_session, request_session) {
+        (Some(recorded), Some(request)) => !recorded.is_empty() && recorded == request,
+        _ => false,
     }
 }
 
@@ -150,6 +199,106 @@ async fn fetch_device_identity(
         Err(error) if matches!(error.error_type, ErrorType::NotFound) => Ok(None),
         Err(error) => Err(error),
     }
+}
+
+/// What a move knows about the target's participant in the SOURCE channel.
+struct SourceParticipant {
+    /// The device suffix of its LiveKit identity, when the move takes the
+    /// device-qualified path ([`qualified_move_device`]).
+    device_id: Option<String>,
+    /// The target's E2EE identity row for that device, if registered.
+    identity_row: Option<E2EEIdentity>,
+    /// The session that owns the participant (`join_call`'s record).
+    recorded_session: Option<String>,
+}
+
+impl SourceParticipant {
+    /// Read everything from the source channel's records: the
+    /// ingress-maintained identity mapping (the server itself never knows
+    /// which device is in a call) and the session record `join_call` wrote.
+    async fn resolve(db: &Database, source_id: &str, user_id: &str) -> Result<Self> {
+        let identity = get_voice_participant_identity(source_id, user_id).await?;
+        let media_e2ee_enabled = crate::routes::mls::require_media_e2ee_enabled()
+            .await
+            .is_ok();
+        let device_id =
+            qualified_move_device(&identity, user_id, media_e2ee_enabled).map(str::to_string);
+
+        let identity_row = match &device_id {
+            Some(device_id) => fetch_device_identity(db, user_id, device_id).await?,
+            None => None,
+        };
+
+        let recorded_session = get_voice_participant_session(source_id, user_id).await?;
+
+        Ok(SourceParticipant {
+            device_id,
+            identity_row,
+            recorded_session,
+        })
+    }
+
+    fn delivery(&self) -> MoveDelivery {
+        move_event_delivery(
+            self.recorded_session.as_deref(),
+            self.device_id.as_deref(),
+            self.identity_row
+                .as_ref()
+                .map(|identity| identity.last_session_id.as_str()),
+        )
+    }
+}
+
+/// Take the target's participant out of the move's source channel: the last
+/// step before a move is announced, or the whole of a move nobody can be
+/// told about ([`MoveDelivery::Nobody`]).
+///
+/// Refused `NotConnected` when the source's session record no longer names
+/// `expected_session`, the owner the move was planned for (`None`: no
+/// owner). This re-check catches a join from another session into the SAME
+/// channel since the move read the record: the participant this would remove
+/// is that session's, and the planned owner, which that join kicked, would be
+/// told to rejoin elsewhere with a token of its own. A join into ANOTHER
+/// channel that kicks the planned owner records nothing here; it is covered
+/// by `join_call`'s kick loop, which drops this channel's record before its
+/// removal (`drop_voice_participant_session`), so this re-check fails for it
+/// too. Checked right before the removal: what is left of the window is the
+/// remote-control release and the removal call, far shorter than a join's
+/// round trip to the SFU.
+///
+/// A failed removal fails the move (`?` here and at both call sites): the
+/// move event, and any token in it, goes out only once the participant is out
+/// of the source.
+async fn take_participant_out_of_source(
+    db: &Database,
+    voice_client: &VoiceClient,
+    source: &UserVoiceChannel,
+    node: &str,
+    user_id: &str,
+    expected_session: Option<&str>,
+) -> Result<()> {
+    if !voice_participant_session_is(&source.id, user_id, expected_session).await? {
+        return Err(create_error!(NotConnected));
+    }
+
+    // Remote-control release hook (plan §1: the moderator voice-move calls
+    // `remove_user` directly, bypassing `remove_user_from_voice_channel`, and
+    // additionally re-tokens the target into a DIFFERENT room while any grant
+    // stays keyed to the old channel — so it must release explicitly here).
+    revolt_database::voice::remote_control::release_remote_control_for_user(
+        db,
+        voice_client,
+        source,
+        user_id,
+        "revoked_by_moderator",
+        // The participant is still in the old room right now — the removal
+        // happens below and can fail, so revoke actively.
+        false,
+    )
+    .await;
+
+    voice_client.remove_user(node, user_id, &source.id).await?;
+    Ok(())
 }
 
 /// Refuse a move or disconnect when the target's voice channel changed after
@@ -211,8 +360,7 @@ pub async fn edit(
     voice_client: &State<VoiceClient>,
     user: User,
     // Optional because bots authenticate with `x-bot-token` and have no
-    // session; every edit that does not self-move a device-qualified
-    // participant ignores it.
+    // session; every edit that is not a self-move ignores it.
     session: Option<Session>,
     server_id: Reference<'_>,
     member_id: Reference<'_>,
@@ -390,7 +538,16 @@ pub async fn edit(
         }
     }
 
-    let new_voice_channel = if let Some(new_channel) = &data.voice_channel {
+    // A move into the channel the target is already in changes nothing, so it
+    // succeeds and does nothing: no kick, no event, no marker (user ruling
+    // 2026-09-26, the AFK branch's `AlreadyPresent`; the FE never offers it).
+    // Someone else's move has already passed MoveMembers on that channel
+    // above. The rest of the edit still applies.
+    let already_there = data.voice_channel.is_some()
+        && data.voice_channel.as_deref() == source_voice_channel.as_deref();
+    let requested_voice_channel = data.voice_channel.as_ref().filter(|_| !already_there);
+
+    let new_voice_channel = if let Some(new_channel) = requested_voice_channel {
         // ensure the channel we are moving them to is in the server and is a voice channel
 
         let channel = Reference::from_unchecked(new_channel)
@@ -415,12 +572,8 @@ pub async fn edit(
                 .throw_if_lacking_channel_permission(ChannelPermission::MoveMembers)?;
         }
 
-        let Some(source_id) = &source_voice_channel else {
+        if source_voice_channel.is_none() {
             return Err(create_error!(NotConnected));
-        };
-
-        if source_id == channel.id() {
-            return Err(create_error!(InvalidOperation));
         }
 
         let user_voice_channel = UserVoiceChannel::from_channel(&channel);
@@ -511,7 +664,7 @@ pub async fn edit(
     };
 
     // Every voice check above (MoveMembers on the source, the same-channel
-    // refusal) was made against `source_voice_channel`. Re-read it here, before
+    // no-op) was made against `source_voice_channel`. Re-read it here, before
     // the first side effect, and refuse if the target has since left or hopped
     // channels: acting on the channel they are in NOW would move or kick them
     // out of a channel nobody checked. The actions below then use the checked
@@ -542,24 +695,12 @@ pub async fn edit(
         None
     };
 
-    // Which LiveKit identity the move may mint a token for, and who receives
-    // it. Resolved before the first side effect, so the refusals below leave
-    // the member untouched. The target's device suffix comes from the source
-    // channel's ingress-maintained identity mapping (the server itself never
-    // knows which device is in a call).
+    // Which LiveKit identity the move may mint a token for, and which one
+    // session receives it. Resolved before the first side effect, so the
+    // refusals below leave the member untouched.
     let move_delivery = match (&new_voice_channel, &source_voice_channel) {
-        (Some(_), Some(source_id)) => {
-            let identity = get_voice_participant_identity(source_id, &target_user.id).await?;
-            let media_e2ee_enabled = crate::routes::mls::require_media_e2ee_enabled()
-                .await
-                .is_ok();
-            let device_id = qualified_move_device(&identity, &target_user.id, media_e2ee_enabled)
-                .map(str::to_string);
-
-            let identity_row = match &device_id {
-                Some(device_id) => fetch_device_identity(db, &target_user.id, device_id).await?,
-                None => None,
-            };
+        (Some(new_voice_channel), Some(source_id)) => {
+            let participant = SourceParticipant::resolve(db, source_id, &target_user.id).await?;
 
             // Moving yourself is a join. For a device-qualified participant
             // it must come from the session bound to that device, as
@@ -567,13 +708,14 @@ pub async fn edit(
             // a stolen web session could move its victim and act as the
             // victim's device. The errors are the ones `join_call` returns.
             // A bot has no session, and cannot hold a device identity.
-            if member.id.user == user.id && device_id.is_some() {
+            if member.id.user == user.id && participant.device_id.is_some() {
                 let session = session
                     .as_ref()
                     .filter(|session| session.user_id == user.id)
                     .ok_or_else(|| create_error!(NotAuthenticated))?;
 
-                identity_row
+                participant
+                    .identity_row
                     .as_ref()
                     .ok_or_else(|| {
                         create_error!(FailedValidation {
@@ -583,12 +725,52 @@ pub async fn edit(
                     .assert_bound_session(&session.id)?;
             }
 
-            let delivery = move_event_delivery(
-                device_id.as_deref(),
-                identity_row
+            // Moving yourself also has to come from the session that owns
+            // the participant, bare or device-qualified: the move event goes
+            // to that session and it obeys, so another session of the same
+            // user could otherwise steer it (a stolen web session moving the
+            // victim's desktop). Same error as an unbound session above. A
+            // bot has no session, so it is refused too. A moderator's move is
+            // not a join by the target and is not checked here. A
+            // self-DISCONNECT is not checked either: it mints nothing and
+            // steers nothing, and `join_call`'s `force_disconnect` already
+            // lets any session end the call (media-e2ee final audit ruling).
+            if member.id.user == user.id {
+                let request_session = session
                     .as_ref()
-                    .map(|identity| identity.last_session_id.as_str()),
-            );
+                    .filter(|session| session.user_id == user.id)
+                    .map(|session| session.id.as_str());
+
+                if !self_move_from_owning_session(
+                    participant.recorded_session.as_deref(),
+                    request_session,
+                ) {
+                    return Err(create_error!(NotAuthenticated));
+                }
+            }
+
+            let delivery = participant.delivery();
+
+            // The session that is moving owns the participant in the
+            // destination too: the moved client may join with the token
+            // minted below and never call `join_call`, and the NEXT move of
+            // this participant reads the destination's record. Written after
+            // every refusal and before any side effect, and only while the
+            // source still names the session read above. A join from another
+            // session since then has kicked that one, and the destination must
+            // not be handed to it. Refused like a source that has gone.
+            if let Some(session_id) = move_token_plan(&delivery).session {
+                if !carry_voice_participant_session(
+                    source_id,
+                    new_voice_channel.id(),
+                    &target_user.id,
+                    session_id,
+                )
+                .await?
+                {
+                    return Err(create_error!(NotConnected));
+                }
+            }
 
             Some(delivery)
         }
@@ -620,91 +802,106 @@ pub async fn edit(
             source_node.clone(),
             move_delivery,
         ) {
-            let new_node = match get_channel_node(new_voice_channel.id()).await? {
-                Some(node) => node,
-                None => {
-                    set_channel_node(new_voice_channel.id(), &old_node).await?;
-                    old_node.clone()
-                }
-            };
-
             let new_user_voice_channel = UserVoiceChannel::from_channel(&new_voice_channel);
             let old_user_voice_channel = UserVoiceChannel {
                 id: channel.clone(),
                 server_id: new_user_voice_channel.server_id.clone(),
             };
 
-            set_user_moved_from_voice(&channel, &new_user_voice_channel, &target_user.id).await?;
-            set_user_moved_to_voice(
-                new_voice_channel.id(),
-                &old_user_voice_channel,
-                &target_user.id,
-            )
-            .await?;
-
-            let mut query = perms(db, &target_user).channel(&new_voice_channel);
-            let permissions = calculate_channel_permissions(&mut query).await;
-
-            voice_client
-                .create_room(&new_node, &new_voice_channel)
-                .await?;
-
-            // Preserve a device-qualified identity across the move, but only
-            // for a delivery that reaches that device's bound session alone.
-            // The mint and the topic below come from the plan and nothing else.
+            // The mint and the recipient below come from the plan and nothing
+            // else.
             let plan = move_token_plan(&delivery);
-            let token = match plan.mint {
-                None => None,
-                Some(token_device) => Some(
+
+            match plan.session {
+                Some(session_id) => {
+                    let new_node = match get_channel_node(new_voice_channel.id()).await? {
+                        Some(node) => node,
+                        None => {
+                            set_channel_node(new_voice_channel.id(), &old_node).await?;
+                            old_node.clone()
+                        }
+                    };
+
+                    set_user_moved_from_voice(&channel, &new_user_voice_channel, &target_user.id)
+                        .await?;
+                    set_user_moved_to_voice(
+                        new_voice_channel.id(),
+                        &old_user_voice_channel,
+                        &target_user.id,
+                    )
+                    .await?;
+
+                    let mut query = perms(db, &target_user).channel(&new_voice_channel);
+                    let permissions = calculate_channel_permissions(&mut query).await;
+
                     voice_client
-                        .create_token(
-                            &new_node,
-                            db,
-                            &target_user,
-                            permissions,
-                            &new_voice_channel,
-                            token_device,
-                        )
-                        .await?,
-                ),
-            };
+                        .create_room(&new_node, &new_voice_channel)
+                        .await?;
 
-            // Remote-control release hook (plan §1: the moderator voice-move
-            // calls `remove_user` directly, bypassing
-            // `remove_user_from_voice_channel`, and additionally re-tokens
-            // the target into a DIFFERENT room while any grant stays keyed
-            // to the old channel — so it must release explicitly here).
-            revolt_database::voice::remote_control::release_remote_control_for_user(
-                db,
-                voice_client,
-                &old_user_voice_channel,
-                &target_user.id,
-                "revoked_by_moderator",
-                // The participant is still in the old room right now — the
-                // removal happens below and can fail, so revoke actively.
-                false,
-            )
-            .await;
+                    // Preserve a device-qualified identity across the move,
+                    // but only for a delivery that reaches that device's
+                    // bound session alone.
+                    let token = match plan.mint {
+                        None => None,
+                        Some(token_device) => Some(
+                            voice_client
+                                .create_token(
+                                    &new_node,
+                                    db,
+                                    &target_user,
+                                    permissions,
+                                    &new_voice_channel,
+                                    token_device,
+                                )
+                                .await?,
+                        ),
+                    };
 
-            voice_client
-                .remove_user(&old_node, &target_user.id, &channel)
-                .await?;
+                    take_participant_out_of_source(
+                        db,
+                        voice_client,
+                        &old_user_voice_channel,
+                        &old_node,
+                        &target_user.id,
+                        Some(session_id),
+                    )
+                    .await?;
 
-            let url = move_event_url(&revolt_config::config().await, &new_node);
+                    let url = move_event_url(&revolt_config::config().await, &new_node);
 
-            let event = EventV1::UserMoveVoiceChannel {
-                node: new_node,
-                from: channel,
-                to: new_voice_channel.id().to_string(),
-                token,
-                url,
-            };
-
-            match plan.topic {
-                MoveTopic::Session(session_id) => {
-                    event.private_session(session_id.to_string()).await
+                    EventV1::UserMoveVoiceChannel {
+                        node: new_node,
+                        from: channel,
+                        to: new_voice_channel.id().to_string(),
+                        token,
+                        url,
+                    }
+                    .private_session(session_id.to_string())
+                    .await;
                 }
-                MoveTopic::User => event.private(target_user.id.clone()).await,
+                // No session is known to own the participant (a join from
+                // before the record existed), so no session can be told to
+                // rejoin and the move could only ever be a kick. It is done as
+                // the disconnect it amounts to: no destination room, node pin
+                // or move markers for a join that will never come. Only a
+                // moderator gets here; a self-move with no owner is refused.
+                None => {
+                    log::warn!(
+                        "voice move of {} from {channel} to {}: no session owns the participant, disconnecting instead",
+                        target_user.id,
+                        new_voice_channel.id()
+                    );
+
+                    take_participant_out_of_source(
+                        db,
+                        voice_client,
+                        &old_user_voice_channel,
+                        &old_node,
+                        &target_user.id,
+                        None,
+                    )
+                    .await?;
+                }
             }
         };
     } else if affects_voice_permissions && !remove.contains(&FieldsMember::VoiceChannel) {
@@ -1053,6 +1250,9 @@ mod test {
         mod_role: Role,
         target: User,
         target_token: String,
+        /// The session `target_token` belongs to, recorded as the owner of
+        /// the target's participant in `source`.
+        target_session: String,
         source: Channel,
         dest: Channel,
         source_uvc: UserVoiceChannel,
@@ -1063,7 +1263,34 @@ mod test {
             delete_channel_voice_state(&self.source_uvc, &[self.target.id.clone()])
                 .await
                 .expect("cleanup source");
+            // A move that got as far as the carry-over or the node pin left
+            // those on the destination.
+            delete_channel_voice_state(&UserVoiceChannel::from_channel(&self.dest), &[])
+                .await
+                .expect("cleanup dest");
         }
+    }
+
+    /// Drop the target's session record in `channel`, as for a participant
+    /// that joined before the record existed. No route does this.
+    async fn forget_session_record(channel: &Channel, user_id: &str) {
+        use redis_kiss::AsyncCommands;
+        use revolt_database::voice::voice_session_key;
+
+        let _: () = redis_kiss::get_connection()
+            .await
+            .expect("redis")
+            .hdel(voice_session_key(channel.id()), user_id)
+            .await
+            .expect("drop record");
+    }
+
+    /// The session recorded as the owner of `user_id`'s participant in
+    /// `channel`.
+    async fn recorded_session(channel: &Channel, user_id: &str) -> Option<String> {
+        revolt_database::voice::get_voice_participant_session(channel.id(), user_id)
+            .await
+            .expect("session record read")
     }
 
     /// A role with explicit rank and permissions. `Role::create` derives the
@@ -1158,8 +1385,11 @@ mod test {
 
     /// Owner, a moderator holding a rank-1 role (granting MoveMembers
     /// server-wide when `server_move_members`), and a plain member connected
-    /// in `source`.
+    /// in `source` from the session `target_token` belongs to, which
+    /// `join_call` records as the owner of their participant there.
     async fn move_fixture(server_move_members: bool) -> MoveFixture {
+        use revolt_database::voice::set_voice_participant_session;
+
         let harness = TestHarness::new().await;
         let (_a, _session_a, owner) = harness.new_user().await;
         let (_m, session_m, moderator) = harness.new_user().await;
@@ -1190,6 +1420,9 @@ mod test {
         set_channel_node(source.id(), ABSENT_NODE)
             .await
             .expect("node");
+        set_voice_participant_session(source.id(), &target.id, &session_t.id)
+            .await
+            .expect("session record");
 
         MoveFixture {
             harness,
@@ -1199,6 +1432,7 @@ mod test {
             mod_role,
             target,
             target_token: session_t.token,
+            target_session: session_t.id,
             source,
             dest,
             source_uvc,
@@ -1434,28 +1668,51 @@ mod test {
     }
 
     #[test]
-    fn move_into_the_current_channel_is_refused() {
-        crate::util::test::rt().block_on(move_into_the_current_channel_is_refused_case())
+    fn move_into_the_current_channel_is_a_no_op() {
+        crate::util::test::rt().block_on(move_into_the_current_channel_is_a_no_op_case())
     }
 
-    async fn move_into_the_current_channel_is_refused_case() {
+    /// User ruling 2026-09-26: a move into the channel the target is already
+    /// in succeeds and does nothing. The fixture's source node is absent, so
+    /// any kick, room or token would have failed `UnknownNode`: a 200 means
+    /// none was attempted.
+    async fn move_into_the_current_channel_is_a_no_op_case() {
         let f = move_fixture(true).await;
 
-        let response = move_member(
-            &f.harness,
-            &f.mod_token,
-            &f.server.id,
-            &f.target.id,
-            f.source.id(),
-        )
-        .await;
-        let (status, error) = error_of(response).await;
-        assert_eq!(status, Status::BadRequest);
-        assert!(
-            matches!(error, revolt_result::ErrorType::InvalidOperation),
-            "{:?}",
-            error
-        );
+        for (token, who) in [
+            (&f.mod_token, "a moderator"),
+            (&f.target_token, "the target"),
+        ] {
+            let response =
+                move_member(&f.harness, token, &f.server.id, &f.target.id, f.source.id()).await;
+            assert_eq!(
+                response.status(),
+                Status::Ok,
+                "{who}: a move into the current channel is a no-op, got {:?}",
+                response.into_string().await
+            );
+
+            assert!(
+                get_voice_state(&f.source_uvc, &f.target.id)
+                    .await
+                    .expect("voice state read")
+                    .is_some(),
+                "{}: the target is still connected in the source",
+                who
+            );
+            assert_eq!(
+                get_user_moved_from_voice(f.source.id(), &f.target.id)
+                    .await
+                    .expect("moved_from read"),
+                None,
+                "{who}: no move marker"
+            );
+            assert_eq!(
+                recorded_session(&f.source, &f.target.id).await,
+                Some(f.target_session.clone()),
+                "{who}: the session record is untouched"
+            );
+        }
 
         f.cleanup().await;
     }
@@ -1885,55 +2142,99 @@ mod test {
     fn a_device_qualified_move_token_goes_to_the_bound_session_only() {
         use super::{move_event_delivery, MoveDelivery};
 
+        let session = |session_id: &str, device_id: Option<&str>| MoveDelivery::Session {
+            session_id: session_id.to_string(),
+            device_id: device_id.map(str::to_string),
+        };
+        let no_token = |session_id: &str| MoveDelivery::SessionNoToken {
+            session_id: session_id.to_string(),
+        };
+
         assert_eq!(
-            move_event_delivery(Some("dev"), Some("bound")),
-            MoveDelivery::Session {
-                session_id: "bound".to_string(),
-                device_id: "dev".to_string()
-            },
-            "qualified + bound: only the bound session gets the token"
+            move_event_delivery(Some("bound"), Some("dev"), Some("bound")),
+            session("bound", Some("dev")),
+            "qualified, recorded session = bound session: only it gets the token"
         );
         assert_eq!(
-            move_event_delivery(Some(""), Some("bound")),
-            MoveDelivery::UserNoToken,
+            move_event_delivery(Some("web"), Some("dev"), Some("bound")),
+            no_token("web"),
+            "qualified, recorded session != bound session: the recorded one, no token"
+        );
+        assert_eq!(
+            move_event_delivery(Some("bound"), Some(""), Some("bound")),
+            no_token("bound"),
             "empty device suffix with a bound session: fails closed"
         );
         assert_eq!(
-            move_event_delivery(Some("dev"), None),
-            MoveDelivery::UserNoToken,
+            move_event_delivery(Some("bound"), Some("dev"), None),
+            no_token("bound"),
             "qualified + no identity row (never registered, or revoked): no token"
         );
         assert_eq!(
-            move_event_delivery(Some("dev"), Some("")),
-            MoveDelivery::UserNoToken,
+            move_event_delivery(Some("bound"), Some("dev"), Some("")),
+            no_token("bound"),
             "qualified + no bound session: no token"
         );
         assert_eq!(
-            move_event_delivery(Some(""), None),
-            MoveDelivery::UserNoToken,
+            move_event_delivery(Some("bound"), Some(""), None),
+            no_token("bound"),
             "empty device suffix: fails closed"
-        );
-        assert_eq!(
-            move_event_delivery(None, None),
-            MoveDelivery::User,
-            "bare identity: bare token to every session"
-        );
-        assert_eq!(
-            move_event_delivery(None, Some("bound")),
-            MoveDelivery::User,
-            "bare identity ignores any row"
         );
     }
 
+    /// Media-e2ee final audit F1: two BARE sessions of one user. Only the
+    /// session that owns the participant is told to move; the one it kicked
+    /// never hears about it.
+    #[test]
+    fn a_move_reaches_only_the_session_that_owns_the_participant() {
+        use super::{move_event_delivery, MoveDelivery};
+
+        assert_eq!(
+            move_event_delivery(Some("web"), None, None),
+            MoveDelivery::Session {
+                session_id: "web".to_string(),
+                device_id: None,
+            },
+            "bare identity: a bare token to the recorded session only"
+        );
+        assert_eq!(
+            move_event_delivery(Some("web"), None, Some("desktop")),
+            MoveDelivery::Session {
+                session_id: "web".to_string(),
+                device_id: None,
+            },
+            "bare identity: an identity row of another device changes nothing"
+        );
+
+        for (device, bound) in [
+            (None, None),
+            (None, Some("desktop")),
+            (Some("dev"), Some("desktop")),
+            (Some("dev"), None),
+            (Some(""), None),
+        ] {
+            assert_eq!(
+                move_event_delivery(None, device, bound),
+                MoveDelivery::Nobody,
+                "no recorded session ({device:?}, {bound:?}): nobody is told to move"
+            );
+            assert_eq!(
+                move_event_delivery(Some(""), device, bound),
+                MoveDelivery::Nobody,
+                "an empty recorded session ({device:?}, {bound:?}): nobody"
+            );
+        }
+    }
+
     /// The route mints and publishes from this plan alone, so these pin
-    /// which device a move token is minted for and which topic carries it.
+    /// which device a move token is minted for and which session gets it.
     #[test]
     fn a_move_token_plan_pins_the_minted_device_and_the_topic() {
-        use super::{move_token_plan, MoveDelivery, MoveTokenPlan, MoveTopic};
+        use super::{move_token_plan, MoveDelivery, MoveTokenPlan};
 
         let session = MoveDelivery::Session {
             session_id: "bound".to_string(),
-            device_id: "dev".to_string(),
+            device_id: Some("dev".to_string()),
         };
         let plan = move_token_plan(&session);
         assert_eq!(
@@ -1942,33 +2243,278 @@ mod test {
             "session delivery: the token is minted for the device"
         );
         assert_eq!(
-            plan.topic,
-            MoveTopic::Session("bound"),
+            plan.session,
+            Some("bound"),
             "session delivery: published to the bound session only"
         );
         assert_eq!(
             plan,
             MoveTokenPlan {
                 mint: Some(Some("dev")),
-                topic: MoveTopic::Session("bound"),
+                session: Some("bound"),
             }
         );
 
-        let plan = move_token_plan(&MoveDelivery::User);
+        let bare = MoveDelivery::Session {
+            session_id: "web".to_string(),
+            device_id: None,
+        };
         assert_eq!(
-            plan.mint,
-            Some(None),
-            "user delivery: a bare token, never a device-qualified one"
+            move_token_plan(&bare),
+            MoveTokenPlan {
+                mint: Some(None),
+                session: Some("web"),
+            },
+            "bare delivery: a bare token, to the recorded session only"
         );
-        assert_eq!(plan.topic, MoveTopic::User, "user delivery: every session");
 
-        let plan = move_token_plan(&MoveDelivery::UserNoToken);
-        assert_eq!(plan.mint, None, "no-token delivery: nothing is minted");
+        let no_token = MoveDelivery::SessionNoToken {
+            session_id: "web".to_string(),
+        };
         assert_eq!(
-            plan.topic,
-            MoveTopic::User,
-            "no-token delivery: every session"
+            move_token_plan(&no_token),
+            MoveTokenPlan {
+                mint: None,
+                session: Some("web"),
+            },
+            "no-token delivery: nothing is minted, one session is told"
         );
+
+        assert_eq!(
+            move_token_plan(&MoveDelivery::Nobody),
+            MoveTokenPlan {
+                mint: None,
+                session: None,
+            },
+            "no owner: nothing is minted and nothing is published"
+        );
+    }
+
+    /// The topic each plan publishes on, as `EventV1::private_session` builds
+    /// it from `plan.session`: one session's topic, never the user's
+    /// (`{user}!`, which every session of the user reads).
+    #[test]
+    fn a_move_plan_publishes_on_one_session_topic() {
+        use super::{move_token_plan, MoveDelivery};
+        use revolt_database::events::client::session_topic;
+
+        let topic = |delivery: &MoveDelivery| move_token_plan(delivery).session.map(session_topic);
+
+        for delivery in [
+            MoveDelivery::Session {
+                session_id: "bound".to_string(),
+                device_id: Some("dev".to_string()),
+            },
+            MoveDelivery::Session {
+                session_id: "bound".to_string(),
+                device_id: None,
+            },
+            MoveDelivery::SessionNoToken {
+                session_id: "bound".to_string(),
+            },
+        ] {
+            assert_eq!(
+                topic(&delivery).as_deref(),
+                Some("session:bound"),
+                "{delivery:?}: the owning session's topic only"
+            );
+        }
+        assert_eq!(
+            topic(&MoveDelivery::Nobody),
+            None,
+            "no owner: no topic at all"
+        );
+    }
+
+    /// The index just past the `}` that closes the `{` at `open`, skipping
+    /// braces inside string literals.
+    fn closing_brace(text: &str, open: usize) -> usize {
+        assert_eq!(&text[open..open + 1], "{", "not an opening brace");
+        let mut depth = 0usize;
+        let mut in_string = false;
+        let mut escaped = false;
+        for (at, c) in text[open..].char_indices() {
+            if in_string {
+                match (escaped, c) {
+                    (true, _) => escaped = false,
+                    (false, '\\') => escaped = true,
+                    (false, '"') => in_string = false,
+                    _ => {}
+                }
+                continue;
+            }
+            match c {
+                '"' => in_string = true,
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return open + at + 1;
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("unbalanced braces");
+    }
+
+    /// The shipping source of `fn {name}` in this file, comments stripped
+    /// (`crate::util::test::without_comments`): from its signature to the
+    /// first `}` in column 0.
+    fn shipping_fn(name: &str) -> String {
+        let source = include_str!("member_edit.rs");
+        let shipping = crate::util::test::without_comments(
+            &source[..source.find("#[cfg(test)]").expect("test module")],
+        );
+        let start = shipping
+            .find(&format!("fn {name}("))
+            .unwrap_or_else(|| panic!("`{}` left member_edit.rs", name));
+        let end = start + shipping[start..].find("\n}\n").expect("the end of the fn");
+        shipping[start..end].to_string()
+    }
+
+    #[test]
+    fn closing_brace_skips_braces_in_strings() {
+        let text = r#"a { b { "}" } c } d"#;
+        assert_eq!(&text[..closing_brace(text, 2)], r#"a { b { "}" } c }"#);
+    }
+
+    /// Media-e2ee final audit F1, pinned on the route itself: the move event
+    /// is published once, to the session the plan names, and only when it
+    /// names one. Lane 6a3's control D swapped that publish for
+    /// `.private(target_user.id)` (every session of the user) and every other
+    /// test stayed green, because no route test gets past `create_room`.
+    #[test]
+    fn the_move_event_is_published_only_to_the_planned_session() {
+        let body = shipping_fn("edit");
+
+        for user_wide in [".private(", ".p(", ".p_user(", ".global("] {
+            assert_eq!(
+                body.matches(user_wide).count(),
+                0,
+                "edit must not publish with `{user_wide}`"
+            );
+        }
+        assert_eq!(
+            body.matches(".private_session(").count(),
+            1,
+            "edit publishes on exactly one session topic"
+        );
+        assert_eq!(
+            body.matches("EventV1::UserMoveVoiceChannel").count(),
+            1,
+            "one move event"
+        );
+        assert_eq!(
+            body.matches("let plan = move_token_plan(&delivery);")
+                .count(),
+            1,
+            "the plan comes from the delivery"
+        );
+
+        let matched = body
+            .find("match plan.session {")
+            .expect("the move branches on the plan's session");
+        let arm = matched
+            + body[matched..]
+                .find("Some(session_id) => {")
+                .expect("the arm for a planned session");
+        let arm_open = arm + "Some(session_id) => ".len();
+        let arm_close = closing_brace(&body, arm_open);
+        let some_arm = &body[arm_open..arm_close];
+
+        let event = some_arm
+            .find("EventV1::UserMoveVoiceChannel")
+            .expect("the move event is built only in the planned-session arm");
+        let publish = some_arm
+            .find(".private_session(session_id.to_string())")
+            .expect("published to the planned session and nothing else");
+        let removal = some_arm
+            .find("take_participant_out_of_source(")
+            .expect("the planned-session arm takes the participant out");
+        assert!(
+            removal < event && event < publish,
+            "removed (after the re-check), then built, then published"
+        );
+
+        let none_arm = arm_close
+            + body[arm_close..]
+                .find("None => {")
+                .expect("the arm for no owner");
+        let none_close = closing_brace(&body, none_arm + "None => ".len());
+        let none_arm = &body[none_arm..none_close];
+        assert!(
+            none_arm.contains("take_participant_out_of_source("),
+            "no owner: the move is a disconnect"
+        );
+        for moved in [
+            "EventV1::",
+            "create_room(",
+            "create_token(",
+            "set_user_moved_",
+        ] {
+            assert!(
+                !none_arm.contains(moved),
+                "no owner: `{}` must not happen",
+                moved
+            );
+        }
+
+        assert_eq!(
+            body[matched..none_close].matches(".remove_user(").count(),
+            0,
+            "a move removes the participant only through the re-check"
+        );
+        assert_eq!(body.matches("take_participant_out_of_source(").count(), 2);
+    }
+
+    /// The re-check a move makes right before it takes the participant out
+    /// of the source, and the error it refuses with.
+    #[test]
+    fn a_move_re_checks_the_source_owner_right_before_the_removal() {
+        let body = shipping_fn("take_participant_out_of_source");
+
+        let check = body
+            .find(
+                "if !voice_participant_session_is(&source.id, user_id, expected_session).await? {",
+            )
+            .expect("the owner re-check");
+        let refuse = body
+            .find("return Err(create_error!(NotConnected));")
+            .expect("a changed owner refuses the move");
+        let release = body
+            .find("release_remote_control_for_user(")
+            .expect("the remote-control release");
+        let removal = body.find(".remove_user(").expect("the removal");
+        assert!(check < refuse && refuse < release && release < removal);
+        assert_eq!(body.matches(".remove_user(").count(), 1);
+    }
+
+    /// A failed removal fails the move: the `remove_user` inside
+    /// `take_participant_out_of_source` and both of its calls in the route
+    /// are whole statements ending `.await?;`, never discarded with
+    /// `let _ =` or left without the `?` (lane 6a4). Otherwise the move
+    /// event, token included, would go out with the participant still in
+    /// the source.
+    #[test]
+    fn a_failed_removal_fails_the_move() {
+        use crate::util::test::{statement_at, without_whitespace};
+
+        let take = without_whitespace(&shipping_fn("take_participant_out_of_source"));
+        statement_at(
+            &take,
+            "voice_client.remove_user(node,user_id,&source.id).await?;",
+        );
+
+        let edit = without_whitespace(&shipping_fn("edit"));
+        for owner in ["Some(session_id)", "None"] {
+            statement_at(
+                &edit,
+                &format!(
+                    "take_participant_out_of_source(db,voice_client,&old_user_voice_channel,&old_node,&target_user.id,{owner},).await?;"
+                ),
+            );
+        }
     }
 
     #[test]
@@ -2047,12 +2593,13 @@ mod test {
             .expect("lookup");
         assert_eq!(
             move_event_delivery(
+                Some(&session.id),
                 Some(&device),
                 row.as_ref().map(|r| r.last_session_id.as_str())
             ),
             MoveDelivery::Session {
                 session_id: session.id.clone(),
-                device_id: device.clone()
+                device_id: Some(device.clone())
             }
         );
 
@@ -2066,11 +2613,132 @@ mod test {
         assert!(row.is_none(), "a revoked device has no identity row");
         assert_eq!(
             move_event_delivery(
+                Some(&session.id),
                 Some(&device),
                 row.as_ref().map(|r| r.last_session_id.as_str())
             ),
-            MoveDelivery::UserNoToken
+            MoveDelivery::SessionNoToken {
+                session_id: session.id.clone()
+            }
         );
+    }
+
+    #[test]
+    fn a_move_is_delivered_to_the_session_recorded_in_the_source_channel() {
+        crate::util::test::rt()
+            .block_on(a_move_is_delivered_to_the_session_recorded_in_the_source_channel_case())
+    }
+
+    /// The route's lookups, against the real records on both drivers (a move
+    /// that clears every check dies at `create_room` before it publishes, so
+    /// the route itself cannot show where the event went). The F1 sequence:
+    /// the desktop is in the call, the web session joins the same channel and
+    /// kicks it, and the web session is then moved. Only the web session may
+    /// hear of it. (The desktop's late leave touches no record: lane 6a3.)
+    async fn a_move_is_delivered_to_the_session_recorded_in_the_source_channel_case() {
+        use super::{MoveDelivery, SourceParticipant};
+        use revolt_database::voice::set_voice_participant_session;
+
+        let harness = TestHarness::new().await;
+        let (account, desktop, user) = harness.new_user().await;
+        let web = account
+            .create_session(&harness.db, String::new())
+            .await
+            .expect("web session");
+        let source = format!("chan{}", ulid::Ulid::new());
+        let delivery = |participant: SourceParticipant| participant.delivery();
+
+        // Joined before the record existed: nobody is told to move.
+        let participant = SourceParticipant::resolve(&harness.db, &source, &user.id)
+            .await
+            .expect("resolve");
+        assert_eq!(participant.recorded_session, None);
+        assert_eq!(delivery(participant), MoveDelivery::Nobody);
+
+        // The desktop joins bare.
+        set_voice_participant_session(&source, &user.id, &desktop.id)
+            .await
+            .expect("desktop join");
+        assert_eq!(
+            delivery(
+                SourceParticipant::resolve(&harness.db, &source, &user.id)
+                    .await
+                    .expect("resolve")
+            ),
+            MoveDelivery::Session {
+                session_id: desktop.id.clone(),
+                device_id: None,
+            }
+        );
+
+        // The web session joins the same channel (the desktop is kicked).
+        set_voice_participant_session(&source, &user.id, &web.id)
+            .await
+            .expect("web join");
+        assert_eq!(
+            delivery(
+                SourceParticipant::resolve(&harness.db, &source, &user.id)
+                    .await
+                    .expect("resolve")
+            ),
+            MoveDelivery::Session {
+                session_id: web.id.clone(),
+                device_id: None,
+            },
+            "only the session in the call is moved; the kicked desktop hears nothing"
+        );
+
+        // Device-qualified: the token needs the recorded session to be the
+        // device's bound one.
+        let device = "a1".repeat(16);
+        set_voice_participant_identity(&source, &user.id, &format!("{}:{device}", user.id))
+            .await
+            .expect("identity mapping");
+        harness
+            .db
+            .insert_e2ee_identity(&identity_row(&user.id, &device, &desktop.id))
+            .await
+            .expect("identity");
+        assert_eq!(
+            delivery(
+                SourceParticipant::resolve(&harness.db, &source, &user.id)
+                    .await
+                    .expect("resolve")
+            ),
+            MoveDelivery::SessionNoToken {
+                session_id: web.id.clone()
+            },
+            "the recorded session is not the device's bound session: no token"
+        );
+
+        set_voice_participant_session(&source, &user.id, &desktop.id)
+            .await
+            .expect("desktop rejoins");
+        assert_eq!(
+            delivery(
+                SourceParticipant::resolve(&harness.db, &source, &user.id)
+                    .await
+                    .expect("resolve")
+            ),
+            MoveDelivery::Session {
+                session_id: desktop.id.clone(),
+                device_id: Some(device.clone()),
+            },
+            "the recorded session is the bound one: the device token, to it alone"
+        );
+
+        delete_voice_participant_identity(&source, &user.id)
+            .await
+            .expect("drop mapping");
+        delete_channel_voice_state(
+            &UserVoiceChannel {
+                id: source.clone(),
+                server_id: None,
+            },
+            &[],
+        )
+        .await
+        .expect("cleanup");
     }
 
     #[test]
@@ -2082,8 +2750,12 @@ mod test {
     /// The target is in the call as `target:device`. Their web session (not
     /// bound to the device) moving them would be handed a token for the
     /// device's identity, so it is refused before anything is written. The
-    /// bound session, a moderator, and a bare participant are unaffected.
+    /// bound session and a moderator are unaffected. Once the participant is
+    /// bare, the web session is STILL refused: it does not own the
+    /// participant (lane 6a2).
     async fn a_web_session_cannot_self_move_a_device_bound_participant_case() {
+        use revolt_database::voice::set_voice_participant_session;
+
         let f = move_fixture(true).await;
         let device = "ef".repeat(16);
         set_voice_participant_identity(
@@ -2105,6 +2777,11 @@ mod test {
             .create_session(&f.harness.db, String::new())
             .await
             .expect("bound session");
+        // A device-qualified join comes from the bound session, so that is
+        // the session `join_call` recorded.
+        set_voice_participant_session(f.source.id(), &f.target.id, &bound.id)
+            .await
+            .expect("session record");
 
         // No identity row yet: refused like a join from an unregistered device.
         let response = move_member(
@@ -2182,7 +2859,10 @@ mod test {
         .await;
         assert_reached_livekit(response).await;
 
-        // A bare participant has no device to impersonate: any session moves.
+        // A bare participant has no device to impersonate, but the session
+        // that owns it obeys the move, so the web session is still refused
+        // (it used to pass here: lane 6a2's stolen-session steer). The owning
+        // session moves itself.
         delete_voice_participant_identity(f.source.id(), &f.target.id)
             .await
             .expect("drop mapping");
@@ -2194,7 +2874,239 @@ mod test {
             f.dest.id(),
         )
         .await;
+        let (status, error) = error_of(response).await;
+        assert_eq!(status, Status::Unauthorized, "{error:?}");
+        assert!(
+            matches!(error, revolt_result::ErrorType::NotAuthenticated),
+            "a session that does not own a bare participant must not move it, got {:?}",
+            error
+        );
+        let response = move_member(
+            &f.harness,
+            &bound.token,
+            &f.server.id,
+            &f.target.id,
+            f.dest.id(),
+        )
+        .await;
         assert_reached_livekit(response).await;
+
+        f.cleanup().await;
+    }
+
+    /// Lane 6a2: a self-move goes ahead only from the session that owns the
+    /// participant in the source channel, which is the one the move event
+    /// goes to and the one that obeys it.
+    #[test]
+    fn a_self_move_must_come_from_the_session_that_owns_the_participant() {
+        use super::self_move_from_owning_session;
+
+        assert!(
+            self_move_from_owning_session(Some("desktop"), Some("desktop")),
+            "the owning session may move itself"
+        );
+
+        for (recorded, request, why) in [
+            (Some("desktop"), Some("web"), "a sibling session"),
+            (Some("desktop"), None, "no session (a bot)"),
+            (None, Some("desktop"), "no record: the owner is unknown"),
+            (None, None, "no record and no session"),
+            (Some(""), Some(""), "an empty id matches nothing"),
+            (Some(""), Some("web"), "an empty record"),
+            (Some("desktop"), Some(""), "an empty session id"),
+        ] {
+            assert!(
+                !self_move_from_owning_session(recorded, request),
+                "{}: must be refused",
+                why
+            );
+        }
+    }
+
+    #[test]
+    fn a_bare_self_move_from_another_session_is_refused() {
+        crate::util::test::rt().block_on(a_bare_self_move_from_another_session_is_refused_case())
+    }
+
+    /// Lane 6a2, the same class as media-e2ee final audit F1. The target is
+    /// in the call BARE from session A (`target_token`; the fixture records
+    /// it). Session B of the same user moving them would steer A, which obeys
+    /// the move event, so B is refused before anything is written. A passes
+    /// the check, and its session is carried over to the destination before
+    /// anything reaches LiveKit (lane 6a3). With no record, nobody may
+    /// self-move; a moderator still may.
+    async fn a_bare_self_move_from_another_session_is_refused_case() {
+        let f = move_fixture(true).await;
+        let account = f
+            .harness
+            .db
+            .fetch_account(&f.target.id)
+            .await
+            .expect("account");
+        let other = account
+            .create_session(&f.harness.db, String::new())
+            .await
+            .expect("session B");
+
+        let response = move_member(
+            &f.harness,
+            &other.token,
+            &f.server.id,
+            &f.target.id,
+            f.dest.id(),
+        )
+        .await;
+        let (status, error) = error_of(response).await;
+        assert_eq!(status, Status::Unauthorized, "{error:?}");
+        assert!(
+            matches!(error, revolt_result::ErrorType::NotAuthenticated),
+            "a session that does not own the participant must not move it, got {:?}",
+            error
+        );
+        assert!(
+            get_voice_state(&f.source_uvc, &f.target.id)
+                .await
+                .expect("voice state read")
+                .is_some(),
+            "the refused move must leave the target connected"
+        );
+        assert_eq!(
+            get_user_moved_from_voice(f.source.id(), &f.target.id)
+                .await
+                .expect("moved_from read"),
+            None,
+            "the refused move must write nothing"
+        );
+        assert_eq!(
+            recorded_session(&f.dest, &f.target.id).await,
+            None,
+            "the refused move must not carry a session over"
+        );
+
+        // The owning session clears the check and every other one, and owns
+        // the participant in the destination before LiveKit is reached.
+        let response = move_member(
+            &f.harness,
+            &f.target_token,
+            &f.server.id,
+            &f.target.id,
+            f.dest.id(),
+        )
+        .await;
+        assert_reached_livekit(response).await;
+        assert_eq!(
+            recorded_session(&f.dest, &f.target.id).await,
+            Some(f.target_session.clone()),
+            "the moving session is carried over to the destination"
+        );
+        assert_eq!(
+            recorded_session(&f.source, &f.target.id).await,
+            Some(f.target_session.clone()),
+            "the source record stays while the participant is still there"
+        );
+
+        // The record is gone (a join from before it existed): the owner is
+        // unknown, so no session may self-move.
+        forget_session_record(&f.source, &f.target.id).await;
+        for token in [&f.target_token, &other.token] {
+            let response =
+                move_member(&f.harness, token, &f.server.id, &f.target.id, f.dest.id()).await;
+            let (status, error) = error_of(response).await;
+            assert_eq!(status, Status::Unauthorized, "{error:?}");
+            assert!(
+                matches!(error, revolt_result::ErrorType::NotAuthenticated),
+                "with no recorded owner a self-move must be refused, got {:?}",
+                error
+            );
+        }
+
+        // A moderator's move is not a join by the target: unaffected (with
+        // no owner it is a disconnect, which reaches LiveKit at the removal).
+        let response = move_member(
+            &f.harness,
+            &f.mod_token,
+            &f.server.id,
+            &f.target.id,
+            f.dest.id(),
+        )
+        .await;
+        assert_reached_livekit(response).await;
+
+        f.cleanup().await;
+    }
+
+    #[test]
+    fn a_move_nobody_can_be_told_about_is_a_disconnect() {
+        crate::util::test::rt().block_on(a_move_nobody_can_be_told_about_is_a_disconnect_case())
+    }
+
+    /// Lane 6a3: with no recorded owner (a join from before the record
+    /// existed) no session can be told to rejoin, so a moderator's move is
+    /// done as the disconnect it amounts to. It pins no destination node,
+    /// writes no move marker and carries no session; a move with an owner
+    /// does all three before LiveKit is reached, which is what tells the two
+    /// paths apart here (both then fail at the absent node).
+    async fn a_move_nobody_can_be_told_about_is_a_disconnect_case() {
+        use revolt_database::voice::get_channel_node;
+
+        let f = move_fixture(true).await;
+        forget_session_record(&f.source, &f.target.id).await;
+
+        let response = move_member(
+            &f.harness,
+            &f.mod_token,
+            &f.server.id,
+            &f.target.id,
+            f.dest.id(),
+        )
+        .await;
+        assert_reached_livekit(response).await;
+        assert_eq!(
+            get_channel_node(f.dest.id()).await.expect("node read"),
+            None,
+            "no owner: no destination room is prepared"
+        );
+        assert_eq!(
+            get_user_moved_from_voice(f.source.id(), &f.target.id)
+                .await
+                .expect("moved_from read"),
+            None,
+            "no owner: no move marker"
+        );
+        assert_eq!(recorded_session(&f.dest, &f.target.id).await, None);
+
+        // The same move with an owner prepares the destination.
+        revolt_database::voice::set_voice_participant_session(
+            f.source.id(),
+            &f.target.id,
+            &f.target_session,
+        )
+        .await
+        .expect("session record");
+        let response = move_member(
+            &f.harness,
+            &f.mod_token,
+            &f.server.id,
+            &f.target.id,
+            f.dest.id(),
+        )
+        .await;
+        assert_reached_livekit(response).await;
+        assert_eq!(
+            get_channel_node(f.dest.id())
+                .await
+                .expect("node read")
+                .as_deref(),
+            Some(ABSENT_NODE)
+        );
+        assert!(get_user_moved_from_voice(f.source.id(), &f.target.id)
+            .await
+            .expect("moved_from read")
+            .is_some());
+        assert_eq!(
+            recorded_session(&f.dest, &f.target.id).await,
+            Some(f.target_session.clone())
+        );
 
         f.cleanup().await;
     }
@@ -2261,9 +3173,26 @@ mod test {
             error
         );
 
+        // Bare, too: with no session there is no owner to match.
         delete_voice_participant_identity(source.id(), &bot_user.id)
             .await
             .expect("drop mapping");
+        let response = harness
+            .client
+            .patch(format!("/servers/{}/members/{}", server.id, bot_user.id))
+            .header(ContentType::JSON)
+            .header(Header::new("x-bot-token", bot.token.clone()))
+            .body(serde_json::json!({ "voice_channel": dest.id() }).to_string())
+            .dispatch()
+            .await;
+        let (status, error) = error_of(response).await;
+        assert_eq!(status, Status::Unauthorized, "{error:?}");
+        assert!(
+            matches!(error, revolt_result::ErrorType::NotAuthenticated),
+            "a sessionless self-move of a bare identity must fail closed, got {:?}",
+            error
+        );
+
         delete_channel_voice_state(&source_uvc, &[bot_user.id.clone()])
             .await
             .expect("cleanup");

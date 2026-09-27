@@ -270,6 +270,151 @@ pub async fn clear_voice_participant_identities(channel_id: &str) -> Result<()> 
         .to_internal_error()
 }
 
+/// The session that owns a user's participant in a call: HASH
+/// `voice_session:{channel_id}`, field `user_id` -> `session_id`. A move event
+/// goes to this session and nowhere else, so one session of a user can never
+/// make ANOTHER session (one it just kicked with `force_disconnect`, say)
+/// rejoin somewhere.
+///
+/// Lifecycle:
+/// - `join_call` writes it for every join, bare or device-qualified, once
+///   nothing else can refuse the join. A moderator move carries the source
+///   channel's session over to the destination
+///   ([`carry_voice_participant_session`]), because the moved client may join
+///   with the pre-minted token and never call `join_call`.
+/// - A leave does not drop a user's record: livekit's full reconnect
+///   (`restartConnection`, a network switch) rejoins with the same token and
+///   never calls `join_call`, so a record dropped on its `participant_left`
+///   would be gone for the rejoin, and the next move would reach nobody. A
+///   record left behind is harmless: a move reads it only while the user has
+///   voice state in that channel, and every way back in (`join_call`, whose
+///   `force_disconnect` / `raise_if_in_voice` also clear or refuse any voice
+///   state first, or a move) writes it again.
+/// - One path does drop a single user's record: `join_call`'s
+///   `force_disconnect` kick, for every channel it kicks the user out of,
+///   before the removal ([`drop_voice_participant_session`]). A kick is not a
+///   reconnect, and it may land in another channel than the one it records.
+/// - [`delete_channel_voice_state`] drops the whole hash with the call, and
+///   the reconcile sweep with a dead room.
+///
+/// Accepted edge: a moderator disconnect removes the participant like a leave
+/// does, and the record survives it. A session a moderator kicked less than
+/// 15 s ago that zombie-rejoins the same channel (a reconnect racing the
+/// removal, say) has voice state there again under a record that still
+/// names it, so a move of the user is delivered to it, and it
+/// follows the move into the destination (the client's rule, `shouldObeyMove`
+/// in `voiceMovePolicy.ts`: a live Room in the source, or removed from it
+/// less than 15 s ago with a move token for its own identity). Accepted: the
+/// session is back in the call, it is the one the move names, and no other
+/// session of the user is steered.
+///
+/// No TTL, like every voice key: it lives as long as the call.
+pub fn voice_session_key(channel_id: &str) -> String {
+    format!("voice_session:{channel_id}")
+}
+
+/// Record the session a user is joining a call from (`join_call`).
+pub async fn set_voice_participant_session(
+    channel_id: &str,
+    user_id: &str,
+    session_id: &str,
+) -> Result<()> {
+    get_connection()
+        .await?
+        .hset(voice_session_key(channel_id), user_id, session_id)
+        .await
+        .to_internal_error()
+}
+
+/// Drop one user's session record in one channel. Only `join_call`'s
+/// `force_disconnect` loop calls it, for each channel it kicks the user out
+/// of, before that channel's removal.
+///
+/// Why only there: a leave keeps the record for livekit's reconnect (see
+/// [`voice_session_key`]), but a kick is not a reconnect, and the join that
+/// kicks may be into ANOTHER channel, so the record it writes does not replace
+/// this one. Left in place, the kicked channel's record would still name the
+/// kicked session, and a move already in flight there would pass both of its
+/// compares ([`carry_voice_participant_session`], then the re-check before
+/// the removal) and deliver a token to the session this join kicked. Dropped
+/// first, both compares fail and the move is refused.
+pub async fn drop_voice_participant_session(channel_id: &str, user_id: &str) -> Result<()> {
+    get_connection()
+        .await?
+        .hdel(voice_session_key(channel_id), user_id)
+        .await
+        .to_internal_error()
+}
+
+/// The session that owns a user's participant in a channel. `None` when
+/// nothing is recorded (a join from before the record existed). An empty
+/// value, never written by a route, reads as no record. The caller must then
+/// treat the owner as unknown, never fall back to every session.
+pub async fn get_voice_participant_session(
+    channel_id: &str,
+    user_id: &str,
+) -> Result<Option<String>> {
+    let stored: Option<String> = get_connection()
+        .await?
+        .hget(voice_session_key(channel_id), user_id)
+        .await
+        .to_internal_error()?;
+
+    Ok(stored.filter(|session_id| !session_id.is_empty()))
+}
+
+/// Whether the user's session record in `channel_id` still names `expected`,
+/// `None` meaning no (or an empty) record, as [`get_voice_participant_session`]
+/// reads it; an empty `expected` is `None` too. A move checks this right
+/// before it takes the participant out of the source: a join from another
+/// session since the move read the record means the participant it would
+/// remove is no longer the one it planned for.
+///
+/// A plain read and compare, not an atomic compare-and-swap: nothing is
+/// written on a match. The record can change right after the read, and each
+/// caller bounds that window itself (see [`carry_voice_participant_session`]).
+pub async fn voice_participant_session_is(
+    channel_id: &str,
+    user_id: &str,
+    expected: Option<&str>,
+) -> Result<bool> {
+    let expected = expected.filter(|session_id| !session_id.is_empty());
+    Ok(get_voice_participant_session(channel_id, user_id)
+        .await?
+        .as_deref()
+        == expected)
+}
+
+/// A move's carry-over: record `session_id` as the owner of the user's
+/// participant in `destination_id`, but only if the SOURCE record still names
+/// it. Returns whether it was carried; `false` means another session joined
+/// the source since the move read the record (or the record is gone), and the
+/// move must be refused.
+///
+/// Compare-then-write, two separate steps and NOT atomic: a compare on the
+/// source ([`voice_participant_session_is`]), then a write to the destination.
+/// The source record is left as it is: the participant is still in the source
+/// until the move removes it, and a move that fails later must leave it
+/// readable for a retry. A change to the source record after the compare
+/// (a join from another session into the source, or `join_call`'s
+/// `force_disconnect` kick dropping it, [`drop_voice_participant_session`]) is
+/// caught by the second compare the move makes right before the removal.
+pub async fn carry_voice_participant_session(
+    source_id: &str,
+    destination_id: &str,
+    user_id: &str,
+    session_id: &str,
+) -> Result<bool> {
+    if session_id.is_empty()
+        || !voice_participant_session_is(source_id, user_id, Some(session_id)).await?
+    {
+        return Ok(false);
+    }
+
+    set_voice_participant_session(destination_id, user_id, session_id).await?;
+    Ok(true)
+}
+
 /// The THIRD segment of a participant identity, if any — `"screen"` for a
 /// screen leg (android-screen-share plan §2.2).
 ///
@@ -716,6 +861,9 @@ pub async fn delete_channel_voice_state(
     // Covers `room_finished` and `reconcile_channel`, which pass no user ids:
     // the whole call is gone, so every screen-leg marker goes with it.
     pipeline.del(format!("vc_leg:{}", &channel.id));
+    // Same for the session records: nobody owns a participant in a call that
+    // is gone.
+    pipeline.del(voice_session_key(&channel.id));
 
     for user_id in user_ids {
         let unique_key = format!("{user_id}:{parent_id}");
@@ -2327,6 +2475,263 @@ mod tests {
             .expect("stray cleanup");
         let stray: Option<bool> = conn.get(format!("recording:{unique_key}")).await.unwrap();
         assert!(stray.is_none(), "an unclaimed stray key is still cleared");
+    }
+
+    // The session record a move is delivered to (media-e2ee final audit F1),
+    // and why no leave drops it (lane 6a3): livekit's full reconnect rejoins
+    // with the same token and never calls `join_call`, so the record has to
+    // outlive the leave that comes with it.
+    #[test]
+    fn voice_session_record_lifecycle_survives_a_reconnect() {
+        rt().block_on(voice_session_record_case())
+    }
+
+    async fn voice_session_record_case() {
+        let suffix = ulid::Ulid::new().to_string();
+        let channel = UserVoiceChannel {
+            id: format!("chan{suffix}"),
+            server_id: Some(format!("srv{suffix}")),
+        };
+        let user = format!("user{suffix}");
+        let key = voice_session_key(&channel.id);
+        assert_eq!(key, format!("voice_session:{}", &channel.id));
+        let mut conn = get_connection().await.unwrap();
+
+        assert_eq!(
+            get_voice_participant_session(&channel.id, &user)
+                .await
+                .unwrap(),
+            None,
+            "no record: the owner is unknown"
+        );
+
+        // The desktop joins; the record names it at once.
+        set_voice_participant_session(&channel.id, &user, "DESKTOP")
+            .await
+            .unwrap();
+        assert_eq!(
+            get_voice_participant_session(&channel.id, &user)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("DESKTOP")
+        );
+        let stored: Option<String> = conn.hget(&key, &user).await.unwrap();
+        assert_eq!(stored.as_deref(), Some("DESKTOP"));
+
+        // A reconnect: the participant leaves and rejoins on the same token.
+        // The leave is a per-user voice-state delete and nothing else touches
+        // the record, so it still names the desktop for the rejoin.
+        delete_voice_state(&channel, &user)
+            .await
+            .expect("the reconnect's leave");
+        assert_eq!(
+            get_voice_participant_session(&channel.id, &user)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("DESKTOP"),
+            "a leave must not take the record with it"
+        );
+
+        // The web session joins; its record replaces the desktop's.
+        set_voice_participant_session(&channel.id, &user, "WEB")
+            .await
+            .unwrap();
+        assert_eq!(
+            get_voice_participant_session(&channel.id, &user)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("WEB"),
+            "the newest join owns the participant"
+        );
+
+        // A `force_disconnect` kick from a join elsewhere drops this user's
+        // record, and nobody else's (lane 6a4).
+        let other = format!("other{suffix}");
+        set_voice_participant_session(&channel.id, &other, "OTHER")
+            .await
+            .unwrap();
+        drop_voice_participant_session(&channel.id, &user)
+            .await
+            .expect("the kick's drop");
+        assert_eq!(
+            get_voice_participant_session(&channel.id, &user)
+                .await
+                .unwrap(),
+            None,
+            "a kick must take the kicked user's record with it"
+        );
+        assert!(
+            !voice_participant_session_is(&channel.id, &user, Some("WEB"))
+                .await
+                .unwrap(),
+            "a move planned for the kicked session no longer matches"
+        );
+        assert_eq!(
+            get_voice_participant_session(&channel.id, &other)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("OTHER"),
+            "another user's record in the same call stays"
+        );
+        set_voice_participant_session(&channel.id, &user, "WEB")
+            .await
+            .unwrap();
+
+        // An empty value, never written by a route, reads as no record.
+        set_voice_participant_session(&channel.id, &user, "")
+            .await
+            .unwrap();
+        assert_eq!(
+            get_voice_participant_session(&channel.id, &user)
+                .await
+                .unwrap(),
+            None,
+            "an empty record must not resolve to a session"
+        );
+
+        // The whole hash goes with the call (room_finished, the reconcile
+        // sweep, channel delete).
+        set_voice_participant_session(&channel.id, &user, "WEB")
+            .await
+            .unwrap();
+        delete_channel_voice_state(&channel, &[])
+            .await
+            .expect("call teardown");
+        let exists: bool = conn.exists(&key).await.unwrap();
+        assert!(!exists, "the session hash must not outlive the call");
+    }
+
+    // A move carries the source record over only while the source still
+    // names the session the move read (lane 6a3): a join from another session
+    // in between must refuse the move, not hand the destination to the
+    // session that join kicked.
+    #[test]
+    fn a_move_carries_the_session_record_only_while_the_source_names_it() {
+        rt().block_on(carry_voice_session_case())
+    }
+
+    async fn carry_voice_session_case() {
+        let suffix = ulid::Ulid::new().to_string();
+        let source = format!("src{suffix}");
+        let destination = format!("dst{suffix}");
+        let fresh = format!("fresh{suffix}");
+        let gone = format!("gone{suffix}");
+        let user = format!("user{suffix}");
+
+        // The compare on its own.
+        assert!(
+            voice_participant_session_is(&source, &user, None)
+                .await
+                .unwrap(),
+            "no record matches `None`"
+        );
+        assert!(
+            !voice_participant_session_is(&source, &user, Some("DESKTOP"))
+                .await
+                .unwrap()
+        );
+        set_voice_participant_session(&source, &user, "DESKTOP")
+            .await
+            .unwrap();
+        assert!(
+            voice_participant_session_is(&source, &user, Some("DESKTOP"))
+                .await
+                .unwrap()
+        );
+        for other in [None, Some("WEB"), Some(""), Some("DESKTOPX"), Some("DESK")] {
+            assert!(
+                !voice_participant_session_is(&source, &user, other)
+                    .await
+                    .unwrap(),
+                "`{other:?}` must not match a record naming DESKTOP"
+            );
+        }
+
+        // Match: carried, and the source is left as it was.
+        assert!(
+            carry_voice_participant_session(&source, &destination, &user, "DESKTOP")
+                .await
+                .unwrap(),
+            "the source still names the session: carried"
+        );
+        assert_eq!(
+            get_voice_participant_session(&destination, &user)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("DESKTOP")
+        );
+        assert_eq!(
+            get_voice_participant_session(&source, &user)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("DESKTOP"),
+            "the source record stays until the participant is gone"
+        );
+
+        // Mismatch: the web session joined the source after the move read
+        // it. Nothing is carried, and the destination keeps what it had.
+        set_voice_participant_session(&source, &user, "WEB")
+            .await
+            .unwrap();
+        set_voice_participant_session(&destination, &user, "EARLIER")
+            .await
+            .unwrap();
+        assert!(
+            !carry_voice_participant_session(&source, &destination, &user, "DESKTOP")
+                .await
+                .unwrap(),
+            "the source names another session: refused"
+        );
+        assert_eq!(
+            get_voice_participant_session(&destination, &user)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("EARLIER")
+        );
+        assert_eq!(
+            get_voice_participant_session(&source, &user)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("WEB")
+        );
+
+        // An empty session id, or a source with no record: never carried.
+        assert!(
+            !carry_voice_participant_session(&source, &fresh, &user, "")
+                .await
+                .unwrap(),
+            "an empty session id is never carried"
+        );
+        assert!(
+            !carry_voice_participant_session(&gone, &fresh, &user, "DESKTOP")
+                .await
+                .unwrap(),
+            "a source with no record carries nothing"
+        );
+        assert_eq!(
+            get_voice_participant_session(&fresh, &user).await.unwrap(),
+            None
+        );
+
+        for channel in [&source, &destination] {
+            delete_channel_voice_state(
+                &UserVoiceChannel {
+                    id: channel.clone(),
+                    server_id: None,
+                },
+                &[],
+            )
+            .await
+            .expect("cleanup");
+        }
     }
 
     /// `VOICE_STATE_KEY_PREFIXES` is the list both delete paths use: a key
