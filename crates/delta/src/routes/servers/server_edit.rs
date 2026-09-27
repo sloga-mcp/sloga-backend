@@ -151,7 +151,7 @@ pub async fn edit(
 
     // One rule, five writers: `AfkTimeout` is meaningless without
     // `AfkChannel`. The five are this route, `channel_create`, the Discord
-    // import worker, the revision-70 migration and
+    // import worker, the revision-72 migration and
     // `Server::clear_afk_channel_if_pointing_at` (from `channel_edit`'s
     // de-voice block and `Channel::delete`). Only the two routes re-sync
     // grants; the helper needs none, because both of its callers tear the

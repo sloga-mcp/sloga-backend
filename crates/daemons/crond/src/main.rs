@@ -34,12 +34,20 @@ pub async fn cron_task_wrapper<Fut: Future<Output = Result<()>>>(
     }
 }
 
+/// `Message::send` (scheduled delivery, import system messages) only *queues*
+/// last_message_id / mention+push / embed work into process-local queues;
+/// these workers drain them. Without this, crond silently drops all of it.
+fn start_side_effect_workers(db: &Database, amqp: &AMQP) {
+    revolt_database::tasks::start_workers(db.clone(), amqp.clone());
+}
+
 #[tokio::main]
 async fn main() {
     configure!(crond);
 
     let db = DatabaseInfo::Auto.connect().await.expect("database");
     let amqp = AMQP::new_auto().await;
+    start_side_effect_workers(&db, &amqp);
 
     join!(
         cron_task_wrapper(file_deletion::task, db.clone(), amqp.clone()),
@@ -62,6 +70,8 @@ async fn main() {
         cron_task_wrapper(thread_archiver::task, db.clone(), amqp.clone()),
         cron_task_wrapper(prune_interactions::task, db.clone(), amqp.clone()),
         cron_task_wrapper(prune_expired_boosts::task, db.clone(), amqp.clone()),
+        cron_task_wrapper(qualify_referrals::task, db.clone(), amqp.clone()),
+        cron_task_wrapper(expire_supporters::task, db.clone(), amqp.clone()),
         cron_task_wrapper(stream_live::task, db.clone(), amqp.clone()),
         cron_task_wrapper(discord_import::task, db.clone(), amqp.clone()),
         cron_task_wrapper(afk_sweep::task, db.clone(), amqp.clone()),

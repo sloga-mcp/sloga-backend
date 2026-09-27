@@ -3,7 +3,7 @@ use deadqueue::limited::Queue;
 use once_cell::sync::Lazy;
 use std::{collections::HashMap, time::Duration};
 
-use crate::{Database, PartialChannel};
+use crate::Database;
 
 use super::DelayedTask;
 
@@ -20,7 +20,7 @@ struct Data {
 /// Task information
 #[derive(Debug)]
 struct Task {
-    /// Latest message ID
+    /// Newest message ID seen
     id: String,
     /// Whether the channel is a DM
     is_dm: bool,
@@ -52,17 +52,11 @@ pub async fn worker(db: Database) {
             if let Some(task) = tasks.remove(key) {
                 let Task { id, is_dm, .. } = task.data;
 
-                let mut channel = PartialChannel {
-                    last_message_id: Some(id.to_string()),
-                    ..Default::default()
-                };
-
-                if is_dm {
-                    channel.active = Some(true);
-                }
-
-                match db.update_channel(key, &channel, vec![]).await {
-                    Ok(_) => info!("Updated last_message_id for {key} to {id}."),
+                match db.set_last_message_id_if_newer(key, &id, is_dm).await {
+                    Ok(true) => info!("Updated last_message_id for {key} to {id}."),
+                    Ok(false) => debug!(
+                        "Skipped last_message_id for {key}: {id} is not newer (or the channel is gone)."
+                    ),
                     Err(err) => error!("Failed to update last_message_id with {err:?}!"),
                 }
             }
@@ -74,7 +68,12 @@ pub async fn worker(db: Database) {
         // Queue incoming tasks.
         while let Some(Data { channel, id, is_dm }) = Q.try_pop() {
             if let Some(task) = tasks.get_mut(&channel) {
-                task.data.id = id;
+                // Ids can be queued out of order (the id is minted before the
+                // send's awaits), so keep the newest rather than the last in.
+                if id > task.data.id {
+                    task.data.id = id;
+                }
+                task.data.is_dm |= is_dm;
                 task.delay();
             } else {
                 tasks.insert(channel, DelayedTask::new(Task { id, is_dm }));

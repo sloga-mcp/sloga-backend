@@ -2,7 +2,7 @@ use iso8601_timestamp::Timestamp;
 use once_cell::sync::Lazy;
 use regex::Regex;
 
-use super::File;
+use super::{File, RE_COLOUR};
 
 #[cfg(feature = "validator")]
 use validator::Validate;
@@ -92,6 +92,22 @@ auto_derived_partial!(
         )]
         pub connections: Vec<UserConnection>,
 
+        /// Name styling, already filtered down to what the user's current
+        /// perks allow
+        #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+        pub name_style: Option<NameStyle>,
+        /// Bitfield of perks the user currently has
+        ///
+        /// https://docs.rs/revolt-models/latest/revolt_models/v0/enum.UserPerks.html
+        #[cfg_attr(
+            feature = "serde",
+            serde(skip_serializing_if = "crate::if_zero_u32", default)
+        )]
+        pub perks: u32,
+        /// Custom profile badge
+        #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+        pub custom_badge: Option<CustomBadge>,
+
         /// Who may fetch the user's profile page; only ever present on the
         /// session user's own object
         #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
@@ -122,6 +138,8 @@ auto_derived!(
         DisplayName,
         Pronouns,
         Connections,
+        NameStyle,
+        CustomBadge,
 
         /// Internal field, ignore this.
         Internal,
@@ -335,6 +353,71 @@ auto_derived!(
         ReservedRelevantJokeBadge1 = 512,
         /// Low resolution troll face
         ReservedRelevantJokeBadge2 = 1024,
+        /// Joined through a friend's referral
+        Welcomed = 4096,
+        /// Referred friends to Sloga
+        Recruiter = 8192,
+        /// Referred many friends to Sloga
+        RecruiterElite = 16384,
+        /// Made a major donation to support Sloga
+        Patron = 32768,
+    }
+
+    /// User perk bitfield
+    #[repr(u32)]
+    pub enum UserPerks {
+        /// May set a custom name color
+        NameColour = 1,
+        /// May set a custom name font
+        NameFont = 2,
+        /// May set an animated name effect
+        NameEffect = 4,
+        /// Raised file upload size limit
+        UploadPerk = 8,
+        /// May set a custom profile badge
+        CustomBadge = 16,
+    }
+
+    /// Font used to render a user's name
+    pub enum NameFont {
+        Serif,
+        Mono,
+        Rounded,
+        Script,
+        Pixel,
+    }
+
+    /// Animated effect applied to a user's name
+    pub enum NameEffect {
+        Shimmer,
+        Glow,
+        Rainbow,
+    }
+
+    /// Custom styling for a user's name
+    #[cfg_attr(feature = "validator", derive(Validate))]
+    pub struct NameStyle {
+        /// Name color, in the same format as role colors
+        #[cfg_attr(
+            feature = "validator",
+            validate(length(min = 1, max = 128), regex = "RE_COLOUR")
+        )]
+        #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+        pub colour: Option<String>,
+        /// Name font
+        #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+        pub font: Option<NameFont>,
+        /// Animated name effect
+        #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+        pub effect: Option<NameEffect>,
+    }
+
+    /// Custom badge shown on a user's profile
+    pub struct CustomBadge {
+        /// Badge image
+        pub image: File,
+        /// Badge label
+        pub label: String,
     }
 
     /// User flag enum
@@ -396,6 +479,24 @@ auto_derived!(
         /// This is applied as a partial.
         #[cfg_attr(feature = "validator", validate)]
         pub profile: Option<DataUserProfile>,
+        /// New name style
+        ///
+        /// Merged with the stored style part by part (color, font, effect):
+        ///
+        /// - A part the user holds the perk for is taken from the request, so
+        ///   leaving it out clears it.
+        /// - A part the user does not hold the perk for (never held, or
+        ///   lapsed) keeps its stored value and can't be changed: leaving it
+        ///   out or resending the stored value is accepted, anything else
+        ///   fails with `PerkRequired`.
+        /// - `{}` therefore clears only the parts the user holds the perk for.
+        /// - A style left with no parts is removed.
+        /// - `remove: ["NameStyle"]` clears everything, locked parts included.
+        ///   Sent together with `name_style`, only the parts the user holds
+        ///   the perk for are set from the request.
+        #[cfg_attr(feature = "validator", validate)]
+        #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+        pub name_style: Option<NameStyle>,
 
         /// Bitfield of user badges
         #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
@@ -469,6 +570,12 @@ auto_derived!(
         pub note: Option<String>,
     }
 );
+
+/// Badge bits derived from referral, welcome and donation state; these are
+/// recomputed on read rather than trusted from the stored bitfield
+///
+/// Supporter | ActiveSupporter | EarlyAdopter | Welcomed | Recruiter | RecruiterElite | Patron
+pub const USER_BADGES_DYNAMIC_MASK: u32 = 4 | 64 | 256 | 4096 | 8192 | 16384 | 32768;
 
 auto_derived_partial!(
     /// Voice State information for a user

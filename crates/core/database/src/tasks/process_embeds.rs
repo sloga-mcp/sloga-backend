@@ -4,7 +4,7 @@ use futures::future::join_all;
 use linkify::{LinkFinder, LinkKind};
 use regex::Regex;
 use revolt_config::config;
-use revolt_result::Result;
+use revolt_result::{ErrorType, Result};
 
 use async_lock::Semaphore;
 use deadqueue::limited::Queue;
@@ -62,9 +62,9 @@ pub async fn worker(db: Database) {
             .await;
 
             if let Ok(embeds) = embeds {
-                if let Err(err) = Message::append(
+                match Message::append(
                     &db,
-                    task.id,
+                    task.id.clone(),
                     task.channel,
                     AppendMessage {
                         embeds: Some(embeds),
@@ -72,7 +72,14 @@ pub async fn worker(db: Database) {
                 )
                 .await
                 {
-                    error!("Encountered an error appending to message: {:?}", err);
+                    Ok(()) => {}
+                    Err(err) if matches!(err.error_type, ErrorType::NotFound) => debug!(
+                        "Message {} was deleted before its embeds resolved; dropping them",
+                        task.id
+                    ),
+                    Err(err) => {
+                        error!("Encountered an error appending to message: {:?}", err);
+                    }
                 }
             }
         });
@@ -148,7 +155,8 @@ pub async fn generate(
             .await
             {
                 drop(guard);
-                response.json::<Embed>().await.ok()
+                let status_ok = response.status().is_success();
+                keep_embed(status_ok, response.json::<Embed>().await.ok())
             } else {
                 None
             }
@@ -167,5 +175,56 @@ pub async fn generate(
         Ok(embeds)
     } else {
         Err(create_error!(LabelMe))
+    }
+}
+
+/// Keep a january response only if it succeeded and carries a real embed.
+/// Unknown embed types decode as `Embed::None`, and so does january's
+/// `{"type":"NoEmbedData"}` error body, so `None` must be filtered out.
+fn keep_embed(status_ok: bool, embed: Option<Embed>) -> Option<Embed> {
+    if !status_ok {
+        return None;
+    }
+
+    embed.filter(|e| !matches!(e, Embed::None))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::keep_embed;
+    use revolt_models::v0::{Embed, Image, ImageSize};
+
+    fn image() -> Embed {
+        Embed::Image(Image {
+            url: "https://example.com/a.png".to_string(),
+            width: 1,
+            height: 1,
+            size: ImageSize::Large,
+        })
+    }
+
+    #[test]
+    fn non_success_status_is_dropped() {
+        assert!(keep_embed(false, Some(image())).is_none());
+    }
+
+    #[test]
+    fn none_embed_is_dropped() {
+        assert!(keep_embed(true, Some(Embed::None)).is_none());
+    }
+
+    #[test]
+    fn real_embed_is_kept() {
+        assert!(matches!(
+            keep_embed(true, Some(image())),
+            Some(Embed::Image(_))
+        ));
+    }
+
+    #[test]
+    fn january_error_body_is_dropped() {
+        let body = serde_json::from_str::<Embed>(r#"{"type":"NoEmbedData","location":"x"}"#).ok();
+        assert!(matches!(body, Some(Embed::None)));
+        assert!(keep_embed(true, body).is_none());
     }
 }

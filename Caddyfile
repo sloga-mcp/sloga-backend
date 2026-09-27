@@ -40,7 +40,21 @@
     }
 }
 
+# Send plain-http visitors to https. http:// used to serve every page with a
+# 200, so a first visit (before HSTS is cached) ran unencrypted end to end.
+# Caddy always receives plain http here, from cloudflared on this box, so the
+# scheme the visitor used only arrives in X-Forwarded-Proto, which Cloudflare
+# sets. The match is exact on purpose: a request without the header (local
+# tooling, the NJ LiveKit node posting to :8500 directly) is never redirected,
+# so a missing header fails open instead of looping. 308 keeps the method and
+# body, so a POST that follows it still lands.
+(https_only) {
+    @plain_http header X-Forwarded-Proto http
+    redir @plain_http https://{host}{uri} 308
+}
+
 :80 {
+    import https_only
 
     # WebSocket (Bonfire)
     handle /ws {
@@ -71,6 +85,14 @@
     }
     handle @lk_webhook_brazil {
         rewrite * /brazil
+        reverse_proxy 127.0.0.1:8500
+    }
+    @lk_webhook_singapore {
+        path /voice-ingress/singapore
+        header CF-Connecting-IP 45.32.115.231
+    }
+    handle @lk_webhook_singapore {
+        rewrite * /singapore
         reverse_proxy 127.0.0.1:8500
     }
     handle /voice-ingress/* {
@@ -177,6 +199,7 @@
 
 # Marketing site — sloga.gg apex (host-matched; app.sloga.gg + localhost still hit the :80 block above)
 http://sloga.gg {
+    import https_only
     root * /home/mcp/sloga-website
 
     # Security headers for the marketing site (audit 2026-09-05 H3). The site is
@@ -198,7 +221,9 @@ http://sloga.gg {
     # folder, so README.md was served at the site root, describing the layout
     # and the deploy recipe (audit 2026-09-05 L8). Blocked here rather than
     # deleted, so a re-sync from the git source cannot quietly restore it.
-    @repodocs path /README.md /readme.md
+    # tools/ is the same case: the build helpers (prerender-discover.py and
+    # the logo/og-image generator pages) were served publicly.
+    @repodocs path /README.md /readme.md /tools /tools/*
     respond @repodocs 404
 
     # The Linux .deb updater's "Open download page" button opens /download.
@@ -247,10 +272,12 @@ http://sloga.gg {
         }
     }
     header @dl Cache-Control "no-store"
-    redir /dl/windows       "https://app.sloga.gg/updates/desktop/Sloga_0.57.0_x64-setup.exe" 302
-    redir /dl/linux-deb     "https://app.sloga.gg/updates/desktop-linux/Sloga-0.58.0-linux-amd64.deb" 302
-    redir /dl/linux-appimage "https://app.sloga.gg/updates/desktop-linux/Sloga-0.58.0-linux-x86_64.AppImage" 302
-    redir /dl/android       "https://app.sloga.gg/updates/android/sloga-0.57.0.apk" 302
+    redir /dl/windows       "https://app.sloga.gg/updates/desktop/Sloga_0.62.0_x64-setup.exe" 302
+    redir /dl/linux-deb     "https://app.sloga.gg/updates/desktop-linux/Sloga-0.62.0-linux-amd64.deb" 302
+    redir /dl/linux-appimage "https://app.sloga.gg/updates/desktop-linux/Sloga-0.62.0-linux-x86_64.AppImage" 302
+    redir /dl/android       "https://app.sloga.gg/updates/android/sloga-0.62.0.apk" 302
+    redir /dl/macos-apple-silicon "https://app.sloga.gg/updates/desktop-macos/Sloga-0.62.0-macos-arm64.dmg" 302
+    redir /dl/macos-intel   "https://app.sloga.gg/updates/desktop-macos/Sloga-0.62.0-macos-x64.dmg" 302
 
     # Short, stable URL for the account-deletion page. Google Play requires a web
     # URL where a user can request account + data deletion without reinstalling

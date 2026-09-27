@@ -2,7 +2,8 @@ use std::collections::{HashMap, HashSet};
 
 use iso8601_timestamp::Timestamp;
 use revolt_database::{
-    events::client::EventV1, Database, E2EEEnvelope, Session, User, AMQP, E2EE_PROTOCOL_VERSION,
+    events::client::EventV1, Database, E2EEEnvelope, Referral, ReferralActivity, Session, User,
+    AMQP, E2EE_PROTOCOL_VERSION,
 };
 use revolt_models::v0;
 use revolt_result::{create_error, Result};
@@ -53,11 +54,9 @@ pub async fn send_messages(
         }));
     }
 
-    if data
-        .envelopes
-        .iter()
-        .any(|envelope| envelope.ciphertext.is_empty() || envelope.ciphertext.len() > MAX_CIPHERTEXT_LENGTH)
-    {
+    if data.envelopes.iter().any(|envelope| {
+        envelope.ciphertext.is_empty() || envelope.ciphertext.len() > MAX_CIPHERTEXT_LENGTH
+    }) {
         return Err(create_error!(PayloadTooLarge));
     }
 
@@ -183,6 +182,12 @@ pub async fn send_messages(
     // dedup the drain-vs-live-push race by envelope id.
     db.insert_e2ee_envelopes(&accepted).await?;
 
+    // Only a send that reached another user counts as a message; envelopes
+    // addressed solely to the sender's own devices do not
+    let reached_other_user = accepted
+        .iter()
+        .any(|envelope| envelope.recipient_user_id != user.id);
+
     let mut notified = HashSet::new();
     for envelope in accepted {
         let recipient_user_id = envelope.recipient_user_id.clone();
@@ -208,6 +213,10 @@ pub async fn send_messages(
                 .ok();
             }
         }
+    }
+
+    if reached_other_user {
+        Referral::record_activity(db, &user, ReferralActivity::Message).await;
     }
 
     Ok(Json(v0::ResponseSendE2EEMessages { receipts }))

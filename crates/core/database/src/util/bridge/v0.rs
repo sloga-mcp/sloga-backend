@@ -1404,6 +1404,8 @@ impl crate::User {
         };
 
         let badges = self.get_badges().await;
+        let now = crate::now_ms();
+        let name_style = self.filtered_name_style(now);
 
         User {
             username: self.username,
@@ -1450,6 +1452,12 @@ impl crate::User {
             privileged: self.privileged,
             bot: self.bot.map(|bot| bot.into()),
             e2ee_enabled: self.e2ee_enabled,
+            name_style,
+            perks: 0,
+            custom_badge: self.custom_badge.map(|badge| CustomBadge {
+                image: badge.image.into(),
+                label: badge.label,
+            }),
             profile_visibility: None,
             relationship,
             relationship_note,
@@ -1496,6 +1504,8 @@ impl crate::User {
         };
 
         let badges = self.get_badges().await;
+        let now = crate::now_ms();
+        let name_style = self.filtered_name_style(now);
 
         User {
             username: self.username,
@@ -1530,6 +1540,12 @@ impl crate::User {
             privileged: self.privileged,
             bot: self.bot.map(|bot| bot.into()),
             e2ee_enabled: self.e2ee_enabled,
+            name_style,
+            perks: 0,
+            custom_badge: self.custom_badge.map(|badge| CustomBadge {
+                image: badge.image.into(),
+                label: badge.label,
+            }),
             profile_visibility: None,
             relationship,
             relationship_note,
@@ -1540,6 +1556,8 @@ impl crate::User {
     /// Convert user object into user model without presence information
     pub async fn into_known_static(self, is_online: bool) -> User {
         let badges = self.get_badges().await;
+        let now = crate::now_ms();
+        let name_style = self.filtered_name_style(now);
 
         User {
             username: self.username,
@@ -1566,6 +1584,12 @@ impl crate::User {
             privileged: self.privileged,
             bot: self.bot.map(|bot| bot.into()),
             e2ee_enabled: self.e2ee_enabled,
+            name_style,
+            perks: 0,
+            custom_badge: self.custom_badge.map(|badge| CustomBadge {
+                image: badge.image.into(),
+                label: badge.label,
+            }),
             profile_visibility: None,
             relationship: RelationshipStatus::None, // events client will populate this from cache
             relationship_note: None,
@@ -1575,6 +1599,9 @@ impl crate::User {
 
     pub async fn into_self(self, force_online: bool) -> User {
         let badges = self.get_badges().await;
+        let now = crate::now_ms();
+        let name_style = self.filtered_name_style(now);
+        let perks = self.perks(now);
 
         User {
             username: self.username,
@@ -1609,6 +1636,12 @@ impl crate::User {
             privileged: self.privileged,
             bot: self.bot.map(|bot| bot.into()),
             e2ee_enabled: self.e2ee_enabled,
+            name_style,
+            perks,
+            custom_badge: self.custom_badge.map(|badge| CustomBadge {
+                image: badge.image.into(),
+                label: badge.label,
+            }),
             profile_visibility: self.profile_visibility.map(Into::into),
             relationship: RelationshipStatus::User,
             relationship_note: None,
@@ -1645,6 +1678,15 @@ impl From<User> for crate::User {
             e2ee_enabled: value.e2ee_enabled,
             suspended_until: None,
             last_acknowledged_policy_change: Timestamp::UNIX_EPOCH,
+            referral_count: None,
+            referral_pending: None,
+            welcomed_at: None,
+            supporter: None,
+            name_style: value.name_style,
+            custom_badge: value.custom_badge.map(|badge| crate::CustomBadge {
+                image: badge.image.into(),
+                label: badge.label,
+            }),
         }
     }
 }
@@ -1672,6 +1714,12 @@ impl From<crate::PartialUser> for PartialUser {
             privileged: value.privileged,
             bot: value.bot.map(|bot| bot.into()),
             e2ee_enabled: value.e2ee_enabled,
+            name_style: value.name_style,
+            perks: None,
+            custom_badge: value.custom_badge.map(|badge| CustomBadge {
+                image: badge.image.into(),
+                label: badge.label,
+            }),
             profile_visibility: None,
             relationship: None,
             relationship_note: None,
@@ -1694,6 +1742,8 @@ impl From<FieldsUser> for crate::FieldsUser {
             FieldsUser::DisplayName => crate::FieldsUser::DisplayName,
             FieldsUser::Pronouns => crate::FieldsUser::Pronouns,
             FieldsUser::Connections => crate::FieldsUser::Connections,
+            FieldsUser::NameStyle => crate::FieldsUser::NameStyle,
+            FieldsUser::CustomBadge => crate::FieldsUser::CustomBadge,
 
             FieldsUser::Internal => crate::FieldsUser::None,
         }
@@ -1713,8 +1763,14 @@ impl From<crate::FieldsUser> for FieldsUser {
             crate::FieldsUser::DisplayName => FieldsUser::DisplayName,
             crate::FieldsUser::Pronouns => FieldsUser::Pronouns,
             crate::FieldsUser::Connections => FieldsUser::Connections,
+            crate::FieldsUser::NameStyle => FieldsUser::NameStyle,
+            crate::FieldsUser::CustomBadge => FieldsUser::CustomBadge,
 
             crate::FieldsUser::Suspension => FieldsUser::Internal,
+            crate::FieldsUser::Supporter => FieldsUser::Internal,
+            crate::FieldsUser::ReferralPending => FieldsUser::Internal,
+            crate::FieldsUser::WelcomedAt => FieldsUser::Internal,
+            crate::FieldsUser::ReferralCount => FieldsUser::Internal,
             crate::FieldsUser::None => FieldsUser::Internal,
         }
     }

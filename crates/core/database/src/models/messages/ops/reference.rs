@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::time::SystemTime;
 use ulid::Ulid;
 
-use super::{AbstractMessages, UnreadSummary};
+use super::{AbstractMessages, UnreadSummary, UNREAD_SCAN_WINDOW};
 
 #[async_trait]
 impl AbstractMessages for ReferenceDb {
@@ -187,6 +187,7 @@ impl AbstractMessages for ReferenceDb {
         &self,
         channel: &str,
         after_id: Option<&str>,
+        user: &str,
     ) -> Result<UnreadSummary> {
         let messages = self.messages.lock().await;
         let mut tail = messages
@@ -198,8 +199,11 @@ impl AbstractMessages for ReferenceDb {
             .collect::<Vec<_>>();
 
         // ULIDs sort lexicographically by creation time, so this is the same
-        // window Mongo's `$sort` + `$limit` sees.
+        // window Mongo's `$sort` + `$limit` sees: bound the scan first, then
+        // drop the reader's own messages, then cap what is left.
         tail.sort_by(|a, b| a.id.cmp(&b.id));
+        tail.truncate(UNREAD_SCAN_WINDOW as usize);
+        tail.retain(|message| message.author != user);
         tail.truncate(UNREAD_COUNT_CAP as usize);
 
         Ok(UnreadSummary {

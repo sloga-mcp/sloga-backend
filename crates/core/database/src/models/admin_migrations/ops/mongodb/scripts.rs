@@ -26,7 +26,7 @@ struct MigrationInfo {
     revision: i32,
 }
 
-pub const LATEST_REVISION: i32 = 71; // MUST BE +1 to last migration
+pub const LATEST_REVISION: i32 = 73; // MUST BE +1 to last migration
 
 pub async fn migrate_database(db: &MongoDb) {
     let migrations = db.col::<Document>("migrations");
@@ -2398,7 +2398,201 @@ pub async fn run_migrations(db: &MongoDb, revision: i32) -> i32 {
     }
 
     if revision <= 70 {
-        info!("Running migration [revision 70 / 23-09-2026]: Designate a server's lone voice channel named afk as its AFK channel");
+        info!("Running migration [revision 70 / 25-09-2026]: Add UseSoundboard to pre-soundboard servers' default permissions");
+
+        // UseSoundboard joined DEFAULT_PERMISSION with the soundboard itself
+        // (2026-07-14), but DEFAULT_PERMISSION is copied onto a server at
+        // creation, so servers made before that never got it and every
+        // member there hit 403 on the soundboard. Revision 61 only created
+        // the `sounds` collection.
+        //
+        // Unlike revision 68, this runs months after the bit existed, so a
+        // server created since then that lacks it had it taken away on
+        // purpose. Only servers created before 2026-07-15T00:00Z are touched:
+        // ULID ids sort by creation time, and 01KXHH5F00 is that instant's
+        // 10-character time prefix. `$bit or` only adds the bit and is a
+        // no-op on re-run.
+        db.col::<Document>("servers")
+            .update_many(
+                doc! { "_id": { "$lt": "01KXHH5F00" } },
+                doc! {
+                    "$bit": {
+                        "default_permissions": {
+                            "or": ChannelPermission::UseSoundboard as i64
+                        },
+                    }
+                },
+            )
+            .await
+            .expect("Failed to add UseSoundboard to default_permissions");
+    }
+
+    if revision <= 71 {
+        info!("Running migration [revision 71 / 25-09-2026]: Create referrals / referral_codes / donations / donation_claim_codes collections, add supporter indexes to users (referrals + donation perks)");
+
+        // Same idempotency contract as prior collection migrations;
+        // mirrors init.rs. The unique specs here MUST stay identical to
+        // the copies in init.rs.
+        db.db().create_collection("referrals").await.ok();
+        db.db().create_collection("referral_codes").await.ok();
+        db.db().create_collection("donations").await.ok();
+        db.db().create_collection("donation_claim_codes").await.ok();
+
+        db.db()
+            .run_command(doc! {
+                "createIndexes": "referrals",
+                "indexes": [
+                    // Serves the per-referrer counts by status (profile
+                    // tally and the weekly cap) via the referrer prefix.
+                    {
+                        "key": {
+                            "referrer": 1_i32,
+                            "status": 1_i32
+                        },
+                        "name": "referrer_status"
+                    },
+                    // Serves the crond sweep over Pending rows.
+                    {
+                        "key": {
+                            "status": 1_i32
+                        },
+                        "name": "status"
+                    }
+                ]
+            })
+            .await
+            .expect("Failed to create referrals indexes.");
+
+        db.db()
+            .run_command(doc! {
+                "createIndexes": "referral_codes",
+                "indexes": [
+                    // ENFORCES one code per user — the lazy create is a
+                    // TOCTOU and the loser of a concurrent first-fetch race
+                    // must fail here. Also serves the by-user lookup and
+                    // the account-deletion cascade.
+                    {
+                        "key": {
+                            "user": 1_i32
+                        },
+                        "name": "user",
+                        "unique": true
+                    }
+                ]
+            })
+            .await
+            .expect("Failed to create referral_codes indexes.");
+
+        db.db()
+            .run_command(doc! {
+                "createIndexes": "donations",
+                "indexes": [
+                    // ENFORCES webhook idempotency — Ko-fi retries deliver
+                    // the same message_id, and a concurrent redelivery must
+                    // fail here rather than record the donation twice.
+                    {
+                        "key": {
+                            "message_id": 1_i32
+                        },
+                        "name": "message_id",
+                        "unique": true
+                    },
+                    // Serves the supporter-total recompute and the
+                    // account-deletion unlink.
+                    {
+                        "key": {
+                            "user": 1_i32
+                        },
+                        "name": "user"
+                    },
+                    // Serves the claim-by-email match and the stale-HMAC
+                    // wipe. Sparse: rows with no email, or already
+                    // wiped, have NO payer_hmac field.
+                    {
+                        "key": {
+                            "payer_hmac": 1_i32
+                        },
+                        "name": "payer_hmac",
+                        "sparse": true
+                    }
+                ]
+            })
+            .await
+            .expect("Failed to create donations indexes.");
+
+        db.db()
+            .run_command(doc! {
+                "createIndexes": "donation_claim_codes",
+                "indexes": [
+                    // Serves the by-user lookup and the account-deletion
+                    // cascade.
+                    {
+                        "key": {
+                            "user": 1_i32
+                        },
+                        "name": "user"
+                    }
+                ]
+            })
+            .await
+            .expect("Failed to create donation_claim_codes indexes.");
+
+        // All sparse: each field is absent on almost every user, so the
+        // indexes hold only the few users that carry it.
+        db.db()
+            .run_command(doc! {
+                "createIndexes": "users",
+                "indexes": [
+                    // Multikey: serves attaching a renewal to its user by
+                    // payer HMAC.
+                    {
+                        "key": {
+                            "supporter.payer_hmacs": 1_i32
+                        },
+                        "name": "supporter.payer_hmacs",
+                        "sparse": true
+                    },
+                    // Serves the crond scan for users still owed a
+                    // referral verdict.
+                    {
+                        "key": {
+                            "referral_pending": 1_i32
+                        },
+                        "name": "referral_pending",
+                        "sparse": true
+                    },
+                    // Serves the welcome-trial expiry window scan.
+                    {
+                        "key": {
+                            "welcomed_at": 1_i32
+                        },
+                        "name": "welcomed_at",
+                        "sparse": true
+                    },
+                    // Serves the monthly-supporter lapse window scan.
+                    {
+                        "key": {
+                            "supporter.monthly_until": 1_i32
+                        },
+                        "name": "supporter.monthly_until",
+                        "sparse": true
+                    },
+                    // Serves the referral-milestone threshold scan.
+                    {
+                        "key": {
+                            "referral_count": 1_i32
+                        },
+                        "name": "referral_count",
+                        "sparse": true
+                    }
+                ]
+            })
+            .await
+            .expect("Failed to create users supporter indexes.");
+    }
+
+    if revision <= 72 {
+        info!("Running migration [revision 72 / 27-09-2026]: Designate a server's lone voice channel named afk as its AFK channel");
 
         // Before the AFK channel was a server setting, the client treated any
         // channel whose lower-cased name is "afk" as one (join muted). This
@@ -2513,7 +2707,7 @@ pub async fn run_migrations(db: &MongoDb, revision: i32) -> i32 {
     LATEST_REVISION.max(revision)
 }
 
-/// Revision 70 (the A11 backfill): which channel, if any, becomes a server's
+/// Revision 72 (the A11 backfill): which channel, if any, becomes a server's
 /// AFK channel. Pure, so every case is unit-tested without a database.
 ///
 /// Designates only when the server has no `afk_channel_id` yet and EXACTLY one
@@ -2554,7 +2748,7 @@ fn afk_backfill_designation(
 }
 
 #[cfg(test)]
-mod tests {
+mod afk_backfill_tests {
     use super::*;
     use crate::{Channel, VoiceInformation};
 
@@ -2610,12 +2804,12 @@ mod tests {
         panic!("unbalanced braces from byte {open}");
     }
 
-    /// The `if revision <= 70` block of `run_migrations`.
+    /// The `if revision <= 72` block of `run_migrations`.
     fn backfill_block() -> &'static str {
-        let needle = format!("if revision <= 70 {OPEN}");
+        let needle = format!("if revision <= 72 {OPEN}");
         let at = shipping()
             .find(&needle)
-            .expect("the revision 70 migration block");
+            .expect("the revision 72 migration block");
         braced(shipping(), at + needle.len() - 1)
     }
 
@@ -2715,12 +2909,12 @@ mod tests {
     }
 
     #[test]
-    fn latest_revision_is_71() {
-        assert_eq!(LATEST_REVISION, 71, "the AFK backfill is revision 70");
+    fn latest_revision_is_73() {
+        assert_eq!(LATEST_REVISION, 73, "the AFK backfill is revision 72");
     }
 
     #[test]
-    fn backfill_is_the_last_migration_and_guarded_by_revision_70() {
+    fn backfill_is_the_last_migration_and_guarded_by_revision_72() {
         let guards: Vec<i32> = shipping()
             .match_indices("if revision <= ")
             .map(|(at, needle)| {
@@ -2732,9 +2926,9 @@ mod tests {
             })
             .collect();
         assert_eq!(
-            guards.iter().filter(|guard| **guard == 70).count(),
+            guards.iter().filter(|guard| **guard == 72).count(),
             1,
-            "exactly one `if revision <= 70` block"
+            "exactly one `if revision <= 72` block"
         );
         assert_eq!(
             guards.iter().max(),
@@ -2794,5 +2988,81 @@ mod tests {
                 "the backfill must only $set one field; found {needle}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{
+        mongodb::bson::{doc, Document},
+        Database,
+    };
+    use revolt_permissions::ChannelPermission;
+
+    /// Revision 70 must add UseSoundboard to servers made before the
+    /// soundboard existed, and leave every later server exactly as it is:
+    /// one of those lacking the bit had it removed by its owner.
+    #[tokio::test]
+    async fn revision_70_backfills_soundboard_only_on_pre_soundboard_servers() {
+        // What `database_test!` does, by hand: the macro names the database
+        // after this file's path and line, which from this deep a path comes
+        // to 73 characters, past MongoDB's 63-character limit.
+        let db = crate::DatabaseInfo::Test("migration_rev70_soundboard".to_string())
+            .connect()
+            .await
+            .expect("Database connection failed.");
+        db.drop_database().await;
+        let guard = crate::test_teardown::TestDatabaseGuard::arm(&db).await;
+
+        {
+            #[allow(irrefutable_let_patterns)]
+            let Database::MongoDb(mongo) = db.clone()
+            else {
+                // The migration scripts are MongoDB-only.
+                db.drop_database().await;
+                guard.disarm();
+                return;
+            };
+
+            let bit = ChannelPermission::UseSoundboard as i64;
+            let servers = mongo.col::<Document>("servers");
+            servers
+                .insert_many(vec![
+                    // before the 2026-07-15 cutoff (01KXHH5F00), lacking it
+                    doc! { "_id": "01KX0000000000000000000000", "default_permissions": 1_i64 },
+                    // before the cutoff, already has it
+                    doc! { "_id": "01KX0000000000000000000001", "default_permissions": bit | 2 },
+                    // after the cutoff, lacking it on purpose
+                    doc! { "_id": "01KZ0000000000000000000000", "default_permissions": 1_i64 },
+                ])
+                .await
+                .expect("insert servers");
+
+            super::run_migrations(&mongo, 70).await;
+
+            let permissions = |id: &'static str| {
+                let servers = servers.clone();
+                async move {
+                    servers
+                        .find_one(doc! { "_id": id })
+                        .await
+                        .expect("find")
+                        .expect("server")
+                        .get_i64("default_permissions")
+                        .expect("i64")
+                }
+            };
+
+            assert_eq!(permissions("01KX0000000000000000000000").await, 1 | bit);
+            assert_eq!(permissions("01KX0000000000000000000001").await, bit | 2);
+            assert_eq!(
+                permissions("01KZ0000000000000000000000").await,
+                1,
+                "a server created after the soundboard shipped must be left alone"
+            );
+        }
+
+        db.drop_database().await;
+        guard.disarm();
     }
 }

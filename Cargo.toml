@@ -23,7 +23,7 @@ async-trait = "0.1.89"
 tokio = "1.49.0"
 async-channel = "2.3.1"
 futures = "0.3.32"
-async-tungstenite = "0.17.0"
+async-tungstenite = "0.23.0"
 futures-locks = "0.7.1"
 async-lock = "2.8.0"
 async-recursion = "1.0.4"
@@ -33,7 +33,6 @@ tokio-util = { version = "0.7.18" }
 anyhow = "1.0.100"
 thiserror = "2.0.18"
 sentry = "0.31.5"
-sentry-anyhow = "0.38.1"
 
 # Data Validation
 regex = "1.12.3"
@@ -195,6 +194,8 @@ jsonwebtoken = { version = "10.4.0", features = ["rust_crypto"] }
 rust-argon2 = "1.0.0"
 base32 = "0.4.0"
 sha1 = "0.10.6"
+hmac = "0.12"
+subtle = "2.6"
 futures-lite = "2.6.1"
 
 # Build Dependencies

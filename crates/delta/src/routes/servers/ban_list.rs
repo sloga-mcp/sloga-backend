@@ -36,7 +36,12 @@ pub async fn list(
         )
         .await?
         .into_iter()
-        .map(|u| u.into_self(false)),
+        .map(|u| async move {
+            let mut user = u.into_self(false).await;
+            // Perks are private to the account owner.
+            user.perks = 0;
+            user
+        }),
     )
     .await;
 

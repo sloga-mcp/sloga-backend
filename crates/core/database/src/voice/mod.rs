@@ -3625,7 +3625,7 @@ async fn sync_server_channel_voice_permissions(
 ///   server it created moments ago, before step 6 creates any membership. No
 ///   member exists yet, so nobody can be in its voice channels and there is
 ///   no grant to re-sync;
-/// - the revision-70 migration (the "afk"-named-channel backfill), which runs
+/// - the revision-72 migration (the "afk"-named-channel backfill), which runs
 ///   at deploy with no `VoiceClient` to sync through. Members already sitting
 ///   in a backfilled channel keep the grant they were minted until they
 ///   rejoin; the migration's own comment records that;

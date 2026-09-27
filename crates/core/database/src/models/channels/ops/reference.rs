@@ -181,6 +181,53 @@ impl AbstractChannels for ReferenceDb {
         }
     }
 
+    /// Compare-and-set under the mutex, so the check and the write are atomic on this driver.
+    async fn set_last_message_id_if_newer(
+        &self,
+        channel_id: &str,
+        message_id: &str,
+        reopen_dm: bool,
+    ) -> Result<bool> {
+        let mut channels = self.channels.lock().await;
+        let (last_message_id, active) = match channels.get_mut(channel_id) {
+            Some(Channel::DirectMessage {
+                last_message_id,
+                active,
+                ..
+            }) => (last_message_id, Some(active)),
+            Some(
+                Channel::Group {
+                    last_message_id, ..
+                }
+                | Channel::TextChannel {
+                    last_message_id, ..
+                }
+                | Channel::Thread {
+                    last_message_id, ..
+                }
+                | Channel::Forum {
+                    last_message_id, ..
+                },
+            ) => (last_message_id, None),
+            // Saved Messages has no pointer; a missing channel is not an error here.
+            Some(Channel::SavedMessages { .. }) | None => return Ok(false),
+        };
+
+        if last_message_id
+            .as_deref()
+            .is_some_and(|current| current >= message_id)
+        {
+            return Ok(false);
+        }
+
+        *last_message_id = Some(message_id.to_owned());
+        if let (Some(active), true) = (active, reopen_dm) {
+            *active = true;
+        }
+
+        Ok(true)
+    }
+
     // Remove a user from a group
     async fn remove_user_from_group(&self, channel: &str, user: &str) -> Result<()> {
         let mut channels = self.channels.lock().await;
@@ -212,6 +259,9 @@ impl AbstractChannels for ReferenceDb {
     async fn delete_channel(&self, channel: &Channel) -> Result<()> {
         let mut channels = self.channels.lock().await;
         if channels.remove(channel.id()).is_some() {
+            // Mirrors Mongo's unread purge; lock order is channels, then channel_unreads.
+            let mut unreads = self.channel_unreads.lock().await;
+            unreads.retain(|key, _| key.channel != channel.id());
             Ok(())
         } else {
             Err(create_error!(NotFound))

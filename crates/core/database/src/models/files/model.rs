@@ -74,6 +74,7 @@ auto_derived!(
         ServerIcon,
         RoleIcon,
         CalendarEvent,
+        UserBadge,
     }
 
     /// Information about what the file was used for
@@ -317,6 +318,25 @@ impl File {
             FileUsedFor {
                 id: parent.to_owned(),
                 object_type: FileUsedForType::RoleIcon,
+            },
+            uploader_id.to_owned(),
+        )
+        .await
+    }
+
+    /// Use a file for a user custom badge
+    pub async fn use_custom_badge(
+        db: &Database,
+        id: &str,
+        parent: &str,
+        uploader_id: &str,
+    ) -> Result<File> {
+        db.find_and_use_attachment(
+            id,
+            "icons",
+            FileUsedFor {
+                id: parent.to_owned(),
+                object_type: FileUsedForType::UserBadge,
             },
             uploader_id.to_owned(),
         )

@@ -331,6 +331,235 @@ impl AbstractUsers for MongoDb {
             .map(|_| ())
             .map_err(|_| create_database_error!("bulk_write", COL))
     }
+
+    /// Fetch the user whose supporter payer hashes contain the given hash
+    async fn fetch_user_by_payer_hmac(&self, hmac: &str) -> Result<Option<User>> {
+        query!(
+            self,
+            find_one,
+            COL,
+            doc! {
+                "supporter.payer_hmacs": hmac
+            }
+        )
+    }
+
+    /// Fetch all users with a referral count of at least `n`
+    async fn fetch_users_with_referral_count_at_least(&self, n: i32) -> Result<Vec<User>> {
+        query!(
+            self,
+            find,
+            COL,
+            doc! {
+                "referral_count": {
+                    "$gte": n
+                }
+            }
+        )
+    }
+
+    /// Fetch all users welcomed between the given timestamps (in milliseconds)
+    async fn fetch_users_welcomed_between(&self, from_ms: i64, to_ms: i64) -> Result<Vec<User>> {
+        query!(
+            self,
+            find,
+            COL,
+            doc! {
+                "welcomed_at": {
+                    "$gte": from_ms,
+                    "$lt": to_ms
+                }
+            }
+        )
+    }
+
+    /// Fetch all users whose monthly supporter status ends between the given
+    /// timestamps (in milliseconds)
+    async fn fetch_users_monthly_until_between(
+        &self,
+        from_ms: i64,
+        to_ms: i64,
+    ) -> Result<Vec<User>> {
+        query!(
+            self,
+            find,
+            COL,
+            doc! {
+                "supporter.monthly_until": {
+                    "$gte": from_ms,
+                    "$lt": to_ms
+                }
+            }
+        )
+    }
+
+    /// Fetch all users with a pending referral
+    async fn fetch_users_with_referral_pending(&self) -> Result<Vec<User>> {
+        query!(
+            self,
+            find,
+            COL,
+            doc! {
+                "referral_pending": true
+            }
+        )
+    }
+
+    /// Claim a payer hash for a user
+    async fn claim_payer_hmac(&self, user_id: &str, hmac: &str) -> Result<Vec<String>> {
+        ensure_supporter(self, user_id).await?;
+
+        // Add to this user first, so a missing user never costs anyone else the hash
+        let result = self
+            .col::<User>(COL)
+            .update_one(
+                doc! {
+                    "_id": user_id
+                },
+                doc! {
+                    "$addToSet": {
+                        "supporter.payer_hmacs": hmac
+                    }
+                },
+            )
+            .await
+            .map_err(|_| create_database_error!("update_one", COL))?;
+
+        if result.matched_count == 0 {
+            return Err(create_error!(NotFound));
+        }
+
+        let losers: Vec<String> = self
+            .col::<DocumentId>(COL)
+            .find(doc! {
+                "supporter.payer_hmacs": hmac,
+                "_id": {
+                    "$ne": user_id
+                }
+            })
+            .with_options(FindOptions::builder().projection(doc! { "_id": 1 }).build())
+            .await
+            .map_err(|_| create_database_error!("find", COL))?
+            .filter_map(|s| async { s.ok() })
+            .map(|user| user.id)
+            .collect()
+            .await;
+
+        if !losers.is_empty() {
+            self.col::<User>(COL)
+                .update_many(
+                    doc! {
+                        "_id": {
+                            "$in": &losers
+                        }
+                    },
+                    doc! {
+                        "$pull": {
+                            "supporter.payer_hmacs": hmac
+                        }
+                    },
+                )
+                .await
+                .map_err(|_| create_database_error!("update_many", COL))?;
+        }
+
+        Ok(losers)
+    }
+
+    /// Set a user's supporter totals
+    async fn set_supporter_totals(
+        &self,
+        user_id: &str,
+        lifetime_usd_cents: i64,
+        monthly_until: Option<i64>,
+    ) -> Result<()> {
+        ensure_supporter(self, user_id).await?;
+
+        let update = if let Some(monthly_until) = monthly_until {
+            doc! {
+                "$set": {
+                    "supporter.lifetime_usd_cents": lifetime_usd_cents,
+                    "supporter.monthly_until": monthly_until
+                }
+            }
+        } else {
+            doc! {
+                "$set": {
+                    "supporter.lifetime_usd_cents": lifetime_usd_cents
+                },
+                "$unset": {
+                    "supporter.monthly_until": 1_i32
+                }
+            }
+        };
+
+        self.col::<User>(COL)
+            .update_one(
+                doc! {
+                    "_id": user_id
+                },
+                update,
+            )
+            .await
+            .map_err(|_| create_database_error!("update_one", COL))
+            .and_then(|result| {
+                if result.matched_count == 0 {
+                    Err(create_error!(NotFound))
+                } else {
+                    Ok(())
+                }
+            })
+    }
+
+    /// Set whether a user's supporter badges are shown
+    async fn set_supporter_show_badges(&self, user_id: &str, show: bool) -> Result<()> {
+        ensure_supporter(self, user_id).await?;
+
+        self.col::<User>(COL)
+            .update_one(
+                doc! {
+                    "_id": user_id
+                },
+                doc! {
+                    "$set": {
+                        "supporter.show_badges": show
+                    }
+                },
+            )
+            .await
+            .map_err(|_| create_database_error!("update_one", COL))
+            .and_then(|result| {
+                if result.matched_count == 0 {
+                    Err(create_error!(NotFound))
+                } else {
+                    Ok(())
+                }
+            })
+    }
+}
+
+/// Create an empty `supporter` for the user if they have none yet
+async fn ensure_supporter(db: &MongoDb, user_id: &str) -> Result<()> {
+    db.col::<User>(COL)
+        .update_one(
+            doc! {
+                "_id": user_id,
+                "supporter": {
+                    "$exists": false
+                }
+            },
+            doc! {
+                "$set": {
+                    "supporter": {
+                        "lifetime_usd_cents": 0_i64,
+                        "show_badges": true
+                    }
+                }
+            },
+        )
+        .await
+        .map(|_| ())
+        .map_err(|_| create_database_error!("update_one", COL))
 }
 
 impl IntoDocumentPath for FieldsUser {
@@ -346,7 +575,13 @@ impl IntoDocumentPath for FieldsUser {
             FieldsUser::DisplayName => "display_name",
             FieldsUser::Pronouns => "pronouns",
             FieldsUser::Connections => "connections",
+            FieldsUser::NameStyle => "name_style",
+            FieldsUser::CustomBadge => "custom_badge",
             FieldsUser::Suspension => "suspended_until",
+            FieldsUser::Supporter => "supporter",
+            FieldsUser::ReferralPending => "referral_pending",
+            FieldsUser::WelcomedAt => "welcomed_at",
+            FieldsUser::ReferralCount => "referral_count",
             FieldsUser::None => "none",
         })
     }

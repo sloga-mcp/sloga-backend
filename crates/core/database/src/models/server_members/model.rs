@@ -248,7 +248,15 @@ impl Member {
     }
 
     /// Get this user's current ranking
+    ///
+    /// Lower is higher. The owner outranks every role, whatever roles they
+    /// hold: an owner with no roles used to rank `i64::MAX`, the very bottom,
+    /// so anyone with a moderation permission passed the rank check against them.
     pub fn get_ranking(&self, server: &Server) -> i64 {
+        if self.id.user == server.owner {
+            return i64::MIN;
+        }
+
         let mut value = i64::MAX;
         for role in &self.roles {
             if let Some(role) = server.roles.get(role) {

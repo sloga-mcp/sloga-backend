@@ -148,6 +148,17 @@ pub enum ErrorType {
         max: usize,
     },
 
+    // ? Referral and supporter perk errors
+    /// The caller does not hold the perk this change needs (for example a
+    /// name style part they have not unlocked)
+    PerkRequired,
+    /// The referral code is unknown, malformed or cannot be used by this
+    /// account
+    InvalidReferralCode,
+    /// The donation cannot be claimed in its current state (already claimed,
+    /// under review or otherwise not open to a claim)
+    InvalidClaim,
+
     // ? Bot related errors
     ReachedMaximumBots,
     IsBot,

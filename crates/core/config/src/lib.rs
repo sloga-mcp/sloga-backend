@@ -10,7 +10,7 @@ use serde::Deserialize;
 #[cfg(feature = "sentry")]
 pub use sentry::{capture_error, capture_message, Level};
 #[cfg(feature = "anyhow")]
-pub use sentry_anyhow::capture_anyhow;
+pub use sentry::integrations::anyhow::capture_anyhow;
 
 #[cfg(all(feature = "report-macros", feature = "sentry"))]
 #[macro_export]
@@ -182,6 +182,11 @@ pub struct PushVapid {
     pub queue: String,
     pub private_key: String,
     pub public_key: String,
+    /// Previous private key, tried once when a push service rejects the
+    /// primary (401/403) so dormant subscriptions survive a rotation.
+    /// Empty = fallback disabled. Defaulted so a config without it still boots.
+    #[serde(default)]
+    pub legacy_private_key: String,
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -206,6 +211,9 @@ pub struct PushApn {
     pub pkcs8: String,
     pub key_id: String,
     pub team_id: String,
+    /// APNs topic — must equal the iOS app's bundle identifier, or Apple
+    /// rejects every push with `TopicDisallowed` and nothing is delivered.
+    pub topic: String,
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -443,6 +451,30 @@ pub struct ApiGifs {
     pub giphy_key: String,
 }
 
+/// Ko-fi donation webhook. Both secrets belong in Revolt.overrides.toml,
+/// never in the baked config. An empty `verification_token` means every
+/// webhook call is refused.
+#[derive(Deserialize, Debug, Clone)]
+#[serde(default)]
+pub struct ApiKofi {
+    /// Shared token Ko-fi sends with each webhook, compared in constant time
+    pub verification_token: String,
+    /// Server secret keying the HMAC of payer emails (never a plain hash)
+    pub email_hmac_key: String,
+    /// Public Ko-fi page linked from the client
+    pub page_url: String,
+}
+
+impl Default for ApiKofi {
+    fn default() -> Self {
+        Self {
+            verification_token: String::new(),
+            email_hmac_key: String::new(),
+            page_url: "https://ko-fi.com/slogatech".to_string(),
+        }
+    }
+}
+
 #[derive(Deserialize, Debug, Clone)]
 pub struct Api {
     pub registration: ApiRegistration,
@@ -461,6 +493,8 @@ pub struct Api {
     pub apps: ApiApps,
     #[serde(default)]
     pub import: ApiImport,
+    #[serde(default)]
+    pub kofi: ApiKofi,
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -529,6 +563,14 @@ impl Pushd {
 #[derive(Deserialize, Debug, Clone)]
 pub struct January {
     pub blocked_domains: Vec<String>,
+    /// Emit Audio embeds for direct audio links and serve `GET /audio`
+    pub audio_embeds: bool,
+    /// Largest audio file (in bytes) that is embedded or relayed
+    pub max_audio_bytes: usize,
+    /// Maximum number of concurrent `/audio` streams
+    pub max_audio_streams: usize,
+    /// Wall-clock limit (in seconds) for a single `/audio` stream
+    pub max_audio_stream_secs: u64,
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -602,12 +644,26 @@ pub struct FeaturesLimits {
     pub file_upload_size_limit: HashMap<String, usize>,
 }
 
+/// Upload-perk overlay. Not a full limits block: only these upload sizes
+/// are laid over `default` for a user holding the upload perk.
+#[derive(Deserialize, Debug, Clone, Default)]
+pub struct PerkLimits {
+    #[serde(default)]
+    pub file_upload_size_limit: HashMap<String, usize>,
+}
+
 #[derive(Deserialize, Debug, Clone)]
 pub struct FeaturesLimitsCollection {
     pub global: GlobalLimits,
 
     pub new_user: FeaturesLimits,
     pub default: FeaturesLimits,
+
+    // Must stay a named field: serde matches named keys before `roles`
+    // collects the rest, and a partial `perk` table would not parse as a
+    // full `FeaturesLimits` role. Absent = the perk is off.
+    #[serde(default)]
+    pub perk: Option<PerkLimits>,
 
     #[serde(flatten)]
     pub roles: HashMap<String, FeaturesLimits>,
@@ -1091,5 +1147,131 @@ mod afk_auto_move_tests {
             .expect("the config deserializes");
 
         assert!(!settings.features.afk_auto_move);
+    }
+}
+
+// Built the way CONFIG_BUILDER builds it: the embedded Revolt.toml first, then
+// a later TOML source standing in for Revolt.overrides.toml. Key fields are
+// compared with `assert!`, never `assert_eq!`, so a failure prints no values.
+#[cfg(test)]
+mod vapid_config_tests {
+    use super::Settings;
+    use config::{Config, File, FileFormat};
+
+    const DEFAULT_VAPID_QUEUE: &str = "notifications.outbound.vapid";
+
+    // Obviously fake placeholders; the merge does not care what they hold.
+    const OVERRIDES: &str = r#"
+[pushd.vapid]
+private_key = "fake-primary-private-key-placeholder"
+public_key = "fake-primary-public-key-placeholder"
+legacy_private_key = "fake-legacy-private-key-placeholder"
+"#;
+
+    #[test]
+    fn overrides_vapid_table_keeps_default_queue() {
+        let settings = Config::builder()
+            .add_source(File::from_str(
+                include_str!("../Revolt.toml"),
+                FileFormat::Toml,
+            ))
+            .add_source(File::from_str(OVERRIDES, FileFormat::Toml))
+            .build()
+            .expect("embedded defaults plus overrides must build")
+            .try_deserialize::<Settings>()
+            .expect("merged config must deserialize");
+
+        let vapid = &settings.pushd.vapid;
+        assert_eq!(vapid.queue, DEFAULT_VAPID_QUEUE);
+        assert!(
+            vapid.private_key == "fake-primary-private-key-placeholder",
+            "private_key did not take the override"
+        );
+        assert!(
+            vapid.public_key == "fake-primary-public-key-placeholder",
+            "public_key did not take the override"
+        );
+        assert!(
+            vapid.legacy_private_key == "fake-legacy-private-key-placeholder",
+            "legacy_private_key did not take the override"
+        );
+    }
+
+    #[test]
+    fn missing_legacy_private_key_defaults_to_empty() {
+        let without_legacy = include_str!("../Revolt.toml")
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("legacy_private_key"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let config = Config::builder()
+            .add_source(File::from_str(&without_legacy, FileFormat::Toml))
+            .build()
+            .expect("embedded defaults must build");
+
+        // The key must really be gone, or this test proves nothing.
+        assert!(config.get_string("pushd.vapid.legacy_private_key").is_err());
+
+        let settings = config
+            .try_deserialize::<Settings>()
+            .expect("a config without pushd.vapid.legacy_private_key must deserialize");
+
+        assert!(
+            settings.pushd.vapid.legacy_private_key.is_empty(),
+            "legacy_private_key must default to empty"
+        );
+        assert_eq!(settings.pushd.vapid.queue, DEFAULT_VAPID_QUEUE);
+    }
+}
+
+#[cfg(test)]
+mod january_tests {
+    use std::collections::HashMap;
+
+    use config::{builder::DefaultState, Config, ConfigBuilder, Environment, File, FileFormat};
+
+    use super::{January, Settings};
+
+    /// Only the bundled defaults, so no local override file can skew the result
+    fn bundled() -> ConfigBuilder<DefaultState> {
+        Config::builder().add_source(File::from_str(
+            include_str!("../Revolt.toml"),
+            FileFormat::Toml,
+        ))
+    }
+
+    #[test]
+    fn audio_embed_defaults() {
+        let settings: Settings = bundled().build().unwrap().try_deserialize().unwrap();
+
+        assert!(!settings.january.audio_embeds);
+        assert_eq!(settings.january.max_audio_bytes, 52_428_800);
+        assert_eq!(settings.january.max_audio_streams, 32);
+        assert_eq!(settings.january.max_audio_stream_secs, 600);
+    }
+
+    #[test]
+    fn audio_embeds_env_override() {
+        // Same environment source as CONFIG_BUILDER, fed from a map instead of
+        // the process environment so tests cannot race on global state
+        let vars = HashMap::from([(
+            "REVOLT__JANUARY__AUDIO_EMBEDS".to_owned(),
+            "true".to_owned(),
+        )]);
+
+        let january: January = bundled()
+            .add_source(
+                Environment::with_prefix("REVOLT")
+                    .separator("__")
+                    .source(Some(vars)),
+            )
+            .build()
+            .unwrap()
+            .get("january")
+            .unwrap();
+
+        assert!(january.audio_embeds);
+        assert_eq!(january.max_audio_bytes, 52_428_800);
     }
 }

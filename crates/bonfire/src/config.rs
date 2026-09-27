@@ -206,3 +206,59 @@ impl handshake::server::Callback for WebsocketHandshakeCallback {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use futures::{SinkExt, StreamExt};
+    use tokio_util::compat::TokioAsyncReadCompatExt;
+
+    use super::*;
+
+    /// The upgrade path websocket::client runs, end to end over an in-memory
+    /// pipe: the callback sees the query, and frames flow both ways.
+    #[tokio::test]
+    async fn handshake_reads_the_query_and_frames_round_trip() {
+        let (server_io, client_io) = tokio::io::duplex(64 * 1024);
+        let (sender, receiver) = futures::channel::oneshot::channel();
+
+        let server = tokio::spawn(async move {
+            async_tungstenite::accept_hdr_async_with_config(
+                server_io.compat(),
+                WebsocketHandshakeCallback::from(sender),
+                None,
+            )
+            .await
+        });
+
+        let (mut client, _) = async_tungstenite::client_async(
+            "ws://localhost/?version=1&format=msgpack&token=abc",
+            client_io.compat(),
+        )
+        .await
+        .expect("client handshake");
+        let mut server = server.await.expect("join").expect("server handshake");
+
+        let config = receiver.await.expect("configuration");
+        assert_eq!(config.get_protocol_version(), 1);
+        assert!(matches!(config.get_protocol_format(), ProtocolFormat::Msgpack));
+        assert_eq!(config.get_session_token().as_deref(), Some("abc"));
+
+        client
+            .send(Message::Binary(vec![1, 2, 3]))
+            .await
+            .expect("client send");
+        assert_eq!(
+            server.next().await.expect("frame").expect("read"),
+            Message::Binary(vec![1, 2, 3])
+        );
+
+        server
+            .send(Message::Text("ready".to_string()))
+            .await
+            .expect("server send");
+        assert_eq!(
+            client.next().await.expect("frame").expect("read"),
+            Message::Text("ready".to_string())
+        );
+    }
+}

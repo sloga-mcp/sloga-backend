@@ -1,7 +1,8 @@
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
-use revolt_database::{iso8601_timestamp::Timestamp, Database};
+use revolt_database::{iso8601_timestamp::Timestamp, now_ms, Database, PERK_RETENTION_DAYS};
+use revolt_models::v0::UserPerks;
 use revolt_result::Result;
 use tokio::time::sleep;
 
@@ -11,10 +12,21 @@ use log::info;
 const SIZE_THRESHOLD: usize = 20_000_000; // 20 MB
 /// How long a large message attachment is retained before it is pruned.
 const MAX_AGE: Duration = Duration::from_secs(60 * 60 * 24); // 24 hours
+/// Retention for a large attachment whose uploader currently has the upload perk.
+const PERK_MAX_AGE: Duration = Duration::from_secs(60 * 60 * 24 * PERK_RETENTION_DAYS as u64);
 
 /// Servers whose message attachments are exempt from pruning (kept indefinitely).
 /// - `01KX3JTSZETQ5MQDGEJ3PVAZGJ` = "Sloga Official"
 const EXEMPT_SERVER_IDS: &[&str] = &["01KX3JTSZETQ5MQDGEJ3PVAZGJ"];
+
+/// Whether a large attachment of this age has outlived its retention window.
+fn past_retention(age: Duration, uploader_has_perk: bool) -> bool {
+    if uploader_has_perk {
+        age > PERK_MAX_AGE
+    } else {
+        age > MAX_AGE
+    }
+}
 
 pub async fn task(db: Database, _: revolt_database::AMQP) -> Result<()> {
     loop {
@@ -36,6 +48,41 @@ pub async fn task(db: Database, _: revolt_database::AMQP) -> Result<()> {
             sleep(Duration::from_secs(60 * 60)).await;
             continue;
         }
+
+        // Uploaders who currently hold the upload perk keep their large
+        // attachments for `PERK_MAX_AGE` instead. A missing or deleted
+        // uploader has no perks and falls back to `MAX_AGE`.
+        let uploader_ids: Vec<String> = expired
+            .iter()
+            .filter_map(|file| file.uploader_id.clone())
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
+        let now = now_ms();
+        let perk_uploaders: HashSet<String> = db
+            .fetch_users(&uploader_ids)
+            .await?
+            .into_iter()
+            .filter(|user| user.perks(now) & UserPerks::UploadPerk as u32 != 0)
+            .map(|user| user.id)
+            .collect();
+
+        let expired: Vec<_> = expired
+            .into_iter()
+            .filter(|file| {
+                let age = file
+                    .uploaded_at
+                    .and_then(|uploaded_at| {
+                        Duration::try_from(Timestamp::now_utc().duration_since(uploaded_at)).ok()
+                    })
+                    .unwrap_or_default();
+                let has_perk = file
+                    .uploader_id
+                    .as_ref()
+                    .is_some_and(|id| perk_uploaders.contains(id));
+                past_retention(age, has_perk)
+            })
+            .collect();
 
         // Build the set of channel ids belonging to exempt servers. Message
         // attachments in these channels are kept regardless of size/age.
@@ -93,11 +140,42 @@ pub async fn task(db: Database, _: revolt_database::AMQP) -> Result<()> {
             //    respecting hash de-duplication and the `reported` (moderation) hold.
             db.mark_attachments_as_deleted(&file_ids).await?;
             info!(
-                "Pruned {} large message attachment(s) older than 24h",
-                file_ids.len()
+                "Pruned {} large message attachment(s) past retention (24h, {}d with the upload perk)",
+                file_ids.len(),
+                PERK_RETENTION_DAYS
             );
         }
 
         sleep(Duration::from_secs(60 * 60)).await; // run hourly
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const HOUR: Duration = Duration::from_secs(60 * 60);
+    const DAY: Duration = Duration::from_secs(60 * 60 * 24);
+
+    #[test]
+    fn perk_uploader_kept_at_three_days() {
+        assert!(!past_retention(DAY * 3, true));
+    }
+
+    #[test]
+    fn non_perk_uploader_pruned_at_25_hours() {
+        assert!(past_retention(HOUR * 25, false));
+    }
+
+    #[test]
+    fn perk_uploader_pruned_at_eight_days() {
+        assert!(past_retention(DAY * 8, true));
+    }
+
+    #[test]
+    fn perk_window_matches_retention_days() {
+        assert_eq!(PERK_MAX_AGE, DAY * PERK_RETENTION_DAYS as u32);
+        assert!(!past_retention(PERK_MAX_AGE, true));
+        assert!(!past_retention(MAX_AGE, false));
     }
 }

@@ -20,13 +20,22 @@ use consumers::{
         fr_accepted::FRAcceptedConsumer, fr_received::FRReceivedConsumer, generic::GenericConsumer,
         mass_mention::MassMessageConsumer, message::MessageConsumer,
     },
-    outbound::{apn::ApnsOutboundConsumer, fcm::FcmOutboundConsumer, vapid::VapidOutboundConsumer},
+    outbound::{
+        apn::ApnsOutboundConsumer,
+        fcm::FcmOutboundConsumer,
+        vapid::{self, VapidOutboundConsumer},
+    },
 };
 
 use crate::utils::{Consumer, Delegate};
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn main() {
+    // Validate the VAPID config and exit, before logging, the database or RabbitMQ are touched
+    if std::env::args().any(|a| a == "--check-config") {
+        std::process::exit(check_config().await);
+    }
+
     // Configure logging and environment
     revolt_config::configure!(pushd);
 
@@ -206,6 +215,133 @@ async fn main() {
 
     for channel in channels {
         let _ = channel.close(0, "close".into()).await;
+    }
+}
+
+/// `revolt-pushd --check-config`: load the config through the same sources and merge as a
+/// normal start, derive the VAPID public points and print only lengths and sha256 prefixes.
+/// Returns the process exit code: 0 if the config is safe to start with, 1 otherwise.
+async fn check_config() -> i32 {
+    // A panic message may quote config contents, so only its location is printed
+    std::panic::set_hook(Box::new(|info| match info.location() {
+        Some(location) => eprintln!(
+            "check-config: panic at {}:{}",
+            location.file(),
+            location.line()
+        ),
+        None => eprintln!("check-config: panic"),
+    }));
+
+    let Ok(config) = tokio::task::spawn(config()).await else {
+        println!("config=unloadable");
+        return 1;
+    };
+
+    let keys = &config.pushd.vapid;
+
+    let primary_derived = vapid::derive_public_b64url(&keys.private_key);
+    match &primary_derived {
+        Ok(public) => println!(
+            "primary-derived len={} sha256={}",
+            public.len(),
+            vapid::sha256_prefix(public)
+        ),
+        Err(_) => println!("primary-derived=unparseable"),
+    }
+
+    let config_public = vapid::normalize_b64url(&keys.public_key);
+    println!(
+        "config-public len={} sha256={}",
+        config_public.len(),
+        vapid::sha256_prefix(&config_public)
+    );
+
+    let legacy_derived = if keys.legacy_private_key.is_empty() {
+        println!("legacy=empty");
+        None
+    } else {
+        let derived = vapid::derive_public_b64url(&keys.legacy_private_key);
+        match &derived {
+            Ok(public) => println!(
+                "legacy-derived len={} sha256={}",
+                public.len(),
+                vapid::sha256_prefix(public)
+            ),
+            Err(_) => println!("legacy-derived=unparseable"),
+        }
+        Some(derived)
+    };
+
+    println!(
+        "queue present={}",
+        if keys.queue.is_empty() { "no" } else { "yes" }
+    );
+
+    if check_config_verdict(&primary_derived, &config_public, legacy_derived.as_ref()) {
+        0
+    } else {
+        1
+    }
+}
+
+/// The primary key's derived public point must equal the normalized config `public_key`,
+/// and a legacy key, when set, must parse
+fn check_config_verdict(
+    primary_derived: &Result<String, String>,
+    config_public: &str,
+    legacy_derived: Option<&Result<String, String>>,
+) -> bool {
+    let primary_ok = matches!(primary_derived, Ok(public) if public == config_public);
+    let legacy_ok = legacy_derived.is_none_or(|legacy| legacy.is_ok());
+
+    primary_ok && legacy_ok
+}
+
+#[cfg(test)]
+mod tests {
+    use super::check_config_verdict;
+
+    fn derived(public: &str) -> Result<String, String> {
+        Ok(public.to_string())
+    }
+
+    fn unparseable() -> Result<String, String> {
+        Err("unparseable".to_string())
+    }
+
+    #[test]
+    fn vapid_check_config_match_passes() {
+        assert!(check_config_verdict(&derived("point-a"), "point-a", None));
+        assert!(check_config_verdict(
+            &derived("point-a"),
+            "point-a",
+            Some(&derived("point-b"))
+        ));
+    }
+
+    #[test]
+    fn vapid_check_config_mismatch_fails() {
+        assert!(!check_config_verdict(&derived("point-a"), "point-b", None));
+        assert!(!check_config_verdict(
+            &derived("point-a"),
+            "point-b",
+            Some(&derived("point-c"))
+        ));
+    }
+
+    #[test]
+    fn vapid_check_config_unparseable_primary_fails() {
+        assert!(!check_config_verdict(&unparseable(), "point-a", None));
+        assert!(!check_config_verdict(&unparseable(), "", None));
+    }
+
+    #[test]
+    fn vapid_check_config_unparseable_legacy_fails() {
+        assert!(!check_config_verdict(
+            &derived("point-a"),
+            "point-a",
+            Some(&unparseable())
+        ));
     }
 }
 

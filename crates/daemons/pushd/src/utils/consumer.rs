@@ -88,3 +88,14 @@ impl<C: Consumer> ConsumerDelegate for Delegate<C> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn capture_anyhow_reaches_the_bound_sentry_client() {
+        let events = sentry::test::with_captured_events(|| {
+            revolt_config::capture_anyhow(&anyhow::anyhow!("pushd consumer failed"));
+        });
+        assert_eq!(events.len(), 1);
+    }
+}

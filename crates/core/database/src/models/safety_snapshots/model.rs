@@ -115,7 +115,7 @@ impl SnapshotContent {
     }
 
     /// Generate snapshot from a given user
-    pub fn generate_from_user(user: User) -> Result<(SnapshotContent, Vec<String>)> {
+    pub fn generate_from_user(mut user: User) -> Result<(SnapshotContent, Vec<String>)> {
         // Collect user's avatar and profile background
         let files = [
             user.avatar.as_ref(),
@@ -126,6 +126,13 @@ impl SnapshotContent {
         .iter()
         .filter_map(|x| x.as_ref().map(|x| x.id.to_string()))
         .collect();
+
+        // Strip donation and referral state; it is not moderation evidence
+        // and must not outlive the account's own deletion
+        user.supporter = None;
+        user.referral_count = None;
+        user.referral_pending = None;
+        user.welcomed_at = None;
 
         Ok((SnapshotContent::User(user), files))
     }

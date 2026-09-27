@@ -1,6 +1,6 @@
 use revolt_database::{
     util::{permissions::DatabasePermissionQuery, reference::Reference},
-    Database, User, AMQP,
+    Channel, Database, Referral, ReferralActivity, User, AMQP,
 };
 use revolt_permissions::{calculate_channel_permissions, ChannelPermission};
 use revolt_result::{create_error, Result};
@@ -31,10 +31,13 @@ pub async fn ack(
         .await
         .throw_if_lacking_channel_permission(ChannelPermission::ViewChannel)?;
 
-    channel
-        .ack(&user.id, message.id, amqp)
-        .await
-        .map(|_| EmptyResponse)
+    channel.ack(&user.id, message.id, amqp).await?;
+
+    if !matches!(channel, Channel::SavedMessages { .. }) {
+        Referral::record_activity(db, &user, ReferralActivity::Ack).await;
+    }
+
+    Ok(EmptyResponse)
 }
 
 #[cfg(test)]

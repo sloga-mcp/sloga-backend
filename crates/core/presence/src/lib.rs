@@ -119,26 +119,40 @@ pub async fn filter_online(user_ids: &'_ [String]) -> HashSet<String> {
 
     // Otherwise, go ahead as normal.
     if let Ok(mut conn) = get_connection().await {
-        // Ok so, if this breaks, that means we've lost the Redis patch which adds SMISMEMBER
-        // Currently it's patched in through a forked repository, investigate what happen to it
-        let data: Vec<bool> = conn
-            .smismember(ONLINE_SET, user_ids)
-            .await
-            .expect("this shouldn't happen, please read this code! presence/mod.rs");
-
-        if data.is_empty() {
-            return set;
-        }
-
-        // We filter known values to figure out who is online.
-        for i in 0..user_ids.len() {
-            if data[i] {
-                set.insert(user_ids[i].to_string());
-            }
-        }
+        // SMISMEMBER comes from the Redis patch in our forked repository;
+        // if it goes missing, investigate what happened to it.
+        set = online_from_flags(user_ids, conn.smismember(ONLINE_SET, user_ids).await);
     }
 
     set
+}
+
+/// Map an SMISMEMBER reply onto the set of online user IDs.
+///
+/// This never panics: its callers include long-lived tasks (the ack worker,
+/// pushd consumers, bonfire). A Redis error means "treat nobody as online",
+/// the same as failing to get a connection, and a short reply only covers
+/// the IDs it has flags for.
+#[cfg(feature = "redis-is-patched")]
+fn online_from_flags<E: std::fmt::Debug>(
+    user_ids: &[String],
+    res: Result<Vec<bool>, E>,
+) -> HashSet<String> {
+    match res {
+        Ok(data) => user_ids
+            .iter()
+            .zip(data)
+            .filter(|(_, online)| *online)
+            .map(|(id, _)| id.clone())
+            .collect(),
+        Err(err) => {
+            error!(
+                "Failed to check online status of {} users: {err:?}",
+                user_ids.len()
+            );
+            HashSet::new()
+        }
+    }
 }
 
 /// Check whether a set of users is online, returns a set of the online user IDs
@@ -244,5 +258,33 @@ mod tests {
 
         let user_ids = filter_online(&[user_id.to_string(), other_id.to_string()]).await;
         assert!(user_ids.is_empty())
+    }
+}
+
+#[cfg(all(test, feature = "redis-is-patched"))]
+mod online_from_flags_tests {
+    use crate::online_from_flags;
+    use std::collections::HashSet;
+
+    fn ids() -> Vec<String> {
+        vec!["id0".to_string(), "id1".to_string(), "id2".to_string()]
+    }
+
+    #[test]
+    fn online_from_flags_err_is_empty() {
+        let set = online_from_flags(&ids(), Err::<Vec<bool>, &str>("boom"));
+        assert!(set.is_empty());
+    }
+
+    #[test]
+    fn online_from_flags_short_vec_does_not_panic() {
+        let set = online_from_flags(&ids(), Ok::<_, &str>(vec![true]));
+        assert_eq!(set, HashSet::from(["id0".to_string()]));
+    }
+
+    #[test]
+    fn online_from_flags_maps_flags() {
+        let set = online_from_flags(&ids(), Ok::<_, &str>(vec![true, false, true]));
+        assert_eq!(set, HashSet::from(["id0".to_string(), "id2".to_string()]));
     }
 }

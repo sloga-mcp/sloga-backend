@@ -3,8 +3,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use revolt_database::{
     events::client::EventV1,
     util::{idempotency::IdempotencyKey, permissions::DatabasePermissionQuery},
-    Channel, Database, File, FileUsedForType, Message, ScheduledMessage, ScheduledMessageStatus,
-    User, AMQP,
+    Channel, Database, File, FileUsedForType, Message, MessageFilter, MessageQuery,
+    MessageTimePeriod, ScheduledMessage, ScheduledMessageStatus, User, AMQP,
 };
 use revolt_models::v0;
 use revolt_permissions::{calculate_channel_permissions, ChannelPermission, PermissionQuery};
@@ -126,6 +126,58 @@ async fn fail(db: &Database, row: &ScheduledMessage, reason: &str) {
     }
     .private(row.author.clone())
     .await;
+}
+
+/// Whether the author has already read everything in the channel.
+///
+/// A live send acks the channel for its author, but a scheduled delivery
+/// happens while the author is absent: acking unconditionally would mark
+/// messages other people sent in the meantime as read without the author
+/// ever seeing them. So the delivery only keeps the author caught up if they
+/// already were — their read pointer is at (or past) the newest message.
+///
+/// Reads the newest message itself rather than the channel's
+/// `last_message_id`, which is written by a debounced worker and can lag. Any
+/// error, a missing unread row or an unset pointer answers `false`: the
+/// channel then stays unread, which is the safe direction.
+async fn author_caught_up(db: &Database, user_id: &str, channel_id: &str) -> bool {
+    let last_read = match db.fetch_unread(user_id, channel_id).await {
+        Ok(Some(unread)) => unread.last_id,
+        Ok(None) => None,
+        Err(err) => {
+            revolt_config::capture_error(&err);
+            return false;
+        }
+    };
+
+    let newest = match db
+        .fetch_messages(MessageQuery {
+            limit: Some(1),
+            filter: MessageFilter {
+                channel: Some(channel_id.to_string()),
+                ..Default::default()
+            },
+            time_period: MessageTimePeriod::Absolute {
+                before: None,
+                after: None,
+                sort: Some(v0::MessageSort::Latest),
+            },
+        })
+        .await
+    {
+        Ok(messages) => messages.into_iter().next(),
+        Err(err) => {
+            revolt_config::capture_error(&err);
+            return false;
+        }
+    };
+
+    match newest {
+        // Nothing to have missed.
+        None => true,
+        // Ids are ULIDs, so string order is creation order.
+        Some(newest) => last_read.is_some_and(|last_read| last_read >= newest.id),
+    }
 }
 
 /// Attempt delivery of one claimed row. Any `Err` is a PERMANENT failure
@@ -287,6 +339,10 @@ async fn deliver(db: &Database, amqp: &AMQP, row: &ScheduledMessage) -> std::res
         None
     };
 
+    // Only move the author's read pointer if they were already caught up;
+    // see `author_caught_up`.
+    let ack_author = author_caught_up(db, &user.id, &row.channel).await;
+
     // The stored payload's nonce was already consumed at schedule time and
     // stripped; the row id doubles as the delivery nonce so clients can
     // correlate the arriving message with their pending entry.
@@ -304,6 +360,7 @@ async fn deliver(db: &Database, amqp: &AMQP, row: &ScheduledMessage) -> std::res
         allow_mentions,
         Some(message_id),
         Some(resolved),
+        ack_author,
     )
     .await
     .map_err(|error| format!("the message could not be sent ({:?})", error.error_type))?;
@@ -328,4 +385,220 @@ async fn deliver(db: &Database, amqp: &AMQP, row: &ScheduledMessage) -> std::res
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use revolt_database::{
+        DatabaseInfo, MessageFilter, MessageQuery, MessageTimePeriod, Relationship,
+        RelationshipStatus,
+    };
+
+    fn make_user(username: &str, relations: Option<Vec<Relationship>>) -> User {
+        User {
+            id: Ulid::new().to_string(),
+            username: username.to_string(),
+            discriminator: "0001".to_string(),
+            relations,
+            // `deliver` re-fetches the author and rejects any non-zero flags.
+            flags: None,
+            ..Default::default()
+        }
+    }
+
+    // `insert_user` / `insert_channel` are disallowed in favor of
+    // `Object::create()`, but this test needs bare rows and nothing else (the
+    // same exemption as `discord_import/worker.rs`).
+    #[allow(clippy::disallowed_methods)]
+    async fn insert_fixtures(db: &Database, users: &[&User], dm: &Channel) {
+        for user in users {
+            db.insert_user(user).await.unwrap();
+        }
+        db.insert_channel(dm).await.unwrap();
+    }
+
+    /// A claimed row. Content carries no URL, so the embed worker never calls
+    /// January.
+    fn claimed_row(author: &User, channel: &str) -> ScheduledMessage {
+        ScheduledMessage {
+            id: Ulid::new().to_string(),
+            author: author.id.clone(),
+            channel: channel.to_string(),
+            server: None,
+            scheduled_at: now_ms(),
+            data: v0::DataMessageSend {
+                nonce: None,
+                content: Some("scheduled side-effect witness".to_string()),
+                attachments: None,
+                replies: None,
+                embeds: None,
+                masquerade: None,
+                interactions: None,
+                components: None,
+                sticker_ids: None,
+                flags: None,
+            },
+            status: ScheduledMessageStatus::Sending,
+            failure_reason: None,
+        }
+    }
+
+    /// `deliver` mints the message id internally; the row id is stamped on
+    /// the delivered message as its nonce.
+    async fn delivered_id(db: &Database, row: &ScheduledMessage) -> String {
+        db.fetch_messages(MessageQuery {
+            limit: Some(50),
+            filter: MessageFilter {
+                channel: Some(row.channel.clone()),
+                ..Default::default()
+            },
+            time_period: MessageTimePeriod::Absolute {
+                before: None,
+                after: None,
+                sort: None,
+            },
+        })
+        .await
+        .expect("fetch_messages")
+        .into_iter()
+        .find(|message| message.nonce.as_deref() == Some(row.id.as_str()))
+        .expect("no delivered message carries the row id as its nonce")
+        .id
+    }
+
+    async fn dm_active(db: &Database, id: &str) -> bool {
+        match db.fetch_channel(id).await.expect("fetch dm") {
+            Channel::DirectMessage { active, .. } => active,
+            _ => panic!("fixture channel is not a DM"),
+        }
+    }
+
+    async fn mentions(db: &Database, user: &str, channel: &str) -> Option<Vec<String>> {
+        db.fetch_unread(user, channel)
+            .await
+            .expect("fetch_unread")
+            .and_then(|unread| unread.mentions)
+    }
+
+    /// Scheduled delivery only QUEUES its last_message_id / mention+push
+    /// side effects; they land only once `start_side_effect_workers` runs.
+    ///
+    /// Phase 1 is the in-test known-bad control (no workers: nothing lands),
+    /// phase 2 starts the workers and requires every witness to land.
+    /// Witnesses: the last_message_id worker flips a DM `active` false → true
+    /// (the DM-reopen side effect, which fires only when the delivered id
+    /// advances the pointer) and records the delivered id as the DM's
+    /// `last_message_id`, and the ack worker records the recipient's mention
+    /// of the delivered id.
+    ///
+    /// The queues are process statics, and other crond tests (the
+    /// discord_import worker tests → `Member::create`) may enqueue into them.
+    /// Run this test alone (name filter, `--ignored`). It asserts only on its
+    /// own channel ids.
+    ///
+    /// The base config keeps `pushd.production = true`, so the ack worker
+    /// publishes pushes to the `-prd` routing key. That is harmless only
+    /// because this test must run against an isolated RabbitMQ with no pushd
+    /// consumer: nothing declares the `revolt.notifications` exchange there
+    /// (only pushd does), so the broker rejects the publish and closes the
+    /// channel, and nothing is delivered. Never point it at a RabbitMQ that
+    /// has a pushd consumer.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "needs isolated local Redis + RabbitMQ; TEST_DB=REFERENCE"]
+    async fn scheduled_delivery_side_effects_drain_only_with_workers() {
+        assert_eq!(
+            std::env::var("TEST_DB").as_deref(),
+            Ok("REFERENCE"),
+            "refusing to run without TEST_DB=REFERENCE"
+        );
+
+        let db = DatabaseInfo::Reference.connect().await.expect("database");
+        let amqp = AMQP::new_auto().await;
+
+        let other = make_user("sched-other", None);
+        let author = make_user(
+            "sched-author",
+            Some(vec![Relationship {
+                id: other.id.clone(),
+                status: RelationshipStatus::Friend,
+                note: None,
+            }]),
+        );
+        let dm = Channel::DirectMessage {
+            id: Ulid::new().to_string(),
+            active: false,
+            recipients: vec![author.id.clone(), other.id.clone()],
+            last_message_id: None,
+        };
+        insert_fixtures(&db, &[&author, &other], &dm).await;
+
+        let group = Channel::create_group(
+            &db,
+            v0::DataCreateGroup {
+                name: "scheduled".to_string(),
+                users: [other.id.clone()].into_iter().collect(),
+                ..Default::default()
+            },
+            author.id.clone(),
+        )
+        .await
+        .expect("create_group");
+
+        let dm_row = claimed_row(&author, dm.id());
+        let group_row = claimed_row(&author, group.id());
+        for row in [&dm_row, &group_row] {
+            deliver(&db, &amqp, row)
+                .await
+                .unwrap_or_else(|reason| panic!("deliver failed: {reason}"));
+        }
+        let dm_message = delivered_id(&db, &dm_row).await;
+        let group_message = delivered_id(&db, &group_row).await;
+
+        // Phase 1: no workers, so nothing drains.
+        sleep(Duration::from_secs(8)).await;
+        assert!(!dm_active(&db, dm.id()).await, "DM went active without workers");
+        assert_eq!(db.fetch_unread(&other.id, dm.id()).await.unwrap(), None);
+        assert_eq!(db.fetch_unread(&other.id, group.id()).await.unwrap(), None);
+
+        // Phase 2: start the workers. A worker commits once more than 5 s
+        // have passed since it picked the task up (checked on a 1 s loop, so
+        // ~6 s); the poll below is bounded by this test's own 30 s deadline.
+        crate::start_side_effect_workers(&db, &amqp);
+
+        let dm_expected = Some(vec![dm_message]);
+        let group_expected = Some(vec![group_message]);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            if dm_active(&db, dm.id()).await
+                && mentions(&db, &other.id, dm.id()).await == dm_expected
+                && mentions(&db, &other.id, group.id()).await == group_expected
+            {
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                break;
+            }
+            sleep(Duration::from_millis(250)).await;
+        }
+
+        assert!(dm_active(&db, dm.id()).await, "DM never went active");
+        // The worker sets `active` and `last_message_id` in one write, so the
+        // pointer has landed too; `dm_expected` holds exactly the delivered id.
+        match db.fetch_channel(dm.id()).await.expect("fetch dm") {
+            Channel::DirectMessage {
+                last_message_id, ..
+            } => assert_eq!(
+                last_message_id.map(|id| vec![id]),
+                dm_expected,
+                "DM last_message_id is not the delivered id"
+            ),
+            _ => panic!("fixture channel is not a DM"),
+        }
+        assert_eq!(mentions(&db, &other.id, dm.id()).await, dm_expected);
+        assert_eq!(mentions(&db, &other.id, group.id()).await, group_expected);
+        // The author is never a recipient of their own message.
+        assert_eq!(db.fetch_unread(&author.id, dm.id()).await.unwrap(), None);
+        assert_eq!(db.fetch_unread(&author.id, group.id()).await.unwrap(), None);
+    }
 }

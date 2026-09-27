@@ -217,6 +217,34 @@ impl AbstractChannels for MongoDb {
         .map(|_| ())
     }
 
+    /// Set last_message_id only if newer; see the trait for semantics.
+    async fn set_last_message_id_if_newer(
+        &self,
+        channel_id: &str,
+        message_id: &str,
+        reopen_dm: bool,
+    ) -> Result<bool> {
+        let mut set = doc! { "last_message_id": message_id };
+        if reopen_dm {
+            set.insert("active", true);
+        }
+
+        self.col::<Document>(COL)
+            .update_one(
+                doc! {
+                    "_id": channel_id,
+                    "channel_type": { "$ne": "SavedMessages" },
+                    // `$not/$gte` matches a missing field, null, or a strictly
+                    // older id; a bare `$lt` would never set the first pointer.
+                    "last_message_id": { "$not": { "$gte": message_id } }
+                },
+                doc! { "$set": set },
+            )
+            .await
+            .map(|result| result.modified_count == 1)
+            .map_err(|_| create_database_error!("update_one", COL))
+    }
+
     // Remove a user from a group
     async fn remove_user_from_group(&self, channel: &str, user: &str) -> Result<()> {
         self.col::<Document>(COL)
@@ -330,7 +358,29 @@ impl AbstractChannels for MongoDb {
         .await?;
 
         // Delete the channel itself
-        query!(self, delete_one_by_id, COL, channel.id()).map(|_| ())
+        query!(self, delete_one_by_id, COL, channel.id())?;
+
+        // Purge unreads a second time, now that the channel is gone.
+        // A writer that raced the first purge checks the channel still
+        // exists after its write: if it saw the channel, its row was
+        // written before this purge and is removed here; if it did not,
+        // the writer removes its own row.
+        //
+        // The channel is already deleted and the caller publishes
+        // ChannelDelete next, so a failure here is logged, not returned.
+        if let Err(err) = self
+            .col::<Document>("channel_unreads")
+            .delete_many(doc! {
+                "_id.channel": &id
+            })
+            .await
+            .map_err(|_| create_database_error!("delete_many", "channel_unreads"))
+        {
+            error!("Failed to purge unreads for deleted channel {id}: {err:?}");
+            revolt_config::capture_error(&err);
+        }
+
+        Ok(())
     }
 }
 

@@ -67,6 +67,10 @@ impl<'r> Responder<'r, 'static> for Error {
             ErrorType::NotEnoughBoosts { .. } => Status::BadRequest,
             ErrorType::TooManyBoosts { .. } => Status::BadRequest,
 
+            ErrorType::PerkRequired => Status::Forbidden,
+            ErrorType::InvalidReferralCode => Status::BadRequest,
+            ErrorType::InvalidClaim => Status::Conflict,
+
             ErrorType::ReachedMaximumBots => Status::BadRequest,
             ErrorType::IsBot => Status::BadRequest,
             ErrorType::IsNotBot => Status::BadRequest,

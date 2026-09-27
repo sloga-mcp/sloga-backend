@@ -393,7 +393,7 @@ impl Server {
     /// `afk_channel_id`.** It names how long a member idles before being moved
     /// to the AFK channel, so with no channel designated there is nothing for
     /// it to mean. The five are this helper, `server_edit`, `channel_create`,
-    /// the Discord import worker and the revision-70 migration. Concretely:
+    /// the Discord import worker and the revision-72 migration. Concretely:
     ///
     /// - clearing the channel clears the timeout - this helper, and the
     ///   `remove: ["AfkChannel"]` path in `server_edit`, which appends
@@ -406,7 +406,7 @@ impl Server {
     ///   timeout it writes (or any timeout the server already carried) has a
     ///   destination by construction;
     /// - the Discord import writes a timeout only alongside the AFK channel it
-    ///   maps, and the revision-70 migration writes the channel and never a
+    ///   maps, and the revision-72 migration writes the channel and never a
     ///   timeout.
     ///
     /// Of the five, only the two routes re-sync live LiveKit grants

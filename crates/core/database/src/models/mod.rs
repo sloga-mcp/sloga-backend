@@ -8,6 +8,7 @@ mod channel_unreads;
 mod channel_webhooks;
 mod channels;
 mod discord_import_jobs;
+mod donations;
 mod e2ee;
 mod emojis;
 mod file_hashes;
@@ -25,6 +26,7 @@ mod thread_members;
 mod upload_sessions;
 mod policy_changes;
 mod ratelimit_events;
+mod referrals;
 mod remote_control_audit;
 mod safety_reports;
 mod safety_snapshots;
@@ -50,6 +52,7 @@ pub use channel_unreads::*;
 pub use channel_webhooks::*;
 pub use channels::*;
 pub use discord_import_jobs::*;
+pub use donations::*;
 pub use e2ee::*;
 pub use emojis::*;
 pub use file_hashes::*;
@@ -67,6 +70,10 @@ pub use thread_members::*;
 pub use upload_sessions::*;
 pub use policy_changes::*;
 pub use ratelimit_events::*;
+pub use referrals::*;
+// calendar_events also glob-exports a crate-private `now_ms`; this explicit
+// import keeps `crate::now_ms` from being ambiguous between the two globs.
+pub use referrals::now_ms;
 pub use remote_control_audit::*;
 pub use safety_reports::*;
 pub use safety_snapshots::*;
@@ -100,6 +107,7 @@ pub trait AbstractDatabase:
     + channel_unreads::AbstractChannelUnreads
     + channel_webhooks::AbstractWebhooks
     + discord_import_jobs::AbstractDiscordImportJobs
+    + donations::AbstractDonations
     + e2ee::AbstractE2EE
     + emojis::AbstractEmojis
     + mls::AbstractMls
@@ -117,6 +125,7 @@ pub trait AbstractDatabase:
     + stream_connections::AbstractStreamConnections
     + policy_changes::AbstractPolicyChange
     + ratelimit_events::AbstractRatelimitEvents
+    + referrals::AbstractReferrals
     + remote_control_audit::AbstractRemoteControlAudit
     + safety_reports::AbstractReport
     + safety_snapshots::AbstractSnapshot

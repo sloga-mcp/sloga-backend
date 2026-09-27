@@ -129,6 +129,14 @@ call_ring_duration = 30
 # Minimum allowed length of usernames
 min_username_length = 2
 
+[api.kofi]
+# Ko-fi webhook verification token (secret, set only in deployment overrides)
+verification_token = ""
+# HMAC key used to hash donor emails before storage (secret, set only in deployment overrides)
+email_hmac_key = ""
+# Public Ko-fi page that donation links point to
+page_url = "https://ko-fi.com/slogatech"
+
 [pushd]
 # this changes the names of the queues to not overlap 
 # prod/beta if they happen to be on the same exchange/instance.
@@ -157,9 +165,13 @@ ack_queue = "notifications.process.ack"                  # updates badges for ap
 
 
 [pushd.vapid]
+# Production keys go ONLY in Revolt.overrides.toml. These values are upstream Revolt's
+# public defaults; they are committed and therefore not secret.
 queue = "notifications.outbound.vapid"
 private_key = "LS0tLS1CRUdJTiBFQyBQUklWQVRFIEtFWS0tLS0tCk1IY0NBUUVFSUJSUWpyTWxLRnBiVWhsUHpUbERvcEliYk1yeVNrNXpKYzVYVzIxSjJDS3hvQW9HQ0NxR1NNNDkKQXdFSG9VUURRZ0FFWnkrQkg2TGJQZ2hEa3pEempXOG0rUXVPM3pCajRXT1phdkR6ZU00c0pqbmFwd1psTFE0WAp1ZDh2TzVodU94QWhMQlU3WWRldVovWHlBdFpWZmNyQi9BPT0KLS0tLS1FTkQgRUMgUFJJVkFURSBLRVktLS0tLQo"
 public_key = "BGcvgR-i2z4IQ5Mw841vJvkLjt8wY-FjmWrw83jOLCY52qcGZS0OF7nfLzuYbjsQISwVO2HXrmf18gLWVX3Kwfw="
+# Previous private key, tried once when the primary is rejected (401/403). Empty disables it.
+legacy_private_key = ""
 
 [pushd.fcm]
 queue = "notifications.outbound.fcm"
@@ -180,9 +192,20 @@ queue = "notifications.outbound.apn"
 pkcs8 = ""
 key_id = ""
 team_id = ""
+# Must match the iOS bundle identifier exactly. A mismatch is not an error you
+# will see on the device: APNs returns TopicDisallowed and the push is dropped.
+topic = "gg.sloga.app"
 
 [january]
 blocked_domains = []
+# Embed direct audio links with an inline player and serve `GET /audio`
+audio_embeds = false
+# Largest audio file (in bytes) that is embedded or relayed (50 MiB)
+max_audio_bytes = 52_428_800
+# Maximum number of concurrent `/audio` streams
+max_audio_streams = 32
+# Wall-clock limit (in seconds) for a single `/audio` stream
+max_audio_stream_secs = 600
 
 [files]
 # Encryption key for stored files
@@ -440,6 +463,8 @@ banners = 6_000_000
 stickers = 500_000
 emojis = 500_000
 soundboard = 1_000_000
+
+# An optional [features.limits.perk] table overlays only file_upload_size_limit for users with the upload perk.
 
 [features.advanced]
 # The max amount of messages the rabbitmq provider/db mention adder job will delay for before forcing handling of a channel.

@@ -78,9 +78,14 @@ pub async fn fetch_forum_posts(
     }
 
     let mut query = DatabasePermissionQuery::new(db, &user).channel(&channel);
-    calculate_channel_permissions(&mut query)
-        .await
-        .throw_if_lacking_channel_permission(ChannelPermission::ViewChannel)?;
+    let permissions = calculate_channel_permissions(&mut query).await;
+    permissions.throw_if_lacking_channel_permission(ChannelPermission::ViewChannel)?;
+
+    // Post titles and tags are channel metadata, visible with ViewChannel like
+    // the channel list. The starter messages are message content, so they
+    // follow the same ReadMessageHistory rule as fetching messages does.
+    let can_read_history =
+        permissions.has_channel_permission(ChannelPermission::ReadMessageHistory);
 
     let requested = match sort.as_deref() {
         None | Some("latest_activity") => ForumSort::LatestActivity,
@@ -170,8 +175,11 @@ pub async fn fetch_forum_posts(
     posts.truncate(limit);
 
     // Starter messages are pinned to their post's id, so the whole page
-    // resolves in one bulk fetch.
-    let starters = if include_starters.unwrap_or(false) {
+    // resolves in one bulk fetch. A caller without ReadMessageHistory gets an
+    // empty list rather than an error, so the post list itself still renders.
+    let starters = if include_starters.unwrap_or(false) && !can_read_history {
+        Some(Vec::new())
+    } else if include_starters.unwrap_or(false) {
         let ids: Vec<String> = posts.iter().map(|post| post.id().to_string()).collect();
         Some(
             db.fetch_messages_by_id(&ids)
@@ -193,8 +201,9 @@ pub async fn fetch_forum_posts(
 #[cfg(test)]
 mod test {
     use crate::util::test::TestHarness;
-    use revolt_database::Channel;
+    use revolt_database::{Channel, Member, PartialChannel};
     use revolt_models::v0;
+    use revolt_permissions::{ChannelPermission, OverrideField};
     use rocket::http::{ContentType, Header, Status};
 
     #[test]
@@ -273,6 +282,120 @@ mod test {
             .await;
         let page: v0::ForumPostsResponse = response.into_json().await.expect("page 1");
         assert_eq!(page.posts.len(), 2);
+    }
+
+    #[test]
+    fn starters_need_read_message_history() {
+        crate::util::test::rt().block_on(starters_need_read_message_history_case())
+    }
+
+    /// The listing used to check ViewChannel only, so a member denied
+    /// ReadMessageHistory could read every post's opening message through
+    /// `include_starters`.
+    async fn starters_need_read_message_history_case() {
+        let harness = TestHarness::new().await;
+        let (_, owner_session, owner) = harness.new_user().await;
+        let (_, member_session, member) = harness.new_user().await;
+        let (mut server, _) = harness.new_server(&owner).await;
+        let mut forum = Channel::create_server_channel(
+            &harness.db,
+            &mut server,
+            v0::DataCreateServerChannel {
+                channel_type: v0::LegacyServerChannelType::Forum,
+                name: "forum".to_string(),
+                ..Default::default()
+            },
+            true,
+        )
+        .await
+        .expect("forum created");
+        Member::create(&harness.db, &server, &member, None)
+            .await
+            .expect("member");
+
+        let response = harness
+            .client
+            .post(format!("/channels/{}/posts", forum.id()))
+            .header(Header::new("x-session-token", owner_session.token.to_string()))
+            .header(ContentType::JSON)
+            .body(
+                json!({
+                    "title": "rules",
+                    "message": { "content": "members-only history" }
+                })
+                .to_string(),
+            )
+            .dispatch()
+            .await;
+        assert_eq!(response.status(), Status::Ok);
+
+        let url = format!("/channels/{}/posts?include_starters=true", forum.id());
+        let fetch = |token: String| {
+            let client = &harness.client;
+            let url = url.clone();
+            async move {
+                let response = client
+                    .get(url)
+                    .header(Header::new("x-session-token", token))
+                    .dispatch()
+                    .await;
+                assert_eq!(response.status(), Status::Ok);
+                response
+                    .into_json::<v0::ForumPostsResponse>()
+                    .await
+                    .expect("posts response")
+            }
+        };
+
+        // Control: with the default permissions the member sees the starter.
+        let body = fetch(member_session.token.to_string()).await;
+        assert_eq!(body.posts.len(), 1);
+        assert_eq!(body.starters.expect("starters").len(), 1);
+
+        forum
+            .update(
+                &harness.db,
+                PartialChannel {
+                    default_permissions: Some(OverrideField {
+                        a: 0,
+                        d: ChannelPermission::ReadMessageHistory as i64,
+                    }),
+                    ..Default::default()
+                },
+                vec![],
+            )
+            .await
+            .expect("deny history");
+
+        // Denied history: the post is still listed, its content is not.
+        let body = fetch(member_session.token.to_string()).await;
+        assert_eq!(body.posts.len(), 1, "titles stay visible with ViewChannel");
+        assert!(
+            body.starters.expect("starters requested").is_empty(),
+            "starter content must not leak without ReadMessageHistory"
+        );
+
+        // Nor through fetching the starter by id: the listing just handed
+        // out the post id, and it is also the starter message's id.
+        let post_id = match &body.posts[0] {
+            v0::Channel::Thread { id, .. } => id.clone(),
+            other => panic!("expected thread, got {:?}", other),
+        };
+        let response = harness
+            .client
+            .get(format!("/channels/{post_id}/messages/{post_id}"))
+            .header(Header::new("x-session-token", member_session.token.to_string()))
+            .dispatch()
+            .await;
+        assert_eq!(
+            response.status(),
+            Status::Forbidden,
+            "fetching the starter by id must need ReadMessageHistory too"
+        );
+
+        // The owner bypasses the override and still gets it.
+        let body = fetch(owner_session.token.to_string()).await;
+        assert_eq!(body.starters.expect("starters").len(), 1);
     }
     #[test]
     fn posts_sort_alphabetically() {
