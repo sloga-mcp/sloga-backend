@@ -266,8 +266,12 @@ server, native or protocol change** — the resume uses two existing DS
 read routes. The final-audit fix pass (2026-09-26: install before
 active, the commit-window tail fetch, the fallback-cause line, the
 stale keys-changed fence) is committed on the same branch as `f3bf4dc8`,
-on top of wave 3. It changes §8.3 steps 5–6, §8.5 and §8.6, and those
-parts are checked against that commit.
+on top of wave 3. It changes §8.3 steps 5–6, §8.5 and §8.6. On top of
+that, the branch carries a merge of frontend `main` (commit `b1c39d6e`,
+which brings in the late-drain guard and its Welcome currency check), a
+merge wave that makes the resume and that guard agree (commit
+`b4c66b58`), and a merge fix pass (commit `e915b070`). §8.3 step 6,
+§8.5 and §8.6 are checked against `e915b070`.
 
 ### 8.1 Why
 
@@ -374,7 +378,15 @@ poisoned/desync.
    case is NOT quiet: if the install throws `MissingLocalFrameKeyError`
    (native has no send key for us at that epoch), `#onRotationError`
    latches loud (control origin) before the fallback runs. That fails
-   closed. Only after a counted install does `#startupResume` set
+   closed. After a clean catch-up (and tail, if one ran) and a counted
+   install, `#startupResume` checks two vetoes, in this order. A catch-up,
+   tail or install miss is returned before either veto runs, and falls
+   back (§8.5). First, if the session went `failed` or latched loud inside
+   the adopt window, the resume STOPS with cause `loud_during_adopt` and
+   stays loud with the gate held (§8.5). Second, if the drain re-secured
+   the session inside the window (a DS 404 on a gap refetch of the adopted
+   group), the resume falls back with cause `resecure_during_adopt`
+   (§8.5). Only past both does `#startupResume` stamp `resumed`, set
    `#joinedGeneration`, call `#toActive()`, kick one reconcile (the
    install's own kick was refused while not yet active), refresh the
    recency record and log "resumed the held call group". Then the
@@ -385,12 +397,33 @@ poisoned/desync.
    the gate could open for ~2 s on an earlier epoch's send key, a key
    a member removed in the catch-up still held. The final audit
    reproduced this (FA-B1).
-   **Live-leg readout (FAR-n1):** the `catchUpDone` and `resumed`
-   timeline stamps are written just BEFORE the install (to keep the join
-   timeline's stamp order), so a seat that fell back on
-   `install_check_failed` still shows `resumed` in its timeline. Judge a
-   leg by the cause line (§8.5) and the "resumed the held call group" log,
-   not by the stamps.
+   **Live-leg readout (FAR-n1):** `catchUpDone` is stamped just before
+   the install, and `resumed` only after the install check and both
+   vetoes passed, so a resumed seat's timeline reads
+   `catchUpDone < keysInstalled < resumed < modeE2ee`. A seat that fell
+   back (on `install_check_failed` or any other cause) or stopped never
+   stamps `resumed`. Before the merge wave, `resumed` was stamped before
+   the install, and a seat that fell back on `install_check_failed`
+   still showed it.
+   The cause line (§8.5) and the "resumed the held call group" log remain
+   the primary readout.
+
+   **Resume and the Welcome currency check.** The late-drain guard
+   (merged from `main`) holds a seat that adopts a Welcome non-active until
+   the DS confirms the Welcome's epoch is current or its commits since are
+   applied (`#confirmWelcomeCurrency`). The resume adopts a group it
+   already holds, receives no Welcome, and never runs that check: it
+   confirms currency itself (the prefetch's DS epoch or the tail's, then
+   native's). While a resume is adopting a group (`#resumeAdopting`, set
+   at the adoption and cleared on every exit), a Welcome for that group
+   writes no `#joinedGeneration`, no `welcomeAdopted` stamp and no
+   currency record. So nothing can go active beside the resume's own
+   verdict, and a fallback ladder does not read itself as joined: it
+   sends its own intent (MWA-m1). A fallback's own Welcome, which arrives
+   after `#resumeAdopting` is cleared, runs the currency check as usual.
+   The two paths share one installer: `#installCaughtUpKeys` and the
+   `#ownSendKeyEpoch` check serve both the resume catch-up (`#catchUp`)
+   and the currency check's catch-up.
 
 **Sent to the DS: no join intent, no Welcome, no commit, and no
 self-Update** (membership did not change; post-compromise security still
@@ -428,7 +461,8 @@ before its first intent.
 On a `join` decision, a null or failed prefetch, a prefetch not back
 within its 3 s bound, a candidate already being deleted, a failed grant
 clear, ANY catch-up outcome other than caught up, a failed key install
-(§8.3 step 6), or a failed tail fetch (§8.6), the device, in
+(§8.3 step 6), a failed tail fetch (§8.6), or a re-secure raised inside
+the adopt window (§8.3 step 6), the device, in
 order: aborts the prefetch; lets go of the candidate, if there was one
 (keep entry, session, recency record), and deletes it; discards the
 channel's other kept groups; ensures its KeyPackages are published; runs
@@ -462,12 +496,33 @@ lag, counts and flags, never key material or a group secret. The
   said join but no mirrored rule failed: the mirror has drifted);
 - adopt: `candidate_being_deleted`, `grant_clear_failed`;
 - catch-up: `catch_up_stopped`, `loud_foreign_drop`,
-  `native_unconfirmed`, `catch_up_threw`;
+  `native_unconfirmed`, `catch_up_threw`. A gap refetch that fails under
+  a fetched commit (`#consumeCatchUp`, counted by `#gapRefetchFailures`)
+  reports `catch_up_stopped` with the result `gap_refetch_failed`; before
+  the merge wave it reported `catch_up_threw`;
 - `tail_failed` (with `reason`: `threw`, a non-ok response kind, `lag`,
-  `short`, `own_commit` or `not_applied`);
+  `short`, `own_commit`, `gap_refetch_failed` or `not_applied`);
 - `install_check_failed`;
-- `superseded`: the session closed or a newer establish took over. This
-  is the one cause that stops rather than falling back to the ladder.
+- adopt window, after the install check: `resecure_during_adopt`. The
+  drain hit a DS 404 on a gap refetch of the adopted group inside the
+  adopt window and left the session re-securing (its rejoin request is
+  dropped by the single-flight while the establish runs). The resume
+  falls back, and the ladder takes the rejoin's place;
+- `loud_during_adopt`: the session went `failed` or latched loud inside
+  the adopt window, and the catch-up (and tail, if one ran) and the
+  install check succeeded. Only then does the resume STOP and stay loud,
+  gate held, never active. It does not fall back, because the fallback's
+  group reset (`#resetGroupBuffers`) would clear the latch. The candidate
+  stays adopted but not joined, so a close deletes it. This veto runs
+  before the re-secure one, so a session both re-securing and latched
+  stays loud. A catch-up, tail or install-check miss takes precedence
+  over it: that miss's cause (for example `catch_up_stopped`) falls back
+  through `#noResume`, and the fallback's reset clears the latch
+  (MFR-m1, §8.6);
+- `superseded`: the session closed or a newer establish took over.
+  `superseded` and `loud_during_adopt` are the two causes that stop
+  (`#resumeStopped`) rather than falling back to the ladder
+  (`#noResume`).
 
 The rule cause is derived by `resumeJoinCause`, which re-walks
 `resumeDecision`'s rules to label the line; the decision itself stays
@@ -475,24 +530,37 @@ The rule cause is derived by `resumeJoinCause`, which re-walks
 a declined resume logged only the candidate, so a live leg could not tell
 which rule sent it to the ladder (FA-m3).
 
-**Stale keys-changed fence (FA-S2).** A fallback deletes the candidate,
-and the ladder may re-enter the SAME DS group id. Native keys-changed
-pushes for commits the old incarnation applied can still be in flight.
-After the group reset zeroes `#installEpoch`, both the group-id check
-and the epoch check would pass, and the frame-key read would hit the
-deleted row (re-securing, then loud). To stop that:
+**Stale keys-changed fence (FA-S2, FAR-m2).** A startup delete removes a
+group, and the ladder may re-enter the SAME DS group id. Native
+keys-changed pushes for commits the old incarnation applied can still be
+in flight. After the group reset zeroes `#installEpoch`, both the
+group-id check and the epoch check would pass, and the frame-key read
+would hit the deleted row (re-securing, then loud). To stop that:
 
 - `#startupAppliedEpochs` records, per group, the highest epoch native
-  applied during the startup window. It is fed from every `processed`
-  outcome `#consume` sees, other groups' included, and cleared with the
-  window.
-- `#joinWithoutResume` sets `#staleKeysFence = { groupId, epoch }` AFTER
-  the group reset, and only if this page applied something for the
-  candidate.
-- `onLocalKeysChanged` drops a push for that group at or below the floor,
-  before anything else (it does not even retire the new incarnation's
-  pending grace), and logs
+  applied during the startup window (`#noteStartupApplied`). It is fed
+  from every `processed` outcome `#consume` sees, other groups' included.
+  At the end of the window every entry is cleared EXCEPT a fenced
+  group's: a fenced group's floor outlives the startup window.
+- `#staleKeysFence` is a Set of fenced group ids. It holds no epoch: the
+  floor is read live from `#startupAppliedEpochs` when each push lands,
+  so an envelope native applies for the group while its delete is still
+  being awaited raises the floor.
+- What is fenced: every `#startupWipe` target, fenced before its delete
+  is awaited, and, on the resume's fallback (`#joinWithoutResume`), every
+  group this page applied commits to during the window (the candidate
+  and the kept groups the discard deletes, whose ids only the bridge
+  knows), fenced after the candidate's group reset and awaited delete,
+  and before the channel discard and the ladder.
+- Once a fenced group is the live group again, what native applies for
+  it is the new incarnation's and no longer raises the floor its own
+  pushes are checked against.
+- `onLocalKeysChanged` drops a push for a fenced group at or below the
+  floor, before anything else (it does not even retire the new
+  incarnation's pending grace; none can be pending while the group is
+  fenced), and logs
   `[mls] keys-changed dropped: the deleted group's { groupId, epoch, floor }`.
+  A fenced group with no recorded epoch has no floor and drops nothing.
 - The fence clears at the new incarnation's first install: the first
   push above the floor that reaches the install and moves
   `#installEpoch` past it. From there the monotonic epoch check covers
@@ -505,7 +573,8 @@ deleted, never reset. So a Welcome back into the same id comes after
 everything this device applied there. The fence applies to every
 fallback that deletes a candidate, including the older
 `catch_up_stopped` one (a catch-up that applied some commits before
-stopping), not only the new install and tail causes.
+stopping), not only the install and tail causes, and to the non-resume
+startup wipe.
 
 ### 8.6 Security
 
@@ -568,13 +637,17 @@ stopping), not only the new install and tail causes.
   store, so a wipe landing mid-connect could re-create the store the user
   just destroyed. The normal flow does not reach it (the prefetch needs a
   ready device, a device id and a keep entry or recency record, and a
-  wipe clears them all). The stale keys-changed fence (§8.5) has two
-  known gaps (FAR-m2), and both fail closed. First, its floor is captured
-  BEFORE the delete is awaited, so a commit native applies for the
-  candidate during that await pushes above the floor and is not
-  dropped. Second, the non-resume `#startupWipe` path sets no fence.
-  Either way, a stale push's frame-key read hits the deleted row and the
-  seat goes re-securing, then loud.
+  wipe clears them all). The stale keys-changed fence (§8.5) covers
+  every startup delete, with a floor read when each push lands (FAR-m2,
+  fixed in the merge wave). MFR-m1 (pre-existing, found in the merge
+  fix pass re-audit): the loud veto (`loud_during_adopt`) runs only
+  after a clean catch-up. If a loud latch fires inside the adopt window
+  AND the catch-up, tail or install check also misses, the miss falls
+  back through `#noResume`, and the fallback's reset clears the latch:
+  the chip goes from red to amber and the ladder runs. It fails closed: the gate stays
+  held and no plaintext is sent. But the loud verdict, possibly the
+  only UI signal of a hostile DS, is lost from the UI. A code fix
+  (the loud veto ahead of the miss return) is a possible follow-up.
   Follow-ups: a device-level + `group.open` gate
   on the commits fetch; a client-requestable re-drain; a native
   `GroupAlreadyExists` test; a boot-time kept-group sweep; `callState`
