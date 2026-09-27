@@ -58,8 +58,12 @@ const SFU_BREAKER_TRIP: u32 = 2;
 
 /// Lifetime of every token [`VoiceClient::create_token`] mints: the join
 /// token and the server-ordered move's token alike. A token must be redeemed
-/// within it, so the SFU calls a move makes between the mint and the event
-/// that hands the token over must fit inside it (the D-5 budget pins).
+/// within it. The move therefore mints AFTER its remote-control release, its
+/// last SFU work before the emit, so no SFU call sits between the mint and
+/// the event that hands the token over (AFK S-3 WC-1; pinned in `voice/mod.rs`
+/// by `the_move_mints_after_the_release_with_no_sfu_call_before_the_emit`).
+/// It used to mint first, which put up to four SFU calls, 12 s at
+/// [`SFU_CALL_TIMEOUT`], inside this 10 s window.
 pub const MOVE_TOKEN_TTL: Duration = Duration::from_secs(10);
 
 /// Lifetime of the Android SCREEN-LEG token
@@ -127,6 +131,35 @@ struct UserEviction {
     /// the listing (legs excluded, empty sids skipped): the answer of
     /// `VoiceClient::remove_user_if_present_sids`.
     sids: Vec<String>,
+}
+
+/// Why [`VoiceClient::remove_user_if_present_sids`] failed (AFK S-3 WBR-3).
+/// The two cases need different answers from a caller that knows nothing
+/// of the user in Redis, so the eviction says which one it was.
+#[derive(Debug)]
+pub enum EvictionFailure {
+    /// The room was never listed: the node is missing from the config
+    /// (`UnknownNode`, reported nowhere yet) or the listing itself failed
+    /// (already reported as ERROR + Sentry by
+    /// [`VoiceClient::list_participants_reported`]). Nothing was evicted,
+    /// and nothing is known of who is in the room.
+    Unlisted(revolt_result::Error),
+    /// The room WAS listed, with at least one connection of the user in it,
+    /// and removing a listed connection failed (already reported as ERROR +
+    /// Sentry, with the SFU's own error). Every removal was attempted; a
+    /// connection of the user is known to be in the room and may still be
+    /// live.
+    Listed(revolt_result::Error),
+}
+
+impl EvictionFailure {
+    /// The error, whichever case it was, for a caller that answers both the
+    /// same way.
+    pub fn into_error(self) -> revolt_result::Error {
+        match self {
+            Self::Unlisted(error) | Self::Listed(error) => error,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -689,7 +722,8 @@ impl VoiceClient {
     ) -> Result<bool> {
         Ok(self
             .evict_user_connections(node, user_id, channel_id)
-            .await?
+            .await
+            .map_err(EvictionFailure::into_error)?
             .is_some_and(|evicted| evicted.any))
     }
 
@@ -706,9 +740,13 @@ impl VoiceClient {
     ///   only a leg was. A listed primary with an empty sid is still evicted
     ///   but cannot be named, so it is left out of `sids` with a WARN.
     /// - `Err`: the first real failure, returned only after every removal was
-    ///   attempted, exactly as [`Self::remove_user_if_present`]. No sids are
-    ///   returned then: a caller must not tear down the record of a
-    ///   connection that may still be live.
+    ///   attempted, exactly as [`Self::remove_user_if_present`], and TYPED
+    ///   (AFK S-3 WBR-3): [`EvictionFailure::Unlisted`] when the room could
+    ///   not be listed (an unknown node, a failed listing), so nothing is
+    ///   known of who is in it; [`EvictionFailure::Listed`] when it was
+    ///   listed with a connection of the user in it and removing a listed
+    ///   connection failed. No sids are returned either way: a caller must
+    ///   not tear down the record of a connection that may still be live.
     ///
     /// The sids are what a set-mode teardown may delete: a connection that
     /// joined AFTER the listing is not among them, so its record, and the
@@ -718,7 +756,7 @@ impl VoiceClient {
         node: &str,
         user_id: &str,
         channel_id: &str,
-    ) -> Result<Option<Vec<String>>> {
+    ) -> Result<Option<Vec<String>>, EvictionFailure> {
         Ok(self
             .evict_user_connections(node, user_id, channel_id)
             .await?
@@ -727,16 +765,21 @@ impl VoiceClient {
 
     /// The shared body of [`Self::remove_user_if_present`] and
     /// [`Self::remove_user_if_present_sids`]: `Ok(None)` for no such room,
-    /// else what was evicted (see [`UserEviction`]).
+    /// else what was evicted (see [`UserEviction`]); a failure says whether
+    /// the room was listed (see [`EvictionFailure`]).
     async fn evict_user_connections(
         &self,
         node: &str,
         user_id: &str,
         channel_id: &str,
-    ) -> Result<Option<UserEviction>> {
-        let livekit = self.get_node(node)?;
+    ) -> Result<Option<UserEviction>, EvictionFailure> {
+        let livekit = self.get_node(node).map_err(EvictionFailure::Unlisted)?;
 
-        let Some(participants) = self.list_participants_reported(node, channel_id).await? else {
+        let Some(participants) = self
+            .list_participants_reported(node, channel_id)
+            .await
+            .map_err(EvictionFailure::Unlisted)?
+        else {
             return Ok(None);
         };
 
@@ -787,7 +830,9 @@ impl VoiceClient {
 
         match super::eviction_result(outcomes) {
             Ok(()) => Ok(Some(UserEviction { any: true, sids })),
-            Err(error) => Err::<Option<UserEviction>, _>(error).to_internal_error(),
+            Err(error) => Err::<Option<UserEviction>, _>(error)
+                .to_internal_error()
+                .map_err(EvictionFailure::Listed),
         }
     }
 
@@ -2298,7 +2343,8 @@ mod sfu_s3_tests {
             not_found, ok, routes, Reply, Stub, CREATE_ROOM, DELETE_ROOM, LIST, MUTE, NODE,
             REMOVE, UPDATE,
         },
-        VoiceClient, MOVE_TOKEN_TTL, SCREEN_LEG_TOKEN_TTL, SFU_BREAKER_WINDOW, SFU_CALL_TIMEOUT,
+        EvictionFailure, VoiceClient, MOVE_TOKEN_TTL, SCREEN_LEG_TOKEN_TTL, SFU_BREAKER_WINDOW,
+        SFU_CALL_TIMEOUT,
     };
     use crate::{
         models::{Channel, User},
@@ -2824,8 +2870,14 @@ mod sfu_s3_tests {
             voice.remove_connection_if_present(NODE, U, ROOM));
         deadline_case!("remove_user_if_present", LIST, voice =>
             voice.remove_user_if_present(NODE, U, ROOM));
-        deadline_case!("remove_user_if_present_sids", LIST, voice =>
-            voice.remove_user_if_present_sids(NODE, U, ROOM));
+        // Typed since WBR-3; the variant a timeout gives (`Unlisted`) is
+        // pinned by `an_eviction_failure_says_whether_the_room_was_listed`.
+        deadline_case!("remove_user_if_present_sids", LIST, voice => async {
+            voice
+                .remove_user_if_present_sids(NODE, U, ROOM)
+                .await
+                .map_err(EvictionFailure::into_error)
+        });
         deadline_case!("list_participants_if_present", LIST, voice =>
             voice.list_participants_if_present(NODE, ROOM));
         deadline_case!("list_participants_reported", LIST, voice =>
@@ -3040,7 +3092,7 @@ mod sfu_s3_tests {
 
     /// Every room-client call in the shipping code sits inside the
     /// arguments of a `.sfu(` call. Textual, so it also covers any call the
-    /// behavioural tests above do not drive; the count floor keeps it from
+    /// behavioral tests above do not drive; the count floor keeps it from
     /// passing over nothing. The floor is today's count, 8, since the S-3
     /// cleanup deleted `remove_user` (two calls) and `mute_track` (one).
     #[test]
@@ -3137,17 +3189,32 @@ mod sfu_s3_tests {
     /// with the SFU's own error. The body lives in `evict_user_connections`
     /// (WA-R); both public entry points only delegate to it, so neither can
     /// grow a second listing or its own eviction loop.
+    ///
+    /// AFK S-3 WBR-3: the failure is typed by whether the room was listed.
+    /// The node lookup and the listing are `Unlisted`; the removals' first
+    /// failure is `Listed`, and only that. Mutations: either arm given the
+    /// other's variant (the behavioral twins in
+    /// `an_eviction_failure_says_whether_the_room_was_listed` go red too).
     #[test]
     fn remove_user_if_present_lists_reported_and_never_reads_the_mapping() {
         let body = shipping_method("async fn evict_user_connections(");
         for needle in [
-            "self.list_participants_reported(node, channel_id).await?",
+            "let livekit = self.get_node(node).map_err(EvictionFailure::Unlisted)?;",
+            "self .list_participants_reported(node, channel_id) .await \
+             .map_err(EvictionFailure::Unlisted)? else",
             "super::eviction_targets(",
             "super::eviction_result(outcomes)",
-            "Err(error) => Err::<Option<UserEviction>, _>(error).to_internal_error(),",
+            "Err(error) => Err::<Option<UserEviction>, _>(error) .to_internal_error() \
+             .map_err(EvictionFailure::Listed),",
         ] {
             assert!(body.contains(needle), "lost `{needle}`: {body}");
         }
+        assert_eq!(
+            body.matches("EvictionFailure::Unlisted").count(),
+            2,
+            "{body}"
+        );
+        assert_eq!(body.matches("EvictionFailure::Listed").count(), 1, "{body}");
         for banned in [
             "voice_participant_identity(",
             ".list_participants_if_present(",
@@ -3313,7 +3380,7 @@ mod sfu_s3_tests {
             .remove_user_if_present_sids(NODE, U, ROOM)
             .await;
         assert_eq!(stub.finish(), every, "no early exit after the failure");
-        assert!(is_internal(&result), "{result:?}");
+        assert!(internal_eviction_failure(&result, true), "{result:?}");
 
         let derived = format!("{U}::screen");
         let stub = sid_removal_stub(&[("PA_u", U), ("PA_ud", &ud)], move |identity| {
@@ -3384,8 +3451,98 @@ mod sfu_s3_tests {
         let result = sfu_stub::voice_client(stub.url())
             .remove_user_if_present_sids(NODE, U, ROOM)
             .await;
-        assert!(is_internal(&result), "a failed listing: {result:?}");
+        assert!(
+            internal_eviction_failure(&result, false),
+            "a failed listing: {result:?}"
+        );
         assert_eq!(stub.finish(), requests(&[(LIST, "")]));
+    }
+
+    // ---- S-3 WBR-3: the typed eviction failure ----
+
+    /// Whether `result` is the eviction failure `listed` names, carrying an
+    /// `InternalError` (reported where it arose).
+    fn internal_eviction_failure<T>(result: &Result<T, EvictionFailure>, listed: bool) -> bool {
+        match result {
+            Err(EvictionFailure::Listed(error)) if listed => {
+                matches!(error.error_type, ErrorType::InternalError)
+            }
+            Err(EvictionFailure::Unlisted(error)) if !listed => {
+                matches!(error.error_type, ErrorType::InternalError)
+            }
+            _ => false,
+        }
+    }
+
+    /// AFK S-3 WBR-3, through the real method: a failure says whether the
+    /// room was LISTED. Nothing listed (a node missing from the config, a
+    /// listing answered 500, a listing that never answers): `Unlisted`, and
+    /// no removal was sent. Listed with a connection of the user whose
+    /// removal is answered 500: `Listed`, after every removal was attempted.
+    /// A caller holding nothing of the user in Redis answers the first with
+    /// `Ok` and the second with the error, so a swapped variant is a kick
+    /// that answers 200 over a connection that is still live. Mutations:
+    /// either arm given the other's variant.
+    #[tokio::test]
+    async fn an_eviction_failure_says_whether_the_room_was_listed() {
+        // A node missing from the config: UnknownNode, before any network.
+        let stub = Stub::serve(routes(vec![]));
+        let result = sfu_stub::voice_client(stub.url())
+            .remove_user_if_present_sids("node-missing-from-config", U, ROOM)
+            .await;
+        assert!(
+            matches!(
+                &result,
+                Err(EvictionFailure::Unlisted(error))
+                    if matches!(error.error_type, ErrorType::UnknownNode)
+            ),
+            "an unknown node: {result:?}"
+        );
+        assert_eq!(stub.finish(), requests(&[]));
+
+        // The listing answered with a real failure.
+        let stub = Stub::serve(routes(vec![(LIST, internal())]));
+        let result = sfu_stub::voice_client(stub.url())
+            .remove_user_if_present_sids(NODE, U, ROOM)
+            .await;
+        assert!(
+            internal_eviction_failure(&result, false),
+            "a failed listing: {result:?}"
+        );
+        assert_eq!(stub.finish(), requests(&[(LIST, "")]));
+
+        // The listing never answered: the client-side deadline.
+        let stub = Stub::silent();
+        let voice = sfu_stub::voice_client_with_bounds(stub.url(), BOUND, SFU_BREAKER_WINDOW);
+        let result = tokio::time::timeout(OUTER, voice.remove_user_if_present_sids(NODE, U, ROOM))
+            .await
+            .expect("the listing is bounded");
+        assert!(
+            internal_eviction_failure(&result, false),
+            "a listing that timed out: {result:?}"
+        );
+        let seen = stub.finish();
+        assert_eq!(
+            seen.iter()
+                .map(|(path, _)| path.as_str())
+                .collect::<Vec<_>>(),
+            vec![LIST],
+            "{seen:?}"
+        );
+
+        // Listed, and the user's listed connection could not be removed.
+        let stub = sid_removal_stub(&[("PA_u", U), ("PA_v", V)], |_| internal());
+        let result = sfu_stub::voice_client(stub.url())
+            .remove_user_if_present_sids(NODE, U, ROOM)
+            .await;
+        assert!(
+            internal_eviction_failure(&result, true),
+            "a failed removal of a listed connection: {result:?}"
+        );
+        assert_eq!(
+            stub.finish(),
+            requests(&[(LIST, ""), (REMOVE, &format!("{U}::screen")), (REMOVE, U)])
+        );
     }
 
     // ---- WA-R: the breaker's half-open probe under concurrency ----

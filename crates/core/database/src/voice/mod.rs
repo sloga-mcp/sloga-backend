@@ -33,8 +33,8 @@ pub mod remote_control;
 pub mod watch;
 mod voice_client;
 pub use voice_client::{
-    screen_leg_participant_permissions, VoiceClient, MOVE_TOKEN_TTL, SFU_BREAKER_WINDOW,
-    SFU_CALL_TIMEOUT,
+    screen_leg_participant_permissions, EvictionFailure, VoiceClient, MOVE_TOKEN_TTL,
+    SFU_BREAKER_WINDOW, SFU_CALL_TIMEOUT,
 };
 
 async fn get_connection() -> Result<Conn> {
@@ -3063,26 +3063,22 @@ pub async fn move_user_to_voice_channel_expecting(
 
     voice_client.create_room(&new_node, destination).await?;
 
-    // Minted for the connection chosen above: `addressing.device_id` is that
-    // connection's device suffix (`None` for a bare seat), so the token's
-    // identity is exactly the chosen one's. The event below carries the same
-    // suffix plus the chosen connection's nonce, so the session this token
-    // was minted for is the only one that redeems it — see the emit site.
-    let token = voice_client
-        .create_token(
-            &new_node,
-            db,
-            target,
-            permissions,
-            destination,
-            addressing.device_id.as_deref(),
-        )
-        .await?;
-
     // Remote-control release hook (plan §1): this path removes participants
     // from the SFU directly, bypassing `remove_user_from_voice_channel`, and
     // additionally re-tokens the target into a DIFFERENT room while any grant
     // stays keyed to the old channel — so it must release explicitly here.
+    //
+    // BEFORE the mint, not after it (AFK S-3 WC-1). The release is the last
+    // SFU work ahead of the emit: up to four calls (the sharer grant's revoke
+    // and ejection, the controller grant's), each bounded by
+    // `SFU_CALL_TIMEOUT` but not reliably by the breaker (any answer resets
+    // its count, and a slow answer under the timeout never adds to it). Run
+    // between the mint and the emit, a degraded node could spend the whole
+    // `MOVE_TOKEN_TTL` there and hand the target an expired token: moved
+    // nowhere. Run here, nothing between the mint and the emit calls the SFU.
+    // The cost, accepted: a mint that fails (the target's Mongo reads) now
+    // follows a completed release, so the move fails with the grant already
+    // ended. That is the revoke direction, and the move is retried.
     remote_control::release_remote_control_for_user(
         db,
         voice_client,
@@ -3098,8 +3094,27 @@ pub async fn move_user_to_voice_channel_expecting(
     )
     .await;
 
+    // Minted for the connection chosen above: `addressing.device_id` is that
+    // connection's device suffix (`None` for a bare seat), so the token's
+    // identity is exactly the chosen one's. The event below carries the same
+    // suffix plus the chosen connection's nonce, so the session this token
+    // was minted for is the only one that redeems it — see the emit site.
+    //
+    // From here to the emit there is no SFU call at all (WC-1, above): the
+    // token's `MOVE_TOKEN_TTL` is spent only on the marker's Redis write.
+    let token = voice_client
+        .create_token(
+            &new_node,
+            db,
+            target,
+            permissions,
+            destination,
+            addressing.device_id.as_deref(),
+        )
+        .await?;
+
     // The Join label (Wave 5b-2 M4-a). Written HERE, after the room, the
-    // mint and the release and immediately before the emit, so a move that
+    // release and the mint and immediately before the emit, so a move that
     // fails before the target is sent anything leaves no marker to mislabel
     // their next ordinary join (it used to be written before `create_room`
     // and `create_token`, both behind a `?`). The evictions below can still
@@ -4390,6 +4405,44 @@ mod permission_tests {
         );
     }
 
+    /// AFK S-3 WC-1: the move mints its token AFTER the remote-control
+    /// release, so nothing between the mint and the emit calls the SFU. The
+    /// release makes up to four SFU calls, each bounded by `SFU_CALL_TIMEOUT`
+    /// but not reliably by the breaker (any answer resets it); between the
+    /// mint and the emit they could outlast `MOVE_TOKEN_TTL` and hand the
+    /// target an expired token. Mutations: the mint moved back above the
+    /// release; any `voice_client.` or `remote_control::` call put between
+    /// the mint and the emit.
+    #[test]
+    fn the_move_mints_after_the_release_with_no_sfu_call_before_the_emit() {
+        let body = move_body_code();
+        let flat = body.split_whitespace().collect::<Vec<_>>().join(" ");
+
+        assert_eq!(flat.matches(".create_token(").count(), 1, "{flat}");
+        assert_eq!(
+            flat.matches("release_remote_control_for_user(").count(),
+            1,
+            "{flat}"
+        );
+        let mint = first(&flat, ".create_token(");
+        let emit = first(&flat, ".private(target.id");
+        assert!(
+            first(&flat, "release_remote_control_for_user(") < mint,
+            "the release must run BEFORE the mint: {flat}"
+        );
+        assert!(mint < emit, "{flat}");
+
+        // Squeezed, so a call chained onto the next line (`voice_client`
+        // then `.remove_...`) still reads `voice_client.`.
+        let window: String = flat[mint..emit].split_whitespace().collect();
+        for banned in ["voice_client.", "remote_control::"] {
+            assert!(
+                !window.contains(banned),
+                "nothing between the mint and the emit may call the SFU (`{banned}`): {window}"
+            );
+        }
+    }
+
     /// I-19 (Wave 5b-2): the move itself has no bot check. Bots can be in
     /// voice and a moderator may move one; the AFK route refuses bots and the
     /// sweep skips them, each at its own layer. A bot check here would make
@@ -5448,7 +5501,10 @@ mod permission_tests {
     /// the error with something held, reported and Ok with nothing.
     /// Mutations: the record read moved below the listing, the set delete
     /// replaced by `delete_voice_state`, the held user's error swallowed,
-    /// the WB-2 split reverted to an unconditional `?`.
+    /// the WB-2 split reverted to an unconditional `?`. WBR-3 split it again
+    /// by whether the room was listed (mutation: a `Listed` failure sent to
+    /// the WB-2 report), and S6B-3 pins every release's
+    /// `participant_already_gone: false` (mutation: any of them `true`).
     ///
     /// The S-3 cleanup moved the teardown into the shared
     /// `tear_down_removed_connections` (WB-8 adds its Leave there), which is
@@ -5511,15 +5567,43 @@ mod permission_tests {
         );
         // WB-2: a failed eviction never reaches the teardown. With something
         // of the user in Redis it is the answer; with nothing, it is reported
-        // and the channel answers Ok with no release and no script.
+        // and the channel answers Ok with no release and no script. WBR-3:
+        // only when the room was never listed. A failed removal of a LISTED
+        // connection is the answer whatever Redis holds, after the release
+        // when nothing held made it run earlier.
         assert!(
             body.contains(
                 "Some(node) => match voice_client .remove_user_if_present_sids(&node, user_id, \
-                 &channel.id) .await \u{7b} Ok(evicted) => evicted, Err(error) if holds_state => \
-                 return Err(error), Err(error) => \u{7b} report_unheld_eviction_failure(&channel.id, \
-                 user_id, error); return Ok(()); \u{7d} \u{7d}, None => None, \u{7d};"
+                 &channel.id) .await \u{7b} Ok(evicted) => evicted, \
+                 Err(EvictionFailure::Listed(error)) => \u{7b} if !holds_state \u{7b} \
+                 remote_control::release_remote_control_for_user( db, voice_client, channel, \
+                 user_id, \"participant_left\", false, ) .await; \u{7d} return Err(error); \u{7d} \
+                 Err(EvictionFailure::Unlisted(error)) if holds_state => return Err(error), \
+                 Err(EvictionFailure::Unlisted(error)) => \u{7b} \
+                 report_unheld_eviction_failure(&channel.id, user_id, error); return Ok(()); \
+                 \u{7d} \u{7d}, None => None, \u{7d};"
             ),
             "a failed eviction returns before any teardown: {body}"
+        );
+        // S6B-3: every release on this path revokes actively
+        // (`participant_already_gone: false`): before the listing when Redis
+        // holds the user, and after it (on success, or on a failed listed
+        // removal) when only the listing does. `true` would end a grant
+        // whose controller the eviction may have failed to remove, leaving
+        // its `can_publish_data` with nothing able to revoke it (F-9).
+        assert_eq!(
+            body.matches(
+                "release_remote_control_for_user( db, voice_client, channel, user_id, \
+                 \"participant_left\", false, ) .await;"
+            )
+            .count(),
+            3,
+            "{body}"
+        );
+        assert_eq!(
+            body.matches("release_remote_control_for_user(").count(),
+            3,
+            "{body}"
         );
         assert!(
             first(&body, "remove_user_if_present_sids(")
@@ -7374,6 +7458,79 @@ mod permission_tests {
         }
     }
 
+    /// AFK S-3 S6B-1 (WC-2): the callers of the set-mode teardowns and of
+    /// the sid-returning eviction, per shipping file, are exactly the ones
+    /// that read `recorded_voice_connections` BEFORE their SFU listing (the
+    /// WA-R ordering rule; each one's order is pinned at its own site). All
+    /// three are `pub` and compile anywhere, so a new caller that lists
+    /// first and reads `recorded` after would reintroduce WA-1 (a sibling
+    /// recorded in between looks stale and is deleted while live) with every
+    /// other test green. A new caller must be added here deliberately, with
+    /// an order pin of its own. The counts are the shipping call sites
+    /// (definitions, imports and comments excluded). Mutation: one more call
+    /// site of any of the three in any shipping file.
+    #[test]
+    fn the_set_teardown_callers_are_exactly_the_record_first_ones() {
+        let allowed: [(&str, Vec<(&str, usize)>); 3] = [
+            (
+                "tear_down_removed_connections(",
+                vec![
+                    ("core/database/src/voice/mod.rs", 1),
+                    ("delta/src/routes/channels/voice_join.rs", 1),
+                    ("delta/src/routes/servers/member_edit.rs", 1),
+                ],
+            ),
+            (
+                "delete_voice_connections(",
+                vec![
+                    ("core/database/src/voice/mod.rs", 1),
+                    ("daemons/voice-ingress/src/api.rs", 1),
+                ],
+            ),
+            (
+                "remove_user_if_present_sids(",
+                vec![
+                    ("core/database/src/voice/mod.rs", 1),
+                    ("delta/src/routes/channels/voice_join.rs", 1),
+                    ("delta/src/routes/servers/member_edit.rs", 1),
+                ],
+            ),
+        ];
+        let sources = shipping_sources();
+        for (needle, want) in allowed {
+            let mut found: Vec<(&str, usize)> = sources
+                .iter()
+                .map(|(rel, shipping)| (rel.as_str(), call_sites(shipping, needle).len()))
+                .filter(|(_, n)| *n > 0)
+                .collect();
+            found.sort();
+            assert_eq!(
+                found, want,
+                "a caller of {needle} outside the record-first allowlist (WC-2)"
+            );
+        }
+    }
+
+    /// AFK S-3 S6B-2 (WBR-6): an eviction failure the removal answers with
+    /// `Ok` (nothing of the user in Redis, the room never listed) is
+    /// reported exactly once: through `to_internal_error()` here unless it
+    /// is an `InternalError`, which was already reported where it arose.
+    /// Mutations: the report deleted (a WARN only, no Sentry); the guard
+    /// dropped (an `InternalError` reported twice).
+    #[test]
+    fn an_unheld_eviction_failure_is_reported_exactly_once() {
+        let shipping = this_file_shipping();
+        let body = flat_fn_body(&shipping, "fn report_unheld_eviction_failure(");
+        assert!(
+            body.ends_with(
+                "if !matches!(error.error_type, revolt_result::ErrorType::InternalError) \
+                 \u{7b} let _ = Err::<(), _>(error).to_internal_error(); \u{7d}"
+            ),
+            "{body}"
+        );
+        assert_eq!(body.matches("to_internal_error()").count(), 1, "{body}");
+    }
+
     // ---- the AFK gate (AFK-channel plan D2 / audit CRITICAL-1) ----
 
     /// The gate at the level the SFU sees it: under an AFK designation NO
@@ -9085,9 +9242,18 @@ fn removal_publishes_leave(leave: ConnectionLeave, announced_by_webhook: bool) -
 /// [`removal_publishes_leave`] says no webhook will announce it (WB-8).
 ///
 /// `evicted` is what `remove_user_if_present_sids` returned (`None` with no
-/// listing), `recorded` the sids read BEFORE that listing (the ordering
-/// rule). Callers: [`remove_user_from_voice_channel`] and the moderator
-/// disconnect in `member_edit`. The caller has already decided the user
+/// listing), `recorded` the sids read BEFORE that listing.
+///
+/// A caller MUST read `recorded` ([`recorded_voice_connections`]) before
+/// it lists the room, never after (the WA-R ordering rule). Read after, a
+/// sibling that records between the listing and the read is in `recorded`
+/// but not in `evicted`, so it reads as stale and its record, and the state
+/// it keeps alive, is deleted while it is live: S-3 WA-1. Nothing here can
+/// check that, so the callers are an allowlist
+/// (`the_set_teardown_callers_are_exactly_the_record_first_ones`), each
+/// with its order pinned at its own site: [`remove_user_from_voice_channel`],
+/// the moderator disconnect in `member_edit`, and the force-disconnect in
+/// `voice_join` (AFK S-3 WC-3). The caller has already decided the user
 /// holds something here, or that the listing named them.
 pub async fn tear_down_removed_connections(
     channel: &UserVoiceChannel,
@@ -9116,14 +9282,16 @@ pub async fn tear_down_removed_connections(
 /// Report a failed eviction from a call where Redis holds nothing of
 /// `user_id` (AFK S-3 WB-2), which [`remove_user_from_voice_channel`] then
 /// answers with `Ok(())`: one ERROR log and one Sentry event per failure,
-/// plus one WARN naming the user and the skipped channel.
+/// plus one WARN naming the user and the skipped channel. Only an
+/// [`EvictionFailure::Unlisted`] reaches it (AFK S-3 WBR-3): a `Listed` one
+/// is returned as the error.
 ///
-/// Every `InternalError` that `remove_user_if_present_sids` returns has
-/// already gone through `to_internal_error()` where it happened (the
-/// listing in `list_participants_reported`, the removals with the SFU's own
-/// error), so it is not reported a second time here. Any other error (the
-/// `UnknownNode` of a pin naming a node missing from the config) was
-/// reported nowhere, and goes through `to_internal_error()` here.
+/// Every `InternalError` in an `Unlisted` failure has already gone through
+/// `to_internal_error()` where it happened (the listing in
+/// `list_participants_reported`), so it is not reported a second time here.
+/// Any other error (the `UnknownNode` of a pin naming a node missing from
+/// the config) was reported nowhere, and goes through `to_internal_error()`
+/// here, exactly once.
 fn report_unheld_eviction_failure(channel_id: &str, user_id: &str, error: revolt_result::Error) {
     log::warn!(
         "voice removal of {user_id}: the eviction from {channel_id} failed and Redis holds \
@@ -9158,28 +9326,34 @@ fn report_unheld_eviction_failure(channel_id: &str, user_id: &str, error: revolt
 ///    eviction too).
 /// 3. With a node pinned, `remove_user_if_present_sids`: ONE listing, every
 ///    listed connection evicted. No node pinned: no eviction (a ghost of a
-///    call that has ended), the recorded sids alone. An `Err` (a failed
-///    listing, a failed removal, or a pin naming a node missing from the
-///    config) never tears anything down, and what it answers depends on
-///    step 2:
-///    - Redis holds something of the user here: the `Err` returns at once,
-///      so a listed connection that may still be live stays visible and
-///      syncable, and the caller can retry.
-///    - Redis holds nothing of the user here (AFK S-3 WB-2): the failure is
-///      reported once ([`report_unheld_eviction_failure`]) and the channel
-///      answers `Ok(())`, with no release and no script. The server walk
-///      sends every member of a server through every call in it, and a
-///      leave evicts before it removes the membership, so one call on a
-///      down or unknown node would otherwise fail every kick, ban and leave
-///      in that server, for users who were never in that call.
+///    call that has ended), the recorded sids alone. A failure never tears
+///    anything down, and it is typed by whether the room was listed (AFK S-3
+///    WBR-3, [`EvictionFailure`]):
+///    - `Listed`: the SFU listed a connection of the user and removing it
+///      failed. The `Err` returns whatever Redis holds: that connection may
+///      still be live, and a kick or ban must not answer 200 over it. With
+///      nothing in Redis the remote-control release runs first (the listing
+///      is the first sign of the user, as in the skip below), actively
+///      revoking.
+///    - `Unlisted` (a failed listing, or a pin naming a node missing from
+///      the config), with something of the user in Redis here: the `Err`
+///      returns at once, so a connection that may still be live stays
+///      visible and syncable, and the caller can retry.
+///    - `Unlisted`, with nothing of the user in Redis here (AFK S-3 WB-2):
+///      the failure is reported once ([`report_unheld_eviction_failure`])
+///      and the channel answers `Ok(())`, with no release and no script. The
+///      server walk sends every member of a server through every call in
+///      it, and a leave evicts before it removes the membership, so one call
+///      on a down or unknown node would otherwise fail every kick, ban and
+///      leave in that server, for users who were never in that call.
 ///
 ///    ACCEPTED RESIDUAL: a live connection the SFU has and Redis does not (a
 ///    join that lost the webhook race, a missed webhook) on a node that
 ///    cannot be listed is not evicted. Nothing could evict it while the node
-///    cannot be listed anyway, and the failure is reported. The same `Ok`
-///    covers such a connection when the listing succeeded and its removal
-///    failed: `remove_user_if_present_sids` answers both with one `Err`, so
-///    they cannot be told apart here. That one is reported too.
+///    cannot be listed anyway, and the failure is reported. (Such a
+///    connection on a node that COULD be listed, whose removal failed, used
+///    to share that `Ok`, because the two failures were one untyped `Err`:
+///    WBR-3 made it the error.)
 /// 4. `delete_voice_connections(returned ∪ (recorded − returned))`, or the
 ///    recorded sids for a room the SFU no longer has, through
 ///    [`tear_down_removed_connections`]. An EMPTY set is the script's pure
@@ -9204,10 +9378,12 @@ fn report_unheld_eviction_failure(channel_id: &str, user_id: &str, error: revolt
 /// shows the user here: that is known before the listing, so the release
 /// runs before it. When only the SFU knows of the user (a connection with
 /// no state), that is known only from the listing, which is also the
-/// eviction; the release then runs right after it, before the teardown.
-/// Such a connection's capability went with it; the release still clears
-/// the grant records and, where the user was the sharer, revokes their
-/// controller.
+/// eviction; the release then runs right after it, before the teardown (or,
+/// when a listed removal failed, before that error returns). When the
+/// eviction succeeded, such a connection's capability went with it; when a
+/// removal failed, it may still be live. Either way the release clears the
+/// grant records and revokes actively: their controller where the user was
+/// the sharer, the user's own capability where they were a controller.
 pub async fn remove_user_from_voice_channel(
     db: &Database,
     voice_client: &VoiceClient,
@@ -9247,10 +9423,32 @@ pub async fn remove_user_from_voice_channel(
             .await
         {
             Ok(evicted) => evicted,
-            // A listed connection may still be live: nothing is torn down.
-            Err(error) if holds_state => return Err(error),
-            // WB-2: Redis holds nothing of the user here to tear down.
-            Err(error) => {
+            // WBR-3: the SFU LISTED a connection of the user and removing it
+            // failed. It may still be live, whatever Redis holds: nothing is
+            // torn down and the error is the answer. With nothing in Redis
+            // the release above did not run, and the listing is the first
+            // this removal knows of the user, so it runs now, actively
+            // revoking, before the error returns.
+            Err(EvictionFailure::Listed(error)) => {
+                if !holds_state {
+                    remote_control::release_remote_control_for_user(
+                        db,
+                        voice_client,
+                        channel,
+                        user_id,
+                        "participant_left",
+                        false,
+                    )
+                    .await;
+                }
+                return Err(error);
+            }
+            // Never listed, and Redis holds something of the user here: a
+            // connection that may still be live, so nothing is torn down.
+            Err(EvictionFailure::Unlisted(error)) if holds_state => return Err(error),
+            // WB-2: never listed, and Redis holds nothing of the user here to
+            // tear down.
+            Err(EvictionFailure::Unlisted(error)) => {
                 report_unheld_eviction_failure(&channel.id, user_id, error);
                 return Ok(());
             }
@@ -12310,6 +12508,137 @@ mod tests {
             record,
             [("SID_A".to_string(), a.clone())].into_iter().collect()
         );
+    }
+
+    /// AFK S-3 WBR-3: the SFU LISTS a connection of a user Redis knows
+    /// nothing of here (no record, no state: a join that lost the webhook
+    /// race), and its removal is answered 500. The connection may still be
+    /// live, so the removal answers the ERROR, whatever Redis holds: a kick
+    /// or ban must not answer 200 over it. It used to share the WB-2 `Ok` of
+    /// a room that could not be listed at all, because both failures were
+    /// one untyped `Err`. The remote-control release runs before the error
+    /// returns, revoking: the user sharing here has their grant ended.
+    ///
+    /// Control, the WB-2 arm this must not swallow: the LISTING answered
+    /// 500, the same user with nothing in Redis, is still `Ok`, with no
+    /// release and no script.
+    ///
+    /// Red at `7fb70a98` (the listed case answered `Ok`, with no release).
+    /// Mutations: the `Listed` arm sent to the WB-2 report (`Ok`); its
+    /// release dropped (the grant survives); the variants swapped in the
+    /// transport.
+    #[test]
+    fn a_failed_removal_of_a_listed_connection_is_the_answer_with_nothing_held() {
+        rt().block_on(
+            a_failed_removal_of_a_listed_connection_is_the_answer_with_nothing_held_case(),
+        )
+    }
+
+    async fn a_failed_removal_of_a_listed_connection_is_the_answer_with_nothing_held_case() {
+        use super::remote_control::{
+            create_remote_control_grant, delete_remote_control_grant_records,
+            fetch_remote_control_grant, RemoteControlGrant, RemoteControlGrantOutcome,
+            INPUT_CLASS_KBM,
+        };
+
+        let db = Database::Reference(Default::default());
+        let mut conn = get_connection().await.expect("redis");
+
+        for listing_fails in [false, true] {
+            let (channel, user, server) = connection_case_ids("RL1");
+            let a = format!("{user}:A");
+            let other = format!("other{user}");
+            let flag = format!("camera:{user}:{server}");
+            set_voice_participant_identity(&channel.id, &user, &a)
+                .await
+                .unwrap();
+            conn.set::<_, _, ()>(&flag, true).await.unwrap();
+            // The user shares here; `other` controls. The release would end
+            // this grant (and try to revoke `other`, which the Reference
+            // database cannot recompute, so it escalates to an ejection).
+            let grant = RemoteControlGrant {
+                id: ulid::Ulid::new().to_string(),
+                channel_id: channel.id.clone(),
+                server_id: Some(server.clone()),
+                node: stub::NODE.to_string(),
+                sharer_id: user.clone(),
+                controller_id: other.clone(),
+                controller_identity: format!("{other}:DEV"),
+                input_class: INPUT_CLASS_KBM.to_string(),
+            };
+            assert_eq!(
+                create_remote_control_grant(&grant).await.unwrap(),
+                RemoteControlGrantOutcome::Created
+            );
+            set_channel_node(&channel.id, stub::NODE).await.unwrap();
+
+            let sfu = if listing_fails {
+                stub::Stub::serve(stub::routes(vec![(stub::LIST, stub::internal())]))
+            } else {
+                eviction_stub(&[("SID_A", &a)], stub::internal())
+            };
+            let result = remove_user_from_voice_channel(
+                &db,
+                &stub::voice_client(sfu.url()),
+                &channel,
+                &user,
+            )
+            .await;
+            let seen = sfu.finish();
+
+            let kept_grant = fetch_remote_control_grant(&channel.id, &user)
+                .await
+                .unwrap();
+            let mapping = stored_voice_participant_identity(&channel.id, &user)
+                .await
+                .unwrap();
+            let kept_flag: Option<String> = conn.get(&flag).await.unwrap();
+            let member = is_voice_member(&mut conn, &channel, &user).await;
+
+            delete_remote_control_grant_records(&grant)
+                .await
+                .expect("cleanup");
+            delete_voice_participant_identity(&channel.id, &user)
+                .await
+                .expect("cleanup");
+            conn.del::<_, ()>(&flag).await.expect("cleanup");
+            delete_channel_node(&channel.id).await.expect("cleanup");
+
+            if listing_fails {
+                assert!(result.is_ok(), "control, a failed listing: {result:?}");
+                assert_eq!(seen, sfu_requests(&[(stub::LIST, "")]), "control");
+                assert_eq!(kept_grant, Some(grant), "control: no release ran");
+            } else {
+                assert!(
+                    matches!(&result, Err(error) if matches!(error.error_type, revolt_result::ErrorType::InternalError)),
+                    "a failed removal of a listed connection: {result:?}"
+                );
+                assert_eq!(
+                    seen,
+                    sfu_requests(&[
+                        (stub::LIST, ""),
+                        (stub::REMOVE, &format!("{a}:screen")),
+                        (stub::REMOVE, &a),
+                        (stub::REMOVE, &grant.controller_identity),
+                    ]),
+                    "every removal attempted, then the release's ejection of the controller"
+                );
+                assert_eq!(kept_grant, None, "the release ended the sharer's grant");
+            }
+            assert_eq!(
+                mapping,
+                Some(a.clone()),
+                "listing fails {listing_fails}: no script ran"
+            );
+            assert!(
+                kept_flag.is_some(),
+                "listing fails {listing_fails}: no script ran"
+            );
+            assert!(
+                !member,
+                "listing fails {listing_fails}: nothing was created"
+            );
+        }
     }
 
     /// P2-6 + RA2-1: a user the SFU does not list, who is not in

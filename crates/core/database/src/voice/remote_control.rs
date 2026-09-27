@@ -810,12 +810,18 @@ pub async fn release_remote_control_for_user(
 ///   participant, hence the revoke.
 /// - **As CONTROLLER:** the grant is ended only when `identity` is the
 ///   grant's `controller_identity`, the exact connection that holds the
-///   capability, and then WITHOUT a revoke: that participant is gone and
-///   the capability went with it. Any other connection of the same user
-///   leaving leaves the grant untouched — the controlling connection is
-///   still live, and ending the record while skipping the revoke would
-///   strand a `can_publish_data` capability nothing could find to revoke
-///   (Stage 1 F-9).
+///   capability, and then WITH an active revoke (AFK S-3 WB-11). An
+///   identity is not a connection: a bare `{user}` identity (or a device's)
+///   is reused by the next connection of the same seat, so the leave of an
+///   OLD connection can arrive after a NEW connection under the same
+///   identity accepted a NEW grant. Ending that grant without a revoke
+///   stranded the new connection's `can_publish_data` with no record left
+///   to revoke it through. The revoke of a controller who really has left
+///   costs one push that the SFU answers `not_found`, which
+///   `revoke_controller_capability` takes as done: no ERROR, no ejection.
+///   Any other connection of the same user leaving leaves the grant
+///   untouched — the controlling connection is still live, and ending the
+///   record at all would be the same stranding (Stage 1 F-9).
 pub async fn release_remote_control_for_connection(
     db: &Database,
     voice_client: &VoiceClient,
@@ -843,6 +849,8 @@ enum ControllerRelease<'a> {
     /// gone.
     WholeUser { participant_already_gone: bool },
     /// One connection, by its SFU identity, which the SFU reported gone.
+    /// Always revokes (WB-11): the identity may already belong to a newer
+    /// connection holding a newer grant.
     Connection { identity: &'a str },
 }
 
@@ -862,7 +870,7 @@ impl ControllerRelease<'_> {
             Self::WholeUser {
                 participant_already_gone,
             } => !participant_already_gone,
-            Self::Connection { .. } => false,
+            Self::Connection { .. } => true,
         }
     }
 }
@@ -1372,16 +1380,24 @@ mod tests {
         })
     }
 
-    /// The controlling connection leaving ends the grant everywhere, with
-    /// NO revoke and NO ejection: that participant, and the capability it
-    /// held, are already gone.
+    /// The controlling connection leaving ends the grant everywhere, WITH a
+    /// revoke (AFK S-3 WB-11): the identity that left may already be held
+    /// by a newer connection that accepted a newer grant, and ending that
+    /// one silently would strand its `can_publish_data`. Here the controller
+    /// really has left, so the SFU answers the ONE permission push
+    /// `not_found`, which is the revoke done: no ejection follows. Mutations:
+    /// the revoke skipped for a connection leave (no push at all); a
+    /// `not_found` escalated to an ejection (a second request).
     #[test]
-    fn the_controller_connection_leaving_ends_the_grant_without_a_revoke() {
+    fn the_controller_connection_leaving_ends_the_grant_with_a_revoke() {
         rt().block_on(async {
             let (db, channel, grant) = release_fixture().await;
             store(&grant).await;
 
-            let stub = Stub::serve(routes(vec![]));
+            let stub = Stub::serve(routes(vec![
+                (UPDATE, not_found()),
+                (REMOVE, ok(Vec::new())),
+            ]));
             let voice_client = sfu_stub::voice_client(stub.url());
 
             release_remote_control_for_connection(
@@ -1397,8 +1413,9 @@ mod tests {
             assert_eq!(grant_present(&grant).await, [false; 3]);
             assert_eq!(
                 stub.finish(),
-                requests(&[]),
-                "the departed controller must not be revoked or ejected"
+                requests(&[(UPDATE, &grant.controller_identity)]),
+                "the controlling identity is revoked once, and a departed \
+                 controller is never ejected"
             );
         })
     }

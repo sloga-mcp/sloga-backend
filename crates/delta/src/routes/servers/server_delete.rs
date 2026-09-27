@@ -4,7 +4,7 @@ use revolt_database::{
     Database, RemovalIntention, User,
 };
 use revolt_models::v0;
-use revolt_result::Result;
+use revolt_result::{ErrorType, Result, ToRevoltError};
 use rocket::State;
 
 use rocket_empty::EmptyResponse;
@@ -39,12 +39,10 @@ pub async fn delete(
 
         server.delete(db).await
     } else {
-        // Every call in the server is reached, not only the one the
-        // per-server pointer names (AFK S-3 F-3). The eviction runs BEFORE
-        // the membership is removed: an eviction that fails answers an error
-        // while the user is still a member, so leaving again retries it.
-        remove_user_from_server_voice(db, voice_client, &server, &user.id).await?;
-
+        // The membership is removed FIRST (AFK S-3 S6A-1), as a kick and a
+        // ban do, so a rejoin racing the eviction below is refused by the
+        // join-time Connect re-check (S-3 D-3), which also closes the
+        // sibling-token window of WB-7.
         member
             .remove(
                 db,
@@ -52,7 +50,34 @@ pub async fn delete(
                 RemovalIntention::Leave,
                 options.leave_silently.unwrap_or_default(),
             )
-            .await
+            .await?;
+
+        // Every call in the server is reached, not only the one the
+        // per-server pointer names (S-3 F-3). Leaving is the user's own
+        // action and must not depend on an SFU: with the eviction first, a
+        // user holding voice state on a node that cannot be reached (breaker
+        // open, a pin naming a node missing from the config, a failed
+        // listing) could never leave the server. The membership is gone and a
+        // retried leave answers NotFound, so a failed eviction is reported
+        // and the leave still answers success (decision DS-1), whatever the
+        // failure (a connection the SFU listed and could not remove
+        // included). Reported exactly once: an `InternalError` already went
+        // through `to_internal_error()` (ERROR + Sentry) where it arose; any
+        // other error (`UnknownNode`) was reported nowhere and goes through
+        // it here.
+        if let Err(error) = remove_user_from_server_voice(db, voice_client, &server, &user.id).await
+        {
+            log::warn!(
+                "{} left server {}, but evicting them from its calls failed: {error:?}",
+                user.id,
+                server.id
+            );
+            if !matches!(error.error_type, ErrorType::InternalError) {
+                let _ = Err::<(), _>(error).to_internal_error();
+            }
+        }
+
+        Ok(())
     }
     .map(|_| EmptyResponse)
 }
@@ -213,16 +238,20 @@ mod test {
 
     // Compile-only without RabbitMQ and Redis: see the section note above.
     #[test]
-    fn a_leave_whose_eviction_fails_can_be_retried() {
-        crate::util::test::rt().block_on(a_leave_whose_eviction_fails_can_be_retried_case())
+    fn a_member_in_a_call_on_an_unreachable_node_still_leaves() {
+        crate::util::test::rt()
+            .block_on(a_member_in_a_call_on_an_unreachable_node_still_leaves_case())
     }
 
-    /// AFK S-3 D-2: the eviction precedes the membership removal, so an
-    /// eviction that fails (ABSENT_NODE, UnknownNode before any network)
-    /// answers an error while the user is still a member, and tears nothing
-    /// down. Leaving again, once the cause is gone, completes both.
-    /// Mutation: the eviction moved below the membership removal.
-    async fn a_leave_whose_eviction_fails_can_be_retried_case() {
+    /// AFK S-3 S6A-1: a member holding voice state in a call whose node
+    /// cannot be reached (ABSENT_NODE, UnknownNode before any network) still
+    /// leaves the server. The membership is removed first; the eviction that
+    /// then fails is reported and discarded (DS-1), so the leave answers
+    /// success, and the Connect re-check refuses any rejoin. Until S6A-1 the
+    /// eviction ran first and its error was the answer: 400 UnknownNode with
+    /// the member kept, and the same for as long as the node stayed
+    /// unreachable. Mutation: the eviction's error propagated with `?`.
+    async fn a_member_in_a_call_on_an_unreachable_node_still_leaves_case() {
         let harness = TestHarness::new().await;
         let (_a, _session_a, user_a) = harness.new_user().await; // owner
         let (_b, session_b, user_b) = harness.new_user().await; // leaves
@@ -233,48 +262,36 @@ mod test {
 
         let channel = voice_channel(&harness, &server, "Live").await;
         let uvc = UserVoiceChannel::from_channel(&channel);
-        join_recorded(&uvc, &user_b.id, "PA_live", &user_b.id).await;
+        join_recorded(&uvc, &user_b.id, "PA_unreachable", &user_b.id).await;
         set_channel_node(channel.id(), ABSENT_NODE)
             .await
             .expect("node");
-
-        let response = leave(&harness, &session_b.token, &server.id).await;
-        assert_eq!(response.status(), Status::BadRequest);
-        let body = response.into_string().await.unwrap_or_default();
-        assert!(body.contains("UnknownNode"), "{}", body);
-
-        assert!(
-            harness
-                .db
-                .fetch_member(&server.id, &user_b.id)
-                .await
-                .is_ok(),
-            "a leave whose eviction failed keeps the member, so it can be retried"
-        );
         assert_eq!(
             voice_traces(&uvc, &user_b.id).await,
             (1, true, true, true),
-            "a failed eviction tears nothing down"
+            "the member holds voice state in the call"
         );
 
-        // The call ended: the retry reaches the ghost with no SFU involved.
-        delete_channel_node(channel.id()).await.expect("node gone");
         let response = leave(&harness, &session_b.token, &server.id).await;
-        assert_eq!(response.status(), Status::NoContent, "the retry succeeds");
-        assert!(harness
+        let status = response.status();
+        let body = response.into_string().await.unwrap_or_default();
+        let still_member = harness
             .db
             .fetch_member(&server.id, &user_b.id)
             .await
-            .is_err());
-        assert_eq!(
-            voice_traces(&uvc, &user_b.id).await,
-            (0, false, false, false),
-            "the retry tears the ghost down"
-        );
-
+            .is_ok();
+        delete_channel_node(channel.id()).await.expect("cleanup");
         delete_channel_voice_state(&uvc, &[user_b.id.clone()])
             .await
             .expect("cleanup");
+
+        assert_eq!(
+            status,
+            Status::NoContent,
+            "an unreachable node must not stop a member leaving: {}",
+            body
+        );
+        assert!(!still_member, "the member has left");
     }
 
     // Compile-only without RabbitMQ and Redis: see the section note above.
@@ -287,9 +304,12 @@ mod test {
     /// AFK S-3 WB-2: a call the member was never in, pinned to a node that
     /// cannot be listed (ABSENT_NODE, UnknownNode before any network), does
     /// not fail their leave: they hold nothing there to tear down, so the
-    /// failed eviction is reported and that call is skipped. Mutation: the
-    /// eviction's error propagated whatever the member holds in the call
-    /// (the WB-2 shape) answers 400 UnknownNode and keeps the member.
+    /// failed eviction is reported and that call is skipped, and nothing is
+    /// written. Since S6A-1 the leave discards ANY eviction error, so this
+    /// route no longer sees the WB-2 mutation (the eviction's error
+    /// propagated whatever the member holds in the call); that is pinned in
+    /// `voice/mod.rs`, where the WB-2 split lives, and kick and ban still
+    /// answer it.
     async fn a_member_in_no_call_leaves_past_a_call_on_an_unlistable_node_case() {
         let harness = TestHarness::new().await;
         let (_a, _session_a, user_a) = harness.new_user().await; // owner
@@ -331,7 +351,7 @@ mod test {
         assert_eq!(traces, (0, false, false, false), "nothing was written");
     }
 
-    // ---- the leave's order, pinned on its text (AFK S-3 D-2) ---------------
+    // ---- the leave's order, pinned on its text (AFK S-3 D-2, S6A-1) --------
 
     /// `delete`'s body, comment lines dropped and whitespace collapsed.
     fn route_body() -> String {
@@ -365,21 +385,32 @@ mod test {
             .join(" ")
     }
 
-    /// AFK S-3 D-2: in the leave branch (the one after the owner's
-    /// `server.delete`), the eviction from every call in the server precedes
-    /// the membership removal, once, `?`-propagated, and the single-pointer
-    /// removal is gone. Mutations: the eviction moved below the membership
-    /// removal; the eviction removed.
+    /// AFK S-3 S6A-1 (amending D-2 for the leave): in the leave branch (the
+    /// one after the owner's `server.delete`), the membership removal,
+    /// `?`-propagated, precedes the eviction from every call in the server,
+    /// whose error is reported exactly once and discarded (DS-1), never
+    /// propagated; and the single-pointer removal is gone. The report is
+    /// pinned here because no route test observes it: an `InternalError` was
+    /// already reported where it arose, anything else goes through
+    /// `to_internal_error()` once. Mutations: the eviction moved back above
+    /// the membership removal; its error propagated with `?`; the report
+    /// dropped; the report made unconditional (an `InternalError` reported
+    /// twice).
     #[test]
-    fn a_leave_evicts_before_removing_the_membership() {
+    fn a_leave_removes_the_membership_before_evicting() {
         const BRANCH: &str = "server.delete(db).await \u{7d} else \u{7b}";
-        const EVICT: &str =
-            "remove_user_from_server_voice(db, voice_client, &server, &user.id).await?;";
-        const REMOVE: &str = "member .remove( db, &server, RemovalIntention::Leave,";
+        const REMOVE: &str = "member .remove( db, &server, RemovalIntention::Leave, \
+                              options.leave_silently.unwrap_or_default(), ) .await?;";
+        const EVICT: &str = "if let Err(error) = \
+                             remove_user_from_server_voice(db, voice_client, &server, &user.id).await \
+                             \u{7b}";
+        const REPORT: &str = "if !matches!(error.error_type, ErrorType::InternalError) \u{7b} \
+                              let _ = Err::<(), _>(error).to_internal_error(); \u{7d} \u{7d} \
+                              Ok(()) \u{7d}";
 
         let body = route_body();
         let mut last = 0;
-        for needle in [BRANCH, EVICT, REMOVE] {
+        for needle in [BRANCH, REMOVE, EVICT, REPORT] {
             assert_eq!(
                 body.matches(needle).count(),
                 1,
@@ -389,6 +420,16 @@ mod test {
             assert!(last < at, "`{}` is out of order: {}", needle, body);
             last = at;
         }
+        assert_eq!(
+            body.matches("remove_user_from_server_voice(").count(),
+            1,
+            "the leave evicts once, and never with `?`: {body}"
+        );
+        assert_eq!(
+            body.matches("to_internal_error()").count(),
+            1,
+            "a failed eviction is reported exactly once: {body}"
+        );
         for banned in [
             "get_user_voice_channel_in_server(",
             "remove_user_from_voice_channel(",

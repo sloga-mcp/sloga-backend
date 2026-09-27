@@ -2,10 +2,10 @@ use revolt_config::config;
 use revolt_database::{
     util::{permissions::perms, reference::Reference},
     voice::{
-        assert_call_caps_admit, delete_voice_connections, get_channel_node,
-        get_user_voice_channel_in_server, get_user_voice_channels, get_voice_channel_members,
-        raise_if_in_voice, recorded_voice_connections, removal_teardown_sids,
-        set_call_notification_recipients, set_channel_node, UserVoiceChannel, VoiceClient,
+        assert_call_caps_admit, get_channel_node, get_user_voice_channel_in_server,
+        get_user_voice_channels, get_voice_channel_members, raise_if_in_voice,
+        recorded_voice_connections, set_call_notification_recipients, set_channel_node,
+        tear_down_removed_connections, EvictionFailure, UserVoiceChannel, VoiceClient,
     },
     Database, Session, User,
 };
@@ -243,13 +243,16 @@ pub async fn call(
             //    already reported (ERROR + Sentry) where it arose; a node
             //    name no configuration knows (`UnknownNode`) is reported only
             //    by the WARN below. Either way the join proceeds, as it always
-            //    has on a failed eviction here. No node pinned: the call has
-            //    ended, there is nothing to evict, and its ghost is torn down
-            //    below from the recorded sids.
+            //    has on a failed eviction here, so whether the room was
+            //    listed (`EvictionFailure`, AFK S-3 WBR-3) changes nothing
+            //    on this path and both cases map back to the plain error. No
+            //    node pinned: the call has ended, there is nothing to evict,
+            //    and its ghost is torn down below from the recorded sids.
             let evicted = match get_channel_node(&previous_channel.id).await? {
                 Some(node) => match voice_client
                     .remove_user_if_present_sids(&node, &user.id, &previous_channel.id)
                     .await
+                    .map_err(EvictionFailure::into_error)
                 {
                     Ok(evicted) => evicted,
                     Err(error) => {
@@ -275,20 +278,18 @@ pub async fn call(
             //    connection recorded after step 1 that the listing did not
             //    see is in neither set, so the script answers `Survivor` and
             //    it keeps its state. The channel came from `vc:{user}`, so
-            //    the user holds state here and the teardown always runs. The
-            //    union is the database crate's own (`removal_teardown_sids`,
-            //    AFK S-3 WB-6), shared with `remove_user_from_voice_channel`.
+            //    the user holds state here and the teardown always runs.
             //
-            //    No `VoiceChannelLeave` is published here for a teardown no
-            //    webhook announces (a ghost of an ended call): unlike the
-            //    moderation removals (AFK S-3 WB-8) this path stays as it
-            //    was, a recorded follow-up.
-            delete_voice_connections(
-                &previous_channel,
-                &user.id,
-                &removal_teardown_sids(evicted, recorded),
-            )
-            .await?;
+            //    The teardown is the database crate's own
+            //    (`tear_down_removed_connections`, AFK S-3 WC-3), shared with
+            //    `remove_user_from_voice_channel` and the moderator
+            //    disconnect: the union (`removal_teardown_sids`, WB-6), the
+            //    set delete, and the `VoiceChannelLeave` of a `Last` that no
+            //    webhook will announce (WB-8). That is a ghost of an ended
+            //    call (no node, so nothing evicted): without the Leave every
+            //    other client kept it on the roster. `recorded` was read in
+            //    step 1, BEFORE the listing, as that function requires.
+            tear_down_removed_connections(&previous_channel, &user.id, evicted, recorded).await?;
         }
     } else {
         raise_if_in_voice(&user, &user_voice_channel).await?;
@@ -362,6 +363,7 @@ mod test {
     use crate::util::test::TestHarness;
     use iso8601_timestamp::Timestamp;
     use revolt_database::{
+        events::client::EventV1,
         voice::{
             create_voice_state, delete_channel_node, delete_channel_voice_state, get_channel_node,
             get_user_voice_channel_in_server, get_user_voice_channels, get_voice_channel_members,
@@ -777,7 +779,7 @@ mod test {
             "release_remote_control_for_user(",
             "recorded_voice_connections(",
             "remove_user_if_present_sids(",
-            "delete_voice_connections(",
+            "tear_down_removed_connections(",
             "create_token(",
             "create_room(",
             "set_channel_node(",
@@ -823,6 +825,16 @@ mod test {
     /// The listed arms (`Ok(Some)`, `Ok(None)`) need a live SFU and are
     /// pinned here by text only. The no-node and eviction-Err arms are
     /// driven for real in the two tests below.
+    ///
+    /// AFK S-3 WC-3: the teardown is the database crate's shared
+    /// `tear_down_removed_connections`, which also publishes the Leave no
+    /// webhook will. A bare `delete_voice_connections(` here would skip that
+    /// Leave, so it is banned. S6B-3: the release passes
+    /// `participant_already_gone: false`: the eviction below is best-effort,
+    /// and `true` would end a controller's grant without revoking a
+    /// capability that a failed eviction left live (F-9). Mutations: the
+    /// teardown put back to the bare set delete; the release's `false`
+    /// turned `true`.
     #[test]
     fn force_disconnect_removes_only_what_it_knows_about() {
         let block = force_disconnect_block();
@@ -839,16 +851,21 @@ mod test {
 
         let loop_head = once("for previous_channel in get_user_voice_channels(&user.id).await?");
         let release = once("release_remote_control_for_user(");
+        once(
+            "release_remote_control_for_user( db, voice_client, &previous_channel, &user.id, \
+             \"reconnected\", false, ) .await;",
+        );
         let recorded = once(
             "recorded_voice_connections(&previous_channel, &user.id) .await .to_internal_error()",
         );
-        let evict =
-            once("remove_user_if_present_sids(&node, &user.id, &previous_channel.id) .await");
-        // AFK S-3 WB-6: the union is the database crate's
-        // `removal_teardown_sids`, not a copy of it.
+        let evict = once(
+            "remove_user_if_present_sids(&node, &user.id, &previous_channel.id) .await \
+             .map_err(EvictionFailure::into_error)",
+        );
+        // AFK S-3 WC-3: the teardown (and, inside it, the WB-6 union) is the
+        // database crate's own, not a copy of it.
         let teardown = once(
-            "delete_voice_connections( &previous_channel, &user.id, \
-             &removal_teardown_sids(evicted, recorded), ) .await?;",
+            "tear_down_removed_connections(&previous_channel, &user.id, evicted, recorded).await?;",
         );
         assert!(
             loop_head < release && release < recorded && recorded < evict && evict < teardown,
@@ -861,6 +878,7 @@ mod test {
         // which went vacuous when the S-3 cleanup deleted that method.
         for banned in [
             "delete_voice_state(",
+            "delete_voice_connections(",
             "remove_user_if_present(",
             "get_user_voice_channel_in_server(",
         ] {
@@ -895,7 +913,7 @@ mod test {
             let arm_text = &block[arm + "Err(error) =>".len()..skip];
             for banned in [
                 "=>",
-                "delete_voice_connections(",
+                "tear_down_removed_connections(",
                 "break",
                 "return",
                 ".await?",
@@ -1001,8 +1019,15 @@ mod test {
     /// sids, as the whole-user teardown did before. Mutations: the recorded
     /// sids dropped from the set (the records survive, the script answers
     /// `Survivor`, the first ghost stays); the teardown skipped.
+    ///
+    /// AFK S-3 WC-3: each teardown publishes the user's `VoiceChannelLeave`
+    /// on that channel's topic. No node is pinned, so nothing is evicted and
+    /// no `participant_left` webhook will ever announce the departure;
+    /// without it every other client kept the ghost on its roster. Mutation:
+    /// the teardown put back to the bare `delete_voice_connections` (the
+    /// wait times out).
     async fn force_disconnect_clears_the_ghost_of_every_ended_call_case() {
-        let harness = TestHarness::new().await;
+        let mut harness = TestHarness::new().await;
         let (_account, session, user) = harness.new_user().await;
 
         let recorded_call = voice_channel(&harness, &user, &[]).await;
@@ -1054,6 +1079,18 @@ mod test {
                 member,
                 pointer
             );
+        }
+
+        for uvc in [&recorded_uvc, &legacy_uvc] {
+            harness
+                .wait_for_event(&uvc.id, |event| {
+                    matches!(
+                        event,
+                        EventV1::VoiceChannelLeave { id, user: left }
+                            if id == &uvc.id && left == &user.id
+                    )
+                })
+                .await;
         }
 
         for uvc in [&recorded_uvc, &legacy_uvc] {

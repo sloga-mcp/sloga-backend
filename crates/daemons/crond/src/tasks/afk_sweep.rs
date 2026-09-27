@@ -1362,49 +1362,38 @@ mod tests {
         );
     }
 
-    /// AFK S-3 D-5 (P2-7): the move's SFU budget, stated against the REAL
-    /// `pub` constants of the transport. A retyped `3` here would stay green
-    /// whatever the transport did.
+    /// AFK S-3 D-5 (P2-7), as corrected by WC-1: the move's SFU budget
+    /// against its outer bound, stated against the REAL `pub` constant of
+    /// the transport. A retyped `3` here would stay green whatever the
+    /// transport did.
     ///
-    /// Every SFU call is bounded by `SFU_CALL_TIMEOUT`, and a node's breaker
-    /// trips after two consecutive timeouts and then fails its calls fast for
-    /// `SFU_BREAKER_WINDOW`. So a node costs a move at most two timeouts per
-    /// window, and the bounds hold ONLY with the breaker:
+    /// Every SFU call is bounded by `SFU_CALL_TIMEOUT`. A node's breaker
+    /// trips after two CONSECUTIVE timeouts and then fails its calls fast,
+    /// so a move over two nodes whose breakers both trip spends at most two
+    /// timeouts on each: that is the only case this pins, and it fits
+    /// `AFK_MOVE_TIMEOUT`. It is not a bound on every degraded move. Any
+    /// answer resets a breaker's count, and a slow answer under the timeout
+    /// never counts, so a node that answers slowly can cost a move more than
+    /// this. `AFK_MOVE_TIMEOUT` itself is the real bound: the sweep runs the
+    /// move under it and abandons a move that outlasts it (pinned by
+    /// `the_move_is_bounded_by_a_timeout`).
     ///
-    /// - The whole move (one listing and the evictions on the source's node,
-    ///   one `create_room` on the destination's, the remote-control calls on
-    ///   the source's): at most two distinct nodes, two timeouts each, inside
-    ///   `AFK_MOVE_TIMEOUT`.
-    /// - Mint to emit: only the remote-control release sits between
-    ///   `create_token` and the event that hands the token over, up to four
-    ///   calls, all on the node the source call's grants were made on. One
-    ///   node, two timeouts, inside `MOVE_TOKEN_TTL`; and the window outlasts
-    ///   the token, so a breaker that trips inside it never lets a half-open
-    ///   probe add a third.
-    ///
-    /// The plan's text asked for `2 * 2 * SFU_CALL_TIMEOUT < MOVE_TOKEN_TTL`
-    /// for the second bound. That is FALSE at the contract values (12 s
-    /// against 10 s), so it is not pinned: it would describe grants of one
-    /// source call spread over two nodes, which a call's single node pin
-    /// does not produce. Recorded as a deviation in the Wave C report.
+    /// The token's lifetime is no longer part of this budget. The move now
+    /// mints AFTER its remote-control release (WC-1), so no SFU call sits
+    /// between the mint and the emit, whatever the node does; the voice
+    /// crate pins that order. The two asserts this used to carry
+    /// (`2 * SFU_CALL_TIMEOUT < MOVE_TOKEN_TTL`,
+    /// `SFU_BREAKER_WINDOW >= MOVE_TOKEN_TTL`) described a mint-to-emit
+    /// window that had SFU calls in it, and that the breaker did not bound
+    /// after all.
     #[test]
-    fn the_move_fits_its_sfu_budget_with_the_breaker() {
-        use revolt_database::voice::{MOVE_TOKEN_TTL, SFU_BREAKER_WINDOW, SFU_CALL_TIMEOUT};
+    fn a_move_over_two_tripped_nodes_fits_its_timeout() {
+        use revolt_database::voice::SFU_CALL_TIMEOUT;
 
         assert!(
             2 * 2 * SFU_CALL_TIMEOUT < AFK_MOVE_TIMEOUT,
             "two nodes x two timeouts must fit the move: {SFU_CALL_TIMEOUT:?} vs \
              {AFK_MOVE_TIMEOUT:?}"
-        );
-        assert!(
-            2 * SFU_CALL_TIMEOUT < MOVE_TOKEN_TTL,
-            "one node x two timeouts must fit between mint and emit: {SFU_CALL_TIMEOUT:?} \
-             vs {MOVE_TOKEN_TTL:?}"
-        );
-        assert!(
-            SFU_BREAKER_WINDOW >= MOVE_TOKEN_TTL,
-            "a breaker tripped between mint and emit stays open for the token's life: \
-             {SFU_BREAKER_WINDOW:?} vs {MOVE_TOKEN_TTL:?}"
         );
     }
 

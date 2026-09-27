@@ -646,7 +646,9 @@ pub async fn ingress(
             // Remote-control release hook (plan §1), scoped to THIS
             // connection (S-3 D-7): a sharer grant ends, with a revoke, on
             // any connection leave of the sharer; a controller grant ends,
-            // without one, only if `identity` is the connection that held it.
+            // also with a revoke (WB-11: a bare `{user}` reconnect reuses the
+            // identity, so the grant may already be a newer connection's),
+            // only if `identity` is the connection that held it.
             // It runs BEFORE the teardown so it still runs when the
             // teardown's `?` fails.
             revolt_database::voice::remote_control::release_remote_control_for_connection(
@@ -1573,9 +1575,15 @@ mod tests {
     }
 
     /// D-3: the Connect re-check runs FIRST in the member join, before the
-    /// mapping, the record or the voice state is written. Mutation this
-    /// catches: the re-check moved after `set_voice_participant_identity`,
-    /// which leaves a refused connection's mapping behind.
+    /// mapping, the record or the voice state is written, and a refused
+    /// connection RETURNS once evicted (AFK S-3 S6B-4): the refused branch
+    /// ends in the one `return Ok(EmptyResponse);` between the guard and
+    /// the record. Mutations this catches: the re-check moved after
+    /// `set_voice_participant_identity`, which leaves a refused connection's
+    /// mapping behind; that `return` deleted, which lets a refused
+    /// connection (a banned user's pre-ban token) fall through to be
+    /// recorded, announced with `VoiceChannelJoin` and rung, and left as a
+    /// ghost if its leave is processed first.
     #[test]
     fn a_member_join_rechecks_connect_before_writing_anything() {
         let body = member_arm("participant_joined");
@@ -1590,6 +1598,16 @@ mod tests {
                 "the Connect re-check must precede `{write}`: {body}"
             );
         }
+        let refused = once(&body, "if !allowed \u{7b}");
+        let record = once(&body, "record_voice_connection(");
+        assert!(refused < record, "{body}");
+        assert_eq!(
+            body[refused..record]
+                .matches("return Ok(EmptyResponse); \u{7d}")
+                .count(),
+            1,
+            "the refused branch must return before the record: {body}"
+        );
     }
 
     /// DS-2: a failed Connect re-check fails CLOSED — the connection is

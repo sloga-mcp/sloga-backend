@@ -8,8 +8,8 @@ use revolt_database::{
     voice::{
         assert_voice_move_admissible, get_channel_node, get_user_voice_channel_in_server,
         holds_voice_state_in, move_user_to_voice_channel_expecting, recorded_voice_connections,
-        sync_user_voice_permissions, tear_down_removed_connections, UserVoiceChannel, VoiceClient,
-        VoiceMoveOutcome,
+        sync_user_voice_permissions, tear_down_removed_connections, EvictionFailure,
+        UserVoiceChannel, VoiceClient, VoiceMoveOutcome,
     },
     Channel, Database, File, PartialMember, User,
 };
@@ -672,13 +672,16 @@ pub async fn edit(
             // answer, not the 500 the since-deleted `remove_user` gave (F-13). `Err`: a
             // listed connection may still be live, so the error is returned
             // with NOTHING torn down, and the survivor stays visible and
-            // syncable.
+            // syncable. Whether the room was listed (`EvictionFailure`, AFK
+            // S-3 WBR-3) does not change that here: this route has always
+            // answered either failure with the error (it acts on one gated
+            // source, not a server walk), so both map back to the plain
+            // error.
             let evicted = match &node {
-                Some(node) => {
-                    voice_client
-                        .remove_user_if_present_sids(node, &target_user.id, channel)
-                        .await?
-                }
+                Some(node) => voice_client
+                    .remove_user_if_present_sids(node, &target_user.id, channel)
+                    .await
+                    .map_err(EvictionFailure::into_error)?,
                 None => None,
             };
 
@@ -1871,9 +1874,9 @@ mod test {
         const NODE: &str = "let node = get_channel_node(channel).await?;";
         const RELEASE: &str = "release_remote_control_for_user( db, voice_client, &uvc, \
              &target_user.id, \"revoked_by_moderator\", false, ) .await;";
-        const EVICT: &str = "let evicted = match &node \u{7b} Some(node) => \u{7b} voice_client \
-             .remove_user_if_present_sids(node, &target_user.id, channel) .await? \u{7d} \
-             None => None, \u{7d};";
+        const EVICT: &str = "let evicted = match &node \u{7b} Some(node) => voice_client \
+             .remove_user_if_present_sids(node, &target_user.id, channel) .await \
+             .map_err(EvictionFailure::into_error)?, None => None, \u{7d};";
         const SKIP: &str = "if !holds_state && evicted.as_ref().is_none_or(Vec::is_empty) \u{7b}";
         const TEARDOWN: &str =
             "tear_down_removed_connections(&uvc, &target_user.id, evicted, recorded).await?;";
