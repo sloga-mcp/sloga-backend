@@ -270,8 +270,10 @@ on top of wave 3. It changes §8.3 steps 5–6, §8.5 and §8.6. On top of
 that, the branch carries a merge of frontend `main` (commit `b1c39d6e`,
 which brings in the late-drain guard and its Welcome currency check), a
 merge wave that makes the resume and that guard agree (commit
-`b4c66b58`), and a merge fix pass (commit `e915b070`). §8.3 step 6,
-§8.5 and §8.6 are checked against `e915b070`.
+`b4c66b58`), and a merge fix pass (commit `e915b070`). The MFR-m1 fix
+(the loud veto takes precedence over a miss, and the adopt window's
+`finally`, MFR-n2) is on the branch, uncommitted. §8.3 step 6, §8.5 and
+§8.6 are checked against `e915b070` plus that fix.
 
 ### 8.1 Why
 
@@ -378,15 +380,27 @@ poisoned/desync.
    case is NOT quiet: if the install throws `MissingLocalFrameKeyError`
    (native has no send key for us at that epoch), `#onRotationError`
    latches loud (control origin) before the fallback runs. That fails
-   closed. After a clean catch-up (and tail, if one ran) and a counted
-   install, `#startupResume` checks two vetoes, in this order. A catch-up,
-   tail or install miss is returned before either veto runs, and falls
-   back (§8.5). First, if the session went `failed` or latched loud inside
-   the adopt window, the resume STOPS with cause `loud_during_adopt` and
-   stays loud with the gate held (§8.5). Second, if the drain re-secured
+   closed, and that latch is the install's own (`ownLatch`, below), so
+   it does not veto: the fallback's fresh join is the recovery for "no
+   local frame key".
+   **The adopt window** runs from the adoption to the verdict in
+   `#resumeAdopt`, which `#startupResume` calls in a `try/finally`. The
+   `finally` clears `#resumeAdopting` on every exit, a throw included
+   (MFR-n2). Inside the window a loud verdict takes precedence over a
+   miss (MFR-m1). Each miss out of it (the grant clear, the catch-up, the
+   tail, the install check) first asks `#loudVeto`. If the session went
+   `failed` or latched loud inside the window, the resume STOPS with
+   cause `loud_during_adopt` and stays loud with the gate held (§8.5),
+   rather than falling back. One latch does not veto: a latch first
+   raised during the resume's own key install (`ownLatch`, attributed by
+   timing: not latched before the install await, latched after it, and
+   the install check missed). That miss falls back with
+   `install_check_failed` (§8.5). After a clean catch-up (and tail, if one
+   ran) and a counted install, `#resumeAdopt` checks two vetoes, in this
+   order. First, the loud veto, as above. Second, if the drain re-secured
    the session inside the window (a DS 404 on a gap refetch of the adopted
    group), the resume falls back with cause `resecure_during_adopt`
-   (§8.5). Only past both does `#startupResume` stamp `resumed`, set
+   (§8.5). Only past both does `#resumeAdopt` stamp `resumed`, set
    `#joinedGeneration`, call `#toActive()`, kick one reconcile (the
    install's own kick was refused while not yet active), refresh the
    recency record and log "resumed the held call group". Then the
@@ -415,7 +429,8 @@ poisoned/desync.
    already holds, receives no Welcome, and never runs that check: it
    confirms currency itself (the prefetch's DS epoch or the tail's, then
    native's). While a resume is adopting a group (`#resumeAdopting`, set
-   at the adoption and cleared on every exit), a Welcome for that group
+   at the adoption and cleared on every exit by the adopt window's
+   `finally`), a Welcome for that group
    writes no `#joinedGeneration`, no `welcomeAdopted` stamp and no
    currency record. So nothing can go active beside the resume's own
    verdict, and a fallback ladder does not read itself as joined: it
@@ -462,7 +477,8 @@ On a `join` decision, a null or failed prefetch, a prefetch not back
 within its 3 s bound, a candidate already being deleted, a failed grant
 clear, ANY catch-up outcome other than caught up, a failed key install
 (§8.3 step 6), a failed tail fetch (§8.6), or a re-secure raised inside
-the adopt window (§8.3 step 6), the device, in
+the adopt window (§8.3 step 6), the device (unless a loud verdict
+inside the adopt window vetoes first, `loud_during_adopt` below), in
 order: aborts the prefetch; lets go of the candidate, if there was one
 (keep entry, session, recency record), and deletes it; discards the
 channel's other kept groups; ensures its KeyPackages are published; runs
@@ -509,16 +525,21 @@ lag, counts and flags, never key material or a group secret. The
   dropped by the single-flight while the establish runs). The resume
   falls back, and the ladder takes the rejoin's place;
 - `loud_during_adopt`: the session went `failed` or latched loud inside
-  the adopt window, and the catch-up (and tail, if one ran) and the
-  install check succeeded. Only then does the resume STOP and stay loud,
-  gate held, never active. It does not fall back, because the fallback's
+  the adopt window (`#loudVeto`). The resume STOPS and stays loud, gate
+  held, never active. It does not fall back, because the fallback's
   group reset (`#resetGroupBuffers`) would clear the latch. The candidate
-  stays adopted but not joined, so a close deletes it. This veto runs
-  before the re-secure one, so a session both re-securing and latched
-  stays loud. A catch-up, tail or install-check miss takes precedence
-  over it: that miss's cause (for example `catch_up_stopped`) falls back
-  through `#noResume`, and the fallback's reset clears the latch
-  (MFR-m1, §8.6);
+  stays adopted but not joined, so a close deletes it. The loud veto
+  takes precedence over a miss (MFR-m1): the grant clear, the catch-up,
+  the tail and the install check each consult it before `#noResume`, so
+  a latch plus, for example, a `catch_up_stopped` miss stops loud rather
+  than falling back. It also runs before the re-secure veto, so a session
+  both re-securing and latched stays loud. One exception: a latch first
+  raised during the resume's own key install (`ownLatch`, §8.3 step 6)
+  falls back with `install_check_failed`, because the fallback's fresh
+  join is the recovery for "no local frame key" (§8.6 residual). Both
+  the veto's line (`[mls] resume vetoed: went loud during the adoption`)
+  and this stop's `no resume` line carry `state` and `miss`: the cause
+  of the miss the veto overrode, or null after a clean catch-up;
 - `superseded`: the session closed or a newer establish took over.
   `superseded` and `loud_during_adopt` are the two causes that stop
   (`#resumeStopped`) rather than falling back to the ladder
@@ -639,15 +660,18 @@ startup wipe.
   ready device, a device id and a keep entry or recency record, and a
   wipe clears them all). The stale keys-changed fence (§8.5) covers
   every startup delete, with a floor read when each push lands (FAR-m2,
-  fixed in the merge wave). MFR-m1 (pre-existing, found in the merge
-  fix pass re-audit): the loud veto (`loud_during_adopt`) runs only
-  after a clean catch-up. If a loud latch fires inside the adopt window
-  AND the catch-up, tail or install check also misses, the miss falls
-  back through `#noResume`, and the fallback's reset clears the latch:
-  the chip goes from red to amber and the ladder runs. It fails closed: the gate stays
-  held and no plaintext is sent. But the loud verdict, possibly the
-  only UI signal of a hostile DS, is lost from the UI. A code fix
-  (the loud veto ahead of the miss return) is a possible follow-up.
+  fixed in the merge wave). MFR-m1 (found in the merge fix pass
+  re-audit) is fixed: the loud veto (`loud_during_adopt`) now takes
+  precedence over a grant-clear, catch-up, tail or install miss (§8.5),
+  so a latch raised inside the adopt window stays loud. A narrower
+  residual remains. The install's own latch (`ownLatch`) is attributed by
+  timing, so a media latch raised during the install await (a LiveKit
+  `encryptionError` or a native key-path error; an envelope's verdict
+  cannot land there, since the install holds the catch-up's lock), while
+  the install check also misses, still falls back. The fallback's reset
+  clears it, as every miss did before the fix: the chip goes from red to
+  amber and the ladder runs. It fails closed: the gate stays held and no
+  plaintext is sent.
   Follow-ups: a device-level + `group.open` gate
   on the commits fetch; a client-requestable re-drain; a native
   `GroupAlreadyExists` test; a boot-time kept-group sweep; `callState`
@@ -661,7 +685,18 @@ MLS-attributable time ≤ 0.1 s (the resume run's `connect.add` →
 enable republish, same sitting); advisory total ≤ 0.5 s; zero Remove/Add
 commits in any admitter log; a solo reload resumes with no DS close. What
 remains between that and a literal 0 is the SFU connect and the enable-time
-republish, not MLS. Live legs are owed; none has run.
+republish, not MLS.
+
+**Live results (2026-09-27).** Branch build `e915b070` against main,
+two and three seats; the MFR-m1 fix was not in that build. Hang-up →
+rejoin inside 10 s resumed 5/5 (three two-seat, two three-party), with
+0 commits from any seat. MLS time (the join timeline's `modeE2ee`
+stamp) was 420–760 ms, against ~23.6 s on main. Only one of the five
+came in under the advisory ≤ 0.5 s. Ctrl+R resumed 0/4. Neither build
+rejoins automatically after a reload, so the seat got back only after a
+manual join, past the peer's 10 s leave-grace; the peer had removed the
+leaf, and each run fell back to §3 safely. §8.2's Ctrl+R case therefore
+did not occur live. The network-drop run is owed.
 
 ## 9. Serve-then-admit: tried and parked
 
