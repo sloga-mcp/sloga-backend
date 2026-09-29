@@ -395,7 +395,15 @@ pub async fn ingress(
             // is reported. If the EVICTION fails, the `?` answers 500 so
             // LiveKit retries this webhook (P2-7): answering 200 would leave
             // a live connection nothing has recorded.
-            let allowed = match voice_connect_still_allowed(db, channel_id, user_id).await {
+            //
+            // A moderator's or the AFK sweep's move may put a user who lacks
+            // Connect here: the move writes a `move_admit:` key naming the
+            // identity it minted the token for, and the re-check admits THIS
+            // event identity only if the key names exactly it (merge slice
+            // P2A-4). The ingress only peeks it through the re-check; it never
+            // drains or deletes it (see `voice_connect_still_allowed`).
+            let allowed = match voice_connect_still_allowed(db, channel_id, user_id, identity).await
+            {
                 Ok(allowed) => allowed,
                 Err(error) => {
                     log::error!("Connect re-check for {identity} in {channel_id} failed ({error}); failing closed and evicting the connection.");
@@ -1269,14 +1277,192 @@ mod tests {
         &SOURCE[..tests_at]
     }
 
-    /// The shipping code with every whole-line comment (`//`, `///`) dropped,
-    /// so a comment can neither satisfy nor trip a pin.
+    /// The shipping code with every comment cut out, whole-line and trailing
+    /// ([`without_comments`]), so a comment can neither satisfy nor trip a
+    /// pin (merge slice S6B-4: only whole-line comments used to be dropped).
     fn code() -> String {
-        shipping()
-            .lines()
-            .filter(|line| !line.trim_start().starts_with("//"))
-            .collect::<Vec<_>>()
-            .join("\n")
+        without_comments(shipping())
+    }
+
+    /// `source` with its comments cut out, as delta's
+    /// `util::test::without_comments` does it (this crate cannot reach that
+    /// one): `// ...` to the end of the line, whole-line or trailing (doc
+    /// comments too), and `/* ... */` blocks, nested as Rust nests them.
+    /// Newlines stay, so the line structure survives. Literals are copied as
+    /// they are, so a `//` or `/*` inside one (a URL) is not taken for a
+    /// comment: strings and byte strings with their escapes, raw strings
+    /// (`r"..."`, `r#"..."#`, raw byte and raw C strings `br"..."`,
+    /// `cr#"..."#` among them, HD re-audit HDA-8), and char literals (`'"'`,
+    /// `'\''`, longer escapes), told from a lifetime by their closing quote.
+    fn without_comments(source: &str) -> String {
+        fn is_ident(c: char) -> bool {
+            c.is_alphanumeric() || c == '_'
+        }
+
+        let chars: Vec<char> = source.chars().collect();
+        let char_at = |at: usize| chars.get(at).copied();
+        let mut out = String::with_capacity(source.len());
+        let mut at = 0;
+
+        while let Some(c) = char_at(at) {
+            match (c, char_at(at + 1)) {
+                ('/', Some('/')) => {
+                    while char_at(at).is_some_and(|c| c != '\n') {
+                        at += 1;
+                    }
+                }
+                ('/', Some('*')) => {
+                    let mut depth = 0usize;
+                    loop {
+                        match (char_at(at), char_at(at + 1)) {
+                            (Some('/'), Some('*')) => {
+                                depth += 1;
+                                at += 2;
+                            }
+                            (Some('*'), Some('/')) => {
+                                depth -= 1;
+                                at += 2;
+                                if depth == 0 {
+                                    break;
+                                }
+                            }
+                            (Some('\n'), _) => {
+                                out.push('\n');
+                                at += 1;
+                            }
+                            (Some(_), _) => at += 1,
+                            (None, _) => panic!("an unclosed /* comment"),
+                        }
+                    }
+                }
+                ('"', _) => {
+                    out.push('"');
+                    at += 1;
+                    loop {
+                        let c = char_at(at).expect("an unclosed string literal");
+                        out.push(c);
+                        at += 1;
+                        match c {
+                            '\\' => {
+                                out.push(char_at(at).expect("an unclosed string literal"));
+                                at += 1;
+                            }
+                            '"' => break,
+                            _ => {}
+                        }
+                    }
+                }
+                ('r', _)
+                    if at == 0
+                        || !is_ident(chars[at - 1])
+                        || (matches!(chars[at - 1], 'b' | 'c')
+                            && (at == 1 || !is_ident(chars[at - 2]))) =>
+                {
+                    let mut quote = at + 1;
+                    while char_at(quote) == Some('#') {
+                        quote += 1;
+                    }
+                    if char_at(quote) != Some('"') {
+                        // `r` starting an identifier, or a raw identifier `r#name`
+                        out.push('r');
+                        at += 1;
+                        continue;
+                    }
+                    // The closing quote, followed by as many `#` as opened it
+                    let hashes = quote - at - 1;
+                    let mut close = quote + 1;
+                    while !(char_at(close).expect("an unclosed raw string literal") == '"'
+                        && (1..=hashes).all(|offset| char_at(close + offset) == Some('#')))
+                    {
+                        close += 1;
+                    }
+                    let end = close + hashes + 1;
+                    out.extend(&chars[at..end]);
+                    at = end;
+                }
+                ('\'', Some('\\')) => {
+                    // An escaped char literal: `'\''`, `'\\'` and longer escapes
+                    let close = (at + 3..chars.len())
+                        .find(|&close| chars[close] == '\'')
+                        .expect("an unclosed char literal");
+                    out.extend(&chars[at..=close]);
+                    at = close + 1;
+                }
+                ('\'', Some(_)) if char_at(at + 2) == Some('\'') => {
+                    // A plain char literal, `'"'` included
+                    out.extend(&chars[at..at + 3]);
+                    at += 3;
+                }
+                _ => {
+                    // Everything else, a lifetime's `'` included
+                    out.push(c);
+                    at += 1;
+                }
+            }
+        }
+
+        out
+    }
+
+    /// `without_comments` cuts whole-line, trailing and block comments and
+    /// nothing else: code and literals (a `//` in a URL) stay, and so do the
+    /// lines.
+    #[test]
+    fn without_comments_cuts_trailing_comments_too() {
+        let source = concat!(
+            "keep(1);\n",
+            "    // gone(1);\n",
+            "/// gone(2);\n",
+            "keep(2); /* gone(3); */ keep(3);\n",
+            "keep(4).await?; // gone(4) trailing\n",
+            "/* outer /* gone(5); */ gone(6); */ keep(5);\n",
+            "let url = \"http://127.0.0.1:1\"; keep(6); // gone(7);\n",
+            "let raw = r#\"a // \"quoted\" /* b\"#; keep(7);\n",
+            "let quote = '\"'; let tick = '\\''; keep(8); // gone(8);\n",
+            "fn f<'a>(x: &'a str) -> &'a str { x } // gone(9);\n",
+        );
+        let code = without_comments(source);
+        assert!(!code.contains("gone("), "{code}");
+        for kept in 1..=8 {
+            assert!(code.contains(&format!("keep({kept})")), "{code}");
+        }
+        for literal in [
+            "\"http://127.0.0.1:1\"",
+            "r#\"a // \"quoted\" /* b\"#",
+            "'\"'",
+            "'\\''",
+            "fn f<'a>(x: &'a str) -> &'a str { x }",
+        ] {
+            assert!(code.contains(literal), "`{literal}` lost: {code}");
+        }
+        assert_eq!(code.lines().count(), source.lines().count());
+    }
+
+    /// HD re-audit HDA-8: a raw C string is a raw string. Read as a plain
+    /// string, `cr"C:\"` would escape its own closing quote and run on, so
+    /// the comment after it would be kept and the code after the next quote
+    /// cut. Control: `c` dropped from the raw prefixes (this goes red).
+    #[test]
+    fn without_comments_reads_raw_c_strings_as_raw() {
+        let source = concat!(
+            "let path = cr\"C:\\\"; keep(1); // gone(1)\n",
+            "let hashed = cr#\"a \"b // c\"#; keep(2); // gone(2)\n",
+            "let cr = 1; let plain = c\"d // e\"; keep(3); // gone(3)\n",
+        );
+        let code = without_comments(source);
+        assert!(!code.contains("gone("), "{code}");
+        for kept in 1..=3 {
+            assert!(code.contains(&format!("keep({kept})")), "{code}");
+        }
+        for literal in [
+            "cr\"C:\\\"",
+            "cr#\"a \"b // c\"#",
+            "let cr = 1;",
+            "c\"d // e\"",
+        ] {
+            assert!(code.contains(literal), "`{literal}` lost: {code}");
+        }
+        assert_eq!(code.lines().count(), source.lines().count());
     }
 
     /// [`code`] with ALL whitespace removed, for call-shape pins that must
@@ -1288,8 +1474,7 @@ mod tests {
     /// The body of the MEMBER arm for `event`, between its braces, with
     /// whitespace collapsed to single spaces. The member arm is the LAST
     /// `"<event>" =>` arm in the file; the first belongs to the screen-leg
-    /// branch. (No brace characters in comments here: the db crate's
-    /// workspace scan strips test modules by brace matching.)
+    /// branch.
     fn member_arm(event: &str) -> String {
         let code = code();
         let arm = code
@@ -1820,6 +2005,185 @@ mod tests {
                 .count(),
             removals.len(),
             "every eviction must propagate its error"
+        );
+    }
+
+    /// Every shipping source of this crate, found on disk so a file added
+    /// later is scanned too: `(path under src, text above its test module
+    /// with every comment cut out)`. Trailing comments too (merge slice
+    /// S6B-4): lens B's RECON4C, `voice_session_key(room)` commented out
+    /// behind code on the same line, used to pass the pins below.
+    fn crate_shipping_sources() -> Vec<(String, String)> {
+        let root = std::path::PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/src"));
+        let mut pending = vec![root.clone()];
+        let mut files = Vec::new();
+        while let Some(dir) = pending.pop() {
+            for entry in std::fs::read_dir(&dir).expect("a readable source directory") {
+                let path = entry.expect("a directory entry").path();
+                if path.is_dir() {
+                    pending.push(path);
+                } else if path.extension().is_some_and(|ext| ext == "rs") {
+                    let text = std::fs::read_to_string(&path).expect("a readable source");
+                    let shipping = match text.find("#[cfg(test)]\nmod ") {
+                        Some(at) => &text[..at],
+                        None => &text[..],
+                    };
+                    let code = without_comments(shipping);
+                    let rel = path
+                        .strip_prefix(&root)
+                        .expect("a source under src")
+                        .to_string_lossy()
+                        .replace('\\', "/");
+                    files.push((rel, code));
+                }
+            }
+        }
+        files.sort();
+        // Found AND non-empty (merge slice M2B-9): a split that cut a known
+        // file's shipping text down to nothing would let every scan over it
+        // pass while asserting over nothing. Each of these three has a
+        // `fn ` well above its test module.
+        for known in ["api.rs", "reconcile.rs", "main.rs"] {
+            let code = files
+                .iter()
+                .find(|(rel, _)| rel == known)
+                .map(|(_, code)| code.as_str())
+                .unwrap_or_else(|| panic!("the crate scan missed {known}: asserting over nothing"));
+            assert!(
+                code.contains("fn "),
+                "the crate scan found no shipping code in {known}: asserting over nothing"
+            );
+        }
+        files
+    }
+
+    /// Merge slice P2A-4: the D-3 re-check is handed the EVENT identity, the
+    /// one LiveKit reports for this connection, as the identity a move
+    /// admission must name. Never `user_id`, which would let any device of a
+    /// moved user (or a bare seat when a device seat was moved) ride one
+    /// device's admission, and never a mapping read, which names whatever
+    /// connection wrote the mapping last. Mutations this catches: `user_id`
+    /// (or anything else) passed as the fourth argument, and `identity`
+    /// rebound in the member join before the re-check.
+    #[test]
+    fn the_connect_recheck_admits_by_the_event_identity() {
+        let dense = dense();
+        let calls = call_args(&dense, "voice_connect_still_allowed(");
+        assert_eq!(calls.len(), 1, "one Connect re-check: {calls:?}");
+        assert_eq!(
+            calls[0],
+            ["db", "channel_id", "user_id", "identity"],
+            "the re-check must be handed the event identity"
+        );
+        assert_eq!(
+            dense
+                .matches("letidentity=event.participant.as_ref().map(|r|&r.identity);")
+                .count(),
+            1,
+            "`identity` is the event participant's"
+        );
+
+        let body = member_arm("participant_joined");
+        let bound = once(&body, "let identity = ");
+        assert!(
+            body[bound..].starts_with("let identity = identity.to_internal_error()?;"),
+            "the member join binds `identity` from the event only: {body}"
+        );
+        assert!(
+            bound < once(&body, "voice_connect_still_allowed("),
+            "{body}"
+        );
+    }
+
+    /// Merge slice P2A-4/P2A-6: the move admission key is PEEKED by the
+    /// re-check and nothing else in this crate touches it. Its only reader
+    /// here is `voice_connect_still_allowed`; no shipping file names the key
+    /// or any admission helper, so none can drain, delete or rewrite it (a
+    /// drain would refuse livekit's reconnect of the moved connection).
+    /// Mutation this catches: any `move_admit` DEL, GETDEL or HDEL, or a
+    /// call to an admission helper, in any shipping file of this crate.
+    #[test]
+    fn the_ingress_never_consumes_a_move_admission() {
+        for (file, code) in crate_shipping_sources() {
+            let lower = code.to_lowercase();
+            for banned in ["move_admit", "move_admission"] {
+                assert!(
+                    !lower.contains(banned),
+                    "{file} names `{banned}`: only the re-check may read an admission"
+                );
+            }
+        }
+    }
+
+    /// Merge slice (B6/R8): the ingress writes no `voice_session` record.
+    /// Recording, carrying and dropping one per user belongs to the join
+    /// route and the move. What it may do is clear a DEAD call's records
+    /// whole: the two hand-built delete lists of the reconcile sweep (steps
+    /// 2 and 4, both pinned in `reconcile.rs`), and `delete_channel_voice_state`
+    /// from `room_finished` and the sweep's ghost-channel step. Mutations this
+    /// catches: a per-user session helper called here, the key built by
+    /// hand, and one more `voice_session_key` or `delete_channel_voice_state`
+    /// call site anywhere in this crate.
+    #[test]
+    fn the_ingress_writes_no_voice_session_record_but_the_dead_call_cleanup() {
+        let sources = crate_shipping_sources();
+        for (file, code) in &sources {
+            for banned in [
+                "set_voice_participant_session(",
+                "carry_voice_participant_session(",
+                "drop_voice_participant_session(",
+                "voice_session:",
+            ] {
+                assert!(!code.contains(banned), "{file} calls or names `{banned}`");
+            }
+        }
+
+        let sites = |needle: &str| -> Vec<(String, usize)> {
+            sources
+                .iter()
+                .map(|(file, code)| (file.clone(), code.matches(needle).count()))
+                .filter(|(_, count)| *count > 0)
+                .collect()
+        };
+        assert_eq!(
+            sites("voice_session_key("),
+            [("reconcile.rs".to_string(), 2)],
+            "the session key is taken only by the sweep's two dead-call delete lists"
+        );
+        assert_eq!(
+            sites("delete_channel_voice_state("),
+            [("api.rs".to_string(), 1), ("reconcile.rs".to_string(), 1)],
+            "a whole call's state is cleared only when the call is gone"
+        );
+        assert_eq!(
+            member_arm("room_finished")
+                .matches("delete_channel_voice_state(&channel, &[]).await?;")
+                .count(),
+            1,
+            "the ingress clears a call's state only once `room_finished` says it is gone"
+        );
+
+        let reconcile: String = sources
+            .iter()
+            .find(|(file, _)| file == "reconcile.rs")
+            .expect("reconcile.rs")
+            .1
+            .split_whitespace()
+            .collect();
+        assert_eq!(
+            reconcile
+                .matches("conn.del::<_,()>(&[format!(\"node:\u{7b}\u{7d}\",entry.id),voice_session_key(&entry.id)])")
+                .count(),
+            1,
+            "step 2 drops the session records with the dead entry's node key"
+        );
+        let ghost = reconcile
+            .find("format!(\"room_participants:\u{7b}room\u{7d}\"),")
+            .expect("step 4's delete list");
+        let list = &reconcile[ghost..ghost + reconcile[ghost..].find("])").expect("its end")];
+        assert!(
+            list.ends_with("voice_session_key(room),"),
+            "step 4 drops the session records of the ghost room only: {list}"
         );
     }
 

@@ -313,16 +313,21 @@ impl Server {
 
     /// Resolve and validate a proposed AFK channel for this server.
     ///
-    /// Shared by every writer of `afk_channel_id` so the three conditions live
+    /// Shared by every writer of `afk_channel_id` so the four conditions live
     /// in exactly one place. Returns the resolved channel because callers need
     /// it to drive `sync_voice_permissions` on the incoming designation.
     ///
-    /// Fails closed on all three cases:
+    /// Fails closed on all four cases, checked in this order:
     /// - the id does not resolve -> `UnknownChannel`
     /// - the channel is not in this server, including a channel with no server
     ///   at all (DM, group, saved messages) -> `UnknownChannel`, matching the
     ///   cross-server check on `member_edit`'s move path
     /// - the channel is not a voice channel -> `InvalidProperty`
+    /// - the channel is behind a client gate (age, spoiler or password,
+    ///   `Channel::has_client_gate`) -> `InvalidProperty`. Idle members are
+    ///   moved into the AFK channel without being asked, so it must never be
+    ///   a channel some of them have not been let into. The server cannot
+    ///   tell who has passed a gate, so any gate refuses.
     ///
     /// There is no `VoiceChannel` type - migration 46 removed it. A voice
     /// channel is a `TextChannel` carrying `voice: Some(..)`, and
@@ -348,6 +353,10 @@ impl Server {
         }
 
         if channel.voice().is_none() {
+            return Err(create_error!(InvalidProperty));
+        }
+
+        if channel.has_client_gate() {
             return Err(create_error!(InvalidProperty));
         }
 
@@ -416,6 +425,13 @@ impl Server {
     /// (through `Channel::delete`) and `channel_edit`'s de-voice block each
     /// call `delete_voice_channel`, so no room is left holding a grant minted
     /// under the old designation.
+    ///
+    /// That is also why putting a client gate on the designated channel is
+    /// REFUSED in `channel_edit` rather than cleared through here: gating a
+    /// channel does not tear its room down, so a clear on that path would
+    /// need a live re-sync to lift the hard mute from everyone still in it.
+    /// Removing the designation first goes through `server_edit`, which
+    /// re-syncs both sides.
     ///
     /// Nothing enforces the rule at the database layer - `PartialServer` can
     /// still carry a timeout on its own - so it is an invariant the route
@@ -1002,5 +1018,131 @@ mod tests {
                 assert_eq!(fetched.afk_timeout, None);
             }
         });
+    }
+
+    // ---- Client gates (wave BG) --------------------------------------------
+
+    async fn new_voice_channel(
+        db: &Database,
+        server: &mut Server,
+        name: &str,
+        nsfw: Option<bool>,
+        spoiler: Option<bool>,
+        description: Option<String>,
+    ) -> Channel {
+        Channel::create_server_channel(
+            db,
+            server,
+            DataCreateServerChannel {
+                channel_type: v0::LegacyServerChannelType::Voice,
+                name: name.to_string(),
+                nsfw,
+                spoiler,
+                description,
+                ..Default::default()
+            },
+            true,
+        )
+        .await
+        .expect("`Channel`")
+    }
+
+    /// Idle members are moved into the AFK channel without being asked, so a
+    /// channel behind a client gate (age, spoiler, password) is never a valid
+    /// designation. Each gate on its own is refused with `InvalidProperty`.
+    ///
+    /// A marker on a line that is NOT the last is no password (the client
+    /// reads only the last line), so that channel is accepted: a refusal of
+    /// every description would fail here. And the server check still comes
+    /// first, so a gated channel in another server stays `UnknownChannel`.
+    #[tokio::test]
+    async fn validate_afk_channel_refuses_a_gated_voice_channel() {
+        database_test!(|db| async move {
+            use crate::{CHANNEL_PASSWORD_PREFIX, CHANNEL_PASSWORD_SUFFIX};
+
+            let mut server = new_server(&db, "AfkGatedOwner").await;
+            let mut other_server = new_server(&db, "AfkGatedOther").await;
+            let hash = "0123456789abcdef".repeat(4);
+            let password = [
+                CHANNEL_PASSWORD_PREFIX,
+                hash.as_str(),
+                CHANNEL_PASSWORD_SUFFIX,
+            ]
+            .concat();
+
+            let gated = [
+                ("Mature", Some(true), None, None),
+                ("Spoiler", None, Some(true), None),
+                (
+                    "Password",
+                    None,
+                    None,
+                    Some(["Welcome\n", password.as_str()].concat()),
+                ),
+            ];
+            for (name, nsfw, spoiler, description) in gated {
+                let channel =
+                    new_voice_channel(&db, &mut server, name, nsfw, spoiler, description).await;
+                assert!(channel.voice().is_some(), "{name} is a voice channel");
+
+                let error = Server::validate_afk_channel(&db, &server.id, channel.id())
+                    .await
+                    .expect_err("a gated channel is not a designation");
+                assert!(
+                    matches!(error.error_type, ErrorType::InvalidProperty),
+                    "{name}: {error:?}"
+                );
+            }
+
+            let open = new_voice_channel(
+                &db,
+                &mut server,
+                "Open",
+                Some(false),
+                Some(false),
+                Some([password.as_str(), "\nWelcome"].concat()),
+            )
+            .await;
+            let resolved = Server::validate_afk_channel(&db, &server.id, open.id())
+                .await
+                .expect("a marker that is not on the last line is no password");
+            assert_eq!(resolved.id(), open.id());
+
+            let elsewhere =
+                new_voice_channel(&db, &mut other_server, "Mature", Some(true), None, None).await;
+            let error = Server::validate_afk_channel(&db, &server.id, elsewhere.id())
+                .await
+                .expect_err("a channel in another server is not ours to designate");
+            assert!(matches!(error.error_type, ErrorType::UnknownChannel));
+        });
+    }
+
+    /// The order the doc promises: server, then voice, then gate. Server first
+    /// because a DM is callable (see above); the gate last, so a gated text
+    /// channel keeps the not-a-voice-channel refusal it always had. Control:
+    /// the gate arm moved above the voice arm.
+    #[test]
+    fn validate_afk_channel_checks_server_then_voice_then_gate() {
+        const SOURCE: &str = include_str!("model.rs");
+
+        let at = SOURCE
+            .find("pub async fn validate_afk_channel(")
+            .expect("the validator");
+        let end = at
+            + SOURCE[at..]
+                .find("\n    }\n")
+                .expect("the end of the validator");
+        let body = &SOURCE[at..end];
+
+        let position = |needle: &str| {
+            assert_eq!(body.matches(needle).count(), 1, "`{needle}`: {body}");
+            body.find(needle).expect("counted above")
+        };
+        let server = position("if channel.server().is_none_or(");
+        let voice = position("if channel.voice().is_none()");
+        let gate = position("if channel.has_client_gate()");
+
+        assert!(server < voice, "{body}");
+        assert!(voice < gate, "{body}");
     }
 }

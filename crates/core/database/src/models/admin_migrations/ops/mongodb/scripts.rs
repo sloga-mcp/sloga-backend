@@ -2711,16 +2711,22 @@ pub async fn run_migrations(db: &MongoDb, revision: i32) -> i32 {
 /// AFK channel. Pure, so every case is unit-tested without a database.
 ///
 /// Designates only when the server has no `afk_channel_id` yet and EXACTLY one
-/// of its channels is both
+/// of its channels is all of
 /// - a voice channel by the predicate `Server::validate_afk_channel` applies:
 ///   `Channel::server()` names this server and `Channel::voice()` is `Some`
-///   (a `TextChannel` whose `voice` is present and not disabled), and
+///   (a `TextChannel` whose `voice` is present and not disabled),
+/// - not behind a client gate (age, spoiler or password,
+///   `Channel::has_client_gate`), which `Server::validate_afk_channel` also
+///   refuses: idle members are moved into the AFK channel without being
+///   asked, and some of them have not been let into a gated one, and
 /// - named "afk" case-insensitively, exactly as the old client matched it:
 ///   `channel.name?.toLowerCase() === "afk"` (frontend `96158a82`,
 ///   `rtc/state.tsx:2982` and `ServerSidebar.tsx:1038`).
 ///
 /// Two or more matches designate nothing: the old client treated them all as
-/// AFK, and picking one would be a guess. The result never sets `afk_timeout`.
+/// AFK, and picking one would be a guess. A gated or disabled channel named
+/// "afk" is not a match at all, so it neither gets designated nor makes an
+/// eligible one ambiguous. The result never sets `afk_timeout`.
 fn afk_backfill_designation(
     server_id: &str,
     already_designated: bool,
@@ -2733,6 +2739,7 @@ fn afk_backfill_designation(
     let mut matches = channels.iter().filter(|channel| {
         channel.server() == Some(server_id)
             && channel.voice().is_some()
+            && !channel.has_client_gate()
             && matches!(
                 channel,
                 crate::Channel::TextChannel { name, .. } if name.to_lowercase() == "afk"
@@ -2752,8 +2759,10 @@ mod afk_backfill_tests {
     use super::*;
     use crate::{Channel, VoiceInformation};
 
-    // Braces in string needles are written as escapes: the voice suite's
-    // `strip_test_items` brace-matches this module out of its workspace scan.
+    // Braces in string needles are written as escapes, a habit from when the
+    // voice suite's `strip_test_items` brace-matched this module out of its
+    // workspace scan on raw text. It reads literal-blanked text now, so a
+    // brace in a string no longer moves that match.
     const SOURCE: &str = include_str!("scripts.rs");
     const OPEN: char = '\u{7b}';
     const CLOSE: char = '\u{7d}';
@@ -2908,6 +2917,78 @@ mod afk_backfill_tests {
         assert_eq!(afk_backfill_designation("S", true, &channels), None);
     }
 
+    /// A voice channel named "afk" behind client gate number `gate`: 0 age,
+    /// 1 spoiler, 2 password.
+    fn gated(id: &str, name: &str, gate: usize) -> Channel {
+        let mut channel = voice(id, name);
+        let Channel::TextChannel {
+            nsfw,
+            spoiler,
+            description,
+            ..
+        } = &mut channel
+        else {
+            unreachable!("`voice` builds a TextChannel");
+        };
+        match gate {
+            0 => *nsfw = true,
+            1 => *spoiler = true,
+            _ => {
+                *description = Some(
+                    [
+                        crate::CHANNEL_PASSWORD_PREFIX,
+                        "ab",
+                        crate::CHANNEL_PASSWORD_SUFFIX,
+                    ]
+                    .concat(),
+                )
+            }
+        }
+        channel
+    }
+
+    /// Wave BG: the backfill must not designate a channel that
+    /// `Server::validate_afk_channel` would refuse. Each gate on its own
+    /// keeps a lone "afk" channel from being designated. Control: the gate
+    /// exclusion deleted.
+    #[test]
+    fn a_gated_afk_channel_is_not_designated() {
+        for gate in 0..3 {
+            let channels = [gated("A", "afk", gate), voice("B", "General")];
+            assert_eq!(
+                afk_backfill_designation("S", false, &channels),
+                None,
+                "gate {gate}"
+            );
+        }
+
+        // A description that is not a password line is no gate.
+        let mut described = voice("A", "afk");
+        if let Channel::TextChannel { description, .. } = &mut described {
+            *description = Some("Idle here".to_string());
+        }
+        assert_eq!(
+            afk_backfill_designation("S", false, &[described]).as_deref(),
+            Some("A")
+        );
+    }
+
+    /// Follows `a_disabled_afk_channel_does_not_make_an_enabled_one_ambiguous`:
+    /// a gated "afk" channel is not a candidate at all, so an ungated one
+    /// beside it is still the only match. Control: the gate applied after the
+    /// uniqueness decision instead of inside the filter.
+    #[test]
+    fn a_gated_afk_channel_does_not_make_an_ungated_one_ambiguous() {
+        for gate in 0..3 {
+            let channels = [gated("A", "afk", gate), voice("B", "AFK")];
+            assert_eq!(
+                afk_backfill_designation("S", false, &channels).as_deref(),
+                Some("B"),
+                "gate {gate}"
+            );
+        }
+    }
+
     #[test]
     fn latest_revision_is_73() {
         assert_eq!(LATEST_REVISION, 73, "the AFK backfill is revision 72");
@@ -2938,6 +3019,57 @@ mod afk_backfill_tests {
         assert!(
             backfill_block().contains("afk_backfill_designation("),
             "the migration must select through the tested pure fn"
+        );
+    }
+
+    /// The renumber's nesting trap (M1 audit M1A-1): the revision-72 guard is
+    /// a TOP-LEVEL statement of `run_migrations`, a sibling of the 70 and 71
+    /// blocks, never inside one of them. Nested inside the 71 block, a
+    /// database already at 72 would skip the backfill forever, and every
+    /// other pin in this module would still pass.
+    #[test]
+    fn revision_72_guard_is_a_top_level_sibling_of_the_71_block() {
+        let depth_at = |at: usize| -> i64 {
+            shipping()[..at]
+                .chars()
+                .map(|ch| match ch {
+                    OPEN => 1,
+                    CLOSE => -1,
+                    _ => 0,
+                })
+                .sum()
+        };
+        let guard = |revision: i32| -> usize {
+            let needle = format!("if revision <= {revision} {OPEN}");
+            assert_eq!(
+                shipping().matches(&needle).count(),
+                1,
+                "exactly one `{needle}`"
+            );
+            shipping().find(&needle).expect("the guard")
+        };
+        let (at_70, at_71, at_72) = (guard(70), guard(71), guard(72));
+
+        let open_71 = at_71 + format!("if revision <= 71 {OPEN}").len() - 1;
+        let block_71 = braced(shipping(), open_71);
+        assert!(
+            !block_71.contains("if revision <= 72"),
+            "the revision 72 guard must not be nested inside the 71 block"
+        );
+        assert!(
+            at_72 > open_71 + block_71.len(),
+            "the revision 72 guard must come after the 71 block closes"
+        );
+
+        let body = shipping()
+            .find("pub async fn run_migrations(")
+            .expect("run_migrations");
+        let body_open = body + shipping()[body..].find(OPEN).expect("its body");
+        let top_level = depth_at(body_open) + 1;
+        assert_eq!(
+            (depth_at(at_70), depth_at(at_71), depth_at(at_72)),
+            (top_level, top_level, top_level),
+            "the 70, 71 and 72 guards must all sit at the top level of run_migrations"
         );
     }
 

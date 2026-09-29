@@ -2,9 +2,10 @@ use revolt_config::config;
 use revolt_database::{
     util::{permissions::perms, reference::Reference},
     voice::{
-        assert_call_caps_admit, get_channel_node, get_user_voice_channel_in_server,
-        get_user_voice_channels, get_voice_channel_members, raise_if_in_voice,
-        recorded_voice_connections, set_call_notification_recipients, set_channel_node,
+        assert_call_caps_admit, drop_voice_participant_session, get_channel_node,
+        get_user_voice_channel_in_server, get_user_voice_channels, get_voice_channel_members,
+        join_call_occupancy_refuses, raise_if_in_voice, recorded_voice_connections,
+        set_call_notification_recipients, set_channel_node, set_voice_participant_session,
         tear_down_removed_connections, EvictionFailure, UserVoiceChannel, VoiceClient,
     },
     Database, Session, User,
@@ -91,12 +92,16 @@ pub async fn call(
 
     let user_voice_channel = UserVoiceChannel::from_channel(&channel);
 
-    if get_voice_channel_members(&user_voice_channel)
-        .await?
-        .zip(voice_info.max_users)
-        .is_some_and(|(ms, max_users)| ms.len() >= max_users)
-        && !current_permissions.has(ChannelPermission::ManageChannel as u64)
-    {
+    // The occupancy rule is the database crate's, the one a tokenless move
+    // asks before it sends its target here (merge slice M2B-1, RRB-5), so the
+    // two can never disagree about whether this channel is full for this
+    // joiner.
+    let members = get_voice_channel_members(&user_voice_channel).await?;
+    if join_call_occupancy_refuses(
+        members.as_deref(),
+        voice_info.max_users,
+        current_permissions.has(ChannelPermission::ManageChannel as u64),
+    ) {
         return Err(create_error!(CannotJoinCall));
     }
 
@@ -190,6 +195,42 @@ pub async fn call(
         // whole-user `delete_voice_state`: that would erase the late
         // sibling's state.
         for previous_channel in get_user_voice_channels(&user.id).await? {
+            // The kicked participant's session no longer owns anything here,
+            // and the record written below is for THIS channel only, which
+            // may not be this one. Dropped before the removal, so a move in
+            // flight out of this channel fails its re-check instead of
+            // handing the session this join kicks a token for the
+            // destination (lane 6a4). A kick is not a reconnect: the reason
+            // a leave keeps the record does not apply.
+            //
+            // A failed drop skips THIS channel, as a failed record read or
+            // eviction below does: nothing of it is released, evicted or torn
+            // down, and the join proceeds (merge slice M2A-2). Evicting
+            // anyway would be the unsafe direction: the kicked session would
+            // keep a record a move could still hand a token to. What the
+            // record that could not be dropped names then depends on where
+            // this join goes (merge slice SEC6-4 / S6A-13):
+            //
+            // - into ANOTHER channel: that record is left alone and still
+            //   names a session that is still connected here, because it was
+            //   not kicked, so a later move out of here reaches a live owner.
+            // - into THIS same channel: the record written at the end of this
+            //   join replaces it and hands ownership to the new session,
+            //   while the old seat, never kicked, survives beside it. No
+            //   token can reach that old seat (a move is announced to the
+            //   recorded session alone), and the next move out of the channel
+            //   evicts it with every other connection of the user there.
+            if let Err(error) = drop_voice_participant_session(&previous_channel.id, &user.id).await
+            {
+                log::warn!(
+                    "force-disconnect of {} from {}: the session record could not be \
+                     dropped, so nothing there is evicted or torn down: {error:?}",
+                    user.id,
+                    previous_channel.id
+                );
+                continue;
+            }
+
             // Reconnect ends any remote-control grant (plan §1): this path
             // removes the participant and the fresh token below is minted
             // with `can_publish_data: false`, so a controller's capability
@@ -319,6 +360,18 @@ pub async fn call(
             set_call_notification_recipients(channel.id(), &user.id, &recipients).await?;
         }
     }
+
+    // This session now owns the user's participant in this channel. A move
+    // event goes to it alone, so a session this join kicked above cannot be
+    // told to rejoin somewhere (media-e2ee final audit F1). The record also
+    // names the seat the token above was minted for, from the same
+    // `device_id`: `Some(device)` for the identity `{user}:{device}`, `None`
+    // for the bare `{user}`. A move mints exactly the recorded seat kind
+    // (merge slice RRB-1, Option A), so a record naming any other seat would
+    // mint a moved session an identity it never joined as. Recorded last,
+    // once nothing else can refuse the join.
+    set_voice_participant_session(channel.id(), &user.id, &session.id, device_id.as_deref())
+        .await?;
 
     Ok(Json(v0::CreateVoiceUserResponse {
         token,
@@ -772,10 +825,12 @@ mod test {
             body
         );
 
-        // The force-disconnect's side effects (AFK S-3 B5): the record read,
-        // the eviction and the set teardown all come after the refusal.
+        // The force-disconnect's side effects (AFK S-3 B5): the session
+        // record's drop, the record read, the eviction and the set teardown
+        // all come after the refusal.
         for effect in [
             "if force_disconnect == Some(true)",
+            "drop_voice_participant_session(",
             "release_remote_control_for_user(",
             "recorded_voice_connections(",
             "remove_user_if_present_sids(",
@@ -1117,7 +1172,18 @@ mod test {
     /// failure cannot reach the second channel. Mutations: a teardown on the
     /// Err arm (the failed channel's record and state go); `break` on it (the
     /// second channel's ghost stays); `?` on it (400 `UnknownNode`).
+    ///
+    /// The session records go in BOTH channels (lane 6a4, merge slice M2a):
+    /// the kick drops a channel's record before it tries the eviction, so a
+    /// record in the failing channel is gone even though its participant is
+    /// not. A move out of it then reaches nobody, the safe direction; a kept
+    /// record would still name the session this join kicked. Mutation: the
+    /// drop moved after the eviction (the failing channel's record stays).
     async fn a_failed_force_disconnect_eviction_tears_nothing_down_case() {
+        use revolt_database::voice::{
+            get_voice_participant_session, set_voice_participant_session,
+        };
+
         let harness = TestHarness::new().await;
         let (_account, session, user) = harness.new_user().await;
 
@@ -1152,8 +1218,25 @@ mod test {
         } else {
             "PA_second"
         };
+        // Both connections are the bare identity, so both records are bare.
+        for channel in [&failing, &cleared] {
+            set_voice_participant_session(&channel.id, &user.id, &session.id, None)
+                .await
+                .expect("record");
+        }
 
         force_join_past_the_disconnect(&harness, &session.token, &target).await;
+
+        for channel in [&failing, &cleared] {
+            assert_eq!(
+                get_voice_participant_session(&channel.id, &user.id)
+                    .await
+                    .expect("record read"),
+                None,
+                "the kick drops the record in {} before its eviction, failed or not",
+                channel.id
+            );
+        }
 
         let (recorded, listed, member, pointer) = voice_traces(&failing, &user.id).await;
         assert_eq!(
@@ -1389,5 +1472,634 @@ mod test {
         )
         .await;
         assert_eq!(status, Status::Forbidden);
+    }
+
+    /// `join_call`'s shipping source, comments and whitespace stripped
+    /// (`crate::util::test::{without_comments, without_whitespace}`).
+    fn join_call_body() -> String {
+        use crate::util::test::{without_comments, without_whitespace};
+
+        let source = include_str!("voice_join.rs");
+        let shipping = without_whitespace(&without_comments(
+            &source[..source.find("#[cfg(test)]").expect("test module")],
+        ));
+        let start = shipping
+            .find("pubasyncfncall(")
+            .expect("join_call left voice_join.rs");
+        let end = start
+            + shipping[start..]
+                .find("pub(crate)fnresolve_join_node(")
+                .expect("the fn after join_call");
+        shipping[start..end].to_string()
+    }
+
+    /// The block that opens at the first `\u{7b}` at or after `from` in the
+    /// whitespace-free `code`: its text without the braces, and the index
+    /// just past its closing brace. Textual brace matching, which holds for
+    /// `join_call`'s shipping text: its literals keep their braces paired.
+    fn block_from(code: &str, from: usize) -> (&str, usize) {
+        let open = from + code[from..].find('\u{7b}').expect("a block");
+        let mut depth = 0usize;
+        for (i, ch) in code[open..].char_indices() {
+            match ch {
+                '\u{7b}' => depth += 1,
+                '\u{7d}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return (&code[open + 1..open + i], open + i + 1);
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("an unclosed block at byte {}: {}", open, code);
+    }
+
+    /// The top-level arguments of the ONE call of `callee` (its name with
+    /// the opening parenthesis) in the whitespace-free `code`, a trailing
+    /// comma dropped, and the index just past its closing parenthesis.
+    fn only_call_args<'a>(code: &'a str, callee: &str) -> (Vec<&'a str>, usize) {
+        assert!(callee.ends_with('('), "`{}` is not a call", callee);
+        assert_eq!(
+            code.matches(callee).count(),
+            1,
+            "`{callee}` must be called exactly once: {code}"
+        );
+        let open = code.find(callee).expect("counted above") + callee.len() - 1;
+        let (mut depth, mut start, mut args) = (0usize, open + 1, Vec::new());
+        for (i, ch) in code[open..].char_indices() {
+            let at = open + i;
+            match ch {
+                '(' | '[' | '\u{7b}' => depth += 1,
+                ')' | ']' | '\u{7d}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        if start < at {
+                            args.push(&code[start..at]);
+                        }
+                        return (args, at + 1);
+                    }
+                }
+                ',' if depth == 1 => {
+                    args.push(&code[start..at]);
+                    start = at + 1;
+                }
+                _ => {}
+            }
+        }
+        panic!("an unclosed call of `{}`: {}", callee, code);
+    }
+
+    /// `join_call`'s kick in `join_call_body`: the byte range of the
+    /// `force_disconnect` branch's body, and inside it the range of the body
+    /// of its loop over the user's channels. The loop is looked for FROM the
+    /// branch, never from the top of `call`: the rejoin check above walks the
+    /// same channels with an identical loop head (merge slice RT-8), and a
+    /// pin that found the first head would hold a drop moved into the rejoin
+    /// loop, where it kicks nothing.
+    fn kick(body: &str) -> (std::ops::Range<usize>, std::ops::Range<usize>) {
+        const BRANCH: &str = "ifforce_disconnect==Some(true)";
+        const HEAD: &str = "forprevious_channelinget_user_voice_channels(&user.id).await?";
+
+        assert_eq!(
+            body.matches(BRANCH).count(),
+            1,
+            "join_call has one force_disconnect branch: {body}"
+        );
+        let branch_at = body.find(BRANCH).expect("counted above");
+        let (branch, branch_end) = block_from(body, branch_at);
+        let branch_start = branch_end - 1 - branch.len();
+        assert!(
+            body[branch_end..].starts_with("else\u{7b}raise_if_in_voice("),
+            "the force_disconnect branch lost its else arm: {}",
+            body
+        );
+
+        assert!(
+            branch.starts_with(HEAD) && branch.matches(HEAD).count() == 1,
+            "the force_disconnect branch is its one loop over the user's channels: {}",
+            branch
+        );
+        let (kick_loop, loop_end) = block_from(body, branch_start);
+        let loop_start = loop_end - 1 - kick_loop.len();
+        assert!(
+            branch_start < loop_start && loop_end < branch_end,
+            "the kick loop lies inside the branch"
+        );
+        (branch_start..branch_end - 1, loop_start..loop_end - 1)
+    }
+
+    /// The statement `join_call` records its session with (merge slice
+    /// R2-M2b, "P4 MUST pin"), whitespace stripped.
+    const RECORD: &str =
+        "set_voice_participant_session(channel.id(),&user.id,&session.id,device_id.as_deref()).await?;";
+
+    /// Every join records its session as the participant's owner, which is
+    /// where a move event goes (media-e2ee final audit F1). A route test
+    /// cannot see it: without a live LiveKit, `create_room` fails first. So
+    /// the whole statement is pinned textually, comments stripped: made
+    /// exactly once, on its own with its `.await?`, with THIS request's
+    /// session and seat, after the device check, the kick loop and
+    /// `create_room` (a refused join must not take the record over), and as
+    /// the LAST statement before the response. Controls VJ (the line
+    /// commented out), VJLET (`let _ = …;`), VJTRAIL (a statement with the
+    /// record in a trailing comment), AB (the line deleted), REC-EARLY (the
+    /// record moved above `.create_token(`).
+    #[test]
+    fn join_call_records_the_joining_session_after_every_refusal() {
+        use crate::util::test::statement_at;
+
+        let body = join_call_body();
+        assert_eq!(
+            body.matches("set_voice_participant_session(").count(),
+            1,
+            "join_call records the session exactly once"
+        );
+        let recorded_at = statement_at(&body, RECORD);
+
+        let (branch, _) = kick(&body);
+        assert!(
+            branch.end < recorded_at,
+            "the session is recorded only after the kick loop"
+        );
+        for earlier in [
+            "assert_device_bound_session(",
+            "raise_if_in_voice(",
+            ".create_token(",
+            ".create_room(",
+            "set_call_notification_recipients(",
+        ] {
+            let at = body
+                .find(earlier)
+                .unwrap_or_else(|| panic!("`{}` left join_call", earlier));
+            assert!(
+                at < recorded_at,
+                "the session is recorded only after `{}`",
+                earlier
+            );
+        }
+
+        assert!(
+            body[recorded_at + RECORD.len()..].starts_with("Ok(Json(v0::CreateVoiceUserResponse"),
+            "the record is the last statement before the response: {}",
+            &body[recorded_at..]
+        );
+    }
+
+    /// Merge slice RRB-1 (Option A): the record names the seat the join
+    /// MINTED, because a move mints exactly the recorded seat kind. The
+    /// request's `device_id` is bound ONCE, by the destructure, and never
+    /// rebound, and that one binding is what the device check admits, what
+    /// the token is minted for (`Some(device)` = `{user}:{device}`, `None` =
+    /// the bare `{user}`) and what the record stores. A second binding (a
+    /// `let`, a shadowing pattern, a closure parameter) would add a mention
+    /// of `device_id` and fails the count. No route test can see the seat:
+    /// the record is written after `create_room`, which fails without a live
+    /// LiveKit. Controls REC-NONE (`None` as the fourth argument), REC-OTHER
+    /// (`Some(session.id.as_str())` as the fourth argument), REC-EARLY.
+    #[test]
+    fn the_record_names_the_seat_the_join_minted() {
+        use crate::util::test::statement_at;
+
+        const SEAT: &str = "device_id.as_deref()";
+
+        let body = join_call_body();
+        statement_at(
+            &body,
+            "letv0::DataJoinCall\u{7b}node,force_disconnect,recipients,device_id,rejoin,\u{7d}=data.into_inner();",
+        );
+        assert_eq!(
+            body.matches(SEAT).count(),
+            3,
+            "the device check, the token and the record each read the request's device: {body}"
+        );
+        assert_eq!(
+            body.matches("device_id").count(),
+            1 + 3,
+            "`device_id` is the destructure's binding and its three reads, nothing else: {body}"
+        );
+
+        let checked_at = statement_at(
+            &body,
+            "assert_device_bound_session(db,&user,&session,device_id.as_deref()).await?;",
+        );
+        let (minted, _) = only_call_args(&body, ".create_token(");
+        assert_eq!(
+            minted,
+            [
+                "&node",
+                "db",
+                "&user",
+                "current_permissions",
+                "&channel",
+                SEAT
+            ],
+            "the token is minted for the request's device"
+        );
+        let (recorded, _) = only_call_args(&body, "set_voice_participant_session(");
+        assert_eq!(
+            recorded,
+            ["channel.id()", "&user.id", "&session.id", SEAT],
+            "the record names this channel, this user, this session and the minted seat"
+        );
+
+        let minted_at = body.find(".create_token(").expect("pinned above");
+        let recorded_at = statement_at(&body, RECORD);
+        assert!(
+            checked_at < minted_at && minted_at < recorded_at,
+            "the device check, then the token, then the record: {}",
+            body
+        );
+    }
+
+    /// Merge slice RRB-5: `join_call` refuses a full channel through the
+    /// database crate's own occupancy rule, the one a tokenless move asks
+    /// before it sends its target here, called once with exactly the three
+    /// things the inline rule read: the roster of THIS channel, its cap and
+    /// THIS joiner's ManageChannel, and the same refusal at the same place
+    /// (after Connect, before the caps). The rule's values are the database
+    /// crate's (`the_tokenless_move_asks_join_calls_own_occupancy_rule`).
+    /// Controls OCC-EXEMPT (`|| true` on the ManageChannel flag), OCC-TWICE
+    /// (a second call), OCC-ARGS (`None` for the cap).
+    #[test]
+    fn join_call_asks_the_shared_occupancy_rule_for_this_joiner() {
+        use crate::util::test::statement_at;
+
+        let body = join_call_body();
+        let connect_at = statement_at(
+            &body,
+            "current_permissions.throw_if_lacking_channel_permission(ChannelPermission::Connect)?;",
+        );
+        statement_at(
+            &body,
+            "letcurrent_permissions=calculate_channel_permissions(&mutpermissions).await;",
+        );
+        statement_at(
+            &body,
+            "letuser_voice_channel=UserVoiceChannel::from_channel(&channel);",
+        );
+        let read_at = statement_at(
+            &body,
+            "letmembers=get_voice_channel_members(&user_voice_channel).await?;",
+        );
+        for binding in ["current_permissions=", "user_voice_channel=", "members="] {
+            assert_eq!(
+                body.matches(binding).count(),
+                1,
+                "`{binding}` is bound once: {body}"
+            );
+        }
+
+        let (args, end) = only_call_args(&body, "join_call_occupancy_refuses(");
+        assert_eq!(
+            args,
+            [
+                "members.as_deref()",
+                "voice_info.max_users",
+                "current_permissions.has(ChannelPermission::ManageChannelasu64)",
+            ],
+            "the roster read, the channel's cap and this joiner's ManageChannel"
+        );
+        let asked_at = body.find("join_call_occupancy_refuses(").expect("counted");
+        assert!(
+            body[..asked_at].ends_with(";if")
+                && body[end..].starts_with("\u{7b}returnErr(create_error!(CannotJoinCall));\u{7d}"),
+            "a full channel is refused with CannotJoinCall and nothing else: {}",
+            body
+        );
+
+        let caps_at = body
+            .find("assert_call_caps_admit(")
+            .expect("join_call's caps");
+        assert!(
+            connect_at < read_at && read_at < asked_at && asked_at < caps_at,
+            "Connect, then the roster, then the occupancy rule, then the caps: {}",
+            body
+        );
+    }
+
+    /// The force-disconnect loop drops the kicked channel's session record
+    /// FIRST, before it releases, reads, evicts or tears down anything there
+    /// (lane 6a4), and only there: in the KICK loop (merge slice RT-8, never
+    /// the rejoin loop above it, found by `kick`), bounded by the loop's
+    /// closing brace (RRB-2). A failed drop skips the channel through an arm
+    /// that logs and continues and does nothing else (M2A-2): never `?`,
+    /// which fails the join, and never on to the eviction, which would leave
+    /// the kicked session a record. The route tests below see the record go
+    /// but cannot see the order, nor a drop that fails. Controls NODROP (the
+    /// drop deleted), DROPLOOP (moved into the rejoin loop), DROPLATE (after
+    /// the channel's teardown), DROPAFTER (just after the kick loop),
+    /// DROP-QMARK (the old `.await?;` statement).
+    #[test]
+    fn a_kick_drops_the_kicked_channels_record_before_the_removal() {
+        const DROP: &str =
+            "ifletErr(error)=drop_voice_participant_session(&previous_channel.id,&user.id).await";
+
+        let body = join_call_body();
+        assert_eq!(
+            body.matches("drop_voice_participant_session(").count(),
+            1,
+            "join_call drops a record only in the kick loop: {body}"
+        );
+        let (branch, lp) = kick(&body);
+        let kick_loop = &body[lp.clone()];
+        let dropped_at = body
+            .find("drop_voice_participant_session(")
+            .expect("counted above");
+        assert!(
+            lp.start < dropped_at && dropped_at < lp.end && lp.end < branch.end,
+            "the drop lies inside the kick loop: {}",
+            body
+        );
+
+        assert!(
+            kick_loop.starts_with(DROP) && kick_loop[DROP.len()..].starts_with('\u{7b}'),
+            "the drop is the kick loop's first statement, its failure handled on the spot: {}",
+            kick_loop
+        );
+        let (arm, arm_end) = block_from(kick_loop, DROP.len());
+        let logged = arm
+            .strip_prefix("log::warn!(")
+            .and_then(|rest| rest.strip_suffix(");continue;"))
+            .unwrap_or_else(|| {
+                panic!(
+                    "a failed drop logs, then skips the channel, and nothing else: {}",
+                    arm
+                )
+            });
+        assert!(
+            !logged.contains(';') && logged.contains("error:?"),
+            "the arm is one WARN naming the error, then `continue`: {}",
+            arm
+        );
+        assert!(
+            !kick_loop[arm_end..].starts_with("else"),
+            "a drop that succeeded goes on to the removal: {}",
+            kick_loop
+        );
+
+        for later in [
+            "release_remote_control_for_user(",
+            "recorded_voice_connections(",
+            "remove_user_if_present_sids(",
+            "tear_down_removed_connections(",
+        ] {
+            let at = kick_loop
+                .find(later)
+                .unwrap_or_else(|| panic!("`{}` left the kick loop", later));
+            assert!(
+                arm_end <= at,
+                "the record is dropped before `{}`: {kick_loop}",
+                later
+            );
+        }
+    }
+
+    /// Every shipping Rust source of this crate as (`src`-relative path,
+    /// text), comments and then `#[cfg(test)]` items stripped. Comments are
+    /// cut first (`util::test::without_comments`), so neither a comment that
+    /// names the attribute nor a brace in a comment matters. The items are
+    /// then matched on that text with the older algorithm, NOT the database
+    /// crate's workspace scan (which reads both the attribute and the braces
+    /// off text with the literals blanked too): every `#[cfg(test)]`
+    /// occurrence counts, one inside a string literal and one in the middle
+    /// of a line included, followed by a brace-matched body or a bodyless
+    /// item ending in `;`, and braces are counted raw, so a brace inside a
+    /// string or char literal moves the match (the S6RM-5 and S6F3A-2 shapes
+    /// are still open here, HD re-audit HDA-6). An item that never closes is
+    /// a panic, never a silent truncation of the shipping text below it.
+    fn delta_shipping_sources() -> Vec<(String, String)> {
+        fn rust_sources(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for entry in std::fs::read_dir(dir).expect("read the source directory") {
+                let path = entry.expect("read a source directory entry").path();
+                if path.is_dir() {
+                    rust_sources(&path, out);
+                } else if path.extension().is_some_and(|ext| ext == "rs") {
+                    out.push(path);
+                }
+            }
+        }
+
+        fn strip_test_items(rel: &str, source: &str) -> String {
+            const ATTR: &str = "#[cfg(test)]";
+            let mut shipping = String::with_capacity(source.len());
+            let mut rest = source;
+            while let Some(attr) = rest.find(ATTR) {
+                shipping.push_str(&rest[..attr]);
+                let after = &rest[attr + ATTR.len()..];
+                let mut depth = 0usize;
+                let mut item_end = None;
+                for (i, ch) in after.char_indices() {
+                    match ch {
+                        ';' if depth == 0 => {
+                            item_end = Some(i + 1);
+                            break;
+                        }
+                        '\u{7b}' => depth += 1,
+                        '\u{7d}' => {
+                            depth = depth.checked_sub(1).unwrap_or_else(|| {
+                                panic!("unbalanced braces after {} in {}", ATTR, rel)
+                            });
+                            if depth == 0 {
+                                item_end = Some(i + 1);
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                let item_end =
+                    item_end.unwrap_or_else(|| panic!("a {} item in {} never closes", ATTR, rel));
+                rest = &after[item_end..];
+            }
+            shipping.push_str(rest);
+            shipping
+        }
+
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        rust_sources(&src, &mut files);
+        assert!(
+            files.len() > 100,
+            "suspiciously small scan of {} ({} files): asserting over nothing",
+            src.display(),
+            files.len()
+        );
+        files
+            .iter()
+            .map(|path| {
+                let text = std::fs::read_to_string(path)
+                    .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
+                let rel = path
+                    .strip_prefix(&src)
+                    .expect("scanned file outside src/")
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                let shipping = strip_test_items(&rel, &crate::util::test::without_comments(&text));
+                (rel, shipping)
+            })
+            .collect()
+    }
+
+    /// Merge slice R2-M2b ("P4 MUST pin"): in this crate only `join_call`
+    /// writes a session record, at ONE call site. The other mint paths, the
+    /// Android screen leg (`create_screen_leg_token`) and remote control
+    /// (`update_permissions_identity`), never do: a record written there
+    /// would name a session, or a seat, that no `join_call` admitted, and a
+    /// move would mint for it. The name is counted too, so an alias or a
+    /// function pointer cannot hide a second writer.
+    #[test]
+    fn only_join_call_writes_a_session_record_in_this_crate() {
+        const JOIN: &str = "routes/channels/voice_join.rs";
+        const WRITER: &str = "set_voice_participant_session";
+
+        let sources = delta_shipping_sources();
+        let mentions: Vec<(&str, usize, usize)> = sources
+            .iter()
+            .map(|(rel, shipping)| {
+                (
+                    rel.as_str(),
+                    shipping.matches(WRITER).count(),
+                    shipping.matches(&format!("{WRITER}(")).count(),
+                )
+            })
+            .filter(|(_, named, _)| *named > 0)
+            .collect();
+        assert_eq!(
+            mentions,
+            [(JOIN, 2, 1)],
+            "only {JOIN} names the writer (its import and its one call): {mentions:?}"
+        );
+        assert_eq!(
+            join_call_body().matches(&format!("{WRITER}(")).count(),
+            1,
+            "the one call is join_call's"
+        );
+
+        for (rel, mint) in [
+            (
+                "routes/channels/voice_screen_leg.rs",
+                ".create_screen_leg_token(",
+            ),
+            (
+                "routes/channels/remote_control.rs",
+                ".update_permissions_identity(",
+            ),
+        ] {
+            let shipping = &sources
+                .iter()
+                .find(|(path, _)| path == rel)
+                .unwrap_or_else(|| panic!("{} left the crate", rel))
+                .1;
+            assert!(
+                shipping.contains(mint),
+                "{} no longer calls `{}`, so this pin checks nothing there",
+                rel,
+                mint
+            );
+            assert!(
+                !shipping.contains(WRITER),
+                "{} writes a session record",
+                rel
+            );
+        }
+    }
+
+    /// A move in flight out of channel A must not reach a session a join
+    /// into ANOTHER channel kicked (lane 6a4): the kick drops A's record, so
+    /// the move's re-check refuses it, and another user's record in A stays,
+    /// seat kind and all. Recast for the merge (RT-8): the old shape pinned A
+    /// to a configured node, so the kick's eviction there asked an SFU no
+    /// test run reaches, failed, and (AFK S-3) tore nothing of A down, which
+    /// turned its "the voice state in A is gone" assertion red. A holds no
+    /// node here, as a call whose room is gone: nothing is evicted, the
+    /// teardown runs from A's records, and the join into X gets past the
+    /// kick (`force_join_past_the_disconnect`). The seats recorded match the
+    /// identities connected (merge slice SEC4-5): the user bare, the other
+    /// user as a device. Control NODROP.
+    #[test]
+    fn a_kick_from_a_join_elsewhere_drops_the_kicked_channels_record() {
+        crate::util::test::rt().block_on(a_kick_from_a_join_elsewhere_case())
+    }
+
+    async fn a_kick_from_a_join_elsewhere_case() {
+        use revolt_database::voice::{
+            get_voice_participant_session, get_voice_participant_session_seat,
+            set_voice_participant_session, SeatKind,
+        };
+
+        let harness = TestHarness::new().await;
+        let (_account, session_w, user) = harness.new_user().await;
+        let (_account_o, _session_o, other) = harness.new_user().await;
+
+        let kicked = voice_channel(&harness, &user, &[&other]).await;
+        let joined = voice_channel(&harness, &user, &[]).await;
+        let kicked_voice = UserVoiceChannel::from_channel(&kicked);
+        let joined_voice = UserVoiceChannel::from_channel(&joined);
+
+        // The user's desktop session "DESKTOP" owns the user's bare seat in
+        // A, and the other user's session owns their device seat there.
+        join_recorded(&kicked_voice, &user.id, "PA_kicked_user", &user.id).await;
+        join_recorded(
+            &kicked_voice,
+            &other.id,
+            "PA_kicked_other",
+            &format!("{}:ODEV", other.id),
+        )
+        .await;
+        set_voice_participant_session(kicked.id(), &user.id, "DESKTOP", None)
+            .await
+            .expect("record");
+        set_voice_participant_session(kicked.id(), &other.id, "OTHER", Some("ODEV"))
+            .await
+            .expect("record");
+        assert!(
+            get_channel_node(kicked.id())
+                .await
+                .expect("node read")
+                .is_none(),
+            "A's room is gone: no node"
+        );
+
+        // Session W joins X with force_disconnect.
+        force_join_past_the_disconnect(&harness, &session_w.token, &joined).await;
+
+        let (recorded, listed, member, pointer) = voice_traces(&kicked_voice, &user.id).await;
+        assert!(
+            recorded.is_empty() && !listed && !member && !pointer,
+            "the kick loop ran: the user's state in A is gone, left: recorded {:?}, vc {}, \
+             vc_members {}, pointer {}",
+            recorded,
+            listed,
+            member,
+            pointer
+        );
+        assert_eq!(
+            get_voice_participant_session(kicked.id(), &user.id)
+                .await
+                .unwrap(),
+            None,
+            "the kick must drop A's record, or a move out of A still reaches DESKTOP"
+        );
+        assert_eq!(
+            get_voice_participant_session_seat(kicked.id(), &other.id)
+                .await
+                .unwrap(),
+            Some(("OTHER".to_string(), SeatKind::Device("ODEV".to_string()))),
+            "only the kicked user's record goes"
+        );
+        assert_eq!(
+            get_voice_participant_session(joined.id(), &user.id)
+                .await
+                .unwrap(),
+            None,
+            "a join that failed at the SFU records nothing in X"
+        );
+
+        for voice in [&kicked_voice, &joined_voice] {
+            delete_channel_voice_state(voice, &[user.id.clone(), other.id.clone()])
+                .await
+                .expect("cleanup");
+        }
     }
 }

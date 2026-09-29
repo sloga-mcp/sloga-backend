@@ -12,6 +12,12 @@
 //! ghost-room lesson). Every entry this task examines leaves the due range:
 //! it is cleared, removed, or requeued through `requeue_score` (P2-1).
 //!
+//! The move is announced to the one session `join_call` recorded as owning
+//! the member's participant, read right before the move (merge slice F8). A
+//! member with no recorded owner is skipped with a backoff, never moved as a
+//! disconnect (ruling 09-27). The sweep moves under moderator admission
+//! rules, as `MovePolicy::Sweep`.
+//!
 //! crond has no leader election. Two replicas may read the same entry; the
 //! move itself is guarded by an atomic `SET NX EX` claim that is never
 //! released, so it also covers the window in which a moved client is still
@@ -41,7 +47,8 @@ use revolt_database::{
             clear_afk_since, drop_idle_member, due_idle_members, parse_afk_idle_member,
             read_idle_state, requeue_idle_member, requeue_score, AfkRequeue, IdleState,
         },
-        move_user_to_voice_channel_expecting, VoiceClient, VoiceMoveOutcome,
+        get_voice_participant_session, move_user_to_voice_channel_expecting, MovePolicy,
+        VoiceClient, VoiceMoveOutcome, MOVE_ADMISSION_TTL_SECS,
     },
     Channel, Database, AMQP,
 };
@@ -65,14 +72,33 @@ const AFK_SWEEP_PAGE: usize = 500;
 /// claim their client re-posts before it has left the old channel.
 const AFK_MOVE_CLAIM_TTL_SECS: usize = 30;
 
+// Merge slice P2A-4: the move admission key a sweep move writes (the target
+// may lack Connect on the AFK channel) LIVES shorter than this claim. That
+// is all this assert proves: it compares the two lifetimes, stated against
+// the voice crate's real constant, which on its side pins only the literal
+// 30 (`the_move_admission_key_outlives_the_token`). It does not order the
+// two expiries (merge slice M2C-3). The claim is taken before the move
+// starts, and the key is written late in a move that may run for up to
+// `AFK_MOVE_TIMEOUT`, so the key can still stand for up to about 10 s
+// (`AFK_MOVE_TIMEOUT` minus the claim's lead over the key's lifetime:
+// 20 - (30 - 20)) after the claim has expired, and a move retried in that
+// window can find the admission the attempt before it left. That is
+// harmless: the key admits one identity (the seat that attempt minted for)
+// into one channel (that attempt's destination) and nothing wider; the
+// server's AFK channel can change between the attempts, and then the key
+// does not even name the retry's destination. A bound on the deadlines
+// plus the move timeout within the claim) would not hold at today's values
+// and is not asserted here.
+const _: () = assert!(MOVE_ADMISSION_TTL_SECS < AFK_MOVE_CLAIM_TTL_SECS);
+
 /// Bound on one move (P2-15). Shorter than the claim, so a move that hangs is
 /// abandoned before a second replica could win the claim and duplicate it.
 const AFK_MOVE_TIMEOUT: Duration = Duration::from_secs(20);
 
-/// After a policy refusal the claim is re-expired to this, and the entry is
-/// requeued as `AfkRequeue::Refused` (the same 300 s): a member who cannot
-/// connect to the AFK channel is asked about again every five minutes, not
-/// every tick.
+/// After a policy refusal, or a member skipped for having no recorded owning
+/// session, the claim is re-expired to this, and the entry is requeued as
+/// `AfkRequeue::Refused` (the same 300 s): a member who cannot be moved into
+/// the AFK channel is asked about again every five minutes, not every tick.
 const AFK_REFUSAL_BACKOFF_SECS: usize = 300;
 
 /// A repeated log line is written at WARN once per this period per (server,
@@ -160,6 +186,12 @@ enum SweepAction {
 /// The refusals a move raises as `Err` (Stage 1 I-17). They are answers
 /// about the member or the AFK channel, not failures, and repeating them
 /// every tick would change nothing.
+///
+/// `NotFound` is the answer for a target who is not a member of the server
+/// (merge slice SEC2-5: a staff account sitting in a call it was never a
+/// member of would otherwise be retried every tick), and `InvalidOperation`
+/// the move's own refusal of a sweep with no owning session, which
+/// `process_candidate` already skips before the call.
 fn refusal_kind(error: &ErrorType) -> Option<&'static str> {
     Some(match error {
         ErrorType::MissingPermission { .. } => "MissingPermission",
@@ -169,16 +201,31 @@ fn refusal_kind(error: &ErrorType) -> Option<&'static str> {
         ErrorType::VideoCallFull { .. } => "VideoCallFull",
         ErrorType::MlsCallFull { .. } => "MlsCallFull",
         ErrorType::UnknownNode => "UnknownNode",
+        ErrorType::NotFound => "NotFound",
+        ErrorType::InvalidOperation => "InvalidOperation",
         _ => return None,
     })
 }
 
-/// Classify what `move_user_to_voice_channel_expecting` returned.
+/// Classify what `move_user_to_voice_channel_expecting` returned. Every
+/// outcome is named, so a new one fails to compile here instead of falling
+/// into an arm by accident.
 fn sweep_action(result: &Result<VoiceMoveOutcome>) -> SweepAction {
     match result {
         Ok(VoiceMoveOutcome::Moved { .. })
         | Ok(VoiceMoveOutcome::AlreadyPresent)
         | Ok(VoiceMoveOutcome::NotConnected) => SweepAction::Clear,
+        // The move with nobody to tell, done as a disconnect. Unreachable
+        // here: the sweep only calls the move with a recorded owning session
+        // (`OwnerRead::Owner`), and the move refuses a `MovePolicy::Sweep`
+        // without one before any write. Should it ever come back, the member
+        // was evicted from the call instead of moved, which is a failure to
+        // be logged and looked at again, never a settled move.
+        Ok(VoiceMoveOutcome::Disconnected) => SweepAction::Other("move disconnected"),
+        // The owning session could only be told without a token and would
+        // have to join the AFK channel itself, which it may not (merge slice
+        // P2A-3): a policy refusal, asked about again after the backoff.
+        Ok(VoiceMoveOutcome::TargetCannotJoin) => SweepAction::Refused("TargetCannotJoin"),
         Err(error) => match refusal_kind(&error.error_type) {
             Some(kind) => SweepAction::Refused(kind),
             None => SweepAction::Other("move failed"),
@@ -195,6 +242,32 @@ fn timed_sweep_action(
     match outcome {
         Ok(result) => sweep_action(result),
         Err(_) => SweepAction::Other("move timed out"),
+    }
+}
+
+/// What the read of the session owning the member's participant decides
+/// (merge slice F8, P2A-15, ruling 09-27).
+#[derive(Debug)]
+enum OwnerRead {
+    /// The session recorded by `join_call`: the move is announced to it.
+    Owner(String),
+    /// No session is recorded (a join from before the record existed, or a
+    /// delta rolled back below the merge). Skipped with the refusal backoff,
+    /// never moved: the move could only be done as a disconnect, and an
+    /// automated sweep must not turn an anomaly into mass disconnects.
+    NoOwner,
+    /// The read failed. An infrastructure error, retried as one, and never
+    /// taken to mean "no owner".
+    Unreadable(revolt_result::Error),
+}
+
+/// Classify the owner read. An empty session id is no owner, as the move
+/// itself reads it.
+fn owner_read(read: Result<Option<String>>) -> OwnerRead {
+    match read {
+        Ok(Some(session_id)) if !session_id.is_empty() => OwnerRead::Owner(session_id),
+        Ok(_) => OwnerRead::NoOwner,
+        Err(error) => OwnerRead::Unreadable(error),
     }
 }
 
@@ -275,8 +348,9 @@ async fn claim_afk_move(user_id: &str, server_id: &str) -> Result<bool> {
     .to_internal_error()
 }
 
-/// After a policy refusal: keep the claim for the backoff, so no replica
-/// retries the same refused move before the entry comes due again.
+/// After a policy refusal or a skip for want of an owning session: keep the
+/// claim for the backoff, so no replica retries the same member before the
+/// entry comes due again.
 async fn back_off_claim(user_id: &str, server_id: &str) -> Result<()> {
     let mut conn = get_connection()
         .await
@@ -305,7 +379,8 @@ enum AfkConfig {
 
 /// Resolve-then-check, never trust: the AFK pointer is validated only when
 /// it is written, and the channel can be deleted or lose its voice
-/// information afterwards (`Server::validate_afk_channel`).
+/// information afterwards (`Server::validate_afk_channel`). What is checked
+/// on the channel it resolves to is [`afk_channel_unusable`].
 async fn resolve_afk_config(db: &Database, server_id: &str) -> AfkConfig {
     let server = match db.fetch_server(server_id).await {
         Ok(server) => server,
@@ -331,18 +406,41 @@ async fn resolve_afk_config(db: &Database, server_id: &str) -> AfkConfig {
         Err(_) => return AfkConfig::Unreadable,
     };
 
-    if channel.server() != Some(server_id) {
-        return AfkConfig::Unusable("the AFK channel is not in this server");
-    }
-
-    if channel.voice().is_none() {
-        return AfkConfig::Unusable("the AFK channel is not a voice channel");
+    if let Some(reason) = afk_channel_unusable(&channel, server_id) {
+        return AfkConfig::Unusable(reason);
     }
 
     AfkConfig::Usable {
         channel,
         timeout_secs,
     }
+}
+
+/// Why the channel a server's AFK pointer resolved to cannot take anyone, or
+/// `None` when the sweep may move members into it. Pure, so every arm is
+/// unit-tested without a database.
+///
+/// The gate arm (wave BG) is defense in depth. `Server::validate_afk_channel`
+/// refuses to designate a gated channel and `channel_edit` refuses to gate
+/// the designated one, but two admins racing each other can still leave the
+/// designated channel gated, and a server that sets only a timeout never has
+/// its channel re-validated. The sweep then moves nobody, rather than moving
+/// idle members into a channel some of them were never let into. It costs no
+/// I/O: the channel is already in hand, and the config is cached per tick.
+fn afk_channel_unusable(channel: &Channel, server_id: &str) -> Option<&'static str> {
+    if channel.server() != Some(server_id) {
+        return Some("the AFK channel is not in this server");
+    }
+
+    if channel.voice().is_none() {
+        return Some("the AFK channel is not a voice channel");
+    }
+
+    if channel.has_client_gate() {
+        return Some("the AFK channel is behind an age, password or spoiler gate");
+    }
+
+    None
 }
 
 /// One tick's cache of resolved server configs: a server with fifty idle
@@ -375,6 +473,9 @@ enum Candidate {
     Cleared,
     /// Put back for later, without a move.
     Requeued(AfkRequeue),
+    /// Due, but no session is recorded as owning the participant: not
+    /// moved, the claim backed off and the entry requeued as refused.
+    SkippedNoOwner,
     /// A move was attempted, with this result.
     MoveAttempted(SweepAction),
 }
@@ -590,8 +691,10 @@ async fn process_candidate(
         }
     };
 
-    // Bots are never moved (I-19). The move function itself deliberately has
-    // no bot check: a moderator may still move a bot by hand.
+    // Bots are never moved (I-19). The move function itself has no bot
+    // check; each caller refuses bots on its own. The member route answers
+    // any move of a bot `IsBot` (ruling 09-27), and a moderator can still
+    // disconnect one.
     if user.bot.is_some() {
         return clear_entry(user_id, server_id, throttle).await;
     }
@@ -680,11 +783,66 @@ async fn process_candidate(
         .await;
     };
 
+    // The session recorded as owning the member's participant in the source
+    // (merge slice F8), read once, here: after the re-read, from the channel
+    // it names, and before the move, which is announced to that session
+    // alone. Channel first, then user; both are `&str`, so a swap would
+    // compile and read nothing, which is why the arguments are pinned.
+    let owner = get_voice_participant_session(&fresh_claim.channel_id, user_id).await;
+    let session_id = match owner_read(owner) {
+        OwnerRead::Owner(session_id) => session_id,
+        // Ruling 09-27: skipped, not moved (see `OwnerRead::NoOwner`), with
+        // the refusal backoff so it is asked about every five minutes.
+        OwnerRead::NoOwner => {
+            if let Err(error) = back_off_claim(user_id, server_id).await {
+                log_throttled(throttle, server_id, "claim failed", || {
+                    format!("AFK sweep: could not extend the move claim for {user_id}: {error}")
+                });
+            }
+            log_throttled(throttle, server_id, "NoOwner", || {
+                format!(
+                    "AFK sweep: not moving {user_id} in server {server_id}: no session is \
+                     recorded as owning their participant in {}; retrying in \
+                     {AFK_REFUSAL_BACKOFF_SECS} s",
+                    fresh_claim.channel_id
+                )
+            });
+            requeue_entry(
+                member,
+                server_id,
+                AfkRequeue::Refused,
+                claim.since_ms,
+                timeout_secs,
+                now_ms,
+                throttle,
+            )
+            .await;
+            return Candidate::SkippedNoOwner;
+        }
+        // P2A-15: a failed read is an infrastructure error, never "no owner".
+        OwnerRead::Unreadable(error) => {
+            log_throttled(throttle, server_id, "owner read failed", || {
+                format!("AFK sweep: could not read the owning session of {user_id}: {error}")
+            });
+            return requeue_entry(
+                member,
+                server_id,
+                AfkRequeue::InfraError,
+                claim.since_ms,
+                timeout_secs,
+                now_ms,
+                throttle,
+            )
+            .await;
+        }
+    };
+
     // Awaited, never propagated: a refusal is an `Err`, and one member's
     // refusal must not end the tick for every other server (I-17). With the
     // expected source, a member who switched channels since the re-read
     // answers `NotConnected` (cleared below) instead of being pulled out of
-    // the channel they just chose.
+    // the channel they just chose. The sweep moves under moderator admission
+    // rules (ruling 09-27), as `MovePolicy::Sweep`.
     let outcome = tokio::time::timeout(
         AFK_MOVE_TIMEOUT,
         move_user_to_voice_channel_expecting(
@@ -693,6 +851,8 @@ async fn process_candidate(
             &user,
             &afk_channel,
             &fresh_claim.channel_id,
+            Some(session_id.as_str()),
+            MovePolicy::Sweep,
         ),
     )
     .await;
@@ -729,7 +889,8 @@ async fn process_candidate(
         SweepAction::Other(kind) => {
             let detail = match &outcome {
                 Ok(Err(error)) => error.to_string(),
-                _ => format!("no answer within {} s", AFK_MOVE_TIMEOUT.as_secs()),
+                Ok(Ok(answer)) => format!("the move answered {answer:?}"),
+                Err(_) => format!("no answer within {} s", AFK_MOVE_TIMEOUT.as_secs()),
             };
             log_throttled(throttle, server_id, kind, || {
                 format!(
@@ -765,6 +926,9 @@ struct TickSummary {
     dropped: usize,
     cleared: usize,
     requeued: usize,
+    /// Due, but skipped for want of a recorded owning session (ruling
+    /// 09-27). Requeued, and not counted in `requeued`.
+    skipped_no_owner: usize,
     moves_attempted: usize,
     moves_settled: usize,
     moves_refused: usize,
@@ -778,6 +942,7 @@ impl TickSummary {
             Candidate::Dropped => self.dropped += 1,
             Candidate::Cleared => self.cleared += 1,
             Candidate::Requeued(_) => self.requeued += 1,
+            Candidate::SkippedNoOwner => self.skipped_no_owner += 1,
             Candidate::MoveAttempted(action) => {
                 self.moves_attempted += 1;
                 match action {
@@ -909,15 +1074,19 @@ pub async fn task(db: Database, _: AMQP) -> Result<()> {
                 log::info!("AFK sweep: features.afk_auto_move is off; not moving anyone");
                 disabled_logged = true;
             }
-        } else if summary.moves_attempted > 0 || summary.panicked > 0 {
+        } else if summary.moves_attempted > 0
+            || summary.skipped_no_owner > 0
+            || summary.panicked > 0
+        {
             log::info!(
                 "AFK sweep: examined {}, moves attempted {} (settled {}, refused {}, failed {}), \
-                 panicked {}, deferred {}",
+                 skipped with no owning session {}, panicked {}, deferred {}",
                 summary.examined,
                 summary.moves_attempted,
                 summary.moves_settled,
                 summary.moves_refused,
                 summary.moves_failed,
+                summary.skipped_no_owner,
                 summary.panicked,
                 summary.deferred
             );
@@ -1044,8 +1213,12 @@ mod tests {
     }
 
     /// The one move call (audit A2: the variant that takes the expected
-    /// source, the only move entry point since S-3 RB-1).
+    /// source, the only move entry point since S-3 RB-1; since the merge
+    /// slice it also takes the expected owning session and the policy).
     const MOVE_CALL: &str = "move_user_to_voice_channel_expecting(";
+
+    /// The one read of the owning session (merge slice F8).
+    const OWNER_READ: &str = "get_voice_participant_session(";
 
     /// The move is called once in the whole sweep, from `process_candidate`.
     /// (The S-3 cleanup deleted the plain move, so the ban on it that used to
@@ -1124,12 +1297,16 @@ mod tests {
             (ErrorType::VideoCallFull { max: 30 }, "VideoCallFull"),
             (ErrorType::MlsCallFull { max: 100 }, "MlsCallFull"),
             (ErrorType::UnknownNode, "UnknownNode"),
+            // Merge slice SEC2-5: a target who is not a member, and the
+            // move's refusal of a sweep with no owning session.
+            (ErrorType::NotFound, "NotFound"),
+            (ErrorType::InvalidOperation, "InvalidOperation"),
         ];
         for (error_type, kind) in refusals {
             assert_eq!(sweep_action(&error(error_type)), SweepAction::Refused(kind));
         }
 
-        for other in [ErrorType::InternalError, ErrorType::NotFound] {
+        for other in [ErrorType::InternalError, ErrorType::NotAuthenticated] {
             assert_eq!(
                 sweep_action(&error(other)),
                 SweepAction::Other("move failed")
@@ -1146,6 +1323,18 @@ mod tests {
         ] {
             assert_eq!(sweep_action(&Ok(settled)), SweepAction::Clear);
         }
+
+        // Merge slice P2A-3: the owning session could not join the AFK
+        // channel itself, a policy refusal with the backoff.
+        assert_eq!(
+            sweep_action(&Ok(VoiceMoveOutcome::TargetCannotJoin)),
+            SweepAction::Refused("TargetCannotJoin")
+        );
+        // A disconnect is never a settled move (unreachable with an owner).
+        assert_eq!(
+            sweep_action(&Ok(VoiceMoveOutcome::Disconnected)),
+            SweepAction::Other("move disconnected")
+        );
     }
 
     #[tokio::test]
@@ -1187,6 +1376,9 @@ mod tests {
         for (arm, requeue) in [
             ("SweepAction::Refused(kind) =>", "AfkRequeue::Refused"),
             ("SweepAction::Other(kind) =>", "AfkRequeue::InfraError"),
+            // Merge slice: the two arms of the owner read that do not move.
+            ("OwnerRead::NoOwner =>", "AfkRequeue::Refused"),
+            ("OwnerRead::Unreadable(error) =>", "AfkRequeue::InfraError"),
         ] {
             let arm_body = braced_body(&body, arm);
             assert!(
@@ -1194,7 +1386,9 @@ mod tests {
                 "{arm} must requeue as {requeue}: {arm_body}"
             );
         }
-        assert!(braced_body(&body, "SweepAction::Refused(kind) =>").contains("back_off_claim("));
+        for backed_off in ["SweepAction::Refused(kind) =>", "OwnerRead::NoOwner =>"] {
+            assert!(braced_body(&body, backed_off).contains("back_off_claim("));
+        }
         assert!(braced_body(&body, "SweepAction::Clear =>").contains("clear_entry("));
     }
 
@@ -1233,6 +1427,11 @@ mod tests {
     /// made the expectation a required `&str`, so the `!call.contains("None")`
     /// that used to guard against "no expectation" could no longer fail and
     /// was deleted; the exact argument list below pins the source.
+    ///
+    /// Merge slice F8: the sixth argument is the owning session the sweep
+    /// read itself (`None` compiles, and would make every move refused), and
+    /// the seventh is exactly `MovePolicy::Sweep` (moderator admission
+    /// rules, ruling 09-27). Controls SWEEP-NONE and POLICY.
     #[test]
     fn the_move_expects_the_reread_claims_channel() {
         let body = process_candidate_body();
@@ -1240,7 +1439,10 @@ mod tests {
 
         assert_eq!(
             call,
-            format!("{MOVE_CALL}db,voice_client,&user,&afk_channel,&fresh_claim.channel_id,)")
+            format!(
+                "{MOVE_CALL}db,voice_client,&user,&afk_channel,&fresh_claim.channel_id,\
+                 Some(session_id.as_str()),MovePolicy::Sweep,)"
+            )
         );
 
         let fresh_claim = body
@@ -1248,6 +1450,130 @@ mod tests {
             .expect("the expectation comes from the re-read state");
         assert!(body.find("let fresh = match read_idle_state(").unwrap() < fresh_claim);
         assert!(fresh_claim < body.find(MOVE_CALL).unwrap());
+
+        // `session_id` is ONE binding, the owner read's: bound once, from
+        // the `Owner` arm, and used once, in the move.
+        for (needle, want) in [
+            ("let session_id = match owner_read(owner)", 1),
+            ("OwnerRead::Owner(session_id) => session_id,", 1),
+            ("session_id", 4),
+        ] {
+            assert_eq!(body.matches(needle).count(), want, "`{needle}`: {body}");
+        }
+    }
+
+    /// Merge slice F8: the owning session is read exactly once, after the
+    /// re-read under the claim (from the channel its claim names) and before
+    /// the move, channel first. Both arguments are `&str`: swapped, the read
+    /// finds nothing and every member is skipped (control SWAP).
+    #[test]
+    fn the_owner_is_read_once_after_the_reread_and_before_the_move() {
+        let body = process_candidate_body();
+
+        assert_eq!(code_only(production()).matches(OWNER_READ).count(), 1);
+        assert_eq!(
+            compact(braced_call(&body, OWNER_READ)),
+            format!("{OWNER_READ}&fresh_claim.channel_id,user_id)")
+        );
+        // Its result goes straight to `owner_read`, and nowhere else.
+        assert!(compact(&body).contains(&format!(
+            "letowner={OWNER_READ}&fresh_claim.channel_id,user_id).await;\
+             letsession_id=matchowner_read(owner)"
+        )));
+        assert_eq!(body.matches("owner_read(owner)").count(), 1);
+        assert_eq!(body.matches("let owner =").count(), 1);
+
+        let fresh_claim = body
+            .find("let Some(fresh_claim) = fresh.claim.as_ref() else")
+            .expect("the re-read claim");
+        let read = body.find(OWNER_READ).expect("the owner read");
+        assert!(fresh_claim < read, "the owner read follows the re-read");
+        assert!(
+            read < body.find(MOVE_CALL).unwrap(),
+            "the owner read precedes the move"
+        );
+    }
+
+    /// Ruling 09-27 and P2A-15: with no owner the member is skipped. The arm
+    /// backs the claim off, requeues as refused and RETURNS, so the move is
+    /// never reached (control NONE-MOVES); a failed read requeues as an
+    /// infrastructure error and returns too.
+    #[test]
+    fn only_a_recorded_owner_reaches_the_move() {
+        let body = process_candidate_body();
+        let movement = body.find(MOVE_CALL).expect("the move");
+
+        let no_owner = braced_body(&body, "OwnerRead::NoOwner =>");
+        assert!(body.find("OwnerRead::NoOwner =>").unwrap() < movement);
+        assert!(!no_owner.contains(MOVE_CALL));
+        assert!(no_owner.contains("back_off_claim(user_id, server_id)"));
+        assert!(
+            compact(no_owner).ends_with(&format!("returnCandidate::SkippedNoOwner;{CLOSE}")),
+            "the no-owner arm must end by returning: {no_owner}"
+        );
+
+        let unreadable = braced_body(&body, "OwnerRead::Unreadable(error) =>");
+        assert!(body.find("OwnerRead::Unreadable(error) =>").unwrap() < movement);
+        assert!(compact(unreadable).contains("returnrequeue_entry("));
+        assert!(unreadable.contains("AfkRequeue::InfraError"));
+        assert!(!unreadable.contains("back_off_claim("));
+    }
+
+    /// P2A-15: a failed read is never "no owner" (control ERR-AS-NONE), and
+    /// an empty session id is no owner, as the move reads it.
+    #[test]
+    fn owner_read_never_takes_a_failed_read_for_no_owner() {
+        assert!(matches!(
+            owner_read(Ok(Some("S".to_string()))),
+            OwnerRead::Owner(session_id) if session_id == "S"
+        ));
+        assert!(matches!(owner_read(Ok(None)), OwnerRead::NoOwner));
+        assert!(matches!(
+            owner_read(Ok(Some(String::new()))),
+            OwnerRead::NoOwner
+        ));
+
+        let failed = revolt_result::Error {
+            error_type: ErrorType::InternalError,
+            location: String::new(),
+        };
+        assert!(matches!(
+            owner_read(Err(failed)),
+            OwnerRead::Unreadable(error) if matches!(error.error_type, ErrorType::InternalError)
+        ));
+    }
+
+    /// Ruling 09-27: the sweep moves under moderator admission rules, and
+    /// constructs no other policy anywhere in its shipping code.
+    #[test]
+    fn the_sweep_moves_only_as_sweep() {
+        let code = code_only(production());
+
+        assert_eq!(code.matches("MovePolicy::").count(), 1, "{code}");
+        assert_eq!(code.matches("MovePolicy::Sweep").count(), 1);
+    }
+
+    /// Ruling 09-27: a member skipped for want of an owner is counted in the
+    /// tick summary, and a tick with skips alone is still logged.
+    #[test]
+    fn a_member_skipped_for_no_owner_is_counted_and_logged() {
+        let mut summary = TickSummary::default();
+        summary.record(Candidate::SkippedNoOwner);
+        assert_eq!(
+            summary,
+            TickSummary {
+                skipped_no_owner: 1,
+                ..Default::default()
+            }
+        );
+
+        let task = compact(&code_only(braced_body(production(), "pub async fn task(")));
+        assert!(task.contains("||summary.skipped_no_owner>0||"), "{task}");
+        assert_eq!(
+            task.matches("summary.skipped_no_owner").count(),
+            2,
+            "{task}"
+        );
     }
 
     /// The arguments that follow each CALL of `name(` in `code` (definitions,
@@ -1285,7 +1611,8 @@ mod tests {
             ("clear_afk_since(", 1),
             ("clear_entry(", 7),
             ("claim_afk_move(", 1),
-            ("back_off_claim(", 1),
+            // The policy refusal and the no-owner skip (merge slice).
+            ("back_off_claim(", 2),
             ("afk_move_claim_key(", 2),
         ] {
             let calls = call_arguments(&code, name);
@@ -1359,6 +1686,27 @@ mod tests {
         assert_eq!(
             requeue_score(AfkRequeue::Refused, 0, 60, 0),
             Some(AFK_REFUSAL_BACKOFF_SECS as i64 * 1000)
+        );
+    }
+
+    /// Merge slice P2A-4 (SEC2-7): the move admission key's lifetime is
+    /// shorter than the move claim's, against the REAL constants of both
+    /// crates (the voice crate pins only the literal 30 on its side). The
+    /// lifetimes only, not the expiries: see the comment on the compile-time
+    /// assert next to `AFK_MOVE_CLAIM_TTL_SECS` (merge slice M2C-3), which
+    /// this also requires to stay. Control TTL.
+    #[test]
+    fn the_move_admission_expires_before_the_claim() {
+        assert!(
+            MOVE_ADMISSION_TTL_SECS < AFK_MOVE_CLAIM_TTL_SECS,
+            "a move admission of {MOVE_ADMISSION_TTL_SECS} s would outlive the \
+             {AFK_MOVE_CLAIM_TTL_SECS} s move claim"
+        );
+        assert_eq!(
+            compact(&code_only(production()))
+                .matches("const_:()=assert!(MOVE_ADMISSION_TTL_SECS<AFK_MOVE_CLAIM_TTL_SECS);")
+                .count(),
+            1
         );
     }
 
@@ -1582,5 +1930,119 @@ mod tests {
 
         throttle.prune(start + AFK_LOG_THROTTLE + AFK_LOG_THROTTLE);
         assert!(throttle.logged_at.is_empty());
+    }
+
+    /// A voice channel of server "S" with the given gate fields.
+    fn afk_channel(
+        server: &str,
+        nsfw: bool,
+        spoiler: bool,
+        description: Option<String>,
+        voice: Option<revolt_database::VoiceInformation>,
+    ) -> Channel {
+        Channel::TextChannel {
+            id: "A".to_string(),
+            server: server.to_string(),
+            name: "AFK".to_string(),
+            description,
+            icon: None,
+            last_message_id: None,
+            default_permissions: None,
+            role_permissions: HashMap::new(),
+            nsfw,
+            spoiler,
+            voice,
+            slowmode: None,
+            announcement: None,
+        }
+    }
+
+    /// Wave BG: a designated AFK channel that sits behind any client gate is
+    /// a config the sweep cannot use, whatever route let it happen. The two
+    /// older arms keep their reasons, and an ungated voice channel of this
+    /// server is usable. Control: the gate arm deleted.
+    #[test]
+    fn a_gated_afk_channel_is_unusable() {
+        const GATED: &str = "the AFK channel is behind an age, password or spoiler gate";
+        let voice = || Some(revolt_database::VoiceInformation::default());
+        let password = [
+            revolt_database::CHANNEL_PASSWORD_PREFIX,
+            "0123abcd",
+            revolt_database::CHANNEL_PASSWORD_SUFFIX,
+        ]
+        .concat();
+
+        assert_eq!(
+            afk_channel_unusable(&afk_channel("S", false, false, None, voice()), "S"),
+            None
+        );
+        assert_eq!(
+            afk_channel_unusable(
+                &afk_channel("S", false, false, Some("Idle here".to_string()), voice()),
+                "S"
+            ),
+            None
+        );
+
+        for channel in [
+            afk_channel("S", true, false, None, voice()),
+            afk_channel("S", false, true, None, voice()),
+            afk_channel("S", false, false, Some(password.clone()), voice()),
+        ] {
+            assert_eq!(
+                afk_channel_unusable(&channel, "S"),
+                Some(GATED),
+                "{channel:?}"
+            );
+        }
+
+        // The older arms come first and keep their reasons, gated or not.
+        assert_eq!(
+            afk_channel_unusable(&afk_channel("T", true, false, None, voice()), "S"),
+            Some("the AFK channel is not in this server")
+        );
+        assert_eq!(
+            afk_channel_unusable(&afk_channel("S", true, false, None, None), "S"),
+            Some("the AFK channel is not a voice channel")
+        );
+        let disabled = Some(revolt_database::VoiceInformation {
+            max_users: None,
+            disabled: true,
+        });
+        assert_eq!(
+            afk_channel_unusable(&afk_channel("S", false, false, None, disabled), "S"),
+            Some("the AFK channel is not a voice channel")
+        );
+    }
+
+    /// `resolve_afk_config` answers `Usable` only through
+    /// `afk_channel_unusable`, called once, on the channel it just fetched,
+    /// and its answer is returned as `Unusable`. Control: the call moved
+    /// above `db.fetch_channel(`, or its result ignored.
+    #[test]
+    fn resolve_afk_config_checks_the_gate_before_usable() {
+        let body = code_only(braced_body(production(), "async fn resolve_afk_config("));
+        const CHECK: &str = "afk_channel_unusable(";
+
+        assert_eq!(body.matches(CHECK).count(), 1, "{body}");
+        assert_eq!(
+            code_only(production()).matches(CHECK).count(),
+            2,
+            "one definition and one call, in resolve_afk_config"
+        );
+
+        let fetch = body.find("db.fetch_channel(").expect("the channel fetch");
+        let check = body.find(CHECK).expect("counted above");
+        let usable = body.find("AfkConfig::Usable").expect("the usable answer");
+        assert!(fetch < check, "{body}");
+        assert!(check < usable, "{body}");
+
+        assert!(
+            compact(&body).contains(
+                "ifletSome(reason)=afk_channel_unusable(&channel,server_id)\u{7b}\
+                 returnAfkConfig::Unusable(reason);\u{7d}"
+            ),
+            "{body}"
+        );
     }
 }

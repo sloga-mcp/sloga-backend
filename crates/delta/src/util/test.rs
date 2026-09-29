@@ -1,7 +1,9 @@
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use futures::StreamExt;
 use rand::Rng;
+use redis_kiss::redis;
 use revolt_database::util::email::normalise_email;
 use revolt_database::util::password::hash_password;
 use revolt_database::{
@@ -64,8 +66,178 @@ pub struct TestHarness {
     /// driver, which leaves nothing behind. Captured at construction because
     /// `Drop` cannot await `config()`.
     mongo_uri: Option<String>,
-    events_rx: tokio::sync::mpsc::UnboundedReceiver<(String, EventV1)>,
+    events: Subscription<(String, EventV1)>,
     event_buffer: Vec<(String, EventV1)>,
+}
+
+/// How long the event pump's blocking read waits before it looks whether its
+/// harness is gone.
+const PUMP_POLL: Duration = Duration::from_millis(250);
+
+/// How long a (re)subscription may wait for redis to confirm it. The
+/// `PSUBSCRIBE` reply is read under this bound, not under `PUMP_POLL`: a
+/// redis that stalls for longer than a poll (a BGSAVE fork, a slow script
+/// from a voice test, a WSL stall) must not fail `TestHarness::new` (HD
+/// re-audit HDA-1). A redis that accepts the connection and never answers
+/// fails after this bound; a host that never accepts it still hangs in the
+/// connect, as before.
+const SUBSCRIBE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Where a pump reports whether its first subscription landed.
+type PumpReady = tokio::sync::oneshot::Sender<Result<(), String>>;
+
+/// A live `PSUBSCRIBE`, pumped on a thread of its own: every message that
+/// `forward` accepts, in the order redis sent it.
+///
+/// Why a blocking connection on a thread and not `redis::aio::PubSub`
+/// (merge slice S6B-7, the "event pump ended (subscription dropped)" flake):
+/// the async `PubSub::on_message()` of the redis version pinned here (0.23)
+/// frames the socket with a NEW codec, so whatever the connection's own
+/// decoder had already read past the `PSUBSCRIBE` reply is thrown away. On a
+/// busy redis (a full delta run, every harness subscribed to `*`) that read
+/// can end inside a message published right after the subscription landed.
+/// The new codec then starts mid-frame and fails to parse, tokio-util's
+/// `Framed` yields that error and ends the stream, and `on_message` filters
+/// the error out, so all a harness ever saw was its stream ending, about
+/// once per full run, on whichever test subscribed at the wrong moment. The
+/// blocking `Connection` keeps ONE parser for the reply and every message
+/// after it, so nothing read is discarded. A thread of its own also keeps
+/// reading while its test blocks its runtime (argon2, the blocking SMTP
+/// send).
+struct Subscription<T> {
+    items: tokio::sync::mpsc::UnboundedReceiver<T>,
+    /// How many times the subscription ended and was taken out again. A
+    /// message published in such a gap is lost for good.
+    gaps: Arc<AtomicUsize>,
+}
+
+impl<T: Send + 'static> Subscription<T> {
+    /// Subscribe to `pattern`, and return once redis has confirmed it, so
+    /// every message published after this returns is delivered.
+    async fn open(pattern: &str, forward: fn(&redis::Msg) -> Option<T>) -> Subscription<T> {
+        let (items_tx, items) = tokio::sync::mpsc::unbounded_channel();
+        let (ready_tx, ready) = tokio::sync::oneshot::channel();
+        let gaps = Arc::new(AtomicUsize::new(0));
+        let pump_gaps = gaps.clone();
+        let pattern = pattern.to_string();
+        std::thread::Builder::new()
+            .name(format!("event pump {pattern}"))
+            .spawn(move || pump(&pattern, forward, &items_tx, &pump_gaps, ready_tx))
+            .expect("start the event pump thread");
+        match ready.await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => panic!("could not subscribe to redis: {}", error),
+            Err(_) => panic!("the event pump thread died before it subscribed"),
+        }
+        Subscription { items, gaps }
+    }
+
+    fn gaps(&self) -> usize {
+        self.gaps.load(Ordering::SeqCst)
+    }
+}
+
+/// The body of a [`Subscription`]'s thread. Runs until the receiving side is
+/// dropped. When the subscription ends (the connection closes, a reply does
+/// not parse), it logs why, counts the gap and subscribes again. The log goes
+/// to the test's captured output, which a passing test discards, so the
+/// count is what makes a gap loud: the harness fails the wait that spans it
+/// and, when dropped, any test that had one (HD re-audit HDA-2).
+fn pump<T>(
+    pattern: &str,
+    forward: fn(&redis::Msg) -> Option<T>,
+    items: &tokio::sync::mpsc::UnboundedSender<T>,
+    gaps: &AtomicUsize,
+    ready: PumpReady,
+) {
+    let mut ready = Some(ready);
+    loop {
+        let mut connection = match redis::Client::open(redis_kiss::REDIS_URI.as_str())
+            .and_then(|client| client.get_connection())
+        {
+            Ok(connection) => connection,
+            Err(error) => {
+                if retry_subscribing(error, &mut ready, items, pattern) {
+                    continue;
+                }
+                return;
+            }
+        };
+        let mut pubsub = connection.as_pubsub();
+        // The poll timeout is set only once the subscription is confirmed:
+        // the reply itself gets `SUBSCRIBE_TIMEOUT` (HDA-1).
+        if let Err(error) = pubsub
+            .set_read_timeout(Some(SUBSCRIBE_TIMEOUT))
+            .and_then(|()| pubsub.psubscribe(pattern))
+            .and_then(|()| pubsub.set_read_timeout(Some(PUMP_POLL)))
+        {
+            if retry_subscribing(error, &mut ready, items, pattern) {
+                continue;
+            }
+            return;
+        }
+        match ready.take() {
+            Some(ready) => {
+                if ready.send(Ok(())).is_err() {
+                    return;
+                }
+            }
+            None => eprintln!("event pump ({pattern}): subscribed again"),
+        }
+
+        let error = loop {
+            match pubsub.get_message() {
+                Ok(message) => {
+                    // Checked on every message, not only when idle: a busy
+                    // redis (another test's flood, every harness subscribed
+                    // to `*`) may never let the read time out, and messages
+                    // `forward` drops never fail a send (HDA-3).
+                    if items.is_closed() {
+                        return;
+                    }
+                    if let Some(item) = forward(&message) {
+                        if items.send(item).is_err() {
+                            return;
+                        }
+                    }
+                }
+                // The read timeout is how the thread notices its harness is gone.
+                Err(error) if error.is_timeout() => {
+                    if items.is_closed() {
+                        return;
+                    }
+                }
+                Err(error) => break error,
+            }
+        };
+        gaps.fetch_add(1, Ordering::SeqCst);
+        eprintln!(
+            "event pump ({pattern}): the subscription ended ({:?}: {error}); subscribing \
+             again, and anything published until then is lost",
+            error.kind()
+        );
+    }
+}
+
+/// After a failed (re)subscription: whether the pump tries again. The first
+/// subscription's failure goes to `open`, which fails loudly; after that it
+/// retries for as long as its harness lives.
+fn retry_subscribing<T>(
+    error: redis::RedisError,
+    ready: &mut Option<PumpReady>,
+    items: &tokio::sync::mpsc::UnboundedSender<T>,
+    pattern: &str,
+) -> bool {
+    if let Some(ready) = ready.take() {
+        let _ = ready.send(Err(error.to_string()));
+        return false;
+    }
+    if items.is_closed() {
+        return false;
+    }
+    eprintln!("event pump ({pattern}): could not subscribe again: {error}; retrying");
+    std::thread::sleep(PUMP_POLL);
+    true
 }
 
 impl TestHarness {
@@ -91,12 +263,6 @@ impl TestHarness {
             .await
             .expect("valid rocket instance");
 
-        let mut sub = redis_kiss::open_pubsub_connection()
-            .await
-            .expect("`PubSub`");
-
-        sub.psubscribe("*").await.unwrap();
-
         // Pump the subscription from construction time. The previous
         // per-`wait_for_event`-call `on_message()` stream lost events that
         // fanned while no stream was polling — an event published BEFORE
@@ -105,22 +271,17 @@ impl TestHarness {
         // turned event assertions into permanent hangs. The pump owns the
         // connection for the harness's lifetime and forwards every
         // decodable event in order; `wait_for_event` reads the channel.
-        let (events_tx, events_rx) = tokio::sync::mpsc::unbounded_channel();
-        tokio::spawn(async move {
-            let mut stream = sub.on_message();
-            while let Some(item) = stream.next().await {
-                let msg_topic = item.get_channel_name().to_string();
-                // The wildcard psubscribe sees EVERY topic on a shared
-                // redis; skip payloads that are not EventV1 (e.g. LiveKit
-                // keepalives) silently — a genuinely missing target event
-                // now surfaces as a wait_for_event TIMEOUT, not a hang.
-                if let Ok(payload) = redis_kiss::decode_payload::<EventV1>(&item) {
-                    if events_tx.send((msg_topic, payload)).is_err() {
-                        break;
-                    }
-                }
-            }
-        });
+        // `open` returns once the subscription is confirmed, so every event
+        // the test causes from here on is delivered.
+        let events = Subscription::open("*", |message| {
+            // The wildcard psubscribe sees EVERY topic on a shared redis;
+            // skip payloads that are not EventV1 (e.g. LiveKit keepalives)
+            // silently — a genuinely missing target event surfaces as a
+            // wait_for_event TIMEOUT, not a hang.
+            let payload = redis_kiss::decode_payload::<EventV1>(message).ok()?;
+            Some((message.get_channel_name().to_string(), payload))
+        })
+        .await;
 
         let db = client
             .rocket()
@@ -154,7 +315,7 @@ impl TestHarness {
             db,
             amqp,
             mongo_uri,
-            events_rx,
+            events,
             event_buffer: vec![],
         }
     }
@@ -332,19 +493,40 @@ impl TestHarness {
         // anything fanned since harness creation is observable here even
         // if it fired before this call. Bounded: a missing event fails the
         // test in 30s instead of hanging the whole suite.
+        //
+        // A subscription that ends is taken out again by the pump (see
+        // `pump`), and an event published in that gap is lost. A later
+        // event that the predicate also accepts would then pass this wait
+        // in place of the lost one, so a gap that opens while this waits
+        // fails it, checked at least every `PUMP_POLL` (HD re-audit HDA-2).
+        let gaps_before = self.events.gaps();
         let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
         loop {
-            let received = tokio::time::timeout_at(deadline, self.events_rx.recv())
-                .await
-                .unwrap_or_else(|_| {
-                    panic!(
-                        "wait_for_event: no event matching predicate on '{topic}' within 30s \
-                         (buffered: {} events)",
-                        self.event_buffer.len()
-                    )
-                });
+            let poll = deadline.min(tokio::time::Instant::now() + PUMP_POLL);
+            let received = tokio::time::timeout_at(poll, self.events.items.recv()).await;
+            let gaps = self.events.gaps();
+            assert!(
+                gaps == gaps_before,
+                "wait_for_event: the event subscription ended and was taken out again \
+                 while this waited for an event on '{}' ({} gap(s)): an event published \
+                 in the gap was lost, and a later match must not stand in for it",
+                topic,
+                gaps - gaps_before
+            );
+            let received = match received {
+                Ok(received) => received,
+                Err(_) if tokio::time::Instant::now() < deadline => continue,
+                Err(_) => panic!(
+                    "wait_for_event: no event matching predicate on '{topic}' within 30s \
+                     (buffered: {} events; subscription gaps: {})",
+                    self.event_buffer.len(),
+                    gaps
+                ),
+            };
             let Some((msg_topic, payload)) = received else {
-                panic!("wait_for_event: event pump ended (subscription dropped)");
+                // The pump returns only once this receiver is gone, so a
+                // closed channel means its thread panicked (see stderr).
+                panic!("wait_for_event: the event pump thread is gone");
             };
 
             if topic == msg_topic && predicate(&payload) {
@@ -362,16 +544,32 @@ impl TestHarness {
     /// `wait_for_event` on it first: redis pub/sub is FIFO per
     /// subscription, so anything published before the marker is guaranteed
     /// to be in the buffer by the time the marker is observed.
+    ///
+    /// FIFO holds only within ONE subscription. If the pump ever had to
+    /// subscribe again, an event published in the gap was never received,
+    /// so the negative cannot be proven and this fails.
     pub fn assert_no_buffered_event<F>(&self, topic: &str, predicate: F)
     where
         F: Fn(&EventV1) -> bool,
     {
         for (msg_topic, event) in &self.event_buffer {
+            // Explicit arguments: this crate is edition 2018, where a lone
+            // literal message is printed as it is, braces and all.
             assert!(
                 !(topic == msg_topic && predicate(event)),
-                "unexpected event on '{topic}': {event:?}"
+                "unexpected event on '{}': {:?}",
+                topic,
+                event
             );
         }
+        assert_eq!(
+            self.events.gaps(),
+            0,
+            "cannot prove that no event on '{}' matched: the event subscription \
+             ended and was taken out again, and an event published in that gap was \
+             never received",
+            topic
+        );
     }
 
     /// Read the mail delta just sent to `mailbox` out of maildev, and pull the
@@ -445,11 +643,36 @@ impl TestHarness {
                 return (entry, code);
             }
 
-            assert!(
-                Instant::now() < deadline,
-                "no email delivered to {} within 15s",
-                mailbox
-            );
+            if Instant::now() >= deadline {
+                // Only now read the config, to explain the timeout rather
+                // than to predict it (HD re-audit HDA-9): read up front it
+                // could fail a send that had already happened with SMTP on,
+                // once `config()`'s 30 s cache turned over.
+                //
+                // A config overwrite is process-wide:
+                // `revolt_config::overwrite_config` sets a `OnceLock`, and
+                // `change_email`'s tests overwrite `api.smtp.host` with "".
+                // Under a plain `cargo test`, where every test shares one
+                // process, SMTP can be off for every test that reads the
+                // config after one of them overwrote it, and the send is
+                // skipped (the reset route swallows the `OperationFailed`)
+                // (merge slice S6B-7, the mailbox flake).
+                let smtp_host = revolt_config::config().await.api.smtp.host;
+                if smtp_host.is_empty() {
+                    panic!(
+                        "no email delivered to {} within 15s, and SMTP is off in this \
+                         process now (`api.smtp.host` is empty), so it was likely never \
+                         sent. Either this environment has no SMTP host configured, or a \
+                         test's `overwrite_config` turned it off (a config overwrite is \
+                         process-wide; nextest runs one process per test)",
+                        mailbox
+                    );
+                }
+                panic!(
+                    "no email delivered to {} within 15s (SMTP host `{}`)",
+                    mailbox, smtp_host
+                );
+            }
 
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
@@ -490,7 +713,28 @@ impl Drop for TestHarness {
     /// `terminate-after`, and a killed process runs no destructors, so a
     /// timing-out test still leaks. `scripts/drop-test-databases.sh` sweeps
     /// whatever survives.
+    ///
+    /// Then, unless the test is already failing, it fails a test whose event
+    /// subscription had a gap (HD re-audit HDA-2): an event published in it
+    /// was lost, and nothing else would say so for a test that passed.
     fn drop(&mut self) {
+        self.drop_test_database();
+
+        if !std::thread::panicking() {
+            assert_eq!(
+                self.events.gaps(),
+                0,
+                "the harness's event subscription ended and was taken out again during \
+                 this test (see the pump's lines in its output): an event published in \
+                 that gap was lost"
+            );
+        }
+    }
+}
+
+impl TestHarness {
+    /// The database half of `Drop`, see there.
+    fn drop_test_database(&self) {
         let Database::MongoDb(mongo) = &self.db else {
             return;
         };
@@ -529,4 +773,465 @@ pub struct MailEnvelope {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct MailAddress {
     pub address: String,
+}
+
+/// `source` with its comments cut out, for the textual pins that stand in for
+/// a route test that cannot reach a line (no live LiveKit). A pin must not be
+/// satisfied by code that is commented out.
+///
+/// Cuts `// ...` to the end of the line, whole-line or trailing (doc comments
+/// too), and `/* ... */` blocks, nested as Rust nests them. Newlines stay, so
+/// the line structure survives. Literals are copied as they are, so a `//` or
+/// `/*` inside one (a URL) is not taken for a comment: strings and byte
+/// strings with their escapes, raw strings (`r"..."`, `r#"..."#`), and char
+/// literals (`'"'`, `'\''`, longer escapes), told from a lifetime by their
+/// closing quote.
+pub fn without_comments(source: &str) -> String {
+    fn is_ident(c: char) -> bool {
+        c.is_alphanumeric() || c == '_'
+    }
+
+    let chars: Vec<char> = source.chars().collect();
+    let char_at = |at: usize| chars.get(at).copied();
+    let mut out = String::with_capacity(source.len());
+    let mut at = 0;
+
+    while let Some(c) = char_at(at) {
+        match (c, char_at(at + 1)) {
+            ('/', Some('/')) => {
+                while char_at(at).is_some_and(|c| c != '\n') {
+                    at += 1;
+                }
+            }
+            ('/', Some('*')) => {
+                let mut depth = 0usize;
+                loop {
+                    match (char_at(at), char_at(at + 1)) {
+                        (Some('/'), Some('*')) => {
+                            depth += 1;
+                            at += 2;
+                        }
+                        (Some('*'), Some('/')) => {
+                            depth -= 1;
+                            at += 2;
+                            if depth == 0 {
+                                break;
+                            }
+                        }
+                        (Some('\n'), _) => {
+                            out.push('\n');
+                            at += 1;
+                        }
+                        (Some(_), _) => at += 1,
+                        (None, _) => panic!("an unclosed /* comment"),
+                    }
+                }
+            }
+            ('"', _) => {
+                out.push('"');
+                at += 1;
+                loop {
+                    let c = char_at(at).expect("an unclosed string literal");
+                    out.push(c);
+                    at += 1;
+                    match c {
+                        '\\' => {
+                            out.push(char_at(at).expect("an unclosed string literal"));
+                            at += 1;
+                        }
+                        '"' => break,
+                        _ => {}
+                    }
+                }
+            }
+            ('r', _)
+                if at == 0
+                    || !is_ident(chars[at - 1])
+                    || (chars[at - 1] == 'b' && (at == 1 || !is_ident(chars[at - 2]))) =>
+            {
+                let mut quote = at + 1;
+                while char_at(quote) == Some('#') {
+                    quote += 1;
+                }
+                if char_at(quote) != Some('"') {
+                    // `r` starting an identifier, or a raw identifier `r#name`
+                    out.push('r');
+                    at += 1;
+                    continue;
+                }
+                // The closing quote, followed by as many `#` as opened it
+                let hashes = quote - at - 1;
+                let mut close = quote + 1;
+                while !(char_at(close).expect("an unclosed raw string literal") == '"'
+                    && (1..=hashes).all(|offset| char_at(close + offset) == Some('#')))
+                {
+                    close += 1;
+                }
+                let end = close + hashes + 1;
+                out.extend(&chars[at..end]);
+                at = end;
+            }
+            ('\'', Some('\\')) => {
+                // An escaped char literal: `'\''`, `'\\'` and longer escapes
+                let close = (at + 3..chars.len())
+                    .find(|&close| chars[close] == '\'')
+                    .expect("an unclosed char literal");
+                out.extend(&chars[at..=close]);
+                at = close + 1;
+            }
+            ('\'', Some(_)) if char_at(at + 2) == Some('\'') => {
+                // A plain char literal, `'"'` included
+                out.extend(&chars[at..at + 3]);
+                at += 3;
+            }
+            _ => {
+                // Everything else, a lifetime's `'` included
+                out.push(c);
+                at += 1;
+            }
+        }
+    }
+
+    out
+}
+
+/// `code` with every whitespace character removed, so a textual pin matches
+/// whatever line breaks and indentation rustfmt picks.
+pub fn without_whitespace(code: &str) -> String {
+    code.chars().filter(|c| !c.is_whitespace()).collect()
+}
+
+/// Where the whole statement `statement` stands in `code`, both without
+/// whitespace ([`without_whitespace`]). It must appear exactly once, and on
+/// its own: right after a `;`, `{` or `}`. So a pin on `call(..).await?;`
+/// fails for `let _ = call(..).await?;`, `let _ = call(..).await;` and
+/// `call(..).await;` alike.
+pub fn statement_at(code: &str, statement: &str) -> usize {
+    assert!(
+        !statement.chars().any(char::is_whitespace) && statement.ends_with(';'),
+        "`{}` is not a whitespace-free statement",
+        statement
+    );
+    assert_eq!(
+        code.matches(statement).count(),
+        1,
+        "`{statement}` must appear exactly once"
+    );
+    let at = code.find(statement).expect("counted above");
+    let statement_start = code[..at].rfind([';', '{', '}']).map_or(0, |end| end + 1);
+    assert!(
+        statement_start == at && at > 0,
+        "`{statement}` must be a statement of its own, not the value of `{}`",
+        &code[statement_start..at]
+    );
+    at
+}
+
+#[test]
+fn without_comments_drops_line_and_block_comments_only() {
+    let stripped = without_comments(concat!(
+        "keep(1);\n",
+        "    // gone(2);\n",
+        "/// gone(3);\n",
+        "keep(4); /* gone(5); */ keep(6);\n",
+        "/*\ngone(7);\n*/\n",
+        "keep(8); // gone(9);\n",
+        "keep(10).await?; // gone(11) trailing\n",
+        "/* outer /* gone(12); */ gone(13); */ keep(14);\n",
+        "//! gone(15);\n",
+    ));
+    assert!(!stripped.contains("gone("), "{}", stripped);
+    for kept in [1, 4, 6, 8, 10, 14] {
+        assert!(stripped.contains(&format!("keep({kept})")), "{}", stripped);
+    }
+    assert!(stripped.contains("keep(10).await?;"), "{}", stripped);
+
+    // `//` and `/*` inside literals are not comments
+    let literals = concat!(
+        "let url = \"http://127.0.0.1:1\"; keep(1);\n",
+        "let raw = r#\"a // \"quoted\" /* b\"#; keep(2);\n",
+        "let raw = r\"c // d\"; keep(3);\n",
+        "let bytes = b\"e // f\"; keep(4);\n",
+        "let escaped = \"g \\\" // h\"; keep(5);\n",
+        "let quote = '\"'; keep(6); // gone(1);\n",
+        "let tick = '\\''; keep(7);\n",
+        "fn f<'a>(x: &'a str) -> &'a str { x } // gone(2);\n",
+        "let r#type = 1; keep(8); // gone(3);\n",
+    );
+    let stripped = without_comments(literals);
+    assert!(!stripped.contains("gone("), "{}", stripped);
+    for kept in 1..=8 {
+        assert!(stripped.contains(&format!("keep({kept})")), "{}", stripped);
+    }
+    for literal in [
+        "\"http://127.0.0.1:1\"",
+        "r#\"a // \"quoted\" /* b\"#",
+        "r\"c // d\"",
+        "b\"e // f\"",
+        "\"g \\\" // h\"",
+        "fn f<'a>(x: &'a str) -> &'a str { x }",
+    ] {
+        assert!(
+            stripped.contains(literal),
+            "`{}` lost: {}",
+            literal,
+            stripped
+        );
+    }
+    assert_eq!(stripped.lines().count(), literals.lines().count());
+}
+
+#[test]
+fn statement_at_needs_the_whole_statement_on_its_own() {
+    let code = without_whitespace("a();\n    call(x, y).await?;\n}");
+    assert_eq!(statement_at(&code, "call(x,y).await?;"), 4);
+
+    for (label, code) in [
+        ("discarded", "a(); let _ = call(x, y).await?;"),
+        ("discarded, no `?`", "a(); let _ = call(x, y).await;"),
+        ("assigned", "a(); r = call(x, y).await?;"),
+        ("returned", "a(); return call(x, y).await?;"),
+        ("no `?`", "a(); call(x, y).await;"),
+        ("twice", "a(); call(x, y).await?; call(x, y).await?;"),
+    ] {
+        let code = without_whitespace(code);
+        let caught = std::panic::catch_unwind(|| statement_at(&code, "call(x,y).await?;"));
+        assert!(
+            caught.is_err(),
+            "{}: must not count as the statement",
+            label
+        );
+    }
+}
+
+/// Merge slice S6B-7: the event pump delivers every message published after
+/// it subscribed, and does not end, even when its subscription lands in the
+/// middle of a burst. Each round opens a [`Subscription`] while a publisher
+/// floods one channel with numbered messages in pipelined bursts, then
+/// requires an unbroken run of numbers that starts no later than the first
+/// message published after `open` returned. The async pump this replaced
+/// could lose its stream here: its first read past the `PSUBSCRIBE` reply
+/// was discarded, and when that read ended mid-message the stream ended.
+///
+/// The flood is paced (HD re-audit HDA-3). Every harness pump in the process
+/// is subscribed to `*` and receives it too, and a pump that falls far enough
+/// behind is disconnected by redis, which would hand an unrelated test the
+/// very gap this test guards against. So the publisher only publishes what a
+/// round allows: up to `OPENING` messages while the round subscribes, then
+/// exactly what the round still reads. Between rounds it is idle, and no
+/// round can make it flood on: a round that hangs has stopped it already.
+#[test]
+fn the_event_pump_keeps_every_message_published_while_it_subscribes() {
+    use std::sync::atomic::{AtomicBool, AtomicU64};
+
+    /// Stops the publisher however the test ends, so a failed round never
+    /// leaves it flooding the redis every other test shares.
+    struct Stop(Arc<AtomicBool>);
+    impl Drop for Stop {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    const ROUNDS: u64 = 30;
+    const RUN: u64 = 300;
+    const BURST: u64 = 64;
+    /// How far the publisher may run ahead while a round subscribes: long
+    /// enough that the subscription lands inside the flood, and about 1 MB.
+    const OPENING: u64 = 64 * BURST;
+
+    rt().block_on(async {
+        let channel = format!("harness-pump-check-{}", TestHarness::rand_string());
+        let published = Arc::new(AtomicU64::new(0));
+        // The publisher starts no burst once it has published this many.
+        let allowed = Arc::new(AtomicU64::new(0));
+        let stop = Stop(Arc::new(AtomicBool::new(false)));
+        let publisher = tokio::spawn({
+            let channel = channel.clone();
+            let published = published.clone();
+            let allowed = allowed.clone();
+            let stop = stop.0.clone();
+            async move {
+                let mut connection = redis_kiss::get_connection()
+                    .await
+                    .expect("a redis connection");
+                // Big enough that a burst spans several socket reads.
+                let pad = "x".repeat(150);
+                let mut sequence = 0u64;
+                while !stop.load(Ordering::SeqCst) {
+                    if sequence >= allowed.load(Ordering::SeqCst) {
+                        tokio::time::sleep(Duration::from_millis(1)).await;
+                        continue;
+                    }
+                    let mut burst = redis::pipe();
+                    for _ in 0..BURST {
+                        sequence += 1;
+                        burst
+                            .cmd("PUBLISH")
+                            .arg(&channel)
+                            .arg(format!("{sequence} {pad}"))
+                            .ignore();
+                    }
+                    let () = burst
+                        .query_async(&mut *connection)
+                        .await
+                        .expect("publish a burst");
+                    published.store(sequence, Ordering::SeqCst);
+                }
+            }
+        });
+
+        for round in 0..ROUNDS {
+            // Start the round's flood, and subscribe only once it is running.
+            let start = published.load(Ordering::SeqCst);
+            allowed.store(start + OPENING, Ordering::SeqCst);
+            let flooding = Instant::now() + Duration::from_secs(10);
+            while published.load(Ordering::SeqCst) == start {
+                assert!(
+                    Instant::now() < flooding,
+                    "round {}: the publisher never started",
+                    round
+                );
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+
+            let mut subscription = Subscription::open(&channel, |message| {
+                let payload: String = message.get_payload().ok()?;
+                payload.split(' ').next()?.parse::<u64>().ok()
+            })
+            .await;
+            // `published` moves once a burst is sent, so the burst after the
+            // one in flight now starts after this read, after the
+            // subscription was confirmed: from it on, every number is owed.
+            let owed = published.load(Ordering::SeqCst) + BURST + 1;
+            // From here on, only what this round still reads.
+            allowed.store(owed + RUN, Ordering::SeqCst);
+            let mut previous = None;
+            loop {
+                let sequence =
+                    tokio::time::timeout(Duration::from_secs(10), subscription.items.recv())
+                        .await
+                        .unwrap_or_else(|_| {
+                            panic!("round {}: nothing for 10 s after {:?}", round, previous)
+                        })
+                        .unwrap_or_else(|| {
+                            panic!("round {}: the pump ended after {:?}", round, previous)
+                        });
+                match previous {
+                    None => assert!(
+                        sequence <= owed,
+                        "round {}: the first message is {}, but {} was published after the \
+                         subscription was confirmed",
+                        round,
+                        sequence,
+                        owed
+                    ),
+                    Some(previous) => assert_eq!(
+                        sequence,
+                        previous + 1,
+                        "round {}: a message lost after {}",
+                        round,
+                        previous
+                    ),
+                }
+                previous = Some(sequence);
+                if sequence >= owed + RUN {
+                    break;
+                }
+            }
+            assert_eq!(
+                subscription.gaps(),
+                0,
+                "round {}: the subscription had to be taken out again",
+                round
+            );
+        }
+
+        drop(stop);
+        publisher.await.expect("the publisher");
+    })
+}
+
+/// The message a caught panic carries.
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    payload
+        .downcast_ref::<String>()
+        .cloned()
+        .or_else(|| payload.downcast_ref::<&str>().map(|text| text.to_string()))
+        .unwrap_or_default()
+}
+
+/// HD re-audit HDA-2: a gap in a harness's subscription that opens while a
+/// wait is waiting fails that wait promptly and says so, instead of waiting
+/// out its 30 s or letting a later match stand in for the lost event; and a
+/// harness that had a gap fails its test when it is dropped. The gap is
+/// counted by hand here, the way the pump counts one: cutting the
+/// subscription on the shared redis would cut every other test's as well.
+/// Controls: the check in `wait_for_event` dropped (the wait times out
+/// instead), and the one in `Drop` dropped.
+#[test]
+fn a_subscription_gap_fails_the_wait_it_spans_and_the_test() {
+    use futures::FutureExt;
+
+    rt().block_on(async {
+        let mut harness = TestHarness::new().await;
+        let gaps = harness.events.gaps.clone();
+        let gap = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            gaps.fetch_add(1, Ordering::SeqCst);
+        });
+
+        let started = Instant::now();
+        let failed =
+            std::panic::AssertUnwindSafe(harness.wait_for_event("harness-gap-check", |_| false))
+                .catch_unwind()
+                .await
+                .expect_err("a wait that spans a gap must fail");
+        gap.await.expect("the gap");
+        let message = panic_message(&*failed);
+        assert!(
+            message.contains("taken out again while this waited"),
+            "{}",
+            message
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "the wait failed only after {:?}",
+            started.elapsed()
+        );
+
+        let dropped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(harness)))
+            .expect_err("a harness that had a gap must fail its test");
+        let message = panic_message(&*dropped);
+        assert!(
+            message.contains("an event published in that gap was lost"),
+            "{}",
+            message
+        );
+    })
+}
+
+/// `assert_no_buffered_event` names the topic and the event it found. This
+/// crate is edition 2018, where an `assert!` message that is a lone literal
+/// is printed as it is, so `'{topic}'` used to reach the log unformatted.
+/// Control: the message back to that lone literal.
+#[test]
+fn an_unexpected_buffered_event_is_named() {
+    rt().block_on(async {
+        let mut harness = TestHarness::new().await;
+        harness
+            .event_buffer
+            .push(("harness-literal-check".to_string(), EventV1::Logout));
+
+        let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            harness.assert_no_buffered_event("harness-literal-check", |_| true)
+        }))
+        .expect_err("a buffered match must fail");
+        let message = panic_message(&*failed);
+        assert!(
+            message.contains("unexpected event on 'harness-literal-check': Logout"),
+            "{}",
+            message
+        );
+    })
 }

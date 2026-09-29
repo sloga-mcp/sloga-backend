@@ -1,5 +1,6 @@
 use revolt_database::util::permissions::DatabasePermissionQuery;
 use revolt_database::{
+    client_gate_is_set,
     util::reference::Reference,
     voice::{sync_afk_designation_change, VoiceClient},
     Channel, Database, FieldsServer, PartialServer, Server, User,
@@ -179,7 +180,14 @@ pub async fn create_server_channel(
 /// pointer-integrity clear in `channel_edit` fires on a de-voicing edit, and
 /// for a channel born disabled no such edit ever happens.
 ///
-/// `InvalidProperty` on both arms, matching the sibling rejection inside
+/// The gate half: `Server::validate_afk_channel` refuses a channel behind a
+/// client gate (age, spoiler or password), so this refuses a body that would
+/// create one. `create_server_channel` copies `nsfw`, `spoiler` and
+/// `description` from the body unchanged (`unwrap_or(false)` on the flags),
+/// so the body decides exactly what `Channel::has_client_gate` would say
+/// about the channel it creates.
+///
+/// `InvalidProperty` on every arm, matching the sibling rejections inside
 /// `Server::validate_afk_channel`. Rejected loudly rather than silently
 /// dropped (which is how the `Voice` arm treats `announcement`): the caller
 /// asked for this control explicitly, and a silent drop would leave them
@@ -190,6 +198,14 @@ fn validate_afk_creation_shape(data: &v0::DataCreateServerChannel) -> Result<()>
     }
 
     if data.voice.as_ref().is_some_and(|voice| voice.disabled) {
+        return Err(create_error!(InvalidProperty));
+    }
+
+    if client_gate_is_set(
+        data.nsfw == Some(true),
+        data.spoiler == Some(true),
+        data.description.as_deref(),
+    ) {
         return Err(create_error!(InvalidProperty));
     }
 
@@ -300,6 +316,67 @@ mod tests {
 
             assert!(matches!(error.error_type, ErrorType::InvalidProperty));
         }
+    }
+
+    /// A password line as the client writes it: the marker on the last line.
+    fn password_description(before: &str) -> String {
+        [
+            before,
+            revolt_database::CHANNEL_PASSWORD_PREFIX,
+            "0123abcd",
+            revolt_database::CHANNEL_PASSWORD_SUFFIX,
+        ]
+        .concat()
+    }
+
+    /// Wave BG: `Server::validate_afk_channel` refuses a channel behind a
+    /// client gate, so creating one with `afk: true` is refused too, before
+    /// anything exists. Each gate on its own. Control: the gate arm deleted.
+    #[test]
+    fn afk_rejects_a_gated_channel_on_create() {
+        let bodies = [
+            ("age", Some(true), None, None),
+            ("spoiler", None, Some(true), None),
+            (
+                "password",
+                None,
+                None,
+                Some(password_description("Welcome\n")),
+            ),
+        ];
+
+        for (gate, nsfw, spoiler, description) in bodies {
+            let body = v0::DataCreateServerChannel {
+                nsfw,
+                spoiler,
+                description,
+                ..data(v0::LegacyServerChannelType::Voice, None)
+            };
+            let error = validate_afk_creation_shape(&body)
+                .expect_err("a gated channel is never the AFK channel");
+
+            assert!(
+                matches!(error.error_type, ErrorType::InvalidProperty),
+                "{}",
+                gate
+            );
+        }
+    }
+
+    /// The gate check reads the body exactly: explicit `false` flags are no
+    /// gate, and a marker that is not on the last line is no password (the
+    /// client reads only the last line). A refusal of every description, or
+    /// of any flag that is merely present, would fail here.
+    #[test]
+    fn afk_accepts_an_ungated_description() {
+        let body = v0::DataCreateServerChannel {
+            nsfw: Some(false),
+            spoiler: Some(false),
+            description: Some(password_description("") + "\nWelcome"),
+            ..data(v0::LegacyServerChannelType::Voice, None)
+        };
+
+        assert!(validate_afk_creation_shape(&body).is_ok());
     }
 
     // ---- "Never" on create (audit A7) ------------------------------------
@@ -535,5 +612,66 @@ mod tests {
                 )
             })
             .await;
+    }
+
+    /// Wave BG, through the route: `afk: true` on a gated body is refused
+    /// before the channel exists, so nothing is created and nothing is
+    /// designated. The actor is the server OWNER, who holds every permission,
+    /// so a refusal written as a permission check could not pass this. The
+    /// same body without the gate is the positive control.
+    #[test]
+    fn a_gated_afk_channel_is_refused_before_it_exists() {
+        crate::util::test::rt().block_on(a_gated_afk_channel_is_refused_before_it_exists_case())
+    }
+
+    async fn a_gated_afk_channel_is_refused_before_it_exists_case() {
+        use crate::util::test::TestHarness;
+        use rocket::http::{ContentType, Header, Status};
+
+        let harness = TestHarness::new().await;
+        let (_, session, owner) = harness.new_user().await;
+        let (server, _channels) = harness.new_server(&owner).await;
+
+        async fn create(
+            harness: &TestHarness,
+            token: &str,
+            server_id: &str,
+            body: &serde_json::Value,
+        ) -> (Status, String) {
+            let response = harness
+                .client
+                .post(format!("/servers/{}/channels", server_id))
+                .header(ContentType::JSON)
+                .header(Header::new("x-session-token", token.to_string()))
+                .body(body.to_string())
+                .dispatch()
+                .await;
+            let status = response.status();
+            (status, response.into_string().await.unwrap_or_default())
+        }
+
+        for body in [
+            serde_json::json!({ "type": "Voice", "name": "AFK", "afk": true, "nsfw": true }),
+            serde_json::json!({ "type": "Voice", "name": "AFK", "afk": true, "spoiler": true }),
+            serde_json::json!({
+                "type": "Voice", "name": "AFK", "afk": true,
+                "description": password_description("Welcome\n")
+            }),
+        ] {
+            let (status, text) = create(&harness, &session.token, &server.id, &body).await;
+            assert_eq!(status, Status::BadRequest, "{body}: {text}");
+            assert!(text.contains("InvalidProperty"), "{}: {}", body, text);
+        }
+
+        let stored = harness.db.fetch_server(&server.id).await.expect("server");
+        assert_eq!(stored.channels, server.channels, "no channel was created");
+        assert_eq!(stored.afk_channel_id, None, "nothing was designated");
+
+        let body = serde_json::json!({ "type": "Voice", "name": "AFK", "afk": true });
+        let (status, text) = create(&harness, &session.token, &server.id, &body).await;
+        assert_eq!(status, Status::Ok, "{text}");
+        let stored = harness.db.fetch_server(&server.id).await.expect("server");
+        assert_eq!(stored.channels.len(), server.channels.len() + 1);
+        assert!(stored.afk_channel_id.is_some());
     }
 }

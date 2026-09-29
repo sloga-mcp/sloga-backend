@@ -15,10 +15,11 @@ use super::permissions::{
 use super::template::{
     channel_type, GuildTemplate, OverwriteKind, PlaceholderId, TemplateChannel, TemplateRole,
 };
-// Read for two constants, not for any database access: the AFK timeout
-// presets live on `Server` and the Connect bit on `ChannelPermission`, and
-// retyping either here is how the two sides drift apart.
-use revolt_database::Server;
+// Read for two constants and one pure predicate, not for any database access:
+// the AFK timeout presets live on `Server`, the Connect bit on
+// `ChannelPermission`, and the client-gate rule in `client_gate_is_set`, and
+// retyping any of them here is how the two sides drift apart.
+use revolt_database::{client_gate_is_set, Server};
 use revolt_permissions::ChannelPermission;
 
 /// Sloga name limits (validated at the HTTP routes, which the worker bypasses —
@@ -753,14 +754,21 @@ pub fn plan_import(template: &GuildTemplate) -> Result<ImportPlan, PlanError> {
 
     // The AFK channel resolves through the same placeholder lookup as the
     // system channel, but it is kept only if it arrived as a VOICE channel
-    // (a Stage channel counts: it became one above). Sloga refuses to
-    // designate anything else (`Server::validate_afk_channel`), and the
-    // worker writes this pointer without going through that check.
+    // (a Stage channel counts: it became one above) that is not behind a
+    // client gate. Sloga refuses to designate anything else
+    // (`Server::validate_afk_channel`), and the worker writes this pointer
+    // without going through that check. The gate is read off the planned
+    // channel, which is what the worker creates: an age-restricted Discord
+    // channel arrives with `nsfw`, and a topic can end in a password line.
+    // The worker never sets `spoiler`, hence `false`.
     let afk = guild.afk_channel_id.as_ref().and_then(|wanted| {
         channels
             .iter()
             .find(|channel| &channel.template_id == wanted)
             .filter(|channel| matches!(channel.kind, PlannedChannelKind::Voice { .. }))
+            .filter(|channel| {
+                !client_gate_is_set(channel.nsfw, false, channel.description.as_deref())
+            })
     });
     let afk_channel = afk.map(|channel| channel.template_id.clone());
     // A timeout means nothing without a channel to move people to, and
@@ -1971,5 +1979,56 @@ mod tests {
         assert!(afk_notes(&guild("null", "1048576", "0", "0")).is_empty());
         // A deny of something other than CONNECT (VIEW_CHANNEL): no note.
         assert!(afk_notes(&guild("2", "1024", "0", "0")).is_empty());
+    }
+
+    /// Wave BG: Sloga never designates a channel behind a client gate
+    /// (`Server::validate_afk_channel`), and the worker writes the pointer
+    /// without that check, so the mapper drops a gated Discord AFK channel,
+    /// and the timeout with it. An age-restricted voice channel and one whose
+    /// topic ends in a password line are each dropped as the AFK channel but
+    /// still imported. An ungated one is still designated, including one
+    /// whose password line is not the last line. Control: the gate filter
+    /// deleted.
+    #[test]
+    fn a_gated_discord_afk_channel_is_not_designated() {
+        let password = [
+            revolt_database::CHANNEL_PASSWORD_PREFIX,
+            "ab",
+            revolt_database::CHANNEL_PASSWORD_SUFFIX,
+        ]
+        .concat();
+        let locked = ["Idle here\n", password.as_str()].concat();
+        let notes = [password.as_str(), "\nIdle here"].concat();
+        let guild = |afk: u64| {
+            let guild = serde_json::json!({
+                "name": "g",
+                "afk_channel_id": afk,
+                "afk_timeout": 300,
+                "channels": [
+                    { "id": 1, "type": 2, "name": "Mature", "nsfw": true },
+                    { "id": 2, "type": 2, "name": "Locked", "topic": locked },
+                    { "id": 3, "type": 2, "name": "Open", "topic": "Idle here" },
+                    { "id": 4, "type": 2, "name": "Notes", "topic": notes }
+                ]
+            });
+            plan_import(&template(&guild.to_string()))
+        };
+
+        for gated in [1, 2] {
+            let plan = guild(gated);
+            assert_eq!(plan.afk_channel, None, "afk_channel_id {gated}");
+            assert_eq!(plan.afk_timeout, None, "afk_channel_id {gated}");
+            assert_eq!(plan.channels.len(), 4, "the channel itself is imported");
+        }
+
+        for open in [3, 4] {
+            let plan = guild(open);
+            assert_eq!(
+                plan.afk_channel,
+                Some(PlaceholderId(open.to_string())),
+                "afk_channel_id {open}"
+            );
+            assert_eq!(plan.afk_timeout, Some(300), "afk_channel_id {open}");
+        }
     }
 }

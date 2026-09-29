@@ -35,15 +35,31 @@
 //! 204). Only the client's withdrawal leaves one: a PUT from inside the AFK
 //! channel clears with `clear_afk_since`, which leaves none, so sitting in the
 //! AFK channel never delays a later claim elsewhere.
+//!
+//! Only the session recorded as owning the member's participant in the call
+//! (the one `join_call` recorded, merge slice F11) may claim. Any other
+//! session of the same user (another tab or device, or a join from before the
+//! record existed) is refused `NotOwner` before anything is written: the
+//! sweep would skip a member with no recorded owner anyway, and a claim from
+//! a session that is not the one in the call says nothing about the member
+//! who is. The refusal is not transient, so a client can stop posting from
+//! that session.
+//!
+//! The session is read only at that step (merge slice M2C-7), so the PUT
+//! still answers in its contract order: a bot, which has no session, is
+//! refused `IsBot` after the two shape checks, not rejected by a session
+//! guard before any of them. A request with no session of the user's own
+//! that gets that far is refused `NotOwner`.
 
 use revolt_config::config;
 use revolt_database::{
     util::{permissions::perms, reference::Reference},
     voice::{
         afk_idle::{clear_afk_since, set_afk_since, withdraw_afk_since},
-        get_user_voice_channel_in_server, is_in_voice_channel, UserVoiceChannel,
+        get_user_voice_channel_in_server, is_in_voice_channel, voice_participant_session_is,
+        UserVoiceChannel,
     },
-    Database, User,
+    Database, Session, User,
 };
 use revolt_models::v0;
 use revolt_permissions::{calculate_channel_permissions, ChannelPermission};
@@ -57,12 +73,14 @@ use rocket_empty::EmptyResponse;
 /// Report that this client has seen no activity from its user in this voice
 /// call for `idle_for` seconds. Once the server's AFK timeout has passed the
 /// member may be moved to the server's AFK channel. A self-report that grants
-/// nothing; repeating it only keeps the claim alive.
+/// nothing; repeating it only keeps the claim alive. Only the session that
+/// joined the call may report it.
 #[openapi(tag = "Voice")]
 #[put("/<target>/afk_idle", data = "<data>")]
 pub async fn afk_idle_set(
     db: &State<Database>,
     user: User,
+    session: Option<Session>,
     target: Reference<'_>,
     data: Json<v0::DataAfkIdle>,
 ) -> Result<EmptyResponse> {
@@ -112,6 +130,26 @@ pub async fn afk_idle_set(
             != Some(channel.id())
     {
         return Err(create_error!(NotInVoiceChannel));
+    }
+
+    // Merge slice F11 (P2A-15): the live seat is the user's, but only the
+    // session recorded as owning it may claim, before any write (the clear
+    // below included). Not `NotInVoiceChannel`, which the client treats as
+    // transient: `NotOwner` stays true for this session until it joins
+    // again, so a client can latch on it and stop posting. A failed read is
+    // an error, never an acceptance.
+    //
+    // The session guard is optional so that a bot, which has none, is
+    // answered `IsBot` above in the contract order (merge slice M2C-7). Past
+    // that check the account signed in with a session, so it is always here
+    // and always the user's own. Should that ever stop holding, a request
+    // with no session of the user's own owns no seat and is refused the same
+    // way, never waved through.
+    let Some(session) = session.filter(|session| session.user_id == user.id) else {
+        return Err(create_error!(NotOwner));
+    };
+    if !voice_participant_session_is(channel.id(), &user.id, Some(&session.id)).await? {
+        return Err(create_error!(NotOwner));
     }
 
     // No designation or no timeout means the server never moves anyone, so
@@ -176,9 +214,9 @@ mod test {
     use revolt_database::{
         voice::{
             afk_idle::get_afk_since, create_voice_state, delete_channel_voice_state,
-            UserVoiceChannel,
+            set_voice_participant_session, UserVoiceChannel,
         },
-        Channel, PartialServer, Server,
+        Bot, Channel, Member, PartialServer, Server,
     };
     use revolt_models::v0;
     use rocket::http::{ContentType, Header, Status};
@@ -289,6 +327,10 @@ mod test {
             "throw_if_lacking_channel_permission(ChannelPermission::Connect)",
             "is_in_voice_channel(",
             "create_error!(NotInVoiceChannel)",
+            "let Some(session) = session.filter(|session| session.user_id == user.id) else",
+            "create_error!(NotOwner)",
+            "voice_participant_session_is(channel.id(), &user.id, Some(&session.id))",
+            "create_error!(NotOwner)",
             "server.afk_channel_id.as_deref(), server.afk_timeout",
             "config().await.features.afk_auto_move",
             "if channel.id() == afk_channel_id",
@@ -303,6 +345,62 @@ mod test {
                 .unwrap_or_else(|| panic!("`{}` is missing or out of order: {}", needle, body));
             last = at + needle.len();
         }
+    }
+
+    /// Merge slice F11 (P2A-15): only the session recorded as owning the
+    /// participant claims. The check is one exact statement, reads the
+    /// channel of the route and the REQUEST's session (a `None` or another
+    /// binding compiles), refuses with `NotOwner`, propagates a failed read,
+    /// and comes after the live-seat check and before both writes. Controls
+    /// OWNER-GONE (deleted) and OWNER-LATE (moved after `set_afk_since(`).
+    ///
+    /// Merge slice M2C-7: the session guard is OPTIONAL and the session is
+    /// first read after the `IsBot` refusal, so a bot (which has no session)
+    /// gets `IsBot` in the contract order instead of failing a required
+    /// guard before every shape check. A missing session, or one that is not
+    /// the user's, is `NotOwner`, never a pass.
+    #[test]
+    fn put_accepts_only_the_recorded_session_before_any_write() {
+        let body = handler_body(PUT);
+        const SESSION: &str = "let Some(session) = \
+             session.filter(|session| session.user_id == user.id) else \u{7b} \
+             return Err(create_error!(NotOwner)); \u{7d};";
+        const CHECK: &str = "if !voice_participant_session_is(channel.id(), &user.id, \
+             Some(&session.id)).await? \u{7b} return Err(create_error!(NotOwner)); \u{7d}";
+
+        assert_eq!(body.matches(SESSION).count(), 1, "{}", body);
+        assert_eq!(body.matches(CHECK).count(), 1, "{}", body);
+        assert_eq!(
+            body.matches("voice_participant_session_is(").count(),
+            1,
+            "{}",
+            body
+        );
+        assert_eq!(body.matches("NotOwner").count(), 2, "{}", body);
+        let session = position(&body, SESSION);
+        let check = position(&body, CHECK);
+        assert!(
+            position(&body, "create_error!(NotInVoiceChannel)") < session && session < check,
+            "{}",
+            body
+        );
+        assert!(check < position(&body, "set_afk_since("), "{}", body);
+        assert!(check < position(&body, "clear_afk_since("), "{}", body);
+        assert!(
+            position(&body, "create_error!(IsBot)") < position(&body, "session"),
+            "nothing may read the session before the bot refusal: {}",
+            body
+        );
+
+        // The request's own session, from an optional request guard.
+        assert!(
+            shipping().contains(
+                "    user: User,\n    session: Option<Session>,\n    target: Reference<'_>,\n"
+            ),
+            "the PUT takes the optional session guard"
+        );
+        // The DELETE stays authentication-only (Stage 1 I-3).
+        assert!(!handler_body(DELETE).contains("voice_participant_session_is("));
     }
 
     /// Audit A3: with auto-move switched off the PUT refuses, and the
@@ -518,11 +616,16 @@ mod test {
         assert_eq!(status, Status::BadRequest, "{body}");
         assert!(body.contains("NotInVoiceChannel"), "{}", body);
 
-        // In the call, but the server moves nobody yet.
+        // In the call, but the server moves nobody yet. Each seat is
+        // recorded as this session's, as `join_call` records it, so every
+        // answer below is for the reason it names and not `NotOwner`.
         let lounge_seat = UserVoiceChannel::from_channel(&lounge);
         create_voice_state(&lounge_seat, &user.id, joined_long_ago())
             .await
             .expect("voice state");
+        set_voice_participant_session(lounge.id(), &user.id, &session.id, None)
+            .await
+            .expect("session record");
         let (status, body) = claim(&harness, &session.token, lounge.id(), 120).await;
         assert_eq!(status, Status::BadRequest, "{body}");
         assert!(body.contains("InvalidOperation"), "{}", body);
@@ -554,6 +657,9 @@ mod test {
         create_voice_state(&other_seat, &user.id, joined_long_ago())
             .await
             .expect("voice state");
+        set_voice_participant_session(other.id(), &user.id, &session.id, None)
+            .await
+            .expect("session record");
         let (status, body) = claim(&harness, &session.token, lounge.id(), 120).await;
         assert_eq!(status, Status::BadRequest, "{body}");
         assert!(body.contains("NotInVoiceChannel"), "{}", body);
@@ -582,6 +688,9 @@ mod test {
         create_voice_state(&afk_seat, &user.id, joined_long_ago())
             .await
             .expect("voice state");
+        set_voice_participant_session(afk.id(), &user.id, &session.id, None)
+            .await
+            .expect("session record");
         let (status, body) = claim(&harness, &session.token, afk.id(), 600).await;
         assert_eq!(status, Status::NoContent, "{body}");
         assert!(get_afk_since(&user.id, &server_id)
@@ -594,5 +703,171 @@ mod test {
                 .await
                 .expect("cleanup");
         }
+    }
+
+    /// Merge slice F11: a claim is taken only from the session recorded as
+    /// owning the participant. With no record at all, and from a session of
+    /// the same user that is not the recorded one, the PUT answers
+    /// `NotOwner` (403) and writes nothing, not even a clear; from the
+    /// recorded session it is stored.
+    #[test]
+    fn idle_claim_is_accepted_only_from_the_recorded_session() {
+        crate::util::test::rt()
+            .block_on(idle_claim_is_accepted_only_from_the_recorded_session_case())
+    }
+
+    async fn idle_claim_is_accepted_only_from_the_recorded_session_case() {
+        let harness = TestHarness::new().await;
+        let (account, desktop, user) = harness.new_user().await;
+        let phone = account
+            .create_session(&harness.db, "phone".to_string())
+            .await
+            .expect("a second session");
+        let (mut server, _channels) = harness.new_server(&user).await;
+        let server_id = server.id.clone();
+        let lounge = voice_channel(&harness, &server, "Lounge").await;
+        let afk = voice_channel(&harness, &server, "AFK").await;
+        server
+            .update(
+                &harness.db,
+                PartialServer {
+                    afk_channel_id: Some(afk.id().to_string()),
+                    afk_timeout: Some(300),
+                    ..Default::default()
+                },
+                vec![],
+            )
+            .await
+            .expect("designate");
+
+        let lounge_seat = UserVoiceChannel::from_channel(&lounge);
+        create_voice_state(&lounge_seat, &user.id, joined_long_ago())
+            .await
+            .expect("voice state");
+
+        // In the call, but no session is recorded as owning the seat (a
+        // join from before the record existed): refused, nothing written.
+        let (status, body) = claim(&harness, &desktop.token, lounge.id(), 120).await;
+        assert_eq!(status, Status::Forbidden, "{body}");
+        assert!(body.contains("NotOwner"), "{}", body);
+        assert!(get_afk_since(&user.id, &server_id)
+            .await
+            .expect("read")
+            .is_none());
+
+        // The phone joined: the desktop is the same user, live seat and all,
+        // but not the session that owns it.
+        set_voice_participant_session(lounge.id(), &user.id, &phone.id, None)
+            .await
+            .expect("session record");
+        let (status, body) = claim(&harness, &desktop.token, lounge.id(), 120).await;
+        assert_eq!(status, Status::Forbidden, "{body}");
+        assert!(body.contains("NotOwner"), "{}", body);
+        assert!(get_afk_since(&user.id, &server_id)
+            .await
+            .expect("read")
+            .is_none());
+
+        // The recorded session claims.
+        let (status, body) = claim(&harness, &phone.token, lounge.id(), 120).await;
+        assert_eq!(status, Status::NoContent, "{body}");
+        let stored = get_afk_since(&user.id, &server_id)
+            .await
+            .expect("read")
+            .expect("the claim is stored");
+        assert_eq!(stored.channel_id, lounge.id());
+
+        // A refused claim from the other session changes nothing: with a
+        // different `idle_for` an accepted one would move `since`.
+        let (status, body) = claim(&harness, &desktop.token, lounge.id(), 600).await;
+        assert_eq!(status, Status::Forbidden, "{body}");
+        let after = get_afk_since(&user.id, &server_id)
+            .await
+            .expect("read")
+            .expect("the claim still stands");
+        assert_eq!(after.channel_id, stored.channel_id);
+        assert_eq!(after.since_ms, stored.since_ms);
+
+        delete_channel_voice_state(&lounge_seat, &[user.id.clone()])
+            .await
+            .expect("cleanup");
+    }
+
+    /// `claim`, authenticated as a bot.
+    async fn bot_claim(
+        harness: &TestHarness,
+        bot_token: &str,
+        channel_id: &str,
+    ) -> (Status, String) {
+        let response = harness
+            .client
+            .put(format!("/channels/{channel_id}/afk_idle"))
+            .header(ContentType::JSON)
+            .header(Header::new("x-bot-token", bot_token.to_string()))
+            .body(serde_json::to_string(&v0::DataAfkIdle { idle_for: 120 }).unwrap())
+            .dispatch()
+            .await;
+        let status = response.status();
+        (status, response.into_string().await.unwrap_or_default())
+    }
+
+    /// Merge slice M2C-7: a bot authenticates with `x-bot-token` and has no
+    /// session, and the PUT still answers it in the contract order: the
+    /// shape check first (`NotAVoiceChannel` for a text channel), then
+    /// `IsBot` for a voice call it sits in, and nothing is stored. A required
+    /// session guard failed both requests before any of those checks ran,
+    /// with a bare 401 from Rocket's catcher and no error body the client
+    /// could read (control M2C-7-GUARD).
+    #[test]
+    fn a_bot_is_answered_in_the_contract_order() {
+        crate::util::test::rt().block_on(a_bot_is_answered_in_the_contract_order_case())
+    }
+
+    async fn a_bot_is_answered_in_the_contract_order_case() {
+        let harness = TestHarness::new().await;
+        let (_, _session, owner) = harness.new_user().await;
+        let (mut server, _channels) = harness.new_server(&owner).await;
+        let server_id = server.id.clone();
+        let (bot, bot_user) = Bot::create(&harness.db, TestHarness::rand_string(), &owner, None)
+            .await
+            .expect("bot");
+        Member::create(&harness.db, &server, &bot_user, None)
+            .await
+            .expect("member");
+        let lounge = voice_channel(&harness, &server, "Lounge").await;
+        let afk = voice_channel(&harness, &server, "AFK").await;
+        let text = harness.new_channel(&server).await;
+        server
+            .update(
+                &harness.db,
+                PartialServer {
+                    afk_channel_id: Some(afk.id().to_string()),
+                    afk_timeout: Some(300),
+                    ..Default::default()
+                },
+                vec![],
+            )
+            .await
+            .expect("designate");
+        let lounge_seat = UserVoiceChannel::from_channel(&lounge);
+        create_voice_state(&lounge_seat, &bot_user.id, joined_long_ago())
+            .await
+            .expect("voice state");
+
+        let (status, body) = bot_claim(&harness, &bot.token, text.id()).await;
+        assert_eq!(status, Status::BadRequest, "{body}");
+        assert!(body.contains("NotAVoiceChannel"), "{}", body);
+
+        let (status, body) = bot_claim(&harness, &bot.token, lounge.id()).await;
+        assert_eq!(status, Status::BadRequest, "{body}");
+        assert!(body.contains("IsBot"), "{}", body);
+        assert!(get_afk_since(&bot_user.id, &server_id)
+            .await
+            .expect("read")
+            .is_none());
+
+        delete_channel_voice_state(&lounge_seat, &[bot_user.id.clone()])
+            .await
+            .expect("cleanup");
     }
 }
