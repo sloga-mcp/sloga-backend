@@ -2,6 +2,10 @@
 
 Status: PLAN — AUDITED (media-e2ee-reviewer, 2026-07-12): APPROVE-WITH-FIXES.
 All audit findings folded below (§7); implement per this amended version.
+Amended 2026-09-26: §8 (resume — a device returning inside the leave-grace
+keeps its group and sends no intent, so §3 becomes the fallback) and §9
+(serve-then-admit: tried and parked, and the epoch-keyed guard that closed
+the ≥ 7-member kick).
 Supersedes the frontend-only HIGH-1 fix attempted in
 `e2ee-media-slice-6.4-leaf-verify-fix.md` (gate re-verify proved it
 inoperative: native `mls_call_remove` commits `remove_members(&[own_index])`
@@ -247,3 +251,576 @@ admit — same cost as any join (cap accounting is the separate tracked issue).
 - **AUD-LOW-3 — solo recovery consumes ~2 of `MAX_REESTABLISH = 3`**
   (rejoin_fresh → join → close, then not_found → re-establish → create);
   acceptable margin, do not shrink the budget without revisiting.
+
+## 8. Resume: a returning device keeps its group
+
+Status: LANDED on the frontend branch `fix/mls-rejoin-resume-w2` (wave 2,
+the foundations, committed `918c246e`; wave 3, the resume itself, landed
+after audit on 2026-09-26). Not on frontend `main` yet: until that branch
+merges, every return takes §3's path. This section describes the landed
+behavior (join-latency "resume" plan, operator-approved 2026-09-25). Two
+waits are bounded: the prefetch at 3 s (`RESUME_PREFETCH_WAIT_MS`; past
+it the device joins), and each delete the join path awaits at 5 s
+(`KEPT_DISCARD_WAIT_MS`; past it the establish goes LOUD, §8.5). **No
+server, native or protocol change** — the resume uses two existing DS
+read routes. The final-audit fix pass (2026-09-26: install before
+active, the commit-window tail fetch, the fallback-cause line, the
+stale keys-changed fence) is committed on the same branch as `f3bf4dc8`,
+on top of wave 3. It changes §8.3 steps 5–6, §8.5 and §8.6. On top of
+that, the branch carries a merge of frontend `main` (commit `b1c39d6e`,
+which brings in the late-drain guard and its Welcome currency check), a
+merge wave that makes the resume and that guard agree (commit
+`b4c66b58`), and a merge fix pass (commit `e915b070`). The MFR-m1 fix
+(the loud veto takes precedence over a miss, and the adopt window's
+`finally`, MFR-n2) is on the branch, uncommitted. §8.3 step 6, §8.5 and
+§8.6 are checked against `e915b070` plus that fix.
+
+### 8.1 Why
+
+§3's path costs ~11 s of dead air: measured 11.0–11.2 s on 3/3 rejoins
+(two-seat legs, 2026-09-08), against 0.7–1.0 s for a clean join. The cost
+exists because the returning client DELETES its own MLS state (the startup
+wipe on reload, `#teardownGroup` on hang-up), so its leaf is stale and two
+commits by OTHER members must re-seat it: the Remove (§3.4), then the Add
+after the joiner's blind 10 s retry (`JOINER_RETRY_MS`). Three attempts to
+make that Add sooner failed audit (§9). The resume removes the reason for
+the dance instead: a device whose leaf is still current keeps the state
+that leaf belongs to.
+
+### 8.2 Who resumes
+
+Only a device that returns while its leaf is still in the roster, i.e.
+inside the peers' leave-grace (`LEAVE_GRACE_MS = 10_000`):
+
+- **Ctrl+R / crash:** the native rows are still on disk (page death runs no
+  MLS teardown).
+- **Hang-up → rejoin:** `dispose()` no longer tears the group down. It
+  clears the channel's downgrade grant first (`callClearDowngrade`, so a
+  kept row cannot carry a confirmed-downgrade grant into the next call),
+  then KEEPS the group for `LOCAL_GROUP_KEEP_MS = 10_000` and deletes it
+  when that expires.
+
+Either way a resume REQUIRES a recency record,
+`sessionStorage["mls-resume:<channelId>"] = { groupId, epoch, at }`,
+naming the same group and no older than 10 s. It is refreshed on every key
+install, every reconcile tick while active, and on an accepted keep, and
+deleted on every immediate-delete reason. It stops a hostile DS steering a
+device into an older group it still holds, and it guarantees a dead page's
+leftover rows are never resumed.
+
+Not resumed (today's path): a full app restart (`sessionStorage` is gone);
+a network-blip auto-rejoin (it fires only after ~12 s of state mismatch
+plus a backoff, past the grace, when peers have already removed the leaf →
+a clean join); any return after 10 s. Never kept, deleted at once:
+sign-out, E2EE disable/wipe, account mismatch, `removed_self`,
+poisoned/desync.
+
+### 8.3 The path
+
+1. **Prefetch, read-only, overlapping the SFU connect.** Started before
+   `room.connect`, so it runs while ICE/DTLS does. Candidate = the
+   channel's kept group (claimed, its expiry timer suspended) or the
+   recency record's group. In parallel: the open-group GET
+   (`/mls/channels/<channel_id>/open_group`, `group_open.rs`), native
+   `callState(candidate)`, the native pending-commit probe; then ONE
+   commits fetch (`/mls/groups/<id>/commits?from_epoch=<local + 1>`,
+   `commits_fetch.rs`), whose `current_epoch` is the DS's current epoch.
+   Nothing is applied. A superseded connect aborts it and hands the claim
+   back. The session waits at most 3 s (`RESUME_PREFETCH_WAIT_MS`) for
+   it; one not back by then reads as no prefetch, and is never read
+   later.
+2. **Decision** (pure `resumeDecision`, `mlsRejoinPolicy.ts`). Resume only
+   if ALL hold: the open-group GET was for the intended channel and names
+   the held group, and native's channel for it matches; native state
+   `active` with self in the roster; no pending own commit; no fetched
+   commit was committed by this device; `0 ≤ current − local < 12`; the
+   fetched list is exactly `current − local` commits, contiguous from
+   `local + 1`; the prefetch is ≤ 10 s old; this is the session's startup
+   establish (a re-establish never resumes). Anything else → join.
+3. **DS verdict.** The open-group GET is a DS answer exactly as the
+   create-409 is on the ladder, so it is this route's verdict; no epoch-0
+   group is minted.
+4. **Adopt, BEFORE the catch-up.** The startup wipe spares the candidate.
+   Then release the keep entry and take the group into the session (if
+   the group is already being deleted → join), then clear the downgrade
+   grant (a failed clear → join). From the release on, no keep timer can
+   delete the group, and a close deletes it rather than keeping it (only
+   a group joined in the live generation is kept). The grant is gone
+   before anything can enable: a reload never ran `dispose`, and native
+   outlived the page.
+5. **Catch up.** Under the session lock, each fetched commit goes through
+   the same inbound path a live commit takes. Native apply is strictly
+   consecutive; a `duplicate` (a drained copy already applied) is clean;
+   the first commit that does not apply cleanly ends the catch-up. Then
+   native `callState` must show self present, `active`, at
+   `epoch == current_epoch`. A `removed_self` arriving during establish is
+   recorded and acted on only if native confirms self absent — never
+   replayed blindly. If an envelope of the candidate group took a
+   non-terminal drop during the startup window, ONE tail fetch
+   (`#catchUpTail`) runs before that final check, and the epoch native
+   must show is then the tail's `current_epoch` (§8.6). Any outcome
+   other than caught up abandons the adopted group through §8.5.
+6. **Install, THEN go active.** Still inside `#catchUp`, under the
+   session lock, after the final native check,
+   `#installCaughtUpKeys(groupId, confirmed)` is AWAITED. It clears
+   `#lastInbound`, so the classifier falls to Remove-immediate and never
+   to an Add-grace that keeps the old send key. It then installs every member's keys, our own
+   send key included, at the confirmed epoch. `#lastOwnWon` is
+   deliberately left alone: the resume branch stages and wins no commit
+   of its own, and the send-key check below refuses a deferred install
+   whatever classified it. The install counts only if all three hold:
+   the install counter moved, the install fence (`#installEpoch`) is
+   still the confirmed epoch, and our own send key's epoch
+   (`#ownSendKeyEpoch`, set only once an awaited install resolves with
+   the fence still on that epoch) equals it. (With no local media
+   identity yet, it counts only if no key was ever installed: nothing
+   can publish.) The session, the generation and the group are
+   re-checked after the await. A failed check falls back to the join
+   ladder with cause `install_check_failed` (§8.5), never active. One
+   case is NOT quiet: if the install throws `MissingLocalFrameKeyError`
+   (native has no send key for us at that epoch), `#onRotationError`
+   latches loud (control origin) before the fallback runs. That fails
+   closed, and that latch is the install's own (`ownLatch`, below), so
+   it does not veto: the fallback's fresh join is the recovery for "no
+   local frame key".
+   **The adopt window** runs from the adoption to the verdict in
+   `#resumeAdopt`, which `#startupResume` calls in a `try/finally`. The
+   `finally` clears `#resumeAdopting` on every exit, a throw included
+   (MFR-n2). Inside the window a loud verdict takes precedence over a
+   miss (MFR-m1). Each miss out of it (the grant clear, the catch-up, the
+   tail, the install check) first asks `#loudVeto`. If the session went
+   `failed` or latched loud inside the window, the resume STOPS with
+   cause `loud_during_adopt` and stays loud with the gate held (§8.5),
+   rather than falling back. One latch does not veto: a latch first
+   raised during the resume's own key install (`ownLatch`, attributed by
+   timing: not latched before the install await, latched after it, and
+   the install check missed). That miss falls back with
+   `install_check_failed` (§8.5). After a clean catch-up (and tail, if one
+   ran) and a counted install, `#resumeAdopt` checks two vetoes, in this
+   order. First, the loud veto, as above. Second, if the drain re-secured
+   the session inside the window (a DS 404 on a gap refetch of the adopted
+   group), the resume falls back with cause `resecure_during_adopt`
+   (§8.5). Only past both does `#resumeAdopt` stamp `resumed`, set
+   `#joinedGeneration`, call `#toActive()`, kick one reconcile (the
+   install's own kick was refused while not yet active), refresh the
+   recency record and log "resumed the held call group". Then the
+   UNCHANGED fail-closed path runs: roster consistency → enable → gate
+   release. At `d4472a26` the order was reversed (`#toActive()`, then an
+   un-awaited install). A keys-changed push for an intermediate epoch
+   landing mid-catch-up then made the explicit install an Add-grace, so
+   the gate could open for ~2 s on an earlier epoch's send key, a key
+   a member removed in the catch-up still held. The final audit
+   reproduced this (FA-B1).
+   **Live-leg readout (FAR-n1):** `catchUpDone` is stamped just before
+   the install, and `resumed` only after the install check and both
+   vetoes passed, so a resumed seat's timeline reads
+   `catchUpDone < keysInstalled < resumed < modeE2ee`. A seat that fell
+   back (on `install_check_failed` or any other cause) or stopped never
+   stamps `resumed`. Before the merge wave, `resumed` was stamped before
+   the install, and a seat that fell back on `install_check_failed`
+   still showed it.
+   The cause line (§8.5) and the "resumed the held call group" log remain
+   the primary readout.
+
+   **Resume and the Welcome currency check.** The late-drain guard
+   (merged from `main`) holds a seat that adopts a Welcome non-active until
+   the DS confirms the Welcome's epoch is current or its commits since are
+   applied (`#confirmWelcomeCurrency`). The resume adopts a group it
+   already holds, receives no Welcome, and never runs that check: it
+   confirms currency itself (the prefetch's DS epoch or the tail's, then
+   native's). While a resume is adopting a group (`#resumeAdopting`, set
+   at the adoption and cleared on every exit by the adopt window's
+   `finally`), a Welcome for that group
+   writes no `#joinedGeneration`, no `welcomeAdopted` stamp and no
+   currency record. So nothing can go active beside the resume's own
+   verdict, and a fallback ladder does not read itself as joined: it
+   sends its own intent (MWA-m1). A fallback's own Welcome, which arrives
+   after `#resumeAdopting` is cleared, runs the currency check as usual.
+   The two paths share one installer: `#installCaughtUpKeys` and the
+   `#ownSendKeyEpoch` check serve both the resume catch-up (`#catchUp`)
+   and the currency check's catch-up.
+
+**Sent to the DS: no join intent, no Welcome, no commit, and no
+self-Update** (membership did not change; post-compromise security still
+comes from the lowest leaf's 10-minute heartbeat). The KeyPackage top-up
+is NOT skipped: `#ensureKeyPackages` runs beside every resume (in
+`start()`, whenever the host supplies a resume prefetch), not ahead of
+it. It is the same low-water enrollment a join runs, a native replenish
+that publishes a KeyPackage batch only when the DS count is below the
+watermark. The resume does not wait for it, and a failure beside a
+resume is logged, not loud. A fallback to the ladder awaits it
+before its first intent.
+
+### 8.4 What the DS and peers see; effect on §3
+
+- Two existing read routes, both already gated: `open_group` needs channel
+  access; the commits fetch needs a device-bound session, channel access,
+  and the caller's USER in the group's roster (NotFound otherwise) and
+  returns at most `MAX_COMMITS_PER_FETCH` (100) commits, far above the lag
+  bound of 12. That membership check is user-level, not device-level
+  (`member_device_of(&user.id)`, `commits_fetch.rs:49`): any rostered
+  device of the same account qualifies, so a device whose own leaf is
+  gone can still read the list. The device-level gate is a §8.6
+  follow-up.
+- **No join intent, so the DS never fans out `rejoin: true`**, no member
+  runs `#serveRejoin`, and no Remove or Add is committed. The `rejoin` flag
+  (§3.1) now fires only on the fallback.
+- **Solo reload:** the sole member resumes without an intent, so §3.1's
+  solo-stale close is not reached on this route; the group stays open.
+- **Peers need nothing new.** The return clears their pending leave-grace
+  Remove, and the returning device installs every member's keys exactly as
+  a join does.
+
+### 8.5 Fallback: §3, unchanged
+
+On a `join` decision, a null or failed prefetch, a prefetch not back
+within its 3 s bound, a candidate already being deleted, a failed grant
+clear, ANY catch-up outcome other than caught up, a failed key install
+(§8.3 step 6), a failed tail fetch (§8.6), or a re-secure raised inside
+the adopt window (§8.3 step 6), the device (unless a loud verdict
+inside the adopt window vetoes first, `loud_during_adopt` below), in
+order: aborts the prefetch; lets go of the candidate, if there was one
+(keep entry, session, recency record), and deletes it; discards the
+channel's other kept groups; ensures its KeyPackages are published; runs
+today's create-or-join ladder from the top. Each delete is awaited and
+bounded at 5 s (`KEPT_DISCARD_WAIT_MS`). A delete that times out OR is
+rejected (a failed cleanup) fails LOUD — the establish refuses — and
+never falls through into the ladder, which could re-enter a group whose
+local delete is still running. It therefore arrives with wiped state,
+and §3 applies exactly as written — including §3.4's `rejoin` serve when
+its old leaf is still rostered. The two-commit ladder, `#serveRejoin`,
+`#removeStaleLeaf`, `JOINER_RETRY_MS` and `REJOIN_SERVE_SUPPRESS_MS` are
+not modified.
+
+**The cause is logged.** Every startup establish that does not resume
+logs ONE `[mls]` info line (`#noResume`, `#resumeStopped`), which names
+the cause:
+
+```
+[mls] startup establish: no resume { cause, candidate, ...numbers }
+```
+
+`candidate` is the group id (or null). The numbers are ages, epochs,
+lag, counts and flags, never key material or a group secret. The
+`cause` values are (type `ResumeMissCause`):
+
+- prefetch: `prefetch_none`, `prefetch_failed`, `prefetch_timeout`;
+- the decision's rules, in `resumeDecision`'s order: `not_startup`,
+  `prefetch_stale`, `open_group_mismatch`, `channel_mismatch`,
+  `held_group_unusable`, `own_commit_pending`, `own_commit_fetched`,
+  `lag_out_of_range`, `commits_mismatch`, and `policy_join` (the policy
+  said join but no mirrored rule failed: the mirror has drifted);
+- adopt: `candidate_being_deleted`, `grant_clear_failed`;
+- catch-up: `catch_up_stopped`, `loud_foreign_drop`,
+  `native_unconfirmed`, `catch_up_threw`. A gap refetch that fails under
+  a fetched commit (`#consumeCatchUp`, counted by `#gapRefetchFailures`)
+  reports `catch_up_stopped` with the result `gap_refetch_failed`; before
+  the merge wave it reported `catch_up_threw`;
+- `tail_failed` (with `reason`: `threw`, a non-ok response kind, `lag`,
+  `short`, `own_commit`, `gap_refetch_failed` or `not_applied`);
+- `install_check_failed`;
+- adopt window, after the install check: `resecure_during_adopt`. The
+  drain hit a DS 404 on a gap refetch of the adopted group inside the
+  adopt window and left the session re-securing (its rejoin request is
+  dropped by the single-flight while the establish runs). The resume
+  falls back, and the ladder takes the rejoin's place;
+- `loud_during_adopt`: the session went `failed` or latched loud inside
+  the adopt window (`#loudVeto`). The resume STOPS and stays loud, gate
+  held, never active. It does not fall back, because the fallback's
+  group reset (`#resetGroupBuffers`) would clear the latch. The candidate
+  stays adopted but not joined, so a close deletes it. The loud veto
+  takes precedence over a miss (MFR-m1): the grant clear, the catch-up,
+  the tail and the install check each consult it before `#noResume`, so
+  a latch plus, for example, a `catch_up_stopped` miss stops loud rather
+  than falling back. It also runs before the re-secure veto, so a session
+  both re-securing and latched stays loud. One exception: a latch first
+  raised during the resume's own key install (`ownLatch`, §8.3 step 6)
+  falls back with `install_check_failed`, because the fallback's fresh
+  join is the recovery for "no local frame key" (§8.6 residual). Both
+  the veto's line (`[mls] resume vetoed: went loud during the adoption`)
+  and this stop's `no resume` line carry `state` and `miss`: the cause
+  of the miss the veto overrode, or null after a clean catch-up;
+- `superseded`: the session closed or a newer establish took over.
+  `superseded` and `loud_during_adopt` are the two causes that stop
+  (`#resumeStopped`) rather than falling back to the ladder
+  (`#noResume`).
+
+The rule cause is derived by `resumeJoinCause`, which re-walks
+`resumeDecision`'s rules to label the line; the decision itself stays
+`resumeDecision`'s, and `mlsRejoinPolicy.ts` is unchanged. At `d4472a26`
+a declined resume logged only the candidate, so a live leg could not tell
+which rule sent it to the ladder (FA-m3).
+
+**Stale keys-changed fence (FA-S2, FAR-m2).** A startup delete removes a
+group, and the ladder may re-enter the SAME DS group id. Native
+keys-changed pushes for commits the old incarnation applied can still be
+in flight. After the group reset zeroes `#installEpoch`, both the
+group-id check and the epoch check would pass, and the frame-key read
+would hit the deleted row (re-securing, then loud). To stop that:
+
+- `#startupAppliedEpochs` records, per group, the highest epoch native
+  applied during the startup window (`#noteStartupApplied`). It is fed
+  from every `processed` outcome `#consume` sees, other groups' included.
+  At the end of the window every entry is cleared EXCEPT a fenced
+  group's: a fenced group's floor outlives the startup window.
+- `#staleKeysFence` is a Set of fenced group ids. It holds no epoch: the
+  floor is read live from `#startupAppliedEpochs` when each push lands,
+  so an envelope native applies for the group while its delete is still
+  being awaited raises the floor.
+- What is fenced: every `#startupWipe` target, fenced before its delete
+  is awaited, and, on the resume's fallback (`#joinWithoutResume`), every
+  group this page applied commits to during the window (the candidate
+  and the kept groups the discard deletes, whose ids only the bridge
+  knows), fenced after the candidate's group reset and awaited delete,
+  and before the channel discard and the ladder.
+- Once a fenced group is the live group again, what native applies for
+  it is the new incarnation's and no longer raises the floor its own
+  pushes are checked against.
+- `onLocalKeysChanged` drops a push for a fenced group at or below the
+  floor, before anything else (it does not even retire the new
+  incarnation's pending grace; none can be pending while the group is
+  fenced), and logs
+  `[mls] keys-changed dropped: the deleted group's { groupId, epoch, floor }`.
+  A fenced group with no recorded epoch has no floor and drops nothing.
+- The fence clears at the new incarnation's first install: the first
+  push above the floor that reaches the install and moves
+  `#installEpoch` past it. From there the monotonic epoch check covers
+  the rest.
+
+Why the new incarnation is always above the floor: native mints
+`group_id = sha256(channel_id || call_start_ulid)`, the DS accepts a
+commit only at `epoch == current_epoch + 1`, and swept groups are
+deleted, never reset. So a Welcome back into the same id comes after
+everything this device applied there. The fence applies to every
+fallback that deletes a candidate, including the older
+`catch_up_stopped` one (a catch-up that applied some commits before
+stopping), not only the install and tail causes, and to the non-resume
+startup wipe.
+
+### 8.6 Security
+
+- **Fail closed, no speculative release.** Publishing on the held keys
+  before any DS answer was designed and REJECTED: if a member left while we
+  were away, releasing under the held epoch lets that removed member read
+  our media, silently. The gate releases only through the unchanged path,
+  after the verdict and the catch-up.
+- **Server can never grow a roster** — unchanged; the resume adds nobody.
+- **Hostile DS:** steering into an old group is blocked by the recency
+  record and the channel binding; a padded or reordered commit list fails
+  the count and contiguity checks.
+- **A commit between the prefetch GET and the adopt.** A commit for the
+  candidate that lands after the prefetch's commits fetch but before the
+  adopt is pushed to the device while the candidate is not yet its
+  group. At `d4472a26` it was handled as another group's envelope. Native
+  was still behind it, so the disposition was non-terminal (a gap): the
+  envelope was left unacked and never retried, and the device could go
+  active one epoch behind. The audit reproduced ~30 s behind, healed
+  only by its own ghost timer (FA-M1). Now, while `#startupEstablish`
+  is set (from `start()`, before the sink registers, until the startup
+  establish returns), every foreign envelope that native does not ack
+  records its group in `#resumeForeignDrops: Set<string>`. The set is
+  cleared on every exit: the resume, each fallback, a stop, and the end
+  of the startup window. If the set holds the candidate, `#catchUp`
+  runs `#catchUpTail` under the session lock before the final native
+  check. It reads native's epoch and makes ONE
+  `mlsFetchCommits(candidate, nativeEpoch + 1)`. The answer must be ok,
+  must stay under `RESUME_MAX_LAG` of the held epoch, must be exactly
+  the missing epochs contiguous from `nativeEpoch + 1`, and must contain
+  none committed by this device. Each commit is applied through the same
+  `#consume(#synthEnvelope(...))` path and must apply cleanly. The final
+  check then requires native epoch == the tail's `current_epoch`. Any
+  failure falls back to the join ladder with cause `tail_failed` and a
+  `reason` (§8.5), never active behind. An empty record adds no
+  request, so the common case's latency is unchanged. With this on the
+  branch, the window is closed and is no longer a residual.
+- **The escalation bound needs peer media.** A device that is active at
+  epoch N while the group is at N+1 goes loud only when a peer's media
+  at N+1 reaches it and fails to decrypt. That decode missing key is the
+  only thing that arms the bound. Inside a rotation window or an
+  observed membership change, the result is a join-race hold, amber for
+  at most `JOIN_RACE_DEFER_MS` (20 s) and then loud. This path takes
+  precedence over the rotation window's `RESECURE_ESCALATE_MS` arm.
+  Outside those windows, the device goes loud at once. With no peer
+  publishing (for example, every peer muted), nothing fails to decode
+  and nothing escalates. Meanwhile the device publishes under epoch N,
+  whose key a member removed at N+1 still holds. So the bound is a
+  backstop, not the
+  guarantee. The guarantee is the catch-up, the tail fetch above, and
+  the final native check. The bound remains the only local signal
+  against a DS that withholds a commit from every fetch.
+- **Frame keys:** a resumed FrameCryptor reuses the epoch's frame key, so
+  IV uniqueness rests on the random SSRC (recorded, accepted).
+- **Residuals / follow-ups:** a page that dies inside the 10 s leaves rows
+  on disk until the next establish on that channel sweeps them (never
+  resumed: no valid record); a background keep-expiry delete can race an
+  `e2ee_wipe` (fix is native); native `callState` (the prefetch probe and
+  the catch-up check) goes through `with_engine`, which creates a missing
+  store, so a wipe landing mid-connect could re-create the store the user
+  just destroyed. The normal flow does not reach it (the prefetch needs a
+  ready device, a device id and a keep entry or recency record, and a
+  wipe clears them all). The stale keys-changed fence (§8.5) covers
+  every startup delete, with a floor read when each push lands (FAR-m2,
+  fixed in the merge wave). MFR-m1 (found in the merge fix pass
+  re-audit) is fixed: the loud veto (`loud_during_adopt`) now takes
+  precedence over a grant-clear, catch-up, tail or install miss (§8.5),
+  so a latch raised inside the adopt window stays loud. A narrower
+  residual remains. The install's own latch (`ownLatch`) is attributed by
+  timing, so a media latch raised during the install await (a LiveKit
+  `encryptionError` or a native key-path error; an envelope's verdict
+  cannot land there, since the install holds the catch-up's lock), while
+  the install check also misses, still falls back. The fallback's reset
+  clears it, as every miss did before the fix: the chip goes from red to
+  amber and the ladder runs. It fails closed: the gate stays held and no
+  plaintext is sent.
+  Follow-ups: a device-level + `group.open` gate
+  on the commits fetch; a client-requestable re-drain; a native
+  `GroupAlreadyExists` test; a boot-time kept-group sweep; `callState`
+  through `with_engine_if_provisioned` (sloga-desktop
+  `e2ee-core/src/shell.rs:1047`).
+
+### 8.7 Target
+
+MLS-attributable time ≤ 0.1 s (the resume run's `connect.add` →
+`resumeGate emptied`, minus the same seat's fresh-join `room.connect` +
+enable republish, same sitting); advisory total ≤ 0.5 s; zero Remove/Add
+commits in any admitter log; a solo reload resumes with no DS close. What
+remains between that and a literal 0 is the SFU connect and the enable-time
+republish, not MLS.
+
+**Live results (2026-09-27).** Branch build `e915b070` against main,
+two and three seats; the MFR-m1 fix was not in that build. Hang-up →
+rejoin inside 10 s resumed 5/5 (three two-seat, two three-party), with
+0 commits from any seat. MLS time (the join timeline's `modeE2ee`
+stamp) was 420–760 ms, against ~23.6 s on main. Only one of the five
+came in under the advisory ≤ 0.5 s. Ctrl+R resumed 0/4. Neither build
+rejoins automatically after a reload, so the seat got back only after a
+manual join, past the peer's 10 s leave-grace; the peer had removed the
+leaf, and each run fell back to §3 safely. §8.2's Ctrl+R case therefore
+did not occur live. The network-drop run is owed.
+
+## 9. Serve-then-admit: tried and parked
+
+A record, so nobody re-derives it. **None of this is in the product**;
+§3.4 step 6 ("No Add is staged here") stands.
+
+### 9.1 What it was
+
+Lever 1 of the join-latency plan (2026-09-20): the member whose stale-leaf
+Remove WINS arbitration chains the admit (`#tryAdmit`) on the SAME rejoin
+intent at once, instead of waiting for the joiner's intent #2. `"won"` was
+pinned narrowly (only after the DS accepted and `callCommitWon` resolved).
+Aim: 11 s → ~1.5–2 s with no DS or joiner change.
+
+### 9.2 The stagger-window mechanism
+
+Every verifying member schedules its own serve at `leafIndex × 2 s`
+(§3.4 step 5). Today the Add lands ~11 s after the Remove — outside a
+higher-leaf member's stagger window in a small call. Chaining moves the Add
+to ~1.5–2 s, INSIDE it. A higher-leaf member's already-scheduled serve then
+fires after the re-add; its fresh `callState` finds (user_id, device_id)
+present — the fresh leaf is indistinguishable from the stale one (§2) — and
+it removes the live, just-readmitted participant and chains its own Add:
+kicked and re-admitted once per higher-leaf member, the replace loop §2
+rejected the atomic variant for. §3.4 step 4's idempotence ("absent means
+another member already served it") holds only while the Add lands after
+every scheduled serve.
+
+### 9.3 Three rounds
+
+1. **Audit FAIL (2026-09-20), blocker W2-1:** the above, reproduced with a
+   third-seat probe. Fix: retire a scheduled serve when an inbound commit
+   removes its target (a `#removedSince[id] = epoch` memo), reconcile on
+   every applied commit, a fire-time memo belt.
+2. **Re-audit (2026-09-21), PASS WITH FIXES, two MAJORs of the same
+   class:** W2R-2 — the recent-add re-check and the memo both ran BEFORE
+   `await callState` and were not re-checked after it, so a Remove + Add
+   applied during that IPC defeated both; W2R-1 — the retire skipped a
+   serve held on a bare `null` reservation, and the scheduling epoch was
+   read after the removal (Remove at N+1, chained Add at N+2: the memo
+   compared N+1 ≥ N+2 and was off). Fix: a snapshot before the window plus
+   after-read re-checks.
+3. **Audit FAIL (2026-09-21), blocker W2F-1:** the W2R-1 guard was a
+   change detector over a map that can be deleted INSIDE its own window.
+   `#removedSince` was deleted by `onParticipantLeft` and by a won own
+   admit; undefined → set → deleted reads "no change", and the serve went
+   ahead onto the live leaf. A rejoin IS a participant leaving and
+   returning, so this is the common case, not a corner. Also: W2F-2, the
+   two new after-read re-checks masked each other (delete either alone and
+   every case stayed green); W2F-3, the reconcile-on-commit mutant was
+   killed only at a plumbing assertion, not a behavior.
+
+### 9.4 Why every guard was deletable
+
+Three of the four belts were difference- or freshness-based over MUTABLE,
+DELETABLE state: the `#removedSince` memo (cleared by `onParticipantLeft`
+and by a won own admit) and `#recentAdds` (the recent-add check, §4.8 of
+the frontend rejoin-after-reload design, maintained by the roster diff).
+None was a fact about the leaf that could not revert inside its own
+window, and a spec can only ever show that SOME belt held. Each fix pass
+closed one interleaving and a new one appeared — and the gate stayed green
+while it did. What a future attempt needs: a guard that is monotonic and
+cannot be deleted inside its own window, e.g. an epoch-keyed fact about
+the leaf carried by the commit stream itself, so "this identity was
+removed at or after the epoch my serve was scheduled against" can never
+revert to "no change".
+
+### 9.5 Ruling (operator, 2026-09-23)
+
+Asked to choose between an 11 s delay and a possible kick of a live
+participant: **park serve-then-admit; ship the instrumentation** (the join
+timeline, merged to frontend `main` as `fb29b21e`). The parked tree is the
+frontend tag `snapshot/joinlat-w2-parked` = `e1f7aab6` (local to the build
+box, not pushed). An earlier amendment of THIS document that described
+serve-then-admit as the behavior (backend branch `docs/join-latency`:
+`7df11359`, `d57edd9a`, `a6e0ebc7`; local, never pushed) must not be
+merged; this section replaces it.
+
+### 9.6 The ≥ 7-member kick and the epoch-keyed guard
+
+The multi-member harness built for the resume found the same class on
+TODAY's path, with no chaining at all. In an E2EE call of ≥ 7 members, a
+rejoin inside the grace got the freshly re-seated participant removed
+again by the member at leaf ≥ 6: its serve fires at `leaf × 2 s` ≥ 12 s,
+after the Add (~10.5 s). On a non-admitting member `#recentAdds` is
+written only by the roster diff of the 5 s reconcile, so the fire-time
+check was blind, `callState` showed the fresh leaf, and the serve removed
+a live member. At 7 seats (real constants): Remove won 0.5 s, re-intent
+10.25 s, Add won 10.5 s, leaf-6 serve 12.25 s → Remove at epoch 9 → the
+victim wipes and re-enrolls again; 14/20 phase offsets. At 8–9 seats
+leaf 7 removed it a second time in 10/20; leaf 8 (16 s) never. Damage per
+hit: one extra re-enrollment cycle.
+
+Fix (wave 1.5 of the resume plan; merged to frontend `main` as `9139682a`,
+shipped in v0.63.0), in the ruling's shape:
+
+- `#removedAtEpoch`: identity → the HIGHEST epoch at which a commit removed
+  it. Written from every inbound commit for our group and from this
+  member's own won Removes; max-merge only; cleared only on a group change,
+  together with every scheduled serve. Never deleted by a leave, an admit,
+  a reconcile or a roster diff — that is the whole point.
+- A serve records `scheduledAtEpoch` from the `callState` that confirmed
+  the stale leaf. The deciding check runs inside the commit build UNDER the
+  session lock, immediately before `callRemove`: if the target was removed
+  at an epoch after `scheduledAtEpoch` (`serveTargetStillStale` false), the
+  serve refuses with `mls_serve_target_fresh`, a benign no-op like
+  AUD-MED-1's `mls_group_not_found`. It also refuses if the session's
+  generation or group changed since scheduling.
+- **Why it is complete:** under the lock no commit applies concurrently.
+  `callRemove` can find the target present only if no Remove of it was
+  applied (the leaf is stale; serving is correct) or a later Add was —
+  which implies its Remove, at an earlier epoch, was applied first and
+  recorded, so `removedAtEpoch > scheduledAtEpoch` and the serve refuses.
+- **No lockout:** a refusal retires only that one serve; the rejoiner's
+  next re-broadcast anchors afresh, so a genuinely stale leaf is still
+  served.
+- **Out of scope, recorded:** a stale rejoin re-broadcast arriving AFTER
+  the re-add schedules a new serve anchored after the Remove, and a slow or
+  ledger-re-driven serve can anchor after the Add; both are still guarded
+  only by the recent-add check. Closing them needs intent freshness (a DS
+  or native change; cf. the deferred signed freshness token, AUD-MED-2).
+
+The wave-1.5 audit judged this guard to close the parked serve-then-admit
+class as well (a chained Add at 1.5–2 s: the victim's Remove at epoch + 1
+postdates a higher-leaf member's anchor). Serve-then-admit has NOT been
+re-attempted; the resume plan does not retry it, and §8 takes the serve
+out of returns inside the grace altogether.
