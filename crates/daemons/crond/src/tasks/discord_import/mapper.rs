@@ -15,6 +15,12 @@ use super::permissions::{
 use super::template::{
     channel_type, GuildTemplate, OverwriteKind, PlaceholderId, TemplateChannel, TemplateRole,
 };
+// Read for two constants and one pure predicate, not for any database access:
+// the AFK timeout presets live on `Server`, the Connect bit on
+// `ChannelPermission`, and the client-gate rule in `client_gate_is_set`, and
+// retyping any of them here is how the two sides drift apart.
+use revolt_database::{client_gate_is_set, Server};
+use revolt_permissions::ChannelPermission;
 
 /// Sloga name limits (validated at the HTTP routes, which the worker bypasses —
 /// so the mapper is where they get enforced).
@@ -171,6 +177,12 @@ pub struct ImportPlan {
     /// Template id of the channel to mint the welcome invite in, if the guild
     /// nominated a system channel.
     pub system_channel: Option<PlaceholderId>,
+    /// Template id of the guild's AFK channel, only if it survived mapping as
+    /// a voice channel. The worker writes it onto the server in step 5.
+    pub afk_channel: Option<PlaceholderId>,
+    /// Discord's AFK timeout in seconds, only if `afk_channel` is set and the
+    /// value is one of `Server::AFK_TIMEOUT_CHOICES`.
+    pub afk_timeout: Option<u32>,
     /// Human-readable notes about anything deliberately not imported.
     pub skipped: Vec<String>,
     /// How many source channels the mapper dropped (threads, directory
@@ -219,6 +231,18 @@ fn voice_limit(raw: Option<u64>) -> Option<u64> {
 /// Slowmode of 0 means "off" in Discord; keep it absent rather than explicit.
 fn slowmode(raw: Option<u64>) -> Option<u64> {
     raw.filter(|value| *value > 0)
+}
+
+/// Discord's AFK timeout → one Sloga accepts, or nothing.
+///
+/// Discord's own choices are the same five as `Server::AFK_TIMEOUT_CHOICES`,
+/// so a real template always passes. Anything else is corrupt input and is
+/// dropped, never rounded to the nearest preset: the server then keeps its
+/// AFK channel with no auto-move, which is a valid Sloga state, rather than
+/// moving members on a schedule nobody chose.
+fn afk_timeout_choice(raw: Option<u64>) -> Option<u32> {
+    raw.and_then(|seconds| u32::try_from(seconds).ok())
+        .filter(|seconds| Server::AFK_TIMEOUT_CHOICES.contains(seconds))
 }
 
 /// Discord role colour (a 24-bit int, `0` meaning "no colour") → a CSS colour
@@ -728,6 +752,48 @@ pub fn plan_import(template: &GuildTemplate) -> Result<ImportPlan, PlanError> {
             .map(|channel| channel.template_id.clone())
     });
 
+    // The AFK channel resolves through the same placeholder lookup as the
+    // system channel, but it is kept only if it arrived as a VOICE channel
+    // (a Stage channel counts: it became one above) that is not behind a
+    // client gate. Sloga refuses to designate anything else
+    // (`Server::validate_afk_channel`), and the worker writes this pointer
+    // without going through that check. The gate is read off the planned
+    // channel, which is what the worker creates: an age-restricted Discord
+    // channel arrives with `nsfw`, and a topic can end in a password line.
+    // The worker never sets `spoiler`, hence `false`.
+    let afk = guild.afk_channel_id.as_ref().and_then(|wanted| {
+        channels
+            .iter()
+            .find(|channel| &channel.template_id == wanted)
+            .filter(|channel| matches!(channel.kind, PlannedChannelKind::Voice { .. }))
+            .filter(|channel| {
+                !client_gate_is_set(channel.nsfw, false, channel.description.as_deref())
+            })
+    });
+    let afk_channel = afk.map(|channel| channel.template_id.clone());
+    // A timeout means nothing without a channel to move people to, and
+    // Discord sends one on every guild (300 by default) whether or not an AFK
+    // channel is set, so it only travels with a surviving channel.
+    let afk_timeout = afk.and_then(|_| afk_timeout_choice(guild.afk_timeout));
+
+    // An `@everyone` overwrite denying CONNECT arrives as a Sloga Connect deny
+    // (`permissions.rs` maps CONNECT to Connect | Listen), and the idle sweep
+    // will not move a member into a channel they cannot connect to. The
+    // import is faithful to Discord here, but the result is an AFK channel
+    // that silently never fills, so say so.
+    if let Some(channel) = afk.filter(|channel| {
+        channel
+            .default_permissions
+            .is_some_and(|everyone| everyone.deny & ChannelPermission::Connect as u64 != 0)
+    }) {
+        skipped.push(format!(
+            "\"{}\" is your AFK channel, but @everyone can't connect to it (the same as on \
+             Discord), so idle members who can't connect won't be moved there. Allow Connect \
+             for @everyone on that channel if you want idle members moved.",
+            channel.name
+        ));
+    }
+
     // Categories that ended up with no importable channels are dropped: Sloga
     // renders an empty category as dead weight, and server_edit drops unknown
     // ids anyway.
@@ -748,6 +814,8 @@ pub fn plan_import(template: &GuildTemplate) -> Result<ImportPlan, PlanError> {
         categories: populated,
         channels,
         system_channel,
+        afk_channel,
+        afk_timeout,
         skipped,
         skipped_channel_count: (skipped_threads + skipped_other) as u32,
     })
@@ -1757,5 +1825,210 @@ mod tests {
         assert_eq!(plan.channels.len(), 1);
         assert_eq!(plan.skipped_channel_count, 3);
         assert!(!plan.skipped.is_empty());
+    }
+
+    // ----------------------------------------------------------------------
+    // AFK channel (Wave 5b-2, BE-4)
+    // ----------------------------------------------------------------------
+
+    /// A guild with a text channel (1), a voice channel (2), a Stage channel
+    /// (3) and a thread (4), whose AFK pointer and timeout are spliced in.
+    fn afk_guild(afk_channel_id: &str, afk_timeout: &str) -> ImportPlan {
+        plan_import(&template(&format!(
+            r#"{{"name":"g","afk_channel_id":{afk_channel_id},"afk_timeout":{afk_timeout},
+                "channels":[
+                    {{"id":1,"type":0,"name":"general"}},
+                    {{"id":2,"type":2,"name":"AFK"}},
+                    {{"id":3,"type":13,"name":"stage"}},
+                    {{"id":4,"type":11,"name":"a thread"}}
+                ]}}"#
+        )))
+    }
+
+    /// Sloga can only designate a voice channel. The worker writes this
+    /// pointer straight onto the server, bypassing the route's
+    /// `validate_afk_channel`, so the mapper is the only filter there is.
+    #[test]
+    fn afk_channel_is_kept_only_when_it_mapped_to_a_voice_channel() {
+        let voice = afk_guild("2", "300");
+        assert_eq!(voice.afk_channel, Some(PlaceholderId("2".to_string())));
+        assert_eq!(voice.afk_timeout, Some(300));
+
+        // A Stage channel became a normal voice channel, so it qualifies.
+        let stage = afk_guild("3", "300");
+        assert_eq!(stage.afk_channel, Some(PlaceholderId("3".to_string())));
+
+        // A TEXT channel as the AFK channel must not be designated, and its
+        // timeout must not survive on its own.
+        let text = afk_guild("1", "300");
+        assert_eq!(
+            text.afk_channel, None,
+            "a text channel must never become the AFK channel"
+        );
+        assert_eq!(text.afk_timeout, None);
+
+        // Pointing at something that was not imported, or at nothing at all.
+        for missing in ["4", "999"] {
+            let plan = afk_guild(missing, "300");
+            assert_eq!(plan.afk_channel, None, "afk_channel_id {missing}");
+            assert_eq!(plan.afk_timeout, None, "afk_channel_id {missing}");
+        }
+    }
+
+    /// Out-of-set timeouts are dropped, not clamped to the nearest preset.
+    /// The designation itself survives: an AFK channel with no auto-move is a
+    /// valid Sloga state.
+    #[test]
+    fn afk_timeout_outside_the_presets_is_dropped_not_clamped() {
+        for seconds in Server::AFK_TIMEOUT_CHOICES {
+            let plan = afk_guild("2", &seconds.to_string());
+            assert_eq!(
+                plan.afk_timeout,
+                Some(seconds),
+                "preset {seconds} must be kept"
+            );
+        }
+
+        // 120 sits between two presets (60 and 300); 4294967596 is 2^32 + 300,
+        // which a truncating cast would turn into a valid-looking 300.
+        for bad in [
+            "120",
+            "0",
+            "59",
+            "61",
+            "7200",
+            "4294967596",
+            "null",
+            "\"soon\"",
+        ] {
+            let plan = afk_guild("2", bad);
+            assert_eq!(plan.afk_timeout, None, "afk_timeout {bad} must be dropped");
+            assert_eq!(
+                plan.afk_channel,
+                Some(PlaceholderId("2".to_string())),
+                "a bad timeout must not cost the designation (afk_timeout {bad})"
+            );
+        }
+    }
+
+    /// Discord sends `afk_timeout` on EVERY guild, 300 by default, even with
+    /// no AFK channel (verified live on the "Blank Server" template,
+    /// 2026-09-23). Carrying it over on its own would write a timeout with no
+    /// channel, which every Sloga writer refuses.
+    #[test]
+    fn afk_timeout_never_travels_without_a_channel() {
+        let plan = afk_guild("null", "300");
+        assert_eq!(plan.afk_channel, None);
+        assert_eq!(plan.afk_timeout, None);
+    }
+
+    /// A Discord AFK channel whose `@everyone` overwrite denies CONNECT maps
+    /// faithfully to a Sloga Connect deny, which means the idle sweep can never
+    /// move anyone without a role grant into it. The import has to say so.
+    #[test]
+    fn afk_channel_denying_connect_to_everyone_is_noted() {
+        // CONNECT is Discord bit 20 = 1048576.
+        let guild = |afk: &str, afk_deny: &str, other_deny: &str, target: &str| {
+            plan_import(&template(&format!(
+                r#"{{"name":"g","afk_channel_id":{afk},"afk_timeout":300,
+                    "roles":[
+                        {{"id":0,"name":"@everyone","permissions":0}},
+                        {{"id":1,"name":"Verified","permissions":0}}
+                    ],
+                    "channels":[
+                        {{"id":2,"type":2,"name":"Idle Zone","permission_overwrites":[
+                            {{"id":{target},"type":0,"allow":0,"deny":{afk_deny}}}
+                        ]}},
+                        {{"id":5,"type":2,"name":"Other","permission_overwrites":[
+                            {{"id":0,"type":0,"allow":0,"deny":{other_deny}}}
+                        ]}}
+                    ]}}"#
+            )))
+        };
+        let afk_notes = |plan: &ImportPlan| {
+            plan.skipped
+                .iter()
+                .filter(|note| note.contains("AFK channel"))
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+
+        let denied = guild("2", "1048576", "0", "0");
+        assert_eq!(
+            denied.afk_channel,
+            Some(PlaceholderId("2".to_string())),
+            "the designation is kept; only the note is added"
+        );
+        let notes = afk_notes(&denied);
+        assert_eq!(
+            notes.len(),
+            1,
+            "expected one AFK note, got {:?}",
+            denied.skipped
+        );
+        assert!(notes[0].contains("\"Idle Zone\""), "{}", notes[0]);
+        assert!(notes[0].contains("@everyone can't connect"), "{}", notes[0]);
+
+        // Controls. No deny: no note.
+        assert!(afk_notes(&guild("2", "0", "0", "0")).is_empty());
+        // The deny is on a role, not @everyone: no note.
+        assert!(afk_notes(&guild("2", "1048576", "0", "1")).is_empty());
+        // Some OTHER voice channel denies Connect: no note.
+        assert!(afk_notes(&guild("2", "0", "1048576", "0")).is_empty());
+        // The deny is there but no AFK channel is designated: no note.
+        assert!(afk_notes(&guild("null", "1048576", "0", "0")).is_empty());
+        // A deny of something other than CONNECT (VIEW_CHANNEL): no note.
+        assert!(afk_notes(&guild("2", "1024", "0", "0")).is_empty());
+    }
+
+    /// Wave BG: Sloga never designates a channel behind a client gate
+    /// (`Server::validate_afk_channel`), and the worker writes the pointer
+    /// without that check, so the mapper drops a gated Discord AFK channel,
+    /// and the timeout with it. An age-restricted voice channel and one whose
+    /// topic ends in a password line are each dropped as the AFK channel but
+    /// still imported. An ungated one is still designated, including one
+    /// whose password line is not the last line. Control: the gate filter
+    /// deleted.
+    #[test]
+    fn a_gated_discord_afk_channel_is_not_designated() {
+        let password = [
+            revolt_database::CHANNEL_PASSWORD_PREFIX,
+            "ab",
+            revolt_database::CHANNEL_PASSWORD_SUFFIX,
+        ]
+        .concat();
+        let locked = ["Idle here\n", password.as_str()].concat();
+        let notes = [password.as_str(), "\nIdle here"].concat();
+        let guild = |afk: u64| {
+            let guild = serde_json::json!({
+                "name": "g",
+                "afk_channel_id": afk,
+                "afk_timeout": 300,
+                "channels": [
+                    { "id": 1, "type": 2, "name": "Mature", "nsfw": true },
+                    { "id": 2, "type": 2, "name": "Locked", "topic": locked },
+                    { "id": 3, "type": 2, "name": "Open", "topic": "Idle here" },
+                    { "id": 4, "type": 2, "name": "Notes", "topic": notes }
+                ]
+            });
+            plan_import(&template(&guild.to_string()))
+        };
+
+        for gated in [1, 2] {
+            let plan = guild(gated);
+            assert_eq!(plan.afk_channel, None, "afk_channel_id {gated}");
+            assert_eq!(plan.afk_timeout, None, "afk_channel_id {gated}");
+            assert_eq!(plan.channels.len(), 4, "the channel itself is imported");
+        }
+
+        for open in [3, 4] {
+            let plan = guild(open);
+            assert_eq!(
+                plan.afk_channel,
+                Some(PlaceholderId(open.to_string())),
+                "afk_channel_id {open}"
+            );
+            assert_eq!(plan.afk_timeout, Some(300), "afk_channel_id {open}");
+        }
     }
 }

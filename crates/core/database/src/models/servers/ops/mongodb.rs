@@ -224,7 +224,7 @@ impl AbstractServers for MongoDb {
             .map_err(|_| create_database_error!("update_many", "server_members"))?;
 
         self.col::<Document>("channels")
-            .update_one(
+            .update_many(
                 doc! {
                     "server": server_id
                 },
@@ -235,7 +235,7 @@ impl AbstractServers for MongoDb {
                 },
             )
             .await
-            .map_err(|_| create_database_error!("update_one", "channels"))?;
+            .map_err(|_| create_database_error!("update_many", "channels"))?;
 
         self.col::<Document>("servers")
             .update_one(
@@ -263,6 +263,8 @@ impl IntoDocumentPath for FieldsServer {
             FieldsServer::Icon => "icon",
             FieldsServer::SystemMessages => "system_messages",
             FieldsServer::VoiceRegion => "voice_region",
+            FieldsServer::AfkChannel => "afk_channel_id",
+            FieldsServer::AfkTimeout => "afk_timeout",
         })
     }
 }

@@ -5,7 +5,7 @@ use std::{
 use tokio::sync::{Mutex, RwLock};
 use lru::LruCache;
 use lru_time_cache::{LruCache as LruTimeCache, TimedEntry};
-use revolt_database::{Channel, Member, Server, User};
+use revolt_database::{events::client::session_topic, Channel, Member, Server, User};
 
 /// Enumeration representing some change in subscriptions
 pub enum SubscriptionStateChange {
@@ -79,6 +79,14 @@ impl State {
         let private_topic = format!("{}!", user.id);
         subscribed.insert(private_topic.clone());
         subscribed.insert(user.id.clone());
+
+        // Per-session topic: events that must reach only this connection
+        // (e.g. a voice move carrying a device-bound token). Kept across
+        // resets, see `reset_state`. Bots have no session (empty id), so
+        // they get no session topic; `private_session` refuses empty ids.
+        if !session_id.is_empty() {
+            subscribed.insert(session_topic(&session_id));
+        }
 
         // Privileged (platform moderator) sessions also listen on the global
         // topic, where moderation events such as ReportCreate are broadcast.
@@ -166,7 +174,15 @@ impl State {
     /// Reset the current state
     pub async fn reset_state(&mut self) {
         self.state = SubscriptionStateChange::Reset;
-        self.subscribed.write().await.clear();
+        let mut subscribed = self.subscribed.write().await;
+        subscribed.clear();
+
+        // Nothing re-derives the session topic from servers / channels /
+        // users, so it is pinned here rather than by the caller. Bots
+        // (empty session id) never get one, same as in `State::from`.
+        if !self.session_id.is_empty() {
+            subscribed.insert(session_topic(&self.session_id));
+        }
     }
 
     /// Add a new subscription
@@ -213,5 +229,105 @@ impl State {
         }
 
         subscribed.remove(subscription);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use revolt_database::{events::client::session_topic, User};
+
+    use super::{State, SubscriptionStateChange};
+
+    fn user(id: &str) -> User {
+        User {
+            id: id.to_string(),
+            username: "user".to_string(),
+            ..Default::default()
+        }
+    }
+
+    /// A new connection listens on its own session topic from the start,
+    /// and not on any other session's topic.
+    #[tokio::test]
+    async fn new_state_subscribes_own_session_topic() {
+        let state = State::from(user("01USER0000000000000000000A"), "01SESSIONA".to_string());
+        let subscribed = state.subscribed.read().await;
+
+        assert!(subscribed.contains(&session_topic("01SESSIONA")));
+        assert!(!subscribed.contains(&session_topic("01SESSIONB")));
+        assert!(subscribed.contains("01USER0000000000000000000A!"));
+        assert!(subscribed.contains("01USER0000000000000000000A"));
+    }
+
+    /// Ready generation resets and rebuilds subscriptions from servers,
+    /// channels and users; the session topic must survive that reset and
+    /// be part of the set the listener subscribes on `Reset`.
+    #[tokio::test]
+    async fn session_topic_survives_reset() {
+        let mut state = State::from(user("01USER0000000000000000000A"), "01SESSIONA".to_string());
+
+        state.reset_state().await;
+        state.insert_subscription(state.private_topic.clone()).await;
+        state
+            .insert_subscription("01CHANNEL000000000000000000".to_string())
+            .await;
+
+        assert!(matches!(
+            state.apply_state().await,
+            SubscriptionStateChange::Reset
+        ));
+        assert!(state
+            .subscribed
+            .read()
+            .await
+            .contains(&session_topic("01SESSIONA")));
+
+        // Later incremental changes leave it in place.
+        state
+            .remove_subscription("01CHANNEL000000000000000000")
+            .await;
+        assert!(matches!(
+            state.apply_state().await,
+            SubscriptionStateChange::Change { .. }
+        ));
+        assert!(state
+            .subscribed
+            .read()
+            .await
+            .contains(&session_topic("01SESSIONA")));
+    }
+
+    /// Bots connect with an empty session id. They must not listen on a
+    /// `session:` topic at all, neither at connect nor after a reset.
+    #[tokio::test]
+    async fn empty_session_id_subscribes_no_session_topic() {
+        let mut state = State::from(user("01BOT00000000000000000000A"), String::new());
+        let prefix = session_topic("");
+
+        {
+            let subscribed = state.subscribed.read().await;
+            assert!(!subscribed.iter().any(|t| t.starts_with(&prefix)));
+            assert!(subscribed.contains("01BOT00000000000000000000A!"));
+        }
+
+        state.reset_state().await;
+        assert!(!state
+            .subscribed
+            .read()
+            .await
+            .iter()
+            .any(|t| t.starts_with(&prefix)));
+
+        state.insert_subscription(state.private_topic.clone()).await;
+        assert!(matches!(
+            state.apply_state().await,
+            SubscriptionStateChange::Reset
+        ));
+        assert!(!state
+            .subscribed
+            .read()
+            .await
+            .iter()
+            .any(|t| t.starts_with(&prefix)));
     }
 }

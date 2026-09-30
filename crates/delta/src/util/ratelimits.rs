@@ -182,6 +182,16 @@ impl<'a> RatelimitResolver<Request<'a>> for DeltaRatelimits {
                         return ("watch", Some(id));
                     }
 
+                    // The AFK idle beacon (PUT claims, DELETE withdraws) must
+                    // not share the plain channels bucket with rc_capable and
+                    // the rest (AFK plan Stage 1 I-3): a withdrawal lost to a
+                    // 429 leaves an idle claim standing against a member who
+                    // is active again, and the sweep would move them. Both
+                    // methods, so this sits outside the POST-only block.
+                    if extra == Some("afk_idle") {
+                        return ("afk_idle", Some(id));
+                    }
+
                     // Following an announcement channel creates a webhook in
                     // the target and fans events to two server topics — bound
                     // it separately (both POST create and DELETE unfollow live
@@ -491,6 +501,10 @@ impl<'a> RatelimitResolver<Request<'a>> for DeltaRatelimits {
             // headroom over a continuous scrub; fan-out is one small event
             // per call member per write, so a hostile host is bounded.
             "watch" => 60,
+            // AFK idle beacon: one claim or refresh a minute while idle, and
+            // a withdrawal (plus up to three retries) when activity returns.
+            // 10 per window is far above that and still bounds a script.
+            "afk_idle" => 10,
             // Offer + respond are deliberate, user-paced actions.
             "remote_control_offer" => 2,
             // "Ask for a turn": user-paced, and request spam at a streamer
@@ -593,6 +607,34 @@ mod tests {
             .mount("/kofi", rocket::routes![kofi_webhook])
             .mount("/referrals", rocket::routes![referral_code])
             .mount("/users", rocket::routes![edit_user, edit_supporter]);
+        Client::untracked(rocket).expect("rocket builds without a database")
+    }
+
+    #[rocket::put("/<_id>/afk_idle")]
+    fn afk_idle_put(_id: &str) -> &'static str {
+        ""
+    }
+
+    #[rocket::delete("/<_id>/afk_idle")]
+    fn afk_idle_delete(_id: &str) -> &'static str {
+        ""
+    }
+
+    #[rocket::put("/<_id>/rc_capable")]
+    fn rc_capable_put(_id: &str) -> &'static str {
+        ""
+    }
+
+    /// The channel routes, on the same database-free Rocket as `client()`.
+    fn channels_client() -> Client {
+        let rocket = rocket::build()
+            .manage(RatelimitStorage::new(DeltaRatelimits))
+            .attach(RatelimitFairing)
+            .mount("/", revolt_ratelimits::rocket::routes())
+            .mount(
+                "/channels",
+                rocket::routes![afk_idle_put, afk_idle_delete, rc_capable_put],
+            );
         Client::untracked(rocket).expect("rocket builds without a database")
     }
 
@@ -720,6 +762,64 @@ mod tests {
             packages.headers().get_one("X-RateLimit-Remaining"),
             Some("29"),
             "31 of 60 delivery-service calls spent"
+        );
+    }
+
+    /// AFK plan Stage 1 I-3: the idle beacon's PUT and DELETE resolve to the
+    /// `afk_idle` bucket, never `channels`, so a client that has spent the
+    /// channels bucket can still withdraw its idle claim.
+    #[test]
+    fn afk_idle_beacon_has_its_own_bucket() {
+        use revolt_ratelimits::ratelimiter::RatelimitResolver;
+
+        let client = channels_client();
+
+        // The resolver itself, before routing, exactly as `on_request` runs it.
+        for request in [
+            client.put("/channels/01CHN/afk_idle"),
+            client.delete("/channels/01CHN/afk_idle"),
+        ] {
+            assert_eq!(
+                DeltaRatelimits.resolve_bucket(&*request),
+                ("afk_idle", Some("01CHN"))
+            );
+        }
+        assert_eq!(
+            DeltaRatelimits.resolve_bucket(&*client.put("/channels/01CHN/rc_capable")),
+            ("channels", Some("01CHN")),
+            "the control route must still land on the channels bucket"
+        );
+
+        // Through the fairing: one counter for both methods, limit 10.
+        let put = client.put("/channels/01CHN/afk_idle").dispatch();
+        assert_eq!(put.status(), Status::Ok);
+        assert_eq!(limit(&put), 10);
+        let delete = client.delete("/channels/01CHN/afk_idle").dispatch();
+        assert_eq!(delete.status(), Status::Ok);
+        assert_eq!(limit(&delete), 10);
+        assert_eq!(bucket(&put), bucket(&delete));
+
+        let channels = client.put("/channels/01CHN/rc_capable").dispatch();
+        assert_eq!(limit(&channels), 15);
+        assert_ne!(bucket(&channels), bucket(&put));
+
+        // Spend the whole channels bucket; the withdrawal still goes through.
+        for _ in 0..14 {
+            assert_eq!(
+                client.put("/channels/01CHN/rc_capable").dispatch().status(),
+                Status::Ok
+            );
+        }
+        assert_eq!(
+            client.put("/channels/01CHN/rc_capable").dispatch().status(),
+            Status::TooManyRequests
+        );
+        let delete = client.delete("/channels/01CHN/afk_idle").dispatch();
+        assert_eq!(delete.status(), Status::Ok);
+        assert_eq!(
+            delete.headers().get_one("X-RateLimit-Remaining"),
+            Some("7"),
+            "the afk_idle bucket has spent exactly its own three requests"
         );
     }
 

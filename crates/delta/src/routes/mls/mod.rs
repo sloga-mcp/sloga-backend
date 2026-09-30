@@ -104,10 +104,12 @@ pub const fn encoded_len(raw: usize) -> usize {
 }
 
 /// All MLS routes sit behind the media-E2EE operator flag, which itself
-/// requires the text-E2EE flag (media E2EE builds on slice-1..5 machinery)
+/// requires the text-E2EE flag (media E2EE builds on slice-1..5 machinery).
+/// The rule itself is the database crate's `voice::media_e2ee_enabled`, the
+/// one a voice move reads too (merge slice P2A-9, F9), so a device-qualified
+/// join and a move can never disagree about it.
 pub async fn require_media_e2ee_enabled() -> Result<()> {
-    let features = &revolt_config::config().await.features;
-    if !features.e2ee_enabled || !features.media_e2ee_enabled {
+    if !revolt_database::voice::media_e2ee_enabled().await {
         return Err(create_error!(FeatureDisabled {
             feature: "media_e2ee".to_string()
         }));
@@ -219,3 +221,68 @@ pub fn routes() -> (Vec<Route>, OpenApi) {
 }
 
 use revolt_rocket_okapi::revolt_okapi::openapi3::OpenApi;
+
+#[cfg(test)]
+mod flag_delegation {
+    const SOURCE: &str = include_str!("mod.rs");
+
+    /// The body of `require_media_e2ee_enabled`, comment lines dropped and
+    /// whitespace collapsed.
+    fn gate_body() -> String {
+        const OPEN: char = '\u{7b}';
+        const CLOSE: char = '\u{7d}';
+        let at = SOURCE
+            .find("pub async fn require_media_e2ee_enabled(")
+            .expect("mod.rs defines the gate");
+        let open = at + SOURCE[at..].find(OPEN).expect("a body");
+        let mut depth = 0usize;
+        let mut close = None;
+        for (i, ch) in SOURCE[open..].char_indices() {
+            if ch == OPEN {
+                depth += 1;
+            } else if ch == CLOSE {
+                depth -= 1;
+                if depth == 0 {
+                    close = Some(open + i);
+                    break;
+                }
+            }
+        }
+        SOURCE[open..=close.expect("a closed body")]
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join(" ")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    /// Merge slice P2A-9 (F9): the MLS gate decides through the database
+    /// crate's `media_e2ee_enabled` alone, with the polarity exact, and
+    /// reads no flag of its own that could drift from the rule a voice move
+    /// applies. Control GATE-INLINE (the old inline body restored).
+    #[test]
+    fn the_gate_delegates_to_the_database_crate() {
+        let body = gate_body();
+
+        assert!(
+            body.contains(
+                "if !revolt_database::voice::media_e2ee_enabled().await \u{7b} \
+                 return Err(create_error!(FeatureDisabled \u{7b} feature: \
+                 \"media_e2ee\".to_string() \u{7d}));"
+            ),
+            "{}",
+            body
+        );
+        assert_eq!(body.matches("media_e2ee_enabled(").count(), 1, "{}", body);
+        for banned in ["features", "config(", "e2ee_enabled &&", "e2ee_enabled ||"] {
+            assert!(
+                !body.contains(banned),
+                "the gate reads `{}` itself: {}",
+                banned,
+                body
+            );
+        }
+    }
+}

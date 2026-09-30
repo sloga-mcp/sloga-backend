@@ -334,6 +334,62 @@ auto_derived!(
     }
 );
 
+/// Opening marker of the line that carries a channel's password hash inside
+/// its `description`.
+///
+/// The password gate is written and enforced by clients; the server only
+/// reads it. The source of truth is `PREFIX` in the client's
+/// `packages/client/src/lib/channelPassword.ts`, and this must stay
+/// byte-identical to it. It is the only place the marker is spelled in the
+/// workspace (pinned by a test below): every other reader goes through
+/// [`description_has_password_gate`].
+pub const CHANNEL_PASSWORD_PREFIX: &str = "[acupass:";
+
+/// Closing marker of the password line; `SUFFIX` in the same client file.
+pub const CHANNEL_PASSWORD_SUFFIX: &str = "]";
+
+/// Whether a channel description carries a password gate, decided exactly as
+/// the client's `parseChannelPassword` (`channelPassword.ts`) decides it.
+///
+/// - Only the LAST line counts, split on `\n` alone. This is
+///   `split('\n').last()`, deliberately not `lines().last()`: `lines()` also
+///   strips a trailing `\r` and ignores a trailing empty line, so a
+///   description ending in a newline, or a marker line ending in CRLF, would
+///   read as gated here while the client (JS `split("\n")`) shows no gate.
+/// - That line must start with [`CHANNEL_PASSWORD_PREFIX`] and end with
+///   [`CHANNEL_PASSWORD_SUFFIX`]: case-sensitive, nothing trimmed.
+/// - The hash between the two must be non-empty. The client tests
+///   `!!passwordHash`, so a marker with nothing between prefix and suffix is
+///   not a gate. Both markers are ASCII, so comparing byte lengths is the
+///   same test as the client's non-empty slice.
+pub fn description_has_password_gate(description: Option<&str>) -> bool {
+    let Some(line) = description.and_then(|description| description.split('\n').last()) else {
+        return false;
+    };
+
+    line.len() > CHANNEL_PASSWORD_PREFIX.len() + CHANNEL_PASSWORD_SUFFIX.len()
+        && line.starts_with(CHANNEL_PASSWORD_PREFIX)
+        && line.ends_with(CHANNEL_PASSWORD_SUFFIX)
+}
+
+/// Whether a channel with these fields sits behind any client gate: age
+/// (`nsfw`), spoiler, or password (in the description).
+///
+/// This is the client's `isChannelGated`
+/// (`packages/client/src/interface/channels/channelGates.ts`, fed by
+/// `isGatedFor` in the server sidebar) with every per-member unlock treated
+/// as not granted. Whether a given member has passed a gate is client-side
+/// layout state that the server never sees, so the server can only answer
+/// "is there a gate at all". An age gate counts even though an attested
+/// member would pass it: the attestation is not visible here either, so this
+/// fails closed.
+///
+/// There is no other gate. Clients read no server-level `nsfw`, and
+/// categories carry no gate that channels inherit.
+pub fn client_gate_is_set(nsfw: bool, spoiler: bool, description: Option<&str>) -> bool {
+    nsfw || spoiler || description_has_password_gate(description)
+}
+
 #[allow(clippy::disallowed_methods)]
 impl Channel {
     /* /// Create a channel
@@ -905,6 +961,42 @@ impl Channel {
         }
     }
 
+    /// Whether clients put this channel behind an age, spoiler or password
+    /// gate: [`client_gate_is_set`] over the channel's own fields.
+    ///
+    /// - A thread has no gate fields of its own. The client gates it by its
+    ///   PARENT's (`gateSource` in `channelGates.ts`), which is not in hand
+    ///   here, so a thread answers `true`: fail closed. No current caller
+    ///   needs a thread to pass, because a thread is never a voice channel.
+    /// - DMs and saved messages carry no gate fields and no client gates
+    ///   them.
+    ///
+    /// Written without a wildcard arm, so a new channel variant has to decide.
+    pub fn has_client_gate(&self) -> bool {
+        match self {
+            Channel::Group {
+                nsfw,
+                spoiler,
+                description,
+                ..
+            }
+            | Channel::TextChannel {
+                nsfw,
+                spoiler,
+                description,
+                ..
+            }
+            | Channel::Forum {
+                nsfw,
+                spoiler,
+                description,
+                ..
+            } => client_gate_is_set(*nsfw, *spoiler, description.as_deref()),
+            Channel::Thread { .. } => true,
+            Channel::DirectMessage { .. } | Channel::SavedMessages { .. } => false,
+        }
+    }
+
     /// Set role permission on a channel
     pub async fn set_role_permission(
         &mut self,
@@ -1404,6 +1496,26 @@ impl Channel {
         // injecting crosspost copies.
         crate::ChannelFollow::cleanup_for_deleted_channel(db, &id).await?;
 
+        // Cascade: a channel that is its server's designated AFK channel takes
+        // the designation with it. The pointer lives on the SERVER document, so
+        // delete_channel has no way to notice; left behind it names a channel
+        // that no longer exists, and the idle sweep would move members into
+        // nothing. Scoped to TextChannel because that is the only variant that
+        // can carry voice information, and so the only one that can ever be
+        // designated; the helper no-ops unless the pointer is this channel.
+        //
+        // Deliberately ABOVE the driver split: Reference::delete_channel does
+        // almost none of MongoDb::delete_channel's cleanup (it does not even
+        // pull the id out of Server.channels), so a driver-level clear would
+        // pass under TEST_DB=MONGODB and silently do nothing under REFERENCE.
+        //
+        // Runs before the ChannelDelete broadcast and before db.delete_channel,
+        // like the cascades above, so a failure aborts the deletion without
+        // having announced it.
+        if let Channel::TextChannel { server, .. } = self {
+            Server::clear_afk_channel_if_pointing_at(db, server, &id).await?;
+        }
+
         EventV1::ChannelDelete { id: id.clone() }.p(id).await;
         // TODO: missing functionality:
         // - group invites
@@ -1548,5 +1660,236 @@ mod tests {
             disabled: true,
         }));
         assert!(off.voice().is_none());
+    }
+
+    // ---- Client gates (wave BG) --------------------------------------------
+
+    /// The server's reading of the password gate is the client's
+    /// `parseChannelPassword`, case for case: gated where the client shows a
+    /// gate, open where it does not. Failing closed on a case the client
+    /// leaves open is still a mismatch, and is caught here.
+    ///
+    /// Controls: `lines()` in place of `split('\n')` (the trailing newline
+    /// and trailing CRLF cases), the first line in place of the last (the
+    /// marker after a line of text), the length check dropped (the empty
+    /// hash).
+    #[test]
+    fn password_gate_matches_the_client_parser() {
+        use crate::description_has_password_gate as gated;
+
+        for description in [
+            "[acupass:ab]",
+            "notes\n[acupass:ab]",
+            "first\nsecond\n[acupass:0123abcd]",
+            "[acupass:\u{e9}]",
+            "notes\r\n[acupass:ab]",
+        ] {
+            assert!(gated(Some(description)), "{description:?} is gated");
+        }
+
+        for description in [
+            "",
+            // The empty hash.
+            "[acupass:]",
+            // Not the last line.
+            "[acupass:ab]\nnotes",
+            // A trailing newline makes the last line empty.
+            "notes\n[acupass:ab]\n",
+            "[acupass:ab]\r\n",
+            // A line ending in CR does not end with the suffix.
+            "[acupass:ab]\r",
+            // No trimming, and the prefix is case-sensitive.
+            " [acupass:ab]",
+            "[acupass:ab] ",
+            "[ACUPASS:ab]",
+            // Half a marker.
+            "[acupass:ab",
+            "acupass:ab]",
+        ] {
+            assert!(!gated(Some(description)), "{description:?} is not gated");
+        }
+
+        assert!(!gated(None));
+    }
+
+    /// Each gate, alone, gates each variant that carries gate fields; no gate
+    /// leaves them open. A thread fails closed; DMs and saved messages have
+    /// no gate. Control: the Thread arm answering `false`.
+    #[test]
+    fn has_client_gate_per_variant() {
+        use crate::{
+            client_gate_is_set, Channel, ForumSortOrder, VoiceInformation, CHANNEL_PASSWORD_PREFIX,
+            CHANNEL_PASSWORD_SUFFIX,
+        };
+        use std::collections::HashMap;
+
+        let password = [CHANNEL_PASSWORD_PREFIX, "ab", CHANNEL_PASSWORD_SUFFIX].concat();
+        // (nsfw, spoiler, description): no gate, then each gate on its own.
+        let cases = [
+            (false, false, None, false),
+            (true, false, None, true),
+            (false, true, None, true),
+            (false, false, Some(password), true),
+            // A description that is not a password line is no gate.
+            (false, false, Some("about this channel".to_string()), false),
+        ];
+
+        for (nsfw, spoiler, description, want) in cases {
+            assert_eq!(
+                client_gate_is_set(nsfw, spoiler, description.as_deref()),
+                want
+            );
+
+            let text = Channel::TextChannel {
+                id: "T".to_string(),
+                server: "S".to_string(),
+                name: "voice".to_string(),
+                description: description.clone(),
+                icon: None,
+                last_message_id: None,
+                default_permissions: None,
+                role_permissions: HashMap::new(),
+                nsfw,
+                spoiler,
+                voice: Some(VoiceInformation::default()),
+                slowmode: None,
+                announcement: None,
+            };
+            let forum = Channel::Forum {
+                id: "F".to_string(),
+                server: "S".to_string(),
+                name: "forum".to_string(),
+                description: description.clone(),
+                icon: None,
+                last_message_id: None,
+                default_permissions: None,
+                role_permissions: HashMap::new(),
+                nsfw,
+                spoiler,
+                tags: vec![],
+                require_tag: false,
+                default_sort: ForumSortOrder::default(),
+                force_sort: false,
+                default_auto_archive_minutes: Channel::default_forum_auto_archive_minutes(),
+            };
+            let group = Channel::Group {
+                id: "G".to_string(),
+                name: "group".to_string(),
+                owner: "O".to_string(),
+                description: description.clone(),
+                recipients: vec![],
+                icon: None,
+                last_message_id: None,
+                permissions: None,
+                nsfw,
+                spoiler,
+                voice: None,
+            };
+
+            for channel in [text, forum, group] {
+                assert_eq!(channel.has_client_gate(), want, "{channel:?}");
+            }
+        }
+
+        let thread = Channel::Thread {
+            id: "H".to_string(),
+            server: "S".to_string(),
+            parent_channel: "T".to_string(),
+            name: "thread".to_string(),
+            creator: "O".to_string(),
+            origin_message_id: None,
+            last_message_id: None,
+            archived: false,
+            archived_timestamp: None,
+            auto_archive_minutes: Channel::default_auto_archive_minutes(),
+            locked: false,
+            applied_tags: vec![],
+        };
+        assert!(thread.has_client_gate(), "a thread fails closed");
+
+        let dm = Channel::DirectMessage {
+            id: "D".to_string(),
+            active: true,
+            recipients: vec!["A".to_string(), "B".to_string()],
+            last_message_id: None,
+        };
+        assert!(!dm.has_client_gate());
+
+        let saved = Channel::SavedMessages {
+            id: "M".to_string(),
+            user: "A".to_string(),
+        };
+        assert!(!saved.has_client_gate());
+    }
+
+    /// The password marker is spelled once in the whole Rust workspace: in
+    /// `CHANNEL_PASSWORD_PREFIX`, in this file's shipping code. Every other
+    /// file, test code included, goes through the predicate or the constants.
+    /// A second spelling is a second copy of the client contract to drift.
+    #[test]
+    fn the_password_marker_is_spelled_only_here() {
+        use crate::CHANNEL_PASSWORD_PREFIX;
+        use std::path::{Path, PathBuf};
+
+        fn rust_sources(dir: &Path, out: &mut Vec<PathBuf>) {
+            for entry in std::fs::read_dir(dir).expect("readable directory") {
+                let path = entry.expect("directory entry").path();
+                let name = path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or_default()
+                    .to_string();
+                if path.is_dir() {
+                    if name != "target" && !name.starts_with('.') {
+                        rust_sources(&path, out);
+                    }
+                } else if name.ends_with(".rs") {
+                    out.push(path);
+                }
+            }
+        }
+
+        const THIS_FILE: &str = "core/database/src/models/channels/model.rs";
+
+        let crates_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let mut files = Vec::new();
+        rust_sources(&crates_dir, &mut files);
+        assert!(
+            files.len() > 300,
+            "suspiciously small workspace scan ({} files)",
+            files.len()
+        );
+
+        let mut seen_this_file = false;
+        let mut elsewhere = Vec::new();
+        for path in &files {
+            let text = std::fs::read_to_string(path).expect("readable source");
+            let rel = path
+                .strip_prefix(&crates_dir)
+                .expect("scanned under crates/")
+                .to_string_lossy()
+                .replace('\\', "/");
+
+            if rel == THIS_FILE {
+                seen_this_file = true;
+                let shipping = text
+                    .split("#[cfg(test)]")
+                    .next()
+                    .expect("text before the test module");
+                assert_eq!(
+                    shipping.matches(CHANNEL_PASSWORD_PREFIX).count(),
+                    1,
+                    "the marker is spelled once in this file's shipping code"
+                );
+            } else if text.contains(CHANNEL_PASSWORD_PREFIX) {
+                elsewhere.push(rel);
+            }
+        }
+
+        assert!(seen_this_file, "the scan did not reach {THIS_FILE}");
+        assert!(
+            elsewhere.is_empty(),
+            "the password marker is spelled outside {THIS_FILE}: {elsewhere:?}"
+        );
     }
 }

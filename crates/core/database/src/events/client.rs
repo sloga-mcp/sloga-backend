@@ -546,11 +546,106 @@ pub enum EventV1 {
         channel_id: String,
         data: PartialUserVoiceState,
     },
+    /// A moderator (or the server-side AFK sweep, or the user themselves from
+    /// the session that owns their call) moved this user from one voice
+    /// channel to another. Carries a fresh SFU token for the destination
+    /// when the receiving session may hold one (see `token`).
+    ///
+    /// TWO STRING FIELDS THAT LOOK SYNONYMOUS AND ARE NOT — do not collapse
+    /// them into one:
+    ///
+    /// - `node` is the LiveKit node NAME, i.e. a key into
+    ///   `config.api.livekit.nodes`. It is retained for wire parity with the
+    ///   shape clients have consumed since this event existed, and it is NOT
+    ///   connectable. A client cannot turn it into a URL either: `root.rs`
+    ///   filters `private` nodes out of what it advertises, so a name-to-URL
+    ///   lookup on the client is structurally unable to resolve a self-hosted
+    ///   private node.
+    /// - `url` is the `wss://` address the client actually dials — it is what
+    ///   `room.connect()` takes, and it is resolved server-side at the emit
+    ///   site from the same `config.hosts.livekit` map the join leg uses.
+    ///
+    /// Delivered to ONE SESSION: the one recorded as owning the user's
+    /// participant in `from` (`voice_session:{from}`, written by the join
+    /// that put it there or carried by an earlier move), through
+    /// `EventV1::private_session`, and NEVER through `EventV1::private`,
+    /// which reaches every session of the user (media-e2ee final audit F1: a
+    /// session the owner had kicked would obey the move and rejoin the
+    /// destination with its microphone live). A move with no recorded owner
+    /// publishes nothing at all: a moderator's is done as a disconnect, the
+    /// AFK sweep's is refused (the sweep skips such a member), and a
+    /// self-move is refused. So no other session of the user ever sees this
+    /// event, and the one that does is the one being moved.
+    ///
+    /// Within that session, the addressing fields describe the ONE source
+    /// connection the server chose to move, read from the SFU's own
+    /// participant list for `from`, and they are sent only when that
+    /// connection is proven the owning session's (its device is bound to
+    /// it); otherwise both are absent:
+    ///
+    /// - `conn_nonce`, when present, IS THE GATE: the `"conn"` token
+    ///   attribute of that connection, so it names exactly one connection. A
+    ///   client acts ONLY on a match (or, connected to `from` under another
+    ///   nonce, treats it as "moved elsewhere").
+    /// - `device_id` is addressing only: when present it is the device the
+    ///   token in the same event was minted for, and it drives the client's
+    ///   E2EE identity assertion. It is never a grant of anything.
+    ///
+    /// Both absent (a bare seat, or a connection not proven the owner's):
+    /// the client acts when it is connected to `from`.
     UserMoveVoiceChannel {
         node: String,
+        /// Public LiveKit URL of the destination node, so the client can
+        /// connect with `token` directly. Absent when the node has no public
+        /// URL configured (a move never publishes then: an unknown node is
+        /// refused before anything is written). Absent, not `null`, on the
+        /// wire.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        url: Option<String>,
+        /// Device suffix of the identity `token` was minted for, sent only
+        /// when the moved connection is proven the receiving session's.
+        /// ADDRESSING ONLY: absent means "not named", never "any device".
+        ///
+        /// Absent rather than `null` on the wire, matching every other
+        /// optional field on this enum — and `default` so a payload minted
+        /// before this field existed still deserializes.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        device_id: Option<String>,
+        /// The SOURCE connection's per-connection nonce: the `"conn"` token
+        /// attribute of the connection being moved, as the SFU reported it in
+        /// `from` at move time. It addresses exactly one connection of the
+        /// user. NEVER the new token's nonce — that one is minted inside
+        /// `token` and only becomes visible once the destination is joined.
+        ///
+        /// Absent when the SFU reported none (or an empty one) for that
+        /// connection, or when that connection is not proven the receiving
+        /// session's; the client then acts when it is connected to `from`.
+        /// Serialized exactly like `device_id`, for the same reasons.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        conn_nonce: Option<String>,
         from: String,
         to: String,
-        token: String,
+        /// The destination token, minted for EXACTLY the seat kind the
+        /// receiving session (the one recorded as owning the participant)
+        /// was recorded as holding at its join, and only when the moved
+        /// connection is that seat (merge slice RRB-1):
+        ///
+        /// - a BARE token only when that session was recorded seated bare
+        ///   and the moved connection is the user's bare seat;
+        /// - a DEVICE token (for the identity `user:device`, the device named
+        ///   by `device_id`) only when that session was recorded seated as
+        ///   that device, the moved connection is that device's seat, media
+        ///   E2EE is on, and the device is bound to the receiving session
+        ///   (read when the move is planned and again right before this
+        ///   event is published).
+        ///
+        /// ABSENT otherwise: a record with no readable seat kind (legacy or
+        /// unknown), a device revoked or bound to another session, media
+        /// E2EE off, or a moved connection that is not the recorded seat.
+        /// The client then joins the destination through `join_call`, which
+        /// checks the binding itself.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        token: Option<String>,
     },
 
     /// Remote control (remote-control plan §1): a sharer offered control of
@@ -943,6 +1038,11 @@ pub enum EventV1 {
     },
 }
 
+/// Redis topic that reaches exactly one session's bonfire connection
+pub fn session_topic(session_id: &str) -> String {
+    format!("session:{session_id}")
+}
+
 impl EventV1 {
     /// Publish helper wrapper
     pub async fn p(self, channel: String) {
@@ -978,6 +1078,19 @@ impl EventV1 {
         self.p(format!("{id}!")).await;
     }
 
+    /// Publish event to a single session (only that session's bonfire connection receives it)
+    ///
+    /// Bots have an empty session id; publishing to `session:` would not
+    /// target any one connection, so an empty id publishes nothing.
+    pub async fn private_session(self, session_id: String) {
+        if session_id.is_empty() {
+            warn!("Refusing to publish a session event with an empty session id");
+            return;
+        }
+
+        self.p(session_topic(&session_id)).await;
+    }
+
     /// Publish server member event
     pub async fn server(self, id: String) {
         self.p(format!("{id}u")).await;
@@ -986,5 +1099,131 @@ impl EventV1 {
     /// Publish internal global event
     pub async fn global(self) {
         self.p("global".to_string()).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{session_topic, EventV1};
+
+    fn move_event(conn_nonce: Option<&str>) -> EventV1 {
+        EventV1::UserMoveVoiceChannel {
+            node: "node".to_string(),
+            url: Some("wss://node".to_string()),
+            device_id: None,
+            conn_nonce: conn_nonce.map(str::to_string),
+            from: "FROM".to_string(),
+            to: "TO".to_string(),
+            token: Some("token".to_string()),
+        }
+    }
+
+    /// The move's addressing nonce is on the wire as `conn_nonce` when
+    /// present and absent (not `null`) when not, as the field's doc says. A
+    /// `rename` on the field, or losing `skip_serializing_if`, compiles: the
+    /// first moves the nonce to a key the client does not read, the second
+    /// sends `null` where every other optional field on this enum is absent.
+    #[test]
+    fn the_move_event_carries_conn_nonce_only_when_present() {
+        let present = serde_json::to_value(move_event(Some("n0nce"))).expect("serializes");
+        assert_eq!(
+            present.get("conn_nonce").and_then(|value| value.as_str()),
+            Some("n0nce"),
+            "a present nonce must be on the wire as `conn_nonce`: {present}"
+        );
+
+        let absent = serde_json::to_value(move_event(None)).expect("serializes");
+        assert!(
+            absent.get("conn_nonce").is_none(),
+            "an absent nonce must be absent from the wire, not null: {absent}"
+        );
+        assert_eq!(
+            absent.get("type").and_then(|value| value.as_str()),
+            Some("UserMoveVoiceChannel"),
+            "{absent}"
+        );
+
+        // And back: both shapes deserialize to the nonce they were built from.
+        for (value, expected) in [(present, Some("n0nce")), (absent, None)] {
+            match serde_json::from_value::<EventV1>(value).expect("deserializes") {
+                EventV1::UserMoveVoiceChannel { conn_nonce, .. } => {
+                    assert_eq!(conn_nonce.as_deref(), expected)
+                }
+                other => panic!("round-tripped to another event: {other:?}"),
+            }
+        }
+    }
+
+    /// Merge slice (R10, SessionNoToken): a move told to a session that may
+    /// not hold a token carries none, and an absent `url` is absent too.
+    /// Both are absent on the wire (not `null`) and come back `None`, and a
+    /// present token and URL come back unchanged.
+    #[test]
+    fn a_none_token_or_url_is_absent_on_the_wire_and_round_trips() {
+        type Fields = (
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            String,
+            String,
+            Option<String>,
+        );
+        fn fields(event: EventV1) -> Fields {
+            match event {
+                EventV1::UserMoveVoiceChannel {
+                    node,
+                    url,
+                    device_id,
+                    conn_nonce,
+                    from,
+                    to,
+                    token,
+                } => (node, url, device_id, conn_nonce, from, to, token),
+                other => panic!("not a move event: {other:?}"),
+            }
+        }
+
+        let tokenless = EventV1::UserMoveVoiceChannel {
+            node: "node".to_string(),
+            url: None,
+            device_id: None,
+            conn_nonce: None,
+            from: "FROM".to_string(),
+            to: "TO".to_string(),
+            token: None,
+        };
+        let wire = serde_json::to_value(&tokenless).expect("serializes");
+        for field in ["token", "url", "device_id", "conn_nonce"] {
+            assert!(
+                wire.get(field).is_none(),
+                "an absent `{field}` must be absent from the wire, not null: {wire}"
+            );
+        }
+        assert_eq!(
+            fields(serde_json::from_value::<EventV1>(wire).expect("deserializes")),
+            fields(tokenless)
+        );
+        let (_, url, _, _, _, _, token) = fields(
+            serde_json::from_str(
+                r#"{"type":"UserMoveVoiceChannel","node":"n","from":"F","to":"T"}"#,
+            )
+            .expect("a payload with neither field deserializes"),
+        );
+        assert_eq!((url, token), (None, None));
+
+        let full = move_event(Some("n0nce"));
+        let wire = serde_json::to_value(&full).expect("serializes");
+        assert_eq!(wire.get("token").and_then(|v| v.as_str()), Some("token"));
+        assert_eq!(wire.get("url").and_then(|v| v.as_str()), Some("wss://node"));
+        assert_eq!(
+            fields(serde_json::from_value::<EventV1>(wire).expect("deserializes")),
+            fields(full)
+        );
+    }
+
+    #[test]
+    fn session_topic_prefixes_the_session_id() {
+        assert_eq!(session_topic("abc"), "session:abc");
     }
 }

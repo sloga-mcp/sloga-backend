@@ -129,6 +129,7 @@ async fn voice_channel_with_members(
                 disabled: false,
             }),
             announcement: None,
+            ..Default::default()
         },
         true,
     )

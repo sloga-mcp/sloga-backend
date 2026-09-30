@@ -313,6 +313,15 @@ remote_control = false
 # process at first access. voice-ingress is intentionally NOT gated on this
 # flag: its leg branches must run for a hand-minted probe leg.
 screen_leg = false
+# AFK auto-move (AFK-channel plan, D-5b2-3): members idle past their server's
+# AFK timeout are moved into its AFK channel. ON by default; this line is where
+# the default lives (the field's serde default is false). This is the kill
+# switch: set it false in Revolt.overrides.toml under an explicit [features]
+# header, or REVOLT__FEATURES__AFK_AUTO_MOVE=false, and RESTART delta AND
+# crond: config file sources are frozen into each process at first access. Off,
+# delta refuses new idle claims (PUT /channels/{id}/afk_idle answers
+# InvalidOperation) and the crond sweep moves nobody.
+afk_auto_move = true
 
 # --- Server boosts (Discord-style) ---
 # The feature ships DARK: all keys below default in code to the values shown,

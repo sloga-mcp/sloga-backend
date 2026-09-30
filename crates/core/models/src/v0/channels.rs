@@ -590,6 +590,39 @@ auto_derived!(
         /// Whether this text channel is created as an announcement channel
         #[serde(skip_serializing_if = "Option::is_none")]
         pub announcement: Option<bool>,
+
+        /// Whether this channel is created as this server's AFK voice channel
+        ///
+        /// Voice channels only. A `true` here on a Text or Forum channel is
+        /// rejected rather than silently dropped. Requires `ManageServer` on
+        /// top of the create-channel route's `ManageChannel`, because the
+        /// designation is stored on the SERVER (`Server.afk_channel_id`), not
+        /// on the channel.
+        ///
+        /// This is a route-level field. The DB-layer
+        /// `Channel::create_server_channel` never reads it, so every other
+        /// caller of that function silently ignores it.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub afk: Option<bool>,
+
+        /// Idle timeout in SECONDS before a member is moved to this channel
+        ///
+        /// Constrained to `Server::AFK_TIMEOUT_CHOICES`. Only read when
+        /// `afk` is `true`; supplied on its own it is ignored, so a request
+        /// that does not ask for the AFK designation behaves exactly as it did
+        /// before this field existed.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub afk_timeout: Option<u32>,
+
+        /// Designate with NO idle timeout ("Never"), clearing any timeout the
+        /// server already has
+        ///
+        /// Only valid alongside `afk: true` and without `afk_timeout`; any
+        /// other combination is rejected. Without this a creation could only
+        /// set a timeout or keep the server's existing one, never remove it.
+        #[cfg_attr(feature = "serde", serde(default))]
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub afk_timeout_never: Option<bool>,
     }
 
     /// New default permissions
@@ -653,6 +686,29 @@ auto_derived!(
         /// `{user_id}:{device_id}` so per-device frame keys map injectively
         /// onto SFU participants.
         pub device_id: Option<String>,
+        /// Whether this join is the client's own automatic rejoin after a
+        /// dropped connection.
+        ///
+        /// A rejoin must never take the seat back from a connection that is
+        /// live in ANOTHER channel (a sibling that was moved while this one
+        /// was offline): when set, such a join is refused with
+        /// `AlreadyConnected` before anything is disconnected. Absent means
+        /// false, the deliberate join, which still force-disconnects as
+        /// before.
+        #[cfg_attr(feature = "serde", serde(default))]
+        pub rejoin: Option<bool>,
+    }
+
+    /// Report that this client has been idle in a voice call
+    ///
+    /// CLIENT-CLAIMED: a self-report the server cannot verify. It grants
+    /// nothing; it can only get its own author moved to the AFK channel.
+    pub struct DataAfkIdle {
+        /// Seconds since this client last saw activity from its user
+        ///
+        /// Relative, so no client clock travels on the wire: the server
+        /// stamps the claim from its own clock and caps it at one hour.
+        pub idle_for: u32,
     }
 
     /// Ask for a token for a native screen-share leg
@@ -715,5 +771,68 @@ impl Channel {
             | Channel::Thread { name, .. }
             | Channel::Forum { name, .. } => Some(name),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DataAfkIdle, DataCreateServerChannel, DataJoinCall};
+
+    /// AFK plan R1 A7: the create route's "Never" flag. It must travel under
+    /// exactly this wire key (the client sends `afk_timeout_never: true`), and
+    /// an older client that never sends it must still deserialize.
+    #[test]
+    fn create_channel_afk_timeout_never_is_optional_on_the_wire() {
+        let data: DataCreateServerChannel =
+            serde_json::from_str(r#"{"type":"Voice","name":"AFK","afk":true}"#).unwrap();
+        assert_eq!(data.afk_timeout_never, None);
+
+        let data: DataCreateServerChannel = serde_json::from_str(
+            r#"{"type":"Voice","name":"AFK","afk":true,"afk_timeout_never":true}"#,
+        )
+        .unwrap();
+        assert_eq!(data.afk_timeout_never, Some(true));
+
+        // The field carries the file's serde-default attribute.
+        let source = include_str!("channels.rs");
+        let field = source
+            .find("pub afk_timeout_never: Option<bool>,")
+            .expect("the field exists");
+        let attributes = &source[source[..field].rfind("///").expect("a doc comment")..field];
+        assert!(
+            attributes.contains("#[cfg_attr(feature = \"serde\", serde(default))]"),
+            "afk_timeout_never lost its serde default: {attributes}"
+        );
+    }
+
+    /// The idle beacon's body is exactly `idle_for` (AFK plan Wave 5b-2 wire
+    /// contract). The destructure is exhaustive, so a second field does not
+    /// compile; the round trip pins the wire key and the integer type.
+    #[test]
+    fn afk_idle_body_is_exactly_idle_for() {
+        let DataAfkIdle { idle_for } =
+            serde_json::from_str::<DataAfkIdle>(r#"{"idle_for":90}"#).unwrap();
+        assert_eq!(idle_for, 90);
+        assert_eq!(
+            serde_json::to_value(DataAfkIdle { idle_for: 90 }).unwrap(),
+            serde_json::json!({ "idle_for": 90 })
+        );
+        for invalid in [r#"{"idle_for":-1}"#, r#"{"idle_for":1.5}"#, r#"{}"#] {
+            assert!(
+                serde_json::from_str::<DataAfkIdle>(invalid).is_err(),
+                "{invalid} must be refused"
+            );
+        }
+    }
+
+    /// Absent `rejoin` is the deliberate join; only an explicit `true` asks
+    /// for the rejoin refusal.
+    #[test]
+    fn join_call_rejoin_defaults_to_absent() {
+        let data: DataJoinCall = serde_json::from_str(r#"{"force_disconnect":true}"#).unwrap();
+        assert_eq!(data.rejoin, None);
+        let data: DataJoinCall =
+            serde_json::from_str(r#"{"force_disconnect":true,"rejoin":true}"#).unwrap();
+        assert_eq!(data.rejoin, Some(true));
     }
 }

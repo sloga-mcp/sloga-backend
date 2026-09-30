@@ -2,7 +2,8 @@ use std::collections::HashSet;
 
 use revolt_database::{
     util::{permissions::DatabasePermissionQuery, reference::Reference},
-    Database, File, PartialServer, User, ValidatedTicket,
+    voice::{sync_afk_designation_change, VoiceClient},
+    Database, File, PartialServer, Server, User, ValidatedTicket,
 };
 use revolt_models::v0;
 use revolt_permissions::{calculate_server_permissions, ChannelPermission};
@@ -17,6 +18,7 @@ use validator::Validate;
 #[patch("/<target>", data = "<data>")]
 pub async fn edit(
     db: &State<Database>,
+    voice_client: &State<VoiceClient>,
     user: User,
     target: Reference<'_>,
     data: Json<v0::DataEditServer>,
@@ -33,33 +35,15 @@ pub async fn edit(
     let mut query = DatabasePermissionQuery::new(db, &user).server(&server);
     let permissions = calculate_server_permissions(&mut query).await;
 
-    // Check permissions
-    if data.name.is_none()
-        && data.description.is_none()
-        && data.icon.is_none()
-        && data.banner.is_none()
-        && data.system_messages.is_none()
-        && data.categories.is_none()
-        // && data.nsfw.is_none()
-        && data.flags.is_none()
-        && data.analytics.is_none()
-        && data.discoverable.is_none()
-        && data.discovery_requested.is_none()
-        && data.voice_region.is_none()
-        && data.owner.is_none()
-        && data.remove.is_empty()
-    {
-        return Ok(Json(server.into()));
-    } else if data.name.is_some()
-        || data.description.is_some()
-        || data.icon.is_some()
-        || data.banner.is_some()
-        || data.system_messages.is_some()
-        || data.analytics.is_some()
-        || data.voice_region.is_some()
-        || !data.remove.is_empty()
-    {
-        permissions.throw_if_lacking_channel_permission(ChannelPermission::ManageServer)?;
+    // Check permissions. The decision is `edit_authorization`, by value; this
+    // route has no membership precondition, so this match is the only thing
+    // standing between an arbitrary account and every ManageServer field.
+    match edit_authorization(&data) {
+        EditAuthorization::NothingToEdit => return Ok(Json(server.into())),
+        EditAuthorization::ManageServer => {
+            permissions.throw_if_lacking_channel_permission(ChannelPermission::ManageServer)?;
+        }
+        EditAuthorization::FieldGatesOnly => {}
     }
 
     // A voice region must name a configured LiveKit node; "Auto" is expressed
@@ -75,6 +59,37 @@ pub async fn edit(
             return Err(create_error!(UnknownNode));
         }
     }
+
+    // Shape rules for the AFK pair that need no database round-trip: the
+    // set-and-remove collision, and "a timeout is meaningless without a
+    // channel". Runs BEFORE the resolving validation below so a request that
+    // is self-contradictory is refused on its own terms rather than on
+    // whichever half happened to be looked up first.
+    validate_afk_edit(server.afk_channel_id.as_deref(), &data)?;
+
+    // The AFK designation must resolve to a voice channel in THIS server.
+    // Validated here, before the destructure, mirroring the voice_region check
+    // directly above. The resolved channel is kept so the A5 re-sync at the end
+    // of this route does not have to fetch it a second time.
+    let incoming_afk_channel = if let Some(afk_channel_id) = &data.afk_channel_id {
+        Some(Server::validate_afk_channel(db, &server.id, afk_channel_id).await?)
+    } else {
+        None
+    };
+
+    // Idle timeout is a closed preset set, in SECONDS. Never clamped, so a
+    // rejected value can never land as a silently different one.
+    if let Some(afk_timeout) = data.afk_timeout {
+        Server::validate_afk_timeout(afk_timeout)?;
+    }
+
+    // Captured BEFORE the update mutates `server`, so the A5 re-sync below can
+    // still reach the OUTGOING channel. Note clearing never travels in the
+    // partial: `Server` derives OptionalStruct with opt_some_priority and these
+    // fields are already Option<T>, so the generated assigner is a `replace()`
+    // and writing `afk_channel_id: None` into the partial is a silent no-op.
+    // A clear must arrive as FieldsServer::AfkChannel in `remove`.
+    let previous_afk_channel_id = server.afk_channel_id.clone();
 
     // Check we are the server owner or privileged if changing sensitive fields
     if data.owner.is_some() {
@@ -128,9 +143,30 @@ pub async fn edit(
         discovery_requested,
         analytics,
         voice_region,
+        afk_channel_id,
+        afk_timeout,
         owner,
-        remove,
+        mut remove,
     } = data;
+
+    // One rule, five writers: `AfkTimeout` is meaningless without
+    // `AfkChannel`. The five are this route, `channel_create`, the Discord
+    // import worker, the revision-72 migration and
+    // `Server::clear_afk_channel_if_pointing_at` (from `channel_edit`'s
+    // de-voice block and `Channel::delete`). Only the two routes re-sync
+    // grants; the helper needs none, because both of its callers tear the
+    // room down (see `sync_afk_designation_change`).
+    // `validate_afk_edit` enforces the "setting a timeout needs
+    // a channel" half by rejection; this is the other half, which has to be an
+    // action rather than a rejection because clearing the channel is a
+    // perfectly valid request that simply must not leave an orphan timeout
+    // behind. `Server::clear_afk_channel_if_pointing_at` clears both for the
+    // same reason - see its doc comment, which states the rule once.
+    if remove.contains(&v0::FieldsServer::AfkChannel)
+        && !remove.contains(&v0::FieldsServer::AfkTimeout)
+    {
+        remove.push(v0::FieldsServer::AfkTimeout);
+    }
 
     // Any explicit transition of `discoverable` clears the pending request:
     // approval consumes it, delisting withdraws it. Set server-side, never
@@ -152,6 +188,8 @@ pub async fn edit(
         discovery_requested,
         analytics,
         voice_region,
+        afk_channel_id,
+        afk_timeout,
         owner: owner.clone(),
         ..Default::default()
     };
@@ -226,7 +264,165 @@ pub async fn edit(
         .update(db, partial, remove.into_iter().map(Into::into).collect())
         .await?;
 
+    // A5: re-sync voice permissions on BOTH sides of a designation change.
+    // Without this, flagging an already-occupied channel is inert until some
+    // unrelated role or permission edit happens to trigger a sync.
+    //
+    // Shared with `channel_create`, which writes the same server field and
+    // used to do none of this. The two failure modes the helper keeps apart -
+    // a swallowed resolve on the outgoing side, a propagating `?` on the sync
+    // itself - are documented on it.
+    //
+    // `server` is passed POST-update on purpose: the gate reads
+    // `afk_channel_id` off it.
+    sync_afk_designation_change(
+        db,
+        voice_client,
+        &server,
+        previous_afk_channel_id.as_deref(),
+        incoming_afk_channel.as_ref(),
+    )
+    .await?;
+
     Ok(Json(server.into()))
+}
+
+/// What `edit` demands of the caller before any field-specific gate runs.
+#[derive(Debug, PartialEq, Eq)]
+enum EditAuthorization {
+    /// The request changes nothing. Answered with the current server and no
+    /// permission check, as it always has been.
+    NothingToEdit,
+    /// At least one field in the request needs `ManageServer`.
+    ManageServer,
+    /// Only fields that carry their own gate further down the route: `flags`
+    /// (privileged), `discoverable` / `discovery_requested` (privileged or
+    /// owner), `owner` (owner plus a validated ticket) and `categories`
+    /// (`ManageChannel`).
+    FieldGatesOnly,
+}
+
+/// Which edits need `ManageServer` (AFK Stage 6 F-B1).
+///
+/// Extracted from the route unchanged, so it can be pinned by value.
+/// `server_edit` has NO membership precondition: a field that should be on
+/// the `ManageServer` arm but is not lands with no authorization at all, from
+/// any account, on any server. `afk_channel_id` and `afk_timeout` are the
+/// sharp case - designating an AFK channel hard-mutes everyone in it, the
+/// owner included, and deleting either term used to leave every test green.
+///
+/// `data` is destructured with no `..`, so a field added to `DataEditServer`
+/// does not compile here until it has been placed on one side or the other.
+/// A field missing from the first arm would be silently discarded by the
+/// early return; one missing from the second would skip `ManageServer`.
+fn edit_authorization(data: &v0::DataEditServer) -> EditAuthorization {
+    let v0::DataEditServer {
+        name,
+        description,
+        icon,
+        banner,
+        categories,
+        system_messages,
+        flags,
+        // nsfw,
+        discoverable,
+        discovery_requested,
+        analytics,
+        voice_region,
+        afk_channel_id,
+        afk_timeout,
+        owner,
+        remove,
+    } = data;
+
+    if name.is_none()
+        && description.is_none()
+        && icon.is_none()
+        && banner.is_none()
+        && system_messages.is_none()
+        && categories.is_none()
+        // && nsfw.is_none()
+        && flags.is_none()
+        && analytics.is_none()
+        && discoverable.is_none()
+        && discovery_requested.is_none()
+        && voice_region.is_none()
+        && afk_channel_id.is_none()
+        && afk_timeout.is_none()
+        && owner.is_none()
+        && remove.is_empty()
+    {
+        EditAuthorization::NothingToEdit
+    } else if name.is_some()
+        || description.is_some()
+        || icon.is_some()
+        || banner.is_some()
+        || system_messages.is_some()
+        || analytics.is_some()
+        || voice_region.is_some()
+        || afk_channel_id.is_some()
+        || afk_timeout.is_some()
+        || !remove.is_empty()
+    {
+        EditAuthorization::ManageServer
+    } else {
+        EditAuthorization::FieldGatesOnly
+    }
+}
+
+/// The AFK edit rules that need no database round-trip.
+///
+/// Two defects, one place:
+///
+/// 1. SET-AND-REMOVE COLLISION. `{"afk_channel_id":"X","remove":["AfkChannel"]}`
+///    asks to set and clear one field in a single edit, and the two drivers
+///    disagree about the result. `MongoDb` builds one
+///    `{"$set":.., "$unset":..}` document with no de-duplication
+///    (`drivers/mongodb.rs`) and Mongo rejects the conflicting path outright;
+///    `Reference` applies `remove_field` first and then `apply_options`, so it
+///    lands on `Some("X")`. Either way the `ServerUpdate` that fans out
+///    carries the set AND the clear and contradicts itself. `member_edit`
+///    refuses exactly this class - for `CanPublish`, `CanReceive` and
+///    `VoiceChannel` - with `InvalidOperation`, and documents the reasoning;
+///    this is the same refusal, for the same reason, on the same grounds.
+///
+/// 2. ORPHAN TIMEOUT. `afk_timeout` has meaning only relative to a
+///    destination, so it is refused unless a channel is designated once this
+///    edit lands: either one is arriving in this same request, or the server
+///    already has one and this request is not removing it. `InvalidProperty`,
+///    matching how `Server::validate_afk_timeout` rejects an out-of-set value.
+///
+/// The other half of rule 2 - clearing the channel clears the timeout - is an
+/// action rather than a rejection and lives at the call site, because clearing
+/// the channel is a perfectly valid request that simply must not leave an
+/// orphan behind. `Server::clear_afk_channel_if_pointing_at` states the whole
+/// rule once in its doc comment, and lists the five writers it binds; this is
+/// one of them.
+///
+/// `voice_region` has the same collision gap today. That is a second instance
+/// of the same bug, deliberately left out of scope here - not a reason to
+/// think the gap is acceptable.
+fn validate_afk_edit(
+    current_afk_channel_id: Option<&str>,
+    data: &v0::DataEditServer,
+) -> Result<()> {
+    if (data.afk_channel_id.is_some() && data.remove.contains(&v0::FieldsServer::AfkChannel))
+        || (data.afk_timeout.is_some() && data.remove.contains(&v0::FieldsServer::AfkTimeout))
+    {
+        return Err(create_error!(InvalidOperation));
+    }
+
+    if data.afk_timeout.is_some() {
+        let designated_after_this_edit = data.afk_channel_id.is_some()
+            || (current_afk_channel_id.is_some()
+                && !data.remove.contains(&v0::FieldsServer::AfkChannel));
+
+        if !designated_after_this_edit {
+            return Err(create_error!(InvalidProperty));
+        }
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -234,6 +430,7 @@ mod test {
     use crate::util::test::TestHarness;
     use revolt_database::{Member, PartialUser, Server, Session};
     use revolt_models::v0;
+    use revolt_result::ErrorType;
     use rocket::http::{ContentType, Header, Status};
 
     async fn edit(
@@ -378,5 +575,249 @@ mod test {
         let fetched = harness.db.fetch_server(&server.id).await.unwrap();
         assert!(!fetched.discoverable);
         assert!(!fetched.discovery_requested);
+    }
+
+    /// Wave-2 audit finding 2 (MEDIUM). Regression test.
+    ///
+    /// Setting and removing the same field in one edit diverged by driver:
+    /// Mongo rejected the conflicting `$set`/`$unset` path pair, the reference
+    /// driver landed on the set value, and the event carried both. Refused
+    /// here the way `member_edit` refuses its three equivalents.
+    #[test]
+    fn afk_set_and_remove_in_one_edit_is_refused() {
+        for body in [
+            json!({ "afk_channel_id": "01ARZ3NDEKTSV4RRFFQ69G5FAV", "remove": ["AfkChannel"] }),
+            json!({ "afk_timeout": 300, "remove": ["AfkTimeout"] }),
+            // Both pairs at once, plus an unrelated field, still refused.
+            json!({
+                "name": "Somewhere",
+                "afk_channel_id": "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+                "afk_timeout": 300,
+                "remove": ["AfkChannel", "AfkTimeout"]
+            }),
+        ] {
+            let data: v0::DataEditServer = serde_json::from_value(body).expect("`DataEditServer`");
+            let error = super::validate_afk_edit(None, &data)
+                .expect_err("set-and-remove of one field must be refused");
+
+            assert!(matches!(error.error_type, ErrorType::InvalidOperation));
+        }
+    }
+
+    /// Wave-2 audit finding 4 (LOW). Regression test for one half of the rule:
+    /// `AfkTimeout` is meaningless without `AfkChannel`, so a timeout is only
+    /// accepted when a channel is designated once the edit lands.
+    #[test]
+    fn afk_timeout_requires_a_designated_channel() {
+        // No channel on the server, none arriving.
+        let data: v0::DataEditServer =
+            serde_json::from_value(json!({ "afk_timeout": 300 })).expect("`DataEditServer`");
+        let error = super::validate_afk_edit(None, &data)
+            .expect_err("a timeout with no destination is meaningless");
+        assert!(matches!(error.error_type, ErrorType::InvalidProperty));
+
+        // A channel is being cleared in the same edit, so none remains.
+        let data: v0::DataEditServer =
+            serde_json::from_value(json!({ "afk_timeout": 300, "remove": ["AfkChannel"] }))
+                .expect("`DataEditServer`");
+        let error = super::validate_afk_edit(Some("01ARZ3NDEKTSV4RRFFQ69G5FAV"), &data)
+            .expect_err("clearing the channel leaves the timeout orphaned");
+        assert!(matches!(error.error_type, ErrorType::InvalidProperty));
+
+        // Channel arriving in the same request: accepted.
+        let data: v0::DataEditServer = serde_json::from_value(
+            json!({ "afk_channel_id": "01ARZ3NDEKTSV4RRFFQ69G5FAV", "afk_timeout": 300 }),
+        )
+        .expect("`DataEditServer`");
+        assert!(super::validate_afk_edit(None, &data).is_ok());
+
+        // Channel already designated and not being removed: accepted.
+        let data: v0::DataEditServer =
+            serde_json::from_value(json!({ "afk_timeout": 300 })).expect("`DataEditServer`");
+        assert!(super::validate_afk_edit(Some("01ARZ3NDEKTSV4RRFFQ69G5FAV"), &data).is_ok());
+    }
+
+    /// Guard against the two rules above turning into a blanket refusal:
+    /// edits that say nothing about AFK must pass through untouched, and so
+    /// must a plain designation or a plain clear.
+    #[test]
+    fn afk_rules_leave_unrelated_edits_alone() {
+        for (current, body) in [
+            (None, json!({})),
+            (None, json!({ "name": "Somewhere" })),
+            (None, json!({ "remove": ["Banner", "Icon"] })),
+            (
+                None,
+                json!({ "afk_channel_id": "01ARZ3NDEKTSV4RRFFQ69G5FAV" }),
+            ),
+            (
+                Some("01ARZ3NDEKTSV4RRFFQ69G5FAV"),
+                json!({ "remove": ["AfkChannel"] }),
+            ),
+            (
+                Some("01ARZ3NDEKTSV4RRFFQ69G5FAV"),
+                json!({ "remove": ["AfkTimeout"] }),
+            ),
+        ] {
+            let data: v0::DataEditServer = serde_json::from_value(body).expect("`DataEditServer`");
+            assert!(super::validate_afk_edit(current, &data).is_ok());
+        }
+    }
+
+    // ---- which edits need ManageServer (AFK Stage 6 F-B1) ----------------
+
+    fn authorization(body: serde_json::Value) -> super::EditAuthorization {
+        let data: v0::DataEditServer =
+            serde_json::from_value(body.clone()).expect("`DataEditServer`");
+        super::edit_authorization(&data)
+    }
+
+    /// The AFK pair, each on its own. This route has no membership check, so
+    /// without these an arbitrary account could designate another server's
+    /// AFK channel - hard-muting everyone in it, the owner too.
+    #[test]
+    fn the_afk_fields_each_need_manage_server_on_their_own() {
+        for body in [
+            json!({ "afk_channel_id": "01ARZ3NDEKTSV4RRFFQ69G5FAV" }),
+            json!({ "afk_timeout": 300 }),
+            json!({ "remove": ["AfkChannel"] }),
+            json!({ "remove": ["AfkTimeout"] }),
+        ] {
+            assert_eq!(
+                authorization(body.clone()),
+                super::EditAuthorization::ManageServer,
+                "{body} must need ManageServer"
+            );
+        }
+    }
+
+    /// Every other field that needed ManageServer before the extraction still
+    /// does, one at a time, and so does every `remove` entry.
+    #[test]
+    fn every_other_manage_server_field_still_needs_it() {
+        for body in [
+            json!({ "name": "Somewhere" }),
+            json!({ "description": "About" }),
+            json!({ "icon": "01ARZ3NDEKTSV4RRFFQ69G5FAV" }),
+            json!({ "banner": "01ARZ3NDEKTSV4RRFFQ69G5FAV" }),
+            json!({ "system_messages": {} }),
+            json!({ "analytics": true }),
+            json!({ "voice_region": "worldwide" }),
+            json!({ "remove": ["Description"] }),
+            json!({ "remove": ["Categories"] }),
+            json!({ "remove": ["SystemMessages"] }),
+            json!({ "remove": ["Icon"] }),
+            json!({ "remove": ["Banner"] }),
+            json!({ "remove": ["VoiceRegion"] }),
+            // A field with its own gate never waives ManageServer for a
+            // ManageServer field in the same request.
+            json!({ "flags": 1, "afk_channel_id": "01ARZ3NDEKTSV4RRFFQ69G5FAV" }),
+            json!({ "owner": "01ARZ3NDEKTSV4RRFFQ69G5FAV", "afk_timeout": 300 }),
+        ] {
+            assert_eq!(
+                authorization(body.clone()),
+                super::EditAuthorization::ManageServer,
+                "{body} must need ManageServer"
+            );
+        }
+    }
+
+    /// The fields that never needed ManageServer keep that answer: each is
+    /// gated further down the route on its own terms (privileged, owner, or
+    /// ManageChannel). Pinned so the extraction changed nothing.
+    #[test]
+    fn fields_with_their_own_gate_do_not_need_manage_server() {
+        for body in [
+            json!({ "categories": [] }),
+            json!({ "flags": 1 }),
+            json!({ "discoverable": true }),
+            json!({ "discoverable": false }),
+            json!({ "discovery_requested": true }),
+            json!({ "owner": "01ARZ3NDEKTSV4RRFFQ69G5FAV" }),
+        ] {
+            assert_eq!(
+                authorization(body.clone()),
+                super::EditAuthorization::FieldGatesOnly,
+                "{body} is gated elsewhere in the route"
+            );
+        }
+    }
+
+    /// The empty edit is the early return, unchecked, as before.
+    #[test]
+    fn the_empty_edit_changes_nothing() {
+        for body in [json!({}), json!({ "remove": [] })] {
+            assert_eq!(
+                authorization(body.clone()),
+                super::EditAuthorization::NothingToEdit,
+                "{body} is the no-op"
+            );
+        }
+    }
+
+    /// `edit`'s body, comment lines dropped and whitespace collapsed.
+    fn route_body() -> String {
+        const SOURCE: &str = include_str!("server_edit.rs");
+        let at = SOURCE
+            .find("pub async fn edit(")
+            .expect("the route is defined");
+        let open = at + SOURCE[at..].find('\u{7b}').expect("a body");
+        let mut depth = 0usize;
+        let mut close = None;
+        for (i, ch) in SOURCE[open..].char_indices() {
+            match ch {
+                '\u{7b}' => depth += 1,
+                '\u{7d}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        close = Some(open + i);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        SOURCE[open..=close.expect("a closed body")]
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join(" ")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    /// The value tests above only matter if the route acts on the answer: it
+    /// calls `edit_authorization` once, returns on `NothingToEdit`, demands
+    /// `ManageServer` on `ManageServer`, and does so before it validates,
+    /// writes or syncs anything.
+    #[test]
+    fn the_route_demands_manage_server_from_the_decision() {
+        let body = route_body();
+        const GATE: &str = "match edit_authorization(&data) \u{7b} \
+             EditAuthorization::NothingToEdit => return Ok(Json(server.into())), \
+             EditAuthorization::ManageServer => \u{7b} \
+             permissions.throw_if_lacking_channel_permission(ChannelPermission::ManageServer)?; \
+             \u{7d} EditAuthorization::FieldGatesOnly => \u{7b}\u{7d} \u{7d}";
+
+        assert_eq!(
+            body.matches(GATE).count(),
+            1,
+            "the route must gate on `edit_authorization` exactly once: {body}"
+        );
+        assert_eq!(body.matches("edit_authorization(").count(), 1, "{body}");
+        let gate = body.find(GATE).expect("counted above");
+        for later in [
+            "validate_afk_edit(",
+            "Server::validate_afk_channel(",
+            "db.mark_attachment_as_deleted(",
+            ".update(db, partial,",
+            "sync_afk_designation_change(",
+        ] {
+            let at = body
+                .find(later)
+                .unwrap_or_else(|| panic!("the route lost `{}`: {}", later, body));
+            assert!(gate < at, "the gate must precede `{}`: {}", later, body);
+        }
     }
 }

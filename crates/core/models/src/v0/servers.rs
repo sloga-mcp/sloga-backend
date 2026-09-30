@@ -105,6 +105,14 @@ auto_derived_partial!(
         /// advertised under `features.livekit.nodes`); absent = automatic
         #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
         pub voice_region: Option<String>,
+
+        /// Id of this server's AFK voice channel; absent = none designated
+        #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+        pub afk_channel_id: Option<String>,
+        /// Idle timeout in SECONDS before a member is moved to the AFK
+        /// channel; absent = no auto-move
+        #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+        pub afk_timeout: Option<u32>,
     },
     "PartialServer"
 );
@@ -149,6 +157,8 @@ auto_derived!(
         Icon,
         Banner,
         VoiceRegion,
+        AfkChannel,
+        AfkTimeout,
     }
 
     /// Optional fields on server object
@@ -289,6 +299,13 @@ auto_derived!(
         /// Preferred voice node (a name advertised under `features.livekit.nodes`).
         /// Remove `VoiceRegion` to return to automatic selection.
         pub voice_region: Option<String>,
+
+        /// Id of the voice channel to designate as this server's AFK channel.
+        /// Remove `AfkChannel` to clear the designation.
+        pub afk_channel_id: Option<String>,
+        /// Idle timeout in SECONDS before a member is moved to the AFK
+        /// channel. Remove `AfkTimeout` to disable the auto-move.
+        pub afk_timeout: Option<u32>,
 
         /// User id of the new owner
         pub owner: Option<String>,

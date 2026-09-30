@@ -643,15 +643,16 @@ pub async fn end_remote_control_grant(
                 .await
             {
                 // Both legs failed. The records are still deleted below,
-                // and deliberately so: by far the most common way to reach
-                // here is that the participant is simply already gone (the
-                // SFU errors on an unknown identity for BOTH calls), and
-                // keeping the records then would leak a grant nothing ever
-                // clears while the sharer's indicator stayed lit forever.
-                // The residual risk is bounded — the only other way both
-                // legs fail is the node being unreachable, and a controller
-                // cannot use a data-channel capability on an SFU that is
-                // not routing for them either.
+                // and deliberately so: keeping them would leak a grant
+                // nothing ever clears while the sharer's indicator stayed
+                // lit forever. A controller that had already left never
+                // gets here (the revoke push answers that case as done, see
+                // `revoke_controller_capability`); one that leaves between
+                // the push and this ejection still can, and the SFU then
+                // errors on the unknown identity. The residual risk is
+                // bounded — the other way both legs fail is the node being
+                // unreachable, and a controller cannot use a data-channel
+                // capability on an SFU that is not routing for them either.
                 log::error!(
                     "remote control: ejection ALSO failed for grant {} (controller {} in {}): {error:?}",
                     grant.id,
@@ -699,6 +700,13 @@ pub async fn end_remote_control_grant(
 
 /// Recompute the controller's full permission set and push it with
 /// `can_publish_data: false` — the active revoke leg of teardown.
+///
+/// The SFU answering that the controller is not in the room is `Ok`: the
+/// capability is held by that participant and ended with it, so there is
+/// nothing left to revoke, and escalating to an ejection would only be a
+/// second guaranteed-failing call after an ERROR log and a Sentry event
+/// (AFK S-3 D-7). Any other failure is still an `Err`, reported by the
+/// push exactly as before, and the caller still escalates it to ejection.
 async fn revoke_controller_capability(
     db: &Database,
     voice_client: &VoiceClient,
@@ -717,33 +725,57 @@ async fn revoke_controller_capability(
     let mut query = DatabasePermissionQuery::new(db, &controller).channel(&channel);
     let permissions = calculate_channel_permissions(&mut query).await;
     let limits = controller.limits().await;
-    let allowed_sources = super::get_allowed_sources(&limits, permissions);
+    // AFK gate (plan D2 / audit CRITICAL-1). This is the RC teardown leg: it
+    // RE-PUSHES a freshly recomputed source set, so an ungated recompute here
+    // would hand every publish source back the moment control was revoked —
+    // the mute defeated by revoking the very thing that defeated it. No server
+    // document is in hand, so the gate fetches its own.
+    let allowed_sources = super::get_allowed_sources(
+        &limits,
+        permissions,
+        super::AfkGate::resolve(db, &channel, None).await?,
+    );
     let can_listen = permissions.has_channel_permission(ChannelPermission::Listen);
 
-    voice_client
-        .update_permissions_identity(
+    let pushed = voice_client
+        .update_permissions_identity_if_present(
             &grant.node,
             &grant.controller_identity,
             &grant.channel_id,
             super::voice_participant_permissions(can_listen, &allowed_sources),
         )
-        .await
-        .map(|_| ())
+        .await?;
+    if !pushed {
+        log::info!(
+            "remote control: controller {} of grant {} had already left {}, nothing to revoke",
+            grant.controller_identity,
+            grant.id,
+            grant.channel_id
+        );
+    }
+
+    Ok(())
 }
 
 /// Release hook: end any grant involving `user_id` in `channel` — as sharer
-/// or as controller.
+/// or as controller — whichever of the user's connections holds it.
 ///
-/// `participant_already_gone` is for the ONE path where the SFU has already
-/// told us the participant is gone (the `participant_left` webhook): there
-/// the controller's capability died with their participant, so revoking it
-/// would only produce a guaranteed-failing round trip. Every other caller
-/// must pass `false`, INCLUDING the delta-initiated removals that are about
-/// to eject the user — those call `remove_user` best-effort (errors
-/// discarded, and the identity re-resolution behind it can silently no-op
-/// for a device-qualified participant), so deleting the records first on
-/// the assumption the removal will work is exactly how a capability
-/// survives with nothing left able to revoke it.
+/// This is the WHOLE-USER release, for paths that take every connection of
+/// the user out of the call (or end the share itself). A single connection
+/// leaving (the `participant_left` webhook) goes through
+/// [`release_remote_control_for_connection`] instead, which leaves a
+/// controller grant held by a DIFFERENT, still-connected connection alone.
+///
+/// `participant_already_gone` may only be `true` when the SFU has already
+/// told us that the connection holding the controller capability is gone:
+/// the capability then died with that participant, so revoking it would
+/// only produce a guaranteed-failing round trip. Every other caller must
+/// pass `false`, INCLUDING the delta-initiated removals that are about
+/// to eject the user — their eviction (`remove_user_if_present_sids`, the
+/// voice move's own evictions, the force-disconnect's best-effort one) can
+/// still fail and leave the connection in the call, so deleting the records
+/// first on the assumption the removal will work is exactly how a
+/// capability survives with nothing left able to revoke it.
 pub async fn release_remote_control_for_user(
     db: &Database,
     voice_client: &VoiceClient,
@@ -751,6 +783,107 @@ pub async fn release_remote_control_for_user(
     user_id: &str,
     reason: &str,
     participant_already_gone: bool,
+) {
+    release_remote_control(
+        db,
+        voice_client,
+        channel,
+        user_id,
+        reason,
+        ControllerRelease::WholeUser {
+            participant_already_gone,
+        },
+    )
+    .await;
+}
+
+/// Release hook for ONE connection of `user_id` leaving `channel` (the
+/// `participant_left` webhook, where `identity` is the SFU identity that
+/// left). AFK S-3 D-7.
+///
+/// - **As SHARER:** the user's grant in this channel is ended, WITH an
+///   active revoke, whichever of their connections left. The grant records
+///   no sharer identity to be finer with, and server state may only ever
+///   revoke a session, never sustain one — so a sharer with two devices
+///   loses the session when EITHER leaves (decision DS-3). Their
+///   controller's capability is live whatever happened to the sharer's
+///   participant, hence the revoke.
+/// - **As CONTROLLER:** the grant is ended only when `identity` is the
+///   grant's `controller_identity`, the exact connection that holds the
+///   capability, and then WITH an active revoke (AFK S-3 WB-11). An
+///   identity is not a connection: a bare `{user}` identity (or a device's)
+///   is reused by the next connection of the same seat, so the leave of an
+///   OLD connection can arrive after a NEW connection under the same
+///   identity accepted a NEW grant. Ending that grant without a revoke
+///   stranded the new connection's `can_publish_data` with no record left
+///   to revoke it through. The revoke of a controller who really has left
+///   costs one push that the SFU answers `not_found`, which
+///   `revoke_controller_capability` takes as done: no ERROR, no ejection.
+///   Any other connection of the same user leaving leaves the grant
+///   untouched — the controlling connection is still live, and ending the
+///   record at all would be the same stranding (Stage 1 F-9).
+pub async fn release_remote_control_for_connection(
+    db: &Database,
+    voice_client: &VoiceClient,
+    channel: &UserVoiceChannel,
+    user_id: &str,
+    identity: &str,
+    reason: &str,
+) {
+    release_remote_control(
+        db,
+        voice_client,
+        channel,
+        user_id,
+        reason,
+        ControllerRelease::Connection { identity },
+    )
+    .await;
+}
+
+/// Which of a user's CONTROLLER grants a release ends, and how.
+#[derive(Debug, Clone, Copy)]
+enum ControllerRelease<'a> {
+    /// Every connection of the user: end the grant whichever connection
+    /// holds it, revoking unless the SFU already reported that participant
+    /// gone.
+    WholeUser { participant_already_gone: bool },
+    /// One connection, by its SFU identity, which the SFU reported gone.
+    /// Always revokes (WB-11): the identity may already belong to a newer
+    /// connection holding a newer grant.
+    Connection { identity: &'a str },
+}
+
+impl ControllerRelease<'_> {
+    /// Whether this release ends `grant`, a controller grant of the user in
+    /// the released channel.
+    fn ends(&self, grant: &RemoteControlGrant) -> bool {
+        match self {
+            Self::WholeUser { .. } => true,
+            Self::Connection { identity } => *identity == grant.controller_identity,
+        }
+    }
+
+    /// Whether ending it must actively revoke the capability.
+    fn revokes(&self) -> bool {
+        match self {
+            Self::WholeUser {
+                participant_already_gone,
+            } => !participant_already_gone,
+            Self::Connection { .. } => true,
+        }
+    }
+}
+
+/// The body both release hooks share: the sharer arm always ends WITH a
+/// revoke; the controller arm is decided by `controller`.
+async fn release_remote_control(
+    db: &Database,
+    voice_client: &VoiceClient,
+    channel: &UserVoiceChannel,
+    user_id: &str,
+    reason: &str,
+    controller: ControllerRelease<'_>,
 ) {
     // Cheap short-circuit: the overwhelming majority of calls are for
     // channels with no grant at all, and this hook sits in the permission-
@@ -781,15 +914,8 @@ pub async fn release_remote_control_for_user(
     // Grants where the user is the CONTROLLER (cross-channel index, filter
     // to this channel)
     match fetch_remote_control_grant_for_controller(user_id).await {
-        Ok(Some(grant)) if grant.channel_id == channel.id => {
-            end_remote_control_grant(
-                db,
-                voice_client,
-                &grant,
-                reason,
-                !participant_already_gone,
-            )
-            .await;
+        Ok(Some(grant)) if grant.channel_id == channel.id && controller.ends(&grant) => {
+            end_remote_control_grant(db, voice_client, &grant, reason, controller.revokes()).await;
         }
         Ok(_) => {}
         Err(error) => log::warn!(
@@ -828,15 +954,10 @@ pub async fn release_remote_control_for_channel(
 mod tests {
     use super::*;
 
+    /// The voice module's shared Redis-test runtime (see `voice::tests::rt`
+    /// for why a second runtime poisons the global connection pool).
     fn rt() -> &'static tokio::runtime::Runtime {
-        static RT: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
-        RT.get_or_init(|| {
-            tokio::runtime::Builder::new_multi_thread()
-                .worker_threads(1)
-                .enable_all()
-                .build()
-                .unwrap()
-        })
+        super::super::tests::rt()
     }
 
     fn offer(suffix: &str) -> RemoteControlOffer {
@@ -1101,6 +1222,360 @@ mod tests {
                 .await
                 .unwrap()
                 .contains(&first.expiry_member()));
+        })
+    }
+
+    // ---- connection-scoped release (AFK S-3 D-7) ----
+    //
+    // The real release against the Reference driver, live Redis and the
+    // mock SFU. Every stub answers a path it was not given with a 500 and
+    // records every request, so "no revoke" and "no ejection" are read off
+    // the requests the SFU actually received.
+
+    use super::super::voice_client::sfu_stub::{
+        self, internal, not_found, ok, routes, Stub, NODE, REMOVE, UPDATE,
+    };
+
+    /// A device suffix for a device-qualified SFU identity.
+    const DEVICE: &str = "DEVICEA";
+
+    fn requests(list: &[(&str, &str)]) -> Vec<(String, String)> {
+        list.iter()
+            .map(|(path, identity)| (path.to_string(), identity.to_string()))
+            .collect()
+    }
+
+    /// A server voice channel with a controller who is a member of it, and
+    /// an UNSTORED grant in it held by that controller's device-qualified
+    /// connection. The revoke recomputes the controller's permissions from
+    /// the channel, the user and the server, so all three are real.
+    async fn release_fixture() -> (Database, UserVoiceChannel, RemoteControlGrant) {
+        use crate::{Channel, Member, Server, User};
+        use revolt_models::v0::{
+            DataCreateServer, DataCreateServerChannel, LegacyServerChannelType,
+        };
+
+        let db = Database::Reference(Default::default());
+        let owner = User::create(&db, "RcReleaseOwner".to_string(), None, None)
+            .await
+            .expect("`User`");
+        let mut server = Server::create(
+            &db,
+            DataCreateServer {
+                name: "RcReleaseServer".to_string(),
+                description: None,
+                nsfw: None,
+            },
+            &owner,
+            false,
+        )
+        .await
+        .expect("`Server`")
+        .0;
+        let channel = Channel::create_server_channel(
+            &db,
+            &mut server,
+            DataCreateServerChannel {
+                channel_type: LegacyServerChannelType::Voice,
+                name: "Lounge".to_string(),
+                ..Default::default()
+            },
+            true,
+        )
+        .await
+        .expect("`Channel`");
+        let controller = User::create(&db, "RcReleaseController".to_string(), None, None)
+            .await
+            .expect("`User`");
+        Member::create(&db, &server, &controller, None)
+            .await
+            .expect("`Member`");
+
+        let channel = UserVoiceChannel::from_channel(&channel);
+        let grant = RemoteControlGrant {
+            id: ulid::Ulid::new().to_string(),
+            channel_id: channel.id.clone(),
+            server_id: Some(server.id.clone()),
+            node: NODE.to_string(),
+            sharer_id: format!("sharer{}", ulid::Ulid::new()),
+            controller_id: controller.id.clone(),
+            controller_identity: format!("{}:{DEVICE}", controller.id),
+            input_class: INPUT_CLASS_KBM.to_string(),
+        };
+
+        (db, channel, grant)
+    }
+
+    async fn store(grant: &RemoteControlGrant) {
+        assert_eq!(
+            create_remote_control_grant(grant).await.unwrap(),
+            RemoteControlGrantOutcome::Created
+        );
+    }
+
+    /// Whether the grant is still findable through the sharer key, the
+    /// controller index and the channel's grant set.
+    async fn grant_present(grant: &RemoteControlGrant) -> [bool; 3] {
+        [
+            fetch_remote_control_grant(&grant.channel_id, &grant.sharer_id)
+                .await
+                .unwrap()
+                .as_ref()
+                == Some(grant),
+            fetch_remote_control_grant_for_controller(&grant.controller_id)
+                .await
+                .unwrap()
+                .as_ref()
+                == Some(grant),
+            remote_control_grants_in_channel(&grant.channel_id)
+                .await
+                .unwrap()
+                .contains(grant),
+        ]
+    }
+
+    /// F-9: a connection of the controller USER that is not the connection
+    /// holding the capability leaving — a second device, or the bare
+    /// identity — ends nothing and sends nothing. Ending the record here
+    /// without a revoke would leave the still-connected controller holding
+    /// `can_publish_data` with no record left to revoke it through.
+    #[test]
+    fn a_non_controller_connection_leaving_keeps_the_controller_grant() {
+        rt().block_on(async {
+            let (db, channel, grant) = release_fixture().await;
+            store(&grant).await;
+
+            let stub = Stub::serve(routes(vec![]));
+            let voice_client = sfu_stub::voice_client(stub.url());
+
+            for identity in [
+                grant.controller_id.clone(),
+                format!("{}:OTHERDEVICE", grant.controller_id),
+            ] {
+                assert_ne!(identity, grant.controller_identity);
+                release_remote_control_for_connection(
+                    &db,
+                    &voice_client,
+                    &channel,
+                    &grant.controller_id,
+                    &identity,
+                    "participant_left",
+                )
+                .await;
+                assert_eq!(
+                    grant_present(&grant).await,
+                    [true; 3],
+                    "{identity} is not the controlling connection, so the \
+                     grant must survive its leave"
+                );
+            }
+
+            assert_eq!(
+                stub.finish(),
+                requests(&[]),
+                "no revoke and no ejection may reach the SFU for a live controller"
+            );
+
+            delete_remote_control_grant_records(&grant).await.unwrap();
+        })
+    }
+
+    /// The controlling connection leaving ends the grant everywhere, WITH a
+    /// revoke (AFK S-3 WB-11): the identity that left may already be held
+    /// by a newer connection that accepted a newer grant, and ending that
+    /// one silently would strand its `can_publish_data`. Here the controller
+    /// really has left, so the SFU answers the ONE permission push
+    /// `not_found`, which is the revoke done: no ejection follows. Mutations:
+    /// the revoke skipped for a connection leave (no push at all); a
+    /// `not_found` escalated to an ejection (a second request).
+    #[test]
+    fn the_controller_connection_leaving_ends_the_grant_with_a_revoke() {
+        rt().block_on(async {
+            let (db, channel, grant) = release_fixture().await;
+            store(&grant).await;
+
+            let stub = Stub::serve(routes(vec![
+                (UPDATE, not_found()),
+                (REMOVE, ok(Vec::new())),
+            ]));
+            let voice_client = sfu_stub::voice_client(stub.url());
+
+            release_remote_control_for_connection(
+                &db,
+                &voice_client,
+                &channel,
+                &grant.controller_id,
+                &grant.controller_identity,
+                "participant_left",
+            )
+            .await;
+
+            assert_eq!(grant_present(&grant).await, [false; 3]);
+            assert_eq!(
+                stub.finish(),
+                requests(&[(UPDATE, &grant.controller_identity)]),
+                "the controlling identity is revoked once, and a departed \
+                 controller is never ejected"
+            );
+        })
+    }
+
+    /// DS-3: ANY connection of the sharer leaving — bare or device-qualified,
+    /// whatever device the share came from — ends the sharer's grant WITH an
+    /// active revoke of the controller's capability, which is still live.
+    /// The revoke is the full sync set with data publishing off, addressed
+    /// to the controller identity captured at accept.
+    #[test]
+    fn any_sharer_connection_leaving_ends_the_grant_with_a_revoke() {
+        rt().block_on(async {
+            let (db, channel, template) = release_fixture().await;
+
+            for leaving in [
+                template.sharer_id.clone(),
+                format!("{}:{DEVICE}", template.sharer_id),
+                format!("{}:OTHERDEVICE", template.sharer_id),
+            ] {
+                let grant = RemoteControlGrant {
+                    id: ulid::Ulid::new().to_string(),
+                    ..template.clone()
+                };
+                store(&grant).await;
+
+                let pushed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+                let stub = {
+                    let pushed = pushed.clone();
+                    Stub::serve(move |path, body| match path {
+                        UPDATE => {
+                            pushed.lock().unwrap().push(sfu_stub::permission(body));
+                            ok(Vec::new())
+                        }
+                        _ => internal(),
+                    })
+                };
+                let voice_client = sfu_stub::voice_client(stub.url());
+
+                release_remote_control_for_connection(
+                    &db,
+                    &voice_client,
+                    &channel,
+                    &grant.sharer_id,
+                    &leaving,
+                    "participant_left",
+                )
+                .await;
+
+                assert_eq!(
+                    grant_present(&grant).await,
+                    [false; 3],
+                    "{leaving} leaving must end the sharer's grant"
+                );
+                assert_eq!(
+                    stub.finish(),
+                    requests(&[(UPDATE, &grant.controller_identity)]),
+                    "{leaving} leaving must revoke the controller, once, by \
+                     the identity captured at accept"
+                );
+                let pushed = pushed.lock().unwrap();
+                assert_eq!(pushed.len(), 1);
+                let permission = pushed[0].as_ref().expect("a permission was pushed");
+                assert!(
+                    !permission.can_publish_data,
+                    "the revoke must turn data off"
+                );
+            }
+        })
+    }
+
+    /// The revoke push addressed to a controller who has ALREADY left: the
+    /// SFU's not_found is the answer "nothing left to revoke" — the revoke
+    /// is `Ok`, no ejection follows, and the grant is still cleaned up.
+    #[test]
+    fn a_revoke_of_a_departed_controller_is_done_not_escalated() {
+        rt().block_on(async {
+            let (db, channel, grant) = release_fixture().await;
+
+            // The revoke on its own: Ok, one push, nothing else.
+            let stub = Stub::serve(routes(vec![
+                (UPDATE, not_found()),
+                (REMOVE, ok(Vec::new())),
+            ]));
+            let voice_client = sfu_stub::voice_client(stub.url());
+            let revoked = revoke_controller_capability(&db, &voice_client, &grant).await;
+            assert!(
+                revoked.is_ok(),
+                "a controller that already left has nothing to revoke: {revoked:?}"
+            );
+            assert_eq!(
+                stub.finish(),
+                requests(&[(UPDATE, &grant.controller_identity)])
+            );
+
+            // Through the release: the sharer leaves, the revoke finds the
+            // controller gone, and no ejection is sent.
+            store(&grant).await;
+            let stub = Stub::serve(routes(vec![
+                (UPDATE, not_found()),
+                (REMOVE, ok(Vec::new())),
+            ]));
+            let voice_client = sfu_stub::voice_client(stub.url());
+            release_remote_control_for_connection(
+                &db,
+                &voice_client,
+                &channel,
+                &grant.sharer_id,
+                &grant.sharer_id,
+                "participant_left",
+            )
+            .await;
+
+            assert_eq!(grant_present(&grant).await, [false; 3]);
+            assert_eq!(
+                stub.finish(),
+                requests(&[(UPDATE, &grant.controller_identity)]),
+                "a departed controller must not be ejected after the revoke"
+            );
+        })
+    }
+
+    /// Control for the case above: a REAL revoke failure is still an error
+    /// and still escalates to ejecting the controller (fail closed).
+    #[test]
+    fn a_failed_revoke_still_escalates_to_ejection() {
+        rt().block_on(async {
+            let (db, channel, grant) = release_fixture().await;
+
+            let stub = Stub::serve(routes(vec![(REMOVE, ok(Vec::new()))]));
+            let voice_client = sfu_stub::voice_client(stub.url());
+            assert!(revoke_controller_capability(&db, &voice_client, &grant)
+                .await
+                .is_err());
+            assert_eq!(
+                stub.finish(),
+                requests(&[(UPDATE, &grant.controller_identity)])
+            );
+
+            store(&grant).await;
+            let stub = Stub::serve(routes(vec![(REMOVE, ok(Vec::new()))]));
+            let voice_client = sfu_stub::voice_client(stub.url());
+            release_remote_control_for_connection(
+                &db,
+                &voice_client,
+                &channel,
+                &grant.sharer_id,
+                &grant.sharer_id,
+                "participant_left",
+            )
+            .await;
+
+            assert_eq!(grant_present(&grant).await, [false; 3]);
+            assert_eq!(
+                stub.finish(),
+                requests(&[
+                    (UPDATE, &grant.controller_identity),
+                    (REMOVE, &grant.controller_identity),
+                ]),
+                "a revoke that really failed must still eject the controller"
+            );
         })
     }
 }

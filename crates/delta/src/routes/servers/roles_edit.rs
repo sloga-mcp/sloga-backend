@@ -1,6 +1,5 @@
 use revolt_database::{
     util::{permissions::DatabasePermissionQuery, reference::Reference},
-    voice::{sync_voice_permissions, VoiceClient},
     Database, File, PartialRole, User,
 };
 use revolt_models::v0;
@@ -16,7 +15,6 @@ use validator::Validate;
 #[patch("/<target>/roles/<role_id>", data = "<data>", rank = 1)]
 pub async fn edit(
     db: &State<Database>,
-    voice_client: &State<VoiceClient>,
     user: User,
     target: Reference<'_>,
     role_id: String,
@@ -79,12 +77,11 @@ pub async fn edit(
         )
         .await?;
 
-        for channel_id in &server.channels {
-            let channel = Reference::from_unchecked(channel_id).as_channel(db).await?;
-
-            sync_voice_permissions(db, voice_client, &channel, Some(&server), Some(&role_id))
-                .await?;
-        }
+        // No voice permission sync here (AFK S-3 F-7): `DataEditRole` only
+        // changes the name, colour, hoist and icon, none of which a grant
+        // reads, and `server` no longer holds this role (it was removed from
+        // the in-memory document above), so a sync would compute every holder
+        // as if they lacked it.
 
         Ok(Json(role.into()))
     } else {
