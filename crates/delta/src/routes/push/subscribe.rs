@@ -131,6 +131,10 @@ mod tests {
     use revolt_models::v0;
     use revolt_result::ErrorType;
 
+    use crate::util::test::TestHarness;
+    use revolt_result::Error;
+    use rocket::http::{ContentType, Header, Status};
+
     #[test]
     fn accepts_every_endpoint_shape_seen_in_prod() {
         for endpoint in [
@@ -338,5 +342,159 @@ mod tests {
                 ..valid()
             });
         }
+    }
+
+    /// A ntfy-style UnifiedPush endpoint on a host no browser pushes through
+    const UNIFIEDPUSH_ENDPOINT: &str = "https://ntfy.sh/upAbC123?up=1";
+
+    const BROWSER_ENDPOINT: &str = "https://fcm.googleapis.com/fcm/send/abc:def";
+
+    fn subscribe_body(endpoint: &str, kind: Option<&str>) -> serde_json::Value {
+        let mut body = json!({
+            "endpoint": endpoint,
+            "p256dh": URL_SAFE_NO_PAD.encode(p256dh()),
+            "auth": URL_SAFE_NO_PAD.encode([7u8; 16]),
+        });
+        if let Some(kind) = kind {
+            body["kind"] = json!(kind);
+        }
+        body
+    }
+
+    /// POST `body` to the route as the session holding `token`, returning
+    /// the status and the response body.
+    async fn post_subscribe(
+        harness: &TestHarness,
+        token: &str,
+        body: serde_json::Value,
+    ) -> (Status, String) {
+        let res = harness
+            .client
+            .post("/push/subscribe")
+            .header(ContentType::JSON)
+            .header(Header::new("X-Session-Token", token.to_string()))
+            .body(body.to_string())
+            .dispatch()
+            .await;
+        let status = res.status();
+        (status, res.into_string().await.unwrap_or_default())
+    }
+
+    async fn stored_subscription(
+        harness: &TestHarness,
+        session_id: &str,
+    ) -> Option<revolt_database::WebPushSubscription> {
+        harness
+            .db
+            .fetch_session(session_id)
+            .await
+            .expect("session should exist")
+            .subscription
+    }
+
+    fn assert_failed_validation(status: Status, body: &str, message: &str) {
+        assert_eq!(status, Status::BadRequest, "unexpected response: {}", body);
+        let error: Error = serde_json::from_str(body).expect("error body should be an Error");
+        match error.error_type {
+            ErrorType::FailedValidation { error } => assert_eq!(error, message),
+            other => panic!("expected FailedValidation, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn unifiedpush_on_a_non_browser_host_is_accepted() {
+        crate::util::test::rt().block_on(unifiedpush_on_a_non_browser_host_is_accepted_case())
+    }
+
+    async fn unifiedpush_on_a_non_browser_host_is_accepted_case() {
+        // The allowlist refuses this host, so a 204 proves `kind` routed the
+        // subscription around the allowlist rather than through it.
+        assert!(
+            !push_endpoint_allowed(UNIFIEDPUSH_ENDPOINT),
+            "{} must not be on the allowlist",
+            UNIFIEDPUSH_ENDPOINT
+        );
+
+        let harness = TestHarness::new().await;
+        let (_, session, _) = harness.new_user().await;
+
+        let (status, body) = post_subscribe(
+            &harness,
+            &session.token,
+            subscribe_body(UNIFIEDPUSH_ENDPOINT, Some("unifiedpush")),
+        )
+        .await;
+        assert_eq!(status, Status::NoContent, "unexpected response: {}", body);
+
+        let stored = stored_subscription(&harness, &session.id)
+            .await
+            .expect("subscription should be stored");
+        assert_eq!(stored.endpoint, UNIFIEDPUSH_ENDPOINT);
+        assert_eq!(
+            stored.kind,
+            Some(revolt_database::PushSubscriptionKind::UnifiedPush)
+        );
+    }
+
+    #[test]
+    fn same_endpoint_without_kind_is_refused() {
+        crate::util::test::rt().block_on(same_endpoint_without_kind_is_refused_case())
+    }
+
+    async fn same_endpoint_without_kind_is_refused_case() {
+        let harness = TestHarness::new().await;
+        let (_, session, _) = harness.new_user().await;
+
+        let (status, body) = post_subscribe(
+            &harness,
+            &session.token,
+            subscribe_body(UNIFIEDPUSH_ENDPOINT, None),
+        )
+        .await;
+        assert_failed_validation(status, &body, "endpoint is not a supported push service");
+        assert_eq!(stored_subscription(&harness, &session.id).await, None);
+    }
+
+    #[test]
+    fn unifiedpush_over_http_is_refused() {
+        crate::util::test::rt().block_on(unifiedpush_over_http_is_refused_case())
+    }
+
+    async fn unifiedpush_over_http_is_refused_case() {
+        let harness = TestHarness::new().await;
+        let (_, session, _) = harness.new_user().await;
+
+        let (status, body) = post_subscribe(
+            &harness,
+            &session.token,
+            subscribe_body("http://ntfy.sh/upAbC123?up=1", Some("unifiedpush")),
+        )
+        .await;
+        assert_failed_validation(status, &body, "endpoint must use https");
+        assert_eq!(stored_subscription(&harness, &session.id).await, None);
+    }
+
+    #[test]
+    fn browser_subscribe_is_unchanged() {
+        crate::util::test::rt().block_on(browser_subscribe_is_unchanged_case())
+    }
+
+    async fn browser_subscribe_is_unchanged_case() {
+        let harness = TestHarness::new().await;
+        let (_, session, _) = harness.new_user().await;
+
+        let (status, body) = post_subscribe(
+            &harness,
+            &session.token,
+            subscribe_body(BROWSER_ENDPOINT, None),
+        )
+        .await;
+        assert_eq!(status, Status::NoContent, "unexpected response: {}", body);
+
+        let stored = stored_subscription(&harness, &session.id)
+            .await
+            .expect("subscription should be stored");
+        assert_eq!(stored.endpoint, BROWSER_ENDPOINT);
+        assert_eq!(stored.kind, None);
     }
 }
