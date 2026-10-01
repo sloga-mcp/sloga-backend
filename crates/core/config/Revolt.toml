@@ -173,6 +173,10 @@ public_key = "BGcvgR-i2z4IQ5Mw841vJvkLjt8wY-FjmWrw83jOLCY52qcGZS0OF7nfLzuYbjsQIS
 # Previous private key, tried once when the primary is rejected (401/403). Empty disables it.
 legacy_private_key = ""
 
+[pushd.unifiedpush]
+# Signs with the keys from [pushd.vapid]; there are no separate UnifiedPush keys
+queue = "notifications.outbound.unifiedpush"
+
 [pushd.fcm]
 queue = "notifications.outbound.fcm"
 key_type = ""

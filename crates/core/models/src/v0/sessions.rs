@@ -34,6 +34,17 @@ auto_derived!(
         pub endpoint: String,
         pub p256dh: String,
         pub auth: String,
+
+        /// Delivery mechanism, absent for browser Web Push subscriptions
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub kind: Option<PushSubscriptionKind>,
+    }
+
+    /// Push subscription delivery mechanism
+    #[serde(rename_all = "lowercase")]
+    pub enum PushSubscriptionKind {
+        /// UnifiedPush distributor endpoint
+        UnifiedPush,
     }
 
     /// # Edit Data

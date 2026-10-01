@@ -23,6 +23,7 @@ use consumers::{
     outbound::{
         apn::ApnsOutboundConsumer,
         fcm::FcmOutboundConsumer,
+        unifiedpush::UnifiedPushOutboundConsumer,
         vapid::{self, VapidOutboundConsumer},
     },
 };
@@ -205,6 +206,18 @@ async fn main() {
                 &config,
                 &config.pushd.vapid.queue,
                 &config.pushd.vapid.queue,
+                None,
+            )
+            .await,
+        );
+
+        channels.push(
+            make_queue_and_consume::<UnifiedPushOutboundConsumer>(
+                &db,
+                &connection,
+                &config,
+                &config.pushd.unifiedpush.queue,
+                &config.pushd.unifiedpush.queue,
                 None,
             )
             .await,

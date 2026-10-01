@@ -190,6 +190,11 @@ pub struct PushVapid {
 }
 
 #[derive(Deserialize, Debug, Clone)]
+pub struct PushUnifiedPush {
+    pub queue: String,
+}
+
+#[derive(Deserialize, Debug, Clone)]
 pub struct PushFcm {
     pub queue: String,
     pub key_type: String,
@@ -515,6 +520,7 @@ pub struct Pushd {
     pub ack_queue: String,
 
     pub vapid: PushVapid,
+    pub unifiedpush: PushUnifiedPush,
     pub fcm: PushFcm,
     pub apn: PushApn,
 }

@@ -69,6 +69,7 @@ mod tests {
                 endpoint: endpoint.to_string(),
                 p256dh: "p256dh".to_string(),
                 auth: "auth".to_string(),
+                kind: None,
             }),
         }
     }
