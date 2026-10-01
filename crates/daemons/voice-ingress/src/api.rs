@@ -3,23 +3,24 @@ use livekit_protocol::{ParticipantInfo, TrackType};
 use revolt_database::{
     events::client::EventV1,
     iso8601_timestamp::{Duration, Timestamp},
-    util::reference::Reference,
+    util::{permissions::DatabasePermissionQuery, reference::Reference},
     voice::{
         clear_voice_participant_identities, create_voice_state, delete_channel_voice_state,
-        delete_voice_connection, delete_voice_connections, get_user_moved_to_voice,
-        get_user_voice_channels, get_voice_channel_members,
-        get_screen_leg_sid, get_voice_state, is_screen_leg, is_screenshare_video, is_video_source,
+        delete_screen_leg, delete_voice_connection, delete_voice_connections, get_screen_leg_sid,
+        get_user_moved_to_voice, get_user_voice_channels, get_voice_channel_members,
+        get_voice_state, is_in_voice_channel, is_screen_leg, is_screenshare_video, is_video_source,
         mls_cap_would_refuse, record_screen_leg, record_voice_connection,
         recorded_voice_connections, remove_user_from_voice_channel, screen_leg_identity,
         screen_leg_left, set_voice_participant_identity, update_voice_state,
         update_voice_state_tracks, user_id_from_participant_identity, video_roster_over_cap,
-        voice_connect_still_allowed, ConnectionLeave, RoomMetadata, UserVoiceChannel,
+        voice_connect_still_allowed, AfkGate, ConnectionLeave, RoomMetadata, UserVoiceChannel,
         VoiceClient, MAX_VIDEO_PARTICIPANTS,
     },
     Database, AMQP,
 };
 use revolt_models::v0::{PartialUserVoiceState, UserVoiceState};
-use revolt_result::{Result, ToRevoltError};
+use revolt_permissions::{calculate_channel_permissions, ChannelPermission};
+use revolt_result::{ErrorType, Result, ToRevoltError};
 use rocket::{post, State};
 use rocket_empty::EmptyResponse;
 
@@ -109,6 +110,37 @@ pub async fn ingress(
                     server_id: room_metadata.to_internal_error()?.server,
                 };
 
+                // Channel-precise owner check (BE-1). The voice-state check
+                // below reads a key scoped to the SERVER (`{user}:{server}`),
+                // so it passes for an owner in ANY voice channel of this
+                // server. After a same-server move (a moderator's, the AFK
+                // sweep's, or the user's own) a leg that joins the OLD room
+                // late would pass it, be recorded here, and never be ejected:
+                // an ownerless leg every viewer of this room reads as a
+                // stranger. Only `vc:{user}` names the exact channel, and it
+                // is the set the route checked before minting.
+                //
+                // Fails CLOSED: a failed read ejects the leg, as a refusal
+                // does. Answering 500 instead would leave the leg live while
+                // LiveKit retries.
+                let in_this_channel = match is_in_voice_channel(user_id, &channel).await {
+                    Ok(in_this_channel) => in_this_channel,
+                    Err(error) => {
+                        log::error!("Channel check for screen leg {identity} in {channel_id} failed ({error}); failing closed and removing the leg.");
+                        // ERROR + Sentry with the cause; the answer is
+                        // decided here, so the converted error is discarded.
+                        let _ = Err::<(), _>(error).to_internal_error();
+                        false
+                    }
+                };
+                if !in_this_channel {
+                    log::warn!("Removing orphan screen leg {identity} from channel {channel_id}: owner is not in this channel.");
+                    let _ = voice_client
+                        .remove_identity(node, identity, channel_id)
+                        .await;
+                    return Ok(EmptyResponse);
+                }
+
                 // Orphan sanity check. The route refuses to mint a leg for a
                 // user who is not in the call, so an owner with no voice state
                 // here means a stale or hand-minted leg — eject it rather than
@@ -125,6 +157,48 @@ pub async fn ingress(
 
                 let sid = &event.participant.as_ref().to_internal_error()?.sid;
 
+                // Publish re-check (BE-3). The leg token is minted with its
+                // grant spelled out, and the leg lives seconds between the
+                // mint and this join: a Video revoke or an AFK designation
+                // landing in that window is otherwise never seen, and the leg
+                // keeps the grant it was minted with. Fails CLOSED exactly as
+                // the channel check above.
+                let may_publish = match screen_leg_owner_may_publish(db, channel_id, user_id).await
+                {
+                    Ok(may_publish) => may_publish,
+                    Err(error) => {
+                        log::error!("Publish re-check for screen leg {identity} in {channel_id} failed ({error}); failing closed and removing the leg.");
+                        // ERROR + Sentry with the cause; the answer is
+                        // decided here, so the converted error is discarded.
+                        let _ = Err::<(), _>(error).to_internal_error();
+                        false
+                    }
+                };
+                if !may_publish {
+                    log::warn!("Removing screen leg {identity} from channel {channel_id}: its owner may no longer publish video here.");
+                    // Recorded BEFORE the eject. Webhooks are not ordered, so
+                    // this leg's `track_published` may already have passed
+                    // the track arm (owner in this channel, no marker yet)
+                    // and lit the owner's flags. Unrecorded, the eject's
+                    // `participant_left` meets no marker in `screen_leg_left`
+                    // and the badge sticks until the owner leaves; recorded,
+                    // that leave clears it through the sid guard. A failed
+                    // record still ejects (fail closed), then answers 500.
+                    //
+                    // The eviction propagates its error (P2-7): answering 200
+                    // would leave a leg holding a revoked grant live, with
+                    // nothing left to catch it. A leg already gone is success.
+                    //
+                    // The BE-1 eject above needs no marker: with the owner
+                    // out of this channel, the leave arm never clears flags.
+                    let recorded = record_screen_leg(channel_id, user_id, sid).await;
+                    voice_client
+                        .remove_connection_if_present(node, identity, channel_id)
+                        .await?;
+                    recorded?;
+                    return Ok(EmptyResponse);
+                }
+
                 record_screen_leg(channel_id, user_id, sid).await?;
             }
             "participant_left" => {
@@ -134,6 +208,27 @@ pub async fn ingress(
                 };
 
                 let sid = &event.participant.as_ref().to_internal_error()?.sid;
+
+                // Channel-precise owner check (BE-1), ahead of
+                // `screen_leg_left`, whose voice-state guard is scoped to the
+                // SERVER. An owner who moved to another channel of this server
+                // still has voice state, and `screensharing` / `screen_video`
+                // are the flags the NEW channel shows: clearing them from this
+                // room's stale leg would blank a share the owner may be
+                // running there, announce it here, and trip the
+                // remote-control release. So such a leave only forgets this
+                // room's marker, and only while it still names this leg; no
+                // flag is written and nothing is announced. A failed read
+                // touches nothing and answers 500 so LiveKit retries.
+                if !is_in_voice_channel(user_id, &channel)
+                    .await
+                    .inspect_err(|error| {
+                        log::error!("Channel check for departed screen leg {identity} in {channel_id} failed ({error}); nothing was changed.");
+                    })?
+                {
+                    forget_screen_leg_if_current(channel_id, user_id, sid).await?;
+                    return Ok(EmptyResponse);
+                }
 
                 // This is what actually clears the "X is sharing" badge:
                 // LiveKit does not reliably emit `track_unpublished` for a
@@ -157,22 +252,58 @@ pub async fn ingress(
                 let track = event.track.as_ref().to_internal_error()?;
 
                 // Track events carry no room metadata; recover the channel
-                // from the OWNER's voice state. Unrecoverable means there is
-                // nothing to update — answer 200, because a 500 here buys a
-                // LiveKit retry storm and no useful state.
+                // from the OWNER's channel set. Unrecoverable means the owner
+                // is not in this channel, which the guard below handles.
                 let channel = match room_metadata {
-                    Some(metadata) => UserVoiceChannel {
+                    Some(metadata) => Some(UserVoiceChannel {
                         id: channel_id.clone(),
                         server_id: metadata.server,
-                    },
-                    None => match get_user_voice_channels(user_id)
+                    }),
+                    None => get_user_voice_channels(user_id)
                         .await?
                         .into_iter()
-                        .find(|channel| &channel.id == channel_id)
-                    {
-                        Some(channel) => channel,
-                        None => return Ok(EmptyResponse),
-                    },
+                        .find(|channel| &channel.id == channel_id),
+                };
+
+                // Channel-precise owner check (BE-1), ahead of the
+                // voice-state guard below, which is scoped to the SERVER and
+                // so passes for an owner who moved to another channel of it.
+                // Writing the flags then would set or clear the share the NEW
+                // channel shows, announce it in this one, and (on a clear)
+                // trip the remote-control release. So for a leg whose owner
+                // is not in this channel:
+                // - a publish (or an unmute) is an orphan going live, and the
+                //   LEG is ejected, as the join arm ejects one;
+                // - an unpublish only forgets this room's marker, and only
+                //   while it still names this leg;
+                // and no flag is written and nothing is announced. A failed
+                // read touches nothing and answers 500 so LiveKit retries.
+                let in_this_channel = match &channel {
+                    Some(channel) => is_in_voice_channel(user_id, channel)
+                        .await
+                        .inspect_err(|error| {
+                            log::error!("Channel check for screen leg {identity} track event in {channel_id} failed ({error}); nothing was changed.");
+                        })?,
+                    None => false,
+                };
+                let channel = match channel {
+                    Some(channel) if in_this_channel => channel,
+                    _ => {
+                        match event.event.as_str() {
+                            "track_published" | "track_unmuted" => {
+                                log::warn!("Removing orphan screen leg {identity} from channel {channel_id}: it went live while its owner is not in this channel.");
+                                let _ = voice_client
+                                    .remove_identity(node, identity, channel_id)
+                                    .await;
+                            }
+                            "track_unpublished" => {
+                                let sid = &event.participant.as_ref().to_internal_error()?.sid;
+                                forget_screen_leg_if_current(channel_id, user_id, sid).await?;
+                            }
+                            _ => {}
+                        }
+                        return Ok(EmptyResponse);
+                    }
                 };
 
                 // Voice-state guard, as on every leg path: with the owner gone
@@ -1118,6 +1249,77 @@ pub async fn ingress(
     Ok(EmptyResponse)
 }
 
+/// Whether the OWNER of a screen leg may still publish it in `channel_id`,
+/// re-checked when the leg reaches the SFU (BE-3).
+///
+/// The two conditions the route minted the leg's video grant on that can
+/// change in the seconds between the mint and the join: the channel's
+/// `Video` permission, read by the calculus exactly as the member join's
+/// Connect re-check reads Connect (`voice_connect_still_allowed`: the query
+/// built from `(db, user)` plus the channel, the member fetched lazily), and
+/// the AFK gate, which is a hard gate AFTER the calculus because the calculus
+/// answers `GrantAllSafe` for the server owner and privileged accounts
+/// before it reads any override.
+///
+/// A user or channel that no longer exists is `Ok(false)`. Any other read
+/// failure is returned, and the caller fails CLOSED on it.
+async fn screen_leg_owner_may_publish(
+    db: &Database,
+    channel_id: &str,
+    user_id: &str,
+) -> Result<bool> {
+    let user = match db.fetch_user(user_id).await {
+        Ok(user) => user,
+        Err(error) if matches!(error.error_type, ErrorType::NotFound) => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    let channel = match db.fetch_channel(channel_id).await {
+        Ok(channel) => channel,
+        Err(error) if matches!(error.error_type, ErrorType::NotFound) => return Ok(false),
+        Err(error) => return Err(error),
+    };
+
+    let mut query = DatabasePermissionQuery::new(db, &user).channel(&channel);
+    if !calculate_channel_permissions(&mut query)
+        .await
+        .has_channel_permission(ChannelPermission::Video)
+    {
+        return Ok(false);
+    }
+
+    Ok(!AfkGate::resolve(db, &channel, None)
+        .await?
+        .denies_publishing())
+}
+
+/// Forget this room's screen-leg marker for `user_id`, but only while it
+/// still names the leg `sid` (BE-1): a leg whose owner is no longer in this
+/// channel left, or stopped publishing. A marker naming another sid belongs
+/// to a NEWER leg and is left alone. Nothing else is touched: the owner's
+/// flags are scoped to the server, and belong to whichever channel the owner
+/// is in now.
+///
+/// A failed read or delete changes nothing more and is returned, so the
+/// webhook answers 500 and LiveKit retries it.
+async fn forget_screen_leg_if_current(channel_id: &str, user_id: &str, sid: &str) -> Result<()> {
+    if get_screen_leg_sid(channel_id, user_id)
+        .await
+        .inspect_err(|error| {
+            log::error!("Reading the screen-leg marker of {user_id} in {channel_id} failed ({error}); it was left in place.");
+        })?
+        .as_deref()
+        == Some(sid)
+    {
+        delete_screen_leg(channel_id, user_id)
+            .await
+            .inspect_err(|error| {
+                log::error!("Forgetting the screen-leg marker of {user_id} in {channel_id} failed ({error}).");
+            })?;
+    }
+
+    Ok(())
+}
+
 /// The sids of `recorded` connections (this user's, from
 /// `recorded_voice_connections`) that the SFU does not list in `listed`:
 /// the connections whose own leave never arrived, which a `Survivor`
@@ -1988,13 +2190,20 @@ mod tests {
     /// S-3 D-2/SR-2: every connection eviction and every track mute addresses
     /// the EVENT `identity`, and an eviction's failure is never discarded (it
     /// answers 500, so LiveKit retries). Mutations this catches: a mute
-    /// addressed to `user_id`, and an eviction whose error is dropped.
+    /// addressed to `user_id`, and an eviction whose error is dropped. The
+    /// fourth eviction is the screen-leg join's BE-3 refusal, whose leg must
+    /// not stay live on a revoked grant; the leg arms' other ejects are
+    /// best-effort `remove_identity` calls and are not counted here.
     #[test]
     fn every_ingress_enforcement_addresses_the_event_identity() {
         let dense = dense();
         let removals = call_args(&dense, "remove_connection_if_present(");
         let mutes = call_args(&dense, "mute_track_identity(");
-        assert_eq!(removals.len(), 3, "the three member eviction sites");
+        assert_eq!(
+            removals.len(),
+            4,
+            "the three member eviction sites and the leg's BE-3 eviction"
+        );
         assert_eq!(mutes.len(), 4, "two leg mutes and two member mutes");
         for args in removals.iter().chain(&mutes) {
             assert_eq!(args[1], "identity", "{args:?}");
@@ -2184,6 +2393,330 @@ mod tests {
         assert!(
             list.ends_with("voice_session_key(room),"),
             "step 4 drops the session records of the ghost room only: {list}"
+        );
+    }
+
+    /// The text of the braced block that opens at the first `\u{7b}` at or
+    /// after byte `from` of `code`, between its braces, with whitespace
+    /// collapsed to single spaces (as [`member_arm`] reads an arm).
+    fn block_from(code: &str, from: usize) -> String {
+        let open = from + code[from..].find('\u{7b}').expect("an opening brace");
+        let mut depth = 0i64;
+        let mut body_end = None;
+        for (i, ch) in code[open..].char_indices() {
+            match ch {
+                '\u{7b}' => depth += 1,
+                '\u{7d}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        body_end = Some(open + i);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        code[open + 1..body_end.expect("a closed block")]
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    /// The SCREEN-LEG arm whose pattern is `head`. The leg arms come first
+    /// in the file, inside the `is_screen_leg` branch; the member arms that
+    /// [`member_arm`] reads share their patterns and come after them.
+    fn leg_arm(head: &str) -> String {
+        let code = code();
+        let needle = format!("{head} => {}", '\u{7b}');
+        let leg = code
+            .find(&needle)
+            .unwrap_or_else(|| panic!("the leg {head} arm"));
+        let branch = code
+            .find("if identity.is_some_and(|identity| is_screen_leg(identity))")
+            .expect("the screen-leg branch");
+        assert!(branch < leg, "the first {head} arm is not the leg's");
+        block_from(&code, leg)
+    }
+
+    /// The body of the shipping function whose definition starts with `def`.
+    fn fn_body(def: &str) -> String {
+        let code = code();
+        let at = code
+            .find(def)
+            .unwrap_or_else(|| panic!("`{def}` is not defined"));
+        block_from(&code, at)
+    }
+
+    const LEG_TRACK_ARM: &str =
+        "\"track_published\" | \"track_unpublished\" | \"track_unmuted\" | \"track_muted\"";
+
+    /// The failure arm of a fail-closed decision `decision` (the text from
+    /// the `match` to its refusal check) answers `false`, so the leg is
+    /// ejected exactly as a refused one.
+    fn assert_fails_closed(decision: &str, ok: &str) {
+        assert!(
+            decision.contains(&format!("{ok}, Err(error) => {}", '\u{7b}')),
+            "{decision}"
+        );
+        assert!(
+            decision.trim_end().ends_with("false \u{7d} \u{7d};"),
+            "a failed re-check must answer `false` (eject the leg): {decision}"
+        );
+    }
+
+    /// The branch of `body` opened by `opener` up to the first early return
+    /// after it, which must eject the LEG (the event identity, a leg here)
+    /// and return.
+    fn assert_ejects_and_returns(body: &str, opener: &str) {
+        let at = once(body, opener);
+        let end = at
+            + body[at..]
+                .find("return Ok(EmptyResponse); \u{7d}")
+                .unwrap_or_else(|| panic!("`{opener}` must return: {body}"));
+        let branch = &body[at..end];
+        assert!(
+            branch.contains(
+                "let _ = voice_client .remove_identity(node, identity, channel_id) .await;"
+            ),
+            "`{opener}` must eject the leg: {branch}"
+        );
+    }
+
+    /// BE-1: the screen-leg JOIN ejects a leg whose owner is not in THIS
+    /// channel, read from `vc:{user}` (`is_in_voice_channel`, the set the
+    /// route checked before minting), and it does so before the leg is
+    /// recorded. The voice-state check after it reads `{user}:{server}`, which
+    /// passes for an owner in ANY channel of the server, so on its own a leg
+    /// that joins the OLD room after a same-server move is recorded and never
+    /// ejected. Mutations this catches: the check deleted or handed another
+    /// channel, moved after `record_screen_leg`, its refusal left without the
+    /// eject or the `return`, and its error arm answering `true` (a Redis
+    /// failure then admits every leg).
+    #[test]
+    fn a_screen_leg_join_needs_its_owner_in_this_channel() {
+        let body = leg_arm("\"participant_joined\"");
+        assert!(
+            body.starts_with(
+                "let channel = UserVoiceChannel \u{7b} id: channel_id.clone(), \
+                 server_id: room_metadata.to_internal_error()?.server, \u{7d};"
+            ),
+            "the check must be handed THIS channel: {body}"
+        );
+        let check = once(
+            &body,
+            "let in_this_channel = match is_in_voice_channel(user_id, &channel).await \u{7b}",
+        );
+        let refused = once(&body, "if !in_this_channel \u{7b}");
+        // The FIRST record: the BE-3 refusal records too (see the next pin),
+        // and both come after this check.
+        let record = body
+            .find("record_screen_leg(channel_id, user_id, sid)")
+            .expect("the leg join records the leg");
+        assert!(check < refused && refused < record, "{body}");
+        assert_fails_closed(
+            &body[check..refused],
+            "Ok(in_this_channel) => in_this_channel",
+        );
+        assert_ejects_and_returns(&body, "if !in_this_channel \u{7b}");
+    }
+
+    /// BE-3: the screen-leg JOIN re-checks that the owner may still publish
+    /// video here, before the leg is recorded as admitted: the channel's
+    /// `Video` permission from the calculus, and the AFK gate as a hard gate
+    /// after it (the calculus answers `GrantAllSafe` for the owner and
+    /// staff). A failed read ejects the leg.
+    ///
+    /// A refused leg is recorded BEFORE it is ejected, so the eject's own
+    /// `participant_left` clears, through the sid guard, flags its earlier
+    /// `track_published` may have lit (webhooks are not ordered). The
+    /// eviction propagates its error (P2-7), and a failed record is
+    /// answered only after the eject (fail closed, then 500).
+    ///
+    /// Mutations this catches: the re-check deleted or moved after the
+    /// admitted record, either condition dropped from it (a Video revoke or
+    /// an AFK designation in the mint-to-join window then leaves the leg its
+    /// minted grant), the AFK gate read as a permission, the error arm
+    /// answering `true`, the refusal's record dropped or moved after the
+    /// eject (a stuck "sharing" badge), the eviction's error discarded, and
+    /// a failed record answered before the eject.
+    #[test]
+    fn a_screen_leg_join_rechecks_video_and_the_afk_gate() {
+        let body = leg_arm("\"participant_joined\"");
+        let check = once(
+            &body,
+            "let may_publish = match screen_leg_owner_may_publish(db, channel_id, user_id).await \u{7b}",
+        );
+        let refused = once(&body, "if !may_publish \u{7b}");
+        assert!(check < refused, "{body}");
+        assert_fails_closed(&body[check..refused], "Ok(may_publish) => may_publish");
+
+        let end = refused
+            + body[refused..]
+                .find("return Ok(EmptyResponse); \u{7d}")
+                .expect("the refusal returns");
+        let branch = &body[refused..end];
+        assert!(
+            branch.ends_with(
+                "let recorded = record_screen_leg(channel_id, user_id, sid).await; \
+                 voice_client .remove_connection_if_present(node, identity, channel_id) \
+                 .await?; recorded?; "
+            ),
+            "a refused leg is recorded, THEN evicted with the error propagated, \
+             THEN a failed record answered: {branch}"
+        );
+        assert!(
+            !branch.contains("let _ ="),
+            "the refusal discards no error: {branch}"
+        );
+        // The admitted record comes only after the refusal has returned.
+        once(
+            &body[end..],
+            "record_screen_leg(channel_id, user_id, sid).await?;",
+        );
+        assert_eq!(
+            body.matches("record_screen_leg(").count(),
+            2,
+            "the refusal's record and the admitted one: {body}"
+        );
+
+        let helper = fn_body("async fn screen_leg_owner_may_publish(");
+        let query = once(
+            &helper,
+            "let mut query = DatabasePermissionQuery::new(db, &user).channel(&channel);",
+        );
+        let video = once(
+            &helper,
+            "if !calculate_channel_permissions(&mut query) .await \
+             .has_channel_permission(ChannelPermission::Video) \u{7b} return Ok(false); \u{7d}",
+        );
+        let afk = once(
+            &helper,
+            "Ok(!AfkGate::resolve(db, &channel, None) .await? .denies_publishing())",
+        );
+        assert!(query < video && video < afk, "{helper}");
+        assert!(
+            !helper.contains("Ok(true)"),
+            "every early answer of the re-check is a refusal: {helper}"
+        );
+    }
+
+    /// BE-1: every screen-leg TRACK event checks that the owner is in THIS
+    /// channel before anything is written, ahead of the server-scoped
+    /// voice-state guard and the F1 sid guard. For an owner elsewhere, a
+    /// publish or an unmute ejects the leg, an unpublish only forgets this
+    /// room's marker (sid-gated, `forget_screen_leg_if_current`), and nothing
+    /// writes the owner's flags, announces, or releases remote control: those
+    /// flags are the ones the owner's NEW channel shows. Mutations this
+    /// catches: the check deleted or moved after the flag write, an
+    /// unrecoverable channel read as "in it", the eject dropped, the
+    /// unpublish clearing the flags, and any write or event in the branch.
+    #[test]
+    fn screen_leg_track_events_need_their_owner_in_this_channel() {
+        let body = leg_arm(LEG_TRACK_ARM);
+        let check = once(
+            &body,
+            "Some(channel) => is_in_voice_channel(user_id, channel) .await",
+        );
+        once(&body, "None => false, \u{7d};");
+        let guard = once(&body, "Some(channel) if in_this_channel => channel,");
+        let voice_state = once(&body, "get_voice_state(&channel, user_id)");
+        let sid_guard = once(&body, "get_screen_leg_sid(channel_id, user_id)");
+        let write = once(&body, "update_voice_state_tracks(");
+        assert!(
+            check < guard && guard < voice_state && voice_state < sid_guard && sid_guard < write,
+            "{body}"
+        );
+
+        let end = guard
+            + body[guard..]
+                .find("return Ok(EmptyResponse); \u{7d} \u{7d};")
+                .expect("the stranded branch returns");
+        assert!(
+            end < voice_state,
+            "a leg whose owner is elsewhere must return before any write: {body}"
+        );
+        let stranded = &body[guard..end];
+        let live = once(
+            stranded,
+            "\"track_published\" | \"track_unmuted\" => \u{7b}",
+        );
+        let gone = once(stranded, "\"track_unpublished\" => \u{7b}");
+        let eject = once(
+            stranded,
+            "let _ = voice_client .remove_identity(node, identity, channel_id) .await;",
+        );
+        let forget = once(
+            stranded,
+            "forget_screen_leg_if_current(channel_id, user_id, sid).await?;",
+        );
+        assert!(live < eject && eject < gone && gone < forget, "{stranded}");
+        for banned in [
+            "update_voice_state",
+            "EventV1",
+            "release_remote_control",
+            "record_screen_leg(",
+            "delete_screen_leg(",
+        ] {
+            assert!(
+                !stranded.contains(banned),
+                "a leg whose owner is elsewhere must not reach `{banned}`: {stranded}"
+            );
+        }
+    }
+
+    /// BE-1: the screen-leg LEAVE checks that the owner is in THIS channel
+    /// before `screen_leg_left`, whose voice-state guard is server-scoped.
+    /// For an owner elsewhere it only forgets this room's marker, sid-gated,
+    /// and returns: no flag write, no event, no remote-control release.
+    /// Mutations this catches: the check deleted or moved after
+    /// `screen_leg_left` (a stale leg's leave then blanks the share the owner
+    /// runs in the NEW channel and announces it here), and the branch
+    /// clearing the marker unconditionally or writing anything else.
+    #[test]
+    fn a_screen_leg_leave_needs_its_owner_in_this_channel() {
+        let body = leg_arm("\"participant_left\"");
+        let check = once(&body, "if !is_in_voice_channel(user_id, &channel) .await");
+        let left = once(&body, "screen_leg_left(&channel, user_id, sid)");
+        assert!(check < left, "{body}");
+        let stranded = &body[check..left];
+        once(
+            stranded,
+            "forget_screen_leg_if_current(channel_id, user_id, sid).await?; \
+             return Ok(EmptyResponse); \u{7d}",
+        );
+        for banned in [
+            "update_voice_state",
+            "EventV1",
+            "release_remote_control",
+            "delete_screen_leg(",
+        ] {
+            assert!(
+                !stranded.contains(banned),
+                "a leg whose owner is elsewhere must not reach `{banned}`: {stranded}"
+            );
+        }
+    }
+
+    /// BE-1: a stranded leg's marker is deleted ONLY while it still names
+    /// that leg's sid. A marker naming another sid belongs to a NEWER leg,
+    /// whose share deleting it would orphan. The helper is the only shipping
+    /// `delete_screen_leg` call in this file, and it writes nothing else.
+    /// Mutations this catches: the sid comparison dropped or inverted, and a
+    /// bare `delete_screen_leg` call anywhere else in the ingress.
+    #[test]
+    fn a_stranded_leg_marker_is_deleted_only_when_it_names_this_leg() {
+        let helper = fn_body("async fn forget_screen_leg_if_current(");
+        let read = once(&helper, "if get_screen_leg_sid(channel_id, user_id) .await");
+        let matched = once(&helper, ".as_deref() == Some(sid) \u{7b}");
+        let delete = once(&helper, "delete_screen_leg(channel_id, user_id)");
+        assert!(read < matched && matched < delete, "{helper}");
+        for banned in ["update_voice_state", "EventV1", "release_remote_control"] {
+            assert!(!helper.contains(banned), "{helper}");
+        }
+        assert_eq!(
+            dense().matches("delete_screen_leg(").count(),
+            1,
+            "the sid-gated helper is the only marker delete in the ingress"
         );
     }
 
