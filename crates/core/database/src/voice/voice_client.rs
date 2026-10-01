@@ -2186,6 +2186,7 @@ mod afk_mint_tests {
     use revolt_config::LiveKitNode;
     use revolt_models::v0::{DataCreateServer, DataCreateServerChannel, LegacyServerChannelType};
     use revolt_permissions::{ChannelPermission, PermissionValue};
+    use revolt_result::ErrorType;
     use std::collections::HashMap;
 
     const NODE: &str = "afk-mint-node";
@@ -2302,6 +2303,129 @@ mod afk_mint_tests {
                 .any(|source| source == "microphone"),
             "control: Speak puts the microphone in the grant: {:?}",
             control.can_publish_sources
+        );
+    }
+
+    /// The Android screen leg is the fifth publish-rights path: its grant is
+    /// spelled out, so the gate inside `create_token` never reaches it, and
+    /// `create_screen_leg_token` carries an AFK gate of its own. The test in
+    /// `voice/mod.rs` only checks that the gate's constructor appears in the
+    /// function's text. This drives the REAL mint: in the designated AFK
+    /// channel it refuses with `MissingPermission { Video }`, and for the same
+    /// member, identity and channel shape in an undesignated channel it mints
+    /// the screen-only grant. The control is what keeps a mint that always
+    /// errors from passing.
+    #[test]
+    fn create_screen_leg_token_in_the_afk_channel_is_refused() {
+        crate::voice::tests::rt()
+            .block_on(create_screen_leg_token_in_the_afk_channel_is_refused_case())
+    }
+
+    async fn create_screen_leg_token_in_the_afk_channel_is_refused_case() {
+        let db = Database::Reference(Default::default());
+
+        let owner = User::create(&db, "AfkLegOwner".to_string(), None, None)
+            .await
+            .expect("`User`");
+        let mut server = Server::create(
+            &db,
+            DataCreateServer {
+                name: "AfkLegServer".to_string(),
+                description: None,
+                nsfw: None,
+            },
+            &owner,
+            false,
+        )
+        .await
+        .expect("`Server`")
+        .0;
+
+        let voice_channel = |name: &str| DataCreateServerChannel {
+            channel_type: LegacyServerChannelType::Voice,
+            name: name.to_string(),
+            ..Default::default()
+        };
+        let afk_channel =
+            Channel::create_server_channel(&db, &mut server, voice_channel("AFK"), true)
+                .await
+                .expect("`Channel`");
+        let normal_channel =
+            Channel::create_server_channel(&db, &mut server, voice_channel("General"), true)
+                .await
+                .expect("`Channel`");
+
+        server
+            .update(
+                &db,
+                PartialServer {
+                    afk_channel_id: Some(afk_channel.id().to_string()),
+                    afk_timeout: Some(300),
+                    ..Default::default()
+                },
+                vec![],
+            )
+            .await
+            .expect("designation");
+
+        let voice = VoiceClient::new(HashMap::from([(
+            NODE.to_string(),
+            LiveKitNode {
+                url: "http://127.0.0.1:1".to_string(),
+                lat: 0.0,
+                lon: 0.0,
+                key: "afkmintkey".to_string(),
+                secret: "afkmintsecret-afkmintsecret-afkmint".to_string(),
+                private: true,
+                remote: false,
+            },
+        )]));
+
+        // The same leg identity in both channels: the only difference
+        // between the two mints is the designation.
+        let identity = crate::voice::screen_leg_identity(&format!("{}:DEVICE", owner.id));
+
+        let refused = voice
+            .create_screen_leg_token(NODE, &db, &owner, &identity, &afk_channel)
+            .await;
+        match &refused {
+            Err(error) => assert!(
+                matches!(
+                    &error.error_type,
+                    ErrorType::MissingPermission { permission } if permission == "Video"
+                ),
+                "the AFK refusal must be MissingPermission {{ Video }}: {error:?}"
+            ),
+            Ok(_) => panic!(
+                "regression: create_screen_leg_token minted a publishing leg \
+                 token for the designated AFK channel"
+            ),
+        }
+
+        // Control: the undesignated channel, same member, same identity.
+        let token = voice
+            .create_screen_leg_token(NODE, &db, &owner, &identity, &normal_channel)
+            .await
+            .expect("control: an undesignated voice channel mints the leg token");
+        let claims = Claims::from_unverified(&token).expect("decode token");
+        assert_eq!(claims.sub, identity, "the token carries the leg identity");
+        assert_eq!(
+            claims.video.room,
+            normal_channel.id(),
+            "the token names its room"
+        );
+        assert!(
+            claims.video.can_publish,
+            "control: the leg token publishes outside the AFK channel"
+        );
+        assert_eq!(
+            claims.video.can_publish_sources,
+            vec!["screen_share".to_string(), "screen_share_audio".to_string()],
+            "control: the leg grant is exactly the two screen sources"
+        );
+        assert!(
+            !claims.video.can_subscribe,
+            "control: a leg never subscribes"
         );
     }
 }
