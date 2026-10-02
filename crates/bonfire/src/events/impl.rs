@@ -12,7 +12,7 @@ use revolt_database::{
 use revolt_models::v0;
 use revolt_permissions::{calculate_channel_permissions, ChannelPermission};
 use revolt_presence::filter_online;
-use revolt_result::Result;
+use revolt_result::{ErrorType, Result};
 
 use super::state::{Cache, State};
 
@@ -400,37 +400,67 @@ impl State {
     }
 
     /// Re-determine the currently accessible server channels
+    ///
+    /// A cached server channel is subscribed exactly when the client has been
+    /// told about it, so the subscription set is the prior visibility. Hidden
+    /// channels stay cached unsubscribed: a thread created under a hidden
+    /// parent is cached that way by `ChannelCreate`, and since threads are not
+    /// in `Server.channels`, the cache is the only place a later grant can
+    /// find it.
     pub async fn recalculate_server(&mut self, db: &Database, id: &str, event: &mut EventV1) {
         if let Some(server) = self.cache.servers.get(id) {
             let mut channel_ids = HashSet::new();
-            let mut added_channels = vec![];
-            let mut removed_channels = vec![];
+            let mut revealed_channels = vec![];
+            let mut hidden_channels = vec![];
 
             let id = &id.to_string();
-            for (channel_id, channel) in &self.cache.channels {
-                if channel.server() == Some(id) {
-                    channel_ids.insert(channel_id.clone());
+            let prior: Vec<(String, bool)> = {
+                let subscribed = self.subscribed.read().await;
+                self.cache
+                    .channels
+                    .iter()
+                    .filter(|(_, channel)| channel.server() == Some(id))
+                    .map(|(channel_id, _)| (channel_id.clone(), subscribed.contains(channel_id)))
+                    .collect()
+            };
 
-                    if self.cache.can_view_channel(db, channel).await {
-                        added_channels.push(channel_id.clone());
-                    } else {
-                        removed_channels.push(channel_id.clone());
+            // A thread is visible exactly when its parent is, and an uncached
+            // parent costs a database read, so resolve each parent once.
+            let mut parent_visibility: HashMap<String, bool> = HashMap::new();
+            for (channel_id, could_view) in prior {
+                let Some(channel) = self.cache.channels.get(&channel_id) else {
+                    continue;
+                };
+
+                let can_view = match channel {
+                    Channel::Thread { parent_channel, .. } => {
+                        match parent_visibility.get(parent_channel) {
+                            Some(can_view) => *can_view,
+                            None => {
+                                let can_view = self.cache.can_view_channel(db, channel).await;
+                                parent_visibility.insert(parent_channel.clone(), can_view);
+                                can_view
+                            }
+                        }
                     }
+                    _ => self.cache.can_view_channel(db, channel).await,
+                };
+
+                if can_view && !could_view {
+                    revealed_channels.push(channel_id.clone());
+                } else if could_view && !can_view {
+                    hidden_channels.push(channel_id.clone());
                 }
+                channel_ids.insert(channel_id);
             }
 
             let known_ids = server.channels.iter().cloned().collect::<HashSet<String>>();
 
             let mut bulk_events = vec![];
+            let revealed_events = self.reveal_channels(db, revealed_channels).await;
 
-            for id in added_channels {
-                self.insert_subscription(id).await;
-            }
-
-            for id in removed_channels {
+            for id in hidden_channels {
                 self.remove_subscription(&id).await;
-                self.cache.channels.remove(&id);
-
                 bulk_events.push(EventV1::ChannelDelete { id });
             }
 
@@ -457,6 +487,10 @@ impl State {
                 }
             }
 
+            // After the unknowns, which are where a revealed thread's parent
+            // usually comes from.
+            bulk_events.extend(revealed_events);
+
             if !bulk_events.is_empty() {
                 let mut new_event = EventV1::Bulk { v: bulk_events };
                 std::mem::swap(&mut new_event, event);
@@ -466,6 +500,65 @@ impl State {
                 }
             }
         }
+    }
+
+    /// Subscribe to cached channels the client has not been told about, and
+    /// return the ChannelCreates that tell it, top-level channels before
+    /// threads so a thread never arrives ahead of its parent.
+    ///
+    /// Re-reads the channels first, in one query: a thread deleted while
+    /// hidden publishes its ChannelDelete only to its own topic, which we were
+    /// not subscribed to, so a cached copy may be a ghost. Channels the read
+    /// does not return are dropped from the cache. If the read fails, nothing
+    /// is revealed and the next recalculation tries again.
+    async fn reveal_channels(&mut self, db: &Database, ids: Vec<String>) -> Vec<EventV1> {
+        if ids.is_empty() {
+            return vec![];
+        }
+
+        let mut fresh: HashMap<String, Channel> = match db.fetch_channels(&ids).await {
+            Ok(channels) => channels
+                .into_iter()
+                .map(|channel| (channel.id().to_string(), channel))
+                .collect(),
+            // The reference driver fails the whole read when one id is
+            // missing; find the survivors one at a time.
+            Err(error) if matches!(error.error_type, ErrorType::NotFound) => {
+                let mut channels = HashMap::new();
+                for id in &ids {
+                    if let Ok(channel) = db.fetch_channel(id).await {
+                        channels.insert(id.clone(), channel);
+                    }
+                }
+                channels
+            }
+            Err(_) => return vec![],
+        };
+
+        let mut events = vec![];
+        let mut thread_events = vec![];
+        for id in ids {
+            let Some(channel) = fresh.remove(&id) else {
+                self.cache.channels.remove(&id);
+                continue;
+            };
+
+            let can_view = self.cache.can_view_channel(db, &channel).await;
+            self.cache.channels.insert(id.clone(), channel.clone());
+            if !can_view {
+                continue;
+            }
+
+            self.insert_subscription(id).await;
+            if matches!(channel, Channel::Thread { .. }) {
+                thread_events.push(EventV1::ChannelCreate(channel.into()));
+            } else {
+                events.push(EventV1::ChannelCreate(channel.into()));
+            }
+        }
+
+        events.extend(thread_events);
+        events
     }
 
     /// Push presence change to the user and all associated server topics
@@ -576,22 +669,33 @@ impl State {
             EventV1::ChannelUpdate {
                 id, data, clear, ..
             } => {
-                let could_view: bool = if let Some(channel) = self.cache.channels.get(id) {
-                    self.cache.can_view_channel(db, channel).await
-                } else {
-                    false
+                // For a server channel, whether the client was told about it
+                // (see recalculate_server); it can be cached while hidden.
+                let could_view: bool = match self.cache.channels.get(id) {
+                    Some(channel) if channel.server().is_some() => {
+                        self.subscribed.read().await.contains(id)
+                    }
+                    Some(channel) => self.cache.can_view_channel(db, channel).await,
+                    None => false,
                 };
 
                 // Capture each child thread's prior visibility BEFORE the parent
                 // is mutated — a parent permission change must propagate to the
                 // threads that delegate their permissions to it, or a newly
                 // denied user keeps live thread subscriptions until reconnect.
+                //
+                // Prior visibility is whether the client was told about the
+                // thread (it is subscribed exactly then), not a permission
+                // check: a hidden parent is usually uncached, and resolving it
+                // from the database would read the already-updated row.
                 let mut thread_prior: Vec<(String, bool)> = vec![];
-                for (child_id, channel) in &self.cache.channels {
-                    if matches!(channel, Channel::Thread { parent_channel, .. } if parent_channel == id)
-                    {
-                        thread_prior
-                            .push((child_id.clone(), self.cache.can_view_channel(db, channel).await));
+                {
+                    let subscribed = self.subscribed.read().await;
+                    for (child_id, channel) in &self.cache.channels {
+                        if matches!(channel, Channel::Thread { parent_channel, .. } if parent_channel == id)
+                        {
+                            thread_prior.push((child_id.clone(), subscribed.contains(child_id)));
+                        }
                     }
                 }
 
@@ -637,6 +741,7 @@ impl State {
                 // child threads, emitting synthetic ChannelCreate/Delete so the
                 // client's cache and subscriptions stay correct.
                 let mut thread_events: Vec<EventV1> = vec![];
+                let mut revealed_threads = vec![];
                 for (thread_id, could_view) in thread_prior {
                     let can_view = if let Some(channel) = self.cache.channels.get(&thread_id) {
                         self.cache.can_view_channel(db, channel).await
@@ -646,24 +751,22 @@ impl State {
 
                     if could_view != can_view {
                         if can_view {
-                            self.insert_subscription(thread_id.clone()).await;
-                            if let Some(channel) = self.cache.channels.get(&thread_id) {
-                                thread_events.push(EventV1::ChannelCreate(channel.clone().into()));
-                            }
+                            revealed_threads.push(thread_id);
                         } else {
                             self.remove_subscription(&thread_id).await;
                             thread_events.push(EventV1::ChannelDelete { id: thread_id.clone() });
                         }
                     }
                 }
+                thread_events.extend(self.reveal_channels(db, revealed_threads).await);
 
+                // The parent's own event goes first, so a revealed thread
+                // never reaches the client ahead of its parent.
                 if !thread_events.is_empty() {
-                    let mut new_event = EventV1::Bulk { v: thread_events };
-                    std::mem::swap(&mut new_event, event);
-
-                    if let EventV1::Bulk { v } = event {
-                        v.push(new_event);
-                    }
+                    let parent_event = std::mem::replace(event, EventV1::Bulk { v: vec![] });
+                    let mut v = vec![parent_event];
+                    v.extend(thread_events);
+                    *event = EventV1::Bulk { v };
                 }
             }
             EventV1::ChannelDelete { id } => {
@@ -705,10 +808,15 @@ impl State {
                 };
                 self.cache.members.insert(id.clone(), member);
 
+                // The carried channels are already filtered to the ones we
+                // can view, and the client learns them from this event, so
+                // subscribe them now; recalculate_server would otherwise see
+                // them as newly revealed and announce each one twice.
                 for channel in channels {
-                    self.cache
-                        .channels
-                        .insert(channel.id().to_string(), channel.clone().into());
+                    let channel: Channel = channel.clone().into();
+                    let channel_id = channel.id().to_string();
+                    self.cache.channels.insert(channel_id.clone(), channel);
+                    self.insert_subscription(channel_id).await;
                 }
 
                 queue_server = Some(id.clone());
@@ -870,7 +978,8 @@ impl State {
 #[cfg(test)]
 mod tests {
     use revolt_database::{
-        events::client::EventV1, Channel, DatabaseInfo, Member, MemberCompositeKey, Server, User,
+        events::client::EventV1, Channel, Database, DatabaseInfo, Member, MemberCompositeKey,
+        PartialChannel, Role, Server, User,
     };
     use revolt_models::v0::{self, RemovalIntention};
     use revolt_permissions::{ChannelPermission, OverrideField};
@@ -901,10 +1010,7 @@ mod tests {
     /// metadata (renames, description edits) to denied members' sockets.
     #[tokio::test]
     async fn hidden_channel_update_is_dropped_for_denied_member() {
-        let db = DatabaseInfo::Test("bonfire_hidden_channel_update".to_string())
-            .connect()
-            .await
-            .expect("database");
+        let db = test_db().await;
 
         let member_user = User {
             id: "01USER000000000000000MEMBER".to_string(),
@@ -979,11 +1085,14 @@ mod tests {
 
         // The denied member's Ready excluded the hidden channel, so it is
         // NOT in their cache; bonfire resolves it from the database.
+        // Ready caches and subscribes the visible channel.
         let mut state = member_state(member_user, &server);
         state
             .cache
             .channels
             .insert(visible.id().to_string(), visible.clone());
+        state.insert_subscription(visible.id().to_string()).await;
+        state.apply_state().await;
 
         let mut event = EventV1::ChannelUpdate {
             id: hidden.id().to_string(),
@@ -1266,5 +1375,541 @@ mod tests {
             subscribed.contains(THREAD_X) && state.cache.channels.contains_key(THREAD_X),
             "uncached server: thread of another server must survive"
         );
+    }
+
+    /// Grants ViewChannel on `PRIVATE_S`.
+    const ROLE_R: &str = "01ROLE0000000000000000000R";
+    /// Text channel of S that only holders of `ROLE_R` can view.
+    const PRIVATE_S: &str = "01CHANNEL00000000000PRIVATE";
+    /// Thread under `PRIVATE_S`.
+    const PRIVATE_THREAD_S: &str = "01CHANNEL0000000000PTHREADS";
+    /// A second thread under `PRIVATE_S`, only in the database where a test
+    /// adds it.
+    const PRIVATE_THREAD2_S: &str = "01CHANNEL000000000PTHREAD2S";
+
+    /// A throwaway database named like the ones `DatabaseInfo::Auto` makes, so
+    /// `scripts/drop-test-databases.sh` sweeps it after a `TEST_DB=MONGODB` run.
+    async fn test_db() -> Database {
+        use rand::Rng;
+        DatabaseInfo::Test(format!(
+            "revolt_test_{}",
+            rand::thread_rng().gen_range(1_000_000..10_000_000)
+        ))
+        .connect()
+        .await
+        .expect("database")
+    }
+
+    fn private_channel() -> Channel {
+        Channel::TextChannel {
+            id: PRIVATE_S.to_string(),
+            server: SERVER_S.to_string(),
+            name: "private".to_string(),
+            description: None,
+            icon: None,
+            last_message_id: None,
+            default_permissions: Some(OverrideField {
+                a: 0,
+                d: ChannelPermission::ViewChannel as i64,
+            }),
+            role_permissions: HashMap::from([(
+                ROLE_R.to_string(),
+                OverrideField {
+                    a: ChannelPermission::ViewChannel as i64,
+                    d: 0,
+                },
+            )]),
+            nsfw: false,
+            spoiler: false,
+            voice: None,
+            slowmode: None,
+            announcement: None,
+        }
+    }
+
+    /// S with a public and a private text channel, and the role that unlocks
+    /// the private one.
+    fn server_with_private_channel() -> Server {
+        let mut server = plain_server(SERVER_S, &[TEXT_S, PRIVATE_S]);
+        server.roles.insert(
+            ROLE_R.to_string(),
+            Role {
+                id: ROLE_R.to_string(),
+                name: "r".to_string(),
+                permissions: OverrideField { a: 0, d: 0 },
+                colour: None,
+                hoist: false,
+                rank: 1,
+                icon: None,
+            },
+        );
+        server
+    }
+
+    /// The database rows a live server would have: both text channels and the
+    /// thread under the private one.
+    #[allow(clippy::disallowed_methods)]
+    async fn private_channel_db() -> Database {
+        let db = test_db().await;
+        for channel in [
+            text_channel(TEXT_S, SERVER_S),
+            private_channel(),
+            thread(PRIVATE_THREAD_S, SERVER_S, PRIVATE_S),
+        ] {
+            db.insert_channel(&channel).await.expect("insert channel");
+        }
+        db
+    }
+
+    /// A member of S holding `roles`, with what Ready would have given them:
+    /// every channel in `visible` cached and subscribed. Flushed out of the
+    /// `Reset` state, where `remove_subscription` panics.
+    async fn private_channel_state(roles: &[&str], visible: &[Channel]) -> State {
+        let user = User {
+            id: SELF_ID.to_string(),
+            username: "self".to_string(),
+            ..Default::default()
+        };
+        let mut state = member_state(user, &server_with_private_channel());
+        state.cache.members.get_mut(SERVER_S).expect("member").roles =
+            roles.iter().map(|r| r.to_string()).collect();
+
+        state.insert_subscription(SERVER_S.to_string()).await;
+        for channel in visible {
+            state
+                .cache
+                .channels
+                .insert(channel.id().to_string(), channel.clone());
+            state.insert_subscription(channel.id().to_string()).await;
+        }
+        state.apply_state().await;
+        state
+    }
+
+    /// Our own roles change to `roles`.
+    fn set_roles(roles: &[&str]) -> EventV1 {
+        EventV1::ServerMemberUpdate {
+            id: v0::MemberCompositeKey {
+                server: SERVER_S.to_string(),
+                user: SELF_ID.to_string(),
+            },
+            data: v0::PartialMember {
+                roles: Some(roles.iter().map(|r| r.to_string()).collect()),
+                ..Default::default()
+            },
+            clear: vec![],
+        }
+    }
+
+    /// The channel ids announced by `ChannelCreate` / `ChannelDelete` inside a
+    /// forwarded event, plus the event recalculate_server wrapped (the last
+    /// entry of the Bulk), or the event itself when nothing was added.
+    fn split_bulk(event: &EventV1) -> (Vec<String>, Vec<String>, &EventV1) {
+        let mut created = vec![];
+        let mut deleted = vec![];
+        let EventV1::Bulk { v } = event else {
+            return (created, deleted, event);
+        };
+        let (original, generated) = v.split_last().expect("non-empty bulk");
+        for event in generated {
+            match event {
+                EventV1::ChannelCreate(channel) => {
+                    let channel: Channel = channel.clone().into();
+                    created.push(channel.id().to_string());
+                }
+                EventV1::ChannelDelete { id } => deleted.push(id.clone()),
+                other => panic!("unexpected generated event {other:?}"),
+            }
+        }
+        (created, deleted, original)
+    }
+
+    /// A thread created while its parent is hidden is cached but neither
+    /// forwarded nor subscribed. The grant that reveals the parent must
+    /// announce the thread too, or its messages reach a client that never
+    /// cached the channel: no notifications, no sidebar entry.
+    #[tokio::test]
+    async fn role_grant_reveals_thread_created_while_parent_hidden() {
+        let db = private_channel_db().await;
+        let mut state = private_channel_state(&[], &[text_channel(TEXT_S, SERVER_S)]).await;
+
+        let mut event =
+            EventV1::ChannelCreate(thread(PRIVATE_THREAD_S, SERVER_S, PRIVATE_S).into());
+        assert!(
+            !state.handle_incoming_event_v1(&db, &mut event).await,
+            "precondition: a thread under a hidden parent is not forwarded"
+        );
+        assert!(state.cache.channels.contains_key(PRIVATE_THREAD_S));
+        assert!(!state.subscribed.read().await.contains(PRIVATE_THREAD_S));
+
+        let mut event = set_roles(&[ROLE_R]);
+        assert!(state.handle_incoming_event_v1(&db, &mut event).await);
+
+        let (created, deleted, original) = split_bulk(&event);
+        assert!(matches!(original, EventV1::ServerMemberUpdate { .. }));
+        assert!(deleted.is_empty(), "nothing was hidden: {deleted:?}");
+        assert_eq!(
+            created,
+            vec![PRIVATE_S.to_string(), PRIVATE_THREAD_S.to_string()],
+            "the parent and then its thread are announced once each, the \
+             already visible channel not at all"
+        );
+
+        let subscribed = state.subscribed.read().await;
+        assert!(subscribed.contains(PRIVATE_S));
+        assert!(subscribed.contains(PRIVATE_THREAD_S));
+        assert!(subscribed.contains(TEXT_S));
+    }
+
+    /// The same reveal through an override on the parent instead of a role.
+    /// The hidden parent is uncached, so its visibility before the update
+    /// cannot be re-derived: the database already holds the new override.
+    #[tokio::test]
+    async fn parent_override_grant_reveals_thread_created_while_hidden() {
+        let db = private_channel_db().await;
+        let mut state = private_channel_state(&[], &[text_channel(TEXT_S, SERVER_S)]).await;
+
+        let mut event =
+            EventV1::ChannelCreate(thread(PRIVATE_THREAD_S, SERVER_S, PRIVATE_S).into());
+        assert!(!state.handle_incoming_event_v1(&db, &mut event).await);
+
+        // As the route does it: write the row, then publish the update.
+        let open = OverrideField { a: 0, d: 0 };
+        db.update_channel(
+            PRIVATE_S,
+            &PartialChannel {
+                default_permissions: Some(open),
+                ..Default::default()
+            },
+            vec![],
+        )
+        .await
+        .expect("update channel");
+
+        let mut event = EventV1::ChannelUpdate {
+            id: PRIVATE_S.to_string(),
+            data: v0::PartialChannel {
+                default_permissions: Some(open),
+                ..Default::default()
+            },
+            clear: vec![],
+        };
+        assert!(state.handle_incoming_event_v1(&db, &mut event).await);
+
+        // The update itself became the parent's ChannelCreate, ahead of the
+        // thread's.
+        assert_eq!(
+            bulk_creates(&event),
+            vec![PRIVATE_S.to_string(), PRIVATE_THREAD_S.to_string()]
+        );
+
+        let subscribed = state.subscribed.read().await;
+        assert!(subscribed.contains(PRIVATE_S));
+        assert!(subscribed.contains(PRIVATE_THREAD_S));
+    }
+
+    /// The ids of a Bulk made only of ChannelCreates, in order.
+    fn bulk_creates(event: &EventV1) -> Vec<String> {
+        let EventV1::Bulk { v } = event else {
+            panic!("expected a Bulk: {event:?}");
+        };
+        v.iter()
+            .map(|event| match event {
+                EventV1::ChannelCreate(channel) => {
+                    let channel: Channel = channel.clone().into();
+                    channel.id().to_string()
+                }
+                other => panic!("expected only ChannelCreate, got {other:?}"),
+            })
+            .collect()
+    }
+
+    /// After a role revoke the hidden parent and thread stay cached. An edit
+    /// to the parent must stay silent, and the override that opens it must
+    /// announce the parent and the thread.
+    #[tokio::test]
+    async fn parent_update_after_role_revoke_follows_what_the_client_knows() {
+        let db = private_channel_db().await;
+        let mut state = private_channel_state(
+            &[ROLE_R],
+            &[
+                text_channel(TEXT_S, SERVER_S),
+                private_channel(),
+                thread(PRIVATE_THREAD_S, SERVER_S, PRIVATE_S),
+            ],
+        )
+        .await;
+
+        let mut event = set_roles(&[]);
+        assert!(state.handle_incoming_event_v1(&db, &mut event).await);
+
+        let mut event = EventV1::ChannelUpdate {
+            id: PRIVATE_S.to_string(),
+            data: v0::PartialChannel {
+                name: Some("renamed secret".to_string()),
+                ..Default::default()
+            },
+            clear: vec![],
+        };
+        assert!(
+            !state.handle_incoming_event_v1(&db, &mut event).await,
+            "an edit to the hidden parent must be dropped"
+        );
+
+        let open = OverrideField { a: 0, d: 0 };
+        db.update_channel(
+            PRIVATE_S,
+            &PartialChannel {
+                default_permissions: Some(open),
+                ..Default::default()
+            },
+            vec![],
+        )
+        .await
+        .expect("update channel");
+
+        let mut event = EventV1::ChannelUpdate {
+            id: PRIVATE_S.to_string(),
+            data: v0::PartialChannel {
+                default_permissions: Some(open),
+                ..Default::default()
+            },
+            clear: vec![],
+        };
+        assert!(state.handle_incoming_event_v1(&db, &mut event).await);
+        assert_eq!(
+            bulk_creates(&event),
+            vec![PRIVATE_S.to_string(), PRIVATE_THREAD_S.to_string()]
+        );
+
+        let subscribed = state.subscribed.read().await;
+        assert!(subscribed.contains(PRIVATE_S));
+        assert!(subscribed.contains(PRIVATE_THREAD_S));
+    }
+
+    /// If bonfire's permission view moved without a recalculation, the next
+    /// update to the channel reconciles against what the client was told: a
+    /// subscribed channel that is no longer viewable is deleted, not left
+    /// subscribed with the update dropped.
+    #[tokio::test]
+    async fn parent_update_heals_subscription_drift() {
+        let db = private_channel_db().await;
+        let mut state = private_channel_state(
+            &[ROLE_R],
+            &[text_channel(TEXT_S, SERVER_S), private_channel()],
+        )
+        .await;
+        state.cache.members.get_mut(SERVER_S).expect("member").roles = vec![];
+
+        let mut event = EventV1::ChannelUpdate {
+            id: PRIVATE_S.to_string(),
+            data: v0::PartialChannel {
+                name: Some("renamed".to_string()),
+                ..Default::default()
+            },
+            clear: vec![],
+        };
+        assert!(state.handle_incoming_event_v1(&db, &mut event).await);
+        assert!(
+            matches!(&event, EventV1::ChannelDelete { id } if id == PRIVATE_S),
+            "the update must become a ChannelDelete: {event:?}"
+        );
+        assert!(!state.subscribed.read().await.contains(PRIVATE_S));
+    }
+
+    /// A recalculation that leaves the parent hidden must not announce the
+    /// never-shown thread's deletion, nor forget it: threads are not in
+    /// `Server.channels`, so an uncached thread could never be revealed by
+    /// the grant that comes later.
+    #[tokio::test]
+    async fn hidden_thread_survives_unrelated_recalculation() {
+        let db = private_channel_db().await;
+        let mut state = private_channel_state(&[], &[text_channel(TEXT_S, SERVER_S)]).await;
+
+        let mut event =
+            EventV1::ChannelCreate(thread(PRIVATE_THREAD_S, SERVER_S, PRIVATE_S).into());
+        assert!(!state.handle_incoming_event_v1(&db, &mut event).await);
+
+        // Recalculates S without changing what we can see.
+        let mut event = set_roles(&[]);
+        assert!(state.handle_incoming_event_v1(&db, &mut event).await);
+        assert!(
+            matches!(event, EventV1::ServerMemberUpdate { .. }),
+            "a recalculation that changes nothing adds nothing, and never \
+             names a hidden channel: {event:?}"
+        );
+        assert!(state.cache.channels.contains_key(PRIVATE_THREAD_S));
+        assert!(!state.subscribed.read().await.contains(PRIVATE_THREAD_S));
+
+        let mut event = set_roles(&[ROLE_R]);
+        assert!(state.handle_incoming_event_v1(&db, &mut event).await);
+        let (created, _, _) = split_bulk(&event);
+        assert!(
+            created.contains(&PRIVATE_THREAD_S.to_string()),
+            "the later grant still reveals the thread: {created:?}"
+        );
+        assert!(state.subscribed.read().await.contains(PRIVATE_THREAD_S));
+    }
+
+    /// Losing the role hides the parent and its thread; getting it back must
+    /// announce both again.
+    #[tokio::test]
+    async fn role_revoke_then_regrant_round_trips_thread() {
+        let db = private_channel_db().await;
+        let mut state = private_channel_state(
+            &[ROLE_R],
+            &[
+                text_channel(TEXT_S, SERVER_S),
+                private_channel(),
+                thread(PRIVATE_THREAD_S, SERVER_S, PRIVATE_S),
+            ],
+        )
+        .await;
+
+        let mut event = set_roles(&[]);
+        assert!(state.handle_incoming_event_v1(&db, &mut event).await);
+        let (created, mut deleted, _) = split_bulk(&event);
+        deleted.sort();
+        assert!(
+            created.is_empty(),
+            "revoke announces nothing new: {created:?}"
+        );
+        assert_eq!(
+            deleted,
+            vec![PRIVATE_S.to_string(), PRIVATE_THREAD_S.to_string()]
+        );
+        {
+            let subscribed = state.subscribed.read().await;
+            assert!(!subscribed.contains(PRIVATE_S));
+            assert!(!subscribed.contains(PRIVATE_THREAD_S));
+            assert!(subscribed.contains(TEXT_S));
+        }
+
+        let mut event = set_roles(&[ROLE_R]);
+        assert!(state.handle_incoming_event_v1(&db, &mut event).await);
+        let (created, deleted, _) = split_bulk(&event);
+        assert!(deleted.is_empty(), "regrant hides nothing: {deleted:?}");
+        assert_eq!(
+            created,
+            vec![PRIVATE_S.to_string(), PRIVATE_THREAD_S.to_string()]
+        );
+        let subscribed = state.subscribed.read().await;
+        assert!(subscribed.contains(PRIVATE_S));
+        assert!(subscribed.contains(PRIVATE_THREAD_S));
+    }
+
+    /// A thread deleted while hidden publishes its ChannelDelete only to its
+    /// own topic, which we were not subscribed to. The grant must not
+    /// resurrect it from the stale cache entry, and must still reveal its
+    /// live sibling (the reference driver fails a batch read on any missing
+    /// id).
+    #[tokio::test]
+    #[allow(clippy::disallowed_methods)]
+    async fn role_grant_skips_thread_deleted_while_hidden() {
+        let db = private_channel_db().await;
+        let sibling = thread(PRIVATE_THREAD2_S, SERVER_S, PRIVATE_S);
+        db.insert_channel(&sibling).await.expect("insert sibling");
+        let mut state = private_channel_state(&[], &[text_channel(TEXT_S, SERVER_S)]).await;
+
+        let hidden_thread = thread(PRIVATE_THREAD_S, SERVER_S, PRIVATE_S);
+        for channel in [&hidden_thread, &sibling] {
+            let mut event = EventV1::ChannelCreate(channel.clone().into());
+            assert!(!state.handle_incoming_event_v1(&db, &mut event).await);
+        }
+        db.delete_channel(&hidden_thread)
+            .await
+            .expect("delete thread");
+
+        let mut event = set_roles(&[ROLE_R]);
+        assert!(state.handle_incoming_event_v1(&db, &mut event).await);
+        let (created, _, _) = split_bulk(&event);
+        assert_eq!(
+            created,
+            vec![PRIVATE_S.to_string(), PRIVATE_THREAD2_S.to_string()],
+            "the parent and the live thread are announced, not the deleted one"
+        );
+        assert!(!state.cache.channels.contains_key(PRIVATE_THREAD_S));
+        let subscribed = state.subscribed.read().await;
+        assert!(!subscribed.contains(PRIVATE_THREAD_S));
+        assert!(subscribed.contains(PRIVATE_THREAD2_S));
+    }
+
+    /// ServerCreate carries the channels the client may see; recalculation
+    /// must not announce any of them a second time.
+    #[tokio::test]
+    async fn server_create_announces_no_channel_twice() {
+        let db = private_channel_db().await;
+        let user = User {
+            id: SELF_ID.to_string(),
+            username: "self".to_string(),
+            ..Default::default()
+        };
+        let mut state = State::from(user, "session".to_string());
+        state.apply_state().await;
+
+        let mut event = EventV1::ServerCreate {
+            id: SERVER_S.to_string(),
+            server: server_with_private_channel().into(),
+            channels: vec![text_channel(TEXT_S, SERVER_S).into()],
+            emojis: vec![],
+            stickers: vec![],
+            voice_states: vec![],
+        };
+        assert!(state.handle_incoming_event_v1(&db, &mut event).await);
+        assert!(
+            matches!(event, EventV1::ServerCreate { .. }),
+            "nothing is added to ServerCreate: {event:?}"
+        );
+        let subscribed = state.subscribed.read().await;
+        assert!(subscribed.contains(SERVER_S));
+        assert!(subscribed.contains(TEXT_S));
+        assert!(!subscribed.contains(PRIVATE_S));
+    }
+
+    /// Leave, then rejoin in the same session. The client swept the server's
+    /// threads on leave; the socket must neither keep delivering them nor
+    /// bring them back as stale state on the ServerCreate.
+    #[tokio::test]
+    async fn rejoin_after_leave_carries_no_stale_thread() {
+        let db = private_channel_db().await;
+        let mut state = private_channel_state(
+            &[],
+            &[
+                text_channel(TEXT_S, SERVER_S),
+                thread(THREAD_S, SERVER_S, TEXT_S),
+            ],
+        )
+        .await;
+
+        let mut event =
+            EventV1::ChannelCreate(thread(PRIVATE_THREAD_S, SERVER_S, PRIVATE_S).into());
+        assert!(!state.handle_incoming_event_v1(&db, &mut event).await);
+
+        let mut event = self_leave();
+        assert!(state.handle_incoming_event_v1(&db, &mut event).await);
+
+        let mut event = EventV1::ServerCreate {
+            id: SERVER_S.to_string(),
+            server: server_with_private_channel().into(),
+            channels: vec![text_channel(TEXT_S, SERVER_S).into()],
+            emojis: vec![],
+            stickers: vec![],
+            voice_states: vec![],
+        };
+        assert!(state.handle_incoming_event_v1(&db, &mut event).await);
+        assert!(
+            matches!(event, EventV1::ServerCreate { .. }),
+            "rejoin adds nothing to ServerCreate: {event:?}"
+        );
+
+        let subscribed = state.subscribed.read().await;
+        assert!(subscribed.contains(TEXT_S));
+        for id in [THREAD_S, PRIVATE_THREAD_S] {
+            assert!(!subscribed.contains(id), "{id} must not be subscribed");
+            assert!(
+                !state.cache.channels.contains_key(id),
+                "{id} must not be cached"
+            );
+        }
     }
 }
