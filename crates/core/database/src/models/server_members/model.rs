@@ -286,6 +286,24 @@ impl Member {
         intention: RemovalIntention,
         silent: bool,
     ) -> Result<()> {
+        // Thread membership cascade: drop the member's thread rows in this server
+        // so a departed member stops being a thread push target. This is hygiene,
+        // not the gate: the thread push path filters recipients by live server
+        // membership itself. Runs before the soft delete and propagates errors, so
+        // a failure leaves the member in place and a retried removal redoes it.
+        for thread_id in db
+            .fetch_joined_thread_ids(&self.id.user, &self.id.server)
+            .await?
+        {
+            db.leave_thread(&thread_id, &self.id.user).await?;
+            EventV1::ThreadMemberLeave {
+                id: thread_id,
+                user: self.id.user.to_string(),
+            }
+            .p(self.id.server.to_string())
+            .await;
+        }
+
         db.soft_delete_member(&self.id).await?;
 
         // Calendar cascade (slice F): drop the member's RSVP rows for this server so
@@ -348,10 +366,12 @@ impl Member {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+
     use iso8601_timestamp::{Duration, Timestamp};
     use revolt_models::v0::DataCreateServer;
 
-    use crate::{Member, PartialMember, RemovalIntention, Server, User};
+    use crate::{Channel, Member, PartialMember, RemovalIntention, Server, User};
 
     #[tokio::test]
     async fn muted_member_rejoin() {
@@ -413,6 +433,107 @@ mod tests {
                 .0;
 
             assert!(kickable_member.in_timeout())
+        });
+    }
+
+    /// Removing a member drops their thread rows in that server (so they stop
+    /// being a thread push target) and leaves their rows in other servers alone.
+    #[tokio::test]
+    async fn remove_drops_thread_memberships_in_that_server_only() {
+        database_test!(|db| async move {
+            let owner = User::create(&db, "01MRT Owner".to_string(), None, None)
+                .await
+                .unwrap();
+            let user = User::create(&db, "01MRT Member".to_string(), None, None)
+                .await
+                .unwrap();
+
+            let new_server = |name: &str| DataCreateServer {
+                name: name.to_string(),
+                description: None,
+                nsfw: None,
+            };
+            let server = Server::create(&db, new_server("01MRT S"), &owner, false)
+                .await
+                .unwrap()
+                .0;
+            let other_server = Server::create(&db, new_server("01MRT S2"), &owner, false)
+                .await
+                .unwrap()
+                .0;
+
+            let thread = |id: &str, server: &str| Channel::Thread {
+                id: id.to_string(),
+                server: server.to_string(),
+                parent_channel: "01MRTPARENT".to_string(),
+                name: id.to_string(),
+                creator: owner.id.clone(),
+                origin_message_id: None,
+                last_message_id: None,
+                archived: false,
+                archived_timestamp: None,
+                auto_archive_minutes: Channel::default_auto_archive_minutes(),
+                locked: false,
+                applied_tags: vec![],
+            };
+            for channel in [
+                thread("01MRTTHREAD1", &server.id),
+                thread("01MRTTHREAD2", &server.id),
+                thread("01MRTTHREAD9", &other_server.id),
+            ] {
+                db.insert_channel(&channel).await.unwrap();
+            }
+
+            // No timeout on either membership: the reference driver panics on
+            // soft-deleting a timed-out member.
+            let member = Member::create(&db, &server, &user, None).await.unwrap().0;
+            Member::create(&db, &other_server, &user, None)
+                .await
+                .unwrap();
+
+            for thread_id in ["01MRTTHREAD1", "01MRTTHREAD2", "01MRTTHREAD9"] {
+                assert!(db.join_thread_if_absent(thread_id, &user.id).await.unwrap());
+            }
+
+            let joined: HashSet<String> = db
+                .fetch_joined_thread_ids(&user.id, &server.id)
+                .await
+                .unwrap()
+                .into_iter()
+                .collect();
+            assert_eq!(
+                joined,
+                HashSet::from(["01MRTTHREAD1".to_string(), "01MRTTHREAD2".to_string()]),
+                "precondition: the user has joined both threads in S"
+            );
+
+            member
+                .remove(&db, &server, RemovalIntention::Ban, false)
+                .await
+                .unwrap();
+
+            assert!(
+                db.fetch_joined_thread_ids(&user.id, &server.id)
+                    .await
+                    .unwrap()
+                    .is_empty(),
+                "removal must drop the member's thread rows in S"
+            );
+            assert!(
+                !db.fetch_thread_members("01MRTTHREAD1")
+                    .await
+                    .unwrap()
+                    .iter()
+                    .any(|row| row.id.user == user.id),
+                "removal must drop the member from T1's member list"
+            );
+            assert_eq!(
+                db.fetch_joined_thread_ids(&user.id, &other_server.id)
+                    .await
+                    .unwrap(),
+                vec!["01MRTTHREAD9".to_string()],
+                "thread rows in another server must survive"
+            );
         });
     }
 }
