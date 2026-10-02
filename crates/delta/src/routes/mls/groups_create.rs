@@ -3,7 +3,7 @@ use revolt_database::{
     is_valid_device_id, is_valid_group_id,
     util::reference::Reference,
     voice::{get_voice_state, UserVoiceChannel},
-    Database, MlsGroup, MlsGroupCreateOutcome, MlsMemberDevice, Session, User,
+    Database, MlsGroup, MlsGroupCreateOutcome, MlsGroupKind, MlsMemberDevice, Session, User,
 };
 use revolt_models::v0;
 use revolt_result::{create_error, Result};
@@ -114,6 +114,11 @@ pub async fn create_group(
         }],
         closed_at: None,
         superseded_by: None,
+        kind: MlsGroupKind::Call,
+        generation: None,
+        seat_list_ad_sha256: None,
+        pending_removals: vec![],
+        member_added: vec![],
     };
 
     match db.create_mls_group(&group, data.supersedes.as_deref()).await? {

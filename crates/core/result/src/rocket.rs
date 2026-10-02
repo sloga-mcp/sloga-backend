@@ -167,6 +167,11 @@ impl<'r> Responder<'r, 'static> for Error {
             ErrorType::IncorrectData { .. } => Status::BadRequest,
             ErrorType::MlsCallFull { .. } => Status::Conflict,
             ErrorType::VideoCallFull { .. } => Status::Conflict,
+            ErrorType::ProtectedChannelResecuring { .. } => Status::Conflict,
+            ErrorType::NotSeated => Status::Forbidden,
+            ErrorType::SeatCapReached { .. } => Status::BadRequest,
+            ErrorType::ChannelProtected => Status::BadRequest,
+            ErrorType::ProtectedFieldRefused { .. } => Status::BadRequest,
         };
 
         // Serialize the error data structure into JSON.

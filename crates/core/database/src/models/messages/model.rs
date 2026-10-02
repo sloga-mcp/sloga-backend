@@ -1,3 +1,4 @@
+use base64::{engine::general_purpose::STANDARD_NO_PAD, Engine};
 use indexmap::{IndexMap, IndexSet};
 use iso8601_timestamp::Timestamp;
 use revolt_config::{config, FeaturesLimits};
@@ -14,6 +15,7 @@ use validator::Validate;
 
 use crate::{
     events::client::EventV1,
+    is_valid_device_id, is_valid_group_id,
     util::{
         bulk_permissions::BulkDatabasePermissionQuery, idempotency::IdempotencyKey,
         permissions::DatabasePermissionQuery,
@@ -131,9 +133,236 @@ auto_derived_partial!(
         /// Bitfield of message flags
         #[serde(skip_serializing_if = "Option::is_none")]
         pub flags: Option<u32>,
+
+        /// Protected-channel ciphertext (design 2.6). When present, the
+        /// readable message lives only inside `ciphertext`; `nonce` carries
+        /// the client message id that the AAD binds.
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        pub encrypted: Option<EncryptedPayload>,
     },
     "PartialMessage"
 );
+
+auto_derived!(
+    /// Encrypted body of a protected-channel message (design 2.6)
+    ///
+    /// The server stores and relays it; it never holds the key and never
+    /// verifies `sig` (the signed payload includes fields that exist only
+    /// inside the ciphertext). Field order is the wire order of the 5.6
+    /// vector.
+    #[serde(deny_unknown_fields)]
+    pub struct EncryptedPayload {
+        /// Payload format version, exactly 1
+        pub v: u8,
+        /// Text group id, 64 lowercase hex
+        pub group_id: String,
+        /// MLS epoch the message key was exported from, `0..=2^53-1`
+        pub epoch: i64,
+        /// Sending device id, 32 lowercase hex
+        pub sender_device_id: String,
+        /// AEAD nonce (b64 of 24 bytes); NOT the message-level `nonce`
+        pub nonce: String,
+        /// AEAD ciphertext with the 16-byte tag appended (b64)
+        pub ciphertext: String,
+        /// Ed25519 signature by the sender device identity key (b64 of 64 bytes)
+        pub sig: String,
+        /// Reserved for message franking; must be absent or null in S1
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        pub franking: Option<String>,
+    }
+);
+
+impl EncryptedPayload {
+    /// The only accepted payload version
+    pub const VERSION: u8 = 1;
+    /// Largest epoch that survives a JSON number round trip (design 0.2)
+    pub const MAX_EPOCH: i64 = (1 << 53) - 1;
+    /// AEAD nonce length (XChaCha20-Poly1305)
+    pub const NONCE_BYTES: usize = 24;
+    /// Ed25519 signature length
+    pub const SIG_BYTES: usize = 64;
+    /// Smallest ciphertext: one plaintext byte plus the 16-byte tag
+    pub const CIPHERTEXT_MIN_BYTES: usize = 17;
+    /// Ciphertext cap (16 KiB), checked on the decoded length
+    pub const CIPHERTEXT_MAX_BYTES: usize = 16384;
+    /// Unpadded b64 length of `CIPHERTEXT_MAX_BYTES`, checked before decoding
+    pub const CIPHERTEXT_MAX_ENCODED: usize = 21846;
+
+    /// Structural validation of the payload (design 2.6)
+    ///
+    /// Checks the version, both id charsets, the epoch range, and the exact
+    /// decoded lengths of `nonce`, `ciphertext` and `sig` under canonical
+    /// unpadded standard base64. A non-null `franking` is refused with
+    /// `ProtectedFieldRefused`; every other failure is `FailedValidation`.
+    /// Unknown fields never get this far: `deny_unknown_fields` refuses them
+    /// at deserialization.
+    pub fn validate_structure(&self) -> Result<()> {
+        let invalid = |error: &str| -> Result<()> {
+            Err(create_error!(FailedValidation {
+                error: format!("encrypted.{error}")
+            }))
+        };
+
+        if self.v != Self::VERSION {
+            return invalid("v must be 1");
+        }
+
+        if !is_valid_group_id(&self.group_id) {
+            return invalid("group_id must be 64 lowercase hex");
+        }
+
+        if !(0..=Self::MAX_EPOCH).contains(&self.epoch) {
+            return invalid("epoch out of range");
+        }
+
+        if !is_valid_device_id(&self.sender_device_id) {
+            return invalid("sender_device_id must be 32 lowercase hex");
+        }
+
+        if decode_b64_exact(&self.nonce, Self::NONCE_BYTES).is_none() {
+            return invalid("nonce must be b64 of 24 bytes");
+        }
+
+        // Encoded length first, so oversized input is never decoded
+        if self.ciphertext.len() > Self::CIPHERTEXT_MAX_ENCODED {
+            return invalid("ciphertext too large");
+        }
+
+        match STANDARD_NO_PAD.decode(&self.ciphertext) {
+            Ok(bytes)
+                if (Self::CIPHERTEXT_MIN_BYTES..=Self::CIPHERTEXT_MAX_BYTES)
+                    .contains(&bytes.len()) => {}
+            Ok(_) => return invalid("ciphertext length out of range"),
+            Err(_) => return invalid("ciphertext must be b64"),
+        }
+
+        if decode_b64_exact(&self.sig, Self::SIG_BYTES).is_none() {
+            return invalid("sig must be b64 of 64 bytes");
+        }
+
+        if self.franking.is_some() {
+            return Err(create_error!(ProtectedFieldRefused {
+                field: "encrypted.franking".to_string()
+            }));
+        }
+
+        Ok(())
+    }
+}
+
+/// Decode canonical unpadded standard base64 of an exact byte length
+///
+/// `STANDARD_NO_PAD` refuses padding, whitespace, the URL-safe alphabet and
+/// non-canonical trailing bits (design 0.1).
+fn decode_b64_exact(value: &str, length: usize) -> Option<Vec<u8>> {
+    if value.len() != (length * 4).div_ceil(3) {
+        return None;
+    }
+
+    STANDARD_NO_PAD
+        .decode(value)
+        .ok()
+        .filter(|bytes| bytes.len() == length)
+}
+
+/// A client message id (`cid`): a canonical ULID, 26 chars of uppercase
+/// Crockford base32 whose first char keeps it within 128 bits (design 0.1)
+pub fn is_valid_client_message_id(cid: &str) -> bool {
+    cid.len() == 26
+        && cid.starts_with(|c: char| ('0'..='7').contains(&c))
+        && cid
+            .chars()
+            .all(|c| c.is_ascii_digit() || (c.is_ascii_uppercase() && !"ILOU".contains(c)))
+}
+
+/// `flags` a protected-channel message may carry: absent, 0, or the value
+/// `has_suppressed_notifications` honours (`SuppressNotifications as u32`,
+/// i.e. 1). Every other bit is refused, the mass-mention bits included.
+///
+/// Note: `MessageFlagsValue::has`/`set` read `SuppressNotifications` as a bit
+/// INDEX (value 2), so `create_from_api_with_id` stores a request's 2 as 2,
+/// which the push gate does not treat as silent, and never stores 1. Only
+/// 0/1 are allowed here so a stored protected message can never claim a
+/// flag the server does not honour.
+fn is_allowed_protected_flags(flags: Option<u32>) -> bool {
+    flags.is_none_or(|flags| flags <= MessageFlags::SuppressNotifications as u32)
+}
+
+fn protected_field_refused(field: &str) -> revolt_result::Error {
+    create_error!(ProtectedFieldRefused {
+        field: field.to_string()
+    })
+}
+
+/// The ciphertext half shared by both protected-channel checks: the payload
+/// is present and well formed, and the message-level `nonce` is the client
+/// message id the AAD binds (design 2.6, 3.5)
+fn validate_protected_ciphertext(
+    encrypted: Option<&EncryptedPayload>,
+    nonce: Option<&str>,
+) -> Result<()> {
+    let Some(encrypted) = encrypted else {
+        return Err(create_error!(ChannelProtected));
+    };
+
+    encrypted.validate_structure()?;
+
+    if !nonce.is_some_and(is_valid_client_message_id) {
+        return Err(create_error!(FailedValidation {
+            error: "nonce must be the ULID client message id".to_string()
+        }));
+    }
+
+    Ok(())
+}
+
+/// Defense-in-depth refusal of a send into, or ciphertext outside, a
+/// protected channel (design 2.6), run before any side effect of
+/// `create_from_api_with_id`. The route allowlist (7.3) is the primary check.
+///
+/// Field names match `DataMessageSend`; any plaintext-bearing field that is
+/// present (even empty) is refused, as the route does.
+fn validate_protected_send(
+    channel_protected: bool,
+    author: &MessageAuthor<'_>,
+    data: &DataMessageSend,
+    resolved_attachments: bool,
+) -> Result<()> {
+    if !channel_protected {
+        if data.encrypted.is_some() {
+            return Err(protected_field_refused("encrypted"));
+        }
+
+        return Ok(());
+    }
+
+    // Webhooks and system authors never write into a protected channel (7.4)
+    if !matches!(author, MessageAuthor::User(_)) {
+        return Err(create_error!(ChannelProtected));
+    }
+
+    let present = [
+        ("content", data.content.is_some()),
+        (
+            "attachments",
+            data.attachments.is_some() || resolved_attachments,
+        ),
+        ("replies", data.replies.is_some()),
+        ("embeds", data.embeds.is_some()),
+        ("masquerade", data.masquerade.is_some()),
+        ("interactions", data.interactions.is_some()),
+        ("components", data.components.is_some()),
+        ("sticker_ids", data.sticker_ids.is_some()),
+        ("flags", !is_allowed_protected_flags(data.flags)),
+    ];
+
+    if let Some((field, _)) = present.iter().find(|(_, is_present)| *is_present) {
+        return Err(protected_field_refused(field));
+    }
+
+    let encrypted = data.encrypted.clone().map(EncryptedPayload::from);
+    validate_protected_ciphertext(encrypted.as_ref(), data.nonce.as_deref())
+}
 
 auto_derived!(
     /// System Event
@@ -381,6 +610,7 @@ impl Default for Message {
             softres: None,
             forwarded: None,
             crosspost: None,
+            encrypted: None,
         }
     }
 }
@@ -463,16 +693,28 @@ impl Message {
             limits.message_length,
         )?;
 
+        // Protected-channel shape (design 2.6), before the nonce is consumed
+        // or any attachment claimed. Early refusal only: `channel` may be a
+        // stale snapshot, so the authoritative check is the driver's
+        // `insert_message`, which re-reads the channel.
+        validate_protected_send(
+            channel.is_protected(),
+            &author,
+            &data,
+            resolved_attachments.is_some(),
+        )?;
+
         idempotency
             .consume_nonce(data.nonce)
             .await
             .map_err(|_| create_error!(InvalidOperation))?;
 
-        // Check the message is not empty
+        // Check the message is not empty; ciphertext alone is a message
         if (data.content.as_ref().is_none_or(|v| v.is_empty()))
             && (data.attachments.as_ref().is_none_or(|v| v.is_empty()))
             && (data.embeds.as_ref().is_none_or(|v| v.is_empty()))
             && (data.sticker_ids.as_ref().is_none_or(|v| v.is_empty()))
+            && data.encrypted.is_none()
         {
             return Err(create_error!(EmptyMessage));
         }
@@ -561,6 +803,7 @@ impl Message {
             webhook: webhook.map(|w| w.into()),
             flags: data.flags,
             components: data.components,
+            encrypted: data.encrypted.map(Into::into),
             ..Default::default()
         };
 
@@ -829,6 +1072,103 @@ impl Message {
         Ok(message)
     }
 
+    /// Stored-shape invariant for a message about to be inserted (design 2.6)
+    ///
+    /// In a protected channel the message carries a well-formed `encrypted`
+    /// payload and a ULID `nonce`, `flags` limited to 0 or the honoured
+    /// suppress value, and every plaintext-bearing field is `None` or empty
+    /// with default `interactions`. Outside one, `encrypted` is refused.
+    /// Beyond the design list this also refuses `softres`, `forwarded` and
+    /// `crosspost`, which carry server-readable content.
+    ///
+    /// Both drivers' `insert_message` call this against a channel read made
+    /// immediately before the write, so every insert path is covered.
+    pub fn validate_protected_shape(&self, channel_protected: bool) -> Result<()> {
+        if !channel_protected {
+            if self.encrypted.is_some() {
+                return Err(protected_field_refused("encrypted"));
+            }
+
+            return Ok(());
+        }
+
+        let present = [
+            (
+                "content",
+                self.content.as_ref().is_some_and(|v| !v.is_empty()),
+            ),
+            (
+                "embeds",
+                self.embeds.as_ref().is_some_and(|v| !v.is_empty()),
+            ),
+            (
+                "attachments",
+                self.attachments.as_ref().is_some_and(|v| !v.is_empty()),
+            ),
+            ("masquerade", self.masquerade.is_some()),
+            (
+                "replies",
+                self.replies.as_ref().is_some_and(|v| !v.is_empty()),
+            ),
+            (
+                "mentions",
+                self.mentions.as_ref().is_some_and(|v| !v.is_empty()),
+            ),
+            (
+                "role_mentions",
+                self.role_mentions.as_ref().is_some_and(|v| !v.is_empty()),
+            ),
+            (
+                "sticker_ids",
+                self.sticker_ids.as_ref().is_some_and(|v| !v.is_empty()),
+            ),
+            ("system", self.system.is_some()),
+            (
+                "components",
+                self.components.as_ref().is_some_and(|v| !v.is_empty()),
+            ),
+            ("poll", self.poll.is_some()),
+            ("command_context", self.command_context.is_some()),
+            ("webhook", self.webhook.is_some()),
+            ("thread_id", self.thread_id.is_some()),
+            ("interactions", !self.interactions.is_default()),
+            ("softres", self.softres.is_some()),
+            ("forwarded", self.forwarded.is_some()),
+            ("crosspost", self.crosspost.is_some()),
+            ("flags", !is_allowed_protected_flags(self.flags)),
+        ];
+
+        if let Some((field, _)) = present.iter().find(|(_, is_present)| *is_present) {
+            return Err(protected_field_refused(field));
+        }
+
+        validate_protected_ciphertext(self.encrypted.as_ref(), self.nonce.as_deref())
+    }
+
+    /// Driver half of the stored-shape check: `channel` is the result of a
+    /// channel read made inside `insert_message`, immediately before the write
+    ///
+    /// A missing channel (`NotFound`) is unprotected: `protected` exists only
+    /// on a channel document, so a message whose channel does not exist is in
+    /// no protected channel. Any other read error refuses the insert (fails
+    /// closed).
+    ///
+    /// This check alone is check-then-act against `protect_channel`, which is
+    /// check-then-act too ("no messages exist", then set `protected`). The
+    /// drivers close the race themselves: Reference holds `channels` across
+    /// this check and the write; Mongo follows the insert with a write to the
+    /// channel document filtered on `protected != true` and undoes the insert
+    /// if it matches nothing (see `messages/ops/mongodb.rs`).
+    pub(crate) fn validate_protected_insert(&self, channel: Result<Channel>) -> Result<()> {
+        let channel_protected = match channel {
+            Ok(channel) => channel.is_protected(),
+            Err(error) if matches!(error.error_type, ErrorType::NotFound) => false,
+            Err(error) => return Err(error),
+        };
+
+        self.validate_protected_shape(channel_protected)
+    }
+
     /// Send a message without any notifications
     pub async fn send_without_notifications(
         &mut self,
@@ -841,6 +1181,8 @@ impl Message {
         // If this is true, you MUST call tasks::ack::queue yourself.
         mentions_elsewhere: bool,
     ) -> Result<()> {
+        // The driver re-reads the channel and enforces the protected-channel
+        // stored shape (design 2.6) itself; no caller snapshot is trusted
         db.insert_message(self).await?;
 
         // Fan out events
@@ -934,6 +1276,9 @@ impl Message {
         generate_embeds: bool,
         ack_author: bool,
     ) -> Result<()> {
+        // `channel` is the caller's snapshot and may predate a protect; it is
+        // never used for the protected decision. `insert_message` re-reads
+        // the channel immediately before the write (design 2.6).
         self.send_without_notifications(
             db,
             user.clone(),
@@ -1946,5 +2291,503 @@ mod silent_flag_tests {
             assert!(!stored.has_suppressed_notifications());
             assert!(queued.iter().all(|(_, _, _, silenced)| !silenced));
         });
+    }
+}
+
+#[cfg(test)]
+mod encrypted_payload_tests {
+    use base64::engine::general_purpose::STANDARD;
+
+    use super::*;
+
+    /// Design 5.6 `tv:payload_json`, byte for byte
+    const PAYLOAD_JSON: &str = r#"{"v":1,"group_id":"4a4ba4afc6e6ea1c9f4a271f7eded44ea860fdb814e4e1377121e02635a715b5","epoch":7,"sender_device_id":"ffeeddccbbaa99887766554433221100","nonce":"YGFiY2RlZmdoaWprbG1ub3BxcnN0dXZ3","ciphertext":"7lyFR0kjzwme2lNYYODt2rZmmYbNUdZ30V/L+qdgbzKONjAeYv8uelDf4K/WcWB+eZH5NVTNV+9i0rW+AGfyD6wMllEfcDpoWSemybsLAnUd2vkx5tmdCrhnWkKmIt4AYuiW2wJroVo6I6KRe9NVyjAYMDwcOtyPnYobI5CPNwg3O7QjdMMjhdkjNGEVh4oGVS+nI04P","sig":"Ylo7oNHshb/EPJ67afoJrw2H0t6FKRiM3dDOUbHGchXCtq3AqxJLv0GuR87KNu8msVg2nKn3iVs4OCDOu15MAA"}"#;
+
+    /// Design 5.6 client message id (`Message.nonce`)
+    const CID: &str = "01JA0000000000000000000MSG";
+
+    fn vector() -> EncryptedPayload {
+        serde_json::from_str(PAYLOAD_JSON).expect("5.6 payload_json deserializes")
+    }
+
+    fn assert_failed_validation(result: Result<()>) {
+        let error = result.expect_err("must be refused");
+        assert!(
+            matches!(error.error_type, ErrorType::FailedValidation { .. }),
+            "expected FailedValidation, got {:?}",
+            error.error_type
+        );
+    }
+
+    fn assert_field_refused(result: Result<()>, expected: &str) {
+        let error = result.expect_err("must be refused");
+        match error.error_type {
+            ErrorType::ProtectedFieldRefused { ref field } => assert_eq!(field, expected),
+            other => panic!("expected ProtectedFieldRefused {{ {expected} }}, got {other:?}"),
+        }
+    }
+
+    fn protected_message() -> Message {
+        Message {
+            id: "01JA0000000000000000000MS1".to_string(),
+            nonce: Some(CID.to_string()),
+            channel: "01J9Z3K4M5N6P7Q8R9S0T1V2W3".to_string(),
+            author: "01HZXBBBBBBBBBBBBBBBBBBBBB".to_string(),
+            flags: Some(0),
+            encrypted: Some(vector()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn vector_payload_validates_and_round_trips_byte_exact() {
+        let payload = vector();
+        payload.validate_structure().expect("5.6 vector is valid");
+        assert_eq!(payload.franking, None);
+        assert_eq!(
+            serde_json::to_string(&payload).expect("serializes"),
+            PAYLOAD_JSON
+        );
+    }
+
+    #[test]
+    fn each_single_field_corruption_is_refused() {
+        let corruptions: &[(&str, fn(&mut EncryptedPayload))] = &[
+            ("v = 0", |p| p.v = 0),
+            ("v = 2", |p| p.v = 2),
+            ("group_id uppercase", |p| {
+                p.group_id = p.group_id.to_uppercase()
+            }),
+            ("group_id short", |p| {
+                p.group_id.pop();
+            }),
+            ("epoch negative", |p| p.epoch = -1),
+            ("epoch above 2^53-1", |p| p.epoch = 1 << 53),
+            ("sender_device_id uppercase", |p| {
+                p.sender_device_id = p.sender_device_id.to_uppercase()
+            }),
+            ("sender_device_id long", |p| p.sender_device_id.push('0')),
+            ("nonce 23 bytes", |p| {
+                p.nonce = STANDARD_NO_PAD.encode([7u8; 23])
+            }),
+            ("nonce url-safe alphabet", |p| {
+                p.nonce.replace_range(0..1, "-")
+            }),
+            ("nonce whitespace", |p| p.nonce.replace_range(0..1, " ")),
+            ("ciphertext 16 bytes", |p| {
+                p.ciphertext = STANDARD_NO_PAD.encode([7u8; 16])
+            }),
+            ("ciphertext padded", |p| {
+                p.ciphertext = STANDARD.encode([7u8; 17])
+            }),
+            ("ciphertext not b64", |p| {
+                p.ciphertext.replace_range(0..1, "*")
+            }),
+            ("sig 63 bytes", |p| {
+                p.sig = STANDARD_NO_PAD.encode([7u8; 63])
+            }),
+            ("sig non-canonical trailing bits", |p| {
+                p.sig.pop();
+                p.sig.push('B');
+            }),
+        ];
+
+        for (name, corrupt) in corruptions.iter() {
+            let mut payload = vector();
+            corrupt(&mut payload);
+            let error = payload
+                .validate_structure()
+                .expect_err(&format!("{name} must be refused"));
+            assert!(
+                matches!(error.error_type, ErrorType::FailedValidation { .. }),
+                "{name}: expected FailedValidation, got {:?}",
+                error.error_type
+            );
+        }
+    }
+
+    #[test]
+    fn franking_null_is_accepted_and_non_null_refused() {
+        let with_null = PAYLOAD_JSON.replacen("{", r#"{"franking":null,"#, 1);
+        let payload: EncryptedPayload = serde_json::from_str(&with_null).expect("null franking");
+        payload
+            .validate_structure()
+            .expect("null franking is valid");
+
+        let mut payload = vector();
+        payload.franking = Some(String::new());
+        assert_field_refused(payload.validate_structure(), "encrypted.franking");
+    }
+
+    #[test]
+    fn unknown_field_is_refused_at_deserialization() {
+        let with_extra = PAYLOAD_JSON.replacen("{", r#"{"extra":1,"#, 1);
+        assert!(serde_json::from_str::<EncryptedPayload>(&with_extra).is_err());
+    }
+
+    #[test]
+    fn ciphertext_cap_boundaries() {
+        for (bytes, ok) in [(17, true), (16384, true), (16, false), (16385, false)] {
+            let mut payload = vector();
+            payload.ciphertext = STANDARD_NO_PAD.encode(vec![7u8; bytes]);
+            assert_eq!(
+                payload.validate_structure().is_ok(),
+                ok,
+                "{bytes}-byte ciphertext"
+            );
+        }
+
+        let mut payload = vector();
+        payload.ciphertext = "A".repeat(EncryptedPayload::CIPHERTEXT_MAX_ENCODED + 1);
+        assert_failed_validation(payload.validate_structure());
+    }
+
+    #[test]
+    fn client_message_id_is_a_canonical_ulid() {
+        assert!(is_valid_client_message_id(CID));
+        assert!(is_valid_client_message_id("7ZZZZZZZZZZZZZZZZZZZZZZZZZ"));
+        for bad in [
+            "01ja0000000000000000000msg",
+            "01JA0000000000000000000MSI",
+            "01JA0000000000000000000MSL",
+            "01JA0000000000000000000MSO",
+            "01JA0000000000000000000MSU",
+            "01JA0000000000000000000MS",
+            "01JA0000000000000000000MSGG",
+            "8ZZZZZZZZZZZZZZZZZZZZZZZZZ",
+            "",
+        ] {
+            assert!(!is_valid_client_message_id(bad), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn message_without_encrypted_omits_the_key() {
+        let value = serde_json::to_value(Message::default()).expect("serializes");
+        assert!(value.get("encrypted").is_none());
+
+        let value = serde_json::to_value(protected_message()).expect("serializes");
+        assert_eq!(
+            value.get("encrypted").and_then(|v| v.get("epoch")),
+            Some(&serde_json::json!(7))
+        );
+    }
+
+    #[test]
+    fn protected_shape_accepts_ciphertext_only() {
+        protected_message()
+            .validate_protected_shape(true)
+            .expect("ciphertext-only message is valid");
+
+        // Empty collections count as absent (design 2.6 "None/empty")
+        let mut message = protected_message();
+        message.replies = Some(vec![]);
+        message.mentions = Some(vec![]);
+        message
+            .validate_protected_shape(true)
+            .expect("empty collections are valid");
+    }
+
+    #[test]
+    fn protected_shape_refuses_plaintext_fields() {
+        let cases: &[(&str, fn(&mut Message))] = &[
+            ("content", |m| m.content = Some("hi".to_string())),
+            ("replies", |m| m.replies = Some(vec![CID.to_string()])),
+            ("mentions", |m| m.mentions = Some(vec![CID.to_string()])),
+            ("role_mentions", |m| {
+                m.role_mentions = Some(vec![CID.to_string()])
+            }),
+            ("sticker_ids", |m| {
+                m.sticker_ids = Some(vec![CID.to_string()])
+            }),
+            ("system", |m| {
+                m.system = Some(SystemMessage::UserJoined {
+                    id: CID.to_string(),
+                })
+            }),
+            ("masquerade", |m| {
+                m.masquerade = Some(Masquerade {
+                    name: Some("x".to_string()),
+                    avatar: None,
+                    colour: None,
+                })
+            }),
+            ("thread_id", |m| m.thread_id = Some(CID.to_string())),
+            ("interactions", |m| m.interactions.restrict_reactions = true),
+        ];
+
+        for (field, corrupt) in cases.iter() {
+            let mut message = protected_message();
+            corrupt(&mut message);
+            assert_field_refused(message.validate_protected_shape(true), field);
+        }
+    }
+
+    #[test]
+    fn protected_shape_requires_ciphertext_and_a_ulid_nonce() {
+        let mut message = protected_message();
+        message.encrypted = None;
+        let error = message
+            .validate_protected_shape(true)
+            .expect_err("plaintext into a protected channel");
+        assert!(matches!(error.error_type, ErrorType::ChannelProtected));
+
+        for nonce in [None, Some("not-a-ulid".to_string())] {
+            let mut message = protected_message();
+            message.nonce = nonce;
+            assert_failed_validation(message.validate_protected_shape(true));
+        }
+
+        let mut message = protected_message();
+        message.encrypted.as_mut().unwrap().v = 2;
+        assert_failed_validation(message.validate_protected_shape(true));
+    }
+
+    #[test]
+    fn unprotected_channel_refuses_ciphertext_only() {
+        assert_field_refused(
+            protected_message().validate_protected_shape(false),
+            "encrypted",
+        );
+
+        let plain = Message {
+            content: Some("hi".to_string()),
+            ..Default::default()
+        };
+        plain
+            .validate_protected_shape(false)
+            .expect("ordinary message is valid");
+    }
+
+    #[test]
+    fn protected_shape_bounds_flags() {
+        for (flags, ok) in [
+            (None, true),
+            (Some(0), true),
+            (Some(MessageFlags::SuppressNotifications as u32), true),
+            // `MessageFlagsValue` encodings: suppress-as-index, everyone, online
+            (Some(2), false),
+            (Some(4), false),
+            (Some(8), false),
+            (Some(5), false),
+        ] {
+            let mut message = protected_message();
+            message.flags = flags;
+            let result = message.validate_protected_shape(true);
+            if ok {
+                result.unwrap_or_else(|e| panic!("{flags:?} must be accepted: {e:?}"));
+            } else {
+                assert_field_refused(result, "flags");
+            }
+        }
+    }
+
+    const PROTECTED_CHANNEL: &str = "01J9Z3K4M5N6P7Q8R9S0T1V2W3";
+    const OPEN_CHANNEL: &str = "01J9Z3K4M5N6P7Q8R9S0T1V2W4";
+    const MISSING_CHANNEL: &str = "01J9Z3K4M5N6P7Q8R9S0T1V2W5";
+
+    fn text_channel(id: &str, protected: bool) -> Channel {
+        serde_json::from_value(serde_json::json!({
+            "channel_type": "TextChannel",
+            "_id": id,
+            "server": "01J9Z3K4M5N6P7Q8R9S0T1V2W6",
+            "name": "general",
+            "protected": protected,
+        }))
+        .expect("text channel")
+    }
+
+    fn plaintext_message(id: &str, channel: &str) -> Message {
+        Message {
+            id: id.to_string(),
+            channel: channel.to_string(),
+            author: "01HZXBBBBBBBBBBBBBBBBBBBBB".to_string(),
+            content: Some("hi".to_string()),
+            ..Default::default()
+        }
+    }
+
+    /// The driver-level refusal (design 2.6, `insert_message`), on whichever
+    /// driver `TEST_DB` selects; run under REFERENCE and MONGODB
+    #[tokio::test]
+    async fn insert_message_enforces_the_protected_shape() {
+        use crate::{AbstractChannels, AbstractMessages};
+
+        database_test!(|db| async move {
+            assert!(text_channel(PROTECTED_CHANNEL, true).is_protected());
+            db.insert_channel(&text_channel(PROTECTED_CHANNEL, true))
+                .await
+                .expect("protected channel");
+            db.insert_channel(&text_channel(OPEN_CHANNEL, false))
+                .await
+                .expect("open channel");
+
+            // Plaintext straight into a protected channel: refused, not stored
+            let plaintext = plaintext_message("01JA0000000000000000000P01", PROTECTED_CHANNEL);
+            assert_field_refused(db.insert_message(&plaintext).await, "content");
+            assert!(db.fetch_message(&plaintext.id).await.is_err());
+
+            // A system message is refused too (join/leave notices are suppressed)
+            let system = SystemMessage::UserJoined {
+                id: "01HZXBBBBBBBBBBBBBBBBBBBBB".to_string(),
+            }
+            .into_message(PROTECTED_CHANNEL.to_string());
+            assert_field_refused(db.insert_message(&system).await, "system");
+            assert!(db.fetch_message(&system.id).await.is_err());
+
+            // Mass-mention bits on an otherwise valid ciphertext: refused
+            let mut mass_mention = protected_message();
+            mass_mention.id = "01JA0000000000000000000P02".to_string();
+            mass_mention.channel = PROTECTED_CHANNEL.to_string();
+            mass_mention.flags = Some(4);
+            assert_field_refused(db.insert_message(&mass_mention).await, "flags");
+
+            // Ciphertext only: stored, `encrypted` and the cid round trip
+            let mut encrypted = protected_message();
+            encrypted.id = "01JA0000000000000000000P03".to_string();
+            encrypted.channel = PROTECTED_CHANNEL.to_string();
+            db.insert_message(&encrypted)
+                .await
+                .expect("ciphertext into a protected channel");
+            let fetched = db.fetch_message(&encrypted.id).await.expect("stored");
+            assert_eq!(fetched.encrypted, encrypted.encrypted);
+            assert_eq!(fetched.nonce.as_deref(), Some(CID));
+
+            // Ciphertext outside a protected channel: refused
+            let mut misplaced = protected_message();
+            misplaced.id = "01JA0000000000000000000P04".to_string();
+            misplaced.channel = OPEN_CHANNEL.to_string();
+            assert_field_refused(db.insert_message(&misplaced).await, "encrypted");
+
+            // Ordinary plaintext: unaffected, in an open or a missing channel
+            db.insert_message(&plaintext_message(
+                "01JA0000000000000000000P05",
+                OPEN_CHANNEL,
+            ))
+            .await
+            .expect("plaintext into an open channel");
+            db.insert_message(&plaintext_message(
+                "01JA0000000000000000000P06",
+                MISSING_CHANNEL,
+            ))
+            .await
+            .expect("a missing channel is not protected");
+        });
+    }
+
+    /// Rounds of the insert-vs-protect race, each on a fresh channel
+    const PROTECT_RACE_ROUNDS: u32 = 30;
+
+    /// A plaintext insert racing `protect_channel` on an empty channel never
+    /// ends with plaintext in a protected channel: either protect refuses
+    /// (a message exists) or the insert is refused. The insert is staggered
+    /// 0..15 ms so it lands at different points of protect's transaction.
+    #[tokio::test]
+    async fn plaintext_insert_racing_protect_never_lands_in_a_protected_channel() {
+        use crate::{
+            AbstractChannels, AbstractMessages, AbstractProtectedChannels, ChannelEntitlement,
+            ChannelEntitlementSource, ChannelEntitlementState, SeatListBody, SeatListSubmission,
+        };
+
+        const OWNER: &str = "01HZXAAAAAAAAAAAAAAAAAAAAA";
+        const OWNER_DEVICE: &str = "00112233445566778899aabbccddeeff";
+
+        database_test!(|db| async move {
+            let now = Timestamp::UNIX_EPOCH
+                .checked_add(iso8601_timestamp::Duration::milliseconds(1_790_812_800_000))
+                .unwrap();
+            let (mut insert_won, mut protect_won) = (0, 0);
+
+            for round in 0..PROTECT_RACE_ROUNDS {
+                let channel_id = format!("01J9Z3K4M5N6P7Q8R9S0T{round:05}");
+                db.insert_channel(&text_channel(&channel_id, false))
+                    .await
+                    .expect("channel");
+                db.upsert_channel_entitlement(
+                    &ChannelEntitlement {
+                        id: Ulid::new().to_string(),
+                        channel_id: channel_id.clone(),
+                        server_id: "01J9Z3K4M5N6P7Q8R9S0T1V2W6".to_string(),
+                        source: ChannelEntitlementSource::AdminGrant,
+                        slot_cap: 10,
+                        device_cap: None,
+                        state: ChannelEntitlementState::Active,
+                        granted_by: "admin".to_string(),
+                        created_at: now,
+                    },
+                    now,
+                )
+                .await
+                .expect("entitlement");
+
+                let submission = SeatListSubmission {
+                    body: SeatListBody {
+                        channel_id: channel_id.clone(),
+                        version: 1,
+                        device_cap: 5,
+                        issued_at: 1_790_812_800_000,
+                        signer_user_id: OWNER.to_string(),
+                        signer_device_id: OWNER_DEVICE.to_string(),
+                        seats: vec![OWNER.to_string()],
+                    }
+                    .build()
+                    .expect("seat list body"),
+                    signature: format!("B{}", "A".repeat(85)),
+                    signer_device_id: OWNER_DEVICE.to_string(),
+                    handover: None,
+                };
+                let message = plaintext_message(&Ulid::new().to_string(), &channel_id);
+                let delay = std::time::Duration::from_millis(u64::from(round % 15));
+
+                let (inserted, protected) = tokio::join!(
+                    async {
+                        tokio::time::sleep(delay).await;
+                        db.insert_message(&message).await
+                    },
+                    db.protect_channel(&channel_id, &submission, now)
+                );
+
+                let channel_protected = db
+                    .fetch_channel(&channel_id)
+                    .await
+                    .expect("channel")
+                    .is_protected();
+                let stored = db.fetch_message(&message.id).await.is_ok();
+
+                assert!(
+                    !(channel_protected && stored),
+                    "round {round}: plaintext stored in a protected channel"
+                );
+                assert_eq!(inserted.is_ok(), stored, "round {round}: {inserted:?}");
+                assert_eq!(
+                    protected.is_ok(),
+                    channel_protected,
+                    "round {round}: {:?}",
+                    protected.as_ref().err()
+                );
+                assert!(
+                    inserted.is_ok() != protected.is_ok(),
+                    "round {round}: exactly one side wins (insert {inserted:?}, protect ok {})",
+                    protected.is_ok()
+                );
+
+                if stored {
+                    insert_won += 1;
+                } else {
+                    protect_won += 1;
+                }
+            }
+
+            eprintln!("protect race: insert won {insert_won}, protect won {protect_won}");
+        });
+    }
+
+    #[cfg(feature = "mongodb")]
+    #[test]
+    fn payload_round_trips_through_bson() {
+        let payload = vector();
+        let document = bson::to_document(&payload).expect("to bson");
+        let back: EncryptedPayload = bson::from_document(document).expect("from bson");
+        assert_eq!(back, payload);
     }
 }

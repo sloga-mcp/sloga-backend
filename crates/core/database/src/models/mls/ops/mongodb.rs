@@ -1,19 +1,100 @@
+use std::collections::HashSet;
+
 use bson::{Bson, Document};
 use iso8601_timestamp::Timestamp;
-use mongodb::options::FindOptions;
+use mongodb::{
+    error::{TRANSIENT_TRANSACTION_ERROR, UNKNOWN_TRANSACTION_COMMIT_RESULT},
+    options::{FindOptions, ReadConcern, WriteConcern},
+    ClientSession,
+};
 use revolt_result::Result;
 
 use futures::StreamExt;
 
 use crate::{
-    AbstractMls, MlsCommit, MlsCommitOutcome, MlsGroup, MlsGroupCreateOutcome, MlsJoinIntent,
-    MlsKeyPackage, MongoDb, MAX_MLS_GROUP_MEMBERS,
+    AbstractMls, ChannelSeat, E2EEIdentity, MlsCommit, MlsCommitOutcome, MlsGroup,
+    MlsGroupCreateOutcome, MlsGroupKind, MlsJoinIntent, MlsKeyPackage, MlsMemberAdded, MongoDb,
+    SeatList, MAX_MLS_GROUP_MEMBERS,
 };
+
+use super::plan_mls_text_commit;
 
 const COL_KEY_PACKAGES: &str = "mls_key_packages";
 const COL_GROUPS: &str = "mls_groups";
 const COL_COMMITS: &str = "mls_commits";
 const COL_JOIN_INTENTS: &str = "mls_join_intents";
+/// Owned by the protected-channels models (design §2.4); read here, inside
+/// the Text commit transaction, never written
+const COL_SEAT_LISTS: &str = "channel_seat_lists";
+/// Owned by the protected-channels models (design §2.3). The Text commit
+/// transaction only bumps a `txn_serial` counter on an ADDED user's ACTIVE
+/// seat row (conflict marker; no seat field is changed)
+const COL_SEATS: &str = "channel_seats";
+/// Owned by the E2EE models (`e2ee/ops/mongodb.rs`, `COL_IDENTITY`); the
+/// collection name is SINGULAR. Read here for the revoked-identity lookup
+const COL_E2EE_IDENTITY: &str = "e2ee_identity";
+
+/// Whole-transaction attempts for a Text commit (design §2.5 (a))
+const TEXT_COMMIT_ATTEMPTS: usize = 5;
+
+/// How many times a Text commit transaction was retried as a whole, in this
+/// process. Test-only evidence that the retry branch actually ran.
+#[cfg(test)]
+pub(crate) static TEXT_COMMIT_RETRIES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Back off before retrying a whole Text commit transaction (same shape as
+/// the protected-channels `retry_backoff`): a write conflict fails fast
+/// while the winning transaction is still open, so an immediate retry would
+/// mostly conflict again. Exponential from 20 ms (capped at 320 ms) plus
+/// 0 to 20 ms of jitter so racing committers do not retry in lockstep.
+async fn text_commit_backoff(retry_no: usize) {
+    let base = 20u64 << retry_no.saturating_sub(1).min(4);
+    let jitter = {
+        use rand::Rng;
+        rand::thread_rng().gen_range(0..=20u64)
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(base + jitter)).await;
+}
+
+/// Filter value for a group's `kind`. A Call lookup also matches a stored
+/// group with no `kind` field (written before the field existed), so Call
+/// callers keep their exact behavior whether or not the revision-73
+/// backfill has run.
+fn kind_filter(kind: MlsGroupKind) -> Bson {
+    match kind {
+        MlsGroupKind::Call => Bson::Document(doc! { "$ne": "Text" }),
+        MlsGroupKind::Text => Bson::String("Text".to_string()),
+    }
+}
+
+/// Why one attempt of the Text commit transaction did not commit
+enum TextAttemptError {
+    /// A definitive refusal or result error: abort and return it
+    Refused(revolt_result::Error),
+    /// A driver error: abort, retry if it carries
+    /// `TransientTransactionError`, else a database error
+    Mongo(mongodb::error::Error, &'static str, &'static str),
+    /// A concurrent writer won (duplicate commit id, or the group update
+    /// matched nothing): abort and retry; the next attempt's step 0 or
+    /// validity checks give the definitive answer
+    Retry,
+}
+
+/// What one attempt of the Text commit transaction decided
+enum TextAttemptOutcome {
+    /// Step 0 found a row: abort (nothing was written) and return it
+    Existing(MlsCommit),
+    /// Every write is staged: commit the transaction, then report `Won`
+    Staged,
+}
+
+fn mongo_error(
+    operation: &'static str,
+    collection: &'static str,
+) -> impl FnOnce(mongodb::error::Error) -> TextAttemptError {
+    move |error| TextAttemptError::Mongo(error, operation, collection)
+}
 
 /// Whether a MongoDB error is a duplicate-key write rejection (the CAS
 /// primitive: unique-index insert arbitration, `insert_e2ee_identity`
@@ -41,31 +122,44 @@ fn timestamp_bson(at: &Timestamp) -> Bson {
 }
 
 impl MongoDb {
-    /// Apply a winning commit's effects to the group document — epoch bump +
-    /// asserted roster delta — as a CAS conditioned on `current_epoch ==
-    /// commit.epoch - 1`. Idempotent: a second applier (or the loser-side
-    /// repair after a winner crashed between commit insert and group update)
-    /// simply matches nothing. Returns whether this call applied it.
+    /// Apply a winning CALL commit's effects to the group document — epoch
+    /// bump + asserted roster delta — as a CAS conditioned on
+    /// `current_epoch == commit.epoch - 1`. Idempotent: a second applier (or
+    /// the loser-side repair after a winner crashed between commit insert
+    /// and group update) simply matches nothing. Returns whether this call
+    /// applied it.
+    ///
+    /// FIELD-LEVEL (design §2.5 (b)): only `current_epoch` and `members`
+    /// are written, never a `replace_one` of a clone, so no other field
+    /// (`kind`, `generation`, `pending_removals`, `seat_list_ad_sha256`,
+    /// `member_added`, a concurrent close) can be reverted. The filter
+    /// excludes Text groups, so neither this nor the repair loop can ever
+    /// apply effects to one.
     async fn apply_mls_commit_effects(&self, group: &MlsGroup, commit: &MlsCommit) -> Result<bool> {
-        let mut updated = group.clone();
-        updated.current_epoch = commit.epoch;
-        updated
-            .members
-            .retain(|member| !commit.removed.iter().any(|removed| removed == member));
-        updated.members.extend(commit.added.iter().cloned());
+        let mut members = group.members.clone();
+        members.retain(|member| !commit.removed.iter().any(|removed| removed == member));
+        members.extend(commit.added.iter().cloned());
+        let members =
+            bson::to_bson(&members).map_err(|_| create_database_error!("to_bson", COL_GROUPS))?;
 
         let applied = self
             .col::<MlsGroup>(COL_GROUPS)
-            .replace_one(
+            .update_one(
                 doc! {
                     "_id": &group.id,
                     "current_epoch": commit.epoch - 1,
-                    "open": true
+                    "open": true,
+                    "kind": kind_filter(MlsGroupKind::Call)
                 },
-                &updated,
+                doc! {
+                    "$set": {
+                        "current_epoch": commit.epoch,
+                        "members": members
+                    }
+                },
             )
             .await
-            .map_err(|_| create_database_error!("replace_one", COL_GROUPS))
+            .map_err(|_| create_database_error!("update_one", COL_GROUPS))
             .map(|result| result.matched_count > 0)?;
 
         // Admission consumes the joiner's intent row: without this, every
@@ -95,11 +189,20 @@ impl MongoDb {
     /// from any stored winning commit it has not yet absorbed (crash
     /// recovery between the commit CAS and the group update — the Reference
     /// driver's single Mutex has no such window)
+    ///
+    /// CALL GROUPS ONLY: a Text group is returned as read. Its insert and
+    /// effects are one transaction, so there is never anything to repair,
+    /// and re-applying a Text commit here would skip every Text rule
+    /// (design §2.5, W0-fix5).
     async fn fetch_mls_group_repaired(&self, group_id: &str) -> Result<MlsGroup> {
         // Bounded: each iteration absorbs one already-arbitrated epoch
         for _ in 0..64 {
             let group: MlsGroup = query!(self, find_one, COL_GROUPS, doc! { "_id": group_id })?
                 .ok_or_else(|| create_error!(NotFound))?;
+
+            if group.kind != MlsGroupKind::Call {
+                return Ok(group);
+            }
 
             let next: Option<MlsCommit> = query!(
                 self,
@@ -117,6 +220,202 @@ impl MongoDb {
         }
 
         Err(create_database_error!("repair_loop", COL_GROUPS))
+    }
+
+    /// One attempt of the Text commit transaction (design §2.5 (a), steps 0
+    /// to 5). Every read and write runs in `session`'s transaction; the
+    /// caller commits or aborts.
+    async fn text_commit_attempt(
+        &self,
+        session: &mut ClientSession,
+        commit: &MlsCommit,
+        ad_sha256: &str,
+        entitlement_device_cap: u32,
+    ) -> std::result::Result<TextAttemptOutcome, TextAttemptError> {
+        let id = MlsCommit::composite_id(&commit.group_id, commit.epoch);
+
+        // Step 0: an existing row at {group}:{epoch} is returned before any
+        // validity check (idempotent resubmit, W0-fix7/8)
+        let existing = self
+            .col::<MlsCommit>(COL_COMMITS)
+            .find_one(doc! { "_id": &id })
+            .session(&mut *session)
+            .await
+            .map_err(mongo_error("find_one", COL_COMMITS))?;
+        if let Some(winning) = existing {
+            return Ok(TextAttemptOutcome::Existing(winning));
+        }
+
+        // Step 1: the group, then the channel's newest seat list
+        let group = self
+            .col::<MlsGroup>(COL_GROUPS)
+            .find_one(doc! { "_id": &commit.group_id })
+            .session(&mut *session)
+            .await
+            .map_err(mongo_error("find_one", COL_GROUPS))?
+            .ok_or_else(|| TextAttemptError::Refused(create_error!(NotFound)))?;
+
+        let seat_list = self
+            .col::<SeatList>(COL_SEAT_LISTS)
+            .find_one(doc! { "_id": &group.channel_id })
+            .session(&mut *session)
+            .await
+            .map_err(mongo_error("find_one", COL_SEAT_LISTS))?;
+
+        // The removed devices' stored join intents (rule 6) and identity
+        // rows (rule 4), read in the same snapshot
+        let mut stored_intents: Vec<MlsJoinIntent> = Vec::new();
+        let mut revoked_identities: HashSet<String> = HashSet::new();
+        for removed in &commit.removed {
+            let intent = self
+                .col::<MlsJoinIntent>(COL_JOIN_INTENTS)
+                .find_one(doc! {
+                    "_id": MlsJoinIntent::composite_id(
+                        &group.id,
+                        &removed.user_id,
+                        &removed.device_id
+                    )
+                })
+                .session(&mut *session)
+                .await
+                .map_err(mongo_error("find_one", COL_JOIN_INTENTS))?;
+            stored_intents.extend(intent);
+
+            let identity_id = E2EEIdentity::composite_id(&removed.user_id, &removed.device_id);
+            let identity = self
+                .col::<Document>(COL_E2EE_IDENTITY)
+                .find_one(doc! { "_id": &identity_id })
+                .projection(doc! { "_id": 1 })
+                .session(&mut *session)
+                .await
+                .map_err(mongo_error("find_one", COL_E2EE_IDENTITY))?;
+            if identity.is_none() {
+                revoked_identities.insert(identity_id);
+            }
+        }
+
+        // Each ADDED user's seat row must be active. This is a conditional
+        // WRITE, not a read: a forced release (kick, ban, leave) writes the
+        // seat row and nothing else this transaction writes, so only a
+        // write here makes a racing release write-conflict (one side
+        // retries and then sees the other's result). Filter encoding matches
+        // the seat writers: `released_at: null` = absent or null (active).
+        let mut active_seat_users: HashSet<String> = HashSet::new();
+        for added in &commit.added {
+            if active_seat_users.contains(&added.user_id) {
+                continue;
+            }
+            let matched = self
+                .col::<Document>(COL_SEATS)
+                .update_one(
+                    doc! {
+                        "_id": ChannelSeat::composite_id(&group.channel_id, &added.user_id),
+                        "released_at": Bson::Null
+                    },
+                    doc! { "$inc": { "txn_serial": 1_i64 } },
+                )
+                .session(&mut *session)
+                .await
+                .map_err(mongo_error("update_one", COL_SEATS))?
+                .matched_count;
+            if matched > 0 {
+                active_seat_users.insert(added.user_id.clone());
+            }
+        }
+
+        // Step 2: every validity check
+        let plan = plan_mls_text_commit(
+            &group,
+            commit,
+            ad_sha256,
+            seat_list.as_ref(),
+            entitlement_device_cap,
+            &stored_intents,
+            &revoked_identities,
+            &active_seat_users,
+        )
+        .map_err(TextAttemptError::Refused)?;
+
+        // Hand-built BSON before any write: `member_added.at` must use the
+        // typed path's Int64 unix-ms encoding (`timestamp_bson`)
+        let members = bson::to_bson(&plan.members).map_err(|_| {
+            TextAttemptError::Refused(create_database_error!("to_bson", COL_GROUPS))
+        })?;
+        let member_added: Vec<Bson> = plan
+            .member_added
+            .iter()
+            .map(|entry: &MlsMemberAdded| {
+                Bson::Document(doc! {
+                    "user_id": &entry.user_id,
+                    "device_id": &entry.device_id,
+                    "epoch": entry.epoch,
+                    "at": timestamp_bson(&entry.at)
+                })
+            })
+            .collect();
+
+        // Step 3: the commit row. Its unique _id still arbitrates a racing
+        // same-epoch insert
+        match self
+            .col::<MlsCommit>(COL_COMMITS)
+            .insert_one(&plan.stored)
+            .session(&mut *session)
+            .await
+        {
+            Ok(_) => {}
+            Err(error) if is_duplicate_key(&error) => return Err(TextAttemptError::Retry),
+            Err(error) => return Err(TextAttemptError::Mongo(error, "insert_one", COL_COMMITS)),
+        }
+
+        // Step 4: field-level effects, filtered on the state just validated
+        let mut update = doc! {
+            "$set": {
+                "current_epoch": commit.epoch,
+                "members": members,
+                "member_added": member_added
+            }
+        };
+        if !plan.cleared_pending.is_empty() {
+            update.insert(
+                "$pull",
+                doc! {
+                    "pending_removals": {
+                        "user_id": { "$in": &plan.cleared_pending }
+                    }
+                },
+            );
+        }
+
+        let matched = self
+            .col::<MlsGroup>(COL_GROUPS)
+            .update_one(
+                doc! {
+                    "_id": &group.id,
+                    "open": true,
+                    "kind": kind_filter(MlsGroupKind::Text),
+                    "current_epoch": commit.epoch - 1,
+                    "seat_list_ad_sha256": ad_sha256
+                },
+                update,
+            )
+            .session(&mut *session)
+            .await
+            .map_err(mongo_error("update_one", COL_GROUPS))?
+            .matched_count;
+        if matched == 0 {
+            return Err(TextAttemptError::Retry);
+        }
+
+        // Step 5: consume the added devices' intents and every rule-6 intent
+        if !plan.consumed_intent_ids.is_empty() {
+            self.col::<Document>(COL_JOIN_INTENTS)
+                .delete_many(doc! { "_id": { "$in": &plan.consumed_intent_ids } })
+                .session(&mut *session)
+                .await
+                .map_err(mongo_error("delete_many", COL_JOIN_INTENTS))?;
+        }
+
+        Ok(TextAttemptOutcome::Staged)
     }
 }
 
@@ -316,6 +615,12 @@ impl AbstractMls for MongoDb {
         group: &MlsGroup,
         supersedes: Option<&str>,
     ) -> Result<MlsGroupCreateOutcome> {
+        // Call groups only: Text groups are created by
+        // `create_text_mls_group` (protected-channels models)
+        if group.kind != MlsGroupKind::Call {
+            return Err(create_error!(InvalidOperation));
+        }
+
         if let Some(superseded_id) = supersedes {
             // CAS-close the predecessor: only one successor's update matches
             // the open document; the loser falls through to the conflict
@@ -326,6 +631,7 @@ impl AbstractMls for MongoDb {
                     doc! {
                         "_id": superseded_id,
                         "channel_id": &group.channel_id,
+                        "kind": kind_filter(group.kind),
                         "open": true
                     },
                     doc! {
@@ -352,6 +658,11 @@ impl AbstractMls for MongoDb {
                             error: "superseded group belongs to another channel".to_string()
                         }));
                     }
+                    Some(old) if old.kind != group.kind => {
+                        return Err(create_error!(FailedValidation {
+                            error: "superseded group is of another kind".to_string()
+                        }));
+                    }
                     // Already closed by a racing successor — fall through to
                     // the normal create/conflict path below
                     Some(_) => {}
@@ -359,7 +670,7 @@ impl AbstractMls for MongoDb {
             }
         }
 
-        // The partial unique index on (channel_id WHERE open) is the
+        // The partial unique index on (channel_id, kind WHERE open) is the
         // arbitration: exactly one insert per open-group slot succeeds.
         // NOTE: if the supersedes branch above closed the predecessor and
         // this insert then fails (crash/duplicate), the channel briefly has
@@ -369,7 +680,7 @@ impl AbstractMls for MongoDb {
             Ok(_) => Ok(MlsGroupCreateOutcome::Created),
             Err(error) if is_duplicate_key(&error) => {
                 let open = self
-                    .fetch_open_mls_group_for_channel(&group.channel_id)
+                    .fetch_open_mls_group_for_channel(&group.channel_id, group.kind)
                     .await?;
 
                 match open {
@@ -394,6 +705,7 @@ impl AbstractMls for MongoDb {
     async fn fetch_open_mls_group_for_channel(
         &self,
         channel_id: &str,
+        kind: MlsGroupKind,
     ) -> Result<Option<MlsGroup>> {
         query!(
             self,
@@ -401,16 +713,24 @@ impl AbstractMls for MongoDb {
             COL_GROUPS,
             doc! {
                 "channel_id": channel_id,
+                "kind": kind_filter(kind),
                 "open": true
             }
         )
     }
 
     async fn close_mls_group(&self, group_id: &str) -> Result<bool> {
+        // Call groups only: the kind filter makes the write itself unable
+        // to touch a Text group; the follow-up read turns that into a loud
+        // refusal
         let result = self
             .col::<MlsGroup>(COL_GROUPS)
             .update_one(
-                doc! { "_id": group_id, "open": true },
+                doc! {
+                    "_id": group_id,
+                    "open": true,
+                    "kind": kind_filter(MlsGroupKind::Call)
+                },
                 doc! {
                     "$set": {
                         "open": false,
@@ -425,10 +745,14 @@ impl AbstractMls for MongoDb {
             return Ok(true);
         }
 
-        // Idempotence vs missing group
+        // Idempotence vs missing group vs Text group
         let exists: Option<MlsGroup> =
             query!(self, find_one, COL_GROUPS, doc! { "_id": group_id })?;
-        exists.map(|_| false).ok_or_else(|| create_error!(NotFound))
+        match exists {
+            None => Err(create_error!(NotFound)),
+            Some(group) if group.kind != MlsGroupKind::Call => Err(create_error!(InvalidOperation)),
+            Some(_) => Ok(false),
+        }
     }
 
     async fn insert_mls_commit(&self, commit: &MlsCommit) -> Result<MlsCommitOutcome> {
@@ -438,6 +762,11 @@ impl AbstractMls for MongoDb {
         // same epoch is settled by the unique-index CAS below, and a stale
         // read merely produces a retryable validation error.
         let group = self.fetch_mls_group_repaired(&commit.group_id).await?;
+
+        // Call path only: Text commits go through insert_mls_text_commit
+        if group.kind != MlsGroupKind::Call {
+            return Err(create_error!(InvalidOperation));
+        }
 
         if !group.open {
             return Err(create_error!(FailedValidation {
@@ -518,6 +847,97 @@ impl AbstractMls for MongoDb {
         }
     }
 
+    async fn insert_mls_text_commit(
+        &self,
+        commit: &MlsCommit,
+        ad_sha256: &str,
+        entitlement_device_cap: u32,
+    ) -> Result<MlsCommitOutcome> {
+        // ONE multi-document transaction, retried as a whole (design §2.5
+        // (a)). No repair loop: insert, effects and intent consumption are
+        // atomic. A seat-list write touches the same group document, so
+        // write-conflict detection serializes the two; the loser retries
+        // and sees the other's result.
+        for attempt in 0..TEXT_COMMIT_ATTEMPTS {
+            if attempt > 0 {
+                #[cfg(test)]
+                TEXT_COMMIT_RETRIES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                text_commit_backoff(attempt).await;
+            }
+
+            let mut session = self
+                .start_session()
+                .await
+                .map_err(|_| create_database_error!("start_session", COL_COMMITS))?;
+
+            session
+                .start_transaction()
+                .read_concern(ReadConcern::snapshot())
+                .write_concern(WriteConcern::majority())
+                .await
+                .map_err(|_| create_database_error!("start_transaction", COL_COMMITS))?;
+
+            let attempt = self
+                .text_commit_attempt(&mut session, commit, ad_sha256, entitlement_device_cap)
+                .await;
+
+            match attempt {
+                Ok(TextAttemptOutcome::Existing(winning)) => {
+                    // Nothing was written; the abort result does not matter
+                    let _ = session.abort_transaction().await;
+                    return Ok(MlsCommitOutcome::Lost { winning });
+                }
+                Ok(TextAttemptOutcome::Staged) => {
+                    // Commit, retrying the commit itself on
+                    // UnknownTransactionCommitResult (commitTransaction is
+                    // idempotent). A transient error retries the whole
+                    // transaction; anything else is the database error, and
+                    // the committer runs its outcome recovery (W0-fix5).
+                    let mut retry_whole = false;
+                    for _ in 0..TEXT_COMMIT_ATTEMPTS {
+                        match session.commit_transaction().await {
+                            Ok(()) => return Ok(MlsCommitOutcome::Won),
+                            Err(error)
+                                if error.contains_label(UNKNOWN_TRANSACTION_COMMIT_RESULT) =>
+                            {
+                                continue;
+                            }
+                            Err(error) if error.contains_label(TRANSIENT_TRANSACTION_ERROR) => {
+                                retry_whole = true;
+                                break;
+                            }
+                            Err(_) => {
+                                return Err(create_database_error!(
+                                    "commit_transaction",
+                                    COL_COMMITS
+                                ))
+                            }
+                        }
+                    }
+
+                    if !retry_whole {
+                        return Err(create_database_error!("commit_transaction", COL_COMMITS));
+                    }
+                }
+                Err(TextAttemptError::Refused(error)) => {
+                    let _ = session.abort_transaction().await;
+                    return Err(error);
+                }
+                Err(TextAttemptError::Retry) => {
+                    let _ = session.abort_transaction().await;
+                }
+                Err(TextAttemptError::Mongo(error, operation, collection)) => {
+                    let _ = session.abort_transaction().await;
+                    if !error.contains_label(TRANSIENT_TRANSACTION_ERROR) {
+                        return Err(create_database_error!(operation, collection));
+                    }
+                }
+            }
+        }
+
+        Err(create_database_error!("transaction", COL_COMMITS))
+    }
+
     async fn fetch_mls_commits_from(
         &self,
         group_id: &str,
@@ -578,9 +998,12 @@ impl AbstractMls for MongoDb {
         closed_threshold: Timestamp,
         created_threshold: Timestamp,
     ) -> Result<usize> {
+        // Text groups are never swept (design §2.5): their commits age out
+        // through prune_mls_text_commits instead
         let swept: Vec<MlsGroup> = self
             .col::<MlsGroup>(COL_GROUPS)
             .find(doc! {
+                "kind": kind_filter(MlsGroupKind::Call),
                 "$or": [
                     { "closed_at": { "$lt": timestamp_bson(&closed_threshold) } },
                     { "created_at": { "$lt": timestamp_bson(&created_threshold) } }
@@ -613,5 +1036,36 @@ impl AbstractMls for MongoDb {
             .await
             .map_err(|_| create_database_error!("delete_many", COL_GROUPS))
             .map(|result| result.deleted_count as usize)
+    }
+
+    async fn prune_mls_text_commits(&self, older_than: Timestamp) -> Result<u64> {
+        let mut cursor = self
+            .col::<Document>(COL_GROUPS)
+            .find(doc! { "kind": kind_filter(MlsGroupKind::Text) })
+            .with_options(FindOptions::builder().projection(doc! { "_id": 1 }).build())
+            .await
+            .map_err(|_| create_database_error!("find", COL_GROUPS))?;
+
+        let mut ids: Vec<String> = vec![];
+        while let Some(document) = cursor.next().await {
+            let document = document.map_err(|_| create_database_error!("find", COL_GROUPS))?;
+            if let Ok(id) = document.get_str("_id") {
+                ids.push(id.to_string());
+            }
+        }
+
+        if ids.is_empty() {
+            return Ok(0);
+        }
+
+        // created_at is Int64 unix-ms on typed writes (`timestamp_bson`)
+        self.col::<Document>(COL_COMMITS)
+            .delete_many(doc! {
+                "group_id": { "$in": ids },
+                "created_at": { "$lt": timestamp_bson(&older_than) }
+            })
+            .await
+            .map_err(|_| create_database_error!("delete_many", COL_COMMITS))
+            .map(|result| result.deleted_count)
     }
 }

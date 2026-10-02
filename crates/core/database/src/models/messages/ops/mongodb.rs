@@ -9,13 +9,51 @@ use std::time::SystemTime;
 use ulid::Ulid;
 
 use crate::{
-    AppendMessage, DocumentId, FieldsMessage, IntoDocumentPath, Message, MessageQuery,
-    MessageTimePeriod, MongoDb, PartialMessage,
+    AbstractChannels, AppendMessage, Channel, DocumentId, FieldsMessage, IntoDocumentPath, Message,
+    MessageQuery, MessageTimePeriod, MongoDb, PartialMessage,
 };
 
 use super::{AbstractMessages, ThreadStats, UnreadSummary, UNREAD_SCAN_WINDOW};
 
 static COL: &str = "messages";
+static COL_CHANNELS: &str = "channels";
+
+impl MongoDb {
+    /// The post-insert half of `insert_message`'s protect race guard: a
+    /// field-level `$inc` of the channel's `txn_serial` (the serialization
+    /// counter `protected_channels/ops/mongodb.rs` uses; never read, no
+    /// other field touched), filtered on `protected != true`. If it matches
+    /// nothing, or its outcome is unknown, the message is deleted again and
+    /// the insert refused (fails closed).
+    async fn hold_channel_unprotected(&self, message: &Message) -> Result<()> {
+        let held = self
+            .col::<Document>(COL_CHANNELS)
+            .update_one(
+                doc! { "_id": &message.channel, "protected": { "$ne": true } },
+                doc! { "$inc": { "txn_serial": 1_i64 } },
+            )
+            .await;
+
+        if matches!(&held, Ok(result) if result.matched_count == 1) {
+            return Ok(());
+        }
+
+        if let Err(error) = self
+            .col::<Document>(COL)
+            .delete_one(doc! { "_id": &message.id })
+            .await
+        {
+            revolt_config::capture_error(&error);
+        }
+
+        // Report the protected refusal when that is what happened
+        if held.is_ok() {
+            message.validate_protected_insert(self.fetch_channel(&message.channel).await)?;
+        }
+
+        Err(create_database_error!("update_one", COL_CHANNELS))
+    }
+}
 
 /// The `fetch_thread_stats` aggregation, kept apart so a test can `explain()`
 /// exactly what runs.
@@ -41,8 +79,43 @@ fn thread_stats_pipeline(channel_ids: &[String]) -> Vec<Document> {
 #[async_trait]
 impl AbstractMessages for MongoDb {
     /// Insert a new message into the database
+    ///
+    /// Refuses a message that breaks the protected-channel stored shape
+    /// (design 2.6), judged on a channel read made here, just before the write.
+    ///
+    /// The read alone is check-then-act against `protect_channel` (which
+    /// reads "no messages" and writes the channel). So after inserting into
+    /// an unprotected text channel, this writes the channel document too,
+    /// filtered on `protected != true`:
+    /// - this write first: protect's transaction later writes the same
+    ///   document, write-conflicts, retries, and its new snapshot sees the
+    ///   message (inserted before this write), so protect refuses;
+    /// - protect's write first (committed, or uncommitted, in which case
+    ///   this write waits for it): the filter matches nothing, the message
+    ///   is deleted again and the insert is refused.
+    ///
+    /// Not one transaction: every send into a busy channel would write the
+    /// same channel document transactionally and conflict with every other
+    /// send. A plain write just serializes behind them.
     async fn insert_message(&self, message: &Message) -> Result<()> {
-        query!(self, insert_one, COL, &message).map(|_| ())
+        let channel = self.fetch_channel(&message.channel).await;
+        // Only an unprotected server text channel can become protected (2.1)
+        let guard = matches!(
+            &channel,
+            Ok(Channel::TextChannel {
+                protected: false,
+                ..
+            })
+        );
+        message.validate_protected_insert(channel)?;
+
+        query!(self, insert_one, COL, &message).map(|_| ())?;
+
+        if guard {
+            self.hold_channel_unprotected(message).await?;
+        }
+
+        Ok(())
     }
 
     /// Fetch a message by its id

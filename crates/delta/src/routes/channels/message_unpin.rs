@@ -119,6 +119,7 @@ mod test {
                 interactions: None,
                 components: None,
                 sticker_ids: None,
+                encrypted: None,
                 flags: None,
             },
             v0::MessageAuthor::User(&user.clone().into(&harness.db, Some(&user)).await),

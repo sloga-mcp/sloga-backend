@@ -102,6 +102,38 @@ auto_derived!(
         pub results: Vec<MlsClaimResult>,
     }
 
+    /// What an MLS group secures (protected channels design §2.5). Groups
+    /// stored before this field existed are call groups.
+    #[derive(Default)]
+    pub enum MlsGroupKind {
+        /// Per-call media E2EE group
+        #[default]
+        Call,
+        /// Protected text channel group
+        Text,
+    }
+
+    /// A stored signed join intent that justified a rejoin-case Remove,
+    /// carried on a commit (protected channels design §8.1). The wire shape
+    /// is exactly native `wire::MlsJoinRequest`. `channel_id` is not part of
+    /// the stored row: the server fills it from the group's channel. The
+    /// signature does not cover `channel_id`; receivers check it against the
+    /// commit's own group and channel.
+    pub struct MlsRejoinIntentInfo {
+        /// Group the intent targets
+        pub group_id: String,
+        /// Channel of that group
+        pub channel_id: String,
+        /// Joining user
+        pub user_id: String,
+        /// Joining device
+        pub device_id: String,
+        /// KeyPackage reference the joiner nominated
+        pub key_package_ref: String,
+        /// Join-intent signature
+        pub signature: String,
+    }
+
     /// Register a per-call MLS group (plan §1.2)
     pub struct DataCreateMlsGroup {
         /// Client-derived group id: 64 lowercase hex chars
@@ -183,6 +215,10 @@ auto_derived!(
         pub added: Vec<MlsMemberDevice>,
         /// Devices removed by the commit
         pub removed: Vec<MlsMemberDevice>,
+        /// Signed join intents that justified a rejoin-case Remove in this
+        /// commit (Text groups only; always empty on Call commits)
+        #[serde(default)]
+        pub rejoin_intents: Vec<MlsRejoinIntentInfo>,
     }
 
     /// Response to a commit submission — 200 on win, 409 on lose (the loser

@@ -236,6 +236,32 @@ impl AbstractChannels for MongoDb {
         channel: &PartialChannel,
         remove: Vec<FieldsChannel>,
     ) -> Result<()> {
+        // A partial adding voice or the announcement flag is refused on a
+        // protected channel. `Channel::update` checked the caller's copy,
+        // which can be stale across a concurrent protect, so the write itself
+        // is conditional on the STORED flag (design 7.4).
+        if channel.sets_field_refused_on_protected() {
+            let matched: Result<u64> = query!(
+                self,
+                update_one,
+                COL,
+                doc! {
+                    "_id": id,
+                    "protected": { "$ne": true }
+                },
+                channel,
+                remove.iter().map(|x| x as &dyn IntoDocumentPath).collect(),
+                None
+            )
+            .map(|result| result.matched_count);
+
+            return if matched? == 0 {
+                Err(create_error!(ChannelProtected))
+            } else {
+                Ok(())
+            };
+        }
+
         query!(
             self,
             update_one_by_id,

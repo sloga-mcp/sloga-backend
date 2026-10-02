@@ -141,6 +141,15 @@ auto_derived!(
             /// ordinary text channel.
             #[serde(skip_serializing_if = "Option::is_none")]
             announcement: Option<bool>,
+
+            /// Whether this channel is a protected (end-to-end encrypted)
+            /// channel. One-way: once true it is never false. Only
+            /// `PUT /channels/:id/protect` sets it; no edit route can.
+            #[cfg_attr(
+                feature = "serde",
+                serde(skip_serializing_if = "crate::if_false", default)
+            )]
+            protected: bool,
         },
         /// Thread belonging to a server text channel
         Thread {
@@ -389,6 +398,8 @@ auto_derived!(
         pub applied_tags: Option<Vec<String>>,
         #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
         pub announcement: Option<bool>,
+        #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+        pub protected: Option<bool>,
     }
 
     /// Optional fields on channel object

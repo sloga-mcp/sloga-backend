@@ -14,7 +14,20 @@ use super::{AbstractMessages, ThreadStats, UnreadSummary, UNREAD_SCAN_WINDOW};
 #[async_trait]
 impl AbstractMessages for ReferenceDb {
     /// Insert a new message into the database
+    ///
+    /// Refuses a message that breaks the protected-channel stored shape
+    /// (design 2.6). `channels` is held across the check and the write, in
+    /// the global lock order `channels -> messages` (as `protect_channel`),
+    /// so a protect can never land between them.
     async fn insert_message(&self, message: &Message) -> Result<()> {
+        let channels = self.channels.lock().await;
+        message.validate_protected_insert(
+            channels
+                .get(&message.channel)
+                .cloned()
+                .ok_or_else(|| create_error!(NotFound)),
+        )?;
+
         let mut messages = self.messages.lock().await;
         if messages.contains_key(&message.id) {
             Err(create_database_error!("insert", "message"))

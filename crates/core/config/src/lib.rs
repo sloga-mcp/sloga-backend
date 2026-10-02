@@ -834,6 +834,54 @@ impl BoostFeatures {
     }
 }
 
+/// Protected channels feature configuration (protected-channels design
+/// §7.1).
+///
+/// Ships fully OFF (`enabled = false` compiled into the defaults; absent
+/// config keys cannot turn it on). `enabled` gates GROWTH only (admin
+/// grants, protect, seating, adds); turning it off never unprotects an
+/// existing channel, and encrypted send, history and receive keep working
+/// there. The text plane's kill switch is `e2ee_enabled`, not this flag.
+/// NOTE: the config file sources are frozen into the process at first
+/// access — flipping `[features.protected_channels] enabled` in
+/// Revolt.overrides.toml requires RESTARTING delta AND crond (no rebuild,
+/// no migration). Do not stage the edit ahead of time: it will silently
+/// activate on the next incidental restart.
+#[derive(Deserialize, Debug, Clone)]
+pub struct ProtectedChannelFeatures {
+    /// Master switch for growth: admin grants, protect, seating, adds
+    #[serde(default)]
+    pub enabled: bool,
+    /// Device cap used when an entitlement's `device_cap` is `None`.
+    /// `0` = unlimited (still bounded by the 100-leaf group cap)
+    #[serde(default = "ProtectedChannelFeatures::default_device_cap")]
+    pub default_device_cap: u32,
+    /// crond prunes Text MLS commits older than this many days. A device
+    /// offline longer than this cannot catch up and must rejoin
+    #[serde(default = "ProtectedChannelFeatures::default_commit_retention_days")]
+    pub commit_retention_days: u32,
+}
+
+impl Default for ProtectedChannelFeatures {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            default_device_cap: Self::default_device_cap(),
+            commit_retention_days: Self::default_commit_retention_days(),
+        }
+    }
+}
+
+impl ProtectedChannelFeatures {
+    fn default_device_cap() -> u32 {
+        5
+    }
+
+    fn default_commit_retention_days() -> u32 {
+        30
+    }
+}
+
 #[derive(Deserialize, Debug, Clone)]
 pub struct Features {
     pub limits: FeaturesLimitsCollection,
@@ -903,6 +951,11 @@ pub struct Features {
     /// flip-requires-restart caveat)
     #[serde(default)]
     pub boosts: BoostFeatures,
+
+    /// Protected channels (ships dark; see ProtectedChannelFeatures docs for
+    /// the flip-requires-restart caveat and flag-off semantics)
+    #[serde(default)]
+    pub protected_channels: ProtectedChannelFeatures,
 
     #[serde(default)]
     pub advanced: FeaturesAdvanced,

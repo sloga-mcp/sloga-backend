@@ -26,7 +26,7 @@ struct MigrationInfo {
     revision: i32,
 }
 
-pub const LATEST_REVISION: i32 = 73; // MUST BE +1 to last migration
+pub const LATEST_REVISION: i32 = 74; // MUST BE +1 to last migration
 
 pub async fn migrate_database(db: &MongoDb) {
     let migrations = db.col::<Document>("migrations");
@@ -2703,6 +2703,122 @@ pub async fn run_migrations(db: &MongoDb, revision: i32) -> i32 {
         info!("AFK backfill: designated {designated} server(s).");
     }
 
+    if revision <= 73 {
+        info!("Running migration [revision 73 / 01-10-2026]: Key open MLS groups by (channel_id, kind); create channel_entitlements / channel_seats / channel_seat_lists collections (protected channels)");
+
+        // Protected channels (docs/protected-channels-design.md 2.5, 2.7) add
+        // Text MLS groups beside the Call groups, so "one open group per
+        // channel" becomes "one open group per channel per kind". The three
+        // steps run in this order so there is never a window without a
+        // uniqueness guarantee on open groups: the old index stays in place
+        // until the new one exists.
+        //
+        // Every step is safe to re-run: the backfill only matches documents
+        // still lacking `kind`, createIndexes is a no-op when key, name and
+        // options already match, and the drop tolerates IndexNotFound (an
+        // earlier run already dropped it). Any other failure panics, so the
+        // revision is not advanced and the whole block runs again.
+
+        // 1. Backfill: every group created before this revision is a Call
+        //    group (`MlsGroupKind::Call`, serialized "Call").
+        db.col::<Document>("mls_groups")
+            .update_many(
+                doc! { "kind": { "$exists": false } },
+                doc! { "$set": { "kind": "Call" } },
+            )
+            .await
+            .expect("Failed to backfill mls_groups.kind.");
+
+        // 2. Create the per-kind create-race arbitration. Mirrors init.rs.
+        //    Safe on existing data: the old index already allowed at most one
+        //    open group per channel, and all of them are now "Call".
+        db.db()
+            .run_command(doc! {
+                "createIndexes": "mls_groups",
+                "indexes": [
+                    {
+                        "key": {
+                            "channel_id": 1_i32,
+                            "kind": 1_i32
+                        },
+                        "name": "open_channel_kind_group",
+                        "unique": true,
+                        "partialFilterExpression": { "open": true }
+                    }
+                ]
+            })
+            .await
+            .expect("Failed to create mls_groups open_channel_kind_group index.");
+
+        // 3. Drop the old per-channel index. Left in place it would refuse a
+        //    Text group in any channel that has an open Call group.
+        let dropped = db
+            .db()
+            .run_command(doc! {
+                "dropIndexes": "mls_groups",
+                "index": "open_channel_group"
+            })
+            .await;
+        if let Err(error) = dropped {
+            // 27 = IndexNotFound: an earlier run of this block dropped it.
+            let already_dropped = matches!(
+                *error.kind,
+                crate::mongodb::error::ErrorKind::Command(ref command) if command.code == 27
+            );
+            if !already_dropped {
+                panic!("Failed to drop mls_groups open_channel_group index: {error}");
+            }
+        }
+
+        // Same idempotency contract as prior collection migrations; mirrors
+        // init.rs. The specs here MUST stay identical to the copies there.
+        db.db().create_collection("channel_entitlements").await.ok();
+        db.db().create_collection("channel_seats").await.ok();
+        db.db().create_collection("channel_seat_lists").await.ok();
+
+        db.db()
+            .run_command(doc! {
+                "createIndexes": "channel_entitlements",
+                "indexes": [
+                    // ENFORCES at most one entitlement per channel.
+                    {
+                        "key": {
+                            "channel_id": 1_i32
+                        },
+                        "name": "channel_id",
+                        "unique": true
+                    }
+                ]
+            })
+            .await
+            .expect("Failed to create channel_entitlements indexes.");
+
+        db.db()
+            .run_command(doc! {
+                "createIndexes": "channel_seats",
+                "indexes": [
+                    // Serves the per-channel seat count and listing.
+                    {
+                        "key": {
+                            "channel_id": 1_i32
+                        },
+                        "name": "channel_id"
+                    },
+                    // Serves per-user seat lookups and cascades.
+                    {
+                        "key": {
+                            "user_id": 1_i32
+                        },
+                        "name": "user_id"
+                    }
+                ]
+            })
+            .await
+            .expect("Failed to create channel_seats indexes.");
+
+        // channel_seat_lists is keyed by `_id` (the channel id) only.
+    }
+
     // Reminder to update LATEST_REVISION when adding new migrations.
     LATEST_REVISION.max(revision)
 }
@@ -2782,6 +2898,7 @@ mod afk_backfill_tests {
             voice,
             slowmode: None,
             announcement: None,
+            protected: false,
         }
     }
 
@@ -2990,12 +3107,15 @@ mod afk_backfill_tests {
     }
 
     #[test]
-    fn latest_revision_is_73() {
-        assert_eq!(LATEST_REVISION, 73, "the AFK backfill is revision 72");
+    fn latest_revision_is_74() {
+        assert_eq!(
+            LATEST_REVISION, 74,
+            "the AFK backfill is revision 72, the protected-channels migration is revision 73"
+        );
     }
 
     #[test]
-    fn backfill_is_the_last_migration_and_guarded_by_revision_72() {
+    fn backfill_is_guarded_by_revision_72_and_revision_73_is_the_last_migration() {
         let guards: Vec<i32> = shipping()
             .match_indices("if revision <= ")
             .map(|(at, needle)| {
@@ -3010,6 +3130,11 @@ mod afk_backfill_tests {
             guards.iter().filter(|guard| **guard == 72).count(),
             1,
             "exactly one `if revision <= 72` block"
+        );
+        assert_eq!(
+            guards.iter().filter(|guard| **guard == 73).count(),
+            1,
+            "exactly one `if revision <= 73` block"
         );
         assert_eq!(
             guards.iter().max(),
@@ -3048,7 +3173,7 @@ mod afk_backfill_tests {
             );
             shipping().find(&needle).expect("the guard")
         };
-        let (at_70, at_71, at_72) = (guard(70), guard(71), guard(72));
+        let (at_70, at_71, at_72, at_73) = (guard(70), guard(71), guard(72), guard(73));
 
         let open_71 = at_71 + format!("if revision <= 71 {OPEN}").len() - 1;
         let block_71 = braced(shipping(), open_71);
@@ -3061,15 +3186,112 @@ mod afk_backfill_tests {
             "the revision 72 guard must come after the 71 block closes"
         );
 
+        // The same trap one revision on: nested inside the 72 block, the
+        // protected-channels migration would never run on a database already
+        // at 73.
+        let open_72 = at_72 + format!("if revision <= 72 {OPEN}").len() - 1;
+        let block_72 = braced(shipping(), open_72);
+        assert!(
+            !block_72.contains("if revision <= 73"),
+            "the revision 73 guard must not be nested inside the 72 block"
+        );
+        assert!(
+            at_73 > open_72 + block_72.len(),
+            "the revision 73 guard must come after the 72 block closes"
+        );
+
         let body = shipping()
             .find("pub async fn run_migrations(")
             .expect("run_migrations");
         let body_open = body + shipping()[body..].find(OPEN).expect("its body");
         let top_level = depth_at(body_open) + 1;
         assert_eq!(
-            (depth_at(at_70), depth_at(at_71), depth_at(at_72)),
-            (top_level, top_level, top_level),
-            "the 70, 71 and 72 guards must all sit at the top level of run_migrations"
+            (
+                depth_at(at_70),
+                depth_at(at_71),
+                depth_at(at_72),
+                depth_at(at_73)
+            ),
+            (top_level, top_level, top_level, top_level),
+            "the 70, 71, 72 and 73 guards must all sit at the top level of run_migrations"
+        );
+    }
+
+    /// The `if revision <= 73` block of `run_migrations`.
+    fn protected_channels_block() -> &'static str {
+        let needle = format!("if revision <= 73 {OPEN}");
+        let at = shipping()
+            .find(&needle)
+            .expect("the revision 73 migration block");
+        braced(shipping(), at + needle.len() - 1)
+    }
+
+    /// docs/protected-channels-design.md 2.7: backfill, then create the new
+    /// index, then drop the old one, so open groups are never without a
+    /// uniqueness guarantee. Control: the drop moved above the create.
+    #[test]
+    fn revision_73_backfills_then_creates_then_drops() {
+        let block: String = protected_channels_block()
+            .chars()
+            .filter(|ch| !ch.is_whitespace())
+            .collect();
+        let position = |needle: &str| -> usize {
+            assert_eq!(block.matches(needle).count(), 1, "exactly one `{needle}`");
+            block.find(needle).expect("the step")
+        };
+
+        let backfill = position("db.col::<Document>(\"mls_groups\").update_many(");
+        let backfill_spec = format!(
+            "db.col::<Document>(\"mls_groups\").update_many(\
+             doc!{OPEN}\"kind\":{OPEN}\"$exists\":false{CLOSE}{CLOSE},\
+             doc!{OPEN}\"$set\":{OPEN}\"kind\":\"Call\"{CLOSE}{CLOSE}"
+        );
+        assert!(
+            block[backfill..].starts_with(&backfill_spec),
+            "the backfill sets kind \"Call\" only where kind is missing"
+        );
+
+        let create = position("\"name\":\"open_channel_kind_group\"");
+        let create_spec = format!(
+            "\"key\":{OPEN}\"channel_id\":1_i32,\"kind\":1_i32{CLOSE},\
+             \"name\":\"open_channel_kind_group\",\"unique\":true,\
+             \"partialFilterExpression\":{OPEN}\"open\":true{CLOSE}"
+        );
+        assert!(
+            block.contains(&create_spec),
+            "the unique (channel_id, kind) index over open groups"
+        );
+
+        let drop = position("\"dropIndexes\":\"mls_groups\",\"index\":\"open_channel_group\"");
+        let collections = position("create_collection(\"channel_entitlements\")");
+
+        assert!(
+            backfill < create,
+            "the backfill must run before the index is created"
+        );
+        assert!(
+            create < drop,
+            "the new index must exist before the old one is dropped"
+        );
+        assert!(drop < collections, "the mls_groups steps run first");
+    }
+
+    /// A re-run of revision 73 (a panic later in the block leaves the
+    /// revision unadvanced) must not fail on the already-dropped index, and
+    /// must not swallow any other drop failure.
+    #[test]
+    fn revision_73_drop_tolerates_only_index_not_found() {
+        let block: String = protected_channels_block()
+            .chars()
+            .filter(|ch| !ch.is_whitespace())
+            .collect();
+        assert!(
+            block.contains("ifcommand.code==27"),
+            "only IndexNotFound (27) may be tolerated"
+        );
+        assert!(
+            block.contains("if!already_dropped{panic!("),
+            "any other drop failure must panic"
         );
     }
 
@@ -3191,6 +3413,147 @@ mod tests {
                 permissions("01KZ0000000000000000000000").await,
                 1,
                 "a server created after the soundboard shipped must be left alone"
+            );
+        }
+
+        db.drop_database().await;
+        guard.disarm();
+    }
+
+    /// Revision 73 (docs/protected-channels-design.md 2.7) on a database in
+    /// the revision-55 shape: kind backfilled to "Call" without touching a
+    /// kind already set, the open-group index swapped from per-channel to
+    /// per-(channel, kind), the three protected-channel collections created,
+    /// and a second run succeeds.
+    #[tokio::test]
+    async fn revision_73_swaps_the_open_group_index_and_is_rerunnable() {
+        // Named by hand for the same 63-character reason as above.
+        let db = crate::DatabaseInfo::Test("migration_rev73_protected".to_string())
+            .connect()
+            .await
+            .expect("Database connection failed.");
+        db.drop_database().await;
+        let guard = crate::test_teardown::TestDatabaseGuard::arm(&db).await;
+
+        {
+            #[allow(irrefutable_let_patterns)]
+            let Database::MongoDb(mongo) = db.clone() else {
+                // The migration scripts are MongoDB-only.
+                db.drop_database().await;
+                guard.disarm();
+                return;
+            };
+
+            // The revision-55 shape: the old per-channel index.
+            mongo
+                .db()
+                .run_command(doc! {
+                    "createIndexes": "mls_groups",
+                    "indexes": [
+                        {
+                            "key": { "channel_id": 1_i32 },
+                            "name": "open_channel_group",
+                            "unique": true,
+                            "partialFilterExpression": { "open": true }
+                        }
+                    ]
+                })
+                .await
+                .expect("create the revision-55 index");
+
+            let groups = mongo.col::<Document>("mls_groups");
+            groups
+                .insert_many(vec![
+                    doc! { "_id": "G1", "channel_id": "C1", "open": true },
+                    doc! { "_id": "G2", "channel_id": "C2", "open": false, "kind": "Text" },
+                ])
+                .await
+                .expect("insert groups");
+
+            super::run_migrations(&mongo, 73).await;
+
+            let kind = |id: &'static str| {
+                let groups = groups.clone();
+                async move {
+                    groups
+                        .find_one(doc! { "_id": id })
+                        .await
+                        .expect("find")
+                        .expect("group")
+                        .get_str("kind")
+                        .expect("kind")
+                        .to_string()
+                }
+            };
+            assert_eq!(
+                kind("G1").await,
+                "Call",
+                "a kind-less group is a Call group"
+            );
+            assert_eq!(
+                kind("G2").await,
+                "Text",
+                "an existing kind is never overwritten"
+            );
+
+            let indexes = groups.list_index_names().await.expect("list indexes");
+            assert!(
+                indexes.iter().any(|name| name == "open_channel_kind_group"),
+                "{indexes:?}"
+            );
+            assert!(
+                !indexes.iter().any(|name| name == "open_channel_group"),
+                "{indexes:?}"
+            );
+
+            // A Text group may now open beside the open Call group in C1 ...
+            let text = doc! { "_id": "G3", "channel_id": "C1", "open": true, "kind": "Text" };
+            groups
+                .insert_one(text)
+                .await
+                .expect("an open Text group beside an open Call group");
+            // ... but a second open Call group in C1 is still refused.
+            let call = doc! { "_id": "G4", "channel_id": "C1", "open": true, "kind": "Call" };
+            assert!(
+                groups.insert_one(call).await.is_err(),
+                "a second open Call group in one channel must be refused"
+            );
+
+            let collections = mongo
+                .db()
+                .list_collection_names()
+                .await
+                .expect("list collections");
+            for name in [
+                "channel_entitlements",
+                "channel_seats",
+                "channel_seat_lists",
+            ] {
+                assert!(
+                    collections.iter().any(|collection| collection == name),
+                    "{name} missing from {collections:?}"
+                );
+            }
+
+            let entitlements = mongo.col::<Document>("channel_entitlements");
+            entitlements
+                .insert_one(doc! { "_id": "E1", "channel_id": "C1" })
+                .await
+                .expect("insert an entitlement");
+            assert!(
+                entitlements
+                    .insert_one(doc! { "_id": "E2", "channel_id": "C1" })
+                    .await
+                    .is_err(),
+                "a second entitlement for one channel must be refused"
+            );
+
+            // Re-run: the old index is already gone, which must not panic.
+            super::run_migrations(&mongo, 73).await;
+            assert_eq!(
+                kind("G3").await,
+                "Text",
+                "a re-run leaves Text groups alone"
             );
         }
 

@@ -203,6 +203,7 @@ impl From<crate::Channel> for Channel {
                 voice,
                 slowmode,
                 announcement,
+                protected,
             } => Channel::TextChannel {
                 id,
                 server,
@@ -217,6 +218,7 @@ impl From<crate::Channel> for Channel {
                 voice: voice.map(|voice| voice.into()),
                 slowmode,
                 announcement,
+                protected,
             },
             crate::Channel::Thread {
                 id,
@@ -339,6 +341,7 @@ impl From<Channel> for crate::Channel {
                 voice,
                 slowmode,
                 announcement,
+                protected,
             } => crate::Channel::TextChannel {
                 id,
                 server,
@@ -353,6 +356,7 @@ impl From<Channel> for crate::Channel {
                 voice: voice.map(|voice| voice.into()),
                 slowmode,
                 announcement,
+                protected,
             },
             Channel::Thread {
                 id,
@@ -511,6 +515,7 @@ impl From<crate::PartialChannel> for PartialChannel {
             default_auto_archive_minutes: value.default_auto_archive_minutes,
             applied_tags: value.applied_tags,
             announcement: value.announcement,
+            protected: value.protected,
         }
     }
 }
@@ -544,6 +549,7 @@ impl From<PartialChannel> for crate::PartialChannel {
             default_auto_archive_minutes: value.default_auto_archive_minutes,
             applied_tags: value.applied_tags,
             announcement: value.announcement,
+            protected: value.protected,
         }
     }
 }
@@ -778,6 +784,37 @@ impl crate::Message {
             softres: self.softres,
             forwarded: self.forwarded.map(Into::into),
             crosspost: self.crosspost,
+            encrypted: self.encrypted.map(Into::into),
+        }
+    }
+}
+
+impl From<crate::EncryptedPayload> for EncryptedPayload {
+    fn from(value: crate::EncryptedPayload) -> Self {
+        EncryptedPayload {
+            v: value.v,
+            group_id: value.group_id,
+            epoch: value.epoch,
+            sender_device_id: value.sender_device_id,
+            nonce: value.nonce,
+            ciphertext: value.ciphertext,
+            sig: value.sig,
+            franking: value.franking,
+        }
+    }
+}
+
+impl From<EncryptedPayload> for crate::EncryptedPayload {
+    fn from(value: EncryptedPayload) -> Self {
+        crate::EncryptedPayload {
+            v: value.v,
+            group_id: value.group_id,
+            epoch: value.epoch,
+            sender_device_id: value.sender_device_id,
+            nonce: value.nonce,
+            ciphertext: value.ciphertext,
+            sig: value.sig,
+            franking: value.franking,
         }
     }
 }
@@ -833,6 +870,7 @@ impl From<crate::PartialMessage> for PartialMessage {
             softres: value.softres,
             forwarded: value.forwarded.map(Into::into),
             crosspost: value.crosspost,
+            encrypted: value.encrypted.map(Into::into),
         }
     }
 }
@@ -2249,6 +2287,78 @@ impl From<crate::E2EEEnvelope> for E2EEMessage {
             content_type: value.content_type.into(),
             group_id: value.group_id,
             epoch: value.epoch,
+        }
+    }
+}
+
+impl From<crate::MlsGroupKind> for MlsGroupKind {
+    fn from(value: crate::MlsGroupKind) -> Self {
+        match value {
+            crate::MlsGroupKind::Call => MlsGroupKind::Call,
+            crate::MlsGroupKind::Text => MlsGroupKind::Text,
+        }
+    }
+}
+
+impl From<MlsGroupKind> for crate::MlsGroupKind {
+    fn from(value: MlsGroupKind) -> Self {
+        match value {
+            MlsGroupKind::Call => crate::MlsGroupKind::Call,
+            MlsGroupKind::Text => crate::MlsGroupKind::Text,
+        }
+    }
+}
+
+impl From<crate::MlsMemberDevice> for MlsMemberDevice {
+    fn from(value: crate::MlsMemberDevice) -> Self {
+        MlsMemberDevice {
+            user_id: value.user_id,
+            device_id: value.device_id,
+        }
+    }
+}
+
+impl From<MlsMemberDevice> for crate::MlsMemberDevice {
+    fn from(value: MlsMemberDevice) -> Self {
+        crate::MlsMemberDevice {
+            user_id: value.user_id,
+            device_id: value.device_id,
+        }
+    }
+}
+
+impl crate::MlsJoinIntent {
+    /// Wire form of a stored join intent carried on a commit (design §8.1).
+    /// The stored row has no channel id, so the caller passes the group's
+    /// `channel_id`. `_id` and `created_at` are not sent.
+    pub fn into_rejoin_intent_info(self, channel_id: &str) -> MlsRejoinIntentInfo {
+        MlsRejoinIntentInfo {
+            group_id: self.group_id,
+            channel_id: channel_id.to_string(),
+            user_id: self.user_id,
+            device_id: self.device_id,
+            key_package_ref: self.key_package_ref,
+            signature: self.signature,
+        }
+    }
+}
+
+impl crate::MlsCommit {
+    /// Wire form of a stored winning commit. `channel_id` is the commit's
+    /// group's channel; it fills each rejoin intent's `channel_id`.
+    pub fn into_commit_info(self, channel_id: &str) -> MlsCommitInfo {
+        MlsCommitInfo {
+            group_id: self.group_id,
+            epoch: self.epoch,
+            committer: self.committer.into(),
+            commit: self.commit,
+            added: self.added.into_iter().map(Into::into).collect(),
+            removed: self.removed.into_iter().map(Into::into).collect(),
+            rejoin_intents: self
+                .rejoin_intents
+                .into_iter()
+                .map(|intent| intent.into_rejoin_intent_info(channel_id))
+                .collect(),
         }
     }
 }

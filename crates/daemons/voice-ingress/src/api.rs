@@ -1108,7 +1108,10 @@ pub async fn ingress(
             // Media E2EE: the call ended — close the channel's open MLS
             // group so members wipe state and the crond sweep reclaims it
             // (plan §1.4 end-of-call / §2.5)
-            if let Some(group) = db.fetch_open_mls_group_for_channel(channel_id).await? {
+            if let Some(group) = db
+                .fetch_open_mls_group_for_channel(channel_id, revolt_database::MlsGroupKind::Call)
+                .await?
+            {
                 db.close_mls_group(&group.id).await?;
             }
         }

@@ -130,7 +130,10 @@ pub async fn video_cap_would_refuse(channel: &UserVoiceChannel, user_id: &str) -
 /// sits as a non-enrolled SFU ghost tripping every member's loud-downgrade
 /// banner (audit CR-HIGH-2).
 pub async fn mls_cap_would_refuse(db: &Database, channel_id: &str, user_id: &str) -> Result<bool> {
-    Ok(match db.fetch_open_mls_group_for_channel(channel_id).await? {
+    Ok(match db
+        .fetch_open_mls_group_for_channel(channel_id, crate::MlsGroupKind::Call)
+        .await?
+    {
         Some(group) => {
             group.members.len() >= MAX_MLS_GROUP_MEMBERS
                 && !group.members.iter().any(|member| member.user_id == user_id)

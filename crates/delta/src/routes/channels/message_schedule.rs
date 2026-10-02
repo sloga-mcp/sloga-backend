@@ -382,6 +382,7 @@ mod test {
                         interactions: None,
                         components: None,
                         sticker_ids: None,
+                        encrypted: None,
                         flags: None,
                     },
                     status: revolt_database::ScheduledMessageStatus::Pending,

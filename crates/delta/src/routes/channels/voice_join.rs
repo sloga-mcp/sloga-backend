@@ -613,6 +613,11 @@ mod test {
                     members,
                     closed_at: None,
                     superseded_by: None,
+                    kind: revolt_database::MlsGroupKind::Call,
+                    generation: None,
+                    seat_list_ad_sha256: None,
+                    pending_removals: vec![],
+                    member_added: vec![],
                 },
                 None,
             )
@@ -713,6 +718,11 @@ mod test {
                     members,
                     closed_at: None,
                     superseded_by: None,
+                    kind: revolt_database::MlsGroupKind::Call,
+                    generation: None,
+                    seat_list_ad_sha256: None,
+                    pending_removals: vec![],
+                    member_added: vec![],
                 },
                 None,
             )

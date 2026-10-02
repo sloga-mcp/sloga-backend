@@ -343,6 +343,27 @@ pub enum ErrorType {
     VideoCallFull {
         max: usize,
     },
+
+    // ? Protected channel errors
+    /// The channel's Text group is mid-resecure; the client refreshes its
+    /// seats and text group, then retries. `reason` is one of
+    /// `pending_removal`, `stale_epoch`, `stale_group`, `not_member`,
+    /// `stale_seat_list`.
+    ProtectedChannelResecuring {
+        reason: String,
+    },
+    /// The caller is not on the channel's current seat list
+    NotSeated,
+    /// The seat list would exceed the per-channel seat ceiling
+    SeatCapReached {
+        max: usize,
+    },
+    /// The route is refused on a protected channel
+    ChannelProtected,
+    /// The request sets a field a protected channel does not accept
+    ProtectedFieldRefused {
+        field: String,
+    },
 }
 
 #[macro_export]

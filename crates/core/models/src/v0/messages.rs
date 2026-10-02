@@ -140,6 +140,13 @@ auto_derived_partial!(
         #[serde(skip_serializing_if = "Option::is_none")]
         pub crosspost: Option<CrosspostInfo>,
 
+        /// End-to-end encrypted payload of a protected-channel message.
+        ///
+        /// Opaque to the server (it never decrypts or verifies `sig`). On a
+        /// protected channel this is the ONLY content a message carries.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub encrypted: Option<EncryptedPayload>,
+
         /// Bitfield of message flags
         ///
         /// https://docs.rs/revolt-models/latest/revolt_models/v0/enum.MessageFlags.html
@@ -153,6 +160,37 @@ auto_derived_partial!(
 );
 
 auto_derived!(
+    /// End-to-end encrypted payload of a protected-channel message
+    /// (protected channels design §2.6). The v0 and database shapes are
+    /// identical. Unknown fields are refused so a future field can never be
+    /// silently dropped by an old server.
+    #[cfg_attr(feature = "serde", serde(deny_unknown_fields))]
+    pub struct EncryptedPayload {
+        /// Payload format version (exactly `1`)
+        pub v: u8,
+        /// Text group id (64 lowercase hex chars)
+        pub group_id: String,
+        /// MLS epoch whose key encrypted this message (`0..=2^53-1`)
+        pub epoch: i64,
+        /// Sending device id (32 lowercase hex chars)
+        pub sender_device_id: String,
+        /// AEAD nonce: unpadded standard base64 of exactly 24 bytes. NOT the
+        /// message-level `nonce` (that one is the client message id)
+        pub nonce: String,
+        /// AEAD ciphertext (plaintext + 16-byte tag), unpadded standard
+        /// base64; decoded length `17..=16384` bytes
+        pub ciphertext: String,
+        /// Ed25519 signature, unpadded standard base64 of exactly 64 bytes
+        pub sig: String,
+        /// Reserved for message franking (S9). Absent or `null`; the S1
+        /// server refuses a non-null value
+        #[cfg_attr(
+            feature = "serde",
+            serde(default, skip_serializing_if = "Option::is_none")
+        )]
+        pub franking: Option<String>,
+    }
+
     /// Bulk Message Response
     #[serde(untagged)]
     pub enum BulkMessageResponse {
@@ -368,6 +406,12 @@ auto_derived!(
 
         /// Sticker IDs to attach to this message
         pub sticker_ids: Option<Vec<String>>,
+
+        /// End-to-end encrypted payload (protected channels only)
+        ///
+        /// Required on a protected channel and refused everywhere else.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub encrypted: Option<EncryptedPayload>,
 
         /// Bitfield of message flags
         ///

@@ -226,6 +226,18 @@ pub async fn create_database(db: &MongoDb) {
         .await
         .expect("Failed to create donation_claim_codes collection.");
 
+    db.create_collection("channel_entitlements")
+        .await
+        .expect("Failed to create channel_entitlements collection.");
+
+    db.create_collection("channel_seats")
+        .await
+        .expect("Failed to create channel_seats collection.");
+
+    db.create_collection("channel_seat_lists")
+        .await
+        .expect("Failed to create channel_seat_lists collection.");
+
     db.run_command(doc! {
         "createIndexes": "users",
         "indexes": [
@@ -665,6 +677,46 @@ pub async fn create_database(db: &MongoDb) {
     })
     .await
     .expect("Failed to create server_boosts index.");
+
+    db.run_command(doc! {
+        "createIndexes": "channel_entitlements",
+        "indexes": [
+            // ENFORCES at most one entitlement per channel.
+            {
+                "key": {
+                    "channel_id": 1_i32
+                },
+                "name": "channel_id",
+                "unique": true
+            }
+        ]
+    })
+    .await
+    .expect("Failed to create channel_entitlements index.");
+
+    db.run_command(doc! {
+        "createIndexes": "channel_seats",
+        "indexes": [
+            // Serves the per-channel seat count and listing.
+            {
+                "key": {
+                    "channel_id": 1_i32
+                },
+                "name": "channel_id"
+            },
+            // Serves per-user seat lookups and cascades.
+            {
+                "key": {
+                    "user_id": 1_i32
+                },
+                "name": "user_id"
+            }
+        ]
+    })
+    .await
+    .expect("Failed to create channel_seats index.");
+
+    // channel_seat_lists is keyed by `_id` (the channel id) only.
 
     db.run_command(doc! {
         "createIndexes": "discord_import_jobs",
@@ -1182,14 +1234,18 @@ pub async fn create_database(db: &MongoDb) {
         "createIndexes": "mls_groups",
         "indexes": [
             // The channel-scoped create-race arbitration (media-E2EE plan
-            // §1.2/A5): at most ONE open group per channel; racing creators
-            // are settled by this partial unique index, never by group_id
-            // (racing creators derive DIFFERENT group ids).
+            // §1.2/A5): at most ONE open group per channel PER KIND (Call,
+            // Text; protected-channels design 2.5, 2.7); racing creators are
+            // settled by this partial unique index, never by group_id
+            // (racing creators derive DIFFERENT group ids). Fresh databases
+            // never had the old per-channel `open_channel_group` index;
+            // revision 73 replaces it on existing ones.
             {
                 "key": {
-                    "channel_id": 1_i32
+                    "channel_id": 1_i32,
+                    "kind": 1_i32
                 },
-                "name": "open_channel_group",
+                "name": "open_channel_kind_group",
                 "unique": true,
                 "partialFilterExpression": { "open": true }
             }

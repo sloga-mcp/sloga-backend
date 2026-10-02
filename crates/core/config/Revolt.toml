@@ -351,6 +351,23 @@ afk_auto_move = true
 # server_emoji = 500
 # server_sounds = 96
 
+# --- Protected channels (protected-channels design §7.1) ---
+# The feature ships DARK: all keys below default in code to the values shown,
+# with enabled = false. To turn it on, put the block in Revolt.overrides.toml
+# (keys MUST sit under an explicit [features.protected_channels] header — a
+# bare key under another table is silently ignored) and RESTART delta AND
+# crond: config file sources are frozen into the process at first access, so
+# a toml edit alone does nothing — and a pre-staged edit will silently
+# activate on the next incidental restart. It also needs e2ee_enabled.
+# Turning it OFF only freezes growth: it never unprotects an existing
+# channel, and encrypted send/history/receive keep working there. The text
+# plane's kill switch is e2ee_enabled, not this flag.
+#
+# [features.protected_channels]
+# enabled = false              # master switch for growth (grants, protect, seating, adds)
+# default_device_cap = 5       # 0 = unlimited (still bounded by 100 leaves)
+# commit_retention_days = 30   # crond prunes Text commits older than this
+
 [features.limits]
 
 [features.limits.global]

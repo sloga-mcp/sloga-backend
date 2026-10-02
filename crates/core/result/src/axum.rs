@@ -162,6 +162,11 @@ impl IntoResponse for Error {
             ErrorType::IncorrectData { .. } => StatusCode::BAD_REQUEST,
             ErrorType::MlsCallFull { .. } => StatusCode::CONFLICT,
             ErrorType::VideoCallFull { .. } => StatusCode::CONFLICT,
+            ErrorType::ProtectedChannelResecuring { .. } => StatusCode::CONFLICT,
+            ErrorType::NotSeated => StatusCode::FORBIDDEN,
+            ErrorType::SeatCapReached { .. } => StatusCode::BAD_REQUEST,
+            ErrorType::ChannelProtected => StatusCode::BAD_REQUEST,
+            ErrorType::ProtectedFieldRefused { .. } => StatusCode::BAD_REQUEST,
         };
 
         (status, Json(&self)).into_response()

@@ -3,13 +3,15 @@ use std::{collections::HashMap, sync::Arc};
 use futures::lock::Mutex;
 
 use crate::{
-    ApplicationCommand, Bot, CalendarEvent, Channel, ChannelCompositeKey, ChannelFollow, ChannelUnread,
+    ApplicationCommand, Bot, CalendarEvent, Channel, ChannelCompositeKey, ChannelEntitlement,
+    ChannelFollow, ChannelSeat, ChannelUnread,
     DiscordImportJob, Donation, DonationClaimCode,
     E2EEBackup, E2EEBlob, E2EEEnvelope, E2EEIdentity, E2EEOneTimeKey, Emoji, EventRsvp,
     EventRsvpKey, File, FileHash, Interaction, Invite, Member, MemberCompositeKey, Message,
     MlsCommit, MlsGroup, MlsJoinIntent, MlsKeyPackage, PolicyChange, Poll, PollVote,
     RatelimitEvent, Referral, ReferralCode, ReminderSent, RemoteControlAuditEntry,
-    ReminderSentKey, Report, Respect, ScheduledMessage, Server, ServerBan, ServerBoost, Snapshot,
+    ReminderSentKey, Report, Respect, ScheduledMessage, SeatList, Server, ServerBan, ServerBoost,
+    Snapshot,
     SoftResReserveRow, SoftResSheet, SoundboardSound,
     Sticker, StreamConnection, ThreadMember,
     ThreadMemberCompositeKey, UploadSession, User, UserSettings, Webhook, Account, AccountInvite, Session,
@@ -58,6 +60,9 @@ database_derived!(
         pub donation_claim_codes: Arc<Mutex<HashMap<String, DonationClaimCode>>>,
         pub server_bans: Arc<Mutex<HashMap<MemberCompositeKey, ServerBan>>>,
         pub server_boosts: Arc<Mutex<HashMap<String, ServerBoost>>>,
+        pub channel_entitlements: Arc<Mutex<HashMap<String, ChannelEntitlement>>>,
+        pub channel_seats: Arc<Mutex<HashMap<String, ChannelSeat>>>,
+        pub channel_seat_lists: Arc<Mutex<HashMap<String, SeatList>>>,
         pub server_members: Arc<Mutex<HashMap<MemberCompositeKey, Member>>>,
         pub servers: Arc<Mutex<HashMap<String, Server>>>,
         pub safety_reports: Arc<Mutex<HashMap<String, Report>>>,
