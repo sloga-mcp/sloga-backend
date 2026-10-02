@@ -51,16 +51,17 @@ impl AbstractUsers for ReferenceDb {
     }
 
     /// Fetch multiple users by their ids
+    ///
+    /// Mirrors the MongoDB `$in` query: unknown ids are skipped instead of
+    /// failing the whole call, and each user is returned at most once.
     async fn fetch_users<'a>(&self, ids: &'a [String]) -> Result<Vec<User>> {
         let users = self.users.lock().await;
-        ids.iter()
-            .map(|id| {
-                users
-                    .get(id)
-                    .cloned()
-                    .ok_or_else(|| create_error!(NotFound))
-            })
-            .collect()
+        let mut seen = std::collections::HashSet::new();
+        Ok(ids
+            .iter()
+            .filter(|id| seen.insert(id.as_str()))
+            .filter_map(|id| users.get(id).cloned())
+            .collect())
     }
 
     /// Fetch all discriminators in use for a username
@@ -362,5 +363,41 @@ impl AbstractUsers for ReferenceDb {
         let supporter = user.supporter.get_or_insert_with(empty_supporter);
         supporter.show_badges = show;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::User;
+
+    fn ids(users: &[User]) -> Vec<&str> {
+        users.iter().map(|user| user.id.as_str()).collect()
+    }
+
+    /// Both drivers: an unknown id is skipped, never an error (Mongo `$in`)
+    #[tokio::test]
+    async fn fetch_users_skips_unknown_ids() {
+        database_test!(|db| async move {
+            let known = User::create(&db, "Known".to_string(), None, None)
+                .await
+                .unwrap();
+            let unknown = ulid::Ulid::new().to_string();
+
+            let users = db
+                .fetch_users(&[known.id.clone(), unknown.clone()])
+                .await
+                .unwrap();
+            assert_eq!(ids(&users), vec![known.id.as_str()]);
+
+            // A repeated id comes back once, as with `$in`
+            let users = db
+                .fetch_users(&[unknown.clone(), known.id.clone(), known.id.clone()])
+                .await
+                .unwrap();
+            assert_eq!(ids(&users), vec![known.id.as_str()]);
+
+            assert!(db.fetch_users(&[unknown]).await.unwrap().is_empty());
+            assert!(db.fetch_users(&[]).await.unwrap().is_empty());
+        });
     }
 }

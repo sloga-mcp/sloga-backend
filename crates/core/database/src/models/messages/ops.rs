@@ -24,6 +24,23 @@ pub struct UnreadSummary {
     pub attachments: bool,
 }
 
+/// Reply count and newest message of one thread (a forum post or a thread)
+///
+/// Computed from the messages themselves on every call, nothing is stored,
+/// so it stays exact under every delete path. System messages are NOT
+/// excluded: filtering on `system` would force a document fetch, while
+/// `channel` + `_id` alone are covered by the `{channel, _id}` index.
+/// System messages in threads are rare and count as activity.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct ThreadStats {
+    /// Thread (channel) id
+    pub channel: String,
+    /// Messages in the thread other than its starter (the message whose id equals the thread id)
+    pub replies: u32,
+    /// Id of the newest message in the thread, including the starter; None if the thread has no messages
+    pub last_message_id: Option<String>,
+}
+
 #[async_trait]
 pub trait AbstractMessages: Sync + Send {
     /// Insert a new message into the database
@@ -77,6 +94,14 @@ pub trait AbstractMessages: Sync + Send {
         after_id: Option<&str>,
         user: &str,
     ) -> Result<UnreadSummary>;
+
+    /// Reply counts and newest message ids for the given threads, one entry per id in `channel_ids` (order not guaranteed)
+    ///
+    /// Every requested id gets an entry, even one with no messages at all
+    /// (`replies: 0`, `last_message_id: None`); a repeated id gets a single
+    /// entry. System messages are NOT excluded, so the query stays covered
+    /// by the `{channel, _id}` index; see [`ThreadStats`].
+    async fn fetch_thread_stats(&self, channel_ids: &[String]) -> Result<Vec<ThreadStats>>;
 
     /// Delete a message from the database by its id
     async fn delete_message(&self, id: &str) -> Result<()>;

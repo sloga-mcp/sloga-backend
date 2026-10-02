@@ -260,6 +260,7 @@ impl From<crate::Channel> for Channel {
                 require_tag,
                 default_sort,
                 force_sort,
+                default_layout,
                 default_auto_archive_minutes,
             } => Channel::Forum {
                 id,
@@ -276,6 +277,7 @@ impl From<crate::Channel> for Channel {
                 require_tag,
                 default_sort: default_sort.into(),
                 force_sort,
+                default_layout: default_layout.into(),
                 default_auto_archive_minutes,
             },
         }
@@ -394,6 +396,7 @@ impl From<Channel> for crate::Channel {
                 require_tag,
                 default_sort,
                 force_sort,
+                default_layout,
                 default_auto_archive_minutes,
             } => crate::Channel::Forum {
                 id,
@@ -410,6 +413,7 @@ impl From<Channel> for crate::Channel {
                 require_tag,
                 default_sort: default_sort.into(),
                 force_sort,
+                default_layout: default_layout.into(),
                 default_auto_archive_minutes,
             },
         }
@@ -458,6 +462,26 @@ impl From<ForumSortOrder> for crate::ForumSortOrder {
     }
 }
 
+impl From<crate::ForumLayout> for ForumLayout {
+    fn from(value: crate::ForumLayout) -> Self {
+        match value {
+            crate::ForumLayout::Modern => ForumLayout::Modern,
+            crate::ForumLayout::Classic => ForumLayout::Classic,
+            crate::ForumLayout::ClassicPlus => ForumLayout::ClassicPlus,
+        }
+    }
+}
+
+impl From<ForumLayout> for crate::ForumLayout {
+    fn from(value: ForumLayout) -> Self {
+        match value {
+            ForumLayout::Modern => crate::ForumLayout::Modern,
+            ForumLayout::Classic => crate::ForumLayout::Classic,
+            ForumLayout::ClassicPlus => crate::ForumLayout::ClassicPlus,
+        }
+    }
+}
+
 impl From<crate::PartialChannel> for PartialChannel {
     fn from(value: crate::PartialChannel) -> Self {
         PartialChannel {
@@ -482,6 +506,7 @@ impl From<crate::PartialChannel> for PartialChannel {
             require_tag: value.require_tag,
             default_sort: value.default_sort.map(|sort| sort.into()),
             force_sort: value.force_sort,
+            default_layout: value.default_layout.map(|layout| layout.into()),
             auto_archive_minutes: value.auto_archive_minutes,
             default_auto_archive_minutes: value.default_auto_archive_minutes,
             applied_tags: value.applied_tags,
@@ -514,6 +539,7 @@ impl From<PartialChannel> for crate::PartialChannel {
             require_tag: value.require_tag,
             default_sort: value.default_sort.map(|sort| sort.into()),
             force_sort: value.force_sort,
+            default_layout: value.default_layout.map(|layout| layout.into()),
             auto_archive_minutes: value.auto_archive_minutes,
             default_auto_archive_minutes: value.default_auto_archive_minutes,
             applied_tags: value.applied_tags,

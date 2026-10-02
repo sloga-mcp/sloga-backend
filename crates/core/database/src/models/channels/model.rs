@@ -228,6 +228,10 @@ auto_derived!(
             /// being the order the browse view merely opens on
             #[serde(skip_serializing_if = "crate::if_false", default)]
             force_sort: bool,
+            /// Default layout of the post browse view; readers may override it
+            /// locally. Absent on older documents, which load as `Modern`
+            #[serde(default)]
+            default_layout: ForumLayout,
             /// Auto-archive duration (minutes) applied to new posts that do
             /// not specify one (see `Channel::is_valid_auto_archive_minutes`,
             /// 0 = Never)
@@ -260,6 +264,18 @@ auto_derived!(
         CreationDate,
         /// By post title, 0-9 then A-Z
         Alphabetical,
+    }
+
+    /// Default layout of a forum's post browse view
+    #[derive(Default)]
+    pub enum ForumLayout {
+        /// Preview cards
+        #[default]
+        Modern,
+        /// One row per post: author, title, tags, last reply and reply count
+        Classic,
+        /// Table with topic, replies and last post columns
+        ClassicPlus,
     }
 
     #[derive(Default)]
@@ -314,6 +330,8 @@ auto_derived!(
         pub default_sort: Option<ForumSortOrder>,
         #[serde(skip_serializing_if = "Option::is_none")]
         pub force_sort: Option<bool>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub default_layout: Option<ForumLayout>,
         #[serde(skip_serializing_if = "Option::is_none")]
         pub auto_archive_minutes: Option<u32>,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -473,6 +491,7 @@ impl Channel {
                 require_tag: false,
                 default_sort: ForumSortOrder::default(),
                 force_sort: false,
+                default_layout: ForumLayout::default(),
                 default_auto_archive_minutes: Channel::default_forum_auto_archive_minutes(),
             },
         };
@@ -1277,6 +1296,8 @@ impl Channel {
                 tags,
                 require_tag,
                 default_sort,
+                force_sort,
+                default_layout,
                 default_auto_archive_minutes,
                 ..
             } => {
@@ -1322,6 +1343,14 @@ impl Channel {
 
                 if let Some(v) = partial.default_sort {
                     *default_sort = v;
+                }
+
+                if let Some(v) = partial.force_sort {
+                    *force_sort = v;
+                }
+
+                if let Some(v) = partial.default_layout {
+                    *default_layout = v;
                 }
 
                 if let Some(v) = partial.default_auto_archive_minutes {
@@ -1718,8 +1747,8 @@ mod tests {
     #[test]
     fn has_client_gate_per_variant() {
         use crate::{
-            client_gate_is_set, Channel, ForumSortOrder, VoiceInformation, CHANNEL_PASSWORD_PREFIX,
-            CHANNEL_PASSWORD_SUFFIX,
+            client_gate_is_set, Channel, ForumLayout, ForumSortOrder, VoiceInformation,
+            CHANNEL_PASSWORD_PREFIX, CHANNEL_PASSWORD_SUFFIX,
         };
         use std::collections::HashMap;
 
@@ -1770,6 +1799,7 @@ mod tests {
                 require_tag: false,
                 default_sort: ForumSortOrder::default(),
                 force_sort: false,
+                default_layout: ForumLayout::default(),
                 default_auto_archive_minutes: Channel::default_forum_auto_archive_minutes(),
             };
             let group = Channel::Group {
@@ -1820,6 +1850,154 @@ mod tests {
             user: "A".to_string(),
         };
         assert!(!saved.has_client_gate());
+    }
+
+    /// A forum stored before `default_layout` existed loads as `Modern` (no
+    /// migration), and a stored layout round-trips under its wire name.
+    /// Control: a `#[default]` other than `Modern`, or the field without
+    /// `#[serde(default)]`.
+    #[test]
+    fn forum_default_layout_is_modern_when_absent() {
+        use crate::{Channel, ForumLayout, PartialChannel};
+
+        fn layout(channel: &Channel) -> ForumLayout {
+            match channel {
+                Channel::Forum { default_layout, .. } => default_layout.clone(),
+                other => panic!("expected a forum, got {other:?}"),
+            }
+        }
+
+        let old: Channel = serde_json::from_value(serde_json::json!({
+            "channel_type": "Forum",
+            "_id": "F",
+            "server": "S",
+            "name": "forum",
+            "default_sort": "LatestActivity",
+        }))
+        .expect("a pre-layout forum document deserializes");
+        assert_eq!(layout(&old), ForumLayout::Modern);
+
+        let stored: Channel = serde_json::from_value(serde_json::json!({
+            "channel_type": "Forum",
+            "_id": "F",
+            "server": "S",
+            "name": "forum",
+            "default_layout": "ClassicPlus",
+        }))
+        .expect("a forum document with a layout deserializes");
+        assert_eq!(layout(&stored), ForumLayout::ClassicPlus);
+        let value = serde_json::to_value(&stored).expect("serializes");
+        assert_eq!(value["default_layout"], "ClassicPlus");
+        let again: Channel = serde_json::from_value(value).expect("round-trips");
+        assert_eq!(again, stored);
+
+        for (variant, wire) in [
+            (ForumLayout::Modern, "Modern"),
+            (ForumLayout::Classic, "Classic"),
+            (ForumLayout::ClassicPlus, "ClassicPlus"),
+        ] {
+            assert_eq!(serde_json::to_value(&variant).expect("serializes"), wire);
+        }
+
+        let mut forum = old.clone();
+        forum.apply_options(PartialChannel {
+            default_layout: Some(ForumLayout::Classic),
+            ..Default::default()
+        });
+        assert_eq!(layout(&forum), ForumLayout::Classic);
+        forum.apply_options(PartialChannel::default());
+        assert_eq!(layout(&forum), ForumLayout::Classic, "None leaves it");
+    }
+
+    /// `force_sort` from a partial lands on the forum (the Reference driver,
+    /// `Channel::update` and bonfire's cached channel all go through
+    /// `apply_options`), and `None` leaves it alone.
+    /// Control: drop the `force_sort` arm of `apply_options`.
+    #[test]
+    fn apply_options_sets_forum_force_sort() {
+        use crate::{Channel, PartialChannel};
+
+        fn force_sort(channel: &Channel) -> bool {
+            match channel {
+                Channel::Forum { force_sort, .. } => *force_sort,
+                other => panic!("expected a forum, got {other:?}"),
+            }
+        }
+
+        let mut forum: Channel = serde_json::from_value(serde_json::json!({
+            "channel_type": "Forum",
+            "_id": "F",
+            "server": "S",
+            "name": "forum",
+            "force_sort": false,
+        }))
+        .expect("a forum document deserializes");
+        assert!(!force_sort(&forum));
+
+        forum.apply_options(PartialChannel {
+            force_sort: Some(true),
+            ..Default::default()
+        });
+        assert!(force_sort(&forum));
+        forum.apply_options(PartialChannel::default());
+        assert!(force_sort(&forum), "None leaves it");
+
+        forum.apply_options(PartialChannel {
+            force_sort: Some(false),
+            ..Default::default()
+        });
+        assert!(!force_sort(&forum));
+    }
+
+    /// Same as above through BSON, the format MongoDB actually stores.
+    #[cfg(feature = "mongodb")]
+    #[test]
+    fn forum_default_layout_is_modern_when_absent_bson() {
+        use crate::{Channel, ForumLayout};
+
+        let old: Channel = bson::from_document(bson::doc! {
+            "channel_type": "Forum",
+            "_id": "F",
+            "server": "S",
+            "name": "forum",
+            "default_sort": "LatestActivity",
+        })
+        .expect("a pre-layout forum document deserializes");
+        assert!(
+            matches!(
+                old,
+                Channel::Forum {
+                    default_layout: ForumLayout::Modern,
+                    ..
+                }
+            ),
+            "{old:?}"
+        );
+
+        let stored: Channel = bson::from_document(bson::doc! {
+            "channel_type": "Forum",
+            "_id": "F",
+            "server": "S",
+            "name": "forum",
+            "default_layout": "ClassicPlus",
+        })
+        .expect("a forum document with a layout deserializes");
+        let document = bson::to_document(&stored).expect("serializes");
+        assert_eq!(
+            document
+                .get_str("default_layout")
+                .expect("stored as a string"),
+            "ClassicPlus"
+        );
+        let again: Channel = bson::from_document(document).expect("round-trips");
+        assert_eq!(again, stored);
+        assert!(matches!(
+            again,
+            Channel::Forum {
+                default_layout: ForumLayout::ClassicPlus,
+                ..
+            }
+        ));
     }
 
     /// The password marker is spelled once in the whole Rust workspace: in
