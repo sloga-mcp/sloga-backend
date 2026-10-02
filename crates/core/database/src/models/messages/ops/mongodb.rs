@@ -470,13 +470,12 @@ impl AbstractMessages for MongoDb {
         let mut deleted_messages: HashMap<String, Vec<String>> = HashMap::new();
         let mut attachment_ids: HashSet<String> = HashSet::new();
 
+        // Drain the whole cursor before any write. A skipped row would still be deleted by
+        // the `delete_many` below, with its attachments never marked and no event sent.
         while let Some(result) = cursor.next().await {
-            if let Ok(item) = result {
-                for id in item.attachment_ids {
-                    attachment_ids.insert(id);
-                }
-                deleted_messages.insert(item.channel, item.message_ids);
-            }
+            let item = result.map_err(|_| create_database_error!("aggregate", COL))?;
+            attachment_ids.extend(item.attachment_ids);
+            deleted_messages.insert(item.channel, item.message_ids);
         }
 
         // Mark attachments as deleted before deleting messages
