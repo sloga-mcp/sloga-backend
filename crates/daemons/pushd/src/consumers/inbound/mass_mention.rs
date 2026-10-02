@@ -29,6 +29,11 @@ impl MassMessageConsumer {
         push: &PushNotification,
         users: &[String],
     ) -> Result<()> {
+        // A silent message still records its mentions; only the push is skipped.
+        if MessageFlagsValue(push.message.flags).has(MessageFlags::SuppressNotifications) {
+            return Ok(());
+        }
+
         if let Ok(sessions) = self
             .db
             .fetch_sessions_with_subscription(users)

@@ -302,11 +302,26 @@ auto_derived!(
     }
 );
 
+/// Stored mask for `MessageFlags::SuppressNotifications`.
+///
+/// This is the one flag stored as a MASK and not at the bit position its
+/// discriminant names (that would be bit 1, value 2). Clients send
+/// `flags |= 1` for a silent message and read it back as `flags & 1`, and the
+/// protected-channel flag allowlist accepts exactly 0 or 1. Every other flag is
+/// a bit position (`1 << flag`). `MessageFlagsValue::has`/`set` route
+/// `SuppressNotifications` here, so callers never see the difference.
+const SUPPRESS_NOTIFICATIONS_MASK: u32 = 1;
+
 pub struct MessageFlagsValue(pub u32);
 
 impl MessageFlagsValue {
     pub fn has(&self, flag: MessageFlags) -> bool {
-        self.has_value(flag as u32)
+        match flag {
+            MessageFlags::SuppressNotifications => {
+                self.0 & SUPPRESS_NOTIFICATIONS_MASK == SUPPRESS_NOTIFICATIONS_MASK
+            }
+            flag => self.has_value(flag as u32),
+        }
     }
     pub fn has_value(&self, bit: u32) -> bool {
         let mask = 1 << bit;
@@ -314,7 +329,17 @@ impl MessageFlagsValue {
     }
 
     pub fn set(&mut self, flag: MessageFlags, toggle: bool) -> &mut Self {
-        self.set_value(flag as u32, toggle)
+        match flag {
+            MessageFlags::SuppressNotifications => {
+                if toggle {
+                    self.0 |= SUPPRESS_NOTIFICATIONS_MASK;
+                } else {
+                    self.0 &= !SUPPRESS_NOTIFICATIONS_MASK;
+                }
+                self
+            }
+            flag => self.set_value(flag as u32, toggle),
+        }
     }
     pub fn set_value(&mut self, bit: u32, toggle: bool) -> &mut Self {
         if toggle {
@@ -941,11 +966,13 @@ impl Message {
         // not just mentioned users.
         let is_thread = matches!(channel, Channel::Thread { .. });
 
-        if !self.has_suppressed_notifications()
-            && (is_dm_or_group
-                || is_thread
-                || self.mentions.is_some()
-                || self.contains_mass_push_mention())
+        // A silent message still takes this branch, marked `silenced`: the ack
+        // task records its mentions and unreads (`send_without_notifications`
+        // was told to leave that to us) and only skips the push.
+        if is_dm_or_group
+            || is_thread
+            || self.mentions.is_some()
+            || self.contains_mass_push_mention()
         {
             // send Push notifications
             #[cfg(feature = "tasks")]
@@ -1003,7 +1030,7 @@ impl Message {
                                 ),
                                 self.clone(),
                                 recipients,
-                                false, // branch already dictates this
+                                self.has_suppressed_notifications(),
                             )],
                         },
                     )
@@ -1041,12 +1068,8 @@ impl Message {
 
     /// Whether this message has suppressed notifications
     pub fn has_suppressed_notifications(&self) -> bool {
-        if let Some(flags) = self.flags {
-            flags & MessageFlags::SuppressNotifications as u32
-                == MessageFlags::SuppressNotifications as u32
-        } else {
-            false
-        }
+        self.flags
+            .is_some_and(|flags| MessageFlagsValue(flags).has(MessageFlags::SuppressNotifications))
     }
 
     pub fn contains_mass_push_mention(&self) -> bool {
@@ -1690,6 +1713,133 @@ mod tests {
                     .is_empty(),
                 "an author mentioning themselves yields no recipients"
             );
+        });
+    }
+}
+
+#[cfg(all(test, feature = "tasks"))]
+mod silent_flag_tests {
+    use super::*;
+    use crate::tasks::ack::{self, PushRoute};
+
+    type Queued = (Option<PushNotification>, Message, Vec<String>, bool);
+
+    #[test]
+    fn suppress_notifications_is_mask_one_and_the_rest_are_bit_positions() {
+        // Clients send `flags |= 1` for a silent message and read `flags & 1`.
+        assert!(MessageFlagsValue(1).has(MessageFlags::SuppressNotifications));
+        assert!(!MessageFlagsValue(2).has(MessageFlags::SuppressNotifications));
+
+        let mut flags = MessageFlagsValue(0);
+        flags
+            .set(MessageFlags::SuppressNotifications, true)
+            .set(MessageFlags::MentionsEveryone, true);
+        assert_eq!(flags.0, 1 | 1 << 2);
+        flags.set(MessageFlags::SuppressNotifications, false);
+        assert_eq!(flags.0, 1 << 2);
+
+        assert!(!MessageFlagsValue(1).has(MessageFlags::MentionsEveryone));
+        assert!(MessageFlagsValue(1 << 5).has(MessageFlags::Interaction));
+    }
+
+    /// Send "hello" with request `flags` into a DM through `create_from_api`.
+    /// Returns the stored message and the ack task entries the send queued.
+    #[allow(clippy::disallowed_methods)]
+    async fn send_dm(db: &Database, flags: Option<u32>) -> (Message, Vec<Queued>) {
+        let author = User {
+            id: Ulid::new().to_string(),
+            username: "author".to_string(),
+            discriminator: "0001".to_string(),
+            ..Default::default()
+        };
+        let channel = Channel::DirectMessage {
+            id: Ulid::new().to_string(),
+            active: true,
+            recipients: vec![author.id.clone(), Ulid::new().to_string()],
+            last_message_id: None,
+        };
+        db.insert_channel(&channel).await.unwrap();
+
+        // From JSON, as a request arrives, so new optional fields need no edit here.
+        let data: DataMessageSend =
+            serde_json::from_value(serde_json::json!({ "content": "hello", "flags": flags }))
+                .unwrap();
+        let model_author = author.clone().into_self(true).await;
+        let message = Message::create_from_api(
+            db,
+            None,
+            channel.clone(),
+            data,
+            MessageAuthor::User(&model_author),
+            Some(model_author.clone()),
+            None,
+            author.limits().await,
+            IdempotencyKey::unchecked_from_string(Ulid::new().to_string()),
+            false,
+            false,
+        )
+        .await
+        .unwrap();
+
+        (
+            db.fetch_message(&message.id).await.unwrap(),
+            ack::take_process_messages(channel.id()),
+        )
+    }
+
+    #[tokio::test]
+    #[allow(clippy::disallowed_methods)]
+    async fn silent_send_is_marked_silenced_and_skips_push() {
+        database_test!(|db| async move {
+            let (stored, queued) = send_dm(&db, Some(1)).await;
+            assert_eq!(stored.flags, Some(1));
+            assert!(stored.has_suppressed_notifications());
+
+            // Still queued, so the ack task records the DM unread, but
+            // marked silenced, so it sends no push.
+            let [(push, message, recipients, silenced)] = queued.as_slice() else {
+                panic!("expected one queued ack entry, got {}", queued.len());
+            };
+            assert!(*silenced);
+            assert_eq!(recipients.len(), 1);
+            assert_eq!(
+                ack::push_route(push.is_some(), message, recipients, *silenced),
+                None
+            );
+        });
+    }
+
+    #[tokio::test]
+    #[allow(clippy::disallowed_methods)]
+    async fn plain_send_is_not_silenced_and_pushes() {
+        database_test!(|db| async move {
+            let (stored, queued) = send_dm(&db, None).await;
+            assert!(!stored.has_suppressed_notifications());
+
+            let [(push, message, recipients, silenced)] = queued.as_slice() else {
+                panic!("expected one queued ack entry, got {}", queued.len());
+            };
+            assert!(!*silenced);
+            assert_eq!(
+                ack::push_route(push.is_some(), message, recipients, *silenced),
+                Some(PushRoute {
+                    direct: true,
+                    mass_mention: false
+                })
+            );
+        });
+    }
+
+    #[tokio::test]
+    #[allow(clippy::disallowed_methods)]
+    async fn request_flag_two_is_not_silent() {
+        database_test!(|db| async move {
+            // Bit 1 (value 2) was where the server used to look for
+            // SuppressNotifications. It carries no flag now and is dropped.
+            let (stored, queued) = send_dm(&db, Some(2)).await;
+            assert_eq!(stored.flags, Some(0));
+            assert!(!stored.has_suppressed_notifications());
+            assert!(queued.iter().all(|(_, _, _, silenced)| !silenced));
         });
     }
 }
