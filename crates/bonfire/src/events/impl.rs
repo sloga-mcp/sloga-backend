@@ -498,6 +498,29 @@ impl State {
         }
     }
 
+    /// Drop every cached thread / forum post of `server_id`. They are never listed in
+    /// `Server.channels`, so the per-channel loops in the leave / delete arms would
+    /// leave them subscribed: Ready subscribes joined threads, and `ChannelCreate`
+    /// caches a thread even when it is not viewable.
+    ///
+    /// Matches on `Channel::server()` rather than on the `Thread` variant, so any
+    /// other cached channel of the server that is missing from `Server.channels`
+    /// goes too. Ids are collected first, since unsubscribing needs `&mut self`.
+    async fn drop_server_threads(&mut self, server_id: &str) {
+        let ids: Vec<String> = self
+            .cache
+            .channels
+            .iter()
+            .filter(|(_, channel)| channel.server() == Some(server_id))
+            .map(|(id, _)| id.clone())
+            .collect();
+
+        for id in ids {
+            self.remove_subscription(&id).await;
+            self.cache.channels.remove(&id);
+        }
+    }
+
     /// Handle an incoming event for protocol version 1
     pub async fn handle_incoming_event_v1(&mut self, db: &Database, event: &mut EventV1) -> bool {
         /* Superseded by private topics.
@@ -718,6 +741,9 @@ impl State {
                             self.cache.channels.remove(channel);
                         }
                     }
+                    // Outside the block above: threads can be cached for a
+                    // server that is not.
+                    self.drop_server_threads(id).await;
                     self.cache.members.remove(id);
                 }
             }
@@ -730,6 +756,7 @@ impl State {
                         self.cache.channels.remove(channel);
                     }
                 }
+                self.drop_server_threads(id).await;
                 self.cache.members.remove(id);
             }
             EventV1::ServerMemberUpdate { id, data, clear } => {
@@ -845,7 +872,7 @@ mod tests {
     use revolt_database::{
         events::client::EventV1, Channel, DatabaseInfo, Member, MemberCompositeKey, Server, User,
     };
-    use revolt_models::v0;
+    use revolt_models::v0::{self, RemovalIntention};
     use revolt_permissions::{ChannelPermission, OverrideField};
     use std::collections::HashMap;
 
@@ -988,6 +1015,256 @@ mod tests {
         assert!(
             matches!(event, EventV1::ChannelUpdate { .. }),
             "forwarded event must remain a ChannelUpdate"
+        );
+    }
+
+    const SELF_ID: &str = "01USER00000000000000000SELF";
+    const OTHER_ID: &str = "01USER0000000000000000OTHER";
+    const SERVER_S: &str = "01SERVER00000000000000000S";
+    const SERVER_X: &str = "01SERVER00000000000000000X";
+    /// Text channel of S, listed in `S.channels`.
+    const TEXT_S: &str = "01CHANNEL0000000000000TEXTS";
+    /// Thread of S. Threads are never listed in `Server.channels`.
+    const THREAD_S: &str = "01CHANNEL00000000000THREADS";
+    /// Text channel of X, the parent of `THREAD_X`.
+    const TEXT_X: &str = "01CHANNEL0000000000000TEXTX";
+    /// Thread of another server X; must survive leaving S.
+    const THREAD_X: &str = "01CHANNEL00000000000THREADX";
+
+    fn plain_server(id: &str, channels: &[&str]) -> Server {
+        Server {
+            id: id.to_string(),
+            owner: OTHER_ID.to_string(),
+            name: "server".to_string(),
+            description: None,
+            channels: channels.iter().map(|c| c.to_string()).collect(),
+            categories: None,
+            system_messages: None,
+            roles: HashMap::new(),
+            default_permissions: ChannelPermission::ViewChannel as i64,
+            icon: None,
+            banner: None,
+            flags: None,
+            nsfw: false,
+            analytics: false,
+            discoverable: false,
+            discovery_requested: false,
+            voice_region: None,
+            boost_count: None,
+            boost_tier: None,
+            afk_channel_id: None,
+            afk_timeout: None,
+        }
+    }
+
+    fn text_channel(id: &str, server: &str) -> Channel {
+        Channel::TextChannel {
+            id: id.to_string(),
+            server: server.to_string(),
+            name: "text".to_string(),
+            description: None,
+            icon: None,
+            last_message_id: None,
+            default_permissions: None,
+            role_permissions: HashMap::new(),
+            nsfw: false,
+            spoiler: false,
+            voice: None,
+            slowmode: None,
+            announcement: None,
+        }
+    }
+
+    fn thread(id: &str, server: &str, parent_channel: &str) -> Channel {
+        Channel::Thread {
+            id: id.to_string(),
+            server: server.to_string(),
+            parent_channel: parent_channel.to_string(),
+            name: "thread".to_string(),
+            creator: OTHER_ID.to_string(),
+            origin_message_id: None,
+            last_message_id: None,
+            archived: false,
+            archived_timestamp: None,
+            auto_archive_minutes: Channel::default_auto_archive_minutes(),
+            locked: false,
+            applied_tags: vec![],
+        }
+    }
+
+    /// A member of S and X with the text channel and a thread of S, plus a
+    /// thread of X, cached and subscribed. With `cache_server_s` false, S
+    /// itself is absent from `cache.servers` while its thread stays cached.
+    ///
+    /// `State::from` starts in `Reset`, where `remove_subscription` panics,
+    /// so the seeded subscriptions are flushed with `apply_state` first.
+    async fn seeded_state(cache_server_s: bool) -> State {
+        let user = User {
+            id: SELF_ID.to_string(),
+            username: "self".to_string(),
+            ..Default::default()
+        };
+
+        let server_s = plain_server(SERVER_S, &[TEXT_S]);
+        let server_x = plain_server(SERVER_X, &[TEXT_X]);
+
+        let mut state = member_state(user, &server_s);
+        if !cache_server_s {
+            state.cache.servers.remove(SERVER_S);
+        }
+        state.cache.servers.insert(SERVER_X.to_string(), server_x);
+
+        for channel in [
+            text_channel(TEXT_S, SERVER_S),
+            thread(THREAD_S, SERVER_S, TEXT_S),
+            text_channel(TEXT_X, SERVER_X),
+            thread(THREAD_X, SERVER_X, TEXT_X),
+        ] {
+            state
+                .cache
+                .channels
+                .insert(channel.id().to_string(), channel);
+        }
+
+        for topic in [SERVER_S, SERVER_X, TEXT_S, THREAD_S, TEXT_X, THREAD_X] {
+            state.insert_subscription(topic.to_string()).await;
+        }
+        state.apply_state().await;
+
+        {
+            let subscribed = state.subscribed.read().await;
+            for topic in [SERVER_S, SERVER_X, TEXT_S, THREAD_S, TEXT_X, THREAD_X] {
+                assert!(
+                    subscribed.contains(topic),
+                    "precondition: {topic} subscribed"
+                );
+            }
+        }
+        assert!(state.cache.channels.contains_key(THREAD_S));
+
+        state
+    }
+
+    /// After leaving / losing S: every channel of S is unsubscribed and
+    /// uncached, threads included, and X is untouched.
+    async fn assert_server_s_dropped(state: &State, case: &str) {
+        {
+            let subscribed = state.subscribed.read().await;
+            assert!(
+                !subscribed.contains(THREAD_S),
+                "{case}: thread of the left server must be unsubscribed"
+            );
+            assert!(
+                !subscribed.contains(TEXT_S),
+                "{case}: text channel of the left server must be unsubscribed"
+            );
+            assert!(
+                !subscribed.contains(SERVER_S),
+                "{case}: the left server's topic must be unsubscribed"
+            );
+            for topic in [SERVER_X, TEXT_X, THREAD_X] {
+                assert!(
+                    subscribed.contains(topic),
+                    "{case}: {topic} of another server must stay subscribed"
+                );
+            }
+        }
+
+        assert!(
+            !state.cache.channels.contains_key(THREAD_S),
+            "{case}: thread of the left server must be uncached"
+        );
+        assert!(
+            !state.cache.channels.contains_key(TEXT_S),
+            "{case}: text channel of the left server must be uncached"
+        );
+        assert!(
+            state.cache.channels.contains_key(THREAD_X)
+                && state.cache.channels.contains_key(TEXT_X),
+            "{case}: channels of another server must stay cached"
+        );
+        assert!(!state.cache.servers.contains_key(SERVER_S));
+        assert!(!state.cache.members.contains_key(SERVER_S));
+    }
+
+    fn self_leave() -> EventV1 {
+        EventV1::ServerMemberLeave {
+            id: SERVER_S.to_string(),
+            user: SELF_ID.to_string(),
+            reason: RemovalIntention::Ban,
+        }
+    }
+
+    /// Being banned / kicked / leaving S drops S's threads from the socket,
+    /// not only the channels listed in `S.channels`; otherwise live thread
+    /// messages keep arriving until reconnect.
+    #[tokio::test]
+    async fn self_member_leave_drops_server_threads() {
+        let db = DatabaseInfo::Reference.connect().await.expect("database");
+        let mut state = seeded_state(true).await;
+
+        // Another member leaving S changes nothing for us.
+        let mut event = EventV1::ServerMemberLeave {
+            id: SERVER_S.to_string(),
+            user: OTHER_ID.to_string(),
+            reason: RemovalIntention::Leave,
+        };
+        assert!(state.handle_incoming_event_v1(&db, &mut event).await);
+        assert!(
+            state.subscribed.read().await.contains(THREAD_S),
+            "another member's leave must not drop our threads"
+        );
+        assert!(state.cache.channels.contains_key(THREAD_S));
+
+        let mut event = self_leave();
+        assert!(
+            state.handle_incoming_event_v1(&db, &mut event).await,
+            "the leave event must still be forwarded to the client"
+        );
+        assert!(matches!(event, EventV1::ServerMemberLeave { .. }));
+        assert_server_s_dropped(&state, "self ServerMemberLeave").await;
+    }
+
+    /// Same for a deleted server.
+    #[tokio::test]
+    async fn server_delete_drops_server_threads() {
+        let db = DatabaseInfo::Reference.connect().await.expect("database");
+        let mut state = seeded_state(true).await;
+
+        let mut event = EventV1::ServerDelete {
+            id: SERVER_S.to_string(),
+        };
+        assert!(
+            state.handle_incoming_event_v1(&db, &mut event).await,
+            "the delete event must still be forwarded to the client"
+        );
+        assert!(matches!(event, EventV1::ServerDelete { .. }));
+        assert_server_s_dropped(&state, "ServerDelete").await;
+    }
+
+    /// A thread can be cached for a server that is not (`ChannelCreate`
+    /// caches threads unconditionally), so the drop must not depend on S
+    /// being in `cache.servers`.
+    #[tokio::test]
+    async fn self_member_leave_drops_threads_of_uncached_server() {
+        let db = DatabaseInfo::Reference.connect().await.expect("database");
+        let mut state = seeded_state(false).await;
+
+        let mut event = self_leave();
+        assert!(state.handle_incoming_event_v1(&db, &mut event).await);
+
+        let subscribed = state.subscribed.read().await;
+        assert!(
+            !subscribed.contains(THREAD_S),
+            "uncached server: thread of the left server must be unsubscribed"
+        );
+        assert!(
+            !state.cache.channels.contains_key(THREAD_S),
+            "uncached server: thread of the left server must be uncached"
+        );
+        assert!(
+            subscribed.contains(THREAD_X) && state.cache.channels.contains_key(THREAD_X),
+            "uncached server: thread of another server must survive"
         );
     }
 }
