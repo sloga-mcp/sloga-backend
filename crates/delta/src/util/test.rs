@@ -463,6 +463,7 @@ impl TestHarness {
                 interactions: None,
                 components: None,
                 sticker_ids: None,
+                encrypted: None,
                 flags: None,
             },
             v0::MessageAuthor::User(&user.clone().into(&self.db, Some(user)).await),

@@ -181,6 +181,12 @@ impl<'r> Responder<'r, 'static> for Error {
             ErrorType::CipherTierInvalid => Status::BadRequest,
             ErrorType::PaymentPending => Status::Conflict,
             ErrorType::PaymentProviderError => Status::BadGateway,
+
+            ErrorType::ProtectedChannelResecuring { .. } => Status::Conflict,
+            ErrorType::NotSeated => Status::Forbidden,
+            ErrorType::SeatCapReached { .. } => Status::BadRequest,
+            ErrorType::ChannelProtected => Status::BadRequest,
+            ErrorType::ProtectedFieldRefused { .. } => Status::BadRequest,
         };
 
         // The body no longer carries the location, so log it for server

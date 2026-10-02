@@ -57,31 +57,7 @@ pub async fn fetch_commits(
     Ok(Json(v0::ResponseFetchMlsCommits {
         commits: commits
             .into_iter()
-            .map(|commit| v0::MlsCommitInfo {
-                group_id: commit.group_id,
-                epoch: commit.epoch,
-                committer: v0::MlsMemberDevice {
-                    user_id: commit.committer.user_id,
-                    device_id: commit.committer.device_id,
-                },
-                commit: commit.commit,
-                added: commit
-                    .added
-                    .into_iter()
-                    .map(|member| v0::MlsMemberDevice {
-                        user_id: member.user_id,
-                        device_id: member.device_id,
-                    })
-                    .collect(),
-                removed: commit
-                    .removed
-                    .into_iter()
-                    .map(|member| v0::MlsMemberDevice {
-                        user_id: member.user_id,
-                        device_id: member.device_id,
-                    })
-                    .collect(),
-            })
+            .map(|commit| commit.into_commit_info(&group.channel_id))
             .collect(),
         current_epoch: group.current_epoch,
     }))

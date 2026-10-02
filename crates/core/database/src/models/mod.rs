@@ -33,6 +33,7 @@ mod safety_reports;
 mod safety_snapshots;
 mod server_bans;
 mod server_boosts;
+mod protected_channels;
 mod server_members;
 mod servers;
 mod user_respect;
@@ -85,6 +86,7 @@ pub use safety_reports::*;
 pub use safety_snapshots::*;
 pub use server_bans::*;
 pub use server_boosts::*;
+pub use protected_channels::*;
 pub use server_members::*;
 pub use servers::*;
 pub use user_respect::*;
@@ -142,6 +144,7 @@ pub trait AbstractDatabase:
     + safety_snapshots::AbstractSnapshot
     + server_bans::AbstractServerBans
     + server_boosts::AbstractServerBoosts
+    + protected_channels::AbstractProtectedChannels
     + server_members::AbstractServerMembers
     + servers::AbstractServers
     + user_respect::AbstractUserRespect

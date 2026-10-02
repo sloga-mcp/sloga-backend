@@ -15,34 +15,6 @@ use crate::routes::e2ee::{require_e2ee_deliver_eligible, MAX_QUEUE_BYTES, MAX_QU
 
 use super::{encoded_len, Arbitrated, MAX_MLS_COMMIT_RAW_SIZE, MAX_MLS_WELCOME_RAW_SIZE};
 
-fn commit_info(commit: MlsCommit) -> v0::MlsCommitInfo {
-    v0::MlsCommitInfo {
-        group_id: commit.group_id,
-        epoch: commit.epoch,
-        committer: v0::MlsMemberDevice {
-            user_id: commit.committer.user_id,
-            device_id: commit.committer.device_id,
-        },
-        commit: commit.commit,
-        added: commit
-            .added
-            .into_iter()
-            .map(|member| v0::MlsMemberDevice {
-                user_id: member.user_id,
-                device_id: member.device_id,
-            })
-            .collect(),
-        removed: commit
-            .removed
-            .into_iter()
-            .map(|member| v0::MlsMemberDevice {
-                user_id: member.user_id,
-                device_id: member.device_id,
-            })
-            .collect(),
-    }
-}
-
 /// # Submit MLS Commit
 ///
 /// Submit the commit for the group's next epoch. **The unique-index insert
@@ -227,6 +199,8 @@ pub async fn submit_commit(
             })
             .collect(),
         created_at: Timestamp::now_utc(),
+        // Call commits never carry rejoin intents (Text-only, design §2.5)
+        rejoin_intents: vec![],
     };
 
     // The CAS — one winner per epoch; membership, epoch monotonicity, the
@@ -236,7 +210,7 @@ pub async fn submit_commit(
         MlsCommitOutcome::Lost { winning } => Ok(Arbitrated {
             conflict: true,
             body: Json(v0::ResponseSubmitMlsCommit::Lost {
-                winning: commit_info(winning),
+                winning: winning.into_commit_info(&group.channel_id),
             }),
         }),
         MlsCommitOutcome::Won => {

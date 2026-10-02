@@ -133,6 +133,15 @@ auto_derived!(
             /// other servers' channels can follow (crosspost fan-out).
             #[serde(skip_serializing_if = "Option::is_none")]
             announcement: Option<bool>,
+
+            /// Whether this is a protected (end-to-end encrypted) channel.
+            ///
+            /// One-way: once true it is never false again. Only the protect
+            /// route sets it; no client edit can set or clear it (it is not
+            /// in `FieldsChannel`), and `Channel::update` refuses a partial
+            /// that would lower it.
+            #[serde(skip_serializing_if = "crate::if_false", default)]
+            protected: bool,
         },
         /// Thread belonging to a server text channel
         Thread {
@@ -340,6 +349,10 @@ auto_derived!(
         pub applied_tags: Option<Vec<String>>,
         #[serde(skip_serializing_if = "Option::is_none")]
         pub announcement: Option<bool>,
+        /// Only ever `Some(true)` on the wire: `Channel::update` refuses
+        /// `Some(false)` on a protected channel and drops it on any other.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub protected: Option<bool>,
     }
 
     /// Optional fields on channel object
@@ -351,6 +364,19 @@ auto_derived!(
         Tags,
     }
 );
+
+impl PartialChannel {
+    /// Whether this partial sets a field a protected channel never takes:
+    /// any `voice`, or `announcement: Some(true)` (design 7.4).
+    ///
+    /// `Channel::update` refuses it against the caller's copy of the
+    /// channel, and both drivers' `update_channel` refuse it again against
+    /// the STORED channel in the same write, because the caller's copy can
+    /// be stale across a concurrent protect.
+    pub fn sets_field_refused_on_protected(&self) -> bool {
+        self.voice.is_some() || self.announcement == Some(true)
+    }
+}
 
 /// Opening marker of the line that carries a channel's password hash inside
 /// its `description`.
@@ -460,6 +486,7 @@ impl Channel {
                 voice: data.voice.map(|voice| voice.into()),
                 slowmode: None,
                 announcement: data.announcement.filter(|v| *v),
+                protected: false,
             },
             v0::LegacyServerChannelType::Voice => Channel::TextChannel {
                 id: id.clone(),
@@ -475,6 +502,7 @@ impl Channel {
                 voice: Some(data.voice.unwrap_or_default().into()),
                 slowmode: None,
                 announcement: None,
+                protected: false,
             },
             v0::LegacyServerChannelType::Forum => Channel::Forum {
                 id: id.clone(),
@@ -957,6 +985,55 @@ impl Channel {
         }
     }
 
+    /// Whether this is a protected (end-to-end encrypted) channel. Only a
+    /// server `TextChannel` can be one; every other variant answers `false`.
+    pub fn is_protected(&self) -> bool {
+        matches!(
+            self,
+            Channel::TextChannel {
+                protected: true,
+                ..
+            }
+        )
+    }
+
+    /// Hold the protected-channel invariants (design 2.1, 7.4) over a
+    /// partial before `update` applies or writes any of it, and return the
+    /// partial to write.
+    ///
+    /// - `protected: Some(false)` on a protected channel is refused
+    ///   (`ChannelProtected`). On any other channel the flag is already
+    ///   false, so it is dropped rather than written: a caller holding a
+    ///   stale copy must never write false over a concurrent protect.
+    /// - `protected: Some(true)` is refused (`InvalidOperation`, as the
+    ///   protect route) unless this is a server `TextChannel` with no voice
+    ///   that is not an announcement channel.
+    /// - A channel that is, or becomes, protected refuses any `voice` and
+    ///   `announcement: Some(true)` (`ChannelProtected`).
+    fn guard_protected_partial(&self, mut partial: PartialChannel) -> Result<PartialChannel> {
+        let requested = partial.protected;
+        match requested {
+            Some(false) if self.is_protected() => return Err(create_error!(ChannelProtected)),
+            Some(false) => partial.protected = None,
+            Some(true) => match self {
+                Channel::TextChannel {
+                    voice: None,
+                    announcement,
+                    ..
+                } if *announcement != Some(true) => {}
+                _ => return Err(create_error!(InvalidOperation)),
+            },
+            None => {}
+        }
+
+        let protected_after = self.is_protected() || partial.protected == Some(true);
+        if protected_after && partial.sets_field_refused_on_protected() {
+            return Err(create_error!(ChannelProtected));
+        }
+
+        Ok(partial)
+    }
+
     /// Gets this channel's voice information
     pub fn voice(&self) -> Option<Cow<VoiceInformation>> {
         match self {
@@ -1066,6 +1143,9 @@ impl Channel {
         partial: PartialChannel,
         remove: Vec<FieldsChannel>,
     ) -> Result<()> {
+        // Before anything is mutated, written or broadcast.
+        let partial = self.guard_protected_partial(partial)?;
+
         for field in &remove {
             self.remove_field(field);
         }
@@ -1209,6 +1289,7 @@ impl Channel {
                 voice,
                 slowmode,
                 announcement,
+                protected,
                 ..
             } => {
                 if let Some(v) = partial.name {
@@ -1249,6 +1330,12 @@ impl Channel {
 
                 if let Some(v) = partial.announcement {
                     *announcement = Some(v);
+                }
+
+                // One-way (design 2.1): a partial can raise the flag, never
+                // lower it.
+                if partial.protected == Some(true) {
+                    *protected = true;
                 }
             }
             Self::Thread {
@@ -1691,6 +1778,276 @@ mod tests {
         assert!(off.voice().is_none());
     }
 
+    // ---- Protected channels (design 2.1, 7.4) ------------------------------
+
+    fn text_channel(protected: bool) -> crate::Channel {
+        crate::Channel::TextChannel {
+            id: "T".to_string(),
+            server: "S".to_string(),
+            name: "text".to_string(),
+            description: None,
+            icon: None,
+            last_message_id: None,
+            default_permissions: None,
+            role_permissions: std::collections::HashMap::new(),
+            nsfw: false,
+            spoiler: false,
+            voice: None,
+            slowmode: None,
+            announcement: None,
+            protected,
+        }
+    }
+
+    fn refused_with(
+        result: revolt_result::Result<crate::PartialChannel>,
+        want: fn(&revolt_result::ErrorType) -> bool,
+    ) -> bool {
+        matches!(result, Err(error) if want(&error.error_type))
+    }
+
+    /// The flag is one-way: `Some(false)` on a protected channel is refused
+    /// with `ChannelProtected`, and `apply_options` never lowers it.
+    ///
+    /// Controls: the `Some(false) if self.is_protected()` arm removed (the
+    /// refusal), `*protected = v` in place of the raise-only apply.
+    #[test]
+    fn protected_flag_is_one_way() {
+        use crate::PartialChannel;
+        use revolt_result::ErrorType;
+
+        let lower = || PartialChannel {
+            protected: Some(false),
+            ..Default::default()
+        };
+
+        let protected = text_channel(true);
+        assert!(protected.is_protected());
+        assert!(refused_with(
+            protected.guard_protected_partial(lower()),
+            |e| matches!(e, ErrorType::ChannelProtected)
+        ));
+
+        // Not protected: false is already the value, and is dropped rather
+        // than written over a possibly concurrent protect.
+        let open = text_channel(false);
+        assert!(!open.is_protected());
+        let written = open.guard_protected_partial(lower()).expect("no-op");
+        assert_eq!(written.protected, None);
+
+        // Raising is idempotent on a protected channel.
+        let raise = || PartialChannel {
+            protected: Some(true),
+            ..Default::default()
+        };
+        assert_eq!(
+            protected
+                .guard_protected_partial(raise())
+                .unwrap()
+                .protected,
+            Some(true)
+        );
+
+        // apply_options raises and never lowers.
+        let mut channel = text_channel(false);
+        channel.apply_options(raise());
+        assert!(channel.is_protected());
+        channel.apply_options(lower());
+        assert!(channel.is_protected(), "apply_options lowered the flag");
+    }
+
+    /// Only a server `TextChannel` with no voice that is not an announcement
+    /// channel can be protected, and a protected channel takes no voice and
+    /// no announcement flag.
+    ///
+    /// Controls: the `voice: None` pattern widened to `..`, the
+    /// `protected_after` check removed.
+    #[test]
+    fn protected_flag_kind_and_field_rules() {
+        use crate::{Channel, PartialChannel, VoiceInformation};
+        use revolt_result::ErrorType;
+
+        let raise = || PartialChannel {
+            protected: Some(true),
+            ..Default::default()
+        };
+        let invalid = |e: &ErrorType| matches!(e, ErrorType::InvalidOperation);
+        let refused = |e: &ErrorType| matches!(e, ErrorType::ChannelProtected);
+
+        assert!(text_channel(false).guard_protected_partial(raise()).is_ok());
+
+        let mut voiced = text_channel(false);
+        if let Channel::TextChannel { voice, .. } = &mut voiced {
+            *voice = Some(VoiceInformation::default());
+        }
+        assert!(refused_with(
+            voiced.guard_protected_partial(raise()),
+            invalid
+        ));
+
+        let mut announcing = text_channel(false);
+        if let Channel::TextChannel { announcement, .. } = &mut announcing {
+            *announcement = Some(true);
+        }
+        assert!(refused_with(
+            announcing.guard_protected_partial(raise()),
+            invalid
+        ));
+
+        let group = Channel::Group {
+            id: "G".to_string(),
+            name: "group".to_string(),
+            owner: "O".to_string(),
+            description: None,
+            recipients: vec![],
+            icon: None,
+            last_message_id: None,
+            permissions: None,
+            nsfw: false,
+            spoiler: false,
+            voice: None,
+        };
+        assert!(!group.is_protected());
+        assert!(refused_with(
+            group.guard_protected_partial(raise()),
+            invalid
+        ));
+
+        let dm = Channel::DirectMessage {
+            id: "D".to_string(),
+            active: true,
+            recipients: vec![],
+            last_message_id: None,
+        };
+        assert!(refused_with(dm.guard_protected_partial(raise()), invalid));
+
+        let add_voice = || PartialChannel {
+            voice: Some(VoiceInformation::default()),
+            ..Default::default()
+        };
+        let add_announcement = || PartialChannel {
+            announcement: Some(true),
+            ..Default::default()
+        };
+        let protected = text_channel(true);
+        assert!(refused_with(
+            protected.guard_protected_partial(add_voice()),
+            refused
+        ));
+        assert!(refused_with(
+            protected.guard_protected_partial(add_announcement()),
+            refused
+        ));
+        // Protecting and adding voice in one partial is refused too.
+        assert!(refused_with(
+            text_channel(false).guard_protected_partial(PartialChannel {
+                protected: Some(true),
+                voice: Some(VoiceInformation::default()),
+                ..Default::default()
+            }),
+            refused
+        ));
+        // An unprotected channel keeps both edits.
+        assert!(text_channel(false)
+            .guard_protected_partial(add_voice())
+            .is_ok());
+        assert!(text_channel(false)
+            .guard_protected_partial(add_announcement())
+            .is_ok());
+    }
+
+    /// The stored shape: absent when false (existing documents need no
+    /// migration), `true` when set.
+    #[test]
+    fn protected_flag_serde() {
+        let open = serde_json::to_value(text_channel(false)).unwrap();
+        assert!(open.get("protected").is_none(), "{open}");
+        let back: crate::Channel = serde_json::from_value(open).unwrap();
+        assert!(!back.is_protected());
+
+        let set = serde_json::to_value(text_channel(true)).unwrap();
+        assert_eq!(set.get("protected"), Some(&serde_json::Value::Bool(true)));
+        let back: crate::Channel = serde_json::from_value(set).unwrap();
+        assert!(back.is_protected());
+    }
+
+    /// The voice / announcement refusal holds against the STORED channel,
+    /// not only the caller's copy: an edit holding a stale, unprotected copy
+    /// of a channel that was protected meanwhile is refused by the write
+    /// itself, and nothing is written. Runs on whichever driver `TEST_DB`
+    /// names.
+    ///
+    /// Controls: the `"protected": { "$ne": true }` filter dropped
+    /// (MongoDB), the `is_protected()` re-check dropped (Reference).
+    #[tokio::test]
+    async fn protected_refusal_holds_against_a_stale_copy() {
+        database_test!(|db| async move {
+            use crate::{PartialChannel, VoiceInformation};
+            use revolt_result::ErrorType;
+
+            let add_voice = || PartialChannel {
+                voice: Some(VoiceInformation::default()),
+                ..Default::default()
+            };
+            let add_announcement = || PartialChannel {
+                announcement: Some(true),
+                ..Default::default()
+            };
+
+            // Unprotected: both edits still go through.
+            let mut open = text_channel(false);
+            db.insert_channel(&open).await.expect("insert");
+            open.update(&db, add_voice(), vec![])
+                .await
+                .expect("voice on an unprotected channel");
+            let stored = db.fetch_channel("T").await.expect("fetch");
+            assert!(stored.voice().is_some(), "{stored:?}");
+
+            // A second channel. The caller's copy is taken before it is
+            // protected; the protect lands in the store only.
+            let mut stale = text_channel(false);
+            if let crate::Channel::TextChannel { id, .. } = &mut stale {
+                *id = "P".to_string();
+            }
+            db.insert_channel(&stale).await.expect("insert");
+            db.update_channel(
+                "P",
+                &PartialChannel {
+                    protected: Some(true),
+                    ..Default::default()
+                },
+                vec![],
+            )
+            .await
+            .expect("protect");
+            assert!(!stale.is_protected(), "the caller's copy is stale");
+
+            for partial in [add_voice(), add_announcement()] {
+                let result = stale.clone().update(&db, partial.clone(), vec![]).await;
+                assert!(
+                    matches!(
+                        &result,
+                        Err(error) if matches!(error.error_type, ErrorType::ChannelProtected)
+                    ),
+                    "{partial:?} on a stored-protected channel: {result:?}"
+                );
+            }
+
+            let stored = db.fetch_channel("P").await.expect("fetch");
+            assert!(stored.is_protected(), "{stored:?}");
+            let crate::Channel::TextChannel {
+                voice,
+                announcement,
+                ..
+            } = &stored
+            else {
+                panic!("{stored:?}");
+            };
+            assert_eq!(voice, &None, "voice was written");
+            assert_ne!(announcement, &Some(true), "announcement was written");
+        });
+    }
+
     // ---- Client gates (wave BG) --------------------------------------------
 
     /// The server's reading of the password gate is the client's
@@ -1783,6 +2140,7 @@ mod tests {
                 voice: Some(VoiceInformation::default()),
                 slowmode: None,
                 announcement: None,
+                protected: false,
             };
             let forum = Channel::Forum {
                 id: "F".to_string(),

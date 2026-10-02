@@ -176,6 +176,12 @@ impl IntoResponse for Error {
             ErrorType::CipherTierInvalid => StatusCode::BAD_REQUEST,
             ErrorType::PaymentPending => StatusCode::CONFLICT,
             ErrorType::PaymentProviderError => StatusCode::BAD_GATEWAY,
+
+            ErrorType::ProtectedChannelResecuring { .. } => StatusCode::CONFLICT,
+            ErrorType::NotSeated => StatusCode::FORBIDDEN,
+            ErrorType::SeatCapReached { .. } => StatusCode::BAD_REQUEST,
+            ErrorType::ChannelProtected => StatusCode::BAD_REQUEST,
+            ErrorType::ProtectedFieldRefused { .. } => StatusCode::BAD_REQUEST,
         };
 
         // The body no longer carries the location, so log it for server

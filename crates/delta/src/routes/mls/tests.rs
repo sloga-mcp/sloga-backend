@@ -1868,6 +1868,7 @@ async fn join_intent_call_full_boundary_and_rejoin_exemption_case() {
             added: synthetic,
             removed: vec![],
             created_at: iso8601_timestamp::Timestamp::now_utc(),
+            rejoin_intents: vec![],
         })
         .await
         .unwrap();

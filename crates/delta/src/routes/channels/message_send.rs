@@ -310,6 +310,7 @@ mod test {
             default_auto_archive_minutes: None,
             applied_tags: None,
             announcement: None,
+            protected: None,
         };
         locked_channel
             .update(&harness.db, partial, vec![])
@@ -339,6 +340,7 @@ mod test {
                 interactions: None,
                 components: None,
                 sticker_ids: None,
+                encrypted: None,
                 flags: None,
             },
             v0::MessageAuthor::User(&user.clone().into(&harness.db, Some(&user)).await),
@@ -381,6 +383,7 @@ mod test {
                 interactions: None,
                 components: None,
                 sticker_ids: None,
+                encrypted: None,
                 flags: None,
             },
             v0::MessageAuthor::User(&user.clone().into(&harness.db, Some(&user)).await),
@@ -432,6 +435,7 @@ mod test {
                 interactions: None,
                 components: None,
                 sticker_ids: None,
+                encrypted: None,
                 flags: None,
             },
             v0::MessageAuthor::User(&user.clone().into(&harness.db, Some(&user)).await),
@@ -484,6 +488,7 @@ mod test {
                 interactions: None,
                 components: None,
                 sticker_ids: None,
+                encrypted: None,
                 flags: None,
             },
             v0::MessageAuthor::User(&user.clone().into(&harness.db, Some(&user)).await),
@@ -537,6 +542,7 @@ mod test {
                 interactions: None,
                 components: None,
                 sticker_ids: None,
+                encrypted: None,
                 flags: None,
             },
             v0::MessageAuthor::User(&user.clone().into(&harness.db, Some(&user)).await),
@@ -576,6 +582,7 @@ mod test {
                 interactions: None,
                 components: None,
                 sticker_ids: None,
+                encrypted: None,
                 flags: None,
             },
             v0::MessageAuthor::User(&user.clone().into(&harness.db, Some(&user)).await),
@@ -609,6 +616,7 @@ mod test {
                 interactions: None,
                 components: None,
                 sticker_ids: None,
+                encrypted: None,
                 flags: None,
             },
             v0::MessageAuthor::User(&user.clone().into(&harness.db, Some(&user)).await),
@@ -665,6 +673,7 @@ mod test {
                 interactions: None,
                 components: None,
                 sticker_ids: None,
+                encrypted: None,
                 flags: None,
             },
             v0::MessageAuthor::User(
@@ -712,6 +721,7 @@ mod test {
                 interactions: None,
                 components: None,
                 sticker_ids: None,
+                encrypted: None,
                 flags: None,
             },
             v0::MessageAuthor::User(
@@ -784,6 +794,7 @@ mod test {
                 interactions: None,
                 components: None,
                 sticker_ids: None,
+                encrypted: None,
                 flags: None,
             },
             v0::MessageAuthor::User(
@@ -891,6 +902,7 @@ mod test {
             interactions: None,
             components: None,
             sticker_ids: None,
+            encrypted: None,
             flags: None,
         }
     }

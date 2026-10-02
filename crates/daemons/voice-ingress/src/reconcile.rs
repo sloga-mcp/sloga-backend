@@ -449,7 +449,10 @@ async fn reconcile_channel(
     // Media E2EE: mirror room_finished so members wipe state and the crond
     // sweep reclaims the group (fetch returns only OPEN groups — a close
     // that already happened makes this a no-op).
-    if let Some(group) = db.fetch_open_mls_group_for_channel(channel_id).await? {
+    if let Some(group) = db
+        .fetch_open_mls_group_for_channel(channel_id, revolt_database::MlsGroupKind::Call)
+        .await?
+    {
         db.close_mls_group(&group.id).await?;
     }
 

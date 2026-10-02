@@ -2339,6 +2339,7 @@ mod tests {
             voice,
             slowmode: None,
             announcement: None,
+            protected: false,
         }
     }
 
