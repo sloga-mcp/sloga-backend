@@ -155,7 +155,9 @@ A hostile or compromised server (or an operator with database access):
   removal is the owner's signed unseat, itself subject to R11.
 - **R9. Commit retention.** Text commits older than `commit_retention_days` (default 30) are
   pruned. A device offline longer than that cannot catch up and must rejoin (history for the
-  gap is lost until S2/S4).
+  gap is lost until S2/S4). **DECISION (W1.5):** `commit_retention_days = 0` means pruning is
+  DISABLED (Text commits are kept forever), mirroring `default_device_cap = 0` = unlimited
+  (2.5, 7.1).
 - **R10. Send-time check races.** The server's epoch and membership checks on send (7.3) are
   not atomic with commit arbitration; a send can land at epoch `e` while a commit to `e+1`
   wins. Receivers handle this (3.9 step 9).
@@ -244,6 +246,12 @@ A hostile or compromised server (or an operator with database access):
     group, and history before the successor stays readable locally). With the owner's device
     lost it is a freeze (R12). The offending member stays identifiable as the committer; S2
     may add owner-driven expulsion.
+- **R15. Protect vs plaintext-send compensation (MongoDB; DECISION (W1.5)).** A plaintext send
+  racing protect is inserted before its guard write; if protect won, the row is deleted
+  again. A crash or failed delete in between leaves one never-broadcast plaintext message,
+  authored before protect, stored in the protected channel, and a fetch can read it briefly
+  before the delete. Backstop: protected-channel history reads drop or flag any row without
+  `encrypted` (W2), and clients never render it as protected (9.4).
 
 ---
 
@@ -558,6 +566,9 @@ commit at that epoch.
 - `sweep_mls_groups` (both drivers) never closes or deletes Text groups. New driver method
   `prune_mls_text_commits(older_than: Timestamp) -> Result<u64>` deletes `mls_commits` rows of
   Text groups with `created_at < older_than` (crond, daily, cutoff `now - commit_retention_days`).
+  **DECISION (W1.5):** `commit_retention_days = 0` disables pruning; crond MUST NOT call
+  `prune_mls_text_commits` when it is `0` (a cutoff of `now - 0` would delete every commit and
+  strand every catch-up).
 - Close paths (`room_finished`, reconcile, `join_intent.rs` closes) touch Call groups only.
 
 ### 2.6 `Message.encrypted`
@@ -1219,12 +1230,15 @@ The server is not the trust anchor, but it validates so garbage never reaches cl
    server's compare-and-set is the equivocation guard; clients accept any higher version.
    **DECISION (W0-fix):** a PUT with `version == stored_version` whose body and signature are
    byte-identical to the stored row is an idempotent success with no side effects (the
-   lost-response retry of 4.9); any other version is `FailedValidation`.
+   retry of 4.9 after a lost response, a transport error or any 5xx, W1.5); any other
+   version is `FailedValidation`.
    **(DECISION (W0-fix8))** That byte-identical re-PUT returns the stored success
    IMMEDIATELY at this step, before steps 5 to 8, including 5b. A retry of a PUT that
    already landed must not be refused because the state moved on afterwards (for example
    the signer device lost its leaf in the meantime, or a seat claim would now exceed the
    cap). Steps 1 to 3 (parse, authorization, signature) still run first.
+   For the genesis list on protect, the same idempotency applies to a byte-identical
+   re-protect while the stored list is still version 1 (7.2, **DECISION (W1.5)**, N3).
 5. Every seated user is a member of the server, not a bot, not staff; the signer is seated.
 5b. **Signer holds a leaf (DECISION (W0-fix7)).** When the channel has an open Text group, the
    signer device `(signer_user_id, signer_device_id)` must be in that group's `members`,
@@ -1324,7 +1338,7 @@ pending signer's `user_id`, `device_id` and **identity key** (not just user/devi
   version 1). **DECISION (W0-fix):** genesis is allowed only when **the server holds no seat
   list for this channel** (the bridge passes the `GET .../seats` result, whose `list` is
   `null`; the server independently refuses version 1 when it holds a list and refuses protect
-  on a protected channel). The absence of a local pin is NOT the criterion: a member device or
+  on a protected channel, except a byte-identical re-protect, 7.2). The absence of a local pin is NOT the criterion: a member device or
   an owner's replacement device also has no pin. The owner device pins itself
   (`source = protect`) only when it verifies the genesis list it reads back (4.9).
 - **At first sight:** a member's device that has no pin for the channel pins the signer of the
@@ -1430,9 +1444,35 @@ A seat list is ADOPTED only if all hold, checked in this order (W0-fix3):
   ALWAYS shows a native dialog naming the target device; in S1 it refuses a target of a
   different user (4.6).
 - The bridge keeps the returned signed bytes until the publish resolves, and PUTs them. On a
-  lost response or a transport error it **re-PUTs the SAME bytes**. The server treats a PUT
+  lost response, a transport error, or ANY 5xx (including `DatabaseError` from exhausted
+  transaction retries, which may follow a commit that landed) it **re-PUTs the SAME bytes**
+  (**DECISION (W1.5)**, extending W0-fix). Only a 2xx or a 4xx other than 429 resolves the
+  publish; the bridge never signs a new version while a publish is unresolved. **A 429 is
+  retryable, not a resolving 4xx (DECISION (W1.5)):** the bridge re-sends the SAME bytes
+  after the server's stated delay, else backs off. Delta sends no standard `Retry-After`
+  header. The bridge prefers the `X-RateLimit-Reset-After` header, in MILLISECONDS (the
+  limiter's `left_until_reset`, `ratelimiter.rs`). Otherwise it uses the body's
+  `retry_after` in the unit of that error type: the rate limiter's own 429 body is in
+  MILLISECONDS (`ratelimits/src/rocket.rs`, the same `left_until_reset` value); route-level
+  errors such as `InSlowmode` are in SECONDS. The server treats a PUT
   whose `version` equals the stored version and whose body and signature are byte-identical
   to the stored row as an idempotent success (no seat changes, no new pending removals).
+- **Protect uses the same rule (DECISION (W1.5), N3).** The genesis list's publish is
+  `PUT /channels/:id/protect`. The bridge keeps the signed genesis bytes and re-sends the
+  SAME protect request on a lost response, a transport error, any 5xx or a 429. A
+  byte-identical re-protect returns success while the stored list is still version 1 (7.2).
+  ANY non-429 4xx on a protect whose earlier attempt is unresolved (`InvalidOperation`, or
+  e.g. `NotAuthenticated` after a re-login) is NOT taken at face value: the bridge resolves
+  it by read-back, the same rule as the crash case below. It reads
+  `GET /channels/:id` and `GET .../seats`. If the channel is `protected: true` and the
+  server's list is version 1 and byte-identical to its genesis bytes, the protect landed: it
+  runs `_seat_list_verify` on that list, which is the only path to the genesis self-pin (4.5).
+  Any other read-back (not protected, no list, a different version-1 list, or a list past
+  version 1) resolves the protect as REFUSED: the device does not self-pin, does not sign
+  another genesis (the server holds a list, 4.5), and shows the owner the failure. A list
+  past version 1 is unreachable with an honest server, because only this device can sign
+  version 2 and it signs nothing before verifying version 1; refusing is the fail-safe
+  reading.
 - The owner device's stored version (and, at genesis, its self-pin) advance only when it
   reads the list back with `GET .../seats` and `_seat_list_verify` accepts it. The owner's
   following Remove commits embed that read-back list (3.12).
@@ -1747,13 +1787,16 @@ above follow immediately, then the opaque `encrypted_sender_data<V>` and `cipher
 
 **Protect (owner).** Admin grants the entitlement (7.2). Owner device: `GET .../seats`
 (`list: null`); `_seat_list_sign` (version 1, seats = owner plus any initial members; native
-dialog if it seats anyone besides the owner); `PUT /channels/:id/protect` with that list;
+dialog if it seats anyone besides the owner); `PUT /channels/:id/protect` with that list
+(re-sent with the same bytes per 4.9; any non-429 4xx on a retry is resolved by
+read-back);
 `GET .../seats` and `_seat_list_verify`, which is when the owner device pins itself (4.9);
 `_group_create` (generation 0); `POST /mls/groups` (`kind: Text`, `generation: 0`). Then seat
 and admit as below.
 
 **Seat a member.** Owner: `_seat_list_sign` (version n+1, native dialog listing the added
-users); `PUT /channels/:id/seats` (re-PUT the same bytes on a lost response); `GET .../seats`,
+users); `PUT /channels/:id/seats` (re-PUT the same bytes on a lost response, a transport
+error, any 5xx or a 429 until a 2xx or another 4xx, 4.9); `GET .../seats`,
 catch up to its `as_of_epoch`, then `_seat_list_verify` (the owner's stored version advances
 here; 4.4 step 0). The member's device: `GET /channels/:id/seats`; `_seat_list_verify` (pins
 the owner on first sight; a joiner has no group state, so no catch-up);
@@ -1901,10 +1944,14 @@ is S2. This is why the HOLD in 1.1 exists.
 [features.protected_channels]
 enabled = false              # master switch for growth (grants, protect, seating, adds)
 default_device_cap = 5       # 0 = unlimited (still bounded by 100 leaves)
-commit_retention_days = 30   # crond prunes Text commits older than this
+commit_retention_days = 30   # crond prunes Text commits older than this; 0 = never prune
 ```
 
-Config struct `ProtectedChannelsFeatures` (copy the `BoostFeatures` pattern: `#[serde(default)]`
+**DECISION (W1.5):** `commit_retention_days = 0` disables pruning (Text commits are kept
+forever); crond skips `prune_mls_text_commits` entirely rather than using a cutoff of
+`now - 0`, which would delete every commit (R9, 2.5).
+
+Config struct `ProtectedChannelFeatures` (copy the `BoostFeatures` pattern: `#[serde(default)]`
 fields, `impl Default`, documented block in `Revolt.toml`). Advertised in `routes/root.rs` as
 `protected_channels: { enabled, default_device_cap }`.
 
@@ -1931,7 +1978,7 @@ Gates (**kind-aware**; the media gate body is unchanged and stays pinned by `fla
 
 | Operation | Flag off |
 |---|---|
-| Admin grant, `PUT .../protect` | Refused `FeatureDisabled { feature: "protected_channels" }` |
+| Admin grant, `PUT .../protect` | Refused `FeatureDisabled { feature: "protected_channels" }`, except a byte-identical re-protect, which writes nothing and returns the stored success (7.2, W1.5 N3) |
 | `PUT .../seats` adding anyone | Refused `FeatureDisabled` |
 | `PUT .../seats` that only removes | Allowed (removal must always be possible) |
 | Text group create, join intent, KeyPackage claim, commits with `added` | Refused `FeatureDisabled` |
@@ -1963,10 +2010,27 @@ calculus, because `calculate_channel_permissions` grants all to privileged accou
 growth gate; `Active` entitlement (else `InvalidOperation`); channel is a server `TextChannel`
 with no `voice` and not an announcement channel (else `InvalidOperation`); channel has no
 messages, `last_message_id == None` (**DECISION (W0)**: protecting a channel with history is
-S4; else `InvalidOperation`); already protected is `InvalidOperation`; a privileged (staff)
+S4; else `InvalidOperation`); already protected is `InvalidOperation` (except the
+byte-identical retry below); a privileged (staff)
 owner is `InvalidOperation` (2.3, **DECISION (W0-fix)**). The seat list is the
 genesis list (`version: 1`), validated per 4.3, stored, seats claimed, all atomically with
 setting the flag.
+
+**Idempotent re-protect (DECISION (W1.5), N3).** A protect on an already-protected channel
+whose genesis list is BYTE-IDENTICAL (`body`, which carries `version: 1`, and `signature`)
+to the stored list, while the stored list is still at version 1, returns the stored success
+(the current v0 `Channel`, `protected: true`). This is the same idempotency as the seat
+re-PUT (4.3 step 4, W0-fix8): it runs after the owner hard check (caller == server owner)
+and 4.3 steps 1 to 3 (parse, authorization, signature), and BEFORE 4.3 steps 4 to 8, the
+staff-owner (privileged) refusal, and every other protect rule (growth gate, entitlement,
+channel shape, no messages, already protected), so a retry of a protect that
+already landed is not refused because state moved on (messages sent since, flag turned
+off). It writes nothing: no seat changes, no second `ChannelUpdate`, no second `AUDIT`
+line. A different body or signature on an already-protected channel stays
+`InvalidOperation`. Once the stored list has advanced past version 1 (seat PUTs after
+protect), the server no longer holds the genesis row (2.4 keeps the newest list only), so
+every re-protect is `InvalidOperation`; the bridge resolves that, like any non-429 4xx on
+a retry, by read-back (4.9).
 
 On success the server emits the existing `ChannelUpdate { id, data: PartialChannel { protected: Some(true), .. }, clear: [] }`
 event (**DECISION (W0-fix)**), so every connected client sets its local protected pin (9.4)
@@ -2071,6 +2135,18 @@ commit submit and commit fetch per 6.1; the ctl pipe refuses Text.
 - `nonce`: REQUIRED, ULID (the `cid`).
 - `encrypted`: REQUIRED.
 - `flags`: absent, `0` or `1` (SuppressNotifications). Any other bit is refused.
+  **DECISION (W1.5), flags encoding:** `MessageFlags::SuppressNotifications = 1` (v0
+  `messages.rs`), and `Message::has_suppressed_notifications` tests the STORED value
+  `flags & 1`. `MessageFlagsValue::has/set`, however, treat the enum value as a bit INDEX, so
+  the plaintext path (`create_from_api_with_id`) reads a request's suppress bit at value `2`
+  and stores `2`, which push never treats as silent (a pre-existing bug, fixed separately on
+  `fix/silent-message-flags`). The W2 protected send route stores the request value AS-IS and
+  never goes through `MessageFlagsValue::has/set`, so a stored `1` = silent, which is what
+  `has_suppressed_notifications` and pushd honor.
+  **Cross-dependency:** the separate silent-flag fix MUST keep "stored value `1` = suppress".
+  If it changes the stored encoding, this allowlist and this section change with it in the
+  same merge. W2 carries a test that ties the protected allowlist to
+  `has_suppressed_notifications`: a protected message stored with `flags: 1` is silent (11).
 - Any other `DataMessageSend` field that is present and non-null (even an empty string or
   empty array) is refused with `ProtectedFieldRefused { field }`: `content`, `attachments`,
   `replies`, `embeds`, `masquerade`, `interactions`, `components`, `sticker_ids`. Server-side
@@ -2140,7 +2216,8 @@ pins, typing indicators, acks.
 ### 7.5 Other server behavior
 
 - **pushd**: a protected message produces a generic notification (body "New message", no
-  content, no preview); `SuppressNotifications` is honored.
+  content, no preview); `SuppressNotifications` is honored (a stored `flags` of `1`, via
+  `has_suppressed_notifications`; 7.3).
 - **Delete cascades**: `channel_delete.rs` and the bulk server delete remove the channel's
   entitlement, seats and seat list, close the open Text group and delete its commits.
 - **Events**: **DECISION (W0):** S1 adds no new websocket events. Clients refresh
@@ -2398,6 +2475,8 @@ re-securing notice; `not_seated` shows "Ask the owner for a seat"; `not_availabl
 | Server | `DuplicateNonce` (409), from the `Idempotency-Key` request guard (W0-fix2) | unchanged | On a protected send it means the client sent the forbidden header (7.3): a client defect, reported to Sentry, never retried with plaintext. Elsewhere it keeps its existing meaning (duplicate retry: possibly delivered, refetch) |
 | Server | `NotSeated` | `not_seated` | "You don't have a seat in this protected channel. Ask the owner for a seat." |
 | Server | `SeatCapReached { max }` | owner seat UI | "All {max} seats are in use. Released seats count for 14 days." |
+| Server | any 5xx (including `DatabaseError`), a 429, a transport error or a lost response on `PUT .../seats` or `PUT .../protect` (W1.5) | owner seat UI, unchanged shield | none while retrying; the bridge re-sends the SAME signed bytes (a 429 after its stated delay, otherwise with backoff) until a 2xx or another 4xx, and signs nothing new meanwhile (4.9) |
+| Server | any non-429 4xx (`InvalidOperation`, or e.g. `NotAuthenticated` after a re-login) on a protect whose earlier attempt is unresolved (W1.5, N3) | owner seat UI | none if the read-back shows this device's genesis list at version 1 on a protected channel (verify it, 4.9); otherwise the protect failed: "This channel couldn't be protected." No self-pin, no second genesis |
 | Server | `ChannelProtected` | unchanged | "Not available in protected channels." (the UI should hide these actions on protected channels). On an ownership-transfer request: "Ownership can't be transferred while this server has protected channels." (7.4) |
 | Server | `FeatureDisabled { feature: "e2ee" }` on a protected send | unchanged; composer notice | "Encrypted messaging is unavailable right now." The draft stays; never sent as plaintext |
 | Server | `InvalidOperation` on a protected send retry | unchanged | treated as "possibly delivered": the bridge refetches the channel to confirm (3.10) |
@@ -2455,6 +2534,10 @@ string goes through lingui.
 - **Local protected pin:** the client persists "channel id seen protected" (one-way). A pinned
   channel refuses plaintext sends and attachments even if the server later strips the flag
   (shield `unverified`).
+- **Rows without `encrypted`:** a message without `encrypted` in a protected or pinned
+  channel, live or from a history fetch (including a plaintext row left by R15), renders as
+  the red "Unencrypted message in a protected channel" marker (9.2), never as a normal or
+  protected message (**DECISION (W1.5)**).
 - **`Draft.ts`:** files in protected or pinned channels are refused **before any upload**.
 - **Bridge:** a text-group manager separate from the call session with a multi-group sink;
   routing by `e2ee_mls_group_kind`; decrypt on live receive (`live: true`) and history fetch
@@ -2713,6 +2796,30 @@ declarations (`committer`, `added`, `removed`, `rejoin_intents`; 8.1) touch the 
 plan's lane rules. Native `wire::MlsEnvelope` is W3 L3b.
 - Frontend: the 9.1 precedence table, step by step, in the shield-state spec (including steps
   6c and 6d).
+- W1.5 obligations. Server (W2):
+  - a byte-identical seat re-PUT after a 5xx returns success (the first PUT landed, its
+    response was replaced by a 5xx), and the same re-PUT when the first PUT did NOT land
+    applies the list normally (4.3, 4.9);
+  - a protected message sent with `flags: 1` is stored as `1` and
+    `has_suppressed_notifications()` is true for it; `flags: 2` (or any value other than
+    absent, `0`, `1`) is refused (7.3);
+  - crond with `commit_retention_days = 0` never calls `prune_mls_text_commits` and deletes
+    no commit (R9, 2.5, 7.1);
+  - a protected-channel history read drops or flags a stored row without `encrypted` (R15);
+  - **re-protect (N3), both drivers:** after a protect that landed, the same protect with
+    byte-identical bytes returns 2xx with `protected: true`, writes no seat or seat-list
+    change, and emits no second `ChannelUpdate`; it still succeeds after a message was sent
+    in the channel and with the growth flag off; the same channel with a different body or
+    signature is `InvalidOperation`; once the stored list is at version 2, the identical
+    genesis re-protect is `InvalidOperation` (7.2).
+
+  Bridge and frontend (W4): a 5xx, 429 or transport error on `PUT .../seats` or
+  `PUT .../protect` re-sends the same bytes and never calls `_seat_list_sign` until a 2xx or
+  another 4xx (4.9); a 429 waits the header delay in milliseconds, else the body's
+  `retry_after` in its error type's unit (4.9); any non-429 4xx on a protect retry
+  (`InvalidOperation`, `NotAuthenticated`) resolves to "landed" only when the read-back shows this device's genesis bytes at version 1 on a protected channel, and to
+  "refused" (no self-pin) otherwise (4.9); a row without `encrypted` in a protected or pinned
+  channel, from a history fetch, renders the red marker (9.4).
 
 ---
 
@@ -2745,13 +2852,14 @@ plan's lane rules. Native `wire::MlsEnvelope` is W3 L3b.
 21. SUPERSEDED by 81 (W0-fix4). Was: signed `device_cap` equals the server's effective cap
     (4.1). Now: at most the entitlement cap.
 22. Server requires version exactly +1 (4.3); a byte-identical re-PUT is the one exception,
-    see 45.
+    see 45, and the byte-identical genesis re-protect at stored version 1 (#128).
 23. First-sight consistency check against the server-reported owner (4.5).
 24. TOFU owner pin allows green (4.5).
 25. Kind-aware gates: growth vs maintenance; `e2ee_enabled` stops the text plane (7.1).
 26. Flag off keeps encrypted send and receive working for existing protected channels (7.1).
 27. Admin grant route path `PUT /channels/:id/protected_entitlement` (7.2).
 28. Protect only channels with no messages; genesis seat list required in the protect body (7.2).
+    A byte-identical re-protect is exempt (#128, W1.5).
 29. `seated_without_access` shown to the owner only (7.2).
 30. New `GET /mls/channels/:id/text_group` route (7.2).
 31. `encrypted` refused on non-protected channels (7.3).
@@ -2787,7 +2895,7 @@ Added or changed in the W0 fix round (audit FAILED; items numbered as in the fix
 45. DECISION (W0-fix), item 7: `_seat_list_sign` persists nothing; the stored version and the
     genesis self-pin advance only on verified read-back; lost-response retry re-PUTs the same
     bytes, and the server treats a byte-identical re-PUT as an idempotent no-op (4.3, 4.9,
-    8.3).
+    8.3). Extended by #127 (W1.5): also on a transport error or any 5xx.
 46. DECISION (W0-fix), item 8: each AAD field at most 255 bytes, refused above (3.5).
 47. DECISION (W0-fix), item 6: native confirmation when a signed list adds users (lists them);
     the handover signature always confirms natively, naming the target; cancel is the existing
@@ -3085,6 +3193,52 @@ Added or changed in W0 fix round 9 (final W0 fold-in; targeted re-check PASSED):
 122. DECISION (W0-fix9): one field name, `created_at`, for the native intent row's local time
      of issue (8.2; the 3.12.3 text no longer references a separate `issued_at` for intents).
 123. DECISION (W0-fix9): #106 annotated "amended by #115".
+
+Added in W1.5 (post-W1 contract corrections):
+
+124. DECISION (W1.5): residual R15, the MongoDB protect vs plaintext-send compensation window
+     (one never-broadcast plaintext row may survive a crash or failed delete). Backstop:
+     protected-channel history reads drop or flag rows without `encrypted` (W2); clients
+     render such a row as the red marker, never as protected (1.3, 9.4, 11).
+125. DECISION (W1.5): `commit_retention_days = 0` disables pruning (Text commits kept
+     forever); crond MUST NOT call `prune_mls_text_commits` when it is `0`. Mirrors
+     `default_device_cap = 0` = unlimited (R9, 2.5, 7.1, 11).
+126. DECISION (W1.5): protected-send `flags` is absent, `0` or `1`, stored AS-IS (never via
+     `MessageFlagsValue::has/set`), so a stored `1` is silent per
+     `has_suppressed_notifications` and pushd. The separate `fix/silent-message-flags` fix
+     MUST keep "stored `1` = suppress", or change 7.3 in the same merge; W2 test ties the
+     allowlist to `has_suppressed_notifications` (7.3, 7.5, 11).
+127. DECISION (W1.5): a seat-list publish resolves only on a 2xx or a 4xx. On a lost
+     response, a transport error or ANY 5xx (including `DatabaseError` from exhausted
+     transaction retries) the bridge re-PUTs the SAME bytes, and it never signs a new
+     version while a publish is unresolved; extends #45 (4.3, 4.9, 6.3, 9.2, 11). Amended by
+     #128 (protect follows the same rule) and #129 (a 429 does not resolve).
+128. DECISION (W1.5), N3: a protect whose genesis list is byte-identical (`body` and
+     `signature`) to the stored list of an already-protected channel, while that list is
+     still version 1, returns the stored success. It runs after the owner hard check
+     (caller == server owner) and 4.3 steps 1 to 3, and before 4.3 steps 4 to 8, the
+     staff-owner (privileged) refusal, and every other protect rule. It writes nothing (no
+     seat changes, no second `ChannelUpdate`). A different body, or any re-protect once the
+     stored list is past version 1, stays `InvalidOperation`. The bridge re-sends the same
+     protect bytes under the #127 rule and resolves ANY non-429 4xx on a retry whose earlier
+     attempt is unresolved (`InvalidOperation`, or e.g. `NotAuthenticated` after a re-login)
+     by read-back (`GET /channels/:id` plus `GET .../seats`): landed only if the channel is
+     protected and the list is its own genesis at version 1 (then `_seat_list_verify`
+     self-pins); otherwise refused, with no self-pin and no second genesis. This is the
+     existing 4.9 crash read-back rule and keeps 4.5's "self-pin only on verified
+     read-back" (4.3, 4.5, 4.9, 6.3, 7.2, 9.2, 11).
+129. DECISION (W1.5): a 429 on a seat-list or protect publish is retryable, not a resolving
+     4xx; the bridge re-sends the same bytes after the server's stated delay, else backs
+     off. Delta sends no standard `Retry-After`. Prefer the `X-RateLimit-Reset-After`
+     header (MILLISECONDS, the limiter's `left_until_reset`); otherwise use the body's
+     `retry_after` in the unit of that error type: the rate limiter's own 429 body,
+     MILLISECONDS (`ratelimits/src/rocket.rs`); route-level errors such as `InSlowmode`,
+     SECONDS (4.9, 6.3, 9.2, 11).
+130. Measured and rejected (W1.5): claiming the group doc first in the Text commit
+     transaction, on every attempt (starved concurrent seat PUTs, 5/6 runs) or on retries
+     only (no demonstrated benefit; turns a retried idempotent resubmit's conflict-free
+     step-0 read into a possible write conflict). W1 ordering kept: step 0 is the first
+     statement of every attempt (2.5 (a)).
 
 ---
 
