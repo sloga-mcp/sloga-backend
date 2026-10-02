@@ -961,25 +961,16 @@ impl Message {
                     // push; the ack task applies each recipient's mute settings.
                     // Explicitly-mentioned users are unioned in so a mention
                     // still notifies even if they have not joined the thread.
-                    Channel::Thread { .. } => {
-                        let mut targets: Vec<String> = db
-                            .fetch_thread_members(&self.channel)
-                            .await
-                            .unwrap_or_default()
-                            .into_iter()
-                            .map(|member| member.id.user)
-                            .filter(|uid| uid.as_str() != author.id())
-                            .collect();
-
-                        if let Some(mentions) = &self.mentions {
-                            for uid in mentions {
-                                if uid.as_str() != author.id() && !targets.contains(uid) {
-                                    targets.push(uid.clone());
-                                }
-                            }
-                        }
-
-                        targets
+                    // Restricted to current server members; see the helper.
+                    Channel::Thread { server, .. } => {
+                        thread_push_recipients(
+                            db,
+                            server,
+                            &self.channel,
+                            author.id(),
+                            self.mentions.as_deref(),
+                        )
+                        .await
                     }
                     // Never notify the author of their own message (self-mention
                     // or reply-ping of their own message).
@@ -1458,6 +1449,54 @@ impl Message {
     }
 }
 
+/// Push recipients for a message in a thread: the thread's joined members and
+/// any explicitly mentioned users, minus the author, restricted to users who
+/// are still members of the server.
+///
+/// Thread membership rows can outlive server membership (a ban, kick or leave
+/// does not necessarily remove them), and nothing downstream of the push queue
+/// re-checks membership, so this filter is the gate that keeps removed users
+/// from receiving message previews. A failed thread-member lookup is treated
+/// as no joined members; a failed server-member lookup yields no recipients at
+/// all (fail closed).
+#[cfg_attr(not(feature = "tasks"), allow(dead_code))]
+pub(crate) async fn thread_push_recipients(
+    db: &Database,
+    server_id: &str,
+    thread_id: &str,
+    author_id: &str,
+    mentions: Option<&[String]>,
+) -> Vec<String> {
+    let mut candidates: Vec<String> = db
+        .fetch_thread_members(thread_id)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .map(|member| member.id.user)
+        .filter(|uid| uid.as_str() != author_id)
+        .collect();
+
+    if let Some(mentions) = mentions {
+        for uid in mentions {
+            if uid.as_str() != author_id && !candidates.contains(uid) {
+                candidates.push(uid.clone());
+            }
+        }
+    }
+
+    if candidates.is_empty() {
+        return candidates;
+    }
+
+    let Ok(members) = db.fetch_members(server_id, &candidates).await else {
+        return vec![];
+    };
+
+    let live: HashSet<String> = members.into_iter().map(|member| member.id.user).collect();
+    candidates.retain(|uid| live.contains(uid));
+    candidates
+}
+
 impl SystemMessage {
     pub fn into_message(self, channel: String) -> Message {
         Message {
@@ -1509,5 +1548,148 @@ impl Interactions {
     /// Check if default initialisation of fields
     pub fn is_default(&self) -> bool {
         !self.restrict_reactions && self.reactions.is_none()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use iso8601_timestamp::{Duration, Timestamp};
+
+    use super::thread_push_recipients;
+    use crate::{Channel, Database, Member, MemberCompositeKey};
+
+    const SERVER: &str = "01TPRSERVER000000000000000";
+    const THREAD: &str = "01TPRTHREAD000000000000000";
+    const PARENT: &str = "01TPRPARENT000000000000000";
+    const AUTHOR: &str = "01TPRAUTHOR000000000000000";
+    const M1: &str = "01TPRMEMBER100000000000000";
+    const M2: &str = "01TPRSTALE2000000000000000";
+    const M3: &str = "01TPRMENTION30000000000000";
+    const M4: &str = "01TPRMEMBER400000000000000";
+    const M5: &str = "01TPRTIMEOUT50000000000000";
+
+    #[allow(clippy::disallowed_methods)]
+    async fn insert_thread(db: &Database, id: &str) {
+        db.insert_channel(&Channel::Thread {
+            id: id.to_string(),
+            server: SERVER.to_string(),
+            parent_channel: PARENT.to_string(),
+            name: "thread".to_string(),
+            creator: AUTHOR.to_string(),
+            origin_message_id: None,
+            last_message_id: None,
+            archived: false,
+            archived_timestamp: None,
+            auto_archive_minutes: 0,
+            locked: false,
+            applied_tags: vec![],
+        })
+        .await
+        .expect("insert thread");
+    }
+
+    async fn insert_member(db: &Database, user: &str, timeout: Option<Timestamp>) {
+        db.insert_or_merge_member(&Member {
+            id: MemberCompositeKey {
+                server: SERVER.to_string(),
+                user: user.to_string(),
+            },
+            timeout,
+            ..Default::default()
+        })
+        .await
+        .expect("insert member");
+    }
+
+    async fn join(db: &Database, user: &str) {
+        db.join_thread_if_absent(THREAD, user)
+            .await
+            .expect("join thread");
+    }
+
+    #[tokio::test]
+    async fn thread_push_recipients_excludes_non_members() {
+        database_test!(|db| async move {
+            insert_thread(&db, THREAD).await;
+
+            // Server members: the author, M1 and M4. M2 and M3 are not.
+            for user in [AUTHOR, M1, M4] {
+                insert_member(&db, user, None).await;
+            }
+
+            // Joined rows: the author, M1, and M2's stale row from before
+            // they were removed from the server.
+            for user in [AUTHOR, M1, M2] {
+                join(&db, user).await;
+            }
+
+            // M1 is mentioned as well as joined (no duplicate), the author
+            // mentions themselves (excluded), M3 is a mentioned non-member.
+            let mentions: Vec<String> = [M1, M3, AUTHOR, M4]
+                .iter()
+                .map(|id| id.to_string())
+                .collect();
+
+            let recipients =
+                thread_push_recipients(&db, SERVER, THREAD, AUTHOR, Some(&mentions)).await;
+            assert_eq!(
+                recipients,
+                vec![M1.to_string(), M4.to_string()],
+                "thread push recipients must be the joined and mentioned users who are still server members"
+            );
+
+            // A member in timeout who is removed is only soft-deleted on
+            // MongoDB (`pending_deletion_at`); the Reference driver panics on
+            // that path, so this case runs on MongoDB only.
+            if matches!(db, Database::MongoDb(_)) {
+                insert_member(&db, M5, Some(Timestamp::now_utc() + Duration::minutes(5))).await;
+                join(&db, M5).await;
+
+                let before =
+                    thread_push_recipients(&db, SERVER, THREAD, AUTHOR, Some(&mentions)).await;
+                assert!(
+                    before.iter().any(|id| id == M5),
+                    "precondition: a live member in timeout is a recipient"
+                );
+
+                db.soft_delete_member(&MemberCompositeKey {
+                    server: SERVER.to_string(),
+                    user: M5.to_string(),
+                })
+                .await
+                .expect("soft delete member");
+
+                let after =
+                    thread_push_recipients(&db, SERVER, THREAD, AUTHOR, Some(&mentions)).await;
+                assert_eq!(
+                    after,
+                    vec![M1.to_string(), M4.to_string()],
+                    "a soft-deleted (pending_deletion_at) member must not receive thread push"
+                );
+            }
+        });
+    }
+
+    #[tokio::test]
+    async fn thread_push_recipients_empty_without_rows_or_mentions() {
+        database_test!(|db| async move {
+            insert_thread(&db, THREAD).await;
+            insert_member(&db, AUTHOR, None).await;
+
+            assert!(
+                thread_push_recipients(&db, SERVER, THREAD, AUTHOR, None)
+                    .await
+                    .is_empty(),
+                "no joined rows and no mentions yields no recipients"
+            );
+
+            let self_mention = vec![AUTHOR.to_string()];
+            assert!(
+                thread_push_recipients(&db, SERVER, THREAD, AUTHOR, Some(&self_mention))
+                    .await
+                    .is_empty(),
+                "an author mentioning themselves yields no recipients"
+            );
+        });
     }
 }

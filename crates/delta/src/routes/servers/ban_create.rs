@@ -114,8 +114,9 @@ pub async fn ban(
         if seconds > 0 {
             let threshold_time = SystemTime::now() - Duration::from_secs(seconds as u64);
 
-            Message::bulk_delete_by_author_since(db, &server.channels, target.id, threshold_time)
-                .await?;
+            // Threads and forum posts are never listed in `server.channels`.
+            let channels = server.message_channel_ids(db).await?;
+            Message::bulk_delete_by_author_since(db, &channels, target.id, threshold_time).await?;
         }
     }
 
@@ -133,7 +134,7 @@ mod test {
             record_voice_connection, recorded_voice_connections, set_channel_node,
             UserVoiceChannel,
         },
-        Channel, Member, PartialMember, Server,
+        Channel, Member, Message, PartialMember, Server,
     };
     use revolt_models::v0;
     use revolt_permissions::{ChannelPermission, OverrideField};
@@ -529,6 +530,260 @@ mod test {
             .expect("cleanup");
     }
 
+    // ---- the message purge reaches threads and forum posts -----------------
+    //
+    // Threads and forum posts hold messages but are never listed in
+    // `server.channels`, so a purge scoped to that list left everything the
+    // target wrote in them behind, a forum post's starter included.
+
+    async fn ban_user_deleting<'a>(
+        harness: &'a TestHarness,
+        token: &str,
+        server_id: &str,
+        target_id: &str,
+        delete_message_seconds: i64,
+    ) -> rocket::local::asynchronous::LocalResponse<'a> {
+        harness
+            .client
+            .put(format!("/servers/{server_id}/bans/{target_id}"))
+            .header(ContentType::JSON)
+            .header(Header::new("x-session-token", token.to_string()))
+            .body(
+                serde_json::json!({
+                    "reason": "purge",
+                    "delete_message_seconds": delete_message_seconds,
+                })
+                .to_string(),
+            )
+            .dispatch()
+            .await
+    }
+
+    /// A message stored as it is, with no send path and no events.
+    #[allow(clippy::disallowed_methods)] // a test fixture, stored directly like test_fixtures does
+    async fn stored_message(harness: &TestHarness, id: &str, channel: &str, author: &str) {
+        harness
+            .db
+            .insert_message(&Message {
+                id: id.to_string(),
+                channel: channel.to_string(),
+                author: author.to_string(),
+                content: Some("purge check".to_string()),
+                ..Default::default()
+            })
+            .await
+            .expect("message");
+    }
+
+    struct PurgeFixture {
+        owner_token: String,
+        server_id: String,
+        target_id: String,
+        thread_id: String,
+        post_id: String,
+        /// The target's messages, each with where it was written.
+        target_messages: Vec<(&'static str, String)>,
+        /// The owner's message in the thread, never the target's to lose.
+        owner_message: String,
+    }
+
+    /// An owner and a member target. The server holds a text channel with a
+    /// thread under it, and a forum with a post, both opened by the target.
+    /// The target wrote in the text channel, the thread and the post (the
+    /// post's starter, whose id is the post's id, as `forum_post_create`
+    /// stores it, and a reply); the owner wrote in the thread. All of it is
+    /// recent. Only the target's messages are counted: `create_thread` also
+    /// posts a system message into the text channel.
+    async fn purge_fixture(harness: &TestHarness) -> PurgeFixture {
+        let (_a, session_a, owner) = harness.new_user().await;
+        let (_b, _session_b, target) = harness.new_user().await;
+        let (mut server, _channels) = harness.new_server(&owner).await;
+        Member::create(&harness.db, &server, &target, None)
+            .await
+            .expect("member");
+
+        // `&mut server` for both: a second create from a stale copy would
+        // write the server's channel list without the first channel.
+        let text = Channel::create_server_channel(
+            &harness.db,
+            &mut server,
+            v0::DataCreateServerChannel {
+                channel_type: v0::LegacyServerChannelType::Text,
+                name: "purge-text".to_string(),
+                ..Default::default()
+            },
+            true,
+        )
+        .await
+        .expect("text channel");
+        let forum = Channel::create_server_channel(
+            &harness.db,
+            &mut server,
+            v0::DataCreateServerChannel {
+                channel_type: v0::LegacyServerChannelType::Forum,
+                name: "purge-forum".to_string(),
+                ..Default::default()
+            },
+            true,
+        )
+        .await
+        .expect("forum");
+        let thread = Channel::create_thread(
+            &harness.db,
+            &text,
+            &target,
+            None,
+            v0::DataCreateThread {
+                name: "purge-thread".to_string(),
+                auto_archive_minutes: None,
+            },
+        )
+        .await
+        .expect("thread");
+        let post = Channel::create_forum_post(
+            &harness.db,
+            &forum,
+            &target,
+            "purge-post".to_string(),
+            vec![],
+            None,
+        )
+        .await
+        .expect("post");
+
+        let stored = harness.db.fetch_server(&server.id).await.expect("`Server`");
+        for listed in [text.id(), forum.id()] {
+            assert!(
+                stored.channels.iter().any(|id| id == listed),
+                "the fixture's channels are the server's: {:?}",
+                stored.channels
+            );
+        }
+        for unlisted in [thread.id(), post.id()] {
+            assert!(
+                !stored.channels.iter().any(|id| id == unlisted),
+                "a thread or post is never in `server.channels`: {:?}",
+                stored.channels
+            );
+        }
+
+        let mut target_messages = vec![];
+        for (place, id, channel) in [
+            ("the text channel", ulid::Ulid::new().to_string(), text.id()),
+            ("the thread", ulid::Ulid::new().to_string(), thread.id()),
+            ("the post's starter", post.id().to_string(), post.id()),
+            ("the post", ulid::Ulid::new().to_string(), post.id()),
+        ] {
+            stored_message(harness, &id, channel, &target.id).await;
+            target_messages.push((place, id));
+        }
+        let owner_message = ulid::Ulid::new().to_string();
+        stored_message(harness, &owner_message, thread.id(), &owner.id).await;
+
+        PurgeFixture {
+            owner_token: session_a.token,
+            server_id: server.id,
+            target_id: target.id,
+            thread_id: thread.id().to_string(),
+            post_id: post.id().to_string(),
+            target_messages,
+            owner_message,
+        }
+    }
+
+    // Compile-only without RabbitMQ and Redis: see the section note above.
+    #[test]
+    fn a_ban_that_deletes_messages_reaches_threads_and_forum_posts() {
+        crate::util::test::rt()
+            .block_on(a_ban_that_deletes_messages_reaches_threads_and_forum_posts_case())
+    }
+
+    /// A ban with `delete_message_seconds` deletes the target's recent
+    /// messages in the text channel, in a thread under it, and in a forum
+    /// post, the post's starter included. The owner's message in the thread
+    /// stays, and so do the thread and the post themselves. Mutation: the
+    /// purge scoped back to `&server.channels`, which deletes only the
+    /// message in the text channel.
+    async fn a_ban_that_deletes_messages_reaches_threads_and_forum_posts_case() {
+        let harness = TestHarness::new().await;
+        let fixture = purge_fixture(&harness).await;
+
+        let response = ban_user_deleting(
+            &harness,
+            &fixture.owner_token,
+            &fixture.server_id,
+            &fixture.target_id,
+            3600,
+        )
+        .await;
+        ban_answered(response, "a ban that deletes messages").await;
+
+        for (place, id) in &fixture.target_messages {
+            let read = harness.db.fetch_message(id).await;
+            assert!(
+                matches!(&read, Err(error) if matches!(error.error_type, ErrorType::NotFound)),
+                "W3A: the ban must delete the target's message in {}, found {:?}",
+                place,
+                read
+            );
+        }
+        harness
+            .db
+            .fetch_message(&fixture.owner_message)
+            .await
+            .expect("the owner's message in the thread survives the target's ban");
+        for (what, id) in [("thread", &fixture.thread_id), ("post", &fixture.post_id)] {
+            // Explicit arguments: in this edition-2018 crate a lone literal
+            // panic message is printed as it is, braces and all.
+            harness.db.fetch_channel(id).await.unwrap_or_else(|error| {
+                panic!(
+                    "the purge deletes messages only, the {} stays: {:?}",
+                    what, error
+                )
+            });
+        }
+    }
+
+    // Compile-only without RabbitMQ and Redis: see the section note above.
+    #[test]
+    fn a_ban_without_delete_message_seconds_keeps_every_message() {
+        crate::util::test::rt()
+            .block_on(a_ban_without_delete_message_seconds_keeps_every_message_case())
+    }
+
+    /// A ban that does not ask for a purge deletes nothing, in a thread or a
+    /// forum post as anywhere else. Mutation: the purge run unconditionally.
+    async fn a_ban_without_delete_message_seconds_keeps_every_message_case() {
+        let harness = TestHarness::new().await;
+        let fixture = purge_fixture(&harness).await;
+
+        let response = ban_user(
+            &harness,
+            &fixture.owner_token,
+            &fixture.server_id,
+            &fixture.target_id,
+            "no purge",
+        )
+        .await;
+        ban_answered(response, "a ban without a purge").await;
+
+        for (place, id) in &fixture.target_messages {
+            let read = harness.db.fetch_message(id).await;
+            assert!(
+                read.is_ok(),
+                "a ban without delete_message_seconds must keep the target's message in {}: \
+                 {:?}",
+                place,
+                read
+            );
+        }
+        harness
+            .db
+            .fetch_message(&fixture.owner_message)
+            .await
+            .expect("the owner's message in the thread");
+    }
+
     // ---- the ban's order, pinned on its text (AFK S-3 P2-2) ----------------
 
     /// `ban`'s body, comment lines dropped and whitespace collapsed.
@@ -724,5 +979,64 @@ mod test {
                 body
             );
         }
+    }
+
+    /// The purge is scoped to every channel that holds the server's
+    /// messages, threads and forum posts included, read once, after the
+    /// eviction, inside the same block as the purge, so a ban that asks for
+    /// no purge reads nothing more. The purge is passed exactly those
+    /// channels, and `channels` is bound once, so neither an empty list nor
+    /// a shadowing binding can stand in for them. `server.channels` lists
+    /// top-level channels only and must not scope it. Mutations: the purge
+    /// scoped back to `&server.channels`, with or without the
+    /// `message_channel_ids` read; the purge passed `&[]`; a shadowing
+    /// `let channels = vec![];`; the read moved out of the `seconds > 0`
+    /// block.
+    #[test]
+    fn the_purge_is_scoped_to_threads_and_posts_too() {
+        const SCOPE: &str = "let channels = server.message_channel_ids(db).await?;";
+        const SCOPED_PURGE: &str = "Message::bulk_delete_by_author_since(db, &channels, \
+             target.id, threshold_time).await?;";
+
+        let body = route_body();
+        assert_eq!(
+            body.matches(SCOPE).count(),
+            1,
+            "W3A: the purge must read its channels with `{SCOPE}` exactly once: {body}"
+        );
+        assert_eq!(
+            body.matches("let channels =").count(),
+            1,
+            "W3A: `channels` must be bound once, by the read, never shadowed: {body}"
+        );
+        assert_eq!(
+            body.matches(SCOPED_PURGE).count(),
+            1,
+            "W3A: the purge must be passed the channels it read: `{SCOPED_PURGE}`: {body}"
+        );
+        let at = body.find(SCOPE).expect("counted above");
+        let evict = body.find(EVICT).expect("the ban evicts");
+        let purge = body.find(PURGE).expect("the ban purges");
+        assert!(
+            evict < at && at < purge,
+            "W3A: the purge's channels are read after the eviction and before the purge: {}",
+            body
+        );
+        assert!(
+            depth_at(&body, at) > 1,
+            "W3A: the purge's channels are read only when a purge is asked for: {}",
+            body
+        );
+        assert_eq!(
+            depth_at(&body, at),
+            depth_at(&body, purge),
+            "W3A: the purge's channels are read in the purge's own block: {body}"
+        );
+        assert!(
+            !body.contains("server.channels"),
+            "W3A: `server.channels` misses threads and forum posts and must not scope \
+             the purge: {}",
+            body
+        );
     }
 }
