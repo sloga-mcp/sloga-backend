@@ -280,19 +280,24 @@ pub async fn worker(db: Database, amqp: AMQP) {
                     .catch_unwind()
                     .await;
 
+                // Ids only: message and push bodies must never reach the logs
+                // or the error reporter.
+                let (kind, message_ids) = event_ids(&event);
+
                 match outcome {
-                    Ok(Ok(())) => info!("User {user:?} ack in {channel} with {event:?}"),
+                    Ok(Ok(())) => {
+                        info!("User {user:?} ack in {channel} with {kind} {message_ids:?}")
+                    }
                     Ok(Err(err)) => {
                         revolt_config::capture_error(&err);
-                        error!("{err:?} for {event:?}. ({user:?}, {channel})");
+                        error!("{err:?} for {kind} {message_ids:?}. ({user:?}, {channel})");
                     }
                     Err(payload) => {
                         let msg = super::panic_message(&*payload);
-                        error!("Ack batch panicked: {msg} for {event:?}. ({user:?}, {channel})");
+                        error!(
+                            "Ack batch panicked: {msg} for {kind} {message_ids:?}. ({user:?}, {channel})"
+                        );
 
-                        // Ids only: message and push bodies must never reach
-                        // the error reporter.
-                        let (kind, message_ids) = event_ids(&event);
                         revolt_config::capture_message(
                             &format!(
                                 "Ack batch panicked: {msg} (kind: {kind}, channel: {channel}, user: {user:?}, messages: {message_ids:?})"
@@ -352,7 +357,10 @@ pub async fn worker(db: Database, amqp: AMQP) {
                                     task.delay();
                                 }
                             } else {
-                                let err_msg = format!("Got zero-length message event: {event:?}");
+                                let (kind, message_ids) = event_ids(&event);
+                                let err_msg = format!(
+                                    "Got zero-length message event: {kind} {message_ids:?}"
+                                );
                                 capture_message(&err_msg, revolt_config::Level::Warning);
                                 info!("{err_msg}")
                             }
@@ -589,5 +597,35 @@ mod tests {
 
         assert!(arrived, "the witness mention never arrived");
         assert!(alive, "the ack worker died after processing the witness");
+    }
+
+    #[tokio::test]
+    async fn event_summary_carries_ids_but_no_content() {
+        let secret = "do-not-log-this-message-text";
+        let channel = new_id();
+        let message = Message {
+            id: new_id(),
+            channel: channel.clone(),
+            author: new_id(),
+            content: Some(secret.to_string()),
+            ..Default::default()
+        };
+        let push = PushNotification::from(
+            message.clone().into_model(None, None),
+            None,
+            text_channel(&channel, &new_id()).into(),
+        )
+        .await;
+        assert!(format!("{push:?}").contains(secret));
+
+        let event = AckEvent::ProcessMessage {
+            messages: vec![(Some(push), message.clone(), vec![new_id()], false)],
+        };
+        let (kind, message_ids) = event_ids(&event);
+        let summary = format!("{kind} {message_ids:?}");
+
+        assert!(format!("{event:?}").contains(secret));
+        assert!(!summary.contains(secret));
+        assert!(summary.contains(&message.id));
     }
 }
