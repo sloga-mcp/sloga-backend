@@ -57,6 +57,24 @@ impl AbstractChannels for ReferenceDb {
             .collect())
     }
 
+    /// Fetch the ids of every thread (incl. forum posts, archived and locked ones) whose parent is in `parent_ids`
+    async fn fetch_thread_ids_by_parents(&self, parent_ids: &[String]) -> Result<Vec<String>> {
+        if parent_ids.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let channels = self.channels.lock().await;
+        Ok(channels
+            .values()
+            .filter_map(|channel| match channel {
+                Channel::Thread {
+                    id, parent_channel, ..
+                } if parent_ids.contains(parent_channel) => Some(id.clone()),
+                _ => None,
+            })
+            .collect())
+    }
+
     /// Fetch every non-archived thread (used by the auto-archive daemon)
     async fn fetch_active_threads(&self) -> Result<Vec<Channel>> {
         let channels = self.channels.lock().await;
