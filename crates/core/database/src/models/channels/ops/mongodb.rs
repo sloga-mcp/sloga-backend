@@ -255,10 +255,21 @@ impl AbstractChannels for MongoDb {
             )
             .map(|result| result.matched_count);
 
-            return if matched? == 0 {
-                Err(create_error!(ChannelProtected))
-            } else {
-                Ok(())
+            if matched? != 0 {
+                return Ok(());
+            }
+
+            // Nothing matched: the channel is protected, or it does not
+            // exist. Read it back to tell the two apart, as the Reference
+            // driver does under its lock.
+            return match self.fetch_channel(id).await {
+                Ok(stored) if stored.is_protected() => Err(create_error!(ChannelProtected)),
+                // Present and unprotected cannot happen while protect is
+                // one-way and ids are never reused. Nothing was written, so
+                // fail closed.
+                Ok(_) => Err(create_database_error!("update_one", "channel")),
+                // NotFound for a missing channel; any other error as is.
+                Err(error) => Err(error),
             };
         }
 
@@ -479,5 +490,132 @@ impl MongoDb {
             .await
             .map_err(|_| create_database_error!("delete_many", "webhooks"))
             .map(|_| ())
+    }
+}
+
+/// `update_channel` with a partial a protected channel refuses (design 7.4).
+/// The conditional write above is Mongo's, but the outcomes must match the
+/// Reference driver, so these run on whichever driver `TEST_DB` names.
+#[cfg(test)]
+mod tests {
+    use crate::{Channel, PartialChannel, VoiceInformation};
+    use revolt_result::ErrorType;
+
+    fn text_channel(id: &str, protected: bool) -> Channel {
+        Channel::TextChannel {
+            id: id.to_string(),
+            server: "S".to_string(),
+            name: "text".to_string(),
+            description: None,
+            icon: None,
+            last_message_id: None,
+            default_permissions: None,
+            role_permissions: std::collections::HashMap::new(),
+            nsfw: false,
+            spoiler: false,
+            voice: None,
+            slowmode: None,
+            announcement: None,
+            protected,
+        }
+    }
+
+    fn refused_partials() -> [PartialChannel; 2] {
+        [
+            PartialChannel {
+                voice: Some(VoiceInformation::default()),
+                ..Default::default()
+            },
+            PartialChannel {
+                announcement: Some(true),
+                ..Default::default()
+            },
+        ]
+    }
+
+    /// A missing channel is `NotFound`, not `ChannelProtected`: the
+    /// conditional write matches nothing for a deleted channel too.
+    ///
+    /// Control: the W1 `matched? == 0 => ChannelProtected` mapping
+    /// (MongoDB).
+    #[tokio::test]
+    async fn refused_field_on_a_missing_channel_is_not_found() {
+        database_test!(|db| async move {
+            for partial in refused_partials() {
+                assert!(partial.sets_field_refused_on_protected());
+                let result = db.update_channel("missing", &partial, vec![]).await;
+                assert!(
+                    matches!(
+                        &result,
+                        Err(error) if matches!(error.error_type, ErrorType::NotFound)
+                    ),
+                    "{partial:?} on a missing channel: {result:?}"
+                );
+            }
+        });
+    }
+
+    /// A stored-protected channel refuses both fields, and nothing is
+    /// written.
+    #[tokio::test]
+    async fn refused_field_on_a_protected_channel_is_refused() {
+        database_test!(|db| async move {
+            db.insert_channel(&text_channel("P", true))
+                .await
+                .expect("insert");
+
+            for partial in refused_partials() {
+                let result = db.update_channel("P", &partial, vec![]).await;
+                assert!(
+                    matches!(
+                        &result,
+                        Err(error) if matches!(error.error_type, ErrorType::ChannelProtected)
+                    ),
+                    "{partial:?} on a protected channel: {result:?}"
+                );
+            }
+
+            let stored = db.fetch_channel("P").await.expect("fetch");
+            assert!(stored.is_protected(), "{stored:?}");
+            let Channel::TextChannel {
+                voice,
+                announcement,
+                ..
+            } = &stored
+            else {
+                panic!("{stored:?}");
+            };
+            assert_eq!(voice, &None, "voice was written");
+            assert_ne!(announcement, &Some(true), "announcement was written");
+        });
+    }
+
+    /// An unprotected channel takes both fields.
+    #[tokio::test]
+    async fn refused_field_on_an_open_channel_is_applied() {
+        database_test!(|db| async move {
+            db.insert_channel(&text_channel("T", false))
+                .await
+                .expect("insert");
+
+            for partial in refused_partials() {
+                db.update_channel("T", &partial, vec![])
+                    .await
+                    .unwrap_or_else(|error| panic!("{partial:?}: {error:?}"));
+            }
+
+            let stored = db.fetch_channel("T").await.expect("fetch");
+            assert!(!stored.is_protected(), "{stored:?}");
+            let Channel::TextChannel {
+                voice,
+                announcement,
+                ..
+            } = &stored
+            else {
+                panic!("{stored:?}");
+            };
+            assert!(voice.is_some(), "voice was not written: {stored:?}");
+            assert_eq!(announcement, &Some(true), "announcement was not written");
+        });
     }
 }

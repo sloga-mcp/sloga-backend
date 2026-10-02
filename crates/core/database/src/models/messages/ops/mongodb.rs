@@ -985,3 +985,166 @@ mod tests {
         });
     }
 }
+
+
+/// `hold_channel_unprotected` driven directly, so each branch runs on every
+/// run (the insert-vs-protect race test in `messages/model.rs` only reaches
+/// the protect-first branch when its timing lands there). Mongo only: under
+/// `TEST_DB=REFERENCE` these return early; Reference closes the race by
+/// holding `channels` instead.
+#[cfg(test)]
+mod protect_hold_tests {
+    use bson::Document;
+    use revolt_result::ErrorType;
+
+    use crate::{AbstractChannels, AbstractMessages, Channel, Database, Message, MongoDb};
+
+    use super::{COL, COL_CHANNELS};
+
+    const CHANNEL: &str = "01J9Z3K4M5N6P7Q8R9S0T1V2W3";
+    const MESSAGE: &str = "01JA0000000000000000000H01";
+
+    /// Seeded on the channel so "not incremented" is read off a stored
+    /// value, not off an absent field
+    const SERIAL: i64 = 5;
+
+    /// An unprotected server text channel, inserted through the driver;
+    /// then `protected` (if `protect`) and `txn_serial` written raw, as a
+    /// protect committing after `insert_message`'s channel read would; then
+    /// a plaintext row inserted raw, as `insert_message`'s insert step does.
+    /// Returns that message.
+    async fn setup(mongo: &MongoDb, protect: bool) -> Message {
+        let channel: Channel = serde_json::from_value(serde_json::json!({
+            "channel_type": "TextChannel",
+            "_id": CHANNEL,
+            "server": "01J9Z3K4M5N6P7Q8R9S0T1V2W6",
+            "name": "general",
+        }))
+        .expect("text channel");
+        assert!(!channel.is_protected());
+        mongo.insert_channel(&channel).await.expect("channel");
+
+        let set = if protect {
+            doc! { "protected": true, "txn_serial": SERIAL }
+        } else {
+            doc! { "txn_serial": SERIAL }
+        };
+        let written = mongo
+            .col::<Document>(COL_CHANNELS)
+            .update_one(doc! { "_id": CHANNEL }, doc! { "$set": set })
+            .await
+            .expect("raw channel write");
+        assert_eq!(written.matched_count, 1);
+        assert_eq!(
+            mongo
+                .fetch_channel(CHANNEL)
+                .await
+                .expect("channel")
+                .is_protected(),
+            protect
+        );
+
+        let message = Message {
+            id: MESSAGE.to_string(),
+            channel: CHANNEL.to_string(),
+            author: "01HZXBBBBBBBBBBBBBBBBBBBBB".to_string(),
+            content: Some("hi".to_string()),
+            ..Default::default()
+        };
+        mongo
+            .col::<Message>(COL)
+            .insert_one(&message)
+            .await
+            .expect("raw message row");
+        assert!(row_exists(mongo).await);
+
+        message
+    }
+
+    async fn channel_doc(mongo: &MongoDb) -> Document {
+        mongo
+            .col::<Document>(COL_CHANNELS)
+            .find_one(doc! { "_id": CHANNEL })
+            .await
+            .expect("channel read")
+            .expect("channel")
+    }
+
+    async fn row_exists(mongo: &MongoDb) -> bool {
+        mongo
+            .col::<Document>(COL)
+            .find_one(doc! { "_id": MESSAGE })
+            .await
+            .expect("message read")
+            .is_some()
+    }
+
+    /// Protect committed first: the guard write matches nothing, the row is
+    /// deleted again, the plaintext refusal is reported, and the channel
+    /// document is left exactly as protect wrote it
+    #[tokio::test]
+    async fn hold_channel_unprotected_deletes_the_row_once_protect_committed() {
+        database_test!(|db| async move {
+            let Database::MongoDb(mongo) = &db else {
+                eprintln!(
+                    "NOTE: hold_channel_unprotected_deletes_the_row_once_protect_committed runs on MONGODB only; skipped on REFERENCE"
+                );
+                return;
+            };
+            let message = setup(mongo, true).await;
+
+            let error = mongo
+                .hold_channel_unprotected(&message)
+                .await
+                .expect_err("a protected channel refuses the insert");
+            match error.error_type {
+                ErrorType::ProtectedFieldRefused { ref field } => assert_eq!(field, "content"),
+                other => panic!("expected ProtectedFieldRefused {{ content }}, got {other:?}"),
+            }
+
+            assert!(!row_exists(mongo).await, "plaintext row left behind");
+            let fetched = mongo.fetch_message(MESSAGE).await.map(|_| ());
+            assert!(
+                matches!(
+                    fetched.as_ref().map_err(|e| &e.error_type),
+                    Err(ErrorType::NotFound)
+                ),
+                "expected NotFound, got {fetched:?}"
+            );
+
+            let channel = channel_doc(mongo).await;
+            assert_eq!(channel.get_bool("protected").ok(), Some(true));
+            assert_eq!(channel.get_i64("txn_serial").ok(), Some(SERIAL));
+        });
+    }
+
+    /// Still unprotected: the guard write holds the channel (`txn_serial` up
+    /// by exactly one) and the row stays
+    #[tokio::test]
+    async fn hold_channel_unprotected_keeps_the_row_in_an_unprotected_channel() {
+        database_test!(|db| async move {
+            let Database::MongoDb(mongo) = &db else {
+                eprintln!(
+                    "NOTE: hold_channel_unprotected_keeps_the_row_in_an_unprotected_channel runs on MONGODB only; skipped on REFERENCE"
+                );
+                return;
+            };
+            let message = setup(mongo, false).await;
+
+            mongo
+                .hold_channel_unprotected(&message)
+                .await
+                .expect("an unprotected channel holds");
+
+            assert!(row_exists(mongo).await, "row deleted from an open channel");
+            assert_eq!(
+                mongo.fetch_message(MESSAGE).await.expect("stored").content,
+                message.content
+            );
+
+            let channel = channel_doc(mongo).await;
+            assert!(!channel.contains_key("protected"));
+            assert_eq!(channel.get_i64("txn_serial").ok(), Some(SERIAL + 1));
+        });
+    }
+}

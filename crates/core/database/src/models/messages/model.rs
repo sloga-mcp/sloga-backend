@@ -2675,110 +2675,234 @@ mod encrypted_payload_tests {
         });
     }
 
-    /// Rounds of the insert-vs-protect race, each on a fresh channel
+    /// Rounds of the insert-vs-protect race per sweep, each on a fresh channel
     const PROTECT_RACE_ROUNDS: u32 = 30;
 
-    /// A plaintext insert racing `protect_channel` on an empty channel never
-    /// ends with plaintext in a protected channel: either protect refuses
-    /// (a message exists) or the insert is refused. The insert is staggered
-    /// 0..15 ms so it lands at different points of protect's transaction.
-    #[tokio::test]
-    async fn plaintext_insert_racing_protect_never_lands_in_a_protected_channel() {
+    // `protect_race_delays` divides by `PROTECT_RACE_ROUNDS - 1`
+    const _: () = assert!(PROTECT_RACE_ROUNDS > 1);
+
+    /// Uncontended timings taken per sweep; the slowest sets the stagger
+    const PROTECT_RACE_CALIBRATION_SAMPLES: u32 = 3;
+
+    /// Sweeps beyond the first on a wall-clock driver (MONGODB) when a sweep
+    /// saw only one outcome; each recalibrates and doubles the stagger
+    const PROTECT_RACE_EXTRA_SWEEPS: u32 = 2;
+
+    /// Least lead and trail of the stagger, so the order still varies on a
+    /// driver whose operations take microseconds (REFERENCE)
+    const PROTECT_RACE_STAGGER_FLOOR: std::time::Duration = std::time::Duration::from_millis(5);
+
+    /// An unprotected text channel with an active entitlement, ready for
+    /// `protect_channel`; returns the submission that protects it
+    async fn protectable_channel(
+        db: &crate::Database,
+        channel_id: &str,
+        now: Timestamp,
+    ) -> crate::SeatListSubmission {
         use crate::{
-            AbstractChannels, AbstractMessages, AbstractProtectedChannels, ChannelEntitlement,
-            ChannelEntitlementSource, ChannelEntitlementState, SeatListBody, SeatListSubmission,
+            ChannelEntitlement, ChannelEntitlementSource, ChannelEntitlementState, SeatListBody,
+            SeatListSubmission,
         };
 
         const OWNER: &str = "01HZXAAAAAAAAAAAAAAAAAAAAA";
         const OWNER_DEVICE: &str = "00112233445566778899aabbccddeeff";
 
+        db.insert_channel(&text_channel(channel_id, false))
+            .await
+            .expect("channel");
+        db.upsert_channel_entitlement(
+            &ChannelEntitlement {
+                id: Ulid::new().to_string(),
+                channel_id: channel_id.to_string(),
+                server_id: "01J9Z3K4M5N6P7Q8R9S0T1V2W6".to_string(),
+                source: ChannelEntitlementSource::AdminGrant,
+                slot_cap: 10,
+                device_cap: None,
+                state: ChannelEntitlementState::Active,
+                granted_by: "admin".to_string(),
+                created_at: now,
+            },
+            now,
+        )
+        .await
+        .expect("entitlement");
+
+        SeatListSubmission {
+            body: SeatListBody {
+                channel_id: channel_id.to_string(),
+                version: 1,
+                device_cap: 5,
+                issued_at: 1_790_812_800_000,
+                signer_user_id: OWNER.to_string(),
+                signer_device_id: OWNER_DEVICE.to_string(),
+                seats: vec![OWNER.to_string()],
+            }
+            .build()
+            .expect("seat list body"),
+            signature: format!("B{}", "A".repeat(85)),
+            signer_device_id: OWNER_DEVICE.to_string(),
+            handover: None,
+        }
+    }
+
+    /// Round `round`'s start delays as (insert, protect): the insert's start
+    /// moves linearly from `lead` before protect's start (round 0) to `trail`
+    /// after it (the last round)
+    fn protect_race_delays(
+        round: u32,
+        lead: std::time::Duration,
+        trail: std::time::Duration,
+    ) -> (std::time::Duration, std::time::Duration) {
+        let step = (lead + trail) * round / (PROTECT_RACE_ROUNDS - 1);
+        if step >= lead {
+            (step - lead, std::time::Duration::ZERO)
+        } else {
+            (std::time::Duration::ZERO, lead - step)
+        }
+    }
+
+    /// One sweep of the insert-vs-protect race on channel ids fresh to
+    /// `sweep`; returns (insert won, protect won). Every round's safety
+    /// assertions are hard.
+    ///
+    /// The stagger is calibrated on throwaway channels: the insert starts
+    /// from 1.5x an uncontended insert before protect (insert done before
+    /// protect reads) to 1.5x an uncontended protect after it (protect
+    /// committed before the insert reads), both doubled per `sweep`, so the
+    /// rounds between land the insert's read before protect's commit and its
+    /// write after.
+    async fn protect_race_sweep(db: &crate::Database, sweep: u32, now: Timestamp) -> (u32, u32) {
+        use std::time::{Duration, Instant};
+
+        let (mut insert_took, mut protect_took) = (Duration::ZERO, Duration::ZERO);
+        for sample in 0..PROTECT_RACE_CALIBRATION_SAMPLES {
+            let open_id = format!("01J9Z3K4M5N6P7Q8R9S0V{sweep}{sample:04}");
+            db.insert_channel(&text_channel(&open_id, false))
+                .await
+                .expect("calibration channel");
+            let message = plaintext_message(&Ulid::new().to_string(), &open_id);
+            let started = Instant::now();
+            db.insert_message(&message)
+                .await
+                .expect("calibration insert");
+            insert_took = insert_took.max(started.elapsed());
+
+            let protect_id = format!("01J9Z3K4M5N6P7Q8R9S0W{sweep}{sample:04}");
+            let submission = protectable_channel(db, &protect_id, now).await;
+            let started = Instant::now();
+            db.protect_channel(&protect_id, &submission, now)
+                .await
+                .expect("calibration protect");
+            protect_took = protect_took.max(started.elapsed());
+        }
+        let scale = 1 << sweep;
+        let lead = (insert_took * 3 / 2).max(PROTECT_RACE_STAGGER_FLOOR) * scale;
+        let trail = (protect_took * 3 / 2).max(PROTECT_RACE_STAGGER_FLOOR) * scale;
+
+        let (mut insert_won, mut protect_won) = (0, 0);
+        let mut outcomes = String::new();
+
+        for round in 0..PROTECT_RACE_ROUNDS {
+            let channel_id = format!("01J9Z3K4M5N6P7Q8R9S0T{sweep}{round:04}");
+            let submission = protectable_channel(db, &channel_id, now).await;
+            let message = plaintext_message(&Ulid::new().to_string(), &channel_id);
+            let (insert_delay, protect_delay) = protect_race_delays(round, lead, trail);
+
+            let (inserted, protected) = tokio::join!(
+                async {
+                    if !insert_delay.is_zero() {
+                        tokio::time::sleep(insert_delay).await;
+                    }
+                    db.insert_message(&message).await
+                },
+                async {
+                    if !protect_delay.is_zero() {
+                        tokio::time::sleep(protect_delay).await;
+                    }
+                    db.protect_channel(&channel_id, &submission, now).await
+                }
+            );
+
+            let channel_protected = db
+                .fetch_channel(&channel_id)
+                .await
+                .expect("channel")
+                .is_protected();
+            let stored = db.fetch_message(&message.id).await.is_ok();
+
+            assert!(
+                !(channel_protected && stored),
+                "sweep {sweep} round {round}: plaintext stored in a protected channel"
+            );
+            assert_eq!(
+                inserted.is_ok(),
+                stored,
+                "sweep {sweep} round {round}: {inserted:?}"
+            );
+            assert_eq!(
+                protected.is_ok(),
+                channel_protected,
+                "sweep {sweep} round {round}: {:?}",
+                protected.as_ref().err()
+            );
+            assert!(
+                inserted.is_ok() != protected.is_ok(),
+                "sweep {sweep} round {round}: exactly one side wins (insert {inserted:?}, \
+                 protect ok {})",
+                protected.is_ok()
+            );
+
+            if stored {
+                insert_won += 1;
+                outcomes.push('I');
+            } else {
+                protect_won += 1;
+                outcomes.push('P');
+            }
+        }
+
+        eprintln!(
+            "protect race sweep {sweep}: insert {insert_took:?}, protect {protect_took:?}, \
+             lead {lead:?}, trail {trail:?}; insert won {insert_won}, \
+             protect won {protect_won} ({outcomes})"
+        );
+        (insert_won, protect_won)
+    }
+
+    /// A plaintext insert racing `protect_channel` on an empty channel never
+    /// ends with plaintext in a protected channel: either protect refuses
+    /// (a message exists) or the insert is refused.
+    ///
+    /// A fixed 0..15 ms stagger never reached the protect-first end on
+    /// MONGODB (protect's transaction outlasts it) nor the insert-first end
+    /// on REFERENCE, so both outcomes are asserted to occur. On REFERENCE
+    /// the order is deterministic and one sweep must show both. On MONGODB
+    /// it is wall-clock, so a one-sided sweep is retried, recalibrated and
+    /// wider, up to `PROTECT_RACE_EXTRA_SWEEPS` times.
+    #[tokio::test]
+    async fn plaintext_insert_racing_protect_never_lands_in_a_protected_channel() {
         database_test!(|db| async move {
             let now = Timestamp::UNIX_EPOCH
                 .checked_add(iso8601_timestamp::Duration::milliseconds(1_790_812_800_000))
                 .unwrap();
-            let (mut insert_won, mut protect_won) = (0, 0);
+            let extra_sweeps = if matches!(db, crate::Database::Reference(_)) {
+                0
+            } else {
+                PROTECT_RACE_EXTRA_SWEEPS
+            };
 
-            for round in 0..PROTECT_RACE_ROUNDS {
-                let channel_id = format!("01J9Z3K4M5N6P7Q8R9S0T{round:05}");
-                db.insert_channel(&text_channel(&channel_id, false))
-                    .await
-                    .expect("channel");
-                db.upsert_channel_entitlement(
-                    &ChannelEntitlement {
-                        id: Ulid::new().to_string(),
-                        channel_id: channel_id.clone(),
-                        server_id: "01J9Z3K4M5N6P7Q8R9S0T1V2W6".to_string(),
-                        source: ChannelEntitlementSource::AdminGrant,
-                        slot_cap: 10,
-                        device_cap: None,
-                        state: ChannelEntitlementState::Active,
-                        granted_by: "admin".to_string(),
-                        created_at: now,
-                    },
-                    now,
-                )
-                .await
-                .expect("entitlement");
-
-                let submission = SeatListSubmission {
-                    body: SeatListBody {
-                        channel_id: channel_id.clone(),
-                        version: 1,
-                        device_cap: 5,
-                        issued_at: 1_790_812_800_000,
-                        signer_user_id: OWNER.to_string(),
-                        signer_device_id: OWNER_DEVICE.to_string(),
-                        seats: vec![OWNER.to_string()],
-                    }
-                    .build()
-                    .expect("seat list body"),
-                    signature: format!("B{}", "A".repeat(85)),
-                    signer_device_id: OWNER_DEVICE.to_string(),
-                    handover: None,
-                };
-                let message = plaintext_message(&Ulid::new().to_string(), &channel_id);
-                let delay = std::time::Duration::from_millis(u64::from(round % 15));
-
-                let (inserted, protected) = tokio::join!(
-                    async {
-                        tokio::time::sleep(delay).await;
-                        db.insert_message(&message).await
-                    },
-                    db.protect_channel(&channel_id, &submission, now)
-                );
-
-                let channel_protected = db
-                    .fetch_channel(&channel_id)
-                    .await
-                    .expect("channel")
-                    .is_protected();
-                let stored = db.fetch_message(&message.id).await.is_ok();
-
-                assert!(
-                    !(channel_protected && stored),
-                    "round {round}: plaintext stored in a protected channel"
-                );
-                assert_eq!(inserted.is_ok(), stored, "round {round}: {inserted:?}");
-                assert_eq!(
-                    protected.is_ok(),
-                    channel_protected,
-                    "round {round}: {:?}",
-                    protected.as_ref().err()
-                );
-                assert!(
-                    inserted.is_ok() != protected.is_ok(),
-                    "round {round}: exactly one side wins (insert {inserted:?}, protect ok {})",
-                    protected.is_ok()
-                );
-
-                if stored {
-                    insert_won += 1;
-                } else {
-                    protect_won += 1;
+            for sweep in 0..=extra_sweeps {
+                let (insert_won, protect_won) = protect_race_sweep(&db, sweep, now).await;
+                if insert_won > 0 && protect_won > 0 {
+                    break;
                 }
+                assert!(
+                    sweep < extra_sweeps,
+                    "both outcomes must occur across the stagger: insert won {insert_won}, \
+                     protect won {protect_won} after {} sweep(s)",
+                    sweep + 1
+                );
             }
-
-            eprintln!("protect race: insert won {insert_won}, protect won {protect_won}");
         });
     }
 
