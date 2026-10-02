@@ -471,6 +471,25 @@ impl Server {
             .await
     }
 
+    /// Every channel id that can hold this server's messages: `self.channels`
+    /// (verbatim, dangling ids included) followed by every thread / forum post
+    /// hanging off them, which are never listed in `Server.channels`.
+    ///
+    /// Anything that scopes a message sweep to "this server" (the ban purge,
+    /// the prune exemption) must use this rather than `self.channels`, or a
+    /// thread's messages fall outside the sweep.
+    ///
+    /// The ids are never resolved through `fetch_channels`: the Reference
+    /// driver fails the whole lookup with NotFound on one dangling id, which
+    /// would abort the caller. A dangling id is harmless here; it matches no
+    /// thread and no message. Threads are found by parent, archived and
+    /// locked ones included. Their order is not guaranteed.
+    pub async fn message_channel_ids(&self, db: &Database) -> Result<Vec<String>> {
+        let mut ids = self.channels.clone();
+        ids.extend(db.fetch_thread_ids_by_parents(&self.channels).await?);
+        Ok(ids)
+    }
+
     /// Ordered roles list
     pub fn ordered_roles(&self) -> Vec<(String, Role)> {
         let mut ordered_roles = self.roles.clone().into_iter().collect::<Vec<_>>();
@@ -652,13 +671,18 @@ impl SystemMessageChannels {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
     use revolt_models::v0::{self, DataCreateServer, DataCreateServerChannel};
     use revolt_permissions::{calculate_server_permissions, ChannelPermission};
     use revolt_result::ErrorType;
+    use ulid::Ulid;
 
     use crate::{
         fixture, util::permissions::DatabasePermissionQuery, Channel, Database, FieldsChannel,
-        PartialChannel, PartialServer, Server, User,
+        File, FileUsedFor, FileUsedForType, Message, Metadata, PartialChannel, PartialServer,
+        Server, User,
     };
 
     #[tokio::test]
@@ -1144,5 +1168,286 @@ mod tests {
 
         assert!(server < voice, "{body}");
         assert!(voice < gate, "{body}");
+    }
+
+    // ---- Message scope (ban purge) -----------------------------------------
+    //
+    // `Server.channels` lists top-level channels only. Threads and forum posts
+    // hold messages too but are never listed there, so a purge scoped to
+    // `server.channels` left everything a banned user wrote in a thread
+    // behind. Control for both tests: `message_channel_ids` returning
+    // `self.channels.clone()`.
+
+    const MCI_P1: &str = "01MCIPARENTTEXT";
+    const MCI_P2: &str = "01MCIPARENTFORUM";
+    const MCI_DANGLING: &str = "01MCIDANGLINGCHANNEL";
+    const MCI_T1: &str = "01MCITHREAD1";
+    const MCI_T2: &str = "01MCITHREAD2ARCHIVEDLOCKED";
+    const MCI_Q1: &str = "01MCIOTHERPARENT";
+    const MCI_U1: &str = "01MCIOTHERTHREAD";
+    const MCI_A: &str = "01MCIAUTHORA";
+    const MCI_B: &str = "01MCIAUTHORB";
+    const MCI_FILE_PURGED: &str = "01MCIFILEPURGED";
+    const MCI_FILE_KEPT: &str = "01MCIFILEKEPT";
+
+    fn mci_text_channel(id: &str, server: &str) -> Channel {
+        Channel::TextChannel {
+            id: id.to_string(),
+            server: server.to_string(),
+            name: "text".to_string(),
+            description: None,
+            icon: None,
+            last_message_id: None,
+            default_permissions: None,
+            role_permissions: Default::default(),
+            nsfw: false,
+            spoiler: false,
+            voice: None,
+            slowmode: None,
+            announcement: None,
+        }
+    }
+
+    fn mci_thread(id: &str, server: &str, parent: &str, archived: bool, locked: bool) -> Channel {
+        Channel::Thread {
+            id: id.to_string(),
+            server: server.to_string(),
+            parent_channel: parent.to_string(),
+            name: "thread".to_string(),
+            creator: MCI_A.to_string(),
+            origin_message_id: None,
+            last_message_id: None,
+            archived,
+            archived_timestamp: None,
+            auto_archive_minutes: Channel::default_auto_archive_minutes(),
+            locked,
+            applied_tags: vec![],
+        }
+    }
+
+    fn mci_file(id: &str, message_id: &str) -> File {
+        File {
+            id: id.to_string(),
+            tag: "attachments".to_string(),
+            filename: "note.txt".to_string(),
+            hash: None,
+            uploaded_at: None,
+            uploader_id: Some(MCI_A.to_string()),
+            used_for: Some(FileUsedFor {
+                object_type: FileUsedForType::Message,
+                id: message_id.to_string(),
+            }),
+            deleted: None,
+            reported: None,
+            metadata: Metadata::File,
+            content_type: "text/plain".to_string(),
+            size: 1,
+            message_id: Some(message_id.to_string()),
+            user_id: None,
+            server_id: None,
+            object_id: None,
+        }
+    }
+
+    /// Server S lists [P1 text, P2 forum, a dangling id]. T1 and T2 (archived
+    /// and locked) hang off P1, post T3 off P2. Server S2 lists Q1, with
+    /// thread U1. Returns S re-fetched, as the ban route holds a fetched one,
+    /// plus T3's id.
+    ///
+    /// A forum post's starter message shares the post's id, so T3 is a real
+    /// ULID minted now: that message has to fall inside a purge window.
+    async fn mci_fixture(db: &Database) -> (Server, String) {
+        let server = new_server(db, "MciOwner").await;
+        let other = new_server(db, "MciOther").await;
+        let t3 = Ulid::new().to_string();
+
+        db.insert_channel(&mci_text_channel(MCI_P1, &server.id))
+            .await
+            .expect("P1");
+        db.insert_channel(&Channel::Forum {
+            id: MCI_P2.to_string(),
+            server: server.id.clone(),
+            name: "forum".to_string(),
+            description: None,
+            icon: None,
+            last_message_id: None,
+            default_permissions: None,
+            role_permissions: Default::default(),
+            nsfw: false,
+            spoiler: false,
+            tags: vec![],
+            require_tag: false,
+            default_sort: Default::default(),
+            force_sort: false,
+            default_auto_archive_minutes: Channel::default_forum_auto_archive_minutes(),
+        })
+        .await
+        .expect("P2");
+        db.insert_channel(&mci_text_channel(MCI_Q1, &other.id))
+            .await
+            .expect("Q1");
+
+        for thread in [
+            mci_thread(MCI_T1, &server.id, MCI_P1, false, false),
+            mci_thread(MCI_T2, &server.id, MCI_P1, true, true),
+            mci_thread(&t3, &server.id, MCI_P2, false, false),
+            mci_thread(MCI_U1, &other.id, MCI_Q1, false, false),
+        ] {
+            db.insert_channel(&thread).await.expect("thread");
+        }
+
+        for (id, channels) in [
+            (&server.id, vec![MCI_P1, MCI_P2, MCI_DANGLING]),
+            (&other.id, vec![MCI_Q1]),
+        ] {
+            db.update_server(
+                id,
+                &PartialServer {
+                    channels: Some(channels.into_iter().map(String::from).collect()),
+                    ..Default::default()
+                },
+                vec![],
+            )
+            .await
+            .expect("channels");
+        }
+
+        let server = db.fetch_server(&server.id).await.expect("`Server`");
+        assert_eq!(server.channels, [MCI_P1, MCI_P2, MCI_DANGLING]);
+        (server, t3)
+    }
+
+    /// `self.channels` leads verbatim and in order, the dangling id included,
+    /// then exactly this server's threads and posts, archived and locked ones
+    /// included. Another server's thread never leaks in.
+    #[tokio::test]
+    async fn message_channel_ids_appends_this_servers_threads_and_posts() {
+        database_test!(|db| async move {
+            let (server, t3) = mci_fixture(&db).await;
+
+            let ids = server
+                .message_channel_ids(&db)
+                .await
+                .expect("message channel ids");
+
+            let listed = server.channels.len();
+            assert!(ids.len() >= listed, "{ids:?}");
+            assert_eq!(
+                ids[..listed],
+                server.channels[..],
+                "W2A-i: server.channels must lead, verbatim and in order"
+            );
+
+            let appended: HashSet<&str> = ids[listed..].iter().map(String::as_str).collect();
+            assert_eq!(
+                appended,
+                HashSet::from([MCI_T1, MCI_T2, t3.as_str()]),
+                "W2A-i: every thread and forum post of this server must follow: {ids:?}"
+            );
+            assert_eq!(ids.len(), listed + 3, "W2A-i: no duplicates: {ids:?}");
+            assert!(
+                !ids.iter().any(|id| id == MCI_U1),
+                "W2A-i: another server's thread leaked in: {ids:?}"
+            );
+        });
+    }
+
+    /// Composition with the ban purge, the way the ban route calls it. Only
+    /// A's recent messages in this server go: in a parent channel, a thread,
+    /// an archived and locked thread, and a forum starter (id = post id). The
+    /// thread message's attachment is marked deleted. A's old message, B's
+    /// message and A's message in another server's thread all stay, and so
+    /// does the post channel itself.
+    #[tokio::test]
+    async fn ban_purge_over_message_channel_ids_reaches_threads_and_posts() {
+        database_test!(|db| async move {
+            let (server, t3) = mci_fixture(&db).await;
+
+            let threshold = SystemTime::now() - Duration::from_secs(3600);
+            let old_ms = threshold
+                .duration_since(UNIX_EPOCH)
+                .expect("after the epoch")
+                .as_millis() as u64
+                - 86_400_000;
+
+            let mk = |id: String, channel: &str, author: &str, file: Option<File>| Message {
+                id,
+                channel: channel.to_string(),
+                author: author.to_string(),
+                content: Some("purge scope".to_string()),
+                attachments: file.map(|file| vec![file]),
+                ..Default::default()
+            };
+
+            let in_t1 = Ulid::new().to_string();
+            let old_in_t1 = Ulid::from_parts(old_ms, 0).to_string();
+            let purged_file = mci_file(MCI_FILE_PURGED, &in_t1);
+            let kept_file = mci_file(MCI_FILE_KEPT, &old_in_t1);
+
+            let purged = [
+                mk(Ulid::new().to_string(), MCI_P1, MCI_A, None),
+                mk(in_t1.clone(), MCI_T1, MCI_A, Some(purged_file.clone())),
+                mk(Ulid::new().to_string(), MCI_T2, MCI_A, None),
+                mk(t3.clone(), t3.as_str(), MCI_A, None),
+            ];
+            let kept = [
+                mk(old_in_t1.clone(), MCI_T1, MCI_A, Some(kept_file.clone())),
+                mk(Ulid::new().to_string(), MCI_T1, MCI_B, None),
+                mk(Ulid::new().to_string(), MCI_U1, MCI_A, None),
+            ];
+
+            for file in [&purged_file, &kept_file] {
+                db.insert_attachment(file).await.expect("attachment");
+            }
+            for message in purged.iter().chain(kept.iter()) {
+                db.insert_message(message).await.expect("message");
+            }
+
+            Message::bulk_delete_by_author_since(
+                &db,
+                &server.message_channel_ids(&db).await.expect("ids"),
+                MCI_A,
+                threshold,
+            )
+            .await
+            .expect("purge");
+
+            for message in &purged {
+                let error = db.fetch_message(&message.id).await.expect_err(&format!(
+                    "W2A-ii: A's recent message in {} survived the purge",
+                    message.channel
+                ));
+                assert!(matches!(error.error_type, ErrorType::NotFound), "{error:?}");
+            }
+            for message in &kept {
+                db.fetch_message(&message.id).await.unwrap_or_else(|error| {
+                    panic!(
+                        "W2A-ii: out-of-scope message {} in {} was purged: {error:?}",
+                        message.id, message.channel
+                    )
+                });
+            }
+
+            let file = db
+                .fetch_attachment("attachments", MCI_FILE_PURGED)
+                .await
+                .expect("purged attachment row");
+            assert_eq!(
+                file.deleted,
+                Some(true),
+                "W2A-ii: the thread message's attachment must be marked deleted"
+            );
+            let file = db
+                .fetch_attachment("attachments", MCI_FILE_KEPT)
+                .await
+                .expect("kept attachment row");
+            assert_ne!(file.deleted, Some(true), "W2A-ii: kept attachment marked deleted");
+
+            let post = db
+                .fetch_channel(&t3)
+                .await
+                .expect("W2A-ii: the post channel must survive its starter's purge");
+            assert!(matches!(post, Channel::Thread { .. }), "{post:?}");
+        });
     }
 }
