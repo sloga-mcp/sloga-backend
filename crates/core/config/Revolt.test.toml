@@ -26,3 +26,24 @@ from_address = "development@stoat.chat"
 reply_to = "support@stoat.chat"
 port = 14025
 use_tls = false
+
+
+# Pin the upload ceiling for tests. These now match the committed
+# Revolt.toml, so this block raises nothing - it exists to stop a developer
+# machine local Revolt.overrides.toml from lowering the limit out from under
+# the chunked-upload tests, the same way the [api.smtp] block above keeps
+# deploy mail config out of the email tests. Overrides load BEFORE this file,
+# so pinning here wins.
+#
+# The tests need headroom above CHUNK_SIZE (32 MiB): create_upload rejects
+# anything at or below one chunk as FileTooSmall and anything above the limit
+# as FileTooLarge, so a limit under 32 MiB leaves an empty window and every
+# chunked upload fails.
+[features.limits.global]
+body_limit_size = 5_000_000_000
+
+[features.limits.default.file_upload_size_limit]
+attachments = 5_000_000_000
+
+[features.limits.new_user.file_upload_size_limit]
+attachments = 5_000_000_000

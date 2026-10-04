@@ -622,8 +622,23 @@ mod tests {
     /// All tests share one scratch bucket so the cached global config (first
     /// loader wins) is consistent; objects are small and the bucket is not
     /// the prod one
-    fn test_env() {
-        std::env::set_var("REVOLT_FILES__S3__DEFAULT_BUCKET", "autumn-upload-tests");
+    async fn test_env() {
+        std::env::set_var("REVOLT__FILES__S3__DEFAULT_BUCKET", "autumn-upload-tests");
+
+        // Prove the override actually reached the config: config-rs reuses the
+        // key separator ("__") as the prefix separator when none is set, so the
+        // prefix is REVOLT__. A single underscore is dropped silently and the
+        // test would quietly run against the dev bucket instead.
+        //
+        // The global config is built once per process, so this only holds if
+        // nothing has read it yet - i.e. under , which gives
+        // each test its own process. Under a plain  an earlier test
+        // in the same binary can win the race and trip this assertion.
+        assert_eq!(
+            revolt_config::config().await.files.s3.default_bucket,
+            "autumn-upload-tests",
+            "S3 default_bucket override never reached the config"
+        );
     }
 
     fn db() -> Database {
@@ -659,7 +674,7 @@ mod tests {
 
     #[tokio::test]
     async fn create_rejects_small_files_wrong_tags_and_caps_sessions() {
-        test_env();
+        test_env().await;
         ensure_bucket().await;
         let db = db();
         let user = test_user();
@@ -728,7 +743,7 @@ mod tests {
     /// second identical upload, and abort of a pending session.
     #[tokio::test]
     async fn chunked_upload_end_to_end() {
-        test_env();
+        test_env().await;
         ensure_bucket().await;
         let db = db();
         let user = test_user();
