@@ -114,6 +114,65 @@ async fn mass_mention_server(db: &Database, channel_id: &str) -> Option<String> 
     }
 }
 
+/// Where the ack worker sends one processed message's push
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct PushRoute {
+    /// Push straight to the message's recipients
+    pub direct: bool,
+    /// Forward to pushd's mass-mention consumer
+    pub mass_mention: bool,
+}
+
+/// Route one `ProcessMessage` entry, or `None` to send nothing.
+///
+/// A silenced message gets no direct push. A silenced mass mention is still
+/// forwarded: that consumer records the @everyone unreads and skips the push
+/// itself for a message flagged `SuppressNotifications`.
+pub(crate) fn push_route(
+    has_push: bool,
+    message: &Message,
+    recipients: &[String],
+    silenced: bool,
+) -> Option<PushRoute> {
+    let mass_mention = message.contains_mass_push_mention();
+    if !has_push || (!mass_mention && (silenced || recipients.is_empty())) {
+        return None;
+    }
+
+    Some(PushRoute {
+        direct: !silenced,
+        mass_mention,
+    })
+}
+
+/// Take every queued `ProcessMessage` entry for `channel` off the queue and
+/// put the rest back, so a test can see what `Message::send` queued. No worker
+/// runs in tests (except the `#[ignore]`d worker test below), so nothing else
+/// drains the queue.
+#[cfg(test)]
+pub(crate) fn take_process_messages(
+    channel: &str,
+) -> Vec<(Option<PushNotification>, Message, Vec<String>, bool)> {
+    let mut taken = vec![];
+    let mut rest = vec![];
+    while let Some(data) = Q.try_pop() {
+        match data {
+            Data {
+                channel: ref queued,
+                event: AckEvent::ProcessMessage { messages },
+                ..
+            } if queued == channel => taken.extend(messages),
+            data => rest.push(data),
+        }
+    }
+
+    for data in rest {
+        Q.try_push(data).ok();
+    }
+
+    taken
+}
+
 pub async fn handle_ack_event(
     event: &AckEvent,
     db: &Database,
@@ -185,10 +244,8 @@ pub async fn handle_ack_event(
             let mut mass_mentions = vec![];
 
             for (push, message, recipients, silenced) in messages {
-                if *silenced
-                    || push.is_none()
-                    || (recipients.is_empty() && !message.contains_mass_push_mention())
-                {
+                let route = push_route(push.is_some(), message, recipients, *silenced);
+                let (Some(push), Some(route)) = (push, route) else {
                     debug!(
                         "Rejecting push: silenced: {}, recipient count: {}, push exists: {:?}",
                         *silenced,
@@ -196,22 +253,21 @@ pub async fn handle_ack_event(
                         push.is_some()
                     );
                     continue;
+                };
+
+                if route.direct {
+                    debug!(
+                        "Sending push event to AMQP; message {} for {} users",
+                        push.message.id,
+                        recipients.len()
+                    );
+                    if let Err(err) = amqp.message_sent(recipients.clone(), push.clone()).await {
+                        revolt_config::capture_error(&err);
+                    }
                 }
 
-                debug!(
-                    "Sending push event to AMQP; message {} for {} users",
-                    push.as_ref().unwrap().message.id,
-                    recipients.len()
-                );
-                if let Err(err) = amqp
-                    .message_sent(recipients.clone(), push.clone().unwrap())
-                    .await
-                {
-                    revolt_config::capture_error(&err);
-                }
-
-                if message.contains_mass_push_mention() {
-                    mass_mentions.push(push.clone().unwrap());
+                if route.mass_mention {
+                    mass_mentions.push(push.clone());
                 }
             }
 
@@ -426,6 +482,50 @@ mod tests {
 
     fn new_id() -> String {
         ulid::Ulid::new().to_string()
+    }
+
+    fn message(role_mentions: Option<Vec<String>>) -> Message {
+        Message {
+            id: new_id(),
+            channel: new_id(),
+            author: new_id(),
+            role_mentions,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn push_route_sends_an_unsilenced_message_directly() {
+        assert_eq!(
+            push_route(true, &message(None), &[new_id()], false),
+            Some(PushRoute {
+                direct: true,
+                mass_mention: false
+            })
+        );
+    }
+
+    #[test]
+    fn push_route_sends_nothing_for_a_silenced_message() {
+        assert_eq!(push_route(true, &message(None), &[new_id()], true), None);
+    }
+
+    #[test]
+    fn push_route_forwards_a_silenced_mass_mention_without_a_direct_push() {
+        // pushd's mass-mention consumer records the unreads and skips the push.
+        assert_eq!(
+            push_route(true, &message(Some(vec![new_id()])), &[new_id()], true),
+            Some(PushRoute {
+                direct: false,
+                mass_mention: true
+            })
+        );
+    }
+
+    #[test]
+    fn push_route_sends_nothing_without_a_push_or_a_target() {
+        assert_eq!(push_route(false, &message(None), &[new_id()], false), None);
+        assert_eq!(push_route(true, &message(None), &[], false), None);
     }
 
     #[tokio::test]
