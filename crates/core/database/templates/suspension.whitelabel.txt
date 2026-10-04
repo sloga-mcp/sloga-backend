@@ -1,6 +1,12 @@
 Your account has been suspended, for one or more reasons:
 {{list}}
 
+{{#if duration}}You will be able to use your account again in {{duration}} days.{{else}}This suspension has no end date.{{/if}}
+
+Sloga's Community Guidelines: https://sloga.gg/legal/guidelines.html
+
+If you think this was a mistake, reply to this email or write to support@sloga.gg. A person reviews every appeal, and we send a first reply within 72 hours.
+
 This email is intended for {{email}}
 
 Sloga
