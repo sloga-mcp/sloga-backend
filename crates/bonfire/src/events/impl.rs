@@ -960,6 +960,51 @@ impl State {
                 }
             }
 
+            // Thread membership events are published to the server topic, so
+            // every member receives them. Our own join is also where a thread
+            // joined mid-session gets subscribed: Ready only subscribes the
+            // threads joined before it.
+            EventV1::ThreadMemberJoin { id, user } if *user == self.cache.user_id => {
+                // Own statement: the read guard must be released before
+                // reveal_channels takes the write lock to subscribe.
+                let already = self.subscribed.read().await.contains(id.as_str());
+                if !already {
+                    // Only a thread can be revealed by a join. Checked before
+                    // reveal_channels, which caches and subscribes; removing
+                    // the subscription afterwards would still leave a Redis
+                    // SUBSCRIBE queued.
+                    match db.fetch_channel(id).await {
+                        Ok(Channel::Thread { .. }) => {}
+                        _ => return false,
+                    }
+
+                    // Visibility comes from the parent. A hidden or deleted
+                    // thread is neither subscribed nor announced.
+                    let revealed = self.reveal_channels(db, vec![id.clone()]).await;
+                    if revealed.is_empty() {
+                        return false;
+                    }
+
+                    // The client drops membership events for channels it has
+                    // not cached, so the ChannelCreate goes first.
+                    let original = std::mem::replace(event, EventV1::Bulk { v: vec![] });
+                    let mut v = revealed;
+                    v.push(original);
+                    *event = EventV1::Bulk { v };
+                }
+            }
+            // Anyone else's membership change, and our own leave, is only
+            // forwarded for a thread the client was told about (it is then
+            // subscribed); otherwise a hidden thread's id and members leak.
+            // Our own leave keeps the subscription, as for a visible thread we
+            // never joined, so an open view keeps updating.
+            EventV1::ThreadMemberJoin { id, .. } | EventV1::ThreadMemberLeave { id, .. } => {
+                let subscribed_now = self.subscribed.read().await.contains(id.as_str());
+                if !subscribed_now {
+                    return false;
+                }
+            }
+
             _ => {}
         }
 
@@ -2189,5 +2234,313 @@ mod tests {
             !state.subscribed.read().await.contains(NEW_TEXT),
             "the now-private channel must be unsubscribed"
         );
+    }
+
+    fn thread_join(user: &str, id: &str) -> EventV1 {
+        EventV1::ThreadMemberJoin {
+            id: id.to_string(),
+            user: user.to_string(),
+        }
+    }
+
+    fn thread_leave(user: &str, id: &str) -> EventV1 {
+        EventV1::ThreadMemberLeave {
+            id: id.to_string(),
+            user: user.to_string(),
+        }
+    }
+
+    /// The topics an `apply_state` flush queues for Redis to subscribe and
+    /// unsubscribe. The fixtures are flushed out of `Reset` first, so a
+    /// `Reset` here means the test is broken.
+    fn queued_changes(
+        change: super::super::state::SubscriptionStateChange,
+    ) -> (Vec<String>, Vec<String>) {
+        use super::super::state::SubscriptionStateChange;
+        match change {
+            SubscriptionStateChange::None => (vec![], vec![]),
+            SubscriptionStateChange::Change { add, remove } => (add, remove),
+            SubscriptionStateChange::Reset => panic!("fixture was not flushed"),
+        }
+    }
+
+    /// Joining a thread after Ready (a reply, an explicit join) must
+    /// subscribe it, or its live messages never reach this socket. A client
+    /// that never cached it learns it from a ChannelCreate placed ahead of
+    /// the join, which the client would otherwise drop.
+    #[tokio::test]
+    #[allow(clippy::disallowed_methods)]
+    async fn thread_member_self_join_reveals_and_subscribes_uncached_thread() {
+        let db = private_channel_db().await;
+        db.insert_channel(&thread(THREAD_S, SERVER_S, TEXT_S))
+            .await
+            .expect("insert thread");
+        let mut state = private_channel_state(&[], &[text_channel(TEXT_S, SERVER_S)]).await;
+
+        let mut event = thread_join(SELF_ID, THREAD_S);
+        assert!(
+            state.handle_incoming_event_v1(&db, &mut event).await,
+            "our own join of a visible thread must be forwarded"
+        );
+
+        let (created, deleted, original) = split_bulk(&event);
+        assert_eq!(
+            created,
+            vec![THREAD_S.to_string()],
+            "the thread is announced ahead of the join: {event:?}"
+        );
+        assert!(deleted.is_empty(), "nothing was hidden: {deleted:?}");
+        assert!(
+            matches!(original, EventV1::ThreadMemberJoin { id, user } if id == THREAD_S && user == SELF_ID),
+            "the join itself comes last, unchanged: {original:?}"
+        );
+
+        assert!(state.cache.channels.contains_key(THREAD_S));
+        assert!(state.subscribed.read().await.contains(THREAD_S));
+        let (add, _) = queued_changes(state.apply_state().await);
+        assert!(
+            add.contains(&THREAD_S.to_string()),
+            "the Redis subscribe must be queued: {add:?}"
+        );
+    }
+
+    /// A join of a thread the socket already follows is forwarded as is and
+    /// reads nothing: with the row gone from the database, a re-reveal would
+    /// drop the join and uncache the thread.
+    #[tokio::test]
+    async fn thread_member_self_join_of_subscribed_thread_is_forwarded_unchanged() {
+        let db = test_db().await;
+        let mut state = private_channel_state(
+            &[],
+            &[
+                text_channel(TEXT_S, SERVER_S),
+                thread(THREAD_S, SERVER_S, TEXT_S),
+            ],
+        )
+        .await;
+
+        let mut event = thread_join(SELF_ID, THREAD_S);
+        assert!(
+            state.handle_incoming_event_v1(&db, &mut event).await,
+            "a join of a subscribed thread must be forwarded"
+        );
+        assert!(
+            matches!(&event, EventV1::ThreadMemberJoin { id, user } if id == THREAD_S && user == SELF_ID),
+            "the join must be forwarded unchanged: {event:?}"
+        );
+        assert!(
+            state.cache.channels.contains_key(THREAD_S),
+            "the thread must stay cached"
+        );
+        assert!(state.subscribed.read().await.contains(THREAD_S));
+    }
+
+    /// Our own join of a thread under a parent we cannot view is dropped and
+    /// subscribes nothing. A later grant still reveals the thread, as a
+    /// ChannelCreate only: the dropped join is not replayed.
+    #[tokio::test]
+    async fn thread_member_self_join_under_hidden_parent_is_dropped() {
+        let db = private_channel_db().await;
+        let mut state = private_channel_state(&[], &[text_channel(TEXT_S, SERVER_S)]).await;
+
+        let mut event = thread_join(SELF_ID, PRIVATE_THREAD_S);
+        assert!(
+            !state.handle_incoming_event_v1(&db, &mut event).await,
+            "a join of a thread under a hidden parent must be dropped"
+        );
+        assert!(!state.subscribed.read().await.contains(PRIVATE_THREAD_S));
+        let (add, _) = queued_changes(state.apply_state().await);
+        assert!(
+            !add.contains(&PRIVATE_THREAD_S.to_string()),
+            "no Redis subscribe for a hidden thread: {add:?}"
+        );
+
+        let mut event = set_roles(&[ROLE_R]);
+        assert!(state.handle_incoming_event_v1(&db, &mut event).await);
+        let (created, deleted, original) = split_bulk(&event);
+        assert!(matches!(original, EventV1::ServerMemberUpdate { .. }));
+        assert!(deleted.is_empty(), "nothing was hidden: {deleted:?}");
+        assert_eq!(
+            created,
+            vec![PRIVATE_S.to_string(), PRIVATE_THREAD_S.to_string()],
+            "the grant announces the parent and then the thread"
+        );
+        let EventV1::Bulk { v } = &event else {
+            panic!("expected a Bulk: {event:?}");
+        };
+        assert!(
+            !v.iter()
+                .any(|event| matches!(event, EventV1::ThreadMemberJoin { .. })),
+            "the dropped join is not replayed by the grant: {v:?}"
+        );
+
+        assert!(state.subscribed.read().await.contains(PRIVATE_THREAD_S));
+        let (add, _) = queued_changes(state.apply_state().await);
+        assert!(
+            add.contains(&PRIVATE_THREAD_S.to_string()),
+            "the grant queues the Redis subscribe: {add:?}"
+        );
+    }
+
+    /// A join of a thread that is not in the database is dropped, and
+    /// neither caches nor subscribes it.
+    #[tokio::test]
+    async fn thread_member_self_join_of_missing_thread_is_dropped() {
+        let db = private_channel_db().await;
+        let mut state = private_channel_state(&[], &[text_channel(TEXT_S, SERVER_S)]).await;
+
+        let mut event = thread_join(SELF_ID, THREAD_S);
+        assert!(
+            !state.handle_incoming_event_v1(&db, &mut event).await,
+            "a join of a missing thread must be dropped"
+        );
+        assert!(!state.cache.channels.contains_key(THREAD_S));
+        assert!(!state.subscribed.read().await.contains(THREAD_S));
+        let (add, _) = queued_changes(state.apply_state().await);
+        assert!(!add.contains(&THREAD_S.to_string()), "{add:?}");
+    }
+
+    /// Another member's join or leave is forwarded only for a thread this
+    /// socket was told about. Membership events go to the whole server
+    /// topic, so without this every member learns the ids and members of
+    /// threads under parents they cannot view.
+    #[tokio::test]
+    #[allow(clippy::disallowed_methods)]
+    async fn thread_member_events_of_other_users_follow_subscription() {
+        let db = private_channel_db().await;
+        db.insert_channel(&thread(THREAD_S, SERVER_S, TEXT_S))
+            .await
+            .expect("insert thread");
+        let mut state = private_channel_state(&[], &[text_channel(TEXT_S, SERVER_S)]).await;
+
+        // Cached while hidden, as ChannelCreate leaves it.
+        let mut event =
+            EventV1::ChannelCreate(thread(PRIVATE_THREAD_S, SERVER_S, PRIVATE_S).into());
+        assert!(!state.handle_incoming_event_v1(&db, &mut event).await);
+        assert!(state.cache.channels.contains_key(PRIVATE_THREAD_S));
+
+        // A hidden thread, then a visible thread this socket never cached.
+        for id in [PRIVATE_THREAD_S, THREAD_S] {
+            for mut event in [thread_join(OTHER_ID, id), thread_leave(OTHER_ID, id)] {
+                assert!(
+                    !state.handle_incoming_event_v1(&db, &mut event).await,
+                    "{id}: another member's {event:?} must be dropped"
+                );
+            }
+        }
+        assert!(
+            !state.cache.channels.contains_key(THREAD_S),
+            "another member's join must not cache the thread"
+        );
+        {
+            let subscribed = state.subscribed.read().await;
+            assert!(!subscribed.contains(THREAD_S));
+            assert!(!subscribed.contains(PRIVATE_THREAD_S));
+        }
+
+        // Once the thread is announced, its membership events flow.
+        let mut event = EventV1::ChannelCreate(thread(THREAD_S, SERVER_S, TEXT_S).into());
+        assert!(state.handle_incoming_event_v1(&db, &mut event).await);
+        assert!(state.subscribed.read().await.contains(THREAD_S));
+
+        let mut event = thread_join(OTHER_ID, THREAD_S);
+        assert!(
+            state.handle_incoming_event_v1(&db, &mut event).await,
+            "another member's join of a subscribed thread must be forwarded"
+        );
+        assert!(
+            matches!(&event, EventV1::ThreadMemberJoin { id, user } if id == THREAD_S && user == OTHER_ID),
+            "forwarded unchanged: {event:?}"
+        );
+
+        let mut event = thread_leave(OTHER_ID, THREAD_S);
+        assert!(
+            state.handle_incoming_event_v1(&db, &mut event).await,
+            "another member's leave of a subscribed thread must be forwarded"
+        );
+        assert!(
+            matches!(&event, EventV1::ThreadMemberLeave { id, user } if id == THREAD_S && user == OTHER_ID),
+            "forwarded unchanged: {event:?}"
+        );
+    }
+
+    /// Leaving a thread keeps it subscribed, as a visible thread we never
+    /// joined is, so an open view keeps receiving its messages. A leave of a
+    /// thread the socket does not follow is dropped.
+    #[tokio::test]
+    async fn thread_member_self_leave_keeps_subscription() {
+        let db = private_channel_db().await;
+        let mut state = private_channel_state(
+            &[],
+            &[
+                text_channel(TEXT_S, SERVER_S),
+                thread(THREAD_S, SERVER_S, TEXT_S),
+            ],
+        )
+        .await;
+
+        let mut event = thread_leave(SELF_ID, THREAD_S);
+        assert!(
+            state.handle_incoming_event_v1(&db, &mut event).await,
+            "our own leave of a subscribed thread must be forwarded"
+        );
+        assert!(
+            matches!(&event, EventV1::ThreadMemberLeave { id, user } if id == THREAD_S && user == SELF_ID),
+            "forwarded unchanged: {event:?}"
+        );
+        assert!(
+            state.subscribed.read().await.contains(THREAD_S),
+            "leaving must keep the subscription"
+        );
+        assert!(state.cache.channels.contains_key(THREAD_S));
+        let (_, remove) = queued_changes(state.apply_state().await);
+        assert!(
+            !remove.contains(&THREAD_S.to_string()),
+            "no Redis unsubscribe on leave: {remove:?}"
+        );
+
+        let mut event = thread_leave(SELF_ID, PRIVATE_THREAD_S);
+        assert!(
+            !state.handle_incoming_event_v1(&db, &mut event).await,
+            "our own leave of an unsubscribed thread must be dropped"
+        );
+    }
+
+    /// A join naming a channel that is not a thread reveals nothing, even
+    /// one we may view: a text channel the socket was not told about, or a
+    /// DM, which `can_view_channel` treats as viewable.
+    #[tokio::test]
+    #[allow(clippy::disallowed_methods)]
+    async fn thread_member_self_join_of_non_thread_channel_is_dropped() {
+        let db = private_channel_db().await;
+        let dm = Channel::DirectMessage {
+            id: "01CHANNEL000000000000000DM".to_string(),
+            active: true,
+            recipients: vec![SELF_ID.to_string(), OTHER_ID.to_string()],
+            last_message_id: None,
+        };
+        db.insert_channel(&dm).await.expect("insert dm");
+        let mut state = private_channel_state(&[], &[]).await;
+
+        for id in [TEXT_S, dm.id()] {
+            let mut event = thread_join(SELF_ID, id);
+            assert!(
+                !state.handle_incoming_event_v1(&db, &mut event).await,
+                "{id}: a join of a non-thread channel must be dropped"
+            );
+            assert!(
+                !state.cache.channels.contains_key(id),
+                "{id}: must not be cached"
+            );
+            assert!(
+                !state.subscribed.read().await.contains(id),
+                "{id}: must not be subscribed"
+            );
+            let (add, _) = queued_changes(state.apply_state().await);
+            assert!(
+                !add.contains(&id.to_string()),
+                "{id}: no Redis subscribe: {add:?}"
+            );
+        }
     }
 }
