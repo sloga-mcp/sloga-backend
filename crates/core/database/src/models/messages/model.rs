@@ -302,11 +302,26 @@ auto_derived!(
     }
 );
 
+/// Stored mask for `MessageFlags::SuppressNotifications`.
+///
+/// This is the one flag stored as a MASK and not at the bit position its
+/// discriminant names (that would be bit 1, value 2). Clients send
+/// `flags |= 1` for a silent message and read it back as `flags & 1`, and the
+/// protected-channel flag allowlist accepts exactly 0 or 1. Every other flag is
+/// a bit position (`1 << flag`). `MessageFlagsValue::has`/`set` route
+/// `SuppressNotifications` here, so callers never see the difference.
+const SUPPRESS_NOTIFICATIONS_MASK: u32 = 1;
+
 pub struct MessageFlagsValue(pub u32);
 
 impl MessageFlagsValue {
     pub fn has(&self, flag: MessageFlags) -> bool {
-        self.has_value(flag as u32)
+        match flag {
+            MessageFlags::SuppressNotifications => {
+                self.0 & SUPPRESS_NOTIFICATIONS_MASK == SUPPRESS_NOTIFICATIONS_MASK
+            }
+            flag => self.has_value(flag as u32),
+        }
     }
     pub fn has_value(&self, bit: u32) -> bool {
         let mask = 1 << bit;
@@ -314,7 +329,17 @@ impl MessageFlagsValue {
     }
 
     pub fn set(&mut self, flag: MessageFlags, toggle: bool) -> &mut Self {
-        self.set_value(flag as u32, toggle)
+        match flag {
+            MessageFlags::SuppressNotifications => {
+                if toggle {
+                    self.0 |= SUPPRESS_NOTIFICATIONS_MASK;
+                } else {
+                    self.0 &= !SUPPRESS_NOTIFICATIONS_MASK;
+                }
+                self
+            }
+            flag => self.set_value(flag as u32, toggle),
+        }
     }
     pub fn set_value(&mut self, bit: u32, toggle: bool) -> &mut Self {
         if toggle {
@@ -941,11 +966,13 @@ impl Message {
         // not just mentioned users.
         let is_thread = matches!(channel, Channel::Thread { .. });
 
-        if !self.has_suppressed_notifications()
-            && (is_dm_or_group
-                || is_thread
-                || self.mentions.is_some()
-                || self.contains_mass_push_mention())
+        // A silent message still takes this branch, marked `silenced`: the ack
+        // task records its mentions and unreads (`send_without_notifications`
+        // was told to leave that to us) and only skips the push.
+        if is_dm_or_group
+            || is_thread
+            || self.mentions.is_some()
+            || self.contains_mass_push_mention()
         {
             // send Push notifications
             #[cfg(feature = "tasks")]
@@ -961,25 +988,16 @@ impl Message {
                     // push; the ack task applies each recipient's mute settings.
                     // Explicitly-mentioned users are unioned in so a mention
                     // still notifies even if they have not joined the thread.
-                    Channel::Thread { .. } => {
-                        let mut targets: Vec<String> = db
-                            .fetch_thread_members(&self.channel)
-                            .await
-                            .unwrap_or_default()
-                            .into_iter()
-                            .map(|member| member.id.user)
-                            .filter(|uid| uid.as_str() != author.id())
-                            .collect();
-
-                        if let Some(mentions) = &self.mentions {
-                            for uid in mentions {
-                                if uid.as_str() != author.id() && !targets.contains(uid) {
-                                    targets.push(uid.clone());
-                                }
-                            }
-                        }
-
-                        targets
+                    // Restricted to current server members; see the helper.
+                    Channel::Thread { server, .. } => {
+                        thread_push_recipients(
+                            db,
+                            server,
+                            &self.channel,
+                            author.id(),
+                            self.mentions.as_deref(),
+                        )
+                        .await
                     }
                     // Never notify the author of their own message (self-mention
                     // or reply-ping of their own message).
@@ -1012,7 +1030,7 @@ impl Message {
                                 ),
                                 self.clone(),
                                 recipients,
-                                false, // branch already dictates this
+                                self.has_suppressed_notifications(),
                             )],
                         },
                     )
@@ -1050,12 +1068,8 @@ impl Message {
 
     /// Whether this message has suppressed notifications
     pub fn has_suppressed_notifications(&self) -> bool {
-        if let Some(flags) = self.flags {
-            flags & MessageFlags::SuppressNotifications as u32
-                == MessageFlags::SuppressNotifications as u32
-        } else {
-            false
-        }
+        self.flags
+            .is_some_and(|flags| MessageFlagsValue(flags).has(MessageFlags::SuppressNotifications))
     }
 
     pub fn contains_mass_push_mention(&self) -> bool {
@@ -1469,6 +1483,54 @@ impl Message {
     }
 }
 
+/// Push recipients for a message in a thread: the thread's joined members and
+/// any explicitly mentioned users, minus the author, restricted to users who
+/// are still members of the server.
+///
+/// Thread membership rows can outlive server membership (a ban, kick or leave
+/// does not necessarily remove them), and nothing downstream of the push queue
+/// re-checks membership, so this filter is the gate that keeps removed users
+/// from receiving message previews. A failed thread-member lookup is treated
+/// as no joined members; a failed server-member lookup yields no recipients at
+/// all (fail closed).
+#[cfg_attr(not(feature = "tasks"), allow(dead_code))]
+pub(crate) async fn thread_push_recipients(
+    db: &Database,
+    server_id: &str,
+    thread_id: &str,
+    author_id: &str,
+    mentions: Option<&[String]>,
+) -> Vec<String> {
+    let mut candidates: Vec<String> = db
+        .fetch_thread_members(thread_id)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .map(|member| member.id.user)
+        .filter(|uid| uid.as_str() != author_id)
+        .collect();
+
+    if let Some(mentions) = mentions {
+        for uid in mentions {
+            if uid.as_str() != author_id && !candidates.contains(uid) {
+                candidates.push(uid.clone());
+            }
+        }
+    }
+
+    if candidates.is_empty() {
+        return candidates;
+    }
+
+    let Ok(members) = db.fetch_members(server_id, &candidates).await else {
+        return vec![];
+    };
+
+    let live: HashSet<String> = members.into_iter().map(|member| member.id.user).collect();
+    candidates.retain(|uid| live.contains(uid));
+    candidates
+}
+
 impl SystemMessage {
     pub fn into_message(self, channel: String) -> Message {
         Message {
@@ -1614,5 +1676,275 @@ mod referenced_user_ids_tests {
     #[test]
     fn no_messages_no_ids() {
         assert!(Message::referenced_user_ids(&[]).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use iso8601_timestamp::{Duration, Timestamp};
+
+    use super::thread_push_recipients;
+    use crate::{Channel, Database, Member, MemberCompositeKey};
+
+    const SERVER: &str = "01TPRSERVER000000000000000";
+    const THREAD: &str = "01TPRTHREAD000000000000000";
+    const PARENT: &str = "01TPRPARENT000000000000000";
+    const AUTHOR: &str = "01TPRAUTHOR000000000000000";
+    const M1: &str = "01TPRMEMBER100000000000000";
+    const M2: &str = "01TPRSTALE2000000000000000";
+    const M3: &str = "01TPRMENTION30000000000000";
+    const M4: &str = "01TPRMEMBER400000000000000";
+    const M5: &str = "01TPRTIMEOUT50000000000000";
+
+    #[allow(clippy::disallowed_methods)]
+    async fn insert_thread(db: &Database, id: &str) {
+        db.insert_channel(&Channel::Thread {
+            id: id.to_string(),
+            server: SERVER.to_string(),
+            parent_channel: PARENT.to_string(),
+            name: "thread".to_string(),
+            creator: AUTHOR.to_string(),
+            origin_message_id: None,
+            last_message_id: None,
+            archived: false,
+            archived_timestamp: None,
+            auto_archive_minutes: 0,
+            locked: false,
+            applied_tags: vec![],
+        })
+        .await
+        .expect("insert thread");
+    }
+
+    async fn insert_member(db: &Database, user: &str, timeout: Option<Timestamp>) {
+        db.insert_or_merge_member(&Member {
+            id: MemberCompositeKey {
+                server: SERVER.to_string(),
+                user: user.to_string(),
+            },
+            timeout,
+            ..Default::default()
+        })
+        .await
+        .expect("insert member");
+    }
+
+    async fn join(db: &Database, user: &str) {
+        db.join_thread_if_absent(THREAD, user)
+            .await
+            .expect("join thread");
+    }
+
+    #[tokio::test]
+    async fn thread_push_recipients_excludes_non_members() {
+        database_test!(|db| async move {
+            insert_thread(&db, THREAD).await;
+
+            // Server members: the author, M1 and M4. M2 and M3 are not.
+            for user in [AUTHOR, M1, M4] {
+                insert_member(&db, user, None).await;
+            }
+
+            // Joined rows: the author, M1, and M2's stale row from before
+            // they were removed from the server.
+            for user in [AUTHOR, M1, M2] {
+                join(&db, user).await;
+            }
+
+            // M1 is mentioned as well as joined (no duplicate), the author
+            // mentions themselves (excluded), M3 is a mentioned non-member.
+            let mentions: Vec<String> = [M1, M3, AUTHOR, M4]
+                .iter()
+                .map(|id| id.to_string())
+                .collect();
+
+            let recipients =
+                thread_push_recipients(&db, SERVER, THREAD, AUTHOR, Some(&mentions)).await;
+            assert_eq!(
+                recipients,
+                vec![M1.to_string(), M4.to_string()],
+                "thread push recipients must be the joined and mentioned users who are still server members"
+            );
+
+            // A member in timeout who is removed is only soft-deleted on
+            // MongoDB (`pending_deletion_at`); the Reference driver panics on
+            // that path, so this case runs on MongoDB only.
+            if matches!(db, Database::MongoDb(_)) {
+                insert_member(&db, M5, Some(Timestamp::now_utc() + Duration::minutes(5))).await;
+                join(&db, M5).await;
+
+                let before =
+                    thread_push_recipients(&db, SERVER, THREAD, AUTHOR, Some(&mentions)).await;
+                assert!(
+                    before.iter().any(|id| id == M5),
+                    "precondition: a live member in timeout is a recipient"
+                );
+
+                db.soft_delete_member(&MemberCompositeKey {
+                    server: SERVER.to_string(),
+                    user: M5.to_string(),
+                })
+                .await
+                .expect("soft delete member");
+
+                let after =
+                    thread_push_recipients(&db, SERVER, THREAD, AUTHOR, Some(&mentions)).await;
+                assert_eq!(
+                    after,
+                    vec![M1.to_string(), M4.to_string()],
+                    "a soft-deleted (pending_deletion_at) member must not receive thread push"
+                );
+            }
+        });
+    }
+
+    #[tokio::test]
+    async fn thread_push_recipients_empty_without_rows_or_mentions() {
+        database_test!(|db| async move {
+            insert_thread(&db, THREAD).await;
+            insert_member(&db, AUTHOR, None).await;
+
+            assert!(
+                thread_push_recipients(&db, SERVER, THREAD, AUTHOR, None)
+                    .await
+                    .is_empty(),
+                "no joined rows and no mentions yields no recipients"
+            );
+
+            let self_mention = vec![AUTHOR.to_string()];
+            assert!(
+                thread_push_recipients(&db, SERVER, THREAD, AUTHOR, Some(&self_mention))
+                    .await
+                    .is_empty(),
+                "an author mentioning themselves yields no recipients"
+            );
+        });
+    }
+}
+
+#[cfg(all(test, feature = "tasks"))]
+mod silent_flag_tests {
+    use super::*;
+    use crate::tasks::ack::{self, PushRoute};
+
+    type Queued = (Option<PushNotification>, Message, Vec<String>, bool);
+
+    #[test]
+    fn suppress_notifications_is_mask_one_and_the_rest_are_bit_positions() {
+        // Clients send `flags |= 1` for a silent message and read `flags & 1`.
+        assert!(MessageFlagsValue(1).has(MessageFlags::SuppressNotifications));
+        assert!(!MessageFlagsValue(2).has(MessageFlags::SuppressNotifications));
+
+        let mut flags = MessageFlagsValue(0);
+        flags
+            .set(MessageFlags::SuppressNotifications, true)
+            .set(MessageFlags::MentionsEveryone, true);
+        assert_eq!(flags.0, 1 | 1 << 2);
+        flags.set(MessageFlags::SuppressNotifications, false);
+        assert_eq!(flags.0, 1 << 2);
+
+        assert!(!MessageFlagsValue(1).has(MessageFlags::MentionsEveryone));
+        assert!(MessageFlagsValue(1 << 5).has(MessageFlags::Interaction));
+    }
+
+    /// Send "hello" with request `flags` into a DM through `create_from_api`.
+    /// Returns the stored message and the ack task entries the send queued.
+    #[allow(clippy::disallowed_methods)]
+    async fn send_dm(db: &Database, flags: Option<u32>) -> (Message, Vec<Queued>) {
+        let author = User {
+            id: Ulid::new().to_string(),
+            username: "author".to_string(),
+            discriminator: "0001".to_string(),
+            ..Default::default()
+        };
+        let channel = Channel::DirectMessage {
+            id: Ulid::new().to_string(),
+            active: true,
+            recipients: vec![author.id.clone(), Ulid::new().to_string()],
+            last_message_id: None,
+        };
+        db.insert_channel(&channel).await.unwrap();
+
+        // From JSON, as a request arrives, so new optional fields need no edit here.
+        let data: DataMessageSend =
+            serde_json::from_value(serde_json::json!({ "content": "hello", "flags": flags }))
+                .unwrap();
+        let model_author = author.clone().into_self(true).await;
+        let message = Message::create_from_api(
+            db,
+            None,
+            channel.clone(),
+            data,
+            MessageAuthor::User(&model_author),
+            Some(model_author.clone()),
+            None,
+            author.limits().await,
+            IdempotencyKey::unchecked_from_string(Ulid::new().to_string()),
+            false,
+            false,
+        )
+        .await
+        .unwrap();
+
+        (
+            db.fetch_message(&message.id).await.unwrap(),
+            ack::take_process_messages(channel.id()),
+        )
+    }
+
+    #[tokio::test]
+    #[allow(clippy::disallowed_methods)]
+    async fn silent_send_is_marked_silenced_and_skips_push() {
+        database_test!(|db| async move {
+            let (stored, queued) = send_dm(&db, Some(1)).await;
+            assert_eq!(stored.flags, Some(1));
+            assert!(stored.has_suppressed_notifications());
+
+            // Still queued, so the ack task records the DM unread, but
+            // marked silenced, so it sends no push.
+            let [(push, message, recipients, silenced)] = queued.as_slice() else {
+                panic!("expected one queued ack entry, got {}", queued.len());
+            };
+            assert!(*silenced);
+            assert_eq!(recipients.len(), 1);
+            assert_eq!(
+                ack::push_route(push.is_some(), message, recipients, *silenced),
+                None
+            );
+        });
+    }
+
+    #[tokio::test]
+    #[allow(clippy::disallowed_methods)]
+    async fn plain_send_is_not_silenced_and_pushes() {
+        database_test!(|db| async move {
+            let (stored, queued) = send_dm(&db, None).await;
+            assert!(!stored.has_suppressed_notifications());
+
+            let [(push, message, recipients, silenced)] = queued.as_slice() else {
+                panic!("expected one queued ack entry, got {}", queued.len());
+            };
+            assert!(!*silenced);
+            assert_eq!(
+                ack::push_route(push.is_some(), message, recipients, *silenced),
+                Some(PushRoute {
+                    direct: true,
+                    mass_mention: false
+                })
+            );
+        });
+    }
+
+    #[tokio::test]
+    #[allow(clippy::disallowed_methods)]
+    async fn request_flag_two_is_not_silent() {
+        database_test!(|db| async move {
+            // Bit 1 (value 2) was where the server used to look for
+            // SuppressNotifications. It carries no flag now and is dropped.
+            let (stored, queued) = send_dm(&db, Some(2)).await;
+            assert_eq!(stored.flags, Some(0));
+            assert!(!stored.has_suppressed_notifications());
+            assert!(queued.iter().all(|(_, _, _, silenced)| !silenced));
+        });
     }
 }

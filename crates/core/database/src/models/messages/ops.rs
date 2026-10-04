@@ -109,7 +109,9 @@ pub trait AbstractMessages: Sync + Send {
     /// Delete messages from a channel by their ids and corresponding channel id
     async fn delete_messages(&self, channel: &str, ids: &[String]) -> Result<()>;
 
-    /// Delete all messages from a specific author in a server from a certain ULID onwards
+    /// Delete all messages from a specific author in a server from a certain ULID onwards.
+    /// If the scan of matching messages fails, this returns an error before anything is
+    /// marked or deleted.
     async fn delete_messages_by_author_since(
         &self,
         channels: &[String],
@@ -449,6 +451,199 @@ mod tests {
                 0,
                 "the scan stops after UNREAD_SCAN_WINDOW messages"
             );
+        });
+    }
+
+    /// The ban purge removes only the author's messages in the listed channels
+    /// from `since` onwards, reports them per channel, and marks only their
+    /// attachments deleted.
+    #[tokio::test]
+    async fn delete_messages_by_author_since_scopes_and_marks_attachments() {
+        database_test!(|db| async move {
+            use revolt_result::ErrorType;
+            use std::collections::HashMap;
+            use std::time::{Duration, SystemTime};
+
+            let author = "01PURGEAUTHOR0000000000000";
+            let other = "01OTHERAUTHOR0000000000000";
+            let chan_a = "01CHANPURGE0000000000000001";
+            let chan_b = "01CHANPURGE0000000000000002";
+            let chan_c = "01CHANPURGE0000000000000003";
+            // Hits sit at 2_000 ms or later and the early control at 500 ms,
+            // never at 1_000 ms: `since` gets random bits on its way to a ULID.
+            let since = SystemTime::UNIX_EPOCH + Duration::from_secs(1);
+
+            let mk = |ms: u64, rand: u128, chan: &str, by: &str| Message {
+                id: ulid::Ulid::from_parts(ms, rand).to_string(),
+                channel: chan.to_string(),
+                author: by.to_string(),
+                content: Some("purge me".to_string()),
+                ..Default::default()
+            };
+
+            let hit_file = attachment_file(7_100_001);
+            let early_file = attachment_file(7_100_002);
+            db.insert_attachment(&hit_file).await.unwrap();
+            db.insert_attachment(&early_file).await.unwrap();
+
+            let hit_a1 = Message {
+                attachments: Some(vec![hit_file.clone()]),
+                ..mk(2_000, 1, chan_a, author)
+            };
+            let hit_a2 = mk(3_000, 2, chan_a, author);
+            let hit_b = mk(2_500, 3, chan_b, author);
+            // Before `since`, by someone else, and in a channel not passed in.
+            let early = Message {
+                attachments: Some(vec![early_file.clone()]),
+                ..mk(500, 4, chan_a, author)
+            };
+            let other_author = mk(2_000, 5, chan_a, other);
+            let unlisted = mk(2_000, 6, chan_c, author);
+
+            let hits = [&hit_a1, &hit_a2, &hit_b];
+            let controls = [&early, &other_author, &unlisted];
+            for message in hits.iter().chain(controls.iter()) {
+                db.insert_message(message).await.unwrap();
+            }
+
+            let listed = [chan_a.to_string(), chan_b.to_string()];
+            let mut deleted = db
+                .delete_messages_by_author_since(&listed, author, since)
+                .await
+                .unwrap();
+            // Neither driver promises an order within a channel.
+            for ids in deleted.values_mut() {
+                ids.sort();
+            }
+            let mut in_a = vec![hit_a1.id.clone(), hit_a2.id.clone()];
+            in_a.sort();
+            let expected = HashMap::from([
+                (chan_a.to_string(), in_a),
+                (chan_b.to_string(), vec![hit_b.id.clone()]),
+            ]);
+            assert_eq!(deleted, expected);
+
+            for hit in hits {
+                let fetched = db.fetch_message(&hit.id).await;
+                assert!(
+                    matches!(&fetched, Err(e) if matches!(e.error_type, ErrorType::NotFound)),
+                    "hit {} survived the purge: {fetched:?}",
+                    hit.id
+                );
+            }
+            for control in controls {
+                assert!(
+                    db.fetch_message(&control.id).await.is_ok(),
+                    "control {} was purged",
+                    control.id
+                );
+            }
+
+            let marked = db
+                .fetch_attachment("attachments", &hit_file.id)
+                .await
+                .unwrap();
+            assert_eq!(marked.deleted, Some(true), "the hit's attachment is marked");
+            let kept = db
+                .fetch_attachment("attachments", &early_file.id)
+                .await
+                .unwrap();
+            assert_eq!(kept.deleted, None, "a surviving message's attachment stays");
+        });
+    }
+
+    /// A row the purge cannot decode fails the whole call before any write:
+    /// nothing is marked or deleted, so the moderator can retry. Mongo only;
+    /// the Reference driver has no cursor to fail, so there it returns early.
+    #[cfg(feature = "mongodb")]
+    #[tokio::test]
+    async fn delete_messages_by_author_since_fails_closed_on_undecodable_row() {
+        database_test!(|db| async move {
+            let crate::Database::MongoDb(mongo) = &db else {
+                return;
+            };
+            use bson::{doc, Document};
+            use revolt_result::ErrorType;
+            use std::collections::HashMap;
+            use std::time::{Duration, SystemTime};
+
+            let author = "01PURGEAUTHOR0000000000000";
+            let good_chan = "01CHANPURGE0000000000000004";
+            let bad_chan = "01CHANPURGE0000000000000005";
+            let since = SystemTime::UNIX_EPOCH + Duration::from_secs(1);
+            let messages = mongo.col::<Document>("messages");
+
+            let file = attachment_file(7_200_001);
+            db.insert_attachment(&file).await.unwrap();
+            let good = Message {
+                id: ulid::Ulid::from_parts(2_000, 1).to_string(),
+                channel: good_chan.to_string(),
+                author: author.to_string(),
+                content: Some("purge me".to_string()),
+                attachments: Some(vec![file.clone()]),
+                ..Default::default()
+            };
+            db.insert_message(&good).await.unwrap();
+
+            // An Int32 attachment id passes the pipeline (`$setUnion` keeps
+            // it) but cannot decode into `AggregatedChannel.attachment_ids:
+            // Vec<String>`, so its row comes off the cursor as an Err. It sits
+            // in a second channel because the pipeline emits one row per
+            // channel: in the good message's channel it would poison that row
+            // too, the unfixed code would mark nothing, and the "not marked"
+            // check below would pass vacuously. Never read it back through
+            // `fetch_message` or `fetch_messages`: their typed reads unwrap in
+            // debug and would panic on it.
+            let bad_id = ulid::Ulid::from_parts(3_000, 2).to_string();
+            messages
+                .insert_one(doc! {
+                    "_id": bad_id.as_str(),
+                    "channel": bad_chan,
+                    "author": author,
+                    "attachments": [{ "_id": 5_i32, "tag": "attachments" }]
+                })
+                .await
+                .expect("insert the poisoned message");
+
+            let listed = [good_chan.to_string(), bad_chan.to_string()];
+            let err = db
+                .delete_messages_by_author_since(&listed, author, since)
+                .await
+                .expect_err("an undecodable row must fail the purge, not be skipped");
+            assert!(
+                matches!(
+                    &err.error_type,
+                    ErrorType::DatabaseError { operation, collection }
+                        if operation == "aggregate" && collection == "messages"
+                ),
+                "{err:?}"
+            );
+
+            // Counted raw: a typed read would trip over the poisoned doc.
+            let left = messages
+                .count_documents(doc! { "_id": { "$in": [good.id.as_str(), bad_id.as_str()] } })
+                .await
+                .unwrap();
+            assert_eq!(left, 2, "a failed purge must delete nothing");
+            let unmarked = db.fetch_attachment("attachments", &file.id).await.unwrap();
+            assert_eq!(unmarked.deleted, None, "a failed purge must mark nothing");
+
+            // With the poisoned doc gone the same call goes through, which
+            // pins the error on that row.
+            messages
+                .delete_one(doc! { "_id": bad_id.as_str() })
+                .await
+                .unwrap();
+            let deleted = db
+                .delete_messages_by_author_since(&listed, author, since)
+                .await
+                .expect("the purge succeeds once the poisoned doc is gone");
+            assert_eq!(
+                deleted,
+                HashMap::from([(good_chan.to_string(), vec![good.id.clone()])])
+            );
+            let marked = db.fetch_attachment("attachments", &file.id).await.unwrap();
+            assert_eq!(marked.deleted, Some(true), "the good attachment is marked");
         });
     }
 

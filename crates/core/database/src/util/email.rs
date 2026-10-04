@@ -282,3 +282,38 @@ pub fn validate_email(email: &str) -> Result<()> {
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::render_template;
+    use serde_json::json;
+
+    const SUSPENSION: &str = include_str!("../../templates/suspension.whitelabel.txt");
+
+    #[test]
+    fn suspension_email_states_duration_and_how_to_appeal() {
+        let text = render_template(
+            SUSPENSION,
+            &json!({ "email": "a@example.com", "list": "Spam", "duration": 7 }),
+        )
+        .unwrap();
+
+        assert!(text.contains("again in 7 days."));
+        assert!(!text.contains("no end date"));
+        assert!(text.contains("https://sloga.gg/legal/guidelines.html"));
+        assert!(text.contains("support@sloga.gg"));
+        assert!(text.contains("within 72 hours"));
+    }
+
+    #[test]
+    fn suspension_email_without_duration_has_no_end_date() {
+        let text = render_template(
+            SUSPENSION,
+            &json!({ "email": "a@example.com", "list": "Spam", "duration": null }),
+        )
+        .unwrap();
+
+        assert!(text.contains("This suspension has no end date."));
+        assert!(!text.contains("again in"));
+    }
+}

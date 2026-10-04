@@ -1,7 +1,7 @@
 use super::AbstractChannels;
 use crate::{AbstractServers, Channel, FieldsChannel, IntoDocumentPath, MongoDb, PartialChannel, util::ChunkedDatabaseGenerator};
 use bson::{Bson, Document};
-use futures::StreamExt;
+use futures::{StreamExt, TryStreamExt};
 use mongodb::options::ReadConcern;
 use revolt_permissions::OverrideField;
 use revolt_result::Result;
@@ -53,6 +53,37 @@ impl AbstractChannels for MongoDb {
                 "parent_channel": parent_id
             }
         )
+    }
+
+    /// Fetch the ids of every thread (incl. forum posts, archived and locked ones) whose parent is in `parent_ids`
+    async fn fetch_thread_ids_by_parents(&self, parent_ids: &[String]) -> Result<Vec<String>> {
+        if parent_ids.is_empty() {
+            return Ok(vec![]);
+        }
+
+        #[derive(serde::Deserialize)]
+        struct ThreadId {
+            #[serde(rename = "_id")]
+            id: String,
+        }
+
+        // A cursor or decode error fails the whole lookup: callers purge by these
+        // ids, and a silently short list would leave a partial purge reported as done.
+        Ok(self
+            .col::<ThreadId>(COL)
+            .find(doc! {
+                "channel_type": "Thread",
+                "parent_channel": { "$in": parent_ids }
+            })
+            .projection(doc! { "_id": 1_i32 })
+            .await
+            .map_err(|_| create_database_error!("find", "channels"))?
+            .try_collect::<Vec<ThreadId>>()
+            .await
+            .map_err(|_| create_database_error!("find", "channels"))?
+            .into_iter()
+            .map(|thread| thread.id)
+            .collect())
     }
 
     /// Fetch every non-archived thread (used by the auto-archive daemon)

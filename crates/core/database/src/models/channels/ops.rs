@@ -19,6 +19,9 @@ pub trait AbstractChannels: Sync + Send {
     /// Fetch all threads hanging off a given parent channel
     async fn fetch_threads_by_parent(&self, parent_id: &str) -> Result<Vec<Channel>>;
 
+    /// Fetch the ids of every thread (incl. forum posts, archived and locked ones) whose parent is in `parent_ids`
+    async fn fetch_thread_ids_by_parents(&self, parent_ids: &[String]) -> Result<Vec<String>>;
+
     /// Fetch every non-archived thread that can auto-archive; excludes threads set to never auto-archive (`auto_archive_minutes == 0`) (used by the auto-archive daemon)
     async fn fetch_active_threads(&self) -> Result<Vec<Channel>>;
 
@@ -251,6 +254,114 @@ mod tests {
                 .set_last_message_id_if_newer(&saved_id, &id1, false)
                 .await
                 .expect("Saved Messages is Ok(false), not an error"));
+        });
+    }
+
+    fn tidbp_text_channel(id: &str) -> Channel {
+        Channel::TextChannel {
+            id: id.to_string(),
+            server: "01TIDBPSERVER".to_string(),
+            name: "text".to_string(),
+            description: None,
+            icon: None,
+            last_message_id: None,
+            default_permissions: None,
+            role_permissions: Default::default(),
+            nsfw: false,
+            spoiler: false,
+            voice: None,
+            slowmode: None,
+            announcement: None,
+        }
+    }
+
+    fn tidbp_thread(id: &str, parent: &str, archived: bool, locked: bool) -> Channel {
+        Channel::Thread {
+            id: id.to_string(),
+            server: "01TIDBPSERVER".to_string(),
+            parent_channel: parent.to_string(),
+            name: "thread".to_string(),
+            creator: "01TIDBPCREATOR".to_string(),
+            origin_message_id: None,
+            last_message_id: None,
+            archived,
+            archived_timestamp: None,
+            auto_archive_minutes: Channel::default_auto_archive_minutes(),
+            locked,
+            applied_tags: vec![],
+        }
+    }
+
+    #[tokio::test]
+    async fn thread_ids_by_parents_includes_archived_locked_and_forum_posts() {
+        database_test!(|db| async move {
+            let (p1, p2, p3) = ("01TIDBPPARENT1", "01TIDBPPARENT2", "01TIDBPPARENT3");
+            let (t1, t2, t3, t4) = (
+                "01TIDBPTHREAD1",
+                "01TIDBPTHREAD2",
+                "01TIDBPTHREAD3",
+                "01TIDBPTHREAD4",
+            );
+
+            db.insert_channel(&tidbp_text_channel(p1)).await.unwrap();
+            db.insert_channel(&Channel::Forum {
+                id: p2.to_string(),
+                server: "01TIDBPSERVER".to_string(),
+                name: "forum".to_string(),
+                description: None,
+                icon: None,
+                last_message_id: None,
+                default_permissions: None,
+                role_permissions: Default::default(),
+                nsfw: false,
+                spoiler: false,
+                tags: vec![],
+                require_tag: false,
+                default_sort: Default::default(),
+                force_sort: false,
+                default_layout: Default::default(),
+                default_auto_archive_minutes: Channel::default_forum_auto_archive_minutes(),
+            })
+            .await
+            .unwrap();
+            db.insert_channel(&tidbp_text_channel(p3)).await.unwrap();
+
+            db.insert_channel(&tidbp_thread(t1, p1, false, false))
+                .await
+                .unwrap();
+            db.insert_channel(&tidbp_thread(t2, p1, true, true))
+                .await
+                .unwrap();
+            db.insert_channel(&tidbp_thread(t3, p2, false, false))
+                .await
+                .unwrap();
+            db.insert_channel(&tidbp_thread(t4, p3, false, false))
+                .await
+                .unwrap();
+
+            // A dangling parent id must neither error nor match anything.
+            let mut got = db
+                .fetch_thread_ids_by_parents(&[
+                    p1.to_string(),
+                    p2.to_string(),
+                    "01TIDBPDANGLINGPARENT".to_string(),
+                ])
+                .await
+                .expect("thread id lookup must succeed");
+            got.sort();
+            assert_eq!(
+                got,
+                vec![t1.to_string(), t2.to_string(), t3.to_string()],
+                "expected every thread under P1 and P2, archived/locked and forum posts included, and nothing under P3"
+            );
+
+            assert!(
+                db.fetch_thread_ids_by_parents(&[])
+                    .await
+                    .expect("an empty parent list is Ok, not an error")
+                    .is_empty(),
+                "an empty parent list must return no ids"
+            );
         });
     }
 }
