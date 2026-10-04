@@ -13,9 +13,30 @@ use crate::{
     MessageTimePeriod, MongoDb, PartialMessage,
 };
 
-use super::{AbstractMessages, UnreadSummary, UNREAD_SCAN_WINDOW};
+use super::{AbstractMessages, ThreadStats, UnreadSummary, UNREAD_SCAN_WINDOW};
 
 static COL: &str = "messages";
+
+/// The `fetch_thread_stats` aggregation, kept apart so a test can `explain()`
+/// exactly what runs.
+///
+/// Only `channel` and `_id` survive the match, so the `channel_id_compound`
+/// `{channel: 1, _id: 1}` index covers the whole pipeline: an IXSCAN with no
+/// FETCH, however long the threads are. Reading any other field (`system`
+/// included) would fetch every message of every thread on the page.
+fn thread_stats_pipeline(channel_ids: &[String]) -> Vec<Document> {
+    vec![
+        doc! { "$match": { "channel": { "$in": channel_ids } } },
+        doc! { "$project": { "channel": 1_i32, "_id": 1_i32 } },
+        doc! { "$group": {
+            "_id": "$channel",
+            // The starter's id equals the thread id; every other message is a reply.
+            "replies": { "$sum": { "$cond": [ { "$ne": [ "$_id", "$channel" ] }, 1_i32, 0_i32 ] } },
+            // ULIDs sort by creation time, so the greatest id is the newest message.
+            "last": { "$max": "$_id" },
+        } },
+    ]
+}
 
 #[async_trait]
 impl AbstractMessages for MongoDb {
@@ -327,6 +348,70 @@ impl AbstractMessages for MongoDb {
         })
     }
 
+    /// Reply counts and newest message ids for the given threads
+    ///
+    /// One index-covered aggregation (see `thread_stats_pipeline`). System
+    /// messages are deliberately NOT filtered out: telling them apart means
+    /// reading `system`, which forces a document fetch and turns every forum
+    /// page load into a scan of whole threads. They are rare in threads and
+    /// count as activity (see [`ThreadStats`]).
+    ///
+    /// Returns one entry per distinct requested id, in first-seen order, like
+    /// the reference driver; an id with no messages reports `0` / `None`.
+    async fn fetch_thread_stats(&self, channel_ids: &[String]) -> Result<Vec<ThreadStats>> {
+        let mut stats: Vec<ThreadStats> = Vec::with_capacity(channel_ids.len());
+        let mut slots: HashMap<&str, usize> = HashMap::with_capacity(channel_ids.len());
+        for id in channel_ids {
+            if !slots.contains_key(id.as_str()) {
+                slots.insert(id.as_str(), stats.len());
+                stats.push(ThreadStats {
+                    channel: id.clone(),
+                    ..Default::default()
+                });
+            }
+        }
+
+        if stats.is_empty() {
+            return Ok(stats);
+        }
+
+        let mut cursor = self
+            .col::<Document>(COL)
+            .aggregate(thread_stats_pipeline(channel_ids))
+            .await
+            .map_err(|_| create_database_error!("aggregate", COL))?;
+
+        // A thread with no messages emits no group at all; its entry keeps
+        // the defaults. Anything malformed fails the call rather than
+        // reporting a plausible-looking zero.
+        while let Some(doc) = cursor.next().await {
+            let doc = doc.map_err(|_| create_database_error!("aggregate", COL))?;
+
+            let channel = doc
+                .get_str("_id")
+                .map_err(|_| create_database_error!("aggregate", COL))?;
+            let Some(&slot) = slots.get(channel) else {
+                continue;
+            };
+
+            // `$sum` is Int32 at any realistic size and widens to Int64 past
+            // it; read either, then saturate into the u32.
+            let replies = doc
+                .get_i32("replies")
+                .map(i64::from)
+                .or_else(|_| doc.get_i64("replies"))
+                .map_err(|_| create_database_error!("aggregate", COL))?;
+            let last = doc
+                .get_str("last")
+                .map_err(|_| create_database_error!("aggregate", COL))?;
+
+            stats[slot].replies = u32::try_from(replies.max(0)).unwrap_or(u32::MAX);
+            stats[slot].last_message_id = Some(last.to_owned());
+        }
+
+        Ok(stats)
+    }
+
     /// Add a new reaction to a message
     async fn add_reaction(&self, id: &str, emoji: &str, user: &str) -> Result<()> {
         self.col::<Document>(COL)
@@ -508,7 +593,8 @@ impl AbstractMessages for MongoDb {
     async fn delete_messages_by_user(&self, user_id: &str) -> Result<()> {
         self.delete_bulk_messages(doc! {
             "author": user_id,
-        }).await
+        })
+        .await
     }
 
     async fn remove_message_attachment(&self, message_id: &str, file_id: &str) -> Result<()> {
@@ -599,5 +685,230 @@ impl MongoDb {
             .await
             .map(|_| ())
             .map_err(|_| create_database_error!("delete_many", COL))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use bson::{doc, Bson};
+
+    use crate::{Message, SystemMessage, ThreadStats};
+
+    use super::thread_stats_pipeline;
+
+    const AUTHOR: &str = "01AUTHOR0000000000000000000";
+
+    /// `rand` keeps ids unique when two messages share a millisecond.
+    fn ulid(ms: u64, rand: u128) -> String {
+        ulid::Ulid::from_parts(ms, rand).to_string()
+    }
+
+    fn message(id: &str, channel: &str) -> Message {
+        Message {
+            id: id.to_string(),
+            channel: channel.to_string(),
+            author: AUTHOR.to_string(),
+            content: Some("hello".to_string()),
+            ..Default::default()
+        }
+    }
+
+    /// Exactly one entry per requested thread, wherever it sits in the result.
+    fn entry<'a>(stats: &'a [ThreadStats], channel: &str) -> &'a ThreadStats {
+        let found: Vec<&ThreadStats> = stats.iter().filter(|s| s.channel == channel).collect();
+        assert_eq!(found.len(), 1, "one entry for {channel} in {stats:?}");
+        found[0]
+    }
+
+    #[tokio::test]
+    async fn thread_stats_count_replies_and_track_the_newest_message() {
+        database_test!(|db| async move {
+            // A post's starter shares the post's id.
+            let starter_only = ulid(1_000, 1);
+            db.insert_message(&message(&starter_only, &starter_only))
+                .await
+                .unwrap();
+
+            let busy = ulid(1_000, 2);
+            db.insert_message(&message(&busy, &busy)).await.unwrap();
+            let replies = [ulid(2_000, 1), ulid(3_000, 1), ulid(4_000, 1)];
+            for reply in &replies {
+                db.insert_message(&message(reply, &busy)).await.unwrap();
+            }
+
+            // Newer than everything above, but in a channel nobody asked about.
+            db.insert_message(&message(&ulid(9_000, 1), &ulid(1_000, 9)))
+                .await
+                .unwrap();
+
+            let unknown = ulid(1_000, 3);
+
+            assert!(db.fetch_thread_stats(&[]).await.unwrap().is_empty());
+
+            // Two threads in one call, plus an id with no messages and a repeat.
+            let stats = db
+                .fetch_thread_stats(&[
+                    starter_only.clone(),
+                    busy.clone(),
+                    unknown.clone(),
+                    busy.clone(),
+                ])
+                .await
+                .unwrap();
+            assert_eq!(stats.len(), 3, "one entry per distinct id: {stats:?}");
+
+            let only = entry(&stats, &starter_only);
+            assert_eq!(only.replies, 0, "the starter is not a reply");
+            assert_eq!(only.last_message_id.as_deref(), Some(starter_only.as_str()));
+
+            let busy_stats = entry(&stats, &busy);
+            assert_eq!(busy_stats.replies, 3);
+            assert_eq!(
+                busy_stats.last_message_id.as_deref(),
+                Some(replies[2].as_str())
+            );
+
+            let missing = entry(&stats, &unknown);
+            assert_eq!(missing.replies, 0);
+            assert_eq!(missing.last_message_id, None);
+        });
+    }
+
+    #[tokio::test]
+    async fn thread_stats_follow_deletes_and_count_system_messages() {
+        database_test!(|db| async move {
+            let thread = ulid(1_000, 1);
+            db.insert_message(&message(&thread, &thread)).await.unwrap();
+            let replies = [ulid(2_000, 1), ulid(3_000, 1), ulid(4_000, 1)];
+            for reply in &replies {
+                db.insert_message(&message(reply, &thread)).await.unwrap();
+            }
+
+            let ids = [thread.clone()];
+            let stats = db.fetch_thread_stats(&ids).await.unwrap();
+            assert_eq!(stats[0].replies, 3);
+            assert_eq!(
+                stats[0].last_message_id.as_deref(),
+                Some(replies[2].as_str())
+            );
+
+            // Deleting the newest reply falls back to the one before it.
+            db.delete_message(&replies[2]).await.unwrap();
+            let stats = db.fetch_thread_stats(&ids).await.unwrap();
+            assert_eq!(stats[0].replies, 2);
+            assert_eq!(
+                stats[0].last_message_id.as_deref(),
+                Some(replies[1].as_str())
+            );
+
+            // System messages count as activity, by design: filtering them
+            // out would cost the index-covered query.
+            let system = ulid(5_000, 1);
+            db.insert_message(&Message {
+                content: None,
+                system: Some(SystemMessage::Text {
+                    content: "pinned a message".to_string(),
+                }),
+                ..message(&system, &thread)
+            })
+            .await
+            .unwrap();
+            let stats = db.fetch_thread_stats(&ids).await.unwrap();
+            assert_eq!(stats[0].replies, 3);
+            assert_eq!(stats[0].last_message_id.as_deref(), Some(system.as_str()));
+
+            // The starter was never counted, so losing it leaves the count alone.
+            db.delete_message(&thread).await.unwrap();
+            let stats = db.fetch_thread_stats(&ids).await.unwrap();
+            assert_eq!(stats[0].replies, 3);
+            assert_eq!(stats[0].last_message_id.as_deref(), Some(system.as_str()));
+        });
+    }
+
+    /// Every `stage` (with its `indexName`) inside any `winningPlan`.
+    fn winning_stages(value: &Bson, in_winner: bool, out: &mut Vec<(String, Option<String>)>) {
+        match value {
+            Bson::Document(doc) => {
+                if in_winner {
+                    if let Ok(stage) = doc.get_str("stage") {
+                        let index = doc.get_str("indexName").ok().map(str::to_owned);
+                        out.push((stage.to_owned(), index));
+                    }
+                }
+                for (key, child) in doc {
+                    winning_stages(child, in_winner || key == "winningPlan", out);
+                }
+            }
+            Bson::Array(items) => {
+                for item in items {
+                    winning_stages(item, in_winner, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// The stats query must stay covered by `channel_id_compound`: an index
+    /// scan that never fetches a document. Mongo-only; a no-op under REFERENCE.
+    #[tokio::test]
+    async fn thread_stats_pipeline_is_covered_by_the_channel_id_index() {
+        database_test!(|db| async move {
+            let crate::Database::MongoDb(mongo) = &db else {
+                return;
+            };
+
+            // `database_test!` hands over an un-migrated database. These two
+            // MUST match the `messages` indexes in `init.rs`; the pinned one
+            // also leads with `channel`, so the planner has a real choice.
+            mongo
+                .db()
+                .run_command(doc! {
+                    "createIndexes": "messages",
+                    "indexes": [
+                        { "key": { "channel": 1_i32, "_id": 1_i32 }, "name": "channel_id_compound" },
+                        { "key": { "channel": 1_i32, "pinned": 1_i32 }, "name": "channel_pinned_compound" },
+                    ]
+                })
+                .await
+                .expect("failed to create messages indexes");
+
+            let threads = [ulid(1_000, 1), ulid(1_000, 2)];
+            for (n, thread) in threads.iter().enumerate() {
+                db.insert_message(&message(thread, thread)).await.unwrap();
+                for ms in 0..10_u64 {
+                    db.insert_message(&message(&ulid(2_000 + ms, n as u128), thread))
+                        .await
+                        .unwrap();
+                }
+            }
+
+            let explain = mongo
+                .db()
+                .run_command(doc! {
+                    "explain": {
+                        "aggregate": "messages",
+                        "pipeline": thread_stats_pipeline(&threads),
+                        "cursor": {},
+                    },
+                    "verbosity": "queryPlanner",
+                })
+                .await
+                .expect("explain failed");
+
+            let mut stages = Vec::new();
+            winning_stages(&Bson::Document(explain.clone()), false, &mut stages);
+
+            assert!(
+                stages.iter().any(|(stage, index)| stage == "IXSCAN"
+                    && index.as_deref() == Some("channel_id_compound")),
+                "expected an IXSCAN on channel_id_compound: {stages:?}\n{explain:?}"
+            );
+            assert!(
+                !stages
+                    .iter()
+                    .any(|(stage, _)| stage == "FETCH" || stage == "COLLSCAN"),
+                "the stats query must not touch documents: {stages:?}\n{explain:?}"
+            );
+        });
     }
 }

@@ -487,8 +487,12 @@ mod test {
             assert_eq!(stored_archive_minutes(&harness, &id).await, minutes);
         }
 
-        // Off-allowlist durations are rejected.
-        let response = post_forum_post(&harness, &session.token, &forum, "bad", Some(30)).await;
+        // Anything past the maximum is rejected: the accepted set is 0 (Never)
+        // or 1 up to `Channel::MAX_AUTO_ARCHIVE_MINUTES` (two years). The old
+        // seven-value allow-list is gone, so a gap value such as 30 is legal.
+        let too_long = Channel::MAX_AUTO_ARCHIVE_MINUTES + 1;
+        let response =
+            post_forum_post(&harness, &session.token, &forum, "bad", Some(too_long)).await;
         assert_eq!(response.status(), Status::BadRequest);
         let error: serde_json::Value = response.into_json().await.expect("error body");
         assert_eq!(error["type"], "InvalidProperty");

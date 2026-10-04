@@ -326,6 +326,7 @@ mod tests {
             require_tag: false,
             default_sort: Default::default(),
             force_sort: false,
+            default_layout: Default::default(),
             default_auto_archive_minutes: Channel::default_forum_auto_archive_minutes(),
         }
     }

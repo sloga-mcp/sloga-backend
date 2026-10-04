@@ -266,6 +266,10 @@ auto_derived!(
                 serde(skip_serializing_if = "crate::if_false", default)
             )]
             force_sort: bool,
+            /// How the forum lists its posts by default; readers can override
+            /// it for themselves
+            #[cfg_attr(feature = "serde", serde(default))]
+            default_layout: ForumLayout,
             /// Default auto-archive duration for new posts in this forum, in
             /// minutes (0 = Never, otherwise 1 up to two years; see
             /// `Channel::is_valid_auto_archive_minutes`)
@@ -304,6 +308,18 @@ auto_derived!(
         CreationDate,
         /// By post title, 0-9 then A-Z
         Alphabetical,
+    }
+
+    /// How a forum's post browse view lists its posts
+    #[derive(Default)]
+    pub enum ForumLayout {
+        /// Preview cards (title, starter excerpt, tags)
+        #[default]
+        Modern,
+        /// One row per post: author, title, tags, last reply, reply count
+        Classic,
+        /// Table with topic, replies and last post columns
+        ClassicPlus,
     }
 
     /// Voice information for a channel
@@ -363,6 +379,8 @@ auto_derived!(
         pub default_sort: Option<ForumSortOrder>,
         #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
         pub force_sort: Option<bool>,
+        #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+        pub default_layout: Option<ForumLayout>,
         #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
         pub auto_archive_minutes: Option<u32>,
         #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
@@ -438,6 +456,10 @@ auto_derived!(
         /// the operator wants one listing everybody sees, not a default each
         /// member can sort away from.
         pub force_sort: Option<bool>,
+
+        /// Default layout of a forum's post browse view (forum channels
+        /// only); readers can override it for themselves
+        pub default_layout: Option<ForumLayout>,
 
         /// Minutes of inactivity after which this thread / forum post
         /// auto-archives (threads and forum posts only;
@@ -559,6 +581,41 @@ auto_derived!(
         /// `include_starters` was set; each message's id equals its post's id)
         #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
         pub starters: Option<Vec<super::Message>>,
+        /// Reply count and latest message id for each of this page's posts
+        /// (present only when requested with `include_stats` and the caller
+        /// can read message history)
+        #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+        pub stats: Option<Vec<ForumPostStats>>,
+        /// Latest message of each of this page's posts (present only when
+        /// requested with `include_stats` and the caller can read message
+        /// history)
+        #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+        pub last_messages: Option<Vec<super::Message>>,
+        /// Users referenced by this page (present only when requested with
+        /// `include_users`: the creators of every returned post, plus, with
+        /// message history, the authors of the starters and last messages)
+        #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+        pub users: Option<Vec<super::User>>,
+        /// Server members referenced by this page (present only when
+        /// requested with `include_users`: the creators of every returned
+        /// post, plus, with message history, the authors of the starters and
+        /// last messages)
+        #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+        pub members: Option<Vec<super::Member>>,
+    }
+
+    /// Activity summary of a single forum post
+    pub struct ForumPostStats {
+        /// Id of the post
+        #[cfg_attr(feature = "serde", serde(rename = "_id"))]
+        pub id: String,
+        /// Number of replies in the post; replies exclude the post's
+        /// starter message (system messages count as replies)
+        pub replies: u32,
+        /// Id of the post's latest message (the starter when it has no
+        /// replies; absent when the post has no messages at all)
+        #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+        pub last_message_id: Option<String>,
     }
 
     /// Create new server channel

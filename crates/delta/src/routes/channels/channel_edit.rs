@@ -70,6 +70,7 @@ pub async fn edit(
         && data.require_tag.is_none()
         && data.default_sort.is_none()
         && data.force_sort.is_none()
+        && data.default_layout.is_none()
         && data.default_auto_archive_minutes.is_none()
         && data.auto_archive_minutes.is_none()
         && data.applied_tags.is_none()
@@ -93,7 +94,8 @@ pub async fn edit(
     if (data.tags.is_some()
         || data.require_tag.is_some()
         || data.default_sort.is_some()
-        || data.force_sort.is_some())
+        || data.force_sort.is_some()
+        || data.default_layout.is_some())
         && !matches!(channel, Channel::Forum { .. })
     {
         return Err(create_error!(InvalidOperation));
@@ -479,6 +481,7 @@ pub async fn edit(
             require_tag,
             default_sort,
             force_sort,
+            default_layout,
             default_auto_archive_minutes,
             ..
         } => {
@@ -547,6 +550,11 @@ pub async fn edit(
             if let Some(new_force_sort) = data.force_sort {
                 *force_sort = new_force_sort;
                 partial.force_sort = Some(new_force_sort);
+            }
+
+            if let Some(new_default_layout) = data.default_layout {
+                *default_layout = new_default_layout.clone().into();
+                partial.default_layout = Some(new_default_layout.into());
             }
 
             if let Some(new_default_auto_archive_minutes) = data.default_auto_archive_minutes {
@@ -1063,7 +1071,10 @@ mod tests {
         );
     }
 
-    /// (e): values outside the allowlist are rejected before any write.
+    /// (e): values outside the accepted set (0 = never, or 1 up to
+    /// `Channel::MAX_AUTO_ARCHIVE_MINUTES`) are rejected before any write.
+    /// The probe is one minute past the maximum; the old seven-value
+    /// allow-list is gone, so a gap value such as 30 is now legal.
     #[test]
     fn auto_archive_outside_allowlist_is_rejected() {
         crate::util::test::rt().block_on(auto_archive_outside_allowlist_is_rejected_case())
@@ -1072,12 +1083,13 @@ mod tests {
     async fn auto_archive_outside_allowlist_is_rejected_case() {
         let fx = forum_fixture().await;
         let before = stored_post_minutes(&fx.harness, fx.post.id()).await;
+        let too_long = revolt_database::Channel::MAX_AUTO_ARCHIVE_MINUTES + 1;
 
         let response = patch(
             &fx.harness,
             &fx.creator_session,
             fx.post.id(),
-            json!({ "auto_archive_minutes": 30 }),
+            json!({ "auto_archive_minutes": too_long }),
         )
         .await;
         assert_error(response, Status::BadRequest, "InvalidProperty").await;
@@ -1088,7 +1100,7 @@ mod tests {
             &fx.harness,
             &fx.owner_session,
             fx.forum.id(),
-            json!({ "default_auto_archive_minutes": 30 }),
+            json!({ "default_auto_archive_minutes": too_long }),
         )
         .await;
         assert_error(response, Status::BadRequest, "InvalidProperty").await;
@@ -1192,6 +1204,156 @@ mod tests {
         .await;
         assert_eq!(response.status(), Status::Ok);
         assert_eq!(stored_post_minutes(&fx.harness, fx.post.id()).await, 43200);
+    }
+
+    // ---- Forum default layout ---------------------------------------------
+
+    async fn stored_forum_layout(harness: &TestHarness, id: &str) -> revolt_database::ForumLayout {
+        match harness.db.fetch_channel(id).await.expect("forum") {
+            revolt_database::Channel::Forum { default_layout, .. } => default_layout,
+            other => panic!("expected a forum, got {:?}", other),
+        }
+    }
+
+    /// A member holding ManageChannel (not the owner, who would hold
+    /// GrantAllSafe) sets the forum's default layout: it persists and fans
+    /// out in the ChannelUpdate partial. Control: the Forum arm without the
+    /// `partial.default_layout` write echoes the layout but stores nothing.
+    #[test]
+    fn manager_sets_forum_default_layout() {
+        crate::util::test::rt().block_on(manager_sets_forum_default_layout_case())
+    }
+
+    async fn manager_sets_forum_default_layout_case() {
+        let mut fx = forum_fixture().await;
+        grant_manage_channel(&fx, &fx.outsider_session.user_id).await;
+        assert_eq!(
+            stored_forum_layout(&fx.harness, fx.forum.id()).await,
+            revolt_database::ForumLayout::Modern,
+            "fixture must start on Modern"
+        );
+
+        let response = patch(
+            &fx.harness,
+            &fx.outsider_session,
+            fx.forum.id(),
+            json!({ "default_layout": "ClassicPlus" }),
+        )
+        .await;
+        assert_eq!(response.status(), Status::Ok);
+        let edited = response.into_json::<v0::Channel>().await.expect("channel");
+        assert!(matches!(
+            edited,
+            v0::Channel::Forum {
+                default_layout: v0::ForumLayout::ClassicPlus,
+                ..
+            }
+        ));
+
+        assert_eq!(
+            stored_forum_layout(&fx.harness, fx.forum.id()).await,
+            revolt_database::ForumLayout::ClassicPlus
+        );
+
+        let forum_id = fx.forum.id().to_string();
+        fx.harness
+            .wait_for_event(&fx.server.id, |event| {
+                matches!(
+                    event,
+                    revolt_database::events::client::EventV1::ChannelUpdate { id, data, .. }
+                        if id == &forum_id
+                            && matches!(data.default_layout, Some(v0::ForumLayout::ClassicPlus))
+                )
+            })
+            .await;
+    }
+
+    /// A body carrying ONLY `default_layout` is applied, not swallowed by the
+    /// early no-op return. Control: `default_layout` missing from that guard.
+    #[test]
+    fn default_layout_only_edit_is_not_a_no_op() {
+        crate::util::test::rt().block_on(default_layout_only_edit_is_not_a_no_op_case())
+    }
+
+    async fn default_layout_only_edit_is_not_a_no_op_case() {
+        let fx = forum_fixture().await;
+
+        let response = patch(
+            &fx.harness,
+            &fx.owner_session,
+            fx.forum.id(),
+            json!({ "default_layout": "Classic" }),
+        )
+        .await;
+        assert_eq!(response.status(), Status::Ok);
+        let edited = response.into_json::<v0::Channel>().await.expect("channel");
+        assert!(matches!(
+            edited,
+            v0::Channel::Forum {
+                default_layout: v0::ForumLayout::Classic,
+                ..
+            }
+        ));
+        assert_eq!(
+            stored_forum_layout(&fx.harness, fx.forum.id()).await,
+            revolt_database::ForumLayout::Classic
+        );
+    }
+
+    /// `default_layout` only exists on forums: a text channel or a forum
+    /// post refuses it instead of silently dropping it.
+    #[test]
+    fn default_layout_rejected_outside_forums() {
+        crate::util::test::rt().block_on(default_layout_rejected_outside_forums_case())
+    }
+
+    async fn default_layout_rejected_outside_forums_case() {
+        let fx = forum_fixture().await;
+
+        let text = fx.harness.new_channel(&fx.server).await;
+        let response = patch(
+            &fx.harness,
+            &fx.owner_session,
+            text.id(),
+            json!({ "default_layout": "ClassicPlus" }),
+        )
+        .await;
+        assert_error(response, Status::BadRequest, "InvalidOperation").await;
+
+        let response = patch(
+            &fx.harness,
+            &fx.owner_session,
+            fx.post.id(),
+            json!({ "default_layout": "ClassicPlus" }),
+        )
+        .await;
+        assert_error(response, Status::BadRequest, "InvalidOperation").await;
+    }
+
+    /// The forum default layout is ManageChannel-gated: plain members,
+    /// including a post creator, are refused and nothing is stored.
+    #[test]
+    fn forum_default_layout_requires_manage_channel() {
+        crate::util::test::rt().block_on(forum_default_layout_requires_manage_channel_case())
+    }
+
+    async fn forum_default_layout_requires_manage_channel_case() {
+        let fx = forum_fixture().await;
+
+        for session in [&fx.outsider_session, &fx.creator_session] {
+            let response = patch(
+                &fx.harness,
+                session,
+                fx.forum.id(),
+                json!({ "default_layout": "ClassicPlus" }),
+            )
+            .await;
+            assert_error(response, Status::Forbidden, "MissingPermission").await;
+        }
+        assert_eq!(
+            stored_forum_layout(&fx.harness, fx.forum.id()).await,
+            revolt_database::ForumLayout::Modern
+        );
     }
 
     // ---- AFK pointer integrity on de-voice (AFK Stage 6 F-B6) -------------

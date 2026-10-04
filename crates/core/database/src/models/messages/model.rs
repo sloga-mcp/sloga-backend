@@ -1111,6 +1111,58 @@ impl Message {
         Ok(())
     }
 
+    /// User ids to fetch alongside these messages: the `author` of every message
+    /// and the users named by system messages, deduplicated in no particular order.
+    ///
+    /// `author` is taken as-is, so a webhook-authored message contributes its
+    /// webhook id and a system message contributes the all-zero system author;
+    /// callers that must not look those up filter the messages first. Mentions,
+    /// replies and forwarded authors are not included.
+    pub fn referenced_user_ids(messages: &[Message]) -> Vec<String> {
+        messages
+            .iter()
+            .flat_map(|m| {
+                let mut users = vec![m.author.clone()];
+                if let Some(system) = &m.system {
+                    match system {
+                        SystemMessage::ChannelDescriptionChanged { by } => users.push(by.clone()),
+                        SystemMessage::ChannelIconChanged { by } => users.push(by.clone()),
+                        SystemMessage::ChannelOwnershipChanged { from, to, .. } => {
+                            users.push(from.clone());
+                            users.push(to.clone())
+                        }
+                        SystemMessage::ChannelRenamed { by, .. } => users.push(by.clone()),
+                        SystemMessage::UserAdded { by, id, .. }
+                        | SystemMessage::UserRemove { by, id, .. } => {
+                            users.push(by.clone());
+                            users.push(id.clone());
+                        }
+                        SystemMessage::UserBanned { id, .. }
+                        | SystemMessage::UserKicked { id, .. }
+                        | SystemMessage::UserJoined { id, .. }
+                        | SystemMessage::UserLeft { id, .. } => {
+                            users.push(id.clone());
+                        }
+                        SystemMessage::Text { .. } => {}
+                        SystemMessage::MessagePinned { by, .. } => {
+                            users.push(by.clone());
+                        }
+                        SystemMessage::MessageUnpinned { by, .. } => {
+                            users.push(by.clone());
+                        }
+                        SystemMessage::CallStarted { by, .. } => users.push(by.clone()),
+                        SystemMessage::ThreadCreated { by, .. } => users.push(by.clone()),
+                        SystemMessage::CallRecordingStarted { by }
+                        | SystemMessage::CallRecordingStopped { by } => users.push(by.clone()),
+                    }
+                }
+                users
+            })
+            .collect::<HashSet<String>>()
+            .into_iter()
+            .collect::<Vec<String>>()
+    }
+
     /// Helper function to fetch many messages with users
     pub async fn fetch_with_users(
         db: &Database,
@@ -1119,60 +1171,19 @@ impl Message {
         include_users: Option<bool>,
         server_id: Option<&str>,
     ) -> Result<BulkMessageResponse> {
-        let messages: Vec<v0::Message> = db
-            .fetch_messages(query)
-            .await?
+        let messages = db.fetch_messages(query).await?;
+        let user_ids = if let Some(true) = include_users {
+            Some(Message::referenced_user_ids(&messages))
+        } else {
+            None
+        };
+
+        let messages: Vec<v0::Message> = messages
             .into_iter()
             .map(|msg| msg.into_model(None, None))
             .collect();
 
-        if let Some(true) = include_users {
-            let user_ids = messages
-                .iter()
-                .flat_map(|m| {
-                    let mut users = vec![m.author.clone()];
-                    if let Some(system) = &m.system {
-                        match system {
-                            v0::SystemMessage::ChannelDescriptionChanged { by } => {
-                                users.push(by.clone())
-                            }
-                            v0::SystemMessage::ChannelIconChanged { by } => users.push(by.clone()),
-                            v0::SystemMessage::ChannelOwnershipChanged { from, to, .. } => {
-                                users.push(from.clone());
-                                users.push(to.clone())
-                            }
-                            v0::SystemMessage::ChannelRenamed { by, .. } => users.push(by.clone()),
-                            v0::SystemMessage::UserAdded { by, id, .. }
-                            | v0::SystemMessage::UserRemove { by, id, .. } => {
-                                users.push(by.clone());
-                                users.push(id.clone());
-                            }
-                            v0::SystemMessage::UserBanned { id, .. }
-                            | v0::SystemMessage::UserKicked { id, .. }
-                            | v0::SystemMessage::UserJoined { id, .. }
-                            | v0::SystemMessage::UserLeft { id, .. } => {
-                                users.push(id.clone());
-                            }
-                            v0::SystemMessage::Text { .. } => {}
-                            v0::SystemMessage::MessagePinned { by, .. } => {
-                                users.push(by.clone());
-                            }
-                            v0::SystemMessage::MessageUnpinned { by, .. } => {
-                                users.push(by.clone());
-                            }
-                            v0::SystemMessage::CallStarted { by, .. } => users.push(by.clone()),
-                            v0::SystemMessage::ThreadCreated { by, .. } => users.push(by.clone()),
-                            v0::SystemMessage::CallRecordingStarted { by }
-                            | v0::SystemMessage::CallRecordingStopped { by } => {
-                                users.push(by.clone())
-                            }
-                        }
-                    }
-                    users
-                })
-                .collect::<HashSet<String>>()
-                .into_iter()
-                .collect::<Vec<String>>();
+        if let Some(user_ids) = user_ids {
             let users = User::fetch_many_ids_as_mutuals(db, perspective, &user_ids).await?;
 
             Ok(BulkMessageResponse::MessagesAndUsers {
@@ -1571,6 +1582,100 @@ impl Interactions {
     /// Check if default initialisation of fields
     pub fn is_default(&self) -> bool {
         !self.restrict_reactions && self.reactions.is_none()
+    }
+}
+
+#[cfg(test)]
+mod referenced_user_ids_tests {
+    use super::*;
+
+    fn message(author: &str, system: Option<SystemMessage>) -> Message {
+        Message {
+            id: Ulid::new().to_string(),
+            channel: "channel".to_string(),
+            author: author.to_string(),
+            system,
+            ..Default::default()
+        }
+    }
+
+    fn sorted(mut ids: Vec<String>) -> Vec<String> {
+        ids.sort();
+        ids
+    }
+
+    #[test]
+    fn authors_are_deduplicated() {
+        let messages = vec![
+            message("alice", None),
+            message("bob", None),
+            message("alice", None),
+        ];
+
+        assert_eq!(
+            sorted(Message::referenced_user_ids(&messages)),
+            vec!["alice".to_string(), "bob".to_string()]
+        );
+    }
+
+    #[test]
+    fn system_message_users_are_included_and_deduplicated() {
+        let messages = vec![
+            message("alice", None),
+            message(
+                "00000000000000000000000000",
+                Some(SystemMessage::UserAdded {
+                    id: "bob".to_string(),
+                    by: "alice".to_string(),
+                }),
+            ),
+            message(
+                "00000000000000000000000000",
+                Some(SystemMessage::ChannelOwnershipChanged {
+                    from: "carol".to_string(),
+                    to: "dave".to_string(),
+                }),
+            ),
+            message(
+                "00000000000000000000000000",
+                Some(SystemMessage::Text {
+                    content: "hello".to_string(),
+                }),
+            ),
+        ];
+
+        assert_eq!(
+            sorted(Message::referenced_user_ids(&messages)),
+            vec![
+                "00000000000000000000000000".to_string(),
+                "alice".to_string(),
+                "bob".to_string(),
+                "carol".to_string(),
+                "dave".to_string(),
+            ]
+        );
+    }
+
+    /// Pins existing `fetch_with_users` behavior: the author id of a webhook
+    /// message is the webhook id and is NOT filtered out here.
+    #[test]
+    fn webhook_author_id_is_kept() {
+        let mut webhook_message = message("webhook", None);
+        webhook_message.webhook = Some(MessageWebhook {
+            name: "Hook".to_string(),
+            avatar: None,
+        });
+        let messages = vec![message("alice", None), webhook_message];
+
+        assert_eq!(
+            sorted(Message::referenced_user_ids(&messages)),
+            vec!["alice".to_string(), "webhook".to_string()]
+        );
+    }
+
+    #[test]
+    fn no_messages_no_ids() {
+        assert!(Message::referenced_user_ids(&[]).is_empty());
     }
 }
 
