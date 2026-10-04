@@ -464,8 +464,8 @@ impl State {
                 bulk_events.push(EventV1::ChannelDelete { id });
             }
 
-            // * NOTE: currently all channels should be cached
-            // * provided that a server was loaded from payload
+            // Server channels the member could not see at Ready or at
+            // ChannelCreate are not cached; they are picked up here.
             let unknowns = known_ids
                 .difference(&channel_ids)
                 .cloned()
@@ -647,22 +647,28 @@ impl State {
                 let db_channel: Channel = channel.clone().into();
                 let id = db_channel.id().to_string();
 
-                // Threads are announced to the entire server topic. Only
-                // subscribe (and forward the event) if we can view the parent
-                // channel — otherwise a member denied ViewChannel on a private
-                // parent would receive the thread and all of its messages.
-                // Other channel types retain their existing behaviour.
-                let can_view = if matches!(db_channel, Channel::Thread { .. }) {
-                    self.cache.can_view_channel(db, &db_channel).await
-                } else {
-                    true
-                };
-
-                self.cache.channels.insert(id.clone(), db_channel);
-
-                if can_view {
+                // Server channels and threads are announced to the entire
+                // server topic. Only subscribe (and forward the event) if we
+                // can view the channel (a thread: its parent). A new channel
+                // has no overrides, so on a server whose default permissions
+                // lack ViewChannel every member without a granting role would
+                // otherwise receive it and all of its messages. DMs, groups
+                // and saved messages are always viewable here.
+                if self.cache.can_view_channel(db, &db_channel).await {
+                    self.cache.channels.insert(id.clone(), db_channel);
                     self.insert_subscription(id).await;
                 } else {
+                    // A hidden thread stays cached: threads are not in
+                    // `Server.channels`, so the cache is the only place a
+                    // later grant can find it. A hidden server channel is
+                    // left uncached, as Ready leaves it; recalculate_server
+                    // finds it in `Server.channels` as an unknown once it
+                    // becomes visible. (A later ChannelUpdate may cache it;
+                    // both states are handled there.)
+                    if matches!(db_channel, Channel::Thread { .. }) {
+                        self.cache.channels.insert(id, db_channel);
+                    }
+
                     return false;
                 }
             }
@@ -1911,5 +1917,276 @@ mod tests {
                 "{id} must not be cached"
             );
         }
+    }
+
+    /// Server whose default permissions lack ViewChannel: only `ROLE_VIEW`
+    /// holders can see a channel without overrides.
+    const SERVER_G: &str = "01SERVER00000000000000000G";
+    /// Grants ViewChannel server-wide on `SERVER_G`.
+    const ROLE_VIEW: &str = "01ROLE0000000000000000VIEW";
+    const NEW_TEXT: &str = "01CHANNEL000000000000NEWTEXT";
+    const NEW_FORUM: &str = "01CHANNEL00000000000NEWFORUM";
+
+    fn role_gated_server(channels: &[&str]) -> Server {
+        let mut server = plain_server(SERVER_G, channels);
+        server.default_permissions = 0;
+        server.roles.insert(
+            ROLE_VIEW.to_string(),
+            Role {
+                id: ROLE_VIEW.to_string(),
+                name: "viewer".to_string(),
+                permissions: OverrideField {
+                    a: ChannelPermission::ViewChannel as i64,
+                    d: 0,
+                },
+                colour: None,
+                hoist: false,
+                rank: 0,
+                icon: None,
+            },
+        );
+        server
+    }
+
+    fn forum(id: &str, server: &str) -> Channel {
+        Channel::Forum {
+            id: id.to_string(),
+            server: server.to_string(),
+            name: "forum".to_string(),
+            description: None,
+            icon: None,
+            last_message_id: None,
+            default_permissions: None,
+            role_permissions: HashMap::new(),
+            nsfw: false,
+            spoiler: false,
+            tags: vec![],
+            require_tag: false,
+            default_sort: Default::default(),
+            force_sort: false,
+            default_auto_archive_minutes: Channel::default_forum_auto_archive_minutes(),
+        }
+    }
+
+    /// A member of `server` holding `roles`, subscribed to the server topic,
+    /// with the subscriptions flushed (see `seeded_state`).
+    async fn member_with_roles(server: &Server, roles: &[&str]) -> State {
+        let user = User {
+            id: SELF_ID.to_string(),
+            username: "self".to_string(),
+            ..Default::default()
+        };
+
+        let mut state = member_state(user, server);
+        state
+            .cache
+            .members
+            .get_mut(&server.id)
+            .expect("member")
+            .roles = roles.iter().map(|r| r.to_string()).collect();
+        state.insert_subscription(server.id.clone()).await;
+        state.apply_state().await;
+        state
+    }
+
+    /// `create_server_channel` publishes ChannelCreate to the server topic,
+    /// and the new channel has no overrides, so its visibility is the
+    /// server-level permission. A member without a role granting ViewChannel
+    /// must neither receive it nor be subscribed to its messages.
+    #[tokio::test]
+    async fn channel_create_hidden_by_server_permissions_is_dropped() {
+        let db = test_db().await;
+        let server = role_gated_server(&[NEW_TEXT, NEW_FORUM]);
+
+        for channel in [text_channel(NEW_TEXT, SERVER_G), forum(NEW_FORUM, SERVER_G)] {
+            let id = channel.id().to_string();
+
+            let mut state = member_with_roles(&server, &[]).await;
+            let mut event = EventV1::ChannelCreate(channel.clone().into());
+            assert!(
+                !state.handle_incoming_event_v1(&db, &mut event).await,
+                "{id}: ChannelCreate must be dropped for a member who cannot view it"
+            );
+            assert!(
+                !state.subscribed.read().await.contains(&id),
+                "{id}: a hidden new channel must not be subscribed"
+            );
+            assert!(
+                !state.cache.channels.contains_key(&id),
+                "{id}: a hidden new server channel must not be cached"
+            );
+
+            let mut state = member_with_roles(&server, &[ROLE_VIEW]).await;
+            let mut event = EventV1::ChannelCreate(channel.clone().into());
+            assert!(
+                state.handle_incoming_event_v1(&db, &mut event).await,
+                "{id}: a member whose role grants ViewChannel must receive the ChannelCreate"
+            );
+            assert!(matches!(event, EventV1::ChannelCreate(_)));
+            assert!(
+                state.subscribed.read().await.contains(&id),
+                "{id}: a visible new channel must be subscribed"
+            );
+            assert!(state.cache.channels.contains_key(&id));
+        }
+    }
+
+    /// The common case: default permissions grant ViewChannel, so a member
+    /// with no roles still receives and subscribes to the new channel.
+    #[tokio::test]
+    async fn channel_create_visible_by_default_is_forwarded() {
+        let db = test_db().await;
+        let server = plain_server(SERVER_G, &[NEW_TEXT]);
+        let mut state = member_with_roles(&server, &[]).await;
+
+        let mut event = EventV1::ChannelCreate(text_channel(NEW_TEXT, SERVER_G).into());
+        assert!(
+            state.handle_incoming_event_v1(&db, &mut event).await,
+            "ChannelCreate must be forwarded when the default permissions grant ViewChannel"
+        );
+        assert!(matches!(event, EventV1::ChannelCreate(_)));
+        assert!(state.subscribed.read().await.contains(NEW_TEXT));
+        assert!(state.cache.channels.contains_key(NEW_TEXT));
+    }
+
+    /// The gate must not catch channels that are always viewable, nor a
+    /// member the server permissions do not bind: the owner sees a new
+    /// channel on a server whose default permissions hide it.
+    #[tokio::test]
+    async fn channel_create_forwarded_to_owner_and_for_private_channels() {
+        let db = test_db().await;
+
+        let mut owned = role_gated_server(&[NEW_TEXT]);
+        owned.owner = SELF_ID.to_string();
+        let mut state = member_with_roles(&owned, &[]).await;
+        let mut event = EventV1::ChannelCreate(text_channel(NEW_TEXT, SERVER_G).into());
+        assert!(
+            state.handle_incoming_event_v1(&db, &mut event).await,
+            "the owner must receive a new channel the default permissions hide"
+        );
+        assert!(state.subscribed.read().await.contains(NEW_TEXT));
+
+        let mut state = member_with_roles(&role_gated_server(&[]), &[]).await;
+        for channel in [
+            Channel::SavedMessages {
+                id: "01CHANNEL0000000000000SAVED".to_string(),
+                user: SELF_ID.to_string(),
+            },
+            Channel::DirectMessage {
+                id: "01CHANNEL000000000000000DM".to_string(),
+                active: true,
+                recipients: vec![SELF_ID.to_string(), OTHER_ID.to_string()],
+                last_message_id: None,
+            },
+        ] {
+            let id = channel.id().to_string();
+            let mut event = EventV1::ChannelCreate(channel.into());
+            assert!(
+                state.handle_incoming_event_v1(&db, &mut event).await,
+                "{id}: ChannelCreate of a private channel must be forwarded"
+            );
+            assert!(
+                state.subscribed.read().await.contains(&id),
+                "{id}: a private channel must be subscribed"
+            );
+            assert!(state.cache.channels.contains_key(&id));
+        }
+    }
+
+    /// A channel dropped at creation must still be announced, once, when a
+    /// later role grant makes it visible. It is uncached, as Ready leaves a
+    /// hidden server channel, so the recalculation finds it among
+    /// `Server.channels` and sends ChannelCreate with the subscription.
+    #[tokio::test]
+    #[allow(clippy::disallowed_methods)]
+    async fn hidden_channel_create_is_announced_on_role_grant() {
+        let db = test_db().await;
+        let channel = text_channel(NEW_TEXT, SERVER_G);
+        db.insert_channel(&channel).await.expect("insert channel");
+
+        let mut state = member_with_roles(&role_gated_server(&[]), &[]).await;
+
+        // create_server_channel publishes the new channel list first.
+        let mut event = EventV1::ServerUpdate {
+            id: SERVER_G.to_string(),
+            data: v0::PartialServer {
+                channels: Some(vec![NEW_TEXT.to_string()]),
+                ..Default::default()
+            },
+            clear: vec![],
+        };
+        assert!(state.handle_incoming_event_v1(&db, &mut event).await);
+
+        let mut event = EventV1::ChannelCreate(channel.clone().into());
+        assert!(
+            !state.handle_incoming_event_v1(&db, &mut event).await,
+            "ChannelCreate must be dropped before the grant"
+        );
+
+        let mut event = EventV1::ServerMemberUpdate {
+            id: v0::MemberCompositeKey {
+                server: SERVER_G.to_string(),
+                user: SELF_ID.to_string(),
+            },
+            data: v0::PartialMember {
+                roles: Some(vec![ROLE_VIEW.to_string()]),
+                ..Default::default()
+            },
+            clear: vec![],
+        };
+        assert!(state.handle_incoming_event_v1(&db, &mut event).await);
+
+        let (created, deleted, original) = split_bulk(&event);
+        assert!(
+            matches!(original, EventV1::ServerMemberUpdate { .. }),
+            "the member update itself must still be delivered"
+        );
+        assert!(deleted.is_empty(), "nothing was hidden: {deleted:?}");
+        assert_eq!(
+            created,
+            vec![NEW_TEXT.to_string()],
+            "the role grant must announce the hidden channel exactly once"
+        );
+        assert!(
+            state.subscribed.read().await.contains(NEW_TEXT),
+            "the revealed channel must be subscribed"
+        );
+        assert!(state.cache.channels.contains_key(NEW_TEXT));
+    }
+
+    /// The "create, then make private" flow: on a server where everyone can
+    /// view, the new channel is visible until the override lands. The
+    /// override's ChannelUpdate (server topic) must then hide it from a member
+    /// it now denies: a ChannelDelete instead of the update, and unsubscribed.
+    #[tokio::test]
+    async fn override_after_create_hides_the_new_channel() {
+        let db = test_db().await;
+        let server = plain_server(SERVER_G, &[NEW_TEXT]);
+        let mut state = member_with_roles(&server, &[]).await;
+
+        let mut event = EventV1::ChannelCreate(text_channel(NEW_TEXT, SERVER_G).into());
+        assert!(state.handle_incoming_event_v1(&db, &mut event).await);
+        assert!(state.subscribed.read().await.contains(NEW_TEXT));
+
+        let mut event = EventV1::ChannelUpdate {
+            id: NEW_TEXT.to_string(),
+            data: v0::PartialChannel {
+                default_permissions: Some(OverrideField {
+                    a: 0,
+                    d: ChannelPermission::ViewChannel as i64,
+                }),
+                ..Default::default()
+            },
+            clear: vec![],
+        };
+        assert!(state.handle_incoming_event_v1(&db, &mut event).await);
+        assert!(
+            matches!(&event, EventV1::ChannelDelete { id } if id == NEW_TEXT),
+            "the override must reach the member as a ChannelDelete, got {event:?}"
+        );
+        assert!(
+            !state.subscribed.read().await.contains(NEW_TEXT),
+            "the now-private channel must be unsubscribed"
+        );
     }
 }
