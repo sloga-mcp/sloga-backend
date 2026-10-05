@@ -1,6 +1,10 @@
 use std::{
+    future::Future,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
-    sync::Arc,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
     time::{Duration, Instant},
 };
 
@@ -9,7 +13,7 @@ use crate::{
     utils::Consumer,
 };
 
-use super::up_limiter::{Admit, Bucket, UpLimiter};
+use super::up_limiter::{Admit, Bucket, DestKey, Offender, Rejected, SubKey, UpLimiter};
 
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
@@ -44,6 +48,13 @@ const DEFAULT_TTL_SECS: u32 = 86400;
 /// Ring TTL if `call_ring_duration` does not fit in a u32.
 const FALLBACK_RING_TTL_SECS: u32 = 30;
 
+/// Longest a send waits, in all, while every rejection token of its
+/// destination is reserved by sends in flight. Past it, the push is dropped.
+const SLOT_WAIT: Duration = Duration::from_secs(10);
+
+/// Least time between two "waited for a send slot" log lines.
+const SLOT_TIMEOUT_LOG_EVERY: Duration = Duration::from_secs(60);
+
 /// What a send result means for the stored subscription.
 #[derive(Debug, PartialEq, Eq)]
 enum Outcome {
@@ -64,6 +75,8 @@ pub struct UnifiedPushOutboundConsumer {
     pkey: Arc<Vec<u8>>,
     /// Shared by every clone, so the limits hold across deliveries.
     limiter: Arc<UpLimiter>,
+    /// Shared by every clone, like the limiter.
+    slot_timeouts: Arc<LogThrottle>,
 }
 
 /// What happened to a send that went through the rate limiter.
@@ -71,10 +84,64 @@ pub struct UnifiedPushOutboundConsumer {
 enum Gated {
     /// Over a limit: nothing was signed or sent.
     Denied { first: bool, bucket: Bucket },
+    /// Sends in flight held every rejection token for the whole wait:
+    /// nothing was signed or sent.
+    SlotTimeout,
     /// Admitted, but signing or encrypting the message failed.
     BuildFailed(anyhow::Error),
-    /// Admitted and sent; the push server's answer.
-    Sent(Result<(), WebPushError>),
+    /// Admitted and sent; the push server's answer, and what it did to the
+    /// destination's rejection budget if it was an HTTP rejection.
+    Sent {
+        result: Result<(), WebPushError>,
+        rejected: Option<Rejected>,
+    },
+}
+
+/// Where a send may go, or why it may not.
+#[derive(Debug, PartialEq, Eq)]
+enum Destination {
+    /// Not an https URL with a host.
+    Invalid,
+    /// An ntfy.sh endpoint that is not a UnifiedPush topic URL.
+    NotNtfyTopic { host: String },
+    /// Does not resolve to only public addresses.
+    NotPublic { host: String },
+    /// Send to `host`, connecting only to `addr`.
+    Checked { host: String, addr: SocketAddr },
+}
+
+/// Lets a log line through at most once per `every`, across every clone of
+/// the consumer.
+struct LogThrottle {
+    epoch: Instant,
+    every: Duration,
+    /// Whole seconds from `epoch` to the last line let through, plus one, so
+    /// 0 means none yet.
+    last: AtomicU64,
+}
+
+impl LogThrottle {
+    fn new(every: Duration) -> Self {
+        LogThrottle {
+            epoch: Instant::now(),
+            every,
+            last: AtomicU64::new(0),
+        }
+    }
+
+    /// Whether a line may be logged at `now`. Of several callers racing for
+    /// the same slot, only one gets it.
+    fn ready(&self, now: Instant) -> bool {
+        let now_secs = now.saturating_duration_since(self.epoch).as_secs() + 1;
+        let last = self.last.load(Ordering::Relaxed);
+        if last != 0 && now_secs < last.saturating_add(self.every.as_secs()) {
+            return false;
+        }
+
+        self.last
+            .compare_exchange(last, now_secs, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+    }
 }
 
 #[async_trait]
@@ -100,6 +167,7 @@ impl Consumer for UnifiedPushOutboundConsumer {
             client: http_client(),
             pkey: web_push_private_key,
             limiter: Arc::new(UpLimiter::new()),
+            slot_timeouts: Arc::new(LogThrottle::new(SLOT_TIMEOUT_LOG_EVERY)),
         }
     }
 
@@ -144,71 +212,139 @@ impl Consumer for UnifiedPushOutboundConsumer {
             return Ok(());
         }
 
+        let sub = SubKey::new(&payload.session_id, &endpoint);
+
         // The endpoint is client-supplied, so check where it points right
         // before we POST to it. The endpoint itself is never logged: it is a
         // bearer capability for the device.
-        let Some((host, port)) = endpoint_host_port(&endpoint) else {
-            warn!(
-                "Refusing UnifiedPush for session {}: endpoint is not a valid https URL",
-                payload.session_id
-            );
+        let destination = resolve_destination(&endpoint, |host, port| async move {
+            checked_address(&host, port).await
+        })
+        .await;
 
-            return Ok(());
+        let (host, addr) = match destination {
+            Destination::Invalid => {
+                warn!(
+                    "Refusing UnifiedPush for session {}: endpoint is not a valid https URL",
+                    payload.session_id
+                );
+
+                return Ok(());
+            }
+            Destination::NotNtfyTopic { host } => {
+                // The subscription is kept, so every push to it ends up
+                // here: log it once per subscription per hour.
+                if self.limiter.first_refusal(sub, Instant::now()) {
+                    warn!(
+                        "Refusing UnifiedPush for session {} (user: {}): {} endpoint is not a UnifiedPush topic URL",
+                        payload.session_id, payload.user_id, host
+                    );
+                }
+
+                return Ok(());
+            }
+            Destination::NotPublic { host } => {
+                warn!(
+                    "Refusing UnifiedPush for session {}: {} does not resolve to only public addresses",
+                    payload.session_id, host
+                );
+
+                return Ok(());
+            }
+            Destination::Checked { host, addr } => (host, addr),
         };
 
-        // The send connects only to this address, so a DNS server cannot
-        // pass the check and then answer differently for the connection.
-        let Some(addr) = checked_address(&host, port).await else {
-            warn!(
-                "Refusing UnifiedPush for session {}: {} does not resolve to only public addresses",
-                payload.session_id, host
-            );
-
-            return Ok(());
-        };
+        let key = limit_key(&host, addr.ip());
 
         // Read before the gate: the message is built in a sync closure.
         let ring_secs = revolt_config::config().await.api.livekit.call_ring_duration;
 
         // Signing and encryption run only once the send is admitted.
-        let gated = gated_send(&self.limiter, &self.client, &payload.user_id, addr, || {
-            let signature = VapidSignatureBuilder::from_pem(
-                std::io::Cursor::new(self.pkey.as_ref()),
-                &subscription,
-            )?
-            .build()?;
+        let gated = gated_send(
+            &self.limiter,
+            &self.client,
+            &payload.user_id,
+            sub,
+            key,
+            addr,
+            SLOT_WAIT,
+            || {
+                let signature = VapidSignatureBuilder::from_pem(
+                    std::io::Cursor::new(self.pkey.as_ref()),
+                    &subscription,
+                )?
+                .build()?;
 
-            Ok(build_message(
-                &subscription,
-                Some(signature),
-                &bytes,
-                &ty,
-                ring_secs,
-            )?)
-        })
+                Ok(build_message(
+                    &subscription,
+                    Some(signature),
+                    &bytes,
+                    &ty,
+                    ring_secs,
+                )?)
+            },
+        )
         .await;
 
-        let result = match gated {
+        let (result, rejected) = match gated {
             Gated::Denied { first, bucket } => {
                 // Once per empty episode of that bucket, so a flood of drops
-                // does not become a flood of log lines.
+                // does not become a flood of log lines. A paused destination
+                // and a cooled subscription stay quiet: the pause is logged
+                // once, when it trips.
                 if first {
-                    let limit = match bucket {
-                        Bucket::Ip => "destination",
-                        Bucket::User => "per-user",
-                    };
+                    match bucket {
+                        Bucket::Ip => warn!(
+                            "{}",
+                            destination_limit_line(
+                                &self.limiter,
+                                &host,
+                                key,
+                                &payload.session_id,
+                                &payload.user_id
+                            )
+                        ),
+                        Bucket::User => warn!(
+                            "Dropping UnifiedPush for session {} (user: {}) to {} [{}]: per-user limit",
+                            payload.session_id,
+                            payload.user_id,
+                            host,
+                            key_label(key)
+                        ),
+                        Bucket::Paused | Bucket::Subscription => {}
+                    }
+                }
 
+                return Ok(());
+            }
+            Gated::SlotTimeout => {
+                if self.slot_timeouts.ready(Instant::now()) {
                     warn!(
-                        "Dropping UnifiedPush for session {} (user: {}) to {}: {} limit",
-                        payload.session_id, payload.user_id, host, limit
+                        "UnifiedPush to {} [{}] waited {} s for a send slot (this push: session {}, user {}, dropped)",
+                        host,
+                        key_label(key),
+                        SLOT_WAIT.as_secs(),
+                        payload.session_id,
+                        payload.user_id
                     );
                 }
 
                 return Ok(());
             }
             Gated::BuildFailed(err) => return Err(err),
-            Gated::Sent(result) => result,
+            Gated::Sent { result, rejected } => (result, rejected),
         };
+
+        // The rejection that spent the budget names who spent it.
+        if let Some(Rejected::Paused { top, others }) = rejected {
+            warn!(
+                "UnifiedPush rejection budget spent for {} [{}], sends paused (top offenders: {}; others: {})",
+                host,
+                key_label(key),
+                offender_list(&top),
+                others
+            );
+        }
 
         match outcome(&result) {
             Outcome::Delivered => {}
@@ -270,48 +406,89 @@ fn http_client() -> HttpClient {
         .expect("isahc HttpClient")
 }
 
-/// POST a message to its endpoint, connecting only to `addr`.
+/// POST a message to its endpoint, connecting only to `addr`. Returns the
+/// result and, if the server answered, its HTTP status: web-push folds every
+/// 5xx into `ServerError`, and the limiter must tell a 503 from a 507.
 async fn send_pinned(
     client: &HttpClient,
     message: WebPushMessage,
     addr: SocketAddr,
-) -> Result<(), WebPushError> {
-    let request = pinned_request(message, addr).map_err(|_| WebPushError::Unspecified)?;
+) -> (Result<(), WebPushError>, Option<u16>) {
+    let Ok(request) = pinned_request(message, addr) else {
+        return (Err(WebPushError::Unspecified), None);
+    };
 
     // A transport error becomes WebPushError::Unspecified, as it does in
     // web-push's IsahcWebPushClient (isahc_client.rs, error.rs).
-    let response = client.send_async(request).await?;
+    let response = match client.send_async(request).await {
+        Ok(response) => response,
+        Err(err) => return (Err(err.into()), None),
+    };
 
     // The body is never read: there is no capped reader without a new
     // dependency, it only carries error detail, and every error except
     // 404/410 is kept anyway. Dropping the response aborts the transfer.
-    parse_response(response.status(), Vec::new())
+    let status = response.status();
+    (parse_response(status, Vec::new()), Some(status.as_u16()))
 }
 
-/// Admit, build, send, and back off on a 429, in that order. `make_msg`
-/// (VAPID signing and encryption) runs only once the send is admitted. Both
-/// limiter calls are synchronous, so its lock is never held across an await.
+/// Admit, build, send, then settle the ticket and back off on a 429, in
+/// that order. `make_msg` (VAPID signing and encryption) runs only once the
+/// send is admitted. While every rejection token of the destination is
+/// reserved by sends in flight, wait for one of them to finish, for at most
+/// `slot_wait` in all. Every limiter call is synchronous, so its lock is
+/// never held across an await.
+#[allow(clippy::too_many_arguments)]
 async fn gated_send<F>(
     limiter: &UpLimiter,
     client: &HttpClient,
     user_id: &str,
+    sub: SubKey,
+    key: DestKey,
     addr: SocketAddr,
+    slot_wait: Duration,
     make_msg: F,
 ) -> Gated
 where
     F: FnOnce() -> Result<WebPushMessage>,
 {
-    let key = limit_key(addr.ip());
-    if let Admit::Denied { first, bucket } = limiter.admit(user_id, key, Instant::now()) {
-        return Gated::Denied { first, bucket };
-    }
+    let deadline = Instant::now() + slot_wait;
+    let ticket = loop {
+        // Made before admit, so a release between the two still wakes it.
+        let released = limiter.released();
 
+        match limiter.admit(user_id, sub, key, Instant::now()) {
+            Admit::Allowed(ticket) => break ticket,
+            Admit::Denied { first, bucket } => return Gated::Denied { first, bucket },
+            Admit::Wait => {
+                let left = deadline.saturating_duration_since(Instant::now());
+                if left.is_zero() || tokio::time::timeout(left, released).await.is_err() {
+                    return Gated::SlotTimeout;
+                }
+            }
+        }
+    };
+
+    // Returning drops the ticket, which only releases its reservation.
     let message = match make_msg() {
         Ok(message) => message,
         Err(err) => return Gated::BuildFailed(err),
     };
 
-    let result = send_pinned(client, message, addr).await;
+    let (result, status) = send_pinned(client, message, addr).await;
+
+    let rejected = if result.is_ok() {
+        ticket.success();
+        None
+    } else if is_http_rejection(&result) {
+        let prunes = outcome(&result) == Outcome::Prune;
+        Some(ticket.rejected(prunes, status, Instant::now()))
+    } else {
+        // The request never got an answer, so the push server has nothing
+        // to count against us: release the reservation, spend nothing.
+        drop(ticket);
+        None
+    };
 
     // ntfy charges UnifiedPush topics to the subscriber, so a 429 is about
     // this user's pushes to this destination, not everyone's.
@@ -319,7 +496,76 @@ where
         limiter.drain_user(user_id, key, Instant::now());
     }
 
-    Gated::Sent(result)
+    Gated::Sent { result, rejected }
+}
+
+/// Check an endpoint in the order that costs least: its URL, then the
+/// ntfy.sh shape rule, and only then the address lookup `resolve` does.
+async fn resolve_destination<R, F>(endpoint: &str, resolve: R) -> Destination
+where
+    R: FnOnce(String, u16) -> F,
+    F: Future<Output = Option<SocketAddr>>,
+{
+    let Some((host, port)) = endpoint_host_port(endpoint) else {
+        return Destination::Invalid;
+    };
+
+    // Before the lookup, so a refused endpoint costs no DNS and no tokens.
+    if !ntfy_endpoint_allowed(endpoint) {
+        return Destination::NotNtfyTopic { host };
+    }
+
+    // The send connects only to this address, so a DNS server cannot pass
+    // the check and then answer differently for the connection.
+    match resolve(host.clone(), port).await {
+        Some(addr) => Destination::Checked { host, addr },
+        None => Destination::NotPublic { host },
+    }
+}
+
+/// Whether `host` is ntfy.sh or one of its subdomains, however it is
+/// spelled: DNS ignores case and a trailing dot.
+fn is_ntfy_host(host: &str) -> bool {
+    let host = host.to_ascii_lowercase();
+    let host = host.trim_end_matches('.');
+
+    host == "ntfy.sh" || host.ends_with(".ntfy.sh")
+}
+
+/// Whether an endpoint may be sent to. Every host but ntfy.sh passes. On
+/// ntfy.sh only the URL its app registers does: `/up` plus 12 topic
+/// characters, optionally `?up=1`, on the default port. A publish anywhere
+/// else there is not a UnifiedPush message, and every rejection it earns
+/// counts toward a ban of our IP.
+fn ntfy_endpoint_allowed(endpoint: &str) -> bool {
+    let Ok(uri) = endpoint.parse::<Uri>() else {
+        return false;
+    };
+    let Some(authority) = uri.authority() else {
+        return false;
+    };
+    if !is_ntfy_host(authority.host()) {
+        return true;
+    }
+
+    // ntfy's own test for a UnifiedPush topic, plus the leading slash.
+    let topic_ok = uri
+        .path()
+        .strip_prefix("/up")
+        .is_some_and(|id| id.len() == 12 && id.bytes().all(is_topic_byte));
+
+    // No userinfo, the default port, no query but `up=1`, and no fragment.
+    // http::Uri drops a fragment while parsing, so the raw string is checked.
+    !authority.as_str().contains('@')
+        && !matches!(uri.port_u16(), Some(port) if port != 443)
+        && topic_ok
+        && matches!(uri.query(), None | Some("up=1"))
+        && !endpoint.contains('#')
+}
+
+/// A byte ntfy allows in a topic name: `[-_A-Za-z0-9]`.
+fn is_topic_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'-' || b == b'_'
 }
 
 /// Truncate `s` to at most `max` bytes without splitting a character.
@@ -410,6 +656,44 @@ fn outcome(result: &Result<(), WebPushError>) -> Outcome {
 /// `Other("429")` (request_builder.rs).
 fn should_drain(result: &Result<(), WebPushError>) -> bool {
     matches!(result, Err(WebPushError::Other(status)) if status == "429")
+}
+
+/// Whether a send result is an HTTP answer other than success, which the
+/// push server may count against our IP. No `_` arm: a web-push upgrade that
+/// adds a variant has to be classified here before it builds.
+fn is_http_rejection(result: &Result<(), WebPushError>) -> bool {
+    let Err(err) = result else {
+        return false;
+    };
+
+    match err {
+        // What parse_response makes of a non-2xx status; a 3xx ends up in
+        // `Other`, since redirects are never followed.
+        WebPushError::Unauthorized
+        | WebPushError::BadRequest(_)
+        | WebPushError::ServerError(_)
+        | WebPushError::EndpointNotValid
+        | WebPushError::EndpointNotFound
+        | WebPushError::PayloadTooLarge
+        | WebPushError::Other(_) => true,
+        // Only from parsing a response body, which send_pinned never reads.
+        // There was an answer, so it counts.
+        WebPushError::InvalidResponse => true,
+        // No request reached the server: a transport error, or building the
+        // message or the request failed.
+        WebPushError::Unspecified
+        | WebPushError::NotImplemented
+        | WebPushError::InvalidUri
+        | WebPushError::TlsError
+        | WebPushError::SslError
+        | WebPushError::IoError
+        | WebPushError::InvalidPackageName
+        | WebPushError::InvalidTtl
+        | WebPushError::InvalidTopic
+        | WebPushError::MissingCryptoKeys
+        | WebPushError::InvalidCryptoKeys
+        | WebPushError::InvalidClaims => false,
+    }
 }
 
 /// Host and port to resolve for an endpoint. Only https is accepted.
@@ -536,12 +820,19 @@ fn embedded_ipv4(v6: Ipv6Addr) -> Option<Ipv4Addr> {
     }
 }
 
-/// The rate-limit key for a checked address. An IPv6 address that carries an
-/// IPv4 one counts as that IPv4, and any other IPv6 address counts as its /64,
-/// so rotating addresses inside one /64 or spelling one IPv4 address several
+/// The rate-limit key for a checked destination. ntfy.sh counts as one
+/// destination by name, so more addresses in its DNS cannot multiply its
+/// budgets: a ban there is per our IP, across all of its frontends. Any
+/// other host counts by address. An IPv6 address that carries an IPv4 one
+/// counts as that IPv4, and any other IPv6 address counts as its /64, so
+/// rotating addresses inside one /64 or spelling one IPv4 address several
 /// ways does not buy a destination more allowances.
-fn limit_key(ip: IpAddr) -> IpAddr {
-    match ip {
+fn limit_key(host: &str, ip: IpAddr) -> DestKey {
+    if is_ntfy_host(host) {
+        return DestKey::Ntfy;
+    }
+
+    DestKey::Ip(match ip {
         IpAddr::V4(_) => ip,
         IpAddr::V6(v6) => match embedded_ipv4(v6) {
             Some(v4) => IpAddr::V4(v4),
@@ -551,7 +842,60 @@ fn limit_key(ip: IpAddr) -> IpAddr {
                 IpAddr::V6(Ipv6Addr::from(segments))
             }
         },
+    })
+}
+
+/// How a limit key appears in log lines.
+fn key_label(key: DestKey) -> String {
+    match key {
+        DestKey::Ntfy => "ntfy.sh".to_string(),
+        DestKey::Ip(ip) => ip.to_string(),
     }
+}
+
+/// The first line for an empty destination send bucket. The push that found
+/// it empty is rarely the one that emptied it, so the line names who sent
+/// the most to `key` since the last such line, then this push. Reading the
+/// top senders clears them.
+fn destination_limit_line(
+    limiter: &UpLimiter,
+    host: &str,
+    key: DestKey,
+    session_id: &str,
+    user_id: &str,
+) -> String {
+    let (top, others) = limiter.top_senders(key);
+    let senders = if top.is_empty() {
+        "none".to_string()
+    } else {
+        // For top_senders, `rejections` holds the number of admitted sends.
+        top.iter()
+            .map(|sender| format!("{} ({})", sender.user_id, sender.rejections))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+
+    format!(
+        "UnifiedPush destination limit reached for {} [{}]: top senders {}, {} other users (this push: session {}, user {})",
+        host,
+        key_label(key),
+        senders,
+        others,
+        session_id,
+        user_id
+    )
+}
+
+/// The offenders a pause names, as "user x3, user x1".
+fn offender_list(top: &[Offender]) -> String {
+    if top.is_empty() {
+        return "none".to_string();
+    }
+
+    top.iter()
+        .map(|offender| format!("{} x{}", offender.user_id, offender.rejections))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 #[cfg(test)]
@@ -568,6 +912,8 @@ mod tests {
     };
 
     use isahc::http::StatusCode;
+
+    use crate::consumers::outbound::up_limiter::{DestLimits, UpLimits};
 
     /// web-push's own test subscription (request_builder.rs tests). Only the
     /// public key exists here, which is all encryption needs.
@@ -1039,13 +1385,14 @@ mod tests {
         assert!(lookup.is_err(), "pin-test.invalid must not resolve");
 
         let server = serve("201 Created", "");
-        let result = tokio::time::timeout(
+        let (result, status) = tokio::time::timeout(
             WAIT,
             send_pinned(&http_client(), pin_test_message("/up/abc"), server.addr),
         )
         .await
         .expect("the send must answer on its own");
         assert_eq!(result, Ok(()));
+        assert_eq!(status, Some(201));
 
         let head = server.requests.recv_timeout(WAIT).expect("a request");
         assert!(head.starts_with("POST /up/abc HTTP/1.1\r\n"), "{head}");
@@ -1069,7 +1416,7 @@ mod tests {
             "302 Found",
             &format!("Location: http://127.0.0.1:{target_port}/x\r\n"),
         );
-        let result = tokio::time::timeout(
+        let (result, status) = tokio::time::timeout(
             WAIT,
             send_pinned(&http_client(), pin_test_message("/up/abc"), redirector.addr),
         )
@@ -1077,6 +1424,7 @@ mod tests {
         .expect("the send must answer on its own");
 
         assert_eq!(result, Err(WebPushError::Other("302".to_string())));
+        assert_eq!(status, Some(302));
         assert_eq!(outcome(&result), Outcome::Keep);
         // A followed redirect keeps the pin, so it would come back to the
         // redirector rather than reach the target: count the redirector.
@@ -1106,44 +1454,290 @@ mod tests {
     #[test]
     fn limit_key_folds_each_destination_into_one_key() {
         let ip = |addr: &str| addr.parse::<IpAddr>().unwrap();
+        let key = |addr: &str| limit_key("push.example.org", ip(addr));
 
-        assert_eq!(limit_key(ip("1.2.3.4")), ip("1.2.3.4"));
+        assert_eq!(key("1.2.3.4"), DestKey::Ip(ip("1.2.3.4")));
         for addr in [
             "::ffff:1.2.3.4",
             "::ffff:0:1.2.3.4",
             "64:ff9b::102:304",
             "2002:102:304::1",
         ] {
-            assert_eq!(limit_key(ip(addr)), ip("1.2.3.4"), "{addr}");
+            assert_eq!(key(addr), DestKey::Ip(ip("1.2.3.4")), "{addr}");
         }
 
         // One /64, whatever the low bits.
         assert_eq!(
-            limit_key(ip("2606:4700:4700::1111")),
-            ip("2606:4700:4700::")
+            key("2606:4700:4700::1111"),
+            DestKey::Ip(ip("2606:4700:4700::"))
         );
         assert_eq!(
-            limit_key(ip("2001:db8:1:2:aaaa:bbbb:cccc:dddd")),
-            limit_key(ip("2001:db8:1:2::1"))
+            key("2001:db8:1:2:aaaa:bbbb:cccc:dddd"),
+            key("2001:db8:1:2::1")
         );
 
         // Different /64s stay apart.
-        assert_ne!(
-            limit_key(ip("2001:db8:1:2::1")),
-            limit_key(ip("2001:db8:1:3::1"))
+        assert_ne!(key("2001:db8:1:2::1"), key("2001:db8:1:3::1"));
+        assert_ne!(key("2606:4700:4700::1111"), key("2606:4700:4700:1::1111"));
+    }
+
+    #[test]
+    fn limit_key_keys_ntfy_by_name() {
+        let ip = |addr: &str| addr.parse::<IpAddr>().unwrap();
+
+        for host in [
+            "ntfy.sh",
+            "NTFY.SH",
+            "ntfy.sh.",
+            "push.ntfy.sh",
+            "Push.Ntfy.Sh.",
+        ] {
+            for addr in ["159.203.148.75", "2604:a880:400:d0::1", "203.0.113.9"] {
+                assert_eq!(limit_key(host, ip(addr)), DestKey::Ntfy, "{host} at {addr}");
+            }
+        }
+
+        for host in [
+            "push.example.org",
+            "notntfy.sh",
+            "ntfy.sh.example.org",
+            "ntfy.shop",
+        ] {
+            assert_eq!(
+                limit_key(host, ip("159.203.148.75")),
+                DestKey::Ip(ip("159.203.148.75")),
+                "{host}"
+            );
+        }
+    }
+
+    /// A topic name the ntfy app would register: `up` plus 12 characters.
+    const TOPIC: &str = "upAbCdEfGhIjKl";
+
+    #[test]
+    fn ntfy_endpoints_must_be_up_topic_urls() {
+        for endpoint in [
+            format!("https://ntfy.sh/{TOPIC}?up=1"),
+            format!("https://ntfy.sh/{TOPIC}"),
+            format!("https://NTFY.SH/{TOPIC}?up=1"),
+            format!("https://ntfy.sh./{TOPIC}?up=1"),
+            format!("https://push.ntfy.sh/{TOPIC}?up=1"),
+            format!("https://ntfy.sh:443/{TOPIC}?up=1"),
+            "https://ntfy.sh/up-_0123456789?up=1".to_string(),
+        ] {
+            assert!(ntfy_endpoint_allowed(&endpoint), "{endpoint} should pass");
+        }
+
+        for endpoint in [
+            "https://ntfy.sh/mytopic".to_string(),
+            "https://NTFY.SH/mytopic".to_string(),
+            "https://Push.Ntfy.Sh./mytopic".to_string(),
+            "https://ntfy.sh/up".to_string(),
+            "https://ntfy.sh/".to_string(),
+            "https://ntfy.sh".to_string(),
+            // 15 and 13 characters.
+            format!("https://ntfy.sh/{TOPIC}M"),
+            "https://ntfy.sh/upAbCdEfGhIjK".to_string(),
+            "https://ntfy.sh/UPAbCdEfGhIjKl".to_string(),
+            "https://ntfy.sh/upAbCdEfGhIj.l".to_string(),
+            format!("https://ntfy.sh/{TOPIC}/seq"),
+            format!("https://ntfy.sh/{TOPIC}/publish"),
+            format!("https://ntfy.sh/{TOPIC}/"),
+            format!("https://ntfy.sh/{TOPIC}?"),
+            format!("https://ntfy.sh/{TOPIC}?up=1&email=a@b.c"),
+            format!("https://ntfy.sh/{TOPIC}?email=a@b.c"),
+            format!("https://ntfy.sh/{TOPIC}?up=2"),
+            format!("https://ntfy.sh/{TOPIC}?up=1#frag"),
+            format!("https://ntfy.sh/{TOPIC}#frag"),
+            "https://ntfy.sh/upAbCdEfGhIj%4Bl".to_string(),
+            "https://ntfy.sh/%75pAbCdEfGhIjKl".to_string(),
+            format!("https://ntfy.sh:8443/{TOPIC}?up=1"),
+            format!("https://user:pass@ntfy.sh/{TOPIC}?up=1"),
+            format!("https://user@push.ntfy.sh/{TOPIC}"),
+        ] {
+            // Premise: the URL itself is fine, so only the ntfy rule refuses.
+            assert!(endpoint_host_port(&endpoint).is_some(), "{endpoint}");
+            assert!(
+                !ntfy_endpoint_allowed(&endpoint),
+                "{endpoint} should be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn other_distributors_are_left_alone() {
+        for endpoint in [
+            "https://push.example.org/up/abc",
+            // NextPush, autopush and Gotify.
+            "https://cloud.example.org/index.php/apps/uppush/push/abc123",
+            "https://updates.push.services.mozilla.com/wpush/v2/gAAAAABk",
+            "https://gotify.example.org/UP?token=abc",
+            // A self-hosted ntfy, and names that only look like ntfy.sh.
+            "https://ntfy.example.org/mytopic?email=a@b.c",
+            "https://notntfy.sh/mytopic",
+            "https://ntfy.sh.example.org/mytopic",
+            "https://user@push.example.org:8443/x?y#z",
+        ] {
+            assert!(ntfy_endpoint_allowed(endpoint), "{endpoint} should pass");
+        }
+    }
+
+    /// A stand-in for `checked_address` that counts its calls and answers
+    /// `addr`.
+    fn counting_resolver(
+        lookups: &AtomicUsize,
+        addr: SocketAddr,
+    ) -> impl FnOnce(String, u16) -> std::future::Ready<Option<SocketAddr>> + '_ {
+        move |_, _| {
+            lookups.fetch_add(1, Ordering::SeqCst);
+            std::future::ready(Some(addr))
+        }
+    }
+
+    #[tokio::test]
+    async fn refused_ntfy_endpoint_stops_before_the_lookup() {
+        let lookups = AtomicUsize::new(0);
+        let addr: SocketAddr = "203.0.113.7:443".parse().unwrap();
+
+        let refused =
+            resolve_destination("https://ntfy.sh/mytopic", counting_resolver(&lookups, addr)).await;
+        assert_eq!(
+            refused,
+            Destination::NotNtfyTopic {
+                host: "ntfy.sh".to_string()
+            }
         );
-        assert_ne!(
-            limit_key(ip("2606:4700:4700::1111")),
-            limit_key(ip("2606:4700:4700:1::1111"))
+        assert_eq!(lookups.load(Ordering::SeqCst), 0);
+
+        let invalid =
+            resolve_destination("http://ntfy.sh/mytopic", counting_resolver(&lookups, addr)).await;
+        assert_eq!(invalid, Destination::Invalid);
+        assert_eq!(lookups.load(Ordering::SeqCst), 0);
+
+        // The same resolver is reached for a topic URL and for other hosts.
+        let topic = format!("https://ntfy.sh/{TOPIC}?up=1");
+        let checked = resolve_destination(&topic, counting_resolver(&lookups, addr)).await;
+        assert_eq!(
+            checked,
+            Destination::Checked {
+                host: "ntfy.sh".to_string(),
+                addr
+            }
         );
+        assert_eq!(lookups.load(Ordering::SeqCst), 1);
+
+        let other = resolve_destination(
+            "https://push.example.org/mytopic",
+            counting_resolver(&lookups, addr),
+        )
+        .await;
+        assert_eq!(
+            other,
+            Destination::Checked {
+                host: "push.example.org".to_string(),
+                addr
+            }
+        );
+        assert_eq!(lookups.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn only_http_answers_are_rejections() {
+        assert!(!is_http_rejection(&Ok(())));
+
+        for err in [
+            WebPushError::Unauthorized,
+            WebPushError::BadRequest(None),
+            WebPushError::BadRequest(Some("bad".to_string())),
+            WebPushError::ServerError(None),
+            WebPushError::ServerError(Some(Duration::from_secs(5))),
+            WebPushError::EndpointNotValid,
+            WebPushError::EndpointNotFound,
+            WebPushError::PayloadTooLarge,
+            WebPushError::Other("302".to_string()),
+            WebPushError::Other("403".to_string()),
+            WebPushError::Other("429".to_string()),
+            WebPushError::InvalidResponse,
+        ] {
+            assert!(is_http_rejection(&Err(err.clone())), "{err:?}");
+        }
+
+        for err in [
+            WebPushError::Unspecified,
+            WebPushError::NotImplemented,
+            WebPushError::InvalidUri,
+            WebPushError::TlsError,
+            WebPushError::SslError,
+            WebPushError::IoError,
+            WebPushError::InvalidPackageName,
+            WebPushError::InvalidTtl,
+            WebPushError::InvalidTopic,
+            WebPushError::MissingCryptoKeys,
+            WebPushError::InvalidCryptoKeys,
+            WebPushError::InvalidClaims,
+        ] {
+            assert!(!is_http_rejection(&Err(err.clone())), "{err:?}");
+        }
+
+        for status in [200, 201, 202] {
+            let result = parse_response(StatusCode::from_u16(status).unwrap(), vec![]);
+            assert!(!is_http_rejection(&result), "status {status}");
+        }
+
+        for status in [
+            301, 302, 307, 400, 401, 403, 404, 410, 413, 429, 500, 502, 503, 507,
+        ] {
+            let result = parse_response(StatusCode::from_u16(status).unwrap(), vec![]);
+            assert!(is_http_rejection(&result), "status {status}");
+        }
+    }
+
+    #[test]
+    fn slot_timeout_log_is_throttled() {
+        let t0 = Instant::now();
+        let throttle = LogThrottle {
+            epoch: t0,
+            every: Duration::from_secs(60),
+            last: AtomicU64::new(0),
+        };
+        let at = |secs: u64| t0 + Duration::from_secs(secs);
+
+        assert!(throttle.ready(at(0)));
+        assert!(!throttle.ready(at(1)));
+        assert!(!throttle.ready(at(59)));
+        assert!(throttle.ready(at(60)));
+        assert!(!throttle.ready(at(61)));
+        assert!(throttle.ready(at(500)));
+    }
+
+    /// The default limits, except for the generic destination's.
+    fn generic_limiter(generic: DestLimits) -> UpLimiter {
+        UpLimiter::with(UpLimits {
+            generic,
+            ..UpLimits::default()
+        })
+    }
+
+    fn default_generic() -> DestLimits {
+        UpLimits::default().generic
+    }
+
+    /// A `make_msg` for `gated_send` that builds a pin-test message.
+    fn plain_message() -> Result<WebPushMessage> {
+        Ok(pin_test_message("/up/abc"))
     }
 
     #[tokio::test]
     async fn gated_send_denies_before_signing_or_sending() {
         let server = serve("201 Created", "");
-        let limiter = UpLimiter::with_limits(1.0, 0.0, 1.0, 0.0, 16);
+        let limiter = generic_limiter(DestLimits {
+            send_burst: 1.0,
+            send_refill_per_sec: 0.0,
+            ..default_generic()
+        });
         let client = http_client();
         let builds = AtomicUsize::new(0);
+        let key = DestKey::Ip(server.addr.ip());
 
         let sent = tokio::time::timeout(
             WAIT,
@@ -1151,13 +1745,25 @@ mod tests {
                 &limiter,
                 &client,
                 "A",
+                SubKey(1),
+                key,
                 server.addr,
+                SLOT_WAIT,
                 counted_message(&builds),
             ),
         )
         .await
         .expect("the send must answer on its own");
-        assert!(matches!(sent, Gated::Sent(Ok(()))), "{sent:?}");
+        assert!(
+            matches!(
+                sent,
+                Gated::Sent {
+                    result: Ok(()),
+                    rejected: None
+                }
+            ),
+            "{sent:?}"
+        );
 
         let denied = tokio::time::timeout(
             WAIT,
@@ -1165,7 +1771,10 @@ mod tests {
                 &limiter,
                 &client,
                 "A",
+                SubKey(1),
+                key,
                 server.addr,
+                SLOT_WAIT,
                 counted_message(&builds),
             ),
         )
@@ -1181,10 +1790,75 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn destination_limit_line_names_the_top_sender() {
+        let server = serve("201 Created", "");
+        let limiter = generic_limiter(DestLimits {
+            send_burst: 2.0,
+            send_refill_per_sec: 0.0,
+            ..default_generic()
+        });
+        let client = http_client();
+        let key = DestKey::Ip(server.addr.ip());
+
+        // A empties the destination bucket; B is the one who finds it empty.
+        for (user, sub) in [("A", 1), ("A", 2), ("B", 3)] {
+            let gated = tokio::time::timeout(
+                WAIT,
+                gated_send(
+                    &limiter,
+                    &client,
+                    user,
+                    SubKey(sub),
+                    key,
+                    server.addr,
+                    SLOT_WAIT,
+                    plain_message,
+                ),
+            )
+            .await
+            .expect("the send must answer on its own");
+
+            if user == "A" {
+                assert!(
+                    matches!(
+                        gated,
+                        Gated::Sent {
+                            result: Ok(()),
+                            rejected: None
+                        }
+                    ),
+                    "{gated:?}"
+                );
+            } else {
+                assert!(
+                    matches!(
+                        gated,
+                        Gated::Denied {
+                            first: true,
+                            bucket: Bucket::Ip
+                        }
+                    ),
+                    "{gated:?}"
+                );
+            }
+        }
+        assert_eq!(server.connections.load(Ordering::SeqCst), 2);
+
+        let line = destination_limit_line(&limiter, "push.example.org", key, "S", "B");
+        assert!(line.contains(": top senders A (2), "), "{line}");
+        assert!(line.ends_with("(this push: session S, user B)"), "{line}");
+    }
+
+    #[tokio::test]
     async fn gated_send_backs_off_only_the_user_a_429_names() {
         let server = serve("429 Too Many Requests", "");
-        let limiter = UpLimiter::with_limits(5.0, 0.0, 5.0, 0.0, 16);
+        let limiter = generic_limiter(DestLimits {
+            send_burst: 5.0,
+            send_refill_per_sec: 0.0,
+            ..default_generic()
+        });
         let builds = AtomicUsize::new(0);
+        let key = DestKey::Ip(server.addr.ip());
 
         let sent = tokio::time::timeout(
             WAIT,
@@ -1192,28 +1866,543 @@ mod tests {
                 &limiter,
                 &http_client(),
                 "A",
+                SubKey(1),
+                key,
                 server.addr,
+                SLOT_WAIT,
                 counted_message(&builds),
             ),
         )
         .await
         .expect("the send must answer on its own");
         assert!(
-            matches!(&sent, Gated::Sent(Err(WebPushError::Other(status))) if status == "429"),
+            matches!(&sent, Gated::Sent { result: Err(WebPushError::Other(status)), .. } if status == "429"),
             "{sent:?}"
         );
 
-        // A is drained for this destination; B still has its own allowance,
-        // and the shared destination bucket still has tokens.
-        let key = limit_key(server.addr.ip());
+        // A is drained for this destination (asked on a subscription the
+        // 429 did not cool); B still has its own allowance, and the shared
+        // destination bucket still has tokens.
         let now = Instant::now();
         assert!(matches!(
-            limiter.admit("A", key, now),
+            limiter.admit("A", SubKey(2), key, now),
             Admit::Denied {
                 bucket: Bucket::User,
                 ..
             }
         ));
-        assert_eq!(limiter.admit("B", key, now), Admit::Allowed);
+        assert!(matches!(
+            limiter.admit("B", SubKey(3), key, now),
+            Admit::Allowed(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn transport_error_costs_no_rejection_token() {
+        let server = serve("201 Created", "");
+        // A port nothing listens on: the send fails before any HTTP answer.
+        let closed = TcpListener::bind("127.0.0.1:0")
+            .expect("bind")
+            .local_addr()
+            .expect("addr");
+        assert_ne!(closed, server.addr);
+
+        // One rejection token and no refill, so a single strike would pause
+        // the destination.
+        let limiter = generic_limiter(DestLimits {
+            reject_burst: 1.0,
+            reject_refill_per_sec: 0.0,
+            ..default_generic()
+        });
+        let client = http_client();
+        let key = DestKey::Ip(closed.ip());
+        assert_eq!(key, DestKey::Ip(server.addr.ip()));
+
+        let failed = tokio::time::timeout(
+            WAIT,
+            gated_send(
+                &limiter,
+                &client,
+                "A",
+                SubKey(1),
+                key,
+                closed,
+                SLOT_WAIT,
+                plain_message,
+            ),
+        )
+        .await
+        .expect("the send must answer on its own");
+        assert!(
+            matches!(
+                failed,
+                Gated::Sent {
+                    result: Err(WebPushError::Unspecified),
+                    rejected: None
+                }
+            ),
+            "{failed:?}"
+        );
+
+        // Same user, subscription and destination: neither paused nor cooled.
+        let sent = tokio::time::timeout(
+            WAIT,
+            gated_send(
+                &limiter,
+                &client,
+                "A",
+                SubKey(1),
+                key,
+                server.addr,
+                SLOT_WAIT,
+                plain_message,
+            ),
+        )
+        .await
+        .expect("the send must answer on its own");
+        assert!(
+            matches!(
+                sent,
+                Gated::Sent {
+                    result: Ok(()),
+                    rejected: None
+                }
+            ),
+            "{sent:?}"
+        );
+        assert_eq!(server.connections.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn gated_rejection_cools_the_subscription() {
+        let server = serve("507 Insufficient Storage", "");
+        let limiter = UpLimiter::new();
+        let client = http_client();
+        let builds = AtomicUsize::new(0);
+        let key = DestKey::Ip(server.addr.ip());
+
+        let first = tokio::time::timeout(
+            WAIT,
+            gated_send(
+                &limiter,
+                &client,
+                "A",
+                SubKey(1),
+                key,
+                server.addr,
+                SLOT_WAIT,
+                counted_message(&builds),
+            ),
+        )
+        .await
+        .expect("the send must answer on its own");
+        assert!(
+            matches!(
+                first,
+                Gated::Sent {
+                    result: Err(WebPushError::ServerError(None)),
+                    rejected: Some(Rejected::Counted)
+                }
+            ),
+            "{first:?}"
+        );
+
+        let second = tokio::time::timeout(
+            WAIT,
+            gated_send(
+                &limiter,
+                &client,
+                "A",
+                SubKey(1),
+                key,
+                server.addr,
+                SLOT_WAIT,
+                counted_message(&builds),
+            ),
+        )
+        .await
+        .expect("the send must answer on its own");
+        assert!(
+            matches!(
+                second,
+                Gated::Denied {
+                    bucket: Bucket::Subscription,
+                    ..
+                }
+            ),
+            "{second:?}"
+        );
+
+        assert_eq!(builds.load(Ordering::SeqCst), 1);
+        assert_eq!(server.connections.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn gated_rejections_pause_the_destination() {
+        let server = serve("507 Insufficient Storage", "");
+        let limiter = generic_limiter(DestLimits {
+            reject_burst: 2.0,
+            reject_refill_per_sec: 0.0,
+            ..default_generic()
+        });
+        let client = http_client();
+        let key = DestKey::Ip(server.addr.ip());
+
+        let mut results = Vec::new();
+        for (user, sub) in [("A", 1), ("B", 2), ("C", 3)] {
+            let gated = tokio::time::timeout(
+                WAIT,
+                gated_send(
+                    &limiter,
+                    &client,
+                    user,
+                    SubKey(sub),
+                    key,
+                    server.addr,
+                    SLOT_WAIT,
+                    plain_message,
+                ),
+            )
+            .await
+            .expect("the send must answer on its own");
+            results.push(gated);
+        }
+
+        assert!(
+            matches!(
+                results[0],
+                Gated::Sent {
+                    rejected: Some(Rejected::Counted),
+                    ..
+                }
+            ),
+            "{:?}",
+            results[0]
+        );
+        let Gated::Sent {
+            rejected: Some(Rejected::Paused { top, .. }),
+            ..
+        } = &results[1]
+        else {
+            panic!("the second rejection must pause: {:?}", results[1]);
+        };
+        for user in ["A", "B"] {
+            assert!(top.iter().any(|o| o.user_id == user), "{user} in {top:?}");
+        }
+        assert!(
+            matches!(
+                results[2],
+                Gated::Denied {
+                    bucket: Bucket::Paused,
+                    ..
+                }
+            ),
+            "{:?}",
+            results[2]
+        );
+
+        assert_eq!(server.connections.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn concurrent_sends_wait_for_a_slot_instead_of_dropping() {
+        // Premise: ntfy.sh allows fewer sends in flight than this.
+        assert!(UpLimits::default().ntfy.max_in_flight < 10);
+
+        let server = serve("201 Created", "");
+        let limiter = Arc::new(UpLimiter::new());
+        let client = http_client();
+        let addr = server.addr;
+
+        let tasks: Vec<_> = (0..10u64)
+            .map(|i| {
+                let limiter = limiter.clone();
+                let client = client.clone();
+                tokio::spawn(async move {
+                    let user = format!("user{i}");
+                    gated_send(
+                        &limiter,
+                        &client,
+                        &user,
+                        SubKey(i),
+                        DestKey::Ntfy,
+                        addr,
+                        SLOT_WAIT,
+                        plain_message,
+                    )
+                    .await
+                })
+            })
+            .collect();
+
+        for task in tasks {
+            let gated = tokio::time::timeout(WAIT, task)
+                .await
+                .expect("the send must answer on its own")
+                .expect("the send must not panic");
+            assert!(
+                matches!(
+                    gated,
+                    Gated::Sent {
+                        result: Ok(()),
+                        rejected: None
+                    }
+                ),
+                "{gated:?}"
+            );
+        }
+
+        assert_eq!(server.connections.load(Ordering::SeqCst), 10);
+    }
+
+    #[tokio::test]
+    async fn waiting_send_is_woken_by_a_release() {
+        let server = serve("201 Created", "");
+        let limiter = generic_limiter(DestLimits {
+            reject_burst: 1.0,
+            reject_refill_per_sec: 0.0,
+            ..default_generic()
+        });
+        let client = http_client();
+        let key = DestKey::Ip(server.addr.ip());
+
+        // Another send holds the only rejection token.
+        let Admit::Allowed(held) = limiter.admit("X", SubKey(9), key, Instant::now()) else {
+            panic!("the first send must be admitted");
+        };
+        assert!(matches!(
+            limiter.admit("A", SubKey(1), key, Instant::now()),
+            Admit::Wait
+        ));
+
+        let started = Instant::now();
+        let (gated, ()) = tokio::time::timeout(WAIT, async {
+            tokio::join!(
+                gated_send(
+                    &limiter,
+                    &client,
+                    "A",
+                    SubKey(1),
+                    key,
+                    server.addr,
+                    SLOT_WAIT,
+                    plain_message,
+                ),
+                async move {
+                    tokio::time::sleep(Duration::from_millis(300)).await;
+                    held.success();
+                }
+            )
+        })
+        .await
+        .expect("the send must answer on its own");
+        let waited = started.elapsed();
+
+        assert!(
+            matches!(
+                gated,
+                Gated::Sent {
+                    result: Ok(()),
+                    rejected: None
+                }
+            ),
+            "{gated:?}"
+        );
+        assert!(waited >= Duration::from_millis(300), "{waited:?}");
+        assert!(waited < SLOT_WAIT, "{waited:?}");
+        assert_eq!(server.connections.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn waiting_send_gives_up_after_slot_wait() {
+        let server = serve("201 Created", "");
+        let limiter = generic_limiter(DestLimits {
+            reject_burst: 1.0,
+            reject_refill_per_sec: 0.0,
+            ..default_generic()
+        });
+        let client = http_client();
+        let builds = AtomicUsize::new(0);
+        let key = DestKey::Ip(server.addr.ip());
+        let slot_wait = Duration::from_millis(300);
+
+        let Admit::Allowed(held) = limiter.admit("X", SubKey(9), key, Instant::now()) else {
+            panic!("the first send must be admitted");
+        };
+
+        let started = Instant::now();
+        let gated = tokio::time::timeout(
+            WAIT,
+            gated_send(
+                &limiter,
+                &client,
+                "A",
+                SubKey(1),
+                key,
+                server.addr,
+                slot_wait,
+                counted_message(&builds),
+            ),
+        )
+        .await
+        .expect("the send must answer on its own");
+        let waited = started.elapsed();
+
+        assert!(matches!(gated, Gated::SlotTimeout), "{gated:?}");
+        assert!(waited >= slot_wait, "{waited:?}");
+        assert!(waited < WAIT, "{waited:?}");
+        assert_eq!(builds.load(Ordering::SeqCst), 0);
+        assert_eq!(server.connections.load(Ordering::SeqCst), 0);
+
+        // With the slot free again, the same send goes out.
+        drop(held);
+        let sent = tokio::time::timeout(
+            WAIT,
+            gated_send(
+                &limiter,
+                &client,
+                "A",
+                SubKey(1),
+                key,
+                server.addr,
+                slot_wait,
+                counted_message(&builds),
+            ),
+        )
+        .await
+        .expect("the send must answer on its own");
+        assert!(
+            matches!(
+                sent,
+                Gated::Sent {
+                    result: Ok(()),
+                    rejected: None
+                }
+            ),
+            "{sent:?}"
+        );
+        assert_eq!(server.connections.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn ntfy_429_does_not_pause_other_users() {
+        let throttled = serve("429 Too Many Requests", "");
+        let open = serve("201 Created", "");
+        let limiter = UpLimiter::new();
+        let client = http_client();
+
+        let first = tokio::time::timeout(
+            WAIT,
+            gated_send(
+                &limiter,
+                &client,
+                "A",
+                SubKey(1),
+                DestKey::Ntfy,
+                throttled.addr,
+                SLOT_WAIT,
+                plain_message,
+            ),
+        )
+        .await
+        .expect("the send must answer on its own");
+        assert!(
+            matches!(
+                &first,
+                Gated::Sent {
+                    result: Err(WebPushError::Other(status)),
+                    rejected: Some(Rejected::Counted)
+                } if status == "429"
+            ),
+            "{first:?}"
+        );
+
+        let second = tokio::time::timeout(
+            WAIT,
+            gated_send(
+                &limiter,
+                &client,
+                "B",
+                SubKey(2),
+                DestKey::Ntfy,
+                open.addr,
+                SLOT_WAIT,
+                plain_message,
+            ),
+        )
+        .await
+        .expect("the send must answer on its own");
+        assert!(
+            matches!(
+                second,
+                Gated::Sent {
+                    result: Ok(()),
+                    rejected: None
+                }
+            ),
+            "{second:?}"
+        );
+        assert_eq!(open.connections.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn ntfy_503_pauses_at_once() {
+        // Premise: without the 503 rule, one strike would not pause.
+        assert!(UpLimits::default().ntfy.reject_burst >= 2.0);
+
+        let server = serve("503 Service Unavailable", "");
+        let limiter = UpLimiter::new();
+        let client = http_client();
+
+        let first = tokio::time::timeout(
+            WAIT,
+            gated_send(
+                &limiter,
+                &client,
+                "A",
+                SubKey(1),
+                DestKey::Ntfy,
+                server.addr,
+                SLOT_WAIT,
+                plain_message,
+            ),
+        )
+        .await
+        .expect("the send must answer on its own");
+        let Gated::Sent {
+            result: Err(WebPushError::ServerError(None)),
+            rejected: Some(Rejected::Paused { top, .. }),
+        } = &first
+        else {
+            panic!("a 503 from ntfy.sh must pause: {first:?}");
+        };
+        assert!(top.iter().any(|o| o.user_id == "A"), "{top:?}");
+
+        let second = tokio::time::timeout(
+            WAIT,
+            gated_send(
+                &limiter,
+                &client,
+                "B",
+                SubKey(2),
+                DestKey::Ntfy,
+                server.addr,
+                SLOT_WAIT,
+                plain_message,
+            ),
+        )
+        .await
+        .expect("the send must answer on its own");
+        assert!(
+            matches!(
+                second,
+                Gated::Denied {
+                    bucket: Bucket::Paused,
+                    ..
+                }
+            ),
+            "{second:?}"
+        );
+        assert_eq!(server.connections.load(Ordering::SeqCst), 1);
     }
 }
