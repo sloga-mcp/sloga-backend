@@ -10,13 +10,13 @@ async fn test_upload_and_download() {
 
     s3.create_bucket(&bucket_id).await.unwrap();
 
-    let iv = s3
+    let (iv, key_id) = s3
         .encrypt_and_upload_file(&bucket_id, "/my-file", &buf)
         .await
         .unwrap();
 
     let buf = s3
-        .fetch_and_decrypt_file(&bucket_id, "/my-file", &iv)
+        .fetch_and_decrypt_file(&bucket_id, "/my-file", &iv, key_id.as_deref())
         .await
         .unwrap();
 
@@ -34,7 +34,8 @@ async fn test_upload_and_delete() {
 
     s3.create_bucket(&bucket_id).await.unwrap();
 
-    s3.encrypt_and_upload_file(&bucket_id, "/my-file", &buf)
+    let (_iv, _key_id) = s3
+        .encrypt_and_upload_file(&bucket_id, "/my-file", &buf)
         .await
         .unwrap();
 

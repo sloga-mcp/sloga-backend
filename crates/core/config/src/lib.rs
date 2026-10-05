@@ -587,7 +587,7 @@ pub struct FilesLimit {
     pub max_pixel_side: usize,
 }
 
-#[derive(Deserialize, Debug, Clone)]
+#[derive(Deserialize, Clone)]
 pub struct FilesS3 {
     pub endpoint: String,
     pub path_style_buckets: bool,
@@ -597,9 +597,220 @@ pub struct FilesS3 {
     pub default_bucket: String,
 }
 
-#[derive(Deserialize, Debug, Clone)]
+impl std::fmt::Debug for FilesS3 {
+    /// Same output as the derive, except `secret_access_key` is never printed
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Exhaustive destructure: a new field fails to compile until it is
+        // either printed or deliberately redacted here
+        let FilesS3 {
+            endpoint,
+            path_style_buckets,
+            region,
+            access_key_id,
+            secret_access_key: _,
+            default_bucket,
+        } = self;
+
+        f.debug_struct("FilesS3")
+            .field("endpoint", endpoint)
+            .field("path_style_buckets", path_style_buckets)
+            .field("region", region)
+            .field("access_key_id", access_key_id)
+            .field("secret_access_key", &"<redacted>")
+            .field("default_bucket", default_bucket)
+            .finish()
+    }
+}
+
+/// Secret map whose Debug never prints values.
+#[derive(Clone, Default)]
+pub struct RedactedKeys(pub HashMap<String, String>);
+
+impl std::fmt::Debug for RedactedKeys {
+    /// Prints the ids only, sorted, e.g. `RedactedKeys(["legacy"])`
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut ids: Vec<&String> = self.0.keys().collect();
+        ids.sort();
+        f.debug_tuple("RedactedKeys").field(&ids).finish()
+    }
+}
+
+/// Hand-written instead of derived: serde's stock type errors quote the value
+/// they were given (`invalid type: string "<key>"`), and a config error ends
+/// up in a boot panic. Accepts a table of strings only; no error built here
+/// contains any part of the value.
+impl<'de> Deserialize<'de> for RedactedKeys {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        // `deserialize_any` hands the value's real kind to the visitor, so no
+        // format-level conversion error (which may quote it) fires first
+        deserializer.deserialize_any(RedactedKeysVisitor)
+    }
+}
+
+struct RedactedKeysVisitor;
+
+impl RedactedKeysVisitor {
+    fn reject<E: serde::de::Error>(found: &str) -> E {
+        E::custom(format!(
+            "files.decrypt_keys must be a table of `id = \"base64 key\"`, not {found}"
+        ))
+    }
+}
+
+impl<'de> serde::de::Visitor<'de> for RedactedKeysVisitor {
+    type Value = RedactedKeys;
+
+    fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("a table of `id = \"base64 key\"`")
+    }
+
+    fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+        let mut keys = HashMap::new();
+        while let Some((id, value)) = map.next_entry::<String, RedactedKeyValue>()? {
+            keys.insert(id, value.0);
+        }
+        Ok(RedactedKeys(keys))
+    }
+
+    fn visit_str<E: serde::de::Error>(self, _: &str) -> Result<Self::Value, E> {
+        Err(Self::reject("a string"))
+    }
+
+    fn visit_borrowed_str<E: serde::de::Error>(self, _: &'de str) -> Result<Self::Value, E> {
+        Err(Self::reject("a string"))
+    }
+
+    fn visit_string<E: serde::de::Error>(self, _: String) -> Result<Self::Value, E> {
+        Err(Self::reject("a string"))
+    }
+
+    fn visit_bool<E: serde::de::Error>(self, _: bool) -> Result<Self::Value, E> {
+        Err(Self::reject("a boolean"))
+    }
+
+    fn visit_i64<E: serde::de::Error>(self, _: i64) -> Result<Self::Value, E> {
+        Err(Self::reject("a number"))
+    }
+
+    fn visit_i128<E: serde::de::Error>(self, _: i128) -> Result<Self::Value, E> {
+        Err(Self::reject("a number"))
+    }
+
+    fn visit_u64<E: serde::de::Error>(self, _: u64) -> Result<Self::Value, E> {
+        Err(Self::reject("a number"))
+    }
+
+    fn visit_u128<E: serde::de::Error>(self, _: u128) -> Result<Self::Value, E> {
+        Err(Self::reject("a number"))
+    }
+
+    fn visit_f64<E: serde::de::Error>(self, _: f64) -> Result<Self::Value, E> {
+        Err(Self::reject("a number"))
+    }
+
+    fn visit_bytes<E: serde::de::Error>(self, _: &[u8]) -> Result<Self::Value, E> {
+        Err(Self::reject("bytes"))
+    }
+
+    fn visit_unit<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+        Err(Self::reject("an empty value"))
+    }
+
+    fn visit_seq<A: serde::de::SeqAccess<'de>>(self, _: A) -> Result<Self::Value, A::Error> {
+        Err(Self::reject("an array"))
+    }
+}
+
+/// One `decrypt_keys` value: a string, taken as is. Any other kind is rejected
+/// without echoing it.
+struct RedactedKeyValue(String);
+
+impl<'de> Deserialize<'de> for RedactedKeyValue {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        // Not `deserialize_string`: config-rs would quietly turn `k1 = 5` into "5"
+        deserializer.deserialize_any(RedactedKeyValueVisitor)
+    }
+}
+
+struct RedactedKeyValueVisitor;
+
+impl RedactedKeyValueVisitor {
+    fn reject<E: serde::de::Error>(found: &str) -> E {
+        E::custom(format!(
+            "each files.decrypt_keys value must be a base64 key string, not {found}"
+        ))
+    }
+}
+
+impl<'de> serde::de::Visitor<'de> for RedactedKeyValueVisitor {
+    type Value = RedactedKeyValue;
+
+    fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("a base64 key string")
+    }
+
+    fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Self::Value, E> {
+        Ok(RedactedKeyValue(value.to_owned()))
+    }
+
+    fn visit_string<E: serde::de::Error>(self, value: String) -> Result<Self::Value, E> {
+        Ok(RedactedKeyValue(value))
+    }
+
+    fn visit_bool<E: serde::de::Error>(self, _: bool) -> Result<Self::Value, E> {
+        Err(Self::reject("a boolean"))
+    }
+
+    fn visit_i64<E: serde::de::Error>(self, _: i64) -> Result<Self::Value, E> {
+        Err(Self::reject("a number"))
+    }
+
+    fn visit_i128<E: serde::de::Error>(self, _: i128) -> Result<Self::Value, E> {
+        Err(Self::reject("a number"))
+    }
+
+    fn visit_u64<E: serde::de::Error>(self, _: u64) -> Result<Self::Value, E> {
+        Err(Self::reject("a number"))
+    }
+
+    fn visit_u128<E: serde::de::Error>(self, _: u128) -> Result<Self::Value, E> {
+        Err(Self::reject("a number"))
+    }
+
+    fn visit_f64<E: serde::de::Error>(self, _: f64) -> Result<Self::Value, E> {
+        Err(Self::reject("a number"))
+    }
+
+    fn visit_bytes<E: serde::de::Error>(self, _: &[u8]) -> Result<Self::Value, E> {
+        Err(Self::reject("bytes"))
+    }
+
+    fn visit_unit<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+        Err(Self::reject("an empty value"))
+    }
+
+    fn visit_seq<A: serde::de::SeqAccess<'de>>(self, _: A) -> Result<Self::Value, A::Error> {
+        Err(Self::reject("an array"))
+    }
+
+    fn visit_map<A: serde::de::MapAccess<'de>>(self, _: A) -> Result<Self::Value, A::Error> {
+        Err(Self::reject("a table"))
+    }
+}
+
+#[derive(Deserialize, Clone)]
 pub struct Files {
+    /// Primary (write) key, base64
     pub encryption_key: String,
+    /// Id the primary key is registered under; "legacy" means rows with no `key_id`
+    #[serde(default = "default_encryption_key_id")]
+    pub encryption_key_id: String,
+    /// Extra keys (id = base64 key) kept for reads and in-flight sessions
+    #[serde(default)]
+    pub decrypt_keys: RedactedKeys,
+    /// Refuse to boot on the "legacy" id or the committed default key
+    #[serde(default)]
+    pub require_rotated_key: bool,
     pub webp_quality: f32,
     pub blocked_mime_types: Vec<String>,
     pub clamd_host: String,
@@ -608,6 +819,46 @@ pub struct Files {
     pub limit: FilesLimit,
     pub preview: HashMap<String, [usize; 2]>,
     pub s3: FilesS3,
+}
+
+fn default_encryption_key_id() -> String {
+    "legacy".to_string()
+}
+
+impl std::fmt::Debug for Files {
+    /// Same output as the derive, except `encryption_key` is never printed and
+    /// `decrypt_keys` shows ids only
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Exhaustive destructure: a new field fails to compile until it is
+        // either printed or deliberately redacted here
+        let Files {
+            encryption_key: _,
+            encryption_key_id,
+            decrypt_keys,
+            require_rotated_key,
+            webp_quality,
+            blocked_mime_types,
+            clamd_host,
+            scan_mime_types,
+            limit,
+            preview,
+            s3,
+        } = self;
+
+        f.debug_struct("Files")
+            .field("encryption_key", &"<redacted>")
+            .field("encryption_key_id", encryption_key_id)
+            .field("decrypt_keys", decrypt_keys)
+            .field("require_rotated_key", require_rotated_key)
+            .field("webp_quality", webp_quality)
+            .field("blocked_mime_types", blocked_mime_types)
+            .field("clamd_host", clamd_host)
+            .field("scan_mime_types", scan_mime_types)
+            .field("limit", limit)
+            .field("preview", preview)
+            .field("s3", s3)
+            .finish()
+    }
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -1279,5 +1530,280 @@ mod january_tests {
 
         assert!(january.audio_embeds);
         assert_eq!(january.max_audio_bytes, 52_428_800);
+    }
+}
+
+// Key material must never reach a Debug string (logs, panics, Sentry). The keys
+// here are fake, but failures still print no formatted output, by convention.
+#[cfg(test)]
+mod files_debug_tests {
+    use config::{Config, ConfigError, Environment, File, FileFormat};
+
+    use super::{Files, FilesS3, RedactedKeys, Settings};
+
+    const PRIMARY: &str = "w1aFakePrimaryKeyNotARealKeyAAAAAAAAAAAAAAA=";
+    const EXTRA: &str = "w1aFakeDecryptKeyNotARealKeyBBBBBBBBBBBBBBB=";
+    const MISPLACED: &str = "w1fixFakeStringKeyNotARealKeyCCCCCCCCCCCCCC=";
+    const S3_SECRET: &str = "w1fixFakeS3SecretNotARealSecretDDDDDDDDDDDD";
+
+    /// A self-contained `[files]` table, so the test does not depend on the
+    /// bundled Revolt.toml
+    fn files_toml(extra: &str) -> String {
+        format!(
+            r#"
+[files]
+encryption_key = "{PRIMARY}"
+webp_quality = 80.0
+blocked_mime_types = []
+clamd_host = ""
+scan_mime_types = []
+
+[files.limit]
+min_file_size = 1
+min_resolution = [1, 1]
+max_mega_pixels = 40
+max_pixel_side = 10000
+
+[files.preview]
+attachments = [1280, 1280]
+
+[files.s3]
+endpoint = "http://minio:9000"
+path_style_buckets = false
+region = "minio"
+access_key_id = "minioautumn"
+secret_access_key = "minioautumn"
+default_bucket = "revolt-uploads"
+{extra}"#
+        )
+    }
+
+    fn parse(toml: &str) -> Files {
+        Config::builder()
+            .add_source(File::from_str(toml, FileFormat::Toml))
+            .build()
+            .expect("the test config builds")
+            .get::<Files>("files")
+            .expect("the test config deserializes")
+    }
+
+    #[test]
+    fn new_fields_default_when_absent() {
+        let files = parse(&files_toml(""));
+
+        assert_eq!(files.encryption_key_id, "legacy");
+        assert!(files.decrypt_keys.0.is_empty());
+        assert!(!files.require_rotated_key);
+    }
+
+    #[test]
+    fn files_debug_never_prints_a_key() {
+        let files = parse(&files_toml(&format!(
+            r#"
+[files.decrypt_keys]
+k2025 = "{EXTRA}"
+"#
+        )));
+
+        // The keys really did deserialize, or the assertions below prove nothing
+        assert!(files.encryption_key == PRIMARY, "primary key not loaded");
+        assert!(
+            files.decrypt_keys.0.get("k2025").map(String::as_str) == Some(EXTRA),
+            "decrypt key not loaded"
+        );
+
+        let debug = format!("{files:?}");
+        assert!(!debug.contains(PRIMARY), "Files Debug leaks encryption_key");
+        assert!(!debug.contains(EXTRA), "Files Debug leaks a decrypt key");
+        assert!(debug.contains(r#"encryption_key: "<redacted>""#));
+        assert!(debug.contains(r#"decrypt_keys: RedactedKeys(["k2025"])"#));
+        assert!(debug.contains(r#"encryption_key_id: "legacy""#));
+        assert!(debug.contains("require_rotated_key: false"));
+        assert!(debug.contains(r#"clamd_host: """#));
+    }
+
+    #[test]
+    fn redacted_keys_debug_prints_sorted_ids_only() {
+        let keys = RedactedKeys(
+            [
+                ("legacy".to_string(), PRIMARY.to_string()),
+                ("k2025".to_string(), EXTRA.to_string()),
+            ]
+            .into(),
+        );
+
+        let debug = format!("{keys:?}");
+        assert!(!debug.contains(PRIMARY), "RedactedKeys Debug leaks a value");
+        assert!(!debug.contains(EXTRA), "RedactedKeys Debug leaks a value");
+        assert_eq!(debug, r#"RedactedKeys(["k2025", "legacy"])"#);
+        assert_eq!(format!("{:?}", RedactedKeys::default()), "RedactedKeys([])");
+    }
+
+    /// `files_toml("")` with a second TOML source layered on top, the way
+    /// Revolt.overrides.toml is; returns the error instead of panicking
+    fn try_parse_with(overlay: &str) -> Result<Files, ConfigError> {
+        Config::builder()
+            .add_source(File::from_str(&files_toml(""), FileFormat::Toml))
+            .add_source(File::from_str(overlay, FileFormat::Toml))
+            .build()?
+            .get::<Files>("files")
+    }
+
+    /// The whole Settings, built as CONFIG_BUILDER builds it: the embedded
+    /// Revolt.toml, then the environment (supplied in-process)
+    fn try_settings_with_env(name: &str, value: &str) -> Result<Settings, ConfigError> {
+        Config::builder()
+            .add_source(File::from_str(
+                include_str!("../Revolt.toml"),
+                FileFormat::Toml,
+            ))
+            .add_source(
+                Environment::with_prefix("REVOLT")
+                    .separator("__")
+                    .source(Some([(name.to_string(), value.to_string())].into())),
+            )
+            .build()?
+            .try_deserialize::<Settings>()
+    }
+
+    /// Both renderings of a config error: Display reaches logs, and Debug
+    /// (which config-rs forwards to Display) reaches the boot `unwrap` panic
+    fn rendered(error: &ConfigError) -> String {
+        format!("{error} {error:?}")
+    }
+
+    const NOT_A_TABLE: &str =
+        "files.decrypt_keys must be a table of `id = \"base64 key\"`, not a string";
+
+    /// A key written where the table belongs fails with an error that names
+    /// the mistake, never the key. The leak check runs first, so the wording
+    /// check may print the error.
+    #[test]
+    fn decrypt_keys_as_a_string_fails_without_echoing_it() {
+        let Err(error) = try_parse_with(&format!("[files]\ndecrypt_keys = \"{MISPLACED}\"\n"))
+        else {
+            panic!("a string decrypt_keys deserialized");
+        };
+        assert!(
+            !rendered(&error).contains(MISPLACED),
+            "the TOML error echoes the key"
+        );
+        assert_eq!(format!("{error}"), NOT_A_TABLE);
+
+        let Err(error) = try_settings_with_env("REVOLT__FILES__DECRYPT_KEYS", MISPLACED) else {
+            panic!("a string REVOLT__FILES__DECRYPT_KEYS deserialized");
+        };
+        assert!(
+            !rendered(&error).contains(MISPLACED),
+            "the env error echoes the key"
+        );
+        assert_eq!(format!("{error}"), NOT_A_TABLE);
+    }
+
+    /// A table value of any other kind fails cleanly, and a nested table that
+    /// holds a key does not echo it either
+    #[test]
+    fn decrypt_keys_with_a_non_string_value_fails_cleanly() {
+        let cases = [
+            ("legacy = 987654321".to_string(), "a number"),
+            ("legacy = 1.5".to_string(), "a number"),
+            ("legacy = true".to_string(), "a boolean"),
+            ("legacy = []".to_string(), "an array"),
+            (format!("legacy = {{ key = \"{MISPLACED}\" }}"), "a table"),
+        ];
+
+        for (entry, found) in cases {
+            let Err(error) = try_parse_with(&format!("[files.decrypt_keys]\n{entry}\n")) else {
+                panic!("a non-string decrypt key deserialized ({found})");
+            };
+            let text = rendered(&error);
+            assert!(
+                !text.contains(MISPLACED),
+                "the error echoes a key ({found})"
+            );
+            assert!(
+                !text.contains("987654321"),
+                "the error echoes the value ({found})"
+            );
+            assert_eq!(
+                format!("{error}"),
+                format!("each files.decrypt_keys value must be a base64 key string, not {found}")
+            );
+        }
+    }
+
+    /// The normal shapes still load: a TOML table, and per-id environment
+    /// variables (config-rs lowercases the id)
+    #[test]
+    fn decrypt_keys_table_parses_from_toml_and_environment() {
+        let Ok(files) = try_parse_with(&format!(
+            "[files.decrypt_keys]\nk2025 = \"{EXTRA}\"\nlegacy = \"{PRIMARY}\"\n"
+        )) else {
+            panic!("a valid decrypt_keys table failed to deserialize");
+        };
+        let keys = &files.decrypt_keys.0;
+        assert!(keys.len() == 2, "wrong number of decrypt keys");
+        assert!(
+            keys.get("k2025").map(String::as_str) == Some(EXTRA),
+            "k2025 not loaded"
+        );
+        assert!(
+            keys.get("legacy").map(String::as_str) == Some(PRIMARY),
+            "legacy not loaded"
+        );
+
+        let Ok(settings) = try_settings_with_env("REVOLT__FILES__DECRYPT_KEYS__K1", EXTRA) else {
+            panic!("REVOLT__FILES__DECRYPT_KEYS__K1 failed to deserialize");
+        };
+        let keys = &settings.files.decrypt_keys.0;
+        assert!(
+            keys.len() == 1,
+            "wrong number of decrypt keys from the environment"
+        );
+        assert!(
+            keys.get("k1").map(String::as_str) == Some(EXTRA),
+            "k1 not loaded"
+        );
+    }
+
+    #[test]
+    fn files_s3_debug_redacts_the_secret_only() {
+        let s3 = FilesS3 {
+            endpoint: "http://minio:9000".to_string(),
+            path_style_buckets: false,
+            region: "minio".to_string(),
+            access_key_id: "w1fixAccessKeyId".to_string(),
+            secret_access_key: S3_SECRET.to_string(),
+            default_bucket: "revolt-uploads".to_string(),
+        };
+
+        let debug = format!("{s3:?}");
+        assert!(
+            !debug.contains(S3_SECRET),
+            "FilesS3 Debug leaks secret_access_key"
+        );
+        assert_eq!(
+            debug,
+            r#"FilesS3 { endpoint: "http://minio:9000", path_style_buckets: false, region: "minio", access_key_id: "w1fixAccessKeyId", secret_access_key: "<redacted>", default_bucket: "revolt-uploads" }"#
+        );
+
+        // And nested in Files, the way a Settings dump prints it
+        let Ok(files) = try_parse_with(&format!(
+            "[files.s3]\nsecret_access_key = \"{S3_SECRET}\"\n"
+        )) else {
+            panic!("the s3 overlay failed to deserialize");
+        };
+        assert!(
+            files.s3.secret_access_key == S3_SECRET,
+            "s3 secret not loaded"
+        );
+
+        let debug = format!("{files:?}");
+        assert!(
+            !debug.contains(S3_SECRET),
+            "Files Debug leaks secret_access_key"
+        );
+        assert!(debug.contains(r#"secret_access_key: "<redacted>""#));
+        assert!(debug.contains(r#"access_key_id: "minioautumn""#));
     }
 }

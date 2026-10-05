@@ -87,6 +87,10 @@ auto_derived!(
         /// Base64 of the 7-byte STREAM nonce prefix; copied into
         /// `FileHash.iv` at complete
         pub nonce_prefix: String,
+        /// Id of the server file key this session's parts are encrypted under,
+        /// frozen at create; absent = "legacy". Every part and the final object use it.
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        pub key_id: Option<String>,
         /// Recorded parts, keyed by STRINGIFIED part number ("1"..) — BSON
         /// rejects integer map keys, and atomic `$set {"parts.5": …}`
         /// updates produce string field names anyway
@@ -132,6 +136,9 @@ impl UploadSessionState {
 }
 
 impl UploadSession {
+    /// Open a `Pending` session with `key_id: None` ("legacy"); callers that
+    /// encrypt under a named file key set `session.key_id` after construction,
+    /// before the session is inserted.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         uploader_id: String,
@@ -157,6 +164,7 @@ impl UploadSession {
             bucket_id,
             s3_upload_id,
             nonce_prefix,
+            key_id: None,
             parts: HashMap::new(),
             in_flight: HashMap::new(),
             head_b64: String::new(),

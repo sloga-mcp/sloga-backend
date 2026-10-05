@@ -444,6 +444,7 @@ fn make_blob(at: SystemTime, size: isize, recipients: Vec<E2EEBlobRecipient>) ->
         size,
         bucket_id: "bucket".to_string(),
         iv: "iv".to_string(),
+        key_id: None,
         recipients,
     }
 }
@@ -509,6 +510,24 @@ async fn blob_fetch_tracking_and_recipient_scoped_authz() {
         assert!(db.delete_e2ee_blob(&blob.id).await.unwrap());
         assert!(!db.delete_e2ee_blob(&blob.id).await.unwrap());
         assert!(db.fetch_e2ee_blob(&blob.id).await.is_err());
+    });
+}
+
+#[tokio::test]
+async fn blob_key_id_round_trips() {
+    database_test!(|db| async move {
+        // A blob stored under a rotated file key fetches back with its key id
+        let mut rotated = make_blob(SystemTime::now(), 1000, vec![recipient("bob", "dev_b")]);
+        rotated.key_id = Some("k1".to_string());
+        db.insert_e2ee_blob(&rotated).await.unwrap();
+        let fetched = db.fetch_e2ee_blob(&rotated.id).await.unwrap();
+        assert_eq!(fetched.key_id.as_deref(), Some("k1"));
+
+        // A legacy blob (no key id) fetches back as None
+        let legacy = make_blob(SystemTime::now(), 1000, vec![recipient("bob", "dev_b")]);
+        db.insert_e2ee_blob(&legacy).await.unwrap();
+        let fetched = db.fetch_e2ee_blob(&legacy.id).await.unwrap();
+        assert_eq!(fetched.key_id, None);
     });
 }
 

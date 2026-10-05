@@ -28,6 +28,9 @@ pub struct PlaintextWindow {
 /// Open a decrypting stream over an inclusive ciphertext byte range of a v2
 /// object.
 ///
+/// The key comes from the keyring by the row's `key_id` (`None` selects the
+/// legacy key); an unknown id is an error, not a fallback.
+///
 /// The returned stream yields plaintext chunks and holds at most one
 /// segment plus one network chunk in memory.
 pub async fn open_v2_plaintext_stream(
@@ -37,8 +40,9 @@ pub async fn open_v2_plaintext_stream(
     ciphertext_start: u64,
     ciphertext_end_inclusive: u64,
     window: PlaintextWindow,
+    key_id: Option<&str>,
 ) -> anyhow::Result<impl Stream<Item = Result<Vec<u8>, io::Error>>> {
-    let cipher = SegmentedStreamCipher::from_config(prefix).await;
+    let cipher = SegmentedStreamCipher::from_config(prefix, key_id).await?;
     let storage = S3Storage::from_config(EncryptionKey::from_config().await).await;
     let body = storage
         .fetch_range(bucket_id, path, ciphertext_start, ciphertext_end_inclusive)

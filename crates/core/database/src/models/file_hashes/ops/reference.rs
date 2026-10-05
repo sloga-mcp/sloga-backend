@@ -27,14 +27,50 @@ impl AbstractAttachmentHashes for ReferenceDb {
             .ok_or(create_error!(NotFound))
     }
 
-    /// Update an attachment hash nonce value.
-    async fn set_attachment_hash_nonce(&self, hash: &str, nonce: &str) -> Result<()> {
+    /// Point a hash at its stored object (path, iv and key id).
+    async fn set_attachment_hash_storage(
+        &self,
+        hash: &str,
+        path: &str,
+        iv: &str,
+        key_id: Option<&str>,
+    ) -> Result<()> {
         let mut hashes = self.file_hashes.lock().await;
         if let Some(file) = hashes.get_mut(hash) {
-            file.iv = nonce.to_owned();
+            file.path = path.to_owned();
+            file.iv = iv.to_owned();
+            file.key_id = key_id.map(str::to_string);
             Ok(())
         } else {
             Err(create_error!(NotFound))
+        }
+    }
+
+    /// Compare-and-swap the storage triple; false if the row is missing or has moved on.
+    #[allow(clippy::too_many_arguments)]
+    async fn swap_attachment_hash_storage(
+        &self,
+        hash: &str,
+        old_path: &str,
+        old_iv: &str,
+        old_key_id: Option<&str>,
+        new_path: &str,
+        new_iv: &str,
+        new_key_id: Option<&str>,
+    ) -> Result<bool> {
+        let mut hashes = self.file_hashes.lock().await;
+        match hashes.get_mut(hash) {
+            Some(file)
+                if file.path == old_path
+                    && file.iv == old_iv
+                    && file.key_id.as_deref() == old_key_id =>
+            {
+                file.path = new_path.to_owned();
+                file.iv = new_iv.to_owned();
+                file.key_id = new_key_id.map(str::to_string);
+                Ok(true)
+            }
+            _ => Ok(false),
         }
     }
 

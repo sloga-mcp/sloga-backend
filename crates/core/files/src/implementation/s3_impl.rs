@@ -422,6 +422,7 @@ impl<ER: EncryptionRepository> FileStorageRepository for S3Storage<ER> {
         bucket_id: &str,
         path: &str,
         iv: &str,
+        key_id: Option<&str>,
     ) -> anyhow::Result<Vec<u8>> {
         let mut object = self
             .client
@@ -441,7 +442,7 @@ impl<ER: EncryptionRepository> FileStorageRepository for S3Storage<ER> {
         if iv.is_empty() {
             Ok(buf)
         } else {
-            self.encryption.decrypt_buffer(buf, iv)
+            self.encryption.decrypt_buffer(buf, iv, key_id)
         }
     }
 
@@ -450,8 +451,8 @@ impl<ER: EncryptionRepository> FileStorageRepository for S3Storage<ER> {
         bucket_id: &str,
         path: &str,
         buf: &[u8],
-    ) -> anyhow::Result<String> {
-        let (buf, iv) = self.encryption.encrypt_buffer(buf)?;
+    ) -> anyhow::Result<(String, Option<String>)> {
+        let (buf, iv, key_id) = self.encryption.encrypt_buffer(buf)?;
 
         if buf.len() > MULTIPART_THRESHOLD {
             self.multipart_upload(bucket_id, path, &buf).await?;
@@ -466,7 +467,7 @@ impl<ER: EncryptionRepository> FileStorageRepository for S3Storage<ER> {
                 .with_context(|| format!("failed to put object at {path} in {bucket_id}"))?;
         }
 
-        Ok(iv)
+        Ok((iv, key_id))
     }
 
     async fn delete_file(&self, bucket_id: &str, path: &str) -> anyhow::Result<()> {
