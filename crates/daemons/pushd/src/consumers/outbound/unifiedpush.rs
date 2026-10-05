@@ -1,13 +1,15 @@
 use std::{
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use crate::{
     consumers::outbound::fcm::{notification_data, NotificationData},
     utils::Consumer,
 };
+
+use super::up_limiter::{Admit, Bucket, UpLimiter};
 
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
@@ -16,7 +18,7 @@ use base64::{
     Engine as _,
 };
 use isahc::{
-    config::{Configurable, Dialer},
+    config::{Configurable, Dialer, RedirectPolicy},
     http::{Request, Uri},
     AsyncBody, HttpClient, RequestExt,
 };
@@ -60,6 +62,19 @@ pub struct UnifiedPushOutboundConsumer {
     channel: Arc<AMQPChannel>,
     client: HttpClient,
     pkey: Arc<Vec<u8>>,
+    /// Shared by every clone, so the limits hold across deliveries.
+    limiter: Arc<UpLimiter>,
+}
+
+/// What happened to a send that went through the rate limiter.
+#[derive(Debug)]
+enum Gated {
+    /// Over a limit: nothing was signed or sent.
+    Denied { first: bool, bucket: Bucket },
+    /// Admitted, but signing or encrypting the message failed.
+    BuildFailed(anyhow::Error),
+    /// Admitted and sent; the push server's answer.
+    Sent(Result<(), WebPushError>),
 }
 
 #[async_trait]
@@ -77,21 +92,14 @@ impl Consumer for UnifiedPushOutboundConsumer {
                 .expect("valid `VAPID_PRIVATE_KEY`"),
         );
 
-        // isahc never times out on its own, and the endpoint is
-        // client-supplied, so a stalled server would pin a consumer task.
-        // isahc does not follow redirects by default, which we rely on too.
         // One client for every send: each one spawns an agent thread.
-        let http_client = HttpClient::builder()
-            .timeout(Duration::from_secs(10))
-            .build()
-            .expect("isahc HttpClient");
-
         Self {
             db,
             connection,
             channel,
-            client: http_client,
+            client: http_client(),
             pkey: web_push_private_key,
+            limiter: Arc::new(UpLimiter::new()),
         }
     }
 
@@ -159,17 +167,49 @@ impl Consumer for UnifiedPushOutboundConsumer {
             return Ok(());
         };
 
+        // Read before the gate: the message is built in a sync closure.
         let ring_secs = revolt_config::config().await.api.livekit.call_ring_duration;
 
-        let signature = VapidSignatureBuilder::from_pem(
-            std::io::Cursor::new(self.pkey.as_ref()),
-            &subscription,
-        )?
-        .build()?;
+        // Signing and encryption run only once the send is admitted.
+        let gated = gated_send(&self.limiter, &self.client, &payload.user_id, addr, || {
+            let signature = VapidSignatureBuilder::from_pem(
+                std::io::Cursor::new(self.pkey.as_ref()),
+                &subscription,
+            )?
+            .build()?;
 
-        let msg = build_message(&subscription, Some(signature), &bytes, &ty, ring_secs)?;
+            Ok(build_message(
+                &subscription,
+                Some(signature),
+                &bytes,
+                &ty,
+                ring_secs,
+            )?)
+        })
+        .await;
 
-        let result = self.post(msg, addr).await;
+        let result = match gated {
+            Gated::Denied { first, bucket } => {
+                // Once per empty episode of that bucket, so a flood of drops
+                // does not become a flood of log lines.
+                if first {
+                    let limit = match bucket {
+                        Bucket::Ip => "destination",
+                        Bucket::User => "per-user",
+                    };
+
+                    warn!(
+                        "Dropping UnifiedPush for session {} (user: {}) to {}: {} limit",
+                        payload.session_id, payload.user_id, host, limit
+                    );
+                }
+
+                return Ok(());
+            }
+            Gated::BuildFailed(err) => return Err(err),
+            Gated::Sent(result) => result,
+        };
+
         match outcome(&result) {
             Outcome::Delivered => {}
             // Only drop the endpoint if it is still the stored one, so a late
@@ -197,10 +237,18 @@ impl Consumer for UnifiedPushOutboundConsumer {
                         "UnifiedPush VAPID rejected for session {} (subscription kept)",
                         payload.session_id
                     );
+                } else if should_drain(&result) {
+                    // Rate limited by the push server: gated_send has already
+                    // backed this user off for that destination. Logged on its
+                    // own so a 429 never hides behind the generic error text.
+                    warn!(
+                        "UnifiedPush {} for session {} (user: {}) rate limited by {} (429)",
+                        ty, payload.session_id, payload.user_id, host
+                    );
                 } else if let Err(err) = result {
                     warn!(
-                        "UnifiedPush {} for session {} failed: {}",
-                        ty, payload.session_id, err
+                        "UnifiedPush {} for session {} failed: {} ({:?})",
+                        ty, payload.session_id, err, err
                     );
                 }
             }
@@ -210,20 +258,68 @@ impl Consumer for UnifiedPushOutboundConsumer {
     }
 }
 
-impl UnifiedPushOutboundConsumer {
-    /// POST a message to its endpoint, connecting only to `addr`.
-    async fn post(&self, message: WebPushMessage, addr: SocketAddr) -> Result<(), WebPushError> {
-        let request = pinned_request(message, addr).map_err(|_| WebPushError::Unspecified)?;
+/// The HTTP client for every send. isahc never times out on its own, and the
+/// endpoint is client-supplied, so a stalled server would pin a consumer task.
+/// Redirects are never followed: a push server answers directly.
+fn http_client() -> HttpClient {
+    HttpClient::builder()
+        .timeout(Duration::from_secs(10))
+        .connect_timeout(Duration::from_secs(5))
+        .redirect_policy(RedirectPolicy::None)
+        .build()
+        .expect("isahc HttpClient")
+}
 
-        // A transport error becomes WebPushError::Unspecified, as it does in
-        // web-push's IsahcWebPushClient (isahc_client.rs, error.rs).
-        let response = self.client.send_async(request).await?;
+/// POST a message to its endpoint, connecting only to `addr`.
+async fn send_pinned(
+    client: &HttpClient,
+    message: WebPushMessage,
+    addr: SocketAddr,
+) -> Result<(), WebPushError> {
+    let request = pinned_request(message, addr).map_err(|_| WebPushError::Unspecified)?;
 
-        // The body is never read: there is no capped reader without a new
-        // dependency, it only carries error detail, and every error except
-        // 404/410 is kept anyway. Dropping the response aborts the transfer.
-        parse_response(response.status(), Vec::new())
+    // A transport error becomes WebPushError::Unspecified, as it does in
+    // web-push's IsahcWebPushClient (isahc_client.rs, error.rs).
+    let response = client.send_async(request).await?;
+
+    // The body is never read: there is no capped reader without a new
+    // dependency, it only carries error detail, and every error except
+    // 404/410 is kept anyway. Dropping the response aborts the transfer.
+    parse_response(response.status(), Vec::new())
+}
+
+/// Admit, build, send, and back off on a 429, in that order. `make_msg`
+/// (VAPID signing and encryption) runs only once the send is admitted. Both
+/// limiter calls are synchronous, so its lock is never held across an await.
+async fn gated_send<F>(
+    limiter: &UpLimiter,
+    client: &HttpClient,
+    user_id: &str,
+    addr: SocketAddr,
+    make_msg: F,
+) -> Gated
+where
+    F: FnOnce() -> Result<WebPushMessage>,
+{
+    let key = limit_key(addr.ip());
+    if let Admit::Denied { first, bucket } = limiter.admit(user_id, key, Instant::now()) {
+        return Gated::Denied { first, bucket };
     }
+
+    let message = match make_msg() {
+        Ok(message) => message,
+        Err(err) => return Gated::BuildFailed(err),
+    };
+
+    let result = send_pinned(client, message, addr).await;
+
+    // ntfy charges UnifiedPush topics to the subscriber, so a 429 is about
+    // this user's pushes to this destination, not everyone's.
+    if should_drain(&result) {
+        limiter.drain_user(user_id, key, Instant::now());
+    }
+
+    Gated::Sent(result)
 }
 
 /// Truncate `s` to at most `max` bytes without splitting a character.
@@ -308,6 +404,12 @@ fn outcome(result: &Result<(), WebPushError>) -> Outcome {
         Err(WebPushError::EndpointNotFound | WebPushError::EndpointNotValid) => Outcome::Prune,
         Err(_) => Outcome::Keep,
     }
+}
+
+/// Whether the push server told us to slow down. web-push reports a 429 as
+/// `Other("429")` (request_builder.rs).
+fn should_drain(result: &Result<(), WebPushError>) -> bool {
+    matches!(result, Err(WebPushError::Other(status)) if status == "429")
 }
 
 /// Host and port to resolve for an endpoint. Only https is accepted.
@@ -434,9 +536,36 @@ fn embedded_ipv4(v6: Ipv6Addr) -> Option<Ipv4Addr> {
     }
 }
 
+/// The rate-limit key for a checked address. An IPv6 address that carries an
+/// IPv4 one counts as that IPv4, and any other IPv6 address counts as its /64,
+/// so rotating addresses inside one /64 or spelling one IPv4 address several
+/// ways does not buy a destination more allowances.
+fn limit_key(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V4(_) => ip,
+        IpAddr::V6(v6) => match embedded_ipv4(v6) {
+            Some(v4) => IpAddr::V4(v4),
+            None => {
+                let mut segments = v6.segments();
+                segments[4..].fill(0);
+                IpAddr::V6(Ipv6Addr::from(segments))
+            }
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use std::{
+        io::{Read, Write},
+        net::{TcpListener, TcpStream},
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            mpsc,
+        },
+    };
 
     use isahc::http::StatusCode;
 
@@ -793,5 +922,298 @@ mod tests {
             "encrypted body is {} bytes",
             payload.content.len()
         );
+    }
+
+    /// Longest any test waits on a send, a lookup or a listener. Longer than
+    /// the client's own 10 s timeout, so a broken send fails instead of hangs.
+    const WAIT: Duration = Duration::from_secs(15);
+
+    /// How long a test listener keeps accepting connections.
+    const LISTEN_FOR: Duration = Duration::from_secs(20);
+
+    /// A local push server on a background thread.
+    struct TestServer {
+        addr: SocketAddr,
+        /// Every connection it accepted.
+        connections: Arc<AtomicUsize>,
+        /// The head of each request, in order.
+        requests: mpsc::Receiver<String>,
+    }
+
+    /// Answers every connection with `status` plus `headers` (each ending in
+    /// CRLF) and an empty body, until `LISTEN_FOR` has passed.
+    fn serve(status: &str, headers: &str) -> TestServer {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        listener.set_nonblocking(true).expect("nonblocking");
+        let addr = listener.local_addr().expect("addr");
+        let response =
+            format!("HTTP/1.1 {status}\r\n{headers}Content-Length: 0\r\nConnection: close\r\n\r\n");
+
+        let connections = Arc::new(AtomicUsize::new(0));
+        let counter = connections.clone();
+        let (requests_tx, requests) = mpsc::channel();
+        std::thread::spawn(move || {
+            let deadline = Instant::now() + LISTEN_FOR;
+            while Instant::now() < deadline {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        counter.fetch_add(1, Ordering::SeqCst);
+                        let _ = requests_tx.send(read_request(&mut stream));
+                        let _ = stream.write_all(response.as_bytes());
+                        let _ = stream.flush();
+                    }
+                    Err(_) => std::thread::sleep(Duration::from_millis(10)),
+                }
+            }
+        });
+
+        TestServer {
+            addr,
+            connections,
+            requests,
+        }
+    }
+
+    /// Reads one request through the end of its headers, then its body, so
+    /// closing the socket afterwards cannot reset the connection under the
+    /// client. Returns the request head.
+    fn read_request(stream: &mut TcpStream) -> String {
+        let _ = stream.set_nonblocking(false);
+        let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+
+        let mut data = Vec::new();
+        let mut chunk = [0u8; 4096];
+        let head_end = loop {
+            if let Some(i) = data.windows(4).position(|w| w == b"\r\n\r\n") {
+                break i + 4;
+            }
+
+            match stream.read(&mut chunk) {
+                Ok(n) if n > 0 && data.len() < 65536 => data.extend_from_slice(&chunk[..n]),
+                _ => return String::from_utf8_lossy(&data).into_owned(),
+            }
+        };
+
+        let head = String::from_utf8_lossy(&data[..head_end]).into_owned();
+        let body_len = head
+            .lines()
+            .filter_map(|line| line.split_once(':'))
+            .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+            .and_then(|(_, value)| value.trim().parse::<usize>().ok())
+            .unwrap_or(0);
+
+        let mut read = data.len() - head_end;
+        while read < body_len {
+            match stream.read(&mut chunk) {
+                Ok(n) if n > 0 => read += n,
+                _ => break,
+            }
+        }
+
+        head
+    }
+
+    /// A message for `http://pin-test.invalid:9{path}`. That host never
+    /// resolves, so only a pinned connect can reach a local listener.
+    fn pin_test_message(path: &str) -> WebPushMessage {
+        let mut subscription = test_subscription();
+        subscription.endpoint = format!("http://pin-test.invalid:9{path}");
+
+        build_message(&subscription, None, b"{}", "push.message", 30).unwrap()
+    }
+
+    /// A `make_msg` for `gated_send` that counts how often it ran.
+    fn counted_message(builds: &AtomicUsize) -> impl FnOnce() -> Result<WebPushMessage> + '_ {
+        move || {
+            builds.fetch_add(1, Ordering::SeqCst);
+            Ok(pin_test_message("/up/abc"))
+        }
+    }
+
+    #[tokio::test]
+    async fn send_connects_only_to_the_pinned_address() {
+        // Premise: nothing but the pin can take the send to the listener.
+        let lookup = tokio::time::timeout(WAIT, tokio::net::lookup_host(("pin-test.invalid", 9)))
+            .await
+            .expect("the lookup must answer");
+        assert!(lookup.is_err(), "pin-test.invalid must not resolve");
+
+        let server = serve("201 Created", "");
+        let result = tokio::time::timeout(
+            WAIT,
+            send_pinned(&http_client(), pin_test_message("/up/abc"), server.addr),
+        )
+        .await
+        .expect("the send must answer on its own");
+        assert_eq!(result, Ok(()));
+
+        let head = server.requests.recv_timeout(WAIT).expect("a request");
+        assert!(head.starts_with("POST /up/abc HTTP/1.1\r\n"), "{head}");
+        // Port 9 is not the listener's, so the pin replaced only the connect:
+        // the request still names the endpoint's own host and port.
+        assert!(
+            head.to_ascii_lowercase()
+                .contains("\r\nhost: pin-test.invalid:9\r\n"),
+            "{head}"
+        );
+    }
+
+    #[tokio::test]
+    async fn send_never_follows_a_redirect() {
+        // Where the redirect points; nothing may ever connect here.
+        let target = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let target_port = target.local_addr().expect("addr").port();
+        target.set_nonblocking(true).expect("nonblocking");
+
+        let redirector = serve(
+            "302 Found",
+            &format!("Location: http://127.0.0.1:{target_port}/x\r\n"),
+        );
+        let result = tokio::time::timeout(
+            WAIT,
+            send_pinned(&http_client(), pin_test_message("/up/abc"), redirector.addr),
+        )
+        .await
+        .expect("the send must answer on its own");
+
+        assert_eq!(result, Err(WebPushError::Other("302".to_string())));
+        assert_eq!(outcome(&result), Outcome::Keep);
+        // A followed redirect keeps the pin, so it would come back to the
+        // redirector rather than reach the target: count the redirector.
+        assert_eq!(redirector.connections.load(Ordering::SeqCst), 1);
+        assert!(matches!(
+            target.accept(),
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock
+        ));
+    }
+
+    #[tokio::test]
+    async fn checked_address_refuses_local_and_unresolvable_hosts() {
+        for host in [
+            "127.0.0.1",
+            "::1",
+            "::ffff:127.0.0.1",
+            "localhost",
+            "pin-test.invalid",
+        ] {
+            let addr = tokio::time::timeout(WAIT, checked_address(host, 443))
+                .await
+                .expect("the lookup must answer");
+            assert_eq!(addr, None, "{host}");
+        }
+    }
+
+    #[test]
+    fn limit_key_folds_each_destination_into_one_key() {
+        let ip = |addr: &str| addr.parse::<IpAddr>().unwrap();
+
+        assert_eq!(limit_key(ip("1.2.3.4")), ip("1.2.3.4"));
+        for addr in [
+            "::ffff:1.2.3.4",
+            "::ffff:0:1.2.3.4",
+            "64:ff9b::102:304",
+            "2002:102:304::1",
+        ] {
+            assert_eq!(limit_key(ip(addr)), ip("1.2.3.4"), "{addr}");
+        }
+
+        // One /64, whatever the low bits.
+        assert_eq!(
+            limit_key(ip("2606:4700:4700::1111")),
+            ip("2606:4700:4700::")
+        );
+        assert_eq!(
+            limit_key(ip("2001:db8:1:2:aaaa:bbbb:cccc:dddd")),
+            limit_key(ip("2001:db8:1:2::1"))
+        );
+
+        // Different /64s stay apart.
+        assert_ne!(
+            limit_key(ip("2001:db8:1:2::1")),
+            limit_key(ip("2001:db8:1:3::1"))
+        );
+        assert_ne!(
+            limit_key(ip("2606:4700:4700::1111")),
+            limit_key(ip("2606:4700:4700:1::1111"))
+        );
+    }
+
+    #[tokio::test]
+    async fn gated_send_denies_before_signing_or_sending() {
+        let server = serve("201 Created", "");
+        let limiter = UpLimiter::with_limits(1.0, 0.0, 1.0, 0.0, 16);
+        let client = http_client();
+        let builds = AtomicUsize::new(0);
+
+        let sent = tokio::time::timeout(
+            WAIT,
+            gated_send(
+                &limiter,
+                &client,
+                "A",
+                server.addr,
+                counted_message(&builds),
+            ),
+        )
+        .await
+        .expect("the send must answer on its own");
+        assert!(matches!(sent, Gated::Sent(Ok(()))), "{sent:?}");
+
+        let denied = tokio::time::timeout(
+            WAIT,
+            gated_send(
+                &limiter,
+                &client,
+                "A",
+                server.addr,
+                counted_message(&builds),
+            ),
+        )
+        .await
+        .expect("the send must answer on its own");
+        assert!(
+            matches!(denied, Gated::Denied { first: true, .. }),
+            "{denied:?}"
+        );
+
+        assert_eq!(builds.load(Ordering::SeqCst), 1);
+        assert_eq!(server.connections.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn gated_send_backs_off_only_the_user_a_429_names() {
+        let server = serve("429 Too Many Requests", "");
+        let limiter = UpLimiter::with_limits(5.0, 0.0, 5.0, 0.0, 16);
+        let builds = AtomicUsize::new(0);
+
+        let sent = tokio::time::timeout(
+            WAIT,
+            gated_send(
+                &limiter,
+                &http_client(),
+                "A",
+                server.addr,
+                counted_message(&builds),
+            ),
+        )
+        .await
+        .expect("the send must answer on its own");
+        assert!(
+            matches!(&sent, Gated::Sent(Err(WebPushError::Other(status))) if status == "429"),
+            "{sent:?}"
+        );
+
+        // A is drained for this destination; B still has its own allowance,
+        // and the shared destination bucket still has tokens.
+        let key = limit_key(server.addr.ip());
+        let now = Instant::now();
+        assert!(matches!(
+            limiter.admit("A", key, now),
+            Admit::Denied {
+                bucket: Bucket::User,
+                ..
+            }
+        ));
+        assert_eq!(limiter.admit("B", key, now), Admit::Allowed);
     }
 }
