@@ -3,6 +3,7 @@ use std::{future::Future, panic::AssertUnwindSafe, time::Duration};
 use futures::FutureExt;
 use revolt_config::{capture_error, configure};
 use revolt_database::{Database, DatabaseInfo, AMQP};
+use revolt_files::{FileKeyring, COMMITTED_DEFAULT_KEY_FP, LEGACY_KEY_ID};
 use revolt_result::Result;
 use tasks::*;
 use tokio::{join, time::sleep};
@@ -41,9 +42,43 @@ fn start_side_effect_workers(db: &Database, amqp: &AMQP) {
     revolt_database::tasks::start_workers(db.clone(), amqp.clone());
 }
 
+/// Build the server file keyring before any task runs, so a bad `[files]`
+/// key config stops crond at boot instead of panicking inside a task later.
+/// Logs key ids and fingerprints only, never a key.
+async fn init_file_keyring() {
+    let keyring = match FileKeyring::init_global().await {
+        Ok(keyring) => keyring,
+        Err(error) => {
+            eprintln!("invalid [files] key config: {error:#}");
+            log::error!("invalid [files] key config: {error:#}");
+            std::process::exit(1);
+        }
+    };
+
+    log::info!(
+        "file keyring: primary id={}",
+        keyring.primary_id().unwrap_or(LEGACY_KEY_ID)
+    );
+
+    for id in keyring.key_ids() {
+        let key_id = (id != LEGACY_KEY_ID).then_some(id.as_str());
+        match keyring.fingerprint(key_id) {
+            Ok(fingerprint) => log::info!("file keyring: id={id} fingerprint={fingerprint}"),
+            Err(error) => log::error!("file keyring: id={id} has no fingerprint: {error:#}"),
+        }
+    }
+
+    if keyring.fingerprint(keyring.primary_id()).ok().as_deref() == Some(COMMITTED_DEFAULT_KEY_FP) {
+        log::warn!(
+            "files.encryption_key is upstream's committed default; anyone with the bucket can decrypt"
+        );
+    }
+}
+
 #[tokio::main]
 async fn main() {
     configure!(crond);
+    init_file_keyring().await;
 
     let db = DatabaseInfo::Auto.connect().await.expect("database");
     let amqp = AMQP::new_auto().await;

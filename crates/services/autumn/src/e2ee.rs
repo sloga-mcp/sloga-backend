@@ -23,7 +23,7 @@ use revolt_config::config;
 use revolt_database::{
     Database, E2EEBlob, E2EEBlobRecipient, Session, User, E2EE_MAX_BLOB_RECIPIENTS,
 };
-use revolt_files::{delete_from_s3, fetch_from_s3, upload_to_s3};
+use revolt_files::{delete_from_s3, fetch_from_s3, upload_to_s3, FileKeyring};
 use revolt_permissions::{calculate_user_permissions, UserPermission};
 use revolt_result::{create_error, Result};
 use serde::{Deserialize, Serialize};
@@ -213,10 +213,27 @@ pub async fn upload_blob(
 
     let id = ulid::Ulid::new().to_string();
     let bucket_id = config().await.files.s3.default_bucket;
+    let path = E2EEBlob::s3_path(&id);
+
+    // Snapshot the primary file key id before the write; the row must name
+    // exactly the key the at-rest layer used, or the blob is unreadable
+    let kid: Option<String> = FileKeyring::global().await.primary_id().map(str::to_string);
 
     // Upload to S3 first, then commit the record — an orphaned S3 object is
     // recoverable garbage, an orphaned record is a broken fetch
-    let iv = upload_to_s3(&bucket_id, &E2EEBlob::s3_path(&id), &buf).await?;
+    let (iv, key_id) = upload_to_s3(&bucket_id, &path, &buf).await?;
+
+    if key_id != kid {
+        tracing::error!(
+            "e2ee blob {id} was encrypted under file key {key_id:?}, expected {kid:?}; discarding it"
+        );
+
+        if let Err(error) = delete_from_s3(&bucket_id, &path).await {
+            tracing::warn!("failed to delete discarded e2ee blob {id} from S3: {error:?}");
+        }
+
+        return Err(create_error!(InternalError));
+    }
 
     db.insert_e2ee_blob(&E2EEBlob {
         id: id.clone(),
@@ -225,6 +242,7 @@ pub async fn upload_blob(
         size: buf.len() as isize,
         bucket_id,
         iv,
+        key_id,
         recipients: recipients
             .into_iter()
             .map(|recipient| E2EEBlobRecipient {
@@ -279,7 +297,13 @@ pub async fn fetch_blob(
     // No shared in-memory cache for blobs: each is fetched approximately
     // once per device and deleted afterwards; caching ciphertext would only
     // extend its lifetime in RAM
-    let data = fetch_from_s3(&blob.bucket_id, &E2EEBlob::s3_path(&blob.id), &blob.iv).await?;
+    let data = fetch_from_s3(
+        &blob.bucket_id,
+        &E2EEBlob::s3_path(&blob.id),
+        &blob.iv,
+        blob.key_id.as_deref(),
+    )
+    .await?;
 
     // Track the fetch; delete the blob once every recipient has it. The
     // record is only removed after the S3 object is gone — otherwise the

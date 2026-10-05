@@ -116,7 +116,11 @@ pub async fn serve_v2(hash: &FileHash, range: Option<&str>) -> Result<Response> 
     }
     prefix.copy_from_slice(&prefix_bytes);
 
-    let cipher = revolt_files::SegmentedStreamCipher::from_config(prefix).await;
+    // Decrypt under the row's own key. An unknown or unconfigured key id
+    // is an InternalError, resolved before any range or object work
+    let cipher = report_internal_error!(
+        revolt_files::SegmentedStreamCipher::from_config(prefix, hash.key_id.as_deref()).await
+    )?;
 
     let (status, start, end) = match parse_range(range, size) {
         RangeOutcome::Full => (StatusCode::OK, 0, size - 1),
@@ -140,6 +144,7 @@ pub async fn serve_v2(hash: &FileHash, range: Option<&str>) -> Result<Response> 
                 skip,
                 take: end - start + 1,
             },
+            hash.key_id.as_deref(),
         )
         .await
     )?;
@@ -155,7 +160,8 @@ pub async fn serve_v2(hash: &FileHash, range: Option<&str>) -> Result<Response> 
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_range, serve_legacy_buffer, RangeOutcome};
+    use super::{parse_range, serve_legacy_buffer, serve_v2, RangeOutcome};
+    use base64::{prelude::BASE64_STANDARD, Engine};
     use revolt_database::{iso8601_timestamp::Timestamp, FileHash, Metadata};
 
     fn legacy_hash(data_len: usize) -> FileHash {
@@ -167,6 +173,7 @@ mod tests {
             path: "test-hash".into(),
             iv: "iv".into(),
             format_version: None,
+            key_id: None,
             metadata: Metadata::File,
             content_type: "application/octet-stream".into(),
             // Legacy size records ciphertext length (plaintext + 16-byte tag)
@@ -196,6 +203,42 @@ mod tests {
 
         let response = serve_legacy_buffer(&hash, data, Some("bytes=200-")).unwrap();
         assert_eq!(response.status(), 416);
+    }
+
+    #[tokio::test]
+    async fn v2_unknown_key_id_fails_closed() {
+        // Same scratch bucket as upload.rs's tests: the global config is
+        // first-loader-wins, so keep it consistent if they share a process
+        std::env::set_var("REVOLT__FILES__S3__DEFAULT_BUCKET", "autumn-upload-tests");
+
+        let keyring = revolt_files::FileKeyring::global().await;
+        let unknown = "zz9";
+        assert!(
+            !keyring.has(Some(unknown)),
+            "test key id must not be configured"
+        );
+
+        let mut hash = legacy_hash(100);
+        hash.format_version = Some(2);
+        hash.iv = BASE64_STANDARD.encode([0u8; revolt_files::STREAM_NONCE_PREFIX_SIZE]);
+        hash.size = 100;
+
+        // Control: under a configured key an out-of-bounds range is a plain
+        // 416, answered before any object is fetched
+        hash.key_id = keyring.primary_id().map(str::to_string);
+        let response = serve_v2(&hash, Some("bytes=200-")).await.unwrap();
+        assert_eq!(response.status(), 416);
+
+        // The row's key id reaches the cipher: an unknown one is an
+        // InternalError, never a panic and never a response
+        hash.key_id = Some(unknown.to_string());
+        match serve_v2(&hash, Some("bytes=200-")).await {
+            Err(err) => assert!(matches!(
+                err.error_type,
+                revolt_result::ErrorType::InternalError
+            )),
+            Ok(response) => panic!("unknown key id was served: {}", response.status()),
+        }
     }
 
     #[test]

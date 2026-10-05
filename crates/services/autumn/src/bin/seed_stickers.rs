@@ -11,7 +11,10 @@ use std::collections::HashMap;
 use revolt_database::{
     iso8601_timestamp::Timestamp, DatabaseInfo, File, FileHash, Metadata, Sticker, StickerFormat,
 };
-use revolt_files::{image_size_vec, upload_to_s3, AUTHENTICATION_TAG_SIZE_BYTES};
+use revolt_files::{
+    delete_from_s3, image_size_vec, upload_to_s3, FileKeyring, AUTHENTICATION_TAG_SIZE_BYTES,
+    COMMITTED_DEFAULT_KEY_FP, LEGACY_KEY_ID,
+};
 use sha2::Digest;
 
 #[tokio::main]
@@ -20,6 +23,35 @@ async fn main() {
     let pack_dir = args.next().expect("usage: seed_stickers <pack_dir> <server_id> <creator_id>");
     let server_id = args.next().expect("missing server id");
     let creator_id = args.next().expect("missing creator id");
+
+    // Build the file keyring before any S3 or database work, so a bad
+    // [files] key config stops the tool here instead of mid-seed
+    let keyring = match FileKeyring::init_global().await {
+        Ok(keyring) => keyring,
+        Err(error) => {
+            eprintln!("invalid [files] key config: {error:#}");
+            std::process::exit(1);
+        }
+    };
+    println!(
+        "file keyring: primary key id {}",
+        keyring.primary_id().unwrap_or(LEGACY_KEY_ID)
+    );
+    for id in keyring.key_ids() {
+        match keyring.fingerprint(Some(id.as_str())) {
+            Ok(fingerprint) => println!("file key id={id} fingerprint={fingerprint}"),
+            Err(error) => eprintln!("file key id={id} has no fingerprint: {error:#}"),
+        }
+    }
+    if keyring
+        .fingerprint(keyring.primary_id())
+        .is_ok_and(|fingerprint| fingerprint == COMMITTED_DEFAULT_KEY_FP)
+    {
+        eprintln!(
+            "WARN: files.encryption_key is upstream's committed default; \
+             anyone with the bucket can decrypt"
+        );
+    }
 
     let config = revolt_config::config().await;
     let db = DatabaseInfo::Auto.connect().await.expect("database");
@@ -101,6 +133,7 @@ async fn main() {
                     path: hash_hex.clone(),
                     iv: String::new(),
                     format_version: None, // legacy whole-file GCM format
+                    key_id: None,
                     metadata: Metadata::Image {
                         width: w as isize,
                         height: h as isize,
@@ -111,12 +144,37 @@ async fn main() {
                     size: (buf.len() + AUTHENTICATION_TAG_SIZE_BYTES) as isize,
                 };
                 let _ = db.insert_attachment_hash(&fh).await;
-                let nonce = upload_to_s3(&fh.bucket_id, &fh.id, &buf)
+
+                // The placeholder row keeps path = hash id; the blob itself goes
+                // to a fresh key-namespaced path, under one keyring snapshot
+                let kid: Option<String> =
+                    FileKeyring::global().await.primary_id().map(str::to_string);
+                let object_path = FileHash::new_object_path(kid.as_deref());
+                let (iv, rkid) = upload_to_s3(&fh.bucket_id, &object_path, &buf)
                     .await
                     .expect("s3 upload");
-                db.set_attachment_hash_nonce(&fh.id, &nonce)
+                if rkid != kid {
+                    if let Err(error) = delete_from_s3(&fh.bucket_id, &object_path).await {
+                        eprintln!(
+                            "failed to delete {object_path} after a key id mismatch: {error:?}"
+                        );
+                    }
+                    panic!("file key id changed during the upload of {hash_hex}");
+                }
+
+                // Path, iv and key id are committed together; if that fails the
+                // object we just wrote is unreferenced, so remove it
+                if let Err(error) = db
+                    .set_attachment_hash_storage(&fh.id, &object_path, &iv, rkid.as_deref())
                     .await
-                    .expect("set nonce");
+                {
+                    if let Err(cleanup) = delete_from_s3(&fh.bucket_id, &object_path).await {
+                        eprintln!(
+                            "failed to delete {object_path} after set storage failed: {cleanup:?}"
+                        );
+                    }
+                    panic!("set storage: {error:?}");
+                }
                 db.fetch_attachment_hash(&hash_hex)
                     .await
                     .expect("refetch hash")
