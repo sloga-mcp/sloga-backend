@@ -1,6 +1,8 @@
 use std::io::Cursor;
 
-use revolt_files::{EncryptionKey, FileStorageRepository, MediaImpl, MediaRepository, S3Storage};
+use revolt_files::{
+    EncryptionKey, FileKeyring, FileStorageRepository, MediaImpl, MediaRepository, S3Storage,
+};
 
 #[tokio::test]
 async fn test_image_roundtrip_png() {
@@ -16,13 +18,17 @@ async fn test_image_roundtrip_png() {
     let mut reader = Cursor::new(buf);
     media.decode_image(&mut reader, "image/png").unwrap();
 
-    let iv = s3
+    let (iv, key_id) = s3
         .encrypt_and_upload_file(&bucket_id, "/my-file", buf)
         .await
         .unwrap();
 
+    // Uploads are written under the primary key (None when it is "legacy")
+    let primary_id = FileKeyring::global().await.primary_id().map(str::to_string);
+    assert_eq!(key_id, primary_id);
+
     let buf = s3
-        .fetch_and_decrypt_file(&bucket_id, "/my-file", &iv)
+        .fetch_and_decrypt_file(&bucket_id, "/my-file", &iv, key_id.as_deref())
         .await
         .unwrap();
 

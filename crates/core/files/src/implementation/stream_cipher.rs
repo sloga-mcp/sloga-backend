@@ -1,9 +1,8 @@
 use aes_gcm::{
     aead::{Aead, OsRng},
-    AeadCore, Aes256Gcm, Key, KeyInit, Nonce,
+    AeadCore, Aes256Gcm, Nonce,
 };
 use anyhow::Context;
-use base64::{prelude::BASE64_STANDARD, Engine};
 
 use crate::AUTHENTICATION_TAG_SIZE_BYTES;
 
@@ -36,6 +35,10 @@ const _: () = assert!(CHUNK_SIZE % STREAM_SEGMENT_SIZE == 0);
 /// segment boundaries, encrypting part `p` depends only on
 /// `(key, prefix, p, is_final_part, part bytes)`.
 ///
+/// The key is a server file key resolved from the [`crate::FileKeyring`] by
+/// id, so an object or upload session must be read and continued under the
+/// same `key_id` it was first written with.
+///
 /// Consequently encryption is deterministic. That is safe *only* while a given
 /// `(prefix, segment index)` never covers two different plaintexts — callers
 /// must reject divergent re-uploads of an already-recorded part rather than
@@ -49,34 +52,53 @@ pub struct SegmentedStreamCipher {
 }
 
 impl SegmentedStreamCipher {
-    /// Cipher for the server key in `files.encryption_key`
-    pub async fn from_config(prefix: [u8; STREAM_NONCE_PREFIX_SIZE]) -> SegmentedStreamCipher {
-        SegmentedStreamCipher::new(
-            &revolt_config::config().await.files.encryption_key,
-            prefix,
-        )
+    /// Cipher for the server file key registered under `key_id` in the
+    /// process-wide [`crate::FileKeyring`] (`None` = the "legacy" key, i.e. a
+    /// row with no `key_id`). An unknown id is an error, never a panic.
+    pub async fn from_config(
+        prefix: [u8; STREAM_NONCE_PREFIX_SIZE],
+        key_id: Option<&str>,
+    ) -> anyhow::Result<SegmentedStreamCipher> {
+        let cipher = crate::FileKeyring::global().await.cipher(key_id)?;
+        Ok(SegmentedStreamCipher::from_cipher(cipher, prefix))
     }
 
+    /// Cipher over an already-resolved server file key, production layout
+    pub fn from_cipher(
+        cipher: Aes256Gcm,
+        prefix: [u8; STREAM_NONCE_PREFIX_SIZE],
+    ) -> SegmentedStreamCipher {
+        Self::with_layout(cipher, prefix, STREAM_SEGMENT_SIZE, CHUNK_SIZE)
+    }
+
+    /// Test-only: cipher from a base64 key, production layout
+    #[cfg(test)]
     pub fn new(key_b64: &str, prefix: [u8; STREAM_NONCE_PREFIX_SIZE]) -> SegmentedStreamCipher {
-        Self::with_layout(key_b64, prefix, STREAM_SEGMENT_SIZE, CHUNK_SIZE)
+        use aes_gcm::{Key, KeyInit};
+        use base64::{prelude::BASE64_STANDARD, Engine};
+
+        let key = BASE64_STANDARD
+            .decode(key_b64)
+            .expect("valid base64 encryption key");
+        let key: &Key<Aes256Gcm> = key[..].into();
+        Self::with_layout(Aes256Gcm::new(key), prefix, STREAM_SEGMENT_SIZE, CHUNK_SIZE)
     }
 
     /// Layout-parameterised constructor so tests can exercise the construction
-    /// with small segments (debug-build AES is ~200x slower than release)
+    /// with small segments (debug-build AES is ~200x slower than release).
+    ///
+    /// The assert cannot fire on the production layout: the const assert on
+    /// [`CHUNK_SIZE`] already guarantees it at compile time.
     fn with_layout(
-        key_b64: &str,
+        cipher: Aes256Gcm,
         prefix: [u8; STREAM_NONCE_PREFIX_SIZE],
         segment_size: usize,
         part_size: usize,
     ) -> SegmentedStreamCipher {
         assert!(segment_size > 0 && part_size % segment_size == 0);
-        let key = BASE64_STANDARD
-            .decode(key_b64)
-            .expect("valid base64 encryption key");
-        let key: &Key<Aes256Gcm> = key[..].into();
 
         SegmentedStreamCipher {
-            cipher: Aes256Gcm::new(key),
+            cipher,
             prefix,
             segment_size,
             segments_per_part: part_size / segment_size,
@@ -289,6 +311,8 @@ mod tests {
     use super::*;
     use aes_gcm::aead::stream::EncryptorBE32;
     use aes_gcm::aead::generic_array::GenericArray;
+    use aes_gcm::{Key, KeyInit};
+    use base64::{prelude::BASE64_STANDARD, Engine};
 
     const KEY: &str = "XkbJ8gBzrouQ+15Ri23xCC81+aZE26Z6+gXzglFxOD4=";
     const PREFIX: [u8; 7] = [1, 2, 3, 4, 5, 6, 7];
@@ -298,8 +322,15 @@ mod tests {
     const SEG: usize = 1024;
     const PART: usize = 4 * SEG;
 
+    /// AES-256-GCM over the test key
+    fn test_aes() -> Aes256Gcm {
+        let key = BASE64_STANDARD.decode(KEY).unwrap();
+        let key: &Key<Aes256Gcm> = key[..].into();
+        Aes256Gcm::new(key)
+    }
+
     fn cipher() -> SegmentedStreamCipher {
-        SegmentedStreamCipher::with_layout(KEY, PREFIX, SEG, PART)
+        SegmentedStreamCipher::with_layout(test_aes(), PREFIX, SEG, PART)
     }
 
     fn pseudo_random(len: usize) -> Vec<u8> {
@@ -456,5 +487,35 @@ mod tests {
 
         // Out of bounds
         assert!(c.plaintext_range_to_ciphertext(0, len, len).is_err());
+    }
+
+    #[test]
+    fn from_cipher_matches_new() {
+        let via_new = SegmentedStreamCipher::new(KEY, PREFIX);
+        let via_cipher = SegmentedStreamCipher::from_cipher(test_aes(), PREFIX);
+
+        // Both use the production layout
+        for c in [&via_new, &via_cipher] {
+            assert_eq!(c.segment_size, STREAM_SEGMENT_SIZE);
+            assert_eq!(c.segments_per_part, CHUNK_SIZE / STREAM_SEGMENT_SIZE);
+        }
+
+        // Sub-segment plaintext keeps debug-build AES fast; a single final
+        // segment is also exactly what the 1 KiB reference produces
+        let plaintext = pseudo_random(1000);
+        let a = via_new.encrypt_part(1, true, &plaintext).unwrap();
+        let b = via_cipher.encrypt_part(1, true, &plaintext).unwrap();
+        assert_eq!(a, b);
+        assert_eq!(a, reference_encrypt(&plaintext));
+
+        // Each opens the other's output
+        assert_eq!(via_cipher.decrypt_segments(0, true, &a).unwrap(), plaintext);
+        assert_eq!(via_new.decrypt_segments(0, true, &b).unwrap(), plaintext);
+
+        // A different key does not
+        let other_key = [7u8; 32];
+        let other_key: &Key<Aes256Gcm> = other_key[..].into();
+        let other = SegmentedStreamCipher::from_cipher(Aes256Gcm::new(other_key), PREFIX);
+        assert!(other.decrypt_segments(0, true, &a).is_err());
     }
 }

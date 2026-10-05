@@ -38,6 +38,12 @@ const MULTIPART_PART_SIZE: usize = 16 * 1024 * 1024;
 /// How many parts to keep in flight at once
 const MULTIPART_CONCURRENCY: usize = 4;
 
+/// Most ListObjectsV2 pages one listing may take before it gives up
+///
+/// At the default 1000 keys per page this is 100M objects; anything past it
+/// is an endpoint that keeps handing back continuation tokens.
+const MAX_LIST_PAGES: usize = 100_000;
+
 pub struct S3Storage<ER: EncryptionRepository> {
     client: Client,
     encryption: ER,
@@ -263,6 +269,61 @@ impl<ER: EncryptionRepository> S3Storage<ER> {
         Ok(object.body)
     }
 
+    /// List every object in a bucket (optionally under a key prefix),
+    /// following continuation tokens
+    ///
+    /// Plain ListObjectsV2: no `fetch_owner` and no metadata extras (R2
+    /// rejects the metadata parameter). Fails rather than loops when an
+    /// endpoint repeats a continuation token or exceeds [`MAX_LIST_PAGES`].
+    pub async fn list_objects(
+        &self,
+        bucket_id: &str,
+        prefix: Option<&str>,
+    ) -> anyhow::Result<Vec<crate::S3ObjectInfo>> {
+        let mut objects = Vec::new();
+        let mut continuation_token: Option<String> = None;
+
+        for _ in 0..MAX_LIST_PAGES {
+            let sent_token = continuation_token.take();
+            let page = self
+                .client
+                .list_objects_v2()
+                .bucket(bucket_id)
+                .set_prefix(prefix.map(str::to_owned))
+                .set_continuation_token(sent_token.clone())
+                .send()
+                .await
+                .with_context(|| format!("failed to list objects in {bucket_id}"))?;
+
+            for object in page.contents() {
+                let key = object
+                    .key()
+                    .with_context(|| format!("S3 listed an object with no key in {bucket_id}"))?;
+
+                objects.push(crate::S3ObjectInfo {
+                    key: key.to_owned(),
+                    size: object.size().unwrap_or(0),
+                    last_modified_unix: object.last_modified().map(|time| time.secs()),
+                });
+            }
+
+            // An explicit `false` is authoritative; otherwise a token means
+            // there is another page
+            match (page.is_truncated(), page.next_continuation_token()) {
+                (Some(false), _) | (None, None) => return Ok(objects),
+                (Some(true), None) => anyhow::bail!(
+                    "failed to list objects in {bucket_id}: truncated page with no continuation token"
+                ),
+                (_, Some(token)) if sent_token.as_deref() == Some(token) => anyhow::bail!(
+                    "failed to list objects in {bucket_id}: continuation token repeated"
+                ),
+                (_, Some(token)) => continuation_token = Some(token.to_owned()),
+            }
+        }
+
+        anyhow::bail!("failed to list objects in {bucket_id}: exceeded {MAX_LIST_PAGES} pages")
+    }
+
     /// Idempotently ensure incomplete multipart uploads get reaped
     /// server-side after [`LIFECYCLE_ABORT_DAYS`]
     ///
@@ -422,6 +483,7 @@ impl<ER: EncryptionRepository> FileStorageRepository for S3Storage<ER> {
         bucket_id: &str,
         path: &str,
         iv: &str,
+        key_id: Option<&str>,
     ) -> anyhow::Result<Vec<u8>> {
         let mut object = self
             .client
@@ -441,7 +503,7 @@ impl<ER: EncryptionRepository> FileStorageRepository for S3Storage<ER> {
         if iv.is_empty() {
             Ok(buf)
         } else {
-            self.encryption.decrypt_buffer(buf, iv)
+            self.encryption.decrypt_buffer(buf, iv, key_id)
         }
     }
 
@@ -450,8 +512,8 @@ impl<ER: EncryptionRepository> FileStorageRepository for S3Storage<ER> {
         bucket_id: &str,
         path: &str,
         buf: &[u8],
-    ) -> anyhow::Result<String> {
-        let (buf, iv) = self.encryption.encrypt_buffer(buf)?;
+    ) -> anyhow::Result<(String, Option<String>)> {
+        let (buf, iv, key_id) = self.encryption.encrypt_buffer(buf)?;
 
         if buf.len() > MULTIPART_THRESHOLD {
             self.multipart_upload(bucket_id, path, &buf).await?;
@@ -466,7 +528,7 @@ impl<ER: EncryptionRepository> FileStorageRepository for S3Storage<ER> {
                 .with_context(|| format!("failed to put object at {path} in {bucket_id}"))?;
         }
 
-        Ok(iv)
+        Ok((iv, key_id))
     }
 
     async fn delete_file(&self, bucket_id: &str, path: &str) -> anyhow::Result<()> {

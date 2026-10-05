@@ -123,6 +123,19 @@ pub async fn create_upload(
     Path(tag): Path<Tag>,
     Json(payload): Json<CreateUploadPayload>,
 ) -> Result<Json<CreateUploadResponse>> {
+    let keyring = revolt_files::FileKeyring::global().await;
+    create_upload_under(&db, user, tag, payload, &keyring).await
+}
+
+/// [`create_upload`] under an explicit keyring (the process-wide one in
+/// production; tests pass their own instead of mutating the global)
+async fn create_upload_under(
+    db: &Database,
+    user: User,
+    tag: Tag,
+    payload: CreateUploadPayload,
+    keyring: &revolt_files::FileKeyring,
+) -> Result<Json<CreateUploadResponse>> {
     let config = config().await;
     assert_attachments_tag(&tag)?;
 
@@ -171,6 +184,11 @@ pub async fn create_upload(
         String::new(), // upload id assigned below, once S3 knows the key
         BASE64_STANDARD.encode(prefix),
     );
+
+    // Frozen for the session's whole life: every part and the assembled
+    // object stay under the key that was primary at create, even if the
+    // primary rotates mid-upload (None = "legacy", never Some("legacy"))
+    session.key_id = keyring.primary_id().map(str::to_string);
 
     session.s3_upload_id =
         revolt_files::create_multipart_in_s3(&session.bucket_id, &session.path).await?;
@@ -274,7 +292,17 @@ pub async fn upload_part(
         };
     }
 
-    let result = store_part(&db, &session, part_number, &part_key, &sha256, &body).await;
+    let keyring = revolt_files::FileKeyring::global().await;
+    let result = store_part(
+        &db,
+        &session,
+        part_number,
+        &part_key,
+        &sha256,
+        &body,
+        &keyring,
+    )
+    .await;
     if result.is_err() {
         // Best-effort: a leaked claim ages out via the TTL anyway
         let _ = db.release_upload_part_claim(&session_id, &part_key).await;
@@ -290,15 +318,9 @@ async fn store_part(
     part_key: &str,
     sha256: &str,
     body: &Bytes,
+    keyring: &revolt_files::FileKeyring,
 ) -> Result<()> {
-    let prefix_bytes = report_internal_error!(BASE64_STANDARD.decode(&session.nonce_prefix))?;
-    let mut prefix = [0u8; revolt_files::STREAM_NONCE_PREFIX_SIZE];
-    if prefix_bytes.len() != prefix.len() {
-        return Err(create_error!(InternalError));
-    }
-    prefix.copy_from_slice(&prefix_bytes);
-
-    let cipher = revolt_files::SegmentedStreamCipher::from_config(prefix).await;
+    let cipher = session_cipher(keyring, session)?;
     let is_final_part = part_number as i64 == session.total_parts();
     let ciphertext =
         report_internal_error!(cipher.encrypt_part(part_number as u32, is_final_part, body))?;
@@ -335,6 +357,27 @@ async fn store_part(
     }
 
     Ok(())
+}
+
+/// The cipher a session's parts are sealed under: its own nonce prefix and
+/// the key frozen into it at create (`None` = "legacy"), never whatever is
+/// primary now. A key id the keyring no longer holds is an internal error,
+/// not a fallback to another key.
+fn session_cipher(
+    keyring: &revolt_files::FileKeyring,
+    session: &UploadSession,
+) -> Result<revolt_files::SegmentedStreamCipher> {
+    let prefix_bytes = report_internal_error!(BASE64_STANDARD.decode(&session.nonce_prefix))?;
+    let mut prefix = [0u8; revolt_files::STREAM_NONCE_PREFIX_SIZE];
+    if prefix_bytes.len() != prefix.len() {
+        return Err(create_error!(InternalError));
+    }
+    prefix.copy_from_slice(&prefix_bytes);
+
+    let cipher = report_internal_error!(keyring.cipher(session.key_id.as_deref()))?;
+    Ok(revolt_files::SegmentedStreamCipher::from_cipher(
+        cipher, prefix,
+    ))
 }
 
 /// Fetch session status (resume source of truth)
@@ -514,6 +557,7 @@ async fn resolve_completing(
         path: session.path.clone(),
         iv: session.nonce_prefix.clone(),
         format_version: Some(2),
+        key_id: session.key_id.clone(),
         metadata: Metadata::File,
         content_type: mime_type,
         size: session.total_size as isize,
@@ -670,6 +714,60 @@ mod tests {
                 state as u8
             })
             .collect()
+    }
+
+    /// Test key (shared with the keyring's own tests); plays the "legacy" key
+    const LEGACY_TEST_KEY: &str = "XkbJ8gBzrouQ+15Ri23xCC81+aZE26Z6+gXzglFxOD4=";
+    /// Test key (shared with the keyring's own tests); plays the rotated key "k1"
+    const K1_TEST_KEY: &str = "qyqLB76aivuQnmIBwO3QETAvkmxMRdlN/+nA+niIIbQ=";
+
+    /// The rotated layout: primary "k1", the old key kept as "legacy"
+    fn rotated_keyring() -> revolt_files::FileKeyring {
+        let decrypt_keys: std::collections::HashMap<String, String> = [(
+            revolt_files::LEGACY_KEY_ID.to_string(),
+            LEGACY_TEST_KEY.to_string(),
+        )]
+        .into_iter()
+        .collect();
+        revolt_files::FileKeyring::from_parts(K1_TEST_KEY, "k1", &decrypt_keys, false)
+            .expect("the rotated test keyring is valid")
+    }
+
+    /// A keyring holding `key_b64` and nothing else, as the "legacy" primary
+    fn single_key_keyring(key_b64: &str) -> revolt_files::FileKeyring {
+        revolt_files::FileKeyring::from_parts(
+            key_b64,
+            revolt_files::LEGACY_KEY_ID,
+            &Default::default(),
+            false,
+        )
+        .expect("the single-key test keyring is valid")
+    }
+
+    /// Open sealed segments (starting at `first_segment`) under the session's
+    /// nonce prefix with ONLY `key_b64` available; None if they do not open
+    fn open_with_only(
+        key_b64: &str,
+        session: &UploadSession,
+        first_segment: u32,
+        includes_final_segment: bool,
+        ciphertext: &[u8],
+    ) -> Option<Vec<u8>> {
+        let prefix: [u8; revolt_files::STREAM_NONCE_PREFIX_SIZE] = BASE64_STANDARD
+            .decode(&session.nonce_prefix)
+            .unwrap()
+            .try_into()
+            .unwrap();
+        revolt_files::SegmentedStreamCipher::from_cipher(
+            single_key_keyring(key_b64).primary_cipher(),
+            prefix,
+        )
+        .decrypt_segments(first_segment, includes_final_segment, ciphertext)
+        .ok()
+    }
+
+    fn sha256_hex(bytes: &[u8]) -> String {
+        format!("{:02x}", sha2::Sha256::digest(bytes))
     }
 
     #[tokio::test]
@@ -874,6 +972,13 @@ mod tests {
         assert!(!hash.iv.is_empty());
         assert_eq!(hash.size as usize, total);
 
+        // The hash carries the key the session froze from the process-wide
+        // primary at create
+        assert_eq!(
+            hash.key_id.as_deref(),
+            revolt_files::FileKeyring::global().await.primary_id()
+        );
+
         // The assembled object really exists
         assert!(
             revolt_files::object_exists_in_s3(&hash.bucket_id, &hash.path)
@@ -997,5 +1102,205 @@ mod tests {
         )
         .await
         .is_err());
+    }
+
+    /// The part cipher follows the key frozen into the session, not the
+    /// current primary. Under a keyring whose primary is now "k1", a session
+    /// frozen to "k1" seals under k1 only, and a session opened before the
+    /// rotation (no key id) still seals under the legacy key only. The
+    /// control: a keyring without k1 refuses a "k1" session instead of
+    /// falling back to another key.
+    #[test]
+    fn session_cipher_uses_the_frozen_key_not_the_primary() {
+        let rotated = rotated_keyring();
+        let mut session = UploadSession::new(
+            "uploader".into(),
+            "attachments".into(),
+            "f.bin".into(),
+            "application/octet-stream".into(),
+            revolt_files::CHUNK_SIZE as i64 + 1000,
+            revolt_files::CHUNK_SIZE as i64,
+            "autumn-upload-tests".into(),
+            "fake-upload-id".into(),
+            BASE64_STANDARD.encode(revolt_files::SegmentedStreamCipher::generate_prefix()),
+        );
+
+        // Part 2 of 2 is the 1000-byte tail: the final segment, after part 1's
+        let tail = pseudo_random(1000, 11);
+        let tail_segment = (revolt_files::CHUNK_SIZE / revolt_files::STREAM_SEGMENT_SIZE) as u32;
+        let seal = |session: &UploadSession| {
+            session_cipher(&rotated, session)
+                .unwrap()
+                .encrypt_part(2, true, &tail)
+                .unwrap()
+        };
+
+        session.key_id = Some("k1".to_string());
+        let sealed = seal(&session);
+        assert_eq!(
+            open_with_only(K1_TEST_KEY, &session, tail_segment, true, &sealed),
+            Some(tail.clone())
+        );
+        assert_eq!(
+            open_with_only(LEGACY_TEST_KEY, &session, tail_segment, true, &sealed),
+            None,
+            "a k1 session's part must not open with the legacy key"
+        );
+
+        session.key_id = None;
+        let sealed = seal(&session);
+        assert_eq!(
+            open_with_only(LEGACY_TEST_KEY, &session, tail_segment, true, &sealed),
+            Some(tail.clone())
+        );
+        assert_eq!(
+            open_with_only(K1_TEST_KEY, &session, tail_segment, true, &sealed),
+            None,
+            "a session opened before the rotation must stay on the legacy key"
+        );
+
+        // Control: the key the session was frozen to is not in the keyring
+        session.key_id = Some("k1".to_string());
+        let refused = session_cipher(&single_key_keyring(LEGACY_TEST_KEY), &session);
+        let Err(error) = refused else {
+            panic!("an unknown key id must be refused, never replaced by another key");
+        };
+        assert!(matches!(
+            error.error_type,
+            revolt_result::ErrorType::InternalError
+        ));
+    }
+
+    /// A session created under a rotated primary is stored with key id "k1";
+    /// its parts are sealed under k1 (S3 holds ciphertext that opens with k1
+    /// alone and NOT with the legacy key), and it completes to a hash that
+    /// carries "k1" at the session's own `chunked/` path. The control: the
+    /// same create under a legacy-only keyring stores no key id at all.
+    #[tokio::test]
+    async fn rotated_primary_is_frozen_into_the_session() {
+        test_env().await;
+        ensure_bucket().await;
+        let db = db();
+        let user = test_user();
+
+        let tail = 1000usize;
+        let total = revolt_files::CHUNK_SIZE + tail;
+        let payload = || CreateUploadPayload {
+            filename: "rotated.bin".into(),
+            total_size: total as i64,
+            content_type: None,
+        };
+
+        // Control: a legacy primary freezes nothing (absent, never "legacy")
+        let created = create_upload_under(
+            &db,
+            user.clone(),
+            Tag::attachments,
+            payload(),
+            &single_key_keyring(LEGACY_TEST_KEY),
+        )
+        .await
+        .unwrap()
+        .0;
+        let session = db.fetch_upload_session(&created.session_id).await.unwrap();
+        assert_eq!(session.key_id, None);
+
+        let rotated = rotated_keyring();
+        let created = create_upload_under(&db, user.clone(), Tag::attachments, payload(), &rotated)
+            .await
+            .unwrap()
+            .0;
+        let session = db.fetch_upload_session(&created.session_id).await.unwrap();
+        assert_eq!(
+            session.key_id.as_deref(),
+            Some("k1"),
+            "the session must be stored frozen to the rotated primary"
+        );
+
+        // Seeds distinct from the other tests' content
+        let part_1 = pseudo_random(revolt_files::CHUNK_SIZE, 31);
+        let part_2 = pseudo_random(tail, 32);
+        for (part_number, bytes) in [(1, &part_1), (2, &part_2)] {
+            store_part(
+                &db,
+                &session,
+                part_number,
+                &UploadSession::part_key(part_number),
+                &sha256_hex(bytes),
+                &Bytes::from(bytes.clone()),
+                &rotated,
+            )
+            .await
+            .unwrap();
+        }
+
+        let completed = complete_upload(
+            State(db.clone()),
+            user.clone(),
+            Path((Tag::attachments, created.session_id.clone())),
+        )
+        .await
+        .unwrap()
+        .0;
+        let file = db
+            .fetch_attachment("attachments", &completed.id)
+            .await
+            .unwrap();
+        let hash = file.as_hash(&db).await.unwrap();
+        assert_eq!(
+            hash.key_id.as_deref(),
+            Some("k1"),
+            "the object keeps the session's key"
+        );
+        assert_eq!(hash.path, format!("chunked/{}", created.session_id));
+        assert_eq!(hash.iv, session.nonce_prefix);
+
+        // Read back what S3 really stores: part 1's first segment and the
+        // final segment (part 2). Single segments only; decrypting 32 MiB in a
+        // debug build is slow.
+        let layout = session_cipher(&rotated, &session).unwrap();
+        let segment = revolt_files::STREAM_SEGMENT_SIZE;
+        for (start, end, plaintext) in [
+            (0, segment - 1, &part_1[..segment]),
+            (revolt_files::CHUNK_SIZE, total - 1, &part_2[..]),
+        ] {
+            let (ct_start, ct_end, first_segment, includes_final, _) = layout
+                .plaintext_range_to_ciphertext(start as u64, end as u64, total as u64)
+                .unwrap();
+            let sealed =
+                revolt_files::fetch_range_from_s3(&hash.bucket_id, &hash.path, ct_start, ct_end)
+                    .await
+                    .unwrap()
+                    .collect()
+                    .await
+                    .unwrap()
+                    .into_bytes();
+            // assert! rather than assert_eq!: a mismatch would print a MiB
+            let opened = open_with_only(
+                K1_TEST_KEY,
+                &session,
+                first_segment,
+                includes_final,
+                &sealed,
+            );
+            assert!(
+                opened.as_deref() == Some(plaintext),
+                "a k1 part must open with k1 alone"
+            );
+            assert!(
+                open_with_only(
+                    LEGACY_TEST_KEY,
+                    &session,
+                    first_segment,
+                    includes_final,
+                    &sealed
+                )
+                .is_none(),
+                "a k1 part must not open with the legacy key"
+            );
+        }
+
+        // Best-effort tidy-up of the scratch bucket
+        let _ = revolt_files::delete_from_s3(&hash.bucket_id, &hash.path).await;
     }
 }

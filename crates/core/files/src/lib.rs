@@ -14,15 +14,29 @@ use tempfile::NamedTempFile;
 
 pub const AUTHENTICATION_TAG_SIZE_BYTES: usize = 16;
 
-/// Fetch a file from S3 (and decrypt it)
-pub async fn fetch_from_s3(bucket_id: &str, path: &str, iv: &str) -> Result<Vec<u8>> {
+/// Fetch a file from S3 (and decrypt it with the file key `key_id`, None = "legacy")
+pub async fn fetch_from_s3(
+    bucket_id: &str,
+    path: &str,
+    iv: &str,
+    key_id: Option<&str>,
+) -> Result<Vec<u8>> {
     let encryption = implementation::EncryptionKey::from_config().await;
     let storage = implementation::S3Storage::from_config(encryption).await;
-    report_internal_error!(storage.fetch_and_decrypt_file(bucket_id, path, iv).await)
+    report_internal_error!(
+        storage
+            .fetch_and_decrypt_file(bucket_id, path, iv, key_id)
+            .await
+    )
 }
 
-/// Encrypt and upload a file to S3 (returning its nonce/IV)
-pub async fn upload_to_s3(bucket_id: &str, path: &str, buf: &[u8]) -> Result<String> {
+/// Encrypt and upload a file to S3 under the primary file key
+/// (returning its nonce/IV and the key id, None = "legacy")
+pub async fn upload_to_s3(
+    bucket_id: &str,
+    path: &str,
+    buf: &[u8],
+) -> Result<(String, Option<String>)> {
     let encryption = implementation::EncryptionKey::from_config().await;
     let storage = implementation::S3Storage::from_config(encryption).await;
     report_internal_error!(storage.encrypt_and_upload_file(bucket_id, path, buf).await)
@@ -91,6 +105,25 @@ pub async fn object_exists_in_s3(bucket_id: &str, path: &str) -> Result<bool> {
     report_internal_error!(storage().await.object_exists(bucket_id, path).await)
 }
 
+/// One object in a bucket listing
+#[derive(Debug, Clone)]
+pub struct S3ObjectInfo {
+    /// Object key
+    pub key: String,
+    /// Object size in bytes
+    pub size: i64,
+    /// Last modified time in whole seconds since the epoch, None if the store omitted it
+    pub last_modified_unix: Option<i64>,
+}
+
+/// List every object in a bucket (optionally under a key prefix)
+pub async fn list_objects_in_s3(
+    bucket_id: &str,
+    prefix: Option<&str>,
+) -> Result<Vec<S3ObjectInfo>> {
+    report_internal_error!(storage().await.list_objects(bucket_id, prefix).await)
+}
+
 /// Stream an object's raw (still-encrypted) bytes
 pub async fn fetch_stream_from_s3(
     bucket_id: &str,
@@ -124,7 +157,9 @@ pub fn image_size(f: &NamedTempFile) -> Option<(usize, usize)> {
     let media = MediaImpl::new(Files {
         blocked_mime_types: Default::default(),
         clamd_host: Default::default(),
+        decrypt_keys: Default::default(),
         encryption_key: Default::default(),
+        encryption_key_id: "legacy".to_string(),
         limit: FilesLimit {
             max_mega_pixels: 0,
             max_pixel_side: 0,
@@ -132,6 +167,7 @@ pub fn image_size(f: &NamedTempFile) -> Option<(usize, usize)> {
             min_resolution: [0, 0],
         },
         preview: Default::default(),
+        require_rotated_key: false,
         s3: FilesS3 {
             access_key_id: Default::default(),
             default_bucket: Default::default(),
@@ -152,7 +188,9 @@ pub fn image_size_vec(v: &[u8], mime: &str) -> Option<(usize, usize)> {
     let media = MediaImpl::new(Files {
         blocked_mime_types: Default::default(),
         clamd_host: Default::default(),
+        decrypt_keys: Default::default(),
         encryption_key: Default::default(),
+        encryption_key_id: "legacy".to_string(),
         limit: FilesLimit {
             max_mega_pixels: 0,
             max_pixel_side: 0,
@@ -160,6 +198,7 @@ pub fn image_size_vec(v: &[u8], mime: &str) -> Option<(usize, usize)> {
             min_resolution: [0, 0],
         },
         preview: Default::default(),
+        require_rotated_key: false,
         s3: FilesS3 {
             access_key_id: Default::default(),
             default_bucket: Default::default(),
@@ -180,7 +219,9 @@ pub fn is_animated(f: &NamedTempFile, mime: &str) -> Option<bool> {
     let media = MediaImpl::new(Files {
         blocked_mime_types: Default::default(),
         clamd_host: Default::default(),
+        decrypt_keys: Default::default(),
         encryption_key: Default::default(),
+        encryption_key_id: "legacy".to_string(),
         limit: FilesLimit {
             max_mega_pixels: 0,
             max_pixel_side: 0,
@@ -188,6 +229,7 @@ pub fn is_animated(f: &NamedTempFile, mime: &str) -> Option<bool> {
             min_resolution: [0, 0],
         },
         preview: Default::default(),
+        require_rotated_key: false,
         s3: FilesS3 {
             access_key_id: Default::default(),
             default_bucket: Default::default(),
@@ -208,7 +250,9 @@ pub fn video_size(f: &NamedTempFile) -> Option<(i64, i64)> {
     let media = MediaImpl::new(Files {
         blocked_mime_types: Default::default(),
         clamd_host: Default::default(),
+        decrypt_keys: Default::default(),
         encryption_key: Default::default(),
+        encryption_key_id: "legacy".to_string(),
         limit: FilesLimit {
             max_mega_pixels: 0,
             max_pixel_side: 0,
@@ -216,6 +260,7 @@ pub fn video_size(f: &NamedTempFile) -> Option<(i64, i64)> {
             min_resolution: [0, 0],
         },
         preview: Default::default(),
+        require_rotated_key: false,
         s3: FilesS3 {
             access_key_id: Default::default(),
             default_bucket: Default::default(),
@@ -236,7 +281,9 @@ pub fn decode_image<R: Read + BufRead + Seek>(reader: &mut R, mime: &str) -> Res
     let media = MediaImpl::new(Files {
         blocked_mime_types: Default::default(),
         clamd_host: Default::default(),
+        decrypt_keys: Default::default(),
         encryption_key: Default::default(),
+        encryption_key_id: "legacy".to_string(),
         limit: FilesLimit {
             max_mega_pixels: 0,
             max_pixel_side: 0,
@@ -244,6 +291,7 @@ pub fn decode_image<R: Read + BufRead + Seek>(reader: &mut R, mime: &str) -> Res
             min_resolution: [0, 0],
         },
         preview: Default::default(),
+        require_rotated_key: false,
         s3: FilesS3 {
             access_key_id: Default::default(),
             default_bucket: Default::default(),
@@ -264,7 +312,9 @@ pub fn is_valid_image<R: Read + BufRead + Seek>(reader: &mut R, mime: &str) -> b
     let media = MediaImpl::new(Files {
         blocked_mime_types: Default::default(),
         clamd_host: Default::default(),
+        decrypt_keys: Default::default(),
         encryption_key: Default::default(),
+        encryption_key_id: "legacy".to_string(),
         limit: FilesLimit {
             max_mega_pixels: 0,
             max_pixel_side: 0,
@@ -272,6 +322,7 @@ pub fn is_valid_image<R: Read + BufRead + Seek>(reader: &mut R, mime: &str) -> b
             min_resolution: [0, 0],
         },
         preview: Default::default(),
+        require_rotated_key: false,
         s3: FilesS3 {
             access_key_id: Default::default(),
             default_bucket: Default::default(),

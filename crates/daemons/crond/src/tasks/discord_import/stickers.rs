@@ -29,7 +29,9 @@ use revolt_database::{
     DiscordImportSummary, File, FileHash, ImportStage, ImportStatus, Metadata, Sticker,
     StickerFormat,
 };
-use revolt_files::{image_size_vec, upload_to_s3, AUTHENTICATION_TAG_SIZE_BYTES};
+use revolt_files::{
+    delete_from_s3, image_size_vec, upload_to_s3, FileKeyring, AUTHENTICATION_TAG_SIZE_BYTES,
+};
 use revolt_permissions::{calculate_server_permissions, ChannelPermission};
 use serde::Deserialize;
 use sha2::Digest;
@@ -398,9 +400,13 @@ async fn store_sticker_file(
                 processed_hash: hash_hex.clone(),
                 created_at: Timestamp::now_utc(),
                 bucket_id: config.files.s3.default_bucket.clone(),
+                // Placeholder only: the object itself goes to a fresh `rk/`
+                // path below, committed together with its IV and key id.
+                // Nothing is ever PUT at the hash id.
                 path: hash_hex.clone(),
                 iv: String::new(),
                 format_version: None, // legacy whole-file GCM format
+                key_id: None,
                 metadata: Metadata::Image {
                     width: width as isize,
                     height: height as isize,
@@ -414,14 +420,34 @@ async fn store_sticker_file(
             // seeder: a crashed earlier attempt can leave a `{iv: ""}` hash
             // row behind, and failing here would wedge that sticker forever —
             // every retry would re-insert, hit the duplicate id, and error.
-            // The heal is to fall through and (re)upload + set the nonce.
+            // The heal is to fall through and (re)upload + set the storage.
             let _ = db.insert_attachment_hash(&fresh).await;
-            let nonce = upload_to_s3(&fresh.bucket_id, &fresh.id, buf)
+
+            // One keyring snapshot per write: the object path, the cipher
+            // and the stored key id must all name the same key.
+            let kid: Option<String> = FileKeyring::global().await.primary_id().map(str::to_string);
+            let path = FileHash::new_object_path(kid.as_deref());
+            let (iv, rkid) = upload_to_s3(&fresh.bucket_id, &path, buf)
                 .await
                 .map_err(|_| ())?;
-            db.set_attachment_hash_nonce(&fresh.id, &nonce)
+            if rkid != kid {
+                log::error!(
+                    "sticker object for hash {hash_hex} was encrypted under an unexpected file key"
+                );
+                discard_sticker_object(&fresh.bucket_id, &path).await;
+                return Err(());
+            }
+
+            // Path, IV and key id land together. If the row is gone (or the
+            // write fails) the object we just PUT is unreferenced: drop it.
+            if db
+                .set_attachment_hash_storage(&fresh.id, &path, &iv, rkid.as_deref())
                 .await
-                .map_err(|_| ())?;
+                .is_err()
+            {
+                discard_sticker_object(&fresh.bucket_id, &path).await;
+                return Err(());
+            }
             db.fetch_attachment_hash(&hash_hex).await.map_err(|_| ())?
         }
     };
@@ -439,6 +465,14 @@ async fn store_sticker_file(
     File::use_sticker(db, &id, &id, creator_id)
         .await
         .map_err(|_| ())
+}
+
+/// Best-effort delete of an object no row points at. A failure is logged
+/// and otherwise ignored; the caller is already returning an error.
+async fn discard_sticker_object(bucket_id: &str, path: &str) {
+    if let Err(error) = delete_from_s3(bucket_id, path).await {
+        log::warn!("could not delete orphaned sticker object {path}: {error:?}");
+    }
 }
 
 // ---------------------------------------------------------------------------

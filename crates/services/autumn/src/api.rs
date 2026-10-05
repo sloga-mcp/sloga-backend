@@ -16,8 +16,8 @@ use lazy_static::lazy_static;
 use revolt_config::{config, report_internal_error};
 use revolt_database::{iso8601_timestamp::Timestamp, Database, FileHash, Metadata, User};
 use revolt_files::{
-    create_thumbnail, decode_image, fetch_from_s3, is_animated, upload_to_s3,
-    AUTHENTICATION_TAG_SIZE_BYTES,
+    create_thumbnail, decode_image, delete_from_s3, fetch_from_s3, is_animated, upload_to_s3,
+    FileKeyring, AUTHENTICATION_TAG_SIZE_BYTES, LEGACY_KEY_ID,
 };
 use revolt_result::{create_error, Error, Result, ToRevoltError};
 use serde::{Deserialize, Serialize};
@@ -148,8 +148,17 @@ async fn retrieve_file_by_hash(hash: &FileHash) -> Result<Vec<u8>> {
     if let Some(data) = S3_CACHE.get(&hash.id).await {
         data
     } else {
-        let data = fetch_from_s3(&hash.bucket_id, &hash.path, &hash.iv).await;
-        if hash.size <= CACHE_INSERT_MAX_SIZE {
+        let data = fetch_from_s3(
+            &hash.bucket_id,
+            &hash.path,
+            &hash.iv,
+            hash.key_id.as_deref(),
+        )
+        .await;
+
+        // Only successes are cached: a transient S3 or key error must not be
+        // served back for the cache's whole lifetime
+        if data.is_ok() && hash.size <= CACHE_INSERT_MAX_SIZE {
             S3_CACHE.insert(hash.id.to_owned(), data.clone()).await;
         }
         data
@@ -325,6 +334,9 @@ async fn upload_file(
         }
     }
 
+    // Object a stale-video reprocess replaces, deleted once the new row is in
+    let mut superseded_object: Option<(String, String)> = None;
+
     // Find an existing hash and use that if possible
     let file_hash_exists = if let Ok(file_hash) = db
         .fetch_attachment_hash(&format!("{original_hash:02x}"))
@@ -353,6 +365,9 @@ async fn upload_file(
         }
 
         if stale_video {
+            // The row is the only reference to its object, and the replacement
+            // goes to a fresh path, so note the old one before the row goes
+            superseded_object = Some((file_hash.bucket_id.clone(), file_hash.path.clone()));
             db.delete_attachment_hash(&file_hash.id).await?;
             false
         } else {
@@ -408,6 +423,7 @@ async fn upload_file(
         path: format!("{original_hash:02x}"),
         iv: String::new(), // indicates file is not uploaded yet
         format_version: None, // legacy whole-file GCM format
+        key_id: None,         // set with the real path and nonce below
 
         metadata,
         content_type: mime_type,
@@ -419,10 +435,39 @@ async fn upload_file(
         db.insert_attachment_hash(&file_hash).await?;
     }
 
-    // Upload the file to S3 and commit nonce to database
+    // Upload the file to S3 under a fresh object key, then commit its path,
+    // nonce and file key id to the database together
     let upload_start = Instant::now();
-    let nonce = upload_to_s3(&file_hash.bucket_id, &file_hash.id, &buf).await?;
-    db.set_attachment_hash_nonce(&file_hash.id, &nonce).await?;
+    let kid: Option<String> = FileKeyring::global().await.primary_id().map(str::to_string);
+    let path = FileHash::new_object_path(kid.as_deref());
+    let (iv, rkid) = upload_to_s3(&file_hash.bucket_id, &path, &buf).await?;
+
+    // The object must be under the key its path and row will name
+    if rkid != kid {
+        tracing::error!(
+            "file key mismatch uploading {}: expected {}, encrypted under {}",
+            file_hash.id,
+            kid.as_deref().unwrap_or(LEGACY_KEY_ID),
+            rkid.as_deref().unwrap_or(LEGACY_KEY_ID)
+        );
+        discard_object(&file_hash.bucket_id, &path).await;
+        return Err(create_error!(InternalError));
+    }
+
+    if let Err(error) = db
+        .set_attachment_hash_storage(&file_hash.id, &path, &iv, rkid.as_deref())
+        .await
+    {
+        discard_object(&file_hash.bucket_id, &path).await;
+        return Err(error);
+    }
+
+    // Nothing points at the replaced object any more
+    if let Some((old_bucket_id, old_path)) = superseded_object {
+        if is_other_object(&old_bucket_id, &old_path, &file_hash.bucket_id, &path) {
+            discard_object(&old_bucket_id, &old_path).await;
+        }
+    }
 
     // Debug information
     let time_to_upload = Instant::now() - upload_start;
@@ -434,6 +479,20 @@ async fn upload_file(
         .await?;
 
     Ok(Json(UploadResponse { id }))
+}
+
+/// Best-effort removal of an object no hash row points at. A failure is
+/// logged and never fails the request
+async fn discard_object(bucket_id: &str, path: &str) {
+    if let Err(error) = delete_from_s3(bucket_id, path).await {
+        tracing::warn!("failed to delete unreferenced object {path} from {bucket_id}: {error:?}");
+    }
+}
+
+/// Whether the old (bucket, path) names a different object from the new one,
+/// so deleting it cannot touch the object the row now points at
+fn is_other_object(old_bucket_id: &str, old_path: &str, bucket_id: &str, path: &str) -> bool {
+    old_bucket_id != bucket_id || old_path != path
 }
 
 /// Rewrite a filename's extension when processing moved the file into a
@@ -457,7 +516,17 @@ fn filename_for_mime(filename: String, old_mime: &str, new_mime: &str) -> String
 
 #[cfg(test)]
 mod upload_tests {
-    use super::filename_for_mime;
+    use super::{filename_for_mime, is_other_object};
+
+    #[test]
+    fn replaced_object_is_deleted_only_when_distinct() {
+        // A legacy hash-id object replaced by a fresh rk/ path
+        assert!(is_other_object("files", "abc123", "files", "rk/k1/01J0"));
+        // Same path in a different bucket is a different object
+        assert!(is_other_object("old", "rk/k1/01J0", "files", "rk/k1/01J0"));
+        // The object the row now points at is never deleted
+        assert!(!is_other_object("files", "rk/k1/01", "files", "rk/k1/01"));
+    }
 
     #[test]
     fn filename_follows_container_change() {

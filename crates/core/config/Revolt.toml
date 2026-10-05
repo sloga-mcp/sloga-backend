@@ -215,6 +215,26 @@ max_audio_stream_secs = 600
 # Encryption key for stored files
 # Generate your own key using `openssl rand -base64 32`
 encryption_key = "qcuMA+ssxhMyKaNAKBGFfryfFtUH8NDlamQyDwGW6fU="
+# Id of the key above. The primary key is encryption_key together with this
+# id: it encrypts every new upload, and new rows record the id (no id at
+# all when it is "legacy").
+#
+# Older keys stay readable through [files.decrypt_keys], which maps a key id
+# to its base64 32-byte key, for example:
+#
+# [files.decrypt_keys]
+# k2024 = "<base64 32-byte key>"
+#
+# "legacy" is the id for rows with no key id (everything written before key
+# ids existed). Every other id is 1 to 16 lowercase letters or digits
+# ([a-z0-9]{1,16}); ids must be lowercase.
+#
+# To rotate, move the current key into [files.decrypt_keys] under its current
+# id, then set a new encryption_key and a new encryption_key_id.
+encryption_key_id = "legacy"
+# Refuse to start while the primary key is the committed default above or its
+# id is "legacy". Enable in production once the key has been rotated.
+require_rotated_key = false
 # Quality used for lossy WebP previews (set to 100 for lossless)
 webp_quality = 80.0
 # Mime types that cannot be uploaded or served

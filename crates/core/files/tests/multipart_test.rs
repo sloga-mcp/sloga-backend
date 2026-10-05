@@ -49,7 +49,7 @@ async fn test_cross_request_multipart_out_of_order() {
     // Assembled object comes back whole (iv = "" is plaintext passthrough)
     let buf = storage()
         .await
-        .fetch_and_decrypt_file(&bucket_id, path, "")
+        .fetch_and_decrypt_file(&bucket_id, path, "", None)
         .await
         .unwrap();
     assert_eq!(buf.len(), PART_1_SIZE + PART_2_SIZE);
@@ -160,7 +160,9 @@ async fn test_encrypted_multipart_range_round_trip() {
         .collect();
 
     let prefix = SegmentedStreamCipher::generate_prefix();
-    let cipher = SegmentedStreamCipher::from_config(prefix).await;
+    let cipher = SegmentedStreamCipher::from_config(prefix, None)
+        .await
+        .unwrap();
 
     let split = SEGMENTS_PART_1 * STREAM_SEGMENT_SIZE;
     // encrypt_part's contract requires full 32 MiB parts, which would be

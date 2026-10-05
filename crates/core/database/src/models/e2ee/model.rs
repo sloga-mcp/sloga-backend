@@ -227,6 +227,9 @@ auto_derived!(
         pub bucket_id: String,
         /// At-rest encryption nonce from the S3 upload layer
         pub iv: String,
+        /// Id of the server file key the at-rest layer used; absent = "legacy"
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        pub key_id: Option<String>,
         /// Devices that may fetch this blob, with per-device fetch tracking
         pub recipients: Vec<E2EEBlobRecipient>,
     }

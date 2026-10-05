@@ -33,6 +33,12 @@ auto_derived_partial!(
         /// size. Never renumber; add new versions additively.
         #[serde(skip_serializing_if = "Option::is_none", default)]
         pub format_version: Option<u32>,
+        /// Id of the server file key this object is encrypted under.
+        ///
+        /// ABSENT (`None`) = the "legacy" key: every row written before file
+        /// key rotation. The field never holds the literal "legacy".
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        pub key_id: Option<String>,
 
         /// Parsed metadata of this file
         pub metadata: Metadata,
@@ -69,6 +75,14 @@ auto_derived!(
 );
 
 impl FileHash {
+    /// Fresh unique object key for a (re-)written blob: `rk/<key_id|legacy>/<ulid>`
+    ///
+    /// Every writer takes its object key from here, so an object key is never
+    /// reused; `hash.id` is never used as an object key.
+    pub fn new_object_path(key_id: Option<&str>) -> String {
+        format!("rk/{}/{}", key_id.unwrap_or("legacy"), ulid::Ulid::new())
+    }
+
     /// Create a file from a file hash
     pub fn into_file(
         &self,
@@ -102,5 +116,24 @@ impl FileHash {
             server_id: None,
             user_id: None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::FileHash;
+
+    #[test]
+    fn new_object_path_is_namespaced_by_key_and_unique() {
+        let legacy = FileHash::new_object_path(None);
+        assert!(legacy.starts_with("rk/legacy/"), "{legacy}");
+
+        let rotated = FileHash::new_object_path(Some("k1"));
+        assert!(rotated.starts_with("rk/k1/"), "{rotated}");
+
+        assert_ne!(
+            FileHash::new_object_path(Some("k1")),
+            FileHash::new_object_path(Some("k1"))
+        );
     }
 }

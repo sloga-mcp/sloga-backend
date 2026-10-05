@@ -60,5 +60,14 @@ slow-timeout = { period = "15s", terminate-after = 20 }
 # in an unoptimized debug build: measured 128s on the WSL rig 2026-09-13,
 # i.e. just past the 120s default cap, so it was being killed rather than
 # failing. 300s keeps a genuine hang detectable.
-filter = 'package(revolt-autumn) & test(=upload::tests::chunked_upload_end_to_end)'
+# rotated_primary_is_frozen_into_the_session has the same shape on a smaller
+# scale: it builds a full 32 MiB part, sha256-hashes it and seals it through
+# the stream cipher, again in a debug build against live MinIO. Measured 105s
+# in a 2026-10-05 full-suite run, too close to the 120s default cap.
+filter = '''
+package(revolt-autumn) & (
+    test(=upload::tests::chunked_upload_end_to_end)
+  | test(=upload::tests::rotated_primary_is_frozen_into_the_session)
+)
+'''
 slow-timeout = { period = "15s", terminate-after = 20 }
