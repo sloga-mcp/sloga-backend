@@ -307,4 +307,16 @@ impl AbstractChannels for ReferenceDb {
             Err(create_error!(NotFound))
         }
     }
+
+    /// Checked under the `channels` lock, which protect holds for its whole
+    /// check-and-write: a protect either saw the inserted thread or has
+    /// already set the flag read here.
+    async fn hold_thread_parent_unprotected(&self, parent_id: &str) -> Result<()> {
+        let channels = self.channels.lock().await;
+        match channels.get(parent_id) {
+            Some(parent) if parent.is_protected() => Err(create_error!(ChannelProtected)),
+            Some(_) => Ok(()),
+            None => Err(create_error!(NotFound)),
+        }
+    }
 }

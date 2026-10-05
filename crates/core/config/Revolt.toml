@@ -510,12 +510,14 @@ cipher_blocked_countries = [
 # activate on the next incidental restart. It also needs e2ee_enabled.
 # Turning it OFF only freezes growth: it never unprotects an existing
 # channel, and encrypted send/history/receive keep working there. The text
-# plane's kill switch is e2ee_enabled, not this flag.
+# plane's kill switch is e2ee_enabled, not this flag. Commit pruning is
+# unaffected by both flags: crond keeps pruning with enabled or e2ee_enabled
+# off. commit_retention_days = 0 is the only way to stop it.
 #
 # [features.protected_channels]
 # enabled = false              # master switch for growth (grants, protect, seating, adds)
 # default_device_cap = 5       # 0 = unlimited (still bounded by 100 leaves)
-# commit_retention_days = 30   # crond prunes Text commits older than this
+# commit_retention_days = 30   # crond prunes Text commits older than this; 0 = never prune
 
 [features.limits]
 

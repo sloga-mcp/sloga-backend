@@ -398,6 +398,11 @@ pub enum ErrorType {
     SeatCapReached {
         max: usize,
     },
+    /// The user already holds as many member devices in the channel's Text
+    /// group as the enforced device cap allows
+    DeviceCapReached {
+        max: usize,
+    },
     /// The route is refused on a protected channel
     ChannelProtected,
     /// The request sets a field a protected channel does not accept

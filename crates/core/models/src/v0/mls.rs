@@ -1,3 +1,5 @@
+use iso8601_timestamp::Timestamp;
+
 auto_derived!(
     /// A (user, device) pair — the unit of MLS group membership, KeyPackage
     /// claims and envelope fan-out (media E2EE)
@@ -134,12 +136,14 @@ auto_derived!(
         pub signature: String,
     }
 
-    /// Register a per-call MLS group (plan §1.2)
+    /// Register an MLS group: a per-call group (plan §1.2) or a protected
+    /// channel's Text group (protected channels design §7.2)
     pub struct DataCreateMlsGroup {
         /// Client-derived group id: 64 lowercase hex chars
-        /// (`hash(channel_id || call_start_ulid)`)
+        /// (`hash(channel_id || call_start_ulid)` for a call group, design
+        /// §3.1 for a Text group)
         pub group_id: String,
-        /// Channel whose call this group secures
+        /// Channel this group secures
         pub channel_id: String,
         /// The creating device
         pub device_id: String,
@@ -147,6 +151,14 @@ auto_derived!(
         /// group and register the new one in its place
         #[serde(default)]
         pub supersedes: Option<String>,
+        /// Group kind. Absent means `Call`, so existing callers (and their
+        /// request bodies) are unchanged
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub kind: Option<MlsGroupKind>,
+        /// Text only: the group-id generation (design §3.1). Required for
+        /// `Text`, refused for `Call`
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub generation: Option<u32>,
     }
 
     /// Response to registering a group — 200 on create, 409 on conflict
@@ -263,4 +275,93 @@ auto_derived!(
         /// Current roster size (device count) — pre-join cap warning input
         pub member_count: usize,
     }
+
+    /// A user whose devices must leave a Text group (protected channels
+    /// design §2.5, §7.2)
+    pub struct MlsPendingRemovalInfo {
+        /// User whose member devices are to be removed
+        pub user_id: String,
+        /// When the pending removal was recorded
+        pub created_at: Timestamp,
+    }
+
+    /// A member device's latest Add to a Text group (design §7.2
+    /// `member_added`, W0-fix7). A liveness aid for the joining bridge only
+    pub struct MlsMemberAddedInfo {
+        /// Added user
+        pub user_id: String,
+        /// Added device
+        pub device_id: String,
+        /// Epoch the Add established (0 = the creator at group create)
+        pub epoch: i64,
+        /// Server-stamped time of the Add
+        pub at: Timestamp,
+    }
+
+    /// The channel's open Text group
+    /// (`GET /mls/channels/:channel_id/text_group`, design §7.2)
+    pub struct ResponseTextGroup {
+        /// Text group id (64 lowercase hex chars)
+        pub group_id: String,
+        /// Channel the group secures
+        pub channel_id: String,
+        /// Group-id generation (design §3.1); joiners check exactly this one
+        pub generation: u32,
+        /// Highest arbitrated epoch
+        pub current_epoch: i64,
+        /// Member devices
+        pub members: Vec<MlsMemberDevice>,
+        /// Users whose devices must be removed before any Add
+        pub pending_removals: Vec<MlsPendingRemovalInfo>,
+        /// Each member device's latest Add
+        pub member_added: Vec<MlsMemberAddedInfo>,
+    }
 );
+
+#[cfg(test)]
+mod tests {
+    use super::{DataCreateMlsGroup, MlsGroupKind, ResponseTextGroup};
+
+    /// The 7.2 text group example, with concrete values in its placeholders
+    const TEXT_GROUP_EXAMPLE: &str = r#"{"group_id":"0000000000000000000000000000000000000000000000000000000000000001","channel_id":"01JA0000000000000000CHANNEL","generation":0,"current_epoch":7,"members":[{"user_id":"01JA00000000000000000USERA","device_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}],"pending_removals":[{"user_id":"01JA00000000000000000USERB","created_at":"2026-10-04T12:00:00.000Z"}],"member_added":[{"user_id":"01JA00000000000000000USERA","device_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","epoch":5,"at":"2026-10-04T11:00:00.000Z"}]}"#;
+
+    /// A group-create body exactly as `996641f1` serialized it
+    const CREATE_AT_996641F1: &str = r#"{"group_id":"0000000000000000000000000000000000000000000000000000000000000001","channel_id":"01JA0000000000000000CHANNEL","device_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","supersedes":null}"#;
+
+    #[test]
+    fn text_group_response_round_trips_the_example() {
+        let parsed: ResponseTextGroup = serde_json::from_str(TEXT_GROUP_EXAMPLE).unwrap();
+        assert_eq!(parsed.generation, 0);
+        assert_eq!(parsed.current_epoch, 7);
+        assert_eq!(parsed.pending_removals.len(), 1);
+        assert_eq!(parsed.member_added[0].epoch, 5);
+        assert_eq!(serde_json::to_string(&parsed).unwrap(), TEXT_GROUP_EXAMPLE);
+    }
+
+    /// An existing caller's body (no `kind`, no `generation`) still parses as
+    /// a call group create, and a call create serializes as it did before
+    #[test]
+    fn create_group_kind_and_generation_are_optional() {
+        let parsed: DataCreateMlsGroup = serde_json::from_str(CREATE_AT_996641F1).unwrap();
+        assert_eq!(parsed.kind, None);
+        assert_eq!(parsed.generation, None);
+        assert_eq!(serde_json::to_string(&parsed).unwrap(), CREATE_AT_996641F1);
+
+        let text = DataCreateMlsGroup {
+            kind: Some(MlsGroupKind::Text),
+            generation: Some(0),
+            ..parsed
+        };
+        let value = serde_json::to_value(&text).unwrap();
+        assert_eq!(value["kind"], "Text");
+        assert_eq!(value["generation"], 0);
+        assert_eq!(
+            serde_json::from_value::<DataCreateMlsGroup>(value).unwrap(),
+            text
+        );
+
+        // Unknown keys are ignored, like every neighboring request body
+        let extra = CREATE_AT_996641F1.replace("\"supersedes\"", "\"future\":1,\"supersedes\"");
+        assert!(serde_json::from_str::<DataCreateMlsGroup>(&extra).is_ok());
+    }
+}

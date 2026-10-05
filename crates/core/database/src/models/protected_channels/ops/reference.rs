@@ -4,16 +4,26 @@
 //! more than one of these collection locks takes them in this order and
 //! holds them for the whole operation:
 //!
-//! `channels -> messages -> channel_entitlements -> channel_seat_lists
-//!  -> channel_seats -> mls_groups -> mls_commits -> mls_join_intents
-//!  -> e2ee_identities`
+//! `channels -> messages -> channel_entitlements -> servers ->
+//!  server_members -> channel_seat_lists -> channel_seats -> mls_groups
+//!  -> mls_commits -> mls_join_intents -> e2ee_identities`
 //!
 //! The doc's order starts at `channel_seat_lists`. `channels` (protect sets
-//! the flag atomically with the genesis list), `messages` (protect refuses a
-//! channel that already holds a message) and `channel_entitlements`
-//! (the slot cap read together with the seat claims, and the admin grant's
-//! seats-in-use check) are PREFIXED, so the doc's order is a suffix of this
-//! one and every path it pins stays valid.
+//! the flag atomically with the genesis list, and refuses a channel with
+//! threads), `messages` (protect refuses a channel that already holds a
+//! message), `channel_entitlements` (the slot cap read together with the
+//! seat claims, and the admin grant's seats-in-use check), `servers`
+//! (protect's owner check, decision 13 (W2)) and `server_members` (the
+//! membership of every newly seated user, decision 13 (W2)) are PREFIXED,
+//! so the doc's order is a suffix of this one and every path it pins stays
+//! valid. No other Reference path holds `servers` or `server_members`
+//! together with another lock (`delete_role` takes them one at a time).
+//!
+//! Decision 13's claim order `groups -> servers -> server_members -> seats`
+//! is the Mongo write order (a liveness rule: the first write fixes the
+//! snapshot). Here every lock is taken up front and held for the whole
+//! operation, so the 2.5 (d) order, which puts `mls_groups` after
+//! `channel_seats`, is kept; the release and Text commit paths rely on it.
 
 use std::collections::{BTreeSet, HashMap};
 
@@ -22,9 +32,10 @@ use revolt_result::Result;
 
 use crate::{
     channel_seats_used, check_channel_protectable, check_text_first_generation,
-    check_text_successor, plan_seat_list_write, prepare_text_group, seat_cooldown_until, Channel,
-    ChannelEntitlement, ChannelSeat, MlsGroup, MlsGroupCreateOutcome, MlsGroupKind,
-    MlsPendingRemoval, ReferenceDb, SeatList, SeatListSnapshot, SeatListSubmission,
+    check_text_successor, is_genesis_reprotect, plan_seat_list_write, prepare_text_group,
+    seat_cooldown_until, seat_list_channel_server, Channel, ChannelEntitlement, ChannelSeat,
+    Member, MemberCompositeKey, MlsGroup, MlsGroupCreateOutcome, MlsGroupKind, MlsPendingRemoval,
+    ReferenceDb, SeatList, SeatListBody, SeatListSnapshot, SeatListSubmission,
     SeatListWriteDecision, SeatListWriteInput, SeatListWriteKind, SeatListWriteOutcome,
     MAX_CHANNEL_SLOT_CAP,
 };
@@ -33,6 +44,30 @@ use super::AbstractProtectedChannels;
 
 fn is_open_text_group_of(group: &MlsGroup, channel_id: &str) -> bool {
     group.channel_id == channel_id && group.open && group.kind == MlsGroupKind::Text
+}
+
+/// Decision 13 (W2): every newly seated user is a member of the server
+/// (Reference has no soft deletion: a removed member is gone from the map)
+fn check_members(
+    members: &HashMap<MemberCompositeKey, Member>,
+    server_id: &str,
+    decision: &SeatListWriteDecision,
+) -> Result<()> {
+    let SeatListWriteDecision::Apply(plan) = decision else {
+        return Ok(());
+    };
+    for user_id in &plan.claimed {
+        let key = MemberCompositeKey {
+            server: server_id.to_string(),
+            user: user_id.clone(),
+        };
+        if !members.contains_key(&key) {
+            return Err(create_error!(FailedValidation {
+                error: "seated user is not a member of the server".to_string()
+            }));
+        }
+    }
+    Ok(())
 }
 
 /// Apply a seat-list plan to the locked maps. Infallible: every check ran
@@ -164,11 +199,48 @@ impl AbstractProtectedChannels for ReferenceDb {
         let mut channels = self.channels.lock().await;
         let messages = self.messages.lock().await;
         let entitlements = self.channel_entitlements.lock().await;
+        let servers = self.servers.lock().await;
+        let members = self.server_members.lock().await;
         let mut seat_lists = self.channel_seat_lists.lock().await;
         let mut seats = self.channel_seats.lock().await;
         let mut groups = self.mls_groups.lock().await;
 
+        let server_id = channels
+            .get(channel_id)
+            .and_then(seat_list_channel_server)
+            .map(str::to_string);
+        let owned_by = |user_id: &str| {
+            server_id
+                .as_deref()
+                .and_then(|server_id| servers.get(server_id))
+                .is_some_and(|server| server.owner == user_id)
+        };
+
+        // N3 (#128, decision 4 (W2)): the byte-identical retry of a protect
+        // that landed is the stored success, decided before the protect
+        // preconditions (which that protect made false); nothing is written
+        if let Some(stored) = seat_lists.get(channel_id) {
+            if is_genesis_reprotect(submission, stored) && owned_by(&stored.signer_user_id) {
+                return Ok(SeatListWriteDecision::Unchanged(stored.clone()).outcome());
+            }
+        }
+
         check_channel_protectable(channels.get(channel_id))?;
+
+        // Decision 13 (W2): the list's signer owns the server
+        let body = SeatListBody::parse(&submission.body)?;
+        if !owned_by(&body.signer_user_id) {
+            return Err(create_error!(NotOwner));
+        }
+        let server_id = server_id.ok_or_else(|| create_error!(InvalidOperation))?;
+
+        // Decision 13 (W2): a channel with threads is refused
+        if channels.values().any(|channel| {
+            matches!(channel, Channel::Thread { parent_channel, .. } if parent_channel == channel_id)
+        }) {
+            return Err(create_error!(InvalidOperation));
+        }
+
         // `last_message_id` is written asynchronously (batched), so it can
         // lag a stored message: ask the messages themselves
         if messages
@@ -182,10 +254,9 @@ impl AbstractProtectedChannels for ReferenceDb {
             .values()
             .find(|entitlement| entitlement.channel_id == channel_id)
             .cloned();
-        if !entitlement
-            .as_ref()
-            .is_some_and(ChannelEntitlement::is_active)
-        {
+        if !entitlement.as_ref().is_some_and(|entitlement| {
+            entitlement.is_active() && entitlement.server_id == server_id
+        }) {
             return Err(create_error!(InvalidOperation));
         }
 
@@ -207,8 +278,10 @@ impl AbstractProtectedChannels for ReferenceDb {
             entitlement: entitlement.as_ref(),
             seats: &channel_seats,
             text_group: text_group.as_ref(),
+            allow_claims: true,
             now,
         })?;
+        check_members(&members, &server_id, &decision)?;
 
         apply_decision(
             &decision,
@@ -228,9 +301,11 @@ impl AbstractProtectedChannels for ReferenceDb {
         &self,
         channel_id: &str,
         submission: &SeatListSubmission,
+        allow_claims: bool,
         now: Timestamp,
     ) -> Result<SeatListWriteOutcome> {
         let entitlements = self.channel_entitlements.lock().await;
+        let members = self.server_members.lock().await;
         let mut seat_lists = self.channel_seat_lists.lock().await;
         let mut seats = self.channel_seats.lock().await;
         let mut groups = self.mls_groups.lock().await;
@@ -257,8 +332,16 @@ impl AbstractProtectedChannels for ReferenceDb {
             entitlement: entitlement.as_ref(),
             seats: &channel_seats,
             text_group: text_group.as_ref(),
+            allow_claims,
             now,
         })?;
+        // Claims need an active entitlement (the planner refused
+        // otherwise), whose server it is; without one nobody is a member
+        let server_id = entitlement
+            .as_ref()
+            .map(|entitlement| entitlement.server_id.as_str())
+            .unwrap_or_default();
+        check_members(&members, server_id, &decision)?;
 
         apply_decision(
             &decision,

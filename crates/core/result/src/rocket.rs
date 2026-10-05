@@ -185,6 +185,7 @@ impl<'r> Responder<'r, 'static> for Error {
             ErrorType::ProtectedChannelResecuring { .. } => Status::Conflict,
             ErrorType::NotSeated => Status::Forbidden,
             ErrorType::SeatCapReached { .. } => Status::BadRequest,
+            ErrorType::DeviceCapReached { .. } => Status::BadRequest,
             ErrorType::ChannelProtected => Status::BadRequest,
             ErrorType::ProtectedFieldRefused { .. } => Status::BadRequest,
         };
@@ -209,7 +210,11 @@ impl<'r> Responder<'r, 'static> for Error {
 
 #[cfg(test)]
 mod tests {
-    use rocket::{local::blocking::Client, response::Responder};
+    use rocket::{
+        http::{ContentType, Status},
+        local::{asynchronous::Client as AsyncClient, blocking::Client},
+        response::Responder,
+    };
 
     use crate::{create_error, Error};
 
@@ -255,5 +260,33 @@ mod tests {
             let response = error.respond_to(request.inner()).unwrap();
             assert_eq!(response.status().code, code, "{name}");
         }
+    }
+
+    #[rocket::async_test]
+    async fn device_cap_reached_is_bad_request_with_max_in_body() {
+        let client = AsyncClient::untracked(rocket::build())
+            .await
+            .expect("local rocket client");
+        let request = client.get("/");
+        let mut response = crate::create_error!(DeviceCapReached { max: 5 })
+            .respond_to(request.inner())
+            .expect("error responder");
+
+        assert_eq!(response.status(), Status::BadRequest);
+        assert_eq!(response.content_type(), Some(ContentType::JSON));
+
+        let body = response.body_mut().to_string().await.expect("body");
+        let body: serde_json::Value = serde_json::from_str(&body).expect("JSON body");
+        assert_eq!(body["type"], "DeviceCapReached");
+        assert_eq!(body["max"], 5);
+
+        let mut keys: Vec<&str> = body
+            .as_object()
+            .expect("JSON object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["location", "max", "type"]);
     }
 }

@@ -245,6 +245,10 @@ pub async fn submit_commit(
                     content_type,
                     group_id: Some(group.id.clone()),
                     epoch: Some(epoch),
+                    committer: None,
+                    added: vec![],
+                    removed: vec![],
+                    rejoin_intents: vec![],
                 }
             };
 

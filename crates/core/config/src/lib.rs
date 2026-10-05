@@ -1709,7 +1709,10 @@ pub struct ProtectedChannelFeatures {
     #[serde(default = "ProtectedChannelFeatures::default_device_cap")]
     pub default_device_cap: u32,
     /// crond prunes Text MLS commits older than this many days. A device
-    /// offline longer than this cannot catch up and must rejoin
+    /// offline longer than this cannot catch up and must rejoin.
+    /// `0` = never prune: crond skips the prune entirely (a cutoff of
+    /// `now - 0` would delete every commit). Pruning is unaffected by both
+    /// `enabled` and `e2ee_enabled`: it keeps running with either one off
     #[serde(default = "ProtectedChannelFeatures::default_commit_retention_days")]
     pub commit_retention_days: u32,
 }
@@ -2321,6 +2324,63 @@ legacy_private_key = "fake-legacy-private-key-placeholder"
             "legacy_private_key must default to empty"
         );
         assert_eq!(settings.pushd.vapid.queue, DEFAULT_VAPID_QUEUE);
+    }
+}
+
+// Built from the two embedded sources CONFIG_BUILDER loads under TEST_DB, in
+// its order: Revolt.toml, then Revolt.test.toml. No override file or
+// environment source, so a developer machine cannot skew the result.
+#[cfg(test)]
+mod protected_channels_config_tests {
+    use config::{Config, File, FileFormat};
+
+    use super::Settings;
+
+    fn embedded() -> File<config::FileSourceString, FileFormat> {
+        File::from_str(include_str!("../Revolt.toml"), FileFormat::Toml)
+    }
+
+    /// The feature ships dark: the defaults alone leave growth off and keep
+    /// the documented retention.
+    #[test]
+    fn the_embedded_default_ships_dark() {
+        let settings: Settings = Config::builder()
+            .add_source(embedded())
+            .build()
+            .expect("the embedded Revolt.toml builds")
+            .try_deserialize()
+            .expect("the embedded Revolt.toml deserializes");
+
+        assert!(!settings.features.protected_channels.enabled);
+        assert_eq!(settings.features.protected_channels.default_device_cap, 5);
+        assert_eq!(
+            settings.features.protected_channels.commit_retention_days,
+            30
+        );
+    }
+
+    /// The test config turns growth on, on top of the E2EE plane it needs,
+    /// so the W2 route tests run with the feature live.
+    #[test]
+    fn the_test_config_turns_growth_on() {
+        let settings: Settings = Config::builder()
+            .add_source(embedded())
+            .add_source(File::from_str(
+                include_str!("../Revolt.test.toml"),
+                FileFormat::Toml,
+            ))
+            .build()
+            .expect("the embedded test config builds")
+            .try_deserialize()
+            .expect("the embedded test config deserializes");
+
+        assert!(settings.features.e2ee_enabled);
+        assert!(settings.features.protected_channels.enabled);
+        assert_eq!(settings.features.protected_channels.default_device_cap, 5);
+        assert_eq!(
+            settings.features.protected_channels.commit_retention_days,
+            30
+        );
     }
 }
 

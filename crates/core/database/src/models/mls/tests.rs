@@ -738,6 +738,10 @@ async fn envelope_byte_budget_is_summed_per_device() {
             content_type: E2EEContentType::MlsCommit,
             group_id: Some(group_id(1)),
             epoch: Some(1),
+            committer: None,
+            added: vec![],
+            removed: vec![],
+            rejoin_intents: vec![],
         };
 
         db.insert_e2ee_envelopes(&[make_envelope(1000), make_envelope(500)])
@@ -979,6 +983,7 @@ async fn try_put_next_seat_list(
                 signer_device_id: signer.device_id.clone(),
                 handover: None,
             },
+            true,
             Timestamp::now_utc(),
         )
         .await?;

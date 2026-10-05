@@ -106,8 +106,22 @@ impl Report {
                 continue;
             }
 
+            // `None` is a stray plaintext row in a protected channel, which is
+            // never evidence; a channel that no longer exists is skipped like
+            // a deleted message. Any other failure still aborts the report.
             let (mut message_snapshot, message_files) =
-                SnapshotContent::generate_from_message(db, message).await?;
+                match SnapshotContent::generate_from_message(db, message).await {
+                    Ok(Some(snapshot)) => snapshot,
+                    Ok(None) => {
+                        warn!(
+                            "System report against {} skipped message {message_id}, it cannot be served",
+                            reported_user.id
+                        );
+                        continue;
+                    }
+                    Err(err) if matches!(err.error_type, ErrorType::NotFound) => continue,
+                    Err(err) => return Err(err),
+                };
 
             // Nobody filed this report, so the surrounding context keeps only
             // the reported user's own messages; the other side's DMs are never
@@ -181,7 +195,7 @@ mod tests {
     use iso8601_timestamp::Timestamp;
     use revolt_models::v0::{ReportStatus, ReportedContent, UserReportReason};
 
-    use crate::{Database, DmGuard, Message, SnapshotContent, User};
+    use crate::{Channel, Database, DmGuard, Message, SnapshotContent, User};
 
     use super::{Report, SYSTEM_USER_ID};
 
@@ -262,6 +276,19 @@ mod tests {
             &user.id,
             "buy cheap followers",
         );
+
+        // The message snapshot reads each message's channel (protected
+        // channels), so both DMs must exist
+        for id in [channel, second_channel] {
+            db.insert_channel(&Channel::DirectMessage {
+                id: id.to_string(),
+                active: true,
+                recipients: vec![user.id.clone(), other_author.clone()],
+                last_message_id: None,
+            })
+            .await
+            .unwrap();
+        }
 
         for row in [
             &prior_own,

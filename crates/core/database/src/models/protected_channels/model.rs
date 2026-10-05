@@ -56,11 +56,17 @@ pub const MAX_CANONICAL_INT: i64 = 9_007_199_254_740_991;
 /// Seat-list body context line (0.4, WIRE FORMAT, never rename)
 pub const CONTEXT_SEAT_LIST: &str = "sloga-seat-list-v1";
 
+/// Owner handover statement context line (0.4, WIRE FORMAT, never rename)
+pub const CONTEXT_HANDOVER: &str = "sloga-owner-handover-v1";
+
 /// Commit `authenticated_data` context field (3.12.1, WIRE FORMAT, never rename)
 pub const CONTEXT_COMMIT_AD: &str = "sloga-text-commit-ad-v1";
 
 /// Length of an Ed25519 signature in unpadded b64 (0.1)
 const SIGNATURE_B64_LEN: usize = 86;
+
+/// Length of an Ed25519 public key in unpadded b64 (0.1)
+const IDENTITY_KEY_B64_LEN: usize = 43;
 
 auto_derived!(
     /// Where a channel entitlement came from (2.2). S1 mints `AdminGrant`
@@ -423,6 +429,111 @@ impl SeatListBody {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Canonical owner handover statement (4.6)
+// ---------------------------------------------------------------------------
+
+/// A parsed owner handover statement body (4.6). The `v:1` format line is
+/// checked by `parse` and not kept, as in `SeatListBody`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HandoverBody {
+    pub channel_id: String,
+    pub from_user_id: String,
+    pub from_device_id: String,
+    /// b64 Ed25519 public key of the signing (`from`) device
+    pub from_identity_key: String,
+    pub to_user_id: String,
+    pub to_device_id: String,
+    /// b64 Ed25519 public key of the successor (`to`) device
+    pub to_identity_key: String,
+    pub issued_at: i64,
+}
+
+/// Ed25519 public key: canonical unpadded b64 of 32 bytes (0.1)
+fn is_valid_identity_key_b64(value: &str) -> bool {
+    value.len() == IDENTITY_KEY_B64_LEN
+        && base64::engine::general_purpose::STANDARD_NO_PAD
+            .decode(value)
+            .is_ok_and(|raw| raw.len() == 32)
+}
+
+impl HandoverBody {
+    /// Strict parse (4.6, including the W0-fix4 `issued_at` bound). Exactly
+    /// 10 lines in order, no trailing LF, no CR; nothing is trimmed or
+    /// normalized. The S1 rule `to_user_id == from_user_id` is a trust rule
+    /// for the route and clients, not a format rule, so it is not checked
+    /// here.
+    pub fn parse(body: &str) -> Result<HandoverBody> {
+        if body.len() > MAX_HANDOVER_BODY_LEN {
+            return Err(invalid("handover body too long"));
+        }
+        if body.contains('\r') {
+            return Err(invalid("handover body contains CR"));
+        }
+
+        let lines: Vec<&str> = body.split('\n').collect();
+        if lines.len() != 10 {
+            return Err(invalid("handover body must have exactly 10 lines"));
+        }
+        if lines[0] != CONTEXT_HANDOVER || lines[1] != "v:1" {
+            return Err(invalid("handover context or format version"));
+        }
+
+        let field = |index: usize, label: &str| {
+            labeled(lines[index], label).ok_or_else(|| invalid("handover label"))
+        };
+        let ulid = |index: usize, label: &str| {
+            field(index, label).and_then(|value| {
+                if is_valid_ulid_id(value) {
+                    Ok(value.to_string())
+                } else {
+                    Err(invalid("handover user or channel id"))
+                }
+            })
+        };
+        let device = |index: usize, label: &str| {
+            field(index, label).and_then(|value| {
+                if is_valid_device_id_hex(value) {
+                    Ok(value.to_string())
+                } else {
+                    Err(invalid("handover device id"))
+                }
+            })
+        };
+        let key = |index: usize, label: &str| {
+            field(index, label).and_then(|value| {
+                if is_valid_identity_key_b64(value) {
+                    Ok(value.to_string())
+                } else {
+                    Err(invalid("handover identity key"))
+                }
+            })
+        };
+
+        let channel_id = ulid(2, "channel_id")?;
+        let from_user_id = ulid(3, "from_user_id")?;
+        let from_device_id = device(4, "from_device_id")?;
+        let from_identity_key = key(5, "from_identity_key")?;
+        let to_user_id = ulid(6, "to_user_id")?;
+        let to_device_id = device(7, "to_device_id")?;
+        let to_identity_key = key(8, "to_identity_key")?;
+        let issued_at = parse_canonical_decimal(field(9, "issued_at")?)
+            .filter(|at| *at <= MAX_CANONICAL_INT as u64)
+            .ok_or_else(|| invalid("handover issued_at"))? as i64;
+
+        Ok(HandoverBody {
+            channel_id,
+            from_user_id,
+            from_device_id,
+            from_identity_key,
+            to_user_id,
+            to_device_id,
+            to_identity_key,
+            issued_at,
+        })
+    }
+}
+
 /// Decode a b64 (standard alphabet, unpadded, canonical) Ed25519 signature
 /// to its raw 64 bytes (0.1). Refuses padding, whitespace, the URL-safe
 /// alphabet and non-canonical trailing bits.
@@ -517,6 +628,9 @@ pub struct SeatListWriteInput<'a> {
     pub seats: &'a [ChannelSeat],
     /// The channel's OPEN Text group, if any
     pub text_group: Option<&'a MlsGroup>,
+    /// Whether the list may claim seats (the growth flag, decision 5 (W2));
+    /// protect always passes `true`, its route is growth-gated
+    pub allow_claims: bool,
     pub now: Timestamp,
 }
 
@@ -583,9 +697,12 @@ impl SeatListWriteDecision {
 /// Order (4.3, W0-fix8): parse (step 1) first; then the version rule
 /// (step 4), where a byte-identical re-PUT returns the stored row
 /// IMMEDIATELY, before the signer-leaf check (5b), the seat claims (7) and
-/// the handover append (8); only then 5b, 7 and 8. Route-side checks
-/// (authorization, session binding, signature, server membership, bots and
-/// staff, the `device_cap` ceiling) are not repeated here.
+/// the handover append (8); only then 5b, the growth flag (decision 5
+/// (W2)), 7 and 8. Route-side checks (authorization, session binding,
+/// signature, bots and staff, the `device_cap` ceiling) are not repeated
+/// here. Server membership of every user in `claimed` and, on protect, the
+/// owner are claimed by the driver in the same transaction (decision 13
+/// (W2)).
 pub fn plan_seat_list_write(input: &SeatListWriteInput<'_>) -> Result<SeatListWriteDecision> {
     let submission = input.submission;
     let now = input.now;
@@ -683,6 +800,17 @@ pub fn plan_seat_list_write(input: &SeatListWriteInput<'_>) -> Result<SeatListWr
             released.push(seat.user_id.clone());
             seat_rows.push(seat);
         }
+    }
+
+    // Decision 5 (W2): with the growth flag off, a list that claims or
+    // reactivates a seat is refused; a removal-only or `device_cap`-only
+    // list still lands. This runs after the byte-identical return of step
+    // 4, so the retry of a list that landed while the flag was on keeps
+    // succeeding (W0-fix8).
+    if !input.allow_claims && !claimed.is_empty() {
+        return Err(create_error!(FeatureDisabled {
+            feature: "protected_channels".to_string()
+        }));
     }
 
     if !claimed.is_empty() {
@@ -843,6 +971,30 @@ pub fn check_text_successor(superseded: &MlsGroup, successor: &MlsGroup) -> Resu
         ));
     }
     Ok(())
+}
+
+/// N3 (#128 as amended by decision 4 (W2)): whether a protect is the
+/// byte-identical retry of a protect that already landed, i.e. its genesis
+/// list (`body`, `signature`, the declared signer device, no handover) is
+/// the stored list and that list is still version 1. The driver decides this
+/// inside the protect transaction BEFORE any write and before the protect
+/// preconditions, which the landed protect itself made false; once the
+/// stored list has moved past version 1 it is never a retry.
+pub fn is_genesis_reprotect(submission: &SeatListSubmission, stored: &SeatList) -> bool {
+    stored.version == 1
+        && submission.body == stored.body
+        && submission.signature == stored.signature
+        && submission.signer_device_id == stored.signer_device_id
+        && submission.handover.is_none()
+}
+
+/// The server of a channel that can hold a seat list (a server
+/// `TextChannel`); `None` for every other kind
+pub fn seat_list_channel_server(channel: &Channel) -> Option<&str> {
+    match channel {
+        Channel::TextChannel { server, .. } => Some(server.as_str()),
+        _ => None,
+    }
 }
 
 /// Protect preconditions the driver re-checks inside the protect

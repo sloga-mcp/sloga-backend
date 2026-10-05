@@ -2881,7 +2881,7 @@ pub async fn run_migrations(db: &MongoDb, revision: i32) -> i32 {
     }
 
     if revision <= 75 {
-        info!("Running migration [revision 75 / 22-10-2026]: Key open MLS groups by (channel_id, kind); create channel_entitlements / channel_seats / channel_seat_lists collections (protected channels)");
+        info!("Running migration [revision 75 / 22-10-2026]: Key open MLS groups by (channel_id, kind); create channel_entitlements / channel_seats / channel_seat_lists collections; add the messages (channel, nonce) replay index (protected channels)");
 
         // Protected channels (docs/protected-channels-design.md 2.5, 2.7) add
         // Text MLS groups beside the Call groups, so "one open group per
@@ -2994,6 +2994,22 @@ pub async fn run_migrations(db: &MongoDb, revision: i32) -> i32 {
             .expect("Failed to create channel_seats indexes.");
 
         // channel_seat_lists is keyed by `_id` (the channel id) only.
+
+        // The durable replay guard on protected-channel messages
+        // (docs/protected-channels-design.md 3.10), built from the same spec
+        // as init.rs. The build scans all of `messages`, but only documents
+        // carrying `encrypted` enter the partial index, so plaintext history
+        // (whose nonces were never unique) cannot fail it. A re-run is a
+        // no-op; a same-named index with any other key or options fails
+        // createIndexes and panics, so the revision is not advanced over an
+        // index that does not enforce this one.
+        db.db()
+            .run_command(doc! {
+                "createIndexes": "messages",
+                "indexes": [super::init::protected_nonce_index()]
+            })
+            .await
+            .expect("Failed to create messages channel_nonce_encrypted_unique index.");
     }
 
     // Reminder to update LATEST_REVISION when adding new migrations.
@@ -4684,6 +4700,308 @@ mod tests {
                 "Text",
                 "a re-run leaves Text groups alone"
             );
+        }
+
+        db.drop_database().await;
+        guard.disarm();
+    }
+
+    /// The `messages` index named `PROTECTED_NONCE_INDEX_NAME`, read back
+    /// through `listIndexes`; `None` when there is none.
+    async fn nonce_index(mongo: &crate::MongoDb) -> Option<Document> {
+        // The crate-internal path the message drivers use.
+        use crate::models::admin_migrations::PROTECTED_NONCE_INDEX_NAME;
+
+        let listed = mongo
+            .db()
+            .run_command(doc! { "listIndexes": "messages" })
+            .await
+            .expect("listIndexes");
+        listed
+            .get_document("cursor")
+            .and_then(|cursor| cursor.get_array("firstBatch"))
+            .expect("a listIndexes first batch")
+            .iter()
+            .find_map(|index| match index {
+                Bson::Document(index)
+                    if index.get_str("name").ok() == Some(PROTECTED_NONCE_INDEX_NAME) =>
+                {
+                    Some(index.clone())
+                }
+                _ => None,
+            })
+    }
+
+    /// Decision 15's index, spelled out here rather than read from
+    /// `protected_nonce_index()`, so a drift in the shared spec fails.
+    fn assert_is_the_protected_nonce_index(index: &Document) {
+        // Ordered: key order is part of an index's identity.
+        let key: Vec<(&str, &Bson)> = index
+            .get_document("key")
+            .expect("key")
+            .iter()
+            .map(|(field, order)| (field.as_str(), order))
+            .collect();
+        assert_eq!(
+            key,
+            vec![("channel", &Bson::Int32(1)), ("nonce", &Bson::Int32(1))],
+            "keyed on (channel, message-level nonce), in that order: {index:?}"
+        );
+        assert_eq!(
+            index.get_bool("unique").ok(),
+            Some(true),
+            "unique: {index:?}"
+        );
+        assert_eq!(
+            index.get_document("partialFilterExpression").ok(),
+            Some(&doc! { "encrypted": { "$exists": true } }),
+            "only messages carrying `encrypted` are indexed: {index:?}"
+        );
+    }
+
+    /// A fresh database (init.rs) carries the protected-message replay
+    /// index (docs/protected-channels-design.md 3.10).
+    #[tokio::test]
+    async fn init_creates_the_protected_nonce_index() {
+        // Named by hand for the same 63-character reason as above.
+        let db = crate::DatabaseInfo::Test("migration_init_nonce_index".to_string())
+            .connect()
+            .await
+            .expect("Database connection failed.");
+        db.drop_database().await;
+        let guard = crate::test_teardown::TestDatabaseGuard::arm(&db).await;
+
+        {
+            #[allow(irrefutable_let_patterns)]
+            let Database::MongoDb(mongo) = db.clone() else {
+                // Indexes exist only on MongoDB.
+                db.drop_database().await;
+                guard.disarm();
+                return;
+            };
+
+            super::super::init::create_database(&mongo).await;
+
+            let index = nonce_index(&mongo)
+                .await
+                .expect("init.rs must create the replay index");
+            assert_is_the_protected_nonce_index(&index);
+        }
+
+        db.drop_database().await;
+        guard.disarm();
+    }
+
+    /// Revision 75 builds the same index over existing history whose
+    /// plaintext nonces repeat (they were never unique), and a second run
+    /// over the index it already built succeeds.
+    #[tokio::test]
+    async fn revision_75_creates_the_protected_nonce_index_and_is_rerunnable() {
+        let db = crate::DatabaseInfo::Test("migration_rev75_nonce_index".to_string())
+            .connect()
+            .await
+            .expect("Database connection failed.");
+        db.drop_database().await;
+        let guard = crate::test_teardown::TestDatabaseGuard::arm(&db).await;
+
+        {
+            #[allow(irrefutable_let_patterns)]
+            let Database::MongoDb(mongo) = db.clone() else {
+                // The migration scripts are MongoDB-only.
+                db.drop_database().await;
+                guard.disarm();
+                return;
+            };
+
+            // Revision 75's drop of the old mls_groups index needs the
+            // collection; the missing index itself is tolerated.
+            mongo
+                .db()
+                .create_collection("mls_groups")
+                .await
+                .expect("create mls_groups");
+
+            mongo
+                .col::<Document>("messages")
+                .insert_many(vec![
+                    doc! { "_id": "M1", "channel": "C1", "nonce": "N1", "content": "a" },
+                    doc! { "_id": "M2", "channel": "C1", "nonce": "N1", "content": "b" },
+                ])
+                .await
+                .expect("insert plaintext history");
+
+            super::run_migrations(&mongo, 75).await;
+            let index = nonce_index(&mongo)
+                .await
+                .expect("revision 75 must create the replay index");
+            assert_is_the_protected_nonce_index(&index);
+
+            super::run_migrations(&mongo, 75).await;
+            let index = nonce_index(&mongo)
+                .await
+                .expect("the replay index survives a re-run");
+            assert_is_the_protected_nonce_index(&index);
+        }
+
+        db.drop_database().await;
+        guard.disarm();
+    }
+
+    /// A same-named index that does not enforce the guard (here: not
+    /// unique) makes revision 75 panic, so the revision is never advanced
+    /// over it. Re-running is a no-op only over the exact index.
+    #[tokio::test]
+    async fn revision_75_refuses_a_conflicting_nonce_index() {
+        use crate::models::admin_migrations::{protected_nonce_index, PROTECTED_NONCE_INDEX_NAME};
+        use futures::FutureExt;
+
+        let db = crate::DatabaseInfo::Test("migration_rev75_nonce_conflict".to_string())
+            .connect()
+            .await
+            .expect("Database connection failed.");
+        db.drop_database().await;
+        let guard = crate::test_teardown::TestDatabaseGuard::arm(&db).await;
+
+        {
+            #[allow(irrefutable_let_patterns)]
+            let Database::MongoDb(mongo) = db.clone() else {
+                // The migration scripts are MongoDB-only.
+                db.drop_database().await;
+                guard.disarm();
+                return;
+            };
+
+            mongo
+                .db()
+                .create_collection("mls_groups")
+                .await
+                .expect("create mls_groups");
+
+            let mut weak = protected_nonce_index();
+            weak.insert("unique", false);
+            mongo
+                .db()
+                .run_command(doc! { "createIndexes": "messages", "indexes": [weak] })
+                .await
+                .expect("create a non-unique index under the name");
+
+            let migration = std::panic::AssertUnwindSafe(super::run_migrations(&mongo, 75))
+                .catch_unwind()
+                .await;
+            let Err(payload) = migration else {
+                panic!("revision 75 must refuse a non-unique {PROTECTED_NONCE_INDEX_NAME}");
+            };
+            let message = payload
+                .downcast_ref::<String>()
+                .map(String::as_str)
+                .or_else(|| payload.downcast_ref::<&str>().copied())
+                .unwrap_or_default();
+            assert!(
+                message.contains(PROTECTED_NONCE_INDEX_NAME),
+                "the panic must come from the replay index step: {message}"
+            );
+        }
+
+        db.drop_database().await;
+        guard.disarm();
+    }
+
+    /// With the index in place, a second message carrying `encrypted` under
+    /// a (channel, nonce) already used is a duplicate-key error naming the
+    /// index. The key is the message-level nonce, not `encrypted.nonce`;
+    /// plaintext messages and other channels are unconstrained. Raw inserts:
+    /// the driver mapping to `DuplicateNonce` belongs to the message drivers.
+    #[tokio::test]
+    async fn protected_nonce_index_refuses_only_an_encrypted_duplicate() {
+        use crate::models::admin_migrations::{protected_nonce_index, PROTECTED_NONCE_INDEX_NAME};
+        use crate::mongodb::error::{ErrorKind, WriteFailure};
+
+        let db = crate::DatabaseInfo::Test("migration_nonce_index_dupes".to_string())
+            .connect()
+            .await
+            .expect("Database connection failed.");
+        db.drop_database().await;
+        let guard = crate::test_teardown::TestDatabaseGuard::arm(&db).await;
+
+        {
+            #[allow(irrefutable_let_patterns)]
+            let Database::MongoDb(mongo) = db.clone() else {
+                // Indexes exist only on MongoDB.
+                db.drop_database().await;
+                guard.disarm();
+                return;
+            };
+
+            mongo
+                .db()
+                .run_command(doc! {
+                    "createIndexes": "messages",
+                    "indexes": [protected_nonce_index()]
+                })
+                .await
+                .expect("create the replay index");
+
+            let payload = |aead_nonce: &str| {
+                doc! {
+                    "v": 1_i32,
+                    "group_id": "G",
+                    "epoch": 0_i64,
+                    "sender_device_id": "D",
+                    "nonce": aead_nonce,
+                    "ciphertext": "X",
+                    "sig": "S"
+                }
+            };
+            let messages = mongo.col::<Document>("messages");
+
+            messages
+                .insert_one(doc! { "_id": "M1", "channel": "C1", "nonce": "N1", "encrypted": payload("A1") })
+                .await
+                .expect("the first protected message");
+
+            // Same (channel, nonce), a different AEAD nonce: still a replay.
+            let error = messages
+                .insert_one(doc! { "_id": "M2", "channel": "C1", "nonce": "N1", "encrypted": payload("A2") })
+                .await
+                .expect_err("a second protected message with the same (channel, nonce)");
+            match *error.kind {
+                ErrorKind::Write(WriteFailure::WriteError(ref write)) => {
+                    assert_eq!(write.code, 11000, "{error:?}");
+                    assert!(
+                        write.message.contains(PROTECTED_NONCE_INDEX_NAME),
+                        "the duplicate must name the replay index: {error:?}"
+                    );
+                }
+                _ => panic!("expected a duplicate-key write error: {error:?}"),
+            }
+
+            for (allowed, why) in [
+                (
+                    doc! { "_id": "M3", "channel": "C1", "nonce": "N2", "encrypted": payload("A1") },
+                    "a repeated AEAD nonce under a new message nonce",
+                ),
+                (
+                    doc! { "_id": "M4", "channel": "C2", "nonce": "N1", "encrypted": payload("A3") },
+                    "the same nonce in another channel",
+                ),
+                (
+                    doc! { "_id": "P1", "channel": "C1", "nonce": "N1", "content": "a" },
+                    "a plaintext message reusing a protected message's nonce",
+                ),
+                (
+                    doc! { "_id": "P2", "channel": "C1", "nonce": "N3", "content": "b" },
+                    "a plaintext message",
+                ),
+                (
+                    doc! { "_id": "P3", "channel": "C1", "nonce": "N3", "content": "c" },
+                    "a second plaintext message with the same (channel, nonce)",
+                ),
+            ] {
+                messages
+                    .insert_one(allowed)
+                    .await
+                    .unwrap_or_else(|error| panic!("{why} must insert: {error:?}"));
+            }
         }
 
         db.drop_database().await;

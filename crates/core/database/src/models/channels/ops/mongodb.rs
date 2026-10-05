@@ -463,6 +463,42 @@ impl AbstractChannels for MongoDb {
 
         Ok(())
     }
+
+    /// A real write to the parent (`$inc` of `txn_serial`), filtered on not
+    /// protected. A protect transaction that read "no threads" before the
+    /// thread was inserted and has not yet written the flag write-conflicts
+    /// on its flag write and retries, then reads the thread; one that has
+    /// written the flag makes this write wait for its commit and then match
+    /// nothing.
+    async fn hold_thread_parent_unprotected(&self, parent_id: &str) -> Result<()> {
+        let matched = self
+            .col::<Document>(COL)
+            .update_one(
+                doc! {
+                    "_id": parent_id,
+                    "protected": { "$ne": true }
+                },
+                doc! { "$inc": { "txn_serial": 1_i64 } },
+            )
+            .await
+            .map(|result| result.matched_count)
+            .map_err(|_| create_database_error!("update_one", COL))?;
+
+        if matched != 0 {
+            return Ok(());
+        }
+
+        // Nothing matched: the parent is protected, or it does not exist.
+        // Read it back to tell the two apart, as `update_channel` does.
+        match self.fetch_channel(parent_id).await {
+            Ok(stored) if stored.is_protected() => Err(create_error!(ChannelProtected)),
+            // Present and unprotected cannot happen while protect is one-way.
+            // Nothing was held, so fail closed.
+            Ok(_) => Err(create_database_error!("update_one", COL)),
+            // NotFound for a missing parent; any other error as is.
+            Err(error) => Err(error),
+        }
+    }
 }
 
 impl MongoDb {

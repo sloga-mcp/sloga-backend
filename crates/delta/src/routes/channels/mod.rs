@@ -11,6 +11,7 @@ mod control_request;
 mod channel_delete;
 mod channel_edit;
 mod channel_fetch;
+mod channel_protect;
 mod command_list;
 mod follow_create;
 mod follow_delete;
@@ -50,8 +51,12 @@ mod poll_end;
 mod poll_fetch;
 mod poll_vote;
 mod poll_voters;
+mod protected_entitlement_grant;
+pub(crate) mod protected_seat_validation;
 mod scheduled_message_delete;
 mod scheduled_messages_list;
+mod seats_fetch;
+mod seats_put;
 mod softres_create;
 mod softres_export;
 mod softres_fetch;
@@ -157,5 +162,9 @@ pub fn routes() -> (Vec<Route>, OpenApi) {
         softres_manage::softres_lock,
         softres_manage::softres_unlock,
         softres_export::softres_export,
+        protected_entitlement_grant::grant_entitlement,
+        channel_protect::protect_channel,
+        seats_put::put_seats,
+        seats_fetch::fetch_seats,
     ]
 }

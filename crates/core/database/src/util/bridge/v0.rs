@@ -2441,6 +2441,23 @@ impl From<crate::E2EEEnvelope> for E2EEMessage {
             content_type: value.content_type.into(),
             group_id: value.group_id,
             epoch: value.epoch,
+            committer: value.committer.map(Into::into),
+            added: value.added.into_iter().map(Into::into).collect(),
+            removed: value.removed.into_iter().map(Into::into).collect(),
+            rejoin_intents: value.rejoin_intents.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+impl From<crate::MlsEnvelopeRejoinIntent> for MlsRejoinIntentInfo {
+    fn from(value: crate::MlsEnvelopeRejoinIntent) -> Self {
+        MlsRejoinIntentInfo {
+            group_id: value.group_id,
+            channel_id: value.channel_id,
+            user_id: value.user_id,
+            device_id: value.device_id,
+            key_package_ref: value.key_package_ref,
+            signature: value.signature,
         }
     }
 }
@@ -2517,6 +2534,147 @@ impl crate::MlsCommit {
     }
 }
 
+impl From<crate::MlsPendingRemoval> for MlsPendingRemovalInfo {
+    fn from(value: crate::MlsPendingRemoval) -> Self {
+        MlsPendingRemovalInfo {
+            user_id: value.user_id,
+            created_at: value.created_at,
+        }
+    }
+}
+
+impl From<crate::MlsMemberAdded> for MlsMemberAddedInfo {
+    fn from(value: crate::MlsMemberAdded) -> Self {
+        MlsMemberAddedInfo {
+            user_id: value.user_id,
+            device_id: value.device_id,
+            epoch: value.epoch,
+            at: value.at,
+        }
+    }
+}
+
+impl crate::MlsGroup {
+    /// The text-group state response (protected channels design §7.2).
+    /// `None` unless this is a Text group with a generation, so a Call group
+    /// (or a corrupt Text row) can never be served as one.
+    pub fn into_text_group_response(self) -> Option<ResponseTextGroup> {
+        if self.kind != crate::MlsGroupKind::Text {
+            return None;
+        }
+
+        Some(ResponseTextGroup {
+            group_id: self.id,
+            channel_id: self.channel_id,
+            generation: self.generation?,
+            current_epoch: self.current_epoch,
+            members: self.members.into_iter().map(Into::into).collect(),
+            pending_removals: self.pending_removals.into_iter().map(Into::into).collect(),
+            member_added: self.member_added.into_iter().map(Into::into).collect(),
+        })
+    }
+}
+
+impl From<crate::ChannelEntitlementSource> for ChannelEntitlementSource {
+    fn from(value: crate::ChannelEntitlementSource) -> Self {
+        match value {
+            crate::ChannelEntitlementSource::AdminGrant => ChannelEntitlementSource::AdminGrant,
+            crate::ChannelEntitlementSource::Prot => ChannelEntitlementSource::Prot,
+            crate::ChannelEntitlementSource::Crowdfund => ChannelEntitlementSource::Crowdfund,
+        }
+    }
+}
+
+impl From<crate::ChannelEntitlementState> for ChannelEntitlementState {
+    fn from(value: crate::ChannelEntitlementState) -> Self {
+        match value {
+            crate::ChannelEntitlementState::Active => ChannelEntitlementState::Active,
+            crate::ChannelEntitlementState::Grace => ChannelEntitlementState::Grace,
+            crate::ChannelEntitlementState::Frozen => ChannelEntitlementState::Frozen,
+            crate::ChannelEntitlementState::Deleted => ChannelEntitlementState::Deleted,
+        }
+    }
+}
+
+impl From<crate::ChannelEntitlement> for ChannelEntitlement {
+    fn from(value: crate::ChannelEntitlement) -> Self {
+        ChannelEntitlement {
+            id: value.id,
+            channel_id: value.channel_id,
+            server_id: value.server_id,
+            source: value.source.into(),
+            slot_cap: value.slot_cap,
+            device_cap: value.device_cap,
+            state: value.state.into(),
+            granted_by: value.granted_by,
+            created_at: value.created_at,
+        }
+    }
+}
+
+impl From<crate::SignedHandover> for SignedHandover {
+    fn from(value: crate::SignedHandover) -> Self {
+        SignedHandover {
+            body: value.body,
+            signature: value.signature,
+        }
+    }
+}
+
+impl From<SignedHandover> for crate::SignedHandover {
+    fn from(value: SignedHandover) -> Self {
+        crate::SignedHandover {
+            body: value.body,
+            signature: value.signature,
+        }
+    }
+}
+
+impl From<DataSeatList> for crate::SeatListSubmission {
+    fn from(value: DataSeatList) -> Self {
+        crate::SeatListSubmission {
+            body: value.body,
+            signature: value.signature,
+            signer_device_id: value.signer_device_id,
+            handover: value.handover.map(Into::into),
+        }
+    }
+}
+
+impl From<crate::SeatList> for ChannelSeatListInfo {
+    fn from(value: crate::SeatList) -> Self {
+        ChannelSeatListInfo {
+            version: value.version,
+            body: value.body,
+            signature: value.signature,
+            signer_user_id: value.signer_user_id,
+            signer_device_id: value.signer_device_id,
+            handovers: value.handovers.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+impl crate::ChannelSeat {
+    /// An active seat entry. `seated_without_access` is left unset: only the
+    /// route can compute it, and only for the server owner (design §7.2).
+    pub fn into_seat_info(self) -> ChannelSeatInfo {
+        ChannelSeatInfo {
+            user_id: self.user_id,
+            seated_at: self.seated_at,
+            seated_without_access: None,
+        }
+    }
+
+    /// A cooling seat entry; `None` for a seat that was never released
+    pub fn into_cooling_info(self) -> Option<ChannelSeatCoolingInfo> {
+        Some(ChannelSeatCoolingInfo {
+            user_id: self.user_id,
+            released_at: self.released_at?,
+            cooldown_until: self.cooldown_until?,
+        })
+    }
+}
+
 impl From<crate::BoostSource> for BoostSource {
     fn from(value: crate::BoostSource) -> Self {
         match value {
@@ -2537,5 +2695,147 @@ impl From<crate::ServerBoost> for ServerBoost {
             expires_at: value.expires_at,
             allocated_at: value.allocated_at,
         }
+    }
+}
+
+#[cfg(test)]
+mod protected_channel_bridge_tests {
+    use iso8601_timestamp::Timestamp;
+    use revolt_models::v0;
+
+    fn device(user_id: &str, fill: &str) -> crate::MlsMemberDevice {
+        crate::MlsMemberDevice {
+            user_id: user_id.to_string(),
+            device_id: fill.repeat(32),
+        }
+    }
+
+    fn text_group() -> crate::MlsGroup {
+        crate::MlsGroup {
+            id: format!("{}1", "0".repeat(63)),
+            channel_id: "01JA0000000000000000CHANNEL".to_string(),
+            open: true,
+            created_by: device("01JA00000000000000000USERA", "a"),
+            created_at: Timestamp::UNIX_EPOCH,
+            current_epoch: 7,
+            members: vec![device("01JA00000000000000000USERA", "a")],
+            closed_at: None,
+            superseded_by: None,
+            kind: crate::MlsGroupKind::Text,
+            generation: Some(2),
+            seat_list_ad_sha256: Some("f".repeat(64)),
+            pending_removals: vec![crate::MlsPendingRemoval {
+                user_id: "01JA00000000000000000USERB".to_string(),
+                created_at: Timestamp::UNIX_EPOCH,
+            }],
+            member_added: vec![crate::MlsMemberAdded {
+                user_id: "01JA00000000000000000USERA".to_string(),
+                device_id: "a".repeat(32),
+                epoch: 5,
+                at: Timestamp::UNIX_EPOCH,
+            }],
+        }
+    }
+
+    #[test]
+    fn only_a_text_group_with_a_generation_is_served_as_one() {
+        let response = text_group().into_text_group_response().unwrap();
+        assert_eq!(response.group_id, format!("{}1", "0".repeat(63)));
+        assert_eq!(response.channel_id, "01JA0000000000000000CHANNEL");
+        assert_eq!(response.generation, 2);
+        assert_eq!(response.current_epoch, 7);
+        assert_eq!(response.members[0].device_id, "a".repeat(32));
+        assert_eq!(
+            response.pending_removals[0].user_id,
+            "01JA00000000000000000USERB"
+        );
+        assert_eq!(response.member_added[0].epoch, 5);
+
+        let call = crate::MlsGroup {
+            kind: crate::MlsGroupKind::Call,
+            ..text_group()
+        };
+        assert_eq!(call.into_text_group_response(), None);
+
+        let corrupt = crate::MlsGroup {
+            generation: None,
+            ..text_group()
+        };
+        assert_eq!(corrupt.into_text_group_response(), None);
+    }
+
+    #[test]
+    fn seat_list_conversions_keep_every_field() {
+        let submission: crate::SeatListSubmission = v0::DataSeatList {
+            body: "body".to_string(),
+            signature: "c2ln".to_string(),
+            signer_device_id: "a".repeat(32),
+            handover: Some(v0::SignedHandover {
+                body: "handover".to_string(),
+                signature: "aG8".to_string(),
+            }),
+        }
+        .into();
+        assert_eq!(submission.body, "body");
+        assert_eq!(submission.signature, "c2ln");
+        assert_eq!(submission.signer_device_id, "a".repeat(32));
+        assert_eq!(
+            submission.handover,
+            Some(crate::SignedHandover {
+                body: "handover".to_string(),
+                signature: "aG8".to_string(),
+            })
+        );
+
+        let list: v0::ChannelSeatListInfo = crate::SeatList {
+            id: "01JA0000000000000000CHANNEL".to_string(),
+            version: 3,
+            body: "body".to_string(),
+            signer_user_id: "01JA00000000000000000USERA".to_string(),
+            signer_device_id: "a".repeat(32),
+            signature: "c2ln".to_string(),
+            handovers: submission.handover.into_iter().collect(),
+            updated_at: Timestamp::UNIX_EPOCH,
+        }
+        .into();
+        assert_eq!(list.version, 3);
+        assert_eq!(list.signer_user_id, "01JA00000000000000000USERA");
+        assert_eq!(list.handovers[0].signature, "aG8");
+
+        let seat = crate::ChannelSeat {
+            id: crate::ChannelSeat::composite_id(
+                "01JA0000000000000000CHANNEL",
+                "01JA00000000000000000USERA",
+            ),
+            channel_id: "01JA0000000000000000CHANNEL".to_string(),
+            user_id: "01JA00000000000000000USERA".to_string(),
+            seated_at: Timestamp::UNIX_EPOCH,
+            released_at: None,
+            cooldown_until: None,
+        };
+        assert_eq!(seat.clone().into_seat_info().seated_without_access, None);
+        assert_eq!(seat.into_cooling_info(), None);
+    }
+
+    #[test]
+    fn entitlement_converts_every_field() {
+        let entitlement: v0::ChannelEntitlement = crate::ChannelEntitlement {
+            id: "01JA00000000000000000000ENT".to_string(),
+            channel_id: "01JA0000000000000000CHANNEL".to_string(),
+            server_id: "01JA00000000000000000SERVER".to_string(),
+            source: crate::ChannelEntitlementSource::AdminGrant,
+            slot_cap: 10,
+            device_cap: Some(3),
+            state: crate::ChannelEntitlementState::Active,
+            granted_by: "01JA00000000000000000ADMIN0".to_string(),
+            created_at: Timestamp::UNIX_EPOCH,
+        }
+        .into();
+        assert_eq!(entitlement.id, "01JA00000000000000000000ENT");
+        assert_eq!(entitlement.source, v0::ChannelEntitlementSource::AdminGrant);
+        assert_eq!(entitlement.slot_cap, 10);
+        assert_eq!(entitlement.device_cap, Some(3));
+        assert_eq!(entitlement.state, v0::ChannelEntitlementState::Active);
+        assert_eq!(entitlement.granted_by, "01JA00000000000000000ADMIN0");
     }
 }

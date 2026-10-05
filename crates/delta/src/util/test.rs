@@ -2,12 +2,21 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use base64::{engine::general_purpose::STANDARD_NO_PAD, Engine as _};
+use ed25519_dalek::{Signer, SigningKey};
+use iso8601_timestamp::Timestamp;
 use rand::Rng;
 use redis_kiss::redis;
 use revolt_database::util::email::normalise_email;
 use revolt_database::util::password::hash_password;
 use revolt_database::{
     events::client::EventV1, Channel, Database, Member, Message, PartialRole, Server, User, AMQP,
+};
+use revolt_database::{
+    seat_list_channel_server, ChannelEntitlement, ChannelEntitlementSource,
+    ChannelEntitlementState, E2EEIdentity, E2EESignedKey, EncryptedPayload, HandoverBody, MlsGroup,
+    MlsGroupCreateOutcome, MlsGroupKind, MlsMemberDevice, SeatListBody, SeatListSubmission,
+    SeatListWriteOutcome, CONTEXT_HANDOVER, E2EE_PROTOCOL_VERSION, E2EE_SIGN_CONTEXT_FALLBACK,
 };
 use revolt_database::{util::idempotency::IdempotencyKey, Role};
 use revolt_database::{Account, EmailVerification, Session};
@@ -18,6 +27,10 @@ use rocket::http::Header;
 use rocket::local::asynchronous::{Client, LocalRequest, LocalResponse};
 use rocket::tokio;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use ulid::Ulid;
+
+use crate::routes::mls::text::text_group_id;
 
 /// One process-lifetime runtime shared by every Redis-backed test.
 ///
@@ -762,6 +775,434 @@ impl TestHarness {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Protected-channel fixtures (W2)
+//
+// Built through the database primitives, which verify no signature and run
+// none of the route checks, so a route test starts from a known state and
+// exercises its own route only. Keys, seat lists and handovers are
+// deterministic (Ed25519 signing is), so a test can rebuild a byte-identical
+// list for a retry; ids are fresh on every call.
+// ---------------------------------------------------------------------------
+
+/// Key seed of the design 5.1 owner device (seed bytes `00 01 .. 1f`)
+pub const OWNER_DEVICE_SEED: u8 = 0x00;
+
+/// Key seed of the design 5.1 member device (seed bytes `20 21 .. 3f`)
+pub const MEMBER_DEVICE_SEED: u8 = 0x20;
+
+/// Key seed of the design 5.1 new owner device (seed bytes `80 81 .. 9f`)
+pub const NEW_OWNER_DEVICE_SEED: u8 = 0x80;
+
+/// `issued_at` of every fixture seat list and handover (the design 5.1 value)
+pub const FIXTURE_ISSUED_AT: i64 = 1_790_812_800_000;
+
+/// Slot cap of the entitlement [`TestHarness::new_protected_channel`] grants
+pub const FIXTURE_SLOT_CAP: u32 = 10;
+
+/// `device_cap` of the list [`TestHarness::new_protected_channel`] signs: the
+/// configured default entitlement cap, so the route's 4.3 step 6 accepts it
+pub const FIXTURE_DEVICE_CAP: u32 = 5;
+
+fn fixture_b64(bytes: &[u8]) -> String {
+    STANDARD_NO_PAD.encode(bytes)
+}
+
+/// An E2EE device with a known Ed25519 identity key, which signs seat lists,
+/// handovers and payloads the way a client device does
+pub struct TestE2EEDevice {
+    pub user_id: String,
+    pub device_id: String,
+    pub signing_key: SigningKey,
+    /// Its directory row (stored by [`TestHarness::new_e2ee_device`])
+    pub identity: E2EEIdentity,
+}
+
+impl TestE2EEDevice {
+    /// The Ed25519 key whose 32 seed bytes are `seed, seed + 1, ..` (wrapping)
+    pub fn signing_key_for(seed: u8) -> SigningKey {
+        SigningKey::from_bytes(&std::array::from_fn(|i| seed.wrapping_add(i as u8)))
+    }
+
+    /// A device of `user_id` with the key for `seed` and a directory row that
+    /// verifies, bound to `session_id`; nothing is stored
+    pub fn new(user_id: &str, device_id: &str, seed: u8, session_id: &str) -> TestE2EEDevice {
+        let signing_key = Self::signing_key_for(seed);
+        let ed25519_key = fixture_b64(signing_key.verifying_key().as_bytes());
+        let curve25519_key = fixture_b64(&Sha256::digest(format!("curve25519:{ed25519_key}")));
+        let fallback_key = fixture_b64(&Sha256::digest(format!("fallback0:{ed25519_key}")));
+        // The database's (private) signed-key payload, as
+        // `routes::e2ee::tests::TestDevice` builds it
+        let fallback_payload = format!(
+            "{E2EE_SIGN_CONTEXT_FALLBACK}\nprotocol_version:{E2EE_PROTOCOL_VERSION}\ndevice_id:{device_id}\nkey_id:fallback0\nkey:{fallback_key}"
+        );
+        let identity_payload = E2EEIdentity::signed_payload(
+            E2EE_PROTOCOL_VERSION,
+            device_id,
+            &ed25519_key,
+            &curve25519_key,
+        );
+        let now = Timestamp::now_utc();
+
+        let identity = E2EEIdentity {
+            id: E2EEIdentity::composite_id(user_id, device_id),
+            user_id: user_id.to_string(),
+            device_id: device_id.to_string(),
+            protocol_version: E2EE_PROTOCOL_VERSION,
+            ed25519_key,
+            curve25519_key,
+            signature: fixture_b64(&signing_key.sign(identity_payload.as_bytes()).to_bytes()),
+            fallback_key: E2EESignedKey {
+                key_id: "fallback0".to_string(),
+                key: fallback_key,
+                signature: fixture_b64(&signing_key.sign(fallback_payload.as_bytes()).to_bytes()),
+            },
+            previous_fallback_key: None,
+            created_at: now,
+            last_seen_at: now,
+            last_session_id: session_id.to_string(),
+        };
+
+        TestE2EEDevice {
+            user_id: user_id.to_string(),
+            device_id: device_id.to_string(),
+            signing_key,
+            identity,
+        }
+    }
+
+    /// b64 of the Ed25519 public key (the directory `ed25519_key`)
+    pub fn identity_key(&self) -> String {
+        self.identity.ed25519_key.clone()
+    }
+
+    /// The b64 Ed25519 signature of `payload` by this device
+    pub fn sign(&self, payload: &str) -> String {
+        fixture_b64(&self.signing_key.sign(payload.as_bytes()).to_bytes())
+    }
+
+    /// A seat list signed by this device (design 4.1, 4.2), no handover: the
+    /// builder sorts and de-duplicates `seats`, which must include this
+    /// device's user
+    pub fn seat_list(
+        &self,
+        channel_id: &str,
+        version: i64,
+        device_cap: u32,
+        seats: &[impl AsRef<str>],
+    ) -> v0::DataSeatList {
+        let body = SeatListBody {
+            channel_id: channel_id.to_string(),
+            version,
+            device_cap,
+            issued_at: FIXTURE_ISSUED_AT,
+            signer_user_id: self.user_id.clone(),
+            signer_device_id: self.device_id.clone(),
+            seats: seats.iter().map(|seat| seat.as_ref().to_string()).collect(),
+        }
+        .build()
+        .expect("a canonical seat list body");
+
+        v0::DataSeatList {
+            signature: self.sign(&body),
+            body,
+            signer_device_id: self.device_id.clone(),
+            handover: None,
+        }
+    }
+
+    /// The protect request: this device's genesis (`version: 1`) seat list
+    pub fn protect_request(
+        &self,
+        channel_id: &str,
+        device_cap: u32,
+        seats: &[impl AsRef<str>],
+    ) -> v0::DataProtectChannel {
+        v0::DataProtectChannel {
+            seat_list: self.seat_list(channel_id, 1, device_cap, seats),
+        }
+    }
+
+    /// A handover statement (design 4.6) from this device to `to`, signed by
+    /// this device, for a later list's `handover`
+    pub fn handover_to(&self, channel_id: &str, to: &TestE2EEDevice) -> v0::SignedHandover {
+        let body = format!(
+            "{CONTEXT_HANDOVER}\nv:1\nchannel_id:{channel_id}\nfrom_user_id:{}\nfrom_device_id:{}\nfrom_identity_key:{}\nto_user_id:{}\nto_device_id:{}\nto_identity_key:{}\nissued_at:{FIXTURE_ISSUED_AT}",
+            self.user_id,
+            self.device_id,
+            self.identity.ed25519_key,
+            to.user_id,
+            to.device_id,
+            to.identity.ed25519_key
+        );
+        HandoverBody::parse(&body).expect("a canonical handover body");
+
+        v0::SignedHandover {
+            signature: self.sign(&body),
+            body,
+        }
+    }
+
+    /// A structurally valid payload (design 2.6) from this device into
+    /// `group` at its current epoch. The AEAD nonce and ciphertext are random
+    /// and `sig` is filler: the server never decrypts or verifies them.
+    pub fn encrypted_payload(&self, group: &MlsGroup) -> v0::EncryptedPayload {
+        let mut rng = rand::thread_rng();
+        let mut nonce = [0u8; EncryptedPayload::NONCE_BYTES];
+        let mut ciphertext = [0u8; 48];
+        let mut sig = [0u8; EncryptedPayload::SIG_BYTES];
+        rng.fill(&mut nonce[..]);
+        rng.fill(&mut ciphertext[..]);
+        rng.fill(&mut sig[..]);
+
+        v0::EncryptedPayload {
+            v: EncryptedPayload::VERSION,
+            group_id: group.id.clone(),
+            epoch: group.current_epoch,
+            sender_device_id: self.device_id.clone(),
+            nonce: fixture_b64(&nonce),
+            ciphertext: fixture_b64(&ciphertext),
+            sig: fixture_b64(&sig),
+            franking: None,
+        }
+    }
+}
+
+/// What [`TestHarness::new_protected_channel`] built
+pub struct ProtectedChannel {
+    /// The server, owned by the owner
+    pub server: Server,
+    /// The channel, re-read after protect (`protected: true`)
+    pub channel: Channel,
+    /// Its Active entitlement
+    pub entitlement: ChannelEntitlement,
+    /// The owner's device that signed the genesis list, bound to the owner's
+    /// session
+    pub owner_device: TestE2EEDevice,
+    /// The stored genesis seat list
+    pub seat_list: v0::DataSeatList,
+}
+
+impl TestHarness {
+    /// A server owned by `owner`, the owner's membership (as `server_create`
+    /// leaves it) and a fresh unprotected TextChannel; the server is re-read,
+    /// so its `channels` lists that channel
+    pub async fn new_protectable_channel(&self, owner: &User) -> (Server, Channel) {
+        let (server, _) = self.new_server(owner).await;
+        self.join_server(&server, owner).await;
+        let channel = self.new_channel(&server).await;
+        let server = self.db.fetch_server(&server.id).await.expect("`Server`");
+        (server, channel)
+    }
+
+    /// `user`'s membership of `server`, through `Member::create`
+    pub async fn join_server(&self, server: &Server, user: &User) -> Member {
+        Member::create(&self.db, server, user, None)
+            .await
+            .expect("Failed to join test server")
+            .0
+    }
+
+    /// An Active admin-grant entitlement on `channel` (a server TextChannel),
+    /// through the database primitive
+    pub async fn grant_entitlement(
+        &self,
+        channel: &Channel,
+        slot_cap: u32,
+        device_cap: Option<u32>,
+    ) -> ChannelEntitlement {
+        let server_id = seat_list_channel_server(channel).expect("a server TextChannel");
+        let now = Timestamp::now_utc();
+        self.db
+            .upsert_channel_entitlement(
+                &ChannelEntitlement {
+                    id: Ulid::new().to_string(),
+                    channel_id: channel.id().to_string(),
+                    server_id: server_id.to_string(),
+                    source: ChannelEntitlementSource::AdminGrant,
+                    slot_cap,
+                    device_cap,
+                    state: ChannelEntitlementState::Active,
+                    granted_by: Ulid::new().to_string(),
+                    created_at: now,
+                },
+                now,
+            )
+            .await
+            .expect("`ChannelEntitlement`")
+    }
+
+    /// Register a device of `user` with the key for `seed` (its device id is
+    /// derived from the key), bound to `session_id`: pass the harness
+    /// session's `id` to bind it, any other value for an unbound device
+    pub async fn new_e2ee_device(&self, user: &User, session_id: &str, seed: u8) -> TestE2EEDevice {
+        let key = TestE2EEDevice::signing_key_for(seed);
+        let device_id: String = key.verifying_key().as_bytes()[..16]
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        let device = TestE2EEDevice::new(&user.id, &device_id, seed, session_id);
+        device
+            .identity
+            .verify()
+            .expect("a valid directory identity");
+        self.db
+            .insert_e2ee_identity(&device.identity)
+            .await
+            .expect("`E2EEIdentity`");
+        device
+    }
+
+    /// Protect `channel` with `data`'s genesis list through the database
+    /// primitive (no signature or route check)
+    pub async fn protect_with_db(
+        &self,
+        channel: &Channel,
+        data: &v0::DataProtectChannel,
+    ) -> SeatListWriteOutcome {
+        self.db
+            .protect_channel(
+                channel.id(),
+                &SeatListSubmission::from(data.seat_list.clone()),
+                Timestamp::now_utc(),
+            )
+            .await
+            .expect("Failed to protect test channel")
+    }
+
+    /// Store `data` as `channel`'s next seat list through the database
+    /// primitive, claims allowed (no signature or route check)
+    pub async fn put_seats_with_db(
+        &self,
+        channel: &Channel,
+        data: &v0::DataSeatList,
+    ) -> SeatListWriteOutcome {
+        self.db
+            .put_seat_list(
+                channel.id(),
+                &SeatListSubmission::from(data.clone()),
+                true,
+                Timestamp::now_utc(),
+            )
+            .await
+            .expect("Failed to store test seat list")
+    }
+
+    /// End to end: [`Self::new_protectable_channel`], an entitlement
+    /// ([`FIXTURE_SLOT_CAP`], default device cap), the owner's
+    /// [`OWNER_DEVICE_SEED`] device bound to `owner_session`, `members` (not
+    /// the owner) joined, then protected through the database with a genesis
+    /// list ([`FIXTURE_DEVICE_CAP`]) seating the owner and `members`
+    pub async fn new_protected_channel(
+        &self,
+        owner: &User,
+        owner_session: &Session,
+        members: &[&User],
+    ) -> ProtectedChannel {
+        let (server, channel) = self.new_protectable_channel(owner).await;
+        let entitlement = self
+            .grant_entitlement(&channel, FIXTURE_SLOT_CAP, None)
+            .await;
+        let owner_device = self
+            .new_e2ee_device(owner, &owner_session.id, OWNER_DEVICE_SEED)
+            .await;
+
+        let mut seats = vec![owner.id.clone()];
+        for member in members {
+            self.join_server(&server, member).await;
+            seats.push(member.id.clone());
+        }
+
+        let protect = owner_device.protect_request(channel.id(), FIXTURE_DEVICE_CAP, &seats);
+        self.protect_with_db(&channel, &protect).await;
+        let channel = self
+            .db
+            .fetch_channel(channel.id())
+            .await
+            .expect("the protected channel");
+
+        ProtectedChannel {
+            server,
+            channel,
+            entitlement,
+            owner_device,
+            seat_list: protect.seat_list,
+        }
+    }
+
+    /// `channel`'s Text group `text_group_id(channel, generation)`, created
+    /// by `creator` (the current list signer's device) through the database
+    /// primitive; `supersedes` names the group it succeeds (generation - 1).
+    /// Returns the stored group (members: the creator only, epoch 0).
+    pub async fn new_text_group(
+        &self,
+        channel: &Channel,
+        creator: &TestE2EEDevice,
+        generation: u32,
+        supersedes: Option<&str>,
+    ) -> MlsGroup {
+        let creator = MlsMemberDevice {
+            user_id: creator.user_id.clone(),
+            device_id: creator.device_id.clone(),
+        };
+        let group = MlsGroup {
+            id: text_group_id(channel.id(), generation),
+            channel_id: channel.id().to_string(),
+            open: true,
+            created_by: creator.clone(),
+            created_at: Timestamp::now_utc(),
+            current_epoch: 0,
+            members: vec![creator],
+            closed_at: None,
+            superseded_by: None,
+            kind: MlsGroupKind::Text,
+            generation: Some(generation),
+            seat_list_ad_sha256: None,
+            pending_removals: vec![],
+            member_added: vec![],
+        };
+
+        match self
+            .db
+            .create_text_mls_group(&group, supersedes)
+            .await
+            .expect("Failed to create test text group")
+        {
+            MlsGroupCreateOutcome::Created => {}
+            other => panic!("test text group not created: {:?}", other),
+        }
+
+        self.db
+            .fetch_mls_group(&group.id)
+            .await
+            .expect("the stored text group")
+    }
+
+    /// An encrypted message from `sender` into `channel` under `group`
+    /// ([`TestE2EEDevice::encrypted_payload`], a fresh id and client message
+    /// id), stored through `insert_message`
+    pub async fn new_encrypted_message(
+        &self,
+        channel: &Channel,
+        sender: &TestE2EEDevice,
+        group: &MlsGroup,
+    ) -> Message {
+        let message = Message {
+            id: Ulid::new().to_string(),
+            channel: channel.id().to_string(),
+            author: sender.user_id.clone(),
+            nonce: Some(Ulid::new().to_string()),
+            encrypted: Some(sender.encrypted_payload(group).into()),
+            ..Default::default()
+        };
+        self.db
+            .insert_message(&message)
+            .await
+            .expect("Failed to store test encrypted message");
+        message
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Mail {
     pub id: String,
@@ -1242,4 +1683,381 @@ fn an_unexpected_buffered_event_is_named() {
             message
         );
     })
+}
+
+/// The protected-channel fixtures build what the W2 routes take. Run under
+/// nextest (one process per test).
+mod protected_fixture_tests {
+    use revolt_database::validate_protected_send;
+    use revolt_result::ErrorType;
+
+    use super::*;
+    use crate::routes::mls::{
+        dispatch_group, require_seated, require_text_gate, GroupDispatch, TextGate,
+    };
+
+    // Design 5.1 inputs
+    const CHANNEL: &str = "01J9Z3K4M5N6P7Q8R9S0T1V2W3";
+    const OWNER: &str = "01HZXAAAAAAAAAAAAAAAAAAAAA";
+    const MEMBER: &str = "01HZXBBBBBBBBBBBBBBBBBBBBB";
+    const OTHER: &str = "01HZXCCCCCCCCCCCCCCCCCCCCC";
+    const OWNER_DEVICE: &str = "00112233445566778899aabbccddeeff";
+    const NEW_OWNER_DEVICE: &str = "0123456789abcdef0123456789abcdef";
+    const MEMBER_DEVICE: &str = "ffeeddccbbaa99887766554433221100";
+
+    // Design 5.2 identity keys
+    const OWNER_IDENTITY_KEY: &str = "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg";
+    const MEMBER_IDENTITY_KEY: &str = "Kay64UG8yvCyLhqU000LxzYeUm0L/hLIl5S8kyKWbdc";
+    const NEW_OWNER_IDENTITY_KEY: &str = "zRSzf5VulTGU/3+3Oz2B3MVh1hp1OAlLfD4aZD7l86o";
+
+    // Design 5.3 seat list and 5.4 handover
+    const VECTOR_SEAT_LIST_BODY: &str = "sloga-seat-list-v1\nv:1\nchannel_id:01J9Z3K4M5N6P7Q8R9S0T1V2W3\nversion:3\ndevice_cap:5\nissued_at:1790812800000\nsigner_user_id:01HZXAAAAAAAAAAAAAAAAAAAAA\nsigner_device_id:00112233445566778899aabbccddeeff\nseats:01HZXAAAAAAAAAAAAAAAAAAAAA,01HZXBBBBBBBBBBBBBBBBBBBBB,01HZXCCCCCCCCCCCCCCCCCCCCC";
+    const VECTOR_SEAT_LIST_SIGNATURE: &str =
+        "HtbS6jbLvwSZxAe4i2a4lwmKhv4hM+3NkMY1EuwRaPyv9kI3x/3t1SsalteuxoxmG4YFczXUA77134HTJwLRCA";
+    const VECTOR_HANDOVER_BODY: &str = "sloga-owner-handover-v1\nv:1\nchannel_id:01J9Z3K4M5N6P7Q8R9S0T1V2W3\nfrom_user_id:01HZXAAAAAAAAAAAAAAAAAAAAA\nfrom_device_id:00112233445566778899aabbccddeeff\nfrom_identity_key:A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg\nto_user_id:01HZXAAAAAAAAAAAAAAAAAAAAA\nto_device_id:0123456789abcdef0123456789abcdef\nto_identity_key:zRSzf5VulTGU/3+3Oz2B3MVh1hp1OAlLfD4aZD7l86o\nissued_at:1790812800000";
+    const VECTOR_HANDOVER_SIGNATURE: &str =
+        "JKnYtaiK/i3tYSxV71XoXyz9l0XaDsWIhzoCu8s9IuTdmFmWX5BNtoEhpt+v9gSvhE+nqS2/kZEA0CX6giR6BA";
+
+    #[track_caller]
+    fn assert_not_authenticated(result: revolt_result::Result<()>, case: &str) {
+        assert!(
+            matches!(&result, Err(error) if matches!(error.error_type, ErrorType::NotAuthenticated)),
+            "{}: expected NotAuthenticated, got {:?}",
+            case,
+            result
+        );
+    }
+
+    /// The builders are canonical and sign with the seed's key: they
+    /// reproduce the design 5.3 seat list and the 5.4 handover byte for
+    /// byte, signatures included, from the 5.1 inputs
+    #[test]
+    fn the_builders_reproduce_the_5_3_and_5_4_vectors() {
+        let owner = TestE2EEDevice::new(OWNER, OWNER_DEVICE, OWNER_DEVICE_SEED, "unbound");
+        let member = TestE2EEDevice::new(MEMBER, MEMBER_DEVICE, MEMBER_DEVICE_SEED, "unbound");
+        let new_owner =
+            TestE2EEDevice::new(OWNER, NEW_OWNER_DEVICE, NEW_OWNER_DEVICE_SEED, "unbound");
+        for (device, key) in [
+            (&owner, OWNER_IDENTITY_KEY),
+            (&member, MEMBER_IDENTITY_KEY),
+            (&new_owner, NEW_OWNER_IDENTITY_KEY),
+        ] {
+            assert_eq!(device.identity_key(), key);
+            device.identity.verify().expect("the identity row verifies");
+        }
+
+        // `seats_unsorted` (5.1): the builder sorts
+        let list = owner.seat_list(CHANNEL, 3, 5, &[OTHER, OWNER, MEMBER]);
+        assert_eq!(list.body, VECTOR_SEAT_LIST_BODY);
+        assert_eq!(list.signature, VECTOR_SEAT_LIST_SIGNATURE);
+        assert_eq!(list.signer_device_id, OWNER_DEVICE);
+        assert!(list.handover.is_none());
+
+        let handover = owner.handover_to(CHANNEL, &new_owner);
+        assert_eq!(handover.body, VECTOR_HANDOVER_BODY);
+        assert_eq!(handover.signature, VECTOR_HANDOVER_SIGNATURE);
+
+        let genesis = owner.protect_request(CHANNEL, 5, &[OWNER]).seat_list;
+        let body = SeatListBody::parse(&genesis.body).expect("the genesis body");
+        assert_eq!((body.version, body.seats), (1, vec![OWNER.to_string()]));
+    }
+
+    #[test]
+    fn the_e2ee_device_fixture_is_registered_and_bound_to_its_session() {
+        rt().block_on(the_e2ee_device_fixture_is_registered_and_bound_to_its_session_case())
+    }
+
+    /// The device is stored, its row verifies, and it is bound to the session
+    /// it was given and no other (the `assert_bound_session` rule)
+    async fn the_e2ee_device_fixture_is_registered_and_bound_to_its_session_case() {
+        let harness = TestHarness::new().await;
+        let db = &harness.db;
+        let (_, session, user) = harness.new_user().await;
+        let (_, other_session, _) = harness.new_user().await;
+
+        let device = harness
+            .new_e2ee_device(&user, &session.id, OWNER_DEVICE_SEED)
+            .await;
+        assert_eq!(device.identity_key(), OWNER_IDENTITY_KEY);
+        let stored = db
+            .fetch_e2ee_identity(&user.id, &device.device_id)
+            .await
+            .expect("the stored identity");
+        assert_eq!(stored.ed25519_key, OWNER_IDENTITY_KEY);
+        stored.verify().expect("the stored identity verifies");
+        stored
+            .assert_bound_session(&session.id)
+            .expect("bound to the harness session");
+        assert_not_authenticated(
+            stored.assert_bound_session(&other_session.id),
+            "another session",
+        );
+        E2EEIdentity::require_device_bound_session(db, &user.id, &session.id)
+            .await
+            .expect("a device-bound session");
+
+        // A second device of the same user, bound elsewhere
+        let unbound = harness
+            .new_e2ee_device(&user, "elsewhere", NEW_OWNER_DEVICE_SEED)
+            .await;
+        assert_ne!(unbound.device_id, device.device_id);
+        let stored = db
+            .fetch_e2ee_identity(&user.id, &unbound.device_id)
+            .await
+            .expect("the unbound identity");
+        assert_eq!(stored.ed25519_key, NEW_OWNER_IDENTITY_KEY);
+        assert_not_authenticated(stored.assert_bound_session(&session.id), "unbound device");
+    }
+
+    #[test]
+    fn the_seat_list_builder_signs_what_the_directory_key_verifies() {
+        rt().block_on(the_seat_list_builder_signs_what_the_directory_key_verifies_case())
+    }
+
+    /// What the builders sign verifies under the signer device's STORED
+    /// directory key (the route's 4.3 step 3 and step 8 primitive) for a
+    /// genesis list, a v+1 list and its handover; a rebuild is byte-identical
+    /// (the 4.9 retry); and the database protect and PUT take them
+    async fn the_seat_list_builder_signs_what_the_directory_key_verifies_case() {
+        let harness = TestHarness::new().await;
+        let db = &harness.db;
+        let (_, owner_session, owner) = harness.new_user().await;
+        let (_, _, member) = harness.new_user().await;
+        let (server, channel) = harness.new_protectable_channel(&owner).await;
+        harness.join_server(&server, &member).await;
+        harness
+            .grant_entitlement(&channel, FIXTURE_SLOT_CAP, None)
+            .await;
+        let device = harness
+            .new_e2ee_device(&owner, &owner_session.id, OWNER_DEVICE_SEED)
+            .await;
+        let successor = harness
+            .new_e2ee_device(&owner, "elsewhere", NEW_OWNER_DEVICE_SEED)
+            .await;
+        let signer = db
+            .fetch_e2ee_identity(&owner.id, &device.device_id)
+            .await
+            .expect("the signer identity");
+        let successor_identity = db
+            .fetch_e2ee_identity(&owner.id, &successor.device_id)
+            .await
+            .expect("the successor identity");
+
+        let seats = [&owner.id, &member.id];
+        let genesis = device
+            .protect_request(channel.id(), FIXTURE_DEVICE_CAP, &seats)
+            .seat_list;
+        let mut next = device.seat_list(channel.id(), 2, FIXTURE_DEVICE_CAP, &seats);
+        let handover = device.handover_to(channel.id(), &successor);
+        next.handover = Some(handover.clone());
+
+        // Verified first, so a bad signature fails here and nowhere else
+        for (case, body, signature) in [
+            ("genesis list", &genesis.body, &genesis.signature),
+            ("v2 list", &next.body, &next.signature),
+            ("handover", &handover.body, &handover.signature),
+        ] {
+            assert!(
+                signer.verify_payload(body, signature),
+                "the {} signature does not verify under the signer device key",
+                case
+            );
+        }
+
+        let rebuilt = device
+            .protect_request(channel.id(), FIXTURE_DEVICE_CAP, &seats)
+            .seat_list;
+        assert_eq!(
+            (&rebuilt.body, &rebuilt.signature),
+            (&genesis.body, &genesis.signature)
+        );
+
+        let mut seated = vec![owner.id.clone(), member.id.clone()];
+        seated.sort();
+        let body = SeatListBody::parse(&genesis.body).expect("the genesis body");
+        assert_eq!(body.channel_id, channel.id());
+        assert_eq!(body.signer_user_id, owner.id);
+        assert_eq!(body.signer_device_id, device.device_id);
+        assert_eq!(genesis.signer_device_id, device.device_id);
+        assert_eq!(body.seats, seated);
+
+        let statement = HandoverBody::parse(&handover.body).expect("the handover body");
+        assert_eq!(statement.channel_id, channel.id());
+        assert_eq!(statement.from_device_id, device.device_id);
+        assert_eq!(statement.from_identity_key, signer.ed25519_key);
+        assert_eq!(statement.to_device_id, successor.device_id);
+        assert_eq!(statement.to_identity_key, successor_identity.ed25519_key);
+
+        let protected = harness
+            .protect_with_db(
+                &channel,
+                &v0::DataProtectChannel {
+                    seat_list: genesis.clone(),
+                },
+            )
+            .await;
+        assert!(!protected.unchanged);
+        assert_eq!(protected.claimed, seated);
+        let put = harness.put_seats_with_db(&channel, &next).await;
+        assert!(!put.unchanged);
+        assert_eq!(put.list.version, 2);
+        assert_eq!(put.list.handovers.len(), 1);
+    }
+
+    #[test]
+    fn the_protected_channel_fixture_is_what_the_routes_need() {
+        rt().block_on(the_protected_channel_fixture_is_what_the_routes_need_case())
+    }
+
+    /// End to end: the server, memberships, entitlement, stored seat list and
+    /// seats, the Text groups (ids from `text_group_id`, through the route
+    /// gate) and an encrypted message the send allowlist and the stored-shape
+    /// rule take
+    async fn the_protected_channel_fixture_is_what_the_routes_need_case() {
+        let harness = TestHarness::new().await;
+        let db = &harness.db;
+        let (_, owner_session, owner) = harness.new_user().await;
+        let (_, member_session, member) = harness.new_user().await;
+        let (_, _, outsider) = harness.new_user().await;
+
+        let protected = harness
+            .new_protected_channel(&owner, &owner_session, &[&member])
+            .await;
+        let channel = &protected.channel;
+
+        assert_eq!(protected.server.owner, owner.id);
+        assert!(protected
+            .server
+            .channels
+            .iter()
+            .any(|id| id == channel.id()));
+        assert_eq!(
+            seat_list_channel_server(channel),
+            Some(protected.server.id.as_str())
+        );
+        assert!(channel.is_protected());
+        for user in [&owner, &member] {
+            db.fetch_member(&protected.server.id, &user.id)
+                .await
+                .expect("a member");
+        }
+
+        let entitlement = db
+            .fetch_channel_entitlement(channel.id())
+            .await
+            .expect("the entitlement read")
+            .expect("an entitlement");
+        assert_eq!(entitlement.id, protected.entitlement.id);
+        assert_eq!(entitlement.server_id, protected.server.id);
+        assert_eq!(entitlement.slot_cap, FIXTURE_SLOT_CAP);
+        assert!(entitlement.is_active());
+
+        let stored = db
+            .fetch_seat_list(channel.id())
+            .await
+            .expect("the seat list read")
+            .expect("a seat list");
+        assert_eq!(stored.version, 1);
+        assert_eq!(stored.body, protected.seat_list.body);
+        assert_eq!(stored.signature, protected.seat_list.signature);
+        let owner_identity = db
+            .fetch_e2ee_identity(&owner.id, &protected.owner_device.device_id)
+            .await
+            .expect("the owner device");
+        owner_identity
+            .assert_bound_session(&owner_session.id)
+            .expect("the owner device is bound to the owner session");
+        assert!(owner_identity.verify_payload(&stored.body, &stored.signature));
+        for user in [&owner, &member] {
+            require_seated(db, channel.id(), &user.id)
+                .await
+                .expect("seated");
+        }
+        assert!(
+            matches!(
+                require_seated(db, channel.id(), &outsider.id).await,
+                Err(error) if matches!(error.error_type, ErrorType::NotSeated)
+            ),
+            "{}",
+            "an outsider is not seated"
+        );
+
+        let group = harness
+            .new_text_group(channel, &protected.owner_device, 0, None)
+            .await;
+        assert_eq!(group.id, text_group_id(channel.id(), 0));
+        assert_eq!(
+            (group.kind, group.generation, group.current_epoch),
+            (MlsGroupKind::Text, Some(0), 0)
+        );
+        assert_eq!(
+            group.seat_list_ad_sha256,
+            Some(stored.commit_ad_sha256().expect("the AD hash"))
+        );
+        let GroupDispatch::Text(gated) = dispatch_group(db, &group.id)
+            .await
+            .expect("the kind dispatch")
+        else {
+            panic!("the fixture's group dispatches as a Text group");
+        };
+        require_text_gate(TextGate::Available)
+            .await
+            .expect("the text gate");
+        assert_eq!(gated.kind, MlsGroupKind::Text);
+
+        let successor = harness
+            .new_text_group(channel, &protected.owner_device, 1, Some(&group.id))
+            .await;
+        assert_eq!(successor.id, text_group_id(channel.id(), 1));
+        assert_eq!(successor.generation, Some(1));
+        let superseded = db.fetch_mls_group(&group.id).await.expect("generation 0");
+        assert!(!superseded.open);
+        assert_eq!(
+            superseded.superseded_by.as_deref(),
+            Some(successor.id.as_str())
+        );
+
+        let member_device = harness
+            .new_e2ee_device(&member, &member_session.id, MEMBER_DEVICE_SEED)
+            .await;
+        let author = member.clone().into(db, Some(&member)).await;
+        validate_protected_send(
+            true,
+            &v0::MessageAuthor::User(&author),
+            &v0::DataMessageSend {
+                content: None,
+                nonce: Some(Ulid::new().to_string()),
+                attachments: None,
+                replies: None,
+                embeds: None,
+                masquerade: None,
+                interactions: None,
+                components: None,
+                sticker_ids: None,
+                encrypted: Some(member_device.encrypted_payload(&successor)),
+                flags: None,
+            },
+            false,
+        )
+        .expect("the send allowlist takes the payload");
+
+        let message = harness
+            .new_encrypted_message(channel, &member_device, &successor)
+            .await;
+        let fetched = db
+            .fetch_message(&message.id)
+            .await
+            .expect("the stored message");
+        assert_eq!(fetched.author, member.id);
+        assert_eq!(fetched.nonce, message.nonce);
+        assert_eq!(fetched.encrypted, message.encrypted);
+        let encrypted = fetched.encrypted.as_ref().expect("encrypted");
+        assert_eq!(encrypted.group_id, successor.id);
+        assert_eq!(encrypted.epoch, successor.current_epoch);
+        assert_eq!(encrypted.sender_device_id, member_device.device_id);
+        assert!(fetched.is_servable(true));
+        fetched
+            .validate_protected_shape(true)
+            .expect("the stored shape");
+    }
 }

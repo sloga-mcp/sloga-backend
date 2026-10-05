@@ -221,6 +221,8 @@ async fn full_flow_create_join_commit_fanout_case() {
                 channel_id: channel.id().to_string(),
                 device_id: device_a.device.device_id.clone(),
                 supersedes: None,
+                kind: None,
+                generation: None,
             })
             .unwrap(),
         )
@@ -239,6 +241,8 @@ async fn full_flow_create_join_commit_fanout_case() {
                 channel_id: channel.id().to_string(),
                 device_id: device_b.device.device_id.clone(),
                 supersedes: None,
+                kind: None,
+                generation: None,
             })
             .unwrap(),
         )
@@ -497,6 +501,8 @@ async fn rejoin_affordance_flags_and_solo_close_case() {
                 channel_id: channel.id().to_string(),
                 device_id: device_a.device.device_id.clone(),
                 supersedes: None,
+                kind: None,
+                generation: None,
             })
             .unwrap(),
         )
@@ -578,6 +584,8 @@ async fn rejoin_affordance_flags_and_solo_close_case() {
                 channel_id: solo_channel.id().to_string(),
                 device_id: device_a.device.device_id.clone(),
                 supersedes: None,
+                kind: None,
+                generation: None,
             })
             .unwrap(),
         )
@@ -721,6 +729,8 @@ async fn dual_reload_rejoin_closes_group_case() {
                 channel_id: channel.id().to_string(),
                 device_id: device_a.device.device_id.clone(),
                 supersedes: None,
+                kind: None,
+                generation: None,
             })
             .unwrap(),
         )
@@ -936,6 +946,8 @@ async fn strangers_without_shared_channel_cannot_claim_or_create_case() {
             channel_id: channel.id().to_string(),
             device_id: device_a.device.device_id.clone(),
             supersedes: None,
+            kind: None,
+            generation: None,
         })
         .unwrap(),
     )
@@ -952,6 +964,8 @@ async fn strangers_without_shared_channel_cannot_claim_or_create_case() {
             channel_id: channel.id().to_string(),
             device_id: device_c.device.device_id.clone(),
             supersedes: None,
+            kind: None,
+            generation: None,
         })
         .unwrap(),
     )
@@ -1045,6 +1059,8 @@ async fn blocked_pair_in_shared_channel_cannot_claim_case() {
             channel_id: channel.id().to_string(),
             device_id: device_a.device.device_id.clone(),
             supersedes: None,
+            kind: None,
+            generation: None,
         })
         .unwrap(),
     )
@@ -1233,6 +1249,8 @@ async fn join_intent_signature_one_device_and_rate_limit_case() {
             channel_id: channel.id().to_string(),
             device_id: device_a.device.device_id.clone(),
             supersedes: None,
+            kind: None,
+            generation: None,
         })
         .unwrap(),
     )
@@ -1347,6 +1365,8 @@ async fn commit_size_caps_and_welcome_pairing_case() {
             channel_id: channel.id().to_string(),
             device_id: device_a.device.device_id.clone(),
             supersedes: None,
+            kind: None,
+            generation: None,
         })
         .unwrap(),
     )
@@ -1494,6 +1514,8 @@ async fn fanout_skips_devices_over_queue_budget_case() {
             channel_id: channel.id().to_string(),
             device_id: device_a.device.device_id.clone(),
             supersedes: None,
+            kind: None,
+            generation: None,
         })
         .unwrap(),
     )
@@ -1517,6 +1539,10 @@ async fn fanout_skips_devices_over_queue_budget_case() {
             content_type: E2EEContentType::Olm,
             group_id: None,
             epoch: None,
+            committer: None,
+            added: vec![],
+            removed: vec![],
+            rejoin_intents: vec![],
         })
         .collect();
     harness.db.insert_e2ee_envelopes(&envelopes).await.unwrap();
@@ -1581,6 +1607,8 @@ async fn seed_group_with_members(
             channel_id: channel_id.to_string(),
             device_id: creator_device.to_string(),
             supersedes: None,
+            kind: None,
+            generation: None,
         })
         .unwrap(),
     )

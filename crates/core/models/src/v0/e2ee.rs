@@ -1,3 +1,5 @@
+use super::{MlsMemberDevice, MlsRejoinIntentInfo};
+
 auto_derived!(
     /// What an E2EE envelope's ciphertext contains. MLS types are only ever
     /// minted server-side by the `/mls` commit fan-out; client envelope
@@ -271,5 +273,127 @@ auto_derived!(
         /// MLS epoch this envelope establishes (mls_* content only)
         #[serde(skip_serializing_if = "Option::is_none")]
         pub epoch: Option<i64>,
+        /// Text `mls_commit` only: the committing device as the server
+        /// recorded it (protected channels design §3.12.3 step 6, §8.1).
+        /// Every declaration field is absent on Call commits, Welcomes and
+        /// ctl envelopes, which keep their earlier shape
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub committer: Option<MlsMemberDevice>,
+        /// Text `mls_commit` only: devices the commit added
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub added: Vec<MlsMemberDevice>,
+        /// Text `mls_commit` only: devices the commit removed
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub removed: Vec<MlsMemberDevice>,
+        /// Text `mls_commit` only: the signed join intents that justified a
+        /// rejoin-case Remove in the commit
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub rejoin_intents: Vec<MlsRejoinIntentInfo>,
     }
 );
+
+#[cfg(test)]
+mod tests {
+    use super::{E2EEContentType, E2EEMessage, MlsMemberDevice, MlsRejoinIntentInfo};
+
+    /// A Call `mls_commit` envelope exactly as `996641f1` serialized it
+    const CALL_COMMIT_AT_996641F1: &str = r#"{"id":"01JA0000000000000000000ENV","recipient_user_id":"01JA00000000000000000USERB","recipient_device_id":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","sender_user_id":"01JA00000000000000000USERA","sender_device_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","protocol_version":1,"sequence":0,"ciphertext":"Y29tbWl0","content_type":"mls_commit","group_id":"0000000000000000000000000000000000000000000000000000000000000001","epoch":4}"#;
+
+    fn call_commit() -> E2EEMessage {
+        E2EEMessage {
+            id: "01JA0000000000000000000ENV".to_string(),
+            recipient_user_id: "01JA00000000000000000USERB".to_string(),
+            recipient_device_id: "b".repeat(32),
+            sender_user_id: "01JA00000000000000000USERA".to_string(),
+            sender_device_id: "a".repeat(32),
+            protocol_version: 1,
+            sequence: 0,
+            ciphertext: "Y29tbWl0".to_string(),
+            content_type: E2EEContentType::MlsCommit,
+            group_id: Some(format!("{}1", "0".repeat(63))),
+            epoch: Some(4),
+            committer: None,
+            added: vec![],
+            removed: vec![],
+            rejoin_intents: vec![],
+        }
+    }
+
+    fn device(user_id: &str, fill: &str) -> MlsMemberDevice {
+        MlsMemberDevice {
+            user_id: user_id.to_string(),
+            device_id: fill.repeat(32),
+        }
+    }
+
+    /// Decision 1: the Call path stays byte-identical
+    #[test]
+    fn call_commit_envelope_serializes_like_996641f1() {
+        assert_eq!(
+            serde_json::to_string(&call_commit()).unwrap(),
+            CALL_COMMIT_AT_996641F1
+        );
+        assert_eq!(
+            serde_json::from_str::<E2EEMessage>(CALL_COMMIT_AT_996641F1).unwrap(),
+            call_commit()
+        );
+    }
+
+    /// [A#14] An envelope written before the declarations existed (no
+    /// `committer`, `added`, `removed` or `rejoin_intents` key) still parses
+    #[test]
+    fn envelope_without_declarations_still_deserializes() {
+        let parsed: E2EEMessage = serde_json::from_str(CALL_COMMIT_AT_996641F1)
+            .expect("an envelope without declaration keys must deserialize");
+        assert_eq!(parsed.committer, None);
+        assert!(parsed.added.is_empty());
+        assert!(parsed.removed.is_empty());
+        assert!(parsed.rejoin_intents.is_empty());
+    }
+
+    /// Decision 7: a Text commit carries every declaration, in wire form
+    #[test]
+    fn text_commit_envelope_carries_the_declarations() {
+        let intent = MlsRejoinIntentInfo {
+            group_id: format!("{}1", "0".repeat(63)),
+            channel_id: "01JA0000000000000000CHANNEL".to_string(),
+            user_id: "01JA00000000000000000USERB".to_string(),
+            device_id: "b".repeat(32),
+            key_package_ref: "a3ByZWY".to_string(),
+            signature: "c2ln".to_string(),
+        };
+        let text = E2EEMessage {
+            committer: Some(device("01JA00000000000000000USERA", "a")),
+            added: vec![device("01JA00000000000000000USERC", "c")],
+            removed: vec![device("01JA00000000000000000USERB", "b")],
+            rejoin_intents: vec![intent],
+            ..call_commit()
+        };
+
+        let value = serde_json::to_value(&text).unwrap();
+        assert_eq!(
+            value["committer"],
+            serde_json::json!({ "user_id": "01JA00000000000000000USERA", "device_id": "a".repeat(32) })
+        );
+        assert_eq!(
+            value["added"],
+            serde_json::json!([{ "user_id": "01JA00000000000000000USERC", "device_id": "c".repeat(32) }])
+        );
+        assert_eq!(
+            value["removed"],
+            serde_json::json!([{ "user_id": "01JA00000000000000000USERB", "device_id": "b".repeat(32) }])
+        );
+        assert_eq!(
+            value["rejoin_intents"],
+            serde_json::json!([{
+                "group_id": format!("{}1", "0".repeat(63)),
+                "channel_id": "01JA0000000000000000CHANNEL",
+                "user_id": "01JA00000000000000000USERB",
+                "device_id": "b".repeat(32),
+                "key_package_ref": "a3ByZWY",
+                "signature": "c2ln"
+            }])
+        );
+        assert_eq!(serde_json::from_value::<E2EEMessage>(value).unwrap(), text);
+    }
+}

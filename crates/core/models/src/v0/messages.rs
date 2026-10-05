@@ -1,7 +1,7 @@
 use std::time::SystemTime;
 
 use indexmap::{IndexMap, IndexSet};
-use revolt_config::config;
+use revolt_config::{config, Hosts};
 
 #[cfg(feature = "validator")]
 use validator::Validate;
@@ -884,19 +884,88 @@ impl From<SystemMessage> for String {
     }
 }
 
+/// Notification body for every protected-channel message (protected
+/// channels design §7.5)
+pub const PROTECTED_PUSH_BODY: &str = "New message";
+
 impl PushNotification {
     /// Create a new notification from a given message, author and channel ID
     pub async fn from(msg: Message, author: Option<MessageAuthor<'_>>, channel: Channel) -> Self {
         let config = config().await;
+        Self::from_with_hosts(msg, author, channel, &config.hosts)
+    }
+
+    /// The message a protected-channel notification carries: an allowlist
+    /// of the ids and flags pushd and the clients use to route and thread
+    /// it, none of which can hold user-authored text. Every other field is
+    /// spelled out as empty, so a field added to `Message` later fails to
+    /// compile here instead of passing through
+    fn protected_message(msg: Message) -> Message {
+        Message {
+            id: msg.id,
+            nonce: msg.nonce,
+            channel: msg.channel,
+            author: msg.author,
+            user: None,
+            member: None,
+            webhook: None,
+            content: None,
+            system: None,
+            attachments: None,
+            edited: None,
+            embeds: None,
+            mentions: None,
+            role_mentions: None,
+            replies: None,
+            reactions: IndexMap::new(),
+            interactions: Interactions::default(),
+            masquerade: None,
+            pinned: None,
+            thread_id: None,
+            command_context: None,
+            components: None,
+            sticker_ids: None,
+            poll: None,
+            softres: None,
+            forwarded: None,
+            crosspost: None,
+            encrypted: None,
+            flags: msg.flags,
+        }
+    }
+
+    fn from_with_hosts(
+        msg: Message,
+        author: Option<MessageAuthor<'_>>,
+        channel: Channel,
+        hosts: &Hosts,
+    ) -> Self {
+        // Protected-channel messages never reach a push service (design
+        // §7.5, decision 10, defense in depth): a generic body, no preview,
+        // and neither the ciphertext nor any stray plaintext is copied into
+        // the notification's message
+        let protected = msg.encrypted.is_some()
+            || matches!(
+                channel,
+                Channel::TextChannel {
+                    protected: true,
+                    ..
+                }
+            );
+        let msg = if protected {
+            Self::protected_message(msg)
+        } else {
+            msg
+        };
 
         let icon = if let Some(author) = &author {
             if let Some(avatar) = author.avatar() {
-                format!("{}/avatars/{}", config.hosts.autumn, avatar)
+                format!("{}/avatars/{}", hosts.autumn, avatar)
             } else {
-                format!("{}/users/{}/default_avatar", config.hosts.api, author.id())
+                format!("{}/users/{}/default_avatar", hosts.api, author.id())
             }
         } else {
-            format!("{}/assets/logo.png", config.hosts.app)
+            format!("{}/assets/logo.png", hosts.app)
         };
 
         let image = msg
@@ -909,9 +978,11 @@ impl PushNotification {
                     .as_ref()
                     .and_then(|forwarded| forwarded.attachments.first())
             })
-            .map(|v| format!("{}/attachments/{}", config.hosts.autumn, v.id));
+            .map(|v| format!("{}/attachments/{}", hosts.autumn, v.id));
 
-        let body = if let Some(ref sys) = msg.system {
+        let body = if protected {
+            PROTECTED_PUSH_BODY.to_string()
+        } else if let Some(ref sys) = msg.system {
             sys.clone().into()
         } else if let Some(ref text) = msg.content {
             text.clone()
@@ -957,9 +1028,350 @@ impl PushNotification {
             raw_body: None,
             tag: channel.id().to_string(),
             timestamp,
-            url: format!("{}/channel/{}/{}", config.hosts.app, channel.id(), msg.id),
+            url: format!("{}/channel/{}/{}", hosts.app, channel.id(), msg.id),
             message: msg,
             channel,
+        }
+    }
+}
+
+#[cfg(test)]
+mod push_redaction_tests {
+    use std::collections::HashMap;
+
+    use revolt_config::Hosts;
+
+    use super::{Channel, Message, PushNotification, PROTECTED_PUSH_BODY};
+
+    const CIPHERTEXT: &str = "Q0lQSEVSVEVYVF9DSVBIRVJURVhUX0NJUEhFUlRFWFQ";
+    const SIG: &str =
+        "U0lHTkFUVVJFX1NJR05BVFVSRV9TSUdOQVRVUkVfU0lHTkFUVVJFX1NJR05BVFVSRV9TSUdOQVRVUkVfU0lH";
+
+    fn hosts() -> Hosts {
+        Hosts {
+            app: "https://app.test".to_string(),
+            api: "https://api.test".to_string(),
+            events: "wss://events.test".to_string(),
+            autumn: "https://autumn.test".to_string(),
+            january: "https://january.test".to_string(),
+            livekit: HashMap::new(),
+        }
+    }
+
+    fn channel(protected: bool) -> Channel {
+        serde_json::from_value(serde_json::json!({
+            "channel_type": "TextChannel",
+            "_id": "01JA0000000000000000CHANNEL",
+            "server": "01JA00000000000000000SERVER",
+            "name": "general",
+            "protected": protected,
+        }))
+        .unwrap()
+    }
+
+    fn attachment() -> serde_json::Value {
+        serde_json::json!({
+            "_id": "ATTACHMENTID",
+            "tag": "attachments",
+            "filename": "photo.png",
+            "metadata": { "type": "File" },
+            "content_type": "image/png",
+            "size": 1,
+        })
+    }
+
+    fn encrypted() -> serde_json::Value {
+        serde_json::json!({
+            "v": 1,
+            "group_id": format!("{}1", "0".repeat(63)),
+            "epoch": 7,
+            "sender_device_id": "a".repeat(32),
+            "nonce": "Tk9OQ0VOT05DRU5PTkNFTk9OQ0VOT05D",
+            "ciphertext": CIPHERTEXT,
+            "sig": SIG,
+        })
+    }
+
+    fn message(extra: serde_json::Value) -> Message {
+        let mut value = serde_json::json!({
+            "_id": "01JA00000000000000000000MSG",
+            "nonce": "01JA0000000000000000000CID",
+            "channel": "01JA0000000000000000CHANNEL",
+            "author": "01JA00000000000000000USERA",
+        });
+        for (key, field) in extra.as_object().unwrap() {
+            value[key] = field.clone();
+        }
+        serde_json::from_value(value).unwrap()
+    }
+
+    fn assert_redacted(push: &PushNotification) {
+        assert_eq!(push.body, PROTECTED_PUSH_BODY);
+        assert_eq!(push.raw_body, None);
+        assert_eq!(push.image, None);
+        assert_eq!(push.message.encrypted, None);
+        assert_eq!(push.message.content, None);
+        assert_eq!(push.message.attachments, None);
+
+        let serialized = serde_json::to_string(push).unwrap();
+        for leak in [
+            "\"encrypted\"",
+            CIPHERTEXT,
+            SIG,
+            "ATTACHMENTID",
+            "stray plaintext",
+        ] {
+            assert!(
+                !serialized.contains(leak),
+                "{leak} leaked into {serialized}"
+            );
+        }
+    }
+
+    /// Decision 10: a protected message yields a generic notification
+    #[test]
+    fn encrypted_message_is_redacted() {
+        let msg = message(serde_json::json!({ "encrypted": encrypted(), "flags": 1 }));
+        let push = PushNotification::from_with_hosts(msg, None, channel(true), &hosts());
+        assert_redacted(&push);
+        // What clients need to route the notification survives
+        assert_eq!(push.message.id, "01JA00000000000000000000MSG");
+        assert_eq!(
+            push.message.nonce.as_deref(),
+            Some("01JA0000000000000000000CID")
+        );
+        assert_eq!(push.tag, "01JA0000000000000000CHANNEL");
+
+        // Even with a stale channel copy, and with plaintext that the
+        // stored-shape invariant should have refused
+        let msg = message(serde_json::json!({
+            "encrypted": encrypted(),
+            "content": "stray plaintext",
+            "attachments": [attachment()],
+        }));
+        let push = PushNotification::from_with_hosts(msg, None, channel(false), &hosts());
+        assert_redacted(&push);
+    }
+
+    /// A stray plaintext row in a protected channel is redacted too
+    #[test]
+    fn plaintext_in_a_protected_channel_is_redacted() {
+        let msg = message(serde_json::json!({
+            "content": "stray plaintext",
+            "attachments": [attachment()],
+        }));
+        let push = PushNotification::from_with_hosts(msg, None, channel(true), &hosts());
+        assert_redacted(&push);
+    }
+
+    /// Ordinary messages are unchanged
+    #[test]
+    fn plaintext_message_is_unchanged() {
+        let msg = message(serde_json::json!({
+            "content": "hello there",
+            "attachments": [attachment()],
+        }));
+        let push = PushNotification::from_with_hosts(msg.clone(), None, channel(false), &hosts());
+        assert_eq!(push.body, "hello there");
+        assert_eq!(
+            push.image.as_deref(),
+            Some("https://autumn.test/attachments/ATTACHMENTID")
+        );
+        assert_eq!(push.message, msg);
+        assert_eq!(
+            push.url,
+            "https://app.test/channel/01JA0000000000000000CHANNEL/01JA00000000000000000000MSG"
+        );
+    }
+
+    /// The only keys a protected notification's message may carry
+    const ALLOWED_KEYS: [&str; 5] = ["_id", "nonce", "channel", "author", "flags"];
+
+    /// One distinct marker per populated field outside the allowlist
+    const SENTINELS: [&str; 30] = [
+        "LEAK_CONTENT",
+        "LEAK_USER_DISPLAY_NAME",
+        "LEAK_USER_STATUS",
+        "LEAK_MEMBER_NICKNAME",
+        "LEAK_WEBHOOK_NAME",
+        "LEAK_WEBHOOK_AVATAR",
+        "LEAK_SYSTEM_TEXT",
+        "ATTACHMENTID",
+        "LEAK_EMBED_TITLE",
+        "LEAK_EMBED_DESCRIPTION",
+        "LEAKMENTIONEDUSER",
+        "LEAKMENTIONEDROLE",
+        "LEAKREPLYTARGET",
+        "LEAKREACTION",
+        "LEAK_INTERACTION_REACTION",
+        "LEAK_MASQUERADE_NAME",
+        "LEAK_MASQUERADE_AVATAR",
+        "LEAKTHREAD",
+        "LEAK_COMMAND_NAME",
+        "LEAK_BUTTON_ID",
+        "LEAK_BUTTON_LABEL",
+        "LEAKSTICKER",
+        "LEAK_POLL_QUESTION",
+        "LEAK_POLL_ANSWER",
+        "LEAK_SOFTRES_TITLE",
+        "LEAK_SOFTRES_NOTE",
+        "LEAK_FORWARDED_CONTENT",
+        "LEAKCROSSPOSTMESSAGE",
+        "\"edited\"",
+        "\"pinned\"",
+    ];
+
+    /// Every optional message field populated, keyed by its wire name
+    fn every_field() -> serde_json::Value {
+        serde_json::json!({
+            "user": {
+                "_id": "01JA00000000000000000USERA",
+                "username": "alice",
+                "discriminator": "0001",
+                "display_name": "LEAK_USER_DISPLAY_NAME",
+                "status": { "text": "LEAK_USER_STATUS" },
+                "relationship": "None",
+                "online": false,
+            },
+            "member": {
+                "_id": {
+                    "server": "01JA00000000000000000SERVER",
+                    "user": "01JA00000000000000000USERA",
+                },
+                "joined_at": "2026-01-01T00:00:00Z",
+                "nickname": "LEAK_MEMBER_NICKNAME",
+            },
+            "webhook": { "name": "LEAK_WEBHOOK_NAME", "avatar": "LEAK_WEBHOOK_AVATAR" },
+            "content": "LEAK_CONTENT",
+            "system": { "type": "text", "content": "LEAK_SYSTEM_TEXT" },
+            "attachments": [attachment()],
+            "edited": "2026-01-01T00:00:00Z",
+            "embeds": [{
+                "type": "Text",
+                "title": "LEAK_EMBED_TITLE",
+                "description": "LEAK_EMBED_DESCRIPTION",
+            }],
+            "mentions": ["LEAKMENTIONEDUSER"],
+            "role_mentions": ["LEAKMENTIONEDROLE"],
+            "replies": ["LEAKREPLYTARGET"],
+            "reactions": { "LEAKREACTION": ["01JA00000000000000000USERB"] },
+            "interactions": {
+                "reactions": ["LEAK_INTERACTION_REACTION"],
+                "restrict_reactions": true,
+            },
+            "masquerade": {
+                "name": "LEAK_MASQUERADE_NAME",
+                "avatar": "https://masquerade.test/LEAK_MASQUERADE_AVATAR",
+                "colour": "red",
+            },
+            "pinned": true,
+            "thread_id": "LEAKTHREAD",
+            "command_context": {
+                "id": "01JA0000000000000000COMMAND",
+                "user_id": "01JA00000000000000000USERB",
+                "command_name": "LEAK_COMMAND_NAME",
+            },
+            "components": [{
+                "components": [{
+                    "type": "Button",
+                    "custom_id": "LEAK_BUTTON_ID",
+                    "label": "LEAK_BUTTON_LABEL",
+                    "style": "Primary",
+                }],
+            }],
+            "sticker_ids": ["LEAKSTICKER"],
+            "poll": {
+                "id": "01JA0000000000000000000POLL",
+                "question": "LEAK_POLL_QUESTION",
+                "answers": [{ "id": 0, "text": "LEAK_POLL_ANSWER" }],
+                "expires_at": 0,
+            },
+            "softres": {
+                "id": "01JA000000000000000SOFTRES",
+                "title": "LEAK_SOFTRES_TITLE",
+                "edition": "classic",
+                "raids": ["molten-core"],
+                "reserves_per_user": 1,
+                "note": "LEAK_SOFTRES_NOTE",
+            },
+            "forwarded": {
+                "message_id": "01JA00000000000000000SOURCE",
+                "channel_id": "01JA000000000000000SOURCECH",
+                "content": "LEAK_FORWARDED_CONTENT",
+                "original_sent_at": 0,
+            },
+            "crosspost": {
+                "message_id": "LEAKCROSSPOSTMESSAGE",
+                "channel_id": "01JA00000000000000CROSSCHAN",
+                "server_id": "01JA0000000000000CROSSSERVER",
+            },
+            "flags": 5,
+        })
+    }
+
+    /// WA#5: a protected notification's message is built from an allowlist,
+    /// so no populated field outside it survives, plaintext row or ciphertext
+    #[test]
+    fn protected_notification_carries_only_allowlisted_fields() {
+        let plaintext = message(every_field());
+        let mut with_ciphertext = every_field();
+        with_ciphertext["encrypted"] = encrypted();
+        let with_ciphertext = message(with_ciphertext);
+
+        for (msg, protected_channel) in [(plaintext, true), (with_ciphertext, false)] {
+            let push =
+                PushNotification::from_with_hosts(msg, None, channel(protected_channel), &hosts());
+            assert_eq!(push.body, PROTECTED_PUSH_BODY);
+            assert_eq!(push.raw_body, None);
+            assert_eq!(push.image, None);
+            assert_eq!(push.icon, "https://app.test/assets/logo.png");
+
+            let serialized = serde_json::to_string(&push).unwrap();
+            for leak in SENTINELS.iter().chain([CIPHERTEXT, SIG].iter()) {
+                assert!(
+                    !serialized.contains(leak),
+                    "{leak} leaked into {serialized}"
+                );
+            }
+
+            let message = serde_json::to_value(&push.message).unwrap();
+            let mut keys: Vec<&str> = message
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect();
+            keys.sort_unstable();
+            let mut allowed = ALLOWED_KEYS.to_vec();
+            allowed.sort_unstable();
+            assert_eq!(keys, allowed, "unexpected keys in {message}");
+
+            assert_eq!(push.message.id, "01JA00000000000000000000MSG");
+            assert_eq!(
+                push.message.nonce.as_deref(),
+                Some("01JA0000000000000000000CID")
+            );
+            assert_eq!(push.message.channel, "01JA0000000000000000CHANNEL");
+            assert_eq!(push.message.author, "01JA00000000000000000USERA");
+            assert_eq!(push.message.flags, 5);
+        }
+    }
+
+    /// The same message outside a protected channel passes through whole,
+    /// which also proves every sentinel above is visible when present
+    #[test]
+    fn unprotected_notification_keeps_every_field() {
+        let msg = message(every_field());
+        let push = PushNotification::from_with_hosts(msg.clone(), None, channel(false), &hosts());
+        assert_eq!(push.message, msg);
+        assert_eq!(push.body, "LEAK_SYSTEM_TEXT");
+
+        let serialized = serde_json::to_string(&push).unwrap();
+        for sentinel in SENTINELS {
+            assert!(
+                serialized.contains(sentinel),
+                "{sentinel} missing from {serialized}"
+            );
         }
     }
 }

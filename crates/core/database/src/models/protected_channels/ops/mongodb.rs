@@ -3,11 +3,19 @@
 //! Every multi-document write is ONE multi-document transaction (design
 //! 2.5 (c)): read concern `snapshot`, write concern `majority`, retried as a
 //! whole on `TransientTransactionError` (which covers write conflicts with a
-//! concurrent seat PUT or Text commit on the same group document), the
-//! commit step retried on `UnknownTransactionCommitResult`, at most
-//! `MAX_TRANSACTION_ATTEMPTS` attempts, after which the existing database
-//! error is returned. The deployment runs a replica set (`rs0`), which
-//! transactions require.
+//! concurrent seat PUT or Text commit on the same group document) for as
+//! long as `TRANSACTION_RETRY_BUDGET` allows, the commit step retried on
+//! `UnknownTransactionCommitResult` at most `MAX_COMMIT_ATTEMPTS` times;
+//! after that the existing database error is returned. The deployment runs
+//! a replica set (`rs0`), which transactions require.
+//!
+//! Why a time budget and not a fixed attempt count (R#17, W2): a writer
+//! that loses a conflict can only see the winner's result once the winner
+//! COMMITS, and under load a winning transaction was measured taking 0.3 to
+//! 2.3 s from its first write to its commit. Five attempts (about 0.3 s of
+//! backoff) ran out while the winner was still open, so a race that had a
+//! definite answer (`InvalidOperation`, a lost version) surfaced as a
+//! `DatabaseError` instead.
 //!
 //! Seat claims are never check-then-act across transactions: the cap count
 //! and the claims happen in one transaction that also writes the channel's
@@ -27,15 +35,18 @@ use serde::de::DeserializeOwned;
 
 use crate::{
     channel_seats_used, check_channel_protectable, check_text_first_generation,
-    check_text_successor, plan_seat_list_write, prepare_text_group, seat_cooldown_until, Channel,
-    ChannelEntitlement, ChannelSeat, MlsGroup, MlsGroupCreateOutcome, MongoDb, SeatList,
-    SeatListSnapshot, SeatListSubmission, SeatListWriteDecision, SeatListWriteInput,
-    SeatListWriteKind, SeatListWriteOutcome, MAX_CHANNEL_SLOT_CAP,
+    check_text_successor, is_genesis_reprotect, plan_seat_list_write, prepare_text_group,
+    seat_cooldown_until, seat_list_channel_server, Channel, ChannelEntitlement, ChannelSeat,
+    MlsGroup, MlsGroupCreateOutcome, MongoDb, SeatList, SeatListBody, SeatListSnapshot,
+    SeatListSubmission, SeatListWriteDecision, SeatListWriteInput, SeatListWriteKind,
+    SeatListWriteOutcome, MAX_CHANNEL_SLOT_CAP,
 };
 
 use super::AbstractProtectedChannels;
 
 const COL_CHANNELS: &str = "channels";
+const COL_SERVERS: &str = "servers";
+const COL_SERVER_MEMBERS: &str = "server_members";
 const COL_ENTITLEMENTS: &str = "channel_entitlements";
 const COL_SEATS: &str = "channel_seats";
 const COL_SEAT_LISTS: &str = "channel_seat_lists";
@@ -53,8 +64,23 @@ const COL_MESSAGES: &str = "messages";
 /// Serialized `MlsGroupKind::Text` (design 2.5)
 const KIND_TEXT: &str = "Text";
 
-/// Whole-transaction attempts (design 2.5 (a): at most 5)
-const MAX_TRANSACTION_ATTEMPTS: u32 = 5;
+/// How long one call keeps retrying its transaction on transient errors
+/// (see the module docs). A retry starts only while this has not run out.
+const TRANSACTION_RETRY_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Backstop on whole-transaction attempts inside the budget, so a stalled
+/// clock can never loop forever (the budget is the bound that applies)
+const MAX_TRANSACTION_ATTEMPTS: u32 = 100;
+
+/// Commit retries on `UnknownTransactionCommitResult` within one attempt
+const MAX_COMMIT_ATTEMPTS: u32 = 5;
+
+/// Backoff before the second attempt; doubled per attempt up to the cap
+const RETRY_BACKOFF_BASE_MS: u64 = 20;
+
+/// Longest single backoff, so a loser polls for the winner's commit at
+/// least this often
+const RETRY_BACKOFF_CAP_MS: u64 = 320;
 
 /// Why one transaction attempt stopped
 enum TxnFail {
@@ -141,14 +167,23 @@ fn timestamp_bson(at: &Timestamp) -> Bson {
 /// Back off before retrying a whole transaction. A write conflict fails
 /// fast while the winning transaction is still open, so an immediate retry
 /// would re-read the same snapshot and conflict again; spacing the attempts
-/// out (20, 40, 80, 160 ms plus jitter) lets the winner commit first.
+/// out lets the winner commit first. Exponential (20, 40, 80, 160, then
+/// 320 ms every time) with the upper half jittered, so a herd of losers
+/// does not retry in lockstep.
 async fn retry_backoff(attempt_no: u32) {
-    let base = 20u64 << attempt_no.saturating_sub(1).min(4);
-    let jitter = {
+    let ceiling =
+        (RETRY_BACKOFF_BASE_MS << attempt_no.saturating_sub(1).min(4)).min(RETRY_BACKOFF_CAP_MS);
+    let wait = {
         use rand::Rng;
-        rand::thread_rng().gen_range(0..=20u64)
+        rand::thread_rng().gen_range(ceiling / 2..=ceiling)
     };
-    tokio::time::sleep(std::time::Duration::from_millis(base + jitter)).await;
+    tokio::time::sleep(std::time::Duration::from_millis(wait)).await;
+}
+
+/// Whether a failed attempt may be retried: inside the time budget and the
+/// attempt backstop
+fn may_retry(attempt_no: u32, started: std::time::Instant) -> bool {
+    attempt_no < MAX_TRANSACTION_ATTEMPTS && started.elapsed() < TRANSACTION_RETRY_BUDGET
 }
 
 async fn commit_with_retry(session: &mut ClientSession) -> mongodb::error::Result<()> {
@@ -159,7 +194,7 @@ async fn commit_with_retry(session: &mut ClientSession) -> mongodb::error::Resul
             Ok(()) => return Ok(()),
             Err(error)
                 if error.contains_label(UNKNOWN_TRANSACTION_COMMIT_RESULT)
-                    && tries < MAX_TRANSACTION_ATTEMPTS =>
+                    && tries < MAX_COMMIT_ATTEMPTS =>
             {
                 continue
             }
@@ -194,6 +229,7 @@ where
 /// transaction, with the retry rules in the module docs
 macro_rules! run_transaction {
     ($self:ident, |$session:ident| $attempt:expr) => {{
+        let started = std::time::Instant::now();
         let mut attempt_no: u32 = 0;
         loop {
             attempt_no += 1;
@@ -216,7 +252,7 @@ macro_rules! run_transaction {
             match outcome {
                 Ok(value) => match commit_with_retry(&mut $session).await {
                     Ok(()) => break Ok(value),
-                    Err(error) if is_transient(&error) && attempt_no < MAX_TRANSACTION_ATTEMPTS => {
+                    Err(error) if is_transient(&error) && may_retry(attempt_no, started) => {
                         retry_backoff(attempt_no).await;
                         continue;
                     }
@@ -234,7 +270,7 @@ macro_rules! run_transaction {
                             operation,
                             collection,
                         } => {
-                            if attempt_no < MAX_TRANSACTION_ATTEMPTS {
+                            if may_retry(attempt_no, started) {
                                 retry_backoff(attempt_no).await;
                                 continue;
                             }
@@ -245,7 +281,7 @@ macro_rules! run_transaction {
                             operation,
                             collection,
                         } => {
-                            if is_transient(&error) && attempt_no < MAX_TRANSACTION_ATTEMPTS {
+                            if is_transient(&error) && may_retry(attempt_no, started) {
                                 retry_backoff(attempt_no).await;
                                 continue;
                             }
@@ -302,6 +338,113 @@ impl MongoDb {
             .await
             .map_err(db_err("update_many", COL_GROUPS))?;
         Ok(())
+    }
+
+    /// Decision 13 (W2): protect claims the server document, filtered on
+    /// the list's signer being its owner. Matching nothing refuses
+    /// (`NotOwner`: the server is gone or the owner changed). A transfer
+    /// that commits after this transaction's snapshot write-conflicts it
+    /// (the retry then matches nothing); one that arrives after the claim
+    /// waits for this commit.
+    async fn claim_server_owner(
+        &self,
+        session: &mut ClientSession,
+        server_id: &str,
+        owner_id: &str,
+    ) -> Attempt<()> {
+        let result = self
+            .col::<Document>(COL_SERVERS)
+            .update_one(
+                doc! { "_id": server_id, "owner": owner_id },
+                doc! { "$inc": { "txn_serial": 1_i64 } },
+            )
+            .session(&mut *session)
+            .await
+            .map_err(db_err("update_one", COL_SERVERS))?;
+        if result.matched_count == 0 {
+            return Err(TxnFail::Refuse(create_error!(NotOwner)));
+        }
+        Ok(())
+    }
+
+    /// Decision 13 (W2): claim the membership of every user this write
+    /// newly seats (sorted by user id; `claimed` is sorted), filtered like
+    /// `fetch_member` (not pending deletion). Matching nothing refuses that
+    /// user (`FailedValidation`): a kick that committed first removed it.
+    async fn claim_members(
+        &self,
+        session: &mut ClientSession,
+        server_id: &str,
+        users: &[String],
+    ) -> Attempt<()> {
+        for user_id in users {
+            let result = self
+                .col::<Document>(COL_SERVER_MEMBERS)
+                .update_one(
+                    doc! {
+                        "_id.server": server_id,
+                        "_id.user": user_id,
+                        "pending_deletion_at": { "$exists": false }
+                    },
+                    doc! { "$inc": { "txn_serial": 1_i64 } },
+                )
+                .session(&mut *session)
+                .await
+                .map_err(db_err("update_one", COL_SERVER_MEMBERS))?;
+            if result.matched_count == 0 {
+                return Err(TxnFail::Refuse(create_error!(FailedValidation {
+                    error: "seated user is not a member of the server".to_string()
+                })));
+            }
+        }
+        Ok(())
+    }
+
+    async fn find_channel(
+        &self,
+        session: &mut ClientSession,
+        channel_id: &str,
+    ) -> Attempt<Option<Channel>> {
+        self.col::<Channel>(COL_CHANNELS)
+            .find_one(doc! { "_id": channel_id })
+            .session(&mut *session)
+            .await
+            .map_err(db_err("find_one", COL_CHANNELS))
+    }
+
+    /// N3 (#128, decision 4 (W2)): the stored success of a byte-identical
+    /// protect retry, or `None` to run the protect. Reads only, so the retry
+    /// writes nothing (no claim, not even a `txn_serial`). The owner is
+    /// re-read so a retry is never answered once the signer no longer owns
+    /// the server; that request then falls through and is refused.
+    async fn genesis_reprotect_attempt(
+        &self,
+        session: &mut ClientSession,
+        channel_id: &str,
+        submission: &SeatListSubmission,
+    ) -> Attempt<Option<SeatListWriteOutcome>> {
+        let Some(stored) = self.find_stored_seat_list(session, channel_id).await? else {
+            return Ok(None);
+        };
+        if !is_genesis_reprotect(submission, &stored) {
+            return Ok(None);
+        }
+
+        let channel = self.find_channel(session, channel_id).await?;
+        let Some(server_id) = channel.as_ref().and_then(seat_list_channel_server) else {
+            return Ok(None);
+        };
+        let owned: Option<Document> = self
+            .col::<Document>(COL_SERVERS)
+            .find_one(doc! { "_id": server_id, "owner": &stored.signer_user_id })
+            .session(&mut *session)
+            .await
+            .map_err(db_err("find_one", COL_SERVERS))?;
+        if owned.is_none() {
+            return Ok(None);
+        }
+
+        Ok(Some(SeatListWriteDecision::Unchanged(stored).outcome()))
     }
 
     async fn find_open_text_group(
@@ -495,24 +638,59 @@ impl MongoDb {
         kind: SeatListWriteKind,
         channel_id: &str,
         submission: &SeatListSubmission,
+        allow_claims: bool,
         now: Timestamp,
     ) -> Attempt<SeatListWriteOutcome> {
-        // FIRST operation: the open Text group whose hash and pending
-        // removals this write updates (see `claim_groups_first`)
+        // N3 is decided before anything is written (claim order below)
+        if kind == SeatListWriteKind::Protect {
+            if let Some(outcome) = self
+                .genesis_reprotect_attempt(session, channel_id, submission)
+                .await?
+            {
+                return Ok(outcome);
+            }
+        }
+
+        // FIRST write: the open Text group whose hash and pending removals
+        // this write updates (see `claim_groups_first`). Claim order
+        // (decision 13 (W2)): groups -> servers -> server_members -> seats.
         self.claim_groups_first(
             session,
             doc! { "channel_id": channel_id, "open": true, "kind": KIND_TEXT },
         )
         .await?;
 
+        // The server whose members are claimed: the channel's on protect
+        // (where the entitlement must agree), the entitlement's on a PUT
+        let mut protect_server: Option<String> = None;
         if kind == SeatListWriteKind::Protect {
-            let channel: Option<Channel> = self
-                .col::<Channel>(COL_CHANNELS)
-                .find_one(doc! { "_id": channel_id })
+            let channel = self.find_channel(session, channel_id).await?;
+            check_channel_protectable(channel.as_ref())?;
+            let server_id = channel
+                .as_ref()
+                .and_then(seat_list_channel_server)
+                .ok_or_else(|| TxnFail::Refuse(create_error!(InvalidOperation)))?
+                .to_string();
+
+            // Decision 13 (W2): the list's signer owns the server, held to
+            // this transaction's commit
+            let body = SeatListBody::parse(&submission.body)?;
+            self.claim_server_owner(session, &server_id, &body.signer_user_id)
+                .await?;
+
+            // Decision 13 (W2): a channel with threads is refused. A thread
+            // created after this read holds its parent (`txn_serial`,
+            // filtered on not protected), which write-conflicts the flag
+            // write below, so the retry reads the thread.
+            let thread: Option<Document> = self
+                .col::<Document>(COL_CHANNELS)
+                .find_one(doc! { "channel_type": "Thread", "parent_channel": channel_id })
                 .session(&mut *session)
                 .await
                 .map_err(db_err("find_one", COL_CHANNELS))?;
-            check_channel_protectable(channel.as_ref())?;
+            if thread.is_some() {
+                return Err(TxnFail::Refuse(create_error!(InvalidOperation)));
+            }
 
             // `last_message_id` is written asynchronously (batched), so it
             // can lag a stored message: ask the messages collection itself
@@ -525,15 +703,17 @@ impl MongoDb {
             if message.is_some() {
                 return Err(TxnFail::Refuse(create_error!(InvalidOperation)));
             }
+
+            protect_server = Some(server_id);
         }
 
         let entitlement = self.find_entitlement(session, channel_id).await?;
-        if kind == SeatListWriteKind::Protect
-            && !entitlement
-                .as_ref()
-                .is_some_and(ChannelEntitlement::is_active)
-        {
-            return Err(TxnFail::Refuse(create_error!(InvalidOperation)));
+        if let Some(server_id) = &protect_server {
+            if !entitlement.as_ref().is_some_and(|entitlement| {
+                entitlement.is_active() && entitlement.server_id == *server_id
+            }) {
+                return Err(TxnFail::Refuse(create_error!(InvalidOperation)));
+            }
         }
 
         let stored = self.find_stored_seat_list(session, channel_id).await?;
@@ -554,8 +734,25 @@ impl MongoDb {
             entitlement: entitlement.as_ref(),
             seats: &seats,
             text_group: text_group.as_ref(),
+            allow_claims,
             now,
         })?;
+
+        // Decision 13 (W2): every newly claimed or reactivated user is a
+        // member of the server at commit. Claims need an active
+        // entitlement (the planner refused otherwise), whose server it is.
+        if let SeatListWriteDecision::Apply(plan) = &decision {
+            if !plan.claimed.is_empty() {
+                let server_id = protect_server
+                    .as_deref()
+                    .or(entitlement
+                        .as_ref()
+                        .map(|entitlement| entitlement.server_id.as_str()))
+                    .ok_or_else(|| TxnFail::Refuse(create_error!(InvalidOperation)))?;
+                self.claim_members(session, server_id, &plan.claimed)
+                    .await?;
+            }
+        }
 
         // The cap check above read the entitlement; claiming seats writes
         // it too, so an admin grant that lowers `slot_cap` (which reads the
@@ -716,6 +913,37 @@ impl MongoDb {
         Ok(MlsGroupCreateOutcome::Created)
     }
 
+    /// The channel ids of every entitlement of `server_id`, read through a
+    /// `channel_id` projection. A scoped release runs on every join, kick,
+    /// leave and ban in the server, so decoding whole entitlement rows here
+    /// would let one undecodable row of an unrelated channel fail all of
+    /// them (W2a audit WA#6). A row whose `channel_id` itself is not a
+    /// string still fails the release: the scope cannot leave out a channel
+    /// the user may hold a seat in.
+    async fn entitled_channel_ids(
+        &self,
+        session: &mut ClientSession,
+        server_id: &str,
+    ) -> Attempt<Vec<String>> {
+        let mut cursor = self
+            .col::<Document>(COL_ENTITLEMENTS)
+            .find(doc! { "server_id": server_id })
+            .projection(doc! { "channel_id": 1 })
+            .session(&mut *session)
+            .await
+            .map_err(db_err("find", COL_ENTITLEMENTS))?;
+
+        let mut channel_ids = Vec::new();
+        while let Some(row) = cursor.next(&mut *session).await {
+            let row = row.map_err(db_err("find", COL_ENTITLEMENTS))?;
+            let channel_id = row
+                .get_str("channel_id")
+                .map_err(|_| create_database_error!("find", COL_ENTITLEMENTS))?;
+            channel_ids.push(channel_id.to_string());
+        }
+        Ok(channel_ids)
+    }
+
     async fn release_attempt(
         &self,
         session: &mut ClientSession,
@@ -731,18 +959,7 @@ impl MongoDb {
         let mut claim = doc! { "open": true, "kind": KIND_TEXT, "members.user_id": user_id };
 
         let scope: Option<Vec<String>> = match server_id {
-            Some(server_id) => Some(
-                find_all::<ChannelEntitlement>(
-                    &self.col(COL_ENTITLEMENTS),
-                    doc! { "server_id": server_id },
-                    session,
-                    COL_ENTITLEMENTS,
-                )
-                .await?
-                .into_iter()
-                .map(|entitlement| entitlement.channel_id)
-                .collect(),
-            ),
+            Some(server_id) => Some(self.entitled_channel_ids(session, server_id).await?),
             None => None,
         };
         if let Some(scope) = &scope {
@@ -943,6 +1160,7 @@ impl AbstractProtectedChannels for MongoDb {
             SeatListWriteKind::Protect,
             channel_id,
             submission,
+            true,
             now
         ))
     }
@@ -951,6 +1169,7 @@ impl AbstractProtectedChannels for MongoDb {
         &self,
         channel_id: &str,
         submission: &SeatListSubmission,
+        allow_claims: bool,
         now: Timestamp,
     ) -> Result<SeatListWriteOutcome> {
         run_transaction!(self, |session| self.seat_list_write_attempt(
@@ -958,6 +1177,7 @@ impl AbstractProtectedChannels for MongoDb {
             SeatListWriteKind::Put,
             channel_id,
             submission,
+            allow_claims,
             now
         ))
     }

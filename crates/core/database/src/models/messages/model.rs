@@ -275,17 +275,18 @@ pub fn is_valid_client_message_id(cid: &str) -> bool {
             .all(|c| c.is_ascii_digit() || (c.is_ascii_uppercase() && !"ILOU".contains(c)))
 }
 
-/// `flags` a protected-channel message may carry: absent, 0, or the value
-/// `has_suppressed_notifications` honours (`SuppressNotifications as u32`,
-/// i.e. 1). Every other bit is refused, the mass-mention bits included.
+/// `flags` a protected-channel message may carry: absent, 0, or
+/// `SUPPRESS_NOTIFICATIONS_MASK` (1), the stored silent value that
+/// `has_suppressed_notifications` and pushd honor (design 7.3). Every other
+/// value is refused, the mass-mention bits included.
 ///
-/// Note: `MessageFlagsValue::has`/`set` read `SuppressNotifications` as a bit
-/// INDEX (value 2), so `create_from_api_with_id` stores a request's 2 as 2,
-/// which the push gate does not treat as silent, and never stores 1. Only
-/// 0/1 are allowed here so a stored protected message can never claim a
-/// flag the server does not honour.
-fn is_allowed_protected_flags(flags: Option<u32>) -> bool {
-    flags.is_none_or(|flags| flags <= MessageFlags::SuppressNotifications as u32)
+/// Tied to the stored mask, not to `MessageFlags::SuppressNotifications as
+/// u32` (a bit index by the enum's convention). `MessageFlagsValue::has`/`set`
+/// route `SuppressNotifications` through the same mask, so
+/// `create_from_api_with_id` stores a request's 1 as 1 and a request's 0 (or
+/// no flags) as 0: an accepted value is stored as the silent flag it claims.
+pub fn is_allowed_protected_flags(flags: Option<u32>) -> bool {
+    flags.is_none_or(|flags| flags == 0 || flags == SUPPRESS_NOTIFICATIONS_MASK)
 }
 
 fn protected_field_refused(field: &str) -> revolt_result::Error {
@@ -318,11 +319,12 @@ fn validate_protected_ciphertext(
 
 /// Defense-in-depth refusal of a send into, or ciphertext outside, a
 /// protected channel (design 2.6), run before any side effect of
-/// `create_from_api_with_id`. The route allowlist (7.3) is the primary check.
+/// `create_from_api_with_id`. The route allowlist (7.3) is the primary check;
+/// this is public so the route runs this same list.
 ///
 /// Field names match `DataMessageSend`; any plaintext-bearing field that is
 /// present (even empty) is refused, as the route does.
-fn validate_protected_send(
+pub fn validate_protected_send(
     channel_protected: bool,
     author: &MessageAuthor<'_>,
     data: &DataMessageSend,
@@ -697,17 +699,24 @@ impl Message {
         // or any attachment claimed. Early refusal only: `channel` may be a
         // stale snapshot, so the authoritative check is the driver's
         // `insert_message`, which re-reads the channel.
+        let channel_protected = channel.is_protected();
         validate_protected_send(
-            channel.is_protected(),
+            channel_protected,
             &author,
             &data,
             resolved_attachments.is_some(),
         )?;
 
-        idempotency
-            .consume_nonce(data.nonce)
-            .await
-            .map_err(|_| create_error!(InvalidOperation))?;
+        // A repeated cid on a protected send gets `DuplicateNonce`, the same
+        // answer as the drivers' unique index (design 3.10); the plaintext
+        // path keeps `InvalidOperation`
+        idempotency.consume_nonce(data.nonce).await.map_err(|_| {
+            if channel_protected {
+                create_error!(DuplicateNonce)
+            } else {
+                create_error!(InvalidOperation)
+            }
+        })?;
 
         // Check the message is not empty; ciphertext alone is a message
         if (data.content.as_ref().is_none_or(|v| v.is_empty()))
@@ -1169,6 +1178,96 @@ impl Message {
         self.validate_protected_shape(channel_protected)
     }
 
+    /// Whether this stored row may be served from `channel` (R15 backstop)
+    ///
+    /// A protected channel serves only rows carrying `encrypted`. A plaintext
+    /// row there (one left by the protect-vs-send compensation window, R15)
+    /// is dropped, not flagged, by the read paths that filter with this.
+    pub fn is_servable(&self, channel_protected: bool) -> bool {
+        !channel_protected || self.encrypted.is_some()
+    }
+
+    /// Refuse a partial that would write a plaintext-bearing field onto a row
+    /// carrying `encrypted` (protected messages are never edited, design 7.4)
+    ///
+    /// Only `pinned`, `reactions` and `edited` may change. The destructuring
+    /// is exhaustive, so a new message field has to be sorted into one list
+    /// or the other before this compiles. On any row, `encrypted` itself is
+    /// refused: it is written once, at insert, where the driver checks the
+    /// stored shape against the channel; an update would bypass that.
+    fn validate_encrypted_update(&self, partial: &PartialMessage) -> Result<()> {
+        if partial.encrypted.is_some() {
+            return Err(protected_field_refused("encrypted"));
+        }
+
+        if self.encrypted.is_none() {
+            return Ok(());
+        }
+
+        let PartialMessage {
+            pinned: _,
+            reactions: _,
+            edited: _,
+            id,
+            nonce,
+            channel,
+            author,
+            webhook,
+            content,
+            system,
+            attachments,
+            embeds,
+            mentions,
+            role_mentions,
+            replies,
+            interactions,
+            masquerade,
+            thread_id,
+            command_context,
+            components,
+            sticker_ids,
+            poll,
+            softres,
+            forwarded,
+            crosspost,
+            flags,
+            encrypted,
+        } = partial;
+
+        let present = [
+            ("id", id.is_some()),
+            ("nonce", nonce.is_some()),
+            ("channel", channel.is_some()),
+            ("author", author.is_some()),
+            ("webhook", webhook.is_some()),
+            ("content", content.is_some()),
+            ("system", system.is_some()),
+            ("attachments", attachments.is_some()),
+            ("embeds", embeds.is_some()),
+            ("mentions", mentions.is_some()),
+            ("role_mentions", role_mentions.is_some()),
+            ("replies", replies.is_some()),
+            ("interactions", interactions.is_some()),
+            ("masquerade", masquerade.is_some()),
+            ("thread_id", thread_id.is_some()),
+            ("command_context", command_context.is_some()),
+            ("components", components.is_some()),
+            ("sticker_ids", sticker_ids.is_some()),
+            ("poll", poll.is_some()),
+            ("softres", softres.is_some()),
+            ("forwarded", forwarded.is_some()),
+            ("crosspost", crosspost.is_some()),
+            ("flags", flags.is_some()),
+            ("encrypted", encrypted.is_some()),
+        ];
+
+        if let Some((field, _)) = present.iter().find(|(_, is_present)| *is_present) {
+            return Err(protected_field_refused(field));
+        }
+
+        Ok(())
+    }
+
     /// Send a message without any notifications
     pub async fn send_without_notifications(
         &mut self,
@@ -1429,12 +1528,17 @@ impl Message {
     }
 
     /// Update message data
+    ///
+    /// A row carrying `encrypted` only takes `pinned`, `reactions` and
+    /// `edited` (see [`Message::validate_encrypted_update`]).
     pub async fn update(
         &mut self,
         db: &Database,
         partial: PartialMessage,
         remove: Vec<FieldsMessage>,
     ) -> Result<()> {
+        self.validate_encrypted_update(&partial)?;
+
         self.apply_options(partial.clone());
 
         for field in &remove {
@@ -1509,14 +1613,35 @@ impl Message {
     }
 
     /// Helper function to fetch many messages with users
+    ///
+    /// `channel_protected` is the queried channel's flag. In a protected
+    /// channel every row without `encrypted` is dropped (R15 backstop) before
+    /// any user id is collected, so a dropped row's author is not returned in
+    /// `users` or `members` either. Each drop is reported by ids only. The
+    /// drivers' fetch paths are untouched, so such a row can still be deleted.
     pub async fn fetch_with_users(
         db: &Database,
         query: MessageQuery,
         perspective: &User,
         include_users: Option<bool>,
         server_id: Option<&str>,
+        channel_protected: bool,
     ) -> Result<BulkMessageResponse> {
-        let messages = db.fetch_messages(query).await?;
+        let mut messages = db.fetch_messages(query).await?;
+        messages.retain(|message| {
+            let servable = message.is_servable(channel_protected);
+            if !servable {
+                revolt_config::capture_message(
+                    &format!(
+                        "Dropped a plaintext row in protected channel {} (message {})",
+                        message.channel, message.id
+                    ),
+                    revolt_config::Level::Error,
+                );
+            }
+            servable
+        });
+
         let user_ids = if let Some(true) = include_users {
             Some(Message::referenced_user_ids(&messages))
         } else {
@@ -1561,6 +1686,12 @@ impl Message {
         // Nothing to add, and nothing for clients to hear about.
         if append.embeds.as_ref().is_none_or(|v| v.is_empty()) {
             return Ok(());
+        }
+
+        // A row carrying `encrypted` takes no embeds (as in `update`). The
+        // read also fails NotFound for a deleted message, before any write.
+        if db.fetch_message(&id).await?.encrypted.is_some() {
+            return Err(protected_field_refused("embeds"));
         }
 
         // NotFound if the message was deleted meanwhile, so no event goes out for it.
@@ -2564,8 +2695,8 @@ mod encrypted_payload_tests {
         for (flags, ok) in [
             (None, true),
             (Some(0), true),
-            (Some(MessageFlags::SuppressNotifications as u32), true),
-            // `MessageFlagsValue` encodings: suppress-as-index, everyone, online
+            (Some(SUPPRESS_NOTIFICATIONS_MASK), true),
+            // Suppress as a bit index (the old encoding), everyone, online
             (Some(2), false),
             (Some(4), false),
             (Some(8), false),
@@ -2585,12 +2716,13 @@ mod encrypted_payload_tests {
     const PROTECTED_CHANNEL: &str = "01J9Z3K4M5N6P7Q8R9S0T1V2W3";
     const OPEN_CHANNEL: &str = "01J9Z3K4M5N6P7Q8R9S0T1V2W4";
     const MISSING_CHANNEL: &str = "01J9Z3K4M5N6P7Q8R9S0T1V2W5";
+    const SERVER: &str = "01J9Z3K4M5N6P7Q8R9S0T1V2W6";
 
     fn text_channel(id: &str, protected: bool) -> Channel {
         serde_json::from_value(serde_json::json!({
             "channel_type": "TextChannel",
             "_id": id,
-            "server": "01J9Z3K4M5N6P7Q8R9S0T1V2W6",
+            "server": SERVER,
             "name": "general",
             "protected": protected,
         }))
@@ -2611,8 +2743,6 @@ mod encrypted_payload_tests {
     /// driver `TEST_DB` selects; run under REFERENCE and MONGODB
     #[tokio::test]
     async fn insert_message_enforces_the_protected_shape() {
-        use crate::{AbstractChannels, AbstractMessages};
-
         database_test!(|db| async move {
             assert!(text_channel(PROTECTED_CHANNEL, true).is_protected());
             db.insert_channel(&text_channel(PROTECTED_CHANNEL, true))
@@ -2694,18 +2824,48 @@ mod encrypted_payload_tests {
 
     /// An unprotected text channel with an active entitlement, ready for
     /// `protect_channel`; returns the submission that protects it
+    ///
+    /// Protect claims the server document filtered on its owner and the
+    /// membership of every seated user (decision 13 (W2)), so the first call
+    /// on a database also creates `SERVER`, owned by the signer, and the
+    /// signer's membership.
     async fn protectable_channel(
         db: &crate::Database,
         channel_id: &str,
         now: Timestamp,
     ) -> crate::SeatListSubmission {
         use crate::{
-            ChannelEntitlement, ChannelEntitlementSource, ChannelEntitlementState, SeatListBody,
-            SeatListSubmission,
+            ChannelEntitlement, ChannelEntitlementSource, ChannelEntitlementState, Member,
+            MemberCompositeKey, SeatListBody, SeatListSubmission, Server,
         };
 
         const OWNER: &str = "01HZXAAAAAAAAAAAAAAAAAAAAA";
         const OWNER_DEVICE: &str = "00112233445566778899aabbccddeeff";
+
+        match db.fetch_server(SERVER).await {
+            Ok(server) => assert_eq!(server.owner, OWNER, "fixture server owner"),
+            Err(error) if matches!(error.error_type, ErrorType::NotFound) => {
+                let server: Server = serde_json::from_value(serde_json::json!({
+                    "_id": SERVER,
+                    "owner": OWNER,
+                    "name": "protected",
+                    "channels": [],
+                    "default_permissions": 0,
+                }))
+                .expect("server");
+                db.insert_server(&server).await.expect("server");
+                db.insert_or_merge_member(&Member {
+                    id: MemberCompositeKey {
+                        server: SERVER.to_string(),
+                        user: OWNER.to_string(),
+                    },
+                    ..Default::default()
+                })
+                .await
+                .expect("owner membership");
+            }
+            Err(error) => panic!("fetch fixture server: {error:?}"),
+        }
 
         db.insert_channel(&text_channel(channel_id, false))
             .await
@@ -2714,7 +2874,7 @@ mod encrypted_payload_tests {
             &ChannelEntitlement {
                 id: Ulid::new().to_string(),
                 channel_id: channel_id.to_string(),
-                server_id: "01J9Z3K4M5N6P7Q8R9S0T1V2W6".to_string(),
+                server_id: SERVER.to_string(),
                 source: ChannelEntitlementSource::AdminGrant,
                 slot_cap: 10,
                 device_cap: None,
@@ -2903,6 +3063,472 @@ mod encrypted_payload_tests {
                     sweep + 1
                 );
             }
+        });
+    }
+
+    /// A user as the send routes pass one
+    fn user(id: &str) -> User {
+        User {
+            id: id.to_string(),
+            username: id.to_lowercase(),
+            discriminator: "0001".to_string(),
+            ..Default::default()
+        }
+    }
+
+    /// Every message of `channel_id`, newest first
+    fn channel_query(channel_id: &str) -> MessageQuery {
+        MessageQuery {
+            limit: Some(50),
+            filter: MessageFilter {
+                channel: Some(channel_id.to_string()),
+                ..Default::default()
+            },
+            time_period: MessageTimePeriod::Absolute {
+                before: None,
+                after: None,
+                sort: None,
+            },
+        }
+    }
+
+    /// A protected send body: the 5.6 payload under `cid`, plus `flags`
+    fn ciphertext_body(cid: &str, flags: Option<u32>) -> serde_json::Value {
+        serde_json::json!({
+            "nonce": cid,
+            "encrypted": serde_json::from_str::<serde_json::Value>(PAYLOAD_JSON)
+                .expect("5.6 payload_json"),
+            "flags": flags,
+        })
+    }
+
+    /// Send `body` through `create_from_api`, built from JSON as a request
+    /// arrives so new optional fields need no edit here
+    #[allow(clippy::disallowed_methods)]
+    async fn send_from_api(
+        db: &Database,
+        channel: &Channel,
+        author: &User,
+        body: serde_json::Value,
+    ) -> Result<Message> {
+        let data: DataMessageSend = serde_json::from_value(body).expect("request body");
+        let model_author = author.clone().into_self(true).await;
+        Message::create_from_api(
+            db,
+            None,
+            channel.clone(),
+            data,
+            MessageAuthor::User(&model_author),
+            Some(model_author.clone()),
+            None,
+            author.limits().await,
+            IdempotencyKey::unchecked_from_string(Ulid::new().to_string()),
+            false,
+            false,
+        )
+        .await
+    }
+
+    /// T5, decision 8 (W2): the protected flag allowlist is the stored silent
+    /// mask. A request's 1 is stored as 1 and reads back silent; 2 (suppress
+    /// as a bit index, which the plaintext path silently stores as 0) and 4
+    /// (mention everyone) are refused, and nothing is stored for them.
+    #[tokio::test]
+    async fn protected_send_stores_flag_one_as_silent_and_refuses_other_bits() {
+        database_test!(|db| async move {
+            let channel = text_channel(PROTECTED_CHANNEL, true);
+            db.insert_channel(&channel)
+                .await
+                .expect("protected channel");
+            let sender = user("01HZXBBBBBBBBBBBBBBBBBBBBB");
+
+            let body = ciphertext_body(&Ulid::new().to_string(), Some(1));
+            let sent = send_from_api(&db, &channel, &sender, body)
+                .await
+                .expect("a silent ciphertext send");
+            let stored = db.fetch_message(&sent.id).await.expect("stored");
+            assert_eq!(stored.flags, Some(1));
+            assert!(stored.has_suppressed_notifications());
+
+            for flags in [2, 4] {
+                let body = ciphertext_body(&Ulid::new().to_string(), Some(flags));
+                match send_from_api(&db, &channel, &sender, body).await {
+                    Err(error) => match error.error_type {
+                        ErrorType::ProtectedFieldRefused { ref field } => {
+                            assert_eq!(field, "flags", "flags {flags}")
+                        }
+                        other => {
+                            panic!("flags {flags}: expected ProtectedFieldRefused, got {other:?}")
+                        }
+                    },
+                    Ok(message) => panic!("flags {flags} accepted, stored as {:?}", message.flags),
+                }
+            }
+
+            let stored: Vec<String> = db
+                .fetch_messages(channel_query(PROTECTED_CHANNEL))
+                .await
+                .expect("channel messages")
+                .into_iter()
+                .map(|message| message.id)
+                .collect();
+            assert_eq!(stored, vec![sent.id]);
+        });
+    }
+
+    /// PA#6: a repeated cid on a protected send is `DuplicateNonce`, the
+    /// answer the drivers' unique index gives (decision 15 (W2)); a repeated
+    /// nonce on a plaintext send is still `InvalidOperation`
+    #[tokio::test]
+    async fn repeated_nonce_is_duplicate_nonce_on_the_protected_path_only() {
+        database_test!(|db| async move {
+            let protected = text_channel(PROTECTED_CHANNEL, true);
+            let open = text_channel(OPEN_CHANNEL, false);
+            db.insert_channel(&protected)
+                .await
+                .expect("protected channel");
+            db.insert_channel(&open).await.expect("open channel");
+            let sender = user("01HZXBBBBBBBBBBBBBBBBBBBBB");
+
+            let cid = Ulid::new().to_string();
+            send_from_api(&db, &protected, &sender, ciphertext_body(&cid, None))
+                .await
+                .expect("first protected send");
+            let error = send_from_api(&db, &protected, &sender, ciphertext_body(&cid, None))
+                .await
+                .expect_err("a replayed cid");
+            assert!(
+                matches!(error.error_type, ErrorType::DuplicateNonce),
+                "protected replay: expected DuplicateNonce, got {:?}",
+                error.error_type
+            );
+
+            let body = serde_json::json!({ "content": "hi", "nonce": Ulid::new().to_string() });
+            send_from_api(&db, &open, &sender, body.clone())
+                .await
+                .expect("first plaintext send");
+            let error = send_from_api(&db, &open, &sender, body)
+                .await
+                .expect_err("a replayed nonce");
+            assert!(
+                matches!(error.error_type, ErrorType::InvalidOperation),
+                "plaintext replay: expected InvalidOperation, got {:?}",
+                error.error_type
+            );
+        });
+    }
+
+    /// Message ids, user ids and member user ids of one `fetch_with_users`
+    /// page of `PROTECTED_CHANNEL`, each sorted
+    async fn users_page(
+        db: &Database,
+        viewer: &User,
+        channel_protected: bool,
+    ) -> (Vec<String>, Vec<String>, Vec<String>) {
+        let response = Message::fetch_with_users(
+            db,
+            channel_query(PROTECTED_CHANNEL),
+            viewer,
+            Some(true),
+            Some(SERVER),
+            channel_protected,
+        )
+        .await
+        .expect("fetch_with_users");
+        let BulkMessageResponse::MessagesAndUsers {
+            messages,
+            users,
+            members,
+        } = response
+        else {
+            panic!("include_users returns users");
+        };
+
+        let sorted = |mut ids: Vec<String>| {
+            ids.sort();
+            ids
+        };
+        (
+            sorted(messages.into_iter().map(|message| message.id).collect()),
+            sorted(users.into_iter().map(|user| user.id).collect()),
+            sorted(
+                members
+                    .expect("a server channel returns members")
+                    .into_iter()
+                    .map(|member| member.id.user)
+                    .collect(),
+            ),
+        )
+    }
+
+    /// R15 backstop, decision 9 (W2): a plaintext row in a protected channel,
+    /// written raw as the compensation window can leave one, is dropped by
+    /// `fetch_with_users`, and so is its author, who wrote nothing else on
+    /// the page: absent from `users` and `members`. The same page read as
+    /// unprotected returns both, so the lookups do find them.
+    #[tokio::test]
+    async fn fetch_with_users_drops_a_stray_plaintext_row_and_its_author() {
+        use crate::{Member, MemberCompositeKey};
+
+        const STRAY_AUTHOR: &str = "01HZXCCCCCCCCCCCCCCCCCCCCC";
+        const SENDER: &str = "01HZXBBBBBBBBBBBBBBBBBBBBB";
+        const VIEWER: &str = "01HZXDDDDDDDDDDDDDDDDDDDDD";
+
+        database_test!(|db| async move {
+            for id in [STRAY_AUTHOR, SENDER, VIEWER] {
+                db.insert_user(&user(id)).await.expect("user");
+                db.insert_or_merge_member(&Member {
+                    id: MemberCompositeKey {
+                        server: SERVER.to_string(),
+                        user: id.to_string(),
+                    },
+                    ..Default::default()
+                })
+                .await
+                .expect("member");
+            }
+            db.insert_channel(&text_channel(PROTECTED_CHANNEL, true))
+                .await
+                .expect("protected channel");
+
+            let ciphertext = protected_message();
+            assert_eq!(ciphertext.author, SENDER);
+            db.insert_message(&ciphertext)
+                .await
+                .expect("ciphertext row");
+
+            // Raw, past `insert_message`'s refusal; older than the
+            // ciphertext, as a stray predates protect
+            let stray = plaintext_message("01J90000000000000000000ST1", PROTECTED_CHANNEL);
+            let stray = Message {
+                author: STRAY_AUTHOR.to_string(),
+                ..stray
+            };
+            match &db {
+                Database::Reference(reference) => {
+                    reference
+                        .messages
+                        .lock()
+                        .await
+                        .insert(stray.id.clone(), stray.clone());
+                }
+                #[cfg(feature = "mongodb")]
+                Database::MongoDb(mongo) => {
+                    mongo
+                        .col::<Message>("messages")
+                        .insert_one(&stray)
+                        .await
+                        .expect("raw stray row");
+                }
+            }
+
+            let viewer = user(VIEWER);
+            let (messages, users, members) = users_page(&db, &viewer, true).await;
+            assert_eq!(
+                messages,
+                vec![ciphertext.id.clone()],
+                "the stray is dropped"
+            );
+            assert_eq!(
+                users,
+                vec![SENDER.to_string()],
+                "the stray's author is dropped"
+            );
+            assert_eq!(
+                members,
+                vec![SENDER.to_string()],
+                "the stray's member is dropped"
+            );
+
+            let (messages, users, members) = users_page(&db, &viewer, false).await;
+            assert_eq!(messages, vec![stray.id.clone(), ciphertext.id.clone()]);
+            assert_eq!(users, vec![SENDER.to_string(), STRAY_AUTHOR.to_string()]);
+            assert_eq!(members, vec![SENDER.to_string(), STRAY_AUTHOR.to_string()]);
+        });
+    }
+
+    /// R2 guard: a row carrying `encrypted` refuses every partial that writes
+    /// a plaintext-bearing field, leaving both the stored row and the
+    /// in-memory copy untouched, and takes no appended embeds; `pinned`,
+    /// `reactions` and `edited` still apply. A plaintext row still takes a
+    /// content edit, but never `encrypted`.
+    #[tokio::test]
+    async fn encrypted_row_takes_only_pinned_reactions_and_edited() {
+        const EMOJI: &str = "01HZXEEEEEEEEEEEEEEEEEEEEE";
+
+        database_test!(|db| async move {
+            db.insert_channel(&text_channel(PROTECTED_CHANNEL, true))
+                .await
+                .expect("protected channel");
+            db.insert_channel(&text_channel(OPEN_CHANNEL, false))
+                .await
+                .expect("open channel");
+
+            let mut message = protected_message();
+            db.insert_message(&message).await.expect("ciphertext row");
+
+            let refused: Vec<(&str, PartialMessage)> = vec![
+                (
+                    "content",
+                    PartialMessage {
+                        content: Some("edited".to_string()),
+                        ..Default::default()
+                    },
+                ),
+                (
+                    "embeds",
+                    PartialMessage {
+                        embeds: Some(vec![]),
+                        ..Default::default()
+                    },
+                ),
+                (
+                    "attachments",
+                    PartialMessage {
+                        attachments: Some(vec![]),
+                        ..Default::default()
+                    },
+                ),
+                (
+                    "masquerade",
+                    PartialMessage {
+                        masquerade: Some(Masquerade {
+                            name: Some("x".to_string()),
+                            avatar: None,
+                            colour: None,
+                        }),
+                        ..Default::default()
+                    },
+                ),
+                (
+                    "flags",
+                    PartialMessage {
+                        flags: Some(1),
+                        ..Default::default()
+                    },
+                ),
+                (
+                    "encrypted",
+                    PartialMessage {
+                        encrypted: Some(vector()),
+                        ..Default::default()
+                    },
+                ),
+                // An allowed field does not carry a refused one through
+                (
+                    "content",
+                    PartialMessage {
+                        pinned: Some(true),
+                        content: Some("edited".to_string()),
+                        ..Default::default()
+                    },
+                ),
+            ];
+            for (field, partial) in refused {
+                assert_field_refused(message.update(&db, partial, vec![]).await, field);
+            }
+            assert_eq!(
+                message,
+                protected_message(),
+                "the in-memory copy is untouched"
+            );
+            assert_eq!(
+                db.fetch_message(&message.id).await.expect("stored"),
+                protected_message(),
+                "the stored row is untouched"
+            );
+
+            assert_field_refused(
+                Message::append(
+                    &db,
+                    message.id.clone(),
+                    message.channel.clone(),
+                    AppendMessage {
+                        embeds: Some(vec![Embed::None]),
+                    },
+                )
+                .await,
+                "embeds",
+            );
+            assert!(db
+                .fetch_message(&message.id)
+                .await
+                .expect("stored")
+                .embeds
+                .is_none());
+
+            message
+                .update(
+                    &db,
+                    PartialMessage {
+                        pinned: Some(true),
+                        reactions: Some(IndexMap::from([(
+                            EMOJI.to_string(),
+                            IndexSet::from([message.author.clone()]),
+                        )])),
+                        edited: Some(Timestamp::now_utc()),
+                        ..Default::default()
+                    },
+                    vec![],
+                )
+                .await
+                .expect("pin, react and mark edited");
+            let stored = db.fetch_message(&message.id).await.expect("stored");
+            assert_eq!(stored.pinned, Some(true));
+            assert!(stored.reactions.contains_key(EMOJI));
+            assert!(stored.edited.is_some());
+            assert_eq!(stored.encrypted, protected_message().encrypted);
+            assert_eq!(stored.content, None);
+
+            message
+                .update(&db, PartialMessage::default(), vec![FieldsMessage::Pinned])
+                .await
+                .expect("unpin");
+            assert_eq!(
+                db.fetch_message(&message.id).await.expect("stored").pinned,
+                None
+            );
+
+            let mut plain = plaintext_message("01JA0000000000000000000P07", OPEN_CHANNEL);
+            db.insert_message(&plain).await.expect("plaintext row");
+            plain
+                .update(
+                    &db,
+                    PartialMessage {
+                        content: Some("edited".to_string()),
+                        ..Default::default()
+                    },
+                    vec![],
+                )
+                .await
+                .expect("a plaintext row takes a content edit");
+            assert_eq!(
+                db.fetch_message(&plain.id)
+                    .await
+                    .expect("stored")
+                    .content
+                    .as_deref(),
+                Some("edited")
+            );
+
+            // Ciphertext is written only at insert, never by an update
+            assert_field_refused(
+                plain
+                    .update(
+                        &db,
+                        PartialMessage {
+                            encrypted: Some(vector()),
+                            ..Default::default()
+                        },
+                        vec![],
+                    )
+                    .await,
+                "encrypted",
+            );
+            assert_eq!(
+                db.fetch_message(&plain.id).await.expect("stored").encrypted,
+                None
+            );
         });
     }
 

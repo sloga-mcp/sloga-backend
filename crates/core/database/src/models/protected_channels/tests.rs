@@ -9,6 +9,7 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering::SeqCst};
+use std::time::Instant;
 
 use iso8601_timestamp::{Duration, Timestamp};
 use revolt_result::ErrorType;
@@ -16,9 +17,9 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     channel_seats_used, Channel, ChannelEntitlement, ChannelEntitlementSource,
-    ChannelEntitlementState, Database, MlsGroup, MlsGroupCreateOutcome, MlsGroupKind,
-    MlsMemberDevice, SeatList, SeatListBody, SeatListSubmission, SignedHandover,
-    MAX_SEAT_LIST_HANDOVERS, SEAT_COOLDOWN_DAYS,
+    ChannelEntitlementState, Database, HandoverBody, Member, MemberCompositeKey, MlsGroup,
+    MlsGroupCreateOutcome, MlsGroupKind, MlsMemberDevice, SeatList, SeatListBody,
+    SeatListSubmission, Server, SignedHandover, MAX_SEAT_LIST_HANDOVERS, SEAT_COOLDOWN_DAYS,
 };
 
 // Section 5.1 inputs
@@ -49,6 +50,10 @@ const VECTOR_COMMIT_AD_HEX: [&str; 6] = [
 ];
 const VECTOR_COMMIT_AD_SHA256: &str =
     "9cc01bfe85923de2a68126c90f891806c0ced23191dc1b44c0d02edb0a4b0ea4";
+
+// Section 5.2 identity keys (owner seed, new owner seed)
+const OWNER_IDENTITY_KEY: &str = "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg";
+const NEW_OWNER_IDENTITY_KEY: &str = "zRSzf5VulTGU/3+3Oz2B3MVh1hp1OAlLfD4aZD7l86o";
 
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
@@ -161,7 +166,44 @@ fn entitlement(slot_cap: u32) -> ChannelEntitlement {
     }
 }
 
+/// A server owned by `owner` (protect claims it, decision 13 (W2))
+async fn insert_server(db: &Database, server_id: &str, owner: &str) {
+    let server: Server = serde_json::from_value(serde_json::json!({
+        "_id": server_id,
+        "owner": owner,
+        "name": "protected",
+        "channels": [],
+        "default_permissions": 0,
+    }))
+    .unwrap();
+    db.insert_server(&server).await.unwrap();
+}
+
+/// Memberships of `users` in `server_id` (protect and the seat PUT claim
+/// the membership of every user they seat, decision 13 (W2))
+async fn insert_members(db: &Database, server_id: &str, users: &[&str]) {
+    for user in users {
+        db.insert_or_merge_member(&Member {
+            id: MemberCompositeKey {
+                server: server_id.to_string(),
+                user: user.to_string(),
+            },
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    }
+}
+
+/// `SERVER`, owned by `USER_A`, with `USER_A`, `USER_B` and `USER_C` as
+/// members
+async fn server_ready(db: &Database) {
+    insert_server(db, SERVER, USER_A).await;
+    insert_members(db, SERVER, &[USER_A, USER_B, USER_C]).await;
+}
+
 async fn setup(db: &Database, slot_cap: u32) {
+    server_ready(db).await;
     db.insert_channel(&text_channel(None)).await.unwrap();
     db.upsert_channel_entitlement(&entitlement(slot_cap), at(0))
         .await
@@ -192,19 +234,28 @@ fn submit_in(channel_id: &str, version: i64, seats: &[&str]) -> SeatListSubmissi
     }
 }
 
-/// Protect `channel_id` (genesis list seats only A) under a fresh entitlement
+/// Protect `channel_id` (genesis list seats only A) under a fresh
+/// entitlement, in `SERVER` (call `server_ready` once first)
 async fn protected_in(db: &Database, channel_id: &str, slot_cap: u32) {
+    protectable_in(db, channel_id, SERVER, slot_cap).await;
+    db.protect_channel(channel_id, &submit_in(channel_id, 1, &[USER_A]), at(0))
+        .await
+        .unwrap();
+}
+
+/// An unprotected channel `channel_id` of `server_id` with a fresh
+/// entitlement
+async fn protectable_in(db: &Database, channel_id: &str, server_id: &str, slot_cap: u32) {
     let mut channel = text_channel(None);
-    if let Channel::TextChannel { id, .. } = &mut channel {
+    if let Channel::TextChannel { id, server, .. } = &mut channel {
         *id = channel_id.to_string();
+        *server = server_id.to_string();
     }
     db.insert_channel(&channel).await.unwrap();
     let mut grant = entitlement(slot_cap);
     grant.channel_id = channel_id.to_string();
+    grant.server_id = server_id.to_string();
     db.upsert_channel_entitlement(&grant, at(0)).await.unwrap();
-    db.protect_channel(channel_id, &submit_in(channel_id, 1, &[USER_A]), at(0))
-        .await
-        .unwrap();
 }
 
 /// Test-only roster edit on both drivers (the Text commit path that really
@@ -245,6 +296,93 @@ fn is_failed_validation(error: &revolt_result::Error) -> bool {
 
 fn is_seat_cap(error: &revolt_result::Error, expected: usize) -> bool {
     matches!(error.error_type, ErrorType::SeatCapReached { max } if max == expected)
+}
+
+fn is_growth_disabled(error: &revolt_result::Error) -> bool {
+    matches!(&error.error_type, ErrorType::FeatureDisabled { feature } if feature == "protected_channels")
+}
+
+fn is_invalid_operation(error: &revolt_result::Error) -> bool {
+    matches!(error.error_type, ErrorType::InvalidOperation)
+}
+
+/// A thread hanging off `parent`
+fn thread(id: &str, parent: &str) -> Channel {
+    serde_json::from_value(serde_json::json!({
+        "channel_type": "Thread",
+        "_id": id,
+        "server": SERVER,
+        "parent_channel": parent,
+        "name": "thread",
+        "creator": USER_B,
+    }))
+    .unwrap()
+}
+
+/// Server ownership transfer at the database level: `server_edit`'s
+/// unconditional owner write (decision 14 (W2)), raw on Mongo
+async fn transfer_owner(db: &Database, server_id: &str, owner: &str) {
+    match db {
+        Database::Reference(reference) => {
+            reference
+                .servers
+                .lock()
+                .await
+                .get_mut(server_id)
+                .expect("server")
+                .owner = owner.to_string();
+        }
+        #[cfg(feature = "mongodb")]
+        Database::MongoDb(mongo) => {
+            let result = mongo
+                .col::<bson::Document>("servers")
+                .update_one(
+                    doc! { "_id": server_id },
+                    doc! { "$set": { "owner": owner } },
+                )
+                .await
+                .unwrap();
+            assert_eq!(result.matched_count, 1);
+        }
+    }
+}
+
+/// Mongo's `txn_serial` of every document a protect or seat PUT of
+/// `CHANNEL` can write (`None`: never claimed); empty under REFERENCE,
+/// which has no such counter
+async fn write_counters(db: &Database, group_id: &str) -> Vec<Option<i64>> {
+    match db {
+        Database::Reference(_) => vec![],
+        #[cfg(feature = "mongodb")]
+        Database::MongoDb(mongo) => {
+            let documents = [
+                ("mls_groups", doc! { "_id": group_id }),
+                ("servers", doc! { "_id": SERVER }),
+                (
+                    "server_members",
+                    doc! { "_id.server": SERVER, "_id.user": USER_A },
+                ),
+                (
+                    "server_members",
+                    doc! { "_id.server": SERVER, "_id.user": USER_B },
+                ),
+                ("channel_entitlements", doc! { "channel_id": CHANNEL }),
+                ("channel_seat_lists", doc! { "_id": CHANNEL }),
+                ("channels", doc! { "_id": CHANNEL }),
+            ];
+            let mut counters = Vec::new();
+            for (collection, filter) in documents {
+                let row = mongo
+                    .col::<bson::Document>(collection)
+                    .find_one(filter)
+                    .await
+                    .unwrap()
+                    .expect("document");
+                counters.push(row.get_i64("txn_serial").ok());
+            }
+            counters
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -384,6 +522,100 @@ fn signatures_must_be_canonical_unpadded_b64_of_64_bytes() {
     }
 }
 
+#[test]
+fn handover_body_parses_the_5_4_vector() {
+    let parsed = HandoverBody::parse(VECTOR_HANDOVER_BODY).unwrap();
+    assert_eq!(
+        parsed,
+        HandoverBody {
+            channel_id: CHANNEL.to_string(),
+            from_user_id: USER_A.to_string(),
+            from_device_id: DEVICE_A.to_string(),
+            from_identity_key: OWNER_IDENTITY_KEY.to_string(),
+            to_user_id: USER_A.to_string(),
+            to_device_id: DEVICE_A2.to_string(),
+            to_identity_key: NEW_OWNER_IDENTITY_KEY.to_string(),
+            issued_at: 1_790_812_800_000,
+        }
+    );
+}
+
+#[test]
+fn handover_body_refuses_every_single_field_corruption() {
+    let issued = "issued_at:1790812800000";
+    let from_device = format!("from_device_id:{DEVICE_A}");
+    let to_device = format!("to_device_id:{DEVICE_A2}");
+    // Last b64 char of a 32-byte key carries 2 padding bits; `g` has them 0
+    let non_canonical_key = format!("{}h", &OWNER_IDENTITY_KEY[..42]);
+
+    let corrupt = [
+        // Line count: a trailing LF, an extra line, a missing line
+        format!("{VECTOR_HANDOVER_BODY}\n"),
+        format!("{VECTOR_HANDOVER_BODY}\nextra:1"),
+        VECTOR_HANDOVER_BODY.replace("\nv:1", ""),
+        // Context and format version
+        VECTOR_HANDOVER_BODY.replace("sloga-owner-handover-v1", "sloga-owner-handover-v2"),
+        VECTOR_HANDOVER_BODY.replace("sloga-owner-handover-v1", "sloga-seat-list-v1"),
+        VECTOR_HANDOVER_BODY.replace("\nv:1\n", "\nv:2\n"),
+        // issued_at: above 2^53 - 1, and non-canonical decimals
+        VECTOR_HANDOVER_BODY.replace(issued, "issued_at:9007199254740992"),
+        VECTOR_HANDOVER_BODY.replace(issued, "issued_at:01790812800000"),
+        VECTOR_HANDOVER_BODY.replace(issued, "issued_at:+1790812800000"),
+        VECTOR_HANDOVER_BODY.replace(issued, "issued_at:"),
+        // CR
+        VECTOR_HANDOVER_BODY.replacen('\n', "\r\n", 1),
+        // Ids out of charset
+        VECTOR_HANDOVER_BODY.replace(CHANNEL, &CHANNEL.to_lowercase()),
+        VECTOR_HANDOVER_BODY.replace(
+            &from_device,
+            &format!("from_device_id:{}", DEVICE_A.to_uppercase()),
+        ),
+        VECTOR_HANDOVER_BODY.replace(&to_device, &format!("{to_device}0")),
+        // Keys: padding, the URL-safe alphabet, non-canonical trailing bits
+        VECTOR_HANDOVER_BODY.replace(OWNER_IDENTITY_KEY, &format!("{OWNER_IDENTITY_KEY}=")),
+        VECTOR_HANDOVER_BODY.replace(
+            NEW_OWNER_IDENTITY_KEY,
+            &NEW_OWNER_IDENTITY_KEY.replace('/', "_"),
+        ),
+        VECTOR_HANDOVER_BODY.replace(OWNER_IDENTITY_KEY, &non_canonical_key),
+        // Labels and field order
+        VECTOR_HANDOVER_BODY.replace("to_user_id:", "to_user:"),
+        VECTOR_HANDOVER_BODY.replace("from_user_id:", "from_user_id: "),
+        VECTOR_HANDOVER_BODY
+            .replace(&from_device, "SWAP")
+            .replace(&to_device, &from_device)
+            .replace("SWAP", &to_device),
+    ];
+
+    for (index, body) in corrupt.iter().enumerate() {
+        assert_ne!(
+            body, VECTOR_HANDOVER_BODY,
+            "corruption {index} changed nothing"
+        );
+        let result = HandoverBody::parse(body);
+        assert!(
+            result.as_ref().is_err_and(is_failed_validation),
+            "corruption {index} was accepted: {body:?}"
+        );
+    }
+
+    // The bound is inclusive
+    let at_bound =
+        HandoverBody::parse(&VECTOR_HANDOVER_BODY.replace(issued, "issued_at:9007199254740991"))
+            .unwrap();
+    assert_eq!(at_bound.issued_at, 9_007_199_254_740_991);
+    assert!(HandoverBody::parse(&VECTOR_HANDOVER_BODY.replace(issued, "issued_at:0")).is_ok());
+
+    // A cross-user link is format-valid; refusing it is an S1 trust rule
+    // (4.6), not a parse rule
+    let cross_user = HandoverBody::parse(&VECTOR_HANDOVER_BODY.replace(
+        &format!("to_user_id:{USER_A}"),
+        &format!("to_user_id:{USER_B}"),
+    ))
+    .unwrap();
+    assert_eq!(cross_user.to_user_id, USER_B);
+}
+
 // ---------------------------------------------------------------------------
 // Database: both drivers
 // ---------------------------------------------------------------------------
@@ -409,9 +641,13 @@ async fn protect_and_put_follow_the_version_rule() {
         assert_eq!(outcome.list.version, 1);
         assert!(db.fetch_channel(CHANNEL).await.unwrap().is_protected());
 
-        // Protect is one-shot
+        // Protect is one-shot: another genesis list is refused. (The
+        // byte-identical retry is the N3 stored success, covered by
+        // `genesis_reprotect_is_the_stored_success_and_writes_nothing`.)
+        let mut other_genesis = submit(1, &[USER_A]);
+        other_genesis.body = body_with(1, 1_790_812_800_001, &[USER_A]);
         let error = db
-            .protect_channel(CHANNEL, &submit(1, &[USER_A]), at(0))
+            .protect_channel(CHANNEL, &other_genesis, at(0))
             .await
             .unwrap_err();
         assert!(matches!(error.error_type, ErrorType::InvalidOperation));
@@ -419,7 +655,7 @@ async fn protect_and_put_follow_the_version_rule() {
         // Strictly stored + 1
         for version in [3, 4, 1_000] {
             let error = db
-                .put_seat_list(CHANNEL, &submit(version, &[USER_A, USER_B]), at(0))
+                .put_seat_list(CHANNEL, &submit(version, &[USER_A, USER_B]), true, at(0))
                 .await
                 .unwrap_err();
             assert!(is_failed_validation(&error), "version {version}");
@@ -429,7 +665,7 @@ async fn protect_and_put_follow_the_version_rule() {
         let mut other_v1 = submit(1, &[USER_A]);
         other_v1.body = body_with(1, 1_790_812_800_001, &[USER_A]);
         let error = db
-            .put_seat_list(CHANNEL, &other_v1, at(0))
+            .put_seat_list(CHANNEL, &other_v1, true, at(0))
             .await
             .unwrap_err();
         assert!(is_failed_validation(&error));
@@ -438,13 +674,13 @@ async fn protect_and_put_follow_the_version_rule() {
         let mut resigned_v1 = submit(1, &[USER_A]);
         resigned_v1.signature = signature(40);
         let error = db
-            .put_seat_list(CHANNEL, &resigned_v1, at(0))
+            .put_seat_list(CHANNEL, &resigned_v1, true, at(0))
             .await
             .unwrap_err();
         assert!(is_failed_validation(&error));
 
         let outcome = db
-            .put_seat_list(CHANNEL, &submit(2, &[USER_A, USER_B]), at(0))
+            .put_seat_list(CHANNEL, &submit(2, &[USER_A, USER_B]), true, at(0))
             .await
             .unwrap();
         assert!(!outcome.unchanged);
@@ -454,7 +690,7 @@ async fn protect_and_put_follow_the_version_rule() {
         // Byte-identical re-PUT: stored success, no side effects
         let seats_before = db.fetch_channel_seats(CHANNEL).await.unwrap();
         let again = db
-            .put_seat_list(CHANNEL, &submit(2, &[USER_A, USER_B]), at(1))
+            .put_seat_list(CHANNEL, &submit(2, &[USER_A, USER_B]), true, at(1))
             .await
             .unwrap();
         assert!(again.unchanged);
@@ -464,7 +700,7 @@ async fn protect_and_put_follow_the_version_rule() {
 
         // A different list at version 2 is refused
         let error = db
-            .put_seat_list(CHANNEL, &submit(2, &[USER_A, USER_C]), at(0))
+            .put_seat_list(CHANNEL, &submit(2, &[USER_A, USER_C]), true, at(0))
             .await
             .unwrap_err();
         assert!(is_failed_validation(&error));
@@ -473,12 +709,17 @@ async fn protect_and_put_follow_the_version_rule() {
         let mut wrong_device = submit(3, &[USER_A]);
         wrong_device.signer_device_id = DEVICE_A2.to_string();
         let error = db
-            .put_seat_list(CHANNEL, &wrong_device, at(0))
+            .put_seat_list(CHANNEL, &wrong_device, true, at(0))
             .await
             .unwrap_err();
         assert!(is_failed_validation(&error));
         let error = db
-            .put_seat_list("01J9Z3K4M5N6P7Q8R9S0T1V2W4", &submit(3, &[USER_A]), at(0))
+            .put_seat_list(
+                "01J9Z3K4M5N6P7Q8R9S0T1V2W4",
+                &submit(3, &[USER_A]),
+                true,
+                at(0),
+            )
             .await
             .unwrap_err();
         assert!(is_failed_validation(&error));
@@ -492,6 +733,7 @@ async fn protect_and_put_follow_the_version_rule() {
 async fn protect_refuses_a_channel_with_messages_or_without_an_active_entitlement() {
     database_test!(|db| async move {
         // No entitlement
+        server_ready(&db).await;
         db.insert_channel(&text_channel(None)).await.unwrap();
         let error = db
             .protect_channel(CHANNEL, &submit(1, &[USER_A]), at(0))
@@ -504,6 +746,7 @@ async fn protect_refuses_a_channel_with_messages_or_without_an_active_entitlemen
 
     database_test!(|db| async move {
         // Has history
+        server_ready(&db).await;
         db.insert_channel(&text_channel(Some(
             "01J9Z3K4M5N6P7Q8R9S0T1V2W0".to_string(),
         )))
@@ -530,12 +773,12 @@ async fn released_seats_count_against_the_cap_until_the_cooldown_ends() {
         db.protect_channel(CHANNEL, &submit(1, &[USER_A]), at(0))
             .await
             .unwrap();
-        db.put_seat_list(CHANNEL, &submit(2, &[USER_A, USER_B]), at(0))
+        db.put_seat_list(CHANNEL, &submit(2, &[USER_A, USER_B]), true, at(0))
             .await
             .unwrap();
 
         let outcome = db
-            .put_seat_list(CHANNEL, &submit(3, &[USER_A]), at(0))
+            .put_seat_list(CHANNEL, &submit(3, &[USER_A]), true, at(0))
             .await
             .unwrap();
         assert_eq!(outcome.released, vec![USER_B]);
@@ -548,14 +791,14 @@ async fn released_seats_count_against_the_cap_until_the_cooldown_ends() {
 
         // A new user does not fit while B cools
         let error = db
-            .put_seat_list(CHANNEL, &submit(4, &[USER_A, USER_C]), at(1))
+            .put_seat_list(CHANNEL, &submit(4, &[USER_A, USER_C]), true, at(1))
             .await
             .unwrap_err();
         assert!(is_seat_cap(&error, 2));
 
         // Re-seating the cooling user reactivates the row, no new slot
         let outcome = db
-            .put_seat_list(CHANNEL, &submit(4, &[USER_A, USER_B]), at(1))
+            .put_seat_list(CHANNEL, &submit(4, &[USER_A, USER_B]), true, at(1))
             .await
             .unwrap();
         assert_eq!(outcome.claimed, vec![USER_B]);
@@ -566,26 +809,26 @@ async fn released_seats_count_against_the_cap_until_the_cooldown_ends() {
         assert_eq!(seats.len(), 2);
 
         // Release again at day 1: cooling until day 15
-        db.put_seat_list(CHANNEL, &submit(5, &[USER_A]), at(1))
+        db.put_seat_list(CHANNEL, &submit(5, &[USER_A]), true, at(1))
             .await
             .unwrap();
 
         // Day 14 is still inside the cooldown
         let error = db
-            .put_seat_list(CHANNEL, &submit(6, &[USER_A, USER_C]), at(14))
+            .put_seat_list(CHANNEL, &submit(6, &[USER_A, USER_C]), true, at(14))
             .await
             .unwrap_err();
         assert!(is_seat_cap(&error, 2));
 
         // A removal-only list is never refused by the cap (7.1)
         // (here: the same seats, so nothing is claimed)
-        db.put_seat_list(CHANNEL, &submit(6, &[USER_A]), at(14))
+        db.put_seat_list(CHANNEL, &submit(6, &[USER_A]), true, at(14))
             .await
             .unwrap();
 
         // Day 16: B's cooldown is over and its slot is free
         let outcome = db
-            .put_seat_list(CHANNEL, &submit(7, &[USER_A, USER_C]), at(16))
+            .put_seat_list(CHANNEL, &submit(7, &[USER_A, USER_C]), true, at(16))
             .await
             .unwrap();
         assert_eq!(outcome.claimed, vec![USER_C]);
@@ -598,6 +841,9 @@ async fn released_seats_count_against_the_cap_until_the_cooldown_ends() {
 async fn racing_seat_claims_never_exceed_the_cap() {
     database_test!(|db| async move {
         setup(&db, 3).await;
+        let racers: Vec<String> = (100..108).chain(200..208).map(numbered_user).collect();
+        let racers: Vec<&str> = racers.iter().map(String::as_str).collect();
+        insert_members(&db, SERVER, &racers).await;
 
         // Racing genesis lists: exactly one protect lands
         let mut handles = Vec::new();
@@ -646,6 +892,7 @@ async fn racing_seat_claims_never_exceed_the_cap() {
                 db.put_seat_list(
                     CHANNEL,
                     &submit(2, &[USER_A, winner.as_str(), new.as_str()]),
+                    true,
                     at(0),
                 )
                 .await
@@ -703,7 +950,7 @@ async fn racing_seat_claims_never_exceed_the_cap() {
                     signer_device_id: DEVICE_A.to_string(),
                     handover: None,
                 };
-                db.put_seat_list(CHANNEL, &submission, at(0)).await
+                db.put_seat_list(CHANNEL, &submission, true, at(0)).await
             }));
         }
         let mut landed = Vec::new();
@@ -762,7 +1009,7 @@ async fn seat_put_writes_the_group_hash_and_pending_removals_with_the_list() {
 
         // Unseat B: released, pending removal, and the new hash, together
         let outcome = db
-            .put_seat_list(CHANNEL, &submit(2, &[USER_A]), at(1))
+            .put_seat_list(CHANNEL, &submit(2, &[USER_A]), true, at(1))
             .await
             .unwrap();
         assert_eq!(outcome.released, vec![USER_B]);
@@ -787,7 +1034,7 @@ async fn seat_put_writes_the_group_hash_and_pending_removals_with_the_list() {
 
         // An identical re-PUT adds nothing
         let again = db
-            .put_seat_list(CHANNEL, &submit(2, &[USER_A]), at(2))
+            .put_seat_list(CHANNEL, &submit(2, &[USER_A]), true, at(2))
             .await
             .unwrap();
         assert!(again.unchanged);
@@ -801,7 +1048,7 @@ async fn seat_put_writes_the_group_hash_and_pending_removals_with_the_list() {
 
         // A later list never duplicates the pending entry, but moves the hash
         let outcome = db
-            .put_seat_list(CHANNEL, &submit(3, &[USER_A]), at(2))
+            .put_seat_list(CHANNEL, &submit(3, &[USER_A]), true, at(2))
             .await
             .unwrap();
         assert!(outcome.pending_removals_added.is_empty());
@@ -826,7 +1073,7 @@ async fn byte_identical_reput_succeeds_after_the_signer_lost_its_leaf() {
             .unwrap();
         let group = text_group(0xbb, &owner, 0);
         db.create_text_mls_group(&group, None).await.unwrap();
-        db.put_seat_list(CHANNEL, &submit(2, &[USER_A, USER_B]), at(0))
+        db.put_seat_list(CHANNEL, &submit(2, &[USER_A, USER_B]), true, at(0))
             .await
             .unwrap();
 
@@ -835,14 +1082,14 @@ async fn byte_identical_reput_succeeds_after_the_signer_lost_its_leaf() {
 
         // 5b refuses a NEW list from a signer without a leaf
         let error = db
-            .put_seat_list(CHANNEL, &submit(3, &[USER_A]), at(1))
+            .put_seat_list(CHANNEL, &submit(3, &[USER_A]), true, at(1))
             .await
             .unwrap_err();
         assert!(is_failed_validation(&error));
 
         // ... but the lost-response retry of the stored list still succeeds
         let again = db
-            .put_seat_list(CHANNEL, &submit(2, &[USER_A, USER_B]), at(1))
+            .put_seat_list(CHANNEL, &submit(2, &[USER_A, USER_B]), true, at(1))
             .await
             .unwrap();
         assert!(again.unchanged);
@@ -950,7 +1197,10 @@ async fn handover_chain_is_append_only_and_capped() {
                 body: format!("handover {version}"),
                 signature: signature(version),
             });
-            let outcome = db.put_seat_list(CHANNEL, &submission, at(0)).await.unwrap();
+            let outcome = db
+                .put_seat_list(CHANNEL, &submission, true, at(0))
+                .await
+                .unwrap();
             assert_eq!(outcome.list.handovers.len() as i64, version - 1);
             assert_eq!(
                 outcome.list.handovers.last().unwrap().body,
@@ -964,12 +1214,15 @@ async fn handover_chain_is_append_only_and_capped() {
             body: "one too many".to_string(),
             signature: signature(next),
         });
-        let error = db.put_seat_list(CHANNEL, &over, at(0)).await.unwrap_err();
+        let error = db
+            .put_seat_list(CHANNEL, &over, true, at(0))
+            .await
+            .unwrap_err();
         assert!(is_failed_validation(&error));
 
         // Without a handover the list still advances; the chain is kept
         let outcome = db
-            .put_seat_list(CHANNEL, &submit(next, &[USER_A]), at(0))
+            .put_seat_list(CHANNEL, &submit(next, &[USER_A]), true, at(0))
             .await
             .unwrap();
         assert_eq!(outcome.list.handovers.len(), MAX_SEAT_LIST_HANDOVERS);
@@ -1047,7 +1300,7 @@ async fn forced_release_releases_the_seat_and_adds_one_pending_removal() {
 
         // The owner's later unseat neither re-releases nor duplicates
         let outcome = db
-            .put_seat_list(CHANNEL, &submit(2, &[USER_A]), at(3))
+            .put_seat_list(CHANNEL, &submit(2, &[USER_A]), true, at(3))
             .await
             .unwrap();
         assert!(outcome.released.is_empty());
@@ -1162,6 +1415,7 @@ const RACE_ITERATIONS: u32 = 25;
 #[tokio::test]
 async fn text_group_create_never_binds_a_stale_seat_list() {
     database_test!(|db| async move {
+        server_ready(&db).await;
         let owner = device(USER_A, DEVICE_A);
         for iteration in 0..RACE_ITERATIONS {
             let channel_id = race_channel(iteration);
@@ -1175,7 +1429,7 @@ async fn text_group_create_never_binds_a_stale_seat_list() {
             let next = submit_in(&channel_id, 2, &[USER_A, USER_B]);
             let (created, put) = tokio::join!(
                 db.create_text_mls_group(&group, None),
-                db.put_seat_list(&channel_id, &next, at(0))
+                db.put_seat_list(&channel_id, &next, true, at(0))
             );
             assert_eq!(
                 created.expect("create must not error"),
@@ -1199,6 +1453,7 @@ async fn text_group_create_never_binds_a_stale_seat_list() {
 #[tokio::test]
 async fn lowering_the_slot_cap_never_skews_against_a_seat_claim() {
     database_test!(|db| async move {
+        server_ready(&db).await;
         for iteration in 0..RACE_ITERATIONS {
             let channel_id = race_channel(1_000 + iteration);
             protected_in(&db, &channel_id, 3).await;
@@ -1209,7 +1464,7 @@ async fn lowering_the_slot_cap_never_skews_against_a_seat_claim() {
             let claim = submit_in(&channel_id, 2, &[USER_A, USER_B]);
             let (granted, put) = tokio::join!(
                 db.upsert_channel_entitlement(&lowered, at(0)),
-                db.put_seat_list(&channel_id, &claim, at(0))
+                db.put_seat_list(&channel_id, &claim, true, at(0))
             );
 
             // Exactly one lands; the other sees it and hits the cap
@@ -1319,6 +1574,7 @@ const FIRST_PUT_VERSION: i64 = 2;
 #[tokio::test]
 async fn seat_put_lands_while_text_commits_stream_in() {
     database_test!(|db| async move {
+        server_ready(&db).await;
         let owner = device(USER_A, DEVICE_A);
         for round in 0..STARVATION_ROUNDS {
             let channel_id = race_channel(2_000 + round);
@@ -1347,7 +1603,10 @@ async fn seat_put_lands_while_text_commits_stream_in() {
                         &[USER_A]
                     };
                     let submission = submit_in(&channel_id, version, seats);
-                    results.push(db.put_seat_list(&channel_id, &submission, at(0)).await);
+                    results.push(
+                        db.put_seat_list(&channel_id, &submission, true, at(0))
+                            .await,
+                    );
                 }
                 // Keep streaming until a commit lands on the newest hash
                 let after = won.load(SeqCst);
@@ -1388,5 +1647,701 @@ async fn seat_put_lands_while_text_commits_stream_in() {
                 "round {round}"
             );
         }
+    });
+}
+
+// ---------------------------------------------------------------------------
+// W2: N3, the growth flag, threads, and the decision 13 claims
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn genesis_reprotect_is_the_stored_success_and_writes_nothing() {
+    database_test!(|db| async move {
+        setup(&db, 10).await;
+        let genesis = submit(1, &[USER_A, USER_B]);
+        let landed = db.protect_channel(CHANNEL, &genesis, at(0)).await.unwrap();
+        assert!(!landed.unchanged);
+
+        // The owner's device opens the Text group right after protect (6.3),
+        // so a retry that wrote anything would touch it too
+        let group = text_group(0xee, &device(USER_A, DEVICE_A), 0);
+        db.create_text_mls_group(&group, None).await.unwrap();
+
+        let list_before = db.fetch_seat_list(CHANNEL).await.unwrap();
+        let seats_before = db.fetch_channel_seats(CHANNEL).await.unwrap();
+        let group_before = db.fetch_mls_group(&group.id).await.unwrap();
+        let counters_before = write_counters(&db, &group.id).await;
+
+        // The landed protect made its own preconditions false (the channel
+        // is protected); the identical retry is still the stored success
+        let again = db.protect_channel(CHANNEL, &genesis, at(5)).await.unwrap();
+        assert!(again.unchanged);
+        assert_eq!(again.list, landed.list);
+        assert!(again.claimed.is_empty());
+        assert!(again.released.is_empty());
+        assert!(again.pending_removals_added.is_empty());
+
+        // ... and it wrote nothing at all
+        assert_eq!(db.fetch_seat_list(CHANNEL).await.unwrap(), list_before);
+        assert_eq!(db.fetch_channel_seats(CHANNEL).await.unwrap(), seats_before);
+        assert_eq!(db.fetch_mls_group(&group.id).await.unwrap(), group_before);
+        assert_eq!(
+            write_counters(&db, &group.id).await,
+            counters_before,
+            "the retry wrote a document"
+        );
+        assert!(db.fetch_channel(CHANNEL).await.unwrap().is_protected());
+
+        // A different genesis body, or the same body re-signed, is refused
+        let mut other = genesis.clone();
+        other.body = body_with(1, 1_790_812_800_001, &[USER_A, USER_B]);
+        let error = db
+            .protect_channel(CHANNEL, &other, at(5))
+            .await
+            .unwrap_err();
+        assert!(is_invalid_operation(&error), "{error:?}");
+        let mut resigned = genesis.clone();
+        resigned.signature = signature(41);
+        let error = db
+            .protect_channel(CHANNEL, &resigned, at(5))
+            .await
+            .unwrap_err();
+        assert!(is_invalid_operation(&error), "{error:?}");
+
+        // Once the stored list is past version 1, the genesis retry is refused
+        db.put_seat_list(CHANNEL, &submit(2, &[USER_A, USER_B]), true, at(1))
+            .await
+            .unwrap();
+        let error = db
+            .protect_channel(CHANNEL, &genesis, at(5))
+            .await
+            .unwrap_err();
+        assert!(is_invalid_operation(&error), "{error:?}");
+    });
+}
+
+#[tokio::test]
+async fn genesis_reprotect_is_not_answered_once_the_signer_lost_the_server() {
+    database_test!(|db| async move {
+        setup(&db, 10).await;
+        let genesis = submit(1, &[USER_A]);
+        db.protect_channel(CHANNEL, &genesis, at(0)).await.unwrap();
+
+        transfer_owner(&db, SERVER, USER_B).await;
+        let error = db
+            .protect_channel(CHANNEL, &genesis, at(1))
+            .await
+            .unwrap_err();
+        assert!(is_invalid_operation(&error), "{error:?}");
+    });
+}
+
+#[tokio::test]
+async fn seat_claims_need_the_growth_flag_but_retries_and_removals_do_not() {
+    database_test!(|db| async move {
+        setup(&db, 10).await;
+        db.protect_channel(CHANNEL, &submit(1, &[USER_A]), at(0))
+            .await
+            .unwrap();
+
+        // Flag off: a new claim is refused and nothing is written
+        let error = db
+            .put_seat_list(CHANNEL, &submit(2, &[USER_A, USER_B]), false, at(0))
+            .await
+            .unwrap_err();
+        assert!(is_growth_disabled(&error), "{error:?}");
+        assert_eq!(
+            db.fetch_seat_list(CHANNEL).await.unwrap().unwrap().version,
+            1
+        );
+        assert_eq!(db.fetch_channel_seats(CHANNEL).await.unwrap().len(), 1);
+
+        // Flag on: B and C are seated
+        let seated = submit(2, &[USER_A, USER_B, USER_C]);
+        let outcome = db
+            .put_seat_list(CHANNEL, &seated, true, at(0))
+            .await
+            .unwrap();
+        assert_eq!(outcome.claimed, vec![USER_B, USER_C]);
+
+        // C is removed from the server: its seat is released and cools
+        db.release_channel_seats_for_user(USER_C, Some(SERVER), at(1))
+            .await
+            .unwrap();
+
+        // Flag off: the byte-identical retry of the list that landed still
+        // succeeds, although applying it again would reactivate C's seat
+        let again = db
+            .put_seat_list(CHANNEL, &seated, false, at(1))
+            .await
+            .unwrap();
+        assert!(again.unchanged, "{again:?}");
+
+        // Flag off: reactivating a cooling seat is a claim
+        let error = db
+            .put_seat_list(CHANNEL, &submit(3, &[USER_A, USER_B, USER_C]), false, at(1))
+            .await
+            .unwrap_err();
+        assert!(is_growth_disabled(&error), "{error:?}");
+
+        // Flag off: a removal-only list lands
+        let outcome = db
+            .put_seat_list(CHANNEL, &submit(3, &[USER_A]), false, at(2))
+            .await
+            .unwrap();
+        assert_eq!(outcome.released, vec![USER_B]);
+        assert!(outcome.claimed.is_empty());
+
+        // Flag off: a `device_cap`-only list lands
+        let capped = SeatListSubmission {
+            body: SeatListBody {
+                channel_id: CHANNEL.to_string(),
+                version: 4,
+                device_cap: 2,
+                issued_at: 1_790_812_800_000,
+                signer_user_id: USER_A.to_string(),
+                signer_device_id: DEVICE_A.to_string(),
+                seats: vec![USER_A.to_string()],
+            }
+            .build()
+            .unwrap(),
+            signature: signature(4),
+            signer_device_id: DEVICE_A.to_string(),
+            handover: None,
+        };
+        let outcome = db
+            .put_seat_list(CHANNEL, &capped, false, at(2))
+            .await
+            .unwrap();
+        assert!(!outcome.unchanged);
+        assert!(outcome.claimed.is_empty() && outcome.released.is_empty());
+        assert_eq!(outcome.list.version, 4);
+
+        let active: Vec<String> = db
+            .fetch_channel_seats(CHANNEL)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|seat| seat.is_active())
+            .map(|seat| seat.user_id)
+            .collect();
+        assert_eq!(active, vec![USER_A]);
+    });
+}
+
+#[tokio::test]
+async fn protect_refuses_a_channel_with_threads() {
+    database_test!(|db| async move {
+        setup(&db, 10).await;
+        db.insert_channel(&thread("01J9Z3K4M5N6P7Q8R9S0T1V2X1", CHANNEL))
+            .await
+            .unwrap();
+
+        let error = db
+            .protect_channel(CHANNEL, &submit(1, &[USER_A]), at(0))
+            .await
+            .unwrap_err();
+        assert!(is_invalid_operation(&error), "{error:?}");
+        assert!(db.fetch_seat_list(CHANNEL).await.unwrap().is_none());
+        assert!(db.fetch_channel_seats(CHANNEL).await.unwrap().is_empty());
+        assert!(!db.fetch_channel(CHANNEL).await.unwrap().is_protected());
+
+        // A thread of ANOTHER channel does not count
+        protected_in(&db, &race_channel(3_000), 10).await;
+        assert!(db
+            .fetch_channel(&race_channel(3_000))
+            .await
+            .unwrap()
+            .is_protected());
+    });
+}
+
+#[tokio::test]
+async fn protect_needs_the_owner_and_every_claim_needs_a_member() {
+    database_test!(|db| async move {
+        setup(&db, 10).await;
+        let stranger = numbered_user(900);
+
+        // A list signed by a member who does not own the server
+        let by_member = SeatListSubmission {
+            body: SeatListBody {
+                channel_id: CHANNEL.to_string(),
+                version: 1,
+                device_cap: 5,
+                issued_at: 1_790_812_800_000,
+                signer_user_id: USER_B.to_string(),
+                signer_device_id: DEVICE_B.to_string(),
+                seats: vec![USER_B.to_string()],
+            }
+            .build()
+            .unwrap(),
+            signature: signature(1),
+            signer_device_id: DEVICE_B.to_string(),
+            handover: None,
+        };
+        let error = db
+            .protect_channel(CHANNEL, &by_member, at(0))
+            .await
+            .unwrap_err();
+        assert!(matches!(error.error_type, ErrorType::NotOwner), "{error:?}");
+
+        // A genesis list seating a non-member
+        let error = db
+            .protect_channel(CHANNEL, &submit(1, &[USER_A, stranger.as_str()]), at(0))
+            .await
+            .unwrap_err();
+        assert!(is_failed_validation(&error), "{error:?}");
+        assert!(db.fetch_seat_list(CHANNEL).await.unwrap().is_none());
+        assert!(db.fetch_channel_seats(CHANNEL).await.unwrap().is_empty());
+        assert!(!db.fetch_channel(CHANNEL).await.unwrap().is_protected());
+
+        db.protect_channel(CHANNEL, &submit(1, &[USER_A, USER_C]), at(0))
+            .await
+            .unwrap();
+
+        // A PUT seating a non-member, or a member who has since left
+        let error = db
+            .put_seat_list(
+                CHANNEL,
+                &submit(2, &[USER_A, USER_C, stranger.as_str()]),
+                true,
+                at(0),
+            )
+            .await
+            .unwrap_err();
+        assert!(is_failed_validation(&error), "{error:?}");
+        db.soft_delete_member(&MemberCompositeKey {
+            server: SERVER.to_string(),
+            user: USER_B.to_string(),
+        })
+        .await
+        .unwrap();
+        let error = db
+            .put_seat_list(CHANNEL, &submit(2, &[USER_A, USER_B, USER_C]), true, at(0))
+            .await
+            .unwrap_err();
+        assert!(is_failed_validation(&error), "{error:?}");
+        assert_eq!(
+            db.fetch_seat_list(CHANNEL).await.unwrap().unwrap().version,
+            1
+        );
+
+        // Only NEW claims are checked: C leaves while still seated, and a
+        // list that keeps C seated still lands
+        db.soft_delete_member(&MemberCompositeKey {
+            server: SERVER.to_string(),
+            user: USER_C.to_string(),
+        })
+        .await
+        .unwrap();
+        db.put_seat_list(CHANNEL, &submit(2, &[USER_A, USER_C]), true, at(0))
+            .await
+            .unwrap();
+    });
+}
+
+/// Rounds of each claim race below (every round uses fresh channels, and a
+/// fresh user or server)
+const CLAIM_RACE_ROUNDS: u32 = 10;
+
+/// Back-to-back operations per round in the claim races. Each round's
+/// stream straddles the one racing kick or transfer, so both of its
+/// outcomes (landed before, refused after) occur without any pacing.
+const CLAIM_RACE_STREAM: u32 = 8;
+
+/// A kick at the database level, in the decision 11 (W2) order without the
+/// thread loop and the events: the first release, the membership delete,
+/// then the second release. Every step must succeed. Returns its window,
+/// from the start of the first release to the end of the second.
+async fn kick(db: &Database, user: &str) -> (Instant, Instant) {
+    let started = Instant::now();
+    db.release_channel_seats_for_user(user, Some(SERVER), at(0))
+        .await
+        .expect("first release");
+    db.soft_delete_member(&MemberCompositeKey {
+        server: SERVER.to_string(),
+        user: user.to_string(),
+    })
+    .await
+    .expect("membership delete");
+    db.release_channel_seats_for_user(user, Some(SERVER), at(0))
+        .await
+        .expect("second release");
+    (started, Instant::now())
+}
+
+/// Once a race with a kick has settled: `user` is not a member and holds no
+/// active seat anywhere
+async fn assert_kicked_and_unseated(db: &Database, user: &str, round: u32) {
+    assert!(
+        db.fetch_member(SERVER, user).await.is_err(),
+        "round {round}: the kick did not remove the member"
+    );
+    let active = db
+        .fetch_channel_seats_for_user(user)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|seat| seat.is_active())
+        .count();
+    assert_eq!(
+        active, 0,
+        "round {round}: a non-member holds an active seat"
+    );
+}
+
+/// Tally of a race's outcomes and timing (W2a audit WA#4, fix re-review
+/// RR#3). Both outcomes occurring is not enough on its own: the round
+/// alternation and the even-round start make it hold even when no claim
+/// ever ran while the kick did. So under MONGODB the kick races also assert
+/// that at least one claim operation OVERLAPPED the kick window (started
+/// before the kick ended and ended after it started). REFERENCE keeps only
+/// the outcome guard: its in-memory store does not yield inside an
+/// operation and its locks serialize, so nothing there overlaps in time.
+#[derive(Default)]
+struct RaceTally {
+    landed: u32,
+    refused: u32,
+    /// Rounds whose own stream saw both outcomes, i.e. the kick landed
+    /// mid-stream (printed; REFERENCE never yields mid-stream)
+    straddled: u32,
+    /// Claim operations that overlapped their round's kick window
+    overlapped: u32,
+    /// Rounds with at least one such claim
+    overlap_rounds: u32,
+    /// (start, end) of each claim operation of one round's stream
+    claims: Vec<(Instant, Instant)>,
+}
+
+impl RaceTally {
+    /// Fold one round's stream into the run's tally, given that round's
+    /// kick window
+    fn add_round(&mut self, stream: RaceTally, kick: (Instant, Instant)) {
+        let (kick_started, kick_ended) = kick;
+        self.landed += stream.landed;
+        self.refused += stream.refused;
+        if stream.landed > 0 && stream.refused > 0 {
+            self.straddled += 1;
+        }
+        let overlapped = stream
+            .claims
+            .iter()
+            .filter(|(started, ended)| *started < kick_ended && *ended > kick_started)
+            .count() as u32;
+        self.overlapped += overlapped;
+        if overlapped > 0 {
+            self.overlap_rounds += 1;
+        }
+    }
+
+    /// The guards, once every round ran (see the type docs). The overlap
+    /// guard is checked first, so a run that never overlapped fails on it.
+    fn assert_raced(&self, db: &Database, race: &str) {
+        eprintln!(
+            "{race}: {} claims landed, {} refused, {} of {CLAIM_RACE_ROUNDS} rounds saw both; \
+             {} claims overlapped the kick, in {} of {CLAIM_RACE_ROUNDS} rounds",
+            self.landed, self.refused, self.straddled, self.overlapped, self.overlap_rounds
+        );
+        if !matches!(db, Database::Reference(_)) {
+            assert!(
+                self.overlapped > 0,
+                "{race}: no claim overlapped the kick in any round"
+            );
+        }
+        assert!(
+            self.landed > 0 && self.refused > 0,
+            "{race}: one-sided race: {} claims landed, {} refused",
+            self.landed,
+            self.refused
+        );
+    }
+}
+
+#[tokio::test]
+async fn seat_puts_racing_a_kick_never_seat_a_non_member() {
+    database_test!(|db| async move {
+        server_ready(&db).await;
+        let mut tally = RaceTally::default();
+        for round in 0..CLAIM_RACE_ROUNDS {
+            let channel_id = race_channel(4_000 + round);
+            let user = numbered_user(4_000 + round);
+            insert_members(&db, SERVER, &[user.as_str()]).await;
+            protected_in(&db, &channel_id, 10).await;
+
+            // Back to back: seat the user, unseat, seat again ..., ending on
+            // a seat attempt, while the kick runs once. No pacing.
+            let stream = async {
+                let mut tally = RaceTally::default();
+                let mut version = 2;
+                for step in 0..=CLAIM_RACE_STREAM {
+                    let seats: &[&str] = if step % 2 == 0 {
+                        &[USER_A, user.as_str()]
+                    } else {
+                        &[USER_A]
+                    };
+                    let list = submit_in(&channel_id, version, seats);
+                    let started = Instant::now();
+                    let put = db.put_seat_list(&channel_id, &list, true, at(0)).await;
+                    if step % 2 == 0 {
+                        tally.claims.push((started, Instant::now()));
+                    }
+                    match put {
+                        Ok(_) => {
+                            version += 1;
+                            if step % 2 == 0 {
+                                tally.landed += 1;
+                            }
+                        }
+                        Err(error) => {
+                            assert!(
+                                step % 2 == 0 && is_failed_validation(&error),
+                                "round {round} step {step}: {error:?}"
+                            );
+                            tally.refused += 1;
+                        }
+                    }
+                }
+                tally
+            };
+            let kicked = kick(&db, &user);
+            let (stream, window) = if round % 2 == 0 {
+                tokio::join!(stream, kicked)
+            } else {
+                let (window, stream) = tokio::join!(kicked, stream);
+                (stream, window)
+            };
+
+            tally.add_round(stream, window);
+            assert_kicked_and_unseated(&db, &user, round).await;
+        }
+        tally.assert_raced(&db, "seat PUT vs kick");
+    });
+}
+
+#[tokio::test]
+async fn protects_racing_a_kick_never_seat_a_non_member() {
+    database_test!(|db| async move {
+        server_ready(&db).await;
+        let mut tally = RaceTally::default();
+        for round in 0..CLAIM_RACE_ROUNDS {
+            let user = numbered_user(5_000 + round);
+            insert_members(&db, SERVER, &[user.as_str()]).await;
+            let channels: Vec<String> = (0..CLAIM_RACE_STREAM)
+                .map(|index| race_channel(10_000 + round * 100 + index))
+                .collect();
+            for channel_id in &channels {
+                protectable_in(&db, channel_id, SERVER, 10).await;
+            }
+
+            // Back to back: protect each channel seating the user, while
+            // the kick runs once. No pacing: the kick (three short writes)
+            // beats most protects under MONGODB, so on even rounds it starts
+            // once the first protect has returned (an event, not a timer)
+            // and races the rest; on odd rounds it starts at once and is
+            // polled first. That start alone makes both outcomes certain, so
+            // the overlap guard (`RaceTally`) is what shows a race happened.
+            let first_returned = tokio::sync::Notify::new();
+            let stream = async {
+                let mut tally = RaceTally::default();
+                for channel_id in &channels {
+                    let genesis = submit_in(channel_id, 1, &[USER_A, user.as_str()]);
+                    let started = Instant::now();
+                    let protected = db.protect_channel(channel_id, &genesis, at(0)).await;
+                    tally.claims.push((started, Instant::now()));
+                    first_returned.notify_one();
+                    let flag = db.fetch_channel(channel_id).await.unwrap().is_protected();
+                    match protected {
+                        Ok(outcome) => {
+                            assert!(outcome.claimed.contains(&user), "round {round}");
+                            assert!(flag, "round {round}");
+                            tally.landed += 1;
+                        }
+                        Err(error) => {
+                            assert!(is_failed_validation(&error), "round {round}: {error:?}");
+                            assert!(!flag, "round {round}");
+                            tally.refused += 1;
+                        }
+                    }
+                }
+                tally
+            };
+            let kicked = async {
+                if round % 2 == 0 {
+                    first_returned.notified().await;
+                }
+                kick(&db, &user).await
+            };
+            let (stream, window) = if round % 2 == 0 {
+                tokio::join!(stream, kicked)
+            } else {
+                let (window, stream) = tokio::join!(kicked, stream);
+                (stream, window)
+            };
+
+            tally.add_round(stream, window);
+            assert_kicked_and_unseated(&db, &user, round).await;
+        }
+        tally.assert_raced(&db, "protect vs kick");
+    });
+}
+
+#[tokio::test]
+async fn protects_racing_an_ownership_transfer_never_commit_for_a_non_owner() {
+    database_test!(|db| async move {
+        let mut tally = RaceTally::default();
+        for round in 0..CLAIM_RACE_ROUNDS {
+            let server_id = format!("01HZXSERVER{round:015}");
+            insert_server(&db, &server_id, USER_A).await;
+            insert_members(&db, &server_id, &[USER_A]).await;
+            let channels: Vec<String> = (0..CLAIM_RACE_STREAM)
+                .map(|index| race_channel(20_000 + round * 100 + index))
+                .collect();
+            for channel_id in &channels {
+                protectable_in(&db, channel_id, &server_id, 10).await;
+            }
+
+            // Back to back: protect each channel, while the owner is
+            // transferred once. Right after the transfer lands, read every
+            // channel: a protect that commits later committed for a
+            // non-owner. No pacing: the transfer (one write) would otherwise
+            // always beat the first protect, so on even rounds it starts
+            // once the first protect has returned (an event, not a timer)
+            // and races the rest; on odd rounds it starts at once and is
+            // polled first (REFERENCE never yields mid-stream, so the poll
+            // order is what decides it there).
+            let first_returned = tokio::sync::Notify::new();
+            let stream = async {
+                let mut outcomes = Vec::new();
+                for channel_id in &channels {
+                    let genesis = submit_in(channel_id, 1, &[USER_A]);
+                    outcomes.push(db.protect_channel(channel_id, &genesis, at(0)).await);
+                    first_returned.notify_one();
+                }
+                outcomes
+            };
+            let transfer = async {
+                if round % 2 == 0 {
+                    first_returned.notified().await;
+                }
+                transfer_owner(&db, &server_id, USER_B).await;
+                let mut protected = Vec::new();
+                for channel_id in &channels {
+                    protected.push(db.fetch_channel(channel_id).await.unwrap().is_protected());
+                }
+                protected
+            };
+            let (outcomes, protected_after_transfer) = if round % 2 == 0 {
+                tokio::join!(stream, transfer)
+            } else {
+                let (after, outcomes) = tokio::join!(transfer, stream);
+                (outcomes, after)
+            };
+
+            for (index, outcome) in outcomes.into_iter().enumerate() {
+                let channel_id = &channels[index];
+                match outcome {
+                    Ok(outcome) => {
+                        assert!(!outcome.unchanged, "round {round} channel {index}");
+                        // Protect may only commit while the signer owns the
+                        // server, i.e. before the transfer landed
+                        assert!(
+                            protected_after_transfer[index],
+                            "round {round} channel {index}: protect committed after the owner changed"
+                        );
+                        tally.landed += 1;
+                    }
+                    Err(error) => {
+                        assert!(
+                            matches!(error.error_type, ErrorType::NotOwner),
+                            "round {round} channel {index}: {error:?}"
+                        );
+                        assert!(!db.fetch_channel(channel_id).await.unwrap().is_protected());
+                        tally.refused += 1;
+                    }
+                }
+            }
+        }
+        eprintln!(
+            "protect vs transfer: {} protects landed, {} refused",
+            tally.landed, tally.refused
+        );
+    });
+}
+
+/// A scoped release reads only the `channel_id` of the server's
+/// entitlements (W2a audit WA#6), so an undecodable entitlement of ANOTHER
+/// channel cannot fail it (and with it every join, kick, leave and ban in
+/// the server). A row whose `channel_id` is unusable still fails it, with
+/// nothing released. MONGODB only: the reference store cannot hold an
+/// undecodable row. Mutation: the full `ChannelEntitlement` decode.
+#[cfg(feature = "mongodb")]
+#[tokio::test]
+async fn a_corrupt_entitlement_of_another_channel_does_not_block_a_release() {
+    database_test!(|db| async move {
+        let Database::MongoDb(mongo) = &db else {
+            return;
+        };
+        setup(&db, 10).await;
+        db.protect_channel(CHANNEL, &submit(1, &[USER_A, USER_B, USER_C]), at(0))
+            .await
+            .unwrap();
+
+        // `slot_cap` is not a number and most fields are missing, so every
+        // typed read of the row fails
+        let other = race_channel(6_000);
+        mongo
+            .col::<bson::Document>("channel_entitlements")
+            .insert_one(doc! {
+                "_id": "01HZXCORRUPTENTITLEMENT000",
+                "channel_id": &other,
+                "server_id": SERVER,
+                "slot_cap": "ten",
+            })
+            .await
+            .unwrap();
+        assert!(
+            mongo
+                .col::<ChannelEntitlement>("channel_entitlements")
+                .find_one(doc! { "channel_id": &other })
+                .await
+                .is_err(),
+            "precondition: the corrupt entitlement does not decode"
+        );
+
+        assert_eq!(
+            db.release_channel_seats_for_user(USER_B, Some(SERVER), at(1))
+                .await
+                .unwrap(),
+            vec![CHANNEL]
+        );
+        let seats = db.fetch_channel_seats_for_user(USER_B).await.unwrap();
+        assert_eq!(seats.len(), 1);
+        assert_eq!(seats[0].released_at, Some(at(1)));
+
+        // A row of the server without a usable `channel_id` cannot be
+        // scoped, so it fails the release closed
+        mongo
+            .col::<bson::Document>("channel_entitlements")
+            .insert_one(doc! {
+                "_id": "01HZXCORRUPTENTITLEMENT001",
+                "channel_id": 7,
+                "server_id": SERVER,
+            })
+            .await
+            .unwrap();
+        let error = db
+            .release_channel_seats_for_user(USER_C, Some(SERVER), at(1))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                &error.error_type,
+                ErrorType::DatabaseError { collection, .. } if collection == "channel_entitlements"
+            ),
+            "{error:?}"
+        );
+        let seats = db.fetch_channel_seats_for_user(USER_C).await.unwrap();
+        assert_eq!(seats.len(), 1);
+        assert!(seats[0].is_active(), "a failed release released nothing");
     });
 }

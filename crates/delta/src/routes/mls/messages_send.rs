@@ -166,6 +166,10 @@ pub async fn send_message(
             content_type: E2EEContentType::MlsCtl,
             group_id: Some(group.id.clone()),
             epoch: None,
+            committer: None,
+            added: vec![],
+            removed: vec![],
+            rejoin_intents: vec![],
         });
     }
 

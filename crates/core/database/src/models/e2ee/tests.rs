@@ -126,6 +126,10 @@ fn make_envelope(recipient_user: &str, recipient_device: &str) -> E2EEEnvelope {
         content_type: crate::E2EEContentType::Olm,
         group_id: None,
         epoch: None,
+        committer: None,
+        added: vec![],
+        removed: vec![],
+        rejoin_intents: vec![],
     }
 }
 

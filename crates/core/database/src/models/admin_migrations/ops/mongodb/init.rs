@@ -6,6 +6,35 @@ use crate::mongodb::bson::doc;
 use crate::mongodb::options::CreateCollectionOptions;
 use crate::MongoDb;
 
+/// Name of the `messages` index that makes a protected-channel message's
+/// client message id single-use per channel
+pub(crate) const PROTECTED_NONCE_INDEX_NAME: &str = "channel_nonce_encrypted_unique";
+
+/// The durable `cid` replay guard (docs/protected-channels-design.md 3.10,
+/// W2 Decision 15): at most one message carrying `encrypted` per
+/// `(channel, nonce)`, as one element of a `createIndexes` "indexes" array.
+///
+/// `nonce` is the message-level client message id (the ULID the AAD binds),
+/// NOT `encrypted.nonce`, the AEAD nonce. Plaintext messages never carry
+/// `encrypted` (it is skipped when `None`), so the partial filter leaves them
+/// outside the index and their nonces unconstrained.
+///
+/// The one spec for this file, revision 75 and the tests, which run on
+/// un-migrated databases and must build exactly this index.
+pub(crate) fn protected_nonce_index() -> bson::Document {
+    doc! {
+        "key": {
+            "channel": 1_i32,
+            "nonce": 1_i32
+        },
+        "name": PROTECTED_NONCE_INDEX_NAME,
+        "unique": true,
+        "partialFilterExpression": {
+            "encrypted": { "$exists": true }
+        }
+    }
+}
+
 pub async fn create_database(db: &MongoDb) {
     info!("Creating database.");
     let db = db.db();
@@ -311,6 +340,8 @@ pub async fn create_database(db: &MongoDb) {
                 },
                 "name": "channel_pinned_compound"
             },
+            // ENFORCES one protected-channel message per (channel, nonce).
+            protected_nonce_index(),
         ]
     })
     .await

@@ -72,6 +72,7 @@ pub async fn search(
         &user,
         include_users,
         channel.server(),
+        channel.is_protected(),
     )
     .await
     .map(Json)

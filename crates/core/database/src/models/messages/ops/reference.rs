@@ -19,6 +19,13 @@ impl AbstractMessages for ReferenceDb {
     /// (design 2.6). `channels` is held across the check and the write, in
     /// the global lock order `channels -> messages` (as `protect_channel`),
     /// so a protect can never land between them.
+    ///
+    /// Emulates MongoDB's partial unique index `PROTECTED_NONCE_INDEX_NAME`
+    /// (W2 Decision 15) under the `messages` lock: a message carrying
+    /// `encrypted` whose `(channel, nonce)` another message carrying
+    /// `encrypted` already has is refused with `DuplicateNonce`. Plaintext
+    /// messages are outside the index and never conflict. A duplicate id is
+    /// checked first and stays a `DatabaseError`.
     async fn insert_message(&self, message: &Message) -> Result<()> {
         let channels = self.channels.lock().await;
         message.validate_protected_insert(
@@ -31,6 +38,14 @@ impl AbstractMessages for ReferenceDb {
         let mut messages = self.messages.lock().await;
         if messages.contains_key(&message.id) {
             Err(create_database_error!("insert", "message"))
+        } else if message.encrypted.is_some()
+            && messages.values().any(|stored| {
+                stored.encrypted.is_some()
+                    && stored.channel == message.channel
+                    && stored.nonce == message.nonce
+            })
+        {
+            Err(create_error!(DuplicateNonce))
         } else {
             messages.insert(message.id.to_string(), message.clone());
             Ok(())
@@ -662,5 +677,196 @@ mod tests {
         assert!(db.fetch_message(&second).await.is_err());
         assert_eq!(db.fetch_message(&survivor).await.unwrap().id, survivor);
         assert_eq!(db.fetch_message(&elsewhere).await.unwrap().id, elsewhere);
+    }
+}
+
+/// The emulated `cid` replay guard (W2 Decision 15), the same matrix as the
+/// MongoDB index tests in `messages/ops/mongodb.rs`, driven straight through
+/// `insert_message` so the in-memory nonce cache is not in the path.
+#[cfg(test)]
+mod nonce_tests {
+    use base64::{engine::general_purpose::STANDARD_NO_PAD, Engine as _};
+    use revolt_result::{ErrorType, Result};
+
+    use super::AbstractMessages;
+    use crate::{AbstractChannels, Channel, EncryptedPayload, Message, ReferenceDb};
+
+    const PROTECTED: &str = "01J9Z3K4M5N6P7Q8R9S0T1V2W3";
+    const PROTECTED_OTHER: &str = "01J9Z3K4M5N6P7Q8R9S0T1V2W4";
+    const PLAINTEXT: &str = "01J9Z3K4M5N6P7Q8R9S0T1V2W5";
+    const SERVER: &str = "01J9Z3K4M5N6P7Q8R9S0T1V2W6";
+    const AUTHOR: &str = "01HZXBBBBBBBBBBBBBBBBBBBBB";
+
+    /// Client message ids (`Message.nonce`), ULIDs as a protected send needs
+    const CID: &str = "01JA0000000000000000000C01";
+    const CID_OTHER: &str = "01JA0000000000000000000C02";
+
+    async fn text_channel(db: &ReferenceDb, id: &str, protected: bool) {
+        let channel: Channel = serde_json::from_value(serde_json::json!({
+            "channel_type": "TextChannel",
+            "_id": id,
+            "server": SERVER,
+            "name": "general",
+            "protected": protected,
+        }))
+        .expect("text channel");
+        assert_eq!(channel.is_protected(), protected);
+        db.insert_channel(&channel).await.expect("channel");
+    }
+
+    /// A structurally valid payload (design 2.6); `seed` varies the AEAD
+    /// nonce, so a replay is never caught on `encrypted.nonce` by accident
+    fn payload(seed: u8) -> EncryptedPayload {
+        EncryptedPayload {
+            v: EncryptedPayload::VERSION,
+            group_id: "ab".repeat(32),
+            epoch: 0,
+            sender_device_id: "cd".repeat(16),
+            nonce: STANDARD_NO_PAD.encode([seed; EncryptedPayload::NONCE_BYTES]),
+            ciphertext: STANDARD_NO_PAD.encode([seed; EncryptedPayload::CIPHERTEXT_MIN_BYTES]),
+            sig: STANDARD_NO_PAD.encode([seed; EncryptedPayload::SIG_BYTES]),
+            franking: None,
+        }
+    }
+
+    fn encrypted(id: &str, channel: &str, cid: &str, seed: u8) -> Message {
+        Message {
+            id: id.to_string(),
+            channel: channel.to_string(),
+            author: AUTHOR.to_string(),
+            nonce: Some(cid.to_string()),
+            encrypted: Some(payload(seed)),
+            ..Default::default()
+        }
+    }
+
+    fn plaintext(id: &str, cid: &str) -> Message {
+        Message {
+            id: id.to_string(),
+            channel: PLAINTEXT.to_string(),
+            author: AUTHOR.to_string(),
+            nonce: Some(cid.to_string()),
+            content: Some("hi".to_string()),
+            ..Default::default()
+        }
+    }
+
+    fn assert_duplicate_nonce(result: Result<()>) {
+        let error = result.expect_err("a replayed (channel, nonce) must be refused");
+        assert!(
+            matches!(error.error_type, ErrorType::DuplicateNonce),
+            "expected DuplicateNonce, got {:?}",
+            error.error_type
+        );
+    }
+
+    fn assert_insert_database_error(result: Result<()>) {
+        let error = result.expect_err("a duplicate id must be refused");
+        assert!(
+            matches!(error.error_type, ErrorType::DatabaseError { .. }),
+            "expected DatabaseError, got {:?}",
+            error.error_type
+        );
+    }
+
+    /// A second protected message under a stored `(channel, nonce)` is
+    /// `DuplicateNonce` and is not stored; a new nonce, or the same nonce in
+    /// another channel, is not a replay
+    #[tokio::test]
+    async fn insert_message_refuses_a_replayed_protected_nonce() {
+        let db = ReferenceDb::default();
+        text_channel(&db, PROTECTED, true).await;
+        text_channel(&db, PROTECTED_OTHER, true).await;
+
+        let first = encrypted("01JA0000000000000000000M01", PROTECTED, CID, 1);
+        db.insert_message(&first)
+            .await
+            .expect("the first protected message");
+
+        // A fresh id and a fresh AEAD nonce: the message nonce alone is the key
+        let replay = encrypted("01JA0000000000000000000M02", PROTECTED, CID, 2);
+        assert_duplicate_nonce(db.insert_message(&replay).await);
+        assert!(
+            matches!(
+                db.fetch_message(&replay.id).await.map_err(|e| e.error_type),
+                Err(ErrorType::NotFound)
+            ),
+            "the replay must not be stored"
+        );
+        assert_eq!(db.fetch_message(&first.id).await.expect("kept"), first);
+
+        db.insert_message(&encrypted(
+            "01JA0000000000000000000M03",
+            PROTECTED,
+            CID_OTHER,
+            3,
+        ))
+        .await
+        .expect("a new nonce in the same channel");
+        db.insert_message(&encrypted(
+            "01JA0000000000000000000M04",
+            PROTECTED_OTHER,
+            CID,
+            4,
+        ))
+        .await
+        .expect("the same nonce in another channel");
+    }
+
+    /// Plaintext messages sharing a `(channel, nonce)` are both stored
+    #[tokio::test]
+    async fn insert_message_lets_plaintext_messages_share_a_nonce() {
+        let db = ReferenceDb::default();
+        text_channel(&db, PLAINTEXT, false).await;
+
+        let first = plaintext("01JA0000000000000000000P01", CID);
+        let second = plaintext("01JA0000000000000000000P02", CID);
+        db.insert_message(&first)
+            .await
+            .expect("the first plaintext message");
+        db.insert_message(&second)
+            .await
+            .expect("a plaintext message reusing the nonce");
+
+        for message in [&first, &second] {
+            assert_eq!(
+                db.fetch_message(&message.id).await.expect("stored"),
+                *message
+            );
+        }
+    }
+
+    /// A duplicate id stays a `DatabaseError`, never `DuplicateNonce`
+    #[tokio::test]
+    async fn insert_message_keeps_a_duplicate_id_a_database_error() {
+        let db = ReferenceDb::default();
+        text_channel(&db, PROTECTED, true).await;
+        text_channel(&db, PLAINTEXT, false).await;
+
+        let first = encrypted("01JA0000000000000000000M01", PROTECTED, CID, 1);
+        db.insert_message(&first)
+            .await
+            .expect("the first protected message");
+        // Only the id collides: the nonce is new
+        assert_insert_database_error(
+            db.insert_message(&encrypted(
+                "01JA0000000000000000000M01",
+                PROTECTED,
+                CID_OTHER,
+                2,
+            ))
+            .await,
+        );
+        assert_eq!(db.fetch_message(&first.id).await.expect("kept"), first);
+
+        let stored = plaintext("01JA0000000000000000000P01", CID);
+        db.insert_message(&stored)
+            .await
+            .expect("the first plaintext message");
+        assert_insert_database_error(
+            db.insert_message(&plaintext("01JA0000000000000000000P01", CID_OTHER))
+                .await,
+        );
+        assert_eq!(db.fetch_message(&stored.id).await.expect("kept"), stored);
     }
 }
