@@ -105,6 +105,25 @@ pub async fn object_exists_in_s3(bucket_id: &str, path: &str) -> Result<bool> {
     report_internal_error!(storage().await.object_exists(bucket_id, path).await)
 }
 
+/// One object in a bucket listing
+#[derive(Debug, Clone)]
+pub struct S3ObjectInfo {
+    /// Object key
+    pub key: String,
+    /// Object size in bytes
+    pub size: i64,
+    /// Last modified time in whole seconds since the epoch, None if the store omitted it
+    pub last_modified_unix: Option<i64>,
+}
+
+/// List every object in a bucket (optionally under a key prefix)
+pub async fn list_objects_in_s3(
+    bucket_id: &str,
+    prefix: Option<&str>,
+) -> Result<Vec<S3ObjectInfo>> {
+    report_internal_error!(storage().await.list_objects(bucket_id, prefix).await)
+}
+
 /// Stream an object's raw (still-encrypted) bytes
 pub async fn fetch_stream_from_s3(
     bucket_id: &str,
