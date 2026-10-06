@@ -1,4 +1,5 @@
 pub mod acker;
+pub mod audit_reason;
 pub mod bridge;
 pub mod bulk_permissions;
 pub mod captcha;

@@ -51,8 +51,10 @@ pub enum ChannelPermission {
     ChangeAvatar = 1 << 12,
     /// Remove other's avatars below their ranking
     RemoveAvatars = 1 << 13,
+    /// View the server's audit log
+    ViewAuditLog = 1 << 14,
 
-    // % 7 bits reserved
+    // % 5 bits reserved (15 to 19)
 
     // * Channel permissions
     /// View a channel

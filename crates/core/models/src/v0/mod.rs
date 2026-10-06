@@ -1,4 +1,5 @@
 mod annotations;
+mod audit_log;
 mod bots;
 mod call_recording;
 mod captions;
@@ -42,6 +43,7 @@ mod sessions;
 pub use bots::*;
 pub use call_recording::*;
 pub use annotations::*;
+pub use audit_log::*;
 pub use captions::*;
 pub use discover::*;
 pub use calendar_events::*;
