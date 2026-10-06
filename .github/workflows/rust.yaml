@@ -1,85 +1,114 @@
-name: Rust build, test, and generate specification
+name: Backend CI
 
 on:
   push:
-    branches: [main]
+    branches:
+      - acutest
+      # Lets a CI change be proven on its own branch before it lands.
+      - "ci/**"
   pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
 
 concurrency:
-  group: rust-build-test-${{ github.head_ref || github.ref }}
+  group: backend-ci-${{ github.head_ref || github.ref }}
   cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  # No debug info: the test build is several GB smaller and links faster, and
+  # a failing test still reports its panic message and location.
+  CARGO_PROFILE_DEV_DEBUG: 0
+  CARGO_PROFILE_TEST_DEBUG: 0
 
 jobs:
-  check:
-    name: Rust project
-    runs-on: arc-runner-set
+  test:
+    name: Build and test (reference database)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+
     steps:
-      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup
+          df -h /
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
-      # Using our own runners for now:
-      # - name: Free up disk space
-      #   run: |
-      #     sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc
+      # The same build libraries as the Dockerfile, plus ffmpeg, which the
+      # autumn video tests run.
+      - name: Install system packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config libssl-dev libdav1d-dev ffmpeg
 
-      - name: Setup Mise
-        uses: immich-app/devtools/actions/use-mise@cd24790a7f5f6439ac32cc94f5523cb2de8bfa8c # use-mise-action-v1.1.0
+      - name: Install the pinned Rust toolchain
+        # With no argument, rustup installs the toolchain rust-toolchain.toml names.
+        run: rustup toolchain install --profile minimal
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+      - uses: taiki-e/install-action@183e4297cca2404691e9380e1307288dced5c82a # v2.87.25
         with:
-          github-token: ${{ secrets.GITHUB_TOKEN }}
+          tool: cargo-nextest
 
-      - run: mise build
-      - run: mise docker:start
-    
-      - name: Reference Test
+      # Everything the reference-database tests talk to (Revolt.test.toml),
+      # minus MongoDB: Redis, RabbitMQ, MinIO and the SMTP mock. They run on
+      # this throwaway runner only. compose.yml's createbuckets service is not
+      # used: its minio/mc image is no longer on Docker Hub, so the bucket is
+      # created with a signed S3 request instead.
+      - name: Start test services
+        run: |
+          docker compose up -d redis rabbit minio maildev \
+            || { echo "::error title=Test services::docker compose up failed"; exit 1; }
+          wait_for() {
+            timeout 120 bash -c "until $2; do sleep 2; done" \
+              || { echo "::error title=Test services::$1 did not become ready"; docker compose logs --tail 50; exit 1; }
+          }
+          wait_for Redis "(echo > /dev/tcp/127.0.0.1/6379) 2> /dev/null"
+          wait_for MinIO "curl -sf http://127.0.0.1:14009/minio/health/ready"
+          wait_for "The SMTP mock" "(echo > /dev/tcp/127.0.0.1/14025) 2> /dev/null"
+          # RabbitMQ opens its port before it accepts logins.
+          wait_for RabbitMQ "docker compose exec -T rabbit rabbitmq-diagnostics -q check_running"
+          wait_for "The RabbitMQ management API" \
+            "curl -sf -o /dev/null -u rabbituser:rabbitpass http://127.0.0.1:15672/api/overview"
+          # crond declares this exchange when it starts, and delta only
+          # publishes to it, so on a fresh broker with no crond every ack
+          # publish fails and the ack routes return 500. Declare it the way
+          # crond does (topic, durable); a broker that already has it accepts this.
+          curl -sSf -o /dev/null -u rabbituser:rabbitpass -X PUT -H 'content-type: application/json' \
+            -d '{"type":"topic","durable":true}' http://127.0.0.1:15672/api/exchanges/%2F/revolt.default \
+            || { echo "::error title=Test services::could not declare the revolt.default exchange"; exit 1; }
+          curl -sSf -o /dev/null --aws-sigv4 "aws:amz:minio:s3" --user minioautumn:minioautumn \
+            -X PUT http://127.0.0.1:14009/revolt-uploads \
+            || { echo "::error title=Test services::could not create the MinIO bucket"; exit 1; }
+
+      - name: Test
         env:
+          # REFERENCE is the in-memory database driver. Always set it: with no
+          # TEST_DB the tests read the normal config instead of Revolt.test.toml.
           TEST_DB: REFERENCE
-        continue-on-error: ${{ github.ref_name == 'main' }}
         run: |
-          mise test
+          set -o pipefail
+          cargo nextest run --locked --no-fail-fast 2>&1 | tee nextest.log
 
-      - name: MongoDB Test
-        env:
-          TEST_DB: MONGODB
-          MONGODB: mongodb://localhost
-        continue-on-error: ${{ github.ref_name == 'main' }}
+      # Annotations can be read without signing in to GitHub, unlike the
+      # raw log, so the failing tests and compile errors are listed there too.
+      - name: List failures
+        if: failure()
         run: |
-          mise test
-
-      - name: Start API in background
-        if: github.event_name != 'pull_request' && github.ref_name == 'main'
-        env:
-          TEST_DB: REFERENCE
-        run: |
-          mise build --bin revolt-delta && (mise service:api &)
-
-      - name: Wait for API to go up
-        if: github.event_name != 'pull_request' && github.ref_name == 'main'
-        uses: nev7n/wait_for_response@7fef3c1a6e8939d0b09062f14fec50d3c5d15fa1 # v1.0.1
-        with:
-          url: "http://localhost:14702/"
-
-      - name: Checkout API repository
-        if: github.event_name != 'pull_request' && github.ref_name == 'main'
-        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
-        with:
-          repository: stoatchat/javascript-client-api
-          path: api
-          ssh-key: ${{ secrets.DEPLOY_KEY_JAVASCRIPT_CLIENT_API }}
-
-      - name: Download OpenAPI specification
-        if: github.event_name != 'pull_request' && github.ref_name == 'main'
-        run: curl http://localhost:14702/openapi.json -o api/OpenAPI.json
-
-      - name: Commit changes
-        if: github.event_name != 'pull_request' && github.ref_name == 'main'
-        uses: EndBug/add-and-commit@a94899bca583c204427a224a7af87c02f9b325d5 # v9.1.4
-        with:
-          cwd: "api"
-          add: "*.json"
-          author_name: Sloga CI
-          author_email: stoat-ci@users.noreply.github.com
-          message: "chore: generate OpenAPI specification"
+          [ -f nextest.log ] || exit 0
+          # Strip the colour codes first: nextest starts FAIL lines with one.
+          sed -E 's/\x1b\[[0-9;]*[A-Za-z]//g' nextest.log > nextest.plain
+          list=$(grep -E '^\s*(FAIL|TIMEOUT|SIGSEGV|SIGABRT|SIGKILL|LEAK-FAIL)\b|^\s*Summary\b|^error(\[E[0-9]+\])?:' nextest.plain \
+            | sed -E 's/^\s+//' | sort -u | head -80 | awk '{printf "%s%%0A", $0}')
+          echo "::error title=Backend tests failed::${list:-no FAIL or error lines found; see the log}"
+          # And why: each panic with the lines that follow it (assertion text, left/right).
+          panics=$(grep -E -A6 'panicked at' nextest.plain | head -120 | awk '{printf "%s%%0A", $0}')
+          [ -z "$panics" ] || echo "::error title=Panic messages::${panics}"

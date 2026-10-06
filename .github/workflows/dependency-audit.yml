@@ -1,0 +1,54 @@
+name: Dependency audit
+
+on:
+  push:
+    branches:
+      - acutest
+      - "ci/**"
+  pull_request:
+  schedule:
+    # Daily, so an advisory published against a crate we already use turns
+    # this red even on a day nothing was pushed.
+    - cron: "41 6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: dependency-audit-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  cargo-audit:
+    name: cargo audit (RustSec)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: taiki-e/install-action@183e4297cca2404691e9380e1307288dced5c82a # v2.87.25
+        with:
+          tool: cargo-audit
+
+      # Fails on any vulnerability advisory against Cargo.lock that is not
+      # ignored in .cargo/audit.toml. Unmaintained, unsound and yanked crates
+      # are reported as warnings. cargo-audit is called directly so rustup does
+      # not install the pinned toolchain just to read the lockfile.
+      - name: cargo audit
+        run: |
+          set +e
+          cargo-audit audit --json > audit.json
+          status=$?
+          set -e
+          jq -r '.vulnerabilities.list[]? | "::error title=RustSec advisory::\(.advisory.id) in \(.package.name) \(.package.version): \(.advisory.title)"' audit.json || true
+          warnings=$(jq -r '[.warnings[]?[]? | "\(.kind) \(.advisory.id // "") \(.package.name) \(.package.version)"] | unique | join("%0A")' audit.json || true)
+          [ -z "$warnings" ] || echo "::warning title=RustSec warnings::$warnings"
+          if [ "$status" -ne 0 ]; then
+            echo "cargo audit exited $status"
+            head -c 2000 audit.json
+          fi
+          exit "$status"

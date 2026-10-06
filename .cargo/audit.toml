@@ -1,0 +1,64 @@
+# cargo-audit configuration, read by .github/workflows/dependency-audit.yml.
+#
+# Every advisory below was already in Cargo.lock when the audit gate was added
+# (2026-10-06, acutest 05b50d57). Ignoring them lets the gate start green and
+# still fail on every NEW advisory, whether a dependency change brings it in or
+# it is newly published against a crate we already use (the workflow also runs
+# daily for that case). Each entry says where the crate comes from and what
+# fixes it.
+#
+# To retire an entry: update the crate (`cargo update -p <crate>` for the
+# patch-level fixes), delete the entry, and re-run `cargo audit`.
+# Never add an entry just to turn the gate green.
+
+[advisories]
+ignore = [
+  # rsa 0.7.2 (pushd: web-push > jwt-simple) and 0.9.10 (jsonwebtoken in
+  # delta; livekit-api). Marvin attack: timing side channel on private-key RSA
+  # operations. No fixed rsa release exists. Reachability not yet traced.
+  "RUSTSEC-2023-0071",
+
+  # libgit2-sys 0.14.2 via vergen > git2, used by delta's build script to read
+  # git metadata at compile time. Build time only, never in a running service.
+  # Fixed in libgit2-sys 0.16.2 (needs a newer vergen).
+  "RUSTSEC-2024-0013",
+
+  # idna 0.3.0 (lettre 0.10) and 0.4.0 (validator 0.16): accepts Punycode
+  # labels that decode to plain ASCII. Fixed in idna 1.0, which needs lettre
+  # 0.11 and a newer validator.
+  "RUSTSEC-2024-0421",
+
+  # rustls-webpki 0.101.7 (aws-config, fcm_v1 via rustls 0.21) and 0.102.8
+  # (revolt_a2 via rustls 0.22): certificate revocation and name-constraint
+  # flaws, and a panic on a malformed CRL, when checking the certificates of
+  # outbound HTTPS (S3, FCM, APNs). Fixed in 0.103.13, which needs those
+  # crates on rustls 0.23.
+  "RUSTSEC-2026-0049",
+  "RUSTSEC-2026-0098",
+  "RUSTSEC-2026-0099",
+  "RUSTSEC-2026-0104",
+
+  # lettre 0.10.4: TLS hostname verification is off with the boring-tls
+  # backend. Sloga does not build lettre with boring-tls (no boring crate in
+  # Cargo.lock), so this does not apply. Goes away with lettre 0.11.22.
+  "RUSTSEC-2026-0141",
+
+  # crossbeam-epoch 0.9.18 via moka (autumn and january caches): invalid
+  # pointer dereference in the fmt::Pointer impl of Atomic and Shared.
+  # Fixed in 0.9.20 (`cargo update -p crossbeam-epoch`).
+  "RUSTSEC-2026-0204",
+
+  # h2 0.4.15 (reqwest 0.12) and 0.3.27 (hyper 0.14, pulled in by rocket_http,
+  # aws-smithy-http-client, yup-oauth2, and sentry/fcm_v1 via reqwest 0.11):
+  # a peer can send unbounded empty DATA frames. As a client this may be
+  # reachable from january, which fetches link previews from attacker-chosen
+  # hosts. delta's own Rocket server speaks HTTP/2 only over TLS and runs as
+  # plain HTTP behind Caddy. Fixed in h2 0.4.16 (`cargo update -p h2@0.4.15`);
+  # 0.3.27 stays until all of those crates move off hyper 0.14.
+  "RUSTSEC-2026-0258",
+
+  # rustls 0.23.41 (mongodb, reqwest): TLS 1.3 handshake messages accepted
+  # across encryption-level boundaries. Fixed in 0.23.45
+  # (`cargo update -p rustls@0.23.41`).
+  "RUSTSEC-2026-0285",
+]
