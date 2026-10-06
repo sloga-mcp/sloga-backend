@@ -76,6 +76,15 @@ jobs:
           wait_for "The SMTP mock" "(echo > /dev/tcp/127.0.0.1/14025) 2> /dev/null"
           # RabbitMQ opens its port before it accepts logins.
           wait_for RabbitMQ "docker compose exec -T rabbit rabbitmq-diagnostics -q check_running"
+          wait_for "The RabbitMQ management API" \
+            "curl -sf -o /dev/null -u rabbituser:rabbitpass http://127.0.0.1:15672/api/overview"
+          # crond declares this exchange when it starts, and delta only
+          # publishes to it, so on a fresh broker with no crond every ack
+          # publish fails and the ack routes return 500. Declare it the way
+          # crond does (topic, durable); a broker that already has it accepts this.
+          curl -sSf -o /dev/null -u rabbituser:rabbitpass -X PUT -H 'content-type: application/json' \
+            -d '{"type":"topic","durable":true}' http://127.0.0.1:15672/api/exchanges/%2F/revolt.default \
+            || { echo "::error title=Test services::could not declare the revolt.default exchange"; exit 1; }
           curl -sSf -o /dev/null --aws-sigv4 "aws:amz:minio:s3" --user minioautumn:minioautumn \
             -X PUT http://127.0.0.1:14009/revolt-uploads \
             || { echo "::error title=Test services::could not create the MinIO bucket"; exit 1; }
