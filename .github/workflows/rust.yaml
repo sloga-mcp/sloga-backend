@@ -1,85 +1,91 @@
-name: Rust build, test, and generate specification
+name: Backend CI
 
 on:
   push:
-    branches: [main]
+    branches:
+      - acutest
+      # Lets a CI change be proven on its own branch before it lands.
+      - "ci/**"
   pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
 
 concurrency:
-  group: rust-build-test-${{ github.head_ref || github.ref }}
+  group: backend-ci-${{ github.head_ref || github.ref }}
   cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  # No debug info: the test build is several GB smaller and links faster, and
+  # a failing test still reports its panic message and location.
+  CARGO_PROFILE_DEV_DEBUG: 0
+  CARGO_PROFILE_TEST_DEBUG: 0
 
 jobs:
-  check:
-    name: Rust project
-    runs-on: arc-runner-set
+  test:
+    name: Build and test (reference database)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+
     steps:
-      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup
+          df -h /
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
-      # Using our own runners for now:
-      # - name: Free up disk space
-      #   run: |
-      #     sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc
+      # The same build libraries as the Dockerfile, plus ffmpeg, which the
+      # autumn video tests run.
+      - name: Install system packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config libssl-dev libdav1d-dev ffmpeg
 
-      - name: Setup Mise
-        uses: immich-app/devtools/actions/use-mise@cd24790a7f5f6439ac32cc94f5523cb2de8bfa8c # use-mise-action-v1.1.0
+      - name: Install the pinned Rust toolchain
+        # With no argument, rustup installs the toolchain rust-toolchain.toml names.
+        run: rustup toolchain install --profile minimal
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+      - uses: taiki-e/install-action@183e4297cca2404691e9380e1307288dced5c82a # v2.87.25
         with:
-          github-token: ${{ secrets.GITHUB_TOKEN }}
+          tool: cargo-nextest
 
-      - run: mise build
-      - run: mise docker:start
-    
-      - name: Reference Test
+      # Everything the reference-database tests talk to (Revolt.test.toml),
+      # minus MongoDB: Redis, RabbitMQ, MinIO with its bucket, and the SMTP
+      # mock. They run on this throwaway runner only.
+      - name: Start test services
+        run: |
+          docker compose up -d redis rabbit minio createbuckets maildev
+          for port in 6379 5672 14009 14025; do
+            timeout 120 bash -c "until (echo > /dev/tcp/127.0.0.1/$port) 2> /dev/null; do sleep 1; done" \
+              || { echo "::error::port $port never opened"; docker compose logs; exit 1; }
+          done
+          # RabbitMQ opens its port before it accepts logins.
+          timeout 120 bash -c "until docker compose exec -T rabbit rabbitmq-diagnostics -q check_running; do sleep 2; done"
+
+      - name: Test
         env:
+          # REFERENCE is the in-memory database driver. Always set it: with no
+          # TEST_DB the tests read the normal config instead of Revolt.test.toml.
           TEST_DB: REFERENCE
-        continue-on-error: ${{ github.ref_name == 'main' }}
         run: |
-          mise test
+          set -o pipefail
+          cargo nextest run --locked --no-fail-fast 2>&1 | tee nextest.log
 
-      - name: MongoDB Test
-        env:
-          TEST_DB: MONGODB
-          MONGODB: mongodb://localhost
-        continue-on-error: ${{ github.ref_name == 'main' }}
+      # Annotations can be read without signing in to GitHub, unlike the
+      # raw log, so the failing tests and compile errors are listed there too.
+      - name: List failures
+        if: failure()
         run: |
-          mise test
-
-      - name: Start API in background
-        if: github.event_name != 'pull_request' && github.ref_name == 'main'
-        env:
-          TEST_DB: REFERENCE
-        run: |
-          mise build --bin revolt-delta && (mise service:api &)
-
-      - name: Wait for API to go up
-        if: github.event_name != 'pull_request' && github.ref_name == 'main'
-        uses: nev7n/wait_for_response@7fef3c1a6e8939d0b09062f14fec50d3c5d15fa1 # v1.0.1
-        with:
-          url: "http://localhost:14702/"
-
-      - name: Checkout API repository
-        if: github.event_name != 'pull_request' && github.ref_name == 'main'
-        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
-        with:
-          repository: stoatchat/javascript-client-api
-          path: api
-          ssh-key: ${{ secrets.DEPLOY_KEY_JAVASCRIPT_CLIENT_API }}
-
-      - name: Download OpenAPI specification
-        if: github.event_name != 'pull_request' && github.ref_name == 'main'
-        run: curl http://localhost:14702/openapi.json -o api/OpenAPI.json
-
-      - name: Commit changes
-        if: github.event_name != 'pull_request' && github.ref_name == 'main'
-        uses: EndBug/add-and-commit@a94899bca583c204427a224a7af87c02f9b325d5 # v9.1.4
-        with:
-          cwd: "api"
-          add: "*.json"
-          author_name: Sloga CI
-          author_email: stoat-ci@users.noreply.github.com
-          message: "chore: generate OpenAPI specification"
+          [ -f nextest.log ] || exit 0
+          list=$(grep -E '^\s*(FAIL|TIMEOUT|SIGSEGV|SIGABRT|SIGKILL)\b|^error(\[E[0-9]+\])?:' nextest.log \
+            | sed -E 's/^\s+//; s/\x1b\[[0-9;]*m//g' | sort -u | head -80 | awk '{printf "%s%%0A", $0}')
+          echo "::error title=Backend tests failed::${list:-no FAIL or error lines found; see the log}"
