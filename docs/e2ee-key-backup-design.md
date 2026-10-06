@@ -360,10 +360,13 @@ replacement §6.3 depends on):
 - **`GET /e2ee/backup`** — the restore path. The restoring device has NO
   keys yet, so a device-bound session is impossible by construction; gate
   with a fresh MFA **`ValidatedTicket`** (single-use, 5-minute TTL,
-  consumed on match — the first-key-publication pattern) **with an explicit
-  `ticket.account_id == user.id` bind** (M8 — the `ValidatedTicket` guard
-  proves *some* account did MFA, not that it is THIS user; a key-egress
-  route must bind them) + a NEW tight ratelimit bucket `e2ee_backup_get`
+  consumed on match — the first-key-publication pattern) **bound to the
+  session's account**. Since SEC-001 the `ValidatedTicket` guard itself
+  binds the ticket to the session's account: a ticket minted on another
+  account is refused with 403 before the route runs, and is not consumed.
+  The route keeps its explicit `ticket.account_id == user.id` check (M8,
+  added when the guard proved only that *some* account did MFA) as defense
+  in depth. Plus a NEW tight ratelimit bucket `e2ee_backup_get`
   (limit 3, added to `util/ratelimits.rs` via
   `("e2ee", Some("backup"), Method::Get) => ("e2ee_backup_get", None)`,
   L5). Returns ALL of the authenticated user's backups (`[{device_id,

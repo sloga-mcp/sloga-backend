@@ -113,12 +113,21 @@ and bonfire.
 - **Timing-attack mitigation:** random 0–1000ms sleep at the top of *every* login.
 - Email normalised; unverified accounts rejected; password checked for compromise
   (`assert_safe`, HIBP-style) *before* verifying.
-- **Account lockout (`Lockout`)**: wrong passwords increment a counter — 3rd = 1min lock,
-  4th = 5min, 5th+ = 1hr. Cleared on success.
+- **Account lockout (`Lockout`)**: every failed password or MFA attempt (TOTP, recovery
+  code or password; at login and on `PUT /auth/mfa/ticket`) increments one atomic counter:
+  3rd = 1min lock, 4th = 5min, 5th+ = 1hr. A request that arrives while locked is refused
+  without being checked. The session-side password checks (`change_password`,
+  `change_email`, `change_username`) count wrong passwords too. The lockout is cleared
+  only once MFA passes, or on a correct password for an account without MFA; for an MFA
+  account a correct password alone does not clear it. A password reset also clears it.
 - **MFA:** if `account.mfa.is_active()`, login returns `ResponseLogin::MFA { ticket,
   allowed_methods }` instead of a session. Client re-calls login with `DataLogin::MFA {
-  mfa_ticket, mfa_response }`; the ticket is resolved and the response consumed. MFA
-  tickets, TOTP, and recovery codes live under `/auth/mfa`.
+  mfa_ticket, mfa_response }`; the ticket is resolved and the response consumed. A login
+  ticket allows at most 3 MFA attempts and is single use: it is claimed atomically before
+  the session is created. MFA tickets, TOTP, and recovery codes live under `/auth/mfa`.
+  A validated ticket works only with a session of the account it was minted for: the
+  ticket guards answer 403 otherwise, without consuming the ticket, and refuse any
+  request that carries `x-bot-token`.
 - Disabled accounts → `ResponseLogin::Disabled`. Success → `account.create_session()`,
   which also emits an `EventV1::CreateSession` over the event bus.
 

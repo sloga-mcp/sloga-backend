@@ -1,7 +1,7 @@
-//! Create a new MFA ticket or validate an existing one.
+//! Create a validated MFA ticket for the current session.
 //! PUT /mfa/ticket
-use revolt_result::{Result, create_error};
-use revolt_database::{Account, Database, MFATicket, UnvalidatedTicket};
+use revolt_result::Result;
+use revolt_database::{Account, Database, MFATicket};
 use revolt_models::v0;
 use rocket::serde::json::Json;
 use rocket::State;
@@ -9,27 +9,16 @@ use rocket::State;
 
 /// # Create MFA ticket
 ///
-/// Create a new MFA ticket or validate an existing one.
+/// Verify an MFA response for the account of the current session and
+/// create a new validated ticket.
 #[openapi(tag = "MFA")]
 #[put("/ticket", data = "<data>")]
 pub async fn create_ticket(
     db: &State<Database>,
-    account: Option<Account>,
-    existing_ticket: Option<UnvalidatedTicket>,
+    mut account: Account,
     data: Json<v0::MFAResponse>,
 ) -> Result<Json<v0::MFATicket>> {
-    // Find the relevant account
-    let mut account = match (account, existing_ticket) {
-        (Some(_), Some(_)) => return Err(create_error!(OperationFailed)),
-        (Some(account), _) => account,
-        (_, Some(ticket)) => {
-            db.delete_ticket(&ticket.id).await?;
-            db.fetch_account(&ticket.account_id).await?
-        }
-        _ => return Err(create_error!(InvalidToken)),
-    };
-
-    // Validate the MFA response
+    // Validate the MFA response; this counts an account lockout attempt
     account
         .consume_mfa_response(db, data.into_inner(), None)
         .await?;
@@ -43,7 +32,7 @@ pub async fn create_ticket(
 #[cfg(test)]
 mod tests {
     use crate::{rocket, util::test::TestHarness};
-    use revolt_database::Totp;
+    use revolt_database::{MFATicket, Totp};
     use rocket::http::{Header, Status};
     use revolt_models::v0;
     use revolt_result::{Error, ErrorType};
@@ -169,5 +158,46 @@ mod tests {
             res.into_json::<Error>().await.unwrap().error_type,
             ErrorType::DisallowedMFAMethod,
         ));
+    }
+
+    #[test]
+    fn failure_unvalidated_ticket_without_session() {
+        crate::util::test::rt().block_on(failure_unvalidated_ticket_without_session_case())
+    }
+
+    /// A login ticket alone no longer stands in for a session: the request
+    /// is refused before the response is checked, and the ticket is intact.
+    async fn failure_unvalidated_ticket_without_session_case() {
+        let harness = TestHarness::new().await;
+        let (mut account, _, _) = harness.new_user().await;
+
+        let totp = Totp::Enabled {
+            secret: "secret".to_string(),
+        };
+
+        account.mfa.totp_token = totp.clone();
+        account.save(&harness.db).await.unwrap();
+
+        let ticket = MFATicket::new(account.id.to_string(), false);
+        ticket.save(&harness.db).await.unwrap();
+
+        let res = harness.client
+            .put("/auth/mfa/ticket")
+            .header(Header::new("X-MFA-Ticket", ticket.token.clone()))
+            .body(
+                json!({
+                    "totp_code": totp.generate_code().unwrap()
+                })
+                .to_string(),
+            )
+            .dispatch()
+            .await;
+
+        assert_eq!(res.status(), Status::Unauthorized);
+        assert!(harness
+            .db
+            .fetch_ticket_by_token(&ticket.token)
+            .await
+            .is_ok());
     }
 }

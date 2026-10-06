@@ -6,6 +6,9 @@ use revolt_result::Result;
 
 use crate::{Database, MultiFactorAuthentication};
 
+/// Maximum number of MFA attempts a single ticket allows
+pub const MFA_TICKET_MAX_ATTEMPTS: u8 = 3;
+
 auto_derived_partial!(
     /// Multi-factor auth ticket
     pub struct MFATicket {
@@ -29,6 +32,11 @@ auto_derived_partial!(
 
         /// TOTP code at time of ticket creation
         pub last_totp_code: Option<String>,
+
+        /// Number of MFA attempts counted against this ticket
+        /// (absent on tickets written before the counter existed)
+        #[serde(default)]
+        pub attempts: u8,
     },
     "PartialMFATicket"
 );
@@ -53,6 +61,7 @@ impl MFATicket {
             validated,
             authorised: false,
             last_totp_code: None,
+            attempts: 0,
         }
     }
 
@@ -79,6 +88,9 @@ impl MFATicket {
     }
 
     /// Claim and remove this MFA ticket
+    ///
+    /// Fails with `InvalidToken` if the ticket expired or was already
+    /// claimed, so of two concurrent claims exactly one succeeds
     pub async fn claim(&self, db: &Database) -> Result<()> {
         if self.is_expired() {
             return Err(create_error!(InvalidToken));

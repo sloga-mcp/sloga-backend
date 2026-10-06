@@ -1,3 +1,4 @@
+use iso8601_timestamp::Timestamp;
 use once_cell::sync::Lazy;
 use regex::Regex;
 use revolt_database::{Database, User, Account};
@@ -42,9 +43,20 @@ pub async fn change_username(
         })
     })?;
 
-    account
-        .verify_password(&data.password)
-        .map_err(|_| create_error!(InvalidCredentials))?;
+    // A locked account cannot probe the password
+    if let Some(lockout) = &account.lockout {
+        if let Some(expiry) = lockout.expiry {
+            if expiry > Timestamp::now_utc() {
+                return Err(create_error!(LockedOut));
+            }
+        }
+    }
+
+    // Count a wrong password towards the lockout
+    if account.verify_password(&data.password).is_err() {
+        db.bump_lockout_count(&account.id).await?;
+        return Err(create_error!(InvalidCredentials));
+    }
 
     user.update_username(db, data.username).await?;
     Ok(Json(user.into(db, None).await))

@@ -31,7 +31,6 @@ pub async fn password_reset(
     // Update the account
     account.password = hash_password(data.password)?;
     account.password_reset = None;
-    account.lockout = None;
 
     // The token was mailed to `account.email`, so using it proves the same
     // thing the verification link does. Without this an unverified account
@@ -48,6 +47,12 @@ pub async fn password_reset(
     if data.remove_sessions {
         account.delete_all_sessions(db, None).await?;
     }
+
+    // Saving never writes the lockout, so clear it directly. Together with
+    // `remove_sessions` this is the way back in for an account locked out
+    // by someone holding one of its sessions. It runs after the purge so a
+    // failure here cannot leave those sessions alive.
+    db.set_lockout(&account.id, None).await?;
 
     Ok(EmptyResponse)
 }
