@@ -1,9 +1,9 @@
 use std::time::{Duration, SystemTime};
 
-use crate::{AbstractMFATickets, MFATicket, MongoDb};
+use crate::{AbstractMFATickets, MFATicket, MongoDb, MFA_TICKET_MAX_ATTEMPTS};
 use bson::{to_document, Document};
 use iso8601_timestamp::Timestamp;
-use mongodb::options::UpdateOptions;
+use mongodb::options::{FindOneAndUpdateOptions, ReturnDocument, UpdateOptions};
 use revolt_result::Result;
 use ulid::Ulid;
 
@@ -46,9 +46,56 @@ impl AbstractMFATickets for MongoDb {
             .map(|_| ())
     }
 
+    /// Atomically count one attempt against a ticket
+    ///
+    /// The attempt cap and the increment happen under one document lock, so
+    /// concurrent requests cannot all read the same count. Never upserts: a
+    /// ticket that was claimed or deleted stays gone.
+    async fn reserve_ticket_attempt(&self, id: &str) -> Result<MFATicket> {
+        let ticket = self
+            .col::<MFATicket>(COL)
+            .find_one_and_update(
+                // Only one `_id` key: a second one would replace the first,
+                // and the filter could then match another account's ticket
+                doc! {
+                    "_id": id,
+                    "$or": [
+                        { "attempts": { "$lt": MFA_TICKET_MAX_ATTEMPTS as i32 } },
+                        // Tickets written before the counter existed
+                        { "attempts": { "$exists": false } },
+                    ]
+                },
+                doc! {
+                    "$inc": { "attempts": 1 }
+                },
+            )
+            .with_options(
+                FindOneAndUpdateOptions::builder()
+                    .return_document(ReturnDocument::After)
+                    .build(),
+            )
+            .await
+            .map_err(|_| create_database_error!("find_one_and_update", COL))?
+            .ok_or_else(|| create_error!(InvalidToken))?;
+
+        if ticket.is_expired() {
+            return Err(create_error!(InvalidToken));
+        }
+
+        Ok(ticket)
+    }
+
     /// Delete ticket
+    ///
+    /// Fails if nothing was deleted, so a ticket can only be claimed once
     async fn delete_ticket(&self, id: &str) -> Result<()> {
-        query!(self, delete_one_by_id, COL, id).map(|_| ())
+        query!(self, delete_one_by_id, COL, id).and_then(|result| {
+            if result.deleted_count == 0 {
+                Err(create_error!(InvalidToken))
+            } else {
+                Ok(())
+            }
+        })
     }
 
     /// Delete all expired tickets

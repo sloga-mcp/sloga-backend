@@ -1177,7 +1177,8 @@ async fn backup_get_requires_mfa_and_binds_to_user_case() {
         .header(Header::new("X-MFA-Ticket", foreign))
         .dispatch()
         .await;
-    assert_eq!(response.status(), Status::Unauthorized);
+    // The guard now rejects a ticket from another account before the route's own check
+    assert_eq!(response.status(), Status::Forbidden);
 }
 
 #[test]

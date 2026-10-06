@@ -1,6 +1,6 @@
 use std::time::{Duration, SystemTime};
 
-use crate::{AbstractMFATickets, MFATicket, ReferenceDb};
+use crate::{AbstractMFATickets, MFATicket, ReferenceDb, MFA_TICKET_MAX_ATTEMPTS};
 use iso8601_timestamp::Timestamp;
 use revolt_result::Result;
 use ulid::Ulid;
@@ -31,6 +31,23 @@ impl AbstractMFATickets for ReferenceDb {
         let mut tickets = self.tickets.lock().await;
         tickets.insert(ticket.id.to_string(), ticket.clone());
         Ok(())
+    }
+
+    /// Atomically count one attempt against a ticket
+    ///
+    /// The check and the increment both happen under the tickets lock
+    async fn reserve_ticket_attempt(&self, id: &str) -> Result<MFATicket> {
+        let mut tickets = self.tickets.lock().await;
+        let ticket = tickets
+            .get_mut(id)
+            .ok_or_else(|| create_error!(InvalidToken))?;
+
+        if ticket.is_expired() || ticket.attempts >= MFA_TICKET_MAX_ATTEMPTS {
+            return Err(create_error!(InvalidToken));
+        }
+
+        ticket.attempts += 1;
+        Ok(ticket.clone())
     }
 
     /// Delete ticket

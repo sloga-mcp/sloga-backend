@@ -1,13 +1,12 @@
 //! Login to an account
 //! POST /session/login
-use std::ops::Add;
 use std::time::Duration;
 
 use tokio::time::sleep;
 use iso8601_timestamp::Timestamp;
 use revolt_database::{
     util::{email::normalise_email, password::assert_safe},
-    Database, EmailVerification, Lockout, MFATicket,
+    Database, EmailVerification, MFATicket,
 };
 use revolt_models::v0;
 use revolt_result::{create_error, Result};
@@ -48,7 +47,8 @@ pub async fn login(
                 // Make sure password has not been compromised
                 assert_safe(&password).await?;
 
-                // Check for account lockout
+                // Check for account lockout (read-only; a request that
+                // arrives while locked does not extend the lockout)
                 if let Some(lockout) = &account.lockout {
                     if let Some(expiry) = lockout.expiry {
                         if expiry > Timestamp::now_utc() {
@@ -57,47 +57,34 @@ pub async fn login(
                     }
                 }
 
-                // Verify the password is correct.
-                if let Err(err) = account.verify_password(&password) {
-                    // Lock out account if attempts are too high
-                    if let Some(lockout) = &mut account.lockout {
-                        lockout.attempts += 1;
+                // Attempts are counted atomically in the database (3 free,
+                // then locked for 1 minute, 5 minutes on the 4th and 1 hour
+                // on each subsequent one); `account.save` never writes the
+                // lockout
+                if !account.mfa.is_active() {
+                    // The password is the only factor: count the attempt
+                    // BEFORE verifying it, so concurrent guesses cannot
+                    // share a stale counter
+                    db.reserve_lockout_attempt(&account.id).await?;
 
-                        // Allow 3 attempts
-                        //
-                        // Lockout for 1 minute on 3rd attempt
-                        // Lockout for 5 minutes on 4th attempt
-                        // Lockout for 1 hour on each subsequent attempt
-                        if lockout.attempts >= 3 {
-                            lockout.expiry = Some(Timestamp::now_utc().add(Duration::from_secs(
-                                if lockout.attempts >= 5 {
-                                    3600
-                                } else if lockout.attempts == 4 {
-                                    300
-                                } else {
-                                    60
-                                },
-                            )));
-                        }
-                    } else {
-                        account.lockout = Some(Lockout {
-                            attempts: 1,
-                            expiry: None,
-                        });
+                    // A wrong password stays counted
+                    account.verify_password(&password)?;
+
+                    // The reservation always leaves a lockout behind, and
+                    // the copy fetched above predates it, so clear it
+                    // unconditionally
+                    db.set_lockout(&account.id, None).await?;
+                    account.lockout = None;
+                } else {
+                    // Count only a wrong password: counting a correct one
+                    // would lock users out over MFA typos. The lockout is
+                    // cleared only once MFA passes, so a correct password
+                    // cannot reset the MFA attempt count.
+                    if let Err(err) = account.verify_password(&password) {
+                        db.bump_lockout_count(&account.id).await?;
+                        return Err(err);
                     }
 
-                    account.save(db).await?;
-                    return Err(err);
-                }
-
-                // Clear lockout information if present
-                if account.lockout.is_some() {
-                    account.lockout = None;
-                    account.save(db).await?;
-                }
-
-                // Check whether an MFA step is required
-                if account.mfa.is_active() {
                     // Create a new ticket
                     let mut ticket = MFATicket::new(account.id, false);
                     ticket.populate(&account.mfa).await;
@@ -133,12 +120,28 @@ pub async fn login(
             // Find the corresponding account
             let mut account = db.fetch_account(&ticket.account_id).await?;
 
+            // Check for account lockout (read-only), before either path
+            if let Some(lockout) = &account.lockout {
+                if let Some(expiry) = lockout.expiry {
+                    if expiry > Timestamp::now_utc() {
+                        return Err(create_error!(LockedOut));
+                    }
+                }
+            }
+
             // Verify the MFA response
             if let Some(mfa_response) = mfa_response {
+                // Counts one ticket attempt and one lockout attempt
+                // atomically; on success the ticket is already claimed
+                // (single use) and the lockout cleared
                 account
-                    .consume_mfa_response(db, mfa_response, Some(ticket))
+                    .consume_mfa_response(db, mfa_response, Some(&ticket))
                     .await?;
-            } else if !ticket.authorised {
+            } else if ticket.authorised {
+                // Single use: of two concurrent requests only one claims
+                // the ticket, and the other gets no session
+                ticket.claim(db).await?;
+            } else {
                 return Err(create_error!(InvalidToken));
             }
 
@@ -533,7 +536,7 @@ mod tests {
     async fn fail_locked_account_case() {
         let harness = TestHarness::new().await;
 
-        let mut account = Account::new(
+        let account = Account::new(
             &harness.db,
             "example@validemail.com".into(),
             "password_insecure".into(),
@@ -624,13 +627,18 @@ mod tests {
             res.into_json::<Error>().await.unwrap().error_type,
             ErrorType::LockedOut,
         ));
-        // Pretend it expired
-        account.lockout = Some(Lockout {
-            attempts: 9001,
-            expiry: Some(Timestamp::now_utc()),
-        });
-
-        account.save(&harness.db).await.unwrap();
+        // Pretend it expired (`save` never writes the lockout)
+        harness
+            .db
+            .set_lockout(
+                &account.id,
+                Some(Lockout {
+                    attempts: 9001,
+                    expiry: Some(Timestamp::now_utc()),
+                }),
+            )
+            .await
+            .unwrap();
 
         // Once it expires, we can log in.
         let res = harness.client

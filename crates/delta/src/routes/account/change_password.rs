@@ -1,5 +1,6 @@
 //! Change account password.
 //! PATCH /account/change/password
+use iso8601_timestamp::Timestamp;
 use revolt_database::{
     util::password::{assert_safe, hash_password},
     Account, Database, ValidatedTicket,
@@ -23,6 +24,15 @@ pub async fn change_password(
 ) -> Result<EmptyResponse> {
     let data = data.into_inner();
 
+    // A locked account cannot probe the ticket or the password
+    if let Some(lockout) = &account.lockout {
+        if let Some(expiry) = lockout.expiry {
+            if expiry > Timestamp::now_utc() {
+                return Err(create_error!(LockedOut));
+            }
+        }
+    }
+
     if account.mfa.is_active() && validated_ticket.is_none() {
         return Err(create_error!(InvalidCredentials));
     }
@@ -30,8 +40,11 @@ pub async fn change_password(
     // Verify password can be used
     assert_safe(&data.password).await?;
 
-    // Ensure given password is correct
-    account.verify_password(&data.current_password)?;
+    // Ensure given password is correct, counting a wrong one
+    if let Err(error) = account.verify_password(&data.current_password) {
+        db.bump_lockout_count(&account.id).await?;
+        return Err(error);
+    }
 
     // Hash and replace password
     account.password = hash_password(data.password)?;
