@@ -1,5 +1,6 @@
 //! Change account email.
 //! PATCH /account/change/email
+use iso8601_timestamp::Timestamp;
 use revolt_database::util::email::validate_email;
 use revolt_database::{Account, Database, ValidatedTicket};
 use revolt_models::v0;
@@ -23,12 +24,24 @@ pub async fn change_email(
 
     validate_email(&data.email)?;
 
+    // A locked account cannot probe the ticket or the password
+    if let Some(lockout) = &account.lockout {
+        if let Some(expiry) = lockout.expiry {
+            if expiry > Timestamp::now_utc() {
+                return Err(create_error!(LockedOut));
+            }
+        }
+    }
+
     if account.mfa.is_active() && validated_ticket.is_none() {
         return Err(create_error!(InvalidCredentials));
     }
 
-    // Ensure given password is correct
-    account.verify_password(&data.current_password)?;
+    // Ensure given password is correct, counting a wrong one
+    if let Err(error) = account.verify_password(&data.current_password) {
+        db.bump_lockout_count(&account.id).await?;
+        return Err(error);
+    }
 
     // Send email verification for new email
     account

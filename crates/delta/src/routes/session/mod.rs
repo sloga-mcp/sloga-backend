@@ -8,6 +8,9 @@ pub mod logout;
 pub mod revoke;
 pub mod revoke_all;
 
+#[cfg(test)]
+mod mfa_limit_tests;
+
 pub fn routes() -> (Vec<Route>, OpenApi) {
     openapi_get_routes_spec![
         login::login,

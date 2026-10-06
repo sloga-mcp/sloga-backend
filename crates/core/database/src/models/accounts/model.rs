@@ -11,7 +11,7 @@ use crate::{
         email::{email_templates, normalise_email, send_email},
         password::hash_password,
     },
-    Database, MFATicket, Session,
+    Database, MFATicket, Session, MFA_TICKET_MAX_ATTEMPTS,
 };
 use revolt_models::v0;
 
@@ -47,6 +47,9 @@ auto_derived_partial!(
         pub deletion: Option<DeletionInfo>,
 
         /// Account lockout
+        ///
+        /// Written only by the lockout ops, never by `save_account`
+        #[serde(default)]
         pub lockout: Option<Lockout>,
 
         /// Multi-factor authentication information
@@ -330,12 +333,14 @@ impl Account {
                 apple_id: None,
             };
 
-            // Send email verification
+            // Send email verification, then insert the account; the
+            // targeted write in `start_email_verification` needs an
+            // existing document, so the first write here stays a full save
             if verify_email {
-                account.start_email_verification(db).await?;
-            } else {
-                account.save(db).await?;
+                account.prepare_email_verification().await?;
             }
+
+            account.save(db).await?;
 
             // Create and push event
             EventV1::CreateAccount {
@@ -443,7 +448,15 @@ impl Account {
     }
 
     /// Send account verification email
+    ///
+    /// Writes only `verification`, so a stale copy cannot revert other fields
     pub async fn start_email_verification(&mut self, db: &Database) -> Result<()> {
+        self.prepare_email_verification().await?;
+        db.set_email_verification(&self.id, &self.verification).await
+    }
+
+    /// Send the verification email and update `verification` in memory
+    async fn prepare_email_verification(&mut self) -> Result<()> {
         let config = config().await;
 
         if !config.api.smtp.host.is_empty() {
@@ -474,7 +487,7 @@ impl Account {
             self.verification = EmailVerification::Verified;
         }
 
-        self.save(db).await
+        Ok(())
     }
 
     /// Send account verification to new email
@@ -512,12 +525,18 @@ impl Account {
                     ))
                     .unwrap(),
             };
+
+            // Write only `verification`, so a stale copy held across the
+            // SMTP round trip cannot revert other fields
+            db.set_email_verification(&self.id, &self.verification).await
         } else {
             self.email_normalised = normalise_email(new_email.clone());
             self.email = new_email;
-        }
 
-        self.save(db).await
+            // No targeted op covers the email fields, and no SMTP round
+            // trip happens on this branch
+            self.save(db).await
+        }
     }
 
     /// Send password reset email
@@ -562,7 +581,9 @@ impl Account {
             return Err(create_error!(OperationFailed));
         }
 
-        self.save(db).await
+        // Write only `password_reset`, so a stale copy held across the SMTP
+        // round trip cannot revert the password, MFA or lockout
+        db.set_password_reset(&self.id, self.password_reset.clone()).await
     }
 
     /// Begin account deletion process by sending confirmation email
@@ -618,57 +639,112 @@ impl Account {
     }
 
     /// Validate an MFA response
+    ///
+    /// One ticket attempt (if a ticket is given) and one account lockout
+    /// attempt are counted atomically BEFORE the response is verified, so
+    /// concurrent guesses never share a stale counter. A failure deletes a
+    /// ticket that has used its last attempt. A success claims the ticket
+    /// (single use), consumes the recovery code if one was used and clears
+    /// the lockout. The account document is never saved whole here.
     pub async fn consume_mfa_response(
         &mut self,
         db: &Database,
         response: v0::MFAResponse,
-        ticket: Option<MFATicket>,
+        ticket: Option<&MFATicket>,
     ) -> Result<()> {
+        // Count one attempt against the ticket, and check that the driver
+        // returned this ticket and that it belongs to this account
+        let ticket = if let Some(ticket) = ticket {
+            let reserved = db.reserve_ticket_attempt(&ticket.id).await?;
+            if reserved.id != ticket.id || reserved.account_id != self.id {
+                return Err(create_error!(InvalidToken));
+            }
+
+            Some(reserved)
+        } else {
+            None
+        };
+
+        let recovery_code = match self.verify_mfa_attempt(db, response, ticket.as_ref()).await {
+            Ok(recovery_code) => recovery_code,
+            Err(error) => {
+                // Burn a ticket that has no attempts left
+                if let Some(ticket) = &ticket {
+                    if ticket.attempts >= MFA_TICKET_MAX_ATTEMPTS {
+                        let _ = db.delete_ticket(&ticket.id).await;
+                    }
+                }
+
+                return Err(error);
+            }
+        };
+
+        // Single use: a request that loses the race for the ticket fails here
+        if let Some(ticket) = &ticket {
+            ticket.claim(db).await?;
+        }
+
+        // Atomic, so two requests cannot both spend the same recovery code
+        if let Some(code) = recovery_code {
+            db.consume_recovery_code(&self.id, &code).await?;
+            self.mfa.recovery_codes.retain(|x| x != &code);
+        }
+
+        db.set_lockout(&self.id, None).await?;
+        self.lockout = None;
+
+        Ok(())
+    }
+
+    /// Count one lockout attempt, then verify an MFA response
+    ///
+    /// Returns the recovery code to consume if the response used one. Writes
+    /// nothing besides the lockout attempt; the caller handles the rest.
+    async fn verify_mfa_attempt(
+        &self,
+        db: &Database,
+        response: v0::MFAResponse,
+        ticket: Option<&MFATicket>,
+    ) -> Result<Option<String>> {
+        db.reserve_lockout_attempt(&self.id).await?;
+
         let allowed_methods = self.mfa.get_methods();
 
         match response {
             v0::MFAResponse::Password { password } => {
                 if allowed_methods.contains(&MFAMethod::Password) {
-                    self.verify_password(&password)
+                    self.verify_password(&password).map(|_| None)
                 } else {
                     Err(create_error!(DisallowedMFAMethod))
                 }
             }
             v0::MFAResponse::Totp { totp_code } => {
-                if allowed_methods.contains(&MFAMethod::Totp) {
-                    if let Totp::Enabled { .. } = &self.mfa.totp_token {
-                        // Use TOTP code at generation if applicable
-                        if let Some(ticket) = ticket {
-                            if let Some(code) = ticket.last_totp_code {
-                                if code == totp_code {
-                                    return Ok(());
-                                }
-                            }
-                        }
+                // `get_methods` only offers TOTP while it is enabled
+                if !allowed_methods.contains(&MFAMethod::Totp)
+                    || self.mfa.totp_token.is_disabled()
+                {
+                    return Err(create_error!(DisallowedMFAMethod));
+                }
 
-                        // Otherwise read current TOTP token
-                        if self.mfa.totp_token.generate_code()? == totp_code {
-                            Ok(())
-                        } else {
-                            Err(create_error!(InvalidToken))
-                        }
-                    } else {
-                        unreachable!()
+                // Use TOTP code at generation if applicable
+                if let Some(code) = ticket.and_then(|ticket| ticket.last_totp_code.as_ref()) {
+                    if code == &totp_code {
+                        return Ok(None);
                     }
+                }
+
+                // Otherwise read current TOTP token
+                if self.mfa.totp_token.generate_code()? == totp_code {
+                    Ok(None)
                 } else {
-                    Err(create_error!(DisallowedMFAMethod))
+                    Err(create_error!(InvalidToken))
                 }
             }
             v0::MFAResponse::Recovery { recovery_code } => {
                 if allowed_methods.contains(&MFAMethod::Recovery) {
-                    if let Some(index) = self
-                        .mfa
-                        .recovery_codes
-                        .iter()
-                        .position(|x| x == &recovery_code)
-                    {
-                        self.mfa.recovery_codes.remove(index);
-                        self.save(db).await
+                    // Membership only; the code is consumed on success
+                    if self.mfa.recovery_codes.contains(&recovery_code) {
+                        Ok(Some(recovery_code))
                     } else {
                         Err(create_error!(InvalidToken))
                     }

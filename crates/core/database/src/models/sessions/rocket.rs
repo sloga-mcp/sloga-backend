@@ -11,20 +11,28 @@ impl<'r> FromRequest<'r> for Session {
     type Error = Error;
 
     async fn from_request(request: &'r Request<'_>) -> Outcome<Self, Self::Error> {
-        if let Some(token) = request.headers().get("x-session-token").next() {
-            if let Ok(session) = request
-                .rocket()
-                .state::<Database>()
-                .expect("`Database`")
-                .fetch_session_by_token(token)
-                .await
-            {
-                Outcome::Success(session)
-            } else {
-                Outcome::Error((Status::Unauthorized, create_error!(InvalidSession)))
-            }
-        } else {
-            Outcome::Error((Status::Unauthorized, create_error!(MissingHeaders)))
-        }
+        // Cached per request: the `User`, ratelimiter and MFA ticket guards
+        // all resolve the session, and should share one lookup
+        let outcome: &Outcome<Session, Error> = request
+            .local_cache_async(async {
+                if let Some(token) = request.headers().get("x-session-token").next() {
+                    if let Ok(session) = request
+                        .rocket()
+                        .state::<Database>()
+                        .expect("`Database`")
+                        .fetch_session_by_token(token)
+                        .await
+                    {
+                        Outcome::Success(session)
+                    } else {
+                        Outcome::Error((Status::Unauthorized, create_error!(InvalidSession)))
+                    }
+                } else {
+                    Outcome::Error((Status::Unauthorized, create_error!(MissingHeaders)))
+                }
+            })
+            .await;
+
+        outcome.clone()
     }
 }

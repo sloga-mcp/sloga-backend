@@ -10,6 +10,9 @@ pub mod totp_disable;
 pub mod totp_enable;
 pub mod totp_generate_secret;
 
+#[cfg(test)]
+mod ticket_binding_tests;
+
 pub fn routes() -> (Vec<Route>, OpenApi) {
     openapi_get_routes_spec![
         create_ticket::create_ticket,
