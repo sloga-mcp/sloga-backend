@@ -454,20 +454,16 @@ async fn upload_file(
         return Err(create_error!(InternalError));
     }
 
-    if let Err(error) = db
-        .set_attachment_hash_storage(&file_hash.id, &path, &iv, rkid.as_deref())
-        .await
-    {
-        discard_object(&file_hash.bucket_id, &path).await;
-        return Err(error);
-    }
-
-    // Nothing points at the replaced object any more
-    if let Some((old_bucket_id, old_path)) = superseded_object {
-        if is_other_object(&old_bucket_id, &old_path, &file_hash.bucket_id, &path) {
-            discard_object(&old_bucket_id, &old_path).await;
-        }
-    }
+    commit_storage(
+        &db,
+        &file_hash.bucket_id,
+        &file_hash.id,
+        &path,
+        &iv,
+        rkid.as_deref(),
+        superseded_object,
+    )
+    .await?;
 
     // Debug information
     let time_to_upload = Instant::now() - upload_start;
@@ -479,6 +475,40 @@ async fn upload_file(
         .await?;
 
     Ok(Json(UploadResponse { id }))
+}
+
+/// Point the hash row at the object just uploaded to `bucket_id`/`path`, then
+/// drop the object a stale-video reprocess replaced, if any.
+///
+/// If the row update fails, nothing references the new object, so it is
+/// deleted and the error propagates; the superseded object is left alone. Once
+/// the row is in, nothing references the superseded object, so it is deleted
+/// (best effort) unless it is the very object the row now names.
+async fn commit_storage(
+    db: &Database,
+    bucket_id: &str,
+    file_hash_id: &str,
+    path: &str,
+    iv: &str,
+    rkid: Option<&str>,
+    superseded: Option<(String, String)>,
+) -> Result<()> {
+    if let Err(error) = db
+        .set_attachment_hash_storage(file_hash_id, path, iv, rkid)
+        .await
+    {
+        discard_object(bucket_id, path).await;
+        return Err(error);
+    }
+
+    // Nothing points at the replaced object any more
+    if let Some((old_bucket_id, old_path)) = superseded {
+        if is_other_object(&old_bucket_id, &old_path, bucket_id, path) {
+            discard_object(&old_bucket_id, &old_path).await;
+        }
+    }
+
+    Ok(())
 }
 
 /// Best-effort removal of an object no hash row points at. A failure is
@@ -516,7 +546,239 @@ fn filename_for_mime(filename: String, old_mime: &str, new_mime: &str) -> String
 
 #[cfg(test)]
 mod upload_tests {
-    use super::{filename_for_mime, is_other_object};
+    use super::{commit_storage, filename_for_mime, is_other_object};
+    use revolt_database::{iso8601_timestamp::Timestamp, Database, FileHash, Metadata};
+    use revolt_files::{
+        delete_from_s3, fetch_from_s3, object_exists_in_s3, upload_to_s3, FileKeyring,
+    };
+    use sha2::Digest;
+
+    /// The scratch bucket `upload.rs`'s S3-backed tests use; never the prod one
+    const TEST_BUCKET: &str = "autumn-upload-tests";
+
+    /// Point the cached global config at [`TEST_BUCKET`], and prove the
+    /// override actually reached it (the same check as `upload.rs`). The
+    /// prefix is REVOLT__ with a DOUBLE underscore; a single one is dropped
+    /// silently and the test would run against the dev bucket. The config is
+    /// built once per process, so this holds under nextest (one process per
+    /// test).
+    async fn test_env() {
+        std::env::set_var("REVOLT__FILES__S3__DEFAULT_BUCKET", TEST_BUCKET);
+        assert_eq!(
+            revolt_config::config().await.files.s3.default_bucket,
+            TEST_BUCKET,
+            "S3 default_bucket override never reached the config"
+        );
+    }
+
+    async fn ensure_bucket() {
+        use revolt_files::{EncryptionKey, FileStorageRepository, S3Storage};
+        let storage = S3Storage::from_config(EncryptionKey::from_config().await).await;
+        // Already-exists is fine
+        let _ = storage.create_bucket(TEST_BUCKET).await;
+    }
+
+    async fn exists(path: &str) -> bool {
+        object_exists_in_s3(TEST_BUCKET, path).await.unwrap()
+    }
+
+    /// The placeholder row the handler inserts before its PUT (pin d): path
+    /// is the hash id and the empty iv means "not uploaded yet"
+    fn placeholder_row(id: &str) -> FileHash {
+        FileHash {
+            id: id.to_string(),
+            processed_hash: id.to_string(),
+            created_at: Timestamp::now_utc(),
+            bucket_id: TEST_BUCKET.to_string(),
+            path: id.to_string(),
+            iv: String::new(),
+            format_version: None,
+            key_id: None,
+            metadata: Metadata::File,
+            content_type: "video/mp4".to_string(),
+            size: 0,
+        }
+    }
+
+    /// The state `commit_storage` sees on a stale-video reprocess
+    struct Reprocessed {
+        /// The hash id, which is also OLD: a legacy row's object path
+        id: String,
+        new_path: String,
+        new_iv: String,
+        new_kid: Option<String>,
+        superseded: Option<(String, String)>,
+    }
+
+    /// A legacy stale-video row has its object at OLD (its hash-id path). The
+    /// handler then notes OLD, drops the row, inserts the placeholder, and
+    /// PUTs the replacement to a fresh rk/ path under the primary key (pin a)
+    async fn stale_video_reprocessed(db: &Database) -> Reprocessed {
+        let id = format!(
+            "{:02x}",
+            sha2::Sha256::digest(ulid::Ulid::new().to_string())
+        );
+
+        let (old_iv, old_kid) = upload_to_s3(TEST_BUCKET, &id, b"old video").await.unwrap();
+        db.insert_attachment_hash(&FileHash {
+            iv: old_iv,
+            key_id: old_kid,
+            ..placeholder_row(&id)
+        })
+        .await
+        .unwrap();
+        assert!(exists(&id).await, "setup: the old object is in place");
+
+        let old = db.fetch_attachment_hash(&id).await.unwrap();
+        let superseded = Some((old.bucket_id.clone(), old.path.clone()));
+        db.delete_attachment_hash(&id).await.unwrap();
+        db.insert_attachment_hash(&placeholder_row(&id))
+            .await
+            .unwrap();
+
+        let kid = FileKeyring::global().await.primary_id().map(str::to_string);
+        let new_path = FileHash::new_object_path(kid.as_deref());
+        let (new_iv, new_kid) = upload_to_s3(TEST_BUCKET, &new_path, b"new video")
+            .await
+            .unwrap();
+        assert_eq!(new_kid, kid, "setup: the new object is under the primary");
+        assert_ne!(new_path, id, "setup: the replacement has its own path");
+
+        Reprocessed {
+            id,
+            new_path,
+            new_iv,
+            new_kid,
+            superseded,
+        }
+    }
+
+    /// Pin (f): once the replacement row is committed, the superseded object
+    /// is deleted and the new one, which the row now names, survives
+    #[tokio::test]
+    async fn stale_video_commit_deletes_the_superseded_object() {
+        test_env().await;
+        ensure_bucket().await;
+        let db = Database::Reference(Default::default());
+
+        let r = stale_video_reprocessed(&db).await;
+        commit_storage(
+            &db,
+            TEST_BUCKET,
+            &r.id,
+            &r.new_path,
+            &r.new_iv,
+            r.new_kid.as_deref(),
+            r.superseded,
+        )
+        .await
+        .unwrap();
+
+        let row = db.fetch_attachment_hash(&r.id).await.unwrap();
+        assert_eq!(row.path, r.new_path, "the row points at the new object");
+        assert_eq!(row.iv, r.new_iv);
+        assert_eq!(row.key_id, r.new_kid);
+        assert!(
+            !exists(&r.id).await,
+            "the superseded object must be deleted"
+        );
+        assert!(exists(&r.new_path).await, "the new object must survive");
+        assert_eq!(
+            fetch_from_s3(TEST_BUCKET, &row.path, &row.iv, row.key_id.as_deref())
+                .await
+                .unwrap(),
+            b"new video",
+            "the row decrypts to the replacement"
+        );
+
+        let _ = delete_from_s3(TEST_BUCKET, &r.new_path).await;
+    }
+
+    /// Control: with nothing superseded, the commit deletes nothing, and a
+    /// superseded entry naming the new object itself never deletes it
+    #[tokio::test]
+    async fn commit_without_a_distinct_superseded_object_deletes_nothing() {
+        test_env().await;
+        ensure_bucket().await;
+        let db = Database::Reference(Default::default());
+
+        let r = stale_video_reprocessed(&db).await;
+        commit_storage(
+            &db,
+            TEST_BUCKET,
+            &r.id,
+            &r.new_path,
+            &r.new_iv,
+            r.new_kid.as_deref(),
+            None,
+        )
+        .await
+        .unwrap();
+        let row = db.fetch_attachment_hash(&r.id).await.unwrap();
+        assert_eq!(row.path, r.new_path, "the row points at the new object");
+        assert!(exists(&r.id).await, "nothing superseded, so OLD stays");
+        assert!(exists(&r.new_path).await, "the new object survives");
+
+        // Superseded == the object the row now names
+        commit_storage(
+            &db,
+            TEST_BUCKET,
+            &r.id,
+            &r.new_path,
+            &r.new_iv,
+            r.new_kid.as_deref(),
+            Some((TEST_BUCKET.to_string(), r.new_path.clone())),
+        )
+        .await
+        .unwrap();
+        assert!(
+            exists(&r.new_path).await,
+            "the object the row names is never deleted"
+        );
+
+        let _ = delete_from_s3(TEST_BUCKET, &r.id).await;
+        let _ = delete_from_s3(TEST_BUCKET, &r.new_path).await;
+    }
+
+    /// Pin (e): a missing row is NotFound; the unreferenced new object is
+    /// deleted and the error propagates, and a failed commit never deletes
+    /// the superseded object
+    #[tokio::test]
+    async fn commit_to_a_missing_row_discards_the_new_object() {
+        test_env().await;
+        ensure_bucket().await;
+        let db = Database::Reference(Default::default());
+
+        let r = stale_video_reprocessed(&db).await;
+        // The row goes before the commit lands (e.g. a concurrent delete)
+        db.delete_attachment_hash(&r.id).await.unwrap();
+
+        let error = commit_storage(
+            &db,
+            TEST_BUCKET,
+            &r.id,
+            &r.new_path,
+            &r.new_iv,
+            r.new_kid.as_deref(),
+            r.superseded,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(error.error_type, revolt_result::ErrorType::NotFound),
+            "a missing row must be NotFound, got {error:?}"
+        );
+        assert!(
+            !exists(&r.new_path).await,
+            "the unreferenced new object must be deleted"
+        );
+        assert!(
+            exists(&r.id).await,
+            "a failed commit leaves the superseded object alone"
+        );
+
+        let _ = delete_from_s3(TEST_BUCKET, &r.id).await;
+    }
 
     #[test]
     fn replaced_object_is_deleted_only_when_distinct() {
