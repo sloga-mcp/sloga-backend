@@ -349,4 +349,49 @@ mod tests {
             assert_raw_key_id_absent(&db, "hash-g").await;
         });
     }
+
+    /// `set_*` on a missing row is NotFound on both drivers: never a silent
+    /// success and never an upsert. The writers' discard-on-error branch
+    /// after a PUT depends on this.
+    #[tokio::test]
+    async fn set_storage_missing_row_is_not_found() {
+        database_test!(|db| async move {
+            use revolt_result::ErrorType;
+
+            // A bystander row, so a filter that matched any document would
+            // show up as a change to it
+            db.insert_attachment_hash(&file_hash("hash-h", "hash-h", "iv-0", None))
+                .await
+                .unwrap();
+            let bystander = db.fetch_attachment_hash("hash-h").await.unwrap();
+
+            // Both update shapes: Some => $set, None => $set + $unset
+            for key_id in [Some("k1"), None] {
+                let err = db
+                    .set_attachment_hash_storage("hash-missing", "rk/k1/fresh", "iv-1", key_id)
+                    .await
+                    .expect_err("set on a missing row must fail");
+                assert!(
+                    matches!(err.error_type, ErrorType::NotFound),
+                    "{key_id:?}: {err:?}"
+                );
+
+                let fetched = db.fetch_attachment_hash("hash-missing").await;
+                assert!(
+                    matches!(&fetched, Err(e) if matches!(e.error_type, ErrorType::NotFound)),
+                    "set must not create the row ({key_id:?}): {fetched:?}"
+                );
+            }
+            assert_eq!(db.fetch_attachment_hash("hash-h").await.unwrap(), bystander);
+
+            // Control: the same call on an existing row succeeds
+            db.set_attachment_hash_storage("hash-h", "rk/k1/fresh", "iv-1", Some("k1"))
+                .await
+                .expect("set on an existing row must succeed");
+            assert_eq!(
+                db.fetch_attachment_hash("hash-h").await.unwrap(),
+                with_storage(&bystander, "rk/k1/fresh", "iv-1", Some("k1"))
+            );
+        });
+    }
 }
