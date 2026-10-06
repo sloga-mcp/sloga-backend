@@ -100,3 +100,6 @@ jobs:
           list=$(grep -E '^\s*(FAIL|TIMEOUT|SIGSEGV|SIGABRT|SIGKILL|LEAK-FAIL)\b|^\s*Summary\b|^error(\[E[0-9]+\])?:' nextest.plain \
             | sed -E 's/^\s+//' | sort -u | head -80 | awk '{printf "%s%%0A", $0}')
           echo "::error title=Backend tests failed::${list:-no FAIL or error lines found; see the log}"
+          # And why: each panic with the lines that follow it (assertion text, left/right).
+          panics=$(grep -E -A6 'panicked at' nextest.plain | head -120 | awk '{printf "%s%%0A", $0}')
+          [ -z "$panics" ] || echo "::error title=Panic messages::${panics}"
