@@ -1276,11 +1276,12 @@ mod tests {
             .any(|note| note.contains("doesn't contain")));
     }
 
-    /// An overwrite made entirely of permissions Sloga has no equivalent for
+    /// An overwrite made entirely of bits that map to nothing at channel level
     /// must leave the channel inheriting, not pinned to an empty override.
     #[test]
     fn overwrite_of_only_unmapped_bits_writes_nothing() {
-        // VIEW_AUDIT_LOG (bit 7 = 128), SEND_TTS_MESSAGES (bit 12 = 4096).
+        // VIEW_AUDIT_LOG (bit 7 = 128) is guild-only and masked out of
+        // overwrites; SEND_TTS_MESSAGES (bit 12 = 4096) is unmapped.
         let plan = plan_import(&template(
             r#"{"name":"g","roles":[{"id":0,"name":"@everyone","permissions":0}],
                 "channels":[{"id":5,"type":0,"name":"c","permission_overwrites":[

@@ -309,6 +309,16 @@ impl<'a> RatelimitResolver<Request<'a>> for DeltaRatelimits {
                 // IP for sessionless requests) — dedicated bucket so a burst
                 // against /discover can't starve the shared "any" bucket.
                 ("discover", _, _) => ("discover", None),
+                // The audit-log read (GET /servers/<id>/audit_log) is a
+                // paginated moderator read, not a server mutation, so it must
+                // not spend the tight `servers` budget (5) that guards edits,
+                // bans and role changes. Keyed per server. GET only: any other
+                // method on the path falls through to the servers bucket. This
+                // arm must sit ABOVE the ("servers", Some(id), _) arm, which
+                // would otherwise swallow it.
+                ("servers", Some(id), Method::Get) if extra == Some("audit_log") => {
+                    ("audit_log", Some(id))
+                }
                 ("servers", Some(id), _) => ("servers", Some(id)),
                 ("auth", _, _) => {
                     if request.method() == Method::Delete {
@@ -535,6 +545,10 @@ impl<'a> RatelimitResolver<Request<'a>> for DeltaRatelimits {
             // ample for a human. It only slows a script walking the code
             // space from one address; it does not bound a distributed one.
             "referrals" => 10,
+            // Audit-log pages: a moderator paging back through history or
+            // flipping filters. 10 per window is ample for a human and keeps
+            // a script from hammering the indexed fetch.
+            "audit_log" => 10,
             _ => 20,
         }
     }
@@ -895,6 +909,115 @@ mod tests {
         assert_eq!(
             client.patch("/users/@me/supporter").dispatch().status(),
             Status::Ok
+        );
+    }
+
+    #[rocket::get("/<_id>/audit_log")]
+    fn audit_log_get(_id: &str) -> &'static str {
+        "{}"
+    }
+
+    #[rocket::get("/<_id>/bans")]
+    fn bans_get(_id: &str) -> &'static str {
+        "{}"
+    }
+
+    #[rocket::patch("/<_id>")]
+    fn server_patch(_id: &str) -> &'static str {
+        "{}"
+    }
+
+    /// The server routes, on the same database-free Rocket as `client()`.
+    fn servers_client() -> Client {
+        let rocket = rocket::build()
+            .manage(RatelimitStorage::new(DeltaRatelimits))
+            .attach(RatelimitFairing)
+            .mount("/", revolt_ratelimits::rocket::routes())
+            .mount(
+                "/servers",
+                rocket::routes![audit_log_get, bans_get, server_patch],
+            );
+        Client::untracked(rocket).expect("rocket builds without a database")
+    }
+
+    /// GET /servers/<id>/audit_log resolves to its own per-server bucket;
+    /// every other method on that path, and every other server route, stays
+    /// on the `servers` bucket.
+    #[test]
+    fn audit_log_read_has_its_own_bucket() {
+        use revolt_ratelimits::ratelimiter::RatelimitResolver;
+
+        let client = servers_client();
+
+        // The resolver itself, before routing, exactly as `on_request` runs it.
+        assert_eq!(
+            DeltaRatelimits.resolve_bucket(&*client.get("/servers/01SRV/audit_log")),
+            ("audit_log", Some("01SRV"))
+        );
+        assert_eq!(
+            DeltaRatelimits.resolve_bucket(&*client.get("/0.8/servers/01SRV/audit_log")),
+            ("audit_log", Some("01SRV")),
+            "the legacy 0.8 prefix resolves the same bucket"
+        );
+        for request in [
+            client.post("/servers/01SRV/audit_log"),
+            client.put("/servers/01SRV/audit_log"),
+            client.patch("/servers/01SRV/audit_log"),
+            client.delete("/servers/01SRV/audit_log"),
+        ] {
+            assert_eq!(
+                DeltaRatelimits.resolve_bucket(&*request),
+                ("servers", Some("01SRV")),
+                "a non-GET on the audit_log path stays on the servers bucket"
+            );
+        }
+        assert_eq!(
+            DeltaRatelimits.resolve_bucket(&*client.get("/servers/01SRV/bans")),
+            ("servers", Some("01SRV"))
+        );
+        assert_eq!(
+            DeltaRatelimits.resolve_bucket(&*client.patch("/servers/01SRV")),
+            ("servers", Some("01SRV"))
+        );
+        assert_eq!(
+            DeltaRatelimits.resolve_bucket(&*client.get("/servers/01SRV")),
+            ("servers", Some("01SRV"))
+        );
+
+        // Through the fairing: audit_log is limit 10, the rest stay at 5.
+        let audit = client.get("/servers/01SRV/audit_log").dispatch();
+        assert_eq!(audit.status(), Status::Ok);
+        assert_eq!(limit(&audit), 10);
+
+        let bans = client.get("/servers/01SRV/bans").dispatch();
+        assert_eq!(bans.status(), Status::Ok);
+        assert_eq!(limit(&bans), 5);
+        assert_ne!(bucket(&audit), bucket(&bans));
+
+        let edit = client.patch("/servers/01SRV").dispatch();
+        assert_eq!(edit.status(), Status::Ok);
+        assert_eq!(limit(&edit), 5);
+        assert_eq!(bucket(&edit), bucket(&bans));
+
+        // Spend the rest of the audit_log window; the servers bucket is
+        // untouched by it: 2 of its 5 were spent above, the read below is
+        // the third.
+        for _ in 0..9 {
+            assert_eq!(
+                client.get("/servers/01SRV/audit_log").dispatch().status(),
+                Status::Ok
+            );
+        }
+        assert_eq!(
+            client.get("/servers/01SRV/audit_log").dispatch().status(),
+            Status::TooManyRequests
+        );
+        let bans = client.get("/servers/01SRV/bans").dispatch();
+        assert_eq!(bans.status(), Status::Ok);
+        assert_eq!(
+            bans.headers().get_one("X-RateLimit-Remaining"),
+            Some("2"),
+            "the servers bucket has spent exactly its own three requests"
         );
     }
 }

@@ -1,6 +1,7 @@
 use revolt_rocket_okapi::revolt_okapi::openapi3::OpenApi;
 use rocket::Route;
 
+mod audit_log_fetch;
 mod ban_create;
 mod ban_list;
 mod ban_remove;
@@ -46,6 +47,7 @@ pub fn routes() -> (Vec<Route>, OpenApi) {
         ban_create::ban,
         ban_remove::unban,
         ban_list::list,
+        audit_log_fetch::fetch_audit_log,
         invites_fetch::invites,
         roles_create::create,
         roles_edit::edit,

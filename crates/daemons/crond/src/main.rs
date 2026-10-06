@@ -104,6 +104,7 @@ async fn main() {
         cron_task_wrapper(scheduled_messages::task, db.clone(), amqp.clone()),
         cron_task_wrapper(thread_archiver::task, db.clone(), amqp.clone()),
         cron_task_wrapper(prune_interactions::task, db.clone(), amqp.clone()),
+        cron_task_wrapper(prune_audit_log::task, db.clone(), amqp.clone()),
         cron_task_wrapper(prune_expired_boosts::task, db.clone(), amqp.clone()),
         cron_task_wrapper(qualify_referrals::task, db.clone(), amqp.clone()),
         cron_task_wrapper(expire_supporters::task, db.clone(), amqp.clone()),
