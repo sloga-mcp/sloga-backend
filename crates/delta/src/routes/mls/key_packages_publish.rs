@@ -32,6 +32,22 @@ fn check_upload(upload: &v0::MlsKeyPackageUpload) -> Result<()> {
     Ok(())
 }
 
+/// The KeyPackage directory is shared by Call and Text groups (W2 decision
+/// 3, protected-channels design §7.1), so publishing needs `e2ee_enabled &&
+/// (media_e2ee_enabled || protected_channels.enabled)`. With E2EE off the
+/// answer is `FeatureDisabled { e2ee }`; with E2EE on and both planes off it
+/// is the media gate's own `FeatureDisabled { media_e2ee }`, the answer Call
+/// clients got before Text groups existed.
+async fn require_publish_enabled() -> Result<()> {
+    super::require_protected_available().await?;
+    let features = revolt_config::config().await.features;
+    if features.protected_channels.enabled {
+        return Ok(());
+    }
+
+    super::require_media_e2ee_enabled().await
+}
+
 /// # Publish MLS KeyPackages
 ///
 /// Publish (or replenish) MLS KeyPackages for one of the current user's
@@ -57,7 +73,7 @@ pub async fn publish_key_packages(
     session: Session,
     data: Json<v0::DataPublishMlsKeyPackages>,
 ) -> Result<Json<v0::ResponsePublishMlsKeyPackages>> {
-    super::require_media_e2ee_enabled().await?;
+    require_publish_enabled().await?;
 
     if user.bot.is_some() {
         return Err(create_error!(IsBot));
@@ -207,4 +223,153 @@ pub async fn publish_key_packages(
     }
 
     Ok(Json(v0::ResponsePublishMlsKeyPackages { key_package_count }))
+}
+
+/// The publish gate's flag matrix (W2 decision 3). Every flag case is its
+/// own `#[test]`: `overwrite_config` runs once per process, BEFORE the
+/// harness primes the config cache, so these need nextest (one process per
+/// test). The test config has every flag on.
+#[cfg(test)]
+mod tests {
+    use base64::{engine::general_purpose::STANDARD_NO_PAD, Engine as _};
+    use revolt_database::mls_credential_binding_payload;
+    use revolt_models::v0;
+    use revolt_result::Error;
+    use rocket::http::{ContentType, Header, Status};
+
+    use crate::routes::mls::{require_media_e2ee_enabled, require_protected_available};
+    use crate::util::test::TestHarness;
+
+    enum Expected {
+        Published,
+        /// The exact error (type, feature and `location`) the gate answers
+        Refused(Error, &'static str),
+    }
+
+    fn upload(key_package_ref: &str) -> v0::MlsKeyPackageUpload {
+        v0::MlsKeyPackageUpload {
+            key_package_ref: key_package_ref.to_string(),
+            key_package: STANDARD_NO_PAD.encode(b"opaque key package bytes"),
+        }
+    }
+
+    /// A valid publish from a bound device, so the only thing that can
+    /// refuse it is the gate; a refusal must store nothing
+    async fn publish(expected: Expected) {
+        let harness = TestHarness::new().await;
+        let (_, session, user) = harness.new_user().await;
+        let device = harness.new_e2ee_device(&user, &session.id, 41).await;
+        let mls_signature_key = STANDARD_NO_PAD.encode([7u8; 32]);
+        let payload = mls_credential_binding_payload(
+            &user.id,
+            &device.device_id,
+            &mls_signature_key,
+            &device.identity_key(),
+        );
+        let body = v0::DataPublishMlsKeyPackages {
+            device_id: device.device_id.clone(),
+            mls_signature_key,
+            binding_signature: device.sign(&payload),
+            key_packages: vec![upload("kp0")],
+            last_resort: Some(upload("kplast")),
+        };
+
+        let response = harness
+            .client
+            .put("/mls/key_packages")
+            .header(ContentType::JSON)
+            .header(Header::new("x-session-token", session.token.clone()))
+            .body(serde_json::to_string(&body).expect("JSON"))
+            .dispatch()
+            .await;
+        let status = response.status();
+        let text = response.into_string().await.expect("a body");
+        let answer: serde_json::Value = serde_json::from_str(&text).expect("JSON");
+        let stored = harness
+            .db
+            .fetch_one_mls_key_package(&user.id, &device.device_id)
+            .await
+            .expect("the directory read");
+
+        match expected {
+            Expected::Published => {
+                assert_eq!(status, Status::Ok, "{}", text);
+                assert_eq!(answer["key_package_count"], 1, "{}", text);
+                assert!(stored.is_some(), "the packages must be stored");
+            }
+            Expected::Refused(error, feature) => {
+                assert_eq!(status, Status::BadRequest, "{}", text);
+                assert_eq!(answer["type"], "FeatureDisabled", "{}", text);
+                assert_eq!(answer["feature"], feature, "{}", text);
+                assert_eq!(
+                    answer,
+                    serde_json::to_value(error).expect("JSON"),
+                    "the body must be the gate's own answer"
+                );
+                assert!(stored.is_none(), "a refusal must store nothing");
+            }
+        }
+    }
+
+    #[test]
+    fn publish_with_every_flag_on() {
+        crate::util::test::rt().block_on(publish(Expected::Published))
+    }
+
+    #[test]
+    fn publish_with_media_on_and_protected_off() {
+        crate::util::test::rt().block_on(async {
+            revolt_config::overwrite_config(|settings| {
+                settings.features.protected_channels.enabled = false;
+            })
+            .await;
+            publish(Expected::Published).await
+        })
+    }
+
+    /// Decision 3: while protected channels are on, the media flag no
+    /// longer stops publish (Text groups claim from the same directory)
+    #[test]
+    fn publish_with_media_off_and_protected_on() {
+        crate::util::test::rt().block_on(async {
+            revolt_config::overwrite_config(|settings| {
+                settings.features.media_e2ee_enabled = false;
+            })
+            .await;
+            publish(Expected::Published).await
+        })
+    }
+
+    /// Both planes off: the media gate's answer, byte-identical to the one
+    /// Call clients got before Text groups existed
+    #[test]
+    fn publish_with_media_and_protected_off() {
+        crate::util::test::rt().block_on(async {
+            revolt_config::overwrite_config(|settings| {
+                settings.features.media_e2ee_enabled = false;
+                settings.features.protected_channels.enabled = false;
+            })
+            .await;
+            let error = require_media_e2ee_enabled()
+                .await
+                .expect_err("the media gate is closed");
+            publish(Expected::Refused(error, "media_e2ee")).await
+        })
+    }
+
+    /// E2EE off refuses whatever the media and protected flags say (both
+    /// stay on here), with the availability gate's `e2ee` answer
+    #[test]
+    fn publish_with_e2ee_off() {
+        crate::util::test::rt().block_on(async {
+            revolt_config::overwrite_config(|settings| {
+                settings.features.e2ee_enabled = false;
+            })
+            .await;
+            let error = require_protected_available()
+                .await
+                .expect_err("the availability gate is closed");
+            publish(Expected::Refused(error, "e2ee")).await
+        })
+    }
 }
