@@ -151,6 +151,17 @@ pub fn import_sources_feature(config: &Settings) -> ImportSourcesFeature {
     }
 }
 
+/// # Protected Channels Configuration
+#[derive(Serialize, JsonSchema, Debug)]
+pub struct ProtectedChannelsFeature {
+    /// Whether protected channels can grow (grants, protect, seating, adds).
+    /// The effective value: true only when E2EE is enabled as well, since
+    /// the text plane needs the E2EE identity directory
+    pub enabled: bool,
+    /// Device cap used when a channel's entitlement sets none (0 = unlimited)
+    pub default_device_cap: u32,
+}
+
 /// # Feature Configuration
 #[derive(Serialize, JsonSchema, Debug)]
 pub struct RevoltFeatures {
@@ -193,6 +204,8 @@ pub struct RevoltFeatures {
     pub legal_links: LegalLinks,
     /// Server boost configuration
     pub boosts: BoostsFeature,
+    /// Protected channels configuration
+    pub protected_channels: ProtectedChannelsFeature,
 }
 
 /// # Limits For Users
@@ -429,6 +442,12 @@ pub async fn root() -> Result<Json<RevoltConfig>> {
                 enabled: config.features.boosts.enabled,
                 purchases_enabled: config.features.boosts.purchases_enabled,
                 tier_thresholds: config.features.boosts.tier_thresholds,
+            },
+            // The effective flag (design 7.1): growth also needs E2EE, so the
+            // advert never offers protecting a channel the gates would refuse
+            protected_channels: ProtectedChannelsFeature {
+                enabled: config.features.e2ee_enabled && config.features.protected_channels.enabled,
+                default_device_cap: config.features.protected_channels.default_device_cap,
             },
         },
         ws: config.hosts.events,
@@ -699,5 +718,59 @@ mod test {
                 "add_bot_url": "https://api.fluxer.app/v1/oauth2/authorize?client_id=1560481642991071233&scope=bot&permissions=8"
             })
         );
+    }
+
+    /// Device cap set by every advert case, distinct from the default (5) so
+    /// the test proves the configured value is the one advertised
+    const ADVERT_DEVICE_CAP: u32 = 7;
+
+    /// Sets both flags (and the device cap) explicitly, then fetches the root
+    /// and checks the protected channels advert. Every case is its own
+    /// `#[test]`: `overwrite_config` runs once per process (nextest)
+    async fn protected_channels_advert_case(e2ee: bool, enabled: bool, advertised: bool) {
+        revolt_config::overwrite_config(|settings| {
+            settings.features.e2ee_enabled = e2ee;
+            settings.features.protected_channels.enabled = enabled;
+            settings.features.protected_channels.default_device_cap = ADVERT_DEVICE_CAP;
+        })
+        .await;
+
+        let harness = crate::util::test::TestHarness::new().await;
+        let response = harness.client.get("/").dispatch().await;
+        assert_eq!(response.status(), Status::Ok);
+
+        // Raw JSON so the assertions cover the wire shape, not the typed struct
+        let body: serde_json::Value =
+            serde_json::from_str(&response.into_string().await.expect("body")).expect("json");
+        let advert = body["features"]["protected_channels"]
+            .as_object()
+            .expect("protected_channels object");
+
+        assert_eq!(advert.len(), 2, "advert fields: {advert:?}");
+        assert_eq!(advert["enabled"].as_bool(), Some(advertised));
+        assert_eq!(
+            advert["default_device_cap"].as_u64(),
+            Some(ADVERT_DEVICE_CAP as u64)
+        );
+    }
+
+    #[test]
+    fn protected_channels_advert_with_e2ee_on_and_enabled_on() {
+        crate::util::test::rt().block_on(protected_channels_advert_case(true, true, true))
+    }
+
+    #[test]
+    fn protected_channels_advert_with_e2ee_on_and_enabled_off() {
+        crate::util::test::rt().block_on(protected_channels_advert_case(true, false, false))
+    }
+
+    #[test]
+    fn protected_channels_advert_with_e2ee_off_and_enabled_on() {
+        crate::util::test::rt().block_on(protected_channels_advert_case(false, true, false))
+    }
+
+    #[test]
+    fn protected_channels_advert_with_e2ee_off_and_enabled_off() {
+        crate::util::test::rt().block_on(protected_channels_advert_case(false, false, false))
     }
 }
