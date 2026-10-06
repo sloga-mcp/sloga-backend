@@ -95,6 +95,8 @@ jobs:
         if: failure()
         run: |
           [ -f nextest.log ] || exit 0
-          list=$(grep -E '^\s*(FAIL|TIMEOUT|SIGSEGV|SIGABRT|SIGKILL)\b|^error(\[E[0-9]+\])?:' nextest.log \
-            | sed -E 's/^\s+//; s/\x1b\[[0-9;]*m//g' | sort -u | head -80 | awk '{printf "%s%%0A", $0}')
+          # Strip the colour codes first: nextest starts FAIL lines with one.
+          sed -E 's/\x1b\[[0-9;]*[A-Za-z]//g' nextest.log > nextest.plain
+          list=$(grep -E '^\s*(FAIL|TIMEOUT|SIGSEGV|SIGABRT|SIGKILL|LEAK-FAIL)\b|^\s*Summary\b|^error(\[E[0-9]+\])?:' nextest.plain \
+            | sed -E 's/^\s+//' | sort -u | head -80 | awk '{printf "%s%%0A", $0}')
           echo "::error title=Backend tests failed::${list:-no FAIL or error lines found; see the log}"

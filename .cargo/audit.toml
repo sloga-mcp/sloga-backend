@@ -48,11 +48,13 @@ ignore = [
   # Fixed in 0.9.20 (`cargo update -p crossbeam-epoch`).
   "RUSTSEC-2026-0204",
 
-  # h2 0.3.27 (sentry and fcm_v1 via reqwest 0.11) and 0.4.15 (reqwest 0.12):
-  # a server can send unbounded empty DATA frames. january fetches link
-  # previews from attacker-chosen hosts, so it may be reachable there. Fixed in
-  # h2 0.4.16 (`cargo update -p h2@0.4.15`); 0.3 has no fix, and a sentry
-  # newer than 0.31 drops it.
+  # h2 0.4.15 (reqwest 0.12) and 0.3.27 (hyper 0.14, pulled in by rocket_http,
+  # aws-smithy-http-client, yup-oauth2, and sentry/fcm_v1 via reqwest 0.11):
+  # a peer can send unbounded empty DATA frames. As a client this may be
+  # reachable from january, which fetches link previews from attacker-chosen
+  # hosts. delta's own Rocket server speaks HTTP/2 only over TLS and runs as
+  # plain HTTP behind Caddy. Fixed in h2 0.4.16 (`cargo update -p h2@0.4.15`);
+  # 0.3.27 stays until all of those crates move off hyper 0.14.
   "RUSTSEC-2026-0258",
 
   # rustls 0.23.41 (mongodb, reqwest): TLS 1.3 handshake messages accepted
