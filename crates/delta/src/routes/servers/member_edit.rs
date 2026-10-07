@@ -311,6 +311,12 @@ pub async fn edit(
         return Err(create_error!(InvalidOperation));
     }
 
+    // joined_at is server-owned history, never client-editable: on MongoDB
+    // removing it corrupts the member document and locks the member out for good.
+    if data.remove.contains(&FieldsMember::JoinedAt) {
+        return Err(create_error!(InvalidOperation));
+    }
+
     // A move combined with an edit that changes the permissions the move is
     // decided UNDER is decided twice, against two different member documents,
     // and both outcomes are wrong:
@@ -340,7 +346,15 @@ pub async fn edit(
     }
 
     // Resolve our ranking
-    let our_ranking = query.get_member_rank().unwrap_or(i64::MIN);
+    //
+    // The owner and platform staff get GrantAllSafe before membership is read,
+    // so they hold no member rank here; they rank above everyone. Anyone else
+    // without a membership (an outsider) ranks below everyone.
+    let our_ranking = if user.privileged || server.owner == user.id {
+        i64::MIN
+    } else {
+        query.get_member_rank().unwrap_or(i64::MAX)
+    };
 
     // Check that we have permissions to act against this member.
     //
@@ -353,7 +367,7 @@ pub async fn edit(
     // position it always held — nothing but the voice block sits between the
     // two — so no other refusal order changes.
     //
-    // Platform staff resolve no member rank (`i64::MIN`), which now ties with
+    // Platform staff rank `i64::MIN` (see `our_ranking` above), which ties with
     // the owner's, so they are exempt here to keep the reach they already had.
     if member.id.user != user.id
         && !user.privileged
@@ -3977,6 +3991,388 @@ mod test {
             owner.nickname.as_deref(),
             Some("renamed"),
             "the staff rename must have landed"
+        );
+    }
+
+    // ---- joined_at is never editable; outsiders rank below everyone -------
+
+    /// The member's stored `joined_at`. Panics when the document no longer
+    /// reads back, which is what a removed `joined_at` does on MongoDB.
+    async fn stored_joined_at(harness: &TestHarness, server: &Server, user: &User) -> Timestamp {
+        harness
+            .db
+            .fetch_member(&server.id, &user.id)
+            .await
+            .unwrap_or_else(|error| panic!("the member document must still read back: {:?}", error))
+            .joined_at
+    }
+
+    /// A refused `JoinedAt` removal: 400 `InvalidOperation`, and the stored
+    /// `joined_at` exactly as it was. The document is read back BEFORE the
+    /// status is asserted, so on MongoDB an unfixed route fails on the damage
+    /// itself (the member no longer reads back), not only on the status.
+    async fn assert_joined_at_refused(
+        harness: &TestHarness,
+        response: rocket::local::asynchronous::LocalResponse<'_>,
+        server: &Server,
+        target: &User,
+        before: Timestamp,
+        who: &str,
+    ) {
+        let status = response.status();
+        let body = response.into_string().await.unwrap_or_default();
+        assert_eq!(
+            stored_joined_at(harness, server, target).await,
+            before,
+            "{who}: joined_at must be untouched"
+        );
+        assert_eq!(status, Status::BadRequest, "{who}: {body}");
+        let error: revolt_result::Error = serde_json::from_str(&body).expect("error body");
+        assert!(
+            matches!(error.error_type, revolt_result::ErrorType::InvalidOperation),
+            "{who}: expected InvalidOperation, got {:?}",
+            error.error_type
+        );
+    }
+
+    #[test]
+    fn a_member_cannot_remove_their_own_joined_at() {
+        crate::util::test::rt().block_on(a_member_cannot_remove_their_own_joined_at_case())
+    }
+
+    /// `joined_at` is server-owned history. On MongoDB removing it `$unset`s
+    /// the field, the member document no longer deserializes, and the member
+    /// is locked out of the server for good (no permissions, no rejoin). A
+    /// self-edit skips the rank check, so the refusal is the only guard. This
+    /// is the MongoDB data-damage witness; the reference driver ignores the
+    /// removal, so there an unfixed route fails on the status alone.
+    async fn a_member_cannot_remove_their_own_joined_at_case() {
+        let harness = TestHarness::new().await;
+        let (_a, _session_a, owner) = harness.new_user().await;
+        let (_b, session_b, user_b) = harness.new_user().await;
+        let (server, _channels) = harness.new_server(&owner).await;
+        Member::create(&harness.db, &server, &user_b, None)
+            .await
+            .expect("member");
+        let before = stored_joined_at(&harness, &server, &user_b).await;
+
+        let response = edit_member(
+            &harness,
+            &session_b.token,
+            &server.id,
+            &user_b.id,
+            serde_json::json!({ "remove": ["JoinedAt"] }),
+        )
+        .await;
+        assert_joined_at_refused(&harness, response, &server, &user_b, before, "a self-edit").await;
+    }
+
+    #[test]
+    fn a_ranked_moderator_cannot_remove_joined_at() {
+        crate::util::test::rt().block_on(a_ranked_moderator_cannot_remove_joined_at_case())
+    }
+
+    /// Outranking the target is not enough: no permission or rank reaches
+    /// `joined_at`. The rename control shows the moderator really outranks the
+    /// target, so the refusal is the field's own, not the rank check's.
+    async fn a_ranked_moderator_cannot_remove_joined_at_case() {
+        let harness = TestHarness::new().await;
+        let (_a, _session_a, owner) = harness.new_user().await;
+        let (_b, session_b, moderator) = harness.new_user().await;
+        let (_c, _session_c, target) = harness.new_user().await;
+        let (server, _channels) = harness.new_server(&owner).await;
+        for user in [&moderator, &target] {
+            Member::create(&harness.db, &server, user, None)
+                .await
+                .expect("member");
+        }
+        let senior = ranked_role(
+            &harness,
+            &server,
+            1,
+            ChannelPermission::ManageNicknames as u64 + ChannelPermission::AssignRoles as u64,
+        )
+        .await;
+        let junior = ranked_role(&harness, &server, 5, 0).await;
+        give_role(&harness, &server, &moderator, &senior).await;
+        give_role(&harness, &server, &target, &junior).await;
+        let before = stored_joined_at(&harness, &server, &target).await;
+
+        let response = edit_member(
+            &harness,
+            &session_b.token,
+            &server.id,
+            &target.id,
+            serde_json::json!({ "remove": ["JoinedAt"] }),
+        )
+        .await;
+        assert_joined_at_refused(&harness, response, &server, &target, before, "a moderator").await;
+
+        let response = edit_member(
+            &harness,
+            &session_b.token,
+            &server.id,
+            &target.id,
+            serde_json::json!({ "nickname": "renamed" }),
+        )
+        .await;
+        assert_eq!(
+            response.status(),
+            Status::Ok,
+            "the moderator must outrank the target"
+        );
+    }
+
+    #[test]
+    fn a_non_member_cannot_remove_joined_at() {
+        crate::util::test::rt().block_on(a_non_member_cannot_remove_joined_at_case())
+    }
+
+    /// An outsider used to rank `i64::MIN`, the owner's rank, and so could
+    /// remove the `joined_at` of every non-owner member of any server. The
+    /// field refusal runs before the rank check, so it is the one that
+    /// answers: 400 `InvalidOperation`.
+    async fn a_non_member_cannot_remove_joined_at_case() {
+        let harness = TestHarness::new().await;
+        let (_a, _session_a, owner) = harness.new_user().await;
+        let (_x, session_x, outsider) = harness.new_user().await;
+        let (_t, _session_t, target) = harness.new_user().await;
+        let (server, _channels) = harness.new_server(&owner).await;
+        Member::create(&harness.db, &server, &target, None)
+            .await
+            .expect("member");
+        assert!(
+            harness
+                .db
+                .fetch_member(&server.id, &outsider.id)
+                .await
+                .is_err(),
+            "the outsider must hold no membership here"
+        );
+        let before = stored_joined_at(&harness, &server, &target).await;
+
+        let response = edit_member(
+            &harness,
+            &session_x.token,
+            &server.id,
+            &target.id,
+            serde_json::json!({ "remove": ["JoinedAt"] }),
+        )
+        .await;
+        assert_joined_at_refused(&harness, response, &server, &target, before, "an outsider").await;
+    }
+
+    #[test]
+    fn a_non_member_cannot_edit_any_member() {
+        crate::util::test::rt().block_on(a_non_member_cannot_edit_any_member_case())
+    }
+
+    /// An outsider holds no member rank. It used to fall back to `i64::MIN`,
+    /// the owner's rank, so even an empty edit of any non-owner member passed
+    /// the rank check and answered 200. It now ranks below everyone: a member
+    /// with no roles and a member holding a role are both out of reach.
+    async fn a_non_member_cannot_edit_any_member_case() {
+        let harness = TestHarness::new().await;
+        let (_a, _session_a, owner) = harness.new_user().await;
+        let (_x, session_x, outsider) = harness.new_user().await;
+        let (_b, _session_b, plain) = harness.new_user().await;
+        let (_c, _session_c, ranked) = harness.new_user().await;
+        let (server, _channels) = harness.new_server(&owner).await;
+        for user in [&plain, &ranked] {
+            Member::create(&harness.db, &server, user, None)
+                .await
+                .expect("member");
+        }
+        let role = ranked_role(&harness, &server, 5, 0).await;
+        give_role(&harness, &server, &ranked, &role).await;
+        assert!(
+            harness
+                .db
+                .fetch_member(&server.id, &outsider.id)
+                .await
+                .is_err(),
+            "the outsider must hold no membership here"
+        );
+
+        for (target, who) in [(&plain, "a roleless member"), (&ranked, "a ranked member")] {
+            let response = edit_member(
+                &harness,
+                &session_x.token,
+                &server.id,
+                &target.id,
+                serde_json::json!({}),
+            )
+            .await;
+            // Status first: an unfixed route answers 200 with a member body.
+            let status = response.status();
+            let body = response.into_string().await.unwrap_or_default();
+            assert_eq!(
+                status,
+                Status::Forbidden,
+                "an outsider's edit of {who}: {body}"
+            );
+            let error: revolt_result::Error = serde_json::from_str(&body).expect("error body");
+            assert!(
+                matches!(error.error_type, revolt_result::ErrorType::NotElevated),
+                "an outsider's edit of {who} must be NotElevated, got {:?}",
+                error.error_type
+            );
+        }
+    }
+
+    #[test]
+    fn the_owner_still_outranks_everyone() {
+        crate::util::test::rt().block_on(the_owner_still_outranks_everyone_case())
+    }
+
+    /// The owner gets `GrantAllSafe` before membership is read, so even with a
+    /// membership the query holds no member rank for them. They must still
+    /// rank above every role: assigning a role and renaming a member who holds
+    /// the top role both succeed.
+    async fn the_owner_still_outranks_everyone_case() {
+        let harness = TestHarness::new().await;
+        let (_a, session_a, owner) = harness.new_user().await;
+        let (_b, _session_b, target) = harness.new_user().await;
+        let (server, _channels) = harness.new_server(&owner).await;
+
+        // The harness inserts the server without the owner's membership,
+        // which a real server always has.
+        if harness
+            .db
+            .fetch_member(&server.id, &owner.id)
+            .await
+            .is_err()
+        {
+            Member::create(&harness.db, &server, &owner, None)
+                .await
+                .expect("owner member");
+        }
+        Member::create(&harness.db, &server, &target, None)
+            .await
+            .expect("member");
+        let top = ranked_role(&harness, &server, 0, 0).await;
+        let granted = ranked_role(&harness, &server, 1, 0).await;
+        give_role(&harness, &server, &target, &top).await;
+
+        let response = edit_member(
+            &harness,
+            &session_a.token,
+            &server.id,
+            &target.id,
+            serde_json::json!({
+                "roles": [top.id, granted.id],
+                "nickname": "renamed"
+            }),
+        )
+        .await;
+        let status = response.status();
+        let body = response.into_string().await.unwrap_or_default();
+        assert_eq!(status, Status::Ok, "the owner's edit: {body}");
+
+        let member = harness
+            .db
+            .fetch_member(&server.id, &target.id)
+            .await
+            .expect("member read");
+        assert!(
+            member.roles.contains(&top.id) && member.roles.contains(&granted.id),
+            "the owner's role assignment must have landed: {:?}",
+            member.roles
+        );
+        assert_eq!(
+            member.nickname.as_deref(),
+            Some("renamed"),
+            "the owner's rename must have landed"
+        );
+    }
+
+    #[test]
+    fn privileged_staff_keep_their_reach() {
+        crate::util::test::rt().block_on(privileged_staff_keep_their_reach_case())
+    }
+
+    /// Platform staff get `GrantAllSafe` before membership is read too, and
+    /// hold no membership here at all, yet they are not an outsider: assigning
+    /// even the top role stays within their reach. The role check has no
+    /// staff exemption of its own, so their rank is what carries them.
+    async fn privileged_staff_keep_their_reach_case() {
+        let harness = TestHarness::new().await;
+        let (_a, _session_a, owner) = harness.new_user().await;
+        let (_s, session_s, mut staff) = harness.new_user().await;
+        let (_t, _session_t, target) = harness.new_user().await;
+        let (server, _channels) = harness.new_server(&owner).await;
+        Member::create(&harness.db, &server, &target, None)
+            .await
+            .expect("member");
+        staff
+            .update(
+                &harness.db,
+                revolt_database::PartialUser {
+                    privileged: Some(true),
+                    ..Default::default()
+                },
+                vec![],
+            )
+            .await
+            .expect("privileged staff");
+        assert!(
+            harness
+                .db
+                .fetch_member(&server.id, &staff.id)
+                .await
+                .is_err(),
+            "staff must hold no membership here, so they resolve no member rank"
+        );
+        let role = ranked_role(&harness, &server, 0, 0).await;
+
+        let response = edit_member(
+            &harness,
+            &session_s.token,
+            &server.id,
+            &target.id,
+            serde_json::json!({ "roles": [role.id] }),
+        )
+        .await;
+        let status = response.status();
+        let body = response.into_string().await.unwrap_or_default();
+        assert_eq!(status, Status::Ok, "the staff role assignment: {body}");
+
+        let member = harness
+            .db
+            .fetch_member(&server.id, &target.id)
+            .await
+            .expect("member read");
+        assert!(
+            member.roles.contains(&role.id),
+            "the staff role assignment must have landed: {:?}",
+            member.roles
+        );
+    }
+
+    /// The acting user's rank fails closed: the owner and platform staff (who
+    /// get `GrantAllSafe` before membership is read, so hold no member rank in
+    /// the query) rank above everyone, and anyone else without a membership
+    /// ranks below everyone. Mutation: the old `unwrap_or(i64::MIN)` fallback
+    /// restored, which gave an outsider the owner's rank.
+    #[test]
+    fn the_rank_fallback_fails_closed() {
+        const RANK: &str = "let our_ranking = \
+             if user.privileged || server.owner == user.id \u{7b} \
+             i64::MIN \
+             \u{7d} else \u{7b} \
+             query.get_member_rank().unwrap_or(i64::MAX) \
+             \u{7d};";
+
+        let body = route_body();
+        assert_eq!(
+            body.matches(RANK).count(),
+            1,
+            "the acting user's rank must be resolved fail-closed: {body}"
+        );
+        assert!(
+            !body.contains("unwrap_or(i64::MIN)"),
+            "no member-rank fallback may grant the owner's rank: {}",
+            body
         );
     }
 
