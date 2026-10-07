@@ -1,5 +1,8 @@
 use revolt_database::{
-    util::{permissions::DatabasePermissionQuery, reference::Reference},
+    util::{
+        audit_reason::sanitize_reason_text, permissions::DatabasePermissionQuery,
+        reference::Reference,
+    },
     voice::{remove_user_from_server_voice, VoiceClient},
     AuditLogAction, AuditLogChange, AuditLogDraft, AuditLogEntry, AuditValue, Database, Message,
     RemovalIntention, ServerBan, User,
@@ -93,15 +96,14 @@ pub async fn ban(
     // The audit entry takes the BODY reason (plan audit M4: a ban reason may
     // run to 1024 characters, past the 512 the reason header allows), so no
     // reason header is read here. It is copied before the create consumes
-    // it: trimmed, and blank means none. `newly_banned` is set only when this
-    // request's create succeeded; an existing ban, or one a concurrent
-    // request won the insert for (that request records its own), is not.
-    let audit_reason = data
-        .reason
-        .as_deref()
-        .map(str::trim)
-        .filter(|reason| !reason.is_empty())
-        .map(str::to_string);
+    // it and sanitized as a header reason is (control and bidi/invisible
+    // format characters stripped, then trimmed, blank means none), without
+    // the header's 512 cap: the body validator's 1024 stands. Only the audit
+    // entry's copy is sanitized; the stored ban keeps the body reason.
+    // `newly_banned` is set only when this request's create succeeded; an
+    // existing ban, or one a concurrent request won the insert for (that
+    // request records its own), is not.
+    let audit_reason = data.reason.as_deref().and_then(sanitize_reason_text);
     let mut newly_banned = false;
     let ban = match db.fetch_ban(&server.id, target.id).await {
         Ok(existing) => existing,
@@ -1084,6 +1086,43 @@ mod test {
                 .as_deref(),
             Some(reason.as_str()),
             "the body reason is recorded in full and the header is not read"
+        );
+    }
+
+    // Compile-only without RabbitMQ and Redis: see the section note above.
+    #[test]
+    fn a_ban_reason_is_recorded_without_bidi_or_invisible_chars() {
+        crate::util::test::rt()
+            .block_on(a_ban_reason_is_recorded_without_bidi_or_invisible_chars_case())
+    }
+
+    /// The body reason is sanitized as a header reason is before it is
+    /// recorded: control and bidi/invisible format characters are stripped,
+    /// so the audit log cannot display a reason differently from what it
+    /// holds. Mutation: the body reason recorded only trimmed.
+    async fn a_ban_reason_is_recorded_without_bidi_or_invisible_chars_case() {
+        let harness = TestHarness::new().await;
+        let (_a, session_a, user_a) = harness.new_user().await; // owner
+        let (_b, _session_b, user_b) = harness.new_user().await; // target
+        let (server, _channels) = harness.new_server(&user_a).await;
+
+        let response = ban_with(
+            &harness,
+            &session_a.token,
+            &server.id,
+            &user_b.id,
+            serde_json::json!({ "reason": "spam\u{202E}evil\u{200B}" }),
+        )
+        .await;
+        ban_answered(response, "a ban with bidi characters in its reason").await;
+
+        let entries = audit_entries(&harness, &server.id).await;
+        assert_eq!(entries.len(), 1, "one ban, one audit entry: {entries:?}");
+        assert_eq!(
+            ban_entry(&entries, &user_a.id, &user_b.id)
+                .reason
+                .as_deref(),
+            Some("spamevil")
         );
     }
 

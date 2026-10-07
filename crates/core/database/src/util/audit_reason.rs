@@ -30,30 +30,46 @@ impl AuditLogReason {
     }
 
     /// Strip control characters and invisible bidi/format characters, then
-    /// trim. An empty result is `None`; more than
-    /// [`AUDIT_LOG_REASON_MAX_CHARS`] chars is `AuditLogReasonTooLong`.
+    /// trim (see [`sanitize_reason_text`]). An empty result is `None`; more
+    /// than [`AUDIT_LOG_REASON_MAX_CHARS`] chars is `AuditLogReasonTooLong`.
     pub fn validated(self) -> Result<Option<String>> {
         let Some(raw) = self.0 else {
             return Ok(None);
         };
 
-        let stripped: String = raw
-            .chars()
-            .filter(|c| !c.is_control() && !is_invisible_format(*c))
-            .collect();
-        let trimmed = stripped.trim();
-        if trimmed.is_empty() {
+        let Some(reason) = sanitize_reason_text(&raw) else {
             return Ok(None);
-        }
+        };
 
-        if trimmed.chars().count() > AUDIT_LOG_REASON_MAX_CHARS {
+        if reason.chars().count() > AUDIT_LOG_REASON_MAX_CHARS {
             return Err(create_error!(FailedValidation {
                 error: "AuditLogReasonTooLong".to_string(),
             }));
         }
 
-        Ok(Some(trimmed.to_string()))
+        Ok(Some(reason))
     }
+}
+
+/// Strip control characters and invisible bidi/format characters from a
+/// reason, then trim. An empty result is `None`.
+///
+/// No length cap is applied: callers enforce their own. The reason header
+/// gets its 512-char cap in [`AuditLogReason::validated`]; a reason taken
+/// from a request body (a ban's, which may run to 1024 characters) keeps
+/// the body validator's limit but is sanitized the same way before it is
+/// recorded in the audit log.
+pub fn sanitize_reason_text(raw: &str) -> Option<String> {
+    let stripped: String = raw
+        .chars()
+        .filter(|c| !c.is_control() && !is_invisible_format(*c))
+        .collect();
+    let trimmed = stripped.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    Some(trimmed.to_string())
 }
 
 /// Bidi marks/overrides/isolates, zero-width characters and the Unicode line
@@ -326,6 +342,62 @@ mod tests {
 
         let ascii = "a".repeat(AUDIT_LOG_REASON_MAX_CHARS + 1);
         assert!(is_too_long(check(Some(&ascii))));
+    }
+
+    #[test]
+    fn sanitize_reason_text_strips_bidi_and_invisible_chars() {
+        assert_eq!(
+            sanitize_reason_text("spam\u{202E}evil\u{200B}"),
+            Some("spamevil".to_string())
+        );
+        assert_eq!(
+            sanitize_reason_text("  a\u{2066}b\u{2069}\u{061C}c\u{2028}d\u{FEFF}\te  "),
+            Some("abcde".to_string())
+        );
+        // Ordinary non-ASCII text survives.
+        assert_eq!(
+            sanitize_reason_text("caf\u{E9} \u{2713}"),
+            Some("caf\u{E9} \u{2713}".to_string())
+        );
+    }
+
+    #[test]
+    fn sanitize_reason_text_of_only_invisible_chars_is_none() {
+        assert_eq!(sanitize_reason_text(""), None);
+        assert_eq!(sanitize_reason_text("   "), None);
+        assert_eq!(sanitize_reason_text("\u{202E}\u{200B}"), None);
+        assert_eq!(
+            sanitize_reason_text(" \u{FEFF}\n\u{2066}\u{2069}\u{2029} "),
+            None
+        );
+    }
+
+    #[test]
+    fn sanitize_reason_text_has_no_length_cap() {
+        let reason = "x".repeat(600);
+        assert_eq!(sanitize_reason_text(&reason), Some(reason.clone()));
+        let padded = format!("\u{202E} {} \u{200B}", "\u{2713}".repeat(600));
+        assert_eq!(sanitize_reason_text(&padded), Some("\u{2713}".repeat(600)));
+        // The header path caps the same text.
+        assert!(is_too_long(check(Some(&reason))));
+    }
+
+    #[test]
+    fn validated_is_sanitize_reason_text_under_the_cap() {
+        for raw in [
+            "",
+            "  ",
+            "spam\u{202E}evil\u{200B}",
+            "  trimmed  ",
+            "line1\nline2",
+            "\u{061C}\u{2028}\u{2029}",
+        ] {
+            assert_eq!(
+                AuditLogReason(Some(raw.to_string())).validated().unwrap(),
+                sanitize_reason_text(raw),
+                "{raw:?}"
+            );
+        }
     }
 
     #[test]
