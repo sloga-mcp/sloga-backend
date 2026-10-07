@@ -1,6 +1,8 @@
+use revolt_database::util::audit_reason::AuditLogReason;
 use revolt_database::{
     util::{permissions::DatabasePermissionQuery, reference::Reference}, voice::{sync_server_voice_permissions, VoiceClient}, Database, User
 };
+use revolt_database::{AuditLogAction, AuditLogChange, AuditLogDraft, AuditLogEntry, AuditValue};
 use revolt_models::v0;
 use revolt_permissions::{calculate_server_permissions, ChannelPermission};
 use revolt_result::{create_error, Result};
@@ -17,7 +19,11 @@ pub async fn edit_role_ranks(
     user: User,
     target: Reference<'_>,
     data: Json<v0::DataEditRoleRanks>,
+    reason: AuditLogReason,
 ) -> Result<Json<v0::Server>> {
+    // Refuse an over-long reason before anything is reordered.
+    let reason = reason.validated()?;
+
     let data = data.into_inner();
 
     let mut server = target.as_server(db).await?;
@@ -68,7 +74,40 @@ pub async fn edit_role_ranks(
         }
     }
 
+    // The order to log, or None when every role already holds the rank this
+    // request gives it (a resubmitted order writes no entry). Read before the
+    // write, which changes `server.roles` in place.
+    let logged_ranks = if new_order
+        .iter()
+        .enumerate()
+        .any(|(rank, id)| server.roles.get(id).map(|role| role.rank) != Some(rank as i64))
+    {
+        Some(new_order.clone())
+    } else {
+        None
+    };
+
     server.set_role_ordering(db, new_order).await?;
+
+    // Logged between the write and the sync: the sync stays the last step.
+    if let Some(ranks) = logged_ranks {
+        AuditLogEntry::record(
+            db,
+            AuditLogDraft {
+                server: server.id.clone(),
+                actor: Some(user.id.clone()),
+                action: AuditLogAction::RoleRanksUpdate,
+                changes: vec![AuditLogChange::new(
+                    "ranks",
+                    None,
+                    Some(AuditValue::StringList(ranks)),
+                )],
+                reason,
+                ..Default::default()
+            },
+        )
+        .await;
+    }
 
     // Every channel is tried before the first failure is answered (AFK S-3
     // D-6); `server` already carries the new ranks.
@@ -79,9 +118,17 @@ pub async fn edit_role_ranks(
 
 #[cfg(test)]
 mod test {
-    use revolt_database::{fixture, PartialServer, Server};
+    use std::collections::HashMap;
+
+    use revolt_database::util::audit_reason::{
+        AUDIT_LOG_REASON_HEADER, AUDIT_LOG_REASON_MAX_CHARS,
+    };
+    use revolt_database::{
+        fixture, AuditLogAction, AuditLogChange, AuditLogEntry, AuditValue, PartialServer, Server,
+    };
     use revolt_models::v0;
     use rocket::http::{ContentType, Header, Status};
+    use serde_json::Value;
 
     use crate::util::test::TestHarness;
 
@@ -539,6 +586,237 @@ mod test {
 
             let server = harness.db.fetch_server(&server.id).await.expect("server");
             assert_eq!(server.default_permissions, 0, "the default landed");
+        })
+    }
+
+    // ---- the audit entry of a rank edit (moderation slice 1) ----
+
+    /// PATCH the ranks; returns the status and the raw JSON body (Null when
+    /// the body is not JSON).
+    async fn edit_ranks(
+        harness: &TestHarness,
+        token: &str,
+        server_id: &str,
+        ranks: &[String],
+        reason: Option<&str>,
+    ) -> (Status, Value) {
+        let mut request = harness
+            .client
+            .patch(format!("/servers/{}/roles/ranks", server_id))
+            .header(ContentType::JSON)
+            .body(
+                json!(v0::DataEditRoleRanks {
+                    ranks: ranks.to_vec()
+                })
+                .to_string(),
+            )
+            .header(Header::new("x-session-token", token.to_string()));
+        if let Some(reason) = reason {
+            request = request.header(Header::new(AUDIT_LOG_REASON_HEADER, reason.to_string()));
+        }
+        let response = request.dispatch().await;
+        let status = response.status();
+        let body = response.into_string().await.unwrap_or_default();
+        (status, serde_json::from_str(&body).unwrap_or(Value::Null))
+    }
+
+    async fn audit_log(harness: &TestHarness, server_id: &str) -> Vec<AuditLogEntry> {
+        harness
+            .db
+            .fetch_audit_log(server_id, None, 50, None, None)
+            .await
+            .expect("fetch audit log")
+    }
+
+    /// Every role's stored rank, by role id.
+    async fn stored_ranks(harness: &TestHarness, server_id: &str) -> HashMap<String, i64> {
+        let server = harness.db.fetch_server(server_id).await.expect("server");
+        server
+            .roles
+            .iter()
+            .map(|(id, role)| (id.clone(), role.rank))
+            .collect()
+    }
+
+    fn ordered_ids(server: &Server) -> Vec<String> {
+        server
+            .ordered_roles()
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect()
+    }
+
+    /// A moderator reorders the roles below them with a percent-encoded
+    /// reason: the new order is stored and exactly one `role_ranks_update`
+    /// entry is written, actor = the moderator, no target, no channel, no
+    /// count, `ranks` = the new order, the reason decoded.
+    #[test]
+    fn a_rank_edit_writes_one_role_ranks_update_entry() {
+        crate::util::test::rt().block_on(async {
+            let harness = TestHarness::new().await;
+            fixture!(harness.db, "server_with_many_roles",
+                moderator user 1
+                server server 4);
+            let (_, session) = harness.account_from_user(moderator.id.clone()).await;
+
+            let mut ranks = ordered_ids(&server);
+            ranks.swap(2, 3);
+            let (status, body) = edit_ranks(
+                &harness,
+                &session.token,
+                &server.id,
+                &ranks,
+                Some("tidy%20up%3A%20lower%20roles"),
+            )
+            .await;
+            assert_eq!(status, Status::Ok, "body: {}", body);
+
+            let after = harness.db.fetch_server(&server.id).await.expect("server");
+            assert_eq!(ordered_ids(&after), ranks, "the new order is stored");
+
+            let entries = audit_log(&harness, &server.id).await;
+            assert_eq!(entries.len(), 1, "{:?}", entries);
+            let entry = &entries[0];
+            assert_eq!(entry.server, server.id);
+            assert_eq!(entry.action, AuditLogAction::RoleRanksUpdate);
+            assert_eq!(entry.actor.as_deref(), Some(moderator.id.as_str()));
+            assert_eq!(entry.target, None);
+            assert_eq!(entry.channel, None);
+            assert_eq!(entry.count, None);
+            assert_eq!(
+                entry.changes,
+                vec![AuditLogChange::new(
+                    "ranks",
+                    None,
+                    Some(AuditValue::StringList(ranks.clone()))
+                )]
+            );
+            assert_eq!(entry.reason.as_deref(), Some("tidy up: lower roles"));
+        })
+    }
+
+    /// Resubmitting the order every role already holds succeeds and writes no
+    /// entry. The fixture's two lower roles share a rank, so the first edit
+    /// (which settles the tie) is a change and is logged; the same order sent
+    /// again is not. Mutation: the `logged_ranks` check dropped.
+    #[test]
+    fn resubmitting_the_stored_order_logs_nothing() {
+        crate::util::test::rt().block_on(async {
+            let harness = TestHarness::new().await;
+            fixture!(harness.db, "server_with_many_roles",
+                owner user 0
+                server server 4);
+            let (_, session) = harness.account_from_user(owner.id.clone()).await;
+
+            let ranks = ordered_ids(&server);
+            let (status, body) =
+                edit_ranks(&harness, &session.token, &server.id, &ranks, None).await;
+            assert_eq!(status, Status::Ok, "body: {}", body);
+            let entries = audit_log(&harness, &server.id).await;
+            assert_eq!(
+                entries.len(),
+                1,
+                "settling the tie is logged: {:?}",
+                entries
+            );
+
+            let before = stored_ranks(&harness, &server.id).await;
+            let (status, body) = edit_ranks(
+                &harness,
+                &session.token,
+                &server.id,
+                &ranks,
+                Some("no%20change"),
+            )
+            .await;
+            assert_eq!(status, Status::Ok, "body: {}", body);
+            assert_eq!(stored_ranks(&harness, &server.id).await, before);
+
+            let entries = audit_log(&harness, &server.id).await;
+            assert_eq!(
+                entries.len(),
+                1,
+                "the same order is not logged: {:?}",
+                entries
+            );
+            assert_eq!(
+                entries[0].reason, None,
+                "the logged entry is the first edit"
+            );
+        })
+    }
+
+    /// Refused rank edits write nothing and change nothing: a moderator
+    /// reordering roles above them (NotElevated), and an order that leaves a
+    /// role out (InvalidOperation).
+    #[test]
+    fn a_refused_rank_edit_logs_nothing() {
+        crate::util::test::rt().block_on(async {
+            let harness = TestHarness::new().await;
+            fixture!(harness.db, "server_with_many_roles",
+                moderator user 1
+                server server 4);
+            let (_, session) = harness.account_from_user(moderator.id.clone()).await;
+            let before = stored_ranks(&harness, &server.id).await;
+
+            let mut above = ordered_ids(&server);
+            above.swap(0, 1);
+            let (status, body) = edit_ranks(
+                &harness,
+                &session.token,
+                &server.id,
+                &above,
+                Some("not%20allowed"),
+            )
+            .await;
+            assert_eq!(status, Status::Forbidden, "body: {}", body);
+            assert_eq!(body["type"], "NotElevated", "body: {}", body);
+
+            let mut missing = ordered_ids(&server);
+            missing.pop();
+            let (status, body) = edit_ranks(
+                &harness,
+                &session.token,
+                &server.id,
+                &missing,
+                Some("not%20allowed"),
+            )
+            .await;
+            assert_eq!(status, Status::BadRequest, "body: {}", body);
+            assert_eq!(body["type"], "InvalidOperation", "body: {}", body);
+
+            assert_eq!(stored_ranks(&harness, &server.id).await, before);
+            let entries = audit_log(&harness, &server.id).await;
+            assert!(entries.is_empty(), "{:?}", entries);
+        })
+    }
+
+    /// A reason one char over the limit is refused with
+    /// FailedValidation/AuditLogReasonTooLong BEFORE the write: the stored
+    /// ranks are unchanged and nothing is logged. Mutation: the
+    /// `validated()?` moved below the write.
+    #[test]
+    fn an_overlong_reason_is_refused_and_the_order_stands() {
+        crate::util::test::rt().block_on(async {
+            let harness = TestHarness::new().await;
+            fixture!(harness.db, "server_with_many_roles",
+                owner user 0
+                server server 4);
+            let (_, session) = harness.account_from_user(owner.id.clone()).await;
+            let before = stored_ranks(&harness, &server.id).await;
+
+            let mut ranks = ordered_ids(&server);
+            ranks.swap(2, 3);
+            let reason = "a".repeat(AUDIT_LOG_REASON_MAX_CHARS + 1);
+            let (status, body) =
+                edit_ranks(&harness, &session.token, &server.id, &ranks, Some(&reason)).await;
+            assert_eq!(status, Status::BadRequest, "body: {}", body);
+            assert_eq!(body["type"], "FailedValidation", "body: {}", body);
+            assert_eq!(body["error"], "AuditLogReasonTooLong", "body: {}", body);
+
+            assert_eq!(stored_ranks(&harness, &server.id).await, before);
+            let entries = audit_log(&harness, &server.id).await;
+            assert!(entries.is_empty(), "{:?}", entries);
         })
     }
 }
