@@ -45,7 +45,16 @@ pub async fn set_role_permissions(
                 return Err(create_error!(NotElevated));
             }
 
-            let current_value: Override = role.permissions.into();
+            // The baseline is the channel's own override for this role (SEC-099),
+            // not the role's server-level permissions: lifting a channel deny or
+            // adding a channel allow is judged against what this channel holds.
+            let current_value: Option<Override> = match &channel {
+                revolt_database::Channel::TextChannel { role_permissions, .. }
+                | revolt_database::Channel::Forum { role_permissions, .. } => {
+                    role_permissions.get(&role_id).map(|field| (*field).into())
+                }
+                _ => None,
+            };
             permissions
                 .throw_permission_override(current_value, &data.permissions)
                 .await?;
@@ -110,6 +119,381 @@ pub async fn set_role_permissions(
         }
     } else {
         Err(create_error!(InvalidOperation))
+    }
+}
+
+#[cfg(test)]
+mod baseline {
+    //! SEC-099: a role's channel override is judged against the override
+    //! this channel already holds for the role, never against the role's
+    //! server-level permissions. Owner O and actor A (holding a rank-1 role)
+    //! on a fresh server per test, the target role at rank 5; at most two
+    //! requests per actor per channel (the "channels" bucket allows 15).
+
+    use crate::util::test::{rt, TestHarness};
+    use revolt_database::{
+        Channel, Member, PartialChannel, PartialMember, PartialRole, Role, Server, User,
+    };
+    use revolt_models::v0;
+    use revolt_permissions::{ChannelPermission, OverrideField};
+    use rocket::http::{ContentType, Header, Status};
+    use serde_json::{json, Value};
+
+    const MANAGE_ROLE: u64 = ChannelPermission::ManageRole as u64;
+    const MANAGE_PERMISSIONS: u64 = ChannelPermission::ManagePermissions as u64;
+    const MANAGE_MESSAGES: u64 = ChannelPermission::ManageMessages as u64;
+    const SEND_MESSAGE: u64 = ChannelPermission::SendMessage as u64;
+
+    struct BaselineFixture {
+        harness: TestHarness,
+        server: Server,
+        /// The server's default text channel.
+        channel: Channel,
+        actor: User,
+        actor_token: String,
+    }
+
+    /// A fresh server owned by O, with A holding a rank-1 role that allows
+    /// `actor_allow` server-wide.
+    async fn baseline_fixture(actor_allow: u64) -> BaselineFixture {
+        let harness = TestHarness::new().await;
+        let (_, _, owner) = harness.new_user().await;
+        let (_, actor_session, actor) = harness.new_user().await;
+        let (server, channels) = harness.new_server(&owner).await;
+        Member::create(&harness.db, &server, &actor, None)
+            .await
+            .expect("member");
+
+        let actor_role = baseline_role(&harness, &server, 1, actor_allow, 0).await;
+        baseline_grant(&harness, &server, &actor, &actor_role).await;
+        let channel = channels.into_iter().next().expect("the default channel");
+
+        BaselineFixture {
+            harness,
+            server,
+            channel,
+            actor,
+            actor_token: actor_session.token,
+        }
+    }
+
+    /// A role at `rank` with the server-level override `allow` / `deny`.
+    /// `Role::create` derives the rank from the (stale) server passed in, so
+    /// it is set here instead.
+    async fn baseline_role(
+        harness: &TestHarness,
+        server: &Server,
+        rank: i64,
+        allow: u64,
+        deny: u64,
+    ) -> Role {
+        let mut role = harness
+            .new_role(
+                server,
+                rank,
+                Some(OverrideField {
+                    a: allow as i64,
+                    d: deny as i64,
+                }),
+            )
+            .await;
+        role.update(
+            &harness.db,
+            &server.id,
+            PartialRole {
+                rank: Some(rank),
+                ..Default::default()
+            },
+            Vec::new(),
+        )
+        .await
+        .expect("role rank");
+        role
+    }
+
+    async fn baseline_grant(harness: &TestHarness, server: &Server, user: &User, role: &Role) {
+        let mut member = harness
+            .db
+            .fetch_member(&server.id, &user.id)
+            .await
+            .expect("member read");
+        let mut roles = member.roles.clone();
+        roles.push(role.id.clone());
+        member
+            .update(
+                &harness.db,
+                PartialMember {
+                    roles: Some(roles),
+                    ..Default::default()
+                },
+                Vec::new(),
+            )
+            .await
+            .expect("member roles");
+    }
+
+    /// A forum channel on the server, which is re-read first: the fixture's
+    /// copy is stale once roles have been created.
+    async fn baseline_forum(harness: &TestHarness, server: &Server) -> Channel {
+        let mut server = harness
+            .db
+            .fetch_server(&server.id)
+            .await
+            .expect("server read");
+        Channel::create_server_channel(
+            &harness.db,
+            &mut server,
+            v0::DataCreateServerChannel {
+                channel_type: v0::LegacyServerChannelType::Forum,
+                name: "forum".to_string(),
+                ..Default::default()
+            },
+            true,
+        )
+        .await
+        .expect("forum created")
+    }
+
+    /// The role overrides of a text channel or a forum.
+    fn overrides_of(channel: &Channel) -> &std::collections::HashMap<String, OverrideField> {
+        match channel {
+            Channel::TextChannel {
+                role_permissions, ..
+            }
+            | Channel::Forum {
+                role_permissions, ..
+            } => role_permissions,
+            _ => panic!("a text channel or a forum"),
+        }
+    }
+
+    /// `role`'s override on `channel`, written through `update`: the
+    /// reference driver's `set_channel_role_permission` only replaces an
+    /// EXISTING entry.
+    async fn write_override(
+        harness: &TestHarness,
+        channel: &Channel,
+        role: &Role,
+        allow: u64,
+        deny: u64,
+    ) {
+        let mut channel = harness
+            .db
+            .fetch_channel(channel.id())
+            .await
+            .expect("channel read");
+        let mut role_permissions = overrides_of(&channel).clone();
+        role_permissions.insert(
+            role.id.clone(),
+            OverrideField {
+                a: allow as i64,
+                d: deny as i64,
+            },
+        );
+        channel
+            .update(
+                &harness.db,
+                PartialChannel {
+                    role_permissions: Some(role_permissions),
+                    ..Default::default()
+                },
+                Vec::new(),
+            )
+            .await
+            .expect("channel override");
+    }
+
+    /// `role`'s override on `channel` as stored.
+    async fn stored_override(
+        harness: &TestHarness,
+        channel: &Channel,
+        role: &Role,
+    ) -> Option<OverrideField> {
+        let channel = harness
+            .db
+            .fetch_channel(channel.id())
+            .await
+            .expect("channel read");
+        overrides_of(&channel).get(&role.id).copied()
+    }
+
+    fn field(allow: u64, deny: u64) -> Option<OverrideField> {
+        Some(OverrideField {
+            a: allow as i64,
+            d: deny as i64,
+        })
+    }
+
+    /// PUT `role`'s override on `channel` as A: the status and the JSON body.
+    async fn put_override(
+        f: &BaselineFixture,
+        channel: &Channel,
+        role: &Role,
+        allow: u64,
+        deny: u64,
+    ) -> (Status, Value) {
+        let response = f
+            .harness
+            .client
+            .put(format!("/channels/{}/permissions/{}", channel.id(), role.id))
+            .header(ContentType::JSON)
+            .header(Header::new("x-session-token", f.actor_token.clone()))
+            .body(json!({ "permissions": { "allow": allow, "deny": deny } }).to_string())
+            .dispatch()
+            .await;
+        let status = response.status();
+        let body = response.into_string().await.unwrap_or_default();
+        (status, serde_json::from_str(&body).unwrap_or(Value::Null))
+    }
+
+    fn assert_cannot_give(answer: &(Status, Value)) {
+        assert_eq!(answer.0, Status::Forbidden, "refused: {}", answer.1);
+        assert_eq!(
+            answer.1["type"], "CannotGiveMissingPermissions",
+            "{}",
+            answer.1
+        );
+    }
+
+    /// The edit landed: 200 with the channel, whose override for `role` is
+    /// now `allow` / `deny`, as stored.
+    async fn assert_set(
+        f: &BaselineFixture,
+        answer: &(Status, Value),
+        channel: &Channel,
+        role: &Role,
+        allow: u64,
+        deny: u64,
+    ) {
+        assert_eq!(answer.0, Status::Ok, "set: {}", answer.1);
+        assert_eq!(answer.1["_id"], channel.id(), "{}", answer.1);
+        assert_eq!(
+            answer.1["role_permissions"][&role.id],
+            json!({ "a": allow, "d": deny }),
+            "{}",
+            answer.1
+        );
+        assert_eq!(
+            stored_override(&f.harness, channel, role).await,
+            field(allow, deny),
+            "the override is stored"
+        );
+    }
+
+    /// (p1) Helper allows ManageMessages server-wide and is denied it on the
+    /// channel. A may manage the channel's permissions and ranks above
+    /// Helper but lacks ManageMessages, so clearing that deny is refused.
+    #[test]
+    fn lifting_a_channel_deny_needs_the_denied_bit() {
+        rt().block_on(async {
+            let f = baseline_fixture(MANAGE_PERMISSIONS).await;
+            let helper = baseline_role(&f.harness, &f.server, 5, MANAGE_MESSAGES, 0).await;
+            write_override(&f.harness, &f.channel, &helper, 0, MANAGE_MESSAGES).await;
+
+            let answer = put_override(&f, &f.channel, &helper, 0, 0).await;
+            assert_cannot_give(&answer);
+            assert_eq!(
+                stored_override(&f.harness, &f.channel, &helper).await,
+                field(0, MANAGE_MESSAGES),
+                "the channel deny is intact"
+            );
+        })
+    }
+
+    /// (p2) With no override on the channel, a channel allow of a bit the
+    /// role already has server-wide still needs A to hold that bit.
+    #[test]
+    fn a_channel_allow_needs_the_bit_even_if_the_role_has_it_server_wide() {
+        rt().block_on(async {
+            let f = baseline_fixture(MANAGE_PERMISSIONS).await;
+            let helper = baseline_role(&f.harness, &f.server, 5, MANAGE_MESSAGES, 0).await;
+
+            let answer = put_override(&f, &f.channel, &helper, MANAGE_MESSAGES, 0).await;
+            assert_cannot_give(&answer);
+            assert_eq!(
+                stored_override(&f.harness, &f.channel, &helper).await,
+                None,
+                "no override is written"
+            );
+        })
+    }
+
+    /// (p3) Control for (p1): an A that holds ManageMessages lifts the same
+    /// channel deny.
+    #[test]
+    fn holding_the_denied_bit_lets_a_manager_lift_the_channel_deny() {
+        rt().block_on(async {
+            let f = baseline_fixture(MANAGE_PERMISSIONS | MANAGE_MESSAGES).await;
+            let helper = baseline_role(&f.harness, &f.server, 5, MANAGE_MESSAGES, 0).await;
+            write_override(&f.harness, &f.channel, &helper, 0, MANAGE_MESSAGES).await;
+
+            let answer = put_override(&f, &f.channel, &helper, 0, 0).await;
+            assert_set(&f, &answer, &f.channel, &helper, 0, 0).await;
+        })
+    }
+
+    /// (p4) Muted denies SendMessage on the channel only. A has ManageRole
+    /// and ManagePermissions and holds Muted, so lacks SendMessage there.
+    /// Step one of the bypass, clearing the channel override, is refused;
+    /// step two, deleting the role, is refused by the SEC-100 gate.
+    #[test]
+    fn the_two_step_role_delete_bypass_is_closed() {
+        rt().block_on(async {
+            let f = baseline_fixture(MANAGE_ROLE | MANAGE_PERMISSIONS).await;
+            let muted = baseline_role(&f.harness, &f.server, 5, 0, 0).await;
+            write_override(&f.harness, &f.channel, &muted, 0, SEND_MESSAGE).await;
+            baseline_grant(&f.harness, &f.server, &f.actor, &muted).await;
+
+            let answer = put_override(&f, &f.channel, &muted, 0, 0).await;
+            assert_cannot_give(&answer);
+            assert_eq!(
+                stored_override(&f.harness, &f.channel, &muted).await,
+                field(0, SEND_MESSAGE),
+                "the channel deny is intact"
+            );
+
+            let response = f
+                .harness
+                .client
+                .delete(format!("/servers/{}/roles/{}", f.server.id, muted.id))
+                .header(Header::new("x-session-token", f.actor_token.clone()))
+                .dispatch()
+                .await;
+            let status = response.status();
+            let body = response.into_string().await.unwrap_or_default();
+            assert_cannot_give(&(status, serde_json::from_str(&body).unwrap_or(Value::Null)));
+            let server = f
+                .harness
+                .db
+                .fetch_server(&f.server.id)
+                .await
+                .expect("server read");
+            assert!(server.roles.contains_key(&muted.id), "Muted is kept");
+            assert_eq!(
+                stored_override(&f.harness, &f.channel, &muted).await,
+                field(0, SEND_MESSAGE),
+                "the channel deny is still intact"
+            );
+        })
+    }
+
+    /// (p5) (p1) on a forum: the baseline reads a forum's overrides too.
+    #[test]
+    fn lifting_a_forum_deny_needs_the_denied_bit() {
+        rt().block_on(async {
+            let f = baseline_fixture(MANAGE_PERMISSIONS).await;
+            let forum = baseline_forum(&f.harness, &f.server).await;
+            let helper = baseline_role(&f.harness, &f.server, 5, MANAGE_MESSAGES, 0).await;
+            write_override(&f.harness, &forum, &helper, 0, MANAGE_MESSAGES).await;
+
+            let answer = put_override(&f, &forum, &helper, 0, 0).await;
+            assert_cannot_give(&answer);
+            assert_eq!(
+                stored_override(&f.harness, &forum, &helper).await,
+                field(0, MANAGE_MESSAGES),
+                "the forum deny is intact"
+            );
+        })
     }
 }
 
