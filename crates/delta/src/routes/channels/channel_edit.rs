@@ -57,6 +57,33 @@ pub async fn edit(
         }
     }
 
+    // Clearing the @everyone override is a permission edit, held to the bar of
+    // PUT /channels/<id>/permissions/default: ManagePermissions, and no lifting a
+    // deny the caller does not hold (a cleared override is allow 0 / deny 0).
+    // Only server text channels and forums carry it. Before any write.
+    let clears_default_permissions = data.remove.contains(&v0::FieldsChannel::DefaultPermissions);
+    if clears_default_permissions {
+        let current = match &channel {
+            Channel::TextChannel {
+                default_permissions,
+                ..
+            }
+            | Channel::Forum {
+                default_permissions,
+                ..
+            } => *default_permissions,
+            _ => return Err(create_error!(InvalidOperation)),
+        };
+
+        permissions.throw_if_lacking_channel_permission(ChannelPermission::ManagePermissions)?;
+        permissions
+            .throw_permission_override(
+                current.map(revolt_permissions::Override::from),
+                &revolt_permissions::Override::default(),
+            )
+            .await?;
+    }
+
     if data.name.is_none()
         && data.description.is_none()
         && data.icon.is_none()
@@ -602,6 +629,23 @@ pub async fn edit(
         }
 
         delete_voice_channel(db, voice_client, &UserVoiceChannel::from_channel(&channel)).await?;
+    }
+
+    // A cleared default override changes what members may do in a call here:
+    // push the new grants, as permissions_set_default does after its write. A
+    // channel this edit de-voiced was torn down above instead.
+    if clears_default_permissions && channel.voice().is_some() {
+        if let Channel::TextChannel { server, .. } = &channel {
+            let server = db.fetch_server(server).await?;
+            revolt_database::voice::sync_voice_permissions(
+                db,
+                voice_client,
+                &channel,
+                Some(&server),
+                None,
+            )
+            .await?;
+        }
     }
 
     Ok(Json(channel.into()))
@@ -2057,6 +2101,478 @@ mod tests {
         assert_eq!(
             designated(&harness, &server.id).await.as_deref(),
             Some(gated.id())
+        );
+    }
+
+    // ---- Clearing the @everyone override (`remove: ["DefaultPermissions"]`) --
+
+    const VIEW: u64 = revolt_permissions::ChannelPermission::ViewChannel as u64;
+    const SEND: u64 = revolt_permissions::ChannelPermission::SendMessage as u64;
+    const MANAGE_CHANNEL: u64 = revolt_permissions::ChannelPermission::ManageChannel as u64;
+    const MANAGE_PERMISSIONS: u64 = revolt_permissions::ChannelPermission::ManagePermissions as u64;
+
+    fn override_field(allow: u64, deny: u64) -> revolt_permissions::OverrideField {
+        revolt_permissions::OverrideField {
+            a: allow as i64,
+            d: deny as i64,
+        }
+    }
+
+    /// Give `user_id` one server role allowing `allow` at the server level.
+    async fn grant_server_role(
+        fx: &ForumFixture,
+        user_id: &str,
+        allow: u64,
+    ) -> revolt_database::Role {
+        let role = fx
+            .harness
+            .new_role(&fx.server, 1, Some(override_field(allow, 0)))
+            .await;
+        let mut member = fx
+            .harness
+            .db
+            .fetch_member(&fx.server.id, user_id)
+            .await
+            .expect("member");
+        member
+            .update(
+                &fx.harness.db,
+                revolt_database::PartialMember {
+                    roles: Some(vec![role.id.clone()]),
+                    ..Default::default()
+                },
+                vec![],
+            )
+            .await
+            .expect("assign the role");
+        role
+    }
+
+    /// Write a channel's @everyone override and one role's override on it.
+    /// Through `update`, not `set_role_permission`: the reference driver's
+    /// `set_channel_role_permission` only replaces an EXISTING role entry.
+    async fn set_channel_overrides(
+        harness: &TestHarness,
+        channel_id: &str,
+        everyone: revolt_permissions::OverrideField,
+        role_id: &str,
+        role: revolt_permissions::OverrideField,
+    ) {
+        let mut channel = harness.db.fetch_channel(channel_id).await.expect("channel");
+        let mut role_permissions = match &channel {
+            revolt_database::Channel::TextChannel {
+                role_permissions, ..
+            }
+            | revolt_database::Channel::Forum {
+                role_permissions, ..
+            } => role_permissions.clone(),
+            other => panic!("expected a text channel or a forum, got {:?}", other),
+        };
+        role_permissions.insert(role_id.to_string(), role);
+        channel
+            .update(
+                &harness.db,
+                revolt_database::PartialChannel {
+                    default_permissions: Some(everyone),
+                    role_permissions: Some(role_permissions),
+                    ..Default::default()
+                },
+                vec![],
+            )
+            .await
+            .expect("channel overrides");
+    }
+
+    /// The channel's @everyone override as stored.
+    async fn stored_default_override(
+        harness: &TestHarness,
+        id: &str,
+    ) -> Option<revolt_permissions::OverrideField> {
+        match harness.db.fetch_channel(id).await.expect("channel") {
+            revolt_database::Channel::TextChannel {
+                default_permissions,
+                ..
+            }
+            | revolt_database::Channel::Forum {
+                default_permissions,
+                ..
+            } => default_permissions,
+            other => panic!("expected a text channel or a forum, got {:?}", other),
+        }
+    }
+
+    /// Clearing the @everyone override is a permission edit: ManageChannel
+    /// alone is refused with ManagePermissions named, alone or alongside
+    /// another removal, on a text channel and on a forum, and nothing is
+    /// written. The caller sees the hidden channel through a role override.
+    /// Control: the same caller may still remove the description. Mutation:
+    /// the ManagePermissions check deleted.
+    #[test]
+    fn manage_channel_alone_cannot_clear_the_default_override() {
+        crate::util::test::rt()
+            .block_on(manage_channel_alone_cannot_clear_the_default_override_case())
+    }
+
+    async fn manage_channel_alone_cannot_clear_the_default_override_case() {
+        let fx = forum_fixture().await;
+        let text = fx.harness.new_channel(&fx.server).await;
+        let role = grant_server_role(&fx, &fx.outsider_session.user_id, MANAGE_CHANNEL).await;
+        let hidden = override_field(0, VIEW);
+
+        for channel in [&text, &fx.forum] {
+            set_channel_overrides(
+                &fx.harness,
+                channel.id(),
+                hidden,
+                &role.id,
+                override_field(VIEW, 0),
+            )
+            .await;
+
+            for body in [
+                json!({ "remove": ["DefaultPermissions"] }),
+                json!({ "remove": ["DefaultPermissions", "Description"] }),
+            ] {
+                let response = patch(
+                    &fx.harness,
+                    &fx.outsider_session,
+                    channel.id(),
+                    body.clone(),
+                )
+                .await;
+                assert_error(
+                    response,
+                    Status::Forbidden,
+                    "\"permission\":\"ManagePermissions\"",
+                )
+                .await;
+                assert_eq!(
+                    stored_default_override(&fx.harness, channel.id()).await,
+                    Some(hidden),
+                    "{} must write nothing",
+                    body
+                );
+            }
+
+            let response = patch(
+                &fx.harness,
+                &fx.outsider_session,
+                channel.id(),
+                json!({ "remove": ["Description"] }),
+            )
+            .await;
+            assert_eq!(response.status(), Status::Ok);
+            assert_eq!(
+                stored_default_override(&fx.harness, channel.id()).await,
+                Some(hidden)
+            );
+        }
+    }
+
+    /// A caller holding ManageChannel and ManagePermissions clears it, on a
+    /// text channel and on a forum: stored as unset, and the ChannelUpdate
+    /// fan-out names the cleared field.
+    #[test]
+    fn manage_permissions_clears_the_default_override() {
+        crate::util::test::rt().block_on(manage_permissions_clears_the_default_override_case())
+    }
+
+    async fn manage_permissions_clears_the_default_override_case() {
+        let mut fx = forum_fixture().await;
+        let text = fx.harness.new_channel(&fx.server).await;
+        let role = grant_server_role(
+            &fx,
+            &fx.outsider_session.user_id,
+            MANAGE_CHANNEL | MANAGE_PERMISSIONS,
+        )
+        .await;
+        let forum = fx.forum.clone();
+
+        for channel in [&text, &forum] {
+            set_channel_overrides(
+                &fx.harness,
+                channel.id(),
+                override_field(0, VIEW),
+                &role.id,
+                override_field(VIEW, 0),
+            )
+            .await;
+
+            let response = patch(
+                &fx.harness,
+                &fx.outsider_session,
+                channel.id(),
+                json!({ "remove": ["DefaultPermissions"] }),
+            )
+            .await;
+            assert_eq!(response.status(), Status::Ok);
+            let edited = response.into_json::<v0::Channel>().await.expect("channel");
+            assert!(matches!(
+                edited,
+                v0::Channel::TextChannel {
+                    default_permissions: None,
+                    ..
+                } | v0::Channel::Forum {
+                    default_permissions: None,
+                    ..
+                }
+            ));
+            assert_eq!(
+                stored_default_override(&fx.harness, channel.id()).await,
+                None
+            );
+
+            let channel_id = channel.id().to_string();
+            fx.harness
+                .wait_for_event(&fx.server.id, |event| {
+                    matches!(
+                        event,
+                        revolt_database::events::client::EventV1::ChannelUpdate { id, clear, .. }
+                            if id == &channel_id
+                                && clear.contains(&v0::FieldsChannel::DefaultPermissions)
+                    )
+                })
+                .await;
+        }
+    }
+
+    /// Clearing lifts every deny in the override, so the caller must hold
+    /// each denied permission, as on the PUT route: a caller with
+    /// ManagePermissions who cannot post here may not lift a SendMessage
+    /// deny, and nothing is written. Control: once a role override lets the
+    /// same caller post, the clear goes through. Mutation: the
+    /// `throw_permission_override` call dropped.
+    #[test]
+    fn clearing_cannot_lift_a_deny_the_caller_lacks() {
+        crate::util::test::rt().block_on(clearing_cannot_lift_a_deny_the_caller_lacks_case())
+    }
+
+    async fn clearing_cannot_lift_a_deny_the_caller_lacks_case() {
+        let fx = forum_fixture().await;
+        let text = fx.harness.new_channel(&fx.server).await;
+        let role = grant_server_role(
+            &fx,
+            &fx.outsider_session.user_id,
+            MANAGE_CHANNEL | MANAGE_PERMISSIONS,
+        )
+        .await;
+        let read_only_hidden = override_field(0, VIEW | SEND);
+
+        for channel in [&text, &fx.forum] {
+            // The role shows the caller the channel, but does not let them post.
+            set_channel_overrides(
+                &fx.harness,
+                channel.id(),
+                read_only_hidden,
+                &role.id,
+                override_field(VIEW, 0),
+            )
+            .await;
+
+            let response = patch(
+                &fx.harness,
+                &fx.outsider_session,
+                channel.id(),
+                json!({ "remove": ["DefaultPermissions"] }),
+            )
+            .await;
+            assert_error(response, Status::Forbidden, "CannotGiveMissingPermissions").await;
+            assert_eq!(
+                stored_default_override(&fx.harness, channel.id()).await,
+                Some(read_only_hidden)
+            );
+
+            set_channel_overrides(
+                &fx.harness,
+                channel.id(),
+                read_only_hidden,
+                &role.id,
+                override_field(VIEW | SEND, 0),
+            )
+            .await;
+
+            let response = patch(
+                &fx.harness,
+                &fx.outsider_session,
+                channel.id(),
+                json!({ "remove": ["DefaultPermissions"] }),
+            )
+            .await;
+            assert_eq!(response.status(), Status::Ok);
+            assert_eq!(
+                stored_default_override(&fx.harness, channel.id()).await,
+                None
+            );
+        }
+    }
+
+    /// Only server text channels and forums carry the override: on a thread
+    /// the removal is refused instead of answered with a silent 200, for the
+    /// thread's creator and for the server owner. Mutation: the non-text
+    /// arm answering `None`.
+    #[test]
+    fn clearing_the_default_override_is_refused_on_threads() {
+        crate::util::test::rt().block_on(clearing_the_default_override_is_refused_on_threads_case())
+    }
+
+    async fn clearing_the_default_override_is_refused_on_threads_case() {
+        let fx = forum_fixture().await;
+
+        for session in [&fx.creator_session, &fx.owner_session] {
+            let response = patch(
+                &fx.harness,
+                session,
+                fx.post.id(),
+                json!({ "remove": ["DefaultPermissions"] }),
+            )
+            .await;
+            assert_error(response, Status::BadRequest, "InvalidOperation").await;
+        }
+    }
+
+    /// On a voice channel the clear also re-syncs the call's grants. With no
+    /// room open the sync has nothing to push, and the edit succeeds.
+    #[test]
+    fn clearing_the_default_override_on_a_voice_channel_succeeds() {
+        crate::util::test::rt()
+            .block_on(clearing_the_default_override_on_a_voice_channel_succeeds_case())
+    }
+
+    async fn clearing_the_default_override_on_a_voice_channel_succeeds_case() {
+        let harness = TestHarness::new().await;
+        let (_, session, owner) = harness.new_user().await;
+        let (server, _) = harness.new_server(&owner).await;
+        let mut lounge = new_voice_channel(&harness, &server, json!({ "name": "Lounge" })).await;
+        let hidden = override_field(0, VIEW);
+        lounge
+            .update(
+                &harness.db,
+                revolt_database::PartialChannel {
+                    default_permissions: Some(hidden),
+                    ..Default::default()
+                },
+                vec![],
+            )
+            .await
+            .expect("hide the voice channel");
+        assert_eq!(
+            stored_default_override(&harness, lounge.id()).await,
+            Some(hidden)
+        );
+
+        let response = patch(
+            &harness,
+            &session,
+            lounge.id(),
+            json!({ "remove": ["DefaultPermissions"] }),
+        )
+        .await;
+        assert_eq!(response.status(), Status::Ok);
+        assert_eq!(stored_default_override(&harness, lounge.id()).await, None);
+        assert!(harness
+            .db
+            .fetch_channel(lounge.id())
+            .await
+            .expect("channel")
+            .voice()
+            .is_some());
+    }
+
+    /// The gate on clearing the override runs after the edit permission check
+    /// and before anything is written or announced, demands ManagePermissions,
+    /// checks the lifted denies, and refuses channel types without the
+    /// override. Mutation: the gate moved below `let mut partial`.
+    #[test]
+    fn the_default_override_gate_precedes_every_write() {
+        const FLAG: &str =
+            "let clears_default_permissions = data.remove.contains(&v0::FieldsChannel::DefaultPermissions);";
+        const GATE: &str =
+            "if clears_default_permissions \u{7b} let current = match &channel \u{7b}";
+        const OPEN: &str = "if clears_default_permissions \u{7b}";
+
+        let body = route_body();
+        assert_eq!(body.matches(FLAG).count(), 1, "{}", body);
+        assert_eq!(body.matches(GATE).count(), 1, "{}", body);
+        let flag = body.find(FLAG).expect("counted above");
+        let gate = body.find(GATE).expect("counted above");
+        assert!(flag < gate, "{}", body);
+
+        let permission = body
+            .find("permissions.throw_if_lacking_channel_permission(ChannelPermission::ManageChannel)?;")
+            .expect("the permission check");
+        assert!(permission < gate, "{}", body);
+
+        for needle in [
+            "let mut partial",
+            "db.mark_attachment_as_deleted(",
+            "File::use_channel_icon(",
+            "SystemMessage::",
+            "channel .update(",
+        ] {
+            let at = body
+                .find(needle)
+                .unwrap_or_else(|| panic!("the route lost `{}`: {}", needle, body));
+            assert!(
+                gate < at,
+                "the default override gate must precede `{}`: {}",
+                needle,
+                body
+            );
+        }
+
+        let block = braced(&body, gate + OPEN.len() - 1);
+        for needle in [
+            "_ => return Err(create_error!(InvalidOperation)),",
+            "permissions.throw_if_lacking_channel_permission(ChannelPermission::ManagePermissions)?;",
+            "permissions .throw_permission_override( \
+             current.map(revolt_permissions::Override::from), \
+             &revolt_permissions::Override::default(), ) .await?;",
+        ] {
+            assert!(
+                block.contains(needle),
+                "the gate lost `{}`: {}",
+                needle,
+                block
+            );
+        }
+    }
+
+    /// A cleared override on a voice channel re-syncs the call's grants, as
+    /// the PUT route does: one sync, after the write, only when the override
+    /// was cleared and the channel is still a voice channel. Mutation: the
+    /// re-sync deleted.
+    #[test]
+    fn clearing_the_default_override_resyncs_voice() {
+        const GUARD: &str = "if clears_default_permissions && channel.voice().is_some() \u{7b}";
+        const SYNC: &str = "revolt_database::voice::sync_voice_permissions( db, voice_client, \
+             &channel, Some(&server), None, ) .await?;";
+
+        let body = route_body();
+        assert_eq!(
+            body.matches("sync_voice_permissions(").count(),
+            1,
+            "{}",
+            body
+        );
+        assert_eq!(body.matches(GUARD).count(), 1, "{}", body);
+        let guard = body.find(GUARD).expect("counted above");
+        let update = body.find("channel .update(").expect("the write");
+        assert!(
+            update < guard,
+            "the re-sync must follow the write: {}",
+            body
+        );
+
+        let block = braced(&body, guard + GUARD.len() - 1);
+        assert!(
+            block.contains("let server = db.fetch_server(server).await?;"),
+            "{}",
+            block
+        );
+        assert!(
+            block.contains(SYNC),
+            "the guard lost the re-sync: {}",
+            block
         );
     }
 }
