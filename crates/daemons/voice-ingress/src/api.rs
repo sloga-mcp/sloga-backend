@@ -120,9 +120,12 @@ pub async fn ingress(
                 // stranger. Only `vc:{user}` names the exact channel, and it
                 // is the set the route checked before minting.
                 //
-                // Fails CLOSED: a failed read ejects the leg, as a refusal
-                // does. Answering 500 instead would leave the leg live while
-                // LiveKit retries.
+                // Fails CLOSED, on the read and on the eviction. A failed
+                // read ejects the leg, as a refusal does: answering 500 there
+                // would leave the leg live while LiveKit retries. A failed
+                // eviction answers 500, so LiveKit retries the webhook:
+                // nothing is recorded before it, and the retry re-runs this
+                // check (a leg already gone is success).
                 let in_this_channel = match is_in_voice_channel(user_id, &channel).await {
                     Ok(in_this_channel) => in_this_channel,
                     Err(error) => {
@@ -135,9 +138,12 @@ pub async fn ingress(
                 };
                 if !in_this_channel {
                     log::warn!("Removing orphan screen leg {identity} from channel {channel_id}: owner is not in this channel.");
-                    let _ = voice_client
-                        .remove_identity(node, identity, channel_id)
-                        .await;
+                    // Propagates: a 500 makes LiveKit retry the webhook, and
+                    // a 200 would leave the orphan leg live with nothing left
+                    // to catch it.
+                    voice_client
+                        .remove_connection_if_present(node, identity, channel_id)
+                        .await?;
                     return Ok(EmptyResponse);
                 }
 
@@ -149,9 +155,11 @@ pub async fn ingress(
                 // Nothing else is touched: the owner may be in another channel.
                 if get_voice_state(&channel, user_id).await?.is_none() {
                     log::warn!("Removing orphan screen leg {identity} from channel {channel_id}: owner has no voice state here.");
-                    let _ = voice_client
-                        .remove_identity(node, identity, channel_id)
-                        .await;
+                    // Propagates, as the BE-1 eject above: a 500 makes LiveKit
+                    // retry, and a 200 would leave the orphan leg live.
+                    voice_client
+                        .remove_connection_if_present(node, identity, channel_id)
+                        .await?;
                     return Ok(EmptyResponse);
                 }
 
@@ -292,9 +300,12 @@ pub async fn ingress(
                         match event.event.as_str() {
                             "track_published" | "track_unmuted" => {
                                 log::warn!("Removing orphan screen leg {identity} from channel {channel_id}: it went live while its owner is not in this channel.");
-                                let _ = voice_client
-                                    .remove_identity(node, identity, channel_id)
-                                    .await;
+                                // Propagates: a 500 makes LiveKit retry,
+                                // and a 200 would leave the orphan leg live
+                                // with nothing left to catch it.
+                                voice_client
+                                    .remove_connection_if_present(node, identity, channel_id)
+                                    .await?;
                             }
                             "track_unpublished" => {
                                 let sid = &event.participant.as_ref().to_internal_error()?.sid;
@@ -2192,8 +2203,11 @@ mod tests {
     /// answers 500, so LiveKit retries). Mutations this catches: a mute
     /// addressed to `user_id`, and an eviction whose error is dropped. The
     /// fourth eviction is the screen-leg join's BE-3 refusal, whose leg must
-    /// not stay live on a revoked grant; the leg arms' other ejects are
-    /// best-effort `remove_identity` calls and are not counted here.
+    /// not stay live on a revoked grant; the fifth to seventh are the leg's
+    /// orphan ejects (Wave 4j: the join's BE-1 and voice-state checks, and a
+    /// track going live with its owner elsewhere), whose leg would otherwise
+    /// stay live with nothing left to catch it. The one leg eject still
+    /// best-effort, the limits disconnect's `remove_identity`, is not counted.
     #[test]
     fn every_ingress_enforcement_addresses_the_event_identity() {
         let dense = dense();
@@ -2201,8 +2215,9 @@ mod tests {
         let mutes = call_args(&dense, "mute_track_identity(");
         assert_eq!(
             removals.len(),
-            4,
-            "the three member eviction sites and the leg's BE-3 eviction"
+            7,
+            "the three member eviction sites, the leg's BE-3 eviction and its \
+             three orphan ejects"
         );
         assert_eq!(mutes.len(), 4, "two leg mutes and two member mutes");
         for args in removals.iter().chain(&mutes) {
@@ -2465,8 +2480,10 @@ mod tests {
     }
 
     /// The branch of `body` opened by `opener` up to the first early return
-    /// after it, which must eject the LEG (the event identity, a leg here)
-    /// and return.
+    /// after it, which must eject the LEG (the event identity, a leg here),
+    /// propagating the eviction's error, and return. Wave 4j: a discarded
+    /// error (`let _ =`) answers 200 on a failed eject, and LiveKit never
+    /// retries it, so the orphan leg stays live.
     fn assert_ejects_and_returns(body: &str, opener: &str) {
         let at = once(body, opener);
         let end = at
@@ -2475,10 +2492,15 @@ mod tests {
                 .unwrap_or_else(|| panic!("`{opener}` must return: {body}"));
         let branch = &body[at..end];
         assert!(
-            branch.contains(
-                "let _ = voice_client .remove_identity(node, identity, channel_id) .await;"
+            branch.ends_with(
+                "voice_client .remove_connection_if_present(node, identity, channel_id) \
+                 .await?; "
             ),
-            "`{opener}` must eject the leg: {branch}"
+            "`{opener}` must eject the leg, propagating the error, then return: {branch}"
+        );
+        assert!(
+            !branch.contains("let _ =") && !branch.contains("remove_identity("),
+            "`{opener}` must not discard the eviction's error: {branch}"
         );
     }
 
@@ -2491,7 +2513,9 @@ mod tests {
     /// ejected. Mutations this catches: the check deleted or handed another
     /// channel, moved after `record_screen_leg`, its refusal left without the
     /// eject or the `return`, and its error arm answering `true` (a Redis
-    /// failure then admits every leg).
+    /// failure then admits every leg). Wave 4j: both orphan ejects of the
+    /// join (this one and the voice-state check after it) propagate their
+    /// error, so a mutation back to a discarded `let _ =` eject goes red.
     #[test]
     fn a_screen_leg_join_needs_its_owner_in_this_channel() {
         let body = leg_arm("\"participant_joined\"");
@@ -2518,6 +2542,18 @@ mod tests {
             "Ok(in_this_channel) => in_this_channel",
         );
         assert_ejects_and_returns(&body, "if !in_this_channel \u{7b}");
+
+        // The voice-state orphan check comes after BE-1 and before the
+        // record, and ejects the same way.
+        let orphan = once(
+            &body,
+            "if get_voice_state(&channel, user_id).await?.is_none() \u{7b}",
+        );
+        assert!(refused < orphan && orphan < record, "{body}");
+        assert_ejects_and_returns(
+            &body,
+            "if get_voice_state(&channel, user_id).await?.is_none() \u{7b}",
+        );
     }
 
     /// BE-3: the screen-leg JOIN re-checks that the owner may still publish
@@ -2643,13 +2679,28 @@ mod tests {
         let gone = once(stranded, "\"track_unpublished\" => \u{7b}");
         let eject = once(
             stranded,
-            "let _ = voice_client .remove_identity(node, identity, channel_id) .await;",
+            "voice_client .remove_connection_if_present(node, identity, channel_id) .await?;",
         );
         let forget = once(
             stranded,
             "forget_screen_leg_if_current(channel_id, user_id, sid).await?;",
         );
         assert!(live < eject && eject < gone && gone < forget, "{stranded}");
+        // Wave 4j: the eject is the live arm's last statement and its error
+        // propagates (a 500, so LiveKit retries); nothing in the arm is
+        // discarded.
+        let live_arm = &stranded[live..gone];
+        assert!(
+            live_arm.ends_with(
+                "voice_client .remove_connection_if_present(node, identity, channel_id) \
+                 .await?; \u{7d} "
+            ),
+            "the orphan eject must propagate its error: {live_arm}"
+        );
+        assert!(
+            !live_arm.contains("let _ =") && !live_arm.contains("remove_identity("),
+            "the orphan eject must not discard its error: {live_arm}"
+        );
         for banned in [
             "update_voice_state",
             "EventV1",
