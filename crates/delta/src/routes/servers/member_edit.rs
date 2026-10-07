@@ -1,18 +1,21 @@
 use std::collections::HashSet;
 
+use iso8601_timestamp::{Duration, Timestamp};
 use revolt_database::{
     util::{
-        name_filter::contains_blocked_slur, permissions::DatabasePermissionQuery,
-        reference::Reference,
+        audit_reason::AuditLogReason, name_filter::contains_blocked_slur,
+        permissions::DatabasePermissionQuery, reference::Reference,
     },
     voice::{
         assert_voice_move_admissible, drop_voice_participant_session, get_channel_node,
         get_user_voice_channel_in_server, get_voice_participant_session, holds_voice_state_in,
         move_user_to_voice_channel_expecting, recorded_voice_connections,
-        self_move_from_owning_session, sync_user_voice_permissions, tear_down_removed_connections,
-        EvictionFailure, MovePolicy, UserVoiceChannel, VoiceClient, VoiceMoveOutcome,
+        remove_user_from_server_voice, self_move_from_owning_session, sync_user_voice_permissions,
+        tear_down_removed_connections, EvictionFailure, MovePolicy, UserVoiceChannel, VoiceClient,
+        VoiceMoveOutcome,
     },
-    Channel, Database, File, PartialMember, Session, User,
+    AuditLogAction, AuditLogChange, AuditLogDraft, AuditLogEntry, AuditValue, Channel, Database,
+    File, Member, PartialMember, Server, Session, User,
 };
 use revolt_models::v0::{self, FieldsMember};
 
@@ -37,6 +40,10 @@ use validator::Validate;
 /// Neither used to trigger a sync, so stripping a voice-granting role or timing
 /// a member out left the SFU honouring the stale grant until something else
 /// happened to sync the channel.
+///
+/// Setting a timeout goes further than a sync since moderation slice 1: the
+/// route evicts the member from voice instead (see `edit`), and syncs them only
+/// if that eviction fails. Lifting one is still a sync.
 fn edit_affects_voice_permissions(data: &v0::DataMemberEdit) -> bool {
     data.can_publish.is_some()
         || data.can_receive.is_some()
@@ -180,6 +187,223 @@ async fn mover_can_see_source(db: &Database, user: &User, source: &Channel) -> b
         .has_channel_permission(ChannelPermission::ViewChannel)
 }
 
+/// The longest a member may be timed out for, in days (Discord parity).
+const MAX_TIMEOUT_DAYS: i64 = 28;
+
+/// Whether `until` is a timeout end the route accepts: strictly after `now`
+/// and no more than [`MAX_TIMEOUT_DAYS`] after it.
+///
+/// Without the upper bound a moderator could time somebody out until the
+/// year 9999, which mutes them server-wide for good and survives leaving and
+/// rejoining. A bound that cannot be computed refuses (fail closed).
+fn timeout_in_range(until: Timestamp, now: Timestamp) -> bool {
+    match now.checked_add(Duration::days(MAX_TIMEOUT_DAYS)) {
+        Some(latest) => now < until && until <= latest,
+        None => false,
+    }
+}
+
+/// An audit log value for a timestamp: ISO-8601, millisecond precision.
+fn audit_timestamp(timestamp: &Timestamp) -> AuditValue {
+    AuditValue::String(timestamp.format().to_string())
+}
+
+/// The audit log entries a member edit writes, one per action kind, decided
+/// from the member as it stood before the edit and as it stands after it.
+///
+/// Decided from the two documents rather than from the request, so a field
+/// the request sent without changing it (a mute of a member who is already
+/// muted) writes nothing. The one exception is the timeout: setting one is
+/// always recorded, because it also evicts the member from voice and the log
+/// has to say why they were disconnected.
+///
+/// - `member_timeout`: `timeout`, the old end (when there was one) and the
+///   new one.
+/// - `member_timeout_remove`: `timeout`, the old end.
+/// - `member_role_update`: `roles_added` and `roles_removed`, each only when
+///   it is not empty, the role ids as the new value.
+/// - `member_update`: `nickname` (old and new, absent as `None`) and
+///   `avatar` (whether there was one, whether there is one).
+/// - `member_voice_update`: `can_publish` and `can_receive`, each only when
+///   it changed.
+///
+/// The caller supplies the actor, the target and the reason, and writes
+/// none of these for a self-edit. Pure.
+fn member_edit_audit_entries(
+    before: &Member,
+    after: &Member,
+    timeout_set: bool,
+) -> Vec<(AuditLogAction, Vec<AuditLogChange>)> {
+    let mut entries = Vec::new();
+
+    if timeout_set {
+        entries.push((
+            AuditLogAction::MemberTimeout,
+            vec![AuditLogChange::new(
+                "timeout",
+                before.timeout.as_ref().map(audit_timestamp),
+                after.timeout.as_ref().map(audit_timestamp),
+            )],
+        ));
+    } else if before.timeout.is_some() && after.timeout.is_none() {
+        entries.push((
+            AuditLogAction::MemberTimeoutRemove,
+            vec![AuditLogChange::new(
+                "timeout",
+                before.timeout.as_ref().map(audit_timestamp),
+                None,
+            )],
+        ));
+    }
+
+    let roles_added: Vec<String> = after
+        .roles
+        .iter()
+        .filter(|role| !before.roles.contains(*role))
+        .cloned()
+        .collect();
+    let roles_removed: Vec<String> = before
+        .roles
+        .iter()
+        .filter(|role| !after.roles.contains(*role))
+        .cloned()
+        .collect();
+    let mut roles = Vec::new();
+    if !roles_added.is_empty() {
+        roles.push(AuditLogChange::new(
+            "roles_added",
+            None,
+            Some(AuditValue::StringList(roles_added)),
+        ));
+    }
+    if !roles_removed.is_empty() {
+        roles.push(AuditLogChange::new(
+            "roles_removed",
+            None,
+            Some(AuditValue::StringList(roles_removed)),
+        ));
+    }
+    if !roles.is_empty() {
+        entries.push((AuditLogAction::MemberRoleUpdate, roles));
+    }
+
+    let mut update = Vec::new();
+    if before.nickname != after.nickname {
+        update.push(AuditLogChange::new(
+            "nickname",
+            before.nickname.clone().map(AuditValue::String),
+            after.nickname.clone().map(AuditValue::String),
+        ));
+    }
+    if before.avatar.as_ref().map(|file| &file.id) != after.avatar.as_ref().map(|file| &file.id) {
+        update.push(AuditLogChange::new(
+            "avatar",
+            Some(AuditValue::Bool(before.avatar.is_some())),
+            Some(AuditValue::Bool(after.avatar.is_some())),
+        ));
+    }
+    if !update.is_empty() {
+        entries.push((AuditLogAction::MemberUpdate, update));
+    }
+
+    let mut voice = Vec::new();
+    if before.can_publish != after.can_publish {
+        voice.push(AuditLogChange::new(
+            "can_publish",
+            Some(AuditValue::Bool(before.can_publish)),
+            Some(AuditValue::Bool(after.can_publish)),
+        ));
+    }
+    if before.can_receive != after.can_receive {
+        voice.push(AuditLogChange::new(
+            "can_receive",
+            Some(AuditValue::Bool(before.can_receive)),
+            Some(AuditValue::Bool(after.can_receive)),
+        ));
+    }
+    if !voice.is_empty() {
+        entries.push((AuditLogAction::MemberVoiceUpdate, voice));
+    }
+
+    entries
+}
+
+/// Best-effort re-sync of a member whose timeout eviction failed.
+///
+/// Setting a timeout evicts the member from voice (see `edit`). When that
+/// eviction fails they may still be connected, holding the grants they were
+/// minted before the timeout. This pushes their current permissions, which
+/// the timeout has already cut down to `ALLOW_IN_TIMEOUT` (no Speak, no
+/// Video), to the call their per-server pointer names, so the SFU stops
+/// honouring the old grants (fail closed). The route answers with the
+/// eviction's own error; a failure here is only logged.
+async fn resync_after_failed_timeout_eviction(
+    db: &Database,
+    voice_client: &VoiceClient,
+    server: &Server,
+    target_user: &User,
+) {
+    let channel_id = match get_user_voice_channel_in_server(&target_user.id, &server.id).await {
+        Ok(Some(channel_id)) => channel_id,
+        Ok(None) => return,
+        Err(error) => {
+            log::warn!(
+                "timeout re-sync of {}: the voice pointer read failed: {:?}",
+                target_user.id,
+                error
+            );
+            return;
+        }
+    };
+
+    let node = match get_channel_node(&channel_id).await {
+        Ok(Some(node)) => node,
+        // The call has ended: there is no participant left to sync.
+        Ok(None) => return,
+        Err(error) => {
+            log::warn!(
+                "timeout re-sync of {} in {}: the node read failed: {:?}",
+                target_user.id,
+                channel_id,
+                error
+            );
+            return;
+        }
+    };
+
+    let channel = match Reference::from_unchecked(&channel_id).as_channel(db).await {
+        Ok(channel) => channel,
+        Err(error) => {
+            log::warn!(
+                "timeout re-sync of {} in {}: the channel read failed: {:?}",
+                target_user.id,
+                channel_id,
+                error
+            );
+            return;
+        }
+    };
+
+    if let Err(error) = sync_user_voice_permissions(
+        db,
+        voice_client,
+        &node,
+        target_user,
+        &channel,
+        Some(server),
+        None,
+    )
+    .await
+    {
+        log::warn!(
+            "timeout re-sync of {} in {}: the sync failed: {:?}",
+            target_user.id,
+            channel_id,
+            error
+        );
+    }
+}
+
 /// # Edit Member
 ///
 /// Edit a member by their id.
@@ -194,6 +418,9 @@ pub async fn edit(
     session: Option<Session>,
     server_id: Reference<'_>,
     member_id: Reference<'_>,
+    // The moderator's reason, from the `X-Audit-Log-Reason` header. Never
+    // refuses the request itself; it is validated first thing below.
+    reason: AuditLogReason,
     data: Json<v0::DataMemberEdit>,
 ) -> Result<Json<v0::Member>> {
     let data = data.into_inner();
@@ -202,6 +429,11 @@ pub async fn edit(
             error: error.to_string()
         })
     })?;
+
+    // Before anything is read or written: a reason that is too long refuses
+    // the whole edit, and must never be answered with a 400 after the edit
+    // has already been applied.
+    let reason = reason.validated()?;
 
     // A nickname is the display name everyone in the server reads, so it gets
     // the same slur filter as usernames and display names.
@@ -267,6 +499,17 @@ pub async fn edit(
         }
 
         permissions.throw_if_lacking_channel_permission(ChannelPermission::TimeoutMembers)?;
+
+        // A timeout must end in the future and at most 28 days from now.
+        // Asked only of somebody allowed to time this member out, and before
+        // anything is written.
+        if let Some(until) = data.timeout {
+            if !timeout_in_range(until, Timestamp::now_utc()) {
+                return Err(create_error!(FailedValidation {
+                    error: "TimeoutOutOfRange".to_string()
+                }));
+            }
+        }
     }
 
     // Applying AND lifting a server mute are both moderation actions, so both
@@ -342,6 +585,19 @@ pub async fn edit(
     // — it exists to answer "does this edit move the member's effective voice
     // permissions" — so the two stay in step by construction.
     if data.voice_channel.is_some() && edit_affects_voice_permissions(&data) {
+        return Err(create_error!(InvalidOperation));
+    }
+
+    // Setting a timeout cannot share a PATCH with clearing it (Mongo rejects
+    // a $set and an $unset of the same field, and the event would contradict
+    // the response), nor with the moderator disconnect. Setting a timeout
+    // evicts the member from voice by itself, and the disconnect's own
+    // pre-flight (MoveMembers, the source's visibility, LiveKit being up)
+    // would otherwise decide an eviction the timeout does not ask for.
+    if data.timeout.is_some()
+        && (data.remove.contains(&FieldsMember::Timeout)
+            || data.remove.contains(&FieldsMember::VoiceChannel))
+    {
         return Err(create_error!(InvalidOperation));
     }
 
@@ -629,8 +885,9 @@ pub async fn edit(
         }
     }
 
-    // Decide this before `data` is destructured below.
+    // Decide these before `data` is destructured below.
     let affects_voice_permissions = edit_affects_voice_permissions(&data);
+    let timeout_set = data.timeout.is_some();
 
     // Apply edits to the member object
     let v0::DataMemberEdit {
@@ -667,9 +924,36 @@ pub async fn edit(
         partial.avatar = Some(File::use_user_avatar(db, &avatar, &user.id, &user.id).await?);
     }
 
+    // The member as it stood, for the audit log entries below.
+    let member_before_edit = member.clone();
+
     member
         .update(db, partial, remove.clone().into_iter().map(Into::into).collect())
         .await?;
+
+    // The audit log, once the member document is written and BEFORE any
+    // voice step: a timeout's eviction below can fail and answer an error,
+    // but the edit it follows still happened. One entry per action kind, by
+    // the authenticated user, none for a self-edit.
+    if member.id.user != user.id {
+        for (action, changes) in
+            member_edit_audit_entries(&member_before_edit, &member, timeout_set)
+        {
+            AuditLogEntry::record(
+                db,
+                AuditLogDraft {
+                    server: server.id.clone(),
+                    actor: Some(user.id.clone()),
+                    action,
+                    target: Some(target_user.id.clone()),
+                    changes,
+                    reason: reason.clone(),
+                    ..Default::default()
+                },
+            )
+            .await;
+        }
+    }
 
     if let Some((new_voice_channel, source_id, expected_session)) = new_voice_channel {
         // The move itself is server-authoritative and lives in the database
@@ -733,10 +1017,57 @@ pub async fn edit(
             VoiceMoveOutcome::NotConnected => return Err(create_error!(NotConnected)),
             VoiceMoveOutcome::TargetCannotJoin => return Err(create_error!(CannotJoinCall)),
         }
+
+        // Recorded once the move has answered, and only for a move of
+        // somebody else out of a different channel: a move into the channel
+        // the target is already in changed nothing. A move done as the
+        // disconnect it amounts to is recorded as the move that was asked
+        // for (the outcomes above are pinned as one arm).
+        if member.id.user != user.id && source_id != new_voice_channel.id() {
+            AuditLogEntry::record(
+                db,
+                AuditLogDraft {
+                    server: server.id.clone(),
+                    actor: Some(user.id.clone()),
+                    action: AuditLogAction::MemberMove,
+                    target: Some(target_user.id.clone()),
+                    channel: Some(new_voice_channel.id().to_string()),
+                    changes: vec![AuditLogChange::new(
+                        "voice_channel",
+                        Some(AuditValue::String(source_id.clone())),
+                        Some(AuditValue::String(new_voice_channel.id().to_string())),
+                    )],
+                    reason: reason.clone(),
+                    ..Default::default()
+                },
+            )
+            .await;
+        }
+    } else if timeout_set {
+        // A timeout disconnects the member from voice in this server, the
+        // same way a kick or a ban does, through the same eviction. It is a
+        // consequence of the timeout, so none of the moderator disconnect's
+        // pre-flight applies: no MoveMembers, no visibility of the call, and
+        // no refusal when LiveKit is off (with no call there is nothing to
+        // evict). Rejoining is blocked by the timeout masking Connect. The
+        // permission sync below is skipped: the member is leaving the call.
+        //
+        // The eviction is not recorded as a disconnect; the timeout entry
+        // above already explains it. If it fails the member may still be
+        // connected with the grants they had before the timeout, so their
+        // current, timed-out permissions are pushed to the call first, best
+        // effort, and then the eviction's error is answered.
+        if let Err(error) =
+            remove_user_from_server_voice(db, voice_client, &server, &target_user.id).await
+        {
+            resync_after_failed_timeout_eviction(db, voice_client, &server, &target_user).await;
+            return Err(error);
+        }
     } else if affects_voice_permissions && !remove.contains(&FieldsMember::VoiceChannel) {
         // Skipped when the member is being disconnected outright just below —
         // syncing a participant we are about to evict is pointless, and a
         // failing sync would abort the request before the eviction ran.
+        // Skipped as well when a timeout was set: the branch above evicts.
         if let Some(channel) = get_user_voice_channel_in_server(&target_user.id, &server.id).await?
         {
             // No node behind the channel: the call ended between the pointer
@@ -944,6 +1275,25 @@ pub async fn edit(
                 //    ended call), which this route used to leave on every
                 //    roster (AFK S-3 WB-8).
                 tear_down_removed_connections(&uvc, &target_user.id, evicted, recorded).await?;
+
+                // Recorded once the teardown has succeeded, so only when the
+                // target was actually in this call, and only for somebody
+                // else's disconnect.
+                if member.id.user != user.id {
+                    AuditLogEntry::record(
+                        db,
+                        AuditLogDraft {
+                            server: server.id.clone(),
+                            actor: Some(user.id.clone()),
+                            action: AuditLogAction::MemberDisconnect,
+                            target: Some(target_user.id.clone()),
+                            channel: Some(channel.clone()),
+                            reason: reason.clone(),
+                            ..Default::default()
+                        },
+                    )
+                    .await;
+                }
             }
         }
     }
@@ -969,9 +1319,9 @@ mod test {
             set_channel_node, set_voice_participant_identity, update_voice_state, UserVoiceChannel,
             MAX_VIDEO_PARTICIPANTS,
         },
-        Bot, Channel, E2EEIdentity, E2EESignedKey, Member, MlsGroup, MlsGroupCreateOutcome,
-        MlsMemberDevice, PartialChannel, PartialMember, PartialRole, PartialServer, Role, Server,
-        User, MAX_MLS_GROUP_MEMBERS,
+        AuditLogAction, AuditLogChange, AuditLogEntry, AuditValue, Bot, Channel, E2EEIdentity,
+        E2EESignedKey, Member, MlsGroup, MlsGroupCreateOutcome, MlsMemberDevice, PartialChannel,
+        PartialMember, PartialRole, PartialServer, Role, Server, User, MAX_MLS_GROUP_MEMBERS,
     };
     use revolt_models::v0;
     use revolt_permissions::{ChannelPermission, OverrideField};
@@ -1531,6 +1881,10 @@ mod test {
         )
         .await;
         assert_missing_permission(response, ChannelPermission::MoveMembers).await;
+        assert!(
+            audit_entries(&f.harness, &f.server.id).await.is_empty(),
+            "a refused move must write no audit entry"
+        );
 
         f.cleanup().await;
     }
@@ -1629,6 +1983,11 @@ mod test {
         )
         .await;
         assert_reached_livekit(response).await;
+        assert!(
+            audit_entries(&f.harness, &f.server.id).await.is_empty(),
+            "neither the refused move nor the one that failed at the node may write an \
+             audit entry"
+        );
 
         f.cleanup().await;
     }
@@ -1783,6 +2142,13 @@ mod test {
                 "{who}: the session record is untouched"
             );
         }
+
+        // A move into the channel the target is already in changed nothing,
+        // so nothing is recorded, by the moderator or by the target.
+        assert!(
+            audit_entries(&f.harness, &f.server.id).await.is_empty(),
+            "a no-op move must write no audit entry"
+        );
 
         f.cleanup().await;
     }
@@ -1998,6 +2364,10 @@ mod test {
         let response =
             disconnect_member(&f.harness, &f.mod_token, &f.server.id, &f.target.id).await;
         assert_reached_livekit(response).await;
+        assert!(
+            audit_entries(&f.harness, &f.server.id).await.is_empty(),
+            "a disconnect whose eviction failed must write no audit entry"
+        );
 
         f.cleanup().await;
     }
@@ -2045,6 +2415,12 @@ mod test {
         let response =
             disconnect_member(&f.harness, &f.mod_token, &f.server.id, &f.target.id).await;
         assert_eq!(response.status(), Status::Ok);
+        // The 200 is a no-op: the target was in no call, so there was no
+        // disconnect to record, and neither did the refusal above write one.
+        assert!(
+            audit_entries(&f.harness, &f.server.id).await.is_empty(),
+            "a disconnect of a target in no call must write no audit entry"
+        );
     }
 
     #[test]
@@ -2399,6 +2775,13 @@ mod test {
             "a target in a call hidden from the mover must be told apart from \
              one in no call by nothing at all"
         );
+        // Nor by the audit log: an entry for the hidden call would name the
+        // channel the target sits in to anybody holding View Audit Log, and
+        // the no-call answer writes none either.
+        assert!(
+            audit_entries(&f.harness, &f.server.id).await.is_empty(),
+            "neither the hidden call nor no call may write an audit entry"
+        );
 
         f.cleanup().await;
     }
@@ -2619,6 +3002,18 @@ mod test {
         let response =
             disconnect_member(&f.harness, &f.mod_token, &f.server.id, &f.target.id).await;
         assert_eq!(response.status(), Status::Ok);
+
+        // The target's state in the source was torn down, so the disconnect
+        // is recorded: by the moderator, about the target, in the SOURCE,
+        // with no changes. The refused move before it recorded nothing.
+        let entries = audit_entries(&f.harness, &f.server.id).await;
+        assert_eq!(entries.len(), 1, "the disconnect alone: {entries:?}");
+        let entry = only_entry(&entries, AuditLogAction::MemberDisconnect);
+        assert_eq!(entry.actor.as_deref(), Some(f.moderator.id.as_str()));
+        assert_eq!(entry.target.as_deref(), Some(f.target.id.as_str()));
+        assert_eq!(entry.channel.as_deref(), Some(f.source.id()));
+        assert!(entry.changes.is_empty(), "{entry:?}");
+        assert_eq!(entry.reason, None, "no header, no reason");
 
         f.cleanup().await;
     }
@@ -3549,6 +3944,14 @@ mod test {
         crate::util::test::rt().block_on(timing_a_member_out_syncs_their_voice_permissions_case())
     }
 
+    /// Moderation slice 1: setting a timeout now EVICTS the member from voice
+    /// rather than syncing them. The fixture's node is `ABSENT_NODE`, so the
+    /// eviction fails with `UnknownNode` before any network and the member
+    /// stays connected, which is exactly the case the fail-closed re-sync is
+    /// for: the timeout stays written, the member's participant is synced
+    /// under it, and the eviction's error is the answer. Mutation: the
+    /// re-sync dropped from the failed eviction (the member keeps
+    /// publishing).
     async fn timing_a_member_out_syncs_their_voice_permissions_case() {
         let (harness, token, server, target, uvc) = muted_member_harness().await;
 
@@ -3556,7 +3959,7 @@ mod test {
             .checked_add(Duration::hours(1))
             .expect("timeout timestamp");
 
-        edit_member(
+        let response = edit_member(
             &harness,
             &token,
             &server.id,
@@ -3564,6 +3967,23 @@ mod test {
             serde_json::json!({ "timeout": until }),
         )
         .await;
+        let (status, error) = error_of(response).await;
+        assert!(
+            matches!(error, revolt_result::ErrorType::UnknownNode),
+            "the failed eviction's own error must be the answer, got {} {:?}",
+            status,
+            error
+        );
+        assert!(
+            harness
+                .db
+                .fetch_member(&server.id, &target.id)
+                .await
+                .expect("member read")
+                .timeout
+                .is_some(),
+            "the timeout was written before the eviction and stays written"
+        );
 
         // A timeout restricts down to ALLOW_IN_TIMEOUT, which has no Speak.
         assert!(
@@ -5757,6 +6177,11 @@ mod test {
             Some(format!("FIXTURESESSION{}", user_c.id)),
             "neither shape may drop the record of a call the mover cannot see"
         );
+        // ...nor record a move or a disconnect, which would name the hidden
+        // call in the audit log. The owner's role grant is the only entry.
+        let entries = audit_entries(&harness, &server.id).await;
+        assert_eq!(entries.len(), 1, "{entries:?}");
+        only_entry(&entries, AuditLogAction::MemberRoleUpdate);
 
         delete_channel_voice_state(&source_uvc, &[user_c.id.clone()])
             .await
@@ -6037,6 +6462,24 @@ mod test {
                 .await;
         }
 
+        // One `member_disconnect` per ghost torn down: by the acting user,
+        // about that member, in the SOURCE channel, with no changes.
+        let entries = audit_entries(&harness, &server.id).await;
+        assert_eq!(entries.len(), 2, "one disconnect per target: {entries:?}");
+        for target in [&user_b, &user_c] {
+            let mine: Vec<&AuditLogEntry> = entries
+                .iter()
+                .filter(|entry| entry.target.as_deref() == Some(target.id.as_str()))
+                .collect();
+            assert_eq!(mine.len(), 1, "{} in {:?}", target.id, entries);
+            let entry = mine[0];
+            assert_eq!(entry.action, AuditLogAction::MemberDisconnect);
+            assert_eq!(entry.actor.as_deref(), Some(user_a.id.as_str()));
+            assert_eq!(entry.channel.as_deref(), Some(channel.id()));
+            assert!(entry.changes.is_empty(), "{entry:?}");
+            assert_eq!(entry.reason, None, "no header, no reason");
+        }
+
         delete_channel_voice_state(&uvc, &[user_b.id.clone(), user_c.id.clone()])
             .await
             .expect("cleanup");
@@ -6100,11 +6543,13 @@ mod test {
             "the call has ended: no node"
         );
 
-        let response = edit_member(
+        // Sent with a moderator's reason, percent-encoded as the client does.
+        let response = edit_member_with_reason(
             &harness,
             &session_a.token,
             &server.id,
             &user_b.id,
+            "ghost%20of%20an%20ended%20call",
             serde_json::json!({ "remove": ["VoiceChannel"] }),
         )
         .await;
@@ -6127,6 +6572,18 @@ mod test {
             "the flags keyed by it go with it: {:?}",
             state
         );
+
+        // The disconnect is recorded once, in the SOURCE, with the reason
+        // decoded.
+        let entries = audit_entries(&harness, &server.id).await;
+        assert_eq!(entries.len(), 1, "{entries:?}");
+        let entry = only_entry(&entries, AuditLogAction::MemberDisconnect);
+        assert_eq!(entry.actor.as_deref(), Some(user_a.id.as_str()));
+        assert_eq!(entry.target.as_deref(), Some(user_b.id.as_str()));
+        assert_eq!(entry.channel.as_deref(), Some(channel.id()));
+        assert!(entry.changes.is_empty(), "{entry:?}");
+        assert_eq!(entry.reason.as_deref(), Some("ghost of an ended call"));
+
         harness
             .wait_for_event(channel.id(), |event| {
                 matches!(
@@ -6189,6 +6646,10 @@ mod test {
             member,
             pointer
         );
+        assert!(
+            audit_entries(&harness, &server.id).await.is_empty(),
+            "a failed disconnect must write no audit entry"
+        );
 
         delete_channel_voice_state(&uvc, &[user_b.id.clone()])
             .await
@@ -6245,5 +6706,1202 @@ mod test {
         delete_channel_voice_state(&uvc, &[user_b.id.clone()])
             .await
             .expect("cleanup");
+    }
+
+    // ---- timeouts and the audit log (moderation slice 1) -----------------
+    //
+    // The route tests below need RabbitMQ, Redis and the database like every
+    // other route test here, and hold on both TEST_DB=REFERENCE and
+    // TEST_DB=MONGODB: none of them kicks a member (the Reference driver's
+    // `soft_delete_member` panics). Each actor sends at most five requests
+    // per harness, the `servers` ratelimit bucket.
+
+    /// Every audit log entry of `server_id`, newest first.
+    async fn audit_entries(harness: &TestHarness, server_id: &str) -> Vec<AuditLogEntry> {
+        harness
+            .db
+            .fetch_audit_log(server_id, None, 50, None, None)
+            .await
+            .expect("audit log read")
+    }
+
+    /// The one entry of `action` in `entries`. Entries written by one request
+    /// can share a millisecond, so the order of their ULIDs is not asserted.
+    fn only_entry(entries: &[AuditLogEntry], action: AuditLogAction) -> &AuditLogEntry {
+        let found: Vec<&AuditLogEntry> = entries
+            .iter()
+            .filter(|entry| entry.action == action)
+            .collect();
+        assert_eq!(
+            found.len(),
+            1,
+            "exactly one {:?} entry in {:?}",
+            action,
+            entries
+        );
+        found[0]
+    }
+
+    /// PATCH the target member with `body` and an `X-Audit-Log-Reason`
+    /// header, sent as given (the client percent-encodes it).
+    async fn edit_member_with_reason<'a>(
+        harness: &'a TestHarness,
+        token: &str,
+        server_id: &str,
+        target_id: &str,
+        reason: &str,
+        body: serde_json::Value,
+    ) -> rocket::local::asynchronous::LocalResponse<'a> {
+        harness
+            .client
+            .patch(format!("/servers/{server_id}/members/{target_id}"))
+            .header(ContentType::JSON)
+            .header(Header::new("x-session-token", token.to_string()))
+            .header(Header::new("X-Audit-Log-Reason", reason.to_string()))
+            .body(body.to_string())
+            .dispatch()
+            .await
+    }
+
+    fn in_one_hour() -> Timestamp {
+        Timestamp::now_utc()
+            .checked_add(Duration::hours(1))
+            .expect("timeout timestamp")
+    }
+
+    /// The harness inserts the server without the owner's membership, which
+    /// a real server always has.
+    async fn owner_membership(harness: &TestHarness, server: &Server, owner: &User) {
+        if harness
+            .db
+            .fetch_member(&server.id, &owner.id)
+            .await
+            .is_err()
+        {
+            Member::create(&harness.db, server, owner, None)
+                .await
+                .expect("owner member");
+        }
+    }
+
+    async fn timeout_of(harness: &TestHarness, server: &Server, user: &User) -> Option<Timestamp> {
+        harness
+            .db
+            .fetch_member(&server.id, &user.id)
+            .await
+            .expect("member read")
+            .timeout
+    }
+
+    fn change(key: &str, old: Option<AuditValue>, new: Option<AuditValue>) -> AuditLogChange {
+        AuditLogChange::new(key, old, new)
+    }
+
+    fn text(value: &str) -> Option<AuditValue> {
+        Some(AuditValue::String(value.to_string()))
+    }
+
+    fn flag(value: bool) -> Option<AuditValue> {
+        Some(AuditValue::Bool(value))
+    }
+
+    fn ids(values: &[&str]) -> Option<AuditValue> {
+        Some(AuditValue::StringList(
+            values.iter().map(|value| value.to_string()).collect(),
+        ))
+    }
+
+    /// The bounds, pure: strictly in the future, at most 28 days ahead, and
+    /// the year 9999 refused. Mutations: `<=` for `<` on the lower bound
+    /// (now accepted), `<` for `<=` on the upper bound (exactly 28 days
+    /// refused), the upper bound dropped (9999 accepted).
+    #[test]
+    fn a_timeout_must_end_within_the_next_28_days() {
+        let now = Timestamp::now_utc();
+        let after = |duration: Duration| now.checked_add(duration).expect("timestamp");
+        let year_9999: Timestamp =
+            serde_json::from_value(serde_json::json!("9999-12-31T00:00:00.000Z"))
+                .expect("timestamp");
+
+        for (until, accepted, what) in [
+            (now, false, "now, which is not in the future"),
+            (after(Duration::seconds(-1)), false, "a second ago"),
+            (after(Duration::seconds(1)), true, "a second from now"),
+            (after(Duration::days(28)), true, "exactly 28 days from now"),
+            (
+                after(Duration::days(28) + Duration::milliseconds(1)),
+                false,
+                "just over 28 days from now",
+            ),
+            (year_9999, false, "the year 9999"),
+        ] {
+            assert_eq!(
+                super::timeout_in_range(until, now),
+                accepted,
+                "a timeout ending {what}"
+            );
+        }
+    }
+
+    /// A member document for the pure audit tests: `fields` over a bare one.
+    fn member_doc(fields: serde_json::Value) -> Member {
+        let mut doc = serde_json::json!({
+            "_id": {
+                "server": "01J9SERVER0000000000000000",
+                "user": "01J9TARGET0000000000000000"
+            },
+            "joined_at": "2026-10-01T00:00:00.000Z"
+        });
+        doc.as_object_mut()
+            .expect("an object")
+            .extend(fields.as_object().expect("an object").clone());
+        serde_json::from_value(doc).expect("a member document")
+    }
+
+    /// The entries, pure, against the action table: one per action kind,
+    /// only what changed, the exact keys and value types. Mutations: an entry
+    /// for an unchanged field (a mute of a muted member), an empty
+    /// `roles_added` / `roles_removed` key, the timeout recorded as a String
+    /// of anything but the ISO form, the avatar removal missed.
+    #[test]
+    fn audit_entries_follow_what_the_edit_changed() {
+        use super::member_edit_audit_entries as entries;
+
+        let bare = member_doc(serde_json::json!({}));
+        assert!(
+            entries(&bare, &bare, false).is_empty(),
+            "nothing changed, nothing recorded"
+        );
+
+        // A timeout set over none, and over an earlier one; then lifted.
+        let timed_out = member_doc(serde_json::json!({ "timeout": "2026-10-07T00:00:00.000Z" }));
+        let extended = member_doc(serde_json::json!({ "timeout": "2026-10-08T00:00:00.000Z" }));
+        assert_eq!(
+            entries(&bare, &timed_out, true),
+            vec![(
+                AuditLogAction::MemberTimeout,
+                vec![change("timeout", None, text("2026-10-07T00:00:00.000Z"))]
+            )]
+        );
+        assert_eq!(
+            entries(&timed_out, &extended, true),
+            vec![(
+                AuditLogAction::MemberTimeout,
+                vec![change(
+                    "timeout",
+                    text("2026-10-07T00:00:00.000Z"),
+                    text("2026-10-08T00:00:00.000Z")
+                )]
+            )]
+        );
+        assert_eq!(
+            entries(&timed_out, &bare, false),
+            vec![(
+                AuditLogAction::MemberTimeoutRemove,
+                vec![change("timeout", text("2026-10-07T00:00:00.000Z"), None)]
+            )]
+        );
+
+        // Roles: the ids added and removed, each key only when non-empty.
+        let ab = member_doc(serde_json::json!({ "roles": ["A", "B"] }));
+        let bc = member_doc(serde_json::json!({ "roles": ["B", "C"] }));
+        let abc = member_doc(serde_json::json!({ "roles": ["A", "B", "C"] }));
+        assert_eq!(
+            entries(&ab, &bc, false),
+            vec![(
+                AuditLogAction::MemberRoleUpdate,
+                vec![
+                    change("roles_added", None, ids(&["C"])),
+                    change("roles_removed", None, ids(&["A"]))
+                ]
+            )]
+        );
+        assert_eq!(
+            entries(&ab, &abc, false),
+            vec![(
+                AuditLogAction::MemberRoleUpdate,
+                vec![change("roles_added", None, ids(&["C"]))]
+            )]
+        );
+
+        // A rename and a moderator's avatar removal: one member_update.
+        let named = member_doc(serde_json::json!({
+            "nickname": "old",
+            "avatar": {
+                "_id": "01J9AVATAR0000000000000000",
+                "tag": "avatars",
+                "filename": "avatar.png",
+                "metadata": { "type": "File" },
+                "content_type": "image/png",
+                "size": 1
+            }
+        }));
+        let renamed = member_doc(serde_json::json!({ "nickname": "new" }));
+        assert_eq!(
+            entries(&named, &renamed, false),
+            vec![(
+                AuditLogAction::MemberUpdate,
+                vec![
+                    change("nickname", text("old"), text("new")),
+                    change("avatar", flag(true), flag(false))
+                ]
+            )]
+        );
+        assert_eq!(
+            entries(&renamed, &bare, false),
+            vec![(
+                AuditLogAction::MemberUpdate,
+                vec![change("nickname", text("new"), None)]
+            )]
+        );
+
+        // Server mute: only the field that changed, and nothing for a mute
+        // that was already in place.
+        let muted = member_doc(serde_json::json!({ "can_publish": false }));
+        assert_eq!(
+            entries(&bare, &muted, false),
+            vec![(
+                AuditLogAction::MemberVoiceUpdate,
+                vec![change("can_publish", flag(true), flag(false))]
+            )]
+        );
+        assert!(entries(&muted, &muted, false).is_empty());
+
+        // One edit of every kind: one entry per kind.
+        let everything = member_doc(serde_json::json!({
+            "roles": ["A"],
+            "nickname": "n",
+            "can_publish": false,
+            "timeout": "2026-10-07T00:00:00.000Z"
+        }));
+        let kinds: Vec<AuditLogAction> = entries(&bare, &everything, true)
+            .into_iter()
+            .map(|(action, _)| action)
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                AuditLogAction::MemberTimeout,
+                AuditLogAction::MemberRoleUpdate,
+                AuditLogAction::MemberUpdate,
+                AuditLogAction::MemberVoiceUpdate
+            ]
+        );
+    }
+
+    /// Audit B1, pinned as text: the reason is validated before anything is
+    /// read or written; the timeout bounds are decided before the member
+    /// write; and setting a timeout writes the member document, THEN the
+    /// audit log, THEN evicts the member through the kick/ban eviction, in a
+    /// branch of its own between the move and the permission sync (so the
+    /// sync is skipped) that asks nothing but whether a timeout was set: no
+    /// LiveKit check (`is_enabled()` stays the voice-shape pre-flight's
+    /// alone), no MoveMembers, no visibility. A failed eviction re-syncs best
+    /// effort, then answers its own error; the re-sync propagates nothing.
+    /// The branch records nothing itself (the timeout entry explains the
+    /// eviction). Mutations: the eviction ahead of the record or the write;
+    /// the branch folded into the sync; `?` on the eviction (no re-sync); an
+    /// `is_enabled()` guard on it; `?` inside the re-sync.
+    #[test]
+    fn a_timeout_is_written_then_recorded_then_evicted() {
+        const VALIDATE: &str = "let reason = reason.validated()?;";
+        const BOUNDS: &str = "if !timeout_in_range(until, Timestamp::now_utc()) \u{7b}";
+        const WRITE: &str = "member .update(";
+        const RECORD: &str = "AuditLogEntry::record(";
+        const EVICT: &str = "\u{7d} else if timeout_set \u{7b} \
+             if let Err(error) = \
+             remove_user_from_server_voice(db, voice_client, &server, &target_user.id).await \
+             \u{7b} \
+             resync_after_failed_timeout_eviction(db, voice_client, &server, &target_user).await; \
+             return Err(error); \u{7d} \
+             \u{7d} else if affects_voice_permissions \
+             && !remove.contains(&FieldsMember::VoiceChannel) \u{7b}";
+
+        let body = route_body();
+        for needle in [VALIDATE, BOUNDS, WRITE, EVICT] {
+            assert_eq!(
+                body.matches(needle).count(),
+                1,
+                "the route must carry `{needle}` exactly once: {body}"
+            );
+        }
+        let at = |needle: &str| body.find(needle).expect("counted above");
+        for earlier in [
+            "server_id.as_server(",
+            "mark_attachment_as_deleted(",
+            "File::use_user_avatar(",
+        ] {
+            assert!(
+                at(VALIDATE) < at(earlier),
+                "the reason is validated before `{}`: {}",
+                earlier,
+                body
+            );
+        }
+        assert!(at(BOUNDS) < at(WRITE), "{body}");
+        assert!(
+            at(WRITE) < at(RECORD) && at(RECORD) < at(EVICT),
+            "the member write, then the audit record, then the eviction: {}",
+            body
+        );
+        for (needle, want) in [
+            ("remove_user_from_server_voice(", 1),
+            ("resync_after_failed_timeout_eviction(", 1),
+            ("is_enabled()", 1),
+        ] {
+            assert_eq!(
+                body.matches(needle).count(),
+                want,
+                "`{needle}` in the route: {body}"
+            );
+        }
+
+        let resync = shipping_fn("resync_after_failed_timeout_eviction");
+        assert!(resync.contains("sync_user_voice_permissions("), "{resync}");
+        assert!(
+            !resync.contains(".await?"),
+            "the re-sync is best effort and propagates nothing: {resync}"
+        );
+    }
+
+    /// Wave audit M1 (c), pinned as TEXT because no move can succeed in this
+    /// harness. Past the route's gates a move resolves the destination's
+    /// LiveKit URL and lists the source room on the SFU before it can answer
+    /// `Moved`; the only stub SFU is test-private to the database crate, so
+    /// every move here ends at `UnknownNode` (`ABSENT_NODE`) or at an
+    /// unreachable node, as `channel_scoped_move_members_is_enough_to_move`
+    /// shows, and writes nothing (asserted there and in the refusal tests).
+    ///
+    /// So the `member_move` entry is pinned where it is written: straight
+    /// after the outcome match, whose failures return first (a refused or
+    /// failed move cannot reach it); only for somebody else's move between
+    /// two different channels (the `AlreadyPresent` no-op records nothing,
+    /// asserted in `move_into_the_current_channel_is_a_no_op`); `channel` =
+    /// the DESTINATION; one `voice_channel` change from the gated source to
+    /// the destination; the header's reason. Mutations: old and new
+    /// swapped; `channel` set to the source; the record moved ahead of the
+    /// match; the same-channel guard or the self-move skip dropped.
+    #[test]
+    fn a_move_is_recorded_after_it_answers_from_source_to_destination() {
+        const MOVE_RECORD: &str = "VoiceMoveOutcome::TargetCannotJoin => \
+             return Err(create_error!(CannotJoinCall)), \u{7d} \
+             if member.id.user != user.id && source_id != new_voice_channel.id() \u{7b} \
+             AuditLogEntry::record( db, AuditLogDraft \u{7b} \
+             server: server.id.clone(), \
+             actor: Some(user.id.clone()), \
+             action: AuditLogAction::MemberMove, \
+             target: Some(target_user.id.clone()), \
+             channel: Some(new_voice_channel.id().to_string()), \
+             changes: vec![AuditLogChange::new( \"voice_channel\", \
+             Some(AuditValue::String(source_id.clone())), \
+             Some(AuditValue::String(new_voice_channel.id().to_string())), )], \
+             reason: reason.clone(), ..Default::default() \u{7d}, ) .await; \u{7d} \
+             \u{7d} else if timeout_set \u{7b}";
+
+        let body = route_body();
+        assert_eq!(
+            body.matches(MOVE_RECORD).count(),
+            1,
+            "the move's audit entry, as pinned: {body}"
+        );
+        for (needle, want) in [
+            ("AuditLogAction::MemberMove", 1),
+            ("AuditLogAction::MemberDisconnect", 1),
+        ] {
+            assert_eq!(
+                body.matches(needle).count(),
+                want,
+                "`{needle}` in the route: {body}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_out_of_range_timeout_is_refused() {
+        crate::util::test::rt().block_on(an_out_of_range_timeout_is_refused_case())
+    }
+
+    /// The HIGH hole: a timeout had no bounds, so `9999-12-31` muted a
+    /// member server-wide for good. In the past, more than 28 days out, and
+    /// 9999 are all `TimeoutOutOfRange`, with nothing written or recorded.
+    /// Mutation: the bounds check dropped (all three answer 200).
+    async fn an_out_of_range_timeout_is_refused_case() {
+        let harness = TestHarness::new().await;
+        let (_a, session_a, owner) = harness.new_user().await;
+        let (_b, _session_b, target) = harness.new_user().await;
+        let (server, _channels) = harness.new_server(&owner).await;
+        Member::create(&harness.db, &server, &target, None)
+            .await
+            .expect("member");
+
+        let now = Timestamp::now_utc();
+        for until in [
+            serde_json::json!(now.checked_add(Duration::minutes(-1)).expect("timestamp")),
+            serde_json::json!(now.checked_add(Duration::days(29)).expect("timestamp")),
+            serde_json::json!("9999-12-31T00:00:00.000Z"),
+        ] {
+            let response = edit_member(
+                &harness,
+                &session_a.token,
+                &server.id,
+                &target.id,
+                serde_json::json!({ "timeout": until }),
+            )
+            .await;
+            let (status, error) = error_of(response).await;
+            assert_eq!(status, Status::BadRequest, "{until}: {error:?}");
+            assert!(
+                matches!(
+                    &error,
+                    revolt_result::ErrorType::FailedValidation { error }
+                        if error == "TimeoutOutOfRange"
+                ),
+                "{} must be TimeoutOutOfRange, got {:?}",
+                until,
+                error
+            );
+        }
+
+        assert_eq!(timeout_of(&harness, &server, &target).await, None);
+        assert!(audit_entries(&harness, &server.id).await.is_empty());
+    }
+
+    #[test]
+    fn setting_a_timeout_with_its_clear_or_a_disconnect_is_refused() {
+        crate::util::test::rt()
+            .block_on(setting_a_timeout_with_its_clear_or_a_disconnect_is_refused_case())
+    }
+
+    /// `{timeout, remove: ["Timeout"]}` is a $set and an $unset of one field
+    /// (Mongo rejects it, the Reference driver applies the remove first), and
+    /// `{timeout, remove: ["VoiceChannel"]}` would run the moderator
+    /// disconnect next to the timeout's own eviction. Both are refused before
+    /// anything is written. Mutation: either half of the refusal dropped.
+    async fn setting_a_timeout_with_its_clear_or_a_disconnect_is_refused_case() {
+        let harness = TestHarness::new().await;
+        let (_a, session_a, owner) = harness.new_user().await;
+        let (_b, _session_b, target) = harness.new_user().await;
+        let (server, _channels) = harness.new_server(&owner).await;
+        Member::create(&harness.db, &server, &target, None)
+            .await
+            .expect("member");
+
+        for body in [
+            serde_json::json!({ "timeout": in_one_hour(), "remove": ["Timeout"] }),
+            serde_json::json!({ "timeout": in_one_hour(), "remove": ["VoiceChannel"] }),
+        ] {
+            let response = edit_member(
+                &harness,
+                &session_a.token,
+                &server.id,
+                &target.id,
+                body.clone(),
+            )
+            .await;
+            let (status, error) = error_of(response).await;
+            assert_eq!(status, Status::BadRequest, "{body}: {error:?}");
+            assert!(
+                matches!(error, revolt_result::ErrorType::InvalidOperation),
+                "{} must be InvalidOperation, got {:?}",
+                body,
+                error
+            );
+        }
+
+        assert_eq!(timeout_of(&harness, &server, &target).await, None);
+        assert!(audit_entries(&harness, &server.id).await.is_empty());
+    }
+
+    #[test]
+    fn timeout_refusals_write_nothing() {
+        crate::util::test::rt().block_on(timeout_refusals_write_nothing_case())
+    }
+
+    /// Who may not time out whom, one actor each: nobody times themselves
+    /// out (`CannotTimeoutYourself`), a member holding TimeoutMembers cannot
+    /// be timed out (`IsElevated`), an actor without TimeoutMembers is
+    /// refused it (403), and an actor ranked below the target is
+    /// `NotElevated`. Nothing is written and nothing is recorded.
+    async fn timeout_refusals_write_nothing_case() {
+        let harness = TestHarness::new().await;
+        let (_a, session_a, owner) = harness.new_user().await;
+        let (_p, session_p, plain) = harness.new_user().await; // holds nothing
+        let (_j, session_j, junior) = harness.new_user().await; // TimeoutMembers, ranked low
+        let (_e, _session_e, elevated) = harness.new_user().await; // holds TimeoutMembers
+        let (_t, _session_t, target) = harness.new_user().await; // ranked high, nothing else
+        let (server, _channels) = harness.new_server(&owner).await;
+        owner_membership(&harness, &server, &owner).await;
+        for user in [&plain, &junior, &elevated, &target] {
+            Member::create(&harness.db, &server, user, None)
+                .await
+                .expect("member");
+        }
+
+        let timeout_members = ChannelPermission::TimeoutMembers as u64;
+        let senior = ranked_role(&harness, &server, 1, 0).await;
+        let low = ranked_role(&harness, &server, 2, timeout_members).await;
+        let elevating = ranked_role(&harness, &server, 3, timeout_members).await;
+        give_role(&harness, &server, &target, &senior).await;
+        give_role(&harness, &server, &junior, &low).await;
+        give_role(&harness, &server, &elevated, &elevating).await;
+
+        let body = serde_json::json!({ "timeout": in_one_hour() });
+
+        let response = edit_member(
+            &harness,
+            &session_a.token,
+            &server.id,
+            &owner.id,
+            body.clone(),
+        )
+        .await;
+        let (status, error) = error_of(response).await;
+        assert_eq!(status, Status::BadRequest, "{error:?}");
+        assert!(
+            matches!(error, revolt_result::ErrorType::CannotTimeoutYourself),
+            "{error:?}"
+        );
+
+        let response = edit_member(
+            &harness,
+            &session_a.token,
+            &server.id,
+            &elevated.id,
+            body.clone(),
+        )
+        .await;
+        let (status, error) = error_of(response).await;
+        assert_eq!(status, Status::Forbidden, "{error:?}");
+        assert!(
+            matches!(error, revolt_result::ErrorType::IsElevated),
+            "{error:?}"
+        );
+
+        let response = edit_member(
+            &harness,
+            &session_p.token,
+            &server.id,
+            &target.id,
+            body.clone(),
+        )
+        .await;
+        assert_missing_permission(response, ChannelPermission::TimeoutMembers).await;
+
+        let response = edit_member(
+            &harness,
+            &session_j.token,
+            &server.id,
+            &target.id,
+            body.clone(),
+        )
+        .await;
+        assert_not_elevated(response).await;
+
+        for user in [&owner, &elevated, &target] {
+            assert_eq!(
+                timeout_of(&harness, &server, user).await,
+                None,
+                "no refused timeout may land"
+            );
+        }
+        assert!(audit_entries(&harness, &server.id).await.is_empty());
+    }
+
+    #[test]
+    fn clearing_a_timeout_works_and_both_are_recorded() {
+        crate::util::test::rt().block_on(clearing_a_timeout_works_and_both_are_recorded_case())
+    }
+
+    /// Setting a timeout records `member_timeout` with the new end, by the
+    /// authenticated user, with the reason from the header percent-decoded;
+    /// lifting it records `member_timeout_remove` with the old end. Mutation:
+    /// the reason dropped from the draft; the remove entry missed.
+    async fn clearing_a_timeout_works_and_both_are_recorded_case() {
+        let harness = TestHarness::new().await;
+        let (_a, session_a, owner) = harness.new_user().await;
+        let (_b, _session_b, target) = harness.new_user().await;
+        let (server, _channels) = harness.new_server(&owner).await;
+        Member::create(&harness.db, &server, &target, None)
+            .await
+            .expect("member");
+
+        let response = edit_member_with_reason(
+            &harness,
+            &session_a.token,
+            &server.id,
+            &target.id,
+            "spam%20in%20chat",
+            serde_json::json!({ "timeout": in_one_hour() }),
+        )
+        .await;
+        let status = response.status();
+        let answer = response.into_string().await;
+        assert_eq!(status, Status::Ok, "{answer:?}");
+
+        let until = timeout_of(&harness, &server, &target)
+            .await
+            .expect("the timeout is written");
+        let until = until.format().to_string();
+
+        let entries = audit_entries(&harness, &server.id).await;
+        assert_eq!(entries.len(), 1, "{entries:?}");
+        let entry = only_entry(&entries, AuditLogAction::MemberTimeout);
+        assert_eq!(entry.actor.as_deref(), Some(owner.id.as_str()));
+        assert_eq!(entry.target.as_deref(), Some(target.id.as_str()));
+        assert_eq!(entry.channel, None);
+        assert_eq!(entry.count, None);
+        assert_eq!(
+            entry.reason.as_deref(),
+            Some("spam in chat"),
+            "the header's reason, percent-decoded"
+        );
+        assert_eq!(entry.changes, vec![change("timeout", None, text(&until))]);
+
+        let response = edit_member(
+            &harness,
+            &session_a.token,
+            &server.id,
+            &target.id,
+            serde_json::json!({ "remove": ["Timeout"] }),
+        )
+        .await;
+        assert_eq!(response.status(), Status::Ok);
+        assert_eq!(
+            timeout_of(&harness, &server, &target).await,
+            None,
+            "the timeout is lifted"
+        );
+
+        let entries = audit_entries(&harness, &server.id).await;
+        assert_eq!(entries.len(), 2, "{entries:?}");
+        let entry = only_entry(&entries, AuditLogAction::MemberTimeoutRemove);
+        assert_eq!(entry.actor.as_deref(), Some(owner.id.as_str()));
+        assert_eq!(entry.target.as_deref(), Some(target.id.as_str()));
+        assert_eq!(entry.reason, None, "no header, no reason");
+        assert_eq!(entry.changes, vec![change("timeout", text(&until), None)]);
+    }
+
+    #[test]
+    fn a_timeout_evicts_from_voice_without_move_members() {
+        crate::util::test::rt().block_on(a_timeout_evicts_from_voice_without_move_members_case())
+    }
+
+    /// Audit B1: setting a timeout disconnects the member from voice, the
+    /// way a kick or a ban does, and it is not the moderator disconnect: the
+    /// moderator here holds TimeoutMembers alone (no MoveMembers anywhere)
+    /// and cannot even see the call, and the target is taken out of it all
+    /// the same. The call ended without its webhooks (no node pinned), the
+    /// one eviction this harness can drive to completion: the recorded
+    /// connection and the state are torn down and the Leave is published.
+    /// The audit log holds the timeout alone, no disconnect. Mutations: the
+    /// eviction gated on MoveMembers or on the call's visibility; the
+    /// eviction dropped (the state survives); a disconnect entry written for
+    /// it.
+    async fn a_timeout_evicts_from_voice_without_move_members_case() {
+        use revolt_database::util::permissions::DatabasePermissionQuery;
+        use revolt_permissions::{calculate_channel_permissions, calculate_server_permissions};
+
+        let mut harness = TestHarness::new().await;
+        let (_a, _session_a, owner) = harness.new_user().await;
+        let (_m, session_m, moderator) = harness.new_user().await;
+        let (_t, _session_t, target) = harness.new_user().await;
+        let (server, _channels) = harness.new_server(&owner).await;
+        for user in [&moderator, &target] {
+            Member::create(&harness.db, &server, user, None)
+                .await
+                .expect("member");
+        }
+        let mod_role = ranked_role(
+            &harness,
+            &server,
+            1,
+            ChannelPermission::TimeoutMembers as u64,
+        )
+        .await;
+        give_role(&harness, &server, &moderator, &mod_role).await;
+
+        let channel = voice_channel(&harness, &server, "Hidden").await;
+        channel_override(
+            &harness,
+            &channel,
+            &mod_role,
+            0,
+            ChannelPermission::ViewChannel as u64,
+        )
+        .await;
+        let uvc = UserVoiceChannel::from_channel(&channel);
+        join_recorded(&uvc, &target.id, "PA_timed_out", &target.id).await;
+
+        // The setup, asserted through the calculus the route runs.
+        let current = harness
+            .db
+            .fetch_server(&server.id)
+            .await
+            .expect("server read");
+        let mut query = DatabasePermissionQuery::new(&harness.db, &moderator).server(&current);
+        assert!(
+            !calculate_server_permissions(&mut query)
+                .await
+                .has_channel_permission(ChannelPermission::MoveMembers),
+            "setup: the moderator holds no MoveMembers in the server"
+        );
+        let current = harness
+            .db
+            .fetch_channel(channel.id())
+            .await
+            .expect("channel read");
+        let mut query = DatabasePermissionQuery::new(&harness.db, &moderator).channel(&current);
+        let in_the_call = calculate_channel_permissions(&mut query).await;
+        assert!(
+            !in_the_call.has_channel_permission(ChannelPermission::ViewChannel)
+                && !in_the_call.has_channel_permission(ChannelPermission::MoveMembers),
+            "setup: the moderator can neither see nor move anybody in the call"
+        );
+        let (recorded, listed, member, pointer) = voice_traces(&uvc, &target.id).await;
+        assert!(
+            !recorded.is_empty() && listed && member && pointer,
+            "setup: the target is in the call"
+        );
+
+        let response = edit_member(
+            &harness,
+            &session_m.token,
+            &server.id,
+            &target.id,
+            serde_json::json!({ "timeout": in_one_hour() }),
+        )
+        .await;
+        let status = response.status();
+        let answer = response.into_string().await;
+        assert_eq!(status, Status::Ok, "{answer:?}");
+
+        let (recorded, listed, member, pointer) = voice_traces(&uvc, &target.id).await;
+        assert!(
+            recorded.is_empty() && !listed && !member && !pointer,
+            "the timed-out member must be taken out of the call, left: recorded {:?}, \
+             vc {}, vc_members {}, pointer {}",
+            recorded,
+            listed,
+            member,
+            pointer
+        );
+        harness
+            .wait_for_event(channel.id(), |event| {
+                matches!(
+                    event,
+                    EventV1::VoiceChannelLeave { id, user }
+                        if id == channel.id() && user == &target.id
+                )
+            })
+            .await;
+
+        assert!(timeout_of(&harness, &server, &target).await.is_some());
+        let entries = audit_entries(&harness, &server.id).await;
+        assert_eq!(
+            entries.len(),
+            1,
+            "the timeout alone, no disconnect entry for its eviction: {entries:?}"
+        );
+        let entry = only_entry(&entries, AuditLogAction::MemberTimeout);
+        assert_eq!(entry.actor.as_deref(), Some(moderator.id.as_str()));
+        assert_eq!(entry.target.as_deref(), Some(target.id.as_str()));
+
+        delete_channel_voice_state(&uvc, &[target.id.clone()])
+            .await
+            .expect("cleanup");
+    }
+
+    /// Call the route directly, with `voice_client` in place of the one the
+    /// harness's Rocket instance manages.
+    async fn edit_directly(
+        harness: &TestHarness,
+        voice_client: &revolt_database::voice::VoiceClient,
+        actor: &User,
+        server: &Server,
+        target: &User,
+        body: serde_json::Value,
+    ) -> revolt_result::Result<v0::Member> {
+        use revolt_database::util::{audit_reason::AuditLogReason, reference::Reference};
+        use revolt_database::{voice::VoiceClient, Database};
+        use rocket::{serde::json::Json, State};
+
+        super::edit(
+            <&State<Database>>::from(&harness.db),
+            <&State<VoiceClient>>::from(voice_client),
+            actor.clone(),
+            None,
+            Reference::from_unchecked(&server.id),
+            Reference::from_unchecked(&target.id),
+            AuditLogReason::none(),
+            Json(member_edit(body)),
+        )
+        .await
+        .map(|member| member.into_inner())
+    }
+
+    #[test]
+    fn a_timeout_needs_no_livekit() {
+        crate::util::test::rt().block_on(a_timeout_needs_no_livekit_case())
+    }
+
+    /// Audit B1: the timeout's eviction does not ask whether LiveKit is
+    /// enabled. The route is called directly with a `VoiceClient` that has
+    /// no nodes (`is_enabled()` false), whatever the harness's own client
+    /// is. The control first: on that client the moderator disconnect DOES
+    /// refuse with `LiveKitUnavailable`, so the client really is disabled.
+    /// A timeout of the same member, sitting in the ghost of an ended call,
+    /// then succeeds, is written, and still clears the ghost. Mutation: an
+    /// `is_enabled()` refusal on the timeout path.
+    async fn a_timeout_needs_no_livekit_case() {
+        let harness = TestHarness::new().await;
+        let (_a, _session_a, owner) = harness.new_user().await;
+        let (_b, _session_b, target) = harness.new_user().await;
+        let (server, _channels) = harness.new_server(&owner).await;
+        Member::create(&harness.db, &server, &target, None)
+            .await
+            .expect("member");
+
+        let channel = voice_channel(&harness, &server, "Ended").await;
+        let uvc = UserVoiceChannel::from_channel(&channel);
+        create_voice_state(&uvc, &target.id, Timestamp::now_utc())
+            .await
+            .expect("voice state");
+
+        let disabled = revolt_database::voice::VoiceClient::new(Default::default());
+        assert!(!disabled.is_enabled(), "setup: a client with no nodes");
+
+        let error = edit_directly(
+            &harness,
+            &disabled,
+            &owner,
+            &server,
+            &target,
+            serde_json::json!({ "remove": ["VoiceChannel"] }),
+        )
+        .await
+        .expect_err("the moderator disconnect needs LiveKit");
+        assert!(
+            matches!(
+                error.error_type,
+                revolt_result::ErrorType::LiveKitUnavailable
+            ),
+            "the control must be refused for LiveKit, got {:?}",
+            error
+        );
+
+        edit_directly(
+            &harness,
+            &disabled,
+            &owner,
+            &server,
+            &target,
+            serde_json::json!({ "timeout": in_one_hour() }),
+        )
+        .await
+        .expect("a timeout needs no LiveKit");
+
+        assert!(timeout_of(&harness, &server, &target).await.is_some());
+        let (recorded, listed, member, pointer) = voice_traces(&uvc, &target.id).await;
+        assert!(
+            recorded.is_empty() && !listed && !member && !pointer,
+            "the ghost is cleared with LiveKit off: recorded {:?}, vc {}, vc_members {}, \
+             pointer {}",
+            recorded,
+            listed,
+            member,
+            pointer
+        );
+
+        delete_channel_voice_state(&uvc, &[target.id.clone()])
+            .await
+            .expect("cleanup");
+    }
+
+    #[test]
+    fn a_moderator_cannot_time_out_or_disconnect_a_roleless_owner() {
+        crate::util::test::rt()
+            .block_on(a_moderator_cannot_time_out_or_disconnect_a_roleless_owner_case())
+    }
+
+    /// The owner-guard tests the 09-15 fix (`e82b4bba`) lacked for the
+    /// timeout and voice shapes: a moderator holding TimeoutMembers and
+    /// MoveMembers is refused all four against an owner holding no roles,
+    /// the timeout as `IsElevated` (the owner holds every permission), the
+    /// rest as `NotElevated`. Nothing lands and nothing is recorded.
+    async fn a_moderator_cannot_time_out_or_disconnect_a_roleless_owner_case() {
+        let harness = TestHarness::new().await;
+        let (_a, _session_a, owner) = harness.new_user().await;
+        let (_m, session_m, moderator) = harness.new_user().await;
+        let (server, _channels) = harness.new_server(&owner).await;
+        owner_membership(&harness, &server, &owner).await;
+        Member::create(&harness.db, &server, &moderator, None)
+            .await
+            .expect("member");
+        let role = ranked_role(
+            &harness,
+            &server,
+            1,
+            ChannelPermission::TimeoutMembers as u64 | ChannelPermission::MoveMembers as u64,
+        )
+        .await;
+        give_role(&harness, &server, &moderator, &role).await;
+        let dest = voice_channel(&harness, &server, "Dest").await;
+
+        let before = harness
+            .db
+            .fetch_member(&server.id, &owner.id)
+            .await
+            .expect("owner member");
+        assert!(before.roles.is_empty(), "the owner must hold no roles here");
+
+        for (body, is_elevated) in [
+            (serde_json::json!({ "timeout": in_one_hour() }), true),
+            (serde_json::json!({ "remove": ["Timeout"] }), false),
+            (serde_json::json!({ "voice_channel": dest.id() }), false),
+            (serde_json::json!({ "remove": ["VoiceChannel"] }), false),
+        ] {
+            let response = edit_member(
+                &harness,
+                &session_m.token,
+                &server.id,
+                &owner.id,
+                body.clone(),
+            )
+            .await;
+            let (status, error) = error_of(response).await;
+            assert_eq!(status, Status::Forbidden, "{body}: {error:?}");
+            if is_elevated {
+                assert!(
+                    matches!(error, revolt_result::ErrorType::IsElevated),
+                    "{} against the owner must be IsElevated, got {:?}",
+                    body,
+                    error
+                );
+            } else {
+                assert!(
+                    matches!(error, revolt_result::ErrorType::NotElevated),
+                    "{} against the owner must fail on rank, got {:?}",
+                    body,
+                    error
+                );
+            }
+        }
+
+        let after = harness
+            .db
+            .fetch_member(&server.id, &owner.id)
+            .await
+            .expect("owner member");
+        assert_eq!(after, before, "nothing may land on the owner");
+        assert!(audit_entries(&harness, &server.id).await.is_empty());
+    }
+
+    #[test]
+    fn member_edits_are_recorded_with_their_exact_changes() {
+        crate::util::test::rt().block_on(member_edits_are_recorded_with_their_exact_changes_case())
+    }
+
+    /// The action table, end to end: one PATCH granting a role, renaming and
+    /// server-muting writes three entries, one per kind, with exactly the
+    /// pinned keys; taking the role back alongside a mute already in place
+    /// writes the role entry alone; removing the nickname records the old
+    /// one. Every entry is by the authenticated user, about the target, with
+    /// no channel and no reason. Mutations: the entries folded into one; an
+    /// entry for the unchanged mute; the actor taken from anywhere but the
+    /// session.
+    async fn member_edits_are_recorded_with_their_exact_changes_case() {
+        let harness = TestHarness::new().await;
+        let (_a, session_a, owner) = harness.new_user().await;
+        let (_b, _session_b, target) = harness.new_user().await;
+        let (server, _channels) = harness.new_server(&owner).await;
+        Member::create(&harness.db, &server, &target, None)
+            .await
+            .expect("member");
+        let role = ranked_role(&harness, &server, 1, 0).await;
+
+        let response = edit_member(
+            &harness,
+            &session_a.token,
+            &server.id,
+            &target.id,
+            serde_json::json!({
+                "roles": [role.id],
+                "nickname": "renamed",
+                "can_publish": false
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), Status::Ok);
+
+        let entries = audit_entries(&harness, &server.id).await;
+        assert_eq!(entries.len(), 3, "one entry per action kind: {entries:?}");
+        for entry in &entries {
+            assert_eq!(entry.server, server.id);
+            assert_eq!(entry.actor.as_deref(), Some(owner.id.as_str()));
+            assert_eq!(entry.target.as_deref(), Some(target.id.as_str()));
+            assert_eq!(entry.channel, None);
+            assert_eq!(entry.reason, None);
+        }
+        assert_eq!(
+            only_entry(&entries, AuditLogAction::MemberRoleUpdate).changes,
+            vec![change("roles_added", None, ids(&[role.id.as_str()]))]
+        );
+        assert_eq!(
+            only_entry(&entries, AuditLogAction::MemberUpdate).changes,
+            vec![change("nickname", None, text("renamed"))]
+        );
+        assert_eq!(
+            only_entry(&entries, AuditLogAction::MemberVoiceUpdate).changes,
+            vec![change("can_publish", flag(true), flag(false))]
+        );
+
+        let response = edit_member(
+            &harness,
+            &session_a.token,
+            &server.id,
+            &target.id,
+            serde_json::json!({ "roles": [], "can_publish": false }),
+        )
+        .await;
+        assert_eq!(response.status(), Status::Ok);
+
+        let entries = audit_entries(&harness, &server.id).await;
+        assert_eq!(
+            entries.len(),
+            4,
+            "the role entry alone, nothing for the mute already in place: {entries:?}"
+        );
+        assert!(
+            entries
+                .iter()
+                .any(|entry| entry.action == AuditLogAction::MemberRoleUpdate
+                    && entry.changes
+                        == vec![change("roles_removed", None, ids(&[role.id.as_str()]))]),
+            "{entries:?}"
+        );
+
+        let response = edit_member(
+            &harness,
+            &session_a.token,
+            &server.id,
+            &target.id,
+            serde_json::json!({ "remove": ["Nickname"] }),
+        )
+        .await;
+        assert_eq!(response.status(), Status::Ok);
+
+        let entries = audit_entries(&harness, &server.id).await;
+        assert_eq!(entries.len(), 5, "{entries:?}");
+        assert!(
+            entries
+                .iter()
+                .any(|entry| entry.action == AuditLogAction::MemberUpdate
+                    && entry.changes == vec![change("nickname", text("renamed"), None)]),
+            "{entries:?}"
+        );
+    }
+
+    #[test]
+    fn a_self_edit_is_not_recorded() {
+        crate::util::test::rt().block_on(a_self_edit_is_not_recorded_case())
+    }
+
+    /// Self-actions are not logged: a member renaming themselves writes no
+    /// entry. Mutation: the self-edit skip dropped.
+    async fn a_self_edit_is_not_recorded_case() {
+        let harness = TestHarness::new().await;
+        let (_a, session_a, owner) = harness.new_user().await;
+        let (server, _channels) = harness.new_server(&owner).await;
+        owner_membership(&harness, &server, &owner).await;
+
+        let response = edit_member(
+            &harness,
+            &session_a.token,
+            &server.id,
+            &owner.id,
+            serde_json::json!({ "nickname": "Spicy Chef" }),
+        )
+        .await;
+        assert_eq!(response.status(), Status::Ok);
+        assert_eq!(
+            harness
+                .db
+                .fetch_member(&server.id, &owner.id)
+                .await
+                .expect("member read")
+                .nickname
+                .as_deref(),
+            Some("Spicy Chef"),
+            "the rename landed"
+        );
+        assert!(audit_entries(&harness, &server.id).await.is_empty());
+    }
+
+    #[test]
+    fn an_overlong_reason_refuses_the_edit() {
+        crate::util::test::rt().block_on(an_overlong_reason_refuses_the_edit_case())
+    }
+
+    /// A reason over 512 chars is `AuditLogReasonTooLong` and refuses the
+    /// whole edit, before anything is written: a 400 must never follow an
+    /// edit that already landed. 512 exactly is accepted and recorded whole.
+    /// Mutation: the reason validated after the member write (the rename
+    /// lands, then 400).
+    async fn an_overlong_reason_refuses_the_edit_case() {
+        let harness = TestHarness::new().await;
+        let (_a, session_a, owner) = harness.new_user().await;
+        let (_b, _session_b, target) = harness.new_user().await;
+        let (server, _channels) = harness.new_server(&owner).await;
+        Member::create(&harness.db, &server, &target, None)
+            .await
+            .expect("member");
+
+        let response = edit_member_with_reason(
+            &harness,
+            &session_a.token,
+            &server.id,
+            &target.id,
+            &"a".repeat(513),
+            serde_json::json!({ "nickname": "renamed" }),
+        )
+        .await;
+        let (status, error) = error_of(response).await;
+        assert_eq!(status, Status::BadRequest, "{error:?}");
+        assert!(
+            matches!(
+                &error,
+                revolt_result::ErrorType::FailedValidation { error }
+                    if error == "AuditLogReasonTooLong"
+            ),
+            "{error:?}"
+        );
+        assert_eq!(
+            harness
+                .db
+                .fetch_member(&server.id, &target.id)
+                .await
+                .expect("member read")
+                .nickname,
+            None,
+            "the refused edit must not land"
+        );
+        assert!(audit_entries(&harness, &server.id).await.is_empty());
+
+        let response = edit_member_with_reason(
+            &harness,
+            &session_a.token,
+            &server.id,
+            &target.id,
+            &"a".repeat(512),
+            serde_json::json!({ "nickname": "renamed" }),
+        )
+        .await;
+        assert_eq!(response.status(), Status::Ok);
+        let entries = audit_entries(&harness, &server.id).await;
+        let entry = only_entry(&entries, AuditLogAction::MemberUpdate);
+        assert_eq!(
+            entry.reason.as_deref().map(|reason| reason.chars().count()),
+            Some(512)
+        );
     }
 }

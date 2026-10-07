@@ -1,9 +1,10 @@
 use revolt_database::util::permissions::DatabasePermissionQuery;
 use revolt_database::{
     client_gate_is_set,
-    util::reference::Reference,
+    util::{audit_reason::AuditLogReason, reference::Reference},
     voice::{sync_afk_designation_change, VoiceClient},
-    Channel, Database, FieldsServer, PartialServer, Server, User,
+    AuditLogAction, AuditLogChange, AuditLogDraft, AuditLogEntry, AuditValue, Channel, Database,
+    FieldsServer, PartialServer, Server, User,
 };
 use revolt_models::v0;
 use revolt_permissions::{calculate_server_permissions, ChannelPermission};
@@ -24,7 +25,12 @@ pub async fn create_server_channel(
     user: User,
     server: Reference<'_>,
     data: Json<v0::DataCreateServerChannel>,
+    reason: AuditLogReason,
 ) -> Result<Json<v0::Channel>> {
+    // Validated before anything else: a too-long reason must refuse the
+    // create, never answer 400 with the channel already made and announced.
+    let reason = reason.validated()?;
+
     let data = data.into_inner();
     data.validate().map_err(|error| {
         create_error!(FailedValidation {
@@ -69,7 +75,36 @@ pub async fn create_server_channel(
         }
     }
 
+    // Captured for the audit entry before `data` moves into the create.
+    let audit_name = data.name.clone();
+    let audit_type = audit_channel_type(&data.channel_type);
+
     let channel = Channel::create_server_channel(db, &mut server, data, true).await?;
+
+    // Recorded as soon as the channel exists and BEFORE the AFK designation:
+    // a failed designation answers an error, but the channel it follows was
+    // still created and announced. The designation itself is a server-level
+    // change and is not part of this entry.
+    AuditLogEntry::record(
+        db,
+        AuditLogDraft {
+            server: server.id.clone(),
+            actor: Some(user.id.clone()),
+            action: AuditLogAction::ChannelCreate,
+            target: Some(channel.id().to_string()),
+            changes: vec![
+                AuditLogChange::new("name", None, Some(AuditValue::String(audit_name))),
+                AuditLogChange::new(
+                    "type",
+                    None,
+                    Some(AuditValue::String(audit_type.to_string())),
+                ),
+            ],
+            reason,
+            ..Default::default()
+        },
+    )
+    .await;
 
     if designate_afk {
         // `Server::validate_afk_channel` is deliberately NOT called here, but
@@ -148,6 +183,28 @@ pub async fn create_server_channel(
     }
 
     Ok(Json(channel.into()))
+}
+
+/// The `type` a `channel_create` audit entry records: the channel type the
+/// request asked this route to create, spelled exactly as its wire form in
+/// `DataCreateServerChannel.type` (`"Text"`, `"Voice"`, `"Forum"`).
+///
+/// It is the request type, not something re-derived from the stored channel,
+/// because there is no `VoiceChannel` type to read back: a voice channel is a
+/// `TextChannel` carrying voice information. `create_server_channel` has
+/// exactly one arm per request type, so this names the arm that ran. Two
+/// edge bodies follow from that and are recorded as asked: a `Voice` body
+/// with `voice.disabled: true` records `"Voice"`, and a `Text` body carrying
+/// `voice` records `"Text"`.
+///
+/// The match is exhaustive with no wildcard, so a new request type fails to
+/// compile here instead of being logged under a wrong name.
+fn audit_channel_type(channel_type: &v0::LegacyServerChannelType) -> &'static str {
+    match channel_type {
+        v0::LegacyServerChannelType::Text => "Text",
+        v0::LegacyServerChannelType::Voice => "Voice",
+        v0::LegacyServerChannelType::Forum => "Forum",
+    }
 }
 
 /// Would the channel this request is about to create actually be a valid AFK
@@ -245,7 +302,7 @@ fn afk_create_timeout(
 
 #[cfg(test)]
 mod tests {
-    use super::{afk_create_timeout, validate_afk_creation_shape};
+    use super::{afk_create_timeout, audit_channel_type, validate_afk_creation_shape};
     use revolt_models::v0;
     use revolt_result::ErrorType;
 
@@ -673,5 +730,276 @@ mod tests {
         let stored = harness.db.fetch_server(&server.id).await.expect("server");
         assert_eq!(stored.channels.len(), server.channels.len() + 1);
         assert!(stored.afk_channel_id.is_some());
+    }
+
+    // ---- the audit log entry ---------------------------------------------
+
+    /// Every request type has its own recorded name, spelled as the wire
+    /// form of `DataCreateServerChannel.type`.
+    #[test]
+    fn the_recorded_type_names_the_requested_type() {
+        assert_eq!(
+            audit_channel_type(&v0::LegacyServerChannelType::Text),
+            "Text"
+        );
+        assert_eq!(
+            audit_channel_type(&v0::LegacyServerChannelType::Voice),
+            "Voice"
+        );
+        assert_eq!(
+            audit_channel_type(&v0::LegacyServerChannelType::Forum),
+            "Forum"
+        );
+    }
+
+    /// The reason is validated before the permission check and the create,
+    /// and the `channel_create` entry is recorded after the create and
+    /// before the AFK designation's server update and re-sync, each once.
+    /// Mutations: the validation moved below the create; the record moved
+    /// above the create or below the designation.
+    #[test]
+    fn the_create_validates_the_reason_first_and_records_after_the_create() {
+        const VALIDATE: &str = "let reason = reason.validated()?;";
+        const PERMISSION: &str =
+            "permissions.throw_if_lacking_channel_permission(ChannelPermission::ManageChannel)?;";
+        const CREATE: &str = "Channel::create_server_channel(db, &mut server, data, true).await?;";
+        const RECORD: &str = "AuditLogEntry::record(";
+        const UPDATE: &str = ".update(";
+        const SYNC: &str = "sync_afk_designation_change(";
+
+        let body = route_body();
+        let mut last = 0;
+        for needle in [VALIDATE, PERMISSION, CREATE, RECORD, UPDATE, SYNC] {
+            assert_eq!(
+                body.matches(needle).count(),
+                1,
+                "the create must carry `{}` exactly once: {}",
+                needle,
+                body
+            );
+            let at = body.find(needle).expect("counted above");
+            assert!(last < at, "`{}` is out of order: {}", needle, body);
+            last = at;
+        }
+        for field in [
+            "action: AuditLogAction::ChannelCreate,",
+            "actor: Some(user.id.clone()),",
+            "target: Some(channel.id().to_string()),",
+        ] {
+            assert!(body.contains(field), "the entry lost `{}`: {}", field, body);
+        }
+    }
+
+    /// `create_server_channel`, optionally with an `X-Audit-Log-Reason`
+    /// header sent as given (the client percent-encodes it).
+    async fn post_channel(
+        harness: &crate::util::test::TestHarness,
+        token: &str,
+        server_id: &str,
+        body: &serde_json::Value,
+        reason: Option<&str>,
+    ) -> (rocket::http::Status, String) {
+        use rocket::http::{ContentType, Header};
+
+        let mut request = harness
+            .client
+            .post(format!("/servers/{}/channels", server_id))
+            .header(ContentType::JSON)
+            .header(Header::new("x-session-token", token.to_string()))
+            .body(body.to_string());
+        if let Some(reason) = reason {
+            request = request.header(Header::new("X-Audit-Log-Reason", reason.to_string()));
+        }
+        let response = request.dispatch().await;
+        let status = response.status();
+        (status, response.into_string().await.unwrap_or_default())
+    }
+
+    /// Every audit log entry of `server_id`, newest first.
+    async fn audit_entries(
+        harness: &crate::util::test::TestHarness,
+        server_id: &str,
+    ) -> Vec<revolt_database::AuditLogEntry> {
+        harness
+            .db
+            .fetch_audit_log(server_id, None, 50, None, None)
+            .await
+            .expect("audit log read")
+    }
+
+    // Compile-only without RabbitMQ: see the behavior section note above.
+    #[test]
+    fn a_create_records_one_channel_create_with_the_header_reason() {
+        crate::util::test::rt()
+            .block_on(a_create_records_one_channel_create_with_the_header_reason_case())
+    }
+
+    /// Each create writes exactly one `channel_create` entry: the creator as
+    /// actor, the new channel as target, no channel or count, `name` and
+    /// `type` as new values only, and the reason percent-decoded from the
+    /// header. A create without the header records no reason. Entries are
+    /// selected by target, never by position: entries minted in the same
+    /// millisecond have no guaranteed order.
+    async fn a_create_records_one_channel_create_with_the_header_reason_case() {
+        use crate::util::test::TestHarness;
+        use revolt_database::{AuditLogAction, AuditLogChange, AuditValue};
+        use rocket::http::Status;
+
+        let harness = TestHarness::new().await;
+        let (_, session, owner) = harness.new_user().await;
+        let (server, _channels) = harness.new_server(&owner).await;
+
+        let requests = vec![
+            (
+                serde_json::json!({ "type": "Text", "name": "audit-text" }),
+                Some("create%20reason"),
+                "audit-text",
+                "Text",
+                Some("create reason"),
+            ),
+            (
+                serde_json::json!({ "type": "Voice", "name": "audit-voice" }),
+                None,
+                "audit-voice",
+                "Voice",
+                None,
+            ),
+        ];
+
+        let mut created = Vec::new();
+        for (body, header, name, kind, expected_reason) in requests {
+            let (status, text) =
+                post_channel(&harness, &session.token, &server.id, &body, header).await;
+            assert_eq!(status, Status::Ok, "{}", text);
+            let id = serde_json::from_str::<serde_json::Value>(&text).expect("a channel body")
+                ["_id"]
+                .as_str()
+                .expect("a channel id")
+                .to_string();
+            created.push((id, name, kind, expected_reason));
+        }
+
+        let stored = harness.db.fetch_server(&server.id).await.expect("server");
+        assert_eq!(stored.channels.len(), server.channels.len() + 2);
+
+        let entries = audit_entries(&harness, &server.id).await;
+        assert_eq!(entries.len(), 2, "one entry per create: {:?}", entries);
+        for (id, name, kind, expected_reason) in &created {
+            assert!(
+                stored.channels.contains(id),
+                "the target is the created channel: {:?}",
+                stored.channels
+            );
+            let matching: Vec<_> = entries
+                .iter()
+                .filter(|entry| entry.target.as_deref() == Some(id.as_str()))
+                .collect();
+            assert_eq!(matching.len(), 1, "one entry for {}: {:?}", id, entries);
+            let entry = matching[0];
+            assert_eq!(entry.server, server.id);
+            assert_eq!(entry.action, AuditLogAction::ChannelCreate);
+            assert_eq!(entry.actor.as_deref(), Some(owner.id.as_str()));
+            assert_eq!(entry.channel, None);
+            assert_eq!(entry.count, None);
+            assert_eq!(
+                entry.changes,
+                vec![
+                    AuditLogChange::new("name", None, Some(AuditValue::String(name.to_string()))),
+                    AuditLogChange::new("type", None, Some(AuditValue::String(kind.to_string()))),
+                ]
+            );
+            assert_eq!(entry.reason.as_deref(), *expected_reason);
+        }
+    }
+
+    // Compile-only without RabbitMQ: see the behavior section note above.
+    #[test]
+    fn a_create_without_manage_channel_is_refused_and_records_nothing() {
+        crate::util::test::rt()
+            .block_on(a_create_without_manage_channel_is_refused_and_records_nothing_case())
+    }
+
+    /// A member without ManageChannel is refused, nothing is created and
+    /// nothing is recorded, although the request carried a valid reason.
+    /// Mutation: the record moved above the permission check.
+    async fn a_create_without_manage_channel_is_refused_and_records_nothing_case() {
+        use crate::util::test::TestHarness;
+        use revolt_database::Member;
+        use rocket::http::Status;
+
+        let harness = TestHarness::new().await;
+        let (_, _owner_session, owner) = harness.new_user().await;
+        let (_, session, member) = harness.new_user().await;
+        let (server, _channels) = harness.new_server(&owner).await;
+        Member::create(&harness.db, &server, &member, None)
+            .await
+            .expect("member");
+
+        let body = serde_json::json!({ "type": "Text", "name": "refused" });
+        let (status, text) =
+            post_channel(&harness, &session.token, &server.id, &body, Some("refused")).await;
+        assert_eq!(status, Status::Forbidden, "{}", text);
+        assert!(text.contains("MissingPermission"), "{}", text);
+        assert!(text.contains("ManageChannel"), "{}", text);
+
+        let stored = harness.db.fetch_server(&server.id).await.expect("server");
+        assert_eq!(stored.channels, server.channels, "no channel was created");
+        let entries = audit_entries(&harness, &server.id).await;
+        assert!(entries.is_empty(), "{:?}", entries);
+    }
+
+    // Compile-only without RabbitMQ: see the behavior section note above.
+    #[test]
+    fn a_too_long_reason_refuses_the_create() {
+        crate::util::test::rt().block_on(a_too_long_reason_refuses_the_create_case())
+    }
+
+    /// A 513-character reason is refused with AuditLogReasonTooLong before
+    /// anything happens: no channel exists and nothing is recorded. The same
+    /// body with a 512-character reason is the positive control. Mutation:
+    /// the validation moved below the create.
+    async fn a_too_long_reason_refuses_the_create_case() {
+        use crate::util::test::TestHarness;
+        use revolt_database::AuditLogAction;
+        use rocket::http::Status;
+
+        let harness = TestHarness::new().await;
+        let (_, session, owner) = harness.new_user().await;
+        let (server, _channels) = harness.new_server(&owner).await;
+        let body = serde_json::json!({ "type": "Text", "name": "reasoned" });
+
+        let too_long = "a".repeat(513);
+        let (status, text) = post_channel(
+            &harness,
+            &session.token,
+            &server.id,
+            &body,
+            Some(too_long.as_str()),
+        )
+        .await;
+        assert_eq!(status, Status::BadRequest, "{}", text);
+        assert!(text.contains("AuditLogReasonTooLong"), "{}", text);
+
+        let stored = harness.db.fetch_server(&server.id).await.expect("server");
+        assert_eq!(stored.channels, server.channels, "no channel was created");
+        let entries = audit_entries(&harness, &server.id).await;
+        assert!(entries.is_empty(), "{:?}", entries);
+
+        let longest = "a".repeat(512);
+        let (status, text) = post_channel(
+            &harness,
+            &session.token,
+            &server.id,
+            &body,
+            Some(longest.as_str()),
+        )
+        .await;
+        assert_eq!(status, Status::Ok, "{}", text);
+        let stored = harness.db.fetch_server(&server.id).await.expect("server");
+        assert_eq!(stored.channels.len(), server.channels.len() + 1);
+        let entries = audit_entries(&harness, &server.id).await;
+        assert_eq!(entries.len(), 1, "{:?}", entries);
+        assert_eq!(entries[0].action, AuditLogAction::ChannelCreate);
+        assert_eq!(entries[0].reason.as_deref(), Some(longest.as_str()));
     }
 }

@@ -1,5 +1,6 @@
 mod admin_migrations;
 mod application_commands;
+mod audit_log;
 mod bots;
 mod calendar_events;
 mod channel_follows;
@@ -44,6 +45,7 @@ mod mfa_tickets;
 
 pub use admin_migrations::*;
 pub use application_commands::*;
+pub use audit_log::*;
 pub use bots::*;
 pub use calendar_events::*;
 pub use channel_follows::*;
@@ -99,6 +101,7 @@ pub trait AbstractDatabase:
     + Send
     + admin_migrations::AbstractMigrations
     + application_commands::AbstractApplicationCommands
+    + audit_log::AbstractAuditLog
     + bots::AbstractBots
     + calendar_events::AbstractCalendarEvents
     + channel_follows::AbstractChannelFollows

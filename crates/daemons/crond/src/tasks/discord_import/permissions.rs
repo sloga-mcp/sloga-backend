@@ -17,6 +17,11 @@
 //!   stray bit in a channel overwrite's `deny` field into "deny all 52
 //!   permissions on this channel", i.e. a channel nobody but the owner can
 //!   see — created silently, from a template that behaved fine on Discord.
+//!
+//! `VIEW_AUDIT_LOG` is guild-level only as well. It is honoured on roles
+//! (→ `ViewAuditLog`) and masked out of overwrites: Sloga reads the audit log
+//! permission server-wide, so a stray overwrite bit could only pin the
+//! channel to an override that changes nothing.
 
 use revolt_permissions::{ChannelPermission, DEFAULT_PERMISSION_SERVER};
 
@@ -30,6 +35,7 @@ mod discord {
     pub const MANAGE_CHANNELS: u32 = 4;
     pub const MANAGE_GUILD: u32 = 5;
     pub const ADD_REACTIONS: u32 = 6;
+    pub const VIEW_AUDIT_LOG: u32 = 7;
     pub const STREAM: u32 = 9;
     pub const VIEW_CHANNEL: u32 = 10;
     pub const SEND_MESSAGES: u32 = 11;
@@ -61,8 +67,8 @@ mod discord {
 /// listed here rather than hidden in code so the table stays auditable against
 /// the plan's §5.2.
 ///
-/// Everything Discord has and Sloga does not — `VIEW_AUDIT_LOG`,
-/// `PRIORITY_SPEAKER`, `SEND_TTS_MESSAGES`, `USE_EXTERNAL_EMOJIS`,
+/// Everything Discord has and Sloga does not — `PRIORITY_SPEAKER`,
+/// `SEND_TTS_MESSAGES`, `USE_EXTERNAL_EMOJIS`,
 /// `VIEW_GUILD_INSIGHTS`, `USE_VAD`, `USE_APPLICATION_COMMANDS`,
 /// `REQUEST_TO_SPEAK`, `MANAGE_EVENTS`, the thread permissions,
 /// `USE_EXTERNAL_STICKERS`, `USE_EMBEDDED_ACTIVITIES`, `USE_EXTERNAL_SOUNDS`,
@@ -84,6 +90,11 @@ static TABLE: &[(u32, u64)] = &[
         ChannelPermission::ManageServer as u64,
     ),
     (discord::ADD_REACTIONS, ChannelPermission::React as u64),
+    // Guild-level only; masked out of overwrites below.
+    (
+        discord::VIEW_AUDIT_LOG,
+        ChannelPermission::ViewAuditLog as u64,
+    ),
     (discord::STREAM, ChannelPermission::Video as u64),
     (discord::VIEW_CHANNEL, ChannelPermission::ViewChannel as u64),
     (
@@ -222,9 +233,10 @@ pub fn map_role_permissions(discord_bits: u64) -> u64 {
 
 /// Map one side (`allow` or `deny`) of a **channel permission overwrite**.
 ///
-/// `ADMINISTRATOR` is ignored — see the module docs.
+/// `ADMINISTRATOR` and `VIEW_AUDIT_LOG` are ignored — see the module docs.
 pub fn map_overwrite_permissions(discord_bits: u64) -> u64 {
-    map_bits(discord_bits & !(1u64 << discord::ADMINISTRATOR))
+    let guild_only = (1u64 << discord::ADMINISTRATOR) | (1u64 << discord::VIEW_AUDIT_LOG);
+    map_bits(discord_bits & !guild_only)
 }
 
 /// Map an overwrite's `allow`/`deny` pair into Sloga bits.
@@ -325,11 +337,41 @@ mod tests {
         assert_eq!(deny, 0);
     }
 
+    /// Pinned to the literal 128 so a typo in the bit constant cannot pass.
+    #[test]
+    fn view_audit_log_maps_on_roles() {
+        assert_eq!(
+            map_role_permissions(128),
+            ChannelPermission::ViewAuditLog as u64
+        );
+        assert_eq!(
+            map_role_permissions(discord(&[discord::VIEW_AUDIT_LOG])),
+            ChannelPermission::ViewAuditLog as u64
+        );
+    }
+
+    /// Guild-level only, like ADMINISTRATOR: an overwrite carrying it on
+    /// either side contributes nothing.
+    #[test]
+    fn view_audit_log_is_ignored_inside_channel_overwrites() {
+        assert_eq!(map_overwrite_permissions(128), 0);
+        assert_eq!(map_overwrite(128, 128), (0, 0));
+        assert_eq!(map_overwrite(128, 0), (0, 0));
+        assert_eq!(map_overwrite(0, 128), (0, 0));
+
+        let (allow, deny) = map_overwrite(
+            discord(&[discord::VIEW_AUDIT_LOG, discord::VIEW_CHANNEL]),
+            discord(&[discord::VIEW_AUDIT_LOG, discord::SEND_MESSAGES]),
+        );
+        assert_eq!(allow, ChannelPermission::ViewChannel as u64);
+        assert_eq!(deny, ChannelPermission::SendMessage as u64);
+    }
+
     #[test]
     fn unmapped_discord_permissions_grant_nothing() {
-        // VIEW_AUDIT_LOG (7), PRIORITY_SPEAKER (8), SEND_TTS_MESSAGES (12),
-        // USE_EXTERNAL_EMOJIS (18), MANAGE_THREADS (34), SEND_POLLS (48).
-        assert_eq!(map_role_permissions(discord(&[7, 8, 12, 18, 34, 48])), 0);
+        // PRIORITY_SPEAKER (8), SEND_TTS_MESSAGES (12), USE_EXTERNAL_EMOJIS (18),
+        // MANAGE_THREADS (34), SEND_POLLS (48).
+        assert_eq!(map_role_permissions(discord(&[8, 12, 18, 34, 48])), 0);
     }
 
     #[test]
@@ -404,6 +446,7 @@ mod tests {
             ChannelPermission::ManageRole,
             ChannelPermission::BanMembers,
             ChannelPermission::KickMembers,
+            ChannelPermission::ViewAuditLog,
         ] {
             assert!(
                 mapped & forbidden as u64 == 0,

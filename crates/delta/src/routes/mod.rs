@@ -157,6 +157,7 @@ fn custom_openapi_spec() -> OpenApi {
               "Server Information",
               "Server Members",
               "Server Permissions",
+              "Audit Log",
               "Calendar"
             ]
           },
@@ -327,6 +328,11 @@ fn custom_openapi_spec() -> OpenApi {
             Tag {
                 name: "Server Permissions".to_owned(),
                 description: Some("Manage permissions for servers".to_owned()),
+                ..Default::default()
+            },
+            Tag {
+                name: "Audit Log".to_owned(),
+                description: Some("Review moderation and configuration actions".to_owned()),
                 ..Default::default()
             },
             Tag {

@@ -1,9 +1,12 @@
 use std::collections::HashSet;
 
 use revolt_database::{
-    util::{permissions::DatabasePermissionQuery, reference::Reference},
+    util::{
+        audit_reason::AuditLogReason, permissions::DatabasePermissionQuery, reference::Reference,
+    },
     voice::{sync_afk_designation_change, VoiceClient},
-    Database, File, PartialServer, Server, User, ValidatedTicket,
+    AuditLogAction, AuditLogChange, AuditLogDraft, AuditLogEntry, AuditValue, Database, File,
+    PartialServer, Server, User, ValidatedTicket,
 };
 use revolt_models::v0;
 use revolt_permissions::{calculate_server_permissions, ChannelPermission};
@@ -23,6 +26,7 @@ pub async fn edit(
     target: Reference<'_>,
     data: Json<v0::DataEditServer>,
     validated_ticket: Option<ValidatedTicket>,
+    reason: AuditLogReason,
 ) -> Result<Json<v0::Server>> {
     let data = data.into_inner();
     data.validate().map_err(|error| {
@@ -31,7 +35,17 @@ pub async fn edit(
         })
     })?;
 
+    // Validated before anything is read or written, so an over-long reason
+    // refuses the whole edit instead of failing after the edit has landed.
+    let reason = reason.validated()?;
+
     let mut server = target.as_server(db).await?;
+    // Audit M2: the audit log's "before" values, taken straight after the
+    // load. Further down, the icon, banner and owner are written into
+    // `server` in place ahead of the update, and `update` then applies the
+    // whole partial to it, so a snapshot taken any later would record the new
+    // values as the old ones.
+    let server_before_edit = server.clone();
     let mut query = DatabasePermissionQuery::new(db, &user).server(&server);
     let permissions = calculate_server_permissions(&mut query).await;
 
@@ -264,6 +278,11 @@ pub async fn edit(
         .update(db, partial, remove.into_iter().map(Into::into).collect())
         .await?;
 
+    // Written only once the edit is persisted, and before the voice re-sync
+    // below: that sync can still return an error, which must not lose the
+    // record of an edit that has already landed.
+    record_audit_entries(db, &user, &server_before_edit, &server, reason).await;
+
     // A5: re-sync voice permissions on BOTH sides of a designation change.
     // Without this, flagging an already-occupied channel is inert until some
     // unrelated role or permission edit happens to trigger a sync.
@@ -285,6 +304,186 @@ pub async fn edit(
     .await?;
 
     Ok(Json(server.into()))
+}
+
+/// Write the audit log entries for an edit that has been persisted.
+///
+/// Two kinds, kept apart so that filtering on either one finds it:
+/// - `server_update`, with one change per field the edit actually changed
+///   (see `server_update_changes`). Skipped when there is none; the owner
+///   does not count.
+/// - `server_owner_transfer`, targeting the new owner, whenever the owner
+///   changed. It is written even when the actor IS the new owner (a
+///   privileged account taking a server over): that is a change of control
+///   over the server, not a self-edit, and staff actions are logged under the
+///   staff member's own name.
+///
+/// Fields only privileged accounts may edit (`flags`, `discoverable`) are
+/// logged like any other.
+async fn record_audit_entries(
+    db: &Database,
+    actor: &User,
+    before: &Server,
+    after: &Server,
+    reason: Option<String>,
+) {
+    let changes = server_update_changes(before, after);
+    if !changes.is_empty() {
+        AuditLogEntry::record(
+            db,
+            AuditLogDraft {
+                server: after.id.clone(),
+                actor: Some(actor.id.clone()),
+                action: AuditLogAction::ServerUpdate,
+                changes,
+                reason: reason.clone(),
+                ..Default::default()
+            },
+        )
+        .await;
+    }
+
+    if before.owner != after.owner {
+        AuditLogEntry::record(
+            db,
+            AuditLogDraft {
+                server: after.id.clone(),
+                actor: Some(actor.id.clone()),
+                action: AuditLogAction::ServerOwnerTransfer,
+                target: Some(after.owner.clone()),
+                changes: vec![AuditLogChange::new(
+                    "owner",
+                    Some(AuditValue::String(before.owner.clone())),
+                    Some(AuditValue::String(after.owner.clone())),
+                )],
+                reason,
+                ..Default::default()
+            },
+        )
+        .await;
+    }
+}
+
+/// The `server_update` changes between the server as loaded before an edit
+/// and as persisted after it.
+///
+/// One change for each field `DataEditServer` can set or `FieldsServer` can
+/// remove, and only when the stored value really differs, so saving an
+/// unchanged settings form records nothing. `owner` is left out on purpose:
+/// it gets its own `server_owner_transfer` entry. Value shapes:
+/// - Scalars carry old and new with their natural type. A field that was
+///   unset has no `old`; a removed field has no `new`.
+/// - `icon` / `banner` carry only `new`: `Bool(true)` when one was set or
+///   replaced, `Bool(false)` when it was removed. File ids are not recorded.
+/// - `categories` / `system_messages` are structured, so they carry only
+///   `new: Bool(true)`, which means "changed" (set, edited or removed alike).
+///   Their contents are not copied into the log.
+fn server_update_changes(before: &Server, after: &Server) -> Vec<AuditLogChange> {
+    fn push_if_changed(
+        changes: &mut Vec<AuditLogChange>,
+        key: &str,
+        old: Option<AuditValue>,
+        new: Option<AuditValue>,
+    ) {
+        if old != new {
+            changes.push(AuditLogChange::new(key, old, new));
+        }
+    }
+
+    fn changed_marker(changes: &mut Vec<AuditLogChange>, key: &str, changed: bool, new: bool) {
+        if changed {
+            changes.push(AuditLogChange::new(key, None, Some(AuditValue::Bool(new))));
+        }
+    }
+
+    let text = |value: &Option<String>| value.clone().map(AuditValue::String);
+    let file_id = |file: &Option<File>| file.as_ref().map(|file| file.id.clone());
+
+    let mut changes = Vec::new();
+    push_if_changed(
+        &mut changes,
+        "name",
+        Some(AuditValue::String(before.name.clone())),
+        Some(AuditValue::String(after.name.clone())),
+    );
+    push_if_changed(
+        &mut changes,
+        "description",
+        text(&before.description),
+        text(&after.description),
+    );
+    changed_marker(
+        &mut changes,
+        "icon",
+        file_id(&before.icon) != file_id(&after.icon),
+        after.icon.is_some(),
+    );
+    changed_marker(
+        &mut changes,
+        "banner",
+        file_id(&before.banner) != file_id(&after.banner),
+        after.banner.is_some(),
+    );
+    changed_marker(
+        &mut changes,
+        "categories",
+        before.categories != after.categories,
+        true,
+    );
+    changed_marker(
+        &mut changes,
+        "system_messages",
+        before.system_messages != after.system_messages,
+        true,
+    );
+    push_if_changed(
+        &mut changes,
+        "flags",
+        before.flags.map(|flags| AuditValue::Int(flags.into())),
+        after.flags.map(|flags| AuditValue::Int(flags.into())),
+    );
+    push_if_changed(
+        &mut changes,
+        "discoverable",
+        Some(AuditValue::Bool(before.discoverable)),
+        Some(AuditValue::Bool(after.discoverable)),
+    );
+    push_if_changed(
+        &mut changes,
+        "discovery_requested",
+        Some(AuditValue::Bool(before.discovery_requested)),
+        Some(AuditValue::Bool(after.discovery_requested)),
+    );
+    push_if_changed(
+        &mut changes,
+        "analytics",
+        Some(AuditValue::Bool(before.analytics)),
+        Some(AuditValue::Bool(after.analytics)),
+    );
+    push_if_changed(
+        &mut changes,
+        "voice_region",
+        text(&before.voice_region),
+        text(&after.voice_region),
+    );
+    push_if_changed(
+        &mut changes,
+        "afk_channel_id",
+        text(&before.afk_channel_id),
+        text(&after.afk_channel_id),
+    );
+    push_if_changed(
+        &mut changes,
+        "afk_timeout",
+        before
+            .afk_timeout
+            .map(|seconds| AuditValue::Int(seconds.into())),
+        after
+            .afk_timeout
+            .map(|seconds| AuditValue::Int(seconds.into())),
+    );
+
+    changes
 }
 
 /// What `edit` demands of the caller before any field-specific gate runs.
@@ -428,7 +627,10 @@ fn validate_afk_edit(
 #[cfg(test)]
 mod test {
     use crate::util::test::TestHarness;
-    use revolt_database::{Member, PartialUser, Server, Session};
+    use revolt_database::{
+        AuditLogAction, AuditLogChange, AuditLogEntry, AuditValue, File, MFATicket, Member,
+        Metadata, PartialUser, Server, Session, User,
+    };
     use revolt_models::v0;
     use revolt_result::ErrorType;
     use rocket::http::{ContentType, Header, Status};
@@ -819,5 +1021,512 @@ mod test {
                 .unwrap_or_else(|| panic!("the route lost `{}`: {}", later, body));
             assert!(gate < at, "the gate must precede `{}`: {}", later, body);
         }
+    }
+
+    // ---- audit log (moderation slice 1) -----------------------------------
+
+    /// Where the audit trail sits in the route:
+    /// - the reason is validated before the server is even loaded, so an
+    ///   over-long reason refuses the edit instead of failing after it;
+    /// - the "before" snapshot is the very next statement after the load,
+    ///   ahead of the in-place icon / banner / owner writes (audit M2);
+    /// - the entries are written after the update and before the voice
+    ///   re-sync, whose `?` must not lose the record of a landed edit.
+    #[test]
+    fn the_route_audits_from_a_snapshot_taken_before_any_write() {
+        let body = route_body();
+
+        assert_eq!(
+            body.matches(
+                "let mut server = target.as_server(db).await?; \
+                 let server_before_edit = server.clone();"
+            )
+            .count(),
+            1,
+            "the snapshot must directly follow the load: {body}"
+        );
+
+        let mut previous = 0;
+        for step in [
+            "let reason = reason.validated()?;",
+            "let mut server = target.as_server(db).await?;",
+            "match edit_authorization(&data)",
+            "db.mark_attachment_as_deleted(",
+            "server.icon = partial.icon.clone();",
+            "server.banner = partial.banner.clone();",
+            "server.owner = owner;",
+            ".update(db, partial,",
+            "record_audit_entries(db, &user, &server_before_edit, &server, reason).await;",
+            "sync_afk_designation_change(",
+        ] {
+            let at = body
+                .find(step)
+                .unwrap_or_else(|| panic!("the route lost `{}`: {}", step, body));
+            assert!(previous <= at, "`{}` is out of order: {}", step, body);
+            previous = at;
+        }
+        assert_eq!(body.matches("record_audit_entries(").count(), 1, "{body}");
+    }
+
+    /// PATCH the server with the optional `X-Audit-Log-Reason` and
+    /// `X-MFA-Ticket` headers. Returns the status and the response body.
+    async fn edit_with_headers(
+        harness: &TestHarness,
+        server_id: &str,
+        session: &Session,
+        body: serde_json::Value,
+        reason: Option<&str>,
+        mfa_ticket: Option<&str>,
+    ) -> (Status, String) {
+        let mut request = harness
+            .client
+            .patch(format!("/servers/{}", server_id))
+            .header(ContentType::JSON)
+            .body(body.to_string())
+            .header(Header::new("x-session-token", session.token.to_string()));
+        if let Some(reason) = reason {
+            request = request.header(Header::new("X-Audit-Log-Reason", reason.to_string()));
+        }
+        if let Some(ticket) = mfa_ticket {
+            request = request.header(Header::new("X-MFA-Ticket", ticket.to_string()));
+        }
+
+        let response = request.dispatch().await;
+        let status = response.status();
+        (status, response.into_string().await.unwrap_or_default())
+    }
+
+    async fn audit_entries(harness: &TestHarness, server_id: &str) -> Vec<AuditLogEntry> {
+        harness
+            .db
+            .fetch_audit_log(server_id, None, 50, None, None)
+            .await
+            .expect("audit log")
+    }
+
+    /// A validated MFA ticket for `account_id`, as the ownership transfer
+    /// demands.
+    async fn mfa_ticket(harness: &TestHarness, account_id: &str) -> String {
+        let ticket = MFATicket::new(account_id.to_string(), true);
+        ticket.save(&harness.db).await.expect("`MFATicket`");
+        ticket.token
+    }
+
+    /// Seed an unclaimed file in the `icons` bucket, as Autumn leaves one
+    /// after an upload, so the route can claim it as the server icon.
+    async fn upload_icon(harness: &TestHarness, uploader: &User) -> String {
+        use iso8601_timestamp::Timestamp;
+        let id = ulid::Ulid::new().to_string();
+        harness
+            .db
+            .insert_attachment(&File {
+                id: id.clone(),
+                tag: "icons".to_string(),
+                filename: "icon.png".to_string(),
+                hash: None,
+                uploaded_at: Some(Timestamp::now_utc()),
+                uploader_id: Some(uploader.id.clone()),
+                used_for: None,
+                deleted: None,
+                reported: None,
+                metadata: Metadata::File,
+                content_type: "image/png".to_string(),
+                size: 10,
+                message_id: None,
+                user_id: None,
+                server_id: None,
+                object_id: None,
+            })
+            .await
+            .expect("insert icon");
+        id
+    }
+
+    /// A rename: exactly one `server_update` entry carrying the old and new
+    /// name, the newly set description, the owner as actor, and the
+    /// percent-encoded reason header decoded. Saving the same values again
+    /// changes nothing and records nothing.
+    #[test]
+    fn a_rename_records_one_server_update_with_its_reason() {
+        crate::util::test::rt().block_on(a_rename_records_one_server_update_with_its_reason_case())
+    }
+
+    async fn a_rename_records_one_server_update_with_its_reason_case() {
+        let harness = TestHarness::new().await;
+        let (_, owner_session, owner) = harness.new_user().await;
+        let (server, _) = harness.new_server(&owner).await;
+
+        let edit_body = json!({ "name": "Renamed", "description": "About" });
+        let (status, body) = edit_with_headers(
+            &harness,
+            &server.id,
+            &owner_session,
+            edit_body.clone(),
+            Some("rename%20reason"),
+            None,
+        )
+        .await;
+        assert_eq!(status, Status::Ok, "{body}");
+
+        let entries = audit_entries(&harness, &server.id).await;
+        assert_eq!(entries.len(), 1, "{entries:?}");
+        let entry = &entries[0];
+        assert_eq!(entry.server, server.id);
+        assert_eq!(entry.action, AuditLogAction::ServerUpdate);
+        assert_eq!(entry.actor.as_deref(), Some(owner.id.as_str()));
+        assert_eq!(entry.target, None);
+        assert_eq!(entry.channel, None);
+        assert_eq!(entry.count, None);
+        assert_eq!(entry.reason.as_deref(), Some("rename reason"));
+        assert_eq!(
+            entry.changes,
+            vec![
+                AuditLogChange::new(
+                    "name",
+                    Some(AuditValue::String("Test Server".to_string())),
+                    Some(AuditValue::String("Renamed".to_string())),
+                ),
+                AuditLogChange::new(
+                    "description",
+                    None,
+                    Some(AuditValue::String("About".to_string())),
+                ),
+            ]
+        );
+
+        let (status, body) =
+            edit_with_headers(&harness, &server.id, &owner_session, edit_body, None, None).await;
+        assert_eq!(status, Status::Ok, "{body}");
+        assert_eq!(audit_entries(&harness, &server.id).await.len(), 1);
+    }
+
+    /// Setting an icon records `icon: Bool(true)`, removing it records
+    /// `icon: Bool(false)`, and removing an icon that is no longer there
+    /// records nothing.
+    #[test]
+    fn icon_set_and_removal_are_recorded_as_bools() {
+        crate::util::test::rt().block_on(icon_set_and_removal_are_recorded_as_bools_case())
+    }
+
+    async fn icon_set_and_removal_are_recorded_as_bools_case() {
+        let harness = TestHarness::new().await;
+        let (_, owner_session, owner) = harness.new_user().await;
+        let (server, _) = harness.new_server(&owner).await;
+        let icon = upload_icon(&harness, &owner).await;
+
+        let (status, body) = edit_with_headers(
+            &harness,
+            &server.id,
+            &owner_session,
+            json!({ "icon": icon }),
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(status, Status::Ok, "{body}");
+        let entries = audit_entries(&harness, &server.id).await;
+        assert_eq!(entries.len(), 1, "{entries:?}");
+        assert_eq!(
+            entries[0].changes,
+            vec![AuditLogChange::new(
+                "icon",
+                None,
+                Some(AuditValue::Bool(true))
+            )]
+        );
+
+        let (status, body) = edit_with_headers(
+            &harness,
+            &server.id,
+            &owner_session,
+            json!({ "remove": ["Icon"] }),
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(status, Status::Ok, "{body}");
+        assert!(harness
+            .db
+            .fetch_server(&server.id)
+            .await
+            .unwrap()
+            .icon
+            .is_none());
+
+        let entries = audit_entries(&harness, &server.id).await;
+        assert_eq!(entries.len(), 2, "{entries:?}");
+        let removal = vec![AuditLogChange::new(
+            "icon",
+            None,
+            Some(AuditValue::Bool(false)),
+        )];
+        let entry = entries
+            .iter()
+            .find(|entry| entry.changes == removal)
+            .unwrap_or_else(|| panic!("no icon removal entry: {entries:?}"));
+        assert_eq!(entry.action, AuditLogAction::ServerUpdate);
+        assert_eq!(entry.actor.as_deref(), Some(owner.id.as_str()));
+        assert_eq!(entry.reason, None);
+
+        let (status, body) = edit_with_headers(
+            &harness,
+            &server.id,
+            &owner_session,
+            json!({ "remove": ["Icon"] }),
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(status, Status::Ok, "{body}");
+        assert_eq!(audit_entries(&harness, &server.id).await.len(), 2);
+    }
+
+    /// The `NothingToEdit` early return writes no entry, reason or not.
+    #[test]
+    fn nothing_to_edit_records_nothing() {
+        crate::util::test::rt().block_on(nothing_to_edit_records_nothing_case())
+    }
+
+    async fn nothing_to_edit_records_nothing_case() {
+        let harness = TestHarness::new().await;
+        let (_, owner_session, owner) = harness.new_user().await;
+        let (server, _) = harness.new_server(&owner).await;
+
+        for body in [json!({}), json!({ "remove": [] })] {
+            let (status, body) = edit_with_headers(
+                &harness,
+                &server.id,
+                &owner_session,
+                body,
+                Some("nothing%20at%20all"),
+                None,
+            )
+            .await;
+            assert_eq!(status, Status::Ok, "{body}");
+        }
+
+        assert_eq!(audit_entries(&harness, &server.id).await, vec![]);
+    }
+
+    /// Refused edits write no entry: a member without ManageServer, an
+    /// account that is not a member at all, and an ownership transfer with
+    /// no MFA ticket.
+    #[test]
+    fn refused_edits_record_nothing() {
+        crate::util::test::rt().block_on(refused_edits_record_nothing_case())
+    }
+
+    async fn refused_edits_record_nothing_case() {
+        let harness = TestHarness::new().await;
+        let (_, owner_session, owner) = harness.new_user().await;
+        let (_, member_session, member_user) = harness.new_user().await;
+        let (_, outsider_session, _) = harness.new_user().await;
+        let (server, _) = harness.new_server(&owner).await;
+        Member::create(&harness.db, &server, &member_user, None)
+            .await
+            .expect("`Member`");
+
+        for session in [&member_session, &outsider_session] {
+            let (status, body) = edit_with_headers(
+                &harness,
+                &server.id,
+                session,
+                json!({ "name": "Taken" }),
+                Some("hostile"),
+                None,
+            )
+            .await;
+            assert_eq!(status, Status::Forbidden, "{body}");
+        }
+
+        let (status, body) = edit_with_headers(
+            &harness,
+            &server.id,
+            &owner_session,
+            json!({ "owner": member_user.id }),
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(status, Status::Unauthorized, "{body}");
+        assert!(body.contains("InvalidCredentials"), "{body}");
+
+        let fetched = harness.db.fetch_server(&server.id).await.unwrap();
+        assert_eq!(fetched.name, "Test Server");
+        assert_eq!(fetched.owner, owner.id);
+        assert_eq!(audit_entries(&harness, &server.id).await, vec![]);
+    }
+
+    /// A 513-char reason is refused with `AuditLogReasonTooLong` and the
+    /// edit does not happen. 512 chars is accepted and stored whole.
+    #[test]
+    fn an_overlong_reason_refuses_the_edit() {
+        crate::util::test::rt().block_on(an_overlong_reason_refuses_the_edit_case())
+    }
+
+    async fn an_overlong_reason_refuses_the_edit_case() {
+        let harness = TestHarness::new().await;
+        let (_, owner_session, owner) = harness.new_user().await;
+        let (server, _) = harness.new_server(&owner).await;
+
+        let too_long = "a".repeat(513);
+        let (status, body) = edit_with_headers(
+            &harness,
+            &server.id,
+            &owner_session,
+            json!({ "name": "Renamed" }),
+            Some(too_long.as_str()),
+            None,
+        )
+        .await;
+        assert_eq!(status, Status::BadRequest, "{body}");
+        assert!(body.contains("AuditLogReasonTooLong"), "{body}");
+        assert_eq!(
+            harness.db.fetch_server(&server.id).await.unwrap().name,
+            "Test Server"
+        );
+        assert_eq!(audit_entries(&harness, &server.id).await, vec![]);
+
+        let longest = "a".repeat(512);
+        let (status, body) = edit_with_headers(
+            &harness,
+            &server.id,
+            &owner_session,
+            json!({ "name": "Renamed" }),
+            Some(longest.as_str()),
+            None,
+        )
+        .await;
+        assert_eq!(status, Status::Ok, "{body}");
+        let entries = audit_entries(&harness, &server.id).await;
+        assert_eq!(entries.len(), 1, "{entries:?}");
+        assert_eq!(entries[0].reason.as_deref(), Some(longest.as_str()));
+    }
+
+    /// Audit M2 regression test. The owner is written into `server` in place
+    /// before the update, so a snapshot taken late would record the NEW
+    /// owner as the old one. The transfer gets its own entry targeting the
+    /// new owner, and the rename in the same request gets a `server_update`
+    /// that does not mention the owner.
+    #[test]
+    fn an_ownership_transfer_records_the_old_owner() {
+        crate::util::test::rt().block_on(an_ownership_transfer_records_the_old_owner_case())
+    }
+
+    async fn an_ownership_transfer_records_the_old_owner_case() {
+        let harness = TestHarness::new().await;
+        let (owner_account, owner_session, owner) = harness.new_user().await;
+        let (_, _, heir) = harness.new_user().await;
+        let (server, _) = harness.new_server(&owner).await;
+        Member::create(&harness.db, &server, &heir, None)
+            .await
+            .expect("`Member`");
+        let ticket = mfa_ticket(&harness, &owner_account.id).await;
+
+        let (status, body) = edit_with_headers(
+            &harness,
+            &server.id,
+            &owner_session,
+            json!({ "owner": heir.id, "name": "Handed over" }),
+            Some("stepping%20down"),
+            Some(ticket.as_str()),
+        )
+        .await;
+        assert_eq!(status, Status::Ok, "{body}");
+        assert_eq!(
+            harness.db.fetch_server(&server.id).await.unwrap().owner,
+            heir.id
+        );
+
+        let entries = audit_entries(&harness, &server.id).await;
+        assert_eq!(entries.len(), 2, "{entries:?}");
+
+        let transfer = entries
+            .iter()
+            .find(|entry| entry.action == AuditLogAction::ServerOwnerTransfer)
+            .unwrap_or_else(|| panic!("no transfer entry: {entries:?}"));
+        assert_eq!(transfer.actor.as_deref(), Some(owner.id.as_str()));
+        assert_eq!(transfer.target.as_deref(), Some(heir.id.as_str()));
+        assert_eq!(transfer.channel, None);
+        assert_eq!(transfer.reason.as_deref(), Some("stepping down"));
+        assert_eq!(
+            transfer.changes,
+            vec![AuditLogChange::new(
+                "owner",
+                Some(AuditValue::String(owner.id.clone())),
+                Some(AuditValue::String(heir.id.clone())),
+            )]
+        );
+
+        let update = entries
+            .iter()
+            .find(|entry| entry.action == AuditLogAction::ServerUpdate)
+            .unwrap_or_else(|| panic!("no server_update entry: {entries:?}"));
+        assert_eq!(update.actor.as_deref(), Some(owner.id.as_str()));
+        assert_eq!(update.target, None);
+        assert_eq!(update.reason.as_deref(), Some("stepping down"));
+        assert_eq!(
+            update.changes,
+            vec![AuditLogChange::new(
+                "name",
+                Some(AuditValue::String("Test Server".to_string())),
+                Some(AuditValue::String("Handed over".to_string())),
+            )]
+        );
+    }
+
+    /// A privileged account taking a server over is the actor AND the new
+    /// owner. That is a change of control, not a self-edit, so it is
+    /// recorded, under the staff member's own name.
+    #[test]
+    fn a_staff_takeover_is_recorded() {
+        crate::util::test::rt().block_on(a_staff_takeover_is_recorded_case())
+    }
+
+    async fn a_staff_takeover_is_recorded_case() {
+        let harness = TestHarness::new().await;
+        let (_, _, owner) = harness.new_user().await;
+        let (admin_account, admin_session, mut admin) = harness.new_user().await;
+        admin
+            .update(
+                &harness.db,
+                PartialUser {
+                    privileged: Some(true),
+                    ..Default::default()
+                },
+                vec![],
+            )
+            .await
+            .expect("privileged admin");
+        let (server, _) = harness.new_server(&owner).await;
+        Member::create(&harness.db, &server, &admin, None)
+            .await
+            .expect("`Member`");
+        let ticket = mfa_ticket(&harness, &admin_account.id).await;
+
+        let (status, body) = edit_with_headers(
+            &harness,
+            &server.id,
+            &admin_session,
+            json!({ "owner": admin.id }),
+            None,
+            Some(ticket.as_str()),
+        )
+        .await;
+        assert_eq!(status, Status::Ok, "{body}");
+
+        let entries = audit_entries(&harness, &server.id).await;
+        assert_eq!(entries.len(), 1, "{entries:?}");
+        assert_eq!(entries[0].action, AuditLogAction::ServerOwnerTransfer);
+        assert_eq!(entries[0].actor.as_deref(), Some(admin.id.as_str()));
+        assert_eq!(entries[0].target.as_deref(), Some(admin.id.as_str()));
+        assert_eq!(
+            entries[0].changes,
+            vec![AuditLogChange::new(
+                "owner",
+                Some(AuditValue::String(owner.id.clone())),
+                Some(AuditValue::String(admin.id.clone())),
+            )]
+        );
     }
 }

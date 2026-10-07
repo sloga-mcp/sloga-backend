@@ -4,7 +4,7 @@ use futures::lock::Mutex;
 
 use crate::{
     ApplicationCommand, Bot, CalendarEvent, Channel, ChannelCompositeKey, ChannelFollow, ChannelUnread,
-    DiscordImportJob, Donation, DonationClaimCode,
+    AuditLogEntry, DiscordImportJob, Donation, DonationClaimCode,
     E2EEBackup, E2EEBlob, E2EEEnvelope, E2EEIdentity, E2EEOneTimeKey, Emoji, EventRsvp,
     EventRsvpKey, File, FileHash, Interaction, Invite, Member, MemberCompositeKey, Message,
     MlsCommit, MlsGroup, MlsJoinIntent, MlsKeyPackage, PolicyChange, Poll, PollVote,
@@ -56,6 +56,7 @@ database_derived!(
         pub referral_codes: Arc<Mutex<HashMap<String, ReferralCode>>>,
         pub donations: Arc<Mutex<HashMap<String, Donation>>>,
         pub donation_claim_codes: Arc<Mutex<HashMap<String, DonationClaimCode>>>,
+        pub server_audit_log: Arc<Mutex<HashMap<String, AuditLogEntry>>>,
         pub server_bans: Arc<Mutex<HashMap<MemberCompositeKey, ServerBan>>>,
         pub server_boosts: Arc<Mutex<HashMap<String, ServerBoost>>>,
         pub server_members: Arc<Mutex<HashMap<MemberCompositeKey, Member>>>,

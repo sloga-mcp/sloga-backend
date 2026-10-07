@@ -990,6 +990,146 @@ impl From<crate::ServerBan> for ServerBan {
     }
 }
 
+impl From<crate::AuditLogEntry> for AuditLogEntry {
+    fn from(value: crate::AuditLogEntry) -> Self {
+        AuditLogEntry {
+            id: value.id,
+            server: value.server,
+            actor: value.actor,
+            action: value.action.into(),
+            target: value.target,
+            channel: value.channel,
+            changes: value.changes.into_iter().map(Into::into).collect(),
+            count: value.count,
+            reason: value.reason,
+        }
+    }
+}
+
+impl From<AuditLogEntry> for crate::AuditLogEntry {
+    fn from(value: AuditLogEntry) -> Self {
+        crate::AuditLogEntry {
+            id: value.id,
+            server: value.server,
+            actor: value.actor,
+            action: value.action.into(),
+            target: value.target,
+            channel: value.channel,
+            changes: value.changes.into_iter().map(Into::into).collect(),
+            count: value.count,
+            reason: value.reason,
+        }
+    }
+}
+
+impl From<crate::AuditLogChange> for AuditLogChange {
+    fn from(value: crate::AuditLogChange) -> Self {
+        AuditLogChange {
+            key: value.key,
+            old: value.old.map(Into::into),
+            new: value.new.map(Into::into),
+        }
+    }
+}
+
+impl From<AuditLogChange> for crate::AuditLogChange {
+    fn from(value: AuditLogChange) -> Self {
+        crate::AuditLogChange {
+            key: value.key,
+            old: value.old.map(Into::into),
+            new: value.new.map(Into::into),
+        }
+    }
+}
+
+impl From<crate::AuditValue> for AuditValue {
+    fn from(value: crate::AuditValue) -> Self {
+        match value {
+            crate::AuditValue::String(value) => AuditValue::String(value),
+            crate::AuditValue::Int(value) => AuditValue::Int(value),
+            crate::AuditValue::Bool(value) => AuditValue::Bool(value),
+            crate::AuditValue::StringList(value) => AuditValue::StringList(value),
+        }
+    }
+}
+
+impl From<AuditValue> for crate::AuditValue {
+    fn from(value: AuditValue) -> Self {
+        match value {
+            AuditValue::String(value) => crate::AuditValue::String(value),
+            AuditValue::Int(value) => crate::AuditValue::Int(value),
+            AuditValue::Bool(value) => crate::AuditValue::Bool(value),
+            AuditValue::StringList(value) => crate::AuditValue::StringList(value),
+        }
+    }
+}
+
+impl From<crate::AuditLogAction> for AuditLogAction {
+    fn from(value: crate::AuditLogAction) -> Self {
+        match value {
+            crate::AuditLogAction::MemberKick => AuditLogAction::MemberKick,
+            crate::AuditLogAction::MemberBanAdd => AuditLogAction::MemberBanAdd,
+            crate::AuditLogAction::MemberBanRemove => AuditLogAction::MemberBanRemove,
+            crate::AuditLogAction::MemberTimeout => AuditLogAction::MemberTimeout,
+            crate::AuditLogAction::MemberTimeoutRemove => AuditLogAction::MemberTimeoutRemove,
+            crate::AuditLogAction::MemberRoleUpdate => AuditLogAction::MemberRoleUpdate,
+            crate::AuditLogAction::MemberUpdate => AuditLogAction::MemberUpdate,
+            crate::AuditLogAction::MemberVoiceUpdate => AuditLogAction::MemberVoiceUpdate,
+            crate::AuditLogAction::MemberMove => AuditLogAction::MemberMove,
+            crate::AuditLogAction::MemberDisconnect => AuditLogAction::MemberDisconnect,
+            crate::AuditLogAction::MessageDelete => AuditLogAction::MessageDelete,
+            crate::AuditLogAction::MessageBulkDelete => AuditLogAction::MessageBulkDelete,
+            crate::AuditLogAction::ChannelCreate => AuditLogAction::ChannelCreate,
+            crate::AuditLogAction::ChannelUpdate => AuditLogAction::ChannelUpdate,
+            crate::AuditLogAction::ChannelDelete => AuditLogAction::ChannelDelete,
+            crate::AuditLogAction::ChannelOverwriteUpdate => AuditLogAction::ChannelOverwriteUpdate,
+            crate::AuditLogAction::ServerPermissionsUpdate => {
+                AuditLogAction::ServerPermissionsUpdate
+            }
+            crate::AuditLogAction::RoleCreate => AuditLogAction::RoleCreate,
+            crate::AuditLogAction::RoleUpdate => AuditLogAction::RoleUpdate,
+            crate::AuditLogAction::RoleDelete => AuditLogAction::RoleDelete,
+            crate::AuditLogAction::RoleRanksUpdate => AuditLogAction::RoleRanksUpdate,
+            crate::AuditLogAction::ServerUpdate => AuditLogAction::ServerUpdate,
+            crate::AuditLogAction::ServerOwnerTransfer => AuditLogAction::ServerOwnerTransfer,
+            crate::AuditLogAction::Unknown => AuditLogAction::Unknown,
+        }
+    }
+}
+
+impl From<AuditLogAction> for crate::AuditLogAction {
+    fn from(value: AuditLogAction) -> Self {
+        match value {
+            AuditLogAction::MemberKick => crate::AuditLogAction::MemberKick,
+            AuditLogAction::MemberBanAdd => crate::AuditLogAction::MemberBanAdd,
+            AuditLogAction::MemberBanRemove => crate::AuditLogAction::MemberBanRemove,
+            AuditLogAction::MemberTimeout => crate::AuditLogAction::MemberTimeout,
+            AuditLogAction::MemberTimeoutRemove => crate::AuditLogAction::MemberTimeoutRemove,
+            AuditLogAction::MemberRoleUpdate => crate::AuditLogAction::MemberRoleUpdate,
+            AuditLogAction::MemberUpdate => crate::AuditLogAction::MemberUpdate,
+            AuditLogAction::MemberVoiceUpdate => crate::AuditLogAction::MemberVoiceUpdate,
+            AuditLogAction::MemberMove => crate::AuditLogAction::MemberMove,
+            AuditLogAction::MemberDisconnect => crate::AuditLogAction::MemberDisconnect,
+            AuditLogAction::MessageDelete => crate::AuditLogAction::MessageDelete,
+            AuditLogAction::MessageBulkDelete => crate::AuditLogAction::MessageBulkDelete,
+            AuditLogAction::ChannelCreate => crate::AuditLogAction::ChannelCreate,
+            AuditLogAction::ChannelUpdate => crate::AuditLogAction::ChannelUpdate,
+            AuditLogAction::ChannelDelete => crate::AuditLogAction::ChannelDelete,
+            AuditLogAction::ChannelOverwriteUpdate => crate::AuditLogAction::ChannelOverwriteUpdate,
+            AuditLogAction::ServerPermissionsUpdate => {
+                crate::AuditLogAction::ServerPermissionsUpdate
+            }
+            AuditLogAction::RoleCreate => crate::AuditLogAction::RoleCreate,
+            AuditLogAction::RoleUpdate => crate::AuditLogAction::RoleUpdate,
+            AuditLogAction::RoleDelete => crate::AuditLogAction::RoleDelete,
+            AuditLogAction::RoleRanksUpdate => crate::AuditLogAction::RoleRanksUpdate,
+            AuditLogAction::ServerUpdate => crate::AuditLogAction::ServerUpdate,
+            AuditLogAction::ServerOwnerTransfer => crate::AuditLogAction::ServerOwnerTransfer,
+            AuditLogAction::Unknown => crate::AuditLogAction::Unknown,
+        }
+    }
+}
+
 impl From<crate::Member> for Member {
     fn from(value: crate::Member) -> Self {
         Member {

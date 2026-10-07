@@ -1,7 +1,11 @@
 use revolt_database::{
-    util::{permissions::DatabasePermissionQuery, reference::Reference},
+    util::{
+        audit_reason::sanitize_reason_text, permissions::DatabasePermissionQuery,
+        reference::Reference,
+    },
     voice::{remove_user_from_server_voice, VoiceClient},
-    Database, Message, RemovalIntention, ServerBan, User,
+    AuditLogAction, AuditLogChange, AuditLogDraft, AuditLogEntry, AuditValue, Database, Message,
+    RemovalIntention, ServerBan, User,
 };
 use revolt_models::v0;
 use std::time::{Duration, SystemTime};
@@ -59,12 +63,16 @@ pub async fn ban(
     // 2. The ban is persisted, BEFORE the membership is removed and before the
     //    eviction: an eviction error then answers an error with the ban
     //    already durable, instead of leaving a kick behind (S-3 F-4).
-    // 3. The membership is removed, if the target is a member.
+    // 3. The membership is removed, if the target is a member. A ban this
+    //    request created is then recorded in the audit log, before the
+    //    eviction, so an eviction error cannot lose the entry.
     // 4. The target is evicted from every call in the server, member or not.
     // 5. Their recent messages are deleted, if asked.
     //
     // A retried ban re-runs steps 3 to 5, which is how an eviction that failed
     // is completed: step 2 answers "already banned" as a success for that.
+    // The retry writes no second audit entry: only a ban this request
+    // created is recorded.
     let member = match target.as_member(db, &server.id).await {
         Ok(member) => Some(member),
         Err(error) if !matches!(error.error_type, ErrorType::NotFound) => return Err(error),
@@ -84,11 +92,27 @@ pub async fn ban(
     // reason. A create that fails because a concurrent ban won the insert
     // finds that ban on the second read; any other create failure finds
     // nothing there and is answered.
+    //
+    // The audit entry takes the BODY reason (plan audit M4: a ban reason may
+    // run to 1024 characters, past the 512 the reason header allows), so no
+    // reason header is read here. It is copied before the create consumes
+    // it and sanitized as a header reason is (control and bidi/invisible
+    // format characters stripped, then trimmed, blank means none), without
+    // the header's 512 cap: the body validator's 1024 stands. Only the audit
+    // entry's copy is sanitized; the stored ban keeps the body reason.
+    // `newly_banned` is set only when this request's create succeeded; an
+    // existing ban, or one a concurrent request won the insert for (that
+    // request records its own), is not.
+    let audit_reason = data.reason.as_deref().and_then(sanitize_reason_text);
+    let mut newly_banned = false;
     let ban = match db.fetch_ban(&server.id, target.id).await {
         Ok(existing) => existing,
         Err(error) if matches!(error.error_type, ErrorType::NotFound) => {
             match ServerBan::create(db, &server, target.id, data.reason).await {
-                Ok(ban) => ban,
+                Ok(ban) => {
+                    newly_banned = true;
+                    ban
+                }
                 Err(error) => db
                     .fetch_ban(&server.id, target.id)
                     .await
@@ -102,6 +126,36 @@ pub async fn ban(
         member
             .remove(db, &server, RemovalIntention::Ban, false)
             .await?;
+    }
+
+    // After the ban is durable and the member removed, before the eviction,
+    // whose error is answered with the ban already standing. The purge
+    // window is recorded only when a purge was asked for.
+    if newly_banned {
+        AuditLogEntry::record(
+            db,
+            AuditLogDraft {
+                server: server.id.clone(),
+                actor: Some(user.id.clone()),
+                action: AuditLogAction::MemberBanAdd,
+                target: Some(target.id.to_string()),
+                changes: data
+                    .delete_message_seconds
+                    .filter(|seconds| *seconds > 0)
+                    .map(|seconds| {
+                        AuditLogChange::new(
+                            "delete_message_seconds",
+                            None,
+                            Some(AuditValue::Int(seconds)),
+                        )
+                    })
+                    .into_iter()
+                    .collect(),
+                reason: audit_reason,
+                ..Default::default()
+            },
+        )
+        .await;
     }
 
     // Outside the member check (S-3 F-4): a hit-and-run spammer who already
@@ -134,7 +188,8 @@ mod test {
             record_voice_connection, recorded_voice_connections, set_channel_node,
             UserVoiceChannel,
         },
-        Channel, Member, Message, PartialMember, Server,
+        AuditLogAction, AuditLogChange, AuditLogEntry, AuditValue, Channel, Member, Message,
+        PartialMember, Server,
     };
     use revolt_models::v0;
     use revolt_permissions::{ChannelPermission, OverrideField};
@@ -284,6 +339,60 @@ mod test {
         );
     }
 
+    /// Every audit log entry in the server, newest first. Unfiltered on
+    /// purpose: a ban must write its one entry and nothing else.
+    async fn audit_entries(harness: &TestHarness, server_id: &str) -> Vec<AuditLogEntry> {
+        harness
+            .db
+            .fetch_audit_log(server_id, None, 50, None, None)
+            .await
+            .expect("the audit log reads")
+    }
+
+    /// A ban with the given JSON body.
+    async fn ban_with<'a>(
+        harness: &'a TestHarness,
+        token: &str,
+        server_id: &str,
+        target_id: &str,
+        body: serde_json::Value,
+    ) -> rocket::local::asynchronous::LocalResponse<'a> {
+        harness
+            .client
+            .put(format!("/servers/{server_id}/bans/{target_id}"))
+            .header(ContentType::JSON)
+            .header(Header::new("x-session-token", token.to_string()))
+            .body(body.to_string())
+            .dispatch()
+            .await
+    }
+
+    /// The one `member_ban_add` entry of `target_id`, asserting there is
+    /// exactly one and that it names `actor_id` and no channel or count.
+    fn ban_entry<'e>(
+        entries: &'e [AuditLogEntry],
+        actor_id: &str,
+        target_id: &str,
+    ) -> &'e AuditLogEntry {
+        let matching: Vec<&AuditLogEntry> = entries
+            .iter()
+            .filter(|entry| entry.target.as_deref() == Some(target_id))
+            .collect();
+        assert_eq!(
+            matching.len(),
+            1,
+            "one audit entry per ban of {}: {:?}",
+            target_id,
+            entries
+        );
+        let entry = matching[0];
+        assert_eq!(entry.action, AuditLogAction::MemberBanAdd, "{entry:?}");
+        assert_eq!(entry.actor.as_deref(), Some(actor_id), "{entry:?}");
+        assert_eq!(entry.channel, None, "{entry:?}");
+        assert_eq!(entry.count, None, "{entry:?}");
+        entry
+    }
+
     // Compile-only without RabbitMQ and Redis: see the section note above.
     #[test]
     fn a_repeated_ban_succeeds_and_evicts_again() {
@@ -318,6 +427,18 @@ mod test {
         assert_eq!(ban.id.user, user_b.id);
         assert_eq!(ban.reason.as_deref(), Some("first"));
         assert_ghost_cleared(&uvc, &user_b.id).await;
+        let entries = audit_entries(&harness, &server.id).await;
+        assert_eq!(
+            entries.len(),
+            1,
+            "the first ban is recorded once: {entries:?}"
+        );
+        assert_eq!(
+            ban_entry(&entries, &user_a.id, &user_b.id)
+                .reason
+                .as_deref(),
+            Some("first")
+        );
         assert!(
             harness
                 .db
@@ -356,6 +477,19 @@ mod test {
                 .reason
                 .as_deref(),
             Some("first")
+        );
+        let entries = audit_entries(&harness, &server.id).await;
+        assert_eq!(
+            entries.len(),
+            1,
+            "an already-banned retry must write no second audit entry: {entries:?}"
+        );
+        assert_eq!(
+            ban_entry(&entries, &user_a.id, &user_b.id)
+                .reason
+                .as_deref(),
+            Some("first"),
+            "the one entry is the first ban's"
         );
 
         delete_channel_voice_state(&uvc, &[user_b.id.clone()])
@@ -430,6 +564,11 @@ mod test {
             "a refused ban must leave the target a member"
         );
         assert_ghost_present(&uvc, &user_b.id, 1).await;
+        let entries = audit_entries(&harness, &server.id).await;
+        assert!(
+            entries.is_empty(),
+            "a ban refused for rank must record nothing: {entries:?}"
+        );
 
         delete_channel_voice_state(&uvc, &[user_b.id.clone()])
             .await
@@ -518,12 +657,30 @@ mod test {
             "the membership is removed before the eviction runs"
         );
         assert_ghost_present(&uvc, &user_b.id, 1).await;
+        let entries = audit_entries(&harness, &server.id).await;
+        assert_eq!(
+            entries.len(),
+            1,
+            "the audit entry is written before the eviction that failed: {entries:?}"
+        );
+        assert_eq!(
+            ban_entry(&entries, &user_a.id, &user_b.id)
+                .reason
+                .as_deref(),
+            Some("live")
+        );
 
         // The call ended: the retry reaches the ghost with no SFU involved.
         delete_channel_node(channel.id()).await.expect("node gone");
         let response = ban_user(&harness, &session_a.token, &server.id, &user_b.id, "retry").await;
         ban_answered(response, "retrying the ban").await;
         assert_ghost_cleared(&uvc, &user_b.id).await;
+        let entries = audit_entries(&harness, &server.id).await;
+        assert_eq!(
+            entries.len(),
+            1,
+            "the retry that completes the eviction records no second ban: {entries:?}"
+        );
 
         delete_channel_voice_state(&uvc, &[user_b.id.clone()])
             .await
@@ -784,6 +941,290 @@ mod test {
             .expect("the owner's message in the thread");
     }
 
+    // ---- the audit log entry (moderation slice 1) ---------------------------
+    //
+    // A ban this request created writes one `member_ban_add` entry: the
+    // banned user as the target, the BODY reason (bans read no reason header,
+    // plan audit M4), and the purge window when one was asked for. An
+    // already-banned retry and every refusal write nothing; the retry is
+    // covered in the voice tests above.
+
+    // Compile-only without RabbitMQ and Redis: see the section note above.
+    #[test]
+    fn a_ban_records_its_reason_and_purge_window() {
+        crate::util::test::rt().block_on(a_ban_records_its_reason_and_purge_window_case())
+    }
+
+    /// The entry names the moderator, the target and the body reason, and
+    /// carries the purge window as an Int. Mutations: the record removed;
+    /// the purge window dropped from the changes or recorded as a String.
+    async fn a_ban_records_its_reason_and_purge_window_case() {
+        let harness = TestHarness::new().await;
+        let (_a, session_a, user_a) = harness.new_user().await; // owner
+        let (_b, _session_b, user_b) = harness.new_user().await; // target
+        let (server, _channels) = harness.new_server(&user_a).await;
+        Member::create(&harness.db, &server, &user_b, None)
+            .await
+            .expect("member");
+
+        let response =
+            ban_user_deleting(&harness, &session_a.token, &server.id, &user_b.id, 3600).await;
+        ban_answered(response, "a ban that deletes messages").await;
+
+        let entries = audit_entries(&harness, &server.id).await;
+        assert_eq!(entries.len(), 1, "one ban, one audit entry: {entries:?}");
+        let entry = ban_entry(&entries, &user_a.id, &user_b.id);
+        assert_eq!(entry.reason.as_deref(), Some("purge"));
+        assert_eq!(
+            entry.changes,
+            vec![AuditLogChange::new(
+                "delete_message_seconds",
+                None,
+                Some(AuditValue::Int(3600))
+            )]
+        );
+    }
+
+    // Compile-only without RabbitMQ and Redis: see the section note above.
+    #[test]
+    fn a_blank_reason_and_no_purge_record_neither() {
+        crate::util::test::rt().block_on(a_blank_reason_and_no_purge_record_neither_case())
+    }
+
+    /// The reason is trimmed and a blank one is recorded as none; a purge
+    /// window that is absent or zero adds no change. Mutations: the trim
+    /// dropped; the blank filter dropped; the `> 0` filter dropped.
+    async fn a_blank_reason_and_no_purge_record_neither_case() {
+        let harness = TestHarness::new().await;
+        let (_a, session_a, user_a) = harness.new_user().await; // owner
+        let (server, _channels) = harness.new_server(&user_a).await;
+
+        let mut cases = vec![];
+        for (body, expected) in [
+            (serde_json::json!({ "reason": "" }), None),
+            (
+                serde_json::json!({ "reason": " \t\n ", "delete_message_seconds": 0 }),
+                None,
+            ),
+            (serde_json::json!({}), None),
+            (serde_json::json!({ "reason": "  spam  " }), Some("spam")),
+        ] {
+            let (_t, _session_t, target) = harness.new_user().await;
+            let response = ban_with(&harness, &session_a.token, &server.id, &target.id, body).await;
+            ban_answered(response, "a ban with a blank or padded reason").await;
+            cases.push((target.id, expected));
+        }
+
+        let entries = audit_entries(&harness, &server.id).await;
+        assert_eq!(entries.len(), cases.len(), "one entry per ban: {entries:?}");
+        for (target_id, expected) in &cases {
+            let entry = ban_entry(&entries, &user_a.id, target_id);
+            assert_eq!(entry.reason.as_deref(), *expected, "{entry:?}");
+            assert!(
+                entry.changes.is_empty(),
+                "no purge window was asked for: {entry:?}"
+            );
+        }
+    }
+
+    // Compile-only without RabbitMQ and Redis: see the section note above.
+    #[test]
+    fn a_ban_records_the_body_reason_up_to_1024_characters() {
+        crate::util::test::rt().block_on(a_ban_records_the_body_reason_up_to_1024_characters_case())
+    }
+
+    /// Plan audit M4: the ban's reason comes from its body, which allows
+    /// 1024 characters. A 1024-character reason is banned and recorded in
+    /// full, and a reason header sent alongside is not read. A 1025-character
+    /// reason fails the body validation with nothing written. Mutations: the
+    /// reason header guard added to the route (its 512 cap answers 400); the
+    /// reason taken from the header.
+    async fn a_ban_records_the_body_reason_up_to_1024_characters_case() {
+        let harness = TestHarness::new().await;
+        let (_a, session_a, user_a) = harness.new_user().await; // owner
+        let (_b, _session_b, user_b) = harness.new_user().await; // target
+        let (server, _channels) = harness.new_server(&user_a).await;
+
+        let response = ban_with(
+            &harness,
+            &session_a.token,
+            &server.id,
+            &user_b.id,
+            serde_json::json!({ "reason": "x".repeat(1025) }),
+        )
+        .await;
+        assert_rejected(response, Status::BadRequest, "FailedValidation").await;
+        let ban = harness.db.fetch_ban(&server.id, &user_b.id).await;
+        assert!(
+            matches!(&ban, Err(error) if matches!(error.error_type, ErrorType::NotFound)),
+            "an over-long reason must persist nothing: {:?}",
+            ban
+        );
+        let entries = audit_entries(&harness, &server.id).await;
+        assert!(
+            entries.is_empty(),
+            "an invalid ban records nothing: {entries:?}"
+        );
+
+        let reason = "x".repeat(1024);
+        let response = harness
+            .client
+            .put(format!("/servers/{}/bans/{}", server.id, user_b.id))
+            .header(ContentType::JSON)
+            .header(Header::new("x-session-token", session_a.token.to_string()))
+            .header(Header::new("X-Audit-Log-Reason", "header%20reason"))
+            .body(serde_json::json!({ "reason": reason }).to_string())
+            .dispatch()
+            .await;
+        ban_answered(response, "a ban with a 1024-character reason").await;
+
+        let entries = audit_entries(&harness, &server.id).await;
+        assert_eq!(entries.len(), 1, "one ban, one audit entry: {entries:?}");
+        assert_eq!(
+            ban_entry(&entries, &user_a.id, &user_b.id)
+                .reason
+                .as_deref(),
+            Some(reason.as_str()),
+            "the body reason is recorded in full and the header is not read"
+        );
+    }
+
+    // Compile-only without RabbitMQ and Redis: see the section note above.
+    #[test]
+    fn a_ban_reason_is_recorded_without_bidi_or_invisible_chars() {
+        crate::util::test::rt()
+            .block_on(a_ban_reason_is_recorded_without_bidi_or_invisible_chars_case())
+    }
+
+    /// The body reason is sanitized as a header reason is before it is
+    /// recorded: control and bidi/invisible format characters are stripped,
+    /// so the audit log cannot display a reason differently from what it
+    /// holds. Mutation: the body reason recorded only trimmed.
+    async fn a_ban_reason_is_recorded_without_bidi_or_invisible_chars_case() {
+        let harness = TestHarness::new().await;
+        let (_a, session_a, user_a) = harness.new_user().await; // owner
+        let (_b, _session_b, user_b) = harness.new_user().await; // target
+        let (server, _channels) = harness.new_server(&user_a).await;
+
+        let response = ban_with(
+            &harness,
+            &session_a.token,
+            &server.id,
+            &user_b.id,
+            serde_json::json!({ "reason": "spam\u{202E}evil\u{200B}" }),
+        )
+        .await;
+        ban_answered(response, "a ban with bidi characters in its reason").await;
+
+        let entries = audit_entries(&harness, &server.id).await;
+        assert_eq!(entries.len(), 1, "one ban, one audit entry: {entries:?}");
+        assert_eq!(
+            ban_entry(&entries, &user_a.id, &user_b.id)
+                .reason
+                .as_deref(),
+            Some("spamevil")
+        );
+    }
+
+    // Compile-only without RabbitMQ and Redis: see the section note above.
+    #[test]
+    fn banning_the_owner_is_refused_and_records_nothing() {
+        crate::util::test::rt().block_on(banning_the_owner_is_refused_and_records_nothing_case())
+    }
+
+    /// The owner guard: a moderator holding BanMembers who tries to ban the
+    /// server owner is refused with InvalidOperation, no ban is persisted
+    /// and nothing is recorded. Mutation: the owner guard removed.
+    async fn banning_the_owner_is_refused_and_records_nothing_case() {
+        let harness = TestHarness::new().await;
+        let (_a, _session_a, user_a) = harness.new_user().await; // owner
+        let (_m, session_m, user_m) = harness.new_user().await; // moderator
+        let (server, _channels) = harness.new_server(&user_a).await;
+
+        let role = harness
+            .new_role(
+                &server,
+                1,
+                Some(OverrideField {
+                    a: ChannelPermission::BanMembers as i64,
+                    d: 0,
+                }),
+            )
+            .await;
+        let (mut member, _) = Member::create(&harness.db, &server, &user_m, None)
+            .await
+            .expect("member");
+        member
+            .update(
+                &harness.db,
+                PartialMember {
+                    roles: Some(vec![role.id.clone()]),
+                    ..Default::default()
+                },
+                vec![],
+            )
+            .await
+            .expect("role");
+
+        let response = ban_user(&harness, &session_m.token, &server.id, &user_a.id, "coup").await;
+        assert_rejected(response, Status::BadRequest, "InvalidOperation").await;
+
+        let ban = harness.db.fetch_ban(&server.id, &user_a.id).await;
+        assert!(
+            matches!(&ban, Err(error) if matches!(error.error_type, ErrorType::NotFound)),
+            "the owner must never be banned: {:?}",
+            ban
+        );
+        let entries = audit_entries(&harness, &server.id).await;
+        assert!(
+            entries.is_empty(),
+            "a refused ban of the owner records nothing: {entries:?}"
+        );
+    }
+
+    // Compile-only without RabbitMQ and Redis: see the section note above.
+    #[test]
+    fn a_ban_refused_for_permission_or_self_records_nothing() {
+        crate::util::test::rt()
+            .block_on(a_ban_refused_for_permission_or_self_records_nothing_case())
+    }
+
+    /// A member without BanMembers is refused with MissingPermission, and a
+    /// ban of oneself with CannotRemoveYourself; neither persists a ban or
+    /// records anything. Mutation: the record moved above the permission
+    /// check.
+    async fn a_ban_refused_for_permission_or_self_records_nothing_case() {
+        let harness = TestHarness::new().await;
+        let (_a, session_a, user_a) = harness.new_user().await; // owner
+        let (_p, session_p, user_p) = harness.new_user().await; // no BanMembers
+        let (_b, _session_b, user_b) = harness.new_user().await; // target
+        let (server, _channels) = harness.new_server(&user_a).await;
+        for user in [&user_p, &user_b] {
+            Member::create(&harness.db, &server, user, None)
+                .await
+                .expect("member");
+        }
+
+        let response = ban_user(&harness, &session_p.token, &server.id, &user_b.id, "no").await;
+        assert_rejected(response, Status::Forbidden, "MissingPermission").await;
+        let response = ban_user(&harness, &session_a.token, &server.id, &user_a.id, "me").await;
+        assert_rejected(response, Status::BadRequest, "CannotRemoveYourself").await;
+
+        for banned in [&user_b.id, &user_a.id] {
+            let ban = harness.db.fetch_ban(&server.id, banned).await;
+            assert!(
+                matches!(&ban, Err(error) if matches!(error.error_type, ErrorType::NotFound)),
+                "a refused ban must persist nothing: {:?}",
+                ban
+            );
+        }
+        let entries = audit_entries(&harness, &server.id).await;
+        assert!(
+            entries.is_empty(),
+            "a refused ban records nothing: {entries:?}"
+        );
+    }
+
     // ---- the ban's order, pinned on its text (AFK S-3 P2-2) ----------------
 
     /// `ban`'s body, comment lines dropped and whitespace collapsed.
@@ -893,14 +1334,17 @@ mod test {
     /// ban. The race arm cannot be driven deterministically through the
     /// route, so it is held here on its text. Mutations: the create's error
     /// returned without the second read; the existing ban's arm removed.
+    /// The create's `Ok` arm also sets `newly_banned` (moderation slice 1),
+    /// which only that arm may do: see
+    /// `the_ban_is_recorded_once_between_the_removal_and_the_eviction`.
     #[test]
     fn an_existing_ban_is_the_answer() {
         const EXISTING: &str = "Ok(existing) => existing,";
         const ABSENT: &str =
             "Err(error) if matches!(error.error_type, ErrorType::NotFound) => \u{7b}";
         const RACE: &str = "match ServerBan::create(db, &server, target.id, data.reason).await \
-             \u{7b} Ok(ban) => ban, Err(error) => db .fetch_ban(&server.id, target.id) .await \
-             .map_err(|_| error)?, \u{7d}";
+             \u{7b} Ok(ban) => \u{7b} newly_banned = true; ban \u{7d} Err(error) => db \
+             .fetch_ban(&server.id, target.id) .await .map_err(|_| error)?, \u{7d}";
         const OTHER: &str = "Err(error) => return Err(error), \u{7d};";
         const ANSWER: &str = "Ok(Json(ban.into()))";
 
@@ -920,6 +1364,64 @@ mod test {
             body.matches("ServerBan::create(").count(),
             1,
             "one create, inside the not-found arm: {body}"
+        );
+    }
+
+    /// Moderation slice 1: the `member_ban_add` entry is written once, and
+    /// only for a ban this request created: `newly_banned` is declared false
+    /// before the ban is read and set only in the create's `Ok` arm, so an
+    /// already-banned retry and a create that lost the insert race to a
+    /// concurrent ban (which records its own) write nothing. It is written
+    /// after the membership removal and before the eviction, whose error is
+    /// answered with the ban already durable. The route reads no reason
+    /// header: the reason is the body's (plan audit M4). Mutations: the
+    /// record moved below the eviction; the `newly_banned` guard dropped; the
+    /// flag set in the not-found arm before the create; an `AuditLogReason`
+    /// guard added to the route.
+    #[test]
+    fn the_ban_is_recorded_once_between_the_removal_and_the_eviction() {
+        const FLAG: &str = "let mut newly_banned = false;";
+        const SET: &str = "Ok(ban) => \u{7b} newly_banned = true; ban \u{7d}";
+        const GUARD: &str = "if newly_banned \u{7b} AuditLogEntry::record(";
+        const ACTION: &str = "action: AuditLogAction::MemberBanAdd,";
+
+        let body = route_body();
+        for needle in [
+            FLAG,
+            SET,
+            GUARD,
+            ACTION,
+            "newly_banned = true;",
+            "AuditLogEntry::record(",
+        ] {
+            assert_eq!(
+                body.matches(needle).count(),
+                1,
+                "the ban must carry `{needle}` exactly once: {body}"
+            );
+        }
+        let mut last = 0;
+        for needle in [FLAG, FETCH, CREATE, SET, REMOVE, GUARD, EVICT] {
+            let at = body.find(needle).expect("counted above or by the step pin");
+            assert!(last < at, "`{}` is out of order: {}", needle, body);
+            last = at;
+        }
+        assert_eq!(
+            depth_at(&body, body.find(GUARD).expect("counted above")),
+            1,
+            "the record's guard is a statement of the route itself: {body}"
+        );
+
+        const SOURCE: &str = include_str!("ban_create.rs");
+        let route = &SOURCE[SOURCE
+            .find("pub async fn ban(")
+            .expect("the route is defined")
+            ..SOURCE
+                .find("#[cfg(test)]")
+                .expect("the tests follow the route")];
+        assert!(
+            !route.contains("AuditLogReason"),
+            "a ban's reason is its body's; no reason header is read (plan audit M4)"
         );
     }
 

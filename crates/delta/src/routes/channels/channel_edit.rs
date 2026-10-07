@@ -1,8 +1,11 @@
 use revolt_database::{
     client_gate_is_set,
-    util::{permissions::DatabasePermissionQuery, reference::Reference},
+    util::{
+        audit_reason::AuditLogReason, permissions::DatabasePermissionQuery, reference::Reference,
+    },
     voice::{delete_voice_channel, UserVoiceChannel, VoiceClient},
-    Channel, Database, File, PartialChannel, Server, SystemMessage, User, AMQP,
+    AuditLogAction, AuditLogChange, AuditLogDraft, AuditLogEntry, AuditValue, Channel, Database,
+    File, PartialChannel, Server, SystemMessage, User, AMQP,
 };
 use revolt_models::v0;
 use revolt_permissions::{calculate_channel_permissions, ChannelPermission};
@@ -22,6 +25,7 @@ pub async fn edit(
     user: User,
     target: Reference<'_>,
     data: Json<v0::DataEditChannel>,
+    reason: AuditLogReason,
 ) -> Result<Json<v0::Channel>> {
     let data = data.into_inner();
     data.validate().map_err(|error| {
@@ -30,7 +34,15 @@ pub async fn edit(
         })
     })?;
 
+    // Validated before anything is read or written, so an over-long reason
+    // refuses the whole edit instead of failing after the edit has landed.
+    let reason = reason.validated()?;
+
     let mut channel = target.as_channel(db).await?;
+    // The audit log's "before" values. Every arm below writes into `channel`
+    // in place, and `update` applies the whole partial to it, so this is
+    // taken straight after the load.
+    let channel_before_edit = channel.clone();
 
     // Threads delegate their permission calculus to the parent text channel;
     // resolve it BEFORE constructing the query. A thread's creator may edit
@@ -607,6 +619,10 @@ pub async fn edit(
         )
         .await?;
 
+    // Written only once the edit is persisted, and before the de-voice block
+    // below: its `?`s can still fail a request whose edit has already landed.
+    record_channel_update(db, &user, &channel_before_edit, &channel, reason).await;
+
     if channel.voice().is_none() {
         // Pointer integrity: this PATCH may have just removed the channel's
         // voice information (remove: ["Voice"]) or disabled calling on it
@@ -649,6 +665,302 @@ pub async fn edit(
     }
 
     Ok(Json(channel.into()))
+}
+
+/// Write the `channel_update` audit entry for an edit that has been persisted.
+///
+/// Server channels only: a text channel, a forum, or a thread, which is logged
+/// under its own server with the thread as the target. Groups never log,
+/// whatever changed. No entry when the edit changed nothing (see
+/// `channel_update_changes`). A thread creator's edits of their own thread
+/// (rename, archive, auto-archive, applied tags) are logged like anyone
+/// else's: the target is the channel, never the actor.
+async fn record_channel_update(
+    db: &Database,
+    actor: &User,
+    before: &Channel,
+    after: &Channel,
+    reason: Option<String>,
+) {
+    let Some(server) = after.server() else {
+        return;
+    };
+
+    let changes = channel_update_changes(before, after);
+    if changes.is_empty() {
+        return;
+    }
+
+    AuditLogEntry::record(
+        db,
+        AuditLogDraft {
+            server: server.to_string(),
+            actor: Some(actor.id.clone()),
+            action: AuditLogAction::ChannelUpdate,
+            target: Some(after.id().to_string()),
+            changes,
+            reason,
+            ..Default::default()
+        },
+    )
+    .await;
+}
+
+/// The `channel_update` changes between a server channel as loaded before an
+/// edit and as it stands after the update.
+///
+/// One change for each field `DataEditChannel` can set or `FieldsChannel` can
+/// remove on that channel type, and only when the value really differs, so
+/// saving an unchanged settings form records nothing. Value shapes:
+/// - Scalars carry old and new with their natural type: `name`,
+///   `description` as `String`; `nsfw`, `spoiler`, `announcement`,
+///   `archived`, `require_tag`, `force_sort` as `Bool`; `slowmode` and the
+///   auto-archive durations as `Int`; `applied_tags` as a `StringList` of tag
+///   ids; `default_sort` / `default_layout` as their variant names. An empty
+///   description counts as no description (no `old` / no `new`), an unset
+///   `announcement` as `false` and an unset `slowmode` as `0`, because that
+///   is what each means.
+/// - `icon` carries only `new`: `Bool(true)` when one was set or replaced,
+///   `Bool(false)` when it was removed. File ids are not recorded.
+/// - `voice`, `tags` and `default_permissions` are structured, so they carry
+///   only `new: Bool(true)`, meaning "changed". Their contents are not copied
+///   into the log.
+///
+/// Left out: `archived_timestamp`, which the route stamps as a side effect of
+/// `archived`, and `owner`, which only groups have. A group, or any other
+/// channel type that is not a server channel, answers no changes.
+fn channel_update_changes(before: &Channel, after: &Channel) -> Vec<AuditLogChange> {
+    fn push_if_changed(
+        changes: &mut Vec<AuditLogChange>,
+        key: &str,
+        old: Option<AuditValue>,
+        new: Option<AuditValue>,
+    ) {
+        if old != new {
+            changes.push(AuditLogChange::new(key, old, new));
+        }
+    }
+
+    fn changed_marker(changes: &mut Vec<AuditLogChange>, key: &str, changed: bool, new: bool) {
+        if changed {
+            changes.push(AuditLogChange::new(key, None, Some(AuditValue::Bool(new))));
+        }
+    }
+
+    /// A unit enum's variant name, which is also its name on the wire.
+    fn variant_name<T: std::fmt::Debug>(value: &T) -> Option<AuditValue> {
+        Some(AuditValue::String(format!("{:?}", value)))
+    }
+
+    let text = |value: &Option<String>| {
+        value
+            .clone()
+            .filter(|value| !value.is_empty())
+            .map(AuditValue::String)
+    };
+    let flag = |value: bool| Some(AuditValue::Bool(value));
+    let minutes = |value: u32| Some(AuditValue::Int(i64::from(value)));
+    let seconds = |value: &Option<u64>| {
+        Some(AuditValue::Int(
+            value.unwrap_or(0).min(i64::MAX as u64) as i64
+        ))
+    };
+    let file_id = |file: &Option<File>| file.as_ref().map(|file| file.id.clone());
+
+    let mut changes = Vec::new();
+
+    if let (
+        Channel::TextChannel { name: old, .. }
+        | Channel::Thread { name: old, .. }
+        | Channel::Forum { name: old, .. },
+        Channel::TextChannel { name: new, .. }
+        | Channel::Thread { name: new, .. }
+        | Channel::Forum { name: new, .. },
+    ) = (before, after)
+    {
+        push_if_changed(
+            &mut changes,
+            "name",
+            Some(AuditValue::String(old.clone())),
+            Some(AuditValue::String(new.clone())),
+        );
+    }
+
+    if let (
+        Channel::TextChannel {
+            description: old_description,
+            icon: old_icon,
+            nsfw: old_nsfw,
+            spoiler: old_spoiler,
+            default_permissions: old_default_permissions,
+            ..
+        }
+        | Channel::Forum {
+            description: old_description,
+            icon: old_icon,
+            nsfw: old_nsfw,
+            spoiler: old_spoiler,
+            default_permissions: old_default_permissions,
+            ..
+        },
+        Channel::TextChannel {
+            description,
+            icon,
+            nsfw,
+            spoiler,
+            default_permissions,
+            ..
+        }
+        | Channel::Forum {
+            description,
+            icon,
+            nsfw,
+            spoiler,
+            default_permissions,
+            ..
+        },
+    ) = (before, after)
+    {
+        push_if_changed(
+            &mut changes,
+            "description",
+            text(old_description),
+            text(description),
+        );
+        changed_marker(
+            &mut changes,
+            "icon",
+            file_id(old_icon) != file_id(icon),
+            icon.is_some(),
+        );
+        push_if_changed(&mut changes, "nsfw", flag(*old_nsfw), flag(*nsfw));
+        push_if_changed(&mut changes, "spoiler", flag(*old_spoiler), flag(*spoiler));
+        changed_marker(
+            &mut changes,
+            "default_permissions",
+            old_default_permissions != default_permissions,
+            true,
+        );
+    }
+
+    match (before, after) {
+        (
+            Channel::TextChannel {
+                voice: old_voice,
+                slowmode: old_slowmode,
+                announcement: old_announcement,
+                ..
+            },
+            Channel::TextChannel {
+                voice,
+                slowmode,
+                announcement,
+                ..
+            },
+        ) => {
+            changed_marker(&mut changes, "voice", old_voice != voice, true);
+            push_if_changed(
+                &mut changes,
+                "slowmode",
+                seconds(old_slowmode),
+                seconds(slowmode),
+            );
+            push_if_changed(
+                &mut changes,
+                "announcement",
+                flag(old_announcement.unwrap_or(false)),
+                flag(announcement.unwrap_or(false)),
+            );
+        }
+        (
+            Channel::Thread {
+                archived: old_archived,
+                auto_archive_minutes: old_auto_archive_minutes,
+                applied_tags: old_applied_tags,
+                ..
+            },
+            Channel::Thread {
+                archived,
+                auto_archive_minutes,
+                applied_tags,
+                ..
+            },
+        ) => {
+            push_if_changed(
+                &mut changes,
+                "archived",
+                flag(*old_archived),
+                flag(*archived),
+            );
+            push_if_changed(
+                &mut changes,
+                "auto_archive_minutes",
+                minutes(*old_auto_archive_minutes),
+                minutes(*auto_archive_minutes),
+            );
+            push_if_changed(
+                &mut changes,
+                "applied_tags",
+                Some(AuditValue::StringList(old_applied_tags.clone())),
+                Some(AuditValue::StringList(applied_tags.clone())),
+            );
+        }
+        (
+            Channel::Forum {
+                tags: old_tags,
+                require_tag: old_require_tag,
+                default_sort: old_default_sort,
+                force_sort: old_force_sort,
+                default_layout: old_default_layout,
+                default_auto_archive_minutes: old_default_auto_archive_minutes,
+                ..
+            },
+            Channel::Forum {
+                tags,
+                require_tag,
+                default_sort,
+                force_sort,
+                default_layout,
+                default_auto_archive_minutes,
+                ..
+            },
+        ) => {
+            changed_marker(&mut changes, "tags", old_tags != tags, true);
+            push_if_changed(
+                &mut changes,
+                "require_tag",
+                flag(*old_require_tag),
+                flag(*require_tag),
+            );
+            push_if_changed(
+                &mut changes,
+                "default_sort",
+                variant_name(old_default_sort),
+                variant_name(default_sort),
+            );
+            push_if_changed(
+                &mut changes,
+                "force_sort",
+                flag(*old_force_sort),
+                flag(*force_sort),
+            );
+            push_if_changed(
+                &mut changes,
+                "default_layout",
+                variant_name(old_default_layout),
+                variant_name(default_layout),
+            );
+            push_if_changed(
+                &mut changes,
+                "default_auto_archive_minutes",
+                minutes(*old_default_auto_archive_minutes),
+                minutes(*default_auto_archive_minutes),
+            );
+        }
+        _ => {}
+    }
+
+    changes
 }
 
 /// Whether this edit leaves a server text channel behind a client gate (see
@@ -815,6 +1127,523 @@ mod tests {
             stored,
             revolt_database::Channel::TextChannel { spoiler: true, .. }
         ));
+    }
+
+    // ---- audit log (moderation slice 1) -----------------------------------
+
+    /// Where the audit trail sits in the route:
+    /// - the reason is validated before the channel is even loaded, so an
+    ///   over-long reason refuses the edit instead of failing after it;
+    /// - the "before" snapshot is the very next statement after the load,
+    ///   ahead of every in-place write;
+    /// - the entry is written after the update and before the de-voice block,
+    ///   whose `?`s must not lose the record of an edit that has landed.
+    ///
+    /// Control: the record call moved above `channel .update(`.
+    #[test]
+    fn the_route_audits_from_a_snapshot_taken_before_any_write() {
+        let body = route_body();
+
+        assert_eq!(
+            body.matches(
+                "let mut channel = target.as_channel(db).await?; \
+                 let channel_before_edit = channel.clone();"
+            )
+            .count(),
+            1,
+            "the snapshot must directly follow the load: {body}"
+        );
+
+        let mut previous = 0;
+        for step in [
+            "let reason = reason.validated()?;",
+            "let mut channel = target.as_channel(db).await?;",
+            "permissions.throw_if_lacking_channel_permission(ChannelPermission::ManageChannel)?;",
+            "let mut partial",
+            "channel .update(",
+            "record_channel_update(db, &user, &channel_before_edit, &channel, reason).await;",
+            "if channel.voice().is_none()",
+        ] {
+            let at = body
+                .find(step)
+                .unwrap_or_else(|| panic!("the route lost `{}`: {}", step, body));
+            assert!(previous <= at, "`{}` is out of order: {}", step, body);
+            previous = at;
+        }
+        assert_eq!(body.matches("reason.validated()").count(), 1, "{body}");
+        assert_eq!(body.matches("record_channel_update(").count(), 1, "{body}");
+    }
+
+    /// PATCH a channel with an optional `X-Audit-Log-Reason` header. Returns
+    /// the status and the response body.
+    async fn audit_patch(
+        harness: &TestHarness,
+        session: &revolt_database::Session,
+        channel_id: &str,
+        body: serde_json::Value,
+        reason: Option<&str>,
+    ) -> (Status, String) {
+        let mut request = harness
+            .client
+            .patch(format!("/channels/{}", channel_id))
+            .header(ContentType::JSON)
+            .body(body.to_string());
+        if let Some(reason) = reason {
+            request = request.header(rocket::http::Header::new(
+                "X-Audit-Log-Reason",
+                reason.to_string(),
+            ));
+        }
+
+        let response = TestHarness::with_session(session.clone(), request).await;
+        let status = response.status();
+        (status, response.into_string().await.unwrap_or_default())
+    }
+
+    async fn audit_entries(
+        harness: &TestHarness,
+        server_id: &str,
+    ) -> Vec<revolt_database::AuditLogEntry> {
+        harness
+            .db
+            .fetch_audit_log(server_id, None, 50, None, None)
+            .await
+            .expect("audit log")
+    }
+
+    /// The `channel_update` entries in `server_id` that target `channel_id`.
+    async fn channel_updates(
+        harness: &TestHarness,
+        server_id: &str,
+        channel_id: &str,
+    ) -> Vec<revolt_database::AuditLogEntry> {
+        audit_entries(harness, server_id)
+            .await
+            .into_iter()
+            .filter(|entry| {
+                entry.action == revolt_database::AuditLogAction::ChannelUpdate
+                    && entry.target.as_deref() == Some(channel_id)
+            })
+            .collect()
+    }
+
+    async fn stored_channel_name(harness: &TestHarness, id: &str) -> String {
+        match harness.db.fetch_channel(id).await.expect("channel") {
+            revolt_database::Channel::TextChannel { name, .. }
+            | revolt_database::Channel::Thread { name, .. }
+            | revolt_database::Channel::Forum { name, .. }
+            | revolt_database::Channel::Group { name, .. } => name,
+            other => panic!("expected a named channel, got {:?}", other),
+        }
+    }
+
+    /// A rename: exactly one `channel_update` entry under the channel's
+    /// server, with the owner as actor, the channel as target, the old and new
+    /// name, and the percent-encoded reason header decoded. Control: the
+    /// record call deleted.
+    #[test]
+    fn a_rename_records_one_channel_update_with_its_reason() {
+        crate::util::test::rt().block_on(a_rename_records_one_channel_update_with_its_reason_case())
+    }
+
+    async fn a_rename_records_one_channel_update_with_its_reason_case() {
+        use revolt_database::{AuditLogAction, AuditLogChange, AuditValue};
+
+        let harness = TestHarness::new().await;
+        let (_, session, owner) = harness.new_user().await;
+        let (server, _) = harness.new_server(&owner).await;
+        let channel = harness.new_channel(&server).await;
+        let before = stored_channel_name(&harness, channel.id()).await;
+        assert_ne!(before, "renamed", "fixture must not already carry the name");
+
+        let (status, body) = audit_patch(
+            &harness,
+            &session,
+            channel.id(),
+            json!({ "name": "renamed" }),
+            Some("rename%20reason"),
+        )
+        .await;
+        assert_eq!(status, Status::Ok, "{body}");
+        assert_eq!(stored_channel_name(&harness, channel.id()).await, "renamed");
+
+        let entries = channel_updates(&harness, &server.id, channel.id()).await;
+        assert_eq!(entries.len(), 1, "{:?}", entries);
+        let entry = &entries[0];
+        assert_eq!(entry.server, server.id);
+        assert_eq!(entry.action, AuditLogAction::ChannelUpdate);
+        assert_eq!(entry.actor.as_deref(), Some(owner.id.as_str()));
+        assert_eq!(entry.target.as_deref(), Some(channel.id()));
+        assert_eq!(entry.channel, None);
+        assert_eq!(entry.count, None);
+        assert_eq!(entry.reason.as_deref(), Some("rename reason"));
+        assert_eq!(
+            entry.changes,
+            vec![AuditLogChange::new(
+                "name",
+                Some(AuditValue::String(before)),
+                Some(AuditValue::String("renamed".to_string())),
+            )]
+        );
+    }
+
+    /// Edits that change nothing record nothing: the early return for an
+    /// empty body, a rename to the current name, flags set to the values they
+    /// already hold (an unset announcement and slowmode mean off), and
+    /// removing an icon that is not there. Control: the empty-changes check
+    /// dropped from `record_channel_update`.
+    #[test]
+    fn edits_that_change_nothing_record_nothing() {
+        crate::util::test::rt().block_on(edits_that_change_nothing_record_nothing_case())
+    }
+
+    async fn edits_that_change_nothing_record_nothing_case() {
+        let harness = TestHarness::new().await;
+        let (_, session, owner) = harness.new_user().await;
+        let (server, _) = harness.new_server(&owner).await;
+        let channel = harness.new_channel(&server).await;
+        let name = stored_channel_name(&harness, channel.id()).await;
+
+        for body in [
+            json!({}),
+            json!({ "remove": [] }),
+            json!({ "name": name }),
+            json!({ "nsfw": false, "spoiler": false }),
+            json!({ "announcement": false, "slowmode": 0 }),
+            json!({ "remove": ["Icon"] }),
+        ] {
+            let (status, response) = audit_patch(
+                &harness,
+                &session,
+                channel.id(),
+                body.clone(),
+                Some("nothing%20at%20all"),
+            )
+            .await;
+            assert_eq!(status, Status::Ok, "{body}: {response}");
+        }
+
+        assert_eq!(audit_entries(&harness, &server.id).await, vec![]);
+    }
+
+    /// Groups are not server channels: editing one, with a reason, records
+    /// nothing, neither under the group's id nor under a server the same user
+    /// owns. The edit itself goes through. Control: the entry keyed on the
+    /// channel id when the channel has no server.
+    #[test]
+    fn a_group_edit_records_nothing() {
+        crate::util::test::rt().block_on(a_group_edit_records_nothing_case())
+    }
+
+    async fn a_group_edit_records_nothing_case() {
+        let harness = TestHarness::new().await;
+        let (_, session, owner) = harness.new_user().await;
+        let (server, _) = harness.new_server(&owner).await;
+        let group = revolt_database::Channel::create_group(
+            &harness.db,
+            v0::DataCreateGroup {
+                name: "group".to_string(),
+                ..Default::default()
+            },
+            owner.id.clone(),
+        )
+        .await
+        .expect("group");
+
+        let (status, body) = audit_patch(
+            &harness,
+            &session,
+            group.id(),
+            json!({ "name": "renamed", "nsfw": true }),
+            Some("group%20reason"),
+        )
+        .await;
+        assert_eq!(status, Status::Ok, "{body}");
+        assert_eq!(stored_channel_name(&harness, group.id()).await, "renamed");
+
+        assert_eq!(audit_entries(&harness, group.id()).await, vec![]);
+        assert_eq!(audit_entries(&harness, &server.id).await, vec![]);
+    }
+
+    /// Refused edits record nothing and store nothing: a member without
+    /// ManageChannel (403), and the owner sending a field this channel type
+    /// does not take (400), each with a reason.
+    #[test]
+    fn refused_edits_record_nothing() {
+        crate::util::test::rt().block_on(refused_edits_record_nothing_case())
+    }
+
+    async fn refused_edits_record_nothing_case() {
+        let harness = TestHarness::new().await;
+        let (_, owner_session, owner) = harness.new_user().await;
+        let (_, member_session, member) = harness.new_user().await;
+        let (server, _) = harness.new_server(&owner).await;
+        revolt_database::Member::create(&harness.db, &server, &member, None)
+            .await
+            .expect("member joins");
+        let channel = harness.new_channel(&server).await;
+        let name = stored_channel_name(&harness, channel.id()).await;
+
+        let (status, body) = audit_patch(
+            &harness,
+            &member_session,
+            channel.id(),
+            json!({ "name": "taken" }),
+            Some("hostile"),
+        )
+        .await;
+        assert_eq!(status, Status::Forbidden, "{body}");
+        assert!(body.contains("MissingPermission"), "{}", body);
+
+        let (status, body) = audit_patch(
+            &harness,
+            &owner_session,
+            channel.id(),
+            json!({ "name": "taken", "default_layout": "Classic" }),
+            Some("wrong%20type"),
+        )
+        .await;
+        assert_eq!(status, Status::BadRequest, "{body}");
+        assert!(body.contains("InvalidOperation"), "{}", body);
+
+        assert_eq!(stored_channel_name(&harness, channel.id()).await, name);
+        assert_eq!(audit_entries(&harness, &server.id).await, vec![]);
+    }
+
+    /// A 513-char reason is refused with `AuditLogReasonTooLong` before
+    /// anything is written: the name is unchanged and nothing is recorded.
+    /// 512 chars is accepted and stored whole.
+    #[test]
+    fn an_overlong_reason_refuses_the_edit() {
+        crate::util::test::rt().block_on(an_overlong_reason_refuses_the_edit_case())
+    }
+
+    async fn an_overlong_reason_refuses_the_edit_case() {
+        let harness = TestHarness::new().await;
+        let (_, session, owner) = harness.new_user().await;
+        let (server, _) = harness.new_server(&owner).await;
+        let channel = harness.new_channel(&server).await;
+        let name = stored_channel_name(&harness, channel.id()).await;
+
+        let too_long = "a".repeat(513);
+        let (status, body) = audit_patch(
+            &harness,
+            &session,
+            channel.id(),
+            json!({ "name": "renamed" }),
+            Some(too_long.as_str()),
+        )
+        .await;
+        assert_eq!(status, Status::BadRequest, "{body}");
+        assert!(body.contains("AuditLogReasonTooLong"), "{}", body);
+        assert_eq!(stored_channel_name(&harness, channel.id()).await, name);
+        assert_eq!(audit_entries(&harness, &server.id).await, vec![]);
+
+        let longest = "b".repeat(512);
+        let (status, body) = audit_patch(
+            &harness,
+            &session,
+            channel.id(),
+            json!({ "name": "renamed" }),
+            Some(longest.as_str()),
+        )
+        .await;
+        assert_eq!(status, Status::Ok, "{body}");
+        assert_eq!(stored_channel_name(&harness, channel.id()).await, "renamed");
+        let entries = channel_updates(&harness, &server.id, channel.id()).await;
+        assert_eq!(entries.len(), 1, "{:?}", entries);
+        assert_eq!(entries[0].reason.as_deref(), Some(longest.as_str()));
+    }
+
+    /// A forum post's creator archiving their own post, without
+    /// ManageChannel, is logged under the forum's server with the creator as
+    /// actor and the post as target. Only `archived` is recorded, not the
+    /// timestamp the route stamps alongside it. Archiving it again changes
+    /// nothing and records nothing.
+    #[test]
+    fn a_creator_archiving_their_post_is_logged_under_its_server() {
+        crate::util::test::rt()
+            .block_on(a_creator_archiving_their_post_is_logged_under_its_server_case())
+    }
+
+    async fn a_creator_archiving_their_post_is_logged_under_its_server_case() {
+        use revolt_database::{AuditLogChange, AuditValue};
+
+        let fx = forum_fixture().await;
+
+        for _ in 0..2 {
+            let (status, body) = audit_patch(
+                &fx.harness,
+                &fx.creator_session,
+                fx.post.id(),
+                json!({ "archived": true }),
+                None,
+            )
+            .await;
+            assert_eq!(status, Status::Ok, "{body}");
+        }
+
+        let entries = channel_updates(&fx.harness, &fx.server.id, fx.post.id()).await;
+        assert_eq!(entries.len(), 1, "{:?}", entries);
+        let entry = &entries[0];
+        assert_eq!(entry.server, fx.server.id);
+        assert_eq!(
+            entry.actor.as_deref(),
+            Some(fx.creator_session.user_id.as_str())
+        );
+        assert_eq!(entry.reason, None);
+        assert_eq!(
+            entry.changes,
+            vec![AuditLogChange::new(
+                "archived",
+                Some(AuditValue::Bool(false)),
+                Some(AuditValue::Bool(true)),
+            )]
+        );
+    }
+
+    /// The change shapes for every field the route can change, per channel
+    /// type, without a database. The channels are decoded from JSON rather
+    /// than built as struct literals, so a field added to a variant does not
+    /// break this test.
+    #[test]
+    fn channel_update_changes_cases() {
+        use super::channel_update_changes;
+        use revolt_database::{AuditLogChange, AuditValue, Channel};
+
+        let decode = |value: serde_json::Value| -> Channel {
+            serde_json::from_value(value.clone())
+                .unwrap_or_else(|error| panic!("{}: {}", value, error))
+        };
+        let icon = |id: &str| {
+            json!({
+                "_id": id, "tag": "icons", "filename": "icon.png",
+                "metadata": { "type": "File" }, "content_type": "image/png", "size": 10
+            })
+        };
+        let string = |value: &str| Some(AuditValue::String(value.to_string()));
+        let flag = |value: bool| Some(AuditValue::Bool(value));
+        let int = |value: i64| Some(AuditValue::Int(value));
+        let changed = |key: &str, value: bool| AuditLogChange::new(key, None, flag(value));
+
+        // Text channel: every field, set from its unset state.
+        let text = decode(json!({
+            "channel_type": "TextChannel", "_id": "C", "server": "S", "name": "general",
+            "description": "about", "default_permissions": { "a": 0, "d": 1 }
+        }));
+        assert_eq!(channel_update_changes(&text, &text.clone()), vec![]);
+        let edited = decode(json!({
+            "channel_type": "TextChannel", "_id": "C", "server": "S", "name": "renamed",
+            "icon": icon("I1"), "nsfw": true, "spoiler": true, "voice": {},
+            "slowmode": 30, "announcement": true
+        }));
+        assert_eq!(
+            channel_update_changes(&text, &edited),
+            vec![
+                AuditLogChange::new("name", string("general"), string("renamed")),
+                AuditLogChange::new("description", string("about"), None),
+                changed("icon", true),
+                AuditLogChange::new("nsfw", flag(false), flag(true)),
+                AuditLogChange::new("spoiler", flag(false), flag(true)),
+                changed("default_permissions", true),
+                changed("voice", true),
+                AuditLogChange::new("slowmode", int(0), int(30)),
+                AuditLogChange::new("announcement", flag(false), flag(true)),
+            ]
+        );
+
+        // Icon: replaced is `true`, removed is `false`, the same file is no
+        // change. An empty description is no description; an explicit
+        // `false` / `0` is the same as unset.
+        let with_icon = |id: &str| {
+            decode(json!({
+                "channel_type": "TextChannel", "_id": "C", "server": "S", "name": "general",
+                "icon": icon(id)
+            }))
+        };
+        let plain = decode(json!({
+            "channel_type": "TextChannel", "_id": "C", "server": "S", "name": "general"
+        }));
+        assert_eq!(
+            channel_update_changes(&with_icon("I1"), &with_icon("I2")),
+            vec![changed("icon", true)]
+        );
+        assert_eq!(
+            channel_update_changes(&with_icon("I1"), &plain),
+            vec![changed("icon", false)]
+        );
+        assert_eq!(
+            channel_update_changes(&with_icon("I1"), &with_icon("I1")),
+            vec![]
+        );
+        let unset_defaults = decode(json!({
+            "channel_type": "TextChannel", "_id": "C", "server": "S", "name": "general",
+            "description": "", "slowmode": 0, "announcement": false
+        }));
+        assert_eq!(channel_update_changes(&plain, &unset_defaults), vec![]);
+
+        // Thread: archived, auto-archive and applied tags; the archive
+        // timestamp is not recorded.
+        let thread = decode(json!({
+            "channel_type": "Thread", "_id": "T", "server": "S", "parent_channel": "F",
+            "name": "post", "creator": "U", "auto_archive_minutes": 1440
+        }));
+        let archived = decode(json!({
+            "channel_type": "Thread", "_id": "T", "server": "S", "parent_channel": "F",
+            "name": "post", "creator": "U", "auto_archive_minutes": 0,
+            "archived": true, "archived_timestamp": "2026-10-06T00:00:00.000Z",
+            "applied_tags": ["G1"]
+        }));
+        assert_eq!(
+            channel_update_changes(&thread, &archived),
+            vec![
+                AuditLogChange::new("archived", flag(false), flag(true)),
+                AuditLogChange::new("auto_archive_minutes", int(1440), int(0)),
+                AuditLogChange::new(
+                    "applied_tags",
+                    Some(AuditValue::StringList(vec![])),
+                    Some(AuditValue::StringList(vec!["G1".to_string()])),
+                ),
+            ]
+        );
+
+        // Forum: the forum configuration, with the enums by their wire names.
+        let forum = decode(json!({
+            "channel_type": "Forum", "_id": "F", "server": "S", "name": "forum",
+            "default_auto_archive_minutes": 4320
+        }));
+        let configured = decode(json!({
+            "channel_type": "Forum", "_id": "F", "server": "S", "name": "forum",
+            "tags": [{ "id": "G1", "name": "news" }], "require_tag": true,
+            "default_sort": "Alphabetical", "force_sort": true,
+            "default_layout": "ClassicPlus", "default_auto_archive_minutes": 60
+        }));
+        assert_eq!(
+            channel_update_changes(&forum, &configured),
+            vec![
+                changed("tags", true),
+                AuditLogChange::new("require_tag", flag(false), flag(true)),
+                AuditLogChange::new(
+                    "default_sort",
+                    string("LatestActivity"),
+                    string("Alphabetical")
+                ),
+                AuditLogChange::new("force_sort", flag(false), flag(true)),
+                AuditLogChange::new("default_layout", string("Modern"), string("ClassicPlus")),
+                AuditLogChange::new("default_auto_archive_minutes", int(4320), int(60)),
+            ]
+        );
+
+        // A group answers nothing, whatever changed.
+        let group = decode(json!({
+            "channel_type": "Group", "_id": "G", "name": "group", "owner": "O",
+            "recipients": []
+        }));
+        let renamed_group = decode(json!({
+            "channel_type": "Group", "_id": "G", "name": "renamed", "owner": "O",
+            "recipients": [], "nsfw": true
+        }));
+        assert_eq!(channel_update_changes(&group, &renamed_group), vec![]);
     }
 
     /// A server (owned by `owner`) with a forum, a plain member `creator`

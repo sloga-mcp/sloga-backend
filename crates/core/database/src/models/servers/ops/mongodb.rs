@@ -394,6 +394,88 @@ impl MongoDb {
             .await
             .map_err(|_| create_database_error!("delete_many", "application_commands"))?;
 
+        // Delete the server's audit log. Entries carry `server`; there is no
+        // separate trait op for this, the cascade lives here only.
+        self.col::<Document>("server_audit_log")
+            .delete_many(doc! {
+                "server": &server_id
+            })
+            .await
+            .map_err(|_| create_database_error!("delete_many", "server_audit_log"))?;
+
         Ok(())
+    }
+}
+
+/// Server-delete cascade of `server_audit_log`.
+///
+/// MongoDB only: this must run under `TEST_DB=MONGODB`. The cascade is a raw
+/// `delete_many` in `MongoDb::delete_associated_server_objects`, and the
+/// Reference driver's `delete_server` removes only the server row (it does not
+/// cascade at all), so under `TEST_DB=REFERENCE` the test returns early and
+/// proves nothing.
+#[cfg(test)]
+mod tests {
+    use bson::{doc, Document};
+
+    const SERVER_A: &str = "01AUDITSERVERA000000000000";
+    const SERVER_B: &str = "01AUDITSERVERB000000000000";
+
+    #[tokio::test]
+    async fn delete_associated_server_objects_drops_that_servers_audit_log_only() {
+        database_test!(|db| async move {
+            let crate::Database::MongoDb(mongo) = &db else {
+                return;
+            };
+
+            // Raw documents on purpose: the cascade filters on the stored
+            // `server` field, independent of the entry model.
+            let audit_log = mongo.col::<Document>("server_audit_log");
+            for (id, server) in [
+                ("01AUDITENTRYA1000000000000", SERVER_A),
+                ("01AUDITENTRYA2000000000000", SERVER_A),
+                ("01AUDITENTRYB1000000000000", SERVER_B),
+            ] {
+                audit_log
+                    .insert_one(doc! {
+                        "_id": id,
+                        "server": server,
+                        "action": "member_kick",
+                    })
+                    .await
+                    .expect("seed server_audit_log");
+            }
+
+            // Control: both of A's entries are present before the cascade.
+            assert_eq!(
+                audit_log
+                    .count_documents(doc! { "server": SERVER_A })
+                    .await
+                    .unwrap(),
+                2
+            );
+
+            mongo
+                .delete_associated_server_objects(SERVER_A)
+                .await
+                .expect("delete_associated_server_objects");
+
+            assert_eq!(
+                audit_log
+                    .count_documents(doc! { "server": SERVER_A })
+                    .await
+                    .unwrap(),
+                0
+            );
+
+            let survivors: Vec<String> = audit_log
+                .distinct("_id", doc! {})
+                .await
+                .unwrap()
+                .into_iter()
+                .filter_map(|id| id.as_str().map(str::to_string))
+                .collect();
+            assert_eq!(survivors, vec!["01AUDITENTRYB1000000000000".to_string()]);
+        });
     }
 }

@@ -1,13 +1,72 @@
 use revolt_database::{
-    util::{permissions::DatabasePermissionQuery, reference::Reference},
+    util::{
+        audit_reason::AuditLogReason, permissions::DatabasePermissionQuery, reference::Reference,
+    },
     voice::{delete_voice_channel, remove_user_from_voice_channel, UserVoiceChannel, VoiceClient},
-    Channel, Database, PartialChannel, User, AMQP,
+    AuditLogAction, AuditLogChange, AuditLogDraft, AuditLogEntry, AuditValue, Channel, Database,
+    PartialChannel, User, AMQP,
 };
 use revolt_models::v0;
 use revolt_permissions::{calculate_channel_permissions, ChannelPermission};
 use revolt_result::{create_error, Result, ToRevoltError};
 use rocket::State;
 use rocket_empty::EmptyResponse;
+
+/// The `channel_delete` entry a server-channel delete writes, built from the
+/// channel as it is BEFORE the delete: the target is the channel, and its
+/// `name` and `type` are recorded as `old`.
+///
+/// `type` uses the vocabulary `channel_create` records (the
+/// `DataCreateServerChannel.type` names `"Text"`, `"Voice"`, `"Forum"`), plus
+/// `"Thread"`. There is no `VoiceChannel` type: a voice channel is a
+/// `TextChannel` carrying voice information, which is how
+/// `create_server_channel` stores a `Voice` body, so that is what `"Voice"`
+/// reads back here (calls switched off included).
+///
+/// `None` for saved messages, DMs and groups, which are never logged.
+/// Written without a wildcard arm, so a new channel variant has to decide.
+fn channel_delete_draft(
+    channel: &Channel,
+    actor: &str,
+    reason: Option<String>,
+) -> Option<AuditLogDraft> {
+    let (server, name, channel_type) = match channel {
+        Channel::TextChannel {
+            server,
+            name,
+            voice: Some(_),
+            ..
+        } => (server, name, "Voice"),
+        Channel::TextChannel {
+            server,
+            name,
+            voice: None,
+            ..
+        } => (server, name, "Text"),
+        Channel::Forum { server, name, .. } => (server, name, "Forum"),
+        Channel::Thread { server, name, .. } => (server, name, "Thread"),
+        Channel::SavedMessages { .. } | Channel::DirectMessage { .. } | Channel::Group { .. } => {
+            return None
+        }
+    };
+
+    Some(AuditLogDraft {
+        server: server.clone(),
+        actor: Some(actor.to_string()),
+        action: AuditLogAction::ChannelDelete,
+        target: Some(channel.id().to_string()),
+        changes: vec![
+            AuditLogChange::new("name", Some(AuditValue::String(name.clone())), None),
+            AuditLogChange::new(
+                "type",
+                Some(AuditValue::String(channel_type.to_string())),
+                None,
+            ),
+        ],
+        reason,
+        ..Default::default()
+    })
+}
 
 /// # Close Channel
 ///
@@ -21,7 +80,11 @@ pub async fn delete(
     user: User,
     target: Reference<'_>,
     options: v0::OptionsChannelDelete,
+    reason: AuditLogReason,
 ) -> Result<EmptyResponse> {
+    // Reject an over-long reason before anything is changed.
+    let reason = reason.validated()?;
+
     let mut channel = target.as_channel(db).await?;
 
     // Threads delegate their permission calculus to the parent text channel;
@@ -31,6 +94,10 @@ pub async fn delete(
     let permissions = calculate_channel_permissions(&mut query).await;
 
     permissions.throw_if_lacking_channel_permission(ChannelPermission::ViewChannel)?;
+
+    // Snapshotted BEFORE the delete, written only once it has succeeded.
+    // `None` for DMs, groups and saved messages, which never log.
+    let audit = channel_delete_draft(&channel, &user.id, reason);
 
     #[allow(deprecated)]
     match &channel {
@@ -86,16 +153,30 @@ pub async fn delete(
             permissions.throw_if_lacking_channel_permission(ChannelPermission::ManageChannel)?;
             channel.delete(db).await?;
 
+            // The channel is gone: record it before the voice teardown, which
+            // can still fail after the delete.
+            if let Some(draft) = audit {
+                AuditLogEntry::record(db, draft).await;
+            }
+
             delete_voice_channel(db, voice_client, &UserVoiceChannel::from_channel(&channel)).await?;
         }
         Channel::Forum { .. } => {
             permissions.throw_if_lacking_channel_permission(ChannelPermission::ManageChannel)?;
             channel.delete(db).await?;
+
+            if let Some(draft) = audit {
+                AuditLogEntry::record(db, draft).await;
+            }
         }
         Channel::Thread { .. } => {
             // ManageChannel on the PARENT channel is required to delete a thread.
             permissions.throw_if_lacking_channel_permission(ChannelPermission::ManageChannel)?;
             channel.delete(db).await?;
+
+            if let Some(draft) = audit {
+                AuditLogEntry::record(db, draft).await;
+            }
         }
     };
 
@@ -440,5 +521,503 @@ mod test {
                 body
             );
         }
+    }
+
+    // ---- the audit log (moderation slice 1) --------------------------------
+    //
+    // Needs RabbitMQ and Redis, as every route test here does.
+
+    use crate::util::test::{statement_at, without_comments, without_whitespace};
+    use revolt_database::{
+        mongodb::bson::{doc, Document},
+        AuditLogAction, AuditLogChange, AuditLogEntry, AuditValue, Database, Member,
+    };
+    use revolt_models::v0;
+
+    async fn delete_channel<'a>(
+        harness: &'a TestHarness,
+        token: &str,
+        channel: &str,
+        reason: Option<&str>,
+    ) -> rocket::local::asynchronous::LocalResponse<'a> {
+        let mut request = harness
+            .client
+            .delete(format!("/channels/{channel}"))
+            .header(Header::new("x-session-token", token.to_string()));
+        if let Some(reason) = reason {
+            request = request.header(Header::new("X-Audit-Log-Reason", reason.to_string()));
+        }
+        request.dispatch().await
+    }
+
+    async fn channel_exists(harness: &TestHarness, id: &str) -> bool {
+        harness.db.fetch_channel(id).await.is_ok()
+    }
+
+    async fn server_entries(harness: &TestHarness, server: &str) -> Vec<AuditLogEntry> {
+        harness
+            .db
+            .fetch_audit_log(server, None, 50, None, None)
+            .await
+            .expect("audit log")
+    }
+
+    /// The `channel_delete` entries in `server` that name `channel`.
+    async fn delete_entries(
+        harness: &TestHarness,
+        server: &str,
+        channel: &str,
+    ) -> Vec<AuditLogEntry> {
+        server_entries(harness, server)
+            .await
+            .into_iter()
+            .filter(|entry| {
+                entry.action == AuditLogAction::ChannelDelete
+                    && entry.target.as_deref() == Some(channel)
+            })
+            .collect()
+    }
+
+    /// How many entries, in ANY server, name `actor` as the actor. A DM or a
+    /// group has no server to read back by, so a stray entry would land under
+    /// an id the test cannot guess; counting by actor finds it anywhere.
+    async fn entries_by_actor(harness: &TestHarness, actor: &str) -> u64 {
+        match &harness.db {
+            Database::Reference(reference) => reference
+                .server_audit_log
+                .lock()
+                .await
+                .values()
+                .filter(|entry| entry.actor.as_deref() == Some(actor))
+                .count() as u64,
+            Database::MongoDb(mongo) => mongo
+                .col::<Document>("server_audit_log")
+                .count_documents(doc! { "actor": actor })
+                .await
+                .expect("count"),
+        }
+    }
+
+    /// The `name` and `type` changes a delete of `name` / `channel_type`
+    /// must carry: both `old`, neither `new`.
+    fn old_name_and_type(name: &str, channel_type: &str) -> Vec<AuditLogChange> {
+        vec![
+            AuditLogChange::new("name", Some(AuditValue::String(name.to_string())), None),
+            AuditLogChange::new(
+                "type",
+                Some(AuditValue::String(channel_type.to_string())),
+                None,
+            ),
+        ]
+    }
+
+    /// Every arm of `channel_delete_draft`, with no database: the three
+    /// server variants (a text channel with and without voice information
+    /// split into "Voice" and "Text") build a draft with the OLD name and
+    /// type, the server, the actor, the channel as target and the reason;
+    /// saved messages, DMs and groups build none. The channels are decoded
+    /// from their stored JSON shape rather than built as struct literals, so
+    /// fields added to a variant later (with serde defaults) do not break
+    /// this. Mutations: "TextChannel" recorded; voice ignored; a non-server
+    /// variant logged; `new` filled instead of `old`.
+    #[test]
+    fn the_draft_covers_every_channel_variant() {
+        fn decode(value: serde_json::Value) -> Channel {
+            serde_json::from_value(value).expect("a stored channel")
+        }
+
+        let server_channels = [
+            (
+                serde_json::json!({ "channel_type": "TextChannel", "_id": "C1",
+                    "server": "S1", "name": "general" }),
+                "general",
+                "Text",
+            ),
+            (
+                serde_json::json!({ "channel_type": "TextChannel", "_id": "C1",
+                    "server": "S1", "name": "lounge", "voice": {} }),
+                "lounge",
+                "Voice",
+            ),
+            (
+                serde_json::json!({ "channel_type": "TextChannel", "_id": "C1",
+                    "server": "S1", "name": "quiet", "voice": { "disabled": true } }),
+                "quiet",
+                "Voice",
+            ),
+            (
+                serde_json::json!({ "channel_type": "Forum", "_id": "C1",
+                    "server": "S1", "name": "ideas" }),
+                "ideas",
+                "Forum",
+            ),
+            (
+                serde_json::json!({ "channel_type": "Thread", "_id": "C1",
+                    "server": "S1", "parent_channel": "P1", "name": "a thread",
+                    "creator": "U9" }),
+                "a thread",
+                "Thread",
+            ),
+        ];
+        for (value, name, channel_type) in server_channels {
+            let channel = decode(value);
+            let draft = super::channel_delete_draft(&channel, "U1", Some("why".to_string()))
+                .expect("a server channel is logged");
+            assert_eq!(draft.server, "S1");
+            assert_eq!(draft.actor.as_deref(), Some("U1"));
+            assert_eq!(draft.action, AuditLogAction::ChannelDelete);
+            assert_eq!(draft.target.as_deref(), Some("C1"));
+            assert_eq!(draft.channel, None);
+            assert_eq!(draft.changes, old_name_and_type(name, channel_type));
+            assert_eq!(draft.count, None);
+            assert_eq!(draft.reason.as_deref(), Some("why"));
+        }
+
+        for value in [
+            serde_json::json!({ "channel_type": "SavedMessages", "_id": "C2", "user": "U1" }),
+            serde_json::json!({ "channel_type": "DirectMessage", "_id": "C3",
+                "active": true, "recipients": ["U1", "U2"] }),
+            serde_json::json!({ "channel_type": "Group", "_id": "C4", "name": "pals",
+                "owner": "U1", "recipients": ["U1", "U2"] }),
+        ] {
+            let channel = decode(value);
+            assert!(
+                super::channel_delete_draft(&channel, "U1", Some("why".to_string())).is_none(),
+                "never logged: {:?}",
+                channel
+            );
+        }
+    }
+
+    #[test]
+    fn deleting_a_server_channel_writes_one_entry() {
+        crate::util::test::rt().block_on(deleting_a_server_channel_writes_one_entry_case())
+    }
+
+    /// The owner deletes the server's text channel with a percent-encoded
+    /// reason: the channel is gone, and the server holds exactly one entry,
+    /// a `channel_delete` naming the owner and the channel, with the OLD name
+    /// and type and the decoded reason.
+    async fn deleting_a_server_channel_writes_one_entry_case() {
+        let harness = TestHarness::new().await;
+        let (_, session, owner) = harness.new_user().await;
+        let (server, channels) = harness.new_server(&owner).await;
+        let text = &channels[0];
+        let name = match text {
+            Channel::TextChannel { name, .. } => name.clone(),
+            _ => unreachable!("the server's default text channel"),
+        };
+
+        let response = delete_channel(
+            &harness,
+            &session.token,
+            text.id(),
+            Some("old%20channel%3A%20unused"),
+        )
+        .await;
+        assert_eq!(response.status(), Status::NoContent);
+        drop(response);
+        assert!(!channel_exists(&harness, text.id()).await, "deleted");
+
+        let entries = server_entries(&harness, &server.id).await;
+        assert_eq!(entries.len(), 1, "exactly one entry: {:?}", entries);
+        let entry = &entries[0];
+        assert_eq!(entry.server, server.id);
+        assert_eq!(entry.action, AuditLogAction::ChannelDelete);
+        assert_eq!(entry.actor.as_deref(), Some(owner.id.as_str()));
+        assert_eq!(entry.target.as_deref(), Some(text.id()));
+        assert_eq!(entry.channel, None);
+        assert_eq!(entry.changes, old_name_and_type(&name, "Text"));
+        assert_eq!(entry.count, None);
+        assert_eq!(entry.reason.as_deref(), Some("old channel: unused"));
+    }
+
+    #[test]
+    fn deleting_a_thread_or_a_forum_records_its_type() {
+        crate::util::test::rt().block_on(deleting_a_thread_or_a_forum_records_its_type_case())
+    }
+
+    /// The other two server-channel arms: a thread (whose permissions come
+    /// from its parent) and a forum each log one entry under the server,
+    /// with their own old name and type, and no header means no reason.
+    async fn deleting_a_thread_or_a_forum_records_its_type_case() {
+        let harness = TestHarness::new().await;
+        let (_, session, owner) = harness.new_user().await;
+        let (mut server, channels) = harness.new_server(&owner).await;
+        let thread = Channel::create_thread(
+            &harness.db,
+            &channels[0],
+            &owner,
+            None,
+            v0::DataCreateThread {
+                name: "audit-thread".to_string(),
+                auto_archive_minutes: None,
+            },
+        )
+        .await
+        .expect("thread");
+        let forum = Channel::create_server_channel(
+            &harness.db,
+            &mut server,
+            v0::DataCreateServerChannel {
+                channel_type: v0::LegacyServerChannelType::Forum,
+                name: "audit-forum".to_string(),
+                ..Default::default()
+            },
+            false,
+        )
+        .await
+        .expect("forum");
+
+        for (channel, name, channel_type) in [
+            (&thread, "audit-thread", "Thread"),
+            (&forum, "audit-forum", "Forum"),
+        ] {
+            let response = delete_channel(&harness, &session.token, channel.id(), None).await;
+            assert_eq!(response.status(), Status::NoContent);
+            drop(response);
+            assert!(!channel_exists(&harness, channel.id()).await, "deleted");
+
+            let entries = delete_entries(&harness, &server.id, channel.id()).await;
+            assert_eq!(entries.len(), 1, "exactly one entry: {:?}", entries);
+            let entry = &entries[0];
+            assert_eq!(entry.server, server.id);
+            assert_eq!(entry.actor.as_deref(), Some(owner.id.as_str()));
+            assert_eq!(entry.channel, None);
+            assert_eq!(entry.changes, old_name_and_type(name, channel_type));
+            assert_eq!(entry.reason, None);
+        }
+
+        assert_eq!(
+            server_entries(&harness, &server.id).await.len(),
+            2,
+            "one entry per delete and nothing else"
+        );
+    }
+
+    #[test]
+    fn leaving_or_closing_a_group_or_dm_writes_no_entry() {
+        crate::util::test::rt().block_on(leaving_or_closing_a_group_or_dm_writes_no_entry_case())
+    }
+
+    /// Every non-server arm, each with a reason header: a member leaving a
+    /// group, the last member leaving (which deletes the group), closing a
+    /// DM, and saved messages (NoEffect). None of them logs anywhere.
+    async fn leaving_or_closing_a_group_or_dm_writes_no_entry_case() {
+        let harness = TestHarness::new().await;
+        let (_, owner_session, owner) = harness.new_user().await;
+        let (_, member_session, member) = harness.new_user().await;
+
+        // A member leaves a group.
+        let group = group_with(&harness, &owner, &member).await;
+        let response =
+            delete_channel(&harness, &member_session.token, group.id(), Some("leaving")).await;
+        assert_eq!(response.status(), Status::NoContent);
+        drop(response);
+        assert!(
+            !is_recipient(&harness, group.id(), &member.id).await,
+            "left"
+        );
+        assert_eq!(entries_by_actor(&harness, &member.id).await, 0);
+
+        // The last member leaves, which deletes the group.
+        let lonely = Channel::create_group(
+            &harness.db,
+            DataCreateGroup {
+                ..Default::default()
+            },
+            owner.id.clone(),
+        )
+        .await
+        .expect("group");
+        let response =
+            delete_channel(&harness, &owner_session.token, lonely.id(), Some("closing")).await;
+        assert_eq!(response.status(), Status::NoContent);
+        drop(response);
+        assert!(!channel_exists(&harness, lonely.id()).await, "deleted");
+        assert_eq!(entries_by_actor(&harness, &owner.id).await, 0);
+
+        // A DM is closed.
+        let dm = Channel::create_dm(&harness.db, &owner, &member)
+            .await
+            .expect("dm");
+        let response =
+            delete_channel(&harness, &owner_session.token, dm.id(), Some("closing")).await;
+        assert_eq!(response.status(), Status::NoContent);
+        drop(response);
+        assert!(
+            matches!(
+                harness.db.fetch_channel(dm.id()).await.expect("dm"),
+                Channel::DirectMessage { active: false, .. }
+            ),
+            "closed"
+        );
+        assert_eq!(entries_by_actor(&harness, &owner.id).await, 0);
+
+        // Saved messages cannot be closed. A user with no other channel: the
+        // Reference driver's DM lookup returns ANY channel holding the user,
+        // so `member` would get their DM back instead.
+        let (_, loner_session, loner) = harness.new_user().await;
+        let saved = Channel::create_dm(&harness.db, &loner, &loner)
+            .await
+            .expect("saved messages");
+        assert!(
+            matches!(saved, Channel::SavedMessages { .. }),
+            "saved messages"
+        );
+        let response =
+            delete_channel(&harness, &loner_session.token, saved.id(), Some("nope")).await;
+        assert_eq!(response.status(), Status::BadRequest);
+        let error: serde_json::Value = response.into_json().await.expect("error body");
+        assert_eq!(error["type"], "NoEffect");
+        assert!(channel_exists(&harness, saved.id()).await, "kept");
+        assert_eq!(entries_by_actor(&harness, &loner.id).await, 0);
+
+        for id in [group.id(), lonely.id(), dm.id(), saved.id(), ""] {
+            assert!(server_entries(&harness, id).await.is_empty());
+        }
+    }
+
+    #[test]
+    fn a_refused_delete_writes_no_entry() {
+        crate::util::test::rt().block_on(a_refused_delete_writes_no_entry_case())
+    }
+
+    /// A member without ManageChannel cannot delete a server channel: 403,
+    /// the channel survives, nothing is logged.
+    async fn a_refused_delete_writes_no_entry_case() {
+        let harness = TestHarness::new().await;
+        let (_, _, owner) = harness.new_user().await;
+        let (_, session, member) = harness.new_user().await;
+        let (server, channels) = harness.new_server(&owner).await;
+        Member::create(&harness.db, &server, &member, None)
+            .await
+            .expect("member");
+
+        let response = delete_channel(
+            &harness,
+            &session.token,
+            channels[0].id(),
+            Some("not%20mine"),
+        )
+        .await;
+        assert_eq!(response.status(), Status::Forbidden);
+        let error: serde_json::Value = response.into_json().await.expect("error body");
+        assert_eq!(error["type"], "MissingPermission");
+        assert!(channel_exists(&harness, channels[0].id()).await, "kept");
+
+        assert_eq!(entries_by_actor(&harness, &member.id).await, 0);
+        assert!(server_entries(&harness, &server.id).await.is_empty());
+    }
+
+    #[test]
+    fn an_over_long_reason_is_refused_before_the_delete() {
+        crate::util::test::rt().block_on(an_over_long_reason_is_refused_before_the_delete_case())
+    }
+
+    /// A 513-char reason is a 400 `AuditLogReasonTooLong` and nothing
+    /// happened: the server channel still exists and nothing is logged. The
+    /// reason is validated first, so a group leave carrying one is refused
+    /// the same way and the member is still in the group.
+    async fn an_over_long_reason_is_refused_before_the_delete_case() {
+        let harness = TestHarness::new().await;
+        let (_, owner_session, owner) = harness.new_user().await;
+        let (_, member_session, member) = harness.new_user().await;
+        let (server, channels) = harness.new_server(&owner).await;
+        let group = group_with(&harness, &owner, &member).await;
+        let reason = "a".repeat(513);
+
+        for (token, channel) in [
+            (&owner_session.token, channels[0].id()),
+            (&member_session.token, group.id()),
+        ] {
+            let response = delete_channel(&harness, token, channel, Some(&reason)).await;
+            assert_eq!(response.status(), Status::BadRequest);
+            let error: serde_json::Value = response.into_json().await.expect("error body");
+            assert_eq!(error["type"], "FailedValidation");
+            assert_eq!(error["error"], "AuditLogReasonTooLong");
+            assert!(channel_exists(&harness, channel).await, "not deleted");
+        }
+
+        assert!(
+            is_recipient(&harness, group.id(), &member.id).await,
+            "not left"
+        );
+        assert!(server_entries(&harness, &server.id).await.is_empty());
+        assert_eq!(entries_by_actor(&harness, &owner.id).await, 0);
+        assert_eq!(entries_by_actor(&harness, &member.id).await, 0);
+    }
+
+    /// The reason is validated before the channel is even fetched; the entry
+    /// is snapshotted before any delete; and each of the three server arms
+    /// records only after its own delete succeeded, the text arm before its
+    /// voice teardown. Mutations: validation moved after a delete (a 400
+    /// after the channel is gone); the snapshot taken after the delete; an
+    /// entry written before its delete (an entry for a delete that failed);
+    /// the entry written after the voice teardown (lost when it fails).
+    #[test]
+    fn the_reason_is_validated_first_and_each_delete_records_after_it_succeeds() {
+        const SOURCE: &str = include_str!("channel_delete.rs");
+        let source = SOURCE
+            .split("#[cfg(test)]")
+            .next()
+            .expect("the route precedes its tests");
+        let route = &source[source
+            .find("pub async fn delete(")
+            .expect("the route is defined")..];
+        let code = without_whitespace(&without_comments(route));
+
+        let validated = statement_at(&code, "letreason=reason.validated()?;");
+        let fetched = code
+            .find("target.as_channel(db)")
+            .expect("the channel is fetched");
+        let snapshot = statement_at(
+            &code,
+            "letaudit=channel_delete_draft(&channel,&user.id,reason);",
+        );
+        assert!(validated < fetched, "validate before anything else");
+
+        const DELETE: &str = "channel.delete(db).await?;";
+        const RECORD: &str = "ifletSome(draft)=audit{AuditLogEntry::record(db,draft).await;}";
+        let deletes: Vec<usize> = code.match_indices(DELETE).map(|(at, _)| at).collect();
+        let records: Vec<usize> = code.match_indices(RECORD).map(|(at, _)| at).collect();
+        assert_eq!(deletes.len(), 3, "one delete per server arm: {}", code);
+        assert_eq!(records.len(), 3, "one record per server arm: {}", code);
+        assert_eq!(
+            code.matches("AuditLogEntry::record(").count(),
+            3,
+            "no record outside the three pinned: {}",
+            code
+        );
+        assert!(snapshot < deletes[0], "snapshot before any delete");
+        for arm in 0..3 {
+            assert!(
+                deletes[arm] < records[arm],
+                "arm {}: record after its delete",
+                arm
+            );
+            if let Some(next) = deletes.get(arm + 1) {
+                assert!(
+                    records[arm] < *next,
+                    "arm {}: record inside its own arm",
+                    arm
+                );
+            }
+        }
+
+        let text_arm = code
+            .find("Channel::TextChannel{..}=>")
+            .expect("the text arm");
+        let teardown = code
+            .find("delete_voice_channel(")
+            .expect("the voice teardown");
+        assert!(
+            text_arm < deletes[0],
+            "the first server arm is the text arm"
+        );
+        assert!(
+            records[0] < teardown && teardown < deletes[1],
+            "the text arm records before its voice teardown"
+        );
     }
 }

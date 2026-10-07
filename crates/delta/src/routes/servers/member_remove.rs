@@ -1,7 +1,9 @@
 use revolt_database::{
-    util::{permissions::DatabasePermissionQuery, reference::Reference},
+    util::{
+        audit_reason::AuditLogReason, permissions::DatabasePermissionQuery, reference::Reference,
+    },
     voice::{remove_user_from_server_voice, VoiceClient},
-    Database, RemovalIntention, User,
+    AuditLogAction, AuditLogDraft, AuditLogEntry, Database, RemovalIntention, User,
 };
 use revolt_permissions::{calculate_server_permissions, ChannelPermission};
 use revolt_result::{create_error, Result};
@@ -19,7 +21,12 @@ pub async fn kick(
     user: User,
     server_id: Reference<'_>,
     member_id: Reference<'_>,
+    reason: AuditLogReason,
 ) -> Result<EmptyResponse> {
+    // Validated before anything else: a too-long reason must refuse the
+    // kick, never answer 400 after it.
+    let reason = reason.validated()?;
+
     let server = server_id.as_server(db).await?;
 
     if member_id.id == user.id {
@@ -46,6 +53,22 @@ pub async fn kick(
         .remove(db, &server, RemovalIntention::Kick, false)
         .await?;
 
+    // Recorded once the kick is durable and BEFORE the eviction: a failed
+    // eviction answers an error, but the kick it follows still happened. The
+    // self-kick was refused above, so the actor is never the target.
+    AuditLogEntry::record(
+        db,
+        AuditLogDraft {
+            server: server.id.clone(),
+            actor: Some(user.id.clone()),
+            action: AuditLogAction::MemberKick,
+            target: Some(member_id.id.to_string()),
+            reason,
+            ..Default::default()
+        },
+    )
+    .await;
+
     // The membership is removed FIRST, so a rejoin racing this eviction is
     // refused by the join-time membership re-check (AFK S-3 D-3). Every call
     // in the server is reached, not only the one the per-server pointer names
@@ -70,9 +93,11 @@ mod test {
             get_voice_channel_members, is_in_voice_channel, record_voice_connection,
             recorded_voice_connections, set_channel_node, UserVoiceChannel,
         },
-        Channel, Member, Server,
+        AuditLogAction, AuditLogEntry, Channel, Member, PartialMember, PartialRole, Role, Server,
+        User,
     };
     use revolt_models::v0;
+    use revolt_permissions::{ChannelPermission, OverrideField};
     use rocket::http::{Header, Status};
 
     // ---- behavior (needs RabbitMQ and Redis) ------------------------------
@@ -159,6 +184,85 @@ mod test {
             .header(Header::new("x-session-token", token.to_string()))
             .dispatch()
             .await
+    }
+
+    /// `kick` with an `X-Audit-Log-Reason` header, sent as given (the
+    /// client percent-encodes it).
+    async fn kick_with_reason<'a>(
+        harness: &'a TestHarness,
+        token: &str,
+        server_id: &str,
+        target_id: &str,
+        reason: &str,
+    ) -> rocket::local::asynchronous::LocalResponse<'a> {
+        harness
+            .client
+            .delete(format!("/servers/{server_id}/members/{target_id}"))
+            .header(Header::new("x-session-token", token.to_string()))
+            .header(Header::new("X-Audit-Log-Reason", reason.to_string()))
+            .dispatch()
+            .await
+    }
+
+    async fn assert_rejected(
+        response: rocket::local::asynchronous::LocalResponse<'_>,
+        status: Status,
+        error_type: &str,
+    ) {
+        assert_eq!(response.status(), status);
+        let body = response.into_string().await.unwrap_or_default();
+        assert!(
+            body.contains(error_type),
+            "expected a {} error, got: {}",
+            error_type,
+            body
+        );
+    }
+
+    /// Every audit log entry of `server_id`, newest first.
+    async fn audit_entries(harness: &TestHarness, server_id: &str) -> Vec<AuditLogEntry> {
+        harness
+            .db
+            .fetch_audit_log(server_id, None, 50, None, None)
+            .await
+            .expect("audit log read")
+    }
+
+    /// A role with explicit rank and permissions. `Role::create` derives the
+    /// rank from the (stale) server passed in, so it is set here instead.
+    async fn ranked_role(harness: &TestHarness, server: &Server, rank: i64, allow: i64) -> Role {
+        let mut role = harness
+            .new_role(server, rank, Some(OverrideField { a: allow, d: 0 }))
+            .await;
+        role.update(
+            &harness.db,
+            &server.id,
+            PartialRole {
+                rank: Some(rank),
+                ..Default::default()
+            },
+            Vec::new(),
+        )
+        .await
+        .expect("role rank");
+        role
+    }
+
+    async fn member_with_role(harness: &TestHarness, server: &Server, user: &User, role: &Role) {
+        let (mut member, _) = Member::create(&harness.db, server, user, None)
+            .await
+            .expect("member");
+        member
+            .update(
+                &harness.db,
+                PartialMember {
+                    roles: Some(vec![role.id.clone()]),
+                    ..Default::default()
+                },
+                vec![],
+            )
+            .await
+            .expect("role");
     }
 
     // Compile-only without RabbitMQ and Redis: see the section note above.
@@ -260,10 +364,227 @@ mod test {
             (1, true, true, true),
             "a failed eviction tears nothing down"
         );
+        // The kick is durable, so it is in the audit log although the
+        // eviction after it failed. Mutation: the record moved below the
+        // eviction.
+        let entries = audit_entries(&harness, &server.id).await;
+        assert_eq!(
+            entries.len(),
+            1,
+            "the durable kick is recorded: {:?}",
+            entries
+        );
+        assert_eq!(entries[0].action, AuditLogAction::MemberKick);
+        assert_eq!(entries[0].target.as_deref(), Some(user_b.id.as_str()));
 
         delete_channel_voice_state(&uvc, &[user_b.id.clone()])
             .await
             .expect("cleanup");
+    }
+
+    // ---- the audit log entry ----------------------------------------------
+
+    // Compile-only without RabbitMQ and Redis: see the section note above.
+    #[test]
+    fn a_kick_records_one_member_kick_with_the_header_reason() {
+        crate::util::test::rt()
+            .block_on(a_kick_records_one_member_kick_with_the_header_reason_case())
+    }
+
+    /// A kick writes exactly one `member_kick` entry: the kicker as actor,
+    /// the kicked user as target, no channel or changes, and the reason
+    /// percent-decoded from the header.
+    async fn a_kick_records_one_member_kick_with_the_header_reason_case() {
+        let harness = TestHarness::new().await;
+        let (_a, session_a, user_a) = harness.new_user().await; // owner
+        let (_b, _session_b, user_b) = harness.new_user().await; // target
+        let (server, _channels) = harness.new_server(&user_a).await;
+        Member::create(&harness.db, &server, &user_b, None)
+            .await
+            .expect("member");
+
+        let response = kick_with_reason(
+            &harness,
+            &session_a.token,
+            &server.id,
+            &user_b.id,
+            "kick%20reason",
+        )
+        .await;
+        assert_eq!(response.status(), Status::NoContent, "the kick succeeds");
+        assert!(harness
+            .db
+            .fetch_member(&server.id, &user_b.id)
+            .await
+            .is_err());
+
+        let entries = audit_entries(&harness, &server.id).await;
+        assert_eq!(entries.len(), 1, "exactly one entry: {:?}", entries);
+        let entry = &entries[0];
+        assert_eq!(entry.server, server.id);
+        assert_eq!(entry.action, AuditLogAction::MemberKick);
+        assert_eq!(entry.actor.as_deref(), Some(user_a.id.as_str()));
+        assert_eq!(entry.target.as_deref(), Some(user_b.id.as_str()));
+        assert_eq!(entry.channel, None);
+        assert!(entry.changes.is_empty(), "{:?}", entry.changes);
+        assert_eq!(entry.count, None);
+        assert_eq!(entry.reason.as_deref(), Some("kick reason"));
+    }
+
+    // Compile-only without RabbitMQ and Redis: see the section note above.
+    #[test]
+    fn a_too_long_reason_refuses_the_kick() {
+        crate::util::test::rt().block_on(a_too_long_reason_refuses_the_kick_case())
+    }
+
+    /// A 513-character reason is refused with AuditLogReasonTooLong before
+    /// anything happens: the target is still a member and nothing is
+    /// recorded. Mutation: the validation moved below the removal.
+    async fn a_too_long_reason_refuses_the_kick_case() {
+        let harness = TestHarness::new().await;
+        let (_a, session_a, user_a) = harness.new_user().await; // owner
+        let (_b, _session_b, user_b) = harness.new_user().await; // target
+        let (server, _channels) = harness.new_server(&user_a).await;
+        Member::create(&harness.db, &server, &user_b, None)
+            .await
+            .expect("member");
+
+        let response = kick_with_reason(
+            &harness,
+            &session_a.token,
+            &server.id,
+            &user_b.id,
+            &"a".repeat(513),
+        )
+        .await;
+        assert_rejected(response, Status::BadRequest, "AuditLogReasonTooLong").await;
+
+        assert!(
+            harness
+                .db
+                .fetch_member(&server.id, &user_b.id)
+                .await
+                .is_ok(),
+            "a refused kick must leave the target a member"
+        );
+        assert!(audit_entries(&harness, &server.id).await.is_empty());
+    }
+
+    // Compile-only without RabbitMQ and Redis: see the section note above.
+    #[test]
+    fn kicking_the_owner_is_refused_and_records_nothing() {
+        crate::util::test::rt().block_on(kicking_the_owner_is_refused_and_records_nothing_case())
+    }
+
+    /// The owner guard: a moderator holding KickMembers cannot kick the
+    /// owner, and the refusal records nothing.
+    async fn kicking_the_owner_is_refused_and_records_nothing_case() {
+        let harness = TestHarness::new().await;
+        let (_a, _session_a, user_a) = harness.new_user().await; // owner
+        let (_m, session_m, user_m) = harness.new_user().await; // moderator
+        let (server, _channels) = harness.new_server(&user_a).await;
+        let role = ranked_role(&harness, &server, 1, ChannelPermission::KickMembers as i64).await;
+        member_with_role(&harness, &server, &user_m, &role).await;
+
+        // `new_server` does not create the owner's member row (the create
+        // route does that separately), so compare membership before and after
+        // rather than assuming the owner is a member.
+        let owner_was_member = harness
+            .db
+            .fetch_member(&server.id, &user_a.id)
+            .await
+            .is_ok();
+
+        let response =
+            kick_with_reason(&harness, &session_m.token, &server.id, &user_a.id, "owner").await;
+        assert_rejected(response, Status::BadRequest, "InvalidOperation").await;
+
+        assert_eq!(
+            harness
+                .db
+                .fetch_member(&server.id, &user_a.id)
+                .await
+                .is_ok(),
+            owner_was_member,
+            "a refused owner kick must not change the owner's membership"
+        );
+        assert_eq!(
+            harness
+                .db
+                .fetch_server(&server.id)
+                .await
+                .expect("server")
+                .owner,
+            user_a.id,
+            "the owner is unchanged"
+        );
+        assert!(audit_entries(&harness, &server.id).await.is_empty());
+    }
+
+    // Compile-only without RabbitMQ and Redis: see the section note above.
+    #[test]
+    fn a_kicker_not_above_the_target_is_refused_and_records_nothing() {
+        crate::util::test::rt()
+            .block_on(a_kicker_not_above_the_target_is_refused_and_records_nothing_case())
+    }
+
+    /// A moderator holding KickMembers whose role ranks below the target's
+    /// (a larger rank number) is refused with NotElevated: the target is
+    /// still a member and nothing is recorded.
+    async fn a_kicker_not_above_the_target_is_refused_and_records_nothing_case() {
+        let harness = TestHarness::new().await;
+        let (_a, _session_a, user_a) = harness.new_user().await; // owner
+        let (_m, session_m, user_m) = harness.new_user().await; // moderator
+        let (_b, _session_b, user_b) = harness.new_user().await; // target
+        let (server, _channels) = harness.new_server(&user_a).await;
+        let moderator =
+            ranked_role(&harness, &server, 5, ChannelPermission::KickMembers as i64).await;
+        let senior = ranked_role(&harness, &server, 1, 0).await;
+        member_with_role(&harness, &server, &user_m, &moderator).await;
+        member_with_role(&harness, &server, &user_b, &senior).await;
+
+        let response =
+            kick_with_reason(&harness, &session_m.token, &server.id, &user_b.id, "rank").await;
+        assert_rejected(response, Status::Forbidden, "NotElevated").await;
+
+        assert!(
+            harness
+                .db
+                .fetch_member(&server.id, &user_b.id)
+                .await
+                .is_ok(),
+            "a refused kick must leave the target a member"
+        );
+        assert!(audit_entries(&harness, &server.id).await.is_empty());
+    }
+
+    // Compile-only without RabbitMQ and Redis: see the section note above.
+    #[test]
+    fn a_self_kick_is_refused_and_records_nothing() {
+        crate::util::test::rt().block_on(a_self_kick_is_refused_and_records_nothing_case())
+    }
+
+    /// Kicking yourself is refused before anything happens, so there is
+    /// never a self-targeted entry.
+    async fn a_self_kick_is_refused_and_records_nothing_case() {
+        let harness = TestHarness::new().await;
+        let (_a, _session_a, user_a) = harness.new_user().await; // owner
+        let (_b, session_b, user_b) = harness.new_user().await; // member
+        let (server, _channels) = harness.new_server(&user_a).await;
+        Member::create(&harness.db, &server, &user_b, None)
+            .await
+            .expect("member");
+
+        let response =
+            kick_with_reason(&harness, &session_b.token, &server.id, &user_b.id, "self").await;
+        assert_rejected(response, Status::BadRequest, "CannotRemoveYourself").await;
+
+        assert!(harness
+            .db
+            .fetch_member(&server.id, &user_b.id)
+            .await
+            .is_ok());
+        assert!(audit_entries(&harness, &server.id).await.is_empty());
     }
 
     // ---- the kick's order, pinned on its text (AFK S-3 D-2) ----------------
@@ -334,5 +655,37 @@ mod test {
                 body
             );
         }
+    }
+
+    /// The reason is validated before the rank check and the removal, and
+    /// the `member_kick` entry is recorded after the removal and before the
+    /// eviction, each once. Mutations: the validation moved below the
+    /// removal; the record moved above the removal or below the eviction.
+    #[test]
+    fn the_kick_validates_the_reason_first_and_records_before_the_eviction() {
+        const VALIDATE: &str = "let reason = reason.validated()?;";
+        const RANK: &str = "return Err(create_error!(NotElevated));";
+        const REMOVE: &str = ".remove(db, &server, RemovalIntention::Kick, false) .await?;";
+        const RECORD: &str = "AuditLogEntry::record(";
+        const EVICT: &str =
+            "remove_user_from_server_voice(db, voice_client, &server, member_id.id).await?;";
+
+        let body = route_body();
+        let mut last = 0;
+        for needle in [VALIDATE, RANK, REMOVE, RECORD, EVICT] {
+            assert_eq!(
+                body.matches(needle).count(),
+                1,
+                "the kick must carry `{needle}` exactly once: {body}"
+            );
+            let at = body.find(needle).expect("counted above");
+            assert!(last < at, "`{}` is out of order: {}", needle, body);
+            last = at;
+        }
+        assert!(
+            body.contains("action: AuditLogAction::MemberKick,"),
+            "the kick records a member_kick: {}",
+            body
+        );
     }
 }

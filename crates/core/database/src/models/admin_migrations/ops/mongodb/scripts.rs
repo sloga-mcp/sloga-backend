@@ -26,7 +26,7 @@ struct MigrationInfo {
     revision: i32,
 }
 
-pub const LATEST_REVISION: i32 = 73; // MUST BE +1 to last migration
+pub const LATEST_REVISION: i32 = 74; // MUST BE +1 to last migration
 
 pub async fn migrate_database(db: &MongoDb) {
     let migrations = db.col::<Document>("migrations");
@@ -2703,6 +2703,158 @@ pub async fn run_migrations(db: &MongoDb, revision: i32) -> i32 {
         info!("AFK backfill: designated {designated} server(s).");
     }
 
+    if revision <= 73 {
+        info!("Running migration [revision 73 / 06-10-2026]: Create server_audit_log collection, grant ViewAuditLog to roles that allow ManageServer");
+
+        // Nothing in this block may panic: delta unwraps the migration at
+        // boot, so a panic here crash-loops it. Every failure is logged and
+        // skipped instead. A skipped grant fails closed: the owner still sees
+        // the audit log, and an admin can grant the permission by hand.
+
+        // Same idempotency contract as prior collection migrations;
+        // mirrors init.rs. The index specs here MUST stay identical there.
+        db.db().create_collection("server_audit_log").await.ok();
+
+        if let Err(error) = db
+            .db()
+            .run_command(doc! {
+                "createIndexes": "server_audit_log",
+                "indexes": [
+                    // Serves the newest-first page of one server's log.
+                    {
+                        "key": {
+                            "server": 1_i32,
+                            "_id": -1_i32
+                        },
+                        "name": "server_id_desc"
+                    },
+                    // Serves the `user` (actor) filter.
+                    {
+                        "key": {
+                            "server": 1_i32,
+                            "actor": 1_i32,
+                            "_id": -1_i32
+                        },
+                        "name": "server_actor_id_desc"
+                    },
+                    // Serves the `action` filter.
+                    {
+                        "key": {
+                            "server": 1_i32,
+                            "action": 1_i32,
+                            "_id": -1_i32
+                        },
+                        "name": "server_action_id_desc"
+                    }
+                ]
+            })
+            .await
+        {
+            error!("Failed to create server_audit_log indexes: {error}");
+        }
+
+        // ViewAuditLog (bit 14) is new, and no default carries it. Every
+        // role that may already ManageServer gets it, so whoever manages a
+        // server today can read its log; `view_audit_log_backfill_plan`
+        // holds the rule. Bit 14 was reserved and unused until now, so any
+        // value already carrying it got it by accident (an "every bit"
+        // value). Those are counted first, read-only, and left alone.
+        let servers = db.col::<Document>("servers");
+
+        match servers
+            .count_documents(doc! {
+                "default_permissions": { "$bitsAllSet": VIEW_AUDIT_LOG_BIT }
+            })
+            .await
+        {
+            Ok(count) => info!("ViewAuditLog backfill: {count} server(s) already carried bit 14 in default_permissions."),
+            Err(error) => warn!("ViewAuditLog backfill: could not count default_permissions already carrying bit 14: {error}"),
+        }
+
+        // The filter skips servers with no roles at all (the field is
+        // omitted when empty). A `roles` that is present but not a document
+        // still matches and is logged below.
+        match servers
+            .find(doc! { "roles": { "$exists": true, "$ne": {} } })
+            .with_options(
+                FindOptions::builder()
+                    .projection(doc! { "roles": 1_i32 })
+                    .build(),
+            )
+            .await
+        {
+            Err(error) => {
+                error!("ViewAuditLog backfill: could not read servers, nothing granted: {error}")
+            }
+            Ok(mut cursor) => {
+                let mut already_granted = 0_u64;
+                let mut granted = 0_u64;
+                let mut updated = 0_u64;
+
+                while let Some(result) = cursor.next().await {
+                    // A cursor error ends the scan: the servers it did not
+                    // reach keep their roles as they are.
+                    let document = match result {
+                        Ok(document) => document,
+                        Err(error) => {
+                            error!("ViewAuditLog backfill: server scan failed, the rest are skipped: {error}");
+                            break;
+                        }
+                    };
+
+                    let Ok(server_id) = document.get_str("_id").map(str::to_string) else {
+                        warn!("ViewAuditLog backfill: skipping a server without a string _id");
+                        continue;
+                    };
+
+                    let Ok(roles) = document.get_document("roles") else {
+                        warn!("ViewAuditLog backfill: skipping server {server_id}, its roles are not a document");
+                        continue;
+                    };
+
+                    let plan = view_audit_log_backfill_plan(roles);
+                    already_granted += plan.already_granted;
+                    for (role_id, reason) in &plan.skipped {
+                        warn!("ViewAuditLog backfill: skipping role {role_id} of server {server_id}: {reason}");
+                    }
+
+                    if plan.targets.is_empty() {
+                        continue;
+                    }
+
+                    // The filter re-checks, at write time, that every target
+                    // still allows ManageServer and does not deny it. That
+                    // also requires its `a` to exist: `$bit` on a missing
+                    // field creates it, which would turn a role deleted since
+                    // the read into a nameless stub that no longer decodes.
+                    // `$not` matches a missing `d`, which denies nothing. If
+                    // any target no longer qualifies, nothing is written.
+                    let mut filter = doc! { "_id": &server_id };
+                    let mut bits = Document::new();
+                    for (role_id, operand) in &plan.targets {
+                        let allow = format!("roles.{role_id}.permissions.a");
+                        let deny = format!("roles.{role_id}.permissions.d");
+                        filter.insert(allow.clone(), doc! { "$bitsAllSet": MANAGE_SERVER_BIT });
+                        filter.insert(deny, doc! { "$not": { "$bitsAnySet": MANAGE_SERVER_BIT } });
+                        bits.insert(allow, doc! { "or": operand.clone() });
+                    }
+
+                    match servers.update_one(filter, doc! { "$bit": bits }).await {
+                        Ok(outcome) if outcome.matched_count == 1 => {
+                            updated += 1;
+                            granted += plan.targets.len() as u64;
+                        }
+                        Ok(_) => warn!("ViewAuditLog backfill: skipping server {server_id}, it changed during the backfill"),
+                        Err(error) => warn!("ViewAuditLog backfill: skipping server {server_id}, the update failed: {error}"),
+                    }
+                }
+
+                info!("ViewAuditLog backfill: {already_granted} role(s) already carried bit 14.");
+                info!("ViewAuditLog backfill: granted ViewAuditLog to {granted} role(s) across {updated} server(s).");
+            }
+        }
+    }
+
     // Reminder to update LATEST_REVISION when adding new migrations.
     LATEST_REVISION.max(revision)
 }
@@ -2752,6 +2904,100 @@ fn afk_backfill_designation(
     }
 
     Some(only.id().to_string())
+}
+
+/// `ChannelPermission::ManageServer` as revision 73 reads it. Literal, so a
+/// later renumbering cannot change what this migration did; a unit test pins
+/// it to the enum as it stands.
+const MANAGE_SERVER_BIT: i64 = 1 << 1;
+
+/// `ChannelPermission::ViewAuditLog` as revision 73 grants it, in both stored
+/// integer widths (see `view_audit_log_backfill_plan`).
+const VIEW_AUDIT_LOG_BIT: i64 = 1 << 14;
+const VIEW_AUDIT_LOG_BIT_I32: i32 = 1 << 14;
+
+/// What revision 73 does to one server's `roles` document.
+#[derive(Debug, Default, PartialEq)]
+struct ViewAuditLogBackfill {
+    /// `(role id, operand)` pairs to `$bit or` into
+    /// `roles.<id>.permissions.a`. The operand has the stored integer type of
+    /// that `a`, so the update keeps the field's type.
+    targets: Vec<(String, Bson)>,
+    /// Roles whose `a` already carries ViewAuditLog. Nothing to do; counted
+    /// for the log.
+    already_granted: u64,
+    /// `(role id, reason)` for roles whose shape could not be read.
+    skipped: Vec<(String, &'static str)>,
+}
+
+/// Revision 73 (the ViewAuditLog backfill): which of a server's roles gain
+/// ViewAuditLog. Pure, so every case is unit-tested without a database.
+///
+/// A role is a target when it effectively grants ManageServer and does not
+/// yet allow ViewAuditLog: its ALLOW bits (`permissions.a`) include
+/// ManageServer and its DENY bits (`permissions.d`) do not.
+/// `PermissionValue::apply` revokes deny after allow, so a role that both
+/// allows and denies ManageServer does not grant it and is not a target.
+///
+/// `a` and `d` are read as Int32 or Int64; a missing `d` denies nothing.
+/// Any other shape (a role that is not a document, no `permissions`
+/// document, `a` missing or of another type, `d` of another type, or a
+/// role id that is not a plain key) is skipped with a reason and never
+/// panics: a panic here crash-loops delta at boot.
+fn view_audit_log_backfill_plan(roles: &Document) -> ViewAuditLogBackfill {
+    let mut plan = ViewAuditLogBackfill::default();
+
+    for (role_id, role) in roles {
+        // The id becomes part of a dotted update path.
+        if role_id.is_empty() || role_id.contains('.') || role_id.starts_with('$') {
+            plan.skipped
+                .push((role_id.clone(), "the role id is not a plain key"));
+            continue;
+        }
+
+        let Bson::Document(role) = role else {
+            plan.skipped
+                .push((role_id.clone(), "the role is not a document"));
+            continue;
+        };
+
+        let Some(Bson::Document(permissions)) = role.get("permissions") else {
+            plan.skipped
+                .push((role_id.clone(), "permissions is missing or not a document"));
+            continue;
+        };
+
+        let (allow, operand) = match permissions.get("a") {
+            Some(Bson::Int64(allow)) => (*allow, Bson::Int64(VIEW_AUDIT_LOG_BIT)),
+            Some(Bson::Int32(allow)) => (i64::from(*allow), Bson::Int32(VIEW_AUDIT_LOG_BIT_I32)),
+            _ => {
+                plan.skipped.push((
+                    role_id.clone(),
+                    "permissions.a is missing or not an Int32 or Int64",
+                ));
+                continue;
+            }
+        };
+
+        let deny = match permissions.get("d") {
+            None => 0,
+            Some(Bson::Int64(deny)) => *deny,
+            Some(Bson::Int32(deny)) => i64::from(*deny),
+            Some(_) => {
+                plan.skipped
+                    .push((role_id.clone(), "permissions.d is not an Int32 or Int64"));
+                continue;
+            }
+        };
+
+        if allow & VIEW_AUDIT_LOG_BIT != 0 {
+            plan.already_granted += 1;
+        } else if allow & MANAGE_SERVER_BIT != 0 && deny & MANAGE_SERVER_BIT == 0 {
+            plan.targets.push((role_id.clone(), operand));
+        }
+    }
+
+    plan
 }
 
 #[cfg(test)]
@@ -2990,12 +3236,18 @@ mod afk_backfill_tests {
     }
 
     #[test]
-    fn latest_revision_is_73() {
-        assert_eq!(LATEST_REVISION, 73, "the AFK backfill is revision 72");
+    fn latest_revision_is_74() {
+        assert_eq!(
+            LATEST_REVISION, 74,
+            "the AFK backfill is revision 72, the ViewAuditLog backfill 73"
+        );
     }
 
+    /// The AFK backfill was the last migration when it landed; revision 73
+    /// (the ViewAuditLog backfill) now is. Both guards are pinned to exactly
+    /// one block each, and the last one to `LATEST_REVISION - 1`.
     #[test]
-    fn backfill_is_the_last_migration_and_guarded_by_revision_72() {
+    fn backfill_is_guarded_by_revision_72_and_revision_73_is_the_last_migration() {
         let guards: Vec<i32> = shipping()
             .match_indices("if revision <= ")
             .map(|(at, needle)| {
@@ -3012,6 +3264,11 @@ mod afk_backfill_tests {
             "exactly one `if revision <= 72` block"
         );
         assert_eq!(
+            guards.iter().filter(|guard| **guard == 73).count(),
+            1,
+            "exactly one `if revision <= 73` block"
+        );
+        assert_eq!(
             guards.iter().max(),
             Some(&(LATEST_REVISION - 1)),
             "LATEST_REVISION MUST BE +1 to the last migration"
@@ -3026,9 +3283,11 @@ mod afk_backfill_tests {
     /// a TOP-LEVEL statement of `run_migrations`, a sibling of the 70 and 71
     /// blocks, never inside one of them. Nested inside the 71 block, a
     /// database already at 72 would skip the backfill forever, and every
-    /// other pin in this module would still pass.
+    /// other pin in this module would still pass. The revision-73 guard
+    /// carries the same trap one block later, so it is pinned the same way
+    /// against the 72 block.
     #[test]
-    fn revision_72_guard_is_a_top_level_sibling_of_the_71_block() {
+    fn revision_72_and_73_guards_are_top_level_siblings_of_the_previous_block() {
         let depth_at = |at: usize| -> i64 {
             shipping()[..at]
                 .chars()
@@ -3048,7 +3307,7 @@ mod afk_backfill_tests {
             );
             shipping().find(&needle).expect("the guard")
         };
-        let (at_70, at_71, at_72) = (guard(70), guard(71), guard(72));
+        let (at_70, at_71, at_72, at_73) = (guard(70), guard(71), guard(72), guard(73));
 
         let open_71 = at_71 + format!("if revision <= 71 {OPEN}").len() - 1;
         let block_71 = braced(shipping(), open_71);
@@ -3061,15 +3320,31 @@ mod afk_backfill_tests {
             "the revision 72 guard must come after the 71 block closes"
         );
 
+        let open_72 = at_72 + format!("if revision <= 72 {OPEN}").len() - 1;
+        let block_72 = braced(shipping(), open_72);
+        assert!(
+            !block_72.contains("if revision <= 73"),
+            "the revision 73 guard must not be nested inside the 72 block"
+        );
+        assert!(
+            at_73 > open_72 + block_72.len(),
+            "the revision 73 guard must come after the 72 block closes"
+        );
+
         let body = shipping()
             .find("pub async fn run_migrations(")
             .expect("run_migrations");
         let body_open = body + shipping()[body..].find(OPEN).expect("its body");
         let top_level = depth_at(body_open) + 1;
         assert_eq!(
-            (depth_at(at_70), depth_at(at_71), depth_at(at_72)),
-            (top_level, top_level, top_level),
-            "the 70, 71 and 72 guards must all sit at the top level of run_migrations"
+            (
+                depth_at(at_70),
+                depth_at(at_71),
+                depth_at(at_72),
+                depth_at(at_73)
+            ),
+            (top_level, top_level, top_level, top_level),
+            "the 70, 71, 72 and 73 guards must all sit at the top level of run_migrations"
         );
     }
 
@@ -3124,9 +3399,297 @@ mod afk_backfill_tests {
 }
 
 #[cfg(test)]
+mod view_audit_log_backfill_tests {
+    use super::*;
+    use crate::mongodb::bson::{doc, Bson, Document};
+
+    const SOURCE: &str = include_str!("scripts.rs");
+    const OPEN: char = '\u{7b}';
+    const CLOSE: char = '\u{7d}';
+
+    /// Everything above the first test module: the shipping source.
+    fn shipping() -> &'static str {
+        let end = SOURCE
+            .find("#[cfg(test)]")
+            .expect("the test module attribute");
+        &SOURCE[..end]
+    }
+
+    /// The revision 73 block of `run_migrations`, brace to brace.
+    fn backfill_block() -> &'static str {
+        let needle = format!("if revision <= 73 {OPEN}");
+        let at = shipping()
+            .find(&needle)
+            .expect("the revision 73 migration block");
+        let open = at + needle.len() - 1;
+        let mut depth = 0i64;
+        for (i, ch) in shipping()[open..].char_indices() {
+            if ch == OPEN {
+                depth += 1;
+            } else if ch == CLOSE {
+                depth -= 1;
+                if depth == 0 {
+                    return &shipping()[open..=open + i];
+                }
+            }
+        }
+        panic!("unbalanced braces in the revision 73 block");
+    }
+
+    fn role(a: Bson) -> Bson {
+        Bson::Document(doc! {
+            "_id": "R",
+            "name": "Role",
+            "permissions": { "a": a, "d": 0_i64 },
+            "rank": 0_i64
+        })
+    }
+
+    fn target_ids(plan: &ViewAuditLogBackfill) -> Vec<&str> {
+        plan.targets.iter().map(|(id, _)| id.as_str()).collect()
+    }
+
+    #[test]
+    fn the_literal_bits_match_the_permission_enum() {
+        assert_eq!(MANAGE_SERVER_BIT, ChannelPermission::ManageServer as i64);
+        assert_eq!(VIEW_AUDIT_LOG_BIT, ChannelPermission::ViewAuditLog as i64);
+        assert_eq!(i64::from(VIEW_AUDIT_LOG_BIT_I32), VIEW_AUDIT_LOG_BIT);
+    }
+
+    #[test]
+    fn int64_manage_server_is_a_target_with_an_int64_operand() {
+        let roles = doc! { "A": role(Bson::Int64(MANAGE_SERVER_BIT | 1)) };
+        let plan = view_audit_log_backfill_plan(&roles);
+        assert_eq!(
+            plan.targets,
+            vec![("A".to_string(), Bson::Int64(VIEW_AUDIT_LOG_BIT))]
+        );
+        assert_eq!(plan.already_granted, 0);
+        assert!(plan.skipped.is_empty());
+    }
+
+    #[test]
+    fn int32_manage_server_is_a_target_with_an_int32_operand() {
+        let roles = doc! { "A": role(Bson::Int32(2 | 4)) };
+        let plan = view_audit_log_backfill_plan(&roles);
+        assert_eq!(
+            plan.targets,
+            vec![("A".to_string(), Bson::Int32(VIEW_AUDIT_LOG_BIT_I32))]
+        );
+        assert!(plan.skipped.is_empty());
+    }
+
+    #[test]
+    fn a_role_without_manage_server_is_not_a_target() {
+        let roles = doc! {
+            "A": role(Bson::Int64(1 | 4 | (1 << 20))),
+            "B": role(Bson::Int32(0)),
+        };
+        let plan = view_audit_log_backfill_plan(&roles);
+        assert_eq!(plan, ViewAuditLogBackfill::default());
+    }
+
+    #[test]
+    fn a_role_that_already_has_view_audit_log_is_counted_not_targeted() {
+        let roles = doc! {
+            "A": role(Bson::Int64(MANAGE_SERVER_BIT | VIEW_AUDIT_LOG_BIT)),
+            "B": role(Bson::Int32(VIEW_AUDIT_LOG_BIT_I32)),
+            "C": role(Bson::Int64(-1)),
+        };
+        let plan = view_audit_log_backfill_plan(&roles);
+        assert!(plan.targets.is_empty(), "{plan:?}");
+        assert_eq!(plan.already_granted, 3);
+        assert!(plan.skipped.is_empty());
+    }
+
+    #[test]
+    fn malformed_roles_are_skipped_and_the_rest_still_selected() {
+        let roles = doc! {
+            "string_a": role(Bson::String("2".to_string())),
+            "double_a": role(Bson::Double(2.0)),
+            "null_a": role(Bson::Null),
+            "no_a": { "name": "x", "permissions": { "d": 0_i64 } },
+            "no_permissions": { "name": "x" },
+            "permissions_not_a_document": { "name": "x", "permissions": 2_i64 },
+            "not_a_document": "oops",
+            "a.b": role(Bson::Int64(MANAGE_SERVER_BIT)),
+            "$x": role(Bson::Int64(MANAGE_SERVER_BIT)),
+            "": role(Bson::Int64(MANAGE_SERVER_BIT)),
+            "good": role(Bson::Int64(MANAGE_SERVER_BIT)),
+        };
+        let plan = view_audit_log_backfill_plan(&roles);
+        assert_eq!(target_ids(&plan), vec!["good"]);
+        assert_eq!(plan.already_granted, 0);
+        let mut skipped: Vec<&str> = plan.skipped.iter().map(|(id, _)| id.as_str()).collect();
+        skipped.sort_unstable();
+        assert_eq!(
+            skipped,
+            vec![
+                "",
+                "$x",
+                "a.b",
+                "double_a",
+                "no_a",
+                "no_permissions",
+                "not_a_document",
+                "null_a",
+                "permissions_not_a_document",
+                "string_a",
+            ]
+        );
+    }
+
+    fn role_with_deny(a: Bson, d: Bson) -> Bson {
+        Bson::Document(doc! {
+            "_id": "R",
+            "name": "Role",
+            "permissions": { "a": a, "d": d },
+            "rank": 0_i64
+        })
+    }
+
+    #[test]
+    fn allowing_and_denying_manage_server_is_not_a_target() {
+        let roles = doc! {
+            "A": role_with_deny(Bson::Int64(MANAGE_SERVER_BIT), Bson::Int64(MANAGE_SERVER_BIT)),
+            "B": role_with_deny(Bson::Int32(2 | 4), Bson::Int32(2)),
+            "C": role_with_deny(Bson::Int64(MANAGE_SERVER_BIT), Bson::Int32(2 | 8)),
+        };
+        let plan = view_audit_log_backfill_plan(&roles);
+        assert_eq!(plan, ViewAuditLogBackfill::default());
+    }
+
+    #[test]
+    fn denying_manage_server_alone_is_not_a_target() {
+        let roles = doc! {
+            "A": role_with_deny(Bson::Int64(1), Bson::Int64(MANAGE_SERVER_BIT)),
+            "B": role_with_deny(Bson::Int32(0), Bson::Int32(2)),
+        };
+        let plan = view_audit_log_backfill_plan(&roles);
+        assert_eq!(plan, ViewAuditLogBackfill::default());
+    }
+
+    #[test]
+    fn a_deny_of_other_bits_or_no_deny_still_targets() {
+        let roles = doc! {
+            "other_bits": role_with_deny(Bson::Int64(MANAGE_SERVER_BIT), Bson::Int64(1 | 4)),
+            "int32_zero": role_with_deny(Bson::Int64(MANAGE_SERVER_BIT), Bson::Int32(0)),
+            "no_d": { "name": "x", "permissions": { "a": MANAGE_SERVER_BIT } },
+        };
+        let plan = view_audit_log_backfill_plan(&roles);
+        assert_eq!(target_ids(&plan), vec!["other_bits", "int32_zero", "no_d"]);
+        assert!(plan.skipped.is_empty());
+    }
+
+    #[test]
+    fn a_malformed_deny_is_skipped() {
+        let roles = doc! {
+            "string_d": role_with_deny(Bson::Int64(MANAGE_SERVER_BIT), Bson::String("0".to_string())),
+            "double_d": role_with_deny(Bson::Int64(MANAGE_SERVER_BIT), Bson::Double(0.0)),
+            "null_d": role_with_deny(Bson::Int64(MANAGE_SERVER_BIT), Bson::Null),
+            "good": role(Bson::Int64(MANAGE_SERVER_BIT)),
+        };
+        let plan = view_audit_log_backfill_plan(&roles);
+        assert_eq!(target_ids(&plan), vec!["good"]);
+        let skipped: Vec<&str> = plan.skipped.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(skipped, vec!["string_d", "double_d", "null_d"]);
+    }
+
+    #[test]
+    fn an_empty_roles_document_plans_nothing() {
+        assert_eq!(
+            view_audit_log_backfill_plan(&Document::new()),
+            ViewAuditLogBackfill::default()
+        );
+    }
+
+    #[test]
+    fn several_targets_in_one_server_are_all_selected() {
+        let roles = doc! {
+            "A": role(Bson::Int64(MANAGE_SERVER_BIT)),
+            "B": role(Bson::Int64(1)),
+            "C": role(Bson::Int32(2)),
+        };
+        let plan = view_audit_log_backfill_plan(&roles);
+        assert_eq!(
+            plan.targets,
+            vec![
+                ("A".to_string(), Bson::Int64(VIEW_AUDIT_LOG_BIT)),
+                ("C".to_string(), Bson::Int32(VIEW_AUDIT_LOG_BIT_I32)),
+            ]
+        );
+    }
+
+    /// Audit M6: delta unwraps the migration at boot, so a panic in this
+    /// block crash-loops it.
+    #[test]
+    fn the_backfill_never_panics() {
+        for needle in [".expect(", ".unwrap(", "panic!", "unreachable!", "todo!"] {
+            assert!(
+                !backfill_block().contains(needle),
+                "the revision 73 block must not panic; found {needle}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_backfill_selects_through_the_pure_fn_and_only_ors_bits() {
+        let block = backfill_block();
+        assert!(block.contains("view_audit_log_backfill_plan("));
+        assert!(block.contains("\"$bit\""));
+        for needle in [
+            "$set",
+            "$unset",
+            "delete_",
+            "drop",
+            "$pull",
+            "update_many",
+            "replace_one",
+        ] {
+            assert!(
+                !block.contains(needle),
+                "the backfill must only OR bits in; found {needle}"
+            );
+        }
+    }
+
+    /// The update filter re-checks each target at write time: ManageServer
+    /// still allowed (which also means `a` exists, so `$bit` never creates a
+    /// stub role for one deleted since the read) and not denied.
+    #[test]
+    fn the_update_rechecks_every_target_at_write_time() {
+        let block: String = backfill_block()
+            .chars()
+            .filter(|ch| !ch.is_whitespace())
+            .collect();
+        assert_eq!(
+            block.matches(".update_one(").count(),
+            1,
+            "one write per server"
+        );
+        assert!(
+            block.contains(&format!(
+                "filter.insert(allow.clone(),doc!{OPEN}\"$bitsAllSet\":MANAGE_SERVER_BIT{CLOSE}"
+            )),
+            "the filter must require ManageServer to still be allowed"
+        );
+        assert!(
+            block.contains(&format!(
+                "filter.insert(deny,doc!{OPEN}\"$not\":{OPEN}\"$bitsAnySet\":MANAGE_SERVER_BIT{CLOSE}{CLOSE}"
+            )),
+            "the filter must require ManageServer not to be denied"
+        );
+        assert!(
+            !block.contains(&format!("doc!{OPEN}\"$exists\":true{CLOSE}")),
+            "the bit conditions replace the bare existence guard"
+        );
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use crate::{
-        mongodb::bson::{doc, Document},
+        mongodb::bson::{doc, Bson, Document},
         Database,
     };
     use revolt_permissions::ChannelPermission;
@@ -3191,6 +3754,183 @@ mod tests {
                 permissions("01KZ0000000000000000000000").await,
                 1,
                 "a server created after the soundboard shipped must be left alone"
+            );
+        }
+
+        db.drop_database().await;
+        guard.disarm();
+    }
+
+    /// Revision 73 must OR ViewAuditLog into exactly the roles that allow
+    /// ManageServer without denying it, keep the stored integer width of each `a`,
+    /// skip malformed roles and servers without panicking, leave everything
+    /// else byte-for-byte alone, and be a no-op when re-run.
+    #[tokio::test]
+    async fn revision_73_backfills_view_audit_log_onto_manage_server_roles() {
+        // Named by hand for the same 63-character reason as revision 70's.
+        let db = crate::DatabaseInfo::Test("migration_rev73_view_audit_log".to_string())
+            .connect()
+            .await
+            .expect("Database connection failed.");
+        db.drop_database().await;
+        let guard = crate::test_teardown::TestDatabaseGuard::arm(&db).await;
+
+        {
+            #[allow(irrefutable_let_patterns)]
+            let Database::MongoDb(mongo) = db.clone() else {
+                // The migration scripts are MongoDB-only.
+                db.drop_database().await;
+                guard.disarm();
+                return;
+            };
+
+            const MANAGE: i64 = ChannelPermission::ManageServer as i64;
+            const VIEW: i64 = ChannelPermission::ViewAuditLog as i64;
+
+            let role = |a: Bson| {
+                doc! {
+                    "name": "Role",
+                    "permissions": { "a": a, "d": 0_i64 },
+                    "rank": 0_i64
+                }
+            };
+
+            let seeded = vec![
+                // Int64 `a` (what serde writes): one ManageServer role, one
+                // without, one that already has the bit.
+                doc! {
+                    "_id": "S_INT64",
+                    "default_permissions": 1_i64,
+                    "roles": {
+                        "admin": role(Bson::Int64(MANAGE | 1)),
+                        "member": role(Bson::Int64(1)),
+                        "auditor": role(Bson::Int64(MANAGE | VIEW | 8)),
+                        // Allows and denies ManageServer: not effective.
+                        "denied": {
+                            "name": "Role",
+                            "permissions": { "a": MANAGE | 1, "d": MANAGE },
+                            "rank": 0_i64
+                        },
+                        // No `d` at all: denies nothing.
+                        "no_deny": { "name": "Role", "permissions": { "a": MANAGE } },
+                    }
+                },
+                // Int32 `a` (a hand-edited or legacy document).
+                doc! {
+                    "_id": "S_INT32",
+                    "default_permissions": 1_i64,
+                    "roles": {
+                        "admin": role(Bson::Int32(2 | 4)),
+                        "member": role(Bson::Int32(4)),
+                    }
+                },
+                // No roles field at all (omitted when empty).
+                doc! { "_id": "S_NO_ROLES", "default_permissions": VIEW | 1 },
+                // Malformed roles beside a well-formed one.
+                doc! {
+                    "_id": "S_MALFORMED",
+                    "default_permissions": 1_i64,
+                    "roles": {
+                        "string_a": role(Bson::String("2".to_string())),
+                        "double_a": role(Bson::Double(2.0)),
+                        "no_permissions": { "name": "x" },
+                        "not_a_document": "oops",
+                        "good": role(Bson::Int64(MANAGE)),
+                    }
+                },
+                // `roles` present but not a document.
+                doc! { "_id": "S_ROLES_NULL", "default_permissions": 1_i64, "roles": Bson::Null },
+                // Empty roles document.
+                doc! { "_id": "S_ROLES_EMPTY", "default_permissions": 1_i64, "roles": {} },
+            ];
+
+            let servers = mongo.col::<Document>("servers");
+            servers
+                .insert_many(seeded.clone())
+                .await
+                .expect("insert servers");
+
+            assert_eq!(super::run_migrations(&mongo, 73).await, 74);
+
+            let fetch = |id: String| {
+                let servers = servers.clone();
+                async move {
+                    servers
+                        .find_one(doc! { "_id": id })
+                        .await
+                        .expect("find")
+                        .expect("server")
+                }
+            };
+
+            let mut expected = seeded.clone();
+            // S_INT64.admin gains the bit as Int64.
+            expected[0]
+                .get_document_mut("roles")
+                .expect("roles")
+                .insert("admin", role(Bson::Int64(MANAGE | 1 | VIEW)));
+            // S_INT64.no_deny gains it too; S_INT64.denied is untouched.
+            expected[0]
+                .get_document_mut("roles")
+                .expect("roles")
+                .insert(
+                    "no_deny",
+                    doc! { "name": "Role", "permissions": { "a": MANAGE | VIEW } },
+                );
+            // S_INT32.admin gains the bit and stays Int32.
+            expected[1]
+                .get_document_mut("roles")
+                .expect("roles")
+                .insert("admin", role(Bson::Int32(2 | 4 | VIEW as i32)));
+            // S_MALFORMED.good gains it; the malformed roles are untouched.
+            expected[3]
+                .get_document_mut("roles")
+                .expect("roles")
+                .insert("good", role(Bson::Int64(MANAGE | VIEW)));
+
+            for want in &expected {
+                let id = want.get_str("_id").expect("_id");
+                let got = fetch(id.to_string()).await;
+                assert_eq!(&got, want, "server {id} after revision 73");
+            }
+
+            // The stored width of the Int32 role is kept, not widened.
+            let int32 = fetch("S_INT32".to_string()).await;
+            assert_eq!(
+                int32
+                    .get_document("roles")
+                    .and_then(|roles| roles.get_document("admin"))
+                    .and_then(|admin| admin.get_document("permissions"))
+                    .and_then(|permissions| permissions.get_i32("a"))
+                    .expect("an Int32 a"),
+                2 | 4 | VIEW as i32
+            );
+
+            // Re-running is a no-op.
+            assert_eq!(super::run_migrations(&mongo, 73).await, 74);
+            for want in &expected {
+                let id = want.get_str("_id").expect("_id");
+                assert_eq!(
+                    &fetch(id.to_string()).await,
+                    want,
+                    "server {id} after a re-run"
+                );
+            }
+
+            let mut names = mongo
+                .col::<Document>("server_audit_log")
+                .list_index_names()
+                .await
+                .expect("list server_audit_log indexes");
+            names.sort_unstable();
+            assert_eq!(
+                names,
+                vec![
+                    "_id_",
+                    "server_action_id_desc",
+                    "server_actor_id_desc",
+                    "server_id_desc"
+                ]
             );
         }
 

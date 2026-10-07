@@ -226,6 +226,10 @@ pub async fn create_database(db: &MongoDb) {
         .await
         .expect("Failed to create donation_claim_codes collection.");
 
+    db.create_collection("server_audit_log")
+        .await
+        .expect("Failed to create server_audit_log collection.");
+
     db.run_command(doc! {
         "createIndexes": "users",
         "indexes": [
@@ -1254,6 +1258,42 @@ pub async fn create_database(db: &MongoDb) {
     })
     .await
     .expect("Failed to create remote_control_audit index.");
+
+    // Server audit log. Every spec below MUST stay identical to the copies in
+    // scripts.rs (revision 73).
+    db.run_command(doc! {
+        "createIndexes": "server_audit_log",
+        "indexes": [
+            // Serves the newest-first page of one server's log.
+            {
+                "key": {
+                    "server": 1_i32,
+                    "_id": -1_i32
+                },
+                "name": "server_id_desc"
+            },
+            // Serves the `user` (actor) filter.
+            {
+                "key": {
+                    "server": 1_i32,
+                    "actor": 1_i32,
+                    "_id": -1_i32
+                },
+                "name": "server_actor_id_desc"
+            },
+            // Serves the `action` filter.
+            {
+                "key": {
+                    "server": 1_i32,
+                    "action": 1_i32,
+                    "_id": -1_i32
+                },
+                "name": "server_action_id_desc"
+            }
+        ]
+    })
+    .await
+    .expect("Failed to create server_audit_log index.");
 
     info!("Created database.");
 }
