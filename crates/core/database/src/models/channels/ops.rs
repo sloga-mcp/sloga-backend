@@ -28,6 +28,11 @@ pub trait AbstractChannels: Sync + Send {
     /// Fetch all direct messages for a user
     async fn find_direct_messages(&self, user_id: &str) -> Result<Vec<Channel>>;
 
+    /// Fetch every DirectMessage channel whose `_id >= cutoff_id` (used by the daily anti-spam
+    /// scan). DM channel ids are ULIDs, so this is a range scan on the primary key; Groups and
+    /// Saved Messages are excluded.
+    async fn fetch_direct_messages_created_since(&self, cutoff_id: &str) -> Result<Vec<Channel>>;
+
     // Fetch all group dms for a user
     async fn find_group_message_channels(&self, user_id: &str) -> Result<ChunkedDatabaseGenerator<Channel>>;
 
@@ -361,6 +366,71 @@ mod tests {
                     .expect("an empty parent list is Ok, not an error")
                     .is_empty(),
                 "an empty parent list must return no ids"
+            );
+        });
+    }
+
+    #[tokio::test]
+    async fn direct_messages_created_since_only_returns_newer_dms() {
+        database_test!(|db| async move {
+            let old_ms = 1_600_000_000_000;
+            let cutoff_ms = 1_700_000_000_000;
+            let new_ms = 1_750_000_000_000;
+            let cutoff = Ulid::from_parts(cutoff_ms, 0).to_string();
+            let old_dm = Ulid::from_parts(old_ms, 1).to_string();
+            let new_dm = Ulid::from_parts(new_ms, 1).to_string();
+            let group = Ulid::from_parts(new_ms, 2).to_string();
+            let saved = Ulid::from_parts(new_ms, 3).to_string();
+            assert!(old_dm < cutoff && cutoff < new_dm);
+
+            for dm_id in [&old_dm, &new_dm, &cutoff] {
+                db.insert_channel(&Channel::DirectMessage {
+                    id: dm_id.clone(),
+                    active: true,
+                    recipients: vec!["01DMCSUSERA".to_string(), "01DMCSUSERB".to_string()],
+                    last_message_id: None,
+                })
+                .await
+                .unwrap();
+            }
+
+            db.insert_channel(&Channel::Group {
+                id: group.clone(),
+                name: "group".to_string(),
+                owner: "01DMCSUSERA".to_string(),
+                description: None,
+                recipients: vec!["01DMCSUSERA".to_string(), "01DMCSUSERB".to_string()],
+                icon: None,
+                last_message_id: None,
+                permissions: None,
+                nsfw: false,
+                spoiler: false,
+                voice: None,
+            })
+            .await
+            .unwrap();
+
+            db.insert_channel(&Channel::SavedMessages {
+                id: saved.clone(),
+                user: "01DMCSUSERA".to_string(),
+            })
+            .await
+            .unwrap();
+
+            let mut got: Vec<String> = db
+                .fetch_direct_messages_created_since(&cutoff)
+                .await
+                .expect("the DM scan must succeed")
+                .iter()
+                .map(|channel| channel.id().to_string())
+                .collect();
+            got.sort();
+
+            // The cutoff is inclusive; the older DM, the Group and Saved Messages are left out.
+            assert_eq!(
+                got,
+                vec![cutoff.clone(), new_dm.clone()],
+                "expected only the DMs at or after the cutoff"
             );
         });
     }

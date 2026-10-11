@@ -1,11 +1,13 @@
 use ::mongodb::options::{Collation, CollationStrength, FindOneOptions, FindOptions};
+use bson::{to_bson, to_raw_document_buf, Bson};
 use futures::StreamExt;
+use iso8601_timestamp::Timestamp;
 use revolt_result::Result;
 
 use crate::DocumentId;
 use crate::IntoDocumentPath;
 use crate::MongoDb;
-use crate::{FieldsUser, PartialUser, RelationshipStatus, User};
+use crate::{DmGuard, FieldsUser, PartialUser, RelationshipStatus, User};
 
 use super::AbstractUsers;
 
@@ -536,6 +538,122 @@ impl AbstractUsers for MongoDb {
                 }
             })
     }
+
+    /// Set a user's DM guard
+    async fn claim_dm_guard(
+        &self,
+        user_id: &str,
+        guard: &DmGuard,
+        rearm_before: Timestamp,
+    ) -> Result<bool> {
+        // Same encoding as a typed insert, so the stored guard looks the
+        // same whichever path wrote it
+        let guard = to_raw_document_buf(guard)
+            .ok()
+            .and_then(|raw| raw.to_document().ok())
+            .ok_or_else(|| create_database_error!("to_document", COL))?;
+
+        // `cleared_at` is Int64 milliseconds when written by a typed insert or
+        // the ops here, but an ISO string when written by `update_user`, and
+        // `$lt` never matches across BSON types, so compare against both
+        let rearm_iso =
+            to_bson(&rearm_before).map_err(|_| create_database_error!("to_bson", COL))?;
+
+        self.col::<User>(COL)
+            .update_one(
+                doc! {
+                    "_id": user_id,
+                    "$or": [
+                        { "dm_guard": null },
+                        { "dm_guard.cleared_at": { "$lt": timestamp_ms(&rearm_before) } },
+                        { "dm_guard.cleared_at": { "$lt": rearm_iso } }
+                    ]
+                },
+                doc! {
+                    "$set": {
+                        "dm_guard": guard
+                    }
+                },
+            )
+            .await
+            .map(|result| result.matched_count == 1)
+            .map_err(|_| create_database_error!("update_one", COL))
+    }
+
+    /// Lift the DM pause of the guard filed under `report_id`
+    async fn clear_dm_guard_pause(
+        &self,
+        user_id: &str,
+        report_id: &str,
+        at: Timestamp,
+    ) -> Result<bool> {
+        self.col::<User>(COL)
+            .update_one(
+                doc! {
+                    "_id": user_id,
+                    "dm_guard.report_id": report_id
+                },
+                doc! {
+                    "$set": {
+                        "dm_guard.paused": false,
+                        "dm_guard.cleared_at": timestamp_ms(&at)
+                    }
+                },
+            )
+            .await
+            .map(|result| result.matched_count == 1)
+            .map_err(|_| create_database_error!("update_one", COL))
+    }
+
+    /// Remove the DM guard filed under `report_id`
+    async fn release_dm_guard(&self, user_id: &str, report_id: &str) -> Result<bool> {
+        self.col::<User>(COL)
+            .update_one(
+                doc! {
+                    "_id": user_id,
+                    "dm_guard.report_id": report_id
+                },
+                doc! {
+                    "$unset": {
+                        "dm_guard": 1_i32
+                    }
+                },
+            )
+            .await
+            .map(|result| result.matched_count == 1)
+            .map_err(|_| create_database_error!("update_one", COL))
+    }
+
+    /// Fetch unguarded, unflagged human users created since `cutoff_id`
+    async fn fetch_users_created_since(&self, cutoff_id: &str) -> Result<Vec<User>> {
+        query!(
+            self,
+            find,
+            COL,
+            doc! {
+                "_id": {
+                    "$gte": cutoff_id
+                },
+                "bot": null,
+                "privileged": {
+                    "$ne": true
+                },
+                "$or": [
+                    { "flags": null },
+                    { "flags": 0_i32 }
+                ],
+                "dm_guard": null
+            }
+        )
+    }
+}
+
+/// A timestamp as a typed write stores it: Int64 unix milliseconds
+fn timestamp_ms(at: &Timestamp) -> Bson {
+    Bson::Int64(
+        at.duration_since(Timestamp::UNIX_EPOCH)
+            .whole_milliseconds() as i64,
+    )
 }
 
 /// Create an empty `supporter` for the user if they have none yet
@@ -582,6 +700,7 @@ impl IntoDocumentPath for FieldsUser {
             FieldsUser::ReferralPending => "referral_pending",
             FieldsUser::WelcomedAt => "welcomed_at",
             FieldsUser::ReferralCount => "referral_count",
+            FieldsUser::DmGuard => "dm_guard",
             FieldsUser::None => "none",
         })
     }

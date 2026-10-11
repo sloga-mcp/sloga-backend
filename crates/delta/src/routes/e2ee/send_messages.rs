@@ -2,8 +2,8 @@ use std::collections::{HashMap, HashSet};
 
 use iso8601_timestamp::Timestamp;
 use revolt_database::{
-    events::client::EventV1, Database, E2EEEnvelope, Referral, ReferralActivity, Session, User,
-    AMQP, E2EE_PROTOCOL_VERSION,
+    events::client::EventV1, util::antispam, Database, E2EEEnvelope, Referral, ReferralActivity,
+    RelationshipStatus, Session, User, AMQP, E2EE_PROTOCOL_VERSION,
 };
 use revolt_models::v0;
 use revolt_result::{create_error, Result};
@@ -83,6 +83,13 @@ pub async fn send_messages(
         .filter(|id| id != &user.id)
         .collect();
 
+    // Anti-spam DM pause. Metadata only: decided from each envelope's
+    // `recipient_user_id` plus the server's own relationship and channel
+    // data. No other envelope field is read for it, and E2EE sends are
+    // never observed by the detector.
+    let dm_pause_enforced =
+        antispam::dm_pause_enforced(&revolt_config::config().await.features.antispam, &user);
+
     let mut recipient_users = HashMap::new();
     for recipient_id in &recipient_user_ids {
         let recipient = db.fetch_user(recipient_id).await?;
@@ -92,6 +99,22 @@ pub async fn send_messages(
         // than plaintext group behaviour); bundle/device FETCH between
         // blocked pairs stays refused in fetch_keys/fetch_devices (§2.6).
         super::require_e2ee_deliver_eligible(db, &user, &recipient).await?;
+
+        // While the caller's DMs are paused, only friends and shared-group
+        // co-members may still receive envelopes. There is no "peer
+        // replied" exemption (the server cannot see E2EE replies). Like an
+        // ineligible recipient, one refused recipient refuses the whole
+        // request before anything is queued. The caller's own devices
+        // never reach this loop (filtered above).
+        if dm_pause_enforced
+            && !matches!(
+                user.relationship_with(recipient_id),
+                RelationshipStatus::Friend
+            )
+            && !super::users_share_group(db, &user.id, recipient_id).await?
+        {
+            return Err(create_error!(DirectMessagesPaused));
+        }
 
         recipient_users.insert(recipient_id.clone(), recipient);
     }

@@ -1,6 +1,7 @@
+use iso8601_timestamp::Timestamp;
 use revolt_result::Result;
 
-use crate::{FieldsUser, PartialUser, RelationshipStatus, User};
+use crate::{DmGuard, FieldsUser, PartialUser, RelationshipStatus, User};
 
 #[cfg(feature = "mongodb")]
 mod mongodb;
@@ -105,4 +106,34 @@ pub trait AbstractUsers: Sync + Send {
     ///
     /// Ensures `supporter` exists, then sets `show_badges`.
     async fn set_supporter_show_badges(&self, user_id: &str, show: bool) -> Result<()>;
+
+    /// Set a user's DM guard
+    ///
+    /// Atomic: only succeeds if the user has no guard, or their guard was
+    /// cleared before `rearm_before`. Returns whether the guard was set.
+    async fn claim_dm_guard(
+        &self,
+        user_id: &str,
+        guard: &DmGuard,
+        rearm_before: Timestamp,
+    ) -> Result<bool>;
+
+    /// Lift the DM pause of the guard filed under `report_id`
+    ///
+    /// Returns whether a guard with that report id matched.
+    async fn clear_dm_guard_pause(
+        &self,
+        user_id: &str,
+        report_id: &str,
+        at: Timestamp,
+    ) -> Result<bool>;
+
+    /// Remove the DM guard filed under `report_id`
+    ///
+    /// Returns whether a guard with that report id matched.
+    async fn release_dm_guard(&self, user_id: &str, report_id: &str) -> Result<bool>;
+
+    /// Fetch users with an id of at least `cutoff_id` that are not bots, not
+    /// privileged, carry no flags and have no DM guard
+    async fn fetch_users_created_since(&self, cutoff_id: &str) -> Result<Vec<User>>;
 }

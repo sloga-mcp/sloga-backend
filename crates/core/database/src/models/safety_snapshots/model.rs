@@ -134,6 +134,46 @@ impl SnapshotContent {
         user.referral_pending = None;
         user.welcomed_at = None;
 
+        // Strip the anti-spam pause record; it is private to the server and
+        // its fingerprint and report id must never reach a report snapshot
+        user.dm_guard = None;
+
         Ok((SnapshotContent::User(user), files))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use iso8601_timestamp::Timestamp;
+
+    use crate::{DmGuard, SnapshotContent, User};
+
+    #[test]
+    fn generate_from_user_strips_dm_guard() {
+        let user = User {
+            id: ulid::Ulid::new().to_string(),
+            username: "spammer".to_string(),
+            discriminator: "0001".to_string(),
+            dm_guard: Some(DmGuard {
+                report_id: "01REPORT00000000000000000000".to_string(),
+                flagged_at: Timestamp::now_utc(),
+                paused: true,
+                cleared_at: None,
+                recipients: 3,
+                fingerprint: "fingerprint".to_string(),
+            }),
+            ..Default::default()
+        };
+
+        let (content, files) = SnapshotContent::generate_from_user(user.clone()).unwrap();
+        assert!(files.is_empty());
+
+        match content {
+            SnapshotContent::User(snapshot_user) => {
+                assert_eq!(snapshot_user.id, user.id);
+                assert!(snapshot_user.dm_guard.is_none());
+            }
+            content => panic!("expected a user snapshot, got {content:?}"),
+        }
     }
 }

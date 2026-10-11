@@ -1506,3 +1506,347 @@ async fn second_publish_same_session_revokes_predecessor_case() {
         .await
         .is_ok());
 }
+
+/// Pause `user`'s DMs to strangers directly, as the copy-paste detector
+/// would. The route loads the caller from the session on every request, so
+/// it sees the guard without a re-fetch here.
+async fn pause_dms(harness: &TestHarness, user: &User) {
+    let guard = revolt_database::DmGuard {
+        report_id: ulid::Ulid::new().to_string(),
+        flagged_at: iso8601_timestamp::Timestamp::now_utc(),
+        paused: true,
+        cleared_at: None,
+        recipients: 3,
+        fingerprint: "test".into(),
+    };
+
+    assert!(harness
+        .db
+        .claim_dm_guard(&user.id, &guard, iso8601_timestamp::Timestamp::now_utc())
+        .await
+        .expect("claim guard"));
+}
+
+/// Put both users in one server: mutual-server DM eligibility with no
+/// friendship and no shared group (the stranger topology the pause targets)
+async fn share_server(harness: &TestHarness, owner: &User, member: &User) {
+    let (server, _channels) = harness.new_server(owner).await;
+    for user in [owner, member] {
+        revolt_database::Member::create(&harness.db, &server, user, None)
+            .await
+            .expect("member");
+    }
+}
+
+fn envelope_to(user: &User, device: &TestDevice, sequence: u64) -> v0::DataE2EEEnvelope {
+    v0::DataE2EEEnvelope {
+        recipient_user_id: user.id.clone(),
+        recipient_device_id: device.device_id.clone(),
+        sequence,
+        ciphertext: STANDARD_NO_PAD.encode(b"opaque"),
+    }
+}
+
+/// POST /e2ee/messages as `session`; returns the status and the raw body
+async fn post_envelopes(
+    harness: &TestHarness,
+    session: &revolt_database::Session,
+    device: &TestDevice,
+    envelopes: Vec<v0::DataE2EEEnvelope>,
+) -> (Status, String) {
+    let body = v0::DataSendE2EEMessages {
+        device_id: device.device_id.clone(),
+        protocol_version: E2EE_PROTOCOL_VERSION,
+        envelopes,
+    };
+    let response = TestHarness::with_session(
+        session.clone(),
+        harness
+            .client
+            .post("/e2ee/messages")
+            .header(ContentType::JSON)
+            .body(serde_json::to_string(&body).unwrap()),
+    )
+    .await;
+    let status = response.status();
+    (status, response.into_string().await.unwrap_or_default())
+}
+
+fn assert_all_queued(body: &str, expected: usize) {
+    let result: v0::ResponseSendE2EEMessages = serde_json::from_str(body).expect("receipts");
+    assert_eq!(result.receipts.len(), expected, "{body}");
+    for receipt in &result.receipts {
+        assert!(
+            matches!(receipt.status, v0::E2EEDeliveryStatus::Queued { .. }),
+            "{}",
+            body
+        );
+    }
+}
+
+fn assert_dms_paused(status: Status, body: &str) {
+    assert_eq!(status, Status::Forbidden, "{body}");
+    let error: revolt_result::Error = serde_json::from_str(body).expect("error body");
+    assert!(
+        matches!(
+            error.error_type,
+            revolt_result::ErrorType::DirectMessagesPaused
+        ),
+        "unexpected error: {:?}",
+        error.error_type
+    );
+}
+
+/// A paused caller can no longer reach a non-friend who shares only a
+/// server with them, even though that stranger is DM-eligible (proven by a
+/// delivery before the pause). A batch with one refused recipient is
+/// refused whole: nothing in it is queued, for the friend either.
+#[test]
+#[ignore = "needs REVOLT__FEATURES__ANTISPAM__DM_DUPE_ENABLED=true"]
+fn antispam_route_e2ee_paused_stranger_refused() {
+    crate::util::test::rt().block_on(antispam_route_e2ee_paused_stranger_refused_case())
+}
+
+async fn antispam_route_e2ee_paused_stranger_refused_case() {
+    assert!(
+        revolt_config::config()
+            .await
+            .features
+            .antispam
+            .dm_dupe_enabled,
+        "run with REVOLT__FEATURES__ANTISPAM__DM_DUPE_ENABLED=true"
+    );
+
+    let harness = TestHarness::new().await;
+    let (account_a, session_a, user_a) = harness.new_user().await;
+    let (account_s, session_s, stranger) = harness.new_user().await;
+    let (account_f, session_f, friend) = harness.new_user().await;
+
+    share_server(&harness, &user_a, &stranger).await;
+    make_dm_eligible(&harness, &user_a, &friend).await;
+
+    let device_a = publish_device(&harness, &account_a.id, &session_a.token, 1).await;
+    let device_s = publish_device(&harness, &account_s.id, &session_s.token, 1).await;
+    let device_f = publish_device(&harness, &account_f.id, &session_f.token, 1).await;
+
+    // Before the pause the stranger is reachable (mutual server), so the
+    // refusal below comes from the pause and not from eligibility
+    let (status, body) = post_envelopes(
+        &harness,
+        &session_a,
+        &device_a,
+        vec![envelope_to(&stranger, &device_s, 1)],
+    )
+    .await;
+    assert_eq!(status, Status::Ok, "{body}");
+    assert_all_queued(&body, 1);
+
+    pause_dms(&harness, &user_a).await;
+
+    let (status, body) = post_envelopes(
+        &harness,
+        &session_a,
+        &device_a,
+        vec![envelope_to(&stranger, &device_s, 2)],
+    )
+    .await;
+    assert_dms_paused(status, &body);
+
+    // One refused recipient refuses the whole request, like an ineligible
+    // recipient does: the friend's envelope is not queued either
+    let (status, body) = post_envelopes(
+        &harness,
+        &session_a,
+        &device_a,
+        vec![
+            envelope_to(&friend, &device_f, 1),
+            envelope_to(&stranger, &device_s, 3),
+        ],
+    )
+    .await;
+    assert_dms_paused(status, &body);
+
+    let queued_f = harness
+        .db
+        .fetch_e2ee_envelopes(&friend.id, &device_f.device_id, 10)
+        .await
+        .unwrap();
+    assert!(queued_f.is_empty(), "nothing queued from a refused batch");
+
+    let queued_s = harness
+        .db
+        .fetch_e2ee_envelopes(&stranger.id, &device_s.device_id, 10)
+        .await
+        .unwrap();
+    assert_eq!(queued_s.len(), 1, "only the pre-pause envelope");
+    assert_eq!(queued_s[0].sequence, 1);
+}
+
+/// A paused caller still reaches friends, shared-group co-members (not
+/// friends) and their own other devices, in one batch and alone.
+#[test]
+#[ignore = "needs REVOLT__FEATURES__ANTISPAM__DM_DUPE_ENABLED=true"]
+fn antispam_route_e2ee_paused_friend_and_group_allowed() {
+    crate::util::test::rt().block_on(antispam_route_e2ee_paused_friend_and_group_allowed_case())
+}
+
+async fn antispam_route_e2ee_paused_friend_and_group_allowed_case() {
+    assert!(
+        revolt_config::config()
+            .await
+            .features
+            .antispam
+            .dm_dupe_enabled,
+        "run with REVOLT__FEATURES__ANTISPAM__DM_DUPE_ENABLED=true"
+    );
+
+    let harness = TestHarness::new().await;
+    let (account_a, session_a, user_a) = harness.new_user().await;
+    let (account_f, session_f, friend) = harness.new_user().await;
+    let (account_g, session_g, co_member) = harness.new_user().await;
+
+    make_dm_eligible(&harness, &user_a, &friend).await;
+    // NOT friends: only a shared group
+    make_group(&harness, &user_a, &co_member).await;
+
+    let device_a = publish_device(&harness, &account_a.id, &session_a.token, 1).await;
+    let device_f = publish_device(&harness, &account_f.id, &session_f.token, 1).await;
+    let device_g = publish_device(&harness, &account_g.id, &session_g.token, 1).await;
+
+    // The caller's second device, on its own session (multi-device fan-out)
+    let session_a2 = account_a
+        .create_session(&harness.db, String::new())
+        .await
+        .expect("second session");
+    let device_a2 = publish_device(&harness, &account_a.id, &session_a2.token, 1).await;
+
+    pause_dms(&harness, &user_a).await;
+    assert!(harness
+        .db
+        .fetch_user(&user_a.id)
+        .await
+        .unwrap()
+        .is_dm_paused());
+
+    let (status, body) = post_envelopes(
+        &harness,
+        &session_a,
+        &device_a,
+        vec![
+            envelope_to(&friend, &device_f, 1),
+            envelope_to(&co_member, &device_g, 1),
+            envelope_to(&user_a, &device_a2, 1),
+        ],
+    )
+    .await;
+    assert_eq!(status, Status::Ok, "{body}");
+    assert_all_queued(&body, 3);
+
+    for (recipient, device) in [
+        (&friend, &device_f),
+        (&co_member, &device_g),
+        (&user_a, &device_a2),
+    ] {
+        let (status, body) = post_envelopes(
+            &harness,
+            &session_a,
+            &device_a,
+            vec![envelope_to(recipient, device, 2)],
+        )
+        .await;
+        assert_eq!(status, Status::Ok, "{body}");
+        assert_all_queued(&body, 1);
+    }
+}
+
+/// The kill switch: with the detector off (the shipped default and the
+/// test config), an existing pause is not enforced on envelope delivery.
+#[test]
+fn e2ee_pause_not_enforced_while_detector_off() {
+    crate::util::test::rt().block_on(e2ee_pause_not_enforced_while_detector_off_case())
+}
+
+async fn e2ee_pause_not_enforced_while_detector_off_case() {
+    assert!(
+        !revolt_config::config()
+            .await
+            .features
+            .antispam
+            .dm_dupe_enabled,
+        "run WITHOUT REVOLT__FEATURES__ANTISPAM__DM_DUPE_ENABLED"
+    );
+
+    let harness = TestHarness::new().await;
+    let (account_a, session_a, user_a) = harness.new_user().await;
+    let (account_s, session_s, stranger) = harness.new_user().await;
+
+    share_server(&harness, &user_a, &stranger).await;
+
+    let device_a = publish_device(&harness, &account_a.id, &session_a.token, 1).await;
+    let device_s = publish_device(&harness, &account_s.id, &session_s.token, 1).await;
+
+    pause_dms(&harness, &user_a).await;
+
+    let (status, body) = post_envelopes(
+        &harness,
+        &session_a,
+        &device_a,
+        vec![envelope_to(&stranger, &device_s, 1)],
+    )
+    .await;
+    assert_eq!(status, Status::Ok, "{body}");
+    assert_all_queued(&body, 1);
+}
+
+/// The E2EE invariant for the pause: the gate is decided from the
+/// recipient id alone (no envelope field, ciphertext or device id), sits
+/// before anything is queued, and the route never feeds the detector.
+#[test]
+fn e2ee_pause_gate_reads_no_envelope_content() {
+    use crate::util::test::{statement_at, without_comments, without_whitespace};
+
+    let code = without_whitespace(&without_comments(include_str!("send_messages.rs")));
+
+    assert!(
+        !code.contains("observe_dm_message"),
+        "E2EE is never observed"
+    );
+    assert!(!code.contains("dm_send_allowed"), "no message-history gate");
+    assert_eq!(code.matches("DirectMessagesPaused").count(), 1, "{code}");
+
+    let enforced = statement_at(
+        &code,
+        "letdm_pause_enforced=antispam::dm_pause_enforced(&revolt_config::config().await.features.antispam,&user);",
+    );
+    let recipients_loop = code
+        .find("forrecipient_idin&recipient_user_ids{")
+        .expect("the recipient loop");
+
+    let gate_start = code.find("ifdm_pause_enforced&&").expect("the gate");
+    let gate_len = code[gate_start..]
+        .find("returnErr(create_error!(DirectMessagesPaused));")
+        .expect("the refusal");
+    let gate = &code[gate_start..gate_start + gate_len];
+
+    for forbidden in ["envelope", "ciphertext", "device", "sequence", "data."] {
+        assert!(
+            !gate.contains(forbidden),
+            "gate reads `{}`: {}",
+            forbidden,
+            gate
+        );
+    }
+    assert!(gate.contains("relationship_with(recipient_id)"), "{}", gate);
+    assert!(
+        gate.contains("users_share_group(db,&user.id,recipient_id)"),
+        "{}",
+        gate
+    );
+
+    let insert = code
+        .find("db.insert_e2ee_envelopes(")
+        .expect("the queue insert");
+    assert!(enforced < recipients_loop, "computed once, before the loop");
+    assert!(recipients_loop < gate_start, "per recipient id");
+    assert!(gate_start < insert, "refused before anything is queued");
+}

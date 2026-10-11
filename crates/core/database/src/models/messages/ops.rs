@@ -80,6 +80,21 @@ pub trait AbstractMessages: Sync + Send {
     /// filter only scans one hour of one channel.
     async fn count_crossposts_since(&self, channel: &str, min_id: &str) -> Result<usize>;
 
+    /// Count the messages `author` sent at or after `cutoff_id` (a ULID, so
+    /// the string compare is a time compare) outside `exclude_channels`.
+    ///
+    /// Used by the daily anti-spam scan to measure a new account's public
+    /// activity: the caller passes the account's DM channels as the
+    /// exclusions. On MongoDB the count is hinted onto the `author` index,
+    /// which stops the planner walking the `_id` range of every message sent
+    /// since the cutoff.
+    async fn count_author_messages_since(
+        &self,
+        author: &str,
+        cutoff_id: &str,
+        exclude_channels: &[String],
+    ) -> Result<u64>;
+
     /// Summarise the messages sitting after a user's read pointer in a channel:
     /// how many there are (stopping at `UNREAD_COUNT_CAP`) and whether any of
     /// them carries an attachment. `after_id` is exclusive; `None` means the
@@ -259,6 +274,73 @@ mod tests {
                 db.count_crossposts_since(channel, &tighter).await.unwrap(),
                 6
             );
+        });
+    }
+
+    /// The daily anti-spam scan's public-activity count: only the author's
+    /// messages, only from the cutoff on, never in an excluded channel.
+    #[tokio::test]
+    async fn count_author_messages_since_scopes_by_author_time_and_channel() {
+        database_test!(|db| async move {
+            let author = "01SPAMAUTHOR00000000000000";
+            let other = "01OTHERAUTHOR0000000000000";
+            let c1 = "01CHANSPAM0000000000000001";
+            let c2 = "01CHANSPAM0000000000000002";
+            let c3 = "01CHANSPAM0000000000000003";
+
+            // `rand` keeps ids unique even when two rows share a timestamp.
+            let mk = |ms: u64, rand: u128, chan: &str, by: &str| Message {
+                id: ulid::Ulid::from_parts(ms, rand).to_string(),
+                channel: chan.to_string(),
+                author: by.to_string(),
+                content: Some("hello".to_string()),
+                ..Default::default()
+            };
+            let cutoff = ulid::Ulid::from_parts(1_000, 0).to_string();
+
+            let rows = [
+                // From the cutoff on: two in c1, three in c2, one in c3.
+                mk(2_000, 1, c1, author),
+                mk(3_000, 2, c1, author),
+                mk(2_000, 3, c2, author),
+                mk(4_000, 4, c2, author),
+                mk(5_000, 5, c2, author),
+                mk(6_000, 6, c3, author),
+                // Exactly at the cutoff: the bound is inclusive.
+                mk(1_000, 0, c3, author),
+                // Before the cutoff, in channels that are counted.
+                mk(500, 7, c2, author),
+                mk(999, 8, c3, author),
+                // Someone else, after the cutoff, in a counted channel.
+                mk(2_500, 9, c2, other),
+            ];
+            for row in &rows {
+                db.insert_message(row).await.unwrap();
+            }
+
+            let count = |by: &'static str, since: String, exclude: Vec<&'static str>| {
+                let db = db.clone();
+                async move {
+                    let exclude: Vec<String> = exclude.into_iter().map(str::to_string).collect();
+                    db.count_author_messages_since(by, &since, &exclude)
+                        .await
+                        .unwrap()
+                }
+            };
+
+            // c1 stands in for the account's DMs: excluded, c2 + c3 remain.
+            assert_eq!(count(author, cutoff.clone(), vec![c1]).await, 5);
+            assert_eq!(count(author, cutoff.clone(), vec![]).await, 7);
+            assert_eq!(count(author, cutoff.clone(), vec![c1, c2, c3]).await, 0);
+            assert_eq!(count(other, cutoff.clone(), vec![]).await, 1);
+            assert_eq!(
+                count("01NOBODY000000000000000000", cutoff.clone(), vec![]).await,
+                0
+            );
+
+            // A later cutoff drops the earlier messages: c2 at 5_000, c3 at 6_000.
+            let later = ulid::Ulid::from_parts(4_500, 0).to_string();
+            assert_eq!(count(author, later, vec![c1]).await, 2);
         });
     }
 

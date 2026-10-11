@@ -1,6 +1,7 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use revolt_config::config;
+use revolt_database::util::antispam;
 use revolt_database::util::idempotency::IdempotencyKey;
 use revolt_database::util::permissions::DatabasePermissionQuery;
 use revolt_database::util::reference::Reference;
@@ -164,6 +165,16 @@ pub async fn message_schedule(
         interactions.validate(db, &permissions).await?;
     }
 
+    // A paused account may not queue DMs to strangers who never wrote
+    // back. Checked before the nonce, attachments or row are touched;
+    // delivery checks again, as a pause can start in between.
+    if let Channel::DirectMessage { recipients, .. } = &channel {
+        if let Some(peer) = recipients.iter().find(|id| *id != &user.id) {
+            antispam::dm_send_allowed(db, &config.features.antispam, &user, channel.id(), peer)
+                .await?;
+        }
+    }
+
     // Pending caps (per channel and overall).
     let per_channel = config.features.limits.global.scheduled_messages_per_channel;
     if db
@@ -248,10 +259,15 @@ pub async fn message_schedule(
 #[cfg(test)]
 mod test {
     use crate::{rocket, util::test::TestHarness};
+    use iso8601_timestamp::Timestamp;
+    use revolt_database::{Channel, DmGuard, Member, Message, User};
     use revolt_models::v0;
+    use revolt_result::{Error, ErrorType};
     use rocket::http::{ContentType, Header, Status};
+    use rocket::local::asynchronous::LocalResponse;
     use serde_json::json;
     use std::time::{SystemTime, UNIX_EPOCH};
+    use ulid::Ulid;
 
     fn in_ms(offset: i64) -> i64 {
         SystemTime::now()
@@ -407,5 +423,167 @@ mod test {
             .dispatch()
             .await;
         assert_eq!(response.status(), Status::BadRequest);
+    }
+
+    /// An author whose DMs to strangers are paused, a stranger they share a
+    /// server with (so the DM itself is permitted) who never wrote back, and
+    /// the DM between them. Returns the author's session token, the author,
+    /// the stranger and the DM.
+    async fn paused_author_and_silent_stranger(
+        harness: &TestHarness,
+    ) -> (String, User, User, Channel) {
+        let (_, session, author) = harness.new_user().await;
+        let (_, _, stranger) = harness.new_user().await;
+        let (server, _) = harness.new_server(&author).await;
+        Member::create(&harness.db, &server, &stranger, None)
+            .await
+            .expect("stranger member");
+
+        let dm = Channel::create_dm(&harness.db, &author, &stranger)
+            .await
+            .expect("dm");
+        assert!(matches!(dm, Channel::DirectMessage { .. }), "a real DM");
+
+        // The route loads the author from the session on every request,
+        // so the guard is picked up without re-fetching here.
+        let claimed = harness
+            .db
+            .claim_dm_guard(
+                &author.id,
+                &DmGuard {
+                    report_id: Ulid::new().to_string(),
+                    flagged_at: Timestamp::now_utc(),
+                    paused: true,
+                    cleared_at: None,
+                    recipients: 3,
+                    fingerprint: "test".into(),
+                },
+                Timestamp::now_utc(),
+            )
+            .await
+            .expect("claim");
+        assert!(claimed, "guard set");
+
+        (session.token.to_string(), author, stranger, dm)
+    }
+
+    async fn schedule_into<'a>(
+        harness: &'a TestHarness,
+        token: &str,
+        channel_id: &str,
+        nonce: &str,
+    ) -> LocalResponse<'a> {
+        harness
+            .client
+            .post(format!("/channels/{channel_id}/scheduled_messages"))
+            .header(Header::new("x-session-token", token.to_string()))
+            .header(ContentType::JSON)
+            .body(
+                json!({
+                    "content": "can I use your profile picture for an art project, I'll pay you",
+                    "nonce": nonce,
+                    "scheduled_at": in_ms(60 * 60 * 1000)
+                })
+                .to_string(),
+            )
+            .dispatch()
+            .await
+    }
+
+    #[test]
+    #[ignore = "needs REVOLT__FEATURES__ANTISPAM__DM_DUPE_ENABLED=true"]
+    fn antispam_route_schedule_paused_refused() {
+        crate::util::test::rt().block_on(antispam_route_schedule_paused_refused_case())
+    }
+
+    async fn antispam_route_schedule_paused_refused_case() {
+        assert!(
+            revolt_config::config()
+                .await
+                .features
+                .antispam
+                .dm_dupe_enabled,
+            "run with REVOLT__FEATURES__ANTISPAM__DM_DUPE_ENABLED=true"
+        );
+
+        let harness = TestHarness::new().await;
+        let (token, author, stranger, dm) = paused_author_and_silent_stranger(&harness).await;
+        let nonce = Ulid::new().to_string();
+
+        // A paused author cannot queue a DM to a stranger who never wrote
+        let response = schedule_into(&harness, &token, dm.id(), &nonce).await;
+        assert_eq!(response.status(), Status::Forbidden);
+        assert!(matches!(
+            response.into_json::<Error>().await.unwrap().error_type,
+            ErrorType::DirectMessagesPaused
+        ));
+
+        // Nothing was queued
+        assert_eq!(
+            harness
+                .db
+                .count_pending_scheduled_messages(&author.id, None)
+                .await
+                .unwrap(),
+            0
+        );
+
+        // Once the stranger has written in the DM it is a real
+        // conversation and scheduling works; the same nonce is accepted,
+        // so the refusal consumed nothing.
+        harness
+            .db
+            .insert_message(&Message {
+                id: Ulid::new().to_string(),
+                channel: dm.id().to_string(),
+                author: stranger.id.clone(),
+                content: Some("sure, who is this?".to_string()),
+                ..Default::default()
+            })
+            .await
+            .expect("reply");
+
+        let response = schedule_into(&harness, &token, dm.id(), &nonce).await;
+        assert_eq!(response.status(), Status::Ok);
+        drop(response);
+        let rows = harness
+            .db
+            .fetch_scheduled_messages_by_author(dm.id(), &author.id)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+    }
+
+    #[test]
+    fn schedule_into_dm_allowed_while_antispam_off() {
+        crate::util::test::rt().block_on(schedule_into_dm_allowed_while_antispam_off_case())
+    }
+
+    async fn schedule_into_dm_allowed_while_antispam_off_case() {
+        // The switched-off detector lifts the pause everywhere (the kill
+        // switch); this cannot be checked with it on.
+        assert!(
+            !revolt_config::config()
+                .await
+                .features
+                .antispam
+                .dm_dupe_enabled,
+            "run without REVOLT__FEATURES__ANTISPAM__DM_DUPE_ENABLED"
+        );
+
+        let harness = TestHarness::new().await;
+        let (token, author, _, dm) = paused_author_and_silent_stranger(&harness).await;
+
+        let response = schedule_into(&harness, &token, dm.id(), &Ulid::new().to_string()).await;
+        assert_eq!(response.status(), Status::Ok);
+        let scheduled: v0::ScheduledMessage = response.into_json().await.expect("row");
+        assert_eq!(scheduled.channel, dm.id());
+
+        let rows = harness
+            .db
+            .fetch_scheduled_messages_by_author(dm.id(), &author.id)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
     }
 }
