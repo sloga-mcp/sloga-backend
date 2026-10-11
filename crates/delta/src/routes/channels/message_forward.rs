@@ -1,5 +1,7 @@
 use iso8601_timestamp::Timestamp;
+use revolt_config::config;
 use revolt_database::events::client::EventV1;
+use revolt_database::util::antispam;
 use revolt_database::util::idempotency::IdempotencyKey;
 use revolt_database::util::permissions::DatabasePermissionQuery;
 use revolt_database::util::reference::Reference;
@@ -84,6 +86,20 @@ pub async fn message_forward(
     // Archived or locked threads reject forwards exactly like normal
     // messages.
     crate::util::threads::ensure_thread_writable(&destination, &permissions)?;
+
+    // An account paused for copy-paste DMs cannot forward into a DM with a
+    // stranger who never wrote back either, exactly like a live send.
+    // Checked before any side effect (slowmode, nonce, minted files).
+    let antispam_config = config().await.features.antispam.clone();
+    let dm_peer = if let Channel::DirectMessage { recipients, .. } = &destination {
+        recipients.iter().find(|id| *id != &user.id).cloned()
+    } else {
+        None
+    };
+
+    if let Some(peer) = &dm_peer {
+        antispam::dm_send_allowed(db, &antispam_config, &user, destination.id(), peer).await?;
+    }
 
     crate::util::slowmode::enforce_slowmode(&user, &destination, &permissions).await?;
 
@@ -244,6 +260,31 @@ pub async fn message_forward(
         return Err(error);
     }
 
+    // Count the forwarded text toward copy-paste DM detection (it lives in
+    // `forwarded.content`, which `dm_text` reads). Spawned so it never fails
+    // or delays the forward. A forward is always a server-built plaintext
+    // snapshot, never an end-to-end encrypted envelope.
+    if let Some(peer) = dm_peer {
+        let (db, user, message, channel_id) = (
+            db.inner().clone(),
+            user.clone(),
+            message.clone(),
+            destination.id().to_string(),
+        );
+
+        tokio::spawn(async move {
+            antispam::observe_dm_message(
+                &db,
+                &antispam_config,
+                &user,
+                &channel_id,
+                &peer,
+                &message,
+            )
+            .await;
+        });
+    }
+
     // Forwarding into a thread joins you to it, exactly like a live send
     // (Discord parity — you start receiving its notifications).
     if let Channel::Thread { server, .. } = &destination {
@@ -265,7 +306,15 @@ pub async fn message_forward(
 
 #[cfg(test)]
 mod test {
+    use std::time::{Duration, Instant};
+
     use crate::{rocket, util::test::TestHarness};
+    use revolt_config::config;
+    use revolt_database::iso8601_timestamp::Timestamp;
+    use revolt_database::{
+        Channel, DmGuard, Member, MessageFilter, MessageQuery, MessageTimePeriod, Session, User,
+        SYSTEM_USER_ID,
+    };
     use revolt_models::v0;
     use rocket::http::{ContentType, Header, Status};
     use serde_json::json;
@@ -451,5 +500,256 @@ mod test {
             message.forwarded.is_none(),
             "regular send must not accept a forwarded snapshot"
         );
+    }
+
+    /// Long enough to fingerprint: the copy-paste scam the detector targets
+    const SCAM: &str = "Hi! I love your profile picture, can I use it for an art project for my client? I'll pay you and credit you.";
+
+    struct ForwardFixture {
+        session: Session,
+        sender: User,
+        /// Server channel holding the message to forward
+        source: Channel,
+        message_id: String,
+        /// Users who share only the server with the sender (so DMs are
+        /// allowed, but they are not friends), each with their session and
+        /// their DM with the sender
+        strangers: Vec<(Session, User, Channel)>,
+    }
+
+    async fn forward_fixture(harness: &TestHarness, strangers: usize) -> ForwardFixture {
+        let (_, session, sender) = harness.new_user().await;
+        let (server, channels) = harness.new_server(&sender).await;
+        Member::create(&harness.db, &server, &sender, Some(channels.clone()))
+            .await
+            .expect("sender membership");
+        let source = channels[0].clone();
+
+        let response = harness
+            .client
+            .post(format!("/channels/{}/messages", source.id()))
+            .header(Header::new("x-session-token", session.token.to_string()))
+            .header(ContentType::JSON)
+            .body(json!({ "content": SCAM }).to_string())
+            .dispatch()
+            .await;
+        assert_eq!(response.status(), Status::Ok);
+        let message: v0::Message = response.into_json().await.expect("`Message`");
+
+        let mut dms = Vec::with_capacity(strangers);
+        for _ in 0..strangers {
+            let (_, stranger_session, stranger) = harness.new_user().await;
+            Member::create(&harness.db, &server, &stranger, None)
+                .await
+                .expect("stranger membership");
+            let dm = Channel::create_dm(&harness.db, &sender, &stranger)
+                .await
+                .expect("DM channel");
+            dms.push((stranger_session, stranger, dm));
+        }
+
+        ForwardFixture {
+            session,
+            sender,
+            source,
+            message_id: message.id,
+            strangers: dms,
+        }
+    }
+
+    async fn forward_to(
+        harness: &TestHarness,
+        fixture: &ForwardFixture,
+        destination: &str,
+    ) -> (Status, serde_json::Value) {
+        let response = harness
+            .client
+            .post(format!(
+                "/channels/{}/messages/{}/forward",
+                fixture.source.id(),
+                fixture.message_id
+            ))
+            .header(Header::new(
+                "x-session-token",
+                fixture.session.token.to_string(),
+            ))
+            .header(ContentType::JSON)
+            .body(json!({ "destination": destination }).to_string())
+            .dispatch()
+            .await;
+
+        let status = response.status();
+        let body = response
+            .into_json::<serde_json::Value>()
+            .await
+            .unwrap_or_default();
+        (status, body)
+    }
+
+    async fn messages_in(harness: &TestHarness, channel_id: &str, author: &str) -> usize {
+        harness
+            .db
+            .fetch_messages(MessageQuery {
+                limit: Some(10),
+                filter: MessageFilter {
+                    channel: Some(channel_id.to_string()),
+                    author: Some(author.to_string()),
+                    ..Default::default()
+                },
+                time_period: MessageTimePeriod::Absolute {
+                    before: None,
+                    after: None,
+                    sort: None,
+                },
+            })
+            .await
+            .expect("messages")
+            .len()
+    }
+
+    #[test]
+    #[ignore = "needs REVOLT__FEATURES__ANTISPAM__DM_DUPE_ENABLED=true"]
+    fn antispam_route_forward_paused_refused() {
+        crate::util::test::rt().block_on(antispam_route_forward_paused_refused_case())
+    }
+
+    async fn antispam_route_forward_paused_refused_case() {
+        assert!(
+            config().await.features.antispam.dm_dupe_enabled,
+            "run with REVOLT__FEATURES__ANTISPAM__DM_DUPE_ENABLED=true"
+        );
+
+        let harness = TestHarness::new().await;
+        let fixture = forward_fixture(&harness, 2).await;
+        let (_, _, silent_dm) = &fixture.strangers[0];
+        let (replier_session, _, replier_dm) = &fixture.strangers[1];
+
+        // The second stranger wrote first: a real conversation
+        let response = harness
+            .client
+            .post(format!("/channels/{}/messages", replier_dm.id()))
+            .header(Header::new(
+                "x-session-token",
+                replier_session.token.to_string(),
+            ))
+            .header(ContentType::JSON)
+            .body(json!({ "content": "hello there" }).to_string())
+            .dispatch()
+            .await;
+        assert_eq!(response.status(), Status::Ok);
+
+        // Pause the sender directly; the route re-reads the user per request
+        let now = Timestamp::now_utc();
+        let claimed = harness
+            .db
+            .claim_dm_guard(
+                &fixture.sender.id,
+                &DmGuard {
+                    report_id: ulid::Ulid::new().to_string(),
+                    flagged_at: now,
+                    paused: true,
+                    cleared_at: None,
+                    recipients: 3,
+                    fingerprint: "test".into(),
+                },
+                now,
+            )
+            .await
+            .expect("claim");
+        assert!(claimed);
+
+        // Silent stranger: refused, and nothing was written into the DM
+        let (status, body) = forward_to(&harness, &fixture, silent_dm.id()).await;
+        assert_eq!(status, Status::Forbidden, "body: {body}");
+        assert_eq!(body["type"], "DirectMessagesPaused", "body: {body}");
+        assert_eq!(
+            messages_in(&harness, silent_dm.id(), &fixture.sender.id).await,
+            0
+        );
+
+        // A stranger who wrote back stays reachable
+        let (status, body) = forward_to(&harness, &fixture, replier_dm.id()).await;
+        assert_eq!(status, Status::Ok, "body: {body}");
+        assert_eq!(
+            messages_in(&harness, replier_dm.id(), &fixture.sender.id).await,
+            1
+        );
+
+        // The pause is about DMs only: a server channel still takes forwards
+        let (status, body) = forward_to(&harness, &fixture, fixture.source.id()).await;
+        assert_eq!(status, Status::Ok, "body: {body}");
+    }
+
+    #[test]
+    #[ignore = "needs REVOLT__FEATURES__ANTISPAM__DM_DUPE_ENABLED=true"]
+    fn antispam_route_forward_counts_toward_flag() {
+        crate::util::test::rt().block_on(antispam_route_forward_counts_toward_flag_case())
+    }
+
+    async fn antispam_route_forward_counts_toward_flag_case() {
+        assert!(
+            config().await.features.antispam.dm_dupe_enabled,
+            "run with REVOLT__FEATURES__ANTISPAM__DM_DUPE_ENABLED=true"
+        );
+
+        let harness = TestHarness::new().await;
+        let fixture = forward_fixture(&harness, 4).await;
+
+        // Forward the same text into three silent strangers' DMs
+        for (_, _, dm) in &fixture.strangers[..3] {
+            let (status, body) = forward_to(&harness, &fixture, dm.id()).await;
+            assert_eq!(status, Status::Ok, "body: {body}");
+        }
+
+        // The observer is spawned: wait for the guard it claims
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let guard = loop {
+            let sender = harness
+                .db
+                .fetch_user(&fixture.sender.id)
+                .await
+                .expect("sender");
+            if let Some(guard) = sender.dm_guard {
+                break guard;
+            }
+
+            assert!(
+                Instant::now() < deadline,
+                "no DM guard after forwarding into 3 silent strangers' DMs"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        };
+        assert_eq!(guard.recipients, 3);
+        assert!(guard.cleared_at.is_none());
+
+        // The system report behind the guard is in the staff queue. The
+        // observer claims the guard BEFORE it files the report, so the report
+        // can lag the guard: wait for it too
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let report = loop {
+            if let Ok(report) = harness.db.fetch_report(&guard.report_id).await {
+                break report;
+            }
+
+            assert!(
+                Instant::now() < deadline,
+                "no system report {} behind the DM guard",
+                guard.report_id
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        };
+        assert_eq!(report.author_id, SYSTEM_USER_ID);
+        let v0::ReportedContent::User { id, .. } = &report.content else {
+            panic!("report must name a user: {:?}", report.content);
+        };
+        assert_eq!(id, &fixture.sender.id);
+
+        // With pausing configured, the next silent stranger is refused
+        if guard.paused {
+            let (_, _, fourth_dm) = &fixture.strangers[3];
+            let (status, body) = forward_to(&harness, &fixture, fourth_dm.id()).await;
+            assert_eq!(status, Status::Forbidden, "body: {body}");
+            assert_eq!(body["type"], "DirectMessagesPaused", "body: {body}");
+        }
     }
 }

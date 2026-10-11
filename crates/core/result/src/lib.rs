@@ -73,6 +73,9 @@ pub enum ErrorType {
     Blocked,
     BlockedByOther,
     NotFriends,
+    /// This account's ability to message non-friends is paused pending staff
+    /// review (automated spam detection)
+    DirectMessagesPaused,
     /// The user limits their profile to friends only
     ProfileIsPrivate,
     TooManyPendingFriendRequests {

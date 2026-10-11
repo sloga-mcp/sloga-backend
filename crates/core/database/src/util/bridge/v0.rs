@@ -1848,6 +1848,7 @@ impl From<User> for crate::User {
             referral_pending: None,
             welcomed_at: None,
             supporter: None,
+            dm_guard: None,
             name_style: value.name_style,
             custom_badge: value.custom_badge.map(|badge| crate::CustomBadge {
                 image: badge.image.into(),
@@ -1937,6 +1938,7 @@ impl From<crate::FieldsUser> for FieldsUser {
             crate::FieldsUser::ReferralPending => FieldsUser::Internal,
             crate::FieldsUser::WelcomedAt => FieldsUser::Internal,
             crate::FieldsUser::ReferralCount => FieldsUser::Internal,
+            crate::FieldsUser::DmGuard => FieldsUser::Internal,
             crate::FieldsUser::None => FieldsUser::Internal,
         }
     }

@@ -102,6 +102,21 @@ impl AbstractChannels for ReferenceDb {
             .collect())
     }
 
+    /// Fetch every DirectMessage channel created since the cutoff; see the trait.
+    async fn fetch_direct_messages_created_since(&self, cutoff_id: &str) -> Result<Vec<Channel>> {
+        let channels = self.channels.lock().await;
+        Ok(channels
+            .values()
+            .filter(|channel| {
+                matches!(
+                    channel,
+                    Channel::DirectMessage { id, .. } if id.as_str() >= cutoff_id
+                )
+            })
+            .cloned()
+            .collect())
+    }
+
     // Fetch all group dms for a user
     async fn find_group_message_channels(&self, user_id: &str) -> Result<ChunkedDatabaseGenerator<Channel>> {
         let channels = self.channels.lock().await;

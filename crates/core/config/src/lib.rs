@@ -1085,6 +1085,84 @@ impl BoostFeatures {
     }
 }
 
+/// Anti-spam: the copy-paste DM detector (with its pause on DMs to
+/// strangers) and the daily staff alert.
+///
+/// Ships OFF. Prod turns it on in Revolt.overrides.toml under an explicit
+/// `[features.antispam]` header (env form `REVOLT__FEATURES__ANTISPAM__...`,
+/// double underscores), then RESTARTS delta AND crond: config sources are
+/// frozen into each process at first access.
+///
+/// `Default` is hand-written on purpose: a derived one would give
+/// `dm_dupe_pause = false` and `dm_dupe_threshold = 0`. Read the threshold
+/// and minimum length through `threshold()` / `min_chars()`, which clamp.
+#[derive(Deserialize, Debug, Clone)]
+#[serde(default)]
+pub struct AntispamFeatures {
+    /// Master switch for the copy-paste DM detector
+    pub dm_dupe_enabled: bool,
+    /// Pause the flagged account's DMs to strangers until staff review the
+    /// report (false = report only)
+    pub dm_dupe_pause: bool,
+    /// Distinct non-friend DMs with the same text that trigger a flag
+    pub dm_dupe_threshold: usize,
+    /// How long a fingerprint is remembered per author
+    pub dm_dupe_window_hours: u64,
+    /// Normalized texts shorter than this are exempt (invite / link only)
+    pub dm_dupe_min_chars: usize,
+    /// Days after staff clear a flag before the detector may flag again
+    pub dm_dupe_rearm_days: u64,
+    /// Master switch for the daily staff alert (crond)
+    pub daily_enabled: bool,
+    /// UTC hour at or after which the daily scan runs
+    pub daily_run_hour_utc: u64,
+    /// Only accounts created within this many days are scanned
+    pub daily_account_age_days: u64,
+    /// Minimum non-friend DMs before an account is considered
+    pub daily_min_nonfriend_dms: usize,
+    /// Flag only when at most this share of those DMs got a reply
+    pub daily_max_reply_ratio: f64,
+    /// Flag only when the account sent at most this many non-DM messages
+    pub daily_max_public_messages: u64,
+    /// Days before the same account may be reported by the scan again
+    pub daily_report_cooldown_days: u64,
+    /// Cap on reports filed per daily run
+    pub daily_max_reports_per_run: usize,
+}
+
+impl Default for AntispamFeatures {
+    fn default() -> Self {
+        Self {
+            dm_dupe_enabled: false,
+            dm_dupe_pause: true,
+            dm_dupe_threshold: 3,
+            dm_dupe_window_hours: 24,
+            dm_dupe_min_chars: 30,
+            dm_dupe_rearm_days: 30,
+            daily_enabled: false,
+            daily_run_hour_utc: 14,
+            daily_account_age_days: 14,
+            daily_min_nonfriend_dms: 5,
+            daily_max_reply_ratio: 0.25,
+            daily_max_public_messages: 3,
+            daily_report_cooldown_days: 30,
+            daily_max_reports_per_run: 10,
+        }
+    }
+}
+
+impl AntispamFeatures {
+    /// Flag threshold, never below 2 (1 would flag every stranger DM)
+    pub fn threshold(&self) -> usize {
+        self.dm_dupe_threshold.max(2)
+    }
+
+    /// Minimum normalized length, never below 10
+    pub fn min_chars(&self) -> usize {
+        self.dm_dupe_min_chars.max(10)
+    }
+}
+
 #[derive(Deserialize, Debug, Clone)]
 pub struct Features {
     pub limits: FeaturesLimitsCollection,
@@ -1154,6 +1232,10 @@ pub struct Features {
     /// flip-requires-restart caveat)
     #[serde(default)]
     pub boosts: BoostFeatures,
+
+    /// Anti-spam (ships off; see AntispamFeatures docs)
+    #[serde(default)]
+    pub antispam: AntispamFeatures,
 
     #[serde(default)]
     pub advanced: FeaturesAdvanced,
@@ -1351,6 +1433,186 @@ mod boost_tests {
         // Disabled => always global, stored tiers notwithstanding
         boosts.enabled = false;
         assert_eq!(boosts.effective_server_emoji(100, 3), 100);
+    }
+}
+
+// Built from in-process sources only, never the cached `config()`, so no
+// local Revolt.overrides.toml or environment variable can skew the result.
+#[cfg(test)]
+mod antispam_config_tests {
+    use std::collections::HashMap;
+
+    use config::{Config, Environment, File, FileFormat};
+
+    use super::{AntispamFeatures, Settings};
+
+    /// The embedded Revolt.toml with its `[features.antispam]` table removed,
+    /// standing in for a config that never mentions the feature
+    fn embedded_without_antispam() -> String {
+        include_str!("../Revolt.toml")
+            .lines()
+            .filter(|line| {
+                let line = line.trim_start();
+                line != "[features.antispam]"
+                    && !line.starts_with("dm_dupe_")
+                    && !line.starts_with("daily_")
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Every field except `dm_dupe_enabled` at the planned default
+    fn assert_defaults_except_enabled(antispam: &AntispamFeatures) {
+        assert!(antispam.dm_dupe_pause);
+        assert_eq!(antispam.dm_dupe_threshold, 3);
+        assert_eq!(antispam.dm_dupe_window_hours, 24);
+        assert_eq!(antispam.dm_dupe_min_chars, 30);
+        assert_eq!(antispam.dm_dupe_rearm_days, 30);
+        assert!(!antispam.daily_enabled);
+        assert_eq!(antispam.daily_run_hour_utc, 14);
+        assert_eq!(antispam.daily_account_age_days, 14);
+        assert_eq!(antispam.daily_min_nonfriend_dms, 5);
+        assert_eq!(antispam.daily_max_reply_ratio, 0.25);
+        assert_eq!(antispam.daily_max_public_messages, 3);
+        assert_eq!(antispam.daily_report_cooldown_days, 30);
+        assert_eq!(antispam.daily_max_reports_per_run, 10);
+    }
+
+    fn assert_defaults(antispam: &AntispamFeatures) {
+        assert!(!antispam.dm_dupe_enabled);
+        assert_defaults_except_enabled(antispam);
+    }
+
+    #[test]
+    fn hand_written_default_has_the_planned_values() {
+        assert_defaults(&AntispamFeatures::default());
+    }
+
+    /// The embedded table must not drift from the code default
+    #[test]
+    fn embedded_table_matches_the_code_default() {
+        let settings: Settings = Config::builder()
+            .add_source(File::from_str(
+                include_str!("../Revolt.toml"),
+                FileFormat::Toml,
+            ))
+            .build()
+            .expect("the embedded Revolt.toml builds")
+            .try_deserialize()
+            .expect("the embedded Revolt.toml deserializes");
+
+        assert_defaults(&settings.features.antispam);
+    }
+
+    #[test]
+    fn missing_table_takes_the_defaults() {
+        let config = Config::builder()
+            .add_source(File::from_str(
+                &embedded_without_antispam(),
+                FileFormat::Toml,
+            ))
+            .build()
+            .expect("the stripped config builds");
+
+        // The table must really be gone, or this test proves nothing
+        assert!(config.get_table("features.antispam").is_err());
+
+        let settings: Settings = config
+            .try_deserialize()
+            .expect("a config without [features.antispam] must deserialize");
+
+        assert_defaults(&settings.features.antispam);
+    }
+
+    /// A partial table (what an overrides file holds) keeps every other default
+    #[test]
+    fn partial_table_keeps_the_other_defaults() {
+        let config = Config::builder()
+            .add_source(File::from_str(
+                &embedded_without_antispam(),
+                FileFormat::Toml,
+            ))
+            .add_source(File::from_str(
+                "[features.antispam]\ndm_dupe_enabled = true\n",
+                FileFormat::Toml,
+            ))
+            .build()
+            .expect("the partial config builds");
+
+        // Only the one key is present, so every other value is serde's default
+        assert!(config
+            .get_string("features.antispam.dm_dupe_threshold")
+            .is_err());
+
+        let settings: Settings = config
+            .try_deserialize()
+            .expect("a partial [features.antispam] table must deserialize");
+
+        assert!(settings.features.antispam.dm_dupe_enabled);
+        assert_defaults_except_enabled(&settings.features.antispam);
+    }
+
+    /// The documented env form (double underscores) reaches the nested keys,
+    /// including the float. Supplied in-process, as CONFIG_BUILDER reads it.
+    #[test]
+    fn environment_override_reaches_the_table() {
+        let vars = HashMap::from([
+            (
+                "REVOLT__FEATURES__ANTISPAM__DM_DUPE_ENABLED".to_owned(),
+                "true".to_owned(),
+            ),
+            (
+                "REVOLT__FEATURES__ANTISPAM__DM_DUPE_THRESHOLD".to_owned(),
+                "4".to_owned(),
+            ),
+            (
+                "REVOLT__FEATURES__ANTISPAM__DAILY_MAX_REPLY_RATIO".to_owned(),
+                "0.5".to_owned(),
+            ),
+        ]);
+
+        let settings: Settings = Config::builder()
+            .add_source(File::from_str(
+                include_str!("../Revolt.toml"),
+                FileFormat::Toml,
+            ))
+            .add_source(
+                Environment::with_prefix("REVOLT")
+                    .separator("__")
+                    .source(Some(vars)),
+            )
+            .build()
+            .expect("the config builds")
+            .try_deserialize()
+            .expect("the config deserializes");
+
+        let antispam = &settings.features.antispam;
+        assert!(antispam.dm_dupe_enabled);
+        assert_eq!(antispam.dm_dupe_threshold, 4);
+        assert_eq!(antispam.daily_max_reply_ratio, 0.5);
+        assert!(antispam.dm_dupe_pause);
+        assert_eq!(antispam.dm_dupe_min_chars, 30);
+    }
+
+    #[test]
+    fn helpers_clamp_misconfigured_values() {
+        let mut antispam = AntispamFeatures {
+            dm_dupe_threshold: 0,
+            dm_dupe_min_chars: 1,
+            ..Default::default()
+        };
+        assert_eq!(antispam.threshold(), 2);
+        assert_eq!(antispam.min_chars(), 10);
+
+        antispam.dm_dupe_threshold = 1;
+        antispam.dm_dupe_min_chars = 0;
+        assert_eq!(antispam.threshold(), 2);
+        assert_eq!(antispam.min_chars(), 10);
+
+        // Sane values pass through untouched
+        let antispam = AntispamFeatures::default();
+        assert_eq!(antispam.threshold(), 3);
+        assert_eq!(antispam.min_chars(), 30);
     }
 }
 

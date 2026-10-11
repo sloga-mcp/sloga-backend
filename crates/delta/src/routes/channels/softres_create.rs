@@ -1,3 +1,5 @@
+use revolt_config::config;
+use revolt_database::util::antispam;
 use revolt_database::util::idempotency::IdempotencyKey;
 use revolt_database::util::permissions::DatabasePermissionQuery;
 use revolt_database::util::reference::Reference;
@@ -71,6 +73,19 @@ pub async fn softres_create(
 
     // Archived or locked threads reject sheets exactly like normal messages.
     crate::util::threads::ensure_thread_writable(&channel, &permissions)?;
+
+    // A paused account cannot reach a stranger through a sheet either.
+    // Checked before any side effect (slowmode key, nonce, sheet row). No
+    // observer: the fallback content is fixed-format, not user text.
+    let dm_peer = if let Channel::DirectMessage { recipients, .. } = &channel {
+        recipients.iter().find(|id| *id != &user.id).cloned()
+    } else {
+        None
+    };
+    if let Some(peer) = &dm_peer {
+        let antispam = config().await.features.antispam.clone();
+        antispam::dm_send_allowed(db, &antispam, &user, channel.id(), peer).await?;
+    }
 
     crate::util::slowmode::enforce_slowmode(&user, &channel, &permissions).await?;
 
@@ -290,11 +305,168 @@ pub async fn softres_create(
 
 #[cfg(test)]
 mod test {
-    use crate::{rocket, util::test::TestHarness};
-    use revolt_database::MessageFlagsValue;
+    use crate::{
+        rocket,
+        util::test::{statement_at, without_comments, without_whitespace, TestHarness},
+    };
+    use revolt_config::config;
+    use revolt_database::{
+        iso8601_timestamp::Timestamp, Channel, DmGuard, Member, Message, MessageFilter,
+        MessageFlagsValue, MessageQuery, MessageTimePeriod, Session,
+    };
     use revolt_models::v0::{self, MessageFlags};
     use rocket::http::{ContentType, Header, Status};
     use serde_json::json;
+
+    /// POST a minimal valid sheet into `channel_id` as `session`.
+    async fn create_sheet(
+        harness: &TestHarness,
+        session: &Session,
+        channel_id: &str,
+    ) -> (Status, serde_json::Value) {
+        let response = harness
+            .client
+            .post(format!("/channels/{channel_id}/softres"))
+            .header(Header::new("x-session-token", session.token.to_string()))
+            .header(ContentType::JSON)
+            .body(
+                json!({ "title": "Sunday MC", "edition": "classic", "raids": ["mc"] }).to_string(),
+            )
+            .dispatch()
+            .await;
+        let status = response.status();
+        let body = response
+            .into_json::<serde_json::Value>()
+            .await
+            .expect("json body");
+        (status, body)
+    }
+
+    async fn messages_by(harness: &TestHarness, channel_id: &str, author: &str) -> Vec<Message> {
+        harness
+            .db
+            .fetch_messages(MessageQuery {
+                limit: Some(10),
+                filter: MessageFilter {
+                    channel: Some(channel_id.to_string()),
+                    author: Some(author.to_string()),
+                    ..Default::default()
+                },
+                time_period: MessageTimePeriod::Absolute {
+                    before: None,
+                    after: None,
+                    sort: None,
+                },
+            })
+            .await
+            .expect("fetch_messages")
+    }
+
+    /// A paused sender cannot open a conversation with a silent stranger
+    /// through a sheet; once the stranger has written in the DM it can.
+    /// Mutation: the `dm_send_allowed` gate removed.
+    #[test]
+    #[ignore = "needs REVOLT__FEATURES__ANTISPAM__DM_DUPE_ENABLED=true"]
+    fn antispam_route_softres_paused_refused() {
+        crate::util::test::rt().block_on(antispam_route_softres_paused_refused_case())
+    }
+
+    async fn antispam_route_softres_paused_refused_case() {
+        assert!(
+            config().await.features.antispam.dm_dupe_enabled,
+            "run with REVOLT__FEATURES__ANTISPAM__DM_DUPE_ENABLED=true"
+        );
+
+        let harness = TestHarness::new().await;
+        let (_, session, spammer) = harness.new_user().await;
+        let (_, _, stranger) = harness.new_user().await;
+
+        // A mutual server grants SendMessage in the DM, so only the pause can
+        // refuse the sheet.
+        let (server, _) = harness.new_server(&spammer).await;
+        for user in [&spammer, &stranger] {
+            Member::create(&harness.db, &server, user, None)
+                .await
+                .expect("member");
+        }
+        let dm = Channel::create_dm(&harness.db, &spammer, &stranger)
+            .await
+            .expect("DM");
+        assert!(matches!(dm, Channel::DirectMessage { .. }), "{:?}", dm);
+
+        // Pause the sender the way the detector would; the route loads the
+        // caller from the session, so the stored copy is what it sees.
+        let guard = DmGuard {
+            report_id: ulid::Ulid::new().to_string(),
+            flagged_at: Timestamp::now_utc(),
+            paused: true,
+            cleared_at: None,
+            recipients: 3,
+            fingerprint: "test".into(),
+        };
+        assert!(
+            harness
+                .db
+                .claim_dm_guard(&spammer.id, &guard, Timestamp::now_utc())
+                .await
+                .expect("claim_dm_guard"),
+            "the fresh user must take the guard"
+        );
+
+        let (status, body) = create_sheet(&harness, &session, dm.id()).await;
+        assert_eq!(status, Status::Forbidden, "{body}");
+        assert_eq!(body["type"], "DirectMessagesPaused", "{body}");
+        assert!(
+            messages_by(&harness, dm.id(), &spammer.id).await.is_empty(),
+            "a refused sheet must not post its message"
+        );
+
+        // Control: once the stranger has written in the DM the same sheet goes
+        // through, so the refusal above is the pause and not the permission
+        // check.
+        harness
+            .db
+            .insert_message(&Message {
+                id: ulid::Ulid::new().to_string(),
+                channel: dm.id().to_string(),
+                author: stranger.id.clone(),
+                content: Some("hello".to_string()),
+                ..Default::default()
+            })
+            .await
+            .expect("reply");
+
+        let (status, body) = create_sheet(&harness, &session, dm.id()).await;
+        assert_eq!(status, Status::Ok, "{body}");
+        assert_eq!(body["author"], spammer.id.as_str(), "{body}");
+        assert_eq!(messages_by(&harness, dm.id(), &spammer.id).await.len(), 1);
+    }
+
+    /// The DM pause gate runs before every side effect of the route: the
+    /// slowmode key, the nonce and the sheet row. Mutation: the gate moved
+    /// below any of them.
+    #[test]
+    fn the_dm_pause_gate_precedes_every_side_effect() {
+        let source = include_str!("softres_create.rs");
+        let shipping = &source[..source.find("#[cfg(test)]").expect("a test module")];
+        let code = without_whitespace(&without_comments(shipping));
+
+        let gate = statement_at(
+            &code,
+            "antispam::dm_send_allowed(db,&antispam,&user,channel.id(),peer).await?;",
+        );
+        for side_effect in [
+            "crate::util::slowmode::enforce_slowmode(&user,&channel,&permissions).await?;",
+            "idempotency.consume_nonce(data.nonce).await.map_err(|_|create_error!(InvalidOperation))?;",
+            "db.insert_sheet(&sheet).await?;",
+        ] {
+            assert!(
+                gate < statement_at(&code, side_effect),
+                "the DM pause gate must precede `{}`",
+                side_effect
+            );
+        }
+    }
 
     #[test]
     fn create_sheet_creates_flagged_message_with_definition() {

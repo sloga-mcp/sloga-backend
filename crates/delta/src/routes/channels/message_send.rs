@@ -1,9 +1,10 @@
 use std::time::Duration;
 
+use revolt_config::config;
 use revolt_database::events::client::EventV1;
 use revolt_database::util::permissions::DatabasePermissionQuery;
 use revolt_database::{
-    util::idempotency::IdempotencyKey, util::reference::Reference, Database, User,
+    util::antispam, util::idempotency::IdempotencyKey, util::reference::Reference, Database, User,
 };
 use revolt_database::{Channel, Interactions, Message, Referral, ReferralActivity, AMQP};
 use revolt_models::v0;
@@ -127,6 +128,29 @@ pub async fn message_send(
     // Notes to self don't count towards a pending referral.
     let counts_for_referral = !matches!(channel, Channel::SavedMessages { .. });
 
+    // Anti-spam looks at direct messages only (never groups, saved messages
+    // or server channels), so capture the DM's id and peer before `channel`
+    // is consumed by the send.
+    let dm_peer = if let Channel::DirectMessage { id, recipients, .. } = &channel {
+        recipients
+            .iter()
+            .find(|recipient| *recipient != &user.id)
+            .map(|peer| (id.clone(), peer.clone()))
+    } else {
+        None
+    };
+
+    // A paused account may keep talking to anyone who has written to it, but
+    // may not open conversations with strangers. Checked before anything is
+    // stored (message, attachments, embeds).
+    let antispam_config = if let Some((channel_id, peer)) = &dm_peer {
+        let antispam_config = config().await.features.antispam.clone();
+        antispam::dm_send_allowed(db, &antispam_config, &user, channel_id, peer).await?;
+        Some(antispam_config)
+    } else {
+        None
+    };
+
     let message = Message::create_from_api(
         db,
         Some(amqp),
@@ -148,6 +172,23 @@ pub async fn message_send(
         Referral::record_activity(db, &user, ReferralActivity::Message).await;
     }
 
+    // Copy-paste DM detection runs on the stored message (it carries the
+    // text embeds) off the request path: it never fails or delays the send.
+    if let (Some((channel_id, peer)), Some(antispam_config)) = (dm_peer, antispam_config) {
+        let (db, user, message) = (db.inner().clone(), user.clone(), message.clone());
+        tokio::spawn(async move {
+            antispam::observe_dm_message(
+                &db,
+                &antispam_config,
+                &user,
+                &channel_id,
+                &peer,
+                &message,
+            )
+            .await;
+        });
+    }
+
     // Sending in a thread joins you to it (Discord parity), so you start
     // receiving its notifications.
     if let Some((thread_id, server_id)) = thread_info {
@@ -167,9 +208,15 @@ pub async fn message_send(
 #[cfg(test)]
 mod test {
     use std::collections::HashMap;
+    use std::time::{Duration, Instant};
 
     use crate::{rocket, util::test::TestHarness};
+    use revolt_config::config;
     use revolt_database::{events::client::EventV1, Bot};
+    use revolt_database::{
+        iso8601_timestamp::Timestamp, DmGuard, MessageFilter, MessageQuery, MessageTimePeriod,
+        RelationshipStatus, Report, Session, User, SYSTEM_USER_ID,
+    };
     use revolt_database::{
         util::{idempotency::IdempotencyKey, reference::Reference},
         Channel, Member, Message, MessageFlagsValue, PartialChannel, PartialMember, Role, Server,
@@ -1161,5 +1208,452 @@ mod test {
         let response = send(channel.id().to_string(), json!({ "content": "hello" })).await;
         assert_eq!(response.status(), Status::Ok);
         assert_eq!(referral_message_count(&harness, &user.id).await, 1);
+    }
+
+    // Anti-spam: the same text sent to several strangers in DMs.
+    //
+    // Delta reads the cached global config, which keeps the detector off in
+    // tests, so the `antispam_route_*` tests are ignored by default and run
+    // with `REVOLT__FEATURES__ANTISPAM__DM_DUPE_ENABLED=true` and `--ignored`.
+    // The observer is spawned off the request, so they poll for its result.
+
+    /// The scam that prompted the detector: long enough to be fingerprinted
+    const SCAM: &str = "Hi! I love your profile picture, can I use it for an art project \
+                        for my client? I'll pay you and credit you.";
+
+    /// A message that is only an invite link, as "Invite to server" sends
+    const INVITE: &str = "https://app.sloga.gg/invite/abc";
+
+    /// How long the spawned observer gets before a test gives up on it
+    const OBSERVE_TIMEOUT: Duration = Duration::from_secs(5);
+
+    /// How long a test watches for a flag that must NOT appear
+    const OBSERVE_SETTLE: Duration = Duration::from_millis(1500);
+
+    const OBSERVE_POLL: Duration = Duration::from_millis(100);
+
+    /// Put `members` in one server (owned by someone else), so each pair may
+    /// DM through the mutual server without being friends
+    async fn share_server(harness: &TestHarness, members: &[&User]) {
+        let (_, _, owner) = harness.new_user().await;
+        let (server, _) = harness.new_server(&owner).await;
+        for member in members {
+            Member::create(&harness.db, &server, member, None)
+                .await
+                .expect("Failed to add test member");
+        }
+    }
+
+    /// A DM between `a` and `b`, inserted directly so each test controls
+    /// exactly which DMs exist
+    async fn new_dm(harness: &TestHarness, a: &User, b: &User) -> String {
+        let id = ulid::Ulid::new().to_string();
+        harness
+            .db
+            .insert_channel(&Channel::DirectMessage {
+                id: id.clone(),
+                active: true,
+                recipients: vec![a.id.clone(), b.id.clone()],
+                last_message_id: None,
+            })
+            .await
+            .expect("Failed to create test DM");
+        id
+    }
+
+    /// Send `content` through the route; the status and the JSON body
+    async fn send_as(
+        harness: &TestHarness,
+        session: &Session,
+        channel_id: &str,
+        content: &str,
+    ) -> (Status, serde_json::Value) {
+        let response = harness
+            .client
+            .post(format!("/channels/{channel_id}/messages"))
+            .header(Header::new("x-session-token", session.token.to_string()))
+            .header(ContentType::JSON)
+            .body(json!({ "content": content }).to_string())
+            .dispatch()
+            .await;
+        let status = response.status();
+        let body = response
+            .into_json::<serde_json::Value>()
+            .await
+            .unwrap_or_default();
+        (status, body)
+    }
+
+    /// Send `content` and expect it to be accepted; the new message's id
+    async fn send_ok(
+        harness: &TestHarness,
+        session: &Session,
+        channel_id: &str,
+        content: &str,
+    ) -> String {
+        let (status, body) = send_as(harness, session, channel_id, content).await;
+        assert_eq!(status, Status::Ok, "send to {channel_id} refused: {body}");
+        body["_id"].as_str().expect("message id").to_string()
+    }
+
+    /// The guard the observer set on `user_id`, waiting for it
+    async fn wait_for_dm_guard(harness: &TestHarness, user_id: &str) -> DmGuard {
+        let deadline = Instant::now() + OBSERVE_TIMEOUT;
+        loop {
+            let user = harness.db.fetch_user(user_id).await.expect("user");
+            if let Some(guard) = user.dm_guard {
+                return guard;
+            }
+
+            assert!(
+                Instant::now() < deadline,
+                "no DM guard after {:?}",
+                OBSERVE_TIMEOUT
+            );
+            tokio::time::sleep(OBSERVE_POLL).await;
+        }
+    }
+
+    /// Watch `user_id` for a while and fail if a guard appears
+    async fn assert_no_dm_guard(harness: &TestHarness, user_id: &str, context: &str) {
+        let deadline = Instant::now() + OBSERVE_SETTLE;
+        loop {
+            let user = harness.db.fetch_user(user_id).await.expect("user");
+            assert!(
+                user.dm_guard.is_none(),
+                "{}: the sender was flagged",
+                context
+            );
+
+            if Instant::now() >= deadline {
+                return;
+            }
+            tokio::time::sleep(OBSERVE_POLL).await;
+        }
+    }
+
+    /// The report filed under `report_id`, waiting for it (the guard is
+    /// claimed before the report is written)
+    async fn wait_for_report(harness: &TestHarness, report_id: &str) -> Report {
+        let deadline = Instant::now() + OBSERVE_TIMEOUT;
+        loop {
+            if let Ok(report) = harness.db.fetch_report(report_id).await {
+                return report;
+            }
+
+            assert!(
+                Instant::now() < deadline,
+                "no report {} after {:?}",
+                report_id,
+                OBSERVE_TIMEOUT
+            );
+            tokio::time::sleep(OBSERVE_POLL).await;
+        }
+    }
+
+    /// Pause `user` the way the detector does, without running it
+    async fn pause_dms(harness: &TestHarness, user: &User) {
+        let guard = DmGuard {
+            report_id: ulid::Ulid::new().to_string(),
+            flagged_at: Timestamp::now_utc(),
+            paused: true,
+            cleared_at: None,
+            recipients: 3,
+            fingerprint: "test".into(),
+        };
+        assert!(
+            harness
+                .db
+                .claim_dm_guard(&user.id, &guard, Timestamp::now_utc())
+                .await
+                .expect("Failed to claim the DM guard"),
+            "precondition: the guard was claimed"
+        );
+    }
+
+    async fn dm_message_count(harness: &TestHarness, channel_id: &str) -> usize {
+        harness
+            .db
+            .fetch_messages(MessageQuery {
+                limit: Some(10),
+                filter: MessageFilter {
+                    channel: Some(channel_id.to_string()),
+                    ..Default::default()
+                },
+                time_period: MessageTimePeriod::Absolute {
+                    before: None,
+                    after: None,
+                    sort: None,
+                },
+            })
+            .await
+            .expect("Failed to fetch DM messages")
+            .len()
+    }
+
+    /// The third stranger who got the same text and never answered files an
+    /// automated report and pauses the sender, whose next new stranger is
+    /// then refused.
+    #[test]
+    #[ignore = "needs REVOLT__FEATURES__ANTISPAM__DM_DUPE_ENABLED=true"]
+    fn antispam_route_third_silent_stranger_files_report_and_pauses() {
+        crate::util::test::rt()
+            .block_on(antispam_route_third_silent_stranger_files_report_and_pauses_case())
+    }
+
+    async fn antispam_route_third_silent_stranger_files_report_and_pauses_case() {
+        assert!(
+            config().await.features.antispam.dm_dupe_enabled,
+            "run with REVOLT__FEATURES__ANTISPAM__DM_DUPE_ENABLED=true"
+        );
+
+        let harness = TestHarness::new().await;
+        let (_, session, sender) = harness.new_user().await;
+        let mut strangers = Vec::new();
+        for _ in 0..4 {
+            strangers.push(harness.new_user().await.2);
+        }
+        let mut members: Vec<&User> = strangers.iter().collect();
+        members.push(&sender);
+        share_server(&harness, &members).await;
+
+        let mut sent = Vec::new();
+        for stranger in &strangers[..3] {
+            let dm = new_dm(&harness, &sender, stranger).await;
+            sent.push(send_ok(&harness, &session, &dm, SCAM).await);
+        }
+
+        let guard = wait_for_dm_guard(&harness, &sender.id).await;
+        assert!(guard.paused, "the default config pauses");
+        assert_eq!(guard.recipients, 3);
+        assert!(
+            harness
+                .db
+                .fetch_user(&sender.id)
+                .await
+                .expect("user")
+                .is_dm_paused(),
+            "the sender is paused"
+        );
+
+        let report = wait_for_report(&harness, &guard.report_id).await;
+        assert_eq!(report.author_id, SYSTEM_USER_ID);
+        match &report.content {
+            v0::ReportedContent::User {
+                id,
+                report_reason,
+                message_id,
+            } => {
+                assert_eq!(id, &sender.id, "the report is about the sender");
+                assert_eq!(*report_reason, v0::UserReportReason::SpamAbuse);
+                assert!(
+                    message_id
+                        .as_ref()
+                        .is_some_and(|message| sent.contains(message)),
+                    "the report points at one of the copies, got {:?}",
+                    message_id
+                );
+            }
+            other => panic!("expected a user report, got {:?}", other),
+        }
+
+        // A fourth stranger who never wrote is now out of reach
+        let dm = new_dm(&harness, &sender, &strangers[3]).await;
+        let (status, body) = send_as(&harness, &session, &dm, SCAM).await;
+        assert_eq!(status, Status::Forbidden, "{body}");
+        assert_eq!(body["type"], "DirectMessagesPaused");
+        assert_eq!(dm_message_count(&harness, &dm).await, 0, "nothing stored");
+    }
+
+    /// The same text to friends and an invite link to strangers are normal
+    /// use, and never flag. Ends with the scam to the same strangers, which
+    /// does flag: proof the detector ran in this test at all.
+    #[test]
+    #[ignore = "needs REVOLT__FEATURES__ANTISPAM__DM_DUPE_ENABLED=true"]
+    fn antispam_route_friends_and_invites_not_flagged() {
+        crate::util::test::rt().block_on(antispam_route_friends_and_invites_not_flagged_case())
+    }
+
+    async fn antispam_route_friends_and_invites_not_flagged_case() {
+        assert!(
+            config().await.features.antispam.dm_dupe_enabled,
+            "run with REVOLT__FEATURES__ANTISPAM__DM_DUPE_ENABLED=true"
+        );
+
+        let harness = TestHarness::new().await;
+        let (_, session, mut sender) = harness.new_user().await;
+        let mut friends = Vec::new();
+        let mut strangers = Vec::new();
+        for _ in 0..3 {
+            friends.push(harness.new_user().await.2);
+            strangers.push(harness.new_user().await.2);
+        }
+        let mut members: Vec<&User> = friends.iter().chain(strangers.iter()).collect();
+        members.push(&sender);
+        share_server(&harness, &members).await;
+
+        for friend in &mut friends {
+            sender
+                .apply_relationship(
+                    &harness.db,
+                    friend,
+                    RelationshipStatus::Friend,
+                    RelationshipStatus::Friend,
+                    None,
+                )
+                .await
+                .expect("friendship");
+        }
+
+        for friend in &friends {
+            let dm = new_dm(&harness, &sender, friend).await;
+            send_ok(&harness, &session, &dm, SCAM).await;
+        }
+
+        let mut stranger_dms = Vec::new();
+        for stranger in &strangers {
+            let dm = new_dm(&harness, &sender, stranger).await;
+            send_ok(&harness, &session, &dm, INVITE).await;
+            stranger_dms.push(dm);
+        }
+
+        assert_no_dm_guard(&harness, &sender.id, "friends and invite links").await;
+
+        // Control: the same strangers, the scam this time
+        for dm in &stranger_dms {
+            send_ok(&harness, &session, dm, SCAM).await;
+        }
+
+        let guard = wait_for_dm_guard(&harness, &sender.id).await;
+        assert_eq!(guard.recipients, 3, "only the strangers count");
+    }
+
+    /// A stranger who writes back is a conversation, not a target: it drops
+    /// out of the count, and the flag needs three others who stayed silent.
+    #[test]
+    #[ignore = "needs REVOLT__FEATURES__ANTISPAM__DM_DUPE_ENABLED=true"]
+    fn antispam_route_reply_removes_that_peer() {
+        crate::util::test::rt().block_on(antispam_route_reply_removes_that_peer_case())
+    }
+
+    async fn antispam_route_reply_removes_that_peer_case() {
+        assert!(
+            config().await.features.antispam.dm_dupe_enabled,
+            "run with REVOLT__FEATURES__ANTISPAM__DM_DUPE_ENABLED=true"
+        );
+
+        let harness = TestHarness::new().await;
+        let (_, session, sender) = harness.new_user().await;
+        let (_, replier_session, replier) = harness.new_user().await;
+        let mut silent = Vec::new();
+        for _ in 0..3 {
+            silent.push(harness.new_user().await.2);
+        }
+        let mut members: Vec<&User> = silent.iter().collect();
+        members.push(&sender);
+        members.push(&replier);
+        share_server(&harness, &members).await;
+
+        let replier_dm = new_dm(&harness, &sender, &replier).await;
+        send_ok(&harness, &session, &replier_dm, SCAM).await;
+        send_ok(
+            &harness,
+            &replier_session,
+            &replier_dm,
+            "sure, what is it for?",
+        )
+        .await;
+
+        let first_dm = new_dm(&harness, &sender, &silent[0]).await;
+        send_ok(&harness, &session, &first_dm, SCAM).await;
+        let second_dm = new_dm(&harness, &sender, &silent[1]).await;
+        send_ok(&harness, &session, &second_dm, SCAM).await;
+
+        assert_no_dm_guard(&harness, &sender.id, "one of three replied").await;
+
+        let third_dm = new_dm(&harness, &sender, &silent[2]).await;
+        send_ok(&harness, &session, &third_dm, SCAM).await;
+
+        let guard = wait_for_dm_guard(&harness, &sender.id).await;
+        assert_eq!(guard.recipients, 3, "the replier is not counted");
+    }
+
+    /// A paused sender cannot reach a stranger who never wrote (and nothing is
+    /// stored), but can keep talking to one who did.
+    #[test]
+    #[ignore = "needs REVOLT__FEATURES__ANTISPAM__DM_DUPE_ENABLED=true"]
+    fn antispam_route_paused_sender_refused_but_replied_peer_allowed() {
+        crate::util::test::rt()
+            .block_on(antispam_route_paused_sender_refused_but_replied_peer_allowed_case())
+    }
+
+    async fn antispam_route_paused_sender_refused_but_replied_peer_allowed_case() {
+        assert!(
+            config().await.features.antispam.dm_dupe_enabled,
+            "run with REVOLT__FEATURES__ANTISPAM__DM_DUPE_ENABLED=true"
+        );
+
+        let harness = TestHarness::new().await;
+        let (_, session, sender) = harness.new_user().await;
+        let (_, _, silent) = harness.new_user().await;
+        let (_, chatty_session, chatty) = harness.new_user().await;
+        share_server(&harness, &[&sender, &silent, &chatty]).await;
+
+        let silent_dm = new_dm(&harness, &sender, &silent).await;
+        let chatty_dm = new_dm(&harness, &sender, &chatty).await;
+        send_ok(
+            &harness,
+            &chatty_session,
+            &chatty_dm,
+            "hey, saw you in the server",
+        )
+        .await;
+
+        pause_dms(&harness, &sender).await;
+
+        let (status, body) = send_as(&harness, &session, &silent_dm, "hi").await;
+        assert_eq!(status, Status::Forbidden, "{body}");
+        assert_eq!(body["type"], "DirectMessagesPaused");
+        assert_eq!(
+            dm_message_count(&harness, &silent_dm).await,
+            0,
+            "nothing stored"
+        );
+
+        send_ok(&harness, &session, &chatty_dm, "hi").await;
+    }
+
+    /// `dm_dupe_enabled = false` is the kill switch: it lifts every standing
+    /// pause, so a paused sender reaches a silent stranger again.
+    #[test]
+    fn antispam_kill_switch_lifts_pause_on_send() {
+        crate::util::test::rt().block_on(antispam_kill_switch_lifts_pause_on_send_case())
+    }
+
+    async fn antispam_kill_switch_lifts_pause_on_send_case() {
+        assert!(
+            !config().await.features.antispam.dm_dupe_enabled,
+            "precondition: the test config keeps the detector off"
+        );
+
+        let harness = TestHarness::new().await;
+        let (_, session, sender) = harness.new_user().await;
+        let (_, _, silent) = harness.new_user().await;
+        share_server(&harness, &[&sender, &silent]).await;
+
+        let dm = new_dm(&harness, &sender, &silent).await;
+        pause_dms(&harness, &sender).await;
+        assert!(
+            harness
+                .db
+                .fetch_user(&sender.id)
+                .await
+                .expect("user")
+                .is_dm_paused(),
+            "precondition: the sender is paused"
+        );
+
+        send_ok(&harness, &session, &dm, SCAM).await;
+        assert_eq!(dm_message_count(&harness, &dm).await, 1);
     }
 }

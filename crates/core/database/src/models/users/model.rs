@@ -98,6 +98,9 @@ auto_derived_partial!(
         /// Donation state (private, never on the v0 user)
         #[serde(skip_serializing_if = "Option::is_none")]
         pub supporter: Option<Supporter>,
+        /// Anti-spam DM state (private, never on the v0 user)
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub dm_guard: Option<DmGuard>,
 
         /// Time until user is unsuspended
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -130,6 +133,7 @@ auto_derived!(
         ReferralPending,
         WelcomedAt,
         ReferralCount,
+        DmGuard,
         None,
     }
 
@@ -168,6 +172,24 @@ auto_derived!(
         /// Whether supporter badges are shown (on unless opted out)
         #[serde(default = "show_badges_default")]
         pub show_badges: bool,
+    }
+
+    /// Private anti-spam state set by the copy-paste DM detector; never
+    /// exposed through any API type
+    pub struct DmGuard {
+        /// Id of the system report filed when the guard was set
+        pub report_id: String,
+        /// When the detector flagged the user
+        pub flagged_at: Timestamp,
+        /// Whether new DMs are paused
+        pub paused: bool,
+        /// When staff cleared the pause
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub cleared_at: Option<Timestamp>,
+        /// Distinct recipients that received the repeated content
+        pub recipients: u32,
+        /// Fingerprint of the repeated content
+        pub fingerprint: String,
     }
 
     /// Custom profile badge
@@ -360,6 +382,7 @@ impl Default for User {
             referral_pending: Default::default(),
             welcomed_at: Default::default(),
             supporter: Default::default(),
+            dm_guard: Default::default(),
             suspended_until: Default::default(),
             last_acknowledged_policy_change: Timestamp::UNIX_EPOCH,
         }
@@ -448,6 +471,11 @@ impl User {
             self.relationship_with(user_b),
             RelationshipStatus::Friend | RelationshipStatus::User
         )
+    }
+
+    /// Whether new DMs from this user are paused by the anti-spam guard
+    pub fn is_dm_paused(&self) -> bool {
+        matches!(&self.dm_guard, Some(g) if g.paused && g.cleared_at.is_none())
     }
 
     /// Check whether two users have a mutual connection
@@ -1150,6 +1178,7 @@ impl User {
             FieldsUser::ReferralPending => self.referral_pending = None,
             FieldsUser::WelcomedAt => self.welcomed_at = None,
             FieldsUser::ReferralCount => self.referral_count = None,
+            FieldsUser::DmGuard => self.dm_guard = None,
             FieldsUser::None => {}
         }
     }

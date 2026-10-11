@@ -26,6 +26,7 @@ impl<'r> Responder<'r, 'static> for Error {
             ErrorType::Blocked => Status::Conflict,
             ErrorType::BlockedByOther => Status::Forbidden,
             ErrorType::NotFriends => Status::Forbidden,
+            ErrorType::DirectMessagesPaused => Status::Forbidden,
             ErrorType::ProfileIsPrivate => Status::Forbidden,
             ErrorType::TooManyPendingFriendRequests { .. } => Status::BadRequest,
 

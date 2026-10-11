@@ -1,6 +1,7 @@
+use iso8601_timestamp::Timestamp;
 use revolt_result::Result;
 
-use crate::{Channel, FieldsUser, PartialUser, RelationshipStatus, Supporter, User};
+use crate::{Channel, DmGuard, FieldsUser, PartialUser, RelationshipStatus, Supporter, User};
 use crate::{ReferenceDb, Relationship};
 
 /// Empty supporter record written when a user gains one for the first time
@@ -364,14 +365,374 @@ impl AbstractUsers for ReferenceDb {
         supporter.show_badges = show;
         Ok(())
     }
+
+    /// Set a user's DM guard
+    async fn claim_dm_guard(
+        &self,
+        user_id: &str,
+        guard: &DmGuard,
+        rearm_before: Timestamp,
+    ) -> Result<bool> {
+        let mut users = self.users.lock().await;
+        let Some(user) = users.get_mut(user_id) else {
+            return Ok(false);
+        };
+
+        let claimable = match &user.dm_guard {
+            None => true,
+            Some(existing) => existing
+                .cleared_at
+                .is_some_and(|cleared_at| cleared_at < rearm_before),
+        };
+
+        if claimable {
+            user.dm_guard = Some(guard.clone());
+        }
+
+        Ok(claimable)
+    }
+
+    /// Lift the DM pause of the guard filed under `report_id`
+    async fn clear_dm_guard_pause(
+        &self,
+        user_id: &str,
+        report_id: &str,
+        at: Timestamp,
+    ) -> Result<bool> {
+        let mut users = self.users.lock().await;
+        let guard = users
+            .get_mut(user_id)
+            .and_then(|user| user.dm_guard.as_mut())
+            .filter(|guard| guard.report_id == report_id);
+
+        if let Some(guard) = guard {
+            guard.paused = false;
+            guard.cleared_at = Some(at);
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    /// Remove the DM guard filed under `report_id`
+    async fn release_dm_guard(&self, user_id: &str, report_id: &str) -> Result<bool> {
+        let mut users = self.users.lock().await;
+        let Some(user) = users.get_mut(user_id) else {
+            return Ok(false);
+        };
+
+        if user
+            .dm_guard
+            .as_ref()
+            .is_some_and(|guard| guard.report_id == report_id)
+        {
+            user.dm_guard = None;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    /// Fetch unguarded, unflagged human users created since `cutoff_id`
+    async fn fetch_users_created_since(&self, cutoff_id: &str) -> Result<Vec<User>> {
+        let users = self.users.lock().await;
+        Ok(users
+            .values()
+            .filter(|u| {
+                u.id.as_str() >= cutoff_id
+                    && u.bot.is_none()
+                    && !u.privileged
+                    && u.flags.unwrap_or(0) == 0
+                    && u.dm_guard.is_none()
+            })
+            .cloned()
+            .collect())
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::User;
+    use iso8601_timestamp::{Duration, Timestamp};
+
+    use crate::{BotInformation, DmGuard, PartialUser, User};
 
     fn ids(users: &[User]) -> Vec<&str> {
         users.iter().map(|user| user.id.as_str()).collect()
+    }
+
+    fn guard(report_id: &str) -> DmGuard {
+        DmGuard {
+            report_id: report_id.to_string(),
+            flagged_at: Timestamp::now_utc(),
+            paused: true,
+            cleared_at: None,
+            recipients: 5,
+            fingerprint: "fingerprint".to_string(),
+        }
+    }
+
+    fn hours_from_now(hours: i64) -> Timestamp {
+        Timestamp::now_utc()
+            .checked_add(Duration::hours(hours))
+            .unwrap()
+    }
+
+    /// Both drivers: only one claim wins, and a cleared guard re-arms only
+    /// once its clear is older than the cutoff
+    #[tokio::test]
+    async fn dm_guard_claim_is_exclusive_and_rearms_after_clear() {
+        database_test!(|db| async move {
+            let user = User::create(&db, "Spammer".to_string(), None, None)
+                .await
+                .unwrap();
+
+            assert!(db
+                .claim_dm_guard(&user.id, &guard("r1"), Timestamp::now_utc())
+                .await
+                .unwrap());
+            // A live guard is never replaced, whatever the cutoff
+            assert!(!db
+                .claim_dm_guard(&user.id, &guard("r2"), hours_from_now(1))
+                .await
+                .unwrap());
+
+            let fetched = db.fetch_user(&user.id).await.unwrap();
+            assert_eq!(fetched.dm_guard.as_ref().unwrap().report_id, "r1");
+            assert!(fetched.is_dm_paused());
+
+            assert!(db
+                .clear_dm_guard_pause(&user.id, "r1", Timestamp::now_utc())
+                .await
+                .unwrap());
+            let fetched = db.fetch_user(&user.id).await.unwrap();
+            assert!(!fetched.is_dm_paused());
+            let cleared = fetched.dm_guard.unwrap();
+            assert_eq!(cleared.report_id, "r1");
+            assert!(!cleared.paused);
+            assert!(cleared.cleared_at.is_some());
+
+            // Cleared after the cutoff: still shielded from a re-flag
+            assert!(!db
+                .claim_dm_guard(&user.id, &guard("r2"), hours_from_now(-1))
+                .await
+                .unwrap());
+            assert_eq!(
+                db.fetch_user(&user.id)
+                    .await
+                    .unwrap()
+                    .dm_guard
+                    .unwrap()
+                    .report_id,
+                "r1"
+            );
+
+            // Cleared before the cutoff: re-arms
+            assert!(db
+                .claim_dm_guard(&user.id, &guard("r3"), hours_from_now(1))
+                .await
+                .unwrap());
+            let fetched = db.fetch_user(&user.id).await.unwrap();
+            assert_eq!(fetched.dm_guard.as_ref().unwrap().report_id, "r3");
+            assert!(fetched.is_dm_paused());
+
+            // An unknown user claims nothing
+            assert!(!db
+                .claim_dm_guard(
+                    &ulid::Ulid::new().to_string(),
+                    &guard("r4"),
+                    hours_from_now(1)
+                )
+                .await
+                .unwrap());
+        });
+    }
+
+    /// Both drivers: clear and release act only on the matching report id
+    #[tokio::test]
+    async fn dm_guard_clear_and_release_need_matching_report() {
+        database_test!(|db| async move {
+            let user = User::create(&db, "Spammer".to_string(), None, None)
+                .await
+                .unwrap();
+
+            // No guard: nothing to clear or release
+            assert!(!db
+                .clear_dm_guard_pause(&user.id, "r1", Timestamp::now_utc())
+                .await
+                .unwrap());
+            assert!(!db.release_dm_guard(&user.id, "r1").await.unwrap());
+            assert!(db.fetch_user(&user.id).await.unwrap().dm_guard.is_none());
+
+            assert!(db
+                .claim_dm_guard(&user.id, &guard("r1"), Timestamp::now_utc())
+                .await
+                .unwrap());
+            let before = db.fetch_user(&user.id).await.unwrap();
+            assert!(before.is_dm_paused());
+
+            assert!(!db
+                .clear_dm_guard_pause(&user.id, "other", Timestamp::now_utc())
+                .await
+                .unwrap());
+            assert!(!db.release_dm_guard(&user.id, "other").await.unwrap());
+            assert_eq!(db.fetch_user(&user.id).await.unwrap(), before);
+
+            assert!(db.release_dm_guard(&user.id, "r1").await.unwrap());
+            let released = db.fetch_user(&user.id).await.unwrap();
+            assert!(released.dm_guard.is_none());
+            assert!(!released.is_dm_paused());
+
+            // Released: the next detection can claim again
+            assert!(db
+                .claim_dm_guard(&user.id, &guard("r2"), Timestamp::now_utc())
+                .await
+                .unwrap());
+        });
+    }
+
+    /// Both drivers: re-arming reads `cleared_at` however it was stored
+    /// (a typed insert writes Int64 milliseconds, `update_user` an ISO string)
+    #[tokio::test]
+    async fn dm_guard_rearm_matches_any_cleared_at_encoding() {
+        database_test!(|db| async move {
+            let cleared = DmGuard {
+                paused: false,
+                cleared_at: Some(hours_from_now(-2)),
+                ..guard("old")
+            };
+
+            let inserted = User::create(
+                &db,
+                "Inserted".to_string(),
+                None,
+                PartialUser {
+                    dm_guard: Some(cleared.clone()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+            let updated = User::create(&db, "Updated".to_string(), None, None)
+                .await
+                .unwrap();
+            db.update_user(
+                &updated.id,
+                &PartialUser {
+                    dm_guard: Some(cleared.clone()),
+                    ..Default::default()
+                },
+                vec![],
+            )
+            .await
+            .unwrap();
+
+            for id in [&inserted.id, &updated.id] {
+                assert!(!db
+                    .claim_dm_guard(id, &guard("new"), hours_from_now(-3))
+                    .await
+                    .unwrap());
+                assert!(db
+                    .claim_dm_guard(id, &guard("new"), hours_from_now(-1))
+                    .await
+                    .unwrap());
+                assert!(db.fetch_user(id).await.unwrap().is_dm_paused());
+            }
+        });
+    }
+
+    /// Both drivers: only unguarded, unflagged, non-bot, non-privileged users
+    /// created at or after the cutoff are returned
+    #[tokio::test]
+    async fn fetch_users_created_since_filters_candidates() {
+        database_test!(|db| async move {
+            let now_ms = ulid::Ulid::new().timestamp_ms();
+            let cutoff = ulid::Ulid::from_parts(now_ms - 60_000, 0).to_string();
+
+            let old = User::create(
+                &db,
+                "Old".to_string(),
+                ulid::Ulid::from_parts(now_ms - 3_600_000, 1).to_string(),
+                None,
+            )
+            .await
+            .unwrap();
+            let boundary = User::create(&db, "Boundary".to_string(), cutoff.clone(), None)
+                .await
+                .unwrap();
+            let fresh = User::create(&db, "Fresh".to_string(), None, None)
+                .await
+                .unwrap();
+            let zero_flags = User::create(
+                &db,
+                "ZeroFlags".to_string(),
+                None,
+                PartialUser {
+                    flags: Some(0),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+            let bot = User::create(
+                &db,
+                "Robot".to_string(),
+                None,
+                PartialUser {
+                    bot: Some(BotInformation {
+                        owner: fresh.id.clone(),
+                    }),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+            let privileged = User::create(
+                &db,
+                "Staff".to_string(),
+                None,
+                PartialUser {
+                    privileged: Some(true),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+            let flagged = User::create(
+                &db,
+                "Flagged".to_string(),
+                None,
+                PartialUser {
+                    flags: Some(1),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+            let guarded = User::create(&db, "Guarded".to_string(), None, None)
+                .await
+                .unwrap();
+            assert!(db
+                .claim_dm_guard(&guarded.id, &guard("r1"), Timestamp::now_utc())
+                .await
+                .unwrap());
+
+            let found = db.fetch_users_created_since(&cutoff).await.unwrap();
+            let mut found = ids(&found);
+            found.sort();
+
+            let mut expected = vec![
+                boundary.id.as_str(),
+                fresh.id.as_str(),
+                zero_flags.id.as_str(),
+            ];
+            expected.sort();
+            assert_eq!(found, expected);
+
+            for excluded in [&old, &bot, &privileged, &flagged, &guarded] {
+                assert!(!found.contains(&excluded.id.as_str()));
+            }
+        });
     }
 
     /// Both drivers: an unknown id is skipped, never an error (Mongo `$in`)

@@ -1,6 +1,7 @@
 pub mod delete_accounts;
 pub mod acks;
 pub mod afk_sweep;
+pub mod antispam_daily;
 pub mod discord_import;
 pub mod event_reminders;
 pub mod expire_supporters;

@@ -192,6 +192,24 @@ impl AbstractMessages for ReferenceDb {
             .count())
     }
 
+    /// Count an author's messages since a cutoff, outside some channels.
+    async fn count_author_messages_since(
+        &self,
+        author: &str,
+        cutoff_id: &str,
+        exclude_channels: &[String],
+    ) -> Result<u64> {
+        let messages = self.messages.lock().await;
+        Ok(messages
+            .values()
+            .filter(|message| {
+                message.author == author
+                    && message.id.as_str() >= cutoff_id
+                    && !exclude_channels.contains(&message.channel)
+            })
+            .count() as u64)
+    }
+
     /// Summarise the unread tail of a channel.
     async fn summarise_unread(
         &self,

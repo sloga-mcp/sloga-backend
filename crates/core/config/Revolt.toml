@@ -371,6 +371,23 @@ afk_auto_move = true
 # server_emoji = 500
 # server_sounds = 96
 
+[features.antispam]
+# Ships OFF; prod enables it in Revolt.overrides.toml under [features.antispam], then restarts delta AND crond.
+dm_dupe_enabled = false
+dm_dupe_pause = true
+dm_dupe_threshold = 3
+dm_dupe_window_hours = 24
+dm_dupe_min_chars = 30
+dm_dupe_rearm_days = 30
+daily_enabled = false
+daily_run_hour_utc = 14
+daily_account_age_days = 14
+daily_min_nonfriend_dms = 5
+daily_max_reply_ratio = 0.25
+daily_max_public_messages = 3
+daily_report_cooldown_days = 30
+daily_max_reports_per_run = 10
+
 [features.limits]
 
 [features.limits.global]

@@ -129,6 +129,19 @@ impl AbstractChannels for MongoDb {
         )
     }
 
+    /// Fetch every DirectMessage channel created since the cutoff; see the trait.
+    async fn fetch_direct_messages_created_since(&self, cutoff_id: &str) -> Result<Vec<Channel>> {
+        query!(
+            self,
+            find,
+            COL,
+            doc! {
+                "_id": { "$gte": cutoff_id },
+                "channel_type": "DirectMessage"
+            }
+        )
+    }
+
     // Fetch all group dms for a user
     async fn find_group_message_channels(&self, user_id: &str) -> Result<ChunkedDatabaseGenerator<Channel>> {
         let mut session = self

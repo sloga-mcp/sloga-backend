@@ -1,3 +1,5 @@
+use revolt_config::config;
+use revolt_database::util::antispam;
 use revolt_database::util::idempotency::IdempotencyKey;
 use revolt_database::util::permissions::DatabasePermissionQuery;
 use revolt_database::util::reference::Reference;
@@ -68,6 +70,20 @@ pub async fn poll_create(
 
     // Archived or locked threads reject polls exactly like normal messages.
     crate::util::threads::ensure_thread_writable(&channel, &permissions)?;
+
+    // A poll is a plaintext message too, so a paused account must not reach
+    // strangers with one. Checked before anything is written (slowmode,
+    // nonce, poll row, message).
+    let antispam = config().await.features.antispam.clone();
+    let dm_peer = if let Channel::DirectMessage { recipients, .. } = &channel {
+        recipients.iter().find(|id| *id != &user.id).cloned()
+    } else {
+        None
+    };
+
+    if let Some(peer) = &dm_peer {
+        antispam::dm_send_allowed(db, &antispam, &user, channel.id(), peer).await?;
+    }
 
     crate::util::slowmode::enforce_slowmode(&user, &channel, &permissions).await?;
 
@@ -171,16 +187,37 @@ pub async fn poll_create(
         return Err(error);
     }
 
+    // Best-effort copy-paste detection on the stored message; never fails or
+    // delays the request.
+    if let Some(peer) = dm_peer {
+        let (db, user, stored, channel_id) = (
+            db.inner().clone(),
+            user.clone(),
+            message.clone(),
+            channel.id().to_string(),
+        );
+        tokio::spawn(async move {
+            antispam::observe_dm_message(&db, &antispam, &user, &channel_id, &peer, &stored)
+                .await;
+        });
+    }
+
     Ok(Json(message.into_model(Some(model_user), model_member)))
 }
 
 #[cfg(test)]
 mod test {
     use crate::{rocket, util::test::TestHarness};
-    use revolt_database::MessageFlagsValue;
+    use iso8601_timestamp::Timestamp;
+    use revolt_config::config;
+    use revolt_database::{
+        Channel, DmGuard, Member, Message, MessageFilter, MessageFlagsValue, MessageQuery,
+        MessageTimePeriod,
+    };
     use revolt_models::v0::{self, MessageFlags};
     use rocket::http::{ContentType, Header, Status};
     use serde_json::json;
+    use ulid::Ulid;
 
     #[test]
     fn create_poll_creates_flagged_message_with_definition() {
@@ -303,5 +340,134 @@ mod test {
             Status::Ok,
             "regular send must not accept the Poll flag"
         );
+    }
+
+    async fn create_dm_poll<'a>(
+        harness: &'a TestHarness,
+        token: &str,
+        channel_id: &str,
+    ) -> rocket::local::asynchronous::LocalResponse<'a> {
+        harness
+            .client
+            .post(format!("/channels/{channel_id}/polls"))
+            .header(Header::new("x-session-token", token.to_string()))
+            .header(ContentType::JSON)
+            .body(
+                json!({
+                    "question": "Can I use your profile picture for an art project?",
+                    "answers": [{ "text": "Yes" }, { "text": "No" }]
+                })
+                .to_string(),
+            )
+            .dispatch()
+            .await
+    }
+
+    async fn messages_in(harness: &TestHarness, channel_id: &str) -> Vec<Message> {
+        harness
+            .db
+            .fetch_messages(MessageQuery {
+                limit: Some(10),
+                filter: MessageFilter {
+                    channel: Some(channel_id.to_string()),
+                    ..Default::default()
+                },
+                time_period: MessageTimePeriod::Absolute {
+                    before: None,
+                    after: None,
+                    sort: None,
+                },
+            })
+            .await
+            .expect("messages")
+    }
+
+    #[test]
+    #[ignore = "needs REVOLT__FEATURES__ANTISPAM__DM_DUPE_ENABLED=true"]
+    fn antispam_route_poll_paused_refused() {
+        crate::util::test::rt().block_on(antispam_route_poll_paused_refused_case())
+    }
+
+    async fn antispam_route_poll_paused_refused_case() {
+        assert!(
+            config().await.features.antispam.dm_dupe_enabled,
+            "run with REVOLT__FEATURES__ANTISPAM__DM_DUPE_ENABLED=true"
+        );
+
+        let harness = TestHarness::new().await;
+        let (_, session, sender) = harness.new_user().await;
+        let (_, _, stranger) = harness.new_user().await;
+
+        // A shared server lets the sender DM the stranger without being
+        // friends, the way the reported spammer reached its targets.
+        let (server, _) = harness.new_server(&sender).await;
+        Member::create(&harness.db, &server, &stranger, None)
+            .await
+            .expect("`Member`");
+
+        let dm = Channel::create_dm(&harness.db, &sender, &stranger)
+            .await
+            .expect("dm");
+        assert!(matches!(dm, Channel::DirectMessage { .. }), "not a DM");
+
+        // Pause the sender directly; the session guard loads the user afresh
+        // on every request.
+        let guard = DmGuard {
+            report_id: Ulid::new().to_string(),
+            flagged_at: Timestamp::now_utc(),
+            paused: true,
+            cleared_at: None,
+            recipients: 3,
+            fingerprint: "test".into(),
+        };
+        assert!(
+            harness
+                .db
+                .claim_dm_guard(&sender.id, &guard, Timestamp::now_utc())
+                .await
+                .expect("claim"),
+            "guard not claimed"
+        );
+
+        // The stranger never wrote here: refused, with nothing written.
+        let response = create_dm_poll(&harness, &session.token, dm.id()).await;
+        assert_eq!(response.status(), Status::Forbidden);
+        let error = response
+            .into_json::<serde_json::Value>()
+            .await
+            .expect("error body");
+        assert_eq!(error["type"], "DirectMessagesPaused");
+
+        assert!(
+            messages_in(&harness, dm.id()).await.is_empty(),
+            "a refused poll stored a message"
+        );
+        assert!(
+            harness
+                .db
+                .fetch_expired_open_polls(i64::MAX)
+                .await
+                .expect("polls")
+                .iter()
+                .all(|poll| poll.channel != dm.id()),
+            "a refused poll stored a poll row"
+        );
+
+        // Once the stranger has written in the DM it is a real conversation,
+        // and the same poll goes through.
+        harness
+            .db
+            .insert_message(&Message {
+                id: Ulid::new().to_string(),
+                channel: dm.id().to_string(),
+                author: stranger.id.clone(),
+                content: Some("hello".into()),
+                ..Default::default()
+            })
+            .await
+            .expect("reply");
+
+        let response = create_dm_poll(&harness, &session.token, dm.id()).await;
+        assert_eq!(response.status(), Status::Ok);
     }
 }

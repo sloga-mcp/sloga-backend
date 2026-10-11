@@ -1,14 +1,15 @@
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use revolt_config::AntispamFeatures;
 use revolt_database::{
     events::client::EventV1,
-    util::{idempotency::IdempotencyKey, permissions::DatabasePermissionQuery},
+    util::{antispam, idempotency::IdempotencyKey, permissions::DatabasePermissionQuery},
     Channel, Database, File, FileUsedForType, Message, MessageFilter, MessageQuery,
     MessageTimePeriod, ScheduledMessage, ScheduledMessageStatus, User, AMQP,
 };
 use revolt_models::v0;
 use revolt_permissions::{calculate_channel_permissions, ChannelPermission, PermissionQuery};
-use revolt_result::Result;
+use revolt_result::{ErrorType, Result};
 use tokio::time::sleep;
 use ulid::Ulid;
 
@@ -24,6 +25,10 @@ const DELIVERY_GRACE_MS: i64 = 5 * 60 * 1000;
 /// Finished (Sent / Failed / crash-stuck Sending) rows are retained a day
 /// for debugging, then swept.
 const RETENTION_MS: i64 = 24 * 60 * 60 * 1000;
+
+/// Failure reason for a scheduled DM refused by the anti-spam pause.
+const DM_PAUSED_REASON: &str =
+    "your direct messages to people who haven't written back to you are paused pending review";
 
 fn now_ms() -> i64 {
     SystemTime::now()
@@ -44,6 +49,7 @@ fn now_ms() -> i64 {
 pub async fn task(db: Database, amqp: AMQP) -> Result<()> {
     loop {
         let now = now_ms();
+        let antispam = revolt_config::config().await.features.antispam;
 
         match db.fetch_due_scheduled_messages(now).await {
             Ok(due) => {
@@ -59,18 +65,7 @@ pub async fn task(db: Database, amqp: AMQP) -> Result<()> {
                         }
                     }
 
-                    if row.scheduled_at < now - DELIVERY_GRACE_MS {
-                        fail(&db, &row, "missed its delivery window").await;
-                        continue;
-                    }
-
-                    if let Err(reason) = deliver(&db, &amqp, &row).await {
-                        fail(&db, &row, &reason).await;
-                    } else if let Err(err) = db.mark_scheduled_message_sent(&row.id).await {
-                        // The message IS delivered; a failed mark leaves the
-                        // row Sending, which the retention sweep collects.
-                        revolt_config::capture_error(&err);
-                    }
+                    settle(&db, Some(&amqp), &row, now, &antispam).await;
                 }
             }
             Err(err) => {
@@ -103,6 +98,29 @@ pub async fn task(db: Database, amqp: AMQP) -> Result<()> {
         }
 
         sleep(DELIVERY_TICK).await
+    }
+}
+
+/// Deliver one claimed row, or mark it permanently failed. `amqp` is only
+/// `None` in tests, which then skip the author ack.
+async fn settle(
+    db: &Database,
+    amqp: Option<&AMQP>,
+    row: &ScheduledMessage,
+    now: i64,
+    cfg: &AntispamFeatures,
+) {
+    if row.scheduled_at < now - DELIVERY_GRACE_MS {
+        fail(db, row, "missed its delivery window").await;
+        return;
+    }
+
+    if let Err(reason) = deliver(db, amqp, row, cfg).await {
+        fail(db, row, &reason).await;
+    } else if let Err(err) = db.mark_scheduled_message_sent(&row.id).await {
+        // The message IS delivered; a failed mark leaves the
+        // row Sending, which the retention sweep collects.
+        revolt_config::capture_error(&err);
     }
 }
 
@@ -182,7 +200,12 @@ async fn author_caught_up(db: &Database, user_id: &str, channel_id: &str) -> boo
 
 /// Attempt delivery of one claimed row. Any `Err` is a PERMANENT failure
 /// reason surfaced to the author — claimed rows are never re-queued.
-async fn deliver(db: &Database, amqp: &AMQP, row: &ScheduledMessage) -> std::result::Result<(), String> {
+async fn deliver(
+    db: &Database,
+    amqp: Option<&AMQP>,
+    row: &ScheduledMessage,
+    cfg: &AntispamFeatures,
+) -> std::result::Result<(), String> {
     // The channel may have been deleted since scheduling (the cascade
     // normally cancels rows; this is the backstop for wholesale server
     // deletion, which drops channels without running per-channel deletes).
@@ -271,6 +294,37 @@ async fn deliver(db: &Database, amqp: &AMQP, row: &ScheduledMessage) -> std::res
         return Err("you no longer have permission to upload files".to_string());
     }
 
+    // The DM peer, if this is a DM. Only DirectMessage channels take part in
+    // the anti-spam guard (never groups, saved messages or server channels).
+    let dm_peer = if let Channel::DirectMessage { recipients, .. } = &channel {
+        recipients.iter().find(|id| *id != &user.id).cloned()
+    } else {
+        None
+    };
+
+    // Same anti-spam pause as a live send, re-checked as of now against the
+    // freshly fetched author (the pause may have landed after scheduling).
+    // Checked before any side effect (the attachment hand-over below): a
+    // refused row is dropped like any other failure, never retried.
+    if let Some(peer) = &dm_peer {
+        if let Err(error) = antispam::dm_send_allowed(db, cfg, &user, &row.channel, peer).await {
+            if matches!(error.error_type, ErrorType::DirectMessagesPaused) {
+                log::info!(
+                    "Dropped scheduled message {} from {} to {}: direct messages paused",
+                    row.id,
+                    user.id,
+                    row.channel
+                );
+                return Err(DM_PAUSED_REASON.to_string());
+            }
+
+            return Err(format!(
+                "the message could not be sent ({:?})",
+                error.error_type
+            ));
+        }
+    }
+
     // Same TRUST-0 rule as a live send: brand-new users don't get mentions
     // in discoverable servers.
     let allow_mentions = if let Some(server) = query.server_ref() {
@@ -346,9 +400,9 @@ async fn deliver(db: &Database, amqp: &AMQP, row: &ScheduledMessage) -> std::res
     // The stored payload's nonce was already consumed at schedule time and
     // stripped; the row id doubles as the delivery nonce so clients can
     // correlate the arriving message with their pending entry.
-    Message::create_from_api_with_id(
+    let message = Message::create_from_api_with_id(
         db,
-        Some(amqp),
+        amqp,
         channel,
         row.data.clone(),
         v0::MessageAuthor::User(&author),
@@ -384,14 +438,23 @@ async fn deliver(db: &Database, amqp: &AMQP, row: &ScheduledMessage) -> std::res
         }
     }
 
+    // Feed the copy-paste DM detector with the stored message, like a live
+    // send. Awaited here (crond is off any request path); it never fails and
+    // logs its own errors. Scheduled payloads are always server-readable
+    // plaintext, never an E2EE envelope.
+    if let Some(peer) = dm_peer {
+        antispam::observe_dm_message(db, cfg, &user, &row.channel, &peer, &message).await;
+    }
+
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use iso8601_timestamp::Timestamp;
     use revolt_database::{
-        DatabaseInfo, MessageFilter, MessageQuery, MessageTimePeriod, Relationship,
+        DatabaseInfo, DmGuard, MessageFilter, MessageQuery, MessageTimePeriod, Relationship,
         RelationshipStatus,
     };
 
@@ -446,7 +509,7 @@ mod tests {
 
     /// `deliver` mints the message id internally; the row id is stamped on
     /// the delivered message as its nonce.
-    async fn delivered_id(db: &Database, row: &ScheduledMessage) -> String {
+    async fn find_delivered(db: &Database, row: &ScheduledMessage) -> Option<Message> {
         db.fetch_messages(MessageQuery {
             limit: Some(50),
             filter: MessageFilter {
@@ -463,8 +526,180 @@ mod tests {
         .expect("fetch_messages")
         .into_iter()
         .find(|message| message.nonce.as_deref() == Some(row.id.as_str()))
-        .expect("no delivered message carries the row id as its nonce")
-        .id
+    }
+
+    async fn delivered_id(db: &Database, row: &ScheduledMessage) -> String {
+        find_delivered(db, row)
+            .await
+            .expect("no delivered message carries the row id as its nonce")
+            .id
+    }
+
+    /// One runtime shared by the anti-spam delivery tests: the Redis pool
+    /// behind event publishing is a process static, so its connections must
+    /// not outlive the runtime that opened them.
+    fn rt() -> &'static tokio::runtime::Runtime {
+        static RT: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
+        RT.get_or_init(|| {
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .enable_all()
+                .build()
+                .unwrap()
+        })
+    }
+
+    fn detector_on() -> AntispamFeatures {
+        AntispamFeatures {
+            dm_dupe_enabled: true,
+            ..Default::default()
+        }
+    }
+
+    /// An author, a peer and their DM. The two also share a group, so the
+    /// DM permission check passes without friendship (as a mutual server
+    /// would) and only the anti-spam gate can refuse the delivery.
+    async fn dm_fixture(db: &Database, friends: bool) -> (User, Channel) {
+        let peer = make_user("antispam-peer", None);
+        let author = make_user(
+            "antispam-author",
+            friends.then(|| {
+                vec![Relationship {
+                    id: peer.id.clone(),
+                    status: RelationshipStatus::Friend,
+                    note: None,
+                }]
+            }),
+        );
+        let dm = Channel::DirectMessage {
+            id: Ulid::new().to_string(),
+            active: true,
+            recipients: vec![author.id.clone(), peer.id.clone()],
+            last_message_id: None,
+        };
+        insert_fixtures(db, &[&author, &peer], &dm).await;
+
+        Channel::create_group(
+            db,
+            v0::DataCreateGroup {
+                name: "mutual".to_string(),
+                users: [peer.id.clone()].into_iter().collect(),
+                ..Default::default()
+            },
+            author.id.clone(),
+        )
+        .await
+        .expect("create_group");
+
+        (author, dm)
+    }
+
+    /// Pause the author's DMs to strangers, as the detector would.
+    async fn pause(db: &Database, author: &User) {
+        let now = Timestamp::now_utc();
+        let claimed = db
+            .claim_dm_guard(
+                &author.id,
+                &DmGuard {
+                    report_id: Ulid::new().to_string(),
+                    flagged_at: now,
+                    paused: true,
+                    cleared_at: None,
+                    recipients: 3,
+                    fingerprint: "test".to_string(),
+                },
+                now,
+            )
+            .await
+            .expect("claim_dm_guard");
+        assert!(claimed, "the fixture author already had a guard");
+    }
+
+    /// Store a due row, claim it and settle it exactly as the task loop
+    /// does, and return the row as stored afterwards.
+    async fn schedule_and_settle(
+        db: &Database,
+        author: &User,
+        channel: &str,
+        cfg: &AntispamFeatures,
+    ) -> ScheduledMessage {
+        let mut row = claimed_row(author, channel);
+        row.status = ScheduledMessageStatus::Pending;
+        db.insert_scheduled_message(&row)
+            .await
+            .expect("insert_scheduled_message");
+        assert!(db
+            .claim_scheduled_message(&row.id)
+            .await
+            .expect("claim_scheduled_message"));
+
+        settle(db, None, &row, now_ms(), cfg).await;
+
+        db.fetch_scheduled_message(&row.id)
+            .await
+            .expect("fetch_scheduled_message")
+    }
+
+    #[test]
+    fn paused_author_scheduled_dm_to_silent_stranger_is_dropped() {
+        rt().block_on(async {
+            let db = Database::Reference(Default::default());
+            let (author, dm) = dm_fixture(&db, false).await;
+            pause(&db, &author).await;
+
+            let row = schedule_and_settle(&db, &author, dm.id(), &detector_on()).await;
+
+            assert!(
+                matches!(row.status, ScheduledMessageStatus::Failed),
+                "a refused row must be marked Failed, never left to retry"
+            );
+            assert_eq!(row.failure_reason.as_deref(), Some(DM_PAUSED_REASON));
+            assert!(
+                find_delivered(&db, &row).await.is_none(),
+                "the paused author's scheduled DM reached a stranger"
+            );
+        });
+    }
+
+    #[test]
+    fn paused_author_scheduled_dm_to_friend_is_delivered() {
+        rt().block_on(async {
+            let db = Database::Reference(Default::default());
+            let (author, dm) = dm_fixture(&db, true).await;
+            pause(&db, &author).await;
+
+            let row = schedule_and_settle(&db, &author, dm.id(), &detector_on()).await;
+
+            assert!(
+                matches!(row.status, ScheduledMessageStatus::Sent),
+                "row ended {:?}: {:?}",
+                row.status,
+                row.failure_reason
+            );
+            assert!(find_delivered(&db, &row).await.is_some());
+        });
+    }
+
+    /// Also the in-test control for the drop above: the same stranger
+    /// fixture delivers once the detector is switched off.
+    #[test]
+    fn paused_author_scheduled_dm_is_delivered_when_detector_disabled() {
+        rt().block_on(async {
+            let db = Database::Reference(Default::default());
+            let (author, dm) = dm_fixture(&db, false).await;
+            pause(&db, &author).await;
+
+            let row =
+                schedule_and_settle(&db, &author, dm.id(), &AntispamFeatures::default()).await;
+
+            assert!(
+                matches!(row.status, ScheduledMessageStatus::Sent),
+                "row ended {:?}: {:?}",
+                row.status,
+                row.failure_reason
+            );
+            assert!(find_delivered(&db, &row).await.is_some());
+        });
     }
 
     async fn dm_active(db: &Database, id: &str) -> bool {
@@ -548,7 +783,7 @@ mod tests {
         let dm_row = claimed_row(&author, dm.id());
         let group_row = claimed_row(&author, group.id());
         for row in [&dm_row, &group_row] {
-            deliver(&db, &amqp, row)
+            deliver(&db, Some(&amqp), row, &AntispamFeatures::default())
                 .await
                 .unwrap_or_else(|reason| panic!("deliver failed: {reason}"));
         }

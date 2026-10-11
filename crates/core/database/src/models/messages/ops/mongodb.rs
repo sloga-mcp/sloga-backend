@@ -1,7 +1,7 @@
 use bson::{to_bson, Document};
 use futures::try_join;
 use futures::StreamExt;
-use mongodb::options::FindOptions;
+use mongodb::options::{FindOptions, Hint};
 use revolt_models::v0::{MessageSort, UNREAD_COUNT_CAP};
 use revolt_result::Result;
 use std::collections::{HashMap, HashSet};
@@ -16,6 +16,49 @@ use crate::{
 use super::{AbstractMessages, ThreadStats, UnreadSummary, UNREAD_SCAN_WINDOW};
 
 static COL: &str = "messages";
+
+/// Name of the `{author: 1}` index on `messages`. MUST match the copies in
+/// `init.rs` and `scripts.rs`.
+const AUTHOR_INDEX: &str = "author";
+
+/// The `count_author_messages_since` filter.
+fn author_messages_since_filter(
+    author: &str,
+    cutoff_id: &str,
+    exclude_channels: &[String],
+) -> Document {
+    doc! {
+        "author": author,
+        "_id": { "$gte": cutoff_id },
+        "channel": { "$nin": exclude_channels },
+    }
+}
+
+/// Run the author count with an optional index hint, handing back the
+/// driver's own error so a missing index can be told apart from any other
+/// failure.
+async fn count_author_messages(
+    col: &mongodb::Collection<Document>,
+    filter: Document,
+    hint: Option<Hint>,
+) -> mongodb::error::Result<u64> {
+    let count = col.count_documents(filter);
+    match hint {
+        Some(hint) => count.hint(hint).await,
+        None => count.await,
+    }
+}
+
+/// Whether the server refused a hint because the named index does not exist
+/// (code 2, BadValue). That is a database that never ran the migrations:
+/// every `database_test!` run, for one.
+fn is_missing_hint_index(err: &mongodb::error::Error) -> bool {
+    matches!(
+        err.kind.as_ref(),
+        mongodb::error::ErrorKind::Command(command)
+            if command.code == 2 && command.message.contains("hint")
+    )
+}
 
 /// The `fetch_thread_stats` aggregation, kept apart so a test can `explain()`
 /// exactly what runs.
@@ -282,6 +325,35 @@ impl AbstractMessages for MongoDb {
             }
         )
         .map(|count| count as usize)
+    }
+
+    /// Count an author's messages since a cutoff, outside some channels.
+    ///
+    /// Hinted onto the `author` index: left to itself the planner may take
+    /// the `_id` range instead, which walks every message anyone sent since
+    /// the cutoff. A database without that index refuses the hint, and only
+    /// that refusal falls back to an unhinted count. The answer is the same,
+    /// just slower; any other error fails the call.
+    async fn count_author_messages_since(
+        &self,
+        author: &str,
+        cutoff_id: &str,
+        exclude_channels: &[String],
+    ) -> Result<u64> {
+        let col = self.col::<Document>(COL);
+        let filter = author_messages_since_filter(author, cutoff_id, exclude_channels);
+        let hint = Some(Hint::Name(AUTHOR_INDEX.to_string()));
+        let counted = match count_author_messages(&col, filter.clone(), hint).await {
+            Err(err) if is_missing_hint_index(&err) => {
+                warn!("messages index `{AUTHOR_INDEX}` is missing; counting without the hint");
+                count_author_messages(&col, filter, None).await
+            }
+            other => other,
+        };
+        counted.map_err(|err| {
+            revolt_config::capture_internal_error!(err);
+            create_database_error!("count_documents", COL)
+        })
     }
 
     /// Summarise the unread tail of a channel.
@@ -822,6 +894,92 @@ mod tests {
             let stats = db.fetch_thread_stats(&ids).await.unwrap();
             assert_eq!(stats[0].replies, 3);
             assert_eq!(stats[0].last_message_id.as_deref(), Some(system.as_str()));
+        });
+    }
+
+    /// The fallback in `count_author_messages_since` would hide a hint that
+    /// names no real index, so this pins the hint's name against the index
+    /// the migrations create, and pins the fallback's error match against what
+    /// the server actually says. Mongo-only; a no-op under REFERENCE.
+    #[tokio::test]
+    async fn author_count_hint_names_the_migrated_author_index() {
+        database_test!(|db| async move {
+            let crate::Database::MongoDb(mongo) = &db else {
+                return;
+            };
+            use super::{
+                author_messages_since_filter, count_author_messages, is_missing_hint_index,
+                AUTHOR_INDEX,
+            };
+            use mongodb::options::Hint;
+
+            let other = "01OTHERAUTHOR0000000000000";
+            let (c1, c2) = (ulid(1, 1), ulid(1, 2));
+            db.insert_message(&message(&ulid(2_000, 1), &c1))
+                .await
+                .unwrap();
+            db.insert_message(&message(&ulid(3_000, 1), &c1))
+                .await
+                .unwrap();
+            db.insert_message(&message(&ulid(2_000, 2), &c2))
+                .await
+                .unwrap();
+            db.insert_message(&message(&ulid(500, 1), &c1))
+                .await
+                .unwrap();
+            db.insert_message(&Message {
+                author: other.to_string(),
+                ..message(&ulid(2_000, 3), &c1)
+            })
+            .await
+            .unwrap();
+
+            let col = mongo.col::<bson::Document>("messages");
+            let cutoff = ulid(1_000, 0);
+            let excluded = vec![c2.clone()];
+            let filter = || author_messages_since_filter(AUTHOR, &cutoff, &excluded);
+            let hint = || Some(Hint::Name(AUTHOR_INDEX.to_string()));
+
+            // `database_test!` hands over an un-migrated database: the server
+            // refuses the hint, and the classifier recognizes the refusal...
+            let err = count_author_messages(&col, filter(), hint())
+                .await
+                .expect_err("a hint naming a missing index must fail");
+            assert!(is_missing_hint_index(&err), "{err:?}");
+            // ...which the op falls back from.
+            assert_eq!(
+                db.count_author_messages_since(AUTHOR, &cutoff, &excluded)
+                    .await
+                    .unwrap(),
+                2
+            );
+
+            // Exactly the index `init.rs` creates, name spelled out so a
+            // renamed constant fails here. The strict hint now resolves.
+            mongo
+                .db()
+                .run_command(doc! {
+                    "createIndexes": "messages",
+                    "indexes": [ { "key": { "author": 1_i32 }, "name": "author" } ]
+                })
+                .await
+                .expect("failed to create the messages author index");
+            assert_eq!(
+                count_author_messages(&col, filter(), hint()).await.unwrap(),
+                2
+            );
+            assert_eq!(
+                db.count_author_messages_since(AUTHOR, &cutoff, &excluded)
+                    .await
+                    .unwrap(),
+                2
+            );
+
+            // Another BadValue is not mistaken for a missing index.
+            let err = count_author_messages(&col, doc! { "$bogus": 1_i32 }, None)
+                .await
+                .expect_err("an unknown top-level operator must fail");
+            assert!(!is_missing_hint_index(&err), "{err:?}");
         });
     }
 
