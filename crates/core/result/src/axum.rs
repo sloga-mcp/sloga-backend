@@ -165,6 +165,12 @@ impl IntoResponse for Error {
             ErrorType::VideoCallFull { .. } => StatusCode::CONFLICT,
         };
 
+        // The body no longer carries the location, so log it for server
+        // errors
+        if status.is_server_error() {
+            log::warn!("{self}");
+        }
+
         (status, Json(&self)).into_response()
     }
 }
