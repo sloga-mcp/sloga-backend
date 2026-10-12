@@ -71,7 +71,7 @@ pub fn is_screenshare_video(source: i32) -> bool {
 }
 
 /// Count the current members of a voice channel who have video active — camera
-/// OR screensharing. Reads the per-member Redis flags under the SAME key
+/// OR screensharing OR screen video. Reads the per-member Redis flags under the SAME key
 /// composition the rest of this module uses: `{user_id}:{server_id | channel_id}`
 /// (the members SET is keyed by channel id, but the per-member flags are keyed
 /// by server id for server voice channels — composing `{user}:{channel_id}` on a
@@ -80,9 +80,18 @@ pub fn is_screenshare_video(source: i32) -> bool {
 /// NB: the `screensharing` flag is set for BOTH screen-video (source 3) and
 /// screen-audio (source 4), so an audio-only screenshare conservatively consumes
 /// a video slot here. That is the safe direction (cap slightly stricter).
-/// Deliberately NOT switched to the stricter `screen_video` flag: states
+/// Deliberately NOT replaced by the stricter `screen_video` flag: states
 /// created before that key existed lack it, and the conservative over-count
 /// is the desired behaviour for the cap anyway.
+///
+/// `screen_video` is OR-ed in on top of it to close the opposite gap, an
+/// UNDER-count. Before `update_voice_state_tracks` learned to keep
+/// `screensharing` while the screen video is live, muting or unpublishing
+/// only the screen audio wrote it `false` mid-share (the Android leg mutes a
+/// silent screen-audio publication itself), so a live share fell out of the
+/// cap. A state written that way before the deploy, or by the read-then-write
+/// race documented there, still counts through `screen_video`. A missing key
+/// reads `false`, so a state without `screen_video` counts exactly as before.
 pub async fn count_video_participants(channel: &UserVoiceChannel) -> Result<usize> {
     let Some(members) = get_voice_channel_members(channel).await? else {
         return Ok(0);
@@ -94,14 +103,18 @@ pub async fn count_video_participants(channel: &UserVoiceChannel) -> Result<usiz
 
     for user_id in members {
         let unique_key = format!("{user_id}:{parent_id}");
-        let (camera, screensharing): (Option<bool>, Option<bool>) = conn
-            .mget(&[
+        let (camera, screensharing, screen_video): (Option<bool>, Option<bool>, Option<bool>) =
+            conn.mget(&[
                 format!("camera:{unique_key}"),
                 format!("screensharing:{unique_key}"),
+                format!("screen_video:{unique_key}"),
             ])
             .await
             .to_internal_error()?;
-        if camera.unwrap_or(false) || screensharing.unwrap_or(false) {
+        if camera.unwrap_or(false)
+            || screensharing.unwrap_or(false)
+            || screen_video.unwrap_or(false)
+        {
             count += 1;
         }
     }
@@ -2507,21 +2520,42 @@ pub async fn update_voice_state_tracks(
             is_publishing: Some(added),
             ..Default::default()
         },
-        // `screensharing` keeps its historical conflated meaning (either
-        // screen track flips it), so existing consumers see no change. The
-        // additive `screen_video` flag tracks source 3 ONLY: without it, a
+        // `screensharing` keeps its historical conflated meaning, "a screen
+        // share is live": either screen track SETS it, and screen video
+        // (source 3) clears it. Screen audio (source 4) going away, whether
+        // unpublished or muted, does NOT clear it while the screen video is
+        // still live: it writes the member's current `screen_video` instead.
+        // The Android leg mutes a silent screen-audio publication itself, and
+        // a plain `false` here ended the flag mid-share, dropping a live
+        // share out of the video cap (`count_video_participants`) and out of
+        // crond's AFK `media_active` exemption. An audio-only share (no
+        // source 3) still clears on its own removal, as `screen_video` reads
+        // `false` there.
+        //
+        // The additive `screen_video` flag tracks source 3 ONLY: without it, a
         // screen-audio unmute after the video track ended reads as "still
-        // screensharing" with nothing to see, and stopping only screen audio
-        // flips the flag false mid-share (remote-control plan §1 blocker).
+        // screensharing" with nothing to see (remote-control plan, section 1
+        // blocker).
         /* TrackSource::ScreenShare */
         3 => PartialUserVoiceState {
             screensharing: Some(added),
             screen_video: Some(added),
             ..Default::default()
         },
+        // Read, then write: NOT atomic. A screen-video stop landing between
+        // the read and the write can leave `screensharing` true with no
+        // share live, until the member's next screen track event or the
+        // voice-state teardown rewrites it. That over-counts, the safe
+        // direction for the video cap and the AFK exemption alike. The
+        // reverse interleaving (a screen-video START racing this read) can
+        // leave `screensharing` false beside a live `screen_video`; the cap
+        // still counts that share through `screen_video`. No Lua script on
+        // purpose: every script here is a pinned hash the deploy's EVAL /
+        // ACL probe has to cover (see `carry_voice_participant_session`).
+        // The partial carries the value actually written.
         /* TrackSource::ScreenShareAudio */
         4 => PartialUserVoiceState {
-            screensharing: Some(added),
+            screensharing: Some(added || screen_video_is_set(channel, user_id).await?),
             ..Default::default()
         },
         _ => unreachable!(),
@@ -2530,6 +2564,26 @@ pub async fn update_voice_state_tracks(
     update_voice_state(channel, user_id, &partial).await?;
 
     Ok(partial)
+}
+
+/// Whether `user_id`'s `screen_video` flag is set in this channel's voice
+/// state, read under the same `{user_id}:{server_id | channel_id}` key
+/// composition [`update_voice_state`] writes. A missing key (a state created
+/// before the flag existed, or one already torn down) reads `false`, as it
+/// does in [`get_voice_state`].
+async fn screen_video_is_set(channel: &UserVoiceChannel, user_id: &str) -> Result<bool> {
+    let unique_key = format!(
+        "{}:{}",
+        &user_id,
+        channel.server_id.as_ref().unwrap_or(&channel.id)
+    );
+
+    get_connection()
+        .await?
+        .get::<_, Option<bool>>(format!("screen_video:{unique_key}"))
+        .await
+        .to_internal_error()
+        .map(|screen_video| screen_video.unwrap_or(false))
 }
 
 pub async fn update_voice_state(
@@ -13738,6 +13792,67 @@ mod tests {
         assert_eq!(count_video_participants(&channel).await.unwrap(), 0);
     }
 
+    // The read-side backstop: a member whose `screen_video` is live but whose
+    // `screensharing` reads false (written by a screen-audio mute before the
+    // source-4 fix deployed) still occupies a video slot, and an audio-only
+    // share keeps its conservative slot through `screensharing`.
+    #[test]
+    fn count_video_participants_counts_screen_video_without_screensharing() {
+        rt().block_on(count_video_participants_screen_video_case())
+    }
+
+    async fn count_video_participants_screen_video_case() {
+        let suffix = ulid::Ulid::new().to_string();
+        let channel = UserVoiceChannel {
+            id: format!("chan{suffix}"),
+            server_id: Some(format!("srv{suffix}")),
+        };
+        let users: Vec<String> = (0..3).map(|i| format!("user{i}{suffix}")).collect();
+
+        for user in &users {
+            create_voice_state(&channel, user, Timestamp::now_utc())
+                .await
+                .expect("seed voice state");
+        }
+        assert_eq!(count_video_participants(&channel).await.unwrap(), 0);
+
+        // user0: the pre-fix state, live screen video with the conflated
+        // flag already cleared.
+        update_voice_state(
+            &channel,
+            &users[0],
+            &v0::PartialUserVoiceState {
+                screensharing: Some(false),
+                screen_video: Some(true),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            count_video_participants(&channel).await.unwrap(),
+            1,
+            "a live screen video counts even with screensharing false"
+        );
+
+        // user1: an audio-only share still consumes a slot (over-count kept).
+        update_voice_state_tracks(&channel, &users[1], true, 4)
+            .await
+            .unwrap();
+        assert_eq!(count_video_participants(&channel).await.unwrap(), 2);
+
+        // user2 stays idle; user0's video ends.
+        update_voice_state_tracks(&channel, &users[0], false, 3)
+            .await
+            .unwrap();
+        assert_eq!(count_video_participants(&channel).await.unwrap(), 1);
+
+        delete_channel_voice_state(&channel, &users)
+            .await
+            .expect("cleanup");
+        assert_eq!(count_video_participants(&channel).await.unwrap(), 0);
+    }
+
     // The `watching` roster flag (watch-together plan §7.3, 4b): created
     // false with the voice state, set/cleared through the partial-update
     // path, gone with the state — and a state written before the key existed
@@ -13843,16 +13958,31 @@ mod tests {
         );
 
         // Inverse leg: with a healthy video+audio share, stopping ONLY the
-        // screen audio flips the conflated flag false; the video flag must
-        // keep reporting the still-live video track.
+        // screen audio (an unpublish, or the mute the Android leg applies to
+        // a silent screen-audio publication; voice-ingress maps both to
+        // `added == false`) must not end the share: the conflated flag keeps
+        // reading true while the video is live, and the video flag keeps
+        // reporting the still-live video track.
         update_voice_state_tracks(&channel, &user, true, 3)
             .await
             .unwrap();
-        update_voice_state_tracks(&channel, &user, false, 4)
+        let partial = update_voice_state_tracks(&channel, &user, false, 4)
             .await
             .unwrap();
+        assert_eq!(
+            partial.screensharing,
+            Some(true),
+            "the announced partial must carry the value actually written"
+        );
+        assert_eq!(
+            partial.screen_video, None,
+            "a screen-audio event never touches the video flag"
+        );
         let state = get_voice_state(&channel, &user).await.unwrap().unwrap();
-        assert!(!state.screensharing, "historical conflated flag: unchanged");
+        assert!(
+            state.screensharing,
+            "stopping screen audio must not end a share whose video is live"
+        );
         assert!(
             state.screen_video,
             "stopping screen audio must not clear the video flag"
@@ -13873,6 +14003,110 @@ mod tests {
             .unwrap()
             .expect("missing screen_video key must not invalidate the state");
         assert!(!state.screen_video);
+
+        delete_voice_state(&channel, &user).await.expect("cleanup");
+        assert!(get_voice_state(&channel, &user).await.unwrap().is_none());
+    }
+
+    // The other half of the source-4 rule: screen audio going away clears
+    // `screensharing` whenever no screen VIDEO is live. An audio-only share
+    // must still end on its own removal, and both teardown orders of a full
+    // share (video first, as `screen_leg_left` runs them, or audio first)
+    // must end with both flags false.
+    #[test]
+    fn screen_audio_removal_clears_screensharing_without_live_video() {
+        rt().block_on(screen_audio_removal_case())
+    }
+
+    async fn screen_audio_removal_case() {
+        let suffix = ulid::Ulid::new().to_string();
+        let channel = UserVoiceChannel {
+            id: format!("chan{suffix}"),
+            server_id: Some(format!("srv{suffix}")),
+        };
+        let user = format!("user{suffix}");
+
+        create_voice_state(&channel, &user, Timestamp::now_utc())
+            .await
+            .expect("seed voice state");
+
+        // Audio-only share: source 4 alone sets, then clears, the flag.
+        update_voice_state_tracks(&channel, &user, true, 4)
+            .await
+            .unwrap();
+        let state = get_voice_state(&channel, &user).await.unwrap().unwrap();
+        assert!(state.screensharing);
+        assert!(!state.screen_video);
+        let partial = update_voice_state_tracks(&channel, &user, false, 4)
+            .await
+            .unwrap();
+        assert_eq!(partial.screensharing, Some(false));
+        let state = get_voice_state(&channel, &user).await.unwrap().unwrap();
+        assert!(
+            !state.screensharing,
+            "an audio-only share must end on its own removal"
+        );
+        assert!(!state.screen_video);
+
+        // Full share torn down video first, then audio (`screen_leg_left`).
+        update_voice_state_tracks(&channel, &user, true, 3)
+            .await
+            .unwrap();
+        update_voice_state_tracks(&channel, &user, true, 4)
+            .await
+            .unwrap();
+        update_voice_state_tracks(&channel, &user, false, 3)
+            .await
+            .unwrap();
+        update_voice_state_tracks(&channel, &user, false, 4)
+            .await
+            .unwrap();
+        let state = get_voice_state(&channel, &user).await.unwrap().unwrap();
+        assert!(
+            !state.screensharing,
+            "video then audio removed must end the share"
+        );
+        assert!(!state.screen_video);
+
+        // Full share torn down audio first, then video.
+        update_voice_state_tracks(&channel, &user, true, 3)
+            .await
+            .unwrap();
+        update_voice_state_tracks(&channel, &user, true, 4)
+            .await
+            .unwrap();
+        update_voice_state_tracks(&channel, &user, false, 4)
+            .await
+            .unwrap();
+        update_voice_state_tracks(&channel, &user, false, 3)
+            .await
+            .unwrap();
+        let state = get_voice_state(&channel, &user).await.unwrap().unwrap();
+        assert!(
+            !state.screensharing,
+            "audio then video removed must end the share"
+        );
+        assert!(!state.screen_video);
+
+        // A state missing the `screen_video` key (created before it existed)
+        // reads it as false: a screen-audio removal clears the flag.
+        update_voice_state_tracks(&channel, &user, true, 4)
+            .await
+            .unwrap();
+        get_connection()
+            .await
+            .unwrap()
+            .del::<_, ()>(format!("screen_video:{user}:srv{suffix}"))
+            .await
+            .unwrap();
+        update_voice_state_tracks(&channel, &user, false, 4)
+            .await
+            .unwrap();
+        let state = get_voice_state(&channel, &user).await.unwrap().unwrap();
+        assert!(
+            !state.screensharing,
+            "a missing screen_video key reads false"
+        );
 
         delete_voice_state(&channel, &user).await.expect("cleanup");
         assert!(get_voice_state(&channel, &user).await.unwrap().is_none());
