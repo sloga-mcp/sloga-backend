@@ -27,33 +27,41 @@
 //! where every badge holder has self-disabled, the route scans, reads one
 //! account each, and returns `[]`.
 //!
+//! The scan is projected to `BADGED_USER_FIELDS` in the database crate, so a
+//! miss never loads relations, profiles or supporter data it does not read.
+//!
 //! Two bounds apply to misses, and only one of them is aggregate. The path
 //! inherits the `discover` bucket from `crate::util::ratelimits`
 //! (`("discover", _, _)`, 20 requests per 10s), but for sessionless requests
 //! that counter is keyed by IP — it bounds one client, not total load. The
-//! aggregate bound is the cache itself: at most one miss per `CACHE_TTL` per
-//! process, as long as Redis is up.
+//! aggregate bound is the cache: at most one complete miss per `CACHE_TTL`
+//! per process, Redis up or not (see below).
 //!
-//! # Accepted window: no single-flight
+//! # Single-flight
 //!
-//! Concurrent misses are NOT collapsed. Every request arriving during a miss
-//! runs its own scan-plus-reads, and while Redis is unreachable EVERY request
-//! does, because there is no cache left to refill.
+//! Misses run one at a time behind `MISS_PERMIT`, a one-permit
+//! `tokio::sync::Semaphore` (not a mutex held across an await). A request
+//! that waited re-reads the cache once it holds the permit, so a herd that
+//! arrives during one miss is served by that miss.
 //!
-//! This is accepted rather than overlooked, but the reason is narrower than
-//! "it is fine". What is rejected here is a PROCESS-GLOBAL MUTEX HELD ACROSS
-//! AN AWAIT, not single-flight as such: a `tokio::sync::Semaphore` of one
-//! permit, or a Redis `SET NX` lease, would collapse the herd without that
-//! foot-gun, and is the shape to reach for if this ever bites.
+//! The re-read only finds something if the miss was stored somewhere, and
+//! Redis may be the thing that is down. So every complete response is also
+//! kept in-process (`LOCAL_CACHE`, a std mutex never held across an await),
+//! checked before Redis.
+//!
+//! Not collapsed: a response that skipped an unreadable account row is never
+//! cached (see `account_verdict`), so while such a row exists every request
+//! recomputes, one at a time. The error log names the row.
 //!
 //! Deliberately NOT claimed: that a CDN absorbs the stampede. Nothing in this
-//! repo configures origin fronting for `/discover/*`, so the honest worst
-//! case is one scan per allowed request per client IP, with Redis down.
+//! repo configures origin fronting for `/discover/*`.
 
 use redis_kiss::{get_connection, redis, AsyncCommands};
-use revolt_database::{Database, ProfileVisibility, User};
+use revolt_config::AntispamFeatures;
+use revolt_database::util::antispam::dm_pause_enforced;
+use revolt_database::{Account, Database, ProfileVisibility, User};
 use revolt_models::v0::{self, UserBadges, UserFlags};
-use revolt_result::{ErrorType, Result};
+use revolt_result::{create_error, ErrorType, Result};
 use revolt_rocket_okapi::gen::OpenApiGenerator;
 use revolt_rocket_okapi::response::OpenApiResponderInner;
 use revolt_rocket_okapi::revolt_okapi::openapi3::Responses;
@@ -61,6 +69,9 @@ use revolt_rocket_okapi::OpenApiError;
 use rocket::response::{self, Responder};
 use rocket::serde::json::Json;
 use rocket::{Request, Response, State};
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
+use tokio::sync::Semaphore;
 
 /// Hard cap on cards emitted, applied AFTER every filter.
 ///
@@ -77,7 +88,9 @@ const MAX_STREAMERS: usize = 50;
 /// shape, and across a rolling deploy an old binary keeps refilling this key
 /// with ungated bodies that the new binary then serves verbatim for up to
 /// `CACHE_TTL`. A new key means the two binaries cannot feed each other.
-const CACHE_KEY: &str = "discover:streamers:v1";
+///
+/// v2: the anti-spam pause gate. A v1 body still lists paused users.
+const CACHE_KEY: &str = "discover:streamers:v2";
 
 /// Cache lifetime, seconds.
 const CACHE_TTL: usize = 30;
@@ -100,6 +113,14 @@ const CACHE_TTL: usize = 30;
 /// the very end of its Redis window, then held for its own `max-age`. That is
 /// acceptable for a directory whose only volatile field is live status.
 const CACHE_CONTROL: &str = "public, max-age=30";
+
+/// Only one cache miss computes at a time (see the module `# Single-flight`)
+static MISS_PERMIT: Semaphore = Semaphore::const_new(1);
+
+/// Last complete response computed by this process, and when
+///
+/// Lets waiters on `MISS_PERMIT` reuse a miss while Redis is unreachable.
+static LOCAL_CACHE: Mutex<Option<(Instant, v0::StreamersResponse)>> = Mutex::new(None);
 
 /// The one badge bit this directory publishes.
 const FOUNDING_STREAMER: u32 = UserBadges::FoundingStreamer as u32;
@@ -179,7 +200,11 @@ fn cache_enabled() -> bool {
 ///
 /// Fail-closed throughout: every check is written as "exclude unless
 /// positively known to be fine".
-fn is_publishable(user: &User) -> bool {
+///
+/// Every `User` field read here must be in `BADGED_USER_FIELDS`
+/// (`models/users/ops.rs` in the database crate): the scan is projected, so an
+/// unlisted field arrives empty and its check silently passes.
+fn is_publishable(user: &User, antispam: &AntispamFeatures) -> bool {
     // 1. THE BADGE BIT. `fetch_badged_users` does NO bit filtering — it
     //    returns every user with a non-zero `badges` field. Without this mask
     //    an anonymous, unauthenticated page would enumerate every Developer,
@@ -228,6 +253,20 @@ fn is_publishable(user: &User) -> bool {
     // 3. BOTS. A bot can hold badges and connections like any other user
     //    document; this directory is about people.
     if user.bot.is_some() {
+        return false;
+    }
+
+    // 3b. ANTI-SPAM PAUSE. A user whose DMs the copy-paste detector has
+    //    paused (and staff have not cleared) is not promoted to strangers.
+    //    The card is simply absent, the same as every other exclusion, so
+    //    the response never says why.
+    //
+    //    Gated through `dm_pause_enforced`, the single source of truth for
+    //    every pause gate: when staff use the `dm_dupe_enabled` kill switch to
+    //    lift a wave of pauses, these streamers reappear along with their DMs.
+    //    A change here is visible within 2 x CACHE_TTL (the Redis window, then
+    //    a client's own max-age).
+    if dm_pause_enforced(antispam, user) {
         return false;
     }
 
@@ -294,13 +333,67 @@ async fn read_cache() -> Option<v0::StreamersResponse> {
         return None;
     }
 
+    if let Some(local) = read_local(Instant::now()) {
+        return Some(local);
+    }
+
     let mut conn = get_connection().await.ok()?.into_inner();
     let payload: Option<String> = conn.get(CACHE_KEY).await.ok()?;
 
     serde_json::from_str(&payload?).ok()
 }
 
-/// Store the composed response for `CACHE_TTL` seconds. Best effort.
+/// What the directory does with one user's account lookup
+#[derive(Debug)]
+enum AccountVerdict {
+    /// Healthy account: the card is published
+    Publish,
+    /// A real, permanent answer: no account row, disabled, or deletion
+    /// pending. The user is skipped and the listing is still complete.
+    Skip,
+    /// No answer: the read failed. The user is skipped (fail closed), and the
+    /// listing is marked incomplete so it is never cached.
+    Unreadable(revolt_result::Error),
+}
+
+/// Classify one account lookup
+///
+/// "No account row" and "the account could not be read" are NOT the same
+/// answer. A missing account is a verdict. Any other error is the absence of
+/// one: a transient fault, or a row that no longer deserializes, which the
+/// driver cannot tell apart. Skipping instead of failing the request means one
+/// bad row cannot take the whole directory down; not caching means a blip
+/// cannot pin a truncated listing for CACHE_TTL.
+///
+/// Debug builds never return that error (`query!` unwraps it into a panic),
+/// which is why this is a pure function: the release behavior is tested here.
+fn account_verdict(result: Result<Account>) -> AccountVerdict {
+    match result {
+        Ok(account) if account.disabled || account.deletion.is_some() => AccountVerdict::Skip,
+        Ok(_) => AccountVerdict::Publish,
+        Err(error) if matches!(error.error_type, ErrorType::UnknownUser) => AccountVerdict::Skip,
+        Err(error) => AccountVerdict::Unreadable(error),
+    }
+}
+
+/// The in-process copy, if it is younger than `CACHE_TTL` at `now`
+fn read_local(now: Instant) -> Option<v0::StreamersResponse> {
+    let guard = LOCAL_CACHE.lock().ok()?;
+    fresh(guard.as_ref(), now)
+}
+
+/// Whether a stored entry is still inside `CACHE_TTL` at `now`
+fn fresh(
+    entry: Option<&(Instant, v0::StreamersResponse)>,
+    now: Instant,
+) -> Option<v0::StreamersResponse> {
+    let (stored_at, response) = entry?;
+    (now.saturating_duration_since(*stored_at) < Duration::from_secs(CACHE_TTL as u64))
+        .then(|| response.clone())
+}
+
+/// Store the composed response for `CACHE_TTL` seconds, in-process and in
+/// Redis. Best effort.
 ///
 /// Only ever called on a response the route is certain is COMPLETE — see the
 /// error split in the route body. Caching a listing that was truncated by a
@@ -308,6 +401,10 @@ async fn read_cache() -> Option<v0::StreamersResponse> {
 async fn write_cache(response: &v0::StreamersResponse) {
     if !cache_enabled() {
         return;
+    }
+
+    if let Ok(mut guard) = LOCAL_CACHE.lock() {
+        *guard = Some((Instant::now(), response.clone()));
     }
 
     let Ok(payload) = serde_json::to_string(response) else {
@@ -340,6 +437,18 @@ pub async fn streamers(db: &State<Database>) -> Result<CachedStreamers> {
         return Ok(CachedStreamers(Json(cached)));
     }
 
+    // Single-flight: one miss computes, the rest wait and then re-read what it
+    // stored. The semaphore is never closed, so acquire cannot fail in
+    // practice.
+    let _permit = MISS_PERMIT
+        .acquire()
+        .await
+        .map_err(|_| create_error!(InternalError))?;
+
+    if let Some(cached) = read_cache().await {
+        return Ok(CachedStreamers(Json(cached)));
+    }
+
     // ACCOUNT STATE, second half. `is_publishable` works off the `User`
     // document and structurally CANNOT see this:
     //
@@ -361,29 +470,28 @@ pub async fn streamers(db: &State<Database>) -> Result<CachedStreamers> {
     // emitted card. A rejected user consumes a read and no slot, so the cap
     // below cannot shorten this loop (see the module `# Cost` note).
     let mut streamers = Vec::with_capacity(MAX_STREAMERS);
+    let mut complete = true;
+
+    let config = revolt_config::config().await;
 
     for user in db
         .fetch_badged_users()
         .await?
         .into_iter()
-        .filter(is_publishable)
+        .filter(|user| is_publishable(user, &config.features.antispam))
     {
-        // "No account row" and "the database just failed" are NOT the same
-        // answer and must not share an arm. A missing account is a real,
-        // permanent verdict: skip the user, fail closed. A transient fault is
-        // an ABSENCE of a verdict — swallowing it would silently drop a
-        // legitimate streamer, and `write_cache` below would then pin that
-        // truncated directory in Redis for CACHE_TTL, long outliving the
-        // blip that caused it. Propagate instead: the caller gets an error,
-        // nothing is cached, and the next request recomputes cleanly.
-        let account = match db.fetch_account(&user.id).await {
-            Ok(account) => account,
-            Err(error) if matches!(error.error_type, ErrorType::UnknownUser) => continue,
-            Err(error) => return Err(error),
-        };
-
-        if account.disabled || account.deletion.is_some() {
-            continue;
+        match account_verdict(db.fetch_account(&user.id).await) {
+            AccountVerdict::Publish => {}
+            AccountVerdict::Skip => continue,
+            AccountVerdict::Unreadable(error) => {
+                log::error!(
+                    "streamer directory: skipping {}, account read failed: {:?}",
+                    user.id,
+                    error
+                );
+                complete = false;
+                continue;
+            }
         }
 
         streamers.push(to_streamer_card(user));
@@ -399,7 +507,9 @@ pub async fn streamers(db: &State<Database>) -> Result<CachedStreamers> {
     }
 
     let response = v0::StreamersResponse { streamers };
-    write_cache(&response).await;
+    if complete {
+        write_cache(&response).await;
+    }
 
     Ok(CachedStreamers(Json(response)))
 }
@@ -953,5 +1063,209 @@ mod test {
              and every other test in this module is passing vacuously"
         );
         assert_ne!(before, after);
+    }
+
+    /// A user whose DMs the anti-spam guard paused is absent; one whose pause
+    /// staff cleared, or who was flagged without a pause, is listed.
+    #[test]
+    fn streamers_hides_users_whose_dms_are_paused() {
+        crate::util::test::rt().block_on(streamers_hides_users_whose_dms_are_paused_case())
+    }
+
+    async fn streamers_hides_users_whose_dms_are_paused_case() {
+        use revolt_database::DmGuard;
+
+        // The detector ships off; with it off no pause is enforced. Also
+        // proves the route reads the live config rather than a default.
+        // Process-wide, so nextest only (one process per test).
+        revolt_config::overwrite_config(|settings| {
+            settings.features.antispam.dm_dupe_enabled = true;
+        })
+        .await;
+
+        let guard = |paused: bool, cleared_at: Option<Timestamp>| DmGuard {
+            report_id: Ulid::new().to_string(),
+            flagged_at: Timestamp::now_utc(),
+            paused,
+            cleared_at,
+            recipients: 5,
+            fingerprint: "fp".to_string(),
+        };
+
+        let harness = TestHarness::new().await;
+
+        let mut paused = fixture(Some(FOUNDING_STREAMER));
+        paused.dm_guard = Some(guard(true, None));
+        assert!(paused.is_dm_paused());
+
+        let mut cleared = fixture(Some(FOUNDING_STREAMER));
+        cleared.dm_guard = Some(guard(true, Some(Timestamp::now_utc())));
+
+        let mut flagged_only = fixture(Some(FOUNDING_STREAMER));
+        flagged_only.dm_guard = Some(guard(false, None));
+
+        for user in [&paused, &cleared, &flagged_only] {
+            insert_ok(&harness, user).await;
+        }
+
+        let body = harness
+            .client
+            .get("/discover/streamers")
+            .dispatch()
+            .await
+            .into_string()
+            .await
+            .expect("body");
+        assert!(
+            !body.contains("dm_guard") && !body.contains("paused"),
+            "the listing must never say why a user is absent: {}",
+            body
+        );
+
+        let listing: v0::StreamersResponse = serde_json::from_str(&body).expect("streamers json");
+        let ids = ids(&listing);
+        assert!(
+            !ids.contains(&paused.id),
+            "a user whose DMs are paused was listed"
+        );
+        assert!(ids.contains(&cleared.id), "a cleared pause must be listed");
+        assert!(
+            ids.contains(&flagged_only.id),
+            "a flag without a pause must be listed"
+        );
+    }
+
+    /// The kill switch lifts the hiding along with the pause itself: with
+    /// `dm_dupe_enabled` off, a paused streamer is publishable again.
+    #[test]
+    fn dm_pause_hides_only_while_enforced() {
+        use revolt_config::AntispamFeatures;
+        use revolt_database::DmGuard;
+
+        let mut paused = fixture(Some(FOUNDING_STREAMER));
+        paused.dm_guard = Some(DmGuard {
+            report_id: Ulid::new().to_string(),
+            flagged_at: Timestamp::now_utc(),
+            paused: true,
+            cleared_at: None,
+            recipients: 5,
+            fingerprint: "fp".to_string(),
+        });
+
+        let enabled = AntispamFeatures {
+            dm_dupe_enabled: true,
+            ..Default::default()
+        };
+        let kill_switch = AntispamFeatures {
+            dm_dupe_enabled: false,
+            ..Default::default()
+        };
+
+        assert!(!super::is_publishable(&paused, &enabled));
+        assert!(
+            super::is_publishable(&paused, &kill_switch),
+            "the kill switch lifted the pause but the streamer stayed hidden"
+        );
+        assert!(super::is_publishable(
+            &fixture(Some(FOUNDING_STREAMER)),
+            &enabled
+        ));
+    }
+
+    /// A failed account read skips the user and marks the listing
+    /// incomplete; it never fails the directory. Tested on the classifier
+    /// because debug builds panic before such an error reaches the route.
+    #[test]
+    fn account_verdict_skips_unreadable_rows_without_failing() {
+        use super::{account_verdict, AccountVerdict};
+        use revolt_result::{create_database_error, create_error};
+
+        let account = |disabled: bool, deletion: Option<DeletionInfo>| Account {
+            id: Ulid::new().to_string(),
+            email: "a@stoat.chat".to_string(),
+            email_normalised: "a@stoat.chat".to_string(),
+            password: "not-a-real-hash".to_string(),
+            deletion,
+            disabled,
+            lockout: None,
+            mfa: Default::default(),
+            password_reset: None,
+            verification: EmailVerification::Verified,
+            google_id: None,
+            apple_id: None,
+        };
+
+        assert!(matches!(
+            account_verdict(Ok(account(false, None))),
+            AccountVerdict::Publish
+        ));
+        assert!(matches!(
+            account_verdict(Ok(account(true, None))),
+            AccountVerdict::Skip
+        ));
+        assert!(matches!(
+            account_verdict(Ok(account(
+                false,
+                Some(DeletionInfo::Scheduled {
+                    after: Timestamp::now_utc()
+                })
+            ))),
+            AccountVerdict::Skip
+        ));
+        assert!(matches!(
+            account_verdict(Err(create_error!(UnknownUser))),
+            AccountVerdict::Skip
+        ));
+        assert!(
+            matches!(
+                account_verdict(Err(create_database_error!("find_one_by_id", "accounts"))),
+                AccountVerdict::Unreadable(_)
+            ),
+            "a failed read must be Unreadable (skipped, listing not cached), not a 500 \
+             and not a clean Skip"
+        );
+    }
+
+    /// The in-process copy is served for exactly `CACHE_TTL`.
+    #[test]
+    fn local_cache_freshness_tracks_the_cache_ttl() {
+        use std::time::{Duration, Instant};
+
+        let stored_at = Instant::now();
+        let entry = (stored_at, v0::StreamersResponse { streamers: vec![] });
+        let ttl = Duration::from_secs(super::CACHE_TTL as u64);
+
+        assert!(super::fresh(None, stored_at).is_none());
+        assert!(super::fresh(Some(&entry), stored_at).is_some());
+        assert!(super::fresh(Some(&entry), stored_at + ttl - Duration::from_millis(1)).is_some());
+        assert!(
+            super::fresh(Some(&entry), stored_at + ttl).is_none(),
+            "an entry CACHE_TTL old must be stale"
+        );
+    }
+
+    /// Requests arriving together all complete: the single-flight permit is
+    /// released after each miss rather than held, which would hang the rest.
+    #[test]
+    fn streamers_concurrent_requests_all_complete() {
+        crate::util::test::rt().block_on(streamers_concurrent_requests_all_complete_case())
+    }
+
+    async fn streamers_concurrent_requests_all_complete_case() {
+        let harness = TestHarness::new().await;
+
+        let user = fixture(Some(FOUNDING_STREAMER));
+        insert_ok(&harness, &user).await;
+
+        let responses = futures::future::join_all(
+            (0..6).map(|_| harness.client.get("/discover/streamers").dispatch()),
+        )
+        .await;
+
+        for response in responses {
+            assert_eq!(response.status(), rocket::http::Status::Ok);
+        }
+
+        assert!(ids(&listing(&harness).await).contains(&user.id));
     }
 }

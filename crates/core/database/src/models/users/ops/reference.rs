@@ -16,6 +16,20 @@ fn empty_supporter() -> Supporter {
 
 use super::AbstractUsers;
 
+/// Mirror the Mongo projection in `fetch_badged_users`: keep only the stored
+/// fields in `BADGED_USER_FIELDS`, by the same serde names Mongo sees
+fn project_badged_user(user: &User) -> Result<User> {
+    let serde_json::Value::Object(mut fields) =
+        serde_json::to_value(user).map_err(|_| create_database_error!("project", "user"))?
+    else {
+        return Err(create_database_error!("project", "user"));
+    };
+
+    fields.retain(|key, _| super::BADGED_USER_FIELDS.contains(&key.as_str()));
+    serde_json::from_value(serde_json::Value::Object(fields))
+        .map_err(|_| create_database_error!("project", "user"))
+}
+
 #[async_trait]
 impl AbstractUsers for ReferenceDb {
     /// Insert a new user into the database
@@ -74,8 +88,8 @@ impl AbstractUsers for ReferenceDb {
         let mut matches: Vec<User> = users
             .values()
             .filter(|user| user.badges.is_some_and(|badges| badges > 0))
-            .cloned()
-            .collect();
+            .map(project_badged_user)
+            .collect::<Result<_>>()?;
 
         // Newest first (ulid ids sort chronologically), matching the Mongo sort
         matches.sort_by(|a, b| b.id.cmp(&a.id));

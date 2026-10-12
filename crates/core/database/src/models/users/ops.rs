@@ -7,6 +7,34 @@ use crate::{DmGuard, FieldsUser, PartialUser, RelationshipStatus, User};
 mod mongodb;
 mod reference;
 
+/// The only stored fields `fetch_badged_users` returns, by their stored
+/// (serde) names; every other field comes back as its default.
+///
+/// The anonymous streamer directory is the caller, and it reads nothing
+/// else: the card fields, plus what it filters on. Without this a cache miss
+/// pulled every badged user's full document, relations and all, into delta.
+///
+/// The four non-optional fields of `User` (`_id`, `username`,
+/// `discriminator`, `last_acknowledged_policy_change`) must stay listed or
+/// the projected document no longer deserializes.
+pub(crate) const BADGED_USER_FIELDS: &[&str] = &[
+    "_id",
+    "username",
+    "discriminator",
+    "last_acknowledged_policy_change",
+    "display_name",
+    "avatar",
+    "badges",
+    "flags",
+    "suspended_until",
+    "bot",
+    "profile_visibility",
+    "connections",
+    // Filter-only: the directory hides users whose DMs the anti-spam guard
+    // has paused. Dropping this would silently publish them again.
+    "dm_guard",
+];
+
 #[async_trait]
 pub trait AbstractUsers: Sync + Send {
     /// Insert a new user into the database
@@ -38,6 +66,10 @@ pub trait AbstractUsers: Sync + Send {
     ///
     /// Newest first (ulid ids sort chronologically), so a caller that caps the
     /// list sees the same page under either driver.
+    ///
+    /// The users are PROJECTED to `BADGED_USER_FIELDS`: relations, status,
+    /// profile, supporter data and every other unlisted field come back empty.
+    /// Never write one of these users back or treat it as the whole record.
     ///
     /// NOTE (Mongo): `badges` is `Option<i32>` with `skip_serializing_if =
     /// Option::is_none`, so "no badges" is an ABSENT field — filters must
@@ -288,6 +320,93 @@ mod tests {
                     "01TEST00000000000000BADGE1".to_string()
                 ]
             );
+        });
+    }
+
+    /// Only `BADGED_USER_FIELDS` come back: the fields the directory reads
+    /// survive, and private ones it never needs are not loaded at all.
+    #[tokio::test]
+    async fn fetch_badged_users_projects_to_the_listed_fields() {
+        use crate::{
+            ConnectionPlatform, DmGuard, ProfileVisibility, Relationship, RelationshipStatus,
+            UserConnection, UserProfile, UserStatus,
+        };
+        use iso8601_timestamp::Timestamp;
+
+        database_test!(|db| async move {
+            let mut full = user(
+                "01TEST00000000000000BADGED",
+                Some(UserBadges::FoundingStreamer as i32),
+            );
+            // Kept
+            full.display_name = Some("Streamer".to_string());
+            full.flags = Some(0);
+            full.profile_visibility = Some(ProfileVisibility::Everyone);
+            full.connections = Some(vec![UserConnection {
+                platform: ConnectionPlatform::Twitch,
+                handle: "streamer".to_string(),
+                display_name: "Streamer".to_string(),
+                live: true,
+                live_title: Some("live now".to_string()),
+                live_since: None,
+            }]);
+            full.dm_guard = Some(DmGuard {
+                report_id: "01TEST00000000000000REPRT1".to_string(),
+                flagged_at: Timestamp::now_utc(),
+                paused: true,
+                cleared_at: None,
+                recipients: 5,
+                fingerprint: "fp".to_string(),
+            });
+            // Dropped
+            full.relations = Some(vec![Relationship {
+                id: "01TEST00000000000000FR1END".to_string(),
+                status: RelationshipStatus::Friend,
+                note: Some("private note".to_string()),
+            }]);
+            full.status = Some(UserStatus {
+                text: Some("status".to_string()),
+                ..Default::default()
+            });
+            full.profile = Some(UserProfile {
+                content: Some("bio".to_string()),
+                ..Default::default()
+            });
+            full.pronouns = Some("they/them".to_string());
+            full.privileged = true;
+            full.referral_count = Some(3);
+            db.insert_user(&full).await.unwrap();
+
+            let fetched = db.fetch_badged_users().await.unwrap();
+            assert_eq!(fetched.len(), 1);
+            let fetched = &fetched[0];
+
+            assert_eq!(fetched.id, full.id);
+            assert_eq!(fetched.username, full.username);
+            assert_eq!(fetched.discriminator, full.discriminator);
+            assert_eq!(fetched.display_name, full.display_name);
+            assert_eq!(fetched.badges, full.badges);
+            assert_eq!(fetched.flags, full.flags);
+            assert_eq!(fetched.profile_visibility, full.profile_visibility);
+            assert_eq!(fetched.connections, full.connections);
+            // Timestamps left out: their round trip is not what this pins
+            let guard = |user: &User| {
+                user.dm_guard
+                    .as_ref()
+                    .map(|g| (g.report_id.clone(), g.paused, g.cleared_at.is_some()))
+            };
+            assert_eq!(
+                guard(fetched),
+                guard(&full),
+                "dm_guard was projected away; the directory's pause filter would never fire"
+            );
+
+            assert_eq!(fetched.relations, None, "relations were loaded");
+            assert_eq!(fetched.status, None, "status was loaded");
+            assert_eq!(fetched.profile, None, "profile was loaded");
+            assert_eq!(fetched.pronouns, None, "pronouns were loaded");
+            assert!(!fetched.privileged, "privileged was loaded");
+            assert_eq!(fetched.referral_count, None, "referral_count was loaded");
         });
     }
 }
