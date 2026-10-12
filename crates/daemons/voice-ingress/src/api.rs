@@ -1424,7 +1424,9 @@ fn retried_first_connection(recorded: &[(String, String)], sid: &str) -> bool {
 /// `screensharing` and `screen_video`, screen audio (4) `screensharing`
 /// only, and the whisper source (0) nothing. A MUTED track counts as off,
 /// as `track_muted` turns its flag off. Every flag is set, so a flag no
-/// survivor backs is written `false`.
+/// survivor backs is written `false`. Deriving from the live set also
+/// agrees with that function's removal rule, where a screen-audio track
+/// going away leaves `screensharing` set while screen video is live.
 fn survivor_track_flags(
     listed: &[ParticipantInfo],
     user_id: &str,
