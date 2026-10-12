@@ -31,6 +31,9 @@ const VIDEO_PROBE_BYTES: usize = 32 * 1024 * 1024;
 const PROXY_IMAGE_BYTES: usize = 20 * 1024 * 1024;
 /// Largest video `/proxy` serves
 const PROXY_VIDEO_BYTES: usize = 50 * 1024 * 1024;
+/// The only ports january fetches from (internal services listen on other
+/// ports of the host's own public address, which is reachable over `lo`)
+const ALLOWED_PORTS: [u16; 4] = [80, 443, 8080, 8443];
 
 lazy_static! {
     /// Request client
@@ -613,13 +616,22 @@ impl Request {
         Ok(Request::exists(proper_url).await)
     }
 
-    /// Refuse `url` unless every address it can reach is allowed
+    /// Refuse `url` unless its port is in `ALLOWED_PORTS` and every address
+    /// it can reach is allowed
     ///
-    /// A literal IP host is judged by `ip_policy::is_forbidden` directly. A
-    /// name must contain a dot and not be in `january.blocked_domains`, and
-    /// then goes through `resolve_vetted` (the same vetting the clients'
-    /// resolver applies), so EVERY address it resolves to must be allowed.
+    /// The port is checked first, before any lookup. A literal IP host is
+    /// judged by `ip_policy::is_forbidden` directly. A name must contain a
+    /// dot and not be in `january.blocked_domains`, and then goes through
+    /// `resolve_vetted` (the same vetting the clients' resolver applies), so
+    /// EVERY address it resolves to must be allowed.
     pub async fn url_is_blacklisted(url: &Url) -> Result<IPRequest> {
+        if !url
+            .port_or_known_default()
+            .is_some_and(|port| ALLOWED_PORTS.contains(&port))
+        {
+            return Err(create_error!(InvalidOperation));
+        }
+
         let resolved_address: IpAddr;
 
         if let Some(host) = url.host() {
@@ -1179,16 +1191,13 @@ mod tests {
 
     #[tokio::test]
     async fn sec002_audio_stream_refuses_a_mixed_answer_before_connecting() {
-        let (listener, port) = bait().await;
-        seed_dns(
-            "mixed-audio.test",
-            &[("8.8.8.8", port), ("127.0.0.1", port)],
-        )
-        .await;
+        // Default port (allowed), so only the mixed answer can refuse it; a
+        // connection attempt would end in ProxyError, not InvalidOperation
+        seed_dns("mixed-audio.test", &[("8.8.8.8", 0), ("127.0.0.1", 0)]).await;
 
         let error = tokio::time::timeout(
             Duration::from_secs(15),
-            Request::open_audio_stream(&format!("http://mixed-audio.test:{port}/a.mp3"), None),
+            Request::open_audio_stream("http://mixed-audio.test/a.mp3", None),
         )
         .await
         .expect("refused without waiting on a connection")
@@ -1196,7 +1205,6 @@ mod tests {
         .expect("refused");
 
         assert!(matches!(error.error_type, ErrorType::InvalidOperation));
-        assert_never_accepted(&listener).await;
     }
 
     #[tokio::test]
@@ -1251,6 +1259,51 @@ mod tests {
         }
 
         assert_never_accepted(&listener).await;
+    }
+
+    #[tokio::test]
+    async fn sec002_only_web_ports_are_fetched() {
+        // A public answer, so only the port can refuse
+        seed_dns("ports.test", &[("8.8.8.8", 0)]).await;
+
+        for value in [
+            "http://ports.test:8500/",
+            "http://ports.test:14702/",
+            "https://ports.test:14703/",
+            "http://ports.test:22/",
+            "http://ports.test:6379/",
+            "http://ports.test:0/",
+            "http://8.8.8.8:8500/",
+            "http://[2606:4700::1111]:14704/",
+            "ftp://ports.test/",
+            // never looked up: a lookup of this name would fail as ProxyError
+            "http://unseeded-port.test:14705/",
+        ] {
+            let error = Request::url_is_blacklisted(&url(value))
+                .await
+                .err()
+                .expect("refused");
+            assert!(
+                matches!(error.error_type, ErrorType::InvalidOperation),
+                "{value}"
+            );
+        }
+
+        for value in [
+            "http://ports.test/",
+            "https://ports.test/",
+            "http://ports.test:80/",
+            "https://ports.test:443/",
+            "http://ports.test:443/",
+            "http://ports.test:8080/",
+            "https://ports.test:8443/",
+            "http://8.8.8.8:8080/",
+        ] {
+            assert!(
+                Request::url_is_blacklisted(&url(value)).await.is_ok(),
+                "{value}"
+            );
+        }
     }
 
     const CAP: usize = 4096;
