@@ -135,9 +135,18 @@ on every device, the client acks encrypted conversations to the server:
   one padded id covers every device's copy of that message.
 - When the user reads a conversation, the server learns which encrypted message
   they read up to, to the millisecond, and when. It never learns the content.
-- An own send is acked at send time from the server's own receipt id. That
-  reveals nothing new, because the server saw the send at that instant. With no
-  queued receipt, no ack is sent.
+- Groups (user decision, 2026-10-12): reading acks sync group read state too.
+  Because every envelope of one send shares its millisecond, a group reading
+  ack also tells the server which group an encrypted send belonged to, to the
+  millisecond. The user accepted this to keep group badges in sync across
+  devices.
+- A DM own send is acked at send time from the server's own receipt id. That
+  reveals nothing new, because the server saw the send at that instant and
+  already knows the pair. With no queued receipt, no ack is sent.
+- A group own send is never acked at send time (user decision, 2026-10-12):
+  the Olm fan-out does not name the group, so the sender's own ack would tie
+  the send to the group the moment it is made. Recipients' reading acks still
+  can, as above.
 - The startup restore and the decrypt path send nothing to the server.
 
 Accepted edge cases:
@@ -145,6 +154,9 @@ Accepted edge cases:
   ack.
 - A device whose clock runs more than 10 minutes slow does not reorder
   conversations.
+- A large fan-out's envelope ids date from the start of the request, so a reply
+  acked while the request is still being stored can cover it (a millisecond
+  window).
 - After updating to a client with this change, an encrypted conversation whose
   newest message is incoming shows an unread dot once, because no encrypted ack
   had ever reached the server.
