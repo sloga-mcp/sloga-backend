@@ -57,6 +57,8 @@
 //! repo configures origin fronting for `/discover/*`.
 
 use redis_kiss::{get_connection, redis, AsyncCommands};
+use revolt_config::AntispamFeatures;
+use revolt_database::util::antispam::dm_pause_enforced;
 use revolt_database::{Account, Database, ProfileVisibility, User};
 use revolt_models::v0::{self, UserBadges, UserFlags};
 use revolt_result::{create_error, ErrorType, Result};
@@ -86,7 +88,9 @@ const MAX_STREAMERS: usize = 50;
 /// shape, and across a rolling deploy an old binary keeps refilling this key
 /// with ungated bodies that the new binary then serves verbatim for up to
 /// `CACHE_TTL`. A new key means the two binaries cannot feed each other.
-const CACHE_KEY: &str = "discover:streamers:v1";
+///
+/// v2: the anti-spam pause gate. A v1 body still lists paused users.
+const CACHE_KEY: &str = "discover:streamers:v2";
 
 /// Cache lifetime, seconds.
 const CACHE_TTL: usize = 30;
@@ -196,7 +200,11 @@ fn cache_enabled() -> bool {
 ///
 /// Fail-closed throughout: every check is written as "exclude unless
 /// positively known to be fine".
-fn is_publishable(user: &User) -> bool {
+///
+/// Every `User` field read here must be in `BADGED_USER_FIELDS`
+/// (`models/users/ops.rs` in the database crate): the scan is projected, so an
+/// unlisted field arrives empty and its check silently passes.
+fn is_publishable(user: &User, antispam: &AntispamFeatures) -> bool {
     // 1. THE BADGE BIT. `fetch_badged_users` does NO bit filtering — it
     //    returns every user with a non-zero `badges` field. Without this mask
     //    an anonymous, unauthenticated page would enumerate every Developer,
@@ -251,9 +259,14 @@ fn is_publishable(user: &User) -> bool {
     // 3b. ANTI-SPAM PAUSE. A user whose DMs the copy-paste detector has
     //    paused (and staff have not cleared) is not promoted to strangers.
     //    The card is simply absent, the same as every other exclusion, so
-    //    the response never says why. Like any change here it shows up within
-    //    one CACHE_TTL.
-    if user.is_dm_paused() {
+    //    the response never says why.
+    //
+    //    Gated through `dm_pause_enforced`, the single source of truth for
+    //    every pause gate: when staff use the `dm_dupe_enabled` kill switch to
+    //    lift a wave of pauses, these streamers reappear along with their DMs.
+    //    A change here is visible within 2 x CACHE_TTL (the Redis window, then
+    //    a client's own max-age).
+    if dm_pause_enforced(antispam, user) {
         return false;
     }
 
@@ -459,11 +472,13 @@ pub async fn streamers(db: &State<Database>) -> Result<CachedStreamers> {
     let mut streamers = Vec::with_capacity(MAX_STREAMERS);
     let mut complete = true;
 
+    let config = revolt_config::config().await;
+
     for user in db
         .fetch_badged_users()
         .await?
         .into_iter()
-        .filter(is_publishable)
+        .filter(|user| is_publishable(user, &config.features.antispam))
     {
         match account_verdict(db.fetch_account(&user.id).await) {
             AccountVerdict::Publish => {}
@@ -1060,6 +1075,14 @@ mod test {
     async fn streamers_hides_users_whose_dms_are_paused_case() {
         use revolt_database::DmGuard;
 
+        // The detector ships off; with it off no pause is enforced. Also
+        // proves the route reads the live config rather than a default.
+        // Process-wide, so nextest only (one process per test).
+        revolt_config::overwrite_config(|settings| {
+            settings.features.antispam.dm_dupe_enabled = true;
+        })
+        .await;
+
         let guard = |paused: bool, cleared_at: Option<Timestamp>| DmGuard {
             report_id: Ulid::new().to_string(),
             flagged_at: Timestamp::now_utc(),
@@ -1110,6 +1133,43 @@ mod test {
             ids.contains(&flagged_only.id),
             "a flag without a pause must be listed"
         );
+    }
+
+    /// The kill switch lifts the hiding along with the pause itself: with
+    /// `dm_dupe_enabled` off, a paused streamer is publishable again.
+    #[test]
+    fn dm_pause_hides_only_while_enforced() {
+        use revolt_config::AntispamFeatures;
+        use revolt_database::DmGuard;
+
+        let mut paused = fixture(Some(FOUNDING_STREAMER));
+        paused.dm_guard = Some(DmGuard {
+            report_id: Ulid::new().to_string(),
+            flagged_at: Timestamp::now_utc(),
+            paused: true,
+            cleared_at: None,
+            recipients: 5,
+            fingerprint: "fp".to_string(),
+        });
+
+        let enabled = AntispamFeatures {
+            dm_dupe_enabled: true,
+            ..Default::default()
+        };
+        let kill_switch = AntispamFeatures {
+            dm_dupe_enabled: false,
+            ..Default::default()
+        };
+
+        assert!(!super::is_publishable(&paused, &enabled));
+        assert!(
+            super::is_publishable(&paused, &kill_switch),
+            "the kill switch lifted the pause but the streamer stayed hidden"
+        );
+        assert!(super::is_publishable(
+            &fixture(Some(FOUNDING_STREAMER)),
+            &enabled
+        ));
     }
 
     /// A failed account read skips the user and marks the listing
