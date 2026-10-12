@@ -1,10 +1,8 @@
 use anyhow::Result;
-use image::{AnimationDecoder, DynamicImage, ImageBuffer, ImageReader};
+use image::{AnimationDecoder, DynamicImage, ImageReader};
 use jxl_oxide::integration::JxlDecoder;
-use revolt_config::report_internal_error;
 use std::io::{BufRead, Read, Seek, SeekFrom};
 use tempfile::NamedTempFile;
-use tiny_skia::Pixmap;
 
 use crate::{MediaError, MediaRepository};
 
@@ -148,13 +146,9 @@ impl MediaRepository for MediaImpl {
 
     fn image_size_vec(&self, v: &[u8], mime: &str) -> Option<(usize, usize)> {
         match mime {
-            "image/svg+xml" => {
-                let tree =
-                    report_internal_error!(usvg::Tree::from_data(v, &Default::default())).ok()?;
-
-                let size = tree.size();
-                Some((size.width() as usize, size.height() as usize))
-            }
+            // SVG is never parsed or rendered server-side: a hostile SVG can exhaust CPU,
+            // memory or the stack in the parser and renderer.
+            "image/svg+xml" => None,
             _ => {
                 if let Ok(size) = imagesize::blob_size(v)
                     .inspect_err(|err| tracing::error!("Failed to generate image size! {err:?}"))
@@ -180,35 +174,11 @@ impl MediaRepository for MediaImpl {
                 DynamicImage::from_decoder(decoder)
                     .map_err(|e| MediaError::from(anyhow::anyhow!(e)))
             }
-            "image/svg+xml" => {
-                let mut buf = Vec::new();
-                reader
-                    .read_to_end(&mut buf)
-                    .map_err(|e| MediaError::from(anyhow::anyhow!(e)))?;
-
-                let tree: usvg::Tree = usvg::Tree::from_data(&buf, &Default::default())
-                    .map_err(|e| MediaError::from(anyhow::anyhow!(e)))?;
-
-                let size = tree.size();
-                let mut pixmap = Pixmap::new(size.width() as u32, size.height() as u32)
-                    .ok_or_else(|| MediaError::ImageProcessingFailed {
-                        cause: "failed to create Pixmap, likely zero sized".to_string(),
-                    })?;
-
-                let mut pixmap_mut = pixmap.as_mut();
-                resvg::render(&tree, Default::default(), &mut pixmap_mut);
-
-                Ok(DynamicImage::ImageRgba8(
-                    ImageBuffer::from_vec(
-                        size.width() as u32,
-                        size.height() as u32,
-                        pixmap.data().to_vec(),
-                    )
-                    .ok_or_else(|| MediaError::ImageProcessingFailed {
-                        cause: "buffer is not big enough".to_string(),
-                    })?,
-                ))
-            }
+            // SVG is never parsed or rendered server-side: a hostile SVG can exhaust CPU,
+            // memory or the stack in the parser and renderer.
+            "image/svg+xml" => Err(MediaError::ImageProcessingFailed {
+                cause: "svg images are not rendered".to_string(),
+            }),
             _ => {
                 let image: ImageReader<&mut R> =
                     reader_with_format(image::ImageReader::new(reader), mime)
@@ -550,5 +520,84 @@ mod tests {
         let mut reader = Cursor::new(buf);
         let image = media.decode_image(&mut reader, "image/avif").unwrap();
         media.create_thumbnail(image, "attachments");
+    }
+
+    fn assert_svg_refused(media: &MediaImpl, name: &str, svg: &str) {
+        assert_eq!(
+            media.image_size_vec(svg.as_bytes(), "image/svg+xml"),
+            None,
+            "{name}: image_size_vec parsed an SVG"
+        );
+        let mut reader = Cursor::new(svg.as_bytes());
+        assert!(
+            media.decode_image(&mut reader, "image/svg+xml").is_err(),
+            "{name}: decode_image rendered an SVG"
+        );
+    }
+
+    #[tokio::test]
+    async fn sec003_svg_plain_is_not_parsed() {
+        let media = MediaImpl::from_config().await;
+        let svg = r#"<svg xmlns="http://www.w3.org/2000/svg" width="200" height="100"><rect width="200" height="100" fill="red"/></svg>"#;
+        assert_svg_refused(&media, "plain", svg);
+    }
+
+    /// Representative hostile inputs: none of them reaches a parser.
+    #[tokio::test]
+    async fn sec003_svg_hostile_samples_are_refused() {
+        let media = MediaImpl::from_config().await;
+
+        let mut png = Cursor::new(Vec::new());
+        image::RgbaImage::from_pixel(50, 50, image::Rgba([255, 0, 0, 255]))
+            .write_to(&mut png, image::ImageFormat::Png)
+            .unwrap();
+        let mut file = tempfile::Builder::new().suffix(".png").tempfile().unwrap();
+        file.write_all(png.get_ref()).unwrap();
+        file.flush().unwrap();
+        let path = file.path().to_str().unwrap();
+
+        let attributes: String = (0..254).map(|i| format!(r#" a{i}="""#)).collect();
+        let samples = [
+            (
+                "local file href",
+                format!(
+                    r#"<svg xmlns="http://www.w3.org/2000/svg" width="100" height="100"><image href="{path}" width="100" height="100"/></svg>"#
+                ),
+            ),
+            (
+                "large declared size",
+                r#"<svg xmlns="http://www.w3.org/2000/svg" width="6000" height="6000"><rect width="6000" height="6000" fill="red"/></svg>"#.to_string(),
+            ),
+            (
+                "dtd entities",
+                format!(
+                    r#"<?xml version="1.0"?><!DOCTYPE svg [<!ENTITY b "ab">]><svg xmlns="http://www.w3.org/2000/svg" width="20" height="10"><desc>{}</desc></svg>"#,
+                    "&b;".repeat(50)
+                ),
+            ),
+            (
+                "many attributes",
+                format!(
+                    r#"<svg xmlns="http://www.w3.org/2000/svg" width="20" height="10"><rect width="20" height="10" fill="red"{attributes}/></svg>"#
+                ),
+            ),
+        ];
+
+        for (name, svg) in &samples {
+            assert_svg_refused(&media, name, svg);
+        }
+    }
+
+    /// An SVG body under a raster mime only reaches the raster decoders, which reject it.
+    #[tokio::test]
+    async fn sec003_svg_body_under_raster_mime_is_not_rendered() {
+        let media = MediaImpl::from_config().await;
+        let svg = br#"<svg xmlns="http://www.w3.org/2000/svg" width="200" height="100"><rect width="200" height="100" fill="red"/></svg>"#;
+
+        for mime in ["image/png", "image/webp", "image/jpeg"] {
+            assert_eq!(media.image_size_vec(svg, mime), None, "{mime}");
+            let mut reader = Cursor::new(&svg[..]);
+            assert!(media.decode_image(&mut reader, mime).is_err(), "{mime}");
+        }
     }
 }

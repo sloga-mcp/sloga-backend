@@ -39,9 +39,6 @@ jxl-oxide = { workspace = true, features = ["image"] }
 image = { workspace = true }
 
 # svg rendering
-usvg = { workspace = true }
-resvg = { workspace = true }
-tiny-skia = { workspace = true }
 
 # encoding
 webp = { workspace = true }
