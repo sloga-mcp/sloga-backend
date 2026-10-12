@@ -1739,6 +1739,22 @@ mod tests {
     }
 
     #[test]
+    fn badges_malformed_id_fails_closed() {
+        // `I`, `L`, `O` and `U` are not Crockford base32, so this id does not
+        // decode; it must fall through to the stored badges, never panic
+        let user = User {
+            id: "01USER0000000000000000BIT1".to_string(),
+            badges: Some(UserBadges::Developer as i32),
+            ..Default::default()
+        };
+        assert!(ulid::Ulid::from_string(&user.id).is_err());
+        assert_eq!(
+            user.compute_badges(Some(u64::MAX), NOW),
+            UserBadges::Developer as u32
+        );
+    }
+
+    #[test]
     fn badges_computed_from_referrals_and_support() {
         let user = User {
             id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_string(),
