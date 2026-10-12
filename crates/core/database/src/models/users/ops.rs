@@ -21,6 +21,29 @@ pub trait AbstractUsers: Sync + Send {
     /// Fetch multiple users by their ids
     async fn fetch_users<'a>(&self, ids: &'a [String]) -> Result<Vec<User>>;
 
+    /// Fetch every user with at least one *stored* badge bit, positive
+    /// bitfield only.
+    ///
+    /// Dynamic badges (early adopter) are computed per-user in
+    /// `User::get_badges` and are not visible to this query.
+    ///
+    /// `badges` is sparse: users with no badges have no `badges` field at all, and some
+    /// carry an explicit 0. Callers bitmask-test the result themselves, because Mongo's
+    /// `$bits*` operators cannot use an index.
+    ///
+    /// A NEGATIVE `badges` value is never returned. It is reachable only by a
+    /// direct database write, but it would sign-extend in a caller's `as u32`
+    /// bit test (-1 becomes 0xFFFFFFFF, every bit set), so both drivers
+    /// exclude it at the source rather than trusting each call site.
+    ///
+    /// Newest first (ulid ids sort chronologically), so a caller that caps the
+    /// list sees the same page under either driver.
+    ///
+    /// NOTE (Mongo): `badges` is `Option<i32>` with `skip_serializing_if =
+    /// Option::is_none`, so "no badges" is an ABSENT field — filters must
+    /// exclude missing/null as well as 0, never a bare `{"badges": {"$ne": 0}}`.
+    async fn fetch_badged_users(&self) -> Result<Vec<User>>;
+
     /// Fetch all discriminators in use for a username
     async fn fetch_discriminators_in_use(&self, username: &str) -> Result<Vec<String>>;
 
@@ -136,4 +159,135 @@ pub trait AbstractUsers: Sync + Send {
     /// Fetch users with an id of at least `cutoff_id` that are not bots, not
     /// privileged, carry no flags and have no DM guard
     async fn fetch_users_created_since(&self, cutoff_id: &str) -> Result<Vec<User>>;
+}
+
+#[cfg(test)]
+mod tests {
+    // NOTE: `AbstractUsers` is deliberately NOT imported -- `Database` derefs
+    // to `dyn AbstractDatabase`, which has this trait as a supertrait, so the
+    // import would be dead code (and a warning).
+    use crate::User;
+    use revolt_models::v0::UserBadges;
+    use ulid::Ulid;
+
+    fn user(id: &str, badges: Option<i32>) -> User {
+        // Fixture ids must be decodable ULIDs -- the Crockford alphabet
+        // excludes I, L, O and U.
+        //
+        // Id-derived logic fails CLOSED on an unparseable id rather than
+        // announcing itself: `User::get_badges` gates the early-adopter bit on
+        // `Ulid::from_string(&self.id).is_ok_and(...)` (`model.rs:1005`), so a
+        // malformed fixture id just silently skips that branch and the user
+        // quietly never earns the badge. A test built on such an id would pass
+        // for the wrong reason. Assert here so the fixture is rejected loudly
+        // instead.
+        assert!(
+            Ulid::from_string(id).is_ok(),
+            "fixture id is not a decodable ULID: {id}"
+        );
+
+        User {
+            id: id.to_string(),
+            username: format!("u{id}"),
+            discriminator: "0001".to_string(),
+            badges,
+            ..Default::default()
+        }
+    }
+
+    /// Regression guard for the sparse-field trap: `badges` is skip-serialized
+    /// when `None`, so an unbadged user has NO `badges` field on Mongo and a
+    /// naive `{"badges": {"$ne": 0}}` returns them. The reference driver
+    /// iterates a `HashMap` and passes either way — run under
+    /// `TEST_DB=MONGODB` for this assertion to mean anything.
+    #[tokio::test]
+    async fn fetch_badged_users_skips_zero_and_absent_badges() {
+        database_test!(|db| async move {
+            // carries the FoundingStreamer bit
+            db.insert_user(&user(
+                "01TEST00000000000000BADGED",
+                Some(UserBadges::FoundingStreamer as i32),
+            ))
+            .await
+            .unwrap();
+            // carries some OTHER badge: the driver must NOT filter by bit
+            db.insert_user(&user("01TEST00000000000000BADGE1", Some(1)))
+                .await
+                .unwrap();
+            // stored field, but no badges set
+            db.insert_user(&user("01TEST0000000000000000ZER0", Some(0)))
+                .await
+                .unwrap();
+            // no `badges` field on the stored document at all
+            db.insert_user(&user("01TEST00000000000000NBADGE", None))
+                .await
+                .unwrap();
+            // negative bitfield: only reachable by a direct DB write, but the
+            // route's `as u32` bit test sign-extends -1 to 0xFFFFFFFF, which
+            // has EVERY bit set -- including FoundingStreamer. Must not be
+            // returned; excluding it at the source is the fail-closed choice.
+            db.insert_user(&user("01TEST00000000000000NEGATV", Some(-1)))
+                .await
+                .unwrap();
+
+            let mut ids: Vec<String> = db
+                .fetch_badged_users()
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|user| user.id)
+                .collect();
+            ids.sort();
+
+            // Sort both sides: this assertion is about set membership, the
+            // ordering contract has its own test below.
+            let mut expected = vec![
+                "01TEST00000000000000BADGED".to_string(),
+                "01TEST00000000000000BADGE1".to_string(),
+            ];
+            expected.sort();
+
+            assert_eq!(
+                ids, expected,
+                "expected exactly the two users carrying a non-zero badge bitfield"
+            );
+        });
+    }
+
+    /// Both drivers promise newest-first, so a caller that caps the list keeps
+    /// the same page whichever driver is behind it.
+    #[tokio::test]
+    async fn fetch_badged_users_orders_newest_first() {
+        database_test!(|db| async move {
+            db.insert_user(&user(
+                "01TEST00000000000000BADGED",
+                Some(UserBadges::FoundingStreamer as i32),
+            ))
+            .await
+            .unwrap();
+            db.insert_user(&user(
+                "01TEST00000000000000BADGE1",
+                Some(UserBadges::FoundingStreamer as i32),
+            ))
+            .await
+            .unwrap();
+
+            let ids: Vec<String> = db
+                .fetch_badged_users()
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|user| user.id)
+                .collect();
+
+            // "01TEST00000000000000BADGED" > "01TEST00000000000000BADGE1" lexicographically
+            assert_eq!(
+                ids,
+                vec![
+                    "01TEST00000000000000BADGED".to_string(),
+                    "01TEST00000000000000BADGE1".to_string()
+                ]
+            );
+        });
+    }
 }

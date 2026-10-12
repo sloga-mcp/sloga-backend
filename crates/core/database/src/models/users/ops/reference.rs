@@ -65,6 +65,23 @@ impl AbstractUsers for ReferenceDb {
             .collect())
     }
 
+    /// Fetch every user with at least one stored badge bit, positive bitfield only
+    async fn fetch_badged_users(&self) -> Result<Vec<User>> {
+        let users = self.users.lock().await;
+        // `> 0`, not `!= 0`: a negative bitfield sign-extends to 0xFFFFFFFF in
+        // a caller's `as u32` bit test (every badge bit set), so it is excluded
+        // here rather than at each call site. Matches the Mongo `$gt: 0`.
+        let mut matches: Vec<User> = users
+            .values()
+            .filter(|user| user.badges.is_some_and(|badges| badges > 0))
+            .cloned()
+            .collect();
+
+        // Newest first (ulid ids sort chronologically), matching the Mongo sort
+        matches.sort_by(|a, b| b.id.cmp(&a.id));
+        Ok(matches)
+    }
+
     /// Fetch all discriminators in use for a username
     async fn fetch_discriminators_in_use(&self, username: &str) -> Result<Vec<String>> {
         let users = self.users.lock().await;

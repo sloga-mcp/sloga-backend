@@ -48,6 +48,7 @@ package(revolt-delta) & (
   | test(=routes::servers::server_join::test::join_rejected_at_server_cap)
   | test(=routes::mls::tests::publish_validates_binding_caps_and_immutability)
   | test(=routes::channels::forum_post_create::test::create_post_is_exempt_from_thread_cap)
+  | test(=routes::discover::streamers_list::test::streamers_caps_the_listing)
 )
 '''
 slow-timeout = { period = "15s", terminate-after = 20 }
