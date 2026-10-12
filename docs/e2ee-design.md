@@ -114,6 +114,41 @@ devices), sealed sender, sender-keys for large groups.
   is client-honored); the lock indicator must be derived from *message type*,
   not conversation state, so a downgrade is visible.
 
+## 8b. Conversation order, unread and read sync (2026-10-11)
+
+The server never sees an encrypted message, so it cannot move a DM to the top of
+the list or count it as unread. The client does both after it decrypts:
+
+- Each decrypted text message calls `Channel.noteEncryptedMessage` once. Control
+  and marker rows never count. An envelope id is accepted only if it is a
+  plausible ULID dated no more than 10 minutes ahead, so a server-chosen id
+  cannot break the sort or pin a conversation to the top.
+- On every connect the client restores the order from the newest message in its
+  local history. Those ids are not trusted for display until the decrypted row
+  replaces whatever is cached under them.
+
+**Read sync metadata (accepted by the user on 2026-10-11).** To clear the badge
+on every device, the client acks encrypted conversations to the server:
+
+- The acked id is padded: the first 10 characters (the millisecond) plus 16 `Z`.
+  `send_messages` stamps every envelope of one send with a single instant, so
+  one padded id covers every device's copy of that message.
+- When the user reads a conversation, the server learns which encrypted message
+  they read up to, to the millisecond, and when. It never learns the content.
+- An own send is acked at send time from the server's own receipt id. That
+  reveals nothing new, because the server saw the send at that instant. With no
+  queued receipt, no ack is sent.
+- The startup restore and the decrypt path send nothing to the server.
+
+Accepted edge cases:
+- A later message stamped in the same millisecond is covered by the same padded
+  ack.
+- A device whose clock runs more than 10 minutes slow does not reorder
+  conversations.
+- After updating to a client with this change, an encrypted conversation whose
+  newest message is incoming shows an unread dot once, because no encrypted ack
+  had ever reached the server.
+
 ## 9a. Slice-0 decision record (2026-07-07)
 
 ### Library: vodozemac (decided)
