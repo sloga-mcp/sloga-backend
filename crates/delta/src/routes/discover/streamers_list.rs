@@ -50,14 +50,14 @@
 //! checked before Redis.
 //!
 //! Not collapsed: a response that skipped an unreadable account row is never
-//! cached (see the route body), so while such a row exists every request
+//! cached (see `account_verdict`), so while such a row exists every request
 //! recomputes, one at a time. The error log names the row.
 //!
 //! Deliberately NOT claimed: that a CDN absorbs the stampede. Nothing in this
 //! repo configures origin fronting for `/discover/*`.
 
 use redis_kiss::{get_connection, redis, AsyncCommands};
-use revolt_database::{Database, ProfileVisibility, User};
+use revolt_database::{Account, Database, ProfileVisibility, User};
 use revolt_models::v0::{self, UserBadges, UserFlags};
 use revolt_result::{create_error, ErrorType, Result};
 use revolt_rocket_okapi::gen::OpenApiGenerator;
@@ -330,6 +330,39 @@ async fn read_cache() -> Option<v0::StreamersResponse> {
     serde_json::from_str(&payload?).ok()
 }
 
+/// What the directory does with one user's account lookup
+#[derive(Debug)]
+enum AccountVerdict {
+    /// Healthy account: the card is published
+    Publish,
+    /// A real, permanent answer: no account row, disabled, or deletion
+    /// pending. The user is skipped and the listing is still complete.
+    Skip,
+    /// No answer: the read failed. The user is skipped (fail closed), and the
+    /// listing is marked incomplete so it is never cached.
+    Unreadable(revolt_result::Error),
+}
+
+/// Classify one account lookup
+///
+/// "No account row" and "the account could not be read" are NOT the same
+/// answer. A missing account is a verdict. Any other error is the absence of
+/// one: a transient fault, or a row that no longer deserializes, which the
+/// driver cannot tell apart. Skipping instead of failing the request means one
+/// bad row cannot take the whole directory down; not caching means a blip
+/// cannot pin a truncated listing for CACHE_TTL.
+///
+/// Debug builds never return that error (`query!` unwraps it into a panic),
+/// which is why this is a pure function: the release behavior is tested here.
+fn account_verdict(result: Result<Account>) -> AccountVerdict {
+    match result {
+        Ok(account) if account.disabled || account.deletion.is_some() => AccountVerdict::Skip,
+        Ok(_) => AccountVerdict::Publish,
+        Err(error) if matches!(error.error_type, ErrorType::UnknownUser) => AccountVerdict::Skip,
+        Err(error) => AccountVerdict::Unreadable(error),
+    }
+}
+
 /// The in-process copy, if it is younger than `CACHE_TTL` at `now`
 fn read_local(now: Instant) -> Option<v0::StreamersResponse> {
     let guard = LOCAL_CACHE.lock().ok()?;
@@ -432,21 +465,10 @@ pub async fn streamers(db: &State<Database>) -> Result<CachedStreamers> {
         .into_iter()
         .filter(is_publishable)
     {
-        // "No account row" and "the account could not be read" are NOT the
-        // same answer and must not share an arm. A missing account is a real,
-        // permanent verdict: skip the user, fail closed.
-        //
-        // Any other error is an ABSENCE of a verdict: a transient fault, or a
-        // row that no longer deserializes, and the driver cannot tell those
-        // apart. Either way the user is skipped (fail closed) rather than
-        // failing the request, so one bad row cannot take the whole
-        // directory down. The response is then marked incomplete and NOT
-        // cached: pinning a listing truncated by a blip would outlive the
-        // blip by CACHE_TTL.
-        let account = match db.fetch_account(&user.id).await {
-            Ok(account) => account,
-            Err(error) if matches!(error.error_type, ErrorType::UnknownUser) => continue,
-            Err(error) => {
+        match account_verdict(db.fetch_account(&user.id).await) {
+            AccountVerdict::Publish => {}
+            AccountVerdict::Skip => continue,
+            AccountVerdict::Unreadable(error) => {
                 log::error!(
                     "streamer directory: skipping {}, account read failed: {:?}",
                     user.id,
@@ -455,10 +477,6 @@ pub async fn streamers(db: &State<Database>) -> Result<CachedStreamers> {
                 complete = false;
                 continue;
             }
-        };
-
-        if account.disabled || account.deletion.is_some() {
-            continue;
         }
 
         streamers.push(to_streamer_card(user));
@@ -1094,52 +1112,57 @@ mod test {
         );
     }
 
-    /// One account row that no longer deserializes must cost that one user,
-    /// not the whole directory.
+    /// A failed account read skips the user and marks the listing
+    /// incomplete; it never fails the directory. Tested on the classifier
+    /// because debug builds panic before such an error reaches the route.
     #[test]
-    fn streamers_skips_an_unreadable_account_row() {
-        crate::util::test::rt().block_on(streamers_skips_an_unreadable_account_row_case())
-    }
+    fn account_verdict_skips_unreadable_rows_without_failing() {
+        use super::{account_verdict, AccountVerdict};
+        use revolt_result::{create_database_error, create_error};
 
-    async fn streamers_skips_an_unreadable_account_row_case() {
-        use revolt_database::mongodb::bson::{doc, Document};
-        use revolt_database::Database;
-
-        let harness = TestHarness::new().await;
-        let Database::MongoDb(mongo) = &harness.db else {
-            return; // REFERENCE cannot hold a row that fails to deserialize
+        let account = |disabled: bool, deletion: Option<DeletionInfo>| Account {
+            id: Ulid::new().to_string(),
+            email: "a@stoat.chat".to_string(),
+            email_normalised: "a@stoat.chat".to_string(),
+            password: "not-a-real-hash".to_string(),
+            deletion,
+            disabled,
+            lockout: None,
+            mfa: Default::default(),
+            password_reset: None,
+            verification: EmailVerification::Verified,
+            google_id: None,
+            apple_id: None,
         };
 
-        let healthy = fixture(Some(FOUNDING_STREAMER));
-        insert_ok(&harness, &healthy).await;
-
-        let broken = fixture(Some(FOUNDING_STREAMER));
-        harness.db.insert_user(&broken).await.expect("insert user");
-        mongo
-            .col::<Document>("accounts")
-            .insert_one(doc! { "_id": &broken.id, "email": 7 })
-            .await
-            .expect("insert malformed account");
+        assert!(matches!(
+            account_verdict(Ok(account(false, None))),
+            AccountVerdict::Publish
+        ));
+        assert!(matches!(
+            account_verdict(Ok(account(true, None))),
+            AccountVerdict::Skip
+        ));
+        assert!(matches!(
+            account_verdict(Ok(account(
+                false,
+                Some(DeletionInfo::Scheduled {
+                    after: Timestamp::now_utc()
+                })
+            ))),
+            AccountVerdict::Skip
+        ));
+        assert!(matches!(
+            account_verdict(Err(create_error!(UnknownUser))),
+            AccountVerdict::Skip
+        ));
         assert!(
-            harness.db.fetch_account(&broken.id).await.is_err(),
-            "fixture account row deserialized; this test would prove nothing"
-        );
-
-        let response = harness.client.get("/discover/streamers").dispatch().await;
-        assert_eq!(
-            response.status(),
-            rocket::http::Status::Ok,
-            "one unreadable account row failed the whole directory"
-        );
-
-        let listing: v0::StreamersResponse =
-            serde_json::from_str(&response.into_string().await.expect("body"))
-                .expect("streamers json");
-        let ids = ids(&listing);
-        assert!(ids.contains(&healthy.id), "healthy streamer must be listed");
-        assert!(
-            !ids.contains(&broken.id),
-            "a user whose account could not be read must fail closed"
+            matches!(
+                account_verdict(Err(create_database_error!("find_one_by_id", "accounts"))),
+                AccountVerdict::Unreadable(_)
+            ),
+            "a failed read must be Unreadable (skipped, listing not cached), not a 500 \
+             and not a clean Skip"
         );
     }
 
