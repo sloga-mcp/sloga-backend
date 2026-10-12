@@ -91,12 +91,20 @@ impl AbstractUsers for MongoDb {
         //
         // No bit filtering here on purpose: `$bits*` operators cannot use an
         // index, so the caller bitmask-tests this (small) set in Rust.
+        let projection: bson::Document = super::BADGED_USER_FIELDS
+            .iter()
+            .map(|field| (field.to_string(), Bson::Int32(1)))
+            .collect();
+
         self.find_with_options::<_, User>(
             COL,
             doc! {
                 "badges": { "$gt": 0 }
             },
-            FindOptions::builder().sort(doc! { "_id": -1 }).build(),
+            FindOptions::builder()
+                .sort(doc! { "_id": -1 })
+                .projection(projection)
+                .build(),
         )
         .await
         .map_err(|_| create_database_error!("find", COL))

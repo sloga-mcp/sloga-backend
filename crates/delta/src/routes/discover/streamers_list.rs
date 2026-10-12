@@ -27,33 +27,39 @@
 //! where every badge holder has self-disabled, the route scans, reads one
 //! account each, and returns `[]`.
 //!
+//! The scan is projected to `BADGED_USER_FIELDS` in the database crate, so a
+//! miss never loads relations, profiles or supporter data it does not read.
+//!
 //! Two bounds apply to misses, and only one of them is aggregate. The path
 //! inherits the `discover` bucket from `crate::util::ratelimits`
 //! (`("discover", _, _)`, 20 requests per 10s), but for sessionless requests
 //! that counter is keyed by IP — it bounds one client, not total load. The
-//! aggregate bound is the cache itself: at most one miss per `CACHE_TTL` per
-//! process, as long as Redis is up.
+//! aggregate bound is the cache: at most one complete miss per `CACHE_TTL`
+//! per process, Redis up or not (see below).
 //!
-//! # Accepted window: no single-flight
+//! # Single-flight
 //!
-//! Concurrent misses are NOT collapsed. Every request arriving during a miss
-//! runs its own scan-plus-reads, and while Redis is unreachable EVERY request
-//! does, because there is no cache left to refill.
+//! Misses run one at a time behind `MISS_PERMIT`, a one-permit
+//! `tokio::sync::Semaphore` (not a mutex held across an await). A request
+//! that waited re-reads the cache once it holds the permit, so a herd that
+//! arrives during one miss is served by that miss.
 //!
-//! This is accepted rather than overlooked, but the reason is narrower than
-//! "it is fine". What is rejected here is a PROCESS-GLOBAL MUTEX HELD ACROSS
-//! AN AWAIT, not single-flight as such: a `tokio::sync::Semaphore` of one
-//! permit, or a Redis `SET NX` lease, would collapse the herd without that
-//! foot-gun, and is the shape to reach for if this ever bites.
+//! The re-read only finds something if the miss was stored somewhere, and
+//! Redis may be the thing that is down. So every complete response is also
+//! kept in-process (`LOCAL_CACHE`, a std mutex never held across an await),
+//! checked before Redis.
+//!
+//! Not collapsed: a response that skipped an unreadable account row is never
+//! cached (see the route body), so while such a row exists every request
+//! recomputes, one at a time. The error log names the row.
 //!
 //! Deliberately NOT claimed: that a CDN absorbs the stampede. Nothing in this
-//! repo configures origin fronting for `/discover/*`, so the honest worst
-//! case is one scan per allowed request per client IP, with Redis down.
+//! repo configures origin fronting for `/discover/*`.
 
 use redis_kiss::{get_connection, redis, AsyncCommands};
 use revolt_database::{Database, ProfileVisibility, User};
 use revolt_models::v0::{self, UserBadges, UserFlags};
-use revolt_result::{ErrorType, Result};
+use revolt_result::{create_error, ErrorType, Result};
 use revolt_rocket_okapi::gen::OpenApiGenerator;
 use revolt_rocket_okapi::response::OpenApiResponderInner;
 use revolt_rocket_okapi::revolt_okapi::openapi3::Responses;
@@ -61,6 +67,9 @@ use revolt_rocket_okapi::OpenApiError;
 use rocket::response::{self, Responder};
 use rocket::serde::json::Json;
 use rocket::{Request, Response, State};
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
+use tokio::sync::Semaphore;
 
 /// Hard cap on cards emitted, applied AFTER every filter.
 ///
@@ -100,6 +109,14 @@ const CACHE_TTL: usize = 30;
 /// the very end of its Redis window, then held for its own `max-age`. That is
 /// acceptable for a directory whose only volatile field is live status.
 const CACHE_CONTROL: &str = "public, max-age=30";
+
+/// Only one cache miss computes at a time (see the module `# Single-flight`)
+static MISS_PERMIT: Semaphore = Semaphore::const_new(1);
+
+/// Last complete response computed by this process, and when
+///
+/// Lets waiters on `MISS_PERMIT` reuse a miss while Redis is unreachable.
+static LOCAL_CACHE: Mutex<Option<(Instant, v0::StreamersResponse)>> = Mutex::new(None);
 
 /// The one badge bit this directory publishes.
 const FOUNDING_STREAMER: u32 = UserBadges::FoundingStreamer as u32;
@@ -294,13 +311,34 @@ async fn read_cache() -> Option<v0::StreamersResponse> {
         return None;
     }
 
+    if let Some(local) = read_local(Instant::now()) {
+        return Some(local);
+    }
+
     let mut conn = get_connection().await.ok()?.into_inner();
     let payload: Option<String> = conn.get(CACHE_KEY).await.ok()?;
 
     serde_json::from_str(&payload?).ok()
 }
 
-/// Store the composed response for `CACHE_TTL` seconds. Best effort.
+/// The in-process copy, if it is younger than `CACHE_TTL` at `now`
+fn read_local(now: Instant) -> Option<v0::StreamersResponse> {
+    let guard = LOCAL_CACHE.lock().ok()?;
+    fresh(guard.as_ref(), now)
+}
+
+/// Whether a stored entry is still inside `CACHE_TTL` at `now`
+fn fresh(
+    entry: Option<&(Instant, v0::StreamersResponse)>,
+    now: Instant,
+) -> Option<v0::StreamersResponse> {
+    let (stored_at, response) = entry?;
+    (now.saturating_duration_since(*stored_at) < Duration::from_secs(CACHE_TTL as u64))
+        .then(|| response.clone())
+}
+
+/// Store the composed response for `CACHE_TTL` seconds, in-process and in
+/// Redis. Best effort.
 ///
 /// Only ever called on a response the route is certain is COMPLETE — see the
 /// error split in the route body. Caching a listing that was truncated by a
@@ -308,6 +346,10 @@ async fn read_cache() -> Option<v0::StreamersResponse> {
 async fn write_cache(response: &v0::StreamersResponse) {
     if !cache_enabled() {
         return;
+    }
+
+    if let Ok(mut guard) = LOCAL_CACHE.lock() {
+        *guard = Some((Instant::now(), response.clone()));
     }
 
     let Ok(payload) = serde_json::to_string(response) else {
@@ -340,6 +382,18 @@ pub async fn streamers(db: &State<Database>) -> Result<CachedStreamers> {
         return Ok(CachedStreamers(Json(cached)));
     }
 
+    // Single-flight: one miss computes, the rest wait and then re-read what it
+    // stored. The semaphore is never closed, so acquire cannot fail in
+    // practice.
+    let _permit = MISS_PERMIT
+        .acquire()
+        .await
+        .map_err(|_| create_error!(InternalError))?;
+
+    if let Some(cached) = read_cache().await {
+        return Ok(CachedStreamers(Json(cached)));
+    }
+
     // ACCOUNT STATE, second half. `is_publishable` works off the `User`
     // document and structurally CANNOT see this:
     //
@@ -361,6 +415,7 @@ pub async fn streamers(db: &State<Database>) -> Result<CachedStreamers> {
     // emitted card. A rejected user consumes a read and no slot, so the cap
     // below cannot shorten this loop (see the module `# Cost` note).
     let mut streamers = Vec::with_capacity(MAX_STREAMERS);
+    let mut complete = true;
 
     for user in db
         .fetch_badged_users()
@@ -368,18 +423,29 @@ pub async fn streamers(db: &State<Database>) -> Result<CachedStreamers> {
         .into_iter()
         .filter(is_publishable)
     {
-        // "No account row" and "the database just failed" are NOT the same
-        // answer and must not share an arm. A missing account is a real,
-        // permanent verdict: skip the user, fail closed. A transient fault is
-        // an ABSENCE of a verdict — swallowing it would silently drop a
-        // legitimate streamer, and `write_cache` below would then pin that
-        // truncated directory in Redis for CACHE_TTL, long outliving the
-        // blip that caused it. Propagate instead: the caller gets an error,
-        // nothing is cached, and the next request recomputes cleanly.
+        // "No account row" and "the account could not be read" are NOT the
+        // same answer and must not share an arm. A missing account is a real,
+        // permanent verdict: skip the user, fail closed.
+        //
+        // Any other error is an ABSENCE of a verdict: a transient fault, or a
+        // row that no longer deserializes, and the driver cannot tell those
+        // apart. Either way the user is skipped (fail closed) rather than
+        // failing the request, so one bad row cannot take the whole
+        // directory down. The response is then marked incomplete and NOT
+        // cached: pinning a listing truncated by a blip would outlive the
+        // blip by CACHE_TTL.
         let account = match db.fetch_account(&user.id).await {
             Ok(account) => account,
             Err(error) if matches!(error.error_type, ErrorType::UnknownUser) => continue,
-            Err(error) => return Err(error),
+            Err(error) => {
+                log::error!(
+                    "streamer directory: skipping {}, account read failed: {:?}",
+                    user.id,
+                    error
+                );
+                complete = false;
+                continue;
+            }
         };
 
         if account.disabled || account.deletion.is_some() {
@@ -399,7 +465,9 @@ pub async fn streamers(db: &State<Database>) -> Result<CachedStreamers> {
     }
 
     let response = v0::StreamersResponse { streamers };
-    write_cache(&response).await;
+    if complete {
+        write_cache(&response).await;
+    }
 
     Ok(CachedStreamers(Json(response)))
 }
@@ -953,5 +1021,97 @@ mod test {
              and every other test in this module is passing vacuously"
         );
         assert_ne!(before, after);
+    }
+
+    /// One account row that no longer deserializes must cost that one user,
+    /// not the whole directory.
+    #[test]
+    fn streamers_skips_an_unreadable_account_row() {
+        crate::util::test::rt().block_on(streamers_skips_an_unreadable_account_row_case())
+    }
+
+    async fn streamers_skips_an_unreadable_account_row_case() {
+        use revolt_database::mongodb::bson::{doc, Document};
+        use revolt_database::Database;
+
+        let harness = TestHarness::new().await;
+        let Database::MongoDb(mongo) = &harness.db else {
+            return; // REFERENCE cannot hold a row that fails to deserialize
+        };
+
+        let healthy = fixture(Some(FOUNDING_STREAMER));
+        insert_ok(&harness, &healthy).await;
+
+        let broken = fixture(Some(FOUNDING_STREAMER));
+        harness.db.insert_user(&broken).await.expect("insert user");
+        mongo
+            .col::<Document>("accounts")
+            .insert_one(doc! { "_id": &broken.id, "email": 7 })
+            .await
+            .expect("insert malformed account");
+        assert!(
+            harness.db.fetch_account(&broken.id).await.is_err(),
+            "fixture account row deserialized; this test would prove nothing"
+        );
+
+        let response = harness.client.get("/discover/streamers").dispatch().await;
+        assert_eq!(
+            response.status(),
+            rocket::http::Status::Ok,
+            "one unreadable account row failed the whole directory"
+        );
+
+        let listing: v0::StreamersResponse =
+            serde_json::from_str(&response.into_string().await.expect("body"))
+                .expect("streamers json");
+        let ids = ids(&listing);
+        assert!(ids.contains(&healthy.id), "healthy streamer must be listed");
+        assert!(
+            !ids.contains(&broken.id),
+            "a user whose account could not be read must fail closed"
+        );
+    }
+
+    /// The in-process copy is served for exactly `CACHE_TTL`.
+    #[test]
+    fn local_cache_freshness_tracks_the_cache_ttl() {
+        use std::time::{Duration, Instant};
+
+        let stored_at = Instant::now();
+        let entry = (stored_at, v0::StreamersResponse { streamers: vec![] });
+        let ttl = Duration::from_secs(super::CACHE_TTL as u64);
+
+        assert!(super::fresh(None, stored_at).is_none());
+        assert!(super::fresh(Some(&entry), stored_at).is_some());
+        assert!(super::fresh(Some(&entry), stored_at + ttl - Duration::from_millis(1)).is_some());
+        assert!(
+            super::fresh(Some(&entry), stored_at + ttl).is_none(),
+            "an entry CACHE_TTL old must be stale"
+        );
+    }
+
+    /// Requests arriving together all complete: the single-flight permit is
+    /// released after each miss rather than held, which would hang the rest.
+    #[test]
+    fn streamers_concurrent_requests_all_complete() {
+        crate::util::test::rt().block_on(streamers_concurrent_requests_all_complete_case())
+    }
+
+    async fn streamers_concurrent_requests_all_complete_case() {
+        let harness = TestHarness::new().await;
+
+        let user = fixture(Some(FOUNDING_STREAMER));
+        insert_ok(&harness, &user).await;
+
+        let responses = futures::future::join_all(
+            (0..6).map(|_| harness.client.get("/discover/streamers").dispatch()),
+        )
+        .await;
+
+        for response in responses {
+            assert_eq!(response.status(), rocket::http::Status::Ok);
+        }
+
+        assert!(ids(&listing(&harness).await).contains(&user.id));
     }
 }
