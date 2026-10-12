@@ -1,6 +1,14 @@
-use std::{collections::HashSet, net::SocketAddr, sync::Arc};
+use std::{
+    collections::HashSet,
+    net::SocketAddr,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
-use async_tungstenite::WebSocketStream;
+use async_tungstenite::{
+    tungstenite::{protocol::WebSocketConfig, Error as WsError, Message},
+    WebSocketStream,
+};
 use fred::{
     error::RedisErrorKind,
     interfaces::{ClientLike, EventInterface, PubsubInterface},
@@ -8,9 +16,10 @@ use fred::{
 };
 use futures::{
     channel::oneshot,
-    join, pin_mut, select,
+    io::{AsyncRead, AsyncWrite},
+    join, pin_mut, select, select_biased,
     stream::{SplitSink, SplitStream},
-    FutureExt, SinkExt, StreamExt, TryStreamExt,
+    FutureExt, Sink, SinkExt, StreamExt, TryStreamExt,
 };
 use redis_kiss::{get_connection, AsyncCommands, PayloadType, REDIS_PAYLOAD_TYPE, REDIS_URI};
 use revolt_config::report_internal_error;
@@ -53,28 +62,270 @@ fn e2ee_generate_nonce() -> String {
 }
 
 type WsReader = SplitStream<WebSocketStream<Compat<TcpStream>>>;
-type WsWriter = SplitSink<WebSocketStream<Compat<TcpStream>>, async_tungstenite::tungstenite::Message>;
+type WsWriter = SplitSink<WebSocketStream<Compat<TcpStream>>, Message>;
+
+/// Absolute bound on everything before authentication: the upgrade, the
+/// configuration hand-off and waiting for a token. Kept above the 10 s
+/// after which stoat.js gives up on a connect.
+const PREAUTH_DEADLINE: Duration = Duration::from_secs(15);
+
+/// Frames other than `Authenticate` tolerated while waiting for a token
+const PREAUTH_MAX_OTHER_FRAMES: usize = 16;
+
+/// Largest message, and largest single frame, accepted from a client.
+/// The largest legitimate one is an `E2EEAck` of a few tens of KiB.
+const MAX_INBOUND_SIZE: usize = 1 << 20;
+
+/// Bound on the session lookup and the Ready database work, generous so a
+/// large account's slow Ready is never cut into a reconnect loop
+const BOOTSTRAP_DB_DEADLINE: Duration = Duration::from_secs(120);
+
+/// Bound on a single send to a client that stopped reading
+const SEND_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Bound on sending the Ready payload, which can be large: a slow link must
+/// not be cut into a reconnect loop
+const READY_SEND_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// How often an authenticated socket is pinged
+const PING_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Inbound silence after which an authenticated socket is dropped
+const IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Room for typing requests queued from the worker to the listener; a full
+/// queue makes the worker wait, so a typing flood slows its own reads
+const LISTENER_SIGNAL_CAPACITY: usize = 64;
+
+/// Keep-alive timing of an authenticated socket
+#[derive(Clone, Copy, Debug)]
+struct KeepAlive {
+    ping_interval: Duration,
+    idle_timeout: Duration,
+    send_timeout: Duration,
+}
+
+const KEEP_ALIVE: KeepAlive = KeepAlive {
+    ping_interval: PING_INTERVAL,
+    idle_timeout: IDLE_TIMEOUT,
+    send_timeout: SEND_TIMEOUT,
+};
+
+/// Socket limits for the whole connection; they cannot be changed after
+/// the upgrade, so they already apply before authentication
+fn websocket_config() -> WebSocketConfig {
+    WebSocketConfig {
+        max_message_size: Some(MAX_INBOUND_SIZE),
+        max_frame_size: Some(MAX_INBOUND_SIZE),
+        ..Default::default()
+    }
+}
+
+/// Why a connection never got as far as a session token
+#[derive(Debug)]
+enum PreAuthError {
+    /// The pre-auth deadline passed
+    Timeout,
+    /// The upgrade failed, or the socket failed while waiting for a token
+    Socket(WsError),
+    /// The upgrade finished without handing over a configuration
+    NoConfiguration,
+    /// The socket closed before a token arrived
+    Closed,
+    /// Too many frames other than `Authenticate`
+    TooManyFrames,
+}
+
+/// Upgrade `stream` to a WebSocket, read the protocol configuration from
+/// the request, and wait for a session token (from the query or an
+/// `Authenticate` frame), all within one absolute `deadline`, so trickling
+/// bytes or frames cannot extend it.
+///
+/// Only succeeds with a session token set on the configuration.
+async fn preauth<S: AsyncRead + AsyncWrite + Unpin>(
+    stream: S,
+    deadline: Duration,
+) -> Result<(WebSocketStream<S>, ProtocolConfiguration), PreAuthError> {
+    let upgrade = async move {
+        // The callback parses parameters such as
+        // wss://example.com?format=json&version=1
+        let (sender, receiver) = oneshot::channel();
+        let mut ws = async_tungstenite::accept_hdr_async_with_config(
+            stream,
+            WebsocketHandshakeCallback::from(sender),
+            Some(websocket_config()),
+        )
+        .await
+        .map_err(PreAuthError::Socket)?;
+
+        let mut config = receiver.await.map_err(|_| PreAuthError::NoConfiguration)?;
+
+        let mut other_frames = 0;
+        while config.get_session_token().is_none() {
+            let message = match ws.try_next().await {
+                Ok(Some(message)) => message,
+                Ok(None) => return Err(PreAuthError::Closed),
+                Err(err) => return Err(PreAuthError::Socket(err)),
+            };
+
+            if let Ok(ClientMessage::Authenticate { token }) = config.decode(&message) {
+                config.set_session_token(token);
+            } else {
+                other_frames += 1;
+                if other_frames > PREAUTH_MAX_OTHER_FRAMES {
+                    return Err(PreAuthError::TooManyFrames);
+                }
+            }
+        }
+
+        Ok((ws, config))
+    };
+
+    tokio::time::timeout(deadline, upgrade)
+        .await
+        .unwrap_or(Err(PreAuthError::Timeout))
+}
+
+/// Outcome of one socket send under a time limit
+#[derive(Debug)]
+enum Sent {
+    Done,
+    Failed(WsError),
+    TimedOut,
+}
+
+/// Send one frame, giving up after `limit` (a client that stopped reading)
+async fn send_bounded<W>(write: &mut W, message: Message, limit: Duration) -> Sent
+where
+    W: Sink<Message, Error = WsError> + Unpin,
+{
+    match tokio::time::timeout(limit, write.send(message)).await {
+        Ok(Ok(())) => Sent::Done,
+        Ok(Err(err)) => Sent::Failed(err),
+        Err(_) => Sent::TimedOut,
+    }
+}
+
+/// A send before the presence session exists: a failure is reported as
+/// before, a timeout is logged; either way the connection is dropped.
+async fn bootstrap_send(
+    write: &mut WsWriter,
+    message: Message,
+    limit: Duration,
+    addr: SocketAddr,
+    started: Instant,
+) -> bool {
+    match send_bounded(write, message, limit).await {
+        Sent::Done => true,
+        Sent::Failed(err) => {
+            report_internal_error!(Err::<(), _>(err)).ok();
+            false
+        }
+        Sent::TimedOut => {
+            bootstrap_timed_out(addr, started, "a send");
+            false
+        }
+    }
+}
+
+fn bootstrap_timed_out(addr: SocketAddr, started: Instant, step: &str) {
+    warn!(
+        "User {addr:?} timed out on {step} while connecting, {:?} after accept",
+        started.elapsed()
+    );
+}
+
+/// After the presence session exists, a send that timed out ends the
+/// connection the normal way
+fn slow_reader(addr: SocketAddr) {
+    info!("User {addr:?} stopped reading, closing the connection");
+}
+
+/// When an authenticated socket last showed signs of life
+#[derive(Clone, Copy, Debug)]
+struct Liveness {
+    last_inbound: Instant,
+    idle_timeout: Duration,
+}
+
+impl Liveness {
+    fn new(now: Instant, idle_timeout: Duration) -> Self {
+        Liveness {
+            last_inbound: now,
+            idle_timeout,
+        }
+    }
+
+    /// Any inbound frame counts, Pongs included
+    fn record_inbound(&mut self, now: Instant) {
+        self.last_inbound = self.last_inbound.max(now);
+    }
+
+    fn deadline(&self) -> Instant {
+        self.last_inbound + self.idle_timeout
+    }
+
+    fn is_expired(&self, now: Instant) -> bool {
+        now >= self.deadline()
+    }
+}
+
+/// Requests from the worker to the listener task, which owns the state
+#[derive(Debug)]
+enum ListenerSignal {
+    /// The active servers changed: re-run `apply_state`
+    Topics,
+    /// The client started (`begin`) or stopped typing in `channel`;
+    /// published only if `typing_allowed`
+    Typing { channel: String, begin: bool },
+}
+
+/// Whether this connection may publish a typing indicator to `id`: only a
+/// channel (or thread) in the cache that the connection is also subscribed
+/// to. `subscribed` alone also holds user, server, member and private
+/// topics, and the cache alone can hold threads the user cannot see.
+fn typing_allowed(state: &State, subscribed: &HashSet<String>, id: &str) -> bool {
+    state.cache.channels.contains_key(id) && subscribed.contains(id)
+}
+
+/// The typing event the listener publishes to `channel` for this
+/// connection's user, or `None` if `typing_allowed` refuses it
+fn typing_event(
+    state: &State,
+    subscribed: &HashSet<String>,
+    channel: &str,
+    begin: bool,
+) -> Option<EventV1> {
+    if !typing_allowed(state, subscribed, channel) {
+        return None;
+    }
+
+    let id = channel.to_string();
+    let user = state.cache.user_id.clone();
+    Some(if begin {
+        EventV1::ChannelStartTyping { id, user }
+    } else {
+        EventV1::ChannelStopTyping { id, user }
+    })
+}
 
 /// Start a new WebSocket client worker given access to the database,
 /// the relevant TCP stream and the remote address of the client.
 pub async fn client(db: &'static Database, stream: TcpStream, addr: SocketAddr) {
-    // Upgrade the TCP connection to a WebSocket connection.
-    // In this process, we also parse any additional parameters given.
-    // e.g. wss://example.com?format=json&version=1
-    let (sender, receiver) = oneshot::channel();
-    let Ok(ws) = async_tungstenite::accept_hdr_async_with_config(
-        stream.compat(),
-        WebsocketHandshakeCallback::from(sender),
-        None,
-    )
-    .await
-    else {
-        return;
-    };
+    let started = Instant::now();
 
-    // Verify we've received a valid config, otherwise we should just drop the connection.
-    let Ok(mut config) = receiver.await else {
-        return;
+    // Upgrade the TCP connection to a WebSocket connection, parse any
+    // additional parameters given and wait for a session token.
+    let (ws, config) = match preauth(stream.compat(), PREAUTH_DEADLINE).await {
+        Ok(upgraded) => upgraded,
+        Err(PreAuthError::Socket(err)) => {
+            debug!("User {addr:?} failed before authenticating: {err}");
+            return;
+        }
+        Err(err) => {
+            debug!("User {addr:?} left before authenticating: {err:?}");
+            return;
+        }
     };
 
     info!(
@@ -84,73 +335,127 @@ pub async fn client(db: &'static Database, stream: TcpStream, addr: SocketAddr) 
     );
 
     // Split the socket for simultaneously read and write.
-    let (mut write, mut read) = ws.split();
+    let (mut write, read) = ws.split();
 
-    // If the user has not provided authentication, request information.
-    if config.get_session_token().is_none() {
-        while let Ok(Some(message)) = read.try_next().await {
-            if let Ok(ClientMessage::Authenticate { token }) = config.decode(&message) {
-                config.set_session_token(token);
-                break;
-            }
-        }
-    }
-
-    // Try to authenticate the user.
+    // Try to authenticate the user. `preauth` only succeeds with a token,
+    // so the refusal below is unreachable; it stays as a defensive answer.
     let Some(token) = config.get_session_token().as_ref() else {
-        write
-            .send(config.encode(&EventV1::Error {
+        send_bounded(
+            &mut write,
+            config.encode(&EventV1::Error {
                 data: create_error!(InvalidSession),
-            }))
-            .await
-            .ok();
+            }),
+            SEND_TIMEOUT,
+        )
+        .await;
         return;
     };
 
-    let (user, session_id) = match User::from_token(db, token, UserHint::Any).await {
-        Ok(user) => user,
-        Err(err) => {
-            write
-                .send(config.encode(&EventV1::Error { data: err }))
-                .await
-                .ok();
+    // Everything up to `create_session` is bounded: database work by one
+    // shared deadline, each send by `SEND_TIMEOUT`. Nothing after it is,
+    // so the presence session is always cleaned up.
+    let db_deadline = tokio::time::Instant::now() + BOOTSTRAP_DB_DEADLINE;
+
+    let (user, session_id) = match tokio::time::timeout_at(
+        db_deadline,
+        User::from_token(db, token, UserHint::Any),
+    )
+    .await
+    {
+        Ok(Ok(user)) => user,
+        Ok(Err(err)) => {
+            send_bounded(
+                &mut write,
+                config.encode(&EventV1::Error { data: err }),
+                SEND_TIMEOUT,
+            )
+            .await;
+            return;
+        }
+        Err(_) => {
+            bootstrap_timed_out(addr, started, "the session lookup");
             return;
         }
     };
 
     info!("User {addr:?} authenticated as @{}", user.username);
 
-    db.update_session_last_seen(&session_id, Timestamp::now_utc())
-        .await
-        .ok();
+    if tokio::time::timeout_at(
+        db_deadline,
+        db.update_session_last_seen(&session_id, Timestamp::now_utc()),
+    )
+    .await
+    .is_err()
+    {
+        bootstrap_timed_out(addr, started, "the session update");
+        return;
+    }
 
     // Create local state.
     let mut state = State::from(user, session_id);
     let user_id = state.cache.user_id.clone();
 
     // Notify socket we have authenticated.
-    if report_internal_error!(write.send(config.encode(&EventV1::Authenticated)).await).is_err() {
+    if !bootstrap_send(
+        &mut write,
+        config.encode(&EventV1::Authenticated),
+        SEND_TIMEOUT,
+        addr,
+        started,
+    )
+    .await
+    {
         return;
     }
 
     // Download required data to local cache and send Ready payload.
-    let ready_payload = match report_internal_error!(
-        state
-            .generate_ready_payload(db, config.get_ready_payload_fields())
-            .await
-    ) {
-        Ok(ready_payload) => ready_payload,
-        Err(_) => return,
+    let ready_payload = match tokio::time::timeout_at(
+        db_deadline,
+        state.generate_ready_payload(db, config.get_ready_payload_fields()),
+    )
+    .await
+    {
+        Ok(ready_payload) => match report_internal_error!(ready_payload) {
+            Ok(ready_payload) => ready_payload,
+            Err(_) => return,
+        },
+        Err(_) => {
+            bootstrap_timed_out(addr, started, "the Ready payload");
+            return;
+        }
     };
 
-    if report_internal_error!(write.send(config.encode(&ready_payload)).await).is_err() {
+    if !bootstrap_send(
+        &mut write,
+        config.encode(&ready_payload),
+        READY_SEND_TIMEOUT,
+        addr,
+        started,
+    )
+    .await
+    {
         return;
     }
 
-    let slowmodes = fetch_user_slowmodes(&user_id).await.unwrap_or_default();
+    let slowmodes = match tokio::time::timeout_at(db_deadline, fetch_user_slowmodes(&user_id)).await
+    {
+        Ok(slowmodes) => slowmodes.unwrap_or_default(),
+        Err(_) => {
+            bootstrap_timed_out(addr, started, "the slowmode lookup");
+            return;
+        }
+    };
     if !slowmodes.is_empty() {
         let event = EventV1::UserSlowmodes { slowmodes };
-        if report_internal_error!(write.send(config.encode(&event)).await).is_err() {
+        if !bootstrap_send(
+            &mut write,
+            config.encode(&event),
+            SEND_TIMEOUT,
+            addr,
+            started,
+        )
+        .await
+        {
             return;
         }
     }
@@ -178,8 +483,23 @@ pub async fn client(db: &'static Database, stream: TcpStream, addr: SocketAddr) 
                 .iter()
                 .map(|voice_state| voice_state.id.as_str())
                 .collect();
-            for event in remote_control_active_snapshot(&channel_ids).await {
-                if report_internal_error!(write.send(config.encode(&event)).await).is_err() {
+            let Ok(events) =
+                tokio::time::timeout_at(db_deadline, remote_control_active_snapshot(&channel_ids))
+                    .await
+            else {
+                bootstrap_timed_out(addr, started, "the remote-control snapshot");
+                return;
+            };
+            for event in events {
+                if !bootstrap_send(
+                    &mut write,
+                    config.encode(&event),
+                    SEND_TIMEOUT,
+                    addr,
+                    started,
+                )
+                .await
+                {
                     return;
                 }
             }
@@ -200,7 +520,7 @@ pub async fn client(db: &'static Database, stream: TcpStream, addr: SocketAddr) 
         let subscribed = state.subscribed.clone();
         let active_servers = state.active_servers.clone();
         let session_id = state.session_id.clone();
-        let (topic_signal_s, topic_signal_r) = async_channel::unbounded();
+        let (topic_signal_s, topic_signal_r) = async_channel::bounded(LISTENER_SIGNAL_CAPACITY);
 
         // TODO: this needs to be rewritten
         // Create channels through which the tasks can signal to each other they need to clean up
@@ -232,6 +552,7 @@ pub async fn client(db: &'static Database, stream: TcpStream, addr: SocketAddr) 
             kill_signal_2_r,
             read,
             &write,
+            KEEP_ALIVE,
             kill_signal_1_s,
         );
 
@@ -252,7 +573,7 @@ async fn listener_with_kill_signal(
     state: &mut State,
     addr: SocketAddr,
     config: &ProtocolConfiguration,
-    topic_signal_r: async_channel::Receiver<()>,
+    topic_signal_r: async_channel::Receiver<ListenerSignal>,
     kill_signal_r: async_channel::Receiver<()>,
     write: &Mutex<WsWriter>,
     kill_signal_s: async_channel::Sender<()>,
@@ -275,7 +596,7 @@ async fn listener(
     state: &mut State,
     addr: SocketAddr,
     config: &ProtocolConfiguration,
-    topic_signal_r: async_channel::Receiver<()>,
+    topic_signal_r: async_channel::Receiver<ListenerSignal>,
     kill_signal_r: async_channel::Receiver<()>,
     write: &Mutex<WsWriter>,
 ) {
@@ -371,7 +692,19 @@ async fn listener(
             _ = t3 => {
                 break 'out;
             },
-            _ = t2 => {},
+            signal = t2 => {
+                // `Topics` only needs the `apply_state` at the top of the loop
+                if let Ok(ListenerSignal::Typing { channel, begin }) = signal {
+                    let event = {
+                        let subscribed = state.subscribed.read().await;
+                        typing_event(state, &subscribed, &channel, begin)
+                    };
+
+                    if let Some(event) = event {
+                        event.p(channel).await;
+                    }
+                }
+            },
             message = t1 => {
                 // Handle incoming events.
                 let message = match report_internal_error!(message) {
@@ -429,16 +762,24 @@ async fn listener(
                     }
                 }
 
-                let result = write.lock().await.send(config.encode(&event)).await;
-                if let Err(e) = result {
-                    use async_tungstenite::tungstenite::Error;
-                    if !matches!(e, Error::AlreadyClosed | Error::ConnectionClosed) {
-                        let err = format!("Error while sending an event to {addr:?}: {e:?}");
-                        warn!("{}", err);
-                        sentry::capture_message(&err, Level::Warning);
-                    }
+                let result =
+                    send_bounded(&mut *write.lock().await, config.encode(&event), SEND_TIMEOUT)
+                        .await;
+                match result {
+                    Sent::Done => {}
+                    Sent::Failed(e) => {
+                        if !matches!(e, WsError::AlreadyClosed | WsError::ConnectionClosed) {
+                            let err = format!("Error while sending an event to {addr:?}: {e:?}");
+                            warn!("{}", err);
+                            sentry::capture_message(&err, Level::Warning);
+                        }
 
-                    break 'out;
+                        break 'out;
+                    }
+                    Sent::TimedOut => {
+                        slow_reader(addr);
+                        break 'out;
+                    }
                 }
 
                 if let EventV1::Logout = event {
@@ -457,14 +798,15 @@ async fn worker_with_kill_signal(
     db: &'static Database,
     addr: SocketAddr,
     subscribed: Arc<RwLock<HashSet<String>>>,
-    active_servers: Arc<Mutex<lru_time_cache::LruCache<String, ()>>>,
+    active_servers: crate::events::state::SharedActiveServers,
     user_id: String,
     session_id: String,
     config: &ProtocolConfiguration,
-    topic_signal_s: async_channel::Sender<()>,
+    topic_signal_s: async_channel::Sender<ListenerSignal>,
     kill_signal_r: async_channel::Receiver<()>,
     read: WsReader,
     write: &Mutex<WsWriter>,
+    keep_alive: KeepAlive,
     kill_signal_s: async_channel::Sender<()>,
 ) {
     worker(
@@ -479,6 +821,7 @@ async fn worker_with_kill_signal(
         kill_signal_r,
         read,
         write,
+        keep_alive,
     )
     .await;
     kill_signal_s.send(()).await.ok();
@@ -489,14 +832,15 @@ async fn worker(
     db: &'static Database,
     addr: SocketAddr,
     subscribed: Arc<RwLock<HashSet<String>>>,
-    active_servers: Arc<Mutex<lru_time_cache::LruCache<String, ()>>>,
+    active_servers: crate::events::state::SharedActiveServers,
     user_id: String,
     session_id: String,
     config: &ProtocolConfiguration,
-    topic_signal_s: async_channel::Sender<()>,
+    topic_signal_s: async_channel::Sender<ListenerSignal>,
     kill_signal_r: async_channel::Receiver<()>,
     mut read: WsReader,
     write: &Mutex<WsWriter>,
+    keep_alive: KeepAlive,
 ) {
     let revolt_config = revolt_config::config().await;
 
@@ -507,13 +851,27 @@ async fn worker(
     let mut e2ee_pending_challenge: Option<(String, String)> = None;
     let mut e2ee_proven_device: Option<String> = None;
 
+    // Ping the client regularly; a client that sends nothing at all (not
+    // even the Pong) for `idle_timeout` is gone.
+    let mut liveness = Liveness::new(Instant::now(), keep_alive.idle_timeout);
+    let mut ping = tokio::time::interval_at(
+        tokio::time::Instant::now() + keep_alive.ping_interval,
+        keep_alive.ping_interval,
+    );
+    ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
     loop {
         let t1 = read.try_next().fuse();
         let t2 = kill_signal_r.recv().fuse();
+        let t3 = ping.tick().fuse();
+        let t4 = tokio::time::sleep_until(liveness.deadline().into()).fuse();
 
-        pin_mut!(t1, t2);
+        pin_mut!(t1, t2, t3, t4);
 
-        select! {
+        // Biased, in this order: a frame that is already waiting must win
+        // over the idle timer, or a client whose frames queued up while
+        // this loop was busy would be dropped as silent.
+        select_biased! {
             _ = t2 => {
                 return;
             },
@@ -526,8 +884,7 @@ async fn worker(
                         return;
                     }
                     Err(e) => {
-                        use async_tungstenite::tungstenite::Error;
-                        if !matches!(e, Error::AlreadyClosed | Error::ConnectionClosed) {
+                        if !matches!(e, WsError::AlreadyClosed | WsError::ConnectionClosed) {
                             let err = format!("Error while reading an event from {addr:?}: {e:?}");
                             warn!("{}", err);
                             sentry::capture_message(&err, Level::Warning);
@@ -536,6 +893,8 @@ async fn worker(
                         return;
                     }
                 };
+
+                liveness.record_inbound(Instant::now());
 
                 let Ok(payload) = config.decode(&msg) else {
                     continue;
@@ -547,51 +906,49 @@ async fn worker(
                             continue;
                         }
 
-                        if !subscribed.read().await.contains(&channel) {
-                            continue;
-                        }
-
-                        EventV1::ChannelStartTyping {
-                            id: channel.clone(),
-                            user: user_id.clone(),
-                        }
-                        .p(channel.clone())
-                        .await;
+                        forward_typing(&subscribed, &topic_signal_s, channel, true).await;
                     }
                     ClientMessage::EndTyping { channel } => {
                         if revolt_config.disable_events_dont_use {
                             continue;
                         }
 
-                        if !subscribed.read().await.contains(&channel) {
+                        forward_typing(&subscribed, &topic_signal_s, channel, false).await;
+                    }
+                    ClientMessage::Subscribe { server_id } => {
+                        // Membership is checked by the listener against its
+                        // server cache; here only junk ids are kept out of
+                        // the bounded set.
+                        if !crate::events::state::is_ulid_shaped(&server_id) {
                             continue;
                         }
 
-                        EventV1::ChannelStopTyping {
-                            id: channel.clone(),
-                            user: user_id.clone(),
-                        }
-                        .p(channel.clone())
-                        .await;
-                    }
-                    ClientMessage::Subscribe { server_id } => {
-                        let mut servers = active_servers.lock().await;
-                        let has_item = servers.contains_key(&server_id);
-                        servers.insert(server_id, ());
+                        // A new key changes the live set (and may evict
+                        // another); refreshing an existing one does not.
+                        let changed = {
+                            let mut servers = active_servers.lock().await;
+                            let is_new = !servers.contains(&server_id);
+                            let evicted = servers.touch(server_id, std::time::Instant::now());
+                            is_new || evicted.is_some()
+                        };
 
-                        if !has_item {
+                        if changed {
                             // Poke the listener to adjust subscriptions
-                            topic_signal_s.send(()).await.ok();
+                            topic_signal_s.send(ListenerSignal::Topics).await.ok();
                         }
                     }
                     ClientMessage::Ping { data, responded } => {
                         if responded.is_none() {
-                            write
-                                .lock()
-                                .await
-                                .send(config.encode(&EventV1::Pong { data }))
-                                .await
-                                .ok();
+                            let sent = send_bounded(
+                                &mut *write.lock().await,
+                                config.encode(&EventV1::Pong { data }),
+                                keep_alive.send_timeout,
+                            )
+                            .await;
+                            if matches!(sent, Sent::TimedOut) {
+                                slow_reader(addr);
+                                return;
+                            }
                         }
                     }
                     ClientMessage::E2EERequestChallenge { device_id } => {
@@ -604,12 +961,16 @@ async fn worker(
                         let nonce = e2ee_generate_nonce();
                         e2ee_pending_challenge = Some((device_id, nonce.clone()));
 
-                        write
-                            .lock()
-                            .await
-                            .send(config.encode(&EventV1::E2EEChallenge { nonce }))
-                            .await
-                            .ok();
+                        let sent = send_bounded(
+                            &mut *write.lock().await,
+                            config.encode(&EventV1::E2EEChallenge { nonce }),
+                            keep_alive.send_timeout,
+                        )
+                        .await;
+                        if matches!(sent, Sent::TimedOut) {
+                            slow_reader(addr);
+                            return;
+                        }
                     }
                     ClientMessage::E2EEProveDevice {
                         device_id,
@@ -666,15 +1027,22 @@ async fn worker(
                         {
                             let mut write = write.lock().await;
 
-                            if write
-                                .send(config.encode(&EventV1::E2EEClaimResult {
+                            let sent = send_bounded(
+                                &mut *write,
+                                config.encode(&EventV1::E2EEClaimResult {
                                     device_id: device_id.clone(),
                                     accepted,
-                                }))
-                                .await
-                                .is_err()
-                            {
-                                return;
+                                }),
+                                keep_alive.send_timeout,
+                            )
+                            .await;
+                            match sent {
+                                Sent::Done => {}
+                                Sent::Failed(_) => return,
+                                Sent::TimedOut => {
+                                    slow_reader(addr);
+                                    return;
+                                }
                             }
 
                             // Drain the queue for the proven device, ordered
@@ -687,16 +1055,19 @@ async fn worker(
                                     .await
                                 {
                                     for envelope in envelopes {
-                                        if write
-                                            .send(
-                                                config.encode(&EventV1::E2EEMessage(
-                                                    envelope.into(),
-                                                )),
-                                            )
-                                            .await
-                                            .is_err()
-                                        {
-                                            return;
+                                        let sent = send_bounded(
+                                            &mut *write,
+                                            config.encode(&EventV1::E2EEMessage(envelope.into())),
+                                            keep_alive.send_timeout,
+                                        )
+                                        .await;
+                                        match sent {
+                                            Sent::Done => {}
+                                            Sent::Failed(_) => return,
+                                            Sent::TimedOut => {
+                                                slow_reader(addr);
+                                                return;
+                                            }
                                         }
                                     }
                                 }
@@ -722,9 +1093,53 @@ async fn worker(
                     }
                     _ => {}
                 }
-            }
+            },
+            _ = t3 => {
+                let sent = send_bounded(
+                    &mut *write.lock().await,
+                    Message::Ping(Vec::new()),
+                    keep_alive.send_timeout,
+                )
+                .await;
+                match sent {
+                    Sent::Done => {}
+                    Sent::Failed(e) => {
+                        debug!("Failed to ping {addr:?}: {e:?}");
+                        return;
+                    }
+                    Sent::TimedOut => {
+                        slow_reader(addr);
+                        return;
+                    }
+                }
+            },
+            _ = t4 => {
+                if liveness.is_expired(Instant::now()) {
+                    info!("User {addr:?} went silent, closing the connection");
+                    return;
+                }
+            },
         }
     }
+}
+
+/// Hand a typing request to the listener, which alone sees the channel
+/// cache and decides with `typing_allowed`. Ids this connection is not
+/// subscribed to at all are dropped here already, so they never queue.
+async fn forward_typing(
+    subscribed: &RwLock<HashSet<String>>,
+    topic_signal_s: &async_channel::Sender<ListenerSignal>,
+    channel: String,
+    begin: bool,
+) {
+    if !subscribed.read().await.contains(&channel) {
+        return;
+    }
+
+    topic_signal_s
+        .send(ListenerSignal::Typing { channel, begin })
+        .await
+        .ok();
 }
 
 async fn fetch_user_slowmodes(user_id: &str) -> Option<Vec<v0::ChannelSlowmode>> {
@@ -764,4 +1179,669 @@ async fn fetch_user_slowmodes(user_id: &str) -> Option<Vec<v0::ChannelSlowmode>>
     }
 
     Some(slowmodes)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        collections::HashMap,
+        future::Future,
+        sync::atomic::{AtomicUsize, Ordering},
+    };
+
+    use revolt_database::{events::client::ReadyPayloadFields, Channel, DatabaseInfo};
+    use tokio::io::{AsyncWriteExt, DuplexStream};
+
+    use super::*;
+    use crate::config::ProtocolFormat;
+    use crate::events::state::ActiveServers;
+
+    /// Pre-auth deadline the timing tests inject
+    const DEADLINE: Duration = Duration::from_millis(300);
+
+    /// Scheduling slack allowed past `DEADLINE`
+    const SLACK: Duration = Duration::from_millis(250);
+
+    type Upgraded = (WebSocketStream<Compat<DuplexStream>>, ProtocolConfiguration);
+
+    /// Run `preauth` with `deadline` on one end of an in-memory pipe while
+    /// `client` drives the other end. Fails, rather than hangs, once three
+    /// deadlines pass. Returns the outcome and how long it took.
+    async fn run_preauth<F, Fut>(
+        deadline: Duration,
+        client: F,
+    ) -> (Result<Upgraded, PreAuthError>, Duration)
+    where
+        F: FnOnce(DuplexStream) -> Fut,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        let (server_io, client_io) = tokio::io::duplex(64 * 1024);
+        let client = tokio::spawn(client(client_io));
+
+        let started = Instant::now();
+        let outcome = tokio::time::timeout(deadline * 3, preauth(server_io.compat(), deadline))
+            .await
+            .expect("preauth outlived three times its deadline");
+        let elapsed = started.elapsed();
+
+        client.abort();
+        (outcome, elapsed)
+    }
+
+    async fn upgrade(io: DuplexStream, url: &str) -> WebSocketStream<Compat<DuplexStream>> {
+        async_tungstenite::client_async(url, io.compat())
+            .await
+            .expect("client handshake")
+            .0
+    }
+
+    fn expect_err(outcome: Result<Upgraded, PreAuthError>) -> PreAuthError {
+        match outcome {
+            Ok(_) => panic!("preauth let the client through"),
+            Err(err) => err,
+        }
+    }
+
+    fn assert_deadline_hit(outcome: Result<Upgraded, PreAuthError>, elapsed: Duration) {
+        let err = expect_err(outcome);
+        assert!(
+            matches!(err, PreAuthError::Timeout),
+            "expected the deadline, got {err:?}"
+        );
+        assert!(elapsed < DEADLINE + SLACK, "took {elapsed:?}");
+    }
+
+    fn expect_token(outcome: Result<Upgraded, PreAuthError>) -> Option<String> {
+        match outcome {
+            Ok((_, config)) => config.get_session_token().clone(),
+            Err(err) => panic!("expected a session token, got {err:?}"),
+        }
+    }
+
+    fn junk() -> Message {
+        Message::Text("{}".to_string())
+    }
+
+    fn authenticate() -> Message {
+        Message::Text(r#"{"type":"Authenticate","token":"abc"}"#.to_string())
+    }
+
+    #[tokio::test]
+    async fn sec005_preauth_drops_a_silent_client() {
+        let (outcome, elapsed) = run_preauth(DEADLINE, |io| async move {
+            let _io = io;
+            std::future::pending::<()>().await
+        })
+        .await;
+
+        assert_deadline_hit(outcome, elapsed);
+    }
+
+    #[tokio::test]
+    async fn sec005_preauth_drops_a_header_trickle() {
+        // tungstenite refuses a request after 64 tiny reads by itself; keep
+        // that well past the outer guard so only the deadline can end it
+        const INTERVAL: Duration = Duration::from_millis(100);
+        assert!(INTERVAL * 64 > DEADLINE * 3);
+
+        let (outcome, elapsed) = run_preauth(DEADLINE, |mut io| async move {
+            let request = b"GET /?token=abc HTTP/1.1\r\nHost: localhost\r\n\
+                Connection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\n\
+                Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n";
+            for byte in request {
+                if io.write_all(&[*byte]).await.is_err() {
+                    break;
+                }
+                tokio::time::sleep(INTERVAL).await;
+            }
+            std::future::pending::<()>().await
+        })
+        .await;
+
+        assert_deadline_hit(outcome, elapsed);
+    }
+
+    #[tokio::test]
+    async fn sec005_preauth_drops_an_upgrade_without_a_token() {
+        let (outcome, elapsed) = run_preauth(DEADLINE, |io| async move {
+            let _ws = upgrade(io, "ws://localhost/").await;
+            std::future::pending::<()>().await
+        })
+        .await;
+
+        assert_deadline_hit(outcome, elapsed);
+    }
+
+    /// A frame every 50 ms would keep a per-read timeout alive forever (and
+    /// reach the frame cap only after 850 ms); the deadline must still hold.
+    #[tokio::test]
+    async fn sec005_preauth_deadline_is_absolute_not_idle() {
+        let (outcome, elapsed) = run_preauth(DEADLINE, |io| async move {
+            let mut ws = upgrade(io, "ws://localhost/").await;
+            while ws.send(junk()).await.is_ok() {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await;
+
+        assert_deadline_hit(outcome, elapsed);
+    }
+
+    #[tokio::test]
+    async fn sec005_preauth_drops_after_sixteen_other_frames() {
+        let (outcome, elapsed) = run_preauth(DEADLINE, |io| async move {
+            let mut ws = upgrade(io, "ws://localhost/").await;
+            for _ in 0..PREAUTH_MAX_OTHER_FRAMES + 1 {
+                ws.send(junk()).await.ok();
+            }
+            std::future::pending::<()>().await
+        })
+        .await;
+
+        let err = expect_err(outcome);
+        assert!(
+            matches!(err, PreAuthError::TooManyFrames),
+            "expected the frame cap, got {err:?}"
+        );
+        assert!(elapsed < DEADLINE, "took {elapsed:?}");
+    }
+
+    #[tokio::test]
+    async fn sec005_preauth_accepts_a_token_after_sixteen_other_frames() {
+        let (outcome, _) = run_preauth(DEADLINE, |io| async move {
+            let mut ws = upgrade(io, "ws://localhost/").await;
+            for _ in 0..PREAUTH_MAX_OTHER_FRAMES {
+                ws.send(junk()).await.ok();
+            }
+            ws.send(authenticate()).await.ok();
+            std::future::pending::<()>().await
+        })
+        .await;
+
+        assert_eq!(expect_token(outcome).as_deref(), Some("abc"));
+    }
+
+    #[tokio::test]
+    async fn sec005_preauth_refuses_a_two_mib_frame() {
+        // Long enough that only the size limit can end it in time
+        let deadline = Duration::from_secs(2);
+
+        let (outcome, elapsed) = run_preauth(deadline, |io| async move {
+            let mut ws = upgrade(io, "ws://localhost/").await;
+            ws.send(Message::Binary(vec![0; 2 << 20])).await.ok();
+            std::future::pending::<()>().await
+        })
+        .await;
+
+        let err = expect_err(outcome);
+        assert!(
+            matches!(err, PreAuthError::Socket(WsError::Capacity(_))),
+            "expected the size limit, got {err:?}"
+        );
+        assert!(elapsed < Duration::from_secs(1), "took {elapsed:?}");
+    }
+
+    #[tokio::test]
+    async fn sec005_preauth_accepts_a_token_in_the_query() {
+        let (outcome, _) = run_preauth(DEADLINE, |io| async move {
+            let _ws = upgrade(io, "ws://localhost/?version=1&token=abc").await;
+            std::future::pending::<()>().await
+        })
+        .await;
+
+        assert_eq!(expect_token(outcome).as_deref(), Some("abc"));
+    }
+
+    #[tokio::test]
+    async fn sec005_preauth_accepts_an_authenticate_frame() {
+        let (outcome, _) = run_preauth(DEADLINE, |io| async move {
+            let mut ws = upgrade(io, "ws://localhost/").await;
+            ws.send(authenticate()).await.ok();
+            std::future::pending::<()>().await
+        })
+        .await;
+
+        assert_eq!(expect_token(outcome).as_deref(), Some("abc"));
+    }
+
+    #[tokio::test]
+    async fn sec005_send_gives_up_on_a_client_that_stops_reading() {
+        let (server_io, client_io) = tokio::io::duplex(1024);
+        let (server, client) = tokio::join!(
+            async_tungstenite::accept_async(server_io.compat()),
+            async_tungstenite::client_async("ws://localhost/", client_io.compat()),
+        );
+        let mut server = server.expect("server handshake");
+        // Kept open and never read from
+        let _client = client.expect("client handshake");
+
+        let started = Instant::now();
+        let sent = tokio::time::timeout(
+            DEADLINE * 3,
+            send_bounded(&mut server, Message::Binary(vec![0; 64 * 1024]), DEADLINE),
+        )
+        .await
+        .expect("send outlived three times its limit");
+
+        assert!(matches!(sent, Sent::TimedOut), "got {sent:?}");
+        assert!(started.elapsed() < DEADLINE + SLACK);
+    }
+
+    #[test]
+    fn sec005_liveness_starts_alive() {
+        let now = Instant::now();
+        let liveness = Liveness::new(now, IDLE_TIMEOUT);
+
+        assert!(!liveness.is_expired(now));
+        assert!(!liveness.is_expired(now + IDLE_TIMEOUT - Duration::from_secs(1)));
+        assert_eq!(liveness.deadline(), now + IDLE_TIMEOUT);
+    }
+
+    #[test]
+    fn sec005_liveness_inbound_frame_extends_it() {
+        let now = Instant::now();
+        let mut liveness = Liveness::new(now, IDLE_TIMEOUT);
+
+        liveness.record_inbound(now + Duration::from_secs(100));
+        assert!(!liveness.is_expired(now + Duration::from_secs(150)));
+        assert!(liveness.is_expired(now + Duration::from_secs(220)));
+
+        // An older timestamp never moves it back
+        liveness.record_inbound(now);
+        assert!(!liveness.is_expired(now + Duration::from_secs(150)));
+    }
+
+    #[test]
+    fn sec005_liveness_expires_after_silence() {
+        let now = Instant::now();
+        let liveness = Liveness::new(now, IDLE_TIMEOUT);
+
+        assert!(liveness.is_expired(now + IDLE_TIMEOUT));
+        assert!(liveness.is_expired(now + IDLE_TIMEOUT + Duration::from_secs(1)));
+    }
+
+    /// Keep-alive timing the worker tests inject
+    const TEST_KEEP_ALIVE: KeepAlive = KeepAlive {
+        ping_interval: Duration::from_millis(100),
+        idle_timeout: Duration::from_millis(300),
+        send_timeout: Duration::from_millis(300),
+    };
+
+    /// An upgraded server and client over loopback TCP
+    async fn tcp_pair() -> (
+        WebSocketStream<Compat<TcpStream>>,
+        WebSocketStream<Compat<TcpStream>>,
+        SocketAddr,
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("address");
+
+        let (server, client) = tokio::join!(
+            async {
+                let (stream, _) = listener.accept().await.expect("accept");
+                async_tungstenite::accept_async(stream.compat())
+                    .await
+                    .expect("server handshake")
+            },
+            async {
+                let stream = TcpStream::connect(addr).await.expect("connect");
+                async_tungstenite::client_async(format!("ws://{addr}/"), stream.compat())
+                    .await
+                    .expect("client handshake")
+                    .0
+            },
+        );
+
+        (server, client, addr)
+    }
+
+    /// Run the worker on `server` with `TEST_KEEP_ALIVE`; how long it ran,
+    /// or `None` if it was still running after `limit`
+    async fn run_worker(
+        server: WebSocketStream<Compat<TcpStream>>,
+        addr: SocketAddr,
+        limit: Duration,
+    ) -> Option<Duration> {
+        run_worker_with(
+            server,
+            addr,
+            limit,
+            TEST_KEEP_ALIVE,
+            HashSet::new(),
+            Duration::ZERO,
+        )
+        .await
+        .0
+    }
+
+    /// Run the worker on `server` with `keep_alive` and `subscribed`, the
+    /// socket's write lock held elsewhere for its first `stall`; how long
+    /// it ran (`None` if still running after `limit`), and what it
+    /// signalled to the listener
+    async fn run_worker_with(
+        server: WebSocketStream<Compat<TcpStream>>,
+        addr: SocketAddr,
+        limit: Duration,
+        keep_alive: KeepAlive,
+        subscribed: HashSet<String>,
+        stall: Duration,
+    ) -> (Option<Duration>, async_channel::Receiver<ListenerSignal>) {
+        let db: &'static Database = Box::leak(Box::new(
+            DatabaseInfo::Reference.connect().await.expect("database"),
+        ));
+        let config = ProtocolConfiguration::from(
+            1,
+            ProtocolFormat::Json,
+            None,
+            ReadyPayloadFields::default(),
+        );
+
+        let (write, read) = server.split();
+        let write = Mutex::new(write);
+        let (topic_signal_s, topic_signal_r) = async_channel::bounded(LISTENER_SIGNAL_CAPACITY);
+        // Held open: a dropped sender reads as the kill signal
+        let (_kill_signal_s, kill_signal_r) = async_channel::bounded(1);
+
+        let stalled = write.lock().await;
+        let release = async move {
+            tokio::time::sleep(stall).await;
+            drop(stalled);
+        };
+
+        let started = Instant::now();
+        let run = tokio::time::timeout(
+            limit,
+            worker(
+                db,
+                addr,
+                Arc::new(RwLock::new(subscribed)),
+                Arc::new(Mutex::new(ActiveServers::new(5, Duration::from_secs(900)))),
+                "user".to_string(),
+                "session".to_string(),
+                &config,
+                topic_signal_s,
+                kill_signal_r,
+                read,
+                &write,
+                keep_alive,
+            ),
+        );
+        let (ran, ()) = tokio::join!(run, release);
+
+        (ran.ok().map(|()| started.elapsed()), topic_signal_r)
+    }
+
+    #[tokio::test]
+    async fn sec005_worker_drops_a_client_that_never_answers() {
+        let (server, mut client, addr) = tcp_pair().await;
+
+        let ran = run_worker(server, addr, TEST_KEEP_ALIVE.idle_timeout * 3)
+            .await
+            .expect("worker kept a silent client past three idle timeouts");
+        assert!(ran >= TEST_KEEP_ALIVE.idle_timeout, "left after {ran:?}");
+
+        // It pinged before giving up
+        let first = tokio::time::timeout(Duration::from_secs(1), client.next())
+            .await
+            .expect("a frame in time")
+            .expect("a frame")
+            .expect("a readable frame");
+        assert!(matches!(first, Message::Ping(_)), "got {first:?}");
+    }
+
+    #[tokio::test]
+    async fn sec005_worker_keeps_a_client_that_answers_pings() {
+        let (server, mut client, addr) = tcp_pair().await;
+
+        // Reading is enough: tungstenite answers each Ping on the next read
+        let pings = Arc::new(AtomicUsize::new(0));
+        let counter = pings.clone();
+        let reader = tokio::spawn(async move {
+            while let Some(Ok(message)) = client.next().await {
+                if let Message::Ping(_) = message {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+        });
+
+        let ran = run_worker(server, addr, TEST_KEEP_ALIVE.idle_timeout * 3).await;
+        reader.abort();
+
+        assert!(ran.is_none(), "worker dropped a live client after {ran:?}");
+        assert!(pings.load(Ordering::SeqCst) >= 3);
+    }
+
+    /// Frames that queued up while the worker was stalled must be handled,
+    /// not lost to an idle timer that expired meanwhile. The first Ping's
+    /// answer waits on the write lock past the idle timeout; the second
+    /// Ping is then buffered while the timer is due, and only reading first
+    /// answers it. A fair pick would pass all runs one time in 1024.
+    #[tokio::test]
+    async fn sec005_worker_buffered_frame_beats_idle_timer() {
+        const RUNS: usize = 10;
+        const FRAMES: usize = 2;
+        let keep_alive = KeepAlive {
+            ping_interval: Duration::from_secs(3600),
+            idle_timeout: Duration::from_millis(50),
+            send_timeout: Duration::from_secs(1),
+        };
+
+        for run in 0..RUNS {
+            let (server, mut client, addr) = tcp_pair().await;
+
+            for n in 0..FRAMES {
+                client
+                    .send(Message::Text(format!(r#"{{"type":"Ping","data":{n}}}"#)))
+                    .await
+                    .expect("client send");
+            }
+            // Let them land in the server's socket before the worker polls
+            tokio::time::sleep(Duration::from_millis(50)).await;
+
+            let (ran, _) = run_worker_with(
+                server,
+                addr,
+                Duration::from_secs(2),
+                keep_alive,
+                HashSet::new(),
+                keep_alive.idle_timeout * 3,
+            )
+            .await;
+            assert!(ran.is_some(), "run {run}: worker outlived its idle timeout");
+
+            let mut pongs = 0;
+            while let Ok(Some(Ok(message))) =
+                tokio::time::timeout(Duration::from_secs(1), client.next()).await
+            {
+                if let Message::Text(text) = message {
+                    if text.contains(r#""type":"Pong""#) {
+                        pongs += 1;
+                    }
+                }
+            }
+            assert_eq!(pongs, FRAMES, "run {run}: buffered Pings left unanswered");
+        }
+    }
+
+    /// The worker publishes nothing itself: typing requests for subscribed
+    /// ids go to the listener, which alone applies `typing_event`
+    #[tokio::test]
+    async fn sec105_worker_forwards_typing_to_the_listener() {
+        let (server, mut client, addr) = tcp_pair().await;
+
+        for frame in [
+            format!(r#"{{"type":"BeginTyping","channel":"{TEXT_ID}"}}"#),
+            format!(r#"{{"type":"EndTyping","channel":"{TEXT_ID}"}}"#),
+            // Not subscribed at all: dropped before it queues
+            format!(r#"{{"type":"BeginTyping","channel":"{THREAD_ID}"}}"#),
+        ] {
+            client
+                .send(Message::Text(frame))
+                .await
+                .expect("client send");
+        }
+
+        let subscribed = [TEXT_ID.to_string()].into_iter().collect();
+        let (ran, signals) = run_worker_with(
+            server,
+            addr,
+            TEST_KEEP_ALIVE.idle_timeout * 3,
+            TEST_KEEP_ALIVE,
+            subscribed,
+            Duration::ZERO,
+        )
+        .await;
+        assert!(ran.is_some(), "worker outlived its idle timeout");
+
+        let got: Vec<ListenerSignal> = std::iter::from_fn(|| signals.try_recv().ok()).collect();
+        assert!(
+            matches!(
+                got.as_slice(),
+                [
+                    ListenerSignal::Typing { channel: a, begin: true },
+                    ListenerSignal::Typing { channel: b, begin: false },
+                ] if a == TEXT_ID && b == TEXT_ID
+            ),
+            "got {got:?}"
+        );
+    }
+
+    const SELF_ID: &str = "01USER00000000000000000SLF";
+    const FRIEND_ID: &str = "01USER00000000000000000FRD";
+    const SERVER_ID: &str = "01SERVER000000000000000SRV";
+    const TEXT_ID: &str = "01CHANNEL00000000000000TXT";
+    const THREAD_ID: &str = "01CHANNEL00000000000000THR";
+
+    /// A user with a cached text channel and a cached thread under it. The
+    /// connection subscribes the text channel, the server, a friend and its
+    /// own topics, but not the thread.
+    fn typing_fixture() -> (State, HashSet<String>) {
+        let user = User {
+            id: SELF_ID.to_string(),
+            username: "self".to_string(),
+            ..Default::default()
+        };
+        let mut state = State::from(user, "session".to_string());
+
+        state.cache.channels.insert(
+            TEXT_ID.to_string(),
+            Channel::TextChannel {
+                id: TEXT_ID.to_string(),
+                server: SERVER_ID.to_string(),
+                name: "text".to_string(),
+                description: None,
+                icon: None,
+                last_message_id: None,
+                default_permissions: None,
+                role_permissions: HashMap::new(),
+                nsfw: false,
+                spoiler: false,
+                voice: None,
+                slowmode: None,
+                announcement: None,
+            },
+        );
+        state.cache.channels.insert(
+            THREAD_ID.to_string(),
+            Channel::Thread {
+                id: THREAD_ID.to_string(),
+                server: SERVER_ID.to_string(),
+                parent_channel: TEXT_ID.to_string(),
+                name: "thread".to_string(),
+                creator: FRIEND_ID.to_string(),
+                origin_message_id: None,
+                last_message_id: None,
+                archived: false,
+                archived_timestamp: None,
+                auto_archive_minutes: Channel::default_auto_archive_minutes(),
+                locked: false,
+                applied_tags: vec![],
+            },
+        );
+
+        let subscribed = [
+            SELF_ID.to_string(),
+            format!("{SELF_ID}!"),
+            FRIEND_ID.to_string(),
+            SERVER_ID.to_string(),
+            format!("{SERVER_ID}u"),
+            TEXT_ID.to_string(),
+        ]
+        .into_iter()
+        .collect();
+
+        (state, subscribed)
+    }
+
+    #[test]
+    fn sec105_typing_allowed_in_a_subscribed_cached_channel() {
+        let (state, subscribed) = typing_fixture();
+        assert!(typing_allowed(&state, &subscribed, TEXT_ID));
+    }
+
+    #[test]
+    fn sec105_typing_refused_for_a_friend_id() {
+        let (state, subscribed) = typing_fixture();
+        assert!(!typing_allowed(&state, &subscribed, FRIEND_ID));
+    }
+
+    #[test]
+    fn sec105_typing_refused_for_a_server_id() {
+        let (state, subscribed) = typing_fixture();
+        assert!(!typing_allowed(&state, &subscribed, SERVER_ID));
+    }
+
+    #[test]
+    fn sec105_typing_refused_for_own_and_member_topics() {
+        let (state, subscribed) = typing_fixture();
+        for topic in [
+            SELF_ID.to_string(),
+            format!("{SELF_ID}!"),
+            format!("{SERVER_ID}u"),
+        ] {
+            assert!(!typing_allowed(&state, &subscribed, &topic), "{topic}");
+        }
+    }
+
+    #[test]
+    fn sec105_typing_refused_in_a_cached_thread_not_subscribed() {
+        let (state, subscribed) = typing_fixture();
+        assert!(!typing_allowed(&state, &subscribed, THREAD_ID));
+    }
+
+    #[test]
+    fn sec105_typing_event_for_a_subscribed_cached_channel() {
+        let (state, subscribed) = typing_fixture();
+
+        let start = typing_event(&state, &subscribed, TEXT_ID, true);
+        assert!(
+            matches!(
+                &start,
+                Some(EventV1::ChannelStartTyping { id, user }) if id == TEXT_ID && user == SELF_ID
+            ),
+            "got {start:?}"
+        );
+
+        let stop = typing_event(&state, &subscribed, TEXT_ID, false);
+        assert!(
+            matches!(
+                &stop,
+                Some(EventV1::ChannelStopTyping { id, user }) if id == TEXT_ID && user == SELF_ID
+            ),
+            "got {stop:?}"
+        );
+    }
+
+    #[test]
+    fn sec105_typing_event_refused_outside_subscribed_cached_channels() {
+        let (state, subscribed) = typing_fixture();
+        for id in [FRIEND_ID, SERVER_ID, THREAD_ID] {
+            for begin in [true, false] {
+                let event = typing_event(&state, &subscribed, id, begin);
+                assert!(event.is_none(), "{id} begin={begin}: got {event:?}");
+            }
+        }
+    }
 }
