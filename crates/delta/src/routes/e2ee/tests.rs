@@ -1850,3 +1850,107 @@ fn e2ee_pause_gate_reads_no_envelope_content() {
     assert!(recipients_loop < gate_start, "per recipient id");
     assert!(gate_start < insert, "refused before anything is queued");
 }
+
+/// One send is minted at ONE server instant: every copy's id shares its
+/// first 10 ULID chars (the millisecond), so a client's padded ack
+/// (`id[..10]` + 16 "Z") covers every device's copy. Ids stay distinct, and
+/// every stored queue row carries that same instant as its timestamp.
+#[test]
+fn one_send_shares_the_envelope_id_millisecond() {
+    crate::util::test::rt().block_on(one_send_shares_the_envelope_id_millisecond_case())
+}
+
+async fn one_send_shares_the_envelope_id_millisecond_case() {
+    let harness = TestHarness::new().await;
+    let (account_a, session_a, user_a) = harness.new_user().await;
+    let (account_b, session_b, user_b) = harness.new_user().await;
+
+    make_dm_eligible(&harness, &user_a, &user_b).await;
+
+    // Every extra device gets its own session: a second publish on the same
+    // session revokes its predecessor
+    let device_a = publish_device(&harness, &account_a.id, &session_a.token, 1).await;
+    let session_a2 = account_a
+        .create_session(&harness.db, String::new())
+        .await
+        .expect("second session");
+    let device_a2 = publish_device(&harness, &account_a.id, &session_a2.token, 1).await;
+    let device_b = publish_device(&harness, &account_b.id, &session_b.token, 1).await;
+    let session_b2 = account_b
+        .create_session(&harness.db, String::new())
+        .await
+        .expect("second session");
+    let device_b2 = publish_device(&harness, &account_b.id, &session_b2.token, 1).await;
+
+    // Both of the recipient's devices plus the sender's other device
+    let targets = [
+        (&user_b, &device_b),
+        (&user_b, &device_b2),
+        (&user_a, &device_a2),
+    ];
+    let (status, body) = post_envelopes(
+        &harness,
+        &session_a,
+        &device_a,
+        targets
+            .iter()
+            .map(|(user, device)| envelope_to(user, device, 1))
+            .collect(),
+    )
+    .await;
+    assert_eq!(status, Status::Ok, "{body}");
+
+    let result: v0::ResponseSendE2EEMessages = serde_json::from_str(&body).expect("receipts");
+    assert_eq!(result.receipts.len(), targets.len(), "{body}");
+
+    let ids: Vec<String> = result
+        .receipts
+        .iter()
+        .zip(&targets)
+        .map(|(receipt, (_, device))| {
+            assert_eq!(receipt.recipient_device_id, device.device_id, "{body}");
+            match &receipt.status {
+                v0::E2EEDeliveryStatus::Queued { id } => id.clone(),
+                _ => panic!("every envelope must be queued: {}", body),
+            }
+        })
+        .collect();
+
+    let distinct: std::collections::HashSet<&String> = ids.iter().collect();
+    assert_eq!(distinct.len(), ids.len(), "ids must be distinct: {ids:?}");
+
+    for id in &ids {
+        assert_eq!(id.len(), 26, "{ids:?}");
+        assert_eq!(id[..10], ids[0][..10], "one millisecond prefix: {ids:?}");
+    }
+
+    // The stored rows are the receipted ids, and each row's timestamp is
+    // the instant the ids were minted from: the same millisecond as the
+    // ULID AND the same instant across rows (one clock read per request,
+    // not one per envelope)
+    let issued_ms = ulid::Ulid::from_string(&ids[0])
+        .expect("ulid")
+        .timestamp_ms() as i128;
+    let mut stamps = vec![];
+    for ((user, device), id) in targets.iter().zip(&ids) {
+        let rows = harness
+            .db
+            .fetch_e2ee_envelopes(&user.id, &device.device_id, 10)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1, "one queued row per device");
+        assert_eq!(&rows[0].id, id, "receipt id is the queued row id");
+
+        let row_ms = rows[0]
+            .timestamp
+            .duration_since(iso8601_timestamp::Timestamp::UNIX_EPOCH)
+            .whole_milliseconds();
+        assert_eq!(row_ms, issued_ms, "row timestamp is the ULID millisecond");
+        stamps.push(rows[0].timestamp);
+    }
+    assert!(
+        stamps.iter().all(|stamp| *stamp == stamps[0]),
+        "every row stamped from the one request instant: {:?}",
+        stamps
+    );
+}

@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::time::SystemTime;
 
 use iso8601_timestamp::Timestamp;
 use revolt_database::{
@@ -127,6 +128,13 @@ pub async fn send_messages(
     // accepted earlier in this same request, not just already-queued ones
     let mut queue_depths: HashMap<(String, String), u64> = HashMap::new();
 
+    // One instant for the whole send. Every copy shares the first 10 ULID
+    // chars (the millisecond), so a padded client ack (`id[..10]` + 16 "Z")
+    // covers every device's copy; the random suffix keeps ids unique.
+    // e2ee-core never targets one device twice per request, so per-device
+    // drain order is unaffected.
+    let issued_at = SystemTime::now();
+
     for envelope in data.envelopes {
         // Unknown / revoked recipient device: report it so the sender tears
         // down the session (invariant: device changes are loud)
@@ -173,7 +181,7 @@ pub async fn send_messages(
         *depth += 1;
 
         let queued = E2EEEnvelope {
-            id: Ulid::new().to_string(),
+            id: Ulid::from_datetime(issued_at).to_string(),
             recipient_user_id: envelope.recipient_user_id.clone(),
             recipient_device_id: envelope.recipient_device_id.clone(),
             // Sender stamped from the session, never from the payload
@@ -182,7 +190,7 @@ pub async fn send_messages(
             protocol_version: data.protocol_version,
             sequence: envelope.sequence,
             ciphertext: envelope.ciphertext,
-            timestamp: Timestamp::now_utc(),
+            timestamp: Timestamp::from(issued_at),
             // Client envelope submission is olm-only: MLS envelope types are
             // minted exclusively by the /mls commit fan-out (server-side)
             content_type: revolt_database::E2EEContentType::Olm,
