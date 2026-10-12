@@ -30,6 +30,9 @@ pub(crate) const BADGED_USER_FIELDS: &[&str] = &[
     "bot",
     "profile_visibility",
     "connections",
+    // Filter-only: the directory hides users whose DMs the anti-spam guard
+    // has paused. Dropping this would silently publish them again.
+    "dm_guard",
 ];
 
 #[async_trait]
@@ -325,9 +328,10 @@ mod tests {
     #[tokio::test]
     async fn fetch_badged_users_projects_to_the_listed_fields() {
         use crate::{
-            ConnectionPlatform, ProfileVisibility, Relationship, RelationshipStatus,
+            ConnectionPlatform, DmGuard, ProfileVisibility, Relationship, RelationshipStatus,
             UserConnection, UserProfile, UserStatus,
         };
+        use iso8601_timestamp::Timestamp;
 
         database_test!(|db| async move {
             let mut full = user(
@@ -346,6 +350,14 @@ mod tests {
                 live_title: Some("live now".to_string()),
                 live_since: None,
             }]);
+            full.dm_guard = Some(DmGuard {
+                report_id: "01TEST00000000000000REPRT1".to_string(),
+                flagged_at: Timestamp::now_utc(),
+                paused: true,
+                cleared_at: None,
+                recipients: 5,
+                fingerprint: "fp".to_string(),
+            });
             // Dropped
             full.relations = Some(vec![Relationship {
                 id: "01TEST00000000000000FR1END".to_string(),
@@ -377,6 +389,17 @@ mod tests {
             assert_eq!(fetched.flags, full.flags);
             assert_eq!(fetched.profile_visibility, full.profile_visibility);
             assert_eq!(fetched.connections, full.connections);
+            // Timestamps left out: their round trip is not what this pins
+            let guard = |user: &User| {
+                user.dm_guard
+                    .as_ref()
+                    .map(|g| (g.report_id.clone(), g.paused, g.cleared_at.is_some()))
+            };
+            assert_eq!(
+                guard(fetched),
+                guard(&full),
+                "dm_guard was projected away; the directory's pause filter would never fire"
+            );
 
             assert_eq!(fetched.relations, None, "relations were loaded");
             assert_eq!(fetched.status, None, "status was loaded");

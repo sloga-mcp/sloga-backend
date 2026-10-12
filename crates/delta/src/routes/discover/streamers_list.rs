@@ -248,6 +248,15 @@ fn is_publishable(user: &User) -> bool {
         return false;
     }
 
+    // 3b. ANTI-SPAM PAUSE. A user whose DMs the copy-paste detector has
+    //    paused (and staff have not cleared) is not promoted to strangers.
+    //    The card is simply absent, the same as every other exclusion, so
+    //    the response never says why. Like any change here it shows up within
+    //    one CACHE_TTL.
+    if user.is_dm_paused() {
+        return false;
+    }
+
     // 4. PROFILE VISIBILITY. This route deliberately BYPASSES the bridge's
     //    `can_see_profile` gate — that bypass is the entire reason
     //    `StreamerCard` exists (see the module comment) — so the restriction
@@ -1021,6 +1030,68 @@ mod test {
              and every other test in this module is passing vacuously"
         );
         assert_ne!(before, after);
+    }
+
+    /// A user whose DMs the anti-spam guard paused is absent; one whose pause
+    /// staff cleared, or who was flagged without a pause, is listed.
+    #[test]
+    fn streamers_hides_users_whose_dms_are_paused() {
+        crate::util::test::rt().block_on(streamers_hides_users_whose_dms_are_paused_case())
+    }
+
+    async fn streamers_hides_users_whose_dms_are_paused_case() {
+        use revolt_database::DmGuard;
+
+        let guard = |paused: bool, cleared_at: Option<Timestamp>| DmGuard {
+            report_id: Ulid::new().to_string(),
+            flagged_at: Timestamp::now_utc(),
+            paused,
+            cleared_at,
+            recipients: 5,
+            fingerprint: "fp".to_string(),
+        };
+
+        let harness = TestHarness::new().await;
+
+        let mut paused = fixture(Some(FOUNDING_STREAMER));
+        paused.dm_guard = Some(guard(true, None));
+        assert!(paused.is_dm_paused());
+
+        let mut cleared = fixture(Some(FOUNDING_STREAMER));
+        cleared.dm_guard = Some(guard(true, Some(Timestamp::now_utc())));
+
+        let mut flagged_only = fixture(Some(FOUNDING_STREAMER));
+        flagged_only.dm_guard = Some(guard(false, None));
+
+        for user in [&paused, &cleared, &flagged_only] {
+            insert_ok(&harness, user).await;
+        }
+
+        let body = harness
+            .client
+            .get("/discover/streamers")
+            .dispatch()
+            .await
+            .into_string()
+            .await
+            .expect("body");
+        assert!(
+            !body.contains("dm_guard") && !body.contains("paused"),
+            "the listing must never say why a user is absent: {}",
+            body
+        );
+
+        let listing: v0::StreamersResponse = serde_json::from_str(&body).expect("streamers json");
+        let ids = ids(&listing);
+        assert!(
+            !ids.contains(&paused.id),
+            "a user whose DMs are paused was listed"
+        );
+        assert!(ids.contains(&cleared.id), "a cleared pause must be listed");
+        assert!(
+            ids.contains(&flagged_only.id),
+            "a flag without a pause must be listed"
+        );
     }
 
     /// One account row that no longer deserializes must cost that one user,
