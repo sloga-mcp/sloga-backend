@@ -2508,7 +2508,7 @@ pub async fn update_voice_state_tracks(
     added: bool,
     track: i32,
 ) -> Result<PartialUserVoiceState> {
-    let partial = match track {
+    let mut partial = match track {
         /* TrackSource::Unknown */ 0 => PartialUserVoiceState::default(),
         /* TrackSource::Camera */
         1 => PartialUserVoiceState {
@@ -2542,17 +2542,8 @@ pub async fn update_voice_state_tracks(
             screen_video: Some(added),
             ..Default::default()
         },
-        // Read, then write: NOT atomic. A screen-video stop landing between
-        // the read and the write can leave `screensharing` true with no
-        // share live, until the member's next screen track event or the
-        // voice-state teardown rewrites it. That over-counts, the safe
-        // direction for the video cap and the AFK exemption alike. The
-        // reverse interleaving (a screen-video START racing this read) can
-        // leave `screensharing` false beside a live `screen_video`; the cap
-        // still counts that share through `screen_video`. No Lua script on
-        // purpose: every script here is a pinned hash the deploy's EVAL /
-        // ACL probe has to cover (see `carry_voice_participant_session`).
-        // The partial carries the value actually written.
+        // A removal writes the `screen_video` value read here, then settles
+        // it against a second read once written (below the match).
         /* TrackSource::ScreenShareAudio */
         4 => PartialUserVoiceState {
             screensharing: Some(added || screen_video_is_set(channel, user_id).await?),
@@ -2563,7 +2554,88 @@ pub async fn update_voice_state_tracks(
 
     update_voice_state(channel, user_id, &partial).await?;
 
+    // A screen-audio removal is read-then-write, NOT atomic. Whether another
+    // event can interleave with it depends on webhook delivery. LiveKit's
+    // own notifier (livekit-protocol 0.7.7, `webhook/notifier.go`) queues
+    // per room with one worker that waits for each response, so one room's
+    // webhooks reach voice-ingress one at a time, possibly reordered but
+    // never concurrently; under that delivery no other WEBHOOK interleaves
+    // here, and reordering alone is the sequential case the tests cover.
+    // That is NOT verified for the livekit-server image deployed, and it
+    // does not hold for a different notifier, or when the sender times out
+    // or retries while a handler is still running. It also never covers
+    // writers outside webhook delivery: the voice-permission sync
+    // (`push_user_voice_permissions`, run on a role or timeout change)
+    // writes both screen flags back from its own earlier read, and can land
+    // anywhere in this sequence. Under concurrent delivery a screen-video
+    // event for the same member can interleave with this one:
+    //  - a video STOP (a desktop share stop sends it back to back with the
+    //    audio stop): the read above sees the video live, the video stop
+    //    writes both flags false, then the write above sets `screensharing`
+    //    true again. Left there, it sticks beside `screen_video` false for
+    //    the rest of the session: a permanent AFK exemption, a "sharing"
+    //    badge with nothing to see, a phantom slot in the video cap.
+    //  - a video START: the read above misses it, and the write leaves
+    //    `screensharing` false beside a live `screen_video`.
+    // So, as defense in depth for that delivery, the removal re-reads
+    // `screen_video` once and, if that differs from what it wrote, writes
+    // the re-read value (one corrective write, in
+    // `settle_screensharing_to_screen_video`). For the back-to-back stop,
+    // every order of the video stop against this path's read and write ends
+    // with both flags false: before the read, this path reads and writes
+    // false; between the read and the write, the re-read sees false and
+    // corrects; after the write, either the re-read corrects or the video
+    // stop's own write is the last one. The reverse race is narrowed the
+    // same way. What remains: a screen-video event still mid-write across
+    // the settle, i.e. one landing between the re-read and the corrective
+    // write, or (as `update_voice_state`'s pipeline is not MULTI) one whose
+    // `screensharing` SET lands before this path's write and whose
+    // `screen_video` SET lands after the re-read. The two flags can then
+    // still disagree until the member's next screen track event or the
+    // voice-state teardown. Like the first write, the corrective SET can
+    // also re-create a `screensharing:` key that a teardown deleted just
+    // before it: voice-ingress's voice-state guard runs before this call,
+    // not around it.
+    //
+    // No Lua script on purpose: every script here is a pinned hash the
+    // deploy's EVAL / ACL probe has to cover (see
+    // `carry_voice_participant_session`), and WATCH/MULTI is ruled out on
+    // pooled connections (see `DELETE_VOICE_STATE`). The partial carries
+    // the last value this path wrote.
+    if track == 4 && !added {
+        if let Some(written) = partial.screensharing {
+            partial.screensharing =
+                Some(settle_screensharing_to_screen_video(channel, user_id, written).await?);
+        }
+    }
+
     Ok(partial)
+}
+
+/// Re-reads `user_id`'s `screen_video` once and, if it differs from the
+/// `screensharing` value just `written` by a screen-audio removal, writes
+/// the re-read value through [`update_voice_state`] (one corrective write).
+/// Returns the value `screensharing` was finally left at. See the race
+/// comment in [`update_voice_state_tracks`] for what this does and does not
+/// close.
+async fn settle_screensharing_to_screen_video(
+    channel: &UserVoiceChannel,
+    user_id: &str,
+    written: bool,
+) -> Result<bool> {
+    let screen_video = screen_video_is_set(channel, user_id).await?;
+    if screen_video != written {
+        update_voice_state(
+            channel,
+            user_id,
+            &PartialUserVoiceState {
+                screensharing: Some(screen_video),
+                ..Default::default()
+            },
+        )
+        .await?;
+    }
+    Ok(screen_video)
 }
 
 /// Whether `user_id`'s `screen_video` flag is set in this channel's voice
@@ -14110,6 +14182,139 @@ mod tests {
 
         delete_voice_state(&channel, &user).await.expect("cleanup");
         assert!(get_voice_state(&channel, &user).await.unwrap().is_none());
+    }
+
+    // The settle step a screen-audio removal runs after its write. Under
+    // concurrent webhook delivery (see the race comment in
+    // `update_voice_state_tracks`), a desktop share stop (video stop and
+    // audio stop back to back) can interleave: the audio stop reads the video
+    // live, the video stop writes both flags false, the audio stop writes
+    // `screensharing` true. The settle must take that stuck state back to
+    // false, take the reverse race (a video START missed by the read) back
+    // to true, and leave a consistent state alone. The interleavings
+    // themselves cannot be scheduled from here, so each case seeds the state
+    // the race leaves and calls the settle with the value the losing write
+    // wrote.
+    async fn seed_screen_flags_case(
+        channel: &UserVoiceChannel,
+        user: &str,
+        screensharing: bool,
+        screen_video: bool,
+    ) {
+        create_voice_state(channel, user, Timestamp::now_utc())
+            .await
+            .expect("seed voice state");
+        update_voice_state(
+            channel,
+            user,
+            &PartialUserVoiceState {
+                screensharing: Some(screensharing),
+                screen_video: Some(screen_video),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("seed screen flags");
+        let state = get_voice_state(channel, user).await.unwrap().unwrap();
+        assert_eq!(state.screensharing, screensharing, "seeded screensharing");
+        assert_eq!(state.screen_video, screen_video, "seeded screen_video");
+    }
+
+    fn settle_case_channel() -> (UserVoiceChannel, String) {
+        let suffix = ulid::Ulid::new().to_string();
+        (
+            UserVoiceChannel {
+                id: format!("chan{suffix}"),
+                server_id: Some(format!("srv{suffix}")),
+            },
+            format!("user{suffix}"),
+        )
+    }
+
+    #[test]
+    fn settle_screensharing_clears_the_stuck_flag_without_live_video() {
+        rt().block_on(async {
+            let (channel, user) = settle_case_channel();
+            // The stuck state the back-to-back stop leaves: the audio stop
+            // wrote `screensharing` true after the video stop cleared both.
+            seed_screen_flags_case(&channel, &user, true, false).await;
+
+            let settled = settle_screensharing_to_screen_video(&channel, &user, true)
+                .await
+                .unwrap();
+            assert!(!settled, "the settle reports the value finally written");
+            let state = get_voice_state(&channel, &user).await.unwrap().unwrap();
+            assert!(
+                !state.screensharing,
+                "a stuck screensharing beside no screen video must be cleared"
+            );
+            assert!(!state.screen_video, "the settle never touches screen_video");
+
+            delete_voice_state(&channel, &user).await.expect("cleanup");
+            assert!(get_voice_state(&channel, &user).await.unwrap().is_none());
+        })
+    }
+
+    #[test]
+    fn settle_screensharing_restores_the_flag_beside_live_video() {
+        rt().block_on(async {
+            let (channel, user) = settle_case_channel();
+            // The reverse race: the audio stop's read missed a video START,
+            // so it wrote `screensharing` false beside a live screen video.
+            seed_screen_flags_case(&channel, &user, false, true).await;
+
+            let settled = settle_screensharing_to_screen_video(&channel, &user, false)
+                .await
+                .unwrap();
+            assert!(settled, "the settle reports the value finally written");
+            let state = get_voice_state(&channel, &user).await.unwrap().unwrap();
+            assert!(
+                state.screensharing,
+                "a live screen video must not be left without screensharing"
+            );
+            assert!(state.screen_video, "the settle never touches screen_video");
+
+            delete_voice_state(&channel, &user).await.expect("cleanup");
+            assert!(get_voice_state(&channel, &user).await.unwrap().is_none());
+        })
+    }
+
+    #[test]
+    fn settle_screensharing_leaves_a_consistent_state_alone() {
+        rt().block_on(async {
+            for (screensharing, screen_video) in [(true, true), (false, false)] {
+                let (channel, user) = settle_case_channel();
+                seed_screen_flags_case(&channel, &user, screensharing, screen_video).await;
+
+                let settled = settle_screensharing_to_screen_video(&channel, &user, screensharing)
+                    .await
+                    .unwrap();
+                assert_eq!(settled, screen_video);
+                let state = get_voice_state(&channel, &user).await.unwrap().unwrap();
+                assert_eq!(state.screensharing, screensharing, "no change");
+                assert_eq!(state.screen_video, screen_video, "no change");
+
+                delete_voice_state(&channel, &user).await.expect("cleanup");
+                assert!(get_voice_state(&channel, &user).await.unwrap().is_none());
+            }
+
+            // A re-read that agrees with what was written issues NO write:
+            // the key deliberately holds the opposite value here, and stays.
+            let (channel, user) = settle_case_channel();
+            seed_screen_flags_case(&channel, &user, false, true).await;
+            let settled = settle_screensharing_to_screen_video(&channel, &user, true)
+                .await
+                .unwrap();
+            assert!(settled);
+            let state = get_voice_state(&channel, &user).await.unwrap().unwrap();
+            assert!(
+                !state.screensharing,
+                "no corrective write when the re-read matches the written value"
+            );
+
+            delete_voice_state(&channel, &user).await.expect("cleanup");
+            assert!(get_voice_state(&channel, &user).await.unwrap().is_none());
+        })
     }
 
     // The screen-leg marker (`vc_leg:{channel}`) and the two leave guards
