@@ -1,7 +1,6 @@
 use encoding_rs::{Encoding, UTF_8_INIT};
 use lazy_static::lazy_static;
 use mime::Mime;
-use pdk_ip_filter_lib::IpFilter;
 use regex::Regex;
 use reqwest::{
     dns::{Addrs, Name, Resolve},
@@ -15,24 +14,44 @@ use revolt_result::{create_error, Error, Result, ToRevoltError};
 use std::net::{IpAddr, SocketAddr};
 use std::{
     io::{Cursor, Write},
-    str::FromStr,
     time::Duration,
 };
 use url::{Host, Url};
 
+use crate::ip_policy;
+
+// TODO config
+/// At most this much of an HTML page is read for a website embed
+const HTML_READ_BYTES: usize = 2 * 1024 * 1024;
+/// At most this much of an image is read to find its dimensions
+const IMAGE_PROBE_BYTES: usize = 1024 * 1024;
+/// At most this much of a video is read for ffprobe
+const VIDEO_PROBE_BYTES: usize = 32 * 1024 * 1024;
+/// Largest image `/proxy` serves
+const PROXY_IMAGE_BYTES: usize = 20 * 1024 * 1024;
+/// Largest video `/proxy` serves
+const PROXY_VIDEO_BYTES: usize = 50 * 1024 * 1024;
+/// The only ports january fetches from (internal services listen on other
+/// ports of the host's own public address, which is reachable over `lo`)
+const ALLOWED_PORTS: [u16; 4] = [80, 443, 8080, 8443];
+
 lazy_static! {
     /// Request client
+    ///
+    /// No proxy: a proxy would resolve the upstream host itself, outside
+    /// the vetting resolver.
     static ref CLIENT: Client = reqwest::Client::builder()
-        .dns_resolver(CachedDnsResolver {})
+        .dns_resolver(VettingDnsResolver)
         .timeout(Duration::from_secs(10)) // TODO config
         .connect_timeout(Duration::from_secs(5)) // TODO config
         .redirect(redirect::Policy::none())
+        .no_proxy()
         .build()
         .expect("reqwest Client");
 
     /// Request client for streamed audio relays (`/audio`)
     ///
-    /// Same SSRF posture as `CLIENT` (cached resolver, no automatic redirects;
+    /// Same SSRF posture as `CLIENT` (vetting resolver, no automatic redirects;
     /// `Request::open` follows them manually and re-checks every hop), but
     /// no total timeout: a stream may legitimately run for minutes, so only
     /// connect and per-read stalls are bounded here and the wall-clock limit
@@ -41,7 +60,7 @@ lazy_static! {
     /// must refer to the raw file. No proxy: a proxy would resolve the
     /// upstream host itself, outside the resolver the blocklist checked.
     static ref STREAM_CLIENT: Client = reqwest::Client::builder()
-        .dns_resolver(CachedDnsResolver {})
+        .dns_resolver(VettingDnsResolver)
         .connect_timeout(Duration::from_secs(5))
         // Some hosts take tens of seconds to send the first byte of a cold
         // file (catbox measured up to 45.6 s). This timeout therefore only
@@ -94,22 +113,12 @@ lazy_static! {
         .time_to_live(Duration::from_secs(60)) // For up to 1 minute
         .build();
 
+    /// Resolved addresses per host name; only `resolve_vetted` inserts, and
+    /// it re-vets every hit
     static ref DNS_CACHE: moka::future::Cache<String, Vec<SocketAddr>> = moka::future::Cache::builder()
         .max_capacity(10_000)
         .time_to_idle(Duration::from_secs(30))
         .build();
-
-    static ref IP_BLOCKLIST: IpFilter = IpFilter::block(&[
-        "0.0.0.0/8",
-        "10.0.0.0/8",
-        "192.168.0.0/16",
-        "127.0.0.0/8",
-        "172.16.0.0/12",
-        "169.254.0.0/16",
-        "::1",
-        "fc00::/7",
-        ]
-    ).unwrap();
 }
 
 #[derive(Clone)]
@@ -128,36 +137,49 @@ impl From<IPRequest> for Url {
     }
 }
 
-struct CachedDnsResolver {}
+/// Resolver for `CLIENT` and `STREAM_CLIENT`: the connector is only ever
+/// handed an address list that passed `resolve_vetted`
+struct VettingDnsResolver;
 
-impl reqwest::dns::Resolve for CachedDnsResolver {
+impl Resolve for VettingDnsResolver {
     fn resolve(&self, name: Name) -> reqwest::dns::Resolving {
         Box::pin(async move {
-            {
-                if let Some(addrs) = DNS_CACHE.get(&name.as_str().to_string()).await {
-                    let resp: Addrs = Box::new(addrs.clone().into_iter());
-                    return Ok(resp);
-                }
-            }
-
-            let mut lookup = name.as_str().to_string();
-            if !lookup.contains(":") {
-                lookup += ":0";
-            }
-
-            let fallback: Vec<SocketAddr> = tokio::net::lookup_host(&lookup)
-                .await
-                .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?
-                .collect();
-
-            {
-                DNS_CACHE
-                    .insert(name.as_str().to_string().clone(), fallback.clone())
-                    .await;
-                let addrs: Addrs = Box::new(fallback.clone().into_iter());
-                Ok(addrs)
-            }
+            let addrs: Addrs = Box::new(resolve_vetted(name.as_str()).await?.into_iter());
+            Ok(addrs)
         })
+    }
+}
+
+/// Resolve `host`, failing the whole name unless the answer is non-empty
+/// and no address in it is `ip_policy::is_forbidden`
+///
+/// Cache hits are vetted again and only vetted answers are cached, so a
+/// mixed answer (public + private) or a name that rebinds to a private
+/// address never reaches the connector. A refusal is a `PermissionDenied`
+/// io error; a failed lookup keeps its own error.
+async fn resolve_vetted(host: &str) -> std::io::Result<Vec<SocketAddr>> {
+    if let Some(addrs) = DNS_CACHE.get(host).await {
+        return vet_addresses(addrs);
+    }
+
+    let mut lookup = host.to_string();
+    if !lookup.contains(':') {
+        lookup += ":0";
+    }
+
+    let addrs = vet_addresses(tokio::net::lookup_host(&lookup).await?.collect())?;
+    DNS_CACHE.insert(host.to_string(), addrs.clone()).await;
+    Ok(addrs)
+}
+
+fn vet_addresses(addrs: Vec<SocketAddr>) -> std::io::Result<Vec<SocketAddr>> {
+    if addrs.is_empty() || addrs.iter().any(|addr| ip_policy::is_forbidden(addr.ip())) {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "host resolves to a forbidden address",
+        ))
+    } else {
+        Ok(addrs)
     }
 }
 
@@ -179,51 +201,71 @@ impl Request {
         if let Some(hit) = PROXY_CACHE.get(url).await {
             hit
         } else {
-            let Request { response, mime } = Request::new_from_str(url).await?;
+            let request = Request::new_from_str(url).await?;
+            Request::proxy_request(url, request).await
+        }
+    }
 
-            if matches!(mime.type_(), mime::IMAGE | mime::VIDEO) {
-                let bytes = report_internal_error!(response.bytes().await);
+    /// Proxy the already-opened upstream `request` for `url`, caching the
+    /// outcome in `PROXY_CACHE`
+    async fn proxy_request(url: &str, request: Request) -> Result<(String, Vec<u8>)> {
+        let Request { response, mime } = request;
 
-                let result = match bytes {
-                    Ok(bytes) => {
-                        if matches!(mime.type_(), mime::IMAGE) {
-                            let reader = &mut Cursor::new(&bytes);
+        // SVG is never parsed or rendered server-side: refuse it unread, as a
+        // cached client error (not an internal error per request)
+        if is_svg(&mime) {
+            let result = Err(create_error!(FileTypeNotAllowed));
+            PROXY_CACHE.insert(url.to_owned(), result.clone()).await;
+            return result;
+        }
 
-                            if matches!(mime.subtype(), mime::GIF) {
-                                if is_valid_image(reader, "image/gif") {
-                                    Ok(("image/gif".to_owned(), bytes.to_vec()))
-                                } else {
-                                    Err(create_error!(FileTypeNotAllowed))
-                                }
-                            } else {
-                                Ok((
-                                    "image/webp".to_owned(),
-                                    create_thumbnail(
-                                        decode_image(reader, mime.as_ref())?,
-                                        "attachments",
-                                    )
-                                    .await,
-                                ))
-                            }
-                        } else {
-                            let mut file = report_internal_error!(tempfile::NamedTempFile::new())?;
-                            report_internal_error!(file.write_all(&bytes))?;
+        if matches!(mime.type_(), mime::IMAGE | mime::VIDEO) {
+            let cap = if matches!(mime.type_(), mime::IMAGE) {
+                PROXY_IMAGE_BYTES
+            } else {
+                PROXY_VIDEO_BYTES
+            };
+            let bytes = read_capped(response, cap, Overflow::Error).await;
 
-                            if video_size(&file).is_some() {
-                                Ok((mime.to_string(), bytes.to_vec()))
+            let result = match bytes {
+                Ok(bytes) => {
+                    if matches!(mime.type_(), mime::IMAGE) {
+                        let reader = &mut Cursor::new(&bytes);
+
+                        if matches!(mime.subtype(), mime::GIF) {
+                            if is_valid_image(reader, "image/gif") {
+                                Ok(("image/gif".to_owned(), bytes.to_vec()))
                             } else {
                                 Err(create_error!(FileTypeNotAllowed))
                             }
+                        } else {
+                            Ok((
+                                "image/webp".to_owned(),
+                                create_thumbnail(
+                                    decode_image(reader, mime.as_ref())?,
+                                    "attachments",
+                                )
+                                .await,
+                            ))
+                        }
+                    } else {
+                        let mut file = report_internal_error!(tempfile::NamedTempFile::new())?;
+                        report_internal_error!(file.write_all(&bytes))?;
+
+                        if video_size(&file).is_some() {
+                            Ok((mime.to_string(), bytes.to_vec()))
+                        } else {
+                            Err(create_error!(FileTypeNotAllowed))
                         }
                     }
-                    Err(err) => Err(err),
-                };
+                }
+                Err(err) => Err(err),
+            };
 
-                PROXY_CACHE.insert(url.to_owned(), result.clone()).await;
-                result
-            } else {
-                Err(create_error!(FileTypeNotAllowed))
-            }
+            PROXY_CACHE.insert(url.to_owned(), result.clone()).await;
+            result
+        } else {
+            Err(create_error!(FileTypeNotAllowed))
         }
     }
 
@@ -249,9 +291,17 @@ impl Request {
                 }
             };
 
+            let Request { response, mime } = request;
+
+            // SVG is never parsed server-side, so its size is never known:
+            // skip the read
+            if is_svg(&mime) {
+                return Ok(None);
+            }
+
             if let Some((width, height)) = image_size_vec(
-                &report_internal_error!(request.response.bytes().await)?,
-                request.mime.as_ref(),
+                &read_capped(response, IMAGE_PROBE_BYTES, Overflow::Truncate).await?,
+                mime.as_ref(),
             ) {
                 Ok(Some(Image {
                     url: url.to_owned(),
@@ -287,10 +337,9 @@ impl Request {
                 }
             };
 
+            let head = read_capped(response, VIDEO_PROBE_BYTES, Overflow::Truncate).await?;
             let mut file = report_internal_error!(tempfile::NamedTempFile::new())?;
-            report_internal_error!(
-                file.write_all(&report_internal_error!(response.bytes().await)?)
-            )?;
+            report_internal_error!(file.write_all(&head))?;
 
             if let Some((width, height)) = video_size(&file) {
                 Ok(Some(Video {
@@ -344,7 +393,8 @@ impl Request {
                     let encoding =
                         Encoding::for_label(encoding_name.as_bytes()).unwrap_or(&UTF_8_INIT);
 
-                    let bytes = report_internal_error!(request.response.bytes().await)?;
+                    let bytes =
+                        read_capped(request.response, HTML_READ_BYTES, Overflow::Truncate).await?;
                     let (text, _, _) = encoding.decode(&bytes);
 
                     crate::website_embed::create_website_embed(&url, &text)
@@ -550,6 +600,10 @@ impl Request {
 
     /// Check if something exists
     pub async fn exists(url: Url) -> bool {
+        if Request::url_is_blacklisted(&url).await.is_err() {
+            return false;
+        }
+
         if let Ok(response) = CLIENT.head(url).send().await {
             response.status().is_success()
         } else {
@@ -562,20 +616,35 @@ impl Request {
         Ok(Request::exists(proper_url).await)
     }
 
+    /// Refuse `url` unless its port is in `ALLOWED_PORTS` and every address
+    /// it can reach is allowed
+    ///
+    /// The port is checked first, before any lookup. A literal IP host is
+    /// judged by `ip_policy::is_forbidden` directly. A name must contain a
+    /// dot and not be in `january.blocked_domains`, and then goes through
+    /// `resolve_vetted` (the same vetting the clients' resolver applies), so
+    /// EVERY address it resolves to must be allowed.
     pub async fn url_is_blacklisted(url: &Url) -> Result<IPRequest> {
+        if !url
+            .port_or_known_default()
+            .is_some_and(|port| ALLOWED_PORTS.contains(&port))
+        {
+            return Err(create_error!(InvalidOperation));
+        }
+
         let resolved_address: IpAddr;
 
         if let Some(host) = url.host() {
             match host {
                 Host::Ipv4(ipv4) => {
                     resolved_address = ipv4.into();
-                    if !IP_BLOCKLIST.is_allowed(&ipv4.to_string()) {
+                    if ip_policy::is_forbidden(resolved_address) {
                         return Err(create_error!(InvalidOperation));
                     }
                 }
                 Host::Ipv6(ipv6) => {
                     resolved_address = ipv6.into();
-                    if !IP_BLOCKLIST.is_allowed(&ipv6.to_string()) {
+                    if ip_policy::is_forbidden(resolved_address) {
                         return Err(create_error!(InvalidOperation));
                     }
                 }
@@ -591,29 +660,13 @@ impl Request {
                         return Err(create_error!(InvalidOperation));
                     }
 
-                    // Second step: resolve the IP and check the blocklist
-                    let resolver = CachedDnsResolver {};
-                    if let Ok(mut resolved_ip) = resolver
-                        .resolve(
-                            Name::from_str(&domain)
-                                .map_err(|_| create_error!(ProxyError))
-                                .unwrap(),
-                        )
-                        .await
-                    {
-                        if let Some(resolved_ip) = resolved_ip.next() {
-                            resolved_address = resolved_ip.ip();
-                            let resolved_string = resolved_address.to_string();
-                            if !IP_BLOCKLIST.is_allowed(&resolved_string)
-                                || resolved_string.contains("::ffff:")
-                            {
-                                return Err(create_error!(InvalidOperation));
-                            }
-                        } else {
+                    // Second step: resolve and vet every address
+                    match resolve_vetted(&domain).await {
+                        Ok(addrs) => resolved_address = addrs[0].ip(),
+                        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
                             return Err(create_error!(InvalidOperation));
                         }
-                    } else {
-                        return Err(create_error!(ProxyError));
+                        Err(_) => return Err(create_error!(ProxyError)),
                     }
                 }
             }
@@ -660,6 +713,64 @@ fn mime_for_status(status: StatusCode, headers: &HeaderMap) -> Result<Mime> {
         .map_err(|_| create_error!(ProxyError))?;
 
     content_type.parse().map_err(|_| create_error!(ProxyError))
+}
+
+/// Whether `mime` is SVG (`image/svg+xml` in any case, whatever its
+/// parameters); january never reads SVG bodies
+fn is_svg(mime: &Mime) -> bool {
+    mime.essence_str()
+        .trim()
+        .eq_ignore_ascii_case("image/svg+xml")
+}
+
+/// What `read_capped` does with a body longer than its cap
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Overflow {
+    /// Keep the first `cap` bytes and leave the rest unread
+    Truncate,
+    /// Drop the response and fail with `FileTooLarge`
+    Error,
+}
+
+/// Read a response body, holding at most `cap` bytes of it
+///
+/// Counts the bytes `Response::chunk()` hands over, so the cap bounds
+/// memory whatever upstream declares. In `Overflow::Error` mode a
+/// `Content-Length` above `cap` is refused before any of the body is read
+/// (not in `Truncate` mode: a large image or page still has a usable head).
+async fn read_capped(mut response: Response, cap: usize, mode: Overflow) -> Result<Vec<u8>> {
+    if mode == Overflow::Error {
+        let declared = response
+            .headers()
+            .get(header::CONTENT_LENGTH)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.trim().parse::<u64>().ok());
+
+        if declared.is_some_and(|declared| declared > cap as u64) {
+            return Err(create_error!(FileTooLarge { max: cap }));
+        }
+    }
+
+    let mut body = Vec::new();
+    while let Some(chunk) = report_internal_error!(response.chunk().await)? {
+        let room = cap - body.len();
+        if chunk.len() > room {
+            match mode {
+                Overflow::Truncate => {
+                    body.extend_from_slice(&chunk[..room]);
+                    break;
+                }
+                Overflow::Error => return Err(create_error!(FileTooLarge { max: cap })),
+            }
+        }
+
+        body.extend_from_slice(&chunk);
+        if mode == Overflow::Truncate && body.len() == cap {
+            break;
+        }
+    }
+
+    Ok(body)
 }
 
 /// Metadata path `Request::generate_embed` takes for a response
@@ -980,5 +1091,379 @@ mod tests {
             .expect("audio embed");
         assert_eq!(audio.content_type, "audio/ogg");
         assert_eq!(audio.filename.as_deref(), Some("track.ogg"));
+    }
+
+    /// Make `host` resolve to `addrs` (as if a lookup had just returned them)
+    async fn seed_dns(host: &str, addrs: &[(&str, u16)]) {
+        DNS_CACHE
+            .insert(
+                host.to_owned(),
+                addrs
+                    .iter()
+                    .map(|(ip, port)| SocketAddr::new(ip.parse().expect("valid ip"), *port))
+                    .collect(),
+            )
+            .await;
+    }
+
+    fn url(value: &str) -> Url {
+        Url::parse(value).expect("valid url")
+    }
+
+    /// A listener on 127.0.0.1 that nothing should ever connect to
+    async fn bait() -> (tokio::net::TcpListener, u16) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let port = listener.local_addr().expect("local addr").port();
+        (listener, port)
+    }
+
+    async fn assert_never_accepted(listener: &tokio::net::TcpListener) {
+        assert!(
+            tokio::time::timeout(Duration::from_millis(500), listener.accept())
+                .await
+                .is_err(),
+            "a forbidden address was dialed"
+        );
+    }
+
+    #[tokio::test]
+    async fn sec002_any_forbidden_address_in_an_answer_refuses_the_name() {
+        seed_dns("mixed.test", &[("8.8.8.8", 0), ("127.0.0.1", 0)]).await;
+        assert!(Request::url_is_blacklisted(&url("http://mixed.test/"))
+            .await
+            .is_err());
+
+        seed_dns("mixed-v6.test", &[("2606:4700::1111", 0), ("fe80::1", 0)]).await;
+        assert!(Request::url_is_blacklisted(&url("http://mixed-v6.test/"))
+            .await
+            .is_err());
+
+        seed_dns("empty.test", &[]).await;
+        assert!(Request::url_is_blacklisted(&url("http://empty.test/"))
+            .await
+            .is_err());
+
+        // an all-public answer still passes
+        seed_dns("public.test", &[("8.8.8.8", 0), ("2606:4700::1111", 0)]).await;
+        assert!(Request::url_is_blacklisted(&url("http://public.test/"))
+            .await
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn sec002_forbidden_literal_hosts_are_refused() {
+        for value in [
+            "http://[::]/",
+            "http://[::ffff:127.0.0.1]/",
+            "http://[::127.0.0.1]/",
+            "http://[fe80::1]/",
+            "http://[fec0::1]/",
+            "http://[ff02::1]/",
+            "http://[64:ff9b::7f00:1]/",
+            "http://[2002:7f00:1::]/",
+            "http://100.64.0.1/",
+            "http://198.18.0.1/",
+            "http://224.0.0.1/",
+            "http://255.255.255.255/",
+            "http://0.0.0.0/",
+            "http://2130706433/",
+        ] {
+            assert!(
+                Request::url_is_blacklisted(&url(value)).await.is_err(),
+                "{value}"
+            );
+        }
+
+        for value in [
+            "http://8.8.8.8/",
+            "http://1.1.1.1/",
+            "http://[2606:4700::1111]/",
+            "http://[2a00:1450::1]/",
+        ] {
+            assert!(
+                Request::url_is_blacklisted(&url(value)).await.is_ok(),
+                "{value}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn sec002_audio_stream_refuses_a_mixed_answer_before_connecting() {
+        // Default port (allowed), so only the mixed answer can refuse it; a
+        // connection attempt would end in ProxyError, not InvalidOperation
+        seed_dns("mixed-audio.test", &[("8.8.8.8", 0), ("127.0.0.1", 0)]).await;
+
+        let error = tokio::time::timeout(
+            Duration::from_secs(15),
+            Request::open_audio_stream("http://mixed-audio.test/a.mp3", None),
+        )
+        .await
+        .expect("refused without waiting on a connection")
+        .err()
+        .expect("refused");
+
+        assert!(matches!(error.error_type, ErrorType::InvalidOperation));
+    }
+
+    #[tokio::test]
+    async fn sec002_clients_never_dial_a_forbidden_address() {
+        // Straight to the clients, past `url_is_blacklisted`: the resolver
+        // itself must refuse (a name that rebinds after the check)
+        for (client, host) in [
+            (&*CLIENT, "rebind.test"),
+            (&*STREAM_CLIENT, "rebind-stream.test"),
+        ] {
+            let (listener, port) = bait().await;
+            seed_dns(host, &[("127.0.0.1", port)]).await;
+
+            let sent = tokio::time::timeout(
+                Duration::from_secs(5),
+                client.get(format!("http://{host}:{port}/")).send(),
+            )
+            .await
+            .expect("refused without waiting on a connection");
+
+            assert!(sent.is_err(), "{host}");
+            assert_never_accepted(&listener).await;
+        }
+
+        // A fresh lookup (not a cache hit) is vetted too, and not cached
+        let (listener, port) = bait().await;
+        let sent = tokio::time::timeout(
+            Duration::from_secs(5),
+            CLIENT.get(format!("http://localhost:{port}/")).send(),
+        )
+        .await
+        .expect("refused without waiting on a connection");
+
+        assert!(sent.is_err());
+        assert_never_accepted(&listener).await;
+        assert!(DNS_CACHE.get("localhost").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn sec002_exists_refuses_forbidden_hosts_before_connecting() {
+        let (listener, port) = bait().await;
+        seed_dns("exists.test", &[("127.0.0.1", port)]).await;
+
+        for value in [
+            format!("http://exists.test:{port}/"),
+            format!("http://127.0.0.1:{port}/"),
+        ] {
+            let found = tokio::time::timeout(Duration::from_secs(5), Request::exists(url(&value)))
+                .await
+                .expect("refused without waiting on a connection");
+            assert!(!found, "{value}");
+        }
+
+        assert_never_accepted(&listener).await;
+    }
+
+    #[tokio::test]
+    async fn sec002_only_web_ports_are_fetched() {
+        // A public answer, so only the port can refuse
+        seed_dns("ports.test", &[("8.8.8.8", 0)]).await;
+
+        for value in [
+            "http://ports.test:8500/",
+            "http://ports.test:14702/",
+            "https://ports.test:14703/",
+            "http://ports.test:22/",
+            "http://ports.test:6379/",
+            "http://ports.test:0/",
+            "http://8.8.8.8:8500/",
+            "http://[2606:4700::1111]:14704/",
+            "ftp://ports.test/",
+            // never looked up: a lookup of this name would fail as ProxyError
+            "http://unseeded-port.test:14705/",
+        ] {
+            let error = Request::url_is_blacklisted(&url(value))
+                .await
+                .err()
+                .expect("refused");
+            assert!(
+                matches!(error.error_type, ErrorType::InvalidOperation),
+                "{value}"
+            );
+        }
+
+        for value in [
+            "http://ports.test/",
+            "https://ports.test/",
+            "http://ports.test:80/",
+            "https://ports.test:443/",
+            "http://ports.test:443/",
+            "http://ports.test:8080/",
+            "https://ports.test:8443/",
+            "http://8.8.8.8:8080/",
+        ] {
+            assert!(
+                Request::url_is_blacklisted(&url(value)).await.is_ok(),
+                "{value}"
+            );
+        }
+    }
+
+    const CAP: usize = 4096;
+
+    async fn read_body(chunks: Vec<Vec<u8>>, mode: Overflow) -> (Result<Vec<u8>>, usize) {
+        let (request, pulled) = synthetic(200, &[(CONTENT_TYPE, "image/png")], chunks);
+        let body = read_capped(request.response, CAP, mode).await;
+        (body, pulled.load(Ordering::SeqCst))
+    }
+
+    #[tokio::test]
+    async fn sec004_one_byte_over_the_cap_is_truncated_or_refused() {
+        for chunks in [
+            vec![vec![1u8; CAP + 1]],
+            vec![vec![1u8; CAP], vec![2u8]],
+            vec![vec![1u8; 1000]; 5],
+        ] {
+            let total: usize = chunks.iter().map(Vec::len).sum();
+            assert!(total > CAP);
+
+            let (body, _) = read_body(chunks.clone(), Overflow::Truncate).await;
+            let body = body.expect("truncated");
+            assert_eq!(body, chunks.concat()[..CAP]);
+
+            let (body, _) = read_body(chunks, Overflow::Error).await;
+            assert!(matches!(
+                body.expect_err("refused").error_type,
+                ErrorType::FileTooLarge { max: CAP }
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn sec004_exactly_the_cap_is_read_whole() {
+        for chunks in [vec![vec![3u8; CAP]], vec![vec![3u8; CAP / 2]; 2], vec![]] {
+            for mode in [Overflow::Truncate, Overflow::Error] {
+                let (body, _) = read_body(chunks.clone(), mode).await;
+                assert_eq!(body.expect("read"), chunks.concat(), "{mode:?}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn sec004_reading_stops_at_the_cap() {
+        // 1 MiB body: an uncapped read would pull all of it
+        for mode in [Overflow::Truncate, Overflow::Error] {
+            let (_, pulled) = read_body(vec![vec![0u8; 1024]; 1024], mode).await;
+            assert!(pulled <= CAP + 1024, "{mode:?} pulled {pulled}");
+        }
+    }
+
+    #[tokio::test]
+    async fn sec004_declared_oversize_is_refused_unread_only_in_error_mode() {
+        let declared = (CAP + 1).to_string();
+        let pairs = [
+            (CONTENT_TYPE, "image/png"),
+            (CONTENT_LENGTH, declared.as_str()),
+        ];
+
+        let (request, pulled) = synthetic(200, &pairs, vec![vec![4u8; CAP + 1]]);
+        let body = read_capped(request.response, CAP, Overflow::Error).await;
+        assert!(matches!(
+            body.expect_err("refused").error_type,
+            ErrorType::FileTooLarge { max: CAP }
+        ));
+        assert_eq!(pulled.load(Ordering::SeqCst), 0);
+
+        let (request, _) = synthetic(200, &pairs, vec![vec![4u8; CAP + 1]]);
+        let body = read_capped(request.response, CAP, Overflow::Truncate).await;
+        assert_eq!(body.expect("truncated").len(), CAP);
+    }
+
+    #[tokio::test]
+    async fn sec004_image_probe_reads_at_most_its_cap() {
+        let (request, pulled) = synthetic(
+            200,
+            &[(CONTENT_TYPE, "image/png")],
+            vec![vec![0u8; 64 * 1024]; 64],
+        );
+
+        let image =
+            Request::fetch_image_metadata("https://example.com/sec004-probe.png", Some(request))
+                .await
+                .expect("probe");
+        assert!(image.is_none());
+        assert!(pulled.load(Ordering::SeqCst) <= IMAGE_PROBE_BYTES + 64 * 1024);
+    }
+
+    const SVG: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10"/>"#;
+
+    #[test]
+    fn sec003_svg_is_recognized_whatever_its_case_or_parameters() {
+        for (value, svg) in [
+            ("image/svg+xml", true),
+            ("image/svg+xml; charset=utf-8", true),
+            ("IMAGE/SVG+XML", true),
+            ("Image/Svg+Xml;charset=UTF-8", true),
+            ("image/png", false),
+            ("image/svg", false),
+            ("text/xml", false),
+            ("application/xml", false),
+        ] {
+            assert_eq!(is_svg(&mime(value)), svg, "{value}");
+        }
+    }
+
+    #[tokio::test]
+    async fn sec003_proxy_refuses_svg_unread_and_caches_the_refusal() {
+        for (n, value) in [
+            "image/svg+xml",
+            "image/svg+xml; charset=utf-8",
+            "IMAGE/SVG+XML",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let url = format!("https://sec003-proxy-{n}.invalid/a.svg");
+            let (request, pulled) = synthetic(200, &[(CONTENT_TYPE, value)], vec![SVG.to_vec()]);
+
+            let error = Request::proxy_request(&url, request)
+                .await
+                .expect_err("refused");
+            assert!(
+                matches!(error.error_type, ErrorType::FileTypeNotAllowed),
+                "{value}"
+            );
+            assert_eq!(pulled.load(Ordering::SeqCst), 0, "{value}");
+
+            // The refusal is cached, so a repeat never fetches again
+            let cached = PROXY_CACHE.get(&url).await.expect("cached");
+            assert!(
+                matches!(
+                    cached.map_err(|error| error.error_type),
+                    Err(ErrorType::FileTypeNotAllowed)
+                ),
+                "{value}"
+            );
+
+            let error = tokio::time::timeout(Duration::from_secs(10), Request::proxy_file(&url))
+                .await
+                .expect("answered from the cache")
+                .expect_err("refused");
+            assert!(
+                matches!(error.error_type, ErrorType::FileTypeNotAllowed),
+                "{value}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn sec003_image_metadata_skips_svg_unread() {
+        for value in ["image/svg+xml", "image/svg+xml; charset=utf-8"] {
+            let (request, pulled) = synthetic(200, &[(CONTENT_TYPE, value)], vec![SVG.to_vec()]);
+
+            let image =
+                Request::fetch_image_metadata("https://example.com/sec003.svg", Some(request))
+                    .await
+                    .expect("probe");
+            assert!(image.is_none(), "{value}");
+            assert_eq!(pulled.load(Ordering::SeqCst), 0, "{value}");
+        }
     }
 }

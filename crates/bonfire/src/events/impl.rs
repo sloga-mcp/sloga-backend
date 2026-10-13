@@ -16,6 +16,17 @@ use revolt_result::{ErrorType, Result};
 
 use super::state::{Cache, State};
 
+/// The user's own membership rows, keyed by server id. Ready's member list
+/// also carries voice participants' rows; keyed by server alone, one of
+/// those could stand in for the user's own row in permission checks.
+fn own_memberships(members: &[Member], user_id: &str) -> HashMap<String, Member> {
+    members
+        .iter()
+        .filter(|member| member.id.user == user_id)
+        .map(|member| (member.id.server.clone(), member.clone()))
+        .collect()
+}
+
 /// Cache Manager
 impl Cache {
     /// Check whether the current user can view a channel
@@ -261,11 +272,9 @@ impl State {
             )
             .await?;
 
-        self.cache.members = members
-            .iter()
-            .cloned()
-            .map(|x| (x.id.server.clone(), x))
-            .collect();
+        // Voice participants' rows still go out in the payload below, but
+        // never into the cache.
+        self.cache.members = own_memberships(&members, &user.id);
 
         // Fetch customisations.
         let server_ids: Vec<String> = servers.iter().map(|x| x.id.to_string()).collect();
@@ -359,12 +368,10 @@ impl State {
             self.insert_subscription(user.id.clone()).await;
         }
 
+        // Member topics (`{id}u`) are left to `apply_state`, which follows
+        // `cache.servers` for bots and live `Subscribe`s for users.
         for server in &servers {
             self.insert_subscription(server.id.clone()).await;
-
-            if self.cache.is_bot {
-                self.insert_subscription(format!("{}u", server.id)).await;
-            }
         }
 
         for channel in &channels {
@@ -800,10 +807,8 @@ impl State {
             } => {
                 self.insert_subscription(id.clone()).await;
 
-                if self.cache.is_bot {
-                    self.insert_subscription(format!("{}u", id)).await;
-                }
-
+                // A bot's member topic follows from `cache.servers` on the
+                // next `apply_state`.
                 self.cache.servers.insert(id.clone(), server.clone().into());
                 let member = Member {
                     id: MemberCompositeKey {
@@ -859,6 +864,12 @@ impl State {
                     // server that is not.
                     self.drop_server_threads(id).await;
                     self.cache.members.remove(id);
+
+                    // Leave, kick and ban all land here. With the server out
+                    // of the cache the reconcile drops its member topic too;
+                    // this does it directly and forgets the `Subscribe`.
+                    self.active_servers.lock().await.remove(id);
+                    self.remove_member_topic(id);
                 }
             }
             EventV1::ServerDelete { id } => {
@@ -872,6 +883,9 @@ impl State {
                 }
                 self.drop_server_threads(id).await;
                 self.cache.members.remove(id);
+
+                self.active_servers.lock().await.remove(id);
+                self.remove_member_topic(id);
             }
             EventV1::ServerMemberUpdate { id, data, clear } => {
                 if id.user == self.cache.user_id {
@@ -2542,5 +2556,190 @@ mod tests {
                 "{id}: no Redis subscribe: {add:?}"
             );
         }
+    }
+
+    fn membership(server: &str, user: &str, roles: &[&str]) -> Member {
+        Member {
+            id: MemberCompositeKey {
+                server: server.to_string(),
+                user: user.to_string(),
+            },
+            roles: roles.iter().map(|r| r.to_string()).collect(),
+            ..Default::default()
+        }
+    }
+
+    /// Ready appends voice participants' rows to the user's own; the cache
+    /// must keep the user's own row for each server, never a participant's.
+    #[test]
+    fn sec104_own_memberships_ignores_voice_participants() {
+        let members = vec![
+            membership(SERVER_S, SELF_ID, &[]),
+            membership(SERVER_S, OTHER_ID, &[ROLE_R]),
+            membership(SERVER_X, OTHER_ID, &[ROLE_R]),
+        ];
+
+        let cached = super::own_memberships(&members, SELF_ID);
+
+        let own = cached.get(SERVER_S).expect("own row for S");
+        assert_eq!(own.id.user, SELF_ID, "S must map to our own row");
+        assert!(own.roles.is_empty(), "a participant's roles leaked in");
+        assert!(
+            !cached.contains_key(SERVER_X),
+            "a server we are not in must not get a row"
+        );
+        assert_eq!(cached.len(), 1);
+    }
+
+    fn member_topic(server: &str) -> String {
+        format!("{server}u")
+    }
+
+    /// S and X are followed, as after a `Subscribe` for each: both are in
+    /// `active_servers` and both member topics are subscribed.
+    async fn follow_member_events(state: &mut State) {
+        for id in [SERVER_S, SERVER_X] {
+            state
+                .active_servers
+                .lock()
+                .await
+                .touch(id.to_string(), std::time::Instant::now());
+        }
+        state.apply_state().await;
+        assert_member_topics_subscribed(state).await;
+    }
+
+    async fn assert_member_topics_subscribed(state: &State) {
+        let subscribed = state.subscribed.read().await;
+        for id in [SERVER_S, SERVER_X] {
+            assert!(
+                subscribed.contains(&member_topic(id)),
+                "precondition: {id}u subscribed"
+            );
+        }
+    }
+
+    /// After losing S: the event arm itself dropped S's member topic, the
+    /// flush unsubscribes it, and X's stays.
+    async fn assert_member_topic_s_dropped(state: &mut State, case: &str) {
+        assert!(
+            !state.member_topics.contains(&member_topic(SERVER_S)),
+            "{case}: the event must drop S's member topic, not leave it to a reconcile"
+        );
+
+        let (_, remove) = queued_changes(state.apply_state().await);
+        assert!(
+            remove.contains(&member_topic(SERVER_S)),
+            "{case}: Redis must be told to unsubscribe S's member topic: {remove:?}"
+        );
+
+        let subscribed = state.subscribed.read().await;
+        assert!(
+            !subscribed.contains(&member_topic(SERVER_S)),
+            "{case}: S's member topic must be unsubscribed"
+        );
+        assert!(
+            subscribed.contains(&member_topic(SERVER_X)),
+            "{case}: X's member topic must stay"
+        );
+    }
+
+    /// A banned user stops receiving S's member events and S is forgotten
+    /// as a followed server, so a later rejoin starts without it.
+    #[tokio::test]
+    async fn sec007_self_ban_drops_member_topic() {
+        let db = DatabaseInfo::Reference.connect().await.expect("database");
+        let mut state = seeded_state(true).await;
+        follow_member_events(&mut state).await;
+
+        let mut event = self_leave();
+        assert!(state.handle_incoming_event_v1(&db, &mut event).await);
+
+        assert!(
+            !state.active_servers.lock().await.contains(SERVER_S),
+            "a ban must forget the Subscribe for S"
+        );
+        assert!(state.active_servers.lock().await.contains(SERVER_X));
+        assert_member_topic_s_dropped(&mut state, "self ban").await;
+    }
+
+    #[tokio::test]
+    async fn sec007_server_delete_drops_member_topic() {
+        let db = DatabaseInfo::Reference.connect().await.expect("database");
+        let mut state = seeded_state(true).await;
+        follow_member_events(&mut state).await;
+
+        let mut event = EventV1::ServerDelete {
+            id: SERVER_S.to_string(),
+        };
+        assert!(state.handle_incoming_event_v1(&db, &mut event).await);
+
+        assert!(
+            !state.active_servers.lock().await.contains(SERVER_S),
+            "a deleted server must forget the Subscribe for it"
+        );
+        assert!(state.active_servers.lock().await.contains(SERVER_X));
+        assert_member_topic_s_dropped(&mut state, "ServerDelete").await;
+    }
+
+    /// Bots follow every server they are in without `Subscribe`; being
+    /// kicked from one stops its member events.
+    #[tokio::test]
+    async fn sec007_bot_self_leave_drops_member_topic() {
+        let db = DatabaseInfo::Reference.connect().await.expect("database");
+        let mut state = seeded_state(true).await;
+        state.cache.is_bot = true;
+        state.apply_state().await;
+        assert_member_topics_subscribed(&state).await;
+
+        let mut event = EventV1::ServerMemberLeave {
+            id: SERVER_S.to_string(),
+            user: SELF_ID.to_string(),
+            reason: RemovalIntention::Kick,
+        };
+        assert!(state.handle_incoming_event_v1(&db, &mut event).await);
+
+        assert_member_topic_s_dropped(&mut state, "bot kick").await;
+    }
+
+    /// A bot added to a server follows its member events through the
+    /// reconcile, which tracks the topic; `ServerCreate` subscribes no
+    /// `{id}u` itself.
+    #[tokio::test]
+    async fn sec007_bot_server_create_member_topic_comes_from_reconcile() {
+        let db = DatabaseInfo::Reference.connect().await.expect("database");
+        let bot = User {
+            id: SELF_ID.to_string(),
+            username: "bot".to_string(),
+            ..Default::default()
+        };
+        let mut state = State::from(bot, String::new());
+        state.cache.is_bot = true;
+        state.apply_state().await;
+
+        let mut event = EventV1::ServerCreate {
+            id: SERVER_S.to_string(),
+            server: plain_server(SERVER_S, &[TEXT_S]).into(),
+            channels: vec![text_channel(TEXT_S, SERVER_S).into()],
+            emojis: vec![],
+            stickers: vec![],
+            voice_states: vec![],
+        };
+        assert!(state.handle_incoming_event_v1(&db, &mut event).await);
+        assert!(
+            !state
+                .subscribed
+                .read()
+                .await
+                .contains(&member_topic(SERVER_S)),
+            "ServerCreate must leave the member topic to the reconcile"
+        );
+
+        let (add, _) = queued_changes(state.apply_state().await);
+        assert!(
+            add.contains(&member_topic(SERVER_S)),
+            "the flush must subscribe S's member topic: {add:?}"
+        );
+        assert!(state.member_topics.contains(&member_topic(SERVER_S)));
     }
 }

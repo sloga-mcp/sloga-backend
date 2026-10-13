@@ -6,7 +6,7 @@ use tokio::time::sleep;
 use iso8601_timestamp::Timestamp;
 use revolt_database::{
     util::{email::normalise_email, password::assert_safe},
-    Database, EmailVerification, MFATicket,
+    Account, Database, EmailVerification, MFATicket,
 };
 use revolt_models::v0;
 use revolt_result::{create_error, Result};
@@ -39,13 +39,9 @@ pub async fn login(
                 .fetch_account_by_normalised_email(&email_normalised)
                 .await?
             {
-                // Make sure the account has been verified
-                if let EmailVerification::Pending { .. } = account.verification {
-                    return Err(create_error!(UnverifiedAccount));
-                }
-
-                // Make sure password has not been compromised
-                assert_safe(&password).await?;
+                // Verification and password strength are only checked once
+                // the password is proven (below): before that, an existing
+                // email must get the same answer as a missing one
 
                 // Check for account lockout (read-only; a request that
                 // arrives while locked does not extend the lockout)
@@ -75,6 +71,8 @@ pub async fn login(
                     // unconditionally
                     db.set_lockout(&account.id, None).await?;
                     account.lockout = None;
+
+                    assert_login_allowed(&account, &password).await?;
                 } else {
                     // Count only a wrong password: counting a correct one
                     // would lock users out over MFA typos. The lockout is
@@ -84,6 +82,8 @@ pub async fn login(
                         db.bump_lockout_count(&account.id).await?;
                         return Err(err);
                     }
+
+                    assert_login_allowed(&account, &password).await?;
 
                     // Create a new ticket
                     let mut ticket = MFATicket::new(account.id, false);
@@ -179,6 +179,18 @@ pub async fn login(
     Ok(Json(v0::ResponseLogin::Success(
         account.create_session(db, name).await?.into(),
     )))
+}
+
+/// Checks that only an existing account can fail, so they run once its
+/// password is proven
+async fn assert_login_allowed(account: &Account, password: &str) -> Result<()> {
+    // Make sure the account has been verified
+    if let EmailVerification::Pending { .. } = account.verification {
+        return Err(create_error!(UnverifiedAccount));
+    }
+
+    // Make sure password has not been compromised
+    assert_safe(password).await
 }
 
 #[cfg(test)]
@@ -656,5 +668,152 @@ mod tests {
 
         assert_eq!(res.status(), Status::Ok);
         assert!(serde_json::from_str::<v0::Session>(&res.into_string().await.unwrap()).is_ok());
+    }
+
+    /// Status and raw body of an email login
+    async fn sec009_login(harness: &TestHarness, email: &str, password: &str) -> (Status, String) {
+        let res = harness
+            .client
+            .post("/auth/session/login")
+            .header(ContentType::JSON)
+            .body(json!({ "email": email, "password": password }).to_string())
+            .dispatch()
+            .await;
+
+        let status = res.status();
+        (status, res.into_string().await.expect("a response body"))
+    }
+
+    fn sec009_email() -> String {
+        format!("{}@validemail.com", TestHarness::rand_string())
+    }
+
+    /// A fresh account, so no earlier attempt counts toward its lockout
+    async fn sec009_account(
+        harness: &TestHarness,
+        password: &str,
+        pending: bool,
+        totp: bool,
+    ) -> Account {
+        let mut account = Account::new(&harness.db, sec009_email(), password.into(), false)
+            .await
+            .unwrap();
+
+        if pending {
+            account.verification = EmailVerification::Pending {
+                token: "".to_string(),
+                expiry: Timestamp::now_utc(),
+            };
+        }
+
+        if totp {
+            account.mfa.totp_token = Totp::Enabled {
+                secret: "secret".to_string(),
+            };
+        }
+
+        account.save(&harness.db).await.unwrap();
+        account
+    }
+
+    /// The answer for an existing email must equal the answer for a missing
+    /// one, byte for byte
+    async fn sec009_assert_matches_unknown_email(
+        harness: &TestHarness,
+        account: &Account,
+        password: &str,
+    ) {
+        let known = sec009_login(harness, &account.email, password).await;
+        let unknown = sec009_login(harness, &sec009_email(), password).await;
+
+        assert_eq!(known, unknown);
+        assert_eq!(known.0, Status::Unauthorized);
+        assert!(matches!(
+            serde_json::from_str::<Error>(&known.1).unwrap().error_type,
+            ErrorType::InvalidCredentials,
+        ));
+    }
+
+    #[test]
+    fn sec009_wrong_password_matches_unknown_email() {
+        crate::util::test::rt().block_on(async {
+            let harness = TestHarness::new().await;
+            let account = sec009_account(&harness, "password_insecure", false, false).await;
+            sec009_assert_matches_unknown_email(&harness, &account, "wrong_password").await;
+        })
+    }
+
+    #[test]
+    fn sec009_short_password_matches_unknown_email() {
+        crate::util::test::rt().block_on(async {
+            let harness = TestHarness::new().await;
+            let account = sec009_account(&harness, "password_insecure", false, false).await;
+            sec009_assert_matches_unknown_email(&harness, &account, "a").await;
+        })
+    }
+
+    #[test]
+    fn sec009_short_password_with_mfa_matches_unknown_email() {
+        crate::util::test::rt().block_on(async {
+            let harness = TestHarness::new().await;
+            let account = sec009_account(&harness, "password_insecure", false, true).await;
+            sec009_assert_matches_unknown_email(&harness, &account, "a").await;
+        })
+    }
+
+    #[test]
+    fn sec009_unverified_wrong_password_matches_unknown_email() {
+        crate::util::test::rt().block_on(async {
+            let harness = TestHarness::new().await;
+            let account = sec009_account(&harness, "password_insecure", true, false).await;
+            sec009_assert_matches_unknown_email(&harness, &account, "wrong_password").await;
+        })
+    }
+
+    #[test]
+    fn sec009_unverified_right_password_is_still_refused() {
+        crate::util::test::rt().block_on(async {
+            let harness = TestHarness::new().await;
+            let account = sec009_account(&harness, "password_insecure", true, false).await;
+
+            let (status, body) = sec009_login(&harness, &account.email, "password_insecure").await;
+            assert_eq!(status, Status::Forbidden);
+            assert!(matches!(
+                serde_json::from_str::<Error>(&body).unwrap().error_type,
+                ErrorType::UnverifiedAccount,
+            ));
+        })
+    }
+
+    #[test]
+    fn sec009_unverified_right_password_with_mfa_gets_no_ticket() {
+        crate::util::test::rt().block_on(async {
+            let harness = TestHarness::new().await;
+            let account = sec009_account(&harness, "password_insecure", true, true).await;
+
+            let (status, body) = sec009_login(&harness, &account.email, "password_insecure").await;
+            assert_eq!(status, Status::Forbidden);
+            assert!(matches!(
+                serde_json::from_str::<Error>(&body).unwrap().error_type,
+                ErrorType::UnverifiedAccount,
+            ));
+        })
+    }
+
+    #[test]
+    fn sec009_right_short_password_is_still_refused() {
+        crate::util::test::rt().block_on(async {
+            let harness = TestHarness::new().await;
+            // Account::new does not check the password, so an old weak one
+            // can be set up directly
+            let account = sec009_account(&harness, "short", false, false).await;
+
+            let (status, body) = sec009_login(&harness, &account.email, "short").await;
+            assert_eq!(status, Status::BadRequest);
+            assert!(matches!(
+                serde_json::from_str::<Error>(&body).unwrap().error_type,
+                ErrorType::ShortPassword,
+            ));
+        })
     }
 }

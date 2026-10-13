@@ -28,7 +28,6 @@ futures = { workspace = true }
 
 # Web requests
 reqwest = { workspace = true, features = ["json", "stream"] }
-pdk-ip-filter-lib = "1.8.0"
 url = { workspace = true }
 
 # Logging

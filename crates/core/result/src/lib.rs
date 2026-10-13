@@ -36,6 +36,10 @@ pub struct Error {
     pub error_type: ErrorType,
 
     /// Where this error occurred
+    ///
+    /// Never sent to clients (it names source files and lines); kept for
+    /// `Display`, so server logs still carry it
+    #[cfg_attr(feature = "serde", serde(skip_serializing, default))]
     pub location: String,
 }
 
@@ -434,5 +438,80 @@ mod tests {
     fn use_macro_to_construct_complex_error() {
         let error = create_error!(LabelMe);
         assert!(matches!(error.error_type, ErrorType::LabelMe));
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn sec009_serialized_error_has_no_location() {
+        let error = create_error!(InvalidCredentials);
+        assert!(!error.location.is_empty());
+
+        let value = serde_json::to_value(&error).unwrap();
+        assert!(value.get("location").is_none());
+        assert_eq!(value, serde_json::json!({ "type": "InvalidCredentials" }));
+
+        // Logs keep it
+        assert!(error.to_string().contains(&error.location));
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn sec009_serialized_error_with_fields_has_no_location() {
+        let error = create_error!(DatabaseError {
+            operation: "find_one".to_string(),
+            collection: "accounts".to_string(),
+        });
+
+        let value = serde_json::to_value(&error).unwrap();
+        assert!(value.get("location").is_none());
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "type": "DatabaseError",
+                "operation": "find_one",
+                "collection": "accounts",
+            })
+        );
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn sec009_error_without_location_deserializes() {
+        let error = serde_json::from_str::<crate::Error>(r#"{"type":"InvalidCredentials"}"#)
+            .expect("an error body without `location`");
+        assert!(matches!(error.error_type, ErrorType::InvalidCredentials));
+        assert!(error.location.is_empty());
+
+        // Bodies from older servers still carry it, and still parse
+        let error = serde_json::from_str::<crate::Error>(
+            r#"{"type":"InvalidCredentials","location":"src/lib.rs:1:1"}"#,
+        )
+        .expect("an error body with `location`");
+        assert!(matches!(error.error_type, ErrorType::InvalidCredentials));
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn sec009_error_with_fields_round_trips() {
+        let error = create_error!(DatabaseError {
+            operation: "find_one".to_string(),
+            collection: "accounts".to_string(),
+        });
+
+        let body = serde_json::to_string(&error).unwrap();
+        assert!(!body.contains("location"));
+
+        let decoded = serde_json::from_str::<crate::Error>(&body).unwrap();
+        match decoded.error_type {
+            ErrorType::DatabaseError {
+                operation,
+                collection,
+            } => {
+                assert_eq!(operation, "find_one");
+                assert_eq!(collection, "accounts");
+            }
+            other => panic!("unexpected error type {other:?}"),
+        }
+        assert!(decoded.location.is_empty());
     }
 }

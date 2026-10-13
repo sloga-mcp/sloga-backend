@@ -40,3 +40,6 @@ log = { workspace = true }
 axum = { workspace = true, optional = true }
 
 sentry = { workspace = true, optional = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }

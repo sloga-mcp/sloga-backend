@@ -11,6 +11,7 @@ use utoipa_scalar::{Scalar, Servable as ScalarServable};
 
 mod api;
 mod audio;
+mod ip_policy;
 pub mod requests;
 pub mod website_embed;
 

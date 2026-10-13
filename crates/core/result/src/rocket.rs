@@ -170,6 +170,12 @@ impl<'r> Responder<'r, 'static> for Error {
             ErrorType::VideoCallFull { .. } => Status::Conflict,
         };
 
+        // The body no longer carries the location, so log it for server
+        // errors
+        if status.code >= 500 {
+            log::warn!("{self}");
+        }
+
         // Serialize the error data structure into JSON.
         let string = serde_json::to_string(&self).unwrap();
 
