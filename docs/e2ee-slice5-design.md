@@ -179,6 +179,21 @@ contract; the existing hostile-server harness is untouched):
   opportunistic auto-upgrade for groups in v1 (flappy under the
   all-members condition and turns server-influenced state into an upgrade
   trigger).
+- **No local row for the group (2026-10-14)**: when this device has no
+  conversation row for `conversation_id`, two verdicts sit next to
+  Encrypt, Blocked, `peer_downgraded` (§5) and Plaintext:
+  - `group_unconfirmed` — no evidence either way; the device cannot tell
+    a group that was never encrypted from one the other members encrypt.
+  - `group_unestablished` — an authenticated group message for this id
+    reached this device and was rejected as `group_not_established`
+    (§2.1); the group is encrypted elsewhere and this device has no pin.
+  The native verdict for a rowless group is Plaintext only after this
+  device's own recorded acknowledgment (§2.5 step 4), or when the install
+  has no E2EE account at all (the documented gap, §4). The client may
+  also send plaintext for `group_unconfirmed` when the server's device
+  listings prove nobody else could be encrypting (§2.5 step 4);
+  `group_unestablished` always asks. A row, when present, always wins;
+  these verdicts never apply to a pinned conversation.
 
 `encrypt_group(conversation_id, content, attachment_ids, bundles)`:
 
@@ -237,9 +252,66 @@ device is enabled+published and the group is within the member cap. Flow:
    - the enable renders as a PROMINENT attributed event ("X enabled
      encryption for this group with these N members: …"), not a subtle
      marker row — the receiver sees who asserted what.
-   Server channel state is then only a diff/display input (§2.3). A
-   receiver that never gets `group_enable` simply keeps treating the
-   group as plaintext — safe direction, visible (no lock).
+   Server channel state is then only a diff/display input (§2.3).
+
+   **A device with no row for the group (fail-closed; the "safe
+   direction" stance below is WITHDRAWN 2026-10-14, user decision):** a
+   device with no local conversation row for a group no longer reads it
+   as plaintext. The withdrawn stance let a device that had lost or never
+   received the group's state post server-readable plaintext into a
+   group the other members encrypt, where their devices drop it: a leak
+   and a silent non-delivery at once. That breaks security invariant 1
+   in `docs/e2ee-implementation-plan.md` (no silent plaintext into an
+   encrypted conversation). Instead:
+   - Native `send_mode_group` returns `group_unconfirmed` (no evidence)
+     or `group_unestablished` (an authenticated group message for that
+     id reached this device and was rejected as `group_not_established`,
+     §2.1). The evidence lives in a local `group_evidence` table keyed by
+     the authenticated `conv`. It is not a pin, creates no conversation
+     row, and is not backed up, so after a restore a rowless group starts
+     again at `group_unconfirmed`. Creating the row (enabling locally, or
+     a valid inbound `group_enable`) clears it.
+   - The client sends plaintext without asking only when the server's
+     device listings prove that no other member — and none of the user's
+     own other devices — has an E2EE device, and it re-reads the native
+     verdict immediately before the send. A listing that fails, is rate
+     limited, or is skipped because the group is too large counts as not
+     proven.
+   - Otherwise it asks once per group per device, with stronger copy for
+     `group_unestablished`, and records the answer natively with
+     `e2ee_acknowledge_group_plaintext`; the verdict is then Plaintext.
+     The ack is refused when a row of any kind exists, so it can never
+     move an established group, or a dm, toward plaintext. An
+     `unconfirmed` ack is also refused once evidence has arrived that the
+     user never saw. New evidence from a binding-verified sender device
+     (identity unchanged) re-arms the prompt after an ack; evidence from a
+     TOFU-only sender does not.
+
+   ~~A receiver that never gets `group_enable` simply keeps treating the
+   group as plaintext — safe direction, visible (no lock).~~
+   *(Kept for history; superseded by the rowless-group verdicts above.)*
+
+**Threat model for the rowless-group verdicts (2026-10-14).** They
+protect against an honest server combined with client state loss: a new
+own device, a wiped or reinstalled store, a device that missed
+`group_enable`, or a member added without an Include (§2.3). They do not
+stop a malicious server. For any device that has no row for the group —
+a fresh device, or one the server never delivered `group_enable` to — a
+malicious server can still make the proof pass (empty device listings,
+the group's `group_enable` and encrypted traffic withheld); only a
+pinned group row resists that. Server-sourced signals therefore only
+ever skip a prompt: they never create, change or clear an existing row,
+so a group this device has pinned keeps its sticky verdict whatever the
+server says (§2.4). Accepted residual: any binding-verified contact,
+even one outside the group, can re-arm the `group_unestablished` prompt
+after an ack by naming the group id, since a rowless device has no
+roster to scope evidence by. That is consent fatigue in the safe
+direction: it only ever adds a prompt, never removes one. Every ordinary
+plaintext group with any E2EE-using member also prompts once per device,
+and again on each new device and after a restore, because neither
+evidence nor acks are backed up. Web and un-enrolled native installs
+remain the documented gap (web: §4; a native install that never enabled
+E2EE holds no keys or pins and is in the same position).
 
 ### 2.6 Server changes (group scope) [G: 4]
 
