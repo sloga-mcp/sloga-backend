@@ -54,6 +54,11 @@ impl IntoResponse for Error {
             ErrorType::AlreadyInServer => StatusCode::CONFLICT,
             ErrorType::CannotTimeoutYourself => StatusCode::BAD_REQUEST,
             ErrorType::ImportAlreadyInProgress => StatusCode::CONFLICT,
+            ErrorType::ImportSourceNotFound => StatusCode::NOT_FOUND,
+            ErrorType::ImportVerificationMissing => StatusCode::FORBIDDEN,
+            ErrorType::ImportBotNotInServer => StatusCode::NOT_FOUND,
+            ErrorType::ImportUpstreamUnavailable => StatusCode::SERVICE_UNAVAILABLE,
+            ErrorType::ImportSourceUnavailable => StatusCode::BAD_REQUEST,
 
             ErrorType::TooManyServers { .. } => StatusCode::BAD_REQUEST,
             ErrorType::TooManyEmbeds { .. } => StatusCode::BAD_REQUEST,
@@ -172,5 +177,29 @@ impl IntoResponse for Error {
         }
 
         (status, Json(&self)).into_response()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::response::IntoResponse;
+
+    use crate::{create_error, Error};
+
+    /// Pins the import errors' statuses; `rocket.rs` pins the same table
+    #[test]
+    fn import_error_statuses() {
+        let cases: [(Error, u16); 5] = [
+            (create_error!(ImportSourceNotFound), 404),
+            (create_error!(ImportVerificationMissing), 403),
+            (create_error!(ImportBotNotInServer), 404),
+            (create_error!(ImportUpstreamUnavailable), 503),
+            (create_error!(ImportSourceUnavailable), 400),
+        ];
+
+        for (error, code) in cases {
+            let name = format!("{:?}", error.error_type);
+            assert_eq!(error.into_response().status().as_u16(), code, "{name}");
+        }
     }
 }

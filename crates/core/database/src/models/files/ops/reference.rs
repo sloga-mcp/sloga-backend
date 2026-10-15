@@ -166,6 +166,26 @@ impl AbstractAttachments for ReferenceDb {
         Ok(())
     }
 
+    /// Mark every attachment used by one of `used_for_ids` as deleted.
+    async fn delete_attachments_used_by(&self, used_for_ids: &[String]) -> Result<()> {
+        if used_for_ids.is_empty() {
+            return Ok(());
+        }
+
+        let mut files = self.files.lock().await;
+        for file in files.values_mut() {
+            if file
+                .used_for
+                .as_ref()
+                .is_some_and(|used_for| used_for_ids.contains(&used_for.id))
+            {
+                file.deleted = Some(true);
+            }
+        }
+
+        Ok(())
+    }
+
     /// Delete the attachment entry.
     async fn delete_attachment(&self, id: &str) -> Result<()> {
         let mut files = self.files.lock().await;

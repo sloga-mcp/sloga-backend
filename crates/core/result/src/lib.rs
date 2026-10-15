@@ -130,6 +130,21 @@ pub enum ErrorType {
     },
     /// A server import is already queued or running for this user
     ImportAlreadyInProgress,
+    /// The server, space or invite named as the import source does not exist
+    /// on the source platform
+    ImportSourceNotFound,
+    /// The caller has not proven they own the source server (no accepted
+    /// challenge code was found on it)
+    ImportVerificationMissing,
+    /// The import bot cannot see the source server (it has not been added,
+    /// or was removed)
+    ImportBotNotInServer,
+    /// The source platform failed, timed out or rate limited the request;
+    /// retry later
+    ImportUpstreamUnavailable,
+    /// Importing from this source is turned off or not configured on this
+    /// instance
+    ImportSourceUnavailable,
     TooManyEmoji {
         max: usize,
     },

@@ -2,9 +2,9 @@ use iso8601_timestamp::Timestamp;
 use revolt_result::Result;
 
 use crate::ReferenceDb;
-use crate::{DiscordImportJob, ImportStatus};
+use crate::{DiscordImportJob, ImportJobKind, ImportStatus};
 
-use super::AbstractDiscordImportJobs;
+use super::{unleft_cutoff, AbstractDiscordImportJobs};
 
 #[async_trait]
 impl AbstractDiscordImportJobs for ReferenceDb {
@@ -117,5 +117,60 @@ impl AbstractDiscordImportJobs for ReferenceDb {
             .filter(|row| row.is_active() && row.updated_at < cutoff)
             .cloned()
             .collect())
+    }
+
+    /// Whether another in-flight job of this kind targets the same source.
+    async fn has_other_active_job_for_source(
+        &self,
+        kind: &ImportJobKind,
+        source_server_id: &str,
+        except_job_id: &str,
+    ) -> Result<bool> {
+        let rows = self.discord_import_jobs.lock().await;
+        Ok(rows.values().any(|row| {
+            row.id != except_job_id
+                && &row.kind == kind
+                && row.source_server_id.as_deref() == Some(source_server_id)
+                // Same active set as the Mongo `active_statuses()` filter.
+                && row.is_active()
+        }))
+    }
+
+    /// Terminal source-kind jobs whose bot has not left the source yet.
+    async fn fetch_unleft_terminal_source_jobs(
+        &self,
+        max_age_days: i64,
+        limit: i64,
+    ) -> Result<Vec<DiscordImportJob>> {
+        if limit <= 0 {
+            return Ok(vec![]);
+        }
+
+        let cutoff = unleft_cutoff(max_age_days);
+        let rows = self.discord_import_jobs.lock().await;
+        let mut matched: Vec<DiscordImportJob> = rows
+            .values()
+            .filter(|row| {
+                row.kind.is_source()
+                    && !row.is_active()
+                    && !row.source_left
+                    && row.updated_at >= cutoff
+            })
+            .cloned()
+            .collect();
+
+        // Oldest first, like Mongo's `_id` sort.
+        matched.sort_by(|a, b| a.id.cmp(&b.id));
+        matched.truncate(limit as usize);
+        Ok(matched)
+    }
+
+    /// Record that the bot has left this job's source.
+    async fn mark_source_left(&self, id: &str) -> Result<()> {
+        let mut rows = self.discord_import_jobs.lock().await;
+        if let Some(row) = rows.get_mut(id) {
+            row.source_left = true;
+        }
+        Ok(())
     }
 }

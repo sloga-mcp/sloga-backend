@@ -19,9 +19,13 @@ auto_derived!(
 
     /// Coarse progress stage, surfaced to the user as a progress label.
     ///
-    /// Ordered as the worker walks them: fetch the Discord template, create
-    /// the server, recreate roles, recreate categories/channels, join the
-    /// owner, mint the invite, done.
+    /// Ordered as the worker walks them: fetch the source (Discord template,
+    /// or a Stoat/Fluxer/Matrix server), verify ownership (source kinds
+    /// only), create the server, recreate roles, recreate
+    /// categories/channels, attach icon/banner/emojis (source kinds only),
+    /// join the owner, mint the invite, done. Declaration order is
+    /// documentation only — nothing derives `Ord` or maps a stage to a
+    /// percentage server-side.
     ///
     /// Variants are ADDITIVE — clients treat the wire value as an opaque
     /// label precisely so a stage introduced by a later slice cannot break a
@@ -29,11 +33,22 @@ auto_derived!(
     /// deserializing.
     pub enum ImportStage {
         Fetching,
+        /// Source kinds only: the fetched source is checked against the
+        /// job's stored `challenge_code` (a comparison, not a second
+        /// request).
+        ///
+        /// Also the stage a source-kind job is BORN at — see
+        /// `DiscordImportJob::new_source` for why it is not `Fetching`.
+        Verifying,
         Server,
         /// Roles are created before channels because per-channel permission
         /// overwrites are keyed by role id.
         Roles,
         Channels,
+        /// Source kinds only: icon, banner and emojis. Runs before
+        /// `Membership` because `ServerCreate` snapshots the in-memory
+        /// server when the owner joins.
+        Assets,
         Membership,
         Invite,
         /// The whole life of a sticker-import job. DELIBERATELY set at
@@ -52,11 +67,31 @@ auto_derived!(
     ///
     /// `#[serde(default)]` on the field means every pre-slice-2 row reads
     /// as `Template`, which is what they all are.
+    ///
+    /// The three source kinds were added together (one schema change, so
+    /// old binaries break on new rows once, not once per source). Any
+    /// binary built before them — slice 2 or later — fails to decode a
+    /// source-kind row on its `kind` alone (unknown variant), so it can
+    /// never misread one as a template import. Pre-slice-2 binaries ignore
+    /// `kind` entirely; for them the guard is the birth stage
+    /// (`ImportStage::Verifying`), exactly as `Stickers` relies on its
+    /// stage. Decoding failing is NOT a clean refusal on MongoDB, though:
+    /// an old crond's claim flips the row to `Running` BEFORE decoding it,
+    /// and an old sweeper silently skips rows it cannot decode, so the row
+    /// sits `Running` until a current crond's sweeper reaps it. Before
+    /// rolling crond back below these kinds, fail or delete every
+    /// source-kind row.
     #[derive(Default)]
     pub enum ImportJobKind {
         #[default]
         Template,
         Stickers,
+        /// A Stoat server, read by the operator bot the user added to it
+        StoatServer,
+        /// A Fluxer guild, read by the operator bot the user added to it
+        FluxerServer,
+        /// A Matrix space, read by the operator account the user invited
+        MatrixSpace,
     }
 
     /// What the import actually did — shown once on completion.
@@ -121,6 +156,11 @@ auto_derived!(
         /// re-import, and the mixed-binary hazard this slice closes was
         /// precisely an old worker running a template import off a sticker
         /// row.
+        ///
+        /// On source-kind jobs (`StoatServer`, `FluxerServer`,
+        /// `MatrixSpace`) this holds the source string the user pasted
+        /// (invite link, server id, space alias), kept for display and
+        /// support. Workers act on `source_server_id`, never on this.
         pub template_code: String,
         /// What kind of work this is. Pre-slice-2 rows deserialize as
         /// `Template`, which is what they all are.
@@ -167,6 +207,26 @@ auto_derived!(
         /// What the import did, populated on completion
         #[serde(skip_serializing_if = "Option::is_none")]
         pub summary: Option<DiscordImportSummary>,
+        /// Source-kind jobs: the id of the server/guild/space being
+        /// imported (resolved by delta at request time for Stoat and Fluxer;
+        /// by crond for Matrix, where delta never contacts the homeserver).
+        /// `None` on template and sticker jobs (they use
+        /// `source_guild_id`). Keys the "is another job still using this
+        /// source" check that decides whether the bot may leave.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub source_server_id: Option<String>,
+        /// Source-kind jobs: the ownership-challenge code delta matched at
+        /// request time. The worker compares the source against THIS,
+        /// never against a recomputation (the day may have rolled over).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub challenge_code: Option<String>,
+        /// Source-kind jobs: whether the operator bot has left the source
+        /// after the job reached a terminal state. Persist it with
+        /// `mark_source_left` (a targeted write — `save_*_if_active` refuses
+        /// terminal rows by design); the sweeper retries the leave while
+        /// this is false. Absent on every older row, which reads as `false`.
+        #[serde(default, skip_serializing_if = "crate::if_false")]
+        pub source_left: bool,
     }
 );
 
@@ -195,9 +255,11 @@ impl ImportStage {
     pub fn as_variant_str(&self) -> &'static str {
         match self {
             ImportStage::Fetching => "Fetching",
+            ImportStage::Verifying => "Verifying",
             ImportStage::Server => "Server",
             ImportStage::Roles => "Roles",
             ImportStage::Channels => "Channels",
+            ImportStage::Assets => "Assets",
             ImportStage::Membership => "Membership",
             ImportStage::Invite => "Invite",
             ImportStage::Stickers => "Stickers",
@@ -214,6 +276,46 @@ impl ImportJobKind {
         match self {
             ImportJobKind::Template => "Template",
             ImportJobKind::Stickers => "Stickers",
+            ImportJobKind::StoatServer => "StoatServer",
+            ImportJobKind::FluxerServer => "FluxerServer",
+            ImportJobKind::MatrixSpace => "MatrixSpace",
+        }
+    }
+
+    /// The kinds that read a third-party source through an operator bot
+    /// account — the ones with `source_server_id` / `challenge_code`, and
+    /// whose bot must leave the source once the job is terminal.
+    ///
+    /// Must agree with `is_source`; a test pins it.
+    pub const SOURCE_KINDS: [ImportJobKind; 3] = [
+        ImportJobKind::StoatServer,
+        ImportJobKind::FluxerServer,
+        ImportJobKind::MatrixSpace,
+    ];
+
+    /// Whether this kind reads a third-party source through an operator
+    /// bot account (see `SOURCE_KINDS`).
+    pub fn is_source(&self) -> bool {
+        match self {
+            ImportJobKind::Template | ImportJobKind::Stickers => false,
+            ImportJobKind::StoatServer
+            | ImportJobKind::FluxerServer
+            | ImportJobKind::MatrixSpace => true,
+        }
+    }
+
+    /// Whether this kind CREATES a server — and therefore owns it, so a
+    /// failed or reaped job may roll it back.
+    ///
+    /// `Stickers` is false on purpose: its `server_id` is a live server the
+    /// user already had, which it must never delete.
+    pub fn builds_server(&self) -> bool {
+        match self {
+            ImportJobKind::Template
+            | ImportJobKind::StoatServer
+            | ImportJobKind::FluxerServer
+            | ImportJobKind::MatrixSpace => true,
+            ImportJobKind::Stickers => false,
         }
     }
 }
@@ -241,6 +343,63 @@ impl DiscordImportJob {
             invite_code: None,
             error: None,
             summary: None,
+            source_server_id: None,
+            challenge_code: None,
+            source_left: false,
+        }
+    }
+
+    /// Create a fresh queued source-kind job (`StoatServer`,
+    /// `FluxerServer`, `MatrixSpace`).
+    ///
+    /// `source` is the string the user pasted, stored in `template_code`
+    /// for display; `source_server_id` and `challenge_code` are what delta
+    /// resolved and verified, and what the worker acts on.
+    ///
+    /// Born at `stage: Verifying`, NOT `Fetching` — the `Stickers`
+    /// precedent. Binaries from slice 2 on already refuse the row on its
+    /// unknown `kind`, but pre-slice-2 binaries ignore `kind` and would
+    /// read a `Fetching` row as a template import of the pasted string; a
+    /// bare invite code can be a syntactically valid Discord template
+    /// code. A stage they cannot parse makes the row illegible to them
+    /// too. The worker moves the stage on from its first progress write.
+    ///
+    /// PANICS on `Template` or `Stickers`: building one of those through
+    /// this constructor would mint a mis-kinded row (a template job born
+    /// at a stage its worker never expects, or a sticker job with no
+    /// parent), and refusing loudly is the fail-closed outcome. Callers
+    /// derive `kind` from the route, never from the request body.
+    pub fn new_source(
+        user_id: String,
+        kind: ImportJobKind,
+        source: String,
+        source_server_id: Option<String>,
+        challenge_code: Option<String>,
+    ) -> DiscordImportJob {
+        assert!(
+            kind.is_source(),
+            "DiscordImportJob::new_source called with non-source kind {kind:?}"
+        );
+
+        DiscordImportJob {
+            id: ulid::Ulid::new().to_string(),
+            user_id,
+            template_code: source,
+            kind,
+            source_guild_id: None,
+            parent_job_id: None,
+            status: ImportStatus::Queued,
+            stage: ImportStage::Verifying,
+            done: 0,
+            total: 0,
+            updated_at: Timestamp::now_utc(),
+            server_id: None,
+            invite_code: None,
+            error: None,
+            summary: None,
+            source_server_id,
+            challenge_code,
+            source_left: false,
         }
     }
 
@@ -271,6 +430,9 @@ impl DiscordImportJob {
             invite_code: None,
             error: None,
             summary: None,
+            source_server_id: None,
+            challenge_code: None,
+            source_left: false,
         }
     }
 
@@ -351,5 +513,137 @@ mod tests {
         let wire = serde_json::to_value(&job).unwrap();
         assert_eq!(wire["stage"], "Stickers");
         assert_eq!(wire["template_code"], "");
+    }
+
+    /// Every row written before the source kinds lacks `source_server_id`,
+    /// `challenge_code` and `source_left`; they must read back as their
+    /// defaults (`source_left: false` is what puts nothing old into the
+    /// leave-retry scan — that scan also filters on kind).
+    #[test]
+    fn pre_source_rows_deserialize_with_defaults() {
+        let stored = r#"{
+            "_id": "01JOB0000000000000000000000",
+            "user_id": "01USER000000000000000000000",
+            "template_code": "abc123",
+            "kind": "Stickers",
+            "parent_job_id": "01JOB0000000000000000000001",
+            "status": "Failed",
+            "stage": "Stickers",
+            "done": 0,
+            "total": 0,
+            "updated_at": "2026-09-26T00:00:00Z"
+        }"#;
+
+        let job: DiscordImportJob = serde_json::from_str(stored).unwrap();
+        assert_eq!(job.source_server_id, None);
+        assert_eq!(job.challenge_code, None);
+        assert!(!job.source_left);
+    }
+
+    /// Wire strings are the variant names — the contract the crond
+    /// dispatch, delta's DTO and the client `stageLabel` all key on — and
+    /// `as_variant_str` (used in Mongo filters) agrees with serde for every
+    /// new variant, both directions.
+    #[test]
+    fn new_kinds_and_stages_round_trip_as_variant_names() {
+        for (kind, name) in [
+            (ImportJobKind::StoatServer, "StoatServer"),
+            (ImportJobKind::FluxerServer, "FluxerServer"),
+            (ImportJobKind::MatrixSpace, "MatrixSpace"),
+        ] {
+            assert_eq!(kind.as_variant_str(), name);
+            assert_eq!(serde_json::to_value(&kind).unwrap(), name);
+            let back: ImportJobKind = serde_json::from_value(name.into()).unwrap();
+            assert_eq!(back, kind);
+        }
+
+        for (stage, name) in [
+            (ImportStage::Verifying, "Verifying"),
+            (ImportStage::Assets, "Assets"),
+        ] {
+            assert_eq!(stage.as_variant_str(), name);
+            assert_eq!(serde_json::to_value(&stage).unwrap(), name);
+            let back: ImportStage = serde_json::from_value(name.into()).unwrap();
+            assert_eq!(back, stage);
+        }
+    }
+
+    /// `builds_server` gates server rollback: true for every kind that
+    /// creates a server, false for `Stickers` (its server is a live one the
+    /// user already owned). `SOURCE_KINDS` and `is_source` must agree.
+    #[test]
+    fn kind_classification() {
+        assert!(ImportJobKind::Template.builds_server());
+        assert!(!ImportJobKind::Stickers.builds_server());
+        assert!(!ImportJobKind::Template.is_source());
+        assert!(!ImportJobKind::Stickers.is_source());
+
+        for kind in ImportJobKind::SOURCE_KINDS {
+            assert!(kind.is_source(), "{kind:?} listed but not is_source");
+            assert!(kind.builds_server(), "{kind:?} must own its server");
+        }
+        assert_eq!(
+            ImportJobKind::SOURCE_KINDS
+                .iter()
+                .filter(|kind| kind.is_source())
+                .count(),
+            3
+        );
+    }
+
+    /// Birth invariants of a source job, and the wire shape: `source_left`
+    /// is omitted while false (so a fresh row looks exactly like an old
+    /// one to the `$ne: true` filter) and written once true.
+    #[test]
+    fn source_jobs_are_born_at_verifying() {
+        let mut job = DiscordImportJob::new_source(
+            "01USER000000000000000000000".to_string(),
+            ImportJobKind::StoatServer,
+            "https://stoat.chat/invite/AbCdEf12".to_string(),
+            Some("01SRCSERVER0000000000000000".to_string()),
+            Some("sloga-import-ABCDEFGH".to_string()),
+        );
+        assert_eq!(job.kind, ImportJobKind::StoatServer);
+        assert_eq!(job.status, ImportStatus::Queued);
+        assert_eq!(job.stage, ImportStage::Verifying);
+        assert_eq!(job.template_code, "https://stoat.chat/invite/AbCdEf12");
+        assert_eq!(job.source_guild_id, None);
+        assert_eq!(job.parent_job_id, None);
+        assert!(!job.source_left);
+
+        let wire = serde_json::to_value(&job).unwrap();
+        assert_eq!(wire["kind"], "StoatServer");
+        assert_eq!(wire["stage"], "Verifying");
+        assert_eq!(wire["source_server_id"], "01SRCSERVER0000000000000000");
+        assert_eq!(wire["challenge_code"], "sloga-import-ABCDEFGH");
+        assert!(wire.get("source_left").is_none());
+
+        job.source_left = true;
+        let wire = serde_json::to_value(&job).unwrap();
+        assert_eq!(wire["source_left"], true);
+    }
+
+    #[test]
+    #[should_panic(expected = "non-source kind")]
+    fn new_source_refuses_template_kind() {
+        DiscordImportJob::new_source(
+            "01USER000000000000000000000".to_string(),
+            ImportJobKind::Template,
+            "abc123".to_string(),
+            None,
+            None,
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "non-source kind")]
+    fn new_source_refuses_stickers_kind() {
+        DiscordImportJob::new_source(
+            "01USER000000000000000000000".to_string(),
+            ImportJobKind::Stickers,
+            String::new(),
+            None,
+            None,
+        );
     }
 }
