@@ -128,6 +128,8 @@ Control =
   no-server-input send_mode property. Roster SHRINKS may additionally
   follow server state (loud marker) because wrongly shrinking is
   availability-only, in the safe direction (§2.3).
+  **(2026-10-15)** "Explicit local user action" means a human click on
+  a native OS dialog (§2.5 step 3), never a call from the webview alone.
 
 ### 2.3 Roster changes (loud, locally pinned)
 
@@ -144,7 +146,9 @@ recipients; the native layer diffs against the pinned roster:
   pinned roster (an unpinned announced member does not wedge the group;
   the banner is the honesty mechanism). [G: 2 — no silent expansion; G: 8
   — the checklist gap closes because the pin, not the server list, is the
-  audience.]
+  audience.] The Include confirm is a NATIVE dialog (2026-10-15, §2.5
+  step 3); a declined Include writes nothing and the member stays
+  `announced`.
 - **Pinned member added to audience** (`roster_add` received or local
   Include): marker `member_added`; bundle fetched, signature-verified,
   pinned; if they have no valid keys the group send mode becomes
@@ -232,11 +236,89 @@ device is enabled+published and the group is within the member cap. Flow:
    count the user is asserting** — the confirm copy says "you are
    encrypting to exactly these N people; check this list against the
    member list you expect" [G: 8 — the roster assertion is the security
-   decision and it is the ENABLER's, made visible].
+   decision and it is the ENABLER's, made visible]. Since 2026-10-15 the
+   list and count the user confirms are the native dialog's (step 3),
+   built from native state.
 3. On all-✓ + blocking confirm: single store transaction sets
    `encrypted_since`, pins the roster as the audience, records the
    `encryption_enabled` marker; then the `group_enable` control message
    (carrying that roster) is sent through the normal atomic encrypt path.
+
+   **The blocking confirm is native, and the commit is checked
+   (2026-10-15).** The encrypt audience grows only through an
+   authenticated control message from a pinned member, or through an
+   explicit local user action (§2.2). The confirm makes that local action
+   a human click on a native OS dialog rather than a webview call: a
+   compromised webview can ask for a growth, but it cannot draw, dismiss
+   or answer the dialog that allows it.
+   - **What prompts:** every change that widens who can read an
+     encrypted group — enable, re-enable after a downgrade, Include
+     (§2.3), and a re-send of the member list with no matching consent
+     record (below).
+   - **Where it runs:** on desktop (Tauri and Electron), through core's
+     `ShellEngine`, which owns the copy; the shell only shows the dialog
+     and returns the button. On Android, a Kotlin `AlertDialog` shows
+     copy the core wrote (the uniffi preview returns it) and carries no
+     strings of its own. iOS has no native E2EE layer and behaves as the
+     web client (§4).
+   - **What the dialog shows**, all from native state except the names:
+     "You (id)" first, then every other member who will be able to read
+     new messages, each with the raw id, a "(new)" tag if they are
+     joining the audience, and this device's verification status for
+     their keys ("verified by you", "not verified", "no keys on this
+     device yet"); and the count. A re-enable that drops members also
+     lists them, as people who "will stop receiving new messages". Every
+     growth dialog says the names come from the app and the server and
+     are not verified. A re-send has its own title and copy, because it
+     re-adds anyone on the list who was removed on another device.
+   - **Preview, then checked commit:** native computes what the change
+     does, writing nothing about the group; the user confirms; the commit
+     re-runs the preview under the engine lock and refuses
+     `roster_changed` when a dialog was needed and not shown, or when the
+     roster it would assert names anyone the dialog did not show. A
+     shrink in between is allowed (safe direction). A refused or declined
+     change writes nothing about the group: no row, marker or consent
+     record.
+   - **Enable on an already-encrypted group** is only a retry: allowed
+     when the roster equals the group's current Active set, refused
+     `roster_mismatch` otherwise. An encrypted group grows only through
+     Include.
+   - **Re-enable after a downgrade** sets the audience to EXACTLY the
+     shown list. Active members outside it become `removed`, with
+     `member_removed` markers; members newly active get `member_added`
+     markers; `announced` rows stay `announced`. This is what receivers
+     apply when the `group_enable` replaces their roster.
+   - **Consent record:** a retry of a change the user already confirmed
+     on this device (an enable retry, or an Include of someone already
+     active) skips the dialog only while an in-memory record of exactly
+     that audience exists. The record is written after a confirmed
+     commit, and cleared when the control message's envelopes commit, on
+     a downgrade, and on any other change to that group's Active set,
+     local or inbound. It is not persisted: after a restart, the retry
+     prompts again.
+   - **Self binding:** the dialog lists the audience minus self, so the
+     self id it is given must be this device's own. The store records
+     which account it belongs to in two places: the owner of its MLS
+     credential, and a one-row self record learned on first ordinary use
+     (a send, a reconcile, MLS key creation) or, failing that, at the
+     first growth. Growth refuses a self id that disagrees with the
+     record, and refuses outright when the two records disagree. For
+     every change except a fresh enable (no local row for the group),
+     growth also requires self to already be an Active member.
+   - **Checked before any dialog:** the device is enabled and published;
+     every id is ULID-shaped (checked by the desktop shell and the
+     Android bridge, which render ids); an enable's roster includes self;
+     the audience has 2 to `MAX_E2EE_GROUP_MEMBERS` members; Include needs an
+     encrypted group row with no pending peer downgrade. A device with no
+     E2EE store answers "not enabled" and creates none.
+   - **Rate:** one growth request at a time (a second is `busy`, with no
+     dialog). A decline locks that group's growth prompts for 30 s
+     (`busy`, no dialog); consented retries are unaffected. On Android
+     the confirm button stays disabled for a short delay after the
+     dialog appears, and the buttons ignore touches while another window
+     covers the dialog. Cancel, back, an outside tap and activity
+     teardown all decline.
+
 4. Receivers: decrypt `group_enable` from an authenticated (TOFU-pinned)
    sender → pin conversation as `kind=group`, sticky `encrypted_since`,
    roster = the ASSERTED roster [G: 2], with three acceptance conditions
@@ -312,6 +394,45 @@ and again on each new device and after a restore, because neither
 evidence nor acks are backed up. Web and un-enrolled native installs
 remain the documented gap (web: §4; a native install that never enabled
 E2EE holds no keys or pins and is in the same position).
+
+**Threat model for the native growth confirm (2026-10-15).** It protects
+against a compromised webview (an XSS, for example) that asks the
+native layer to widen an encrypted group's audience. With it,
+growing the set of MEMBERS on other members' devices takes a human click
+on a dialog the webview cannot draw, dismiss or answer. Native code
+writes the "You (id)" line, every member id, the count, the new and
+removed members and each member's verification status, and the commit
+cannot assert anyone the dialog did not show. What it cannot prove:
+- **Names.** They come from the app and the server and are not
+  verified; a compromised webview can put a friend's name on a
+  stranger's id. The raw id on every line, and copy that says the names
+  are unverified, are what the user has to check against.
+- **Which group, and how often.** The webview chooses which group it
+  asks about, and it can keep asking; the 30 s decline lockout and the
+  one-at-a-time rule bound the rate, not the intent.
+- **Devices.** The dialog covers members, not devices. Bundles the
+  webview supplies can still pin new devices for members already in the
+  audience; device-level trust is the existing identity-change and
+  verification flow (§3).
+- **What the webview already sees.** A compromised webview still reads
+  whatever it renders; the confirm only bounds who ELSE can read.
+
+Accepted residuals:
+- **First use of the self record.** A store with no record yet learns
+  its owner from the first id it is given. A wrong id learned that way
+  can hide one member only in a fresh enable, since every other change
+  requires self to already be Active; there, the dialog's "You (id)"
+  line is the only signal. After that, growth with the real id fails
+  closed.
+- **A second account on a shared install** (logout does not wipe the
+  store): its ordinary use keeps working, but its growth calls fail
+  closed, as do the first account's once the two ownership records
+  disagree, until the store is reset.
+- **Include ordering.** The native commit does not reconcile the group
+  against the displayed member list. A member removed from the group
+  while the dialog is open is still shown in it; if the user confirms,
+  the full-roster `group_enable` re-adds them, loudly, on receivers
+  until their next reconcile removes them again.
 
 ### 2.6 Server changes (group scope) [G: 4]
 
