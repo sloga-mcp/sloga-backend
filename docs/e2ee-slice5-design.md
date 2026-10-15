@@ -147,8 +147,8 @@ recipients; the native layer diffs against the pinned roster:
   the banner is the honesty mechanism). [G: 2 — no silent expansion; G: 8
   — the checklist gap closes because the pin, not the server list, is the
   audience.] The Include confirm is a NATIVE dialog (2026-10-15, §2.5
-  step 3); a declined Include writes nothing and the member stays
-  `announced`.
+  step 3); a declined Include writes nothing about the group and the
+  member stays `announced`.
 - **Pinned member added to audience** (`roster_add` received or local
   Include): marker `member_added`; bundle fetched, signature-verified,
   pinned; if they have no valid keys the group send mode becomes
@@ -261,16 +261,17 @@ device is enabled+published and the group is within the member cap. Flow:
      copy the core wrote (the uniffi preview returns it) and carries no
      strings of its own. iOS has no native E2EE layer and behaves as the
      web client (§4).
-   - **What the dialog shows**, all from native state except the names:
-     "You (id)" first, then every other member who will be able to read
-     new messages, each with the raw id, a "(new)" tag if they are
-     joining the audience, and this device's verification status for
-     their keys ("verified by you", "not verified", "no keys on this
-     device yet"); and the count. A re-enable that drops members also
-     lists them, as people who "will stop receiving new messages". Every
-     growth dialog says the names come from the app and the server and
-     are not verified. A re-send has its own title and copy, because it
-     re-adds anyone on the list who was removed on another device.
+   - **What the dialog shows:** "You (id)" first, then every other
+     member who will be able to read new messages, each with the raw id,
+     a "(new)" tag if they are joining the audience, and a trust label
+     for their keys on this device ("verified by you", "not verified",
+     "no keys on this device yet"); and the count. The ids, the count
+     and the new and removed marks come from native state. A re-enable
+     that drops members also lists them, as people who "will stop
+     receiving new messages". Every growth dialog says the names come
+     from the app and the server and are not verified. A re-send has its
+     own title and copy, because it re-adds anyone on the list who was
+     removed on another device.
    - **Preview, then checked commit:** native computes what the change
      does, writing nothing about the group; the user confirms; the commit
      re-runs the preview under the engine lock and refuses
@@ -400,9 +401,9 @@ against a compromised webview (an XSS, for example) that asks the
 native layer to widen an encrypted group's audience. With it,
 growing the set of MEMBERS on other members' devices takes a human click
 on a dialog the webview cannot draw, dismiss or answer. Native code
-writes the "You (id)" line, every member id, the count, the new and
-removed members and each member's verification status, and the commit
-cannot assert anyone the dialog did not show. What it cannot prove:
+writes the "You (id)" line, every member id, the count and the new and
+removed members, and the commit cannot assert anyone the dialog did not
+show. What it cannot prove:
 - **Names.** They come from the app and the server and are not
   verified; a compromised webview can put a friend's name on a
   stranger's id. The raw id on every line, and copy that says the names
@@ -410,29 +411,22 @@ cannot assert anyone the dialog did not show. What it cannot prove:
 - **Which group, and how often.** The webview chooses which group it
   asks about, and it can keep asking; the 30 s decline lockout and the
   one-at-a-time rule bound the rate, not the intent.
-- **Devices.** The dialog covers members, not devices. Bundles the
-  webview supplies can still pin new devices for members already in the
-  audience; device-level trust is the existing identity-change and
-  verification flow (§3).
+- **Devices.** The dialog confirms members, not the devices each member
+  has.
 - **What the webview already sees.** A compromised webview still reads
   whatever it renders; the confirm only bounds who ELSE can read.
 
 Accepted residuals:
-- **First use of the self record.** A store with no record yet learns
-  its owner from the first id it is given. A wrong id learned that way
-  can hide one member only in a fresh enable, since every other change
-  requires self to already be Active; there, the dialog's "You (id)"
-  line is the only signal. After that, growth with the real id fails
-  closed.
+- **First use of the self record.** The self record is trust-on-first-use;
+  until it is set, the dialog's "You (id)" line is the check.
 - **A second account on a shared install** (logout does not wipe the
   store): its ordinary use keeps working, but its growth calls fail
   closed, as do the first account's once the two ownership records
   disagree, until the store is reset.
-- **Include ordering.** The native commit does not reconcile the group
-  against the displayed member list. A member removed from the group
-  while the dialog is open is still shown in it; if the user confirms,
-  the full-roster `group_enable` re-adds them, loudly, on receivers
-  until their next reconcile removes them again.
+- **Removal during a dialog.** A member removed while any growth dialog
+  is open, and not yet reconciled on this device, is still shown; if the
+  user confirms, receivers re-add them loudly until their next
+  reconcile.
 
 ### 2.6 Server changes (group scope) [G: 4]
 
