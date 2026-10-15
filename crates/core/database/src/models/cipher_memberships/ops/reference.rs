@@ -27,15 +27,41 @@ impl AbstractCipherMemberships for ReferenceDb {
         Ok(memberships.get(user_id).cloned())
     }
 
-    async fn update_cipher_membership(&self, m: &CipherMembership) -> Result<()> {
+    async fn update_cipher_membership_if_version(
+        &self,
+        m: &CipherMembership,
+        expected: u64,
+    ) -> Result<bool> {
+        let next = expected
+            .checked_add(1)
+            .ok_or_else(|| create_database_error!("replace", "cipher_membership"))?;
+
+        // The check and the write run while the map mutex is held, which is
+        // this driver's equivalent of Mongo's filtered replace_one
         let mut memberships = self.cipher_memberships.lock().await;
-        match memberships.get_mut(&m.user_id) {
-            Some(row) => {
-                *row = m.clone();
-                Ok(())
-            }
-            None => Err(create_error!(NotFound)),
+        if memberships
+            .get(&m.user_id)
+            .is_none_or(|row| row.version != expected)
+        {
+            return Ok(false);
         }
+
+        // Mirrors the unique `number` index on MongoDB
+        if memberships
+            .values()
+            .any(|row| row.user_id != m.user_id && row.number == m.number)
+        {
+            return Err(create_database_error!("replace", "cipher_membership"));
+        }
+
+        memberships.insert(
+            m.user_id.clone(),
+            CipherMembership {
+                version: next,
+                ..m.clone()
+            },
+        );
+        Ok(true)
     }
 
     async fn delete_cipher_membership(&self, user_id: &str) -> Result<()> {

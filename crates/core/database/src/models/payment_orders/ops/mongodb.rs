@@ -1,5 +1,5 @@
 use bson::{to_bson, Bson, Document};
-use futures::StreamExt;
+use futures::TryStreamExt;
 use mongodb::options::{FindOneAndUpdateOptions, ReturnDocument};
 use revolt_result::Result;
 
@@ -19,6 +19,13 @@ fn state_bson(state: &OrderState) -> Result<Bson> {
 /// An `$in` list of states, in the stored encoding
 fn states_bson(states: &[OrderState]) -> Result<Bson> {
     to_bson(states).map_err(|_| create_database_error!("to_bson", COL))
+}
+
+/// A row of a list query that failed to read (or decode) fails the whole
+/// query: a money sweep that skipped it would never act on that order
+fn row_error(error: mongodb::error::Error) -> revolt_result::Error {
+    log::error!("{COL}: failed to read a row of a list query: {error}");
+    create_database_error!("find", COL)
 }
 
 /// The lease is free: never taken, or taken and run out before `now`.
@@ -80,8 +87,7 @@ impl AbstractPaymentOrders for MongoDb {
         user_id: &str,
         states: &[OrderState],
     ) -> Result<Vec<PaymentOrder>> {
-        Ok(self
-            .col::<PaymentOrder>(COL)
+        self.col::<PaymentOrder>(COL)
             .find(doc! {
                 "user_id": user_id,
                 "state": { "$in": states_bson(states)? }
@@ -89,9 +95,9 @@ impl AbstractPaymentOrders for MongoDb {
             .sort(doc! { "created_at": 1_i32, "_id": 1_i32 })
             .await
             .map_err(|_| create_database_error!("find", COL))?
-            .filter_map(|s| async { s.ok() })
-            .collect()
-            .await)
+            .try_collect()
+            .await
+            .map_err(row_error)
     }
 
     async fn fetch_payment_orders_by_state(
@@ -100,8 +106,7 @@ impl AbstractPaymentOrders for MongoDb {
         before: i64,
         limit: i64,
     ) -> Result<Vec<PaymentOrder>> {
-        Ok(self
-            .col::<PaymentOrder>(COL)
+        self.col::<PaymentOrder>(COL)
             .find(doc! {
                 "state": { "$in": states_bson(states)? },
                 "created_at": { "$lt": before }
@@ -110,9 +115,9 @@ impl AbstractPaymentOrders for MongoDb {
             .limit(limit)
             .await
             .map_err(|_| create_database_error!("find", COL))?
-            .filter_map(|s| async { s.ok() })
-            .collect()
-            .await)
+            .try_collect()
+            .await
+            .map_err(row_error)
     }
 
     async fn fetch_payment_orders_reversal_pending(
@@ -120,8 +125,7 @@ impl AbstractPaymentOrders for MongoDb {
         now: i64,
         limit: i64,
     ) -> Result<Vec<PaymentOrder>> {
-        Ok(self
-            .col::<PaymentOrder>(COL)
+        self.col::<PaymentOrder>(COL)
             .find(doc! {
                 "reversal_pending": { "$exists": true },
                 "$or": lease_free(now)
@@ -130,9 +134,9 @@ impl AbstractPaymentOrders for MongoDb {
             .limit(limit)
             .await
             .map_err(|_| create_database_error!("find", COL))?
-            .filter_map(|s| async { s.ok() })
-            .collect()
-            .await)
+            .try_collect()
+            .await
+            .map_err(row_error)
     }
 
     async fn acquire_payment_order_lease(
@@ -194,14 +198,35 @@ impl AbstractPaymentOrders for MongoDb {
         // state. The typed replacement leaves unset optionals out (never
         // null), which the partial unique indexes depend on. No upsert, so
         // a missing order is `false`.
+        let mut filter = doc! {
+            "_id": &o.id,
+            "state": state_bson(&expected)?
+        };
+
+        // Fencing token: a worker whose lease ran out and was taken over
+        // still carries the old `lease_until`, so it no longer matches
+        match o.lease_until {
+            Some(until) => {
+                filter.insert("lease_until", until);
+            }
+            None => {
+                filter.insert("lease_until", doc! { "$exists": false });
+            }
+        }
+
+        // An account-deletion unlink is never undone by a writer that read
+        // the order before it ran
+        match &o.user_id {
+            Some(user_id) => {
+                filter.insert("user_id", user_id.as_str());
+            }
+            None => {
+                filter.insert("user_id", doc! { "$exists": false });
+            }
+        }
+
         self.col::<PaymentOrder>(COL)
-            .replace_one(
-                doc! {
-                    "_id": &o.id,
-                    "state": state_bson(&expected)?
-                },
-                o,
-            )
+            .replace_one(filter, o)
             .await
             .map(|result| result.matched_count == 1)
             .map_err(|_| create_database_error!("replace_one", COL))

@@ -14,7 +14,8 @@ pub trait AbstractCipherNumbers: Sync + Send {
     /// under a higher cap is still returned. `cap` lets a lowered
     /// `cipher_cap` bind a table seeded larger. Ok(None) on an empty table
     /// means "not seeded", not "sold out"; callers tell the two apart with
-    /// `count_cipher_numbers`.
+    /// `count_cipher_numbers`. `cap == 0` is a configuration error and
+    /// returns Err (checked before the resume), never Ok(None).
     async fn claim_cipher_number(&self, order_id: &str, cap: u32) -> Result<Option<u32>>;
 
     /// Fetch the number claimed by an order, if any
@@ -129,6 +130,24 @@ mod tests {
             assert_eq!(db.claim_cipher_number("order-d", 5).await.unwrap(), Some(4));
             assert_eq!(db.claim_cipher_number("order-d", 3).await.unwrap(), Some(4));
             assert_eq!(db.count_claimed_cipher_numbers().await.unwrap(), 4);
+        });
+    }
+
+    #[tokio::test]
+    async fn a_zero_cap_is_an_error_not_sold_out() {
+        database_test!(|db| async move {
+            create_cipher_number_indexes(&db).await;
+
+            // Unseeded and seeded alike
+            assert!(db.claim_cipher_number("order-a", 0).await.is_err());
+            db.seed_cipher_numbers(3).await.unwrap();
+            assert!(db.claim_cipher_number("order-a", 0).await.is_err());
+            assert_eq!(db.count_claimed_cipher_numbers().await.unwrap(), 0);
+
+            // Even for an order that already holds a number
+            assert_eq!(db.claim_cipher_number("order-a", 3).await.unwrap(), Some(1));
+            assert!(db.claim_cipher_number("order-a", 0).await.is_err());
+            assert_eq!(db.count_claimed_cipher_numbers().await.unwrap(), 1);
         });
     }
 

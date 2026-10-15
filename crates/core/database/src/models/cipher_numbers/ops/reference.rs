@@ -13,6 +13,14 @@ fn count_to_u32(count: usize) -> Result<u32> {
 #[async_trait]
 impl AbstractCipherNumbers for ReferenceDb {
     async fn claim_cipher_number(&self, order_id: &str, cap: u32) -> Result<Option<u32>> {
+        // A zero cap is a misconfiguration, never "sold out"
+        if cap == 0 {
+            return Err(create_database_error!(
+                "claim (cipher_cap is 0)",
+                "cipher_numbers"
+            ));
+        }
+
         // The whole find-then-claim runs while the map mutex is held, which
         // is this driver's equivalent of Mongo's find_one_and_update.
         let mut numbers = self.cipher_numbers.lock().await;

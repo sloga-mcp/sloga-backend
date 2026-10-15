@@ -1,5 +1,5 @@
-use bson::{to_bson, Document};
-use futures::StreamExt;
+use bson::{to_bson, Bson, Document};
+use futures::TryStreamExt;
 use revolt_result::Result;
 
 use crate::MongoDb;
@@ -8,6 +8,19 @@ use crate::{PaymentEvent, PaymentEventState};
 use super::AbstractPaymentEvents;
 
 static COL: &str = "payment_events";
+
+/// A state exactly as the typed insert stores it (unit variants are plain
+/// strings, e.g. "Received")
+fn state_bson(state: &PaymentEventState) -> Result<Bson> {
+    to_bson(state).map_err(|_| create_database_error!("to_bson", COL))
+}
+
+/// A row of a list query that failed to read (or decode) fails the whole
+/// query: a re-drive sweep that skipped it would never act on that event
+fn row_error(error: mongodb::error::Error) -> revolt_result::Error {
+    log::error!("{COL}: failed to read a row of a list query: {error}");
+    create_database_error!("find", COL)
+}
 
 /// Whether a Mongo error is a duplicate key violation
 fn is_duplicate_key(error: &mongodb::error::Error) -> bool {
@@ -83,19 +96,38 @@ impl AbstractPaymentEvents for MongoDb {
         max_attempts: u32,
         limit: i64,
     ) -> Result<Vec<PaymentEvent>> {
-        Ok(self
-            .col::<PaymentEvent>(COL)
+        self.col::<PaymentEvent>(COL)
             .find(doc! {
-                "state": "Failed",
+                "state": state_bson(&PaymentEventState::Failed)?,
                 "attempts": { "$lt": max_attempts as i64 }
             })
             .sort(doc! { "received_at": 1_i32, "_id": 1_i32 })
             .limit(limit)
             .await
             .map_err(|_| create_database_error!("find", COL))?
-            .filter_map(|s| async { s.ok() })
-            .collect()
-            .await)
+            .try_collect()
+            .await
+            .map_err(row_error)
+    }
+
+    async fn fetch_payment_events_by_state(
+        &self,
+        state: PaymentEventState,
+        before: i64,
+        limit: i64,
+    ) -> Result<Vec<PaymentEvent>> {
+        self.col::<PaymentEvent>(COL)
+            .find(doc! {
+                "state": state_bson(&state)?,
+                "received_at": { "$lt": before }
+            })
+            .sort(doc! { "received_at": 1_i32, "_id": 1_i32 })
+            .limit(limit)
+            .await
+            .map_err(|_| create_database_error!("find", COL))?
+            .try_collect()
+            .await
+            .map_err(row_error)
     }
 }
 

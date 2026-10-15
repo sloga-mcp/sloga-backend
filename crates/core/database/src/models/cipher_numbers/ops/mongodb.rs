@@ -46,6 +46,11 @@ fn count_to_u32(count: u64) -> Result<u32> {
 #[async_trait]
 impl AbstractCipherNumbers for MongoDb {
     async fn claim_cipher_number(&self, order_id: &str, cap: u32) -> Result<Option<u32>> {
+        // A zero cap is a misconfiguration, never "sold out"
+        if cap == 0 {
+            return Err(create_database_error!("claim (cipher_cap is 0)", COL));
+        }
+
         // Resume: an order that already holds a number keeps it
         if let Some(number) = self.fetch_cipher_number_by_order(order_id).await? {
             return Ok(Some(number));

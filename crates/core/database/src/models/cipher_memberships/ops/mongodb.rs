@@ -50,18 +50,49 @@ impl AbstractCipherMemberships for MongoDb {
         query!(self, find_one_by_id, COL, user_id)
     }
 
-    async fn update_cipher_membership(&self, m: &CipherMembership) -> Result<()> {
+    async fn update_cipher_membership_if_version(
+        &self,
+        m: &CipherMembership,
+        expected: u64,
+    ) -> Result<bool> {
+        let next = expected
+            .checked_add(1)
+            .ok_or_else(|| create_database_error!("replace_one", COL))?;
+        // bson stores a u64 as Int64; Mongo compares numbers across types
+        let expected_bson =
+            i64::try_from(expected).map_err(|_| create_database_error!("replace_one", COL))?;
+
+        // Filter + replace under one document lock: a writer that read the
+        // row before another bumped the version cannot overwrite it. Only
+        // one `_id` key (a second one would replace the first).
+        let filter = if expected == 0 {
+            // A row written before `version` existed has no such field
+            doc! {
+                "_id": &m.user_id,
+                "$or": [
+                    { "version": 0_i64 },
+                    { "version": { "$exists": false } }
+                ]
+            }
+        } else {
+            doc! {
+                "_id": &m.user_id,
+                "version": expected_bson
+            }
+        };
+
+        let row = CipherMembership {
+            version: next,
+            ..m.clone()
+        };
+
+        // No upsert, so a missing row is `false`. A number held by another
+        // user's row fails on the unique index, as on insert.
         self.col::<CipherMembership>(COL)
-            .replace_one(doc! { "_id": &m.user_id }, m)
+            .replace_one(filter, &row)
             .await
+            .map(|result| result.matched_count == 1)
             .map_err(|_| create_database_error!("replace_one", COL))
-            .and_then(|result| {
-                if result.matched_count == 0 {
-                    Err(create_error!(NotFound))
-                } else {
-                    Ok(())
-                }
-            })
     }
 
     async fn delete_cipher_membership(&self, user_id: &str) -> Result<()> {

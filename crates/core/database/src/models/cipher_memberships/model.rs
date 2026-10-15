@@ -42,6 +42,11 @@ auto_derived!(
         /// When the Prot grant was posted
         #[serde(skip_serializing_if = "Option::is_none", default)]
         pub prot_posted_at: Option<i64>,
+        /// Optimistic-concurrency counter, bumped by every
+        /// `update_cipher_membership_if_version`; a row stored before the
+        /// field existed reads as 0
+        #[serde(default)]
+        pub version: u64,
     }
 );
 
@@ -81,6 +86,7 @@ mod tests {
             revoked_at: None,
             revoke_reason: None,
             prot_posted_at: None,
+            version: 0,
         }
     }
 
@@ -151,5 +157,20 @@ mod tests {
         assert!(!doc.contains_key("prot_posted_at"));
         assert_eq!(doc.get_str("_id").unwrap(), "01USER00000000000000000000");
         assert_eq!(doc.get_str("tier").unwrap(), "T149");
+    }
+
+    #[cfg(feature = "mongodb")]
+    #[test]
+    fn version_is_stored_as_int64_and_absent_reads_as_zero() {
+        let mut row = membership();
+        row.version = 3;
+        let mut doc = bson::to_document(&row).unwrap();
+        // The compare-and-swap filter matches on this encoding
+        assert_eq!(doc.get("version"), Some(&bson::Bson::Int64(3)));
+
+        // A row written before the field existed
+        doc.remove("version");
+        let read: CipherMembership = bson::from_document(doc).unwrap();
+        assert_eq!(read.version, 0);
     }
 }
