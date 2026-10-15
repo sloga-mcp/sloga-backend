@@ -85,6 +85,10 @@ auto_derived_partial!(
         /// Custom profile badge, set by privileged routes only
         #[serde(skip_serializing_if = "Option::is_none")]
         pub custom_badge: Option<CustomBadge>,
+        /// Public Cipher badge, set by the payments fulfil path only and
+        /// present only while the membership is active and undisputed
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        pub cipher: Option<v0::UserCipher>,
 
         /// Number of qualified referrals (recomputed, never incremented)
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -135,6 +139,9 @@ auto_derived!(
         ReferralCount,
         DmGuard,
         None,
+
+        // public fields, server-set only
+        Cipher,
     }
 
     /// Platform of a linked streaming channel
@@ -378,6 +385,7 @@ impl Default for User {
             connections: Default::default(),
             name_style: Default::default(),
             custom_badge: Default::default(),
+            cipher: Default::default(),
             referral_count: Default::default(),
             referral_pending: Default::default(),
             welcomed_at: Default::default(),
@@ -1078,6 +1086,16 @@ impl User {
         self.flags.unwrap_or_default() & UserFlags::Deleted as i32 != 0
     }
 
+    /// The public Cipher badge, or None for a deleted account even if a
+    /// stale stored copy outlived `mark_deleted`
+    pub fn public_cipher(&self) -> Option<v0::UserCipher> {
+        if self.is_deleted() {
+            return None;
+        }
+
+        self.cipher.clone()
+    }
+
     /// Bitfield of perks the user holds at `now_ms`
     ///
     /// The OR of the referral tiers, the donation tiers and the welcome
@@ -1180,6 +1198,7 @@ impl User {
             FieldsUser::ReferralCount => self.referral_count = None,
             FieldsUser::DmGuard => self.dm_guard = None,
             FieldsUser::None => {}
+            FieldsUser::Cipher => self.cipher = None,
         }
     }
 
@@ -1298,6 +1317,8 @@ impl User {
                 FieldsUser::ReferralPending,
                 FieldsUser::WelcomedAt,
                 FieldsUser::ReferralCount,
+                // A deleted account never keeps a public Cipher badge
+                FieldsUser::Cipher,
             ],
         )
         .await
@@ -1820,6 +1841,38 @@ mod tests {
             suspended.compute_badges(None, NOW) & UserBadges::Recruiter as u32,
             0
         );
+    }
+
+    #[test]
+    fn cipher_hidden_for_deleted_user_and_cleared_on_remove() {
+        let badge = v0::UserCipher {
+            number: 42,
+            tier: v0::CipherTier::T299,
+        };
+
+        let mut user = User {
+            cipher: Some(badge.clone()),
+            ..Default::default()
+        };
+        assert_eq!(user.public_cipher(), Some(badge.clone()));
+
+        // A stale stored copy never shows on a deleted account
+        let deleted = User {
+            flags: Some(UserFlags::Deleted as i32),
+            ..user.clone()
+        };
+        assert_eq!(deleted.public_cipher(), None);
+
+        // Other flags leave it alone
+        let suspended = User {
+            flags: Some(UserFlags::SuspendedUntil as i32),
+            ..user.clone()
+        };
+        assert_eq!(suspended.public_cipher(), Some(badge));
+
+        user.remove_field(&FieldsUser::Cipher);
+        assert_eq!(user.cipher, None);
+        assert_eq!(user.public_cipher(), None);
     }
 
     #[test]

@@ -365,6 +365,21 @@ pub enum ErrorType {
     VideoCallFull {
         max: usize,
     },
+
+    // ? Payment and Cipher errors
+    /// Payments are switched off in the config (`[features.payments]`)
+    PaymentsDisabled,
+    /// Cipher sales are not open (not opened yet, or past the close date)
+    CipherSalesClosed,
+    /// Every Cipher number has been claimed
+    CipherSoldOut,
+    /// The requested Cipher tier is not valid for this purchase (for example
+    /// not an upgrade from the tier already held)
+    CipherTierInvalid,
+    /// The caller already has a checkout in progress
+    PaymentPending,
+    /// The payment provider failed or returned an unusable response
+    PaymentProviderError,
 }
 
 #[macro_export]

@@ -1572,6 +1572,7 @@ impl crate::User {
         let badges = self.get_badges().await;
         let now = crate::now_ms();
         let name_style = self.filtered_name_style(now);
+        let cipher = self.public_cipher();
 
         User {
             username: self.username,
@@ -1619,6 +1620,7 @@ impl crate::User {
             bot: self.bot.map(|bot| bot.into()),
             e2ee_enabled: self.e2ee_enabled,
             name_style,
+            cipher,
             perks: 0,
             custom_badge: self.custom_badge.map(|badge| CustomBadge {
                 image: badge.image.into(),
@@ -1672,6 +1674,7 @@ impl crate::User {
         let badges = self.get_badges().await;
         let now = crate::now_ms();
         let name_style = self.filtered_name_style(now);
+        let cipher = self.public_cipher();
 
         User {
             username: self.username,
@@ -1707,6 +1710,7 @@ impl crate::User {
             bot: self.bot.map(|bot| bot.into()),
             e2ee_enabled: self.e2ee_enabled,
             name_style,
+            cipher,
             perks: 0,
             custom_badge: self.custom_badge.map(|badge| CustomBadge {
                 image: badge.image.into(),
@@ -1724,6 +1728,7 @@ impl crate::User {
         let badges = self.get_badges().await;
         let now = crate::now_ms();
         let name_style = self.filtered_name_style(now);
+        let cipher = self.public_cipher();
 
         User {
             username: self.username,
@@ -1751,6 +1756,7 @@ impl crate::User {
             bot: self.bot.map(|bot| bot.into()),
             e2ee_enabled: self.e2ee_enabled,
             name_style,
+            cipher,
             perks: 0,
             custom_badge: self.custom_badge.map(|badge| CustomBadge {
                 image: badge.image.into(),
@@ -1767,6 +1773,7 @@ impl crate::User {
         let badges = self.get_badges().await;
         let now = crate::now_ms();
         let name_style = self.filtered_name_style(now);
+        let cipher = self.public_cipher();
         let perks = self.perks(now);
 
         User {
@@ -1803,6 +1810,7 @@ impl crate::User {
             bot: self.bot.map(|bot| bot.into()),
             e2ee_enabled: self.e2ee_enabled,
             name_style,
+            cipher,
             perks,
             custom_badge: self.custom_badge.map(|badge| CustomBadge {
                 image: badge.image.into(),
@@ -1850,6 +1858,7 @@ impl From<User> for crate::User {
             supporter: None,
             dm_guard: None,
             name_style: value.name_style,
+            cipher: value.cipher,
             custom_badge: value.custom_badge.map(|badge| crate::CustomBadge {
                 image: badge.image.into(),
                 label: badge.label,
@@ -1882,6 +1891,7 @@ impl From<crate::PartialUser> for PartialUser {
             bot: value.bot.map(|bot| bot.into()),
             e2ee_enabled: value.e2ee_enabled,
             name_style: value.name_style,
+            cipher: value.cipher,
             perks: None,
             custom_badge: value.custom_badge.map(|badge| CustomBadge {
                 image: badge.image.into(),
@@ -1911,6 +1921,7 @@ impl From<FieldsUser> for crate::FieldsUser {
             FieldsUser::Connections => crate::FieldsUser::Connections,
             FieldsUser::NameStyle => crate::FieldsUser::NameStyle,
             FieldsUser::CustomBadge => crate::FieldsUser::CustomBadge,
+            FieldsUser::Cipher => crate::FieldsUser::Cipher,
 
             FieldsUser::Internal => crate::FieldsUser::None,
         }
@@ -1932,6 +1943,7 @@ impl From<crate::FieldsUser> for FieldsUser {
             crate::FieldsUser::Connections => FieldsUser::Connections,
             crate::FieldsUser::NameStyle => FieldsUser::NameStyle,
             crate::FieldsUser::CustomBadge => FieldsUser::CustomBadge,
+            crate::FieldsUser::Cipher => FieldsUser::Cipher,
 
             crate::FieldsUser::Suspension => FieldsUser::Internal,
             crate::FieldsUser::Supporter => FieldsUser::Internal,

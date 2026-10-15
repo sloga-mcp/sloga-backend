@@ -1,4 +1,6 @@
-use super::scripts::LATEST_REVISION;
+use super::scripts::{
+    create_payment_indexes, seed_cipher_numbers_table, LATEST_REVISION, PAYMENT_COLLECTIONS,
+};
 
 use crate::mongodb::bson::doc;
 use crate::mongodb::options::CreateCollectionOptions;
@@ -229,6 +231,13 @@ pub async fn create_database(db: &MongoDb) {
     db.create_collection("server_audit_log")
         .await
         .expect("Failed to create server_audit_log collection.");
+
+    // Payments + Cipher (revision 74).
+    for collection in PAYMENT_COLLECTIONS {
+        db.create_collection(collection)
+            .await
+            .unwrap_or_else(|error| panic!("Failed to create {collection} collection: {error}"));
+    }
 
     db.run_command(doc! {
         "createIndexes": "users",
@@ -1294,6 +1303,16 @@ pub async fn create_database(db: &MongoDb) {
     })
     .await
     .expect("Failed to create server_audit_log index.");
+
+    // Payments + Cipher. The same helpers revision 74 runs, so the index
+    // specs and the seed cannot drift from scripts.rs.
+    create_payment_indexes(&db)
+        .await
+        .expect("Failed to create payments indexes.");
+
+    seed_cipher_numbers_table(&db)
+        .await
+        .expect("Failed to seed cipher_numbers.");
 
     info!("Created database.");
 }

@@ -173,6 +173,13 @@ impl<'r> Responder<'r, 'static> for Error {
             ErrorType::IncorrectData { .. } => Status::BadRequest,
             ErrorType::MlsCallFull { .. } => Status::Conflict,
             ErrorType::VideoCallFull { .. } => Status::Conflict,
+
+            ErrorType::PaymentsDisabled => Status::BadRequest,
+            ErrorType::CipherSalesClosed => Status::Forbidden,
+            ErrorType::CipherSoldOut => Status::Conflict,
+            ErrorType::CipherTierInvalid => Status::BadRequest,
+            ErrorType::PaymentPending => Status::Conflict,
+            ErrorType::PaymentProviderError => Status::BadGateway,
         };
 
         // The body no longer carries the location, so log it for server

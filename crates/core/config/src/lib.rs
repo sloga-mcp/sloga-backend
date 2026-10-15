@@ -795,6 +795,46 @@ impl Default for ApiGamedata {
     }
 }
 
+/// Stripe Checkout (the Cipher sale). Both secrets belong in
+/// Revolt.overrides.toml under an explicit `[api.stripe]` header (env form
+/// `REVOLT__API__STRIPE__...`, double underscores), never in the baked
+/// config. An empty `webhook_secret` means every webhook call is refused.
+///
+/// `Default` is hand-written for the URLs and the tolerance, and `Debug` is
+/// hand-written so `init()`'s config dump never prints a secret.
+#[derive(Deserialize, Clone)]
+#[serde(default)]
+pub struct ApiStripe {
+    /// Stripe API secret key (`sk_live_...` / `sk_test_...`)
+    pub secret_key: String,
+    /// Signing secret of the webhook endpoint (`whsec_...`)
+    pub webhook_secret: String,
+    /// Events and sessions whose `livemode` differs are ignored
+    pub expect_livemode: bool,
+    /// Where Checkout sends the buyer back, per `return_to`
+    pub success_url_web: String,
+    pub cancel_url_web: String,
+    pub success_url_shell: String,
+    pub cancel_url_shell: String,
+    /// Maximum age, in seconds, of a webhook signature timestamp
+    pub tolerance_secs: u64,
+}
+
+impl Default for ApiStripe {
+    fn default() -> Self {
+        Self {
+            secret_key: String::new(),
+            webhook_secret: String::new(),
+            expect_livemode: false,
+            success_url_web: "https://app.sloga.gg/settings?cipher=success".to_string(),
+            cancel_url_web: "https://app.sloga.gg/settings?cipher=cancel".to_string(),
+            success_url_shell: "https://sloga.gg/cipher/thanks/".to_string(),
+            cancel_url_shell: "https://sloga.gg/cipher/".to_string(),
+            tolerance_secs: 300,
+        }
+    }
+}
+
 impl std::fmt::Debug for ApiGamedata {
     /// Same output as the derive, except `blizzard_client_secret` and
     /// `internal_key` are never printed
@@ -827,6 +867,44 @@ impl std::fmt::Debug for ApiGamedata {
     }
 }
 
+impl std::fmt::Debug for ApiStripe {
+    /// Same output as the derive, except the two secrets print as
+    /// `"<redacted>"` (or `"<unset>"` when empty)
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        fn redact(secret: &str) -> &'static str {
+            if secret.is_empty() {
+                "<unset>"
+            } else {
+                "<redacted>"
+            }
+        }
+
+        // Exhaustive destructure: a new field fails to compile until it is
+        // either printed or deliberately redacted here
+        let ApiStripe {
+            secret_key,
+            webhook_secret,
+            expect_livemode,
+            success_url_web,
+            cancel_url_web,
+            success_url_shell,
+            cancel_url_shell,
+            tolerance_secs,
+        } = self;
+
+        f.debug_struct("ApiStripe")
+            .field("secret_key", &redact(secret_key))
+            .field("webhook_secret", &redact(webhook_secret))
+            .field("expect_livemode", expect_livemode)
+            .field("success_url_web", success_url_web)
+            .field("cancel_url_web", cancel_url_web)
+            .field("success_url_shell", success_url_shell)
+            .field("cancel_url_shell", cancel_url_shell)
+            .field("tolerance_secs", tolerance_secs)
+            .finish()
+    }
+}
+
 #[derive(Deserialize, Debug, Clone)]
 pub struct Api {
     pub registration: ApiRegistration,
@@ -849,6 +927,7 @@ pub struct Api {
     pub kofi: ApiKofi,
     #[serde(default)]
     pub gamedata: ApiGamedata,
+    pub stripe: ApiStripe,
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -1512,6 +1591,41 @@ impl AntispamFeatures {
     }
 }
 
+/// Payments: the Stripe Checkout routes, the webhook and the crond
+/// reconcile task, plus the Cipher sale they carry (provider keys live in
+/// `[api.stripe]`).
+///
+/// Ships OFF. Prod turns it on in Revolt.overrides.toml under an explicit
+/// `[features.payments]` header (env form `REVOLT__FEATURES__PAYMENTS__...`,
+/// double underscores), then RESTARTS delta AND crond: config sources are
+/// frozen into each process at first access.
+///
+/// `Default` is hand-written on purpose: a derived one would give
+/// `cipher_cap = 0`, which reads as "sold out".
+#[derive(Deserialize, Debug, Clone)]
+#[serde(default)]
+pub struct FeaturePayments {
+    /// Master switch: routes, webhook and the crond reconcile task
+    pub enabled: bool,
+    /// Whether new Cipher checkouts (and upgrades) may start
+    pub cipher_sales_open: bool,
+    /// Size of the pre-seeded Cipher number table
+    pub cipher_cap: u32,
+    /// RFC 3339 instant after which the sale is closed; empty = no close date
+    pub cipher_sales_close_at: String,
+}
+
+impl Default for FeaturePayments {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            cipher_sales_open: false,
+            cipher_cap: 1000,
+            cipher_sales_close_at: String::new(),
+        }
+    }
+}
+
 #[derive(Deserialize, Debug, Clone)]
 pub struct Features {
     pub limits: FeaturesLimitsCollection,
@@ -1585,6 +1699,10 @@ pub struct Features {
     /// Anti-spam (ships off; see AntispamFeatures docs)
     #[serde(default)]
     pub antispam: AntispamFeatures,
+
+    /// Payments and the Cipher sale (ships off; see FeaturePayments docs)
+    #[serde(default)]
+    pub payments: FeaturePayments,
 
     #[serde(default)]
     pub advanced: FeaturesAdvanced,
@@ -2849,5 +2967,241 @@ mod gamedata_debug_tests {
         );
         assert_eq!(bundled.steam_news_per_window, default.steam_news_per_window);
         assert_eq!(bundled.blizzard_per_second, default.blizzard_per_second);
+    }
+}
+
+// Built from in-process sources only, never the cached `config()`. Secrets are
+// fake, and leak checks use `assert!` so a failure prints no values.
+#[cfg(test)]
+mod payments_config_tests {
+    use std::collections::HashMap;
+
+    use config::{Config, Environment, File, FileFormat};
+
+    use super::{ApiStripe, FeaturePayments, Settings};
+
+    const SECRET_KEY: &str = "sk_test_w1cfgFakeSecretKeyNotARealKey";
+    const WEBHOOK_SECRET: &str = "whsec_w1cfgFakeWebhookSecretNotReal";
+
+    /// The embedded Revolt.toml with `[features.payments]` and `[api.stripe]`
+    /// removed, standing in for a config that never mentions either
+    fn embedded_without_payments() -> String {
+        let mut skipping = false;
+        include_str!("../Revolt.toml")
+            .lines()
+            .filter(|line| {
+                let line = line.trim_start();
+                if line.starts_with('[') {
+                    skipping = line == "[features.payments]" || line == "[api.stripe]";
+                }
+                !skipping
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn assert_payments_defaults(payments: &FeaturePayments) {
+        assert!(!payments.enabled);
+        assert!(!payments.cipher_sales_open);
+        assert_eq!(payments.cipher_cap, 1000);
+        assert_eq!(payments.cipher_sales_close_at, "");
+    }
+
+    fn assert_stripe_defaults(stripe: &ApiStripe) {
+        assert!(stripe.secret_key.is_empty());
+        assert!(stripe.webhook_secret.is_empty());
+        assert!(!stripe.expect_livemode);
+        assert_eq!(
+            stripe.success_url_web,
+            "https://app.sloga.gg/settings?cipher=success"
+        );
+        assert_eq!(
+            stripe.cancel_url_web,
+            "https://app.sloga.gg/settings?cipher=cancel"
+        );
+        assert_eq!(stripe.success_url_shell, "https://sloga.gg/cipher/thanks/");
+        assert_eq!(stripe.cancel_url_shell, "https://sloga.gg/cipher/");
+        assert_eq!(stripe.tolerance_secs, 300);
+    }
+
+    #[test]
+    fn hand_written_defaults_have_the_planned_values() {
+        assert_payments_defaults(&FeaturePayments::default());
+        assert_stripe_defaults(&ApiStripe::default());
+    }
+
+    /// The embedded tables must not drift from the code defaults
+    #[test]
+    fn embedded_tables_match_the_code_defaults() {
+        let settings: Settings = Config::builder()
+            .add_source(File::from_str(
+                include_str!("../Revolt.toml"),
+                FileFormat::Toml,
+            ))
+            .build()
+            .expect("the embedded Revolt.toml builds")
+            .try_deserialize()
+            .expect("the embedded Revolt.toml deserializes");
+
+        assert_payments_defaults(&settings.features.payments);
+        assert_stripe_defaults(&settings.api.stripe);
+    }
+
+    #[test]
+    fn missing_tables_take_the_defaults() {
+        let config = Config::builder()
+            .add_source(File::from_str(
+                &embedded_without_payments(),
+                FileFormat::Toml,
+            ))
+            .build()
+            .expect("the stripped config builds");
+
+        // The tables must really be gone, or this test proves nothing
+        assert!(config.get_table("features.payments").is_err());
+        assert!(config.get_table("api.stripe").is_err());
+        // ...and nothing else went with them
+        assert!(config.get_table("features.antispam").is_ok());
+        assert!(config.get_table("api.kofi").is_ok());
+
+        let settings: Settings = config
+            .try_deserialize()
+            .expect("a config without the payments tables must deserialize");
+
+        assert_payments_defaults(&settings.features.payments);
+        assert_stripe_defaults(&settings.api.stripe);
+    }
+
+    /// The documented env form (double underscores) reaches the nested keys
+    #[test]
+    fn environment_override_reaches_the_tables() {
+        let vars: HashMap<String, String> = [
+            ("REVOLT__FEATURES__PAYMENTS__ENABLED", "true"),
+            ("REVOLT__FEATURES__PAYMENTS__CIPHER_CAP", "250"),
+            ("REVOLT__API__STRIPE__WEBHOOK_SECRET", WEBHOOK_SECRET),
+            ("REVOLT__API__STRIPE__EXPECT_LIVEMODE", "true"),
+        ]
+        .map(|(k, v)| (k.to_owned(), v.to_owned()))
+        .into();
+
+        let settings: Settings = Config::builder()
+            .add_source(File::from_str(
+                include_str!("../Revolt.toml"),
+                FileFormat::Toml,
+            ))
+            .add_source(
+                Environment::with_prefix("REVOLT")
+                    .separator("__")
+                    .source(Some(vars)),
+            )
+            .build()
+            .expect("the config builds")
+            .try_deserialize()
+            .expect("the config deserializes");
+
+        let payments = &settings.features.payments;
+        assert!(payments.enabled);
+        assert_eq!(payments.cipher_cap, 250);
+        assert!(!payments.cipher_sales_open);
+
+        let stripe = &settings.api.stripe;
+        assert!(
+            stripe.webhook_secret == WEBHOOK_SECRET,
+            "webhook_secret did not take the override"
+        );
+        assert!(stripe.expect_livemode);
+        assert!(stripe.secret_key.is_empty());
+        assert_eq!(stripe.tolerance_secs, 300);
+    }
+
+    /// The test config layered on top, as CONFIG_BUILDER does under TEST_DB
+    #[test]
+    fn test_config_enables_payments_with_dummy_secrets() {
+        let settings: Settings = Config::builder()
+            .add_source(File::from_str(
+                include_str!("../Revolt.toml"),
+                FileFormat::Toml,
+            ))
+            .add_source(File::from_str(
+                include_str!("../Revolt.test.toml"),
+                FileFormat::Toml,
+            ))
+            .build()
+            .expect("the test config builds")
+            .try_deserialize()
+            .expect("the test config deserializes");
+
+        let payments = &settings.features.payments;
+        assert!(payments.enabled);
+        assert!(payments.cipher_sales_open);
+        assert_eq!(payments.cipher_cap, 1000);
+        assert_eq!(settings.api.stripe.secret_key, "sk_test_dummy");
+        assert_eq!(settings.api.stripe.webhook_secret, "whsec_test_dummy");
+    }
+
+    #[test]
+    fn stripe_debug_redacts_the_secrets_only() {
+        let stripe = ApiStripe {
+            secret_key: SECRET_KEY.to_string(),
+            webhook_secret: WEBHOOK_SECRET.to_string(),
+            ..Default::default()
+        };
+
+        let debug = format!("{stripe:?}");
+        assert!(
+            !debug.contains(SECRET_KEY),
+            "ApiStripe Debug leaks secret_key"
+        );
+        assert!(
+            !debug.contains(WEBHOOK_SECRET),
+            "ApiStripe Debug leaks webhook_secret"
+        );
+        assert_eq!(
+            debug,
+            r#"ApiStripe { secret_key: "<redacted>", webhook_secret: "<redacted>", expect_livemode: false, success_url_web: "https://app.sloga.gg/settings?cipher=success", cancel_url_web: "https://app.sloga.gg/settings?cipher=cancel", success_url_shell: "https://sloga.gg/cipher/thanks/", cancel_url_shell: "https://sloga.gg/cipher/", tolerance_secs: 300 }"#
+        );
+
+        // Empty secrets say so, so a missing override is visible in the dump
+        let debug = format!("{:?}", ApiStripe::default());
+        assert!(debug.contains(r#"secret_key: "<unset>""#));
+        assert!(debug.contains(r#"webhook_secret: "<unset>""#));
+    }
+
+    /// Nested in Settings, the way `init()` prints it
+    #[test]
+    fn settings_debug_never_prints_a_stripe_secret() {
+        let overrides = format!(
+            "[api.stripe]\nsecret_key = \"{SECRET_KEY}\"\nwebhook_secret = \"{WEBHOOK_SECRET}\"\n"
+        );
+        let settings: Settings = Config::builder()
+            .add_source(File::from_str(
+                include_str!("../Revolt.toml"),
+                FileFormat::Toml,
+            ))
+            .add_source(File::from_str(&overrides, FileFormat::Toml))
+            .build()
+            .expect("the config builds")
+            .try_deserialize()
+            .expect("the config deserializes");
+
+        // The secrets really did deserialize, or the assertions below prove nothing
+        assert!(
+            settings.api.stripe.secret_key == SECRET_KEY,
+            "secret_key not loaded"
+        );
+        assert!(
+            settings.api.stripe.webhook_secret == WEBHOOK_SECRET,
+            "webhook_secret not loaded"
+        );
+
+        let debug = format!("{settings:?}");
+        assert!(
+            !debug.contains(SECRET_KEY),
+            "Settings Debug leaks secret_key"
+        );
+        assert!(
+            !debug.contains(WEBHOOK_SECRET),
+            "Settings Debug leaks webhook_secret"
+        );
     }
 }

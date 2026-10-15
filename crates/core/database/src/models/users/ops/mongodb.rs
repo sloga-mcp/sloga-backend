@@ -743,6 +743,7 @@ impl IntoDocumentPath for FieldsUser {
             FieldsUser::ReferralCount => "referral_count",
             FieldsUser::DmGuard => "dm_guard",
             FieldsUser::None => "none",
+            FieldsUser::Cipher => "cipher",
         })
     }
 }

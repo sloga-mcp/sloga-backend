@@ -42,6 +42,10 @@ mod accounts;
 mod account_invites;
 mod sessions;
 mod mfa_tickets;
+mod payment_events;
+mod payment_orders;
+mod cipher_numbers;
+mod cipher_memberships;
 
 pub use admin_migrations::*;
 pub use application_commands::*;
@@ -90,6 +94,10 @@ pub use accounts::*;
 pub use account_invites::*;
 pub use sessions::*;
 pub use mfa_tickets::*;
+pub use payment_events::*;
+pub use payment_orders::*;
+pub use cipher_numbers::*;
+pub use cipher_memberships::*;
 
 use crate::{Database, ReferenceDb};
 
@@ -143,6 +151,10 @@ pub trait AbstractDatabase:
     + account_invites::AbstractAccountInvites
     + sessions::AbstractSessions
     + mfa_tickets::AbstractMFATickets
+    + payment_events::AbstractPaymentEvents
+    + payment_orders::AbstractPaymentOrders
+    + cipher_numbers::AbstractCipherNumbers
+    + cipher_memberships::AbstractCipherMemberships
 {
 }
 
