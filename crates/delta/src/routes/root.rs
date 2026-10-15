@@ -1,4 +1,4 @@
-use revolt_config::config;
+use revolt_config::{config, Settings};
 use revolt_result::Result;
 use rocket::serde::json::Json;
 use serde::Serialize;
@@ -51,6 +51,44 @@ pub struct BoostsFeature {
     pub tier_thresholds: [u32; 3],
 }
 
+/// # Bot-Based Import Source
+#[derive(Serialize, JsonSchema, Debug, PartialEq)]
+pub struct ImportBotSourceFeature {
+    /// Link on the source platform that adds the operator's import bot to
+    /// a server
+    pub add_bot_url: String,
+}
+
+/// # Import Sources Configuration
+///
+/// One key per import source that is ready on this node; a source that is
+/// not ready is left out entirely.
+#[derive(Serialize, JsonSchema, Debug, PartialEq)]
+pub struct ImportSourcesFeature {
+    /// Importing a server from Stoat
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stoat: Option<ImportBotSourceFeature>,
+}
+
+/// Which import sources to advertise. A source is advertised only when its
+/// import can actually run AND the client has everything it needs to build
+/// the add-bot link; otherwise its key is left out.
+pub fn import_sources_feature(config: &Settings) -> ImportSourcesFeature {
+    let import = &config.api.import;
+    let stoat = &import.stoat;
+
+    ImportSourcesFeature {
+        stoat: (import.stoat_ready() && !stoat.app_url.is_empty() && !stoat.bot_id.is_empty())
+            .then(|| ImportBotSourceFeature {
+                add_bot_url: format!(
+                    "{}/bot/{}",
+                    stoat.app_url.trim_end_matches('/'),
+                    stoat.bot_id
+                ),
+            }),
+    }
+}
+
 /// # Feature Configuration
 #[derive(Serialize, JsonSchema, Debug)]
 pub struct RevoltFeatures {
@@ -75,6 +113,8 @@ pub struct RevoltFeatures {
     /// URL from it). Absent when the bot upgrade is not configured.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub import_discord_stickers: Option<String>,
+    /// Import sources other than Discord that are ready on this node
+    pub import_sources: ImportSourcesFeature,
     /// Whether remote desktop control during screen share is enabled
     pub remote_control: bool,
     /// Whether this server is invite only
@@ -261,6 +301,7 @@ pub async fn root() -> Result<Json<RevoltConfig>> {
                 .discord
                 .stickers_enabled()
                 .then(|| config.api.import.discord.client_id.clone()),
+            import_sources: import_sources_feature(&config),
             // Unlike the flags above (per-service config), this comes from
             // `features` — the real Features flags are otherwise not
             // surfaced in RevoltFeatures at all, so this is net-new
@@ -376,5 +417,86 @@ mod test {
         let harness = crate::util::test::TestHarness::new().await;
         let response = harness.client.get("/").dispatch().await;
         assert_eq!(response.status(), Status::Ok);
+    }
+
+    /// The node's own config with Stoat fully ready
+    fn ready_settings() -> revolt_config::Settings {
+        let mut config = crate::util::test::rt().block_on(revolt_config::config());
+        let import = &mut config.api.import;
+        import.challenge_secret = "secret".to_string();
+        import.stoat.enabled = true;
+        import.stoat.api_url = "https://api.stoat.chat".to_string();
+        import.stoat.app_url = "https://stoat.chat".to_string();
+        import.stoat.cdn_url = "https://cdn.stoatusercontent.com".to_string();
+        import.stoat.bot_id = "01BOT".to_string();
+        import.stoat.bot_token = "token".to_string();
+        import.fluxer = import.stoat.clone();
+        config
+    }
+
+    fn import_sources_json(config: &revolt_config::Settings) -> serde_json::Value {
+        serde_json::to_value(super::import_sources_feature(config)).unwrap()
+    }
+
+    #[test]
+    fn import_sources_advertises_stoat_when_ready() {
+        let config = ready_settings();
+        assert!(config.api.import.stoat_ready());
+        // Release 1 advertises Stoat only, even with Fluxer fully configured
+        assert!(config.api.import.fluxer_ready());
+        assert_eq!(
+            import_sources_json(&config),
+            serde_json::json!({ "stoat": { "add_bot_url": "https://stoat.chat/bot/01BOT" } })
+        );
+
+        let mut config = ready_settings();
+        config.api.import.stoat.app_url = "https://stoat.chat//".to_string();
+        assert_eq!(
+            import_sources_json(&config),
+            serde_json::json!({ "stoat": { "add_bot_url": "https://stoat.chat/bot/01BOT" } }),
+            "trailing slashes on app_url are trimmed"
+        );
+    }
+
+    #[test]
+    fn import_sources_is_an_empty_object_when_dark() {
+        type Darken = fn(&mut revolt_config::Settings);
+        let cases: [(&str, Darken); 5] = [
+            ("disabled", |c| c.api.import.stoat.enabled = false),
+            ("no challenge secret", |c| {
+                c.api.import.challenge_secret.clear()
+            }),
+            ("no bot token", |c| c.api.import.stoat.bot_token.clear()),
+            ("no bot id", |c| c.api.import.stoat.bot_id.clear()),
+            // Ready for the read path, but the client cannot build the link
+            ("no app url", |c| c.api.import.stoat.app_url.clear()),
+        ];
+        for (name, darken) in cases {
+            let mut config = ready_settings();
+            darken(&mut config);
+            assert_eq!(
+                import_sources_json(&config),
+                serde_json::json!({}),
+                "stoat advertised with {name}"
+            );
+        }
+    }
+
+    /// `GET /` carries exactly what the builder produces for the node's
+    /// config, under `features`
+    #[test]
+    fn root_serves_import_sources() {
+        crate::util::test::rt().block_on(root_serves_import_sources_case())
+    }
+
+    async fn root_serves_import_sources_case() {
+        let harness = crate::util::test::TestHarness::new().await;
+        let response = harness.client.get("/").dispatch().await;
+        assert_eq!(response.status(), Status::Ok);
+        let body: serde_json::Value =
+            serde_json::from_str(&response.into_string().await.unwrap()).unwrap();
+        let expected = import_sources_json(&revolt_config::config().await);
+        assert!(expected.is_object());
+        assert_eq!(body["features"]["import_sources"], expected);
     }
 }
