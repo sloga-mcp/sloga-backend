@@ -1,9 +1,11 @@
 //! Start a server import from another platform.
 //! POST /import/<source>/server
 //!
-//! Stoat (release 1) verifies synchronously before anything is queued: the
-//! pasted link or id is whitelisted, resolved, fetched as the operator bot,
-//! and the requester's challenge code must be in the server description.
+//! Every source verifies synchronously before anything is queued: the pasted
+//! link or id is whitelisted by that source's parser, resolved, and checked
+//! as the operator bot for the requester's challenge code. Stoat looks for
+//! it in the server description; Fluxer looks for a role named exactly the
+//! code, holding Manage Server, whose history the guild audit log confirms.
 //! The job then carries the resolved server id and the code that matched;
 //! crond acts on those, never on the pasted string.
 
@@ -18,8 +20,12 @@ use validator::Validate;
 
 use super::discord_template::ResponseImportStarted;
 use super::dto::DataImportSourceServer;
+use super::fluxer_source::{
+    self, parse_fluxer_source, verify_fluxer_source, FluxerApi, FluxerSource,
+};
 use super::stoat_source::{
-    self, api_url_is_https, parse_stoat_source, verify_stoat_source, StoatApi, Transport,
+    self, api_url_is_https, parse_stoat_source, verify_stoat_source, StoatApi, StoatSource,
+    Transport,
 };
 use super::upstream_throttle::UpstreamThrottle;
 
@@ -37,9 +43,16 @@ impl ImportSource {
     pub fn tag(self) -> &'static str {
         match self {
             ImportSource::Stoat => stoat_source::SOURCE_TAG,
-            ImportSource::Fluxer => "fluxer",
+            ImportSource::Fluxer => fluxer_source::SOURCE_TAG,
             ImportSource::Matrix => "matrix",
         }
+    }
+
+    /// The outbound budgets for this source's verification calls, shared by
+    /// every delta process. Each source has its own: spending one never
+    /// refuses another.
+    pub fn throttle(self) -> UpstreamThrottle {
+        UpstreamThrottle::for_source(self.tag())
     }
 
     /// Job kind for an import from this source. Derived from the route,
@@ -52,11 +65,11 @@ impl ImportSource {
         }
     }
 
-    /// Whether this build can import from the source at all. Release 1 is
-    /// Stoat only; Fluxer and Matrix stay unavailable here even with their
-    /// config filled in, until their own releases flip this.
+    /// Whether this build can import from the source at all: Stoat and
+    /// Fluxer. Matrix stays unavailable here even with its config filled in,
+    /// until its own release flips this.
     pub fn implemented(self) -> bool {
-        matches!(self, ImportSource::Stoat)
+        matches!(self, ImportSource::Stoat | ImportSource::Fluxer)
     }
 
     /// Implemented AND configured (the config's `ready()`, which includes
@@ -107,10 +120,10 @@ impl<'r> FromParam<'r> for ImportSource {
 /// # Import a Server From Another Platform
 ///
 /// Verifies that you manage the source server (your challenge code from
-/// `GET /import/<source>/challenge` must be in its description), then queues
-/// the import. Returns immediately with a job id; progress streams over your
-/// private WebSocket topic, and the job is followed with the same routes as
-/// a Discord import.
+/// `GET /import/<source>/challenge` must be placed on it as that source's
+/// instructions say), then queues the import. Returns immediately with a
+/// job id; progress streams over your private WebSocket topic, and the job
+/// is followed with the same routes as a Discord import.
 #[openapi(tag = "Import")]
 #[post("/<source>/server", data = "<data>")]
 pub async fn import_source_server(
@@ -148,7 +161,7 @@ pub async fn import_source_server(
         &config,
         Utc::now(),
         Transport::Production,
-        &UpstreamThrottle::stoat(),
+        &source.throttle(),
     )
     .await
     .map(Json)
@@ -193,12 +206,19 @@ pub async fn import_unknown_source_server() -> Result<()> {
     Err(create_error!(NotFound))
 }
 
+/// What the user pasted, parsed by its own source's rules
+enum ParsedSource {
+    Stoat(StoatSource),
+    Fluxer(FluxerSource),
+}
+
 /// The guards and the upstream check, with the config, clock, transport and
 /// outbound budgets passed in so tests can point them at a fake upstream.
+/// `throttle` must be `source`'s own budgets (`ImportSource::throttle`).
 ///
 /// Order matters: every local refusal comes first, so a refused request
-/// spends no outbound budget; the throttle is checked inside
-/// `verify_stoat_source` before each upstream call.
+/// spends no outbound budget; the throttle is checked inside the source's
+/// verify function before each upstream call.
 #[allow(clippy::too_many_arguments)]
 async fn start_source_import(
     db: &Database,
@@ -236,15 +256,16 @@ async fn start_source_import(
         })
     })?;
 
-    // Only Stoat passes `ready` in this release; the match keeps a future
-    // source from falling through to Stoat's parser and client
+    // Each source parses with its own rules and verifies with its own
+    // client; a source without an arm here never falls through to another's
     let parsed = match source {
-        ImportSource::Stoat => {
-            parse_stoat_source(&data.source).ok_or_else(|| create_error!(InvalidOperation))?
-        }
-        ImportSource::Fluxer | ImportSource::Matrix => {
-            return Err(create_error!(ImportSourceUnavailable))
-        }
+        ImportSource::Stoat => ParsedSource::Stoat(
+            parse_stoat_source(&data.source).ok_or_else(|| create_error!(InvalidOperation))?,
+        ),
+        ImportSource::Fluxer => ParsedSource::Fluxer(
+            parse_fluxer_source(&data.source).ok_or_else(|| create_error!(InvalidOperation))?,
+        ),
+        ImportSource::Matrix => return Err(create_error!(ImportSourceUnavailable)),
     };
 
     // Cheap local refusals before spending upstream calls
@@ -258,23 +279,30 @@ async fn start_source_import(
         return Err(create_error!(ImportAlreadyInProgress));
     }
 
-    let api = StoatApi::connect(&config.api.import.stoat, transport)?;
-    let verified = verify_stoat_source(
-        &api,
-        throttle,
-        &parsed,
-        config.api.import.challenge_secret.as_bytes(),
-        &user.id,
-        now,
-    )
-    .await?;
+    let challenge_secret = config.api.import.challenge_secret.as_bytes();
+    let (server_id, challenge_code) = match parsed {
+        ParsedSource::Stoat(parsed) => {
+            let api = StoatApi::connect(&config.api.import.stoat, transport)?;
+            let verified =
+                verify_stoat_source(&api, throttle, &parsed, challenge_secret, &user.id, now)
+                    .await?;
+            (verified.server_id, verified.challenge_code)
+        }
+        ParsedSource::Fluxer(parsed) => {
+            let api = FluxerApi::connect(&config.api.import.fluxer, transport)?;
+            let verified =
+                verify_fluxer_source(&api, throttle, &parsed, challenge_secret, &user.id, now)
+                    .await?;
+            (verified.guild_id, verified.challenge_code)
+        }
+    };
 
     let job = DiscordImportJob::new_source(
         user.id.clone(),
         source.kind(),
         data.source,
-        Some(verified.server_id),
-        Some(verified.challenge_code),
+        Some(server_id),
+        Some(challenge_code),
     );
     // A concurrent request that also passed the check above is refused here
     // with the same 409 (unique active-job index / reference mutex)
@@ -285,6 +313,7 @@ async fn start_source_import(
 
 #[cfg(test)]
 mod tests {
+    use super::super::fluxer_source::fixtures as fluxer_fx;
     use super::super::stoat_source::fake_upstream::{FakeStoat, BOT_TOKEN};
     use super::super::upstream_throttle::UpstreamTarget;
     use super::*;
@@ -319,7 +348,7 @@ mod tests {
         }
     }
 
-    /// One request, with outbound budgets of its own
+    /// One request, with `source`'s outbound budgets on keys of its own
     async fn start(
         harness: &TestHarness,
         user: &User,
@@ -335,7 +364,30 @@ mod tests {
             settings,
             now(),
             Transport::LoopbackTest,
-            &UpstreamThrottle::isolated_for_tests(),
+            &UpstreamThrottle::isolated_for_source_tests(source.tag()),
+        )
+        .await
+    }
+
+    /// A request for any source against shared `throttle` budgets
+    async fn start_source_with(
+        harness: &TestHarness,
+        user: &User,
+        source: ImportSource,
+        pasted: &str,
+        settings: &Settings,
+        throttle: &UpstreamThrottle,
+        at: DateTime<Utc>,
+    ) -> Result<ResponseImportStarted> {
+        start_source_import(
+            &harness.db,
+            user,
+            source,
+            body(pasted),
+            settings,
+            at,
+            Transport::LoopbackTest,
+            throttle,
         )
         .await
     }
@@ -482,13 +534,12 @@ mod tests {
     }
 
     #[test]
-    fn fluxer_and_matrix_are_unavailable_even_when_configured() {
+    fn matrix_is_unavailable_even_when_configured() {
         crate::util::test::rt().block_on(async {
             let harness = TestHarness::new().await;
             let (_, _, user) = harness.new_user().await;
             let fake = verifying_fake(&user.id).await;
             let mut settings = ready_settings(&fake).await;
-            settings.api.import.fluxer = fake.source_config();
             settings.api.import.matrix = ApiImportMatrix {
                 enabled: true,
                 homeserver_url: fake.api_url.clone(),
@@ -496,17 +547,47 @@ mod tests {
                 access_token: "token".to_string(),
                 max_joins: 8,
             };
-            assert!(settings.api.import.fluxer_ready());
             assert!(settings.api.import.matrix_ready());
 
-            for source in [ImportSource::Fluxer, ImportSource::Matrix] {
-                assert_error(
-                    start(&harness, &user, source, INVITE, &settings).await,
-                    "ImportSourceUnavailable",
-                );
-            }
+            assert_error(
+                start(&harness, &user, ImportSource::Matrix, INVITE, &settings).await,
+                "ImportSourceUnavailable",
+            );
             assert!(fake.seen().is_empty(), "{:?}", fake.seen());
         })
+    }
+
+    #[test]
+    fn stoat_and_fluxer_are_implemented_matrix_is_not() {
+        assert!(ImportSource::Stoat.implemented());
+        assert!(ImportSource::Fluxer.implemented());
+        assert!(!ImportSource::Matrix.implemented());
+        assert_eq!(ImportSource::Fluxer.tag(), "fluxer");
+        assert_eq!(ImportSource::Fluxer.kind(), ImportJobKind::FluxerServer);
+    }
+
+    /// The live route spends each source's own budgets: `throttle()` is
+    /// `for_source(tag)`, and Stoat's is release 1's Stoat throttle
+    #[test]
+    fn each_source_verifies_against_its_own_budgets() {
+        let debug = |throttle: UpstreamThrottle| format!("{throttle:?}");
+        for source in [
+            ImportSource::Stoat,
+            ImportSource::Fluxer,
+            ImportSource::Matrix,
+        ] {
+            assert_eq!(
+                debug(source.throttle()),
+                debug(UpstreamThrottle::for_source(source.tag()))
+            );
+        }
+        assert_eq!(
+            debug(ImportSource::Stoat.throttle()),
+            debug(UpstreamThrottle::stoat())
+        );
+        let fluxer = debug(ImportSource::Fluxer.throttle());
+        assert!(fluxer.contains(r#""import_upstream:fluxer""#), "{}", fluxer);
+        assert_ne!(fluxer, debug(UpstreamThrottle::stoat()));
     }
 
     #[test]
@@ -862,6 +943,360 @@ mod tests {
         })
     }
 
+    // ---- Fluxer ----
+
+    /// Settings with Fluxer ready and pointed at `fake`
+    async fn fluxer_settings(fake: &FakeStoat) -> Settings {
+        let mut settings = config().await;
+        settings.api.import.challenge_secret = SECRET.to_string();
+        settings.api.import.fluxer = fluxer_fx::fluxer_config(fake);
+        settings.features.limits.global.restrict_server_creation = vec![];
+        assert!(settings.api.import.fluxer_ready());
+        settings
+    }
+
+    fn fluxer_code(user_id: &str, at: DateTime<Utc>) -> String {
+        code(SECRET.as_bytes(), "fluxer", user_id, at.date_naive())
+    }
+
+    /// A Fluxer guild where `user_id` made today's code role through the
+    /// web UI an hour before `now()`
+    async fn fluxer_fake(user_id: &str) -> FakeStoat {
+        let made = now() - chrono::Duration::hours(1);
+        fluxer_fx::Guild::ui_flow(
+            &fluxer_code(user_id, now()),
+            fluxer_fx::snowflake_at(made, 7),
+            made,
+        )
+        .fake(now())
+        .start()
+        .await
+    }
+
+    #[test]
+    fn happy_path_stores_a_verified_fluxer_job() {
+        crate::util::test::rt().block_on(async {
+            let harness = TestHarness::new().await;
+            let (_, _, user) = harness.new_user().await;
+            let fake = fluxer_fake(&user.id).await;
+            let settings = fluxer_settings(&fake).await;
+
+            let pasted = format!("https://fluxer.gg/{}", fluxer_fx::INVITE);
+            let started = start(&harness, &user, ImportSource::Fluxer, &pasted, &settings)
+                .await
+                .expect("import queued");
+
+            let job = harness
+                .db
+                .fetch_discord_import_job(&started.job_id)
+                .await
+                .expect("job stored");
+            assert_eq!(job.user_id, user.id);
+            assert_eq!(job.kind, ImportJobKind::FluxerServer);
+            assert_eq!(job.status, ImportStatus::Queued);
+            assert_eq!(job.stage, ImportStage::Verifying);
+            assert_eq!(job.template_code, pasted);
+            assert_eq!(job.source_server_id, Some(fluxer_fx::GUILD.to_string()));
+            assert_eq!(job.challenge_code, Some(fluxer_code(&user.id, now())));
+            assert!(!job.source_left);
+
+            // The invite is public; the four guild calls are the bot's
+            let seen = fake.seen();
+            assert_eq!(seen.len(), 5, "{seen:?}");
+            assert_eq!(seen[0].header("authorization"), None);
+            let bot = format!("Bot {}", fluxer_fx::BOT_TOKEN);
+            for call in &seen[1..] {
+                assert_eq!(
+                    call.header("authorization"),
+                    Some(bot.as_str()),
+                    "{}",
+                    call.path
+                );
+            }
+        })
+    }
+
+    #[test]
+    fn fluxer_job_by_guild_id_stores_the_canonical_id() {
+        crate::util::test::rt().block_on(async {
+            let harness = TestHarness::new().await;
+            let (_, _, user) = harness.new_user().await;
+            let fake = fluxer_fake(&user.id).await;
+            let settings = fluxer_settings(&fake).await;
+
+            let pasted = format!(" 0{} ", fluxer_fx::GUILD);
+            let started = start(&harness, &user, ImportSource::Fluxer, &pasted, &settings)
+                .await
+                .expect("import queued");
+            let job = harness
+                .db
+                .fetch_discord_import_job(&started.job_id)
+                .await
+                .unwrap();
+            assert_eq!(job.source_server_id, Some(fluxer_fx::GUILD.to_string()));
+            assert_eq!(fake.seen().len(), 4, "{:?}", fake.seen());
+        })
+    }
+
+    #[test]
+    fn failed_fluxer_verification_stores_nothing() {
+        crate::util::test::rt().block_on(async {
+            let harness = TestHarness::new().await;
+            let (_, _, user) = harness.new_user().await;
+            let (_, _, someone_else) = harness.new_user().await;
+            // The role carries a code, but another Sloga user's
+            let fake = fluxer_fake(&someone_else.id).await;
+            let settings = fluxer_settings(&fake).await;
+
+            assert_error(
+                start(
+                    &harness,
+                    &user,
+                    ImportSource::Fluxer,
+                    fluxer_fx::INVITE,
+                    &settings,
+                )
+                .await,
+                "ImportVerificationMissing",
+            );
+            // ...and a Stoat code on the role is not a Fluxer code
+            let stoat_code = code(SECRET.as_bytes(), "stoat", &user.id, now().date_naive());
+            let made = now() - chrono::Duration::hours(1);
+            let stoat_tagged =
+                fluxer_fx::Guild::ui_flow(&stoat_code, fluxer_fx::snowflake_at(made, 7), made)
+                    .fake(now())
+                    .start()
+                    .await;
+            assert_error(
+                start(
+                    &harness,
+                    &user,
+                    ImportSource::Fluxer,
+                    fluxer_fx::INVITE,
+                    &fluxer_settings(&stoat_tagged).await,
+                )
+                .await,
+                "ImportVerificationMissing",
+            );
+
+            assert!(harness
+                .db
+                .fetch_active_discord_import_job_for_user(&user.id)
+                .await
+                .unwrap()
+                .is_none());
+        })
+    }
+
+    #[test]
+    fn unparseable_fluxer_sources_make_no_upstream_call() {
+        crate::util::test::rt().block_on(async {
+            let harness = TestHarness::new().await;
+            let (_, _, user) = harness.new_user().await;
+            let fake = fluxer_fake(&user.id).await;
+            let settings = fluxer_settings(&fake).await;
+
+            for pasted in [
+                "",
+                "  ",
+                "a",
+                "../../admin",
+                "fluxer.gg/AbC123",
+                "Ab C123",
+                "https://fluxer.gg/%2e%2e",
+                "https://fluxer.gg/AbC123?x=1",
+                "1234",
+                "123456789012345678901",
+            ] {
+                let result = start(&harness, &user, ImportSource::Fluxer, pasted, &settings).await;
+                let expected = if pasted.is_empty() {
+                    "FailedValidation"
+                } else {
+                    "InvalidOperation"
+                };
+                assert!(
+                    matches!(
+                        &result,
+                        Err(error) if format!("{:?}", error.error_type).starts_with(expected)
+                    ),
+                    "{pasted:?}: {:?}",
+                    result.as_ref().err()
+                );
+            }
+            assert!(fake.seen().is_empty(), "{:?}", fake.seen());
+        })
+    }
+
+    /// The route guard holds for Fluxer as for Stoat: not ready, or a
+    /// plain-HTTP `api_url` under the production transport, makes no call
+    #[test]
+    fn fluxer_not_ready_is_unavailable() {
+        crate::util::test::rt().block_on(async {
+            let harness = TestHarness::new().await;
+            let (_, _, user) = harness.new_user().await;
+            let fake = fluxer_fake(&user.id).await;
+
+            let mut disabled = fluxer_settings(&fake).await;
+            disabled.api.import.fluxer.enabled = false;
+            let mut no_token = fluxer_settings(&fake).await;
+            no_token.api.import.fluxer.bot_token = String::new();
+            // Stoat's readiness says nothing about Fluxer
+            let mut only_stoat = ready_settings(&fake).await;
+            only_stoat.api.import.fluxer = Default::default();
+            for settings in [disabled, no_token, only_stoat] {
+                assert_error(
+                    start(
+                        &harness,
+                        &user,
+                        ImportSource::Fluxer,
+                        fluxer_fx::INVITE,
+                        &settings,
+                    )
+                    .await,
+                    "ImportSourceUnavailable",
+                );
+            }
+
+            let settings = fluxer_settings(&fake).await;
+            assert!(!ImportSource::Fluxer.ready(&settings.api.import));
+            assert_error(
+                start_source_import(
+                    &harness.db,
+                    &user,
+                    ImportSource::Fluxer,
+                    body(fluxer_fx::INVITE),
+                    &settings,
+                    now(),
+                    Transport::Production,
+                    &UpstreamThrottle::isolated_for_source_tests("fluxer"),
+                )
+                .await,
+                "ImportSourceUnavailable",
+            );
+            assert!(fake.seen().is_empty(), "{:?}", fake.seen());
+        })
+    }
+
+    /// Through the route, with every key in one namespace as the live
+    /// throttles share Redis: a user whose Stoat budget is spent can still
+    /// verify on Fluxer, and Fluxer budgets spent to the global cap never
+    /// refuse a Stoat verification
+    #[test]
+    fn fluxer_and_stoat_budgets_never_refuse_each_other() {
+        crate::util::test::rt().block_on(async {
+            let harness = TestHarness::new().await;
+            let (_, _, first) = harness.new_user().await;
+            let (_, _, second) = harness.new_user().await;
+            // Stoat verifies only `second`; Fluxer only `first`
+            let stoat_fake = verifying_fake(&second.id).await;
+            let fluxer_fake = fluxer_fake(&first.id).await;
+            let mut settings = ready_settings(&stoat_fake).await;
+            settings.api.import.fluxer = fluxer_fx::fluxer_config(&fluxer_fake);
+            assert!(settings.api.import.fluxer_ready());
+
+            let namespace = format!("import_upstream_test:{}", ulid::Ulid::new());
+            let stoat = UpstreamThrottle::in_test_namespace(&namespace, "stoat");
+            let fluxer = UpstreamThrottle::in_test_namespace(&namespace, "fluxer");
+            let guild = fluxer_fx::GUILD.to_string();
+
+            // `first` spends their Stoat verification...
+            assert_error(
+                start_source_with(
+                    &harness,
+                    &first,
+                    ImportSource::Stoat,
+                    SERVER,
+                    &settings,
+                    &stoat,
+                    now(),
+                )
+                .await,
+                "ImportVerificationMissing",
+            );
+            assert_error(
+                start_source_with(
+                    &harness,
+                    &first,
+                    ImportSource::Stoat,
+                    SERVER,
+                    &settings,
+                    &stoat,
+                    now(),
+                )
+                .await,
+                "ImportUpstreamUnavailable",
+            );
+            // ...and still verifies on Fluxer
+            start_source_with(
+                &harness,
+                &first,
+                ImportSource::Fluxer,
+                &guild,
+                &settings,
+                &fluxer,
+                now(),
+            )
+            .await
+            .expect("Fluxer unaffected by Stoat's spent budget");
+
+            // `second` spends both Fluxer verifications, then Fluxer's global
+            // budget is filled (after the guild's 10 s window has passed)
+            let later = now() + chrono::Duration::seconds(11);
+            for _ in 0..2 {
+                assert_error(
+                    start_source_with(
+                        &harness,
+                        &second,
+                        ImportSource::Fluxer,
+                        &guild,
+                        &settings,
+                        &fluxer,
+                        later,
+                    )
+                    .await,
+                    "ImportVerificationMissing",
+                );
+            }
+            assert_error(
+                start_source_with(
+                    &harness,
+                    &second,
+                    ImportSource::Fluxer,
+                    &guild,
+                    &settings,
+                    &fluxer,
+                    later,
+                )
+                .await,
+                "ImportUpstreamUnavailable",
+            );
+            for i in 0..10 {
+                let _ = fluxer
+                    .next_call(UpstreamTarget::Server(&format!("FILL{i}")), later)
+                    .await;
+            }
+            assert!(fluxer
+                .next_call(UpstreamTarget::Server("FILL10"), later)
+                .await
+                .is_err());
+
+            // Stoat still verifies `second`
+            let fluxer_calls = fluxer_fake.seen().len();
+            start_source_with(
+                &harness,
+                &second,
+                ImportSource::Stoat,
+                INVITE,
+                &settings,
+                &stoat,
+                later,
+            )
+            .await
+            .expect("Stoat unaffected by Fluxer's spent budgets");
+            assert_eq!(fluxer_fake.seen().len(), fluxer_calls);
+        })
+    }
+
     // ---- through Rocket: path parsing, ranking, default config ----
 
     /// The routed handler end to end: session guard, JSON body, the guards,
@@ -939,6 +1374,54 @@ mod tests {
                 .dispatch()
                 .await;
             assert_eq!(response.status(), Status::Ok);
+        })
+    }
+
+    /// `POST /import/fluxer/server` end to end: the path picks Fluxer's
+    /// parser and client, and the job is a Fluxer one
+    #[test]
+    fn routed_post_queues_a_verified_fluxer_import() {
+        crate::util::test::rt().block_on(async {
+            let harness = TestHarness::new().await;
+            let (_, session, user) = harness.new_user().await;
+
+            // The handler reads the real clock: the role is made "now"
+            let today = Utc::now();
+            let mine = fluxer_code(&user.id, today);
+            let fake = fluxer_fx::Guild::ui_flow(&mine, fluxer_fx::snowflake_at(today, 7), today)
+                .fake(today)
+                .start()
+                .await;
+            routed_test_upstream::route(
+                &user.id,
+                fluxer_settings(&fake).await,
+                UpstreamThrottle::isolated_for_source_tests("fluxer"),
+            );
+
+            let pasted = format!("https://web.fluxer.app/invite/{}", fluxer_fx::INVITE);
+            let response = harness
+                .client
+                .post("/import/fluxer/server")
+                .header(ContentType::JSON)
+                .header(Header::new("X-Session-Token", session.token.clone()))
+                .body(json!({ "source": pasted }).to_string())
+                .dispatch()
+                .await;
+            let status = response.status();
+            let text = response.into_string().await.unwrap_or_default();
+            assert_eq!(status, Status::Ok, "{text}");
+
+            let started: serde_json::Value = serde_json::from_str(&text).unwrap();
+            let job = harness
+                .db
+                .fetch_discord_import_job(started["job_id"].as_str().unwrap())
+                .await
+                .expect("job stored");
+            assert_eq!(job.kind, ImportJobKind::FluxerServer);
+            assert_eq!(job.template_code, pasted);
+            assert_eq!(job.source_server_id, Some(fluxer_fx::GUILD.to_string()));
+            assert_eq!(job.challenge_code, Some(mine));
+            assert_eq!(fake.seen().len(), 5, "{:?}", fake.seen());
         })
     }
 

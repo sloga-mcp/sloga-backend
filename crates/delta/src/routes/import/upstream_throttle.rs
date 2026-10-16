@@ -155,6 +155,7 @@ impl UpstreamThrottle {
     }
 
     /// The budgets for calls to Stoat
+    #[cfg(test)]
     pub fn stoat() -> UpstreamThrottle {
         UpstreamThrottle::for_source("stoat")
     }

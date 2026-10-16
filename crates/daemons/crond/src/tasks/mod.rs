@@ -6,6 +6,7 @@ pub mod discord_import;
 pub mod event_reminders;
 pub mod expire_supporters;
 pub mod file_deletion;
+pub mod fluxer_import;
 pub mod import_http;
 pub mod poll_expiry;
 pub mod prune_audit_log;

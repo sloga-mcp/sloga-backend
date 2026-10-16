@@ -100,7 +100,8 @@ impl From<DiscordImportJob> for ImportJobResponse {
 pub struct DataImportSourceServer {
     /// What names the source server. For Stoat: an invite link
     /// (`https://stoat.chat/invite/…`, `rvlt.gg/…`), a bare invite code, or
-    /// a server id.
+    /// a server id. For Fluxer: an invite link (`https://…/<code>`), a bare
+    /// invite code, or a guild id (17 to 20 digits).
     #[validate(length(min = 1, max = 256))]
     pub source: String,
 }

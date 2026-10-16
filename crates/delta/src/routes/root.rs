@@ -3,8 +3,9 @@ use revolt_result::Result;
 use rocket::serde::json::Json;
 use serde::Serialize;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 
-use super::import::ImportSource;
+use super::import::{api_url_is_https, ImportSource};
 
 /// # hCaptcha Configuration
 #[derive(Serialize, JsonSchema, Debug)]
@@ -70,6 +71,46 @@ pub struct ImportSourcesFeature {
     /// Importing a server from Stoat
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stoat: Option<ImportBotSourceFeature>,
+    /// Importing a server from Fluxer
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fluxer: Option<ImportBotSourceFeature>,
+}
+
+/// Fluxer's add-bot link: the OAuth2 authorize route on its API (which
+/// redirects to whichever web app Fluxer currently serves), asking for
+/// Administrator (`permissions=8`) so the bot can see private channels and
+/// the audit log. The route is appended to `api_url`'s own path, so a base
+/// with a path prefix keeps it.
+///
+/// `None` unless `bot_id` is a non-empty run of ASCII digits (a snowflake)
+/// and `api_url` is an absolute `https://` URL with a host and no
+/// credentials, query or fragment (the link is public).
+pub fn fluxer_add_bot_url(api_url: &str, bot_id: &str) -> Option<String> {
+    if bot_id.is_empty() || !bot_id.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+
+    if !api_url_is_https(api_url) {
+        return None;
+    }
+    let mut url = url::Url::parse(api_url.trim_end_matches('/')).ok()?;
+    if !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return None;
+    }
+
+    url.path_segments_mut()
+        .ok()?
+        .pop_if_empty()
+        .extend(["v1", "oauth2", "authorize"]);
+    url.query_pairs_mut()
+        .append_pair("client_id", bot_id)
+        .append_pair("scope", "bot")
+        .append_pair("permissions", "8");
+    Some(url.into())
 }
 
 /// Which import sources to advertise. A source is advertised only when its
@@ -82,6 +123,22 @@ pub fn import_sources_feature(config: &Settings) -> ImportSourcesFeature {
     let stoat_advertised =
         ImportSource::Stoat.ready(import) && !stoat.app_url.is_empty() && !stoat.bot_id.is_empty();
 
+    let fluxer = &import.fluxer;
+    let fluxer_url = if ImportSource::Fluxer.ready(import) {
+        let url = fluxer_add_bot_url(&fluxer.api_url, &fluxer.bot_id);
+        // Once per process: this runs on every `GET /`
+        static WARNED: AtomicBool = AtomicBool::new(false);
+        if url.is_none() && !WARNED.swap(true, Ordering::Relaxed) {
+            log::warn!(
+                "Fluxer import is ready but not advertised: bot_id must be digits only and \
+                 api_url an https URL without credentials, query or fragment"
+            );
+        }
+        url
+    } else {
+        None
+    };
+
     ImportSourcesFeature {
         stoat: stoat_advertised.then(|| ImportBotSourceFeature {
             add_bot_url: format!(
@@ -90,6 +147,7 @@ pub fn import_sources_feature(config: &Settings) -> ImportSourcesFeature {
                 stoat.bot_id
             ),
         }),
+        fluxer: fluxer_url.map(|add_bot_url| ImportBotSourceFeature { add_bot_url }),
     }
 }
 
@@ -446,7 +504,8 @@ mod test {
     fn import_sources_advertises_stoat_when_ready() {
         let config = ready_settings();
         assert!(config.api.import.stoat_ready());
-        // Release 1 advertises Stoat only, even with Fluxer fully configured
+        // Fluxer is fully configured but stays out: `01BOT` is not a Fluxer
+        // bot id, so no add-bot link can be built
         assert!(config.api.import.fluxer_ready());
         assert_eq!(
             import_sources_json(&config),
@@ -507,8 +566,138 @@ mod test {
         assert_eq!(response.status(), Status::Ok);
         let body: serde_json::Value =
             serde_json::from_str(&response.into_string().await.unwrap()).unwrap();
-        let expected = import_sources_json(&revolt_config::config().await);
+        let config = revolt_config::config().await;
+        let expected = import_sources_json(&config);
         assert!(expected.is_object());
         assert_eq!(body["features"]["import_sources"], expected);
+
+        // The test node's Fluxer source is not ready, so `GET /` leaves it out
+        assert!(!super::ImportSource::Fluxer.ready(&config.api.import));
+        assert!(body["features"]["import_sources"].get("fluxer").is_none());
+    }
+
+    const FLUXER_BOT_ID: &str = "1560481642991071233";
+
+    #[test]
+    fn fluxer_add_bot_url_appends_the_authorize_route() {
+        let expected = format!(
+            "https://api.fluxer.app/v1/oauth2/authorize?client_id={FLUXER_BOT_ID}&scope=bot&permissions=8"
+        );
+        for api_url in [
+            "https://api.fluxer.app",
+            "https://api.fluxer.app/",
+            "https://api.fluxer.app//",
+        ] {
+            assert_eq!(
+                super::fluxer_add_bot_url(api_url, FLUXER_BOT_ID).as_deref(),
+                Some(expected.as_str()),
+                "{api_url}"
+            );
+        }
+
+        // A path prefix on the base is kept, not replaced
+        for api_url in ["https://x.test/api", "https://x.test/api/"] {
+            assert_eq!(
+                super::fluxer_add_bot_url(api_url, "42").as_deref(),
+                Some("https://x.test/api/v1/oauth2/authorize?client_id=42&scope=bot&permissions=8"),
+                "{api_url}"
+            );
+        }
+    }
+
+    #[test]
+    fn fluxer_add_bot_url_rejects_bad_input() {
+        for bot_id in [
+            "",
+            "01BOT",
+            "123&scope=admin",
+            "123#x",
+            "123/../x",
+            " 123",
+            "123 ",
+            "+123",
+            "-123",
+        ] {
+            assert_eq!(
+                super::fluxer_add_bot_url("https://api.fluxer.app", bot_id),
+                None,
+                "bot_id {bot_id:?}"
+            );
+        }
+
+        for api_url in [
+            "http://api.fluxer.app",
+            "",
+            "api.fluxer.app",
+            "ftp://api.fluxer.app",
+            "https://",
+            "https://user:pw@api.fluxer.app",
+            "https://user@api.fluxer.app",
+            "https://api.fluxer.app/?x=1",
+            "https://api.fluxer.app/#x",
+        ] {
+            assert_eq!(
+                super::fluxer_add_bot_url(api_url, FLUXER_BOT_ID),
+                None,
+                "api_url {api_url:?}"
+            );
+        }
+    }
+
+    /// The node's own config with Fluxer configured the way the operator
+    /// would: digit bot id, default `https://` API URL
+    fn fluxer_ready_settings() -> revolt_config::Settings {
+        let mut config = crate::util::test::rt().block_on(revolt_config::config());
+        let import = &mut config.api.import;
+        import.challenge_secret = "secret".to_string();
+        import.fluxer.enabled = true;
+        import.fluxer.api_url = "https://api.fluxer.app".to_string();
+        import.fluxer.bot_id = FLUXER_BOT_ID.to_string();
+        import.fluxer.bot_token = "token".to_string();
+        config
+    }
+
+    #[test]
+    fn import_sources_leaves_fluxer_out_when_not_ready() {
+        type Darken = fn(&mut revolt_config::Settings);
+        let cases: [(&str, Darken); 6] = [
+            ("disabled", |c| c.api.import.fluxer.enabled = false),
+            ("no bot token", |c| c.api.import.fluxer.bot_token.clear()),
+            ("no challenge secret", |c| {
+                c.api.import.challenge_secret.clear()
+            }),
+            ("http api url", |c| {
+                c.api.import.fluxer.api_url = "http://api.fluxer.app".to_string()
+            }),
+            // Ready for the read path, but the link cannot be built
+            ("non-digit bot id", |c| {
+                c.api.import.fluxer.bot_id = "01BOT".to_string()
+            }),
+            ("credentials in api url", |c| {
+                c.api.import.fluxer.api_url = "https://u:p@api.fluxer.app".to_string()
+            }),
+        ];
+        for (name, darken) in cases {
+            let mut config = fluxer_ready_settings();
+            darken(&mut config);
+            assert!(
+                import_sources_json(&config).get("fluxer").is_none(),
+                "fluxer advertised with {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn fluxer_advertised_when_ready() {
+        let config = fluxer_ready_settings();
+        assert!(config.api.import.fluxer_ready());
+        assert!(super::ImportSource::Fluxer.ready(&config.api.import));
+
+        assert_eq!(
+            import_sources_json(&config)["fluxer"],
+            serde_json::json!({
+                "add_bot_url": "https://api.fluxer.app/v1/oauth2/authorize?client_id=1560481642991071233&scope=bot&permissions=8"
+            })
+        );
     }
 }

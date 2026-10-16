@@ -151,13 +151,16 @@ impl AssetLimits {
 /// source) live with the source, as inherent methods on [`FakeUpstream`].
 #[cfg(test)]
 pub(crate) mod fake_upstream {
-    use std::collections::HashMap;
+    use std::collections::{HashMap, VecDeque};
     use std::sync::{Arc, Mutex};
 
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
     pub(crate) const BOT_TOKEN: &str = "fake-bot-token";
+
+    /// Largest request body the fake reads.
+    const MAX_REQUEST_BODY: usize = 1024 * 1024;
 
     /// One request the fake received.
     #[derive(Clone, Debug)]
@@ -168,6 +171,9 @@ pub(crate) mod fake_upstream {
         pub headers: Vec<(String, String)>,
         /// The `x-bot-token` header (Stoat's bot credential), if sent.
         pub bot_token: Option<String>,
+        /// The request body, as long as its `Content-Length` said (empty
+        /// without one).
+        pub body: Vec<u8>,
     }
 
     impl Seen {
@@ -188,11 +194,17 @@ pub(crate) mod fake_upstream {
         /// Leave out `Content-Length` (the body ends at connection close),
         /// so a size cap must be enforced while streaming.
         no_length: bool,
+        /// Further response headers, written as given.
+        headers: Vec<(String, String)>,
     }
+
+    /// The replies scripted for one `(method, path)`, served in order; the
+    /// last one is repeated once the others are used up.
+    type Script = Arc<Mutex<HashMap<(String, String), VecDeque<Reply>>>>;
 
     pub(crate) struct FakeUpstream {
         pub url: String,
-        replies: HashMap<(String, String), Reply>,
+        replies: HashMap<(String, String), VecDeque<Reply>>,
         seen: Arc<Mutex<Vec<Seen>>>,
     }
 
@@ -205,10 +217,35 @@ pub(crate) mod fake_upstream {
             }
         }
 
+        /// Make `reply` the only answer to `method path`.
         fn with(mut self, method: &str, path: &str, reply: Reply) -> FakeUpstream {
-            self.replies
-                .insert((method.to_string(), path.to_string()), reply);
+            self.replies.insert(
+                (method.to_string(), path.to_string()),
+                VecDeque::from([reply]),
+            );
             self
+        }
+
+        /// Queue `reply` after the answers already scripted for `method path`.
+        fn then(mut self, method: &str, path: &str, reply: Reply) -> FakeUpstream {
+            self.replies
+                .entry((method.to_string(), path.to_string()))
+                .or_default()
+                .push_back(reply);
+            self
+        }
+
+        fn plain(status: u16, body: Vec<u8>, headers: &[(&str, &str)]) -> Reply {
+            Reply {
+                status,
+                body,
+                location: None,
+                no_length: false,
+                headers: headers
+                    .iter()
+                    .map(|(name, value)| (name.to_string(), value.to_string()))
+                    .collect(),
+            }
         }
 
         /// Answer `method path` with `status` and `body` as is.
@@ -219,16 +256,36 @@ pub(crate) mod fake_upstream {
             status: u16,
             body: impl Into<Vec<u8>>,
         ) -> FakeUpstream {
+            self.with(method, path, FakeUpstream::plain(status, body.into(), &[]))
+        }
+
+        /// Like `reply`, with extra response headers (`Retry-After`, ...).
+        pub(crate) fn reply_with_headers(
+            self,
+            method: &str,
+            path: &str,
+            status: u16,
+            body: impl Into<Vec<u8>>,
+            headers: &[(&str, &str)],
+        ) -> FakeUpstream {
             self.with(
                 method,
                 path,
-                Reply {
-                    status,
-                    body: body.into(),
-                    location: None,
-                    no_length: false,
-                },
+                FakeUpstream::plain(status, body.into(), headers),
             )
+        }
+
+        /// Answer the NEXT `method path` request this way, after the
+        /// replies already scripted for it. Each scripted reply is used once,
+        /// in order, and the last one is repeated from then on.
+        pub(crate) fn then_reply(
+            self,
+            method: &str,
+            path: &str,
+            status: u16,
+            body: impl Into<Vec<u8>>,
+        ) -> FakeUpstream {
+            self.then(method, path, FakeUpstream::plain(status, body.into(), &[]))
         }
 
         /// Like `reply`, without a `Content-Length` header.
@@ -247,6 +304,7 @@ pub(crate) mod fake_upstream {
                     body: body.into(),
                     location: None,
                     no_length: true,
+                    headers: Vec::new(),
                 },
             )
         }
@@ -261,8 +319,20 @@ pub(crate) mod fake_upstream {
                     body: Vec::new(),
                     location: Some(location.to_string()),
                     no_length: false,
+                    headers: Vec::new(),
                 },
             )
+        }
+
+        /// The reply for `key`: the next scripted one, or the last again.
+        fn next_reply(script: &Script, key: &(String, String)) -> Option<Reply> {
+            let mut script = script.lock().unwrap();
+            let queue = script.get_mut(key)?;
+            if queue.len() > 1 {
+                queue.pop_front()
+            } else {
+                queue.front().cloned()
+            }
         }
 
         /// Start serving; unscripted requests get 404.
@@ -270,23 +340,31 @@ pub(crate) mod fake_upstream {
             let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
             self.url = format!("http://{}", listener.local_addr().expect("addr"));
 
-            let replies = self.replies.clone();
+            let replies: Script = Arc::new(Mutex::new(self.replies.clone()));
             let seen = self.seen.clone();
             tokio::spawn(async move {
                 while let Ok((mut socket, _)) = listener.accept().await {
                     let replies = replies.clone();
                     let seen = seen.clone();
                     tokio::spawn(async move {
-                        let mut head = Vec::new();
+                        let mut raw = Vec::new();
                         let mut chunk = [0u8; 1024];
-                        while !head.windows(4).any(|w| w == b"\r\n\r\n") && head.len() < 65536 {
+                        while !raw.windows(4).any(|w| w == b"\r\n\r\n") && raw.len() < 65536 {
                             match socket.read(&mut chunk).await {
                                 Ok(0) | Err(_) => break,
-                                Ok(n) => head.extend_from_slice(&chunk[..n]),
+                                Ok(n) => raw.extend_from_slice(&chunk[..n]),
                             }
                         }
 
-                        let head = String::from_utf8_lossy(&head).to_string();
+                        // Whatever followed the blank line is the start of
+                        // the body; read the rest of what `Content-Length`
+                        // announced.
+                        let head_end = raw
+                            .windows(4)
+                            .position(|w| w == b"\r\n\r\n")
+                            .map_or(raw.len(), |at| at + 4);
+                        let mut body = raw.split_off(head_end);
+                        let head = String::from_utf8_lossy(&raw).to_string();
                         let mut words = head.split_whitespace();
                         let method = words.next().unwrap_or("").to_string();
                         let path = words.next().unwrap_or("").to_string();
@@ -307,19 +385,35 @@ pub(crate) mod fake_upstream {
                             .iter()
                             .find(|(name, _)| name == "x-bot-token")
                             .map(|(_, value)| value.clone());
+                        let length = headers
+                            .iter()
+                            .find(|(name, _)| name == "content-length")
+                            .and_then(|(_, value)| value.parse::<usize>().ok())
+                            .unwrap_or(0)
+                            .min(MAX_REQUEST_BODY);
+                        while body.len() < length {
+                            match socket.read(&mut chunk).await {
+                                Ok(0) | Err(_) => break,
+                                Ok(n) => body.extend_from_slice(&chunk[..n]),
+                            }
+                        }
+                        body.truncate(length);
                         seen.lock().unwrap().push(Seen {
                             method: method.clone(),
                             path: path.clone(),
                             headers,
                             bot_token,
+                            body,
                         });
 
-                        let reply = replies.get(&(method, path)).cloned().unwrap_or(Reply {
-                            status: 404,
-                            body: br#"{"type":"NotFound"}"#.to_vec(),
-                            location: None,
-                            no_length: false,
-                        });
+                        let reply =
+                            FakeUpstream::next_reply(&replies, &(method, path)).unwrap_or(Reply {
+                                status: 404,
+                                body: br#"{"type":"NotFound"}"#.to_vec(),
+                                location: None,
+                                no_length: false,
+                                headers: Vec::new(),
+                            });
                         let location = reply
                             .location
                             .map(|to| format!("location: {to}\r\n"))
@@ -329,8 +423,13 @@ pub(crate) mod fake_upstream {
                         } else {
                             format!("content-length: {}\r\n", reply.body.len())
                         };
+                        let extra: String = reply
+                            .headers
+                            .iter()
+                            .map(|(name, value)| format!("{name}: {value}\r\n"))
+                            .collect();
                         let mut response = format!(
-                            "HTTP/1.1 {} Scripted\r\n{location}{length}connection: close\r\n\r\n",
+                            "HTTP/1.1 {} Scripted\r\n{location}{length}{extra}connection: close\r\n\r\n",
                             reply.status
                         )
                         .into_bytes();
@@ -401,6 +500,66 @@ mod tests {
         assert_eq!(seen[1].bot_token.as_deref(), Some(BOT_TOKEN));
         assert_eq!(seen[1].header("x-bot-token"), Some(BOT_TOKEN));
         assert_eq!(seen[1].header("authorization"), None);
+    }
+
+    /// Scripted replies are served in order and the last one repeats; extra
+    /// reply headers arrive; request bodies are recorded.
+    #[tokio::test]
+    async fn the_fake_scripts_replies_in_order_and_records_bodies() {
+        let fake = FakeUpstream::new()
+            .reply_with_headers("DELETE", "/v1/x", 429, "{}", &[("Retry-After", "7")])
+            .then_reply("DELETE", "/v1/x", 204, "")
+            .reply("GET", "/v1/once", 200, "a")
+            .reply("GET", "/v1/once", 200, "b")
+            .start()
+            .await;
+        let client = client_builder(transport_for(&fake.url))
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .expect("client");
+
+        let mut statuses = Vec::new();
+        for _ in 0..3 {
+            let response = client
+                .delete(format!("{}/v1/x", fake.url))
+                .header("Content-Type", "application/json")
+                .body("{\"k\":1}")
+                .send()
+                .await
+                .expect("sent");
+            statuses.push((
+                response.status().as_u16(),
+                response
+                    .headers()
+                    .get("retry-after")
+                    .map(|value| value.to_str().unwrap().to_string()),
+            ));
+        }
+        assert_eq!(
+            statuses,
+            vec![
+                (429, Some("7".to_string())),
+                (204, None),
+                // The last scripted reply repeats.
+                (204, None),
+            ]
+        );
+
+        // `reply` still replaces what was scripted before it.
+        let body = client
+            .get(format!("{}/v1/once", fake.url))
+            .send()
+            .await
+            .expect("sent")
+            .text()
+            .await
+            .unwrap();
+        assert_eq!(body, "b");
+
+        let seen = fake.seen();
+        assert_eq!(seen.len(), 4, "{seen:?}");
+        assert!(seen[..3].iter().all(|s| s.body == b"{\"k\":1}"), "{seen:?}");
+        assert!(seen[3].body.is_empty());
     }
 
     #[test]

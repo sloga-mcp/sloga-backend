@@ -80,7 +80,7 @@ mod tests {
     use crate::util::test::TestHarness;
     use chrono::TimeZone;
     use revolt_config::{ApiImportBotSource, ApiImportMatrix};
-    use revolt_database::util::import_challenge::find_accepted_code;
+    use revolt_database::util::import_challenge::{accepted_codes_with_days, find_accepted_code};
     use revolt_database::BotInformation;
     use rocket::http::{Header, Status};
 
@@ -152,6 +152,32 @@ mod tests {
         })
     }
 
+    /// Fluxer is served once ready, with a code of its own tag: what the
+    /// Fluxer verification accepts, and never Stoat's
+    #[test]
+    fn returns_todays_fluxer_code() {
+        crate::util::test::rt().block_on(async {
+            let harness = TestHarness::new().await;
+            let (_, _, user) = harness.new_user().await;
+            let import = all_ready();
+            let now = Utc.with_ymd_and_hms(2026, 10, 15, 23, 59, 0).unwrap();
+
+            let issued = challenge_for(&user, ImportSource::Fluxer, &import, now).unwrap();
+            assert_eq!(
+                issued,
+                code(SECRET.as_bytes(), "fluxer", &user.id, now.date_naive())
+            );
+            assert_eq!(
+                accepted_codes_with_days(SECRET.as_bytes(), "fluxer", &user.id, now)[0],
+                (issued.clone(), now.date_naive())
+            );
+            assert_ne!(
+                issued,
+                challenge_for(&user, ImportSource::Stoat, &import, now).unwrap()
+            );
+        })
+    }
+
     #[test]
     fn not_found_unless_implemented_and_ready() {
         crate::util::test::rt().block_on(async {
@@ -160,35 +186,61 @@ mod tests {
             let now = Utc::now();
 
             // Configured, but not built in this release
-            for source in [ImportSource::Fluxer, ImportSource::Matrix] {
-                assert_eq!(
-                    error_name(challenge_for(&user, source, &all_ready(), now)),
-                    "NotFound"
-                );
-            }
+            assert_eq!(
+                error_name(challenge_for(
+                    &user,
+                    ImportSource::Matrix,
+                    &all_ready(),
+                    now
+                )),
+                "NotFound"
+            );
 
             // Built, but not ready
-            let mut disabled = all_ready();
-            disabled.stoat.enabled = false;
-            let mut no_secret = all_ready();
-            no_secret.challenge_secret = String::new();
-            let mut no_token = all_ready();
-            no_token.stoat.bot_token = String::new();
-            // The client refuses plain HTTP, so the source could never verify
-            let mut plain_http = all_ready();
-            plain_http.stoat.api_url = "http://api.example".to_string();
-            for import in [
-                disabled,
-                no_secret,
-                no_token,
-                plain_http,
-                ApiImport::default(),
-            ] {
-                assert_eq!(
-                    error_name(challenge_for(&user, ImportSource::Stoat, &import, now)),
-                    "NotFound"
-                );
+            fn bot_source(import: &mut ApiImport, source: ImportSource) -> &mut ApiImportBotSource {
+                match source {
+                    ImportSource::Fluxer => &mut import.fluxer,
+                    _ => &mut import.stoat,
+                }
             }
+            for source in [ImportSource::Stoat, ImportSource::Fluxer] {
+                let mut disabled = all_ready();
+                bot_source(&mut disabled, source).enabled = false;
+                let mut no_secret = all_ready();
+                no_secret.challenge_secret = String::new();
+                let mut no_token = all_ready();
+                bot_source(&mut no_token, source).bot_token = String::new();
+                // The client refuses plain HTTP, so the source could never verify
+                let mut plain_http = all_ready();
+                bot_source(&mut plain_http, source).api_url = "http://api.example".to_string();
+                for import in [
+                    disabled,
+                    no_secret,
+                    no_token,
+                    plain_http,
+                    ApiImport::default(),
+                ] {
+                    assert_eq!(
+                        error_name(challenge_for(&user, source, &import, now)),
+                        "NotFound",
+                        "{source:?}"
+                    );
+                }
+            }
+
+            // One source's readiness says nothing about another's
+            let mut only_stoat = all_ready();
+            only_stoat.fluxer = ApiImportBotSource::default();
+            assert_eq!(
+                error_name(challenge_for(&user, ImportSource::Fluxer, &only_stoat, now)),
+                "NotFound"
+            );
+            let mut only_fluxer = all_ready();
+            only_fluxer.stoat = ApiImportBotSource::default();
+            assert_eq!(
+                error_name(challenge_for(&user, ImportSource::Stoat, &only_fluxer, now)),
+                "NotFound"
+            );
 
             // Bots are refused before anything else
             let mut bot = user.clone();
