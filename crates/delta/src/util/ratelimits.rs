@@ -418,6 +418,22 @@ impl<'a> RatelimitResolver<Request<'a>> for DeltaRatelimits {
                 // must spend one counter. The route also enforces 5 per 30 s
                 // per user, which this fixed 10 s window cannot express.
                 ("lookup", _, _) => ("lookup", None),
+                // Stripe's payment webhook carries no session, so it is keyed
+                // by the sender's address: deliveries from one Stripe server
+                // share a counter that neither buyers nor the unmapped
+                // startup routes in "any" can spend.
+                ("payments", Some("stripe"), _) => ("payments_webhook", None),
+                // The public sale counter is cheap and polled by the Cipher
+                // page, sessionless or not, so it must not spend the tight
+                // checkout budget. Sessionless callers are keyed by IP.
+                ("payments", Some("cipher"), _) if extra == Some("stats") => {
+                    ("payments_stats", None)
+                }
+                // Checkout and @me, keyed per session. Checkout creates a
+                // Stripe session, so the budget is tight; the engine's one
+                // live Pending order per user bounds a user with many
+                // sessions independently of this counter.
+                ("payments", _, _) => ("payments", None),
                 _ => ("any", None),
             }
         } else {
@@ -566,6 +582,16 @@ impl<'a> RatelimitResolver<Request<'a>> for DeltaRatelimits {
             // allows a burst of 5 and the route's own per-user 30 s window
             // holds the rest of the contract.
             "lookup" => 5,
+            // Checkout + @me: a buyer clicks once and the page reads its
+            // standing a couple of times. 3 per window is ample for a human
+            // and keeps a script from minting checkout sessions.
+            "payments" => 3,
+            // One delivery per Stripe event plus Stripe's retries after a
+            // failed one. 60 leaves room for a retry burst after an outage.
+            "payments_webhook" => 60,
+            // Public sale counter: responses carry `max-age=30`, so a page
+            // left open costs about one request per 30 s.
+            "payments_stats" => 20,
             _ => 20,
         }
     }
@@ -627,6 +653,18 @@ mod tests {
     #[rocket::patch("/@me/supporter")]
     fn edit_supporter() {}
 
+    #[rocket::post("/cipher/checkout")]
+    fn cipher_checkout() {}
+
+    #[rocket::get("/cipher/@me")]
+    fn cipher_me() {}
+
+    #[rocket::get("/cipher/stats")]
+    fn cipher_stats() {}
+
+    #[rocket::post("/stripe/webhook")]
+    fn stripe_webhook() {}
+
     fn client() -> Client {
         let rocket = rocket::build()
             .manage(RatelimitStorage::new(DeltaRatelimits))
@@ -637,7 +675,11 @@ mod tests {
             .mount("/sync", rocket::routes![sync_settings])
             .mount("/kofi", rocket::routes![kofi_webhook])
             .mount("/referrals", rocket::routes![referral_code])
-            .mount("/users", rocket::routes![edit_user, edit_supporter]);
+            .mount("/users", rocket::routes![edit_user, edit_supporter])
+            .mount(
+                "/payments",
+                rocket::routes![cipher_checkout, cipher_me, cipher_stats, stripe_webhook],
+            );
         Client::untracked(rocket).expect("rocket builds without a database")
     }
 
@@ -866,6 +908,89 @@ mod tests {
             bucket(&any),
             bucket(&webhook),
             "payment deliveries must not compete with unmapped startup traffic"
+        );
+    }
+
+    #[test]
+    fn payments_routes_split_into_their_own_buckets() {
+        use revolt_ratelimits::ratelimiter::RatelimitResolver;
+
+        let client = client();
+
+        // The resolver, including the versioned prefix
+        for (method, path, expected) in [
+            ("POST", "/payments/cipher/checkout", "payments"),
+            ("GET", "/payments/cipher/@me", "payments"),
+            ("GET", "/0.8/payments/cipher/@me", "payments"),
+            ("GET", "/payments/cipher/stats", "payments_stats"),
+            ("GET", "/0.8/payments/cipher/stats", "payments_stats"),
+            ("POST", "/payments/stripe/webhook", "payments_webhook"),
+            ("POST", "/0.8/payments/stripe/webhook", "payments_webhook"),
+        ] {
+            let request = match method {
+                "POST" => client.post(path),
+                _ => client.get(path),
+            };
+            assert_eq!(
+                DeltaRatelimits.resolve_bucket(&*request),
+                (expected, None),
+                "{method} {path}"
+            );
+        }
+
+        // Checkout and @me spend one tight counter
+        let checkout = client.post("/payments/cipher/checkout").dispatch();
+        assert_eq!(checkout.status(), Status::Ok);
+        assert_eq!(limit(&checkout), 3);
+        let me = client.get("/payments/cipher/@me").dispatch();
+        assert_eq!(me.status(), Status::Ok);
+        assert_eq!(limit(&me), 3);
+        assert_eq!(
+            bucket(&checkout),
+            bucket(&me),
+            "checkout and @me must share one counter"
+        );
+
+        let stats = client.get("/payments/cipher/stats").dispatch();
+        assert_eq!(stats.status(), Status::Ok);
+        assert_eq!(limit(&stats), 20);
+        let webhook = client.post("/payments/stripe/webhook").dispatch();
+        assert_eq!(webhook.status(), Status::Ok);
+        assert_eq!(limit(&webhook), 60);
+        let any = client.get("/sync/settings").dispatch();
+        let buckets = [
+            bucket(&checkout),
+            bucket(&stats),
+            bucket(&webhook),
+            bucket(&any),
+        ];
+        for (i, a) in buckets.iter().enumerate() {
+            for b in &buckets[i + 1..] {
+                assert_ne!(
+                    a, b,
+                    "payments, stats, webhook and any must be distinct counters"
+                );
+            }
+        }
+
+        // The third request exhausts the window and the fourth is refused
+        assert_eq!(
+            client.post("/payments/cipher/checkout").dispatch().status(),
+            Status::Ok
+        );
+        assert_eq!(
+            client.get("/payments/cipher/@me").dispatch().status(),
+            Status::TooManyRequests
+        );
+
+        // Neither the public counter nor Stripe's deliveries are spent by it
+        assert_eq!(
+            client.get("/payments/cipher/stats").dispatch().status(),
+            Status::Ok
+        );
+        assert_eq!(
+            client.post("/payments/stripe/webhook").dispatch().status(),
+            Status::Ok
         );
     }
 

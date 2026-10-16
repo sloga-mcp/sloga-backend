@@ -206,6 +206,7 @@ revolt-files = { version = "0.13.7", path = "crates/core/files" }
 revolt-gamedata = { version = "0.13.7", path = "crates/core/gamedata" }
 revolt-models = { version = "0.13.7", path = "crates/core/models" }
 revolt-parser = { version = "0.13.7", path = "crates/core/parser" }
+revolt-payments = { version = "0.13.7", path = "crates/core/payments" }
 revolt-permissions = { version = "0.13.7", path = "crates/core/permissions" }
 revolt-presence = { version = "0.13.7", path = "crates/core/presence" }
 revolt-ratelimits = { version = "0.13.7", path = "crates/core/ratelimits" }
