@@ -18,6 +18,7 @@ use std::{
 };
 use url::{Host, Url};
 
+use crate::game_cards::{self, EmbedCacheKey};
 use crate::ip_policy;
 
 // TODO config
@@ -106,8 +107,8 @@ lazy_static! {
         .time_to_live(Duration::from_secs(60)) // For up to 1 minute
         .build();
 
-    /// Cache for embed results
-    static ref EMBED_CACHE: moka::future::Cache<String, Embed> = moka::future::Cache::builder()
+    /// Cache for embed results, keyed by `game_cards::embed_cache_key`
+    static ref EMBED_CACHE: moka::future::Cache<EmbedCacheKey, Embed> = moka::future::Cache::builder()
         // TODO config
         .max_capacity(10_000) // Cache up to 10k embeds
         .time_to_live(Duration::from_secs(60)) // For up to 1 minute
@@ -274,7 +275,7 @@ impl Request {
         url: &str,
         request: Option<Request>,
     ) -> Result<Option<Image>> {
-        if let Some(hit) = EMBED_CACHE.get(url).await {
+        if let Some(hit) = EMBED_CACHE.get(&game_cards::embed_cache_key(url, false)).await {
             match hit {
                 Embed::Image(img) => Ok(Some(img)),
                 _ => Ok(None),
@@ -320,7 +321,7 @@ impl Request {
         url: &str,
         request: Option<Request>,
     ) -> Result<Option<Video>> {
-        if let Some(hit) = EMBED_CACHE.get(url).await {
+        if let Some(hit) = EMBED_CACHE.get(&game_cards::embed_cache_key(url, false)).await {
             match hit {
                 Embed::Video(vid) => Ok(Some(vid)),
                 _ => Ok(None),
@@ -354,7 +355,23 @@ impl Request {
     }
 
     /// Generate embed for a given URL
-    pub async fn generate_embed(mut url: String) -> Result<Embed> {
+    ///
+    /// `enrich` (the caller presented the internal key) allows a game card:
+    /// judged on the request URL alone, before any rewrite or page fetch.
+    /// When no card can be built the normal preview below is used.
+    pub async fn generate_embed(mut url: String, enrich: bool) -> Result<Embed> {
+        if let Some(target) = game_cards::game_target_for(&url, enrich) {
+            let key = game_cards::embed_cache_key(&url, enrich);
+            if let Some(hit) = EMBED_CACHE.get(&key).await {
+                return Ok(hit);
+            }
+
+            if let Some(embed) = game_cards::card_embed(&target, &url).await {
+                EMBED_CACHE.insert(key, embed.clone()).await;
+                return Ok(embed);
+            }
+        }
+
         // Re-map certain links for better metadata generation
         if RE_URL_NEW_REDDIT.is_match(&url) {
             url = RE_URL_NEW_REDDIT
@@ -371,7 +388,8 @@ impl Request {
         }
 
         // Generate the actual embed
-        if let Some(hit) = EMBED_CACHE.get(&url).await {
+        let key = game_cards::embed_cache_key(&url, enrich);
+        if let Some(hit) = EMBED_CACHE.get(&key).await {
             Ok(hit)
         } else {
             let request = Request::new_from_str(&url).await?;
@@ -417,7 +435,7 @@ impl Request {
                 EmbedKind::None => Embed::None,
             };
 
-            EMBED_CACHE.insert(url.to_owned(), embed.clone()).await;
+            EMBED_CACHE.insert(key, embed.clone()).await;
             Ok(embed)
         }
     }
@@ -1449,6 +1467,53 @@ mod tests {
             assert!(
                 matches!(error.error_type, ErrorType::FileTypeNotAllowed),
                 "{value}"
+            );
+        }
+    }
+
+    /// A distinct embed per `tag`
+    fn tagged(tag: &str) -> Embed {
+        Embed::Image(Image {
+            url: format!("https://example.com/{tag}.png"),
+            width: 1,
+            height: 1,
+            size: ImageSize::Preview,
+        })
+    }
+
+    #[tokio::test]
+    async fn embed_cache_never_mixes_cards_and_plain_previews_of_game_links() {
+        // Served from the cache only: neither call reaches the network
+        let url = "https://store.steampowered.com/app/4242/cache_split/";
+        EMBED_CACHE
+            .insert(game_cards::embed_cache_key(url, false), tagged("plain"))
+            .await;
+        EMBED_CACHE
+            .insert(game_cards::embed_cache_key(url, true), tagged("card"))
+            .await;
+
+        assert_eq!(
+            Request::generate_embed(url.to_string(), false).await.unwrap(),
+            tagged("plain")
+        );
+        assert_eq!(
+            Request::generate_embed(url.to_string(), true).await.unwrap(),
+            tagged("card")
+        );
+    }
+
+    #[tokio::test]
+    async fn embed_cache_is_shared_for_every_other_link() {
+        let url = "https://blog.example/cache_shared";
+        EMBED_CACHE
+            .insert(game_cards::embed_cache_key(url, false), tagged("shared"))
+            .await;
+
+        for enrich in [false, true] {
+            assert_eq!(
+                Request::generate_embed(url.to_string(), enrich).await.unwrap(),
+                tagged("shared"),
+                "enrich={enrich}"
             );
         }
     }

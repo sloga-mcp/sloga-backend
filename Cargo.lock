@@ -7312,6 +7312,7 @@ dependencies = [
  "reqwest 0.13.4",
  "revolt-config",
  "revolt-files",
+ "revolt-gamedata",
  "revolt-models",
  "revolt-result",
  "scraper",

@@ -17,6 +17,7 @@ use axum::{
 };
 use futures::{future::Either, Stream, StreamExt};
 use reqwest::header;
+use revolt_gamedata::GameData;
 use revolt_models::v0::Embed;
 use revolt_result::{create_error, Result};
 use serde::{Deserialize, Serialize};
@@ -100,6 +101,20 @@ async fn proxy(Query(UrlQuery { url }): Query<UrlQuery>) -> Result<impl IntoResp
     })
 }
 
+/// Header an internal caller (the embed worker) sends to unlock game cards
+const INTERNAL_KEY_HEADER: &str = "x-internal-key";
+
+/// Whether this `/embed` request may build a game card (and so spend the
+/// shared game data budget). Decided only by `GameData::internal_key_ok`,
+/// which fails closed when no key is configured.
+fn enrich_requested(gd: &GameData, headers: &HeaderMap) -> bool {
+    gd.internal_key_ok(
+        headers
+            .get(INTERNAL_KEY_HEADER)
+            .and_then(|value| value.to_str().ok()),
+    )
+}
+
 /// Generate embed for a given URL
 #[utoipa::path(
     get,
@@ -116,9 +131,11 @@ async fn proxy(Query(UrlQuery { url }): Query<UrlQuery>) -> Result<impl IntoResp
 )]
 async fn embed(
     Query(UrlQuery { url }): Query<UrlQuery>,
+    headers: HeaderMap,
     // TypedHeader(Authorization(_bearer)): TypedHeader<Authorization<Bearer>>,
 ) -> Result<impl IntoResponse> {
-    match Request::generate_embed(url).await {
+    let enrich = enrich_requested(GameData::global().await, &headers);
+    match Request::generate_embed(url, enrich).await {
         Ok(Embed::None) => Err(create_error!(NoEmbedData)),
         result => result,
     }
@@ -629,6 +646,42 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Game data client whose configured internal key is `key`
+    async fn game_data_with_key(key: &str) -> GameData {
+        let mut settings = revolt_config::config().await;
+        settings.api.gamedata.internal_key = key.to_string();
+        GameData::from_config(&settings)
+    }
+
+    fn with_key_header(value: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert("X-Internal-Key", HeaderValue::from_str(value).unwrap());
+        headers
+    }
+
+    #[tokio::test]
+    async fn enrichment_needs_the_configured_internal_key() {
+        let gd = game_data_with_key("k3y-for-tests").await;
+        assert!(enrich_requested(&gd, &with_key_header("k3y-for-tests")));
+        assert!(!enrich_requested(&gd, &with_key_header("wrong")));
+        assert!(!enrich_requested(&gd, &with_key_header("")));
+        assert!(!enrich_requested(&gd, &HeaderMap::new()));
+    }
+
+    #[tokio::test]
+    async fn an_unconfigured_key_never_unlocks_enrichment() {
+        for configured in ["", "   "] {
+            let gd = game_data_with_key(configured).await;
+            for presented in ["", "   ", "anything"] {
+                assert!(
+                    !enrich_requested(&gd, &with_key_header(presented)),
+                    "{configured:?} {presented:?}"
+                );
+            }
+            assert!(!enrich_requested(&gd, &HeaderMap::new()));
+        }
+    }
 
     type Item = std::result::Result<Bytes, std::io::Error>;
 

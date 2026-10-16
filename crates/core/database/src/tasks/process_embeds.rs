@@ -56,6 +56,7 @@ pub async fn worker(db: Database) {
             let embeds = generate(
                 task.content,
                 &config.hosts.january,
+                &config.api.gamedata.internal_key,
                 config.features.limits.global.message_embeds,
                 semaphore,
             )
@@ -89,9 +90,32 @@ pub async fn worker(db: Database) {
 static RE_CODE: Lazy<Regex> = Lazy::new(|| Regex::new("```(?:.|\n)+?```|`(?:.|\n)+?`").unwrap());
 static RE_IGNORED: Lazy<Regex> = Lazy::new(|| Regex::new("(<http.+>)").unwrap());
 
+/// Header that lets January build game cards (and spend the shared game
+/// data budget) for the worker's requests
+const INTERNAL_KEY_HEADER: &str = "X-Internal-Key";
+
+/// January `/embed` request for `link`. The internal key is sent only when
+/// one is configured; the header is marked sensitive so it is never printed.
+fn embed_request(host: &str, link: &str, internal_key: &str) -> Option<isahc::Request<()>> {
+    let mut builder = isahc::Request::get(format!(
+        "{host}/embed?url={}",
+        url_escape::encode_component(link)
+    ));
+
+    if !internal_key.trim().is_empty() {
+        if let Ok(mut value) = isahc::http::HeaderValue::from_str(internal_key) {
+            value.set_sensitive(true);
+            builder = builder.header(INTERNAL_KEY_HEADER, value);
+        }
+    }
+
+    builder.body(()).ok()
+}
+
 pub async fn generate(
     content: String,
     host: &str,
+    internal_key: &str,
     max_embeds: usize,
     semaphore: Arc<Semaphore>,
 ) -> Result<Vec<Embed>> {
@@ -144,16 +168,12 @@ pub async fn generate(
 
     for link in links {
         let semaphore = semaphore.clone();
-        let host = host.to_string();
+        let request = embed_request(host, &link, internal_key);
         tasks.push(spawn(async move {
+            let request = request?;
             let guard = semaphore.acquire().await;
 
-            if let Ok(mut response) = isahc::get_async(format!(
-                "{host}/embed?url={}",
-                url_escape::encode_component(&link)
-            ))
-            .await
-            {
+            if let Ok(mut response) = request.send_async().await {
                 drop(guard);
                 let status_ok = response.status().is_success();
                 keep_embed(status_ok, response.json::<Embed>().await.ok())
@@ -191,8 +211,35 @@ fn keep_embed(status_ok: bool, embed: Option<Embed>) -> Option<Embed> {
 
 #[cfg(test)]
 mod tests {
-    use super::keep_embed;
+    use super::{embed_request, keep_embed, INTERNAL_KEY_HEADER};
     use revolt_models::v0::{Embed, Image, ImageSize};
+
+    const LINK: &str = "https://store.steampowered.com/app/620/?a=1&b=2";
+    const URI: &str =
+        "http://january:14705/embed?url=https%3A%2F%2Fstore.steampowered.com%2Fapp%2F620%2F%3Fa%3D1%26b%3D2";
+
+    #[test]
+    fn internal_key_is_sent_when_configured() {
+        let request = embed_request("http://january:14705", LINK, "s3cret").expect("request");
+        assert_eq!(request.uri().to_string(), URI);
+        let value = request
+            .headers()
+            .get(INTERNAL_KEY_HEADER)
+            .expect("internal key header");
+        assert_eq!(value.to_str().unwrap(), "s3cret");
+        assert!(value.is_sensitive());
+        assert!(!format!("{request:?}").contains("s3cret"));
+    }
+
+    #[test]
+    fn no_internal_key_header_without_a_configured_key() {
+        for key in ["", "   "] {
+            let request = embed_request("http://january:14705", LINK, key).expect("request");
+            assert_eq!(request.uri().to_string(), URI);
+            assert!(request.headers().get(INTERNAL_KEY_HEADER).is_none(), "{key:?}");
+            assert!(request.headers().is_empty(), "{key:?}");
+        }
+    }
 
     fn image() -> Embed {
         Embed::Image(Image {
