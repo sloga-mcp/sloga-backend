@@ -7207,6 +7207,7 @@ dependencies = [
  "reqwest 0.13.4",
  "revolt-config",
  "revolt-database",
+ "revolt-gamedata",
  "revolt-models",
  "revolt-permissions",
  "revolt-presence",

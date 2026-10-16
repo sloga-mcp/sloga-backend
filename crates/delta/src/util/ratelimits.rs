@@ -407,6 +407,13 @@ impl<'a> RatelimitResolver<Request<'a>> for DeltaRatelimits {
                 // and deliberately NOT keyed per code: walking codes must
                 // spend one counter.
                 ("referrals", _, _) => ("referrals", None),
+                // Game lookups (GET /lookup/games) each may spend the shared
+                // upstream `interactive` budget (Steam store, Blizzard), so
+                // they get a tight bucket of their own instead of the shared
+                // "any" one. Not keyed per source or query: switching either
+                // must spend one counter. The route also enforces 5 per 30 s
+                // per user, which this fixed 10 s window cannot express.
+                ("lookup", _, _) => ("lookup", None),
                 _ => ("any", None),
             }
         } else {
@@ -549,6 +556,12 @@ impl<'a> RatelimitResolver<Request<'a>> for DeltaRatelimits {
             // flipping filters. 10 per window is ample for a human and keeps
             // a script from hammering the indexed fetch.
             "audit_log" => 10,
+            // Game lookups: a user picking a game types a query and maybe
+            // refines it once or twice. The plan's limit is 5 per 30 s; the
+            // fairing's window is a fixed 10 s for every bucket, so this
+            // allows a burst of 5 and the route's own per-user 30 s window
+            // holds the rest of the contract.
+            "lookup" => 5,
             _ => 20,
         }
     }
@@ -1018,6 +1031,80 @@ mod tests {
             bans.headers().get_one("X-RateLimit-Remaining"),
             Some("2"),
             "the servers bucket has spent exactly its own three requests"
+        );
+    }
+
+    #[rocket::get("/games?<source>&<q>")]
+    fn lookup_games(source: Option<&str>, q: Option<&str>) -> &'static str {
+        let _ = (source, q);
+        "[]"
+    }
+
+    /// The lookup routes, on the same database-free Rocket as `client()`.
+    fn lookup_client() -> Client {
+        let rocket = rocket::build()
+            .manage(RatelimitStorage::new(DeltaRatelimits))
+            .attach(RatelimitFairing)
+            .mount("/", revolt_ratelimits::rocket::routes())
+            .mount("/lookup", rocket::routes![lookup_games])
+            .mount("/sync", rocket::routes![sync_settings]);
+        Client::untracked(rocket).expect("rocket builds without a database")
+    }
+
+    /// GET /lookup/games resolves to the tight `lookup` bucket (limit 5),
+    /// one counter for every source and query, and never to `any`.
+    #[test]
+    fn lookup_games_has_its_own_tight_bucket() {
+        use revolt_ratelimits::ratelimiter::RatelimitResolver;
+
+        let client = lookup_client();
+
+        // The resolver itself, before routing, exactly as `on_request` runs it.
+        for request in [
+            client.get("/lookup/games?source=steam&q=portal"),
+            client.get("/lookup/games?source=wow&q=thunderfury"),
+            client.get("/lookup/games"),
+            client.get("/0.8/lookup/games?source=lol&q=ahri"),
+        ] {
+            assert_eq!(DeltaRatelimits.resolve_bucket(&*request), ("lookup", None));
+        }
+        assert_eq!(DeltaRatelimits.resolve_bucket_limit("lookup"), 5);
+
+        // Through the fairing: limit 5, distinct from the shared any bucket.
+        let first = client.get("/lookup/games?source=steam&q=a").dispatch();
+        assert_eq!(first.status(), Status::Ok);
+        assert_eq!(limit(&first), 5);
+
+        let any = client.get("/sync/settings").dispatch();
+        assert_eq!(limit(&any), 20);
+        assert_ne!(
+            bucket(&any),
+            bucket(&first),
+            "lookups must not share the any bucket"
+        );
+
+        // Switching source or query spends the same counter.
+        for (n, source) in ["wow", "lol", "steam", "wow"].iter().enumerate() {
+            let path = format!("/lookup/games?source={source}&q=q{n}");
+            let response = client.get(path.as_str()).dispatch();
+            assert_eq!(response.status(), Status::Ok);
+            assert_eq!(bucket(&response), bucket(&first));
+        }
+        assert_eq!(
+            client
+                .get("/lookup/games?source=lol&q=zed")
+                .dispatch()
+                .status(),
+            Status::TooManyRequests
+        );
+
+        // The shared any bucket is untouched by the spent lookups.
+        let any = client.get("/sync/settings").dispatch();
+        assert_eq!(any.status(), Status::Ok);
+        assert_eq!(
+            any.headers().get_one("X-RateLimit-Remaining"),
+            Some("18"),
+            "the any bucket has spent exactly its own two requests"
         );
     }
 }
