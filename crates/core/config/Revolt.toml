@@ -109,6 +109,13 @@ app_url = "https://stoat.chat"
 cdn_url = "https://cdn.stoatusercontent.com"
 bot_id = ""
 bot_token = ""
+# crond makes the bot leave any Stoat server it joined more than this many
+# hours ago that no import job is using (someone added the bot and never
+# finished verifying). Needs only api_url and bot_token. 0 = off. Turn it on
+# (24) in the overrides of exactly ONE deployment: every crond judges by its
+# own database, so a second one holding the same token would evict the bot
+# from servers the first is importing.
+reconcile_after_hours = 0
 
 [api.import.fluxer]
 # Import a Fluxer guild through an operator-run public bot on fluxer.app.
@@ -120,6 +127,12 @@ app_url = "https://fluxer.app"
 cdn_url = "https://fluxerusercontent.com"
 bot_id = ""
 bot_token = ""
+# crond makes the bot leave any Fluxer guild it joined more than this many
+# hours ago that no import job is using. The bot holds Administrator there,
+# so turn it on (24, what the import screen promises) in the overrides of
+# exactly ONE deployment, the one that runs Fluxer imports: every crond
+# judges by its own database. 0 = off.
+reconcile_after_hours = 0
 
 [api.import.matrix]
 # Import a Matrix space through an operator-run bot account the user invites.

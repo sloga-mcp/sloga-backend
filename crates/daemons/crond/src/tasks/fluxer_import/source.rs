@@ -801,7 +801,7 @@ pub(crate) mod fake_upstream {
 
     impl FakeUpstream {
         /// A ready `[api.import.fluxer]` whose API is this fake and whose CDN
-        /// is `cdn`.
+        /// is `cdn`, with the bot reconcile on (24 h).
         pub(crate) fn fluxer_config(&self, cdn: &FakeUpstream) -> ApiImportBotSource {
             ApiImportBotSource {
                 enabled: true,
@@ -810,6 +810,7 @@ pub(crate) mod fake_upstream {
                 cdn_url: cdn.url.clone(),
                 bot_id: "1300000000000000999".to_string(),
                 bot_token: BOT_TOKEN.to_string(),
+                reconcile_after_hours: 24,
             }
         }
     }

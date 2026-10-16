@@ -75,8 +75,24 @@ async fn init_file_keyring() {
     }
 }
 
+/// The `RUST_LOG` crond starts with: the operator's (or `info`), with the
+/// WebSocket frame logs forced off.
+///
+/// tungstenite traces every frame's whole payload, and the Stoat reconcile's
+/// `Authenticate` frame carries the bot token (the REST calls mark theirs
+/// sensitive; a frame cannot be). A directive later in the list wins over an
+/// earlier one for the same module, so appending overrides `trace` set by
+/// hand.
+fn log_filter(operator: Option<String>) -> String {
+    let base = operator
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "info".to_string());
+    format!("{base},tungstenite=off,tokio_tungstenite=off")
+}
+
 #[tokio::main]
 async fn main() {
+    std::env::set_var("RUST_LOG", log_filter(std::env::var("RUST_LOG").ok()));
     configure!(crond);
     init_file_keyring().await;
 
@@ -110,8 +126,58 @@ async fn main() {
         cron_task_wrapper(expire_supporters::task, db.clone(), amqp.clone()),
         cron_task_wrapper(stream_live::task, db.clone(), amqp.clone()),
         cron_task_wrapper(discord_import::task, db.clone(), amqp.clone()),
+        cron_task_wrapper(stoat_import::reconcile::task, db.clone(), amqp.clone()),
         cron_task_wrapper(fluxer_import::reconcile::task, db.clone(), amqp.clone()),
         cron_task_wrapper(afk_sweep::task, db.clone(), amqp.clone()),
         cron_task_wrapper(antispam_daily::task, db.clone(), amqp.clone()),
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use log::{Level, Metadata};
+
+    use super::log_filter;
+
+    fn enabled(filter: &str, target: &str, level: Level) -> bool {
+        env_logger::filter::Builder::new()
+            .parse(filter)
+            .build()
+            .enabled(&Metadata::builder().level(level).target(target).build())
+    }
+
+    /// The bot token rides a WebSocket frame, and tungstenite traces frames
+    /// whole: no operator `RUST_LOG` may turn that back on.
+    #[test]
+    fn frame_traces_stay_off_whatever_rust_log_says() {
+        for operator in [
+            None,
+            Some(""),
+            Some("info"),
+            Some("trace"),
+            Some("tungstenite=trace,tokio_tungstenite=trace"),
+            Some("debug,revolt_crond=trace"),
+        ] {
+            let filter = log_filter(operator.map(str::to_string));
+            for target in [
+                "tungstenite::protocol",
+                "tungstenite::protocol::frame",
+                "tokio_tungstenite",
+            ] {
+                assert!(
+                    !enabled(&filter, target, Level::Error),
+                    "{operator:?} {target}"
+                );
+            }
+        }
+
+        // Everything else keeps the operator's level.
+        assert!(enabled(&log_filter(None), "revolt_crond", Level::Info));
+        assert!(!enabled(&log_filter(None), "revolt_crond", Level::Debug));
+        assert!(enabled(
+            &log_filter(Some("trace".into())),
+            "revolt_crond",
+            Level::Trace
+        ));
+    }
 }

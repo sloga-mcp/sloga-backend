@@ -94,6 +94,7 @@ mod tests {
             cdn_url: "https://cdn.example".to_string(),
             bot_id: "01BOT000000000000000000000".to_string(),
             bot_token: "token".to_string(),
+            reconcile_after_hours: 24,
         }
     }
 

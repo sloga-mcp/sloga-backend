@@ -513,6 +513,7 @@ pub(super) mod fixtures {
             cdn_url: "https://cdn.fluxer.example".to_string(),
             bot_id: BOT_USER.to_string(),
             bot_token: BOT_TOKEN.to_string(),
+            reconcile_after_hours: 24,
         }
     }
 

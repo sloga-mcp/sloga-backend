@@ -5,8 +5,16 @@
 //! that is never started, or fails verification, has no job to make the bot
 //! leave. Left alone the bot would keep Administrator in that guild for
 //! good. Every [`PASS_INTERVAL`] this pass lists the guilds the bot is in and
-//! leaves each one it joined at least [`GRACE_HOURS`] ago that no Fluxer job
-//! has touched in the last [`GRACE_HOURS`].
+//! leaves each one it joined at least `reconcile_after_hours` ago that no
+//! Fluxer job has touched in the last `reconcile_after_hours`. The explain
+//! screen promises 24 hours to finish, so a deployment that turns this on
+//! sets 24 or more.
+//!
+//! 🔴 Opt-in, on exactly ONE deployment (`[api.import.fluxer]`
+//! `reconcile_after_hours`, 0 = off by default: the pass then sends nothing).
+//! "No job is using it" is read from this crond's own database, so any other
+//! deployment holding the same bot token (the home box, a live leg) would
+//! evict the bot from guilds this one is importing, and the other way round.
 //!
 //! When the bot joined comes from Fluxer (`joined_at` of
 //! `GET /v1/guilds/{id}/members/@me`), not from this process, so a crond
@@ -32,6 +40,7 @@
 #[cfg(test)]
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use futures::future::BoxFuture;
@@ -51,10 +60,8 @@ const FIRST_PASS_DELAY: Duration = Duration::from_secs(10 * 60);
 /// Time between passes.
 const PASS_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
 
-/// How long ago the bot must have joined a guild, and how long the guild must
-/// have gone without a Fluxer job, before the bot leaves it. The explain
-/// screen promises 24 hours to finish.
-pub(crate) const GRACE_HOURS: i64 = 24;
+/// Whether the switched-off notice has been logged in this process.
+static OFF_NOTED: AtomicBool = AtomicBool::new(false);
 
 /// Pages of `GET /v1/users/@me/guilds` read per pass (5000 guilds).
 pub(crate) const MAX_LIST_PAGES: usize = 25;
@@ -108,15 +115,25 @@ pub async fn task(db: Database, _amqp: AMQP) -> Result<()> {
 }
 
 /// One pass for `[api.import.fluxer]`. Nothing is sent, and `None` comes
-/// back, without an API URL and a bot token: no bot could have been added.
+/// back, when `reconcile_after_hours` is 0 (switched off, logged once), or
+/// without an API URL and a bot token: no bot could have been added.
 pub(crate) async fn run_configured_pass(
     jobs: &dyn RecentJobs,
     config: &ApiImportBotSource,
     cursor: &mut Option<Snowflake>,
     pacing: &Pacing,
 ) -> Option<PassReport> {
+    let grace_hours = config.reconcile_after_hours;
+    if grace_hours == 0 {
+        if !OFF_NOTED.swap(true, Ordering::Relaxed) {
+            log::info!(
+                "fluxer reconcile: reconcile_after_hours is 0; the bot reconcile is switched off"
+            );
+        }
+        return None;
+    }
     let api = FluxerApi::new(config)?;
-    run_pass(jobs, &api, cursor, pacing).await
+    run_pass(jobs, &api, cursor, pacing, grace_hours).await
 }
 
 /// The guilds the bot is in, as far as one pass could read them.
@@ -180,17 +197,23 @@ pub(crate) async fn list_guilds(api: &FluxerApi, pacing: &Pacing) -> Option<List
 }
 
 /// THE rule, with no I/O: the bot leaves a guild only when no Fluxer job is
-/// recent on it and Fluxer says the bot joined it at least [`GRACE_HOURS`]
+/// recent on it and Fluxer says the bot joined it at least `grace_hours`
 /// before `now`. A join time that is not known, or lies in the future, keeps
-/// the bot.
-pub(crate) fn should_leave(joined_at: Option<Timestamp>, now: Timestamp, recent_job: bool) -> bool {
-    if recent_job {
+/// the bot, and so does a grace of 0 (the reconcile is switched off).
+pub(crate) fn should_leave(
+    joined_at: Option<Timestamp>,
+    now: Timestamp,
+    recent_job: bool,
+    grace_hours: u32,
+) -> bool {
+    if recent_job || grace_hours == 0 {
         return false;
     }
     let Some(joined) = joined_at else {
         return false;
     };
-    let Some(cutoff) = now.checked_sub(iso8601_timestamp::Duration::hours(GRACE_HOURS)) else {
+    let grace = iso8601_timestamp::Duration::hours(i64::from(grace_hours));
+    let Some(cutoff) = now.checked_sub(grace) else {
         return false;
     };
     joined <= cutoff
@@ -205,6 +228,7 @@ pub(crate) fn guilds_to_leave(
     joined_at: &HashMap<Snowflake, Option<Timestamp>>,
     now: Timestamp,
     recent: &HashSet<Snowflake>,
+    grace_hours: u32,
 ) -> Vec<Snowflake> {
     listed
         .iter()
@@ -214,6 +238,7 @@ pub(crate) fn guilds_to_leave(
                 joined_at.get(guild).copied().flatten(),
                 now,
                 recent.contains(guild),
+                grace_hours,
             )
         })
         .collect()
@@ -230,20 +255,22 @@ pub(crate) fn pass_order(listed: &[Snowflake], cursor: Option<Snowflake>) -> Vec
     order
 }
 
-/// Whether a Fluxer job is active on a guild or touched it within
-/// [`GRACE_HOURS`]. `None` when that cannot be read, which keeps the bot.
+/// Whether a Fluxer job is active on a guild or touched it within the last
+/// `grace_hours`. `None` when that cannot be read, which keeps the bot.
 ///
 /// The database in production; a seam so a test can make a job appear at a
 /// chosen moment.
 pub(crate) trait RecentJobs: Sync {
-    fn recent_job(&self, guild: Snowflake) -> BoxFuture<'_, Option<bool>>;
+    fn recent_job(&self, guild: Snowflake, grace_hours: u32) -> BoxFuture<'_, Option<bool>>;
 }
 
 impl RecentJobs for Database {
-    fn recent_job(&self, guild: Snowflake) -> BoxFuture<'_, Option<bool>> {
+    fn recent_job(&self, guild: Snowflake, grace_hours: u32) -> BoxFuture<'_, Option<bool>> {
         Box::pin(async move {
+            // A grace no clock could subtract counts every job ever made.
             let since = Timestamp::now_utc()
-                .checked_sub(iso8601_timestamp::Duration::hours(GRACE_HOURS))?;
+                .checked_sub(iso8601_timestamp::Duration::hours(i64::from(grace_hours)))
+                .unwrap_or(Timestamp::UNIX_EPOCH);
             match self
                 .has_recent_job_for_source(&ImportJobKind::FluxerServer, &guild.to_string(), since)
                 .await
@@ -273,7 +300,7 @@ pub(crate) struct PassReport {
     pub gone: usize,
     /// A Fluxer job is active on the guild or touched it within the grace.
     pub kept_for_job: usize,
-    /// The bot joined less than [`GRACE_HOURS`] ago.
+    /// The bot joined less than `reconcile_after_hours` ago.
     pub kept_joined_recently: usize,
     /// Fluxer gave no readable join time.
     pub kept_join_unknown: usize,
@@ -334,10 +361,11 @@ async fn visit(
     api: &FluxerApi,
     guild: Snowflake,
     now: Timestamp,
+    grace_hours: u32,
     calls: &mut Calls<'_>,
     report: &mut PassReport,
 ) -> Visit {
-    let recent = match jobs.recent_job(guild).await {
+    let recent = match jobs.recent_job(guild, grace_hours).await {
         Some(false) => false,
         Some(true) => {
             report.kept_for_job += 1;
@@ -373,7 +401,7 @@ async fn visit(
         }
     };
 
-    if !should_leave(joined_at, now, recent) {
+    if !should_leave(joined_at, now, recent, grace_hours) {
         if joined_at.is_none() {
             log::warn!("fluxer reconcile: no readable joined_at for guild {guild}; staying");
             report.kept_join_unknown += 1;
@@ -384,7 +412,7 @@ async fn visit(
     }
 
     loop {
-        match jobs.recent_job(guild).await {
+        match jobs.recent_job(guild, grace_hours).await {
             Some(false) => {}
             Some(true) => {
                 report.kept_for_job += 1;
@@ -422,11 +450,14 @@ async fn visit(
 /// One pass: list, then visit each guild in [`pass_order`] until done or
 /// out of calls, moving `cursor` past every guild finished; log the counts.
 /// `None` when the listing failed (nothing is visited, `cursor` is kept).
+/// `grace_hours` is `reconcile_after_hours`, which [`run_configured_pass`]
+/// has already checked is not 0.
 pub(crate) async fn run_pass(
     jobs: &dyn RecentJobs,
     api: &FluxerApi,
     cursor: &mut Option<Snowflake>,
     pacing: &Pacing,
+    grace_hours: u32,
 ) -> Option<PassReport> {
     let Some(listing) = list_guilds(api, pacing).await else {
         log::warn!("fluxer reconcile: could not list the bot's guilds; nothing left this pass");
@@ -448,7 +479,7 @@ pub(crate) async fn run_pass(
     let now = Timestamp::now_utc();
 
     for guild in pass_order(&listing.guilds, *cursor) {
-        match visit(jobs, api, guild, now, &mut calls, &mut report).await {
+        match visit(jobs, api, guild, now, grace_hours, &mut calls, &mut report).await {
             Visit::Done => *cursor = Some(guild),
             Visit::Stop => break,
         }
@@ -500,6 +531,10 @@ mod tests {
         max_retry_after: Duration::from_secs(5),
         max_calls: MAX_CALLS_PER_PASS,
     };
+
+    /// The `reconcile_after_hours` most tests run with (the fixture's).
+    const GRACE: u32 = 24;
+    const GRACE_HOURS: i64 = GRACE as i64;
 
     /// The database `TEST_DB` names (refuses to run without it).
     async fn database() -> Database {
@@ -609,18 +644,46 @@ mod tests {
         };
 
         // Joined exactly 24 h ago, or longer, with no recent job: leave.
-        assert!(should_leave(ago(GRACE_HOURS, 0), now, false));
-        assert!(should_leave(ago(24 * 30, 0), now, false));
+        assert!(should_leave(ago(GRACE_HOURS, 0), now, false, GRACE));
+        assert!(should_leave(ago(24 * 30, 0), now, false, GRACE));
         // A second short of 24 h: stay.
-        assert!(!should_leave(ago(GRACE_HOURS, 1), now, false));
-        assert!(!should_leave(ago(1, 0), now, false));
+        assert!(!should_leave(ago(GRACE_HOURS, 1), now, false, GRACE));
+        assert!(!should_leave(ago(1, 0), now, false, GRACE));
         // Joined "in the future" (clock skew): stay.
-        assert!(!should_leave(ago(-1, 0), now, false));
+        assert!(!should_leave(ago(-1, 0), now, false, GRACE));
         // A recent job keeps the bot however old the join.
-        assert!(!should_leave(ago(24 * 30, 0), now, true));
+        assert!(!should_leave(ago(24 * 30, 0), now, true, GRACE));
         // No known join time: stay.
-        assert!(!should_leave(None, now, false));
-        assert!(!should_leave(None, now, true));
+        assert!(!should_leave(None, now, false, GRACE));
+        assert!(!should_leave(None, now, true, GRACE));
+    }
+
+    /// The boundary is the configured `reconcile_after_hours`, not a fixed
+    /// 24; 0 (switched off) never leaves, and a grace no clock could
+    /// subtract keeps everything.
+    #[test]
+    fn the_rule_uses_the_configured_grace() {
+        let now = Timestamp::now_utc();
+        let ago = |hours: i64, seconds: i64| {
+            now.checked_sub(iso8601_timestamp::Duration::hours(hours))
+                .and_then(|t| t.checked_add(iso8601_timestamp::Duration::seconds(seconds)))
+        };
+
+        // Exactly 48 h: past a 48 h grace and a 24 h one.
+        assert!(should_leave(ago(48, 0), now, false, 48));
+        assert!(should_leave(ago(48, 0), now, false, 24));
+        // A second short of 48 h: inside a 48 h grace, past a 24 h one.
+        assert!(!should_leave(ago(48, 1), now, false, 48));
+        assert!(should_leave(ago(48, 1), now, false, 24));
+        // 30 h: inside 48, past 24.
+        assert!(!should_leave(ago(30, 0), now, false, 48));
+        assert!(should_leave(ago(30, 0), now, false, 24));
+        // A second short of 24 h: inside both.
+        assert!(!should_leave(ago(24, 1), now, false, 24));
+
+        // 0 is "off": however old the join, never a reason to leave.
+        assert!(!should_leave(ago(24 * 365, 0), now, false, 0));
+        assert!(!should_leave(ago(24 * 365, 0), now, false, u32::MAX));
     }
 
     #[test]
@@ -645,8 +708,13 @@ mod tests {
         let recent: HashSet<Snowflake> = [Snowflake(3)].into_iter().collect();
 
         assert_eq!(
-            guilds_to_leave(&ids(&[6, 5, 4, 3, 2, 1]), &joined_at, now, &recent),
+            guilds_to_leave(&ids(&[6, 5, 4, 3, 2, 1]), &joined_at, now, &recent, GRACE),
             ids(&[6, 1])
+        );
+        // With a 48 h grace only the exact-48 h join is past it; 6 (24 h) stays.
+        assert_eq!(
+            guilds_to_leave(&ids(&[6, 5, 4, 3, 2, 1]), &joined_at, now, &recent, 48),
+            ids(&[1])
         );
     }
 
@@ -691,7 +759,7 @@ mod tests {
         let fake = fake_with(&[(11, 23), (12, GRACE_HOURS + 1), (13, 48), (14, 48)]).await;
 
         let mut cursor = None;
-        let report = run_pass(&db, &api(&fake), &mut cursor, &FAST)
+        let report = run_pass(&db, &api(&fake), &mut cursor, &FAST, GRACE)
             .await
             .unwrap();
         assert_eq!(
@@ -728,7 +796,9 @@ mod tests {
             .start()
             .await;
 
-        let report = run_pass(&db, &api(&fake), &mut None, &FAST).await.unwrap();
+        let report = run_pass(&db, &api(&fake), &mut None, &FAST, GRACE)
+            .await
+            .unwrap();
         assert_eq!(report.kept_join_unknown, 4, "{report:?}");
         assert_eq!(report.left, 0);
         assert!(deletes(&fake).is_empty(), "{:?}", deletes(&fake));
@@ -748,7 +818,9 @@ mod tests {
             .start()
             .await;
 
-        let report = run_pass(&db, &api(&fake), &mut None, &FAST).await.unwrap();
+        let report = run_pass(&db, &api(&fake), &mut None, &FAST, GRACE)
+            .await
+            .unwrap();
         assert_eq!(report.gone, 1, "{report:?}");
         assert_eq!(report.failed, 2, "{report:?}");
         assert_eq!(report.left, 0);
@@ -765,7 +837,7 @@ mod tests {
     }
 
     impl RecentJobs for JobAppearsBeforeLeave {
-        fn recent_job(&self, guild: Snowflake) -> BoxFuture<'_, Option<bool>> {
+        fn recent_job(&self, guild: Snowflake, grace_hours: u32) -> BoxFuture<'_, Option<bool>> {
             Box::pin(async move {
                 if guild == self.guild && self.checks.fetch_add(1, Ordering::SeqCst) == 1 {
                     let mut job = DiscordImportJob::new_source(
@@ -778,7 +850,7 @@ mod tests {
                     job.status = ImportStatus::Queued;
                     self.db.insert_discord_import_job(&job).await.unwrap();
                 }
-                self.db.recent_job(guild).await
+                self.db.recent_job(guild, grace_hours).await
             })
         }
     }
@@ -795,7 +867,7 @@ mod tests {
             checks: AtomicUsize::new(0),
         };
 
-        let report = run_pass(&jobs, &api(&fake), &mut None, &FAST)
+        let report = run_pass(&jobs, &api(&fake), &mut None, &FAST, GRACE)
             .await
             .unwrap();
         assert_eq!(jobs.checks.load(Ordering::SeqCst), 2);
@@ -828,7 +900,7 @@ mod tests {
         assert_eq!(FAST.max_calls, PRODUCTION_PACING.max_calls);
 
         let mut cursor = None;
-        let report = run_pass(&db, &api(&fake), &mut cursor, &FAST)
+        let report = run_pass(&db, &api(&fake), &mut cursor, &FAST, GRACE)
             .await
             .unwrap();
         assert!(report.capped, "{report:?}");
@@ -861,7 +933,9 @@ mod tests {
 
         let mut cursor = None;
         for expected in [2, 4, 1] {
-            run_pass(&db, &api, &mut cursor, &small).await.unwrap();
+            run_pass(&db, &api, &mut cursor, &small, GRACE)
+                .await
+                .unwrap();
             assert_eq!(cursor, Some(Snowflake(expected)));
         }
         // Unscripted leaves answer 404 (left), and the fake keeps listing
@@ -870,7 +944,9 @@ mod tests {
 
         // A new process starts from the lowest id again.
         let mut fresh = None;
-        run_pass(&db, &api, &mut fresh, &small).await.unwrap();
+        run_pass(&db, &api, &mut fresh, &small, GRACE)
+            .await
+            .unwrap();
         assert_eq!(fresh, Some(Snowflake(2)));
     }
 
@@ -892,7 +968,7 @@ mod tests {
 
         let mut cursor = None;
         let started = Instant::now();
-        let report = run_pass(&db, &api(&fake), &mut cursor, &FAST)
+        let report = run_pass(&db, &api(&fake), &mut cursor, &FAST, GRACE)
             .await
             .unwrap();
         assert!(
@@ -931,7 +1007,9 @@ mod tests {
         };
 
         let started = Instant::now();
-        let report = run_pass(&db, &api(&fake), &mut None, &quick).await.unwrap();
+        let report = run_pass(&db, &api(&fake), &mut None, &quick, GRACE)
+            .await
+            .unwrap();
         assert!(started.elapsed() < Duration::from_secs(30));
         assert_eq!(report.left, 1, "{report:?}");
     }
@@ -978,7 +1056,10 @@ mod tests {
                 .await,
         ] {
             let mut cursor = Some(Snowflake(70));
-            assert_eq!(run_pass(&db, &api(&fake), &mut cursor, &FAST).await, None);
+            assert_eq!(
+                run_pass(&db, &api(&fake), &mut cursor, &FAST, GRACE).await,
+                None
+            );
             assert!(lookups(&fake).is_empty());
             assert!(deletes(&fake).is_empty());
             assert_eq!(cursor, Some(Snowflake(70)), "the cursor is kept");
@@ -1015,5 +1096,80 @@ mod tests {
             .await
             .is_some());
         assert_eq!(deletes(&fake), vec![leave_path(81)]);
+    }
+
+    /// `reconcile_after_hours = 0` (the default) switches the pass off:
+    /// nothing is listed, looked up or left, and the cursor stays put.
+    #[tokio::test]
+    async fn switched_off_no_calls() {
+        let db = database().await;
+        let fake = fake_with(&[(85, 24 * 30)]).await;
+
+        let mut config = fake.fluxer_config(&fake);
+        config.reconcile_after_hours = 0;
+        let mut cursor = None;
+        for _ in 0..2 {
+            assert_eq!(
+                run_configured_pass(&db, &config, &mut cursor, &FAST).await,
+                None
+            );
+        }
+        assert!(fake.seen().is_empty(), "{:?}", fake.seen());
+        assert_eq!(cursor, None);
+
+        // Switched on, the same fake is called: the check above is not
+        // vacuous.
+        config.reconcile_after_hours = GRACE;
+        assert!(run_configured_pass(&db, &config, &mut cursor, &FAST)
+            .await
+            .is_some());
+        assert_eq!(deletes(&fake), vec![leave_path(85)]);
+    }
+
+    /// A whole pass judges both the join time and the last job by the
+    /// configured `reconcile_after_hours`, read from the config.
+    #[tokio::test]
+    async fn a_pass_uses_the_configured_grace() {
+        // Joined 30 h ago; joined 50 h ago; joined 72 h ago with a job
+        // finished 30 h ago.
+        let guilds = [(91, 30), (92, 50), (93, 72)];
+
+        let db = database().await;
+        job_on(&db, 93, 30).await;
+
+        // 48 h: 91 joined too recently, 93's job is recent, 92 is left.
+        let fake = fake_with(&guilds).await;
+        let mut config = fake.fluxer_config(&fake);
+        config.reconcile_after_hours = 48;
+        let report = run_configured_pass(&db, &config, &mut None, &FAST)
+            .await
+            .unwrap();
+        assert_eq!(
+            report,
+            PassReport {
+                listed: 3,
+                complete: true,
+                calls: 3,
+                left: 1,
+                kept_for_job: 1,
+                kept_joined_recently: 1,
+                ..PassReport::default()
+            }
+        );
+        assert_eq!(deletes(&fake), vec![leave_path(92)]);
+        assert_eq!(lookups(&fake), vec![lookup_path(91), lookup_path(92)]);
+
+        // 24 h: every one of them is past it, the job included.
+        let fake = fake_with(&guilds).await;
+        let mut config = fake.fluxer_config(&fake);
+        config.reconcile_after_hours = 24;
+        let report = run_configured_pass(&db, &config, &mut None, &FAST)
+            .await
+            .unwrap();
+        assert_eq!(report.left, 3, "{report:?}");
+        assert_eq!(
+            deletes(&fake),
+            vec![leave_path(91), leave_path(92), leave_path(93)]
+        );
     }
 }

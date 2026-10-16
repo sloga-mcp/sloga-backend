@@ -15,8 +15,12 @@
 //! failed or reaped), through the worker's `on_terminal` and its leave
 //! retry. Upstream calls per import: server + emojis + leave, plus the CDN
 //! downloads on another host.
+//!
+//! A server where no job was ever created (the bot was added, then nobody
+//! finished verifying) is left by the hourly `reconcile` instead.
 
 pub(crate) mod mapper;
+pub(crate) mod reconcile;
 pub(crate) mod source;
 
 use std::collections::HashSet;

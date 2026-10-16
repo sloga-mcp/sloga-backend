@@ -437,6 +437,17 @@ pub struct ApiImportBotSource {
     /// never logged, never surfaced in any response body.
     #[serde(default)]
     pub bot_token: String,
+    /// crond makes the bot leave any server it joined more than this many
+    /// hours ago that no import job is using (a user who added the bot and
+    /// never finished verifying). `0`, the default, turns that reconcile off.
+    /// Stoat and Fluxer read it; Matrix does not yet.
+    ///
+    /// Opt-in, and on exactly ONE deployment: each crond judges "no job is
+    /// using it" by its own database, so a second deployment holding the
+    /// same bot token would evict the bot from servers the first one is
+    /// importing.
+    #[serde(default)]
+    pub reconcile_after_hours: u32,
 }
 
 impl ApiImportBotSource {
@@ -448,6 +459,7 @@ impl ApiImportBotSource {
             cdn_url: cdn_url.to_string(),
             bot_id: String::new(),
             bot_token: String::new(),
+            reconcile_after_hours: 0,
         }
     }
 
@@ -492,6 +504,7 @@ impl std::fmt::Debug for ApiImportBotSource {
             cdn_url,
             bot_id,
             bot_token: _,
+            reconcile_after_hours,
         } = self;
 
         f.debug_struct("ApiImportBotSource")
@@ -501,6 +514,7 @@ impl std::fmt::Debug for ApiImportBotSource {
             .field("cdn_url", cdn_url)
             .field("bot_id", bot_id)
             .field("bot_token", &"<redacted>")
+            .field("reconcile_after_hours", reconcile_after_hours)
             .finish()
     }
 }
@@ -2367,6 +2381,7 @@ mod import_config_tests {
             cdn_url: "https://cdn.example.test".to_string(),
             bot_id: "01BOTID".to_string(),
             bot_token: STOAT_TOKEN.to_string(),
+            reconcile_after_hours: 24,
         }
     }
 
@@ -2387,6 +2402,7 @@ mod import_config_tests {
         assert_eq!(stoat.cdn_url, "https://cdn.stoatusercontent.com");
         assert!(stoat.bot_id.is_empty());
         assert!(stoat.bot_token.is_empty());
+        assert_eq!(stoat.reconcile_after_hours, 0);
     }
 
     fn assert_fluxer_defaults(fluxer: &ApiImportBotSource) {
@@ -2565,7 +2581,22 @@ mod import_config_tests {
         // can never be ready from it alone
         assert_eq!(partial.stoat.bot_id, "x");
         assert!(partial.stoat.api_url.is_empty());
+        // A table that leaves the reconcile out (heart1's today) gets it off
+        assert_eq!(partial.stoat.reconcile_after_hours, 0);
         assert_fluxer_defaults(&partial.fluxer);
+    }
+
+    /// The operator turns the bot reconcile on (and picks its grace) in the
+    /// overrides of the one deployment that owns the bot
+    #[test]
+    fn overrides_set_the_reconcile_grace() {
+        for (value, expected) in [(0, 0), (24, 24), (6, 6)] {
+            let overrides = format!("[api.import.stoat]\nreconcile_after_hours = {value}\n");
+            let settings =
+                settings(bundled().add_source(File::from_str(&overrides, FileFormat::Toml)));
+            assert_eq!(settings.api.import.stoat.reconcile_after_hours, expected);
+            assert_eq!(settings.api.import.fluxer.reconcile_after_hours, 0);
+        }
     }
 
     /// Overrides on top of the baked file: the operator sets only the secrets
@@ -2582,6 +2613,7 @@ mod import_config_tests {
         assert!(import.stoat_ready());
         assert_eq!(import.stoat.api_url, "https://api.stoat.chat");
         assert_eq!(import.stoat.cdn_url, "https://cdn.stoatusercontent.com");
+        assert_eq!(import.stoat.reconcile_after_hours, 0);
         assert!(!import.fluxer_ready());
         assert!(!import.matrix_ready());
         assert!(import.any_enabled());

@@ -12,6 +12,11 @@
 //! spent some of it, so nothing here retries: a 429 is "Stoat is
 //! unavailable", and the user tries again.
 //!
+//! The bot reconcile also opens one events (WebSocket) session an hour to
+//! read the bot's own memberships from `Ready`; Stoat has no REST route that
+//! lists them. Its URL comes from the API root and must be on the API host,
+//! the app host or a subdomain of the app host (see [`events_url_allowed`]).
+//!
 //! Every response body is read through a size cap, aborting as soon as it is
 //! exceeded. The transport, timeouts, user agent, capped read and asset caps
 //! are shared with the other source importers (`tasks::import_http`).
@@ -23,14 +28,25 @@
 
 use std::collections::HashMap;
 use std::fmt;
+use std::time::Duration;
 
 use futures::future::BoxFuture;
-use reqwest::header::HeaderValue;
+use futures::{SinkExt, Stream, StreamExt};
+use iso8601_timestamp::Timestamp;
+use reqwest::header::{
+    HeaderValue, CONNECTION, SEC_WEBSOCKET_ACCEPT, SEC_WEBSOCKET_KEY, SEC_WEBSOCKET_VERSION,
+    UPGRADE,
+};
 use reqwest::{StatusCode, Url};
 use revolt_config::ApiImportBotSource;
 use serde::de::{Deserializer, MapAccess, Visitor};
 use serde::Deserialize;
 use serde_json::Value;
+use tokio_tungstenite::tungstenite::handshake::client::generate_key;
+use tokio_tungstenite::tungstenite::handshake::derive_accept_key;
+use tokio_tungstenite::tungstenite::protocol::{Role, WebSocketConfig};
+use tokio_tungstenite::tungstenite::{Error as WsError, Message};
+use tokio_tungstenite::WebSocketStream;
 
 use crate::tasks::discord_import::assets::AssetFetcher;
 use crate::tasks::discord_import::mapper::{AssetKind, PlannedAsset};
@@ -515,6 +531,278 @@ impl StoatApi {
             false
         }
     }
+
+    /// The bot's own user id (`GET /users/@me`, the `users` bucket).
+    pub(crate) async fn fetch_self_id(&self) -> Result<String, StoatError> {
+        #[derive(Deserialize)]
+        struct Me {
+            #[serde(rename = "_id")]
+            id: String,
+        }
+
+        let body = self.get_json("/users/@me").await?;
+        let me: Me = serde_json::from_slice(&body).map_err(|_| StoatError::Malformed)?;
+        // User and server ids share one shape.
+        if !is_server_id(&me.id) {
+            return Err(StoatError::Malformed);
+        }
+        Ok(me.id)
+    }
+
+    /// The events URL the API root advertises (`GET /` → `ws`), if it is
+    /// one the token may be sent to (see [`events_url_allowed`]).
+    async fn events_url(&self, app_url: &str) -> Result<Url, StoatError> {
+        #[derive(Deserialize)]
+        struct Root {
+            ws: String,
+        }
+
+        let body = self.get_json("/").await?;
+        let root: Root = serde_json::from_slice(&body).map_err(|_| StoatError::Malformed)?;
+        let url = Url::parse(&root.ws).map_err(|_| StoatError::Malformed)?;
+        if !events_url_allowed(&url, &self.api_url, app_url) {
+            log::warn!(
+                "stoat import: the API advertises events at {url}, which is not on the API or \
+                 app host; the bot will not send its token there"
+            );
+            return Err(StoatError::Malformed);
+        }
+        Ok(url)
+    }
+
+    /// Every server the bot is a member of, with its join time, read from
+    /// ONE events session (see [`EventsLimits`]).
+    pub(crate) async fn fetch_memberships(
+        &self,
+        app_url: &str,
+        limits: EventsLimits,
+    ) -> Result<Vec<BotMembership>, StoatError> {
+        let self_id = self.fetch_self_id().await?;
+        let url = self.events_url(app_url).await?;
+        let members = tokio::time::timeout(limits.deadline, self.ready_members(url, limits))
+            .await
+            .map_err(|_| StoatError::Unavailable)??;
+        Ok(own_memberships(&members, &self_id))
+    }
+
+    /// Connect, authenticate and return `Ready.members`, closing after.
+    ///
+    /// The connection is a reqwest HTTP/1.1 upgrade, so it has the same
+    /// transport rules as every other call here (HTTPS only, no redirects,
+    /// system proxy). The token rides only the `Authenticate` frame, never
+    /// the URL, where it would reach access logs.
+    async fn ready_members(
+        &self,
+        url: Url,
+        limits: EventsLimits,
+    ) -> Result<Vec<Value>, StoatError> {
+        let mut http = url;
+        let scheme = if http.scheme() == "wss" {
+            "https"
+        } else {
+            "http"
+        };
+        http.set_scheme(scheme).map_err(|_| StoatError::Malformed)?;
+        // `ready=` trims Ready to the fields named (upstream b3ca4399). An
+        // older bonfire ignores it and sends everything, which still parses.
+        http.query_pairs_mut()
+            .append_pair("version", "1")
+            .append_pair("format", "json")
+            .append_pair("ready", "members");
+
+        let client = client_builder(transport_for(http.as_str()))
+            .http1_only()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .map_err(|_| StoatError::Unavailable)?;
+
+        let key = generate_key();
+        let response = client
+            .get(http)
+            .header(CONNECTION, "upgrade")
+            .header(UPGRADE, "websocket")
+            .header(SEC_WEBSOCKET_VERSION, "13")
+            .header(SEC_WEBSOCKET_KEY, &key)
+            .send()
+            .await
+            .map_err(|_| StoatError::Unavailable)?;
+
+        if response.status() != StatusCode::SWITCHING_PROTOCOLS {
+            log::warn!(
+                "stoat import: the events endpoint answered {} instead of upgrading",
+                response.status()
+            );
+            return Err(StoatError::Unavailable);
+        }
+        let accepted = response
+            .headers()
+            .get(SEC_WEBSOCKET_ACCEPT)
+            .and_then(|value| value.to_str().ok())
+            == Some(derive_accept_key(key.as_bytes()).as_str());
+        if !accepted {
+            return Err(StoatError::Malformed);
+        }
+
+        let upgraded = response
+            .upgrade()
+            .await
+            .map_err(|_| StoatError::Unavailable)?;
+        let config = WebSocketConfig::default()
+            .max_message_size(Some(limits.frame_cap))
+            .max_frame_size(Some(limits.frame_cap));
+        let mut socket =
+            WebSocketStream::from_raw_socket(upgraded, Role::Client, Some(config)).await;
+
+        let authenticate =
+            serde_json::json!({ "type": "Authenticate", "token": self.bot_token }).to_string();
+        socket
+            .send(Message::text(authenticate))
+            .await
+            .map_err(|_| StoatError::Unavailable)?;
+
+        let result = read_ready(&mut socket).await;
+        // Best effort, and short, so a stalled close cannot use up the
+        // session deadline once Ready is in.
+        let _ = tokio::time::timeout(Duration::from_secs(2), socket.close(None)).await;
+        result
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Events session
+// ---------------------------------------------------------------------------
+
+/// Bounds on the one events session the reconcile opens.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct EventsLimits {
+    /// The whole session: both REST calls before it are bounded by
+    /// `UPSTREAM_TIMEOUT` already, this covers connect, authenticate and
+    /// `Ready`.
+    pub deadline: Duration,
+    /// Largest frame or message read. `Ready` trimmed to `members` is a
+    /// few hundred bytes per server; the full payload an older bonfire sends
+    /// is still far under the default for a bot in thousands of servers.
+    pub frame_cap: usize,
+}
+
+impl Default for EventsLimits {
+    fn default() -> Self {
+        EventsLimits {
+            deadline: Duration::from_secs(30),
+            frame_cap: 16 * 1024 * 1024,
+        }
+    }
+}
+
+/// Frames read while waiting for `Ready` before giving up.
+const EVENTS_MAX_FRAMES: usize = 64;
+
+/// One of the bot's own server memberships.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct BotMembership {
+    pub server_id: String,
+    /// When the bot joined; `None` when Stoat sent nothing readable.
+    pub joined_at: Option<Timestamp>,
+}
+
+/// Whether the token may be sent to this events URL: `wss` on the API host,
+/// the app host, or a subdomain of the app host (stoat.chat advertises
+/// `wss://events.stoat.chat`). The URL comes from the API root, so this keeps
+/// a bad or hijacked answer there from sending the token anywhere else.
+///
+/// A test build also accepts plain `ws://` to the loopback fake, the same
+/// split as `transport_for`.
+pub(crate) fn events_url_allowed(url: &Url, api_url: &str, app_url: &str) -> bool {
+    let loopback_test = cfg!(test) && url.scheme() == "ws" && url.host_str() == Some("127.0.0.1");
+    // `wss` on its default port only (the `url` crate drops an explicit 443).
+    let scheme_ok = (url.scheme() == "wss" && url.port().is_none()) || loopback_test;
+    if !scheme_ok || !url.username().is_empty() || url.password().is_some() {
+        return false;
+    }
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+
+    let host_of = |base: &str| Url::parse(base).ok()?.host_str().map(str::to_string);
+    let api_host = host_of(api_url);
+    let app_host = host_of(app_url);
+    api_host.as_deref() == Some(host)
+        || app_host
+            .as_deref()
+            .is_some_and(|app| host == app || host.ends_with(&format!(".{app}")))
+}
+
+/// Read frames until `Ready` and return its `members`. Frames before it
+/// (`Authenticated`, pings, anything binary) are skipped; an `Error` frame,
+/// a close, a frame over the cap or too many frames fail the session.
+async fn read_ready<S>(socket: &mut S) -> Result<Vec<Value>, StoatError>
+where
+    S: Stream<Item = Result<Message, WsError>> + Unpin,
+{
+    #[derive(Deserialize)]
+    struct Frame {
+        #[serde(rename = "type")]
+        kind: String,
+        #[serde(default)]
+        members: Option<Vec<Value>>,
+        #[serde(default)]
+        error: Option<Value>,
+    }
+
+    for _ in 0..EVENTS_MAX_FRAMES {
+        let text = match socket.next().await {
+            Some(Ok(Message::Text(text))) => text,
+            Some(Ok(Message::Close(_))) | None => return Err(StoatError::Unavailable),
+            Some(Ok(_)) => continue,
+            Some(Err(WsError::Capacity(_))) => {
+                log::warn!("stoat import: an events frame went over the size cap");
+                return Err(StoatError::Malformed);
+            }
+            Some(Err(_)) => return Err(StoatError::Unavailable),
+        };
+
+        let frame: Frame =
+            serde_json::from_str(text.as_str()).map_err(|_| StoatError::Malformed)?;
+        match frame.kind.as_str() {
+            "Ready" => return frame.members.ok_or(StoatError::Malformed),
+            "Error" => {
+                log::warn!(
+                    "stoat import: the events session was refused: {}",
+                    frame.error.unwrap_or(Value::Null)
+                );
+                return Err(StoatError::Unavailable);
+            }
+            _ => continue,
+        }
+    }
+    Err(StoatError::Malformed)
+}
+
+/// The members in `Ready` that are the bot's own (an older bonfire also
+/// sends voice participants' members), one per server, in server id order.
+/// Rows whose server id is unusable are dropped; an unreadable `joined_at`
+/// is kept as `None` so the caller can decide what that means.
+pub(crate) fn own_memberships(members: &[Value], self_id: &str) -> Vec<BotMembership> {
+    let mut own = std::collections::BTreeMap::new();
+    for member in members {
+        if member["_id"]["user"].as_str() != Some(self_id) {
+            continue;
+        }
+        let Some(server_id) = member["_id"]["server"]
+            .as_str()
+            .filter(|id| is_server_id(id))
+        else {
+            continue;
+        };
+        let joined_at = member["joined_at"].as_str().and_then(Timestamp::parse);
+        own.insert(server_id.to_string(), joined_at);
+    }
+    own.into_iter()
+        .map(|(server_id, joined_at)| BotMembership {
+            server_id,
+            joined_at,
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -632,11 +920,134 @@ impl AssetFetcher for StoatAssets {
 /// at the path the Stoat and worker tests import it from.
 #[cfg(test)]
 pub(crate) mod fake_upstream {
+    use std::sync::{Arc, Mutex};
+
     use revolt_config::ApiImportBotSource;
+    use tokio::net::TcpListener;
 
     pub(crate) use crate::tasks::import_http::fake_upstream::{
         FakeUpstream as FakeStoat, BOT_TOKEN,
     };
+
+    /// What a [`FakeEvents`] session sends after the client's first frame.
+    #[derive(Clone)]
+    pub(crate) enum Send {
+        Text(String),
+        Binary,
+        Ping,
+        Close,
+        /// Send nothing more, keeping the connection open.
+        Hang,
+    }
+
+    /// One session a [`FakeEvents`] accepted.
+    #[derive(Clone, Debug)]
+    pub(crate) struct EventsSeen {
+        /// Request target of the upgrade, query included
+        pub uri: String,
+        /// Every request header line, lowercased names
+        pub headers: Vec<(String, String)>,
+        /// The client's first frame (its `Authenticate`)
+        pub first_frame: Option<String>,
+    }
+
+    /// A scripted Stoat events WebSocket on a loopback port. Every session
+    /// reads the client's first frame, then plays the script.
+    pub(crate) struct FakeEvents {
+        pub url: String,
+        seen: Arc<Mutex<Vec<EventsSeen>>>,
+    }
+
+    impl FakeEvents {
+        /// Answer each session's first frame with these text frames.
+        pub(crate) async fn start(frames: Vec<String>) -> FakeEvents {
+            FakeEvents::script(frames.into_iter().map(Send::Text).collect()).await
+        }
+
+        pub(crate) async fn script(script: Vec<Send>) -> FakeEvents {
+            use futures::{SinkExt, StreamExt};
+            use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
+            use tokio_tungstenite::tungstenite::Message;
+
+            let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+            let url = format!("ws://{}/events", listener.local_addr().expect("addr"));
+            let seen: Arc<Mutex<Vec<EventsSeen>>> = Arc::new(Mutex::new(vec![]));
+
+            let sessions = seen.clone();
+            tokio::spawn(async move {
+                while let Ok((socket, _)) = listener.accept().await {
+                    let script = script.clone();
+                    let sessions = sessions.clone();
+                    tokio::spawn(async move {
+                        let request = Arc::new(Mutex::new((String::new(), vec![])));
+                        let record = request.clone();
+                        let callback = move |req: &Request, response: Response| {
+                            let headers = req
+                                .headers()
+                                .iter()
+                                .map(|(name, value)| {
+                                    (
+                                        name.as_str().to_lowercase(),
+                                        value.to_str().unwrap_or("").to_string(),
+                                    )
+                                })
+                                .collect();
+                            *record.lock().unwrap() = (req.uri().to_string(), headers);
+                            Ok(response)
+                        };
+                        let Ok(mut ws) =
+                            tokio_tungstenite::accept_hdr_async(socket, callback).await
+                        else {
+                            return;
+                        };
+
+                        let first_frame = match ws.next().await {
+                            Some(Ok(Message::Text(text))) => Some(text.to_string()),
+                            _ => None,
+                        };
+                        let (uri, headers) = request.lock().unwrap().clone();
+                        sessions.lock().unwrap().push(EventsSeen {
+                            uri,
+                            headers,
+                            first_frame,
+                        });
+
+                        for step in script {
+                            let message = match step {
+                                Send::Text(text) => Message::text(text),
+                                Send::Binary => Message::binary(vec![0u8, 1, 2]),
+                                Send::Ping => Message::Ping(vec![1u8].into()),
+                                Send::Close => Message::Close(None),
+                                Send::Hang => {
+                                    tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                                    return;
+                                }
+                            };
+                            if ws.send(message).await.is_err() {
+                                return;
+                            }
+                        }
+                        // Let the client read and close.
+                        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                            while let Some(Ok(_)) = ws.next().await {}
+                        })
+                        .await;
+                    });
+                }
+            });
+
+            FakeEvents { url, seen }
+        }
+
+        /// Sessions that got as far as the client's first frame.
+        pub(crate) fn sessions(&self) -> usize {
+            self.seen.lock().unwrap().len()
+        }
+
+        pub(crate) fn seen(&self) -> Vec<EventsSeen> {
+            self.seen.lock().unwrap().clone()
+        }
+    }
 
     impl FakeStoat {
         /// A ready `[api.import.stoat]` whose API is this fake and whose CDN
@@ -649,6 +1060,7 @@ pub(crate) mod fake_upstream {
                 cdn_url: cdn.url.clone(),
                 bot_id: "01BOT000000000000000000000".to_string(),
                 bot_token: BOT_TOKEN.to_string(),
+                reconcile_after_hours: 24,
             }
         }
     }
@@ -1154,5 +1566,263 @@ pub(crate) mod tests {
                 emoji: 30
             }
         );
+    }
+
+    // ------------------------------------------------------------ events --
+
+    use super::fake_upstream::{FakeEvents, Send};
+
+    const SELF_ID: &str = "01BOT000000000000000000000";
+    const APP: &str = "https://stoat.example";
+
+    fn me_body() -> String {
+        format!(r#"{{"_id":"{SELF_ID}"}}"#)
+    }
+
+    /// An API whose root advertises `ws` and whose `/users/@me` is the bot.
+    async fn events_api(ws: &str) -> (FakeStoat, StoatApi) {
+        let fake = FakeStoat::new()
+            .reply("GET", "/", 200, format!(r#"{{"ws":"{ws}"}}"#))
+            .reply("GET", "/users/@me", 200, me_body())
+            .start()
+            .await;
+        let api = StoatApi::new(&fake.source_config(&FakeStoat::new())).expect("api");
+        (fake, api)
+    }
+
+    fn quick() -> EventsLimits {
+        EventsLimits {
+            deadline: Duration::from_millis(500),
+            frame_cap: 64 * 1024,
+        }
+    }
+
+    #[tokio::test]
+    async fn memberships_come_from_one_authenticated_ready_session() {
+        let joined = "2026-10-01T10:00:00.000Z";
+        let ready = format!(
+            r#"{{"type":"Ready","servers":[],"members":[
+                {{"_id":{{"server":"01SRVB","user":"{SELF_ID}"}},"joined_at":"{joined}"}},
+                {{"_id":{{"server":"01SRVA","user":"{SELF_ID}"}},"joined_at":"not a time"}},
+                {{"_id":{{"server":"01SRVC","user":"01SOMEONEELSE"}},"joined_at":"{joined}"}},
+                {{"_id":{{"server":"bad/id","user":"{SELF_ID}"}},"joined_at":"{joined}"}},
+                {{"_id":{{"user":"{SELF_ID}"}},"joined_at":"{joined}"}}
+            ]}}"#
+        );
+        let events = FakeEvents::script(vec![
+            Send::Text(r#"{"type":"Authenticated"}"#.to_string()),
+            Send::Ping,
+            Send::Binary,
+            Send::Text(r#"{"type":"Pong","data":0}"#.to_string()),
+            Send::Text(ready),
+        ])
+        .await;
+        let (fake, api) = events_api(&events.url).await;
+
+        let memberships = api.fetch_memberships(APP, quick()).await.unwrap();
+        assert_eq!(
+            memberships,
+            vec![
+                BotMembership {
+                    server_id: "01SRVA".to_string(),
+                    joined_at: None,
+                },
+                BotMembership {
+                    server_id: "01SRVB".to_string(),
+                    joined_at: Timestamp::parse(joined),
+                },
+            ]
+        );
+        assert!(memberships[1].joined_at.is_some());
+
+        let sessions = events.seen();
+        assert_eq!(sessions.len(), 1);
+        let session = &sessions[0];
+        for part in ["version=1", "format=json", "ready=members"] {
+            assert!(session.uri.contains(part), "{}", session.uri);
+        }
+        // The token rides the Authenticate frame only.
+        assert!(!session.uri.contains(BOT_TOKEN));
+        assert!(session
+            .headers
+            .iter()
+            .all(|(_, value)| !value.contains(BOT_TOKEN)));
+        let auth: Value = serde_json::from_str(session.first_frame.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            auth,
+            serde_json::json!({ "type": "Authenticate", "token": BOT_TOKEN })
+        );
+
+        let paths: Vec<String> = fake.seen().into_iter().map(|seen| seen.path).collect();
+        assert_eq!(paths, ["/users/@me", "/"]);
+    }
+
+    /// Each way a session can go wrong fails with its own error, and at once:
+    /// the fake keeps the connection open for 5 s after its script, so a
+    /// case that only failed by waiting out a deadline would show here.
+    #[tokio::test]
+    async fn a_session_that_never_delivers_a_usable_ready_fails() {
+        use std::time::Instant;
+        use StoatError::{Malformed, Unavailable};
+
+        let authenticated = || Send::Text(r#"{"type":"Authenticated"}"#.to_string());
+        let error = r#"{"type":"Error","error":"InvalidSession"}"#.to_string();
+        let oversized = format!(
+            r#"{{"type":"Ready","members":[],"pad":"{}"}}"#,
+            "x".repeat(128 * 1024)
+        );
+        let too_many: Vec<Send> = (0..=EVENTS_MAX_FRAMES).map(|_| authenticated()).collect();
+        let scripts = [
+            (
+                "error",
+                vec![authenticated(), Send::Text(error)],
+                Unavailable,
+            ),
+            ("close", vec![authenticated(), Send::Close], Unavailable),
+            (
+                "no members",
+                vec![Send::Text(r#"{"type":"Ready"}"#.to_string())],
+                Malformed,
+            ),
+            (
+                "not json",
+                vec![Send::Text("not json".to_string())],
+                Malformed,
+            ),
+            ("over the cap", vec![Send::Text(oversized)], Malformed),
+            ("too many frames", too_many, Malformed),
+        ];
+        let limits = EventsLimits {
+            deadline: Duration::from_secs(10),
+            frame_cap: 64 * 1024,
+        };
+        for (name, script, expected) in scripts {
+            let events = FakeEvents::script(script).await;
+            let (_fake, api) = events_api(&events.url).await;
+            let started = Instant::now();
+            assert_eq!(
+                api.fetch_memberships(APP, limits).await,
+                Err(expected),
+                "{name}"
+            );
+            assert!(started.elapsed() < Duration::from_secs(3), "{name}");
+            assert_eq!(events.sessions(), 1, "{name}");
+        }
+
+        // Silence is bounded by the deadline.
+        let events = FakeEvents::script(vec![authenticated(), Send::Hang]).await;
+        let (_fake, api) = events_api(&events.url).await;
+        let started = Instant::now();
+        assert_eq!(api.fetch_memberships(APP, quick()).await, Err(Unavailable));
+        assert!(started.elapsed() < Duration::from_secs(3));
+    }
+
+    /// A 101 without the right `Sec-WebSocket-Accept` is not our upgrade.
+    #[tokio::test]
+    async fn a_wrong_handshake_answer_fails() {
+        let path = "/events?version=1&format=json&ready=members";
+        let wrong = FakeStoat::new().reply("GET", path, 101, "").start().await;
+        let ws = format!("{}/events", wrong.url.replacen("http://", "ws://", 1));
+        let (_fake, api) = events_api(&ws).await;
+        assert_eq!(
+            api.fetch_memberships(APP, quick()).await,
+            Err(StoatError::Malformed)
+        );
+    }
+
+    /// An endpoint that answers the upgrade with a plain response fails, and
+    /// the upgrade request itself carries no token.
+    #[tokio::test]
+    async fn an_endpoint_that_does_not_upgrade_fails() {
+        let plain = FakeStoat::new().start().await;
+        let ws = format!("{}/events", plain.url.replacen("http://", "ws://", 1));
+        let (_fake, api) = events_api(&ws).await;
+
+        assert!(matches!(
+            api.fetch_memberships(APP, quick()).await,
+            Err(StoatError::Unavailable)
+        ));
+        let seen = plain.seen();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].path, "/events?version=1&format=json&ready=members");
+        assert!(seen[0].bot_token.is_none());
+    }
+
+    /// The root's `ws` decides where the token goes, so an answer off the
+    /// configured hosts is refused before anything connects.
+    #[tokio::test]
+    async fn an_events_url_off_the_configured_hosts_is_never_contacted() {
+        let events = FakeEvents::start(vec![]).await;
+        let elsewhere = events.url.replacen("127.0.0.1", "localhost", 1);
+        for ws in [
+            elsewhere.as_str(),
+            "wss://evil.example/events",
+            "https://127.0.0.1/events",
+            "not a url",
+        ] {
+            let (_fake, api) = events_api(ws).await;
+            assert!(
+                matches!(
+                    api.fetch_memberships(APP, quick()).await,
+                    Err(StoatError::Malformed)
+                ),
+                "{ws}"
+            );
+        }
+        assert_eq!(events.sessions(), 0);
+    }
+
+    #[tokio::test]
+    async fn no_session_without_the_bot_s_own_id() {
+        let events = FakeEvents::start(vec![]).await;
+        for (status, body) in [
+            (401, "{}".to_string()),
+            (200, r#"{"_id":"bad/id"}"#.to_string()),
+        ] {
+            let fake = FakeStoat::new()
+                .reply("GET", "/", 200, format!(r#"{{"ws":"{}"}}"#, events.url))
+                .reply("GET", "/users/@me", status, body)
+                .start()
+                .await;
+            let api = StoatApi::new(&fake.source_config(&FakeStoat::new())).unwrap();
+            assert!(api.fetch_memberships(APP, quick()).await.is_err());
+        }
+        assert_eq!(events.sessions(), 0);
+    }
+
+    #[test]
+    fn events_urls_must_be_wss_on_the_api_or_app_host() {
+        let api = "https://api.stoat.chat";
+        let app = "https://stoat.chat";
+        let allowed = |url: &str| events_url_allowed(&Url::parse(url).unwrap(), api, app);
+
+        // What stoat.chat advertises today, and the other plausible layouts.
+        assert!(allowed("wss://events.stoat.chat"));
+        assert!(allowed("wss://events.stoat.chat:443"));
+        assert!(allowed("wss://stoat.chat/events"));
+        assert!(allowed("wss://api.stoat.chat/ws"));
+
+        for url in [
+            "ws://events.stoat.chat",
+            "https://events.stoat.chat",
+            "wss://stoat.chat.evil.example",
+            "wss://evilstoat.chat",
+            "wss://api.stoat.chat.evil.example",
+            "wss://evil.example",
+            "wss://user:secret@events.stoat.chat",
+            "wss://events.stoat.chat:8443",
+            "ws://127.0.0.2:1/events",
+        ] {
+            assert!(!allowed(url), "{url}");
+        }
+
+        // Without an app URL, only the API host.
+        let url = |url: &str| Url::parse(url).unwrap();
+        assert!(events_url_allowed(&url("wss://api.stoat.chat"), api, ""));
+        assert!(!events_url_allowed(
+            &url("wss://events.stoat.chat"),
+            api,
+            ""
+        ));
     }
 }
