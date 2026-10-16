@@ -1,0 +1,50 @@
+[package]
+name = "revolt-payments"
+version = "0.13.7"
+edition = "2021"
+license = "AGPL-3.0-or-later"
+authors = ["Sloga Technologies LLC <sloga@sloga.gg>"]
+description = "Revolt Backend: Payments (Stripe) and the Cipher sale"
+publish = false
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[features]
+# Exposes `stripe::MockStripe` to other crates' tests (delta routes, crond)
+test-mock = []
+
+[dependencies]
+# Core
+revolt-database = { workspace = true }
+revolt-models = { workspace = true }
+revolt-config = { workspace = true }
+revolt-result = { workspace = true }
+
+# Async Language Features
+async-trait = { workspace = true }
+
+# Web Requests
+reqwest = { workspace = true, features = ["json", "form"] }
+
+# Serialisation
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Time (RFC 3339 parsing of `cipher_sales_close_at`)
+chrono = { workspace = true }
+
+# Security (webhook signatures)
+hmac = { workspace = true }
+sha2 = { workspace = true }
+subtle = { workspace = true }
+
+# Logging
+log = { workspace = true }
+
+# Order ids
+ulid = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "macros", "time"] }
+# Drops the throwaway Mongo test databases even when a test panics
+revolt-database = { workspace = true, features = ["test-teardown"] }

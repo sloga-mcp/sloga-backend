@@ -155,9 +155,15 @@ impl AbstractPaymentOrders for MongoDb {
                     "_id": id,
                     "$or": lease_free(now)
                 },
+                // Taking a lease moves the version, so a copy read before it
+                // (an unleased or stale-lease writer) can no longer write.
+                // `$inc` on an order stored without `version` sets it to 1.
                 doc! {
                     "$set": {
                         "lease_until": until
+                    },
+                    "$inc": {
+                        "version": 1_i64
                     }
                 },
             )
@@ -171,11 +177,14 @@ impl AbstractPaymentOrders for MongoDb {
             .map_err(|_| create_database_error!("find_one_and_update", COL))
     }
 
-    async fn release_payment_order_lease(&self, id: &str) -> Result<()> {
+    async fn release_payment_order_lease(&self, id: &str, until: i64) -> Result<()> {
+        // Fenced on the holder's own token: after a takeover the stored
+        // lease is the new holder's and this matches nothing (a no-op)
         self.col::<Document>(COL)
             .update_one(
                 doc! {
-                    "_id": id
+                    "_id": id,
+                    "lease_until": until
                 },
                 doc! {
                     "$unset": {
@@ -198,10 +207,37 @@ impl AbstractPaymentOrders for MongoDb {
         // state. The typed replacement leaves unset optionals out (never
         // null), which the partial unique indexes depend on. No upsert, so
         // a missing order is `false`.
+        let next = o
+            .version
+            .checked_add(1)
+            .ok_or_else(|| create_database_error!("replace_one", COL))?;
+
+        // Only one `_id` key and one `$or` (a second one would replace the
+        // first)
         let mut filter = doc! {
             "_id": &o.id,
             "state": state_bson(&expected)?
         };
+
+        // Optimistic concurrency: a writer whose copy is older than the
+        // last write, lease or unlink no longer matches, even when the
+        // state, lease and buyer still do
+        if o.version == 0 {
+            // An order written before `version` existed has no such field
+            filter.insert(
+                "$or",
+                Bson::Array(vec![
+                    Bson::Document(doc! { "version": 0_i64 }),
+                    Bson::Document(doc! { "version": { "$exists": false } }),
+                ]),
+            );
+        } else {
+            // bson stores a u64 as Int64; Mongo compares numbers across
+            // types
+            let version =
+                i64::try_from(o.version).map_err(|_| create_database_error!("replace_one", COL))?;
+            filter.insert("version", version);
+        }
 
         // Fencing token: a worker whose lease ran out and was taken over
         // still carries the old `lease_until`, so it no longer matches
@@ -225,14 +261,21 @@ impl AbstractPaymentOrders for MongoDb {
             }
         }
 
+        let row = PaymentOrder {
+            version: next,
+            ..o.clone()
+        };
+
         self.col::<PaymentOrder>(COL)
-            .replace_one(filter, o)
+            .replace_one(filter, &row)
             .await
             .map(|result| result.matched_count == 1)
             .map_err(|_| create_database_error!("replace_one", COL))
     }
 
     async fn unlink_payment_orders_by_user(&self, user_id: &str) -> Result<()> {
+        // The version bump refuses any copy read before the unlink, even
+        // one that already carries no buyer
         self.col::<Document>(COL)
             .update_many(
                 doc! {
@@ -241,6 +284,9 @@ impl AbstractPaymentOrders for MongoDb {
                 doc! {
                     "$unset": {
                         "user_id": 1_i32
+                    },
+                    "$inc": {
+                        "version": 1_i64
                     }
                 },
             )
@@ -277,6 +323,7 @@ mod tests {
             void_reason: None,
             reversal_pending: None,
             lease_until: None,
+            version: 0,
             created_at: 1_788_264_000_000,
             paid_at: None,
             fulfilled_at: None,
@@ -300,7 +347,10 @@ mod tests {
                 "currency",
                 "provider",
                 "sku",
-                "state"
+                "state",
+                // Not optional: always stored, so the version filter can
+                // match it exactly
+                "version"
             ]
         );
         assert_eq!(doc.get_str("state").unwrap(), "Creating");
@@ -337,6 +387,39 @@ mod tests {
         assert_eq!(doc.get_str("reversal_pending").unwrap(), "DisputeLost");
         assert_eq!(doc.get_i64("lease_until").unwrap(), 1_788_264_120_000);
         assert_eq!(from_document::<PaymentOrder>(doc).unwrap(), full);
+    }
+
+    #[test]
+    fn version_is_stored_as_int64_and_absent_reads_as_zero() {
+        let mut doc = to_document(&PaymentOrder {
+            version: 3,
+            ..order()
+        })
+        .unwrap();
+        // The version filter matches on this encoding
+        assert_eq!(doc.get("version"), Some(&bson::Bson::Int64(3)));
+
+        // An order written before the field existed
+        doc.remove("version");
+        assert_eq!(from_document::<PaymentOrder>(doc).unwrap().version, 0);
+
+        // The largest storable version; one above it is refused, never
+        // wrapped to a negative Int64
+        let max = i64::MAX.unsigned_abs();
+        assert_eq!(
+            to_document(&PaymentOrder {
+                version: max,
+                ..order()
+            })
+            .unwrap()
+            .get("version"),
+            Some(&bson::Bson::Int64(i64::MAX))
+        );
+        assert!(to_document(&PaymentOrder {
+            version: max + 1,
+            ..order()
+        })
+        .is_err());
     }
 
     #[test]

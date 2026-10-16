@@ -142,6 +142,11 @@ impl AbstractPaymentOrders for ReferenceDb {
         let mut orders = self.payment_orders.lock().await;
         match orders.get_mut(id) {
             Some(row) if lease_free(row, now) => {
+                // Same as the Mongo `$inc`: taking a lease moves the version
+                row.version = row
+                    .version
+                    .checked_add(1)
+                    .ok_or_else(|| create_database_error!("update", "payment_order"))?;
                 row.lease_until = Some(until);
                 Ok(Some(row.clone()))
             }
@@ -149,10 +154,13 @@ impl AbstractPaymentOrders for ReferenceDb {
         }
     }
 
-    async fn release_payment_order_lease(&self, id: &str) -> Result<()> {
+    async fn release_payment_order_lease(&self, id: &str, until: i64) -> Result<()> {
         let mut orders = self.payment_orders.lock().await;
+        // Fenced on the holder's own token: a stale release is a no-op
         if let Some(row) = orders.get_mut(id) {
-            row.lease_until = None;
+            if row.lease_until == Some(until) {
+                row.lease_until = None;
+            }
         }
         Ok(())
     }
@@ -162,12 +170,22 @@ impl AbstractPaymentOrders for ReferenceDb {
         o: &PaymentOrder,
         expected: OrderState,
     ) -> Result<bool> {
+        let next = o
+            .version
+            .checked_add(1)
+            .ok_or_else(|| create_database_error!("replace", "payment_order"))?;
+
         let mut orders = self.payment_orders.lock().await;
-        // Same filter as the Mongo driver: the state, the lease as a
-        // fencing token (a taken-over holder carries the old `lease_until`),
-        // and the buyer (an account-deletion unlink is never undone)
+        // Same filter as the Mongo driver: the state, the version (this
+        // driver has no absent field; an order always reads as at least 0),
+        // the lease as a fencing token (a taken-over holder carries the old
+        // `lease_until`), and the buyer (an account-deletion unlink is never
+        // undone)
         if !orders.get(&o.id).is_some_and(|row| {
-            row.state == expected && row.lease_until == o.lease_until && row.user_id == o.user_id
+            row.state == expected
+                && row.version == o.version
+                && row.lease_until == o.lease_until
+                && row.user_id == o.user_id
         }) {
             return Ok(false);
         }
@@ -175,7 +193,13 @@ impl AbstractPaymentOrders for ReferenceDb {
         if provider_id_taken(&orders, o) {
             return Err(create_database_error!("replace", "payment_order"));
         }
-        orders.insert(o.id.clone(), o.clone());
+        orders.insert(
+            o.id.clone(),
+            PaymentOrder {
+                version: next,
+                ..o.clone()
+            },
+        );
         Ok(true)
     }
 
@@ -183,6 +207,12 @@ impl AbstractPaymentOrders for ReferenceDb {
         let mut orders = self.payment_orders.lock().await;
         for row in orders.values_mut() {
             if row.user_id.as_deref() == Some(user_id) {
+                // Same as the Mongo `$inc`: a copy read before the unlink
+                // can no longer write
+                row.version = row
+                    .version
+                    .checked_add(1)
+                    .ok_or_else(|| create_database_error!("update", "payment_order"))?;
                 row.user_id = None;
             }
         }

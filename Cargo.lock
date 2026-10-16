@@ -7360,6 +7360,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "revolt-payments"
+version = "0.13.7"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "hmac 0.12.1",
+ "log",
+ "reqwest 0.13.4",
+ "revolt-config",
+ "revolt-database",
+ "revolt-models",
+ "revolt-result",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "subtle",
+ "tokio",
+ "ulid",
+]
+
+[[package]]
 name = "revolt-permissions"
 version = "0.13.7"
 dependencies = [

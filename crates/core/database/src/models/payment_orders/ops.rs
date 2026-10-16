@@ -51,9 +51,11 @@ pub trait AbstractPaymentOrders: Sync + Send {
     ) -> Result<Vec<PaymentOrder>>;
 
     /// Atomically set `lease_until = until` WHERE `_id = id` AND
-    /// (`lease_until` unset OR `lease_until < now`).
-    /// Ok(Some(order_after)) if acquired, Ok(None) if held by someone else
-    /// or no such order.
+    /// (`lease_until` unset OR `lease_until < now`), and bump `version`
+    /// (+1).
+    /// Ok(Some(order_after)) if acquired (it carries the new `version` and
+    /// `lease_until = until`), Ok(None) if held by someone else or no such
+    /// order.
     async fn acquire_payment_order_lease(
         &self,
         id: &str,
@@ -61,11 +63,18 @@ pub trait AbstractPaymentOrders: Sync + Send {
         until: i64,
     ) -> Result<Option<PaymentOrder>>;
 
-    /// Unset `lease_until`; a missing order is not an error
-    async fn release_payment_order_lease(&self, id: &str) -> Result<()>;
+    /// Fenced release: `$unset lease_until` WHERE `_id = id` AND
+    /// `lease_until == until`, so a stale holder cannot clear a newer
+    /// lease. No version bump. A stale release (the lease was taken over)
+    /// and a missing order are both a no-op Ok(()).
+    async fn release_payment_order_lease(&self, id: &str, until: i64) -> Result<()>;
 
     /// Conditional replace: write `o` in full WHERE `_id = o.id` AND
     /// `state = expected` AND
+    /// - `version` equals `o.version` (`o.version == 0` also matches a
+    ///   stored order with no version field). The stored version becomes
+    ///   `o.version + 1`: a caller doing a second write in the same lease
+    ///   bumps its copy first.
     /// - `lease_until` equals `o.lease_until` (`None`: the stored field
     ///   must be unset). This is the fencing token: a holder whose lease ran
     ///   out and was taken over carries the old value and cannot write.
@@ -74,17 +83,22 @@ pub trait AbstractPaymentOrders: Sync + Send {
     ///   unset), so a writer that read the order before an account-deletion
     ///   unlink cannot put the buyer back.
     ///
-    /// Ok(true) if matched and written, Ok(false) if the state, lease or
-    /// buyer differed or the order does not exist. `lease_until` is written
-    /// as `o` carries it, so a lease holder writing the order it acquired
-    /// keeps its lease.
+    /// `acquire_payment_order_lease` and `unlink_payment_orders_by_user`
+    /// also bump `version` (+1).
+    ///
+    /// Ok(true) if matched and written, Ok(false) if the state, version,
+    /// lease or buyer differed or the order does not exist. Ok(false) does
+    /// not say which check failed: re-fetch before deciding to retry or give
+    /// up. `lease_until` is written as `o` carries it, so a lease holder
+    /// writing the order it acquired keeps its lease.
     async fn update_payment_order_if_state(
         &self,
         o: &PaymentOrder,
         expected: OrderState,
     ) -> Result<bool>;
 
-    /// Account deletion: unset `user_id` on every order of the user
+    /// Account deletion: unset `user_id` and bump `version` (+1) on every
+    /// order of the user
     async fn unlink_payment_orders_by_user(&self, user_id: &str) -> Result<()>;
 }
 
@@ -112,6 +126,7 @@ mod tests {
             void_reason: None,
             reversal_pending: None,
             lease_until: None,
+            version: 0,
             created_at,
             paid_at: None,
             fulfilled_at: None,
@@ -202,8 +217,8 @@ mod tests {
                 Some(241_001)
             );
 
-            // Released: free again at any time
-            db.release_payment_order_lease("o1").await.unwrap();
+            // Released by its holder: free again at any time
+            db.release_payment_order_lease("o1", 241_001).await.unwrap();
             assert!(db
                 .fetch_payment_order("o1")
                 .await
@@ -223,7 +238,9 @@ mod tests {
                 .await
                 .unwrap()
                 .is_none());
-            db.release_payment_order_lease("missing").await.unwrap();
+            db.release_payment_order_lease("missing", 120_000)
+                .await
+                .unwrap();
             assert!(db.fetch_payment_order("missing").await.unwrap().is_none());
         });
     }
@@ -246,9 +263,19 @@ mod tests {
                 .await
                 .unwrap());
 
-            // A stale writer that still believes the order is Pending loses
+            // The write moved the version on
+            let paid = PaymentOrder { version: 1, ..paid };
+            assert_eq!(
+                db.fetch_payment_order("o1").await.unwrap(),
+                Some(paid.clone())
+            );
+
+            // A stale writer that still believes the order is Pending loses.
+            // It carries the current version, so only the state check can
+            // refuse it.
             let expired = PaymentOrder {
                 state: OrderState::Expired,
+                version: 1,
                 ..pending.clone()
             };
             assert!(!db
@@ -289,10 +316,13 @@ mod tests {
                 .expect("B takes over");
 
             // A wakes up and writes from its copy: the state still matches,
-            // but its lease token is stale
+            // but its lease token is stale. Even given the current version,
+            // the stale token alone refuses it.
+            assert_eq!((a.version, b.version), (1, 2));
             let a_paid = PaymentOrder {
                 state: OrderState::Paid,
                 paid_at: Some(2_500),
+                version: b.version,
                 ..a
             };
             assert!(!db
@@ -324,10 +354,16 @@ mod tests {
                 .update_payment_order_if_state(&b_paid, OrderState::Pending)
                 .await
                 .unwrap());
-            assert_eq!(db.fetch_payment_order("o1").await.unwrap(), Some(b_paid));
+            assert_eq!(
+                db.fetch_payment_order("o1").await.unwrap(),
+                Some(PaymentOrder {
+                    version: 3,
+                    ..b_paid
+                })
+            );
 
             // Released: a write from an unleased read matches again
-            db.release_payment_order_lease("o1").await.unwrap();
+            db.release_payment_order_lease("o1", 3_001).await.unwrap();
             let released = db.fetch_payment_order("o1").await.unwrap().unwrap();
             assert!(released.lease_until.is_none());
             let fulfilled = PaymentOrder {
@@ -352,9 +388,11 @@ mod tests {
             // The buyer deletes their account after the worker read the order
             db.unlink_payment_orders_by_user("u1").await.unwrap();
 
+            // Given the current version, the stale buyer alone refuses it
             let fulfilled = PaymentOrder {
                 state: OrderState::Fulfilled,
                 fulfilled_at: Some(20),
+                version: 1,
                 ..read.clone()
             };
             assert!(!db
@@ -376,17 +414,25 @@ mod tests {
                 .update_payment_order_if_state(&voided, OrderState::Paid)
                 .await
                 .unwrap());
-            assert_eq!(db.fetch_payment_order("o1").await.unwrap(), Some(voided));
+            assert_eq!(
+                db.fetch_payment_order("o1").await.unwrap(),
+                Some(PaymentOrder {
+                    version: 2,
+                    ..voided
+                })
+            );
             assert!(db
                 .fetch_payment_orders_by_user("u1", &[OrderState::Voided])
                 .await
                 .unwrap()
                 .is_empty());
 
-            // Nor can a writer attach a buyer to an unlinked order
+            // Nor can a writer attach a buyer to an unlinked order (again
+            // with the current version, so the buyer check alone refuses it)
             let relinked = PaymentOrder {
                 user_id: Some("u1".to_string()),
                 state: OrderState::Refunded,
+                version: 2,
                 ..read
             };
             assert!(!db
@@ -565,20 +611,365 @@ mod tests {
             assert!(mine.user_id.is_none());
             // The order itself stays (it is the payment record)
             assert_eq!(mine.state, OrderState::Fulfilled);
-            assert_eq!(
-                db.fetch_payment_order("theirs")
-                    .await
-                    .unwrap()
-                    .unwrap()
-                    .user_id
-                    .as_deref(),
-                Some("u2")
-            );
+            assert_eq!(mine.version, 1);
+            let theirs = db.fetch_payment_order("theirs").await.unwrap().unwrap();
+            assert_eq!(theirs.user_id.as_deref(), Some("u2"));
+            // Untouched orders keep their version
+            assert_eq!(theirs.version, 0);
             assert!(db
                 .fetch_payment_orders_by_user("u1", &[OrderState::Fulfilled])
                 .await
                 .unwrap()
                 .is_empty());
+        });
+    }
+
+    #[tokio::test]
+    async fn a_write_from_a_read_during_a_lease_loses_to_the_holders_write() {
+        database_test!(|db| async move {
+            create_payment_order_indexes(&db).await;
+            db.insert_payment_order(&order("o1", "u1", OrderState::Paid, 10))
+                .await
+                .unwrap();
+
+            // A worker leases the order to fulfil it
+            let held = db
+                .acquire_payment_order_lease("o1", 1_000, 121_000)
+                .await
+                .unwrap()
+                .expect("a free lease is acquired");
+            // Meanwhile a refund handler reads the order (not via a lease):
+            // it carries the holder's lease token, state and buyer
+            let outside = db.fetch_payment_order("o1").await.unwrap().unwrap();
+            assert_eq!(outside.lease_until, Some(121_000));
+
+            // The holder writes without changing the state
+            let held_write = PaymentOrder {
+                payment_intent_id: Some("pi_1".to_string()),
+                ..held
+            };
+            assert!(db
+                .update_payment_order_if_state(&held_write, OrderState::Paid)
+                .await
+                .unwrap());
+
+            // The outside write keeps the state, lease and buyer; only the
+            // version moved, and that alone refuses it
+            let outside_write = PaymentOrder {
+                reversal_pending: Some(ReversalPending::Refund),
+                ..outside
+            };
+            assert!(!db
+                .update_payment_order_if_state(&outside_write, OrderState::Paid)
+                .await
+                .unwrap());
+            assert_eq!(
+                db.fetch_payment_order("o1").await.unwrap(),
+                Some(PaymentOrder {
+                    version: 2,
+                    ..held_write
+                })
+            );
+        });
+    }
+
+    #[tokio::test]
+    async fn the_holders_write_loses_to_an_earlier_outside_write() {
+        database_test!(|db| async move {
+            create_payment_order_indexes(&db).await;
+            db.insert_payment_order(&order("o1", "u1", OrderState::Paid, 10))
+                .await
+                .unwrap();
+
+            let held = db
+                .acquire_payment_order_lease("o1", 1_000, 121_000)
+                .await
+                .unwrap()
+                .expect("a free lease is acquired");
+            let outside = db.fetch_payment_order("o1").await.unwrap().unwrap();
+
+            // The outside write lands first
+            let outside_write = PaymentOrder {
+                reversal_pending: Some(ReversalPending::Refund),
+                ..outside
+            };
+            assert!(db
+                .update_payment_order_if_state(&outside_write, OrderState::Paid)
+                .await
+                .unwrap());
+
+            // The holder's write from its leased copy would drop the
+            // pending reversal; the version refuses it
+            let held_write = PaymentOrder {
+                payment_intent_id: Some("pi_1".to_string()),
+                ..held
+            };
+            assert!(!db
+                .update_payment_order_if_state(&held_write, OrderState::Paid)
+                .await
+                .unwrap());
+            let stored = db.fetch_payment_order("o1").await.unwrap().unwrap();
+            assert_eq!(stored.reversal_pending, Some(ReversalPending::Refund));
+            assert!(stored.payment_intent_id.is_none());
+            assert_eq!(stored.version, 2);
+
+            // Re-fetched, the holder keeps both changes
+            let retried = PaymentOrder {
+                payment_intent_id: Some("pi_1".to_string()),
+                ..stored
+            };
+            assert!(db
+                .update_payment_order_if_state(&retried, OrderState::Paid)
+                .await
+                .unwrap());
+            let stored = db.fetch_payment_order("o1").await.unwrap().unwrap();
+            assert_eq!(stored.reversal_pending, Some(ReversalPending::Refund));
+            assert_eq!(stored.payment_intent_id.as_deref(), Some("pi_1"));
+            assert_eq!(stored.version, 3);
+        });
+    }
+
+    #[tokio::test]
+    async fn consecutive_writes_in_one_lease_bump_the_local_version() {
+        database_test!(|db| async move {
+            create_payment_order_indexes(&db).await;
+            db.insert_payment_order(&order("o1", "u1", OrderState::Pending, 10))
+                .await
+                .unwrap();
+
+            let mut held = db
+                .acquire_payment_order_lease("o1", 1_000, 121_000)
+                .await
+                .unwrap()
+                .expect("a free lease is acquired");
+            assert_eq!(held.version, 1);
+
+            held.state = OrderState::Paid;
+            held.paid_at = Some(1_100);
+            assert!(db
+                .update_payment_order_if_state(&held, OrderState::Pending)
+                .await
+                .unwrap());
+
+            // The same copy again, without the bump, is refused
+            held.state = OrderState::Fulfilled;
+            held.fulfilled_at = Some(1_200);
+            assert!(!db
+                .update_payment_order_if_state(&held, OrderState::Paid)
+                .await
+                .unwrap());
+
+            // Bumped to what the first write stored: the second write lands
+            held.version += 1;
+            assert!(db
+                .update_payment_order_if_state(&held, OrderState::Paid)
+                .await
+                .unwrap());
+            assert_eq!(
+                db.fetch_payment_order("o1").await.unwrap(),
+                Some(PaymentOrder { version: 3, ..held })
+            );
+        });
+    }
+
+    #[tokio::test]
+    async fn a_stale_release_leaves_the_new_lease() {
+        database_test!(|db| async move {
+            create_payment_order_indexes(&db).await;
+            db.insert_payment_order(&order("o1", "u1", OrderState::Paid, 10))
+                .await
+                .unwrap();
+
+            // A's lease runs out and B takes it over
+            db.acquire_payment_order_lease("o1", 1_000, 2_000)
+                .await
+                .unwrap()
+                .expect("A acquires");
+            db.acquire_payment_order_lease("o1", 2_001, 3_001)
+                .await
+                .unwrap()
+                .expect("B takes over");
+
+            // A releases late, with its own token: a no-op
+            db.release_payment_order_lease("o1", 2_000).await.unwrap();
+            let stored = db.fetch_payment_order("o1").await.unwrap().unwrap();
+            assert_eq!(stored.lease_until, Some(3_001));
+            // A release never moves the version
+            assert_eq!(stored.version, 2);
+            // B still holds it
+            assert!(db
+                .acquire_payment_order_lease("o1", 2_500, 4_000)
+                .await
+                .unwrap()
+                .is_none());
+
+            // B's own release frees it, still without a version bump
+            db.release_payment_order_lease("o1", 3_001).await.unwrap();
+            let stored = db.fetch_payment_order("o1").await.unwrap().unwrap();
+            assert!(stored.lease_until.is_none());
+            assert_eq!(stored.version, 2);
+
+            // Releasing a free lease is a no-op too
+            db.release_payment_order_lease("o1", 3_001).await.unwrap();
+            assert_eq!(db.fetch_payment_order("o1").await.unwrap(), Some(stored));
+        });
+    }
+
+    #[tokio::test]
+    async fn acquiring_a_lease_bumps_the_version() {
+        database_test!(|db| async move {
+            create_payment_order_indexes(&db).await;
+            db.insert_payment_order(&order("o1", "u1", OrderState::Pending, 10))
+                .await
+                .unwrap();
+            // A copy read before anyone leased the order
+            let before = db.fetch_payment_order("o1").await.unwrap().unwrap();
+            assert_eq!(before.version, 0);
+
+            let held = db
+                .acquire_payment_order_lease("o1", 1_000, 121_000)
+                .await
+                .unwrap()
+                .unwrap();
+            // The returned post-image carries the new version and lease
+            assert_eq!(held.version, 1);
+            assert_eq!(held.lease_until, Some(121_000));
+            assert_eq!(db.fetch_payment_order("o1").await.unwrap(), Some(held));
+
+            // A refused acquire does not bump it
+            assert!(db
+                .acquire_payment_order_lease("o1", 2_000, 122_000)
+                .await
+                .unwrap()
+                .is_none());
+            db.release_payment_order_lease("o1", 121_000).await.unwrap();
+            assert_eq!(
+                db.fetch_payment_order("o1").await.unwrap().unwrap().version,
+                1
+            );
+
+            // The lease is free again, so the pre-lease copy matches on
+            // state, lease (unset) and buyer; the moved version alone
+            // refuses it
+            let stale = PaymentOrder {
+                state: OrderState::Expired,
+                ..before
+            };
+            assert!(!db
+                .update_payment_order_if_state(&stale, OrderState::Pending)
+                .await
+                .unwrap());
+
+            assert_eq!(
+                db.acquire_payment_order_lease("o1", 3_000, 123_000)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .version,
+                2
+            );
+        });
+    }
+
+    #[tokio::test]
+    async fn an_unlink_bumps_the_version_and_refuses_a_pre_unlink_copy() {
+        database_test!(|db| async move {
+            create_payment_order_indexes(&db).await;
+            db.insert_payment_order(&order("o1", "u1", OrderState::Paid, 10))
+                .await
+                .unwrap();
+            let before = db.fetch_payment_order("o1").await.unwrap().unwrap();
+
+            db.unlink_payment_orders_by_user("u1").await.unwrap();
+            let stored = db.fetch_payment_order("o1").await.unwrap().unwrap();
+            assert!(stored.user_id.is_none());
+            assert_eq!(stored.version, 1);
+
+            // A pre-unlink copy that itself drops the buyer passes the
+            // buyer check; the moved version alone refuses it
+            let voided = PaymentOrder {
+                user_id: None,
+                state: OrderState::Voided,
+                void_reason: Some(crate::VoidReason::AccountDeleted),
+                reversed_at: Some(20),
+                ..before
+            };
+            assert!(!db
+                .update_payment_order_if_state(&voided, OrderState::Paid)
+                .await
+                .unwrap());
+            assert_eq!(db.fetch_payment_order("o1").await.unwrap(), Some(stored));
+        });
+    }
+
+    #[tokio::test]
+    async fn expected_version_zero_matches_an_order_stored_without_a_version() {
+        database_test!(|db| async move {
+            create_payment_order_indexes(&db).await;
+            let row = order("o1", "u1", OrderState::Pending, 10);
+            let leased_row = order("o2", "u1", OrderState::Pending, 20);
+
+            match &db {
+                // This driver has no absent field: the order reads as 0
+                crate::Database::Reference(_) => {
+                    db.insert_payment_order(&row).await.unwrap();
+                    db.insert_payment_order(&leased_row).await.unwrap();
+                }
+                #[cfg(feature = "mongodb")]
+                crate::Database::MongoDb(mongo) => {
+                    // Orders written before `version` existed
+                    for typed in [&row, &leased_row] {
+                        let mut raw = bson::to_document(typed).unwrap();
+                        raw.remove("version");
+                        assert!(!raw.contains_key("version"));
+                        mongo
+                            .col::<bson::Document>("payment_orders")
+                            .insert_one(raw)
+                            .await
+                            .unwrap();
+                    }
+                }
+            }
+
+            assert_eq!(
+                db.fetch_payment_order("o1").await.unwrap(),
+                Some(row.clone())
+            );
+
+            let paid = PaymentOrder {
+                state: OrderState::Paid,
+                paid_at: Some(30),
+                ..row.clone()
+            };
+            assert!(db
+                .update_payment_order_if_state(&paid, OrderState::Pending)
+                .await
+                .unwrap());
+            assert_eq!(
+                db.fetch_payment_order("o1").await.unwrap(),
+                Some(PaymentOrder {
+                    version: 1,
+                    ..paid.clone()
+                })
+            );
+
+            // Now at 1: the absent-or-zero match no longer applies
+            let stale = PaymentOrder {
+                paid_at: Some(40),
+                ..paid
+            };
+            assert!(!db
+                .update_payment_order_if_state(&stale, OrderState::Paid)
+                .await
+                .unwrap());
+
+            // A lease on a version-less order starts the count at 1
+            let held = db
+                .acquire_payment_order_lease("o2", 1_000, 121_000)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(held.version, 1);
         });
     }
 }

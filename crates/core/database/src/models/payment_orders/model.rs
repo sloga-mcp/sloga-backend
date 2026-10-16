@@ -97,6 +97,13 @@ auto_derived!(
         /// Epoch ms until which a worker holds this order; unset when free
         #[serde(skip_serializing_if = "Option::is_none", default)]
         pub lease_until: Option<i64>,
+        /// Optimistic-concurrency counter, bumped by every
+        /// `update_payment_order_if_state`, `acquire_payment_order_lease` and
+        /// `unlink_payment_orders_by_user`; an order stored before the field
+        /// existed reads as 0. Stored as Int64 (bson refuses a u64 above
+        /// `i64::MAX`, so such a write fails instead of wrapping).
+        #[serde(default)]
+        pub version: u64,
         /// Epoch ms the order was created
         pub created_at: i64,
         /// Epoch ms the payment was confirmed
