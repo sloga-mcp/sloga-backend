@@ -62,7 +62,7 @@ const SWEEP_EVERY_N_TICKS: u32 = 10;
 const HEARTBEAT_TIMEOUT_SECS: i64 = 300;
 
 /// How long the sweeper keeps retrying the bot's leave for a finished
-/// source job before giving up loudly. See `retry_source_leaves`.
+/// source job before giving up loudly. See `retry_source_leaves_with`.
 const LEAVE_RETRY_DAYS: i64 = 7;
 
 /// The leave-retry scan reads a day further back than it retries, so a job
@@ -89,19 +89,13 @@ pub async fn task(db: Database, _amqp: AMQP) -> Result<()> {
     loop {
         let config = config().await;
 
-        // Runs while ANY source is switched on. That alone would weaken the
-        // Discord kill switch, so `run_job` re-checks each job's own source
-        // (`kind_source_ready`) and fails the job when it is off.
-        if !config.api.import.any_enabled() {
+        // The claim loop runs while ANY source is switched on. That alone
+        // would weaken the Discord kill switch, so `run_job` re-checks each
+        // job's own source (`kind_source_ready`) and fails the job when it
+        // is off.
+        if !housekeeping(&db, &config, tick, &leave_source).await {
             sleep(DISABLED_TICK).await;
             continue;
-        }
-
-        if tick % SWEEP_EVERY_N_TICKS == 0 {
-            if let Err(error) = sweep_stale(&db).await {
-                log::error!("discord import sweeper failed: {error:?}");
-            }
-            retry_source_leaves(&db, &config).await;
         }
         tick = tick.wrapping_add(1);
 
@@ -121,6 +115,29 @@ pub async fn task(db: Database, _amqp: AMQP) -> Result<()> {
 
         sleep(TICK).await;
     }
+}
+
+/// The sweeps a tick owes before any claiming. Returns whether any source
+/// is switched on, i.e. whether the claim loop should run.
+///
+/// The bot-leave retry runs whatever is switched on: rows whose bot has not
+/// left yet must keep being retried (and, past the cap, given up on loudly)
+/// after every import source is turned off. Switched off, it runs once per
+/// idle tick; the stale-job sweep, which only matters while jobs can run,
+/// stays behind the switch.
+async fn housekeeping(db: &Database, config: &Settings, tick: u32, leave: &LeaveHook) -> bool {
+    if !config.api.import.any_enabled() {
+        retry_source_leaves_with(db, config, leave).await;
+        return false;
+    }
+
+    if tick % SWEEP_EVERY_N_TICKS == 0 {
+        if let Err(error) = sweep_stale(db).await {
+            log::error!("discord import sweeper failed: {error:?}");
+        }
+        retry_source_leaves_with(db, config, leave).await;
+    }
+    true
 }
 
 /// Fail jobs whose worker vanished, so the UI never spins forever.
@@ -238,10 +255,8 @@ async fn sweep_stale(db: &Database) -> Result<()> {
 /// may still be in that source and has to be removed by hand. The query
 /// reads one day further back than the cap so a job crossing it is seen and
 /// logged instead of silently aging out of the window.
-async fn retry_source_leaves(db: &Database, config: &Settings) {
-    retry_source_leaves_with(db, config, &leave_source).await
-}
-
+///
+/// `leave` is `leave_source` outside tests.
 async fn retry_source_leaves_with(db: &Database, config: &Settings, leave: &LeaveHook) {
     let jobs = match db
         .fetch_unleft_terminal_source_jobs(LEAVE_RETRY_WINDOW_DAYS, LEAVE_RETRY_BATCH)
@@ -285,16 +300,16 @@ type LeaveHook = dyn for<'a> Fn(&'a Database, &'a mut DiscordImportJob, &'a Sett
     + Send
     + Sync;
 
-/// Per-source leave dispatch. No source importer exists yet, so no source
-/// can report having left; each source's importer replaces its own arm.
+/// Per-source leave dispatch. A source without an importer cannot report
+/// having left; each source's importer replaces its own arm.
 fn leave_source<'a>(
     _db: &'a Database,
     job: &'a mut DiscordImportJob,
-    _config: &'a Settings,
+    config: &'a Settings,
 ) -> BoxFuture<'a, bool> {
     Box::pin(async move {
         match job.kind {
-            ImportJobKind::StoatServer => false,
+            ImportJobKind::StoatServer => crate::tasks::stoat_import::leave(job, config).await,
             ImportJobKind::FluxerServer => false,
             ImportJobKind::MatrixSpace => false,
             // Never reached: `on_terminal` returns early for these.
@@ -533,11 +548,11 @@ async fn run_job(db: &Database, mut job: DiscordImportJob, config: &Settings) {
         match job.kind {
             ImportJobKind::Template => import(db, &mut job).await,
             ImportJobKind::Stickers => super::stickers::import_stickers(db, &mut job).await,
+            ImportJobKind::StoatServer => {
+                crate::tasks::stoat_import::run(db, &mut job, config).await
+            }
             // No importer for these sources on this build: fail closed so a
             // row can never sit unclaimed.
-            ImportJobKind::StoatServer => {
-                Err(ImportAbort::Failed(source_unavailable_message(&job.kind)))
-            }
             ImportJobKind::FluxerServer => {
                 Err(ImportAbort::Failed(source_unavailable_message(&job.kind)))
             }
@@ -2203,11 +2218,18 @@ mod tests {
     /// A source kind with no importer on this build must not sit in the
     /// queue (holding its owner's one active job) forever: it is claimed and
     /// failed, whether or not its source is configured.
+    ///
+    /// Stoat has an importer (and is covered by the `stoat_` tests below);
+    /// run here with its source configured it would contact the configured
+    /// API, so it is left out.
     #[tokio::test]
     async fn source_kinds_without_an_importer_fail_closed_instead_of_sitting_queued() {
         for sources_ready in [true, false] {
             let config = config_with(true, true, sources_ready).await;
-            for kind in ImportJobKind::SOURCE_KINDS {
+            for kind in ImportJobKind::SOURCE_KINDS
+                .into_iter()
+                .filter(|kind| !matches!(kind, ImportJobKind::StoatServer))
+            {
                 let db = DatabaseInfo::Reference.connect().await.unwrap();
                 let owner = make_owner(&db).await;
                 let job = source_job(&owner.id, kind.clone(), "01SOURCE000000000000000001");
@@ -2815,5 +2837,517 @@ mod tests {
         // Everyone else keeps the Discord shape: no deny.
         let other_id = roles.get(&plan.roles[1].template_id.0).unwrap();
         assert_eq!(stored.roles[other_id].permissions.d, 0);
+    }
+
+    /// The leave retry runs with every import source switched off: the rows
+    /// whose bot has not left are still retried and, past the cap, given up
+    /// on loudly. Tick 1 is off the sweep cadence, so only the switched-off
+    /// branch can have run it.
+    #[tokio::test]
+    async fn leave_retry_runs_while_every_source_is_switched_off() {
+        let db = DatabaseInfo::Reference.connect().await.unwrap();
+        let config = config_with(false, false, false).await;
+        assert!(!config.api.import.any_enabled());
+
+        let mut job = source_job(
+            "01USERA0000000000000000009",
+            ImportJobKind::StoatServer,
+            "01SRCOFF",
+        );
+        job.status = ImportStatus::Failed;
+        db.insert_discord_import_job(&job).await.unwrap();
+
+        assert!(
+            !housekeeping(&db, &config, 1, &leaves).await,
+            "nothing is switched on: no claiming"
+        );
+        assert!(leave_called(&job.id), "the leave retry must still run");
+        assert!(
+            db.fetch_discord_import_job(&job.id)
+                .await
+                .unwrap()
+                .source_left
+        );
+    }
+
+    // ----------------------------------------------------------------------
+    // Stoat importer, through the claim loop's dispatch, against a fake
+    // Stoat API and CDN on loopback
+    // ----------------------------------------------------------------------
+
+    use crate::tasks::stoat_import::source::fake_upstream::{FakeStoat, BOT_TOKEN};
+    use crate::tasks::stoat_import::source::tests::SERVER as STOAT_SERVER;
+    use crate::tasks::stoat_import::VERIFICATION_MISSING;
+
+    const STOAT_CODE: &str = "sloga-import-ABCDEFGH";
+
+    /// A Stoat server as `GET /servers/{id}?include_channels=true` returns
+    /// it: the server's id list under `channels`, then the visible channel
+    /// objects under `channels` again. `01CHANHID` is not visible to the bot.
+    fn stoat_server_body(description: &str) -> String {
+        let bit = |permission: ChannelPermission| permission as u64 as i64;
+        let view = bit(ChannelPermission::ViewChannel);
+        let admin_allow = bit(ChannelPermission::ManageServer) | view;
+        let muted_deny = bit(ChannelPermission::SendMessage);
+        // Bits 14 and 41 must not survive the trip.
+        let default_permissions = view
+            | bit(ChannelPermission::ReadMessageHistory)
+            | bit(ChannelPermission::SendMessage)
+            | bit(ChannelPermission::ViewAuditLog)
+            | bit(ChannelPermission::UseRemoteControl);
+        let server = serde_json::json!({
+            "_id": STOAT_SERVER,
+            "owner": "01OWNER0000000000000000000",
+            "name": "Stoat Place",
+            "description": description,
+            "nsfw": true,
+            "categories": [
+                { "id": "c1", "title": "Text",
+                  "channels": ["01CHANWEL", "01CHANGEN", "01CHANPRV", "01CHANGONE"] },
+                { "id": "c2", "title": "Voice", "channels": ["01CHANVOI"] }
+            ],
+            "system_messages": { "user_joined": "01CHANWEL", "user_left": "01CHANGEN" },
+            "roles": {
+                "01ROLEADM": {
+                    "name": "Admin",
+                    "permissions": { "a": admin_allow, "d": 0 },
+                    "colour": "linear-gradient(90deg, #ff0000 0%, #0000ff 100%)",
+                    "hoist": true,
+                    "rank": 0
+                },
+                "01ROLEMUT": {
+                    "name": "Muted",
+                    "permissions": { "a": 0, "d": muted_deny },
+                    "rank": 1
+                }
+            },
+            "default_permissions": default_permissions,
+            "icon": { "_id": "01ICON", "tag": "icons", "filename": "icon.png",
+                      "content_type": "image/png", "size": 67,
+                      "metadata": { "type": "Image", "width": 1, "height": 1 } }
+        });
+        let ids = serde_json::json!([
+            "01CHANGEN",
+            "01CHANWEL",
+            "01CHANVOI",
+            "01CHANPRV",
+            "01CHANHID"
+        ]);
+        let visible = serde_json::json!([
+            { "channel_type": "TextChannel", "_id": "01CHANGEN", "server": STOAT_SERVER,
+              "name": "general" },
+            { "channel_type": "TextChannel", "_id": "01CHANWEL", "server": STOAT_SERVER,
+              "name": "welcome" },
+            { "channel_type": "TextChannel", "_id": "01CHANVOI", "server": STOAT_SERVER,
+              "name": "Lounge", "voice": { "max_users": 0 } },
+            { "channel_type": "TextChannel", "_id": "01CHANPRV", "server": STOAT_SERVER,
+              "name": "staff",
+              "default_permissions": { "a": 0, "d": view },
+              "role_permissions": { "01ROLEADM": { "a": view, "d": 0 } } }
+        ]);
+        let head = server.to_string();
+        format!(
+            "{},\"channels\":{ids},\"channels\":{visible}}}",
+            &head[..head.len() - 1]
+        )
+    }
+
+    fn stoat_job(owner_id: &str) -> DiscordImportJob {
+        DiscordImportJob::new_source(
+            owner_id.to_string(),
+            ImportJobKind::StoatServer,
+            "https://stoat.chat/invite/AbC123".to_string(),
+            Some(STOAT_SERVER.to_string()),
+            Some(STOAT_CODE.to_string()),
+        )
+    }
+
+    fn server_path() -> String {
+        format!("/servers/{STOAT_SERVER}?include_channels=true")
+    }
+
+    fn leave_path() -> String {
+        format!("/servers/{STOAT_SERVER}?leave_silently=true")
+    }
+
+    /// Claim the queued job and run it the way the claim loop does.
+    async fn claim_and_run(db: &Database, job: &DiscordImportJob, config: &Settings) {
+        db.insert_discord_import_job(job).await.unwrap();
+        let claimed = db
+            .claim_next_queued_discord_import_job()
+            .await
+            .unwrap()
+            .expect("the queued Stoat job is claimable");
+        assert_eq!(claimed.id, job.id);
+        run_job(db, claimed, config).await;
+    }
+
+    #[tokio::test]
+    async fn stoat_import_runs_end_to_end_and_the_bot_leaves() {
+        let db = DatabaseInfo::Reference.connect().await.unwrap();
+        let owner = make_owner(&db).await;
+        seed_png_hash(&db).await;
+
+        let api = FakeStoat::new()
+            .reply(
+                "GET",
+                &server_path(),
+                200,
+                stoat_server_body(&format!("Welcome! Verify: {STOAT_CODE}")),
+            )
+            .reply(
+                "GET",
+                &format!("/servers/{STOAT_SERVER}/emojis"),
+                200,
+                serde_json::json!([{
+                    "_id": "01EMOJI", "parent": { "type": "Server", "id": STOAT_SERVER },
+                    "creator_id": "01OWNER0000000000000000000", "name": "party"
+                }])
+                .to_string(),
+            )
+            .reply("DELETE", &leave_path(), 204, "")
+            .start()
+            .await;
+        let cdn = FakeStoat::new()
+            // Autumn's `original` is a relative redirect to the filename.
+            .redirect("/icons/01ICON/original", "icon.png")
+            .reply("GET", "/icons/01ICON/icon.png", 200, PNG_1X1)
+            .reply("GET", "/emojis/01EMOJI/original", 200, PNG_1X1)
+            .start()
+            .await;
+        let mut config = config_with(false, false, true).await;
+        config.api.import.stoat = api.source_config(&cdn);
+
+        let job = stoat_job(&owner.id);
+        claim_and_run(&db, &job, &config).await;
+
+        let stored = db.fetch_discord_import_job(&job.id).await.unwrap();
+        assert_eq!(stored.status, ImportStatus::Completed, "{:?}", stored.error);
+        assert!(stored.source_left, "the bot leaves once the job is done");
+
+        // Exactly the three API calls the rate limit budget allows, all as
+        // the bot; no CDN call carries the token.
+        let calls: Vec<(String, String)> = api
+            .seen()
+            .into_iter()
+            .map(|seen| {
+                assert_eq!(seen.bot_token.as_deref(), Some(BOT_TOKEN));
+                (seen.method, seen.path)
+            })
+            .collect();
+        assert_eq!(
+            calls,
+            vec![
+                ("GET".to_string(), server_path()),
+                ("GET".to_string(), format!("/servers/{STOAT_SERVER}/emojis")),
+                ("DELETE".to_string(), leave_path()),
+            ]
+        );
+        assert!(cdn.seen().iter().all(|seen| seen.bot_token.is_none()));
+
+        let server_id = stored.server_id.clone().expect("server built");
+        db.fetch_member(&server_id, &owner.id)
+            .await
+            .expect("the owner is a member");
+        let server = db.fetch_server(&server_id).await.unwrap();
+        assert_eq!(server.name, "Stoat Place");
+        assert_eq!(
+            server.description.as_deref(),
+            Some("Welcome! Verify:"),
+            "the verification code must not be imported"
+        );
+        assert!(server.nsfw);
+        assert_eq!(
+            server.default_permissions as u64,
+            ChannelPermission::ViewChannel as u64
+                | ChannelPermission::ReadMessageHistory as u64
+                | ChannelPermission::SendMessage as u64
+                | ChannelPermission::UseSoundboard as u64
+                | ChannelPermission::UseWatchTogether as u64
+        );
+        assert_eq!(server.icon.as_ref().expect("icon imported").tag, "icons");
+
+        // Roles: rank order, gradient, derived audit log, deny bits.
+        let ordered = server.ordered_roles();
+        assert_eq!(
+            ordered
+                .iter()
+                .map(|(_, role)| (role.name.as_str(), role.rank))
+                .collect::<Vec<_>>(),
+            vec![("Admin", 0), ("Muted", 1)]
+        );
+        let (admin_id, admin) = &ordered[0];
+        assert_eq!(
+            admin.colour.as_deref(),
+            Some("linear-gradient(90deg, #ff0000 0%, #0000ff 100%)")
+        );
+        assert!(admin.hoist);
+        assert_ne!(
+            admin.permissions.a & ChannelPermission::ViewAuditLog as i64,
+            0
+        );
+        assert_eq!(
+            ordered[1].1.permissions.d,
+            ChannelPermission::SendMessage as i64
+        );
+
+        // Channels by name.
+        let mut by_name = HashMap::new();
+        for id in &server.channels {
+            let channel = db.fetch_channel(id).await.unwrap();
+            if let Channel::TextChannel { name, .. } = &channel {
+                by_name.insert(name.clone(), channel.clone());
+            }
+        }
+        assert_eq!(by_name.len(), 4, "{:?}", by_name.keys());
+        let id_of = |name: &str| by_name[name].id().to_string();
+
+        let voice = by_name["Lounge"].voice().expect("a voice channel");
+        assert_eq!(voice.max_users, None, "max_users 0 is unlimited");
+        match &by_name["staff"] {
+            Channel::TextChannel {
+                default_permissions,
+                role_permissions,
+                ..
+            } => {
+                assert_eq!(
+                    default_permissions.expect("private").d,
+                    ChannelPermission::ViewChannel as i64
+                );
+                assert_eq!(
+                    role_permissions[admin_id.as_str()].a,
+                    ChannelPermission::ViewChannel as i64
+                );
+            }
+            _ => panic!("expected a text channel"),
+        }
+
+        let categories = server.categories.expect("categories");
+        assert_eq!(
+            categories
+                .iter()
+                .map(|category| (category.title.as_str(), category.channels.clone()))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    "Text",
+                    vec![id_of("welcome"), id_of("general"), id_of("staff")]
+                ),
+                ("Voice", vec![id_of("Lounge")]),
+            ]
+        );
+
+        let system = server.system_messages.expect("system messages");
+        assert_eq!(system.user_joined, Some(id_of("welcome")));
+        assert_eq!(system.user_left, Some(id_of("general")));
+        assert_eq!(system.user_kicked, None);
+        assert_eq!(system.user_banned, None);
+
+        match db
+            .fetch_invite(stored.invite_code.as_deref().expect("invite minted"))
+            .await
+            .unwrap()
+        {
+            Invite::Server { channel, .. } => assert_eq!(channel, id_of("welcome")),
+            _ => panic!("expected a server invite"),
+        }
+
+        let emojis = db.fetch_emoji_by_parent_id(&server_id).await.unwrap();
+        assert_eq!(emojis.len(), 1);
+        assert_eq!(emojis[0].name, "party");
+
+        let summary = stored.summary.expect("summary");
+        assert_eq!(summary.channels_created, 4);
+        assert_eq!(summary.channels_skipped, 1);
+        assert!(
+            summary
+                .notes
+                .iter()
+                .any(|note| note.starts_with("1 channel(s) were not visible to the importer bot")),
+            "{:?}",
+            summary.notes
+        );
+    }
+
+    /// The code delta matched has since been removed from the description:
+    /// nothing is built, the job fails with the verification copy, the emoji
+    /// are never fetched, and the bot still leaves. A rate-limited fetch
+    /// fails as "unavailable" with no retry, and the bot leaves then too.
+    #[tokio::test]
+    async fn stoat_job_fails_without_its_code_or_on_429_and_the_bot_still_leaves() {
+        let db = DatabaseInfo::Reference.connect().await.unwrap();
+        let owner = make_owner(&db).await;
+
+        let api = FakeStoat::new()
+            .reply(
+                "GET",
+                &server_path(),
+                200,
+                // Another code is not this job's code.
+                stoat_server_body("Welcome! sloga-import-ZZZZZZZZ"),
+            )
+            .reply("DELETE", &leave_path(), 204, "")
+            .start()
+            .await;
+        let mut config = config_with(false, false, true).await;
+        config.api.import.stoat = api.source_config(&api);
+
+        let job = stoat_job(&owner.id);
+        claim_and_run(&db, &job, &config).await;
+
+        let stored = db.fetch_discord_import_job(&job.id).await.unwrap();
+        assert_eq!(stored.status, ImportStatus::Failed);
+        assert_eq!(stored.error.as_deref(), Some(VERIFICATION_MISSING));
+        assert_eq!(stored.server_id, None, "nothing was built");
+        assert!(stored.source_left, "the bot leaves after a failure too");
+        assert_eq!(
+            api.seen()
+                .into_iter()
+                .map(|seen| (seen.method, seen.path))
+                .collect::<Vec<_>>(),
+            vec![
+                ("GET".to_string(), server_path()),
+                ("DELETE".to_string(), leave_path()),
+            ]
+        );
+
+        let limited = FakeStoat::new()
+            .reply("GET", &server_path(), 429, r#"{"type":"RateLimited"}"#)
+            .reply("DELETE", &leave_path(), 204, "")
+            .start()
+            .await;
+        config.api.import.stoat = limited.source_config(&limited);
+
+        let job = stoat_job(&owner.id);
+        claim_and_run(&db, &job, &config).await;
+
+        let stored = db.fetch_discord_import_job(&job.id).await.unwrap();
+        assert_eq!(stored.status, ImportStatus::Failed);
+        assert_eq!(
+            stored.error,
+            Some(crate::tasks::stoat_import::source::StoatError::Unavailable.user_message())
+        );
+        assert!(stored.source_left);
+        assert_eq!(
+            limited
+                .seen()
+                .into_iter()
+                .map(|seen| seen.method)
+                .collect::<Vec<_>>(),
+            vec!["GET", "DELETE"],
+            "one fetch, no retry"
+        );
+    }
+
+    /// A Stoat job whose worker died mid-build: the sweeper rolls its
+    /// orphan server back, and the bot leaves on the leave retry.
+    ///
+    /// `sweep_stale` reads the ambient config, which on a dev box has no
+    /// Stoat bot token, so the sweep's own leave sends nothing (asserted);
+    /// the next housekeeping tick, with the fake upstream's config, leaves.
+    #[tokio::test]
+    async fn reaped_stoat_job_rolls_back_and_the_bot_leaves() {
+        assert!(
+            config().await.api.import.stoat.bot_token.is_empty(),
+            "this test assumes no Stoat bot token in the ambient config"
+        );
+
+        let db = DatabaseInfo::Reference.connect().await.unwrap();
+        let owner = make_owner(&db).await;
+        let (server, _) = Server::create(
+            &db,
+            v0::DataCreateServer {
+                name: "Half built".to_string(),
+                description: None,
+                nsfw: None,
+            },
+            &owner,
+            false,
+        )
+        .await
+        .unwrap();
+
+        let mut job = stoat_job(&owner.id);
+        job.status = ImportStatus::Running;
+        job.stage = ImportStage::Channels;
+        job.server_id = Some(server.id.clone());
+        job.updated_at = Timestamp::now_utc()
+            .checked_sub(iso8601_timestamp::Duration::hours(1))
+            .unwrap();
+        db.insert_discord_import_job(&job).await.unwrap();
+
+        sweep_stale(&db).await.unwrap();
+
+        assert!(
+            db.fetch_server(&server.id).await.is_err(),
+            "the orphan server is rolled back"
+        );
+        let stored = db.fetch_discord_import_job(&job.id).await.unwrap();
+        assert_eq!(stored.status, ImportStatus::Failed);
+        assert!(!stored.source_left, "no token: nothing could be sent yet");
+
+        let api = FakeStoat::new()
+            .reply("DELETE", &leave_path(), 204, "")
+            .start()
+            .await;
+        let mut config = config_with(false, false, true).await;
+        config.api.import.stoat = api.source_config(&api);
+
+        // Tick 0 is a sweep tick: the leave retry runs with the real hook.
+        assert!(housekeeping(&db, &config, 0, &leave_source).await);
+
+        assert!(
+            db.fetch_discord_import_job(&job.id)
+                .await
+                .unwrap()
+                .source_left
+        );
+        assert_eq!(
+            api.seen()
+                .into_iter()
+                .map(|seen| (seen.method, seen.path))
+                .collect::<Vec<_>>(),
+            vec![("DELETE".to_string(), leave_path())]
+        );
+    }
+
+    /// The leave needs the bot token, not `enabled`. Without one nothing is
+    /// sent and the row stays un-left for the retry (and its give-up); with
+    /// one, the same retry leaves even though Stoat is switched off.
+    #[tokio::test]
+    async fn stoat_leave_needs_the_bot_token_not_the_switch() {
+        let db = DatabaseInfo::Reference.connect().await.unwrap();
+        let api = FakeStoat::new()
+            .reply("DELETE", &leave_path(), 204, "")
+            .start()
+            .await;
+
+        let mut config = config_with(false, false, false).await;
+        config.api.import.stoat = api.source_config(&api);
+        config.api.import.stoat.enabled = false;
+        config.api.import.stoat.bot_token = String::new();
+
+        let mut job = stoat_job("01USERA000000000000000000A");
+        job.status = ImportStatus::Completed;
+        db.insert_discord_import_job(&job).await.unwrap();
+
+        retry_source_leaves_with(&db, &config, &leave_source).await;
+        assert!(
+            !db.fetch_discord_import_job(&job.id)
+                .await
+                .unwrap()
+                .source_left
+        );
+        assert!(api.seen().is_empty(), "{:?}", api.seen());
+
+        config.api.import.stoat.bot_token = BOT_TOKEN.to_string();
+        retry_source_leaves_with(&db, &config, &leave_source).await;
+        assert!(
+            db.fetch_discord_import_job(&job.id)
+                .await
+                .unwrap()
+                .source_left
+        );
+        assert_eq!(api.seen().len(), 1);
     }
 }

@@ -84,7 +84,7 @@ impl PlanError {
                     .to_string()
             }
             (PlanError::UnexpectedRoleOrder, false) => {
-                "This server's roles are arranged in a way we don't recognise, and we won't \
+                "This server's roles are arranged in a way we don't recognize, and we won't \
                  guess at a server's permissions. Please report this."
                     .to_string()
             }
@@ -95,7 +95,7 @@ impl PlanError {
                     .to_string()
             }
             (PlanError::UnknownOverwriteKind, false) => {
-                "This server contains channel permissions we don't recognise. We've stopped \
+                "This server contains channel permissions we don't recognize. We've stopped \
                  rather than risk importing a private channel as a public one. Please report \
                  this."
                     .to_string()
@@ -341,7 +341,9 @@ fn clamp(value: &str, max: usize) -> String {
     value.trim().chars().take(max).collect::<String>()
 }
 
-fn clamp_name(raw: Option<&str>, fallback: &str) -> String {
+/// A name within Sloga's limits, or `fallback` when blank. Every source's
+/// mapper goes through this (the worker bypasses the HTTP validators).
+pub(crate) fn clamp_name(raw: Option<&str>, fallback: &str) -> String {
     let cleaned = clamp(raw.unwrap_or(""), NAME_MAX);
     if cleaned.chars().count() < NAME_MIN {
         fallback.to_string()
@@ -350,7 +352,8 @@ fn clamp_name(raw: Option<&str>, fallback: &str) -> String {
     }
 }
 
-fn clamp_description(raw: Option<&str>) -> Option<String> {
+/// A description within Sloga's limit; blank becomes `None`.
+pub(crate) fn clamp_description(raw: Option<&str>) -> Option<String> {
     raw.map(|value| clamp(value, DESCRIPTION_MAX))
         .filter(|value| !value.is_empty())
 }
@@ -1236,6 +1239,10 @@ mod tests {
                 let message = error.user_message_for(&kind);
                 assert!(!message.contains("Discord"), "{kind:?}: {message}");
                 assert!(!message.contains("template"), "{kind:?}: {message}");
+                // New copy uses US spelling; only the pinned Discord copy
+                // above keeps its original wording.
+                assert!(message.contains("recognize"), "{kind:?}: {message}");
+                assert!(!message.contains("recognise"), "{kind:?}: {message}");
             }
         }
     }
