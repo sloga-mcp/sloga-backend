@@ -7,7 +7,7 @@
 //! anyone able to make delta call it at will could keep another user's
 //! verification, and their import, at 429 just by naming their server.
 //! Three budgets are checked after every local refusal and before each
-//! upstream call:
+//! upstream call. For Stoat:
 //!
 //! - per user: one verification per 30 s;
 //! - per target: two calls per 10 s for one server id, and for an invite
@@ -15,6 +15,14 @@
 //! - global: ten calls per 10 s from delta, which protects the operator's
 //!   bot account and the shared IP the unauthenticated invite lookup
 //!   leaves from.
+//!
+//! Every source has its own keys and its own budgets
+//! ([`UpstreamThrottle::for_source`]): calls to one platform never spend
+//! another's. Fluxer allows two verifications per user per 30 s (a quick
+//! retry after fixing the role is not mistaken for an outage) and five
+//! calls per target per 10 s (one verification makes up to five calls on
+//! the guild id); its global budget is the same size as Stoat's, on its own
+//! key.
 //!
 //! The budgets live in Redis, so a restart does not reset them and every
 //! delta process shares them. One script checks every budget before it
@@ -35,6 +43,7 @@ struct Budget {
     window_ms: i64,
 }
 
+/// Stoat's budgets
 const PER_USER: Budget = Budget {
     limit: 1,
     window_ms: 30_000,
@@ -47,6 +56,55 @@ const GLOBAL: Budget = Budget {
     limit: 10,
     window_ms: 10_000,
 };
+
+/// Fluxer's budgets
+const FLUXER_PER_USER: Budget = Budget {
+    limit: 2,
+    window_ms: 30_000,
+};
+const FLUXER_PER_TARGET: Budget = Budget {
+    limit: 5,
+    window_ms: 10_000,
+};
+const FLUXER_GLOBAL: Budget = Budget {
+    limit: 10,
+    window_ms: 10_000,
+};
+
+/// The three budgets of one source
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SourceBudgets {
+    per_user: Budget,
+    per_target: Budget,
+    global: Budget,
+}
+
+const STOAT_BUDGETS: SourceBudgets = SourceBudgets {
+    per_user: PER_USER,
+    per_target: PER_TARGET,
+    global: GLOBAL,
+};
+const FLUXER_BUDGETS: SourceBudgets = SourceBudgets {
+    per_user: FLUXER_PER_USER,
+    per_target: FLUXER_PER_TARGET,
+    global: FLUXER_GLOBAL,
+};
+
+/// Prefix of every live key; a source's keys are `<this>:<tag>:…`
+const LIVE_NAMESPACE: &str = "import_upstream";
+
+/// The key segment and budgets for the source tagged `tag`. A tag with no
+/// arm of its own still gets keys of its own (its tag), with Stoat's
+/// budgets, the strictest: a source added without a row here is throttled
+/// harder than it needs, never shares another source's budget, and never
+/// runs unthrottled.
+fn source_budgets(tag: &'static str) -> (&'static str, SourceBudgets) {
+    match tag {
+        "stoat" => ("stoat", STOAT_BUDGETS),
+        "fluxer" => ("fluxer", FLUXER_BUDGETS),
+        other => (other, STOAT_BUDGETS),
+    }
+}
 
 /// Sliding windows, one sorted set per key, scored by milliseconds.
 ///
@@ -86,22 +144,51 @@ pub enum UpstreamTarget<'a> {
 #[derive(Clone, Debug)]
 pub struct UpstreamThrottle {
     prefix: String,
+    budgets: SourceBudgets,
 }
 
 impl UpstreamThrottle {
+    /// The budgets for calls to the source tagged `tag` (its challenge
+    /// tag, e.g. `stoat_source::SOURCE_TAG`), shared by every delta process
+    pub fn for_source(tag: &'static str) -> UpstreamThrottle {
+        UpstreamThrottle::in_namespace(LIVE_NAMESPACE, tag)
+    }
+
     /// The budgets for calls to Stoat
     pub fn stoat() -> UpstreamThrottle {
+        UpstreamThrottle::for_source("stoat")
+    }
+
+    fn in_namespace(namespace: &str, tag: &'static str) -> UpstreamThrottle {
+        let (key, budgets) = source_budgets(tag);
         UpstreamThrottle {
-            prefix: "import_upstream:stoat".to_string(),
+            prefix: format!("{namespace}:{key}"),
+            budgets,
         }
     }
 
-    /// Budgets no other test shares
+    /// Stoat's budgets, on keys no other test shares
     #[cfg(test)]
     pub fn isolated_for_tests() -> UpstreamThrottle {
-        UpstreamThrottle {
-            prefix: format!("import_upstream_test:{}", ulid::Ulid::new()),
-        }
+        UpstreamThrottle::isolated_for_source_tests("stoat")
+    }
+
+    /// `tag`'s budgets, on keys no other test shares
+    #[cfg(test)]
+    pub fn isolated_for_source_tests(tag: &'static str) -> UpstreamThrottle {
+        UpstreamThrottle::in_test_namespace(
+            &format!("import_upstream_test:{}", ulid::Ulid::new()),
+            tag,
+        )
+    }
+
+    /// `tag`'s budgets under a test's own `namespace` (use a fresh one per
+    /// test). Throttles for different sources in one namespace are keyed
+    /// exactly as [`UpstreamThrottle::for_source`] keys them, so a test can
+    /// check one source never spends another's.
+    #[cfg(test)]
+    pub fn in_test_namespace(namespace: &str, tag: &'static str) -> UpstreamThrottle {
+        UpstreamThrottle::in_namespace(namespace, tag)
     }
 
     fn user_key(&self, user_id: &str) -> String {
@@ -136,9 +223,9 @@ impl UpstreamThrottle {
     ) -> Result<()> {
         self.take(
             &[
-                ("user", self.user_key(user_id), PER_USER),
-                ("target", self.target_key(target), PER_TARGET),
-                ("global", self.global_key(), GLOBAL),
+                ("user", self.user_key(user_id), self.budgets.per_user),
+                ("target", self.target_key(target), self.budgets.per_target),
+                ("global", self.global_key(), self.budgets.global),
             ],
             now,
         )
@@ -150,8 +237,8 @@ impl UpstreamThrottle {
     pub async fn next_call(&self, target: UpstreamTarget<'_>, now: DateTime<Utc>) -> Result<()> {
         self.take(
             &[
-                ("target", self.target_key(target), PER_TARGET),
-                ("global", self.global_key(), GLOBAL),
+                ("target", self.target_key(target), self.budgets.per_target),
+                ("global", self.global_key(), self.budgets.global),
             ],
             now,
         )
@@ -462,6 +549,221 @@ mod tests {
                 let ttl: i64 = conn.pttl(&key).await.unwrap();
                 assert!(ttl > 0 && ttl <= window, "{}: pttl {}", key, ttl);
             }
+        })
+    }
+
+    // ---- per-source budgets ----
+
+    /// `stoat()` and `for_source("stoat")` are release 1's Stoat throttle:
+    /// the same Redis keys, literally, and the same budgets
+    #[test]
+    fn for_source_stoat_is_the_stoat_throttle() {
+        for throttle in [
+            UpstreamThrottle::stoat(),
+            UpstreamThrottle::for_source("stoat"),
+        ] {
+            assert_eq!(throttle.user_key("U1"), "import_upstream:stoat:user:U1");
+            assert_eq!(
+                throttle.target_key(UpstreamTarget::Invite("AbC123")),
+                "import_upstream:stoat:invite:abc123"
+            );
+            assert_eq!(
+                throttle.target_key(UpstreamTarget::Server("01hserver")),
+                "import_upstream:stoat:server:01HSERVER"
+            );
+            assert_eq!(throttle.global_key(), "import_upstream:stoat:global");
+            assert_eq!(
+                throttle.budgets,
+                SourceBudgets {
+                    per_user: Budget {
+                        limit: 1,
+                        window_ms: 30_000
+                    },
+                    per_target: Budget {
+                        limit: 2,
+                        window_ms: 10_000
+                    },
+                    global: Budget {
+                        limit: 10,
+                        window_ms: 10_000
+                    },
+                }
+            );
+        }
+    }
+
+    /// Fluxer's budgets, pinned, on keys of its own
+    #[test]
+    fn fluxer_has_its_own_keys_and_budgets() {
+        let throttle = UpstreamThrottle::for_source("fluxer");
+        assert_eq!(throttle.user_key("U1"), "import_upstream:fluxer:user:U1");
+        assert_eq!(
+            throttle.target_key(UpstreamTarget::Server("123")),
+            "import_upstream:fluxer:server:123"
+        );
+        assert_eq!(
+            throttle.target_key(UpstreamTarget::Invite("AbC")),
+            "import_upstream:fluxer:invite:abc"
+        );
+        assert_eq!(throttle.global_key(), "import_upstream:fluxer:global");
+        assert_eq!(
+            throttle.budgets,
+            SourceBudgets {
+                per_user: Budget {
+                    limit: 2,
+                    window_ms: 30_000
+                },
+                per_target: Budget {
+                    limit: 5,
+                    window_ms: 10_000
+                },
+                global: Budget {
+                    limit: 10,
+                    window_ms: 10_000
+                },
+            }
+        );
+    }
+
+    /// A tag with no row gets keys of its own and Stoat's (strictest)
+    /// budgets, never another source's keys
+    #[test]
+    fn an_unlisted_source_gets_its_own_keys_and_stoats_budgets() {
+        let throttle = UpstreamThrottle::for_source("matrix");
+        assert_eq!(throttle.user_key("U1"), "import_upstream:matrix:user:U1");
+        assert_eq!(throttle.global_key(), "import_upstream:matrix:global");
+        assert_eq!(throttle.budgets, STOAT_BUDGETS);
+    }
+
+    #[test]
+    fn fluxer_allows_two_verifications_per_user_per_30_seconds() {
+        crate::util::test::rt().block_on(async {
+            let throttle = UpstreamThrottle::isolated_for_source_tests("fluxer");
+            throttle
+                .begin_verification("U1", UpstreamTarget::Server("1001"), now())
+                .await
+                .unwrap();
+            throttle
+                .begin_verification(
+                    "U1",
+                    UpstreamTarget::Server("1002"),
+                    now() + Duration::seconds(1),
+                )
+                .await
+                .unwrap();
+            // The third within 30 s of the first, on any target
+            assert_refused(
+                throttle
+                    .begin_verification(
+                        "U1",
+                        UpstreamTarget::Invite("fresh"),
+                        now() + Duration::seconds(29),
+                    )
+                    .await,
+            );
+            // Once the first has left the window
+            throttle
+                .begin_verification(
+                    "U1",
+                    UpstreamTarget::Server("1004"),
+                    now() + Duration::milliseconds(30_001),
+                )
+                .await
+                .unwrap();
+        })
+    }
+
+    #[test]
+    fn fluxer_allows_five_calls_per_target_per_10_seconds() {
+        crate::util::test::rt().block_on(async {
+            let throttle = UpstreamThrottle::isolated_for_source_tests("fluxer");
+            throttle
+                .begin_verification("U1", UpstreamTarget::Server("1001"), now())
+                .await
+                .unwrap();
+            for _ in 0..4 {
+                throttle
+                    .next_call(UpstreamTarget::Server("1001"), now())
+                    .await
+                    .unwrap();
+            }
+            assert_refused(
+                throttle
+                    .next_call(UpstreamTarget::Server("1001"), now())
+                    .await,
+            );
+            assert_refused(
+                throttle
+                    .begin_verification("U2", UpstreamTarget::Server("1001"), now())
+                    .await,
+            );
+        })
+    }
+
+    /// Spending one source's budgets, global included, refuses nothing on
+    /// another: both directions, with every key in one namespace as live
+    /// throttles share Redis
+    #[test]
+    fn sources_never_spend_each_others_budgets() {
+        crate::util::test::rt().block_on(async {
+            // Fluxer exhausted: U1's verifications, the target, the global
+            let namespace = format!("import_upstream_test:{}", ulid::Ulid::new());
+            let fluxer = UpstreamThrottle::in_test_namespace(&namespace, "fluxer");
+            let stoat = UpstreamThrottle::in_test_namespace(&namespace, "stoat");
+            for _ in 0..2 {
+                fluxer
+                    .begin_verification("U1", UpstreamTarget::Server("G0"), now())
+                    .await
+                    .unwrap();
+            }
+            for target in ["G0", "G0", "G0", "G1", "G2", "G3", "G4", "G5"] {
+                fluxer
+                    .next_call(UpstreamTarget::Server(target), now())
+                    .await
+                    .unwrap();
+            }
+            assert_refused(
+                fluxer
+                    .begin_verification("U2", UpstreamTarget::Server("G9"), now())
+                    .await,
+            );
+            assert_refused(fluxer.next_call(UpstreamTarget::Server("G9"), now()).await);
+
+            stoat
+                .begin_verification("U1", UpstreamTarget::Server("G0"), now())
+                .await
+                .unwrap();
+            stoat
+                .next_call(UpstreamTarget::Server("G0"), now())
+                .await
+                .unwrap();
+
+            // Stoat exhausted the same way; Fluxer is unaffected
+            let namespace = format!("import_upstream_test:{}", ulid::Ulid::new());
+            let fluxer = UpstreamThrottle::in_test_namespace(&namespace, "fluxer");
+            let stoat = UpstreamThrottle::in_test_namespace(&namespace, "stoat");
+            stoat
+                .begin_verification("U1", UpstreamTarget::Server("G0"), now())
+                .await
+                .unwrap();
+            for target in ["G0", "G1", "G2", "G3", "G4", "G5", "G6", "G7", "G8"] {
+                stoat
+                    .next_call(UpstreamTarget::Server(target), now())
+                    .await
+                    .unwrap();
+            }
+            assert_refused(stoat.next_call(UpstreamTarget::Server("G9"), now()).await);
+
+            for _ in 0..2 {
+                fluxer
+                    .begin_verification("U1", UpstreamTarget::Server("G0"), now())
+                    .await
+                    .unwrap();
+            }
+            fluxer
+                .next_call(UpstreamTarget::Server("G0"), now())
+                .await
+                .unwrap();
         })
     }
 }

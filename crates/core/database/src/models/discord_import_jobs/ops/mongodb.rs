@@ -194,6 +194,32 @@ impl AbstractDiscordImportJobs for MongoDb {
             .map_err(|_| create_database_error!("find_one", COL))
     }
 
+    /// Whether a job of this kind on this source is active or recent.
+    async fn has_recent_job_for_source(
+        &self,
+        kind: &ImportJobKind,
+        source_server_id: &str,
+        since: Timestamp,
+    ) -> Result<bool> {
+        // Untyped + id-only projection, as above. `updated_at` is stored
+        // as Int64 milliseconds, so the bound goes through `timestamp_bson`
+        // too — an ISO-string bound would compare across BSON types and
+        // never match.
+        self.col::<Document>(COL)
+            .find_one(doc! {
+                "kind": kind.as_variant_str(),
+                "source_server_id": source_server_id,
+                "$or": [
+                    { "status": { "$in": active_statuses() } },
+                    { "updated_at": { "$gte": timestamp_bson(&since) } }
+                ]
+            })
+            .projection(doc! { "_id": 1_i32 })
+            .await
+            .map(|found| found.is_some())
+            .map_err(|_| create_database_error!("find_one", COL))
+    }
+
     /// Terminal source-kind jobs whose bot has not left the source yet.
     async fn fetch_unleft_terminal_source_jobs(
         &self,

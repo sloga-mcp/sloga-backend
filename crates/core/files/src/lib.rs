@@ -1,8 +1,10 @@
 mod implementation;
 mod repositories;
+mod sanitize;
 
 pub use implementation::*;
 pub use repositories::*;
+pub use sanitize::{sanitize_image, ImageLimits, SanitizeError, SanitizedImage};
 
 use std::io::{BufRead, Read, Seek};
 

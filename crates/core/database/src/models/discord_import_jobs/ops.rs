@@ -96,6 +96,25 @@ pub trait AbstractDiscordImportJobs: Sync + Send {
         except_job_id: &str,
     ) -> Result<bool>;
 
+    /// Whether any job of this `kind` against `source_server_id` is still
+    /// in flight (`Queued` or `Running` — the same set as
+    /// `has_other_active_job_for_source`) OR, in any status, has a
+    /// heartbeat at or after `since` (`updated_at >= since`).
+    ///
+    /// Drives the reconcile pass that leaves sources nobody is importing:
+    /// a guild is only left when this returns `false` for a window back
+    /// from now. Keyed on `updated_at` (there is no `created_at` field); a
+    /// terminal job's heartbeat stops at its finish time, so the window is
+    /// measured from when the job last did anything. A read, not
+    /// a lock: the caller re-checks right before each leave. Template and
+    /// sticker rows never carry `source_server_id`, so they never match.
+    async fn has_recent_job_for_source(
+        &self,
+        kind: &ImportJobKind,
+        source_server_id: &str,
+        since: Timestamp,
+    ) -> Result<bool>;
+
     /// Terminal (`Completed` / `Failed`) source-kind jobs whose bot has not
     /// yet left the source (`source_left` false OR ABSENT), whose heartbeat
     /// (`updated_at`, which stops moving once a job is terminal) is within
@@ -747,6 +766,130 @@ mod tests {
                 .unwrap());
             assert!(!db
                 .has_other_active_job_for_source(&stoat, source, &mine.id)
+                .await
+                .unwrap());
+        });
+    }
+
+    #[tokio::test]
+    async fn recent_job_for_source() {
+        database_test!(|db| async move {
+            let now = Timestamp::now_utc();
+            let since = now.checked_sub(Duration::hours(24)).unwrap();
+            let fluxer = ImportJobKind::FluxerServer;
+            let source = "01SRCSERVER00000000000000DA";
+
+            // No jobs at all.
+            assert!(!db
+                .has_recent_job_for_source(&fluxer, source, since)
+                .await
+                .unwrap());
+
+            // Same source id, different kind — active AND fresh, still not
+            // this source.
+            let stoat = source_job(
+                "01USER0000000000000000RJS1",
+                ImportJobKind::StoatServer,
+                source,
+            );
+            db.insert_discord_import_job(&stoat).await.unwrap();
+            // Same kind, different source — active AND fresh, unrelated.
+            let elsewhere = source_job(
+                "01USER0000000000000000RJS2",
+                fluxer.clone(),
+                "01SRCSERVER00000000000000DB",
+            );
+            db.insert_discord_import_job(&elsewhere).await.unwrap();
+            // A template job never carries a source id.
+            let template = job("01USER0000000000000000RJS3", "tmpl-x");
+            db.insert_discord_import_job(&template).await.unwrap();
+            assert!(!db
+                .has_recent_job_for_source(&fluxer, source, since)
+                .await
+                .unwrap());
+
+            // Finished BEFORE `since` (either terminal status): not recent.
+            for (user, status) in [
+                ("01USER0000000000000000RJS4", ImportStatus::Completed),
+                ("01USER0000000000000000RJS5", ImportStatus::Failed),
+            ] {
+                let mut done = source_job(user, fluxer.clone(), source);
+                done.status = status;
+                done.stage = ImportStage::Done;
+                done.updated_at = since.checked_sub(Duration::hours(1)).unwrap();
+                db.insert_discord_import_job(&done).await.unwrap();
+            }
+            assert!(!db
+                .has_recent_job_for_source(&fluxer, source, since)
+                .await
+                .unwrap());
+
+            // Finished AFTER `since`: recent.
+            let recent_source = "01SRCSERVER00000000000000DC";
+            let mut recent =
+                source_job("01USER0000000000000000RJS6", fluxer.clone(), recent_source);
+            recent.status = ImportStatus::Completed;
+            recent.stage = ImportStage::Done;
+            recent.updated_at = since.checked_add(Duration::hours(1)).unwrap();
+            db.insert_discord_import_job(&recent).await.unwrap();
+            assert!(db
+                .has_recent_job_for_source(&fluxer, recent_source, since)
+                .await
+                .unwrap());
+            // ...and it does not bleed into the stale source.
+            assert!(!db
+                .has_recent_job_for_source(&fluxer, source, since)
+                .await
+                .unwrap());
+
+            // Finished EXACTLY at `since`: the bound is inclusive.
+            let edge_source = "01SRCSERVER00000000000000DD";
+            let mut edge = source_job("01USER0000000000000000RJS7", fluxer.clone(), edge_source);
+            edge.status = ImportStatus::Failed;
+            edge.stage = ImportStage::Done;
+            edge.updated_at = since;
+            db.insert_discord_import_job(&edge).await.unwrap();
+            assert!(db
+                .has_recent_job_for_source(&fluxer, edge_source, since)
+                .await
+                .unwrap());
+
+            // Active jobs count regardless of `since`: a Queued job with an
+            // ancient heartbeat, checked against a bound in the FUTURE.
+            let future = now.checked_add(Duration::days(1)).unwrap();
+            let active_source = "01SRCSERVER00000000000000DE";
+            let mut queued =
+                source_job("01USER0000000000000000RJS8", fluxer.clone(), active_source);
+            queued.updated_at = now.checked_sub(Duration::days(30)).unwrap();
+            db.insert_discord_import_job(&queued).await.unwrap();
+            assert!(db
+                .has_recent_job_for_source(&fluxer, active_source, future)
+                .await
+                .unwrap());
+
+            // Running holds it too.
+            let mut running = queued.clone();
+            running.status = ImportStatus::Running;
+            db.save_discord_import_job(&running).await.unwrap();
+            assert!(db
+                .has_recent_job_for_source(&fluxer, active_source, future)
+                .await
+                .unwrap());
+
+            // Once it finishes with that old heartbeat, nothing holds it.
+            let mut finished = running.clone();
+            finished.status = ImportStatus::Completed;
+            finished.stage = ImportStage::Done;
+            assert!(db
+                .save_discord_import_job_if_active(&finished)
+                .await
+                .unwrap());
+            assert!(!db
+                .has_recent_job_for_source(&fluxer, active_source, future)
+                .await
+                .unwrap());
+            assert!(!db
+                .has_recent_job_for_source(&fluxer, active_source, since)
                 .await
                 .unwrap());
         });

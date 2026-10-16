@@ -4,11 +4,14 @@ use rocket::Route;
 mod challenge;
 mod discord_template;
 mod dto;
+#[cfg(test)]
+mod fake_upstream;
 mod job_active;
 mod job_fetch;
 mod source_server;
 mod stickers_start;
 mod stoat_source;
+mod upstream_http;
 mod upstream_throttle;
 
 /// For `GET /`, which advertises exactly the sources these routes accept
