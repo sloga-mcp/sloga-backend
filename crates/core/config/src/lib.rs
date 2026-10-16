@@ -493,6 +493,11 @@ pub struct ApiGamedata {
     pub blizzard_client_secret: String,
     /// Shared key that lets an internal caller ask January for game cards
     pub internal_key: String,
+    /// January base URL the embed worker uses when it sends `internal_key`.
+    /// Must be http(s) on localhost, a loopback or an RFC 1918 address (e.g.
+    /// `http://127.0.0.1:14705`); otherwise the key is never sent. Not a
+    /// secret.
+    pub internal_january: String,
     /// Length of the Steam store budget window, in seconds
     pub steam_store_window_secs: u64,
     /// Steam store calls per window for embeds
@@ -511,6 +516,7 @@ impl Default for ApiGamedata {
             blizzard_client_id: String::new(),
             blizzard_client_secret: String::new(),
             internal_key: String::new(),
+            internal_january: String::new(),
             steam_store_window_secs: 300,
             steam_store_embed_budget: 100,
             steam_store_interactive_budget: 50,
@@ -530,6 +536,7 @@ impl std::fmt::Debug for ApiGamedata {
             blizzard_client_id,
             blizzard_client_secret: _,
             internal_key: _,
+            internal_january,
             steam_store_window_secs,
             steam_store_embed_budget,
             steam_store_interactive_budget,
@@ -541,6 +548,7 @@ impl std::fmt::Debug for ApiGamedata {
             .field("blizzard_client_id", blizzard_client_id)
             .field("blizzard_client_secret", &"<redacted>")
             .field("internal_key", &"<redacted>")
+            .field("internal_january", internal_january)
             .field("steam_store_window_secs", steam_store_window_secs)
             .field("steam_store_embed_budget", steam_store_embed_budget)
             .field("steam_store_interactive_budget", steam_store_interactive_budget)
@@ -2159,6 +2167,7 @@ mod gamedata_debug_tests {
             blizzard_client_id: "la1-client-id".into(),
             blizzard_client_secret: SECRET.into(),
             internal_key: INTERNAL.into(),
+            internal_january: "http://127.0.0.1:14705".into(),
             ..ApiGamedata::default()
         };
         let printed = format!("{gamedata:?}");
@@ -2168,6 +2177,10 @@ mod gamedata_debug_tests {
         assert!(!pretty.contains(SECRET), "blizzard_client_secret printed (pretty)");
         assert!(!pretty.contains(INTERNAL), "internal_key printed (pretty)");
         assert!(printed.contains("la1-client-id"), "non-secret field missing");
+        assert!(
+            printed.contains(r#"internal_january: "http://127.0.0.1:14705""#),
+            "internal_january missing"
+        );
         assert_eq!(printed.matches("<redacted>").count(), 2);
     }
 
@@ -2184,6 +2197,7 @@ mod gamedata_debug_tests {
         assert!(bundled.blizzard_client_id.is_empty());
         assert!(bundled.blizzard_client_secret.is_empty());
         assert!(bundled.internal_key.is_empty());
+        assert!(bundled.internal_january.is_empty());
         assert_eq!(bundled.steam_store_window_secs, default.steam_store_window_secs);
         assert_eq!(bundled.steam_store_embed_budget, default.steam_store_embed_budget);
         assert_eq!(

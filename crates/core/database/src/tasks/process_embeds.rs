@@ -10,7 +10,14 @@ use async_lock::Semaphore;
 use deadqueue::limited::Queue;
 use once_cell::sync::Lazy;
 use revolt_models::v0::Embed;
-use std::{collections::HashSet, sync::Arc};
+use std::{
+    collections::HashSet,
+    net::IpAddr,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+};
 use tokio::task::spawn;
 
 use isahc::prelude::*;
@@ -57,6 +64,7 @@ pub async fn worker(db: Database) {
                 task.content,
                 &config.hosts.january,
                 &config.api.gamedata.internal_key,
+                &config.api.gamedata.internal_january,
                 config.features.limits.global.message_embeds,
                 semaphore,
             )
@@ -94,16 +102,101 @@ static RE_IGNORED: Lazy<Regex> = Lazy::new(|| Regex::new("(<http.+>)").unwrap())
 /// data budget) for the worker's requests
 const INTERNAL_KEY_HEADER: &str = "X-Internal-Key";
 
-/// January `/embed` request for `link`. The internal key is sent only when
-/// one is configured; the header is marked sensitive so it is never printed.
-fn embed_request(host: &str, link: &str, internal_key: &str) -> Option<isahc::Request<()>> {
+/// Where the worker sends its `/embed` requests, and with which key
+#[derive(Debug, PartialEq, Eq)]
+struct EmbedRoute<'a> {
+    /// January base URL
+    host: &'a str,
+    /// `X-Internal-Key` value, if one is sent
+    key: Option<&'a str>,
+    /// Both settings were present but `internal_january` was not a
+    /// loopback / private URL, so the key was withheld
+    refused: bool,
+}
+
+/// Whether `url` is an http(s) URL whose host is `localhost`, a loopback
+/// address (127.0.0.0/8, ::1) or an RFC 1918 private IPv4 address. The
+/// internal key may only travel to such a host, never through a public
+/// proxy or CDN.
+fn is_internal_url(url: &str) -> bool {
+    let Ok(uri) = url.parse::<isahc::http::Uri>() else {
+        return false;
+    };
+    let Some(scheme) = uri.scheme_str() else {
+        return false;
+    };
+    if !scheme.eq_ignore_ascii_case("http") && !scheme.eq_ignore_ascii_case("https") {
+        return false;
+    }
+    let Some(authority) = uri.authority() else {
+        return false;
+    };
+    // No credentials in the URL
+    if authority.as_str().contains('@') {
+        return false;
+    }
+
+    let host = authority.host();
+    let host = host
+        .strip_prefix('[')
+        .and_then(|host| host.strip_suffix(']'))
+        .unwrap_or(host);
+
+    match host.parse::<IpAddr>() {
+        Ok(IpAddr::V4(ip)) => ip.is_loopback() || ip.is_private(),
+        Ok(IpAddr::V6(ip)) => ip.is_loopback(),
+        Err(_) => host.eq_ignore_ascii_case("localhost"),
+    }
+}
+
+/// Route for the worker's `/embed` requests. The key is sent only when
+/// both `internal_key` and `internal_january` are set and the latter is an
+/// internal URL; the request then goes there instead of the public
+/// `hosts.january`. In every other case the request is exactly as before:
+/// the public host, no key (so no game cards).
+fn embed_route<'a>(
+    public_host: &'a str,
+    internal_key: &'a str,
+    internal_january: &'a str,
+) -> EmbedRoute<'a> {
+    let internal_january = internal_january.trim();
+    if internal_key.trim().is_empty() || internal_january.is_empty() {
+        return EmbedRoute {
+            host: public_host,
+            key: None,
+            refused: false,
+        };
+    }
+
+    if !is_internal_url(internal_january) {
+        return EmbedRoute {
+            host: public_host,
+            key: None,
+            refused: true,
+        };
+    }
+
+    EmbedRoute {
+        host: internal_january.trim_end_matches('/'),
+        key: Some(internal_key),
+        refused: false,
+    }
+}
+
+/// Set once the refused-route warning has been logged
+static WARNED_REFUSED_ROUTE: AtomicBool = AtomicBool::new(false);
+
+/// January `/embed` request for `link` along `route`. The key header is
+/// marked sensitive so it is never printed.
+fn embed_request(route: &EmbedRoute, link: &str) -> Option<isahc::Request<()>> {
+    let host = route.host;
     let mut builder = isahc::Request::get(format!(
         "{host}/embed?url={}",
         url_escape::encode_component(link)
     ));
 
-    if !internal_key.trim().is_empty() {
-        if let Ok(mut value) = isahc::http::HeaderValue::from_str(internal_key) {
+    if let Some(key) = route.key {
+        if let Ok(mut value) = isahc::http::HeaderValue::from_str(key) {
             value.set_sensitive(true);
             builder = builder.header(INTERNAL_KEY_HEADER, value);
         }
@@ -116,6 +209,7 @@ pub async fn generate(
     content: String,
     host: &str,
     internal_key: &str,
+    internal_january: &str,
     max_embeds: usize,
     semaphore: Arc<Semaphore>,
 ) -> Result<Vec<Embed>> {
@@ -166,9 +260,17 @@ pub async fn generate(
     // TODO: batch request to january
     let mut tasks = Vec::new();
 
+    let route = embed_route(host, internal_key, internal_january);
+    if route.refused && !WARNED_REFUSED_ROUTE.swap(true, Ordering::Relaxed) {
+        warn!(
+            "api.gamedata.internal_january is not an http(s) URL on localhost, a loopback or a \
+             private address; the internal key is not sent and game cards stay off"
+        );
+    }
+
     for link in links {
         let semaphore = semaphore.clone();
-        let request = embed_request(host, &link, internal_key);
+        let request = embed_request(&route, &link);
         tasks.push(spawn(async move {
             let request = request?;
             let guard = semaphore.acquire().await;
@@ -211,33 +313,101 @@ fn keep_embed(status_ok: bool, embed: Option<Embed>) -> Option<Embed> {
 
 #[cfg(test)]
 mod tests {
-    use super::{embed_request, keep_embed, INTERNAL_KEY_HEADER};
+    use super::{embed_request, embed_route, is_internal_url, keep_embed, INTERNAL_KEY_HEADER};
     use revolt_models::v0::{Embed, Image, ImageSize};
 
     const LINK: &str = "https://store.steampowered.com/app/620/?a=1&b=2";
-    const URI: &str =
-        "http://january:14705/embed?url=https%3A%2F%2Fstore.steampowered.com%2Fapp%2F620%2F%3Fa%3D1%26b%3D2";
+    const QUERY: &str =
+        "/embed?url=https%3A%2F%2Fstore.steampowered.com%2Fapp%2F620%2F%3Fa%3D1%26b%3D2";
+    const PUBLIC: &str = "https://app.sloga.gg/proxy";
+    const INTERNAL: &str = "http://127.0.0.1:14705";
+    const KEY: &str = "s3cret-internal-key";
 
-    #[test]
-    fn internal_key_is_sent_when_configured() {
-        let request = embed_request("http://january:14705", LINK, "s3cret").expect("request");
-        assert_eq!(request.uri().to_string(), URI);
-        let value = request
-            .headers()
-            .get(INTERNAL_KEY_HEADER)
-            .expect("internal key header");
-        assert_eq!(value.to_str().unwrap(), "s3cret");
-        assert!(value.is_sensitive());
-        assert!(!format!("{request:?}").contains("s3cret"));
+    /// (uri, key header) the worker would send for `LINK`
+    fn sent(key: &str, internal_january: &str) -> (String, Option<String>) {
+        let route = embed_route(PUBLIC, key, internal_january);
+        let request = embed_request(&route, LINK).expect("request");
+        assert!(!format!("{request:?}").contains(KEY), "key printed");
+        let header = request.headers().get(INTERNAL_KEY_HEADER).map(|value| {
+            assert!(value.is_sensitive());
+            value.to_str().unwrap().to_string()
+        });
+        (request.uri().to_string(), header)
     }
 
     #[test]
-    fn no_internal_key_header_without_a_configured_key() {
-        for key in ["", "   "] {
-            let request = embed_request("http://january:14705", LINK, key).expect("request");
-            assert_eq!(request.uri().to_string(), URI);
-            assert!(request.headers().get(INTERNAL_KEY_HEADER).is_none(), "{key:?}");
-            assert!(request.headers().is_empty(), "{key:?}");
+    fn key_without_an_internal_url_goes_to_the_public_host_without_a_header() {
+        for internal in ["", "   "] {
+            let (uri, header) = sent(KEY, internal);
+            assert_eq!(uri, format!("{PUBLIC}{QUERY}"), "{internal:?}");
+            assert_eq!(header, None, "{internal:?}");
+            assert!(!embed_route(PUBLIC, KEY, internal).refused);
+        }
+    }
+
+    #[test]
+    fn no_key_is_exactly_the_old_request() {
+        for (key, internal) in [("", ""), ("   ", ""), ("", INTERNAL), ("  ", INTERNAL)] {
+            let route = embed_route(PUBLIC, key, internal);
+            let request = embed_request(&route, LINK).expect("request");
+            assert_eq!(request.uri().to_string(), format!("{PUBLIC}{QUERY}"));
+            assert!(request.headers().is_empty(), "{key:?} {internal:?}");
+            assert!(!route.refused);
+        }
+    }
+
+    #[test]
+    fn key_and_internal_url_send_the_header_to_the_internal_host() {
+        for internal in [INTERNAL, "http://127.0.0.1:14705/", " http://localhost:14705 "] {
+            let (uri, header) = sent(KEY, internal);
+            let base = internal.trim().trim_end_matches('/');
+            assert_eq!(uri, format!("{base}{QUERY}"), "{internal:?}");
+            assert_eq!(header.as_deref(), Some(KEY), "{internal:?}");
+        }
+    }
+
+    #[test]
+    fn a_public_internal_url_never_gets_the_key() {
+        for internal in [
+            PUBLIC,
+            "http://january:14705",
+            "http://8.8.8.8:14705",
+            "http://localhost.evil.example",
+            "ftp://127.0.0.1",
+            "127.0.0.1:14705",
+        ] {
+            let (uri, header) = sent(KEY, internal);
+            assert_eq!(uri, format!("{PUBLIC}{QUERY}"), "{internal:?}");
+            assert_eq!(header, None, "{internal:?}");
+            assert!(embed_route(PUBLIC, KEY, internal).refused, "{internal:?}");
+        }
+    }
+
+    #[test]
+    fn internal_urls_are_loopback_or_private_only() {
+        for (url, internal) in [
+            ("http://127.0.0.1:14705", true),
+            ("http://127.8.9.10", true),
+            ("https://localhost", true),
+            ("HTTP://LOCALHOST:14705", true),
+            ("http://[::1]:14705", true),
+            ("http://10.0.0.5:14705", true),
+            ("http://172.16.0.1", true),
+            ("http://172.31.255.255", true),
+            ("http://192.168.1.20:14705", true),
+            ("http://172.32.0.1", false),
+            ("http://169.254.169.254", false),
+            ("http://100.64.0.1", false),
+            ("http://[::ffff:127.0.0.1]", false),
+            ("http://[fd00::1]", false),
+            ("http://127.1", false),
+            ("http://user:pass@127.0.0.1", false),
+            ("https://app.sloga.gg/proxy", false),
+            ("ws://127.0.0.1", false),
+            ("not a url", false),
+            ("", false),
+        ] {
+            assert_eq!(is_internal_url(url), internal, "{url}");
         }
     }
 

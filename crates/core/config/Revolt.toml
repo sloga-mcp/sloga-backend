@@ -146,6 +146,11 @@ blizzard_client_id = ""
 blizzard_client_secret = ""
 # Shared key internal callers send as X-Internal-Key to get game cards
 internal_key = ""
+# January URL the embed worker sends internal_key to, bypassing the public
+# proxy, e.g. a loopback URL such as http://127.0.0.1:14705. Must be http(s)
+# on localhost, a loopback or a private (RFC 1918) address, or the key is
+# never sent. Empty: no key is sent and game cards stay off.
+internal_january = ""
 # Steam store (appdetails + storesearch) budget window, in seconds
 steam_store_window_secs = 300
 # Steam store calls per window for embeds
