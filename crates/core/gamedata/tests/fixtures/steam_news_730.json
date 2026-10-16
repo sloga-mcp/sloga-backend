@@ -1,0 +1,43 @@
+{
+ "appnews": {
+  "appid": 730,
+  "newsitems": [
+   {
+    "gid": "1846651706675829",
+    "title": "Counter-Strike 2 Update",
+    "url": "https://steamstore-a.akamaihd.net/news/externalpost/steam_community_announcements/1846651706675829",
+    "is_external_url": true,
+    "author": "Vitaliy",
+    "contents": "\\Demo/Replay viewer improvements:Added a progress bar for demo/replay downloadsCamera controls now use click-and-drag schemeFree and chase camera are usable during a paused demoFixed some minor issues when seeking to a different position in the demo file\\Round backup files now require the game serve...",
+    "feedlabel": "Community Announcements",
+    "date": 1792018968,
+    "feedname": "steam_community_announcements",
+    "feed_type": 1,
+    "appid": 730,
+    "tags": [
+     "patchnotes",
+     "mod_reviewed",
+     "ModAct_487176015_1792019293_0",
+     "mod_require_rereview"
+    ]
+   },
+   {
+    "gid": "1846018067931597",
+    "title": "Counter-Strike 2 Update",
+    "url": "https://steamstore-a.akamaihd.net/news/externalpost/steam_community_announcements/1846018067931597",
+    "is_external_url": true,
+    "author": "Vitaliy",
+    "contents": "\\Added a ping icon for dropped defuse kitsReduced the time for AUG reload by half secondFixed the sound event during silent reload for Desert EagleFixed a case of buzzing soundscape sounds during demo playbackClipping fixes for Rush mapsLocalization updatesStability updates",
+    "feedlabel": "Community Announcements",
+    "date": 1791499009,
+    "feedname": "steam_community_announcements",
+    "feed_type": 1,
+    "appid": 730,
+    "tags": [
+     "patchnotes"
+    ]
+   }
+  ],
+  "count": 454
+ }
+}

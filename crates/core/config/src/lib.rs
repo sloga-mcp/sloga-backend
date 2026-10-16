@@ -480,6 +480,76 @@ impl Default for ApiKofi {
     }
 }
 
+/// Game data sources (Steam, Blizzard, Riot) used for game cards and
+/// lookups. The Blizzard client secret and `internal_key` belong in
+/// Revolt.overrides.toml or the environment, never in the baked config.
+/// Empty Blizzard credentials turn WoW cards off.
+#[derive(Deserialize, Clone)]
+#[serde(default)]
+pub struct ApiGamedata {
+    /// Battle.net OAuth client id
+    pub blizzard_client_id: String,
+    /// Battle.net OAuth client secret
+    pub blizzard_client_secret: String,
+    /// Shared key that lets an internal caller ask January for game cards
+    pub internal_key: String,
+    /// Length of the Steam store budget window, in seconds
+    pub steam_store_window_secs: u64,
+    /// Steam store calls per window for embeds
+    pub steam_store_embed_budget: u32,
+    /// Steam store calls per window for interactive lookups
+    pub steam_store_interactive_budget: u32,
+    /// Steam news calls per Steam store window
+    pub steam_news_per_window: u32,
+    /// Blizzard API calls per second, shared by every pool
+    pub blizzard_per_second: u32,
+}
+
+impl Default for ApiGamedata {
+    fn default() -> Self {
+        Self {
+            blizzard_client_id: String::new(),
+            blizzard_client_secret: String::new(),
+            internal_key: String::new(),
+            steam_store_window_secs: 300,
+            steam_store_embed_budget: 100,
+            steam_store_interactive_budget: 50,
+            steam_news_per_window: 60,
+            blizzard_per_second: 20,
+        }
+    }
+}
+
+impl std::fmt::Debug for ApiGamedata {
+    /// Same output as the derive, except `blizzard_client_secret` and
+    /// `internal_key` are never printed
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Exhaustive destructure: a new field fails to compile until it is
+        // either printed or deliberately redacted here
+        let ApiGamedata {
+            blizzard_client_id,
+            blizzard_client_secret: _,
+            internal_key: _,
+            steam_store_window_secs,
+            steam_store_embed_budget,
+            steam_store_interactive_budget,
+            steam_news_per_window,
+            blizzard_per_second,
+        } = self;
+
+        f.debug_struct("ApiGamedata")
+            .field("blizzard_client_id", blizzard_client_id)
+            .field("blizzard_client_secret", &"<redacted>")
+            .field("internal_key", &"<redacted>")
+            .field("steam_store_window_secs", steam_store_window_secs)
+            .field("steam_store_embed_budget", steam_store_embed_budget)
+            .field("steam_store_interactive_budget", steam_store_interactive_budget)
+            .field("steam_news_per_window", steam_news_per_window)
+            .field("blizzard_per_second", blizzard_per_second)
+            .finish()
+    }
+}
+
 #[derive(Deserialize, Debug, Clone)]
 pub struct Api {
     pub registration: ApiRegistration,
@@ -500,6 +570,8 @@ pub struct Api {
     pub import: ApiImport,
     #[serde(default)]
     pub kofi: ApiKofi,
+    #[serde(default)]
+    pub gamedata: ApiGamedata,
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -2067,5 +2139,58 @@ k2025 = "{EXTRA}"
         );
         assert!(debug.contains(r#"secret_access_key: "<redacted>""#));
         assert!(debug.contains(r#"access_key_id: "minioautumn""#));
+    }
+}
+
+// The Blizzard secret and the internal key must never reach a Debug string.
+// Failures print no formatted output, by convention.
+#[cfg(test)]
+mod gamedata_debug_tests {
+    use config::{Config, File, FileFormat};
+
+    use super::{ApiGamedata, Settings};
+
+    const SECRET: &str = "la1FakeBlizzardSecretNotARealOne";
+    const INTERNAL: &str = "la1FakeInternalKeyNotARealOne";
+
+    #[test]
+    fn debug_redacts_secret_and_internal_key() {
+        let gamedata = ApiGamedata {
+            blizzard_client_id: "la1-client-id".into(),
+            blizzard_client_secret: SECRET.into(),
+            internal_key: INTERNAL.into(),
+            ..ApiGamedata::default()
+        };
+        let printed = format!("{gamedata:?}");
+        let pretty = format!("{gamedata:#?}");
+        assert!(!printed.contains(SECRET), "blizzard_client_secret printed");
+        assert!(!printed.contains(INTERNAL), "internal_key printed");
+        assert!(!pretty.contains(SECRET), "blizzard_client_secret printed (pretty)");
+        assert!(!pretty.contains(INTERNAL), "internal_key printed (pretty)");
+        assert!(printed.contains("la1-client-id"), "non-secret field missing");
+        assert_eq!(printed.matches("<redacted>").count(), 2);
+    }
+
+    #[test]
+    fn bundled_defaults_match_default_impl() {
+        let settings: Settings = Config::builder()
+            .add_source(File::from_str(include_str!("../Revolt.toml"), FileFormat::Toml))
+            .build()
+            .unwrap()
+            .try_deserialize()
+            .unwrap();
+        let bundled = settings.api.gamedata;
+        let default = ApiGamedata::default();
+        assert!(bundled.blizzard_client_id.is_empty());
+        assert!(bundled.blizzard_client_secret.is_empty());
+        assert!(bundled.internal_key.is_empty());
+        assert_eq!(bundled.steam_store_window_secs, default.steam_store_window_secs);
+        assert_eq!(bundled.steam_store_embed_budget, default.steam_store_embed_budget);
+        assert_eq!(
+            bundled.steam_store_interactive_budget,
+            default.steam_store_interactive_budget
+        );
+        assert_eq!(bundled.steam_news_per_window, default.steam_news_per_window);
+        assert_eq!(bundled.blizzard_per_second, default.blizzard_per_second);
     }
 }

@@ -1,0 +1,60 @@
+{
+ "total": 10,
+ "items": [
+  {
+   "type": "app",
+   "name": "Portal 2",
+   "id": 620,
+   "price": {
+    "currency": "USD",
+    "initial": 999,
+    "final": 999
+   },
+   "tiny_image": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/620/bd23943dcd0280aa2cdc066e2f86d2185cfd4cce/capsule_231x87.jpg?t=1790187113",
+   "metascore": "95",
+   "streamingvideo": false,
+   "controller_support": "full"
+  },
+  {
+   "type": "app",
+   "name": "Portal",
+   "id": 400,
+   "price": {
+    "currency": "USD",
+    "initial": 999,
+    "final": 999
+   },
+   "tiny_image": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/400/capsule_231x87.jpg?t=1745368554",
+   "metascore": "90",
+   "streamingvideo": false,
+   "controller_support": "full"
+  },
+  {
+   "type": "app",
+   "name": "Portal Knights",
+   "id": 374040,
+   "price": {
+    "currency": "USD",
+    "initial": 1999,
+    "final": 1999
+   },
+   "tiny_image": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/374040/capsule_231x87.jpg?t=1696604379",
+   "metascore": "72",
+   "streamingvideo": false
+  },
+  {
+   "type": "app",
+   "name": "Bridge Constructor Portal - Portal Proficiency",
+   "id": 1113550,
+   "price": {
+    "currency": "USD",
+    "initial": 399,
+    "final": 399
+   },
+   "tiny_image": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1113550/capsule_231x87.jpg?t=1717674841",
+   "metascore": "",
+   "streamingvideo": false,
+   "controller_support": "full"
+  }
+ ]
+}

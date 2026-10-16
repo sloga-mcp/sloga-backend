@@ -7257,6 +7257,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "revolt-gamedata"
+version = "0.13.7"
+dependencies = [
+ "log",
+ "moka",
+ "redis-kiss",
+ "reqwest 0.13.4",
+ "revolt-config",
+ "serde",
+ "serde_json",
+ "subtle",
+ "thiserror 2.0.18",
+ "tokio",
+ "url",
+]
+
+[[package]]
 name = "revolt-gifbox"
 version = "0.13.7"
 dependencies = [

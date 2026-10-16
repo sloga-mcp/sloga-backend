@@ -1,0 +1,39 @@
+[package]
+name = "revolt-gamedata"
+version = "0.13.7"
+edition = "2021"
+license = "AGPL-3.0-or-later"
+publish = false
+description = "Revolt Backend: Game data (Steam, Blizzard, Riot) for game cards and lookups"
+repository = "https://github.com/stoatchat/stoatchat"
+
+[dependencies]
+# Constant-time compare of the internal key
+subtle = { workspace = true }
+
+# Errors
+thiserror = { workspace = true }
+
+# Logging
+log = { workspace = true }
+
+# Serialisation
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Async runtime
+tokio = { workspace = true, features = ["sync", "time", "net"] }
+
+# Web requests (default features: rustls, no decompression)
+reqwest = { workspace = true }
+url = { workspace = true }
+
+# Caching
+moka = { workspace = true, features = ["sync"] }
+redis-kiss = { workspace = true, default-features = false, features = ["tokio-runtime"] }
+
+# Core crates
+revolt-config = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "sync", "time", "net"] }

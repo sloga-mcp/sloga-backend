@@ -1,0 +1,15 @@
+{
+ "page": 1,
+ "pageSize": 2,
+ "maxPageSize": 1000,
+ "pageCount": 1,
+ "results": [
+  {"key": {"href": "https://us.api.blizzard.com/data/wow/item/19019?namespace=static-11.0.2_56313-us"},
+   "data": {"level": 80, "required_level": 60, "name": {"en_US": "Thunderfury, Blessed Blade of the Windseeker", "de_DE": "Donnerzorn, Gesegnete Klinge des Windsuchers"},
+    "id": 19019, "quality": {"type": "LEGENDARY", "name": {"en_US": "Legendary", "de_DE": "Legendär"}},
+    "inventory_type": {"type": "WEAPON", "name": {"en_US": "One-Hand"}}}},
+  {"key": {"href": "https://us.api.blizzard.com/data/wow/item/17182?namespace=static-11.0.2_56313-us"},
+   "data": {"level": 80, "required_level": 60, "name": {"en_US": "Sulfuras, Hand of Ragnaros"},
+    "id": 17182, "quality": {"type": "LEGENDARY", "name": {"en_US": "Legendary"}}}}
+ ]
+}
