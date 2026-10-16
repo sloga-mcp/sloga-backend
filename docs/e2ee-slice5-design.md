@@ -427,8 +427,7 @@ show. What it cannot prove:
   far listed only for calls), when a removed device of theirs returns,
   or when a device that was call-only starts receiving messages, this
   device records a note in the direct conversation with them and in each
-  encrypted group where they are an active member. A device added to the
-  user's own account is recorded on this device too. A server can still
+  encrypted group where they are an active member. A server can still
   add a device for a user: device keys are self-signed by each device and
   there is no account-level signature over a user's devices, so these
   notes record an addition; they do not prevent it.
@@ -570,10 +569,10 @@ safety number = 6 groups of 5 digits (30 digits total)
     already-verified device succeeds with no dialog and no write. The
     Android guards of §2.5 step 3 (a delayed confirm button, touches
     ignored while the dialog is covered) apply here too.
-- **Teeth**: any identity change keeps sending to that person Blocked
-  until it is accepted (existing machinery). Accepting clears
-  `user_verified`, including on a device that was verified, so the new
-  key starts unverified until the user verifies it.
+- **Teeth**: a device in the identity-changed state blocks sending to
+  that person until the change is accepted (existing machinery). The
+  change clears `user_verified`, and accepting does not restore it, so
+  the new key starts unverified until the user verifies it.
 - Screen: conversation header lock → "Verify security numbers"; shows
   per-device number, verified badge, first-seen, honest scope copy (§3.1
   non-goal included). Native-only; web shows the §4 state.
