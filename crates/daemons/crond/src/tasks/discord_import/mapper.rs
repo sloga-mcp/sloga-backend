@@ -21,7 +21,7 @@ use super::template::{
 // retyping any of them here is how the two sides drift apart. `ImportJobKind`
 // only picks the wording of `PlanError` messages.
 use revolt_database::{client_gate_is_set, ImportJobKind, Server};
-use revolt_permissions::ChannelPermission;
+use revolt_permissions::{ChannelPermission, Override, PermissionValue};
 
 /// Sloga name limits (validated at the HTTP routes, which the worker bypasses —
 /// so the mapper is where they get enforced).
@@ -134,6 +134,28 @@ impl PlannedOverride {
     fn is_empty(&self) -> bool {
         self.allow == 0 && self.deny == 0
     }
+}
+
+/// Whether `@everyone` can view a channel: the server default with the
+/// channel's own `@everyone` override applied, allow then deny, as
+/// `calculate_channel_permissions` computes it for a member with no roles
+/// (`PermissionValue::apply`).
+///
+/// The welcome invite may only point at such a channel. Anyone holding an
+/// invite can read its channel's name and description, and a joiner lands in
+/// it: a channel `@everyone` cannot see leaks the one and strands the other.
+pub(crate) fn everyone_can_view(
+    server_default: u64,
+    channel_default: Option<PlannedOverride>,
+) -> bool {
+    let mut permissions = PermissionValue::from_raw(server_default);
+    if let Some(everyone) = channel_default {
+        permissions.apply(Override {
+            allow: everyone.allow,
+            deny: everyone.deny,
+        });
+    }
+    permissions.has_channel_permission(ChannelPermission::ViewChannel)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -266,8 +288,9 @@ pub struct ImportPlan {
     pub system_messages: PlannedSystemMessages,
     /// Template id of the channel to mint the welcome invite in. The Discord
     /// mapper uses the guild's system channel; with none (or one that was
-    /// not created, or is not a text channel) the worker falls back to the
-    /// first text channel.
+    /// not created, is not a text channel, or `@everyone` cannot view: see
+    /// [`everyone_can_view`]) the worker falls back to the first text channel
+    /// `@everyone` can view, and with none of those mints no invite.
     pub invite_channel: Option<PlaceholderId>,
     /// Template id of the guild's AFK channel, only if it survived mapping as
     /// a voice channel. The worker writes it onto the server in step 5.
@@ -2282,5 +2305,25 @@ mod tests {
             );
             assert_eq!(plan.afk_timeout, Some(300), "afk_channel_id {open}");
         }
+    }
+
+    /// `@everyone`'s view of a channel: server default, then the channel's
+    /// `@everyone` allow, then its deny.
+    #[test]
+    fn everyone_can_view_applies_the_channel_override_to_the_server_default() {
+        let view = ChannelPermission::ViewChannel as u64;
+        let send = ChannelPermission::SendMessage as u64;
+        let over = |allow: u64, deny: u64| Some(PlannedOverride { allow, deny });
+
+        assert!(everyone_can_view(view | send, None));
+        assert!(!everyone_can_view(send, None));
+        // The channel denies it: private, however open the server is.
+        assert!(!everyone_can_view(view | send, over(0, view)));
+        // The channel grants it on a server that does not.
+        assert!(everyone_can_view(send, over(view, 0)));
+        // Deny wins over allow, as in `PermissionValue::apply`.
+        assert!(!everyone_can_view(send, over(view, view)));
+        // Unrelated bits change nothing.
+        assert!(everyone_can_view(view, over(0, send)));
     }
 }

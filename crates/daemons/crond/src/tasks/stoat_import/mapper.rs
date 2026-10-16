@@ -28,9 +28,9 @@ use super::source::{
     StoatChannel, StoatEmoji, StoatFile, StoatOverride, StoatServer, StoatTextChannel,
 };
 use crate::tasks::discord_import::mapper::{
-    clamp_description, clamp_name, AssetKind, ImportPlan, PlanError, PlannedAsset, PlannedCategory,
-    PlannedChannel, PlannedChannelKind, PlannedEmoji, PlannedOverride, PlannedRole,
-    PlannedSystemMessages,
+    clamp_description, clamp_name, everyone_can_view, AssetKind, ImportPlan, PlanError,
+    PlannedAsset, PlannedCategory, PlannedChannel, PlannedChannelKind, PlannedEmoji,
+    PlannedOverride, PlannedRole, PlannedSystemMessages,
 };
 use crate::tasks::discord_import::template::PlaceholderId;
 
@@ -226,9 +226,9 @@ fn planned_channel(
 /// Order: roles most-authoritative first (Stoat rank ascending, ties by id).
 /// Channels in category order, then uncategorized channels in the server's
 /// own order. The welcome invite goes to the join-message channel when that
-/// is a text channel, else the first text channel (the Discord mapper's
-/// choice is its system channel, with the worker falling back to the first
-/// text channel, which this mirrors).
+/// is a text channel `@everyone` can view, else the first such text channel,
+/// else nowhere (the Discord mapper's choice is its system channel, with the
+/// worker falling back to the first such text channel, which this mirrors).
 ///
 /// Never refuses today; the `Result` matches the other sources' mappers.
 pub(crate) fn plan_stoat_import(
@@ -394,22 +394,27 @@ pub(crate) fn plan_stoat_import(
         user_banned: slot(&system.user_banned),
     };
 
-    let is_text = |id: &PlaceholderId| {
-        plan.channels.iter().any(|channel| {
-            &channel.template_id == id && matches!(channel.kind, PlannedChannelKind::Text { .. })
-        })
+    // The invite goes to a text channel `@everyone` can view: an invite
+    // shows its channel's name and description to anyone holding it, and
+    // joiners land there. A private join channel is passed over; with no
+    // public text channel at all there is no invite (the worker notes it).
+    let server_default = plan.default_permissions;
+    let invitable = |channel: &PlannedChannel| {
+        matches!(channel.kind, PlannedChannelKind::Text { .. })
+            && everyone_can_view(server_default, channel.default_permissions)
     };
     plan.invite_channel = plan
         .system_messages
         .user_joined
-        .clone()
-        .filter(|id| is_text(id))
-        .or_else(|| {
+        .as_ref()
+        .and_then(|id| {
             plan.channels
                 .iter()
-                .find(|channel| matches!(channel.kind, PlannedChannelKind::Text { .. }))
-                .map(|channel| channel.template_id.clone())
-        });
+                .find(|channel| &channel.template_id == id)
+        })
+        .filter(|channel| invitable(channel))
+        .or_else(|| plan.channels.iter().find(|channel| invitable(channel)))
+        .map(|channel| channel.template_id.clone());
 
     // Emoji, up to the new server's cap.
     let over_emoji_cap = emojis.len().saturating_sub(emoji_cap);
@@ -459,7 +464,7 @@ pub(crate) fn plan_stoat_import(
     }
     if invalid_colours > 0 {
         notes.push(format!(
-            "{invalid_colours} role colour(s) Sloga can't display were dropped."
+            "{invalid_colours} role color(s) Sloga can't display were dropped."
         ));
     }
     if over_emoji_cap > 0 {
@@ -838,7 +843,7 @@ mod tests {
         assert_eq!(plan.roles[4].colour, None);
         assert!(plan
             .skipped
-            .contains(&"1 role colour(s) Sloga can't display were dropped.".to_string()));
+            .contains(&"1 role color(s) Sloga can't display were dropped.".to_string()));
     }
 
     #[test]
@@ -870,7 +875,7 @@ mod tests {
                 json!({
                     "_id": "S", "channels": ["V", "A", "B"],
                     "system_messages": { "user_joined": joined },
-                    "default_permissions": 0
+                    "default_permissions": VIEW as i64
                 }),
                 json!([
                     { "channel_type": "TextChannel", "_id": "V", "name": "v", "voice": {} },
@@ -885,6 +890,67 @@ mod tests {
         assert_eq!(with_join(json!("V")), id("A"));
         assert_eq!(with_join(Value::Null), id("A"));
         assert_eq!(with_join(json!("GONE")), id("A"));
+    }
+
+    /// The invite never points at a channel `@everyone` cannot view: anyone
+    /// holding it would read that channel's name and description, and
+    /// joiners would land somewhere they cannot see. Neither the join
+    /// channel nor the fallback may be private; with no public text channel
+    /// there is no invite.
+    #[test]
+    fn the_invite_only_goes_to_a_channel_everyone_can_view() {
+        let private = |id: &str| {
+            json!({ "channel_type": "TextChannel", "_id": id, "name": id,
+                    "default_permissions": { "a": 0, "d": VIEW as i64 } })
+        };
+        let opened = |id: &str| {
+            json!({ "channel_type": "TextChannel", "_id": id, "name": id,
+                    "default_permissions": { "a": VIEW as i64, "d": 0 } })
+        };
+        let invite = |default: u64, joined: &str, channels_json: Value| {
+            let ids: Vec<Value> = channels_json
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|channel| channel["_id"].clone())
+                .collect();
+            plan(
+                json!({
+                    "_id": "S", "channels": ids,
+                    "system_messages": { "user_joined": joined },
+                    "default_permissions": default as i64
+                }),
+                channels_json,
+            )
+            .invite_channel
+        };
+
+        // A private join channel: the first public text channel instead,
+        // passing over a private one ahead of it.
+        assert_eq!(
+            invite(
+                VIEW | SEND,
+                "STAFF",
+                json!([private("MODS"), private("STAFF"), text("PUB", "pub")])
+            ),
+            id("PUB")
+        );
+        // Nothing public: no invite at all.
+        assert_eq!(
+            invite(VIEW, "STAFF", json!([private("STAFF"), private("MODS")])),
+            None
+        );
+        // `@everyone` cannot view by default: only a channel that grants it
+        // back qualifies, the join channel included.
+        assert_eq!(
+            invite(SEND, "A", json!([text("A", "a"), opened("B")])),
+            id("B")
+        );
+        assert_eq!(
+            invite(SEND, "B", json!([opened("A"), opened("B")])),
+            id("B")
+        );
+        assert_eq!(invite(SEND, "A", json!([text("A", "a")])), None);
     }
 
     #[test]

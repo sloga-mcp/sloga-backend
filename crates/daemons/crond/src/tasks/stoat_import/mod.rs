@@ -19,6 +19,9 @@
 pub(crate) mod mapper;
 pub(crate) mod source;
 
+use std::collections::HashSet;
+use std::sync::{LazyLock, Mutex};
+
 use revolt_config::Settings;
 use revolt_database::{Database, DiscordImportJob, ImportStage};
 
@@ -147,15 +150,42 @@ pub(crate) async fn leave(job: &DiscordImportJob, config: &Settings) -> bool {
     };
 
     let Some(api) = StoatApi::new(&config.api.import.stoat) else {
-        log::warn!(
-            "stoat import job {}: no Stoat bot token configured; the bot stays in {server_id} \
-             for now",
-            job.id
-        );
+        // The leave retry calls this every sweep for days; say it once.
+        if first_no_token_warning(&job.id) {
+            log::warn!(
+                "stoat import job {}: no Stoat bot token configured; the bot stays in \
+                 {server_id} until one is (the leave retry keeps trying, and logs again if it \
+                 gives up)",
+                job.id
+            );
+        }
         return false;
     };
 
     api.leave_server(server_id).await
+}
+
+/// Jobs the no-token leave warning has been logged for in this process.
+static NO_TOKEN_WARNED: LazyLock<Mutex<HashSet<String>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
+
+/// Past this many ids the set starts over, so it stays bounded; each job
+/// then warns once more at most.
+const NO_TOKEN_WARNED_CAP: usize = 10_000;
+
+/// Whether this is the first no-token leave for `job_id` (in this process).
+fn first_no_token_warning(job_id: &str) -> bool {
+    let mut warned = NO_TOKEN_WARNED
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if warned.contains(job_id) {
+        return false;
+    }
+    if warned.len() >= NO_TOKEN_WARNED_CAP {
+        warned.clear();
+    }
+    warned.insert(job_id.to_string());
+    true
 }
 
 #[cfg(test)]
@@ -189,5 +219,17 @@ mod tests {
         }
 
         assert!(!contains_code("anything", ""));
+    }
+
+    /// The leave retry runs every sweep; without a token the warning is
+    /// logged once per job, not on every one of them.
+    #[test]
+    fn the_no_token_warning_is_once_per_job() {
+        let job = "01WARNONCE0000000000000001";
+        let other = "01WARNONCE0000000000000002";
+        assert!(first_no_token_warning(job));
+        assert!(!first_no_token_warning(job));
+        assert!(!first_no_token_warning(job));
+        assert!(first_no_token_warning(other));
     }
 }

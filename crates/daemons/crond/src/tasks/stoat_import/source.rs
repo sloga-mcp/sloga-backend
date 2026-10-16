@@ -543,9 +543,12 @@ impl StoatApi {
     /// is a leave (the bot cannot own a Stoat server: bots cannot create
     /// one), sent with `leave_silently` so no "left" message is posted.
     ///
-    /// Returns whether the bot is now out: a 2xx, and also a 404 or 403
-    /// (the server is gone, or the bot is no longer a member). Anything else
-    /// is "not left", and the sweeper's leave retry asks again.
+    /// Returns whether the bot is now out: a 2xx, and also a 404 (Stoat's
+    /// answer when the server is gone or the bot is not a member). Anything
+    /// else is "not left", and the sweeper's leave retry asks again until
+    /// its give-up. That includes 403: Stoat does not send it for a
+    /// non-member, so it means something stood in the way (an edge block,
+    /// a disabled bot) and the bot may well still be in the server.
     pub(crate) async fn leave_server(&self, server_id: &str) -> bool {
         if !is_server_id(server_id) {
             return false;
@@ -573,8 +576,7 @@ impl StoatApi {
         };
 
         let status = response.status();
-        if status.is_success() || status == StatusCode::NOT_FOUND || status == StatusCode::FORBIDDEN
-        {
+        if status.is_success() || status == StatusCode::NOT_FOUND {
             true
         } else {
             log::warn!("stoat import: leaving server {server_id} answered {status}");
@@ -1258,7 +1260,8 @@ pub(crate) mod tests {
             (204, true),
             (200, true),
             (404, true),
-            (403, true),
+            // Not Stoat's non-member answer: something blocked the leave.
+            (403, false),
             (401, false),
             (429, false),
             (500, false),

@@ -33,7 +33,8 @@ use tokio::time::sleep;
 
 use super::assets::{store_file, AssetFetcher, NoAssets};
 use super::mapper::{
-    plan_import, AssetKind, ImportPlan, PlannedAsset, PlannedChannelKind, PlannedOverride,
+    everyone_can_view, plan_import, AssetKind, ImportPlan, PlannedAsset, PlannedChannel,
+    PlannedChannelKind, PlannedOverride,
 };
 use super::template::{self, PlaceholderId, TemplateFetchError};
 
@@ -120,13 +121,19 @@ pub async fn task(db: Database, _amqp: AMQP) -> Result<()> {
 /// The sweeps a tick owes before any claiming. Returns whether any source
 /// is switched on, i.e. whether the claim loop should run.
 ///
-/// The bot-leave retry runs whatever is switched on: rows whose bot has not
-/// left yet must keep being retried (and, past the cap, given up on loudly)
-/// after every import source is turned off. Switched off, it runs once per
-/// idle tick; the stale-job sweep, which only matters while jobs can run,
-/// stays behind the switch.
+/// Both sweeps run whatever is switched on. Rows whose bot has not left yet
+/// must keep being retried (and, past the cap, given up on loudly) after
+/// every import source is turned off. So must the stale-job sweep: a source
+/// job orphaned while Running is only made terminal by it, and until it is
+/// the bot never leaves and its owner's one active job is never freed.
+/// Switched off, both run once per idle tick (`DISABLED_TICK`, slower than
+/// the sweep cadence while on); the tick counter does not advance there, so
+/// the cadence check cannot be used.
 async fn housekeeping(db: &Database, config: &Settings, tick: u32, leave: &LeaveHook) -> bool {
     if !config.api.import.any_enabled() {
+        if let Err(error) = sweep_stale(db).await {
+            log::error!("discord import sweeper failed: {error:?}");
+        }
         retry_source_leaves_with(db, config, leave).await;
         return false;
     }
@@ -635,6 +642,17 @@ pub(crate) async fn execute_plan(
     plan: ImportPlan,
     fetch_asset: &dyn AssetFetcher,
 ) -> std::result::Result<(), ImportAbort> {
+    execute_plan_with(db, job, plan, fetch_asset, &StoredChannels).await
+}
+
+/// `execute_plan` with the channel writes as a seam (tests fail them).
+async fn execute_plan_with(
+    db: &Database,
+    job: &mut DiscordImportJob,
+    plan: ImportPlan,
+    fetch_asset: &dyn AssetFetcher,
+    writes: &dyn ChannelWrites,
+) -> std::result::Result<(), ImportAbort> {
     let owner = db
         .fetch_user(&job.user_id)
         .await
@@ -695,7 +713,7 @@ pub(crate) async fn execute_plan(
 
     // Everything past this point can leave a half-built server behind, so it
     // runs in an inner call whose failures trigger a rollback.
-    match build_server(db, job, &owner, server, &plan, total, fetch_asset).await {
+    match build_server(db, job, &owner, server, &plan, total, fetch_asset, writes).await {
         Ok(()) => Ok(()),
         Err(abort) => {
             rollback_server(db, &server_id).await;
@@ -707,6 +725,7 @@ pub(crate) async fn execute_plan(
 
 /// Populate the server and hand it to its owner. Any error here means the
 /// caller rolls the whole server back.
+#[allow(clippy::too_many_arguments)]
 async fn build_server(
     db: &Database,
     job: &mut DiscordImportJob,
@@ -715,6 +734,7 @@ async fn build_server(
     plan: &ImportPlan,
     total: u32,
     fetch_asset: &dyn AssetFetcher,
+    writes: &dyn ChannelWrites,
 ) -> std::result::Result<(), ImportAbort> {
     // 3. Roles, before channels — per-channel overwrites are keyed by role id.
     let (roles, roles_created, roles_skipped, role_notes) =
@@ -722,7 +742,7 @@ async fn build_server(
 
     // 4. Channels, with their permission overwrites resolved against `roles`.
     let (channels, mut summary) =
-        create_channels(db, &mut server, plan, job, total, &roles).await?;
+        create_channels(db, &mut server, plan, job, total, &roles, writes).await?;
     summary.roles_created = roles_created;
     summary.roles_skipped = roles_skipped;
     summary.notes.extend(role_notes);
@@ -816,7 +836,13 @@ async fn build_server(
         return Err(ImportAbort::Superseded);
     }
 
-    let invite_code = mint_invite(db, owner, plan, &channels).await;
+    let invite_code = match invite_target(server.default_permissions as u64, plan, &channels) {
+        Some(target) => mint_invite(db, owner, target).await,
+        None => {
+            summary.notes.push(NO_INVITE_CHANNEL.to_string());
+            None
+        }
+    };
     job.invite_code = invite_code.clone();
 
     // 8. Done.
@@ -955,8 +981,64 @@ fn stored_override(planned: &PlannedOverride) -> OverrideField {
     }
 }
 
+/// The writes `create_channels` makes to a channel it has created: a seam so
+/// tests can make them fail. Outside tests this is [`StoredChannels`].
+trait ChannelWrites: Sync {
+    /// `Channel::update`: applies `partial` in memory, then persists it.
+    fn update<'a>(
+        &'a self,
+        db: &'a Database,
+        channel: &'a mut Channel,
+        partial: PartialChannel,
+    ) -> BoxFuture<'a, Result<()>>;
+
+    /// `Channel::delete`.
+    fn delete<'a>(&'a self, db: &'a Database, channel: &'a Channel) -> BoxFuture<'a, Result<()>>;
+}
+
+/// The real channel writes.
+struct StoredChannels;
+
+impl ChannelWrites for StoredChannels {
+    fn update<'a>(
+        &'a self,
+        db: &'a Database,
+        channel: &'a mut Channel,
+        partial: PartialChannel,
+    ) -> BoxFuture<'a, Result<()>> {
+        Box::pin(channel.update(db, partial, vec![]))
+    }
+
+    fn delete<'a>(&'a self, db: &'a Database, channel: &'a Channel) -> BoxFuture<'a, Result<()>> {
+        Box::pin(channel.delete(db))
+    }
+}
+
+/// Whether a created channel whose permission write failed has to be
+/// removed instead of kept.
+///
+/// Without its overrides a channel inherits the server default. Losing only
+/// allows leaves it more closed than on the source, which fails safe. Losing
+/// any deny leaves it more open, above all a private channel whose
+/// `@everyone` ViewChannel deny is gone: that channel would be imported
+/// public. Decided on the planned overrides, including any for a role that
+/// was not created, which errs towards removing.
+fn must_remove_without_overrides(planned: &PlannedChannel) -> bool {
+    planned
+        .default_permissions
+        .is_some_and(|everyone| everyone.deny != 0)
+        || planned
+            .role_overrides
+            .iter()
+            .any(|(_, role)| role.deny != 0)
+}
+
 /// Create every planned channel, returning them paired with their template id
 /// so categories and the system channel can be resolved afterwards.
+///
+/// A channel whose permission write fails and whose planned overrides deny
+/// anything is removed again (with a note), and if that removal fails too
+/// the import aborts: see `must_remove_without_overrides`.
 async fn create_channels(
     db: &Database,
     server: &mut Server,
@@ -964,6 +1046,7 @@ async fn create_channels(
     job: &mut DiscordImportJob,
     total: u32,
     roles: &RoleMap,
+    writes: &dyn ChannelWrites,
 ) -> std::result::Result<(Vec<(String, Channel)>, DiscordImportSummary), ImportAbort> {
     let mut created: Vec<(String, Channel)> = Vec::new();
     let mut skipped = 0u32;
@@ -979,6 +1062,9 @@ async fn create_channels(
     let mut dropped_overrides = 0u32;
     // Channels created, but whose slowmode/permissions write failed.
     let mut settings_failed = 0u32;
+    // Channels created, then removed because that write failed and lost a
+    // deny (see `must_remove_without_overrides`).
+    let mut removed = 0u32;
 
     for (index, planned) in plan.channels.iter().enumerate() {
         if created.len() >= channel_limit {
@@ -1073,7 +1159,7 @@ async fn create_channels(
                 // deriving the count from the map's size would silently absorb
                 // any future duplicate into this figure and misreport it as a
                 // dropped role reference.
-                dropped_overrides += planned
+                let unresolved = planned
                     .role_overrides
                     .iter()
                     .filter(|(template_id, _)| !roles.contains_key(&template_id.0))
@@ -1096,16 +1182,49 @@ async fn create_channels(
                     || partial.default_permissions.is_some()
                     || partial.role_permissions.is_some();
 
+                let mut keep = true;
                 if needs_update {
-                    if let Err(error) = channel.update(db, partial, vec![]).await {
-                        // The channel exists and is usable; losing its
-                        // permissions is worth a note, not the whole import.
+                    // `Channel::update` applies the partial in memory BEFORE
+                    // it writes, so a failed write leaves the struct claiming
+                    // settings the database does not have. This struct is
+                    // what `ServerCreate` ships and what the invite check
+                    // reads, so it goes back to what is stored.
+                    let stored = channel.clone();
+                    if let Err(error) = writes.update(db, &mut channel, partial).await {
                         log::warn!("could not apply channel settings during import: {error:?}");
-                        settings_failed += 1;
+                        channel = stored;
+
+                        if must_remove_without_overrides(planned) {
+                            // Fail closed: without its denies the channel is
+                            // more open than on the source (a private channel
+                            // imported public). Remove it; if even that
+                            // fails, the whole import is rolled back rather
+                            // than handed over with it in place.
+                            if let Err(error) = writes.delete(db, &channel).await {
+                                log::error!(
+                                    "could not remove an imported channel whose permissions \
+                                     failed to apply; abandoning the import: {error:?}"
+                                );
+                                return Err(ImportAbort::Failed(generic_failure()));
+                            }
+                            removed += 1;
+                            keep = false;
+                        } else {
+                            // Only allows or slowmode were lost: the channel
+                            // is, if anything, more closed than on the
+                            // source. Worth a note, not the channel.
+                            settings_failed += 1;
+                        }
                     }
                 }
 
-                created.push((planned.template_id.0.clone(), channel));
+                // A removed channel is not in `created`, so categories, the
+                // system-message slots, the AFK pointer and the invite never
+                // resolve to it.
+                if keep {
+                    dropped_overrides += unresolved;
+                    created.push((planned.template_id.0.clone(), channel));
+                }
             }
             Err(error) => {
                 // One bad channel must not cost the user the whole server.
@@ -1131,10 +1250,17 @@ async fn create_channels(
         ));
     }
 
+    if removed > 0 {
+        notes.push(format!(
+            "{removed} channel(s) weren't imported because their permissions couldn't be applied \
+             — without them, more people could have seen or used them than on the original server."
+        ));
+    }
+
     if settings_failed > 0 {
         notes.push(format!(
-            "{settings_failed} channel(s) were created but their Discord permissions couldn't be \
-             applied — check them in channel settings."
+            "{settings_failed} channel(s) were created but their permissions or slowmode couldn't \
+             be applied — check them in channel settings."
         ));
     }
 
@@ -1150,7 +1276,7 @@ async fn create_channels(
         categories_created: 0, // set by the caller once categories are built
         // Everything the user didn't get, so this can't contradict the notes
         // rendered beside it.
-        channels_skipped: skipped + over_limit + plan.skipped_channel_count,
+        channels_skipped: skipped + over_limit + removed + plan.skipped_channel_count,
         // Both set by the caller; roles are created before this runs.
         roles_created: 0,
         roles_skipped: 0,
@@ -1456,31 +1582,56 @@ fn build_categories(plan: &ImportPlan, channels: &[(String, Channel)]) -> Vec<Ca
         .collect()
 }
 
-/// Mint the welcome invite in the most sensible channel we have.
-async fn mint_invite(
-    db: &Database,
-    owner: &User,
-    plan: &ImportPlan,
-    channels: &[(String, Channel)],
-) -> Option<String> {
-    // Voice channels are `TextChannel` with `voice: Some(..)`, so a naive
-    // TextChannel match would happily drop new members into a voice room.
-    let is_text = |channel: &&Channel| matches!(channel, Channel::TextChannel { voice: None, .. });
+/// Summary note when no created channel could take the welcome invite.
+const NO_INVITE_CHANNEL: &str = "No invite link was created because none of the imported text \
+     channels is visible to everyone. Create one from a channel new members should see.";
 
-    // Prefer the source's own pick (Discord: the guild's system channel),
-    // else the first real text channel.
-    let target = plan
-        .invite_channel
+/// The channel the welcome invite goes in: the source's own pick (Discord:
+/// the guild's system channel), else the first text channel, and either way
+/// only a text channel `@everyone` can view (`everyone_can_view`). `None`
+/// when no created channel qualifies, and then no invite is minted.
+///
+/// Anyone holding an invite can read its channel's name and description,
+/// and joiners land in it, so a private channel must never be the target.
+/// Read off the created channels, which carry what is stored (a channel
+/// whose permission write failed is either removed or back to its stored
+/// state), against the server default the import wrote.
+fn invite_target<'a>(
+    server_default: u64,
+    plan: &ImportPlan,
+    channels: &'a [(String, Channel)],
+) -> Option<&'a Channel> {
+    let invitable = |channel: &&Channel| match channel {
+        // Voice channels are `TextChannel` with `voice: Some(..)`, so a naive
+        // TextChannel match would happily drop new members into a voice room.
+        Channel::TextChannel {
+            voice: None,
+            default_permissions,
+            ..
+        } => everyone_can_view(
+            server_default,
+            default_permissions.map(|everyone| PlannedOverride {
+                allow: everyone.a as u64,
+                deny: everyone.d as u64,
+            }),
+        ),
+        _ => false,
+    };
+
+    plan.invite_channel
         .as_ref()
         .and_then(|wanted| {
             channels
                 .iter()
                 .find(|(id, _)| id == &wanted.0)
                 .map(|(_, channel)| channel)
-                .filter(is_text)
+                .filter(invitable)
         })
-        .or_else(|| channels.iter().map(|(_, channel)| channel).find(is_text))?;
+        .or_else(|| channels.iter().map(|(_, channel)| channel).find(invitable))
+}
 
+/// Mint the welcome invite in `target` (see `invite_target`).
+async fn mint_invite(db: &Database, owner: &User, target: &Channel) -> Option<String> {
     match Invite::create_channel_invite(db, owner, target).await {
         Ok(invite) => Some(invite.code().to_string()),
         Err(error) => {
@@ -1612,11 +1763,20 @@ mod tests {
         assert!(moderator.permissions.a & (ChannelPermission::ManageMessages as i64) != 0);
 
         let total = plan.total_steps().max(1);
-        let (channels, summary) =
-            match create_channels(&db, &mut server, &plan, &mut job, total, &roles).await {
-                Ok(result) => result,
-                Err(_) => panic!("create_channels aborted"),
-            };
+        let (channels, summary) = match create_channels(
+            &db,
+            &mut server,
+            &plan,
+            &mut job,
+            total,
+            &roles,
+            &StoredChannels,
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => panic!("create_channels aborted"),
+        };
 
         assert_eq!(channels.len(), 2);
         assert_eq!(summary.channels_created, 2);
@@ -1970,9 +2130,18 @@ mod tests {
         db.insert_discord_import_job(&job).await.unwrap();
 
         let total = plan.total_steps().max(1);
-        if build_server(&db, &mut job, &owner, server, &plan, total, &NoAssets)
-            .await
-            .is_err()
+        if build_server(
+            &db,
+            &mut job,
+            &owner,
+            server,
+            &plan,
+            total,
+            &NoAssets,
+            &StoredChannels,
+        )
+        .await
+        .is_err()
         {
             panic!("build_server aborted");
         }
@@ -2868,6 +3037,461 @@ mod tests {
                 .unwrap()
                 .source_left
         );
+    }
+
+    /// The stale-job sweep runs with every import source switched off too. A
+    /// Stoat job orphaned while Running is only made terminal by it; without
+    /// it the job would hold its owner's one active slot and keep the bot in
+    /// the source forever. Tick 1 is off the sweep cadence, so only the
+    /// switched-off branch can have run it.
+    #[tokio::test]
+    async fn stale_jobs_are_reaped_while_every_source_is_switched_off() {
+        assert!(
+            config().await.api.import.stoat.bot_token.is_empty(),
+            "the sweep's own leave reads the ambient config; it must not reach a real Stoat"
+        );
+
+        let db = DatabaseInfo::Reference.connect().await.unwrap();
+        let config = config_with(false, false, false).await;
+        assert!(!config.api.import.any_enabled());
+        let owner = make_owner(&db).await;
+        let (server, _) = Server::create(
+            &db,
+            v0::DataCreateServer {
+                name: "Half built".to_string(),
+                description: None,
+                nsfw: None,
+            },
+            &owner,
+            false,
+        )
+        .await
+        .unwrap();
+
+        let mut job = source_job(&owner.id, ImportJobKind::StoatServer, "01SRCOFFSTALE");
+        job.status = ImportStatus::Running;
+        job.stage = ImportStage::Channels;
+        job.server_id = Some(server.id.clone());
+        job.updated_at = Timestamp::now_utc()
+            .checked_sub(iso8601_timestamp::Duration::hours(1))
+            .unwrap();
+        db.insert_discord_import_job(&job).await.unwrap();
+
+        assert!(!housekeeping(&db, &config, 1, &leaves).await);
+
+        let stored = db.fetch_discord_import_job(&job.id).await.unwrap();
+        assert_eq!(stored.status, ImportStatus::Failed, "the orphan is reaped");
+        assert!(
+            db.fetch_server(&server.id).await.is_err(),
+            "its half-built server is rolled back"
+        );
+        // Terminal now, so the same tick's leave retry gets the bot out.
+        assert!(leave_called(&job.id));
+        assert!(stored.source_left);
+    }
+
+    /// Channel writes that fail on demand. `update` behaves like
+    /// `Channel::update` on a failed write: the partial is applied in memory,
+    /// then the write errors.
+    struct FailingWrites {
+        /// Channel name whose settings write fails.
+        fail_update_for: &'static str,
+        /// Whether removing that channel fails as well.
+        fail_delete: bool,
+        /// Ids of the channels `delete` was asked to remove.
+        deleted: Mutex<Vec<String>>,
+    }
+
+    impl FailingWrites {
+        fn new(fail_update_for: &'static str, fail_delete: bool) -> FailingWrites {
+            FailingWrites {
+                fail_update_for,
+                fail_delete,
+                deleted: Mutex::new(vec![]),
+            }
+        }
+    }
+
+    impl ChannelWrites for FailingWrites {
+        fn update<'a>(
+            &'a self,
+            db: &'a Database,
+            channel: &'a mut Channel,
+            partial: PartialChannel,
+        ) -> BoxFuture<'a, Result<()>> {
+            Box::pin(async move {
+                let failing = matches!(&*channel, Channel::TextChannel { name, .. } if name == self.fail_update_for);
+                if failing {
+                    channel.apply_options(partial);
+                    Err(revolt_result::create_error!(InternalError))
+                } else {
+                    channel.update(db, partial, vec![]).await
+                }
+            })
+        }
+
+        fn delete<'a>(
+            &'a self,
+            db: &'a Database,
+            channel: &'a Channel,
+        ) -> BoxFuture<'a, Result<()>> {
+            Box::pin(async move {
+                self.deleted.lock().unwrap().push(channel.id().to_string());
+                if self.fail_delete {
+                    Err(revolt_result::create_error!(InternalError))
+                } else {
+                    channel.delete(db).await
+                }
+            })
+        }
+    }
+
+    /// Created text channels of the stored server, by name.
+    async fn stored_channels_by_name(db: &Database, server: &Server) -> HashMap<String, Channel> {
+        let mut by_name = HashMap::new();
+        for id in &server.channels {
+            let channel = db.fetch_channel(id).await.unwrap();
+            if let Channel::TextChannel { name, .. } = &channel {
+                by_name.insert(name.clone(), channel.clone());
+            }
+        }
+        by_name
+    }
+
+    /// Run a plan as a Discord template job would, with `writes`.
+    async fn run_plan_with(
+        db: &Database,
+        plan: ImportPlan,
+        writes: &dyn ChannelWrites,
+    ) -> (DiscordImportJob, std::result::Result<(), ImportAbort>) {
+        let owner = make_owner(db).await;
+        let mut job = DiscordImportJob::new(owner.id.clone(), "writes".to_string());
+        job.status = ImportStatus::Running;
+        db.insert_discord_import_job(&job).await.unwrap();
+        let result = execute_plan_with(db, &mut job, plan, &NoFetchExpected, writes).await;
+        (job, result)
+    }
+
+    #[test]
+    fn a_failed_permission_write_removes_the_channel_only_if_a_deny_is_lost() {
+        let template: GuildTemplate = serde_json::from_str(FIXTURE).unwrap();
+        let plan = plan_import(&template).unwrap();
+        let named = |wanted: &str| {
+            plan.channels
+                .iter()
+                .find(|channel| channel.name == wanted)
+                .unwrap()
+                .clone()
+        };
+
+        // `@everyone` denied ViewChannel: private.
+        assert!(must_remove_without_overrides(&named("mod-chat")));
+        // No overrides at all.
+        assert!(!must_remove_without_overrides(&named("general")));
+
+        let mut allow_only = named("general");
+        allow_only.role_overrides = vec![(
+            PlaceholderId("2".to_string()),
+            PlannedOverride {
+                allow: ChannelPermission::ViewChannel as u64,
+                deny: 0,
+            },
+        )];
+        allow_only.default_permissions = Some(PlannedOverride {
+            allow: ChannelPermission::SendMessage as u64,
+            deny: 0,
+        });
+        assert!(!must_remove_without_overrides(&allow_only));
+
+        // A deny on a role (a muted role), not on `@everyone`, also counts.
+        let mut role_deny = allow_only.clone();
+        role_deny.role_overrides[0].1.deny = ChannelPermission::SendMessage as u64;
+        assert!(must_remove_without_overrides(&role_deny));
+    }
+
+    /// **A private channel is never imported public.** Its permission write
+    /// fails, so without its `@everyone` deny it would be open to everyone:
+    /// it is removed again, and with it every pointer to it (its category,
+    /// the system-message slots, the invite), with a note.
+    #[tokio::test]
+    async fn a_private_channel_whose_permissions_fail_is_removed_not_imported_public() {
+        let db = DatabaseInfo::Reference.connect().await.unwrap();
+        let template: GuildTemplate = serde_json::from_str(FIXTURE).unwrap();
+        let mut plan = plan_import(&template).unwrap();
+        // Point the system messages and the invite at the private channel.
+        let private = PlaceholderId("11".to_string());
+        plan.system_messages.user_joined = Some(private.clone());
+        plan.system_messages.user_left = Some(private.clone());
+        plan.invite_channel = Some(private);
+
+        let writes = FailingWrites::new("mod-chat", false);
+        let (job, result) = run_plan_with(&db, plan, &writes).await;
+        assert!(result.is_ok(), "the import still completes");
+
+        let server = db
+            .fetch_server(job.server_id.as_deref().unwrap())
+            .await
+            .unwrap();
+        let by_name = stored_channels_by_name(&db, &server).await;
+        assert_eq!(
+            by_name.keys().collect::<Vec<_>>(),
+            vec!["general"],
+            "the private channel is not on the server"
+        );
+        let deleted = writes.deleted.lock().unwrap().clone();
+        assert_eq!(deleted.len(), 1);
+        assert!(db.fetch_channel(&deleted[0]).await.is_err(), "and is gone");
+
+        // Its category had nothing else in it; the slots and the invite
+        // that named it resolve to nothing / fall back.
+        assert!(server.categories.unwrap_or_default().is_empty());
+        assert!(server.system_messages.is_none());
+        match db
+            .fetch_invite(job.invite_code.as_deref().expect("an invite was minted"))
+            .await
+            .unwrap()
+        {
+            Invite::Server { channel, .. } => assert_eq!(channel, by_name["general"].id()),
+            _ => panic!("expected a server invite"),
+        }
+
+        let summary = job.summary.expect("summary");
+        assert_eq!(summary.channels_created, 1);
+        assert_eq!(summary.channels_skipped, 1);
+        assert!(
+            summary.notes.contains(
+                &"1 channel(s) weren't imported because their permissions couldn't be applied — \
+                  without them, more people could have seen or used them than on the original \
+                  server."
+                    .to_string()
+            ),
+            "{:?}",
+            summary.notes
+        );
+    }
+
+    /// The removal failing as well: the import is abandoned and the server
+    /// rolled back, never handed over with the channel open.
+    #[tokio::test]
+    async fn a_private_channel_that_cannot_be_removed_either_aborts_the_import() {
+        let db = DatabaseInfo::Reference.connect().await.unwrap();
+        let template: GuildTemplate = serde_json::from_str(FIXTURE).unwrap();
+        let plan = plan_import(&template).unwrap();
+
+        let writes = FailingWrites::new("mod-chat", true);
+        let (job, result) = run_plan_with(&db, plan, &writes).await;
+        match result {
+            Err(ImportAbort::Failed(message)) => assert_eq!(message, generic_failure()),
+            Err(ImportAbort::Superseded) => panic!("expected a failure, got superseded"),
+            Ok(()) => panic!("the import must not complete"),
+        }
+        assert_eq!(writes.deleted.lock().unwrap().len(), 1);
+        assert_eq!(job.server_id, None);
+        assert!(job.invite_code.is_none());
+        let stored = db.fetch_discord_import_job(&job.id).await.unwrap();
+        let server_id = stored.server_id.expect("the job recorded its server");
+        assert!(db.fetch_server(&server_id).await.is_err(), "rolled back");
+    }
+
+    /// Only allows lost: the channel stays (it is, if anything, more closed
+    /// than on the source), with a source-neutral note, and the struct
+    /// `ServerCreate` ships says what is stored, not what failed to write.
+    #[tokio::test]
+    async fn a_channel_that_only_loses_allows_is_kept_as_stored() {
+        let db = DatabaseInfo::Reference.connect().await.unwrap();
+        let template: GuildTemplate = serde_json::from_str(FIXTURE).unwrap();
+        let mut plan = plan_import(&template).unwrap();
+        let general = plan
+            .channels
+            .iter_mut()
+            .find(|channel| channel.name == "general")
+            .unwrap();
+        general.role_overrides = vec![(
+            PlaceholderId("2".to_string()),
+            PlannedOverride {
+                allow: ChannelPermission::ManageMessages as u64,
+                deny: 0,
+            },
+        )];
+
+        let writes = FailingWrites::new("general", false);
+        let (job, result) = run_plan_with(&db, plan, &writes).await;
+        assert!(result.is_ok());
+        assert!(writes.deleted.lock().unwrap().is_empty());
+
+        let server = db
+            .fetch_server(job.server_id.as_deref().unwrap())
+            .await
+            .unwrap();
+        let by_name = stored_channels_by_name(&db, &server).await;
+        assert_eq!(by_name.len(), 2);
+        match &by_name["general"] {
+            Channel::TextChannel {
+                role_permissions, ..
+            } => assert!(role_permissions.is_empty()),
+            _ => panic!("expected a text channel"),
+        }
+
+        let summary = job.summary.expect("summary");
+        assert_eq!(summary.channels_created, 2);
+        assert!(
+            summary.notes.contains(
+                &"1 channel(s) were created but their permissions or slowmode couldn't be \
+                  applied — check them in channel settings."
+                    .to_string()
+            ),
+            "{:?}",
+            summary.notes
+        );
+        assert!(!summary
+            .notes
+            .iter()
+            .any(|note| note.contains("Discord permissions")));
+    }
+
+    /// The restore itself, on the exact struct `create_channels` returns
+    /// (the one `Member::create` snapshots into `ServerCreate`).
+    #[tokio::test]
+    async fn a_failed_settings_write_leaves_the_struct_as_stored() {
+        let db = DatabaseInfo::Reference.connect().await.unwrap();
+        let owner = make_owner(&db).await;
+        let template: GuildTemplate = serde_json::from_str(FIXTURE).unwrap();
+        let mut plan = plan_import(&template).unwrap();
+        for channel in &mut plan.channels {
+            if channel.name == "general" {
+                channel.kind = PlannedChannelKind::Text {
+                    slowmode: Some(10),
+                    announcement: false,
+                };
+            }
+        }
+        let (mut server, _) = Server::create(
+            &db,
+            v0::DataCreateServer {
+                name: plan.server_name.clone(),
+                description: None,
+                nsfw: None,
+            },
+            &owner,
+            false,
+        )
+        .await
+        .unwrap();
+        let mut job = DiscordImportJob::new(owner.id.clone(), "restore".to_string());
+        db.insert_discord_import_job(&job).await.unwrap();
+
+        let writes = FailingWrites::new("general", false);
+        let total = plan.total_steps().max(1);
+        let (channels, _) = match create_channels(
+            &db,
+            &mut server,
+            &plan,
+            &mut job,
+            total,
+            &RoleMap::new(),
+            &writes,
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => panic!("create_channels aborted"),
+        };
+        let general = channels
+            .iter()
+            .map(|(_, channel)| channel)
+            .find(
+                |channel| matches!(channel, Channel::TextChannel { name, .. } if name == "general"),
+            )
+            .expect("kept");
+        assert_eq!(
+            general,
+            &db.fetch_channel(general.id()).await.unwrap(),
+            "the returned struct must match the stored channel"
+        );
+        match general {
+            Channel::TextChannel { slowmode, .. } => assert_eq!(*slowmode, None),
+            _ => panic!("expected a text channel"),
+        }
+    }
+
+    /// A Discord guild whose system channel and first text channel are both
+    /// private: the invite goes to the first channel `@everyone` can view.
+    /// System messages still go to the system channel (members who can see
+    /// it see them). With nothing public at all there is no invite, a note
+    /// says so, and the import still completes.
+    #[tokio::test]
+    async fn the_discord_invite_skips_channels_everyone_cannot_view() {
+        let guild = |with_public: bool| {
+            let public = if with_public {
+                r#",{"id": 3, "type": 0, "name": "general", "position": 2}"#
+            } else {
+                ""
+            };
+            format!(
+                r#"{{
+                "code": "private",
+                "name": "Private Template",
+                "serialized_source_guild": {{
+                    "name": "Private Guild",
+                    "system_channel_id": 2,
+                    "roles": [{{"id": 0, "name": "@everyone", "permissions": "3148800"}}],
+                    "channels": [
+                        {{"id": 1, "type": 0, "name": "staff", "position": 0,
+                         "permission_overwrites": [{{"id": "0", "type": 0, "allow": "0", "deny": "1024"}}]}},
+                        {{"id": 2, "type": 0, "name": "welcome", "position": 1,
+                         "permission_overwrites": [{{"id": "0", "type": 0, "allow": "0", "deny": "1024"}}]}}
+                        {public}
+                    ]
+                }}
+            }}"#
+            )
+        };
+
+        let db = DatabaseInfo::Reference.connect().await.unwrap();
+        let template: GuildTemplate = serde_json::from_str(&guild(true)).unwrap();
+        let (job, result) =
+            run_plan_with(&db, plan_import(&template).unwrap(), &StoredChannels).await;
+        assert!(result.is_ok());
+        let server = db
+            .fetch_server(job.server_id.as_deref().unwrap())
+            .await
+            .unwrap();
+        let by_name = stored_channels_by_name(&db, &server).await;
+        match db
+            .fetch_invite(job.invite_code.as_deref().expect("an invite was minted"))
+            .await
+            .unwrap()
+        {
+            Invite::Server { channel, .. } => assert_eq!(
+                channel,
+                by_name["general"].id(),
+                "the invite goes to the public channel"
+            ),
+            _ => panic!("expected a server invite"),
+        }
+        assert_eq!(
+            server.system_messages.unwrap().user_joined.as_deref(),
+            Some(by_name["welcome"].id())
+        );
+        assert!(!job
+            .summary
+            .expect("summary")
+            .notes
+            .contains(&NO_INVITE_CHANNEL.to_string()));
+
+        let template: GuildTemplate = serde_json::from_str(&guild(false)).unwrap();
+        let (job, result) =
+            run_plan_with(&db, plan_import(&template).unwrap(), &StoredChannels).await;
+        assert!(result.is_ok());
+        assert_eq!(job.invite_code, None, "no channel to invite into");
+        let stored = db.fetch_discord_import_job(&job.id).await.unwrap();
+        assert_eq!(stored.status, ImportStatus::Completed);
+        assert_eq!(stored.invite_code, None);
+        assert!(stored
+            .summary
+            .expect("summary")
+            .notes
+            .contains(&NO_INVITE_CHANNEL.to_string()));
     }
 
     // ----------------------------------------------------------------------
