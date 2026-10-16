@@ -39,6 +39,7 @@ revolt-config = { workspace = true }
 revolt-models = { workspace = true }
 revolt-result = { workspace = true, features = ["utoipa", "axum"] }
 revolt-files = { workspace = true }
+revolt-gamedata = { workspace = true }
 
 # Axum / web server
 axum = { workspace = true }
