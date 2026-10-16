@@ -12,13 +12,19 @@
 //! Money rules this module keeps:
 //! - prices come from [`crate::catalog`] only; the client names a tier
 //! - a completed session is applied only when it matches the order exactly
-//!   (session id, order id, amount, currency, livemode)
+//!   (session id, order id, amount, currency, livemode). A session that is
+//!   not provably the order's (or not in our mode) is ignored; the order's
+//!   own session paid in another amount or currency is refunded and the
+//!   order voided (`AmountMismatch`)
 //! - a resumed fulfil never refunds or re-numbers an order it already
 //!   applied: the "already applied?" check runs before any precondition
 //! - our own refunds use the idempotency key `void-{order_id}`, and a
-//!   payment already refunded or lost in a dispute is never refunded again
+//!   payment lost in a dispute is never refunded by us
 //! - a reversal only touches a membership when the order is Fulfilled and
 //!   listed in that membership, so the refund of a voided order is a no-op
+//! - an open dispute is recorded on the order (`dispute_open`) before and
+//!   after fulfilment; fulfilment adds a disputed order to the membership
+//!   already listed in `disputed_orders`, so its badge is never published
 
 use revolt_database::{
     CipherMembership, CipherRevokeReason, Database, FieldsUser, OrderState, PartialUser,
@@ -32,6 +38,7 @@ use revolt_result::{create_error, ErrorType, Result};
 use ulid::Ulid;
 
 use crate::catalog;
+use crate::dispatch::dispute_kind;
 use crate::settings::PaymentsSettings;
 use crate::stripe::{CheckoutSession, CheckoutSessionParams, StripeApi, StripeError};
 
@@ -90,13 +97,13 @@ pub enum ReverseKind {
 pub enum ReverseOutcome {
     /// The membership (and the order) changed
     Applied,
-    /// The order is not fulfilled yet; fulfilment applies the reversal last
+    /// The order is not fulfilled yet; the reversal (or the dispute's
+    /// status) is recorded on the order and fulfilment honours it
     RecordedPending,
-    /// Nothing to do (voided, expired or already reversed, or not applied
-    /// to any membership)
+    /// Nothing to do (voided or already reversed, or not applied to any
+    /// membership)
     NoOp,
-    /// Another worker holds the order, or the order is paid but not
-    /// fulfilled yet; the caller retries later
+    /// Another worker holds the order; the caller retries later
     Busy,
 }
 
@@ -176,7 +183,9 @@ fn void_key(order_id: &str) -> String {
 }
 
 /// Refund `payment_intent` for an order we are voiding. A payment that is
-/// already refunded counts as done (the money is back either way).
+/// already refunded counts as done (the money is back either way). A refund
+/// Stripe reports `failed` or `canceled` returned nothing: that is an error,
+/// so the order is not voided and the caller retries.
 async fn refund_for_void(
     stripe: &dyn StripeApi,
     payment_intent: &str,
@@ -186,7 +195,16 @@ async fn refund_for_void(
         .create_refund(payment_intent, &void_key(order_id))
         .await
     {
-        Ok(_) => Ok(()),
+        Ok(refund) => match refund.status.as_deref() {
+            Some(status @ ("failed" | "canceled")) => {
+                log::error!(
+                    "payments: refund {} of order {order_id} is {status}; the order stays unvoided",
+                    refund.id
+                );
+                Err(create_error!(PaymentProviderError))
+            }
+            _ => Ok(()),
+        },
         Err(StripeError::Api {
             code: Some(code), ..
         }) if code == CHARGE_ALREADY_REFUNDED => {
@@ -219,74 +237,98 @@ fn pending_kind(pending: &ReversalPending) -> ReverseKind {
     }
 }
 
+/// Why a completed session cannot be applied to its order
+#[derive(Debug)]
+enum SessionMismatch {
+    /// Not provably the order's own session (another session or order,
+    /// another payment or buyer, or the other livemode): nothing about it
+    /// is ours to settle, so it is ignored
+    NotOurs(String),
+    /// The order's own session (its stored id, or none stored, and our
+    /// metadata naming this order) in our mode, but in another amount or
+    /// currency; names the field that differs
+    Terms(&'static str),
+}
+
 /// Why a completed session cannot be applied to this order, if it cannot.
 /// The session is what Stripe reports (a signed event or an API read).
+/// Every identity check runs before the amount and currency, so a `Terms`
+/// mismatch is only ever reported for the order's own session.
 fn session_mismatch(
     order: &PaymentOrder,
     session: &CheckoutSession,
     s: &PaymentsSettings,
-) -> Option<String> {
+) -> Option<SessionMismatch> {
+    use SessionMismatch::{NotOurs, Terms};
+
     match &order.checkout_session_id {
         Some(id) if *id != session.id => {
-            return Some(format!(
+            return Some(NotOurs(format!(
                 "session {} is not the order's session {id}",
                 session.id
-            ))
+            )))
         }
         Some(_) => {}
         // The session id was never stored (a crash between Stripe's answer
         // and the Pending write): bind on the order id we put in metadata
         None if session.metadata_order_id.as_deref() != Some(order.id.as_str()) => {
-            return Some(format!(
+            return Some(NotOurs(format!(
                 "order has no stored session and session {} names another order",
                 session.id
-            ))
+            )))
         }
         None => {}
     }
 
     if let Some(named) = &session.metadata_order_id {
         if *named != order.id {
-            return Some(format!("session metadata names order {named}"));
+            return Some(NotOurs(format!("session metadata names order {named}")));
         }
     }
 
     if session.livemode != s.expect_livemode {
-        return Some(format!(
+        return Some(NotOurs(format!(
             "session livemode {} but expect_livemode {}",
             session.livemode, s.expect_livemode
-        ));
-    }
-
-    if session.amount_total != Some(order.amount_cents) {
-        return Some(format!(
-            "session amount {:?} but order amount {}",
-            session.amount_total, order.amount_cents
-        ));
-    }
-
-    if order.currency != "usd" || session.currency.as_deref() != Some(order.currency.as_str()) {
-        return Some(format!(
-            "session currency {:?} but order currency {}",
-            session.currency, order.currency
-        ));
+        )));
     }
 
     if let (Some(stored), Some(reported)) = (&order.payment_intent_id, &session.payment_intent) {
         if stored != reported {
-            return Some(format!(
+            return Some(NotOurs(format!(
                 "session payment intent {reported} but the order is paid by {stored}"
-            ));
+            )));
         }
     }
 
     if let (Some(user_id), Some(reference)) = (&order.user_id, &session.client_reference_id) {
         if user_id != reference {
-            return Some("session client_reference_id names another user".to_string());
+            return Some(NotOurs(
+                "session client_reference_id names another user".to_string(),
+            ));
         }
     }
 
-    None
+    let field = if session.amount_total != Some(order.amount_cents) {
+        "amount"
+    } else if order.currency != "usd"
+        || session.currency.as_deref() != Some(order.currency.as_str())
+    {
+        "currency"
+    } else {
+        return None;
+    };
+
+    // Ours only when our own metadata names the order: a session without
+    // it is never settled on its id alone
+    if session.metadata_order_id.as_deref() == Some(order.id.as_str()) {
+        Some(Terms(field))
+    } else {
+        Some(NotOurs(format!(
+            "session {} has the wrong {field} and no metadata naming the order",
+            session.id
+        )))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -380,6 +422,7 @@ pub async fn create_cipher_checkout(
         state: OrderState::Creating,
         void_reason: None,
         reversal_pending: None,
+        dispute_open: false,
         lease_until: None,
         version: 0,
         created_at: now_ms,
@@ -557,16 +600,29 @@ async fn fulfil_locked(
         | OrderState::Paid => {}
     }
 
-    if let Some(why) = session_mismatch(&leased.order, session, s) {
-        log::warn!(
-            "payments: ignoring session {} for order {}: {why}",
-            session.id,
-            leased.order.id
-        );
-        return Ok(FulfilOutcome::Ignored);
-    }
+    let wrong_terms = match session_mismatch(&leased.order, session, s) {
+        None => None,
+        Some(SessionMismatch::NotOurs(why)) => {
+            log::warn!(
+                "payments: ignoring session {} for order {}: {why}",
+                session.id,
+                leased.order.id
+            );
+            return Ok(FulfilOutcome::Ignored);
+        }
+        Some(SessionMismatch::Terms(field)) => Some(field),
+    };
 
     if session.payment_status.as_deref() != Some("paid") {
+        if let Some(field) = wrong_terms {
+            // Nothing was taken, so there is nothing to settle
+            log::warn!(
+                "payments: ignoring unpaid session {} for order {}: wrong {field}",
+                session.id,
+                leased.order.id
+            );
+            return Ok(FulfilOutcome::Ignored);
+        }
         return Ok(FulfilOutcome::NotPaid);
     }
 
@@ -584,9 +640,10 @@ async fn fulfil_locked(
     // 1. Pending → Paid
     if leased.order.state != OrderState::Paid {
         let session_id = session.id.clone();
+        let paid_by = payment_intent.clone();
         write(db, leased, move |o| {
             o.state = OrderState::Paid;
-            o.payment_intent_id = Some(payment_intent);
+            o.payment_intent_id = Some(paid_by);
             o.paid_at = Some(now_ms);
             if o.checkout_session_id.is_none() {
                 o.checkout_session_id = Some(session_id);
@@ -595,9 +652,23 @@ async fn fulfil_locked(
         .await?;
     }
 
-    // The buyer deleted their account before fulfilment
+    // Our own session, paid, but not what the order costs: the buyer is
+    // refunded and nothing is granted
+    if let Some(field) = wrong_terms {
+        log::error!(
+            "payments: session {} of order {} was paid by {payment_intent} with the wrong {field}; \
+             voiding and refunding it",
+            session.id,
+            leased.order.id
+        );
+        return void_paid(db, stripe, leased, VoidReason::AmountMismatch, now_ms).await;
+    }
+
+    // The buyer deleted their account before fulfilment. Our session names
+    // them, which finds a membership a fulfilment racing the deletion left.
     let Some(user_id) = leased.order.user_id.clone() else {
-        return void_paid(db, stripe, leased, VoidReason::AccountDeleted, now_ms).await;
+        let buyer = session.client_reference_id.clone();
+        return void_for_deleted_account(db, stripe, leased, buyer.as_deref(), now_ms).await;
     };
 
     // 2. Already applied? (a resume after a crash must neither refund nor
@@ -607,7 +678,11 @@ async fn fulfil_locked(
         .as_ref()
         .is_some_and(|m| m.orders.contains(&leased.order.id));
 
-    if !applied {
+    if applied {
+        // Applied by a worker that crashed. The order's flag is the truth:
+        // every dispute event since was recorded on the order first.
+        set_dispute_listing(db, &user_id, &leased.order.id, leased.order.dispute_open).await?;
+    } else {
         // 3. Preconditions
         if let Some(reason) = precondition_failure(s, &leased.order, membership.as_ref()) {
             return void_paid(db, stripe, leased, reason, now_ms).await;
@@ -642,6 +717,11 @@ async fn fulfil_locked(
 /// recorded before a crash
 async fn finish_fulfilled(db: &Database, leased: &mut Leased, now_ms: i64) -> Result<()> {
     if let Some(user_id) = leased.order.user_id.clone() {
+        // Only ever adds the listing (fails closed): clearing it is the
+        // job of the dispute's own won/closed event
+        if leased.order.dispute_open {
+            set_dispute_listing(db, &user_id, &leased.order.id, true).await?;
+        }
         sync_user_badge(db, &user_id).await?;
     }
 
@@ -673,7 +753,9 @@ async fn void_late_payment(
         return Ok(FulfilOutcome::Voided(reason));
     }
 
-    if let Some(why) = session_mismatch(&leased.order, session, s) {
+    // The order's own session paid in the wrong amount or currency is
+    // refunded like any other late payment of a voided order
+    if let Some(SessionMismatch::NotOurs(why)) = session_mismatch(&leased.order, session, s) {
         log::warn!(
             "payments: ignoring session {} for voided order {}: {why}",
             session.id,
@@ -767,13 +849,19 @@ async fn apply_membership(
                 },
             };
 
+            // A dispute opened before fulfilment is listed in the same write
+            // that adds the order, so no badge is published for it
             let fresh = CipherMembership {
                 user_id: user_id.to_string(),
                 number,
                 tier: *tier,
                 prot_grant: catalog::tier_prot(*tier),
                 orders: vec![order.id.clone()],
-                disputed_orders: vec![],
+                disputed_orders: if order.dispute_open {
+                    vec![order.id.clone()]
+                } else {
+                    vec![]
+                },
                 granted_at: now_ms,
                 revoked_at: None,
                 revoke_reason: None,
@@ -827,10 +915,17 @@ async fn apply_membership(
                     return Ok(Applied::Void(VoidReason::DisputeOpen));
                 }
 
+                // The membership's own payments are undisputed (checked
+                // above); an upgrade whose payment is disputed still applies
+                // and keeps the number, listed as disputed in this same
+                // write, so the badge stays hidden until the dispute is won
                 let mut next = m.clone();
                 next.tier = *to;
                 next.prot_grant = catalog::tier_prot(*to);
                 next.orders.push(order.id.clone());
+                if order.dispute_open {
+                    next.disputed_orders.push(order.id.clone());
+                }
                 if db
                     .update_cipher_membership_if_version(&next, m.version)
                     .await?
@@ -848,8 +943,12 @@ async fn apply_membership(
     }
 }
 
-/// Void a Paid order: refund it (unless the payment is already refunded or
-/// lost in a dispute), then record Voided with `reason`
+/// Void a Paid order: refund it (unless a dispute on it was lost), then
+/// record Voided with `reason`
+///
+/// A recorded owner refund does not skip ours: it may have been partial,
+/// and when nothing is left Stripe answers `charge_already_refunded`, which
+/// counts as done. A lost dispute already took the money back.
 async fn void_paid(
     db: &Database,
     stripe: &dyn StripeApi,
@@ -857,7 +956,7 @@ async fn void_paid(
     reason: VoidReason,
     now_ms: i64,
 ) -> Result<FulfilOutcome> {
-    if leased.order.reversal_pending.is_none() {
+    if leased.order.reversal_pending != Some(ReversalPending::DisputeLost) {
         let Some(payment_intent) = leased.order.payment_intent_id.clone() else {
             log::error!(
                 "payments: cannot refund order {}: no payment intent",
@@ -879,6 +978,78 @@ async fn void_paid(
 
     log::info!("payments: order {} voided ({reason:?})", leased.order.id);
     Ok(FulfilOutcome::Voided(reason))
+}
+
+/// Void a Paid order of a deleted account (AccountDeleted). A fulfilment
+/// that held the lease while the account was deleted can have written the
+/// membership after the deletion removed it; a membership of `buyer` that
+/// lists this order is deleted here. Only a row listing this order is
+/// touched, so a wrong `buyer` deletes nothing.
+async fn void_for_deleted_account(
+    db: &Database,
+    stripe: &dyn StripeApi,
+    leased: &mut Leased,
+    buyer: Option<&str>,
+    now_ms: i64,
+) -> Result<FulfilOutcome> {
+    if let Some(user_id) = buyer {
+        let holds_order = db
+            .fetch_cipher_membership(user_id)
+            .await?
+            .is_some_and(|m| m.orders.contains(&leased.order.id));
+        if holds_order {
+            db.delete_cipher_membership(user_id).await?;
+            log::warn!(
+                "payments: deleted the membership of deleted account {user_id}, which order {} \
+                 was applied to after the deletion",
+                leased.order.id
+            );
+        }
+    }
+
+    void_paid(db, stripe, leased, VoidReason::AccountDeleted, now_ms).await
+}
+
+/// List `order_id` in the membership's `disputed_orders` when `open`, or
+/// take it out when not, if the membership holds that order.
+/// Compare-and-swap on the membership version, retried a bounded number of
+/// times; nothing is written when the listing already matches.
+/// Ok(true) when the membership holds the order.
+async fn set_dispute_listing(
+    db: &Database,
+    user_id: &str,
+    order_id: &str,
+    open: bool,
+) -> Result<bool> {
+    for _ in 0..MEMBERSHIP_RETRIES {
+        let Some(m) = db.fetch_cipher_membership(user_id).await? else {
+            return Ok(false);
+        };
+        if !m.orders.iter().any(|id| id == order_id) {
+            return Ok(false);
+        }
+        if m.disputed_orders.iter().any(|id| id == order_id) == open {
+            return Ok(true);
+        }
+
+        let mut next = m.clone();
+        if open {
+            next.disputed_orders.push(order_id.to_string());
+        } else {
+            next.disputed_orders.retain(|id| id != order_id);
+        }
+        if db
+            .update_cipher_membership_if_version(&next, m.version)
+            .await?
+        {
+            return Ok(true);
+        }
+    }
+
+    log::error!(
+        "payments: dispute listing of order {order_id} did not settle after {MEMBERSHIP_RETRIES} tries"
+    );
+    Err(create_error!(InternalError))
 }
 
 // ---------------------------------------------------------------------------
@@ -906,6 +1077,94 @@ pub async fn reverse_order(
     outcome
 }
 
+/// Apply a dispute as Stripe reports it now. The dispute is read INSIDE the
+/// order's lease, so of two deliveries handled one after the other the
+/// later one always applies the newer status. The dispute must be on this
+/// order's payment; a failed or inconsistent lookup is an error (the caller
+/// retries), never a guess.
+pub async fn reverse_dispute(
+    db: &Database,
+    stripe: &dyn StripeApi,
+    s: &PaymentsSettings,
+    order_id: &str,
+    dispute_id: &str,
+    now_ms: i64,
+) -> Result<ReverseOutcome> {
+    let Some(mut leased) = acquire(db, order_id, now_ms).await? else {
+        return Ok(ReverseOutcome::Busy);
+    };
+    let outcome = match current_dispute_kind(stripe, s, &leased.order, dispute_id).await {
+        Ok(kind) => reverse_locked(db, &mut leased, kind, now_ms).await,
+        Err(err) => Err(err),
+    };
+    release(db, &leased).await;
+    outcome
+}
+
+/// The reversal a dispute's current status calls for, once the dispute is
+/// shown to be on `order`'s payment
+async fn current_dispute_kind(
+    stripe: &dyn StripeApi,
+    s: &PaymentsSettings,
+    order: &PaymentOrder,
+    dispute_id: &str,
+) -> Result<ReverseKind> {
+    let dispute = stripe.get_dispute(dispute_id).await.map_err(|err| {
+        provider_error(
+            &format!("fetching dispute {dispute_id} of order {}", order.id),
+            err,
+        )
+    })?;
+    if dispute.id != dispute_id {
+        log::error!(
+            "payments: asked for dispute {dispute_id} of order {}, got {}",
+            order.id,
+            dispute.id
+        );
+        return Err(create_error!(PaymentProviderError));
+    }
+    let Some(disputed) = dispute.payment_intent.as_deref() else {
+        log::error!(
+            "payments: dispute {dispute_id} of order {} names no payment",
+            order.id
+        );
+        return Err(create_error!(PaymentProviderError));
+    };
+
+    match order.payment_intent_id.as_deref() {
+        Some(paid_by) if paid_by == disputed => {}
+        Some(paid_by) => {
+            log::error!(
+                "payments: dispute {dispute_id} is on {disputed}, but order {} was paid by {paid_by}",
+                order.id
+            );
+            return Err(create_error!(PaymentProviderError));
+        }
+        // Not marked paid on our side yet: the disputed payment must name
+        // this order in the metadata we set at checkout
+        None => {
+            let intent = stripe.get_payment_intent(disputed).await.map_err(|err| {
+                provider_error(
+                    &format!("fetching the payment of dispute {dispute_id}"),
+                    err,
+                )
+            })?;
+            if intent.id != disputed
+                || intent.livemode != s.expect_livemode
+                || intent.metadata_order_id.as_deref() != Some(order.id.as_str())
+            {
+                log::error!(
+                    "payments: dispute {dispute_id} is on {disputed}, which is not order {}'s payment",
+                    order.id
+                );
+                return Err(create_error!(PaymentProviderError));
+            }
+        }
+    }
+
+    Ok(dispute_kind(dispute.status.as_deref()))
+}
+
 /// [`reverse_order`] on an order whose lease the caller already holds
 /// (fulfil applies a recorded reversal this way; leases are not re-entrant)
 async fn reverse_locked(
@@ -916,34 +1175,62 @@ async fn reverse_locked(
 ) -> Result<ReverseOutcome> {
     match leased.order.state {
         // Includes the charge.refunded of our own void refund
-        OrderState::Voided | OrderState::Expired | OrderState::Refunded => Ok(ReverseOutcome::NoOp),
+        OrderState::Voided | OrderState::Refunded => Ok(ReverseOutcome::NoOp),
+        // Not fulfilled (yet). Expired is included: a session paid after the
+        // order expired is still fulfilled, and must honour what came first.
         OrderState::Creating
         | OrderState::Pending
         | OrderState::SessionFailed
-        | OrderState::Paid => match kind {
-            ReverseKind::Refund | ReverseKind::DisputeLost => {
-                if leased.order.reversal_pending.is_none() {
-                    let pending = match kind {
-                        ReverseKind::Refund => ReversalPending::Refund,
-                        _ => ReversalPending::DisputeLost,
-                    };
-                    write(db, leased, move |o| o.reversal_pending = Some(pending)).await?;
-                }
-                Ok(ReverseOutcome::RecordedPending)
-            }
-            // A dispute on a paid order that is not fulfilled yet cannot be
-            // recorded; retry once fulfilment has run, so the badge is never
-            // shown while the dispute is open
-            ReverseKind::DisputeOpened | ReverseKind::DisputeWon => {
-                if leased.order.state == OrderState::Paid {
-                    Ok(ReverseOutcome::Busy)
-                } else {
-                    Ok(ReverseOutcome::NoOp)
-                }
-            }
-        },
+        | OrderState::Expired
+        | OrderState::Paid => record_before_fulfilment(db, leased, kind).await,
         OrderState::Fulfilled => reverse_fulfilled(db, leased, kind, now_ms).await,
     }
+}
+
+/// A reversal or dispute status for an order that is not fulfilled yet:
+/// recorded on the order, under the lease. Fulfilment lists a disputed
+/// order as disputed in the write that adds it to the membership, and
+/// applies a recorded reversal as its last step.
+async fn record_before_fulfilment(
+    db: &Database,
+    leased: &mut Leased,
+    kind: ReverseKind,
+) -> Result<ReverseOutcome> {
+    let order = &leased.order;
+    let (pending, dispute_open) = match kind {
+        ReverseKind::Refund => (
+            order
+                .reversal_pending
+                .clone()
+                .or(Some(ReversalPending::Refund)),
+            order.dispute_open,
+        ),
+        // A lost dispute outranks a recorded refund (the money is already
+        // gone, so we must not refund it), and the order stays listed as
+        // disputed until the reversal revokes the membership, so no badge
+        // is published in between
+        ReverseKind::DisputeLost => (Some(ReversalPending::DisputeLost), true),
+        ReverseKind::DisputeOpened => (order.reversal_pending.clone(), true),
+        ReverseKind::DisputeWon => (order.reversal_pending.clone(), false),
+    };
+
+    if pending != order.reversal_pending || dispute_open != order.dispute_open {
+        write(db, leased, move |o| {
+            o.reversal_pending = pending;
+            o.dispute_open = dispute_open;
+        })
+        .await?;
+    }
+
+    // A worker that died after its membership write (the order is still
+    // Paid) may already have published the badge: mirror the dispute into
+    // that membership now rather than at the resume
+    if let Some(user_id) = leased.order.user_id.clone() {
+        if set_dispute_listing(db, &user_id, &leased.order.id, dispute_open).await? {
+            sync_user_badge(db, &user_id).await?;
+        }
+    }
+    Ok(ReverseOutcome::RecordedPending)
 }
 
 async fn reverse_fulfilled(
@@ -952,6 +1239,18 @@ async fn reverse_fulfilled(
     kind: ReverseKind,
     now_ms: i64,
 ) -> Result<ReverseOutcome> {
+    // The order records the dispute first: if the membership write below
+    // fails, the event is retried, and a redelivered completion re-adds the
+    // listing from this flag (it never clears one)
+    let open = match kind {
+        ReverseKind::DisputeOpened => Some(true),
+        ReverseKind::DisputeWon => Some(false),
+        ReverseKind::Refund | ReverseKind::DisputeLost => None,
+    };
+    if let Some(open) = open.filter(|open| *open != leased.order.dispute_open) {
+        write(db, leased, move |o| o.dispute_open = open).await?;
+    }
+
     // Unlinked by an account deletion: the membership is gone with it
     let Some(user_id) = leased.order.user_id.clone() else {
         return no_membership_to_reverse(db, leased).await;
@@ -1159,7 +1458,10 @@ pub async fn sync_user_badge(db: &Database, user_id: &str) -> Result<()> {
 /// by the reconcile resume, because fulfil voids an order with no buyer; a
 /// session paid after deletion is refunded by fulfil; a Creating order
 /// expires). An order whose lease is held is left to its holder, whose next
-/// write is fenced off by the unlink. Fulfilled orders are not refunded.
+/// write is fenced off by the unlink; if that holder wrote the membership
+/// after the delete below, the resume that voids the order deletes it (the
+/// session's `client_reference_id` names the buyer). Fulfilled orders are
+/// not refunded.
 pub async fn on_account_deleted(
     db: &Database,
     stripe: &dyn StripeApi,
@@ -1218,7 +1520,8 @@ async fn void_for_deletion(
 ) -> Result<()> {
     match leased.order.state {
         OrderState::Paid => {
-            void_paid(db, stripe, leased, VoidReason::AccountDeleted, now_ms).await?;
+            let buyer = leased.order.user_id.clone();
+            void_for_deleted_account(db, stripe, leased, buyer.as_deref(), now_ms).await?;
             Ok(())
         }
         OrderState::Creating | OrderState::Pending | OrderState::SessionFailed => {
@@ -1247,7 +1550,7 @@ mod tests {
 
     use super::*;
     use crate::catalog::CIPHER_CAP_MAX;
-    use crate::stripe::MockStripe;
+    use crate::stripe::{Dispute, MockStripe, PaymentIntent};
 
     const NOW: i64 = 1_760_000_000_000;
     /// After a dead worker's lease has run out
@@ -1541,7 +1844,9 @@ mod tests {
         let session = pay(&stripe, &pending, "pi_1");
 
         // Two deliveries at once: one applies, the other finds the lease
-        // held (or, if it ran second, the order fulfilled)
+        // held (or, if it ran second, the order fulfilled). Only MONGODB
+        // interleaves the two: the reference driver's calls never yield
+        // mid-step, so there the second simply runs after the first.
         let (a, b) = tokio::join!(
             fulfil_order(&db, &stripe, &s, &pending.id, &session, NOW),
             fulfil_order(&db, &stripe, &s, &pending.id, &session, NOW)
@@ -2049,7 +2354,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_void_after_a_recorded_refund_does_not_refund_again() {
+    async fn a_void_after_a_recorded_refund_refunds_only_what_is_left() {
         let db = test_db().await;
         let stripe = MockStripe::new();
         let s = PaymentsSettings {
@@ -2067,7 +2372,9 @@ mod tests {
             .await
             .unwrap();
 
-        // b's payment was refunded at Stripe before its completion was handled
+        // b's payment was refunded in full by the owner at Stripe before its
+        // completion was handled
+        stripe.create_refund("pi_b", "owner-refund").await.unwrap();
         assert_eq!(
             reverse_order(&db, &stripe, &s, &b.id, ReverseKind::Refund, NOW)
                 .await
@@ -2080,9 +2387,112 @@ mod tests {
                 .unwrap(),
             FulfilOutcome::Voided(VoidReason::SoldOut)
         );
+        // The recorded refund may have been partial, so the void still asks
+        // for the rest; Stripe has nothing left (charge_already_refunded),
+        // which counts as done, and no second refund exists
+        assert_eq!(
+            refund_keys(&stripe),
+            vec![
+                ("pi_b".to_string(), Some("owner-refund".to_string())),
+                ("pi_b".to_string(), Some(format!("void-{}", b.id))),
+            ]
+        );
+        assert_eq!(stripe.refund_count_for("pi_b"), 1);
+        let voided = order(&db, &b.id).await;
+        assert_eq!(voided.state, OrderState::Voided);
+        assert_eq!(voided.reversal_pending, None);
+        drop_db(&db).await;
+    }
+
+    #[tokio::test]
+    async fn a_void_after_a_lost_dispute_never_refunds() {
+        let db = test_db().await;
+        let stripe = MockStripe::new();
+        let s = PaymentsSettings {
+            cap: 1,
+            ..settings()
+        };
+        insert_user(&db, "a").await;
+        insert_user(&db, "b").await;
+
+        let a = checkout(&db, &stripe, &s, "a", CipherTier::T99, NOW).await;
+        let b = checkout(&db, &stripe, &s, "b", CipherTier::T99, NOW).await;
+        let session_a = pay(&stripe, &a, "pi_a");
+        let session_b = pay(&stripe, &b, "pi_b");
+        fulfil_order(&db, &stripe, &s, &a.id, &session_a, NOW)
+            .await
+            .unwrap();
+
+        // A refund recorded, then the dispute lost: the lost dispute wins
+        for kind in [ReverseKind::Refund, ReverseKind::DisputeLost] {
+            assert_eq!(
+                reverse_order(&db, &stripe, &s, &b.id, kind, NOW)
+                    .await
+                    .unwrap(),
+                ReverseOutcome::RecordedPending
+            );
+        }
+        assert_eq!(
+            order(&db, &b.id).await.reversal_pending,
+            Some(ReversalPending::DisputeLost)
+        );
+        assert_eq!(
+            fulfil_order(&db, &stripe, &s, &b.id, &session_b, NOW + 1)
+                .await
+                .unwrap(),
+            FulfilOutcome::Voided(VoidReason::SoldOut)
+        );
         assert_eq!(stripe.call_count("create_refund"), 0);
         assert_eq!(order(&db, &b.id).await.reversal_pending, None);
         drop_db(&db).await;
+    }
+
+    #[tokio::test]
+    async fn a_failed_or_canceled_void_refund_leaves_the_order_unvoided() {
+        for status in ["failed", "canceled"] {
+            let db = test_db().await;
+            let stripe = MockStripe::new();
+            let s = PaymentsSettings {
+                cap: 1,
+                ..settings()
+            };
+            insert_user(&db, "a").await;
+            insert_user(&db, "b").await;
+
+            // Both start before either is fulfilled; a takes the last number
+            let a = checkout(&db, &stripe, &s, "a", CipherTier::T99, NOW).await;
+            let b = checkout(&db, &stripe, &s, "b", CipherTier::T99, NOW).await;
+            let session_a = pay(&stripe, &a, "pi_a");
+            let session_b = pay(&stripe, &b, "pi_b");
+            assert_eq!(
+                fulfil_order(&db, &stripe, &s, &a.id, &session_a, NOW)
+                    .await
+                    .unwrap(),
+                FulfilOutcome::Fulfilled
+            );
+            stripe.set_refund_status(status);
+            assert!(matches!(
+                error_type(fulfil_order(&db, &stripe, &s, &b.id, &session_b, NOW).await),
+                ErrorType::PaymentProviderError
+            ));
+
+            // Paid, not voided, lease released: the next attempt retries
+            let kept = order(&db, &b.id).await;
+            assert_eq!(kept.state, OrderState::Paid, "{status}");
+            assert_eq!(kept.void_reason, None, "{status}");
+            assert!(kept.lease_until.is_none(), "{status}");
+            assert_eq!(stripe.refund_count_for("pi_b"), 0, "{status}");
+            assert!(db.fetch_cipher_membership("b").await.unwrap().is_none());
+
+            // Stripe replays the same refund under the same key: still not
+            // voided (the money never came back)
+            assert!(resume_order(&db, &stripe, &s, &b.id, NOW + 1)
+                .await
+                .is_err());
+            assert_eq!(order(&db, &b.id).await.state, OrderState::Paid);
+            assert_eq!(stripe.call_count("create_refund"), 2, "{status}");
+            drop_db(&db).await;
+        }
     }
 
     #[tokio::test]
@@ -2210,7 +2620,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_dispute_on_a_paid_unfulfilled_order_waits_for_fulfilment() {
+    async fn a_dispute_on_a_paid_unfulfilled_order_is_recorded_and_never_badged() {
         let db = test_db().await;
         let stripe = MockStripe::new();
         let s = settings();
@@ -2223,7 +2633,262 @@ mod tests {
             o.payment_intent_id = Some("pi_1".to_string());
         })
         .await;
+        let reverse = |kind, at| reverse_order(&db, &stripe, &s, &pending.id, kind, at);
 
+        // Recorded on the Paid order under the lease
+        assert_eq!(
+            reverse(ReverseKind::DisputeOpened, LATER).await.unwrap(),
+            ReverseOutcome::RecordedPending
+        );
+        let recorded = order(&db, &pending.id).await;
+        assert_eq!(recorded.state, OrderState::Paid);
+        assert!(recorded.dispute_open);
+        assert_eq!(badge(&db, "u1").await, None);
+
+        // Fulfilment adds the order already listed as disputed
+        assert_eq!(
+            fulfil_order(&db, &stripe, &s, &pending.id, &session, LATER + 1)
+                .await
+                .unwrap(),
+            FulfilOutcome::Fulfilled
+        );
+        let m = membership(&db, "u1").await;
+        assert!(m.is_active());
+        assert_eq!(m.orders, vec![pending.id.clone()]);
+        assert_eq!(m.disputed_orders, vec![pending.id.clone()]);
+        assert_eq!(badge(&db, "u1").await, None);
+        assert!(
+            cipher_me(&db, "u1", LATER + 1)
+                .await
+                .unwrap()
+                .membership
+                .unwrap()
+                .disputed
+        );
+
+        // A redelivery of the opening changes nothing
+        assert_eq!(
+            reverse(ReverseKind::DisputeOpened, LATER + 2)
+                .await
+                .unwrap(),
+            ReverseOutcome::Applied
+        );
+        assert_eq!(membership(&db, "u1").await.disputed_orders.len(), 1);
+        assert_eq!(badge(&db, "u1").await, None);
+
+        // Won: the badge appears
+        assert_eq!(
+            reverse(ReverseKind::DisputeWon, LATER + 3).await.unwrap(),
+            ReverseOutcome::Applied
+        );
+        assert!(!order(&db, &pending.id).await.dispute_open);
+        assert!(membership(&db, "u1").await.disputed_orders.is_empty());
+        assert_eq!(badge(&db, "u1").await, badge_of(1, CipherTier::T99));
+        drop_db(&db).await;
+    }
+
+    #[tokio::test]
+    async fn a_dispute_before_completion_keeps_the_badge_hidden_at_every_step() {
+        let db = test_db().await;
+        let stripe = MockStripe::new();
+        let s = settings();
+        insert_user(&db, "u1").await;
+
+        let pending = checkout(&db, &stripe, &s, "u1", CipherTier::T149, NOW).await;
+        let session = pay(&stripe, &pending, "pi_1");
+        let reverse = |kind, at| reverse_order(&db, &stripe, &s, &pending.id, kind, at);
+
+        // Opened while the order is still Pending
+        assert_eq!(
+            reverse(ReverseKind::DisputeOpened, NOW + 1).await.unwrap(),
+            ReverseOutcome::RecordedPending
+        );
+        let recorded = order(&db, &pending.id).await;
+        assert_eq!(recorded.state, OrderState::Pending);
+        assert!(recorded.dispute_open);
+        assert!(recorded.reversal_pending.is_none());
+        assert_eq!(badge(&db, "u1").await, None);
+
+        assert_eq!(
+            fulfil_order(&db, &stripe, &s, &pending.id, &session, NOW + 2)
+                .await
+                .unwrap(),
+            FulfilOutcome::Fulfilled
+        );
+        let m = membership(&db, "u1").await;
+        assert_eq!((m.number, m.tier), (1, CipherTier::T149));
+        assert_eq!(m.disputed_orders, vec![pending.id.clone()]);
+        assert_eq!(badge(&db, "u1").await, None);
+
+        // A duplicate completion re-asserts the badge: still hidden
+        assert_eq!(
+            fulfil_order(&db, &stripe, &s, &pending.id, &session, NOW + 3)
+                .await
+                .unwrap(),
+            FulfilOutcome::AlreadyFulfilled
+        );
+        assert_eq!(badge(&db, "u1").await, None);
+
+        assert_eq!(
+            reverse(ReverseKind::DisputeWon, NOW + 4).await.unwrap(),
+            ReverseOutcome::Applied
+        );
+        assert_eq!(badge(&db, "u1").await, badge_of(1, CipherTier::T149));
+        drop_db(&db).await;
+    }
+
+    #[tokio::test]
+    async fn a_dispute_won_before_completion_badges_normally() {
+        let db = test_db().await;
+        let stripe = MockStripe::new();
+        let s = settings();
+        insert_user(&db, "u1").await;
+
+        let pending = checkout(&db, &stripe, &s, "u1", CipherTier::T99, NOW).await;
+        let session = pay(&stripe, &pending, "pi_1");
+        for kind in [ReverseKind::DisputeOpened, ReverseKind::DisputeWon] {
+            assert_eq!(
+                reverse_order(&db, &stripe, &s, &pending.id, kind, NOW)
+                    .await
+                    .unwrap(),
+                ReverseOutcome::RecordedPending
+            );
+            assert_eq!(badge(&db, "u1").await, None);
+        }
+        assert!(!order(&db, &pending.id).await.dispute_open);
+
+        assert_eq!(
+            fulfil_order(&db, &stripe, &s, &pending.id, &session, NOW + 1)
+                .await
+                .unwrap(),
+            FulfilOutcome::Fulfilled
+        );
+        assert!(membership(&db, "u1").await.disputed_orders.is_empty());
+        assert_eq!(badge(&db, "u1").await, badge_of(1, CipherTier::T99));
+        drop_db(&db).await;
+    }
+
+    #[tokio::test]
+    async fn a_dispute_lost_before_completion_never_shows_the_badge() {
+        let db = test_db().await;
+        let stripe = MockStripe::new();
+        let s = settings();
+        insert_user(&db, "u1").await;
+
+        let pending = checkout(&db, &stripe, &s, "u1", CipherTier::T99, NOW).await;
+        let session = pay(&stripe, &pending, "pi_1");
+        assert_eq!(
+            reverse_order(&db, &stripe, &s, &pending.id, ReverseKind::DisputeLost, NOW)
+                .await
+                .unwrap(),
+            ReverseOutcome::RecordedPending
+        );
+        let recorded = order(&db, &pending.id).await;
+        assert!(recorded.dispute_open);
+        assert_eq!(
+            recorded.reversal_pending,
+            Some(ReversalPending::DisputeLost)
+        );
+
+        assert_eq!(
+            fulfil_order(&db, &stripe, &s, &pending.id, &session, NOW + 1)
+                .await
+                .unwrap(),
+            FulfilOutcome::Fulfilled
+        );
+        let m = membership(&db, "u1").await;
+        assert!(!m.is_active());
+        assert_eq!(m.revoke_reason, Some(CipherRevokeReason::DisputeLost));
+        assert!(m.disputed_orders.is_empty());
+        assert_eq!(order(&db, &pending.id).await.state, OrderState::Refunded);
+        assert_eq!(badge(&db, "u1").await, None);
+        assert_eq!(stripe.call_count("create_refund"), 0);
+        drop_db(&db).await;
+    }
+
+    #[tokio::test]
+    async fn a_disputed_upgrade_keeps_the_number_and_hides_the_badge_until_won() {
+        let db = test_db().await;
+        let stripe = MockStripe::new();
+        let s = settings();
+        insert_user(&db, "u1").await;
+        let first = buy(&db, &stripe, &s, "u1", CipherTier::T99, "pi_new", NOW).await;
+        assert_eq!(badge(&db, "u1").await, badge_of(1, CipherTier::T99));
+
+        // The upgrade's own payment is disputed before its completion
+        let upgrade = checkout(&db, &stripe, &s, "u1", CipherTier::T299, NOW).await;
+        let session = pay(&stripe, &upgrade, "pi_up");
+        let reverse = |kind, at| reverse_order(&db, &stripe, &s, &upgrade.id, kind, at);
+        assert_eq!(
+            reverse(ReverseKind::DisputeOpened, NOW + 1).await.unwrap(),
+            ReverseOutcome::RecordedPending
+        );
+        // The existing badge is untouched until the upgrade applies
+        assert_eq!(badge(&db, "u1").await, badge_of(1, CipherTier::T99));
+
+        assert_eq!(
+            fulfil_order(&db, &stripe, &s, &upgrade.id, &session, NOW + 2)
+                .await
+                .unwrap(),
+            FulfilOutcome::Fulfilled
+        );
+        let m = membership(&db, "u1").await;
+        assert_eq!((m.number, m.tier), (1, CipherTier::T299));
+        assert_eq!(m.orders, vec![first.id.clone(), upgrade.id.clone()]);
+        assert_eq!(m.disputed_orders, vec![upgrade.id.clone()]);
+        assert_eq!(badge(&db, "u1").await, None);
+        assert_eq!(stripe.call_count("create_refund"), 0);
+
+        assert_eq!(
+            reverse(ReverseKind::DisputeWon, NOW + 3).await.unwrap(),
+            ReverseOutcome::Applied
+        );
+        assert_eq!(badge(&db, "u1").await, badge_of(1, CipherTier::T299));
+        drop_db(&db).await;
+    }
+
+    #[tokio::test]
+    async fn a_dispute_after_a_crashed_membership_write_hides_the_badge_at_once() {
+        let db = test_db().await;
+        let stripe = MockStripe::new();
+        let s = settings();
+        insert_user(&db, "u1").await;
+
+        let pending = checkout(&db, &stripe, &s, "u1", CipherTier::T99, NOW).await;
+        pay(&stripe, &pending, "pi_1");
+        // A worker marked it Paid, wrote the membership (undisputed then),
+        // published the badge and died holding the lease
+        crash_after(&db, &pending.id, |o| {
+            o.state = OrderState::Paid;
+            o.payment_intent_id = Some("pi_1".to_string());
+        })
+        .await;
+        let number = db
+            .claim_cipher_number(&pending.id, s.cap)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(db
+            .insert_cipher_membership(&CipherMembership {
+                user_id: "u1".to_string(),
+                number,
+                tier: CipherTier::T99,
+                prot_grant: 16_500,
+                orders: vec![pending.id.clone()],
+                disputed_orders: vec![],
+                granted_at: NOW,
+                revoked_at: None,
+                revoke_reason: None,
+                prot_posted_at: None,
+                version: 0,
+            })
+            .await
+            .unwrap());
+        sync_user_badge(&db, "u1").await.unwrap();
+        assert_eq!(badge(&db, "u1").await, badge_of(number, CipherTier::T99));
+
+        // The dispute opens on the Paid order once the lease ran out: it is
+        // recorded on the order and mirrored into the membership at once
         assert_eq!(
             reverse_order(
                 &db,
@@ -2235,27 +2900,153 @@ mod tests {
             )
             .await
             .unwrap(),
-            ReverseOutcome::Busy
+            ReverseOutcome::RecordedPending
         );
+        assert!(order(&db, &pending.id).await.dispute_open);
         assert_eq!(
-            fulfil_order(&db, &stripe, &s, &pending.id, &session, LATER + 1)
+            membership(&db, "u1").await.disputed_orders,
+            vec![pending.id.clone()]
+        );
+        assert_eq!(badge(&db, "u1").await, None);
+
+        // The resume finds the order applied and keeps it listed
+        assert_eq!(
+            resume_order(&db, &stripe, &s, &pending.id, LATER + 1)
                 .await
                 .unwrap(),
             FulfilOutcome::Fulfilled
         );
         assert_eq!(
-            reverse_order(
-                &db,
-                &stripe,
-                &s,
-                &pending.id,
-                ReverseKind::DisputeOpened,
-                LATER + 2
-            )
+            membership(&db, "u1").await.disputed_orders,
+            vec![pending.id.clone()]
+        );
+        assert_eq!(badge(&db, "u1").await, None);
+        drop_db(&db).await;
+    }
+
+    #[tokio::test]
+    async fn a_dispute_is_read_inside_the_lease_and_must_be_on_the_orders_payment() {
+        let db = test_db().await;
+        let stripe = MockStripe::new();
+        let s = settings();
+        insert_user(&db, "u1").await;
+        let pending = checkout(&db, &stripe, &s, "u1", CipherTier::T99, NOW).await;
+        let session = pay(&stripe, &pending, "pi_1");
+        let dispute = |payment_intent: &str, status: &str| Dispute {
+            id: "dp_1".to_string(),
+            status: Some(status.to_string()),
+            payment_intent: Some(payment_intent.to_string()),
+        };
+        let intent_naming = |order_id: &str| PaymentIntent {
+            id: "pi_1".to_string(),
+            metadata_order_id: Some(order_id.to_string()),
+            ..Default::default()
+        };
+
+        // Not paid on our side yet: the disputed payment must name the order
+        stripe.set_dispute(dispute("pi_1", "needs_response"));
+        stripe.set_payment_intent(intent_naming("01OTHERORDER00000000000000"));
+        assert!(reverse_dispute(&db, &stripe, &s, &pending.id, "dp_1", NOW)
             .await
-            .unwrap(),
+            .is_err());
+        let untouched = order(&db, &pending.id).await;
+        assert!(!untouched.dispute_open);
+        assert!(untouched.lease_until.is_none());
+
+        stripe.set_payment_intent(intent_naming(&pending.id));
+        assert_eq!(
+            reverse_dispute(&db, &stripe, &s, &pending.id, "dp_1", NOW + 1)
+                .await
+                .unwrap(),
+            ReverseOutcome::RecordedPending
+        );
+        assert!(order(&db, &pending.id).await.dispute_open);
+
+        // A held lease: Busy, and Stripe is not asked
+        let lookups = stripe.call_count("get_dispute");
+        let held = db
+            .acquire_payment_order_lease(&pending.id, NOW + 2, NOW + 2 + LEASE_MS)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            reverse_dispute(&db, &stripe, &s, &pending.id, "dp_1", NOW + 3)
+                .await
+                .unwrap(),
+            ReverseOutcome::Busy
+        );
+        assert_eq!(stripe.call_count("get_dispute"), lookups);
+        db.release_payment_order_lease(&pending.id, held.lease_until.unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            fulfil_order(&db, &stripe, &s, &pending.id, &session, NOW + 4)
+                .await
+                .unwrap(),
+            FulfilOutcome::Fulfilled
+        );
+        assert_eq!(badge(&db, "u1").await, None);
+
+        // Paid: the stored payment must be the disputed one
+        stripe.set_dispute(dispute("pi_other", "won"));
+        assert!(
+            reverse_dispute(&db, &stripe, &s, &pending.id, "dp_1", NOW + 5)
+                .await
+                .is_err()
+        );
+        assert_eq!(badge(&db, "u1").await, None);
+
+        // Unknown at Stripe: an error, never a guess
+        assert!(
+            reverse_dispute(&db, &stripe, &s, &pending.id, "dp_unknown", NOW + 6)
+                .await
+                .is_err()
+        );
+        assert_eq!(badge(&db, "u1").await, None);
+
+        stripe.set_dispute(dispute("pi_1", "won"));
+        assert_eq!(
+            reverse_dispute(&db, &stripe, &s, &pending.id, "dp_1", NOW + 7)
+                .await
+                .unwrap(),
             ReverseOutcome::Applied
         );
+        assert_eq!(badge(&db, "u1").await, badge_of(1, CipherTier::T99));
+        drop_db(&db).await;
+    }
+
+    #[tokio::test]
+    async fn a_refund_on_an_expired_order_is_honoured_by_a_late_fulfil() {
+        let db = test_db().await;
+        let stripe = MockStripe::new();
+        let s = settings();
+        insert_user(&db, "u1").await;
+
+        let pending = checkout(&db, &stripe, &s, "u1", CipherTier::T99, NOW).await;
+        let session = pay(&stripe, &pending, "pi_1");
+        expire_order(&db, &pending.id, NOW + 1).await.unwrap();
+        assert_eq!(order(&db, &pending.id).await.state, OrderState::Expired);
+
+        assert_eq!(
+            reverse_order(&db, &stripe, &s, &pending.id, ReverseKind::Refund, NOW + 2)
+                .await
+                .unwrap(),
+            ReverseOutcome::RecordedPending
+        );
+        assert_eq!(
+            order(&db, &pending.id).await.reversal_pending,
+            Some(ReversalPending::Refund)
+        );
+
+        assert_eq!(
+            fulfil_order(&db, &stripe, &s, &pending.id, &session, NOW + 3)
+                .await
+                .unwrap(),
+            FulfilOutcome::Fulfilled
+        );
+        assert_eq!(order(&db, &pending.id).await.state, OrderState::Refunded);
+        assert!(!membership(&db, "u1").await.is_active());
         assert_eq!(badge(&db, "u1").await, None);
         drop_db(&db).await;
     }
@@ -2396,6 +3187,7 @@ mod tests {
             state: OrderState::Creating,
             void_reason: None,
             reversal_pending: None,
+            dispute_open: false,
             lease_until: None,
             version: 0,
             created_at: NOW,
@@ -2482,17 +3274,29 @@ mod tests {
         let pending = checkout(&db, &stripe, &s, "u1", CipherTier::T149, NOW).await;
         let paid = pay(&stripe, &pending, "pi_1");
 
+        // Not provably ours (the wrong amount or currency on our own paid
+        // session is refunded instead: see the AmountMismatch tests)
         let cases = [
             CheckoutSession {
-                amount_total: Some(100),
+                livemode: true,
                 ..paid.clone()
             },
+            // The other livemode outranks a wrong amount: not ours to settle
             CheckoutSession {
+                livemode: true,
                 currency: Some("eur".to_string()),
                 ..paid.clone()
             },
+            // Wrong amount and no metadata naming the order
             CheckoutSession {
-                livemode: true,
+                amount_total: Some(100),
+                metadata_order_id: None,
+                ..paid.clone()
+            },
+            // Our session, the wrong amount, but nothing was paid
+            CheckoutSession {
+                amount_total: Some(100),
+                payment_status: Some("unpaid".to_string()),
                 ..paid.clone()
             },
             CheckoutSession {
@@ -2559,6 +3363,96 @@ mod tests {
             order(&db, &pending.id).await.payment_intent_id.as_deref(),
             Some("pi_1")
         );
+        drop_db(&db).await;
+    }
+
+    #[tokio::test]
+    async fn our_session_paid_in_another_currency_is_voided_and_refunded_once() {
+        let db = test_db().await;
+        let stripe = MockStripe::new();
+        let s = settings();
+        insert_user(&db, "u1").await;
+
+        let pending = checkout(&db, &stripe, &s, "u1", CipherTier::T149, NOW).await;
+        let mut session = pay(&stripe, &pending, "pi_eur");
+        // Stripe converted the price (e.g. Adaptive Pricing): settled in EUR
+        session.currency = Some("eur".to_string());
+        session.amount_total = Some(13_700);
+        stripe.set_session(session.clone());
+
+        assert_eq!(
+            fulfil_order(&db, &stripe, &s, &pending.id, &session, NOW)
+                .await
+                .unwrap(),
+            FulfilOutcome::Voided(VoidReason::AmountMismatch)
+        );
+        let voided = order(&db, &pending.id).await;
+        assert_eq!(voided.state, OrderState::Voided);
+        assert_eq!(voided.void_reason, Some(VoidReason::AmountMismatch));
+        assert_eq!(voided.payment_intent_id.as_deref(), Some("pi_eur"));
+        assert!(voided.lease_until.is_none());
+        assert_eq!(
+            refund_keys(&stripe),
+            vec![("pi_eur".to_string(), Some(format!("void-{}", pending.id)))]
+        );
+        assert_eq!(stripe.refund_count_for("pi_eur"), 1);
+        assert!(db.fetch_cipher_membership("u1").await.unwrap().is_none());
+        assert_eq!(db.count_claimed_cipher_numbers().await.unwrap(), 0);
+        assert_eq!(badge(&db, "u1").await, None);
+
+        // Redelivered, and resumed from Stripe's copy: no second refund
+        assert_eq!(
+            fulfil_order(&db, &stripe, &s, &pending.id, &session, NOW + MINUTE)
+                .await
+                .unwrap(),
+            FulfilOutcome::Voided(VoidReason::AmountMismatch)
+        );
+        assert_eq!(
+            resume_order(&db, &stripe, &s, &pending.id, NOW + 2 * MINUTE)
+                .await
+                .unwrap(),
+            FulfilOutcome::Voided(VoidReason::AmountMismatch)
+        );
+        assert_eq!(stripe.call_count("create_refund"), 1);
+        assert_eq!(stripe.refund_count(), 1);
+
+        // Our own refund comes back as charge.refunded: nothing to do
+        assert_eq!(
+            reverse_order(
+                &db,
+                &stripe,
+                &s,
+                &pending.id,
+                ReverseKind::Refund,
+                NOW + 3 * MINUTE
+            )
+            .await
+            .unwrap(),
+            ReverseOutcome::NoOp
+        );
+        drop_db(&db).await;
+    }
+
+    #[tokio::test]
+    async fn our_session_paid_in_another_amount_is_voided_and_refunded() {
+        let db = test_db().await;
+        let stripe = MockStripe::new();
+        let s = settings();
+        insert_user(&db, "u1").await;
+
+        let pending = checkout(&db, &stripe, &s, "u1", CipherTier::T99, NOW).await;
+        let mut session = pay(&stripe, &pending, "pi_short");
+        session.amount_total = Some(100);
+        stripe.set_session(session.clone());
+
+        assert_eq!(
+            fulfil_order(&db, &stripe, &s, &pending.id, &session, NOW)
+                .await
+                .unwrap(),
+            FulfilOutcome::Voided(VoidReason::AmountMismatch)
+        );
+        assert_eq!(stripe.refund_count_for("pi_short"), 1);
+        assert!(db.fetch_cipher_membership("u1").await.unwrap().is_none());
         drop_db(&db).await;
     }
 
@@ -2693,6 +3587,70 @@ mod tests {
         );
         assert_eq!(stripe.refund_count_for("pi_1"), 1);
         assert_eq!(db.count_claimed_cipher_numbers().await.unwrap(), 0);
+        drop_db(&db).await;
+    }
+
+    #[tokio::test]
+    async fn a_membership_written_by_a_fulfil_racing_the_deletion_is_deleted() {
+        let db = test_db().await;
+        let stripe = MockStripe::new();
+        let s = settings();
+        insert_user(&db, "u1").await;
+        insert_user(&db, "u2").await;
+        let other = buy(&db, &stripe, &s, "u2", CipherTier::T99, "pi_other", NOW).await;
+
+        let pending = checkout(&db, &stripe, &s, "u1", CipherTier::T149, NOW).await;
+        pay(&stripe, &pending, "pi_1");
+        // A fulfilment holds the lease while the account is deleted: the
+        // deletion skips the order, unlinks it and deletes the membership
+        crash_after(&db, &pending.id, |o| {
+            o.state = OrderState::Paid;
+            o.payment_intent_id = Some("pi_1".to_string());
+        })
+        .await;
+        on_account_deleted(&db, &stripe, &s, "u1", NOW + 1)
+            .await
+            .unwrap();
+        assert!(order(&db, &pending.id).await.user_id.is_none());
+
+        // ... and only then does that fulfilment's membership write land
+        let number = db
+            .claim_cipher_number(&pending.id, s.cap)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(db
+            .insert_cipher_membership(&CipherMembership {
+                user_id: "u1".to_string(),
+                number,
+                tier: CipherTier::T149,
+                prot_grant: 33_000,
+                orders: vec![pending.id.clone()],
+                disputed_orders: vec![],
+                granted_at: NOW + 1,
+                revoked_at: None,
+                revoke_reason: None,
+                prot_posted_at: None,
+                version: 0,
+            })
+            .await
+            .unwrap());
+
+        // The resume voids and refunds the order and removes that row
+        assert_eq!(
+            resume_order(&db, &stripe, &s, &pending.id, LATER)
+                .await
+                .unwrap(),
+            FulfilOutcome::Voided(VoidReason::AccountDeleted)
+        );
+        assert!(db.fetch_cipher_membership("u1").await.unwrap().is_none());
+        assert_eq!(stripe.refund_count_for("pi_1"), 1);
+        let voided = order(&db, &pending.id).await;
+        assert_eq!(voided.state, OrderState::Voided);
+        assert_eq!(voided.void_reason, Some(VoidReason::AccountDeleted));
+
+        // Another member is untouched
+        assert_eq!(membership(&db, "u2").await.orders, vec![other.id]);
         drop_db(&db).await;
     }
 

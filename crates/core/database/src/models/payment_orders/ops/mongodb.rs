@@ -122,11 +122,13 @@ impl AbstractPaymentOrders for MongoDb {
 
     async fn fetch_payment_orders_reversal_pending(
         &self,
+        states: &[OrderState],
         now: i64,
         limit: i64,
     ) -> Result<Vec<PaymentOrder>> {
         self.col::<PaymentOrder>(COL)
             .find(doc! {
+                "state": { "$in": states_bson(states)? },
                 "reversal_pending": { "$exists": true },
                 "$or": lease_free(now)
             })
@@ -322,6 +324,7 @@ mod tests {
             state: OrderState::Creating,
             void_reason: None,
             reversal_pending: None,
+            dispute_open: false,
             lease_until: None,
             version: 0,
             created_at: 1_788_264_000_000,
@@ -376,6 +379,7 @@ mod tests {
             state: OrderState::Voided,
             void_reason: Some(VoidReason::DisputeOpen),
             reversal_pending: Some(ReversalPending::DisputeLost),
+            dispute_open: true,
             lease_until: Some(1_788_264_120_000),
             paid_at: Some(1_788_264_060_000),
             fulfilled_at: Some(1_788_264_070_000),
@@ -385,8 +389,17 @@ mod tests {
         let doc = to_document(&full).unwrap();
         assert_eq!(doc.get_str("void_reason").unwrap(), "DisputeOpen");
         assert_eq!(doc.get_str("reversal_pending").unwrap(), "DisputeLost");
+        assert!(doc.get_bool("dispute_open").unwrap());
         assert_eq!(doc.get_i64("lease_until").unwrap(), 1_788_264_120_000);
         assert_eq!(from_document::<PaymentOrder>(doc).unwrap(), full);
+
+        // Appended variant, stored by name like the others
+        let mismatch = to_document(&PaymentOrder {
+            void_reason: Some(VoidReason::AmountMismatch),
+            ..full
+        })
+        .unwrap();
+        assert_eq!(mismatch.get_str("void_reason").unwrap(), "AmountMismatch");
     }
 
     #[test]

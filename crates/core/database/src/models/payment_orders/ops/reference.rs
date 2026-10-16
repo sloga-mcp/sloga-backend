@@ -116,13 +116,18 @@ impl AbstractPaymentOrders for ReferenceDb {
 
     async fn fetch_payment_orders_reversal_pending(
         &self,
+        states: &[OrderState],
         now: i64,
         limit: i64,
     ) -> Result<Vec<PaymentOrder>> {
         let orders = self.payment_orders.lock().await;
         let mut rows: Vec<PaymentOrder> = orders
             .values()
-            .filter(|row| row.reversal_pending.is_some() && lease_free(row, now))
+            .filter(|row| {
+                states.contains(&row.state)
+                    && row.reversal_pending.is_some()
+                    && lease_free(row, now)
+            })
             .cloned()
             .collect();
         sort_oldest_first(&mut rows);

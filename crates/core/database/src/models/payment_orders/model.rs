@@ -40,6 +40,9 @@ auto_derived!(
         DisputeOpen,
         /// The buyer deleted their account before fulfilment
         AccountDeleted,
+        /// Our own session was paid, but not in the order's amount or
+        /// currency
+        AmountMismatch,
     }
 
     /// A reversal that arrived before fulfilment finished; fulfilment
@@ -94,6 +97,13 @@ auto_derived!(
         /// A reversal still to be applied once fulfilment finishes
         #[serde(skip_serializing_if = "Option::is_none", default)]
         pub reversal_pending: Option<ReversalPending>,
+        /// A dispute on the payment is open. Set and cleared under the lease
+        /// in every state before fulfilment as well as after it; fulfilment
+        /// lists the order in the membership's `disputed_orders` in the same
+        /// write that adds it, so no badge is published while it is set.
+        /// Left out of the stored document when false (absent reads false).
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        pub dispute_open: bool,
         /// Epoch ms until which a worker holds this order; unset when free
         #[serde(skip_serializing_if = "Option::is_none", default)]
         pub lease_until: Option<i64>,

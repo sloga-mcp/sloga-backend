@@ -41,11 +41,13 @@ pub trait AbstractPaymentOrders: Sync + Send {
         limit: i64,
     ) -> Result<Vec<PaymentOrder>>;
 
-    /// Orders with `reversal_pending` set whose lease is free (`lease_until`
-    /// unset or `< now`), oldest `created_at` first, up to `limit`
-    /// (0 = no limit)
+    /// Orders in any of `states` with `reversal_pending` set whose lease is
+    /// free (`lease_until` unset or `< now`), oldest `created_at` first, up
+    /// to `limit` (0 = no limit). The state filter runs in the query, so
+    /// rows the caller cannot act on never fill the batch.
     async fn fetch_payment_orders_reversal_pending(
         &self,
+        states: &[OrderState],
         now: i64,
         limit: i64,
     ) -> Result<Vec<PaymentOrder>>;
@@ -125,6 +127,7 @@ mod tests {
             state,
             void_reason: None,
             reversal_pending: None,
+            dispute_open: false,
             lease_until: None,
             version: 0,
             created_at,
@@ -529,6 +532,12 @@ mod tests {
                     lease_until: Some(400),
                     ..order("rev_lapsed", "u3", OrderState::Paid, 60)
                 },
+                // Too young for the by-state cutoff; only the reversal
+                // queries that name Pending see it
+                PaymentOrder {
+                    reversal_pending: Some(ReversalPending::Refund),
+                    ..order("rev_pending", "u4", OrderState::Pending, 150)
+                },
             ] {
                 db.insert_payment_order(&row).await.unwrap();
             }
@@ -559,27 +568,54 @@ mod tests {
                 .is_empty());
 
             // Free leases only: unset, or run out before `now`
+            let paid_or_fulfilled = [OrderState::Paid, OrderState::Fulfilled];
             assert_eq!(
                 ids(db
-                    .fetch_payment_orders_reversal_pending(500, 0)
+                    .fetch_payment_orders_reversal_pending(&paid_or_fulfilled, 500, 0)
                     .await
                     .unwrap()),
                 ["rev_free", "rev_lapsed"]
             );
             assert_eq!(
                 ids(db
-                    .fetch_payment_orders_reversal_pending(1_001, 0)
+                    .fetch_payment_orders_reversal_pending(&paid_or_fulfilled, 1_001, 0)
                     .await
                     .unwrap()),
                 ["rev_held", "rev_free", "rev_lapsed"]
             );
             assert_eq!(
                 ids(db
-                    .fetch_payment_orders_reversal_pending(1_001, 1)
+                    .fetch_payment_orders_reversal_pending(&paid_or_fulfilled, 1_001, 1)
                     .await
                     .unwrap()),
                 ["rev_held"]
             );
+
+            // Only the named states, filtered before the limit
+            assert_eq!(
+                ids(db
+                    .fetch_payment_orders_reversal_pending(&[OrderState::Fulfilled], 1_001, 1)
+                    .await
+                    .unwrap()),
+                ["rev_held"]
+            );
+            assert!(db
+                .fetch_payment_orders_reversal_pending(&[OrderState::Fulfilled], 500, 0)
+                .await
+                .unwrap()
+                .is_empty());
+            assert_eq!(
+                ids(db
+                    .fetch_payment_orders_reversal_pending(&[OrderState::Pending], 500, 0)
+                    .await
+                    .unwrap()),
+                ["rev_pending"]
+            );
+            assert!(db
+                .fetch_payment_orders_reversal_pending(&[], 1_001, 0)
+                .await
+                .unwrap()
+                .is_empty());
 
             assert_eq!(
                 ids(db

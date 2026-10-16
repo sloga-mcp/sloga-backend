@@ -253,10 +253,14 @@ pub trait StripeApi: Send + Sync {
 /// Form body for `POST /v1/checkout/sessions`, in Stripe's bracket notation.
 /// Card only: no delayed payment methods, so `checkout.session.completed`
 /// with `payment_status=paid` is the single success signal.
+/// Adaptive Pricing is off, so the buyer always pays in the order's
+/// currency (a session settled in another currency would not match the
+/// order, and fulfilment refunds it).
 pub fn checkout_form(p: &CheckoutSessionParams) -> Vec<(String, String)> {
     [
         ("mode", "payment".to_string()),
         ("payment_method_types[0]", "card".to_string()),
+        ("adaptive_pricing[enabled]", "false".to_string()),
         ("line_items[0][quantity]", "1".to_string()),
         ("line_items[0][price_data][currency]", p.currency.clone()),
         (
@@ -710,6 +714,8 @@ mod mock {
         /// idempotency key -> (payment intent, refund)
         refund_keys: HashMap<String, (String, Refund)>,
         next_refund: u64,
+        /// Status of refunds created from now on (None: `succeeded`)
+        refund_status: Option<String>,
         disputes: HashMap<String, Dispute>,
     }
 
@@ -780,7 +786,8 @@ mod mock {
     ///   params). Replaying an idempotency key with the same params returns
     ///   the original response; with different params it is a 400
     ///   `idempotency_error`.
-    /// - `create_refund` creates `re_test_<n>` (`succeeded`). Replaying a key
+    /// - `create_refund` creates `re_test_<n>` (`succeeded` unless
+    ///   [`MockStripe::set_refund_status`] says otherwise). Replaying a key
     ///   returns the same refund without creating another; refunding a
     ///   payment intent that already has a refund under a different key is a
     ///   400 `charge_already_refunded` (every refund here is a full refund).
@@ -835,6 +842,13 @@ mod mock {
         /// `livemode` of sessions created from now on (default false)
         pub fn set_livemode(&self, livemode: bool) {
             self.state().livemode = livemode;
+        }
+
+        /// Status of refunds created from now on (default `succeeded`). A
+        /// `failed` or `canceled` refund is kept under its idempotency key
+        /// (a replay returns it again) but is not counted as a refund.
+        pub fn set_refund_status(&self, status: &str) {
+            self.state().refund_status = Some(status.to_string());
         }
 
         /// Insert or replace a session (e.g. mark one `complete` / `paid`
@@ -1014,13 +1028,22 @@ mod mock {
                 }
 
                 state.next_refund += 1;
+                let status = state
+                    .refund_status
+                    .clone()
+                    .unwrap_or_else(|| "succeeded".to_string());
+                let moved_money = !matches!(status.as_str(), "failed" | "canceled");
                 let refund = Refund {
                     id: format!("re_test_{}", state.next_refund),
-                    status: Some("succeeded".to_string()),
+                    status: Some(status),
                 };
-                state
-                    .refunds
-                    .push((payment_intent.to_string(), refund.clone()));
+                // A failed or canceled refund returned nothing: it does not
+                // count and does not block a later refund
+                if moved_money {
+                    state
+                        .refunds
+                        .push((payment_intent.to_string(), refund.clone()));
+                }
                 state.refund_keys.insert(
                     idempotency_key.to_string(),
                     (payment_intent.to_string(), refund.clone()),
@@ -1112,6 +1135,8 @@ mod tests {
             vec![
                 ("mode", "payment"),
                 ("payment_method_types[0]", "card"),
+                // Keeps the session in the order's currency
+                ("adaptive_pricing[enabled]", "false"),
                 ("line_items[0][quantity]", "1"),
                 ("line_items[0][price_data][currency]", "usd"),
                 ("line_items[0][price_data][unit_amount]", "9900"),
