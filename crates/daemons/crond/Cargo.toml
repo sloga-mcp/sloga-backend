@@ -29,6 +29,11 @@ futures-lite = { workspace = true }
 # default in reqwest 0.13 — required for .query(), don't rely on
 # workspace feature unification
 reqwest = { workspace = true, features = ["json", "query"] }
+# The Stoat importer reads its bot's server list from one events (WebSocket)
+# session. Frames only: the connection is a reqwest HTTP/1.1 upgrade, so it
+# keeps reqwest's TLS, proxy and https-only settings. Already in the lock
+# through livekit-api.
+tokio-tungstenite = { version = "0.29", default-features = false, features = ["handshake"] }
 
 # Processing
 serde_json = { workspace = true }
@@ -62,6 +67,13 @@ revolt-presence = { workspace = true }
 revolt-models = { workspace = true }
 
 [dev-dependencies]
+# The Stoat reconcile tests run on the driver TEST_DB names and drop their
+# throwaway Mongo database through `TestDatabaseGuard`. Dev-only, so no code
+# able to drop a database reaches the crond binary.
+revolt-database = { workspace = true, features = ["tasks", "mongodb", "voice", "test-teardown"] }
 # `#[tokio::test]` needs these; without them the crate's tests only build when
 # another workspace crate happens to unify the features in.
 tokio = { workspace = true, features = ["rt", "macros", "time"] }
+# Proves crond's log filter silences the WebSocket frame traces (main.rs);
+# the version pretty_env_logger already uses.
+env_logger = "0.7"

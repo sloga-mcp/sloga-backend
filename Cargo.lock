@@ -7089,6 +7089,7 @@ dependencies = [
 name = "revolt-crond"
 version = "0.13.7"
 dependencies = [
+ "env_logger",
  "futures",
  "futures-lite",
  "iso8601-timestamp",
@@ -7109,6 +7110,7 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "tokio",
+ "tokio-tungstenite",
  "ulid",
 ]
 

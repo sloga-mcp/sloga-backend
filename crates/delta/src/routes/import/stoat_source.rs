@@ -627,6 +627,7 @@ pub(super) mod fake_upstream {
                 cdn_url: "https://cdn.stoat.example".to_string(),
                 bot_id: "01BOT000000000000000000000".to_string(),
                 bot_token: BOT_TOKEN.to_string(),
+                reconcile_after_hours: 24,
             }
         }
     }

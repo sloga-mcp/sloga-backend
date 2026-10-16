@@ -89,6 +89,9 @@ pub trait AbstractDiscordImportJobs: Sync + Send {
     /// the user re-adds the bot and retries. Meant
     /// for source kinds; template and sticker rows never carry
     /// `source_server_id`, so they never match.
+    ///
+    /// An empty `except_job_id` excludes nothing (job ids are ULIDs): crond's
+    /// bot reconcile asks that way, having no job of its own.
     async fn has_other_active_job_for_source(
         &self,
         kind: &ImportJobKind,
@@ -747,6 +750,76 @@ mod tests {
                 .unwrap());
             assert!(!db
                 .has_other_active_job_for_source(&stoat, source, &mine.id)
+                .await
+                .unwrap());
+        });
+    }
+
+    /// crond's bot reconcile asks with no job of its own: an empty exclusion
+    /// must count every active job on the source, and nothing else.
+    #[tokio::test]
+    async fn an_empty_exclusion_counts_every_active_job_on_the_source() {
+        database_test!(|db| async move {
+            let source = "01SRCSERVER00000000000000DD";
+            let stoat = ImportJobKind::StoatServer;
+            assert!(!db
+                .has_other_active_job_for_source(&stoat, source, "")
+                .await
+                .unwrap());
+
+            // Terminal jobs, another kind on the same id, and the same kind
+            // on another source: none of them hold the bot.
+            for (user, status) in [
+                ("01USER0000000000000000EEX1", ImportStatus::Completed),
+                ("01USER0000000000000000EEX2", ImportStatus::Failed),
+            ] {
+                let mut done = source_job(user, stoat.clone(), source);
+                done.status = status;
+                done.stage = ImportStage::Done;
+                db.insert_discord_import_job(&done).await.unwrap();
+            }
+            let fluxer = source_job(
+                "01USER0000000000000000EEX3",
+                ImportJobKind::FluxerServer,
+                source,
+            );
+            db.insert_discord_import_job(&fluxer).await.unwrap();
+            let elsewhere = source_job(
+                "01USER0000000000000000EEX4",
+                stoat.clone(),
+                "01SRCSERVER00000000000000EE",
+            );
+            db.insert_discord_import_job(&elsewhere).await.unwrap();
+            assert!(!db
+                .has_other_active_job_for_source(&stoat, source, "")
+                .await
+                .unwrap());
+
+            // A Queued job holds it, then Running, and not once it finishes.
+            let queued = source_job("01USER0000000000000000EEX5", stoat.clone(), source);
+            db.insert_discord_import_job(&queued).await.unwrap();
+            assert!(db
+                .has_other_active_job_for_source(&stoat, source, "")
+                .await
+                .unwrap());
+
+            let mut running = queued.clone();
+            running.status = ImportStatus::Running;
+            db.save_discord_import_job(&running).await.unwrap();
+            assert!(db
+                .has_other_active_job_for_source(&stoat, source, "")
+                .await
+                .unwrap());
+
+            let mut finished = running.clone();
+            finished.status = ImportStatus::Completed;
+            finished.stage = ImportStage::Done;
+            assert!(db
+                .save_discord_import_job_if_active(&finished)
+                .await
+                .unwrap());
+            assert!(!db
+                .has_other_active_job_for_source(&stoat, source, "")
                 .await
                 .unwrap());
         });
