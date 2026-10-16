@@ -4,6 +4,8 @@ use rocket::serde::json::Json;
 use serde::Serialize;
 use std::collections::HashMap;
 
+use super::import::ImportSource;
+
 /// # hCaptcha Configuration
 #[derive(Serialize, JsonSchema, Debug)]
 pub struct CaptchaFeature {
@@ -71,21 +73,23 @@ pub struct ImportSourcesFeature {
 }
 
 /// Which import sources to advertise. A source is advertised only when its
-/// import can actually run AND the client has everything it needs to build
-/// the add-bot link; otherwise its key is left out.
+/// import can actually run (the same `ready()` the import routes check,
+/// which includes an `https://` API URL) AND the client has everything it
+/// needs to build the add-bot link; otherwise its key is left out.
 pub fn import_sources_feature(config: &Settings) -> ImportSourcesFeature {
     let import = &config.api.import;
     let stoat = &import.stoat;
+    let stoat_advertised =
+        ImportSource::Stoat.ready(import) && !stoat.app_url.is_empty() && !stoat.bot_id.is_empty();
 
     ImportSourcesFeature {
-        stoat: (import.stoat_ready() && !stoat.app_url.is_empty() && !stoat.bot_id.is_empty())
-            .then(|| ImportBotSourceFeature {
-                add_bot_url: format!(
-                    "{}/bot/{}",
-                    stoat.app_url.trim_end_matches('/'),
-                    stoat.bot_id
-                ),
-            }),
+        stoat: stoat_advertised.then(|| ImportBotSourceFeature {
+            add_bot_url: format!(
+                "{}/bot/{}",
+                stoat.app_url.trim_end_matches('/'),
+                stoat.bot_id
+            ),
+        }),
     }
 }
 
@@ -461,7 +465,7 @@ mod test {
     #[test]
     fn import_sources_is_an_empty_object_when_dark() {
         type Darken = fn(&mut revolt_config::Settings);
-        let cases: [(&str, Darken); 5] = [
+        let cases: [(&str, Darken); 8] = [
             ("disabled", |c| c.api.import.stoat.enabled = false),
             ("no challenge secret", |c| {
                 c.api.import.challenge_secret.clear()
@@ -470,6 +474,14 @@ mod test {
             ("no bot id", |c| c.api.import.stoat.bot_id.clear()),
             // Ready for the read path, but the client cannot build the link
             ("no app url", |c| c.api.import.stoat.app_url.clear()),
+            // The client refuses plain HTTP, so the import could never run
+            ("http api url", |c| {
+                c.api.import.stoat.api_url = "http://api.stoat.chat".to_string()
+            }),
+            ("no api url", |c| c.api.import.stoat.api_url.clear()),
+            ("api url without a scheme", |c| {
+                c.api.import.stoat.api_url = "api.stoat.chat".to_string()
+            }),
         ];
         for (name, darken) in cases {
             let mut config = ready_settings();

@@ -8,7 +8,7 @@
 //! crond acts on those, never on the pasted string.
 
 use chrono::{DateTime, Utc};
-use revolt_config::{config, ApiImport, ApiImportBotSource, Settings};
+use revolt_config::{config, ApiImport, Settings};
 use revolt_database::{Database, DiscordImportJob, ImportJobKind, User};
 use revolt_result::{create_error, Result};
 use rocket::request::FromParam;
@@ -18,7 +18,10 @@ use validator::Validate;
 
 use super::discord_template::ResponseImportStarted;
 use super::dto::DataImportSourceServer;
-use super::stoat_source::{self, parse_stoat_source, verify_stoat_source, StoatApi};
+use super::stoat_source::{
+    self, api_url_is_https, parse_stoat_source, verify_stoat_source, StoatApi, Transport,
+};
+use super::upstream_throttle::UpstreamThrottle;
 
 /// A platform servers can be imported from: the `<source>` path segment
 #[derive(Clone, Copy, Debug, PartialEq, Eq, JsonSchema)]
@@ -56,15 +59,32 @@ impl ImportSource {
         matches!(self, ImportSource::Stoat)
     }
 
-    /// Implemented AND configured (`ready()`, which includes the shared
-    /// challenge secret)
-    pub fn ready(self, import: &ApiImport) -> bool {
+    /// Implemented AND configured (the config's `ready()`, which includes
+    /// the shared challenge secret), with no check on the API URL's scheme
+    fn configured(self, import: &ApiImport) -> bool {
         self.implemented()
             && match self {
                 ImportSource::Stoat => import.stoat_ready(),
                 ImportSource::Fluxer => import.fluxer_ready(),
                 ImportSource::Matrix => import.matrix_ready(),
             }
+    }
+
+    /// The configured base URL delta would call
+    fn api_url(self, import: &ApiImport) -> &str {
+        match self {
+            ImportSource::Stoat => &import.stoat.api_url,
+            ImportSource::Fluxer => &import.fluxer.api_url,
+            ImportSource::Matrix => &import.matrix.homeserver_url,
+        }
+    }
+
+    /// Implemented, configured, and its API URL is `https://`: the client
+    /// refuses plain HTTP, so a source configured with one could never
+    /// verify. The one readiness test for the POST and challenge routes and
+    /// for what `GET /` advertises.
+    pub fn ready(self, import: &ApiImport) -> bool {
+        self.configured(import) && api_url_is_https(self.api_url(import))
     }
 }
 
@@ -99,6 +119,26 @@ pub async fn import_source_server(
     source: ImportSource,
     data: Json<DataImportSourceServer>,
 ) -> Result<Json<ResponseImportStarted>> {
+    // A test driving this handler through Rocket points it at a fake
+    // upstream for its own user only; release builds have no such path
+    #[cfg(test)]
+    {
+        if let Some((settings, throttle)) = routed_test_upstream::lookup(&user.id) {
+            return start_source_import(
+                db,
+                &user,
+                source,
+                data.into_inner(),
+                &settings,
+                Utc::now(),
+                Transport::LoopbackTest,
+                &throttle,
+            )
+            .await
+            .map(Json);
+        }
+    }
+
     let config = config().await;
     start_source_import(
         db,
@@ -107,10 +147,38 @@ pub async fn import_source_server(
         data.into_inner(),
         &config,
         Utc::now(),
-        StoatApi::new,
+        Transport::Production,
+        &UpstreamThrottle::stoat(),
     )
     .await
     .map(Json)
+}
+
+/// Per-user overrides for tests that go through the routed handler: the
+/// settings to use (pointing at a fake upstream) and isolated budgets.
+/// Keyed by user so tests running alongside are unaffected.
+#[cfg(test)]
+pub(super) mod routed_test_upstream {
+    use std::collections::HashMap;
+    use std::sync::{LazyLock, Mutex};
+
+    use revolt_config::Settings;
+
+    use super::UpstreamThrottle;
+
+    static ROUTES: LazyLock<Mutex<HashMap<String, (Settings, UpstreamThrottle)>>> =
+        LazyLock::new(|| Mutex::new(HashMap::new()));
+
+    pub fn route(user_id: &str, settings: Settings, throttle: UpstreamThrottle) {
+        ROUTES
+            .lock()
+            .unwrap()
+            .insert(user_id.to_string(), (settings, throttle));
+    }
+
+    pub fn lookup(user_id: &str) -> Option<(Settings, UpstreamThrottle)> {
+        ROUTES.lock().unwrap().get(user_id).cloned()
+    }
 }
 
 /// Any other `<source>` on the POST route.
@@ -125,8 +193,13 @@ pub async fn import_unknown_source_server() -> Result<()> {
     Err(create_error!(NotFound))
 }
 
-/// The guards and the upstream check, with the config, clock and Stoat
-/// client passed in so tests can point them at a fake upstream.
+/// The guards and the upstream check, with the config, clock, transport and
+/// outbound budgets passed in so tests can point them at a fake upstream.
+///
+/// Order matters: every local refusal comes first, so a refused request
+/// spends no outbound budget; the throttle is checked inside
+/// `verify_stoat_source` before each upstream call.
+#[allow(clippy::too_many_arguments)]
 async fn start_source_import(
     db: &Database,
     user: &User,
@@ -134,15 +207,18 @@ async fn start_source_import(
     data: DataImportSourceServer,
     config: &Settings,
     now: DateTime<Utc>,
-    stoat_api: fn(&ApiImportBotSource) -> Result<StoatApi>,
+    transport: Transport,
+    throttle: &UpstreamThrottle,
 ) -> Result<ResponseImportStarted> {
     if user.bot.is_some() {
         return Err(create_error!(IsBot));
     }
 
-    // Not built in this release, or not configured: nothing below runs and
-    // no upstream is contacted
-    if !source.ready(&config.api.import) {
+    // Not built in this release, not configured, or not reachable over
+    // `transport`: nothing below runs and no upstream is contacted. Under
+    // `Production` this is exactly `source.ready()`.
+    let import = &config.api.import;
+    if !(source.configured(import) && transport.accepts_api_url(source.api_url(import))) {
         return Err(create_error!(ImportSourceUnavailable));
     }
 
@@ -182,9 +258,10 @@ async fn start_source_import(
         return Err(create_error!(ImportAlreadyInProgress));
     }
 
-    let api = stoat_api(&config.api.import.stoat)?;
+    let api = StoatApi::connect(&config.api.import.stoat, transport)?;
     let verified = verify_stoat_source(
         &api,
+        throttle,
         &parsed,
         config.api.import.challenge_secret.as_bytes(),
         &user.id,
@@ -209,6 +286,7 @@ async fn start_source_import(
 #[cfg(test)]
 mod tests {
     use super::super::stoat_source::fake_upstream::{FakeStoat, BOT_TOKEN};
+    use super::super::upstream_throttle::UpstreamTarget;
     use super::*;
     use crate::util::test::TestHarness;
     use chrono::TimeZone;
@@ -241,6 +319,7 @@ mod tests {
         }
     }
 
+    /// One request, with outbound budgets of its own
     async fn start(
         harness: &TestHarness,
         user: &User,
@@ -255,9 +334,50 @@ mod tests {
             body(pasted),
             settings,
             now(),
-            StoatApi::loopback_for_tests,
+            Transport::LoopbackTest,
+            &UpstreamThrottle::isolated_for_tests(),
         )
         .await
+    }
+
+    /// A Stoat request against shared `throttle` budgets, as every request
+    /// to one delta shares them
+    async fn start_with(
+        harness: &TestHarness,
+        user: &User,
+        pasted: &str,
+        settings: &Settings,
+        throttle: &UpstreamThrottle,
+        at: DateTime<Utc>,
+    ) -> Result<ResponseImportStarted> {
+        start_source_import(
+            &harness.db,
+            user,
+            ImportSource::Stoat,
+            body(pasted),
+            settings,
+            at,
+            Transport::LoopbackTest,
+            throttle,
+        )
+        .await
+    }
+
+    /// A fake whose server `SERVER` has a description holding today's code
+    /// for each of `user_ids` (none: no code at all)
+    async fn server_fake(user_ids: &[&str]) -> FakeStoat {
+        let codes: Vec<String> = user_ids
+            .iter()
+            .map(|id| code(SECRET.as_bytes(), "stoat", id, now().date_naive()))
+            .collect();
+        FakeStoat::new()
+            .reply(
+                &format!("/servers/{SERVER}"),
+                200,
+                json!({ "_id": SERVER, "name": "S", "description": codes.join(" ") }),
+            )
+            .start()
+            .await
     }
 
     fn assert_error(result: Result<ResponseImportStarted>, expected: &str) {
@@ -487,7 +607,340 @@ mod tests {
         })
     }
 
+    /// The route guard and `GET /` agree: a plain-HTTP `api_url` is not
+    /// ready, and the production transport refuses it before any call
+    #[test]
+    fn production_transport_refuses_a_plain_http_api_url() {
+        crate::util::test::rt().block_on(async {
+            let harness = TestHarness::new().await;
+            let (_, _, user) = harness.new_user().await;
+            let fake = verifying_fake(&user.id).await;
+            let settings = ready_settings(&fake).await;
+            assert!(settings.api.import.stoat.api_url.starts_with("http://"));
+            assert!(!ImportSource::Stoat.ready(&settings.api.import));
+
+            let result = start_source_import(
+                &harness.db,
+                &user,
+                ImportSource::Stoat,
+                body(INVITE),
+                &settings,
+                now(),
+                Transport::Production,
+                &UpstreamThrottle::isolated_for_tests(),
+            )
+            .await;
+            assert_error(result, "ImportSourceUnavailable");
+            assert!(fake.seen().is_empty(), "{:?}", fake.seen());
+        })
+    }
+
+    // ---- outbound budgets ----
+
+    #[test]
+    fn a_second_verification_by_one_user_within_30s_makes_no_upstream_call() {
+        crate::util::test::rt().block_on(async {
+            let harness = TestHarness::new().await;
+            let (_, _, user) = harness.new_user().await;
+            // No code in the description: the first attempt fails, so
+            // the one-active-job check cannot be what stops the second
+            let fake = server_fake(&[]).await;
+            let settings = ready_settings(&fake).await;
+            let throttle = UpstreamThrottle::isolated_for_tests();
+
+            assert_error(
+                start_with(&harness, &user, SERVER, &settings, &throttle, now()).await,
+                "ImportVerificationMissing",
+            );
+            assert_eq!(fake.seen().len(), 1);
+
+            for at in [now(), now() + chrono::Duration::seconds(29)] {
+                assert_error(
+                    start_with(&harness, &user, SERVER, &settings, &throttle, at).await,
+                    "ImportUpstreamUnavailable",
+                );
+            }
+            assert_eq!(fake.seen().len(), 1, "{:?}", fake.seen());
+
+            // After 30 s the user may try again
+            assert_error(
+                start_with(
+                    &harness,
+                    &user,
+                    SERVER,
+                    &settings,
+                    &throttle,
+                    now() + chrono::Duration::milliseconds(30_001),
+                )
+                .await,
+                "ImportVerificationMissing",
+            );
+            assert_eq!(fake.seen().len(), 2);
+        })
+    }
+
+    #[test]
+    fn a_third_verification_of_one_server_within_10s_makes_no_upstream_call() {
+        crate::util::test::rt().block_on(async {
+            let harness = TestHarness::new().await;
+            let (_, _, first) = harness.new_user().await;
+            let (_, _, second) = harness.new_user().await;
+            let (_, _, third) = harness.new_user().await;
+            let fake = server_fake(&[]).await;
+            let settings = ready_settings(&fake).await;
+            let throttle = UpstreamThrottle::isolated_for_tests();
+
+            for user in [&first, &second] {
+                assert_error(
+                    start_with(&harness, user, SERVER, &settings, &throttle, now()).await,
+                    "ImportVerificationMissing",
+                );
+            }
+            assert_eq!(fake.seen().len(), 2);
+
+            // Lowercase is the same server
+            assert_error(
+                start_with(
+                    &harness,
+                    &third,
+                    &SERVER.to_lowercase(),
+                    &settings,
+                    &throttle,
+                    now(),
+                )
+                .await,
+                "ImportUpstreamUnavailable",
+            );
+            assert_eq!(fake.seen().len(), 2, "{:?}", fake.seen());
+        })
+    }
+
+    #[test]
+    fn the_global_cap_refuses_without_an_upstream_call() {
+        crate::util::test::rt().block_on(async {
+            let harness = TestHarness::new().await;
+            let (_, _, user) = harness.new_user().await;
+            let fake = verifying_fake(&user.id).await;
+            let settings = ready_settings(&fake).await;
+            let throttle = UpstreamThrottle::isolated_for_tests();
+
+            // Ten calls on other servers in this window
+            for i in 0..10 {
+                throttle
+                    .next_call(UpstreamTarget::Server(&format!("FILL{i}")), now())
+                    .await
+                    .unwrap();
+            }
+
+            assert_error(
+                start_with(&harness, &user, INVITE, &settings, &throttle, now()).await,
+                "ImportUpstreamUnavailable",
+            );
+            assert!(fake.seen().is_empty(), "{:?}", fake.seen());
+        })
+    }
+
+    /// Requests refused by a local guard spend no budget: not the user's,
+    /// not the target's, not the global one
+    #[test]
+    fn local_refusals_spend_no_outbound_budget() {
+        crate::util::test::rt().block_on(async {
+            let harness = TestHarness::new().await;
+            let (_, _, first) = harness.new_user().await;
+            let (_, _, second) = harness.new_user().await;
+            let (_, _, busy) = harness.new_user().await;
+            let (_, _, late) = harness.new_user().await;
+            let fake = server_fake(&[&first.id, &second.id]).await;
+            let settings = ready_settings(&fake).await;
+            let throttle = UpstreamThrottle::isolated_for_tests();
+
+            // Leave room for exactly two calls in the global budget
+            for i in 0..8 {
+                throttle
+                    .next_call(UpstreamTarget::Server(&format!("FILL{i}")), now())
+                    .await
+                    .unwrap();
+            }
+
+            let mut restricted = settings.clone();
+            restricted.features.limits.global.restrict_server_creation =
+                vec!["01SOMEONEELSE0000000000000".to_string()];
+            let mut dark = settings.clone();
+            dark.api.import.stoat.enabled = false;
+            let mut bot = first.clone();
+            bot.bot = Some(BotInformation {
+                owner: first.id.clone(),
+            });
+            harness
+                .db
+                .insert_discord_import_job(&DiscordImportJob::new(
+                    busy.id.clone(),
+                    "abc".to_string(),
+                ))
+                .await
+                .unwrap();
+
+            // Every refusal names SERVER, the target the real requests use
+            for _ in 0..3 {
+                for (user, settings, expected) in [
+                    (&first, &restricted, "CantCreateServers"),
+                    (&first, &dark, "ImportSourceUnavailable"),
+                    (&bot, &settings, "IsBot"),
+                    (&busy, &settings, "ImportAlreadyInProgress"),
+                ] {
+                    assert_error(
+                        start_with(&harness, user, SERVER, settings, &throttle, now()).await,
+                        expected,
+                    );
+                }
+                assert_error(
+                    start_with(
+                        &harness,
+                        &first,
+                        &format!("{SERVER}?x"),
+                        &settings,
+                        &throttle,
+                        now(),
+                    )
+                    .await,
+                    "InvalidOperation",
+                );
+            }
+            assert!(fake.seen().is_empty(), "{:?}", fake.seen());
+
+            // Both real requests still fit every budget
+            for user in [&first, &second] {
+                start_with(&harness, user, SERVER, &settings, &throttle, now())
+                    .await
+                    .expect("budget untouched by refusals");
+            }
+            assert_eq!(fake.seen().len(), 2);
+
+            // ...and the budgets were live: the next one is refused
+            assert_error(
+                start_with(&harness, &late, SERVER, &settings, &throttle, now()).await,
+                "ImportUpstreamUnavailable",
+            );
+            assert_eq!(fake.seen().len(), 2);
+        })
+    }
+
+    /// Parallel POSTs from one user all pass the one-active-job check
+    /// before any of them inserts; the user budget lets one verify
+    #[test]
+    fn parallel_requests_from_one_user_verify_once() {
+        crate::util::test::rt().block_on(async {
+            let harness = TestHarness::new().await;
+            let (_, _, user) = harness.new_user().await;
+            let fake = verifying_fake(&user.id).await;
+            let settings = ready_settings(&fake).await;
+            let throttle = UpstreamThrottle::isolated_for_tests();
+
+            let results = futures::future::join_all(
+                (0..5).map(|_| start_with(&harness, &user, INVITE, &settings, &throttle, now())),
+            )
+            .await;
+
+            let mut started = 0;
+            for result in results {
+                match result {
+                    Ok(_) => started += 1,
+                    Err(error) => {
+                        let kind = format!("{:?}", error.error_type);
+                        assert!(
+                            kind == "ImportUpstreamUnavailable"
+                                || kind == "ImportAlreadyInProgress",
+                            "{}",
+                            kind
+                        );
+                    }
+                }
+            }
+            assert_eq!(started, 1);
+            // One verification: the invite, then the server
+            assert_eq!(fake.seen().len(), 2, "{:?}", fake.seen());
+        })
+    }
+
     // ---- through Rocket: path parsing, ranking, default config ----
+
+    /// The routed handler end to end: session guard, JSON body, the guards,
+    /// verification against the fake upstream, the stored job, and the
+    /// response body
+    #[test]
+    fn routed_post_queues_a_verified_import() {
+        crate::util::test::rt().block_on(async {
+            let harness = TestHarness::new().await;
+            let (_, session, user) = harness.new_user().await;
+
+            // The handler reads the real clock
+            let today = Utc::now();
+            let mine = code(SECRET.as_bytes(), "stoat", &user.id, today.date_naive());
+            let fake = FakeStoat::new()
+                .reply(
+                    &format!("/invites/{INVITE}"),
+                    200,
+                    json!({ "type": "Server", "code": INVITE, "server_id": SERVER }),
+                )
+                .reply(
+                    &format!("/servers/{SERVER}"),
+                    200,
+                    json!({ "_id": SERVER, "name": "S", "description": format!("hi {mine}") }),
+                )
+                .start()
+                .await;
+            routed_test_upstream::route(
+                &user.id,
+                ready_settings(&fake).await,
+                UpstreamThrottle::isolated_for_tests(),
+            );
+
+            let pasted = format!("https://stoat.chat/invite/{INVITE}");
+            let response = harness
+                .client
+                .post("/import/stoat/server")
+                .header(ContentType::JSON)
+                .header(Header::new("X-Session-Token", session.token.clone()))
+                .body(json!({ "source": pasted }).to_string())
+                .dispatch()
+                .await;
+            let status = response.status();
+            let text = response.into_string().await.unwrap_or_default();
+            assert_eq!(status, Status::Ok, "{text}");
+
+            let started: serde_json::Value = serde_json::from_str(&text).unwrap();
+            let fields: Vec<&String> = started.as_object().unwrap().keys().collect();
+            assert_eq!(fields, ["job_id"], "{text}");
+            let job_id = started["job_id"].as_str().unwrap();
+
+            let job = harness
+                .db
+                .fetch_discord_import_job(job_id)
+                .await
+                .expect("job stored");
+            assert_eq!(job.user_id, user.id);
+            assert_eq!(job.kind, ImportJobKind::StoatServer);
+            assert_eq!(job.status, ImportStatus::Queued);
+            assert_eq!(job.stage, ImportStage::Verifying);
+            assert_eq!(job.template_code, pasted);
+            assert_eq!(job.source_server_id.as_deref(), Some(SERVER));
+            assert_eq!(job.challenge_code, Some(mine));
+
+            let seen = fake.seen();
+            assert_eq!(seen.len(), 2, "{seen:?}");
+            assert_eq!(seen[0].path, format!("/invites/{INVITE}"));
+            assert_eq!(seen[1].bot_token.as_deref(), Some(BOT_TOKEN));
+
+            // Followed with the Discord job route, as the docs say
+            let response = harness
+                .client
+                .get(format!("/import/discord/jobs/{job_id}"))
+                .header(Header::new("X-Session-Token", session.token.clone()))
+                .dispatch()
+                .await;
+            assert_eq!(response.status(), Status::Ok);
+        })
+    }
 
     /// POST and return the status plus the error `type` (or the raw body)
     async fn post_error(

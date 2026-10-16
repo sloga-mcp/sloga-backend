@@ -5,8 +5,12 @@
 //! Verification is at most two upstream calls (Stoat's `servers` bucket is
 //! 5 requests / 10 s per bot and server): resolve the invite (public, no
 //! token), then fetch the server as the operator bot and look for the
-//! requester's challenge code in its description. crond owns the full read
-//! client; this one only verifies.
+//! requester's challenge code in its description. Each call first spends
+//! from the shared outbound budgets (`upstream_throttle`). crond owns the
+//! full read client; this one only verifies.
+//!
+//! Failures are logged at `warn` by call, status code and error kind only:
+//! never the URL (it carries what the user pasted), the token or a body.
 
 use std::time::Duration;
 
@@ -16,7 +20,10 @@ use reqwest::StatusCode;
 use revolt_config::ApiImportBotSource;
 use revolt_database::util::import_challenge::find_accepted_code;
 use revolt_result::{create_error, Result};
+use serde::de::DeserializeOwned;
 use serde::Deserialize;
+
+use super::upstream_throttle::{UpstreamTarget, UpstreamThrottle};
 
 /// Challenge source tag for Stoat. A code minted for another source never
 /// verifies here.
@@ -35,6 +42,9 @@ const ULID_ALPHABET: &str = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
 const INVITE_PREFIXES: [&str; 2] = ["stoat.chat/invite/", "rvlt.gg/"];
 
 const UPSTREAM_TIMEOUT: Duration = Duration::from_secs(15);
+/// Largest upstream body read. An invite or server object is a few KiB;
+/// a description is capped far below this upstream.
+const MAX_BODY_BYTES: usize = 1024 * 1024;
 const USER_AGENT: &str = concat!(
     "SlogaImport/",
     env!("CARGO_PKG_VERSION"),
@@ -143,6 +153,15 @@ pub struct VerifiedStoatSource {
     pub challenge_code: String,
 }
 
+/// Whether `api_url` is an absolute `https://` URL with a host. A source
+/// whose API URL is anything else is not ready: the production client
+/// refuses plain HTTP, so it could never verify.
+pub fn api_url_is_https(api_url: &str) -> bool {
+    url::Url::parse(api_url)
+        .map(|url| url.scheme() == "https" && url.host_str().is_some_and(|host| !host.is_empty()))
+        .unwrap_or(false)
+}
+
 /// Minimal Stoat API client for verification.
 ///
 /// The base URL comes only from operator config. Redirects are never
@@ -155,7 +174,9 @@ pub struct StoatApi {
     bot_token: String,
 }
 
-enum Transport {
+/// How the client reaches its upstream
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Transport {
     /// HTTPS only, system proxy settings honored
     Production,
     /// Plain HTTP to a loopback fake, never through a proxy
@@ -163,20 +184,87 @@ enum Transport {
     LoopbackTest,
 }
 
+impl Transport {
+    /// Whether this transport can reach `api_url` at all. Production is
+    /// exactly [`api_url_is_https`], the same test `GET /` and the challenge
+    /// route apply through `ImportSource::ready`.
+    pub fn accepts_api_url(self, api_url: &str) -> bool {
+        match self {
+            Transport::Production => api_url_is_https(api_url),
+            #[cfg(test)]
+            Transport::LoopbackTest => api_url.starts_with("http://127.0.0.1:"),
+        }
+    }
+}
+
+/// A transport error by kind. `reqwest::Error`'s `Display` includes the
+/// URL, which carries what the user pasted, so it is never logged.
+fn error_kind(error: &reqwest::Error) -> &'static str {
+    if error.is_timeout() {
+        "timeout"
+    } else if error.is_connect() {
+        "connect"
+    } else if error.is_redirect() {
+        "redirect"
+    } else if error.is_body() {
+        "body"
+    } else if error.is_decode() {
+        "decode"
+    } else if error.is_request() {
+        "request"
+    } else if error.is_builder() {
+        "builder"
+    } else {
+        "other"
+    }
+}
+
+/// Read a JSON body of at most [`MAX_BODY_BYTES`]: refused up front when the
+/// declared length is over, and while reading when the bytes are (chunked
+/// or undeclared bodies). Every failure is `ImportUpstreamUnavailable`.
+async fn read_json<T: DeserializeOwned>(
+    mut response: reqwest::Response,
+    call: &'static str,
+) -> Result<T> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_BODY_BYTES as u64)
+    {
+        log::warn!("stoat import: {call}: declared body over {MAX_BODY_BYTES} bytes; refused");
+        return Err(create_error!(ImportUpstreamUnavailable));
+    }
+
+    let mut body = Vec::new();
+    loop {
+        match response.chunk().await {
+            Ok(Some(chunk)) => {
+                if body.len() + chunk.len() > MAX_BODY_BYTES {
+                    log::warn!("stoat import: {call}: body over {MAX_BODY_BYTES} bytes; refused");
+                    return Err(create_error!(ImportUpstreamUnavailable));
+                }
+                body.extend_from_slice(&chunk);
+            }
+            Ok(None) => break,
+            Err(error) => {
+                log::warn!(
+                    "stoat import: {call}: reading the body failed ({})",
+                    error_kind(&error)
+                );
+                return Err(create_error!(ImportUpstreamUnavailable));
+            }
+        }
+    }
+
+    serde_json::from_slice(&body).map_err(|_| {
+        log::warn!("stoat import: {call}: body is not the expected JSON");
+        create_error!(ImportUpstreamUnavailable)
+    })
+}
+
 impl StoatApi {
-    /// Client for `config` (`[api.import.stoat]`). An `http://` `api_url` is
-    /// refused at request time.
-    pub fn new(config: &ApiImportBotSource) -> Result<StoatApi> {
-        StoatApi::build(config, Transport::Production)
-    }
-
-    /// Client for a fake upstream listening on plain HTTP
-    #[cfg(test)]
-    pub fn loopback_for_tests(config: &ApiImportBotSource) -> Result<StoatApi> {
-        StoatApi::build(config, Transport::LoopbackTest)
-    }
-
-    fn build(config: &ApiImportBotSource, transport: Transport) -> Result<StoatApi> {
+    /// Client for `config` (`[api.import.stoat]`) over `transport`. Under
+    /// `Production` an `http://` `api_url` is refused at request time too.
+    pub fn connect(config: &ApiImportBotSource, transport: Transport) -> Result<StoatApi> {
         let builder = reqwest::Client::builder()
             .timeout(UPSTREAM_TIMEOUT)
             .connect_timeout(UPSTREAM_TIMEOUT)
@@ -189,9 +277,13 @@ impl StoatApi {
             Transport::LoopbackTest => builder.no_proxy(),
         };
 
-        let client = builder
-            .build()
-            .map_err(|_| create_error!(ImportUpstreamUnavailable))?;
+        let client = builder.build().map_err(|error| {
+            log::warn!(
+                "stoat import: building the client failed ({})",
+                error_kind(&error)
+            );
+            create_error!(ImportUpstreamUnavailable)
+        })?;
 
         Ok(StoatApi {
             client,
@@ -203,23 +295,27 @@ impl StoatApi {
     /// Resolve an invite to its server id. Public route, sent without the
     /// bot token.
     async fn resolve_invite(&self, code: &str) -> Result<String> {
+        const CALL: &str = "invite lookup";
         let response = self
             .client
             .get(format!("{}/invites/{code}", self.api_url))
             .send()
             .await
-            .map_err(|_| create_error!(ImportUpstreamUnavailable))?;
+            .map_err(|error| {
+                log::warn!("stoat import: {CALL} failed ({})", error_kind(&error));
+                create_error!(ImportUpstreamUnavailable)
+            })?;
 
         match response.status() {
             status if status.is_success() => {}
             StatusCode::NOT_FOUND => return Err(create_error!(ImportSourceNotFound)),
-            _ => return Err(create_error!(ImportUpstreamUnavailable)),
+            status => {
+                log::warn!("stoat import: {CALL} answered {}", status.as_u16());
+                return Err(create_error!(ImportUpstreamUnavailable));
+            }
         }
 
-        let invite: InviteProbe = response
-            .json()
-            .await
-            .map_err(|_| create_error!(ImportUpstreamUnavailable))?;
+        let invite: InviteProbe = read_json(response, CALL).await?;
 
         // A group invite names no server
         if invite.kind.as_deref() != Some("Server") {
@@ -230,14 +326,20 @@ impl StoatApi {
         // user input even though it came from the configured upstream
         match invite.server_id {
             Some(id) if is_safe_token(&id) => Ok(id),
-            _ => Err(create_error!(ImportUpstreamUnavailable)),
+            _ => {
+                log::warn!("stoat import: {CALL} returned an unusable server id");
+                Err(create_error!(ImportUpstreamUnavailable))
+            }
         }
     }
 
     /// Fetch a server as the operator bot
     async fn fetch_server(&self, server_id: &str) -> Result<ServerProbe> {
-        let mut token = HeaderValue::from_str(&self.bot_token)
-            .map_err(|_| create_error!(ImportUpstreamUnavailable))?;
+        const CALL: &str = "server fetch";
+        let mut token = HeaderValue::from_str(&self.bot_token).map_err(|_| {
+            log::warn!("stoat import: the configured bot token is not a valid header value");
+            create_error!(ImportUpstreamUnavailable)
+        })?;
         token.set_sensitive(true);
 
         let response = self
@@ -246,24 +348,34 @@ impl StoatApi {
             .header("x-bot-token", token)
             .send()
             .await
-            .map_err(|_| create_error!(ImportUpstreamUnavailable))?;
+            .map_err(|error| {
+                log::warn!("stoat import: {CALL} failed ({})", error_kind(&error));
+                create_error!(ImportUpstreamUnavailable)
+            })?;
 
         match response.status() {
             status if status.is_success() => {}
             // Not a member, removed, or no such server: Stoat does not let
-            // a non-member tell these apart, and neither do we
-            StatusCode::NOT_FOUND | StatusCode::FORBIDDEN | StatusCode::UNAUTHORIZED => {
+            // a non-member tell these apart, and neither do we. A 401 can
+            // also mean the operator's token was revoked, which would
+            // otherwise fail every import quietly, so it is logged.
+            StatusCode::UNAUTHORIZED => {
+                log::warn!("stoat import: {CALL} answered 401; check the bot token");
+                return Err(create_error!(ImportBotNotInServer));
+            }
+            StatusCode::NOT_FOUND | StatusCode::FORBIDDEN => {
                 return Err(create_error!(ImportBotNotInServer))
             }
-            _ => return Err(create_error!(ImportUpstreamUnavailable)),
+            status => {
+                log::warn!("stoat import: {CALL} answered {}", status.as_u16());
+                return Err(create_error!(ImportUpstreamUnavailable));
+            }
         }
 
-        let server: ServerProbe = response
-            .json()
-            .await
-            .map_err(|_| create_error!(ImportUpstreamUnavailable))?;
+        let server: ServerProbe = read_json(response, CALL).await?;
 
         if server.id != server_id {
+            log::warn!("stoat import: {CALL} returned a different server");
             return Err(create_error!(ImportUpstreamUnavailable));
         }
 
@@ -277,18 +389,36 @@ impl StoatApi {
 /// Errors: `ImportSourceNotFound` (unknown or group invite),
 /// `ImportBotNotInServer` (the bot cannot see the server),
 /// `ImportVerificationMissing` (no accepted code for this user and source),
-/// `ImportUpstreamUnavailable` (429, 5xx, timeout, transport, redirect, or a
-/// malformed response).
+/// `ImportUpstreamUnavailable` (`throttle` refused a call, 429, 5xx,
+/// timeout, transport, redirect, an oversize or malformed response).
+///
+/// Every upstream call is preceded by a `throttle` check; a refused check
+/// makes no call. The caller must have finished every local refusal first.
 pub async fn verify_stoat_source(
     api: &StoatApi,
+    throttle: &UpstreamThrottle,
     source: &StoatSource,
     challenge_secret: &[u8],
     user_id: &str,
     now: DateTime<Utc>,
 ) -> Result<VerifiedStoatSource> {
     let server_id = match source {
-        StoatSource::Invite(code) => api.resolve_invite(code).await?,
-        StoatSource::ServerId(id) => id.clone(),
+        StoatSource::Invite(code) => {
+            throttle
+                .begin_verification(user_id, UpstreamTarget::Invite(code), now)
+                .await?;
+            let server_id = api.resolve_invite(code).await?;
+            throttle
+                .next_call(UpstreamTarget::Server(&server_id), now)
+                .await?;
+            server_id
+        }
+        StoatSource::ServerId(id) => {
+            throttle
+                .begin_verification(user_id, UpstreamTarget::Server(id), now)
+                .await?;
+            id.clone()
+        }
     };
 
     let server = api.fetch_server(&server_id).await?;
@@ -328,11 +458,25 @@ pub(super) mod fake_upstream {
         pub bot_token: Option<String>,
     }
 
+    /// How a reply's body is framed on the wire
+    #[derive(Clone, Copy)]
+    pub enum Framing {
+        /// `content-length` = the body, then close
+        Length,
+        /// `transfer-encoding: chunked`, no declared length, then close
+        Chunked,
+        /// `content-length: <n>` with only the body sent, then the
+        /// connection held open: a reader that trusts the declared length
+        /// waits for bytes that never come
+        DeclaredButHeld(usize),
+    }
+
     #[derive(Clone)]
     struct Reply {
         status: u16,
         body: String,
         location: Option<String>,
+        framing: Framing,
     }
 
     pub struct FakeStoat {
@@ -351,13 +495,25 @@ pub(super) mod fake_upstream {
         }
 
         /// Answer `path` with `status` and a JSON `body`
-        pub fn reply(mut self, path: &str, status: u16, body: serde_json::Value) -> FakeStoat {
+        pub fn reply(self, path: &str, status: u16, body: serde_json::Value) -> FakeStoat {
+            self.reply_framed(path, status, body, Framing::Length)
+        }
+
+        /// Answer `path` with `status` and a JSON `body` framed as `framing`
+        pub fn reply_framed(
+            mut self,
+            path: &str,
+            status: u16,
+            body: serde_json::Value,
+            framing: Framing,
+        ) -> FakeStoat {
             self.replies.insert(
                 path.to_string(),
                 Reply {
                     status,
                     body: body.to_string(),
                     location: None,
+                    framing,
                 },
             );
             self
@@ -371,6 +527,7 @@ pub(super) mod fake_upstream {
                     status: 302,
                     body: String::new(),
                     location: Some(location.to_string()),
+                    framing: Framing::Length,
                 },
             );
             self
@@ -414,18 +571,40 @@ pub(super) mod fake_upstream {
                             status: 404,
                             body: r#"{"type":"NotFound"}"#.to_string(),
                             location: None,
+                            framing: Framing::Length,
                         });
                         let location = reply
                             .location
                             .map(|to| format!("location: {to}\r\n"))
                             .unwrap_or_default();
-                        let response = format!(
-                            "HTTP/1.1 {} Scripted\r\ncontent-type: application/json\r\n{location}content-length: {}\r\nconnection: close\r\n\r\n{}",
-                            reply.status,
-                            reply.body.len(),
-                            reply.body
+                        let head = format!(
+                            "HTTP/1.1 {} Scripted\r\ncontent-type: application/json\r\n{location}connection: close\r\n",
+                            reply.status
                         );
+                        let response = match reply.framing {
+                            Framing::Length => format!(
+                                "{head}content-length: {}\r\n\r\n{}",
+                                reply.body.len(),
+                                reply.body
+                            ),
+                            Framing::DeclaredButHeld(declared) => {
+                                format!("{head}content-length: {declared}\r\n\r\n{}", reply.body)
+                            }
+                            Framing::Chunked => {
+                                let mut out = format!("{head}transfer-encoding: chunked\r\n\r\n");
+                                for chunk in reply.body.as_bytes().chunks(64 * 1024) {
+                                    out.push_str(&format!("{:x}\r\n", chunk.len()));
+                                    out.push_str(std::str::from_utf8(chunk).expect("ascii body"));
+                                    out.push_str("\r\n");
+                                }
+                                out.push_str("0\r\n\r\n");
+                                out
+                            }
+                        };
                         let _ = socket.write_all(response.as_bytes()).await;
+                        if let Framing::DeclaredButHeld(_) = reply.framing {
+                            rocket::tokio::time::sleep(std::time::Duration::from_secs(20)).await;
+                        }
                         let _ = socket.shutdown().await;
                     });
                 }
@@ -455,7 +634,7 @@ pub(super) mod fake_upstream {
 
 #[cfg(test)]
 mod tests {
-    use super::fake_upstream::{FakeStoat, BOT_TOKEN};
+    use super::fake_upstream::{FakeStoat, Framing, BOT_TOKEN};
     use super::*;
     use chrono::TimeZone;
     use revolt_database::util::import_challenge::code;
@@ -482,9 +661,12 @@ mod tests {
         json!({ "_id": SERVER, "name": "S", "description": description })
     }
 
+    /// One verification, with outbound budgets of its own
     async fn verify(fake: &FakeStoat, source: StoatSource) -> Result<VerifiedStoatSource> {
-        let api = StoatApi::loopback_for_tests(&fake.source_config()).expect("client");
-        verify_stoat_source(&api, &source, SECRET, USER, now()).await
+        let api =
+            StoatApi::connect(&fake.source_config(), Transport::LoopbackTest).expect("client");
+        let throttle = UpstreamThrottle::isolated_for_tests();
+        verify_stoat_source(&api, &throttle, &source, SECRET, USER, now()).await
     }
 
     fn invite() -> StoatSource {
@@ -929,9 +1111,17 @@ mod tests {
 
             let mut config = FakeStoat::new().source_config();
             config.api_url = format!("http://{address}");
-            let api = StoatApi::loopback_for_tests(&config).expect("client");
+            let api = StoatApi::connect(&config, Transport::LoopbackTest).expect("client");
             assert_error(
-                verify_stoat_source(&api, &invite(), SECRET, USER, now()).await,
+                verify_stoat_source(
+                    &api,
+                    &UpstreamThrottle::isolated_for_tests(),
+                    &invite(),
+                    SECRET,
+                    USER,
+                    now(),
+                )
+                .await,
                 "ImportUpstreamUnavailable",
             );
         })
@@ -944,10 +1134,12 @@ mod tests {
                 .reply(&format!("/servers/{SERVER}"), 200, server_with(&my_code()))
                 .start()
                 .await;
-            let api = StoatApi::new(&fake.source_config()).expect("client");
+            let api =
+                StoatApi::connect(&fake.source_config(), Transport::Production).expect("client");
             assert_error(
                 verify_stoat_source(
                     &api,
+                    &UpstreamThrottle::isolated_for_tests(),
                     &StoatSource::ServerId(SERVER.to_string()),
                     SECRET,
                     USER,
@@ -957,6 +1149,215 @@ mod tests {
                 "ImportUpstreamUnavailable",
             );
             assert!(fake.seen().is_empty(), "{:?}", fake.seen());
+        })
+    }
+
+    #[test]
+    fn api_url_must_be_https_with_a_host() {
+        for url in [
+            "https://api.stoat.chat",
+            "https://api.stoat.chat/",
+            "HTTPS://api.stoat.chat",
+            "https://127.0.0.1:8443/api",
+        ] {
+            assert!(api_url_is_https(url), "{}", url);
+            assert!(Transport::Production.accepts_api_url(url), "{}", url);
+        }
+        for url in [
+            "http://api.stoat.chat",
+            "http://127.0.0.1:1234",
+            "ftp://api.stoat.chat",
+            "api.stoat.chat",
+            "//api.stoat.chat",
+            "https://",
+            "",
+        ] {
+            assert!(!api_url_is_https(url), "{}", url);
+            assert!(!Transport::Production.accepts_api_url(url), "{}", url);
+        }
+    }
+
+    // ---- outbound budgets ----
+
+    /// With one `throttle` for every call, as one delta process has
+    async fn verify_as(
+        fake: &FakeStoat,
+        throttle: &UpstreamThrottle,
+        user_id: &str,
+        source: StoatSource,
+    ) -> Result<VerifiedStoatSource> {
+        let api =
+            StoatApi::connect(&fake.source_config(), Transport::LoopbackTest).expect("client");
+        verify_stoat_source(&api, throttle, &source, SECRET, user_id, now()).await
+    }
+
+    #[test]
+    fn a_throttled_verification_makes_no_upstream_call() {
+        crate::util::test::rt().block_on(async {
+            let fake = FakeStoat::new()
+                .reply(&format!("/invites/{INVITE}"), 200, server_invite())
+                .reply(&format!("/servers/{SERVER}"), 200, server_with("no code"))
+                .start()
+                .await;
+            let throttle = UpstreamThrottle::isolated_for_tests();
+
+            // Per user: the second attempt within 30 s, whatever its target
+            assert_error(
+                verify_as(&fake, &throttle, USER, invite()).await,
+                "ImportVerificationMissing",
+            );
+            assert_eq!(fake.seen().len(), 2);
+            assert_error(
+                verify_as(
+                    &fake,
+                    &throttle,
+                    USER,
+                    StoatSource::ServerId("01HOTHER000000000000000000".to_string()),
+                )
+                .await,
+                "ImportUpstreamUnavailable",
+            );
+            assert_eq!(fake.seen().len(), 2, "{:?}", fake.seen());
+
+            // Per target: the invite code is spent once more by another
+            // user, then a third user is refused before the invite lookup
+            assert_error(
+                verify_as(&fake, &throttle, OTHER_USER, invite()).await,
+                "ImportVerificationMissing",
+            );
+            assert_eq!(fake.seen().len(), 4);
+            assert_error(
+                verify_as(&fake, &throttle, "01J9ZQ4V6X7B8C9D0E1F2G3H4M", invite()).await,
+                "ImportUpstreamUnavailable",
+            );
+            // ...and the resolved server id is spent too: a fourth user
+            // naming it directly is refused
+            assert_error(
+                verify_as(
+                    &fake,
+                    &throttle,
+                    "01J9ZQ4V6X7B8C9D0E1F2G3H4N",
+                    StoatSource::ServerId(SERVER.to_string()),
+                )
+                .await,
+                "ImportUpstreamUnavailable",
+            );
+            assert_eq!(fake.seen().len(), 4, "{:?}", fake.seen());
+        })
+    }
+
+    // ---- response size ----
+
+    /// A server body padded to `size` bytes whose description carries the
+    /// requester's code: it verifies unless refused for its size
+    fn padded_server(size: usize) -> serde_json::Value {
+        let base = server_with(&my_code()).to_string().len();
+        json!({
+            "_id": SERVER,
+            "name": "S",
+            "description": my_code(),
+            "pad": "x".repeat(size - base - r#","pad":"""#.len()),
+        })
+    }
+
+    #[test]
+    fn padding_helper_hits_the_size() {
+        for size in [MAX_BODY_BYTES, MAX_BODY_BYTES + 1] {
+            assert_eq!(padded_server(size).to_string().len(), size);
+        }
+    }
+
+    #[test]
+    fn bodies_up_to_the_cap_are_read() {
+        crate::util::test::rt().block_on(async {
+            for framing in [Framing::Length, Framing::Chunked] {
+                let fake = FakeStoat::new()
+                    .reply_framed(
+                        &format!("/servers/{SERVER}"),
+                        200,
+                        padded_server(MAX_BODY_BYTES),
+                        framing,
+                    )
+                    .start()
+                    .await;
+                let verified = verify(&fake, StoatSource::ServerId(SERVER.to_string()))
+                    .await
+                    .expect("a body of exactly the cap verifies");
+                assert_eq!(verified.challenge_code, my_code());
+            }
+        })
+    }
+
+    #[test]
+    fn oversize_bodies_are_upstream_unavailable() {
+        crate::util::test::rt().block_on(async {
+            // Over by one byte, declared and undeclared (chunked: only the
+            // running count can catch it)
+            for framing in [Framing::Length, Framing::Chunked] {
+                let fake = FakeStoat::new()
+                    .reply_framed(
+                        &format!("/servers/{SERVER}"),
+                        200,
+                        padded_server(MAX_BODY_BYTES + 1),
+                        framing,
+                    )
+                    .start()
+                    .await;
+                assert_error(
+                    verify(&fake, StoatSource::ServerId(SERVER.to_string())).await,
+                    "ImportUpstreamUnavailable",
+                );
+            }
+
+            // The invite lookup is capped as well
+            let fake = FakeStoat::new()
+                .reply_framed(
+                    &format!("/invites/{INVITE}"),
+                    200,
+                    json!({
+                        "type": "Server",
+                        "server_id": SERVER,
+                        "pad": "x".repeat(MAX_BODY_BYTES),
+                    }),
+                    Framing::Chunked,
+                )
+                .start()
+                .await;
+            assert_error(verify(&fake, invite()).await, "ImportUpstreamUnavailable");
+            assert_eq!(
+                fake.seen().len(),
+                1,
+                "no server fetch after an oversize invite"
+            );
+        })
+    }
+
+    /// An oversize declared length is refused from the header, before any
+    /// of the body is awaited: the fake sends a small valid body and holds
+    /// the connection, so a reader that waited would sit out the 15 s
+    /// client timeout
+    #[test]
+    fn an_oversize_declared_length_is_refused_without_reading() {
+        crate::util::test::rt().block_on(async {
+            let fake = FakeStoat::new()
+                .reply_framed(
+                    &format!("/servers/{SERVER}"),
+                    200,
+                    server_with(&my_code()),
+                    Framing::DeclaredButHeld(MAX_BODY_BYTES + 1),
+                )
+                .start()
+                .await;
+            let started = std::time::Instant::now();
+            assert_error(
+                verify(&fake, StoatSource::ServerId(SERVER.to_string())).await,
+                "ImportUpstreamUnavailable",
+            );
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "took {:?}",
+                started.elapsed()
+            );
         })
     }
 }

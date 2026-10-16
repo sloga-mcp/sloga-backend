@@ -174,7 +174,16 @@ mod tests {
             no_secret.challenge_secret = String::new();
             let mut no_token = all_ready();
             no_token.stoat.bot_token = String::new();
-            for import in [disabled, no_secret, no_token, ApiImport::default()] {
+            // The client refuses plain HTTP, so the source could never verify
+            let mut plain_http = all_ready();
+            plain_http.stoat.api_url = "http://api.example".to_string();
+            for import in [
+                disabled,
+                no_secret,
+                no_token,
+                plain_http,
+                ApiImport::default(),
+            ] {
                 assert_eq!(
                     error_name(challenge_for(&user, ImportSource::Stoat, &import, now)),
                     "NotFound"

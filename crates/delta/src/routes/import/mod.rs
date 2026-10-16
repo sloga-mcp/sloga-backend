@@ -9,6 +9,10 @@ mod job_fetch;
 mod source_server;
 mod stickers_start;
 mod stoat_source;
+mod upstream_throttle;
+
+/// For `GET /`, which advertises exactly the sources these routes accept
+pub(crate) use source_server::ImportSource;
 
 pub fn routes() -> (Vec<Route>, OpenApi) {
     openapi_get_routes_spec![
