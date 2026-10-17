@@ -317,7 +317,7 @@ fn leave_source<'a>(
     Box::pin(async move {
         match job.kind {
             ImportJobKind::StoatServer => crate::tasks::stoat_import::leave(job, config).await,
-            ImportJobKind::FluxerServer => false,
+            ImportJobKind::FluxerServer => crate::tasks::fluxer_import::leave(job, config).await,
             ImportJobKind::MatrixSpace => false,
             // Never reached: `on_terminal` returns early for these.
             ImportJobKind::Template | ImportJobKind::Stickers => false,
@@ -558,11 +558,11 @@ async fn run_job(db: &Database, mut job: DiscordImportJob, config: &Settings) {
             ImportJobKind::StoatServer => {
                 crate::tasks::stoat_import::run(db, &mut job, config).await
             }
-            // No importer for these sources on this build: fail closed so a
-            // row can never sit unclaimed.
             ImportJobKind::FluxerServer => {
-                Err(ImportAbort::Failed(source_unavailable_message(&job.kind)))
+                crate::tasks::fluxer_import::run(db, &mut job, config).await
             }
+            // No importer for this source on this build: fail closed so a
+            // row can never sit unclaimed.
             ImportJobKind::MatrixSpace => {
                 Err(ImportAbort::Failed(source_unavailable_message(&job.kind)))
             }
@@ -1374,7 +1374,9 @@ async fn import_server_image(
 
 /// Recreate one planned emoji on the server, the way delta's emoji route
 /// does: the emoji id is its file's id (a ULID), the file is claimed for
-/// that id, and `animated` follows the stored content type.
+/// that id, and `animated` is what the stored file's metadata says (read
+/// from its frames, so an animated WebP or APNG counts and a one-frame GIF
+/// does not).
 ///
 /// Returns whether the emoji now exists.
 async fn import_emoji(
@@ -1409,7 +1411,13 @@ async fn import_emoji(
         },
         creator_id: owner.id.clone(),
         name: name.to_string(),
-        animated: "image/gif" == file.content_type,
+        animated: matches!(
+            file.metadata,
+            revolt_database::Metadata::Image {
+                animated: Some(true),
+                ..
+            }
+        ),
         nsfw: false,
     };
 
@@ -2388,17 +2396,19 @@ mod tests {
     /// queue (holding its owner's one active job) forever: it is claimed and
     /// failed, whether or not its source is configured.
     ///
-    /// Stoat has an importer (and is covered by the `stoat_` tests below);
-    /// run here with its source configured it would contact the configured
-    /// API, so it is left out.
+    /// Stoat and Fluxer have importers (covered by the `stoat_` and
+    /// `fluxer_` tests below); run here with their sources configured they
+    /// would contact the configured API, so they are left out.
     #[tokio::test]
     async fn source_kinds_without_an_importer_fail_closed_instead_of_sitting_queued() {
         for sources_ready in [true, false] {
             let config = config_with(true, true, sources_ready).await;
-            for kind in ImportJobKind::SOURCE_KINDS
-                .into_iter()
-                .filter(|kind| !matches!(kind, ImportJobKind::StoatServer))
-            {
+            for kind in ImportJobKind::SOURCE_KINDS.into_iter().filter(|kind| {
+                !matches!(
+                    kind,
+                    ImportJobKind::StoatServer | ImportJobKind::FluxerServer
+                )
+            }) {
                 let db = DatabaseInfo::Reference.connect().await.unwrap();
                 let owner = make_owner(&db).await;
                 let job = source_job(&owner.id, kind.clone(), "01SOURCE000000000000000001");
@@ -3973,5 +3983,326 @@ mod tests {
                 .source_left
         );
         assert_eq!(api.seen().len(), 1);
+    }
+
+    // ----------------------------------------------------------------------
+    // Fluxer importer, through the claim loop's dispatch, against a fake
+    // Fluxer API and CDN on loopback
+    // ----------------------------------------------------------------------
+
+    use crate::tasks::fluxer_import::fixtures::{
+        leave_path as fluxer_leave_path, Fixture as FluxerFixture, BOT_ROLE as FLUXER_BOT_ROLE,
+        GUILD as FLUXER_GUILD, MOD_ROLE as FLUXER_MOD_ROLE, SECRET as FLUXER_SECRET,
+        VIEW as FLUXER_VIEW,
+    };
+    use crate::tasks::import_http::fake_upstream::FakeUpstream;
+
+    /// An animated WebP (the file crate's fixture, 128x128).
+    const ANIMATED_WEBP: &[u8] =
+        include_bytes!("../../../../../core/files/tests/assets/anim-icos.webp");
+
+    /// A one-frame GIF.
+    const STILL_GIF: &[u8] = &[
+        0x47, 0x49, 0x46, 0x38, 0x39, 0x61, 0x01, 0x00, 0x01, 0x00, 0x80, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0xFF, 0xFF, 0xFF, 0x21, 0xF9, 0x04, 0x01, 0x00, 0x00, 0x00, 0x00, 0x2C, 0x00, 0x00,
+        0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x02, 0x02, 0x44, 0x01, 0x00, 0x3B,
+    ];
+
+    /// The stored object `store_file` finds for `bytes` once they are
+    /// cleaned, written as `store_file` itself writes one (the sanitiser's
+    /// type, size and frame count), so no object store is needed.
+    async fn seed_cleaned(db: &Database, bytes: &[u8]) {
+        use sha2::Digest;
+        let image = revolt_files::sanitize_image(
+            bytes.to_vec(),
+            revolt_files::ImageLimits {
+                max_side: 4096,
+                max_pixels: 16 * 1024 * 1024,
+                max_alloc: 256 * 1024 * 1024,
+            },
+        )
+        .expect("a valid image");
+        let hash = format!("{:02x}", sha2::Sha256::digest(&image.bytes));
+        db.insert_attachment_hash(&FileHash {
+            id: hash.clone(),
+            processed_hash: hash.clone(),
+            created_at: Timestamp::now_utc(),
+            bucket_id: "revolt-uploads".to_string(),
+            path: format!("rk/k1/{hash}"),
+            iv: "iv".to_string(),
+            format_version: None,
+            key_id: Some("k1".to_string()),
+            metadata: Metadata::Image {
+                width: image.width as isize,
+                height: image.height as isize,
+                thumbhash: None,
+                animated: image.animated.then_some(true),
+            },
+            content_type: image.mime.to_string(),
+            size: image.bytes.len() as isize,
+        })
+        .await
+        .unwrap();
+    }
+
+    fn fluxer_job(owner_id: &str, code: &str) -> DiscordImportJob {
+        DiscordImportJob::new_source(
+            owner_id.to_string(),
+            ImportJobKind::FluxerServer,
+            "https://fluxer.gg/AbC123".to_string(),
+            Some(FLUXER_GUILD.to_string()),
+            Some(code.to_string()),
+        )
+    }
+
+    /// A Fluxer guild with a private channel, a link channel, an icon and two
+    /// emoji, imported through the claim loop. The private channel stays
+    /// private; the bot's and the code's roles are not imported; an emoji
+    /// is animated when its stored frames say so (an animated WebP is, a
+    /// one-frame GIF is not, whatever Fluxer claimed); the bot leaves.
+    #[tokio::test]
+    async fn fluxer_import_runs_end_to_end_and_the_bot_leaves() {
+        let db = DatabaseInfo::Reference.connect().await.unwrap();
+        let owner = make_owner(&db).await;
+        seed_png_hash(&db).await;
+        seed_cleaned(&db, ANIMATED_WEBP).await;
+        seed_cleaned(&db, STILL_GIF).await;
+
+        let mut fixture = FluxerFixture::ui_flow(&owner.id);
+        let guild = FLUXER_GUILD.to_string();
+        let view = FLUXER_VIEW.to_string();
+        fixture.guild = serde_json::json!({
+            "id": guild, "name": "Flux Place", "nsfw": false, "icon": "0a1b",
+            "banner": null, "system_channel_id": "1300000000000000301",
+            "emojis": [
+                { "id": "1300000000000000501", "name": "party", "animated": true },
+                { "id": "1300000000000000502", "name": "still", "animated": true }
+            ]
+        });
+        fixture.channels = serde_json::json!([
+            { "id": "1300000000000000301", "type": 0, "name": "general", "position": 0,
+              "permission_overwrites": [] },
+            { "id": "1300000000000000302", "type": 0, "name": "staff", "position": 1,
+              "permission_overwrites": [
+                { "id": guild, "type": 0, "allow": "0", "deny": view },
+                { "id": FLUXER_MOD_ROLE.to_string(), "type": 0, "allow": view, "deny": "0" },
+                { "id": FLUXER_BOT_ROLE.to_string(), "type": 0, "allow": view, "deny": "0" },
+                { "id": fixture.code_role.to_string(), "type": 0, "allow": view, "deny": "0" }
+              ] },
+            { "id": "1300000000000000303", "type": 998, "name": "website", "position": 2,
+              "url": "https://example.com", "permission_overwrites": [] }
+        ]);
+        let api = fixture.script(FakeUpstream::new()).start().await;
+        let cdn = FakeUpstream::new()
+            .reply(
+                "GET",
+                &format!("/icons/{guild}/0a1b.png?size=1024"),
+                200,
+                PNG_1X1,
+            )
+            .reply(
+                "GET",
+                "/emojis/1300000000000000501.gif?size=512&animated=true",
+                200,
+                ANIMATED_WEBP,
+            )
+            .reply(
+                "GET",
+                "/emojis/1300000000000000502.gif?size=512&animated=true",
+                200,
+                STILL_GIF,
+            )
+            .start()
+            .await;
+        let mut config = config_with(false, false, true).await;
+        config.api.import.challenge_secret = FLUXER_SECRET.to_string();
+        config.api.import.fluxer = api.fluxer_config(&cdn);
+
+        let job = fluxer_job(&owner.id, &fixture.code);
+        claim_and_run(&db, &job, &config).await;
+
+        let stored = db.fetch_discord_import_job(&job.id).await.unwrap();
+        assert_eq!(stored.status, ImportStatus::Completed, "{:?}", stored.error);
+        assert!(stored.source_left, "the bot leaves once the job is done");
+
+        // Every API call as the bot; the leave carries `{}`; no CDN call
+        // carries the token.
+        let authorization = format!("Bot {BOT_TOKEN}");
+        let calls: Vec<(String, String)> = api
+            .seen()
+            .into_iter()
+            .map(|seen| {
+                assert_eq!(seen.header("authorization"), Some(authorization.as_str()));
+                if seen.method == "DELETE" {
+                    assert_eq!(seen.body, b"{}");
+                }
+                (seen.method, seen.path)
+            })
+            .collect();
+        assert_eq!(
+            calls
+                .iter()
+                .map(|(method, _)| method.as_str())
+                .collect::<Vec<_>>(),
+            vec!["GET", "GET", "GET", "GET", "GET", "GET", "DELETE"]
+        );
+        assert_eq!(calls[6].1, fluxer_leave_path());
+        assert!(cdn
+            .seen()
+            .iter()
+            .all(|seen| seen.header("authorization").is_none()));
+
+        let server_id = stored.server_id.clone().expect("server built");
+        db.fetch_member(&server_id, &owner.id)
+            .await
+            .expect("the owner is a member");
+        let server = db.fetch_server(&server_id).await.unwrap();
+        assert_eq!(server.name, "Flux Place");
+        assert_eq!(server.icon.as_ref().expect("icon imported").tag, "icons");
+
+        // Only the moderator role: the bot's and the code's are dropped.
+        let ordered = server.ordered_roles();
+        assert_eq!(
+            ordered
+                .iter()
+                .map(|(_, role)| role.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Mod"]
+        );
+        let mod_id = ordered[0].0.clone();
+
+        let mut by_name = HashMap::new();
+        for id in &server.channels {
+            let channel = db.fetch_channel(id).await.unwrap();
+            if let Channel::TextChannel { name, .. } = &channel {
+                by_name.insert(name.clone(), channel.clone());
+            }
+        }
+        assert_eq!(by_name.len(), 2, "{:?}", by_name.keys());
+        match &by_name["staff"] {
+            Channel::TextChannel {
+                default_permissions,
+                role_permissions,
+                ..
+            } => {
+                assert_eq!(
+                    default_permissions.expect("still private").d,
+                    ChannelPermission::ViewChannel as i64
+                );
+                assert_eq!(
+                    role_permissions.keys().collect::<Vec<_>>(),
+                    vec![&mod_id],
+                    "no overwrite of a dropped role survives"
+                );
+            }
+            _ => panic!("expected a text channel"),
+        }
+
+        let mut emojis: Vec<(String, bool)> = db
+            .fetch_emoji_by_parent_id(&server_id)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|emoji| (emoji.name, emoji.animated))
+            .collect();
+        emojis.sort();
+        assert_eq!(
+            emojis,
+            vec![("party".to_string(), true), ("still".to_string(), false)]
+        );
+
+        let summary = stored.summary.expect("summary");
+        assert_eq!(summary.channels_created, 2);
+        assert_eq!(summary.channels_skipped, 1);
+        assert!(
+            summary
+                .notes
+                .iter()
+                .any(|note| note.contains("Fluxer link channels")),
+            "{:?}",
+            summary.notes
+        );
+        assert!(
+            summary
+                .notes
+                .iter()
+                .any(|note| note.starts_with("Delete the 'Sloga Importer' role on Fluxer")),
+            "{:?}",
+            summary.notes
+        );
+    }
+
+    /// A Fluxer job whose worker died mid-build: the sweeper rolls its
+    /// orphan server back, and the bot leaves on the leave retry (with the
+    /// `{}` body).
+    ///
+    /// `sweep_stale` reads the ambient config, which on a dev box has no
+    /// Fluxer bot token, so the sweep's own leave sends nothing (asserted);
+    /// the next housekeeping tick, with the fake upstream's config, leaves.
+    #[tokio::test]
+    async fn reaped_fluxer_job_rolls_back_and_the_bot_leaves() {
+        assert!(
+            config().await.api.import.fluxer.bot_token.is_empty(),
+            "this test assumes no Fluxer bot token in the ambient config"
+        );
+
+        let db = DatabaseInfo::Reference.connect().await.unwrap();
+        let owner = make_owner(&db).await;
+        let (server, _) = Server::create(
+            &db,
+            v0::DataCreateServer {
+                name: "Half built".to_string(),
+                description: None,
+                nsfw: None,
+            },
+            &owner,
+            false,
+        )
+        .await
+        .unwrap();
+
+        let mut job = fluxer_job(&owner.id, "sloga-import-ABCDEFGH");
+        job.status = ImportStatus::Running;
+        job.stage = ImportStage::Channels;
+        job.server_id = Some(server.id.clone());
+        job.updated_at = Timestamp::now_utc()
+            .checked_sub(iso8601_timestamp::Duration::hours(1))
+            .unwrap();
+        db.insert_discord_import_job(&job).await.unwrap();
+
+        sweep_stale(&db).await.unwrap();
+
+        assert!(
+            db.fetch_server(&server.id).await.is_err(),
+            "the orphan server is rolled back"
+        );
+        let stored = db.fetch_discord_import_job(&job.id).await.unwrap();
+        assert_eq!(stored.status, ImportStatus::Failed);
+        assert!(!stored.source_left, "no token: nothing could be sent yet");
+
+        let api = FakeUpstream::new()
+            .reply("DELETE", &fluxer_leave_path(), 204, "")
+            .start()
+            .await;
+        let mut config = config_with(false, false, true).await;
+        config.api.import.fluxer = api.fluxer_config(&api);
+
+        // Tick 0 is a sweep tick: the leave retry runs with the real hook.
+        assert!(housekeeping(&db, &config, 0, &leave_source).await);
+
+        assert!(
+            db.fetch_discord_import_job(&job.id)
+                .await
+                .unwrap()
+                .source_left
+        );
+        let seen = api.seen();
+        assert_eq!(
+            seen.iter()
+                .map(|seen| (seen.method.as_str(), seen.path.as_str()))
+                .collect::<Vec<_>>(),
+            vec![("DELETE", fluxer_leave_path().as_str())]
+        );
+        assert_eq!(seen[0].body, b"{}");
     }
 }

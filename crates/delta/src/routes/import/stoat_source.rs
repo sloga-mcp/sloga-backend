@@ -11,7 +11,9 @@
 //!
 //! Failures are logged at `warn` by call, status code and error kind only:
 //! never the URL (it carries what the user pasted), the token or a body.
+//! The client, body cap and transport are shared (`upstream_http`).
 
+#[cfg(test)]
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
@@ -20,10 +22,19 @@ use reqwest::StatusCode;
 use revolt_config::ApiImportBotSource;
 use revolt_database::util::import_challenge::find_accepted_code;
 use revolt_result::{create_error, Result};
-use serde::de::DeserializeOwned;
 use serde::Deserialize;
 
+#[cfg(test)]
+use super::upstream_http::MAX_BODY_BYTES;
+use super::upstream_http::{build_client, error_kind, read_json};
 use super::upstream_throttle::{UpstreamTarget, UpstreamThrottle};
+
+// Moved to `upstream_http`; re-exported here for existing importers
+pub use super::upstream_http::{api_url_is_https, Transport};
+
+// Moved to `fake_upstream`; re-exported here for existing importers
+#[cfg(test)]
+pub(super) use super::fake_upstream;
 
 /// Challenge source tag for Stoat. A code minted for another source never
 /// verifies here.
@@ -40,16 +51,6 @@ const ULID_ALPHABET: &str = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
 /// Link forms that carry an invite code, matched case-insensitively after the
 /// scheme is dropped. Self-hosted instances are out of scope.
 const INVITE_PREFIXES: [&str; 2] = ["stoat.chat/invite/", "rvlt.gg/"];
-
-const UPSTREAM_TIMEOUT: Duration = Duration::from_secs(15);
-/// Largest upstream body read. An invite or server object is a few KiB;
-/// a description is capped far below this upstream.
-const MAX_BODY_BYTES: usize = 1024 * 1024;
-const USER_AGENT: &str = concat!(
-    "SlogaImport/",
-    env!("CARGO_PKG_VERSION"),
-    " (+https://sloga.gg)"
-);
 
 /// What the user pasted, reduced to one whitelisted token
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -153,15 +154,6 @@ pub struct VerifiedStoatSource {
     pub challenge_code: String,
 }
 
-/// Whether `api_url` is an absolute `https://` URL with a host. A source
-/// whose API URL is anything else is not ready: the production client
-/// refuses plain HTTP, so it could never verify.
-pub fn api_url_is_https(api_url: &str) -> bool {
-    url::Url::parse(api_url)
-        .map(|url| url.scheme() == "https" && url.host_str().is_some_and(|host| !host.is_empty()))
-        .unwrap_or(false)
-}
-
 /// Minimal Stoat API client for verification.
 ///
 /// The base URL comes only from operator config. Redirects are never
@@ -174,116 +166,11 @@ pub struct StoatApi {
     bot_token: String,
 }
 
-/// How the client reaches its upstream
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Transport {
-    /// HTTPS only, system proxy settings honored
-    Production,
-    /// Plain HTTP to a loopback fake, never through a proxy
-    #[cfg(test)]
-    LoopbackTest,
-}
-
-impl Transport {
-    /// Whether this transport can reach `api_url` at all. Production is
-    /// exactly [`api_url_is_https`], the same test `GET /` and the challenge
-    /// route apply through `ImportSource::ready`.
-    pub fn accepts_api_url(self, api_url: &str) -> bool {
-        match self {
-            Transport::Production => api_url_is_https(api_url),
-            #[cfg(test)]
-            Transport::LoopbackTest => api_url.starts_with("http://127.0.0.1:"),
-        }
-    }
-}
-
-/// A transport error by kind. `reqwest::Error`'s `Display` includes the
-/// URL, which carries what the user pasted, so it is never logged.
-fn error_kind(error: &reqwest::Error) -> &'static str {
-    if error.is_timeout() {
-        "timeout"
-    } else if error.is_connect() {
-        "connect"
-    } else if error.is_redirect() {
-        "redirect"
-    } else if error.is_body() {
-        "body"
-    } else if error.is_decode() {
-        "decode"
-    } else if error.is_request() {
-        "request"
-    } else if error.is_builder() {
-        "builder"
-    } else {
-        "other"
-    }
-}
-
-/// Read a JSON body of at most [`MAX_BODY_BYTES`]: refused up front when the
-/// declared length is over, and while reading when the bytes are (chunked
-/// or undeclared bodies). Every failure is `ImportUpstreamUnavailable`.
-async fn read_json<T: DeserializeOwned>(
-    mut response: reqwest::Response,
-    call: &'static str,
-) -> Result<T> {
-    if response
-        .content_length()
-        .is_some_and(|length| length > MAX_BODY_BYTES as u64)
-    {
-        log::warn!("stoat import: {call}: declared body over {MAX_BODY_BYTES} bytes; refused");
-        return Err(create_error!(ImportUpstreamUnavailable));
-    }
-
-    let mut body = Vec::new();
-    loop {
-        match response.chunk().await {
-            Ok(Some(chunk)) => {
-                if body.len() + chunk.len() > MAX_BODY_BYTES {
-                    log::warn!("stoat import: {call}: body over {MAX_BODY_BYTES} bytes; refused");
-                    return Err(create_error!(ImportUpstreamUnavailable));
-                }
-                body.extend_from_slice(&chunk);
-            }
-            Ok(None) => break,
-            Err(error) => {
-                log::warn!(
-                    "stoat import: {call}: reading the body failed ({})",
-                    error_kind(&error)
-                );
-                return Err(create_error!(ImportUpstreamUnavailable));
-            }
-        }
-    }
-
-    serde_json::from_slice(&body).map_err(|_| {
-        log::warn!("stoat import: {call}: body is not the expected JSON");
-        create_error!(ImportUpstreamUnavailable)
-    })
-}
-
 impl StoatApi {
     /// Client for `config` (`[api.import.stoat]`) over `transport`. Under
     /// `Production` an `http://` `api_url` is refused at request time too.
     pub fn connect(config: &ApiImportBotSource, transport: Transport) -> Result<StoatApi> {
-        let builder = reqwest::Client::builder()
-            .timeout(UPSTREAM_TIMEOUT)
-            .connect_timeout(UPSTREAM_TIMEOUT)
-            .redirect(reqwest::redirect::Policy::none())
-            .user_agent(USER_AGENT);
-
-        let builder = match transport {
-            Transport::Production => builder.https_only(true),
-            #[cfg(test)]
-            Transport::LoopbackTest => builder.no_proxy(),
-        };
-
-        let client = builder.build().map_err(|error| {
-            log::warn!(
-                "stoat import: building the client failed ({})",
-                error_kind(&error)
-            );
-            create_error!(ImportUpstreamUnavailable)
-        })?;
+        let client = build_client(transport, SOURCE_TAG)?;
 
         Ok(StoatApi {
             client,
@@ -315,7 +202,7 @@ impl StoatApi {
             }
         }
 
-        let invite: InviteProbe = read_json(response, CALL).await?;
+        let invite: InviteProbe = read_json(response, SOURCE_TAG, CALL).await?;
 
         // A group invite names no server
         if invite.kind.as_deref() != Some("Server") {
@@ -372,7 +259,7 @@ impl StoatApi {
             }
         }
 
-        let server: ServerProbe = read_json(response, CALL).await?;
+        let server: ServerProbe = read_json(response, SOURCE_TAG, CALL).await?;
 
         if server.id != server_id {
             log::warn!("stoat import: {CALL} returned a different server");
@@ -436,201 +323,6 @@ pub async fn verify_stoat_source(
         server_id,
         challenge_code,
     })
-}
-
-/// A scripted Stoat API on a loopback port, for tests that must not reach
-/// the real one
-#[cfg(test)]
-pub(super) mod fake_upstream {
-    use std::collections::HashMap;
-    use std::sync::{Arc, Mutex};
-
-    use revolt_config::ApiImportBotSource;
-    use rocket::tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use rocket::tokio::net::TcpListener;
-
-    pub const BOT_TOKEN: &str = "fake-bot-token";
-
-    /// One request the fake received
-    #[derive(Clone, Debug)]
-    pub struct Seen {
-        pub path: String,
-        pub bot_token: Option<String>,
-    }
-
-    /// How a reply's body is framed on the wire
-    #[derive(Clone, Copy)]
-    pub enum Framing {
-        /// `content-length` = the body, then close
-        Length,
-        /// `transfer-encoding: chunked`, no declared length, then close
-        Chunked,
-        /// `content-length: <n>` with only the body sent, then the
-        /// connection held open: a reader that trusts the declared length
-        /// waits for bytes that never come
-        DeclaredButHeld(usize),
-    }
-
-    #[derive(Clone)]
-    struct Reply {
-        status: u16,
-        body: String,
-        location: Option<String>,
-        framing: Framing,
-    }
-
-    pub struct FakeStoat {
-        pub api_url: String,
-        replies: HashMap<String, Reply>,
-        seen: Arc<Mutex<Vec<Seen>>>,
-    }
-
-    impl FakeStoat {
-        pub fn new() -> FakeStoat {
-            FakeStoat {
-                api_url: String::new(),
-                replies: HashMap::new(),
-                seen: Arc::new(Mutex::new(vec![])),
-            }
-        }
-
-        /// Answer `path` with `status` and a JSON `body`
-        pub fn reply(self, path: &str, status: u16, body: serde_json::Value) -> FakeStoat {
-            self.reply_framed(path, status, body, Framing::Length)
-        }
-
-        /// Answer `path` with `status` and a JSON `body` framed as `framing`
-        pub fn reply_framed(
-            mut self,
-            path: &str,
-            status: u16,
-            body: serde_json::Value,
-            framing: Framing,
-        ) -> FakeStoat {
-            self.replies.insert(
-                path.to_string(),
-                Reply {
-                    status,
-                    body: body.to_string(),
-                    location: None,
-                    framing,
-                },
-            );
-            self
-        }
-
-        /// Answer `path` with a 302 to `location`
-        pub fn redirect(mut self, path: &str, location: &str) -> FakeStoat {
-            self.replies.insert(
-                path.to_string(),
-                Reply {
-                    status: 302,
-                    body: String::new(),
-                    location: Some(location.to_string()),
-                    framing: Framing::Length,
-                },
-            );
-            self
-        }
-
-        /// Start serving; unscripted paths get 404
-        pub async fn start(mut self) -> FakeStoat {
-            let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
-            self.api_url = format!("http://{}", listener.local_addr().expect("addr"));
-
-            let replies = self.replies.clone();
-            let seen = self.seen.clone();
-            rocket::tokio::spawn(async move {
-                while let Ok((mut socket, _)) = listener.accept().await {
-                    let replies = replies.clone();
-                    let seen = seen.clone();
-                    rocket::tokio::spawn(async move {
-                        let mut head = Vec::new();
-                        let mut chunk = [0u8; 1024];
-                        while !head.windows(4).any(|w| w == b"\r\n\r\n") && head.len() < 65536 {
-                            match socket.read(&mut chunk).await {
-                                Ok(0) | Err(_) => break,
-                                Ok(n) => head.extend_from_slice(&chunk[..n]),
-                            }
-                        }
-
-                        let head = String::from_utf8_lossy(&head).to_string();
-                        let path = head.split_whitespace().nth(1).unwrap_or("").to_string();
-                        let bot_token = head.lines().find_map(|line| {
-                            let (name, value) = line.split_once(':')?;
-                            name.trim()
-                                .eq_ignore_ascii_case("x-bot-token")
-                                .then(|| value.trim().to_string())
-                        });
-                        seen.lock().unwrap().push(Seen {
-                            path: path.clone(),
-                            bot_token,
-                        });
-
-                        let reply = replies.get(&path).cloned().unwrap_or(Reply {
-                            status: 404,
-                            body: r#"{"type":"NotFound"}"#.to_string(),
-                            location: None,
-                            framing: Framing::Length,
-                        });
-                        let location = reply
-                            .location
-                            .map(|to| format!("location: {to}\r\n"))
-                            .unwrap_or_default();
-                        let head = format!(
-                            "HTTP/1.1 {} Scripted\r\ncontent-type: application/json\r\n{location}connection: close\r\n",
-                            reply.status
-                        );
-                        let response = match reply.framing {
-                            Framing::Length => format!(
-                                "{head}content-length: {}\r\n\r\n{}",
-                                reply.body.len(),
-                                reply.body
-                            ),
-                            Framing::DeclaredButHeld(declared) => {
-                                format!("{head}content-length: {declared}\r\n\r\n{}", reply.body)
-                            }
-                            Framing::Chunked => {
-                                let mut out = format!("{head}transfer-encoding: chunked\r\n\r\n");
-                                for chunk in reply.body.as_bytes().chunks(64 * 1024) {
-                                    out.push_str(&format!("{:x}\r\n", chunk.len()));
-                                    out.push_str(std::str::from_utf8(chunk).expect("ascii body"));
-                                    out.push_str("\r\n");
-                                }
-                                out.push_str("0\r\n\r\n");
-                                out
-                            }
-                        };
-                        let _ = socket.write_all(response.as_bytes()).await;
-                        if let Framing::DeclaredButHeld(_) = reply.framing {
-                            rocket::tokio::time::sleep(std::time::Duration::from_secs(20)).await;
-                        }
-                        let _ = socket.shutdown().await;
-                    });
-                }
-            });
-
-            self
-        }
-
-        /// Requests received so far, in order
-        pub fn seen(&self) -> Vec<Seen> {
-            self.seen.lock().unwrap().clone()
-        }
-
-        /// A ready-looking `[api.import.stoat]` pointing at this fake
-        pub fn source_config(&self) -> ApiImportBotSource {
-            ApiImportBotSource {
-                enabled: true,
-                api_url: self.api_url.clone(),
-                app_url: "https://stoat.example".to_string(),
-                cdn_url: "https://cdn.stoat.example".to_string(),
-                bot_id: "01BOT000000000000000000000".to_string(),
-                bot_token: BOT_TOKEN.to_string(),
-                reconcile_after_hours: 24,
-            }
-        }
-    }
 }
 
 #[cfg(test)]

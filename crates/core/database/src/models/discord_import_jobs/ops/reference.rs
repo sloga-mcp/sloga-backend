@@ -136,6 +136,21 @@ impl AbstractDiscordImportJobs for ReferenceDb {
         }))
     }
 
+    /// Whether a job of this kind on this source is active or recent.
+    async fn has_recent_job_for_source(
+        &self,
+        kind: &ImportJobKind,
+        source_server_id: &str,
+        since: Timestamp,
+    ) -> Result<bool> {
+        let rows = self.discord_import_jobs.lock().await;
+        Ok(rows.values().any(|row| {
+            &row.kind == kind
+                && row.source_server_id.as_deref() == Some(source_server_id)
+                && (row.is_active() || row.updated_at >= since)
+        }))
+    }
+
     /// Terminal source-kind jobs whose bot has not left the source yet.
     async fn fetch_unleft_terminal_source_jobs(
         &self,

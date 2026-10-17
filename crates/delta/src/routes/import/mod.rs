@@ -4,15 +4,21 @@ use rocket::Route;
 mod challenge;
 mod discord_template;
 mod dto;
+#[cfg(test)]
+mod fake_upstream;
+mod fluxer_source;
 mod job_active;
 mod job_fetch;
 mod source_server;
 mod stickers_start;
 mod stoat_source;
+mod upstream_http;
 mod upstream_throttle;
 
 /// For `GET /`, which advertises exactly the sources these routes accept
 pub(crate) use source_server::ImportSource;
+/// For `GET /`, which advertises a source only when its API URL is HTTPS
+pub(crate) use upstream_http::api_url_is_https;
 
 pub fn routes() -> (Vec<Route>, OpenApi) {
     openapi_get_routes_spec![

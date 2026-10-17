@@ -127,6 +127,12 @@ app_url = "https://fluxer.app"
 cdn_url = "https://fluxerusercontent.com"
 bot_id = ""
 bot_token = ""
+# crond makes the bot leave any Fluxer guild it joined more than this many
+# hours ago that no import job is using. The bot holds Administrator there,
+# so turn it on (24, what the import screen promises) in the overrides of
+# exactly ONE deployment, the one that runs Fluxer imports: every crond
+# judges by its own database. 0 = off.
+reconcile_after_hours = 0
 
 [api.import.matrix]
 # Import a Matrix space through an operator-run bot account the user invites.

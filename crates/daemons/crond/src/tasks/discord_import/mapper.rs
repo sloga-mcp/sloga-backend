@@ -745,8 +745,39 @@ fn sorted_channels(template: &GuildTemplate) -> Vec<&TemplateChannel> {
     channels
 }
 
-/// Map a fetched template into a plan.
+/// The platform a template came from. Picks the wording of the notes shown to
+/// the user and nothing else: the mapping is identical for every source.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SourceLabel {
+    /// A Discord guild template.
+    Discord,
+    /// A Fluxer guild, adapted onto [`GuildTemplate`] by the Fluxer importer.
+    Fluxer,
+}
+
+impl SourceLabel {
+    /// The platform's name as users know it.
+    pub(crate) fn display_name(self) -> &'static str {
+        match self {
+            SourceLabel::Discord => "Discord",
+            SourceLabel::Fluxer => "Fluxer",
+        }
+    }
+}
+
+/// Map a fetched Discord template into a plan.
 pub fn plan_import(template: &GuildTemplate) -> Result<ImportPlan, PlanError> {
+    plan_import_from(template, SourceLabel::Discord)
+}
+
+/// Map a template from the `label` platform into a plan. `label` only words
+/// the user-visible notes; [`PlanError`] is worded by the caller from the job
+/// kind (`PlanError::user_message_for`).
+pub(crate) fn plan_import_from(
+    template: &GuildTemplate,
+    label: SourceLabel,
+) -> Result<ImportPlan, PlanError> {
+    let source = label.display_name();
     let guild = &template.serialized_source_guild;
     let mut skipped: Vec<String> = Vec::new();
 
@@ -779,13 +810,12 @@ pub fn plan_import(template: &GuildTemplate) -> Result<ImportPlan, PlanError> {
     // everyone who accepts it is about to be an administrator, say so in terms
     // nobody could miss.
     if role_plan.everyone_is_administrator {
-        skipped.push(
-            "⚠ In your Discord server, @everyone had the Administrator permission, so everyone \
+        skipped.push(format!(
+            "⚠ In your {source} server, @everyone had the Administrator permission, so everyone \
              on this Sloga server can manage roles, channels and bans — including anyone who \
              joins using the invite link below. Change this in Server Settings if it wasn't \
              deliberate."
-                .to_string(),
-        );
+        ));
     }
 
     let ordered = sorted_channels(template);
@@ -885,15 +915,25 @@ pub fn plan_import(template: &GuildTemplate) -> Result<ImportPlan, PlanError> {
         ));
     }
     if skipped_member_overwrites > 0 {
+        // "The template" is Discord's word for what was read; a Fluxer import
+        // reads the server itself.
+        let rather_than = match label {
+            SourceLabel::Discord => "the template",
+            SourceLabel::Fluxer => "being copied",
+        };
         skipped.push(format!(
-            "{skipped_member_overwrites} channel permission(s) set on individual Discord members \
+            "{skipped_member_overwrites} channel permission(s) set on individual {source} members \
              were not imported — Sloga sets channel permissions by role, and members come over \
-             through your invite link rather than the template."
+             through your invite link rather than {rather_than}."
         ));
     }
     if skipped_dangling_overwrites > 0 {
+        let container = match label {
+            SourceLabel::Discord => "the template",
+            SourceLabel::Fluxer => "the Fluxer server",
+        };
         skipped.push(format!(
-            "{skipped_dangling_overwrites} channel permission(s) pointed at a role the template \
+            "{skipped_dangling_overwrites} channel permission(s) pointed at a role {container} \
              doesn't contain and were skipped."
         ));
     }
@@ -948,7 +988,7 @@ pub fn plan_import(template: &GuildTemplate) -> Result<ImportPlan, PlanError> {
     }) {
         skipped.push(format!(
             "\"{}\" is your AFK channel, but @everyone can't connect to it (the same as on \
-             Discord), so idle members who can't connect won't be moved there. Allow Connect \
+             {source}), so idle members who can't connect won't be moved there. Allow Connect \
              for @everyone on that channel if you want idle members moved.",
             channel.name
         ));
@@ -2325,5 +2365,99 @@ mod tests {
         assert!(!everyone_can_view(send, over(view, view)));
         // Unrelated bits change nothing.
         assert!(everyone_can_view(view, over(0, send)));
+    }
+
+    // ----------------------------------------------------------------------
+    // Source label
+    // ----------------------------------------------------------------------
+
+    /// A guild that raises every note that names the source: `@everyone` is an
+    /// administrator (8), a channel carries a member overwrite and one for an
+    /// undefined role, and the AFK channel denies CONNECT (1048576) to
+    /// `@everyone`.
+    fn every_labelled_note() -> GuildTemplate {
+        template(
+            r#"{"name":"g","afk_channel_id":2,"afk_timeout":300,
+                "roles":[{"id":0,"name":"@everyone","permissions":8}],
+                "channels":[
+                    {"id":1,"type":0,"name":"c","permission_overwrites":[
+                        {"id":"99","type":1,"allow":"1024","deny":"0"},
+                        {"id":404,"type":0,"allow":1024,"deny":0}
+                    ]},
+                    {"id":2,"type":2,"name":"Idle Zone","permission_overwrites":[
+                        {"id":0,"type":0,"allow":0,"deny":1048576}
+                    ]}
+                ]}"#,
+        )
+    }
+
+    /// `plan_import` is the Discord label, and the Discord notes are pinned
+    /// verbatim to the copy users saw before the label existed.
+    #[test]
+    fn plan_import_is_the_discord_label_with_unchanged_copy() {
+        let template = every_labelled_note();
+        let plan = plan_import(&template);
+        assert_eq!(
+            Ok(plan.clone()),
+            plan_import_from(&template, SourceLabel::Discord)
+        );
+        assert_eq!(
+            plan.skipped,
+            vec![
+                "⚠ In your Discord server, @everyone had the Administrator permission, so \
+                 everyone on this Sloga server can manage roles, channels and bans — including \
+                 anyone who joins using the invite link below. Change this in Server Settings \
+                 if it wasn't deliberate."
+                    .to_string(),
+                "1 channel permission(s) set on individual Discord members were not imported — \
+                 Sloga sets channel permissions by role, and members come over through your \
+                 invite link rather than the template."
+                    .to_string(),
+                "1 channel permission(s) pointed at a role the template doesn't contain and \
+                 were skipped."
+                    .to_string(),
+                "\"Idle Zone\" is your AFK channel, but @everyone can't connect to it (the same \
+                 as on Discord), so idle members who can't connect won't be moved there. Allow \
+                 Connect for @everyone on that channel if you want idle members moved."
+                    .to_string(),
+            ]
+        );
+    }
+
+    /// A Fluxer import sees the same notes, naming Fluxer, never Discord or a
+    /// template. The plan itself does not depend on the label.
+    #[test]
+    fn fluxer_label_names_fluxer_in_every_note() {
+        let template = every_labelled_note();
+        let discord = plan_import(&template);
+        let fluxer = plan_import_from(&template, SourceLabel::Fluxer).unwrap();
+
+        assert_eq!(fluxer.skipped.len(), 4, "{:?}", fluxer.skipped);
+        for note in &fluxer.skipped {
+            assert!(!note.contains("Discord"), "{note}");
+            assert!(!note.contains("template"), "{note}");
+        }
+        for wanted in [
+            "In your Fluxer server, @everyone had the Administrator permission",
+            "set on individual Fluxer members",
+            "rather than being copied.",
+            "pointed at a role the Fluxer server doesn't contain",
+            "(the same as on Fluxer)",
+        ] {
+            assert!(
+                fluxer.skipped.iter().any(|note| note.contains(wanted)),
+                "missing {wanted:?} in {:?}",
+                fluxer.skipped
+            );
+        }
+
+        assert_eq!(
+            ImportPlan {
+                skipped: discord.skipped.clone(),
+                ..fluxer
+            },
+            discord,
+            "only the wording may differ"
+        );
     }
 }

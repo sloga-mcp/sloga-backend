@@ -440,7 +440,7 @@ pub struct ApiImportBotSource {
     /// crond makes the bot leave any server it joined more than this many
     /// hours ago that no import job is using (a user who added the bot and
     /// never finished verifying). `0`, the default, turns that reconcile off.
-    /// Only Stoat reads it so far.
+    /// Stoat and Fluxer read it; Matrix does not yet.
     ///
     /// Opt-in, and on exactly ONE deployment: each crond judges "no job is
     /// using it" by its own database, so a second deployment holding the

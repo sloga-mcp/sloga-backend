@@ -127,6 +127,7 @@ async fn main() {
         cron_task_wrapper(stream_live::task, db.clone(), amqp.clone()),
         cron_task_wrapper(discord_import::task, db.clone(), amqp.clone()),
         cron_task_wrapper(stoat_import::reconcile::task, db.clone(), amqp.clone()),
+        cron_task_wrapper(fluxer_import::reconcile::task, db.clone(), amqp.clone()),
         cron_task_wrapper(afk_sweep::task, db.clone(), amqp.clone()),
         cron_task_wrapper(antispam_daily::task, db.clone(), amqp.clone()),
     );
