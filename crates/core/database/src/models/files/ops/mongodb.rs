@@ -209,6 +209,21 @@ impl AbstractAttachments for MongoDb {
             .map_err(|_| create_database_error!("update_many", COL))
     }
 
+    /// Mark every attachment used by one of `used_for_ids` as deleted.
+    async fn delete_attachments_used_by(&self, used_for_ids: &[String]) -> Result<()> {
+        if used_for_ids.is_empty() {
+            return Ok(());
+        }
+
+        // Same soft delete as the server deletion path.
+        self.delete_many_attachments(doc! {
+            "used_for.id": {
+                "$in": used_for_ids
+            }
+        })
+        .await
+    }
+
     /// Delete the attachment entry.
     async fn delete_attachment(&self, id: &str) -> Result<()> {
         query!(self, delete_one_by_id, COL, id).map(|_| ())

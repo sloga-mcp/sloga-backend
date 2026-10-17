@@ -57,6 +57,11 @@ impl<'r> Responder<'r, 'static> for Error {
             ErrorType::AlreadyInServer => Status::Conflict,
             ErrorType::CannotTimeoutYourself => Status::BadRequest,
             ErrorType::ImportAlreadyInProgress => Status::Conflict,
+            ErrorType::ImportSourceNotFound => Status::NotFound,
+            ErrorType::ImportVerificationMissing => Status::Forbidden,
+            ErrorType::ImportBotNotInServer => Status::NotFound,
+            ErrorType::ImportUpstreamUnavailable => Status::ServiceUnavailable,
+            ErrorType::ImportSourceUnavailable => Status::BadRequest,
 
             ErrorType::TooManyServers { .. } => Status::BadRequest,
             ErrorType::TooManyEmbeds { .. } => Status::BadRequest,
@@ -185,5 +190,33 @@ impl<'r> Responder<'r, 'static> for Error {
             .header(ContentType::new("application", "json"))
             .status(status)
             .ok()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use rocket::{local::blocking::Client, response::Responder};
+
+    use crate::{create_error, Error};
+
+    /// Pins the import errors' statuses; `axum.rs` pins the same table
+    #[test]
+    fn import_error_statuses() {
+        let client = Client::untracked(rocket::build()).unwrap();
+        let request = client.get("/");
+
+        let cases: [(Error, u16); 5] = [
+            (create_error!(ImportSourceNotFound), 404),
+            (create_error!(ImportVerificationMissing), 403),
+            (create_error!(ImportBotNotInServer), 404),
+            (create_error!(ImportUpstreamUnavailable), 503),
+            (create_error!(ImportSourceUnavailable), 400),
+        ];
+
+        for (error, code) in cases {
+            let name = format!("{:?}", error.error_type);
+            let response = error.respond_to(request.inner()).unwrap();
+            assert_eq!(response.status().code, code, "{name}");
+        }
     }
 }

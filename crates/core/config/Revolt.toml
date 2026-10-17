@@ -88,11 +88,56 @@ client_id = ""
 client_secret = ""
 redirect_uri = ""
 
+[api.import]
+# Key for the ownership-challenge codes of every bot source (stoat, fluxer,
+# matrix). SECRET: set it in Revolt.overrides.toml only. Empty = no bot
+# source is ready, whatever its own keys say.
+challenge_secret = ""
+
 [api.import.discord]
 # Import a Discord community into Sloga.
 # Primary path is a server-template link, which hits a PUBLIC unauthenticated
 # Discord endpoint — no credentials of any kind are required to enable this.
 enabled = false
+
+[api.import.stoat]
+# Import a Stoat server through an operator-run public bot on stoat.chat.
+# bot_token is SECRET: set it in Revolt.overrides.toml only.
+enabled = false
+api_url = "https://api.stoat.chat"
+app_url = "https://stoat.chat"
+cdn_url = "https://cdn.stoatusercontent.com"
+bot_id = ""
+bot_token = ""
+# crond makes the bot leave any Stoat server it joined more than this many
+# hours ago that no import job is using (someone added the bot and never
+# finished verifying). Needs only api_url and bot_token. 0 = off. Turn it on
+# (24) in the overrides of exactly ONE deployment: every crond judges by its
+# own database, so a second one holding the same token would evict the bot
+# from servers the first is importing.
+reconcile_after_hours = 0
+
+[api.import.fluxer]
+# Import a Fluxer guild through an operator-run public bot on fluxer.app.
+# bot_id is the application / client id. bot_token is SECRET: set it in
+# Revolt.overrides.toml only.
+enabled = false
+api_url = "https://api.fluxer.app"
+app_url = "https://fluxer.app"
+cdn_url = "https://fluxerusercontent.com"
+bot_id = ""
+bot_token = ""
+
+[api.import.matrix]
+# Import a Matrix space through an operator-run bot account the user invites.
+# bot_user_id is e.g. @sloga-import:<homeserver>. access_token is SECRET: set
+# it in Revolt.overrides.toml only. max_joins = child-room join budget per
+# import.
+enabled = false
+homeserver_url = ""
+bot_user_id = ""
+access_token = ""
+max_joins = 8
 
 [api.security]
 # Authifier Shield API key

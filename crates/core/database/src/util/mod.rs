@@ -8,6 +8,7 @@ pub mod chunked;
 pub mod email;
 mod funcs;
 pub mod idempotency;
+pub mod import_challenge;
 pub mod ip;
 pub mod name_filter;
 pub mod password;

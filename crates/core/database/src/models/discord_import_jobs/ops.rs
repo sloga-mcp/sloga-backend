@@ -1,7 +1,7 @@
-use iso8601_timestamp::Timestamp;
+use iso8601_timestamp::{Duration, Timestamp};
 use revolt_result::Result;
 
-use crate::DiscordImportJob;
+use crate::{DiscordImportJob, ImportJobKind};
 
 #[cfg(feature = "mongodb")]
 mod mongodb;
@@ -77,12 +77,73 @@ pub trait AbstractDiscordImportJobs: Sync + Send {
         &self,
         cutoff: Timestamp,
     ) -> Result<Vec<DiscordImportJob>>;
+
+    /// Whether any job OTHER than `except_job_id` of this `kind` is still
+    /// in flight (`Queued` or `Running` — the same set as the
+    /// `active_user_id` partial index and `is_active`) against the same
+    /// `source_server_id`.
+    ///
+    /// Drives "the bot leaves a source only once no job still needs it". A
+    /// read, not a lock: a job queued for the source an instant after this
+    /// returns `false` finds the bot gone and fails with `ImportBotNotInServer`;
+    /// the user re-adds the bot and retries. Meant
+    /// for source kinds; template and sticker rows never carry
+    /// `source_server_id`, so they never match.
+    ///
+    /// An empty `except_job_id` excludes nothing (job ids are ULIDs): crond's
+    /// bot reconcile asks that way, having no job of its own.
+    async fn has_other_active_job_for_source(
+        &self,
+        kind: &ImportJobKind,
+        source_server_id: &str,
+        except_job_id: &str,
+    ) -> Result<bool>;
+
+    /// Terminal (`Completed` / `Failed`) source-kind jobs whose bot has not
+    /// yet left the source (`source_left` false OR ABSENT), whose heartbeat
+    /// (`updated_at`, which stops moving once a job is terminal) is within
+    /// the last `max_age_days` days — the leave-retry sweep's input.
+    ///
+    /// Oldest first (ULID id order), at most `limit` rows; `limit <= 0`
+    /// returns nothing rather than meaning "unbounded". Rows past the age
+    /// cap drop out on purpose: the caller logs them loudly instead of
+    /// retrying forever.
+    async fn fetch_unleft_terminal_source_jobs(
+        &self,
+        max_age_days: i64,
+        limit: i64,
+    ) -> Result<Vec<DiscordImportJob>>;
+
+    /// Record that the bot has left this job's source (`source_left =
+    /// true`), touching nothing else — in particular NOT `updated_at`, so
+    /// the row's terminal time is preserved.
+    ///
+    /// A targeted field write, not a replace: the job is terminal, and
+    /// `save_discord_import_job_if_active` refuses terminal rows by design.
+    /// No upsert; a missing row is a silent no-op.
+    async fn mark_source_left(&self, id: &str) -> Result<()>;
 }
+
+/// Lower bound on `updated_at` for `fetch_unleft_terminal_source_jobs`,
+/// shared by both drivers so they agree on the boundary.
+///
+/// The age is clamped to `0..=UNLEFT_MAX_AGE_DAYS` first: `Duration::days`
+/// PANICS on overflow, and a crond config typo must not take the sweeper
+/// down. Negative reads as 0 (bound = now, so nothing qualifies).
+fn unleft_cutoff(max_age_days: i64) -> Timestamp {
+    let days = max_age_days.clamp(0, UNLEFT_MAX_AGE_DAYS);
+    Timestamp::now_utc()
+        .checked_sub(Duration::days(days))
+        .unwrap_or(Timestamp::UNIX_EPOCH)
+}
+
+/// Upper clamp for `unleft_cutoff` — 100 years, far beyond any sane cap.
+const UNLEFT_MAX_AGE_DAYS: i64 = 36_500;
 
 #[cfg(test)]
 mod tests {
     use super::AbstractDiscordImportJobs;
-    use crate::{DiscordImportJob, DiscordImportSummary, ImportStage, ImportStatus};
+    use crate::{DiscordImportJob, DiscordImportSummary, ImportJobKind, ImportStage, ImportStatus};
     use iso8601_timestamp::{Duration, Timestamp};
     use revolt_result::ErrorType;
 
@@ -545,6 +606,384 @@ mod tests {
                     .id,
                 fourth.id
             );
+        });
+    }
+
+    fn source_job(user_id: &str, kind: ImportJobKind, source_server_id: &str) -> DiscordImportJob {
+        DiscordImportJob::new_source(
+            user_id.to_string(),
+            kind,
+            format!("pasted:{source_server_id}"),
+            Some(source_server_id.to_string()),
+            Some("sloga-import-ABCDEFGH".to_string()),
+        )
+    }
+
+    /// Each source kind, its birth stage, the three new fields, and the
+    /// `Assets` stage survive both drivers.
+    #[tokio::test]
+    async fn source_job_round_trip() {
+        database_test!(|db| async move {
+            for (index, kind) in ImportJobKind::SOURCE_KINDS.into_iter().enumerate() {
+                let user = format!("01USER00000000000000000SRC{index}");
+                let row = source_job(&user, kind.clone(), "01SRCSERVER0000000000000000");
+                db.insert_discord_import_job(&row).await.unwrap();
+
+                let fetched = db.fetch_discord_import_job(&row.id).await.unwrap();
+                assert_eq!(fetched.kind, kind);
+                assert_eq!(fetched.stage, ImportStage::Verifying);
+                assert_eq!(fetched.status, ImportStatus::Queued);
+                assert_eq!(fetched.template_code, "pasted:01SRCSERVER0000000000000000");
+                assert_eq!(
+                    fetched.source_server_id.as_deref(),
+                    Some("01SRCSERVER0000000000000000")
+                );
+                assert_eq!(
+                    fetched.challenge_code.as_deref(),
+                    Some("sloga-import-ABCDEFGH")
+                );
+                assert!(!fetched.source_left);
+
+                let mut assets = fetched.clone();
+                assets.status = ImportStatus::Running;
+                assets.stage = ImportStage::Assets;
+                assert!(db.save_discord_import_job_if_active(&assets).await.unwrap());
+                assert_eq!(
+                    db.fetch_discord_import_job(&row.id).await.unwrap().stage,
+                    ImportStage::Assets
+                );
+            }
+
+            // A template job carries none of the source fields.
+            let template = job("01USER00000000000000000SRCT", "tmpl-x");
+            db.insert_discord_import_job(&template).await.unwrap();
+            let fetched = db.fetch_discord_import_job(&template.id).await.unwrap();
+            assert_eq!(fetched.source_server_id, None);
+            assert_eq!(fetched.challenge_code, None);
+            assert!(!fetched.source_left);
+        });
+    }
+
+    #[tokio::test]
+    async fn other_active_job_for_source() {
+        database_test!(|db| async move {
+            let source = "01SRCSERVER00000000000000AA";
+            let stoat = ImportJobKind::StoatServer;
+
+            // This job alone: there is no OTHER job, so the bot may leave.
+            let mine = source_job("01USER0000000000000000OJS1", stoat.clone(), source);
+            db.insert_discord_import_job(&mine).await.unwrap();
+            assert!(!db
+                .has_other_active_job_for_source(&stoat, source, &mine.id)
+                .await
+                .unwrap());
+
+            // Terminal jobs on the same source do not hold the bot.
+            for (user, status) in [
+                ("01USER0000000000000000OJS2", ImportStatus::Completed),
+                ("01USER0000000000000000OJS3", ImportStatus::Failed),
+            ] {
+                let mut done = source_job(user, stoat.clone(), source);
+                done.status = status;
+                done.stage = ImportStage::Done;
+                db.insert_discord_import_job(&done).await.unwrap();
+            }
+            assert!(!db
+                .has_other_active_job_for_source(&stoat, source, &mine.id)
+                .await
+                .unwrap());
+
+            // Same source id, different kind: not the same source.
+            let fluxer = source_job(
+                "01USER0000000000000000OJS4",
+                ImportJobKind::FluxerServer,
+                source,
+            );
+            db.insert_discord_import_job(&fluxer).await.unwrap();
+            assert!(!db
+                .has_other_active_job_for_source(&stoat, source, &mine.id)
+                .await
+                .unwrap());
+
+            // Same kind, different source: unrelated.
+            let elsewhere = source_job(
+                "01USER0000000000000000OJS5",
+                stoat.clone(),
+                "01SRCSERVER00000000000000BB",
+            );
+            db.insert_discord_import_job(&elsewhere).await.unwrap();
+            assert!(!db
+                .has_other_active_job_for_source(&stoat, source, &mine.id)
+                .await
+                .unwrap());
+
+            // Another user's QUEUED job on the same source holds the bot...
+            let queued = source_job("01USER0000000000000000OJS6", stoat.clone(), source);
+            db.insert_discord_import_job(&queued).await.unwrap();
+            assert!(db
+                .has_other_active_job_for_source(&stoat, source, &mine.id)
+                .await
+                .unwrap());
+            // ...and the exclusion is by job id only: from `queued`'s side,
+            // `mine` is the other active job.
+            assert!(db
+                .has_other_active_job_for_source(&stoat, source, &queued.id)
+                .await
+                .unwrap());
+
+            // RUNNING holds it too.
+            let mut running = queued.clone();
+            running.status = ImportStatus::Running;
+            db.save_discord_import_job(&running).await.unwrap();
+            assert!(db
+                .has_other_active_job_for_source(&stoat, source, &mine.id)
+                .await
+                .unwrap());
+
+            // Once it finishes, `mine` is the only active job again.
+            let mut finished = running.clone();
+            finished.status = ImportStatus::Completed;
+            finished.stage = ImportStage::Done;
+            assert!(db
+                .save_discord_import_job_if_active(&finished)
+                .await
+                .unwrap());
+            assert!(!db
+                .has_other_active_job_for_source(&stoat, source, &mine.id)
+                .await
+                .unwrap());
+        });
+    }
+
+    /// crond's bot reconcile asks with no job of its own: an empty exclusion
+    /// must count every active job on the source, and nothing else.
+    #[tokio::test]
+    async fn an_empty_exclusion_counts_every_active_job_on_the_source() {
+        database_test!(|db| async move {
+            let source = "01SRCSERVER00000000000000DD";
+            let stoat = ImportJobKind::StoatServer;
+            assert!(!db
+                .has_other_active_job_for_source(&stoat, source, "")
+                .await
+                .unwrap());
+
+            // Terminal jobs, another kind on the same id, and the same kind
+            // on another source: none of them hold the bot.
+            for (user, status) in [
+                ("01USER0000000000000000EEX1", ImportStatus::Completed),
+                ("01USER0000000000000000EEX2", ImportStatus::Failed),
+            ] {
+                let mut done = source_job(user, stoat.clone(), source);
+                done.status = status;
+                done.stage = ImportStage::Done;
+                db.insert_discord_import_job(&done).await.unwrap();
+            }
+            let fluxer = source_job(
+                "01USER0000000000000000EEX3",
+                ImportJobKind::FluxerServer,
+                source,
+            );
+            db.insert_discord_import_job(&fluxer).await.unwrap();
+            let elsewhere = source_job(
+                "01USER0000000000000000EEX4",
+                stoat.clone(),
+                "01SRCSERVER00000000000000EE",
+            );
+            db.insert_discord_import_job(&elsewhere).await.unwrap();
+            assert!(!db
+                .has_other_active_job_for_source(&stoat, source, "")
+                .await
+                .unwrap());
+
+            // A Queued job holds it, then Running, and not once it finishes.
+            let queued = source_job("01USER0000000000000000EEX5", stoat.clone(), source);
+            db.insert_discord_import_job(&queued).await.unwrap();
+            assert!(db
+                .has_other_active_job_for_source(&stoat, source, "")
+                .await
+                .unwrap());
+
+            let mut running = queued.clone();
+            running.status = ImportStatus::Running;
+            db.save_discord_import_job(&running).await.unwrap();
+            assert!(db
+                .has_other_active_job_for_source(&stoat, source, "")
+                .await
+                .unwrap());
+
+            let mut finished = running.clone();
+            finished.status = ImportStatus::Completed;
+            finished.stage = ImportStage::Done;
+            assert!(db
+                .save_discord_import_job_if_active(&finished)
+                .await
+                .unwrap());
+            assert!(!db
+                .has_other_active_job_for_source(&stoat, source, "")
+                .await
+                .unwrap());
+        });
+    }
+
+    #[tokio::test]
+    async fn unleft_terminal_source_jobs_scan_and_mark_left() {
+        database_test!(|db| async move {
+            let now = Timestamp::now_utc();
+            let source = "01SRCSERVER00000000000000CC";
+
+            let terminal =
+                |user: &str, kind: ImportJobKind, status: ImportStatus, age_days: i64| {
+                    let mut row = source_job(user, kind, source);
+                    row.status = status;
+                    row.stage = ImportStage::Done;
+                    row.updated_at = now.checked_sub(Duration::days(age_days)).unwrap();
+                    row
+                };
+
+            // Qualify: terminal, source kind, not left, within 7 days.
+            let completed = terminal(
+                "01USER0000000000000000ULT1",
+                ImportJobKind::StoatServer,
+                ImportStatus::Completed,
+                1,
+            );
+            let failed = terminal(
+                "01USER0000000000000000ULT2",
+                ImportJobKind::MatrixSpace,
+                ImportStatus::Failed,
+                3,
+            );
+            let fluxer = terminal(
+                "01USER0000000000000000ULT3",
+                ImportJobKind::FluxerServer,
+                ImportStatus::Completed,
+                0,
+            );
+
+            // Excluded: already left.
+            let mut left = terminal(
+                "01USER0000000000000000ULT4",
+                ImportJobKind::StoatServer,
+                ImportStatus::Completed,
+                1,
+            );
+            left.source_left = true;
+            // Excluded: past the age cap.
+            let ancient = terminal(
+                "01USER0000000000000000ULT5",
+                ImportJobKind::StoatServer,
+                ImportStatus::Failed,
+                30,
+            );
+            // Excluded: still active (Queued and Running).
+            let queued = source_job(
+                "01USER0000000000000000ULT6",
+                ImportJobKind::StoatServer,
+                source,
+            );
+            let mut running = source_job(
+                "01USER0000000000000000ULT7",
+                ImportJobKind::StoatServer,
+                source,
+            );
+            running.status = ImportStatus::Running;
+            // Excluded: terminal but not a source kind.
+            let mut template = job("01USER0000000000000000ULT8", "tmpl-done");
+            template.status = ImportStatus::Completed;
+            template.stage = ImportStage::Done;
+            let mut stickers = DiscordImportJob::new_stickers(&template);
+            stickers.user_id = "01USER0000000000000000ULT9".to_string();
+            stickers.status = ImportStatus::Failed;
+
+            for row in [
+                &completed, &failed, &fluxer, &left, &ancient, &queued, &running, &template,
+                &stickers,
+            ] {
+                db.insert_discord_import_job(row).await.unwrap();
+            }
+
+            let ids =
+                |rows: Vec<DiscordImportJob>| rows.into_iter().map(|r| r.id).collect::<Vec<_>>();
+
+            // Oldest-first by id, all three qualifying rows.
+            let mut expected = vec![completed.id.clone(), failed.id.clone(), fluxer.id.clone()];
+            expected.sort();
+            assert_eq!(
+                ids(db.fetch_unleft_terminal_source_jobs(7, 100).await.unwrap()),
+                expected
+            );
+
+            // `limit` caps the batch and keeps the oldest.
+            assert_eq!(
+                ids(db.fetch_unleft_terminal_source_jobs(7, 2).await.unwrap()),
+                expected[..2].to_vec()
+            );
+            // <= 0 is "nothing", never "unbounded".
+            assert!(db
+                .fetch_unleft_terminal_source_jobs(7, 0)
+                .await
+                .unwrap()
+                .is_empty());
+            assert!(db
+                .fetch_unleft_terminal_source_jobs(7, -1)
+                .await
+                .unwrap()
+                .is_empty());
+
+            // A wider window takes in the 30-day-old row; a narrower one
+            // drops the 3-day-old row. An absurd window must not panic.
+            assert_eq!(
+                db.fetch_unleft_terminal_source_jobs(60, 100)
+                    .await
+                    .unwrap()
+                    .len(),
+                4
+            );
+            assert_eq!(
+                db.fetch_unleft_terminal_source_jobs(2, 100)
+                    .await
+                    .unwrap()
+                    .len(),
+                2
+            );
+            assert_eq!(
+                db.fetch_unleft_terminal_source_jobs(i64::MAX, 100)
+                    .await
+                    .unwrap()
+                    .len(),
+                4
+            );
+
+            // Mark one left: it drops out, and NOTHING else on the row moves —
+            // in particular not the terminal heartbeat.
+            let before = db.fetch_discord_import_job(&completed.id).await.unwrap();
+            db.mark_source_left(&completed.id).await.unwrap();
+            let after = db.fetch_discord_import_job(&completed.id).await.unwrap();
+            assert!(after.source_left);
+            assert_eq!(after.status, before.status);
+            assert_eq!(after.stage, before.stage);
+            assert_eq!(after.updated_at, before.updated_at);
+            assert_eq!(after.source_server_id, before.source_server_id);
+            assert_eq!(after.challenge_code, before.challenge_code);
+
+            let mut expected_after: Vec<String> = expected
+                .into_iter()
+                .filter(|id| id != &completed.id)
+                .collect();
+            expected_after.sort();
+            assert_eq!(
+                ids(db.fetch_unleft_terminal_source_jobs(7, 100).await.unwrap()),
+                expected_after
+            );
+
+            // Marking a row that does not exist is a no-op, not an upsert.
+            db.mark_source_left("01JOB00000000000000000NONE")
+                .await
+                .unwrap();
+            assert!(db
+                .fetch_discord_import_job("01JOB00000000000000000NONE")
+                .await
+                .is_err());
         });
     }
 

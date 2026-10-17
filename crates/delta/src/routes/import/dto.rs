@@ -94,3 +94,13 @@ impl From<DiscordImportJob> for ImportJobResponse {
         }
     }
 }
+
+/// # Import From Another Platform
+#[derive(serde::Deserialize, validator::Validate, JsonSchema, Debug)]
+pub struct DataImportSourceServer {
+    /// What names the source server. For Stoat: an invite link
+    /// (`https://stoat.chat/invite/…`, `rvlt.gg/…`), a bare invite code, or
+    /// a server id.
+    #[validate(length(min = 1, max = 256))]
+    pub source: String,
+}

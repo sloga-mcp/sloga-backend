@@ -25,17 +25,13 @@ use std::collections::HashSet;
 use revolt_config::config;
 use revolt_database::util::permissions::DatabasePermissionQuery;
 use revolt_database::{
-    events::client::EventV1, iso8601_timestamp::Timestamp, Database, DiscordImportJob,
-    DiscordImportSummary, File, FileHash, ImportStage, ImportStatus, Metadata, Sticker,
-    StickerFormat,
-};
-use revolt_files::{
-    delete_from_s3, image_size_vec, upload_to_s3, FileKeyring, AUTHENTICATION_TAG_SIZE_BYTES,
+    events::client::EventV1, Database, DiscordImportJob, DiscordImportSummary, File, ImportStage,
+    ImportStatus, Sticker, StickerFormat,
 };
 use revolt_permissions::{calculate_server_permissions, ChannelPermission};
 use serde::Deserialize;
-use sha2::Digest;
 
+use super::assets::{store_file_in, S3Objects};
 use super::template::{DISCORD_API, FETCH_TIMEOUT};
 use super::worker::{generic_failure, progress, ImportAbort};
 
@@ -47,6 +43,11 @@ const FALLBACK_STICKER_BYTES: usize = 500_000;
 const NAME_MAX_CHARS: usize = 32;
 /// Sloga's sticker-description validator bound, char-based.
 const DESCRIPTION_MAX_CHARS: usize = 200;
+
+/// What a sticker job is failed with when sticker import is off. Also used
+/// by the worker's per-kind gate, so the two checks cannot word it
+/// differently.
+pub(super) const STICKERS_DISABLED: &str = "Sticker import is not enabled on this instance.";
 
 // ---------------------------------------------------------------------------
 // Discord API shapes
@@ -368,111 +369,32 @@ async fn download_sticker(
 /// S3 blob + attachment row with `used_for` set immediately (so the
 /// dangling-file pruner never touches it), sticker id == attachment id.
 ///
-/// Mirrors `seed_stickers.rs` (the sanctioned seeding pattern). Kept here
-/// rather than in a shared crate on purpose: the natural shared home would
-/// drag the S3 SDK into the database crate for two call sites.
-///
-/// `insert_attachment` is on the disallowed list because attachments are
-/// normally minted by autumn's upload route; this helper IS that upload
-/// route replicated at library level (no session token exists server-side),
-/// so the raw insert is the point — same justification as the seeder.
-#[allow(clippy::disallowed_methods)]
+/// The storage itself is the shared `assets::store_file_in` (keyring
+/// snapshot, key-id check, discard on mismatch, image check). The content
+/// type is passed in rather than sniffed: it comes from `format_type`, and an
+/// APNG must stay `image/apng` although its bytes sniff as `image/png`.
 async fn store_sticker_file(
     db: &Database,
     planned: &PlannedSticker,
-    buf: &[u8],
+    buf: Vec<u8>,
     creator_id: &str,
 ) -> Result<File, ()> {
-    let config = config().await;
-    let hash_hex = format!("{:02x}", sha2::Sha256::digest(buf));
-
-    // ACCEPTED RESIDUAL: content-addressed reuse means byte-identical media
-    // uploaded earlier through autumn keeps ITS hash metadata (e.g. an APNG
-    // autumn sniffed as image/png) — the Sticker row's `format` is still
-    // correct (it comes from format_type), only serving metadata can be
-    // stale, and only for byte-identical prior uploads.
-    let file_hash = match db.fetch_attachment_hash(&hash_hex).await {
-        Ok(hash) if !hash.iv.is_empty() => hash,
-        _ => {
-            let (width, height) = image_size_vec(buf, planned.content_type).unwrap_or((320, 320));
-            let fresh = FileHash {
-                id: hash_hex.clone(),
-                processed_hash: hash_hex.clone(),
-                created_at: Timestamp::now_utc(),
-                bucket_id: config.files.s3.default_bucket.clone(),
-                // Placeholder only: the object itself goes to a fresh `rk/`
-                // path below, committed together with its IV and key id.
-                // Nothing is ever PUT at the hash id.
-                path: hash_hex.clone(),
-                iv: String::new(),
-                format_version: None, // legacy whole-file GCM format
-                key_id: None,
-                metadata: Metadata::Image {
-                    width: width as isize,
-                    height: height as isize,
-                    thumbhash: None,
-                    animated: planned.animated.then_some(true),
-                },
-                content_type: planned.content_type.to_owned(),
-                size: (buf.len() + AUTHENTICATION_TAG_SIZE_BYTES) as isize,
-            };
-            // Duplicate-insert errors are IGNORED on purpose, exactly like the
-            // seeder: a crashed earlier attempt can leave a `{iv: ""}` hash
-            // row behind, and failing here would wedge that sticker forever —
-            // every retry would re-insert, hit the duplicate id, and error.
-            // The heal is to fall through and (re)upload + set the storage.
-            let _ = db.insert_attachment_hash(&fresh).await;
-
-            // One keyring snapshot per write: the object path, the cipher
-            // and the stored key id must all name the same key.
-            let kid: Option<String> = FileKeyring::global().await.primary_id().map(str::to_string);
-            let path = FileHash::new_object_path(kid.as_deref());
-            let (iv, rkid) = upload_to_s3(&fresh.bucket_id, &path, buf)
-                .await
-                .map_err(|_| ())?;
-            if rkid != kid {
-                log::error!(
-                    "sticker object for hash {hash_hex} was encrypted under an unexpected file key"
-                );
-                discard_sticker_object(&fresh.bucket_id, &path).await;
-                return Err(());
-            }
-
-            // Path, IV and key id land together. If the row is gone (or the
-            // write fails) the object we just PUT is unreferenced: drop it.
-            if db
-                .set_attachment_hash_storage(&fresh.id, &path, &iv, rkid.as_deref())
-                .await
-                .is_err()
-            {
-                discard_sticker_object(&fresh.bucket_id, &path).await;
-                return Err(());
-            }
-            db.fetch_attachment_hash(&hash_hex).await.map_err(|_| ())?
-        }
-    };
-
-    let id = nanoid::nanoid!(42);
-    db.insert_attachment(&file_hash.into_file(
-        id.clone(),
-        "stickers".to_owned(),
-        format!("{}.{}", planned.discord_id, planned.extension),
-        creator_id.to_owned(),
-    ))
+    let file = store_file_in(
+        db,
+        &S3Objects,
+        creator_id,
+        "stickers",
+        &format!("{}.{}", planned.discord_id, planned.extension),
+        buf,
+        planned.animated,
+        Some(planned.content_type),
+    )
     .await
     .map_err(|_| ())?;
 
-    File::use_sticker(db, &id, &id, creator_id)
+    File::use_sticker(db, &file.id, &file.id, creator_id)
         .await
         .map_err(|_| ())
-}
-
-/// Best-effort delete of an object no row points at. A failure is logged
-/// and otherwise ignored; the caller is already returning an error.
-async fn discard_sticker_object(bucket_id: &str, path: &str) {
-    if let Err(error) = delete_from_s3(bucket_id, path).await {
-        log::warn!("could not delete orphaned sticker object {path}: {error:?}");
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -490,9 +412,7 @@ pub(super) async fn import_stickers(
     // Time-of-use re-checks: config can change between queue and claim, and
     // the user's standing on the server can too.
     if !config.api.import.discord.stickers_enabled() {
-        return Err(ImportAbort::Failed(
-            "Sticker import is not enabled on this instance.".to_string(),
-        ));
+        return Err(ImportAbort::Failed(STICKERS_DISABLED.to_string()));
     }
 
     let owner = db
@@ -601,7 +521,7 @@ pub(super) async fn import_stickers(
 
     for planned in &plan.planned {
         match download_sticker(&client, planned, byte_limit).await {
-            Some(buf) => match store_sticker_file(db, planned, &buf, &owner.id).await {
+            Some(buf) => match store_sticker_file(db, planned, buf, &owner.id).await {
                 Ok(attachment) => {
                     let sticker = Sticker {
                         id: attachment.id.clone(),

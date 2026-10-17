@@ -388,7 +388,11 @@ impl<'a> RatelimitResolver<Request<'a>> for DeltaRatelimits {
                 // Starting an import kicks off a whole server build — keep it
                 // tight. Job polling is only a reconnect fallback (progress
                 // normally arrives over the WebSocket) so it stays modest too.
-                ("import", Some("discord"), Method::Post) => ("import_start", None),
+                // Every import POST, whatever the source segment, spends the
+                // tight bucket: POST /import/<source>/server for every source,
+                // plus the Discord template and sticker starts. GETs (job
+                // polling, the ownership-challenge code) stay on `import`.
+                ("import", Some(_), Method::Post) => ("import_start", None),
                 ("import", _, _) => ("import", None),
                 // Static loot-catalog reads (cheap, client-cached for a day)
                 // get headroom above the shared "any" bucket. The sheet and
@@ -938,6 +942,72 @@ mod tests {
                 rocket::routes![audit_log_get, bans_get, server_patch],
             );
         Client::untracked(rocket).expect("rocket builds without a database")
+    }
+
+    /// Every import POST resolves to `import_start`, for every source; every
+    /// import GET stays on `import`. The resolver runs before routing, so no
+    /// import routes need mounting.
+    #[test]
+    fn import_starts_share_the_tight_bucket_for_every_source() {
+        use revolt_ratelimits::ratelimiter::RatelimitResolver;
+
+        let client = servers_client();
+
+        for path in [
+            "/import/discord/template",
+            "/import/discord/jobs/01JOB/stickers",
+            "/import/stoat/server",
+            "/import/fluxer/server",
+            "/import/matrix/server",
+            "/0.8/import/stoat/server",
+        ] {
+            assert_eq!(
+                DeltaRatelimits.resolve_bucket(&*client.post(path)),
+                ("import_start", None),
+                "POST {path}"
+            );
+        }
+        for path in [
+            "/import/discord/active",
+            "/import/discord/jobs/01JOB",
+            "/import/stoat/challenge",
+            "/import/fluxer/challenge",
+            "/import/matrix/challenge",
+            "/0.8/import/stoat/challenge",
+        ] {
+            assert_eq!(
+                DeltaRatelimits.resolve_bucket(&*client.get(path)),
+                ("import", None),
+                "GET {path}"
+            );
+        }
+
+        // Through the fairing: one shared counter of 5 for every source, so
+        // switching source cannot reset the start budget. Nothing is mounted
+        // under /import, so each request 404s after the fairing has counted it.
+        let first = client.post("/import/stoat/server").dispatch();
+        assert_eq!(limit(&first), 5);
+        let discord = client.post("/import/discord/template").dispatch();
+        assert_eq!(bucket(&first), bucket(&discord));
+        for path in [
+            "/import/fluxer/server",
+            "/import/matrix/server",
+            "/import/stoat/server",
+        ] {
+            assert_ne!(
+                client.post(path).dispatch().status(),
+                Status::TooManyRequests
+            );
+        }
+        assert_eq!(
+            client.post("/import/discord/template").dispatch().status(),
+            Status::TooManyRequests
+        );
+
+        let poll = client.get("/import/stoat/challenge").dispatch();
+        assert_ne!(poll.status(), Status::TooManyRequests);
+        assert_eq!(limit(&poll), 30);
+        assert_ne!(bucket(&poll), bucket(&first));
     }
 
     /// GET /servers/<id>/audit_log resolves to its own per-server bucket;

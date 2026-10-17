@@ -12,11 +12,18 @@
 //! operator-owned bot the user adds to their guild is the only way to read
 //! them). Emojis and the server icon remain future work on the same bot
 //! plumbing.
+//!
+//! The same job queue, claim loop, sweeper and server builder also serve the
+//! imports from other platforms (Stoat, Fluxer, Matrix): each source fetches
+//! and maps into an [`mapper::ImportPlan`] and hands it to
+//! [`worker::execute_plan`], which copies its icon, banner and emojis through
+//! [`assets`].
 
+pub(crate) mod assets;
 pub mod mapper;
 pub mod permissions;
 mod stickers;
 pub mod template;
-mod worker;
+pub(crate) mod worker;
 
 pub use worker::task;

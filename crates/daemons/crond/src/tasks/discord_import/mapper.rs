@@ -18,9 +18,10 @@ use super::template::{
 // Read for two constants and one pure predicate, not for any database access:
 // the AFK timeout presets live on `Server`, the Connect bit on
 // `ChannelPermission`, and the client-gate rule in `client_gate_is_set`, and
-// retyping any of them here is how the two sides drift apart.
-use revolt_database::{client_gate_is_set, Server};
-use revolt_permissions::ChannelPermission;
+// retyping any of them here is how the two sides drift apart. `ImportJobKind`
+// only picks the wording of `PlanError` messages.
+use revolt_database::{client_gate_is_set, ImportJobKind, Server};
+use revolt_permissions::{ChannelPermission, Override, PermissionValue};
 
 /// Sloga name limits (validated at the HTTP routes, which the worker bypasses —
 /// so the mapper is where they get enforced).
@@ -62,19 +63,41 @@ pub enum PlanError {
 }
 
 impl PlanError {
-    /// User-safe message stored on the job and shown in the client.
+    /// User-safe message stored on the job and shown in the client, for a
+    /// Discord template import.
     pub fn user_message(&self) -> String {
-        match self {
-            PlanError::UnexpectedRoleOrder => {
+        self.user_message_for(&ImportJobKind::Template)
+    }
+
+    /// User-safe message for an import of `kind`.
+    ///
+    /// Sources other than a Discord template (Fluxer is adapted onto this
+    /// mapper) get the same refusal without the Discord-specific wording.
+    /// The Discord copy is unchanged.
+    pub fn user_message_for(&self, kind: &ImportJobKind) -> String {
+        let discord = matches!(kind, ImportJobKind::Template | ImportJobKind::Stickers);
+        match (self, discord) {
+            (PlanError::UnexpectedRoleOrder, true) => {
                 "This Discord template's roles are arranged in a way we don't recognise, and we \
                  won't guess at a server's permissions. Please report this — it means Discord \
                  changed their template format."
                     .to_string()
             }
-            PlanError::UnknownOverwriteKind => {
+            (PlanError::UnexpectedRoleOrder, false) => {
+                "This server's roles are arranged in a way we don't recognize, and we won't \
+                 guess at a server's permissions. Please report this."
+                    .to_string()
+            }
+            (PlanError::UnknownOverwriteKind, true) => {
                 "This Discord template contains channel permissions we don't recognise. We've \
                  stopped rather than risk importing a private channel as a public one. Please \
                  report this."
+                    .to_string()
+            }
+            (PlanError::UnknownOverwriteKind, false) => {
+                "This server contains channel permissions we don't recognize. We've stopped \
+                 rather than risk importing a private channel as a public one. Please report \
+                 this."
                     .to_string()
             }
         }
@@ -113,6 +136,28 @@ impl PlannedOverride {
     }
 }
 
+/// Whether `@everyone` can view a channel: the server default with the
+/// channel's own `@everyone` override applied, allow then deny, as
+/// `calculate_channel_permissions` computes it for a member with no roles
+/// (`PermissionValue::apply`).
+///
+/// The welcome invite may only point at such a channel. Anyone holding an
+/// invite can read its channel's name and description, and a joiner lands in
+/// it: a channel `@everyone` cannot see leaks the one and strands the other.
+pub(crate) fn everyone_can_view(
+    server_default: u64,
+    channel_default: Option<PlannedOverride>,
+) -> bool {
+    let mut permissions = PermissionValue::from_raw(server_default);
+    if let Some(everyone) = channel_default {
+        permissions.apply(Override {
+            allow: everyone.allow,
+            deny: everyone.deny,
+        });
+    }
+    permissions.has_channel_permission(ChannelPermission::ViewChannel)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlannedRole {
     /// Template placeholder id, used to resolve channel overwrites once real
@@ -122,9 +167,12 @@ pub struct PlannedRole {
     /// `#RRGGBB`, or absent when Discord had no colour set (its `color: 0`).
     pub colour: Option<String>,
     pub hoist: bool,
-    /// Sloga allow-bits. Discord role permissions are pure grants — deny only
-    /// exists in channel overwrites — so there is no deny counterpart here.
+    /// Sloga allow-bits.
     pub permissions: u64,
+    /// Sloga deny-bits for the role itself. Always 0 from the Discord mapper:
+    /// Discord role permissions are pure grants, and deny only exists in
+    /// channel overwrites. Sources whose roles carry denies (Stoat) set it.
+    pub deny: u64,
     /// This role held Discord's `ADMINISTRATOR`.
     ///
     /// Tracked separately from `permissions` because ADMINISTRATOR is not just
@@ -158,10 +206,71 @@ pub struct PlannedCategory {
     pub title: String,
 }
 
+/// What a [`PlannedAsset`] becomes on the imported server.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AssetKind {
+    Icon,
+    Banner,
+    // Only a source mapper that copies emoji builds this, and the Discord
+    // mapper copies none.
+    #[allow(dead_code)]
+    Emoji,
+}
+
+/// An image the source wants copied onto the imported server.
+///
+/// Deliberately a typed reference and never a URL: the plan is built from
+/// data a third party controls, and a free-form URL would let it point the
+/// worker (and, for some sources, the bot's credentials) anywhere. Each
+/// source's fetcher turns `id` into a URL on its own configured host after
+/// validating it, and skips the asset (with a note) when it does not pass.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PlannedAsset {
+    pub kind: AssetKind,
+    /// The source's own id for the asset. Untrusted until the fetcher has
+    /// validated it.
+    pub id: String,
+    pub animated: bool,
+}
+
+/// A custom emoji to recreate on the imported server.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PlannedEmoji {
+    pub name: String,
+    pub asset: PlannedAsset,
+}
+
+/// Where each kind of system message goes, as template placeholder ids. Same
+/// field names as Sloga's `SystemMessageChannels`.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct PlannedSystemMessages {
+    pub user_joined: Option<PlaceholderId>,
+    pub user_left: Option<PlaceholderId>,
+    pub user_kicked: Option<PlaceholderId>,
+    pub user_banned: Option<PlaceholderId>,
+}
+
+impl PlannedSystemMessages {
+    /// Every kind of system message to the same channel, which is how
+    /// Discord's single system channel maps.
+    fn all(channel: Option<PlaceholderId>) -> PlannedSystemMessages {
+        PlannedSystemMessages {
+            user_joined: channel.clone(),
+            user_left: channel.clone(),
+            user_kicked: channel.clone(),
+            user_banned: channel,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ImportPlan {
     pub server_name: String,
     pub server_description: Option<String>,
+    /// Whether the server is marked NSFW. Discord templates carry no such
+    /// flag, so the Discord mapper always leaves it false, which is also
+    /// what `Server::create` stores for `None`.
+    pub nsfw: bool,
     /// **Ordered most-authoritative first**, i.e. index 0 becomes Sloga rank 0.
     /// Truncating the tail of this list (for the role cap) therefore drops the
     /// least powerful roles and leaves the surviving ranks contiguous.
@@ -174,9 +283,15 @@ pub struct ImportPlan {
     pub categories: Vec<PlannedCategory>,
     /// Ordered; `parent` refers to a category's `template_id`.
     pub channels: Vec<PlannedChannel>,
-    /// Template id of the channel to mint the welcome invite in, if the guild
-    /// nominated a system channel.
-    pub system_channel: Option<PlaceholderId>,
+    /// Where system messages go. The Discord mapper points all four at the
+    /// guild's one system channel.
+    pub system_messages: PlannedSystemMessages,
+    /// Template id of the channel to mint the welcome invite in. The Discord
+    /// mapper uses the guild's system channel; with none (or one that was
+    /// not created, is not a text channel, or `@everyone` cannot view: see
+    /// [`everyone_can_view`]) the worker falls back to the first text channel
+    /// `@everyone` can view, and with none of those mints no invite.
+    pub invite_channel: Option<PlaceholderId>,
     /// Template id of the guild's AFK channel, only if it survived mapping as
     /// a voice channel. The worker writes it onto the server in step 5.
     pub afk_channel: Option<PlaceholderId>,
@@ -189,9 +304,50 @@ pub struct ImportPlan {
     /// channels, types Sloga has no equivalent for). Feeds the summary's
     /// skipped count so the number can't contradict the notes beside it.
     pub skipped_channel_count: u32,
+    /// Server icon and banner to copy. Always `None` from the Discord mapper
+    /// (templates carry no images).
+    pub(crate) icon: Option<PlannedAsset>,
+    pub(crate) banner: Option<PlannedAsset>,
+    /// Custom emoji to recreate. Always empty from the Discord mapper.
+    pub(crate) emojis: Vec<PlannedEmoji>,
 }
 
 impl ImportPlan {
+    /// An empty plan for a server called `server_name`: no roles, channels,
+    /// categories, system channels, assets or notes, not NSFW.
+    ///
+    /// `default_permissions` starts at what a natively created server gets
+    /// (the same fallback the Discord mapper uses for a template with no
+    /// roles), so a source that never sets it still produces a usable
+    /// server rather than one nobody can see into.
+    pub fn new(server_name: String) -> ImportPlan {
+        ImportPlan {
+            server_name,
+            server_description: None,
+            nsfw: false,
+            roles: Vec::new(),
+            default_permissions: sloga_default_server_permissions() | baseline_grants(),
+            categories: Vec::new(),
+            channels: Vec::new(),
+            system_messages: PlannedSystemMessages::default(),
+            invite_channel: None,
+            afk_channel: None,
+            afk_timeout: None,
+            skipped: Vec::new(),
+            skipped_channel_count: 0,
+            icon: None,
+            banner: None,
+            emojis: Vec::new(),
+        }
+    }
+
+    /// Whether the plan has any icon, banner or emoji to copy. The worker
+    /// skips its Assets stage entirely when this is false, so a Discord
+    /// template job never records that stage.
+    pub(crate) fn has_assets(&self) -> bool {
+        self.icon.is_some() || self.banner.is_some() || !self.emojis.is_empty()
+    }
+
     /// Total unit count for progress reporting.
     ///
     /// Channels only: they're the per-item loop the progress bar tracks.
@@ -208,7 +364,9 @@ fn clamp(value: &str, max: usize) -> String {
     value.trim().chars().take(max).collect::<String>()
 }
 
-fn clamp_name(raw: Option<&str>, fallback: &str) -> String {
+/// A name within Sloga's limits, or `fallback` when blank. Every source's
+/// mapper goes through this (the worker bypasses the HTTP validators).
+pub(crate) fn clamp_name(raw: Option<&str>, fallback: &str) -> String {
     let cleaned = clamp(raw.unwrap_or(""), NAME_MAX);
     if cleaned.chars().count() < NAME_MIN {
         fallback.to_string()
@@ -217,7 +375,8 @@ fn clamp_name(raw: Option<&str>, fallback: &str) -> String {
     }
 }
 
-fn clamp_description(raw: Option<&str>) -> Option<String> {
+/// A description within Sloga's limit; blank becomes `None`.
+pub(crate) fn clamp_description(raw: Option<&str>) -> Option<String> {
     raw.map(|value| clamp(value, DESCRIPTION_MAX))
         .filter(|value| !value.is_empty())
 }
@@ -399,6 +558,7 @@ fn plan_roles(roles: &[TemplateRole]) -> Result<RolePlan, PlanError> {
             colour: role_colour(role.color),
             hoist: role.hoist,
             permissions: map_role_permissions(role.permissions.0),
+            deny: 0,
             administrator: has_administrator(role.permissions.0),
         })
         .collect();
@@ -809,15 +969,23 @@ pub fn plan_import(template: &GuildTemplate) -> Result<ImportPlan, PlanError> {
     Ok(ImportPlan {
         server_name,
         server_description: clamp_description(guild.description.as_deref()),
+        nsfw: false,
         roles,
         default_permissions,
         categories: populated,
         channels,
-        system_channel,
+        // Discord has one system channel for every kind of system message,
+        // and it is also where the welcome invite goes.
+        system_messages: PlannedSystemMessages::all(system_channel.clone()),
+        invite_channel: system_channel,
         afk_channel,
         afk_timeout,
         skipped,
         skipped_channel_count: (skipped_threads + skipped_other) as u32,
+        // Templates carry no images.
+        icon: None,
+        banner: None,
+        emojis: Vec::new(),
     })
 }
 
@@ -992,13 +1160,114 @@ mod tests {
         let kept = plan_import(&template(
             r#"{"name":"g","system_channel_id":2,"channels":[{"id":2,"type":0,"name":"general"}]}"#,
         ));
-        assert_eq!(kept.system_channel, Some(PlaceholderId("2".to_string())));
+        assert_eq!(kept.invite_channel, Some(PlaceholderId("2".to_string())));
+        assert_eq!(
+            kept.system_messages,
+            PlannedSystemMessages::all(Some(PlaceholderId("2".to_string())))
+        );
 
         // Points at a skipped thread → must not dangle.
         let dropped = plan_import(&template(
             r#"{"name":"g","system_channel_id":2,"channels":[{"id":2,"type":11,"name":"t"}]}"#,
         ));
-        assert_eq!(dropped.system_channel, None);
+        assert_eq!(dropped.invite_channel, None);
+        assert_eq!(dropped.system_messages, PlannedSystemMessages::default());
+    }
+
+    /// Discord's one system channel fans out to all four system-message
+    /// slots AND is the welcome-invite channel, exactly as the single
+    /// `system_channel` field did before sources with separate channels
+    /// existed.
+    #[test]
+    fn discord_system_channel_fills_every_slot_and_the_invite_channel() {
+        let plan = plan_import(&template(
+            r#"{"name":"g","system_channel_id":5,"channels":[
+                {"id":4,"type":0,"name":"rules"},
+                {"id":5,"type":0,"name":"welcome"}
+            ]}"#,
+        ));
+        let welcome = Some(PlaceholderId("5".to_string()));
+        assert_eq!(plan.system_messages.user_joined, welcome);
+        assert_eq!(plan.system_messages.user_left, welcome);
+        assert_eq!(plan.system_messages.user_kicked, welcome);
+        assert_eq!(plan.system_messages.user_banned, welcome);
+        assert_eq!(plan.invite_channel, welcome);
+    }
+
+    /// Nothing a Discord template maps to may carry the fields only other
+    /// sources fill: no assets (so the worker never writes the `Assets`
+    /// stage on a template row), no role denies, not NSFW.
+    #[test]
+    fn discord_plans_carry_no_assets_denies_or_nsfw() {
+        let plan = plan_import(&template(
+            r#"{"name":"g","channels":[{"id":1,"type":0,"name":"a"}],"roles":[
+                {"id":0,"name":"@everyone","permissions":"1024"},
+                {"id":1,"name":"Mod","permissions":"8192"}
+            ]}"#,
+        ));
+        assert!(!plan.has_assets());
+        assert_eq!(plan.icon, None);
+        assert_eq!(plan.banner, None);
+        assert!(plan.emojis.is_empty());
+        assert!(!plan.nsfw);
+        assert_eq!(plan.roles.len(), 1);
+        assert!(plan.roles.iter().all(|role| role.deny == 0));
+    }
+
+    #[test]
+    fn new_plan_is_empty_with_a_native_baseline() {
+        let plan = ImportPlan::new("Imported".to_string());
+        assert_eq!(plan.server_name, "Imported");
+        assert_eq!(plan.server_description, None);
+        assert!(!plan.nsfw);
+        assert!(plan.roles.is_empty());
+        assert!(plan.categories.is_empty());
+        assert!(plan.channels.is_empty());
+        assert_eq!(plan.system_messages, PlannedSystemMessages::default());
+        assert_eq!(plan.invite_channel, None);
+        assert_eq!(plan.afk_channel, None);
+        assert_eq!(plan.afk_timeout, None);
+        assert!(plan.skipped.is_empty());
+        assert_eq!(plan.skipped_channel_count, 0);
+        assert!(!plan.has_assets());
+        // Same baseline as a role-less Discord template.
+        assert_eq!(
+            plan.default_permissions,
+            plan_import(&template(r#"{"name":"g","channels":[]}"#)).default_permissions
+        );
+    }
+
+    /// The Discord copy users see today is pinned verbatim; every other kind
+    /// gets wording that does not mention Discord.
+    #[test]
+    fn plan_error_copy_is_unchanged_for_discord_and_neutral_otherwise() {
+        assert_eq!(
+            PlanError::UnexpectedRoleOrder.user_message(),
+            "This Discord template's roles are arranged in a way we don't recognise, and we \
+             won't guess at a server's permissions. Please report this — it means Discord \
+             changed their template format."
+        );
+        assert_eq!(
+            PlanError::UnknownOverwriteKind.user_message(),
+            "This Discord template contains channel permissions we don't recognise. We've \
+             stopped rather than risk importing a private channel as a public one. Please \
+             report this."
+        );
+
+        for kind in ImportJobKind::SOURCE_KINDS {
+            for error in [
+                PlanError::UnexpectedRoleOrder,
+                PlanError::UnknownOverwriteKind,
+            ] {
+                let message = error.user_message_for(&kind);
+                assert!(!message.contains("Discord"), "{kind:?}: {message}");
+                assert!(!message.contains("template"), "{kind:?}: {message}");
+                // New copy uses US spelling; only the pinned Discord copy
+                // above keeps its original wording.
+                assert!(message.contains("recognize"), "{kind:?}: {message}");
+                assert!(!message.contains("recognise"), "{kind:?}: {message}");
+            }
+        }
     }
 
     /// Progress is driven by the per-channel loop, so categories must NOT be
@@ -1460,7 +1729,11 @@ mod tests {
         // through the CHANNEL namespace to `general`, not to role id 3.
         assert_eq!(plan.categories.len(), 2);
         assert_eq!(plan.channels.len(), 3);
-        assert_eq!(plan.system_channel, Some(PlaceholderId("3".to_string())));
+        assert_eq!(plan.invite_channel, Some(PlaceholderId("3".to_string())));
+        assert_eq!(
+            plan.system_messages,
+            PlannedSystemMessages::all(Some(PlaceholderId("3".to_string())))
+        );
         assert_eq!(
             plan.channels
                 .iter()
@@ -1606,6 +1879,7 @@ mod tests {
             colour: None,
             hoist: false,
             permissions: 0,
+            deny: 0,
             administrator: false,
         };
 
@@ -2031,5 +2305,25 @@ mod tests {
             );
             assert_eq!(plan.afk_timeout, Some(300), "afk_channel_id {open}");
         }
+    }
+
+    /// `@everyone`'s view of a channel: server default, then the channel's
+    /// `@everyone` allow, then its deny.
+    #[test]
+    fn everyone_can_view_applies_the_channel_override_to_the_server_default() {
+        let view = ChannelPermission::ViewChannel as u64;
+        let send = ChannelPermission::SendMessage as u64;
+        let over = |allow: u64, deny: u64| Some(PlannedOverride { allow, deny });
+
+        assert!(everyone_can_view(view | send, None));
+        assert!(!everyone_can_view(send, None));
+        // The channel denies it: private, however open the server is.
+        assert!(!everyone_can_view(view | send, over(0, view)));
+        // The channel grants it on a server that does not.
+        assert!(everyone_can_view(send, over(view, 0)));
+        // Deny wins over allow, as in `PermissionValue::apply`.
+        assert!(!everyone_can_view(send, over(view, view)));
+        // Unrelated bits change nothing.
+        assert!(everyone_can_view(view, over(0, send)));
     }
 }

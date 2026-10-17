@@ -366,7 +366,7 @@ pub struct ApiOauthKick {
 /// bot upgrade: it needs a Discord application whose bot the importing
 /// user adds to their guild. Both keys belong in Revolt.overrides.toml,
 /// never in the baked config.
-#[derive(Deserialize, Debug, Clone, Default)]
+#[derive(Deserialize, Clone, Default)]
 pub struct ApiImportDiscord {
     #[serde(default)]
     pub enabled: bool,
@@ -389,10 +389,279 @@ impl ApiImportDiscord {
     }
 }
 
-#[derive(Deserialize, Debug, Clone, Default)]
+impl std::fmt::Debug for ApiImportDiscord {
+    /// Same output as the derive, except `bot_token` is never printed
+    /// (`init()` prints the whole config at boot)
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Exhaustive destructure: a new field fails to compile until it is
+        // either printed or deliberately redacted here
+        let ApiImportDiscord {
+            enabled,
+            client_id,
+            bot_token: _,
+        } = self;
+
+        f.debug_struct("ApiImportDiscord")
+            .field("enabled", enabled)
+            .field("client_id", client_id)
+            .field("bot_token", &"<redacted>")
+            .finish()
+    }
+}
+
+/// An import source read through an operator-run bot account on a
+/// Revolt-style platform (`stoat`, `fluxer`). The user adds the bot to the
+/// server they want to import. Base URLs are operator config only, never
+/// user input or job data. `bot_token` belongs in Revolt.overrides.toml,
+/// never in the baked config.
+///
+/// Fields left out of a table come out empty, and an empty URL keeps the
+/// source not `ready()`; the baked Revolt.toml supplies the public URLs.
+#[derive(Deserialize, Clone, Default)]
+pub struct ApiImportBotSource {
+    #[serde(default)]
+    pub enabled: bool,
+    /// API base, e.g. `https://api.stoat.chat`
+    #[serde(default)]
+    pub api_url: String,
+    /// Web app base, used to build the add-bot link shown to users
+    #[serde(default)]
+    pub app_url: String,
+    /// CDN base for icons, banners and emoji
+    #[serde(default)]
+    pub cdn_url: String,
+    /// Bot / application id. Public by nature: it appears in the add-bot link
+    #[serde(default)]
+    pub bot_id: String,
+    /// Bot token. SECRET: read only where the outbound API call is made,
+    /// never logged, never surfaced in any response body.
+    #[serde(default)]
+    pub bot_token: String,
+    /// crond makes the bot leave any server it joined more than this many
+    /// hours ago that no import job is using (a user who added the bot and
+    /// never finished verifying). `0`, the default, turns that reconcile off.
+    /// Only Stoat reads it so far.
+    ///
+    /// Opt-in, and on exactly ONE deployment: each crond judges "no job is
+    /// using it" by its own database, so a second deployment holding the
+    /// same bot token would evict the bot from servers the first one is
+    /// importing.
+    #[serde(default)]
+    pub reconcile_after_hours: u32,
+}
+
+impl ApiImportBotSource {
+    fn with_urls(api_url: &str, app_url: &str, cdn_url: &str) -> Self {
+        Self {
+            enabled: false,
+            api_url: api_url.to_string(),
+            app_url: app_url.to_string(),
+            cdn_url: cdn_url.to_string(),
+            bot_id: String::new(),
+            bot_token: String::new(),
+            reconcile_after_hours: 0,
+        }
+    }
+
+    fn stoat_default() -> Self {
+        Self::with_urls(
+            "https://api.stoat.chat",
+            "https://stoat.chat",
+            "https://cdn.stoatusercontent.com",
+        )
+    }
+
+    fn fluxer_default() -> Self {
+        Self::with_urls(
+            "https://api.fluxer.app",
+            "https://fluxer.app",
+            "https://fluxerusercontent.com",
+        )
+    }
+
+    /// Whether imports from this source may run. Fails closed: switched on,
+    /// every key the read path needs set, and the shared challenge secret
+    /// set (there is no fallback key).
+    pub fn ready(&self, challenge_secret: &str) -> bool {
+        self.enabled
+            && !self.bot_id.is_empty()
+            && !self.bot_token.is_empty()
+            && !self.api_url.is_empty()
+            && !self.cdn_url.is_empty()
+            && !challenge_secret.is_empty()
+    }
+}
+
+impl std::fmt::Debug for ApiImportBotSource {
+    /// Same output as a derive, except `bot_token` is never printed
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Exhaustive destructure: a new field fails to compile until it is
+        // either printed or deliberately redacted here
+        let ApiImportBotSource {
+            enabled,
+            api_url,
+            app_url,
+            cdn_url,
+            bot_id,
+            bot_token: _,
+            reconcile_after_hours,
+        } = self;
+
+        f.debug_struct("ApiImportBotSource")
+            .field("enabled", enabled)
+            .field("api_url", api_url)
+            .field("app_url", app_url)
+            .field("cdn_url", cdn_url)
+            .field("bot_id", bot_id)
+            .field("bot_token", &"<redacted>")
+            .field("reconcile_after_hours", reconcile_after_hours)
+            .finish()
+    }
+}
+
+fn default_matrix_max_joins() -> u32 {
+    8
+}
+
+/// Import a Matrix space through an operator-run bot account the user
+/// invites to the space. `access_token` belongs in Revolt.overrides.toml,
+/// never in the baked config.
+#[derive(Deserialize, Clone)]
+pub struct ApiImportMatrix {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Client-server API base of the bot's homeserver
+    #[serde(default)]
+    pub homeserver_url: String,
+    /// Full user id of the bot, e.g. `@sloga-import:<homeserver>`
+    #[serde(default)]
+    pub bot_user_id: String,
+    /// Bot access token. SECRET: read only where the outbound call is made,
+    /// never logged, never surfaced in any response body.
+    #[serde(default)]
+    pub access_token: String,
+    /// Child-room join budget per import
+    #[serde(default = "default_matrix_max_joins")]
+    pub max_joins: u32,
+}
+
+impl Default for ApiImportMatrix {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            homeserver_url: String::new(),
+            bot_user_id: String::new(),
+            access_token: String::new(),
+            max_joins: default_matrix_max_joins(),
+        }
+    }
+}
+
+impl ApiImportMatrix {
+    /// Whether Matrix imports may run. Same fail-closed rule as
+    /// [`ApiImportBotSource::ready`].
+    pub fn ready(&self, challenge_secret: &str) -> bool {
+        self.enabled
+            && !self.homeserver_url.is_empty()
+            && !self.bot_user_id.is_empty()
+            && !self.access_token.is_empty()
+            && !challenge_secret.is_empty()
+    }
+}
+
+impl std::fmt::Debug for ApiImportMatrix {
+    /// Same output as a derive, except `access_token` is never printed
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Exhaustive destructure: a new field fails to compile until it is
+        // either printed or deliberately redacted here
+        let ApiImportMatrix {
+            enabled,
+            homeserver_url,
+            bot_user_id,
+            access_token: _,
+            max_joins,
+        } = self;
+
+        f.debug_struct("ApiImportMatrix")
+            .field("enabled", enabled)
+            .field("homeserver_url", homeserver_url)
+            .field("bot_user_id", bot_user_id)
+            .field("access_token", &"<redacted>")
+            .field("max_joins", max_joins)
+            .finish()
+    }
+}
+
+#[derive(Deserialize, Clone)]
 pub struct ApiImport {
+    /// Key for the ownership-challenge codes of every bot source. SECRET,
+    /// overrides only. Empty = no bot source is ready.
+    #[serde(default)]
+    pub challenge_secret: String,
     #[serde(default)]
     pub discord: ApiImportDiscord,
+    #[serde(default = "ApiImportBotSource::stoat_default")]
+    pub stoat: ApiImportBotSource,
+    #[serde(default = "ApiImportBotSource::fluxer_default")]
+    pub fluxer: ApiImportBotSource,
+    #[serde(default)]
+    pub matrix: ApiImportMatrix,
+}
+
+impl Default for ApiImport {
+    fn default() -> Self {
+        Self {
+            challenge_secret: String::new(),
+            discord: ApiImportDiscord::default(),
+            stoat: ApiImportBotSource::stoat_default(),
+            fluxer: ApiImportBotSource::fluxer_default(),
+            matrix: ApiImportMatrix::default(),
+        }
+    }
+}
+
+impl ApiImport {
+    pub fn stoat_ready(&self) -> bool {
+        self.stoat.ready(&self.challenge_secret)
+    }
+
+    pub fn fluxer_ready(&self) -> bool {
+        self.fluxer.ready(&self.challenge_secret)
+    }
+
+    pub fn matrix_ready(&self) -> bool {
+        self.matrix.ready(&self.challenge_secret)
+    }
+
+    /// Whether any import source is switched on (enabled flags only). Gates
+    /// the import job claim loop; each job's own source is re-checked when
+    /// it runs.
+    pub fn any_enabled(&self) -> bool {
+        self.discord.enabled || self.stoat.enabled || self.fluxer.enabled || self.matrix.enabled
+    }
+}
+
+impl std::fmt::Debug for ApiImport {
+    /// Same output as a derive, except `challenge_secret` is never printed
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Exhaustive destructure: a new field fails to compile until it is
+        // either printed or deliberately redacted here
+        let ApiImport {
+            challenge_secret: _,
+            discord,
+            stoat,
+            fluxer,
+            matrix,
+        } = self;
+
+        f.debug_struct("ApiImport")
+            .field("challenge_secret", &"<redacted>")
+            .field("discord", discord)
+            .field("stoat", stoat)
+            .field("fluxer", fluxer)
+            .field("matrix", matrix)
+            .finish()
+    }
 }
 
 #[derive(Deserialize, Debug, Clone, Default)]
@@ -2067,5 +2336,379 @@ k2025 = "{EXTRA}"
         );
         assert!(debug.contains(r#"secret_access_key: "<redacted>""#));
         assert!(debug.contains(r#"access_key_id: "minioautumn""#));
+    }
+}
+
+// Built from in-process sources only, never the cached `config()`, so no
+// local Revolt.overrides.toml or environment variable can skew the result.
+// Secrets are compared with `assert!`, never `assert_eq!`, so a failure
+// prints no values.
+#[cfg(test)]
+mod import_config_tests {
+    use std::collections::HashMap;
+
+    use config::{builder::DefaultState, Config, ConfigBuilder, Environment, File, FileFormat};
+
+    use super::{ApiImport, ApiImportBotSource, ApiImportMatrix, Settings};
+
+    const SECRET: &str = "fake-challenge-secret-placeholder";
+    const DISCORD_TOKEN: &str = "fake-discord-bot-token-placeholder";
+    const STOAT_TOKEN: &str = "fake-stoat-bot-token-placeholder";
+    const FLUXER_TOKEN: &str = "fake-fluxer-bot-token-placeholder";
+    const MATRIX_TOKEN: &str = "fake-matrix-access-token-placeholder";
+
+    /// Only the bundled defaults, so no local override file can skew the result
+    fn bundled() -> ConfigBuilder<DefaultState> {
+        Config::builder().add_source(File::from_str(
+            include_str!("../Revolt.toml"),
+            FileFormat::Toml,
+        ))
+    }
+
+    fn settings(builder: ConfigBuilder<DefaultState>) -> Settings {
+        builder
+            .build()
+            .expect("the config builds")
+            .try_deserialize()
+            .expect("the config deserializes")
+    }
+
+    fn full_bot_source() -> ApiImportBotSource {
+        ApiImportBotSource {
+            enabled: true,
+            api_url: "https://api.example.test".to_string(),
+            app_url: "https://example.test".to_string(),
+            cdn_url: "https://cdn.example.test".to_string(),
+            bot_id: "01BOTID".to_string(),
+            bot_token: STOAT_TOKEN.to_string(),
+            reconcile_after_hours: 24,
+        }
+    }
+
+    fn full_matrix() -> ApiImportMatrix {
+        ApiImportMatrix {
+            enabled: true,
+            homeserver_url: "https://matrix.example.test".to_string(),
+            bot_user_id: "@sloga-import:example.test".to_string(),
+            access_token: MATRIX_TOKEN.to_string(),
+            max_joins: 8,
+        }
+    }
+
+    fn assert_stoat_defaults(stoat: &ApiImportBotSource) {
+        assert!(!stoat.enabled);
+        assert_eq!(stoat.api_url, "https://api.stoat.chat");
+        assert_eq!(stoat.app_url, "https://stoat.chat");
+        assert_eq!(stoat.cdn_url, "https://cdn.stoatusercontent.com");
+        assert!(stoat.bot_id.is_empty());
+        assert!(stoat.bot_token.is_empty());
+        assert_eq!(stoat.reconcile_after_hours, 0);
+    }
+
+    fn assert_fluxer_defaults(fluxer: &ApiImportBotSource) {
+        assert!(!fluxer.enabled);
+        assert_eq!(fluxer.api_url, "https://api.fluxer.app");
+        assert_eq!(fluxer.app_url, "https://fluxer.app");
+        assert_eq!(fluxer.cdn_url, "https://fluxerusercontent.com");
+        assert!(fluxer.bot_id.is_empty());
+        assert!(fluxer.bot_token.is_empty());
+    }
+
+    fn assert_matrix_defaults(matrix: &ApiImportMatrix) {
+        assert!(!matrix.enabled);
+        assert!(matrix.homeserver_url.is_empty());
+        assert!(matrix.bot_user_id.is_empty());
+        assert!(matrix.access_token.is_empty());
+        assert_eq!(matrix.max_joins, 8);
+    }
+
+    fn assert_import_defaults(import: &ApiImport) {
+        assert!(import.challenge_secret.is_empty());
+        assert!(!import.discord.enabled);
+        assert_stoat_defaults(&import.stoat);
+        assert_fluxer_defaults(&import.fluxer);
+        assert_matrix_defaults(&import.matrix);
+        assert!(!import.stoat_ready());
+        assert!(!import.fluxer_ready());
+        assert!(!import.matrix_ready());
+        assert!(!import.any_enabled());
+    }
+
+    #[test]
+    fn bot_source_ready_truth_table() {
+        assert!(full_bot_source().ready(SECRET));
+
+        // An empty challenge secret alone keeps a fully configured source off
+        assert!(!full_bot_source().ready(""));
+
+        type Clear = fn(&mut ApiImportBotSource);
+        let required: [(&str, Clear); 5] = [
+            ("enabled", |s| s.enabled = false),
+            ("bot_id", |s| s.bot_id.clear()),
+            ("bot_token", |s| s.bot_token.clear()),
+            ("api_url", |s| s.api_url.clear()),
+            ("cdn_url", |s| s.cdn_url.clear()),
+        ];
+        for (name, clear) in required {
+            let mut source = full_bot_source();
+            clear(&mut source);
+            assert!(!source.ready(SECRET), "ready() without {name}");
+        }
+
+        // app_url only builds the add-bot link; the read path never uses it
+        let mut source = full_bot_source();
+        source.app_url.clear();
+        assert!(source.ready(SECRET));
+
+        assert!(!ApiImportBotSource::default().ready(SECRET));
+    }
+
+    #[test]
+    fn matrix_ready_truth_table() {
+        assert!(full_matrix().ready(SECRET));
+        assert!(!full_matrix().ready(""));
+
+        type Clear = fn(&mut ApiImportMatrix);
+        let required: [(&str, Clear); 4] = [
+            ("enabled", |m| m.enabled = false),
+            ("homeserver_url", |m| m.homeserver_url.clear()),
+            ("bot_user_id", |m| m.bot_user_id.clear()),
+            ("access_token", |m| m.access_token.clear()),
+        ];
+        for (name, clear) in required {
+            let mut matrix = full_matrix();
+            clear(&mut matrix);
+            assert!(!matrix.ready(SECRET), "ready() without {name}");
+        }
+
+        // The join budget is not a readiness key
+        let mut matrix = full_matrix();
+        matrix.max_joins = 0;
+        assert!(matrix.ready(SECRET));
+
+        assert!(!ApiImportMatrix::default().ready(SECRET));
+    }
+
+    /// The per-source helpers pass the shared secret, and only their own source
+    #[test]
+    fn source_helpers_use_the_shared_secret() {
+        let mut import = ApiImport {
+            stoat: full_bot_source(),
+            fluxer: full_bot_source(),
+            matrix: full_matrix(),
+            ..Default::default()
+        };
+        assert!(!import.stoat_ready());
+        assert!(!import.fluxer_ready());
+        assert!(!import.matrix_ready());
+
+        import.challenge_secret = SECRET.to_string();
+        assert!(import.stoat_ready());
+        assert!(import.fluxer_ready());
+        assert!(import.matrix_ready());
+
+        import.stoat.enabled = false;
+        assert!(!import.stoat_ready());
+        assert!(import.fluxer_ready());
+        assert!(import.matrix_ready());
+
+        import.fluxer.bot_token.clear();
+        assert!(!import.fluxer_ready());
+        assert!(import.matrix_ready());
+
+        import.matrix.access_token.clear();
+        assert!(!import.matrix_ready());
+    }
+
+    /// Enabled flags only: readiness is re-checked per job kind in crond
+    #[test]
+    fn any_enabled_reads_the_flags_only() {
+        assert!(!ApiImport::default().any_enabled());
+
+        type Enable = fn(&mut ApiImport);
+        let flags: [(&str, Enable); 4] = [
+            ("discord", |i| i.discord.enabled = true),
+            ("stoat", |i| i.stoat.enabled = true),
+            ("fluxer", |i| i.fluxer.enabled = true),
+            ("matrix", |i| i.matrix.enabled = true),
+        ];
+        for (name, enable) in flags {
+            let mut import = ApiImport::default();
+            enable(&mut import);
+            assert!(import.any_enabled(), "any_enabled() missed {name}");
+            // No keys and no secret: on, but not ready
+            assert!(!import.stoat_ready());
+            assert!(!import.fluxer_ready());
+            assert!(!import.matrix_ready());
+        }
+    }
+
+    #[test]
+    fn hand_written_default_has_the_planned_values() {
+        assert_import_defaults(&ApiImport::default());
+    }
+
+    /// The embedded tables must not drift from the code defaults
+    #[test]
+    fn embedded_tables_match_the_code_defaults() {
+        let settings = settings(bundled());
+        assert_import_defaults(&settings.api.import);
+    }
+
+    /// A config with no import tables at all, and partial tables (what an
+    /// overrides file holds), still deserialize with the planned defaults
+    #[test]
+    fn missing_and_partial_tables_take_the_defaults() {
+        let empty: ApiImport = Config::builder()
+            .build()
+            .expect("an empty config builds")
+            .try_deserialize()
+            .expect("an empty table must deserialize");
+        assert_import_defaults(&empty);
+
+        let partial: ApiImport = Config::builder()
+            .add_source(File::from_str(
+                "[matrix]\nenabled = true\n[stoat]\nbot_id = \"x\"\n",
+                FileFormat::Toml,
+            ))
+            .build()
+            .expect("a partial config builds")
+            .try_deserialize()
+            .expect("partial tables must deserialize");
+        assert!(partial.matrix.enabled);
+        assert_eq!(partial.matrix.max_joins, 8);
+        // A partial table without the baked file has no URLs, so the source
+        // can never be ready from it alone
+        assert_eq!(partial.stoat.bot_id, "x");
+        assert!(partial.stoat.api_url.is_empty());
+        // A table that leaves the reconcile out (heart1's today) gets it off
+        assert_eq!(partial.stoat.reconcile_after_hours, 0);
+        assert_fluxer_defaults(&partial.fluxer);
+    }
+
+    /// The operator turns the bot reconcile on (and picks its grace) in the
+    /// overrides of the one deployment that owns the bot
+    #[test]
+    fn overrides_set_the_reconcile_grace() {
+        for (value, expected) in [(0, 0), (24, 24), (6, 6)] {
+            let overrides = format!("[api.import.stoat]\nreconcile_after_hours = {value}\n");
+            let settings =
+                settings(bundled().add_source(File::from_str(&overrides, FileFormat::Toml)));
+            assert_eq!(settings.api.import.stoat.reconcile_after_hours, expected);
+            assert_eq!(settings.api.import.fluxer.reconcile_after_hours, 0);
+        }
+    }
+
+    /// Overrides on top of the baked file: the operator sets only the secrets
+    /// and ids, and the baked public URLs survive the merge
+    #[test]
+    fn overrides_make_a_source_ready_and_keep_the_baked_urls() {
+        let overrides = format!(
+            "[api.import]\nchallenge_secret = \"{SECRET}\"\n\
+             [api.import.stoat]\nenabled = true\nbot_id = \"01BOTID\"\nbot_token = \"{STOAT_TOKEN}\"\n"
+        );
+        let settings = settings(bundled().add_source(File::from_str(&overrides, FileFormat::Toml)));
+        let import = &settings.api.import;
+
+        assert!(import.stoat_ready());
+        assert_eq!(import.stoat.api_url, "https://api.stoat.chat");
+        assert_eq!(import.stoat.cdn_url, "https://cdn.stoatusercontent.com");
+        assert_eq!(import.stoat.reconcile_after_hours, 0);
+        assert!(!import.fluxer_ready());
+        assert!(!import.matrix_ready());
+        assert!(import.any_enabled());
+    }
+
+    /// The documented env form (double underscores) reaches the nested keys.
+    /// Supplied in-process, as CONFIG_BUILDER reads it.
+    #[test]
+    fn environment_override_reaches_the_tables() {
+        let vars = HashMap::from([
+            (
+                "REVOLT__API__IMPORT__CHALLENGE_SECRET".to_owned(),
+                SECRET.to_owned(),
+            ),
+            (
+                "REVOLT__API__IMPORT__MATRIX__ENABLED".to_owned(),
+                "true".to_owned(),
+            ),
+            (
+                "REVOLT__API__IMPORT__MATRIX__MAX_JOINS".to_owned(),
+                "3".to_owned(),
+            ),
+        ]);
+
+        let settings = settings(
+            bundled().add_source(
+                Environment::with_prefix("REVOLT")
+                    .separator("__")
+                    .source(Some(vars)),
+            ),
+        );
+        let import = &settings.api.import;
+
+        assert!(
+            import.challenge_secret == SECRET,
+            "challenge_secret not loaded"
+        );
+        assert!(import.matrix.enabled);
+        assert_eq!(import.matrix.max_joins, 3);
+        // Enabled with no bot keys is still not ready
+        assert!(!import.matrix_ready());
+    }
+
+    #[test]
+    fn debug_never_prints_the_import_secrets() {
+        let overrides = format!(
+            "[api.import]\nchallenge_secret = \"{SECRET}\"\n\
+             [api.import.discord]\nbot_token = \"{DISCORD_TOKEN}\"\n\
+             [api.import.stoat]\nbot_token = \"{STOAT_TOKEN}\"\n\
+             [api.import.fluxer]\nbot_token = \"{FLUXER_TOKEN}\"\n\
+             [api.import.matrix]\naccess_token = \"{MATRIX_TOKEN}\"\n"
+        );
+        let settings = settings(bundled().add_source(File::from_str(&overrides, FileFormat::Toml)));
+
+        // The values really loaded, or the absence below proves nothing
+        let import = &settings.api.import;
+        assert!(
+            import.challenge_secret == SECRET,
+            "challenge_secret not loaded"
+        );
+        assert!(
+            import.discord.bot_token == DISCORD_TOKEN,
+            "discord token not loaded"
+        );
+        assert!(
+            import.stoat.bot_token == STOAT_TOKEN,
+            "stoat token not loaded"
+        );
+        assert!(
+            import.fluxer.bot_token == FLUXER_TOKEN,
+            "fluxer token not loaded"
+        );
+        assert!(
+            import.matrix.access_token == MATRIX_TOKEN,
+            "matrix token not loaded"
+        );
+
+        // `init()` prints the whole Settings at boot
+        let debug = format!("{settings:?}");
+        for (name, secret) in [
+            ("challenge_secret", SECRET),
+            ("discord bot_token", DISCORD_TOKEN),
+            ("stoat bot_token", STOAT_TOKEN),
+            ("fluxer bot_token", FLUXER_TOKEN),
+            ("matrix access_token", MATRIX_TOKEN),
+        ] {
+            assert!(!debug.contains(secret), "Settings Debug leaks {name}");
+        }
+
+        let debug = format!("{import:?}");
+        assert!(debug.contains(r#"challenge_secret: "<redacted>""#));
+        assert_eq!(debug.matches(r#"bot_token: "<redacted>""#).count(), 3);
+        assert!(debug.contains(r#"access_token: "<redacted>""#));
+        // Non-secret fields still print
+        assert!(debug.contains(r#"api_url: "https://api.stoat.chat""#));
+        assert!(debug.contains("max_joins: 8"));
     }
 }

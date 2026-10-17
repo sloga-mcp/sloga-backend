@@ -1,13 +1,13 @@
-use bson::Bson;
+use bson::{Bson, Document};
 use futures::StreamExt;
 use iso8601_timestamp::Timestamp;
 use mongodb::options::{FindOneAndUpdateOptions, ReturnDocument};
 use revolt_result::Result;
 
 use crate::MongoDb;
-use crate::{DiscordImportJob, ImportStatus};
+use crate::{DiscordImportJob, ImportJobKind, ImportStatus};
 
-use super::AbstractDiscordImportJobs;
+use super::{unleft_cutoff, AbstractDiscordImportJobs};
 
 static COL: &str = "discord_import_jobs";
 
@@ -30,6 +30,14 @@ fn active_statuses() -> Bson {
     Bson::Array(vec![
         Bson::String(ImportStatus::Queued.as_variant_str().to_string()),
         Bson::String(ImportStatus::Running.as_variant_str().to_string()),
+    ])
+}
+
+/// The complement of `active_statuses()` — the states nothing moves out of.
+fn terminal_statuses() -> Bson {
+    Bson::Array(vec![
+        Bson::String(ImportStatus::Completed.as_variant_str().to_string()),
+        Bson::String(ImportStatus::Failed.as_variant_str().to_string()),
     ])
 }
 
@@ -161,5 +169,76 @@ impl AbstractDiscordImportJobs for MongoDb {
             .filter_map(|s| async { s.ok() })
             .collect()
             .await)
+    }
+
+    /// Whether another in-flight job of this kind targets the same source.
+    async fn has_other_active_job_for_source(
+        &self,
+        kind: &ImportJobKind,
+        source_server_id: &str,
+        except_job_id: &str,
+    ) -> Result<bool> {
+        // Untyped + id-only projection: this answers yes/no, and must not
+        // turn a row this binary cannot decode into an error.
+        self.col::<Document>(COL)
+            .find_one(doc! {
+                "_id": { "$ne": except_job_id },
+                "kind": kind.as_variant_str(),
+                "source_server_id": source_server_id,
+                // Same set as the `active_user_id` partial index.
+                "status": { "$in": active_statuses() }
+            })
+            .projection(doc! { "_id": 1_i32 })
+            .await
+            .map(|found| found.is_some())
+            .map_err(|_| create_database_error!("find_one", COL))
+    }
+
+    /// Terminal source-kind jobs whose bot has not left the source yet.
+    async fn fetch_unleft_terminal_source_jobs(
+        &self,
+        max_age_days: i64,
+        limit: i64,
+    ) -> Result<Vec<DiscordImportJob>> {
+        // Mongo reads `limit(0)` as "no limit" and a negative limit as a
+        // single batch; neither is what a caller passing <= 0 means.
+        if limit <= 0 {
+            return Ok(vec![]);
+        }
+
+        let source_kinds: Vec<Bson> = ImportJobKind::SOURCE_KINDS
+            .iter()
+            .map(|kind| Bson::String(kind.as_variant_str().to_string()))
+            .collect();
+
+        Ok(self
+            .col::<DiscordImportJob>(COL)
+            .find(doc! {
+                "kind": { "$in": source_kinds },
+                "status": { "$in": terminal_statuses() },
+                // `$ne: true`, NOT `false`: the field is omitted while
+                // false (`skip_serializing_if`), and absent on every row
+                // written before it existed.
+                "source_left": { "$ne": true },
+                "updated_at": { "$gte": timestamp_bson(&unleft_cutoff(max_age_days)) }
+            })
+            .sort(doc! { "_id": 1_i32 })
+            .limit(limit)
+            .await
+            .map_err(|_| create_database_error!("find", COL))?
+            .filter_map(|s| async { s.ok() })
+            .collect()
+            .await)
+    }
+
+    /// Record that the bot has left this job's source.
+    async fn mark_source_left(&self, id: &str) -> Result<()> {
+        // `$set` on the one field, no upsert: the rest of the terminal row
+        // (including its `updated_at`) stays exactly as the worker left it.
+        self.col::<Document>(COL)
+            .update_one(doc! { "_id": id }, doc! { "$set": { "source_left": true } })
+            .await
+            .map(|_| ())
+            .map_err(|_| create_database_error!("update_one", COL))
     }
 }

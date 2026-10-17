@@ -22,5 +22,6 @@ pub mod prune_mls_key_packages;
 pub mod prune_upload_sessions;
 pub mod qualify_referrals;
 pub mod scheduled_messages;
+pub mod stoat_import;
 pub mod stream_live;
 pub mod thread_archiver;
