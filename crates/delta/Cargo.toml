@@ -75,6 +75,7 @@ lapin = { workspace = true, features = ["tokio"] }
 
 # core
 revolt-config = { workspace = true }
+revolt-gamedata = { workspace = true }
 revolt-database = { workspace = true, features = [
     "rocket-impl",
     "redis-is-patched",

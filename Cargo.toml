@@ -203,6 +203,7 @@ revolt-coalesced = { version = "0.13.7", path = "crates/core/coalesced" }
 revolt-config = { version = "0.13.7", path = "crates/core/config" }
 revolt-database = { version = "0.13.7", path = "crates/core/database" }
 revolt-files = { version = "0.13.7", path = "crates/core/files" }
+revolt-gamedata = { version = "0.13.7", path = "crates/core/gamedata" }
 revolt-models = { version = "0.13.7", path = "crates/core/models" }
 revolt-parser = { version = "0.13.7", path = "crates/core/parser" }
 revolt-permissions = { version = "0.13.7", path = "crates/core/permissions" }

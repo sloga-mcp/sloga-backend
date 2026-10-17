@@ -188,6 +188,31 @@ email_hmac_key = ""
 # Public Ko-fi page that donation links point to
 page_url = "https://ko-fi.com/slogatech"
 
+[api.gamedata]
+# Game cards and lookups (Steam, World of Warcraft, League of Legends).
+# Secrets are set only in deployment overrides or the environment, e.g.
+# REVOLT__API__GAMEDATA__BLIZZARD_CLIENT_SECRET (double underscores).
+# Empty Blizzard credentials turn World of Warcraft cards off.
+blizzard_client_id = ""
+blizzard_client_secret = ""
+# Shared key internal callers send as X-Internal-Key to get game cards
+internal_key = ""
+# January URL the embed worker sends internal_key to, bypassing the public
+# proxy, e.g. a loopback URL such as http://127.0.0.1:14705. Must be http(s)
+# on localhost, a loopback or a private (RFC 1918) address, or the key is
+# never sent. Empty: no key is sent and game cards stay off.
+internal_january = ""
+# Steam store (appdetails + storesearch) budget window, in seconds
+steam_store_window_secs = 300
+# Steam store calls per window for embeds
+steam_store_embed_budget = 100
+# Steam store calls per window for interactive lookups
+steam_store_interactive_budget = 50
+# Steam news calls per window
+steam_news_per_window = 60
+# Blizzard API calls per second (shared by embeds and lookups)
+blizzard_per_second = 20
+
 [pushd]
 # this changes the names of the queues to not overlap 
 # prod/beta if they happen to be on the same exchange/instance.

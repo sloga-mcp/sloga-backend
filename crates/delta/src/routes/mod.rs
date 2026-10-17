@@ -14,6 +14,7 @@ mod gifs;
 mod interactions;
 mod invites;
 mod kofi;
+mod lookup;
 mod mls;
 mod onboard;
 mod policy;
@@ -53,6 +54,7 @@ pub fn mount(config: Settings, mut rocket: Rocket<Build>) -> Rocket<Build> {
             "/mls" => mls::routes(),
             "/events" => events::routes(),
             "/gifs" => gifs::routes(),
+            "/lookup" => lookup::routes(),
             "/import" => import::routes(),
             "/softres" => softres::routes(),
             "/auth/account" => account::routes(),
@@ -85,6 +87,7 @@ pub fn mount(config: Settings, mut rocket: Rocket<Build>) -> Rocket<Build> {
             "/mls" => mls::routes(),
             "/events" => events::routes(),
             "/gifs" => gifs::routes(),
+            "/lookup" => lookup::routes(),
             "/import" => import::routes(),
             "/softres" => softres::routes(),
             "/auth/account" => account::routes(),
@@ -207,7 +210,8 @@ fn custom_openapi_spec() -> OpenApi {
             "tags": [
               "Sync",
               "Web Push",
-              "Soft Reserves"
+              "Soft Reserves",
+              "Game Lookup"
             ]
           }
         ]),
@@ -413,6 +417,14 @@ fn custom_openapi_spec() -> OpenApi {
                 name: "Soft Reserves".to_owned(),
                 description: Some(
                     "Static raid loot catalog for soft-reserve sheets".to_owned(),
+                ),
+                ..Default::default()
+            },
+            Tag {
+                name: "Game Lookup".to_owned(),
+                description: Some(
+                    "Search Steam games, World of Warcraft items and League of Legends champions"
+                        .to_owned(),
                 ),
                 ..Default::default()
             },
