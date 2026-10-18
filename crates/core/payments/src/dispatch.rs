@@ -327,6 +327,10 @@ fn fulfil_step(outcome: FulfilOutcome) -> Step {
         // up yet: retry rather than settle (the Pending sweep is the backstop)
         FulfilOutcome::NotPaid => Step::Retry("session not reported paid yet".to_string()),
         FulfilOutcome::LeaseHeld => Step::Retry("order lease held".to_string()),
+        // The order is still Paid; the reconcile resume also retries it
+        FulfilOutcome::VoidDeferred(_) => {
+            Step::Retry("void waits for an open dispute to close".to_string())
+        }
     }
 }
 
@@ -636,8 +640,13 @@ fn count_fulfil(tally: &mut Tally, outcome: FulfilOutcome) {
         FulfilOutcome::Fulfilled | FulfilOutcome::AlreadyFulfilled | FulfilOutcome::Voided(_) => {
             tally.resumed += 1
         }
-        // Someone else holds the order, or there was nothing to do
-        FulfilOutcome::LeaseHeld | FulfilOutcome::NotPaid | FulfilOutcome::Ignored => {}
+        // Someone else holds the order, or there was nothing to do (yet: a
+        // void that waits for a dispute is resumed again by the next sweep,
+        // and the engine logs it)
+        FulfilOutcome::LeaseHeld
+        | FulfilOutcome::NotPaid
+        | FulfilOutcome::Ignored
+        | FulfilOutcome::VoidDeferred(_) => {}
     }
 }
 
@@ -933,7 +942,7 @@ mod tests {
             state,
             void_reason: None,
             reversal_pending: None,
-            dispute_open: false,
+            open_disputes: vec![],
             lease_until: None,
             created_at,
             paid_at: None,
@@ -1388,6 +1397,289 @@ mod tests {
         drop_db(&db).await;
     }
 
+    /// Set dispute `id` on `payment_intent` to `status` at Stripe
+    fn set_dispute_status(stripe: &MockStripe, id: &str, payment_intent: &str, status: &str) {
+        stripe.set_dispute(Dispute {
+            id: id.to_string(),
+            status: Some(status.to_string()),
+            payment_intent: Some(payment_intent.to_string()),
+        });
+    }
+
+    /// Deliver event `event_id` about dispute `dispute_id` on
+    /// `payment_intent`. The payload's status is deliberately stale: the
+    /// engine applies the status Stripe reports now.
+    async fn deliver_dispute(
+        db: &Database,
+        stripe: &MockStripe,
+        event_id: &str,
+        dispute_id: &str,
+        payment_intent: &str,
+        at: i64,
+    ) {
+        let object = json!({
+            "id": dispute_id,
+            "object": "dispute",
+            "payment_intent": payment_intent,
+            "status": "needs_response"
+        });
+        let delivery = event(event_id, "charge.dispute.updated", false, object);
+        assert_eq!(
+            handle_event(db, stripe, &settings(), &delivery, at)
+                .await
+                .unwrap(),
+            EventOutcome::Processed,
+            "{event_id}"
+        );
+    }
+
+    /// The order's open disputes, u1's listed orders and u1's badge
+    async fn dispute_state(
+        db: &Database,
+        order_id: &str,
+    ) -> (Vec<String>, Vec<String>, Option<v0::UserCipher>) {
+        let o = db.fetch_payment_order(order_id).await.unwrap().unwrap();
+        let m = db.fetch_cipher_membership("u1").await.unwrap().unwrap();
+        assert!(m.revoked_at.is_none());
+        (o.open_disputes, m.disputed_orders, badge(db).await)
+    }
+
+    #[tokio::test]
+    async fn a_closed_inquiry_never_clears_an_open_chargeback_on_the_same_payment() {
+        let db = test_db().await;
+        let stripe = MockStripe::new();
+        fulfilled_member(&db, "o_two", "pi_two").await;
+        let listed = vec!["o_two".to_string()];
+
+        // An inquiry opens, then a chargeback on the same payment
+        set_dispute_status(&stripe, "dp_inquiry", "pi_two", "warning_needs_response");
+        deliver_dispute(&db, &stripe, "evt_inq_created", "dp_inquiry", "pi_two", NOW).await;
+        set_dispute_status(&stripe, "dp_chargeback", "pi_two", "needs_response");
+        deliver_dispute(
+            &db,
+            &stripe,
+            "evt_cb_created",
+            "dp_chargeback",
+            "pi_two",
+            NOW + 1,
+        )
+        .await;
+        assert_eq!(
+            dispute_state(&db, "o_two").await,
+            (
+                vec!["dp_inquiry".to_string(), "dp_chargeback".to_string()],
+                listed.clone(),
+                None
+            )
+        );
+
+        // The inquiry closes in our favor: the chargeback still hides the
+        // badge
+        set_dispute_status(&stripe, "dp_inquiry", "pi_two", "warning_closed");
+        deliver_dispute(
+            &db,
+            &stripe,
+            "evt_inq_closed",
+            "dp_inquiry",
+            "pi_two",
+            NOW + 2,
+        )
+        .await;
+        assert_eq!(
+            dispute_state(&db, "o_two").await,
+            (vec!["dp_chargeback".to_string()], listed.clone(), None)
+        );
+
+        // The chargeback is won: the badge is back
+        set_dispute_status(&stripe, "dp_chargeback", "pi_two", "won");
+        deliver_dispute(
+            &db,
+            &stripe,
+            "evt_cb_closed",
+            "dp_chargeback",
+            "pi_two",
+            NOW + 3,
+        )
+        .await;
+        assert_eq!(
+            dispute_state(&db, "o_two").await,
+            (vec![], vec![], Some(t99_badge()))
+        );
+
+        drop_db(&db).await;
+    }
+
+    #[tokio::test]
+    async fn two_disputes_delivered_out_of_order_keep_the_badge_hidden_until_both_close() {
+        let db = test_db().await;
+        let stripe = MockStripe::new();
+        fulfilled_member(&db, "o_ooo", "pi_ooo").await;
+        let listed = vec!["o_ooo".to_string()];
+        let only_cb = || {
+            (
+                vec!["dp_cb".to_string()],
+                listed.clone(),
+                None::<v0::UserCipher>,
+            )
+        };
+
+        // By the time anything is delivered, the inquiry is already closed
+        // and the chargeback open
+        set_dispute_status(&stripe, "dp_inq", "pi_ooo", "warning_closed");
+        set_dispute_status(&stripe, "dp_cb", "pi_ooo", "needs_response");
+
+        deliver_dispute(&db, &stripe, "evt_cb_created", "dp_cb", "pi_ooo", NOW).await;
+        assert_eq!(dispute_state(&db, "o_ooo").await, only_cb());
+        // The inquiry's close, then its creation: neither touches the
+        // chargeback
+        deliver_dispute(&db, &stripe, "evt_inq_closed", "dp_inq", "pi_ooo", NOW + 1).await;
+        assert_eq!(dispute_state(&db, "o_ooo").await, only_cb());
+        deliver_dispute(&db, &stripe, "evt_inq_created", "dp_inq", "pi_ooo", NOW + 2).await;
+        assert_eq!(dispute_state(&db, "o_ooo").await, only_cb());
+
+        // The chargeback is won, and a late update of it does not reopen it
+        set_dispute_status(&stripe, "dp_cb", "pi_ooo", "won");
+        deliver_dispute(&db, &stripe, "evt_cb_closed", "dp_cb", "pi_ooo", NOW + 3).await;
+        assert_eq!(
+            dispute_state(&db, "o_ooo").await,
+            (vec![], vec![], Some(t99_badge()))
+        );
+        deliver_dispute(&db, &stripe, "evt_cb_late", "dp_cb", "pi_ooo", NOW + 4).await;
+        assert_eq!(
+            dispute_state(&db, "o_ooo").await,
+            (vec![], vec![], Some(t99_badge()))
+        );
+
+        // The other way round: a second chargeback's close (won) arrives
+        // while a new inquiry is open, before its own creation
+        set_dispute_status(&stripe, "dp_inq2", "pi_ooo", "warning_under_review");
+        set_dispute_status(&stripe, "dp_cb2", "pi_ooo", "won");
+        deliver_dispute(
+            &db,
+            &stripe,
+            "evt_inq2_created",
+            "dp_inq2",
+            "pi_ooo",
+            NOW + 5,
+        )
+        .await;
+        let only_inq2 = || {
+            (
+                vec!["dp_inq2".to_string()],
+                listed.clone(),
+                None::<v0::UserCipher>,
+            )
+        };
+        assert_eq!(dispute_state(&db, "o_ooo").await, only_inq2());
+        deliver_dispute(&db, &stripe, "evt_cb2_closed", "dp_cb2", "pi_ooo", NOW + 6).await;
+        assert_eq!(dispute_state(&db, "o_ooo").await, only_inq2());
+        deliver_dispute(&db, &stripe, "evt_cb2_created", "dp_cb2", "pi_ooo", NOW + 7).await;
+        assert_eq!(dispute_state(&db, "o_ooo").await, only_inq2());
+
+        set_dispute_status(&stripe, "dp_inq2", "pi_ooo", "warning_closed");
+        deliver_dispute(
+            &db,
+            &stripe,
+            "evt_inq2_closed",
+            "dp_inq2",
+            "pi_ooo",
+            NOW + 8,
+        )
+        .await;
+        assert_eq!(
+            dispute_state(&db, "o_ooo").await,
+            (vec![], vec![], Some(t99_badge()))
+        );
+        assert_eq!(stripe.refund_count(), 0);
+
+        drop_db(&db).await;
+    }
+
+    #[tokio::test]
+    async fn a_void_waiting_on_a_dispute_is_retried_not_settled() {
+        let db = test_db().await;
+        let stripe = MockStripe::new();
+        let s = PaymentsSettings {
+            close_at_ms: Some(NOW - 10 * MINUTE),
+            ..settings()
+        };
+        // Created after the sale closed, so it can only be voided; disputed
+        // before its completion is handled
+        paid_at_stripe(&db, &stripe, "o_wait", "pi_wait").await;
+        set_dispute_status(&stripe, "dp_wait", "pi_wait", "needs_response");
+        let opened = event(
+            "evt_wait_dp",
+            "charge.dispute.created",
+            false,
+            json!({ "id": "dp_wait", "object": "dispute", "payment_intent": "pi_wait" }),
+        );
+        assert_eq!(
+            handle_event(&db, &stripe, &s, &opened, NOW).await.unwrap(),
+            EventOutcome::Processed
+        );
+
+        // The completion cannot void while the dispute is open: Retry,
+        // nothing refunded, the order still Paid
+        let done = completed("evt_wait_done", "o_wait");
+        assert_eq!(
+            handle_event(&db, &stripe, &s, &done, NOW + 1)
+                .await
+                .unwrap(),
+            EventOutcome::Retry
+        );
+        assert_eq!(
+            stored(&db, "evt_wait_done").await.state,
+            PaymentEventState::Failed
+        );
+        let o = db.fetch_payment_order("o_wait").await.unwrap().unwrap();
+        assert_eq!(o.state, OrderState::Paid);
+        assert_eq!(stripe.call_count("create_refund"), 0);
+
+        // The sweep resumes the order (not counted as resumed, not an
+        // error) and re-drives the completion, which still retries (the one
+        // error)
+        stripe.set_event(done.clone());
+        assert_eq!(
+            reconcile(&db, &stripe, &s, NOW + 2).await.unwrap(),
+            "expired=0, resumed=0, reversed=0, redriven=0, errors=1"
+        );
+        assert_eq!(stripe.call_count("create_refund"), 0);
+        assert_eq!(
+            db.fetch_payment_order("o_wait")
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            OrderState::Paid
+        );
+
+        // Won: the redelivered completion voids and refunds
+        set_dispute_status(&stripe, "dp_wait", "pi_wait", "won");
+        let closed = event(
+            "evt_wait_dp_closed",
+            "charge.dispute.closed",
+            false,
+            json!({ "id": "dp_wait", "object": "dispute", "payment_intent": "pi_wait" }),
+        );
+        assert_eq!(
+            handle_event(&db, &stripe, &s, &closed, NOW + 3)
+                .await
+                .unwrap(),
+            EventOutcome::Processed
+        );
+        assert_eq!(
+            handle_event(&db, &stripe, &s, &done, NOW + 4)
+                .await
+                .unwrap(),
+            EventOutcome::Processed
+        );
+        let o = db.fetch_payment_order("o_wait").await.unwrap().unwrap();
+        assert_eq!(o.state, OrderState::Voided);
+        assert_eq!(stripe.refund_count_for("pi_wait"), 1);
+
+        drop_db(&db).await;
+    }
+
     #[tokio::test]
     async fn a_failed_dispute_lookup_retries_and_never_guesses() {
         let db = test_db().await;
@@ -1524,7 +1816,7 @@ mod tests {
         );
         let o = db.fetch_payment_order("o_early_dp").await.unwrap().unwrap();
         assert_eq!(o.state, OrderState::Pending);
-        assert!(o.dispute_open);
+        assert_eq!(o.open_disputes, ["dp_test_1"]);
         assert_eq!(badge(&db).await, None);
 
         // The completion: a member, listed as disputed, and no badge
@@ -1626,7 +1918,7 @@ mod tests {
         );
         let o = db.fetch_payment_order("o_paid_dp").await.unwrap().unwrap();
         assert_eq!(o.state, OrderState::Paid);
-        assert!(o.dispute_open);
+        assert_eq!(o.open_disputes, ["dp_test_1"]);
         assert_eq!(badge(&db).await, None);
 
         // The sweep resumes the Paid order

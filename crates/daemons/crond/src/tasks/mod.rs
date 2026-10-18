@@ -8,6 +8,7 @@ pub mod expire_supporters;
 pub mod file_deletion;
 pub mod fluxer_import;
 pub mod import_http;
+pub mod payments_reconcile;
 pub mod poll_expiry;
 pub mod prune_audit_log;
 pub mod prune_dangling_files;

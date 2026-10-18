@@ -97,13 +97,16 @@ auto_derived!(
         /// A reversal still to be applied once fulfilment finishes
         #[serde(skip_serializing_if = "Option::is_none", default)]
         pub reversal_pending: Option<ReversalPending>,
-        /// A dispute on the payment is open. Set and cleared under the lease
-        /// in every state before fulfilment as well as after it; fulfilment
-        /// lists the order in the membership's `disputed_orders` in the same
-        /// write that adds it, so no badge is published while it is set.
-        /// Left out of the stored document when false (absent reads false).
-        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-        pub dispute_open: bool,
+        /// Provider ids of the disputes open on the payment. One payment can
+        /// carry more than one (an inquiry closed `warning_closed`, then a
+        /// chargeback), so each dispute is added and removed by its own id.
+        /// Changed under the lease in every state before fulfilment as well
+        /// as after it. While it is non-empty the order is listed in the
+        /// membership's `disputed_orders` (fulfilment lists it in the same
+        /// write that adds it), so no badge is published. Left out of the
+        /// stored document when empty (absent reads empty).
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub open_disputes: Vec<String>,
         /// Epoch ms until which a worker holds this order; unset when free
         #[serde(skip_serializing_if = "Option::is_none", default)]
         pub lease_until: Option<i64>,

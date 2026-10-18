@@ -324,7 +324,7 @@ mod tests {
             state: OrderState::Creating,
             void_reason: None,
             reversal_pending: None,
-            dispute_open: false,
+            open_disputes: vec![],
             lease_until: None,
             version: 0,
             created_at: 1_788_264_000_000,
@@ -379,7 +379,7 @@ mod tests {
             state: OrderState::Voided,
             void_reason: Some(VoidReason::DisputeOpen),
             reversal_pending: Some(ReversalPending::DisputeLost),
-            dispute_open: true,
+            open_disputes: vec!["dp_1".to_string(), "dp_2".to_string()],
             lease_until: Some(1_788_264_120_000),
             paid_at: Some(1_788_264_060_000),
             fulfilled_at: Some(1_788_264_070_000),
@@ -389,7 +389,10 @@ mod tests {
         let doc = to_document(&full).unwrap();
         assert_eq!(doc.get_str("void_reason").unwrap(), "DisputeOpen");
         assert_eq!(doc.get_str("reversal_pending").unwrap(), "DisputeLost");
-        assert!(doc.get_bool("dispute_open").unwrap());
+        assert_eq!(
+            doc.get_array("open_disputes").unwrap(),
+            &vec![bson::Bson::from("dp_1"), bson::Bson::from("dp_2")]
+        );
         assert_eq!(doc.get_i64("lease_until").unwrap(), 1_788_264_120_000);
         assert_eq!(from_document::<PaymentOrder>(doc).unwrap(), full);
 
@@ -400,6 +403,37 @@ mod tests {
         })
         .unwrap();
         assert_eq!(mismatch.get_str("void_reason").unwrap(), "AmountMismatch");
+    }
+
+    #[test]
+    fn open_disputes_are_absent_when_empty_and_absent_reads_empty() {
+        // Empty: left out of the stored document (no empty array)
+        let doc = to_document(&order()).unwrap();
+        assert!(!doc.contains_key("open_disputes"));
+
+        // Non-empty: stored as an array of ids, in order, and read back
+        let disputed = PaymentOrder {
+            open_disputes: vec!["dp_a".to_string(), "dp_b".to_string()],
+            ..order()
+        };
+        let doc = to_document(&disputed).unwrap();
+        assert_eq!(
+            doc.get("open_disputes"),
+            Some(&bson::Bson::Array(vec!["dp_a".into(), "dp_b".into()]))
+        );
+        assert_eq!(from_document::<PaymentOrder>(doc).unwrap(), disputed);
+
+        // An order stored before the field existed reads as no open dispute
+        let mut legacy = to_document(&disputed).unwrap();
+        legacy.remove("open_disputes");
+        assert!(!legacy.contains_key("open_disputes"));
+        assert_eq!(
+            from_document::<PaymentOrder>(legacy).unwrap(),
+            PaymentOrder {
+                open_disputes: vec![],
+                ..disputed
+            }
+        );
     }
 
     #[test]

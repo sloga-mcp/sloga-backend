@@ -127,7 +127,7 @@ mod tests {
             state,
             void_reason: None,
             reversal_pending: None,
-            dispute_open: false,
+            open_disputes: vec![],
             lease_until: None,
             version: 0,
             created_at,
@@ -1006,6 +1006,78 @@ mod tests {
                 .unwrap()
                 .unwrap();
             assert_eq!(held.version, 1);
+        });
+    }
+
+    #[tokio::test]
+    async fn open_disputes_are_written_and_cleared_by_id() {
+        database_test!(|db| async move {
+            create_payment_order_indexes(&db).await;
+            let row = order("o1", "u1", OrderState::Paid, 10);
+            db.insert_payment_order(&row).await.unwrap();
+            assert!(db
+                .fetch_payment_order("o1")
+                .await
+                .unwrap()
+                .unwrap()
+                .open_disputes
+                .is_empty());
+
+            // Two disputes on one payment, kept apart by id
+            let two = PaymentOrder {
+                open_disputes: vec!["dp_a".to_string(), "dp_b".to_string()],
+                ..row
+            };
+            assert!(db
+                .update_payment_order_if_state(&two, OrderState::Paid)
+                .await
+                .unwrap());
+            let stored = db.fetch_payment_order("o1").await.unwrap().unwrap();
+            assert_eq!(stored.open_disputes, ["dp_a", "dp_b"]);
+
+            // One closes: only its id goes
+            let one = PaymentOrder {
+                open_disputes: vec!["dp_b".to_string()],
+                ..stored
+            };
+            assert!(db
+                .update_payment_order_if_state(&one, OrderState::Paid)
+                .await
+                .unwrap());
+            let stored = db.fetch_payment_order("o1").await.unwrap().unwrap();
+            assert_eq!(stored.open_disputes, ["dp_b"]);
+
+            // The last closes: read back empty, and (Mongo) the field is
+            // gone from the stored document, not left as an empty array
+            let none = PaymentOrder {
+                open_disputes: vec![],
+                ..stored
+            };
+            assert!(db
+                .update_payment_order_if_state(&none, OrderState::Paid)
+                .await
+                .unwrap());
+            assert!(db
+                .fetch_payment_order("o1")
+                .await
+                .unwrap()
+                .unwrap()
+                .open_disputes
+                .is_empty());
+
+            match &db {
+                crate::Database::Reference(_) => {}
+                #[cfg(feature = "mongodb")]
+                crate::Database::MongoDb(mongo) => {
+                    let raw = mongo
+                        .col::<bson::Document>("payment_orders")
+                        .find_one(bson::doc! { "_id": "o1" })
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    assert!(!raw.contains_key("open_disputes"), "{raw:?}");
+                }
+            }
         });
     }
 }

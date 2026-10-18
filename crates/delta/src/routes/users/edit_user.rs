@@ -100,6 +100,13 @@ pub async fn edit(
     data.remove
         .retain(|field| field != &v0::FieldsUser::CustomBadge);
 
+    // The Cipher badge mirrors a paid membership and only the payments
+    // engine writes it, so a request to drop one is ignored too (staff
+    // included: the engine would put it back). It cannot be set here
+    // either: `DataEditUser` has no `cipher` field and the partial below
+    // never carries one.
+    data.remove.retain(|field| field != &v0::FieldsUser::Cipher);
+
     // Each part of a name style needs its own perk. The request decides the
     // parts the user holds the perk for; a locked part keeps its stored value
     // so it comes back if the perk returns. A style left with no parts is
@@ -899,5 +906,100 @@ mod tests {
 
         let stored = harness.db.fetch_user(&user.id).await.expect("`User`");
         assert!(stored.custom_badge.is_some());
+    }
+
+    #[test]
+    fn remove_cipher_is_ignored() {
+        crate::util::test::rt().block_on(remove_cipher_is_ignored_case())
+    }
+
+    async fn remove_cipher_is_ignored_case() {
+        let harness = TestHarness::new().await;
+        let (_, session, mut user) = harness.new_user().await;
+
+        let badge = v0::UserCipher {
+            number: 42,
+            tier: v0::CipherTier::T149,
+        };
+        user.update(
+            &harness.db,
+            PartialUser {
+                cipher: Some(badge.clone()),
+                ..Default::default()
+            },
+            vec![],
+        )
+        .await
+        .expect("Cipher user");
+
+        // Only the payments engine takes the badge away; the rest of the
+        // edit still lands
+        let response = TestHarness::with_session(
+            session.clone(),
+            harness
+                .client
+                .patch("/users/@me")
+                .header(ContentType::JSON)
+                .body(json!({ "display_name": "Cipher Keeper", "remove": ["Cipher"] }).to_string()),
+        )
+        .await;
+
+        assert_eq!(response.status(), Status::Ok);
+        let edited = response.into_json::<v0::User>().await.expect("`User`");
+        assert_eq!(edited.display_name, Some("Cipher Keeper".to_string()));
+        assert_eq!(edited.cipher, Some(badge.clone()));
+
+        // A request that only asks to drop it changes nothing
+        let response = TestHarness::with_session(
+            session,
+            harness
+                .client
+                .patch("/users/@me")
+                .header(ContentType::JSON)
+                .body(json!({ "remove": ["Cipher"] }).to_string()),
+        )
+        .await;
+
+        assert_eq!(response.status(), Status::Ok);
+        let edited = response.into_json::<v0::User>().await.expect("`User`");
+        assert_eq!(edited.cipher, Some(badge.clone()));
+
+        let stored = harness.db.fetch_user(&user.id).await.expect("`User`");
+        assert_eq!(stored.cipher, Some(badge));
+    }
+
+    #[test]
+    fn cipher_cannot_be_set_by_edit() {
+        crate::util::test::rt().block_on(cipher_cannot_be_set_by_edit_case())
+    }
+
+    async fn cipher_cannot_be_set_by_edit_case() {
+        let harness = TestHarness::new().await;
+        let (_, session, user) = harness.new_user().await;
+
+        // `cipher` is not an edit field: a body carrying one (alone or next
+        // to a real change) never grants a badge
+        for body in [
+            json!({ "cipher": { "number": 1, "tier": "T299" } }),
+            json!({ "display_name": "No Badge", "cipher": { "number": 1, "tier": "T299" } }),
+        ] {
+            let response = TestHarness::with_session(
+                session.clone(),
+                harness
+                    .client
+                    .patch("/users/@me")
+                    .header(ContentType::JSON)
+                    .body(body.to_string()),
+            )
+            .await;
+
+            assert_eq!(response.status(), Status::Ok);
+            let edited = response.into_json::<v0::User>().await.expect("`User`");
+            assert_eq!(edited.cipher, None);
+        }
+
+        let stored = harness.db.fetch_user(&user.id).await.expect("`User`");
+        assert_eq!(stored.display_name, Some("No Badge".to_string()));
+        assert_eq!(stored.cipher, None);
     }
 }
