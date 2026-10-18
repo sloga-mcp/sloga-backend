@@ -7,18 +7,25 @@
 //! `revolt-database` cannot call the payments crate (payments depends on it),
 //! so the cascade is hooked here, at the only place an account is deleted.
 //!
-//! A cascade that fails is logged and the deletion goes ahead: deleting an
-//! account must not wait on Stripe or on the payments config. What it leaves
-//! behind heals on its own (see `on_account_deleted`): a Paid order that is
-//! not voided (unlinked, or still linked when the cascade failed outright)
-//! is voided and refunded by the payments reconcile sweep, because
-//! fulfilment voids an order whose buyer is unlinked or deleted.
+//! The Stripe half of the cascade (voiding and refunding open orders) is
+//! best-effort: deleting an account must not wait on Stripe or on the
+//! payments config, and what it leaves behind heals on its own (see
+//! `on_account_deleted`): a Paid order that is not voided is voided and
+//! refunded by the payments reconcile sweep, because fulfilment voids an
+//! order whose buyer is unlinked or deleted.
+//!
+//! Unlinking the orders and deleting the membership must succeed
+//! (`engine::unlink_account_payments`, run even without a payments config):
+//! when either fails, the account is NOT deleted this run. It stays due, so
+//! the next hourly run tries the whole cascade again; once the account is
+//! marked deleted nothing would ever unlink its orders.
 //!
 //! The Stripe secret key is only handed to the client; it is never logged.
 
 use std::time::Duration;
 
-use revolt_config::FeaturePayments;
+use std::future::Future;
+
 use revolt_database::{Account, Database};
 use revolt_payments::{
     engine,
@@ -74,7 +81,7 @@ async fn payments_settings() -> Option<PaymentsSettings> {
                  payments cascade with the sale settings at their defaults"
             );
             let config = revolt_config::config().await;
-            match PaymentsSettings::from_parts(&FeaturePayments::default(), &config.api.stripe) {
+            match PaymentsSettings::for_settlement(&config.api.stripe) {
                 Ok(settings) => Some(settings),
                 Err(err) => {
                     log::error!(
@@ -95,12 +102,39 @@ async fn delete_accounts(
     payments: Payments<'_>,
     accounts: Vec<Account>,
 ) -> Result<()> {
+    delete_accounts_with(db, accounts, |user_id| async move {
+        payments_cascade(db, payments, &user_id).await
+    })
+    .await
+}
+
+/// [`delete_accounts`] with the payments cascade passed in (tests inject a
+/// failing one). An account whose cascade fails is skipped, not deleted:
+/// it stays due and the next run tries again.
+async fn delete_accounts_with<F, Fut>(
+    db: &Database,
+    accounts: Vec<Account>,
+    cascade: F,
+) -> Result<()>
+where
+    F: Fn(String) -> Fut,
+    Fut: Future<Output = Result<()>>,
+{
     for mut account in accounts {
         let mut user = db.fetch_user(&account.id).await?;
 
         // Before `User::delete`: the open orders are still linked to the
         // user, so they can be found, voided and refunded
-        payments_cascade(db, payments, &user.id).await;
+        if let Err(err) = cascade(user.id.clone()).await {
+            log::error!(
+                "Account deletion of {}: its payment orders could not be unlinked or its \
+                 membership deleted; not deleting the account this run, retrying next run: \
+                 {err:?}",
+                user.id
+            );
+            revolt_config::capture_error(&err);
+            continue;
+        }
 
         user.delete(db).await?;
         account.mark_deleted(db).await?;
@@ -109,31 +143,27 @@ async fn delete_accounts(
     Ok(())
 }
 
-/// Run `on_account_deleted` for `user_id`. Best-effort: a failure is logged
-/// and reported, and the deletion continues.
-async fn payments_cascade(db: &Database, payments: Payments<'_>, user_id: &str) {
+/// The payments cascade for `user_id`. The voids are best-effort (logged by
+/// the engine); Err only when unlinking the orders or deleting the
+/// membership failed, which must stop the deletion. Without a usable
+/// payments config only that unlink part runs.
+async fn payments_cascade(db: &Database, payments: Payments<'_>, user_id: &str) -> Result<()> {
     let Some((settings, stripe)) = payments else {
         log::error!(
-            "Account deletion of {user_id}: payments cascade skipped; its payment orders stay \
-             linked to the account"
+            "Account deletion of {user_id}: no usable payments config, so its open orders are \
+             not voided now (the reconcile sweep refunds a Paid one); unlinking them"
         );
-        return;
+        return engine::unlink_account_payments(db, user_id).await;
     };
 
     let now_ms = revolt_database::now_ms();
-    if let Err(err) = engine::on_account_deleted(db, stripe, settings, user_id, now_ms).await {
-        log::error!(
-            "Account deletion of {user_id}: payments cascade failed, deleting the account \
-             anyway: {err:?}"
-        );
-        revolt_config::capture_error(&err);
-    }
+    engine::on_account_deleted(db, stripe, settings, user_id, now_ms).await
 }
 
 #[cfg(test)]
 mod tests {
     use iso8601_timestamp::Timestamp;
-    use revolt_config::ApiStripe;
+    use revolt_config::{ApiStripe, FeaturePayments};
     use revolt_database::{
         DatabaseInfo, DeletionInfo, EmailVerification, OrderState, PaymentOrder, User, VoidReason,
     };
@@ -144,6 +174,7 @@ mod tests {
         engine::{FulfilOutcome, LEASE_MS},
         stripe::{CheckoutSession, MockStripe, StripeError},
     };
+    use revolt_result::create_error;
 
     use super::*;
 
@@ -438,13 +469,69 @@ mod tests {
     #[tokio::test]
     async fn the_deletion_goes_ahead_without_a_payments_config() {
         let db = reference_db().await;
+        let stripe = MockStripe::new();
+        let s = settings();
         insert_user(&db, "u1").await;
+        let member = buy(&db, &stripe, &s, "u1", "pi_member").await;
         schedule_deletion(&db, "u1").await;
 
         let accounts = db.fetch_accounts_due_for_deletion().await.unwrap();
         assert_eq!(accounts.len(), 1);
         delete_accounts(&db, None, accounts).await.unwrap();
 
+        assert_deleted(&db, "u1").await;
+        // The unlink half still ran: no Stripe call is needed for it
+        assert!(db.fetch_cipher_membership("u1").await.unwrap().is_none());
+        assert_eq!(order(&db, &member.id).await.user_id, None);
+    }
+
+    /// A failed unlink (or membership delete) stops the deletion of that
+    /// account only: it is not anonymised or marked deleted, stays due,
+    /// and the next run deletes it
+    #[tokio::test]
+    async fn a_failed_unlink_keeps_the_account_for_the_next_run() {
+        let db = reference_db().await;
+        insert_user(&db, "u1").await;
+        insert_user(&db, "u2").await;
+        schedule_deletion(&db, "u1").await;
+        schedule_deletion(&db, "u2").await;
+
+        // The database refuses u1's unlink this run
+        let accounts = db.fetch_accounts_due_for_deletion().await.unwrap();
+        assert_eq!(accounts.len(), 2);
+        delete_accounts_with(&db, accounts, |user_id| async move {
+            if user_id == "u1" {
+                Err(create_error!(InternalError))
+            } else {
+                Ok(())
+            }
+        })
+        .await
+        .unwrap();
+
+        // u2 went ahead; u1 did not
+        assert_deleted(&db, "u2").await;
+        let kept = db.fetch_user("u1").await.unwrap();
+        assert_eq!(
+            kept.flags.unwrap_or_default() & UserFlags::Deleted as i32,
+            0,
+            "u1 is not anonymised"
+        );
+        assert!(matches!(
+            db.fetch_account("u1").await.unwrap().deletion,
+            Some(DeletionInfo::Scheduled { .. })
+        ));
+        let due = db.fetch_accounts_due_for_deletion().await.unwrap();
+        assert_eq!(
+            due.iter().map(|a| a.id.as_str()).collect::<Vec<_>>(),
+            ["u1"],
+            "u1 is still due"
+        );
+
+        // Next run: the cascade succeeds and the account is deleted
+        delete_accounts_with(&db, due, |_| async { Ok(()) })
+            .await
+            .unwrap();
         assert_deleted(&db, "u1").await;
     }
 }

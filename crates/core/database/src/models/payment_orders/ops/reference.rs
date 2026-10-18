@@ -135,6 +135,25 @@ impl AbstractPaymentOrders for ReferenceDb {
         Ok(rows)
     }
 
+    async fn fetch_payment_orders_disputed(
+        &self,
+        states: &[OrderState],
+        now: i64,
+        limit: i64,
+    ) -> Result<Vec<PaymentOrder>> {
+        let orders = self.payment_orders.lock().await;
+        let mut rows: Vec<PaymentOrder> = orders
+            .values()
+            .filter(|row| {
+                states.contains(&row.state) && !row.open_disputes.is_empty() && lease_free(row, now)
+            })
+            .cloned()
+            .collect();
+        sort_oldest_first(&mut rows);
+        apply_limit(&mut rows, limit);
+        Ok(rows)
+    }
+
     async fn acquire_payment_order_lease(
         &self,
         id: &str,

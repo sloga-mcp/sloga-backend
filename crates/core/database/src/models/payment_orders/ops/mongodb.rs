@@ -141,6 +141,29 @@ impl AbstractPaymentOrders for MongoDb {
             .map_err(row_error)
     }
 
+    async fn fetch_payment_orders_disputed(
+        &self,
+        states: &[OrderState],
+        now: i64,
+        limit: i64,
+    ) -> Result<Vec<PaymentOrder>> {
+        // `open_disputes` is left out of the document when empty, so a
+        // first element exists exactly when one dispute is listed
+        self.col::<PaymentOrder>(COL)
+            .find(doc! {
+                "state": { "$in": states_bson(states)? },
+                "open_disputes.0": { "$exists": true },
+                "$or": lease_free(now)
+            })
+            .sort(doc! { "created_at": 1_i32, "_id": 1_i32 })
+            .limit(limit)
+            .await
+            .map_err(|_| create_database_error!("find", COL))?
+            .try_collect()
+            .await
+            .map_err(row_error)
+    }
+
     async fn acquire_payment_order_lease(
         &self,
         id: &str,
@@ -403,6 +426,13 @@ mod tests {
         })
         .unwrap();
         assert_eq!(mismatch.get_str("void_reason").unwrap(), "AmountMismatch");
+
+        let reversed = to_document(&PaymentOrder {
+            void_reason: Some(VoidReason::Reversed),
+            ..from_document::<PaymentOrder>(mismatch).unwrap()
+        })
+        .unwrap();
+        assert_eq!(reversed.get_str("void_reason").unwrap(), "Reversed");
     }
 
     #[test]

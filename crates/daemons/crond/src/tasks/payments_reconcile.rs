@@ -1,15 +1,20 @@
 //! Payments reconcile sweep (plan "crond payments_reconcile").
 //!
-//! Every 10 minutes, while `features.payments.enabled` is on, this hands the
-//! sweep to `revolt_payments::dispatch::reconcile`: stale unpaid orders are
-//! expired, pending orders are checked against Stripe, stranded fulfilments
-//! and reversals are resumed, and failed or stranded webhook events are
-//! fetched again and re-handled.
+//! Every 10 minutes, while a Stripe secret key is configured
+//! (`[api.stripe] secret_key`), this hands the sweep to
+//! `revolt_payments::dispatch::reconcile`: stale unpaid orders are expired,
+//! pending orders are checked against Stripe, stranded fulfilments and
+//! reversals are resumed, open disputes are re-read, and failed or stranded
+//! webhook events are fetched again and re-handled.
 //!
-//! `reconcile` does not look at `enabled` itself, so the gate here is the only
-//! thing that keeps a disabled install from calling Stripe. The config is
-//! frozen into the process at first access, so flipping the flag takes a
-//! crond restart.
+//! The gate is the key, NOT `features.payments.enabled`. That switch stops
+//! new checkouts; the sweep never starts a sale, it only settles money that
+//! was already taken (a paid order is fulfilled or refunded, a refund or a
+//! dispute is applied, a void waiting on a dispute is finished). Gating it on
+//! `enabled` would strand those orders the moment the kill switch is
+//! flipped. Without a key there is nothing at Stripe to settle with, so the
+//! tick does nothing. The config is frozen into the process at first access,
+//! so a change takes a crond restart.
 //!
 //! crond has no leader election. Two replicas running the sweep at once is
 //! safe because every order write in `dispatch` goes through the order lease,
@@ -35,15 +40,15 @@ const TICK: Duration = Duration::from_secs(10 * 60);
 enum Tick {
     /// The payments config did not validate; nothing ran
     BadConfig,
-    /// Payments are off; nothing ran
-    Disabled,
+    /// No Stripe secret key is configured; nothing ran
+    NotConfigured,
     /// The sweep ran (its summary is logged)
     Ran,
     /// The sweep returned an error (logged)
     Failed,
 }
 
-/// Run the reconcile sweep every [`TICK`], while payments are enabled.
+/// Run the reconcile sweep every [`TICK`], while a Stripe key is configured.
 pub async fn task(db: Database, _: AMQP) -> Result<()> {
     loop {
         let loaded = PaymentsSettings::load().await;
@@ -68,9 +73,10 @@ async fn tick(db: &Database, loaded: Result<PaymentsSettings>, now_ms: i64) -> T
         }
     };
 
-    if !settings.enabled {
-        debug!("Payments reconcile skipped, payments are disabled");
-        return Tick::Disabled;
+    // Not `settings.enabled`: see the module docs
+    if settings.secret_key.is_empty() {
+        debug!("Payments reconcile skipped, no Stripe secret key is configured");
+        return Tick::NotConfigured;
     }
 
     let stripe = ReqwestStripe::new(settings.secret_key.clone());
@@ -101,19 +107,36 @@ mod tests {
         Database::Reference(Default::default())
     }
 
-    fn settings(enabled: bool) -> PaymentsSettings {
+    /// A key-shaped value, built at runtime. The client is handed it, but
+    /// with an empty database the sweep makes no Stripe call.
+    fn configured_key() -> String {
+        ["sk", "test", "reconcile", "tick", "placeholder"].join("_")
+    }
+
+    fn settings(enabled: bool, secret_key: String) -> PaymentsSettings {
         let payments = FeaturePayments {
             enabled,
             ..FeaturePayments::default()
         };
+        let stripe = ApiStripe {
+            secret_key,
+            ..ApiStripe::default()
+        };
 
-        PaymentsSettings::from_parts(&payments, &ApiStripe::default()).unwrap()
+        PaymentsSettings::from_parts(&payments, &stripe).unwrap()
     }
 
+    /// Without a key there is nothing to settle with, whatever `enabled` says
     #[tokio::test]
-    async fn disabled_config_is_a_no_op() {
+    async fn no_secret_key_is_a_no_op() {
         let db = reference_db();
-        assert_eq!(tick(&db, Ok(settings(false)), NOW_MS).await, Tick::Disabled);
+        for enabled in [false, true] {
+            assert_eq!(
+                tick(&db, Ok(settings(enabled, String::new())), NOW_MS).await,
+                Tick::NotConfigured,
+                "enabled = {enabled}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -125,13 +148,26 @@ mod tests {
         );
     }
 
-    /// The control for the two tests above: an enabled config does reach the
-    /// sweep. The database is empty and the key is unset, so nothing touches
-    /// the network.
+    /// The kill switch stops checkouts, never the settling of money already
+    /// taken: a configured key runs the sweep with payments disabled. The
+    /// control for the two tests above. The database is empty, so nothing
+    /// touches the network.
     #[tokio::test]
-    async fn enabled_config_runs_the_sweep() {
+    async fn disabled_but_configured_runs_the_sweep() {
         let db = reference_db();
-        assert_eq!(tick(&db, Ok(settings(true)), NOW_MS).await, Tick::Ran);
+        assert_eq!(
+            tick(&db, Ok(settings(false, configured_key())), NOW_MS).await,
+            Tick::Ran
+        );
+    }
+
+    #[tokio::test]
+    async fn enabled_and_configured_runs_the_sweep() {
+        let db = reference_db();
+        assert_eq!(
+            tick(&db, Ok(settings(true, configured_key())), NOW_MS).await,
+            Tick::Ran
+        );
     }
 
     const MAIN: &str = include_str!("../main.rs");

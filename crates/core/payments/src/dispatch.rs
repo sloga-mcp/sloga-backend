@@ -327,10 +327,11 @@ fn fulfil_step(outcome: FulfilOutcome) -> Step {
         // up yet: retry rather than settle (the Pending sweep is the backstop)
         FulfilOutcome::NotPaid => Step::Retry("session not reported paid yet".to_string()),
         FulfilOutcome::LeaseHeld => Step::Retry("order lease held".to_string()),
-        // The order is still Paid; the reconcile resume also retries it
-        FulfilOutcome::VoidDeferred(_) => {
-            Step::Retry("void waits for an open dispute to close".to_string())
-        }
+        // Handled: the deferral is durable (the order stays Paid), and the
+        // reconcile resume owns it from here, re-reading the disputes it
+        // waits on every sweep. Retrying the event would only spend its
+        // attempts while the dispute runs for weeks.
+        FulfilOutcome::VoidDeferred(_) => Step::Processed,
     }
 }
 
@@ -481,7 +482,11 @@ impl Tally {
 /// 3. Paid orders whose lease is free (a fulfilment that crashed or gave up)
 ///    → resumed
 /// 4. Fulfilled orders with a reversal still pending → reversed
-/// 5. Failed events (fewer than 10 attempts) and Received events older than
+/// 5. Fulfilled orders that list open disputes: each dispute is re-read at
+///    Stripe and its current status applied (counted under `reversed` when
+///    it changed the order), so a lost close event cannot keep a badge
+///    hidden for good
+/// 6. Failed events (fewer than 10 attempts) and Received events older than
 ///    10 min → fetched from Stripe by id and handled again
 ///
 /// Each part looks at a bounded batch. A failing item, or a failing query,
@@ -510,6 +515,10 @@ pub async fn reconcile(
     let before = tally.errors;
     apply_pending_reversals(db, stripe, s, now_ms, &mut tally).await;
     tally.report("pending reversals", before);
+
+    let before = tally.errors;
+    recheck_open_disputes(db, stripe, s, now_ms, &mut tally).await;
+    tally.report("open disputes", before);
 
     let before = tally.errors;
     redrive_events(db, stripe, s, now_ms, &mut tally).await;
@@ -683,6 +692,31 @@ async fn apply_pending_reversals(
             Ok(ReverseOutcome::Applied) => tally.reversed += 1,
             Ok(ReverseOutcome::RecordedPending | ReverseOutcome::NoOp | ReverseOutcome::Busy) => {}
             Err(error) => tally.error("order", &order.id, &engine_text("reverse", &error)),
+        }
+    }
+}
+
+async fn recheck_open_disputes(
+    db: &Database,
+    stripe: &dyn StripeApi,
+    s: &PaymentsSettings,
+    now_ms: i64,
+    tally: &mut Tally,
+) {
+    // Paid ones are re-read by the resume above
+    let orders = match db
+        .fetch_payment_orders_disputed(&[OrderState::Fulfilled], now_ms, SWEEP_BATCH)
+        .await
+    {
+        Ok(orders) => orders,
+        Err(error) => return tally.error("query", "open disputes", &engine_text("fetch", &error)),
+    };
+
+    for order in orders {
+        match engine::recheck_disputes(db, stripe, s, &order.id, now_ms).await {
+            Ok(ReverseOutcome::Applied) => tally.reversed += 1,
+            Ok(ReverseOutcome::RecordedPending | ReverseOutcome::NoOp | ReverseOutcome::Busy) => {}
+            Err(error) => tally.error("order", &order.id, &engine_text("dispute", &error)),
         }
     }
 }
@@ -1596,7 +1630,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_void_waiting_on_a_dispute_is_retried_not_settled() {
+    async fn a_void_waiting_on_a_dispute_is_settled_and_finished_by_the_sweep() {
         let db = test_db().await;
         let stripe = MockStripe::new();
         let s = PaymentsSettings {
@@ -1618,31 +1652,33 @@ mod tests {
             EventOutcome::Processed
         );
 
-        // The completion cannot void while the dispute is open: Retry,
-        // nothing refunded, the order still Paid
+        // The completion cannot void while the dispute is open. The
+        // deferral is durable (the order stays Paid, nothing refunded), so
+        // the event is settled: retrying it would only burn its attempts
         let done = completed("evt_wait_done", "o_wait");
         assert_eq!(
             handle_event(&db, &stripe, &s, &done, NOW + 1)
                 .await
                 .unwrap(),
-            EventOutcome::Retry
+            EventOutcome::Processed
         );
         assert_eq!(
             stored(&db, "evt_wait_done").await.state,
-            PaymentEventState::Failed
+            PaymentEventState::Processed
         );
         let o = db.fetch_payment_order("o_wait").await.unwrap().unwrap();
         assert_eq!(o.state, OrderState::Paid);
+        assert_eq!(o.open_disputes, ["dp_wait"]);
         assert_eq!(stripe.call_count("create_refund"), 0);
 
-        // The sweep resumes the order (not counted as resumed, not an
-        // error) and re-drives the completion, which still retries (the one
-        // error)
-        stripe.set_event(done.clone());
+        // The sweep resumes the order and re-reads the dispute: still open,
+        // so it keeps waiting (not counted, not an error)
+        let lookups = stripe.call_count("get_dispute");
         assert_eq!(
             reconcile(&db, &stripe, &s, NOW + 2).await.unwrap(),
-            "expired=0, resumed=0, reversed=0, redriven=0, errors=1"
+            "expired=0, resumed=0, reversed=0, redriven=0, errors=0"
         );
+        assert_eq!(stripe.call_count("get_dispute"), lookups + 1);
         assert_eq!(stripe.call_count("create_refund"), 0);
         assert_eq!(
             db.fetch_payment_order("o_wait")
@@ -1653,8 +1689,20 @@ mod tests {
             OrderState::Paid
         );
 
-        // Won: the redelivered completion voids and refunds
+        // Won at Stripe, and the close event never arrives: the next sweep
+        // reads the win and the void refunds, once
         set_dispute_status(&stripe, "dp_wait", "pi_wait", "won");
+        assert_eq!(
+            reconcile(&db, &stripe, &s, NOW + 3).await.unwrap(),
+            "expired=0, resumed=1, reversed=0, redriven=0, errors=0"
+        );
+        let o = db.fetch_payment_order("o_wait").await.unwrap().unwrap();
+        assert_eq!(o.state, OrderState::Voided);
+        assert!(o.open_disputes.is_empty());
+        assert_eq!(stripe.refund_count_for("pi_wait"), 1);
+
+        // The close event arriving late, and the completion again, change
+        // nothing
         let closed = event(
             "evt_wait_dp_closed",
             "charge.dispute.closed",
@@ -1662,20 +1710,123 @@ mod tests {
             json!({ "id": "dp_wait", "object": "dispute", "payment_intent": "pi_wait" }),
         );
         assert_eq!(
-            handle_event(&db, &stripe, &s, &closed, NOW + 3)
+            handle_event(&db, &stripe, &s, &closed, NOW + 4)
                 .await
                 .unwrap(),
             EventOutcome::Processed
         );
         assert_eq!(
-            handle_event(&db, &stripe, &s, &done, NOW + 4)
+            handle_event(&db, &stripe, &s, &done, NOW + 5)
                 .await
                 .unwrap(),
+            EventOutcome::Duplicate
+        );
+        assert_eq!(stripe.refund_count_for("pi_wait"), 1);
+        assert_eq!(
+            reconcile(&db, &stripe, &s, NOW + 6).await.unwrap(),
+            "expired=0, resumed=0, reversed=0, redriven=0, errors=0"
+        );
+
+        drop_db(&db).await;
+    }
+
+    /// m2: a Fulfilled order whose dispute closes at Stripe without the
+    /// close event ever arriving. The sweep re-reads its open disputes, so
+    /// the won dispute restores the badge; a failed read changes nothing
+    /// (the badge stays hidden) and is counted as an error.
+    #[tokio::test]
+    async fn a_dispute_whose_close_event_never_arrives_is_settled_by_the_sweep() {
+        let db = test_db().await;
+        let stripe = MockStripe::new();
+        let s = settings();
+        fulfilled_member(&db, "o_quiet", "pi_quiet").await;
+
+        set_dispute_status(&stripe, "dp_quiet", "pi_quiet", "needs_response");
+        let opened = event(
+            "evt_quiet_dp",
+            "charge.dispute.created",
+            false,
+            json!({ "id": "dp_quiet", "object": "dispute", "payment_intent": "pi_quiet" }),
+        );
+        assert_eq!(
+            handle_event(&db, &stripe, &s, &opened, NOW).await.unwrap(),
             EventOutcome::Processed
         );
-        let o = db.fetch_payment_order("o_wait").await.unwrap().unwrap();
-        assert_eq!(o.state, OrderState::Voided);
-        assert_eq!(stripe.refund_count_for("pi_wait"), 1);
+        assert_eq!(badge(&db).await, None);
+        let o = db.fetch_payment_order("o_quiet").await.unwrap().unwrap();
+        assert_eq!(o.open_disputes, ["dp_quiet"]);
+
+        // Still open: read, nothing changes
+        assert_eq!(
+            reconcile(&db, &stripe, &s, NOW + 1).await.unwrap(),
+            "expired=0, resumed=0, reversed=0, redriven=0, errors=0"
+        );
+        assert_eq!(badge(&db).await, None);
+
+        // Won at Stripe, but Stripe cannot be reached this sweep: an
+        // error, and the badge stays hidden (fail closed)
+        set_dispute_status(&stripe, "dp_quiet", "pi_quiet", "won");
+        stripe.fail_next(
+            "get_dispute",
+            StripeError::Transport("connection reset".to_string()),
+        );
+        assert_eq!(
+            reconcile(&db, &stripe, &s, NOW + 2).await.unwrap(),
+            "expired=0, resumed=0, reversed=0, redriven=0, errors=1"
+        );
+        assert_eq!(badge(&db).await, None);
+
+        // The next sweep reads the win: the badge is back
+        assert_eq!(
+            reconcile(&db, &stripe, &s, NOW + 3).await.unwrap(),
+            "expired=0, resumed=0, reversed=1, redriven=0, errors=0"
+        );
+        assert_eq!(badge(&db).await, Some(t99_badge()));
+        let m = db.fetch_cipher_membership("u1").await.unwrap().unwrap();
+        assert!(m.disputed_orders.is_empty());
+        assert!(m.revoked_at.is_none());
+        let o = db.fetch_payment_order("o_quiet").await.unwrap().unwrap();
+        assert_eq!(o.state, OrderState::Fulfilled);
+        assert!(o.open_disputes.is_empty());
+
+        // Nothing is left to read
+        let lookups = stripe.call_count("get_dispute");
+        assert_eq!(
+            reconcile(&db, &stripe, &s, NOW + 4).await.unwrap(),
+            "expired=0, resumed=0, reversed=0, redriven=0, errors=0"
+        );
+        assert_eq!(stripe.call_count("get_dispute"), lookups);
+
+        drop_db(&db).await;
+    }
+
+    /// The lost variant: the sweep reads the loss and revokes
+    #[tokio::test]
+    async fn a_lost_dispute_whose_close_event_never_arrives_revokes_at_the_sweep() {
+        let db = test_db().await;
+        let stripe = MockStripe::new();
+        let s = settings();
+        fulfilled_member(&db, "o_gone", "pi_gone").await;
+
+        set_dispute_status(&stripe, "dp_gone", "pi_gone", "needs_response");
+        let opened = event(
+            "evt_gone_dp",
+            "charge.dispute.created",
+            false,
+            json!({ "id": "dp_gone", "object": "dispute", "payment_intent": "pi_gone" }),
+        );
+        assert_eq!(
+            handle_event(&db, &stripe, &s, &opened, NOW).await.unwrap(),
+            EventOutcome::Processed
+        );
+
+        set_dispute_status(&stripe, "dp_gone", "pi_gone", "lost");
+        assert_eq!(
+            reconcile(&db, &stripe, &s, NOW + 1).await.unwrap(),
+            "expired=0, resumed=0, reversed=1, redriven=0, errors=0"
+        );
+        assert_lost(&db, "o_gone").await;
+        assert_eq!(stripe.call_count("create_refund"), 0);
 
         drop_db(&db).await;
     }

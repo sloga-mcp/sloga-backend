@@ -126,6 +126,16 @@ impl PaymentsSettings {
         Self::from_config(&revolt_config::config().await)
     }
 
+    /// The fallback for settling money already taken (refunds, disputes,
+    /// voids) when `[features.payments]` does not validate: the sale fields
+    /// at their defaults (payments off, sales closed) and `[api.stripe]` as
+    /// configured. None of the sale fields bears on a refund or a dispute,
+    /// but fulfilment and expiry read the cap and the close date, so those
+    /// must never run on these settings.
+    pub fn for_settlement(stripe: &ApiStripe) -> Result<Self> {
+        Self::from_parts(&FeaturePayments::default(), stripe)
+    }
+
     /// Whether a checkout may start at `at_ms`:
     /// enabled && sales_open && (no close date || at_ms < close date)
     pub fn sales_open_at(&self, at_ms: i64) -> bool {
@@ -307,6 +317,23 @@ mod tests {
         assert_eq!(s.success_url_shell, "https://s/s");
         assert_eq!(s.cancel_url_shell, "https://s/c");
         assert_eq!(s.cap, 500);
+    }
+
+    #[test]
+    fn settlement_fallback_keeps_the_stripe_section_and_closes_the_sale() {
+        let stripe = ApiStripe {
+            webhook_secret: ["whsec", "settlement", "fallback"].join("_"),
+            expect_livemode: true,
+            tolerance_secs: 120,
+            ..ApiStripe::default()
+        };
+        let s = PaymentsSettings::for_settlement(&stripe).unwrap();
+        assert_eq!(s.webhook_secret, stripe.webhook_secret);
+        assert!(s.expect_livemode);
+        assert_eq!(s.tolerance_secs, 120);
+        assert!(!s.enabled);
+        assert!(!s.sales_open);
+        assert!(!s.sales_open_at(0));
     }
 
     #[test]

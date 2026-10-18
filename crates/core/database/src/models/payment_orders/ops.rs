@@ -52,6 +52,19 @@ pub trait AbstractPaymentOrders: Sync + Send {
         limit: i64,
     ) -> Result<Vec<PaymentOrder>>;
 
+    /// Orders in any of `states` that list at least one open dispute and
+    /// whose lease is free (`lease_until` unset or `< now`), oldest
+    /// `created_at` first, up to `limit` (0 = no limit). The reconcile sweep
+    /// re-reads those disputes at Stripe, so a close event that never
+    /// arrives cannot keep a badge hidden for good. Served by the
+    /// `payment_orders_state_created` index; no new index.
+    async fn fetch_payment_orders_disputed(
+        &self,
+        states: &[OrderState],
+        now: i64,
+        limit: i64,
+    ) -> Result<Vec<PaymentOrder>>;
+
     /// Atomically set `lease_until = until` WHERE `_id = id` AND
     /// (`lease_until` unset OR `lease_until < now`), and bump `version`
     /// (+1).
@@ -626,6 +639,87 @@ mod tests {
                     .await
                     .unwrap()),
                 ["done", "newer", "young"]
+            );
+        });
+    }
+
+    #[tokio::test]
+    async fn the_dispute_sweep_selects_listed_disputes_with_a_free_lease() {
+        database_test!(|db| async move {
+            create_payment_order_indexes(&db).await;
+            for row in [
+                PaymentOrder {
+                    open_disputes: vec!["dp_1".to_string()],
+                    ..order("disputed", "u1", OrderState::Fulfilled, 20)
+                },
+                PaymentOrder {
+                    open_disputes: vec!["dp_2".to_string(), "dp_3".to_string()],
+                    ..order("twice", "u2", OrderState::Fulfilled, 10)
+                },
+                PaymentOrder {
+                    open_disputes: vec!["dp_4".to_string()],
+                    lease_until: Some(1_000),
+                    ..order("held", "u3", OrderState::Fulfilled, 5)
+                },
+                // Another state
+                PaymentOrder {
+                    open_disputes: vec!["dp_5".to_string()],
+                    ..order("paid", "u4", OrderState::Paid, 1)
+                },
+                // No open dispute
+                order("clean", "u5", OrderState::Fulfilled, 2),
+            ] {
+                db.insert_payment_order(&row).await.unwrap();
+            }
+
+            let fulfilled = [OrderState::Fulfilled];
+            assert_eq!(
+                ids(db
+                    .fetch_payment_orders_disputed(&fulfilled, 500, 0)
+                    .await
+                    .unwrap()),
+                ["twice", "disputed"]
+            );
+            assert_eq!(
+                ids(db
+                    .fetch_payment_orders_disputed(&fulfilled, 1_001, 0)
+                    .await
+                    .unwrap()),
+                ["held", "twice", "disputed"]
+            );
+            assert_eq!(
+                ids(db
+                    .fetch_payment_orders_disputed(&fulfilled, 1_001, 1)
+                    .await
+                    .unwrap()),
+                ["held"]
+            );
+            assert_eq!(
+                ids(db
+                    .fetch_payment_orders_disputed(&[OrderState::Paid], 500, 0)
+                    .await
+                    .unwrap()),
+                ["paid"]
+            );
+            assert!(db
+                .fetch_payment_orders_disputed(&[], 1_001, 0)
+                .await
+                .unwrap()
+                .is_empty());
+
+            // Closing the last dispute takes the order out of the sweep
+            let mut closed = db.fetch_payment_order("disputed").await.unwrap().unwrap();
+            closed.open_disputes.clear();
+            assert!(db
+                .update_payment_order_if_state(&closed, OrderState::Fulfilled)
+                .await
+                .unwrap());
+            assert_eq!(
+                ids(db
+                    .fetch_payment_orders_disputed(&fulfilled, 500, 0)
+                    .await
+                    .unwrap()),
+                ["twice"]
             );
         });
     }

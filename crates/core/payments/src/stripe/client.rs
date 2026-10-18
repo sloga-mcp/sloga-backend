@@ -250,12 +250,29 @@ pub trait StripeApi: Send + Sync {
     async fn get_dispute(&self, id: &str) -> Result<Dispute, StripeError>;
 }
 
+/// What the buyer ticks at checkout (`consent_collection[terms_of_service]`
+/// is `required`, so Stripe will not take the payment without it). The
+/// Cipher badge is supplied at once, so an EU/UK buyer acknowledges here
+/// that the 14-day right of withdrawal ends when it is. Stripe renders
+/// basic Markdown links in this text and caps it at 1200 characters.
+pub const TERMS_ACCEPTANCE_MESSAGE: &str = "I agree to the \
+    [Terms of Service](https://sloga.gg/legal/terms.html). My Cipher badge is supplied as soon \
+    as my payment goes through, and I lose my right to withdraw from this purchase within 14 \
+    days.";
+
 /// Form body for `POST /v1/checkout/sessions`, in Stripe's bracket notation.
 /// Card only: no delayed payment methods, so `checkout.session.completed`
 /// with `payment_status=paid` is the single success signal.
 /// Adaptive Pricing is off, so the buyer always pays in the order's
 /// currency (a session settled in another currency would not match the
 /// order, and fulfilment refunds it).
+///
+/// The buyer must accept the Terms of Service, with the withdrawal
+/// acknowledgement as the checkbox text ([`TERMS_ACCEPTANCE_MESSAGE`]).
+/// Operator note: Stripe refuses `consent_collection[terms_of_service]`
+/// until a Terms of Service URL is set in the Dashboard (Settings, Public
+/// details); until then every checkout fails with `PaymentProviderError`
+/// and its order is left SessionFailed (it never blocks a later checkout).
 pub fn checkout_form(p: &CheckoutSessionParams) -> Vec<(String, String)> {
     [
         ("mode", "payment".to_string()),
@@ -280,6 +297,14 @@ pub fn checkout_form(p: &CheckoutSessionParams) -> Vec<(String, String)> {
         ("success_url", p.success_url.clone()),
         ("cancel_url", p.cancel_url.clone()),
         ("expires_at", p.expires_at_secs.to_string()),
+        (
+            "consent_collection[terms_of_service]",
+            "required".to_string(),
+        ),
+        (
+            "custom_text[terms_of_service_acceptance][message]",
+            TERMS_ACCEPTANCE_MESSAGE.to_string(),
+        ),
     ]
     .into_iter()
     .map(|(key, value)| (key.to_string(), value))
@@ -1153,8 +1178,31 @@ mod tests {
                 ("success_url", "https://sloga.gg/cipher/thanks"),
                 ("cancel_url", "https://sloga.gg/cipher"),
                 ("expires_at", "1729002100"),
+                // The buyer accepts the Terms, which carry the EU/UK
+                // withdrawal acknowledgement
+                ("consent_collection[terms_of_service]", "required"),
+                (
+                    "custom_text[terms_of_service_acceptance][message]",
+                    "I agree to the [Terms of Service](https://sloga.gg/legal/terms.html). \
+                     My Cipher badge is supplied as soon as my payment goes through, and I \
+                     lose my right to withdraw from this purchase within 14 days."
+                ),
             ]
         );
+    }
+
+    #[test]
+    fn terms_acceptance_message_fits_stripe() {
+        // Stripe's limit on custom_text messages
+        assert!(TERMS_ACCEPTANCE_MESSAGE.chars().count() <= 1200);
+        assert!(TERMS_ACCEPTANCE_MESSAGE.is_ascii());
+        // One Markdown link, to the published Terms
+        assert_eq!(TERMS_ACCEPTANCE_MESSAGE.matches("](").count(), 1);
+        assert!(TERMS_ACCEPTANCE_MESSAGE
+            .contains("[Terms of Service](https://sloga.gg/legal/terms.html)"));
+        assert!(TERMS_ACCEPTANCE_MESSAGE.contains("right to withdraw"));
+        // The continuation lines leave single spaces only
+        assert!(!TERMS_ACCEPTANCE_MESSAGE.contains("  "));
     }
 
     #[test]

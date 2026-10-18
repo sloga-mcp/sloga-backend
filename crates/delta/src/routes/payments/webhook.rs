@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use revolt_config::ApiStripe;
 use revolt_database::Database;
 use revolt_payments::dispatch::{handle_event, EventOutcome};
 use revolt_payments::settings::PaymentsSettings;
@@ -13,6 +14,9 @@ use rocket::{Data, Request, State};
 /// Largest delivery read. Stripe event payloads are a few KiB; anything
 /// past this is refused unread rather than truncated.
 const BODY_LIMIT_MIB: u64 = 1;
+
+/// Type prefix of the events that fulfil or expire an order
+const CHECKOUT_SESSION_PREFIX: &str = "checkout.session.";
 
 /// The raw `Stripe-Signature` header (`t=…,v1=…`). Only its presence is
 /// checked here; the route verifies it against the raw body.
@@ -55,9 +59,17 @@ impl<'r> FromRequest<'r> for StripeSignature<'r> {
 ///   act on) or already handled
 ///
 /// Deliveries are handled whenever the signature verifies, whatever
-/// `features.payments.enabled` says: that switch gates new checkouts and the
-/// crond sweep, never reversals, so a refund after the kill switch is flipped
-/// still revokes.
+/// `features.payments.enabled` says: that switch gates new checkouts only,
+/// never the settling of money already taken, so a refund after the kill
+/// switch is flipped still revokes.
+///
+/// A `[features.payments]` table that does not validate (cap, close date)
+/// does not stop refunds and disputes either: they are handled with the
+/// sale fields at their defaults and the configured `[api.stripe]`, as the
+/// account-deletion cascade does. `checkout.session.*` events read the cap
+/// and the close date, so they are answered 500 until the config is fixed
+/// (Stripe retries them for days, and the reconcile sweep checks paid
+/// sessions too).
 #[openapi(skip)]
 #[post("/stripe/webhook", data = "<data>")]
 pub async fn webhook(
@@ -81,14 +93,53 @@ pub async fn webhook(
     }
     let body = body.into_inner();
 
-    // `load` logs what is wrong with the config; the secrets are never printed
-    let settings = PaymentsSettings::load().await.map_err(|_| {
-        log::error!("payments webhook: payments settings are unusable; refusing delivery");
-        create_error!(InternalError)
-    })?;
+    // `from_config` logs what is wrong with the config; the secrets are
+    // never printed
+    let config = revolt_config::config().await;
+    let (settings, sale) =
+        webhook_settings(PaymentsSettings::from_config(&config), &config.api.stripe)?;
 
     let now_ms = chrono::Utc::now().timestamp_millis();
-    handle_delivery(db, &**stripe.inner(), &settings, signature.0, &body, now_ms).await
+    handle_delivery(
+        db,
+        &**stripe.inner(),
+        &settings,
+        sale,
+        signature.0,
+        &body,
+        now_ms,
+    )
+    .await
+}
+
+/// Whether the sale fields of the payments config validated
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SaleConfig {
+    Valid,
+    /// The settings are the settlement fallback: refunds and disputes only
+    Invalid,
+}
+
+/// The settings a delivery is handled with: the loaded ones, or the
+/// settlement fallback when `[features.payments]` does not validate
+fn webhook_settings(
+    loaded: Result<PaymentsSettings>,
+    stripe: &ApiStripe,
+) -> Result<(PaymentsSettings, SaleConfig)> {
+    match loaded {
+        Ok(settings) => Ok((settings, SaleConfig::Valid)),
+        Err(_) => {
+            log::error!(
+                "payments webhook: the payments sale config is invalid; handling refunds and \
+                 disputes only"
+            );
+            let settings = PaymentsSettings::for_settlement(stripe).map_err(|_| {
+                log::error!("payments webhook: no usable payments settings; refusing delivery");
+                create_error!(InternalError)
+            })?;
+            Ok((settings, SaleConfig::Invalid))
+        }
+    }
 }
 
 /// Everything after the body is read and the settings are loaded: the secret
@@ -100,6 +151,7 @@ async fn handle_delivery(
     db: &Database,
     stripe: &dyn StripeApi,
     settings: &PaymentsSettings,
+    sale: SaleConfig,
     header: &str,
     body: &[u8],
     now_ms: i64,
@@ -140,6 +192,18 @@ async fn handle_delivery(
         }
     };
 
+    // Fulfilment and expiry read the cap and the close date, which the
+    // fallback does not carry: not recorded, so Stripe's retry finds it new
+    if sale == SaleConfig::Invalid && event.event_type.starts_with(CHECKOUT_SESSION_PREFIX) {
+        log::error!(
+            "payments webhook: event {} ({}) needs the payments sale config, which is invalid; \
+             answered 500 for a retry",
+            event.id,
+            event.event_type
+        );
+        return Err(create_error!(InternalError));
+    }
+
     match handle_event(db, stripe, settings, &event, now_ms).await {
         Ok(EventOutcome::Processed | EventOutcome::Ignored | EventOutcome::Duplicate) => {
             Ok(Status::Ok)
@@ -169,14 +233,15 @@ async fn handle_delivery(
 mod test {
     use revolt_database::{OrderState, PaymentEventState};
     use revolt_models::v0::{CipherReturnTo, CipherTier};
-    use revolt_payments::engine::create_cipher_checkout;
+    use revolt_payments::engine::{create_cipher_checkout, fulfil_order};
     use revolt_payments::settings::PaymentsSettings;
     use revolt_payments::stripe::{sign_for_tests, CheckoutSession, PaymentIntent, StripeError};
+    use revolt_result::create_error;
     use revolt_result::ErrorType;
     use rocket::http::{ContentType, Header, Status};
     use serde_json::Value;
 
-    use super::{handle_delivery, BODY_LIMIT_MIB};
+    use super::{handle_delivery, webhook_settings, SaleConfig, BODY_LIMIT_MIB};
     use crate::util::test::TestHarness;
 
     const WEBHOOK: &str = "/payments/stripe/webhook";
@@ -655,6 +720,7 @@ mod test {
             &harness.db,
             &*harness.stripe,
             &unconfigured,
+            SaleConfig::Valid,
             &signature,
             &body,
             now_ms(),
@@ -673,6 +739,7 @@ mod test {
             &harness.db,
             &*harness.stripe,
             &configured,
+            SaleConfig::Valid,
             &signature,
             &body,
             now_ms(),
@@ -683,5 +750,144 @@ mod test {
             event_state(&harness, "evt_webhook_nosecret").await,
             Some(PaymentEventState::Ignored)
         );
+    }
+
+    #[test]
+    fn an_invalid_sale_config_still_settles_refunds_but_not_checkouts() {
+        crate::util::test::rt()
+            .block_on(an_invalid_sale_config_still_settles_refunds_but_not_checkouts_case())
+    }
+
+    async fn an_invalid_sale_config_still_settles_refunds_but_not_checkouts_case() {
+        let harness = TestHarness::new().await;
+        let s = settings().await;
+        let (_, _, user) = harness.new_user().await;
+        harness.db.seed_cipher_numbers(s.cap).await.unwrap();
+
+        // A fulfilled member, through the engine and the mock
+        let url = create_cipher_checkout(
+            &harness.db,
+            &*harness.stripe,
+            &s,
+            &user.id,
+            CipherTier::T99,
+            CipherReturnTo::Web,
+            now_ms(),
+        )
+        .await
+        .expect("checkout");
+        let order = harness
+            .db
+            .fetch_payment_orders_by_user(&user.id, &[OrderState::Pending])
+            .await
+            .unwrap()
+            .pop()
+            .expect("a pending order");
+        assert_eq!(order.checkout_url.as_deref(), Some(url.as_str()));
+        let session_id = order.checkout_session_id.clone().expect("a session");
+        let session = harness.stripe.session(&session_id).expect("mock session");
+        let paid = CheckoutSession {
+            status: Some("complete".to_string()),
+            payment_status: Some("paid".to_string()),
+            payment_intent: Some("pi_webhook_fallback".to_string()),
+            ..session
+        };
+        harness.stripe.set_session(paid.clone());
+        fulfil_order(
+            &harness.db,
+            &*harness.stripe,
+            &s,
+            &order.id,
+            &paid,
+            now_ms(),
+        )
+        .await
+        .expect("fulfilled");
+        assert!(harness
+            .db
+            .fetch_user(&user.id)
+            .await
+            .unwrap()
+            .cipher
+            .is_some());
+
+        // [features.payments] stops validating (e.g. a bad close date): the
+        // route falls back to the configured [api.stripe]
+        let stripe_section = revolt_config::config().await.api.stripe;
+        let (fallback, sale) =
+            webhook_settings(Err(create_error!(InternalError)), &stripe_section).unwrap();
+        assert_eq!(sale, SaleConfig::Invalid);
+        assert_eq!(fallback.webhook_secret, s.webhook_secret);
+        assert!(!fallback.enabled);
+        // A valid config is used as loaded
+        let (loaded, sale) = webhook_settings(Ok(s.clone()), &stripe_section).unwrap();
+        assert_eq!(sale, SaleConfig::Valid);
+        assert_eq!(loaded.cap, s.cap);
+
+        let deliver = |body: Vec<u8>| {
+            let signature = sign_for_tests(&body, &fallback.webhook_secret, now_secs());
+            let db = harness.db.clone();
+            let stripe = harness.stripe.clone();
+            let fallback = fallback.clone();
+            async move {
+                handle_delivery(
+                    &db,
+                    &*stripe,
+                    &fallback,
+                    SaleConfig::Invalid,
+                    &signature,
+                    &body,
+                    now_ms(),
+                )
+                .await
+                .map_err(|error| error.error_type)
+            }
+        };
+
+        // A checkout event is not handled on the fallback: 500, not recorded
+        let completed = event_body(
+            "evt_webhook_fallback_cs",
+            "checkout.session.completed",
+            false,
+            serde_json::json!({ "id": session_id, "object": "checkout.session" }),
+        );
+        assert!(matches!(
+            deliver(completed).await,
+            Err(ErrorType::InternalError)
+        ));
+        assert_eq!(event_state(&harness, "evt_webhook_fallback_cs").await, None);
+
+        // The refund is: the membership is revoked and the badge cleared
+        let refunded = event_body(
+            "evt_webhook_fallback_refund",
+            "charge.refunded",
+            false,
+            serde_json::json!({
+                "id": "ch_webhook_fallback",
+                "object": "charge",
+                "payment_intent": "pi_webhook_fallback"
+            }),
+        );
+        let answered = deliver(refunded).await;
+        assert_eq!(answered.as_ref().ok(), Some(&Status::Ok), "{answered:?}");
+        assert_eq!(
+            event_state(&harness, "evt_webhook_fallback_refund").await,
+            Some(PaymentEventState::Processed)
+        );
+        let stored = harness
+            .db
+            .fetch_payment_order(&order.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.state, OrderState::Refunded);
+        let membership = harness
+            .db
+            .fetch_cipher_membership(&user.id)
+            .await
+            .unwrap()
+            .expect("a membership");
+        assert!(membership.revoked_at.is_some());
+        assert_eq!(harness.db.fetch_user(&user.id).await.unwrap().cipher, None);
     }
 }

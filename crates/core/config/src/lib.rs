@@ -927,6 +927,7 @@ pub struct Api {
     pub kofi: ApiKofi,
     #[serde(default)]
     pub gamedata: ApiGamedata,
+    #[serde(default)]
     pub stripe: ApiStripe,
 }
 
@@ -1591,9 +1592,8 @@ impl AntispamFeatures {
     }
 }
 
-/// Payments: the Stripe Checkout routes, the webhook and the crond
-/// reconcile task, plus the Cipher sale they carry (provider keys live in
-/// `[api.stripe]`).
+/// Payments: the Cipher sale and the Stripe Checkout it runs on (provider
+/// keys live in `[api.stripe]`).
 ///
 /// Ships OFF. Prod turns it on in Revolt.overrides.toml under an explicit
 /// `[features.payments]` header (env form `REVOLT__FEATURES__PAYMENTS__...`,
@@ -1605,7 +1605,13 @@ impl AntispamFeatures {
 #[derive(Deserialize, Debug, Clone)]
 #[serde(default)]
 pub struct FeaturePayments {
-    /// Master switch: routes, webhook and the crond reconcile task
+    /// Switch for new checkouts only: while off, `POST
+    /// /payments/cipher/checkout` answers `PaymentsDisabled` and `GET
+    /// /payments/cipher/stats` reports `open: false`. It does NOT gate the
+    /// Stripe webhook, `GET /payments/cipher/@me`, the stats route itself or
+    /// the crond reconcile sweep: those only read, or settle money already
+    /// taken (fulfil a paid order, refund, apply a dispute). The sweep runs
+    /// whenever `[api.stripe] secret_key` is set.
     pub enabled: bool,
     /// Whether new Cipher checkouts (and upgrades) may start
     pub cipher_sales_open: bool,
@@ -3070,6 +3076,77 @@ mod payments_config_tests {
 
         assert_payments_defaults(&settings.features.payments);
         assert_stripe_defaults(&settings.api.stripe);
+    }
+
+    /// An overrides-less install whose Revolt.toml predates `[api.stripe]`:
+    /// the section is optional (`#[serde(default)]` on `Api.stripe`), so the
+    /// whole config still loads, with the Stripe defaults. Without the
+    /// attribute every process fails to start on "missing field `stripe`".
+    #[test]
+    fn missing_stripe_table_alone_takes_the_defaults() {
+        let mut skipping = false;
+        let stripped = include_str!("../Revolt.toml")
+            .lines()
+            .filter(|line| {
+                let line = line.trim_start();
+                if line.starts_with('[') {
+                    skipping = line == "[api.stripe]";
+                }
+                !skipping
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let config = Config::builder()
+            .add_source(File::from_str(&stripped, FileFormat::Toml))
+            .build()
+            .expect("the stripped config builds");
+
+        // Only [api.stripe] is gone, or this test proves nothing
+        assert!(config.get_table("api.stripe").is_err());
+        assert!(config.get_table("features.payments").is_ok());
+        assert!(config.get_table("api.gamedata").is_ok());
+
+        let settings: Settings = config
+            .try_deserialize()
+            .expect("a config without [api.stripe] must deserialize");
+
+        let stripe = &settings.api.stripe;
+        assert_stripe_defaults(stripe);
+        let defaults = ApiStripe::default();
+        assert_eq!(stripe.secret_key, defaults.secret_key);
+        assert_eq!(stripe.webhook_secret, defaults.webhook_secret);
+        assert_eq!(stripe.expect_livemode, defaults.expect_livemode);
+        assert_eq!(stripe.tolerance_secs, defaults.tolerance_secs);
+    }
+
+    /// `Features.payments` is optional the same way
+    #[test]
+    fn missing_payments_table_alone_takes_the_defaults() {
+        let mut skipping = false;
+        let stripped = include_str!("../Revolt.toml")
+            .lines()
+            .filter(|line| {
+                let line = line.trim_start();
+                if line.starts_with('[') {
+                    skipping = line == "[features.payments]";
+                }
+                !skipping
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let config = Config::builder()
+            .add_source(File::from_str(&stripped, FileFormat::Toml))
+            .build()
+            .expect("the stripped config builds");
+        assert!(config.get_table("features.payments").is_err());
+        assert!(config.get_table("api.stripe").is_ok());
+
+        let settings: Settings = config
+            .try_deserialize()
+            .expect("a config without [features.payments] must deserialize");
+        assert_payments_defaults(&settings.features.payments);
     }
 
     /// The documented env form (double underscores) reaches the nested keys

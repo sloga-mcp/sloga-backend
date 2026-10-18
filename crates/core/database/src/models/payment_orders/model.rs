@@ -43,6 +43,9 @@ auto_derived!(
         /// Our own session was paid, but not in the order's amount or
         /// currency
         AmountMismatch,
+        /// A refund or a lost dispute arrived before fulfilment applied the
+        /// order, so it was never applied
+        Reversed,
     }
 
     /// A reversal that arrived before fulfilment finished; fulfilment

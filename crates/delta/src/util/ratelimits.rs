@@ -429,10 +429,15 @@ impl<'a> RatelimitResolver<Request<'a>> for DeltaRatelimits {
                 ("payments", Some("cipher"), _) if extra == Some("stats") => {
                     ("payments_stats", None)
                 }
-                // Checkout and @me, keyed per session. Checkout creates a
-                // Stripe session, so the budget is tight; the engine's one
-                // live Pending order per user bounds a user with many
-                // sessions independently of this counter.
+                // The buyer's own standing, keyed per session. The Cipher
+                // settings page polls it while a checkout settles, so it
+                // must neither spend nor be starved by the tight checkout
+                // budget. A plain database read; it never calls Stripe.
+                ("payments", Some("cipher"), _) if extra == Some("@me") => ("payments_me", None),
+                // Checkout, keyed per session. It creates a Stripe session,
+                // so the budget is tight; the engine's one live Pending
+                // order per user bounds a user with many sessions
+                // independently of this counter.
                 ("payments", _, _) => ("payments", None),
                 _ => ("any", None),
             }
@@ -582,10 +587,12 @@ impl<'a> RatelimitResolver<Request<'a>> for DeltaRatelimits {
             // allows a burst of 5 and the route's own per-user 30 s window
             // holds the rest of the contract.
             "lookup" => 5,
-            // Checkout + @me: a buyer clicks once and the page reads its
-            // standing a couple of times. 3 per window is ample for a human
-            // and keeps a script from minting checkout sessions.
+            // Checkout: a buyer clicks once. 3 per window is ample for a
+            // human and keeps a script from minting checkout sessions.
             "payments" => 3,
+            // The buyer's standing, polled every few seconds while a
+            // checkout settles (and on page load)
+            "payments_me" => 10,
             // One delivery per Stripe event plus Stripe's retries after a
             // failed one. 60 leaves room for a retry burst after an outage.
             "payments_webhook" => 60,
@@ -920,8 +927,9 @@ mod tests {
         // The resolver, including the versioned prefix
         for (method, path, expected) in [
             ("POST", "/payments/cipher/checkout", "payments"),
-            ("GET", "/payments/cipher/@me", "payments"),
-            ("GET", "/0.8/payments/cipher/@me", "payments"),
+            ("POST", "/0.8/payments/cipher/checkout", "payments"),
+            ("GET", "/payments/cipher/@me", "payments_me"),
+            ("GET", "/0.8/payments/cipher/@me", "payments_me"),
             ("GET", "/payments/cipher/stats", "payments_stats"),
             ("GET", "/0.8/payments/cipher/stats", "payments_stats"),
             ("POST", "/payments/stripe/webhook", "payments_webhook"),
@@ -938,17 +946,18 @@ mod tests {
             );
         }
 
-        // Checkout and @me spend one tight counter
+        // Checkout and @me are separate counters: polling the standing
+        // never spends the tight checkout budget
         let checkout = client.post("/payments/cipher/checkout").dispatch();
         assert_eq!(checkout.status(), Status::Ok);
         assert_eq!(limit(&checkout), 3);
         let me = client.get("/payments/cipher/@me").dispatch();
         assert_eq!(me.status(), Status::Ok);
-        assert_eq!(limit(&me), 3);
-        assert_eq!(
+        assert_eq!(limit(&me), 10);
+        assert_ne!(
             bucket(&checkout),
             bucket(&me),
-            "checkout and @me must share one counter"
+            "checkout and @me must not share a counter"
         );
 
         let stats = client.get("/payments/cipher/stats").dispatch();
@@ -960,6 +969,7 @@ mod tests {
         let any = client.get("/sync/settings").dispatch();
         let buckets = [
             bucket(&checkout),
+            bucket(&me),
             bucket(&stats),
             bucket(&webhook),
             bucket(&any),
@@ -968,22 +978,38 @@ mod tests {
             for b in &buckets[i + 1..] {
                 assert_ne!(
                     a, b,
-                    "payments, stats, webhook and any must be distinct counters"
+                    "payments, payments_me, stats, webhook and any must be distinct counters"
                 );
             }
         }
 
-        // The third request exhausts the window and the fourth is refused
+        // Checkout: the third request exhausts the window and the fourth is
+        // refused
+        for _ in 0..2 {
+            assert_eq!(
+                client.post("/payments/cipher/checkout").dispatch().status(),
+                Status::Ok
+            );
+        }
         assert_eq!(
             client.post("/payments/cipher/checkout").dispatch().status(),
-            Status::Ok
+            Status::TooManyRequests
         );
+
+        // @me keeps its own budget after checkout is exhausted: 9 more fit
+        // the window (10 in all), the next is refused
+        for _ in 0..9 {
+            assert_eq!(
+                client.get("/payments/cipher/@me").dispatch().status(),
+                Status::Ok
+            );
+        }
         assert_eq!(
             client.get("/payments/cipher/@me").dispatch().status(),
             Status::TooManyRequests
         );
 
-        // Neither the public counter nor Stripe's deliveries are spent by it
+        // Neither the public counter nor Stripe's deliveries are spent by them
         assert_eq!(
             client.get("/payments/cipher/stats").dispatch().status(),
             Status::Ok
