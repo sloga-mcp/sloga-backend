@@ -20,10 +20,10 @@ use super::event::{
     StripeEvent,
 };
 
-/// `Stripe-Version` sent with every request. `""` omits the header, so the
-/// account's default API version applies. Set it once the version of the
-/// webhook endpoint is known, so the REST and webhook shapes agree.
-pub const STRIPE_API_VERSION: &str = "";
+/// `Stripe-Version` sent with every request. It matches the API version of the
+/// webhook endpoint (snapshot payloads), so REST responses and webhook events
+/// share one shape. `""` would omit the header and use the account default.
+pub const STRIPE_API_VERSION: &str = "2026-09-30.endive";
 
 /// Base URL of the Stripe REST API
 pub const STRIPE_API_BASE: &str = "https://api.stripe.com/v1";
@@ -1359,6 +1359,10 @@ mod tests {
     fn version_header_only_when_set() {
         assert_eq!(api_version_header(""), None);
         assert_eq!(api_version_header("2024-06-20"), Some("2024-06-20"));
+        assert_eq!(
+            api_version_header(STRIPE_API_VERSION),
+            Some("2026-09-30.endive")
+        );
     }
 
     #[test]
