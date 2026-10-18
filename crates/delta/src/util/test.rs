@@ -12,6 +12,7 @@ use revolt_database::{
 use revolt_database::{util::idempotency::IdempotencyKey, Role};
 use revolt_database::{Account, EmailVerification, Session};
 use revolt_models::v0;
+use revolt_payments::stripe::MockStripe;
 use revolt_permissions::OverrideField;
 use rocket::http::Header;
 use rocket::local::asynchronous::{Client, LocalRequest, LocalResponse};
@@ -61,6 +62,10 @@ pub struct TestHarness {
     pub client: Client,
     pub db: Database,
     pub amqp: AMQP,
+    /// The Stripe client the rocket manages (as `Arc<dyn StripeApi>`). Script
+    /// responses and failures here and read back the calls a route made; the
+    /// harness never reaches the network.
+    pub stripe: Arc<MockStripe>,
     /// Connection string this harness resolved to, kept so `Drop` can
     /// reconnect and delete the throwaway database. `None` on the reference
     /// driver, which leaves nothing behind. Captured at construction because
@@ -259,7 +264,8 @@ impl TestHarness {
              `TEST_DB=REFERENCE` (mock) or `TEST_DB=MONGODB` (throwaway db)."
         );
 
-        let client = Client::tracked(crate::web().await)
+        let stripe = Arc::new(MockStripe::new());
+        let client = Client::tracked(crate::web_with_stripe(stripe.clone()).await)
             .await
             .expect("valid rocket instance");
 
@@ -314,6 +320,7 @@ impl TestHarness {
             client,
             db,
             amqp,
+            stripe,
             mongo_uri,
             events,
             event_buffer: vec![],

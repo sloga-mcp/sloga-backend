@@ -64,6 +64,7 @@ nanoid = { workspace = true }
 sha2 = { workspace = true }
 revolt-permissions = { workspace = true }
 revolt-presence = { workspace = true }
+revolt-payments = { workspace = true }
 revolt-models = { workspace = true }
 
 [dev-dependencies]
@@ -77,3 +78,5 @@ tokio = { workspace = true, features = ["rt", "macros", "time"] }
 # Proves crond's log filter silences the WebSocket frame traces (main.rs);
 # the version pretty_env_logger already uses.
 env_logger = "0.7"
+# `MockStripe` for the account-deletion payments cascade tests
+revolt-payments = { workspace = true, features = ["test-mock"] }

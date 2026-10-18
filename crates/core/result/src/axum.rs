@@ -168,6 +168,13 @@ impl IntoResponse for Error {
             ErrorType::IncorrectData { .. } => StatusCode::BAD_REQUEST,
             ErrorType::MlsCallFull { .. } => StatusCode::CONFLICT,
             ErrorType::VideoCallFull { .. } => StatusCode::CONFLICT,
+
+            ErrorType::PaymentsDisabled => StatusCode::BAD_REQUEST,
+            ErrorType::CipherSalesClosed => StatusCode::FORBIDDEN,
+            ErrorType::CipherSoldOut => StatusCode::CONFLICT,
+            ErrorType::CipherTierInvalid => StatusCode::BAD_REQUEST,
+            ErrorType::PaymentPending => StatusCode::CONFLICT,
+            ErrorType::PaymentProviderError => StatusCode::BAD_GATEWAY,
         };
 
         // The body no longer carries the location, so log it for server

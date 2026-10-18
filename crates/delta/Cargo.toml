@@ -90,6 +90,7 @@ revolt-presence = { workspace = true }
 revolt-result = { workspace = true, features = ["rocket", "okapi"] }
 revolt-permissions = { workspace = true, features = ["schemas"] }
 revolt-ratelimits = { workspace = true, features = ["rocket"] }
+revolt-payments = { workspace = true }
 
 # voice
 livekit-api = { workspace = true }
@@ -102,6 +103,9 @@ ed25519-dalek = { workspace = true }
 # here rather than in `[dependencies]` so the teardown path is not compiled
 # into the delta binary.
 revolt-database = { workspace = true, features = ["test-teardown"] }
+# `MockStripe` for `TestHarness::stripe`, so route tests script Stripe
+# instead of reaching the network. Test builds only.
+revolt-payments = { workspace = true, features = ["test-mock"] }
 
 [build-dependencies]
 vergen = { workspace = true }

@@ -17,6 +17,7 @@ mod kofi;
 mod lookup;
 mod mls;
 mod onboard;
+mod payments;
 mod policy;
 mod push;
 mod referrals;
@@ -66,6 +67,7 @@ pub fn mount(config: Settings, mut rocket: Rocket<Build>) -> Rocket<Build> {
             "/push" => push::routes(),
             "/referrals" => referrals::routes(),
             "/kofi" => kofi::routes(),
+            "/payments" => payments::routes(),
             "/sync" => sync::routes(),
             "/webhooks" => webhooks::routes()
         };
@@ -99,6 +101,7 @@ pub fn mount(config: Settings, mut rocket: Rocket<Build>) -> Rocket<Build> {
             "/push" => push::routes(),
             "/referrals" => referrals::routes(),
             "/kofi" => kofi::routes(),
+            "/payments" => payments::routes(),
             "/sync" => sync::routes()
         };
     }
@@ -211,7 +214,8 @@ fn custom_openapi_spec() -> OpenApi {
               "Sync",
               "Web Push",
               "Soft Reserves",
-              "Game Lookup"
+              "Game Lookup",
+              "Payments"
             ]
           }
         ]),
@@ -426,6 +430,11 @@ fn custom_openapi_spec() -> OpenApi {
                     "Search Steam games, World of Warcraft items and League of Legends champions"
                         .to_owned(),
                 ),
+                ..Default::default()
+            },
+            Tag {
+                name: "Payments".to_owned(),
+                description: Some("Cipher founding sale checkout and status".to_owned()),
                 ..Default::default()
             },
         ],

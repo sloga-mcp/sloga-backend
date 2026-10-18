@@ -85,6 +85,10 @@ auto_derived_partial!(
         /// Custom profile badge, set by privileged routes only
         #[serde(skip_serializing_if = "Option::is_none")]
         pub custom_badge: Option<CustomBadge>,
+        /// Public Cipher badge, set by the payments fulfil path only and
+        /// present only while the membership is active and undisputed
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        pub cipher: Option<v0::UserCipher>,
 
         /// Number of qualified referrals (recomputed, never incremented)
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -135,6 +139,9 @@ auto_derived!(
         ReferralCount,
         DmGuard,
         None,
+
+        // public fields, server-set only
+        Cipher,
     }
 
     /// Platform of a linked streaming channel
@@ -378,6 +385,7 @@ impl Default for User {
             connections: Default::default(),
             name_style: Default::default(),
             custom_badge: Default::default(),
+            cipher: Default::default(),
             referral_count: Default::default(),
             referral_pending: Default::default(),
             welcomed_at: Default::default(),
@@ -962,6 +970,17 @@ impl User {
         let mut clear: Vec<v0::FieldsUser> = remove.into_iter().map(|v| v.into()).collect();
         let mut data: v0::PartialUser = partial.into();
 
+        // The stored badge mirrors the membership, but what goes out is the
+        // public one (as on every read): while it is hidden (supporter
+        // badges opted out, or a deleted account) the event clears it
+        // instead of carrying it
+        if data.cipher.is_some() && self.public_cipher().is_none() {
+            data.cipher = None;
+            if !clear.contains(&v0::FieldsUser::Cipher) {
+                clear.push(v0::FieldsUser::Cipher);
+            }
+        }
+
         if perk_inputs {
             data.badges = Some(self.badges_at(now).await);
             if style_inputs {
@@ -1020,6 +1039,39 @@ impl User {
         }
     }
 
+    /// Emit the public Cipher badge to everyone who can see this user if it
+    /// differs from `before` (what they saw): the badge when it shows, a
+    /// clear when it no longer does. For changes that move the public badge
+    /// without touching the stored one (the supporter `show_badges` toggle).
+    pub async fn publish_public_cipher_if_changed(
+        &self,
+        db: &Database,
+        before: Option<v0::UserCipher>,
+    ) {
+        let cipher = self.public_cipher();
+        if cipher == before {
+            return;
+        }
+
+        let clear = if cipher.is_none() {
+            vec![v0::FieldsUser::Cipher]
+        } else {
+            vec![]
+        };
+
+        EventV1::UserUpdate {
+            id: self.id.clone(),
+            data: v0::PartialUser {
+                cipher,
+                ..Default::default()
+            },
+            clear,
+            event_id: Some(Ulid::new().to_string()),
+        }
+        .p_user(self.id.clone(), db)
+        .await;
+    }
+
     /// Emit the computed badges and filtered name style to everyone who
     /// can see this user
     async fn publish_public_perks(
@@ -1076,6 +1128,27 @@ impl User {
     /// Whether the account has been deleted
     fn is_deleted(&self) -> bool {
         self.flags.unwrap_or_default() & UserFlags::Deleted as i32 != 0
+    }
+
+    /// The public Cipher badge: None for a deleted account even if a stale
+    /// stored copy outlived `mark_deleted`, and None while the user hides
+    /// their supporter badges (`supporter.show_badges`, as for the donation
+    /// badges in `compute_badges`). The stored `cipher` keeps mirroring the
+    /// membership either way, so turning badges back on shows it again.
+    pub fn public_cipher(&self) -> Option<v0::UserCipher> {
+        if self.is_deleted() {
+            return None;
+        }
+
+        if self
+            .supporter
+            .as_ref()
+            .is_some_and(|supporter| !supporter.show_badges)
+        {
+            return None;
+        }
+
+        self.cipher.clone()
     }
 
     /// Bitfield of perks the user holds at `now_ms`
@@ -1180,6 +1253,7 @@ impl User {
             FieldsUser::ReferralCount => self.referral_count = None,
             FieldsUser::DmGuard => self.dm_guard = None,
             FieldsUser::None => {}
+            FieldsUser::Cipher => self.cipher = None,
         }
     }
 
@@ -1298,6 +1372,8 @@ impl User {
                 FieldsUser::ReferralPending,
                 FieldsUser::WelcomedAt,
                 FieldsUser::ReferralCount,
+                // A deleted account never keeps a public Cipher badge
+                FieldsUser::Cipher,
             ],
         )
         .await
@@ -1820,6 +1896,74 @@ mod tests {
             suspended.compute_badges(None, NOW) & UserBadges::Recruiter as u32,
             0
         );
+    }
+
+    #[test]
+    fn cipher_hidden_for_deleted_user_and_cleared_on_remove() {
+        let badge = v0::UserCipher {
+            number: 42,
+            tier: v0::CipherTier::T299,
+        };
+
+        let mut user = User {
+            cipher: Some(badge.clone()),
+            ..Default::default()
+        };
+        assert_eq!(user.public_cipher(), Some(badge.clone()));
+
+        // A stale stored copy never shows on a deleted account
+        let deleted = User {
+            flags: Some(UserFlags::Deleted as i32),
+            ..user.clone()
+        };
+        assert_eq!(deleted.public_cipher(), None);
+
+        // Other flags leave it alone
+        let suspended = User {
+            flags: Some(UserFlags::SuspendedUntil as i32),
+            ..user.clone()
+        };
+        assert_eq!(suspended.public_cipher(), Some(badge));
+
+        user.remove_field(&FieldsUser::Cipher);
+        assert_eq!(user.cipher, None);
+        assert_eq!(user.public_cipher(), None);
+    }
+
+    #[test]
+    fn cipher_follows_the_show_badges_preference() {
+        let badge = v0::UserCipher {
+            number: 7,
+            tier: v0::CipherTier::T99,
+        };
+        let supporter = |show_badges| Supporter {
+            lifetime_usd_cents: 0,
+            monthly_until: None,
+            payer_hmacs: vec![],
+            show_badges,
+        };
+
+        // Never a supporter: shown
+        let user = User {
+            cipher: Some(badge.clone()),
+            ..Default::default()
+        };
+        assert_eq!(user.public_cipher(), Some(badge.clone()));
+
+        // Opted out: hidden from the public projection, still stored
+        let hidden = User {
+            supporter: Some(supporter(false)),
+            ..user.clone()
+        };
+        assert_eq!(hidden.public_cipher(), None);
+        assert_eq!(hidden.cipher, Some(badge.clone()));
+
+        // Opted back in: shown again
+        let shown = User {
+            supporter: Some(supporter(true)),
+            ..user
+        };
+        assert_eq!(shown.public_cipher(), Some(badge));
     }
 
     #[test]

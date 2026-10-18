@@ -24,9 +24,24 @@ use std::net::Ipv4Addr;
 use std::str::FromStr;
 
 use revolt_database::voice::VoiceClient;
+use revolt_payments::stripe::{ReqwestStripe, StripeApi};
 use rocket::data::ToByteUnit;
+use std::sync::Arc;
 
 pub async fn web() -> Rocket<Build> {
+    // Stripe client for the payments routes. An empty key is accepted: every
+    // Stripe call then fails closed without touching the network. The key
+    // stays inside the client, whose Debug output redacts it.
+    let stripe: Arc<dyn StripeApi> = Arc::new(ReqwestStripe::new(
+        config().await.api.stripe.secret_key.clone(),
+    ));
+
+    web_with_stripe(stripe).await
+}
+
+/// [`web`] with the Stripe client supplied by the caller, so the test
+/// harness can manage a `MockStripe` in its place.
+pub async fn web_with_stripe(stripe: Arc<dyn StripeApi>) -> Rocket<Build> {
     // Get settings
     let config = config().await;
 
@@ -95,6 +110,7 @@ pub async fn web() -> Rocket<Build> {
         .manage(amqp)
         .manage(cors.clone())
         .manage(voice_client)
+        .manage(stripe)
         .manage(ratelimits)
         .attach(ratelimiter::RatelimitFairing)
         .attach(cors)

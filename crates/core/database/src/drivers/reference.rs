@@ -15,6 +15,7 @@ use crate::{
     ThreadMemberCompositeKey, UploadSession, User, UserSettings, Webhook, Account, AccountInvite, Session,
     MFATicket
 };
+use crate::{CipherMembership, CipherNumber, PaymentEvent, PaymentOrder};
 
 database_derived!(
     /// Reference implementation
@@ -76,5 +77,9 @@ database_derived!(
         pub mls_groups: Arc<Mutex<HashMap<String, MlsGroup>>>,
         pub mls_commits: Arc<Mutex<HashMap<String, MlsCommit>>>,
         pub mls_join_intents: Arc<Mutex<HashMap<String, MlsJoinIntent>>>,
+        pub payment_events: Arc<Mutex<HashMap<String, PaymentEvent>>>,
+        pub payment_orders: Arc<Mutex<HashMap<String, PaymentOrder>>>,
+        pub cipher_numbers: Arc<Mutex<HashMap<u32, CipherNumber>>>,
+        pub cipher_memberships: Arc<Mutex<HashMap<String, CipherMembership>>>,
     }
 );

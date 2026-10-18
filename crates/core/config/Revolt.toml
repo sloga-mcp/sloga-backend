@@ -213,6 +213,21 @@ steam_news_per_window = 60
 # Blizzard API calls per second (shared by embeds and lookups)
 blizzard_per_second = 20
 
+[api.stripe]
+# Stripe API secret key (secret, set only in deployment overrides)
+secret_key = ""
+# Webhook endpoint signing secret (secret, set only in deployment overrides); empty = every webhook refused
+webhook_secret = ""
+# Events and sessions whose livemode differs are ignored (true in production)
+expect_livemode = false
+# Where Checkout returns the buyer, per return_to
+success_url_web = "https://app.sloga.gg/settings?cipher=success"
+cancel_url_web = "https://app.sloga.gg/settings?cipher=cancel"
+success_url_shell = "https://sloga.gg/cipher/thanks/"
+cancel_url_shell = "https://sloga.gg/cipher/"
+# Maximum age of a webhook signature timestamp, in seconds
+tolerance_secs = 300
+
 [pushd]
 # this changes the names of the queues to not overlap 
 # prod/beta if they happen to be on the same exchange/instance.
@@ -463,6 +478,14 @@ daily_max_reply_ratio = 0.25
 daily_max_public_messages = 3
 daily_report_cooldown_days = 30
 daily_max_reports_per_run = 10
+
+[features.payments]
+# Ships OFF; prod enables it in Revolt.overrides.toml under [features.payments], then restarts delta AND crond.
+enabled = false
+cipher_sales_open = false
+cipher_cap = 1000
+# RFC 3339 instant after which the Cipher sale closes; empty = no close date
+cipher_sales_close_at = ""
 
 [features.limits]
 

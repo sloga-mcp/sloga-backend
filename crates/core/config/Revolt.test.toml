@@ -27,6 +27,16 @@ reply_to = "support@stoat.chat"
 port = 14025
 use_tls = false
 
+# Payments on, with dummy Stripe secrets, so the payment route and webhook
+# tests run without overwrite_config (which works once per process).
+[features.payments]
+enabled = true
+cipher_sales_open = true
+
+[api.stripe]
+secret_key = "sk_test_dummy"
+webhook_secret = "whsec_test_dummy"
+
 
 # Pin the upload ceiling for tests. These now match the committed
 # Revolt.toml, so this block raises nothing - it exists to stop a developer

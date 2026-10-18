@@ -2,7 +2,7 @@ use iso8601_timestamp::Timestamp;
 use once_cell::sync::Lazy;
 use regex::Regex;
 
-use super::{File, RE_COLOUR};
+use super::{File, UserCipher, RE_COLOUR};
 
 #[cfg(feature = "validator")]
 use validator::Validate;
@@ -107,6 +107,10 @@ auto_derived_partial!(
         /// Custom profile badge
         #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
         pub custom_badge: Option<CustomBadge>,
+        /// Cipher badge; absent unless the membership is active and has no
+        /// open dispute
+        #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+        pub cipher: Option<UserCipher>,
 
         /// Who may fetch the user's profile page; only ever present on the
         /// session user's own object
@@ -143,6 +147,7 @@ auto_derived!(
 
         /// Internal field, ignore this.
         Internal,
+        Cipher,
     }
 
     /// Platform of a linked streaming channel

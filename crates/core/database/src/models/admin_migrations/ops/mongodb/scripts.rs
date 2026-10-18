@@ -26,7 +26,7 @@ struct MigrationInfo {
     revision: i32,
 }
 
-pub const LATEST_REVISION: i32 = 74; // MUST BE +1 to last migration
+pub const LATEST_REVISION: i32 = 75; // MUST BE +1 to last migration
 
 pub async fn migrate_database(db: &MongoDb) {
     let migrations = db.col::<Document>("migrations");
@@ -2855,8 +2855,211 @@ pub async fn run_migrations(db: &MongoDb, revision: i32) -> i32 {
         }
     }
 
+    if revision <= 74 {
+        info!("Running migration [revision 74 / 15-10-2026]: Create payment_events / payment_orders / cipher_numbers / cipher_memberships collections, seed cipher_numbers (payments + Cipher)");
+
+        // Same idempotency contract as prior collection migrations. init.rs
+        // calls the same two helpers, so the specs cannot drift.
+        //
+        // Unlike revision 73 this block panics on failure, as revision 71
+        // does: the unique indexes are what stop one checkout session, one
+        // payment intent or one order from being fulfilled twice, so delta
+        // must not serve payments without them. A panic leaves the stored
+        // revision at 74, so the next boot re-runs the whole block, and
+        // every step in it is idempotent.
+        for collection in PAYMENT_COLLECTIONS {
+            db.db().create_collection(collection).await.ok();
+        }
+
+        create_payment_indexes(&db.db())
+            .await
+            .expect("Failed to create payments indexes.");
+
+        seed_cipher_numbers_table(&db.db())
+            .await
+            .expect("Failed to seed cipher_numbers.");
+    }
+
     // Reminder to update LATEST_REVISION when adding new migrations.
     LATEST_REVISION.max(revision)
+}
+
+/// The payments + Cipher collections (revision 74). Created by both the
+/// migration and `init.rs`.
+pub const PAYMENT_COLLECTIONS: [&str; 4] = [
+    "payment_events",
+    "payment_orders",
+    "cipher_numbers",
+    "cipher_memberships",
+];
+
+/// The seeded `cipher_numbers` table holds numbers 1 through this. Fixed
+/// rather than read from `features.payments.cipher_cap`: migrations read no
+/// config, and the model's `seed_cipher_numbers(cap)` can extend the table
+/// if the cap is ever raised. A lower cap has to be enforced where numbers
+/// are claimed, not here.
+pub const CIPHER_NUMBER_SEED_CAP: u32 = 1000;
+
+/// Revision 74: the payments + Cipher indexes, shared by the migration and
+/// `init.rs`. Re-running is a no-op: createIndexes with an identical name
+/// and spec succeeds without change.
+///
+/// The unique indexes on optional fields are PARTIAL on `$type: "string"`,
+/// not plain unique: an absent `checkout_session_id`, `payment_intent_id` or
+/// `order_id` is the normal state of most rows, and a plain unique index
+/// would index every absent value as null and reject the second such row.
+pub async fn create_payment_indexes(
+    db: &crate::mongodb::Database,
+) -> Result<(), crate::mongodb::error::Error> {
+    db.run_command(doc! {
+        "createIndexes": "payment_orders",
+        "indexes": [
+            // ENFORCES one order per Checkout Session, and serves the
+            // webhook's lookup by session.
+            {
+                "key": {
+                    "checkout_session_id": 1_i32
+                },
+                "name": "payment_orders_session_unique",
+                "unique": true,
+                "partialFilterExpression": {
+                    "checkout_session_id": { "$type": "string" }
+                }
+            },
+            // ENFORCES one order per PaymentIntent, and serves the refund
+            // and dispute lookups by intent.
+            {
+                "key": {
+                    "payment_intent_id": 1_i32
+                },
+                "name": "payment_orders_intent_unique",
+                "unique": true,
+                "partialFilterExpression": {
+                    "payment_intent_id": { "$type": "string" }
+                }
+            },
+            // Serves a user's orders (pending checkout, account deletion).
+            {
+                "key": {
+                    "user_id": 1_i32
+                },
+                "name": "payment_orders_user"
+            },
+            // Serves the crond sweeps over orders in a state, oldest first.
+            {
+                "key": {
+                    "state": 1_i32,
+                    "created_at": 1_i32
+                },
+                "name": "payment_orders_state_created"
+            }
+        ]
+    })
+    .await?;
+
+    db.run_command(doc! {
+        "createIndexes": "cipher_numbers",
+        "indexes": [
+            // ENFORCES one number per order: a fulfilment retried after a
+            // crash finds the number it already claimed instead of taking
+            // a second one.
+            {
+                "key": {
+                    "order_id": 1_i32
+                },
+                "name": "cipher_numbers_order_unique",
+                "unique": true,
+                "partialFilterExpression": {
+                    "order_id": { "$type": "string" }
+                }
+            }
+        ]
+    })
+    .await?;
+
+    db.run_command(doc! {
+        "createIndexes": "cipher_memberships",
+        "indexes": [
+            // ENFORCES one member per number.
+            {
+                "key": {
+                    "number": 1_i32
+                },
+                "name": "cipher_memberships_number_unique",
+                "unique": true
+            }
+        ]
+    })
+    .await?;
+
+    db.run_command(doc! {
+        "createIndexes": "payment_events",
+        "indexes": [
+            // Serves the crond retry scan over Failed events, oldest first.
+            {
+                "key": {
+                    "state": 1_i32,
+                    "received_at": 1_i32
+                },
+                "name": "payment_events_state_received"
+            }
+        ]
+    })
+    .await?;
+
+    Ok(())
+}
+
+/// Revision 74: seed `cipher_numbers` with every number from 1 through
+/// `CIPHER_NUMBER_SEED_CAP`, unclaimed. Shared by the migration and
+/// `init.rs`.
+///
+/// One unordered `insert_many` of bare `{_id}` rows. Inserts only: an
+/// existing row, claimed or not, fails its own insert with a duplicate key
+/// and is left exactly as it is, so an `order_id` is never touched, and
+/// unordered means every other row is still inserted. A failure made only
+/// of duplicate keys is success (`seed_failed_only_on_existing_rows`).
+/// Works on every MongoDB version, unlike an upsert with an empty
+/// `$setOnInsert`, which needs 5.0 or later.
+///
+/// `_id` is written as Int64 because that is what bson 2 writes for the
+/// model's `number: u32` through serde (`to_document` and the raw
+/// serializer `insert_one` uses). `doc!` turns a bare `u32` into Int32
+/// instead; equality and range filters match across the two widths, but
+/// `$type` filters and whole-document comparisons do not.
+pub async fn seed_cipher_numbers_table(
+    db: &crate::mongodb::Database,
+) -> Result<(), crate::mongodb::error::Error> {
+    let rows: Vec<Document> = (1..=CIPHER_NUMBER_SEED_CAP)
+        .map(|number| doc! { "_id": i64::from(number) })
+        .collect();
+
+    match db
+        .collection::<Document>("cipher_numbers")
+        .insert_many(rows)
+        .ordered(false)
+        .await
+    {
+        Ok(_) => Ok(()),
+        Err(error) if seed_failed_only_on_existing_rows(&error) => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+/// Whether an unordered `insert_many` failed only on rows that already
+/// exist: every write error is a duplicate key (11000) and there is no
+/// write concern error. The same rule as `is_only_duplicate_keys` in
+/// `models/cipher_numbers/ops/mongodb.rs`.
+fn seed_failed_only_on_existing_rows(error: &crate::mongodb::error::Error) -> bool {
+    match *error.kind {
+        crate::mongodb::error::ErrorKind::InsertMany(ref failure) => {
+            failure.write_concern_error.is_none()
+                && failure.write_errors.as_ref().is_some_and(|errors| {
+                    errors.iter().all(|write_error| write_error.code == 11000)
+                })
+        }
+        _ => false,
+    }
 }
 
 /// Revision 72 (the A11 backfill): which channel, if any, becomes a server's
@@ -3236,18 +3439,19 @@ mod afk_backfill_tests {
     }
 
     #[test]
-    fn latest_revision_is_74() {
+    fn latest_revision_is_75() {
         assert_eq!(
-            LATEST_REVISION, 74,
-            "the AFK backfill is revision 72, the ViewAuditLog backfill 73"
+            LATEST_REVISION, 75,
+            "the AFK backfill is revision 72, the ViewAuditLog backfill 73, the payments collections 74"
         );
     }
 
-    /// The AFK backfill was the last migration when it landed; revision 73
-    /// (the ViewAuditLog backfill) now is. Both guards are pinned to exactly
-    /// one block each, and the last one to `LATEST_REVISION - 1`.
+    /// The AFK backfill was the last migration when it landed; revision 74
+    /// (the payments collections) now is. The 72, 73 and 74 guards are
+    /// pinned to exactly one block each, and the last one to
+    /// `LATEST_REVISION - 1`.
     #[test]
-    fn backfill_is_guarded_by_revision_72_and_revision_73_is_the_last_migration() {
+    fn backfill_is_guarded_by_revision_72_and_revision_74_is_the_last_migration() {
         let guards: Vec<i32> = shipping()
             .match_indices("if revision <= ")
             .map(|(at, needle)| {
@@ -3269,6 +3473,11 @@ mod afk_backfill_tests {
             "exactly one `if revision <= 73` block"
         );
         assert_eq!(
+            guards.iter().filter(|guard| **guard == 74).count(),
+            1,
+            "exactly one `if revision <= 74` block"
+        );
+        assert_eq!(
             guards.iter().max(),
             Some(&(LATEST_REVISION - 1)),
             "LATEST_REVISION MUST BE +1 to the last migration"
@@ -3283,11 +3492,11 @@ mod afk_backfill_tests {
     /// a TOP-LEVEL statement of `run_migrations`, a sibling of the 70 and 71
     /// blocks, never inside one of them. Nested inside the 71 block, a
     /// database already at 72 would skip the backfill forever, and every
-    /// other pin in this module would still pass. The revision-73 guard
-    /// carries the same trap one block later, so it is pinned the same way
-    /// against the 72 block.
+    /// other pin in this module would still pass. The revision-73 and
+    /// revision-74 guards carry the same trap one and two blocks later, so
+    /// each is pinned the same way against the block before it.
     #[test]
-    fn revision_72_and_73_guards_are_top_level_siblings_of_the_previous_block() {
+    fn revision_72_to_74_guards_are_top_level_siblings_of_the_previous_block() {
         let depth_at = |at: usize| -> i64 {
             shipping()[..at]
                 .chars()
@@ -3307,7 +3516,8 @@ mod afk_backfill_tests {
             );
             shipping().find(&needle).expect("the guard")
         };
-        let (at_70, at_71, at_72, at_73) = (guard(70), guard(71), guard(72), guard(73));
+        let (at_70, at_71, at_72, at_73, at_74) =
+            (guard(70), guard(71), guard(72), guard(73), guard(74));
 
         let open_71 = at_71 + format!("if revision <= 71 {OPEN}").len() - 1;
         let block_71 = braced(shipping(), open_71);
@@ -3331,6 +3541,17 @@ mod afk_backfill_tests {
             "the revision 73 guard must come after the 72 block closes"
         );
 
+        let open_73 = at_73 + format!("if revision <= 73 {OPEN}").len() - 1;
+        let block_73 = braced(shipping(), open_73);
+        assert!(
+            !block_73.contains("if revision <= 74"),
+            "the revision 74 guard must not be nested inside the 73 block"
+        );
+        assert!(
+            at_74 > open_73 + block_73.len(),
+            "the revision 74 guard must come after the 73 block closes"
+        );
+
         let body = shipping()
             .find("pub async fn run_migrations(")
             .expect("run_migrations");
@@ -3341,10 +3562,11 @@ mod afk_backfill_tests {
                 depth_at(at_70),
                 depth_at(at_71),
                 depth_at(at_72),
-                depth_at(at_73)
+                depth_at(at_73),
+                depth_at(at_74)
             ),
-            (top_level, top_level, top_level, top_level),
-            "the 70, 71, 72 and 73 guards must all sit at the top level of run_migrations"
+            (top_level, top_level, top_level, top_level, top_level),
+            "the 70, 71, 72, 73 and 74 guards must all sit at the top level of run_migrations"
         );
     }
 
@@ -3850,7 +4072,9 @@ mod tests {
                 .await
                 .expect("insert servers");
 
-            assert_eq!(super::run_migrations(&mongo, 73).await, 74);
+            // Revision 74 runs after it (it touches no server); the return
+            // is LATEST_REVISION.
+            assert_eq!(super::run_migrations(&mongo, 73).await, 75);
 
             let fetch = |id: String| {
                 let servers = servers.clone();
@@ -3907,7 +4131,7 @@ mod tests {
             );
 
             // Re-running is a no-op.
-            assert_eq!(super::run_migrations(&mongo, 73).await, 74);
+            assert_eq!(super::run_migrations(&mongo, 73).await, 75);
             for want in &expected {
                 let id = want.get_str("_id").expect("_id");
                 assert_eq!(
@@ -3936,5 +4160,336 @@ mod tests {
 
         db.drop_database().await;
         guard.disarm();
+    }
+
+    /// Revision 74 must create the payments indexes, with the unique ones
+    /// on optional fields PARTIAL (most rows lack the field), seed
+    /// cipher_numbers 1..=1000 as Int64, keep an order_id already set, and
+    /// be a no-op when re-run. Control: drop a `partialFilterExpression`
+    /// and the second session-less order is refused.
+    #[tokio::test]
+    async fn revision_74_creates_payment_indexes_and_seeds_cipher_numbers() {
+        // Named by hand for the same 63-character reason as revision 70's.
+        let db = crate::DatabaseInfo::Test("migration_rev74_payments".to_string())
+            .connect()
+            .await
+            .expect("Database connection failed.");
+        db.drop_database().await;
+        let guard = crate::test_teardown::TestDatabaseGuard::arm(&db).await;
+
+        {
+            #[allow(irrefutable_let_patterns)]
+            let Database::MongoDb(mongo) = db.clone() else {
+                // The migration scripts are MongoDB-only.
+                db.drop_database().await;
+                guard.disarm();
+                return;
+            };
+
+            // A number claimed before a crash mid-block, so the block runs
+            // again over it: the re-run must keep its order_id.
+            let numbers = mongo.col::<Document>("cipher_numbers");
+            numbers
+                .insert_one(doc! { "_id": 7_i64, "order_id": "ORDER_A" })
+                .await
+                .expect("insert a claimed number");
+
+            assert_eq!(super::run_migrations(&mongo, 74).await, 75);
+            assert_eq!(super::run_migrations(&mongo, 74).await, 75, "a re-run");
+
+            assert_eq!(numbers.count_documents(doc! {}).await.expect("count"), 1000);
+            assert_eq!(
+                numbers
+                    .count_documents(doc! {
+                        "_id": { "$type": "long", "$gte": 1_i64, "$lte": 1000_i64 }
+                    })
+                    .await
+                    .expect("count"),
+                1000,
+                "every number 1..=1000, stored as Int64 like the model's u32"
+            );
+            assert_eq!(
+                numbers
+                    .count_documents(doc! { "order_id": { "$exists": true } })
+                    .await
+                    .expect("count"),
+                1,
+                "the seed leaves every other number unclaimed"
+            );
+            assert_eq!(
+                numbers
+                    .find_one(doc! { "_id": 7_i64 })
+                    .await
+                    .expect("find")
+                    .expect("number 7"),
+                doc! { "_id": 7_i64, "order_id": "ORDER_A" },
+                "the seed must never touch an order_id"
+            );
+            // `doc!` makes Int32 of a bare u32; equality still matches.
+            assert!(numbers
+                .find_one(doc! { "_id": 7_i32 })
+                .await
+                .expect("find")
+                .is_some());
+
+            for (collection, want) in [
+                (
+                    "payment_orders",
+                    vec![
+                        "_id_",
+                        "payment_orders_intent_unique",
+                        "payment_orders_session_unique",
+                        "payment_orders_state_created",
+                        "payment_orders_user",
+                    ],
+                ),
+                (
+                    "cipher_numbers",
+                    vec!["_id_", "cipher_numbers_order_unique"],
+                ),
+                (
+                    "cipher_memberships",
+                    vec!["_id_", "cipher_memberships_number_unique"],
+                ),
+                (
+                    "payment_events",
+                    vec!["_id_", "payment_events_state_received"],
+                ),
+            ] {
+                let mut names = mongo
+                    .col::<Document>(collection)
+                    .list_index_names()
+                    .await
+                    .expect("list indexes");
+                names.sort_unstable();
+                assert_eq!(names, want, "{collection} indexes");
+            }
+
+            let orders = mongo.col::<Document>("payment_orders");
+            orders
+                .insert_many(vec![doc! { "_id": "O1" }, doc! { "_id": "O2" }])
+                .await
+                .expect("two orders without a session or an intent");
+            orders
+                .insert_one(doc! {
+                    "_id": "O3",
+                    "checkout_session_id": "cs_1",
+                    "payment_intent_id": "pi_1"
+                })
+                .await
+                .expect("an order with a session and an intent");
+            assert!(
+                orders
+                    .insert_one(doc! { "_id": "O4", "checkout_session_id": "cs_1" })
+                    .await
+                    .is_err(),
+                "a second order on one Checkout Session"
+            );
+            assert!(
+                orders
+                    .insert_one(doc! { "_id": "O5", "payment_intent_id": "pi_1" })
+                    .await
+                    .is_err(),
+                "a second order on one PaymentIntent"
+            );
+
+            assert!(
+                numbers
+                    .update_one(
+                        doc! { "_id": 8_i64 },
+                        doc! { "$set": { "order_id": "ORDER_A" } }
+                    )
+                    .await
+                    .is_err(),
+                "a second number for one order"
+            );
+            numbers
+                .update_one(
+                    doc! { "_id": 8_i64 },
+                    doc! { "$set": { "order_id": "ORDER_B" } },
+                )
+                .await
+                .expect("another order claims another number");
+
+            let memberships = mongo.col::<Document>("cipher_memberships");
+            memberships
+                .insert_one(doc! { "_id": "U1", "number": 7_i64 })
+                .await
+                .expect("a member");
+            assert!(
+                memberships
+                    .insert_one(doc! { "_id": "U2", "number": 7_i64 })
+                    .await
+                    .is_err(),
+                "a second member on one number"
+            );
+        }
+
+        db.drop_database().await;
+        guard.disarm();
+    }
+}
+
+#[cfg(test)]
+mod payments_migration_tests {
+    use super::*;
+
+    const SOURCE: &str = include_str!("scripts.rs");
+    const INIT: &str = include_str!("init.rs");
+    const OPEN: char = '\u{7b}';
+    const CLOSE: char = '\u{7d}';
+
+    /// Everything above the first test module: the shipping source.
+    fn shipping(source: &'static str) -> &'static str {
+        let end = source.find("#[cfg(test)]").unwrap_or(source.len());
+        &source[..end]
+    }
+
+    /// The revision 74 block of `run_migrations`, brace to brace.
+    fn payments_block() -> &'static str {
+        let needle = format!("if revision <= 74 {OPEN}");
+        let text = shipping(SOURCE);
+        let at = text.find(&needle).expect("the revision 74 migration block");
+        let open = at + needle.len() - 1;
+        let mut depth = 0i64;
+        for (i, ch) in text[open..].char_indices() {
+            if ch == OPEN {
+                depth += 1;
+            } else if ch == CLOSE {
+                depth -= 1;
+                if depth == 0 {
+                    return &text[open..=open + i];
+                }
+            }
+        }
+        panic!("unbalanced braces in the revision 74 block");
+    }
+
+    /// The seed's `_id` width rests on this: bson 2 writes a `u32` field as
+    /// Int64 through both serde paths (`to_document`, and the raw
+    /// serializer a typed `insert_one` uses), while `Bson::from(u32)`, which
+    /// `doc!` calls, gives Int32. A bson upgrade that changes either fires
+    /// here.
+    #[test]
+    fn a_u32_field_serializes_as_int64() {
+        #[derive(Serialize)]
+        struct Row {
+            #[serde(rename = "_id")]
+            number: u32,
+        }
+
+        let row = Row { number: 7 };
+        assert_eq!(
+            to_document(&row).expect("to_document").get("_id"),
+            Some(&Bson::Int64(7))
+        );
+        assert_eq!(
+            bson::to_raw_document_buf(&row)
+                .expect("to_raw_document_buf")
+                .to_document()
+                .expect("to_document")
+                .get("_id"),
+            Some(&Bson::Int64(7))
+        );
+        assert_eq!(Bson::from(7_u32), Bson::Int32(7));
+    }
+
+    #[test]
+    fn the_payments_block_runs_the_shared_helpers() {
+        let block = payments_block();
+        for needle in [
+            "PAYMENT_COLLECTIONS",
+            "create_payment_indexes(",
+            "seed_cipher_numbers_table(",
+        ] {
+            assert!(
+                block.contains(needle),
+                "the revision 74 block must call {needle}"
+            );
+        }
+    }
+
+    /// Fresh databases skip the migrations, so init.rs must build the same
+    /// schema through the same helpers.
+    #[test]
+    fn init_builds_the_payments_schema_through_the_shared_helpers() {
+        let init = shipping(INIT);
+        for needle in [
+            "PAYMENT_COLLECTIONS",
+            "create_payment_indexes(",
+            "seed_cipher_numbers_table(",
+        ] {
+            assert!(init.contains(needle), "init.rs must call {needle}");
+        }
+    }
+
+    /// The seed is one unordered insert_many of new rows, so it can never
+    /// write to a row that already exists, and one existing row does not
+    /// stop the rest from being inserted. The duplicate-key tolerance and
+    /// the pre-claimed row are exercised for real by
+    /// `revision_74_creates_payment_indexes_and_seeds_cipher_numbers`.
+    #[test]
+    fn the_seed_never_overwrites_a_row() {
+        let at = SOURCE
+            .find("pub async fn seed_cipher_numbers_table(")
+            .expect("the seed fn");
+        let open = at + SOURCE[at..].find(OPEN).expect("its body");
+        let mut depth = 0i64;
+        let mut end = open;
+        for (i, ch) in SOURCE[open..].char_indices() {
+            if ch == OPEN {
+                depth += 1;
+            } else if ch == CLOSE {
+                depth -= 1;
+                if depth == 0 {
+                    end = open + i;
+                    break;
+                }
+            }
+        }
+        let body: String = SOURCE[open..=end]
+            .chars()
+            .filter(|ch| !ch.is_whitespace())
+            .collect();
+        for needle in [
+            ".insert_many(",
+            ".ordered(false)",
+            "seed_failed_only_on_existing_rows(&error)",
+        ] {
+            assert!(body.contains(needle), "the seed must use {needle}: {body}");
+        }
+        for needle in [
+            "\"$set",
+            "$unset",
+            "replace_one",
+            "update_one",
+            "update_many",
+            "upsert",
+            "order_id",
+        ] {
+            assert!(!body.contains(needle), "the seed must not use {needle}");
+        }
+
+        // Duplicate keys, and only duplicate keys, count as success.
+        let at = SOURCE
+            .find("fn seed_failed_only_on_existing_rows(")
+            .expect("the duplicate-key rule");
+        let rule: String = SOURCE[at..]
+            .split("\n}\n")
+            .next()
+            .expect("its body")
+            .chars()
+            .filter(|ch| !ch.is_whitespace())
+            .collect();
+        for needle in [
+            "ErrorKind::InsertMany(",
+            "write_concern_error.is_none()",
+            ".all(|write_error|write_error.code==11000)",
+        ] {
+            assert!(
+                rule.contains(needle),
+                "the rule must check {needle}: {rule}"
+            );
+        }
     }
 }

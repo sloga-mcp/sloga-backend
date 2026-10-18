@@ -181,12 +181,17 @@ pub async fn edit_supporter(
     let before_badges = user.get_badges().await;
     let before_style = user.filtered_name_style(now);
     let before_perks = user.perks(now);
+    let before_cipher = user.public_cipher();
 
     db.set_supporter_show_badges(&user.id, data.show_badges)
         .await?;
 
     let user = db.fetch_user(&user.id).await?;
     user.publish_perks_update_if_changed(db, before_badges, before_style, before_perks)
+        .await;
+    // The Cipher badge follows the same preference; the stored copy does
+    // not change, so it is re-published (or cleared) here
+    user.publish_public_cipher_if_changed(db, before_cipher)
         .await;
 
     Ok(Json(supporter_summary(&user).await))
@@ -195,8 +200,169 @@ pub async fn edit_supporter(
 #[cfg(test)]
 mod test {
     use crate::util::test::TestHarness;
+    use revolt_database::events::client::EventV1;
+    use revolt_database::{now_ms, CipherMembership};
+    use revolt_models::v0;
+    use revolt_payments::engine::sync_user_badge;
     use rocket::http::{ContentType, Status};
     use serde_json::json;
+
+    /// `(cipher carried, Cipher cleared)` of a UserUpdate about `user_id`
+    fn cipher_update(event: &EventV1, user_id: &str) -> Option<(Option<v0::UserCipher>, bool)> {
+        match event {
+            EventV1::UserUpdate {
+                id, data, clear, ..
+            } if id == user_id => {
+                Some((data.cipher.clone(), clear.contains(&v0::FieldsUser::Cipher)))
+            }
+            _ => None,
+        }
+    }
+
+    /// The user as their own session reads it
+    async fn fetched(
+        harness: &TestHarness,
+        session: &revolt_database::Session,
+        id: &str,
+    ) -> serde_json::Value {
+        let response =
+            TestHarness::with_session(session.clone(), harness.client.get(format!("/users/{id}")))
+                .await;
+        assert_eq!(response.status(), Status::Ok);
+        response.into_json().await.expect("user body")
+    }
+
+    async fn set_show_badges(
+        harness: &TestHarness,
+        session: &revolt_database::Session,
+        show: bool,
+    ) {
+        let response = TestHarness::with_session(
+            session.clone(),
+            harness
+                .client
+                .patch("/users/@me/supporter")
+                .header(ContentType::JSON)
+                .body(json!({ "show_badges": show }).to_string()),
+        )
+        .await;
+        assert_eq!(response.status(), Status::Ok);
+        let summary = response
+            .into_json::<serde_json::Value>()
+            .await
+            .expect("supporter summary");
+        // `show_badges` is left out of the summary when false
+        assert_eq!(summary["show_badges"].as_bool().unwrap_or(false), show);
+    }
+
+    /// "Show supporter badges on my profile" covers the Cipher badge: hidden
+    /// from every read and every event while off (the stored copy keeps
+    /// following the membership), shown again, current, when back on
+    #[test]
+    fn the_show_badges_toggle_hides_and_republishes_the_cipher_badge() {
+        crate::util::test::rt()
+            .block_on(the_show_badges_toggle_hides_and_republishes_the_cipher_badge_case())
+    }
+
+    async fn the_show_badges_toggle_hides_and_republishes_the_cipher_badge_case() {
+        let mut harness = TestHarness::new().await;
+        let (_, session, user) = harness.new_user().await;
+        let id = user.id.clone();
+        let t99 = v0::UserCipher {
+            number: 42,
+            tier: v0::CipherTier::T99,
+        };
+        let t299 = v0::UserCipher {
+            number: 42,
+            tier: v0::CipherTier::T299,
+        };
+
+        // A member: the badge is published
+        assert!(harness
+            .db
+            .insert_cipher_membership(&CipherMembership {
+                user_id: id.clone(),
+                number: 42,
+                tier: v0::CipherTier::T99,
+                prot_grant: 16_500,
+                orders: vec!["01JTESTCIPHERORDER00000001".to_string()],
+                disputed_orders: vec![],
+                granted_at: now_ms(),
+                revoked_at: None,
+                revoke_reason: None,
+                prot_posted_at: None,
+                version: 0,
+            })
+            .await
+            .unwrap());
+        sync_user_badge(&harness.db, &id).await.unwrap();
+        harness
+            .wait_for_event(&id, |e| {
+                cipher_update(e, &id) == Some((Some(t99.clone()), false))
+            })
+            .await;
+        assert_eq!(
+            fetched(&harness, &session, &id).await["cipher"]["number"],
+            42
+        );
+
+        // Badges off: one clear goes out and no read shows it
+        set_show_badges(&harness, &session, false).await;
+        harness
+            .wait_for_event(&id, |e| cipher_update(e, &id) == Some((None, true)))
+            .await;
+        assert!(fetched(&harness, &session, &id).await["cipher"].is_null());
+        assert_eq!(
+            harness.db.fetch_user(&id).await.unwrap().cipher,
+            Some(t99.clone()),
+            "the stored badge still mirrors the membership"
+        );
+
+        // The membership changes while hidden: the sync stores the new
+        // badge but publishes a clear, never the badge
+        let m = harness
+            .db
+            .fetch_cipher_membership(&id)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut upgraded = m.clone();
+        upgraded.tier = v0::CipherTier::T299;
+        upgraded.prot_grant = 75_000;
+        assert!(harness
+            .db
+            .update_cipher_membership_if_version(&upgraded, m.version)
+            .await
+            .unwrap());
+        sync_user_badge(&harness.db, &id).await.unwrap();
+        harness
+            .wait_for_event(&id, |e| cipher_update(e, &id) == Some((None, true)))
+            .await;
+        assert_eq!(
+            harness.db.fetch_user(&id).await.unwrap().cipher,
+            Some(t299.clone())
+        );
+        assert!(fetched(&harness, &session, &id).await["cipher"].is_null());
+
+        // Badges on: the current badge is published again
+        set_show_badges(&harness, &session, true).await;
+        harness
+            .wait_for_event(&id, |e| {
+                cipher_update(e, &id) == Some((Some(t299.clone()), false))
+            })
+            .await;
+        let shown = fetched(&harness, &session, &id).await;
+        assert_eq!(shown["cipher"]["number"], 42);
+        assert_eq!(
+            serde_json::from_value::<v0::UserCipher>(shown["cipher"].clone()).unwrap(),
+            t299
+        );
+
+        // Nothing carried a badge while it was hidden: every event pulled
+        // in before the last one is buffered (FIFO), and none carries one
+        harness
+            .assert_no_buffered_event(&id, |e| matches!(cipher_update(e, &id), Some((Some(_), _))));
+    }
 
     #[test]
     fn supporter_code_not_found_when_kofi_unconfigured() {
