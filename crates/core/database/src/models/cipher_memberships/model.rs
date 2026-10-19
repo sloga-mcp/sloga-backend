@@ -12,7 +12,9 @@ auto_derived!(
     }
 
     /// A user's Cipher membership. A revoked row is kept, and its number
-    /// stays retired; the row is deleted only with the account.
+    /// stays retired; the row is deleted with the account, or when a refund
+    /// within the release window puts its number back in the pool (the
+    /// unique `number` index would otherwise block the number's reuse).
     /// Timestamps are epoch milliseconds.
     pub struct CipherMembership {
         /// Id of the member

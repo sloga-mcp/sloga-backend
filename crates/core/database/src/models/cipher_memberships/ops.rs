@@ -34,6 +34,19 @@ pub trait AbstractCipherMemberships: Sync + Send {
 
     /// Account-deletion cascade: delete a user's membership (Ok if absent)
     async fn delete_cipher_membership(&self, user_id: &str) -> Result<()>;
+
+    /// Compare-and-swap delete: remove the user's row WHERE
+    /// `version == expected` (`expected == 0` also matches a row stored
+    /// without a version field), under the same rule as
+    /// `update_cipher_membership_if_version`. Ok(true) if deleted; Ok(false)
+    /// if the version moved or there is no row, and the caller re-reads.
+    /// Used when a refunded purchase's number goes back to the pool, so a
+    /// row the user replaced meanwhile (a new purchase) is never deleted.
+    async fn delete_cipher_membership_if_version(
+        &self,
+        user_id: &str,
+        expected: u64,
+    ) -> Result<bool>;
 }
 
 #[cfg(test)]
@@ -318,6 +331,84 @@ mod tests {
                     .unwrap()
                     .map(|stored| (stored.number, stored.version)),
                 Some((10, 0))
+            );
+        });
+    }
+
+    #[tokio::test]
+    async fn compare_and_swap_delete_needs_the_version_read() {
+        database_test!(|db| async move {
+            create_cipher_membership_indexes(&db).await;
+
+            let user_id = "01USERI0000000000000000000";
+            let read = membership(user_id, 11);
+            assert!(db.insert_cipher_membership(&read).await.unwrap());
+
+            // The row moved on (e.g. the user bought again): a delete built
+            // from the old read is refused and the row is unchanged
+            let mut moved = read.clone();
+            moved.orders = vec!["order-repurchase".to_string()];
+            assert!(db
+                .update_cipher_membership_if_version(&moved, 0)
+                .await
+                .unwrap());
+            assert!(!db
+                .delete_cipher_membership_if_version(user_id, 0)
+                .await
+                .unwrap());
+            assert!(!db
+                .delete_cipher_membership_if_version(user_id, 2)
+                .await
+                .unwrap());
+            assert_eq!(
+                db.fetch_cipher_membership(user_id)
+                    .await
+                    .unwrap()
+                    .map(|stored| stored.orders),
+                Some(vec!["order-repurchase".to_string()])
+            );
+
+            // The version just read deletes it; the number is free again
+            assert!(db
+                .delete_cipher_membership_if_version(user_id, 1)
+                .await
+                .unwrap());
+            assert_eq!(db.fetch_cipher_membership(user_id).await.unwrap(), None);
+            assert!(db
+                .insert_cipher_membership(&membership("01USERJ0000000000000000000", 11))
+                .await
+                .unwrap());
+
+            // A missing row is false, not an error
+            assert!(!db
+                .delete_cipher_membership_if_version(user_id, 1)
+                .await
+                .unwrap());
+
+            // Expected 0 also matches a row stored without a version
+            let legacy = membership("01USERK0000000000000000000", 12);
+            match &db {
+                crate::Database::Reference(_) => {
+                    assert!(db.insert_cipher_membership(&legacy).await.unwrap());
+                }
+                #[cfg(feature = "mongodb")]
+                crate::Database::MongoDb(mongo) => {
+                    let mut raw = bson::to_document(&legacy).unwrap();
+                    raw.remove("version");
+                    mongo
+                        .col::<bson::Document>("cipher_memberships")
+                        .insert_one(raw)
+                        .await
+                        .unwrap();
+                }
+            }
+            assert!(db
+                .delete_cipher_membership_if_version(&legacy.user_id, 0)
+                .await
+                .unwrap());
+            assert_eq!(
+                db.fetch_cipher_membership(&legacy.user_id).await.unwrap(),
+                None
             );
         });
     }

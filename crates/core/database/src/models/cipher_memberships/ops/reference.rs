@@ -69,4 +69,22 @@ impl AbstractCipherMemberships for ReferenceDb {
         memberships.remove(user_id);
         Ok(())
     }
+
+    async fn delete_cipher_membership_if_version(
+        &self,
+        user_id: &str,
+        expected: u64,
+    ) -> Result<bool> {
+        // The check and the removal run while the map mutex is held
+        let mut memberships = self.cipher_memberships.lock().await;
+        if memberships
+            .get(user_id)
+            .is_none_or(|row| row.version != expected)
+        {
+            return Ok(false);
+        }
+
+        memberships.remove(user_id);
+        Ok(true)
+    }
 }

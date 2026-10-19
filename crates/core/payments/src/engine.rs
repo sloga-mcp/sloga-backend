@@ -33,6 +33,14 @@
 //!   event that never arrives cannot strand it
 //! - a refund or lost dispute recorded before fulfilment voids the order
 //!   instead of applying it: no number is claimed and no badge published
+//! - a full refund made within [`REFUND_RELEASE_WINDOW_MS`] (plus
+//!   [`REFUND_GRACE_MS`]) of the refunded order's payment undoes it: the
+//!   latest upgrade is rolled back to its `from` tier (the number is kept),
+//!   a new purchase deletes the membership and puts its number back in the
+//!   pool. A release is recorded on the number row before anything else,
+//!   so any later reversal of the order or the reconcile sweep finishes
+//!   it. Any other refund, and every lost dispute, revokes the membership
+//!   and retires the number (see `window_refund_plan` for the exact rule)
 
 use revolt_database::{
     CipherMembership, CipherRevokeReason, Database, FieldsUser, OrderState, PartialUser,
@@ -56,6 +64,35 @@ pub const LEASE_MS: i64 = 120_000;
 
 /// Lifetime of a Stripe Checkout Session, from the order's creation
 pub const SESSION_TTL_SECS: i64 = 35 * 60;
+
+/// The buyer's no-questions refund period (14 days, the Terms): a FULL
+/// refund of an order made within this long (plus [`REFUND_GRACE_MS`]) of
+/// its payment is undone rather than punished. A refunded upgrade rolls the
+/// membership back to its previous tier; a refunded new purchase puts its
+/// Cipher number back in the pool. Measured from the refunded order's own
+/// `paid_at` to when the refund was made ([`RefundFacts::refunded_at_ms`],
+/// Stripe's `created` of the refund event, so a late or re-driven delivery
+/// is judged by when the owner refunded, not when we processed it),
+/// inclusive. A later or partial refund, or any lost dispute, revokes the
+/// membership and retires the number for good.
+pub const REFUND_RELEASE_WINDOW_MS: i64 = 14 * 24 * 3600 * 1000;
+
+/// Operator grace on top of [`REFUND_RELEASE_WINDOW_MS`] (3 days). The
+/// owner's runbook: a refund request received within the 14 days is
+/// refunded from the Stripe Dashboard within 3 days of receiving it, so a
+/// request made on day 14 still counts as made in time.
+pub const REFUND_GRACE_MS: i64 = 3 * 24 * 3600 * 1000;
+
+/// What the provider said about a refund (a Refund reversal only)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RefundFacts {
+    /// When the refund was made (epoch ms): the refund event's signed
+    /// `created`, never later than the time it is processed
+    pub refunded_at_ms: i64,
+    /// Whether the charge is now refunded in full; only a full refund is
+    /// undone (a partial one revokes and retires)
+    pub full: bool,
+}
 
 /// Bounded retries of a membership compare-and-swap
 const MEMBERSHIP_RETRIES: usize = 5;
@@ -850,7 +887,7 @@ async fn fulfil_locked(
     // A recorded reversal names no dispute: a lost dispute's id already
     // left `open_disputes` when it was recorded
     if let Some(pending) = leased.order.reversal_pending.clone() {
-        reverse_locked(db, leased, pending_kind(&pending), None, now_ms).await?;
+        reverse_locked(db, leased, pending_kind(&pending), None, None, now_ms).await?;
     }
 
     Ok(FulfilOutcome::Fulfilled)
@@ -907,7 +944,7 @@ async fn finish_fulfilled(db: &Database, leased: &mut Leased, now_ms: i64) -> Re
 
     // As in fulfil: a recorded reversal names no dispute
     if let Some(pending) = leased.order.reversal_pending.clone() {
-        reverse_locked(db, leased, pending_kind(&pending), None, now_ms).await?;
+        reverse_locked(db, leased, pending_kind(&pending), None, None, now_ms).await?;
     }
 
     Ok(())
@@ -1306,7 +1343,10 @@ async fn set_dispute_listing(
 
 /// Apply a refund, or a lost dispute recorded on the order earlier, to an
 /// order. Acts on a membership only when the order is Fulfilled and listed
-/// in that membership.
+/// in that membership. A full refund made inside the release window rolls
+/// an upgrade back or releases a new purchase's number instead of revoking
+/// (see `window_refund_plan`); `refund` is what the provider said about the
+/// refund (None: nothing known, so it revokes and retires as before).
 ///
 /// An opened or won dispute is refused (`InternalError`): it must name its
 /// dispute, so it goes through [`reverse_dispute`].
@@ -1316,6 +1356,7 @@ pub async fn reverse_order(
     s: &PaymentsSettings,
     order_id: &str,
     kind: ReverseKind,
+    refund: Option<RefundFacts>,
     now_ms: i64,
 ) -> Result<ReverseOutcome> {
     // Reversals never call Stripe or read the sale settings
@@ -1324,7 +1365,7 @@ pub async fn reverse_order(
     let Some(mut leased) = acquire(db, order_id, now_ms).await? else {
         return Ok(ReverseOutcome::Busy);
     };
-    let outcome = reverse_locked(db, &mut leased, kind, None, now_ms).await;
+    let outcome = reverse_locked(db, &mut leased, kind, None, refund, now_ms).await;
     release(db, &leased).await;
     outcome
 }
@@ -1346,7 +1387,7 @@ pub async fn reverse_dispute(
         return Ok(ReverseOutcome::Busy);
     };
     let outcome = match current_dispute_kind(stripe, s, &leased.order, dispute_id).await {
-        Ok(kind) => reverse_locked(db, &mut leased, kind, Some(dispute_id), now_ms).await,
+        Ok(kind) => reverse_locked(db, &mut leased, kind, Some(dispute_id), None, now_ms).await,
         Err(err) => Err(err),
     };
     release(db, &leased).await;
@@ -1376,7 +1417,7 @@ async fn recheck_open_disputes(
             break;
         }
         let kind = current_dispute_kind(stripe, s, &leased.order, &dispute_id).await?;
-        reverse_locked(db, leased, kind, Some(&dispute_id), now_ms).await?;
+        reverse_locked(db, leased, kind, Some(&dispute_id), None, now_ms).await?;
     }
     Ok(())
 }
@@ -1480,12 +1521,14 @@ async fn current_dispute_kind(
 /// (fulfil applies a recorded reversal this way; leases are not re-entrant).
 /// `dispute` names the dispute an opened, won or lost status is about; an
 /// opened or won one without it is refused, so a dispute is never opened
-/// or closed by anything but its own id.
+/// or closed by anything but its own id. `refund` is only read for a
+/// Refund.
 async fn reverse_locked(
     db: &Database,
     leased: &mut Leased,
     kind: ReverseKind,
     dispute: Option<&str>,
+    refund: Option<RefundFacts>,
     now_ms: i64,
 ) -> Result<ReverseOutcome> {
     if dispute.is_none() && matches!(kind, ReverseKind::DisputeOpened | ReverseKind::DisputeWon) {
@@ -1506,7 +1549,7 @@ async fn reverse_locked(
         | OrderState::SessionFailed
         | OrderState::Expired
         | OrderState::Paid => record_before_fulfilment(db, leased, kind, dispute).await,
-        OrderState::Fulfilled => reverse_fulfilled(db, leased, kind, dispute, now_ms).await,
+        OrderState::Fulfilled => reverse_fulfilled(db, leased, kind, dispute, refund, now_ms).await,
     }
 }
 
@@ -1561,8 +1604,20 @@ async fn reverse_fulfilled(
     leased: &mut Leased,
     kind: ReverseKind,
     dispute: Option<&str>,
+    refund: Option<RefundFacts>,
     now_ms: i64,
 ) -> Result<ReverseOutcome> {
+    // A release a refund decided earlier and did not finish (a crash, a
+    // failed write) is finished first, whatever this reversal is: a lost
+    // dispute or anything else arriving now must not leave the number held
+    // by a revoked row
+    // Boxed (here and below): the release adds several awaits to every
+    // reversal, and inline they deepen the poll stack enough to overflow
+    // a 2 MiB thread in debug builds
+    if let Some(outcome) = Box::pin(finish_number_release_locked(db, leased, now_ms)).await? {
+        return Ok(outcome);
+    }
+
     // The order records the dispute first: if the membership write below
     // fails, the event is retried, and a redelivered completion re-adds the
     // listing from the order (it never clears one)
@@ -1576,6 +1631,17 @@ async fn reverse_fulfilled(
         return no_membership_to_reverse(db, leased).await;
     };
     let order_id = leased.order.id.clone();
+
+    // A full refund inside the window is undone instead (rolled back, or
+    // the number released); None falls through to revoke + retire
+    if kind == ReverseKind::Refund {
+        if let Some(outcome) =
+            Box::pin(refund_within_window(db, leased, &user_id, refund, now_ms)).await?
+        {
+            return Ok(outcome);
+        }
+    }
+
     // Another dispute on the same payment can still be open after this one
     // closes: the order stays listed until the last one does. A lost
     // dispute being applied now no longer counts (it revokes below).
@@ -1587,13 +1653,14 @@ async fn reverse_fulfilled(
     let mut settled = false;
     for _ in 0..MEMBERSHIP_RETRIES {
         let Some(m) = db.fetch_cipher_membership(&user_id).await? else {
-            return no_membership_to_reverse(db, leased).await;
+            return unlisted_reversal(db, leased, kind, &user_id, now_ms).await;
         };
         if !m.orders.contains(&order_id) {
             log::warn!(
-                "payments: {kind:?} on order {order_id}, which is not part of the membership; ignored"
+                "payments: {kind:?} on order {order_id}, which is not part of the membership; \
+                 no membership change"
             );
-            return no_membership_to_reverse(db, leased).await;
+            return unlisted_reversal(db, leased, kind, &user_id, now_ms).await;
         }
 
         let mut next = m.clone();
@@ -1654,6 +1721,381 @@ async fn no_membership_to_reverse(db: &Database, leased: &mut Leased) -> Result<
         write(db, leased, |o| o.reversal_pending = None).await?;
     }
     Ok(ReverseOutcome::NoOp)
+}
+
+/// A refund or lost dispute of a Fulfilled order of a live buyer whose
+/// membership does not list the order: the membership is gone (a refund
+/// inside the window deleted it to release its number), or holds the order
+/// no more (an upgrade rolled back by its refund, or a row replaced by a
+/// new purchase after a revoke). No membership changes, but the money went
+/// back, so the order is recorded Refunded; this is also how a reversal
+/// that stopped after its membership write (a crash, a failed write) is
+/// finished when the event is delivered again. Any other kind only clears
+/// a recorded reversal.
+async fn unlisted_reversal(
+    db: &Database,
+    leased: &mut Leased,
+    kind: ReverseKind,
+    user_id: &str,
+    now_ms: i64,
+) -> Result<ReverseOutcome> {
+    if !matches!(kind, ReverseKind::Refund | ReverseKind::DisputeLost) {
+        return no_membership_to_reverse(db, leased).await;
+    }
+
+    sync_user_badge(db, user_id).await?;
+    write(db, leased, move |o| {
+        o.state = OrderState::Refunded;
+        o.reversed_at = Some(now_ms);
+        o.reversal_pending = None;
+    })
+    .await?;
+    log::info!(
+        "payments: order {} reversed ({kind:?}); no membership lists it",
+        leased.order.id
+    );
+    Ok(ReverseOutcome::NoOp)
+}
+
+/// What a full refund inside the release window does instead of revoking
+/// the membership
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WindowRefund {
+    /// Roll the membership back to the upgrade's `from` tier
+    Downgrade { from: CipherTier },
+    /// Delete the membership and put its number back in the pool
+    Release,
+    /// An upgrade with another one stacked on top: the membership is left
+    /// as it is and only the order is recorded Refunded (manual handling)
+    RefundOnly,
+}
+
+/// The refund rule (owner decision 2026-10-18; the Terms promise a full
+/// refund within 14 days). For a Refund of `order`, a Fulfilled order
+/// listed in membership `m`, with what the provider said about it:
+///
+/// - Nothing known about the refund, or a partial refund: None, i.e.
+///   revoke + retire as before (a partial refund is logged).
+/// - `prot_posted_at` is set (Prot was credited), or the order has a
+///   dispute on record: None. Refunds after Prot is credited are handled
+///   by hand.
+/// - The refund was made (Stripe's `created` of the refund event, never
+///   later than now) more than [`REFUND_RELEASE_WINDOW_MS`] plus
+///   [`REFUND_GRACE_MS`] after the order was paid: None.
+/// - A `CipherUpgrade { from, to }` on an active membership that is its
+///   latest upgrade (last in `orders`, and the tier is still `to`):
+///   [`WindowRefund::Downgrade`] (tier and Prot back to `from`, the order
+///   leaves the membership, the number is kept). An older upgrade with
+///   another stacked on top: [`WindowRefund::RefundOnly`].
+/// - The `CipherNew` order (the one holding the membership's number), with
+///   no dispute listed on the membership, and the membership active or
+///   revoked by a refund (never one revoked for a lost dispute or by
+///   staff): [`WindowRefund::Release`] (the membership is deleted, upgrades
+///   included, and the number goes back to the pool).
+///
+/// A lost dispute never comes here: it always revokes and retires.
+async fn window_refund_plan(
+    db: &Database,
+    order: &PaymentOrder,
+    m: &CipherMembership,
+    refund: Option<RefundFacts>,
+) -> Result<Option<WindowRefund>> {
+    if !m.orders.contains(&order.id) {
+        return Ok(None);
+    }
+    let Some(refund) = refund else {
+        return Ok(None);
+    };
+    if !refund.full {
+        log::warn!(
+            "payments: order {} was refunded in part; revoking the membership of {} and \
+             retiring number {} (only a full refund is undone)",
+            order.id,
+            m.user_id,
+            m.number
+        );
+        return Ok(None);
+    }
+    if let Some(posted) = m.prot_posted_at {
+        log::warn!(
+            "payments: order {} is refunded, but Prot was credited to the membership of {} at \
+             {posted}; revoking and retiring number {} (handle the refund by hand)",
+            order.id,
+            m.user_id,
+            m.number
+        );
+        return Ok(None);
+    }
+    if is_disputed(order) {
+        return Ok(None);
+    }
+    let Some(paid_at) = order.paid_at else {
+        log::warn!(
+            "payments: fulfilled order {} has no paid_at; its refund revokes",
+            order.id
+        );
+        return Ok(None);
+    };
+    if refund.refunded_at_ms.saturating_sub(paid_at) > REFUND_RELEASE_WINDOW_MS + REFUND_GRACE_MS {
+        return Ok(None);
+    }
+
+    match order.sku {
+        Sku::CipherUpgrade { to, from } => {
+            if !m.is_active() {
+                return Ok(None);
+            }
+            if m.tier != to || m.orders.last() != Some(&order.id) {
+                return Ok(Some(WindowRefund::RefundOnly));
+            }
+            Ok(Some(WindowRefund::Downgrade { from }))
+        }
+        Sku::CipherNew { .. } => {
+            let revoked_by_refund = m.revoke_reason == Some(CipherRevokeReason::Refund);
+            // Revoked for a lost dispute or by staff: the number stays
+            // retired
+            if !m.disputed_orders.is_empty() || (!m.is_active() && !revoked_by_refund) {
+                return Ok(None);
+            }
+            match db.fetch_cipher_number_by_order(&order.id).await? {
+                Some(number) if number == m.number => Ok(Some(WindowRefund::Release)),
+                held => {
+                    log::error!(
+                        "payments: order {} holds number {held:?}, but its membership has {}; \
+                         not releasing it",
+                        order.id,
+                        m.number
+                    );
+                    Ok(None)
+                }
+            }
+        }
+    }
+}
+
+/// Record the leased order Refunded (state, `reversed_at`, no reversal
+/// pending)
+async fn mark_refunded(db: &Database, leased: &mut Leased, now_ms: i64) -> Result<()> {
+    write(db, leased, move |o| {
+        o.state = OrderState::Refunded;
+        o.reversed_at = Some(now_ms);
+        o.reversal_pending = None;
+    })
+    .await
+}
+
+/// A full Refund inside the window ([`window_refund_plan`]), applied in
+/// full: Some(outcome), or None when the rule says revoke + retire (the
+/// caller does that). Every membership write is a compare-and-swap
+/// re-checked against the plan on each read.
+async fn refund_within_window(
+    db: &Database,
+    leased: &mut Leased,
+    user_id: &str,
+    refund: Option<RefundFacts>,
+    now_ms: i64,
+) -> Result<Option<ReverseOutcome>> {
+    let order_id = leased.order.id.clone();
+    for _ in 0..MEMBERSHIP_RETRIES {
+        let Some(m) = db.fetch_cipher_membership(user_id).await? else {
+            return Ok(None);
+        };
+        match window_refund_plan(db, &leased.order, &m, refund).await? {
+            None => return Ok(None),
+            Some(WindowRefund::RefundOnly) => {
+                log::error!(
+                    "payments: upgrade order {order_id} (payment {:?}) was refunded within the \
+                     window, but another upgrade is stacked on it in the membership of \
+                     {user_id} (orders {:?}); the membership is left as it is and the order \
+                     recorded Refunded; handle by hand",
+                    leased.order.payment_intent_id,
+                    m.orders
+                );
+                mark_refunded(db, leased, now_ms).await?;
+                return Ok(Some(ReverseOutcome::NoOp));
+            }
+            Some(WindowRefund::Release) => {
+                // The decision is recorded on the number row first: from
+                // here on, any reversal of this order or the reconcile sweep
+                // finishes the release, whatever happens to the membership
+                if !db.mark_cipher_number_release(&order_id, now_ms).await? {
+                    log::error!(
+                        "payments: order {order_id} lost its number while being refunded; not \
+                         releasing anything"
+                    );
+                    return Ok(None);
+                }
+                return Box::pin(finish_number_release_locked(db, leased, now_ms)).await;
+            }
+            Some(WindowRefund::Downgrade { from }) => {
+                // One write: a retry after it finds the order unlisted and
+                // only records it Refunded (`unlisted_reversal`)
+                let mut next = m.clone();
+                next.tier = from;
+                next.prot_grant = catalog::tier_prot(from);
+                next.orders.retain(|id| *id != order_id);
+                next.disputed_orders.retain(|id| *id != order_id);
+                if !db
+                    .update_cipher_membership_if_version(&next, m.version)
+                    .await?
+                {
+                    continue;
+                }
+
+                sync_user_badge(db, user_id).await?;
+                mark_refunded(db, leased, now_ms).await?;
+                log::info!(
+                    "payments: upgrade order {order_id} refunded within the window; the \
+                     membership of {user_id} is back to {from:?} and keeps number {}",
+                    m.number
+                );
+                return Ok(Some(ReverseOutcome::Applied));
+            }
+        }
+    }
+
+    log::error!(
+        "payments: refund of order {order_id} did not settle after {MEMBERSHIP_RETRIES} tries"
+    );
+    Err(create_error!(InternalError))
+}
+
+/// Finish the number release a refund decided for the leased order (its
+/// number row carries `release_pending_at`), if it did: None when there is
+/// nothing to finish. The steps after the decision run in this order, each
+/// idempotent, so stopping after any of them and running again (any
+/// reversal of the order, or the reconcile sweep) finishes the job:
+///
+/// 1. revoke the membership that lists the order (reason Refund) and clear
+///    the badge;
+/// 2. delete that membership, compare-and-swap on the version read, so a
+///    row the buyer replaced meanwhile (a new purchase) is never deleted;
+/// 3. release the number (`release_cipher_number` unsets `order_id` and the
+///    mark together, and touches only this order's row);
+/// 4. record the order Refunded (if it is still Fulfilled).
+///
+/// The membership goes before the number, so a number is never free while
+/// a membership row still holds it (the unique `number` index).
+async fn finish_number_release_locked(
+    db: &Database,
+    leased: &mut Leased,
+    now_ms: i64,
+) -> Result<Option<ReverseOutcome>> {
+    if !matches!(leased.order.sku, Sku::CipherNew { .. }) {
+        return Ok(None);
+    }
+    let order_id = leased.order.id.clone();
+    let Some(row) = db.fetch_cipher_number_row_by_order(&order_id).await? else {
+        return Ok(None);
+    };
+    if row.release_pending_at.is_none() {
+        return Ok(None);
+    }
+
+    // Unlinked by an account deletion: the membership went with it
+    if let Some(user_id) = leased.order.user_id.clone() {
+        let mut settled = false;
+        for _ in 0..MEMBERSHIP_RETRIES {
+            let Some(m) = db.fetch_cipher_membership(&user_id).await? else {
+                settled = true;
+                break;
+            };
+            if !m.orders.contains(&order_id) {
+                // Replaced by a new purchase: nothing of this order's left
+                settled = true;
+                break;
+            }
+
+            if m.is_active() {
+                // 1. Revoke; the badge goes at once
+                let mut next = m.clone();
+                next.revoked_at = Some(now_ms);
+                next.revoke_reason = Some(CipherRevokeReason::Refund);
+                if db
+                    .update_cipher_membership_if_version(&next, m.version)
+                    .await?
+                {
+                    sync_user_badge(db, &user_id).await?;
+                }
+                continue;
+            }
+
+            // 2. Delete the row that holds the number
+            if db
+                .delete_cipher_membership_if_version(&user_id, m.version)
+                .await?
+            {
+                warn_unrefunded_upgrades(db, &m, &order_id).await;
+                settled = true;
+                break;
+            }
+        }
+
+        if !settled {
+            log::error!(
+                "payments: release of the number of order {order_id} did not settle after \
+                 {MEMBERSHIP_RETRIES} tries"
+            );
+            return Err(create_error!(InternalError));
+        }
+        sync_user_badge(db, &user_id).await?;
+    }
+
+    // 3. The number back to the pool
+    let released = db.release_cipher_number(&order_id).await?;
+    log::info!(
+        "payments: order {order_id} refunded within the window; number {} is back in the pool \
+         (released now: {released})",
+        row.number
+    );
+
+    // 4. The order
+    if leased.order.state == OrderState::Fulfilled {
+        mark_refunded(db, leased, now_ms).await?;
+    }
+    Ok(Some(ReverseOutcome::Applied))
+}
+
+/// A membership deleted by a release can still list upgrades nobody
+/// refunded: the buyer paid for them and lost them with the number. Logged
+/// at warn level with their payments, so the owner refunds them.
+async fn warn_unrefunded_upgrades(db: &Database, m: &CipherMembership, released_by: &str) {
+    let mut unrefunded = Vec::new();
+    for id in m.orders.iter().filter(|id| *id != released_by) {
+        match db.fetch_payment_order(id).await {
+            Ok(Some(order)) if order.state != OrderState::Refunded => unrefunded.push(format!(
+                "{} (payment {:?})",
+                order.id, order.payment_intent_id
+            )),
+            Ok(_) => {}
+            Err(err) => unrefunded.push(format!("{id} (could not be read: {err:?})")),
+        }
+    }
+    if !unrefunded.is_empty() {
+        log::warn!(
+            "payments: the membership of {} was deleted by the refund of order {released_by}, \
+             but these upgrades of it are not refunded; refund them: {}",
+            m.user_id,
+            unrefunded.join(", ")
+        );
+    }
+}
+
+/// The reconcile sweep's step for a number whose release was decided but
+/// not finished ([`finish_number_release_locked`]), under the order's
+/// lease. `Applied` when finished now, `NoOp` when there was nothing to
+/// finish, `Busy` when another worker holds the order.
+pub async fn finish_number_release(
+    db: &Database,
+    order_id: &str,
+    now_ms: i64,
+) -> Result<ReverseOutcome> {
+    let Some(mut leased) = acquire(db, order_id, now_ms).await? else {
+        return Ok(ReverseOutcome::Busy);
+    };
+    let outcome = finish_number_release_locked(db, &mut leased, now_ms).await;
+    release(db, &leased).await;
+    Ok(outcome?.unwrap_or(ReverseOutcome::NoOp))
 }
 
 // ---------------------------------------------------------------------------
@@ -1899,12 +2341,17 @@ mod tests {
 
     use super::*;
     use crate::catalog::CIPHER_CAP_MAX;
+    use crate::dispatch::reconcile;
     use crate::stripe::{Dispute, MockStripe, PaymentIntent};
 
     const NOW: i64 = 1_760_000_000_000;
     /// After a dead worker's lease has run out
     const LATER: i64 = NOW + LEASE_MS + 1;
     const MINUTE: i64 = 60_000;
+    const DAY: i64 = 24 * 60 * MINUTE;
+    /// The first moment a refund of an order paid at NOW is past the
+    /// release window
+    const AFTER_WINDOW: i64 = NOW + REFUND_RELEASE_WINDOW_MS + REFUND_GRACE_MS + 1;
 
     static NEXT_DB: AtomicU64 = AtomicU64::new(0);
 
@@ -2105,7 +2552,7 @@ mod tests {
         let Some(mut leased) = acquire(db, order_id, at).await? else {
             return Ok(ReverseOutcome::Busy);
         };
-        let outcome = reverse_locked(db, &mut leased, kind, Some(dispute_id), at).await;
+        let outcome = reverse_locked(db, &mut leased, kind, Some(dispute_id), None, at).await;
         release(db, &leased).await;
         outcome
     }
@@ -2265,9 +2712,17 @@ mod tests {
             FulfilOutcome::LeaseHeld
         );
         assert_eq!(
-            reverse_order(&db, &stripe, &s, &pending.id, ReverseKind::Refund, NOW + 1)
-                .await
-                .unwrap(),
+            reverse_order(
+                &db,
+                &stripe,
+                &s,
+                &pending.id,
+                ReverseKind::Refund,
+                None,
+                NOW + 1
+            )
+            .await
+            .unwrap(),
             ReverseOutcome::Busy
         );
         let untouched = order(&db, &pending.id).await;
@@ -2578,9 +3033,17 @@ mod tests {
 
         // Our own refund comes back as charge.refunded on the voided order
         assert_eq!(
-            reverse_order(&db, &stripe, &s, &stale.id, ReverseKind::Refund, later + 1)
-                .await
-                .unwrap(),
+            reverse_order(
+                &db,
+                &stripe,
+                &s,
+                &stale.id,
+                ReverseKind::Refund,
+                None,
+                later + 1
+            )
+            .await
+            .unwrap(),
             ReverseOutcome::NoOp
         );
         let m = membership(&db, "u1").await;
@@ -2691,9 +3154,17 @@ mod tests {
         // The owner refunds at Stripe before the completion is handled
         stripe.create_refund("pi_1", "owner-refund").await.unwrap();
         assert_eq!(
-            reverse_order(&db, &stripe, &s, &pending.id, ReverseKind::Refund, NOW)
-                .await
-                .unwrap(),
+            reverse_order(
+                &db,
+                &stripe,
+                &s,
+                &pending.id,
+                ReverseKind::Refund,
+                None,
+                NOW
+            )
+            .await
+            .unwrap(),
             ReverseOutcome::RecordedPending
         );
         let recorded = order(&db, &pending.id).await;
@@ -2760,9 +3231,17 @@ mod tests {
         // A partial refund at Stripe (the mock keeps no partial refunds, so
         // only the event is seen): the rest is still with us
         assert_eq!(
-            reverse_order(&db, &stripe, &s, &pending.id, ReverseKind::Refund, NOW)
-                .await
-                .unwrap(),
+            reverse_order(
+                &db,
+                &stripe,
+                &s,
+                &pending.id,
+                ReverseKind::Refund,
+                None,
+                NOW
+            )
+            .await
+            .unwrap(),
             ReverseOutcome::RecordedPending
         );
         assert_eq!(
@@ -2804,7 +3283,7 @@ mod tests {
         // completion was handled
         stripe.create_refund("pi_b", "owner-refund").await.unwrap();
         assert_eq!(
-            reverse_order(&db, &stripe, &s, &b.id, ReverseKind::Refund, NOW)
+            reverse_order(&db, &stripe, &s, &b.id, ReverseKind::Refund, None, NOW)
                 .await
                 .unwrap(),
             ReverseOutcome::RecordedPending
@@ -2856,7 +3335,7 @@ mod tests {
         // A refund recorded, then the dispute lost: the lost dispute wins
         for kind in [ReverseKind::Refund, ReverseKind::DisputeLost] {
             assert_eq!(
-                reverse_order(&db, &stripe, &s, &b.id, kind, NOW)
+                reverse_order(&db, &stripe, &s, &b.id, kind, None, NOW)
                     .await
                     .unwrap(),
                 ReverseOutcome::RecordedPending
@@ -3457,7 +3936,7 @@ mod tests {
         // Nothing can close (or open) a dispute without naming it
         for kind in [ReverseKind::DisputeWon, ReverseKind::DisputeOpened] {
             assert!(matches!(
-                error_type(reverse_order(&db, &stripe, &s, &bought.id, kind, NOW + 2).await),
+                error_type(reverse_order(&db, &stripe, &s, &bought.id, kind, None, NOW + 2).await),
                 ErrorType::InternalError
             ));
         }
@@ -3730,9 +4209,17 @@ mod tests {
         assert_eq!(order(&db, &pending.id).await.state, OrderState::Expired);
 
         assert_eq!(
-            reverse_order(&db, &stripe, &s, &pending.id, ReverseKind::Refund, NOW + 2)
-                .await
-                .unwrap(),
+            reverse_order(
+                &db,
+                &stripe,
+                &s,
+                &pending.id,
+                ReverseKind::Refund,
+                None,
+                NOW + 2
+            )
+            .await
+            .unwrap(),
             ReverseOutcome::RecordedPending
         );
         assert_eq!(
@@ -4033,16 +4520,34 @@ mod tests {
 
         let first = buy(&db, &stripe, &s, "u1", CipherTier::T99, "pi_1", NOW).await;
         buy(&db, &stripe, &s, "u2", CipherTier::T99, "pi_2", NOW).await;
+        // Refunded after the release window: revoked, number retired
         assert_eq!(
-            reverse_order(&db, &stripe, &s, &first.id, ReverseKind::Refund, NOW + 1)
-                .await
-                .unwrap(),
+            reverse_order(
+                &db,
+                &stripe,
+                &s,
+                &first.id,
+                ReverseKind::Refund,
+                full_refund(AFTER_WINDOW),
+                AFTER_WINDOW
+            )
+            .await
+            .unwrap(),
             ReverseOutcome::Applied
         );
         assert_eq!(badge(&db, "u1").await, None);
 
         // The revoked row does not block a new purchase, and is not an upgrade
-        let again = buy(&db, &stripe, &s, "u1", CipherTier::T149, "pi_3", NOW + 2).await;
+        let again = buy(
+            &db,
+            &stripe,
+            &s,
+            "u1",
+            CipherTier::T149,
+            "pi_3",
+            AFTER_WINDOW + 1,
+        )
+        .await;
         assert_eq!(
             again.sku,
             Sku::CipherNew {
@@ -4053,7 +4558,7 @@ mod tests {
         assert!(m.is_active());
         assert_eq!((m.number, m.tier), (3, CipherTier::T149));
         assert_eq!(m.orders, vec![again.id.clone()]);
-        assert_eq!(m.granted_at, NOW + 2);
+        assert_eq!(m.granted_at, AFTER_WINDOW + 1);
         assert_eq!(m.revoke_reason, None);
         assert_eq!(badge(&db, "u1").await, badge_of(3, CipherTier::T149));
 
@@ -4396,6 +4901,7 @@ mod tests {
                 &s,
                 &pending.id,
                 ReverseKind::Refund,
+                None,
                 NOW + 3 * MINUTE
             )
             .await
@@ -4854,13 +5360,31 @@ mod tests {
         insert_user(&db, "u2").await;
 
         let first = buy(&db, &stripe, &s, "u1", CipherTier::T99, "pi_1", NOW).await;
-        reverse_order(&db, &stripe, &s, &first.id, ReverseKind::Refund, NOW + 1)
-            .await
-            .unwrap();
-        buy(&db, &stripe, &s, "u2", CipherTier::T99, "pi_2", NOW + 2).await;
+        // After the release window: #1 is retired
+        reverse_order(
+            &db,
+            &stripe,
+            &s,
+            &first.id,
+            ReverseKind::Refund,
+            full_refund(AFTER_WINDOW),
+            AFTER_WINDOW,
+        )
+        .await
+        .unwrap();
+        buy(
+            &db,
+            &stripe,
+            &s,
+            "u2",
+            CipherTier::T99,
+            "pi_2",
+            AFTER_WINDOW + 1,
+        )
+        .await;
 
         assert_eq!(
-            cipher_stats(&db, &s, NOW + 3).await.unwrap(),
+            cipher_stats(&db, &s, AFTER_WINDOW + 2).await.unwrap(),
             CipherStats {
                 claimed: 2,
                 cap: CIPHER_CAP_MAX,
@@ -4869,6 +5393,924 @@ mod tests {
             }
         );
         assert_eq!(membership(&db, "u2").await.number, 2);
+        drop_db(&db).await;
+    }
+
+    // --- refunds inside the release window ------------------------------
+
+    async fn maybe_membership(db: &Database, user: &str) -> Option<CipherMembership> {
+        db.fetch_cipher_membership(user).await.unwrap()
+    }
+
+    /// A full refund made at `at`
+    fn full_refund(at: i64) -> Option<RefundFacts> {
+        Some(RefundFacts {
+            refunded_at_ms: at,
+            full: true,
+        })
+    }
+
+    /// Apply a refund made (`refunded_at_ms`) at `made`, processed at `now`
+    async fn refund_with(
+        db: &Database,
+        order_id: &str,
+        facts: Option<RefundFacts>,
+        now: i64,
+    ) -> ReverseOutcome {
+        reverse_order(
+            db,
+            &MockStripe::new(),
+            &settings(),
+            order_id,
+            ReverseKind::Refund,
+            facts,
+            now,
+        )
+        .await
+        .unwrap()
+    }
+
+    /// A full refund made and processed at `at`
+    async fn refund(db: &Database, order_id: &str, at: i64) -> ReverseOutcome {
+        refund_with(db, order_id, full_refund(at), at).await
+    }
+
+    /// A worker that decided the release at `at` and stopped right after
+    /// recording it (and, with `revoked`, after revoking the membership)
+    async fn release_decided(db: &Database, user: &str, order_id: &str, at: i64, revoked: bool) {
+        assert!(db.mark_cipher_number_release(order_id, at).await.unwrap());
+        if revoked {
+            change_membership(db, user, revoked_for_refund(at)).await;
+        }
+    }
+
+    /// Write the membership the way a worker that stopped mid-reversal left
+    /// it
+    async fn change_membership(
+        db: &Database,
+        user: &str,
+        change: impl FnOnce(&mut CipherMembership),
+    ) {
+        let mut m = membership(db, user).await;
+        let read = m.version;
+        change(&mut m);
+        assert!(db
+            .update_cipher_membership_if_version(&m, read)
+            .await
+            .unwrap());
+    }
+
+    fn revoked_for_refund(at: i64) -> impl FnOnce(&mut CipherMembership) {
+        move |m| {
+            m.revoked_at = Some(at);
+            m.revoke_reason = Some(CipherRevokeReason::Refund);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_refund_within_the_window_releases_the_number_to_the_next_buyer() {
+        let db = test_db().await;
+        let stripe = MockStripe::new();
+        let s = settings();
+        for user in ["u1", "u2", "u3"] {
+            insert_user(&db, user).await;
+        }
+
+        let first = buy(&db, &stripe, &s, "u1", CipherTier::T149, "pi_1", NOW).await;
+        buy(&db, &stripe, &s, "u2", CipherTier::T99, "pi_2", NOW).await;
+        assert_eq!(badge(&db, "u1").await, badge_of(1, CipherTier::T149));
+
+        // Day 3: the owner refunds u1 from the Dashboard
+        let at = NOW + 3 * DAY;
+        assert_eq!(refund(&db, &first.id, at).await, ReverseOutcome::Applied);
+
+        // The membership is gone (not kept revoked), the number is free
+        assert_eq!(maybe_membership(&db, "u1").await, None);
+        assert_eq!(
+            db.fetch_cipher_number_by_order(&first.id).await.unwrap(),
+            None
+        );
+        assert_eq!(badge(&db, "u1").await, None);
+        assert_eq!(cipher_me(&db, "u1", at).await.unwrap().membership, None);
+        assert_eq!(db.count_claimed_cipher_numbers().await.unwrap(), 1);
+        assert_eq!(
+            cipher_stats(&db, &s, at).await.unwrap().claimed,
+            1,
+            "the counter drops by one"
+        );
+        // The order is kept for the accounts
+        let refunded = order(&db, &first.id).await;
+        assert_eq!(refunded.state, OrderState::Refunded);
+        assert_eq!(refunded.reversed_at, Some(at));
+        // u2 is untouched
+        assert_eq!(badge(&db, "u2").await, badge_of(2, CipherTier::T99));
+
+        // A redelivery changes nothing
+        assert_eq!(refund(&db, &first.id, at + 1).await, ReverseOutcome::NoOp);
+
+        // A new buyer gets #1 (the unique number index allows it, because
+        // the refunded row is deleted, not kept revoked)
+        let third = buy(&db, &stripe, &s, "u3", CipherTier::T99, "pi_3", at + 2).await;
+        assert_eq!(membership(&db, "u3").await.number, 1);
+        assert_eq!(badge(&db, "u3").await, badge_of(1, CipherTier::T99));
+        assert_eq!(
+            db.fetch_cipher_number_by_order(&third.id).await.unwrap(),
+            Some(1)
+        );
+
+        // u1 can buy again normally: the lowest free number
+        buy(&db, &stripe, &s, "u1", CipherTier::T99, "pi_4", at + 3).await;
+        assert_eq!(membership(&db, "u1").await.number, 3);
+        assert_eq!(db.count_claimed_cipher_numbers().await.unwrap(), 3);
+
+        // Our own refunds were never involved
+        assert_eq!(stripe.call_count("create_refund"), 0);
+        drop_db(&db).await;
+    }
+
+    #[tokio::test]
+    async fn the_window_is_inclusive_and_a_later_refund_retires_the_number() {
+        let db = test_db().await;
+        let stripe = MockStripe::new();
+        let s = settings();
+        for user in ["u1", "u2", "u3"] {
+            insert_user(&db, user).await;
+        }
+
+        let late = buy(&db, &stripe, &s, "u1", CipherTier::T99, "pi_1", NOW).await;
+        let edge = buy(&db, &stripe, &s, "u2", CipherTier::T99, "pi_2", NOW).await;
+
+        // One millisecond past the window: today's rule, revoke + retire
+        assert_eq!(
+            refund(&db, &late.id, AFTER_WINDOW).await,
+            ReverseOutcome::Applied
+        );
+        let m = membership(&db, "u1").await;
+        assert!(!m.is_active());
+        assert_eq!(m.revoke_reason, Some(CipherRevokeReason::Refund));
+        assert_eq!(m.number, 1);
+        assert_eq!(
+            db.fetch_cipher_number_by_order(&late.id).await.unwrap(),
+            Some(1)
+        );
+        assert_eq!(badge(&db, "u1").await, None);
+        assert_eq!(order(&db, &late.id).await.state, OrderState::Refunded);
+
+        // Exactly at the end of the window: released
+        assert_eq!(
+            refund(
+                &db,
+                &edge.id,
+                NOW + REFUND_RELEASE_WINDOW_MS + REFUND_GRACE_MS
+            )
+            .await,
+            ReverseOutcome::Applied
+        );
+        assert_eq!(maybe_membership(&db, "u2").await, None);
+        assert_eq!(
+            db.fetch_cipher_number_by_order(&edge.id).await.unwrap(),
+            None
+        );
+
+        // #1 stays retired; the next buyer gets the released #2
+        buy(
+            &db,
+            &stripe,
+            &s,
+            "u3",
+            CipherTier::T99,
+            "pi_3",
+            AFTER_WINDOW + 1,
+        )
+        .await;
+        assert_eq!(membership(&db, "u3").await.number, 2);
+        assert_eq!(db.count_claimed_cipher_numbers().await.unwrap(), 2);
+        drop_db(&db).await;
+    }
+
+    #[tokio::test]
+    async fn a_lost_dispute_within_the_window_retires_the_number() {
+        let db = test_db().await;
+        let stripe = MockStripe::new();
+        let s = settings();
+        insert_user(&db, "u1").await;
+        insert_user(&db, "u2").await;
+
+        let bought = buy(&db, &stripe, &s, "u1", CipherTier::T99, "pi_1", NOW).await;
+        on_dispute(
+            &db,
+            &bought.id,
+            "dp_1",
+            ReverseKind::DisputeOpened,
+            NOW + DAY,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            on_dispute(
+                &db,
+                &bought.id,
+                "dp_1",
+                ReverseKind::DisputeLost,
+                NOW + 2 * DAY
+            )
+            .await
+            .unwrap(),
+            ReverseOutcome::Applied
+        );
+
+        let m = membership(&db, "u1").await;
+        assert_eq!(m.revoke_reason, Some(CipherRevokeReason::DisputeLost));
+        assert_eq!(
+            db.fetch_cipher_number_by_order(&bought.id).await.unwrap(),
+            Some(1)
+        );
+
+        // A refund arriving after it changes nothing
+        assert_eq!(
+            refund(&db, &bought.id, NOW + 3 * DAY).await,
+            ReverseOutcome::NoOp
+        );
+        assert!(maybe_membership(&db, "u1").await.is_some());
+
+        buy(
+            &db,
+            &stripe,
+            &s,
+            "u2",
+            CipherTier::T99,
+            "pi_2",
+            NOW + 4 * DAY,
+        )
+        .await;
+        assert_eq!(membership(&db, "u2").await.number, 2);
+        drop_db(&db).await;
+    }
+
+    #[tokio::test]
+    async fn a_refund_while_a_dispute_is_listed_retires_the_number() {
+        let db = test_db().await;
+        let stripe = MockStripe::new();
+        let s = settings();
+        insert_user(&db, "u1").await;
+
+        let bought = buy(&db, &stripe, &s, "u1", CipherTier::T99, "pi_1", NOW).await;
+        on_dispute(
+            &db,
+            &bought.id,
+            "dp_1",
+            ReverseKind::DisputeOpened,
+            NOW + DAY,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            refund(&db, &bought.id, NOW + 2 * DAY).await,
+            ReverseOutcome::Applied
+        );
+
+        let m = membership(&db, "u1").await;
+        assert_eq!(m.revoke_reason, Some(CipherRevokeReason::Refund));
+        assert_eq!(
+            db.fetch_cipher_number_by_order(&bought.id).await.unwrap(),
+            Some(1)
+        );
+        drop_db(&db).await;
+    }
+
+    #[tokio::test]
+    async fn a_release_stopped_after_its_decision_is_finished_by_the_redelivery() {
+        let db = test_db().await;
+        let stripe = MockStripe::new();
+        let s = settings();
+        for user in ["u1", "u2", "u3", "u4"] {
+            insert_user(&db, user).await;
+        }
+
+        // u1: stopped right after recording the decision; u2: after the
+        // revoke as well
+        let a = buy(&db, &stripe, &s, "u1", CipherTier::T99, "pi_1", NOW).await;
+        let b = buy(&db, &stripe, &s, "u2", CipherTier::T99, "pi_2", NOW).await;
+        release_decided(&db, "u1", &a.id, NOW + DAY, false).await;
+        release_decided(&db, "u2", &b.id, NOW + DAY, true).await;
+
+        // Until it is finished the numbers stay claimed: nobody else gets
+        // them, so no membership can collide with the old rows
+        buy(
+            &db,
+            &stripe,
+            &s,
+            "u3",
+            CipherTier::T99,
+            "pi_3",
+            NOW + DAY + 1,
+        )
+        .await;
+        assert_eq!(membership(&db, "u3").await.number, 3);
+
+        // Redelivered long after the window: the recorded decision stands
+        let late = AFTER_WINDOW + 5 * DAY;
+        for (user, order_id) in [("u1", &a.id), ("u2", &b.id)] {
+            assert_eq!(refund(&db, order_id, late).await, ReverseOutcome::Applied);
+            assert_eq!(maybe_membership(&db, user).await, None);
+            assert_eq!(badge(&db, user).await, None);
+            assert_eq!(
+                db.fetch_cipher_number_by_order(order_id).await.unwrap(),
+                None
+            );
+            assert_eq!(order(&db, order_id).await.state, OrderState::Refunded);
+        }
+        assert!(db
+            .fetch_cipher_numbers_release_pending(10)
+            .await
+            .unwrap()
+            .is_empty());
+
+        buy(&db, &stripe, &s, "u4", CipherTier::T99, "pi_4", late + 1).await;
+        assert_eq!(membership(&db, "u4").await.number, 1);
+        assert_eq!(db.count_claimed_cipher_numbers().await.unwrap(), 2);
+        drop_db(&db).await;
+    }
+
+    #[tokio::test]
+    async fn a_release_stopped_at_any_later_step_is_finished_by_the_redelivery() {
+        let db = test_db().await;
+        let stripe = MockStripe::new();
+        let s = settings();
+        for user in ["u1", "u2", "u3"] {
+            insert_user(&db, user).await;
+        }
+
+        // u1: stopped after deleting the membership, before the release
+        let a = buy(&db, &stripe, &s, "u1", CipherTier::T99, "pi_1", NOW).await;
+        release_decided(&db, "u1", &a.id, NOW + DAY, true).await;
+        let read = membership(&db, "u1").await.version;
+        assert!(db
+            .delete_cipher_membership_if_version("u1", read)
+            .await
+            .unwrap());
+        // u2: stopped after the release, before the order was recorded
+        let b = buy(&db, &stripe, &s, "u2", CipherTier::T99, "pi_2", NOW).await;
+        release_decided(&db, "u2", &b.id, NOW + DAY, true).await;
+        let read = membership(&db, "u2").await.version;
+        assert!(db
+            .delete_cipher_membership_if_version("u2", read)
+            .await
+            .unwrap());
+        assert!(db.release_cipher_number(&b.id).await.unwrap());
+
+        assert_eq!(
+            refund(&db, &a.id, NOW + DAY + 1).await,
+            ReverseOutcome::Applied
+        );
+        assert_eq!(db.fetch_cipher_number_by_order(&a.id).await.unwrap(), None);
+        assert_eq!(order(&db, &a.id).await.state, OrderState::Refunded);
+
+        // Nothing left to change in a membership; the order is recorded
+        assert_eq!(
+            refund(&db, &b.id, NOW + DAY + 1).await,
+            ReverseOutcome::NoOp
+        );
+        assert_eq!(order(&db, &b.id).await.state, OrderState::Refunded);
+        assert_eq!(badge(&db, "u2").await, None);
+
+        // Both numbers are back
+        assert_eq!(db.count_claimed_cipher_numbers().await.unwrap(), 0);
+        buy(
+            &db,
+            &stripe,
+            &s,
+            "u3",
+            CipherTier::T99,
+            "pi_3",
+            NOW + 2 * DAY,
+        )
+        .await;
+        assert_eq!(membership(&db, "u3").await.number, 1);
+        drop_db(&db).await;
+    }
+
+    #[tokio::test]
+    async fn a_lost_dispute_after_a_stopped_release_finishes_the_release() {
+        let db = test_db().await;
+        let stripe = MockStripe::new();
+        let s = settings();
+        insert_user(&db, "u1").await;
+        insert_user(&db, "u2").await;
+
+        let bought = buy(&db, &stripe, &s, "u1", CipherTier::T99, "pi_1", NOW).await;
+        release_decided(&db, "u1", &bought.id, NOW + DAY, true).await;
+
+        // The refund event never comes back; a lost dispute does. It must
+        // not leave #1 held by a revoked row (or claimed for good)
+        assert_eq!(
+            on_dispute(
+                &db,
+                &bought.id,
+                "dp_1",
+                ReverseKind::DisputeLost,
+                NOW + 2 * DAY
+            )
+            .await
+            .unwrap(),
+            ReverseOutcome::Applied
+        );
+        assert_eq!(maybe_membership(&db, "u1").await, None);
+        assert_eq!(
+            db.fetch_cipher_number_by_order(&bought.id).await.unwrap(),
+            None
+        );
+        assert_eq!(order(&db, &bought.id).await.state, OrderState::Refunded);
+
+        buy(
+            &db,
+            &stripe,
+            &s,
+            "u2",
+            CipherTier::T99,
+            "pi_2",
+            NOW + 3 * DAY,
+        )
+        .await;
+        assert_eq!(membership(&db, "u2").await.number, 1);
+        drop_db(&db).await;
+    }
+
+    #[tokio::test]
+    async fn a_repurchase_after_a_stopped_release_keeps_the_new_membership() {
+        let db = test_db().await;
+        let stripe = MockStripe::new();
+        let s = settings();
+        insert_user(&db, "u1").await;
+
+        let first = buy(&db, &stripe, &s, "u1", CipherTier::T99, "pi_1", NOW).await;
+        release_decided(&db, "u1", &first.id, NOW + DAY, true).await;
+
+        // The buyer buys again before anything finishes the release: #1 is
+        // still claimed, so the new purchase gets #2 and replaces the
+        // revoked row
+        let again = buy(
+            &db,
+            &stripe,
+            &s,
+            "u1",
+            CipherTier::T149,
+            "pi_2",
+            NOW + DAY + 1,
+        )
+        .await;
+        let m = membership(&db, "u1").await;
+        assert_eq!((m.number, m.orders.clone()), (2, vec![again.id.clone()]));
+
+        // The reconcile sweep finishes the old release without touching
+        // the new membership
+        reconcile(&db, &stripe, &s, NOW + DAY + 2 * MINUTE)
+            .await
+            .unwrap();
+        assert_eq!(
+            db.fetch_cipher_number_by_order(&first.id).await.unwrap(),
+            None
+        );
+        assert_eq!(order(&db, &first.id).await.state, OrderState::Refunded);
+        let m = membership(&db, "u1").await;
+        assert!(m.is_active());
+        assert_eq!((m.number, m.tier), (2, CipherTier::T149));
+        assert_eq!(badge(&db, "u1").await, badge_of(2, CipherTier::T149));
+        assert_eq!(db.count_claimed_cipher_numbers().await.unwrap(), 1);
+        assert!(db
+            .fetch_cipher_numbers_release_pending(10)
+            .await
+            .unwrap()
+            .is_empty());
+
+        // A second sweep finds nothing to do
+        reconcile(&db, &stripe, &s, NOW + DAY + 4 * MINUTE)
+            .await
+            .unwrap();
+        assert_eq!(membership(&db, "u1").await.number, 2);
+        drop_db(&db).await;
+    }
+
+    #[tokio::test]
+    async fn the_window_is_judged_when_the_refund_was_made_with_a_grace() {
+        let db = test_db().await;
+        let stripe = MockStripe::new();
+        let s = settings();
+        for user in ["u1", "u2", "u3", "u4"] {
+            insert_user(&db, user).await;
+        }
+        let a = buy(&db, &stripe, &s, "u1", CipherTier::T99, "pi_1", NOW).await;
+        let b = buy(&db, &stripe, &s, "u2", CipherTier::T99, "pi_2", NOW).await;
+        let c = buy(&db, &stripe, &s, "u3", CipherTier::T99, "pi_3", NOW).await;
+        buy(&db, &stripe, &s, "u4", CipherTier::T99, "pi_4", NOW).await;
+        let up = buy(&db, &stripe, &s, "u4", CipherTier::T299, "pi_5", NOW).await;
+
+        // Made on day 13, processed on day 15 (a re-drive): released
+        assert_eq!(
+            refund_with(&db, &a.id, full_refund(NOW + 13 * DAY), NOW + 15 * DAY).await,
+            ReverseOutcome::Applied
+        );
+        assert_eq!(maybe_membership(&db, "u1").await, None);
+
+        // Made on day 16 (inside the grace), processed on day 19 (past it):
+        // released, because the refund was made in time
+        assert_eq!(
+            refund_with(&db, &b.id, full_refund(NOW + 16 * DAY), NOW + 19 * DAY).await,
+            ReverseOutcome::Applied
+        );
+        assert_eq!(maybe_membership(&db, "u2").await, None);
+        assert_eq!(db.fetch_cipher_number_by_order(&b.id).await.unwrap(), None);
+
+        // Made on day 18: past the 14 days and the 3-day grace, retired
+        assert_eq!(
+            refund_with(&db, &c.id, full_refund(NOW + 18 * DAY), NOW + 18 * DAY).await,
+            ReverseOutcome::Applied
+        );
+        let m = membership(&db, "u3").await;
+        assert_eq!(m.revoke_reason, Some(CipherRevokeReason::Refund));
+        assert_eq!(
+            db.fetch_cipher_number_by_order(&c.id).await.unwrap(),
+            Some(3)
+        );
+
+        // An upgrade refund made on day 16, processed on day 19: rolled back
+        assert_eq!(
+            refund_with(&db, &up.id, full_refund(NOW + 16 * DAY), NOW + 19 * DAY).await,
+            ReverseOutcome::Applied
+        );
+        let m = membership(&db, "u4").await;
+        assert!(m.is_active());
+        assert_eq!((m.number, m.tier), (4, CipherTier::T99));
+        drop_db(&db).await;
+    }
+
+    #[tokio::test]
+    async fn a_partial_or_unknown_refund_inside_the_window_revokes_and_retires() {
+        let db = test_db().await;
+        let stripe = MockStripe::new();
+        let s = settings();
+        for user in ["u1", "u2", "u3"] {
+            insert_user(&db, user).await;
+        }
+
+        // A partial refund of a new purchase on day 1
+        let a = buy(&db, &stripe, &s, "u1", CipherTier::T99, "pi_1", NOW).await;
+        let partial = Some(RefundFacts {
+            refunded_at_ms: NOW + DAY,
+            full: false,
+        });
+        assert_eq!(
+            refund_with(&db, &a.id, partial, NOW + DAY).await,
+            ReverseOutcome::Applied
+        );
+        let m = membership(&db, "u1").await;
+        assert_eq!(m.revoke_reason, Some(CipherRevokeReason::Refund));
+        assert_eq!(
+            db.fetch_cipher_number_by_order(&a.id).await.unwrap(),
+            Some(1)
+        );
+
+        // A partial refund of an upgrade: revoked, not rolled back
+        buy(&db, &stripe, &s, "u2", CipherTier::T99, "pi_2", NOW).await;
+        let up = buy(&db, &stripe, &s, "u2", CipherTier::T299, "pi_3", NOW).await;
+        assert_eq!(
+            refund_with(&db, &up.id, partial, NOW + DAY).await,
+            ReverseOutcome::Applied
+        );
+        let m = membership(&db, "u2").await;
+        assert!(!m.is_active());
+        assert_eq!(m.tier, CipherTier::T299);
+
+        // Nothing known about the refund (a recorded reversal): the same
+        let c = buy(&db, &stripe, &s, "u3", CipherTier::T99, "pi_4", NOW).await;
+        assert_eq!(
+            refund_with(&db, &c.id, None, NOW + DAY).await,
+            ReverseOutcome::Applied
+        );
+        assert!(!membership(&db, "u3").await.is_active());
+        assert_eq!(
+            db.fetch_cipher_number_by_order(&c.id).await.unwrap(),
+            Some(3)
+        );
+        assert_eq!(db.count_claimed_cipher_numbers().await.unwrap(), 3);
+        drop_db(&db).await;
+    }
+
+    #[tokio::test]
+    async fn a_membership_revoked_by_staff_or_a_lost_dispute_keeps_its_number_retired() {
+        let db = test_db().await;
+        let stripe = MockStripe::new();
+        let s = settings();
+        insert_user(&db, "u1").await;
+        insert_user(&db, "u2").await;
+
+        // Revoked by staff, then the purchase is refunded on day 1
+        let a = buy(&db, &stripe, &s, "u1", CipherTier::T99, "pi_1", NOW).await;
+        change_membership(&db, "u1", |m| {
+            m.revoked_at = Some(NOW + 1);
+            m.revoke_reason = Some(CipherRevokeReason::Admin);
+        })
+        .await;
+        assert_eq!(refund(&db, &a.id, NOW + DAY).await, ReverseOutcome::Applied);
+        let m = membership(&db, "u1").await;
+        assert_eq!(m.revoke_reason, Some(CipherRevokeReason::Admin));
+        assert_eq!(
+            db.fetch_cipher_number_by_order(&a.id).await.unwrap(),
+            Some(1)
+        );
+        assert_eq!(order(&db, &a.id).await.state, OrderState::Refunded);
+
+        // Revoked for a dispute lost on its upgrade, then the purchase is
+        // refunded on day 2
+        let b = buy(&db, &stripe, &s, "u2", CipherTier::T99, "pi_2", NOW).await;
+        let up = buy(&db, &stripe, &s, "u2", CipherTier::T299, "pi_3", NOW).await;
+        on_dispute(&db, &up.id, "dp_1", ReverseKind::DisputeOpened, NOW + DAY)
+            .await
+            .unwrap();
+        on_dispute(&db, &up.id, "dp_1", ReverseKind::DisputeLost, NOW + DAY + 1)
+            .await
+            .unwrap();
+        assert_eq!(
+            membership(&db, "u2").await.revoke_reason,
+            Some(CipherRevokeReason::DisputeLost)
+        );
+        assert_eq!(
+            refund(&db, &b.id, NOW + 2 * DAY).await,
+            ReverseOutcome::Applied
+        );
+        let m = membership(&db, "u2").await;
+        assert_eq!(m.revoke_reason, Some(CipherRevokeReason::DisputeLost));
+        assert_eq!(
+            db.fetch_cipher_number_by_order(&b.id).await.unwrap(),
+            Some(2)
+        );
+        assert_eq!(db.count_claimed_cipher_numbers().await.unwrap(), 2);
+        drop_db(&db).await;
+    }
+
+    #[tokio::test]
+    async fn credited_prot_keeps_the_old_rule() {
+        let db = test_db().await;
+        let stripe = MockStripe::new();
+        let s = settings();
+        insert_user(&db, "u1").await;
+        insert_user(&db, "u2").await;
+
+        // A new purchase whose Prot was credited: revoked + retired
+        let first = buy(&db, &stripe, &s, "u1", CipherTier::T99, "pi_1", NOW).await;
+        change_membership(&db, "u1", |m| m.prot_posted_at = Some(NOW + 1)).await;
+        assert_eq!(
+            refund(&db, &first.id, NOW + DAY).await,
+            ReverseOutcome::Applied
+        );
+        let m = membership(&db, "u1").await;
+        assert_eq!(m.revoke_reason, Some(CipherRevokeReason::Refund));
+        assert_eq!(
+            db.fetch_cipher_number_by_order(&first.id).await.unwrap(),
+            Some(1)
+        );
+
+        // An upgrade on a credited membership: revoked, not rolled back
+        buy(&db, &stripe, &s, "u2", CipherTier::T99, "pi_2", NOW).await;
+        let up = buy(&db, &stripe, &s, "u2", CipherTier::T299, "pi_3", NOW + DAY).await;
+        change_membership(&db, "u2", |m| m.prot_posted_at = Some(NOW + DAY + 1)).await;
+        assert_eq!(
+            refund(&db, &up.id, NOW + 2 * DAY).await,
+            ReverseOutcome::Applied
+        );
+        let m = membership(&db, "u2").await;
+        assert!(!m.is_active());
+        assert_eq!(m.tier, CipherTier::T299);
+        assert_eq!(m.number, 2);
+        assert_eq!(db.count_claimed_cipher_numbers().await.unwrap(), 2);
+        drop_db(&db).await;
+    }
+
+    #[tokio::test]
+    async fn an_upgrade_refunded_within_its_window_rolls_back_and_keeps_the_number() {
+        let db = test_db().await;
+        let stripe = MockStripe::new();
+        let s = settings();
+        insert_user(&db, "u1").await;
+
+        let first = buy(&db, &stripe, &s, "u1", CipherTier::T99, "pi_1", NOW).await;
+        // Bought on day 1 and refunded on day 3; the purchase itself is
+        // long out of its own window by then, which does not matter
+        let up = buy(&db, &stripe, &s, "u1", CipherTier::T299, "pi_up", NOW + DAY).await;
+        assert_eq!(badge(&db, "u1").await, badge_of(1, CipherTier::T299));
+
+        assert_eq!(
+            refund(&db, &up.id, NOW + 3 * DAY).await,
+            ReverseOutcome::Applied
+        );
+        let m = membership(&db, "u1").await;
+        assert!(m.is_active());
+        assert_eq!(
+            (m.number, m.tier, m.prot_grant),
+            (1, CipherTier::T99, catalog::tier_prot(CipherTier::T99))
+        );
+        assert_eq!(m.orders, vec![first.id.clone()]);
+        assert_eq!(m.granted_at, NOW);
+        assert_eq!(badge(&db, "u1").await, badge_of(1, CipherTier::T99));
+        assert_eq!(order(&db, &up.id).await.state, OrderState::Refunded);
+        assert_eq!(order(&db, &first.id).await.state, OrderState::Fulfilled);
+        assert_eq!(db.count_claimed_cipher_numbers().await.unwrap(), 1);
+
+        // A redelivery changes nothing
+        assert_eq!(
+            refund(&db, &up.id, NOW + 3 * DAY + 1).await,
+            ReverseOutcome::NoOp
+        );
+        assert_eq!(membership(&db, "u1").await.tier, CipherTier::T99);
+
+        // The buyer can upgrade again
+        let again = buy(
+            &db,
+            &stripe,
+            &s,
+            "u1",
+            CipherTier::T149,
+            "pi_up2",
+            NOW + 4 * DAY,
+        )
+        .await;
+        assert_eq!(
+            again.sku,
+            Sku::CipherUpgrade {
+                from: CipherTier::T99,
+                to: CipherTier::T149
+            }
+        );
+        assert_eq!(badge(&db, "u1").await, badge_of(1, CipherTier::T149));
+        drop_db(&db).await;
+    }
+
+    #[tokio::test]
+    async fn a_rollback_stopped_after_its_membership_write_is_finished_by_the_redelivery() {
+        let db = test_db().await;
+        let stripe = MockStripe::new();
+        let s = settings();
+        insert_user(&db, "u1").await;
+
+        let first = buy(&db, &stripe, &s, "u1", CipherTier::T99, "pi_1", NOW).await;
+        let up = buy(&db, &stripe, &s, "u1", CipherTier::T299, "pi_up", NOW + DAY).await;
+
+        // The rollback was written, then the worker died: the badge and the
+        // order were never updated
+        change_membership(&db, "u1", |m| {
+            m.tier = CipherTier::T99;
+            m.prot_grant = catalog::tier_prot(CipherTier::T99);
+            m.orders = vec![first.id.clone()];
+        })
+        .await;
+        assert_eq!(badge(&db, "u1").await, badge_of(1, CipherTier::T299));
+
+        assert_eq!(
+            refund(&db, &up.id, NOW + 2 * DAY).await,
+            ReverseOutcome::NoOp
+        );
+        assert_eq!(order(&db, &up.id).await.state, OrderState::Refunded);
+        assert_eq!(badge(&db, "u1").await, badge_of(1, CipherTier::T99));
+        assert!(membership(&db, "u1").await.is_active());
+        drop_db(&db).await;
+    }
+
+    #[tokio::test]
+    async fn an_upgrade_refunded_after_its_window_revokes_and_retires() {
+        let db = test_db().await;
+        let stripe = MockStripe::new();
+        let s = settings();
+        insert_user(&db, "u1").await;
+
+        buy(&db, &stripe, &s, "u1", CipherTier::T99, "pi_1", NOW).await;
+        let up = buy(&db, &stripe, &s, "u1", CipherTier::T299, "pi_up", NOW).await;
+
+        // Day 20
+        assert_eq!(
+            refund(&db, &up.id, NOW + 20 * DAY).await,
+            ReverseOutcome::Applied
+        );
+        let m = membership(&db, "u1").await;
+        assert!(!m.is_active());
+        assert_eq!(m.revoke_reason, Some(CipherRevokeReason::Refund));
+        assert_eq!((m.number, m.tier), (1, CipherTier::T299));
+        assert_eq!(badge(&db, "u1").await, None);
+        assert_eq!(db.count_claimed_cipher_numbers().await.unwrap(), 1);
+        assert_eq!(order(&db, &up.id).await.state, OrderState::Refunded);
+        drop_db(&db).await;
+    }
+
+    #[tokio::test]
+    async fn only_the_latest_of_stacked_upgrades_rolls_back() {
+        let db = test_db().await;
+        let stripe = MockStripe::new();
+        let s = settings();
+        insert_user(&db, "u1").await;
+        insert_user(&db, "u2").await;
+
+        // u1: 99 → 149 → 299, then the OLDER upgrade is refunded: the
+        // membership is left as it is, the order is recorded Refunded and
+        // the case is logged for manual handling
+        let first = buy(&db, &stripe, &s, "u1", CipherTier::T99, "pi_1", NOW).await;
+        let older = buy(&db, &stripe, &s, "u1", CipherTier::T149, "pi_2", NOW + DAY).await;
+        let latest = buy(
+            &db,
+            &stripe,
+            &s,
+            "u1",
+            CipherTier::T299,
+            "pi_3",
+            NOW + 2 * DAY,
+        )
+        .await;
+        let before = membership(&db, "u1").await;
+        assert_eq!(
+            refund(&db, &older.id, NOW + 3 * DAY).await,
+            ReverseOutcome::NoOp
+        );
+        assert_eq!(membership(&db, "u1").await, before, "untouched");
+        assert!(before.is_active());
+        assert_eq!(
+            before.orders,
+            vec![first.id.clone(), older.id.clone(), latest.id.clone()]
+        );
+        assert_eq!(badge(&db, "u1").await, badge_of(1, CipherTier::T299));
+        assert_eq!(order(&db, &older.id).await.state, OrderState::Refunded);
+        assert_eq!(order(&db, &latest.id).await.state, OrderState::Fulfilled);
+        // A redelivery changes nothing
+        assert_eq!(
+            refund(&db, &older.id, NOW + 3 * DAY + 1).await,
+            ReverseOutcome::NoOp
+        );
+        assert_eq!(membership(&db, "u1").await, before);
+
+        // u2: the same stack, refunded latest first: each one rolls back
+        buy(&db, &stripe, &s, "u2", CipherTier::T99, "pi_4", NOW).await;
+        let mid = buy(&db, &stripe, &s, "u2", CipherTier::T149, "pi_5", NOW + DAY).await;
+        let top = buy(
+            &db,
+            &stripe,
+            &s,
+            "u2",
+            CipherTier::T299,
+            "pi_6",
+            NOW + 2 * DAY,
+        )
+        .await;
+        assert_eq!(
+            refund(&db, &top.id, NOW + 3 * DAY).await,
+            ReverseOutcome::Applied
+        );
+        assert_eq!(badge(&db, "u2").await, badge_of(2, CipherTier::T149));
+        assert_eq!(
+            refund(&db, &mid.id, NOW + 3 * DAY).await,
+            ReverseOutcome::Applied
+        );
+        let m = membership(&db, "u2").await;
+        assert!(m.is_active());
+        assert_eq!((m.number, m.tier), (2, CipherTier::T99));
+        assert_eq!(m.orders.len(), 1);
+        assert_eq!(badge(&db, "u2").await, badge_of(2, CipherTier::T99));
+        drop_db(&db).await;
+    }
+
+    #[tokio::test]
+    async fn a_refunded_purchase_takes_its_upgrades_with_it() {
+        let db = test_db().await;
+        let stripe = MockStripe::new();
+        let s = settings();
+        insert_user(&db, "u1").await;
+        insert_user(&db, "u2").await;
+
+        let first = buy(&db, &stripe, &s, "u1", CipherTier::T99, "pi_1", NOW).await;
+        let up = buy(&db, &stripe, &s, "u1", CipherTier::T299, "pi_up", NOW + DAY).await;
+
+        assert_eq!(
+            refund(&db, &first.id, NOW + 2 * DAY).await,
+            ReverseOutcome::Applied
+        );
+        assert_eq!(maybe_membership(&db, "u1").await, None);
+        assert_eq!(badge(&db, "u1").await, None);
+        assert_eq!(db.count_claimed_cipher_numbers().await.unwrap(), 0);
+
+        // The upgrade's own refund then only records it
+        assert_eq!(
+            refund(&db, &up.id, NOW + 2 * DAY + 1).await,
+            ReverseOutcome::NoOp
+        );
+        assert_eq!(order(&db, &up.id).await.state, OrderState::Refunded);
+
+        buy(
+            &db,
+            &stripe,
+            &s,
+            "u2",
+            CipherTier::T99,
+            "pi_2",
+            NOW + 3 * DAY,
+        )
+        .await;
+        assert_eq!(membership(&db, "u2").await.number, 1);
         drop_db(&db).await;
     }
 }

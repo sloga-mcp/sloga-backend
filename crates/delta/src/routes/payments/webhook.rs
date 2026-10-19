@@ -233,7 +233,9 @@ async fn handle_delivery(
 mod test {
     use revolt_database::{OrderState, PaymentEventState};
     use revolt_models::v0::{CipherReturnTo, CipherTier};
-    use revolt_payments::engine::{create_cipher_checkout, fulfil_order};
+    use revolt_payments::engine::{
+        create_cipher_checkout, fulfil_order, REFUND_GRACE_MS, REFUND_RELEASE_WINDOW_MS,
+    };
     use revolt_payments::settings::PaymentsSettings;
     use revolt_payments::stripe::{sign_for_tests, CheckoutSession, PaymentIntent, StripeError};
     use revolt_result::create_error;
@@ -754,8 +756,20 @@ mod test {
 
     #[test]
     fn an_invalid_sale_config_still_settles_refunds_but_not_checkouts() {
-        crate::util::test::rt()
-            .block_on(an_invalid_sale_config_still_settles_refunds_but_not_checkouts_case())
+        // Two whole purchase-and-refund flows polled straight from this
+        // thread (`block_on`, no HTTP hop) overflow the default 2 MiB test
+        // stack in a debug build on MongoDB: run the boxed case on a thread
+        // with room. A panic in the case still fails the test.
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                crate::util::test::rt().block_on(Box::pin(
+                    an_invalid_sale_config_still_settles_refunds_but_not_checkouts_case(),
+                ))
+            })
+            .expect("test thread")
+            .join()
+            .expect("the case passes")
     }
 
     async fn an_invalid_sale_config_still_settles_refunds_but_not_checkouts_case() {
@@ -764,7 +778,10 @@ mod test {
         let (_, _, user) = harness.new_user().await;
         harness.db.seed_cipher_numbers(s.cap).await.unwrap();
 
-        // A fulfilled member, through the engine and the mock
+        // A fulfilled member, through the engine and the mock, who paid more
+        // than 14 days (plus the 3-day grace) ago: the full refund below
+        // revokes and retires the number
+        let paid_at = now_ms() - REFUND_RELEASE_WINDOW_MS - REFUND_GRACE_MS - 60_000;
         let url = create_cipher_checkout(
             &harness.db,
             &*harness.stripe,
@@ -772,7 +789,7 @@ mod test {
             &user.id,
             CipherTier::T99,
             CipherReturnTo::Web,
-            now_ms(),
+            paid_at,
         )
         .await
         .expect("checkout");
@@ -793,16 +810,9 @@ mod test {
             ..session
         };
         harness.stripe.set_session(paid.clone());
-        fulfil_order(
-            &harness.db,
-            &*harness.stripe,
-            &s,
-            &order.id,
-            &paid,
-            now_ms(),
-        )
-        .await
-        .expect("fulfilled");
+        fulfil_order(&harness.db, &*harness.stripe, &s, &order.id, &paid, paid_at)
+            .await
+            .expect("fulfilled");
         assert!(harness
             .db
             .fetch_user(&user.id)
@@ -857,7 +867,8 @@ mod test {
         ));
         assert_eq!(event_state(&harness, "evt_webhook_fallback_cs").await, None);
 
-        // The refund is: the membership is revoked and the badge cleared
+        // The refund is: past the window and the grace, the membership is revoked,
+        // the number retired and the badge cleared
         let refunded = event_body(
             "evt_webhook_fallback_refund",
             "charge.refunded",
@@ -865,7 +876,10 @@ mod test {
             serde_json::json!({
                 "id": "ch_webhook_fallback",
                 "object": "charge",
-                "payment_intent": "pi_webhook_fallback"
+                "payment_intent": "pi_webhook_fallback",
+                "amount": 9900,
+                "amount_refunded": 9900,
+                "refunded": true
             }),
         );
         let answered = deliver(refunded).await;
@@ -889,5 +903,119 @@ mod test {
             .expect("a membership");
         assert!(membership.revoked_at.is_some());
         assert_eq!(harness.db.fetch_user(&user.id).await.unwrap().cipher, None);
+        assert_eq!(
+            harness
+                .db
+                .fetch_cipher_number_by_order(&order.id)
+                .await
+                .unwrap(),
+            Some(membership.number),
+            "the number stays retired"
+        );
+
+        // A second member, refunded within 14 days, under the same fallback:
+        // the membership is deleted and the number goes back to the pool
+        let (_, _, recent) = harness.new_user().await;
+        create_cipher_checkout(
+            &harness.db,
+            &*harness.stripe,
+            &s,
+            &recent.id,
+            CipherTier::T99,
+            CipherReturnTo::Web,
+            now_ms(),
+        )
+        .await
+        .expect("checkout");
+        let recent_order = harness
+            .db
+            .fetch_payment_orders_by_user(&recent.id, &[OrderState::Pending])
+            .await
+            .unwrap()
+            .pop()
+            .expect("a pending order");
+        let recent_session = harness
+            .stripe
+            .session(
+                recent_order
+                    .checkout_session_id
+                    .as_deref()
+                    .expect("a session"),
+            )
+            .expect("mock session");
+        let recent_paid = CheckoutSession {
+            status: Some("complete".to_string()),
+            payment_status: Some("paid".to_string()),
+            payment_intent: Some("pi_webhook_fallback_recent".to_string()),
+            ..recent_session
+        };
+        harness.stripe.set_session(recent_paid.clone());
+        fulfil_order(
+            &harness.db,
+            &*harness.stripe,
+            &s,
+            &recent_order.id,
+            &recent_paid,
+            now_ms(),
+        )
+        .await
+        .expect("fulfilled");
+        let number = harness
+            .db
+            .fetch_cipher_number_by_order(&recent_order.id)
+            .await
+            .unwrap()
+            .expect("a claimed number");
+
+        let refunded = event_body(
+            "evt_webhook_fallback_refund_recent",
+            "charge.refunded",
+            false,
+            serde_json::json!({
+                "id": "ch_webhook_fallback_recent",
+                "object": "charge",
+                "payment_intent": "pi_webhook_fallback_recent",
+                "amount": 9900,
+                "amount_refunded": 9900,
+                "refunded": true
+            }),
+        );
+        let answered = deliver(refunded).await;
+        assert_eq!(answered.as_ref().ok(), Some(&Status::Ok), "{answered:?}");
+        assert_eq!(
+            event_state(&harness, "evt_webhook_fallback_refund_recent").await,
+            Some(PaymentEventState::Processed)
+        );
+        assert_eq!(
+            harness
+                .db
+                .fetch_payment_order(&recent_order.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            OrderState::Refunded
+        );
+        assert_eq!(
+            harness
+                .db
+                .fetch_cipher_membership(&recent.id)
+                .await
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            harness
+                .db
+                .fetch_cipher_number_by_order(&recent_order.id)
+                .await
+                .unwrap(),
+            None,
+            "number {number} is back in the pool"
+        );
+        assert_eq!(
+            harness.db.fetch_user(&recent.id).await.unwrap().cipher,
+            None
+        );
     }
 }
