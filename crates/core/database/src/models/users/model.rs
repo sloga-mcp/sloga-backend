@@ -1,7 +1,9 @@
 use std::{collections::HashSet, str::FromStr, time::Duration};
 
 use crate::{
+    credential_lookup_error,
     events::client::EventV1,
+    is_invalid_session,
     util::email::{email_templates, send_email},
     util::name_filter::contains_blocked_slur,
     Database, File, RatelimitEvent, AMQP,
@@ -581,27 +583,35 @@ impl User {
     #[async_recursion]
     pub async fn from_token(db: &Database, token: &str, hint: UserHint) -> Result<(User, String)> {
         match hint {
-            UserHint::Bot => Ok((
-                db.fetch_user(
-                    &db.fetch_bot_by_token(token)
-                        .await
-                        .map_err(|_| create_error!(InvalidSession))?
-                        .id,
-                )
-                .await?,
-                String::new(),
-            )),
-            UserHint::User => {
-                let session = db.fetch_session_by_token(token).await?;
-                Ok((db.fetch_user(&session.user_id).await?, session.id))
+            UserHint::Bot => {
+                let bot = db
+                    .fetch_bot_by_token(token)
+                    .await
+                    .map_err(credential_lookup_error)?;
+                let user = db
+                    .fetch_user(&bot.id)
+                    .await
+                    .map_err(credential_lookup_error)?;
+                Ok((user, String::new()))
             }
-            UserHint::Any => {
-                if let Ok(result) = User::from_token(db, token, UserHint::User).await {
-                    Ok(result)
-                } else {
+            UserHint::User => {
+                let session = db
+                    .fetch_session_by_token(token)
+                    .await
+                    .map_err(credential_lookup_error)?;
+                let user = db
+                    .fetch_user(&session.user_id)
+                    .await
+                    .map_err(credential_lookup_error)?;
+                Ok((user, session.id))
+            }
+            UserHint::Any => match User::from_token(db, token, UserHint::User).await {
+                // The bot fallback is only for a token that is not a session
+                Err(error) if is_invalid_session(&error) => {
                     User::from_token(db, token, UserHint::Bot).await
                 }
-            }
+                result => result,
+            },
         }
     }
 
@@ -2070,6 +2080,157 @@ mod tests {
                 .await;
 
             assert!(updated_invalid_update_result.is_err());
+        });
+    }
+
+    fn from_token_session(id: &str, user_id: &str, token: &str) -> crate::Session {
+        crate::Session {
+            id: id.to_string(),
+            user_id: user_id.to_string(),
+            token: token.to_string(),
+            name: "test".to_string(),
+            last_seen: iso8601_timestamp::Timestamp::now_utc(),
+            origin: None,
+            subscription: None,
+        }
+    }
+
+    fn from_token_assert_invalid_session(
+        result: revolt_result::Result<(User, String)>,
+        case: &str,
+    ) {
+        match result {
+            Err(error) => assert!(
+                matches!(error.error_type, revolt_result::ErrorType::InvalidSession),
+                "{case}: expected InvalidSession, got {:?}",
+                error.error_type
+            ),
+            Ok((user, session_id)) => panic!(
+                "{case}: expected InvalidSession, got user {} session {session_id:?}",
+                user.id
+            ),
+        }
+    }
+
+    #[tokio::test]
+    async fn from_token_unknown_token_is_invalid_session() {
+        use crate::UserHint;
+
+        database_test!(|db| async move {
+            for hint in [UserHint::Any, UserHint::User, UserHint::Bot] {
+                let case = format!("{hint:?}");
+                from_token_assert_invalid_session(
+                    User::from_token(&db, "token-that-does-not-exist", hint).await,
+                    &case,
+                );
+            }
+        });
+    }
+
+    #[tokio::test]
+    async fn from_token_any_accepts_a_session() {
+        use crate::UserHint;
+
+        database_test!(|db| async move {
+            let user = User::create(&db, "Session".to_string(), None, None)
+                .await
+                .unwrap();
+            let session = from_token_session(
+                "01SESSIONFROMTOKENVALID0000",
+                &user.id,
+                "token-from-token-valid-session",
+            );
+            db.save_session(&session).await.unwrap();
+
+            let (found, session_id) = User::from_token(&db, &session.token, UserHint::Any)
+                .await
+                .unwrap();
+            assert_eq!(found.id, user.id);
+            assert_eq!(session_id, session.id);
+        });
+    }
+
+    #[tokio::test]
+    async fn from_token_any_accepts_a_bot() {
+        use crate::{Bot, PartialBot, UserHint};
+
+        database_test!(|db| async move {
+            let owner = User::create(&db, "Owner".to_string(), None, None)
+                .await
+                .unwrap();
+            let (bot, _) = Bot::create(&db, "Bot".to_string(), &owner, None::<PartialBot>)
+                .await
+                .unwrap();
+
+            let (found, session_id) = User::from_token(&db, &bot.token, UserHint::Any)
+                .await
+                .unwrap();
+            assert_eq!(found.id, bot.id);
+            assert!(session_id.is_empty());
+        });
+    }
+
+    #[tokio::test]
+    async fn from_token_orphaned_session_user_hint_is_invalid_session() {
+        use crate::UserHint;
+
+        database_test!(|db| async move {
+            // The session's user doc never existed
+            let session = from_token_session(
+                "01SESSIONFROMTOKENORPHANU00",
+                "01USERFROMTOKENMISSING00000",
+                "token-from-token-orphaned-session-user",
+            );
+            db.save_session(&session).await.unwrap();
+
+            from_token_assert_invalid_session(
+                User::from_token(&db, &session.token, UserHint::User).await,
+                "User",
+            );
+        });
+    }
+
+    #[tokio::test]
+    async fn from_token_orphaned_session_any_hint_is_invalid_session() {
+        use crate::UserHint;
+
+        database_test!(|db| async move {
+            // The session's user doc never existed
+            let session = from_token_session(
+                "01SESSIONFROMTOKENORPHANA00",
+                "01USERFROMTOKENMISSING00000",
+                "token-from-token-orphaned-session-any",
+            );
+            db.save_session(&session).await.unwrap();
+
+            from_token_assert_invalid_session(
+                User::from_token(&db, &session.token, UserHint::Any).await,
+                "Any",
+            );
+        });
+    }
+
+    #[tokio::test]
+    async fn from_token_orphaned_bot_is_invalid_session() {
+        use crate::{Bot, PartialBot, UserHint};
+
+        database_test!(|db| async move {
+            let owner = User::create(&db, "Owner".to_string(), None, None)
+                .await
+                .unwrap();
+            let (bot, _) = Bot::create(&db, "Bot".to_string(), &owner, None::<PartialBot>)
+                .await
+                .unwrap();
+            db.delete_user(&bot.id).await.unwrap();
+
+            from_token_assert_invalid_session(
+                User::from_token(&db, &bot.token, UserHint::Bot).await,
+                "Bot",
+            );
+            from_token_assert_invalid_session(
+                User::from_token(&db, &bot.token, UserHint::Any).await,
+                "Any",
+            );
         });
     }
 }
