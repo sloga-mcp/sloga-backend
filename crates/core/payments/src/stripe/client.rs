@@ -262,8 +262,12 @@ pub const TERMS_ACCEPTANCE_MESSAGE: &str = "I agree to the \
     as my payment goes through, and I can ask for a full refund within 14 days.";
 
 /// Form body for `POST /v1/checkout/sessions`, in Stripe's bracket notation.
-/// Card only: no delayed payment methods, so `checkout.session.completed`
-/// with `payment_status=paid` is the single success signal.
+/// No `payment_method_types`: since API version 2026-09-30.endive Stripe
+/// refuses it and takes the payment methods from the Dashboard (Settings,
+/// Payment methods). Keep that list to methods that confirm at once (card,
+/// Link, wallets), so `checkout.session.completed` with `payment_status=paid`
+/// stays the single success signal; a delayed method would leave the session
+/// complete but unpaid until a reconcile sweep sees it paid.
 /// Adaptive Pricing is off, so the buyer always pays in the order's
 /// currency (a session settled in another currency would not match the
 /// order, and fulfilment refunds it).
@@ -277,7 +281,6 @@ pub const TERMS_ACCEPTANCE_MESSAGE: &str = "I agree to the \
 pub fn checkout_form(p: &CheckoutSessionParams) -> Vec<(String, String)> {
     [
         ("mode", "payment".to_string()),
-        ("payment_method_types[0]", "card".to_string()),
         ("adaptive_pricing[enabled]", "false".to_string()),
         ("line_items[0][quantity]", "1".to_string()),
         ("line_items[0][price_data][currency]", p.currency.clone()),
@@ -1160,7 +1163,6 @@ mod tests {
             pairs(&form),
             vec![
                 ("mode", "payment"),
-                ("payment_method_types[0]", "card"),
                 // Keeps the session in the order's currency
                 ("adaptive_pricing[enabled]", "false"),
                 ("line_items[0][quantity]", "1"),
