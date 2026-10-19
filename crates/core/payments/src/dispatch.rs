@@ -490,14 +490,25 @@ struct Tally {
     reversed: u32,
     redriven: u32,
     errors: u32,
+    /// Paid upgrades deleted with a membership whose number a release put
+    /// back in the pool; each one is logged at error level, to refund
+    unrefunded_upgrades: u32,
 }
 
 impl Tally {
     fn summary(&self) -> String {
-        format!(
+        let mut summary = format!(
             "expired={}, resumed={}, reversed={}, redriven={}, errors={}",
             self.expired, self.resumed, self.reversed, self.redriven, self.errors
-        )
+        );
+        // Only when there are any, so the usual line stays as it was
+        if self.unrefunded_upgrades > 0 {
+            summary.push_str(&format!(
+                ", unrefunded_upgrades={}",
+                self.unrefunded_upgrades
+            ));
+        }
+        summary
     }
 
     fn error(&mut self, what: &str, id: &str, reason: &str) {
@@ -524,7 +535,9 @@ impl Tally {
 ///    → resumed
 /// 4. Fulfilled orders with a reversal still pending → reversed; then
 ///    Cipher numbers whose release a refund decided but did not finish →
-///    finished (membership deleted, number released, order Refunded)
+///    finished (membership deleted, order Refunded, number released; paid
+///    upgrades deleted with a membership are counted under
+///    `unrefunded_upgrades`)
 /// 5. Fulfilled orders that list open disputes: each dispute is re-read at
 ///    Stripe and its current status applied (counted under `reversed` when
 ///    it changed the order), so a lost close event cannot keep a badge
@@ -759,7 +772,10 @@ async fn finish_number_releases(db: &Database, now_ms: i64, tally: &mut Tally) {
         let Some(order_id) = row.order_id else {
             continue;
         };
-        match engine::finish_number_release(db, &order_id, now_ms).await {
+        let mut unrefunded = 0;
+        let outcome = engine::finish_number_release(db, &order_id, now_ms, &mut unrefunded).await;
+        tally.unrefunded_upgrades += unrefunded;
+        match outcome {
             Ok(ReverseOutcome::Applied) => tally.reversed += 1,
             Ok(ReverseOutcome::RecordedPending | ReverseOutcome::NoOp | ReverseOutcome::Busy) => {}
             Err(error) => tally.error("order", &order_id, &engine_text("release", &error)),

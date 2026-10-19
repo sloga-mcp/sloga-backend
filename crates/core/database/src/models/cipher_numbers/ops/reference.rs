@@ -86,6 +86,16 @@ impl AbstractCipherNumbers for ReferenceDb {
         }
     }
 
+    async fn cancel_cipher_number_release(&self, order_id: &str) -> Result<bool> {
+        // Find and unset while the map mutex is held; `order_id` stays
+        let mut numbers = self.cipher_numbers.lock().await;
+        Ok(numbers
+            .values_mut()
+            .find(|row| row.order_id.as_deref() == Some(order_id))
+            .and_then(|row| row.release_pending_at.take())
+            .is_some())
+    }
+
     async fn release_cipher_number(&self, order_id: &str) -> Result<bool> {
         // Find and unset while the map mutex is held, as in claim
         let mut numbers = self.cipher_numbers.lock().await;

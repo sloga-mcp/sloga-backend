@@ -50,6 +50,19 @@ impl AbstractCipherMemberships for MongoDb {
         query!(self, find_one_by_id, COL, user_id)
     }
 
+    async fn fetch_cipher_membership_by_number(
+        &self,
+        number: u32,
+    ) -> Result<Option<CipherMembership>> {
+        // bson stores the u32 as Int64; served by the unique `number` index
+        self.col::<CipherMembership>(COL)
+            .find_one(doc! {
+                "number": i64::from(number)
+            })
+            .await
+            .map_err(|_| create_database_error!("find_one", COL))
+    }
+
     async fn update_cipher_membership_if_version(
         &self,
         m: &CipherMembership,

@@ -15,6 +15,14 @@ pub trait AbstractCipherMemberships: Sync + Send {
     /// Fetch a user's membership, revoked or not
     async fn fetch_cipher_membership(&self, user_id: &str) -> Result<Option<CipherMembership>>;
 
+    /// Fetch the row holding `number`, revoked or not, whoever's it is (the
+    /// unique `number` index allows at most one). A number goes back to the
+    /// pool only while this is None.
+    async fn fetch_cipher_membership_by_number(
+        &self,
+        number: u32,
+    ) -> Result<Option<CipherMembership>>;
+
     /// Compare-and-swap replace: write `m` in full with
     /// `version = expected + 1` WHERE `_id = m.user_id` AND
     /// `version == expected` (`expected == 0` also matches a row stored
@@ -423,6 +431,45 @@ mod tests {
                 .unwrap());
             assert_eq!(
                 db.fetch_cipher_membership(&row.user_id).await.unwrap(),
+                None
+            );
+        });
+    }
+
+    #[tokio::test]
+    async fn fetch_by_number_finds_the_holder_revoked_or_not() {
+        database_test!(|db| async move {
+            create_cipher_membership_indexes(&db).await;
+
+            let active = membership("01USERL0000000000000000000", 13);
+            let mut revoked = membership("01USERM0000000000000000000", 14);
+            assert!(db.insert_cipher_membership(&active).await.unwrap());
+            assert!(db.insert_cipher_membership(&revoked).await.unwrap());
+            revoked.revoked_at = Some(2_000_000);
+            revoked.revoke_reason = Some(CipherRevokeReason::Admin);
+            assert!(db
+                .update_cipher_membership_if_version(&revoked, 0)
+                .await
+                .unwrap());
+            revoked.version = 1;
+
+            assert_eq!(
+                db.fetch_cipher_membership_by_number(13).await.unwrap(),
+                Some(active.clone())
+            );
+            assert_eq!(
+                db.fetch_cipher_membership_by_number(14).await.unwrap(),
+                Some(revoked)
+            );
+            assert_eq!(
+                db.fetch_cipher_membership_by_number(15).await.unwrap(),
+                None
+            );
+
+            // Gone once the row is deleted
+            db.delete_cipher_membership(&active.user_id).await.unwrap();
+            assert_eq!(
+                db.fetch_cipher_membership_by_number(13).await.unwrap(),
                 None
             );
         });

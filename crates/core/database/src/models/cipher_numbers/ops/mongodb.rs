@@ -166,6 +166,25 @@ impl AbstractCipherNumbers for MongoDb {
             .map_err(|_| create_database_error!("update_one", COL))
     }
 
+    async fn cancel_cipher_number_release(&self, order_id: &str) -> Result<bool> {
+        // Only the mark goes; the row stays claimed by this order
+        self.col::<Document>(COL)
+            .update_one(
+                doc! {
+                    "order_id": order_id,
+                    "release_pending_at": { "$exists": true }
+                },
+                doc! {
+                    "$unset": {
+                        "release_pending_at": 1_i32
+                    }
+                },
+            )
+            .await
+            .map(|result| result.modified_count == 1)
+            .map_err(|_| create_database_error!("update_one", COL))
+    }
+
     async fn fetch_cipher_numbers_release_pending(&self, limit: i64) -> Result<Vec<CipherNumber>> {
         // The table is at most the seeded 1000 rows, so no index is needed
         self.col::<CipherNumber>(COL)

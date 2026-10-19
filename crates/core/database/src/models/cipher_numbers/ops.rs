@@ -47,6 +47,12 @@ pub trait AbstractCipherNumbers: Sync + Send {
     /// retired number (refunded later, or a lost dispute) is never released.
     async fn release_cipher_number(&self, order_id: &str) -> Result<bool>;
 
+    /// Drop a release decision without releasing: unset `release_pending_at`
+    /// on the row held by `order_id`, which stays claimed (the number is
+    /// retired). Ok(true) if a mark was cleared, Ok(false) if the order holds
+    /// no number or its row is not marked.
+    async fn cancel_cipher_number_release(&self, order_id: &str) -> Result<bool>;
+
     /// Rows whose release was decided but not finished (`release_pending_at`
     /// set, still claimed), oldest decision first, up to `limit`: the
     /// reconcile sweep finishes them
@@ -372,6 +378,48 @@ mod tests {
                     assert!(row.get("release_pending_at").is_none());
                 }
             }
+        });
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_release_keeps_the_number_claimed() {
+        database_test!(|db| async move {
+            create_cipher_number_indexes(&db).await;
+            db.seed_cipher_numbers(3).await.unwrap();
+            db.claim_cipher_number("order-a", 3).await.unwrap();
+            db.claim_cipher_number("order-b", 3).await.unwrap();
+            assert!(db.mark_cipher_number_release("order-a", 10).await.unwrap());
+            assert!(db.mark_cipher_number_release("order-b", 20).await.unwrap());
+
+            // Unknown order, or held but unmarked: nothing to cancel
+            assert!(!db
+                .cancel_cipher_number_release("order-unknown")
+                .await
+                .unwrap());
+
+            assert!(db.cancel_cipher_number_release("order-a").await.unwrap());
+            assert!(!db.cancel_cipher_number_release("order-a").await.unwrap());
+            assert_eq!(
+                db.fetch_cipher_number_row_by_order("order-a")
+                    .await
+                    .unwrap()
+                    .map(|row| (row.number, row.release_pending_at)),
+                Some((1, None))
+            );
+
+            // Still claimed (retired), and no longer pending; the other
+            // order's mark is untouched
+            assert_eq!(db.count_claimed_cipher_numbers().await.unwrap(), 2);
+            assert_eq!(
+                db.fetch_cipher_numbers_release_pending(10)
+                    .await
+                    .unwrap()
+                    .iter()
+                    .map(|row| row.number)
+                    .collect::<Vec<_>>(),
+                vec![2]
+            );
+            assert_eq!(db.claim_cipher_number("order-c", 3).await.unwrap(), Some(3));
         });
     }
 

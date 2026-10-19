@@ -27,6 +27,17 @@ impl AbstractCipherMemberships for ReferenceDb {
         Ok(memberships.get(user_id).cloned())
     }
 
+    async fn fetch_cipher_membership_by_number(
+        &self,
+        number: u32,
+    ) -> Result<Option<CipherMembership>> {
+        let memberships = self.cipher_memberships.lock().await;
+        Ok(memberships
+            .values()
+            .find(|row| row.number == number)
+            .cloned())
+    }
+
     async fn update_cipher_membership_if_version(
         &self,
         m: &CipherMembership,
