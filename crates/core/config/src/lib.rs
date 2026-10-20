@@ -818,6 +818,11 @@ pub struct ApiStripe {
     pub cancel_url_shell: String,
     /// Maximum age, in seconds, of a webhook signature timestamp
     pub tolerance_secs: u64,
+    /// Stripe Tax on Checkout, with tax-inclusive prices: the buyer pays the
+    /// list price and Stripe carves out the tax where we are registered.
+    /// Stripe refuses every checkout while Stripe Tax is not active in the
+    /// account, so turn this on only once it is
+    pub automatic_tax: bool,
 }
 
 impl Default for ApiStripe {
@@ -831,6 +836,7 @@ impl Default for ApiStripe {
             success_url_shell: "https://sloga.gg/cipher/thanks/".to_string(),
             cancel_url_shell: "https://sloga.gg/cipher/".to_string(),
             tolerance_secs: 300,
+            automatic_tax: false,
         }
     }
 }
@@ -890,6 +896,7 @@ impl std::fmt::Debug for ApiStripe {
             success_url_shell,
             cancel_url_shell,
             tolerance_secs,
+            automatic_tax,
         } = self;
 
         f.debug_struct("ApiStripe")
@@ -901,6 +908,7 @@ impl std::fmt::Debug for ApiStripe {
             .field("success_url_shell", success_url_shell)
             .field("cancel_url_shell", cancel_url_shell)
             .field("tolerance_secs", tolerance_secs)
+            .field("automatic_tax", automatic_tax)
             .finish()
     }
 }
@@ -3235,7 +3243,7 @@ mod payments_config_tests {
         );
         assert_eq!(
             debug,
-            r#"ApiStripe { secret_key: "<redacted>", webhook_secret: "<redacted>", expect_livemode: false, success_url_web: "https://app.sloga.gg/settings?cipher=success", cancel_url_web: "https://app.sloga.gg/settings?cipher=cancel", success_url_shell: "https://sloga.gg/cipher/thanks/", cancel_url_shell: "https://sloga.gg/cipher/", tolerance_secs: 300 }"#
+            r#"ApiStripe { secret_key: "<redacted>", webhook_secret: "<redacted>", expect_livemode: false, success_url_web: "https://app.sloga.gg/settings?cipher=success", cancel_url_web: "https://app.sloga.gg/settings?cipher=cancel", success_url_shell: "https://sloga.gg/cipher/thanks/", cancel_url_shell: "https://sloga.gg/cipher/", tolerance_secs: 300, automatic_tax: false }"#
         );
 
         // Empty secrets say so, so a missing override is visible in the dump

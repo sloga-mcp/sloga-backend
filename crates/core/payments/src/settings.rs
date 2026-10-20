@@ -24,6 +24,8 @@ pub struct PaymentsSettings {
     pub expect_livemode: bool,
     /// Maximum age, in seconds, of a webhook signature timestamp
     pub tolerance_secs: u64,
+    /// Stripe Tax on Checkout, tax-inclusive (`api.stripe.automatic_tax`)
+    pub automatic_tax: bool,
     /// Stripe API secret key; never printed
     pub secret_key: String,
     /// Webhook endpoint signing secret; never printed
@@ -55,6 +57,7 @@ impl std::fmt::Debug for PaymentsSettings {
             close_at_ms,
             expect_livemode,
             tolerance_secs,
+            automatic_tax,
             secret_key,
             webhook_secret,
             success_url_web,
@@ -70,6 +73,7 @@ impl std::fmt::Debug for PaymentsSettings {
             .field("close_at_ms", close_at_ms)
             .field("expect_livemode", expect_livemode)
             .field("tolerance_secs", tolerance_secs)
+            .field("automatic_tax", automatic_tax)
             .field("secret_key", &redact(secret_key))
             .field("webhook_secret", &redact(webhook_secret))
             .field("success_url_web", success_url_web)
@@ -112,6 +116,7 @@ impl PaymentsSettings {
             close_at_ms,
             expect_livemode: stripe.expect_livemode,
             tolerance_secs: stripe.tolerance_secs,
+            automatic_tax: stripe.automatic_tax,
             secret_key: stripe.secret_key.clone(),
             webhook_secret: stripe.webhook_secret.clone(),
             success_url_web: stripe.success_url_web.clone(),
@@ -306,10 +311,12 @@ mod tests {
             success_url_shell: "https://s/s".to_string(),
             cancel_url_shell: "https://s/c".to_string(),
             tolerance_secs: 42,
+            automatic_tax: true,
         };
         let s = PaymentsSettings::from_parts(&payments(500, ""), &stripe).unwrap();
         assert!(s.expect_livemode);
         assert_eq!(s.tolerance_secs, 42);
+        assert!(s.automatic_tax);
         assert_eq!(s.secret_key, "sk_test_abc");
         assert_eq!(s.webhook_secret, "whsec_abc");
         assert_eq!(s.success_url_web, "https://w/s");

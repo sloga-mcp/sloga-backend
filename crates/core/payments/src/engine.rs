@@ -585,6 +585,7 @@ async fn start_session(
         success_url,
         cancel_url,
         expires_at_secs,
+        automatic_tax: s.automatic_tax,
     };
     let order_id = order.id.clone();
 
@@ -2566,6 +2567,7 @@ mod tests {
             close_at_ms: None,
             expect_livemode: false,
             tolerance_secs: 300,
+            automatic_tax: false,
             secret_key: String::new(),
             webhook_secret: String::new(),
             success_url_web: "https://app.test/settings?cipher=success".to_string(),

@@ -958,6 +958,7 @@ mod tests {
             close_at_ms: None,
             expect_livemode: false,
             tolerance_secs: 300,
+            automatic_tax: false,
             secret_key: SECRET_MARKER.to_string(),
             webhook_secret: "whsec_test_dispatch".to_string(),
             success_url_web: "https://app.sloga.gg/settings?cipher=success".to_string(),

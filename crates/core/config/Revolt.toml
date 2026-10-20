@@ -227,6 +227,9 @@ success_url_shell = "https://sloga.gg/cipher/thanks/"
 cancel_url_shell = "https://sloga.gg/cipher/"
 # Maximum age of a webhook signature timestamp, in seconds
 tolerance_secs = 300
+# Stripe Tax on Checkout with tax-inclusive prices (the buyer pays the list price); Stripe
+# refuses every checkout until Stripe Tax is active in the account, so turn on only after that
+automatic_tax = false
 
 [pushd]
 # this changes the names of the queues to not overlap 

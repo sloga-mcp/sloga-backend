@@ -101,6 +101,8 @@ pub struct CheckoutSessionParams {
     pub cancel_url: String,
     /// Session expiry, seconds since the Unix epoch
     pub expires_at_secs: i64,
+    /// Stripe Tax on, prices tax-inclusive (`api.stripe.automatic_tax`)
+    pub automatic_tax: bool,
 }
 
 /// A Checkout Session as Stripe reports it
@@ -261,6 +263,9 @@ pub const TERMS_ACCEPTANCE_MESSAGE: &str = "I agree to the \
     [Terms of Service](https://sloga.gg/legal/terms.html). My Cipher badge is supplied as soon \
     as my payment goes through, and I can ask for a full refund within 14 days.";
 
+/// Stripe tax code for a Cipher: General - Electronically Supplied Services
+pub const CIPHER_TAX_CODE: &str = "txcd_10000000";
+
 /// Form body for `POST /v1/checkout/sessions`, in Stripe's bracket notation.
 /// No `payment_method_types`: since API version 2026-09-30.endive Stripe
 /// refuses it and takes the payment methods from the Dashboard (Settings,
@@ -278,8 +283,12 @@ pub const TERMS_ACCEPTANCE_MESSAGE: &str = "I agree to the \
 /// until a Terms of Service URL is set in the Dashboard (Settings, Public
 /// details); until then every checkout fails with `PaymentProviderError`
 /// and its order is left SessionFailed (it never blocks a later checkout).
+///
+/// With `automatic_tax`, Stripe Tax is on and the price is tax-inclusive,
+/// so `amount_total` still equals the order amount and the fulfilment
+/// amount check is unchanged.
 pub fn checkout_form(p: &CheckoutSessionParams) -> Vec<(String, String)> {
-    [
+    let mut form: Vec<(String, String)> = [
         ("mode", "payment".to_string()),
         ("adaptive_pricing[enabled]", "false".to_string()),
         ("line_items[0][quantity]", "1".to_string()),
@@ -312,7 +321,21 @@ pub fn checkout_form(p: &CheckoutSessionParams) -> Vec<(String, String)> {
     ]
     .into_iter()
     .map(|(key, value)| (key.to_string(), value))
-    .collect()
+    .collect();
+    if p.automatic_tax {
+        form.extend(
+            [
+                ("automatic_tax[enabled]", "true"),
+                ("line_items[0][price_data][tax_behavior]", "inclusive"),
+                (
+                    "line_items[0][price_data][product_data][tax_code]",
+                    CIPHER_TAX_CODE,
+                ),
+            ]
+            .map(|(key, value)| (key.to_string(), value.to_string())),
+        );
+    }
+    form
 }
 
 /// Whether `id` is safe to place in a request path: 1 to 255 characters,
@@ -1147,6 +1170,7 @@ mod tests {
             success_url: "https://sloga.gg/cipher/thanks".to_string(),
             cancel_url: "https://sloga.gg/cipher".to_string(),
             expires_at_secs: 1_729_002_100,
+            automatic_tax: false,
         }
     }
 
@@ -1189,6 +1213,29 @@ mod tests {
                     "I agree to the [Terms of Service](https://sloga.gg/legal/terms.html). \
                      My Cipher badge is supplied as soon as my payment goes through, and I \
                      can ask for a full refund within 14 days."
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn checkout_form_with_automatic_tax_adds_inclusive_tax() {
+        let without = checkout_form(&params());
+        let with = checkout_form(&CheckoutSessionParams {
+            automatic_tax: true,
+            ..params()
+        });
+
+        // The same form, plus Stripe Tax with a tax-inclusive price
+        assert_eq!(&with[..without.len()], &without[..]);
+        assert_eq!(
+            pairs(&with[without.len()..]),
+            vec![
+                ("automatic_tax[enabled]", "true"),
+                ("line_items[0][price_data][tax_behavior]", "inclusive"),
+                (
+                    "line_items[0][price_data][product_data][tax_code]",
+                    "txcd_10000000"
                 ),
             ]
         );
