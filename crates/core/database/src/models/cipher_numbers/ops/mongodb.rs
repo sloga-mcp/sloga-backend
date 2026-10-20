@@ -1,4 +1,5 @@
 use bson::Document;
+use futures::TryStreamExt;
 use mongodb::options::{FindOneAndUpdateOptions, InsertManyOptions, ReturnDocument};
 use revolt_result::Result;
 
@@ -104,6 +105,102 @@ impl AbstractCipherNumbers for MongoDb {
             .map_err(|_| create_database_error!("find_one", COL))
     }
 
+    async fn fetch_cipher_number_row_by_order(
+        &self,
+        order_id: &str,
+    ) -> Result<Option<CipherNumber>> {
+        self.col::<CipherNumber>(COL)
+            .find_one(doc! {
+                "order_id": order_id
+            })
+            .await
+            .map_err(|_| create_database_error!("find_one", COL))
+    }
+
+    async fn mark_cipher_number_release(&self, order_id: &str, at: i64) -> Result<bool> {
+        // Only an unmarked row is written, so the first decision's time
+        // stays; an already marked row is found by the read below
+        let marked = self
+            .col::<Document>(COL)
+            .update_one(
+                doc! {
+                    "order_id": order_id,
+                    "release_pending_at": { "$exists": false }
+                },
+                doc! {
+                    "$set": {
+                        "release_pending_at": at
+                    }
+                },
+            )
+            .await
+            .map_err(|_| create_database_error!("update_one", COL))?;
+        if marked.matched_count == 1 {
+            return Ok(true);
+        }
+
+        Ok(self
+            .fetch_cipher_number_row_by_order(order_id)
+            .await?
+            .is_some_and(|row| row.release_pending_at.is_some()))
+    }
+
+    async fn release_cipher_number(&self, order_id: &str) -> Result<bool> {
+        // One update_one: the match on this order's row and the unset happen
+        // under one document lock. The unique partial order_id index means
+        // at most one row matches; a row another order holds never does.
+        self.col::<Document>(COL)
+            .update_one(
+                doc! {
+                    "order_id": order_id
+                },
+                doc! {
+                    "$unset": {
+                        "order_id": 1_i32,
+                        "release_pending_at": 1_i32
+                    }
+                },
+            )
+            .await
+            .map(|result| result.modified_count == 1)
+            .map_err(|_| create_database_error!("update_one", COL))
+    }
+
+    async fn cancel_cipher_number_release(&self, order_id: &str) -> Result<bool> {
+        // Only the mark goes; the row stays claimed by this order
+        self.col::<Document>(COL)
+            .update_one(
+                doc! {
+                    "order_id": order_id,
+                    "release_pending_at": { "$exists": true }
+                },
+                doc! {
+                    "$unset": {
+                        "release_pending_at": 1_i32
+                    }
+                },
+            )
+            .await
+            .map(|result| result.modified_count == 1)
+            .map_err(|_| create_database_error!("update_one", COL))
+    }
+
+    async fn fetch_cipher_numbers_release_pending(&self, limit: i64) -> Result<Vec<CipherNumber>> {
+        // The table is at most the seeded 1000 rows, so no index is needed
+        self.col::<CipherNumber>(COL)
+            .find(doc! {
+                "order_id": { "$exists": true },
+                "release_pending_at": { "$exists": true }
+            })
+            .sort(doc! { "release_pending_at": 1_i32, "_id": 1_i32 })
+            .limit(limit)
+            .await
+            .map_err(|_| create_database_error!("find", COL))?
+            .try_collect()
+            .await
+            .map_err(|_| create_database_error!("collect", COL))
+    }
+
     async fn count_claimed_cipher_numbers(&self) -> Result<u32> {
         let count = self
             .col::<Document>(COL)
@@ -137,6 +234,7 @@ impl AbstractCipherNumbers for MongoDb {
                 .map(|number| CipherNumber {
                     number,
                     order_id: None,
+                    release_pending_at: None,
                 })
                 .collect();
 

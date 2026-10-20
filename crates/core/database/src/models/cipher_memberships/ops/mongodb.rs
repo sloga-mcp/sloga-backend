@@ -50,6 +50,19 @@ impl AbstractCipherMemberships for MongoDb {
         query!(self, find_one_by_id, COL, user_id)
     }
 
+    async fn fetch_cipher_membership_by_number(
+        &self,
+        number: u32,
+    ) -> Result<Option<CipherMembership>> {
+        // bson stores the u32 as Int64; served by the unique `number` index
+        self.col::<CipherMembership>(COL)
+            .find_one(doc! {
+                "number": i64::from(number)
+            })
+            .await
+            .map_err(|_| create_database_error!("find_one", COL))
+    }
+
     async fn update_cipher_membership_if_version(
         &self,
         m: &CipherMembership,
@@ -102,6 +115,38 @@ impl AbstractCipherMemberships for MongoDb {
             })
             .await
             .map(|_| ())
+            .map_err(|_| create_database_error!("delete_one", COL))
+    }
+
+    async fn delete_cipher_membership_if_version(
+        &self,
+        user_id: &str,
+        expected: u64,
+    ) -> Result<bool> {
+        let expected_bson =
+            i64::try_from(expected).map_err(|_| create_database_error!("delete_one", COL))?;
+
+        // Filter + delete under one document lock, with the same version
+        // match as the compare-and-swap replace
+        let filter = if expected == 0 {
+            doc! {
+                "_id": user_id,
+                "$or": [
+                    { "version": 0_i64 },
+                    { "version": { "$exists": false } }
+                ]
+            }
+        } else {
+            doc! {
+                "_id": user_id,
+                "version": expected_bson
+            }
+        };
+
+        self.col::<Document>(COL)
+            .delete_one(filter)
+            .await
+            .map(|result| result.deleted_count == 1)
             .map_err(|_| create_database_error!("delete_one", COL))
     }
 }

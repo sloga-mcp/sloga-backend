@@ -3,6 +3,8 @@ pub mod reference;
 
 use revolt_result::Result;
 
+use crate::CipherNumber;
+
 #[async_trait]
 pub trait AbstractCipherNumbers: Sync + Send {
     /// Claim the lowest number `<= cap` whose `order_id` is absent by
@@ -20,6 +22,41 @@ pub trait AbstractCipherNumbers: Sync + Send {
 
     /// Fetch the number claimed by an order, if any
     async fn fetch_cipher_number_by_order(&self, order_id: &str) -> Result<Option<u32>>;
+
+    /// The row held by `order_id`, if any
+    async fn fetch_cipher_number_row_by_order(
+        &self,
+        order_id: &str,
+    ) -> Result<Option<CipherNumber>>;
+
+    /// Record that the number held by `order_id` is to be released: set
+    /// `release_pending_at = at` on that one row unless it is set already
+    /// (the first decision's time is kept). Ok(true) if the row is marked
+    /// (now or before), Ok(false) if the order holds no number. The row
+    /// stays claimed until [`Self::release_cipher_number`].
+    async fn mark_cipher_number_release(&self, order_id: &str, at: i64) -> Result<bool>;
+
+    /// Put the number held by `order_id` back in the pool: unset `order_id`
+    /// and `release_pending_at` on that one row, atomically. Ok(true) if a
+    /// number was released, Ok(false) if the order holds none (never
+    /// claimed, or released already, so a retry is a no-op). No other row
+    /// is touched, so a number another order claimed since an earlier
+    /// release stays claimed.
+    ///
+    /// Only for a purchase refunded in full within the release window: a
+    /// retired number (refunded later, or a lost dispute) is never released.
+    async fn release_cipher_number(&self, order_id: &str) -> Result<bool>;
+
+    /// Drop a release decision without releasing: unset `release_pending_at`
+    /// on the row held by `order_id`, which stays claimed (the number is
+    /// retired). Ok(true) if a mark was cleared, Ok(false) if the order holds
+    /// no number or its row is not marked.
+    async fn cancel_cipher_number_release(&self, order_id: &str) -> Result<bool>;
+
+    /// Rows whose release was decided but not finished (`release_pending_at`
+    /// set, still claimed), oldest decision first, up to `limit`: the
+    /// reconcile sweep finishes them
+    async fn fetch_cipher_numbers_release_pending(&self, limit: i64) -> Result<Vec<CipherNumber>>;
 
     /// Count rows with `order_id` present (retired numbers included)
     async fn count_claimed_cipher_numbers(&self) -> Result<u32>;
@@ -178,6 +215,211 @@ mod tests {
             // Seeding nothing is a no-op, not an error
             db.seed_cipher_numbers(0).await.unwrap();
             assert_eq!(db.count_cipher_numbers().await.unwrap(), 4);
+        });
+    }
+
+    #[tokio::test]
+    async fn release_frees_only_the_orders_number_and_is_idempotent() {
+        database_test!(|db| async move {
+            create_cipher_number_indexes(&db).await;
+            db.seed_cipher_numbers(3).await.unwrap();
+            assert_eq!(db.claim_cipher_number("order-a", 3).await.unwrap(), Some(1));
+            assert_eq!(db.claim_cipher_number("order-b", 3).await.unwrap(), Some(2));
+
+            // An order that holds nothing releases nothing
+            assert!(!db.release_cipher_number("order-unknown").await.unwrap());
+            assert_eq!(db.count_claimed_cipher_numbers().await.unwrap(), 2);
+
+            assert!(db.release_cipher_number("order-a").await.unwrap());
+            assert_eq!(
+                db.fetch_cipher_number_by_order("order-a").await.unwrap(),
+                None
+            );
+            assert_eq!(db.count_claimed_cipher_numbers().await.unwrap(), 1);
+            // The other order's number is untouched
+            assert_eq!(
+                db.fetch_cipher_number_by_order("order-b").await.unwrap(),
+                Some(2)
+            );
+
+            // A retry is a no-op
+            assert!(!db.release_cipher_number("order-a").await.unwrap());
+
+            // The released number is the lowest free one again, and a new
+            // order claims it under the unique order_id index
+            assert_eq!(db.claim_cipher_number("order-c", 3).await.unwrap(), Some(1));
+
+            // A late retry of the old release never frees the new claim
+            assert!(!db.release_cipher_number("order-a").await.unwrap());
+            assert_eq!(
+                db.fetch_cipher_number_by_order("order-c").await.unwrap(),
+                Some(1)
+            );
+            assert_eq!(db.count_claimed_cipher_numbers().await.unwrap(), 2);
+
+            match &db {
+                crate::Database::Reference(_) => {}
+                #[cfg(feature = "mongodb")]
+                crate::Database::MongoDb(mongo) => {
+                    // Released means the field is gone, not null: the claim
+                    // filter is `$exists: false` and the index is partial
+                    // on `$type: "string"`
+                    assert!(db.release_cipher_number("order-b").await.unwrap());
+                    let row = mongo
+                        .col::<bson::Document>("cipher_numbers")
+                        .find_one(bson::doc! { "_id": 2_i64 })
+                        .await
+                        .unwrap()
+                        .expect("seeded row");
+                    assert!(row.get("order_id").is_none());
+                }
+            }
+        });
+    }
+
+    #[tokio::test]
+    async fn a_release_mark_is_durable_until_the_release() {
+        database_test!(|db| async move {
+            create_cipher_number_indexes(&db).await;
+            db.seed_cipher_numbers(4).await.unwrap();
+            for order in ["order-a", "order-b", "order-c"] {
+                db.claim_cipher_number(order, 4).await.unwrap();
+            }
+
+            // Nothing held, nothing marked
+            assert!(!db
+                .mark_cipher_number_release("order-unknown", 10)
+                .await
+                .unwrap());
+            assert!(db
+                .fetch_cipher_numbers_release_pending(10)
+                .await
+                .unwrap()
+                .is_empty());
+
+            assert!(db.mark_cipher_number_release("order-b", 20).await.unwrap());
+            assert!(db.mark_cipher_number_release("order-a", 30).await.unwrap());
+            // Marking again keeps the first decision's time
+            assert!(db.mark_cipher_number_release("order-b", 99).await.unwrap());
+
+            let row = db
+                .fetch_cipher_number_row_by_order("order-b")
+                .await
+                .unwrap()
+                .expect("held row");
+            assert_eq!((row.number, row.release_pending_at), (2, Some(20)));
+            assert_eq!(
+                db.fetch_cipher_number_row_by_order("order-c")
+                    .await
+                    .unwrap()
+                    .map(|row| row.release_pending_at),
+                Some(None)
+            );
+
+            // A marked number is still claimed: not handed out, counted
+            assert_eq!(db.count_claimed_cipher_numbers().await.unwrap(), 3);
+            assert_eq!(db.claim_cipher_number("order-d", 4).await.unwrap(), Some(4));
+
+            // Oldest decision first, bounded
+            let pending = db.fetch_cipher_numbers_release_pending(10).await.unwrap();
+            assert_eq!(
+                pending
+                    .iter()
+                    .map(|row| (row.number, row.order_id.clone()))
+                    .collect::<Vec<_>>(),
+                vec![
+                    (2, Some("order-b".to_string())),
+                    (1, Some("order-a".to_string()))
+                ]
+            );
+            assert_eq!(
+                db.fetch_cipher_numbers_release_pending(1)
+                    .await
+                    .unwrap()
+                    .len(),
+                1
+            );
+
+            // The release clears both fields together
+            assert!(db.release_cipher_number("order-b").await.unwrap());
+            assert_eq!(
+                db.fetch_cipher_number_row_by_order("order-b")
+                    .await
+                    .unwrap(),
+                None
+            );
+            assert_eq!(
+                db.fetch_cipher_numbers_release_pending(10)
+                    .await
+                    .unwrap()
+                    .len(),
+                1
+            );
+            assert_eq!(db.claim_cipher_number("order-e", 4).await.unwrap(), Some(2));
+            assert_eq!(
+                db.fetch_cipher_number_row_by_order("order-e")
+                    .await
+                    .unwrap()
+                    .and_then(|row| row.release_pending_at),
+                None,
+                "a re-claimed number carries no stale mark"
+            );
+
+            match &db {
+                crate::Database::Reference(_) => {}
+                #[cfg(feature = "mongodb")]
+                crate::Database::MongoDb(mongo) => {
+                    let row = mongo
+                        .col::<bson::Document>("cipher_numbers")
+                        .find_one(bson::doc! { "_id": 2_i64 })
+                        .await
+                        .unwrap()
+                        .expect("seeded row");
+                    assert!(row.get("release_pending_at").is_none());
+                }
+            }
+        });
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_release_keeps_the_number_claimed() {
+        database_test!(|db| async move {
+            create_cipher_number_indexes(&db).await;
+            db.seed_cipher_numbers(3).await.unwrap();
+            db.claim_cipher_number("order-a", 3).await.unwrap();
+            db.claim_cipher_number("order-b", 3).await.unwrap();
+            assert!(db.mark_cipher_number_release("order-a", 10).await.unwrap());
+            assert!(db.mark_cipher_number_release("order-b", 20).await.unwrap());
+
+            // Unknown order, or held but unmarked: nothing to cancel
+            assert!(!db
+                .cancel_cipher_number_release("order-unknown")
+                .await
+                .unwrap());
+
+            assert!(db.cancel_cipher_number_release("order-a").await.unwrap());
+            assert!(!db.cancel_cipher_number_release("order-a").await.unwrap());
+            assert_eq!(
+                db.fetch_cipher_number_row_by_order("order-a")
+                    .await
+                    .unwrap()
+                    .map(|row| (row.number, row.release_pending_at)),
+                Some((1, None))
+            );
+
+            // Still claimed (retired), and no longer pending; the other
+            // order's mark is untouched
+            assert_eq!(db.count_claimed_cipher_numbers().await.unwrap(), 2);
+            assert_eq!(
+                db.fetch_cipher_numbers_release_pending(10)
+                    .await
+                    .unwrap()
+                    .iter()
+                    .map(|row| row.number)
+                    .collect::<Vec<_>>(),
+                vec![2]
+            );
+            assert_eq!(db.claim_cipher_number("order-c", 3).await.unwrap(), Some(3));
         });
     }
 

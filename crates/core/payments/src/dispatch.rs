@@ -28,11 +28,20 @@
 //! a newer one; applying where the dispute is now, through idempotent
 //! reversals, makes every delivery order converge. A failed lookup is a
 //! retry, never a guess.
+//!
+//! Decision: `charge.refunded` is judged from the event itself
+//! ([`refund_facts`]): its `created` is when the refund was made (the
+//! 14-day refund window is measured to it, not to when a late or re-driven
+//! delivery is processed), and its Charge says whether the refund is full.
+//! The event is either signature-verified (webhook) or fetched from Stripe
+//! by id (re-drive), and each refund has its own event, so the snapshot is
+//! the right one to read.
 use log::{info, warn};
 use revolt_database::{Database, OrderState, PaymentEvent, PaymentEventState, ReversalPending};
 use revolt_result::{Error, Result};
+use serde_json::Value;
 
-use crate::engine::{self, FulfilOutcome, ReverseKind, ReverseOutcome};
+use crate::engine::{self, FulfilOutcome, RefundFacts, ReverseKind, ReverseOutcome};
 use crate::settings::PaymentsSettings;
 use crate::stripe::event::{
     obj_expandable_id, obj_str, StripeEvent, CHARGE_DISPUTE_PREFIX, CHARGE_REFUNDED,
@@ -286,7 +295,12 @@ async fn process(
                 Err(reason) => return Step::Retry(reason),
             };
 
-            match engine::reverse_order(db, stripe, s, &order_id, kind, now_ms).await {
+            let refund = (kind == ReverseKind::Refund).then(|| refund_facts(event, now_ms));
+            match Box::pin(engine::reverse_order(
+                db, stripe, s, &order_id, kind, refund, now_ms,
+            ))
+            .await
+            {
                 Ok(outcome) => reverse_step(outcome),
                 Err(error) => Step::Retry(engine_text("reverse", &error)),
             }
@@ -316,6 +330,33 @@ async fn process(
     }
 }
 
+/// What a `charge.refunded` event says about its refund: when it was made
+/// (the signed event's `created`, never later than `now_ms`, so a late or
+/// re-driven delivery is judged by when the owner refunded) and whether the
+/// charge is now refunded in full
+pub(crate) fn refund_facts(event: &StripeEvent, now_ms: i64) -> RefundFacts {
+    RefundFacts {
+        refunded_at_ms: event.created.saturating_mul(1000).min(now_ms),
+        full: charge_fully_refunded(&event.object),
+    }
+}
+
+/// Whether a Charge object is refunded in full: Stripe's `refunded` flag,
+/// or `amount_refunded` reaching a positive `amount`. Anything missing or
+/// malformed is "not full" (fails toward revoke + retire).
+pub(crate) fn charge_fully_refunded(charge: &Value) -> bool {
+    if charge.get("refunded").and_then(Value::as_bool) == Some(true) {
+        return true;
+    }
+    match (
+        charge.get("amount").and_then(Value::as_i64),
+        charge.get("amount_refunded").and_then(Value::as_i64),
+    ) {
+        (Some(amount), Some(refunded)) => amount > 0 && refunded >= amount,
+        _ => false,
+    }
+}
+
 fn fulfil_step(outcome: FulfilOutcome) -> Step {
     match outcome {
         FulfilOutcome::Fulfilled | FulfilOutcome::AlreadyFulfilled | FulfilOutcome::Voided(_) => {
@@ -323,8 +364,11 @@ fn fulfil_step(outcome: FulfilOutcome) -> Step {
         }
         // The order is not in a state fulfilment applies to: nothing changed
         FulfilOutcome::Ignored => Step::Ignored,
-        // A completed card checkout is paid, so Stripe's view has not caught
-        // up yet: retry rather than settle (the Pending sweep is the backstop)
+        // The Dashboard offers only methods that confirm at once (card, Link,
+        // wallets, Cash App Pay, Amazon Pay, Affirm, Klarna; bank debits
+        // off), so a completed checkout is paid and Stripe's view has not
+        // caught up yet: retry rather than settle (the Pending sweep is the
+        // backstop)
         FulfilOutcome::NotPaid => Step::Retry("session not reported paid yet".to_string()),
         FulfilOutcome::LeaseHeld => Step::Retry("order lease held".to_string()),
         // Handled: the deferral is durable (the order stays Paid), and the
@@ -449,14 +493,27 @@ struct Tally {
     reversed: u32,
     redriven: u32,
     errors: u32,
+    /// Paid upgrades deleted with a membership whose number a release put
+    /// back in the pool; each one is logged at error level, to refund.
+    /// Sweep-only: a release the webhook finishes inline logs its upgrades
+    /// the same way but is not counted here.
+    unrefunded_upgrades: u32,
 }
 
 impl Tally {
     fn summary(&self) -> String {
-        format!(
+        let mut summary = format!(
             "expired={}, resumed={}, reversed={}, redriven={}, errors={}",
             self.expired, self.resumed, self.reversed, self.redriven, self.errors
-        )
+        );
+        // Only when there are any, so the usual line stays as it was
+        if self.unrefunded_upgrades > 0 {
+            summary.push_str(&format!(
+                ", unrefunded_upgrades={}",
+                self.unrefunded_upgrades
+            ));
+        }
+        summary
     }
 
     fn error(&mut self, what: &str, id: &str, reason: &str) {
@@ -481,7 +538,11 @@ impl Tally {
 ///    paid → fulfil; expired → Expired; open → left alone
 /// 3. Paid orders whose lease is free (a fulfilment that crashed or gave up)
 ///    → resumed
-/// 4. Fulfilled orders with a reversal still pending → reversed
+/// 4. Fulfilled orders with a reversal still pending → reversed; then
+///    Cipher numbers whose release a refund decided but did not finish →
+///    finished (membership deleted, order Refunded, number released; paid
+///    upgrades deleted with a membership are counted under
+///    `unrefunded_upgrades`)
 /// 5. Fulfilled orders that list open disputes: each dispute is re-read at
 ///    Stripe and its current status applied (counted under `reversed` when
 ///    it changed the order), so a lost close event cannot keep a badge
@@ -515,6 +576,10 @@ pub async fn reconcile(
     let before = tally.errors;
     apply_pending_reversals(db, stripe, s, now_ms, &mut tally).await;
     tally.report("pending reversals", before);
+
+    let before = tally.errors;
+    finish_number_releases(db, now_ms, &mut tally).await;
+    tally.report("number releases", before);
 
     let before = tally.errors;
     recheck_open_disputes(db, stripe, s, now_ms, &mut tally).await;
@@ -609,8 +674,9 @@ async fn check_pending(
                 Ok(()) => tally.expired += 1,
                 Err(error) => tally.error("order", &order.id, &engine_text("expire", &error)),
             },
-            // Still open (or complete without payment, which card-only
-            // checkout never produces): leave it for a later sweep
+            // Still open (or complete without payment, which the
+            // confirm-at-once methods the Dashboard offers never produce):
+            // leave it for a later sweep
             _ => {}
         }
     }
@@ -688,10 +754,37 @@ async fn apply_pending_reversals(
             ReversalPending::DisputeLost => ReverseKind::DisputeLost,
         };
 
-        match engine::reverse_order(db, stripe, s, &order.id, kind, now_ms).await {
+        // A recorded refund carries no refund event: nothing says it was
+        // full, so it revokes and retires (fails closed)
+        match engine::reverse_order(db, stripe, s, &order.id, kind, None, now_ms).await {
             Ok(ReverseOutcome::Applied) => tally.reversed += 1,
             Ok(ReverseOutcome::RecordedPending | ReverseOutcome::NoOp | ReverseOutcome::Busy) => {}
             Err(error) => tally.error("order", &order.id, &engine_text("reverse", &error)),
+        }
+    }
+}
+
+/// Numbers whose release a refund decided but did not finish (a crash, a
+/// failed write, an event that will not come back): finished here
+async fn finish_number_releases(db: &Database, now_ms: i64, tally: &mut Tally) {
+    let rows = match db.fetch_cipher_numbers_release_pending(SWEEP_BATCH).await {
+        Ok(rows) => rows,
+        Err(error) => {
+            return tally.error("query", "number releases", &engine_text("fetch", &error))
+        }
+    };
+
+    for row in rows {
+        let Some(order_id) = row.order_id else {
+            continue;
+        };
+        let mut unrefunded = 0;
+        let outcome = engine::finish_number_release(db, &order_id, now_ms, &mut unrefunded).await;
+        tally.unrefunded_upgrades += unrefunded;
+        match outcome {
+            Ok(ReverseOutcome::Applied) => tally.reversed += 1,
+            Ok(ReverseOutcome::RecordedPending | ReverseOutcome::NoOp | ReverseOutcome::Busy) => {}
+            Err(error) => tally.error("order", &order_id, &engine_text("release", &error)),
         }
     }
 }
@@ -792,7 +885,10 @@ mod tests {
     use revolt_models::v0;
     use serde_json::{json, Value};
 
-    use super::{action_for, dispute_kind, handle_event, reconcile, Action, EventOutcome};
+    use super::{
+        action_for, charge_fully_refunded, dispute_kind, handle_event, reconcile, refund_facts,
+        Action, EventOutcome,
+    };
     use crate::engine::{sync_user_badge, ReverseKind, LEASE_MS};
     use crate::settings::PaymentsSettings;
     use crate::stripe::{
@@ -862,6 +958,7 @@ mod tests {
             close_at_ms: None,
             expect_livemode: false,
             tolerance_secs: 300,
+            automatic_tax: false,
             secret_key: SECRET_MARKER.to_string(),
             webhook_secret: "whsec_test_dispatch".to_string(),
             success_url_web: "https://app.sloga.gg/settings?cipher=success".to_string(),
@@ -2494,6 +2591,242 @@ mod tests {
         assert_eq!(in_flight.state, PaymentEventState::Failed);
         assert_eq!(in_flight.attempts, 1);
 
+        drop_db(&db).await;
+    }
+
+    // --- refunds: when made, and whether full ---------------------------
+
+    const DAY: i64 = 24 * 60 * MINUTE;
+
+    #[test]
+    fn a_charge_is_fully_refunded_by_its_flag_or_its_amounts() {
+        assert!(charge_fully_refunded(&json!({ "refunded": true })));
+        assert!(charge_fully_refunded(
+            &json!({ "amount": 9900, "amount_refunded": 9900 })
+        ));
+        assert!(!charge_fully_refunded(
+            &json!({ "refunded": false, "amount": 9900, "amount_refunded": 5000 })
+        ));
+        // Missing or malformed: not full (revoke + retire)
+        assert!(!charge_fully_refunded(&json!({})));
+        assert!(!charge_fully_refunded(
+            &json!({ "amount": 0, "amount_refunded": 0 })
+        ));
+        assert!(!charge_fully_refunded(&json!({ "refunded": "true" })));
+    }
+
+    #[test]
+    fn a_refund_is_dated_by_its_event_and_never_in_the_future() {
+        let mut refunded = event(
+            "evt_d",
+            "charge.refunded",
+            false,
+            json!({ "refunded": true }),
+        );
+        refunded.created = (NOW + 16 * DAY) / 1000;
+        let facts = refund_facts(&refunded, NOW + 19 * DAY);
+        assert_eq!(facts.refunded_at_ms, NOW + 16 * DAY);
+        assert!(facts.full);
+
+        // A `created` ahead of our clock is capped at now
+        refunded.created = (NOW + 30 * DAY) / 1000;
+        assert_eq!(refund_facts(&refunded, NOW).refunded_at_ms, NOW);
+    }
+
+    /// A Fulfilled new purchase of u1 paid at `paid_at`, holding a claimed
+    /// number, its membership and badge; the number
+    async fn paid_member(db: &Database, order_id: &str, payment_intent: &str, paid_at: i64) -> u32 {
+        insert_buyer(db).await;
+        db.seed_cipher_numbers(10).await.unwrap();
+        db.insert_payment_order(&PaymentOrder {
+            payment_intent_id: Some(payment_intent.to_string()),
+            paid_at: Some(paid_at),
+            fulfilled_at: Some(paid_at),
+            ..with_session(
+                order(order_id, OrderState::Fulfilled, paid_at - MINUTE),
+                &format!("cs_{order_id}"),
+            )
+        })
+        .await
+        .unwrap();
+        let number = db
+            .claim_cipher_number(order_id, 10)
+            .await
+            .unwrap()
+            .expect("a number");
+        assert!(db
+            .insert_cipher_membership(&CipherMembership {
+                user_id: "u1".to_string(),
+                number,
+                tier: v0::CipherTier::T99,
+                prot_grant: 16_500,
+                orders: vec![order_id.to_string()],
+                disputed_orders: vec![],
+                granted_at: paid_at,
+                revoked_at: None,
+                revoke_reason: None,
+                prot_posted_at: None,
+                version: 0,
+            })
+            .await
+            .unwrap());
+        sync_user_badge(db, "u1").await.unwrap();
+        number
+    }
+
+    fn refunded_charge(payment_intent: &str, amount_refunded: i64) -> Value {
+        json!({
+            "id": "ch_test_1",
+            "object": "charge",
+            "payment_intent": payment_intent,
+            "amount": 9900,
+            "amount_refunded": amount_refunded,
+            "refunded": amount_refunded >= 9900
+        })
+    }
+
+    #[tokio::test]
+    async fn a_redriven_refund_made_in_time_releases_the_number() {
+        let db = test_db().await;
+        let stripe = MockStripe::new();
+        let s = settings();
+        paid_member(&db, "o_rel", "pi_rel", NOW).await;
+
+        // Refunded in full on day 16 (inside the 14 days plus the grace);
+        // the delivery failed and the sweep re-drives it on day 19
+        let mut refunded = event(
+            "evt_rel",
+            "charge.refunded",
+            false,
+            refunded_charge("pi_rel", 9900),
+        );
+        refunded.created = (NOW + 16 * DAY) / 1000;
+        stripe.set_event(refunded);
+        db.insert_payment_event_if_absent(&event_row(
+            "evt_rel",
+            PaymentEventState::Failed,
+            NOW + 16 * DAY,
+            1,
+        ))
+        .await
+        .unwrap();
+
+        reconcile(&db, &stripe, &s, NOW + 19 * DAY).await.unwrap();
+        assert_eq!(
+            stored(&db, "evt_rel").await.state,
+            PaymentEventState::Processed
+        );
+        assert_eq!(db.fetch_cipher_membership("u1").await.unwrap(), None);
+        assert_eq!(
+            db.fetch_cipher_number_by_order("o_rel").await.unwrap(),
+            None
+        );
+        assert_eq!(badge(&db).await, None);
+        assert_eq!(
+            db.fetch_payment_order("o_rel")
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            OrderState::Refunded
+        );
+        drop_db(&db).await;
+    }
+
+    #[tokio::test]
+    async fn a_refund_made_after_the_grace_retires_the_number() {
+        let db = test_db().await;
+        let stripe = MockStripe::new();
+        let s = settings();
+        let number = paid_member(&db, "o_late", "pi_late", NOW).await;
+
+        let mut refunded = event(
+            "evt_late",
+            "charge.refunded",
+            false,
+            refunded_charge("pi_late", 9900),
+        );
+        refunded.created = (NOW + 18 * DAY) / 1000;
+        assert_eq!(
+            handle_event(&db, &stripe, &s, &refunded, NOW + 18 * DAY)
+                .await
+                .unwrap(),
+            EventOutcome::Processed
+        );
+        let m = db.fetch_cipher_membership("u1").await.unwrap().unwrap();
+        assert_eq!(m.revoke_reason, Some(CipherRevokeReason::Refund));
+        assert_eq!(
+            db.fetch_cipher_number_by_order("o_late").await.unwrap(),
+            Some(number)
+        );
+        drop_db(&db).await;
+    }
+
+    #[tokio::test]
+    async fn a_partial_refund_inside_the_window_retires_the_number() {
+        let db = test_db().await;
+        let stripe = MockStripe::new();
+        let s = settings();
+        let number = paid_member(&db, "o_part", "pi_part", NOW).await;
+
+        let mut refunded = event(
+            "evt_part",
+            "charge.refunded",
+            false,
+            refunded_charge("pi_part", 5000),
+        );
+        refunded.created = (NOW + DAY) / 1000;
+        assert_eq!(
+            handle_event(&db, &stripe, &s, &refunded, NOW + DAY)
+                .await
+                .unwrap(),
+            EventOutcome::Processed
+        );
+        let m = db.fetch_cipher_membership("u1").await.unwrap().unwrap();
+        assert!(!m.is_active());
+        assert_eq!(
+            db.fetch_cipher_number_by_order("o_part").await.unwrap(),
+            Some(number)
+        );
+        assert_eq!(badge(&db).await, None);
+        drop_db(&db).await;
+    }
+
+    #[tokio::test]
+    async fn the_sweep_finishes_a_release_whose_event_never_returns() {
+        let db = test_db().await;
+        let stripe = MockStripe::new();
+        let s = settings();
+        paid_member(&db, "o_strand", "pi_strand", NOW).await;
+
+        // A worker recorded the release and died; the event was settled
+        // by then, so nothing will deliver it again
+        assert!(db
+            .mark_cipher_number_release("o_strand", NOW + DAY)
+            .await
+            .unwrap());
+
+        reconcile(&db, &stripe, &s, NOW + DAY + MINUTE)
+            .await
+            .unwrap();
+        assert_eq!(db.fetch_cipher_membership("u1").await.unwrap(), None);
+        assert_eq!(
+            db.fetch_cipher_number_by_order("o_strand").await.unwrap(),
+            None
+        );
+        assert_eq!(
+            db.fetch_payment_order("o_strand")
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            OrderState::Refunded
+        );
+        assert!(db
+            .fetch_cipher_numbers_release_pending(10)
+            .await
+            .unwrap()
+            .is_empty());
         drop_db(&db).await;
     }
 }

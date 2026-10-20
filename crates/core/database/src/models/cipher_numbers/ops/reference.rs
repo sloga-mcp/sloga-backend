@@ -60,6 +60,70 @@ impl AbstractCipherNumbers for ReferenceDb {
             .map(|row| row.number))
     }
 
+    async fn fetch_cipher_number_row_by_order(
+        &self,
+        order_id: &str,
+    ) -> Result<Option<CipherNumber>> {
+        let numbers = self.cipher_numbers.lock().await;
+        Ok(numbers
+            .values()
+            .find(|row| row.order_id.as_deref() == Some(order_id))
+            .cloned())
+    }
+
+    async fn mark_cipher_number_release(&self, order_id: &str, at: i64) -> Result<bool> {
+        // Find and set while the map mutex is held; the first time stays
+        let mut numbers = self.cipher_numbers.lock().await;
+        match numbers
+            .values_mut()
+            .find(|row| row.order_id.as_deref() == Some(order_id))
+        {
+            Some(row) => {
+                row.release_pending_at.get_or_insert(at);
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
+    async fn cancel_cipher_number_release(&self, order_id: &str) -> Result<bool> {
+        // Find and unset while the map mutex is held; `order_id` stays
+        let mut numbers = self.cipher_numbers.lock().await;
+        Ok(numbers
+            .values_mut()
+            .find(|row| row.order_id.as_deref() == Some(order_id))
+            .and_then(|row| row.release_pending_at.take())
+            .is_some())
+    }
+
+    async fn release_cipher_number(&self, order_id: &str) -> Result<bool> {
+        // Find and unset while the map mutex is held, as in claim
+        let mut numbers = self.cipher_numbers.lock().await;
+        match numbers
+            .values_mut()
+            .find(|row| row.order_id.as_deref() == Some(order_id))
+        {
+            Some(row) => {
+                row.order_id = None;
+                row.release_pending_at = None;
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
+    async fn fetch_cipher_numbers_release_pending(&self, limit: i64) -> Result<Vec<CipherNumber>> {
+        let numbers = self.cipher_numbers.lock().await;
+        let mut pending: Vec<CipherNumber> = numbers
+            .values()
+            .filter(|row| row.order_id.is_some() && row.release_pending_at.is_some())
+            .cloned()
+            .collect();
+        pending.sort_by_key(|row| (row.release_pending_at, row.number));
+        pending.truncate(usize::try_from(limit.max(0)).unwrap_or(usize::MAX));
+        Ok(pending)
+    }
+
     async fn count_claimed_cipher_numbers(&self) -> Result<u32> {
         let numbers = self.cipher_numbers.lock().await;
         count_to_u32(
@@ -82,6 +146,7 @@ impl AbstractCipherNumbers for ReferenceDb {
             numbers.entry(number).or_insert(CipherNumber {
                 number,
                 order_id: None,
+                release_pending_at: None,
             });
         }
         Ok(())

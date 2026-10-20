@@ -20,10 +20,10 @@ use super::event::{
     StripeEvent,
 };
 
-/// `Stripe-Version` sent with every request. `""` omits the header, so the
-/// account's default API version applies. Set it once the version of the
-/// webhook endpoint is known, so the REST and webhook shapes agree.
-pub const STRIPE_API_VERSION: &str = "";
+/// `Stripe-Version` sent with every request. It matches the API version of the
+/// webhook endpoint (snapshot payloads), so REST responses and webhook events
+/// share one shape. `""` would omit the header and use the account default.
+pub const STRIPE_API_VERSION: &str = "2026-09-30.endive";
 
 /// Base URL of the Stripe REST API
 pub const STRIPE_API_BASE: &str = "https://api.stripe.com/v1";
@@ -101,6 +101,8 @@ pub struct CheckoutSessionParams {
     pub cancel_url: String,
     /// Session expiry, seconds since the Unix epoch
     pub expires_at_secs: i64,
+    /// Stripe Tax on, prices tax-inclusive (`api.stripe.automatic_tax`)
+    pub automatic_tax: bool,
 }
 
 /// A Checkout Session as Stripe reports it
@@ -252,31 +254,42 @@ pub trait StripeApi: Send + Sync {
 
 /// What the buyer ticks at checkout (`consent_collection[terms_of_service]`
 /// is `required`, so Stripe will not take the payment without it). The
-/// Cipher badge is supplied at once, so an EU/UK buyer acknowledges here
-/// that the 14-day right of withdrawal ends when it is. Stripe renders
-/// basic Markdown links in this text and caps it at 1200 characters.
+/// Cipher badge is supplied at once, and the buyer can still ask for a full
+/// refund within 14 days (the owner refunds from the Stripe Dashboard; see
+/// `engine::REFUND_RELEASE_WINDOW_MS` for what such a refund does). Stripe
+/// renders basic Markdown links in this text and caps it at 1200
+/// characters.
 pub const TERMS_ACCEPTANCE_MESSAGE: &str = "I agree to the \
     [Terms of Service](https://sloga.gg/legal/terms.html). My Cipher badge is supplied as soon \
-    as my payment goes through, and I lose my right to withdraw from this purchase within 14 \
-    days.";
+    as my payment goes through, and I can ask for a full refund within 14 days.";
+
+/// Stripe tax code for a Cipher: General - Electronically Supplied Services
+pub const CIPHER_TAX_CODE: &str = "txcd_10000000";
 
 /// Form body for `POST /v1/checkout/sessions`, in Stripe's bracket notation.
-/// Card only: no delayed payment methods, so `checkout.session.completed`
-/// with `payment_status=paid` is the single success signal.
+/// No `payment_method_types`: since API version 2026-09-30.endive Stripe
+/// refuses it and takes the payment methods from the Dashboard (Settings,
+/// Payment methods). Keep that list to methods that confirm at once (card,
+/// Link, wallets), so `checkout.session.completed` with `payment_status=paid`
+/// stays the single success signal; a delayed method would leave the session
+/// complete but unpaid until a reconcile sweep sees it paid.
 /// Adaptive Pricing is off, so the buyer always pays in the order's
 /// currency (a session settled in another currency would not match the
 /// order, and fulfilment refunds it).
 ///
-/// The buyer must accept the Terms of Service, with the withdrawal
-/// acknowledgement as the checkbox text ([`TERMS_ACCEPTANCE_MESSAGE`]).
+/// The buyer must accept the Terms of Service, with the 14-day refund
+/// promise as the checkbox text ([`TERMS_ACCEPTANCE_MESSAGE`]).
 /// Operator note: Stripe refuses `consent_collection[terms_of_service]`
 /// until a Terms of Service URL is set in the Dashboard (Settings, Public
 /// details); until then every checkout fails with `PaymentProviderError`
 /// and its order is left SessionFailed (it never blocks a later checkout).
+///
+/// With `automatic_tax`, Stripe Tax is on and the price is tax-inclusive,
+/// so `amount_total` still equals the order amount and the fulfilment
+/// amount check is unchanged.
 pub fn checkout_form(p: &CheckoutSessionParams) -> Vec<(String, String)> {
-    [
+    let mut form: Vec<(String, String)> = [
         ("mode", "payment".to_string()),
-        ("payment_method_types[0]", "card".to_string()),
         ("adaptive_pricing[enabled]", "false".to_string()),
         ("line_items[0][quantity]", "1".to_string()),
         ("line_items[0][price_data][currency]", p.currency.clone()),
@@ -308,7 +321,21 @@ pub fn checkout_form(p: &CheckoutSessionParams) -> Vec<(String, String)> {
     ]
     .into_iter()
     .map(|(key, value)| (key.to_string(), value))
-    .collect()
+    .collect();
+    if p.automatic_tax {
+        form.extend(
+            [
+                ("automatic_tax[enabled]", "true"),
+                ("line_items[0][price_data][tax_behavior]", "inclusive"),
+                (
+                    "line_items[0][price_data][product_data][tax_code]",
+                    CIPHER_TAX_CODE,
+                ),
+            ]
+            .map(|(key, value)| (key.to_string(), value.to_string())),
+        );
+    }
+    form
 }
 
 /// Whether `id` is safe to place in a request path: 1 to 255 characters,
@@ -1143,6 +1170,7 @@ mod tests {
             success_url: "https://sloga.gg/cipher/thanks".to_string(),
             cancel_url: "https://sloga.gg/cipher".to_string(),
             expires_at_secs: 1_729_002_100,
+            automatic_tax: false,
         }
     }
 
@@ -1159,7 +1187,6 @@ mod tests {
             pairs(&form),
             vec![
                 ("mode", "payment"),
-                ("payment_method_types[0]", "card"),
                 // Keeps the session in the order's currency
                 ("adaptive_pricing[enabled]", "false"),
                 ("line_items[0][quantity]", "1"),
@@ -1178,14 +1205,37 @@ mod tests {
                 ("success_url", "https://sloga.gg/cipher/thanks"),
                 ("cancel_url", "https://sloga.gg/cipher"),
                 ("expires_at", "1729002100"),
-                // The buyer accepts the Terms, which carry the EU/UK
-                // withdrawal acknowledgement
+                // The buyer accepts the Terms, with the 14-day full
+                // refund promise
                 ("consent_collection[terms_of_service]", "required"),
                 (
                     "custom_text[terms_of_service_acceptance][message]",
                     "I agree to the [Terms of Service](https://sloga.gg/legal/terms.html). \
                      My Cipher badge is supplied as soon as my payment goes through, and I \
-                     lose my right to withdraw from this purchase within 14 days."
+                     can ask for a full refund within 14 days."
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn checkout_form_with_automatic_tax_adds_inclusive_tax() {
+        let without = checkout_form(&params());
+        let with = checkout_form(&CheckoutSessionParams {
+            automatic_tax: true,
+            ..params()
+        });
+
+        // The same form, plus Stripe Tax with a tax-inclusive price
+        assert_eq!(&with[..without.len()], &without[..]);
+        assert_eq!(
+            pairs(&with[without.len()..]),
+            vec![
+                ("automatic_tax[enabled]", "true"),
+                ("line_items[0][price_data][tax_behavior]", "inclusive"),
+                (
+                    "line_items[0][price_data][product_data][tax_code]",
+                    "txcd_10000000"
                 ),
             ]
         );
@@ -1193,14 +1243,18 @@ mod tests {
 
     #[test]
     fn terms_acceptance_message_fits_stripe() {
-        // Stripe's limit on custom_text messages
+        // Stripe's limit on custom_text messages, and the exact length of
+        // the approved wording
         assert!(TERMS_ACCEPTANCE_MESSAGE.chars().count() <= 1200);
+        assert_eq!(TERMS_ACCEPTANCE_MESSAGE.chars().count(), 181);
         assert!(TERMS_ACCEPTANCE_MESSAGE.is_ascii());
         // One Markdown link, to the published Terms
         assert_eq!(TERMS_ACCEPTANCE_MESSAGE.matches("](").count(), 1);
         assert!(TERMS_ACCEPTANCE_MESSAGE
             .contains("[Terms of Service](https://sloga.gg/legal/terms.html)"));
-        assert!(TERMS_ACCEPTANCE_MESSAGE.contains("right to withdraw"));
+        // The refund promise, not the old withdrawal waiver
+        assert!(TERMS_ACCEPTANCE_MESSAGE.ends_with("I can ask for a full refund within 14 days."));
+        assert!(!TERMS_ACCEPTANCE_MESSAGE.contains("withdraw"));
         // The continuation lines leave single spaces only
         assert!(!TERMS_ACCEPTANCE_MESSAGE.contains("  "));
     }
@@ -1359,6 +1413,10 @@ mod tests {
     fn version_header_only_when_set() {
         assert_eq!(api_version_header(""), None);
         assert_eq!(api_version_header("2024-06-20"), Some("2024-06-20"));
+        assert_eq!(
+            api_version_header(STRIPE_API_VERSION),
+            Some("2026-09-30.endive")
+        );
     }
 
     #[test]

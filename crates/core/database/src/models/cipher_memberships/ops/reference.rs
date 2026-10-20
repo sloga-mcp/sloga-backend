@@ -27,6 +27,17 @@ impl AbstractCipherMemberships for ReferenceDb {
         Ok(memberships.get(user_id).cloned())
     }
 
+    async fn fetch_cipher_membership_by_number(
+        &self,
+        number: u32,
+    ) -> Result<Option<CipherMembership>> {
+        let memberships = self.cipher_memberships.lock().await;
+        Ok(memberships
+            .values()
+            .find(|row| row.number == number)
+            .cloned())
+    }
+
     async fn update_cipher_membership_if_version(
         &self,
         m: &CipherMembership,
@@ -68,5 +79,23 @@ impl AbstractCipherMemberships for ReferenceDb {
         let mut memberships = self.cipher_memberships.lock().await;
         memberships.remove(user_id);
         Ok(())
+    }
+
+    async fn delete_cipher_membership_if_version(
+        &self,
+        user_id: &str,
+        expected: u64,
+    ) -> Result<bool> {
+        // The check and the removal run while the map mutex is held
+        let mut memberships = self.cipher_memberships.lock().await;
+        if memberships
+            .get(user_id)
+            .is_none_or(|row| row.version != expected)
+        {
+            return Ok(false);
+        }
+
+        memberships.remove(user_id);
+        Ok(true)
     }
 }
