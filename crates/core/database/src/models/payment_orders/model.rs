@@ -100,6 +100,13 @@ auto_derived!(
         /// A reversal still to be applied once fulfilment finishes
         #[serde(skip_serializing_if = "Option::is_none", default)]
         pub reversal_pending: Option<ReversalPending>,
+        /// Epoch ms a refund of the payment was first seen still settling
+        /// (`pending` or `requires_action` at the provider). Set until the
+        /// refund is acted on, or until every refund failed; the reconcile
+        /// sweep re-reads the refunds of every order that carries it, so a
+        /// refund whose update event never arrives is still applied.
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        pub refund_settling_since: Option<i64>,
         /// Provider ids of the disputes open on the payment. One payment can
         /// carry more than one (an inquiry closed `warning_closed`, then a
         /// chargeback), so each dispute is added and removed by its own id.

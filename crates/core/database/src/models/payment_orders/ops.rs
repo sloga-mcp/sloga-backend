@@ -65,6 +65,19 @@ pub trait AbstractPaymentOrders: Sync + Send {
         limit: i64,
     ) -> Result<Vec<PaymentOrder>>;
 
+    /// Orders with `refund_settling_since` set whose lease is free
+    /// (`lease_until` unset or `< now`), oldest `created_at` first, up to
+    /// `limit` (0 = no limit). Any state: the mark is only set while a
+    /// refund can still change the order, and cleared once it is acted on.
+    /// The reconcile sweep re-reads their refunds at Stripe, so a refund
+    /// whose update event never arrives is still applied. No index: only
+    /// orders with a refund in flight carry the field.
+    async fn fetch_payment_orders_refund_settling(
+        &self,
+        now: i64,
+        limit: i64,
+    ) -> Result<Vec<PaymentOrder>>;
+
     /// Atomically set `lease_until = until` WHERE `_id = id` AND
     /// (`lease_until` unset OR `lease_until < now`), and bump `version`
     /// (+1).
@@ -140,6 +153,7 @@ mod tests {
             state,
             void_reason: None,
             reversal_pending: None,
+            refund_settling_since: None,
             open_disputes: vec![],
             lease_until: None,
             version: 0,
@@ -721,6 +735,88 @@ mod tests {
                     .unwrap()),
                 ["twice"]
             );
+        });
+    }
+
+    #[tokio::test]
+    async fn the_settling_refund_sweep_selects_marked_orders_with_a_free_lease() {
+        database_test!(|db| async move {
+            create_payment_order_indexes(&db).await;
+            for row in [
+                PaymentOrder {
+                    refund_settling_since: Some(300),
+                    ..order("fulfilled", "u1", OrderState::Fulfilled, 20)
+                },
+                // Any state is selected
+                PaymentOrder {
+                    refund_settling_since: Some(200),
+                    ..order("paid", "u2", OrderState::Paid, 10)
+                },
+                PaymentOrder {
+                    refund_settling_since: Some(100),
+                    lease_until: Some(1_000),
+                    ..order("held", "u3", OrderState::Fulfilled, 5)
+                },
+                // Not marked
+                order("clean", "u4", OrderState::Fulfilled, 1),
+                PaymentOrder {
+                    reversal_pending: Some(ReversalPending::Refund),
+                    ..order("recorded", "u5", OrderState::Paid, 2)
+                },
+            ] {
+                db.insert_payment_order(&row).await.unwrap();
+            }
+
+            assert_eq!(
+                ids(db
+                    .fetch_payment_orders_refund_settling(500, 0)
+                    .await
+                    .unwrap()),
+                ["paid", "fulfilled"]
+            );
+            assert_eq!(
+                ids(db
+                    .fetch_payment_orders_refund_settling(1_001, 0)
+                    .await
+                    .unwrap()),
+                ["held", "paid", "fulfilled"]
+            );
+            assert_eq!(
+                ids(db
+                    .fetch_payment_orders_refund_settling(1_001, 1)
+                    .await
+                    .unwrap()),
+                ["held"]
+            );
+
+            // Cleared: out of the sweep, and (Mongo) gone from the stored
+            // document, not left as null
+            let mut cleared = db.fetch_payment_order("paid").await.unwrap().unwrap();
+            cleared.refund_settling_since = None;
+            assert!(db
+                .update_payment_order_if_state(&cleared, OrderState::Paid)
+                .await
+                .unwrap());
+            assert_eq!(
+                ids(db
+                    .fetch_payment_orders_refund_settling(500, 0)
+                    .await
+                    .unwrap()),
+                ["fulfilled"]
+            );
+            match &db {
+                crate::Database::Reference(_) => {}
+                #[cfg(feature = "mongodb")]
+                crate::Database::MongoDb(mongo) => {
+                    let raw = mongo
+                        .col::<bson::Document>("payment_orders")
+                        .find_one(bson::doc! { "_id": "paid" })
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    assert!(!raw.contains_key("refund_settling_since"), "{raw:?}");
+                }
+            }
         });
     }
 

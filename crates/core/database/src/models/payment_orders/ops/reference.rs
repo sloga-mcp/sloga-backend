@@ -154,6 +154,22 @@ impl AbstractPaymentOrders for ReferenceDb {
         Ok(rows)
     }
 
+    async fn fetch_payment_orders_refund_settling(
+        &self,
+        now: i64,
+        limit: i64,
+    ) -> Result<Vec<PaymentOrder>> {
+        let orders = self.payment_orders.lock().await;
+        let mut rows: Vec<PaymentOrder> = orders
+            .values()
+            .filter(|row| row.refund_settling_since.is_some() && lease_free(row, now))
+            .cloned()
+            .collect();
+        sort_oldest_first(&mut rows);
+        apply_limit(&mut rows, limit);
+        Ok(rows)
+    }
+
     async fn acquire_payment_order_lease(
         &self,
         id: &str,
