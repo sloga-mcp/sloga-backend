@@ -177,6 +177,7 @@ impl<'r> Responder<'r, 'static> for Error {
             ErrorType::PaymentsDisabled => Status::BadRequest,
             ErrorType::CipherSalesClosed => Status::Forbidden,
             ErrorType::CipherSoldOut => Status::Conflict,
+            ErrorType::CipherRegionUnavailable => Status::BadRequest,
             ErrorType::CipherTierInvalid => Status::BadRequest,
             ErrorType::PaymentPending => Status::Conflict,
             ErrorType::PaymentProviderError => Status::BadGateway,
@@ -218,6 +219,29 @@ mod tests {
             (create_error!(ImportBotNotInServer), 404),
             (create_error!(ImportUpstreamUnavailable), 503),
             (create_error!(ImportSourceUnavailable), 400),
+        ];
+
+        for (error, code) in cases {
+            let name = format!("{:?}", error.error_type);
+            let response = error.respond_to(request.inner()).unwrap();
+            assert_eq!(response.status().code, code, "{name}");
+        }
+    }
+
+    /// Pins the payment errors' statuses; `axum.rs` pins the same table
+    #[test]
+    fn payment_error_statuses() {
+        let client = Client::untracked(rocket::build()).unwrap();
+        let request = client.get("/");
+
+        let cases: [(Error, u16); 7] = [
+            (create_error!(PaymentsDisabled), 400),
+            (create_error!(CipherSalesClosed), 403),
+            (create_error!(CipherSoldOut), 409),
+            (create_error!(CipherRegionUnavailable), 400),
+            (create_error!(CipherTierInvalid), 400),
+            (create_error!(PaymentPending), 409),
+            (create_error!(PaymentProviderError), 502),
         ];
 
         for (error, code) in cases {

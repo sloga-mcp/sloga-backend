@@ -800,7 +800,9 @@ async fn expire_unpaid(db: &Database, now_ms: i64, tally: &mut Tally) {
 
     for order in orders {
         match engine::expire_order(db, &order.id, now_ms).await {
-            Ok(_) => tally.expired += 1,
+            Ok(true) => tally.expired += 1,
+            // Its lease is held: the holder settles it, or the next sweep
+            Ok(false) => {}
             Err(error) => tally.error("order", &order.id, &engine_text("expire", &error)),
         }
     }
@@ -830,7 +832,9 @@ async fn check_pending(
             // A Pending order always has a session; without one nobody can
             // pay it
             match engine::expire_order(db, &order.id, now_ms).await {
-                Ok(_) => tally.expired += 1,
+                Ok(true) => tally.expired += 1,
+                // Its lease is held: the holder settles it, or the next sweep
+                Ok(false) => {}
                 Err(error) => tally.error("order", &order.id, &engine_text("expire", &error)),
             }
             continue;
@@ -864,7 +868,9 @@ async fn check_pending(
                 }
             }
             (Some("expired"), _) => match engine::expire_order(db, &order.id, now_ms).await {
-                Ok(_) => tally.expired += 1,
+                Ok(true) => tally.expired += 1,
+                // Its lease is held: the holder settles it, or the next sweep
+                Ok(false) => {}
                 Err(error) => tally.error("order", &order.id, &engine_text("expire", &error)),
             },
             // Still open, or complete with a delayed payment still clearing
@@ -961,8 +967,8 @@ async fn apply_pending_reversals(
 /// ([`engine::mark_refund_settling`]): their refunds are read again at
 /// Stripe, so a refund whose `charge.refund.updated` never arrives (or
 /// gave up its attempts) is still applied, through the same reversal as
-/// that event. An order not marked Paid yet has no payment to look up; it
-/// waits for its fulfilment.
+/// that event. An order not marked Paid yet has no payment to look up; the
+/// query leaves it out until its fulfilment records the payment.
 async fn settle_refunds(
     db: &Database,
     stripe: &dyn StripeApi,
@@ -981,10 +987,17 @@ async fn settle_refunds(
     };
 
     for order in orders {
+        // The query selects only orders with both set; anything else is a
+        // driver bug, counted rather than skipped in silence
         let (Some(since), Some(payment_intent)) = (
             order.refund_settling_since,
             order.payment_intent_id.as_deref(),
         ) else {
+            tally.error(
+                "order",
+                &order.id,
+                "selected as settling without a settling mark or a payment intent",
+            );
             continue;
         };
         let refunds = match stripe.list_refunds(payment_intent).await {
@@ -1150,6 +1163,7 @@ mod tests {
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::Mutex;
 
+    use revolt_config::FeaturePayments;
     use revolt_database::test_teardown::TestDatabaseGuard;
     use revolt_database::{
         CipherMembership, CipherRevokeReason, Database, DatabaseInfo, OrderState, PaymentEvent,
@@ -1231,6 +1245,7 @@ mod tests {
             expect_livemode: false,
             tolerance_secs: 300,
             automatic_tax: false,
+            blocked_countries: FeaturePayments::default().cipher_blocked_countries,
             secret_key: SECRET_MARKER.to_string(),
             webhook_secret: "whsec_test_dispatch".to_string(),
             success_url_web: "https://app.sloga.gg/settings?cipher=success".to_string(),
@@ -1378,6 +1393,7 @@ mod tests {
             client_reference_id: Some("u1".to_string()),
             metadata_order_id: Some(order_id.to_string()),
             expires_at: None,
+            billing_country: None,
         }
     }
 
@@ -3522,6 +3538,150 @@ mod tests {
         );
         assert_untouched(&db, "o_sfail", number).await;
         assert_eq!(settling_since(&db, "o_sfail").await, None);
+        drop_db(&db).await;
+    }
+
+    #[tokio::test]
+    async fn a_sweep_after_the_event_reversed_the_order_is_a_no_op() {
+        let db = test_db().await;
+        let stripe = MockStripe::new();
+        let s = settings();
+        paid_member(&db, "o_twice", "pi_twice", NOW).await;
+
+        let made = NOW + DAY;
+        stripe.set_refund(refund_of("re_twice", "pi_twice", "pending", 9900, made));
+        assert_eq!(
+            handle_event(
+                &db,
+                &stripe,
+                &s,
+                &charge_refunded("evt_twice", "pi_twice", made),
+                made
+            )
+            .await
+            .unwrap(),
+            EventOutcome::Processed
+        );
+        assert_eq!(settling_since(&db, "o_twice").await, Some(made));
+
+        // It succeeds and its update event reverses the order (inside the
+        // window: the number is released)
+        stripe.set_refund(refund_of("re_twice", "pi_twice", "succeeded", 9900, made));
+        assert_eq!(
+            handle_event(
+                &db,
+                &stripe,
+                &s,
+                &refund_updated("evt_twice_up", "re_twice", "pi_twice", made + MINUTE),
+                made + MINUTE
+            )
+            .await
+            .unwrap(),
+            EventOutcome::Processed
+        );
+        let reversed = db.fetch_payment_order("o_twice").await.unwrap().unwrap();
+        assert_eq!(reversed.state, OrderState::Refunded);
+        assert_eq!(reversed.refund_settling_since, None);
+        assert_eq!(db.fetch_cipher_membership("u1").await.unwrap(), None);
+        let claimed = db.count_claimed_cipher_numbers().await.unwrap();
+
+        // A sweep now selects nothing and changes nothing
+        let lists = stripe.call_count("list_refunds");
+        assert_eq!(
+            reconcile(&db, &stripe, &s, made + DAY).await.unwrap(),
+            "expired=0, resumed=0, reversed=0, redriven=0, errors=0"
+        );
+        assert_eq!(stripe.call_count("list_refunds"), lists);
+
+        // A worker that stopped after the reversal's write but before it
+        // cleared the mark: the sweep re-reads the refund, finds the order
+        // already reversed, and only clears the mark
+        let mut stranded = reversed.clone();
+        stranded.refund_settling_since = Some(made);
+        assert!(db
+            .update_payment_order_if_state(&stranded, OrderState::Refunded)
+            .await
+            .unwrap());
+        assert_eq!(
+            reconcile(&db, &stripe, &s, made + 2 * DAY).await.unwrap(),
+            "expired=0, resumed=0, reversed=0, redriven=0, errors=0"
+        );
+        let after = db.fetch_payment_order("o_twice").await.unwrap().unwrap();
+        assert_eq!(after.state, OrderState::Refunded);
+        assert_eq!(after.reversed_at, reversed.reversed_at);
+        assert_eq!(after.refund_settling_since, None);
+        assert_eq!(stripe.call_count("list_refunds"), lists + 1);
+        assert_eq!(db.count_claimed_cipher_numbers().await.unwrap(), claimed);
+        assert_eq!(db.fetch_cipher_membership("u1").await.unwrap(), None);
+        assert_eq!(badge(&db).await, None);
+        assert_eq!(stripe.refund_count(), 0);
+
+        // ...and no later sweep looks at it again
+        reconcile(&db, &stripe, &s, made + 3 * DAY).await.unwrap();
+        assert_eq!(stripe.call_count("list_refunds"), lists + 1);
+        drop_db(&db).await;
+    }
+
+    #[tokio::test]
+    async fn a_held_unpaid_order_is_neither_expired_nor_counted() {
+        let db = test_db().await;
+        let stripe = MockStripe::new();
+        let s = settings();
+        insert_buyer(&db).await;
+
+        db.insert_payment_order(&order("o_stale", OrderState::Creating, NOW - 11 * MINUTE))
+            .await
+            .unwrap();
+        db.insert_payment_order(&PaymentOrder {
+            user_id: Some("u2".to_string()),
+            ..order("o_held", OrderState::SessionFailed, NOW - 12 * MINUTE)
+        })
+        .await
+        .unwrap();
+        // Lapsed at Stripe, but another worker holds it
+        db.insert_payment_order(&PaymentOrder {
+            user_id: Some("u3".to_string()),
+            ..with_session(
+                order("o_lapsed_held", OrderState::Pending, NOW - 45 * MINUTE),
+                "cs_lapsed_held",
+            )
+        })
+        .await
+        .unwrap();
+        stripe.set_session(session(
+            "cs_lapsed_held",
+            "o_lapsed_held",
+            "expired",
+            "unpaid",
+        ));
+        for id in ["o_held", "o_lapsed_held"] {
+            db.acquire_payment_order_lease(id, NOW, NOW + LEASE_MS)
+                .await
+                .unwrap()
+                .expect("lease");
+        }
+
+        assert_eq!(
+            reconcile(&db, &stripe, &s, NOW).await.unwrap(),
+            "expired=1, resumed=0, reversed=0, redriven=0, errors=0"
+        );
+        let state = |id: &'static str| {
+            let db = db.clone();
+            async move { db.fetch_payment_order(id).await.unwrap().unwrap().state }
+        };
+        assert_eq!(state("o_stale").await, OrderState::Expired);
+        assert_eq!(state("o_held").await, OrderState::SessionFailed);
+        assert_eq!(state("o_lapsed_held").await, OrderState::Pending);
+
+        // Once the leases run out, the next sweep expires and counts both
+        assert_eq!(
+            reconcile(&db, &stripe, &s, NOW + LEASE_MS + 1)
+                .await
+                .unwrap(),
+            "expired=2, resumed=0, reversed=0, redriven=0, errors=0"
+        );
+        assert_eq!(state("o_held").await, OrderState::Expired);
+        assert_eq!(state("o_lapsed_held").await, OrderState::Expired);
         drop_db(&db).await;
     }
 

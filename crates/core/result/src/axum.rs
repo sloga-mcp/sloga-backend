@@ -172,6 +172,7 @@ impl IntoResponse for Error {
             ErrorType::PaymentsDisabled => StatusCode::BAD_REQUEST,
             ErrorType::CipherSalesClosed => StatusCode::FORBIDDEN,
             ErrorType::CipherSoldOut => StatusCode::CONFLICT,
+            ErrorType::CipherRegionUnavailable => StatusCode::BAD_REQUEST,
             ErrorType::CipherTierInvalid => StatusCode::BAD_REQUEST,
             ErrorType::PaymentPending => StatusCode::CONFLICT,
             ErrorType::PaymentProviderError => StatusCode::BAD_GATEWAY,
@@ -202,6 +203,25 @@ mod tests {
             (create_error!(ImportBotNotInServer), 404),
             (create_error!(ImportUpstreamUnavailable), 503),
             (create_error!(ImportSourceUnavailable), 400),
+        ];
+
+        for (error, code) in cases {
+            let name = format!("{:?}", error.error_type);
+            assert_eq!(error.into_response().status().as_u16(), code, "{name}");
+        }
+    }
+
+    /// Pins the payment errors' statuses; `rocket.rs` pins the same table
+    #[test]
+    fn payment_error_statuses() {
+        let cases: [(Error, u16); 7] = [
+            (create_error!(PaymentsDisabled), 400),
+            (create_error!(CipherSalesClosed), 403),
+            (create_error!(CipherSoldOut), 409),
+            (create_error!(CipherRegionUnavailable), 400),
+            (create_error!(CipherTierInvalid), 400),
+            (create_error!(PaymentPending), 409),
+            (create_error!(PaymentProviderError), 502),
         ];
 
         for (error, code) in cases {

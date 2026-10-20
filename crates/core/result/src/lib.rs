@@ -373,6 +373,9 @@ pub enum ErrorType {
     CipherSalesClosed,
     /// Every Cipher number has been claimed
     CipherSoldOut,
+    /// Cipher is not sold in the caller's country
+    /// (`[features.payments] cipher_blocked_countries`)
+    CipherRegionUnavailable,
     /// The requested Cipher tier is not valid for this purchase (for example
     /// not an upgrade from the tier already held)
     CipherTierInvalid,
@@ -482,6 +485,17 @@ mod tests {
 
         // Logs keep it
         assert!(error.to_string().contains(&error.location));
+    }
+
+    /// The type the client keys its message on
+    #[cfg(feature = "serde")]
+    #[test]
+    fn region_error_serializes_by_name() {
+        let value = serde_json::to_value(create_error!(CipherRegionUnavailable)).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({ "type": "CipherRegionUnavailable" })
+        );
     }
 
     #[cfg(feature = "serde")]

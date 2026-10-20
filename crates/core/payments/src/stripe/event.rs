@@ -153,6 +153,17 @@ pub fn obj_metadata_order_id(o: &Value) -> Option<String> {
         .map(str::to_string)
 }
 
+/// A Checkout Session's `customer_details.address.country`, when it is a
+/// non-empty string: the billing country the buyer entered. `None` when
+/// any level is absent, `null` or of another type.
+pub fn obj_billing_country(o: &Value) -> Option<String> {
+    o.get("customer_details")
+        .and_then(|details| details.get("address"))
+        .and_then(|address| obj_str(address, "country"))
+        .filter(|country| !country.is_empty())
+        .map(str::to_string)
+}
+
 fn decode(message: &str) -> StripeError {
     StripeError::Decode(message.to_string())
 }
@@ -177,7 +188,14 @@ mod tests {
           "client_reference_id": "01JA0000000000000000000USR",
           "created": 1728999000,
           "currency": "usd",
-          "customer_details": {"email": "buyer@example.com", "name": "Test Buyer"},
+          "customer_details": {
+            "email": "buyer@example.com",
+            "name": "Test Buyer",
+            "address": {
+              "city": "Dublin", "country": "IE", "line1": "1 Main Street", "line2": null,
+              "postal_code": "D01 F5P2", "state": null
+            }
+          },
           "expires_at": 1729001100,
           "livemode": false,
           "metadata": {"order_id": "01JA0000000000000000000ORD"},
@@ -291,6 +309,8 @@ mod tests {
             Some("01JA0000000000000000000ORD")
         );
         assert_eq!(session.expires_at, Some(1729001100));
+        assert_eq!(session.billing_country.as_deref(), Some("IE"));
+        assert_eq!(obj_billing_country(&event.object).as_deref(), Some("IE"));
     }
 
     #[test]

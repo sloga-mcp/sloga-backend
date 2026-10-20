@@ -49,8 +49,14 @@
 //! - a release refunds every paid upgrade on the membership (idempotency
 //!   key `release-upgrade-{order_id}`) and deletes the membership only once
 //!   each of them is recorded Refunded, so the 14-day refund gives back the
-//!   whole Cipher purchase. No new purchase is taken while a release runs,
-//!   and a dispute lost during one drops it (the number stays retired)
+//!   whole Cipher purchase. No new checkout is started while a release
+//!   runs, a new purchase paid during one (a session opened before it) is
+//!   voided and refunded at once (`ReleasePending`), and a dispute lost
+//!   during one drops it (the number stays retired)
+//! - Cipher is not sold to `cipher_blocked_countries` (the EU and the UK):
+//!   checkout refuses a request Cloudflare places there (the route), and a
+//!   payment whose billing country is there is voided and refunded
+//!   (`RegionUnavailable`) before any number is claimed
 
 use revolt_database::{
     CipherMembership, CipherRevokeReason, Database, FieldsUser, OrderState, PartialUser,
@@ -921,21 +927,43 @@ async fn fulfil_locked(
         // truth: every dispute event since was recorded on the order first.
         set_dispute_listing(db, &user_id, &leased.order.id, is_disputed(&leased.order)).await?;
     } else {
+        // Not sold to the buyer's billing country: refunded, no number
+        // claimed. No country reported (a session completed without the
+        // billing address) is fulfilled; checkout requires the address, so
+        // that is logged for a look.
+        match session.billing_country.as_deref() {
+            Some(country) if s.region_blocked(country) => {
+                log::warn!(
+                    "payments: order {} was paid from billing country {country}, where Cipher \
+                     is not sold; voiding and refunding it",
+                    leased.order.id
+                );
+                return void_paid(db, stripe, leased, VoidReason::RegionUnavailable, now_ms).await;
+            }
+            Some(_) => {}
+            None => log::warn!(
+                "payments: session {} of order {} reports no billing country; fulfilling it",
+                session.id,
+                leased.order.id
+            ),
+        }
+
         // A new purchase paid while the release of the buyer's old number
         // is still running would replace that row, and the upgrades on it
-        // not refunded yet would go with it: it waits (Paid, so the event
-        // retries and the reconcile resume tries again) until the release
-        // has finished
+        // not refunded yet would go with it. Checkout refuses to start one
+        // then, so only a session opened before the release reaches this:
+        // it is voided and refunded at once rather than holding the money
+        // for as long as the release takes
         if matches!(leased.order.sku, Sku::CipherNew { .. }) {
             if let Some(m) = &membership {
                 if number_release_pending(db, m).await? {
                     log::warn!(
-                        "payments: order {} waits for the release of number {} of {user_id} to \
-                         finish",
+                        "payments: order {} was paid while the release of number {} of \
+                         {user_id} is still running; voiding and refunding it",
                         leased.order.id,
                         m.number
                     );
-                    return Err(create_error!(PaymentPending));
+                    return void_paid(db, stripe, leased, VoidReason::ReleasePending, now_ms).await;
                 }
             }
         }
@@ -2161,12 +2189,14 @@ async fn window_refund_plan(
 }
 
 /// Record the leased order Refunded (state, `reversed_at`, no reversal
-/// pending)
+/// pending, and no refund left settling: on a Refunded order a refund
+/// changes nothing, so the reconcile sweep has nothing to re-read)
 async fn mark_refunded(db: &Database, leased: &mut Leased, now_ms: i64) -> Result<()> {
     write(db, leased, move |o| {
         o.state = OrderState::Refunded;
         o.reversed_at = Some(now_ms);
         o.reversal_pending = None;
+        o.refund_settling_since = None;
     })
     .await
 }
@@ -2981,6 +3011,8 @@ mod tests {
             expect_livemode: false,
             tolerance_secs: 300,
             automatic_tax: false,
+            // The shipped list (the EU and the UK)
+            blocked_countries: revolt_config::FeaturePayments::default().cipher_blocked_countries,
             secret_key: String::new(),
             webhook_secret: String::new(),
             success_url_web: "https://app.test/settings?cipher=success".to_string(),
@@ -6445,39 +6477,166 @@ mod tests {
             ErrorType::PaymentPending
         ));
 
-        // The open one is paid: it waits (Paid) instead of replacing the
-        // row being released
+        // The open one is paid: it is voided and refunded at once (the
+        // money is never held while the release runs), and the row being
+        // released is left alone
         let session = pay(&stripe, &late, "pi_late");
-        assert!(matches!(
-            error_type(fulfil_order(&db, &stripe, &s, &late.id, &session, NOW + DAY + 3).await),
-            ErrorType::PaymentPending
-        ));
-        assert_eq!(order(&db, &late.id).await.state, OrderState::Paid);
+        assert_eq!(
+            fulfil_order(&db, &stripe, &s, &late.id, &session, NOW + DAY + 3)
+                .await
+                .unwrap(),
+            FulfilOutcome::Voided(VoidReason::ReleasePending)
+        );
+        let voided = order(&db, &late.id).await;
+        assert_eq!(voided.state, OrderState::Voided);
+        assert_eq!(voided.void_reason, Some(VoidReason::ReleasePending));
+        assert_eq!(
+            refund_keys(&stripe),
+            vec![("pi_late".to_string(), Some(format!("void-{}", late.id)))]
+        );
         assert_eq!(membership(&db, "u1").await.orders, vec![first.id.clone()]);
+        assert_eq!(
+            db.fetch_cipher_number_by_order(&late.id).await.unwrap(),
+            None
+        );
 
-        // The sweep finishes the release (the resume still waits on it),
-        // then the next one applies the purchase, which gets #1 back
+        // A redelivery refunds nothing more
+        assert_eq!(
+            fulfil_order(&db, &stripe, &s, &late.id, &session, NOW + DAY + 4)
+                .await
+                .unwrap(),
+            FulfilOutcome::Voided(VoidReason::ReleasePending)
+        );
+        assert_eq!(stripe.refund_count(), 1);
+
+        // The sweep finishes the release; nothing is left to resume
         assert_eq!(
             reconcile(&db, &stripe, &s, NOW + DAY + 2 * MINUTE)
                 .await
                 .unwrap(),
-            "expired=0, resumed=0, reversed=1, redriven=0, errors=1"
+            "expired=0, resumed=0, reversed=1, redriven=0, errors=0"
         );
         assert_eq!(maybe_membership(&db, "u1").await, None);
+        assert_eq!(order(&db, &first.id).await.state, OrderState::Refunded);
+
+        // Then the buyer can buy again, and gets #1 back
+        buy(
+            &db,
+            &stripe,
+            &s,
+            "u1",
+            CipherTier::T149,
+            "pi_again",
+            NOW + DAY + 3 * MINUTE,
+        )
+        .await;
+        let m = membership(&db, "u1").await;
+        assert!(m.is_active());
+        assert_eq!((m.number, m.tier), (1, CipherTier::T149));
+        assert_eq!(badge(&db, "u1").await, badge_of(1, CipherTier::T149));
+        assert_eq!(stripe.refund_count(), 1);
+        drop_db(&db).await;
+    }
+
+    #[tokio::test]
+    async fn no_checkout_starts_while_the_release_of_a_revoked_row_runs() {
+        let db = test_db().await;
+        let stripe = MockStripe::new();
+        let s = settings();
+        insert_user(&db, "u1").await;
+
+        let first = buy(&db, &stripe, &s, "u1", CipherTier::T99, "pi_1", NOW).await;
+        // Decided and revoked (the badge is gone), the row not deleted yet
+        release_decided(&db, "u1", &first.id, NOW + DAY, true).await;
+        assert!(!membership(&db, "u1").await.is_active());
+
+        for tier in [CipherTier::T99, CipherTier::T149, CipherTier::T299] {
+            assert!(matches!(
+                error_type(
+                    create_cipher_checkout(
+                        &db,
+                        &stripe,
+                        &s,
+                        "u1",
+                        tier,
+                        CipherReturnTo::Web,
+                        NOW + DAY + 1
+                    )
+                    .await
+                ),
+                ErrorType::PaymentPending
+            ));
+        }
+        assert_eq!(stripe.call_count("create_checkout_session"), 1);
+
+        // Once the sweep has finished the release, checkout works again
         assert_eq!(
-            reconcile(&db, &stripe, &s, NOW + DAY + 4 * MINUTE)
+            reconcile(&db, &stripe, &s, NOW + DAY + 2 * MINUTE)
                 .await
                 .unwrap(),
-            "expired=0, resumed=1, reversed=0, redriven=0, errors=0"
+            "expired=0, resumed=0, reversed=1, redriven=0, errors=0"
+        );
+        checkout(
+            &db,
+            &stripe,
+            &s,
+            "u1",
+            CipherTier::T99,
+            NOW + DAY + 3 * MINUTE,
+        )
+        .await;
+        drop_db(&db).await;
+    }
+
+    #[tokio::test]
+    async fn a_purchase_paid_after_a_dropped_release_gets_a_new_number() {
+        let db = test_db().await;
+        let stripe = MockStripe::new();
+        let s = settings();
+        insert_user(&db, "u1").await;
+
+        let first = buy(&db, &stripe, &s, "u1", CipherTier::T99, "pi_1", NOW).await;
+        // Refunded in part (revoked), a new checkout opened, then the rest
+        // refunded in the window (the release is decided)...
+        change_membership(&db, "u1", revoked_for_refund(NOW + DAY)).await;
+        let late = checkout(&db, &stripe, &s, "u1", CipherTier::T149, NOW + DAY).await;
+        release_decided(&db, "u1", &first.id, NOW + DAY + 1, false).await;
+        // ...then Prot was credited, so the sweep drops the release
+        // (keep_number_retired): #1 stays retired on the old row
+        change_membership(&db, "u1", |m| m.prot_posted_at = Some(NOW + DAY + 2)).await;
+        assert_eq!(
+            reconcile(&db, &stripe, &s, NOW + DAY + 2 * MINUTE)
+                .await
+                .unwrap(),
+            "expired=0, resumed=0, reversed=1, redriven=0, errors=0"
+        );
+        assert!(db
+            .fetch_cipher_numbers_release_pending(10)
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(order(&db, &first.id).await.state, OrderState::Refunded);
+
+        // The open session is paid now: no release runs, so it is applied
+        // (not voided ReleasePending), on a new number
+        let session = pay(&stripe, &late, "pi_late");
+        assert_eq!(
+            fulfil_order(&db, &stripe, &s, &late.id, &session, NOW + DAY + 3 * MINUTE)
+                .await
+                .unwrap(),
+            FulfilOutcome::Fulfilled
         );
         let m = membership(&db, "u1").await;
         assert!(m.is_active());
         assert_eq!(
             (m.number, m.tier, m.orders.clone()),
-            (1, CipherTier::T149, vec![late.id.clone()])
+            (2, CipherTier::T149, vec![late.id.clone()])
         );
-        assert_eq!(badge(&db, "u1").await, badge_of(1, CipherTier::T149));
-        assert_eq!(order(&db, &first.id).await.state, OrderState::Refunded);
+        assert_eq!(
+            db.fetch_cipher_number_by_order(&first.id).await.unwrap(),
+            Some(1)
+        );
+        assert_eq!(badge(&db, "u1").await, badge_of(2, CipherTier::T149));
         assert_eq!(stripe.refund_count(), 0);
         drop_db(&db).await;
     }
@@ -7950,6 +8109,202 @@ mod tests {
             db.fetch_cipher_number_by_order(&first.id).await.unwrap(),
             Some(1)
         );
+        drop_db(&db).await;
+    }
+
+    #[tokio::test]
+    async fn an_upgrade_the_release_records_refunded_is_no_longer_marked_settling() {
+        let db = test_db().await;
+        let stripe = MockStripe::new();
+        let s = settings();
+        insert_user(&db, "u1").await;
+
+        let first = buy(&db, &stripe, &s, "u1", CipherTier::T99, "pi_1", NOW).await;
+        let up = buy(&db, &stripe, &s, "u1", CipherTier::T299, "pi_up", NOW + DAY).await;
+
+        // The upgrade was refunded in the Dashboard; the refund is pending,
+        // and its charge.refunded marked the upgrade settling
+        stripe.set_refund_status("pending");
+        let earlier = StripeApi::create_refund(&stripe, "pi_up", "dashboard-up")
+            .await
+            .unwrap();
+        stripe.set_refund_status("succeeded");
+        stripe.set_refund(upgrade_refund(&earlier.id, &up, "pending", NOW + DAY));
+        assert_eq!(
+            mark_refund_settling(&db, &up.id, NOW + DAY + MINUTE)
+                .await
+                .unwrap(),
+            ReverseOutcome::RecordedPending
+        );
+
+        // The purchase is refunded in its window: the release waits for the
+        // upgrade's refund
+        let at = NOW + 2 * DAY;
+        assert_eq!(
+            refund_via(&db, &stripe, &first.id, at).await,
+            ReverseOutcome::RecordedPending
+        );
+
+        // It succeeds, and the release (not the upgrade's own event)
+        // records the upgrade Refunded: the mark goes with it
+        stripe.set_refund(upgrade_refund(&earlier.id, &up, "succeeded", NOW + DAY));
+        assert_eq!(
+            finish_number_release(&db, &stripe, &first.id, at + MINUTE)
+                .await
+                .unwrap(),
+            ReverseOutcome::Applied
+        );
+        let o = order(&db, &up.id).await;
+        assert_eq!(o.state, OrderState::Refunded);
+        assert_eq!(o.refund_settling_since, None);
+        assert!(db
+            .fetch_payment_orders_refund_settling(at + 2 * MINUTE, 0)
+            .await
+            .unwrap()
+            .is_empty());
+        drop_db(&db).await;
+    }
+
+    // --- regions Cipher is not sold to --------------------------------
+
+    /// The buyer pays with a billing address in `country`
+    fn pay_from(
+        stripe: &MockStripe,
+        order: &PaymentOrder,
+        payment_intent: &str,
+        country: Option<&str>,
+    ) -> CheckoutSession {
+        let mut session = pay(stripe, order, payment_intent);
+        session.billing_country = country.map(str::to_string);
+        stripe.set_session(session.clone());
+        session
+    }
+
+    #[tokio::test]
+    async fn a_payment_billed_to_a_blocked_country_is_voided_and_refunded() {
+        let db = test_db().await;
+        let stripe = MockStripe::new();
+        let s = settings();
+        for user in ["u1", "u2", "u3"] {
+            insert_user(&db, user).await;
+        }
+
+        // Blocked, in any case Stripe reports it: refunded under the void
+        // key, no number claimed, no membership, no badge
+        for (user, country, pi) in [("u1", "DE", "pi_de"), ("u2", "gb", "pi_gb")] {
+            let pending = checkout(&db, &stripe, &s, user, CipherTier::T149, NOW).await;
+            let session = pay_from(&stripe, &pending, pi, Some(country));
+            assert_eq!(
+                fulfil_order(&db, &stripe, &s, &pending.id, &session, NOW)
+                    .await
+                    .unwrap(),
+                FulfilOutcome::Voided(VoidReason::RegionUnavailable)
+            );
+            let voided = order(&db, &pending.id).await;
+            assert_eq!(voided.state, OrderState::Voided);
+            assert_eq!(voided.void_reason, Some(VoidReason::RegionUnavailable));
+            assert_eq!(
+                db.fetch_cipher_number_by_order(&pending.id).await.unwrap(),
+                None
+            );
+            assert_eq!(maybe_membership(&db, user).await, None);
+            assert_eq!(badge(&db, user).await, None);
+            assert!(refund_keys(&stripe)
+                .contains(&(pi.to_string(), Some(format!("void-{}", pending.id)))));
+
+            // A redelivery refunds nothing more
+            assert_eq!(
+                fulfil_order(&db, &stripe, &s, &pending.id, &session, NOW + 1)
+                    .await
+                    .unwrap(),
+                FulfilOutcome::Voided(VoidReason::RegionUnavailable)
+            );
+        }
+        assert_eq!(stripe.refund_count(), 2);
+        assert_eq!(db.count_claimed_cipher_numbers().await.unwrap(), 0);
+
+        // Not blocked, or no country reported: fulfilled as usual
+        for (user, country, pi) in [("u3", Some("US"), "pi_us"), ("u1", None, "pi_none")] {
+            let pending = checkout(&db, &stripe, &s, user, CipherTier::T99, NOW + 2).await;
+            let session = pay_from(&stripe, &pending, pi, country);
+            assert_eq!(
+                fulfil_order(&db, &stripe, &s, &pending.id, &session, NOW + 2)
+                    .await
+                    .unwrap(),
+                FulfilOutcome::Fulfilled
+            );
+        }
+        assert_eq!(db.count_claimed_cipher_numbers().await.unwrap(), 2);
+        assert_eq!(stripe.refund_count(), 2);
+        drop_db(&db).await;
+    }
+
+    #[tokio::test]
+    async fn an_upgrade_billed_to_a_blocked_country_is_refunded_and_the_tier_kept() {
+        let db = test_db().await;
+        let stripe = MockStripe::new();
+        let s = settings();
+        insert_user(&db, "u1").await;
+
+        buy(&db, &stripe, &s, "u1", CipherTier::T99, "pi_1", NOW).await;
+        let up = checkout(&db, &stripe, &s, "u1", CipherTier::T299, NOW + DAY).await;
+        assert!(matches!(up.sku, Sku::CipherUpgrade { .. }));
+        let session = pay_from(&stripe, &up, "pi_up", Some("FR"));
+        assert_eq!(
+            fulfil_order(&db, &stripe, &s, &up.id, &session, NOW + DAY)
+                .await
+                .unwrap(),
+            FulfilOutcome::Voided(VoidReason::RegionUnavailable)
+        );
+        let m = membership(&db, "u1").await;
+        assert_eq!((m.number, m.tier), (1, CipherTier::T99));
+        assert!(!m.orders.contains(&up.id));
+        assert_eq!(badge(&db, "u1").await, badge_of(1, CipherTier::T99));
+        assert_eq!(
+            refund_keys(&stripe),
+            vec![("pi_up".to_string(), Some(format!("void-{}", up.id)))]
+        );
+        drop_db(&db).await;
+    }
+
+    #[tokio::test]
+    async fn the_region_rule_never_undoes_an_applied_order() {
+        let db = test_db().await;
+        let stripe = MockStripe::new();
+        let s = settings();
+        insert_user(&db, "u1").await;
+
+        // A worker applied the order (no country reported then), then
+        // crashed before writing it Fulfilled; the session read on resume
+        // reports a blocked country. The applied order is finished, never
+        // refunded or re-numbered.
+        let pending = checkout(&db, &stripe, &s, "u1", CipherTier::T99, NOW).await;
+        let session = pay_from(&stripe, &pending, "pi_1", None);
+        crash_after(&db, &pending.id, |o| {
+            o.state = OrderState::Paid;
+            o.payment_intent_id = Some("pi_1".to_string());
+            o.paid_at = Some(NOW);
+        })
+        .await;
+        let leased = acquire(&db, &pending.id, LATER).await.unwrap().unwrap();
+        assert!(matches!(
+            apply_membership(&db, &s, &leased.order, "u1", LATER)
+                .await
+                .unwrap(),
+            Applied::Done
+        ));
+        release(&db, &leased).await;
+
+        let blocked = pay_from(&stripe, &pending, "pi_1", Some("DE"));
+        assert_ne!(blocked, session);
+        assert_eq!(
+            fulfil_order(&db, &stripe, &s, &pending.id, &blocked, LATER + 1)
+                .await
+                .unwrap(),
+            FulfilOutcome::Fulfilled
+        );
+        assert_eq!(membership(&db, "u1").await.number, 1);
+        assert_eq!(stripe.refund_count(), 0);
         drop_db(&db).await;
     }
 }

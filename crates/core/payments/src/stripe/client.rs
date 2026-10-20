@@ -16,8 +16,8 @@ use async_trait::async_trait;
 use serde_json::Value;
 
 use super::event::{
-    event_from_value, obj_bool, obj_expandable_id, obj_i64, obj_metadata_order_id, obj_str,
-    StripeEvent,
+    event_from_value, obj_billing_country, obj_bool, obj_expandable_id, obj_i64,
+    obj_metadata_order_id, obj_str, StripeEvent,
 };
 
 /// `Stripe-Version` sent with every request. It matches the API version of the
@@ -125,6 +125,10 @@ pub struct CheckoutSession {
     pub metadata_order_id: Option<String>,
     /// Seconds since the Unix epoch
     pub expires_at: Option<i64>,
+    /// `customer_details.address.country`: the billing country the buyer
+    /// entered (ISO 3166-1 alpha-2), once the session is complete. Checkout
+    /// asks for the billing address (`billing_address_collection`).
+    pub billing_country: Option<String>,
 }
 
 /// A Payment Intent as Stripe reports it
@@ -183,6 +187,7 @@ impl CheckoutSession {
             client_reference_id: opt_string(value, "client_reference_id"),
             metadata_order_id: obj_metadata_order_id(value),
             expires_at: obj_i64(value, "expires_at"),
+            billing_country: obj_billing_country(value),
         })
     }
 }
@@ -328,6 +333,10 @@ pub const CIPHER_TAX_CODE: &str = "txcd_10000000";
 /// With `automatic_tax`, Stripe Tax is on and the price is tax-inclusive,
 /// so `amount_total` still equals the order amount and the fulfilment
 /// amount check is unchanged.
+///
+/// The billing address is required (`billing_address_collection`), so the
+/// completed session reports the buyer's billing country, which fulfilment
+/// checks against `[features.payments] cipher_blocked_countries`.
 pub fn checkout_form(p: &CheckoutSessionParams) -> Vec<(String, String)> {
     let mut form: Vec<(String, String)> = [
         ("mode", "payment".to_string()),
@@ -351,6 +360,7 @@ pub fn checkout_form(p: &CheckoutSessionParams) -> Vec<(String, String)> {
         ("success_url", p.success_url.clone()),
         ("cancel_url", p.cancel_url.clone()),
         ("expires_at", p.expires_at_secs.to_string()),
+        ("billing_address_collection", "required".to_string()),
         (
             "consent_collection[terms_of_service]",
             "required".to_string(),
@@ -1077,6 +1087,7 @@ mod mock {
                     client_reference_id: Some(p.user_id.clone()),
                     metadata_order_id: Some(p.order_id.clone()),
                     expires_at: Some(p.expires_at_secs),
+                    billing_country: None,
                 };
                 state.sessions.insert(session.id.clone(), session.clone());
                 state
@@ -1307,6 +1318,8 @@ mod tests {
                 ("success_url", "https://sloga.gg/cipher/thanks"),
                 ("cancel_url", "https://sloga.gg/cipher"),
                 ("expires_at", "1729002100"),
+                // The billing country is checked at fulfilment
+                ("billing_address_collection", "required"),
                 // The buyer accepts the Terms, with the 14-day full
                 // refund promise
                 ("consent_collection[terms_of_service]", "required"),
@@ -1664,7 +1677,11 @@ mod tests {
             "livemode": false,
             "client_reference_id": "user1",
             "metadata": {"order_id": "order1"},
-            "expires_at": 1729002100
+            "expires_at": 1729002100,
+            "customer_details": {
+                "email": "buyer@example.com",
+                "address": {"country": "DE", "postal_code": "10115"}
+            }
         });
         assert_eq!(
             CheckoutSession::from_stripe_json(&value).unwrap(),
@@ -1680,6 +1697,7 @@ mod tests {
                 client_reference_id: Some("user1".to_string()),
                 metadata_order_id: Some("order1".to_string()),
                 expires_at: Some(1729002100),
+                billing_country: Some("DE".to_string()),
             }
         );
 
@@ -1693,6 +1711,29 @@ mod tests {
         assert!(session.livemode);
         // a mistyped field is absent, never coerced
         assert_eq!(session.amount_total, None);
+        assert_eq!(session.billing_country, None);
+
+        // No address, a null country or a malformed one: absent
+        for details in [
+            serde_json::json!(null),
+            serde_json::json!({"email": "buyer@example.com"}),
+            serde_json::json!({"address": null}),
+            serde_json::json!({"address": {"country": null}}),
+            serde_json::json!({"address": {"country": ""}}),
+            serde_json::json!({"address": {"country": 49}}),
+            serde_json::json!({"address": "DE"}),
+        ] {
+            let value = serde_json::json!({
+                "id": "cs_test_a1", "livemode": false, "customer_details": details
+            });
+            assert_eq!(
+                CheckoutSession::from_stripe_json(&value)
+                    .unwrap()
+                    .billing_country,
+                None,
+                "{value}"
+            );
+        }
     }
 
     #[test]

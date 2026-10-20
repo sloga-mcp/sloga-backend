@@ -65,10 +65,13 @@ pub trait AbstractPaymentOrders: Sync + Send {
         limit: i64,
     ) -> Result<Vec<PaymentOrder>>;
 
-    /// Orders with `refund_settling_since` set whose lease is free
-    /// (`lease_until` unset or `< now`), oldest `created_at` first, up to
-    /// `limit` (0 = no limit). Any state: the mark is only set while a
-    /// refund can still change the order, and cleared once it is acted on.
+    /// Orders with `refund_settling_since` AND `payment_intent_id` set whose
+    /// lease is free (`lease_until` unset or `< now`), oldest `created_at`
+    /// first, up to `limit` (0 = no limit). Any state: the mark is only set
+    /// while a refund can still change the order, and cleared once it is
+    /// acted on. A marked order with no payment intent (not marked Paid yet)
+    /// has nothing to look up at Stripe; it is left out, so it never takes a
+    /// batch slot, and comes in once its fulfilment records the payment.
     /// The reconcile sweep re-reads their refunds at Stripe, so a refund
     /// whose update event never arrives is still applied. No index: only
     /// orders with a refund in flight carry the field.
@@ -745,15 +748,18 @@ mod tests {
             for row in [
                 PaymentOrder {
                     refund_settling_since: Some(300),
+                    payment_intent_id: Some("pi_fulfilled".to_string()),
                     ..order("fulfilled", "u1", OrderState::Fulfilled, 20)
                 },
                 // Any state is selected
                 PaymentOrder {
                     refund_settling_since: Some(200),
+                    payment_intent_id: Some("pi_paid".to_string()),
                     ..order("paid", "u2", OrderState::Paid, 10)
                 },
                 PaymentOrder {
                     refund_settling_since: Some(100),
+                    payment_intent_id: Some("pi_held".to_string()),
                     lease_until: Some(1_000),
                     ..order("held", "u3", OrderState::Fulfilled, 5)
                 },
@@ -762,6 +768,12 @@ mod tests {
                 PaymentOrder {
                     reversal_pending: Some(ReversalPending::Refund),
                     ..order("recorded", "u5", OrderState::Paid, 2)
+                },
+                // Marked, but not paid yet: no payment to look up, so it is
+                // never selected (oldest of all, so a limit would show it)
+                PaymentOrder {
+                    refund_settling_since: Some(50),
+                    ..order("unpaid", "u6", OrderState::Pending, 0)
                 },
             ] {
                 db.insert_payment_order(&row).await.unwrap();

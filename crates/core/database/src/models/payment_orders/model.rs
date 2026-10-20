@@ -46,6 +46,12 @@ auto_derived!(
         /// A refund or a lost dispute arrived before fulfilment applied the
         /// order, so it was never applied
         Reversed,
+        /// A new purchase paid while the release of the buyer's previous
+        /// Cipher number (a refund within the 14 days) was still running
+        ReleasePending,
+        /// The buyer's billing country is one Cipher is not sold to
+        /// (`[features.payments] cipher_blocked_countries`)
+        RegionUnavailable,
     }
 
     /// A reversal that arrived before fulfilment finished; fulfilment

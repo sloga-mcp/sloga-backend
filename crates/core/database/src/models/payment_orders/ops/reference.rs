@@ -162,7 +162,11 @@ impl AbstractPaymentOrders for ReferenceDb {
         let orders = self.payment_orders.lock().await;
         let mut rows: Vec<PaymentOrder> = orders
             .values()
-            .filter(|row| row.refund_settling_since.is_some() && lease_free(row, now))
+            .filter(|row| {
+                row.refund_settling_since.is_some()
+                    && row.payment_intent_id.is_some()
+                    && lease_free(row, now)
+            })
             .cloned()
             .collect();
         sort_oldest_first(&mut rows);

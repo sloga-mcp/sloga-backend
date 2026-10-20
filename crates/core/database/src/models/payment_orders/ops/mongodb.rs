@@ -169,10 +169,11 @@ impl AbstractPaymentOrders for MongoDb {
         now: i64,
         limit: i64,
     ) -> Result<Vec<PaymentOrder>> {
-        // Never stored as null, so `$exists` is exactly "set"
+        // Neither is ever stored as null, so `$exists` is exactly "set"
         self.col::<PaymentOrder>(COL)
             .find(doc! {
                 "refund_settling_since": { "$exists": true },
+                "payment_intent_id": { "$exists": true },
                 "$or": lease_free(now)
             })
             .sort(doc! { "created_at": 1_i32, "_id": 1_i32 })
@@ -459,6 +460,20 @@ mod tests {
         })
         .unwrap();
         assert_eq!(reversed.get_str("void_reason").unwrap(), "Reversed");
+
+        for (reason, name) in [
+            (VoidReason::ReleasePending, "ReleasePending"),
+            (VoidReason::RegionUnavailable, "RegionUnavailable"),
+        ] {
+            let voided = PaymentOrder {
+                state: OrderState::Voided,
+                void_reason: Some(reason),
+                ..order()
+            };
+            let doc = to_document(&voided).unwrap();
+            assert_eq!(doc.get_str("void_reason").unwrap(), name);
+            assert_eq!(from_document::<PaymentOrder>(doc).unwrap(), voided);
+        }
     }
 
     #[test]
