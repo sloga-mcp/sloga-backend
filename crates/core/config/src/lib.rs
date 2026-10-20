@@ -1631,11 +1631,38 @@ pub struct FeaturePayments {
     /// checkout refuses a request Cloudflare places there
     /// (`CipherRegionUnavailable`, only with `[api.security]
     /// trust_cloudflare`), and fulfilment voids and refunds a payment whose
-    /// billing address is there. Defaults to the 27 EU member states and the
-    /// UK (no VAT registrations yet). A list cannot be set through the
-    /// environment; set it in Revolt.overrides.toml. An entry that is not two
-    /// uppercase letters fails the payments config (checkouts refused).
+    /// billing address, or the issuing country of the card that paid it, is
+    /// there. Defaults to the 27 EU member states and the UK (no VAT
+    /// registrations yet). A TOML list, or one comma-separated string (the
+    /// environment form, `REVOLT__FEATURES__PAYMENTS__CIPHER_BLOCKED_COUNTRIES=DE,FR`;
+    /// see `country_list`). An entry that is not two uppercase letters
+    /// fails the payments config (checkouts refused).
+    #[serde(deserialize_with = "country_list")]
     pub cipher_blocked_countries: Vec<String>,
+}
+
+/// `cipher_blocked_countries` from a list, or from one comma-separated
+/// string (an environment variable cannot carry a list). Each entry of the
+/// string is trimmed; an empty one (`""`, `"DE,"`) is kept, so the payments
+/// config refuses it instead of blocking nothing. To block nothing, set
+/// `cipher_blocked_countries = []` in Revolt.overrides.toml.
+fn country_list<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Vec<String>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum CountryList {
+        List(Vec<String>),
+        Joined(String),
+    }
+
+    Ok(match CountryList::deserialize(deserializer)? {
+        CountryList::List(codes) => codes,
+        CountryList::Joined(joined) => joined
+            .split(',')
+            .map(|code| code.trim().to_string())
+            .collect(),
+    })
 }
 
 /// The 27 EU member states and the United Kingdom: the default of
@@ -3233,6 +3260,42 @@ mod payments_config_tests {
                 .map(str::to_string)
                 .to_vec()
         );
+    }
+
+    /// The blocked list from the environment: one comma-separated string,
+    /// each entry trimmed. An empty entry is kept for the payments config
+    /// to refuse, never dropped.
+    #[test]
+    fn environment_sets_the_blocked_countries_as_a_comma_separated_string() {
+        let from_env = |value: &str| -> Vec<String> {
+            let settings: Settings = Config::builder()
+                .add_source(File::from_str(
+                    include_str!("../Revolt.toml"),
+                    FileFormat::Toml,
+                ))
+                .add_source(
+                    Environment::with_prefix("REVOLT")
+                        .separator("__")
+                        .source(Some(
+                            [(
+                                "REVOLT__FEATURES__PAYMENTS__CIPHER_BLOCKED_COUNTRIES".to_string(),
+                                value.to_string(),
+                            )]
+                            .into(),
+                        )),
+                )
+                .build()
+                .expect("the config builds")
+                .try_deserialize()
+                .expect("the config deserializes");
+            settings.features.payments.cipher_blocked_countries
+        };
+
+        assert_eq!(from_env("DE,FR"), ["DE", "FR"]);
+        assert_eq!(from_env(" DE , US "), ["DE", "US"]);
+        assert_eq!(from_env("GB"), ["GB"]);
+        assert_eq!(from_env("DE,"), ["DE", ""]);
+        assert_eq!(from_env(""), [""]);
     }
 
     /// The documented env form (double underscores) reaches the nested keys

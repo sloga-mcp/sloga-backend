@@ -20,6 +20,9 @@
 //!   applied: the "already applied?" check runs before any precondition
 //! - our own refunds use the idempotency key `void-{order_id}`, and a
 //!   payment lost in a dispute is never refunded by us
+//! - a void records its reason on the order before it refunds, so a worker
+//!   that stops between the refund and the Voided write leaves the void to
+//!   be finished, never the refunded order to be applied
 //! - a reversal only touches a membership when the order is Fulfilled and
 //!   listed in that membership, so the refund of a voided order is a no-op
 //! - every open dispute is recorded on the order by its id
@@ -54,9 +57,10 @@
 //!   voided and refunded at once (`ReleasePending`), and a dispute lost
 //!   during one drops it (the number stays retired)
 //! - Cipher is not sold to `cipher_blocked_countries` (the EU and the UK):
-//!   checkout refuses a request Cloudflare places there (the route), and a
-//!   payment whose billing country is there is voided and refunded
-//!   (`RegionUnavailable`) before any number is claimed
+//!   checkout refuses a request Cloudflare places there (the route) and a
+//!   buyer already refunded for that reason, and a payment whose billing
+//!   country, or whose card's issuing country, is there is voided and
+//!   refunded (`RegionUnavailable`) before any number is claimed
 
 use revolt_database::{
     CipherMembership, CipherRevokeReason, Database, FieldsUser, OrderState, PartialUser,
@@ -326,10 +330,11 @@ async fn ask_refund(
     }
 }
 
-/// Refund `payment_intent` for an order we are voiding. A payment that is
-/// already refunded counts as done (the money is back either way). A refund
-/// Stripe reports `failed` or `canceled` returned nothing: that is an error,
-/// so the order is not voided and the caller retries.
+/// Refund `payment_intent` for an order we are voiding. Ok(true) once the
+/// money is back or on its way; a payment that is already refunded counts
+/// as done. Ok(false), logged, when Stripe reports the refund `failed` or
+/// `canceled`: nothing went back, so the order is not voided and the caller
+/// retries. Err when the call itself failed (its outcome is unknown).
 ///
 /// Operator note: a refund Stripe reports `pending` (or `requires_action`)
 /// is accepted and the order is voided, but the money has not moved yet.
@@ -341,25 +346,25 @@ async fn refund_for_void(
     stripe: &dyn StripeApi,
     payment_intent: &str,
     order_id: &str,
-) -> Result<()> {
+) -> Result<bool> {
     match ask_refund(stripe, payment_intent, &void_key(order_id), order_id).await? {
         RefundAsked::Refused { refund_id, status } => {
             log::error!(
                 "payments: refund {refund_id} of order {order_id} is {status}; the order stays \
                  unvoided"
             );
-            Err(create_error!(PaymentProviderError))
+            Ok(false)
         }
         // Already refunded: the money is back or on its way, like a pending
         // refund of ours below
-        RefundAsked::Done | RefundAsked::AlreadyRefunded => Ok(()),
+        RefundAsked::Done | RefundAsked::AlreadyRefunded => Ok(true),
         RefundAsked::Unsettled { refund_id, status } => {
             // Not settled yet (see the operator note above)
             log::error!(
                 "payments: refund {refund_id} of order {order_id} is {status}; the order is \
                  voided, but the refund must be watched in the Stripe dashboard until it succeeds"
             );
-            Ok(())
+            Ok(true)
         }
     }
 }
@@ -543,6 +548,19 @@ pub async fn create_cipher_checkout(
 
     if !s.sales_open_at(now_ms) {
         return Err(create_error!(CipherSalesClosed));
+    }
+
+    // A buyer once refunded because the payment came from a country Cipher
+    // is not sold to gets no new checkout: each one would be paid, voided
+    // and refunded again, at a Stripe fee each time. A void of that kind
+    // still finishing (Paid, the reason recorded) counts too.
+    if db
+        .fetch_payment_orders_by_user(user_id, &[OrderState::Voided, OrderState::Paid])
+        .await?
+        .iter()
+        .any(|o| o.void_reason == Some(VoidReason::RegionUnavailable))
+    {
+        return Err(create_error!(CipherRegionUnavailable));
     }
 
     let row = db.fetch_cipher_membership(user_id).await?;
@@ -948,6 +966,35 @@ async fn fulfil_locked(
             ),
         }
 
+        // Nor to a card issued there, whatever billing address was typed
+        // in (Apple Pay, Google Pay and Link included). Any other method,
+        // or a card Stripe reports no country for, is judged on the billing
+        // country alone. A failed read is an error: nothing is claimed, and
+        // the event (or the reconcile resume) tries again.
+        if !s.blocked_countries.is_empty() {
+            let charge = stripe
+                .get_payment_charge(&payment_intent)
+                .await
+                .map_err(|err| {
+                    provider_error(
+                        &format!("reading the charge of order {}", leased.order.id),
+                        err,
+                    )
+                })?;
+            if let Some(country) = charge
+                .card_country
+                .as_deref()
+                .filter(|country| s.region_blocked(country))
+            {
+                log::warn!(
+                    "payments: order {} was paid with a card issued in {country}, where Cipher \
+                     is not sold; voiding and refunding it",
+                    leased.order.id
+                );
+                return void_paid(db, stripe, leased, VoidReason::RegionUnavailable, now_ms).await;
+            }
+        }
+
         // A new purchase paid while the release of the buyer's old number
         // is still running would replace that row, and the upgrades on it
         // not refunded yet would go with it. Checkout refuses to start one
@@ -1173,7 +1220,9 @@ async fn void_late_payment(
         return void_paid(db, stripe, leased, reason, now_ms).await;
     }
 
-    refund_for_void(stripe, &payment_intent, &leased.order.id).await?;
+    if !refund_for_void(stripe, &payment_intent, &leased.order.id).await? {
+        return Err(create_error!(PaymentProviderError));
+    }
     let session_id = session.id.clone();
     write(db, leased, move |o| {
         o.payment_intent_id = Some(payment_intent);
@@ -1406,7 +1455,27 @@ async fn void_paid(
             );
             return Err(create_error!(InternalError));
         };
-        refund_for_void(stripe, &payment_intent, &leased.order.id).await?;
+
+        // The reason goes on the order before the refund. A worker that
+        // stops after Stripe refunded, before the Voided write below, leaves
+        // the order Paid with its reason, and the next attempt finishes this
+        // void (fulfilment reads `void_reason` first) instead of judging the
+        // order again, maybe once what voided it is gone (a release that
+        // has finished since), and applying a refunded payment.
+        let previous = leased.order.void_reason.clone();
+        let marked_now = previous.as_ref() != Some(&reason);
+        if marked_now {
+            let marked = reason.clone();
+            write(db, leased, move |o| o.void_reason = Some(marked)).await?;
+        }
+        if !refund_for_void(stripe, &payment_intent, &leased.order.id).await? {
+            // Refused: no money moved, so nothing is committed yet; the next
+            // attempt judges the order afresh
+            if marked_now {
+                write(db, leased, move |o| o.void_reason = previous).await?;
+            }
+            return Err(create_error!(PaymentProviderError));
+        }
     }
 
     let stored_reason = reason.clone();
@@ -2925,7 +2994,7 @@ mod tests {
     use super::*;
     use crate::catalog::CIPHER_CAP_MAX;
     use crate::dispatch::{handle_event, reconcile, EventOutcome};
-    use crate::stripe::{Dispute, MockStripe, PaymentIntent, Refund, StripeEvent};
+    use crate::stripe::{Dispute, MockStripe, PaymentCharge, PaymentIntent, Refund, StripeEvent};
 
     const NOW: i64 = 1_760_000_000_000;
     /// After a dead worker's lease has run out
@@ -8185,7 +8254,7 @@ mod tests {
         let db = test_db().await;
         let stripe = MockStripe::new();
         let s = settings();
-        for user in ["u1", "u2", "u3"] {
+        for user in ["u1", "u2", "u3", "u4"] {
             insert_user(&db, user).await;
         }
 
@@ -8223,8 +8292,10 @@ mod tests {
         assert_eq!(stripe.refund_count(), 2);
         assert_eq!(db.count_claimed_cipher_numbers().await.unwrap(), 0);
 
-        // Not blocked, or no country reported: fulfilled as usual
-        for (user, country, pi) in [("u3", Some("US"), "pi_us"), ("u1", None, "pi_none")] {
+        // Not blocked, or no country reported: fulfilled as usual (u1 is
+        // refused a new checkout, see
+        // `a_buyer_refunded_for_their_region_gets_no_new_checkout`)
+        for (user, country, pi) in [("u3", Some("US"), "pi_us"), ("u4", None, "pi_none")] {
             let pending = checkout(&db, &stripe, &s, user, CipherTier::T99, NOW + 2).await;
             let session = pay_from(&stripe, &pending, pi, country);
             assert_eq!(
@@ -8305,6 +8376,261 @@ mod tests {
         );
         assert_eq!(membership(&db, "u1").await.number, 1);
         assert_eq!(stripe.refund_count(), 0);
+        drop_db(&db).await;
+    }
+
+    /// Paid by `method`, issued in `country`
+    fn paid_by(payment_intent: &str, method: &str, country: Option<&str>) -> PaymentCharge {
+        PaymentCharge {
+            payment_intent: payment_intent.to_string(),
+            method: Some(method.to_string()),
+            card_country: country.map(str::to_string),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_buyer_refunded_for_their_region_gets_no_new_checkout() {
+        let db = test_db().await;
+        let stripe = MockStripe::new();
+        let s = settings();
+        for user in ["u1", "u2", "u3"] {
+            insert_user(&db, user).await;
+        }
+
+        // u1: voided and refunded for the billing country
+        let pending = checkout(&db, &stripe, &s, "u1", CipherTier::T99, NOW).await;
+        let session = pay_from(&stripe, &pending, "pi_de", Some("DE"));
+        assert_eq!(
+            fulfil_order(&db, &stripe, &s, &pending.id, &session, NOW)
+                .await
+                .unwrap(),
+            FulfilOutcome::Voided(VoidReason::RegionUnavailable)
+        );
+
+        // u2: the same void, stopped after the refund (Stripe acted, its
+        // answer was lost): Paid, the reason recorded
+        let stopped = checkout(&db, &stripe, &s, "u2", CipherTier::T99, NOW).await;
+        let session = pay_from(&stripe, &stopped, "pi_gb", Some("GB"));
+        stripe.fail_next_after_effect(
+            "create_refund",
+            StripeError::Transport("timeout".to_string()),
+        );
+        assert!(matches!(
+            error_type(fulfil_order(&db, &stripe, &s, &stopped.id, &session, NOW).await),
+            ErrorType::PaymentProviderError
+        ));
+        let paid = order(&db, &stopped.id).await;
+        assert_eq!(paid.state, OrderState::Paid);
+        assert_eq!(paid.void_reason, Some(VoidReason::RegionUnavailable));
+
+        // Neither gets a new checkout, of any tier: no order, no session
+        let sessions = stripe.call_count("create_checkout_session");
+        for user in ["u1", "u2"] {
+            for tier in [CipherTier::T99, CipherTier::T299] {
+                assert!(matches!(
+                    error_type(
+                        create_cipher_checkout(
+                            &db,
+                            &stripe,
+                            &s,
+                            user,
+                            tier,
+                            CipherReturnTo::Web,
+                            NOW + DAY
+                        )
+                        .await
+                    ),
+                    ErrorType::CipherRegionUnavailable
+                ));
+            }
+            assert!(db
+                .fetch_payment_orders_by_user(user, &[OrderState::Creating, OrderState::Pending])
+                .await
+                .unwrap()
+                .is_empty());
+        }
+        assert_eq!(stripe.call_count("create_checkout_session"), sessions);
+        assert_eq!(stripe.refund_count(), 2);
+
+        // Another void reason blocks nothing
+        let other = checkout(&db, &stripe, &s, "u3", CipherTier::T99, NOW).await;
+        crash_after(&db, &other.id, |o| {
+            o.state = OrderState::Voided;
+            o.void_reason = Some(VoidReason::SoldOut);
+        })
+        .await;
+        buy(&db, &stripe, &s, "u3", CipherTier::T99, "pi_us", LATER).await;
+        drop_db(&db).await;
+    }
+
+    #[tokio::test]
+    async fn a_void_stopped_after_its_refund_is_finished_even_once_its_cause_is_gone() {
+        let db = test_db().await;
+        let stripe = MockStripe::new();
+        let s = settings();
+        insert_user(&db, "u1").await;
+
+        // A purchase opened before a release of the buyer's number, paid
+        // while it runs: voided (ReleasePending). The refund goes through,
+        // then the worker stops before writing the order Voided.
+        let first = buy(&db, &stripe, &s, "u1", CipherTier::T99, "pi_1", NOW).await;
+        change_membership(&db, "u1", revoked_for_refund(NOW + DAY)).await;
+        let late = checkout(&db, &stripe, &s, "u1", CipherTier::T149, NOW + DAY).await;
+        release_decided(&db, "u1", &first.id, NOW + DAY + 1, false).await;
+        let session = pay(&stripe, &late, "pi_late");
+        stripe.fail_next_after_effect(
+            "create_refund",
+            StripeError::Transport("timeout".to_string()),
+        );
+        assert!(matches!(
+            error_type(fulfil_order(&db, &stripe, &s, &late.id, &session, NOW + DAY + 3).await),
+            ErrorType::PaymentProviderError
+        ));
+        let stopped = order(&db, &late.id).await;
+        assert_eq!(stopped.state, OrderState::Paid);
+        assert_eq!(stopped.void_reason, Some(VoidReason::ReleasePending));
+        assert!(stopped.lease_until.is_none());
+        assert_eq!(stripe.refund_count_for("pi_late"), 1);
+
+        // The release finishes before anything picks the order up again
+        assert_eq!(
+            finish_number_release(&db, &stripe, &first.id, NOW + DAY + MINUTE)
+                .await
+                .unwrap(),
+            ReverseOutcome::Applied
+        );
+        assert_eq!(maybe_membership(&db, "u1").await, None);
+
+        // The resume finishes the void: the refunded payment is never
+        // applied (no number, no membership, no badge), nor refunded twice
+        assert_eq!(
+            resume_order(&db, &stripe, &s, &late.id, NOW + DAY + 2 * MINUTE)
+                .await
+                .unwrap(),
+            FulfilOutcome::Voided(VoidReason::ReleasePending)
+        );
+        let voided = order(&db, &late.id).await;
+        assert_eq!(voided.state, OrderState::Voided);
+        assert_eq!(voided.void_reason, Some(VoidReason::ReleasePending));
+        assert_eq!(
+            db.fetch_cipher_number_by_order(&late.id).await.unwrap(),
+            None
+        );
+        assert_eq!(maybe_membership(&db, "u1").await, None);
+        assert_eq!(badge(&db, "u1").await, None);
+        assert_eq!(stripe.refund_count_for("pi_late"), 1);
+        drop_db(&db).await;
+    }
+
+    #[tokio::test]
+    async fn a_card_issued_in_a_blocked_country_is_voided_whatever_the_billing_address() {
+        let db = test_db().await;
+        let stripe = MockStripe::new();
+        let s = settings();
+
+        // A card (a wallet too) or a Link card issued in a blocked country,
+        // billed to the US: refunded under the void key, nothing claimed
+        for (user, pi, method, country) in [
+            ("u1", "pi_card_de", "card", "DE"),
+            ("u2", "pi_link_fr", "link", "fr"),
+        ] {
+            insert_user(&db, user).await;
+            let pending = checkout(&db, &stripe, &s, user, CipherTier::T149, NOW).await;
+            let session = pay_from(&stripe, &pending, pi, Some("US"));
+            stripe.set_payment_charge(paid_by(pi, method, Some(country)));
+            assert_eq!(
+                fulfil_order(&db, &stripe, &s, &pending.id, &session, NOW)
+                    .await
+                    .unwrap(),
+                FulfilOutcome::Voided(VoidReason::RegionUnavailable)
+            );
+            let voided = order(&db, &pending.id).await;
+            assert_eq!(voided.state, OrderState::Voided);
+            assert_eq!(voided.void_reason, Some(VoidReason::RegionUnavailable));
+            assert_eq!(
+                db.fetch_cipher_number_by_order(&pending.id).await.unwrap(),
+                None
+            );
+            assert_eq!(maybe_membership(&db, user).await, None);
+            assert_eq!(badge(&db, user).await, None);
+            assert!(refund_keys(&stripe)
+                .contains(&(pi.to_string(), Some(format!("void-{}", pending.id)))));
+        }
+        assert_eq!(stripe.refund_count(), 2);
+
+        // A US card billed to the US, and a method with no card country
+        // billed to the US: fulfilled
+        for (user, pi, method, country) in [
+            ("u3", "pi_card_us", "card", Some("US")),
+            ("u4", "pi_cashapp_us", "cashapp", None),
+        ] {
+            insert_user(&db, user).await;
+            let pending = checkout(&db, &stripe, &s, user, CipherTier::T99, NOW + 1).await;
+            let session = pay_from(&stripe, &pending, pi, Some("US"));
+            stripe.set_payment_charge(paid_by(pi, method, country));
+            assert_eq!(
+                fulfil_order(&db, &stripe, &s, &pending.id, &session, NOW + 1)
+                    .await
+                    .unwrap(),
+                FulfilOutcome::Fulfilled
+            );
+            assert!(membership(&db, user).await.is_active());
+        }
+
+        // A method with no card country is judged on the billing country
+        // alone: billed to a blocked one, it is voided before the charge is
+        // read at all
+        insert_user(&db, "u5").await;
+        let pending = checkout(&db, &stripe, &s, "u5", CipherTier::T99, NOW + 2).await;
+        let session = pay_from(&stripe, &pending, "pi_cashapp_de", Some("DE"));
+        stripe.set_payment_charge(paid_by("pi_cashapp_de", "cashapp", None));
+        assert_eq!(
+            fulfil_order(&db, &stripe, &s, &pending.id, &session, NOW + 2)
+                .await
+                .unwrap(),
+            FulfilOutcome::Voided(VoidReason::RegionUnavailable)
+        );
+
+        assert_eq!(stripe.refund_count(), 3);
+        assert_eq!(db.count_claimed_cipher_numbers().await.unwrap(), 2);
+        assert_eq!(stripe.call_count("get_payment_charge"), 4);
+        drop_db(&db).await;
+    }
+
+    #[tokio::test]
+    async fn a_charge_that_cannot_be_read_applies_nothing_until_it_is_read() {
+        let db = test_db().await;
+        let stripe = MockStripe::new();
+        let s = settings();
+        insert_user(&db, "u1").await;
+
+        let pending = checkout(&db, &stripe, &s, "u1", CipherTier::T99, NOW).await;
+        let session = pay_from(&stripe, &pending, "pi_1", Some("US"));
+        stripe.set_payment_charge(paid_by("pi_1", "card", Some("DE")));
+        stripe.fail_next(
+            "get_payment_charge",
+            StripeError::Transport("timeout".to_string()),
+        );
+        assert!(matches!(
+            error_type(fulfil_order(&db, &stripe, &s, &pending.id, &session, NOW).await),
+            ErrorType::PaymentProviderError
+        ));
+        let kept = order(&db, &pending.id).await;
+        assert_eq!(kept.state, OrderState::Paid);
+        assert_eq!(kept.void_reason, None);
+        assert!(kept.lease_until.is_none());
+        assert_eq!(db.count_claimed_cipher_numbers().await.unwrap(), 0);
+        assert_eq!(stripe.refund_count(), 0);
+
+        // The next attempt reads the charge and voids
+        assert_eq!(
+            resume_order(&db, &stripe, &s, &pending.id, NOW + 1)
+                .await
+                .unwrap(),
+            FulfilOutcome::Voided(VoidReason::RegionUnavailable)
+        );
+        assert_eq!(stripe.refund_count_for("pi_1"), 1);
+        assert_eq!(db.count_claimed_cipher_numbers().await.unwrap(), 0);
         drop_db(&db).await;
     }
 }

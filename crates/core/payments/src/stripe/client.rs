@@ -1,8 +1,8 @@
 //! Stripe REST client
 //!
 //! [`StripeApi`] is the narrow slice of the Stripe API the payment engine
-//! uses: create and read Checkout Sessions, read Payment Intents, Events and
-//! Disputes, refund, and list a payment's refunds. [`ReqwestStripe`] talks to `https://api.stripe.com/v1`;
+//! uses: create and read Checkout Sessions, read Payment Intents (with their
+//! latest charge), Events and Disputes, refund, and list a payment's refunds. [`ReqwestStripe`] talks to `https://api.stripe.com/v1`;
 //! `MockStripe` (tests and the `test-mock` feature) mirrors the parts of
 //! Stripe's behavior the engine depends on, idempotency keys included.
 //!
@@ -143,6 +143,22 @@ pub struct PaymentIntent {
     pub metadata_order_id: Option<String>,
 }
 
+/// How a payment was paid: its latest charge, as Stripe reports it
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PaymentCharge {
+    /// The payment intent the charge belongs to
+    pub payment_intent: String,
+    /// `latest_charge.payment_method_details.type`: `card` (Apple Pay and
+    /// Google Pay included), `link`, or another method; None while the
+    /// payment has no charge
+    pub method: Option<String>,
+    /// The card's issuing country (ISO 3166-1 alpha-2):
+    /// `payment_method_details.card.country`, or for Link
+    /// `payment_method_details.link.country` (its funding source's). None
+    /// for any other method, or when Stripe does not report one.
+    pub card_country: Option<String>,
+}
+
 /// A Refund as Stripe reports it
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Refund {
@@ -204,6 +220,47 @@ impl PaymentIntent {
             currency: opt_string(value, "currency"),
             status: opt_string(value, "status"),
             metadata_order_id: obj_metadata_order_id(value),
+        })
+    }
+}
+
+impl PaymentCharge {
+    /// Map a Payment Intent JSON object read with `expand[]=latest_charge`.
+    /// Requires a well-formed `id`. Fails closed on a `latest_charge` that
+    /// is not expanded, or that belongs to another payment intent; no
+    /// charge yet (`null`) reports no method.
+    pub fn from_stripe_json(value: &Value) -> Result<Self, StripeError> {
+        expect_object(value, "payment_intent")?;
+        let payment_intent = required_id(value)?;
+        let charge = match value.get("latest_charge") {
+            None | Some(Value::Null) => {
+                return Ok(PaymentCharge {
+                    payment_intent,
+                    ..Default::default()
+                })
+            }
+            Some(charge) if charge.is_object() => charge,
+            Some(_) => return Err(decode("latest_charge is not expanded")),
+        };
+        expect_object(charge, "charge")?;
+        if obj_expandable_id(charge, "payment_intent").is_some_and(|id| id != payment_intent) {
+            return Err(decode("latest_charge belongs to another payment intent"));
+        }
+
+        let details = charge.get("payment_method_details");
+        let method = details.and_then(|d| obj_str(d, "type")).map(str::to_string);
+        let card_country = match method.as_deref() {
+            Some(kind @ ("card" | "link")) => details
+                .and_then(|d| d.get(kind))
+                .and_then(|paid_by| obj_str(paid_by, "country"))
+                .filter(|country| !country.is_empty())
+                .map(str::to_string),
+            _ => None,
+        };
+        Ok(PaymentCharge {
+            payment_intent,
+            method,
+            card_country,
         })
     }
 }
@@ -278,6 +335,10 @@ pub trait StripeApi: Send + Sync {
     /// `GET /v1/payment_intents/{id}`
     async fn get_payment_intent(&self, id: &str) -> Result<PaymentIntent, StripeError>;
 
+    /// `GET /v1/payment_intents/{id}?expand[]=latest_charge`: how the
+    /// payment was paid (the method, and the card's issuing country)
+    async fn get_payment_charge(&self, payment_intent: &str) -> Result<PaymentCharge, StripeError>;
+
     /// `GET /v1/events/{id}` (re-drive; Stripe keeps events for 30 days)
     async fn get_event(&self, id: &str) -> Result<StripeEvent, StripeError>;
 
@@ -336,7 +397,9 @@ pub const CIPHER_TAX_CODE: &str = "txcd_10000000";
 ///
 /// The billing address is required (`billing_address_collection`), so the
 /// completed session reports the buyer's billing country, which fulfilment
-/// checks against `[features.payments] cipher_blocked_countries`.
+/// checks against `[features.payments] cipher_blocked_countries` (as it does
+/// the issuing country of a card that paid, read with
+/// [`StripeApi::get_payment_charge`]).
 pub fn checkout_form(p: &CheckoutSessionParams) -> Vec<(String, String)> {
     let mut form: Vec<(String, String)> = [
         ("mode", "payment".to_string()),
@@ -705,6 +768,22 @@ impl StripeApi for ReqwestStripe {
         Ok(intent)
     }
 
+    async fn get_payment_charge(&self, payment_intent: &str) -> Result<PaymentCharge, StripeError> {
+        check_id(payment_intent)?;
+        let value = self
+            .call(
+                "get_payment_charge",
+                reqwest::Method::GET,
+                &format!("/payment_intents/{payment_intent}?expand[]=latest_charge"),
+                None,
+                None,
+            )
+            .await?;
+        let charge = PaymentCharge::from_stripe_json(&value)?;
+        check_same_id(payment_intent, &charge.payment_intent)?;
+        Ok(charge)
+    }
+
     async fn get_event(&self, id: &str) -> Result<StripeEvent, StripeError> {
         check_id(id)?;
         let value = self
@@ -787,21 +866,23 @@ mod mock {
 
     use super::{
         check_id, check_idempotency_key, checkout_form, CheckoutSession, CheckoutSessionParams,
-        Dispute, PaymentIntent, Refund, StripeApi, StripeError, StripeEvent,
+        Dispute, PaymentCharge, PaymentIntent, Refund, StripeApi, StripeError, StripeEvent,
     };
 
     const CREATE_CHECKOUT_SESSION: &str = "create_checkout_session";
     const GET_CHECKOUT_SESSION: &str = "get_checkout_session";
     const GET_PAYMENT_INTENT: &str = "get_payment_intent";
+    const GET_PAYMENT_CHARGE: &str = "get_payment_charge";
     const GET_EVENT: &str = "get_event";
     const CREATE_REFUND: &str = "create_refund";
     const GET_DISPUTE: &str = "get_dispute";
     const LIST_REFUNDS: &str = "list_refunds";
 
-    const METHODS: [&str; 7] = [
+    const METHODS: [&str; 8] = [
         CREATE_CHECKOUT_SESSION,
         GET_CHECKOUT_SESSION,
         GET_PAYMENT_INTENT,
+        GET_PAYMENT_CHARGE,
         GET_EVENT,
         CREATE_REFUND,
         GET_DISPUTE,
@@ -828,6 +909,8 @@ mod mock {
         checkout_params: Vec<CheckoutSessionParams>,
         next_session: u64,
         payment_intents: HashMap<String, PaymentIntent>,
+        /// payment intent -> how it was paid (see [`MockStripe::set_payment_charge`])
+        payment_charges: HashMap<String, PaymentCharge>,
         events: HashMap<String, StripeEvent>,
         /// Refunds that exist, as (payment intent, refund)
         refunds: Vec<(String, Refund)>,
@@ -919,6 +1002,10 @@ mod mock {
     /// - `list_refunds` reports every refund created here and every one set
     ///   with [`MockStripe::set_refund`] (a Dashboard refund, or a status
     ///   change), in that order.
+    /// - `get_payment_charge` reports what [`MockStripe::set_payment_charge`]
+    ///   set for the payment intent; for any other (well-formed) intent, a
+    ///   charge with no method and no card country, so a test that does not
+    ///   care how the buyer paid is judged on the billing country alone.
     /// - Gets of unknown ids are a 404 `resource_missing`; malformed ids and
     ///   keys fail exactly as they do on [`super::ReqwestStripe`].
     ///
@@ -995,6 +1082,13 @@ mod mock {
             self.state()
                 .payment_intents
                 .insert(intent.id.clone(), intent);
+        }
+
+        /// How `charge.payment_intent` was paid, for `get_payment_charge`
+        pub fn set_payment_charge(&self, charge: PaymentCharge) {
+            self.state()
+                .payment_charges
+                .insert(charge.payment_intent.clone(), charge);
         }
 
         /// Insert or replace an event for `get_event`
@@ -1124,6 +1218,25 @@ mod mock {
             })
         }
 
+        fn get_payment_charge_now(
+            &self,
+            payment_intent: &str,
+        ) -> Result<PaymentCharge, StripeError> {
+            let mut state = self.state();
+            let scripted = state.begin(GET_PAYMENT_CHARGE, payment_intent, None);
+            finish(scripted, || {
+                check_id(payment_intent)?;
+                Ok(state
+                    .payment_charges
+                    .get(payment_intent)
+                    .cloned()
+                    .unwrap_or_else(|| PaymentCharge {
+                        payment_intent: payment_intent.to_string(),
+                        ..Default::default()
+                    }))
+            })
+        }
+
         fn get_event_now(&self, id: &str) -> Result<StripeEvent, StripeError> {
             let mut state = self.state();
             let scripted = state.begin(GET_EVENT, id, None);
@@ -1245,6 +1358,13 @@ mod mock {
 
         async fn get_payment_intent(&self, id: &str) -> Result<PaymentIntent, StripeError> {
             self.get_payment_intent_now(id)
+        }
+
+        async fn get_payment_charge(
+            &self,
+            payment_intent: &str,
+        ) -> Result<PaymentCharge, StripeError> {
+            self.get_payment_charge_now(payment_intent)
         }
 
         async fn get_event(&self, id: &str) -> Result<StripeEvent, StripeError> {
@@ -1555,6 +1675,10 @@ mod tests {
             client.get_payment_intent("pi_1/x").await.unwrap_err(),
             bad_id
         );
+        assert_eq!(
+            client.get_payment_charge("pi_1?x=1").await.unwrap_err(),
+            bad_id
+        );
         assert_eq!(client.get_event("evt 1").await.unwrap_err(), bad_id);
         assert_eq!(client.get_dispute("du_1/../x").await.unwrap_err(), bad_id);
         assert_eq!(
@@ -1776,6 +1900,72 @@ mod tests {
             }
         );
         assert!(PaymentIntent::from_stripe_json(&serde_json::json!({"id": "pi_3Q"})).is_err());
+
+        let paid_by = |details: Value| {
+            serde_json::json!({
+                "id": "pi_3Q", "object": "payment_intent", "livemode": true,
+                "latest_charge": {
+                    "id": "ch_3Q", "object": "charge", "payment_intent": "pi_3Q",
+                    "payment_method_details": details
+                }
+            })
+        };
+        let charge = |method: Option<&str>, country: Option<&str>| PaymentCharge {
+            payment_intent: "pi_3Q".to_string(),
+            method: method.map(str::to_string),
+            card_country: country.map(str::to_string),
+        };
+        // A card (a wallet too), and Link: the issuing country
+        let card = paid_by(serde_json::json!({
+            "type": "card", "card": {"country": "DE", "wallet": {"type": "apple_pay"}}
+        }));
+        assert_eq!(
+            PaymentCharge::from_stripe_json(&card).unwrap(),
+            charge(Some("card"), Some("DE"))
+        );
+        let link = paid_by(serde_json::json!({"type": "link", "link": {"country": "FR"}}));
+        assert_eq!(
+            PaymentCharge::from_stripe_json(&link).unwrap(),
+            charge(Some("link"), Some("FR"))
+        );
+        // Any other method, or no country reported: none
+        let other = paid_by(serde_json::json!({"type": "cashapp", "cashapp": {"country": "DE"}}));
+        assert_eq!(
+            PaymentCharge::from_stripe_json(&other).unwrap(),
+            charge(Some("cashapp"), None)
+        );
+        let blank = paid_by(serde_json::json!({"type": "card", "card": {"country": ""}}));
+        assert_eq!(
+            PaymentCharge::from_stripe_json(&blank).unwrap(),
+            charge(Some("card"), None)
+        );
+        let no_charge = serde_json::json!({
+            "id": "pi_3Q", "object": "payment_intent", "livemode": true, "latest_charge": null
+        });
+        assert_eq!(
+            PaymentCharge::from_stripe_json(&no_charge).unwrap(),
+            charge(None, None)
+        );
+        // Not expanded, another payment's charge, or not a charge: refused
+        for bad in [
+            serde_json::json!({"id": "pi_3Q", "object": "payment_intent", "latest_charge": "ch_3Q"}),
+            serde_json::json!({
+                "id": "pi_3Q", "object": "payment_intent",
+                "latest_charge": {"id": "ch_1", "object": "charge", "payment_intent": "pi_other"}
+            }),
+            serde_json::json!({
+                "id": "pi_3Q", "object": "payment_intent",
+                "latest_charge": {"id": "re_1", "object": "refund"}
+            }),
+        ] {
+            assert!(
+                matches!(
+                    PaymentCharge::from_stripe_json(&bad),
+                    Err(StripeError::Decode(_))
+                ),
+                "{bad}"
+            );
+        }
 
         let refund = serde_json::json!({
             "id": "re_3Q", "object": "refund", "amount": 9900,
@@ -2051,6 +2241,26 @@ mod tests {
         };
         stripe.set_payment_intent(intent.clone());
         assert_eq!(stripe.get_payment_intent("pi_1").await.unwrap(), intent);
+
+        // A charge never set reports no method; a set one is reported as set
+        assert_eq!(
+            stripe.get_payment_charge("pi_1").await.unwrap(),
+            PaymentCharge {
+                payment_intent: "pi_1".to_string(),
+                ..Default::default()
+            }
+        );
+        let charge = PaymentCharge {
+            payment_intent: "pi_1".to_string(),
+            method: Some("card".to_string()),
+            card_country: Some("DE".to_string()),
+        };
+        stripe.set_payment_charge(charge.clone());
+        assert_eq!(stripe.get_payment_charge("pi_1").await.unwrap(), charge);
+        assert_eq!(
+            stripe.get_payment_charge("pi/1").await,
+            Err(StripeError::Decode("bad id".to_string()))
+        );
 
         let event = StripeEvent {
             id: "evt_1".to_string(),

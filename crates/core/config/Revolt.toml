@@ -491,8 +491,10 @@ cipher_cap = 1000
 cipher_sales_close_at = ""
 # Countries (ISO 3166-1 alpha-2, uppercase) Cipher is not sold to: checkout refuses a request
 # Cloudflare places there (only with [api.security] trust_cloudflare), and a payment whose billing
-# address is there is voided and refunded. The 27 EU member states and the UK (no VAT registrations
-# yet). Override the whole list in Revolt.overrides.toml; it cannot be set through the environment.
+# address, or the issuing country of the card that paid it, is there is voided and refunded. The 27
+# EU member states and the UK (no VAT registrations yet). Override the whole list in
+# Revolt.overrides.toml, or in the environment as one comma-separated string
+# (REVOLT__FEATURES__PAYMENTS__CIPHER_BLOCKED_COUNTRIES=DE,FR).
 cipher_blocked_countries = [
     "AT", "BE", "BG", "HR", "CY", "CZ", "DK", "EE", "FI", "FR", "DE", "GR", "HU", "IE",
     "IT", "LV", "LT", "LU", "MT", "NL", "PL", "PT", "RO", "SK", "SI", "ES", "SE", "GB",
