@@ -2,7 +2,7 @@
 //!
 //! [`StripeApi`] is the narrow slice of the Stripe API the payment engine
 //! uses: create and read Checkout Sessions, read Payment Intents, Events and
-//! Disputes, and refund. [`ReqwestStripe`] talks to `https://api.stripe.com/v1`;
+//! Disputes, refund, and list a payment's refunds. [`ReqwestStripe`] talks to `https://api.stripe.com/v1`;
 //! `MockStripe` (tests and the `test-mock` feature) mirrors the parts of
 //! Stripe's behavior the engine depends on, idempotency keys included.
 //!
@@ -145,6 +145,12 @@ pub struct Refund {
     pub id: String,
     /// `pending` | `requires_action` | `succeeded` | `failed` | `canceled`
     pub status: Option<String>,
+    /// Amount refunded, in the smallest currency unit
+    pub amount: Option<i64>,
+    /// Payment intent of the refunded charge
+    pub payment_intent: Option<String>,
+    /// When the refund was made, in seconds since the Unix epoch
+    pub created: Option<i64>,
 }
 
 /// A Dispute as Stripe reports it
@@ -204,7 +210,37 @@ impl Refund {
         Ok(Refund {
             id: required_id(value)?,
             status: opt_string(value, "status"),
+            amount: obj_i64(value, "amount"),
+            payment_intent: obj_expandable_id(value, "payment_intent").map(str::to_string),
+            created: obj_i64(value, "created"),
         })
+    }
+
+    /// Map a `GET /v1/refunds?payment_intent=...` list. Fails closed: a list
+    /// that does not fit one page (`has_more` not `false`), or that holds a
+    /// refund of another payment, is an error, never a partial answer.
+    pub fn list_from_stripe_json(
+        value: &Value,
+        payment_intent: &str,
+    ) -> Result<Vec<Self>, StripeError> {
+        expect_object(value, "list")?;
+        if obj_bool(value, "has_more") != Some(false) {
+            return Err(decode("refund list does not fit one page"));
+        }
+        let Some(data) = value.get("data").and_then(Value::as_array) else {
+            return Err(decode("refund list has no data"));
+        };
+        let refunds = data
+            .iter()
+            .map(Refund::from_stripe_json)
+            .collect::<Result<Vec<_>, _>>()?;
+        if refunds
+            .iter()
+            .any(|refund| refund.payment_intent.as_deref() != Some(payment_intent))
+        {
+            return Err(decode("refund list names another payment"));
+        }
+        Ok(refunds)
     }
 }
 
@@ -250,6 +286,11 @@ pub trait StripeApi: Send + Sync {
     /// `GET /v1/disputes/{id}`: a dispute's current status, so dispute
     /// events delivered out of order converge on where the dispute is now
     async fn get_dispute(&self, id: &str) -> Result<Dispute, StripeError>;
+
+    /// `GET /v1/refunds?payment_intent={id}`: every refund of a payment as
+    /// Stripe reports it now, so a refund is acted on only once it has
+    /// `succeeded`
+    async fn list_refunds(&self, payment_intent: &str) -> Result<Vec<Refund>, StripeError>;
 }
 
 /// What the buyer ticks at checkout (`consent_collection[terms_of_service]`
@@ -269,10 +310,10 @@ pub const CIPHER_TAX_CODE: &str = "txcd_10000000";
 /// Form body for `POST /v1/checkout/sessions`, in Stripe's bracket notation.
 /// No `payment_method_types`: since API version 2026-09-30.endive Stripe
 /// refuses it and takes the payment methods from the Dashboard (Settings,
-/// Payment methods). Keep that list to methods that confirm at once (card,
-/// Link, wallets), so `checkout.session.completed` with `payment_status=paid`
-/// stays the single success signal; a delayed method would leave the session
-/// complete but unpaid until a reconcile sweep sees it paid.
+/// Payment methods). A method that confirms at once pays the session by
+/// `checkout.session.completed`; a delayed one completes it unpaid and pays
+/// it later (`checkout.session.async_payment_succeeded`, or `_failed`), and
+/// dispatch handles both.
 /// Adaptive Pricing is off, so the buyer always pays in the order's
 /// currency (a session settled in another currency would not match the
 /// order, and fulfilment refunds it).
@@ -705,6 +746,21 @@ impl StripeApi for ReqwestStripe {
         check_same_id(id, &dispute.id)?;
         Ok(dispute)
     }
+
+    async fn list_refunds(&self, payment_intent: &str) -> Result<Vec<Refund>, StripeError> {
+        // The id is checked before it goes into the query string
+        check_id(payment_intent)?;
+        let value = self
+            .call(
+                "list_refunds",
+                reqwest::Method::GET,
+                &format!("/refunds?payment_intent={payment_intent}&limit=100"),
+                None,
+                None,
+            )
+            .await?;
+        Refund::list_from_stripe_json(&value, payment_intent)
+    }
 }
 
 #[cfg(any(test, feature = "test-mock"))]
@@ -730,14 +786,16 @@ mod mock {
     const GET_EVENT: &str = "get_event";
     const CREATE_REFUND: &str = "create_refund";
     const GET_DISPUTE: &str = "get_dispute";
+    const LIST_REFUNDS: &str = "list_refunds";
 
-    const METHODS: [&str; 6] = [
+    const METHODS: [&str; 7] = [
         CREATE_CHECKOUT_SESSION,
         GET_CHECKOUT_SESSION,
         GET_PAYMENT_INTENT,
         GET_EVENT,
         CREATE_REFUND,
         GET_DISPUTE,
+        LIST_REFUNDS,
     ];
 
     /// A scripted failure. `after_effect` means the call takes effect on
@@ -765,6 +823,9 @@ mod mock {
         refunds: Vec<(String, Refund)>,
         /// idempotency key -> (payment intent, refund)
         refund_keys: HashMap<String, (String, Refund)>,
+        /// What `list_refunds` reports: every refund created here, failed
+        /// ones included, and any set with [`MockStripe::set_refund`]
+        listed_refunds: Vec<Refund>,
         next_refund: u64,
         /// Status of refunds created from now on (None: `succeeded`)
         refund_status: Option<String>,
@@ -843,7 +904,11 @@ mod mock {
     ///   returns the same refund without creating another; refunding a
     ///   payment intent that already has a refund under a different key is a
     ///   400 `charge_already_refunded` (every refund here is a full refund).
-    ///   Payment intents need not be registered to be refunded.
+    ///   Payment intents need not be registered to be refunded; the refund's
+    ///   amount is the registered intent's, if any.
+    /// - `list_refunds` reports every refund created here and every one set
+    ///   with [`MockStripe::set_refund`] (a Dashboard refund, or a status
+    ///   change), in that order.
     /// - Gets of unknown ids are a 404 `resource_missing`; malformed ids and
     ///   keys fail exactly as they do on [`super::ReqwestStripe`].
     ///
@@ -931,6 +996,18 @@ mod mock {
         /// `get_dispute`
         pub fn set_dispute(&self, dispute: Dispute) {
             self.state().disputes.insert(dispute.id.clone(), dispute);
+        }
+
+        /// Insert or replace (by id) a refund that `list_refunds` reports,
+        /// e.g. one made in the Dashboard, or a refund of ours that changed
+        /// status. Only the listing changes: `create_refund` and the refund
+        /// counts do not see it.
+        pub fn set_refund(&self, refund: Refund) {
+            let mut state = self.state();
+            match state.listed_refunds.iter_mut().find(|r| r.id == refund.id) {
+                Some(listed) => *listed = refund,
+                None => state.listed_refunds.push(refund),
+            }
         }
 
         /// Every call so far, in order: `(method, detail, idempotency key)`
@@ -1088,7 +1165,14 @@ mod mock {
                 let refund = Refund {
                     id: format!("re_test_{}", state.next_refund),
                     status: Some(status),
+                    amount: state
+                        .payment_intents
+                        .get(payment_intent)
+                        .and_then(|intent| intent.amount),
+                    payment_intent: Some(payment_intent.to_string()),
+                    created: None,
                 };
+                state.listed_refunds.push(refund.clone());
                 // A failed or canceled refund returned nothing: it does not
                 // count and does not block a later refund
                 if moved_money {
@@ -1114,6 +1198,20 @@ mod mock {
                     .get(id)
                     .cloned()
                     .ok_or_else(|| not_found("dispute", id))
+            })
+        }
+
+        fn list_refunds_now(&self, payment_intent: &str) -> Result<Vec<Refund>, StripeError> {
+            let mut state = self.state();
+            let scripted = state.begin(LIST_REFUNDS, payment_intent, None);
+            finish(scripted, || {
+                check_id(payment_intent)?;
+                Ok(state
+                    .listed_refunds
+                    .iter()
+                    .filter(|r| r.payment_intent.as_deref() == Some(payment_intent))
+                    .cloned()
+                    .collect())
             })
         }
     }
@@ -1152,6 +1250,10 @@ mod mock {
 
         async fn get_dispute(&self, id: &str) -> Result<Dispute, StripeError> {
             self.get_dispute_now(id)
+        }
+
+        async fn list_refunds(&self, payment_intent: &str) -> Result<Vec<Refund>, StripeError> {
+            self.list_refunds_now(payment_intent)
         }
     }
 }
@@ -1636,13 +1738,16 @@ mod tests {
 
         let refund = serde_json::json!({
             "id": "re_3Q", "object": "refund", "amount": 9900,
-            "payment_intent": "pi_3Q", "status": "pending"
+            "payment_intent": "pi_3Q", "status": "pending", "created": 1729100000
         });
         assert_eq!(
             Refund::from_stripe_json(&refund).unwrap(),
             Refund {
                 id: "re_3Q".to_string(),
                 status: Some("pending".to_string()),
+                amount: Some(9900),
+                payment_intent: Some("pi_3Q".to_string()),
+                created: Some(1729100000),
             }
         );
         assert!(Refund::from_stripe_json(&serde_json::json!({"object": "refund"})).is_err());
@@ -1650,6 +1755,95 @@ mod tests {
             Refund::from_stripe_json(&serde_json::json!({"id": "ch_1", "object": "charge"}))
                 .is_err()
         );
+    }
+
+    #[test]
+    fn maps_a_refund_list_and_fails_closed_on_anything_partial() {
+        let refund = |id: &str, pi: &str| {
+            serde_json::json!({
+                "id": id, "object": "refund", "amount": 9900,
+                "payment_intent": pi, "status": "succeeded", "created": 1729100000
+            })
+        };
+        let list = |data: Vec<Value>, has_more: Value| serde_json::json!({"object": "list", "data": data, "has_more": has_more});
+
+        let listed = Refund::list_from_stripe_json(
+            &list(
+                vec![refund("re_1", "pi_1"), refund("re_2", "pi_1")],
+                false.into(),
+            ),
+            "pi_1",
+        )
+        .unwrap();
+        assert_eq!(
+            listed.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
+            ["re_1", "re_2"]
+        );
+        assert_eq!(
+            Refund::list_from_stripe_json(&list(vec![], false.into()), "pi_1").unwrap(),
+            vec![]
+        );
+
+        // More than one page, an unknown page count, a refund of another
+        // payment, a malformed entry, or not a list at all
+        for bad in [
+            list(vec![refund("re_1", "pi_1")], true.into()),
+            list(vec![refund("re_1", "pi_1")], Value::Null),
+            list(
+                vec![refund("re_1", "pi_1"), refund("re_2", "pi_2")],
+                false.into(),
+            ),
+            list(vec![serde_json::json!({"object": "refund"})], false.into()),
+            serde_json::json!({"object": "list", "has_more": false}),
+            serde_json::json!({"object": "refund", "data": [], "has_more": false}),
+        ] {
+            assert!(
+                matches!(
+                    Refund::list_from_stripe_json(&bad, "pi_1"),
+                    Err(StripeError::Decode(_))
+                ),
+                "{bad}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn mock_lists_the_refunds_of_one_payment() {
+        let stripe = MockStripe::new();
+        stripe.set_payment_intent(PaymentIntent {
+            id: "pi_1".to_string(),
+            amount: Some(9900),
+            ..Default::default()
+        });
+        let ours = stripe.create_refund("pi_1", "void-order1").await.unwrap();
+        stripe.set_refund(Refund {
+            id: "re_dash".to_string(),
+            status: Some("pending".to_string()),
+            amount: Some(100),
+            payment_intent: Some("pi_2".to_string()),
+            created: Some(5),
+        });
+
+        let listed = stripe.list_refunds("pi_1").await.unwrap();
+        assert_eq!(listed, vec![ours.clone()]);
+        assert_eq!(listed[0].amount, Some(9900));
+        assert_eq!(listed[0].payment_intent.as_deref(), Some("pi_1"));
+
+        // A status change replaces the listed refund, by id
+        stripe.set_refund(Refund {
+            status: Some("failed".to_string()),
+            ..ours
+        });
+        let listed = stripe.list_refunds("pi_1").await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].status.as_deref(), Some("failed"));
+        assert_eq!(stripe.list_refunds("pi_2").await.unwrap().len(), 1);
+        assert_eq!(stripe.list_refunds("pi_3").await.unwrap(), vec![]);
+        assert_eq!(
+            stripe.list_refunds("pi/1").await,
+            Err(StripeError::Decode("bad id".to_string()))
+        );
+        assert_eq!(stripe.call_count("list_refunds"), 5);
     }
 
     #[tokio::test]

@@ -29,25 +29,40 @@
 //! reversals, makes every delivery order converge. A failed lookup is a
 //! retry, never a guess.
 //!
-//! Decision: `charge.refunded` is judged from the event itself
-//! ([`refund_facts`]): its `created` is when the refund was made (the
-//! 14-day refund window is measured to it, not to when a late or re-driven
-//! delivery is processed), and its Charge says whether the refund is full.
-//! The event is either signature-verified (webhook) or fetched from Stripe
-//! by id (re-drive), and each refund has its own event, so the snapshot is
-//! the right one to read.
-use log::{info, warn};
+//! Decision: `charge.refunded` and `charge.refund.updated` RE-FETCH the
+//! payment's refunds (`list_refunds`) and act only once every refund on it
+//! is settled and one has `succeeded` ([`refund_facts`]). A refund can be
+//! `pending` (or `requires_action`) when its `charge.refunded` arrives and
+//! still fail, and the charge's `amount_refunded` already counts it, so
+//! neither the event nor its charge is trusted for that. A pending refund
+//! settles the event with nothing reversed; its `charge.refund.updated`
+//! does the reversal once it succeeds, or only logs once it fails. The
+//! refund's own `created` is when it was made (the 14-day refund window is
+//! measured to it, not to when an update or a late delivery is
+//! processed), and whether it is full is the sum of the succeeded refunds
+//! against what the order cost.
+//!
+//! Decision: delayed payment methods. A session such a method pays
+//! completes unpaid (`checkout.session.completed` with `payment_status`
+//! `unpaid`) and is paid or not later:
+//! `checkout.session.async_payment_succeeded` fulfils exactly like a
+//! completion (from the re-fetched session), and
+//! `checkout.session.async_payment_failed` expires the order like
+//! `checkout.session.expired` (nothing claimed). The unpaid completion is
+//! settled (Processed): retrying it would only burn its attempts while the
+//! payment clears.
+use log::{error, info, warn};
 use revolt_database::{Database, OrderState, PaymentEvent, PaymentEventState, ReversalPending};
 use revolt_result::{Error, Result};
-use serde_json::Value;
 
-use crate::engine::{self, FulfilOutcome, RefundFacts, ReverseKind, ReverseOutcome};
+use crate::engine::{self, FulfilOutcome, RefundFacts, RefundStatus, ReverseKind, ReverseOutcome};
 use crate::settings::PaymentsSettings;
 use crate::stripe::event::{
     obj_expandable_id, obj_str, StripeEvent, CHARGE_DISPUTE_PREFIX, CHARGE_REFUNDED,
-    CHECKOUT_SESSION_COMPLETED, CHECKOUT_SESSION_EXPIRED,
+    CHARGE_REFUND_UPDATED, CHECKOUT_SESSION_ASYNC_PAYMENT_FAILED,
+    CHECKOUT_SESSION_ASYNC_PAYMENT_SUCCEEDED, CHECKOUT_SESSION_COMPLETED, CHECKOUT_SESSION_EXPIRED,
 };
-use crate::stripe::{StripeApi, StripeError};
+use crate::stripe::{CheckoutSession, Refund, StripeApi, StripeError};
 
 /// Creating / SessionFailed orders older than this are expired (no buyer can
 /// still be paying for them: the checkout URL was never handed out, or the
@@ -102,9 +117,9 @@ enum Action {
 
 fn action_for(event: &StripeEvent) -> Action {
     match event.event_type.as_str() {
-        CHECKOUT_SESSION_COMPLETED => Action::Fulfil,
-        CHECKOUT_SESSION_EXPIRED => Action::Expire,
-        CHARGE_REFUNDED => Action::Reverse(ReverseKind::Refund),
+        CHECKOUT_SESSION_COMPLETED | CHECKOUT_SESSION_ASYNC_PAYMENT_SUCCEEDED => Action::Fulfil,
+        CHECKOUT_SESSION_EXPIRED | CHECKOUT_SESSION_ASYNC_PAYMENT_FAILED => Action::Expire,
+        CHARGE_REFUNDED | CHARGE_REFUND_UPDATED => Action::Reverse(ReverseKind::Refund),
         ty if ty.starts_with(CHARGE_DISPUTE_PREFIX) => Action::Dispute,
         _ => Action::Ignore,
     }
@@ -265,6 +280,17 @@ async fn process(
             }
 
             match engine::fulfil_order(db, stripe, s, &order_id, &session, now_ms).await {
+                // A delayed payment method still clearing (see the module
+                // docs): the completion said unpaid and Stripe still does.
+                // Its async_payment_* event, or the Pending sweep, settles
+                // the order.
+                Ok(FulfilOutcome::NotPaid) if awaits_async_payment(event, &session) => {
+                    info!(
+                        "payments: session {session_id} of order {order_id} completed unpaid; \
+                         waiting for its delayed payment"
+                    );
+                    Step::Processed
+                }
                 Ok(outcome) => fulfil_step(outcome),
                 Err(error) => Step::Retry(engine_text("fulfil", &error)),
             }
@@ -285,7 +311,7 @@ async fn process(
             }
         }
         Action::Reverse(kind) => {
-            // A charge names its payment intent
+            // A charge or a refund names its payment intent
             let Some(payment_intent) = obj_expandable_id(&event.object, "payment_intent") else {
                 return Step::Ignored;
             };
@@ -295,7 +321,17 @@ async fn process(
                 Err(reason) => return Step::Retry(reason),
             };
 
-            let refund = (kind == ReverseKind::Refund).then(|| refund_facts(event, now_ms));
+            // The refunds as Stripe reports them now (see the module docs)
+            let refund = if kind == ReverseKind::Refund {
+                match settled_refund(db, stripe, event, &order_id, payment_intent, now_ms).await {
+                    Ok(Some(facts)) => Some(facts),
+                    // Not succeeded: nothing to reverse, and nothing to retry
+                    Ok(None) => return Step::Processed,
+                    Err(reason) => return Step::Retry(reason),
+                }
+            } else {
+                None
+            };
             match Box::pin(engine::reverse_order(
                 db, stripe, s, &order_id, kind, refund, now_ms,
             ))
@@ -330,31 +366,123 @@ async fn process(
     }
 }
 
-/// What a `charge.refunded` event says about its refund: when it was made
-/// (the signed event's `created`, never later than `now_ms`, so a late or
-/// re-driven delivery is judged by when the owner refunded) and whether the
-/// charge is now refunded in full
-pub(crate) fn refund_facts(event: &StripeEvent, now_ms: i64) -> RefundFacts {
-    RefundFacts {
-        refunded_at_ms: event.created.saturating_mul(1000).min(now_ms),
-        full: charge_fully_refunded(&event.object),
+/// Whether an unpaid outcome is a delayed payment method still clearing: a
+/// `checkout.session.completed` whose own payload says `unpaid`, for a
+/// session Stripe now reports `complete` and unpaid. Anything else unpaid
+/// (an async_payment_succeeded, or a completion that said paid) is Stripe's
+/// view not having caught up yet, which is retried.
+fn awaits_async_payment(event: &StripeEvent, session: &CheckoutSession) -> bool {
+    event.event_type == CHECKOUT_SESSION_COMPLETED
+        && obj_str(&event.object, "payment_status") == Some("unpaid")
+        && session.status.as_deref() == Some("complete")
+        && session.payment_status.as_deref() == Some("unpaid")
+}
+
+/// The refund facts of `order_id`'s payment as Stripe reports them now,
+/// when they call for a reversal: Ok(Some) once its refunds have
+/// `succeeded`, Ok(None) (logged) while one is still settling or once they
+/// all failed. Err: a short reason to retry with (a failed lookup, or no
+/// refund listed yet).
+async fn settled_refund(
+    db: &Database,
+    stripe: &dyn StripeApi,
+    event: &StripeEvent,
+    order_id: &str,
+    payment_intent: &str,
+    now_ms: i64,
+) -> std::result::Result<Option<RefundFacts>, String> {
+    let amount_cents = match db.fetch_payment_order(order_id).await {
+        Ok(Some(order)) => order.amount_cents,
+        Ok(None) => return Err("order not found".to_string()),
+        Err(error) => return Err(engine_text("find order", &error)),
+    };
+    let refunds = match stripe.list_refunds(payment_intent).await {
+        Ok(refunds) => refunds,
+        Err(error) => return Err(stripe_text("list_refunds", &error)),
+    };
+    let Some(facts) = refund_facts(&refunds, amount_cents, event.created, now_ms) else {
+        return Err("stripe lists no refund of the payment yet".to_string());
+    };
+
+    match facts.status {
+        RefundStatus::Succeeded => Ok(Some(facts)),
+        RefundStatus::Pending => {
+            info!(
+                "payments: event {} ({}): a refund of order {order_id} is not settled yet; \
+                 nothing is reversed until its charge.refund.updated reports it succeeded",
+                event.id, event.event_type
+            );
+            Ok(None)
+        }
+        RefundStatus::Failed => {
+            error!(
+                "payments: event {} ({}): every refund of order {order_id} failed or was \
+                 canceled; nothing is reversed, check the refund in the Stripe dashboard",
+                event.id, event.event_type
+            );
+            Ok(None)
+        }
     }
 }
 
-/// Whether a Charge object is refunded in full: Stripe's `refunded` flag,
-/// or `amount_refunded` reaching a positive `amount`. Anything missing or
-/// malformed is "not full" (fails toward revoke + retire).
-pub(crate) fn charge_fully_refunded(charge: &Value) -> bool {
-    if charge.get("refunded").and_then(Value::as_bool) == Some(true) {
-        return true;
+/// What `refunds` (every refund of an order's payment) add up to:
+///
+/// - status: `Pending` while any refund is `pending`, `requires_action` or
+///   in a status we do not know; else `Succeeded` if any `succeeded`; else
+///   `Failed` (all `failed` or `canceled`)
+/// - full: the succeeded refunds add up to at least `amount_cents`, what
+///   the order cost; a succeeded refund without an amount is "not full"
+///   (fails toward revoke + retire)
+/// - refunded_at_ms: when the latest succeeded refund was made (its own
+///   `created`; `event_created` when Stripe gave none), never later than
+///   `now_ms`, so an update or a late delivery is judged by when the owner
+///   refunded
+///
+/// None when there are no refunds at all.
+pub(crate) fn refund_facts(
+    refunds: &[Refund],
+    amount_cents: i64,
+    event_created: i64,
+    now_ms: i64,
+) -> Option<RefundFacts> {
+    if refunds.is_empty() {
+        return None;
     }
-    match (
-        charge.get("amount").and_then(Value::as_i64),
-        charge.get("amount_refunded").and_then(Value::as_i64),
-    ) {
-        (Some(amount), Some(refunded)) => amount > 0 && refunded >= amount,
-        _ => false,
-    }
+
+    let succeeded: Vec<&Refund> = refunds
+        .iter()
+        .filter(|r| r.status.as_deref() == Some("succeeded"))
+        .collect();
+    let unsettled = refunds.iter().any(|r| {
+        !matches!(
+            r.status.as_deref(),
+            Some("succeeded" | "failed" | "canceled")
+        )
+    });
+    let status = if unsettled {
+        RefundStatus::Pending
+    } else if succeeded.is_empty() {
+        RefundStatus::Failed
+    } else {
+        RefundStatus::Succeeded
+    };
+
+    let refunded: Option<i64> = succeeded
+        .iter()
+        .try_fold(0i64, |sum, r| r.amount.map(|a| sum.saturating_add(a)));
+    let full = amount_cents > 0 && refunded.is_some_and(|sum| sum >= amount_cents);
+
+    let made_at = succeeded
+        .iter()
+        .map(|r| r.created.unwrap_or(event_created))
+        .max()
+        .unwrap_or(event_created);
+
+    Some(RefundFacts {
+        refunded_at_ms: made_at.saturating_mul(1000).min(now_ms),
+        full,
+        status,
+    })
 }
 
 fn fulfil_step(outcome: FulfilOutcome) -> Step {
@@ -364,11 +492,11 @@ fn fulfil_step(outcome: FulfilOutcome) -> Step {
         }
         // The order is not in a state fulfilment applies to: nothing changed
         FulfilOutcome::Ignored => Step::Ignored,
-        // The Dashboard offers only methods that confirm at once (card, Link,
-        // wallets, Cash App Pay, Amazon Pay, Affirm, Klarna; bank debits
-        // off), so a completed checkout is paid and Stripe's view has not
-        // caught up yet: retry rather than settle (the Pending sweep is the
-        // backstop)
+        // The event says paid (a completion that said so, or an
+        // async_payment_succeeded) and Stripe's view has not caught up yet:
+        // retry rather than settle (the Pending sweep is the backstop). A
+        // delayed method's unpaid completion never comes here (`process`
+        // settles it).
         FulfilOutcome::NotPaid => Step::Retry("session not reported paid yet".to_string()),
         FulfilOutcome::LeaseHeld => Step::Retry("order lease held".to_string()),
         // Handled: the deferral is durable (the order stays Paid), and the
@@ -493,27 +621,14 @@ struct Tally {
     reversed: u32,
     redriven: u32,
     errors: u32,
-    /// Paid upgrades deleted with a membership whose number a release put
-    /// back in the pool; each one is logged at error level, to refund.
-    /// Sweep-only: a release the webhook finishes inline logs its upgrades
-    /// the same way but is not counted here.
-    unrefunded_upgrades: u32,
 }
 
 impl Tally {
     fn summary(&self) -> String {
-        let mut summary = format!(
+        format!(
             "expired={}, resumed={}, reversed={}, redriven={}, errors={}",
             self.expired, self.resumed, self.reversed, self.redriven, self.errors
-        );
-        // Only when there are any, so the usual line stays as it was
-        if self.unrefunded_upgrades > 0 {
-            summary.push_str(&format!(
-                ", unrefunded_upgrades={}",
-                self.unrefunded_upgrades
-            ));
-        }
-        summary
+        )
     }
 
     fn error(&mut self, what: &str, id: &str, reason: &str) {
@@ -535,14 +650,15 @@ impl Tally {
 ///
 /// 1. Creating / SessionFailed orders older than 10 min → Expired
 /// 2. Pending orders older than 40 min, checked against Stripe: complete and
-///    paid → fulfil; expired → Expired; open → left alone
+///    paid → fulfil; expired → Expired; open, or complete with a delayed
+///    payment still clearing → left alone
 /// 3. Paid orders whose lease is free (a fulfilment that crashed or gave up)
 ///    → resumed
 /// 4. Fulfilled orders with a reversal still pending → reversed; then
 ///    Cipher numbers whose release a refund decided but did not finish →
-///    finished (membership deleted, order Refunded, number released; paid
-///    upgrades deleted with a membership are counted under
-///    `unrefunded_upgrades`)
+///    finished (the membership's paid upgrades refunded and recorded, the
+///    membership deleted, the order Refunded, the number released; one
+///    still waiting on an upgrade refund is not counted)
 /// 5. Fulfilled orders that list open disputes: each dispute is re-read at
 ///    Stripe and its current status applied (counted under `reversed` when
 ///    it changed the order), so a lost close event cannot keep a badge
@@ -578,7 +694,7 @@ pub async fn reconcile(
     tally.report("pending reversals", before);
 
     let before = tally.errors;
-    finish_number_releases(db, now_ms, &mut tally).await;
+    finish_number_releases(db, stripe, now_ms, &mut tally).await;
     tally.report("number releases", before);
 
     let before = tally.errors;
@@ -674,8 +790,8 @@ async fn check_pending(
                 Ok(()) => tally.expired += 1,
                 Err(error) => tally.error("order", &order.id, &engine_text("expire", &error)),
             },
-            // Still open (or complete without payment, which the
-            // confirm-at-once methods the Dashboard offers never produce):
+            // Still open, or complete with a delayed payment still clearing
+            // (its async_payment_* event, or a later sweep, settles it):
             // leave it for a later sweep
             _ => {}
         }
@@ -765,8 +881,15 @@ async fn apply_pending_reversals(
 }
 
 /// Numbers whose release a refund decided but did not finish (a crash, a
-/// failed write, an event that will not come back): finished here
-async fn finish_number_releases(db: &Database, now_ms: i64, tally: &mut Tally) {
+/// failed write, an event that will not come back, an upgrade refund that
+/// failed or is still settling): finished here, or carried on (a waiting
+/// release asks Stripe again for each upgrade refund it waits on)
+async fn finish_number_releases(
+    db: &Database,
+    stripe: &dyn StripeApi,
+    now_ms: i64,
+    tally: &mut Tally,
+) {
     let rows = match db.fetch_cipher_numbers_release_pending(SWEEP_BATCH).await {
         Ok(rows) => rows,
         Err(error) => {
@@ -778,11 +901,9 @@ async fn finish_number_releases(db: &Database, now_ms: i64, tally: &mut Tally) {
         let Some(order_id) = row.order_id else {
             continue;
         };
-        let mut unrefunded = 0;
-        let outcome = engine::finish_number_release(db, &order_id, now_ms, &mut unrefunded).await;
-        tally.unrefunded_upgrades += unrefunded;
-        match outcome {
+        match engine::finish_number_release(db, stripe, &order_id, now_ms).await {
             Ok(ReverseOutcome::Applied) => tally.reversed += 1,
+            // Still waiting on an upgrade refund (the engine logs why)
             Ok(ReverseOutcome::RecordedPending | ReverseOutcome::NoOp | ReverseOutcome::Busy) => {}
             Err(error) => tally.error("order", &order_id, &engine_text("release", &error)),
         }
@@ -886,13 +1007,12 @@ mod tests {
     use serde_json::{json, Value};
 
     use super::{
-        action_for, charge_fully_refunded, dispute_kind, handle_event, reconcile, refund_facts,
-        Action, EventOutcome,
+        action_for, dispute_kind, handle_event, reconcile, refund_facts, Action, EventOutcome,
     };
-    use crate::engine::{sync_user_badge, ReverseKind, LEASE_MS};
+    use crate::engine::{sync_user_badge, RefundStatus, ReverseKind, LEASE_MS};
     use crate::settings::PaymentsSettings;
     use crate::stripe::{
-        CheckoutSession, Dispute, MockStripe, PaymentIntent, StripeError, StripeEvent,
+        CheckoutSession, Dispute, MockStripe, PaymentIntent, Refund, StripeError, StripeEvent,
     };
 
     const NOW: i64 = 1_760_000_000_000;
@@ -1177,18 +1297,24 @@ mod tests {
     #[test]
     fn event_types_map_to_their_actions() {
         let of = |ty: &str, object: Value| action_for(&event("evt_map", ty, false, object));
-        assert!(matches!(
-            of("checkout.session.completed", json!({})),
-            Action::Fulfil
-        ));
-        assert!(matches!(
-            of("checkout.session.expired", json!({})),
-            Action::Expire
-        ));
-        assert!(matches!(
-            of("charge.refunded", json!({})),
-            Action::Reverse(ReverseKind::Refund)
-        ));
+        for ty in [
+            "checkout.session.completed",
+            "checkout.session.async_payment_succeeded",
+        ] {
+            assert!(matches!(of(ty, json!({})), Action::Fulfil), "{ty}");
+        }
+        for ty in [
+            "checkout.session.expired",
+            "checkout.session.async_payment_failed",
+        ] {
+            assert!(matches!(of(ty, json!({})), Action::Expire), "{ty}");
+        }
+        for ty in ["charge.refunded", "charge.refund.updated"] {
+            assert!(
+                matches!(of(ty, json!({})), Action::Reverse(ReverseKind::Refund)),
+                "{ty}"
+            );
+        }
         // Every dispute event goes through the dispute's current status,
         // whatever its type or payload status says
         for (ty, status) in [
@@ -1206,8 +1332,11 @@ mod tests {
         }
         // Lookalikes are not ours
         for ty in [
-            "checkout.session.async_payment_succeeded",
-            "charge.refund.updated",
+            "checkout.session.async_payment",
+            "checkout.session.async_payment_succeeded.v2",
+            "charge.refund",
+            "refund.updated",
+            "refund.failed",
             "charge.dispute",
             "charge.disputed",
             "payment_intent.succeeded",
@@ -2209,7 +2338,7 @@ mod tests {
             ("evt_u1", "customer.created"),
             ("evt_u2", "payment_intent.succeeded"),
             ("evt_u3", "invoice.paid"),
-            ("evt_u4", "checkout.session.async_payment_failed"),
+            ("evt_u4", "refund.updated"),
         ] {
             let other = event(
                 id,
@@ -2293,6 +2422,7 @@ mod tests {
         );
         db.insert_payment_order(&pending).await.unwrap();
         stripe.set_payment_intent(intent("pi_early", Some("o_early")));
+        stripe.set_refund(refund_of("re_early", "pi_early", "succeeded", 9900, NOW));
         stripe.fail_next(
             "get_payment_intent",
             StripeError::Transport(format!("timed out using {SECRET_MARKER}")),
@@ -2598,39 +2728,131 @@ mod tests {
 
     const DAY: i64 = 24 * 60 * MINUTE;
 
-    #[test]
-    fn a_charge_is_fully_refunded_by_its_flag_or_its_amounts() {
-        assert!(charge_fully_refunded(&json!({ "refunded": true })));
-        assert!(charge_fully_refunded(
-            &json!({ "amount": 9900, "amount_refunded": 9900 })
-        ));
-        assert!(!charge_fully_refunded(
-            &json!({ "refunded": false, "amount": 9900, "amount_refunded": 5000 })
-        ));
-        // Missing or malformed: not full (revoke + retire)
-        assert!(!charge_fully_refunded(&json!({})));
-        assert!(!charge_fully_refunded(
-            &json!({ "amount": 0, "amount_refunded": 0 })
-        ));
-        assert!(!charge_fully_refunded(&json!({ "refunded": "true" })));
+    /// A refund of `payment_intent` as Stripe lists it, made at `made_ms`
+    fn refund_of(
+        id: &str,
+        payment_intent: &str,
+        status: &str,
+        amount: i64,
+        made_ms: i64,
+    ) -> Refund {
+        Refund {
+            id: id.to_string(),
+            status: Some(status.to_string()),
+            amount: Some(amount),
+            payment_intent: Some(payment_intent.to_string()),
+            created: Some(made_ms / 1000),
+        }
     }
 
     #[test]
-    fn a_refund_is_dated_by_its_event_and_never_in_the_future() {
-        let mut refunded = event(
-            "evt_d",
-            "charge.refunded",
-            false,
-            json!({ "refunded": true }),
-        );
-        refunded.created = (NOW + 16 * DAY) / 1000;
-        let facts = refund_facts(&refunded, NOW + 19 * DAY);
-        assert_eq!(facts.refunded_at_ms, NOW + 16 * DAY);
-        assert!(facts.full);
+    fn refunds_count_only_once_they_have_succeeded() {
+        let at = NOW + DAY;
+        let facts = |refunds: &[Refund]| refund_facts(refunds, 9900, at / 1000, NOW + 2 * DAY);
+        let status = |refunds: &[Refund]| facts(refunds).map(|f| f.status);
 
-        // A `created` ahead of our clock is capped at now
-        refunded.created = (NOW + 30 * DAY) / 1000;
-        assert_eq!(refund_facts(&refunded, NOW).refunded_at_ms, NOW);
+        assert_eq!(facts(&[]), None);
+        assert_eq!(
+            status(&[refund_of("re_1", "pi", "succeeded", 9900, at)]),
+            Some(RefundStatus::Succeeded)
+        );
+        // Anything unsettled, or a status we do not know, waits
+        for unsettled in ["pending", "requires_action", "SUCCEEDED", ""] {
+            assert_eq!(
+                status(&[
+                    refund_of("re_1", "pi", "succeeded", 5000, at),
+                    refund_of("re_2", "pi", unsettled, 4900, at),
+                ]),
+                Some(RefundStatus::Pending),
+                "{unsettled}"
+            );
+        }
+        let no_status = Refund {
+            status: None,
+            ..refund_of("re_1", "pi", "succeeded", 9900, at)
+        };
+        assert_eq!(status(&[no_status]), Some(RefundStatus::Pending));
+        // Nothing went back
+        assert_eq!(
+            status(&[
+                refund_of("re_1", "pi", "failed", 9900, at),
+                refund_of("re_2", "pi", "canceled", 9900, at),
+            ]),
+            Some(RefundStatus::Failed)
+        );
+        // A failed one next to a succeeded one: the succeeded one counts
+        assert_eq!(
+            status(&[
+                refund_of("re_1", "pi", "failed", 9900, at),
+                refund_of("re_2", "pi", "succeeded", 9900, at),
+            ]),
+            Some(RefundStatus::Succeeded)
+        );
+    }
+
+    #[test]
+    fn a_refund_is_full_by_its_succeeded_amounts_and_dated_by_its_own_creation() {
+        let facts = |refunds: &[Refund], now: i64| refund_facts(refunds, 9900, 1, now).unwrap();
+
+        let one = facts(
+            &[refund_of("re_1", "pi", "succeeded", 9900, NOW + 16 * DAY)],
+            NOW + 19 * DAY,
+        );
+        assert!(one.full);
+        assert_eq!(one.refunded_at_ms, NOW + 16 * DAY);
+
+        // Two partial refunds that add up: full, made when the later was
+        let two = facts(
+            &[
+                refund_of("re_1", "pi", "succeeded", 5000, NOW + DAY),
+                refund_of("re_2", "pi", "succeeded", 4900, NOW + 3 * DAY),
+            ],
+            NOW + 4 * DAY,
+        );
+        assert!(two.full);
+        assert_eq!(two.refunded_at_ms, NOW + 3 * DAY);
+
+        // Not full: short, a failed remainder, or a succeeded refund with no
+        // amount (fails toward revoke + retire)
+        for refunds in [
+            vec![refund_of("re_1", "pi", "succeeded", 9899, NOW)],
+            vec![
+                refund_of("re_1", "pi", "succeeded", 5000, NOW),
+                refund_of("re_2", "pi", "failed", 4900, NOW),
+            ],
+            vec![Refund {
+                amount: None,
+                ..refund_of("re_1", "pi", "succeeded", 9900, NOW)
+            }],
+        ] {
+            assert!(!facts(&refunds, NOW + DAY).full, "{refunds:?}");
+        }
+        assert!(
+            !refund_facts(&[refund_of("re_1", "pi", "succeeded", 0, NOW)], 0, 1, NOW)
+                .unwrap()
+                .full
+        );
+
+        // A `created` ahead of our clock is capped at now; a missing one
+        // falls back to the event's
+        assert_eq!(
+            facts(
+                &[refund_of("re_1", "pi", "succeeded", 9900, NOW + 30 * DAY)],
+                NOW
+            )
+            .refunded_at_ms,
+            NOW
+        );
+        let undated = Refund {
+            created: None,
+            ..refund_of("re_1", "pi", "succeeded", 9900, NOW)
+        };
+        assert_eq!(
+            refund_facts(&[undated], 9900, (NOW + DAY) / 1000, NOW + 2 * DAY)
+                .unwrap()
+                .refunded_at_ms,
+            NOW + DAY
+        );
     }
 
     /// A Fulfilled new purchase of u1 paid at `paid_at`, holding a claimed
@@ -2694,6 +2916,13 @@ mod tests {
 
         // Refunded in full on day 16 (inside the 14 days plus the grace);
         // the delivery failed and the sweep re-drives it on day 19
+        stripe.set_refund(refund_of(
+            "re_rel",
+            "pi_rel",
+            "succeeded",
+            9900,
+            NOW + 16 * DAY,
+        ));
         let mut refunded = event(
             "evt_rel",
             "charge.refunded",
@@ -2740,6 +2969,13 @@ mod tests {
         let s = settings();
         let number = paid_member(&db, "o_late", "pi_late", NOW).await;
 
+        stripe.set_refund(refund_of(
+            "re_late",
+            "pi_late",
+            "succeeded",
+            9900,
+            NOW + 18 * DAY,
+        ));
         let mut refunded = event(
             "evt_late",
             "charge.refunded",
@@ -2769,6 +3005,13 @@ mod tests {
         let s = settings();
         let number = paid_member(&db, "o_part", "pi_part", NOW).await;
 
+        stripe.set_refund(refund_of(
+            "re_part",
+            "pi_part",
+            "succeeded",
+            5000,
+            NOW + DAY,
+        ));
         let mut refunded = event(
             "evt_part",
             "charge.refunded",
@@ -2827,6 +3070,360 @@ mod tests {
             .await
             .unwrap()
             .is_empty());
+        drop_db(&db).await;
+    }
+
+    // --- refunds that are still settling ------------------------------
+
+    /// A `charge.refund.updated` for refund `refund_id`, delivered at `at`
+    fn refund_updated(id: &str, refund_id: &str, payment_intent: &str, at: i64) -> StripeEvent {
+        StripeEvent {
+            created: at / 1000,
+            ..event(
+                id,
+                "charge.refund.updated",
+                false,
+                json!({
+                    "id": refund_id,
+                    "object": "refund",
+                    "payment_intent": payment_intent,
+                    "status": "succeeded"
+                }),
+            )
+        }
+    }
+
+    /// A `charge.refunded` of `payment_intent`'s charge, delivered at `at`
+    fn charge_refunded(id: &str, payment_intent: &str, at: i64) -> StripeEvent {
+        StripeEvent {
+            created: at / 1000,
+            ..event(
+                id,
+                "charge.refunded",
+                false,
+                refunded_charge(payment_intent, 9900),
+            )
+        }
+    }
+
+    /// u1 is still an active member holding `number`, `order_id` is
+    /// Fulfilled and nothing is pending
+    async fn assert_untouched(db: &Database, order_id: &str, number: u32) {
+        let m = db.fetch_cipher_membership("u1").await.unwrap().unwrap();
+        assert!(m.is_active());
+        assert_eq!(m.number, number);
+        assert_eq!(
+            db.fetch_cipher_number_by_order(order_id).await.unwrap(),
+            Some(number)
+        );
+        assert_eq!(badge(db).await.map(|b| b.number), Some(number));
+        assert_eq!(
+            db.fetch_payment_order(order_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            OrderState::Fulfilled
+        );
+        assert!(db
+            .fetch_cipher_numbers_release_pending(10)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_pending_refund_is_reversed_once_its_update_reports_it_succeeded() {
+        let db = test_db().await;
+        let stripe = MockStripe::new();
+        let s = settings();
+        let number = paid_member(&db, "o_pend", "pi_pend", NOW).await;
+
+        // Refunded in full on day 16 (inside the 14 days plus the grace),
+        // but the refund is still pending at Stripe: nothing irreversible,
+        // and the event is settled (not retried)
+        let made = NOW + 16 * DAY;
+        stripe.set_refund(refund_of("re_pend", "pi_pend", "pending", 9900, made));
+        assert_eq!(
+            handle_event(
+                &db,
+                &stripe,
+                &s,
+                &charge_refunded("evt_pend", "pi_pend", made),
+                made
+            )
+            .await
+            .unwrap(),
+            EventOutcome::Processed
+        );
+        assert_eq!(
+            stored(&db, "evt_pend").await.state,
+            PaymentEventState::Processed
+        );
+        assert_untouched(&db, "o_pend", number).await;
+
+        // It succeeds on day 20, past the window and the grace: the window
+        // is judged by when the refund was made, so the number is released
+        stripe.set_refund(refund_of("re_pend", "pi_pend", "succeeded", 9900, made));
+        let updated = NOW + 20 * DAY;
+        assert_eq!(
+            handle_event(
+                &db,
+                &stripe,
+                &s,
+                &refund_updated("evt_pend_ok", "re_pend", "pi_pend", updated),
+                updated
+            )
+            .await
+            .unwrap(),
+            EventOutcome::Processed
+        );
+        assert_eq!(db.fetch_cipher_membership("u1").await.unwrap(), None);
+        assert_eq!(
+            db.fetch_cipher_number_by_order("o_pend").await.unwrap(),
+            None
+        );
+        assert_eq!(badge(&db).await, None);
+        assert_eq!(
+            db.fetch_payment_order("o_pend")
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            OrderState::Refunded
+        );
+
+        // The charge.refunded delivered again now changes nothing
+        assert_eq!(
+            handle_event(
+                &db,
+                &stripe,
+                &s,
+                &charge_refunded("evt_pend_again", "pi_pend", made),
+                updated + 1
+            )
+            .await
+            .unwrap(),
+            EventOutcome::Processed
+        );
+        assert_eq!(stripe.refund_count(), 0);
+        drop_db(&db).await;
+    }
+
+    #[tokio::test]
+    async fn a_refund_that_fails_after_its_charge_refunded_reverses_nothing() {
+        let db = test_db().await;
+        let stripe = MockStripe::new();
+        let s = settings();
+        let number = paid_member(&db, "o_fail", "pi_fail", NOW).await;
+
+        let made = NOW + DAY;
+        stripe.set_refund(refund_of("re_fail", "pi_fail", "pending", 9900, made));
+        assert_eq!(
+            handle_event(
+                &db,
+                &stripe,
+                &s,
+                &charge_refunded("evt_fail", "pi_fail", made),
+                made
+            )
+            .await
+            .unwrap(),
+            EventOutcome::Processed
+        );
+        assert_untouched(&db, "o_fail", number).await;
+
+        // The refund fails: logged, nothing reversed, the event settled
+        stripe.set_refund(refund_of("re_fail", "pi_fail", "failed", 9900, made));
+        let failed = refund_updated("evt_fail_upd", "re_fail", "pi_fail", made + DAY);
+        assert_eq!(
+            handle_event(&db, &stripe, &s, &failed, made + DAY)
+                .await
+                .unwrap(),
+            EventOutcome::Processed
+        );
+        assert_eq!(
+            stored(&db, "evt_fail_upd").await.state,
+            PaymentEventState::Processed
+        );
+        assert_untouched(&db, "o_fail", number).await;
+
+        // A refund Stripe does not list yet is retried, never guessed
+        let unknown = charge_refunded("evt_fail_none", "pi_other", made);
+        db.insert_payment_order(&PaymentOrder {
+            user_id: Some("u2".to_string()),
+            payment_intent_id: Some("pi_other".to_string()),
+            ..order("o_other", OrderState::Fulfilled, NOW)
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            handle_event(&db, &stripe, &s, &unknown, made)
+                .await
+                .unwrap(),
+            EventOutcome::Retry
+        );
+        assert_eq!(
+            db.fetch_payment_order("o_other")
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            OrderState::Fulfilled
+        );
+        drop_db(&db).await;
+    }
+
+    // --- delayed payment methods --------------------------------------
+
+    /// A `checkout.session.completed` whose payload says the session is
+    /// complete but unpaid (a delayed payment method)
+    fn completed_unpaid(id: &str, order_id: &str) -> StripeEvent {
+        event(
+            id,
+            "checkout.session.completed",
+            false,
+            json!({
+                "id": format!("cs_{order_id}"),
+                "object": "checkout.session",
+                "status": "complete",
+                "payment_status": "unpaid"
+            }),
+        )
+    }
+
+    fn async_payment(id: &str, event_type: &str, order_id: &str) -> StripeEvent {
+        event(
+            id,
+            event_type,
+            false,
+            json!({ "id": format!("cs_{order_id}"), "object": "checkout.session" }),
+        )
+    }
+
+    /// Stripe reports `order_id`'s session complete but not paid yet
+    fn clearing_at_stripe(stripe: &MockStripe, order_id: &str) {
+        stripe.set_session(session(
+            &format!("cs_{order_id}"),
+            order_id,
+            "complete",
+            "unpaid",
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_delayed_payment_is_fulfilled_by_its_async_success() {
+        let db = test_db().await;
+        let stripe = MockStripe::new();
+        let s = settings();
+        paid_at_stripe(&db, &stripe, "o_async", "pi_async").await;
+        clearing_at_stripe(&stripe, "o_async");
+
+        // Completed unpaid: settled, nothing applied, nothing claimed
+        assert_eq!(
+            handle_event(
+                &db,
+                &stripe,
+                &s,
+                &completed_unpaid("evt_async_done", "o_async"),
+                NOW
+            )
+            .await
+            .unwrap(),
+            EventOutcome::Processed
+        );
+        let o = db.fetch_payment_order("o_async").await.unwrap().unwrap();
+        assert_eq!(o.state, OrderState::Pending);
+        assert_eq!(db.fetch_cipher_membership("u1").await.unwrap(), None);
+        assert_eq!(db.count_claimed_cipher_numbers().await.unwrap(), 0);
+
+        // The success, before Stripe's view caught up: retried
+        let success = async_payment(
+            "evt_async_ok",
+            "checkout.session.async_payment_succeeded",
+            "o_async",
+        );
+        assert_eq!(
+            handle_event(&db, &stripe, &s, &success, NOW + MINUTE)
+                .await
+                .unwrap(),
+            EventOutcome::Retry
+        );
+        assert_eq!(db.count_claimed_cipher_numbers().await.unwrap(), 0);
+
+        // Then paid at Stripe: fulfilled from the re-fetched session
+        stripe.set_session(CheckoutSession {
+            payment_intent: Some("pi_async".to_string()),
+            ..session("cs_o_async", "o_async", "complete", "paid")
+        });
+        assert_eq!(
+            handle_event(&db, &stripe, &s, &success, NOW + 2 * MINUTE)
+                .await
+                .unwrap(),
+            EventOutcome::Processed
+        );
+        let o = db.fetch_payment_order("o_async").await.unwrap().unwrap();
+        assert_eq!(o.state, OrderState::Fulfilled);
+        assert_eq!(o.payment_intent_id.as_deref(), Some("pi_async"));
+        let m = db.fetch_cipher_membership("u1").await.unwrap().unwrap();
+        assert_eq!(m.orders, vec!["o_async".to_string()]);
+        assert_eq!(badge(&db).await.map(|b| b.number), Some(m.number));
+        assert_eq!(stripe.refund_count(), 0);
+        drop_db(&db).await;
+    }
+
+    #[tokio::test]
+    async fn a_failed_delayed_payment_expires_the_order_without_a_number() {
+        let db = test_db().await;
+        let stripe = MockStripe::new();
+        let s = settings();
+        paid_at_stripe(&db, &stripe, "o_async_no", "pi_async_no").await;
+        clearing_at_stripe(&stripe, "o_async_no");
+
+        assert_eq!(
+            handle_event(
+                &db,
+                &stripe,
+                &s,
+                &completed_unpaid("evt_async_no_done", "o_async_no"),
+                NOW
+            )
+            .await
+            .unwrap(),
+            EventOutcome::Processed
+        );
+        let failed = async_payment(
+            "evt_async_no",
+            "checkout.session.async_payment_failed",
+            "o_async_no",
+        );
+        assert_eq!(
+            handle_event(&db, &stripe, &s, &failed, NOW + MINUTE)
+                .await
+                .unwrap(),
+            EventOutcome::Processed
+        );
+        let o = db.fetch_payment_order("o_async_no").await.unwrap().unwrap();
+        assert_eq!(o.state, OrderState::Expired);
+        assert!(o.payment_intent_id.is_none());
+        assert_eq!(db.fetch_cipher_membership("u1").await.unwrap(), None);
+        assert_eq!(db.count_claimed_cipher_numbers().await.unwrap(), 0);
+        assert_eq!(badge(&db).await, None);
+        assert_eq!(stripe.refund_count(), 0);
+
+        // The sweep does not fulfil it either
+        reconcile(&db, &stripe, &s, NOW + 41 * MINUTE)
+            .await
+            .unwrap();
+        assert_eq!(
+            db.fetch_payment_order("o_async_no")
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            OrderState::Expired
+        );
+        assert_eq!(db.count_claimed_cipher_numbers().await.unwrap(), 0);
         drop_db(&db).await;
     }
 }

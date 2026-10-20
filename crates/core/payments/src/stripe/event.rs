@@ -23,8 +23,18 @@ use super::client::{is_valid_stripe_id, StripeError};
 pub const CHECKOUT_SESSION_COMPLETED: &str = "checkout.session.completed";
 /// `checkout.session.expired`: the session timed out unpaid
 pub const CHECKOUT_SESSION_EXPIRED: &str = "checkout.session.expired";
+/// `checkout.session.async_payment_succeeded`: a delayed payment method
+/// paid a session that completed unpaid
+pub const CHECKOUT_SESSION_ASYNC_PAYMENT_SUCCEEDED: &str =
+    "checkout.session.async_payment_succeeded";
+/// `checkout.session.async_payment_failed`: a delayed payment method did
+/// not pay a session that completed unpaid
+pub const CHECKOUT_SESSION_ASYNC_PAYMENT_FAILED: &str = "checkout.session.async_payment_failed";
 /// `charge.refunded`: a full or partial refund (ours or the dashboard's)
 pub const CHARGE_REFUNDED: &str = "charge.refunded";
+/// `charge.refund.updated`: a refund changed, e.g. from `pending` to
+/// `succeeded` or `failed` (`data.object` is the Refund)
+pub const CHARGE_REFUND_UPDATED: &str = "charge.refund.updated";
 /// `charge.dispute.created`: the buyer opened a dispute
 pub const CHARGE_DISPUTE_CREATED: &str = "charge.dispute.created";
 /// `charge.dispute.closed`: a dispute ended; see `status` on the object
