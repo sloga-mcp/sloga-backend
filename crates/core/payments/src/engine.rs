@@ -58,9 +58,13 @@
 //!   during one drops it (the number stays retired)
 //! - Cipher is not sold to `cipher_blocked_countries` (the EU and the UK):
 //!   checkout refuses a request Cloudflare places there (the route) and a
-//!   buyer already refunded for that reason, and a payment whose billing
+//!   buyer refunded for that reason in the last 30 days while that country
+//!   is still blocked ([`REGION_REFUSAL_MS`]), and a payment whose billing
 //!   country, or whose card's issuing country, is there is voided and
-//!   refunded (`RegionUnavailable`) before any number is claimed
+//!   refunded (`RegionUnavailable`) before any number is claimed. A card
+//!   country Stripe permanently refuses to report is waited on for
+//!   [`CARD_COUNTRY_WAIT_MS`] after payment, then the billing country alone
+//!   decides (logged `CARD_COUNTRY_UNAVAILABLE`)
 
 use revolt_database::{
     CipherMembership, CipherRevokeReason, Database, FieldsUser, OrderState, PartialUser,
@@ -141,6 +145,20 @@ const CREATING_BLOCKS_MS: i64 = 2 * 60 * 1000;
 
 /// Stripe's error code for refunding a charge that is already refunded
 const CHARGE_ALREADY_REFUNDED: &str = "charge_already_refunded";
+
+/// How long after its payment ([`PaymentOrder::paid_at`]) an order waits on
+/// a card country Stripe permanently refuses to report (a key without the
+/// permission, a request Stripe calls invalid, a response we cannot decode).
+/// Until then the order stays Paid and is retried; after it, the billing
+/// country alone decides, logged at error level as
+/// `CARD_COUNTRY_UNAVAILABLE`. A transport error, a 5xx or a 429 is never
+/// permanent: those keep the order waiting however long it takes.
+pub const CARD_COUNTRY_WAIT_MS: i64 = 30 * 60 * 1000;
+
+/// For how long after a `RegionUnavailable` void (its `reversed_at`, or
+/// its `paid_at` while the void is still finishing) checkout refuses that
+/// buyer, and only while the void's country is still blocked
+pub const REGION_REFUSAL_MS: i64 = 30 * 24 * 3600 * 1000;
 
 /// Result of [`fulfil_order`]
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -376,6 +394,26 @@ fn provider_error(context: &str, err: StripeError) -> revolt_result::Error {
     create_error!(PaymentProviderError)
 }
 
+/// Whether a failed read of a payment's charge is one retrying cannot fix
+/// (see [`CARD_COUNTRY_WAIT_MS`]): a 4xx Stripe answers with
+/// `permission_error` or `invalid_request_error` (never a 429), or a
+/// response that does not decode (e.g. `latest_charge` not expanded).
+/// A transport error, a 5xx, a 429 and any other 4xx are not.
+fn card_country_unreadable(err: &StripeError) -> bool {
+    match err {
+        StripeError::Api { status, kind, .. } => {
+            (400..500).contains(status)
+                && *status != 429
+                && matches!(
+                    kind.as_deref(),
+                    Some("permission_error" | "invalid_request_error")
+                )
+        }
+        StripeError::Decode(_) => true,
+        StripeError::Transport(_) => false,
+    }
+}
+
 /// Whether the account has been deleted
 fn is_deleted(user: &User) -> bool {
     user.flags.unwrap_or_default() & UserFlags::Deleted as i32 != 0
@@ -524,6 +562,22 @@ fn session_mismatch(
 // Checkout
 // ---------------------------------------------------------------------------
 
+/// Whether `order` is a `RegionUnavailable` void that still keeps its buyer
+/// out of checkout: its country is on the current list, and it was voided
+/// (or, still finishing, paid) less than [`REGION_REFUSAL_MS`] ago. A void
+/// recorded before its country was kept blocks nothing.
+fn region_refusal_holds(s: &PaymentsSettings, order: &PaymentOrder, now_ms: i64) -> bool {
+    order.void_reason == Some(VoidReason::RegionUnavailable)
+        && order
+            .region_blocked_country
+            .as_deref()
+            .is_some_and(|country| s.region_blocked(country))
+        && order
+            .reversed_at
+            .or(order.paid_at)
+            .is_some_and(|at| now_ms.saturating_sub(at) < REGION_REFUSAL_MS)
+}
+
 /// Checkout: enabled + sales_open_at(now); quote(); refuse upgrade while
 /// disputed; one live Pending order per user (unexpired → return its stored
 /// checkout_url); Creating → create session (idempotency key = order id) →
@@ -550,15 +604,18 @@ pub async fn create_cipher_checkout(
         return Err(create_error!(CipherSalesClosed));
     }
 
-    // A buyer once refunded because the payment came from a country Cipher
-    // is not sold to gets no new checkout: each one would be paid, voided
-    // and refunded again, at a Stripe fee each time. A void of that kind
-    // still finishing (Paid, the reason recorded) counts too.
-    if db
-        .fetch_payment_orders_by_user(user_id, &[OrderState::Voided, OrderState::Paid])
-        .await?
-        .iter()
-        .any(|o| o.void_reason == Some(VoidReason::RegionUnavailable))
+    // A buyer recently refunded because the payment came from a country
+    // Cipher is not sold to gets no new checkout while that country is
+    // still blocked: each one would be paid, voided and refunded again, at
+    // a Stripe fee each time. A void of that kind still finishing (Paid,
+    // the reason recorded) counts too. Not with an empty list (nothing is
+    // blocked), and not for long: see `region_refusal_holds`.
+    if !s.blocked_countries.is_empty()
+        && db
+            .fetch_payment_orders_by_user(user_id, &[OrderState::Voided, OrderState::Paid])
+            .await?
+            .iter()
+            .any(|o| region_refusal_holds(s, o, now_ms))
     {
         return Err(create_error!(CipherRegionUnavailable));
     }
@@ -629,6 +686,7 @@ pub async fn create_cipher_checkout(
         payment_intent_id: None,
         state: OrderState::Creating,
         void_reason: None,
+        region_blocked_country: None,
         reversal_pending: None,
         refund_settling_since: None,
         open_disputes: vec![],
@@ -956,7 +1014,8 @@ async fn fulfil_locked(
                      is not sold; voiding and refunding it",
                     leased.order.id
                 );
-                return void_paid(db, stripe, leased, VoidReason::RegionUnavailable, now_ms).await;
+                let country = country.to_string();
+                return void_for_region(db, stripe, leased, country, now_ms).await;
             }
             Some(_) => {}
             None => log::warn!(
@@ -970,28 +1029,44 @@ async fn fulfil_locked(
         // in (Apple Pay, Google Pay and Link included). Any other method,
         // or a card Stripe reports no country for, is judged on the billing
         // country alone. A failed read is an error: nothing is claimed, and
-        // the event (or the reconcile resume) tries again.
+        // the event (or the reconcile resume) tries again. Only a failure
+        // that retrying cannot fix, still there [`CARD_COUNTRY_WAIT_MS`]
+        // after the payment, lets the billing country decide alone.
         if !s.blocked_countries.is_empty() {
-            let charge = stripe
-                .get_payment_charge(&payment_intent)
-                .await
-                .map_err(|err| {
-                    provider_error(
+            match stripe.get_payment_charge(&payment_intent).await {
+                Ok(charge) => {
+                    if let Some(country) = charge
+                        .card_country
+                        .filter(|country| s.region_blocked(country))
+                    {
+                        log::warn!(
+                            "payments: order {} was paid with a card issued in {country}, where \
+                             Cipher is not sold; voiding and refunding it",
+                            leased.order.id
+                        );
+                        return void_for_region(db, stripe, leased, country, now_ms).await;
+                    }
+                }
+                Err(err)
+                    if card_country_unreadable(&err)
+                        && leased
+                            .order
+                            .paid_at
+                            .is_some_and(|at| now_ms.saturating_sub(at) > CARD_COUNTRY_WAIT_MS) =>
+                {
+                    log::error!(
+                        "payments: CARD_COUNTRY_UNAVAILABLE order {}: the card country of its \
+                         payment still cannot be read ({err}); fulfilling it on its billing \
+                         country alone",
+                        leased.order.id
+                    );
+                }
+                Err(err) => {
+                    return Err(provider_error(
                         &format!("reading the charge of order {}", leased.order.id),
                         err,
-                    )
-                })?;
-            if let Some(country) = charge
-                .card_country
-                .as_deref()
-                .filter(|country| s.region_blocked(country))
-            {
-                log::warn!(
-                    "payments: order {} was paid with a card issued in {country}, where Cipher \
-                     is not sold; voiding and refunding it",
-                    leased.order.id
-                );
-                return void_paid(db, stripe, leased, VoidReason::RegionUnavailable, now_ms).await;
+                    ))
+                }
             }
         }
 
@@ -1519,6 +1594,22 @@ async fn void_for_deleted_account(
     }
 
     void_paid(db, stripe, leased, VoidReason::AccountDeleted, now_ms).await
+}
+
+/// Void a Paid order from `country`, where Cipher is not sold
+/// (RegionUnavailable). The country goes on the order with the reason:
+/// every write of [`void_paid`] (the reason's mark before the refund, then
+/// Voided) carries it, so checkout refuses the buyer only while it is still
+/// blocked (`region_refusal_holds`).
+async fn void_for_region(
+    db: &Database,
+    stripe: &dyn StripeApi,
+    leased: &mut Leased,
+    country: String,
+    now_ms: i64,
+) -> Result<FulfilOutcome> {
+    leased.order.region_blocked_country = Some(country);
+    void_paid(db, stripe, leased, VoidReason::RegionUnavailable, now_ms).await
 }
 
 /// List `order_id` in the membership's `disputed_orders` when `open`, or
@@ -5121,6 +5212,7 @@ mod tests {
             StripeError::Api {
                 status: 400,
                 code: None,
+                kind: Some("invalid_request_error".to_string()),
                 message: "You must set a Terms of Service URL in your public business details \
                           to collect terms of service consent."
                     .to_string(),
@@ -5320,6 +5412,7 @@ mod tests {
             payment_intent_id: None,
             state: OrderState::Creating,
             void_reason: None,
+            region_blocked_country: None,
             reversal_pending: None,
             refund_settling_since: None,
             open_disputes: vec![],
@@ -8134,6 +8227,7 @@ mod tests {
         let disputed = || StripeError::Api {
             status: 400,
             code: Some("charge_disputed".to_string()),
+            kind: Some("invalid_request_error".to_string()),
             message: "This charge has been charged back.".to_string(),
         };
         stripe.fail_next("create_refund", disputed());
@@ -8631,6 +8725,370 @@ mod tests {
         );
         assert_eq!(stripe.refund_count_for("pi_1"), 1);
         assert_eq!(db.count_claimed_cipher_numbers().await.unwrap(), 0);
+        drop_db(&db).await;
+    }
+
+    // --- card country Stripe will not report ----------------------------
+
+    /// Error-level log lines of this test binary, so a test can assert an
+    /// operator alert was raised (each test filters by its own order id)
+    static ERROR_LINES: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+    struct ErrorLog;
+
+    impl log::Log for ErrorLog {
+        fn enabled(&self, metadata: &log::Metadata) -> bool {
+            metadata.level() <= log::Level::Error
+        }
+
+        fn log(&self, record: &log::Record) {
+            if self.enabled(record.metadata()) {
+                ERROR_LINES
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push(record.args().to_string());
+            }
+        }
+
+        fn flush(&self) {}
+    }
+
+    /// Start capturing error-level log lines (once per test binary). Panics
+    /// if another logger is installed: the assertions would see nothing.
+    fn capture_error_log() {
+        static LOGGER: ErrorLog = ErrorLog;
+        static INSTALL: std::sync::Once = std::sync::Once::new();
+        INSTALL.call_once(|| {
+            log::set_logger(&LOGGER).expect("no other logger in this test binary");
+            log::set_max_level(log::LevelFilter::Error);
+        });
+    }
+
+    /// Captured `CARD_COUNTRY_UNAVAILABLE` alerts naming `order_id`
+    fn card_country_alerts(order_id: &str) -> usize {
+        ERROR_LINES
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter(|line| {
+                line.starts_with("payments: CARD_COUNTRY_UNAVAILABLE ") && line.contains(order_id)
+            })
+            .count()
+    }
+
+    fn api_error(status: u16, kind: &str) -> StripeError {
+        StripeError::Api {
+            status,
+            code: None,
+            kind: Some(kind.to_string()),
+            message: format!("a {kind}"),
+        }
+    }
+
+    #[test]
+    fn only_a_refusal_retrying_cannot_fix_lets_the_card_country_go_unread() {
+        for (err, unreadable) in [
+            (api_error(403, "permission_error"), true),
+            (api_error(400, "invalid_request_error"), true),
+            (api_error(404, "invalid_request_error"), true),
+            (
+                StripeError::Decode("latest_charge is not expanded".to_string()),
+                true,
+            ),
+            (api_error(429, "rate_limit_error"), false),
+            (api_error(429, "invalid_request_error"), false),
+            (api_error(500, "api_error"), false),
+            (api_error(503, "invalid_request_error"), false),
+            (api_error(401, "authentication_error"), false),
+            (api_error(402, "card_error"), false),
+            (api_error(400, "idempotency_error"), false),
+            (
+                StripeError::Api {
+                    status: 403,
+                    code: None,
+                    kind: None,
+                    message: "HTTP 403 without a Stripe error body".to_string(),
+                },
+                false,
+            ),
+            (
+                StripeError::Transport("request timed out".to_string()),
+                false,
+            ),
+        ] {
+            assert_eq!(card_country_unreadable(&err), unreadable, "{err:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_card_country_stripe_refuses_for_good_is_waited_on_then_the_billing_country_decides()
+    {
+        capture_error_log();
+        let db = test_db().await;
+        let stripe = MockStripe::new();
+        let s = settings();
+        insert_user(&db, "u1").await;
+
+        // Paid at NOW, billed to the US; the key may not read charges
+        let pending = checkout(&db, &stripe, &s, "u1", CipherTier::T99, NOW).await;
+        let session = pay_from(&stripe, &pending, "pi_1", Some("US"));
+        stripe.fail_next("get_payment_charge", api_error(403, "permission_error"));
+        assert!(matches!(
+            error_type(fulfil_order(&db, &stripe, &s, &pending.id, &session, NOW).await),
+            ErrorType::PaymentProviderError
+        ));
+
+        // Still within the wait: an error, the order kept Paid, nothing
+        // claimed, no alert
+        stripe.fail_next("get_payment_charge", api_error(403, "permission_error"));
+        let at = NOW + CARD_COUNTRY_WAIT_MS;
+        assert!(matches!(
+            error_type(resume_order(&db, &stripe, &s, &pending.id, at).await),
+            ErrorType::PaymentProviderError
+        ));
+        let kept = order(&db, &pending.id).await;
+        assert_eq!(kept.state, OrderState::Paid);
+        assert_eq!(kept.paid_at, Some(NOW));
+        assert_eq!(db.count_claimed_cipher_numbers().await.unwrap(), 0);
+        assert_eq!(card_country_alerts(&pending.id), 0);
+
+        // Past it: fulfilled on the billing country alone, and alerted
+        stripe.fail_next("get_payment_charge", api_error(403, "permission_error"));
+        assert_eq!(
+            resume_order(&db, &stripe, &s, &pending.id, at + 1)
+                .await
+                .unwrap(),
+            FulfilOutcome::Fulfilled
+        );
+        assert!(membership(&db, "u1").await.is_active());
+        assert_eq!(stripe.refund_count(), 0);
+        assert_eq!(stripe.call_count("get_payment_charge"), 3);
+        assert_eq!(card_country_alerts(&pending.id), 1);
+        drop_db(&db).await;
+    }
+
+    #[tokio::test]
+    async fn a_card_country_read_failing_for_a_passing_reason_never_falls_back() {
+        capture_error_log();
+        let db = test_db().await;
+        let stripe = MockStripe::new();
+        let s = settings();
+        insert_user(&db, "u1").await;
+
+        // A card issued in a blocked country, billed to the US
+        let pending = checkout(&db, &stripe, &s, "u1", CipherTier::T99, NOW).await;
+        let session = pay_from(&stripe, &pending, "pi_1", Some("US"));
+        stripe.set_payment_charge(paid_by("pi_1", "card", Some("DE")));
+        stripe.fail_next("get_payment_charge", api_error(500, "api_error"));
+        assert!(matches!(
+            error_type(fulfil_order(&db, &stripe, &s, &pending.id, &session, NOW).await),
+            ErrorType::PaymentProviderError
+        ));
+
+        // However long after the payment: fail closed, every time
+        let past = NOW + CARD_COUNTRY_WAIT_MS + 1;
+        for (i, err) in [
+            api_error(500, "api_error"),
+            // A 5xx whatever type it names
+            api_error(503, "invalid_request_error"),
+            api_error(429, "rate_limit_error"),
+            api_error(429, "invalid_request_error"),
+            api_error(401, "authentication_error"),
+            StripeError::Transport("request timed out".to_string()),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            stripe.fail_next("get_payment_charge", err.clone());
+            let at = past + i as i64 * DAY;
+            assert!(
+                matches!(
+                    error_type(resume_order(&db, &stripe, &s, &pending.id, at).await),
+                    ErrorType::PaymentProviderError
+                ),
+                "{err:?}"
+            );
+            let kept = order(&db, &pending.id).await;
+            assert_eq!(kept.state, OrderState::Paid);
+            assert_eq!(kept.void_reason, None);
+        }
+        assert_eq!(db.count_claimed_cipher_numbers().await.unwrap(), 0);
+        assert_eq!(maybe_membership(&db, "u1").await, None);
+        assert_eq!(card_country_alerts(&pending.id), 0);
+
+        // Once it reads, the card's country decides
+        assert_eq!(
+            resume_order(&db, &stripe, &s, &pending.id, past + 10 * DAY)
+                .await
+                .unwrap(),
+            FulfilOutcome::Voided(VoidReason::RegionUnavailable)
+        );
+        assert_eq!(stripe.refund_count_for("pi_1"), 1);
+        drop_db(&db).await;
+    }
+
+    #[tokio::test]
+    async fn a_charge_that_never_decodes_falls_back_to_the_billing_country_after_the_wait() {
+        capture_error_log();
+        let db = test_db().await;
+        let stripe = MockStripe::new();
+        let s = settings();
+
+        for (user, pi, err) in [
+            (
+                "u1",
+                "pi_1",
+                StripeError::Decode("latest_charge is not expanded".to_string()),
+            ),
+            ("u2", "pi_2", api_error(404, "invalid_request_error")),
+        ] {
+            insert_user(&db, user).await;
+            let pending = checkout(&db, &stripe, &s, user, CipherTier::T99, NOW).await;
+            let session = pay_from(&stripe, &pending, pi, Some("US"));
+            stripe.fail_next("get_payment_charge", err.clone());
+            assert!(matches!(
+                error_type(fulfil_order(&db, &stripe, &s, &pending.id, &session, NOW).await),
+                ErrorType::PaymentProviderError
+            ));
+            assert_eq!(order(&db, &pending.id).await.state, OrderState::Paid);
+
+            stripe.fail_next("get_payment_charge", err);
+            assert_eq!(
+                resume_order(
+                    &db,
+                    &stripe,
+                    &s,
+                    &pending.id,
+                    NOW + CARD_COUNTRY_WAIT_MS + 1
+                )
+                .await
+                .unwrap(),
+                FulfilOutcome::Fulfilled
+            );
+            assert!(membership(&db, user).await.is_active());
+            assert_eq!(card_country_alerts(&pending.id), 1);
+        }
+        assert_eq!(stripe.refund_count(), 0);
+        drop_db(&db).await;
+    }
+
+    // --- how long a region void refuses checkout -------------------------
+
+    async fn try_checkout(
+        db: &Database,
+        stripe: &MockStripe,
+        s: &PaymentsSettings,
+        user: &str,
+        at: i64,
+    ) -> Result<String> {
+        create_cipher_checkout(
+            db,
+            stripe,
+            s,
+            user,
+            CipherTier::T99,
+            CipherReturnTo::Web,
+            at,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn a_region_refusal_holds_only_while_its_country_is_blocked_and_for_30_days() {
+        let db = test_db().await;
+        let stripe = MockStripe::new();
+        let s = settings();
+        for user in ["u1", "u2", "u3"] {
+            insert_user(&db, user).await;
+        }
+
+        // u1: voided at NOW for the billing country, which is kept
+        let billed = checkout(&db, &stripe, &s, "u1", CipherTier::T99, NOW).await;
+        let session = pay_from(&stripe, &billed, "pi_de", Some("DE"));
+        assert_eq!(
+            fulfil_order(&db, &stripe, &s, &billed.id, &session, NOW)
+                .await
+                .unwrap(),
+            FulfilOutcome::Voided(VoidReason::RegionUnavailable)
+        );
+        let voided = order(&db, &billed.id).await;
+        assert_eq!(voided.region_blocked_country.as_deref(), Some("DE"));
+        assert_eq!(voided.reversed_at, Some(NOW));
+
+        // u2: a card issued in FR, billed to the US, the void stopped after
+        // the refund: Paid at NOW, reason and country recorded
+        let carded = checkout(&db, &stripe, &s, "u2", CipherTier::T99, NOW).await;
+        let session = pay_from(&stripe, &carded, "pi_fr", Some("US"));
+        stripe.set_payment_charge(paid_by("pi_fr", "card", Some("FR")));
+        stripe.fail_next_after_effect(
+            "create_refund",
+            StripeError::Transport("timeout".to_string()),
+        );
+        assert!(matches!(
+            error_type(fulfil_order(&db, &stripe, &s, &carded.id, &session, NOW).await),
+            ErrorType::PaymentProviderError
+        ));
+        let stopped = order(&db, &carded.id).await;
+        assert_eq!(stopped.state, OrderState::Paid);
+        assert_eq!(stopped.void_reason, Some(VoidReason::RegionUnavailable));
+        assert_eq!(stopped.region_blocked_country.as_deref(), Some("FR"));
+
+        // u3: a region void recorded before the country was kept
+        let legacy = checkout(&db, &stripe, &s, "u3", CipherTier::T99, NOW).await;
+        crash_after(&db, &legacy.id, |o| {
+            o.state = OrderState::Voided;
+            o.void_reason = Some(VoidReason::RegionUnavailable);
+            o.reversed_at = Some(NOW);
+        })
+        .await;
+
+        // Listed and recent: refused, to the last millisecond
+        let last = NOW + REGION_REFUSAL_MS - 1;
+        for user in ["u1", "u2"] {
+            assert!(matches!(
+                error_type(try_checkout(&db, &stripe, &s, user, last).await),
+                ErrorType::CipherRegionUnavailable
+            ));
+        }
+        // No country on record: never refused
+        try_checkout(&db, &stripe, &s, "u3", NOW + DAY)
+            .await
+            .unwrap();
+
+        // DE taken off the list: u1 is let in, u2 (FR) is not
+        let without_de = PaymentsSettings {
+            blocked_countries: s
+                .blocked_countries
+                .iter()
+                .filter(|country| country.as_str() != "DE")
+                .cloned()
+                .collect(),
+            ..settings()
+        };
+        assert!(without_de.region_blocked("FR"));
+        try_checkout(&db, &stripe, &without_de, "u1", NOW + DAY)
+            .await
+            .unwrap();
+        assert!(matches!(
+            error_type(try_checkout(&db, &stripe, &without_de, "u2", NOW + DAY).await),
+            ErrorType::CipherRegionUnavailable
+        ));
+
+        // Nothing blocked at all: let in
+        let open = PaymentsSettings {
+            blocked_countries: vec![],
+            ..settings()
+        };
+        try_checkout(&db, &stripe, &open, "u2", NOW + 2 * DAY)
+            .await
+            .unwrap();
+
+        // 30 days on, on the full list: both let in
+        for user in ["u1", "u2"] {
+            try_checkout(&db, &stripe, &s, user, NOW + REGION_REFUSAL_MS)
+                .await
+                .unwrap();
+        }
         drop_db(&db).await;
     }
 }

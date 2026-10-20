@@ -49,8 +49,10 @@ auto_derived!(
         /// A new purchase paid while the release of the buyer's previous
         /// Cipher number (a refund within the 14 days) was still running
         ReleasePending,
-        /// The buyer's billing country is one Cipher is not sold to
-        /// (`[features.payments] cipher_blocked_countries`)
+        /// The buyer's billing country, or their card's issuing country, is
+        /// one Cipher is not sold to (`[features.payments]
+        /// cipher_blocked_countries`); the country is kept in
+        /// `region_blocked_country`
         RegionUnavailable,
     }
 
@@ -103,6 +105,13 @@ auto_derived!(
         /// Why the order was voided (only on Voided)
         #[serde(skip_serializing_if = "Option::is_none", default)]
         pub void_reason: Option<VoidReason>,
+        /// The country (ISO 3166-1 alpha-2, as Stripe reported it) a
+        /// `RegionUnavailable` void was for: the billing country, or the
+        /// card's issuing country. Checkout refuses the buyer again only
+        /// while that country is still blocked. Unset on every other order,
+        /// and on a void recorded before the field existed.
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        pub region_blocked_country: Option<String>,
         /// A reversal still to be applied once fulfilment finishes
         #[serde(skip_serializing_if = "Option::is_none", default)]
         pub reversal_pending: Option<ReversalPending>,

@@ -49,11 +49,14 @@ pub enum StripeError {
     /// unknown, so a mutating call must be retried with the same
     /// idempotency key.
     Transport(String),
-    /// Stripe answered with a non-2xx status. `code` and `message` come from
-    /// Stripe's `error` object (scrubbed and truncated).
+    /// Stripe answered with a non-2xx status. `code`, `kind` and `message`
+    /// come from Stripe's `error` object (scrubbed and truncated).
     Api {
         status: u16,
         code: Option<String>,
+        /// Stripe's `error.type` (`invalid_request_error`,
+        /// `permission_error`, `api_error`, ...)
+        kind: Option<String>,
         message: String,
     },
     /// The input or the response did not have the expected shape (a
@@ -69,11 +72,13 @@ impl fmt::Display for StripeError {
                 status,
                 code: Some(code),
                 message,
+                ..
             } => write!(f, "Stripe API error {status} ({code}): {message}"),
             StripeError::Api {
                 status,
                 code: None,
                 message,
+                ..
             } => write!(f, "Stripe API error {status}: {message}"),
             StripeError::Decode(message) => write!(f, "Stripe decode error: {message}"),
         }
@@ -573,6 +578,11 @@ fn api_error_from_body(status: u16, body: &[u8], secret: &str) -> StripeError {
         .filter(|code| !code.is_empty())
         .map(|code| sanitize_message(code, secret));
 
+    let kind = error
+        .and_then(|e| obj_str(e, "type"))
+        .filter(|kind| !kind.is_empty())
+        .map(|kind| sanitize_message(kind, secret));
+
     let message = error
         .and_then(|e| obj_str(e, "message").or_else(|| obj_str(e, "type")))
         .filter(|message| !message.is_empty())
@@ -582,6 +592,7 @@ fn api_error_from_body(status: u16, body: &[u8], secret: &str) -> StripeError {
     StripeError::Api {
         status,
         code,
+        kind,
         message,
     }
 }
@@ -706,6 +717,16 @@ impl ReqwestStripe {
     }
 }
 
+/// Request path of [`StripeApi::get_payment_charge`]: the Payment Intent
+/// with its latest charge expanded (an unexpanded `latest_charge` is only an
+/// id, and is refused when decoded). Refuses a malformed id.
+fn payment_charge_path(payment_intent: &str) -> Result<String, StripeError> {
+    check_id(payment_intent)?;
+    Ok(format!(
+        "/payment_intents/{payment_intent}?expand[]=latest_charge"
+    ))
+}
+
 /// A GET must answer for the object that was asked for
 fn check_same_id(requested: &str, returned: &str) -> Result<(), StripeError> {
     if requested == returned {
@@ -769,12 +790,12 @@ impl StripeApi for ReqwestStripe {
     }
 
     async fn get_payment_charge(&self, payment_intent: &str) -> Result<PaymentCharge, StripeError> {
-        check_id(payment_intent)?;
+        let path = payment_charge_path(payment_intent)?;
         let value = self
             .call(
                 "get_payment_charge",
                 reqwest::Method::GET,
-                &format!("/payment_intents/{payment_intent}?expand[]=latest_charge"),
+                &path,
                 None,
                 None,
             )
@@ -946,6 +967,7 @@ mod mock {
         StripeError::Api {
             status: 404,
             code: Some("resource_missing".to_string()),
+            kind: Some("invalid_request_error".to_string()),
             message: format!("No such {kind}: '{id}'"),
         }
     }
@@ -954,6 +976,7 @@ mod mock {
         StripeError::Api {
             status: 400,
             code: Some("idempotency_error".to_string()),
+            kind: Some("idempotency_error".to_string()),
             message: "Keys for idempotent requests can only be used with the same parameters \
                       they were first used with."
                 .to_string(),
@@ -1273,6 +1296,7 @@ mod mock {
                     return Err(StripeError::Api {
                         status: 400,
                         code: Some("charge_already_refunded".to_string()),
+                        kind: Some("invalid_request_error".to_string()),
                         message: format!(
                             "The charge for payment intent {payment_intent} has already been \
                              refunded."
@@ -1519,7 +1543,20 @@ mod tests {
             StripeError::Api {
                 status: 404,
                 code: Some("resource_missing".to_string()),
+                kind: Some("invalid_request_error".to_string()),
                 message: "No such checkout.session: 'cs_test_missing'".to_string(),
+            }
+        );
+
+        let denied = br#"{"error": {"type": "permission_error",
+            "message": "The provided key does not have the required permissions"}}"#;
+        assert_eq!(
+            api_error_from_body(403, denied, ""),
+            StripeError::Api {
+                status: 403,
+                code: None,
+                kind: Some("permission_error".to_string()),
+                message: "The provided key does not have the required permissions".to_string(),
             }
         );
     }
@@ -1532,6 +1569,7 @@ mod tests {
             StripeError::Api {
                 status: 500,
                 code: None,
+                kind: Some("api_error".to_string()),
                 message: "api_error".to_string(),
             }
         );
@@ -1541,6 +1579,7 @@ mod tests {
             StripeError::Api {
                 status: 502,
                 code: None,
+                kind: None,
                 message,
             } => {
                 assert_eq!(message, "HTTP 502 without a Stripe error body");
@@ -1631,6 +1670,29 @@ mod tests {
             );
         }
         assert!(is_valid_stripe_id(&"a".repeat(MAX_ID_LEN)));
+    }
+
+    #[test]
+    fn payment_charge_path_expands_the_latest_charge() {
+        // Without the expansion `latest_charge` is a bare id, which is
+        // refused when decoded: no card country could ever be read
+        assert_eq!(
+            payment_charge_path("pi_3QAbCdEfGhIjKlMn0"),
+            Ok("/payment_intents/pi_3QAbCdEfGhIjKlMn0?expand[]=latest_charge".to_string())
+        );
+        for bad in [
+            "",
+            "pi_1?x=1",
+            "pi_1/../x",
+            "pi_1&expand[]=customer",
+            "pi 1",
+        ] {
+            assert_eq!(
+                payment_charge_path(bad),
+                Err(StripeError::Decode("bad id".to_string())),
+                "{bad:?}"
+            );
+        }
     }
 
     #[test]

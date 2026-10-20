@@ -367,6 +367,7 @@ mod tests {
             payment_intent_id: None,
             state: OrderState::Creating,
             void_reason: None,
+            region_blocked_country: None,
             reversal_pending: None,
             refund_settling_since: None,
             open_disputes: vec![],
@@ -472,8 +473,20 @@ mod tests {
             };
             let doc = to_document(&voided).unwrap();
             assert_eq!(doc.get_str("void_reason").unwrap(), name);
+            assert!(!doc.contains_key("region_blocked_country"));
             assert_eq!(from_document::<PaymentOrder>(doc).unwrap(), voided);
         }
+
+        // The country of a region void, stored as its code
+        let region = PaymentOrder {
+            state: OrderState::Voided,
+            void_reason: Some(VoidReason::RegionUnavailable),
+            region_blocked_country: Some("DE".to_string()),
+            ..order()
+        };
+        let doc = to_document(&region).unwrap();
+        assert_eq!(doc.get_str("region_blocked_country").unwrap(), "DE");
+        assert_eq!(from_document::<PaymentOrder>(doc).unwrap(), region);
     }
 
     #[test]

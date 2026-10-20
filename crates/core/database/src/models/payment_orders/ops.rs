@@ -155,6 +155,7 @@ mod tests {
             payment_intent_id: None,
             state,
             void_reason: None,
+            region_blocked_country: None,
             reversal_pending: None,
             refund_settling_since: None,
             open_disputes: vec![],
