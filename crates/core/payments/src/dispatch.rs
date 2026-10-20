@@ -364,8 +364,11 @@ fn fulfil_step(outcome: FulfilOutcome) -> Step {
         }
         // The order is not in a state fulfilment applies to: nothing changed
         FulfilOutcome::Ignored => Step::Ignored,
-        // A completed card checkout is paid, so Stripe's view has not caught
-        // up yet: retry rather than settle (the Pending sweep is the backstop)
+        // The Dashboard offers only methods that confirm at once (card, Link,
+        // wallets, Cash App Pay, Amazon Pay, Affirm, Klarna; bank debits
+        // off), so a completed checkout is paid and Stripe's view has not
+        // caught up yet: retry rather than settle (the Pending sweep is the
+        // backstop)
         FulfilOutcome::NotPaid => Step::Retry("session not reported paid yet".to_string()),
         FulfilOutcome::LeaseHeld => Step::Retry("order lease held".to_string()),
         // Handled: the deferral is durable (the order stays Paid), and the
@@ -491,7 +494,9 @@ struct Tally {
     redriven: u32,
     errors: u32,
     /// Paid upgrades deleted with a membership whose number a release put
-    /// back in the pool; each one is logged at error level, to refund
+    /// back in the pool; each one is logged at error level, to refund.
+    /// Sweep-only: a release the webhook finishes inline logs its upgrades
+    /// the same way but is not counted here.
     unrefunded_upgrades: u32,
 }
 
@@ -669,8 +674,9 @@ async fn check_pending(
                 Ok(()) => tally.expired += 1,
                 Err(error) => tally.error("order", &order.id, &engine_text("expire", &error)),
             },
-            // Still open (or complete without payment, which card-only
-            // checkout never produces): leave it for a later sweep
+            // Still open (or complete without payment, which the
+            // confirm-at-once methods the Dashboard offers never produce):
+            // leave it for a later sweep
             _ => {}
         }
     }
