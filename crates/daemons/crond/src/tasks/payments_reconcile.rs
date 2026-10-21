@@ -4,7 +4,8 @@
 //! (`[api.stripe] secret_key`), this hands the sweep to
 //! `revolt_payments::dispatch::reconcile`: stale unpaid orders are expired,
 //! pending orders are checked against Stripe, stranded fulfilments and
-//! reversals are resumed, open disputes are re-read, and failed or stranded
+//! reversals are resumed, refunds that were still settling and open
+//! disputes are re-read, and failed or stranded
 //! webhook events are fetched again and re-handled.
 //!
 //! The gate is the key, NOT `features.payments.enabled`. That switch stops

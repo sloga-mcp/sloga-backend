@@ -46,6 +46,14 @@ auto_derived!(
         /// A refund or a lost dispute arrived before fulfilment applied the
         /// order, so it was never applied
         Reversed,
+        /// A new purchase paid while the release of the buyer's previous
+        /// Cipher number (a refund within the 14 days) was still running
+        ReleasePending,
+        /// The buyer's billing country, or their card's issuing country, is
+        /// one Cipher is not sold to (`[features.payments]
+        /// cipher_blocked_countries`); the country is kept in
+        /// `region_blocked_country`
+        RegionUnavailable,
     }
 
     /// A reversal that arrived before fulfilment finished; fulfilment
@@ -97,9 +105,23 @@ auto_derived!(
         /// Why the order was voided (only on Voided)
         #[serde(skip_serializing_if = "Option::is_none", default)]
         pub void_reason: Option<VoidReason>,
+        /// The country (ISO 3166-1 alpha-2, as Stripe reported it) a
+        /// `RegionUnavailable` void was for: the billing country, or the
+        /// card's issuing country. Checkout refuses the buyer again only
+        /// while that country is still blocked. Unset on every other order,
+        /// and on a void recorded before the field existed.
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        pub region_blocked_country: Option<String>,
         /// A reversal still to be applied once fulfilment finishes
         #[serde(skip_serializing_if = "Option::is_none", default)]
         pub reversal_pending: Option<ReversalPending>,
+        /// Epoch ms a refund of the payment was first seen still settling
+        /// (`pending` or `requires_action` at the provider). Set until the
+        /// refund is acted on, or until every refund failed; the reconcile
+        /// sweep re-reads the refunds of every order that carries it, so a
+        /// refund whose update event never arrives is still applied.
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        pub refund_settling_since: Option<i64>,
         /// Provider ids of the disputes open on the payment. One payment can
         /// carry more than one (an inquiry closed `warning_closed`, then a
         /// chargeback), so each dispute is added and removed by its own id.

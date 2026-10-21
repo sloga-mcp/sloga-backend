@@ -1627,7 +1627,50 @@ pub struct FeaturePayments {
     pub cipher_cap: u32,
     /// RFC 3339 instant after which the sale is closed; empty = no close date
     pub cipher_sales_close_at: String,
+    /// Countries (ISO 3166-1 alpha-2, uppercase) Cipher is not sold to:
+    /// checkout refuses a request Cloudflare places there
+    /// (`CipherRegionUnavailable`, only with `[api.security]
+    /// trust_cloudflare`), and fulfilment voids and refunds a payment whose
+    /// billing address, or the issuing country of the card that paid it, is
+    /// there. Defaults to the 27 EU member states and the UK (no VAT
+    /// registrations yet). A TOML list, or one comma-separated string (the
+    /// environment form, `REVOLT__FEATURES__PAYMENTS__CIPHER_BLOCKED_COUNTRIES=DE,FR`;
+    /// see `country_list`). An entry that is not two uppercase letters
+    /// fails the payments config (checkouts refused).
+    #[serde(deserialize_with = "country_list")]
+    pub cipher_blocked_countries: Vec<String>,
 }
+
+/// `cipher_blocked_countries` from a list, or from one comma-separated
+/// string (an environment variable cannot carry a list). Each entry of the
+/// string is trimmed; an empty one (`""`, `"DE,"`) is kept, so the payments
+/// config refuses it instead of blocking nothing. To block nothing, set
+/// `cipher_blocked_countries = []` in Revolt.overrides.toml.
+fn country_list<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Vec<String>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum CountryList {
+        List(Vec<String>),
+        Joined(String),
+    }
+
+    Ok(match CountryList::deserialize(deserializer)? {
+        CountryList::List(codes) => codes,
+        CountryList::Joined(joined) => joined
+            .split(',')
+            .map(|code| code.trim().to_string())
+            .collect(),
+    })
+}
+
+/// The 27 EU member states and the United Kingdom: the default of
+/// `[features.payments] cipher_blocked_countries`
+pub const CIPHER_BLOCKED_COUNTRIES_DEFAULT: [&str; 28] = [
+    "AT", "BE", "BG", "HR", "CY", "CZ", "DK", "EE", "FI", "FR", "DE", "GR", "HU", "IE", "IT", "LV",
+    "LT", "LU", "MT", "NL", "PL", "PT", "RO", "SK", "SI", "ES", "SE", "GB",
+];
 
 impl Default for FeaturePayments {
     fn default() -> Self {
@@ -1636,6 +1679,9 @@ impl Default for FeaturePayments {
             cipher_sales_open: false,
             cipher_cap: 1000,
             cipher_sales_close_at: String::new(),
+            cipher_blocked_countries: CIPHER_BLOCKED_COUNTRIES_DEFAULT
+                .map(str::to_string)
+                .to_vec(),
         }
     }
 }
@@ -2992,7 +3038,7 @@ mod payments_config_tests {
 
     use config::{Config, Environment, File, FileFormat};
 
-    use super::{ApiStripe, FeaturePayments, Settings};
+    use super::{ApiStripe, FeaturePayments, Settings, CIPHER_BLOCKED_COUNTRIES_DEFAULT};
 
     const SECRET_KEY: &str = "sk_test_w1cfgFakeSecretKeyNotARealKey";
     const WEBHOOK_SECRET: &str = "whsec_w1cfgFakeWebhookSecretNotReal";
@@ -3019,6 +3065,31 @@ mod payments_config_tests {
         assert!(!payments.cipher_sales_open);
         assert_eq!(payments.cipher_cap, 1000);
         assert_eq!(payments.cipher_sales_close_at, "");
+        assert_eq!(
+            payments.cipher_blocked_countries,
+            CIPHER_BLOCKED_COUNTRIES_DEFAULT
+                .map(str::to_string)
+                .to_vec()
+        );
+    }
+
+    /// The default list is the 27 EU member states plus the UK, each once
+    #[test]
+    fn blocked_countries_default_is_the_eu_and_the_uk() {
+        let mut codes = CIPHER_BLOCKED_COUNTRIES_DEFAULT.to_vec();
+        codes.sort_unstable();
+        codes.dedup();
+        assert_eq!(codes.len(), 28);
+        assert!(codes
+            .iter()
+            .all(|c| c.len() == 2 && c.bytes().all(|b| b.is_ascii_uppercase())));
+        for code in ["DE", "FR", "IE", "NL", "GB"] {
+            assert!(codes.contains(&code), "{code} is missing");
+        }
+        // Not EU members, or not ISO 3166-1 alpha-2 (UK, EL)
+        for code in ["US", "CH", "NO", "IS", "UK", "EL"] {
+            assert!(!codes.contains(&code), "{code} must not be listed");
+        }
     }
 
     fn assert_stripe_defaults(stripe: &ApiStripe) {
@@ -3155,6 +3226,76 @@ mod payments_config_tests {
             .try_deserialize()
             .expect("a config without [features.payments] must deserialize");
         assert_payments_defaults(&settings.features.payments);
+    }
+
+    /// An overrides file replaces the whole blocked list (an empty one
+    /// blocks nothing); one that does not set it keeps the default
+    #[test]
+    fn overrides_replace_the_blocked_countries() {
+        let layered = |overrides: &str| -> Vec<String> {
+            let settings: Settings = Config::builder()
+                .add_source(File::from_str(
+                    include_str!("../Revolt.toml"),
+                    FileFormat::Toml,
+                ))
+                .add_source(File::from_str(overrides, FileFormat::Toml))
+                .build()
+                .expect("the layered config builds")
+                .try_deserialize()
+                .expect("the layered config deserializes");
+            settings.features.payments.cipher_blocked_countries
+        };
+
+        assert_eq!(
+            layered("[features.payments]\ncipher_blocked_countries = []\n"),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            layered("[features.payments]\ncipher_blocked_countries = [\"DE\", \"US\"]\n"),
+            ["DE", "US"]
+        );
+        assert_eq!(
+            layered("[features.payments]\nenabled = true\n"),
+            CIPHER_BLOCKED_COUNTRIES_DEFAULT
+                .map(str::to_string)
+                .to_vec()
+        );
+    }
+
+    /// The blocked list from the environment: one comma-separated string,
+    /// each entry trimmed. An empty entry is kept for the payments config
+    /// to refuse, never dropped.
+    #[test]
+    fn environment_sets_the_blocked_countries_as_a_comma_separated_string() {
+        let from_env = |value: &str| -> Vec<String> {
+            let settings: Settings = Config::builder()
+                .add_source(File::from_str(
+                    include_str!("../Revolt.toml"),
+                    FileFormat::Toml,
+                ))
+                .add_source(
+                    Environment::with_prefix("REVOLT")
+                        .separator("__")
+                        .source(Some(
+                            [(
+                                "REVOLT__FEATURES__PAYMENTS__CIPHER_BLOCKED_COUNTRIES".to_string(),
+                                value.to_string(),
+                            )]
+                            .into(),
+                        )),
+                )
+                .build()
+                .expect("the config builds")
+                .try_deserialize()
+                .expect("the config deserializes");
+            settings.features.payments.cipher_blocked_countries
+        };
+
+        assert_eq!(from_env("DE,FR"), ["DE", "FR"]);
+        assert_eq!(from_env(" DE , US "), ["DE", "US"]);
+        assert_eq!(from_env("GB"), ["GB"]);
+        assert_eq!(from_env("DE,"), ["DE", ""]);
+        assert_eq!(from_env(""), [""]);
     }
 
     /// The documented env form (double underscores) reaches the nested keys
