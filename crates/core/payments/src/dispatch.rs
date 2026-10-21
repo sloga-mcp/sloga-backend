@@ -66,7 +66,7 @@ use crate::stripe::event::{
     CHARGE_REFUND_UPDATED, CHECKOUT_SESSION_ASYNC_PAYMENT_FAILED,
     CHECKOUT_SESSION_ASYNC_PAYMENT_SUCCEEDED, CHECKOUT_SESSION_COMPLETED, CHECKOUT_SESSION_EXPIRED,
 };
-use crate::stripe::{CheckoutSession, Refund, StripeApi, StripeError};
+use crate::stripe::{CheckoutSession, PaymentIntent, Refund, StripeApi, StripeError};
 
 /// Creating / SessionFailed orders older than this are expired (no buyer can
 /// still be paying for them: the checkout URL was never handed out, or the
@@ -873,12 +873,50 @@ async fn check_pending(
                 Ok(false) => {}
                 Err(error) => tally.error("order", &order.id, &engine_text("expire", &error)),
             },
-            // Still open, or complete with a delayed payment still clearing
-            // (its async_payment_* event, or a later sweep, settles it):
-            // leave it for a later sweep
+            // Complete with a delayed payment: its async_payment_* event
+            // settles it. A failure the payment intent already reports
+            // expires it here too, so a lost async_payment_failed (or an
+            // endpoint not subscribed to it) cannot leave it Pending for
+            // good; one still clearing is left for a later sweep
+            (Some("complete"), Some("unpaid")) => {
+                let Some(payment_intent) = session.payment_intent.as_deref() else {
+                    continue;
+                };
+                match stripe.get_payment_intent(payment_intent).await {
+                    Ok(intent) if delayed_payment_failed(&intent) => {
+                        match engine::expire_order(db, &order.id, now_ms).await {
+                            Ok(true) => tally.expired += 1,
+                            // Its lease is held: the holder settles it, or
+                            // the next sweep
+                            Ok(false) => {}
+                            Err(error) => {
+                                tally.error("order", &order.id, &engine_text("expire", &error))
+                            }
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(error) => tally.error(
+                        "order",
+                        &order.id,
+                        &stripe_text("get_payment_intent", &error),
+                    ),
+                }
+            }
+            // Still open: leave it for a later sweep
             _ => {}
         }
     }
+}
+
+/// Whether the payment intent of a session that completed unpaid reports
+/// its delayed payment failed: Stripe moves it back to
+/// `requires_payment_method` (the session cannot take another), or it was
+/// canceled
+fn delayed_payment_failed(intent: &PaymentIntent) -> bool {
+    matches!(
+        intent.status.as_deref(),
+        Some("requires_payment_method" | "canceled")
+    )
 }
 
 async fn resume_paid(
@@ -3952,6 +3990,86 @@ mod tests {
                 .state,
             OrderState::Expired
         );
+        drop_db(&db).await;
+    }
+
+    #[tokio::test]
+    async fn the_sweep_expires_a_delayed_payment_whose_failure_was_never_delivered() {
+        for (order_id, pi, status) in [
+            ("o_lost_rpm", "pi_lost_rpm", "requires_payment_method"),
+            ("o_lost_cancel", "pi_lost_cancel", "canceled"),
+        ] {
+            let db = test_db().await;
+            let stripe = MockStripe::new();
+            let s = settings();
+            paid_at_stripe(&db, &stripe, order_id, pi).await;
+            // Completed unpaid; the failure moved the intent on, and its
+            // async_payment_failed never arrived
+            stripe.set_session(CheckoutSession {
+                payment_intent: Some(pi.to_string()),
+                ..session(&format!("cs_{order_id}"), order_id, "complete", "unpaid")
+            });
+            stripe.set_payment_intent(PaymentIntent {
+                status: Some(status.to_string()),
+                ..intent(pi, Some(order_id))
+            });
+
+            reconcile(&db, &stripe, &s, NOW + 41 * MINUTE)
+                .await
+                .unwrap();
+            let o = db.fetch_payment_order(order_id).await.unwrap().unwrap();
+            assert_eq!(o.state, OrderState::Expired, "{status}");
+            assert_eq!(db.fetch_cipher_membership("u1").await.unwrap(), None);
+            assert_eq!(db.count_claimed_cipher_numbers().await.unwrap(), 0);
+            assert_eq!(stripe.refund_count(), 0);
+            drop_db(&db).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn the_sweep_leaves_a_delayed_payment_that_is_still_clearing() {
+        let db = test_db().await;
+        let stripe = MockStripe::new();
+        let s = settings();
+        paid_at_stripe(&db, &stripe, "o_clearing", "pi_clearing").await;
+        stripe.set_session(CheckoutSession {
+            payment_intent: Some("pi_clearing".to_string()),
+            ..session("cs_o_clearing", "o_clearing", "complete", "unpaid")
+        });
+        stripe.set_payment_intent(PaymentIntent {
+            status: Some("processing".to_string()),
+            ..intent("pi_clearing", Some("o_clearing"))
+        });
+
+        // Still clearing, then the intent cannot be read: Pending both times
+        reconcile(&db, &stripe, &s, NOW + 41 * MINUTE)
+            .await
+            .unwrap();
+        stripe.fail_next(
+            "get_payment_intent",
+            StripeError::Transport("request timed out".to_string()),
+        );
+        reconcile(&db, &stripe, &s, NOW + 51 * MINUTE)
+            .await
+            .unwrap();
+        let o = db.fetch_payment_order("o_clearing").await.unwrap().unwrap();
+        assert_eq!(o.state, OrderState::Pending);
+        assert_eq!(db.count_claimed_cipher_numbers().await.unwrap(), 0);
+
+        // Once it is paid, the sweep fulfils it
+        stripe.set_session(CheckoutSession {
+            payment_intent: Some("pi_clearing".to_string()),
+            ..session("cs_o_clearing", "o_clearing", "complete", "paid")
+        });
+        stripe.set_payment_intent(PaymentIntent {
+            status: Some("succeeded".to_string()),
+            ..intent("pi_clearing", Some("o_clearing"))
+        });
+        reconcile(&db, &stripe, &s, NOW + 61 * MINUTE)
+            .await
+            .unwrap();
+        let o = db.fetch_payment_order("o_clearing").await.unwrap().unwrap();
+        assert_eq!(o.state, OrderState::Fulfilled);
         drop_db(&db).await;
     }
 }
