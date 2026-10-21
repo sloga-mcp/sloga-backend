@@ -1,13 +1,12 @@
 use revolt_database::{
     events::client::EventV1,
     events::rabbit::{CalendarEventNotification, CalendarEventPayload},
-    util::permissions::DatabasePermissionQuery,
+    util::event_visibility::{resolve_event_channel_target, user_can_view_channel},
     util::reference::Reference,
     Database, EventRsvp, RsvpStatus, User, AMQP,
 };
 use revolt_models::v0;
-use revolt_permissions::{calculate_channel_permissions, ChannelPermission};
-use revolt_result::{create_error, Result};
+use revolt_result::{create_error, ErrorType, Result};
 use rocket::{serde::json::Json, State};
 use rocket_empty::EmptyResponse;
 use validator::Validate;
@@ -49,10 +48,11 @@ pub async fn invite_to_event(
     }
 
     let event = db.fetch_event(target.id).await?;
+    // Manage rights first, so the cancelled state is only reported to managers.
+    super::authorize_manage(db, &user, &event).await?;
     if event.cancelled {
         return Err(create_error!(InvalidOperation));
     }
-    super::authorize_manage(db, &user, &event).await?;
 
     // Role expansion: every role must exist on the server (a typo'd/deleted role is
     // a hard error, not a silent no-op), then its current holders join the invite
@@ -76,8 +76,16 @@ pub async fn invite_to_event(
     // For a channel-scoped event, an invitee must be able to view that channel —
     // otherwise they would be "invited but cannot open" (keeps invite/view/RSVP
     // consistent, and avoids an invite push for an event they can never see).
-    let channel = match &event.channel {
-        Some(channel_id) => Some(db.fetch_channel(channel_id).await?),
+    // A thread or forum post is judged by its parent, resolved once here:
+    // `Some(None)` means the channel cannot be resolved (including a deleted
+    // channel), so nobody can view the event and every invitee is skipped. Any
+    // other lookup error fails the request.
+    let channel_target = match &event.channel {
+        Some(channel_id) => match db.fetch_channel(channel_id).await {
+            Ok(channel) => Some(resolve_event_channel_target(db, &channel).await),
+            Err(error) if matches!(error.error_type, ErrorType::NotFound) => Some(None),
+            Err(error) => return Err(error),
+        },
         None => None,
     };
 
@@ -92,7 +100,11 @@ pub async fn invite_to_event(
             skipped += 1;
             continue;
         }
-        if let Some(channel) = &channel {
+        if let Some(target) = &channel_target {
+            let Some(target) = target else {
+                skipped += 1;
+                continue;
+            };
             let target_user = match db.fetch_user(uid).await {
                 Ok(u) => u,
                 Err(_) => {
@@ -100,11 +112,7 @@ pub async fn invite_to_event(
                     continue;
                 }
             };
-            let mut query = DatabasePermissionQuery::new(db, &target_user).channel(channel);
-            if !calculate_channel_permissions(&mut query)
-                .await
-                .has_channel_permission(ChannelPermission::ViewChannel)
-            {
+            if !user_can_view_channel(db, &target_user, &event.server, target).await {
                 skipped += 1;
                 continue;
             }
@@ -176,22 +184,32 @@ pub async fn set_rsvp(
     super::require_events_enabled().await?;
 
     let event = db.fetch_event(target.id).await?;
-    if event.cancelled {
-        return Err(create_error!(InvalidOperation));
-    }
 
     // RSVP authority must track LIVE membership/permission, not a stale invite row
     // (a removed/banned user, or one who lost ViewChannel, must not keep attending).
-    // EXCEPTION: the withdraw transition (`NotGoing`) needs only live membership — a
-    // user who lost view (e.g. the event moved to a channel they cannot see) must
-    // always be able to escape `Going` and its reminder pushes.
+    // EXCEPTION: the withdraw transition (`NotGoing`) needs live membership plus
+    // either view or an existing RSVP row — a user who lost view (e.g. the event moved to a channel they cannot see) must
+    // always be able to escape `Going` and its reminder pushes. These gates run
+    // before the cancelled check, so callers who cannot see the event get the same
+    // `NotFound` whether it is live, cancelled or missing.
     let target_status = super::status_from_wire(data.into_inner().status);
     if matches!(target_status, RsvpStatus::NotGoing) {
         db.fetch_member(&event.server, &user.id)
             .await
             .map_err(|_| create_error!(NotFound))?;
+        // The escape is for users holding an RSVP row; a member who cannot view
+        // the event and holds no row learns nothing about it.
+        if super::authorize_view(db, &user, &event).await.is_err()
+            && db.fetch_rsvp(&event.id, &user.id).await.is_err()
+        {
+            return Err(create_error!(NotFound));
+        }
     } else {
         super::authorize_view(db, &user, &event).await?;
+    }
+
+    if event.cancelled {
+        return Err(create_error!(InvalidOperation));
     }
 
     // Only invited users may RSVP: they must already have a row (design §6/§7).

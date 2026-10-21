@@ -1,14 +1,16 @@
 use std::collections::HashMap;
 
 use revolt_database::{
-    events::client::EventV1, util::permissions::DatabasePermissionQuery,
-    util::reference::Reference, CalendarEvent, Database, MessageFilter, MessageQuery,
-    MessageTimePeriod, User,
+    events::client::EventV1,
+    util::event_visibility::{
+        require_event_channel_view, resolve_event_channel_target, user_can_view_channel,
+    },
+    util::permissions::DatabasePermissionQuery,
+    util::reference::Reference,
+    CalendarEvent, Database, MessageFilter, MessageQuery, MessageTimePeriod, User,
 };
 use revolt_models::v0;
-use revolt_permissions::{
-    calculate_channel_permissions, calculate_server_permissions, ChannelPermission,
-};
+use revolt_permissions::{calculate_server_permissions, ChannelPermission};
 use revolt_result::{create_error, ErrorType, Result};
 use rocket::{serde::json::Json, State};
 use serde::Deserialize;
@@ -90,15 +92,10 @@ pub async fn import_legacy_events(
 
     // The source channel must belong to this server AND be viewable by the caller —
     // a manager denied ViewChannel on a private channel must not be able to turn its
-    // tagged content into server-visible events.
+    // tagged content into server-visible events. A thread is judged by its parent;
+    // a channel outside the server is InvalidOperation, a hidden one NotFound.
     let channel = db.fetch_channel(&data.channel).await?;
-    if channel.server() != Some(server.id.as_str()) {
-        return Err(create_error!(InvalidOperation));
-    }
-    let mut query = DatabasePermissionQuery::new(db, &user).channel(&channel);
-    calculate_channel_permissions(&mut query)
-        .await
-        .throw_if_lacking_channel_permission(ChannelPermission::ViewChannel)?;
+    require_event_channel_view(db, &user, &server.id, &channel).await?;
 
     // Dedup set: everything this server already imported (finding M5), extended with
     // this run's inserts so a duplicate tag within one scan imports once.
@@ -183,21 +180,21 @@ pub async fn import_legacy_events(
                 Some(vid) => match voice_cache.get(vid) {
                     Some(cached) => cached.clone(),
                     None => {
-                        let validated = match db.fetch_channel(vid).await {
+                        // A thread or forum post is judged by its parent; one that
+                        // cannot be resolved degrades like any other unusable id.
+                        let target = match db.fetch_channel(vid).await {
                             Ok(vc) if vc.server() == Some(server.id.as_str()) => {
-                                let mut q =
-                                    DatabasePermissionQuery::new(db, &user).channel(&vc);
-                                if calculate_channel_permissions(&mut q)
-                                    .await
-                                    .has_channel_permission(ChannelPermission::ViewChannel)
-                                {
-                                    Some(vid.clone())
-                                } else {
-                                    None
-                                }
+                                resolve_event_channel_target(db, &vc).await
                             }
                             _ => None,
                         };
+                        let visible = match &target {
+                            Some(target) => {
+                                user_can_view_channel(db, &user, &server.id, target).await
+                            }
+                            None => false,
+                        };
+                        let validated = visible.then(|| vid.clone());
                         voice_cache.insert(vid.clone(), validated.clone());
                         validated
                     }

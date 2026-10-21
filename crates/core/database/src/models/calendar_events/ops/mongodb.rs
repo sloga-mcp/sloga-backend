@@ -55,6 +55,69 @@ impl AbstractCalendarEvents for MongoDb {
             .await)
     }
 
+    async fn fetch_upcoming_oneoffs_for_server(
+        &self,
+        server_id: &str,
+        from: i64,
+        to: i64,
+        offset: usize,
+        limit: usize,
+    ) -> Result<Vec<CalendarEvent>> {
+        // Mongo treats `limit(0)` as "no limit"; zero rows were asked for.
+        if limit == 0 {
+            return Ok(vec![]);
+        }
+        // `recurrence: null` matches an absent field (how `None` is stored, via
+        // `skip_serializing_if`) AND an explicit null. `cancelled` is omitted while false,
+        // so `$ne: true` (not `false`) matches both the absent and the explicit-false rows.
+        self.find_with_options::<_, CalendarEvent>(
+            COL_EVENTS,
+            doc! {
+                "server": server_id,
+                "recurrence": null,
+                "cancelled": { "$ne": true },
+                "start": { "$gte": from, "$lte": to },
+            },
+            FindOptions::builder()
+                .sort(doc! { "start": 1_i32, "_id": 1_i32 })
+                .skip(saturating_i64(offset).unsigned_abs())
+                .limit(saturating_i64(limit))
+                .build(),
+        )
+        .await
+        .map_err(|_| create_database_error!("find", COL_EVENTS))
+    }
+
+    async fn fetch_upcoming_series_for_server(
+        &self,
+        server_id: &str,
+        from: i64,
+        to: i64,
+        limit: usize,
+    ) -> Result<Vec<CalendarEvent>> {
+        // Mongo treats `limit(0)` as "no limit"; zero rows were asked for.
+        if limit == 0 {
+            return Ok(vec![]);
+        }
+        // `$ne: null` = the field is present and non-null, i.e. a recurring series.
+        self.find_with_options::<_, CalendarEvent>(
+            COL_EVENTS,
+            doc! {
+                "server": server_id,
+                "recurrence": { "$ne": null },
+                "cancelled": { "$ne": true },
+                "start": { "$lte": to },
+                "series_end": { "$gte": from },
+            },
+            FindOptions::builder()
+                .sort(doc! { "start": 1_i32, "_id": 1_i32 })
+                .limit(saturating_i64(limit))
+                .build(),
+        )
+        .await
+        .map_err(|_| create_database_error!("find", COL_EVENTS))
+    }
+
     async fn update_event(
         &self,
         id: &str,
@@ -387,6 +450,12 @@ impl MongoDb {
             .collect()
             .await)
     }
+}
+
+/// A `usize` row count as the int64 Mongo sends for `skip`/`limit`, saturating instead of
+/// wrapping or panicking.
+fn saturating_i64(n: usize) -> i64 {
+    i64::try_from(n).unwrap_or(i64::MAX)
 }
 
 impl IntoDocumentPath for FieldsCalendarEvent {

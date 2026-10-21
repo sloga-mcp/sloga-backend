@@ -30,6 +30,32 @@ pub trait AbstractCalendarEvents: Sync + Send {
         to: i64,
     ) -> Result<Vec<CalendarEvent>>;
 
+    /// Non-recurring, non-cancelled events of one server with `start` in `[from, to]`,
+    /// ordered by (start, id) ascending, skipping `offset`, at most `limit` rows.
+    /// Used by the cross-server upcoming route, which pages this per server.
+    /// A page shorter than `limit` does not imply the end of the results (unreadable rows
+    /// are skipped); callers advance `offset` by the requested page size and stop on an
+    /// empty page or their own scan budget.
+    async fn fetch_upcoming_oneoffs_for_server(
+        &self,
+        server_id: &str,
+        from: i64,
+        to: i64,
+        offset: usize,
+        limit: usize,
+    ) -> Result<Vec<CalendarEvent>>;
+
+    /// Recurring, non-cancelled series of one server whose span overlaps the window
+    /// (`series_end >= from AND start <= to`), ordered by (start, id) ascending, at most `limit` rows.
+    /// May return fewer than `limit` rows even when more exist (unreadable rows are skipped).
+    async fn fetch_upcoming_series_for_server(
+        &self,
+        server_id: &str,
+        from: i64,
+        to: i64,
+        limit: usize,
+    ) -> Result<Vec<CalendarEvent>>;
+
     /// Update an event with a partial and a list of fields to unset.
     /// NOTE: does NOT recompute derived fields — only for non-time edits. Time/recurrence
     /// changes must go through `CalendarEvent::edit` (which uses `replace_event`).

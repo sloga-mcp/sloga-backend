@@ -147,7 +147,8 @@ it resolves the same Rocket mount-prefix hazard (no dynamic-first segment can co
 and is what stoat.js + the frontend (slice E) bind against. Concrete paths:
 `POST|GET /events/server/<server>`; `GET|PATCH|DELETE /events/event/<event>`;
 `POST /events/event/<event>/invites`; `DELETE /events/event/<event>/invites/<user>`;
-`PUT /events/event/<event>/rsvp`; `GET /events/event/<event>/attendees?limit=&before=`.
+`PUT /events/event/<event>/rsvp`; `GET /events/event/<event>/attendees?limit=&before=`;
+`GET /events/@me/upcoming?from=&to=&limit=` (cross-server list, below).
 
 Original (superseded) sketch:
 
@@ -178,6 +179,38 @@ Original (superseded) sketch:
 - **[fixes C1] Per-event view filter**: `GET /servers/<server>/events` must filter each event whose
   `channel` the caller cannot `ViewChannel` — server membership alone is insufficient.
 - **[fixes L3]** GET list caps returned events + expanded occurrences; heavy daily×1yr case is bounded.
+- **Cross-server upcoming list**: `GET /events/@me/upcoming?from=<ms>&to=<ms>&limit=<n>`
+  (`routes/events/upcoming.rs`, OpenAPI tag `Calendar`). The soonest events the caller can view
+  across every server they are a member of (Home's "Upcoming" card). Feature-gated like the other
+  calendar routes (`FeatureDisabled`); bots get 400 `IsBot`.
+  - **Window**: `from` and `to` are required. Missing, unparseable, inverted, or wider than
+    `MAX_UPCOMING_WINDOW_MS` = 62 days is 400 `FailedValidation{window}`, never a 404 forward. The
+    span is a checked subtraction, so i64 extremes are a 400, not a panic. Both ends are inclusive.
+  - **Limit**: default 20 (`DEFAULT_LIMIT`), accepted 1..=100 (`MAX_LIMIT`); 0, negative or over
+    100 is 400 `FailedValidation{limit}`. A non-numeric `limit` reads as absent and gets the default.
+  - **Visibility**: the same rules as `list_events` (membership, ViewChannel on the event's channel,
+    a thread or forum post judged by its parent channel), through `EventViewer`. An event whose
+    channel resolves to a different server than the event's own is never listed.
+  - **Cancelled**: cancelled series are excluded here (unlike `list_events`, 0.2-A).
+  - **Ranking**: `occ = occurrences_in_window(e, from, to)` kept only where `start >= from`, so
+    excepted occurrences and an occurrence already in progress at `from` drop out; an event with an
+    empty `occ` is dropped; key = `occ[0]` (the first occurrence at or after `from`, not the series
+    anchor); rows are sorted by (key, event id) and cut to `limit` after visibility. Each row's
+    `occurrences` is `occ`.
+  - **Response**: `Vec<v0::EventWithOccurrences>`, the same type as `list_events`, with no wrapper.
+  - **Bounds**: at most `MAX_UPCOMING_SERVERS` = 200 memberships, lowest server id first (the cut is
+    logged); 8 servers in flight with results kept in order. Per server: one-offs are read ordered by
+    (start, id) in pages of `PAGE` = 100, with visibility applied per page, until `limit` visible
+    one-offs are found or the scan budget of `SCAN_BUDGET` = 500 rows is spent; recurring series are
+    capped at `SERIES_CAP` = 200, taken in (anchor start, id) order before the visibility check. Both
+    caps are logged when hit. A database error fails the request; a per-event visibility problem
+    only skips that event.
+  - **Rate limit**: its own bucket `events_me`, 10 per 10 s, separate from the shared `events`
+    bucket (30 per 10 s) that `list_events` uses.
+  - **Never NotFound**: a caller with no servers, or with nothing visible in the window, gets 200
+    `[]`. Clients read an untyped 404 (Rocket's default HTML 404 from a server that predates the
+    route) as "route missing" and fall back to per-server `list_events`, so an internal `NotFound`
+    is reported as `InternalError` instead.
 - Every route registered in the router **and** `#[openapi]`-annotated.
 
 ## 6. Authorization
@@ -197,6 +230,17 @@ Reuse existing permissions — **no new bitfield v1**. `DatabasePermissionQuery`
 - **RSVP**: caller must be a server member **and** already have an RSVP row for the event (was invited).
   Non-invited users cannot RSVP. IDOR-safe (acting user from session).
 - **View**: server member with `ViewChannel` on the event's channel (or server-wide if `channel=None`).
+- **Threads and forum posts**: an event in a thread (or forum post) takes the parent channel's
+  permissions for every check above (view, create, edit, invite, import), including the parent's
+  role and default overrides, and `ManageChannel` is evaluated on the parent. View denials return
+  `NotFound`, the same as a missing event; the RSVP, edit and invite routes check view or manage
+  rights before reporting that an event is cancelled.
+- **Deleted channels**: if the event's channel can no longer be resolved (deleted channel or deleted
+  parent), the event is hidden and only its creator may edit it, manage its invites or link a
+  soft-res sheet to it. Cancelling falls back to server-wide `ManageChannel`, so managers can still
+  clean such events up. On the manage paths and the RSVP prune after a move, a lookup failure other
+  than "not found" (for the channel or a thread's parent) fails the request or skips the prune; the
+  view paths hide the event on any lookup failure.
 
 ## 7. RSVP state machine (server-enforced)
 

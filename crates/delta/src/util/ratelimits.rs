@@ -380,6 +380,12 @@ impl<'a> RatelimitResolver<Request<'a>> for DeltaRatelimits {
                 // tight dedicated buckets — invites fan out to notifications in slice D.
                 ("events", Some("server"), Method::Post) => ("events_create", extra),
                 ("events", Some("event"), Method::Post) => ("events_invite", extra),
+                // The caller's cross-server upcoming list (GET /events/@me/upcoming)
+                // scans every server the caller is in, so it gets a tighter bucket of
+                // its own and never spends the per-server reads' budget. This arm
+                // must sit ABOVE the ("events", _, _) fallback. HEAD is included
+                // because Rocket answers an unmatched HEAD with the GET handler.
+                ("events", Some("@me"), Method::Get | Method::Head) => ("events_me", None),
                 ("events", _, _) => ("events", None),
                 // GIF picker proxy — search fires per keystroke, so give it
                 // headroom above the shared "any" bucket (server-side caching
@@ -504,6 +510,9 @@ impl<'a> RatelimitResolver<Request<'a>> for DeltaRatelimits {
             "events_create" => 10,
             "events_invite" => 5,
             "events" => 30,
+            // The cross-server upcoming list: Home asks once per load, and
+            // each request scans every server the caller is in.
+            "events_me" => 10,
             "thread_create" => 5,
             "forum_post_create" => 5,
             "interaction_create" => 10,
@@ -1326,6 +1335,120 @@ mod tests {
             any.headers().get_one("X-RateLimit-Remaining"),
             Some("18"),
             "the any bucket has spent exactly its own two requests"
+        );
+    }
+
+    #[rocket::get("/@me/upcoming?<from>&<to>&<limit>")]
+    fn events_upcoming(from: Option<i64>, to: Option<i64>, limit: Option<i64>) -> &'static str {
+        let _ = (from, to, limit);
+        "[]"
+    }
+
+    #[rocket::get("/server/<_server>?<from>&<to>")]
+    fn events_list(_server: &str, from: Option<i64>, to: Option<i64>) -> &'static str {
+        let _ = (from, to);
+        "[]"
+    }
+
+    /// The calendar routes, on the same database-free Rocket as `client()`.
+    fn events_client() -> Client {
+        let rocket = rocket::build()
+            .manage(RatelimitStorage::new(DeltaRatelimits))
+            .attach(RatelimitFairing)
+            .mount("/", revolt_ratelimits::rocket::routes())
+            .mount("/events", rocket::routes![events_upcoming, events_list]);
+        Client::untracked(rocket).expect("rocket builds without a database")
+    }
+
+    /// GET and HEAD /events/@me/upcoming resolve to their own `events_me` bucket
+    /// (limit 10); the per-server calendar reads stay on `events`.
+    #[test]
+    fn upcoming_events_have_their_own_bucket() {
+        use revolt_ratelimits::ratelimiter::RatelimitResolver;
+
+        let client = events_client();
+
+        // The resolver itself, before routing, exactly as `on_request` runs it.
+        for path in [
+            "/events/@me/upcoming?from=0&to=1",
+            "/events/@me/upcoming",
+            "/0.8/events/@me/upcoming?from=0&to=1&limit=5",
+        ] {
+            assert_eq!(
+                DeltaRatelimits.resolve_bucket(&*client.get(path)),
+                ("events_me", None),
+                "GET {path}"
+            );
+            assert_eq!(
+                DeltaRatelimits.resolve_bucket(&*client.head(path)),
+                ("events_me", None),
+                "HEAD {path}"
+            );
+        }
+        for path in [
+            "/events/server/01SRV?from=0&to=1",
+            "/0.8/events/server/01SRV?from=0&to=1",
+            "/events/event/01EVT",
+        ] {
+            assert_eq!(
+                DeltaRatelimits.resolve_bucket(&*client.get(path)),
+                ("events", None),
+                "GET {path}"
+            );
+        }
+        assert_eq!(
+            DeltaRatelimits.resolve_bucket(&*client.post("/events/server/01SRV")),
+            ("events_create", Some("01SRV")),
+            "event creation keeps its own per-server bucket"
+        );
+        assert_eq!(DeltaRatelimits.resolve_bucket_limit("events_me"), 10);
+
+        // Through the fairing: limit 10, a counter distinct from `events`.
+        let upcoming = client.get("/events/@me/upcoming?from=0&to=1").dispatch();
+        assert_eq!(upcoming.status(), Status::Ok);
+        assert_eq!(limit(&upcoming), 10);
+
+        let list = client.get("/events/server/01SRV?from=0&to=1").dispatch();
+        assert_eq!(list.status(), Status::Ok);
+        assert_eq!(limit(&list), 30);
+        assert_ne!(
+            bucket(&upcoming),
+            bucket(&list),
+            "the upcoming list must not share the per-server read counter"
+        );
+
+        // A HEAD is answered by the GET handler, so it spends the same counter.
+        let head = client.head("/events/@me/upcoming?from=0&to=1").dispatch();
+        assert_eq!(head.status(), Status::Ok);
+        assert_eq!(limit(&head), 10);
+        assert_eq!(bucket(&head), bucket(&upcoming));
+        assert_eq!(head.headers().get_one("X-RateLimit-Remaining"), Some("8"));
+
+        // Eight more fit the window (ten in all); the next is refused.
+        for _ in 0..8 {
+            assert_eq!(
+                client
+                    .get("/events/@me/upcoming?from=0&to=1")
+                    .dispatch()
+                    .status(),
+                Status::Ok
+            );
+        }
+        assert_eq!(
+            client
+                .get("/events/@me/upcoming?from=0&to=1")
+                .dispatch()
+                .status(),
+            Status::TooManyRequests
+        );
+
+        // The per-server reads are untouched by the spent upcoming budget.
+        let list = client.get("/events/server/01SRV?from=0&to=1").dispatch();
+        assert_eq!(list.status(), Status::Ok);
+        assert_eq!(
+            list.headers().get_one("X-RateLimit-Remaining"),
+            Some("28"),
+            "the events bucket has spent exactly its own two requests"
         );
     }
 }

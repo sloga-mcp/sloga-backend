@@ -1122,7 +1122,7 @@ async fn import_requires_viewable_in_server_channel_case() {
         .body(json!({ "channel": channels[0].id() }).to_string())
         .dispatch()
         .await;
-    assert_ne!(response.status(), Status::Ok);
+    assert_eq!(response.status(), Status::BadRequest);
 
     // Grant the manager server-wide ManageChannel via a role, then deny ViewChannel
     // on the channel itself: manager authority without readability.
@@ -2443,9 +2443,9 @@ async fn edit_moves_event_into_channel_and_prunes_blind_rsvps_case() {
         .body(json!({ "channel": channel_id }).to_string())
         .dispatch()
         .await;
-    assert_ne!(
+    assert_eq!(
         response.status(),
-        Status::Ok,
+        Status::Forbidden,
         "a non-manager must not move the event at all"
     );
 
@@ -2493,7 +2493,7 @@ async fn edit_moves_event_into_channel_and_prunes_blind_rsvps_case() {
         ))
         .dispatch()
         .await;
-    assert_ne!(response.status(), Status::Ok);
+    assert_eq!(response.status(), Status::NotFound);
 }
 
 /// A cross-server channel is rejected as an edit target.
@@ -2554,9 +2554,9 @@ async fn edit_rejects_cross_server_channel_case() {
         .body(json!({ "channel": foreign_channel }).to_string())
         .dispatch()
         .await;
-    assert_ne!(
+    assert_eq!(
         response.status(),
-        Status::Ok,
+        Status::BadRequest,
         "a channel from another server must be rejected"
     );
 
@@ -2712,9 +2712,2362 @@ async fn notgoing_escape_survives_lost_view_case() {
         .body(json!({ "status": "Going" }).to_string())
         .dispatch()
         .await;
-    assert_ne!(
+    assert_eq!(
         response.status(),
-        Status::Ok,
+        Status::NotFound,
         "Going must stay behind the view gate"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Cross-server upcoming list: GET /events/@me/upcoming. The caller's soonest
+// visible events across every server they are in, ranked by each event's first
+// occurrence at or after `from`. The route has its own rate bucket
+// (`events_me`, 10 per 10 s per session), so no test spends more than nine
+// upcoming calls on one session. Events are seeded through
+// `CalendarEvent::create`, which derives `duration_ms` and `series_end`. The
+// helpers below are used only by the tests in this block.
+// ---------------------------------------------------------------------------
+
+const UPCOMING_MINUTE: i64 = 60 * 1000;
+const UPCOMING_HOUR: i64 = 60 * UPCOMING_MINUTE;
+const UPCOMING_DAY: i64 = 24 * UPCOMING_HOUR;
+const UPCOMING_T0: i64 = 1_900_000_000_000;
+/// The route's window cap: 62 days.
+const UPCOMING_MAX_WINDOW: i64 = 62 * UPCOMING_DAY;
+
+/// The shape of a seeded event; `timezone` defaults to UTC.
+#[derive(Default)]
+struct UpcomingSeed<'a> {
+    start: i64,
+    end: Option<i64>,
+    timezone: Option<&'a str>,
+    recurrence: Option<revolt_database::RecurrenceRule>,
+    channel: Option<&'a str>,
+}
+
+/// A server-wide one-off starting at `start`, with no end.
+fn upcoming_at<'a>(start: i64) -> UpcomingSeed<'a> {
+    UpcomingSeed {
+        start,
+        ..Default::default()
+    }
+}
+
+/// A weekly rule that ends after `count` occurrences and skips `exceptions`.
+fn upcoming_weekly(count: u16, exceptions: Vec<i64>) -> revolt_database::RecurrenceRule {
+    revolt_database::RecurrenceRule {
+        freq: revolt_database::Frequency::Weekly,
+        interval: 1,
+        by_weekday: vec![],
+        end: revolt_database::RecurrenceEnd::Count { count },
+        exceptions,
+    }
+}
+
+/// Store an event through the model's create path. It runs no membership or
+/// channel checks, so a test can also plant a corrupted row with it.
+async fn upcoming_seed(
+    harness: &TestHarness,
+    server_id: &str,
+    creator: &User,
+    title: &str,
+    seed: UpcomingSeed<'_>,
+) -> revolt_database::CalendarEvent {
+    revolt_database::CalendarEvent::create(
+        &harness.db,
+        server_id.to_string(),
+        creator.id.clone(),
+        title.to_string(),
+        None,
+        None,
+        seed.start,
+        seed.end,
+        false,
+        seed.timezone.unwrap_or("UTC").to_string(),
+        seed.recurrence,
+        None,
+        seed.channel.map(str::to_string),
+        None,
+    )
+    .await
+    .expect("seed event")
+}
+
+/// Deny ViewChannel to everyone below the owner on `channel`.
+async fn upcoming_hide_channel(harness: &TestHarness, channel: &mut revolt_database::Channel) {
+    use revolt_database::PartialChannel;
+    use revolt_permissions::{ChannelPermission, OverrideField};
+
+    channel
+        .update(
+            &harness.db,
+            PartialChannel {
+                default_permissions: Some(OverrideField {
+                    a: 0,
+                    d: ChannelPermission::ViewChannel as i64,
+                }),
+                ..Default::default()
+            },
+            vec![],
+        )
+        .await
+        .expect("deny view");
+}
+
+/// A thread under `parent`, created by `creator`.
+async fn upcoming_thread(
+    harness: &TestHarness,
+    parent: &revolt_database::Channel,
+    creator: &User,
+    name: &str,
+) -> revolt_database::Channel {
+    revolt_database::Channel::create_thread(
+        &harness.db,
+        parent,
+        creator,
+        None,
+        v0::DataCreateThread {
+            name: name.to_string(),
+            auto_archive_minutes: None,
+        },
+    )
+    .await
+    .expect("thread")
+}
+
+/// `?from=<from>&to=<to>`, plus `&limit=<limit>` when given.
+fn upcoming_query(from: i64, to: i64, limit: Option<i64>) -> String {
+    match limit {
+        Some(limit) => format!("?from={from}&to={to}&limit={limit}"),
+        None => format!("?from={from}&to={to}"),
+    }
+}
+
+/// One `GET /events/@me/upcoming{query}`. `auth` is a header name and its
+/// token; None sends no credentials. Returns the status and the body parsed as
+/// JSON (Null when it is not JSON).
+async fn upcoming_get(
+    harness: &TestHarness,
+    auth: Option<(&str, &str)>,
+    query: &str,
+) -> (Status, serde_json::Value) {
+    let mut request = harness.client.get(format!("/events/@me/upcoming{query}"));
+    if let Some((name, token)) = auth {
+        request = request.header(Header::new(name.to_string(), token.to_string()));
+    }
+    let response = request.dispatch().await;
+    let status = response.status();
+    let text = response.into_string().await.unwrap_or_default();
+    let value = serde_json::from_str(&text).unwrap_or(serde_json::Value::Null);
+    (status, value)
+}
+
+/// A session call that must answer 200, parsed as the route's response type.
+async fn upcoming_ok(
+    harness: &TestHarness,
+    token: &str,
+    query: &str,
+) -> Vec<v0::EventWithOccurrences> {
+    let (status, body) = upcoming_get(harness, Some(("x-session-token", token)), query).await;
+    assert_eq!(
+        status,
+        Status::Ok,
+        "GET /events/@me/upcoming{query}: {body}"
+    );
+    serde_json::from_value(body).expect("upcoming list")
+}
+
+/// A session call that must answer 400 `FailedValidation` naming `field`.
+async fn upcoming_rejects(harness: &TestHarness, token: &str, query: &str, field: &str) {
+    let (status, body) = upcoming_get(harness, Some(("x-session-token", token)), query).await;
+    assert_eq!(
+        status,
+        Status::BadRequest,
+        "GET /events/@me/upcoming{query}: {body}"
+    );
+    assert_eq!(body["type"], "FailedValidation", "{query}: {body}");
+    assert_eq!(body["error"], field, "{query}: {body}");
+}
+
+/// The titles of a response, in order.
+fn upcoming_titles(rows: &[v0::EventWithOccurrences]) -> Vec<&str> {
+    rows.iter().map(|row| row.event.title.as_str()).collect()
+}
+
+/// The event ids of a response, in order.
+fn upcoming_ids(rows: &[v0::EventWithOccurrences]) -> Vec<&str> {
+    rows.iter().map(|row| row.event.id.as_str()).collect()
+}
+
+/// The ids of seeded one-offs in the route's order: (start, id) ascending.
+fn upcoming_expected_order(events: &[revolt_database::CalendarEvent]) -> Vec<&str> {
+    let mut keyed: Vec<(i64, &str)> = events
+        .iter()
+        .map(|event| (event.start, event.id.as_str()))
+        .collect();
+    keyed.sort();
+    keyed.into_iter().map(|(_, id)| id).collect()
+}
+
+/// `GET /events/server/<server>` over the same window: the occurrence oracle.
+/// It spends the shared `events` bucket, not `events_me`.
+async fn upcoming_list_oracle(
+    harness: &TestHarness,
+    token: &str,
+    server_id: &str,
+    from: i64,
+    to: i64,
+) -> Vec<v0::EventWithOccurrences> {
+    let response = harness
+        .client
+        .get(format!("/events/server/{server_id}?from={from}&to={to}"))
+        .header(Header::new("x-session-token", token.to_string()))
+        .dispatch()
+        .await;
+    assert_eq!(response.status(), Status::Ok);
+    response
+        .into_json::<Vec<v0::EventWithOccurrences>>()
+        .await
+        .expect("list")
+}
+
+/// Two member servers come back as one list ordered by first occurrence, and a
+/// server the caller is not in contributes nothing, not even its soonest event.
+#[test]
+fn upcoming_merges_member_servers_by_first_occurrence() {
+    crate::util::test::rt().block_on(upcoming_merges_member_servers_by_first_occurrence_case())
+}
+
+async fn upcoming_merges_member_servers_by_first_occurrence_case() {
+    let harness = TestHarness::new().await;
+    let (_, owner_session, owner) = harness.new_user().await;
+    let (_, guest_session, guest) = harness.new_user().await;
+    let server_a = make_server(&harness, &owner).await;
+    let server_b = make_server(&harness, &owner).await;
+    let outside = make_server(&harness, &owner).await;
+    for server in [&server_a, &server_b] {
+        Member::create(&harness.db, server, &guest, None)
+            .await
+            .expect("guest member");
+    }
+
+    // Created out of order, interleaved across the two servers.
+    let hour = |n: i64| upcoming_at(UPCOMING_T0 + n * UPCOMING_HOUR);
+    upcoming_seed(&harness, &server_a.id, &owner, "a3", hour(3)).await;
+    upcoming_seed(&harness, &server_b.id, &owner, "b4", hour(4)).await;
+    upcoming_seed(&harness, &server_a.id, &owner, "a1", hour(1)).await;
+    upcoming_seed(&harness, &server_b.id, &owner, "b2", hour(2)).await;
+    // The soonest event of all, in a server the guest is not in.
+    let soonest = upcoming_at(UPCOMING_T0 + 30 * UPCOMING_MINUTE);
+    upcoming_seed(&harness, &outside.id, &owner, "outside", soonest).await;
+
+    let query = upcoming_query(UPCOMING_T0, UPCOMING_T0 + UPCOMING_DAY, None);
+    let rows = upcoming_ok(&harness, &guest_session.token, &query).await;
+    assert_eq!(upcoming_titles(&rows), ["a1", "b2", "a3", "b4"]);
+    let servers: Vec<&str> = rows.iter().map(|row| row.event.server.as_str()).collect();
+    assert_eq!(
+        servers,
+        [
+            server_a.id.as_str(),
+            server_b.id.as_str(),
+            server_a.id.as_str(),
+            server_b.id.as_str()
+        ]
+    );
+    for row in &rows {
+        assert_eq!(
+            row.occurrences,
+            vec![row.event.start],
+            "a one-off's only occurrence is its start"
+        );
+    }
+
+    // Control: the owner is in all three servers and does get the outside event.
+    let rows = upcoming_ok(&harness, &owner_session.token, &query).await;
+    assert_eq!(upcoming_titles(&rows), ["outside", "a1", "b2", "a3", "b4"]);
+}
+
+/// A kicked member stops getting that server's events on the next call; their
+/// other server's events stay.
+#[test]
+fn upcoming_drops_a_server_after_a_kick() {
+    crate::util::test::rt().block_on(upcoming_drops_a_server_after_a_kick_case())
+}
+
+async fn upcoming_drops_a_server_after_a_kick_case() {
+    use revolt_database::RemovalIntention;
+
+    let harness = TestHarness::new().await;
+    let (_, _owner_session, owner) = harness.new_user().await;
+    let (_, guest_session, guest) = harness.new_user().await;
+    let server_a = make_server(&harness, &owner).await;
+    let server_b = make_server(&harness, &owner).await;
+    for server in [&server_a, &server_b] {
+        Member::create(&harness.db, server, &guest, None)
+            .await
+            .expect("guest member");
+    }
+    upcoming_seed(
+        &harness,
+        &server_a.id,
+        &owner,
+        "a",
+        upcoming_at(UPCOMING_T0 + UPCOMING_HOUR),
+    )
+    .await;
+    upcoming_seed(
+        &harness,
+        &server_b.id,
+        &owner,
+        "b",
+        upcoming_at(UPCOMING_T0 + 2 * UPCOMING_HOUR),
+    )
+    .await;
+
+    let query = upcoming_query(UPCOMING_T0, UPCOMING_T0 + UPCOMING_DAY, None);
+    let rows = upcoming_ok(&harness, &guest_session.token, &query).await;
+    assert_eq!(upcoming_titles(&rows), ["a", "b"]);
+
+    for (server, expected) in [(&server_a, vec!["b"]), (&server_b, vec![])] {
+        harness
+            .db
+            .fetch_member(&server.id, &guest.id)
+            .await
+            .expect("member row")
+            .remove(&harness.db, server, RemovalIntention::Kick, true)
+            .await
+            .expect("kick");
+        let rows = upcoming_ok(&harness, &guest_session.token, &query).await;
+        assert_eq!(
+            upcoming_titles(&rows),
+            expected,
+            "after the kick from {}",
+            server.id
+        );
+    }
+}
+
+/// An event in a channel the caller cannot view, or in a thread under such a
+/// channel, is left out for a plain member and kept for the owner. Events in a
+/// visible channel and in a thread under it stay for both.
+#[test]
+fn upcoming_hides_denied_channel_and_its_threads() {
+    crate::util::test::rt().block_on(upcoming_hides_denied_channel_and_its_threads_case())
+}
+
+async fn upcoming_hides_denied_channel_and_its_threads_case() {
+    let harness = TestHarness::new().await;
+    let (_, owner_session, owner) = harness.new_user().await;
+    let (_, guest_session, guest) = harness.new_user().await;
+    let server = make_server(&harness, &owner).await;
+    Member::create(&harness.db, &server, &guest, None)
+        .await
+        .expect("guest member");
+
+    let mut hidden = harness.new_channel(&server).await;
+    upcoming_hide_channel(&harness, &mut hidden).await;
+    let open = harness.new_channel(&server).await;
+    let hidden_thread = upcoming_thread(&harness, &hidden, &owner, "hidden thread").await;
+    let open_thread = upcoming_thread(&harness, &open, &owner, "open thread").await;
+
+    let seeds = [
+        ("wide", None),
+        ("hidden", Some(hidden.id())),
+        ("hidden thread", Some(hidden_thread.id())),
+        ("open thread", Some(open_thread.id())),
+        ("open", Some(open.id())),
+    ];
+    for (n, (title, channel)) in (1..).zip(seeds) {
+        let seed = UpcomingSeed {
+            channel,
+            ..upcoming_at(UPCOMING_T0 + n * UPCOMING_HOUR)
+        };
+        upcoming_seed(&harness, &server.id, &owner, title, seed).await;
+    }
+
+    let query = upcoming_query(UPCOMING_T0, UPCOMING_T0 + UPCOMING_DAY, None);
+    let rows = upcoming_ok(&harness, &guest_session.token, &query).await;
+    assert_eq!(
+        upcoming_titles(&rows),
+        ["wide", "open thread", "open"],
+        "a plain member must not get events in a hidden channel or its threads"
+    );
+
+    let rows = upcoming_ok(&harness, &owner_session.token, &query).await;
+    assert_eq!(
+        upcoming_titles(&rows),
+        ["wide", "hidden", "hidden thread", "open thread", "open"],
+        "the owner views every channel"
+    );
+}
+
+/// A corrupted row that claims server A but names a channel of server B is
+/// left out, even for a member of both who can view that channel, and even
+/// though a valid event in the same channel (in its real server) is listed
+/// first.
+#[test]
+fn upcoming_skips_event_naming_another_servers_channel() {
+    crate::util::test::rt().block_on(upcoming_skips_event_naming_another_servers_channel_case())
+}
+
+async fn upcoming_skips_event_naming_another_servers_channel_case() {
+    let harness = TestHarness::new().await;
+    let (_, owner_session, owner) = harness.new_user().await;
+    let (_, guest_session, guest) = harness.new_user().await;
+    // The assertion below holds whichever server is processed first: each server
+    // is checked with its own viewer, and the event's server is compared with the
+    // channel's on every check.
+    let server_b = make_server(&harness, &owner).await;
+    let server_a = make_server(&harness, &owner).await;
+    for server in [&server_a, &server_b] {
+        Member::create(&harness.db, server, &guest, None)
+            .await
+            .expect("guest member");
+    }
+    let channel_b = harness.new_channel(&server_b).await;
+
+    let at = |n: i64, channel| UpcomingSeed {
+        channel,
+        ..upcoming_at(UPCOMING_T0 + n * UPCOMING_HOUR)
+    };
+    upcoming_seed(
+        &harness,
+        &server_b.id,
+        &owner,
+        "valid",
+        at(1, Some(channel_b.id())),
+    )
+    .await;
+    let corrupt = upcoming_seed(
+        &harness,
+        &server_a.id,
+        &owner,
+        "corrupt",
+        at(2, Some(channel_b.id())),
+    )
+    .await;
+    upcoming_seed(&harness, &server_a.id, &owner, "a wide", at(3, None)).await;
+    assert_eq!(corrupt.server, server_a.id);
+
+    let query = upcoming_query(UPCOMING_T0, UPCOMING_T0 + UPCOMING_DAY, None);
+    for token in [&guest_session.token, &owner_session.token] {
+        let rows = upcoming_ok(&harness, token, &query).await;
+        assert_eq!(
+            upcoming_titles(&rows),
+            ["valid", "a wide"],
+            "an event whose channel lives in another server is never listed"
+        );
+    }
+}
+
+/// A weekly series anchored weeks before the window, in America/New_York across
+/// the November DST change, is listed with the same occurrences `list_events`
+/// returns for that server minus the one already in progress at `from`. It is
+/// ranked by its first occurrence at or after `from`, not by its anchor.
+#[test]
+fn upcoming_series_before_window_matches_list_oracle() {
+    crate::util::test::rt().block_on(upcoming_series_before_window_matches_list_oracle_case())
+}
+
+async fn upcoming_series_before_window_matches_list_oracle_case() {
+    // Tuesday 2030-10-01 18:00 EDT.
+    const ANCHOR: i64 = 1_917_122_400_000;
+    // 2030-10-29 22:30 UTC: 30 minutes into the 18:00 EDT occurrence.
+    const FROM: i64 = 1_919_543_400_000;
+    // 2030-11-20 00:00 UTC.
+    const TO: i64 = 1_921_363_200_000;
+    // 2030-10-29 18:00 EDT, then 2030-11-05, -12 and -19 18:00 EST.
+    const IN_PROGRESS: i64 = 1_919_541_600_000;
+    const AFTER_FROM: [i64; 3] = [1_920_150_000_000, 1_920_754_800_000, 1_921_359_600_000];
+
+    let harness = TestHarness::new().await;
+    let (_, session, owner) = harness.new_user().await;
+    let server = make_server(&harness, &owner).await;
+
+    let weekly = upcoming_seed(
+        &harness,
+        &server.id,
+        &owner,
+        "weekly",
+        UpcomingSeed {
+            start: ANCHOR,
+            end: Some(ANCHOR + 2 * UPCOMING_HOUR),
+            timezone: Some("America/New_York"),
+            recurrence: Some(upcoming_weekly(12, vec![])),
+            channel: None,
+        },
+    )
+    .await;
+    // Starts after the anchor but before the series' first occurrence >= FROM.
+    upcoming_seed(
+        &harness,
+        &server.id,
+        &owner,
+        "between",
+        upcoming_at(FROM + 3 * UPCOMING_DAY),
+    )
+    .await;
+
+    let oracle = upcoming_list_oracle(&harness, &session.token, &server.id, FROM, TO).await;
+    let oracle = oracle
+        .into_iter()
+        .find(|row| row.event.id == weekly.id)
+        .expect("list_events returns the series")
+        .occurrences;
+    let mut expected_oracle = vec![IN_PROGRESS];
+    expected_oracle.extend(AFTER_FROM);
+    assert_eq!(
+        oracle, expected_oracle,
+        "the oracle includes the occurrence in progress at `from`"
+    );
+    let expected: Vec<i64> = oracle.into_iter().filter(|start| *start >= FROM).collect();
+
+    let rows = upcoming_ok(&harness, &session.token, &upcoming_query(FROM, TO, None)).await;
+    assert_eq!(upcoming_titles(&rows), ["between", "weekly"]);
+    assert_eq!(rows[1].occurrences, expected);
+    assert_eq!(rows[1].occurrences, AFTER_FROM);
+    assert_eq!(
+        rows[1].occurrences[0] - IN_PROGRESS,
+        7 * UPCOMING_DAY + UPCOMING_HOUR,
+        "the wall-clock time holds across the DST change"
+    );
+    assert_eq!(rows[1].event.start, ANCHOR, "the row carries the series");
+}
+
+/// A series whose next occurrence is excepted is keyed on the occurrence after
+/// it, and the excepted start is not in its occurrences. An identical series
+/// without the exception is keyed on the excepted start, as a control.
+#[test]
+fn upcoming_excepted_next_occurrence_keys_on_the_following_one() {
+    crate::util::test::rt()
+        .block_on(upcoming_excepted_next_occurrence_keys_on_the_following_one_case())
+}
+
+async fn upcoming_excepted_next_occurrence_keys_on_the_following_one_case() {
+    let harness = TestHarness::new().await;
+    let (_, session, owner) = harness.new_user().await;
+    let server = make_server(&harness, &owner).await;
+
+    // Weekly from two weeks before T0, so T0 is the third occurrence.
+    let series = |exceptions| UpcomingSeed {
+        start: UPCOMING_T0 - 14 * UPCOMING_DAY,
+        end: Some(UPCOMING_T0 - 14 * UPCOMING_DAY + UPCOMING_HOUR),
+        recurrence: Some(upcoming_weekly(10, exceptions)),
+        ..Default::default()
+    };
+    upcoming_seed(
+        &harness,
+        &server.id,
+        &owner,
+        "excepted",
+        series(vec![UPCOMING_T0]),
+    )
+    .await;
+    upcoming_seed(&harness, &server.id, &owner, "plain", series(vec![])).await;
+    upcoming_seed(
+        &harness,
+        &server.id,
+        &owner,
+        "midweek",
+        upcoming_at(UPCOMING_T0 + 3 * UPCOMING_DAY),
+    )
+    .await;
+
+    let (from, to) = (UPCOMING_T0 - UPCOMING_HOUR, UPCOMING_T0 + 30 * UPCOMING_DAY);
+    let weeks = |from_week: i64| -> Vec<i64> {
+        (from_week..=4)
+            .map(|week| UPCOMING_T0 + week * 7 * UPCOMING_DAY)
+            .collect()
+    };
+
+    let rows = upcoming_ok(&harness, &session.token, &upcoming_query(from, to, None)).await;
+    assert_eq!(upcoming_titles(&rows), ["plain", "midweek", "excepted"]);
+    assert_eq!(rows[0].occurrences, weeks(0));
+    assert_eq!(
+        rows[2].occurrences,
+        weeks(1),
+        "the excepted start never appears"
+    );
+
+    let rows = upcoming_ok(&harness, &session.token, &upcoming_query(from, to, Some(2))).await;
+    assert_eq!(upcoming_titles(&rows), ["plain", "midweek"]);
+}
+
+/// Cancelled series and cancelled one-offs are left out, and so is anything
+/// whose only in-window occurrence started before `from`: a one-off in
+/// progress at `from`, and a series whose last occurrence is in progress. An
+/// event starting exactly at `from` is kept. `list_events` still returns all of
+/// them, so the exclusions are this route's own.
+#[test]
+fn upcoming_excludes_cancelled_and_already_started() {
+    crate::util::test::rt().block_on(upcoming_excludes_cancelled_and_already_started_case())
+}
+
+async fn upcoming_excludes_cancelled_and_already_started_case() {
+    let harness = TestHarness::new().await;
+    let (_, owner_session, owner) = harness.new_user().await;
+    let (_, guest_session, guest) = harness.new_user().await;
+    let server = make_server(&harness, &owner).await;
+    Member::create(&harness.db, &server, &guest, None)
+        .await
+        .expect("guest member");
+
+    let (from, to) = (UPCOMING_T0, UPCOMING_T0 + 7 * UPCOMING_DAY);
+    let cancelled_series = upcoming_seed(
+        &harness,
+        &server.id,
+        &owner,
+        "cancelled series",
+        UpcomingSeed {
+            recurrence: Some(upcoming_weekly(4, vec![])),
+            ..upcoming_at(from + UPCOMING_HOUR)
+        },
+    )
+    .await;
+    let cancelled_oneoff = upcoming_seed(
+        &harness,
+        &server.id,
+        &owner,
+        "cancelled one-off",
+        upcoming_at(from + 2 * UPCOMING_HOUR),
+    )
+    .await;
+    for event in [&cancelled_series, &cancelled_oneoff] {
+        let response = harness
+            .client
+            .delete(format!("/events/event/{}", event.id))
+            .header(Header::new(
+                "x-session-token",
+                owner_session.token.to_string(),
+            ))
+            .dispatch()
+            .await;
+        assert_eq!(response.status(), Status::NoContent);
+    }
+    upcoming_seed(
+        &harness,
+        &server.id,
+        &owner,
+        "in progress",
+        UpcomingSeed {
+            end: Some(from + UPCOMING_HOUR),
+            ..upcoming_at(from - UPCOMING_HOUR)
+        },
+    )
+    .await;
+    // Two weekly occurrences; the second runs from 30 minutes before `from`
+    // until 90 minutes after it.
+    let last_start = from - 30 * UPCOMING_MINUTE;
+    upcoming_seed(
+        &harness,
+        &server.id,
+        &owner,
+        "series in progress",
+        UpcomingSeed {
+            start: last_start - 7 * UPCOMING_DAY,
+            end: Some(last_start - 7 * UPCOMING_DAY + 2 * UPCOMING_HOUR),
+            recurrence: Some(upcoming_weekly(2, vec![])),
+            ..Default::default()
+        },
+    )
+    .await;
+    upcoming_seed(&harness, &server.id, &owner, "at from", upcoming_at(from)).await;
+    upcoming_seed(
+        &harness,
+        &server.id,
+        &owner,
+        "later",
+        upcoming_at(from + 3 * UPCOMING_HOUR),
+    )
+    .await;
+
+    // Oracle: the per-server list returns every one of them.
+    let listed = upcoming_list_oracle(&harness, &guest_session.token, &server.id, from, to).await;
+    let mut listed = upcoming_titles(&listed)
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    listed.sort();
+    assert_eq!(
+        listed,
+        [
+            "at from",
+            "cancelled one-off",
+            "cancelled series",
+            "in progress",
+            "later",
+            "series in progress"
+        ]
+    );
+
+    let rows = upcoming_ok(
+        &harness,
+        &guest_session.token,
+        &upcoming_query(from, to, None),
+    )
+    .await;
+    assert_eq!(upcoming_titles(&rows), ["at from", "later"]);
+    assert_eq!(rows[0].occurrences, vec![from]);
+}
+
+/// Bad windows are 400 `FailedValidation{window}`, never a 404 forward or a
+/// panic: inverted, longer than 62 days, i64 extremes, and missing or
+/// unparseable bounds. Exactly 62 days and a zero-length window are accepted
+/// and both ends are inclusive.
+#[test]
+fn upcoming_rejects_bad_windows() {
+    crate::util::test::rt().block_on(upcoming_rejects_bad_windows_case())
+}
+
+async fn upcoming_rejects_bad_windows_case() {
+    let harness = TestHarness::new().await;
+    let (_, session, owner) = harness.new_user().await;
+    let (_, other_session, _) = harness.new_user().await;
+    let server = make_server(&harness, &owner).await;
+    let start = UPCOMING_T0 + UPCOMING_HOUR;
+    upcoming_seed(&harness, &server.id, &owner, "event", upcoming_at(start)).await;
+
+    // Seven calls on the first session.
+    let token = &session.token;
+    let t0 = UPCOMING_T0;
+    upcoming_rejects(&harness, token, &upcoming_query(t0 + 1, t0, None), "window").await;
+    let over = t0 + UPCOMING_MAX_WINDOW + 1;
+    upcoming_rejects(&harness, token, &upcoming_query(t0, over, None), "window").await;
+    let rows = upcoming_ok(
+        &harness,
+        token,
+        &upcoming_query(t0, t0 + UPCOMING_MAX_WINDOW, None),
+    )
+    .await;
+    assert_eq!(
+        upcoming_titles(&rows),
+        ["event"],
+        "exactly 62 days is accepted"
+    );
+    let rows = upcoming_ok(&harness, token, &upcoming_query(start, start, None)).await;
+    assert_eq!(
+        upcoming_titles(&rows),
+        ["event"],
+        "from == to == start is kept"
+    );
+    for (from, to) in [(i64::MIN, i64::MAX), (i64::MAX, i64::MIN), (i64::MIN, 0)] {
+        upcoming_rejects(&harness, token, &upcoming_query(from, to, None), "window").await;
+    }
+
+    // Six calls on a second session.
+    let token = &other_session.token;
+    for query in [
+        format!("?to={t0}"),
+        format!("?from={t0}"),
+        String::new(),
+        format!("?from=abc&to={t0}"),
+        format!("?from=9223372036854775808&to={t0}"),
+        upcoming_query(0, i64::MAX, None),
+    ] {
+        upcoming_rejects(&harness, token, &query, "window").await;
+    }
+}
+
+/// `limit` defaults to 20 and accepts 1..=100; 0, 101 and -1 are 400
+/// `FailedValidation{limit}`. The rows are the soonest ones, in order.
+#[test]
+fn upcoming_limit_default_and_bounds() {
+    crate::util::test::rt().block_on(upcoming_limit_default_and_bounds_case())
+}
+
+async fn upcoming_limit_default_and_bounds_case() {
+    let harness = TestHarness::new().await;
+    let (_, session, owner) = harness.new_user().await;
+    let server = make_server(&harness, &owner).await;
+
+    // 25 hourly one-offs, created in a shuffled order (7 is coprime to 25).
+    for i in 0..25 {
+        let n = (i * 7) % 25;
+        let seed = upcoming_at(UPCOMING_T0 + n * UPCOMING_HOUR);
+        upcoming_seed(&harness, &server.id, &owner, &format!("e{n:02}"), seed).await;
+    }
+    let titles = |count: i64| -> Vec<String> { (0..count).map(|n| format!("e{n:02}")).collect() };
+
+    let (from, to) = (UPCOMING_T0, UPCOMING_T0 + 7 * UPCOMING_DAY);
+    let token = &session.token;
+    let rows = upcoming_ok(&harness, token, &upcoming_query(from, to, None)).await;
+    assert_eq!(
+        upcoming_titles(&rows),
+        titles(20),
+        "the default limit is 20"
+    );
+    let rows = upcoming_ok(&harness, token, &upcoming_query(from, to, Some(100))).await;
+    assert_eq!(upcoming_titles(&rows), titles(25));
+    let rows = upcoming_ok(&harness, token, &upcoming_query(from, to, Some(1))).await;
+    assert_eq!(upcoming_titles(&rows), titles(1));
+    for limit in [0, 101, -1] {
+        upcoming_rejects(
+            &harness,
+            token,
+            &upcoming_query(from, to, Some(limit)),
+            "limit",
+        )
+        .await;
+    }
+}
+
+/// With rows from two servers created in a shuffled order, `limit` keeps the
+/// soonest N overall in (first occurrence, id) order, not each server's first
+/// rows in server order.
+#[test]
+fn upcoming_returns_the_soonest_n_across_servers() {
+    crate::util::test::rt().block_on(upcoming_returns_the_soonest_n_across_servers_case())
+}
+
+async fn upcoming_returns_the_soonest_n_across_servers_case() {
+    let harness = TestHarness::new().await;
+    let (_, session, owner) = harness.new_user().await;
+    let server_a = make_server(&harness, &owner).await;
+    let server_b = make_server(&harness, &owner).await;
+
+    let mut seeded = Vec::new();
+    for (server, hours, title) in [
+        (&server_b, 5, "b5"),
+        (&server_a, 2, "a2"),
+        (&server_b, 1, "b1"),
+        (&server_a, 6, "a6"),
+        (&server_a, 4, "a4"),
+        (&server_b, 3, "b3"),
+        (&server_b, 7, "b7 tie"),
+        (&server_a, 7, "a7 tie"),
+    ] {
+        let seed = upcoming_at(UPCOMING_T0 + hours * UPCOMING_HOUR);
+        seeded.push(upcoming_seed(&harness, &server.id, &owner, title, seed).await);
+    }
+
+    let (from, to) = (UPCOMING_T0, UPCOMING_T0 + UPCOMING_DAY);
+    let rows = upcoming_ok(&harness, &session.token, &upcoming_query(from, to, Some(3))).await;
+    assert_eq!(upcoming_titles(&rows), ["b1", "a2", "b3"]);
+
+    // The 7-hour tie is broken by event id.
+    let rows = upcoming_ok(
+        &harness,
+        &session.token,
+        &upcoming_query(from, to, Some(100)),
+    )
+    .await;
+    assert_eq!(upcoming_ids(&rows), upcoming_expected_order(&seeded));
+    assert_eq!(rows.len(), 8);
+}
+
+/// A server with more than a page of near events cannot push another server's
+/// sooner-or-equal events out of the top `limit`, whatever the server order.
+#[test]
+fn upcoming_busy_server_cannot_crowd_out_another() {
+    crate::util::test::rt().block_on(upcoming_busy_server_cannot_crowd_out_another_case())
+}
+
+async fn upcoming_busy_server_cannot_crowd_out_another_case() {
+    let harness = TestHarness::new().await;
+    let (_, _owner_session, owner) = harness.new_user().await;
+    let (_, guest_session, guest) = harness.new_user().await;
+    // The busy server is created first, so it has the lower id.
+    let busy = make_server(&harness, &owner).await;
+    let quiet = make_server(&harness, &owner).await;
+    for server in [&busy, &quiet] {
+        Member::create(&harness.db, server, &guest, None)
+            .await
+            .expect("guest member");
+    }
+
+    // 150 one-offs a minute apart starting at T0.
+    let mut seeded = Vec::new();
+    for n in 0..150 {
+        let seed = upcoming_at(UPCOMING_T0 + n * UPCOMING_MINUTE);
+        seeded.push(upcoming_seed(&harness, &busy.id, &owner, &format!("busy {n}"), seed).await);
+    }
+    // Same keys as the busy server's first and third events.
+    let quiet_first = upcoming_seed(
+        &harness,
+        &quiet.id,
+        &owner,
+        "quiet first",
+        upcoming_at(UPCOMING_T0),
+    )
+    .await;
+    let third = upcoming_at(UPCOMING_T0 + 2 * UPCOMING_MINUTE);
+    let quiet_third = upcoming_seed(&harness, &quiet.id, &owner, "quiet third", third).await;
+    seeded.push(quiet_first.clone());
+    seeded.push(quiet_third.clone());
+    let expected = upcoming_expected_order(&seeded);
+
+    let (from, to) = (UPCOMING_T0, UPCOMING_T0 + UPCOMING_DAY);
+    for limit in [5, 100] {
+        let rows = upcoming_ok(
+            &harness,
+            &guest_session.token,
+            &upcoming_query(from, to, Some(limit)),
+        )
+        .await;
+        let ids = upcoming_ids(&rows);
+        assert_eq!(ids, expected[..limit as usize], "limit {limit}");
+        for quiet_event in [&quiet_first, &quiet_third] {
+            assert!(
+                ids.contains(&quiet_event.id.as_str()),
+                "limit {limit}: {} was crowded out",
+                quiet_event.title
+            );
+        }
+    }
+}
+
+/// More than a page of events in a hidden channel, all sooner than a visible
+/// event in the same server, cannot hide the visible one from a plain member.
+#[test]
+fn upcoming_hidden_rows_cannot_hide_a_visible_event() {
+    crate::util::test::rt().block_on(upcoming_hidden_rows_cannot_hide_a_visible_event_case())
+}
+
+async fn upcoming_hidden_rows_cannot_hide_a_visible_event_case() {
+    let harness = TestHarness::new().await;
+    let (_, owner_session, owner) = harness.new_user().await;
+    let (_, guest_session, guest) = harness.new_user().await;
+    let server = make_server(&harness, &owner).await;
+    Member::create(&harness.db, &server, &guest, None)
+        .await
+        .expect("guest member");
+    let mut hidden = harness.new_channel(&server).await;
+    upcoming_hide_channel(&harness, &mut hidden).await;
+
+    for n in 0..120 {
+        let seed = UpcomingSeed {
+            channel: Some(hidden.id()),
+            ..upcoming_at(UPCOMING_T0 + n * UPCOMING_MINUTE)
+        };
+        upcoming_seed(
+            &harness,
+            &server.id,
+            &owner,
+            &format!("hidden {n:03}"),
+            seed,
+        )
+        .await;
+    }
+    let later = upcoming_at(UPCOMING_T0 + 3 * UPCOMING_HOUR);
+    upcoming_seed(&harness, &server.id, &owner, "visible", later).await;
+
+    let (from, to) = (UPCOMING_T0, UPCOMING_T0 + UPCOMING_DAY);
+    for limit in [Some(1), None] {
+        let rows = upcoming_ok(
+            &harness,
+            &guest_session.token,
+            &upcoming_query(from, to, limit),
+        )
+        .await;
+        assert_eq!(upcoming_titles(&rows), ["visible"], "limit {limit:?}");
+    }
+
+    // Control: the hidden rows are real and sooner.
+    let rows = upcoming_ok(
+        &harness,
+        &owner_session.token,
+        &upcoming_query(from, to, Some(3)),
+    )
+    .await;
+    assert_eq!(
+        upcoming_titles(&rows),
+        ["hidden 000", "hidden 001", "hidden 002"]
+    );
+}
+
+/// The one-off scan stops once `limit` one-offs are visible, but series do not
+/// count toward that stop: a series keyed between those one-offs still takes its
+/// place in the cut, and one keyed after all of them is cut, as is the last
+/// one-off.
+#[test]
+fn upcoming_series_do_not_count_toward_the_oneoff_stop() {
+    crate::util::test::rt().block_on(upcoming_series_do_not_count_toward_the_oneoff_stop_case())
+}
+
+async fn upcoming_series_do_not_count_toward_the_oneoff_stop_case() {
+    let harness = TestHarness::new().await;
+    let (_, session, owner) = harness.new_user().await;
+    let server = make_server(&harness, &owner).await;
+
+    // Weekly series anchored a week before T0, so the anchor is outside the window
+    // and the key is the second occurrence.
+    let weekly_at = |hours: i64| UpcomingSeed {
+        start: UPCOMING_T0 - 7 * UPCOMING_DAY + hours * UPCOMING_HOUR,
+        end: Some(UPCOMING_T0 - 7 * UPCOMING_DAY + hours * UPCOMING_HOUR + UPCOMING_MINUTE),
+        recurrence: Some(upcoming_weekly(4, vec![])),
+        ..Default::default()
+    };
+    let early = upcoming_seed(&harness, &server.id, &owner, "early series", weekly_at(2)).await;
+    upcoming_seed(&harness, &server.id, &owner, "late series", weekly_at(6)).await;
+    for hours in [1, 3, 5] {
+        let seed = upcoming_at(UPCOMING_T0 + hours * UPCOMING_HOUR);
+        upcoming_seed(
+            &harness,
+            &server.id,
+            &owner,
+            &format!("one-off {hours}"),
+            seed,
+        )
+        .await;
+    }
+
+    let (from, to) = (UPCOMING_T0, UPCOMING_T0 + UPCOMING_DAY);
+    let rows = upcoming_ok(&harness, &session.token, &upcoming_query(from, to, Some(3))).await;
+    assert_eq!(
+        upcoming_titles(&rows),
+        ["one-off 1", "early series", "one-off 3"],
+        "the early series sits between the one-offs; the late series and the last one-off are cut"
+    );
+    assert_eq!(rows[1].event.id, early.id);
+    assert_eq!(rows[1].occurrences, vec![UPCOMING_T0 + 2 * UPCOMING_HOUR]);
+
+    // Control: with room for everything, the late series and the last one-off are listed.
+    let rows = upcoming_ok(
+        &harness,
+        &session.token,
+        &upcoming_query(from, to, Some(100)),
+    )
+    .await;
+    assert_eq!(
+        upcoming_titles(&rows),
+        [
+            "one-off 1",
+            "early series",
+            "one-off 3",
+            "one-off 5",
+            "late series"
+        ]
+    );
+}
+
+/// A bot is refused with 400 `IsBot`, even as a member of a server with events.
+#[test]
+fn upcoming_rejects_bots() {
+    crate::util::test::rt().block_on(upcoming_rejects_bots_case())
+}
+
+async fn upcoming_rejects_bots_case() {
+    use revolt_database::Bot;
+
+    let harness = TestHarness::new().await;
+    let (_, _session, owner) = harness.new_user().await;
+    let server = make_server(&harness, &owner).await;
+    let (bot, bot_user) = Bot::create(&harness.db, TestHarness::rand_string(), &owner, None)
+        .await
+        .expect("bot");
+    Member::create(&harness.db, &server, &bot_user, None)
+        .await
+        .expect("bot member");
+    let seed = upcoming_at(UPCOMING_T0 + UPCOMING_HOUR);
+    upcoming_seed(&harness, &server.id, &owner, "event", seed).await;
+
+    let query = upcoming_query(UPCOMING_T0, UPCOMING_T0 + UPCOMING_DAY, None);
+    let (status, body) =
+        upcoming_get(&harness, Some(("x-bot-token", bot.token.as_str())), &query).await;
+    assert_eq!(status, Status::BadRequest, "{body}");
+    assert_eq!(body["type"], "IsBot", "{body}");
+}
+
+/// The route never answers NotFound, which the client reads as "this server
+/// predates the route": a caller with no servers, and one whose only server
+/// holds nothing in the window but an event naming a channel that does not
+/// exist, both get 200 with an empty list. No session is 401.
+#[test]
+fn upcoming_never_answers_not_found() {
+    crate::util::test::rt().block_on(upcoming_never_answers_not_found_case())
+}
+
+async fn upcoming_never_answers_not_found_case() {
+    let harness = TestHarness::new().await;
+    let (_, lonely_session, _) = harness.new_user().await;
+    let (_, session, owner) = harness.new_user().await;
+    let server = make_server(&harness, &owner).await;
+
+    let query = upcoming_query(UPCOMING_T0, UPCOMING_T0 + UPCOMING_DAY, None);
+
+    // Zero memberships.
+    let rows = upcoming_ok(&harness, &lonely_session.token, &query).await;
+    assert!(rows.is_empty());
+
+    // Outside the window, and a dangling channel id inside it.
+    let past = upcoming_at(UPCOMING_T0 - UPCOMING_DAY);
+    upcoming_seed(&harness, &server.id, &owner, "past", past).await;
+    let missing_channel = ulid::Ulid::new().to_string();
+    let dangling = UpcomingSeed {
+        channel: Some(missing_channel.as_str()),
+        ..upcoming_at(UPCOMING_T0 + UPCOMING_HOUR)
+    };
+    upcoming_seed(&harness, &server.id, &owner, "dangling", dangling).await;
+    let rows = upcoming_ok(&harness, &session.token, &query).await;
+    assert!(rows.is_empty(), "{:?}", upcoming_titles(&rows));
+
+    // No credentials at all.
+    let (status, _) = upcoming_get(&harness, None, &query).await;
+    assert_eq!(status, Status::Unauthorized);
+}
+
+// ---------------------------------------------------------------------------
+// Thread and forum-post event scope: events in a thread or forum post take the
+// parent channel's permissions. The helpers below are used only by the tests
+// in this block.
+// ---------------------------------------------------------------------------
+
+/// A server whose default text channel is hidden from plain members, with a
+/// thread under that channel created by the owner.
+struct ThreadScopeFixture {
+    server: Server,
+    owner: User,
+    owner_token: String,
+    member: User,
+    member_token: String,
+    thread: revolt_database::Channel,
+}
+
+async fn thread_scope_fixture(harness: &TestHarness) -> ThreadScopeFixture {
+    use revolt_database::{Channel, PartialChannel};
+    use revolt_permissions::{ChannelPermission, OverrideField};
+
+    let (_, owner_session, owner) = harness.new_user().await;
+    let (_, member_session, member) = harness.new_user().await;
+    let (server, channels) = Server::create(
+        &harness.db,
+        DataCreateServer {
+            name: "Thread scope".to_string(),
+            description: None,
+            nsfw: None,
+        },
+        &owner,
+        true,
+    )
+    .await
+    .expect("server");
+    for user in [&owner, &member] {
+        Member::create(&harness.db, &server, user, None)
+            .await
+            .expect("member");
+    }
+
+    let mut parent = channels
+        .into_iter()
+        .find(|c| matches!(c, Channel::TextChannel { .. }))
+        .expect("text channel");
+    parent
+        .update(
+            &harness.db,
+            PartialChannel {
+                default_permissions: Some(OverrideField {
+                    a: 0,
+                    d: ChannelPermission::ViewChannel as i64,
+                }),
+                ..Default::default()
+            },
+            vec![],
+        )
+        .await
+        .expect("deny view");
+    let thread = Channel::create_thread(
+        &harness.db,
+        &parent,
+        &owner,
+        None,
+        v0::DataCreateThread {
+            name: "hidden thread".to_string(),
+            auto_archive_minutes: None,
+        },
+    )
+    .await
+    .expect("thread");
+
+    ThreadScopeFixture {
+        server,
+        owner,
+        owner_token: owner_session.token.to_string(),
+        member,
+        member_token: member_session.token.to_string(),
+        thread,
+    }
+}
+
+/// Add a member holding a role with server-wide `ManageChannel`.
+async fn thread_scope_manager(harness: &TestHarness, server: &Server) -> String {
+    use revolt_database::{PartialMember, Role};
+    use revolt_permissions::{ChannelPermission, OverrideField};
+
+    let (_, session, manager) = harness.new_user().await;
+    let member = Member::create(&harness.db, server, &manager, None)
+        .await
+        .expect("manager member")
+        .0;
+    let role = Role {
+        id: ulid::Ulid::new().to_string(),
+        name: "Event managers".to_string(),
+        permissions: OverrideField {
+            a: ChannelPermission::ManageChannel as i64,
+            d: 0,
+        },
+        colour: None,
+        hoist: false,
+        rank: 1,
+        icon: None,
+    };
+    harness
+        .db
+        .insert_role(&server.id, &role)
+        .await
+        .expect("role");
+    harness
+        .db
+        .update_member(
+            &member.id,
+            &PartialMember {
+                roles: Some(vec![role.id.clone()]),
+                ..Default::default()
+            },
+            vec![],
+        )
+        .await
+        .expect("assign role");
+    session.token.to_string()
+}
+
+/// Send a request; returns the status and the body parsed as JSON (Null if empty).
+async fn thread_scope_call(
+    harness: &TestHarness,
+    method: rocket::http::Method,
+    url: String,
+    token: &str,
+    body: Option<serde_json::Value>,
+) -> (Status, serde_json::Value) {
+    let mut request = harness
+        .client
+        .req(method, url)
+        .header(Header::new("x-session-token", token.to_string()));
+    if let Some(body) = body {
+        request = request.header(ContentType::JSON).body(body.to_string());
+    }
+    let response = request.dispatch().await;
+    let status = response.status();
+    let text = response.into_string().await.unwrap_or_default();
+    let value = serde_json::from_str(&text).unwrap_or(serde_json::Value::Null);
+    (status, value)
+}
+
+fn thread_scope_event_body(title: &str, channel: Option<&str>) -> serde_json::Value {
+    let mut body = json!({
+        "title": title,
+        "start": 1_900_000_000_000_i64,
+        "timezone": "UTC"
+    });
+    if let Some(channel) = channel {
+        body["channel"] = json!(channel);
+    }
+    body
+}
+
+fn thread_scope_list_url(server: &Server) -> String {
+    format!(
+        "/events/server/{}?from=1899000000000&to=1901000000000",
+        server.id
+    )
+}
+
+/// A thread under a visible text channel and a post in a visible forum work like
+/// any other channel for a plain member: create, list, fetch, invite, RSVP and
+/// attendees all succeed, and a server-wide manager can edit events there.
+#[test]
+fn thread_scope_visible_thread_and_forum_post_events_work() {
+    crate::util::test::rt().block_on(thread_scope_visible_thread_and_forum_post_events_work_case())
+}
+
+async fn thread_scope_visible_thread_and_forum_post_events_work_case() {
+    use revolt_database::{Channel, PartialMember, Role};
+    use revolt_permissions::{ChannelPermission, OverrideField};
+    use rocket::http::Method;
+
+    let harness = TestHarness::new().await;
+    let (_, owner_session, owner) = harness.new_user().await;
+    let (_, member_session, member) = harness.new_user().await;
+    let (_, manager_session, manager) = harness.new_user().await;
+    let (owner_token, member_token, manager_token) = (
+        owner_session.token.to_string(),
+        member_session.token.to_string(),
+        manager_session.token.to_string(),
+    );
+
+    let (mut server, channels) = Server::create(
+        &harness.db,
+        DataCreateServer {
+            name: "Open threads".to_string(),
+            description: None,
+            nsfw: None,
+        },
+        &owner,
+        true,
+    )
+    .await
+    .expect("server");
+    for user in [&owner, &member] {
+        Member::create(&harness.db, &server, user, None)
+            .await
+            .expect("member");
+    }
+    let manager_member = Member::create(&harness.db, &server, &manager, None)
+        .await
+        .expect("manager member")
+        .0;
+    let role = Role {
+        id: ulid::Ulid::new().to_string(),
+        name: "Event managers".to_string(),
+        permissions: OverrideField {
+            a: ChannelPermission::ManageChannel as i64,
+            d: 0,
+        },
+        colour: None,
+        hoist: false,
+        rank: 1,
+        icon: None,
+    };
+    harness
+        .db
+        .insert_role(&server.id, &role)
+        .await
+        .expect("role");
+    harness
+        .db
+        .update_member(
+            &manager_member.id,
+            &PartialMember {
+                roles: Some(vec![role.id.clone()]),
+                ..Default::default()
+            },
+            vec![],
+        )
+        .await
+        .expect("assign role");
+
+    let parent = channels
+        .into_iter()
+        .find(|c| matches!(c, Channel::TextChannel { .. }))
+        .expect("text channel");
+    let thread = Channel::create_thread(
+        &harness.db,
+        &parent,
+        &owner,
+        None,
+        v0::DataCreateThread {
+            name: "open thread".to_string(),
+            auto_archive_minutes: None,
+        },
+    )
+    .await
+    .expect("thread");
+    let forum = Channel::create_server_channel(
+        &harness.db,
+        &mut server,
+        v0::DataCreateServerChannel {
+            channel_type: v0::LegacyServerChannelType::Forum,
+            name: "open forum".to_string(),
+            ..Default::default()
+        },
+        false,
+    )
+    .await
+    .expect("forum");
+    let post = Channel::create_forum_post(
+        &harness.db,
+        &forum,
+        &owner,
+        "open post".to_string(),
+        vec![],
+        None,
+    )
+    .await
+    .expect("post");
+
+    let create_url = format!("/events/server/{}", server.id);
+    for target in [thread.id(), post.id()] {
+        let body = json!({
+            "title": "Member event",
+            "start": 1_900_000_000_000_i64,
+            "timezone": "UTC",
+            "channel": target
+        });
+        let (status, created) = thread_scope_call(
+            &harness,
+            Method::Post,
+            create_url.clone(),
+            &member_token,
+            Some(body),
+        )
+        .await;
+        assert_eq!(status, Status::Ok, "member creates in {target}");
+        let created: v0::Event = serde_json::from_value(created).expect("event");
+        assert_eq!(created.channel.as_deref(), Some(target));
+
+        let body = json!({
+            "title": "Owner event",
+            "start": 1_900_000_000_000_i64,
+            "timezone": "UTC",
+            "channel": target
+        });
+        let (status, event) = thread_scope_call(
+            &harness,
+            Method::Post,
+            create_url.clone(),
+            &owner_token,
+            Some(body),
+        )
+        .await;
+        assert_eq!(status, Status::Ok, "owner creates in {target}");
+        let event: v0::Event = serde_json::from_value(event).expect("event");
+
+        let (status, result) = thread_scope_call(
+            &harness,
+            Method::Post,
+            format!("/events/event/{}/invites", event.id),
+            &owner_token,
+            Some(json!({ "users": [member.id] })),
+        )
+        .await;
+        assert_eq!(status, Status::Ok);
+        let result: v0::InviteResult = serde_json::from_value(result).expect("invite result");
+        assert_eq!(result.invited, 1, "member invited in {target}");
+        assert_eq!(result.skipped, 0);
+
+        let (status, _) = thread_scope_call(
+            &harness,
+            Method::Put,
+            format!("/events/event/{}/rsvp", event.id),
+            &member_token,
+            Some(json!({ "status": "Going" })),
+        )
+        .await;
+        assert_eq!(status, Status::Ok, "member RSVPs Going in {target}");
+
+        let (status, _) = thread_scope_call(
+            &harness,
+            Method::Get,
+            format!("/events/event/{}", event.id),
+            &member_token,
+            None,
+        )
+        .await;
+        assert_eq!(status, Status::Ok, "member fetches in {target}");
+
+        let (status, attendees) = thread_scope_call(
+            &harness,
+            Method::Get,
+            format!("/events/event/{}/attendees", event.id),
+            &member_token,
+            None,
+        )
+        .await;
+        assert_eq!(status, Status::Ok, "member reads attendees in {target}");
+        let attendees: v0::AttendeesResponse =
+            serde_json::from_value(attendees).expect("attendees");
+        assert_eq!(attendees.attendees.len(), 1);
+        assert_eq!(attendees.attendees[0].user, member.id);
+        assert!(matches!(
+            attendees.attendees[0].status,
+            v0::RsvpStatus::Going
+        ));
+
+        let (status, _) = thread_scope_call(
+            &harness,
+            Method::Patch,
+            format!("/events/event/{}", event.id),
+            &manager_token,
+            Some(json!({ "title": "Renamed" })),
+        )
+        .await;
+        assert_eq!(status, Status::Ok, "manager edits in {target}");
+    }
+
+    let (status, list) = thread_scope_call(
+        &harness,
+        Method::Get,
+        format!(
+            "/events/server/{}?from=1899000000000&to=1901000000000",
+            server.id
+        ),
+        &member_token,
+        None,
+    )
+    .await;
+    assert_eq!(status, Status::Ok);
+    let list: Vec<v0::EventWithOccurrences> = serde_json::from_value(list).expect("list");
+    assert_eq!(list.len(), 4, "member lists every thread and post event");
+}
+
+/// An event in a thread under a channel hidden from plain members is absent from
+/// their list and reads as missing on fetch and attendees; the owner still sees it.
+#[test]
+fn thread_scope_hidden_parent_event_not_readable() {
+    crate::util::test::rt().block_on(thread_scope_hidden_parent_event_not_readable_case())
+}
+
+async fn thread_scope_hidden_parent_event_not_readable_case() {
+    use rocket::http::Method;
+
+    let harness = TestHarness::new().await;
+    let fx = thread_scope_fixture(&harness).await;
+
+    let (status, event) = thread_scope_call(
+        &harness,
+        Method::Post,
+        format!("/events/server/{}", fx.server.id),
+        &fx.owner_token,
+        Some(thread_scope_event_body("Hidden", Some(fx.thread.id()))),
+    )
+    .await;
+    assert_eq!(status, Status::Ok);
+    let event: v0::Event = serde_json::from_value(event).expect("event");
+
+    // The owner reads it on every path.
+    let (status, list) = thread_scope_call(
+        &harness,
+        Method::Get,
+        thread_scope_list_url(&fx.server),
+        &fx.owner_token,
+        None,
+    )
+    .await;
+    assert_eq!(status, Status::Ok);
+    let list: Vec<v0::EventWithOccurrences> = serde_json::from_value(list).expect("list");
+    assert_eq!(list.len(), 1, "owner lists the thread event");
+    let (status, _) = thread_scope_call(
+        &harness,
+        Method::Get,
+        format!("/events/event/{}", event.id),
+        &fx.owner_token,
+        None,
+    )
+    .await;
+    assert_eq!(status, Status::Ok);
+
+    // A plain member does not. All three reads are taken before asserting, so a
+    // failure reports every path at once: (list status, events listed, fetch,
+    // attendees).
+    let (list_status, list) = thread_scope_call(
+        &harness,
+        Method::Get,
+        thread_scope_list_url(&fx.server),
+        &fx.member_token,
+        None,
+    )
+    .await;
+    let listed = serde_json::from_value::<Vec<v0::EventWithOccurrences>>(list)
+        .map(|list| list.len())
+        .unwrap_or(usize::MAX);
+    let (fetch_status, _) = thread_scope_call(
+        &harness,
+        Method::Get,
+        format!("/events/event/{}", event.id),
+        &fx.member_token,
+        None,
+    )
+    .await;
+    let (attendees_status, _) = thread_scope_call(
+        &harness,
+        Method::Get,
+        format!("/events/event/{}/attendees", event.id),
+        &fx.member_token,
+        None,
+    )
+    .await;
+    assert_eq!(
+        (list_status, listed, fetch_status, attendees_status),
+        (Status::Ok, 0, Status::NotFound, Status::NotFound),
+        "(list status, events listed, fetch, attendees) for a member who cannot \
+         view the parent channel"
+    );
+}
+
+/// A plain member can neither create an event in, nor move their own event into,
+/// a thread or forum post whose parent they cannot view.
+#[test]
+fn thread_scope_hidden_parent_rejects_create_and_move() {
+    crate::util::test::rt().block_on(thread_scope_hidden_parent_rejects_create_and_move_case())
+}
+
+async fn thread_scope_hidden_parent_rejects_create_and_move_case() {
+    use revolt_database::{Channel, PartialChannel};
+    use revolt_permissions::{ChannelPermission, OverrideField};
+    use rocket::http::Method;
+
+    let harness = TestHarness::new().await;
+    let fx = thread_scope_fixture(&harness).await;
+
+    // A forum hidden from plain members, with a post in it.
+    let mut server = fx.server.clone();
+    let mut forum = Channel::create_server_channel(
+        &harness.db,
+        &mut server,
+        v0::DataCreateServerChannel {
+            channel_type: v0::LegacyServerChannelType::Forum,
+            name: "hidden forum".to_string(),
+            ..Default::default()
+        },
+        false,
+    )
+    .await
+    .expect("forum");
+    forum
+        .update(
+            &harness.db,
+            PartialChannel {
+                default_permissions: Some(OverrideField {
+                    a: 0,
+                    d: ChannelPermission::ViewChannel as i64,
+                }),
+                ..Default::default()
+            },
+            vec![],
+        )
+        .await
+        .expect("deny view");
+    let post = Channel::create_forum_post(
+        &harness.db,
+        &forum,
+        &fx.owner,
+        "hidden post".to_string(),
+        vec![],
+        None,
+    )
+    .await
+    .expect("post");
+
+    let create_url = format!("/events/server/{}", fx.server.id);
+    for target in [fx.thread.id(), post.id()] {
+        let (status, _) = thread_scope_call(
+            &harness,
+            Method::Post,
+            create_url.clone(),
+            &fx.member_token,
+            Some(thread_scope_event_body("Planning", Some(target))),
+        )
+        .await;
+        assert_eq!(status, Status::NotFound, "create in {target}");
+    }
+
+    // The member's own server-wide event cannot be moved there either.
+    let (status, event) = thread_scope_call(
+        &harness,
+        Method::Post,
+        create_url.clone(),
+        &fx.member_token,
+        Some(thread_scope_event_body("Mine", None)),
+    )
+    .await;
+    assert_eq!(status, Status::Ok);
+    let event: v0::Event = serde_json::from_value(event).expect("event");
+    for target in [fx.thread.id(), post.id()] {
+        let (status, _) = thread_scope_call(
+            &harness,
+            Method::Patch,
+            format!("/events/event/{}", event.id),
+            &fx.member_token,
+            Some(json!({ "channel": target })),
+        )
+        .await;
+        assert_eq!(status, Status::NotFound, "move into {target}");
+    }
+    let (status, event) = thread_scope_call(
+        &harness,
+        Method::Get,
+        format!("/events/event/{}", event.id),
+        &fx.member_token,
+        None,
+    )
+    .await;
+    assert_eq!(status, Status::Ok);
+    let event: v0::EventWithContext = serde_json::from_value(event).expect("event");
+    assert_eq!(event.event.channel, None, "the event stayed server-wide");
+}
+
+/// Moving an event into a thread whose parent a Going attendee cannot view prunes
+/// their RSVP row; an attendee whose role the parent allows keeps theirs.
+#[test]
+fn thread_scope_move_into_hidden_thread_prunes_rsvp() {
+    crate::util::test::rt().block_on(thread_scope_move_into_hidden_thread_prunes_rsvp_case())
+}
+
+async fn thread_scope_move_into_hidden_thread_prunes_rsvp_case() {
+    use revolt_database::{Channel, PartialChannel, PartialMember, Role};
+    use revolt_permissions::{ChannelPermission, OverrideField};
+    use rocket::http::Method;
+    use std::collections::HashMap;
+
+    let harness = TestHarness::new().await;
+    let fx = thread_scope_fixture(&harness).await;
+
+    // A second member whose role the hidden parent channel allows to view it.
+    let (_, viewer_session, viewer) = harness.new_user().await;
+    let viewer_token = viewer_session.token.to_string();
+    let viewer_member = Member::create(&harness.db, &fx.server, &viewer, None)
+        .await
+        .expect("viewer member")
+        .0;
+    let role = Role {
+        id: ulid::Ulid::new().to_string(),
+        name: "Parent viewers".to_string(),
+        permissions: OverrideField { a: 0, d: 0 },
+        colour: None,
+        hoist: false,
+        rank: 1,
+        icon: None,
+    };
+    harness
+        .db
+        .insert_role(&fx.server.id, &role)
+        .await
+        .expect("role");
+    harness
+        .db
+        .update_member(
+            &viewer_member.id,
+            &PartialMember {
+                roles: Some(vec![role.id.clone()]),
+                ..Default::default()
+            },
+            vec![],
+        )
+        .await
+        .expect("assign role");
+    let Channel::Thread { parent_channel, .. } = &fx.thread else {
+        panic!("fixture thread is not a thread");
+    };
+    let mut parent = harness
+        .db
+        .fetch_channel(parent_channel)
+        .await
+        .expect("parent");
+    parent
+        .update(
+            &harness.db,
+            PartialChannel {
+                role_permissions: Some(HashMap::from([(
+                    role.id.clone(),
+                    OverrideField {
+                        a: ChannelPermission::ViewChannel as i64,
+                        d: 0,
+                    },
+                )])),
+                ..Default::default()
+            },
+            vec![],
+        )
+        .await
+        .expect("allow the role on the parent");
+
+    let (status, event) = thread_scope_call(
+        &harness,
+        Method::Post,
+        format!("/events/server/{}", fx.server.id),
+        &fx.owner_token,
+        Some(thread_scope_event_body("Movable", None)),
+    )
+    .await;
+    assert_eq!(status, Status::Ok);
+    let event: v0::Event = serde_json::from_value(event).expect("event");
+
+    let (status, result) = thread_scope_call(
+        &harness,
+        Method::Post,
+        format!("/events/event/{}/invites", event.id),
+        &fx.owner_token,
+        Some(json!({ "users": [fx.member.id, viewer.id] })),
+    )
+    .await;
+    assert_eq!(status, Status::Ok);
+    let result: v0::InviteResult = serde_json::from_value(result).expect("invite result");
+    assert_eq!(result.invited, 2);
+    for token in [&fx.member_token, &viewer_token] {
+        let (status, _) = thread_scope_call(
+            &harness,
+            Method::Put,
+            format!("/events/event/{}/rsvp", event.id),
+            token,
+            Some(json!({ "status": "Going" })),
+        )
+        .await;
+        assert_eq!(status, Status::Ok);
+    }
+
+    let (status, _) = thread_scope_call(
+        &harness,
+        Method::Patch,
+        format!("/events/event/{}", event.id),
+        &fx.owner_token,
+        Some(json!({ "channel": fx.thread.id() })),
+    )
+    .await;
+    assert_eq!(status, Status::Ok);
+
+    let (status, attendees) = thread_scope_call(
+        &harness,
+        Method::Get,
+        format!("/events/event/{}/attendees", event.id),
+        &fx.owner_token,
+        None,
+    )
+    .await;
+    assert_eq!(status, Status::Ok);
+    let attendees: v0::AttendeesResponse = serde_json::from_value(attendees).expect("attendees");
+    let kept: Vec<&str> = attendees
+        .attendees
+        .iter()
+        .map(|row| row.user.as_str())
+        .collect();
+    assert!(
+        !kept.contains(&fx.member.id.as_str()),
+        "Going row kept after a move into a thread its user cannot view"
+    );
+    assert_eq!(
+        kept,
+        vec![viewer.id.as_str()],
+        "the Going row of a user the parent allows must survive the move"
+    );
+    assert!(matches!(
+        attendees.attendees[0].status,
+        v0::RsvpStatus::Going
+    ));
+}
+
+/// Inviting a member to an event in a thread whose parent they cannot view is
+/// skipped, the same as for the hidden channel itself.
+#[test]
+fn thread_scope_invite_to_hidden_thread_event_skipped() {
+    crate::util::test::rt().block_on(thread_scope_invite_to_hidden_thread_event_skipped_case())
+}
+
+async fn thread_scope_invite_to_hidden_thread_event_skipped_case() {
+    use rocket::http::Method;
+
+    let harness = TestHarness::new().await;
+    let fx = thread_scope_fixture(&harness).await;
+
+    let (status, event) = thread_scope_call(
+        &harness,
+        Method::Post,
+        format!("/events/server/{}", fx.server.id),
+        &fx.owner_token,
+        Some(thread_scope_event_body("Hidden", Some(fx.thread.id()))),
+    )
+    .await;
+    assert_eq!(status, Status::Ok);
+    let event: v0::Event = serde_json::from_value(event).expect("event");
+
+    let (status, result) = thread_scope_call(
+        &harness,
+        Method::Post,
+        format!("/events/event/{}/invites", event.id),
+        &fx.owner_token,
+        Some(json!({ "users": [fx.member.id] })),
+    )
+    .await;
+    assert_eq!(status, Status::Ok);
+    let result: v0::InviteResult = serde_json::from_value(result).expect("invite result");
+    assert_eq!(
+        result.invited, 0,
+        "member invited to a thread event they cannot view"
+    );
+    assert_eq!(result.skipped, 1);
+
+    let (status, attendees) = thread_scope_call(
+        &harness,
+        Method::Get,
+        format!("/events/event/{}/attendees", event.id),
+        &fx.owner_token,
+        None,
+    )
+    .await;
+    assert_eq!(status, Status::Ok);
+    let attendees: v0::AttendeesResponse = serde_json::from_value(attendees).expect("attendees");
+    assert!(attendees.attendees.is_empty());
+}
+
+/// An imported row whose `voiceId` names a thread under a channel the importer
+/// cannot view imports with no channel; one naming a visible thread keeps it.
+#[test]
+fn thread_scope_import_voice_id_in_hidden_thread_degrades() {
+    crate::util::test::rt().block_on(thread_scope_import_voice_id_in_hidden_thread_degrades_case())
+}
+
+async fn thread_scope_import_voice_id_in_hidden_thread_degrades_case() {
+    use revolt_database::{Channel, Message};
+    use rocket::http::Method;
+
+    let harness = TestHarness::new().await;
+    let fx = thread_scope_fixture(&harness).await;
+    let manager_token = thread_scope_manager(&harness, &fx.server).await;
+
+    // A visible source channel with a visible thread of its own.
+    let source = harness.new_channel(&fx.server).await;
+    let open_thread = Channel::create_thread(
+        &harness.db,
+        &source,
+        &fx.owner,
+        None,
+        v0::DataCreateThread {
+            name: "open thread".to_string(),
+            auto_archive_minutes: None,
+        },
+    )
+    .await
+    .expect("thread");
+
+    for (title, voice) in [
+        ("Hidden voice", fx.thread.id()),
+        ("Open voice", open_thread.id()),
+    ] {
+        harness
+            .db
+            .insert_message(&Message {
+                id: ulid::Ulid::new().to_string(),
+                channel: source.id().to_string(),
+                author: fx.owner.id.clone(),
+                content: Some(format!(
+                    "[ACUTEST_EVENT]:{}",
+                    json!({ "title": title, "start": "2030-05-01T10:00:00.000Z", "voiceId": voice })
+                )),
+                ..Default::default()
+            })
+            .await
+            .expect("message");
+    }
+
+    let (status, result) = thread_scope_call(
+        &harness,
+        Method::Post,
+        format!("/events/server/{}/import", fx.server.id),
+        &manager_token,
+        Some(json!({ "channel": source.id() })),
+    )
+    .await;
+    assert_eq!(status, Status::Ok);
+    let result: v0::ImportResult = serde_json::from_value(result).expect("import result");
+    assert_eq!(result.imported, 2);
+
+    let (status, list) = thread_scope_call(
+        &harness,
+        Method::Get,
+        format!(
+            "/events/server/{}?from=1890000000000&to=1920000000000",
+            fx.server.id
+        ),
+        &fx.owner_token,
+        None,
+    )
+    .await;
+    assert_eq!(status, Status::Ok);
+    let list: Vec<v0::EventWithOccurrences> = serde_json::from_value(list).expect("list");
+    let channel_of = |title: &str| {
+        list.iter()
+            .find(|row| row.event.title == title)
+            .unwrap_or_else(|| panic!("{} not imported", title))
+            .event
+            .channel
+            .clone()
+    };
+    assert_eq!(
+        channel_of("Open voice").as_deref(),
+        Some(open_thread.id()),
+        "a visible thread is kept"
+    );
+    assert_eq!(
+        channel_of("Hidden voice"),
+        None,
+        "a thread under a channel the importer cannot view must not be attached"
+    );
+}
+
+/// A member with server-wide `ManageChannel` that the parent channel takes away
+/// cannot edit or cancel an event in a thread under it.
+#[test]
+fn thread_scope_manage_is_judged_on_the_parent() {
+    crate::util::test::rt().block_on(thread_scope_manage_is_judged_on_the_parent_case())
+}
+
+async fn thread_scope_manage_is_judged_on_the_parent_case() {
+    use revolt_database::{Channel, PartialChannel};
+    use revolt_permissions::{ChannelPermission, OverrideField};
+    use rocket::http::Method;
+
+    let harness = TestHarness::new().await;
+    let fx = thread_scope_fixture(&harness).await;
+    let manager_token = thread_scope_manager(&harness, &fx.server).await;
+
+    // A visible channel that takes ManageChannel away from everyone but the owner.
+    let mut parent = harness.new_channel(&fx.server).await;
+    parent
+        .update(
+            &harness.db,
+            PartialChannel {
+                default_permissions: Some(OverrideField {
+                    a: 0,
+                    d: ChannelPermission::ManageChannel as i64,
+                }),
+                ..Default::default()
+            },
+            vec![],
+        )
+        .await
+        .expect("deny manage");
+    let thread = Channel::create_thread(
+        &harness.db,
+        &parent,
+        &fx.owner,
+        None,
+        v0::DataCreateThread {
+            name: "managed thread".to_string(),
+            auto_archive_minutes: None,
+        },
+    )
+    .await
+    .expect("thread");
+
+    let create_url = format!("/events/server/{}", fx.server.id);
+    let (status, server_wide) = thread_scope_call(
+        &harness,
+        Method::Post,
+        create_url.clone(),
+        &fx.owner_token,
+        Some(thread_scope_event_body("Server-wide", None)),
+    )
+    .await;
+    assert_eq!(status, Status::Ok);
+    let server_wide: v0::Event = serde_json::from_value(server_wide).expect("event");
+    let (status, in_thread) = thread_scope_call(
+        &harness,
+        Method::Post,
+        create_url,
+        &fx.owner_token,
+        Some(thread_scope_event_body("In thread", Some(thread.id()))),
+    )
+    .await;
+    assert_eq!(status, Status::Ok);
+    let in_thread: v0::Event = serde_json::from_value(in_thread).expect("event");
+
+    // The manager can see the thread event and manage server-wide events.
+    let (status, _) = thread_scope_call(
+        &harness,
+        Method::Get,
+        format!("/events/event/{}", in_thread.id),
+        &manager_token,
+        None,
+    )
+    .await;
+    assert_eq!(status, Status::Ok);
+    let (status, _) = thread_scope_call(
+        &harness,
+        Method::Patch,
+        format!("/events/event/{}", server_wide.id),
+        &manager_token,
+        Some(json!({ "title": "Renamed" })),
+    )
+    .await;
+    assert_eq!(status, Status::Ok);
+
+    // But not the thread event.
+    let (status, _) = thread_scope_call(
+        &harness,
+        Method::Patch,
+        format!("/events/event/{}", in_thread.id),
+        &manager_token,
+        Some(json!({ "title": "Renamed" })),
+    )
+    .await;
+    assert_eq!(status, Status::Forbidden, "edit");
+    let (status, _) = thread_scope_call(
+        &harness,
+        Method::Delete,
+        format!("/events/event/{}", in_thread.id),
+        &manager_token,
+        None,
+    )
+    .await;
+    assert_eq!(status, Status::Forbidden, "cancel");
+}
+
+/// Create two owner events, one in a channel and one in a thread, then delete the
+/// channel and the thread's parent. Returns the event ids.
+async fn thread_scope_events_in_deleted_channels(
+    harness: &TestHarness,
+    fx: &ThreadScopeFixture,
+) -> Vec<String> {
+    use revolt_database::Channel;
+    use rocket::http::Method;
+
+    let doomed = harness.new_channel(&fx.server).await;
+    let doomed_parent = harness.new_channel(&fx.server).await;
+    let orphan = Channel::create_thread(
+        &harness.db,
+        &doomed_parent,
+        &fx.owner,
+        None,
+        v0::DataCreateThread {
+            name: "orphaned thread".to_string(),
+            auto_archive_minutes: None,
+        },
+    )
+    .await
+    .expect("thread");
+
+    let mut events = Vec::new();
+    for target in [doomed.id(), orphan.id()] {
+        let (status, event) = thread_scope_call(
+            harness,
+            Method::Post,
+            format!("/events/server/{}", fx.server.id),
+            &fx.owner_token,
+            Some(thread_scope_event_body("Doomed", Some(target))),
+        )
+        .await;
+        assert_eq!(status, Status::Ok);
+        let event: v0::Event = serde_json::from_value(event).expect("event");
+        events.push(event.id);
+    }
+    harness
+        .db
+        .delete_channel(&doomed)
+        .await
+        .expect("delete channel");
+    harness
+        .db
+        .delete_channel(&doomed_parent)
+        .await
+        .expect("delete parent");
+    events
+}
+
+/// An event whose channel (or thread parent) was deleted can still be cancelled by
+/// a server-wide manager, and still not by a plain member.
+#[test]
+fn thread_scope_deleted_channel_event_cancellable_by_manager() {
+    crate::util::test::rt()
+        .block_on(thread_scope_deleted_channel_event_cancellable_by_manager_case())
+}
+
+async fn thread_scope_deleted_channel_event_cancellable_by_manager_case() {
+    use rocket::http::Method;
+
+    let harness = TestHarness::new().await;
+    let fx = thread_scope_fixture(&harness).await;
+    let manager_token = thread_scope_manager(&harness, &fx.server).await;
+    let events = thread_scope_events_in_deleted_channels(&harness, &fx).await;
+
+    for event_id in &events {
+        let (status, _) = thread_scope_call(
+            &harness,
+            Method::Delete,
+            format!("/events/event/{event_id}"),
+            &fx.member_token,
+            None,
+        )
+        .await;
+        assert_eq!(status, Status::Forbidden, "plain member cancels {event_id}");
+
+        let (status, _) = thread_scope_call(
+            &harness,
+            Method::Delete,
+            format!("/events/event/{event_id}"),
+            &manager_token,
+            None,
+        )
+        .await;
+        assert_eq!(status, Status::NoContent, "manager cancels {event_id}");
+        let stored = harness.db.fetch_event(event_id).await.expect("event row");
+        assert!(stored.cancelled);
+    }
+}
+
+/// A server-wide manager cannot edit, or invite to, an event whose channel (or
+/// thread parent) was deleted; only cancelling falls back to server-wide rights.
+#[test]
+fn thread_scope_deleted_channel_event_not_editable_by_manager() {
+    crate::util::test::rt()
+        .block_on(thread_scope_deleted_channel_event_not_editable_by_manager_case())
+}
+
+async fn thread_scope_deleted_channel_event_not_editable_by_manager_case() {
+    use rocket::http::Method;
+
+    let harness = TestHarness::new().await;
+    let fx = thread_scope_fixture(&harness).await;
+    let manager_token = thread_scope_manager(&harness, &fx.server).await;
+    let events = thread_scope_events_in_deleted_channels(&harness, &fx).await;
+
+    for event_id in &events {
+        let (status, _) = thread_scope_call(
+            &harness,
+            Method::Patch,
+            format!("/events/event/{event_id}"),
+            &manager_token,
+            Some(json!({ "title": "Renamed" })),
+        )
+        .await;
+        assert_eq!(status, Status::Forbidden, "manager edits {event_id}");
+
+        let (status, _) = thread_scope_call(
+            &harness,
+            Method::Post,
+            format!("/events/event/{event_id}/invites"),
+            &manager_token,
+            Some(json!({ "users": [fx.member.id] })),
+        )
+        .await;
+        assert_eq!(status, Status::Forbidden, "manager invites to {event_id}");
+
+        let stored = harness.db.fetch_event(event_id).await.expect("event row");
+        assert_eq!(stored.title, "Doomed");
+        assert!(harness
+            .db
+            .fetch_rsvps_for_event(event_id)
+            .await
+            .expect("rsvps")
+            .is_empty());
+
+        let (status, _) = thread_scope_call(
+            &harness,
+            Method::Delete,
+            format!("/events/event/{event_id}"),
+            &manager_token,
+            None,
+        )
+        .await;
+        assert_eq!(status, Status::NoContent, "manager cancels {event_id}");
+    }
+}
+
+/// A user outside the server gets `NotFound` from the RSVP route whether the event
+/// is live or cancelled; a member who can view the event still gets the cancelled
+/// error.
+#[test]
+fn thread_scope_rsvp_by_non_member_reads_as_missing() {
+    crate::util::test::rt().block_on(thread_scope_rsvp_by_non_member_reads_as_missing_case())
+}
+
+async fn thread_scope_rsvp_by_non_member_reads_as_missing_case() {
+    use rocket::http::Method;
+
+    let harness = TestHarness::new().await;
+    let fx = thread_scope_fixture(&harness).await;
+    let (_, outsider_session, _) = harness.new_user().await;
+    let outsider_token = outsider_session.token.to_string();
+
+    let mut events = Vec::new();
+    for title in ["Live", "Called off"] {
+        let (status, event) = thread_scope_call(
+            &harness,
+            Method::Post,
+            format!("/events/server/{}", fx.server.id),
+            &fx.owner_token,
+            Some(thread_scope_event_body(title, None)),
+        )
+        .await;
+        assert_eq!(status, Status::Ok);
+        let event: v0::Event = serde_json::from_value(event).expect("event");
+        events.push(event.id);
+    }
+    let (status, _) = thread_scope_call(
+        &harness,
+        Method::Delete,
+        format!("/events/event/{}", events[1]),
+        &fx.owner_token,
+        None,
+    )
+    .await;
+    assert_eq!(status, Status::NoContent);
+
+    for event_id in &events {
+        for answer in ["Going", "NotGoing"] {
+            let (status, _) = thread_scope_call(
+                &harness,
+                Method::Put,
+                format!("/events/event/{event_id}/rsvp"),
+                &outsider_token,
+                Some(json!({ "status": answer })),
+            )
+            .await;
+            assert_eq!(status, Status::NotFound, "{answer} on {event_id}");
+        }
+    }
+
+    let (status, _) = thread_scope_call(
+        &harness,
+        Method::Put,
+        format!("/events/event/{}/rsvp", events[1]),
+        &fx.member_token,
+        Some(json!({ "status": "Going" })),
+    )
+    .await;
+    assert_eq!(
+        status,
+        Status::BadRequest,
+        "member answers a cancelled event"
+    );
+}
+
+/// A member who cannot view a cancelled event's thread gets `NotFound` from the
+/// RSVP route, the same as for a missing event; the owner, who can view it, gets
+/// the cancelled error.
+#[test]
+fn thread_scope_rsvp_on_hidden_cancelled_event_reads_as_missing() {
+    crate::util::test::rt()
+        .block_on(thread_scope_rsvp_on_hidden_cancelled_event_reads_as_missing_case())
+}
+
+async fn thread_scope_rsvp_on_hidden_cancelled_event_reads_as_missing_case() {
+    use rocket::http::Method;
+
+    let harness = TestHarness::new().await;
+    let fx = thread_scope_fixture(&harness).await;
+
+    let (status, event) = thread_scope_call(
+        &harness,
+        Method::Post,
+        format!("/events/server/{}", fx.server.id),
+        &fx.owner_token,
+        Some(thread_scope_event_body("Hidden", Some(fx.thread.id()))),
+    )
+    .await;
+    assert_eq!(status, Status::Ok);
+    let event: v0::Event = serde_json::from_value(event).expect("event");
+    let (status, _) = thread_scope_call(
+        &harness,
+        Method::Delete,
+        format!("/events/event/{}", event.id),
+        &fx.owner_token,
+        None,
+    )
+    .await;
+    assert_eq!(status, Status::NoContent);
+
+    for answer in ["Going", "NotGoing"] {
+        let (status, _) = thread_scope_call(
+            &harness,
+            Method::Put,
+            format!("/events/event/{}/rsvp", event.id),
+            &fx.member_token,
+            Some(json!({ "status": answer })),
+        )
+        .await;
+        assert_eq!(status, Status::NotFound, "member answers {answer}");
+    }
+
+    let (status, _) = thread_scope_call(
+        &harness,
+        Method::Put,
+        format!("/events/event/{}/rsvp", event.id),
+        &fx.owner_token,
+        Some(json!({ "status": "Going" })),
+    )
+    .await;
+    assert_eq!(
+        status,
+        Status::BadRequest,
+        "owner answers a cancelled event"
     );
 }
