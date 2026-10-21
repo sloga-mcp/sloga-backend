@@ -264,14 +264,23 @@ device is enabled+published and the group is within the member cap. Flow:
    - **What the dialog shows:** "You (id)" first, then every other
      member who will be able to read new messages, each with the raw id,
      a "(new)" tag if they are joining the audience, and a trust label
-     for their keys on this device ("verified by you", "not verified",
-     "no keys on this device yet"); and the count. The ids, the count
-     and the new and removed marks come from native state. A re-enable
-     that drops members also lists them, as people who "will stop
-     receiving new messages". Every growth dialog says the names come
-     from the app and the server and are not verified. A re-send has its
-     own title and copy, because it re-adds anyone on the list who was
-     removed on another device.
+     for their keys on this device ("verified by you", "not all of their
+     devices are verified by you", "not verified", "no keys on this
+     device yet"); and the count. The ids, the count, the trust labels
+     and the new and removed marks come from native state. A trust label
+     reflects this device's verification records for the devices it has
+     pinned for that member, not every device the member has. "Verified
+     by you" records that the user confirmed a native dialog showing that
+     device's safety number (§3.3), or an earlier verification record on
+     this device or one restored from a backup; it does not prove the
+     numbers were compared. A member with some devices verified and some
+     not (typically a verified contact whose new device was pinned later;
+     a new pin starts unverified) reads "not all of their devices are
+     verified by you". A re-enable that drops members also lists them,
+     as people who "will stop receiving new messages". Every growth
+     dialog says the names come from the app and the server and are not
+     verified. A re-send has its own title and copy, because it re-adds
+     anyone on the list who was removed on another device.
    - **Preview, then checked commit:** native computes what the change
      does, writing nothing about the group; the user confirms; the commit
      re-runs the preview under the engine lock and refuses
@@ -412,7 +421,16 @@ show. What it cannot prove:
   asks about, and it can keep asking; the 30 s decline lockout and the
   one-at-a-time rule bound the rate, not the intent.
 - **Devices.** The dialog confirms members, not the devices each member
-  has.
+  has, and its trust labels reflect this device's verification records
+  for the member devices it has pinned. Device additions are announced
+  by notes instead: when another user gains a device (including one so
+  far listed only for calls), when a removed device of theirs returns,
+  or when a device that was call-only starts receiving messages, this
+  device records a note in the direct conversation with them and in each
+  encrypted group where they are an active member. A server can still
+  add a device for a user: device keys are self-signed by each device and
+  there is no account-level signature over a user's devices, so these
+  notes record an addition; they do not prevent it.
 - **What the webview already sees.** A compromised webview still reads
   whatever it renders; the confirm only bounds who ELSE can read.
 
@@ -514,12 +532,47 @@ safety number = 6 groups of 5 digits (30 digits total)
 ### 3.3 Verified state + its teeth
 
 - `e2ee_mark_verified(peer_user_id, device_id)` sets `user_verified` on
-  the pin (new column, above `binding_verified`); timeline marker.
-- **Teeth**: an identity change on a `user_verified` device is a heavier
-  event than the standard `identity_changed`: the accept dialog states
-  verification is being discarded, requires re-typing the peer's name,
-  and clears `user_verified`. Send mode stays Blocked until accepted
-  (existing machinery).
+  the pin (new column, above `binding_verified`); timeline marker. It
+  applies only to an active pin whose keys are bound by the device's own
+  signature, and only through the native confirm below.
+- **Native confirms.** Marking a device verified and accepting a changed
+  key both happen behind a native confirm the webview cannot draw,
+  dismiss or answer: an OS dialog on desktop (Tauri and Electron, through
+  core's `ShellEngine`), a system dialog on Android. Core owns the copy;
+  the shells show it and return the button. Native code first computes a
+  read-only preview, then shows:
+  - **Verify:** that device's safety number and device id, and asks the
+    user to continue only if the peer is reading the same number from
+    their own device right now (for the user's own account: if the other
+    device shows it); then how many of that person's devices pinned on
+    this device will be verified afterwards.
+  - **Accept:** whose device it is and whether it is the user's own
+    account; what the new key can read once accepted (new messages to
+    that person in direct messages and in the encrypted groups they
+    share, with the count; for the user's own account, everything the
+    user sends in every encrypted conversation); that messages from it
+    count as theirs (for the user's own account, as sent by the user)
+    and, for a signed key, that this includes changes it sends to the
+    user's encrypted groups; and the safety number over the new keys, or,
+    when the new key arrived unsigned, that no safety number exists for
+    it yet.
+  - Both dialogs say the names come from the app and the server and are
+    not verified.
+  - **Bound commit:** each commit re-reads the pin and is bound to the
+    keys the dialog showed; if the keys (or the pin's state) changed
+    while the dialog was open, it refuses `keys_changed` and writes
+    nothing.
+  - **Rate:** these dialogs share the one-at-a-time rule with the growth
+    confirm (§2.5 step 3; a second request is `busy`, with no dialog). A
+    declined verify locks verify prompts for that person for 30 s, and a
+    declined accept does the same for accept prompts. Verifying an
+    already-verified device succeeds with no dialog and no write. The
+    Android guards of §2.5 step 3 (a delayed confirm button, touches
+    ignored while the dialog is covered) apply here too.
+- **Teeth**: a device in the identity-changed state blocks sending to
+  that person until the change is accepted (existing machinery). The
+  change clears `user_verified`, and accepting does not restore it, so
+  the new key starts unverified until the user verifies it.
 - Screen: conversation header lock → "Verify security numbers"; shows
   per-device number, verified badge, first-seen, honest scope copy (§3.1
   non-goal included). Native-only; web shows the §4 state.
@@ -703,7 +756,7 @@ Native (e2ee-core):
 - Safety number: cross-platform test vector (fixed keys → exact 30
   digits); symmetric (a,b) == (b,a); pinned-keys-only (changing the
   server bundle does not change the number); mark-verified → identity
-  change takes the heavy path and clears the flag.
+  change blocks sends, and accepting it clears the flag.
 - Version floor matrix (§6): v=0 below floor, v=2 above current, inner/
   outer mismatch.
 
