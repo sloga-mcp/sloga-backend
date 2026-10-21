@@ -395,15 +395,15 @@ fn provider_error(context: &str, err: StripeError) -> revolt_result::Error {
 }
 
 /// Whether a failed read of a payment's charge is one retrying cannot fix
-/// (see [`CARD_COUNTRY_WAIT_MS`]): a 4xx Stripe answers with
-/// `permission_error` or `invalid_request_error` (never a 429), or a
-/// response that does not decode (e.g. `latest_charge` not expanded).
-/// A transport error, a 5xx, a 429 and any other 4xx are not.
+/// (see [`CARD_COUNTRY_WAIT_MS`]): a 400, 403 or 404 Stripe answers with
+/// `permission_error` or `invalid_request_error`, or a response that does
+/// not decode (e.g. `latest_charge` not expanded). A transport error, a
+/// 5xx and any other 4xx (429, and 409, which Stripe's own libraries
+/// retry) are not.
 fn card_country_unreadable(err: &StripeError) -> bool {
     match err {
         StripeError::Api { status, kind, .. } => {
-            (400..500).contains(status)
-                && *status != 429
+            matches!(*status, 400 | 403 | 404)
                 && matches!(
                     kind.as_deref(),
                     Some("permission_error" | "invalid_request_error")
@@ -1031,7 +1031,9 @@ async fn fulfil_locked(
         // country alone. A failed read is an error: nothing is claimed, and
         // the event (or the reconcile resume) tries again. Only a failure
         // that retrying cannot fix, still there [`CARD_COUNTRY_WAIT_MS`]
-        // after the payment, lets the billing country decide alone.
+        // after the payment, lets the billing country decide alone, and
+        // only when there is one: with neither country known, it stays an
+        // error.
         if !s.blocked_countries.is_empty() {
             match stripe.get_payment_charge(&payment_intent).await {
                 Ok(charge) => {
@@ -1049,6 +1051,7 @@ async fn fulfil_locked(
                 }
                 Err(err)
                     if card_country_unreadable(&err)
+                        && session.billing_country.is_some()
                         && leased
                             .order
                             .paid_at
@@ -1545,9 +1548,14 @@ async fn void_paid(
         }
         if !refund_for_void(stripe, &payment_intent, &leased.order.id).await? {
             // Refused: no money moved, so nothing is committed yet; the next
-            // attempt judges the order afresh
+            // attempt judges the order afresh. The region's country goes
+            // with the reason it came with.
             if marked_now {
-                write(db, leased, move |o| o.void_reason = previous).await?;
+                write(db, leased, move |o| {
+                    o.void_reason = previous;
+                    o.region_blocked_country = None;
+                })
+                .await?;
             }
             return Err(create_error!(PaymentProviderError));
         }
@@ -8893,6 +8901,8 @@ mod tests {
             api_error(503, "invalid_request_error"),
             api_error(429, "rate_limit_error"),
             api_error(429, "invalid_request_error"),
+            // Stripe's libraries retry a 409 (a conflict that passes)
+            api_error(409, "invalid_request_error"),
             api_error(401, "authentication_error"),
             StripeError::Transport("request timed out".to_string()),
         ]
@@ -8969,6 +8979,62 @@ mod tests {
             assert_eq!(card_country_alerts(&pending.id), 1);
         }
         assert_eq!(stripe.refund_count(), 0);
+        drop_db(&db).await;
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_card_country_never_falls_back_without_a_billing_country() {
+        capture_error_log();
+        let db = test_db().await;
+        let stripe = MockStripe::new();
+        let s = settings();
+        insert_user(&db, "u1").await;
+
+        // No billing country reported, and the key may not read charges
+        let pending = checkout(&db, &stripe, &s, "u1", CipherTier::T99, NOW).await;
+        let session = pay_from(&stripe, &pending, "pi_1", None);
+        stripe.fail_next("get_payment_charge", api_error(403, "permission_error"));
+        assert!(matches!(
+            error_type(fulfil_order(&db, &stripe, &s, &pending.id, &session, NOW).await),
+            ErrorType::PaymentProviderError
+        ));
+
+        // Long past the wait: still an error, nothing claimed, no fallback
+        stripe.fail_next("get_payment_charge", api_error(403, "permission_error"));
+        let past = NOW + CARD_COUNTRY_WAIT_MS + DAY;
+        assert!(matches!(
+            error_type(resume_order(&db, &stripe, &s, &pending.id, past).await),
+            ErrorType::PaymentProviderError
+        ));
+        let kept = order(&db, &pending.id).await;
+        assert_eq!(kept.state, OrderState::Paid);
+        assert_eq!(kept.void_reason, None);
+        assert_eq!(db.count_claimed_cipher_numbers().await.unwrap(), 0);
+        assert_eq!(maybe_membership(&db, "u1").await, None);
+        assert_eq!(card_country_alerts(&pending.id), 0);
+        drop_db(&db).await;
+    }
+
+    #[tokio::test]
+    async fn a_refused_region_refund_takes_the_country_back_off_the_order() {
+        let db = test_db().await;
+        let stripe = MockStripe::new();
+        let s = settings();
+        insert_user(&db, "u1").await;
+
+        // Billed to a blocked country; Stripe answers the refund as failed
+        let pending = checkout(&db, &stripe, &s, "u1", CipherTier::T99, NOW).await;
+        let session = pay_from(&stripe, &pending, "pi_1", Some("DE"));
+        stripe.set_refund_status("failed");
+        assert!(matches!(
+            error_type(fulfil_order(&db, &stripe, &s, &pending.id, &session, NOW).await),
+            ErrorType::PaymentProviderError
+        ));
+        let kept = order(&db, &pending.id).await;
+        assert_eq!(kept.state, OrderState::Paid);
+        assert_eq!(kept.void_reason, None);
+        assert_eq!(kept.region_blocked_country, None);
+        assert_eq!(db.count_claimed_cipher_numbers().await.unwrap(), 0);
         drop_db(&db).await;
     }
 
