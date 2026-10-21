@@ -49,8 +49,10 @@ const ULID_LEN: usize = 26;
 const ULID_ALPHABET: &str = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
 
 /// Link forms that carry an invite code, matched case-insensitively after the
-/// scheme is dropped. Self-hosted instances are out of scope.
-const INVITE_PREFIXES: [&str; 2] = ["stoat.chat/invite/", "rvlt.gg/"];
+/// scheme is dropped. `stt.gg/<code>` is what Stoat's "Create invite" hands
+/// out today (a redirect to `stoat.chat/invite/<code>`); `rvlt.gg` is the old
+/// Revolt short link. Self-hosted instances are out of scope.
+const INVITE_PREFIXES: [&str; 3] = ["stoat.chat/invite/", "stt.gg/", "rvlt.gg/"];
 
 /// What the user pasted, reduced to one whitelisted token
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -64,7 +66,8 @@ pub enum StoatSource {
 /// Parse a Stoat invite link, bare invite code, or server id.
 ///
 /// Accepts `https://stoat.chat/invite/<code>`, `stoat.chat/invite/<code>`,
-/// `https://rvlt.gg/<code>`, `rvlt.gg/<code>`, a bare invite code, and a raw
+/// `https://stt.gg/<code>`, `stt.gg/<code>`, `https://rvlt.gg/<code>`,
+/// `rvlt.gg/<code>`, a bare invite code, and a raw
 /// 26-character ULID. Surrounding whitespace and one trailing `/` are
 /// ignored. Anything else (another host, a query or fragment, extra path
 /// segments, any character outside `[A-Za-z0-9]`) is refused outright rather
@@ -389,6 +392,9 @@ mod tests {
             ("http://stoat.chat/invite/AbC123", invite("AbC123")),
             ("stoat.chat/invite/AbC123", invite("AbC123")),
             ("HTTPS://Stoat.Chat/Invite/AbC123", invite("AbC123")),
+            ("https://stt.gg/Q1XpKkha", invite("Q1XpKkha")),
+            ("stt.gg/AbC123", invite("AbC123")),
+            ("HTTPS://STT.GG/AbC123/", invite("AbC123")),
             ("https://rvlt.gg/AbC123", invite("AbC123")),
             ("rvlt.gg/AbC123", invite("AbC123")),
             ("AbC123", invite("AbC123")),
@@ -432,6 +438,12 @@ mod tests {
             "https://stoat.chat/invite/",
             "https://stoat.chat/invite",
             "stoat.chat",
+            "stt.gg",
+            "https://stt.gg/",
+            "https://stt.gg.evil.example/AbC123",
+            "https://evil.example/stt.gg/AbC123",
+            "https://stt.gg/AbC123?ref=x",
+            "https://stt.gg/Ab/C123",
             "rvlt.gg",
             "https://rvlt.gg/",
             "https://evil.example/AbC123",
@@ -499,6 +511,7 @@ mod tests {
                 format!("AbC{ch}123"),
                 format!("https://stoat.chat/invite/AbC{ch}123"),
                 format!("rvlt.gg/AbC{ch}123"),
+                format!("https://stt.gg/AbC{ch}123"),
             ] {
                 let parsed = parse_stoat_source(&input);
                 let token = match &parsed {
