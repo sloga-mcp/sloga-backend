@@ -46,6 +46,57 @@ impl AbstractCalendarEvents for ReferenceDb {
             .collect())
     }
 
+    async fn fetch_upcoming_oneoffs_for_server(
+        &self,
+        server_id: &str,
+        from: i64,
+        to: i64,
+        offset: usize,
+        limit: usize,
+    ) -> Result<Vec<CalendarEvent>> {
+        if limit == 0 {
+            return Ok(vec![]);
+        }
+        let events = self.calendar_events.lock().await;
+        let mut rows: Vec<&CalendarEvent> = events
+            .values()
+            .filter(|e| {
+                e.server == server_id
+                    && e.recurrence.is_none()
+                    && !e.cancelled
+                    && e.start >= from
+                    && e.start <= to
+            })
+            .collect();
+        rows.sort_by(|a, b| (a.start, &a.id).cmp(&(b.start, &b.id)));
+        Ok(rows.into_iter().skip(offset).take(limit).cloned().collect())
+    }
+
+    async fn fetch_upcoming_series_for_server(
+        &self,
+        server_id: &str,
+        from: i64,
+        to: i64,
+        limit: usize,
+    ) -> Result<Vec<CalendarEvent>> {
+        if limit == 0 {
+            return Ok(vec![]);
+        }
+        let events = self.calendar_events.lock().await;
+        let mut rows: Vec<&CalendarEvent> = events
+            .values()
+            .filter(|e| {
+                e.server == server_id
+                    && e.recurrence.is_some()
+                    && !e.cancelled
+                    && e.start <= to
+                    && e.series_end >= from
+            })
+            .collect();
+        rows.sort_by(|a, b| (a.start, &a.id).cmp(&(b.start, &b.id)));
+        Ok(rows.into_iter().take(limit).cloned().collect())
+    }
+
     async fn update_event(
         &self,
         id: &str,

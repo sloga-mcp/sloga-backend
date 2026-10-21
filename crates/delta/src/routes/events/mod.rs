@@ -16,6 +16,7 @@ mod events_crud;
 mod import;
 mod rsvp;
 mod softres_lookup;
+mod upcoming;
 #[cfg(test)]
 mod tests;
 
@@ -294,5 +295,6 @@ pub fn routes() -> (Vec<Route>, OpenApi) {
         rsvp::set_rsvp,
         rsvp::fetch_attendees,
         softres_lookup::fetch_event_softres,
+        upcoming::list_upcoming_events,
     ]
 }

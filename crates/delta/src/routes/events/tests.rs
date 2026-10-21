@@ -2720,6 +2720,1094 @@ async fn notgoing_escape_survives_lost_view_case() {
 }
 
 // ---------------------------------------------------------------------------
+// Cross-server upcoming list: GET /events/@me/upcoming. The caller's soonest
+// visible events across every server they are in, ranked by each event's first
+// occurrence at or after `from`. The route has its own rate bucket
+// (`events_me`, 10 per 10 s per session), so no test spends more than nine
+// upcoming calls on one session. Events are seeded through
+// `CalendarEvent::create`, which derives `duration_ms` and `series_end`. The
+// helpers below are used only by the tests in this block.
+// ---------------------------------------------------------------------------
+
+const UPCOMING_MINUTE: i64 = 60 * 1000;
+const UPCOMING_HOUR: i64 = 60 * UPCOMING_MINUTE;
+const UPCOMING_DAY: i64 = 24 * UPCOMING_HOUR;
+const UPCOMING_T0: i64 = 1_900_000_000_000;
+/// The route's window cap: 62 days.
+const UPCOMING_MAX_WINDOW: i64 = 62 * UPCOMING_DAY;
+
+/// The shape of a seeded event; `timezone` defaults to UTC.
+#[derive(Default)]
+struct UpcomingSeed<'a> {
+    start: i64,
+    end: Option<i64>,
+    timezone: Option<&'a str>,
+    recurrence: Option<revolt_database::RecurrenceRule>,
+    channel: Option<&'a str>,
+}
+
+/// A server-wide one-off starting at `start`, with no end.
+fn upcoming_at<'a>(start: i64) -> UpcomingSeed<'a> {
+    UpcomingSeed {
+        start,
+        ..Default::default()
+    }
+}
+
+/// A weekly rule that ends after `count` occurrences and skips `exceptions`.
+fn upcoming_weekly(count: u16, exceptions: Vec<i64>) -> revolt_database::RecurrenceRule {
+    revolt_database::RecurrenceRule {
+        freq: revolt_database::Frequency::Weekly,
+        interval: 1,
+        by_weekday: vec![],
+        end: revolt_database::RecurrenceEnd::Count { count },
+        exceptions,
+    }
+}
+
+/// Store an event through the model's create path. It runs no membership or
+/// channel checks, so a test can also plant a corrupted row with it.
+async fn upcoming_seed(
+    harness: &TestHarness,
+    server_id: &str,
+    creator: &User,
+    title: &str,
+    seed: UpcomingSeed<'_>,
+) -> revolt_database::CalendarEvent {
+    revolt_database::CalendarEvent::create(
+        &harness.db,
+        server_id.to_string(),
+        creator.id.clone(),
+        title.to_string(),
+        None,
+        None,
+        seed.start,
+        seed.end,
+        false,
+        seed.timezone.unwrap_or("UTC").to_string(),
+        seed.recurrence,
+        None,
+        seed.channel.map(str::to_string),
+        None,
+    )
+    .await
+    .expect("seed event")
+}
+
+/// Deny ViewChannel to everyone below the owner on `channel`.
+async fn upcoming_hide_channel(harness: &TestHarness, channel: &mut revolt_database::Channel) {
+    use revolt_database::PartialChannel;
+    use revolt_permissions::{ChannelPermission, OverrideField};
+
+    channel
+        .update(
+            &harness.db,
+            PartialChannel {
+                default_permissions: Some(OverrideField {
+                    a: 0,
+                    d: ChannelPermission::ViewChannel as i64,
+                }),
+                ..Default::default()
+            },
+            vec![],
+        )
+        .await
+        .expect("deny view");
+}
+
+/// A thread under `parent`, created by `creator`.
+async fn upcoming_thread(
+    harness: &TestHarness,
+    parent: &revolt_database::Channel,
+    creator: &User,
+    name: &str,
+) -> revolt_database::Channel {
+    revolt_database::Channel::create_thread(
+        &harness.db,
+        parent,
+        creator,
+        None,
+        v0::DataCreateThread {
+            name: name.to_string(),
+            auto_archive_minutes: None,
+        },
+    )
+    .await
+    .expect("thread")
+}
+
+/// `?from=<from>&to=<to>`, plus `&limit=<limit>` when given.
+fn upcoming_query(from: i64, to: i64, limit: Option<i64>) -> String {
+    match limit {
+        Some(limit) => format!("?from={from}&to={to}&limit={limit}"),
+        None => format!("?from={from}&to={to}"),
+    }
+}
+
+/// One `GET /events/@me/upcoming{query}`. `auth` is a header name and its
+/// token; None sends no credentials. Returns the status and the body parsed as
+/// JSON (Null when it is not JSON).
+async fn upcoming_get(
+    harness: &TestHarness,
+    auth: Option<(&str, &str)>,
+    query: &str,
+) -> (Status, serde_json::Value) {
+    let mut request = harness.client.get(format!("/events/@me/upcoming{query}"));
+    if let Some((name, token)) = auth {
+        request = request.header(Header::new(name.to_string(), token.to_string()));
+    }
+    let response = request.dispatch().await;
+    let status = response.status();
+    let text = response.into_string().await.unwrap_or_default();
+    let value = serde_json::from_str(&text).unwrap_or(serde_json::Value::Null);
+    (status, value)
+}
+
+/// A session call that must answer 200, parsed as the route's response type.
+async fn upcoming_ok(
+    harness: &TestHarness,
+    token: &str,
+    query: &str,
+) -> Vec<v0::EventWithOccurrences> {
+    let (status, body) = upcoming_get(harness, Some(("x-session-token", token)), query).await;
+    assert_eq!(
+        status,
+        Status::Ok,
+        "GET /events/@me/upcoming{query}: {body}"
+    );
+    serde_json::from_value(body).expect("upcoming list")
+}
+
+/// A session call that must answer 400 `FailedValidation` naming `field`.
+async fn upcoming_rejects(harness: &TestHarness, token: &str, query: &str, field: &str) {
+    let (status, body) = upcoming_get(harness, Some(("x-session-token", token)), query).await;
+    assert_eq!(
+        status,
+        Status::BadRequest,
+        "GET /events/@me/upcoming{query}: {body}"
+    );
+    assert_eq!(body["type"], "FailedValidation", "{query}: {body}");
+    assert_eq!(body["error"], field, "{query}: {body}");
+}
+
+/// The titles of a response, in order.
+fn upcoming_titles(rows: &[v0::EventWithOccurrences]) -> Vec<&str> {
+    rows.iter().map(|row| row.event.title.as_str()).collect()
+}
+
+/// The event ids of a response, in order.
+fn upcoming_ids(rows: &[v0::EventWithOccurrences]) -> Vec<&str> {
+    rows.iter().map(|row| row.event.id.as_str()).collect()
+}
+
+/// The ids of seeded one-offs in the route's order: (start, id) ascending.
+fn upcoming_expected_order(events: &[revolt_database::CalendarEvent]) -> Vec<&str> {
+    let mut keyed: Vec<(i64, &str)> = events
+        .iter()
+        .map(|event| (event.start, event.id.as_str()))
+        .collect();
+    keyed.sort();
+    keyed.into_iter().map(|(_, id)| id).collect()
+}
+
+/// `GET /events/server/<server>` over the same window: the occurrence oracle.
+/// It spends the shared `events` bucket, not `events_me`.
+async fn upcoming_list_oracle(
+    harness: &TestHarness,
+    token: &str,
+    server_id: &str,
+    from: i64,
+    to: i64,
+) -> Vec<v0::EventWithOccurrences> {
+    let response = harness
+        .client
+        .get(format!("/events/server/{server_id}?from={from}&to={to}"))
+        .header(Header::new("x-session-token", token.to_string()))
+        .dispatch()
+        .await;
+    assert_eq!(response.status(), Status::Ok);
+    response
+        .into_json::<Vec<v0::EventWithOccurrences>>()
+        .await
+        .expect("list")
+}
+
+/// Two member servers come back as one list ordered by first occurrence, and a
+/// server the caller is not in contributes nothing, not even its soonest event.
+#[test]
+fn upcoming_merges_member_servers_by_first_occurrence() {
+    crate::util::test::rt().block_on(upcoming_merges_member_servers_by_first_occurrence_case())
+}
+
+async fn upcoming_merges_member_servers_by_first_occurrence_case() {
+    let harness = TestHarness::new().await;
+    let (_, owner_session, owner) = harness.new_user().await;
+    let (_, guest_session, guest) = harness.new_user().await;
+    let server_a = make_server(&harness, &owner).await;
+    let server_b = make_server(&harness, &owner).await;
+    let outside = make_server(&harness, &owner).await;
+    for server in [&server_a, &server_b] {
+        Member::create(&harness.db, server, &guest, None)
+            .await
+            .expect("guest member");
+    }
+
+    // Created out of order, interleaved across the two servers.
+    let hour = |n: i64| upcoming_at(UPCOMING_T0 + n * UPCOMING_HOUR);
+    upcoming_seed(&harness, &server_a.id, &owner, "a3", hour(3)).await;
+    upcoming_seed(&harness, &server_b.id, &owner, "b4", hour(4)).await;
+    upcoming_seed(&harness, &server_a.id, &owner, "a1", hour(1)).await;
+    upcoming_seed(&harness, &server_b.id, &owner, "b2", hour(2)).await;
+    // The soonest event of all, in a server the guest is not in.
+    let soonest = upcoming_at(UPCOMING_T0 + 30 * UPCOMING_MINUTE);
+    upcoming_seed(&harness, &outside.id, &owner, "outside", soonest).await;
+
+    let query = upcoming_query(UPCOMING_T0, UPCOMING_T0 + UPCOMING_DAY, None);
+    let rows = upcoming_ok(&harness, &guest_session.token, &query).await;
+    assert_eq!(upcoming_titles(&rows), ["a1", "b2", "a3", "b4"]);
+    let servers: Vec<&str> = rows.iter().map(|row| row.event.server.as_str()).collect();
+    assert_eq!(
+        servers,
+        [
+            server_a.id.as_str(),
+            server_b.id.as_str(),
+            server_a.id.as_str(),
+            server_b.id.as_str()
+        ]
+    );
+    for row in &rows {
+        assert_eq!(
+            row.occurrences,
+            vec![row.event.start],
+            "a one-off's only occurrence is its start"
+        );
+    }
+
+    // Control: the owner is in all three servers and does get the outside event.
+    let rows = upcoming_ok(&harness, &owner_session.token, &query).await;
+    assert_eq!(upcoming_titles(&rows), ["outside", "a1", "b2", "a3", "b4"]);
+}
+
+/// A kicked member stops getting that server's events on the next call; their
+/// other server's events stay.
+#[test]
+fn upcoming_drops_a_server_after_a_kick() {
+    crate::util::test::rt().block_on(upcoming_drops_a_server_after_a_kick_case())
+}
+
+async fn upcoming_drops_a_server_after_a_kick_case() {
+    use revolt_database::RemovalIntention;
+
+    let harness = TestHarness::new().await;
+    let (_, _owner_session, owner) = harness.new_user().await;
+    let (_, guest_session, guest) = harness.new_user().await;
+    let server_a = make_server(&harness, &owner).await;
+    let server_b = make_server(&harness, &owner).await;
+    for server in [&server_a, &server_b] {
+        Member::create(&harness.db, server, &guest, None)
+            .await
+            .expect("guest member");
+    }
+    upcoming_seed(
+        &harness,
+        &server_a.id,
+        &owner,
+        "a",
+        upcoming_at(UPCOMING_T0 + UPCOMING_HOUR),
+    )
+    .await;
+    upcoming_seed(
+        &harness,
+        &server_b.id,
+        &owner,
+        "b",
+        upcoming_at(UPCOMING_T0 + 2 * UPCOMING_HOUR),
+    )
+    .await;
+
+    let query = upcoming_query(UPCOMING_T0, UPCOMING_T0 + UPCOMING_DAY, None);
+    let rows = upcoming_ok(&harness, &guest_session.token, &query).await;
+    assert_eq!(upcoming_titles(&rows), ["a", "b"]);
+
+    for (server, expected) in [(&server_a, vec!["b"]), (&server_b, vec![])] {
+        harness
+            .db
+            .fetch_member(&server.id, &guest.id)
+            .await
+            .expect("member row")
+            .remove(&harness.db, server, RemovalIntention::Kick, true)
+            .await
+            .expect("kick");
+        let rows = upcoming_ok(&harness, &guest_session.token, &query).await;
+        assert_eq!(
+            upcoming_titles(&rows),
+            expected,
+            "after the kick from {}",
+            server.id
+        );
+    }
+}
+
+/// An event in a channel the caller cannot view, or in a thread under such a
+/// channel, is left out for a plain member and kept for the owner. Events in a
+/// visible channel and in a thread under it stay for both.
+#[test]
+fn upcoming_hides_denied_channel_and_its_threads() {
+    crate::util::test::rt().block_on(upcoming_hides_denied_channel_and_its_threads_case())
+}
+
+async fn upcoming_hides_denied_channel_and_its_threads_case() {
+    let harness = TestHarness::new().await;
+    let (_, owner_session, owner) = harness.new_user().await;
+    let (_, guest_session, guest) = harness.new_user().await;
+    let server = make_server(&harness, &owner).await;
+    Member::create(&harness.db, &server, &guest, None)
+        .await
+        .expect("guest member");
+
+    let mut hidden = harness.new_channel(&server).await;
+    upcoming_hide_channel(&harness, &mut hidden).await;
+    let open = harness.new_channel(&server).await;
+    let hidden_thread = upcoming_thread(&harness, &hidden, &owner, "hidden thread").await;
+    let open_thread = upcoming_thread(&harness, &open, &owner, "open thread").await;
+
+    let seeds = [
+        ("wide", None),
+        ("hidden", Some(hidden.id())),
+        ("hidden thread", Some(hidden_thread.id())),
+        ("open thread", Some(open_thread.id())),
+        ("open", Some(open.id())),
+    ];
+    for (n, (title, channel)) in (1..).zip(seeds) {
+        let seed = UpcomingSeed {
+            channel,
+            ..upcoming_at(UPCOMING_T0 + n * UPCOMING_HOUR)
+        };
+        upcoming_seed(&harness, &server.id, &owner, title, seed).await;
+    }
+
+    let query = upcoming_query(UPCOMING_T0, UPCOMING_T0 + UPCOMING_DAY, None);
+    let rows = upcoming_ok(&harness, &guest_session.token, &query).await;
+    assert_eq!(
+        upcoming_titles(&rows),
+        ["wide", "open thread", "open"],
+        "a plain member must not get events in a hidden channel or its threads"
+    );
+
+    let rows = upcoming_ok(&harness, &owner_session.token, &query).await;
+    assert_eq!(
+        upcoming_titles(&rows),
+        ["wide", "hidden", "hidden thread", "open thread", "open"],
+        "the owner views every channel"
+    );
+}
+
+/// A corrupted row that claims server A but names a channel of server B is
+/// left out, even for a member of both who can view that channel, and even
+/// though a valid event in the same channel (in its real server) is listed
+/// first.
+#[test]
+fn upcoming_skips_event_naming_another_servers_channel() {
+    crate::util::test::rt().block_on(upcoming_skips_event_naming_another_servers_channel_case())
+}
+
+async fn upcoming_skips_event_naming_another_servers_channel_case() {
+    let harness = TestHarness::new().await;
+    let (_, owner_session, owner) = harness.new_user().await;
+    let (_, guest_session, guest) = harness.new_user().await;
+    // The assertion below holds whichever server is processed first: each server
+    // is checked with its own viewer, and the event's server is compared with the
+    // channel's on every check.
+    let server_b = make_server(&harness, &owner).await;
+    let server_a = make_server(&harness, &owner).await;
+    for server in [&server_a, &server_b] {
+        Member::create(&harness.db, server, &guest, None)
+            .await
+            .expect("guest member");
+    }
+    let channel_b = harness.new_channel(&server_b).await;
+
+    let at = |n: i64, channel| UpcomingSeed {
+        channel,
+        ..upcoming_at(UPCOMING_T0 + n * UPCOMING_HOUR)
+    };
+    upcoming_seed(
+        &harness,
+        &server_b.id,
+        &owner,
+        "valid",
+        at(1, Some(channel_b.id())),
+    )
+    .await;
+    let corrupt = upcoming_seed(
+        &harness,
+        &server_a.id,
+        &owner,
+        "corrupt",
+        at(2, Some(channel_b.id())),
+    )
+    .await;
+    upcoming_seed(&harness, &server_a.id, &owner, "a wide", at(3, None)).await;
+    assert_eq!(corrupt.server, server_a.id);
+
+    let query = upcoming_query(UPCOMING_T0, UPCOMING_T0 + UPCOMING_DAY, None);
+    for token in [&guest_session.token, &owner_session.token] {
+        let rows = upcoming_ok(&harness, token, &query).await;
+        assert_eq!(
+            upcoming_titles(&rows),
+            ["valid", "a wide"],
+            "an event whose channel lives in another server is never listed"
+        );
+    }
+}
+
+/// A weekly series anchored weeks before the window, in America/New_York across
+/// the November DST change, is listed with the same occurrences `list_events`
+/// returns for that server minus the one already in progress at `from`. It is
+/// ranked by its first occurrence at or after `from`, not by its anchor.
+#[test]
+fn upcoming_series_before_window_matches_list_oracle() {
+    crate::util::test::rt().block_on(upcoming_series_before_window_matches_list_oracle_case())
+}
+
+async fn upcoming_series_before_window_matches_list_oracle_case() {
+    // Tuesday 2030-10-01 18:00 EDT.
+    const ANCHOR: i64 = 1_917_122_400_000;
+    // 2030-10-29 22:30 UTC: 30 minutes into the 18:00 EDT occurrence.
+    const FROM: i64 = 1_919_543_400_000;
+    // 2030-11-20 00:00 UTC.
+    const TO: i64 = 1_921_363_200_000;
+    // 2030-10-29 18:00 EDT, then 2030-11-05, -12 and -19 18:00 EST.
+    const IN_PROGRESS: i64 = 1_919_541_600_000;
+    const AFTER_FROM: [i64; 3] = [1_920_150_000_000, 1_920_754_800_000, 1_921_359_600_000];
+
+    let harness = TestHarness::new().await;
+    let (_, session, owner) = harness.new_user().await;
+    let server = make_server(&harness, &owner).await;
+
+    let weekly = upcoming_seed(
+        &harness,
+        &server.id,
+        &owner,
+        "weekly",
+        UpcomingSeed {
+            start: ANCHOR,
+            end: Some(ANCHOR + 2 * UPCOMING_HOUR),
+            timezone: Some("America/New_York"),
+            recurrence: Some(upcoming_weekly(12, vec![])),
+            channel: None,
+        },
+    )
+    .await;
+    // Starts after the anchor but before the series' first occurrence >= FROM.
+    upcoming_seed(
+        &harness,
+        &server.id,
+        &owner,
+        "between",
+        upcoming_at(FROM + 3 * UPCOMING_DAY),
+    )
+    .await;
+
+    let oracle = upcoming_list_oracle(&harness, &session.token, &server.id, FROM, TO).await;
+    let oracle = oracle
+        .into_iter()
+        .find(|row| row.event.id == weekly.id)
+        .expect("list_events returns the series")
+        .occurrences;
+    let mut expected_oracle = vec![IN_PROGRESS];
+    expected_oracle.extend(AFTER_FROM);
+    assert_eq!(
+        oracle, expected_oracle,
+        "the oracle includes the occurrence in progress at `from`"
+    );
+    let expected: Vec<i64> = oracle.into_iter().filter(|start| *start >= FROM).collect();
+
+    let rows = upcoming_ok(&harness, &session.token, &upcoming_query(FROM, TO, None)).await;
+    assert_eq!(upcoming_titles(&rows), ["between", "weekly"]);
+    assert_eq!(rows[1].occurrences, expected);
+    assert_eq!(rows[1].occurrences, AFTER_FROM);
+    assert_eq!(
+        rows[1].occurrences[0] - IN_PROGRESS,
+        7 * UPCOMING_DAY + UPCOMING_HOUR,
+        "the wall-clock time holds across the DST change"
+    );
+    assert_eq!(rows[1].event.start, ANCHOR, "the row carries the series");
+}
+
+/// A series whose next occurrence is excepted is keyed on the occurrence after
+/// it, and the excepted start is not in its occurrences. An identical series
+/// without the exception is keyed on the excepted start, as a control.
+#[test]
+fn upcoming_excepted_next_occurrence_keys_on_the_following_one() {
+    crate::util::test::rt()
+        .block_on(upcoming_excepted_next_occurrence_keys_on_the_following_one_case())
+}
+
+async fn upcoming_excepted_next_occurrence_keys_on_the_following_one_case() {
+    let harness = TestHarness::new().await;
+    let (_, session, owner) = harness.new_user().await;
+    let server = make_server(&harness, &owner).await;
+
+    // Weekly from two weeks before T0, so T0 is the third occurrence.
+    let series = |exceptions| UpcomingSeed {
+        start: UPCOMING_T0 - 14 * UPCOMING_DAY,
+        end: Some(UPCOMING_T0 - 14 * UPCOMING_DAY + UPCOMING_HOUR),
+        recurrence: Some(upcoming_weekly(10, exceptions)),
+        ..Default::default()
+    };
+    upcoming_seed(
+        &harness,
+        &server.id,
+        &owner,
+        "excepted",
+        series(vec![UPCOMING_T0]),
+    )
+    .await;
+    upcoming_seed(&harness, &server.id, &owner, "plain", series(vec![])).await;
+    upcoming_seed(
+        &harness,
+        &server.id,
+        &owner,
+        "midweek",
+        upcoming_at(UPCOMING_T0 + 3 * UPCOMING_DAY),
+    )
+    .await;
+
+    let (from, to) = (UPCOMING_T0 - UPCOMING_HOUR, UPCOMING_T0 + 30 * UPCOMING_DAY);
+    let weeks = |from_week: i64| -> Vec<i64> {
+        (from_week..=4)
+            .map(|week| UPCOMING_T0 + week * 7 * UPCOMING_DAY)
+            .collect()
+    };
+
+    let rows = upcoming_ok(&harness, &session.token, &upcoming_query(from, to, None)).await;
+    assert_eq!(upcoming_titles(&rows), ["plain", "midweek", "excepted"]);
+    assert_eq!(rows[0].occurrences, weeks(0));
+    assert_eq!(
+        rows[2].occurrences,
+        weeks(1),
+        "the excepted start never appears"
+    );
+
+    let rows = upcoming_ok(&harness, &session.token, &upcoming_query(from, to, Some(2))).await;
+    assert_eq!(upcoming_titles(&rows), ["plain", "midweek"]);
+}
+
+/// Cancelled series and cancelled one-offs are left out, and so is anything
+/// whose only in-window occurrence started before `from`: a one-off in
+/// progress at `from`, and a series whose last occurrence is in progress. An
+/// event starting exactly at `from` is kept. `list_events` still returns all of
+/// them, so the exclusions are this route's own.
+#[test]
+fn upcoming_excludes_cancelled_and_already_started() {
+    crate::util::test::rt().block_on(upcoming_excludes_cancelled_and_already_started_case())
+}
+
+async fn upcoming_excludes_cancelled_and_already_started_case() {
+    let harness = TestHarness::new().await;
+    let (_, owner_session, owner) = harness.new_user().await;
+    let (_, guest_session, guest) = harness.new_user().await;
+    let server = make_server(&harness, &owner).await;
+    Member::create(&harness.db, &server, &guest, None)
+        .await
+        .expect("guest member");
+
+    let (from, to) = (UPCOMING_T0, UPCOMING_T0 + 7 * UPCOMING_DAY);
+    let cancelled_series = upcoming_seed(
+        &harness,
+        &server.id,
+        &owner,
+        "cancelled series",
+        UpcomingSeed {
+            recurrence: Some(upcoming_weekly(4, vec![])),
+            ..upcoming_at(from + UPCOMING_HOUR)
+        },
+    )
+    .await;
+    let cancelled_oneoff = upcoming_seed(
+        &harness,
+        &server.id,
+        &owner,
+        "cancelled one-off",
+        upcoming_at(from + 2 * UPCOMING_HOUR),
+    )
+    .await;
+    for event in [&cancelled_series, &cancelled_oneoff] {
+        let response = harness
+            .client
+            .delete(format!("/events/event/{}", event.id))
+            .header(Header::new(
+                "x-session-token",
+                owner_session.token.to_string(),
+            ))
+            .dispatch()
+            .await;
+        assert_eq!(response.status(), Status::NoContent);
+    }
+    upcoming_seed(
+        &harness,
+        &server.id,
+        &owner,
+        "in progress",
+        UpcomingSeed {
+            end: Some(from + UPCOMING_HOUR),
+            ..upcoming_at(from - UPCOMING_HOUR)
+        },
+    )
+    .await;
+    // Two weekly occurrences; the second runs from 30 minutes before `from`
+    // until 90 minutes after it.
+    let last_start = from - 30 * UPCOMING_MINUTE;
+    upcoming_seed(
+        &harness,
+        &server.id,
+        &owner,
+        "series in progress",
+        UpcomingSeed {
+            start: last_start - 7 * UPCOMING_DAY,
+            end: Some(last_start - 7 * UPCOMING_DAY + 2 * UPCOMING_HOUR),
+            recurrence: Some(upcoming_weekly(2, vec![])),
+            ..Default::default()
+        },
+    )
+    .await;
+    upcoming_seed(&harness, &server.id, &owner, "at from", upcoming_at(from)).await;
+    upcoming_seed(
+        &harness,
+        &server.id,
+        &owner,
+        "later",
+        upcoming_at(from + 3 * UPCOMING_HOUR),
+    )
+    .await;
+
+    // Oracle: the per-server list returns every one of them.
+    let listed = upcoming_list_oracle(&harness, &guest_session.token, &server.id, from, to).await;
+    let mut listed = upcoming_titles(&listed)
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    listed.sort();
+    assert_eq!(
+        listed,
+        [
+            "at from",
+            "cancelled one-off",
+            "cancelled series",
+            "in progress",
+            "later",
+            "series in progress"
+        ]
+    );
+
+    let rows = upcoming_ok(
+        &harness,
+        &guest_session.token,
+        &upcoming_query(from, to, None),
+    )
+    .await;
+    assert_eq!(upcoming_titles(&rows), ["at from", "later"]);
+    assert_eq!(rows[0].occurrences, vec![from]);
+}
+
+/// Bad windows are 400 `FailedValidation{window}`, never a 404 forward or a
+/// panic: inverted, longer than 62 days, i64 extremes, and missing or
+/// unparseable bounds. Exactly 62 days and a zero-length window are accepted
+/// and both ends are inclusive.
+#[test]
+fn upcoming_rejects_bad_windows() {
+    crate::util::test::rt().block_on(upcoming_rejects_bad_windows_case())
+}
+
+async fn upcoming_rejects_bad_windows_case() {
+    let harness = TestHarness::new().await;
+    let (_, session, owner) = harness.new_user().await;
+    let (_, other_session, _) = harness.new_user().await;
+    let server = make_server(&harness, &owner).await;
+    let start = UPCOMING_T0 + UPCOMING_HOUR;
+    upcoming_seed(&harness, &server.id, &owner, "event", upcoming_at(start)).await;
+
+    // Seven calls on the first session.
+    let token = &session.token;
+    let t0 = UPCOMING_T0;
+    upcoming_rejects(&harness, token, &upcoming_query(t0 + 1, t0, None), "window").await;
+    let over = t0 + UPCOMING_MAX_WINDOW + 1;
+    upcoming_rejects(&harness, token, &upcoming_query(t0, over, None), "window").await;
+    let rows = upcoming_ok(
+        &harness,
+        token,
+        &upcoming_query(t0, t0 + UPCOMING_MAX_WINDOW, None),
+    )
+    .await;
+    assert_eq!(
+        upcoming_titles(&rows),
+        ["event"],
+        "exactly 62 days is accepted"
+    );
+    let rows = upcoming_ok(&harness, token, &upcoming_query(start, start, None)).await;
+    assert_eq!(
+        upcoming_titles(&rows),
+        ["event"],
+        "from == to == start is kept"
+    );
+    for (from, to) in [(i64::MIN, i64::MAX), (i64::MAX, i64::MIN), (i64::MIN, 0)] {
+        upcoming_rejects(&harness, token, &upcoming_query(from, to, None), "window").await;
+    }
+
+    // Six calls on a second session.
+    let token = &other_session.token;
+    for query in [
+        format!("?to={t0}"),
+        format!("?from={t0}"),
+        String::new(),
+        format!("?from=abc&to={t0}"),
+        format!("?from=9223372036854775808&to={t0}"),
+        upcoming_query(0, i64::MAX, None),
+    ] {
+        upcoming_rejects(&harness, token, &query, "window").await;
+    }
+}
+
+/// `limit` defaults to 20 and accepts 1..=100; 0, 101 and -1 are 400
+/// `FailedValidation{limit}`. The rows are the soonest ones, in order.
+#[test]
+fn upcoming_limit_default_and_bounds() {
+    crate::util::test::rt().block_on(upcoming_limit_default_and_bounds_case())
+}
+
+async fn upcoming_limit_default_and_bounds_case() {
+    let harness = TestHarness::new().await;
+    let (_, session, owner) = harness.new_user().await;
+    let server = make_server(&harness, &owner).await;
+
+    // 25 hourly one-offs, created in a shuffled order (7 is coprime to 25).
+    for i in 0..25 {
+        let n = (i * 7) % 25;
+        let seed = upcoming_at(UPCOMING_T0 + n * UPCOMING_HOUR);
+        upcoming_seed(&harness, &server.id, &owner, &format!("e{n:02}"), seed).await;
+    }
+    let titles = |count: i64| -> Vec<String> { (0..count).map(|n| format!("e{n:02}")).collect() };
+
+    let (from, to) = (UPCOMING_T0, UPCOMING_T0 + 7 * UPCOMING_DAY);
+    let token = &session.token;
+    let rows = upcoming_ok(&harness, token, &upcoming_query(from, to, None)).await;
+    assert_eq!(
+        upcoming_titles(&rows),
+        titles(20),
+        "the default limit is 20"
+    );
+    let rows = upcoming_ok(&harness, token, &upcoming_query(from, to, Some(100))).await;
+    assert_eq!(upcoming_titles(&rows), titles(25));
+    let rows = upcoming_ok(&harness, token, &upcoming_query(from, to, Some(1))).await;
+    assert_eq!(upcoming_titles(&rows), titles(1));
+    for limit in [0, 101, -1] {
+        upcoming_rejects(
+            &harness,
+            token,
+            &upcoming_query(from, to, Some(limit)),
+            "limit",
+        )
+        .await;
+    }
+}
+
+/// With rows from two servers created in a shuffled order, `limit` keeps the
+/// soonest N overall in (first occurrence, id) order, not each server's first
+/// rows in server order.
+#[test]
+fn upcoming_returns_the_soonest_n_across_servers() {
+    crate::util::test::rt().block_on(upcoming_returns_the_soonest_n_across_servers_case())
+}
+
+async fn upcoming_returns_the_soonest_n_across_servers_case() {
+    let harness = TestHarness::new().await;
+    let (_, session, owner) = harness.new_user().await;
+    let server_a = make_server(&harness, &owner).await;
+    let server_b = make_server(&harness, &owner).await;
+
+    let mut seeded = Vec::new();
+    for (server, hours, title) in [
+        (&server_b, 5, "b5"),
+        (&server_a, 2, "a2"),
+        (&server_b, 1, "b1"),
+        (&server_a, 6, "a6"),
+        (&server_a, 4, "a4"),
+        (&server_b, 3, "b3"),
+        (&server_b, 7, "b7 tie"),
+        (&server_a, 7, "a7 tie"),
+    ] {
+        let seed = upcoming_at(UPCOMING_T0 + hours * UPCOMING_HOUR);
+        seeded.push(upcoming_seed(&harness, &server.id, &owner, title, seed).await);
+    }
+
+    let (from, to) = (UPCOMING_T0, UPCOMING_T0 + UPCOMING_DAY);
+    let rows = upcoming_ok(&harness, &session.token, &upcoming_query(from, to, Some(3))).await;
+    assert_eq!(upcoming_titles(&rows), ["b1", "a2", "b3"]);
+
+    // The 7-hour tie is broken by event id.
+    let rows = upcoming_ok(
+        &harness,
+        &session.token,
+        &upcoming_query(from, to, Some(100)),
+    )
+    .await;
+    assert_eq!(upcoming_ids(&rows), upcoming_expected_order(&seeded));
+    assert_eq!(rows.len(), 8);
+}
+
+/// A server with more than a page of near events cannot push another server's
+/// sooner-or-equal events out of the top `limit`, whatever the server order.
+#[test]
+fn upcoming_busy_server_cannot_crowd_out_another() {
+    crate::util::test::rt().block_on(upcoming_busy_server_cannot_crowd_out_another_case())
+}
+
+async fn upcoming_busy_server_cannot_crowd_out_another_case() {
+    let harness = TestHarness::new().await;
+    let (_, _owner_session, owner) = harness.new_user().await;
+    let (_, guest_session, guest) = harness.new_user().await;
+    // The busy server is created first, so it has the lower id.
+    let busy = make_server(&harness, &owner).await;
+    let quiet = make_server(&harness, &owner).await;
+    for server in [&busy, &quiet] {
+        Member::create(&harness.db, server, &guest, None)
+            .await
+            .expect("guest member");
+    }
+
+    // 150 one-offs a minute apart starting at T0.
+    let mut seeded = Vec::new();
+    for n in 0..150 {
+        let seed = upcoming_at(UPCOMING_T0 + n * UPCOMING_MINUTE);
+        seeded.push(upcoming_seed(&harness, &busy.id, &owner, &format!("busy {n}"), seed).await);
+    }
+    // Same keys as the busy server's first and third events.
+    let quiet_first = upcoming_seed(
+        &harness,
+        &quiet.id,
+        &owner,
+        "quiet first",
+        upcoming_at(UPCOMING_T0),
+    )
+    .await;
+    let third = upcoming_at(UPCOMING_T0 + 2 * UPCOMING_MINUTE);
+    let quiet_third = upcoming_seed(&harness, &quiet.id, &owner, "quiet third", third).await;
+    seeded.push(quiet_first.clone());
+    seeded.push(quiet_third.clone());
+    let expected = upcoming_expected_order(&seeded);
+
+    let (from, to) = (UPCOMING_T0, UPCOMING_T0 + UPCOMING_DAY);
+    for limit in [5, 100] {
+        let rows = upcoming_ok(
+            &harness,
+            &guest_session.token,
+            &upcoming_query(from, to, Some(limit)),
+        )
+        .await;
+        let ids = upcoming_ids(&rows);
+        assert_eq!(ids, expected[..limit as usize], "limit {limit}");
+        for quiet_event in [&quiet_first, &quiet_third] {
+            assert!(
+                ids.contains(&quiet_event.id.as_str()),
+                "limit {limit}: {} was crowded out",
+                quiet_event.title
+            );
+        }
+    }
+}
+
+/// More than a page of events in a hidden channel, all sooner than a visible
+/// event in the same server, cannot hide the visible one from a plain member.
+#[test]
+fn upcoming_hidden_rows_cannot_hide_a_visible_event() {
+    crate::util::test::rt().block_on(upcoming_hidden_rows_cannot_hide_a_visible_event_case())
+}
+
+async fn upcoming_hidden_rows_cannot_hide_a_visible_event_case() {
+    let harness = TestHarness::new().await;
+    let (_, owner_session, owner) = harness.new_user().await;
+    let (_, guest_session, guest) = harness.new_user().await;
+    let server = make_server(&harness, &owner).await;
+    Member::create(&harness.db, &server, &guest, None)
+        .await
+        .expect("guest member");
+    let mut hidden = harness.new_channel(&server).await;
+    upcoming_hide_channel(&harness, &mut hidden).await;
+
+    for n in 0..120 {
+        let seed = UpcomingSeed {
+            channel: Some(hidden.id()),
+            ..upcoming_at(UPCOMING_T0 + n * UPCOMING_MINUTE)
+        };
+        upcoming_seed(
+            &harness,
+            &server.id,
+            &owner,
+            &format!("hidden {n:03}"),
+            seed,
+        )
+        .await;
+    }
+    let later = upcoming_at(UPCOMING_T0 + 3 * UPCOMING_HOUR);
+    upcoming_seed(&harness, &server.id, &owner, "visible", later).await;
+
+    let (from, to) = (UPCOMING_T0, UPCOMING_T0 + UPCOMING_DAY);
+    for limit in [Some(1), None] {
+        let rows = upcoming_ok(
+            &harness,
+            &guest_session.token,
+            &upcoming_query(from, to, limit),
+        )
+        .await;
+        assert_eq!(upcoming_titles(&rows), ["visible"], "limit {limit:?}");
+    }
+
+    // Control: the hidden rows are real and sooner.
+    let rows = upcoming_ok(
+        &harness,
+        &owner_session.token,
+        &upcoming_query(from, to, Some(3)),
+    )
+    .await;
+    assert_eq!(
+        upcoming_titles(&rows),
+        ["hidden 000", "hidden 001", "hidden 002"]
+    );
+}
+
+/// The one-off scan stops once `limit` one-offs are visible, but series do not
+/// count toward that stop: a series keyed between those one-offs still takes its
+/// place in the cut, and one keyed after all of them is cut, as is the last
+/// one-off.
+#[test]
+fn upcoming_series_do_not_count_toward_the_oneoff_stop() {
+    crate::util::test::rt().block_on(upcoming_series_do_not_count_toward_the_oneoff_stop_case())
+}
+
+async fn upcoming_series_do_not_count_toward_the_oneoff_stop_case() {
+    let harness = TestHarness::new().await;
+    let (_, session, owner) = harness.new_user().await;
+    let server = make_server(&harness, &owner).await;
+
+    // Weekly series anchored a week before T0, so the anchor is outside the window
+    // and the key is the second occurrence.
+    let weekly_at = |hours: i64| UpcomingSeed {
+        start: UPCOMING_T0 - 7 * UPCOMING_DAY + hours * UPCOMING_HOUR,
+        end: Some(UPCOMING_T0 - 7 * UPCOMING_DAY + hours * UPCOMING_HOUR + UPCOMING_MINUTE),
+        recurrence: Some(upcoming_weekly(4, vec![])),
+        ..Default::default()
+    };
+    let early = upcoming_seed(&harness, &server.id, &owner, "early series", weekly_at(2)).await;
+    upcoming_seed(&harness, &server.id, &owner, "late series", weekly_at(6)).await;
+    for hours in [1, 3, 5] {
+        let seed = upcoming_at(UPCOMING_T0 + hours * UPCOMING_HOUR);
+        upcoming_seed(
+            &harness,
+            &server.id,
+            &owner,
+            &format!("one-off {hours}"),
+            seed,
+        )
+        .await;
+    }
+
+    let (from, to) = (UPCOMING_T0, UPCOMING_T0 + UPCOMING_DAY);
+    let rows = upcoming_ok(&harness, &session.token, &upcoming_query(from, to, Some(3))).await;
+    assert_eq!(
+        upcoming_titles(&rows),
+        ["one-off 1", "early series", "one-off 3"],
+        "the early series sits between the one-offs; the late series and the last one-off are cut"
+    );
+    assert_eq!(rows[1].event.id, early.id);
+    assert_eq!(rows[1].occurrences, vec![UPCOMING_T0 + 2 * UPCOMING_HOUR]);
+
+    // Control: with room for everything, the late series and the last one-off are listed.
+    let rows = upcoming_ok(
+        &harness,
+        &session.token,
+        &upcoming_query(from, to, Some(100)),
+    )
+    .await;
+    assert_eq!(
+        upcoming_titles(&rows),
+        [
+            "one-off 1",
+            "early series",
+            "one-off 3",
+            "one-off 5",
+            "late series"
+        ]
+    );
+}
+
+/// A bot is refused with 400 `IsBot`, even as a member of a server with events.
+#[test]
+fn upcoming_rejects_bots() {
+    crate::util::test::rt().block_on(upcoming_rejects_bots_case())
+}
+
+async fn upcoming_rejects_bots_case() {
+    use revolt_database::Bot;
+
+    let harness = TestHarness::new().await;
+    let (_, _session, owner) = harness.new_user().await;
+    let server = make_server(&harness, &owner).await;
+    let (bot, bot_user) = Bot::create(&harness.db, TestHarness::rand_string(), &owner, None)
+        .await
+        .expect("bot");
+    Member::create(&harness.db, &server, &bot_user, None)
+        .await
+        .expect("bot member");
+    let seed = upcoming_at(UPCOMING_T0 + UPCOMING_HOUR);
+    upcoming_seed(&harness, &server.id, &owner, "event", seed).await;
+
+    let query = upcoming_query(UPCOMING_T0, UPCOMING_T0 + UPCOMING_DAY, None);
+    let (status, body) =
+        upcoming_get(&harness, Some(("x-bot-token", bot.token.as_str())), &query).await;
+    assert_eq!(status, Status::BadRequest, "{body}");
+    assert_eq!(body["type"], "IsBot", "{body}");
+}
+
+/// The route never answers NotFound, which the client reads as "this server
+/// predates the route": a caller with no servers, and one whose only server
+/// holds nothing in the window but an event naming a channel that does not
+/// exist, both get 200 with an empty list. No session is 401.
+#[test]
+fn upcoming_never_answers_not_found() {
+    crate::util::test::rt().block_on(upcoming_never_answers_not_found_case())
+}
+
+async fn upcoming_never_answers_not_found_case() {
+    let harness = TestHarness::new().await;
+    let (_, lonely_session, _) = harness.new_user().await;
+    let (_, session, owner) = harness.new_user().await;
+    let server = make_server(&harness, &owner).await;
+
+    let query = upcoming_query(UPCOMING_T0, UPCOMING_T0 + UPCOMING_DAY, None);
+
+    // Zero memberships.
+    let rows = upcoming_ok(&harness, &lonely_session.token, &query).await;
+    assert!(rows.is_empty());
+
+    // Outside the window, and a dangling channel id inside it.
+    let past = upcoming_at(UPCOMING_T0 - UPCOMING_DAY);
+    upcoming_seed(&harness, &server.id, &owner, "past", past).await;
+    let missing_channel = ulid::Ulid::new().to_string();
+    let dangling = UpcomingSeed {
+        channel: Some(missing_channel.as_str()),
+        ..upcoming_at(UPCOMING_T0 + UPCOMING_HOUR)
+    };
+    upcoming_seed(&harness, &server.id, &owner, "dangling", dangling).await;
+    let rows = upcoming_ok(&harness, &session.token, &query).await;
+    assert!(rows.is_empty(), "{:?}", upcoming_titles(&rows));
+
+    // No credentials at all.
+    let (status, _) = upcoming_get(&harness, None, &query).await;
+    assert_eq!(status, Status::Unauthorized);
+}
+
+// ---------------------------------------------------------------------------
 // Thread and forum-post event scope: events in a thread or forum post take the
 // parent channel's permissions. The helpers below are used only by the tests
 // in this block.

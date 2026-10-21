@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use chrono::{
     DateTime, Datelike, Duration, LocalResult, NaiveDate, NaiveDateTime, Offset, TimeZone, Utc,
 };
@@ -414,16 +416,22 @@ pub fn series_occurrence_starts_bounded(event: &CalendarEvent, stop_after: Optio
     out
 }
 
+/// The event's excepted occurrence starts as a set, built once per call so each
+/// expanded occurrence is a constant-time lookup. Empty for a one-off.
+fn exception_set(event: &CalendarEvent) -> HashSet<i64> {
+    event
+        .recurrence
+        .as_ref()
+        .map(|r| r.exceptions.iter().copied().collect())
+        .unwrap_or_default()
+}
+
 /// Occurrence starts (UTC ms) that overlap the window `[from, to]`, with
 /// `exceptions` removed. Occurrences before the window still count toward a
 /// `Count` terminator but are not returned.
 pub fn occurrences_in_window(event: &CalendarEvent, from: i64, to: i64) -> Vec<i64> {
     let duration = event.duration_ms.max(0);
-    let exceptions = event
-        .recurrence
-        .as_ref()
-        .map(|r| r.exceptions.clone())
-        .unwrap_or_default();
+    let exceptions = exception_set(event);
 
     // Bounded expansion: no occurrence starting after `to` can overlap the window,
     // and starts are non-decreasing, so stop expanding there (slice F, deferred LOW).
@@ -459,11 +467,7 @@ pub fn reminders_due_for_event(event: &CalendarEvent, now: i64) -> Vec<(i64, i64
     if event.cancelled {
         return vec![];
     }
-    let exceptions = event
-        .recurrence
-        .as_ref()
-        .map(|r| r.exceptions.clone())
-        .unwrap_or_default();
+    let exceptions = exception_set(event);
 
     // All-day events are anchored to local midnight; a "30-min-before" reminder would
     // fire at 23:30 the night before, which is surprising. Remind only at the start.
@@ -567,6 +571,13 @@ impl CalendarEvent {
             if !(1..=52).contains(&rule.interval) {
                 return Err(create_error!(FailedValidation {
                     error: "interval".to_string()
+                }));
+            }
+            // A series never has more than MAX_OCCURRENCES occurrences, so a longer
+            // exception list can only be padding; it also bounds the per-read lookup set.
+            if rule.exceptions.len() > MAX_OCCURRENCES {
+                return Err(create_error!(FailedValidation {
+                    error: "exceptions".to_string()
                 }));
             }
             // by_weekday only makes sense for a weekly rule, and (when present) must
@@ -1009,6 +1020,94 @@ mod tests {
             exceptions: vec![],
         });
         assert!(event.validate().is_err());
+    }
+
+    #[test]
+    fn validate_caps_exceptions_at_max_occurrences() {
+        let rule = RecurrenceRule {
+            freq: Frequency::Daily,
+            interval: 1,
+            by_weekday: vec![],
+            end: RecurrenceEnd::Count { count: 5 },
+            exceptions: vec![],
+        };
+        let mut event = event_at_local(chrono_tz::UTC, 2026, 6, 1, 9, 0, Some(rule));
+        let start = event.start;
+        let set_exceptions = |event: &mut CalendarEvent, len: i64| {
+            event.recurrence.as_mut().unwrap().exceptions =
+                (0..len).map(|n| start + day_ms(n)).collect();
+        };
+
+        set_exceptions(&mut event, MAX_OCCURRENCES as i64);
+        assert!(
+            event.validate().is_ok(),
+            "exactly MAX_OCCURRENCES is accepted"
+        );
+
+        set_exceptions(&mut event, MAX_OCCURRENCES as i64 + 1);
+        let error = event.validate().expect_err("one past the cap is rejected");
+        assert!(
+            matches!(
+                &error.error_type,
+                revolt_result::ErrorType::FailedValidation { error: field } if field == "exceptions"
+            ),
+            "{error:?}"
+        );
+    }
+
+    /// The pre-set implementation: a linear scan of `exceptions` per occurrence.
+    fn occurrences_in_window_linear(event: &CalendarEvent, from: i64, to: i64) -> Vec<i64> {
+        let exceptions = &event.recurrence.as_ref().unwrap().exceptions;
+        series_occurrence_starts(event)
+            .into_iter()
+            .filter(|s| !exceptions.contains(s))
+            .filter(|s| *s <= to && s.saturating_add(event.duration_ms.max(0)) >= from)
+            .collect()
+    }
+
+    #[test]
+    fn many_exceptions_match_the_linear_scan() {
+        let rule = RecurrenceRule {
+            freq: Frequency::Daily,
+            interval: 1,
+            by_weekday: vec![],
+            end: RecurrenceEnd::Count { count: 60 },
+            exceptions: vec![],
+        };
+        let mut event = event_at_local(chrono_tz::UTC, 2026, 6, 1, 9, 0, Some(rule));
+        let starts = series_occurrence_starts(&event);
+        assert_eq!(starts.len(), 60);
+
+        // Every third occurrence (before, inside and after the window), plus 700
+        // instants that match no occurrence: 720 in all, unsorted.
+        let mut exceptions: Vec<i64> = starts.iter().step_by(3).copied().rev().collect();
+        exceptions.extend((1..=700).map(|n| starts[0] + n * 1000));
+        assert_eq!(exceptions.len(), 720);
+        event.recurrence.as_mut().unwrap().exceptions = exceptions;
+        assert!(event.validate().is_ok());
+
+        // Occurrences 10..=40 overlap the window.
+        let (from, to) = (starts[10], starts[40]);
+        let expected: Vec<i64> = (10..=40)
+            .filter(|n| n % 3 != 0)
+            .map(|n| starts[n])
+            .collect();
+        assert_eq!(occurrences_in_window(&event, from, to), expected);
+        assert_eq!(
+            occurrences_in_window(&event, from, to),
+            occurrences_in_window_linear(&event, from, to)
+        );
+        // A window over the whole series.
+        assert_eq!(
+            occurrences_in_window(&event, starts[0], starts[59]),
+            occurrences_in_window_linear(&event, starts[0], starts[59])
+        );
+
+        // Reminders: an excepted occurrence never reminds, every other one does.
+        for (n, occ) in starts.iter().enumerate() {
+            let due = reminders_due_for_event(&event, *occ);
+            assert_eq!(due.contains(&(*occ, 0)), n % 3 != 0, "occurrence {n}");
+        }
     }
 
     #[tokio::test]
@@ -1671,6 +1770,374 @@ mod tests {
             assert!(
                 db.mark_reminder_sent_if_absent(&marker).await.unwrap(),
                 "the reminder marker was deleted by the server cascade"
+            );
+        });
+    }
+
+    /// Build a validated event with a CHOSEN id (so tie-break order is not insertion
+    /// order) and correct derived `duration_ms`/`series_end`, for the upcoming-ops tests.
+    fn upcoming_event(
+        id: &str,
+        server: &str,
+        start: i64,
+        recurrence: Option<RecurrenceRule>,
+        cancelled: bool,
+    ) -> CalendarEvent {
+        let mut event = CalendarEvent {
+            id: id.to_string(),
+            server: server.to_string(),
+            channel: None,
+            creator: "01H".to_string(),
+            title: "Up".to_string(),
+            description: None,
+            location: None,
+            start,
+            end: Some(start + 3_600_000),
+            duration_ms: 3_600_000,
+            series_end: start,
+            all_day: false,
+            timezone: "UTC".to_string(),
+            recurrence,
+            color: None,
+            cancelled,
+            source_message_id: None,
+            attachments: None,
+            created_at: 0,
+            edited_at: None,
+        };
+        event.validate().unwrap();
+        event.series_end = event.compute_series_end();
+        event
+    }
+
+    fn upcoming_rule(freq: Frequency, count: u16) -> Option<RecurrenceRule> {
+        Some(RecurrenceRule {
+            freq,
+            interval: 1,
+            by_weekday: vec![],
+            end: RecurrenceEnd::Count { count },
+            exceptions: vec![],
+        })
+    }
+
+    fn ids(events: &[CalendarEvent]) -> Vec<&str> {
+        events.iter().map(|e| e.id.as_str()).collect()
+    }
+
+    /// Cross-server upcoming ops: the one-off/recurring split, the `[from, to]` start
+    /// bound for one-offs vs the span overlap for series, cancelled excluded from both,
+    /// other servers excluded, (start, id) order, offset/limit paging, limit 0.
+    #[tokio::test]
+    async fn upcoming_ops_split_filter_order_and_page() {
+        database_test!(|db| async move {
+            let from = 1_900_000_000_000_i64;
+            let to = from + day_ms(14);
+            let hour = 3_600_000_i64;
+
+            let events = [
+                // One-offs on server A. Ids are deliberately NOT in start order, and the
+                // three ties at `from + 2d` are inserted in reverse id order.
+                upcoming_event("01O_AT_FROM", "01UPA", from, None, false),
+                upcoming_event("01O_ZDAY1", "01UPA", from + day_ms(1), None, false),
+                upcoming_event("01O_TIE_C", "01UPA", from + day_ms(2), None, false),
+                upcoming_event("01O_TIE_B", "01UPA", from + day_ms(2), None, false),
+                upcoming_event("01O_TIE_A", "01UPA", from + day_ms(2), None, false),
+                upcoming_event("01O_AT_TO", "01UPA", to, None, false),
+                // In progress at `from` (started an hour before): NOT upcoming.
+                upcoming_event("01O_INPROG", "01UPA", from - hour, None, false),
+                upcoming_event("01O_AFTER", "01UPA", to + 1, None, false),
+                upcoming_event("01O_CANCEL", "01UPA", from + day_ms(3), None, true),
+                // Series on server A.
+                // Anchored 30 days before the window, weekly x10: still running.
+                upcoming_event(
+                    "01S_RUNNING",
+                    "01UPA",
+                    from - day_ms(30),
+                    upcoming_rule(Frequency::Weekly, 10),
+                    false,
+                ),
+                // Starts inside the window: a series, so never a one-off.
+                upcoming_event(
+                    "01S_INWIN",
+                    "01UPA",
+                    from + day_ms(1),
+                    upcoming_rule(Frequency::Daily, 3),
+                    false,
+                ),
+                // Ended before the window (series_end < from).
+                upcoming_event(
+                    "01S_ENDED",
+                    "01UPA",
+                    from - day_ms(30),
+                    upcoming_rule(Frequency::Daily, 5),
+                    false,
+                ),
+                upcoming_event(
+                    "01S_FUTURE",
+                    "01UPA",
+                    to + 1,
+                    upcoming_rule(Frequency::Daily, 3),
+                    false,
+                ),
+                upcoming_event(
+                    "01S_CANCEL",
+                    "01UPA",
+                    from - day_ms(7),
+                    upcoming_rule(Frequency::Weekly, 10),
+                    true,
+                ),
+                // Another server: never returned for server A.
+                upcoming_event("01O_OTHER", "01UPB", from + day_ms(1), None, false),
+                upcoming_event(
+                    "01S_OTHER",
+                    "01UPB",
+                    from - day_ms(7),
+                    upcoming_rule(Frequency::Weekly, 10),
+                    false,
+                ),
+            ];
+            for event in &events {
+                db.insert_event(event).await.unwrap();
+            }
+            let by_id = |id: &str| events.iter().find(|e| e.id == id).unwrap().clone();
+            assert!(
+                by_id("01S_ENDED").series_end < from,
+                "fixture: the ended series must end before the window"
+            );
+            assert!(
+                by_id("01S_RUNNING").series_end >= from,
+                "fixture: the running series must still be live at the window start"
+            );
+
+            let oneoffs = db
+                .fetch_upcoming_oneoffs_for_server("01UPA", from, to, 0, 100)
+                .await
+                .unwrap();
+            assert_eq!(
+                ids(&oneoffs),
+                vec![
+                    "01O_AT_FROM",
+                    "01O_ZDAY1",
+                    "01O_TIE_A",
+                    "01O_TIE_B",
+                    "01O_TIE_C",
+                    "01O_AT_TO",
+                ],
+                "one-offs: start in [from, to] inclusive, (start, id) order; in-progress, \
+                 after-window, cancelled, recurring and other-server rows excluded"
+            );
+
+            let series = db
+                .fetch_upcoming_series_for_server("01UPA", from, to, 100)
+                .await
+                .unwrap();
+            assert_eq!(
+                ids(&series),
+                vec!["01S_RUNNING", "01S_INWIN"],
+                "series: span overlaps the window, (start, id) order; ended, future, \
+                 cancelled, one-off and other-server rows excluded"
+            );
+
+            // The split is exact: no row is in both.
+            assert!(oneoffs.iter().all(|o| series.iter().all(|s| s.id != o.id)));
+
+            // Server B sees only its own rows.
+            assert_eq!(
+                ids(&db
+                    .fetch_upcoming_oneoffs_for_server("01UPB", from, to, 0, 100)
+                    .await
+                    .unwrap()),
+                vec!["01O_OTHER"]
+            );
+            assert_eq!(
+                ids(&db
+                    .fetch_upcoming_series_for_server("01UPB", from, to, 100)
+                    .await
+                    .unwrap()),
+                vec!["01S_OTHER"]
+            );
+
+            // Paging: consecutive pages are disjoint and concatenate to the full list.
+            let mut paged = Vec::new();
+            for offset in [0_usize, 2, 4] {
+                let page = db
+                    .fetch_upcoming_oneoffs_for_server("01UPA", from, to, offset, 2)
+                    .await
+                    .unwrap();
+                assert_eq!(page.len(), 2, "page at offset {offset}");
+                paged.extend(page);
+            }
+            assert_eq!(ids(&paged), ids(&oneoffs));
+            assert!(db
+                .fetch_upcoming_oneoffs_for_server("01UPA", from, to, 6, 2)
+                .await
+                .unwrap()
+                .is_empty());
+            // A short last page.
+            assert_eq!(
+                ids(&db
+                    .fetch_upcoming_oneoffs_for_server("01UPA", from, to, 5, 2)
+                    .await
+                    .unwrap()),
+                vec!["01O_AT_TO"]
+            );
+            // Huge offset/limit saturate rather than panic.
+            assert!(db
+                .fetch_upcoming_oneoffs_for_server("01UPA", from, to, usize::MAX, usize::MAX)
+                .await
+                .unwrap()
+                .is_empty());
+            assert_eq!(
+                db.fetch_upcoming_series_for_server("01UPA", from, to, usize::MAX)
+                    .await
+                    .unwrap()
+                    .len(),
+                2
+            );
+
+            // Series limit keeps the earliest by (start, id).
+            assert_eq!(
+                ids(&db
+                    .fetch_upcoming_series_for_server("01UPA", from, to, 1)
+                    .await
+                    .unwrap()),
+                vec!["01S_RUNNING"]
+            );
+
+            // limit 0 is empty (Mongo would read `limit(0)` as unlimited).
+            assert!(db
+                .fetch_upcoming_oneoffs_for_server("01UPA", from, to, 0, 0)
+                .await
+                .unwrap()
+                .is_empty());
+            assert!(db
+                .fetch_upcoming_series_for_server("01UPA", from, to, 0)
+                .await
+                .unwrap()
+                .is_empty());
+        });
+    }
+
+    /// Mongo storage forms the upcoming filters must handle beyond what the serializer
+    /// writes: an explicit `recurrence: null` is a one-off (never a series), and an
+    /// explicit `cancelled: false` is not cancelled. Mongo-only: the Reference driver
+    /// holds typed structs, so neither form exists there.
+    #[cfg(feature = "mongodb")]
+    #[tokio::test]
+    async fn upcoming_ops_mongo_explicit_null_and_false() {
+        database_test!(|db| async move {
+            let crate::Database::MongoDb(mongo) = &db else {
+                return;
+            };
+            use bson::{doc, to_document, Bson, Document};
+
+            let from = 1_900_000_000_000_i64;
+            let to = from + day_ms(14);
+
+            let mut oneoff = to_document(&upcoming_event(
+                "01O_NULLREC",
+                "01UPM",
+                from + 1,
+                None,
+                false,
+            ))
+            .unwrap();
+            assert!(
+                !oneoff.contains_key("recurrence"),
+                "None is skip-serialized"
+            );
+            assert!(
+                !oneoff.contains_key("cancelled"),
+                "false is skip-serialized"
+            );
+            oneoff.insert("recurrence", Bson::Null);
+            oneoff.insert("cancelled", false);
+
+            let mut series = to_document(&upcoming_event(
+                "01S_FALSECANCEL",
+                "01UPM",
+                from + 1,
+                upcoming_rule(Frequency::Daily, 3),
+                false,
+            ))
+            .unwrap();
+            series.insert("cancelled", false);
+
+            let col = mongo.col::<Document>("calendar_events");
+            col.insert_one(oneoff).await.unwrap();
+            col.insert_one(series).await.unwrap();
+            // Sanity: the raw forms really are stored.
+            let stored = col
+                .find_one(doc! { "_id": "01O_NULLREC" })
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(stored.get("recurrence"), Some(&Bson::Null));
+
+            assert_eq!(
+                ids(&db
+                    .fetch_upcoming_oneoffs_for_server("01UPM", from, to, 0, 10)
+                    .await
+                    .unwrap()),
+                vec!["01O_NULLREC"]
+            );
+            assert_eq!(
+                ids(&db
+                    .fetch_upcoming_series_for_server("01UPM", from, to, 10)
+                    .await
+                    .unwrap()),
+                vec!["01S_FALSECANCEL"]
+            );
+        });
+    }
+
+    /// Series window edges are inclusive: a series anchored exactly at `to`, and one
+    /// whose computed `series_end` is exactly `from` (its last occurrence ends at
+    /// `from`), are both returned; one millisecond past either edge is not.
+    #[tokio::test]
+    async fn upcoming_series_window_edges_are_inclusive() {
+        database_test!(|db| async move {
+            let from = 1_900_000_000_000_i64;
+            let to = from + day_ms(14);
+            let hour = 3_600_000_i64;
+            let daily3 = || upcoming_rule(Frequency::Daily, 3);
+
+            let events = [
+                upcoming_event("01S_AT_TO", "01UPE", to, daily3(), false),
+                upcoming_event("01S_PAST_TO", "01UPE", to + 1, daily3(), false),
+                // Three hour-long daily occurrences, the last starting an hour
+                // before `from`: it ends exactly at `from`.
+                upcoming_event(
+                    "01S_ENDS_AT_FROM",
+                    "01UPE",
+                    from - day_ms(2) - hour,
+                    daily3(),
+                    false,
+                ),
+                upcoming_event(
+                    "01S_ENDS_BEFORE",
+                    "01UPE",
+                    from - day_ms(2) - hour - 1,
+                    daily3(),
+                    false,
+                ),
+            ];
+            for event in &events {
+                db.insert_event(event).await.unwrap();
+            }
+            let by_id = |id: &str| events.iter().find(|e| e.id == id).unwrap().clone();
+            assert_eq!(by_id("01S_ENDS_AT_FROM").series_end, from);
+            assert_eq!(by_id("01S_ENDS_BEFORE").series_end, from - 1);
+            assert_eq!(by_id("01S_AT_TO").start, to);
+
+            let series = db
+                .fetch_upcoming_series_for_server("01UPE", from, to, 100)
+                .await
+                .unwrap();
+            assert_eq!(
+                ids(&series),
+                vec!["01S_ENDS_AT_FROM", "01S_AT_TO"],
+                "series edges: series_end == from and start == to are inside the window"
             );
         });
     }
