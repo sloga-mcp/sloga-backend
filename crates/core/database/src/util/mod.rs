@@ -6,6 +6,7 @@ pub mod bulk_permissions;
 pub mod captcha;
 pub mod chunked;
 pub mod email;
+pub mod event_visibility;
 mod funcs;
 pub mod idempotency;
 pub mod import_challenge;

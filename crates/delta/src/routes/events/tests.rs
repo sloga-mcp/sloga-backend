@@ -1122,7 +1122,7 @@ async fn import_requires_viewable_in_server_channel_case() {
         .body(json!({ "channel": channels[0].id() }).to_string())
         .dispatch()
         .await;
-    assert_ne!(response.status(), Status::Ok);
+    assert_eq!(response.status(), Status::BadRequest);
 
     // Grant the manager server-wide ManageChannel via a role, then deny ViewChannel
     // on the channel itself: manager authority without readability.
@@ -2443,9 +2443,9 @@ async fn edit_moves_event_into_channel_and_prunes_blind_rsvps_case() {
         .body(json!({ "channel": channel_id }).to_string())
         .dispatch()
         .await;
-    assert_ne!(
+    assert_eq!(
         response.status(),
-        Status::Ok,
+        Status::Forbidden,
         "a non-manager must not move the event at all"
     );
 
@@ -2493,7 +2493,7 @@ async fn edit_moves_event_into_channel_and_prunes_blind_rsvps_case() {
         ))
         .dispatch()
         .await;
-    assert_ne!(response.status(), Status::Ok);
+    assert_eq!(response.status(), Status::NotFound);
 }
 
 /// A cross-server channel is rejected as an edit target.
@@ -2554,9 +2554,9 @@ async fn edit_rejects_cross_server_channel_case() {
         .body(json!({ "channel": foreign_channel }).to_string())
         .dispatch()
         .await;
-    assert_ne!(
+    assert_eq!(
         response.status(),
-        Status::Ok,
+        Status::BadRequest,
         "a channel from another server must be rejected"
     );
 
@@ -2712,9 +2712,1274 @@ async fn notgoing_escape_survives_lost_view_case() {
         .body(json!({ "status": "Going" }).to_string())
         .dispatch()
         .await;
-    assert_ne!(
+    assert_eq!(
         response.status(),
-        Status::Ok,
+        Status::NotFound,
         "Going must stay behind the view gate"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Thread and forum-post event scope: events in a thread or forum post take the
+// parent channel's permissions. The helpers below are used only by the tests
+// in this block.
+// ---------------------------------------------------------------------------
+
+/// A server whose default text channel is hidden from plain members, with a
+/// thread under that channel created by the owner.
+struct ThreadScopeFixture {
+    server: Server,
+    owner: User,
+    owner_token: String,
+    member: User,
+    member_token: String,
+    thread: revolt_database::Channel,
+}
+
+async fn thread_scope_fixture(harness: &TestHarness) -> ThreadScopeFixture {
+    use revolt_database::{Channel, PartialChannel};
+    use revolt_permissions::{ChannelPermission, OverrideField};
+
+    let (_, owner_session, owner) = harness.new_user().await;
+    let (_, member_session, member) = harness.new_user().await;
+    let (server, channels) = Server::create(
+        &harness.db,
+        DataCreateServer {
+            name: "Thread scope".to_string(),
+            description: None,
+            nsfw: None,
+        },
+        &owner,
+        true,
+    )
+    .await
+    .expect("server");
+    for user in [&owner, &member] {
+        Member::create(&harness.db, &server, user, None)
+            .await
+            .expect("member");
+    }
+
+    let mut parent = channels
+        .into_iter()
+        .find(|c| matches!(c, Channel::TextChannel { .. }))
+        .expect("text channel");
+    parent
+        .update(
+            &harness.db,
+            PartialChannel {
+                default_permissions: Some(OverrideField {
+                    a: 0,
+                    d: ChannelPermission::ViewChannel as i64,
+                }),
+                ..Default::default()
+            },
+            vec![],
+        )
+        .await
+        .expect("deny view");
+    let thread = Channel::create_thread(
+        &harness.db,
+        &parent,
+        &owner,
+        None,
+        v0::DataCreateThread {
+            name: "hidden thread".to_string(),
+            auto_archive_minutes: None,
+        },
+    )
+    .await
+    .expect("thread");
+
+    ThreadScopeFixture {
+        server,
+        owner,
+        owner_token: owner_session.token.to_string(),
+        member,
+        member_token: member_session.token.to_string(),
+        thread,
+    }
+}
+
+/// Add a member holding a role with server-wide `ManageChannel`.
+async fn thread_scope_manager(harness: &TestHarness, server: &Server) -> String {
+    use revolt_database::{PartialMember, Role};
+    use revolt_permissions::{ChannelPermission, OverrideField};
+
+    let (_, session, manager) = harness.new_user().await;
+    let member = Member::create(&harness.db, server, &manager, None)
+        .await
+        .expect("manager member")
+        .0;
+    let role = Role {
+        id: ulid::Ulid::new().to_string(),
+        name: "Event managers".to_string(),
+        permissions: OverrideField {
+            a: ChannelPermission::ManageChannel as i64,
+            d: 0,
+        },
+        colour: None,
+        hoist: false,
+        rank: 1,
+        icon: None,
+    };
+    harness
+        .db
+        .insert_role(&server.id, &role)
+        .await
+        .expect("role");
+    harness
+        .db
+        .update_member(
+            &member.id,
+            &PartialMember {
+                roles: Some(vec![role.id.clone()]),
+                ..Default::default()
+            },
+            vec![],
+        )
+        .await
+        .expect("assign role");
+    session.token.to_string()
+}
+
+/// Send a request; returns the status and the body parsed as JSON (Null if empty).
+async fn thread_scope_call(
+    harness: &TestHarness,
+    method: rocket::http::Method,
+    url: String,
+    token: &str,
+    body: Option<serde_json::Value>,
+) -> (Status, serde_json::Value) {
+    let mut request = harness
+        .client
+        .req(method, url)
+        .header(Header::new("x-session-token", token.to_string()));
+    if let Some(body) = body {
+        request = request.header(ContentType::JSON).body(body.to_string());
+    }
+    let response = request.dispatch().await;
+    let status = response.status();
+    let text = response.into_string().await.unwrap_or_default();
+    let value = serde_json::from_str(&text).unwrap_or(serde_json::Value::Null);
+    (status, value)
+}
+
+fn thread_scope_event_body(title: &str, channel: Option<&str>) -> serde_json::Value {
+    let mut body = json!({
+        "title": title,
+        "start": 1_900_000_000_000_i64,
+        "timezone": "UTC"
+    });
+    if let Some(channel) = channel {
+        body["channel"] = json!(channel);
+    }
+    body
+}
+
+fn thread_scope_list_url(server: &Server) -> String {
+    format!(
+        "/events/server/{}?from=1899000000000&to=1901000000000",
+        server.id
+    )
+}
+
+/// A thread under a visible text channel and a post in a visible forum work like
+/// any other channel for a plain member: create, list, fetch, invite, RSVP and
+/// attendees all succeed, and a server-wide manager can edit events there.
+#[test]
+fn thread_scope_visible_thread_and_forum_post_events_work() {
+    crate::util::test::rt().block_on(thread_scope_visible_thread_and_forum_post_events_work_case())
+}
+
+async fn thread_scope_visible_thread_and_forum_post_events_work_case() {
+    use revolt_database::{Channel, PartialMember, Role};
+    use revolt_permissions::{ChannelPermission, OverrideField};
+    use rocket::http::Method;
+
+    let harness = TestHarness::new().await;
+    let (_, owner_session, owner) = harness.new_user().await;
+    let (_, member_session, member) = harness.new_user().await;
+    let (_, manager_session, manager) = harness.new_user().await;
+    let (owner_token, member_token, manager_token) = (
+        owner_session.token.to_string(),
+        member_session.token.to_string(),
+        manager_session.token.to_string(),
+    );
+
+    let (mut server, channels) = Server::create(
+        &harness.db,
+        DataCreateServer {
+            name: "Open threads".to_string(),
+            description: None,
+            nsfw: None,
+        },
+        &owner,
+        true,
+    )
+    .await
+    .expect("server");
+    for user in [&owner, &member] {
+        Member::create(&harness.db, &server, user, None)
+            .await
+            .expect("member");
+    }
+    let manager_member = Member::create(&harness.db, &server, &manager, None)
+        .await
+        .expect("manager member")
+        .0;
+    let role = Role {
+        id: ulid::Ulid::new().to_string(),
+        name: "Event managers".to_string(),
+        permissions: OverrideField {
+            a: ChannelPermission::ManageChannel as i64,
+            d: 0,
+        },
+        colour: None,
+        hoist: false,
+        rank: 1,
+        icon: None,
+    };
+    harness
+        .db
+        .insert_role(&server.id, &role)
+        .await
+        .expect("role");
+    harness
+        .db
+        .update_member(
+            &manager_member.id,
+            &PartialMember {
+                roles: Some(vec![role.id.clone()]),
+                ..Default::default()
+            },
+            vec![],
+        )
+        .await
+        .expect("assign role");
+
+    let parent = channels
+        .into_iter()
+        .find(|c| matches!(c, Channel::TextChannel { .. }))
+        .expect("text channel");
+    let thread = Channel::create_thread(
+        &harness.db,
+        &parent,
+        &owner,
+        None,
+        v0::DataCreateThread {
+            name: "open thread".to_string(),
+            auto_archive_minutes: None,
+        },
+    )
+    .await
+    .expect("thread");
+    let forum = Channel::create_server_channel(
+        &harness.db,
+        &mut server,
+        v0::DataCreateServerChannel {
+            channel_type: v0::LegacyServerChannelType::Forum,
+            name: "open forum".to_string(),
+            ..Default::default()
+        },
+        false,
+    )
+    .await
+    .expect("forum");
+    let post = Channel::create_forum_post(
+        &harness.db,
+        &forum,
+        &owner,
+        "open post".to_string(),
+        vec![],
+        None,
+    )
+    .await
+    .expect("post");
+
+    let create_url = format!("/events/server/{}", server.id);
+    for target in [thread.id(), post.id()] {
+        let body = json!({
+            "title": "Member event",
+            "start": 1_900_000_000_000_i64,
+            "timezone": "UTC",
+            "channel": target
+        });
+        let (status, created) = thread_scope_call(
+            &harness,
+            Method::Post,
+            create_url.clone(),
+            &member_token,
+            Some(body),
+        )
+        .await;
+        assert_eq!(status, Status::Ok, "member creates in {target}");
+        let created: v0::Event = serde_json::from_value(created).expect("event");
+        assert_eq!(created.channel.as_deref(), Some(target));
+
+        let body = json!({
+            "title": "Owner event",
+            "start": 1_900_000_000_000_i64,
+            "timezone": "UTC",
+            "channel": target
+        });
+        let (status, event) = thread_scope_call(
+            &harness,
+            Method::Post,
+            create_url.clone(),
+            &owner_token,
+            Some(body),
+        )
+        .await;
+        assert_eq!(status, Status::Ok, "owner creates in {target}");
+        let event: v0::Event = serde_json::from_value(event).expect("event");
+
+        let (status, result) = thread_scope_call(
+            &harness,
+            Method::Post,
+            format!("/events/event/{}/invites", event.id),
+            &owner_token,
+            Some(json!({ "users": [member.id] })),
+        )
+        .await;
+        assert_eq!(status, Status::Ok);
+        let result: v0::InviteResult = serde_json::from_value(result).expect("invite result");
+        assert_eq!(result.invited, 1, "member invited in {target}");
+        assert_eq!(result.skipped, 0);
+
+        let (status, _) = thread_scope_call(
+            &harness,
+            Method::Put,
+            format!("/events/event/{}/rsvp", event.id),
+            &member_token,
+            Some(json!({ "status": "Going" })),
+        )
+        .await;
+        assert_eq!(status, Status::Ok, "member RSVPs Going in {target}");
+
+        let (status, _) = thread_scope_call(
+            &harness,
+            Method::Get,
+            format!("/events/event/{}", event.id),
+            &member_token,
+            None,
+        )
+        .await;
+        assert_eq!(status, Status::Ok, "member fetches in {target}");
+
+        let (status, attendees) = thread_scope_call(
+            &harness,
+            Method::Get,
+            format!("/events/event/{}/attendees", event.id),
+            &member_token,
+            None,
+        )
+        .await;
+        assert_eq!(status, Status::Ok, "member reads attendees in {target}");
+        let attendees: v0::AttendeesResponse =
+            serde_json::from_value(attendees).expect("attendees");
+        assert_eq!(attendees.attendees.len(), 1);
+        assert_eq!(attendees.attendees[0].user, member.id);
+        assert!(matches!(
+            attendees.attendees[0].status,
+            v0::RsvpStatus::Going
+        ));
+
+        let (status, _) = thread_scope_call(
+            &harness,
+            Method::Patch,
+            format!("/events/event/{}", event.id),
+            &manager_token,
+            Some(json!({ "title": "Renamed" })),
+        )
+        .await;
+        assert_eq!(status, Status::Ok, "manager edits in {target}");
+    }
+
+    let (status, list) = thread_scope_call(
+        &harness,
+        Method::Get,
+        format!(
+            "/events/server/{}?from=1899000000000&to=1901000000000",
+            server.id
+        ),
+        &member_token,
+        None,
+    )
+    .await;
+    assert_eq!(status, Status::Ok);
+    let list: Vec<v0::EventWithOccurrences> = serde_json::from_value(list).expect("list");
+    assert_eq!(list.len(), 4, "member lists every thread and post event");
+}
+
+/// An event in a thread under a channel hidden from plain members is absent from
+/// their list and reads as missing on fetch and attendees; the owner still sees it.
+#[test]
+fn thread_scope_hidden_parent_event_not_readable() {
+    crate::util::test::rt().block_on(thread_scope_hidden_parent_event_not_readable_case())
+}
+
+async fn thread_scope_hidden_parent_event_not_readable_case() {
+    use rocket::http::Method;
+
+    let harness = TestHarness::new().await;
+    let fx = thread_scope_fixture(&harness).await;
+
+    let (status, event) = thread_scope_call(
+        &harness,
+        Method::Post,
+        format!("/events/server/{}", fx.server.id),
+        &fx.owner_token,
+        Some(thread_scope_event_body("Hidden", Some(fx.thread.id()))),
+    )
+    .await;
+    assert_eq!(status, Status::Ok);
+    let event: v0::Event = serde_json::from_value(event).expect("event");
+
+    // The owner reads it on every path.
+    let (status, list) = thread_scope_call(
+        &harness,
+        Method::Get,
+        thread_scope_list_url(&fx.server),
+        &fx.owner_token,
+        None,
+    )
+    .await;
+    assert_eq!(status, Status::Ok);
+    let list: Vec<v0::EventWithOccurrences> = serde_json::from_value(list).expect("list");
+    assert_eq!(list.len(), 1, "owner lists the thread event");
+    let (status, _) = thread_scope_call(
+        &harness,
+        Method::Get,
+        format!("/events/event/{}", event.id),
+        &fx.owner_token,
+        None,
+    )
+    .await;
+    assert_eq!(status, Status::Ok);
+
+    // A plain member does not. All three reads are taken before asserting, so a
+    // failure reports every path at once: (list status, events listed, fetch,
+    // attendees).
+    let (list_status, list) = thread_scope_call(
+        &harness,
+        Method::Get,
+        thread_scope_list_url(&fx.server),
+        &fx.member_token,
+        None,
+    )
+    .await;
+    let listed = serde_json::from_value::<Vec<v0::EventWithOccurrences>>(list)
+        .map(|list| list.len())
+        .unwrap_or(usize::MAX);
+    let (fetch_status, _) = thread_scope_call(
+        &harness,
+        Method::Get,
+        format!("/events/event/{}", event.id),
+        &fx.member_token,
+        None,
+    )
+    .await;
+    let (attendees_status, _) = thread_scope_call(
+        &harness,
+        Method::Get,
+        format!("/events/event/{}/attendees", event.id),
+        &fx.member_token,
+        None,
+    )
+    .await;
+    assert_eq!(
+        (list_status, listed, fetch_status, attendees_status),
+        (Status::Ok, 0, Status::NotFound, Status::NotFound),
+        "(list status, events listed, fetch, attendees) for a member who cannot \
+         view the parent channel"
+    );
+}
+
+/// A plain member can neither create an event in, nor move their own event into,
+/// a thread or forum post whose parent they cannot view.
+#[test]
+fn thread_scope_hidden_parent_rejects_create_and_move() {
+    crate::util::test::rt().block_on(thread_scope_hidden_parent_rejects_create_and_move_case())
+}
+
+async fn thread_scope_hidden_parent_rejects_create_and_move_case() {
+    use revolt_database::{Channel, PartialChannel};
+    use revolt_permissions::{ChannelPermission, OverrideField};
+    use rocket::http::Method;
+
+    let harness = TestHarness::new().await;
+    let fx = thread_scope_fixture(&harness).await;
+
+    // A forum hidden from plain members, with a post in it.
+    let mut server = fx.server.clone();
+    let mut forum = Channel::create_server_channel(
+        &harness.db,
+        &mut server,
+        v0::DataCreateServerChannel {
+            channel_type: v0::LegacyServerChannelType::Forum,
+            name: "hidden forum".to_string(),
+            ..Default::default()
+        },
+        false,
+    )
+    .await
+    .expect("forum");
+    forum
+        .update(
+            &harness.db,
+            PartialChannel {
+                default_permissions: Some(OverrideField {
+                    a: 0,
+                    d: ChannelPermission::ViewChannel as i64,
+                }),
+                ..Default::default()
+            },
+            vec![],
+        )
+        .await
+        .expect("deny view");
+    let post = Channel::create_forum_post(
+        &harness.db,
+        &forum,
+        &fx.owner,
+        "hidden post".to_string(),
+        vec![],
+        None,
+    )
+    .await
+    .expect("post");
+
+    let create_url = format!("/events/server/{}", fx.server.id);
+    for target in [fx.thread.id(), post.id()] {
+        let (status, _) = thread_scope_call(
+            &harness,
+            Method::Post,
+            create_url.clone(),
+            &fx.member_token,
+            Some(thread_scope_event_body("Planning", Some(target))),
+        )
+        .await;
+        assert_eq!(status, Status::NotFound, "create in {target}");
+    }
+
+    // The member's own server-wide event cannot be moved there either.
+    let (status, event) = thread_scope_call(
+        &harness,
+        Method::Post,
+        create_url.clone(),
+        &fx.member_token,
+        Some(thread_scope_event_body("Mine", None)),
+    )
+    .await;
+    assert_eq!(status, Status::Ok);
+    let event: v0::Event = serde_json::from_value(event).expect("event");
+    for target in [fx.thread.id(), post.id()] {
+        let (status, _) = thread_scope_call(
+            &harness,
+            Method::Patch,
+            format!("/events/event/{}", event.id),
+            &fx.member_token,
+            Some(json!({ "channel": target })),
+        )
+        .await;
+        assert_eq!(status, Status::NotFound, "move into {target}");
+    }
+    let (status, event) = thread_scope_call(
+        &harness,
+        Method::Get,
+        format!("/events/event/{}", event.id),
+        &fx.member_token,
+        None,
+    )
+    .await;
+    assert_eq!(status, Status::Ok);
+    let event: v0::EventWithContext = serde_json::from_value(event).expect("event");
+    assert_eq!(event.event.channel, None, "the event stayed server-wide");
+}
+
+/// Moving an event into a thread whose parent a Going attendee cannot view prunes
+/// their RSVP row; an attendee whose role the parent allows keeps theirs.
+#[test]
+fn thread_scope_move_into_hidden_thread_prunes_rsvp() {
+    crate::util::test::rt().block_on(thread_scope_move_into_hidden_thread_prunes_rsvp_case())
+}
+
+async fn thread_scope_move_into_hidden_thread_prunes_rsvp_case() {
+    use revolt_database::{Channel, PartialChannel, PartialMember, Role};
+    use revolt_permissions::{ChannelPermission, OverrideField};
+    use rocket::http::Method;
+    use std::collections::HashMap;
+
+    let harness = TestHarness::new().await;
+    let fx = thread_scope_fixture(&harness).await;
+
+    // A second member whose role the hidden parent channel allows to view it.
+    let (_, viewer_session, viewer) = harness.new_user().await;
+    let viewer_token = viewer_session.token.to_string();
+    let viewer_member = Member::create(&harness.db, &fx.server, &viewer, None)
+        .await
+        .expect("viewer member")
+        .0;
+    let role = Role {
+        id: ulid::Ulid::new().to_string(),
+        name: "Parent viewers".to_string(),
+        permissions: OverrideField { a: 0, d: 0 },
+        colour: None,
+        hoist: false,
+        rank: 1,
+        icon: None,
+    };
+    harness
+        .db
+        .insert_role(&fx.server.id, &role)
+        .await
+        .expect("role");
+    harness
+        .db
+        .update_member(
+            &viewer_member.id,
+            &PartialMember {
+                roles: Some(vec![role.id.clone()]),
+                ..Default::default()
+            },
+            vec![],
+        )
+        .await
+        .expect("assign role");
+    let Channel::Thread { parent_channel, .. } = &fx.thread else {
+        panic!("fixture thread is not a thread");
+    };
+    let mut parent = harness
+        .db
+        .fetch_channel(parent_channel)
+        .await
+        .expect("parent");
+    parent
+        .update(
+            &harness.db,
+            PartialChannel {
+                role_permissions: Some(HashMap::from([(
+                    role.id.clone(),
+                    OverrideField {
+                        a: ChannelPermission::ViewChannel as i64,
+                        d: 0,
+                    },
+                )])),
+                ..Default::default()
+            },
+            vec![],
+        )
+        .await
+        .expect("allow the role on the parent");
+
+    let (status, event) = thread_scope_call(
+        &harness,
+        Method::Post,
+        format!("/events/server/{}", fx.server.id),
+        &fx.owner_token,
+        Some(thread_scope_event_body("Movable", None)),
+    )
+    .await;
+    assert_eq!(status, Status::Ok);
+    let event: v0::Event = serde_json::from_value(event).expect("event");
+
+    let (status, result) = thread_scope_call(
+        &harness,
+        Method::Post,
+        format!("/events/event/{}/invites", event.id),
+        &fx.owner_token,
+        Some(json!({ "users": [fx.member.id, viewer.id] })),
+    )
+    .await;
+    assert_eq!(status, Status::Ok);
+    let result: v0::InviteResult = serde_json::from_value(result).expect("invite result");
+    assert_eq!(result.invited, 2);
+    for token in [&fx.member_token, &viewer_token] {
+        let (status, _) = thread_scope_call(
+            &harness,
+            Method::Put,
+            format!("/events/event/{}/rsvp", event.id),
+            token,
+            Some(json!({ "status": "Going" })),
+        )
+        .await;
+        assert_eq!(status, Status::Ok);
+    }
+
+    let (status, _) = thread_scope_call(
+        &harness,
+        Method::Patch,
+        format!("/events/event/{}", event.id),
+        &fx.owner_token,
+        Some(json!({ "channel": fx.thread.id() })),
+    )
+    .await;
+    assert_eq!(status, Status::Ok);
+
+    let (status, attendees) = thread_scope_call(
+        &harness,
+        Method::Get,
+        format!("/events/event/{}/attendees", event.id),
+        &fx.owner_token,
+        None,
+    )
+    .await;
+    assert_eq!(status, Status::Ok);
+    let attendees: v0::AttendeesResponse = serde_json::from_value(attendees).expect("attendees");
+    let kept: Vec<&str> = attendees
+        .attendees
+        .iter()
+        .map(|row| row.user.as_str())
+        .collect();
+    assert!(
+        !kept.contains(&fx.member.id.as_str()),
+        "Going row kept after a move into a thread its user cannot view"
+    );
+    assert_eq!(
+        kept,
+        vec![viewer.id.as_str()],
+        "the Going row of a user the parent allows must survive the move"
+    );
+    assert!(matches!(
+        attendees.attendees[0].status,
+        v0::RsvpStatus::Going
+    ));
+}
+
+/// Inviting a member to an event in a thread whose parent they cannot view is
+/// skipped, the same as for the hidden channel itself.
+#[test]
+fn thread_scope_invite_to_hidden_thread_event_skipped() {
+    crate::util::test::rt().block_on(thread_scope_invite_to_hidden_thread_event_skipped_case())
+}
+
+async fn thread_scope_invite_to_hidden_thread_event_skipped_case() {
+    use rocket::http::Method;
+
+    let harness = TestHarness::new().await;
+    let fx = thread_scope_fixture(&harness).await;
+
+    let (status, event) = thread_scope_call(
+        &harness,
+        Method::Post,
+        format!("/events/server/{}", fx.server.id),
+        &fx.owner_token,
+        Some(thread_scope_event_body("Hidden", Some(fx.thread.id()))),
+    )
+    .await;
+    assert_eq!(status, Status::Ok);
+    let event: v0::Event = serde_json::from_value(event).expect("event");
+
+    let (status, result) = thread_scope_call(
+        &harness,
+        Method::Post,
+        format!("/events/event/{}/invites", event.id),
+        &fx.owner_token,
+        Some(json!({ "users": [fx.member.id] })),
+    )
+    .await;
+    assert_eq!(status, Status::Ok);
+    let result: v0::InviteResult = serde_json::from_value(result).expect("invite result");
+    assert_eq!(
+        result.invited, 0,
+        "member invited to a thread event they cannot view"
+    );
+    assert_eq!(result.skipped, 1);
+
+    let (status, attendees) = thread_scope_call(
+        &harness,
+        Method::Get,
+        format!("/events/event/{}/attendees", event.id),
+        &fx.owner_token,
+        None,
+    )
+    .await;
+    assert_eq!(status, Status::Ok);
+    let attendees: v0::AttendeesResponse = serde_json::from_value(attendees).expect("attendees");
+    assert!(attendees.attendees.is_empty());
+}
+
+/// An imported row whose `voiceId` names a thread under a channel the importer
+/// cannot view imports with no channel; one naming a visible thread keeps it.
+#[test]
+fn thread_scope_import_voice_id_in_hidden_thread_degrades() {
+    crate::util::test::rt().block_on(thread_scope_import_voice_id_in_hidden_thread_degrades_case())
+}
+
+async fn thread_scope_import_voice_id_in_hidden_thread_degrades_case() {
+    use revolt_database::{Channel, Message};
+    use rocket::http::Method;
+
+    let harness = TestHarness::new().await;
+    let fx = thread_scope_fixture(&harness).await;
+    let manager_token = thread_scope_manager(&harness, &fx.server).await;
+
+    // A visible source channel with a visible thread of its own.
+    let source = harness.new_channel(&fx.server).await;
+    let open_thread = Channel::create_thread(
+        &harness.db,
+        &source,
+        &fx.owner,
+        None,
+        v0::DataCreateThread {
+            name: "open thread".to_string(),
+            auto_archive_minutes: None,
+        },
+    )
+    .await
+    .expect("thread");
+
+    for (title, voice) in [
+        ("Hidden voice", fx.thread.id()),
+        ("Open voice", open_thread.id()),
+    ] {
+        harness
+            .db
+            .insert_message(&Message {
+                id: ulid::Ulid::new().to_string(),
+                channel: source.id().to_string(),
+                author: fx.owner.id.clone(),
+                content: Some(format!(
+                    "[ACUTEST_EVENT]:{}",
+                    json!({ "title": title, "start": "2030-05-01T10:00:00.000Z", "voiceId": voice })
+                )),
+                ..Default::default()
+            })
+            .await
+            .expect("message");
+    }
+
+    let (status, result) = thread_scope_call(
+        &harness,
+        Method::Post,
+        format!("/events/server/{}/import", fx.server.id),
+        &manager_token,
+        Some(json!({ "channel": source.id() })),
+    )
+    .await;
+    assert_eq!(status, Status::Ok);
+    let result: v0::ImportResult = serde_json::from_value(result).expect("import result");
+    assert_eq!(result.imported, 2);
+
+    let (status, list) = thread_scope_call(
+        &harness,
+        Method::Get,
+        format!(
+            "/events/server/{}?from=1890000000000&to=1920000000000",
+            fx.server.id
+        ),
+        &fx.owner_token,
+        None,
+    )
+    .await;
+    assert_eq!(status, Status::Ok);
+    let list: Vec<v0::EventWithOccurrences> = serde_json::from_value(list).expect("list");
+    let channel_of = |title: &str| {
+        list.iter()
+            .find(|row| row.event.title == title)
+            .unwrap_or_else(|| panic!("{} not imported", title))
+            .event
+            .channel
+            .clone()
+    };
+    assert_eq!(
+        channel_of("Open voice").as_deref(),
+        Some(open_thread.id()),
+        "a visible thread is kept"
+    );
+    assert_eq!(
+        channel_of("Hidden voice"),
+        None,
+        "a thread under a channel the importer cannot view must not be attached"
+    );
+}
+
+/// A member with server-wide `ManageChannel` that the parent channel takes away
+/// cannot edit or cancel an event in a thread under it.
+#[test]
+fn thread_scope_manage_is_judged_on_the_parent() {
+    crate::util::test::rt().block_on(thread_scope_manage_is_judged_on_the_parent_case())
+}
+
+async fn thread_scope_manage_is_judged_on_the_parent_case() {
+    use revolt_database::{Channel, PartialChannel};
+    use revolt_permissions::{ChannelPermission, OverrideField};
+    use rocket::http::Method;
+
+    let harness = TestHarness::new().await;
+    let fx = thread_scope_fixture(&harness).await;
+    let manager_token = thread_scope_manager(&harness, &fx.server).await;
+
+    // A visible channel that takes ManageChannel away from everyone but the owner.
+    let mut parent = harness.new_channel(&fx.server).await;
+    parent
+        .update(
+            &harness.db,
+            PartialChannel {
+                default_permissions: Some(OverrideField {
+                    a: 0,
+                    d: ChannelPermission::ManageChannel as i64,
+                }),
+                ..Default::default()
+            },
+            vec![],
+        )
+        .await
+        .expect("deny manage");
+    let thread = Channel::create_thread(
+        &harness.db,
+        &parent,
+        &fx.owner,
+        None,
+        v0::DataCreateThread {
+            name: "managed thread".to_string(),
+            auto_archive_minutes: None,
+        },
+    )
+    .await
+    .expect("thread");
+
+    let create_url = format!("/events/server/{}", fx.server.id);
+    let (status, server_wide) = thread_scope_call(
+        &harness,
+        Method::Post,
+        create_url.clone(),
+        &fx.owner_token,
+        Some(thread_scope_event_body("Server-wide", None)),
+    )
+    .await;
+    assert_eq!(status, Status::Ok);
+    let server_wide: v0::Event = serde_json::from_value(server_wide).expect("event");
+    let (status, in_thread) = thread_scope_call(
+        &harness,
+        Method::Post,
+        create_url,
+        &fx.owner_token,
+        Some(thread_scope_event_body("In thread", Some(thread.id()))),
+    )
+    .await;
+    assert_eq!(status, Status::Ok);
+    let in_thread: v0::Event = serde_json::from_value(in_thread).expect("event");
+
+    // The manager can see the thread event and manage server-wide events.
+    let (status, _) = thread_scope_call(
+        &harness,
+        Method::Get,
+        format!("/events/event/{}", in_thread.id),
+        &manager_token,
+        None,
+    )
+    .await;
+    assert_eq!(status, Status::Ok);
+    let (status, _) = thread_scope_call(
+        &harness,
+        Method::Patch,
+        format!("/events/event/{}", server_wide.id),
+        &manager_token,
+        Some(json!({ "title": "Renamed" })),
+    )
+    .await;
+    assert_eq!(status, Status::Ok);
+
+    // But not the thread event.
+    let (status, _) = thread_scope_call(
+        &harness,
+        Method::Patch,
+        format!("/events/event/{}", in_thread.id),
+        &manager_token,
+        Some(json!({ "title": "Renamed" })),
+    )
+    .await;
+    assert_eq!(status, Status::Forbidden, "edit");
+    let (status, _) = thread_scope_call(
+        &harness,
+        Method::Delete,
+        format!("/events/event/{}", in_thread.id),
+        &manager_token,
+        None,
+    )
+    .await;
+    assert_eq!(status, Status::Forbidden, "cancel");
+}
+
+/// Create two owner events, one in a channel and one in a thread, then delete the
+/// channel and the thread's parent. Returns the event ids.
+async fn thread_scope_events_in_deleted_channels(
+    harness: &TestHarness,
+    fx: &ThreadScopeFixture,
+) -> Vec<String> {
+    use revolt_database::Channel;
+    use rocket::http::Method;
+
+    let doomed = harness.new_channel(&fx.server).await;
+    let doomed_parent = harness.new_channel(&fx.server).await;
+    let orphan = Channel::create_thread(
+        &harness.db,
+        &doomed_parent,
+        &fx.owner,
+        None,
+        v0::DataCreateThread {
+            name: "orphaned thread".to_string(),
+            auto_archive_minutes: None,
+        },
+    )
+    .await
+    .expect("thread");
+
+    let mut events = Vec::new();
+    for target in [doomed.id(), orphan.id()] {
+        let (status, event) = thread_scope_call(
+            harness,
+            Method::Post,
+            format!("/events/server/{}", fx.server.id),
+            &fx.owner_token,
+            Some(thread_scope_event_body("Doomed", Some(target))),
+        )
+        .await;
+        assert_eq!(status, Status::Ok);
+        let event: v0::Event = serde_json::from_value(event).expect("event");
+        events.push(event.id);
+    }
+    harness
+        .db
+        .delete_channel(&doomed)
+        .await
+        .expect("delete channel");
+    harness
+        .db
+        .delete_channel(&doomed_parent)
+        .await
+        .expect("delete parent");
+    events
+}
+
+/// An event whose channel (or thread parent) was deleted can still be cancelled by
+/// a server-wide manager, and still not by a plain member.
+#[test]
+fn thread_scope_deleted_channel_event_cancellable_by_manager() {
+    crate::util::test::rt()
+        .block_on(thread_scope_deleted_channel_event_cancellable_by_manager_case())
+}
+
+async fn thread_scope_deleted_channel_event_cancellable_by_manager_case() {
+    use rocket::http::Method;
+
+    let harness = TestHarness::new().await;
+    let fx = thread_scope_fixture(&harness).await;
+    let manager_token = thread_scope_manager(&harness, &fx.server).await;
+    let events = thread_scope_events_in_deleted_channels(&harness, &fx).await;
+
+    for event_id in &events {
+        let (status, _) = thread_scope_call(
+            &harness,
+            Method::Delete,
+            format!("/events/event/{event_id}"),
+            &fx.member_token,
+            None,
+        )
+        .await;
+        assert_eq!(status, Status::Forbidden, "plain member cancels {event_id}");
+
+        let (status, _) = thread_scope_call(
+            &harness,
+            Method::Delete,
+            format!("/events/event/{event_id}"),
+            &manager_token,
+            None,
+        )
+        .await;
+        assert_eq!(status, Status::NoContent, "manager cancels {event_id}");
+        let stored = harness.db.fetch_event(event_id).await.expect("event row");
+        assert!(stored.cancelled);
+    }
+}
+
+/// A server-wide manager cannot edit, or invite to, an event whose channel (or
+/// thread parent) was deleted; only cancelling falls back to server-wide rights.
+#[test]
+fn thread_scope_deleted_channel_event_not_editable_by_manager() {
+    crate::util::test::rt()
+        .block_on(thread_scope_deleted_channel_event_not_editable_by_manager_case())
+}
+
+async fn thread_scope_deleted_channel_event_not_editable_by_manager_case() {
+    use rocket::http::Method;
+
+    let harness = TestHarness::new().await;
+    let fx = thread_scope_fixture(&harness).await;
+    let manager_token = thread_scope_manager(&harness, &fx.server).await;
+    let events = thread_scope_events_in_deleted_channels(&harness, &fx).await;
+
+    for event_id in &events {
+        let (status, _) = thread_scope_call(
+            &harness,
+            Method::Patch,
+            format!("/events/event/{event_id}"),
+            &manager_token,
+            Some(json!({ "title": "Renamed" })),
+        )
+        .await;
+        assert_eq!(status, Status::Forbidden, "manager edits {event_id}");
+
+        let (status, _) = thread_scope_call(
+            &harness,
+            Method::Post,
+            format!("/events/event/{event_id}/invites"),
+            &manager_token,
+            Some(json!({ "users": [fx.member.id] })),
+        )
+        .await;
+        assert_eq!(status, Status::Forbidden, "manager invites to {event_id}");
+
+        let stored = harness.db.fetch_event(event_id).await.expect("event row");
+        assert_eq!(stored.title, "Doomed");
+        assert!(harness
+            .db
+            .fetch_rsvps_for_event(event_id)
+            .await
+            .expect("rsvps")
+            .is_empty());
+
+        let (status, _) = thread_scope_call(
+            &harness,
+            Method::Delete,
+            format!("/events/event/{event_id}"),
+            &manager_token,
+            None,
+        )
+        .await;
+        assert_eq!(status, Status::NoContent, "manager cancels {event_id}");
+    }
+}
+
+/// A user outside the server gets `NotFound` from the RSVP route whether the event
+/// is live or cancelled; a member who can view the event still gets the cancelled
+/// error.
+#[test]
+fn thread_scope_rsvp_by_non_member_reads_as_missing() {
+    crate::util::test::rt().block_on(thread_scope_rsvp_by_non_member_reads_as_missing_case())
+}
+
+async fn thread_scope_rsvp_by_non_member_reads_as_missing_case() {
+    use rocket::http::Method;
+
+    let harness = TestHarness::new().await;
+    let fx = thread_scope_fixture(&harness).await;
+    let (_, outsider_session, _) = harness.new_user().await;
+    let outsider_token = outsider_session.token.to_string();
+
+    let mut events = Vec::new();
+    for title in ["Live", "Called off"] {
+        let (status, event) = thread_scope_call(
+            &harness,
+            Method::Post,
+            format!("/events/server/{}", fx.server.id),
+            &fx.owner_token,
+            Some(thread_scope_event_body(title, None)),
+        )
+        .await;
+        assert_eq!(status, Status::Ok);
+        let event: v0::Event = serde_json::from_value(event).expect("event");
+        events.push(event.id);
+    }
+    let (status, _) = thread_scope_call(
+        &harness,
+        Method::Delete,
+        format!("/events/event/{}", events[1]),
+        &fx.owner_token,
+        None,
+    )
+    .await;
+    assert_eq!(status, Status::NoContent);
+
+    for event_id in &events {
+        for answer in ["Going", "NotGoing"] {
+            let (status, _) = thread_scope_call(
+                &harness,
+                Method::Put,
+                format!("/events/event/{event_id}/rsvp"),
+                &outsider_token,
+                Some(json!({ "status": answer })),
+            )
+            .await;
+            assert_eq!(status, Status::NotFound, "{answer} on {event_id}");
+        }
+    }
+
+    let (status, _) = thread_scope_call(
+        &harness,
+        Method::Put,
+        format!("/events/event/{}/rsvp", events[1]),
+        &fx.member_token,
+        Some(json!({ "status": "Going" })),
+    )
+    .await;
+    assert_eq!(
+        status,
+        Status::BadRequest,
+        "member answers a cancelled event"
+    );
+}
+
+/// A member who cannot view a cancelled event's thread gets `NotFound` from the
+/// RSVP route, the same as for a missing event; the owner, who can view it, gets
+/// the cancelled error.
+#[test]
+fn thread_scope_rsvp_on_hidden_cancelled_event_reads_as_missing() {
+    crate::util::test::rt()
+        .block_on(thread_scope_rsvp_on_hidden_cancelled_event_reads_as_missing_case())
+}
+
+async fn thread_scope_rsvp_on_hidden_cancelled_event_reads_as_missing_case() {
+    use rocket::http::Method;
+
+    let harness = TestHarness::new().await;
+    let fx = thread_scope_fixture(&harness).await;
+
+    let (status, event) = thread_scope_call(
+        &harness,
+        Method::Post,
+        format!("/events/server/{}", fx.server.id),
+        &fx.owner_token,
+        Some(thread_scope_event_body("Hidden", Some(fx.thread.id()))),
+    )
+    .await;
+    assert_eq!(status, Status::Ok);
+    let event: v0::Event = serde_json::from_value(event).expect("event");
+    let (status, _) = thread_scope_call(
+        &harness,
+        Method::Delete,
+        format!("/events/event/{}", event.id),
+        &fx.owner_token,
+        None,
+    )
+    .await;
+    assert_eq!(status, Status::NoContent);
+
+    for answer in ["Going", "NotGoing"] {
+        let (status, _) = thread_scope_call(
+            &harness,
+            Method::Put,
+            format!("/events/event/{}/rsvp", event.id),
+            &fx.member_token,
+            Some(json!({ "status": answer })),
+        )
+        .await;
+        assert_eq!(status, Status::NotFound, "member answers {answer}");
+    }
+
+    let (status, _) = thread_scope_call(
+        &harness,
+        Method::Put,
+        format!("/events/event/{}/rsvp", event.id),
+        &fx.owner_token,
+        Some(json!({ "status": "Going" })),
+    )
+    .await;
+    assert_eq!(
+        status,
+        Status::BadRequest,
+        "owner answers a cancelled event"
     );
 }

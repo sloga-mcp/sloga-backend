@@ -2,13 +2,15 @@ use revolt_database::{
     events::client::EventV1,
     events::rabbit::{CalendarEventNotification, CalendarEventPayload},
     occurrences_in_window,
-    util::permissions::DatabasePermissionQuery,
+    util::event_visibility::{
+        require_event_channel_view, try_resolve_event_channel_target, user_can_view_channel,
+        EventViewer,
+    },
     util::reference::Reference,
     CalendarEvent, Database, FieldsCalendarEvent, File, PartialCalendarEvent, RsvpStatus, User,
     AMQP, MAX_EVENT_ATTACHMENTS,
 };
 use revolt_models::v0;
-use revolt_permissions::{calculate_channel_permissions, ChannelPermission};
 use revolt_result::{create_error, Result};
 use rocket::{serde::json::Json, State};
 use rocket_empty::EmptyResponse;
@@ -87,15 +89,11 @@ pub async fn create_event(
         .await
         .map_err(|_| create_error!(NotFound))?;
 
+    // The channel must belong to the server (InvalidOperation) and be visible to
+    // the caller (NotFound); a thread or forum post is judged by its parent.
     if let Some(channel_id) = &data.channel {
         let channel = db.fetch_channel(channel_id).await?;
-        if channel.server() != Some(server.id.as_str()) {
-            return Err(create_error!(InvalidOperation));
-        }
-        let mut query = DatabasePermissionQuery::new(db, &user).channel(&channel);
-        calculate_channel_permissions(&mut query)
-            .await
-            .throw_if_lacking_channel_permission(ChannelPermission::ViewChannel)?;
+        require_event_channel_view(db, &user, &server.id, &channel).await?;
     }
 
     let mut event = CalendarEvent::create(
@@ -182,7 +180,8 @@ pub async fn list_events(
     super::require_events_enabled().await?;
 
     let server = server.as_server(db).await?;
-    db.fetch_member(&server.id, &user.id)
+    let member = db
+        .fetch_member(&server.id, &user.id)
         .await
         .map_err(|_| create_error!(NotFound))?;
 
@@ -200,10 +199,13 @@ pub async fn list_events(
         .fetch_events_for_server_in_window(&server.id, from, to)
         .await?;
 
+    // One viewer for the whole list: it reuses the caller's member row and caches
+    // each channel's verdict, so events sharing a channel cost one lookup.
+    let mut viewer = EventViewer::with_memberships(db, &user, vec![member]);
     let mut out = Vec::new();
     for event in candidates {
         // Per-event view filter (finding C1).
-        if super::authorize_view(db, &user, &event).await.is_err() {
+        if !viewer.can_view(&event).await {
             continue;
         }
         // Expand occurrences once: drop series with none in the window (e.g. all excepted)
@@ -274,25 +276,21 @@ pub async fn edit_event(
     })?;
 
     let mut event = db.fetch_event(target.id).await?;
+    // Manage rights first, so the cancelled state is only reported to managers.
+    super::authorize_manage(db, &user, &event).await?;
     if event.cancelled {
         return Err(create_error!(InvalidOperation));
     }
-    super::authorize_manage(db, &user, &event).await?;
 
     // ----- validate a channel move up front (before ANY mutation) --------------
     // Same gate as create: the target channel must belong to the event's server
-    // and the caller must be able to view it. The fetched channel is reused for
-    // the RSVP prune after the edit persists.
+    // and the caller must be able to view it (a thread or forum post is judged by
+    // its parent). The fetched channel is reused for the RSVP prune after the
+    // edit persists.
     let new_channel = match &data.channel {
         Some(channel_id) => {
             let channel = db.fetch_channel(channel_id).await?;
-            if channel.server() != Some(event.server.as_str()) {
-                return Err(create_error!(InvalidOperation));
-            }
-            let mut query = DatabasePermissionQuery::new(db, &user).channel(&channel);
-            calculate_channel_permissions(&mut query)
-                .await
-                .throw_if_lacking_channel_permission(ChannelPermission::ViewChannel)?;
+            require_event_channel_view(db, &user, &event.server, &channel).await?;
             Some(channel)
         }
         None => None,
@@ -436,23 +434,33 @@ pub async fn edit_event(
     // them). A widening move (channel cleared) strands nobody — skip.
     if channel_changed {
         if let Some(channel) = &new_channel {
+            // A thread or forum post is judged by its parent, resolved once. If it
+            // cannot be resolved, nobody can view the event: every row is pruned.
+            // A lookup error is not "unresolvable": skip the prune and capture it
+            // rather than dropping every row on a transient failure.
             // Best-effort (the move itself already committed) but never silent:
             // a half-run prune revives the stranded-Going reminders, so every
             // failure is captured. The NotGoing membership-only escape in
             // `set_rsvp` caps the damage either way.
-            match db.fetch_rsvps_for_event(&event.id).await {
-                Ok(rsvps) => {
+            let rsvps = match try_resolve_event_channel_target(db, channel).await {
+                Ok(target) => db
+                    .fetch_rsvps_for_event(&event.id)
+                    .await
+                    .map(|rsvps| (target, rsvps)),
+                Err(error) => Err(error),
+            };
+            match rsvps {
+                Ok((target, rsvps)) => {
                     for rsvp in rsvps {
                         let uid = rsvp.id.user;
-                        let visible = match db.fetch_user(&uid).await {
-                            Ok(target) => {
-                                let mut query =
-                                    DatabasePermissionQuery::new(db, &target).channel(channel);
-                                calculate_channel_permissions(&mut query)
-                                    .await
-                                    .has_channel_permission(ChannelPermission::ViewChannel)
-                            }
-                            Err(_) => false,
+                        let visible = match &target {
+                            Some(target) => match db.fetch_user(&uid).await {
+                                Ok(holder) => {
+                                    user_can_view_channel(db, &holder, &event.server, target).await
+                                }
+                                Err(_) => false,
+                            },
+                            None => false,
                         };
                         if !visible {
                             if let Err(error) = db.delete_rsvp(&event.id, &uid).await {
@@ -501,7 +509,9 @@ pub async fn cancel_event(
     super::require_events_enabled().await?;
 
     let mut event = db.fetch_event(target.id).await?;
-    super::authorize_manage(db, &user, &event).await?;
+    // Cleanup variant: an event whose channel was deleted stays cancellable by
+    // server-wide managers.
+    super::authorize_cleanup(db, &user, &event).await?;
 
     // Idempotent: a re-issued DELETE on an already-cancelled event is a no-op. Without
     // this, each retry/double-cancel would re-notify every attendee (cancel is terminal,

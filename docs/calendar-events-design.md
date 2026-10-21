@@ -197,6 +197,17 @@ Reuse existing permissions — **no new bitfield v1**. `DatabasePermissionQuery`
 - **RSVP**: caller must be a server member **and** already have an RSVP row for the event (was invited).
   Non-invited users cannot RSVP. IDOR-safe (acting user from session).
 - **View**: server member with `ViewChannel` on the event's channel (or server-wide if `channel=None`).
+- **Threads and forum posts**: an event in a thread (or forum post) takes the parent channel's
+  permissions for every check above (view, create, edit, invite, import), including the parent's
+  role and default overrides, and `ManageChannel` is evaluated on the parent. View denials return
+  `NotFound`, the same as a missing event; the RSVP, edit and invite routes check view or manage
+  rights before reporting that an event is cancelled.
+- **Deleted channels**: if the event's channel can no longer be resolved (deleted channel or deleted
+  parent), the event is hidden and only its creator may edit it, manage its invites or link a
+  soft-res sheet to it. Cancelling falls back to server-wide `ManageChannel`, so managers can still
+  clean such events up. On the manage paths and the RSVP prune after a move, a lookup failure other
+  than "not found" (for the channel or a thread's parent) fails the request or skips the prune; the
+  view paths hide the event on any lookup failure.
 
 ## 7. RSVP state machine (server-enforced)
 

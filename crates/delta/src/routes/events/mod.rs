@@ -1,12 +1,14 @@
 use revolt_database::{
-    util::permissions::DatabasePermissionQuery, CalendarEvent, Database, EventRsvp, Frequency,
-    RecurrenceEnd, RecurrenceRule, RsvpStatus, Weekday,
+    util::event_visibility::{try_resolve_event_channel_target, EventViewer},
+    util::permissions::DatabasePermissionQuery,
+    CalendarEvent, Database, EventRsvp, Frequency, RecurrenceEnd, RecurrenceRule, RsvpStatus,
+    Weekday,
 };
 use revolt_models::v0;
 use revolt_permissions::{
     calculate_channel_permissions, calculate_server_permissions, ChannelPermission,
 };
-use revolt_result::{create_error, Result};
+use revolt_result::{create_error, ErrorType, Result};
 use revolt_rocket_okapi::revolt_okapi::openapi3::OpenApi;
 use rocket::Route;
 
@@ -30,46 +32,105 @@ pub async fn require_events_enabled() -> Result<()> {
 // ----- Authorization helpers ---------------------------------------------------
 
 /// The caller may VIEW an event iff they are a member of its server and, when the
-/// event names a channel, hold `ViewChannel` there (design §6/§8, finding C1).
+/// event names a channel, hold `ViewChannel` there (design §6/§8, finding C1). An
+/// event in a thread or forum post takes the parent channel's permissions. Every
+/// denial is `NotFound`, so a hidden event is indistinguishable from a missing one.
 pub async fn authorize_view(db: &Database, user: &revolt_database::User, event: &CalendarEvent) -> Result<()> {
-    if let Some(channel_id) = &event.channel {
-        let channel = db.fetch_channel(channel_id).await?;
-        let mut query = DatabasePermissionQuery::new(db, user).channel(&channel);
-        calculate_channel_permissions(&mut query)
-            .await
-            .throw_if_lacking_channel_permission(ChannelPermission::ViewChannel)?;
-    } else {
-        // Server-wide event: membership is sufficient.
-        db.fetch_member(&event.server, &user.id)
-            .await
-            .map_err(|_| create_error!(NotFound))?;
+    if !EventViewer::for_server(db, user, &event.server)
+        .await
+        .can_view(event)
+        .await
+    {
+        return Err(create_error!(NotFound));
     }
     Ok(())
 }
 
 /// The caller may MANAGE an event iff they created it OR hold `ManageChannel`
 /// (evaluated on the event's channel, or server-wide when it has none) (design §6).
+/// An event in a thread or forum post is judged on the parent channel. When the
+/// event's channel can no longer be resolved (deleted channel, missing parent),
+/// only the creator may manage it; use `authorize_cleanup` for cancelling.
 ///
 /// The creator branch additionally requires LIVE membership (slice F hardening): a
 /// banned/departed creator with a still-valid session must not retitle/cancel events
 /// or fan out invite pushes to the server's members. Imported events (whose creator is
 /// the original message author, possibly long gone) rely on the same gate.
 pub async fn authorize_manage(db: &Database, user: &revolt_database::User, event: &CalendarEvent) -> Result<()> {
+    authorize_manage_scoped(db, user, event, false).await
+}
+
+/// Same as `authorize_manage`, except that cancelling an event whose channel no
+/// longer exists falls back to server-wide `ManageChannel`, so such events can
+/// still be cleaned up.
+pub async fn authorize_cleanup(
+    db: &Database,
+    user: &revolt_database::User,
+    event: &CalendarEvent,
+) -> Result<()> {
+    authorize_manage_scoped(db, user, event, true).await
+}
+
+/// Where a manage check on an event is evaluated.
+enum ManageScope {
+    /// The event has no channel.
+    Server,
+    /// The channel (thread parent resolved) that governs the event.
+    Channel(revolt_database::Channel),
+    /// The event's channel no longer resolves inside the event's server.
+    Unresolvable,
+}
+
+async fn manage_scope(db: &Database, event: &CalendarEvent) -> Result<ManageScope> {
+    let Some(channel_id) = &event.channel else {
+        return Ok(ManageScope::Server);
+    };
+    let channel = match db.fetch_channel(channel_id).await {
+        Ok(channel) => channel,
+        Err(error) if matches!(error.error_type, ErrorType::NotFound) => {
+            return Ok(ManageScope::Unresolvable)
+        }
+        Err(error) => return Err(error),
+    };
+    Ok(
+        match try_resolve_event_channel_target(db, &channel)
+            .await?
+            .filter(|target| target.server() == Some(event.server.as_str()))
+        {
+            Some(target) => ManageScope::Channel(target),
+            None => ManageScope::Unresolvable,
+        },
+    )
+}
+
+async fn authorize_manage_scoped(
+    db: &Database,
+    user: &revolt_database::User,
+    event: &CalendarEvent,
+    cleanup: bool,
+) -> Result<()> {
     if user.id == event.creator && db.fetch_member(&event.server, &user.id).await.is_ok() {
         return Ok(());
     }
-    if let Some(channel_id) = &event.channel {
-        let channel = db.fetch_channel(channel_id).await?;
-        let mut query = DatabasePermissionQuery::new(db, user).channel(&channel);
-        calculate_channel_permissions(&mut query)
-            .await
-            .throw_if_lacking_channel_permission(ChannelPermission::ManageChannel)?;
-    } else {
-        let server = db.fetch_server(&event.server).await?;
-        let mut query = DatabasePermissionQuery::new(db, user).server(&server);
-        calculate_server_permissions(&mut query)
-            .await
-            .throw_if_lacking_channel_permission(ChannelPermission::ManageChannel)?;
+    match manage_scope(db, event).await? {
+        ManageScope::Channel(target) => {
+            let mut query = DatabasePermissionQuery::new(db, user).channel(&target);
+            calculate_channel_permissions(&mut query)
+                .await
+                .throw_if_lacking_channel_permission(ChannelPermission::ManageChannel)?;
+        }
+        ManageScope::Unresolvable if !cleanup => {
+            return Err(create_error!(MissingPermission {
+                permission: ChannelPermission::ManageChannel.to_string()
+            }));
+        }
+        ManageScope::Server | ManageScope::Unresolvable => {
+            let server = db.fetch_server(&event.server).await?;
+            let mut query = DatabasePermissionQuery::new(db, user).server(&server);
+            calculate_server_permissions(&mut query)
+                .await
+                .throw_if_lacking_channel_permission(ChannelPermission::ManageChannel)?;
+        }
     }
     Ok(())
 }
