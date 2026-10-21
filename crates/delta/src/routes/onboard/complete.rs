@@ -2,10 +2,11 @@ use once_cell::sync::Lazy;
 use regex::Regex;
 use revolt_config::config;
 use revolt_database::{
-    Database, Invite, Member, PartialUser, Referral, ReferralSource, Session, User,
+    is_invalid_session, Database, Invite, Member, PartialUser, Referral, ReferralSource, Session,
+    User,
 };
 use revolt_models::v0::{self, UserFlags};
-use revolt_result::{create_error, ErrorType, Result};
+use revolt_result::{create_error, Error, ErrorType, Result};
 
 use rocket::{serde::json::Json, State};
 use serde::{Deserialize, Serialize};
@@ -60,11 +61,15 @@ async fn referrer_from_invite(db: &Database, input: &str) -> Option<(String, Ref
 pub async fn complete(
     db: &State<Database>,
     session: Session,
-    user: Option<User>,
+    user: std::result::Result<User, Error>,
     data: Json<DataOnboard>,
 ) -> Result<Json<v0::User>> {
-    if user.is_some() {
-        return Err(create_error!(AlreadyOnboarded));
+    match user {
+        Ok(_) => return Err(create_error!(AlreadyOnboarded)),
+        // No user yet: the session exists but onboarding has not run
+        Err(error) if is_invalid_session(&error) => {}
+        // A failed lookup is not "no user yet": going on would create a user over an existing one
+        Err(error) => return Err(error),
     }
 
     let data = data.into_inner();
@@ -359,5 +364,27 @@ mod test {
             .await
             .expect("fetch")
             .is_none());
+    }
+
+    #[test]
+    fn complete_already_onboarded() {
+        crate::util::test::rt().block_on(complete_already_onboarded_case())
+    }
+
+    async fn complete_already_onboarded_case() {
+        let harness = TestHarness::new().await;
+        let (_, session, user) = harness.new_user().await;
+        let response = onboard(
+            &harness,
+            &session.token,
+            json!({ "username": TestHarness::rand_string() }),
+        )
+        .await;
+        assert_eq!(response.status(), Status::Forbidden);
+        let error: Error = response.into_json().await.expect("error");
+        assert!(matches!(error.error_type, ErrorType::AlreadyOnboarded));
+
+        let unchanged = harness.db.fetch_user(&user.id).await.expect("user");
+        assert_eq!(unchanged.username, user.username);
     }
 }

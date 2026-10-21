@@ -2,7 +2,7 @@ use axum::{extract::{FromRef, FromRequestParts}, http::request::Parts};
 
 use revolt_result::{create_error, Error, Result};
 
-use crate::{Database, Session};
+use crate::{credential_lookup_error, Database, Session};
 
 #[async_trait]
 impl<S> FromRequestParts<S> for Session
@@ -16,7 +16,7 @@ where
         let db = Database::from_ref(state);
 
         if let Some(Ok(token)) = parts.headers.get("x-session-token").map(|v| v.to_str()) {
-            db.fetch_session_by_token(token).await
+            db.fetch_session_by_token(token).await.map_err(credential_lookup_error)
         } else {
             Err(create_error!(MissingHeaders))
         }

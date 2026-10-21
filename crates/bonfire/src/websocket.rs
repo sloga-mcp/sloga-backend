@@ -363,13 +363,31 @@ pub async fn client(db: &'static Database, stream: TcpStream, addr: SocketAddr) 
     .await
     {
         Ok(Ok(user)) => user,
-        Ok(Err(err)) => {
+        Ok(Err(err)) if revolt_database::is_invalid_session(&err) => {
             send_bounded(
                 &mut write,
                 config.encode(&EventV1::Error { data: err }),
                 SEND_TIMEOUT,
             )
             .await;
+            return;
+        }
+        Ok(Err(err)) => {
+            // Any other failure (database or internal) closes with no frame.
+            // Shipped clients treat every Error frame as permanent and stop
+            // reconnecting, while a plain close makes them back off and
+            // retry. The jitter blunts immediate reconnects from other SDKs.
+            warn!(
+                "User {addr:?} could not be authenticated, closing without an error frame: {:?}",
+                err.error_type
+            );
+
+            // `ThreadRng` is not Send: draw the value before any await.
+            let jitter_ms = {
+                use rand::Rng;
+                rand::thread_rng().gen_range(1000..=3000u64)
+            };
+            tokio::time::sleep(Duration::from_millis(jitter_ms)).await;
             return;
         }
         Err(_) => {

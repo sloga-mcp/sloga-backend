@@ -1,4 +1,4 @@
-use crate::{Database, Session};
+use crate::{credential_error_status, credential_lookup_error, Database, Session};
 use revolt_result::Error;
 use rocket::{
     http::Status,
@@ -16,16 +16,19 @@ impl<'r> FromRequest<'r> for Session {
         let outcome: &Outcome<Session, Error> = request
             .local_cache_async(async {
                 if let Some(token) = request.headers().get("x-session-token").next() {
-                    if let Ok(session) = request
+                    match request
                         .rocket()
                         .state::<Database>()
                         .expect("`Database`")
                         .fetch_session_by_token(token)
                         .await
                     {
-                        Outcome::Success(session)
-                    } else {
-                        Outcome::Error((Status::Unauthorized, create_error!(InvalidSession)))
+                        Ok(session) => Outcome::Success(session),
+                        Err(e) => {
+                            // A database error is a 500, not a dead session (a 401 signs the client out)
+                            let e = credential_lookup_error(e);
+                            Outcome::Error((credential_error_status(&e), e))
+                        }
                     }
                 } else {
                     Outcome::Error((Status::Unauthorized, create_error!(MissingHeaders)))

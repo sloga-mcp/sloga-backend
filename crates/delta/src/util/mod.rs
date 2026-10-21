@@ -9,4 +9,6 @@ pub mod softres_catalog;
 pub mod threads;
 
 #[cfg(test)]
+mod auth_guard_tests;
+#[cfg(test)]
 pub mod test;
