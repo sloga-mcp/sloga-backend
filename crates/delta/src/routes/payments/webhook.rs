@@ -237,7 +237,9 @@ mod test {
         create_cipher_checkout, fulfil_order, REFUND_GRACE_MS, REFUND_RELEASE_WINDOW_MS,
     };
     use revolt_payments::settings::PaymentsSettings;
-    use revolt_payments::stripe::{sign_for_tests, CheckoutSession, PaymentIntent, StripeError};
+    use revolt_payments::stripe::{
+        sign_for_tests, CheckoutSession, PaymentIntent, Refund, StripeError,
+    };
     use revolt_result::create_error;
     use revolt_result::ErrorType;
     use rocket::http::{ContentType, Header, Status};
@@ -280,6 +282,17 @@ mod test {
             "data": { "object": object }
         }))
         .unwrap()
+    }
+
+    /// A full refund of `payment_intent` ($99) made now, as Stripe lists it
+    fn succeeded_refund(id: &str, payment_intent: &str) -> Refund {
+        Refund {
+            id: id.to_string(),
+            status: Some("succeeded".to_string()),
+            amount: Some(9900),
+            payment_intent: Some(payment_intent.to_string()),
+            created: Some(now_secs()),
+        }
     }
 
     /// An event type the engine does not act on: handled as Ignored without
@@ -868,7 +881,12 @@ mod test {
         assert_eq!(event_state(&harness, "evt_webhook_fallback_cs").await, None);
 
         // The refund is: past the window and the grace, the membership is revoked,
-        // the number retired and the badge cleared
+        // the number retired and the badge cleared. Stripe lists it as
+        // succeeded (dispatch acts only on a succeeded refund).
+        harness.stripe.set_refund(succeeded_refund(
+            "re_webhook_fallback",
+            "pi_webhook_fallback",
+        ));
         let refunded = event_body(
             "evt_webhook_fallback_refund",
             "charge.refunded",
@@ -967,6 +985,10 @@ mod test {
             .unwrap()
             .expect("a claimed number");
 
+        harness.stripe.set_refund(succeeded_refund(
+            "re_webhook_fallback_recent",
+            "pi_webhook_fallback_recent",
+        ));
         let refunded = event_body(
             "evt_webhook_fallback_refund_recent",
             "charge.refunded",

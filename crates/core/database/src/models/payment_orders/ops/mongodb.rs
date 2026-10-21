@@ -164,6 +164,27 @@ impl AbstractPaymentOrders for MongoDb {
             .map_err(row_error)
     }
 
+    async fn fetch_payment_orders_refund_settling(
+        &self,
+        now: i64,
+        limit: i64,
+    ) -> Result<Vec<PaymentOrder>> {
+        // Neither is ever stored as null, so `$exists` is exactly "set"
+        self.col::<PaymentOrder>(COL)
+            .find(doc! {
+                "refund_settling_since": { "$exists": true },
+                "payment_intent_id": { "$exists": true },
+                "$or": lease_free(now)
+            })
+            .sort(doc! { "created_at": 1_i32, "_id": 1_i32 })
+            .limit(limit)
+            .await
+            .map_err(|_| create_database_error!("find", COL))?
+            .try_collect()
+            .await
+            .map_err(row_error)
+    }
+
     async fn acquire_payment_order_lease(
         &self,
         id: &str,
@@ -346,7 +367,9 @@ mod tests {
             payment_intent_id: None,
             state: OrderState::Creating,
             void_reason: None,
+            region_blocked_country: None,
             reversal_pending: None,
+            refund_settling_since: None,
             open_disputes: vec![],
             lease_until: None,
             version: 0,
@@ -402,6 +425,7 @@ mod tests {
             state: OrderState::Voided,
             void_reason: Some(VoidReason::DisputeOpen),
             reversal_pending: Some(ReversalPending::DisputeLost),
+            refund_settling_since: Some(1_788_264_090_000),
             open_disputes: vec!["dp_1".to_string(), "dp_2".to_string()],
             lease_until: Some(1_788_264_120_000),
             paid_at: Some(1_788_264_060_000),
@@ -417,6 +441,10 @@ mod tests {
             &vec![bson::Bson::from("dp_1"), bson::Bson::from("dp_2")]
         );
         assert_eq!(doc.get_i64("lease_until").unwrap(), 1_788_264_120_000);
+        assert_eq!(
+            doc.get_i64("refund_settling_since").unwrap(),
+            1_788_264_090_000
+        );
         assert_eq!(from_document::<PaymentOrder>(doc).unwrap(), full);
 
         // Appended variant, stored by name like the others
@@ -433,6 +461,32 @@ mod tests {
         })
         .unwrap();
         assert_eq!(reversed.get_str("void_reason").unwrap(), "Reversed");
+
+        for (reason, name) in [
+            (VoidReason::ReleasePending, "ReleasePending"),
+            (VoidReason::RegionUnavailable, "RegionUnavailable"),
+        ] {
+            let voided = PaymentOrder {
+                state: OrderState::Voided,
+                void_reason: Some(reason),
+                ..order()
+            };
+            let doc = to_document(&voided).unwrap();
+            assert_eq!(doc.get_str("void_reason").unwrap(), name);
+            assert!(!doc.contains_key("region_blocked_country"));
+            assert_eq!(from_document::<PaymentOrder>(doc).unwrap(), voided);
+        }
+
+        // The country of a region void, stored as its code
+        let region = PaymentOrder {
+            state: OrderState::Voided,
+            void_reason: Some(VoidReason::RegionUnavailable),
+            region_blocked_country: Some("DE".to_string()),
+            ..order()
+        };
+        let doc = to_document(&region).unwrap();
+        assert_eq!(doc.get_str("region_blocked_country").unwrap(), "DE");
+        assert_eq!(from_document::<PaymentOrder>(doc).unwrap(), region);
     }
 
     #[test]

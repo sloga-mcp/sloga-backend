@@ -26,6 +26,9 @@ pub struct PaymentsSettings {
     pub tolerance_secs: u64,
     /// Stripe Tax on Checkout, tax-inclusive (`api.stripe.automatic_tax`)
     pub automatic_tax: bool,
+    /// Countries Cipher is not sold to, ISO 3166-1 alpha-2, uppercase
+    /// (`features.payments.cipher_blocked_countries`)
+    pub blocked_countries: Vec<String>,
     /// Stripe API secret key; never printed
     pub secret_key: String,
     /// Webhook endpoint signing secret; never printed
@@ -58,6 +61,7 @@ impl std::fmt::Debug for PaymentsSettings {
             expect_livemode,
             tolerance_secs,
             automatic_tax,
+            blocked_countries,
             secret_key,
             webhook_secret,
             success_url_web,
@@ -74,6 +78,7 @@ impl std::fmt::Debug for PaymentsSettings {
             .field("expect_livemode", expect_livemode)
             .field("tolerance_secs", tolerance_secs)
             .field("automatic_tax", automatic_tax)
+            .field("blocked_countries", blocked_countries)
             .field("secret_key", &redact(secret_key))
             .field("webhook_secret", &redact(webhook_secret))
             .field("success_url_web", success_url_web)
@@ -88,7 +93,9 @@ impl PaymentsSettings {
     /// Build from the loaded config
     ///
     /// Err(InternalError), logged, when `cipher_sales_close_at` is non-empty
-    /// and not RFC 3339, or `cipher_cap` is 0 or above [`CIPHER_CAP_MAX`].
+    /// and not RFC 3339, `cipher_cap` is 0 or above [`CIPHER_CAP_MAX`], or
+    /// an entry of `cipher_blocked_countries` is not two uppercase ASCII
+    /// letters.
     pub fn from_config(c: &Settings) -> Result<Self> {
         Self::from_parts(&c.features.payments, &c.api.stripe)
     }
@@ -109,6 +116,20 @@ impl PaymentsSettings {
             create_error!(InternalError)
         })?;
 
+        // A typo (`"de"`, `"DEU"`, `" DE"`) would silently sell to a country
+        // meant to be blocked: refuse the whole config instead
+        if let Some(bad) = payments
+            .cipher_blocked_countries
+            .iter()
+            .find(|code| !is_country_code(code))
+        {
+            log::error!(
+                "[features.payments] cipher_blocked_countries: {bad:?} is not an ISO 3166-1 \
+                 alpha-2 code in uppercase"
+            );
+            return Err(create_error!(InternalError));
+        }
+
         Ok(Self {
             enabled: payments.enabled,
             sales_open: payments.cipher_sales_open,
@@ -117,6 +138,7 @@ impl PaymentsSettings {
             expect_livemode: stripe.expect_livemode,
             tolerance_secs: stripe.tolerance_secs,
             automatic_tax: stripe.automatic_tax,
+            blocked_countries: payments.cipher_blocked_countries.clone(),
             secret_key: stripe.secret_key.clone(),
             webhook_secret: stripe.webhook_secret.clone(),
             success_url_web: stripe.success_url_web.clone(),
@@ -146,6 +168,19 @@ impl PaymentsSettings {
     pub fn sales_open_at(&self, at_ms: i64) -> bool {
         self.enabled && self.sales_open && self.close_at_ms.is_none_or(|close| at_ms < close)
     }
+
+    /// Whether Cipher is not sold to `country` (an ISO 3166-1 alpha-2 code
+    /// as Cloudflare or Stripe report it; compared without regard to case)
+    pub fn region_blocked(&self, country: &str) -> bool {
+        self.blocked_countries
+            .iter()
+            .any(|blocked| blocked.eq_ignore_ascii_case(country))
+    }
+}
+
+/// Exactly two uppercase ASCII letters
+fn is_country_code(code: &str) -> bool {
+    code.len() == 2 && code.bytes().all(|b| b.is_ascii_uppercase())
 }
 
 /// Parse `cipher_sales_close_at`: "" → None; otherwise an RFC 3339 instant
@@ -181,6 +216,7 @@ mod tests {
             cipher_sales_open: true,
             cipher_cap: cap,
             cipher_sales_close_at: close_at.to_string(),
+            ..FeaturePayments::default()
         }
     }
 
@@ -298,6 +334,38 @@ mod tests {
         assert_eq!(s.cap, CIPHER_CAP_MAX);
         assert_eq!(s.close_at_ms, None);
         assert!(!s.sales_open_at(0));
+        // ...and the EU and the UK blocked
+        assert_eq!(s.blocked_countries.len(), 28);
+        for code in ["DE", "FR", "GB", "IE", "de"] {
+            assert!(s.region_blocked(code), "{code}");
+        }
+        for code in ["US", "BR", "CH", "", "XX", "DEU"] {
+            assert!(!s.region_blocked(code), "{code}");
+        }
+    }
+
+    #[test]
+    fn blocked_countries_must_be_uppercase_alpha_2() {
+        let with = |codes: &[&str]| FeaturePayments {
+            cipher_blocked_countries: codes.iter().map(|c| c.to_string()).collect(),
+            ..payments(1000, "")
+        };
+        for bad in ["de", "De", "DEU", "D", "", " DE", "DE ", "D1", "A-"] {
+            assert_internal_error(PaymentsSettings::from_parts(
+                &with(&["FR", bad]),
+                &ApiStripe::default(),
+            ));
+        }
+
+        let s = PaymentsSettings::from_parts(&with(&["FR", "US"]), &ApiStripe::default()).unwrap();
+        assert_eq!(s.blocked_countries, ["FR", "US"]);
+        assert!(s.region_blocked("US"));
+        assert!(!s.region_blocked("DE"));
+
+        // An empty list blocks nothing
+        let s = PaymentsSettings::from_parts(&with(&[]), &ApiStripe::default()).unwrap();
+        assert!(s.blocked_countries.is_empty());
+        assert!(!s.region_blocked("DE"));
     }
 
     #[test]

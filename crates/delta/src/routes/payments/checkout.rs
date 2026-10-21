@@ -6,31 +6,97 @@ use revolt_payments::engine;
 use revolt_payments::settings::PaymentsSettings;
 use revolt_payments::stripe::StripeApi;
 use revolt_result::{create_error, Result};
+use revolt_rocket_okapi::gen::OpenApiGenerator;
+use revolt_rocket_okapi::request::{OpenApiFromRequest, RequestHeaderInput};
+use rocket::request::{FromRequest, Outcome};
 use rocket::serde::json::Json;
-use rocket::State;
+use rocket::{Request, State};
 
 use crate::util::polls::now_ms;
+
+/// Header Cloudflare sets to the country it places the client in
+const CF_IP_COUNTRY: &str = "CF-IPCountry";
+
+/// The caller's country as Cloudflare reports it (`CF-IPCountry`), read
+/// only when `[api.security] trust_cloudflare` is on: the same rule as the
+/// client IP (`revolt_database::util::ip`), because without Cloudflare in
+/// front any client could send the header. `None` when not trusted, absent,
+/// or not a two-character code.
+pub struct RequestCountry(pub Option<String>);
+
+#[async_trait]
+impl<'r> FromRequest<'r> for RequestCountry {
+    type Error = std::convert::Infallible;
+
+    async fn from_request(request: &'r Request<'_>) -> Outcome<Self, Self::Error> {
+        let trust = revolt_config::config().await.api.security.trust_cloudflare;
+        Outcome::Success(Self(request_country(
+            trust,
+            request.headers().get_one(CF_IP_COUNTRY),
+        )))
+    }
+}
+
+/// Set by Cloudflare, not the client: nothing to document
+impl OpenApiFromRequest<'_> for RequestCountry {
+    fn from_request_input(
+        _gen: &mut OpenApiGenerator,
+        _name: String,
+        _required: bool,
+    ) -> revolt_rocket_okapi::Result<RequestHeaderInput> {
+        Ok(RequestHeaderInput::None)
+    }
+}
+
+/// [`RequestCountry`] from the trust switch and the raw header, uppercased.
+/// Cloudflare sends `XX` (unknown) and `T1` (Tor) as well; neither is ever
+/// in the blocked list, so they pass, and fulfilment checks the billing
+/// country anyway.
+fn request_country(trust_cloudflare: bool, header: Option<&str>) -> Option<String> {
+    if !trust_cloudflare {
+        return None;
+    }
+    header
+        .filter(|code| code.len() == 2 && code.bytes().all(|b| b.is_ascii_alphanumeric()))
+        .map(str::to_ascii_uppercase)
+}
+
+/// Refuse a checkout from a country Cipher is not sold to
+/// (`cipher_blocked_countries`). An unknown country passes: fulfilment
+/// voids and refunds a payment billed to a blocked one.
+fn refuse_blocked_region(settings: &PaymentsSettings, country: Option<&str>) -> Result<()> {
+    match country {
+        Some(country) if settings.region_blocked(country) => {
+            Err(create_error!(CipherRegionUnavailable))
+        }
+        _ => Ok(()),
+    }
+}
 
 /// # Start Cipher Checkout
 ///
 /// Create (or reuse) a Stripe Checkout session for a Cipher tier and return
 /// the hosted page to send the user to. Prices and upgrades are quoted by the
-/// server; the body only names the tier wanted. Bots cannot buy.
+/// server; the body only names the tier wanted. Bots cannot buy. Refused
+/// with `CipherRegionUnavailable` from a country Cipher is not sold to.
 #[openapi(tag = "Payments")]
 #[post("/cipher/checkout", data = "<data>")]
 pub async fn checkout(
     db: &State<Database>,
     stripe: &State<Arc<dyn StripeApi>>,
     user: User,
+    country: RequestCountry,
     data: Json<v0::DataCipherCheckout>,
 ) -> Result<Json<v0::CipherCheckoutResponse>> {
     if user.bot.is_some() {
         return Err(create_error!(IsBot));
     }
 
-    // A config that fails validation (bad close date, cap out of range)
-    // refuses the request rather than selling under a default
+    // A config that fails validation (bad close date, cap out of range, a
+    // malformed blocked country) refuses the request rather than selling
+    // under a default
     let settings = PaymentsSettings::load().await?;
+    refuse_blocked_region(&settings, country.0.as_deref())?;
     let data = data.into_inner();
 
     // The engine owns every other gate: payments enabled, sale open, the
@@ -390,5 +456,105 @@ mod test {
 
         assert!(harness.stripe.calls().is_empty());
         assert_eq!(orders_of(&harness.db, &user.id).await, 0);
+    }
+
+    /// Without `trust_cloudflare` (the test config, as the shipped one) the
+    /// `CF-IPCountry` header is the client's word: a blocked country in it
+    /// is ignored and the checkout goes ahead
+    #[test]
+    fn country_header_is_ignored_without_trust_cloudflare() {
+        crate::util::test::rt().block_on(country_header_is_ignored_without_trust_cloudflare_case())
+    }
+
+    async fn country_header_is_ignored_without_trust_cloudflare_case() {
+        let harness = TestHarness::new().await;
+        let (_, session, user) = harness.new_user().await;
+        assert!(
+            !revolt_config::config().await.api.security.trust_cloudflare,
+            "the test config must not trust Cloudflare, or this test proves nothing"
+        );
+        let settings = PaymentsSettings::load().await.expect("settings");
+        assert!(settings.region_blocked("DE"));
+
+        let response = harness
+            .client
+            .post("/payments/cipher/checkout")
+            .header(ContentType::JSON)
+            .header(Header::new("x-session-token", session.token.clone()))
+            .header(Header::new("CF-IPCountry", "DE"))
+            .body(body("T99", "web"))
+            .dispatch()
+            .await;
+        url_of(response).await;
+        assert_eq!(harness.stripe.call_count(CREATE_SESSION), 1);
+        assert_eq!(orders_of(&harness.db, &user.id).await, 1);
+    }
+
+    /// With `trust_cloudflare` on, a blocked country refuses the checkout
+    /// (`CipherRegionUnavailable`); anything else, or no header, goes
+    /// ahead. The route refuses before the engine runs, so nothing is
+    /// stored or sent to Stripe.
+    ///
+    /// The config is loaded once per process and the test config does not
+    /// trust Cloudflare, so this drives the two steps the route takes, the
+    /// header read and the refusal, with the switch passed in.
+    #[test]
+    fn a_trusted_blocked_country_is_refused() {
+        crate::util::test::rt().block_on(a_trusted_blocked_country_is_refused_case())
+    }
+
+    async fn a_trusted_blocked_country_is_refused_case() {
+        let settings = PaymentsSettings::load().await.expect("settings");
+        let refused = |trust: bool, header: Option<&str>| {
+            super::refuse_blocked_region(
+                &settings,
+                super::request_country(trust, header).as_deref(),
+            )
+            .err()
+            .map(|err| err.error_type)
+        };
+
+        for header in ["DE", "de", "Fr", "GB", "IE", "SE"] {
+            assert!(
+                matches!(
+                    refused(true, Some(header)),
+                    Some(ErrorType::CipherRegionUnavailable)
+                ),
+                "{}",
+                header
+            );
+            // Not trusted: the header is never read
+            assert!(refused(false, Some(header)).is_none(), "{}", header);
+        }
+        for header in [
+            None,
+            Some("US"),
+            Some("BR"),
+            Some("XX"),
+            Some("T1"),
+            Some(""),
+        ] {
+            assert!(refused(true, header).is_none(), "{:?}", header);
+        }
+        // Not a two-character code: treated as unknown
+        for header in ["DEU", "D", " DE", "D-"] {
+            assert_eq!(
+                super::request_country(true, Some(header)),
+                None,
+                "{}",
+                header
+            );
+        }
+        assert_eq!(
+            super::request_country(true, Some("de")).as_deref(),
+            Some("DE")
+        );
+        assert_eq!(super::request_country(false, Some("DE")), None);
+
+        // The refusal carries its own type (its 400 is pinned in
+        // revolt-result)
+        let error = super::refuse_blocked_region(&settings, Some("DE")).unwrap_err();
+        let value = serde_json::to_value(&error).unwrap();
+        assert_eq!(value, json!({ "type": "CipherRegionUnavailable" }));
     }
 }
