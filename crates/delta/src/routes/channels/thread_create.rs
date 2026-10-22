@@ -180,8 +180,10 @@ mod test {
     ///
     /// Control: the route refusals dropped (`db0f44d4`). The parent hold in
     /// `create_thread` still answers `ChannelProtected` with no event, but
-    /// from the database crate (`location`), and only after the duration
-    /// check (`InvalidProperty`) and the message lookup (`NotFound`).
+    /// only after the duration check (`InvalidProperty`) and the message
+    /// lookup (`NotFound`), so the "bad duration" and "unknown anchor" cases
+    /// fail. (The body no longer carries the error's `location`, so the
+    /// "plain" case alone cannot tell the two refusals apart.)
     #[test]
     fn protected_parent_refuses_both_thread_routes_without_side_effects() {
         crate::util::test::rt()
@@ -225,10 +227,9 @@ mod test {
             let (status, body) = post_thread(&harness, &token, path, *auto_archive_minutes).await;
             assert_eq!(status, Status::BadRequest, "{}: {}", case, body);
             assert_eq!(body["type"], "ChannelProtected", "{}: {}", case, body);
-            let location = body["location"].as_str().unwrap_or_default();
             assert!(
-                location.contains("routes/channels/thread_create.rs"),
-                "{}: refused outside the route: {}",
+                body.get("location").is_none(),
+                "{}: the body must not carry the error location: {}",
                 case,
                 body
             );

@@ -175,10 +175,8 @@ mod test {
         let value = body(&stray_answer);
         assert_eq!(value["type"], "NotFound", "{}", stray_answer.1);
         assert!(
-            value["location"]
-                .as_str()
-                .is_some_and(|location| location.contains("routes/channels/message_fetch.rs")),
-            "{}",
+            value.get("location").is_none(),
+            "the body must not carry the error location: {}",
             stray_answer.1
         );
         assert_eq!(stray_answer, foreign_answer);

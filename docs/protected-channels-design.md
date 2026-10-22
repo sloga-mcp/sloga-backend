@@ -704,11 +704,13 @@ commit at that epoch.
   `system`, `components`, `poll`, `command_context`, `webhook`, `thread_id` are all
   `None`/empty and `interactions` is default. Anything else is refused.
 
-### 2.7 Migration (revision 73, `LATEST_REVISION` 74)
+### 2.7 Migration (revision 75, `LATEST_REVISION` 76)
 
-Confirm with the merge steward that no unmerged branch has claimed revision 73 before W1
-lands. Revision 73 runs, in this order, so there is never a window without a uniqueness
-guarantee:
+Renumbered from 73 when the branch was rebased onto acutest `ab530457`, where revision 73
+(the ViewAuditLog backfill) and revision 74 (payments) had already shipped. Revision 75 is
+a top-level block after 74, never nested in it. Confirm with the merge steward that no
+unmerged branch has claimed revision 75 before W1 lands. Revision 75 runs, in this order,
+so there is never a window without a uniqueness guarantee:
 
 1. **Backfill:** `mls_groups.updateMany({ kind: { $exists: false } }, { $set: { kind: "Call" } })`.
 2. **Create** the new index on `mls_groups`:
@@ -717,21 +719,23 @@ guarantee:
 4. **Create** (W2, **DECISION (W2)**, #145) the partial unique index on `messages` that makes
    `cid` replay refusal durable (3.10):
    `{ key: { channel: 1, nonce: 1 }, name: "channel_nonce_encrypted_unique", unique: true, partialFilterExpression: { encrypted: { $exists: true } } }`.
-   `nonce` is the message-level `cid` (2.6), not `encrypted.nonce`. `init.rs`, revision 73
+   `nonce` is the message-level `cid` (2.6), not `encrypted.nonce`. `init.rs`, revision 75
    and the tests all build it from ONE spec (`protected_nonce_index()` and
    `PROTECTED_NONCE_INDEX_NAME`, `admin_migrations/ops/mongodb/init.rs`), because the test
    database is not migrated.
 
 **Deploy notes (W2).** Step 4 is an index build over the whole `messages` collection. Only
 rows carrying `encrypted` enter the index (production has none yet), but the build still
-scans the collection. Revision 73 has not shipped, so W2 folds the index into it rather than
-adding a revision. A DEV database that already ran W1's revision 73 sits at revision 74 and
-never gets the index: create it by hand from the spec above, or reset that database. The
-partial filter relies on `encrypted` being OMITTED (never `null`) when absent; W1's test
-`message_without_encrypted_omits_the_key` pins that. Re-check that no other branch has
-claimed revision 73 before W2 lands.
+scans the collection. Revision 75 has not shipped, so W2 folds the index into it rather than
+adding a revision. A DEV database that ran this branch before the renumber (its block was
+then revision 73) is stored at revision 74: it now runs upstream's revision 74 (payments)
+and revision 75, but SKIPS upstream's revision 73 (the `server_audit_log` collection, its
+indexes and the ViewAuditLog grant). Reset such a database's migration document to
+revision 72, or drop the database. The partial filter relies on `encrypted` being OMITTED
+(never `null`) when absent; W1's test `message_without_encrypted_omits_the_key` pins that.
+Re-check that no other branch has claimed revision 75 before W2 lands.
 
-Then `LATEST_REVISION = 74`. `init.rs` (fresh databases) creates `open_channel_kind_group`
+Then `LATEST_REVISION = 76`. `init.rs` (fresh databases) creates `open_channel_kind_group`
 only, plus: `channel_entitlements` unique index on `channel_id`; `channel_seats` index on
 `channel_id` and on `user_id`; `channel_seat_lists` needs only `_id`; and (W2) the step-4
 `messages` index from the same spec. The Reference driver
@@ -3876,10 +3880,11 @@ stand in the plan; #150 onward record lane findings.
      fails closed and loud (1.3, 6.3, 7.4).
 145. DECISION (W2), decision 15 [A#1, R#9]: durable `cid` replay refusal. A partial unique
      index `channel_nonce_encrypted_unique` on `messages { channel, nonce }` over rows with
-     `encrypted`, folded into the unshipped revision 73 and built from one spec; both
+     `encrypted`, folded into the unshipped revision 75 and built from one spec; both
      drivers' `insert_message` map a hit on that index (Mongo: error 11000 matched by the
      index NAME) to `DuplicateNonce`, and Reference emulates it. Deploy notes cover the
-     collection-wide build and dev databases already at revision 74 (2.7, 3.10).
+     collection-wide build and dev databases that ran the pre-renumber revision 73 (2.7,
+     3.10).
 146. DECISION (W2), decision 16: pin and unpin on a protected channel suppress the system
      message and never fail (7.4).
 147. DECISION (W2), decision 17 [A#18, R#2]: doc fixes. The impossible "Forum posts"

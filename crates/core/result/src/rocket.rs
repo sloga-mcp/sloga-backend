@@ -287,6 +287,7 @@ mod tests {
             .map(String::as_str)
             .collect();
         keys.sort_unstable();
-        assert_eq!(keys, ["location", "max", "type"]);
+        // The error's `location` stays out of the body
+        assert_eq!(keys, ["max", "type"]);
     }
 }

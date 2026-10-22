@@ -1350,7 +1350,7 @@ mod protect_hold_tests {
 /// The durable `cid` replay guard (W2 Decision 15), driven straight through
 /// `insert_message` so the in-memory nonce cache is not in the path. The
 /// test database is un-migrated, so each test builds the index from the one
-/// spec `init.rs` and revision 73 use. Mongo only: under `TEST_DB=REFERENCE`
+/// spec `init.rs` and revision 75 use. Mongo only: under `TEST_DB=REFERENCE`
 /// these return early; the Reference emulation has its own tests in
 /// `reference.rs`.
 #[cfg(test)]

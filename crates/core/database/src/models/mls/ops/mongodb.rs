@@ -59,7 +59,7 @@ async fn text_commit_backoff(retry_no: usize) {
 
 /// Filter value for a group's `kind`. A Call lookup also matches a stored
 /// group with no `kind` field (written before the field existed), so Call
-/// callers keep their exact behavior whether or not the revision-73
+/// callers keep their exact behavior whether or not the revision-75
 /// backfill has run.
 fn kind_filter(kind: MlsGroupKind) -> Bson {
     match kind {

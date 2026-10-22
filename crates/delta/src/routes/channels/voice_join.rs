@@ -2252,11 +2252,11 @@ mod test {
     }
 
     /// Decision 18 (W2): a caller who fails Connect gets the same answer,
-    /// byte for byte (`location` included), from a protected channel and an
-    /// unprotected one of the same server, so the refusal tells a caller who
-    /// cannot connect nothing about the channel. Control: the refusal moved
-    /// above the permission calculation (the protected join answers
-    /// `ChannelProtected`).
+    /// byte for byte (the body never carries the error's `location`), from a
+    /// protected channel and an unprotected one of the same server, so the
+    /// refusal tells a caller who cannot connect nothing about the channel.
+    /// Control: the refusal moved above the permission calculation (the
+    /// protected join answers `ChannelProtected`).
     async fn join_call_answers_a_caller_without_connect_alike_protected_or_not_case() {
         let harness = TestHarness::new().await;
         let (_account, session, owner) = harness.new_user().await;
@@ -2288,7 +2288,7 @@ mod test {
             assert!(
                 refused.1.contains("\"type\":\"MissingPermission\"")
                     && refused.1.contains("Connect")
-                    && refused.1.contains("\"location\""),
+                    && !refused.1.contains("\"location\""),
                 "{}",
                 refused.1
             );

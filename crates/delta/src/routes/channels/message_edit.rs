@@ -641,10 +641,8 @@ mod test {
         let value = body(&answer);
         assert_eq!(value["type"], "ChannelProtected", "{}", answer.1);
         assert!(
-            value["location"]
-                .as_str()
-                .is_some_and(|location| location.contains("routes/channels/message_edit.rs")),
-            "{}",
+            value.get("location").is_none(),
+            "the body must not carry the error location: {}",
             answer.1
         );
 

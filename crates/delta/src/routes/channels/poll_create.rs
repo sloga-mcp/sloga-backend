@@ -826,7 +826,7 @@ mod protected_test {
             "MissingPermission",
             "a non-viewer",
         );
-        assert!(ordinary.1["location"].is_string(), "{}", ordinary.1);
+        assert!(ordinary.1.get("location").is_none(), "{}", ordinary.1);
         assert_eq!(protected, ordinary, "protected vs ordinary");
     }
 }

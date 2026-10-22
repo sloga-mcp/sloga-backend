@@ -241,17 +241,17 @@ mod tests {
         serde_json::from_str(&answer.1).unwrap_or_else(|_| panic!("not JSON: {:?}", answer))
     }
 
-    /// The route's own 404 (not an unmatched route's, not another file's)
+    /// An API 404 (JSON typed `NotFound`, so not an unmatched route's). The
+    /// body never carries the error's `location`, so it cannot tell this
+    /// route's 404 from another file's.
     #[track_caller]
     fn assert_own_not_found(answer: &(Status, String), case: &str) {
         assert_eq!(answer.0, Status::NotFound, "{}: {:?}", case, answer);
         let value = body(answer);
         assert_eq!(value["type"], "NotFound", "{}: {}", case, answer.1);
         assert!(
-            value["location"]
-                .as_str()
-                .is_some_and(|location| location.contains("routes/mls/text_group.rs")),
-            "{}: {}",
+            value.get("location").is_none(),
+            "{}: the body must not carry the error location: {}",
             case,
             answer.1
         );

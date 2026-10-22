@@ -850,16 +850,16 @@ mod test {
         serde_json::from_str(&answer.1).expect("a JSON body")
     }
 
-    /// This route's own `ChannelProtected`, not the database floor's
+    /// A `ChannelProtected` refusal. The body no longer carries the error's
+    /// `location`, so it cannot tell this route's refusal from the database
+    /// floor's.
     fn assert_refused_here(answer: &(Status, String), case: &str) {
         assert_eq!(answer.0, Status::BadRequest, "{}: {:?}", case, answer);
         let value = body(answer);
         assert_eq!(value["type"], "ChannelProtected", "{}: {}", case, answer.1);
         assert!(
-            value["location"]
-                .as_str()
-                .is_some_and(|location| location.contains("routes/channels/message_forward.rs")),
-            "{}: {}",
+            value.get("location").is_none(),
+            "{}: the body must not carry the error location: {}",
             case,
             answer.1
         );

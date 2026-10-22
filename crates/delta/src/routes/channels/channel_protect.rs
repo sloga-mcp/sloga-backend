@@ -157,18 +157,18 @@ mod test {
         .await;
 
         // An unmounted route is also a 404, but from Rocket's catcher, which
-        // carries no API error body. The location pins it to this handler.
+        // carries no API error body: a JSON body typed `NotFound` is the
+        // handler's own. The body never carries the error's `location`.
         assert_eq!(response.status(), Status::NotFound);
+        assert_eq!(response.content_type(), Some(ContentType::JSON));
         let error = response
             .into_json::<serde_json::Value>()
             .await
             .expect("API error body");
         assert_eq!(error["type"], "NotFound");
         assert!(
-            error["location"]
-                .as_str()
-                .is_some_and(|location| location.contains("routes/channels/channel_protect.rs")),
-            "unexpected error: {}",
+            error.get("location").is_none(),
+            "the body must not carry the error location: {}",
             error
         );
     }
@@ -251,16 +251,12 @@ mod test {
         serde_json::from_str(&answer.1).unwrap_or_else(|_| panic!("not JSON: {:?}", answer))
     }
 
-    /// A refusal: its status, and its error body apart from `location`
+    /// A refusal: its status, and its whole error body. The body never
+    /// carries the error's `location`, so an exact match also proves that.
     #[track_caller]
     fn assert_refused(answer: &(Status, String), status: Status, error: serde_json::Value) {
         assert_eq!(answer.0, status, "{:?}", answer);
-        let mut value = body(answer);
-        value
-            .as_object_mut()
-            .expect("an error object")
-            .remove("location");
-        assert_eq!(value, error, "{:?}", answer);
+        assert_eq!(body(answer), error, "{:?}", answer);
     }
 
     /// The success answer: the channel as stored now, which is protected
@@ -684,9 +680,9 @@ mod test {
 
     /// Decision 18 (W2): for every caller class, a channel the caller cannot
     /// view (protectable, or already protected) and a deleted channel answer
-    /// EXACTLY as a channel id the server never held, the full body
-    /// (`location` included), for a valid and a garbage request alike, and
-    /// that answer is not what a viewer gets
+    /// EXACTLY as a channel id the server never held, the full body, for a
+    /// valid and a garbage request alike, and that answer is not what a
+    /// viewer gets
     async fn non_viewers_answer_as_a_missing_channel() {
         let harness = TestHarness::new().await;
         let db = &harness.db;
@@ -779,10 +775,8 @@ mod test {
                 let missing = protect(&harness, session, &missing_id, &request).await;
                 assert_refused(&missing, Status::NotFound, json!({ "type": "NotFound" }));
                 assert!(
-                    body(&missing)["location"].as_str().is_some_and(
-                        |location| location.contains("routes/channels/channel_protect.rs")
-                    ),
-                    "{}",
+                    body(&missing).get("location").is_none(),
+                    "the body must not carry the error location: {}",
                     missing.1
                 );
 

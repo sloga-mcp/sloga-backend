@@ -405,12 +405,11 @@ mod protected {
         let (status, body) = roll(&f.harness, &f.member_session, &channel_id, &nonce).await;
         assert_eq!(status, Status::BadRequest, "{body}");
         assert_eq!(body["type"], "ChannelProtected", "{body}");
-        // The route refused, not the database floor behind it
+        // The body never carries the error's `location`, so it cannot tell
+        // the route's refusal from the database floor's
         assert!(
-            body["location"]
-                .as_str()
-                .is_some_and(|location| location.contains("message_roll.rs")),
-            "{}",
+            body.get("location").is_none(),
+            "the body must not carry the error location: {}",
             body
         );
 
@@ -488,7 +487,7 @@ mod protected {
         .await;
         assert_eq!(ordinary.0, Status::Forbidden, "{}", ordinary.1);
         assert_eq!(ordinary.1["type"], "MissingPermission", "{}", ordinary.1);
-        assert!(ordinary.1["location"].is_string(), "{}", ordinary.1);
+        assert!(ordinary.1.get("location").is_none(), "{}", ordinary.1);
         assert_eq!(protected, ordinary);
     }
 }

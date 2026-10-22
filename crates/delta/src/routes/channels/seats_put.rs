@@ -966,10 +966,8 @@ mod test {
                 );
                 let value = assert_error(&missing, "NotFound", caller.class);
                 assert!(
-                    value["location"]
-                        .as_str()
-                        .is_some_and(|location| location.contains("routes/channels/seats_put.rs")),
-                    "{}: {}",
+                    value.get("location").is_none(),
+                    "{}: the body must not carry the error location: {}",
                     caller.class,
                     missing.1
                 );

@@ -297,11 +297,8 @@ mod test {
                 let missing = grant(harness, &caller.session, &missing_id, body.clone()).await;
                 assert_refused(&missing, Status::Forbidden, "NotPrivileged", caller.class);
                 assert!(
-                    missing.1["location"]
-                        .as_str()
-                        .is_some_and(|location| location
-                            .contains("routes/channels/protected_entitlement_grant.rs")),
-                    "{}: refused away from this route: {:?}",
+                    missing.1.get("location").is_none(),
+                    "{}: the body must not carry the error location: {:?}",
                     caller.class,
                     missing
                 );

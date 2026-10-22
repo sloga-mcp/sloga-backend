@@ -619,9 +619,7 @@ mod test {
 
     use crate::util::test::ProtectedChannel;
     use revolt_database::events::client::EventV1;
-    use revolt_database::{
-        Channel, MessageFilter, MessageQuery, MessageTimePeriod, PartialChannel, Session,
-    };
+    use revolt_database::PartialChannel;
     use revolt_permissions::{ChannelPermission, OverrideField};
     use serde_json::Value;
 

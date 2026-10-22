@@ -499,7 +499,9 @@ mod test {
                 channel.id(),
             )
             .await;
-            assert_eq!(body["type"], "MissingPermission", "{}", body);
+            // The pre-W2 answer for a hidden source channel (upstream's
+            // `require_event_channel_view`)
+            assert_eq!(body["type"], "NotFound", "{}", body);
             answers.push((status, body.to_string()));
         }
 
