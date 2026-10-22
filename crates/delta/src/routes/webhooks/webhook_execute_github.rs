@@ -771,7 +771,16 @@ pub async fn webhook_execute_github(
     let webhook = webhook_id.as_webhook(db).await?;
     webhook.assert_token(token)?;
 
+    // A webhook can only post plaintext, so a protected channel takes none
+    // (design 7.4). Refused after the token check (a caller without it learns
+    // nothing about the channel) and before the event is parsed and its embed
+    // built or sent. Keyed on the channel alone: the refusal holds with E2EE
+    // or growth off.
     let channel = db.fetch_channel(&webhook.channel_id).await?;
+    if channel.is_protected() {
+        return Err(create_error!(ChannelProtected));
+    }
+
     let event = convert_event(&data, &event)?;
 
     let sendable_embed = match event.event {
@@ -1104,4 +1113,313 @@ pub async fn webhook_execute_github(
             false,
         )
         .await
+}
+
+#[cfg(test)]
+mod test {
+    use crate::util::test::{TestHarness, FIXTURE_DEVICE_CAP, FIXTURE_SLOT_CAP, OWNER_DEVICE_SEED};
+    use revolt_database::{
+        events::client::EventV1, Channel, MessageFilter, MessageQuery, MessageTimePeriod, Webhook,
+    };
+    use rocket::http::{ContentType, Header, Status};
+    use serde_json::{json, Map, Value};
+
+    struct Fixture {
+        harness: TestHarness,
+        /// Protected after its webhook was made
+        protected: Channel,
+        ordinary: Channel,
+        protected_hook: Webhook,
+        ordinary_hook: Webhook,
+    }
+
+    fn webhook(channel: &Channel, creator_id: &str) -> Webhook {
+        Webhook {
+            id: ulid::Ulid::new().to_string(),
+            name: "Protected test github webhook".to_string(),
+            avatar: None,
+            creator_id: creator_id.to_string(),
+            channel_id: channel.id().to_string(),
+            permissions: *revolt_permissions::DEFAULT_WEBHOOK_PERMISSIONS,
+            token: Some(TestHarness::rand_string()),
+        }
+    }
+
+    /// Two channels of one owner, each with a webhook; the first is then
+    /// protected through the database, so its webhook predates the
+    /// protection as a real one would
+    async fn fixture() -> Fixture {
+        let harness = TestHarness::new().await;
+        let (_, owner_session, owner) = harness.new_user().await;
+        let (server, protected) = harness.new_protectable_channel(&owner).await;
+        let ordinary = harness.new_channel(&server).await;
+
+        let protected_hook = webhook(&protected, &owner.id);
+        let ordinary_hook = webhook(&ordinary, &owner.id);
+        for hook in [&protected_hook, &ordinary_hook] {
+            harness.db.insert_webhook(hook).await.expect("`Webhook`");
+        }
+
+        harness
+            .grant_entitlement(&protected, FIXTURE_SLOT_CAP, None)
+            .await;
+        let owner_device = harness
+            .new_e2ee_device(&owner, &owner_session.id, OWNER_DEVICE_SEED)
+            .await;
+        let protect =
+            owner_device.protect_request(protected.id(), FIXTURE_DEVICE_CAP, &[owner.id.clone()]);
+        harness.protect_with_db(&protected, &protect).await;
+        let protected = harness
+            .db
+            .fetch_channel(protected.id())
+            .await
+            .expect("the protected channel");
+        assert!(protected.is_protected(), "the fixture channel is protected");
+
+        Fixture {
+            harness,
+            protected,
+            ordinary,
+            protected_hook,
+            ordinary_hook,
+        }
+    }
+
+    fn github_user() -> Value {
+        let mut user = Map::new();
+        user.insert("login".to_string(), json!("octocat"));
+        user.insert("id".to_string(), json!(1));
+        user.insert("node_id".to_string(), json!("MDQ6VXNlcjE="));
+        user.insert("gravatar_id".to_string(), json!(""));
+        for field in [
+            "avatar_url",
+            "url",
+            "html_url",
+            "followers_url",
+            "following_url",
+            "gists_url",
+            "starred_url",
+            "subscriptions_url",
+            "organizations_url",
+            "repos_url",
+            "events_url",
+            "received_events_url",
+        ] {
+            user.insert(field.to_string(), json!("https://github.com/octocat"));
+        }
+        Value::Object(user)
+    }
+
+    fn github_repository() -> Value {
+        let mut repository = Map::new();
+        repository.insert("id".to_string(), json!(1));
+        repository.insert("node_id".to_string(), json!("MDEwOlJlcG9zaXRvcnkx"));
+        repository.insert("name".to_string(), json!("hello"));
+        repository.insert("full_name".to_string(), json!("octocat/hello"));
+        repository.insert("owner".to_string(), github_user());
+        repository.insert("private".to_string(), json!(false));
+        repository.insert("fork".to_string(), json!(false));
+        repository.insert("created_at".to_string(), json!(0));
+        for field in [
+            "html_url",
+            "url",
+            "archive_url",
+            "assignees_url",
+            "blobs_url",
+            "branches_url",
+            "collaborators_url",
+            "comments_url",
+            "commits_url",
+            "compare_url",
+            "contents_url",
+            "contributors_url",
+            "deployments_url",
+            "downloads_url",
+            "events_url",
+            "forks_url",
+            "git_commits_url",
+            "git_refs_url",
+            "git_tags_url",
+            "issue_comment_url",
+            "issue_events_url",
+            "issues_url",
+            "keys_url",
+            "labels_url",
+            "languages_url",
+            "merges_url",
+            "milestones_url",
+            "notifications_url",
+            "pulls_url",
+            "releases_url",
+            "ssh_url",
+            "stargazers_url",
+            "statuses_url",
+            "subscribers_url",
+            "subscription_url",
+            "tags_url",
+            "teams_url",
+            "trees_url",
+            "hooks_url",
+        ] {
+            repository.insert(field.to_string(), json!("https://github.com/octocat/hello"));
+        }
+        Value::Object(repository)
+    }
+
+    /// A `create` event (a branch was created): it builds an embed and sends
+    fn create_event() -> Value {
+        json!({
+            "master_branch": "main",
+            "pusher_type": "user",
+            "ref": "feature",
+            "ref_type": "branch",
+            "sender": github_user(),
+            "repository": github_repository(),
+        })
+    }
+
+    /// A `ping` event: the pre-W2 route answers it with no message at all
+    fn ping_event() -> Value {
+        json!({
+            "zen": "Keep it logically awesome.",
+            "hook_id": 1,
+            "sender": github_user(),
+            "repository": github_repository(),
+        })
+    }
+
+    /// POST `body` as the github event `event` to the webhook; the status
+    /// and the raw response body
+    async fn execute(
+        harness: &TestHarness,
+        webhook_id: &str,
+        token: &str,
+        event: &str,
+        body: &Value,
+    ) -> (Status, String) {
+        let response = harness
+            .client
+            .post(format!("/webhooks/{webhook_id}/{token}/github"))
+            .header(ContentType::JSON)
+            .header(Header::new("X-GitHub-Event", event.to_string()))
+            .body(body.to_string())
+            .dispatch()
+            .await;
+        let status = response.status();
+        (status, response.into_string().await.unwrap_or_default())
+    }
+
+    fn token(hook: &Webhook) -> &str {
+        hook.token.as_deref().expect("a webhook token")
+    }
+
+    fn assert_refused(answer: &(Status, String), status: Status, error: &str, case: &str) {
+        assert_eq!(answer.0, status, "{case}: {}", answer.1);
+        let body: Value = serde_json::from_str(&answer.1).expect("a JSON error body");
+        assert_eq!(body["type"], error, "{case}: {}", answer.1);
+    }
+
+    async fn stored_messages(harness: &TestHarness, channel: &Channel) -> usize {
+        harness
+            .db
+            .fetch_messages(MessageQuery {
+                limit: Some(10),
+                filter: MessageFilter {
+                    channel: Some(channel.id().to_string()),
+                    ..Default::default()
+                },
+                time_period: MessageTimePeriod::Absolute {
+                    before: None,
+                    after: None,
+                    sort: None,
+                },
+            })
+            .await
+            .expect("the channel's messages")
+            .len()
+    }
+
+    /// Decision 18 (W2): a protected channel's github webhook is refused with
+    /// `ChannelProtected` for an event that would send and for one that would
+    /// not (`ping`), with no message row and no `Message` event; the same
+    /// event to an ordinary channel's webhook still sends
+    #[test]
+    fn protected_github_execute_is_refused_without_side_effects() {
+        crate::util::test::rt().block_on(Box::pin(
+            protected_github_execute_is_refused_without_side_effects_case(),
+        ))
+    }
+
+    async fn protected_github_execute_is_refused_without_side_effects_case() {
+        let Fixture {
+            mut harness,
+            protected,
+            ordinary,
+            protected_hook,
+            ordinary_hook,
+        } = fixture().await;
+
+        for (event, body) in [("create", create_event()), ("ping", ping_event())] {
+            assert_refused(
+                &execute(
+                    &harness,
+                    &protected_hook.id,
+                    token(&protected_hook),
+                    event,
+                    &body,
+                )
+                .await,
+                Status::BadRequest,
+                "ChannelProtected",
+                event,
+            );
+        }
+        assert_eq!(stored_messages(&harness, &protected).await, 0);
+
+        // Positive control, and the marker for the negative below: the same
+        // event sends to an ordinary channel, and its `Message` event arrives
+        // on the one `psubscribe("*")` connection, FIFO, after anything the
+        // refusals could have published
+        let (status, sent) = execute(
+            &harness,
+            &ordinary_hook.id,
+            token(&ordinary_hook),
+            "create",
+            &create_event(),
+        )
+        .await;
+        assert_eq!(status, Status::Ok, "an ordinary channel: {sent}");
+        assert_eq!(stored_messages(&harness, &ordinary).await, 1);
+
+        let ordinary_id = ordinary.id().to_string();
+        harness
+            .wait_for_event(ordinary.id(), |event| match event {
+                EventV1::Message(message) => message.channel == ordinary_id,
+                _ => false,
+            })
+            .await;
+        harness
+            .assert_no_buffered_event(protected.id(), |event| matches!(event, EventV1::Message(_)));
+    }
+
+    /// Decision 18 (W2): a bad token gets the pre-W2 answer, byte-identical
+    /// for a protected and an ordinary channel's github webhook
+    #[test]
+    fn protected_github_execute_bad_token_is_answered_as_before() {
+        crate::util::test::rt().block_on(Box::pin(async {
+            let f = fixture().await;
+            let h = &f.harness;
+
+            for (event, body) in [("create", create_event()), ("ping", ping_event())] {
+                let protected =
+                    execute(h, &f.protected_hook.id, "not-the-token", event, &body).await;
+                let ordinary = execute(h, &f.ordinary_hook.id, "not-the-token", event, &body).await;
+                assert_refused(&ordinary, Status::Unauthorized, "NotAuthenticated", event);
+                assert_eq!(protected, ordinary, "{event}");
+            }
+
+            assert_eq!(stored_messages(h, &f.protected).await, 0);
+            assert_eq!(stored_messages(h, &f.ordinary).await, 0);
+        }))
+    }
 }

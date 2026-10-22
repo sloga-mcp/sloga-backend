@@ -56,6 +56,12 @@ pub async fn message_interact(
     permissions.throw_if_lacking_channel_permission(ChannelPermission::ViewChannel)?;
     permissions.throw_if_lacking_channel_permission(ChannelPermission::ReadMessageHistory)?;
 
+    // A protected channel carries only ciphertext: no bot may be addressed
+    // there. Refused after the permission checks (a caller who cannot view
+    // the channel learns nothing about the flag) and before the interaction
+    // insert and the event to the bot.
+    crate::util::interactions::ensure_interactions_allowed(&channel)?;
+
     // Archived / locked threads are read-only: clicking would create an
     // interaction whose response is guaranteed to be rejected — fail early.
     crate::util::threads::ensure_thread_writable(&channel, &permissions)?;
@@ -169,8 +175,10 @@ pub async fn message_interact(
 #[cfg(test)]
 mod test {
     use crate::{rocket, util::test::TestHarness};
+    use revolt_database::events::client::EventV1;
     use revolt_database::{
-        Bot, Interaction, InteractionKind, Member, Message, PartialChannel, Server, User,
+        Bot, Channel, Database, Interaction, InteractionKind, Member, Message, PartialChannel,
+        Server, User,
     };
     use revolt_models::v0;
     use revolt_permissions::{ChannelPermission, OverrideField};
@@ -528,5 +536,201 @@ mod test {
             Status::Ok,
             "a member denied ViewChannel must not interact"
         );
+    }
+
+    /// Mark `channel_id` protected under the rows already stored in it. The
+    /// database refuses a plaintext row in a protected channel, so a bot
+    /// message with components can only sit in one that was protected after
+    /// the message was written.
+    async fn protect_under_stored_rows(db: &Database, channel_id: &str) {
+        match db {
+            Database::Reference(reference) => {
+                match reference.channels.lock().await.get_mut(channel_id) {
+                    Some(Channel::TextChannel { protected, .. }) => *protected = true,
+                    other => panic!("expected a text channel, got {:?}", other),
+                }
+            }
+            Database::MongoDb(mongo) => {
+                use revolt_database::mongodb::bson::{doc, Document};
+
+                let result = mongo
+                    .col::<Document>("channels")
+                    .update_one(
+                        doc! { "_id": channel_id },
+                        doc! { "$set": { "protected": true } },
+                    )
+                    .await
+                    .expect("raw protect");
+                assert_eq!(result.matched_count, 1);
+            }
+        }
+
+        assert!(db
+            .fetch_channel(channel_id)
+            .await
+            .expect("channel")
+            .is_protected());
+    }
+
+    /// How many interaction rows are stored for `channel_id`
+    async fn interactions_in(db: &Database, channel_id: &str) -> u64 {
+        match db {
+            Database::Reference(reference) => reference
+                .interactions
+                .lock()
+                .await
+                .values()
+                .filter(|interaction| interaction.channel_id == channel_id)
+                .count() as u64,
+            Database::MongoDb(mongo) => {
+                use revolt_database::mongodb::bson::{doc, Document};
+
+                mongo
+                    .col::<Document>("interactions")
+                    .count_documents(doc! { "channel_id": channel_id })
+                    .await
+                    .expect("count interactions")
+            }
+        }
+    }
+
+    async fn click(
+        harness: &TestHarness,
+        session_token: &str,
+        channel_id: &str,
+        message_id: &str,
+    ) -> (Status, String) {
+        let response = harness
+            .client
+            .post(format!(
+                "/channels/{channel_id}/messages/{message_id}/interact"
+            ))
+            .header(Header::new("x-session-token", session_token.to_string()))
+            .header(ContentType::JSON)
+            .body(json!({ "custom_id": "btn_a" }).to_string())
+            .dispatch()
+            .await;
+        let status = response.status();
+        let body = response.into_string().await.unwrap_or_default();
+        (status, body)
+    }
+
+    /// A click in a protected channel is refused with `ChannelProtected`,
+    /// no interaction row is written and the bot is never told: no
+    /// `InteractionCreate` for the channel reaches its private topic. The
+    /// same click in an unprotected channel of the same server reaches the
+    /// bot; its event is published after the refused click, so once it is
+    /// observed anything the refused click published is already buffered.
+    #[test]
+    fn interact_in_protected_channel_is_refused_before_reaching_the_bot() {
+        crate::util::test::rt()
+            .block_on(interact_in_protected_channel_is_refused_before_reaching_the_bot_case())
+    }
+
+    async fn interact_in_protected_channel_is_refused_before_reaching_the_bot_case() {
+        let mut harness = TestHarness::new().await;
+        let (_, session, user) = harness.new_user().await;
+        let (server, _) = harness.new_server(&user).await;
+        let (bot, _) = setup_bot(&harness, &user, &server).await;
+
+        // Everything but the flag is identical: same server, same bot, a
+        // components-bearing bot message in each.
+        let protected = harness.new_channel(&server).await;
+        let stray = insert_bot_message(&harness, protected.id(), &bot.id).await;
+        protect_under_stored_rows(&harness.db, protected.id()).await;
+        let open = harness.new_channel(&server).await;
+        let message = insert_bot_message(&harness, open.id(), &bot.id).await;
+        assert!(!open.is_protected(), "precondition: unprotected");
+
+        // A live bot session: without the refusal the click would go all
+        // the way through to the bot.
+        let (_, presence_session) = revolt_presence::create_session(&bot.id, 0).await;
+
+        let refused = click(&harness, &session.token, protected.id(), &stray.id).await;
+        let allowed = click(&harness, &session.token, open.id(), &message.id).await;
+
+        revolt_presence::delete_session(&bot.id, presence_session).await;
+
+        assert_eq!(refused.0, Status::BadRequest, "body: {}", refused.1);
+        let refused_body: serde_json::Value = serde_json::from_str(&refused.1).expect("error body");
+        assert_eq!(refused_body["type"], "ChannelProtected");
+        assert_eq!(interactions_in(&harness.db, protected.id()).await, 0);
+
+        assert_eq!(allowed.0, Status::Ok, "body: {}", allowed.1);
+        let allowed: v0::CreateInteractionResponse =
+            serde_json::from_str(&allowed.1).expect("`CreateInteractionResponse`");
+        assert_eq!(interactions_in(&harness.db, open.id()).await, 1);
+
+        let bot_topic = format!("{}!", bot.id);
+        harness
+            .wait_for_event(&bot_topic, |event| match event {
+                EventV1::InteractionCreate { interaction } => {
+                    interaction.id == allowed.interaction_id
+                }
+                _ => false,
+            })
+            .await;
+
+        let protected_id = protected.id().to_string();
+        harness.assert_no_buffered_event(&bot_topic, |event| match event {
+            EventV1::InteractionCreate { interaction } => interaction.channel_id == protected_id,
+            _ => false,
+        });
+    }
+
+    /// A member who cannot view the channel gets the same error, body and
+    /// all, whether or not the channel is protected, so the refusal reveals
+    /// nothing about a channel the caller cannot see.
+    #[test]
+    fn interact_without_view_errors_identically_protected_or_not() {
+        crate::util::test::rt()
+            .block_on(interact_without_view_errors_identically_protected_or_not_case())
+    }
+
+    async fn interact_without_view_errors_identically_protected_or_not_case() {
+        let harness = TestHarness::new().await;
+        let (_, _, owner) = harness.new_user().await;
+        let (_, viewer_session, viewer) = harness.new_user().await;
+        let (server, _) = harness.new_server(&owner).await;
+        let (bot, _) = setup_bot(&harness, &owner, &server).await;
+        Member::create(&harness.db, &server, &viewer, None)
+            .await
+            .expect("member");
+
+        let protected = harness.new_channel(&server).await;
+        let stray = insert_bot_message(&harness, protected.id(), &bot.id).await;
+        protect_under_stored_rows(&harness.db, protected.id()).await;
+        let open = harness.new_channel(&server).await;
+        let message = insert_bot_message(&harness, open.id(), &bot.id).await;
+
+        for channel_id in [protected.id(), open.id()] {
+            let mut channel = harness
+                .db
+                .fetch_channel(channel_id)
+                .await
+                .expect("the channel");
+            channel
+                .update(
+                    &harness.db,
+                    PartialChannel {
+                        default_permissions: Some(OverrideField {
+                            a: 0,
+                            d: ChannelPermission::ViewChannel as i64,
+                        }),
+                        ..Default::default()
+                    },
+                    vec![],
+                )
+                .await
+                .expect("deny view");
+        }
+
+        let on_open = click(&harness, &viewer_session.token, open.id(), &message.id).await;
+        let on_protected = click(&harness, &viewer_session.token, protected.id(), &stray.id).await;
+
+        assert_eq!(on_open.0, Status::Forbidden, "body: {}", on_open.1);
+        let body: serde_json::Value = serde_json::from_str(&on_open.1).expect("error body");
+        assert_eq!(body["type"], "MissingPermission");
+        assert_eq!(on_protected, on_open);
     }
 }

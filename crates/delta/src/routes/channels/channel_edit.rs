@@ -119,6 +119,17 @@ pub async fn edit(
         return Ok(Json(channel.into()));
     }
 
+    // A protected channel never becomes a voice or an announcement channel.
+    // `Channel::update` refuses that write too, but only after the icon below
+    // has been claimed or deleted, so the route refuses first: after the
+    // permission checks (a caller who may not edit the channel learns nothing
+    // about it) and before any side effect. Keyed on the stored flag alone,
+    // never on a feature flag. Every other edit of a protected channel goes
+    // through.
+    if channel.is_protected() && (data.voice.is_some() || data.announcement == Some(true)) {
+        return Err(create_error!(ChannelProtected));
+    }
+
     // The announcement flag only ever applies to plain server text channels
     // (never voice-flavoured text channels).
     if data.announcement.is_some()
@@ -3404,5 +3415,327 @@ mod tests {
             "the guard lost the re-sync: {}",
             block
         );
+    }
+
+    // ---- Protected channels (W2 B35) ----------------------------------------
+
+    /// Seed an unclaimed file in the `icons` bucket, as Autumn leaves one
+    /// after an upload.
+    async fn upload_icon(harness: &TestHarness, uploader: &revolt_database::User) -> String {
+        let id = ulid::Ulid::new().to_string();
+        harness
+            .db
+            .insert_attachment(&revolt_database::File {
+                id: id.clone(),
+                tag: "icons".to_string(),
+                filename: "icon.png".to_string(),
+                hash: None,
+                uploaded_at: Some(iso8601_timestamp::Timestamp::now_utc()),
+                uploader_id: Some(uploader.id.clone()),
+                used_for: None,
+                deleted: None,
+                reported: None,
+                metadata: revolt_database::Metadata::File,
+                content_type: "image/png".to_string(),
+                size: 10,
+                message_id: None,
+                user_id: None,
+                server_id: None,
+                object_id: None,
+            })
+            .await
+            .expect("insert icon");
+        id
+    }
+
+    /// (claimed, deleted) as stored.
+    async fn icon_state(harness: &TestHarness, id: &str) -> (bool, bool) {
+        let file = harness
+            .db
+            .fetch_attachment("icons", id)
+            .await
+            .expect("icon");
+        (file.used_for.is_some(), file.deleted.unwrap_or_default())
+    }
+
+    /// (name, icon id, voice present, announcement, protected) as stored.
+    async fn stored_text_channel(
+        harness: &TestHarness,
+        id: &str,
+    ) -> (String, Option<String>, bool, Option<bool>, bool) {
+        match harness.db.fetch_channel(id).await.expect("channel") {
+            revolt_database::Channel::TextChannel {
+                name,
+                icon,
+                voice,
+                announcement,
+                protected,
+                ..
+            } => (
+                name,
+                icon.map(|icon| icon.id),
+                voice.is_some(),
+                announcement,
+                protected,
+            ),
+            other => panic!("expected a text channel, got {:?}", other),
+        }
+    }
+
+    /// A protected channel refuses `voice` and `announcement: true` with
+    /// `ChannelProtected`, before any side effect: an icon in the same body
+    /// is not claimed, a `remove: ["Icon"]` does not delete the stored icon,
+    /// nothing is stored, and no `ChannelUpdate` carries any of it. A rename
+    /// with an icon, and a description edit, still go through. Control: the
+    /// route refusal deleted (the database still answers `ChannelProtected`,
+    /// but only after the icon has been claimed).
+    #[test]
+    fn protected_channel_refuses_voice_and_announcement_before_any_side_effect() {
+        crate::util::test::rt().block_on(
+            protected_channel_refuses_voice_and_announcement_before_any_side_effect_case(),
+        )
+    }
+
+    async fn protected_channel_refuses_voice_and_announcement_before_any_side_effect_case() {
+        let mut harness = TestHarness::new().await;
+        let (_, session, owner) = harness.new_user().await;
+        let protected = harness.new_protected_channel(&owner, &session, &[]).await;
+        let channel_id = protected.channel.id().to_string();
+        let server_id = protected.server.id.clone();
+
+        // An allowed edit, which also seeds a stored icon.
+        let stored_icon = upload_icon(&harness, &owner).await;
+        let response = patch(
+            &harness,
+            &session,
+            &channel_id,
+            json!({ "name": "renamed", "icon": stored_icon }),
+        )
+        .await;
+        assert_eq!(response.status(), Status::Ok);
+        drop(response);
+        let seeded = (
+            "renamed".to_string(),
+            Some(stored_icon.clone()),
+            false,
+            None,
+            true,
+        );
+        assert_eq!(stored_text_channel(&harness, &channel_id).await, seeded);
+        assert_eq!(icon_state(&harness, &stored_icon).await, (true, false));
+
+        let fresh_icon = upload_icon(&harness, &owner).await;
+        for body in [
+            json!({ "voice": {}, "icon": fresh_icon }),
+            json!({ "voice": { "disabled": true }, "icon": fresh_icon }),
+            json!({ "announcement": true, "icon": fresh_icon }),
+            json!({ "voice": {}, "remove": ["Icon"] }),
+            json!({ "announcement": true, "remove": ["Icon"], "name": "leaked" }),
+        ] {
+            let response = patch(&harness, &session, &channel_id, body.clone()).await;
+            assert_eq!(response.status(), Status::BadRequest, "{body}");
+            let error: serde_json::Value =
+                serde_json::from_str(&response.into_string().await.unwrap_or_default())
+                    .expect("an error body");
+            assert_eq!(error["type"], "ChannelProtected", "{body}: {error}");
+
+            assert_eq!(
+                icon_state(&harness, &fresh_icon).await,
+                (false, false),
+                "{body} claimed the icon"
+            );
+            assert_eq!(
+                icon_state(&harness, &stored_icon).await,
+                (true, false),
+                "{body} deleted the stored icon"
+            );
+            assert_eq!(
+                stored_text_channel(&harness, &channel_id).await,
+                seeded,
+                "{body} must write nothing"
+            );
+        }
+
+        // A later allowed edit is the marker: every event published before
+        // it is buffered once it is observed.
+        let response = patch(
+            &harness,
+            &session,
+            &channel_id,
+            json!({ "description": "marker" }),
+        )
+        .await;
+        assert_eq!(response.status(), Status::Ok);
+        drop(response);
+        harness
+            .wait_for_event(&server_id, |event| {
+                matches!(
+                    event,
+                    revolt_database::events::client::EventV1::ChannelUpdate { id, data, .. }
+                        if id == &channel_id && data.description.as_deref() == Some("marker")
+                )
+            })
+            .await;
+        harness.assert_no_buffered_event(&server_id, |event| {
+            matches!(
+                event,
+                revolt_database::events::client::EventV1::ChannelUpdate { id, data, clear }
+                    if id == &channel_id
+                        && (data.voice.is_some()
+                            || data.announcement.is_some()
+                            || data.name.as_deref() == Some("leaked")
+                            || data.icon.as_ref().is_some_and(|icon| icon.id == fresh_icon)
+                            || clear.contains(&v0::FieldsChannel::Icon))
+            )
+        });
+    }
+
+    /// Positive control: the same edits on an unprotected channel of the
+    /// same server go through and are stored.
+    #[test]
+    fn unprotected_channel_takes_voice_and_announcement() {
+        crate::util::test::rt().block_on(unprotected_channel_takes_voice_and_announcement_case())
+    }
+
+    async fn unprotected_channel_takes_voice_and_announcement_case() {
+        let harness = TestHarness::new().await;
+        let (_, session, owner) = harness.new_user().await;
+        let protected = harness.new_protected_channel(&owner, &session, &[]).await;
+
+        let voice = harness.new_channel(&protected.server).await;
+        let icon = upload_icon(&harness, &owner).await;
+        let response = patch(
+            &harness,
+            &session,
+            voice.id(),
+            json!({ "voice": {}, "icon": icon }),
+        )
+        .await;
+        assert_eq!(response.status(), Status::Ok);
+        assert_eq!(
+            stored_text_channel(&harness, voice.id()).await,
+            (
+                "Test Channel".to_string(),
+                Some(icon.clone()),
+                true,
+                None,
+                false
+            )
+        );
+        assert_eq!(icon_state(&harness, &icon).await, (true, false));
+
+        let news = harness.new_channel(&protected.server).await;
+        let response = patch(
+            &harness,
+            &session,
+            news.id(),
+            json!({ "announcement": true }),
+        )
+        .await;
+        assert_eq!(response.status(), Status::Ok);
+        assert_eq!(
+            stored_text_channel(&harness, news.id()).await,
+            ("Test Channel".to_string(), None, false, Some(true), false)
+        );
+    }
+
+    /// A caller who may not edit the channel (a member without
+    /// ManageChannel, and a stranger) gets the pre-W2 error, byte-identical
+    /// on a protected and an unprotected channel, so the refusal tells them
+    /// nothing (decision 18). Control: the refusal moved above the
+    /// permission check (also caught by
+    /// `the_protected_refusal_precedes_every_side_effect`).
+    #[test]
+    fn a_caller_who_may_not_edit_gets_the_same_error_either_way() {
+        crate::util::test::rt()
+            .block_on(a_caller_who_may_not_edit_gets_the_same_error_either_way_case())
+    }
+
+    async fn a_caller_who_may_not_edit_gets_the_same_error_either_way_case() {
+        let harness = TestHarness::new().await;
+        let (_, session, owner) = harness.new_user().await;
+        let (_, member_session, member) = harness.new_user().await;
+        let (_, stranger_session, _) = harness.new_user().await;
+        let protected = harness.new_protected_channel(&owner, &session, &[]).await;
+        harness.join_server(&protected.server, &member).await;
+        let plain = harness.new_channel(&protected.server).await;
+
+        for (caller, session) in [("member", &member_session), ("stranger", &stranger_session)] {
+            for body in [json!({ "voice": {} }), json!({ "announcement": true })] {
+                let mut answers = vec![];
+                for id in [protected.channel.id(), plain.id()] {
+                    let response = patch(&harness, session, id, body.clone()).await;
+                    let status = response.status();
+                    answers.push((status, response.into_string().await.unwrap_or_default()));
+                }
+                assert_eq!(answers[0], answers[1], "{caller} {body}");
+                assert!(
+                    !answers[0].1.contains("ChannelProtected"),
+                    "{caller} {body}: {:?}",
+                    answers[0]
+                );
+                if caller == "member" {
+                    assert_eq!(answers[0].0, Status::Forbidden, "{body}");
+                    assert!(
+                        answers[0].1.contains("MissingPermission"),
+                        "{:?}",
+                        answers[0]
+                    );
+                }
+            }
+        }
+
+        assert_eq!(
+            stored_text_channel(&harness, protected.channel.id()).await,
+            ("Test Channel".to_string(), None, false, None, true)
+        );
+    }
+
+    /// The protected refusal sits after the no-op return and the permission
+    /// checks, and before every read of the server and every side effect.
+    /// Control: the refusal deleted, or moved below the icon claim.
+    #[test]
+    fn the_protected_refusal_precedes_every_side_effect() {
+        const REFUSAL: &str = "if channel.is_protected() && (data.voice.is_some() || \
+             data.announcement == Some(true)) { return Err(create_error!(ChannelProtected)); }";
+
+        let body = route_body();
+        assert_eq!(body.matches(REFUSAL).count(), 1, "{}", body);
+        let refusal = body.find(REFUSAL).expect("counted above");
+
+        for needle in [
+            "permissions.throw_if_lacking_channel_permission(ChannelPermission::ManageChannel)?;",
+            "permissions.throw_if_lacking_channel_permission(ChannelPermission::ViewChannel)?;",
+            "return Ok(Json(channel.into()));",
+        ] {
+            let at = body
+                .find(needle)
+                .unwrap_or_else(|| panic!("the route lost `{}`: {}", needle, body));
+            assert!(
+                at < refusal,
+                "the refusal must follow `{}`: {}",
+                needle,
+                body
+            );
+        }
+
+        for needle in [
+            "db.fetch_server(",
+            "let mut partial",
+            "db.mark_attachment_as_deleted(",
+            "File::use_channel_icon(",
+            "SystemMessage::",
+            "channel .update(",
+        ] {
+            let at = body
+                .find(needle)
+                .unwrap_or_else(|| panic!("the route lost `{}`: {}", needle, body));
+            assert!(
+                refusal < at,
+                "the refusal must precede `{}`: {}",
+                needle,
+                body
+            );
+        }
     }
 }

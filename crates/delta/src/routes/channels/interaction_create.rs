@@ -53,6 +53,12 @@ pub async fn interaction_create(
     let permissions = calculate_channel_permissions(&mut query).await;
     permissions.throw_if_lacking_channel_permission(ChannelPermission::SendMessage)?;
 
+    // A protected channel carries only ciphertext: no bot may be addressed
+    // there. Refused after the permission check (a caller who cannot send
+    // here learns nothing about the flag) and before slowmode, the
+    // interaction insert and the event to the bot.
+    crate::util::interactions::ensure_interactions_allowed(&channel)?;
+
     // Archived or locked threads reject invocations exactly like messages.
     crate::util::threads::ensure_thread_writable(&channel, &permissions)?;
 
@@ -166,6 +172,7 @@ pub async fn interaction_create(
 #[cfg(test)]
 mod test {
     use crate::{rocket, util::test::TestHarness};
+    use revolt_database::events::client::EventV1;
     use revolt_database::{Bot, Channel, Member};
     use revolt_models::v0;
     use rocket::http::{ContentType, Header, Status};
@@ -424,5 +431,158 @@ mod test {
             members.iter().any(|member| member.id.user == user.id),
             "invoker should be auto-joined to the thread"
         );
+    }
+
+    async fn invoke(
+        harness: &TestHarness,
+        session_token: &str,
+        channel_id: &str,
+        command_id: &str,
+    ) -> (Status, serde_json::Value) {
+        let response = harness
+            .client
+            .post(format!("/channels/{channel_id}/interactions"))
+            .header(Header::new("x-session-token", session_token.to_string()))
+            .header(ContentType::JSON)
+            .body(json!({ "command_id": command_id }).to_string())
+            .dispatch()
+            .await;
+        let status = response.status();
+        let body = response.into_json().await.expect("response body");
+        (status, body)
+    }
+
+    /// A protected channel refuses the invocation with `ChannelProtected`,
+    /// and the bot is never told: no `InteractionCreate` for the channel
+    /// reaches its private topic (the event is published only after the
+    /// interaction row is inserted, so none was written either). The same
+    /// invocation in an unprotected channel reaches the bot; its event is
+    /// published after the refused attempt, so once it is observed anything
+    /// the refused attempt published is already in the buffer.
+    #[test]
+    fn invoke_in_protected_channel_is_refused_before_reaching_the_bot() {
+        crate::util::test::rt()
+            .block_on(invoke_in_protected_channel_is_refused_before_reaching_the_bot_case())
+    }
+
+    async fn invoke_in_protected_channel_is_refused_before_reaching_the_bot_case() {
+        let mut harness = TestHarness::new().await;
+        let (_, session, user) = harness.new_user().await;
+        let protected = harness.new_protected_channel(&user, &session, &[]).await;
+        assert!(protected.channel.is_protected(), "precondition: protected");
+        let (open_server, open_channel) = harness.new_protectable_channel(&user).await;
+        assert!(!open_channel.is_protected(), "precondition: unprotected");
+
+        // The bot is a member of both servers, so only the flag differs.
+        let (bot, _) = Bot::create(&harness.db, TestHarness::rand_string(), &user, None)
+            .await
+            .expect("`Bot`");
+        let bot_user = harness.db.fetch_user(&bot.id).await.expect("bot user");
+        harness.join_server(&protected.server, &bot_user).await;
+        harness.join_server(&open_server, &bot_user).await;
+
+        let command = register_command(
+            &harness,
+            &session.token,
+            &bot.id,
+            json!({ "name": "ping", "description": "Ping" }),
+        )
+        .await;
+
+        // A live bot session: without the refusal the invocation would go
+        // all the way through to the bot.
+        let (_, presence_session) = revolt_presence::create_session(&bot.id, 0).await;
+
+        let refused = invoke(
+            &harness,
+            &session.token,
+            protected.channel.id(),
+            &command.id,
+        )
+        .await;
+        let allowed = invoke(&harness, &session.token, open_channel.id(), &command.id).await;
+
+        revolt_presence::delete_session(&bot.id, presence_session).await;
+
+        assert_eq!(refused.0, Status::BadRequest, "body: {}", refused.1);
+        assert_eq!(refused.1["type"], "ChannelProtected");
+
+        assert_eq!(allowed.0, Status::Ok, "body: {}", allowed.1);
+        let allowed_id = allowed.1["interaction_id"]
+            .as_str()
+            .expect("interaction id")
+            .to_string();
+
+        let bot_topic = format!("{}!", bot.id);
+        harness
+            .wait_for_event(&bot_topic, |event| match event {
+                EventV1::InteractionCreate { interaction } => interaction.id == allowed_id,
+                _ => false,
+            })
+            .await;
+
+        let protected_id = protected.channel.id().to_string();
+        harness.assert_no_buffered_event(&bot_topic, |event| match event {
+            EventV1::InteractionCreate { interaction } => interaction.channel_id == protected_id,
+            _ => false,
+        });
+    }
+
+    /// A caller who fails the permission check gets the same error whether
+    /// or not the channel is protected, so the refusal reveals nothing about
+    /// a channel the caller cannot send to.
+    #[test]
+    fn invoke_without_permission_errors_identically_protected_or_not() {
+        crate::util::test::rt()
+            .block_on(invoke_without_permission_errors_identically_protected_or_not_case())
+    }
+
+    async fn invoke_without_permission_errors_identically_protected_or_not_case() {
+        let harness = TestHarness::new().await;
+        let (_, session, user) = harness.new_user().await;
+        let (_, outsider_session, _) = harness.new_user().await;
+        let protected = harness.new_protected_channel(&user, &session, &[]).await;
+        assert!(protected.channel.is_protected(), "precondition: protected");
+        let (open_server, open_channel) = harness.new_protectable_channel(&user).await;
+
+        let (bot, _) = Bot::create(&harness.db, TestHarness::rand_string(), &user, None)
+            .await
+            .expect("`Bot`");
+        let bot_user = harness.db.fetch_user(&bot.id).await.expect("bot user");
+        harness.join_server(&protected.server, &bot_user).await;
+        harness.join_server(&open_server, &bot_user).await;
+
+        let command = register_command(
+            &harness,
+            &session.token,
+            &bot.id,
+            json!({ "name": "ping", "description": "Ping" }),
+        )
+        .await;
+
+        // The outsider is a member of neither server.
+        let on_protected = invoke(
+            &harness,
+            &outsider_session.token,
+            protected.channel.id(),
+            &command.id,
+        )
+        .await;
+        let on_open = invoke(
+            &harness,
+            &outsider_session.token,
+            open_channel.id(),
+            &command.id,
+        )
+        .await;
+
+        assert_ne!(on_open.1["type"], "ChannelProtected");
+        assert!(
+            on_open.0.code >= 400,
+            "precondition: refused, got {}",
+            on_open.0
+        );
+        assert_eq!(on_protected.0, on_open.0);
+        assert_eq!(on_protected.1, on_open.1);
     }
 }

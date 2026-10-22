@@ -37,6 +37,14 @@ pub async fn create_thread(
     permissions.throw_if_lacking_channel_permission(ChannelPermission::ViewChannel)?;
     permissions.throw_if_lacking_channel_permission(ChannelPermission::SendMessage)?;
 
+    // A protected channel takes no plaintext-named thread (decision 18 (W2)):
+    // refused after the permission checks, so a non-viewer gets the same
+    // answer as for any channel, and before the thread row, the auto-join
+    // and the `ChannelCreate`. `create_thread`'s parent hold stays the floor.
+    if channel.is_protected() {
+        return Err(create_error!(ChannelProtected));
+    }
+
     let thread = Channel::create_thread(db, &channel, &user, None, data).await?;
     Ok(Json(thread.into()))
 }
@@ -69,6 +77,12 @@ pub async fn create_thread_from_message(
     permissions.throw_if_lacking_channel_permission(ChannelPermission::ViewChannel)?;
     permissions.throw_if_lacking_channel_permission(ChannelPermission::SendMessage)?;
 
+    // As in `create_thread`, and before the message lookup: a protected
+    // channel's messages never anchor a thread.
+    if channel.is_protected() {
+        return Err(create_error!(ChannelProtected));
+    }
+
     // Ensure the message actually belongs to the target channel.
     let message = msg.as_message_in_channel(db, channel.id()).await?;
     let thread = Channel::create_thread(db, &channel, &user, Some(&message), data).await?;
@@ -79,11 +93,286 @@ pub async fn create_thread_from_message(
 mod test {
     use crate::util::test::TestHarness;
     use revolt_database::{
-        util::bulk_permissions::BulkDatabasePermissionQuery, Channel, Member, PartialChannel,
+        events::client::EventV1, util::bulk_permissions::BulkDatabasePermissionQuery, Channel,
+        Member, Message, PartialChannel,
     };
     use revolt_models::v0;
     use revolt_permissions::{ChannelPermission, OverrideField};
     use revolt_result::ErrorType;
+    use rocket::http::{ContentType, Header, Status};
+    use serde_json::{json, Value};
+    use ulid::Ulid;
+
+    /// POST `path` (under `/channels`) as `token` with a thread body
+    async fn post_thread(
+        harness: &TestHarness,
+        token: &str,
+        path: &str,
+        auto_archive_minutes: Option<u32>,
+    ) -> (Status, Value) {
+        let response = harness
+            .client
+            .post(format!("/channels/{}", path))
+            .header(Header::new("x-session-token", token.to_string()))
+            .header(ContentType::JSON)
+            .body(
+                json!({ "name": "Thread", "auto_archive_minutes": auto_archive_minutes })
+                    .to_string(),
+            )
+            .dispatch()
+            .await;
+        let status = response.status();
+        let body = response.into_json::<Value>().await.expect("json body");
+        (status, body)
+    }
+
+    /// The created thread's id, asserting it hangs off `parent_id`
+    #[track_caller]
+    fn created_thread(answer: &(Status, Value), parent_id: &str) -> String {
+        assert_eq!(answer.0, Status::Ok, "{}", answer.1);
+        match serde_json::from_value::<v0::Channel>(answer.1.clone()).expect("a channel") {
+            v0::Channel::Thread {
+                id, parent_channel, ..
+            } if parent_channel == parent_id => id,
+            other => panic!("expected a thread under {}, got {:?}", parent_id, other),
+        }
+    }
+
+    fn is_thread_create_under(parent_id: String) -> impl Fn(&EventV1) -> bool {
+        move |event| {
+            matches!(
+                event,
+                EventV1::ChannelCreate(v0::Channel::Thread { parent_channel, .. })
+                    if parent_channel == &parent_id
+            )
+        }
+    }
+
+    fn is_thread_create_of(thread_id: String) -> impl Fn(&EventV1) -> bool {
+        move |event| {
+            matches!(
+                event,
+                EventV1::ChannelCreate(v0::Channel::Thread { id, .. }) if id == &thread_id
+            )
+        }
+    }
+
+    /// Store a plaintext message in `channel_id`, returning it
+    async fn insert_plain(harness: &TestHarness, channel_id: &str, author: &str) -> Message {
+        let message = Message {
+            id: Ulid::new().to_string(),
+            channel: channel_id.to_string(),
+            author: author.to_string(),
+            content: Some("anchor".to_string()),
+            ..Default::default()
+        };
+        harness.db.insert_message(&message).await.expect("message");
+        message
+    }
+
+    /// Decision 18 (W2): both thread routes refuse a protected parent with
+    /// the ROUTE's `ChannelProtected`, ahead of everything `create_thread`
+    /// checks (an invalid auto-archive duration) and ahead of the message
+    /// lookup (an unknown message id). No thread row, no membership, no
+    /// stamp on the anchor, and no `ChannelCreate` for a thread under the
+    /// parent reaches the server topic: a thread created afterwards under
+    /// an unprotected channel of the same server is the FIFO marker.
+    ///
+    /// Control: the route refusals dropped (`db0f44d4`). The parent hold in
+    /// `create_thread` still answers `ChannelProtected` with no event, but
+    /// from the database crate (`location`), and only after the duration
+    /// check (`InvalidProperty`) and the message lookup (`NotFound`).
+    #[test]
+    fn protected_parent_refuses_both_thread_routes_without_side_effects() {
+        crate::util::test::rt()
+            .block_on(protected_parent_refuses_both_thread_routes_without_side_effects_case())
+    }
+
+    async fn protected_parent_refuses_both_thread_routes_without_side_effects_case() {
+        let mut harness = TestHarness::new().await;
+        let (_, session, owner) = harness.new_user().await;
+        let protected = harness.new_protected_channel(&owner, &session, &[]).await;
+        let open = harness.new_channel(&protected.server).await;
+        let group = harness
+            .new_text_group(&protected.channel, &protected.owner_device, 0, None)
+            .await;
+        let anchor = harness
+            .new_encrypted_message(&protected.channel, &protected.owner_device, &group)
+            .await;
+        let token = session.token.to_string();
+        let parent = protected.channel.id().to_string();
+        assert!(protected.channel.is_protected());
+
+        let cases = [
+            ("plain", format!("{}/threads", parent), None),
+            (
+                "bad duration",
+                format!("{}/threads", parent),
+                Some(u32::MAX),
+            ),
+            (
+                "anchored",
+                format!("{}/messages/{}/threads", parent, anchor.id),
+                None,
+            ),
+            (
+                "unknown anchor",
+                format!("{}/messages/{}/threads", parent, Ulid::new()),
+                None,
+            ),
+        ];
+        for (case, path, auto_archive_minutes) in &cases {
+            let (status, body) = post_thread(&harness, &token, path, *auto_archive_minutes).await;
+            assert_eq!(status, Status::BadRequest, "{}: {}", case, body);
+            assert_eq!(body["type"], "ChannelProtected", "{}: {}", case, body);
+            let location = body["location"].as_str().unwrap_or_default();
+            assert!(
+                location.contains("routes/channels/thread_create.rs"),
+                "{}: refused outside the route: {}",
+                case,
+                body
+            );
+        }
+
+        assert!(harness
+            .db
+            .fetch_threads_by_parent(&parent)
+            .await
+            .expect("threads")
+            .is_empty());
+        assert!(harness
+            .db
+            .fetch_joined_thread_ids(&owner.id, &protected.server.id)
+            .await
+            .expect("joined threads")
+            .is_empty());
+        let anchor = harness.db.fetch_message(&anchor.id).await.expect("anchor");
+        assert_eq!(anchor.thread_id, None);
+
+        // Marker: the same request under an unprotected sibling channel
+        let marker = created_thread(
+            &post_thread(&harness, &token, &format!("{}/threads", open.id()), None).await,
+            open.id(),
+        );
+        harness
+            .wait_for_event(&protected.server.id, is_thread_create_of(marker))
+            .await;
+        harness.assert_no_buffered_event(&protected.server.id, is_thread_create_under(parent));
+    }
+
+    /// Positive control: the same requests under an unprotected channel
+    /// create threads, and the anchored one stamps its message.
+    #[test]
+    fn unprotected_parent_creates_threads_through_both_routes() {
+        crate::util::test::rt()
+            .block_on(unprotected_parent_creates_threads_through_both_routes_case())
+    }
+
+    async fn unprotected_parent_creates_threads_through_both_routes_case() {
+        let mut harness = TestHarness::new().await;
+        let (_, session, owner) = harness.new_user().await;
+        let (server, channel) = harness.new_protectable_channel(&owner).await;
+        let anchor = insert_plain(&harness, channel.id(), &owner.id).await;
+        let token = session.token.to_string();
+        assert!(!channel.is_protected());
+
+        let plain = created_thread(
+            &post_thread(&harness, &token, &format!("{}/threads", channel.id()), None).await,
+            channel.id(),
+        );
+        let anchored = created_thread(
+            &post_thread(
+                &harness,
+                &token,
+                &format!("{}/messages/{}/threads", channel.id(), anchor.id),
+                None,
+            )
+            .await,
+            channel.id(),
+        );
+
+        let anchor = harness.db.fetch_message(&anchor.id).await.expect("anchor");
+        assert_eq!(anchor.thread_id.as_deref(), Some(anchored.as_str()));
+        assert_eq!(
+            harness
+                .db
+                .fetch_threads_by_parent(channel.id())
+                .await
+                .expect("threads")
+                .len(),
+            2
+        );
+        harness
+            .wait_for_event(&server.id, is_thread_create_of(plain))
+            .await;
+        harness
+            .wait_for_event(&server.id, is_thread_create_of(anchored))
+            .await;
+    }
+
+    /// Decision 18 (W2): a member who cannot view the channel gets the
+    /// pre-W2 `MissingPermission`, byte-identical (`location` included) for
+    /// a protected and an unprotected channel, from both routes.
+    ///
+    /// Control: the refusal moved above the permission calculation.
+    #[test]
+    fn non_viewer_answer_is_identical_protected_or_not() {
+        crate::util::test::rt().block_on(non_viewer_answer_is_identical_protected_or_not_case())
+    }
+
+    async fn non_viewer_answer_is_identical_protected_or_not_case() {
+        let harness = TestHarness::new().await;
+        let (_, owner_session, owner) = harness.new_user().await;
+        let (_, member_session, member) = harness.new_user().await;
+        let protected = harness
+            .new_protected_channel(&owner, &owner_session, &[&member])
+            .await;
+        let open = harness.new_channel(&protected.server).await;
+        let token = member_session.token.to_string();
+
+        let mut answers: Vec<Vec<(Status, String)>> = vec![];
+        for mut channel in [protected.channel.clone(), open] {
+            channel
+                .update(
+                    &harness.db,
+                    PartialChannel {
+                        default_permissions: Some(OverrideField {
+                            a: 0,
+                            d: ChannelPermission::ViewChannel as i64,
+                        }),
+                        ..Default::default()
+                    },
+                    vec![],
+                )
+                .await
+                .expect("deny view");
+
+            let mut per_channel = vec![];
+            for path in [
+                format!("{}/threads", channel.id()),
+                format!("{}/messages/{}/threads", channel.id(), Ulid::new()),
+            ] {
+                let (status, body) = post_thread(&harness, &token, &path, None).await;
+                assert_eq!(body["type"], "MissingPermission", "{}: {}", path, body);
+                per_channel.push((status, body.to_string()));
+            }
+            assert!(harness
+                .db
+                .fetch_threads_by_parent(channel.id())
+                .await
+                .expect("threads")
+                .is_empty());
+            answers.push(per_channel);
+        }
+
+        assert!(harness
+            .db
+            .fetch_channel(protected.channel.id())
+            .await
+            .expect("channel")
+            .is_protected());
+        assert_eq!(answers[0], answers[1]);
+    }
 
     #[test]
     fn create_thread_auto_joins_creator_and_delegates_permissions() {

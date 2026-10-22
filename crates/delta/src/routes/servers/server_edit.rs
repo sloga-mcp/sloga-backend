@@ -10,7 +10,7 @@ use revolt_database::{
 };
 use revolt_models::v0;
 use revolt_permissions::{calculate_server_permissions, ChannelPermission};
-use revolt_result::{create_error, Result};
+use revolt_result::{create_error, ErrorType, Result};
 use rocket::{serde::json::Json, State};
 use validator::Validate;
 
@@ -142,6 +142,18 @@ pub async fn edit(
     // Changing categories requires manage channel
     if data.categories.is_some() {
         permissions.throw_if_lacking_channel_permission(ChannelPermission::ManageChannel)?;
+    }
+
+    // Protected channels (W2 decision 14): the owner signs every seat list,
+    // so ownership cannot move while any channel of this server is
+    // protected. Runs after the owner check above, so a caller who may not
+    // transfer learns nothing about the server's channels, and before any
+    // attachment is deleted or claimed and before the update. A transfer to
+    // the current owner changes nothing and is let through.
+    if let Some(owner) = &data.owner {
+        if owner != &server.owner {
+            refuse_while_any_channel_is_protected(db, &server).await?;
+        }
     }
 
     let v0::DataEditServer {
@@ -486,6 +498,32 @@ fn server_update_changes(before: &Server, after: &Server) -> Vec<AuditLogChange>
     changes
 }
 
+/// `ChannelProtected` if any channel listed on `server` is protected.
+///
+/// Fetched per id. An id with no channel behind it (a dangling entry in
+/// `server.channels`) is skipped rather than failing the edit; any other
+/// fetch error is returned, so an unreadable channel never counts as
+/// unprotected.
+///
+/// The read is not atomic with the transfer's write. Protect claims the
+/// `servers` document filtered on the owner, so a transfer that lands first
+/// makes protect refuse; a protect that lands between this read and the
+/// write is the documented R16 order, surfaced to clients as `OwnerChanged`.
+async fn refuse_while_any_channel_is_protected(db: &Database, server: &Server) -> Result<()> {
+    for channel_id in &server.channels {
+        match db.fetch_channel(channel_id).await {
+            Ok(channel) if channel.is_protected() => {
+                return Err(create_error!(ChannelProtected));
+            }
+            Ok(_) => {}
+            Err(error) if matches!(error.error_type, ErrorType::NotFound) => {}
+            Err(error) => return Err(error),
+        }
+    }
+
+    Ok(())
+}
+
 /// What `edit` demands of the caller before any field-specific gate runs.
 #[derive(Debug, PartialEq, Eq)]
 enum EditAuthorization {
@@ -628,8 +666,8 @@ fn validate_afk_edit(
 mod test {
     use crate::util::test::TestHarness;
     use revolt_database::{
-        AuditLogAction, AuditLogChange, AuditLogEntry, AuditValue, File, MFATicket, Member,
-        Metadata, PartialUser, Server, Session, User,
+        events::client::EventV1, AuditLogAction, AuditLogChange, AuditLogEntry, AuditValue, File,
+        MFATicket, Member, Metadata, PartialServer, PartialUser, Server, Session, User,
     };
     use revolt_models::v0;
     use revolt_result::ErrorType;
@@ -1528,5 +1566,277 @@ mod test {
                 Some(AuditValue::String(admin.id.clone())),
             )]
         );
+    }
+
+    // ---- ownership transfer with a protected channel (W2 decision 14) ----
+
+    /// PATCH `body` as `session`, carrying a fresh validated MFA ticket for
+    /// `account_id` (the owner gate demands one). Returns the status and the
+    /// raw body.
+    async fn edit_with_ticket(
+        harness: &TestHarness,
+        server_id: &str,
+        session: &Session,
+        account_id: &str,
+        body: serde_json::Value,
+    ) -> (Status, String) {
+        let ticket = MFATicket::new(account_id.to_string(), true);
+        ticket.save(&harness.db).await.expect("`MFATicket`");
+
+        let response = harness
+            .client
+            .patch(format!("/servers/{}", server_id))
+            .header(ContentType::JSON)
+            .body(body.to_string())
+            .header(Header::new("x-session-token", session.token.to_string()))
+            .header(Header::new("x-mfa-ticket", ticket.token))
+            .dispatch()
+            .await;
+        let status = response.status();
+        (status, response.into_string().await.unwrap_or_default())
+    }
+
+    /// The owner cannot hand the server to a member while one of its channels
+    /// is protected: 400 `ChannelProtected`, the owner and every other field
+    /// in the request unchanged, and no `ServerUpdate` naming the new owner.
+    /// A "transfer" to the current owner changes nothing and still succeeds;
+    /// its `ServerUpdate` is the marker that proves the negative.
+    #[test]
+    fn owner_transfer_is_refused_while_a_channel_is_protected() {
+        crate::util::test::rt()
+            .block_on(owner_transfer_is_refused_while_a_channel_is_protected_case())
+    }
+
+    async fn owner_transfer_is_refused_while_a_channel_is_protected_case() {
+        let mut harness = TestHarness::new().await;
+        let (owner_account, owner_session, owner) = harness.new_user().await;
+        let (_, _, member) = harness.new_user().await;
+        let protected = harness
+            .new_protected_channel(&owner, &owner_session, &[])
+            .await;
+        let server = protected.server;
+        assert!(protected.channel.is_protected());
+        assert!(server
+            .channels
+            .contains(&protected.channel.id().to_string()));
+        harness.join_server(&server, &member).await;
+
+        let (status, body) = edit_with_ticket(
+            &harness,
+            &server.id,
+            &owner_session,
+            &owner_account.id,
+            json!({ "owner": member.id, "name": "Renamed" }),
+        )
+        .await;
+        assert_eq!(status, Status::BadRequest, "{body}");
+        let error: serde_json::Value = serde_json::from_str(&body).expect("an error body");
+        assert_eq!(error["type"], "ChannelProtected", "{body}");
+
+        let stored = harness.db.fetch_server(&server.id).await.expect("`Server`");
+        assert_eq!(stored.owner, owner.id, "ownership must not move");
+        assert_eq!(stored.name, server.name, "nothing in the request may land");
+
+        let (status, body) = edit_with_ticket(
+            &harness,
+            &server.id,
+            &owner_session,
+            &owner_account.id,
+            json!({ "owner": owner.id }),
+        )
+        .await;
+        assert_eq!(
+            status,
+            Status::Ok,
+            "a same-owner transfer is allowed: {body}"
+        );
+
+        let owner_id = owner.id.clone();
+        harness
+            .wait_for_event(&server.id, |event| {
+                matches!(
+                    event,
+                    EventV1::ServerUpdate { data, .. }
+                        if data.owner.as_deref() == Some(owner_id.as_str())
+                )
+            })
+            .await;
+        let member_id = member.id.clone();
+        harness.assert_no_buffered_event(&server.id, |event| {
+            matches!(
+                event,
+                EventV1::ServerUpdate { data, .. }
+                    if data.owner.as_deref() == Some(member_id.as_str())
+                        || data.name.as_deref() == Some("Renamed")
+            )
+        });
+    }
+
+    /// Positive control: the same transfer on a server with only unprotected
+    /// channels lands.
+    #[test]
+    fn owner_transfer_is_allowed_with_no_protected_channel() {
+        crate::util::test::rt().block_on(owner_transfer_is_allowed_with_no_protected_channel_case())
+    }
+
+    async fn owner_transfer_is_allowed_with_no_protected_channel_case() {
+        let mut harness = TestHarness::new().await;
+        let (owner_account, owner_session, owner) = harness.new_user().await;
+        let (_, _, member) = harness.new_user().await;
+        let (server, channel) = harness.new_protectable_channel(&owner).await;
+        assert!(!channel.is_protected());
+        harness.join_server(&server, &member).await;
+
+        let (status, body) = edit_with_ticket(
+            &harness,
+            &server.id,
+            &owner_session,
+            &owner_account.id,
+            json!({ "owner": member.id }),
+        )
+        .await;
+        assert_eq!(status, Status::Ok, "{body}");
+
+        let stored = harness.db.fetch_server(&server.id).await.expect("`Server`");
+        assert_eq!(stored.owner, member.id);
+
+        let member_id = member.id.clone();
+        harness
+            .wait_for_event(&server.id, |event| {
+                matches!(
+                    event,
+                    EventV1::ServerUpdate { data, .. }
+                        if data.owner.as_deref() == Some(member_id.as_str())
+                )
+            })
+            .await;
+    }
+
+    /// A channel id on the server with no channel behind it is skipped, not
+    /// an error: the transfer lands.
+    #[test]
+    fn owner_transfer_is_allowed_with_a_dangling_channel_id() {
+        crate::util::test::rt()
+            .block_on(owner_transfer_is_allowed_with_a_dangling_channel_id_case())
+    }
+
+    async fn owner_transfer_is_allowed_with_a_dangling_channel_id_case() {
+        let harness = TestHarness::new().await;
+        let (owner_account, owner_session, owner) = harness.new_user().await;
+        let (_, _, member) = harness.new_user().await;
+        let (server, _) = harness.new_protectable_channel(&owner).await;
+        harness.join_server(&server, &member).await;
+
+        let dangling = TestHarness::rand_string();
+        let mut channels = server.channels.clone();
+        channels.push(dangling.clone());
+        harness
+            .db
+            .update_server(
+                &server.id,
+                &PartialServer {
+                    channels: Some(channels),
+                    ..Default::default()
+                },
+                vec![],
+            )
+            .await
+            .expect("the dangling channel id is appended");
+        let server = harness.db.fetch_server(&server.id).await.expect("`Server`");
+        assert!(server.channels.contains(&dangling));
+        assert!(harness.db.fetch_channel(&dangling).await.is_err());
+
+        let (status, body) = edit_with_ticket(
+            &harness,
+            &server.id,
+            &owner_session,
+            &owner_account.id,
+            json!({ "owner": member.id }),
+        )
+        .await;
+        assert_eq!(status, Status::Ok, "{body}");
+
+        let stored = harness.db.fetch_server(&server.id).await.expect("`Server`");
+        assert_eq!(stored.owner, member.id);
+    }
+
+    /// A member who is not the owner gets the pre-W2 `NotOwner`, the full
+    /// body byte-identical whether or not the server has a protected
+    /// channel: the refusal must not tell them which it is.
+    #[test]
+    fn a_non_owner_transfer_answers_the_same_with_or_without_a_protected_channel() {
+        crate::util::test::rt().block_on(
+            a_non_owner_transfer_answers_the_same_with_or_without_a_protected_channel_case(),
+        )
+    }
+
+    async fn a_non_owner_transfer_answers_the_same_with_or_without_a_protected_channel_case() {
+        let harness = TestHarness::new().await;
+        let (_, owner_session, owner) = harness.new_user().await;
+        let (member_account, member_session, member) = harness.new_user().await;
+
+        let protected = harness
+            .new_protected_channel(&owner, &owner_session, &[&member])
+            .await;
+        assert!(protected.channel.is_protected());
+        let (plain_server, plain_channel) = harness.new_protectable_channel(&owner).await;
+        assert!(!plain_channel.is_protected());
+        harness.join_server(&plain_server, &member).await;
+
+        let mut answers = vec![];
+        for server_id in [&protected.server.id, &plain_server.id] {
+            let (status, body) = edit_with_ticket(
+                &harness,
+                server_id,
+                &member_session,
+                &member_account.id,
+                json!({ "owner": member.id }),
+            )
+            .await;
+            assert_eq!(status, Status::Forbidden, "{body}");
+            let error: serde_json::Value = serde_json::from_str(&body).expect("an error body");
+            assert_eq!(error["type"], "NotOwner", "{body}");
+
+            let stored = harness.db.fetch_server(server_id).await.expect("`Server`");
+            assert_eq!(stored.owner, owner.id);
+            answers.push(body);
+        }
+
+        assert_eq!(
+            answers[0], answers[1],
+            "protected and unprotected must answer byte-identically"
+        );
+    }
+
+    /// The refusal's position, which the route tests above cannot see: after
+    /// the owner check, before any attachment delete or claim and before the
+    /// update.
+    #[test]
+    fn the_transfer_refusal_runs_after_the_owner_check_and_before_any_write() {
+        let body = route_body();
+        let refusal = "refuse_while_any_channel_is_protected(db, &server).await?;";
+        assert_eq!(body.matches(refusal).count(), 1, "{body}");
+        let at = body.find(refusal).expect("counted above");
+
+        let owner_check = body
+            .find("return Err(create_error!(NotOwner));")
+            .unwrap_or_else(|| panic!("the route lost its owner check: {}", body));
+        assert!(
+            owner_check < at,
+            "the owner check must come first: {}",
+            body
+        );
+
+        for later in [
+            "db.mark_attachment_as_deleted(",
+            "File::use_server_icon(",
+            "File::use_server_banner(",
+            ".update(db, partial,",
+        ] {
+            let write = body
+                .find(later)
+                .unwrap_or_else(|| panic!("the route lost `{}`: {}", later, body));
+            assert!(at < write, "the refusal must precede `{}`: {}", later, body);
+        }
     }
 }

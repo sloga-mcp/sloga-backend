@@ -58,6 +58,13 @@ pub async fn message_forward(
     source_permissions
         .throw_if_lacking_channel_permission(ChannelPermission::ReadMessageHistory)?;
 
+    // A protected source never leaves its channel as a server-built
+    // plaintext snapshot. Refused only once the forwarder can read the
+    // source, so a caller who cannot learns nothing about its protection.
+    if source_channel.is_protected() || source_message.encrypted.is_some() {
+        return Err(create_error!(ChannelProtected));
+    }
+
     // System messages and polls don't forward (poll state wouldn't travel
     // with the snapshot; system messages are channel-local narration).
     if source_message.system.is_some() || source_message.poll.is_some() {
@@ -82,6 +89,14 @@ pub async fn message_forward(
     let permissions = calculate_channel_permissions(&mut query).await;
     permissions.throw_if_lacking_channel_permission(ChannelPermission::ViewChannel)?;
     permissions.throw_if_lacking_channel_permission(ChannelPermission::SendMessage)?;
+
+    // A protected channel only takes encrypted messages, and a forward is a
+    // plaintext snapshot. Refused after the send check (same reasoning as
+    // the source) and before the slowmode claim, the nonce and the
+    // attachment copies.
+    if destination.is_protected() {
+        return Err(create_error!(ChannelProtected));
+    }
 
     // Archived or locked threads reject forwards exactly like normal
     // messages.
@@ -310,14 +325,16 @@ mod test {
 
     use crate::{rocket, util::test::TestHarness};
     use revolt_config::config;
+    use revolt_database::events::client::EventV1;
     use revolt_database::iso8601_timestamp::Timestamp;
     use revolt_database::{
-        Channel, DmGuard, Member, MessageFilter, MessageQuery, MessageTimePeriod, Session, User,
-        SYSTEM_USER_ID,
+        Channel, Database, DmGuard, Member, Message, MessageFilter, MessageQuery,
+        MessageTimePeriod, Session, User, SYSTEM_USER_ID,
     };
     use revolt_models::v0;
     use rocket::http::{ContentType, Header, Status};
-    use serde_json::json;
+    use serde_json::{json, Value};
+    use ulid::Ulid;
 
     #[test]
     fn forward_carries_snapshot_and_requires_source_read() {
@@ -751,5 +768,427 @@ mod test {
             assert_eq!(status, Status::Forbidden, "body: {body}");
             assert_eq!(body["type"], "DirectMessagesPaused", "body: {body}");
         }
+    }
+
+    // Protected channels (decision 18, W2): a protected source or destination
+    // is refused after that side's first authorization and before any side
+    // effect.
+
+    /// Set `protected` on a stored TextChannel through the driver, under any
+    /// rows it already holds
+    async fn set_protected(db: &Database, channel_id: &str, value: bool) {
+        match db {
+            Database::Reference(reference) => {
+                match reference.channels.lock().await.get_mut(channel_id) {
+                    Some(Channel::TextChannel { protected, .. }) => *protected = value,
+                    other => panic!("expected a text channel, got {:?}", other),
+                }
+            }
+            Database::MongoDb(mongo) => {
+                use revolt_database::mongodb::bson::{doc, Document};
+
+                let result = mongo
+                    .col::<Document>("channels")
+                    .update_one(
+                        doc! { "_id": channel_id },
+                        doc! { "$set": { "protected": value } },
+                    )
+                    .await
+                    .expect("raw protect");
+                assert_eq!(result.matched_count, 1);
+            }
+        }
+
+        assert_eq!(
+            db.fetch_channel(channel_id)
+                .await
+                .expect("channel")
+                .is_protected(),
+            value
+        );
+    }
+
+    /// A plaintext row by `author` in `channel`, stored through the driver
+    async fn insert_plaintext(db: &Database, channel: &Channel, author: &str) -> Message {
+        let message = Message {
+            id: Ulid::new().to_string(),
+            channel: channel.id().to_string(),
+            author: author.to_string(),
+            content: Some("Test message".to_string()),
+            ..Default::default()
+        };
+        db.insert_message(&message)
+            .await
+            .expect("Failed to store test plaintext message");
+        message
+    }
+
+    /// Forward `message_id` out of `channel_id` as `session` with `body`
+    async fn forward(
+        harness: &TestHarness,
+        session: &Session,
+        channel_id: &str,
+        message_id: &str,
+        body: Value,
+    ) -> (Status, String) {
+        let response = harness
+            .client
+            .post(format!(
+                "/channels/{}/messages/{}/forward",
+                channel_id, message_id
+            ))
+            .header(Header::new("x-session-token", session.token.to_string()))
+            .header(ContentType::JSON)
+            .body(body.to_string())
+            .dispatch()
+            .await;
+        let status = response.status();
+        (status, response.into_string().await.unwrap_or_default())
+    }
+
+    fn body(answer: &(Status, String)) -> Value {
+        serde_json::from_str(&answer.1).expect("a JSON body")
+    }
+
+    /// This route's own `ChannelProtected`, not the database floor's
+    fn assert_refused_here(answer: &(Status, String), case: &str) {
+        assert_eq!(answer.0, Status::BadRequest, "{}: {:?}", case, answer);
+        let value = body(answer);
+        assert_eq!(value["type"], "ChannelProtected", "{}: {}", case, answer.1);
+        assert!(
+            value["location"]
+                .as_str()
+                .is_some_and(|location| location.contains("routes/channels/message_forward.rs")),
+            "{}: {}",
+            case,
+            answer.1
+        );
+    }
+
+    /// Wait for the `Message` event of `message_id` on `channel_id`. The
+    /// harness reads every topic through one subscription, FIFO, so anything
+    /// published before it is then in the event buffer.
+    async fn wait_for_message_event(harness: &mut TestHarness, channel_id: &str, message_id: &str) {
+        harness
+            .wait_for_event(channel_id, |event| match event {
+                EventV1::Message(message) => message.id == message_id,
+                _ => false,
+            })
+            .await;
+    }
+
+    #[test]
+    fn forward_from_a_protected_source_is_refused() {
+        crate::util::test::rt().block_on(forward_from_a_protected_source_is_refused_case())
+    }
+
+    async fn forward_from_a_protected_source_is_refused_case() {
+        let mut harness = TestHarness::new().await;
+        let (_, session, owner) = harness.new_user().await;
+
+        let protected = harness.new_protected_channel(&owner, &session, &[]).await;
+        let group = harness
+            .new_text_group(&protected.channel, &protected.owner_device, 0, None)
+            .await;
+        let encrypted = harness
+            .new_encrypted_message(&protected.channel, &protected.owner_device, &group)
+            .await;
+
+        // A plaintext stray: a forward of it would otherwise succeed, so the
+        // refusal below is the protection and nothing else
+        let flipped = harness.new_channel(&protected.server).await;
+        let stray = insert_plaintext(&harness.db, &flipped, &owner.id).await;
+        set_protected(&harness.db, flipped.id(), true).await;
+
+        let destination = harness.new_channel(&protected.server).await;
+        let open = harness.new_channel(&protected.server).await;
+        let plaintext = insert_plaintext(&harness.db, &open, &owner.id).await;
+
+        for (case, channel_id, message_id) in [
+            ("encrypted", protected.channel.id(), &encrypted.id),
+            ("stray", flipped.id(), &stray.id),
+        ] {
+            let answer = forward(
+                &harness,
+                &session,
+                channel_id,
+                message_id,
+                json!({ "destination": destination.id() }),
+            )
+            .await;
+            assert_refused_here(&answer, case);
+        }
+
+        // Marker: a forward that lands in the same destination. Once its
+        // event is seen, a refused forward's event would be buffered too.
+        let marker = forward(
+            &harness,
+            &session,
+            open.id(),
+            &plaintext.id,
+            json!({ "destination": destination.id() }),
+        )
+        .await;
+        assert_eq!(marker.0, Status::Ok, "{:?}", marker);
+        let marker_id = body(&marker)["_id"]
+            .as_str()
+            .expect("the marker id")
+            .to_string();
+        wait_for_message_event(&mut harness, destination.id(), &marker_id).await;
+
+        harness.assert_no_buffered_event(destination.id(), |event| match event {
+            EventV1::Message(message) => message.id != marker_id,
+            _ => false,
+        });
+    }
+
+    #[test]
+    fn forward_of_an_encrypted_message_is_refused_in_an_unprotected_channel() {
+        crate::util::test::rt()
+            .block_on(forward_of_an_encrypted_message_is_refused_in_an_unprotected_channel_case())
+    }
+
+    async fn forward_of_an_encrypted_message_is_refused_in_an_unprotected_channel_case() {
+        // The message is checked on its own: an encrypted row is refused
+        // even where the channel no longer answers protected
+        let harness = TestHarness::new().await;
+        let (_, session, owner) = harness.new_user().await;
+
+        let protected = harness.new_protected_channel(&owner, &session, &[]).await;
+        let group = harness
+            .new_text_group(&protected.channel, &protected.owner_device, 0, None)
+            .await;
+        let encrypted = harness
+            .new_encrypted_message(&protected.channel, &protected.owner_device, &group)
+            .await;
+        set_protected(&harness.db, protected.channel.id(), false).await;
+
+        let destination = harness.new_channel(&protected.server).await;
+        let answer = forward(
+            &harness,
+            &session,
+            protected.channel.id(),
+            &encrypted.id,
+            json!({ "destination": destination.id() }),
+        )
+        .await;
+        assert_refused_here(&answer, "encrypted row");
+    }
+
+    #[test]
+    fn forward_from_an_unprotected_source_succeeds() {
+        crate::util::test::rt().block_on(forward_from_an_unprotected_source_succeeds_case())
+    }
+
+    async fn forward_from_an_unprotected_source_succeeds_case() {
+        // Positive control: the same request as the refused one, from an
+        // unprotected channel of a server that also holds a protected one
+        let harness = TestHarness::new().await;
+        let (_, session, owner) = harness.new_user().await;
+
+        let protected = harness.new_protected_channel(&owner, &session, &[]).await;
+        let source = harness.new_channel(&protected.server).await;
+        let plaintext = insert_plaintext(&harness.db, &source, &owner.id).await;
+        let destination = harness.new_channel(&protected.server).await;
+
+        let answer = forward(
+            &harness,
+            &session,
+            source.id(),
+            &plaintext.id,
+            json!({ "destination": destination.id() }),
+        )
+        .await;
+        assert_eq!(answer.0, Status::Ok, "{:?}", answer);
+        let value = body(&answer);
+        assert_eq!(value["channel"], destination.id());
+        assert_eq!(value["forwarded"]["message_id"], plaintext.id.as_str());
+    }
+
+    #[test]
+    fn non_readers_get_the_same_answer_from_a_protected_source() {
+        crate::util::test::rt()
+            .block_on(non_readers_get_the_same_answer_from_a_protected_source_case())
+    }
+
+    async fn non_readers_get_the_same_answer_from_a_protected_source_case() {
+        let harness = TestHarness::new().await;
+        let (_, owner_session, owner) = harness.new_user().await;
+        let (_, session, outsider) = harness.new_user().await;
+
+        let protected = harness
+            .new_protected_channel(&owner, &owner_session, &[])
+            .await;
+        let group = harness
+            .new_text_group(&protected.channel, &protected.owner_device, 0, None)
+            .await;
+        let encrypted = harness
+            .new_encrypted_message(&protected.channel, &protected.owner_device, &group)
+            .await;
+        let open = harness.new_channel(&protected.server).await;
+        let plaintext = insert_plaintext(&harness.db, &open, &owner.id).await;
+
+        // A destination the outsider can send to: their own group
+        let destination = revolt_database::Channel::create_group(
+            &harness.db,
+            v0::DataCreateGroup {
+                name: "Test Group".to_string(),
+                ..Default::default()
+            },
+            outsider.id.clone(),
+        )
+        .await
+        .expect("Failed to create group");
+
+        let baseline = forward(
+            &harness,
+            &session,
+            open.id(),
+            &plaintext.id,
+            json!({ "destination": destination.id() }),
+        )
+        .await;
+        assert_eq!(baseline.0, Status::Forbidden, "{:?}", baseline);
+        assert_eq!(
+            body(&baseline)["type"],
+            "MissingPermission",
+            "{}",
+            baseline.1
+        );
+
+        let answer = forward(
+            &harness,
+            &session,
+            protected.channel.id(),
+            &encrypted.id,
+            json!({ "destination": destination.id() }),
+        )
+        .await;
+        assert_eq!(answer, baseline);
+    }
+
+    #[test]
+    fn forward_into_a_protected_channel_is_refused_before_the_nonce() {
+        crate::util::test::rt()
+            .block_on(forward_into_a_protected_channel_is_refused_before_the_nonce_case())
+    }
+
+    async fn forward_into_a_protected_channel_is_refused_before_the_nonce_case() {
+        let mut harness = TestHarness::new().await;
+        let (_, session, owner) = harness.new_user().await;
+
+        let protected = harness.new_protected_channel(&owner, &session, &[]).await;
+        let source = harness.new_channel(&protected.server).await;
+        let plaintext = insert_plaintext(&harness.db, &source, &owner.id).await;
+        let open = harness.new_channel(&protected.server).await;
+        let nonce = Ulid::new().to_string();
+
+        let answer = forward(
+            &harness,
+            &session,
+            source.id(),
+            &plaintext.id,
+            json!({ "destination": protected.channel.id(), "nonce": nonce }),
+        )
+        .await;
+        assert_refused_here(&answer, "protected destination");
+
+        // The refusal consumed nothing: the same nonce still sends, and that
+        // forward is the marker for the event check below
+        let marker = forward(
+            &harness,
+            &session,
+            source.id(),
+            &plaintext.id,
+            json!({ "destination": open.id(), "nonce": nonce }),
+        )
+        .await;
+        assert_eq!(marker.0, Status::Ok, "{:?}", marker);
+        let marker_id = body(&marker)["_id"]
+            .as_str()
+            .expect("the marker id")
+            .to_string();
+        wait_for_message_event(&mut harness, open.id(), &marker_id).await;
+
+        harness.assert_no_buffered_event(protected.channel.id(), |event| {
+            matches!(event, EventV1::Message(_))
+        });
+    }
+
+    #[test]
+    fn forward_into_an_unprotected_channel_succeeds() {
+        crate::util::test::rt().block_on(forward_into_an_unprotected_channel_succeeds_case())
+    }
+
+    async fn forward_into_an_unprotected_channel_succeeds_case() {
+        // Positive control: the same request as the refused one, into an
+        // unprotected channel of the server that holds the protected one
+        let harness = TestHarness::new().await;
+        let (_, session, owner) = harness.new_user().await;
+
+        let protected = harness.new_protected_channel(&owner, &session, &[]).await;
+        let source = harness.new_channel(&protected.server).await;
+        let plaintext = insert_plaintext(&harness.db, &source, &owner.id).await;
+        let destination = harness.new_channel(&protected.server).await;
+
+        let answer = forward(
+            &harness,
+            &session,
+            source.id(),
+            &plaintext.id,
+            json!({ "destination": destination.id(), "nonce": Ulid::new().to_string() }),
+        )
+        .await;
+        assert_eq!(answer.0, Status::Ok, "{:?}", answer);
+        assert_eq!(body(&answer)["channel"], destination.id());
+    }
+
+    #[test]
+    fn non_senders_get_the_same_answer_into_a_protected_channel() {
+        crate::util::test::rt()
+            .block_on(non_senders_get_the_same_answer_into_a_protected_channel_case())
+    }
+
+    async fn non_senders_get_the_same_answer_into_a_protected_channel_case() {
+        let harness = TestHarness::new().await;
+        let (_, owner_session, owner) = harness.new_user().await;
+        let (_, session, outsider) = harness.new_user().await;
+
+        let protected = harness
+            .new_protected_channel(&owner, &owner_session, &[])
+            .await;
+        let open = harness.new_channel(&protected.server).await;
+
+        // A source the outsider can read: a message in their own server
+        let (outsider_server, outsider_channels) = harness.new_server(&outsider).await;
+        let (source, _, message) = harness
+            .new_message(&outsider, &outsider_server, outsider_channels)
+            .await;
+
+        let baseline = forward(
+            &harness,
+            &session,
+            source.id(),
+            &message.id,
+            json!({ "destination": open.id() }),
+        )
+        .await;
+        assert_eq!(baseline.0, Status::Forbidden, "{:?}", baseline);
+        assert_eq!(
+            body(&baseline)["type"],
+            "MissingPermission",
+            "{}",
+            baseline.1
+        );
+
+        let answer = forward(
+            &harness,
+            &session,
+            source.id(),
+            &message.id,
+            json!({ "destination": protected.channel.id() }),
+        )
+        .await;
+        assert_eq!(answer, baseline);
     }
 }

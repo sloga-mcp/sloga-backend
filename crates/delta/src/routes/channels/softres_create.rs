@@ -61,15 +61,21 @@ pub async fn softres_create(
         return Err(create_error!(InvalidOperation));
     }
 
-    // NOTE: E2EE exclusion (sheets are server-validated plaintext) is
-    // enforced client-side by the composer, matching message_send — the
-    // server cannot reliably know a conversation's encryption state.
-
     // Threads inherit their parent channel's permission overrides.
     let permission_channel = channel.permission_target(db).await?.into_owned();
     let mut query = DatabasePermissionQuery::new(db, &user).channel(&permission_channel);
     let permissions = calculate_channel_permissions(&mut query).await;
     permissions.throw_if_lacking_channel_permission(ChannelPermission::SendMessage)?;
+
+    // A sheet is server-validated plaintext, which a protected channel never
+    // carries (design 7.3). Refused here, after the SendMessage check, so a
+    // caller who cannot view the channel gets the same answer for a
+    // protected channel as for any other (decision 18 (W2)), and before
+    // slowmode claims its slot and the nonce is consumed. No thread under a
+    // protected parent can exist (2.5); its parent is checked anyway.
+    if channel.is_protected() || permission_channel.is_protected() {
+        return Err(create_error!(ChannelProtected));
+    }
 
     // Archived or locked threads reject sheets exactly like normal messages.
     crate::util::threads::ensure_thread_writable(&channel, &permissions)?;
@@ -609,5 +615,217 @@ mod test {
             Status::Ok,
             "regular send must not accept the SoftRes flag"
         );
+    }
+
+    use crate::util::test::ProtectedChannel;
+    use revolt_database::events::client::EventV1;
+    use revolt_database::{
+        Channel, MessageFilter, MessageQuery, MessageTimePeriod, PartialChannel, Session,
+    };
+    use revolt_permissions::{ChannelPermission, OverrideField};
+    use serde_json::Value;
+
+    fn sheet_body(nonce: &str) -> serde_json::Value {
+        json!({
+            "nonce": nonce,
+            "title": "Sunday MC",
+            "edition": "classic",
+            "raids": ["mc"]
+        })
+    }
+
+    async fn create_sheet_with_body(
+        harness: &TestHarness,
+        session: &Session,
+        channel_id: &str,
+        body: &serde_json::Value,
+    ) -> (Status, Value) {
+        let response = harness
+            .client
+            .post(format!("/channels/{}/softres", channel_id))
+            .header(Header::new("x-session-token", session.token.to_string()))
+            .header(ContentType::JSON)
+            .body(body.to_string())
+            .dispatch()
+            .await;
+        let status = response.status();
+        let body = response.into_json::<Value>().await.expect("json body");
+        (status, body)
+    }
+
+    async fn stored_messages(harness: &TestHarness, channel_id: &str) -> usize {
+        harness
+            .db
+            .fetch_messages(MessageQuery {
+                limit: Some(10),
+                filter: MessageFilter {
+                    channel: Some(channel_id.to_string()),
+                    ..Default::default()
+                },
+                time_period: MessageTimePeriod::Absolute {
+                    before: None,
+                    after: None,
+                    sort: None,
+                },
+            })
+            .await
+            .expect("the channel's messages")
+            .len()
+    }
+
+    async fn set_slowmode(harness: &TestHarness, channel: &Channel) {
+        channel
+            .clone()
+            .update(
+                &harness.db,
+                PartialChannel {
+                    slowmode: Some(600),
+                    ..Default::default()
+                },
+                vec![],
+            )
+            .await
+            .expect("slowmode");
+    }
+
+    async fn deny_view(harness: &TestHarness, channel: &Channel) {
+        channel
+            .clone()
+            .update(
+                &harness.db,
+                PartialChannel {
+                    default_permissions: Some(OverrideField {
+                        a: 0,
+                        d: ChannelPermission::ViewChannel as i64,
+                    }),
+                    ..Default::default()
+                },
+                vec![],
+            )
+            .await
+            .expect("deny view");
+    }
+
+    /// A seated member's sheet in a protected channel is refused with
+    /// `ChannelProtected` before any side effect: no slowmode slot (a second
+    /// try is refused the same way, not `InSlowmode`), no consumed nonce (the
+    /// same nonce then succeeds in an ordinary channel: the positive control),
+    /// no stored message and no `Message` event (the control's event is the
+    /// marker that proves nothing earlier reached the protected topic).
+    ///
+    /// Control: the `is_protected()` refusal dropped.
+    #[test]
+    fn softres_create_refuses_a_protected_channel() {
+        crate::util::test::rt().block_on(softres_create_refuses_a_protected_channel_case())
+    }
+
+    async fn softres_create_refuses_a_protected_channel_case() {
+        let mut harness = TestHarness::new().await;
+        let (_, owner_session, owner) = harness.new_user().await;
+        let (_, member_session, member) = harness.new_user().await;
+        let ProtectedChannel {
+            server,
+            channel: protected,
+            ..
+        } = harness
+            .new_protected_channel(&owner, &owner_session, &[&member])
+            .await;
+        let ordinary = harness.new_channel(&server).await;
+        set_slowmode(&harness, &protected).await;
+        set_slowmode(&harness, &ordinary).await;
+        let protected = harness
+            .db
+            .fetch_channel(protected.id())
+            .await
+            .expect("the protected channel");
+        assert!(protected.is_protected());
+
+        let nonce = ulid::Ulid::new().to_string();
+        let body = sheet_body(&nonce);
+
+        for attempt in ["the first try", "the second try"] {
+            let (status, refused) =
+                create_sheet_with_body(&harness, &member_session, protected.id(), &body).await;
+            assert_eq!(refused["type"], "ChannelProtected", "{attempt}: {refused}");
+            assert_eq!(status, Status::BadRequest, "{attempt}: {refused}");
+        }
+        assert_eq!(stored_messages(&harness, protected.id()).await, 0);
+
+        // Positive control: the same request (same nonce) in an ordinary
+        // channel of the same server.
+        let (status, sent) =
+            create_sheet_with_body(&harness, &member_session, ordinary.id(), &body).await;
+        assert_eq!(status, Status::Ok, "{sent}");
+        let message: v0::Message = serde_json::from_value(sent).expect("`Message`");
+        assert!(MessageFlagsValue(message.flags).has(MessageFlags::SoftRes));
+        assert!(message.softres.is_some());
+        assert_eq!(stored_messages(&harness, ordinary.id()).await, 1);
+
+        // Redis pub/sub is FIFO per subscription: once the control's event is
+        // observed, anything the refused tries published is buffered too.
+        harness
+            .wait_for_event(ordinary.id(), |event| match event {
+                EventV1::Message(sent) => sent.id == message.id,
+                _ => false,
+            })
+            .await;
+        harness
+            .assert_no_buffered_event(protected.id(), |event| matches!(event, EventV1::Message(_)));
+    }
+
+    /// Decision 18 (W2): a member who cannot view the channel gets the
+    /// pre-W2 answer, byte-identical (`location` included) for a protected
+    /// and an ordinary channel.
+    #[test]
+    fn softres_create_non_viewer_error_is_unchanged_by_protection() {
+        crate::util::test::rt()
+            .block_on(softres_create_non_viewer_error_is_unchanged_by_protection_case())
+    }
+
+    async fn softres_create_non_viewer_error_is_unchanged_by_protection_case() {
+        let harness = TestHarness::new().await;
+        let (_, owner_session, owner) = harness.new_user().await;
+        let (_, member_session, member) = harness.new_user().await;
+        let ProtectedChannel {
+            server,
+            channel: protected,
+            ..
+        } = harness
+            .new_protected_channel(&owner, &owner_session, &[&member])
+            .await;
+        let ordinary = harness.new_channel(&server).await;
+        deny_view(&harness, &protected).await;
+        deny_view(&harness, &ordinary).await;
+        assert!(harness
+            .db
+            .fetch_channel(protected.id())
+            .await
+            .expect("the protected channel")
+            .is_protected());
+
+        let (protected_status, protected_body) = create_sheet_with_body(
+            &harness,
+            &member_session,
+            protected.id(),
+            &sheet_body(&ulid::Ulid::new().to_string()),
+        )
+        .await;
+        let (ordinary_status, ordinary_body) = create_sheet_with_body(
+            &harness,
+            &member_session,
+            ordinary.id(),
+            &sheet_body(&ulid::Ulid::new().to_string()),
+        )
+        .await;
+
+        assert_eq!(ordinary_status, Status::Forbidden, "{ordinary_body}");
+        assert_eq!(
+            ordinary_body["type"], "MissingPermission",
+            "{ordinary_body}"
+        );
+        assert_eq!(protected_status, ordinary_status);
+        assert_eq!(protected_body, ordinary_body);
+        assert_eq!(stored_messages(&harness, protected.id()).await, 0);
+        assert_eq!(stored_messages(&harness, ordinary.id()).await, 0);
     }
 }

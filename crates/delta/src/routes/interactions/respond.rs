@@ -143,6 +143,14 @@ pub async fn interaction_respond(
     // A thread archived/locked since invocation rejects the response too.
     crate::util::threads::ensure_thread_writable(&channel, &permissions)?;
 
+    // A protected channel carries only ciphertext the server cannot read, so
+    // no bot may answer into it. Refused after the standing re-check (a bot
+    // that can no longer see the channel learns nothing about its status)
+    // and before the edit fetch and the slot claim, so it covers every path
+    // below, including the ephemeral reply that never reaches
+    // `insert_message`.
+    crate::util::interactions::ensure_interactions_allowed(&channel)?;
+
     // Edit path: fetch and verify the component's host message BEFORE
     // claiming the single-use slot, so a deleted message doesn't burn it.
     let mut edit_target = None;
@@ -1238,5 +1246,188 @@ mod test {
             Status::Ok,
             "a kicked bot must not deliver ephemeral responses"
         );
+    }
+
+    /// Answer a Command interaction in a protected channel (`ephemeral`
+    /// picks the reply path), and prove the refusal: 400 `ChannelProtected`, the single-use slot still unclaimed,
+    /// and no event on the channel topic or the invoker's private topic.
+    /// Then the same request against a twin interaction in an unprotected
+    /// channel of the same server succeeds (positive control).
+    async fn assert_protected_respond_refused(ephemeral: bool) {
+        let mut harness = TestHarness::new().await;
+        let (_, session, user) = harness.new_user().await;
+        let protected = harness.new_protected_channel(&user, &session, &[]).await;
+        assert!(protected.channel.is_protected());
+        let open = harness.new_channel(&protected.server).await;
+        let (bot, _) = setup_bot(&harness, &user, &protected.server).await;
+
+        let interaction = interaction_row(
+            ulid::Ulid::new().to_string(),
+            "tok-protected",
+            &bot.id,
+            &user.id,
+            protected.channel.id(),
+        );
+        harness
+            .db
+            .insert_interaction(&interaction)
+            .await
+            .expect("interaction");
+
+        let body = json!({
+            "token": "tok-protected",
+            "content": "plaintext into a protected channel",
+            "ephemeral": ephemeral
+        })
+        .to_string();
+
+        let response = harness
+            .client
+            .post(format!("/interactions/{}/respond", interaction.id))
+            .header(Header::new("x-bot-token", bot.token.clone()))
+            .header(ContentType::JSON)
+            .body(body.clone())
+            .dispatch()
+            .await;
+        assert_eq!(response.status(), Status::BadRequest);
+        let error: serde_json::Value =
+            serde_json::from_str(&response.into_string().await.expect("body")).expect("JSON");
+        assert_eq!(error["type"], "ChannelProtected", "{error}");
+
+        // The refusal precedes the claim: the slot is still unused.
+        let stored = harness
+            .db
+            .fetch_interaction(&interaction.id)
+            .await
+            .expect("interaction");
+        assert!(
+            !stored.responded,
+            "a refused response must not claim the single-use slot"
+        );
+
+        // Marker published AFTER the refused respond (FIFO per subscription):
+        // once it is observed, anything the respond published is buffered.
+        let response = harness
+            .client
+            .post(format!("/channels/{}/messages", open.id()))
+            .header(Header::new("x-session-token", session.token.to_string()))
+            .header(ContentType::JSON)
+            .body(json!({ "content": "marker" }).to_string())
+            .dispatch()
+            .await;
+        assert_eq!(response.status(), Status::Ok);
+        drop(response);
+        harness
+            .wait_for_event(open.id(), |event| match event {
+                EventV1::Message(message) => message.content.as_deref() == Some("marker"),
+                _ => false,
+            })
+            .await;
+
+        harness.assert_no_buffered_event(protected.channel.id(), |event| match event {
+            EventV1::Message(message) => message.author == bot.id,
+            EventV1::InteractionEphemeralMessage { .. } => true,
+            _ => false,
+        });
+        harness.assert_no_buffered_event(&format!("{}!", user.id), |event| {
+            matches!(event, EventV1::InteractionEphemeralMessage { .. })
+        });
+
+        // Positive control: the identical request in an unprotected channel.
+        let twin = interaction_row(
+            ulid::Ulid::new().to_string(),
+            "tok-protected",
+            &bot.id,
+            &user.id,
+            open.id(),
+        );
+        harness.db.insert_interaction(&twin).await.expect("twin");
+        let response = harness
+            .client
+            .post(format!("/interactions/{}/respond", twin.id))
+            .header(Header::new("x-bot-token", bot.token.clone()))
+            .header(ContentType::JSON)
+            .body(body)
+            .dispatch()
+            .await;
+        assert_eq!(response.status(), Status::Ok);
+        let message: v0::Message = response.into_json().await.expect("`Message`");
+        assert_eq!(message.channel, open.id());
+        assert_eq!(
+            harness.db.fetch_message(&message.id).await.is_ok(),
+            !ephemeral,
+            "only the non-ephemeral twin is persisted"
+        );
+    }
+
+    #[test]
+    fn respond_in_protected_channel_refused_before_claim() {
+        crate::util::test::rt().block_on(assert_protected_respond_refused(false))
+    }
+
+    #[test]
+    fn ephemeral_respond_in_protected_channel_refused_before_claim() {
+        crate::util::test::rt().block_on(assert_protected_respond_refused(true))
+    }
+
+    #[test]
+    fn respond_auth_failure_identical_protected_or_not() {
+        crate::util::test::rt().block_on(respond_auth_failure_identical_protected_or_not_case())
+    }
+
+    /// A responder who fails the route's first authorization (a bad response
+    /// token, or the wrong bot) gets the pre-W2 error, byte-identical
+    /// whether or not the channel is protected.
+    async fn respond_auth_failure_identical_protected_or_not_case() {
+        let harness = TestHarness::new().await;
+        let (_, session, user) = harness.new_user().await;
+        let protected = harness.new_protected_channel(&user, &session, &[]).await;
+        let open = harness.new_channel(&protected.server).await;
+        let (bot, _) = setup_bot(&harness, &user, &protected.server).await;
+        let (other_bot, _) = setup_bot(&harness, &user, &protected.server).await;
+
+        let mut answers = Vec::new();
+        for channel_id in [protected.channel.id(), open.id()] {
+            let interaction = interaction_row(
+                ulid::Ulid::new().to_string(),
+                "tok-auth",
+                &bot.id,
+                &user.id,
+                channel_id,
+            );
+            harness
+                .db
+                .insert_interaction(&interaction)
+                .await
+                .expect("interaction");
+
+            let mut pair = Vec::new();
+            for (bot_token, token) in [
+                (bot.token.clone(), "wrong"),
+                (other_bot.token.clone(), "tok-auth"),
+            ] {
+                let response = harness
+                    .client
+                    .post(format!("/interactions/{}/respond", interaction.id))
+                    .header(Header::new("x-bot-token", bot_token))
+                    .header(ContentType::JSON)
+                    .body(json!({ "token": token, "content": "hi" }).to_string())
+                    .dispatch()
+                    .await;
+                let status = response.status();
+                pair.push((status, response.into_string().await.unwrap_or_default()));
+            }
+            answers.push(pair);
+        }
+
+        assert_eq!(answers[0][0].0, Status::Unauthorized);
+        assert_eq!(answers[0][1].0, Status::NotFound);
+        assert_eq!(
+            answers[0], answers[1],
+            "auth failures must not reveal the channel's protected status"
+        );
+        for (_, body) in &answers[0] {
+            assert!(!body.contains("ChannelProtected"), "{}", body);
+        }
     }
 }
