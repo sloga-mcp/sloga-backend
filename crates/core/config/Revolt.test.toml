@@ -32,6 +32,12 @@ use_tls = false
 [features.payments]
 enabled = true
 cipher_sales_open = true
+prot_sales_open = true
+
+# Prot on for the wallet and pack tests. cipher_grants_enabled stays off, so
+# the Cipher tests never post Prot; grant tests pass their own settings.
+[features.boosts.protection]
+enabled = true
 
 [api.stripe]
 secret_key = "sk_test_dummy"

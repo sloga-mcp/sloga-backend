@@ -465,6 +465,37 @@ afk_auto_move = true
 # server_emoji = 500
 # server_sounds = 96
 
+# --- Protected servers and channels (Prot) ---
+# Ships DARK with its OWN flags: turning boosts on never turns Prot on. Every
+# key below defaults in code to the value shown. To change one, put it in
+# Revolt.overrides.toml under an explicit [features.boosts.protection] header
+# and RESTART delta AND crond (config is frozen into each process at first
+# access). A cost table that is set must name all four tiers, or no process
+# starts. Prot sales (packs, pay-exact, return URLs) are under
+# [features.payments].
+#
+# [features.boosts.protection]
+# enabled = false                 # master switch: ledger reads and writes, tank routes
+# self_serve_enabled = false      # non-admin tank creation and goals
+# burn_enabled = false            # the daily burn clock
+# deletion_enabled = false        # the day-30 purge (dry-run logging while off)
+# cipher_grants_enabled = false   # founding Prot for Cipher members
+# channel_daily_cost = { 10 = 40, 25 = 90, 50 = 160, 100 = 280 }   # Prot per day, per slot tier
+# server_daily_cost = { 10 = 60, 25 = 135, 50 = 240, 100 = 420 }
+# grace_days = 5
+# freeze_days = 25
+# final_warning_day = 20
+# warn_days = [7, 3, 1]
+# min_reactivation_days = 1
+# launch_goal_deadline_days = 30
+# launch_window_days = 7
+# launch_seat_window_days = 7
+# min_contribution = 50           # Prot
+# min_launch_goal_days = 30
+# withdraw_cutoff_hours = 48
+# contribute_hold_hours = 72      # Prot bought this recently can't be contributed; 0 = no hold
+# wallet_cap = 100000             # most Prot one wallet may hold
+
 [features.antispam]
 # Ships OFF; prod enables it in Revolt.overrides.toml under [features.antispam], then restarts delta AND crond.
 dm_dupe_enabled = false
@@ -499,6 +530,32 @@ cipher_blocked_countries = [
     "AT", "BE", "BG", "HR", "CY", "CZ", "DK", "EE", "FI", "FR", "DE", "GR", "HU", "IE",
     "IT", "LV", "LT", "LU", "MT", "NL", "PL", "PT", "RO", "SK", "SI", "ES", "SE", "GB",
 ]
+# Prot sales. prot_sales_open gates NEW Prot checkouts only; a paid order is still credited, and
+# refunds and disputes still settle, while it is off. Prot also needs
+# [features.boosts.protection] enabled.
+prot_sales_open = false
+# Packs on sale: ids are unique "p" + digits, cents is the price, prot what it credits (bonus
+# included). Setting the key in Revolt.overrides.toml replaces the whole list.
+prot_packs = [
+    { id = "p5", cents = 500, prot = 500 },
+    { id = "p10", cents = 1000, prot = 1000 },
+    { id = "p25", cents = 2500, prot = 2600 },
+    { id = "p50", cents = 5000, prot = 5300 },
+    { id = "p100", cents = 10000, prot = 11000 },
+]
+# Pay-exact bounds, in cents (1 Prot = 1 cent); 50 is Stripe's USD minimum
+prot_exact_min_cents = 50
+prot_exact_max_cents = 50000
+# Countries Prot is not sold to; same format, env form and default as cipher_blocked_countries
+# (REVOLT__FEATURES__PAYMENTS__PROT_BLOCKED_COUNTRIES=DE,FR)
+prot_blocked_countries = [
+    "AT", "BE", "BG", "HR", "CY", "CZ", "DK", "EE", "FI", "FR", "DE", "GR", "HU", "IE",
+    "IT", "LV", "LT", "LU", "MT", "NL", "PL", "PT", "RO", "SK", "SI", "ES", "SE", "GB",
+]
+# Where Checkout returns a Prot buyer: web success and cancel, and the shells (both outcomes)
+prot_success_url = "https://app.sloga.gg/settings?prot=success"
+prot_cancel_url = "https://app.sloga.gg/settings?prot=cancel"
+prot_shell_return_url = "https://sloga.gg/prot/thanks/"
 
 [features.limits]
 

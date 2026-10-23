@@ -5,6 +5,10 @@ use super::AbstractMigrations;
 mod init;
 mod scripts;
 
+/// The Prot tests install the real migration indexes
+#[cfg(test)]
+pub(crate) use scripts::{create_prot_indexes, PROT_COLLECTIONS};
+
 #[async_trait]
 impl AbstractMigrations for MongoDb {
     #[cfg(test)]

@@ -15,7 +15,9 @@ use crate::{
     ThreadMemberCompositeKey, UploadSession, User, UserSettings, Webhook, Account, AccountInvite, Session,
     MFATicket
 };
-use crate::{CipherMembership, CipherNumber, PaymentEvent, PaymentOrder};
+use crate::{
+    CipherMembership, CipherNumber, PaymentEvent, PaymentOrder, ProtAccount, ProtLedgerEntry,
+};
 
 database_derived!(
     /// Reference implementation
@@ -81,5 +83,9 @@ database_derived!(
         pub payment_orders: Arc<Mutex<HashMap<String, PaymentOrder>>>,
         pub cipher_numbers: Arc<Mutex<HashMap<u32, CipherNumber>>>,
         pub cipher_memberships: Arc<Mutex<HashMap<String, CipherMembership>>>,
+        /// Keyed by the ledger row's `key` (the idempotency key), NOT `_id`
+        pub prot_ledger: Arc<Mutex<HashMap<String, ProtLedgerEntry>>>,
+        /// Keyed by account id (`user:{id}`; S5b adds `tank:`/`hold:`)
+        pub prot_accounts: Arc<Mutex<HashMap<String, ProtAccount>>>,
     }
 );

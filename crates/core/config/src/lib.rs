@@ -1429,6 +1429,9 @@ pub struct BoostFeatures {
     pub tier2: BoostTierPerks,
     #[serde(default = "BoostFeatures::default_tier3")]
     pub tier3: BoostTierPerks,
+    /// Protected servers and channels (S5): its OWN flags, so turning Boosts on never turns Prot on
+    #[serde(default)]
+    pub protection: ProtectionFeatures,
 }
 
 impl Default for BoostFeatures {
@@ -1441,8 +1444,102 @@ impl Default for BoostFeatures {
             tier1: Self::default_tier1(),
             tier2: Self::default_tier2(),
             tier3: Self::default_tier3(),
+            protection: ProtectionFeatures::default(),
         }
     }
+}
+
+/// `[features.boosts.protection]`. Ships dark; flips need a delta AND crond
+/// restart (config is frozen per process).
+///
+/// Every key is optional and takes the default below. A cost table that is
+/// set must name all four tiers: a partial one fails the whole config at
+/// startup rather than pricing a tier at zero.
+#[derive(Deserialize, Debug, Clone)]
+#[serde(default)]
+pub struct ProtectionFeatures {
+    /// Master switch for ledger reads and writes and the tank routes
+    pub enabled: bool,
+    /// Non-admin tank creation and goals
+    pub self_serve_enabled: bool,
+    /// The daily burn clock
+    pub burn_enabled: bool,
+    /// The day-30 purge (dry-run logging while off)
+    pub deletion_enabled: bool,
+    /// Founding Prot for Cipher members
+    pub cipher_grants_enabled: bool,
+    /// Prot per day for a protected channel, per slot tier
+    pub channel_daily_cost: ProtTierCosts,
+    /// Prot per day for a protected server, per slot tier
+    pub server_daily_cost: ProtTierCosts,
+    pub grace_days: u32,
+    pub freeze_days: u32,
+    pub final_warning_day: u32,
+    /// Days before the tank runs dry that the owner is warned
+    pub warn_days: Vec<u32>,
+    pub min_reactivation_days: u32,
+    pub launch_goal_deadline_days: u32,
+    pub launch_window_days: u32,
+    pub launch_seat_window_days: u32,
+    /// Smallest contribution, in Prot
+    pub min_contribution: i64,
+    pub min_launch_goal_days: u32,
+    pub withdraw_cutoff_hours: u32,
+    /// Prot bought in the last this many hours can't go into a tank or a
+    /// pledge (0 disables the hold)
+    pub contribute_hold_hours: u32,
+    /// Most Prot one wallet may hold
+    pub wallet_cap: i64,
+}
+
+impl Default for ProtectionFeatures {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            self_serve_enabled: false,
+            burn_enabled: false,
+            deletion_enabled: false,
+            cipher_grants_enabled: false,
+            channel_daily_cost: ProtTierCosts {
+                t10: 40,
+                t25: 90,
+                t50: 160,
+                t100: 280,
+            },
+            server_daily_cost: ProtTierCosts {
+                t10: 60,
+                t25: 135,
+                t50: 240,
+                t100: 420,
+            },
+            grace_days: 5,
+            freeze_days: 25,
+            final_warning_day: 20,
+            warn_days: vec![7, 3, 1],
+            min_reactivation_days: 1,
+            launch_goal_deadline_days: 30,
+            launch_window_days: 7,
+            launch_seat_window_days: 7,
+            min_contribution: 50,
+            min_launch_goal_days: 30,
+            withdraw_cutoff_hours: 48,
+            contribute_hold_hours: 72,
+            wallet_cap: 100000,
+        }
+    }
+}
+
+/// TOML `channel_daily_cost = { 10 = 40, 25 = 90, 50 = 160, 100 = 280 }`
+#[derive(Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProtTierCosts {
+    #[serde(rename = "10")]
+    pub t10: i64,
+    #[serde(rename = "25")]
+    pub t25: i64,
+    #[serde(rename = "50")]
+    pub t50: i64,
+    #[serde(rename = "100")]
+    pub t100: i64,
 }
 
 impl BoostFeatures {
@@ -1639,13 +1736,48 @@ pub struct FeaturePayments {
     /// fails the payments config (checkouts refused).
     #[serde(deserialize_with = "country_list")]
     pub cipher_blocked_countries: Vec<String>,
+    /// Kill switch for NEW Prot checkouts only (fulfilling a paid one never reads it)
+    pub prot_sales_open: bool,
+    /// Packs on sale; ids are unique "p" + digits
+    pub prot_packs: Vec<ProtPackConfig>,
+    /// Smallest pay-exact purchase, in cents (Stripe's USD minimum)
+    pub prot_exact_min_cents: i64,
+    /// Largest pay-exact purchase, in cents
+    pub prot_exact_max_cents: i64,
+    /// Same format and env form as cipher_blocked_countries
+    #[serde(deserialize_with = "country_list")]
+    pub prot_blocked_countries: Vec<String>,
+    /// Where Checkout returns a web buyer of Prot
+    pub prot_success_url: String,
+    pub prot_cancel_url: String,
+    /// Where Checkout returns a shell buyer of Prot, on success AND cancel
+    pub prot_shell_return_url: String,
 }
 
-/// `cipher_blocked_countries` from a list, or from one comma-separated
-/// string (an environment variable cannot carry a list). Each entry of the
-/// string is trimmed; an empty one (`""`, `"DE,"`) is kept, so the payments
-/// config refuses it instead of blocking nothing. To block nothing, set
-/// `cipher_blocked_countries = []` in Revolt.overrides.toml.
+/// One Prot pack in `[features.payments] prot_packs`: `cents` is the price,
+/// `prot` what it credits (bonus included)
+#[derive(Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct ProtPackConfig {
+    pub id: String,
+    pub cents: i64,
+    pub prot: i64,
+}
+
+impl ProtPackConfig {
+    fn new(id: &str, cents: i64, prot: i64) -> Self {
+        Self {
+            id: id.to_string(),
+            cents,
+            prot,
+        }
+    }
+}
+
+/// `cipher_blocked_countries` and `prot_blocked_countries` from a list, or
+/// from one comma-separated string (an environment variable cannot carry a
+/// list). Each entry of the string is trimmed; an empty one (`""`, `"DE,"`)
+/// is kept, so the payments config refuses it instead of blocking nothing.
+/// To block nothing, set the key to `[]` in Revolt.overrides.toml.
 fn country_list<'de, D: serde::Deserializer<'de>>(
     deserializer: D,
 ) -> Result<Vec<String>, D::Error> {
@@ -1682,6 +1814,22 @@ impl Default for FeaturePayments {
             cipher_blocked_countries: CIPHER_BLOCKED_COUNTRIES_DEFAULT
                 .map(str::to_string)
                 .to_vec(),
+            prot_sales_open: false,
+            prot_packs: vec![
+                ProtPackConfig::new("p5", 500, 500),
+                ProtPackConfig::new("p10", 1000, 1000),
+                ProtPackConfig::new("p25", 2500, 2600),
+                ProtPackConfig::new("p50", 5000, 5300),
+                ProtPackConfig::new("p100", 10000, 11000),
+            ],
+            prot_exact_min_cents: 50,
+            prot_exact_max_cents: 50000,
+            prot_blocked_countries: CIPHER_BLOCKED_COUNTRIES_DEFAULT
+                .map(str::to_string)
+                .to_vec(),
+            prot_success_url: "https://app.sloga.gg/settings?prot=success".to_string(),
+            prot_cancel_url: "https://app.sloga.gg/settings?prot=cancel".to_string(),
+            prot_shell_return_url: "https://sloga.gg/prot/thanks/".to_string(),
         }
     }
 }
@@ -3429,5 +3577,371 @@ mod payments_config_tests {
             !debug.contains(WEBHOOK_SECRET),
             "Settings Debug leaks webhook_secret"
         );
+    }
+}
+
+// Built from in-process sources only, never the cached `config()`, so no
+// local Revolt.overrides.toml or environment variable can skew the result.
+// `ProtectionFeatures` holds no secrets and has no PartialEq, so whole values
+// are compared through their Debug output.
+#[cfg(test)]
+mod prot_config_tests {
+    use std::collections::HashMap;
+
+    use config::{Config, ConfigError, Environment, File, FileFormat};
+
+    use super::{
+        FeaturePayments, ProtPackConfig, ProtTierCosts, ProtectionFeatures, Settings,
+        CIPHER_BLOCKED_COUNTRIES_DEFAULT,
+    };
+
+    /// The embedded Revolt.toml with each overlay layered on top, in order
+    fn layered(overlays: &[&str]) -> Result<Settings, ConfigError> {
+        let embedded = File::from_str(include_str!("../Revolt.toml"), FileFormat::Toml);
+        let mut builder = Config::builder().add_source(embedded);
+        for overlay in overlays {
+            builder = builder.add_source(File::from_str(overlay, FileFormat::Toml));
+        }
+        builder.build()?.try_deserialize()
+    }
+
+    fn settings(overlays: &[&str]) -> Settings {
+        layered(overlays).expect("the layered config deserializes")
+    }
+
+    fn pack(id: &str, cents: i64, prot: i64) -> ProtPackConfig {
+        ProtPackConfig {
+            id: id.to_string(),
+            cents,
+            prot,
+        }
+    }
+
+    fn default_packs() -> Vec<ProtPackConfig> {
+        vec![
+            pack("p5", 500, 500),
+            pack("p10", 1000, 1000),
+            pack("p25", 2500, 2600),
+            pack("p50", 5000, 5300),
+            pack("p100", 10000, 11000),
+        ]
+    }
+
+    fn assert_protection_defaults(protection: &ProtectionFeatures) {
+        assert!(!protection.enabled);
+        assert!(!protection.self_serve_enabled);
+        assert!(!protection.burn_enabled);
+        assert!(!protection.deletion_enabled);
+        assert!(!protection.cipher_grants_enabled);
+        assert_eq!(
+            protection.channel_daily_cost,
+            ProtTierCosts {
+                t10: 40,
+                t25: 90,
+                t50: 160,
+                t100: 280,
+            }
+        );
+        assert_eq!(
+            protection.server_daily_cost,
+            ProtTierCosts {
+                t10: 60,
+                t25: 135,
+                t50: 240,
+                t100: 420,
+            }
+        );
+        assert_eq!(protection.grace_days, 5);
+        assert_eq!(protection.freeze_days, 25);
+        assert_eq!(protection.final_warning_day, 20);
+        assert_eq!(protection.warn_days, [7, 3, 1]);
+        assert_eq!(protection.min_reactivation_days, 1);
+        assert_eq!(protection.launch_goal_deadline_days, 30);
+        assert_eq!(protection.launch_window_days, 7);
+        assert_eq!(protection.launch_seat_window_days, 7);
+        assert_eq!(protection.min_contribution, 50);
+        assert_eq!(protection.min_launch_goal_days, 30);
+        assert_eq!(protection.withdraw_cutoff_hours, 48);
+        assert_eq!(protection.contribute_hold_hours, 72);
+        assert_eq!(protection.wallet_cap, 100000);
+    }
+
+    fn assert_prot_payments_defaults(payments: &FeaturePayments) {
+        assert!(!payments.prot_sales_open);
+        assert_eq!(payments.prot_packs, default_packs());
+        assert_eq!(payments.prot_exact_min_cents, 50);
+        assert_eq!(payments.prot_exact_max_cents, 50000);
+        assert_eq!(
+            payments.prot_blocked_countries,
+            CIPHER_BLOCKED_COUNTRIES_DEFAULT
+                .map(str::to_string)
+                .to_vec()
+        );
+        assert_eq!(
+            payments.prot_success_url,
+            "https://app.sloga.gg/settings?prot=success"
+        );
+        assert_eq!(
+            payments.prot_cancel_url,
+            "https://app.sloga.gg/settings?prot=cancel"
+        );
+        assert_eq!(
+            payments.prot_shell_return_url,
+            "https://sloga.gg/prot/thanks/"
+        );
+    }
+
+    #[test]
+    fn hand_written_prot_defaults_have_the_planned_values() {
+        assert_protection_defaults(&ProtectionFeatures::default());
+        assert_protection_defaults(&super::BoostFeatures::default().protection);
+        assert_prot_payments_defaults(&FeaturePayments::default());
+    }
+
+    /// The default packs pass the rules the payments config enforces: ids
+    /// unique "p" + digits, at least Stripe's 50 cents, never fewer Prot than
+    /// cents, and within the pay-exact ceiling
+    #[test]
+    fn default_packs_are_well_formed() {
+        let payments = FeaturePayments::default();
+        let mut seen: Vec<&str> = Vec::new();
+        for p in &payments.prot_packs {
+            assert!(!seen.contains(&p.id.as_str()), "{} repeats", p.id);
+            seen.push(&p.id);
+
+            let digits = p.id.strip_prefix('p').expect("ids start with p");
+            assert!(
+                !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()),
+                "{} is not p + digits",
+                p.id
+            );
+            assert!(p.cents >= 50, "{} costs under 50 cents", p.id);
+            assert!(p.prot >= p.cents, "{} credits less than it costs", p.id);
+            assert!(
+                p.cents <= payments.prot_exact_max_cents,
+                "{} costs more than the pay-exact ceiling",
+                p.id
+            );
+        }
+        assert_eq!(seen.len(), 5);
+    }
+
+    /// The embedded tables must not drift from the code defaults, and the
+    /// protection table stays commented out (its defaults live in code)
+    #[test]
+    fn embedded_tables_match_the_code_defaults() {
+        let config = Config::builder()
+            .add_source(File::from_str(
+                include_str!("../Revolt.toml"),
+                FileFormat::Toml,
+            ))
+            .build()
+            .expect("the embedded Revolt.toml builds");
+        assert!(config.get_table("features.boosts.protection").is_err());
+
+        let settings: Settings = config
+            .try_deserialize()
+            .expect("the embedded Revolt.toml deserializes");
+        assert_protection_defaults(&settings.features.boosts.protection);
+        assert_prot_payments_defaults(&settings.features.payments);
+    }
+
+    /// The commented `[features.boosts.protection]` block in Revolt.toml,
+    /// uncommented, parses to exactly the code defaults, so the documented
+    /// values cannot drift
+    #[test]
+    fn documented_protection_block_matches_the_code_defaults() {
+        let block = include_str!("../Revolt.toml")
+            .lines()
+            .skip_while(|line| *line != "# [features.boosts.protection]")
+            .take_while(|line| line.starts_with('#'))
+            .map(|line| line.trim_start_matches('#').trim_start())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        // Every key is in the block, or the comparison below proves little
+        let documented = block.lines().filter(|line| line.contains(" = ")).count();
+        assert_eq!(documented, 20, "the documented block lists every key");
+
+        let protection = settings(&[block.as_str()]).features.boosts.protection;
+        let expected = ProtectionFeatures::default();
+        assert_eq!(format!("{protection:?}"), format!("{expected:?}"));
+    }
+
+    /// The test config turns on `enabled` and `prot_sales_open` only:
+    /// `cipher_grants_enabled` stays off, so the Cipher tests never post Prot
+    #[test]
+    fn test_config_turns_on_prot_and_prot_sales_only() {
+        let settings = settings(&[include_str!("../Revolt.test.toml")]);
+
+        let protection = &settings.features.boosts.protection;
+        assert!(protection.enabled);
+        assert!(!protection.cipher_grants_enabled);
+        let expected = ProtectionFeatures {
+            enabled: true,
+            ..Default::default()
+        };
+        assert_eq!(format!("{protection:?}"), format!("{expected:?}"));
+        assert!(!settings.features.boosts.enabled);
+
+        let payments = &settings.features.payments;
+        assert!(payments.prot_sales_open);
+        assert_eq!(payments.prot_packs, default_packs());
+        assert_eq!(
+            payments.prot_blocked_countries,
+            CIPHER_BLOCKED_COUNTRIES_DEFAULT
+                .map(str::to_string)
+                .to_vec()
+        );
+    }
+
+    /// Prot keeps its own flags in both directions
+    #[test]
+    fn boosts_and_prot_switch_independently() {
+        let boosts_on = settings(&["[features.boosts]\nenabled = true\n"]);
+        assert!(boosts_on.features.boosts.enabled);
+        assert_protection_defaults(&boosts_on.features.boosts.protection);
+
+        let prot_on = settings(&["[features.boosts.protection]\nenabled = true\n"]);
+        assert!(prot_on.features.boosts.protection.enabled);
+        assert!(!prot_on.features.boosts.enabled);
+        assert!(!prot_on.features.boosts.purchases_enabled);
+        assert_eq!(prot_on.features.boosts.tier_thresholds, [2, 7, 14]);
+    }
+
+    /// An overrides file sets protection keys (the rest keep their defaults)
+    /// and replaces the whole pack list
+    #[test]
+    fn overrides_set_the_prot_keys() {
+        let overrides = r#"
+[features.boosts.protection]
+cipher_grants_enabled = true
+channel_daily_cost = { 10 = 1, 25 = 2, 50 = 3, 100 = 4 }
+warn_days = [2]
+wallet_cap = 2500
+
+[features.payments]
+prot_sales_open = true
+prot_packs = [{ id = "p7", cents = 700, prot = 750 }]
+prot_blocked_countries = []
+prot_shell_return_url = "https://example.test/prot/thanks/"
+"#;
+        let settings = settings(&[overrides]);
+
+        let protection = &settings.features.boosts.protection;
+        assert!(protection.cipher_grants_enabled);
+        assert!(!protection.enabled);
+        assert_eq!(
+            protection.channel_daily_cost,
+            ProtTierCosts {
+                t10: 1,
+                t25: 2,
+                t50: 3,
+                t100: 4,
+            }
+        );
+        assert_eq!(
+            protection.server_daily_cost,
+            ProtectionFeatures::default().server_daily_cost
+        );
+        assert_eq!(protection.warn_days, [2]);
+        assert_eq!(protection.wallet_cap, 2500);
+        assert_eq!(protection.contribute_hold_hours, 72);
+
+        let payments = &settings.features.payments;
+        assert!(payments.prot_sales_open);
+        assert_eq!(payments.prot_packs, [pack("p7", 700, 750)]);
+        assert!(payments.prot_blocked_countries.is_empty());
+        assert_eq!(
+            payments.prot_shell_return_url,
+            "https://example.test/prot/thanks/"
+        );
+        assert_eq!(
+            payments.prot_success_url,
+            "https://app.sloga.gg/settings?prot=success"
+        );
+        // The Cipher keys are untouched
+        assert!(!payments.cipher_sales_open);
+        assert_eq!(
+            payments.cipher_blocked_countries,
+            CIPHER_BLOCKED_COUNTRIES_DEFAULT
+                .map(str::to_string)
+                .to_vec()
+        );
+    }
+
+    /// A cost table missing a tier fails the config instead of pricing that
+    /// tier at zero; so does a pack missing a field
+    #[test]
+    fn partial_cost_tables_and_packs_fail_the_config() {
+        let overlays = [
+            "[features.boosts.protection]\nchannel_daily_cost = { 10 = 1 }\n",
+            "[features.boosts.protection]\nserver_daily_cost = { 10 = 1, 25 = 2, 50 = 3 }\n",
+            "[features.payments]\nprot_packs = [{ id = \"p7\", cents = 700 }]\n",
+        ];
+        for overlay in overlays {
+            assert!(layered(&[overlay]).is_err(), "accepted: {overlay}");
+        }
+    }
+
+    /// The documented env form (double underscores) reaches the nested keys,
+    /// including a cost table given tier by tier
+    #[test]
+    fn environment_override_reaches_the_prot_keys() {
+        // Each key is prefixed with REVOLT__FEATURES__
+        let vars: HashMap<String, String> = [
+            ("BOOSTS__PROTECTION__ENABLED", "true"),
+            ("BOOSTS__PROTECTION__WALLET_CAP", "5000"),
+            ("BOOSTS__PROTECTION__SERVER_DAILY_COST__10", "61"),
+            ("BOOSTS__PROTECTION__SERVER_DAILY_COST__25", "136"),
+            ("BOOSTS__PROTECTION__SERVER_DAILY_COST__50", "241"),
+            ("BOOSTS__PROTECTION__SERVER_DAILY_COST__100", "421"),
+            ("PAYMENTS__PROT_SALES_OPEN", "true"),
+            ("PAYMENTS__PROT_EXACT_MAX_CENTS", "20000"),
+            ("PAYMENTS__PROT_BLOCKED_COUNTRIES", "DE, FR"),
+        ]
+        .map(|(k, v)| (format!("REVOLT__FEATURES__{k}"), v.to_owned()))
+        .into();
+
+        let settings: Settings = Config::builder()
+            .add_source(File::from_str(
+                include_str!("../Revolt.toml"),
+                FileFormat::Toml,
+            ))
+            .add_source(
+                Environment::with_prefix("REVOLT")
+                    .separator("__")
+                    .source(Some(vars)),
+            )
+            .build()
+            .expect("the config builds")
+            .try_deserialize()
+            .expect("the config deserializes");
+
+        let protection = &settings.features.boosts.protection;
+        assert!(protection.enabled);
+        assert!(!protection.cipher_grants_enabled);
+        assert_eq!(protection.wallet_cap, 5000);
+        assert_eq!(
+            protection.server_daily_cost,
+            ProtTierCosts {
+                t10: 61,
+                t25: 136,
+                t50: 241,
+                t100: 421,
+            }
+        );
+        assert_eq!(
+            protection.channel_daily_cost,
+            ProtectionFeatures::default().channel_daily_cost
+        );
+
+        let payments = &settings.features.payments;
+        assert!(payments.prot_sales_open);
+        assert_eq!(payments.prot_exact_max_cents, 20000);
+        assert_eq!(payments.prot_exact_min_cents, 50);
+        assert_eq!(payments.prot_blocked_countries, ["DE", "FR"]);
+        assert_eq!(payments.prot_packs, default_packs());
+        assert!(!settings.features.boosts.enabled);
     }
 }

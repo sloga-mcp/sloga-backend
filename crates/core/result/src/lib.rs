@@ -383,6 +383,42 @@ pub enum ErrorType {
     PaymentPending,
     /// The payment provider failed or returned an unusable response
     PaymentProviderError,
+
+    // ? Prot errors
+    /// The Prot account holds less than the debit needs
+    InsufficientProt {
+        needed: i64,
+        available: i64,
+    },
+    /// Prot is switched off in the config
+    ProtDisabled,
+    /// Prot sales are not open (`prot_sales_open`)
+    ProtSalesClosed,
+    /// The requested Prot pack is not valid (unknown pack, exact amount out
+    /// of range, or both or neither of pack and exact amount given)
+    ProtPackInvalid,
+    /// The purchase would take the wallet over its cap
+    ProtWalletCap {
+        max: i64,
+    },
+    /// Prot bought within the hold period (`contribute_hold_hours`) cannot
+    /// go into a tank or a pledge yet
+    ProtHeldPurchase,
+    /// The tank is frozen
+    ProtTankFrozen,
+    /// The goal no longer takes pledges
+    ProtGoalClosed,
+    /// The caller cannot do this with Prot right now (for example a checkout
+    /// while a payment dispute is open)
+    ProtNotEligible,
+    /// The requested tier is below the seats already in use
+    ProtTierBelowSeats,
+    /// The idempotency key was used before with a different payload
+    ProtIdempotencyConflict,
+    /// The Prot ledger needs MongoDB running as a replica set (transactions)
+    ProtReplicaSetRequired,
+    /// Prot is not sold in the caller's country
+    ProtRegionUnavailable,
 }
 
 #[macro_export]
@@ -557,5 +593,31 @@ mod tests {
             other => panic!("unexpected error type {other:?}"),
         }
         assert!(decoded.location.is_empty());
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn prot_errors_serialize_by_name_with_fields() {
+        let error = create_error!(InsufficientProt {
+            needed: 500,
+            available: 120,
+        });
+        let value = serde_json::to_value(&error).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({ "type": "InsufficientProt", "needed": 500, "available": 120 })
+        );
+
+        let value = serde_json::to_value(create_error!(ProtWalletCap { max: 100_000 })).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({ "type": "ProtWalletCap", "max": 100_000 })
+        );
+
+        let value = serde_json::to_value(create_error!(ProtRegionUnavailable)).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({ "type": "ProtRegionUnavailable" })
+        );
     }
 }

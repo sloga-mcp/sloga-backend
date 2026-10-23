@@ -1,5 +1,6 @@
 use super::scripts::{
-    create_payment_indexes, seed_cipher_numbers_table, LATEST_REVISION, PAYMENT_COLLECTIONS,
+    create_payment_indexes, create_prot_indexes, seed_cipher_numbers_table, LATEST_REVISION,
+    PAYMENT_COLLECTIONS, PROT_COLLECTIONS,
 };
 
 use crate::mongodb::bson::doc;
@@ -234,6 +235,13 @@ pub async fn create_database(db: &MongoDb) {
 
     // Payments + Cipher (revision 74).
     for collection in PAYMENT_COLLECTIONS {
+        db.create_collection(collection)
+            .await
+            .unwrap_or_else(|error| panic!("Failed to create {collection} collection: {error}"));
+    }
+
+    // Prot wallet ledger (revision 76).
+    for collection in PROT_COLLECTIONS {
         db.create_collection(collection)
             .await
             .unwrap_or_else(|error| panic!("Failed to create {collection} collection: {error}"));
@@ -1313,6 +1321,11 @@ pub async fn create_database(db: &MongoDb) {
     seed_cipher_numbers_table(&db)
         .await
         .expect("Failed to seed cipher_numbers.");
+
+    // Prot. The same helper revision 76 runs.
+    create_prot_indexes(&db)
+        .await
+        .expect("Failed to create Prot indexes.");
 
     info!("Created database.");
 }
