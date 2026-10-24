@@ -42,6 +42,7 @@ use crate::{
     SeatListWriteOutcome, MAX_CHANNEL_SLOT_CAP,
 };
 
+use super::reference::{is_derived_text_group_id, log_call_squat_evicted};
 use super::AbstractProtectedChannels;
 
 const COL_CHANNELS: &str = "channels";
@@ -63,6 +64,28 @@ const COL_MESSAGES: &str = "messages";
 
 /// Serialized `MlsGroupKind::Text` (design 2.5)
 const KIND_TEXT: &str = "Text";
+
+/// Serialized `MlsGroupKind::Call` (design 2.5)
+const KIND_CALL: &str = "Call";
+
+/// The row at `group_id` a Text create may evict (M9): a Call group,
+/// `kind: "Call"` or no `kind` at all (written before the field existed).
+/// Any other row there (a Text group, an unknown kind) is never matched.
+fn call_squat_filter(group_id: &str) -> Document {
+    doc! {
+        "_id": group_id,
+        "$or": [{ "kind": KIND_CALL }, { "kind": { "$exists": false } }]
+    }
+}
+
+/// `call_squat_filter` on a row already read
+fn is_call_row(row: &Document) -> bool {
+    match row.get("kind") {
+        None => true,
+        Some(Bson::String(kind)) => kind == KIND_CALL,
+        Some(_) => false,
+    }
+}
 
 /// How long one call keeps retrying its transaction on transient errors
 /// (see the module docs). A retry starts only while this has not run out.
@@ -802,21 +825,61 @@ impl MongoDb {
         Ok(decision.outcome())
     }
 
+    /// M9: delete the Call squat at a Text create's id with its Call-plane
+    /// dependents keyed by that id (the `sweep_mls_groups` cascade: commits,
+    /// join intents, the group), inside the create's transaction.
+    /// KeyPackages are keyed by device, never by group, so none go.
+    async fn evict_call_squat(&self, session: &mut ClientSession, group_id: &str) -> Attempt<()> {
+        let result = self
+            .col::<Document>(COL_GROUPS)
+            .delete_one(call_squat_filter(group_id))
+            .session(&mut *session)
+            .await
+            .map_err(db_err("delete_one", COL_GROUPS))?;
+        if result.deleted_count == 0 {
+            return Err(TxnFail::Retry {
+                operation: "delete_one",
+                collection: COL_GROUPS,
+            });
+        }
+        self.col::<Document>(COL_COMMITS)
+            .delete_many(doc! { "group_id": group_id })
+            .session(&mut *session)
+            .await
+            .map_err(db_err("delete_many", COL_COMMITS))?;
+        self.col::<Document>(COL_JOIN_INTENTS)
+            .delete_many(doc! { "group_id": group_id })
+            .session(&mut *session)
+            .await
+            .map_err(db_err("delete_many", COL_JOIN_INTENTS))?;
+        Ok(())
+    }
+
+    /// The create's outcome, and the channel and creator of the Call squat
+    /// it evicted (M9), logged once the transaction commits
     async fn create_text_group_attempt(
         &self,
         session: &mut ClientSession,
         group: &MlsGroup,
         supersedes: Option<&str>,
-    ) -> Attempt<MlsGroupCreateOutcome> {
-        // FIRST operation: the superseded group this create closes (a first
-        // create writes no existing group: its insert and the seat-list
-        // touch below cannot collide with a Text commit)
+    ) -> Attempt<(MlsGroupCreateOutcome, Option<(String, String)>)> {
+        // FIRST operation: the superseded group this create closes, and a
+        // Call squat at this create's id that it would evict (M9), so a
+        // squatter's Call commits wait for this transaction instead of
+        // write-conflicting it on every attempt. A first create with no
+        // squat writes no existing group: its insert and the seat-list touch
+        // below cannot collide with a Text commit.
+        let evictable = is_derived_text_group_id(group);
+        let mut claims = Vec::new();
         if let Some(superseded_id) = supersedes {
-            self.claim_groups_first(
-                session,
-                doc! { "_id": superseded_id, "open": true, "kind": KIND_TEXT },
-            )
-            .await?;
+            claims.push(doc! { "_id": superseded_id, "open": true, "kind": KIND_TEXT });
+        }
+        if evictable {
+            claims.push(call_squat_filter(&group.id));
+        }
+        if !claims.is_empty() {
+            self.claim_groups_first(session, doc! { "$or": claims })
+                .await?;
         }
 
         let list = self
@@ -842,19 +905,25 @@ impl MongoDb {
                     .ok_or_else(|| TxnFail::Refuse(create_error!(NotFound)))?;
                 check_text_successor(&superseded, group)?;
                 if let Some(open) = open.filter(|open| open.id != superseded_id) {
-                    return Ok(MlsGroupCreateOutcome::Conflict {
-                        open_group_id: open.id,
-                        channel_id: open.channel_id,
-                    });
+                    return Ok((
+                        MlsGroupCreateOutcome::Conflict {
+                            open_group_id: open.id,
+                            channel_id: open.channel_id,
+                        },
+                        None,
+                    ));
                 }
             }
             None => {
                 check_text_first_generation(group)?;
                 if let Some(open) = open {
-                    return Ok(MlsGroupCreateOutcome::Conflict {
-                        open_group_id: open.id,
-                        channel_id: open.channel_id,
-                    });
+                    return Ok((
+                        MlsGroupCreateOutcome::Conflict {
+                            open_group_id: open.id,
+                            channel_id: open.channel_id,
+                        },
+                        None,
+                    ));
                 }
             }
         }
@@ -872,15 +941,36 @@ impl MongoDb {
         )
         .await?;
 
+        // Test-only (compiled out of every build but `cargo test`): the M9
+        // claim test's squatter writes its Call row here, once this
+        // attempt's snapshot is fixed and before the eviction deletes it
+        #[cfg(test)]
+        super::super::tests::run_text_create_hook(&group.id).await;
+
         let taken: Option<Document> = self
             .col::<Document>(COL_GROUPS)
             .find_one(doc! { "_id": &prepared.id })
             .session(&mut *session)
             .await
             .map_err(db_err("find_one", COL_GROUPS))?;
-        if taken.is_some() {
-            return Err(TxnFail::Refuse(create_error!(InvalidOperation)));
-        }
+        // A row already at the id: a Call squat at a derived id is evicted
+        // (M9, see `is_derived_text_group_id`); any other row is refused as
+        // before
+        let evicted = match taken {
+            None => None,
+            Some(row) if evictable && is_call_row(&row) => {
+                let call_channel_id = row.get_str("channel_id").unwrap_or("?").to_string();
+                let call_creator = row
+                    .get_document("created_by")
+                    .ok()
+                    .and_then(|creator| creator.get_str("user_id").ok())
+                    .unwrap_or("?")
+                    .to_string();
+                self.evict_call_squat(session, &prepared.id).await?;
+                Some((call_channel_id, call_creator))
+            }
+            Some(_) => return Err(TxnFail::Refuse(create_error!(InvalidOperation))),
+        };
 
         if let Some(superseded_id) = supersedes {
             // Matches nothing when a racing successor already closed it;
@@ -910,7 +1000,7 @@ impl MongoDb {
             .await
             .map_err(dup_or_db_err("insert_one", COL_GROUPS))?;
 
-        Ok(MlsGroupCreateOutcome::Created)
+        Ok((MlsGroupCreateOutcome::Created, evicted))
     }
 
     /// The channel ids of every entitlement of `server_id`, read through a
@@ -1187,11 +1277,15 @@ impl AbstractProtectedChannels for MongoDb {
         group: &MlsGroup,
         supersedes: Option<&str>,
     ) -> Result<MlsGroupCreateOutcome> {
-        run_transaction!(self, |session| self.create_text_group_attempt(
+        let (outcome, evicted) = run_transaction!(self, |session| self.create_text_group_attempt(
             &mut session,
             group,
             supersedes
-        ))
+        ))?;
+        if let Some((call_channel_id, call_creator)) = evicted {
+            log_call_squat_evicted(group, &call_channel_id, &call_creator);
+        }
+        Ok(outcome)
     }
 
     async fn release_channel_seats_for_user(

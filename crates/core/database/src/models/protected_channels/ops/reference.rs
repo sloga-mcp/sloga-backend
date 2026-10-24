@@ -29,6 +29,7 @@ use std::collections::{BTreeSet, HashMap};
 
 use iso8601_timestamp::Timestamp;
 use revolt_result::Result;
+use sha2::{Digest, Sha256};
 
 use crate::{
     channel_seats_used, check_channel_protectable, check_text_first_generation,
@@ -44,6 +45,47 @@ use super::AbstractProtectedChannels;
 
 fn is_open_text_group_of(group: &MlsGroup, channel_id: &str) -> bool {
     group.channel_id == channel_id && group.open && group.kind == MlsGroupKind::Text
+}
+
+/// Text group id derivation context (design 0.4, WIRE FORMAT, never rename)
+const CONTEXT_TEXT_GROUP: &str = "sloga-text-group-v1";
+
+/// M9 (W3a audit), shared by both drivers: whether a Text create's id
+/// really derives from its channel and generation (design 3.1).
+///
+/// Text group ids are public and deterministic, while a Call create takes
+/// any 64-hex id on any channel its caller can call in. A Call row at the
+/// id a Text create derives is therefore a squat by construction (a random
+/// Call id equals a derived one with probability 2^-256), and
+/// `create_text_mls_group` evicts it in the same atomic unit as its insert.
+/// The database cannot see that the route checked the derivation, so the
+/// eviction is bounded here: a create naming any other id (another call's
+/// random id) keeps the `InvalidOperation` refusal and deletes nothing.
+/// This is the design 3.1 equation; delta's `routes/mls/text.rs`
+/// `text_group_id` is the route's copy, and the tests pin this one to the
+/// 5.5 vectors.
+pub(super) fn is_derived_text_group_id(group: &MlsGroup) -> bool {
+    let Some(generation) = group.generation else {
+        return false;
+    };
+    let digest = Sha256::digest(format!(
+        "{CONTEXT_TEXT_GROUP}\n{}\n{generation}",
+        group.channel_id
+    ));
+    let derived: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
+    derived == group.id
+}
+
+/// The audit line of an M9 eviction (ids only): the Text group, its
+/// channel, and the evicted Call row's channel and creator
+pub(super) fn log_call_squat_evicted(group: &MlsGroup, call_channel_id: &str, call_creator: &str) {
+    log::warn!(
+        "AUDIT mls_text_squat_evicted group={} channel={} call_channel={} call_creator={}",
+        group.id,
+        group.channel_id,
+        call_channel_id,
+        call_creator
+    );
 }
 
 /// Decision 13 (W2): every newly seated user is a member of the server
@@ -361,6 +403,9 @@ impl AbstractProtectedChannels for ReferenceDb {
     ) -> Result<MlsGroupCreateOutcome> {
         let seat_lists = self.channel_seat_lists.lock().await;
         let mut groups = self.mls_groups.lock().await;
+        // M9: a Call squat at this id goes with its commits and join intents
+        let mut commits = self.mls_commits.lock().await;
+        let mut intents = self.mls_join_intents.lock().await;
 
         let list = seat_lists.get(&group.channel_id).ok_or_else(|| {
             create_error!(FailedValidation {
@@ -398,8 +443,24 @@ impl AbstractProtectedChannels for ReferenceDb {
         }
 
         let prepared = prepare_text_group(group, list)?;
-        if groups.contains_key(&prepared.id) {
-            return Err(create_error!(InvalidOperation));
+
+        // A row already at the id: a Call squat at a derived id is evicted
+        // (M9, see `is_derived_text_group_id`) with its Call-plane
+        // dependents (the `sweep_mls_groups` cascade; KeyPackages are keyed
+        // by device, not group); any other row is refused as before
+        let evicted = match groups.get(&prepared.id) {
+            None => None,
+            Some(taken)
+                if taken.kind == MlsGroupKind::Call && is_derived_text_group_id(&prepared) =>
+            {
+                Some((taken.channel_id.clone(), taken.created_by.user_id.clone()))
+            }
+            Some(_) => return Err(create_error!(InvalidOperation)),
+        };
+        if evicted.is_some() {
+            groups.remove(&prepared.id);
+            commits.retain(|_, commit| commit.group_id != prepared.id);
+            intents.retain(|_, intent| intent.group_id != prepared.id);
         }
 
         if let Some(superseded) = supersedes.and_then(|id| groups.get_mut(id)) {
@@ -410,6 +471,10 @@ impl AbstractProtectedChannels for ReferenceDb {
             }
         }
         groups.insert(prepared.id.clone(), prepared);
+
+        if let Some((call_channel_id, call_creator)) = evicted {
+            log_call_squat_evicted(group, &call_channel_id, &call_creator);
+        }
 
         Ok(MlsGroupCreateOutcome::Created)
     }

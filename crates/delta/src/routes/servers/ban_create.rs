@@ -1,3 +1,4 @@
+use iso8601_timestamp::Timestamp;
 use revolt_database::{
     util::{
         audit_reason::sanitize_reason_text, permissions::DatabasePermissionQuery,
@@ -66,13 +67,15 @@ pub async fn ban(
     // 3. The membership is removed, if the target is a member. A ban this
     //    request created is then recorded in the audit log, before the
     //    eviction, so an eviction error cannot lose the entry.
-    // 4. The target is evicted from every call in the server, member or not.
-    // 5. Their recent messages are deleted, if asked.
+    // 4. The target's seats in the server's protected channels are released,
+    //    member or not (protected channels 6.3).
+    // 5. The target is evicted from every call in the server, member or not.
+    // 6. Their recent messages are deleted, if asked.
     //
-    // A retried ban re-runs steps 3 to 5, which is how an eviction that failed
-    // is completed: step 2 answers "already banned" as a success for that.
-    // The retry writes no second audit entry: only a ban this request
-    // created is recorded.
+    // A retried ban re-runs steps 3 to 6, which is how an eviction or a
+    // release that failed is completed: step 2 answers "already banned" as a
+    // success for that. The retry writes no second audit entry: only a ban
+    // this request created is recorded.
     let member = match target.as_member(db, &server.id).await {
         Ok(member) => Some(member),
         Err(error) if !matches!(error.error_type, ErrorType::NotFound) => return Err(error),
@@ -158,6 +161,19 @@ pub async fn ban(
         .await;
     }
 
+    // Protected channels (6.3, decision 11 (W2)): the target's seats in this
+    // server's protected channels are released (their cooldown starts) and a
+    // pending removal is added on each open Text group they are in. Under no
+    // condition: a former member can still hold a seat (a removal whose
+    // second release failed leaves one behind, and a ban is its documented
+    // repair), and an "already banned" retry runs it again. It follows the
+    // audit record, so a failed release cannot lose the entry (the retry
+    // sees no new ban). It precedes the eviction and the purge, so neither
+    // failing can skip it. Scoped by the server's entitlements, never by
+    // `server.channels`.
+    db.release_channel_seats_for_user(target.id, Some(&server.id), Timestamp::now_utc())
+        .await?;
+
     // Outside the member check (S-3 F-4): a hit-and-run spammer who already
     // left can still hold a connection. Every call in the server is reached,
     // not only the one the per-server pointer names (S-3 F-3).
@@ -182,14 +198,15 @@ mod test {
     use crate::util::test::TestHarness;
     use iso8601_timestamp::Timestamp;
     use revolt_database::{
+        seat_cooldown_until,
         voice::{
             create_voice_state, delete_channel_node, delete_channel_voice_state,
             get_user_voice_channel_in_server, get_voice_channel_members, is_in_voice_channel,
             record_voice_connection, recorded_voice_connections, set_channel_node,
             UserVoiceChannel,
         },
-        AuditLogAction, AuditLogChange, AuditLogEntry, AuditValue, Channel, Member, Message,
-        PartialMember, Server,
+        AuditLogAction, AuditLogChange, AuditLogEntry, AuditValue, Channel, ChannelSeat, Database,
+        Member, Message, PartialMember, Server,
     };
     use revolt_models::v0;
     use revolt_permissions::{ChannelPermission, OverrideField};
@@ -1225,6 +1242,336 @@ mod test {
         );
     }
 
+    // ---- protected channels: the ban releases the target's seats (6.3) -----
+    //
+    // A ban releases the target's seats in the server's protected channels
+    // whether or not the target is still a member: a removal whose second
+    // release failed leaves a former member seated, and the ban is the
+    // documented repair. For a member, `Member::remove` releases too; the
+    // former member and the retry below are what only the ban's own release
+    // reaches.
+
+    /// An ACTIVE seat row of `user_id` in `channel_id`, written straight to
+    /// the store (the seat PUT refuses to seat a non-member)
+    async fn seat_raw(db: &Database, channel_id: &str, user_id: &str) {
+        let seat = ChannelSeat {
+            id: ChannelSeat::composite_id(channel_id, user_id),
+            channel_id: channel_id.to_string(),
+            user_id: user_id.to_string(),
+            seated_at: Timestamp::now_utc(),
+            released_at: None,
+            cooldown_until: None,
+        };
+        match db {
+            Database::Reference(reference) => {
+                reference
+                    .channel_seats
+                    .lock()
+                    .await
+                    .insert(seat.id.clone(), seat);
+            }
+            Database::MongoDb(mongo) => {
+                mongo
+                    .col::<ChannelSeat>("channel_seats")
+                    .insert_one(&seat)
+                    .await
+                    .expect("raw seat");
+            }
+        }
+    }
+
+    /// `user_id`'s seat row in `channel_id`
+    async fn seat_of(db: &Database, channel_id: &str, user_id: &str) -> ChannelSeat {
+        db.fetch_channel_seats_for_user(user_id)
+            .await
+            .expect("the seats read")
+            .into_iter()
+            .find(|seat| seat.channel_id == channel_id)
+            .expect("a seat row")
+    }
+
+    /// Released as 6.3 releases a seat: no longer active, cooling now, the
+    /// cooldown running from the release
+    fn assert_released(seat: &ChannelSeat, what: &str) {
+        assert!(!seat.is_active(), "{} must be released: {:?}", what, seat);
+        let released_at = seat.released_at.expect("released above");
+        assert_eq!(
+            seat.cooldown_until,
+            Some(seat_cooldown_until(released_at).expect("a cooldown")),
+            "{what}'s cooldown starts at its release: {seat:?}"
+        );
+        assert!(
+            seat.is_cooling(Timestamp::now_utc()),
+            "{} must be cooling: {:?}",
+            what,
+            seat
+        );
+    }
+
+    // Compile-only without RabbitMQ and Redis: see the section note above.
+    #[test]
+    fn a_ban_releases_the_targets_seats_in_that_server_only() {
+        crate::util::test::rt()
+            .block_on(a_ban_releases_the_targets_seats_in_that_server_only_case())
+    }
+
+    /// A seated member is banned: their seat in the server's protected
+    /// channel is released and cooling. Their seat in another server's
+    /// protected channel, and the owner's seat, stay active. Mutations: every
+    /// release dropped (the ban's and `Member::remove`'s); the release
+    /// unscoped (`None`).
+    async fn a_ban_releases_the_targets_seats_in_that_server_only_case() {
+        let harness = TestHarness::new().await;
+        let (_a, session_a, owner) = harness.new_user().await;
+        let (_b, _session_b, target) = harness.new_user().await;
+        let protected = harness
+            .new_protected_channel(&owner, &session_a, &[&target])
+            .await;
+        let (_elsewhere, elsewhere) = harness.new_protectable_channel(&owner).await;
+        harness.grant_entitlement(&elsewhere, 10, None).await;
+        seat_raw(&harness.db, elsewhere.id(), &target.id).await;
+        assert!(
+            seat_of(&harness.db, protected.channel.id(), &target.id)
+                .await
+                .is_active(),
+            "precondition: the target is seated"
+        );
+
+        let response = ban_user(
+            &harness,
+            &session_a.token,
+            &protected.server.id,
+            &target.id,
+            "seated",
+        )
+        .await;
+        ban_answered(response, "banning a seated member").await;
+
+        assert_released(
+            &seat_of(&harness.db, protected.channel.id(), &target.id).await,
+            "the banned member's seat",
+        );
+        assert!(
+            seat_of(&harness.db, elsewhere.id(), &target.id)
+                .await
+                .is_active(),
+            "the target's seat in another server must survive the ban"
+        );
+        assert!(
+            seat_of(&harness.db, protected.channel.id(), &owner.id)
+                .await
+                .is_active(),
+            "the owner's seat must survive the ban"
+        );
+    }
+
+    // Compile-only without RabbitMQ and Redis: see the section note above.
+    #[test]
+    fn a_ban_releases_a_former_members_seat() {
+        crate::util::test::rt().block_on(a_ban_releases_a_former_members_seat_case())
+    }
+
+    /// A former member still seated (the membership gone, the seat left
+    /// behind, as by a removal whose second release failed) is banned: the
+    /// ban releases the seat with no member to remove, and records the ban.
+    /// Mutations: the ban's release dropped; the release moved inside the
+    /// member check.
+    async fn a_ban_releases_a_former_members_seat_case() {
+        let harness = TestHarness::new().await;
+        let (_a, session_a, owner) = harness.new_user().await;
+        let (_b, _session_b, target) = harness.new_user().await;
+        let protected = harness
+            .new_protected_channel(&owner, &session_a, &[&target])
+            .await;
+        let member = harness
+            .db
+            .fetch_member(&protected.server.id, &target.id)
+            .await
+            .expect("the target joined");
+        harness
+            .db
+            .soft_delete_member(&member.id)
+            .await
+            .expect("the membership removed, the seat left behind");
+        assert!(
+            harness
+                .db
+                .fetch_member(&protected.server.id, &target.id)
+                .await
+                .is_err(),
+            "precondition: the target is no longer a member"
+        );
+        assert!(
+            seat_of(&harness.db, protected.channel.id(), &target.id)
+                .await
+                .is_active(),
+            "precondition: the former member is still seated"
+        );
+
+        let response = ban_user(
+            &harness,
+            &session_a.token,
+            &protected.server.id,
+            &target.id,
+            "left",
+        )
+        .await;
+        ban_answered(response, "banning a seated former member").await;
+
+        assert_released(
+            &seat_of(&harness.db, protected.channel.id(), &target.id).await,
+            "the former member's seat",
+        );
+        let entries = audit_entries(&harness, &protected.server.id).await;
+        assert_eq!(entries.len(), 1, "one ban, one audit entry: {entries:?}");
+        ban_entry(&entries, &owner.id, &target.id);
+    }
+
+    // Compile-only without RabbitMQ and Redis: see the section note above.
+    #[test]
+    fn an_already_banned_retry_releases_again() {
+        crate::util::test::rt().block_on(an_already_banned_retry_releases_again_case())
+    }
+
+    /// A retried ban ("already banned", a success) runs the release again:
+    /// a seat in the server that is active after the first ban is released
+    /// by the retry, and the retry records no second entry. Mutations: the
+    /// ban's release dropped; the release moved inside the `newly_banned`
+    /// block or the member check.
+    async fn an_already_banned_retry_releases_again_case() {
+        let harness = TestHarness::new().await;
+        let (_a, session_a, owner) = harness.new_user().await;
+        let (_b, _session_b, target) = harness.new_user().await;
+        let protected = harness
+            .new_protected_channel(&owner, &session_a, &[&target])
+            .await;
+        let server_id = protected.server.id.clone();
+
+        let response = ban_user(&harness, &session_a.token, &server_id, &target.id, "first").await;
+        ban_answered(response, "the first ban").await;
+        assert_released(
+            &seat_of(&harness.db, protected.channel.id(), &target.id).await,
+            "the first ban's seat",
+        );
+
+        // Another protected channel of the server, the target seated there
+        // after the first ban: a seat the first ban did not reach.
+        let server = harness.db.fetch_server(&server_id).await.expect("`Server`");
+        let later = harness.new_channel(&server).await;
+        harness.grant_entitlement(&later, 10, None).await;
+        seat_raw(&harness.db, later.id(), &target.id).await;
+
+        let response = ban_user(&harness, &session_a.token, &server_id, &target.id, "second").await;
+        let ban = ban_answered(response, "banning an already banned user").await;
+        assert_eq!(ban.reason.as_deref(), Some("first"), "the existing ban");
+
+        assert_released(
+            &seat_of(&harness.db, later.id(), &target.id).await,
+            "the seat the retry reaches",
+        );
+        let entries = audit_entries(&harness, &server_id).await;
+        assert_eq!(
+            entries.len(),
+            1,
+            "an already-banned retry must write no second audit entry: {entries:?}"
+        );
+    }
+
+    // Compile-only without RabbitMQ and Redis: see the section note above.
+    #[test]
+    fn a_failed_release_answers_an_error_after_the_ban_and_its_record() {
+        crate::util::test::rt()
+            .block_on(a_failed_release_answers_an_error_after_the_ban_and_its_record_case())
+    }
+
+    /// A release that fails (an undecodable seat row) answers an error with
+    /// the ban durable and its audit entry written: the release follows the
+    /// record, so the retry, which sees no new ban, does not have to write
+    /// it. Once the row is repaired the retry releases and records nothing
+    /// more. The target was never a member, so the ban's own release is the
+    /// only one. MONGODB only: the reference store cannot hold an undecodable
+    /// row. Mutations: the release moved above the audit record; the
+    /// release's error dropped.
+    async fn a_failed_release_answers_an_error_after_the_ban_and_its_record_case() {
+        use revolt_database::mongodb::bson::{doc, Document};
+
+        let harness = TestHarness::new().await;
+        let Database::MongoDb(mongo) = &harness.db else {
+            return;
+        };
+        let (_a, session_a, owner) = harness.new_user().await;
+        let (_b, _session_b, target) = harness.new_user().await;
+        let (server, channel) = harness.new_protectable_channel(&owner).await;
+        harness.grant_entitlement(&channel, 10, None).await;
+
+        // `seated_at` is not a timestamp, so every read of the row fails
+        let seat_id = ChannelSeat::composite_id(channel.id(), &target.id);
+        mongo
+            .col::<Document>("channel_seats")
+            .insert_one(doc! {
+                "_id": &seat_id,
+                "channel_id": channel.id(),
+                "user_id": &target.id,
+                "seated_at": true,
+            })
+            .await
+            .expect("the corrupt seat row");
+        assert!(
+            harness
+                .db
+                .release_channel_seats_for_user(&target.id, Some(&server.id), Timestamp::now_utc())
+                .await
+                .is_err(),
+            "precondition: the corrupt row fails a release"
+        );
+
+        let response = ban_user(
+            &harness,
+            &session_a.token,
+            &server.id,
+            &target.id,
+            "corrupt",
+        )
+        .await;
+        assert_rejected(response, Status::InternalServerError, "DatabaseError").await;
+
+        assert!(
+            harness.db.fetch_ban(&server.id, &target.id).await.is_ok(),
+            "the ban must be durable before the release runs"
+        );
+        let entries = audit_entries(&harness, &server.id).await;
+        assert_eq!(
+            entries.len(),
+            1,
+            "the audit entry is written before the release that failed: {entries:?}"
+        );
+        assert_eq!(
+            ban_entry(&entries, &owner.id, &target.id).reason.as_deref(),
+            Some("corrupt")
+        );
+
+        // The operator repair (6.3): the row fixed, then the ban retried
+        mongo
+            .col::<Document>("channel_seats")
+            .delete_one(doc! { "_id": &seat_id })
+            .await
+            .expect("the corrupt row deleted");
+        seat_raw(&harness.db, channel.id(), &target.id).await;
+
+        let response = ban_user(&harness, &session_a.token, &server.id, &target.id, "repair").await;
+        ban_answered(response, "the retry after the repair").await;
+        assert_released(
+            &seat_of(&harness.db, channel.id(), &target.id).await,
+            "the repaired seat",
+        );
+        let entries = audit_entries(&harness, &server.id).await;
+        assert_eq!(
+            entries.len(),
+            1,
+            "the retry after the repair records no second ban: {entries:?}"
+        );
+    }
+
     // ---- the ban's order, pinned on its text (AFK S-3 P2-2) ----------------
 
     /// `ban`'s body, comment lines dropped and whitespace collapsed.
@@ -1273,20 +1620,32 @@ mod test {
     const FETCH: &str = "let ban = match db.fetch_ban(&server.id, target.id).await \u{7b}";
     const CREATE: &str = "ServerBan::create(db, &server, target.id, data.reason).await";
     const REMOVE: &str = ".remove(db, &server, RemovalIntention::Ban, false) .await?;";
+    const GUARD: &str = "if newly_banned \u{7b} AuditLogEntry::record(";
+    const RELEASE: &str = "db.release_channel_seats_for_user(target.id, Some(&server.id), \
+         Timestamp::now_utc()) .await?;";
     const EVICT: &str =
         "remove_user_from_server_voice(db, voice_client, &server, target.id).await?;";
     const PURGE: &str = "Message::bulk_delete_by_author_since(";
 
     /// AFK S-3 D-2 / P2-2: rank check, ban persisted, membership removed,
-    /// eviction, message delete, in that order, each exactly once, and the
-    /// single-pointer removal gone. Mutations: the rank check moved below the
-    /// persist; the persist moved back to the end; the eviction moved before
-    /// the membership removal or removed.
+    /// audit record, seat release (protected channels 6.3), eviction, message
+    /// delete, in that order, each exactly once, and the single-pointer
+    /// removal gone. The release follows the record (a failed release must
+    /// not lose the entry: the retry sees no new ban) and precedes the
+    /// eviction and the purge (neither failing may skip it). Mutations: the
+    /// rank check moved below the persist; the persist moved back to the end;
+    /// the eviction moved before the membership removal or removed; the
+    /// release moved above the record, below the purge, or removed.
     #[test]
     fn the_ban_runs_its_steps_in_order() {
         let body = route_body();
+        assert_eq!(
+            body.matches("release_channel_seats_for_user(").count(),
+            1,
+            "the ban releases the target's seats once: {body}"
+        );
         let mut last = 0;
-        for needle in [RANK, FETCH, CREATE, REMOVE, EVICT, PURGE] {
+        for needle in [RANK, FETCH, CREATE, REMOVE, GUARD, RELEASE, EVICT, PURGE] {
             assert_eq!(
                 body.matches(needle).count(),
                 1,
@@ -1310,9 +1669,13 @@ mod test {
     }
 
     /// AFK S-3 F-4: the eviction is a statement of the route itself, under no
-    /// condition, so a target who is not a member is evicted too. The rank
-    /// check and the membership removal are the ones under the member check.
-    /// Mutation: the eviction moved back inside the member check.
+    /// condition, so a target who is not a member is evicted too. So is the
+    /// seat release (protected channels 6.3, PA#12): a former member can
+    /// still hold a seat, and a retry ("already banned") must release again.
+    /// The rank check and the membership removal are the ones under the
+    /// member check. Mutations: the eviction moved back inside the member
+    /// check; the release moved inside the member check or the
+    /// `newly_banned` block.
     #[test]
     fn the_ban_evicts_members_and_non_members_alike() {
         let body = route_body();
@@ -1321,6 +1684,12 @@ mod test {
             depth_at(&body, at),
             1,
             "the eviction must not sit inside any block: {body}"
+        );
+        let release = body.find(RELEASE).expect("the ban releases");
+        assert_eq!(
+            depth_at(&body, release),
+            1,
+            "the seat release must not sit inside any block: {body}"
         );
         assert!(
             depth_at(&body, body.find(REMOVE).expect("the ban removes")) > 1,
@@ -1382,7 +1751,6 @@ mod test {
     fn the_ban_is_recorded_once_between_the_removal_and_the_eviction() {
         const FLAG: &str = "let mut newly_banned = false;";
         const SET: &str = "Ok(ban) => \u{7b} newly_banned = true; ban \u{7d}";
-        const GUARD: &str = "if newly_banned \u{7b} AuditLogEntry::record(";
         const ACTION: &str = "action: AuditLogAction::MemberBanAdd,";
 
         let body = route_body();

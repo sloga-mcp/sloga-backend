@@ -2345,3 +2345,637 @@ async fn a_corrupt_entitlement_of_another_channel_does_not_block_a_release() {
         assert!(seats[0].is_active(), "a failed release released nothing");
     });
 }
+
+// ---------------------------------------------------------------------------
+// M9 (b6 B47): a Call squat at a Text group's derived id is evicted
+// ---------------------------------------------------------------------------
+
+/// Section 5.5: the Text group ids of the 5.1 channel (`CHANNEL`)
+const GROUP_ID_G0: &str = "4a4ba4afc6e6ea1c9f4a271f7eded44ea860fdb814e4e1377121e02635a715b5";
+const GROUP_ID_G1: &str = "b4989a8d9b082e1668a726aa3303d3eb8b52688d340ca4dc1e0184f61fc67000";
+
+/// Design 3.1, computed here independently of the drivers
+fn derived_group_id(channel_id: &str, generation: u32) -> String {
+    hex(&Sha256::digest(format!(
+        "sloga-text-group-v1\n{channel_id}\n{generation}"
+    )))
+}
+
+/// A distinct voice channel per squat (the database does not check it;
+/// the Call route needs only call access there)
+fn call_channel(n: u32) -> String {
+    format!("01HZXVOICE{n:016}")
+}
+
+fn squatter() -> MlsMemberDevice {
+    device(USER_C, DEVICE_B)
+}
+
+/// A Call group the squatter registers at `group_id`
+fn call_group(group_id: &str, call_channel: &str) -> MlsGroup {
+    let squatter = squatter();
+    MlsGroup {
+        id: group_id.to_string(),
+        channel_id: call_channel.to_string(),
+        open: true,
+        created_by: squatter.clone(),
+        created_at: Timestamp::now_utc(),
+        current_epoch: 0,
+        members: vec![squatter],
+        closed_at: None,
+        superseded_by: None,
+        kind: MlsGroupKind::Call,
+        generation: None,
+        seat_list_ad_sha256: None,
+        pending_removals: vec![],
+        member_added: vec![],
+    }
+}
+
+fn call_commit(group_id: &str, epoch: i64) -> crate::MlsCommit {
+    crate::MlsCommit {
+        id: crate::MlsCommit::composite_id(group_id, epoch),
+        group_id: group_id.to_string(),
+        epoch,
+        committer: squatter(),
+        commit: "b3BhcXVl".to_string(),
+        size: 6,
+        added: vec![],
+        removed: vec![],
+        created_at: Timestamp::now_utc(),
+        rejoin_intents: vec![],
+    }
+}
+
+/// The squat through the REAL Call paths: the group, a won Call commit at
+/// epoch 1 and a join intent, i.e. every Call-plane row keyed by the id
+async fn squat(db: &Database, group_id: &str, call_channel: &str) {
+    assert_eq!(
+        db.create_mls_group(&call_group(group_id, call_channel), None)
+            .await
+            .unwrap(),
+        MlsGroupCreateOutcome::Created
+    );
+    assert!(matches!(
+        db.insert_mls_commit(&call_commit(group_id, 1))
+            .await
+            .unwrap(),
+        crate::MlsCommitOutcome::Won
+    ));
+    let joiner = device(USER_B, DEVICE_A2);
+    db.upsert_mls_join_intent(&crate::MlsJoinIntent {
+        id: crate::MlsJoinIntent::composite_id(group_id, &joiner.user_id, &joiner.device_id),
+        group_id: group_id.to_string(),
+        user_id: joiner.user_id,
+        device_id: joiner.device_id,
+        key_package_ref: "cmVm".to_string(),
+        signature: signature(1),
+        created_at: at(0),
+    })
+    .await
+    .unwrap();
+}
+
+/// The squat and its Call-plane rows are all still there
+async fn assert_squat_intact(db: &Database, group_id: &str, call_channel: &str, case: &str) {
+    let group = db
+        .fetch_mls_group(group_id)
+        .await
+        .unwrap_or_else(|error| panic!("{case}: the squat is gone: {error:?}"));
+    assert_eq!(group.kind, MlsGroupKind::Call, "{case}");
+    assert_eq!(group.channel_id, call_channel, "{case}");
+    assert_eq!(
+        db.fetch_mls_commits_from(group_id, 0, 10)
+            .await
+            .unwrap()
+            .len(),
+        1,
+        "{case}: the squat's commit"
+    );
+    assert_eq!(
+        db.fetch_mls_join_intents_for_group(group_id)
+            .await
+            .unwrap()
+            .len(),
+        1,
+        "{case}: the squat's join intent"
+    );
+}
+
+/// The Text group stands at `group_id`, and nothing of the squat is left
+async fn assert_text_group_replaced_the_squat(
+    db: &Database,
+    group_id: &str,
+    channel_id: &str,
+    generation: u32,
+    creator: &MlsMemberDevice,
+) {
+    let group = db.fetch_mls_group(group_id).await.unwrap();
+    assert_eq!(group.kind, MlsGroupKind::Text);
+    assert_eq!(group.channel_id, channel_id);
+    assert_eq!(group.generation, Some(generation));
+    assert!(group.open);
+    assert_eq!(group.members, vec![creator.clone()]);
+    assert!(group.seat_list_ad_sha256.is_some());
+    assert!(
+        db.fetch_mls_commits_from(group_id, 0, 10)
+            .await
+            .unwrap()
+            .is_empty(),
+        "the squat's commits went with it"
+    );
+    assert!(
+        db.fetch_mls_join_intents_for_group(group_id)
+            .await
+            .unwrap()
+            .is_empty(),
+        "the squat's join intents went with it"
+    );
+}
+
+/// A REAL Text Update commit at the next epoch of the channel's open Text
+/// group must win: no Call commit is left at that `{group}:{epoch}`
+async fn assert_text_commit_wins(db: &Database, channel_id: &str, committer: &MlsMemberDevice) {
+    let group = db
+        .fetch_seat_list_snapshot(channel_id)
+        .await
+        .unwrap()
+        .text_group
+        .expect("open Text group");
+    let epoch = group.current_epoch + 1;
+    let commit = crate::MlsCommit {
+        id: crate::MlsCommit::composite_id(&group.id, epoch),
+        group_id: group.id.clone(),
+        epoch,
+        committer: committer.clone(),
+        commit: "b3BhcXVl".to_string(),
+        size: 6,
+        added: vec![],
+        removed: vec![],
+        created_at: Timestamp::now_utc(),
+        rejoin_intents: vec![],
+    };
+    let outcome = db
+        .insert_mls_text_commit(&commit, &group.seat_list_ad_sha256.unwrap(), 0)
+        .await
+        .unwrap();
+    assert!(
+        matches!(outcome, crate::MlsCommitOutcome::Won),
+        "the Text commit at epoch {epoch} lost to a leftover row: {outcome:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_call_squat_at_the_text_group_id_no_longer_blocks_protect() {
+    database_test!(|db| async move {
+        // The squats name the 5.5 vector ids: the drivers' derivation must
+        // be the design's, or nothing is evicted
+        assert_eq!(derived_group_id(CHANNEL, 0), GROUP_ID_G0);
+        assert_eq!(derived_group_id(CHANNEL, 1), GROUP_ID_G1);
+        setup(&db, 10).await;
+        let owner = device(USER_A, DEVICE_A);
+
+        // Pre-registered before the channel is even protected
+        squat(&db, GROUP_ID_G0, &call_channel(0)).await;
+        squat(&db, GROUP_ID_G1, &call_channel(1)).await;
+
+        db.protect_channel(CHANNEL, &submit(1, &[USER_A]), at(0))
+            .await
+            .unwrap();
+        let mut first = text_group(0, &owner, 0);
+        first.id = GROUP_ID_G0.to_string();
+        assert_eq!(
+            db.create_text_mls_group(&first, None)
+                .await
+                .expect("a Call squat must not block the Text create"),
+            MlsGroupCreateOutcome::Created
+        );
+
+        assert_text_group_replaced_the_squat(&db, GROUP_ID_G0, CHANNEL, 0, &owner).await;
+        assert_text_commit_wins(&db, CHANNEL, &owner).await;
+        // A squat at another generation's id is untouched
+        assert_squat_intact(&db, GROUP_ID_G1, &call_channel(1), "generation 1").await;
+    });
+}
+
+#[tokio::test]
+async fn a_call_squat_at_a_successor_id_no_longer_blocks_supersession() {
+    database_test!(|db| async move {
+        setup(&db, 10).await;
+        let owner = device(USER_A, DEVICE_A);
+        db.protect_channel(CHANNEL, &submit(1, &[USER_A]), at(0))
+            .await
+            .unwrap();
+        let mut first = text_group(0, &owner, 0);
+        first.id = GROUP_ID_G0.to_string();
+        assert_eq!(
+            db.create_text_mls_group(&first, None).await.unwrap(),
+            MlsGroupCreateOutcome::Created
+        );
+
+        squat(&db, GROUP_ID_G1, &call_channel(1)).await;
+        let generation_2 = derived_group_id(CHANNEL, 2);
+        squat(&db, &generation_2, &call_channel(2)).await;
+
+        // A row written before `kind` existed is a Call group too (Mongo
+        // only: a Reference row always has its kind)
+        if let Database::MongoDb(mongo) = &db {
+            let result = mongo
+                .col::<bson::Document>("mls_groups")
+                .update_one(
+                    doc! { "_id": GROUP_ID_G1 },
+                    doc! { "$unset": { "kind": "" } },
+                )
+                .await
+                .unwrap();
+            assert_eq!(result.modified_count, 1, "precondition: kind removed");
+        }
+
+        let mut successor = text_group(0, &owner, 1);
+        successor.id = GROUP_ID_G1.to_string();
+        assert_eq!(
+            db.create_text_mls_group(&successor, Some(GROUP_ID_G0))
+                .await
+                .expect("a Call squat must not block the successor"),
+            MlsGroupCreateOutcome::Created
+        );
+
+        assert_text_group_replaced_the_squat(&db, GROUP_ID_G1, CHANNEL, 1, &owner).await;
+        let old = db.fetch_mls_group(GROUP_ID_G0).await.unwrap();
+        assert!(!old.open);
+        assert_eq!(old.superseded_by.as_deref(), Some(GROUP_ID_G1));
+        assert_text_commit_wins(&db, CHANNEL, &owner).await;
+        assert_squat_intact(&db, &generation_2, &call_channel(2), "generation 2").await;
+    });
+}
+
+#[tokio::test]
+async fn a_text_group_at_the_id_still_answers_as_before() {
+    database_test!(|db| async move {
+        setup(&db, 10).await;
+        let owner = device(USER_A, DEVICE_A);
+        db.protect_channel(CHANNEL, &submit(1, &[USER_A]), at(0))
+            .await
+            .unwrap();
+        let mut first = text_group(0, &owner, 0);
+        first.id = GROUP_ID_G0.to_string();
+        assert_eq!(
+            db.create_text_mls_group(&first, None).await.unwrap(),
+            MlsGroupCreateOutcome::Created
+        );
+
+        // The channel's own open Text group: `Conflict`, as before
+        assert_eq!(
+            db.create_text_mls_group(&first, None).await.unwrap(),
+            MlsGroupCreateOutcome::Conflict {
+                open_group_id: GROUP_ID_G0.to_string(),
+                channel_id: CHANNEL.to_string(),
+            }
+        );
+
+        // Another channel's Text group at the id (the database does not
+        // derive Text ids, the route does): refused, and left as it was
+        let other = race_channel(7_000);
+        let holder = race_channel(7_001);
+        protected_in(&db, &other, 10).await;
+        protected_in(&db, &holder, 10).await;
+        let taken_id = derived_group_id(&other, 0);
+        let mut holding = text_group(0, &owner, 0);
+        holding.id = taken_id.clone();
+        holding.channel_id = holder.clone();
+        assert_eq!(
+            db.create_text_mls_group(&holding, None).await.unwrap(),
+            MlsGroupCreateOutcome::Created
+        );
+
+        let mut wanted = text_group(0, &owner, 0);
+        wanted.id = taken_id.clone();
+        wanted.channel_id = other.clone();
+        let error = db.create_text_mls_group(&wanted, None).await.unwrap_err();
+        assert!(is_invalid_operation(&error), "{error:?}");
+        let kept = db.fetch_mls_group(&taken_id).await.unwrap();
+        assert_eq!(kept.kind, MlsGroupKind::Text);
+        assert_eq!(kept.channel_id, holder);
+        assert!(kept.open);
+        assert!(db
+            .fetch_seat_list_snapshot(&other)
+            .await
+            .unwrap()
+            .text_group
+            .is_none());
+    });
+}
+
+#[tokio::test]
+async fn a_refused_text_create_leaves_a_call_squat_untouched() {
+    database_test!(|db| async move {
+        setup(&db, 10).await;
+        let owner = device(USER_A, DEVICE_A);
+        squat(&db, GROUP_ID_G0, &call_channel(0)).await;
+        let mut first = text_group(0, &owner, 0);
+        first.id = GROUP_ID_G0.to_string();
+
+        // No seat list yet
+        let error = db.create_text_mls_group(&first, None).await.unwrap_err();
+        assert!(is_failed_validation(&error), "{error:?}");
+        assert_squat_intact(&db, GROUP_ID_G0, &call_channel(0), "no seat list").await;
+
+        db.protect_channel(CHANNEL, &submit(1, &[USER_A]), at(0))
+            .await
+            .unwrap();
+
+        // Not the signer device
+        let mut other_device = text_group(0, &device(USER_A, DEVICE_A2), 0);
+        other_device.id = GROUP_ID_G0.to_string();
+        let error = db
+            .create_text_mls_group(&other_device, None)
+            .await
+            .unwrap_err();
+        assert!(is_failed_validation(&error), "{error:?}");
+        assert_squat_intact(&db, GROUP_ID_G0, &call_channel(0), "not the signer").await;
+
+        // The signer's create then lands
+        assert_eq!(
+            db.create_text_mls_group(&first, None).await.unwrap(),
+            MlsGroupCreateOutcome::Created
+        );
+        assert_text_group_replaced_the_squat(&db, GROUP_ID_G0, CHANNEL, 0, &owner).await;
+    });
+}
+
+#[tokio::test]
+async fn a_call_group_at_an_id_the_create_does_not_derive_is_never_evicted() {
+    database_test!(|db| async move {
+        setup(&db, 10).await;
+        let owner = device(USER_A, DEVICE_A);
+        db.protect_channel(CHANNEL, &submit(1, &[USER_A]), at(0))
+            .await
+            .unwrap();
+
+        // A random id, another generation's id, another channel's id: none
+        // is this generation-0 create's own id, so another call's group
+        // there is never deleted
+        let cases = [
+            ("a random id", "ab".repeat(32)),
+            ("generation 1's id", GROUP_ID_G1.to_string()),
+            (
+                "another channel's id",
+                derived_group_id(&race_channel(7_100), 0),
+            ),
+        ];
+        for (n, (case, group_id)) in cases.iter().enumerate() {
+            squat(&db, group_id, &call_channel(n as u32)).await;
+            let mut naming = text_group(0, &owner, 0);
+            naming.id = group_id.clone();
+            let error = db.create_text_mls_group(&naming, None).await.unwrap_err();
+            assert!(is_invalid_operation(&error), "{case}: {error:?}");
+            assert_squat_intact(&db, group_id, &call_channel(n as u32), case).await;
+        }
+    });
+}
+
+/// The squatter re-registering its Call group at `group_id` as fast as it
+/// can until `stop`, counting its attempts
+async fn resquat_loop(
+    db: &Database,
+    group_id: &str,
+    call_channel: &str,
+    stop: &AtomicBool,
+    attempts: &AtomicI64,
+) {
+    while !stop.load(SeqCst) {
+        let _ = db
+            .create_mls_group(&call_group(group_id, call_channel), None)
+            .await;
+        attempts.fetch_add(1, SeqCst);
+        tokio::task::yield_now().await;
+    }
+}
+
+#[tokio::test]
+async fn a_text_create_racing_a_resquat_still_lands() {
+    database_test!(|db| async move {
+        // Under REFERENCE the create holds every lock it needs at once, so
+        // this is structural; the eviction's atomicity against a squatter
+        // that re-registers in between is exercised under MONGODB
+        server_ready(&db).await;
+        let owner = device(USER_A, DEVICE_A);
+        for iteration in 0..RACE_ITERATIONS {
+            let channel_id = race_channel(8_000 + iteration);
+            protected_in(&db, &channel_id, 10).await;
+            let group_id = derived_group_id(&channel_id, 0);
+            let call_channel = call_channel(100 + iteration);
+            squat(&db, &group_id, &call_channel).await;
+
+            let mut group = text_group(0, &owner, 0);
+            group.id = group_id.clone();
+            group.channel_id = channel_id.clone();
+            let stop = AtomicBool::new(false);
+            let attempts = AtomicI64::new(0);
+            let create = async {
+                // Fire the create only once the squatter is live
+                let live = wait_until(|| attempts.load(SeqCst) >= 1).await;
+                let created = db.create_text_mls_group(&group, None).await;
+                stop.store(true, SeqCst);
+                (live, created)
+            };
+            let ((live, created), ()) = tokio::join!(
+                create,
+                resquat_loop(&db, &group_id, &call_channel, &stop, &attempts)
+            );
+
+            assert!(live, "iteration {iteration}: the squatter never went live");
+            assert_eq!(
+                created.unwrap_or_else(|error| panic!(
+                    "iteration {iteration}: the Text create was refused: {error:?}"
+                )),
+                MlsGroupCreateOutcome::Created
+            );
+            let stored = db.fetch_mls_group(&group_id).await.unwrap();
+            assert_eq!(stored.kind, MlsGroupKind::Text, "iteration {iteration}");
+            assert_eq!(stored.channel_id, channel_id, "iteration {iteration}");
+        }
+    });
+}
+
+/// The squatter streaming REAL Call commits on its squat, one epoch after
+/// the other, until `stop`; counts the wins
+async fn call_commit_stream(db: &Database, group_id: &str, stop: &AtomicBool, won: &AtomicI64) {
+    while !stop.load(SeqCst) {
+        if let Ok(group) = db.fetch_mls_group(group_id).await {
+            if group.kind == MlsGroupKind::Call {
+                let commit = call_commit(group_id, group.current_epoch + 1);
+                if let Ok(crate::MlsCommitOutcome::Won) = db.insert_mls_commit(&commit).await {
+                    won.fetch_add(1, SeqCst);
+                }
+            }
+        }
+        tokio::task::yield_now().await;
+    }
+}
+
+/// Rounds of the commit-stream test (each a fresh channel)
+const SQUAT_STREAM_ROUNDS: u32 = 8;
+
+#[tokio::test]
+async fn a_text_create_lands_while_the_squat_streams_call_commits() {
+    database_test!(|db| async move {
+        server_ready(&db).await;
+        let owner = device(USER_A, DEVICE_A);
+        for round in 0..SQUAT_STREAM_ROUNDS {
+            let channel_id = race_channel(9_000 + round);
+            protected_in(&db, &channel_id, 10).await;
+            let group_id = derived_group_id(&channel_id, 0);
+            squat(&db, &group_id, &call_channel(200 + round)).await;
+
+            let mut group = text_group(0, &owner, 0);
+            group.id = group_id.clone();
+            group.channel_id = channel_id.clone();
+            let stop = AtomicBool::new(false);
+            let won = AtomicI64::new(0);
+            let create = async {
+                let live = wait_until(|| won.load(SeqCst) >= 2).await;
+                let created = db.create_text_mls_group(&group, None).await;
+                stop.store(true, SeqCst);
+                (live, created)
+            };
+            let ((live, created), ()) =
+                tokio::join!(create, call_commit_stream(&db, &group_id, &stop, &won));
+
+            assert!(live, "round {round}: the commit stream never went live");
+            assert_eq!(
+                created.unwrap_or_else(|error| panic!(
+                    "round {round}: the Text create never landed: {error:?}"
+                )),
+                MlsGroupCreateOutcome::Created
+            );
+            let stored = db.fetch_mls_group(&group_id).await.unwrap();
+            assert_eq!(stored.kind, MlsGroupKind::Text, "round {round}");
+
+            // Not asserted (a residual outside this driver): a Call commit
+            // that read its group before the eviction committed is still
+            // inserted after it, since the Call commit path is not one
+            // transaction
+            let left = db
+                .fetch_mls_commits_from(&group_id, 0, 1_000)
+                .await
+                .unwrap()
+                .len();
+            if left > 0 {
+                eprintln!(
+                    "NOTE round {round}: {left} Call commit row(s) landed at the evicted id after the eviction"
+                );
+            }
+        }
+    });
+}
+
+/// What the Mongo Text create runs mid-transaction (test-only, see
+/// `run_text_create_hook`)
+type TextCreateHook =
+    std::sync::Arc<dyn Fn() -> futures::future::BoxFuture<'static, ()> + Send + Sync>;
+
+/// The group id the hook fires for, and the hook. Keyed by id, so the
+/// tests running beside the one that sets it are never affected.
+static TEXT_CREATE_HOOK: std::sync::Mutex<Option<(String, TextCreateHook)>> =
+    std::sync::Mutex::new(None);
+
+/// Called by the Mongo Text create (`ops/mongodb.rs`, `#[cfg(test)]` only)
+/// inside every transaction attempt, once the attempt's snapshot is fixed
+/// and before it reads and evicts the row at its id
+pub(super) async fn run_text_create_hook(group_id: &str) {
+    let hook = TEXT_CREATE_HOOK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .as_ref()
+        .filter(|(id, _)| id == group_id)
+        .map(|(_, hook)| hook.clone());
+    if let Some(hook) = hook {
+        hook().await;
+    }
+}
+
+/// How long the squatter's mid-transaction write may wait before the
+/// create goes on without it
+const SQUAT_WRITE_WAIT_MS: u64 = 300;
+
+#[tokio::test]
+async fn a_text_create_claims_the_squat_row_before_the_squatter_can_starve_it() {
+    database_test!(|db| async move {
+        // MONGODB only (under REFERENCE the create holds every lock it
+        // needs at once). The create's FIRST operation writes the squat's
+        // row (`claim_groups_first`), so a squatter writing that row while
+        // the create is in flight (a won Call commit's effects update) waits
+        // for the create's transaction. Without the claim the row is first
+        // written by the eviction's delete, after the snapshot, so a write
+        // landing in between write-conflicts the attempt, and a squatter
+        // that does it on every attempt starves the create until the retry
+        // budget runs out. The hook is that squatter, made deterministic.
+        let Database::MongoDb(mongo) = &db else {
+            return;
+        };
+        server_ready(&db).await;
+        let owner = device(USER_A, DEVICE_A);
+        let channel_id = race_channel(9_500);
+        protected_in(&db, &channel_id, 10).await;
+        let group_id = derived_group_id(&channel_id, 0);
+        squat(&db, &group_id, &call_channel(300)).await;
+
+        let fired = std::sync::Arc::new(AtomicI64::new(0));
+        let landed = std::sync::Arc::new(AtomicI64::new(0));
+        let hook: TextCreateHook = {
+            let (mongo, group_id) = (mongo.clone(), group_id.clone());
+            let (fired, landed) = (fired.clone(), landed.clone());
+            std::sync::Arc::new(move || {
+                let (mongo, group_id) = (mongo.clone(), group_id.clone());
+                let (fired, landed) = (fired.clone(), landed.clone());
+                Box::pin(async move {
+                    fired.fetch_add(1, SeqCst);
+                    // Outside any transaction, filtered on the Call kind (a
+                    // Call commit never writes a Text group)
+                    let write = async {
+                        mongo
+                            .col::<bson::Document>("mls_groups")
+                            .update_one(
+                                doc! { "_id": &group_id, "kind": "Call" },
+                                doc! { "$inc": { "squat_writes": 1_i64 } },
+                            )
+                            .await
+                    };
+                    let waited = std::time::Duration::from_millis(SQUAT_WRITE_WAIT_MS);
+                    if let Ok(Ok(result)) = tokio::time::timeout(waited, write).await {
+                        if result.modified_count == 1 {
+                            landed.fetch_add(1, SeqCst);
+                        }
+                    }
+                })
+            })
+        };
+        *TEXT_CREATE_HOOK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some((group_id.clone(), hook));
+
+        let mut group = text_group(0, &owner, 0);
+        group.id = group_id.clone();
+        group.channel_id = channel_id.clone();
+        let created = db.create_text_mls_group(&group, None).await;
+        *TEXT_CREATE_HOOK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+
+        let (fired, landed) = (fired.load(SeqCst), landed.load(SeqCst));
+        assert_eq!(
+            created.unwrap_or_else(|error| panic!(
+                "the squatter starved the Text create ({fired} attempts, its write \
+                 landed mid-transaction {landed} times): {error:?}"
+            )),
+            MlsGroupCreateOutcome::Created
+        );
+        assert!(fired >= 1, "the hook never ran: the test proves nothing");
+        assert_eq!(
+            landed, 0,
+            "the squatter's write landed while the create's transaction was open"
+        );
+        assert_text_group_replaced_the_squat(&db, &group_id, &channel_id, 0, &owner).await;
+    });
+}
