@@ -258,7 +258,7 @@ async fn full_flow_create_join_commit_fanout_case() {
                 // guard compares this against its route-truth channel (H2)
                 assert_eq!(channel_id, channel.id().to_string());
             }
-            other => panic!("expected conflict body, got {other:?}"),
+            other => panic!("expected conflict body, got {:?}", other),
         }
     }
 
@@ -322,7 +322,7 @@ async fn full_flow_create_join_commit_fanout_case() {
     assert_eq!(body.results.len(), 1);
     match &body.results[0].status {
         v0::MlsClaimStatus::Claimed { reused, .. } => assert!(!*reused),
-        other => panic!("expected claim, got {other:?}"),
+        other => panic!("expected claim, got {:?}", other),
     }
 
     // A commits epoch 1 adding B, with a Welcome
@@ -390,7 +390,7 @@ async fn full_flow_create_join_commit_fanout_case() {
                 STANDARD_NO_PAD.encode(b"commit one".as_slice())
             );
         }
-        other => panic!("expected lost body, got {other:?}"),
+        other => panic!("expected lost body, got {:?}", other),
     }
 
     // B (now a member) commits epoch 2 removing itself — commit envelope
@@ -694,7 +694,7 @@ fn dual_reload_rejoin_closes_group() {
 }
 
 async fn dual_reload_rejoin_closes_group_case() {
-    let mut harness = TestHarness::new().await;
+    let harness = TestHarness::new().await;
     let (account_a, session_a, user_a) = harness.new_user().await;
     let (account_b, session_b, user_b) = harness.new_user().await;
 
@@ -1525,26 +1525,30 @@ async fn fanout_skips_devices_over_queue_budget_case() {
     // Pre-fill B's queue past the BYTE budget (three 11 MiB envelopes >
     // 32 MiB — inserted at the DB layer; route caps do not apply to the
     // budget seed, that is the point of the budget)
+    // Built from the stored shape, naming only the fields it sets, so every
+    // optional MLS field (all serde-defaulted) is absent: a plain Olm row
     let envelopes: Vec<E2EEEnvelope> = (0..3)
-        .map(|_| E2EEEnvelope {
-            id: Ulid::new().to_string(),
-            recipient_user_id: user_b.id.clone(),
-            recipient_device_id: device_b.device.device_id.clone(),
-            sender_user_id: user_a.id.clone(),
-            sender_device_id: device_a.device.device_id.clone(),
-            protocol_version: E2EE_PROTOCOL_VERSION,
-            sequence: 0,
-            ciphertext: "A".repeat(11 * 1024 * 1024),
-            timestamp: iso8601_timestamp::Timestamp::now_utc(),
-            content_type: E2EEContentType::Olm,
-            group_id: None,
-            epoch: None,
-            committer: None,
-            added: vec![],
-            removed: vec![],
-            rejoin_intents: vec![],
+        .map(|_| {
+            serde_json::from_value(serde_json::json!({
+                "_id": Ulid::new().to_string(),
+                "recipient_user_id": user_b.id,
+                "recipient_device_id": device_b.device.device_id,
+                "sender_user_id": user_a.id,
+                "sender_device_id": device_a.device.device_id,
+                "protocol_version": E2EE_PROTOCOL_VERSION,
+                "sequence": 0,
+                "ciphertext": "A".repeat(11 * 1024 * 1024),
+                "timestamp": iso8601_timestamp::Timestamp::now_utc(),
+                "content_type": "olm",
+            }))
+            .expect("an Olm envelope")
         })
         .collect();
+    assert!(envelopes.iter().all(|envelope| {
+        matches!(envelope.content_type, E2EEContentType::Olm)
+            && envelope.group_id.is_none()
+            && envelope.epoch.is_none()
+    }));
     harness.db.insert_e2ee_envelopes(&envelopes).await.unwrap();
 
     // A's commit adding B: the Welcome for B is SKIPPED (budget), loudly
@@ -1881,25 +1885,31 @@ async fn join_intent_call_full_boundary_and_rejoin_exemption_case() {
             device_id: format!("{index:032x}"),
         })
         .collect();
-    let outcome = harness
+    // The epoch-2 row is the stored epoch-1 row with its fields replaced, so
+    // the seed names no field it does not set (a new optional commit field
+    // keeps the epoch-1 row's value: empty on a Call commit)
+    let mut seed = harness
         .db
-        .insert_mls_commit(&revolt_database::MlsCommit {
-            id: revolt_database::MlsCommit::composite_id(&gid, 2),
-            group_id: gid.clone(),
-            epoch: 2,
-            committer: revolt_database::MlsMemberDevice {
-                user_id: user_a.id.clone(),
-                device_id: device_a.device.device_id.clone(),
-            },
-            commit: STANDARD_NO_PAD.encode(b"seed commit"),
-            size: 16,
-            added: synthetic,
-            removed: vec![],
-            created_at: iso8601_timestamp::Timestamp::now_utc(),
-            rejoin_intents: vec![],
-        })
+        .fetch_mls_commits_from(&gid, 1, 1)
         .await
-        .unwrap();
+        .unwrap()
+        .into_iter()
+        .find(|row| row.epoch == 1)
+        .expect("the epoch-1 seed commit");
+    seed.id = revolt_database::MlsCommit::composite_id(&gid, 2);
+    seed.group_id = gid.clone();
+    seed.epoch = 2;
+    seed.committer = revolt_database::MlsMemberDevice {
+        user_id: user_a.id.clone(),
+        device_id: device_a.device.device_id.clone(),
+    };
+    seed.commit = STANDARD_NO_PAD.encode(b"seed commit");
+    seed.size = 16;
+    seed.added = synthetic;
+    seed.removed = vec![];
+    seed.created_at = iso8601_timestamp::Timestamp::now_utc();
+    seed.rejoin_intents = vec![];
+    let outcome = harness.db.insert_mls_commit(&seed).await.unwrap();
     assert!(
         matches!(outcome, revolt_database::MlsCommitOutcome::Won),
         "db-layer roster seed must win epoch 2"
@@ -1966,6 +1976,56 @@ fn flag_off_rejects_every_route() {
     crate::util::test::rt().block_on(flag_off_rejects_every_route_case())
 }
 
+/// A route's whole answer, status and JSON body. Error bodies no longer
+/// carry `location` (upstream 2e8bf9d7), so this is (type, status, body).
+async fn whole_answer(
+    response: rocket::local::asynchronous::LocalResponse<'_>,
+) -> (Status, serde_json::Value) {
+    let status = response.status();
+    let text = response.into_string().await.unwrap_or_default();
+    let body = if text.is_empty() {
+        serde_json::Value::Null
+    } else {
+        serde_json::from_str(&text).unwrap_or(serde_json::Value::String(text))
+    };
+    (status, body)
+}
+
+/// The exact `FeatureDisabled { feature }` answer
+fn feature_disabled(feature: &str) -> (Status, serde_json::Value) {
+    (
+        Status::BadRequest,
+        serde_json::json!({ "type": "FeatureDisabled", "feature": feature }),
+    )
+}
+
+/// A Text commit framed as a client frames it (design §3.12.2): the MLS
+/// prefix for `group_id` at `epoch - 1`, the AD, then opaque bytes
+fn framed_text_commit(group_id: &str, epoch: i64, ad: &[u8]) -> String {
+    let mut bytes = vec![0x00, 0x01, 0x00, 0x02, 0x20];
+    for index in 0..32 {
+        bytes.push(u8::from_str_radix(&group_id[index * 2..index * 2 + 2], 16).expect("hex"));
+    }
+    bytes.extend_from_slice(&((epoch - 1) as u64).to_be_bytes());
+    bytes.push(0x03);
+    if ad.len() < 0x40 {
+        bytes.push(ad.len() as u8);
+    } else {
+        bytes.push(0x40 | (ad.len() >> 8) as u8);
+        bytes.push((ad.len() & 0xff) as u8);
+    }
+    bytes.extend_from_slice(ad);
+    bytes.extend_from_slice(b"opaque private message content");
+    STANDARD_NO_PAD.encode(bytes)
+}
+
+/// Media E2EE AND protected-channel growth off, E2EE on. Every Call route
+/// and every unknown group id answers `FeatureDisabled { media_e2ee }`.
+/// Every Text growth route (Text create, join intent, KeyPackage claim, an
+/// Add commit) answers `FeatureDisabled { protected_channels }` to a seated,
+/// session-bound viewer; the Text maintenance routes (text group read,
+/// Update commit, commit fetch) still work, and the Text send refusal is
+/// unchanged (decisions 3 and 5 (W2)). Each answer is compared whole.
 async fn flag_off_rejects_every_route_case() {
     // overwrite_config is once-per-process and must run BEFORE the harness
     // primes the config cache (the create_account.rs test convention) —
@@ -1973,17 +2033,26 @@ async fn flag_off_rejects_every_route_case() {
     // test must run in its own process (e.g. filtered alone)
     revolt_config::overwrite_config(|settings| {
         settings.features.media_e2ee_enabled = false;
+        settings.features.protected_channels.enabled = false;
     })
     .await;
+    assert!(
+        revolt_config::config().await.features.e2ee_enabled,
+        "the Text plane's maintenance gate must stay open for this test"
+    );
 
     let harness = TestHarness::new().await;
     let (_account, session, _user) = harness.new_user().await;
+
+    // --- The Call plane and unknown group ids: the media gate answers ---
 
     // Bodies must deserialize (a malformed body is 422 before the handler
     // runs); the flag check must then fire FIRST in every handler
     let gid = group_id(1);
     let device = "aa".repeat(16);
 
+    // Publish needs `e2ee && (media || protected)`: with both planes off it
+    // is the media gate's own answer
     let response = harness
         .client
         .put("/mls/key_packages")
@@ -1994,7 +2063,11 @@ async fn flag_off_rejects_every_route_case() {
         ))
         .dispatch()
         .await;
-    assert_eq!(response.status(), Status::BadRequest);
+    assert_eq!(
+        whole_answer(response).await,
+        feature_disabled("media_e2ee"),
+        "publish"
+    );
 
     for (uri, body) in [
         (
@@ -2020,8 +2093,12 @@ async fn flag_off_rejects_every_route_case() {
             format!(r#"{{"device_id":"{device}","ciphertext":"a"}}"#),
         ),
     ] {
-        let response = post_json(&harness, &session, uri, body).await;
-        assert_eq!(response.status(), Status::BadRequest);
+        let response = post_json(&harness, &session, uri.clone(), body).await;
+        assert_eq!(
+            whole_answer(response).await,
+            feature_disabled("media_e2ee"),
+            "{uri}"
+        );
     }
 
     // The open-group probe (GET) is flag-gated too
@@ -2031,7 +2108,11 @@ async fn flag_off_rejects_every_route_case() {
         .header(Header::new("x-session-token", session.token.clone()))
         .dispatch()
         .await;
-    assert_eq!(response.status(), Status::BadRequest);
+    assert_eq!(
+        whole_answer(response).await,
+        feature_disabled("media_e2ee"),
+        "open group"
+    );
 
     let response = harness
         .client
@@ -2039,5 +2120,159 @@ async fn flag_off_rejects_every_route_case() {
         .header(Header::new("x-session-token", session.token.clone()))
         .dispatch()
         .await;
-    assert_eq!(response.status(), Status::BadRequest);
+    assert_eq!(
+        whole_answer(response).await,
+        feature_disabled("media_e2ee"),
+        "commit fetch"
+    );
+
+    // --- The Text plane: a seated owner, its device bound to its session ---
+
+    let (_account_owner, session_owner, owner) = harness.new_user().await;
+    let protected = harness
+        .new_protected_channel(&owner, &session_owner, &[])
+        .await;
+    let owner_device = &protected.owner_device;
+    let channel_id = protected.channel.id().to_string();
+    let text = harness
+        .new_text_group(&protected.channel, owner_device, 0, None)
+        .await;
+    let ad = harness
+        .db
+        .fetch_seat_list(&channel_id)
+        .await
+        .expect("seat list read")
+        .expect("a seat list")
+        .commit_ad()
+        .expect("commit ad");
+    let owner_member = v0::MlsMemberDevice {
+        user_id: owner.id.clone(),
+        device_id: owner_device.device_id.clone(),
+    };
+
+    // Growth: every request is valid up to the gate, so the gate answers
+    for (case, uri, body) in [
+        (
+            "text create",
+            "/mls/groups".to_string(),
+            serde_json::to_string(&v0::DataCreateMlsGroup {
+                group_id: text.id.clone(),
+                channel_id: channel_id.clone(),
+                device_id: owner_device.device_id.clone(),
+                supersedes: None,
+                kind: Some(v0::MlsGroupKind::Text),
+                generation: Some(0),
+            })
+            .unwrap(),
+        ),
+        (
+            "text join intent",
+            format!("/mls/groups/{}/join_intent", text.id),
+            serde_json::to_string(&v0::DataMlsJoinIntent {
+                device_id: owner_device.device_id.clone(),
+                key_package_ref: "a".to_string(),
+                signature: "a".to_string(),
+            })
+            .unwrap(),
+        ),
+        (
+            "text key package claim",
+            "/mls/key_packages/claim".to_string(),
+            serde_json::to_string(&v0::DataClaimMlsKeyPackages {
+                device_id: owner_device.device_id.clone(),
+                group_id: text.id.clone(),
+                targets: vec![owner_member.clone()],
+            })
+            .unwrap(),
+        ),
+        (
+            "text add commit",
+            format!("/mls/groups/{}/commits", text.id),
+            serde_json::to_string(&v0::DataSubmitMlsCommit {
+                device_id: owner_device.device_id.clone(),
+                epoch: 1,
+                commit: framed_text_commit(&text.id, 1, &ad),
+                welcome: Some(STANDARD_NO_PAD.encode(b"opaque welcome")),
+                added: vec![owner_member.clone()],
+                removed: vec![],
+            })
+            .unwrap(),
+        ),
+    ] {
+        let response = post_json(&harness, &session_owner, uri, body).await;
+        assert_eq!(
+            whole_answer(response).await,
+            feature_disabled("protected_channels"),
+            "{case}"
+        );
+    }
+
+    // Maintenance: the growth flag never stops these (decision 5 (W2))
+    let response = harness
+        .client
+        .get(format!("/mls/channels/{channel_id}/text_group"))
+        .header(Header::new("x-session-token", session_owner.token.clone()))
+        .dispatch()
+        .await;
+    let (status, body) = whole_answer(response).await;
+    assert_eq!(status, Status::Ok, "text group read: {body}");
+    assert_eq!(body["group_id"], text.id.as_str(), "text group read");
+
+    // An Update commit (no Adds) wins with growth off; the refused Add
+    // above stored nothing, so epoch 1 is still free
+    let response = post_json(
+        &harness,
+        &session_owner,
+        format!("/mls/groups/{}/commits", text.id),
+        serde_json::to_string(&v0::DataSubmitMlsCommit {
+            device_id: owner_device.device_id.clone(),
+            epoch: 1,
+            commit: framed_text_commit(&text.id, 1, &ad),
+            welcome: None,
+            added: vec![],
+            removed: vec![],
+        })
+        .unwrap(),
+    )
+    .await;
+    assert_eq!(
+        whole_answer(response).await,
+        (Status::Ok, serde_json::json!({ "result": "Won" })),
+        "text update commit"
+    );
+
+    let response = harness
+        .client
+        .get(format!("/mls/groups/{}/commits?from_epoch=0", text.id))
+        .header(Header::new("x-session-token", session_owner.token.clone()))
+        .dispatch()
+        .await;
+    let (status, body) = whole_answer(response).await;
+    assert_eq!(status, Status::Ok, "text commit fetch: {body}");
+    assert_eq!(
+        body["commits"].as_array().map(Vec::len),
+        Some(1),
+        "text commit fetch: {body}"
+    );
+
+    // The Text send refusal is the same with every flag (B6)
+    let response = post_json(
+        &harness,
+        &session_owner,
+        format!("/mls/groups/{}/messages", text.id),
+        serde_json::to_string(&v0::DataSendMlsMessage {
+            device_id: owner_device.device_id.clone(),
+            ciphertext: STANDARD_NO_PAD.encode(b"opaque ctl"),
+        })
+        .unwrap(),
+    )
+    .await;
+    assert_eq!(
+        whole_answer(response).await,
+        (
+            Status::BadRequest,
+            serde_json::json!({ "type": "InvalidOperation" })
+        ),
+        "text send"
+    );
 }

@@ -198,6 +198,42 @@ auto_derived!(
 );
 
 auto_derived!(
+    /// Which Remove rule (design §3.12.2) admitted a removed device of a
+    /// Text commit, as the route found it. Stored and served snake_case.
+    /// ADVISORY ONLY: it never changes admission, and receivers decide from
+    /// signed material (the server is untrusted)
+    #[derive(Copy, Hash)]
+    #[serde(rename_all = "snake_case")]
+    pub enum MlsRemovalReason {
+        /// Rule 2: the committer's own user
+        OwnUser,
+        /// Rule 3: the device's user is pending removal
+        PendingRemoval,
+        /// Rule 5: the device's user is off the newest seat list and the
+        /// committer is the list signer's device
+        OffList,
+        /// Rule 4: the device has no registered identity
+        Revoked,
+        /// Rule 6: the device's own outstanding rejoin intent
+        Rejoin,
+    }
+);
+
+auto_derived!(
+    /// The advisory reason for one device a Text commit removed: the
+    /// STRONGEST rule that admitted it (`pending_removal` > `off_list` >
+    /// `revoked` > `own_user` > `rejoin`)
+    pub struct MlsRemovedReason {
+        /// Removed user
+        pub user_id: String,
+        /// Removed device
+        pub device_id: String,
+        /// The strongest admitting rule
+        pub reason: MlsRemovalReason,
+    }
+);
+
+auto_derived!(
     /// An MLS group registered with the delivery service: a per-call media
     /// group (`kind: Call`) or a protected text channel group (`kind: Text`).
     ///
@@ -343,6 +379,12 @@ auto_derived!(
         /// Call commits.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         pub rejoin_intents: Vec<MlsJoinIntent>,
+        /// Text only: one advisory reason per removed device, stamped by
+        /// the submit route (B48). Never read for admission; always empty
+        /// on Call commits, so a Call row keeps its earlier shape, and a row
+        /// written before the field existed reads as empty.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub removed_reasons: Vec<MlsRemovedReason>,
     }
 );
 
@@ -421,3 +463,69 @@ auto_derived!(
         },
     }
 );
+
+#[cfg(test)]
+mod removed_reasons_shape_tests {
+    use iso8601_timestamp::Timestamp;
+
+    use super::{MlsCommit, MlsMemberDevice, MlsRemovalReason, MlsRemovedReason};
+
+    fn device(user_id: &str, fill: &str) -> MlsMemberDevice {
+        MlsMemberDevice {
+            user_id: user_id.to_string(),
+            device_id: fill.repeat(32),
+        }
+    }
+
+    fn call_row() -> MlsCommit {
+        let group_id = format!("{}1", "0".repeat(63));
+        MlsCommit {
+            id: MlsCommit::composite_id(&group_id, 2),
+            group_id,
+            epoch: 2,
+            committer: device("01JA00000000000000000USERA", "a"),
+            commit: "Y29tbWl0".to_string(),
+            size: 6,
+            added: vec![],
+            removed: vec![device("01JA00000000000000000USERB", "b")],
+            created_at: Timestamp::UNIX_EPOCH,
+            rejoin_intents: vec![],
+            removed_reasons: vec![],
+        }
+    }
+
+    /// B48: a row without reasons (every Call row) stores no
+    /// `removed_reasons` key; a Text row stores them snake_case; a row
+    /// written before the field existed reads as empty
+    #[test]
+    fn removed_reasons_are_stored_only_when_present() {
+        let call = call_row();
+        let document = bson::to_document(&call).unwrap();
+        assert!(!document.contains_key("removed_reasons"));
+        assert_eq!(bson::from_document::<MlsCommit>(document).unwrap(), call);
+
+        let text = MlsCommit {
+            removed_reasons: vec![MlsRemovedReason {
+                user_id: "01JA00000000000000000USERB".to_string(),
+                device_id: "b".repeat(32),
+                reason: MlsRemovalReason::PendingRemoval,
+            }],
+            ..call_row()
+        };
+        let mut document = bson::to_document(&text).unwrap();
+        let stored = document
+            .get_array("removed_reasons")
+            .expect("the reasons are stored");
+        assert_eq!(
+            stored[0].as_document().unwrap().get_str("reason").unwrap(),
+            "pending_removal"
+        );
+        assert_eq!(
+            bson::from_document::<MlsCommit>(document.clone()).unwrap(),
+            text
+        );
+
+        assert!(document.remove("removed_reasons").is_some());
+        assert_eq!(bson::from_document::<MlsCommit>(document).unwrap(), call);
+    }
+}

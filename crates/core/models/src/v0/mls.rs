@@ -136,6 +136,37 @@ auto_derived!(
         pub signature: String,
     }
 
+    /// Which Remove rule (protected channels design §3.12.2) the server
+    /// found admitting a removed device. Several rules can admit one
+    /// device; the strongest is stamped: `pending_removal` > `off_list` >
+    /// `revoked` > `own_user` > `rejoin`. ADVISORY ONLY: the server is
+    /// untrusted, so receivers decide from signed material
+    #[derive(Copy)]
+    #[serde(rename_all = "snake_case")]
+    pub enum MlsRemovalReason {
+        /// The device belongs to the committer's own user
+        OwnUser,
+        /// The device's user is pending removal from the group
+        PendingRemoval,
+        /// The device's user is off the newest seat list and the committer
+        /// is the list signer's device
+        OffList,
+        /// The device has no registered identity
+        Revoked,
+        /// The device's own outstanding rejoin intent
+        Rejoin,
+    }
+
+    /// The server's advisory reason for one device a Text commit removed
+    pub struct MlsRemovedReasonInfo {
+        /// Removed user
+        pub user_id: String,
+        /// Removed device
+        pub device_id: String,
+        /// The strongest admitting rule
+        pub reason: MlsRemovalReason,
+    }
+
     /// Register an MLS group: a per-call group (plan §1.2) or a protected
     /// channel's Text group (protected channels design §7.2)
     pub struct DataCreateMlsGroup {
@@ -231,6 +262,10 @@ auto_derived!(
         /// commit (Text groups only; always empty on Call commits)
         #[serde(default)]
         pub rejoin_intents: Vec<MlsRejoinIntentInfo>,
+        /// Text groups only: one advisory reason per removed device
+        /// (absent = empty; never present on Call commits)
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub removed_reasons: Vec<MlsRemovedReasonInfo>,
     }
 
     /// Response to a commit submission — 200 on win, 409 on lose (the loser
@@ -320,7 +355,10 @@ auto_derived!(
 
 #[cfg(test)]
 mod tests {
-    use super::{DataCreateMlsGroup, MlsGroupKind, ResponseTextGroup};
+    use super::{
+        DataCreateMlsGroup, MlsCommitInfo, MlsGroupKind, MlsRemovalReason, MlsRemovedReasonInfo,
+        ResponseTextGroup,
+    };
 
     /// The 7.2 text group example, with concrete values in its placeholders
     const TEXT_GROUP_EXAMPLE: &str = r#"{"group_id":"0000000000000000000000000000000000000000000000000000000000000001","channel_id":"01JA0000000000000000CHANNEL","generation":0,"current_epoch":7,"members":[{"user_id":"01JA00000000000000000USERA","device_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}],"pending_removals":[{"user_id":"01JA00000000000000000USERB","created_at":"2026-10-04T12:00:00.000Z"}],"member_added":[{"user_id":"01JA00000000000000000USERA","device_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","epoch":5,"at":"2026-10-04T11:00:00.000Z"}]}"#;
@@ -363,5 +401,52 @@ mod tests {
         // Unknown keys are ignored, like every neighboring request body
         let extra = CREATE_AT_996641F1.replace("\"supersedes\"", "\"future\":1,\"supersedes\"");
         assert!(serde_json::from_str::<DataCreateMlsGroup>(&extra).is_ok());
+    }
+
+    /// A commit info exactly as `4206add3` serialized it (no
+    /// `removed_reasons` key)
+    const COMMIT_INFO_AT_4206ADD3: &str = r#"{"group_id":"0000000000000000000000000000000000000000000000000000000000000001","epoch":2,"committer":{"user_id":"01JA00000000000000000USERA","device_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},"commit":"Y29tbWl0","added":[],"removed":[{"user_id":"01JA00000000000000000USERB","device_id":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}],"rejoin_intents":[]}"#;
+
+    /// B48: an empty `removed_reasons` is never serialized (Call commits keep
+    /// the earlier shape), an old body without it parses as empty, and each
+    /// reason is snake_case on the wire
+    #[test]
+    fn removed_reasons_are_optional_and_snake_case() {
+        let parsed: MlsCommitInfo = serde_json::from_str(COMMIT_INFO_AT_4206ADD3).unwrap();
+        assert!(parsed.removed_reasons.is_empty());
+        assert_eq!(
+            serde_json::to_string(&parsed).unwrap(),
+            COMMIT_INFO_AT_4206ADD3
+        );
+
+        for (reason, wire) in [
+            (MlsRemovalReason::OwnUser, "own_user"),
+            (MlsRemovalReason::PendingRemoval, "pending_removal"),
+            (MlsRemovalReason::OffList, "off_list"),
+            (MlsRemovalReason::Revoked, "revoked"),
+            (MlsRemovalReason::Rejoin, "rejoin"),
+        ] {
+            let info = MlsCommitInfo {
+                removed_reasons: vec![MlsRemovedReasonInfo {
+                    user_id: "01JA00000000000000000USERB".to_string(),
+                    device_id: "b".repeat(32),
+                    reason,
+                }],
+                ..parsed.clone()
+            };
+            let value = serde_json::to_value(&info).unwrap();
+            assert_eq!(
+                value["removed_reasons"],
+                serde_json::json!([{
+                    "user_id": "01JA00000000000000000USERB",
+                    "device_id": "b".repeat(32),
+                    "reason": wire
+                }])
+            );
+            assert_eq!(
+                serde_json::from_value::<MlsCommitInfo>(value).unwrap(),
+                info
+            );
+        }
     }
 }

@@ -186,6 +186,7 @@ pub async fn send_message(
             added: vec![],
             removed: vec![],
             rejoin_intents: vec![],
+            removed_reasons: vec![],
         });
     }
 
@@ -341,6 +342,7 @@ mod tests {
             removed: vec![],
             created_at: Timestamp::now_utc(),
             rejoin_intents: vec![],
+            removed_reasons: vec![],
         };
         let outcome = db
             .insert_mls_text_commit(&commit, &hash, 0)

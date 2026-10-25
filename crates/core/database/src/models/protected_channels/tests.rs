@@ -1538,6 +1538,7 @@ async fn text_commit_stream(
             removed: vec![],
             created_at: Timestamp::now_utc(),
             rejoin_intents: vec![],
+            removed_reasons: vec![],
         };
         match db.insert_mls_text_commit(&commit, &hash, 0).await {
             Ok(crate::MlsCommitOutcome::Won) => {
@@ -2404,6 +2405,7 @@ fn call_commit(group_id: &str, epoch: i64) -> crate::MlsCommit {
         removed: vec![],
         created_at: Timestamp::now_utc(),
         rejoin_intents: vec![],
+        removed_reasons: vec![],
     }
 }
 
@@ -2514,6 +2516,7 @@ async fn assert_text_commit_wins(db: &Database, channel_id: &str, committer: &Ml
         removed: vec![],
         created_at: Timestamp::now_utc(),
         rejoin_intents: vec![],
+        removed_reasons: vec![],
     };
     let outcome = db
         .insert_mls_text_commit(&commit, &group.seat_list_ad_sha256.unwrap(), 0)

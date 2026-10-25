@@ -156,7 +156,8 @@ mod tests {
     use iso8601_timestamp::{Duration, Timestamp};
     use revolt_database::{
         BotInformation, Database, MlsCommit, MlsCommitOutcome, MlsGroup, MlsGroupCreateOutcome,
-        MlsGroupKind, MlsJoinIntent, MlsMemberDevice, PartialChannel, Session, User,
+        MlsGroupKind, MlsJoinIntent, MlsMemberDevice, MlsRemovalReason, MlsRemovedReason,
+        PartialChannel, Session, User,
     };
     use revolt_models::v0;
     use revolt_permissions::{ChannelPermission, OverrideField};
@@ -226,6 +227,7 @@ mod tests {
             removed,
             created_at: at,
             rejoin_intents: vec![],
+            removed_reasons: vec![],
         }
     }
 
@@ -355,16 +357,24 @@ mod tests {
         db.upsert_mls_join_intent(&intent)
             .await
             .expect("the rejoin intent");
+        // The advisory reason the submit route stamps for this Remove (B48)
         assert_won(
             db.insert_mls_text_commit(
-                &commit(
-                    &group,
-                    2,
-                    &owner_leaf,
-                    vec![],
-                    vec![member_leaf],
-                    Timestamp::now_utc(),
-                ),
+                &MlsCommit {
+                    removed_reasons: vec![MlsRemovedReason {
+                        user_id: member.id.clone(),
+                        device_id: member_device.device_id.clone(),
+                        reason: MlsRemovalReason::Rejoin,
+                    }],
+                    ..commit(
+                        &group,
+                        2,
+                        &owner_leaf,
+                        vec![],
+                        vec![member_leaf],
+                        Timestamp::now_utc(),
+                    )
+                },
                 &hash,
                 0,
             )
@@ -486,6 +496,30 @@ mod tests {
             ]
         );
         assert_eq!(element["channel_id"], fixture.channel_id.as_str());
+
+        // B48: the stored advisory reasons round-trip, snake_case; a commit
+        // without any omits the key
+        assert_eq!(
+            served.commits[1].removed_reasons,
+            vec![v0::MlsRemovedReasonInfo {
+                user_id: intent.user_id.clone(),
+                device_id: intent.device_id.clone(),
+                reason: v0::MlsRemovalReason::Rejoin,
+            }]
+        );
+        assert_eq!(
+            wire["commits"][1]["removed_reasons"],
+            serde_json::json!([{
+                "user_id": intent.user_id,
+                "device_id": intent.device_id,
+                "reason": "rejoin"
+            }])
+        );
+        assert!(
+            wire["commits"][0].get("removed_reasons").is_none(),
+            "{}",
+            wire
+        );
 
         // The member's device left the roster at epoch 2; its seat and the
         // channel are what count on Text
@@ -686,8 +720,14 @@ mod tests {
         assert_eq!(served.commits.len(), 1);
         assert_eq!(served.commits[0].committer.device_id.len(), 32);
         assert!(served.commits[0].rejoin_intents.is_empty());
+        assert!(served.commits[0].removed_reasons.is_empty());
         let wire = serde_json::to_value(&served).expect("JSON");
         assert_eq!(wire["commits"][0]["rejoin_intents"], serde_json::json!([]));
+        assert!(
+            wire["commits"][0].get("removed_reasons").is_none(),
+            "{}",
+            wire
+        );
 
         // A channel viewer who is not a group member: the route's own
         // membership check answers, not the unknown-group answer
@@ -994,5 +1034,95 @@ mod tests {
             .await;
             hidden_and_deleted_text_groups_answer_as_unknown().await
         })
+    }
+
+    /// B48: a Text commit row stored before `removed_reasons` existed (no
+    /// key) reads as empty and is served without the key; its other
+    /// declarations are unchanged. Mongo: the key is unset on the stored
+    /// document. Reference (no serialization): the row is replaced by the
+    /// BSON round trip of the keyless document.
+    #[test]
+    fn a_text_row_without_removed_reasons_reads_as_empty() {
+        crate::util::test::rt().block_on(a_text_row_without_removed_reasons_reads_as_empty_case())
+    }
+
+    async fn a_text_row_without_removed_reasons_reads_as_empty_case() {
+        use revolt_database::mongodb::bson::{doc, from_document, to_document, Document};
+
+        let fixture = fixture().await;
+        let db = &fixture.harness.db;
+        let group_id = &fixture.text_group_id;
+        let row_id = MlsCommit::composite_id(group_id, 2);
+
+        let stored = db
+            .fetch_mls_commits_from(group_id, 2, 1)
+            .await
+            .expect("commit read")
+            .remove(0);
+        assert_eq!(stored.removed_reasons.len(), 1);
+        let mut document = to_document(&stored).expect("BSON");
+        assert!(document.remove("removed_reasons").is_some());
+        let old: MlsCommit = from_document(document).expect("a keyless row deserializes");
+        assert!(old.removed_reasons.is_empty());
+        // Field by field: BSON keeps milliseconds, the Reference row
+        // nanoseconds, so `created_at` is not compared
+        assert_eq!(old.id, stored.id);
+        assert_eq!(old.committer, stored.committer);
+        assert_eq!(old.commit, stored.commit);
+        assert_eq!(old.added, stored.added);
+        assert_eq!(old.removed, stored.removed);
+        assert_eq!(
+            old.rejoin_intents
+                .iter()
+                .map(|intent| &intent.id)
+                .collect::<Vec<_>>(),
+            stored
+                .rejoin_intents
+                .iter()
+                .map(|intent| &intent.id)
+                .collect::<Vec<_>>()
+        );
+
+        match db {
+            Database::Reference(reference) => {
+                reference
+                    .mls_commits
+                    .lock()
+                    .await
+                    .insert(row_id.clone(), old);
+            }
+            Database::MongoDb(mongo) => {
+                let result = mongo
+                    .col::<Document>("mls_commits")
+                    .update_one(
+                        doc! { "_id": &row_id },
+                        doc! { "$unset": { "removed_reasons": "" } },
+                    )
+                    .await
+                    .expect("unset the key");
+                assert_eq!(result.modified_count, 1);
+                let raw = mongo
+                    .col::<Document>("mls_commits")
+                    .find_one(doc! { "_id": &row_id })
+                    .await
+                    .expect("raw read")
+                    .expect("the row");
+                assert!(!raw.contains_key("removed_reasons"));
+            }
+        }
+
+        let served = fetch(db, &fixture.owner, &fixture.owner_session, group_id, 2)
+            .await
+            .expect("the owner is served");
+        assert_eq!(served.commits.len(), 1);
+        assert!(served.commits[0].removed_reasons.is_empty());
+        assert_eq!(served.commits[0].removed.len(), 1);
+        assert_eq!(served.commits[0].rejoin_intents.len(), 1);
+        let wire = serde_json::to_value(&served).expect("JSON");
+        assert!(
+            wire["commits"][0].get("removed_reasons").is_none(),
+            "{}",
+            wire
+        );
     }
 }

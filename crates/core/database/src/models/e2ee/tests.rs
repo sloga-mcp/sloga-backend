@@ -130,6 +130,7 @@ fn make_envelope(recipient_user: &str, recipient_device: &str) -> E2EEEnvelope {
         added: vec![],
         removed: vec![],
         rejoin_intents: vec![],
+        removed_reasons: vec![],
     }
 }
 

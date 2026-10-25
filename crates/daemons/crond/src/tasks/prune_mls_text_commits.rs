@@ -160,6 +160,7 @@ mod tests {
             removed: vec![],
             created_at,
             rejoin_intents: vec![],
+            removed_reasons: vec![],
         }
     }
 

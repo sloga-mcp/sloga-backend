@@ -2445,6 +2445,29 @@ impl From<crate::E2EEEnvelope> for E2EEMessage {
             added: value.added.into_iter().map(Into::into).collect(),
             removed: value.removed.into_iter().map(Into::into).collect(),
             rejoin_intents: value.rejoin_intents.into_iter().map(Into::into).collect(),
+            removed_reasons: value.removed_reasons.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+impl From<crate::MlsRemovalReason> for MlsRemovalReason {
+    fn from(value: crate::MlsRemovalReason) -> Self {
+        match value {
+            crate::MlsRemovalReason::OwnUser => MlsRemovalReason::OwnUser,
+            crate::MlsRemovalReason::PendingRemoval => MlsRemovalReason::PendingRemoval,
+            crate::MlsRemovalReason::OffList => MlsRemovalReason::OffList,
+            crate::MlsRemovalReason::Revoked => MlsRemovalReason::Revoked,
+            crate::MlsRemovalReason::Rejoin => MlsRemovalReason::Rejoin,
+        }
+    }
+}
+
+impl From<crate::MlsRemovedReason> for MlsRemovedReasonInfo {
+    fn from(value: crate::MlsRemovedReason) -> Self {
+        MlsRemovedReasonInfo {
+            user_id: value.user_id,
+            device_id: value.device_id,
+            reason: value.reason.into(),
         }
     }
 }
@@ -2530,6 +2553,7 @@ impl crate::MlsCommit {
                 .into_iter()
                 .map(|intent| intent.into_rejoin_intent_info(channel_id))
                 .collect(),
+            removed_reasons: self.removed_reasons.into_iter().map(Into::into).collect(),
         }
     }
 }

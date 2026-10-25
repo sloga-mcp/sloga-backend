@@ -200,6 +200,7 @@ pub async fn send_messages(
             added: vec![],
             removed: vec![],
             rejoin_intents: vec![],
+            removed_reasons: vec![],
         };
 
         receipts.push(v0::E2EEDeliveryReceipt {

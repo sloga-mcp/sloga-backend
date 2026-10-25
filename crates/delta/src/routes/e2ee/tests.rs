@@ -612,6 +612,7 @@ async fn queue_depth_cap_reports_queue_full_case() {
             added: vec![],
             removed: vec![],
             rejoin_intents: vec![],
+            removed_reasons: vec![],
         })
         .collect();
     harness.db.insert_e2ee_envelopes(&envelopes).await.unwrap();
@@ -756,6 +757,7 @@ async fn queue_depth_cap_holds_within_a_single_request_case() {
             added: vec![],
             removed: vec![],
             rejoin_intents: vec![],
+            removed_reasons: vec![],
         })
         .collect();
     harness.db.insert_e2ee_envelopes(&envelopes).await.unwrap();

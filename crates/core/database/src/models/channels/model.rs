@@ -2451,6 +2451,7 @@ mod tests {
                 removed: vec![],
                 created_at: pc_now(),
                 rejoin_intents: vec![],
+                removed_reasons: vec![],
             };
             let outcome = db
                 .insert_mls_text_commit(&commit, &list.commit_ad_sha256().unwrap(), 0)

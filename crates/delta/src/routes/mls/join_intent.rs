@@ -524,6 +524,7 @@ mod tests {
                     removed: vec![],
                     created_at: Timestamp::now_utc(),
                     rejoin_intents: vec![],
+                    removed_reasons: vec![],
                 },
                 &hash,
                 0,

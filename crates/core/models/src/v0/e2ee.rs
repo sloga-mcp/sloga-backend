@@ -1,4 +1,4 @@
-use super::{MlsMemberDevice, MlsRejoinIntentInfo};
+use super::{MlsMemberDevice, MlsRejoinIntentInfo, MlsRemovedReasonInfo};
 
 auto_derived!(
     /// What an E2EE envelope's ciphertext contains. MLS types are only ever
@@ -289,12 +289,19 @@ auto_derived!(
         /// rejoin-case Remove in the commit
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         pub rejoin_intents: Vec<MlsRejoinIntentInfo>,
+        /// Text `mls_commit` only: the server's advisory reason for each
+        /// removed device (absent = empty)
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub removed_reasons: Vec<MlsRemovedReasonInfo>,
     }
 );
 
 #[cfg(test)]
 mod tests {
-    use super::{E2EEContentType, E2EEMessage, MlsMemberDevice, MlsRejoinIntentInfo};
+    use super::{
+        E2EEContentType, E2EEMessage, MlsMemberDevice, MlsRejoinIntentInfo, MlsRemovedReasonInfo,
+    };
+    use crate::v0::MlsRemovalReason;
 
     /// A Call `mls_commit` envelope exactly as `996641f1` serialized it
     const CALL_COMMIT_AT_996641F1: &str = r#"{"id":"01JA0000000000000000000ENV","recipient_user_id":"01JA00000000000000000USERB","recipient_device_id":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","sender_user_id":"01JA00000000000000000USERA","sender_device_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","protocol_version":1,"sequence":0,"ciphertext":"Y29tbWl0","content_type":"mls_commit","group_id":"0000000000000000000000000000000000000000000000000000000000000001","epoch":4}"#;
@@ -316,6 +323,7 @@ mod tests {
             added: vec![],
             removed: vec![],
             rejoin_intents: vec![],
+            removed_reasons: vec![],
         }
     }
 
@@ -349,6 +357,7 @@ mod tests {
         assert!(parsed.added.is_empty());
         assert!(parsed.removed.is_empty());
         assert!(parsed.rejoin_intents.is_empty());
+        assert!(parsed.removed_reasons.is_empty());
     }
 
     /// Decision 7: a Text commit carries every declaration, in wire form
@@ -367,6 +376,11 @@ mod tests {
             added: vec![device("01JA00000000000000000USERC", "c")],
             removed: vec![device("01JA00000000000000000USERB", "b")],
             rejoin_intents: vec![intent],
+            removed_reasons: vec![MlsRemovedReasonInfo {
+                user_id: "01JA00000000000000000USERB".to_string(),
+                device_id: "b".repeat(32),
+                reason: MlsRemovalReason::Rejoin,
+            }],
             ..call_commit()
         };
 
@@ -392,6 +406,14 @@ mod tests {
                 "device_id": "b".repeat(32),
                 "key_package_ref": "a3ByZWY",
                 "signature": "c2ln"
+            }])
+        );
+        assert_eq!(
+            value["removed_reasons"],
+            serde_json::json!([{
+                "user_id": "01JA00000000000000000USERB",
+                "device_id": "b".repeat(32),
+                "reason": "rejoin"
             }])
         );
         assert_eq!(serde_json::from_value::<E2EEMessage>(value).unwrap(), text);

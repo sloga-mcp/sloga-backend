@@ -4,8 +4,8 @@ use iso8601_timestamp::{Duration, Timestamp};
 use revolt_database::{
     events::client::EventV1, is_valid_device_id, mls_text_enforced_device_cap, Channel, Database,
     E2EEContentType, E2EEEnvelope, MlsCommit, MlsCommitOutcome, MlsEnvelopeRejoinIntent, MlsGroup,
-    MlsJoinIntent, MlsMemberDevice, SeatListBody, Session, User, E2EE_PROTOCOL_VERSION,
-    MAX_MLS_GROUP_MEMBERS, MAX_MLS_TEXT_GROUP_MEMBERS,
+    MlsJoinIntent, MlsMemberDevice, MlsRemovalReason, MlsRemovedReason, SeatListBody, Session,
+    User, E2EE_PROTOCOL_VERSION, MAX_MLS_GROUP_MEMBERS, MAX_MLS_TEXT_GROUP_MEMBERS,
 };
 use revolt_models::v0;
 use revolt_result::{create_error, ErrorType, Result};
@@ -249,6 +249,8 @@ async fn submit_call_commit(
         created_at: Timestamp::now_utc(),
         // Call commits never carry rejoin intents (Text-only, design §2.5)
         rejoin_intents: vec![],
+        // Nor removal reasons (Text-only, B48): never serialized for Call
+        removed_reasons: vec![],
     };
 
     // The CAS — one winner per epoch; membership, epoch monotonicity, the
@@ -455,7 +457,9 @@ async fn submit_text_commit(
     }
 
     let now = Timestamp::now_utc();
-    check_removals(db, &group, &signed, &committer, &removed, now).await?;
+    // Advisory only (B48): stored on the row and fanned out, never read
+    // for admission
+    let removed_reasons = check_removals(db, &group, &signed, &committer, &removed, now).await?;
 
     if !added.is_empty() {
         for target in &added {
@@ -503,6 +507,7 @@ async fn submit_text_commit(
         created_at: now,
         // Filled by the commit transaction from the stored intents
         rejoin_intents: vec![],
+        removed_reasons,
     };
 
     match db
@@ -562,6 +567,7 @@ async fn submit_text_commit(
                         added: stored_commit.added.clone(),
                         removed: stored_commit.removed.clone(),
                         rejoin_intents: rejoin_intents.clone(),
+                        removed_reasons: stored_commit.removed_reasons.clone(),
                         ..build(
                             recipient,
                             E2EEContentType::MlsCommit,
@@ -595,6 +601,19 @@ async fn submit_text_commit(
     }
 }
 
+/// Rank of a Remove rule for the advisory `removed_reasons` (B48): the
+/// strongest admitting rule is stamped, `pending_removal` > `off_list` >
+/// `revoked` > `own_user` > `rejoin`
+fn removal_priority(reason: MlsRemovalReason) -> u8 {
+    match reason {
+        MlsRemovalReason::PendingRemoval => 5,
+        MlsRemovalReason::OffList => 4,
+        MlsRemovalReason::Revoked => 3,
+        MlsRemovalReason::OwnUser => 2,
+        MlsRemovalReason::Rejoin => 1,
+    }
+}
+
 /// The Remove rule (design §3.12.2), checked by the route on the group and
 /// seat list it read; the commit transaction checks it again on its own
 /// read. `signed` is the newest stored list, `now` the commit's time.
@@ -604,6 +623,16 @@ async fn submit_text_commit(
 /// user, its user is pending removal, its identity is revoked, its user is
 /// off the list and the committer is the signer's device, or in the rejoin
 /// case.
+///
+/// Returns one advisory reason per removed device, in `removed` order: the
+/// strongest rule that admits it (B48). The reasons never change admission:
+/// a device is admitted exactly when some rule admits it. Every rule but
+/// rejoin is evaluated for every device. Rejoin is the weakest, so it can
+/// never be the strongest when another rule admits; it is evaluated only
+/// when none does, as before, so its intent read never runs, and never
+/// fails, for a device another rule already admits. An identity read error
+/// is no evidence of revocation: it refuses only when no other rule admits
+/// the device, as before.
 async fn check_removals(
     db: &Database,
     group: &MlsGroup,
@@ -611,9 +640,9 @@ async fn check_removals(
     committer: &MlsMemberDevice,
     removed: &[MlsMemberDevice],
     now: Timestamp,
-) -> Result<()> {
+) -> Result<Vec<MlsRemovedReason>> {
     if removed.is_empty() {
-        return Ok(());
+        return Ok(vec![]);
     }
 
     let committer_is_signer = committer.user_id == signed.signer_user_id
@@ -622,6 +651,7 @@ async fn check_removals(
         .checked_sub(Duration::seconds(REJOIN_OUTSTANDING_WINDOW_SECONDS))
         .ok_or_else(|| failed("invalid commit time"))?;
     let mut intents: Option<Vec<MlsJoinIntent>> = None;
+    let mut reasons = Vec::with_capacity(removed.len());
 
     for device in removed {
         if !group.has_member(&device.user_id, &device.device_id) {
@@ -635,12 +665,17 @@ async fn check_removals(
         let is_signer_device =
             device.user_id == signed.signer_user_id && device.device_id == signed.signer_device_id;
 
+        // Rules 2 to 5, all of them; none applies to the signer's device
+        let mut admitting: Vec<MlsRemovalReason> = Vec::new();
         if !is_signer_device {
-            if device.user_id == committer.user_id
-                || group.has_pending_removal(&device.user_id)
-                || (committer_is_signer && !signed.seats.iter().any(|seat| *seat == device.user_id))
-            {
-                continue;
+            if group.has_pending_removal(&device.user_id) {
+                admitting.push(MlsRemovalReason::PendingRemoval);
+            }
+            if committer_is_signer && !signed.seats.iter().any(|seat| *seat == device.user_id) {
+                admitting.push(MlsRemovalReason::OffList);
+            }
+            if device.user_id == committer.user_id {
+                admitting.push(MlsRemovalReason::OwnUser);
             }
 
             // Revoked = no identity row; a read error is no evidence
@@ -649,9 +684,24 @@ async fn check_removals(
                 .await
             {
                 Ok(_) => {}
-                Err(error) if matches!(error.error_type, ErrorType::NotFound) => continue,
-                Err(error) => return Err(error),
+                Err(error) if matches!(error.error_type, ErrorType::NotFound) => {
+                    admitting.push(MlsRemovalReason::Revoked)
+                }
+                Err(error) if admitting.is_empty() => return Err(error),
+                Err(_) => {}
             }
+        }
+
+        if let Some(reason) = admitting
+            .into_iter()
+            .max_by_key(|reason| removal_priority(*reason))
+        {
+            reasons.push(MlsRemovedReason {
+                user_id: device.user_id.clone(),
+                device_id: device.device_id.clone(),
+                reason,
+            });
+            continue;
         }
 
         // Rejoin case: a stored intent of this device, outstanding and
@@ -677,9 +727,14 @@ async fn check_removals(
         if !outstanding {
             return Err(failed("removal not permitted"));
         }
+        reasons.push(MlsRemovedReason {
+            user_id: device.user_id.clone(),
+            device_id: device.device_id.clone(),
+            reason: MlsRemovalReason::Rejoin,
+        });
     }
 
-    Ok(())
+    Ok(reasons)
 }
 
 /// One ADDED device (design §6.1 "Commit with `added`", decision 7 (W2)): a
@@ -761,6 +816,7 @@ fn envelope(
         added: vec![],
         removed: vec![],
         rejoin_intents: vec![],
+        removed_reasons: vec![],
     }
 }
 
@@ -833,8 +889,9 @@ mod tests {
     use revolt_database::{
         Account, BotInformation, ChannelEntitlementState, Database, E2EEContentType, E2EEEnvelope,
         MemberCompositeKey, MlsCommit, MlsCommitOutcome, MlsEnvelopeRejoinIntent, MlsGroup,
-        MlsGroupCreateOutcome, MlsGroupKind, MlsJoinIntent, MlsMemberDevice, PartialChannel,
-        PartialMember, PartialUser, RelationshipStatus, SeatList, Session, User,
+        MlsGroupCreateOutcome, MlsGroupKind, MlsJoinIntent, MlsMemberDevice, MlsRemovalReason,
+        MlsRemovedReason, PartialChannel, PartialMember, PartialUser, RelationshipStatus, SeatList,
+        Session, User,
     };
     use revolt_models::v0;
     use revolt_permissions::{ChannelPermission, OverrideField};
@@ -1586,6 +1643,7 @@ mod tests {
                     removed: vec![],
                     created_at: Timestamp::now_utc(),
                     rejoin_intents: vec![],
+                    removed_reasons: vec![],
                 },
                 &stored.commit_ad_sha256().expect("hash"),
                 FIXTURE_DEVICE_CAP,
@@ -2727,6 +2785,522 @@ mod tests {
             commit_next(&setup, committer, vec![], vec![target.device()]).await,
             "a fresh rejoin intent",
         );
+    }
+
+    // ---------------------------------------------------------------------
+    // Advisory `removed_reasons` (B48)
+    // ---------------------------------------------------------------------
+
+    fn removed_reason(party: &Party, reason: MlsRemovalReason) -> MlsRemovedReason {
+        MlsRemovedReason {
+            user_id: party.user.id.clone(),
+            device_id: party.device_id.clone(),
+            reason,
+        }
+    }
+
+    /// The stored commit row at `epoch`
+    async fn stored_commit(setup: &Setup, epoch: i64) -> MlsCommit {
+        setup
+            .db()
+            .fetch_mls_commits_from(&setup.group_id, epoch, 1)
+            .await
+            .expect("commit read")
+            .into_iter()
+            .find(|row| row.epoch == epoch)
+            .expect("the stored commit")
+    }
+
+    /// The commit envelope at `epoch` queued for `recipient`
+    async fn commit_envelope(setup: &Setup, recipient: &Party, epoch: i64) -> E2EEEnvelope {
+        envelopes_of(&setup.harness, &recipient.user.id, &recipient.device_id)
+            .await
+            .into_iter()
+            .find(|envelope| {
+                envelope.content_type == E2EEContentType::MlsCommit && envelope.epoch == Some(epoch)
+            })
+            .expect("the commit envelope")
+    }
+
+    /// `committer` removes `removed`; the stored row and the commit envelope
+    /// to `witness` carry exactly `expected`
+    async fn assert_removal_stamped(
+        setup: &Setup,
+        committer: &Party,
+        witness: &Party,
+        removed: &Party,
+        expected: MlsRemovalReason,
+        case: &str,
+    ) {
+        let epoch = setup
+            .db()
+            .fetch_mls_group(&setup.group_id)
+            .await
+            .expect("the group")
+            .current_epoch
+            + 1;
+        assert_won(
+            commit_next(setup, committer, vec![], vec![removed.device()]).await,
+            case,
+        );
+        let want = vec![removed_reason(removed, expected)];
+        assert_eq!(
+            stored_commit(setup, epoch).await.removed_reasons,
+            want,
+            "{}: row",
+            case
+        );
+        assert_eq!(
+            commit_envelope(setup, witness, epoch).await.removed_reasons,
+            want,
+            "{}: envelope",
+            case
+        );
+    }
+
+    /// Drop every pending removal of the group, leaving a user off the
+    /// newest list without one (only rule 5 then applies to them). No route
+    /// reaches that state; written directly
+    async fn clear_pending_removals(db: &Database, group_id: &str) {
+        match db {
+            Database::Reference(reference) => {
+                reference
+                    .mls_groups
+                    .lock()
+                    .await
+                    .get_mut(group_id)
+                    .expect("the group")
+                    .pending_removals
+                    .clear();
+            }
+            Database::MongoDb(mongo) => {
+                use revolt_database::mongodb::bson::{doc, Document};
+                let result = mongo
+                    .col::<Document>("mls_groups")
+                    .update_one(
+                        doc! { "_id": group_id },
+                        doc! { "$set": { "pending_removals": [] } },
+                    )
+                    .await
+                    .expect("clear the pending removals");
+                assert_eq!(result.matched_count, 1);
+            }
+        }
+        assert!(db
+            .fetch_mls_group(group_id)
+            .await
+            .expect("the group")
+            .pending_removals
+            .is_empty());
+    }
+
+    /// B48: each Remove rule, alone, stamps its own reason on the stored row
+    /// and on the commit envelope; the 409 body serves it snake_case
+    #[test]
+    fn every_removal_reason_is_stamped() {
+        crate::util::test::rt().block_on(every_removal_reason_is_stamped_case())
+    }
+
+    async fn every_removal_reason_is_stamped_case() {
+        let setup = setup(5).await;
+        let db = setup.db();
+        let owner = &setup.owner;
+        let committer = &setup.members[0];
+        let own_other = setup
+            .harness
+            .new_e2ee_device(&committer.user, &Ulid::new().to_string(), 0x61)
+            .await;
+        let own_other = Party {
+            user: committer.user.clone(),
+            session: committer.session.clone(),
+            device_id: own_other.device_id,
+        };
+        let pending = &setup.members[1];
+        let revoked = &setup.members[2];
+        let rejoining = &setup.members[3];
+        let off_list = &setup.members[4];
+        assert_won(
+            commit_next(
+                &setup,
+                owner,
+                vec![
+                    committer.device(),
+                    own_other.device(),
+                    pending.device(),
+                    revoked.device(),
+                    rejoining.device(),
+                    off_list.device(),
+                ],
+                vec![],
+            )
+            .await,
+            "six Adds",
+        );
+
+        // Rule 2 alone: the identity is live, the user seated
+        assert_removal_stamped(
+            &setup,
+            committer,
+            owner,
+            &own_other,
+            MlsRemovalReason::OwnUser,
+            "own_user",
+        )
+        .await;
+
+        // Rule 3 alone: unseated by the owner, removed by a non-signer. The
+        // same list also takes `off_list` off it (its pending entry is
+        // cleared below)
+        setup
+            .harness
+            .put_seats_with_db(
+                &setup.protected.channel,
+                &setup.protected.owner_device.seat_list(
+                    setup.channel_id(),
+                    2,
+                    FIXTURE_DEVICE_CAP,
+                    &[
+                        &owner.user.id,
+                        &committer.user.id,
+                        &revoked.user.id,
+                        &rejoining.user.id,
+                    ],
+                ),
+            )
+            .await;
+        assert_removal_stamped(
+            &setup,
+            committer,
+            owner,
+            pending,
+            MlsRemovalReason::PendingRemoval,
+            "pending_removal",
+        )
+        .await;
+
+        // Rule 4 alone: a seated user's revoked device, by a non-signer
+        assert!(db
+            .delete_e2ee_device(&revoked.user.id, &revoked.device_id)
+            .await
+            .expect("revoke"));
+        assert_removal_stamped(
+            &setup,
+            committer,
+            owner,
+            revoked,
+            MlsRemovalReason::Revoked,
+            "revoked",
+        )
+        .await;
+
+        // Rule 6 alone: a seated user's live device on its fresh intent
+        db.upsert_mls_join_intent(&MlsJoinIntent {
+            id: MlsJoinIntent::composite_id(
+                &setup.group_id,
+                &rejoining.user.id,
+                &rejoining.device_id,
+            ),
+            group_id: setup.group_id.clone(),
+            user_id: rejoining.user.id.clone(),
+            device_id: rejoining.device_id.clone(),
+            key_package_ref: "rejoin-key-package".to_string(),
+            signature: "rejoin-signature".to_string(),
+            created_at: Timestamp::now_utc(),
+        })
+        .await
+        .expect("the rejoin intent");
+        assert_removal_stamped(
+            &setup,
+            committer,
+            owner,
+            rejoining,
+            MlsRemovalReason::Rejoin,
+            "rejoin",
+        )
+        .await;
+
+        // Rule 5 alone: off the list with no pending entry, removed by the
+        // signer's device
+        clear_pending_removals(db, &setup.group_id).await;
+        assert_removal_stamped(
+            &setup,
+            owner,
+            committer,
+            off_list,
+            MlsRemovalReason::OffList,
+            "off_list",
+        )
+        .await;
+
+        // The 409 body carries the winner's reasons, snake_case
+        let group = db
+            .fetch_mls_group(&setup.group_id)
+            .await
+            .expect("the group");
+        let ad = current_ad(&setup.harness, setup.channel_id()).await;
+        let winning = assert_lost(
+            submit(
+                &setup.harness,
+                &committer.user,
+                &committer.session,
+                &setup.group_id,
+                request(
+                    &committer.device_id,
+                    &setup.group_id,
+                    group.current_epoch,
+                    &ad,
+                    vec![],
+                    vec![],
+                ),
+            )
+            .await,
+            "a commit at the off_list epoch",
+        );
+        let wire = serde_json::to_value(&winning).expect("JSON");
+        assert_eq!(
+            wire["removed_reasons"],
+            serde_json::json!([{
+                "user_id": off_list.user.id,
+                "device_id": off_list.device_id,
+                "reason": "off_list"
+            }])
+        );
+    }
+
+    /// B48: when several rules admit one device the strongest is stamped,
+    /// `pending_removal` > `off_list` > `revoked` > `own_user` > `rejoin`.
+    /// Admission is unchanged: every one of these commits wins
+    #[test]
+    fn the_strongest_admitting_rule_is_stamped() {
+        crate::util::test::rt().block_on(the_strongest_admitting_rule_is_stamped_case())
+    }
+
+    async fn the_strongest_admitting_rule_is_stamped_case() {
+        let setup = setup(4).await;
+        let db = setup.db();
+        let owner = &setup.owner;
+        let committer = &setup.members[0];
+        let own_other = setup
+            .harness
+            .new_e2ee_device(&committer.user, &Ulid::new().to_string(), 0x62)
+            .await;
+        let own_other = Party {
+            user: committer.user.clone(),
+            session: committer.session.clone(),
+            device_id: own_other.device_id,
+        };
+        let pending_revoked = &setup.members[1];
+        let pending_off_list = &setup.members[2];
+        let off_list_revoked = &setup.members[3];
+        assert_won(
+            commit_next(
+                &setup,
+                owner,
+                vec![
+                    committer.device(),
+                    own_other.device(),
+                    pending_revoked.device(),
+                    pending_off_list.device(),
+                    off_list_revoked.device(),
+                ],
+                vec![],
+            )
+            .await,
+            "five Adds",
+        );
+
+        // revoked + own_user: the committer's own revoked device
+        assert!(db
+            .delete_e2ee_device(&committer.user.id, &own_other.device_id)
+            .await
+            .expect("revoke"));
+        assert_removal_stamped(
+            &setup,
+            committer,
+            owner,
+            &own_other,
+            MlsRemovalReason::Revoked,
+            "revoked over own_user",
+        )
+        .await;
+
+        // Two users unseated: both pending removal
+        setup
+            .harness
+            .put_seats_with_db(
+                &setup.protected.channel,
+                &setup.protected.owner_device.seat_list(
+                    setup.channel_id(),
+                    2,
+                    FIXTURE_DEVICE_CAP,
+                    &[
+                        &owner.user.id,
+                        &committer.user.id,
+                        &off_list_revoked.user.id,
+                    ],
+                ),
+            )
+            .await;
+
+        // pending_removal + revoked, by a non-signer
+        assert!(db
+            .delete_e2ee_device(&pending_revoked.user.id, &pending_revoked.device_id)
+            .await
+            .expect("revoke"));
+        assert_removal_stamped(
+            &setup,
+            committer,
+            owner,
+            pending_revoked,
+            MlsRemovalReason::PendingRemoval,
+            "pending_removal over revoked",
+        )
+        .await;
+
+        // pending_removal + off_list, by the signer's device
+        assert_removal_stamped(
+            &setup,
+            owner,
+            committer,
+            pending_off_list,
+            MlsRemovalReason::PendingRemoval,
+            "pending_removal over off_list",
+        )
+        .await;
+
+        // off_list + revoked, by the signer's device, no pending entry
+        setup
+            .harness
+            .put_seats_with_db(
+                &setup.protected.channel,
+                &setup.protected.owner_device.seat_list(
+                    setup.channel_id(),
+                    3,
+                    FIXTURE_DEVICE_CAP,
+                    &[&owner.user.id, &committer.user.id],
+                ),
+            )
+            .await;
+        clear_pending_removals(db, &setup.group_id).await;
+        assert!(db
+            .delete_e2ee_device(&off_list_revoked.user.id, &off_list_revoked.device_id)
+            .await
+            .expect("revoke"));
+        assert_removal_stamped(
+            &setup,
+            owner,
+            committer,
+            off_list_revoked,
+            MlsRemovalReason::OffList,
+            "off_list over revoked",
+        )
+        .await;
+    }
+
+    /// B48: a Call commit never carries `removed_reasons`, even with a
+    /// Remove: not on the stored row, not on its envelopes, not on the wire
+    /// of the 409 body
+    #[test]
+    fn call_commits_carry_no_removed_reasons() {
+        crate::util::test::rt().block_on(call_commits_carry_no_removed_reasons_case())
+    }
+
+    async fn call_commits_carry_no_removed_reasons_case() {
+        let harness = TestHarness::new().await;
+        let db = &harness.db;
+        let (_, session_a, user_a) = harness.new_user().await;
+        let (_, session_b, user_b) = harness.new_user().await;
+        let (_, session_c, user_c) = harness.new_user().await;
+        let (server, channel) = harness.new_protectable_channel(&user_a).await;
+        harness.join_server(&server, &user_b).await;
+        harness.join_server(&server, &user_c).await;
+        let device_a = harness.new_e2ee_device(&user_a, &session_a.id, 0x72).await;
+        let device_b = harness.new_e2ee_device(&user_b, &session_b.id, 0x73).await;
+        let device_c = harness.new_e2ee_device(&user_c, &session_c.id, 0x74).await;
+        let leaf_b = member_device(&user_b.id, &device_b.device_id);
+        let members = vec![
+            member_device(&user_a.id, &device_a.device_id),
+            leaf_b.clone(),
+            member_device(&user_c.id, &device_c.device_id),
+        ];
+        let group = MlsGroup {
+            id: format!("{:032x}{:032x}", Ulid::new().0, Ulid::new().0),
+            channel_id: channel.id().to_string(),
+            open: true,
+            created_by: members[0].clone(),
+            created_at: Timestamp::now_utc(),
+            current_epoch: 0,
+            members,
+            closed_at: None,
+            superseded_by: None,
+            kind: MlsGroupKind::Call,
+            generation: None,
+            seat_list_ad_sha256: None,
+            pending_removals: vec![],
+            member_added: vec![],
+        };
+        assert!(matches!(
+            db.create_mls_group(&group, None).await.expect("call group"),
+            MlsGroupCreateOutcome::Created
+        ));
+
+        let call_commit =
+            |device_id: &str, removed: Vec<v0::MlsMemberDevice>| v0::DataSubmitMlsCommit {
+                device_id: device_id.to_string(),
+                epoch: 1,
+                commit: STANDARD_NO_PAD.encode(format!("opaque call commit {device_id}")),
+                welcome: None,
+                added: vec![],
+                removed,
+            };
+        assert_won(
+            submit(
+                &harness,
+                &user_a,
+                &session_a,
+                &group.id,
+                call_commit(
+                    &device_a.device_id,
+                    vec![device_of(&user_b, &device_b.device_id)],
+                ),
+            )
+            .await,
+            "a Call commit removing B",
+        );
+
+        let stored = db
+            .fetch_mls_commits_from(&group.id, 1, 1)
+            .await
+            .expect("commit read");
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].removed, vec![leaf_b]);
+        assert!(stored[0].removed_reasons.is_empty(), "{:?}", stored[0]);
+
+        for (user, device) in [(&user_b, &device_b), (&user_c, &device_c)] {
+            let envelopes = envelopes_of(&harness, &user.id, &device.device_id).await;
+            assert_eq!(envelopes.len(), 1);
+            assert!(
+                envelopes[0].removed_reasons.is_empty(),
+                "{:?}",
+                envelopes[0]
+            );
+        }
+
+        let winning = assert_lost(
+            submit(
+                &harness,
+                &user_c,
+                &session_c,
+                &group.id,
+                call_commit(&device_c.device_id, vec![]),
+            )
+            .await,
+            "a racing Call commit",
+        );
+        assert_eq!(winning.removed.len(), 1);
+        assert!(winning.removed_reasons.is_empty());
+        let wire = serde_json::to_value(&winning).expect("JSON");
+        assert!(wire.get("removed_reasons").is_none(), "{}", wire);
     }
 
     // ---------------------------------------------------------------------

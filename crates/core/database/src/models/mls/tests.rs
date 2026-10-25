@@ -64,6 +64,7 @@ fn make_commit(
         removed,
         created_at: Timestamp::now_utc(),
         rejoin_intents: vec![],
+        removed_reasons: vec![],
     }
 }
 
@@ -742,6 +743,7 @@ async fn envelope_byte_budget_is_summed_per_device() {
             added: vec![],
             removed: vec![],
             rejoin_intents: vec![],
+            removed_reasons: vec![],
         };
 
         db.insert_e2ee_envelopes(&[make_envelope(1000), make_envelope(500)])
