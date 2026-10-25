@@ -364,7 +364,8 @@ wins).
 
 `fetch_payment_orders_by_*` fail a whole list when one stored row does not decode. Older builds do not know
 `ProtPack` or `ProtExact`. **Once a ProtPack/ProtExact order or a ledger row exists, delta and crond must never be
-rolled back below the first S5 build**, and they are deployed together.
+rolled back below the first S5 build**, and they are deployed together with bonfire (an older bonfire cannot parse
+`ProtBalanceUpdate` and drops every balance event).
 
 ## 6. Cipher founding Prot (D2)
 
@@ -759,7 +760,8 @@ Routes (S5a):
 - `GET /admin/prot/orders/<order_id>` and `POST /admin/prot/adjust` (`routes/admin/`): privileged, an MFA ticket
   and an `X-Audit-Log-Reason` are required; the ledger row (actor + reason) and an `AUDIT prot_*` log line are the
   audit record. They are not gated on `enabled`, so support can inspect and correct while Prot is dark. A negative
-  adjustment never takes a wallet below 0.
+  adjustment never takes a wallet below 0. Staff cannot credit their own wallet (`SelfAdjust`); a self-debit is
+  allowed.
 
 S5b adds tank and goal routes, the `prot_write` bucket (10 per 60 s) and a privileged termination route.
 
