@@ -440,6 +440,11 @@ impl<'a> RatelimitResolver<Request<'a>> for DeltaRatelimits {
                 // must neither spend nor be starved by the tight checkout
                 // budget. A plain database read; it never calls Stripe.
                 ("payments", Some("cipher"), _) if extra == Some("@me") => ("payments_me", None),
+                // The Prot wallet (GET /payments/prot/@me) is the same kind of
+                // read, polled the same way while a pack checkout settles. It
+                // shares the payments_me counter; checkout falls through to
+                // "payments" below.
+                ("payments", Some("prot"), _) if extra == Some("@me") => ("payments_me", None),
                 // Checkout, keyed per session. It creates a Stripe session,
                 // so the budget is tight; the engine's one live Pending
                 // order per user bounds a user with many sessions
@@ -1026,6 +1031,119 @@ mod tests {
         assert_eq!(
             client.post("/payments/stripe/webhook").dispatch().status(),
             Status::Ok
+        );
+    }
+
+    #[rocket::post("/prot/checkout")]
+    fn prot_checkout() {}
+
+    #[rocket::get("/prot/@me")]
+    fn prot_me() {}
+
+    #[rocket::get("/prot/orders/<_order_id>")]
+    fn admin_prot_order(_order_id: &str) {}
+
+    #[rocket::post("/prot/adjust")]
+    fn admin_prot_adjust() {}
+
+    /// The Prot payment and admin routes, on the same database-free Rocket
+    /// as `client()`
+    fn prot_client() -> Client {
+        let rocket = rocket::build()
+            .manage(RatelimitStorage::new(DeltaRatelimits))
+            .attach(RatelimitFairing)
+            .mount("/", revolt_ratelimits::rocket::routes())
+            .mount("/sync", rocket::routes![sync_settings])
+            .mount(
+                "/payments",
+                rocket::routes![prot_checkout, prot_me, cipher_checkout, cipher_me],
+            )
+            .mount(
+                "/admin",
+                rocket::routes![admin_prot_order, admin_prot_adjust],
+            );
+        Client::untracked(rocket).expect("rocket builds without a database")
+    }
+
+    #[test]
+    fn prot_payments_routes_use_the_payments_buckets() {
+        use revolt_ratelimits::ratelimiter::RatelimitResolver;
+
+        let client = prot_client();
+
+        // The resolver, including the versioned prefix
+        for (method, path, expected) in [
+            ("POST", "/payments/prot/checkout", "payments"),
+            ("POST", "/0.8/payments/prot/checkout", "payments"),
+            ("GET", "/payments/prot/@me", "payments_me"),
+            ("GET", "/0.8/payments/prot/@me", "payments_me"),
+            ("GET", "/admin/prot/orders/x", "any"),
+            ("POST", "/admin/prot/adjust", "any"),
+        ] {
+            let request = match method {
+                "POST" => client.post(path),
+                _ => client.get(path),
+            };
+            assert_eq!(
+                DeltaRatelimits.resolve_bucket(&*request),
+                (expected, None),
+                "{method} {path}"
+            );
+        }
+
+        // Through the fairing: checkout 3 per window, the wallet 10, and
+        // they are separate counters
+        let checkout = client.post("/payments/prot/checkout").dispatch();
+        assert_eq!(checkout.status(), Status::Ok);
+        assert_eq!(limit(&checkout), 3);
+        let me = client.get("/payments/prot/@me").dispatch();
+        assert_eq!(me.status(), Status::Ok);
+        assert_eq!(limit(&me), 10);
+        assert_ne!(
+            bucket(&checkout),
+            bucket(&me),
+            "Prot checkout and the Prot wallet must not share a counter"
+        );
+
+        // No new buckets: the Prot routes spend the Cipher routes' counters,
+        // and the admin routes the shared "any" one
+        let cipher_checkout = client.post("/payments/cipher/checkout").dispatch();
+        assert_eq!(bucket(&cipher_checkout), bucket(&checkout));
+        let cipher_me = client.get("/payments/cipher/@me").dispatch();
+        assert_eq!(bucket(&cipher_me), bucket(&me));
+        let any = client.get("/sync/settings").dispatch();
+        let order = client.get("/admin/prot/orders/x").dispatch();
+        assert_eq!(order.status(), Status::Ok);
+        assert_eq!(bucket(&order), bucket(&any));
+        let adjust = client.post("/admin/prot/adjust").dispatch();
+        assert_eq!(adjust.status(), Status::Ok);
+        assert_eq!(bucket(&adjust), bucket(&any));
+        assert_ne!(bucket(&any), bucket(&checkout));
+        assert_ne!(bucket(&any), bucket(&me));
+
+        // One Prot and one Cipher checkout so far: a second Prot checkout
+        // fills the window of 3 and the next is refused
+        assert_eq!(
+            client.post("/payments/prot/checkout").dispatch().status(),
+            Status::Ok
+        );
+        assert_eq!(
+            client.post("/payments/prot/checkout").dispatch().status(),
+            Status::TooManyRequests
+        );
+
+        // The wallet keeps its own budget after checkout is exhausted: one
+        // Prot and one Cipher read so far, 8 more fit the window, the next
+        // is refused
+        for _ in 0..8 {
+            assert_eq!(
+                client.get("/payments/prot/@me").dispatch().status(),
+                Status::Ok
+            );
+        }
+        assert_eq!(
+            client.get("/payments/prot/@me").dispatch().status(),
+            Status::TooManyRequests
         );
     }
 

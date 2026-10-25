@@ -730,7 +730,7 @@ Packs (`prot_packs`):
 
 Pay-exact: `prot_exact_min_cents` (50, Stripe's USD minimum) to `prot_exact_max_cents` (50000, D18), 1 Prot per
 cent. Wallet cap: `wallet_cap` = 100,000 (D18, checked at checkout only). Not on sale in
-`prot_blocked_countries` (default: the Cipher list, EU27 + GB).
+`prot_blocked_countries` (default: EU27 + GB like Cipher, plus Norway, Iceland and Liechtenstein, because Prot is sold non-refundable and buyers there keep a withdrawal right the checkout does not waive).
 
 Config lives in `crates/core/config/src/lib.rs`:
 - `FeaturePayments`: `prot_sales_open`, `prot_packs` (`ProtPackConfig`), `prot_exact_min_cents`,

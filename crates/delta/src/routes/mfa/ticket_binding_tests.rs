@@ -18,8 +18,10 @@
 use std::collections::BTreeSet;
 use std::path::Path;
 
+use revolt_database::{prot_key_admin, prot_user_account};
 use revolt_database::{
-    Account, MFATicket, Member, Session, Totp, UnvalidatedTicket, User, ValidatedTicket,
+    Account, MFATicket, Member, PartialUser, Session, Totp, UnvalidatedTicket, User,
+    ValidatedTicket,
 };
 use revolt_models::v0;
 use rocket::http::{ContentType, Header, Status};
@@ -42,6 +44,8 @@ const TICKET_ROUTES: &[(&str, &str)] = &[
         "account/disable_account.rs",
         "foreign_ticket_disable_account",
     ),
+    ("admin/prot_adjust.rs", "foreign_ticket_admin_prot_adjust"),
+    ("admin/prot_orders.rs", "foreign_ticket_admin_prot_orders"),
     ("e2ee/delete_backup.rs", "foreign_ticket_delete_backup"),
     ("e2ee/get_backup.rs", "foreign_ticket_get_backup"),
     ("e2ee/publish_keys.rs", "foreign_ticket_publish_keys"),
@@ -774,6 +778,105 @@ async fn foreign_ticket_server_edit_case() {
     );
     pair.assert_unchanged("server_edit", &before).await;
     pair.assert_ticket_kept("server_edit").await;
+}
+
+#[test]
+fn foreign_ticket_admin_prot_adjust() {
+    rt().block_on(foreign_ticket_admin_prot_adjust_case())
+}
+
+/// POST /admin/prot/adjust would credit the attacker's wallet as the victim.
+/// The victim is promoted to staff and the body and reason are valid, so the
+/// refusal can only come from the binding.
+async fn foreign_ticket_admin_prot_adjust_case() {
+    let mut pair = pair().await;
+    pair.victim_user
+        .update(
+            &pair.harness.db,
+            PartialUser {
+                privileged: Some(true),
+                ..Default::default()
+            },
+            vec![],
+        )
+        .await
+        .expect("promote the victim");
+    let before = victim_state(&pair).await;
+
+    let body = json!({ "user": pair.attacker_user.id, "amount": 5000, "nonce": "forged" });
+    let status = pair
+        .forged(
+            pair.harness
+                .client
+                .post("/admin/prot/adjust")
+                .header(ContentType::JSON)
+                .header(Header::new("X-Audit-Log-Reason", "goodwill"))
+                .body(body.to_string()),
+        )
+        .dispatch()
+        .await
+        .status();
+
+    assert_eq!(status, Status::Forbidden, "admin_prot_adjust");
+    assert!(
+        pair.harness
+            .db
+            .fetch_prot_entry_by_key(&prot_key_admin(&pair.victim_user.id, "forged"))
+            .await
+            .expect("ledger read")
+            .is_none(),
+        "admin_prot_adjust: the forged adjustment was written"
+    );
+    assert!(
+        pair.harness
+            .db
+            .fetch_prot_account(&prot_user_account(&pair.attacker_user.id))
+            .await
+            .expect("account read")
+            .is_none(),
+        "admin_prot_adjust: the attacker's wallet was credited"
+    );
+    pair.assert_unchanged("admin_prot_adjust", &before).await;
+    pair.assert_ticket_kept("admin_prot_adjust").await;
+}
+
+#[test]
+fn foreign_ticket_admin_prot_orders() {
+    rt().block_on(foreign_ticket_admin_prot_orders_case())
+}
+
+/// GET /admin/prot/orders/:id would read an order's Prot as the victim. With
+/// the binding gone the handler answers 404 for this unknown id; the guard
+/// must refuse first.
+async fn foreign_ticket_admin_prot_orders_case() {
+    let mut pair = pair().await;
+    pair.victim_user
+        .update(
+            &pair.harness.db,
+            PartialUser {
+                privileged: Some(true),
+                ..Default::default()
+            },
+            vec![],
+        )
+        .await
+        .expect("promote the victim");
+    let before = victim_state(&pair).await;
+
+    let status = pair
+        .forged(
+            pair.harness
+                .client
+                .get(format!("/admin/prot/orders/{}", ulid::Ulid::new()))
+                .header(Header::new("X-Audit-Log-Reason", "check")),
+        )
+        .dispatch()
+        .await
+        .status();
+
+    assert_eq!(status, Status::Forbidden, "admin_prot_orders");
+    pair.assert_unchanged("admin_prot_orders", &before).await;
+    pair.assert_ticket_kept("admin_prot_orders").await;
 }
 
 // ------------------------------------------------------------------------

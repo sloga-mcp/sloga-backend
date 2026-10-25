@@ -1,9 +1,12 @@
 use revolt_config::{config, Settings};
+use revolt_models::v0;
+use revolt_payments::settings::{PaymentsSettings, ProtSalesSettings};
 use revolt_result::Result;
 use rocket::serde::json::Json;
 use serde::Serialize;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::OnceLock;
 
 use super::import::{api_url_is_https, ImportSource};
 
@@ -52,6 +55,23 @@ pub struct BoostsFeature {
     pub purchases_enabled: bool,
     /// Boosts required for tiers 1/2/3
     pub tier_thresholds: [u32; 3],
+}
+
+/// # Prot Configuration
+#[derive(Serialize, JsonSchema, Debug, Clone)]
+pub struct ProtFeature {
+    /// features.boosts.protection.enabled
+    pub enabled: bool,
+    /// features.boosts.protection.self_serve_enabled
+    pub self_serve_enabled: bool,
+    /// ProtSalesSettings::checkout_open (false when either config fails to validate)
+    pub sales_open: bool,
+    /// ProtSalesSettings::grants_active
+    pub cipher_grants_enabled: bool,
+    pub packs: Vec<v0::ProtPackView>,
+    pub exact_min_cents: i64,
+    pub exact_max_cents: i64,
+    pub wallet_cap: i64,
 }
 
 /// # Bot-Based Import Source
@@ -151,6 +171,58 @@ pub fn import_sources_feature(config: &Settings) -> ImportSourcesFeature {
     }
 }
 
+/// What to advertise for Prot. The sale and grant flags come from the same
+/// validated settings the engine uses, so a config the engine would refuse
+/// is advertised closed: no packs, sales and grants off.
+pub fn prot_feature_from(config: &Settings) -> ProtFeature {
+    let protection = &config.features.boosts.protection;
+    let Ok(prot) = ProtSalesSettings::from_config(config) else {
+        return ProtFeature {
+            enabled: protection.enabled,
+            self_serve_enabled: protection.self_serve_enabled,
+            sales_open: false,
+            cipher_grants_enabled: false,
+            packs: Vec::new(),
+            exact_min_cents: config.features.payments.prot_exact_min_cents,
+            exact_max_cents: config.features.payments.prot_exact_max_cents,
+            wallet_cap: protection.wallet_cap,
+        };
+    };
+
+    // Checkout also needs `[features.payments]` to validate and be enabled
+    let sales_open = PaymentsSettings::from_config(config).is_ok_and(|s| prot.checkout_open(&s));
+
+    ProtFeature {
+        enabled: protection.enabled,
+        self_serve_enabled: protection.self_serve_enabled,
+        sales_open,
+        cipher_grants_enabled: prot.grants_active(),
+        packs: prot
+            .packs
+            .iter()
+            .map(|pack| v0::ProtPackView {
+                id: pack.id.clone(),
+                cents: pack.cents,
+                prot: pack.prot,
+            })
+            .collect(),
+        exact_min_cents: prot.exact_min_cents,
+        exact_max_cents: prot.exact_max_cents,
+        wallet_cap: prot.wallet_cap,
+    }
+}
+
+/// The Prot advert of this process: [`prot_feature_from`] once, on the first
+/// `GET /`. The config is frozen into the process at first load, so the
+/// answer cannot change, and validating both payment configs on every
+/// request would log a bad key at error level each time.
+pub fn prot_feature(config: &Settings) -> ProtFeature {
+    static PROT_FEATURE: OnceLock<ProtFeature> = OnceLock::new();
+    PROT_FEATURE
+        .get_or_init(|| prot_feature_from(config))
+        .clone()
+}
+
 /// # Feature Configuration
 #[derive(Serialize, JsonSchema, Debug)]
 pub struct RevoltFeatures {
@@ -193,6 +265,8 @@ pub struct RevoltFeatures {
     pub legal_links: LegalLinks,
     /// Server boost configuration
     pub boosts: BoostsFeature,
+    /// Prot configuration
+    pub prot: ProtFeature,
 }
 
 /// # Limits For Users
@@ -341,6 +415,9 @@ pub async fn root() -> Result<Json<RevoltConfig>> {
         UserLimits::from_feature_limits(fl)
     });
 
+    // Built before the literal below, which moves fields out of `config`
+    let prot = prot_feature(&config);
+
     Ok(Json(RevoltConfig {
         revolt: env!("CARGO_PKG_VERSION").to_string(),
         features: RevoltFeatures {
@@ -430,6 +507,7 @@ pub async fn root() -> Result<Json<RevoltConfig>> {
                 purchases_enabled: config.features.boosts.purchases_enabled,
                 tier_thresholds: config.features.boosts.tier_thresholds,
             },
+            prot,
         },
         ws: config.hosts.events,
         app: config.hosts.app,
@@ -698,6 +776,192 @@ mod test {
             serde_json::json!({
                 "add_bot_url": "https://api.fluxer.app/v1/oauth2/authorize?client_id=1560481642991071233&scope=bot&permissions=8"
             })
+        );
+    }
+
+    /// The node's own config with every Prot switch on and a valid sale
+    /// config set explicitly, so a local override file can't change it
+    fn prot_settings() -> revolt_config::Settings {
+        let mut config = crate::util::test::rt().block_on(revolt_config::config());
+        let payments = &mut config.features.payments;
+        payments.enabled = true;
+        payments.cipher_cap = 1000;
+        payments.cipher_sales_close_at = String::new();
+        payments.prot_sales_open = true;
+        payments.prot_packs = vec![
+            revolt_config::ProtPackConfig {
+                id: "p5".to_string(),
+                cents: 500,
+                prot: 500,
+            },
+            revolt_config::ProtPackConfig {
+                id: "p25".to_string(),
+                cents: 2500,
+                prot: 2600,
+            },
+        ];
+        payments.prot_exact_min_cents = 50;
+        payments.prot_exact_max_cents = 50000;
+        payments.prot_blocked_countries = vec!["GB".to_string()];
+        payments.prot_success_url = "https://app.sloga.gg/settings?prot=success".to_string();
+        payments.prot_cancel_url = "https://app.sloga.gg/settings?prot=cancel".to_string();
+        payments.prot_shell_return_url = "https://sloga.gg/prot/thanks/".to_string();
+
+        let protection = &mut config.features.boosts.protection;
+        protection.enabled = true;
+        protection.self_serve_enabled = false;
+        protection.cipher_grants_enabled = true;
+        protection.wallet_cap = 100000;
+        config
+    }
+
+    fn prot_json(config: &revolt_config::Settings) -> serde_json::Value {
+        serde_json::to_value(super::prot_feature_from(config)).unwrap()
+    }
+
+    #[test]
+    fn prot_feature_advertises_the_validated_config() {
+        assert_eq!(
+            prot_json(&prot_settings()),
+            serde_json::json!({
+                "enabled": true,
+                "self_serve_enabled": false,
+                "sales_open": true,
+                "cipher_grants_enabled": true,
+                "packs": [
+                    { "id": "p5", "cents": 500, "prot": 500 },
+                    { "id": "p25", "cents": 2500, "prot": 2600 },
+                ],
+                "exact_min_cents": 50,
+                "exact_max_cents": 50000,
+                "wallet_cap": 100000,
+            })
+        );
+
+        let mut config = prot_settings();
+        config.features.boosts.protection.self_serve_enabled = true;
+        assert_eq!(prot_json(&config)["self_serve_enabled"], true);
+    }
+
+    #[test]
+    fn prot_feature_sales_open_needs_every_switch() {
+        type Darken = fn(&mut revolt_config::Settings);
+        let cases: [(&str, Darken); 3] = [
+            ("payments disabled", |c| c.features.payments.enabled = false),
+            ("prot disabled", |c| {
+                c.features.boosts.protection.enabled = false
+            }),
+            ("prot sales closed", |c| {
+                c.features.payments.prot_sales_open = false
+            }),
+        ];
+        for (name, darken) in cases {
+            let mut config = prot_settings();
+            darken(&mut config);
+            assert_eq!(prot_json(&config)["sales_open"], false, "{name}");
+        }
+
+        // Grants need the master switch too, but not the sale
+        let mut config = prot_settings();
+        config.features.boosts.protection.enabled = false;
+        assert_eq!(prot_json(&config)["cipher_grants_enabled"], false);
+        let mut config = prot_settings();
+        config.features.payments.enabled = false;
+        config.features.payments.prot_sales_open = false;
+        assert_eq!(prot_json(&config)["cipher_grants_enabled"], true);
+        let mut config = prot_settings();
+        config.features.boosts.protection.cipher_grants_enabled = false;
+        assert_eq!(prot_json(&config)["cipher_grants_enabled"], false);
+    }
+
+    #[test]
+    fn prot_feature_is_closed_when_the_prot_config_is_invalid() {
+        type Break = fn(&mut revolt_config::Settings);
+        let cases: [(&str, Break); 5] = [
+            ("pack id without the p prefix", |c| {
+                c.features.payments.prot_packs[0].id = "x5".to_string()
+            }),
+            ("duplicate pack id", |c| {
+                c.features.payments.prot_packs[1].id = "p5".to_string()
+            }),
+            ("exact minimum below 50", |c| {
+                c.features.payments.prot_exact_min_cents = 10
+            }),
+            ("zero wallet cap", |c| {
+                c.features.boosts.protection.wallet_cap = 0
+            }),
+            ("plain http return url", |c| {
+                c.features.payments.prot_success_url = "http://app.sloga.gg/".to_string()
+            }),
+        ];
+        for (name, break_config) in cases {
+            let mut config = prot_settings();
+            break_config(&mut config);
+            let json = prot_json(&config);
+            assert_eq!(json["sales_open"], false, "{name}");
+            assert_eq!(json["cipher_grants_enabled"], false, "{name}");
+            assert_eq!(json["packs"], serde_json::json!([]), "{name}");
+            // The master switch is advertised as configured, so the wallet
+            // page still shows the balance
+            assert_eq!(json["enabled"], true, "{name}");
+        }
+    }
+
+    #[test]
+    fn prot_feature_sales_closed_when_the_payments_config_is_invalid() {
+        let mut config = prot_settings();
+        config.features.payments.cipher_cap = 0;
+        let json = prot_json(&config);
+        assert_eq!(json["sales_open"], false);
+        // Grants and the pack list don't depend on `[features.payments]`
+        // validating
+        assert_eq!(json["cipher_grants_enabled"], true);
+        assert_eq!(json["packs"].as_array().map(Vec::len), Some(2));
+    }
+
+    /// The route's advert is built once per process: a later call with a
+    /// config that no longer validates still answers the first advert (and
+    /// so validates and logs nothing again)
+    #[test]
+    fn prot_feature_is_built_once_per_process() {
+        let config = crate::util::test::rt().block_on(revolt_config::config());
+        let first = serde_json::to_value(super::prot_feature(&config)).unwrap();
+        assert_eq!(first, prot_json(&config));
+        assert_eq!(first["sales_open"], true);
+
+        let mut invalid = config.clone();
+        invalid.features.payments.prot_exact_min_cents = 10;
+        assert_eq!(prot_json(&invalid)["sales_open"], false);
+        assert_eq!(
+            serde_json::to_value(super::prot_feature(&invalid)).unwrap(),
+            first
+        );
+    }
+
+    /// `GET /` carries exactly what the builder produces for the node's
+    /// config, under `features.prot`, and leaves the boosts advert alone
+    #[test]
+    fn root_serves_prot_feature() {
+        crate::util::test::rt().block_on(root_serves_prot_feature_case())
+    }
+
+    async fn root_serves_prot_feature_case() {
+        let harness = crate::util::test::TestHarness::new().await;
+        let response = harness.client.get("/").dispatch().await;
+        assert_eq!(response.status(), Status::Ok);
+        let body: serde_json::Value =
+            serde_json::from_str(&response.into_string().await.unwrap()).unwrap();
+        let config = revolt_config::config().await;
+        assert_eq!(body["features"]["prot"], prot_json(&config));
+
+        // Revolt.test.toml turns Prot and its sale on, grants stay off
+        assert_eq!(body["features"]["prot"]["enabled"], true);
+        assert_eq!(body["features"]["prot"]["sales_open"], true);
+        assert_eq!(body["features"]["prot"]["cipher_grants_enabled"], false);
+
+        assert_eq!(
+            body["features"]["boosts"]["purchases_enabled"],
+            config.features.boosts.purchases_enabled
         );
     }
 }

@@ -9,6 +9,7 @@ use rocket::Route;
 
 mod checkout;
 mod me;
+mod prot;
 mod stats;
 mod webhook;
 
@@ -17,6 +18,8 @@ pub fn routes() -> (Vec<Route>, OpenApi) {
         // Session user
         checkout::checkout,
         me::me,
+        prot::prot_checkout,
+        prot::prot_me,
         // Public
         stats::stats,
         // Stripe

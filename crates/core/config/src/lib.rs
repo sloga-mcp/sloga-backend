@@ -1744,7 +1744,11 @@ pub struct FeaturePayments {
     pub prot_exact_min_cents: i64,
     /// Largest pay-exact purchase, in cents
     pub prot_exact_max_cents: i64,
-    /// Same format and env form as cipher_blocked_countries
+    /// Same format and env form as cipher_blocked_countries. The default is
+    /// wider than Cipher's: Norway, Iceland and Liechtenstein are added
+    /// (`PROT_BLOCKED_COUNTRIES_DEFAULT`), because Prot is sold
+    /// non-refundable and buyers there keep a statutory right of withdrawal
+    /// that the Prot checkout terms do not waive
     #[serde(deserialize_with = "country_list")]
     pub prot_blocked_countries: Vec<String>,
     /// Where Checkout returns a web buyer of Prot
@@ -1804,6 +1808,13 @@ pub const CIPHER_BLOCKED_COUNTRIES_DEFAULT: [&str; 28] = [
     "LT", "LU", "MT", "NL", "PL", "PT", "RO", "SK", "SI", "ES", "SE", "GB",
 ];
 
+/// The Cipher list plus Norway, Iceland and Liechtenstein (the rest of the
+/// EEA): the default of `[features.payments] prot_blocked_countries`
+pub const PROT_BLOCKED_COUNTRIES_DEFAULT: [&str; 31] = [
+    "AT", "BE", "BG", "HR", "CY", "CZ", "DK", "EE", "FI", "FR", "DE", "GR", "HU", "IE", "IT", "LV",
+    "LT", "LU", "MT", "NL", "PL", "PT", "RO", "SK", "SI", "ES", "SE", "GB", "NO", "IS", "LI",
+];
+
 impl Default for FeaturePayments {
     fn default() -> Self {
         Self {
@@ -1824,9 +1835,7 @@ impl Default for FeaturePayments {
             ],
             prot_exact_min_cents: 50,
             prot_exact_max_cents: 50000,
-            prot_blocked_countries: CIPHER_BLOCKED_COUNTRIES_DEFAULT
-                .map(str::to_string)
-                .to_vec(),
+            prot_blocked_countries: PROT_BLOCKED_COUNTRIES_DEFAULT.map(str::to_string).to_vec(),
             prot_success_url: "https://app.sloga.gg/settings?prot=success".to_string(),
             prot_cancel_url: "https://app.sloga.gg/settings?prot=cancel".to_string(),
             prot_shell_return_url: "https://sloga.gg/prot/thanks/".to_string(),
@@ -3592,7 +3601,7 @@ mod prot_config_tests {
 
     use super::{
         FeaturePayments, ProtPackConfig, ProtTierCosts, ProtectionFeatures, Settings,
-        CIPHER_BLOCKED_COUNTRIES_DEFAULT,
+        CIPHER_BLOCKED_COUNTRIES_DEFAULT, PROT_BLOCKED_COUNTRIES_DEFAULT,
     };
 
     /// The embedded Revolt.toml with each overlay layered on top, in order
@@ -3673,9 +3682,7 @@ mod prot_config_tests {
         assert_eq!(payments.prot_exact_max_cents, 50000);
         assert_eq!(
             payments.prot_blocked_countries,
-            CIPHER_BLOCKED_COUNTRIES_DEFAULT
-                .map(str::to_string)
-                .to_vec()
+            PROT_BLOCKED_COUNTRIES_DEFAULT.map(str::to_string).to_vec()
         );
         assert_eq!(
             payments.prot_success_url,
@@ -3789,9 +3796,39 @@ mod prot_config_tests {
         assert_eq!(payments.prot_packs, default_packs());
         assert_eq!(
             payments.prot_blocked_countries,
+            PROT_BLOCKED_COUNTRIES_DEFAULT.map(str::to_string).to_vec()
+        );
+    }
+
+    /// The Prot default is the Cipher list plus Norway, Iceland and
+    /// Liechtenstein, each code once; widening it must not touch Cipher's
+    #[test]
+    fn prot_blocked_countries_default_adds_the_rest_of_the_eea() {
+        assert_eq!(
+            PROT_BLOCKED_COUNTRIES_DEFAULT[..28],
             CIPHER_BLOCKED_COUNTRIES_DEFAULT
-                .map(str::to_string)
-                .to_vec()
+        );
+        assert_eq!(PROT_BLOCKED_COUNTRIES_DEFAULT[28..], ["NO", "IS", "LI"]);
+        let mut codes = PROT_BLOCKED_COUNTRIES_DEFAULT.to_vec();
+        codes.sort_unstable();
+        codes.dedup();
+        assert_eq!(codes.len(), 31);
+        for code in ["US", "CH", "UK", "EL"] {
+            assert!(!codes.contains(&code), "{code} must not be listed");
+        }
+
+        // Cipher keeps the 27 EU member states and the UK, in code and in
+        // the embedded Revolt.toml
+        let cipher = [
+            "AT", "BE", "BG", "HR", "CY", "CZ", "DK", "EE", "FI", "FR", "DE", "GR", "HU", "IE",
+            "IT", "LV", "LT", "LU", "MT", "NL", "PL", "PT", "RO", "SK", "SI", "ES", "SE", "GB",
+        ]
+        .map(str::to_string)
+        .to_vec();
+        assert_eq!(FeaturePayments::default().cipher_blocked_countries, cipher);
+        assert_eq!(
+            settings(&[]).features.payments.cipher_blocked_countries,
+            cipher
         );
     }
 

@@ -546,11 +546,14 @@ prot_packs = [
 # Pay-exact bounds, in cents (1 Prot = 1 cent); 50 is Stripe's USD minimum
 prot_exact_min_cents = 50
 prot_exact_max_cents = 50000
-# Countries Prot is not sold to; same format, env form and default as cipher_blocked_countries
-# (REVOLT__FEATURES__PAYMENTS__PROT_BLOCKED_COUNTRIES=DE,FR)
+# Countries Prot is not sold to; same format and env form as cipher_blocked_countries
+# (REVOLT__FEATURES__PAYMENTS__PROT_BLOCKED_COUNTRIES=DE,FR). The Cipher list plus Norway, Iceland
+# and Liechtenstein: Prot is sold non-refundable, and buyers there keep a statutory right of
+# withdrawal that the Prot checkout terms do not waive.
 prot_blocked_countries = [
     "AT", "BE", "BG", "HR", "CY", "CZ", "DK", "EE", "FI", "FR", "DE", "GR", "HU", "IE",
     "IT", "LV", "LT", "LU", "MT", "NL", "PL", "PT", "RO", "SK", "SI", "ES", "SE", "GB",
+    "NO", "IS", "LI",
 ]
 # Where Checkout returns a Prot buyer: web success and cancel, and the shells (both outcomes)
 prot_success_url = "https://app.sloga.gg/settings?prot=success"

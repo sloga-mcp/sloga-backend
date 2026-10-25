@@ -131,6 +131,7 @@ async fn main() {
         cron_task_wrapper(afk_sweep::task, db.clone(), amqp.clone()),
         cron_task_wrapper(antispam_daily::task, db.clone(), amqp.clone()),
         cron_task_wrapper(payments_reconcile::task, db.clone(), amqp.clone()),
+        cron_task_wrapper(prot_cipher_backfill::task, db.clone(), amqp.clone()),
     );
 }
 

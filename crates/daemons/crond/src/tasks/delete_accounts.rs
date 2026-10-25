@@ -20,6 +20,15 @@
 //! the next hourly run tries the whole cascade again; once the account is
 //! marked deleted nothing would ever unlink its orders.
 //!
+//! The Prot wallet is forfeited after `User::delete`
+//! (`engine::prot::forfeit_wallet_on_deletion`, whatever the Prot flags
+//! say): the delete cascade (the owner's servers among it) runs first, so
+//! anything it pays back into the wallet is forfeited with the rest, and the
+//! user is already flagged deleted, so a credit that lands after the forfeit
+//! is forfeited by the engine's second pass (`forfeit:{user_id}:{n}`). The
+//! forfeit must succeed too: when it fails the account is not marked deleted
+//! and stays due, and the next run repeats the cascade and the forfeit.
+//!
 //! The Stripe secret key is only handed to the client; it is never logged.
 
 use std::time::Duration;
@@ -110,7 +119,9 @@ async fn delete_accounts(
 
 /// [`delete_accounts`] with the payments cascade passed in (tests inject a
 /// failing one). An account whose cascade fails is skipped, not deleted:
-/// it stays due and the next run tries again.
+/// it stays due and the next run tries again. So is one whose Prot wallet
+/// could not be forfeited (after `User::delete`, so that run has already
+/// anonymised the user).
 async fn delete_accounts_with<F, Fut>(
     db: &Database,
     accounts: Vec<Account>,
@@ -137,6 +148,21 @@ where
         }
 
         user.delete(db).await?;
+        // Prot (D11): the wallet is forfeited AFTER the delete cascade (S5b: settlements and
+        // goal cancellations pay the owner's own share into the wallet first). Must succeed: on
+        // failure the account stays due and the next run repeats the cascade (as a failed
+        // mark_deleted does today).
+        if let Err(err) =
+            engine::prot::forfeit_wallet_on_deletion(db, &user.id, revolt_database::now_ms()).await
+        {
+            log::error!(
+                "Account deletion of {}: its Prot wallet could not be forfeited; retrying next \
+                 run: {err:?}",
+                user.id
+            );
+            revolt_config::capture_error(&err);
+            continue;
+        }
         account.mark_deleted(db).await?;
     }
 
@@ -175,6 +201,14 @@ mod tests {
         stripe::{CheckoutSession, MockStripe, StripeError},
     };
     use revolt_result::create_error;
+
+    use revolt_database::test_teardown::TestDatabaseGuard;
+    use revolt_database::{
+        prot_key_admin, prot_key_forfeit, prot_key_purchase, prot_user_account, ProtAmount,
+        ProtPosting, ProtRef, Server, PROT_ACTOR_DELETION, PROT_ACTOR_PAYMENTS, PROT_SYS_ADJUST,
+        PROT_SYS_FORFEITED, PROT_SYS_ISSUED,
+    };
+    use revolt_models::v0::{DataCreateServer, ProtEntryKind};
 
     use super::*;
 
@@ -533,5 +567,259 @@ mod tests {
             .await
             .unwrap();
         assert_deleted(&db, "u1").await;
+    }
+
+    /// A fresh test database on the driver `TEST_DB` names (which must be
+    /// set: `DatabaseInfo::Test` panics without it rather than reach the
+    /// configured database). Migrated, so MongoDB has the Prot indexes (the
+    /// ledger's unique key among them). The guard drops it when the test
+    /// ends, panics included.
+    async fn test_db() -> (Database, TestDatabaseGuard) {
+        let suffix = 1_000_000 + (ulid::Ulid::new().random() % 9_000_000);
+        let db = DatabaseInfo::Test(format!("revolt_test_{suffix}"))
+            .connect()
+            .await
+            .expect("test database");
+        let guard = TestDatabaseGuard::arm(&db).await;
+        db.migrate_database().await.expect("schema");
+        (db, guard)
+    }
+
+    /// Credit `amount` Prot to `user`'s wallet under `key`, as a purchase
+    async fn credit_prot(db: &Database, user: &str, key: &str, amount: i64) {
+        db.apply_prot_posting(&ProtPosting {
+            key: key.to_string(),
+            kind: ProtEntryKind::Purchase,
+            debit: PROT_SYS_ISSUED.to_string(),
+            credit: prot_user_account(user),
+            amount: ProtAmount::Exact(amount),
+            debit_floor: 0,
+            actor: PROT_ACTOR_PAYMENTS.to_string(),
+            reference: ProtRef::default(),
+            reason: None,
+            created_at: revolt_database::now_ms(),
+        })
+        .await
+        .unwrap();
+    }
+
+    /// Support takes `amount` Prot out of `user`'s wallet by hand
+    async fn debit_by_admin(db: &Database, user: &str, nonce: &str, amount: i64) {
+        db.apply_prot_posting(&ProtPosting {
+            key: prot_key_admin("01ADMIN0000000000000000000", nonce),
+            kind: ProtEntryKind::AdminAdjust,
+            debit: prot_user_account(user),
+            credit: PROT_SYS_ADJUST.to_string(),
+            amount: ProtAmount::Exact(amount),
+            debit_floor: 0,
+            actor: "01ADMIN0000000000000000000".to_string(),
+            reference: ProtRef::default(),
+            reason: Some("settled by hand".to_string()),
+            created_at: revolt_database::now_ms(),
+        })
+        .await
+        .unwrap();
+    }
+
+    /// `user`'s wallet balance (0 without a wallet)
+    async fn wallet(db: &Database, user: &str) -> i64 {
+        db.fetch_prot_account(&prot_user_account(user))
+            .await
+            .unwrap()
+            .map_or(0, |account| account.balance)
+    }
+
+    /// How many forfeit rows debit `user`'s wallet
+    async fn forfeit_rows(db: &Database, user: &str) -> usize {
+        db.fetch_prot_entries_by_account(&prot_user_account(user), None, 100)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|row| row.kind == ProtEntryKind::Forfeit)
+            .count()
+    }
+
+    /// Forfeit pass `n` of `user`'s wallet moved `amount` to sys:forfeited
+    async fn assert_forfeited(db: &Database, user: &str, n: u64, amount: i64) {
+        let row = db
+            .fetch_prot_entry_by_key(&prot_key_forfeit(user, n))
+            .await
+            .unwrap()
+            .unwrap_or_else(|| panic!("forfeit pass {n} of {user}"));
+        assert_eq!(row.kind, ProtEntryKind::Forfeit);
+        assert_eq!(row.debit, prot_user_account(user));
+        assert_eq!(row.credit, PROT_SYS_FORFEITED);
+        assert_eq!(row.amount, amount);
+        assert_eq!(row.actor, PROT_ACTOR_DELETION);
+    }
+
+    /// An owner holding Prot: the delete cascade removes their server, then
+    /// the whole wallet is forfeited in one pass. The forfeit runs without a
+    /// payments config too, and another user's wallet is not touched.
+    #[tokio::test]
+    async fn an_owner_holding_prot_loses_their_server_and_forfeits_the_wallet() {
+        let (db, _teardown) = test_db().await;
+        insert_user(&db, "u1").await;
+        insert_user(&db, "u2").await;
+        let owner = db.fetch_user("u1").await.unwrap();
+        let (server, _) = Server::create(
+            &db,
+            DataCreateServer {
+                name: "Owned".to_string(),
+                description: None,
+                nsfw: None,
+            },
+            &owner,
+            true,
+        )
+        .await
+        .unwrap();
+        credit_prot(&db, "u1", &prot_key_purchase("01ORDERU1"), 1_250).await;
+        credit_prot(&db, "u2", &prot_key_purchase("01ORDERU2"), 300).await;
+        schedule_deletion(&db, "u1").await;
+
+        let accounts = db.fetch_accounts_due_for_deletion().await.unwrap();
+        assert_eq!(accounts.len(), 1);
+        delete_accounts(&db, None, accounts).await.unwrap();
+
+        assert_deleted(&db, "u1").await;
+        assert!(
+            db.fetch_server(&server.id).await.is_err(),
+            "the owned server is deleted"
+        );
+        assert_forfeited(&db, "u1", 1, 1_250).await;
+        assert_eq!(forfeit_rows(&db, "u1").await, 1);
+        assert_eq!(wallet(&db, "u1").await, 0);
+
+        // Only the deleted account's wallet moves
+        assert_eq!(wallet(&db, "u2").await, 300);
+        assert_eq!(forfeit_rows(&db, "u2").await, 0);
+    }
+
+    /// A forfeit that fails stops the deletion of that account only. The
+    /// cascade has already run (the user is anonymised), but the account is
+    /// not marked deleted and stays due; the next run repeats the cascade on
+    /// the anonymised user and, once the forfeit goes through, deletes it.
+    #[tokio::test]
+    async fn a_failed_forfeit_keeps_the_account_due_for_the_next_run() {
+        let (db, _teardown) = test_db().await;
+        insert_user(&db, "u1").await;
+        insert_user(&db, "u2").await;
+        // A row with another payload already holds u1's first forfeit key, so
+        // its forfeit pass is refused (ProtIdempotencyConflict) on any run
+        credit_prot(&db, "u1", &prot_key_forfeit("u1", 1), 500).await;
+        credit_prot(&db, "u2", &prot_key_purchase("01ORDERU2"), 200).await;
+        schedule_deletion(&db, "u1").await;
+        schedule_deletion(&db, "u2").await;
+
+        let accounts = db.fetch_accounts_due_for_deletion().await.unwrap();
+        assert_eq!(accounts.len(), 2);
+        delete_accounts_with(&db, accounts, |_| async { Ok(()) })
+            .await
+            .unwrap();
+
+        // u2 went ahead
+        assert_deleted(&db, "u2").await;
+        assert_forfeited(&db, "u2", 1, 200).await;
+        assert_eq!(wallet(&db, "u2").await, 0);
+
+        // u1 is anonymised but not marked deleted, and keeps its Prot
+        let kept = db.fetch_user("u1").await.unwrap();
+        assert_ne!(
+            kept.flags.unwrap_or_default() & UserFlags::Deleted as i32,
+            0,
+            "the delete cascade ran before the forfeit"
+        );
+        assert!(matches!(
+            db.fetch_account("u1").await.unwrap().deletion,
+            Some(DeletionInfo::Scheduled { .. })
+        ));
+        assert_eq!(wallet(&db, "u1").await, 500);
+        assert_eq!(forfeit_rows(&db, "u1").await, 0);
+        let due = db.fetch_accounts_due_for_deletion().await.unwrap();
+        assert_eq!(
+            due.iter().map(|a| a.id.as_str()).collect::<Vec<_>>(),
+            ["u1"],
+            "u1 is still due"
+        );
+
+        // Support empties the wallet by hand; the next run has nothing to
+        // forfeit and deletes the account
+        debit_by_admin(&db, "u1", "settle", 500).await;
+        delete_accounts_with(&db, due, |_| async { Ok(()) })
+            .await
+            .unwrap();
+        assert_deleted(&db, "u1").await;
+        assert_eq!(wallet(&db, "u1").await, 0);
+        assert_eq!(forfeit_rows(&db, "u1").await, 0);
+        assert!(db
+            .fetch_accounts_due_for_deletion()
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    /// Prot credited to a wallet after an earlier forfeit pass (a run that
+    /// forfeited it and then failed to mark the account deleted), while the
+    /// account is still due: the next run forfeits it under the next key
+    #[tokio::test]
+    async fn prot_credited_after_an_earlier_forfeit_pass_is_forfeited_under_the_next_key() {
+        let (db, _teardown) = test_db().await;
+        insert_user(&db, "u1").await;
+        schedule_deletion(&db, "u1").await;
+        credit_prot(&db, "u1", &prot_key_purchase("01ORDERA"), 400).await;
+        let first = db
+            .forfeit_prot_wallet("u1", revolt_database::now_ms())
+            .await
+            .unwrap()
+            .expect("the first pass");
+        assert_eq!(first.entry().key, prot_key_forfeit("u1", 1));
+        credit_prot(&db, "u1", &prot_key_purchase("01ORDERB"), 150).await;
+
+        let accounts = db.fetch_accounts_due_for_deletion().await.unwrap();
+        assert_eq!(accounts.len(), 1);
+        delete_accounts_with(&db, accounts, |_| async { Ok(()) })
+            .await
+            .unwrap();
+
+        assert_deleted(&db, "u1").await;
+        assert_forfeited(&db, "u1", 1, 400).await;
+        assert_forfeited(&db, "u1", 2, 150).await;
+        assert_eq!(forfeit_rows(&db, "u1").await, 2);
+        assert_eq!(wallet(&db, "u1").await, 0);
+    }
+
+    /// No wallet, or an emptied one: nothing is written to the ledger and the
+    /// deletion goes ahead
+    #[tokio::test]
+    async fn an_account_without_prot_is_deleted_without_a_ledger_row() {
+        let (db, _teardown) = test_db().await;
+        insert_user(&db, "u1").await;
+        insert_user(&db, "u2").await;
+        credit_prot(&db, "u2", &prot_key_purchase("01ORDERU2"), 100).await;
+        debit_by_admin(&db, "u2", "empty", 100).await;
+        schedule_deletion(&db, "u1").await;
+        schedule_deletion(&db, "u2").await;
+
+        let accounts = db.fetch_accounts_due_for_deletion().await.unwrap();
+        assert_eq!(accounts.len(), 2);
+        delete_accounts_with(&db, accounts, |_| async { Ok(()) })
+            .await
+            .unwrap();
+
+        assert_deleted(&db, "u1").await;
+        assert_deleted(&db, "u2").await;
+        assert!(db
+            .fetch_prot_account(&prot_user_account("u1"))
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(forfeit_rows(&db, "u1").await, 0);
+        assert_eq!(forfeit_rows(&db, "u2").await, 0);
+        assert!(db
+            .fetch_prot_entry_by_key(&prot_key_forfeit("u2", 1))
+            .await
+            .unwrap()
+            .is_none());
     }
 }
