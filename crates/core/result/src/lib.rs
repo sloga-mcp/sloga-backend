@@ -388,7 +388,7 @@ pub enum ErrorType {
     /// The channel's Text group is mid-resecure; the client refreshes its
     /// seats and text group, then retries. `reason` is one of
     /// `pending_removal`, `stale_epoch`, `stale_group`, `not_member`,
-    /// `stale_seat_list`.
+    /// `stale_seat_list`, `owner_device_lost`.
     ProtectedChannelResecuring {
         reason: String,
     },
@@ -415,6 +415,17 @@ pub enum ErrorType {
     /// first; adding one back later is an ordinary seat claim.
     SeatListNamesRemovedUsers {
         users: Vec<String>,
+    },
+    /// A kick or ban in a server with a protected channel, or a seat list
+    /// that releases someone, needs a non-empty `X-Audit-Log-Reason`. The
+    /// reason is not part of the signed list, so a refused list is re-sent
+    /// with the same bytes and the header.
+    RemovalReasonRequired,
+    /// An ownership transfer of a server with protected channels must carry,
+    /// for each of them, a seat list with a handover to the new owner;
+    /// `channel_ids` names the channels the request lacks one for
+    ProtectedHandoverRequired {
+        channel_ids: Vec<String>,
     },
 }
 
@@ -618,6 +629,55 @@ mod tests {
             ErrorType::SeatListNamesRemovedUsers { users } => assert_eq!(
                 users,
                 ["01HZXBBBBBBBBBBBBBBBBBBBBB", "01HZXCCCCCCCCCCCCCCCCCCCCC"]
+            ),
+            other => panic!("unexpected error type {other:?}"),
+        }
+    }
+
+    /// S2-D20: the type the kick, ban and seat-list dialogs key on, with no
+    /// fields
+    #[cfg(feature = "serde")]
+    #[test]
+    fn removal_reason_required_round_trips() {
+        let value = serde_json::to_value(create_error!(RemovalReasonRequired)).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({ "type": "RemovalReasonRequired" })
+        );
+
+        let decoded = serde_json::from_value::<crate::Error>(value).unwrap();
+        assert!(matches!(
+            decoded.error_type,
+            ErrorType::RemovalReasonRequired
+        ));
+    }
+
+    /// S2-D25 [S2b]: the channels still lacking a handover survive a round
+    /// trip under `channel_ids`
+    #[cfg(feature = "serde")]
+    #[test]
+    fn protected_handover_required_round_trips() {
+        let error = create_error!(ProtectedHandoverRequired {
+            channel_ids: vec![
+                "01HZXDDDDDDDDDDDDDDDDDDDDD".to_string(),
+                "01HZXEEEEEEEEEEEEEEEEEEEEE".to_string(),
+            ],
+        });
+
+        let value = serde_json::to_value(&error).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "type": "ProtectedHandoverRequired",
+                "channel_ids": ["01HZXDDDDDDDDDDDDDDDDDDDDD", "01HZXEEEEEEEEEEEEEEEEEEEEE"],
+            })
+        );
+
+        let decoded = serde_json::from_value::<crate::Error>(value).unwrap();
+        match decoded.error_type {
+            ErrorType::ProtectedHandoverRequired { channel_ids } => assert_eq!(
+                channel_ids,
+                ["01HZXDDDDDDDDDDDDDDDDDDDDD", "01HZXEEEEEEEEEEEEEEEEEEEEE"]
             ),
             other => panic!("unexpected error type {other:?}"),
         }

@@ -2481,6 +2481,8 @@ impl From<crate::MlsEnvelopeRejoinIntent> for MlsRejoinIntentInfo {
             device_id: value.device_id,
             key_package_ref: value.key_package_ref,
             signature: value.signature,
+            generation: None,
+            issued_at: None,
         }
     }
 }
@@ -2533,6 +2535,8 @@ impl crate::MlsJoinIntent {
             device_id: self.device_id,
             key_package_ref: self.key_package_ref,
             signature: self.signature,
+            generation: None,
+            issued_at: None,
         }
     }
 }
@@ -2595,6 +2599,9 @@ impl crate::MlsGroup {
             members: self.members.into_iter().map(Into::into).collect(),
             pending_removals: self.pending_removals.into_iter().map(Into::into).collect(),
             member_added: self.member_added.into_iter().map(Into::into).collect(),
+            join_requests: Vec::new(),
+            pending_device_removals: Vec::new(),
+            signer_lost: None,
         })
     }
 }
@@ -2674,6 +2681,7 @@ impl From<crate::SeatList> for ChannelSeatListInfo {
             signer_user_id: value.signer_user_id,
             signer_device_id: value.signer_device_id,
             handovers: value.handovers.into_iter().map(Into::into).collect(),
+            authority: None,
         }
     }
 }
@@ -2695,6 +2703,7 @@ impl crate::ChannelSeat {
             user_id: self.user_id,
             released_at: self.released_at?,
             cooldown_until: self.cooldown_until?,
+            cause: None,
         })
     }
 }
@@ -2798,6 +2807,7 @@ mod protected_channel_bridge_tests {
                 body: "handover".to_string(),
                 signature: "aG8".to_string(),
             }),
+            authority: None,
         }
         .into();
         assert_eq!(submission.body, "body");

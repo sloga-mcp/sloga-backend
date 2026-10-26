@@ -124,6 +124,13 @@ auto_derived!(
         /// One-time keys remaining (own devices only; drives replenishment)
         #[serde(skip_serializing_if = "Option::is_none")]
         pub one_time_key_count: Option<u64>,
+        /// The session this device is bound to (own devices only; protected
+        /// channels design §7.2, S2-D38)
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub session_id: Option<String>,
+        /// That session's name (own devices only)
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub session_name: Option<String>,
     }
 
     /// An encrypted envelope submitted for relay
@@ -299,7 +306,8 @@ auto_derived!(
 #[cfg(test)]
 mod tests {
     use super::{
-        E2EEContentType, E2EEMessage, MlsMemberDevice, MlsRejoinIntentInfo, MlsRemovedReasonInfo,
+        E2EEContentType, E2EEDeviceInfo, E2EEMessage, MlsMemberDevice, MlsRejoinIntentInfo,
+        MlsRemovedReasonInfo,
     };
     use crate::v0::MlsRemovalReason;
 
@@ -370,6 +378,8 @@ mod tests {
             device_id: "b".repeat(32),
             key_package_ref: "a3ByZWY".to_string(),
             signature: "c2ln".to_string(),
+            generation: None,
+            issued_at: None,
         };
         let text = E2EEMessage {
             committer: Some(device("01JA00000000000000000USERA", "a")),
@@ -417,5 +427,62 @@ mod tests {
             }])
         );
         assert_eq!(serde_json::from_value::<E2EEMessage>(value).unwrap(), text);
+    }
+
+    /// S2 (design §3.13): a rejoin intent signed over the Text join payload
+    /// carries its `generation` and `issued_at` on the envelope too
+    #[test]
+    fn text_commit_envelope_carries_text_join_fields() {
+        let intent = MlsRejoinIntentInfo {
+            group_id: format!("{}1", "0".repeat(63)),
+            channel_id: "01JA0000000000000000CHANNEL".to_string(),
+            user_id: "01JA00000000000000000USERB".to_string(),
+            device_id: "b".repeat(32),
+            key_package_ref: "a3ByZWY".to_string(),
+            signature: "c2ln".to_string(),
+            generation: Some(65535),
+            issued_at: Some(1_760_000_000_000),
+        };
+        let text = E2EEMessage {
+            rejoin_intents: vec![intent],
+            ..call_commit()
+        };
+        let value = serde_json::to_value(&text).unwrap();
+        assert_eq!(value["rejoin_intents"][0]["generation"], 65535);
+        assert_eq!(
+            value["rejoin_intents"][0]["issued_at"],
+            1_760_000_000_000i64
+        );
+        assert_eq!(serde_json::from_value::<E2EEMessage>(value).unwrap(), text);
+    }
+
+    /// An own-device listing entry exactly as the S1 route serialized it
+    const OWN_DEVICE_AT_B6643748: &str = r#"{"device_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","protocol_version":1,"ed25519_key":"ZWQ","curve25519_key":"Y3Y","signature":"c2ln","created_at":"2026-10-01T12:00:00.000Z","last_seen_at":"2026-10-02T12:00:00.000Z","one_time_key_count":50}"#;
+
+    /// S2-D38: `session_id` and `session_name` are absent when unset (so the
+    /// S1 shape and every other user's entries are unchanged), an S1 entry
+    /// still decodes, and both travel under exactly these keys
+    #[test]
+    fn device_info_session_fields_are_optional() {
+        let parsed: E2EEDeviceInfo = serde_json::from_str(OWN_DEVICE_AT_B6643748).unwrap();
+        assert_eq!(parsed.session_id, None);
+        assert_eq!(parsed.session_name, None);
+        assert_eq!(
+            serde_json::to_string(&parsed).unwrap(),
+            OWN_DEVICE_AT_B6643748
+        );
+
+        let named = E2EEDeviceInfo {
+            session_id: Some("01JA0000000000000000SESSION".to_string()),
+            session_name: Some("Desktop".to_string()),
+            ..parsed
+        };
+        let value = serde_json::to_value(&named).unwrap();
+        assert_eq!(value["session_id"], "01JA0000000000000000SESSION");
+        assert_eq!(value["session_name"], "Desktop");
+        assert_eq!(
+            serde_json::from_value::<E2EEDeviceInfo>(value).unwrap(),
+            named
+        );
     }
 }

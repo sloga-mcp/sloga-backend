@@ -908,6 +908,7 @@ impl TestE2EEDevice {
             body,
             signer_device_id: self.device_id.clone(),
             handover: None,
+            authority: None,
         }
     }
 

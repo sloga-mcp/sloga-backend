@@ -272,6 +272,8 @@ async fn full_flow_create_join_commit_fanout_case() {
                 device_id: device_b.device.device_id.clone(),
                 key_package_ref: "b0".to_string(),
                 signature: device_b.join_signature(&user_b.id, &gid, "b0"),
+                generation: None,
+                issued_at: None,
             })
             .unwrap(),
         )
@@ -543,6 +545,8 @@ async fn rejoin_affordance_flags_and_solo_close_case() {
                 device_id: device_b.device.device_id.clone(),
                 key_package_ref: "b0".to_string(),
                 signature: device_b.join_signature(&user_b.id, &gid, "b0"),
+                generation: None,
+                issued_at: None,
             })
             .unwrap(),
         )
@@ -601,6 +605,8 @@ async fn rejoin_affordance_flags_and_solo_close_case() {
                 device_id: device_a.device.device_id.clone(),
                 key_package_ref: "a0".to_string(),
                 signature: device_a.join_signature(&user_a.id, &solo_gid, "a0"),
+                generation: None,
+                issued_at: None,
             })
             .unwrap(),
         )
@@ -618,6 +624,8 @@ async fn rejoin_affordance_flags_and_solo_close_case() {
                 device_id: device_a.device.device_id.clone(),
                 key_package_ref: "a0".to_string(),
                 signature: device_a.join_signature(&user_a.id, &solo_gid, "a0"),
+                generation: None,
+                issued_at: None,
             })
             .unwrap(),
         )
@@ -748,6 +756,8 @@ async fn dual_reload_rejoin_closes_group_case() {
                 device_id: device_b.device.device_id.clone(),
                 key_package_ref: "b0".to_string(),
                 signature: device_b.join_signature(&user_b.id, &gid, "b0"),
+                generation: None,
+                issued_at: None,
             })
             .unwrap(),
         )
@@ -790,6 +800,8 @@ async fn dual_reload_rejoin_closes_group_case() {
                 device_id: device_a.device.device_id.clone(),
                 key_package_ref: "a0".to_string(),
                 signature: device_a.join_signature(&user_a.id, &gid, "a0"),
+                generation: None,
+                issued_at: None,
             })
             .unwrap(),
         )
@@ -813,6 +825,8 @@ async fn dual_reload_rejoin_closes_group_case() {
                 device_id: device_b.device.device_id.clone(),
                 key_package_ref: "b0".to_string(),
                 signature: device_b.join_signature(&user_b.id, &gid, "b0"),
+                generation: None,
+                issued_at: None,
             })
             .unwrap(),
         )
@@ -833,6 +847,8 @@ async fn dual_reload_rejoin_closes_group_case() {
                 device_id: device_a.device.device_id.clone(),
                 key_package_ref: "a0".to_string(),
                 signature: device_a.join_signature(&user_a.id, &gid, "a0"),
+                generation: None,
+                issued_at: None,
             })
             .unwrap(),
         )
@@ -1266,6 +1282,8 @@ async fn join_intent_signature_one_device_and_rate_limit_case() {
             device_id: device_b.device.device_id.clone(),
             key_package_ref: "b0".to_string(),
             signature: STANDARD_NO_PAD.encode([0u8; 64]),
+            generation: None,
+            issued_at: None,
         })
         .unwrap(),
     )
@@ -1291,6 +1309,8 @@ async fn join_intent_signature_one_device_and_rate_limit_case() {
             device_id: second_device.device.device_id.clone(),
             key_package_ref: "a20".to_string(),
             signature: second_device.join_signature(&user_a.id, &gid, "a20"),
+            generation: None,
+            issued_at: None,
         })
         .unwrap(),
     )
@@ -1302,6 +1322,8 @@ async fn join_intent_signature_one_device_and_rate_limit_case() {
         device_id: device_b.device.device_id.clone(),
         key_package_ref: "b0".to_string(),
         signature: device_b.join_signature(&user_b.id, &gid, "b0"),
+        generation: None,
+        issued_at: None,
     })
     .unwrap();
 
@@ -1931,6 +1953,8 @@ async fn join_intent_call_full_boundary_and_rejoin_exemption_case() {
                 &gid,
                 &STANDARD_NO_PAD.encode(b"ref-c"),
             ),
+            generation: None,
+            issued_at: None,
         })
         .unwrap(),
     )
@@ -1960,6 +1984,8 @@ async fn join_intent_call_full_boundary_and_rejoin_exemption_case() {
                 &gid,
                 &STANDARD_NO_PAD.encode(b"ref-b2"),
             ),
+            generation: None,
+            issued_at: None,
         })
         .unwrap(),
     )
@@ -2172,6 +2198,8 @@ async fn flag_off_rejects_every_route_case() {
                 device_id: owner_device.device_id.clone(),
                 key_package_ref: "a".to_string(),
                 signature: "a".to_string(),
+                generation: None,
+                issued_at: None,
             })
             .unwrap(),
         ),

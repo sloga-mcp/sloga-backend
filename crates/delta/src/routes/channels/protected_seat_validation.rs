@@ -642,6 +642,7 @@ mod tests {
                 body,
                 signer_device_id: self.signer_device.to_string(),
                 handover: None,
+                authority: None,
             }
         }
     }

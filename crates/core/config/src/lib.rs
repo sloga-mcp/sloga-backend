@@ -1715,6 +1715,31 @@ pub struct ProtectedChannelFeatures {
     /// `enabled` and `e2ee_enabled`: it keeps running with either one off
     #[serde(default = "ProtectedChannelFeatures::default_commit_retention_days")]
     pub commit_retention_days: u32,
+    /// Rollout gate for the S2 formats (#218): a channel ENTERS v2 (a v2
+    /// genesis, or a v1-to-v2 upgrade list) only while this is on, because
+    /// an S1 build parses a v2 list in a commit AD as malformed. It governs
+    /// nothing else about formats: a channel already on v2 keeps v2 bodies,
+    /// v2 ids, the AD v2, the Text join payload, seat PUTs and commits and
+    /// successors whatever this says, so turning it off never strands a v2
+    /// channel. On, protect accepts a v2 genesis only; off, a v1 genesis
+    /// only. It also gates the S2 device-revocation hook (#219). Flip it
+    /// once every protected device runs S2. Carried in the root advert
+    #[serde(default)]
+    pub formats_v2: bool,
+    /// Period, in seconds, of the crond protected-access sweep that runs
+    /// `reconcile_channel` over every channel with active seats (S2-D14).
+    /// The sweep runs with either feature flag in any state
+    #[serde(default = "ProtectedChannelFeatures::default_reconcile_sweep_secs")]
+    pub reconcile_sweep_secs: u64,
+    /// How long, in seconds, a Text join or rejoin intent stays
+    /// outstanding (S2-D28): the route's window and the driver's rule-6
+    /// window. The Call window stays 30 s
+    #[serde(default = "ProtectedChannelFeatures::default_text_rejoin_window_secs")]
+    pub text_rejoin_window_secs: u64,
+    /// Successor Text group creates allowed per channel per 24 h (S2-D33);
+    /// one more is refused with `InSlowmode`
+    #[serde(default = "ProtectedChannelFeatures::default_successor_rate_per_day")]
+    pub successor_rate_per_day: u32,
 }
 
 impl Default for ProtectedChannelFeatures {
@@ -1723,6 +1748,10 @@ impl Default for ProtectedChannelFeatures {
             enabled: false,
             default_device_cap: Self::default_device_cap(),
             commit_retention_days: Self::default_commit_retention_days(),
+            formats_v2: false,
+            reconcile_sweep_secs: Self::default_reconcile_sweep_secs(),
+            text_rejoin_window_secs: Self::default_text_rejoin_window_secs(),
+            successor_rate_per_day: Self::default_successor_rate_per_day(),
         }
     }
 }
@@ -1734,6 +1763,18 @@ impl ProtectedChannelFeatures {
 
     fn default_commit_retention_days() -> u32 {
         30
+    }
+
+    fn default_reconcile_sweep_secs() -> u64 {
+        300
+    }
+
+    fn default_text_rejoin_window_secs() -> u64 {
+        86400
+    }
+
+    fn default_successor_rate_per_day() -> u32 {
+        10
     }
 }
 
@@ -2332,12 +2373,112 @@ legacy_private_key = "fake-legacy-private-key-placeholder"
 // environment source, so a developer machine cannot skew the result.
 #[cfg(test)]
 mod protected_channels_config_tests {
-    use config::{Config, File, FileFormat};
+    use std::collections::HashMap;
 
-    use super::Settings;
+    use config::{Config, Environment, File, FileFormat};
+
+    use super::{ProtectedChannelFeatures, Settings};
 
     fn embedded() -> File<config::FileSourceString, FileFormat> {
         File::from_str(include_str!("../Revolt.toml"), FileFormat::Toml)
+    }
+
+    /// The embedded Revolt.toml with an overrides file on top
+    fn layered(overrides: &str) -> ProtectedChannelFeatures {
+        let settings: Settings = Config::builder()
+            .add_source(embedded())
+            .add_source(File::from_str(overrides, FileFormat::Toml))
+            .build()
+            .expect("the layered config builds")
+            .try_deserialize()
+            .expect("the layered config deserializes");
+        settings.features.protected_channels
+    }
+
+    /// The S2 keys at their design 7.1 values
+    fn assert_s2_defaults(protected: &ProtectedChannelFeatures) {
+        assert!(!protected.formats_v2);
+        assert_eq!(protected.reconcile_sweep_secs, 300);
+        assert_eq!(protected.text_rejoin_window_secs, 86400);
+        assert_eq!(protected.successor_rate_per_day, 10);
+    }
+
+    #[test]
+    fn hand_written_defaults_have_the_documented_values() {
+        let protected = ProtectedChannelFeatures::default();
+        assert!(!protected.enabled);
+        assert_eq!(protected.default_device_cap, 5);
+        assert_eq!(protected.commit_retention_days, 30);
+        assert_s2_defaults(&protected);
+    }
+
+    /// An S1 overrides block names none of the S2 keys: it still loads, and
+    /// each S2 key takes its own default
+    #[test]
+    fn an_s1_block_takes_the_s2_defaults() {
+        let protected = layered(
+            "[features.protected_channels]\nenabled = true\ndefault_device_cap = 7\ncommit_retention_days = 14\n",
+        );
+        assert!(protected.enabled);
+        assert_eq!(protected.default_device_cap, 7);
+        assert_eq!(protected.commit_retention_days, 14);
+        assert_s2_defaults(&protected);
+    }
+
+    #[test]
+    fn a_toml_override_sets_each_s2_key() {
+        let protected = layered(
+            "[features.protected_channels]\nformats_v2 = true\nreconcile_sweep_secs = 60\ntext_rejoin_window_secs = 3600\nsuccessor_rate_per_day = 3\n",
+        );
+        assert!(protected.formats_v2);
+        assert_eq!(protected.reconcile_sweep_secs, 60);
+        assert_eq!(protected.text_rejoin_window_secs, 3600);
+        assert_eq!(protected.successor_rate_per_day, 3);
+        // The keys it does not name keep theirs: growth stays off
+        assert!(!protected.enabled);
+        assert_eq!(protected.default_device_cap, 5);
+        assert_eq!(protected.commit_retention_days, 30);
+
+        // One key alone moves only that key
+        let protected = layered("[features.protected_channels]\nformats_v2 = true\n");
+        assert!(protected.formats_v2);
+        assert!(!protected.enabled);
+        assert_eq!(protected.reconcile_sweep_secs, 300);
+        assert_eq!(protected.text_rejoin_window_secs, 86400);
+        assert_eq!(protected.successor_rate_per_day, 10);
+    }
+
+    /// The documented env form (double underscores) reaches the S2 keys
+    #[test]
+    fn environment_override_reaches_the_s2_keys() {
+        let vars: HashMap<String, String> = [
+            ("REVOLT__FEATURES__PROTECTED_CHANNELS__FORMATS_V2", "true"),
+            (
+                "REVOLT__FEATURES__PROTECTED_CHANNELS__SUCCESSOR_RATE_PER_DAY",
+                "4",
+            ),
+        ]
+        .map(|(k, v)| (k.to_owned(), v.to_owned()))
+        .into();
+
+        let settings: Settings = Config::builder()
+            .add_source(embedded())
+            .add_source(
+                Environment::with_prefix("REVOLT")
+                    .separator("__")
+                    .source(Some(vars)),
+            )
+            .build()
+            .expect("the config builds")
+            .try_deserialize()
+            .expect("the config deserializes");
+
+        let protected = &settings.features.protected_channels;
+        assert!(protected.formats_v2);
+        assert_eq!(protected.successor_rate_per_day, 4);
+        assert!(!protected.enabled);
+        assert_eq!(protected.reconcile_sweep_secs, 300);
+        assert_eq!(protected.text_rejoin_window_secs, 86400);
     }
 
     /// The feature ships dark: the defaults alone leave growth off and keep
@@ -2357,10 +2498,12 @@ mod protected_channels_config_tests {
             settings.features.protected_channels.commit_retention_days,
             30
         );
+        assert_s2_defaults(&settings.features.protected_channels);
     }
 
     /// The test config turns growth on, on top of the E2EE plane it needs,
-    /// so the W2 route tests run with the feature live.
+    /// so the W2 route tests run with the feature live. `formats_v2` stays
+    /// off there: the existing route tests protect with a v1 genesis.
     #[test]
     fn the_test_config_turns_growth_on() {
         let settings: Settings = Config::builder()
@@ -2381,6 +2524,7 @@ mod protected_channels_config_tests {
             settings.features.protected_channels.commit_retention_days,
             30
         );
+        assert_s2_defaults(&settings.features.protected_channels);
     }
 }
 

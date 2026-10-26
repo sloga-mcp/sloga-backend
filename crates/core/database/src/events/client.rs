@@ -463,6 +463,18 @@ pub enum EventV1 {
         message_id: String,
     },
 
+    /// A protected channel's seats or Text group changed (protected
+    /// channels 7.5). Published on the CHANNEL topic, so only viewers
+    /// receive it, and it carries no user ids. `scope` names what to
+    /// refetch: `"seats"` (`GET .../seats`) or `"text_group"`
+    /// (`GET .../text_group`). Clients refetch (debounced) and run the
+    /// removal duty; the periodic refresh stays as the backstop. No push
+    /// notification in S2.
+    ProtectedChannelChanged {
+        id: String,
+        scope: Vec<String>,
+    },
+
     /// New webhook
     WebhookCreate(Webhook),
 
@@ -1225,5 +1237,47 @@ mod tests {
     #[test]
     fn session_topic_prefixes_the_session_id() {
         assert_eq!(session_topic("abc"), "session:abc");
+    }
+
+    /// Protected channels 7.5: the event is exactly `type`, `id` and
+    /// `scope` on the wire, in that shape, and nothing else (it goes to
+    /// every viewer of the channel, so a field added here would reach
+    /// them too). A `rename` on the variant or a field compiles and
+    /// moves it to a key stoat.js does not read.
+    #[test]
+    fn protected_channel_changed_has_the_exact_wire_shape() {
+        let event = EventV1::ProtectedChannelChanged {
+            id: "01J9Z3K4M5N6P7Q8R9S0T1V2W3".to_string(),
+            scope: vec!["seats".to_string()],
+        };
+        let json = serde_json::to_string(&event).expect("serializes");
+        assert_eq!(
+            json,
+            r#"{"type":"ProtectedChannelChanged","id":"01J9Z3K4M5N6P7Q8R9S0T1V2W3","scope":["seats"]}"#
+        );
+
+        match serde_json::from_str::<EventV1>(&json).expect("deserializes") {
+            EventV1::ProtectedChannelChanged { id, scope } => {
+                assert_eq!(id, "01J9Z3K4M5N6P7Q8R9S0T1V2W3");
+                assert_eq!(scope, vec!["seats".to_string()]);
+            }
+            other => panic!("round-tripped to another event: {other:?}"),
+        }
+    }
+
+    /// Both scope items survive a round trip, in order, from the JSON a
+    /// publisher sends for a change that touched seats and the Text group.
+    #[test]
+    fn protected_channel_changed_round_trips_both_scopes() {
+        let wire = r#"{"type":"ProtectedChannelChanged","id":"C","scope":["seats","text_group"]}"#;
+        let event = serde_json::from_str::<EventV1>(wire).expect("deserializes");
+        match &event {
+            EventV1::ProtectedChannelChanged { id, scope } => {
+                assert_eq!(id, "C");
+                assert_eq!(scope, &["seats", "text_group"]);
+            }
+            other => panic!("decoded to another event: {other:?}"),
+        }
+        assert_eq!(serde_json::to_string(&event).expect("serializes"), wire);
     }
 }

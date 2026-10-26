@@ -869,6 +869,14 @@ auto_derived!(
         pub signature: String,
     }
 
+    /// A channel authority and its signature (design §2.4, §4.10)
+    pub struct SignedAuthority {
+        /// Exact canonical authority body (design §4.10)
+        pub body: String,
+        /// b64 Ed25519 signature over `body`
+        pub signature: String,
+    }
+
     /// An owner-signed seat list as submitted to protect (the genesis list)
     /// or `PUT /channels/:channel_id/seats` (design §4.1, §7.2)
     pub struct DataSeatList {
@@ -884,6 +892,13 @@ auto_derived!(
             serde(default, skip_serializing_if = "Option::is_none")
         )]
         pub handover: Option<SignedHandover>,
+        /// v2 lists only: the channel authority the body's `authority:` line
+        /// names (design §4.3 step 3b)
+        #[cfg_attr(
+            feature = "serde",
+            serde(default, skip_serializing_if = "Option::is_none")
+        )]
+        pub authority: Option<SignedAuthority>,
     }
 
     /// Protect a channel (`PUT /channels/:channel_id/protect`, design §7.2)
@@ -906,6 +921,12 @@ auto_derived!(
         pub signer_device_id: String,
         /// Append-only owner handover chain
         pub handovers: Vec<SignedHandover>,
+        /// v2 lists only: the stored channel authority; absent when none
+        #[cfg_attr(
+            feature = "serde",
+            serde(default, skip_serializing_if = "Option::is_none")
+        )]
+        pub authority: Option<SignedAuthority>,
     }
 
     /// One active seat (design §7.2)
@@ -923,6 +944,20 @@ auto_derived!(
         pub seated_without_access: Option<bool>,
     }
 
+    /// Why a seat was released (design §2.3 `release_cause`)
+    #[derive(Copy)]
+    #[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
+    pub enum SeatReleaseCauseInfo {
+        /// The owner's seat list unseated the user
+        OwnerUnseat,
+        /// The server removed the user (kick, ban, leave, account deletion)
+        ServerRemoval,
+        /// The reconciler found the user lost access to the channel
+        AccessLost,
+        /// Released before any of the user's devices received the keys
+        DeviceNeverJoined,
+    }
+
     /// One released seat still counting against the slot cap (design §2.3,
     /// §7.2)
     pub struct ChannelSeatCoolingInfo {
@@ -932,6 +967,13 @@ auto_derived!(
         pub released_at: Timestamp,
         /// When the seat stops counting against the slot cap
         pub cooldown_until: Timestamp,
+        /// Why the seat was released. Serialized only when the caller is the
+        /// server owner; absent otherwise
+        #[cfg_attr(
+            feature = "serde",
+            serde(default, skip_serializing_if = "Option::is_none")
+        )]
+        pub cause: Option<SeatReleaseCauseInfo>,
     }
 
     /// Seat state of a channel (`GET` and `PUT /channels/:channel_id/seats`,
@@ -943,6 +985,12 @@ auto_derived!(
         pub as_of_epoch: Option<i64>,
         /// The open Text group's id; `null` without one
         pub as_of_group_id: Option<String>,
+        /// The open Text group's generation (S2-D33); absent without one
+        #[cfg_attr(
+            feature = "serde",
+            serde(default, skip_serializing_if = "Option::is_none")
+        )]
+        pub as_of_generation: Option<u32>,
         /// Ceiling a newly signed list may use (the effective entitlement
         /// cap); `null` without an entitlement
         pub entitlement_device_cap: Option<u32>,
@@ -956,6 +1004,14 @@ auto_derived!(
         pub seats: Vec<ChannelSeatInfo>,
         /// Released seats still cooling down
         pub cooling: Vec<ChannelSeatCoolingInfo>,
+        /// Owner caller only: device ids of the stored authority's
+        /// `owner_devices` with no registered identity or a changed key
+        /// (R27); absent = empty
+        #[cfg_attr(
+            feature = "serde",
+            serde(default, skip_serializing_if = "Vec::is_empty")
+        )]
+        pub revoked_owner_devices: Vec<String>,
     }
 );
 
@@ -1066,6 +1122,7 @@ mod protected_dto_tests {
     use super::{
         ChannelEntitlement, ChannelEntitlementSource, ChannelEntitlementState,
         DataGrantChannelEntitlement, DataProtectChannel, DataSeatList, ResponseChannelSeats,
+        SeatReleaseCauseInfo, SignedAuthority,
     };
 
     /// The 7.2 `GET .../seats` example as the server owner sees it, with
@@ -1116,6 +1173,79 @@ mod protected_dto_tests {
             serde_json::from_str::<DataSeatList>(&extra).unwrap(),
             parsed
         );
+    }
+
+    /// The S2 `GET .../seats` response as the server owner sees it: a v2
+    /// list with its authority, the generation, a revoked owner device and
+    /// a cooling seat's cause (design §7.2 "S2 route changes")
+    const SEATS_S2_OWNER: &str = r#"{"list":{"version":3,"body":"sloga-seat-list-v2\nv:2\n...","signature":"c2ln","signer_user_id":"01JA00000000000000000USERA","signer_device_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","handovers":[],"authority":{"body":"sloga-channel-authority-v1\n...","signature":"YXV0"}},"as_of_epoch":7,"as_of_group_id":"0000000000000000000000000000000000000000000000000000000000000001","as_of_generation":2,"entitlement_device_cap":5,"slot_cap":10,"device_cap":5,"seats_used":2,"seats":[{"user_id":"01JA00000000000000000USERA","seated_at":"2026-10-04T12:00:00.000Z","seated_without_access":false}],"cooling":[{"user_id":"01JA00000000000000000USERB","released_at":"2026-10-01T12:00:00.000Z","cooldown_until":"2026-10-15T12:00:00.000Z","cause":"server_removal"}],"revoked_owner_devices":["ffffffffffffffffffffffffffffffff"]}"#;
+
+    /// S2: every new field round-trips under its exact key; cleared, they
+    /// are all absent, so a member caller (and every v1 channel) gets
+    /// exactly the S1 shape (`channel_seats_response_round_trips_the_example`
+    /// still pins those bytes)
+    #[test]
+    fn channel_seats_s2_fields_round_trip() {
+        let parsed: ResponseChannelSeats = serde_json::from_str(SEATS_S2_OWNER).unwrap();
+        let list = parsed.list.as_ref().unwrap();
+        assert_eq!(
+            list.authority,
+            Some(SignedAuthority {
+                body: "sloga-channel-authority-v1\n...".to_string(),
+                signature: "YXV0".to_string(),
+            })
+        );
+        assert_eq!(parsed.as_of_generation, Some(2));
+        assert_eq!(
+            parsed.cooling[0].cause,
+            Some(SeatReleaseCauseInfo::ServerRemoval)
+        );
+        assert_eq!(parsed.revoked_owner_devices, vec!["f".repeat(32)]);
+        assert_eq!(serde_json::to_string(&parsed).unwrap(), SEATS_S2_OWNER);
+
+        let mut cleared = parsed;
+        cleared.list.as_mut().unwrap().authority = None;
+        cleared.as_of_generation = None;
+        cleared.cooling[0].cause = None;
+        cleared.seats[0].seated_without_access = None;
+        cleared.revoked_owner_devices.clear();
+        let value = serde_json::to_value(&cleared).unwrap();
+        assert!(value["list"].get("authority").is_none());
+        assert!(value["cooling"][0].get("cause").is_none());
+        for key in ["as_of_generation", "revoked_owner_devices"] {
+            assert!(value.get(key).is_none(), "{key} must be absent when empty");
+        }
+
+        for (cause, wire) in [
+            (SeatReleaseCauseInfo::OwnerUnseat, "owner_unseat"),
+            (SeatReleaseCauseInfo::ServerRemoval, "server_removal"),
+            (SeatReleaseCauseInfo::AccessLost, "access_lost"),
+            (
+                SeatReleaseCauseInfo::DeviceNeverJoined,
+                "device_never_joined",
+            ),
+        ] {
+            assert_eq!(serde_json::to_value(cause).unwrap(), wire);
+            assert_eq!(
+                serde_json::from_value::<SeatReleaseCauseInfo>(serde_json::json!(wire)).unwrap(),
+                cause
+            );
+        }
+    }
+
+    /// S2 (design §4.3 step 3b): a seat PUT may carry the channel authority;
+    /// an S1 body has none and serializes unchanged
+    #[test]
+    fn seat_list_body_carries_the_authority() {
+        let s1 = r#"{"body":"sloga-seat-list-v1\nv:1\n...","signature":"c2ln","signer_device_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}"#;
+        let parsed: DataSeatList = serde_json::from_str(s1).unwrap();
+        assert_eq!(parsed.authority, None);
+        assert_eq!(serde_json::to_string(&parsed).unwrap(), s1);
+
+        let v2 = r#"{"body":"sloga-seat-list-v2\nv:2\n...","signature":"c2ln","signer_device_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","authority":{"body":"sloga-channel-authority-v1\n...","signature":"YXV0"}}"#;
+        let parsed: DataSeatList = serde_json::from_str(v2).unwrap();
+        assert_eq!(parsed.authority.as_ref().unwrap().signature, "YXV0");
+        assert_eq!(serde_json::to_string(&parsed).unwrap(), v2);
     }
 
     #[test]

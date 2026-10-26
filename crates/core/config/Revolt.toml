@@ -513,11 +513,18 @@ cipher_blocked_countries = [
 # plane's kill switch is e2ee_enabled, not this flag. Commit pruning is
 # unaffected by both flags: crond keeps pruning with enabled or e2ee_enabled
 # off. commit_retention_days = 0 is the only way to stop it.
+# formats_v2 (S2) governs only a channel ENTERING the v2 formats; a channel
+# already on v2 keeps working with it off. Flip it once every protected
+# device runs S2. The reconcile sweep runs with either flag in any state.
 #
 # [features.protected_channels]
 # enabled = false              # master switch for growth (grants, protect, seating, adds)
 # default_device_cap = 5       # 0 = unlimited (still bounded by 100 leaves)
 # commit_retention_days = 30   # crond prunes Text commits older than this; 0 = never prune
+# formats_v2 = false              # entry into v2 (genesis, upgrade) and the revocation hook; flip once every protected device runs S2
+# reconcile_sweep_secs = 300      # S2-D14 sweep period
+# text_rejoin_window_secs = 86400 # S2-D28 Text join and rejoin intent window (route and driver)
+# successor_rate_per_day = 10     # S2-D33 successor creates per channel per 24 h
 
 [features.limits]
 

@@ -62,6 +62,8 @@ pub async fn fetch_devices(
             curve25519_key: identity.curve25519_key,
             signature: identity.signature,
             one_time_key_count,
+            session_id: None,
+            session_name: None,
         });
     }
 

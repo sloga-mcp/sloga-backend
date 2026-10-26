@@ -457,6 +457,8 @@ mod tests {
             device_id: device.device_id.clone(),
             key_package_ref: key_package_ref.to_string(),
             signature: device.sign(&payload),
+            generation: None,
+            issued_at: None,
         }
     }
 
@@ -1296,6 +1298,8 @@ mod tests {
                     device_id: format!("{:032x}", 0xb07),
                     key_package_ref: "k1".to_string(),
                     signature: STANDARD_NO_PAD.encode([1u8; 64]),
+                    generation: None,
+                    issued_at: None,
                 },
             };
             if malformed {

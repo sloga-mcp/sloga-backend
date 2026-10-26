@@ -90,6 +90,7 @@ async fn fetch_call_commits(
             .map(|commit| commit.into_commit_info(&group.channel_id))
             .collect(),
         current_epoch: group.current_epoch,
+        oldest_epoch: None,
     }))
 }
 
@@ -144,6 +145,7 @@ async fn fetch_text_commits(
             .map(|commit| commit.into_commit_info(&group.channel_id))
             .collect(),
         current_epoch: group.current_epoch,
+        oldest_epoch: None,
     }))
 }
 
@@ -473,6 +475,8 @@ mod tests {
                 device_id: intent.device_id.clone(),
                 key_package_ref: intent.key_package_ref.clone(),
                 signature: intent.signature.clone(),
+                generation: None,
+                issued_at: None,
             }]
         );
 

@@ -184,6 +184,8 @@ impl IntoResponse for Error {
             ErrorType::ChannelProtected => StatusCode::BAD_REQUEST,
             ErrorType::ProtectedFieldRefused { .. } => StatusCode::BAD_REQUEST,
             ErrorType::SeatListNamesRemovedUsers { .. } => StatusCode::BAD_REQUEST,
+            ErrorType::RemovalReasonRequired => StatusCode::BAD_REQUEST,
+            ErrorType::ProtectedHandoverRequired { .. } => StatusCode::BAD_REQUEST,
         };
 
         // The body no longer carries the location, so log it for server
@@ -312,6 +314,55 @@ mod tests {
             serde_json::json!({
                 "type": "SeatListNamesRemovedUsers",
                 "users": ["01HZXBBBBBBBBBBBBBBBBBBBBB"],
+            })
+        );
+    }
+
+    /// S2-D20: 400 and a body that is the type alone; `rocket.rs` pins the
+    /// same answer
+    #[test]
+    fn removal_reason_required_is_bad_request_with_type_only_body() {
+        let response = crate::create_error!(RemovalReasonRequired).into_response();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .map(|value| value.as_bytes()),
+            Some(&b"application/json"[..])
+        );
+
+        let body = ready(axum::body::to_bytes(response.into_body(), usize::MAX)).expect("body");
+        let body: serde_json::Value = serde_json::from_slice(&body).expect("JSON body");
+        assert_eq!(body, serde_json::json!({ "type": "RemovalReasonRequired" }));
+    }
+
+    /// S2-D25 [S2b]: 400, the channels in `channel_ids`, nothing else in the
+    /// body; `rocket.rs` pins the same answer
+    #[test]
+    fn protected_handover_required_is_bad_request_with_channel_ids_in_body() {
+        let response = crate::create_error!(ProtectedHandoverRequired {
+            channel_ids: vec!["01HZXDDDDDDDDDDDDDDDDDDDDD".to_string()],
+        })
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .map(|value| value.as_bytes()),
+            Some(&b"application/json"[..])
+        );
+
+        let body = ready(axum::body::to_bytes(response.into_body(), usize::MAX)).expect("body");
+        let body: serde_json::Value = serde_json::from_slice(&body).expect("JSON body");
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "type": "ProtectedHandoverRequired",
+                "channel_ids": ["01HZXDDDDDDDDDDDDDDDDDDDDD"],
             })
         );
     }

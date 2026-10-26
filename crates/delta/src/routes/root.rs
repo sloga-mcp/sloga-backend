@@ -160,6 +160,9 @@ pub struct ProtectedChannelsFeature {
     pub enabled: bool,
     /// Device cap used when a channel's entitlement sets none (0 = unlimited)
     pub default_device_cap: u32,
+    /// Whether channels may enter the S2 (v2) formats (design 7.2 "Root
+    /// advert"); the bridge passes it to native when signing a list
+    pub formats_v2: bool,
 }
 
 /// # Feature Configuration
@@ -448,6 +451,7 @@ pub async fn root() -> Result<Json<RevoltConfig>> {
             protected_channels: ProtectedChannelsFeature {
                 enabled: config.features.e2ee_enabled && config.features.protected_channels.enabled,
                 default_device_cap: config.features.protected_channels.default_device_cap,
+                formats_v2: false,
             },
         },
         ws: config.hosts.events,
@@ -746,7 +750,8 @@ mod test {
             .as_object()
             .expect("protected_channels object");
 
-        assert_eq!(advert.len(), 2, "advert fields: {advert:?}");
+        assert_eq!(advert.len(), 3, "advert fields: {advert:?}");
+        assert!(advert["formats_v2"].is_boolean(), "advert: {:?}", advert);
         assert_eq!(advert["enabled"].as_bool(), Some(advertised));
         assert_eq!(
             advert["default_device_cap"].as_u64(),

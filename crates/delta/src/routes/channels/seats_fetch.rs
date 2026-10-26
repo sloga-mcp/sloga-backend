@@ -202,6 +202,7 @@ fn project_seats(
             .as_ref()
             .map(|group| group.current_epoch),
         as_of_group_id: snapshot.text_group.map(|group| group.id),
+        as_of_generation: None,
         list: snapshot.list.map(Into::into),
         entitlement_device_cap,
         slot_cap: entitlement.map(|entitlement| entitlement.slot_cap),
@@ -209,6 +210,7 @@ fn project_seats(
         seats_used,
         seats: active,
         cooling,
+        revoked_owner_devices: Vec::new(),
     })
 }
 
