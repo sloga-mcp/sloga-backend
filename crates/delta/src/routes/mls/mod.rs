@@ -255,7 +255,9 @@ pub(crate) async fn dispatch_group(db: &Database, group_id: &str) -> Result<Grou
 /// then, when the route takes a session, a session bound to one of the
 /// caller's E2EE devices. The SINGLE source of these errors for an unknown
 /// group id ([`as_unknown_group`]) and for a Text group's viewer, so the two
-/// answers carry the same body, `location` included (fix re-review RR#1).
+/// answers are the same error by construction (fix re-review RR#1). The
+/// response body carries no `location` (upstream 2e8bf9d7); the one site
+/// keeps the server-log location of the two the same as well.
 ///
 /// `None` is for a route that takes no session at all; it skips the bound
 /// session check only, never the bot check.
@@ -293,10 +295,12 @@ pub(crate) async fn require_text_gate(text_gate: TextGate) -> Result<()> {
 /// member, a bot, an unbound session) a hidden or deleted channel's Text
 /// group is indistinguishable from no group at all (WA#1, RR#1).
 ///
-/// The error's `location` is part of the response body, so a route answers
-/// `GroupDispatch::CallOrUnknown(None)` and those Text cases through this
-/// function, never through a later fetch's `NotFound` or its own caller
-/// checks, or the answers differ.
+/// A route answers `GroupDispatch::CallOrUnknown(None)` and those Text cases
+/// through this function, never through a later fetch's `NotFound` or its
+/// own caller checks. The response body carries no `location` (upstream
+/// 2e8bf9d7), so this is not about the body's bytes: a second site can
+/// drift from this one in its gate order or its errors, and the oracle
+/// tests would then see different answers.
 pub(crate) async fn as_unknown_group<T>(
     db: &Database,
     user: &User,
@@ -1049,8 +1053,8 @@ mod protected_gates {
 
     /// WA#1, RR#1: for every caller class, a Text group whose channel the
     /// caller cannot view, and one whose channel was deleted, answer EXACTLY
-    /// as a group id the server does not know: the same response body,
-    /// `location` included, under every flag combination
+    /// as a group id the server does not know: the same response body
+    /// (which carries no `location`), under every flag combination
     async fn hidden_and_deleted_text_groups_answer_as_unknown() {
         let oracle = oracle_fixture().await;
         let db = &oracle.harness.db;

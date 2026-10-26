@@ -10,6 +10,18 @@ use crate::{
 
 use super::plan_mls_text_commit;
 
+/// The Reference form of the storage-level Text marker (R22; Mongo stores
+/// `kind: "Text"` on the document): a row the Text commit transaction wrote
+/// is keyed `text:{group}:{epoch}` in `mls_commits`, every other row under
+/// its plain id. The stored [`MlsCommit::id`] stays `{group}:{epoch}`, so a
+/// reader of the values (sweeps, prunes, cascades, the Call-plane fetch) is
+/// unaffected; only a keyed lookup tells the two apart.
+const TEXT_COMMIT_KEY_PREFIX: &str = "text:";
+
+fn text_commit_key(id: &str) -> String {
+    format!("{TEXT_COMMIT_KEY_PREFIX}{id}")
+}
+
 #[async_trait]
 impl crate::AbstractMls for ReferenceDb {
     async fn insert_mls_key_packages(&self, packages: &[MlsKeyPackage]) -> Result<()> {
@@ -198,6 +210,13 @@ impl crate::AbstractMls for ReferenceDb {
                     // Someone else already superseded it — conflict with the
                     // channel's actual open group, if any
                 }
+                // The successor's id is taken (A3): Mongo's insert fails on
+                // `_id` after its close, and with the predecessor closed it
+                // finds no open group, so it answers InvalidOperation. Same
+                // answer here, refused before the close
+                Some(_) if groups.contains_key(&group.id) => {
+                    return Err(create_error!(InvalidOperation));
+                }
                 Some(_) => {
                     let old = groups
                         .get_mut(superseded_id)
@@ -224,6 +243,14 @@ impl crate::AbstractMls for ReferenceDb {
                 open_group_id: open.id.clone(),
                 channel_id: open.channel_id.clone(),
             });
+        }
+
+        // An id that already exists is never overwritten (A3), whatever its
+        // kind, channel or state: Mongo's `_id` insert fails and, with no
+        // open group of this kind on the channel (checked above), answers
+        // InvalidOperation
+        if groups.contains_key(&group.id) {
+            return Err(create_error!(InvalidOperation));
         }
 
         groups.insert(group.id.clone(), group.clone());
@@ -395,9 +422,10 @@ impl crate::AbstractMls for ReferenceDb {
         let mut intents = self.mls_join_intents.lock().await;
         let identities = self.e2ee_identities.lock().await;
 
-        // Step 0: an existing row wins before any validity check
+        // Step 0: an existing TEXT-MARKED row wins before any validity
+        // check. An unmarked row at the id (R22 stray) is replaced in step 3
         let id = MlsCommit::composite_id(&commit.group_id, commit.epoch);
-        if let Some(winning) = commits.get(&id) {
+        if let Some(winning) = commits.get(&text_commit_key(&id)) {
             return Ok(MlsCommitOutcome::Lost {
                 winning: winning.clone(),
             });
@@ -454,8 +482,16 @@ impl crate::AbstractMls for ReferenceDb {
         )?;
 
         // Steps 3 to 5 (the filter of step 4 is the state just validated
-        // under the same locks)
-        commits.insert(id, plan.stored);
+        // under the same locks). An unmarked row at the id never wins a
+        // Text epoch (R22): it goes, then the marked row is stored
+        if commits.remove(&id).is_some() {
+            log::warn!(
+                "AUDIT mls_text_stray_replaced group={} epoch={}",
+                commit.group_id,
+                commit.epoch
+            );
+        }
+        commits.insert(text_commit_key(&id), plan.stored);
 
         group.current_epoch = commit.epoch;
         group.members = plan.members;
@@ -482,6 +518,30 @@ impl crate::AbstractMls for ReferenceDb {
             .values()
             .filter(|commit| commit.group_id == group_id && commit.epoch >= from_epoch)
             .cloned()
+            .collect();
+
+        result.sort_by_key(|commit| commit.epoch);
+        result.truncate(limit.max(0) as usize);
+        Ok(result)
+    }
+
+    async fn fetch_mls_text_commits_from(
+        &self,
+        group_id: &str,
+        from_epoch: i64,
+        limit: i64,
+    ) -> Result<Vec<MlsCommit>> {
+        // Text-marked rows only (R22): an unmarked row under a Text group's
+        // id is never served
+        let commits = self.mls_commits.lock().await;
+        let mut result: Vec<MlsCommit> = commits
+            .iter()
+            .filter(|(key, commit)| {
+                key.starts_with(TEXT_COMMIT_KEY_PREFIX)
+                    && commit.group_id == group_id
+                    && commit.epoch >= from_epoch
+            })
+            .map(|(_, commit)| commit.clone())
             .collect();
 
         result.sort_by_key(|commit| commit.epoch);

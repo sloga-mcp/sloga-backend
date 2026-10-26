@@ -148,8 +148,8 @@ pub async fn interaction_respond(
     // that can no longer see the channel learns nothing about its status)
     // and before the edit fetch and the slot claim, so it covers every path
     // below, including the ephemeral reply that never reaches
-    // `insert_message`.
-    crate::util::interactions::ensure_interactions_allowed(&channel)?;
+    // `insert_message`. A thread is judged by its parent too (W2 audit B1).
+    crate::util::interactions::ensure_interactions_allowed_in(&channel, &permission_channel)?;
 
     // Edit path: fetch and verify the component's host message BEFORE
     // claiming the single-use slot, so a deleted message doesn't burn it.
@@ -1368,6 +1368,112 @@ mod test {
     #[test]
     fn ephemeral_respond_in_protected_channel_refused_before_claim() {
         crate::util::test::rt().block_on(assert_protected_respond_refused(true))
+    }
+
+    /// W2 audit B1: a thread is judged by its parent. A response (persisted
+    /// or ephemeral) into a thread left under a protected parent (stored
+    /// directly) is refused with `ChannelProtected` before the slot claim,
+    /// and nothing is stored in the thread.
+    ///
+    /// Control: the `2acdf5f0` helper call (the thread judged alone) → the
+    /// ephemeral reply is delivered (200) and the persisted one claims the
+    /// slot before the floor refuses its row.
+    #[test]
+    fn respond_in_a_thread_under_a_protected_parent_is_refused_before_claim() {
+        crate::util::test::rt()
+            .block_on(respond_in_a_thread_under_a_protected_parent_is_refused_before_claim_case())
+    }
+
+    async fn respond_in_a_thread_under_a_protected_parent_is_refused_before_claim_case() {
+        let harness = TestHarness::new().await;
+        let (_, session, user) = harness.new_user().await;
+        let protected = harness.new_protected_channel(&user, &session, &[]).await;
+        let orphan = revolt_database::Channel::Thread {
+            id: ulid::Ulid::new().to_string(),
+            server: protected.server.id.clone(),
+            parent_channel: protected.channel.id().to_string(),
+            name: "Thread".to_string(),
+            creator: user.id.clone(),
+            origin_message_id: None,
+            last_message_id: None,
+            archived: false,
+            archived_timestamp: None,
+            auto_archive_minutes: 0,
+            locked: false,
+            applied_tags: vec![],
+        };
+        harness.db.insert_channel(&orphan).await.expect("thread");
+        let (bot, _) = setup_bot(&harness, &user, &protected.server).await;
+
+        for ephemeral in [false, true] {
+            let interaction = interaction_row(
+                ulid::Ulid::new().to_string(),
+                "tok-orphan",
+                &bot.id,
+                &user.id,
+                orphan.id(),
+            );
+            harness
+                .db
+                .insert_interaction(&interaction)
+                .await
+                .expect("interaction");
+
+            let response = harness
+                .client
+                .post(format!("/interactions/{}/respond", interaction.id))
+                .header(Header::new("x-bot-token", bot.token.clone()))
+                .header(ContentType::JSON)
+                .body(
+                    json!({
+                        "token": "tok-orphan",
+                        "content": "plaintext into an orphan thread",
+                        "ephemeral": ephemeral
+                    })
+                    .to_string(),
+                )
+                .dispatch()
+                .await;
+            assert_eq!(
+                response.status(),
+                Status::BadRequest,
+                "ephemeral {ephemeral}"
+            );
+            let error: serde_json::Value =
+                serde_json::from_str(&response.into_string().await.expect("body")).expect("JSON");
+            assert_eq!(
+                error["type"], "ChannelProtected",
+                "ephemeral {ephemeral}: {error}"
+            );
+
+            let stored = harness
+                .db
+                .fetch_interaction(&interaction.id)
+                .await
+                .expect("interaction");
+            assert!(
+                !stored.responded,
+                "ephemeral {ephemeral}: the slot was claimed"
+            );
+        }
+
+        let rows = harness
+            .db
+            .fetch_messages(revolt_database::MessageQuery {
+                limit: Some(10),
+                filter: revolt_database::MessageFilter {
+                    channel: Some(orphan.id().to_string()),
+                    ..Default::default()
+                },
+                time_period: revolt_database::MessageTimePeriod::Absolute {
+                    before: None,
+                    after: None,
+                    sort: None,
+                },
+            })
+            .await
+            .expect("the thread's messages");
+        assert!(rows.is_empty(), "{rows:?}");
     }
 
     #[test]

@@ -581,8 +581,9 @@ mod tests {
     /// Decision 1 (W2): for every caller class and every request, a Text
     /// group whose channel the caller cannot view, and one whose channel was
     /// deleted, answer EXACTLY as a group id the server does not know: the
-    /// same status and response body, `location` included. A viewer gets the
-    /// refusal under every flag set, so the Text path is really reached.
+    /// same status and response body (which carries no `location`). A
+    /// viewer gets the refusal under every flag set, so the Text path is
+    /// really reached.
     /// Controls: the refusal before the channel fetch; request validation
     /// between the kind dispatch and the branch.
     async fn hidden_and_deleted_text_groups_answer_as_unknown() {

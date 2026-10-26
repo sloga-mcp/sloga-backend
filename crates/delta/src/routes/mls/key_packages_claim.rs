@@ -735,8 +735,8 @@ mod tests {
     /// Decision 1 (W2), design 6.1 invariant: for every caller class, a Text
     /// group whose channel the caller cannot view, and one whose channel was
     /// deleted, answer a claim EXACTLY as a group id the server does not
-    /// know (status and full body, `location` included), for a valid and a
-    /// malformed request, under the current flags
+    /// know (status and full body; the body carries no `location`), for a
+    /// valid and a malformed request, under the current flags
     async fn hidden_and_deleted_text_groups_claim_as_unknown() {
         let oracle = oracle_fixture().await;
         let db = &oracle.harness.db;

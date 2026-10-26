@@ -772,7 +772,7 @@ mod test {
     }
 
     /// Decision 18 (W2): a member who cannot view the channel gets the
-    /// pre-W2 answer, byte-identical (`location` included) for a protected
+    /// pre-W2 answer, byte-identical (type, status, body) for a protected
     /// and an ordinary channel.
     #[test]
     fn softres_create_non_viewer_error_is_unchanged_by_protection() {

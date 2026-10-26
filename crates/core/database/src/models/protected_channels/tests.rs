@@ -16,10 +16,11 @@ use revolt_result::ErrorType;
 use sha2::{Digest, Sha256};
 
 use crate::{
-    channel_seats_used, Channel, ChannelEntitlement, ChannelEntitlementSource,
-    ChannelEntitlementState, Database, HandoverBody, Member, MemberCompositeKey, MlsGroup,
-    MlsGroupCreateOutcome, MlsGroupKind, MlsMemberDevice, SeatList, SeatListBody,
-    SeatListSubmission, Server, SignedHandover, MAX_SEAT_LIST_HANDOVERS, SEAT_COOLDOWN_DAYS,
+    channel_seats_used, seat_list_removed_users, Channel, ChannelEntitlement,
+    ChannelEntitlementSource, ChannelEntitlementState, ChannelSeat, Database, E2EEContentType,
+    E2EEEnvelope, HandoverBody, Member, MemberCompositeKey, MlsGroup, MlsGroupCreateOutcome,
+    MlsGroupKind, MlsMemberDevice, SeatList, SeatListBody, SeatListSubmission, Server,
+    SignedHandover, E2EE_PROTOCOL_VERSION, MAX_SEAT_LIST_HANDOVERS, SEAT_COOLDOWN_DAYS,
 };
 
 // Section 5.1 inputs
@@ -304,6 +305,11 @@ fn is_growth_disabled(error: &revolt_result::Error) -> bool {
 
 fn is_invalid_operation(error: &revolt_result::Error) -> bool {
     matches!(error.error_type, ErrorType::InvalidOperation)
+}
+
+/// `SeatListNamesRemovedUsers` naming exactly `expected` (C1)
+fn is_removed_users(error: &revolt_result::Error, expected: &[&str]) -> bool {
+    matches!(&error.error_type, ErrorType::SeatListNamesRemovedUsers { users } if users == expected)
 }
 
 /// A thread hanging off `parent`
@@ -1350,6 +1356,10 @@ async fn entitlement_upsert_refuses_a_cap_below_the_seats_in_use() {
     });
 }
 
+/// Design 7.5 with C7 (W2 audit): the cascade deletes the channel's Text
+/// group rows, the closed one as well as the open one, with their join
+/// intents; another channel's group is untouched. Control: today's close
+/// instead of the delete (the rows are still found).
 #[tokio::test]
 async fn delete_cascade_removes_the_protected_channel_data() {
     database_test!(|db| async move {
@@ -1358,8 +1368,31 @@ async fn delete_cascade_removes_the_protected_channel_data() {
         db.protect_channel(CHANNEL, &submit(1, &[USER_A]), at(0))
             .await
             .unwrap();
-        let group = text_group(0xdd, &owner, 0);
-        db.create_text_mls_group(&group, None).await.unwrap();
+        let first = text_group(0xdd, &owner, 0);
+        db.create_text_mls_group(&first, None).await.unwrap();
+        let successor = text_group(0xde, &owner, 1);
+        db.create_text_mls_group(&successor, Some(&first.id))
+            .await
+            .unwrap();
+        assert!(!db.fetch_mls_group(&first.id).await.unwrap().open);
+        let joiner = device(USER_B, DEVICE_B);
+        db.upsert_mls_join_intent(&crate::MlsJoinIntent {
+            id: crate::MlsJoinIntent::composite_id(
+                &successor.id,
+                &joiner.user_id,
+                &joiner.device_id,
+            ),
+            group_id: successor.id.clone(),
+            user_id: joiner.user_id,
+            device_id: joiner.device_id,
+            key_package_ref: "cmVm".to_string(),
+            signature: signature(1),
+            created_at: at(0),
+        })
+        .await
+        .unwrap();
+        let bystander = call_group(&"df".repeat(32), &call_channel(400));
+        db.create_mls_group(&bystander, None).await.unwrap();
 
         db.delete_protected_channel_data(CHANNEL).await.unwrap();
 
@@ -1372,7 +1405,22 @@ async fn delete_cascade_removes_the_protected_channel_data() {
         let snapshot = db.fetch_seat_list_snapshot(CHANNEL).await.unwrap();
         assert!(snapshot.list.is_none());
         assert!(snapshot.text_group.is_none());
-        assert!(!db.fetch_mls_group(&group.id).await.unwrap().open);
+        for (case, group_id) in [("closed", &first.id), ("open", &successor.id)] {
+            let result = db.fetch_mls_group(group_id).await;
+            assert!(
+                matches!(&result, Err(error) if matches!(error.error_type, ErrorType::NotFound)),
+                "the {case} Text group row survived: {result:?}"
+            );
+        }
+        assert!(db
+            .fetch_mls_join_intents_for_group(&successor.id)
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            db.fetch_mls_group(&bystander.id).await.unwrap().kind,
+            MlsGroupKind::Call
+        );
     });
 }
 
@@ -1778,12 +1826,13 @@ async fn seat_claims_need_the_growth_flag_but_retries_and_removals_do_not() {
             .unwrap();
         assert!(again.unchanged, "{again:?}");
 
-        // Flag off: reactivating a cooling seat is a claim
+        // C1 (W2 audit): a list that still names C, whom the server removed
+        // since v2, is refused before the flag is even looked at
         let error = db
             .put_seat_list(CHANNEL, &submit(3, &[USER_A, USER_B, USER_C]), false, at(1))
             .await
             .unwrap_err();
-        assert!(is_growth_disabled(&error), "{error:?}");
+        assert!(is_removed_users(&error, &[USER_C]), "{error:?}");
 
         // Flag off: a removal-only list lands
         let outcome = db
@@ -1792,6 +1841,14 @@ async fn seat_claims_need_the_growth_flag_but_retries_and_removals_do_not() {
             .unwrap();
         assert_eq!(outcome.released, vec![USER_B]);
         assert!(outcome.claimed.is_empty());
+
+        // Flag off: reactivating a cooling seat is a claim (B's, which the
+        // owner's v3 released)
+        let error = db
+            .put_seat_list(CHANNEL, &submit(4, &[USER_A, USER_B]), false, at(2))
+            .await
+            .unwrap_err();
+        assert!(is_growth_disabled(&error), "{error:?}");
 
         // Flag off: a `device_cap`-only list lands
         let capped = SeatListSubmission {
@@ -1938,6 +1995,319 @@ async fn protect_needs_the_owner_and_every_claim_needs_a_member() {
         db.put_seat_list(CHANNEL, &submit(2, &[USER_A, USER_C]), true, at(0))
             .await
             .unwrap();
+    });
+}
+
+// ---------------------------------------------------------------------------
+// C1 (W2 audit): a list still naming a user the server removed is refused
+// ---------------------------------------------------------------------------
+
+/// C1 (W2 audit; decision 2, confirmed by the user 2026-10-04: a removed or
+/// re-invited member is not re-seated until the owner re-seats them). B is
+/// kicked and rejoins; the owner's client still names B, so its next list
+/// (adding C) would reactivate B's cooling seat with no dialog. That list
+/// is refused with B's id and nothing is written, with the growth flag on or
+/// off. The list without B lands; only then does a list naming B again
+/// land, as an ordinary claim, and only with the flag on. The stored list's
+/// byte-identical retry is unaffected. Control: the planner's
+/// `seat_list_removed_users` check removed (the first PUT lands and B is
+/// seated again).
+#[tokio::test]
+async fn a_list_still_naming_a_removed_user_is_refused_until_one_without_them_lands() {
+    database_test!(|db| async move {
+        setup(&db, 10).await;
+        db.protect_channel(CHANNEL, &submit(1, &[USER_A, USER_B]), at(0))
+            .await
+            .unwrap();
+        let genesis = db.fetch_seat_list(CHANNEL).await.unwrap().unwrap();
+
+        // B is kicked, then rejoins by invite
+        kick(&db, USER_B).await;
+        insert_members(&db, SERVER, &[USER_B]).await;
+
+        // The stored list's retry is still the stored success
+        let again = db
+            .put_seat_list(CHANNEL, &submit(1, &[USER_A, USER_B]), true, at(1))
+            .await
+            .unwrap();
+        assert!(again.unchanged, "{again:?}");
+
+        for allow_claims in [true, false] {
+            let error = db
+                .put_seat_list(
+                    CHANNEL,
+                    &submit(2, &[USER_A, USER_B, USER_C]),
+                    allow_claims,
+                    at(1),
+                )
+                .await
+                .unwrap_err();
+            assert!(
+                is_removed_users(&error, &[USER_B]),
+                "growth {allow_claims}: {error:?}"
+            );
+        }
+        assert_eq!(
+            db.fetch_seat_list(CHANNEL).await.unwrap(),
+            Some(genesis),
+            "a refused list writes nothing"
+        );
+        let seats = db.fetch_channel_seats(CHANNEL).await.unwrap();
+        assert!(
+            seats.iter().all(|seat| seat.user_id != USER_C),
+            "C was claimed: {seats:?}"
+        );
+        assert!(
+            seats
+                .iter()
+                .any(|seat| seat.user_id == USER_B && !seat.is_active()),
+            "B was seated again: {seats:?}"
+        );
+
+        // The list without B lands
+        let outcome = db
+            .put_seat_list(CHANNEL, &submit(2, &[USER_A, USER_C]), true, at(2))
+            .await
+            .unwrap();
+        assert_eq!(outcome.claimed, vec![USER_C]);
+        assert!(outcome.released.is_empty(), "{outcome:?}");
+
+        // Only now is B's re-seat an ordinary claim: refused with the
+        // growth flag off, landed with it on
+        let error = db
+            .put_seat_list(CHANNEL, &submit(3, &[USER_A, USER_B, USER_C]), false, at(3))
+            .await
+            .unwrap_err();
+        assert!(is_growth_disabled(&error), "{error:?}");
+        let outcome = db
+            .put_seat_list(CHANNEL, &submit(3, &[USER_A, USER_B, USER_C]), true, at(3))
+            .await
+            .unwrap();
+        assert_eq!(outcome.claimed, vec![USER_B]);
+
+        let active: Vec<String> = db
+            .fetch_channel_seats(CHANNEL)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|seat| seat.is_active())
+            .map(|seat| seat.user_id)
+            .collect();
+        assert_eq!(active, vec![USER_A, USER_B, USER_C]);
+    });
+}
+
+/// C1: which removals refuse a later list naming the user. The owner's own
+/// unseat does not: the list that released B no longer names B, so a list
+/// naming B again is an ordinary claim. A release by the server-forced
+/// primitive does, whatever drove it: kick, ban, leaving the server of
+/// one's own accord and account deletion all run
+/// `release_channel_seats_for_user` (6.3), which carries no reason, so a
+/// user who LEFT and rejoined is refused like a kicked one (fail closed:
+/// their devices are pending removal exactly as after a kick, and the
+/// owner's client still lists them). An expired cooldown changes nothing.
+/// The signer is never reported, or a forced release of the owner's own
+/// seat would wedge every later list.
+#[tokio::test]
+async fn only_a_server_removal_refuses_a_list_naming_the_user_again() {
+    database_test!(|db| async move {
+        setup(&db, 10).await;
+        db.protect_channel(CHANNEL, &submit(1, &[USER_A, USER_B, USER_C]), at(0))
+            .await
+            .unwrap();
+
+        // The owner unseats B, then seats B again
+        let outcome = db
+            .put_seat_list(CHANNEL, &submit(2, &[USER_A, USER_C]), true, at(1))
+            .await
+            .unwrap();
+        assert_eq!(outcome.released, vec![USER_B]);
+        let outcome = db
+            .put_seat_list(CHANNEL, &submit(3, &[USER_A, USER_B, USER_C]), true, at(2))
+            .await
+            .unwrap();
+        assert_eq!(outcome.claimed, vec![USER_B]);
+
+        // C leaves the server (the leave runs the forced release) and is a
+        // member again by the next list, whose time is past C's cooldown
+        db.release_channel_seats_for_user(USER_C, Some(SERVER), at(3))
+            .await
+            .unwrap();
+        let expired = at(3 + SEAT_COOLDOWN_DAYS + 1);
+        let error = db
+            .put_seat_list(
+                CHANNEL,
+                &submit(4, &[USER_A, USER_B, USER_C]),
+                true,
+                expired,
+            )
+            .await
+            .unwrap_err();
+        assert!(is_removed_users(&error, &[USER_C]), "{error:?}");
+
+        // A forced release of the signer's own seat never refuses its lists
+        db.release_channel_seats_for_user(USER_A, Some(SERVER), expired)
+            .await
+            .unwrap();
+        let outcome = db
+            .put_seat_list(CHANNEL, &submit(4, &[USER_A, USER_B]), true, expired)
+            .await
+            .unwrap();
+        assert_eq!(outcome.claimed, vec![USER_A]);
+    });
+}
+
+/// C1, pure: the rule reads the rows, never a release time. A seat released
+/// BEFORE the stored list's `updated_at` while that list names its user is
+/// still reported: that is a removal that committed between a seat PUT's
+/// snapshot and its commit (the PUT writes no row of a user it keeps). A
+/// released seat whose user the stored list does not name (the owner's own
+/// unseat), an active seat and the signer are not. With no stored list
+/// (genesis) nothing is; a stored body that no longer parses fails closed.
+#[test]
+fn removed_users_are_read_from_the_rows_not_from_release_times() {
+    let row = |user_id: &str, released: Option<i64>| ChannelSeat {
+        id: ChannelSeat::composite_id(CHANNEL, user_id),
+        channel_id: CHANNEL.to_string(),
+        user_id: user_id.to_string(),
+        seated_at: at(0),
+        released_at: released.map(at),
+        cooldown_until: released.map(|days| at(days + SEAT_COOLDOWN_DAYS)),
+    };
+    let unseated = numbered_user(901);
+    let stored = SeatList {
+        id: CHANNEL.to_string(),
+        version: 2,
+        body: body_with(2, 1_790_812_800_000, &[USER_A, USER_B, USER_C]),
+        signer_user_id: USER_A.to_string(),
+        signer_device_id: DEVICE_A.to_string(),
+        signature: signature(2),
+        handovers: vec![],
+        updated_at: at(5),
+    };
+    let seats = vec![
+        row(USER_A, Some(1)),
+        row(USER_B, Some(1)),
+        row(USER_C, None),
+        row(&unseated, Some(1)),
+    ];
+    let next = SeatListBody::parse(&body_with(
+        3,
+        1_790_812_800_000,
+        &[USER_A, USER_B, USER_C, unseated.as_str()],
+    ))
+    .unwrap();
+
+    assert_eq!(
+        seat_list_removed_users(&next, Some(&stored), &seats).unwrap(),
+        vec![USER_B]
+    );
+    assert!(seat_list_removed_users(&next, None, &seats)
+        .unwrap()
+        .is_empty());
+
+    let mut corrupt = stored.clone();
+    corrupt.body = "garbage".to_string();
+    assert!(seat_list_removed_users(&next, Some(&corrupt), &seats).is_err());
+}
+
+/// C1 with re-review L3, pure: a user the stored list still names who has
+/// NO seat row is reported (a landed list has an active row for every user
+/// it names, so a missing one was removed); only an active row clears a
+/// listed user. Control: the earlier `any(!is_active)` filter.
+#[test]
+fn a_listed_user_with_no_seat_row_is_reported_as_removed() {
+    let rowless = numbered_user(902);
+    let stored = SeatList {
+        id: CHANNEL.to_string(),
+        version: 2,
+        body: body_with(2, 1_790_812_800_000, &[USER_A, USER_B, rowless.as_str()]),
+        signer_user_id: USER_A.to_string(),
+        signer_device_id: DEVICE_A.to_string(),
+        signature: signature(2),
+        handovers: vec![],
+        updated_at: at(5),
+    };
+    let active = |user_id: &str| ChannelSeat {
+        id: ChannelSeat::composite_id(CHANNEL, user_id),
+        channel_id: CHANNEL.to_string(),
+        user_id: user_id.to_string(),
+        seated_at: at(0),
+        released_at: None,
+        cooldown_until: None,
+    };
+    // The signer has no row either: still never reported
+    let seats = vec![active(USER_B)];
+    let next = SeatListBody::parse(&body_with(
+        3,
+        1_790_812_800_000,
+        &[USER_A, USER_B, rowless.as_str()],
+    ))
+    .unwrap();
+
+    assert_eq!(
+        seat_list_removed_users(&next, Some(&stored), &seats).unwrap(),
+        vec![rowless]
+    );
+}
+
+/// C1 with re-review L3: B is kicked and B's seat row is then deleted
+/// outright (what a future released-seat sweep would do); B rejoins. The
+/// owner's list still naming B is refused, not answered as a fresh claim of
+/// a user with no row. Raw delete on both drivers. Control: the earlier
+/// `any(!is_active)` filter (the list lands and seats B again).
+#[tokio::test]
+async fn a_removed_user_whose_seat_row_is_gone_is_still_refused() {
+    database_test!(|db| async move {
+        setup(&db, 10).await;
+        db.protect_channel(CHANNEL, &submit(1, &[USER_A, USER_B]), at(0))
+            .await
+            .unwrap();
+        kick(&db, USER_B).await;
+
+        let seat_id = ChannelSeat::composite_id(CHANNEL, USER_B);
+        match &db {
+            Database::Reference(reference) => {
+                assert!(reference
+                    .channel_seats
+                    .lock()
+                    .await
+                    .remove(&seat_id)
+                    .is_some());
+            }
+            #[cfg(feature = "mongodb")]
+            Database::MongoDb(mongo) => {
+                let result = mongo
+                    .col::<bson::Document>("channel_seats")
+                    .delete_one(doc! { "_id": &seat_id })
+                    .await
+                    .unwrap();
+                assert_eq!(result.deleted_count, 1);
+            }
+        }
+        insert_members(&db, SERVER, &[USER_B]).await;
+        assert!(db
+            .fetch_channel_seats(CHANNEL)
+            .await
+            .unwrap()
+            .iter()
+            .all(|seat| seat.user_id != USER_B));
+
+        let error = db
+            .put_seat_list(CHANNEL, &submit(2, &[USER_A, USER_B, USER_C]), true, at(1))
+            .await
+            .unwrap_err();
+        assert!(is_removed_users(&error, &[USER_B]), "{error:?}");
+        assert_eq!(
+            db.fetch_seat_list(CHANNEL).await.unwrap().unwrap().version,
+            1
+        );
+        assert!(db
+            .fetch_channel_seats(CHANNEL)
+            .await
+            .unwrap()
+            .iter()
+            .all(|seat| seat.user_id != USER_B && seat.user_id != USER_C));
     });
 }
 
@@ -2347,6 +2717,275 @@ async fn a_corrupt_entitlement_of_another_channel_does_not_block_a_release() {
     });
 }
 
+/// C9 (W2 audit): the release decodes neither the seat nor the group
+/// document (a `channel_id` projection, then `update_many` on the same
+/// filter), so a seat row and a Text group carrying a field added later
+/// (unknown) and a field no typed read decodes still release: the user can
+/// still be kicked, banned and can join. The extra field alone would prove
+/// nothing (serde skips unknown fields), so each row also carries an
+/// undecodable `seated_at` / `member_added`. MONGODB only: the reference
+/// store cannot hold such a row. Control: today's typed `find_all` of
+/// `ChannelSeat` and `MlsGroup`.
+#[cfg(feature = "mongodb")]
+#[tokio::test]
+async fn a_release_never_decodes_the_seat_or_group_rows() {
+    database_test!(|db| async move {
+        let Database::MongoDb(mongo) = &db else {
+            return;
+        };
+        setup(&db, 10).await;
+        let owner = device(USER_A, DEVICE_A);
+        db.protect_channel(CHANNEL, &submit(1, &[USER_A, USER_B]), at(0))
+            .await
+            .unwrap();
+        let group = text_group(0xcc, &owner, 0);
+        db.create_text_mls_group(&group, None).await.unwrap();
+        set_group_members(
+            &db,
+            &group.id,
+            vec![owner.clone(), device(USER_B, DEVICE_B)],
+        )
+        .await;
+
+        let seat_id = ChannelSeat::composite_id(CHANNEL, USER_B);
+        for (collection, id, corrupt) in [
+            ("channel_seats", seat_id.as_str(), "seated_at"),
+            ("mls_groups", group.id.as_str(), "member_added"),
+        ] {
+            let mut set = doc! { "added_by_a_later_release": { "nested": true } };
+            set.insert(corrupt, "not decodable");
+            let result = mongo
+                .col::<bson::Document>(collection)
+                .update_one(doc! { "_id": id }, doc! { "$set": set })
+                .await
+                .unwrap();
+            assert_eq!(result.modified_count, 1, "{collection}");
+        }
+        assert!(
+            mongo
+                .col::<ChannelSeat>("channel_seats")
+                .find_one(doc! { "_id": &seat_id })
+                .await
+                .is_err(),
+            "precondition: the seat row does not decode"
+        );
+        assert!(
+            mongo
+                .col::<MlsGroup>("mls_groups")
+                .find_one(doc! { "_id": &group.id })
+                .await
+                .is_err(),
+            "precondition: the group does not decode"
+        );
+
+        assert_eq!(
+            db.release_channel_seats_for_user(USER_B, Some(SERVER), at(1))
+                .await
+                .unwrap(),
+            vec![CHANNEL]
+        );
+        let millis = |time: Timestamp| {
+            time.duration_since(Timestamp::UNIX_EPOCH)
+                .whole_milliseconds() as i64
+        };
+        let seat = mongo
+            .col::<bson::Document>("channel_seats")
+            .find_one(doc! { "_id": &seat_id })
+            .await
+            .unwrap()
+            .expect("the seat row");
+        assert_eq!(seat.get_i64("released_at").ok(), Some(millis(at(1))));
+        assert_eq!(
+            seat.get_i64("cooldown_until").ok(),
+            Some(millis(at(1 + SEAT_COOLDOWN_DAYS)))
+        );
+        let pending = |row: &bson::Document| -> Vec<String> {
+            row.get_array("pending_removals")
+                .unwrap()
+                .iter()
+                .map(|entry| {
+                    entry
+                        .as_document()
+                        .and_then(|entry| entry.get_str("user_id").ok())
+                        .unwrap()
+                        .to_string()
+                })
+                .collect()
+        };
+        let stored = mongo
+            .col::<bson::Document>("mls_groups")
+            .find_one(doc! { "_id": &group.id })
+            .await
+            .unwrap()
+            .expect("the group");
+        assert_eq!(pending(&stored), vec![USER_B]);
+
+        // Still idempotent: nothing left to release, no second entry
+        assert!(db
+            .release_channel_seats_for_user(USER_B, None, at(2))
+            .await
+            .unwrap()
+            .is_empty());
+        let stored = mongo
+            .col::<bson::Document>("mls_groups")
+            .find_one(doc! { "_id": &group.id })
+            .await
+            .unwrap()
+            .expect("the group");
+        assert_eq!(pending(&stored), vec![USER_B]);
+    });
+}
+
+/// C9 (W2 audit), the closed side: with no row decoded, what still fails a
+/// release (fail closed, in one transaction, so nothing is released) is a
+/// write the database refuses, or a matched row whose `channel_id` is not a
+/// string. Scoped (kick, ban, leave, join): a Text group of the server that
+/// lists the user and whose `pending_removals` is not an array refuses the
+/// `$push`. Unscoped (account deletion): a seat row of the user with an
+/// Int32 `channel_id`. These are the triggers a test that needs a failing
+/// release can use now that an undecodable `seated_at` releases. MONGODB
+/// only.
+#[cfg(feature = "mongodb")]
+#[tokio::test]
+async fn a_release_that_cannot_be_written_fails_closed_and_releases_nothing() {
+    database_test!(|db| async move {
+        let Database::MongoDb(mongo) = &db else {
+            return;
+        };
+        setup(&db, 10).await;
+        let owner = device(USER_A, DEVICE_A);
+        db.protect_channel(CHANNEL, &submit(1, &[USER_A, USER_B, USER_C]), at(0))
+            .await
+            .unwrap();
+        let group = text_group(0xcc, &owner, 0);
+        db.create_text_mls_group(&group, None).await.unwrap();
+        set_group_members(
+            &db,
+            &group.id,
+            vec![owner.clone(), device(USER_B, DEVICE_B)],
+        )
+        .await;
+        let result = mongo
+            .col::<bson::Document>("mls_groups")
+            .update_one(
+                doc! { "_id": &group.id },
+                doc! { "$set": { "pending_removals": "not an array" } },
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.modified_count, 1);
+
+        let error = db
+            .release_channel_seats_for_user(USER_B, Some(SERVER), at(1))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                &error.error_type,
+                ErrorType::DatabaseError { operation, collection }
+                    if operation == "update_many" && collection == "mls_groups"
+            ),
+            "{error:?}"
+        );
+        let seats = db.fetch_channel_seats_for_user(USER_B).await.unwrap();
+        assert!(seats[0].is_active(), "a failed release released nothing");
+
+        // Unscoped: a seat row whose `channel_id` is an Int32
+        mongo
+            .col::<bson::Document>("channel_seats")
+            .insert_one(doc! {
+                "_id": "corrupt",
+                "channel_id": 5_i32,
+                "user_id": USER_C,
+                "seated_at": 0_i64,
+            })
+            .await
+            .unwrap();
+        let error = db
+            .release_channel_seats_for_user(USER_C, None, at(1))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                &error.error_type,
+                ErrorType::DatabaseError { operation, collection }
+                    if operation == "find" && collection == "channel_seats"
+            ),
+            "{error:?}"
+        );
+        let seat = db
+            .fetch_channel_seats(CHANNEL)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|seat| seat.user_id == USER_C)
+            .expect("C's seat");
+        assert!(seat.is_active(), "a failed release released nothing");
+    });
+}
+
+/// C4 (W2 audit): the channel ids of a server's entitlements, sorted, and
+/// only that server's. Under MONGODB they are read through a projection: an
+/// entitlement row nothing else decodes still answers its `channel_id`, and
+/// a row whose `channel_id` is not a string fails the read closed.
+#[tokio::test]
+async fn entitled_channel_ids_list_every_entitlement_of_the_server() {
+    database_test!(|db| async move {
+        server_ready(&db).await;
+        let (second, first) = (race_channel(6_101), race_channel(6_100));
+        protectable_in(&db, &second, SERVER, 10).await;
+        protectable_in(&db, &first, SERVER, 10).await;
+        protectable_in(&db, &race_channel(6_102), "01HZXOTHERSERVEROTHERSERVE", 10).await;
+
+        assert_eq!(
+            db.fetch_entitled_channel_ids(SERVER).await.unwrap(),
+            vec![first.clone(), second.clone()]
+        );
+        assert!(db
+            .fetch_entitled_channel_ids("01HZXNOSERVERNOSERVERNOSER")
+            .await
+            .unwrap()
+            .is_empty());
+
+        #[cfg(feature = "mongodb")]
+        if let Database::MongoDb(mongo) = &db {
+            let corrupt = race_channel(6_103);
+            mongo
+                .col::<bson::Document>("channel_entitlements")
+                .insert_one(doc! {
+                    "_id": "01HZXCORRUPTENTITLEMENT100",
+                    "channel_id": &corrupt,
+                    "server_id": SERVER,
+                    "slot_cap": "ten",
+                })
+                .await
+                .unwrap();
+            assert_eq!(
+                db.fetch_entitled_channel_ids(SERVER).await.unwrap(),
+                vec![first.clone(), second.clone(), corrupt]
+            );
+
+            mongo
+                .col::<bson::Document>("channel_entitlements")
+                .insert_one(doc! {
+                    "_id": "01HZXCORRUPTENTITLEMENT101",
+                    "channel_id": 7,
+                    "server_id": SERVER,
+                })
+                .await
+                .unwrap();
+            let error = db.fetch_entitled_channel_ids(SERVER).await.unwrap_err();
+            assert!(
+                matches!(
+                    &error.error_type,
+                    ErrorType::DatabaseError { collection, .. } if collection == "channel_entitlements"
+                ),
+                "{error:?}"
+            );
+        }
+    });
+}
+
 // ---------------------------------------------------------------------------
 // M9 (b6 B47): a Call squat at a Text group's derived id is evicted
 // ---------------------------------------------------------------------------
@@ -2409,8 +3048,22 @@ fn call_commit(group_id: &str, epoch: i64) -> crate::MlsCommit {
     }
 }
 
+/// The device the squat's queued envelope is addressed to: its own per
+/// group id, so counting that device's queue counts this squat's envelope
+/// only (A6)
+fn squat_recipient(group_id: &str) -> (&'static str, String) {
+    (USER_B, group_id[..32].to_string())
+}
+
+/// Queued envelopes of the squat at `group_id` (A6)
+async fn squat_envelopes(db: &Database, group_id: &str) -> usize {
+    let (user_id, device_id) = squat_recipient(group_id);
+    db.count_e2ee_envelopes(user_id, &device_id).await.unwrap() as usize
+}
+
 /// The squat through the REAL Call paths: the group, a won Call commit at
-/// epoch 1 and a join intent, i.e. every Call-plane row keyed by the id
+/// epoch 1, a join intent and the commit's queued envelope, i.e. every
+/// Call-plane row keyed by the id
 async fn squat(db: &Database, group_id: &str, call_channel: &str) {
     assert_eq!(
         db.create_mls_group(&call_group(group_id, call_channel), None)
@@ -2434,6 +3087,28 @@ async fn squat(db: &Database, group_id: &str, call_channel: &str) {
         signature: signature(1),
         created_at: at(0),
     })
+    .await
+    .unwrap();
+    let (recipient_user_id, recipient_device_id) = squat_recipient(group_id);
+    db.insert_e2ee_envelopes(&[E2EEEnvelope {
+        id: ulid::Ulid::new().to_string(),
+        recipient_user_id: recipient_user_id.to_string(),
+        recipient_device_id,
+        sender_user_id: squatter().user_id,
+        sender_device_id: squatter().device_id,
+        protocol_version: E2EE_PROTOCOL_VERSION,
+        sequence: 0,
+        ciphertext: "b3BhcXVl".to_string(),
+        timestamp: Timestamp::now_utc(),
+        content_type: E2EEContentType::MlsCommit,
+        group_id: Some(group_id.to_string()),
+        epoch: Some(1),
+        committer: None,
+        added: vec![],
+        removed: vec![],
+        rejoin_intents: vec![],
+        removed_reasons: vec![],
+    }])
     .await
     .unwrap();
 }
@@ -2461,6 +3136,11 @@ async fn assert_squat_intact(db: &Database, group_id: &str, call_channel: &str, 
             .len(),
         1,
         "{case}: the squat's join intent"
+    );
+    assert_eq!(
+        squat_envelopes(db, group_id).await,
+        1,
+        "{case}: the squat's queued envelope"
     );
 }
 
@@ -2492,6 +3172,13 @@ async fn assert_text_group_replaced_the_squat(
             .unwrap()
             .is_empty(),
         "the squat's join intents went with it"
+    );
+    // A6 (W2 audit): no envelope queued for the squat is left to reach the
+    // Text group's members as that group's
+    assert_eq!(
+        squat_envelopes(db, group_id).await,
+        0,
+        "the squat's queued envelopes went with it"
     );
 }
 

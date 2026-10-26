@@ -2880,6 +2880,32 @@ pub async fn run_migrations(db: &MongoDb, revision: i32) -> i32 {
             .expect("Failed to seed cipher_numbers.");
     }
 
+    // The dev-database trap (protected-channels rebase, design 2.7, audit
+    // C5): a database that ran a pre-rebase protected-channels build stored
+    // revision 74 after running ITS revision 73, so upstream's revision 73
+    // (the `server_audit_log` collection, its indexes, the ViewAuditLog
+    // grant) never ran, and from 74 on nothing runs it. Upstream's own 74
+    // always has the collection (revision 73 creates it). Fails loud, before
+    // revision 75, leaving the stored revision at 74.
+    if revision == 74 {
+        let audit_log = db
+            .db()
+            .list_collection_names()
+            .filter(doc! { "name": "server_audit_log" })
+            .await
+            .expect("Failed to list collections for the revision 74 check.");
+        if audit_log.is_empty() {
+            panic!(
+                "Migration refused: this database is stored at revision 74 but has no \
+                 server_audit_log collection, so upstream revision 73 never ran on it (the \
+                 dev-database trap: it ran a pre-rebase protected-channels build). Fix: set the \
+                 migrations document's revision to 72 (db.migrations.updateOne({{}}, \
+                 {{ $set: {{ revision: 72 }} }})) and restart, so revisions 72 to 75 run, or drop \
+                 the database."
+            );
+        }
+    }
+
     if revision <= 75 {
         info!("Running migration [revision 75 / 22-10-2026]: Key open MLS groups by (channel_id, kind); create channel_entitlements / channel_seats / channel_seat_lists collections; add the messages (channel, nonce) replay index (protected channels)");
 
@@ -4422,6 +4448,14 @@ mod tests {
                 return;
             };
 
+            // Upstream's revision 74: revision 73 ran, so `server_audit_log`
+            // exists (without it, the dev-database trap check refuses).
+            mongo
+                .db()
+                .create_collection("server_audit_log")
+                .await
+                .expect("create server_audit_log");
+
             // A number claimed before a crash mid-block, so the block runs
             // again over it: the re-run must keep its order_id.
             let numbers = mongo.col::<Document>("cipher_numbers");
@@ -4558,6 +4592,82 @@ mod tests {
                     .await
                     .is_err(),
                 "a second member on one number"
+            );
+        }
+
+        db.drop_database().await;
+        guard.disarm();
+    }
+
+    /// The dev-database trap (audit C5): a database stored at revision 74
+    /// WITHOUT `server_audit_log` (it ran a pre-rebase protected-channels
+    /// build, so upstream's revision 73 never ran) makes the migration panic
+    /// with a message naming the trap and the fix (reset to 72), and the
+    /// protected-channels revision does not run. The same database WITH the
+    /// collection (upstream's own revision 74) migrates to the latest.
+    /// Control: the check removed (the first run returns 76).
+    #[tokio::test]
+    async fn revision_74_without_the_audit_log_is_refused_as_the_dev_database_trap() {
+        use futures::FutureExt;
+
+        // Named by hand for the same 63-character reason as revision 70's.
+        let db = crate::DatabaseInfo::Test("migration_rev74_dev_trap".to_string())
+            .connect()
+            .await
+            .expect("Database connection failed.");
+        db.drop_database().await;
+        let guard = crate::test_teardown::TestDatabaseGuard::arm(&db).await;
+
+        {
+            #[allow(irrefutable_let_patterns)]
+            let Database::MongoDb(mongo) = db.clone() else {
+                // The migration scripts are MongoDB-only.
+                db.drop_database().await;
+                guard.disarm();
+                return;
+            };
+
+            let migration = std::panic::AssertUnwindSafe(super::run_migrations(&mongo, 74))
+                .catch_unwind()
+                .await;
+            let Err(payload) = migration else {
+                panic!("revision 74 without server_audit_log must be refused");
+            };
+            let message = payload
+                .downcast_ref::<String>()
+                .map(String::as_str)
+                .or_else(|| payload.downcast_ref::<&str>().copied())
+                .unwrap_or_default();
+            for needle in [
+                "revision 74",
+                "server_audit_log",
+                "dev-database trap",
+                "revision to 72",
+            ] {
+                assert!(
+                    message.contains(needle),
+                    "the panic must name `{needle}`: {message}"
+                );
+            }
+            let collections = mongo
+                .db()
+                .list_collection_names()
+                .await
+                .expect("list collections");
+            assert!(
+                !collections.iter().any(|name| name == "channel_seats"),
+                "revision 75 must not run past the refusal: {collections:?}"
+            );
+
+            mongo
+                .db()
+                .create_collection("server_audit_log")
+                .await
+                .expect("create server_audit_log");
+            assert_eq!(
+                super::run_migrations(&mongo, 74).await,
+                76,
+                "upstream's revision 74 (with server_audit_log) migrates"
             );
         }
 

@@ -21,10 +21,11 @@ pub async fn message_unpin(
     msg: Reference<'_>,
 ) -> Result<EmptyResponse> {
     let channel = target.as_channel(db).await?;
+    // Threads inherit their parent channel's permission overrides (a DM is
+    // its own target, read here only for the protected check below).
+    let permission_channel = channel.permission_target(db).await?.into_owned();
 
     if !matches!(channel, Channel::DirectMessage { .. }) {
-        // Threads inherit their parent channel's permission overrides.
-        let permission_channel = channel.permission_target(db).await?.into_owned();
         let mut query = DatabasePermissionQuery::new(db, &user).channel(&permission_channel);
         calculate_channel_permissions(&mut query)
             .await
@@ -42,8 +43,9 @@ pub async fn message_unpin(
         .await?;
 
     // A protected channel takes no system rows (decision 16 (W2)): the unpin
-    // stands, and its announcement is dropped rather than failing the route
-    if channel.is_protected() || message.encrypted.is_some() {
+    // stands, and its announcement is dropped rather than failing the route.
+    // A thread is judged by its parent (W2 audit B1).
+    if channel.is_protected() || permission_channel.is_protected() || message.encrypted.is_some() {
         return Ok(EmptyResponse);
     }
 
@@ -408,5 +410,93 @@ mod test {
             let stored = harness.db.fetch_message(id).await.expect("the message");
             assert_eq!(stored.pinned, Some(true));
         }
+    }
+
+    /// W2 audit B1: decision 16 judges a thread by its parent. The unpin of
+    /// a row in a thread left under a protected parent (stored directly,
+    /// its row written before the flag) stands, with no system row.
+    ///
+    /// Control: the `2acdf5f0` route (judges the thread itself) → the
+    /// system message reaches the floor, which refuses it, and the route
+    /// answers 400.
+    #[test]
+    fn unpin_in_a_thread_under_a_protected_parent_sends_no_system_message() {
+        crate::util::test::rt()
+            .block_on(unpin_in_a_thread_under_a_protected_parent_sends_no_system_message_case())
+    }
+
+    async fn unpin_in_a_thread_under_a_protected_parent_sends_no_system_message_case() {
+        use revolt_database::{Channel, Database};
+
+        let harness = TestHarness::new().await;
+        let (_, session, owner) = harness.new_user().await;
+        let (server, parent) = harness.new_protectable_channel(&owner).await;
+        let thread = Channel::Thread {
+            id: Ulid::new().to_string(),
+            server: server.id.clone(),
+            parent_channel: parent.id().to_string(),
+            name: "Thread".to_string(),
+            creator: owner.id.clone(),
+            origin_message_id: None,
+            last_message_id: None,
+            archived: false,
+            archived_timestamp: None,
+            auto_archive_minutes: 0,
+            locked: false,
+            applied_tags: vec![],
+        };
+        harness.db.insert_channel(&thread).await.expect("thread");
+
+        let stray = Message {
+            id: Ulid::new().to_string(),
+            channel: thread.id().to_string(),
+            author: owner.id.clone(),
+            content: Some("Stray".to_string()),
+            ..Default::default()
+        };
+        harness.db.insert_message(&stray).await.expect("message");
+        pin_raw(&harness, &stray.id).await;
+
+        // Protect the parent raw, under the thread's stored row
+        match &harness.db {
+            Database::Reference(reference) => {
+                match reference.channels.lock().await.get_mut(parent.id()) {
+                    Some(Channel::TextChannel { protected, .. }) => *protected = true,
+                    other => panic!("expected a text channel, got {:?}", other),
+                }
+            }
+            Database::MongoDb(mongo) => {
+                use revolt_database::mongodb::bson::{doc, Document};
+
+                let result = mongo
+                    .col::<Document>("channels")
+                    .update_one(
+                        doc! { "_id": parent.id() },
+                        doc! { "$set": { "protected": true } },
+                    )
+                    .await
+                    .expect("raw protect");
+                assert_eq!(result.matched_count, 1);
+            }
+        }
+        assert!(harness
+            .db
+            .fetch_channel(parent.id())
+            .await
+            .expect("parent")
+            .is_protected());
+
+        let answer = unpin(&harness, &session, thread.id(), &stray.id).await;
+        assert_eq!(answer.0, Status::NoContent, "{:?}", answer);
+
+        let stored = harness.db.fetch_message(&stray.id).await.expect("the row");
+        assert_eq!(stored.pinned, None);
+        let rows = stored_in(&harness, thread.id()).await;
+        assert_eq!(
+            rows.iter().map(|row| row.id.as_str()).collect::<Vec<_>>(),
+            vec![stray.id.as_str()],
+            "no system row: {:?}",
+            rows
+        );
     }
 }

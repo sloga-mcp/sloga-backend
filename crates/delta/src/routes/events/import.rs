@@ -100,7 +100,9 @@ pub async fn import_legacy_events(
     // A protected channel's history is ciphertext the server can't read; any
     // plaintext row left in it is a stray that must never be served. Refused
     // after the view check, so a non-viewer gets the same answer either way.
-    if channel.is_protected() {
+    // A thread is judged by its parent (W2 audit B1), the target the view
+    // check just resolved.
+    if channel.is_protected() || channel.permission_target(db).await?.is_protected() {
         return Err(create_error!(ChannelProtected));
     }
 
@@ -506,6 +508,53 @@ mod test {
         }
 
         assert_eq!(answers[0], answers[1]);
+        assert!(harness
+            .db
+            .fetch_imported_source_ids(&server.id)
+            .await
+            .expect("imported ids")
+            .is_empty());
+    }
+
+    /// W2 audit B1: a thread is judged by its parent. A tagged row in a
+    /// thread left under a protected parent (stored directly, the row
+    /// written before the flag) is never imported: `ChannelProtected`,
+    /// nothing stored.
+    ///
+    /// Control: the `2acdf5f0` route (the thread's own flag) → the row is
+    /// imported.
+    #[test]
+    fn import_refuses_a_thread_under_a_protected_parent() {
+        crate::util::test::rt().block_on(import_refuses_a_thread_under_a_protected_parent_case())
+    }
+
+    async fn import_refuses_a_thread_under_a_protected_parent_case() {
+        let harness = TestHarness::new().await;
+        let (_, session, owner) = harness.new_user().await;
+        let (server, _) = harness.new_server(&owner).await;
+        harness.join_server(&server, &owner).await;
+        let parent = harness.new_channel(&server).await;
+        let thread = Channel::Thread {
+            id: Ulid::new().to_string(),
+            server: server.id.clone(),
+            parent_channel: parent.id().to_string(),
+            name: "Thread".to_string(),
+            creator: owner.id.clone(),
+            origin_message_id: None,
+            last_message_id: None,
+            archived: false,
+            archived_timestamp: None,
+            auto_archive_minutes: 0,
+            locked: false,
+            applied_tags: vec![],
+        };
+        harness.db.insert_channel(&thread).await.expect("thread");
+        insert_tagged(&harness, thread.id(), &owner.id, "Stray").await;
+        protect_under_stored_rows(&harness.db, parent.id()).await;
+
+        let (status, body) = import(&harness, &session.token, &server.id, thread.id()).await;
+        assert_eq!(status, Status::BadRequest, "{}", body);
+        assert_eq!(body["type"], "ChannelProtected", "{}", body);
         assert!(harness
             .db
             .fetch_imported_source_ids(&server.id)

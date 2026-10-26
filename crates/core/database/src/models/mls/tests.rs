@@ -1210,6 +1210,14 @@ fn assert_failed_validation(result: revolt_result::Result<MlsCommitOutcome>, wha
     }
 }
 
+/// The error type of a refused commit
+fn refusal_type(result: revolt_result::Result<MlsCommitOutcome>, what: &str) -> ErrorType {
+    match result {
+        Err(error) => error.error_type,
+        Ok(outcome) => panic!("{what}: expected a refusal, got {outcome:?}"),
+    }
+}
+
 fn assert_not_seated(result: revolt_result::Result<MlsCommitOutcome>, what: &str) {
     match result {
         Err(error) => match error.error_type {
@@ -2482,20 +2490,29 @@ async fn text_device_cap_is_enforced_inside_the_commit() {
                 .await,
             "second device within the signed cap",
         );
-        assert_failed_validation(
+        // A5: the route's own typed errors, not FailedValidation
+        let refused = refusal_type(
             db.insert_mls_text_commit(&add_bob(&fixture, 2, 3), &fixture.hash, 0)
                 .await,
             "third device over the signed cap",
+        );
+        assert!(
+            matches!(refused, ErrorType::DeviceCapReached { max: 2 }),
+            "third device over the signed cap: {refused:?}"
         );
 
         // Signed 3, entitlement 1: the entitlement binds
         let mut seed = text_seed(91, &alice, &[alice.clone(), bob(1)], &[ALICE, BOB]);
         seed.device_cap = 3;
         let fixture = seed_text_group(&db, &seed).await;
-        assert_failed_validation(
+        let refused = refusal_type(
             db.insert_mls_text_commit(&add_bob(&fixture, 1, 2), &fixture.hash, 1)
                 .await,
             "over the entitlement cap",
+        );
+        assert!(
+            matches!(refused, ErrorType::DeviceCapReached { max: 1 }),
+            "over the entitlement cap: {refused:?}"
         );
 
         // Both unlimited: bounded only by the leaf cap
@@ -2519,10 +2536,14 @@ async fn text_device_cap_is_enforced_inside_the_commit() {
         let mut roster: Vec<MlsMemberDevice> = (1..=99u8).map(|n| text_device(ALICE, n)).collect();
         roster.push(bob(1));
         let fixture = seed_text_group(&db, &text_seed(93, &alice, &roster, &[ALICE, BOB])).await;
-        assert_failed_validation(
+        let refused = refusal_type(
             db.insert_mls_text_commit(&add_bob(&fixture, 1, 2), &fixture.hash, 0)
                 .await,
             "101st leaf",
+        );
+        assert!(
+            matches!(refused, ErrorType::MlsCallFull { max: 100 }),
+            "101st leaf: {refused:?}"
         );
     });
 }
@@ -2611,5 +2632,196 @@ async fn call_path_preserves_text_fields_and_never_touches_text_groups() {
         assert_eq!(group.current_epoch, 0);
         assert!(!group.has_member(&bob.user_id, &bob.device_id));
         assert_eq!(group, fixture.group);
+    });
+}
+
+/// R22 (W2 audit A1): a Call-shaped row at a Text group's `{group}:{epoch}`
+/// id (a Call-plane stray left by a squat at the derived id, written by the
+/// non-transactional Call insert) never answers the Text existing-row check
+/// and is never served by the Text fetch; the first Text commit at that
+/// epoch WINS and replaces it, at the first epoch and at a later one. A
+/// genuine Text row still answers `Lost` (N3), and a refused Text commit
+/// leaves the stray where it was.
+#[tokio::test]
+async fn a_call_shaped_stray_never_wins_a_text_epoch() {
+    database_test!(|db| async move {
+        db.migrate_database().await.expect("schema");
+
+        let alice = text_device(ALICE, 1);
+        let bob = text_device(BOB, 1);
+        let squatter = text_device(EVE, 9);
+        let fixture = seed_text_group(
+            &db,
+            &text_seed(110, &alice, &[alice.clone(), bob.clone()], &[ALICE, BOB]),
+        )
+        .await;
+        let group = &fixture.group.id;
+        let stray = |epoch: i64| make_commit(group, epoch, &squatter, vec![], vec![], "stray");
+        let epochs = |rows: Vec<MlsCommit>| -> Vec<(i64, String)> {
+            rows.into_iter()
+                .map(|row| (row.epoch, row.commit))
+                .collect()
+        };
+
+        // The stray at epoch 1, after the Text create: never served
+        insert_raw_commit(&db, &stray(1)).await;
+        assert!(db
+            .fetch_mls_text_commits_from(group, 0, 10)
+            .await
+            .unwrap()
+            .is_empty());
+
+        // The first Text commit at epoch 1 wins (not `Lost { stray }`)
+        let alices = text_commit(&fixture, 1, &alice, vec![], vec![], Timestamp::now_utc());
+        assert_won(
+            db.insert_mls_text_commit(&alices, &fixture.hash, 0).await,
+            "the first Text commit over a stray",
+        );
+        assert_eq!(
+            epochs(db.fetch_mls_text_commits_from(group, 0, 10).await.unwrap()),
+            vec![(1, alices.commit.clone())]
+        );
+        // The stray is gone: the one row at the id is the Text row
+        assert_eq!(
+            epochs(db.fetch_mls_commits_from(group, 0, 10).await.unwrap()),
+            vec![(1, alices.commit.clone())]
+        );
+
+        // N3: the genuine Text row answers an identical resubmit
+        match db
+            .insert_mls_text_commit(&alices, &fixture.hash, 0)
+            .await
+            .unwrap()
+        {
+            MlsCommitOutcome::Lost { winning } => {
+                assert_eq!(winning.commit, alices.commit);
+                assert_eq!(winning.committer, alice);
+            }
+            other => panic!("identical resubmit must return the Text row: {other:?}"),
+        }
+
+        // A later epoch: a stray at 2 is not served, a refused commit at 2
+        // leaves it in place, and the first valid one wins over it
+        insert_raw_commit(&db, &stray(2)).await;
+        assert_eq!(
+            epochs(db.fetch_mls_text_commits_from(group, 0, 10).await.unwrap()),
+            vec![(1, alices.commit.clone())]
+        );
+        assert_resecuring(
+            db.insert_mls_text_commit(
+                &text_commit(&fixture, 2, &bob, vec![], vec![], Timestamp::now_utc()),
+                &"00".repeat(32),
+                0,
+            )
+            .await,
+            "stale_seat_list",
+            "a refused commit over a stray",
+        );
+        assert_eq!(
+            epochs(db.fetch_mls_commits_from(group, 2, 10).await.unwrap()),
+            vec![(2, "stray".to_string())],
+            "a refused commit removes nothing"
+        );
+        let bobs = text_commit(&fixture, 2, &bob, vec![], vec![], Timestamp::now_utc());
+        assert_won(
+            db.insert_mls_text_commit(&bobs, &fixture.hash, 0).await,
+            "a later Text commit over a stray",
+        );
+        assert_eq!(
+            epochs(db.fetch_mls_text_commits_from(group, 0, 10).await.unwrap()),
+            vec![(1, alices.commit.clone()), (2, bobs.commit.clone())]
+        );
+        assert_eq!(
+            epochs(db.fetch_mls_commits_from(group, 0, 10).await.unwrap()),
+            vec![(1, alices.commit.clone()), (2, bobs.commit.clone())]
+        );
+        match db
+            .insert_mls_text_commit(&bobs, &fixture.hash, 0)
+            .await
+            .unwrap()
+        {
+            MlsCommitOutcome::Lost { winning } => assert_eq!(winning.commit, bobs.commit),
+            other => panic!("identical resubmit must return the Text row: {other:?}"),
+        }
+        assert_eq!(db.fetch_mls_group(group).await.unwrap().current_epoch, 2);
+    });
+}
+
+/// W2 audit A3: a Call create never overwrites a stored group, whatever
+/// its kind, channel or state; both drivers answer `InvalidOperation`
+/// (Mongo's `_id` insert fails and no open group of the kind is on the
+/// channel). The Text group at the id is intact afterwards.
+#[tokio::test]
+async fn a_call_create_never_overwrites_an_existing_group_id() {
+    database_test!(|db| async move {
+        db.migrate_database().await.expect("schema");
+
+        let alice = text_device(ALICE, 1);
+        let text_channel = ulid(1120);
+        store_genesis_seat_list(&db, &seat_list_row(&text_channel, 1, 0, &alice, &[ALICE])).await;
+        let mut text = make_group(&group_id(120), &text_channel, &alice);
+        text.kind = MlsGroupKind::Text;
+        text.generation = Some(0);
+        assert!(matches!(
+            db.create_text_mls_group(&text, None).await.unwrap(),
+            MlsGroupCreateOutcome::Created
+        ));
+        let before = db.fetch_mls_group(&text.id).await.unwrap();
+        assert!(before.is_text() && before.open);
+
+        fn refused(result: revolt_result::Result<MlsGroupCreateOutcome>, case: &str) {
+            match result {
+                Err(error) => assert!(
+                    matches!(error.error_type, ErrorType::InvalidOperation),
+                    "{case}: {error:?}"
+                ),
+                Ok(outcome) => panic!("{case}: a Call create over a stored id: {outcome:?}"),
+            }
+        }
+
+        // At the Text id, on another channel and on the Text group's own
+        // channel (neither has an open Call group)
+        for channel in [ulid(1121), text_channel.clone()] {
+            refused(
+                db.create_mls_group(&make_group(&text.id, &channel, &alice), None)
+                    .await,
+                &format!("Call create at the Text id on {channel}"),
+            );
+        }
+
+        // As the successor of a channel's open Call group
+        let call_channel = ulid(1122);
+        let call = make_group(&group_id(121), &call_channel, &alice);
+        assert!(matches!(
+            db.create_mls_group(&call, None).await.unwrap(),
+            MlsGroupCreateOutcome::Created
+        ));
+        refused(
+            db.create_mls_group(&make_group(&text.id, &call_channel, &alice), Some(&call.id))
+                .await,
+            "Call successor at the Text id",
+        );
+
+        assert_eq!(db.fetch_mls_group(&text.id).await.unwrap(), before);
+        assert_eq!(
+            db.fetch_open_mls_group_for_channel(&text_channel, MlsGroupKind::Text)
+                .await
+                .unwrap()
+                .expect("the Text group is still the channel's open group"),
+            before
+        );
+
+        // A closed Call group's id is not reusable either
+        let closed_channel = ulid(1123);
+        let closed = make_group(&group_id(122), &closed_channel, &alice);
+        db.create_mls_group(&closed, None).await.unwrap();
+        assert!(db.close_mls_group(&closed.id).await.unwrap());
+        let stored = db.fetch_mls_group(&closed.id).await.unwrap();
+        refused(
+            db.create_mls_group(&make_group(&closed.id, &closed_channel, &alice), None)
+                .await,
+            "Call create at a closed Call group's id",
+        );
+        assert_eq!(db.fetch_mls_group(&closed.id).await.unwrap(), stored);
     });
 }

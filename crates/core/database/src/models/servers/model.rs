@@ -281,14 +281,20 @@ impl Server {
         db.deallocate_all_server_boosts_for_server(&self.id).await?;
 
         // Protected-channel cascade (design 7.5, decision 12 (W2)): this path
-        // never runs Channel::delete, so each listed channel's entitlement,
-        // seats, seat list, Text group and commits go here. Every id, protected
+        // never runs Channel::delete, so each channel's entitlement, seats,
+        // seat list, Text groups and commits go here. Every id, protected
         // or not (an unprotected channel can hold an entitlement), and never
         // flag-gated; a dangling id is a no-op, the primitive never reads the
-        // channel row. Last of the cascades, so an earlier failure cannot strip
-        // a server that survives, and before the broadcast and the row delete,
-        // so a failure here aborts the deletion without announcing it.
-        for channel_id in &self.channels {
+        // channel row. The ids are `self.channels` together with the
+        // channels of the server's entitlements (C4, W2 audit), so a
+        // protected channel missing from the list is not left behind. Last
+        // of the cascades, so an earlier failure cannot strip a server that
+        // survives, and before the broadcast and the row delete, so a failure
+        // here aborts the deletion without announcing it.
+        let mut protected_ids: std::collections::BTreeSet<String> =
+            self.channels.iter().cloned().collect();
+        protected_ids.extend(db.fetch_entitled_channel_ids(&self.id).await?);
+        for channel_id in &protected_ids {
             db.delete_protected_channel_data(channel_id).await?;
         }
 
@@ -1473,6 +1479,7 @@ mod tests {
 mod protected_delete_tests {
     use iso8601_timestamp::{Duration, Timestamp};
     use revolt_models::v0::{self, DataCreateServer, DataCreateServerChannel};
+    use revolt_result::ErrorType;
     use ulid::Ulid;
 
     use crate::{
@@ -1693,9 +1700,87 @@ mod protected_delete_tests {
                 .await
                 .expect("seats")
                 .is_empty());
-            // The Text group row is closed, not deleted (the primitive's contract)
-            assert!(!db.fetch_mls_group(&group.id).await.expect("group").open);
+            // C7 (W2 audit): the Text group row is deleted, not only closed
+            let result = db.fetch_mls_group(&group.id).await;
+            assert!(
+                result
+                    .as_ref()
+                    .is_err_and(|error| matches!(error.error_type, ErrorType::NotFound)),
+                "the Text group row survived the server delete: {result:?}"
+            );
             assert!(db.fetch_server(&server_id).await.is_err());
+        });
+    }
+
+    /// C4 (W2 audit): a protected channel missing from `server.channels`
+    /// (the list is a plain array any edit rewrites) is still cleaned: the
+    /// cascade walks the channels of the server's entitlements too.
+    /// Control: the loop over `self.channels` only.
+    #[tokio::test]
+    async fn delete_removes_protected_data_of_an_entitled_channel_missing_from_the_list() {
+        database_test!(|db| async move {
+            let (server, owner, protected, plain) = fixture(&db).await;
+            db.upsert_channel_entitlement(&entitlement(&protected, &server.id), now())
+                .await
+                .expect("entitlement");
+            let submission = SeatListSubmission {
+                body: SeatListBody {
+                    channel_id: protected.clone(),
+                    version: 1,
+                    device_cap: 5,
+                    issued_at: 1_790_812_800_000,
+                    signer_user_id: owner.id.clone(),
+                    signer_device_id: DEVICE.to_string(),
+                    seats: vec![owner.id.clone()],
+                }
+                .build()
+                .expect("body"),
+                signature: format!("B{}", "A".repeat(85)),
+                signer_device_id: DEVICE.to_string(),
+                handover: None,
+            };
+            db.protect_channel(&protected, &submission, now())
+                .await
+                .expect("protect");
+
+            // The protected channel drops out of the server's list
+            db.update_server(
+                &server.id,
+                &PartialServer {
+                    channels: Some(vec![plain.clone()]),
+                    ..Default::default()
+                },
+                vec![],
+            )
+            .await
+            .expect("channels");
+            let server = db.fetch_server(&server.id).await.expect("`Server`");
+            assert_eq!(server.channels, [plain]);
+            assert!(db
+                .fetch_seat_list(&protected)
+                .await
+                .expect("list")
+                .is_some());
+
+            server.delete(&db).await.expect("delete");
+
+            assert!(
+                db.fetch_channel_entitlement(&protected)
+                    .await
+                    .expect("entitlement")
+                    .is_none(),
+                "the unlisted channel's entitlement survived the server delete"
+            );
+            assert!(db
+                .fetch_channel_seats(&protected)
+                .await
+                .expect("seats")
+                .is_empty());
+            assert!(db
+                .fetch_seat_list(&protected)
+                .await
+                .expect("list")
+                .is_none());
         });
     }
 

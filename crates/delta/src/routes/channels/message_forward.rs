@@ -61,7 +61,11 @@ pub async fn message_forward(
     // A protected source never leaves its channel as a server-built
     // plaintext snapshot. Refused only once the forwarder can read the
     // source, so a caller who cannot learns nothing about its protection.
-    if source_channel.is_protected() || source_message.encrypted.is_some() {
+    // A thread is judged by its parent (W2 audit B1).
+    if source_channel.is_protected()
+        || source_permission_channel.is_protected()
+        || source_message.encrypted.is_some()
+    {
         return Err(create_error!(ChannelProtected));
     }
 
@@ -93,8 +97,8 @@ pub async fn message_forward(
     // A protected channel only takes encrypted messages, and a forward is a
     // plaintext snapshot. Refused after the send check (same reasoning as
     // the source) and before the slowmode claim, the nonce and the
-    // attachment copies.
-    if destination.is_protected() {
+    // attachment copies. A thread is judged by its parent (W2 audit B1).
+    if destination.is_protected() || permission_channel.is_protected() {
         return Err(create_error!(ChannelProtected));
     }
 
@@ -850,9 +854,9 @@ mod test {
         serde_json::from_str(&answer.1).expect("a JSON body")
     }
 
-    /// A `ChannelProtected` refusal. The body no longer carries the error's
-    /// `location`, so it cannot tell this route's refusal from the database
-    /// floor's.
+    /// This route's `ChannelProtected` refusal. The database floor answers
+    /// `ProtectedFieldRefused` instead, so the type tells the two apart; the
+    /// body no longer carries the error's `location`.
     fn assert_refused_here(answer: &(Status, String), case: &str) {
         assert_eq!(answer.0, Status::BadRequest, "{}: {:?}", case, answer);
         let value = body(answer);
@@ -1190,5 +1194,88 @@ mod test {
         )
         .await;
         assert_eq!(answer, baseline);
+    }
+
+    /// A thread under `parent`, stored directly. With the parent protected
+    /// afterwards it stands for the thread `create_thread` leaves behind
+    /// when its delete after a refused hold fails (W2 audit B1).
+    async fn orphan_thread(harness: &TestHarness, parent: &Channel, creator: &str) -> Channel {
+        let thread = Channel::Thread {
+            id: Ulid::new().to_string(),
+            server: parent.server().expect("a server channel").to_string(),
+            parent_channel: parent.id().to_string(),
+            name: "Thread".to_string(),
+            creator: creator.to_string(),
+            origin_message_id: None,
+            last_message_id: None,
+            archived: false,
+            archived_timestamp: None,
+            auto_archive_minutes: 0,
+            locked: false,
+            applied_tags: vec![],
+        };
+        harness.db.insert_channel(&thread).await.expect("thread");
+        thread
+    }
+
+    /// W2 audit B1: a thread is judged by its parent, both as the source
+    /// and as the destination. Out of a thread under a protected parent (a
+    /// plaintext row written before the flag) and into one: the route's own
+    /// `ChannelProtected`, before the nonce. A thread under an open parent
+    /// takes the forward (positive control, with the same nonce).
+    ///
+    /// Control: the `2acdf5f0` route (judges the thread itself) → the
+    /// forward out succeeds and the forward in reaches the floor
+    /// (`ProtectedFieldRefused`).
+    #[test]
+    fn forward_out_of_and_into_a_thread_under_a_protected_parent_is_refused() {
+        crate::util::test::rt()
+            .block_on(forward_out_of_and_into_a_thread_under_a_protected_parent_is_refused_case())
+    }
+
+    async fn forward_out_of_and_into_a_thread_under_a_protected_parent_is_refused_case() {
+        let harness = TestHarness::new().await;
+        let (_, session, owner) = harness.new_user().await;
+        let (server, parent) = harness.new_protectable_channel(&owner).await;
+        let orphan = orphan_thread(&harness, &parent, &owner.id).await;
+        let stray = insert_plaintext(&harness.db, &orphan, &owner.id).await;
+        set_protected(&harness.db, parent.id(), true).await;
+
+        let open = harness.new_channel(&server).await;
+        let plaintext = insert_plaintext(&harness.db, &open, &owner.id).await;
+        let open_thread = orphan_thread(&harness, &open, &owner.id).await;
+        let nonce = Ulid::new().to_string();
+
+        let answer = forward(
+            &harness,
+            &session,
+            orphan.id(),
+            &stray.id,
+            json!({ "destination": open.id() }),
+        )
+        .await;
+        assert_refused_here(&answer, "out of the orphan");
+
+        let answer = forward(
+            &harness,
+            &session,
+            open.id(),
+            &plaintext.id,
+            json!({ "destination": orphan.id(), "nonce": nonce }),
+        )
+        .await;
+        assert_refused_here(&answer, "into the orphan");
+        assert_eq!(messages_in(&harness, orphan.id(), &owner.id).await, 1);
+
+        let answer = forward(
+            &harness,
+            &session,
+            open.id(),
+            &plaintext.id,
+            json!({ "destination": open_thread.id(), "nonce": nonce }),
+        )
+        .await;
+        assert_eq!(answer.0, Status::Ok, "{:?}", answer);
+        assert_eq!(body(&answer)["channel"], open_thread.id());
     }
 }

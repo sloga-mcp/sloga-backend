@@ -498,19 +498,31 @@ fn server_update_changes(before: &Server, after: &Server) -> Vec<AuditLogChange>
     changes
 }
 
-/// `ChannelProtected` if any channel listed on `server` is protected.
+/// `ChannelProtected` if any channel of `server` is protected: every id
+/// listed on `server`, and every channel of the server's entitlements (C4,
+/// W2 audit), so a protected channel missing from `server.channels` still
+/// blocks the transfer. Protect needs an entitlement, so the union covers
+/// every channel protect can have flagged.
 ///
 /// Fetched per id. An id with no channel behind it (a dangling entry in
-/// `server.channels`) is skipped rather than failing the edit; any other
-/// fetch error is returned, so an unreadable channel never counts as
-/// unprotected.
+/// `server.channels`, or an entitlement whose channel is gone) is skipped
+/// rather than failing the edit; any other fetch error is returned, so an
+/// unreadable channel never counts as unprotected. So is a failure to list
+/// the entitlements.
 ///
 /// The read is not atomic with the transfer's write. Protect claims the
 /// `servers` document filtered on the owner, so a transfer that lands first
 /// makes protect refuse; a protect that lands between this read and the
 /// write is the documented R16 order, surfaced to clients as `OwnerChanged`.
 async fn refuse_while_any_channel_is_protected(db: &Database, server: &Server) -> Result<()> {
-    for channel_id in &server.channels {
+    let mut channel_ids = server.channels.clone();
+    for channel_id in db.fetch_entitled_channel_ids(&server.id).await? {
+        if !channel_ids.contains(&channel_id) {
+            channel_ids.push(channel_id);
+        }
+    }
+
+    for channel_id in &channel_ids {
         match db.fetch_channel(channel_id).await {
             Ok(channel) if channel.is_protected() => {
                 return Err(create_error!(ChannelProtected));
@@ -1670,6 +1682,70 @@ mod test {
                         || data.name.as_deref() == Some("Renamed")
             )
         });
+    }
+
+    /// C4 (W2 audit): a protected channel missing from `server.channels`
+    /// (a plain array any server edit rewrites) still blocks the transfer:
+    /// the refusal also walks the channels of the server's entitlements.
+    /// Control: the loop over `server.channels` only (the transfer lands).
+    #[test]
+    fn owner_transfer_is_refused_while_an_unlisted_channel_is_protected() {
+        crate::util::test::rt()
+            .block_on(owner_transfer_is_refused_while_an_unlisted_channel_is_protected_case())
+    }
+
+    async fn owner_transfer_is_refused_while_an_unlisted_channel_is_protected_case() {
+        let harness = TestHarness::new().await;
+        let (owner_account, owner_session, owner) = harness.new_user().await;
+        let (_, _, member) = harness.new_user().await;
+        let protected = harness
+            .new_protected_channel(&owner, &owner_session, &[])
+            .await;
+        let protected_id = protected.channel.id().to_string();
+        let server = protected.server;
+        harness.join_server(&server, &member).await;
+
+        let listed: Vec<String> = server
+            .channels
+            .iter()
+            .filter(|id| **id != protected_id)
+            .cloned()
+            .collect();
+        harness
+            .db
+            .update_server(
+                &server.id,
+                &PartialServer {
+                    channels: Some(listed),
+                    ..Default::default()
+                },
+                vec![],
+            )
+            .await
+            .expect("the protected channel drops out of the list");
+        let server = harness.db.fetch_server(&server.id).await.expect("`Server`");
+        assert!(!server.channels.contains(&protected_id));
+        assert!(harness
+            .db
+            .fetch_channel(&protected_id)
+            .await
+            .expect("the channel")
+            .is_protected());
+
+        let (status, body) = edit_with_ticket(
+            &harness,
+            &server.id,
+            &owner_session,
+            &owner_account.id,
+            json!({ "owner": member.id }),
+        )
+        .await;
+        assert_eq!(status, Status::BadRequest, "{body}");
+        let error: serde_json::Value = serde_json::from_str(&body).expect("an error body");
+        assert_eq!(error["type"], "ChannelProtected", "{body}");
+
+        let stored = harness.db.fetch_server(&server.id).await.expect("`Server`");
+        assert_eq!(stored.owner, owner.id, "ownership must not move");
     }
 
     /// Positive control: the same transfer on a server with only unprotected

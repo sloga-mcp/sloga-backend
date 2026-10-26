@@ -7,8 +7,8 @@ use revolt_database::{
         EventViewer,
     },
     util::reference::Reference,
-    CalendarEvent, Database, FieldsCalendarEvent, File, PartialCalendarEvent, RsvpStatus, User,
-    AMQP, MAX_EVENT_ATTACHMENTS,
+    CalendarEvent, Channel, Database, FieldsCalendarEvent, File, PartialCalendarEvent, RsvpStatus,
+    User, AMQP, MAX_EVENT_ATTACHMENTS,
 };
 use revolt_models::v0;
 use revolt_result::{create_error, Result};
@@ -61,6 +61,20 @@ async fn claim_event_attachments(
     Ok(files)
 }
 
+/// Refuse a protected event channel (W2 audit B2): an event posts plaintext
+/// (title, description, RSVPs) onto the channel's topic, and a protected
+/// channel carries only ciphertext. A thread is judged by its parent, the
+/// target `require_event_channel_view` resolved. Run only after that view
+/// check (decision 18 (W2)), so a caller who cannot view the channel gets
+/// the same answer whether or not it is protected.
+async fn refuse_protected_event_channel(db: &Database, channel: &Channel) -> Result<()> {
+    if channel.is_protected() || channel.permission_target(db).await?.is_protected() {
+        return Err(create_error!(ChannelProtected));
+    }
+
+    Ok(())
+}
+
 /// # Create Event
 ///
 /// Create a calendar event in a server. Any server member may create; if a channel
@@ -94,6 +108,7 @@ pub async fn create_event(
     if let Some(channel_id) = &data.channel {
         let channel = db.fetch_channel(channel_id).await?;
         require_event_channel_view(db, &user, &server.id, &channel).await?;
+        refuse_protected_event_channel(db, &channel).await?;
     }
 
     let mut event = CalendarEvent::create(
@@ -291,6 +306,7 @@ pub async fn edit_event(
         Some(channel_id) => {
             let channel = db.fetch_channel(channel_id).await?;
             require_event_channel_view(db, &user, &event.server, &channel).await?;
+            refuse_protected_event_channel(db, &channel).await?;
             Some(channel)
         }
         None => None,
@@ -576,4 +592,225 @@ pub async fn cancel_event(
     }
 
     Ok(EmptyResponse)
+}
+
+#[cfg(test)]
+mod protected_tests {
+    use crate::util::test::TestHarness;
+    use revolt_database::{Channel, PartialChannel, Session};
+    use revolt_permissions::{ChannelPermission, OverrideField};
+    use rocket::http::{ContentType, Header, Status};
+    use serde_json::{json, Value};
+    use ulid::Ulid;
+
+    const START: i64 = 1_900_000_000_000;
+
+    /// Create an event in `server_id`, attached to `channel_id` if given
+    async fn create(
+        harness: &TestHarness,
+        session: &Session,
+        server_id: &str,
+        channel_id: Option<&str>,
+    ) -> (Status, String) {
+        let mut body = json!({ "title": "Raid", "start": START, "timezone": "UTC" });
+        if let Some(channel_id) = channel_id {
+            body["channel"] = json!(channel_id);
+        }
+        let response = harness
+            .client
+            .post(format!("/events/server/{server_id}"))
+            .header(Header::new("x-session-token", session.token.clone()))
+            .header(ContentType::JSON)
+            .body(body.to_string())
+            .dispatch()
+            .await;
+        let status = response.status();
+        (status, response.into_string().await.unwrap_or_default())
+    }
+
+    /// Move `event_id` to `channel_id`
+    async fn move_to(
+        harness: &TestHarness,
+        session: &Session,
+        event_id: &str,
+        channel_id: &str,
+    ) -> (Status, String) {
+        let response = harness
+            .client
+            .patch(format!("/events/event/{event_id}"))
+            .header(Header::new("x-session-token", session.token.clone()))
+            .header(ContentType::JSON)
+            .body(json!({ "channel": channel_id }).to_string())
+            .dispatch()
+            .await;
+        let status = response.status();
+        (status, response.into_string().await.unwrap_or_default())
+    }
+
+    #[track_caller]
+    fn body(answer: &(Status, String)) -> Value {
+        serde_json::from_str(&answer.1).unwrap_or_else(|_| panic!("not JSON: {:?}", answer))
+    }
+
+    #[track_caller]
+    fn assert_protected(answer: &(Status, String), case: &str) {
+        assert_eq!(answer.0, Status::BadRequest, "{case}: {:?}", answer);
+        assert_eq!(
+            body(answer)["type"],
+            "ChannelProtected",
+            "{case}: {}",
+            answer.1
+        );
+    }
+
+    /// A thread under `parent`, stored directly (W2 audit B1)
+    async fn thread_under(harness: &TestHarness, parent: &Channel, creator: &str) -> Channel {
+        let thread = Channel::Thread {
+            id: Ulid::new().to_string(),
+            server: parent.server().expect("a server channel").to_string(),
+            parent_channel: parent.id().to_string(),
+            name: "Thread".to_string(),
+            creator: creator.to_string(),
+            origin_message_id: None,
+            last_message_id: None,
+            archived: false,
+            archived_timestamp: None,
+            auto_archive_minutes: 0,
+            locked: false,
+            applied_tags: vec![],
+        };
+        harness.db.insert_channel(&thread).await.expect("thread");
+        thread
+    }
+
+    async fn deny_view(harness: &TestHarness, channel: &Channel) {
+        let mut channel = harness
+            .db
+            .fetch_channel(channel.id())
+            .await
+            .expect("the channel");
+        channel
+            .update(
+                &harness.db,
+                PartialChannel {
+                    default_permissions: Some(OverrideField {
+                        a: 0,
+                        d: ChannelPermission::ViewChannel as i64,
+                    }),
+                    ..Default::default()
+                },
+                vec![],
+            )
+            .await
+            .expect("deny view");
+    }
+
+    /// W2 audit B2: an event is never attached to a protected channel, nor
+    /// to a thread under one, on create or on a move. Refused with
+    /// `ChannelProtected` and nothing changes; an open channel takes the
+    /// event (positive control).
+    ///
+    /// Control: the `2acdf5f0` routes (no refusal) → the protected create
+    /// lands.
+    #[test]
+    fn events_refuse_a_protected_channel_on_create_and_move() {
+        crate::util::test::rt()
+            .block_on(events_refuse_a_protected_channel_on_create_and_move_case())
+    }
+
+    async fn events_refuse_a_protected_channel_on_create_and_move_case() {
+        let harness = TestHarness::new().await;
+        let (_, session, owner) = harness.new_user().await;
+        let protected = harness.new_protected_channel(&owner, &session, &[]).await;
+        let orphan = thread_under(&harness, &protected.channel, &owner.id).await;
+        let open = harness.new_channel(&protected.server).await;
+        let server_id = protected.server.id.clone();
+
+        for (case, channel_id) in [
+            ("protected", protected.channel.id()),
+            ("thread under protected", orphan.id()),
+        ] {
+            assert_protected(
+                &create(&harness, &session, &server_id, Some(channel_id)).await,
+                case,
+            );
+        }
+
+        let created = create(&harness, &session, &server_id, Some(open.id())).await;
+        assert_eq!(created.0, Status::Ok, "{:?}", created);
+        let event_id = body(&created)["_id"]
+            .as_str()
+            .expect("the event id")
+            .to_string();
+
+        for (case, channel_id) in [
+            ("protected", protected.channel.id()),
+            ("thread under protected", orphan.id()),
+        ] {
+            assert_protected(
+                &move_to(&harness, &session, &event_id, channel_id).await,
+                case,
+            );
+        }
+        let stored = harness.db.fetch_event(&event_id).await.expect("the event");
+        assert_eq!(stored.channel.as_deref(), Some(open.id()), "not moved");
+
+        let listed = harness
+            .db
+            .fetch_events_for_server_in_window(&server_id, START - 1, START + 1)
+            .await
+            .expect("the server's events");
+        assert_eq!(
+            listed
+                .iter()
+                .map(|event| event.id.as_str())
+                .collect::<Vec<_>>(),
+            vec![event_id.as_str()],
+            "only the open event was stored"
+        );
+    }
+
+    /// Decision 18 (W2): a member who cannot view the channel gets the
+    /// pre-W2 answer, byte-identical (type, status, body) for a protected
+    /// and an open channel, on create and on a move.
+    ///
+    /// Control: the refusal moved above `require_event_channel_view` → the
+    /// protected answers become `ChannelProtected`.
+    #[test]
+    fn events_non_viewer_answer_is_identical_protected_or_not() {
+        crate::util::test::rt()
+            .block_on(events_non_viewer_answer_is_identical_protected_or_not_case())
+    }
+
+    async fn events_non_viewer_answer_is_identical_protected_or_not_case() {
+        let harness = TestHarness::new().await;
+        let (_, owner_session, owner) = harness.new_user().await;
+        let (_, session, member) = harness.new_user().await;
+        let protected = harness
+            .new_protected_channel(&owner, &owner_session, &[])
+            .await;
+        harness.join_server(&protected.server, &member).await;
+        let open = harness.new_channel(&protected.server).await;
+        for channel in [&protected.channel, &open] {
+            deny_view(&harness, channel).await;
+        }
+        let server_id = protected.server.id.clone();
+
+        let on_protected =
+            create(&harness, &session, &server_id, Some(protected.channel.id())).await;
+        let on_open = create(&harness, &session, &server_id, Some(open.id())).await;
+        assert_eq!(body(&on_open)["type"], "NotFound", "{}", on_open.1);
+        assert_eq!(on_protected, on_open, "create");
+
+        let created = create(&harness, &session, &server_id, None).await;
+        assert_eq!(created.0, Status::Ok, "{:?}", created);
+        let event_id = body(&created)["_id"]
+            .as_str()
+            .expect("the event id")
+            .to_string();
+        let on_protected = move_to(&harness, &session, &event_id, protected.channel.id()).await;
+        let on_open = move_to(&harness, &session, &event_id, open.id()).await;
+        assert_eq!(body(&on_open)["type"], "NotFound", "{}", on_open.1);
+        assert_eq!(on_protected, on_open, "move");
+    }
 }

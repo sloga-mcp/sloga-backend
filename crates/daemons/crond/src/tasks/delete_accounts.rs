@@ -152,7 +152,11 @@ where
                  {err:?}",
                 user.id
             );
-            revolt_config::capture_error(&err);
+            report_skip(
+                &account.id,
+                "its payment orders could not be unlinked or its membership deleted",
+                &err,
+            );
             continue;
         }
 
@@ -185,7 +189,24 @@ fn skip_account(account_id: &str, step: &str, err: &revolt_result::Error) {
         "Account deletion of {account_id}: {step}; not marking the account deleted this run, \
          retrying next run: {err:?}"
     );
-    revolt_config::capture_error(err);
+    report_skip(account_id, step, err);
+}
+
+/// Report to Sentry that the deletion of `account_id` was skipped at
+/// `step`. The event carries the account id (audit C11: the error alone
+/// does not say which account to look at) and the error, and nothing else
+/// of the account. crond has no Sentry scope API of its own, so the id goes
+/// in the message; one account failing hourly reports once an hour.
+fn report_skip(account_id: &str, step: &str, err: &revolt_result::Error) {
+    revolt_config::capture_message(
+        &skip_report(account_id, step, err),
+        revolt_config::Level::Error,
+    );
+}
+
+/// The Sentry message of [`report_skip`]
+fn skip_report(account_id: &str, step: &str, err: &revolt_result::Error) -> String {
+    format!("Account deletion of {account_id} skipped, retried next run: {step}: {err:?}")
 }
 
 /// The payments cascade for `user_id`. The voids are best-effort (logged by
@@ -787,5 +808,34 @@ mod tests {
         let deleted = delete_accounts_with(&db, due, |_| async { Ok(()) }).await;
         assert_eq!(deleted.unwrap(), 1);
         assert_deleted(&db, "u1").await;
+    }
+
+    /// Audit C11: the Sentry report of a skipped account names the account
+    /// (the error alone does not) and the step, and carries the error.
+    /// Both skip paths (the payments cascade and `skip_account`) report
+    /// through `report_skip`. Mutation: the id dropped from the message.
+    #[test]
+    fn a_skipped_account_is_reported_with_its_id() {
+        let err = create_error!(InternalError);
+        let report = skip_report("01ACCOUNTID", "deleting its user failed", &err);
+        for needle in ["01ACCOUNTID", "deleting its user failed", "InternalError"] {
+            assert!(
+                report.contains(needle),
+                "the report must carry `{needle}`: {report}"
+            );
+        }
+
+        const SOURCE: &str = include_str!("delete_accounts.rs");
+        let shipping = &SOURCE[..SOURCE.find("#[cfg(test)]").expect("the tests")];
+        assert_eq!(
+            shipping.matches("report_skip(").count(),
+            3,
+            "the cascade branch and `skip_account` report through `report_skip` \
+             (plus its definition): {shipping}"
+        );
+        assert!(
+            !shipping.contains("capture_error("),
+            "no skip may be reported without the account id"
+        );
     }
 }

@@ -242,7 +242,8 @@ mod tests {
 
     enum Expected {
         Published,
-        /// The exact error (type, feature and `location`) the gate answers
+        /// The gate's own error: the route's body must be its serialized
+        /// form (type and feature; the body carries no `location`)
         Refused(Error, &'static str),
     }
 

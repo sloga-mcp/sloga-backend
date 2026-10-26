@@ -375,9 +375,11 @@ async fn submit_text_commit(
         removed,
     } = data;
 
-    // Existing-row check: after access, before every validity check
+    // Existing-row check: after access, before every validity check. Only
+    // a Text-marked row counts (R22): an unmarked row at the id is a
+    // Call-plane stray the commit transaction replaces
     if let Some(winning) = db
-        .fetch_mls_commits_from(&group.id, epoch, 1)
+        .fetch_mls_text_commits_from(&group.id, epoch, 1)
         .await?
         .into_iter()
         .find(|row| row.epoch == epoch)
@@ -527,7 +529,7 @@ async fn submit_text_commit(
             // without them; an error here sends the committer down the
             // outcome recovery (§2.5) and members gap-refetch.
             let stored_commit = db
-                .fetch_mls_commits_from(&group.id, epoch, 1)
+                .fetch_mls_text_commits_from(&group.id, epoch, 1)
                 .await?
                 .into_iter()
                 .find(|row| {
@@ -1365,9 +1367,9 @@ mod tests {
     /// a bot, a member whose session is bound to none of its devices) and
     /// for a valid and a malformed request, a Text group whose channel is
     /// hidden and one whose channel was deleted answer EXACTLY as an unknown
-    /// group id: the same error body, `location` included. The owner commits
-    /// epoch 1 first, so a caller who reached the existing-row check would
-    /// get `Lost` instead.
+    /// group id: the same serialized error body (it carries no `location`).
+    /// The owner commits epoch 1 first, so a caller who reached the
+    /// existing-row check would get `Lost` instead.
     async fn hidden_and_deleted_text_groups_answer_as_unknown() {
         let harness = TestHarness::new().await;
         let db = &harness.db;
@@ -1720,6 +1722,138 @@ mod tests {
         assert_won(
             commit_next(&setup, &setup.owner, vec![], vec![]).await,
             "an Update with growth off",
+        );
+    }
+
+    /// Store a Call-shaped row at `{group}:{epoch}` through the typed
+    /// Call-plane write, as the non-transactional Call insert can leave one
+    /// at a Text group's id after a squat eviction (R22): it carries no Text
+    /// marker
+    async fn insert_stray(db: &Database, row: &MlsCommit) {
+        match db {
+            Database::Reference(reference) => {
+                reference
+                    .mls_commits
+                    .lock()
+                    .await
+                    .insert(row.id.clone(), row.clone());
+            }
+            Database::MongoDb(mongo) => {
+                mongo
+                    .col::<MlsCommit>("mls_commits")
+                    .insert_one(row)
+                    .await
+                    .expect("the stray row");
+            }
+        }
+    }
+
+    /// The Text group's commits as the commit fetch route serves them to
+    /// the owner: `(epoch, ciphertext)`
+    async fn served_commits(setup: &Setup) -> Vec<(i64, String)> {
+        super::super::commits_fetch::fetch_commits(
+            State::from(setup.db()),
+            setup.owner.user.clone(),
+            setup.owner.session.clone(),
+            setup.group_id.clone(),
+            0,
+        )
+        .await
+        .expect("the owner is served")
+        .into_inner()
+        .commits
+        .into_iter()
+        .map(|commit| (commit.epoch, commit.commit))
+        .collect()
+    }
+
+    /// R22 (W2 audit A1) through the routes: a Call-shaped row at the Text
+    /// group's id never answers the existing-row check (the first Text
+    /// commit wins, no 409 carrying the stray) and the commit fetch never
+    /// serves it, at epoch 1 and at a later epoch; an identical resubmit
+    /// still gets its own row (N3)
+    #[test]
+    fn a_call_shaped_stray_never_wins_or_is_served() {
+        crate::util::test::rt().block_on(a_call_shaped_stray_never_wins_or_is_served_case())
+    }
+
+    async fn a_call_shaped_stray_never_wins_or_is_served_case() {
+        let setup = setup(1).await;
+        let db = setup.db();
+        let squatter = &setup.members[0];
+        let stray = |epoch: i64| MlsCommit {
+            id: MlsCommit::composite_id(&setup.group_id, epoch),
+            group_id: setup.group_id.clone(),
+            epoch,
+            committer: member_device(&squatter.user.id, &squatter.device_id),
+            commit: STANDARD_NO_PAD.encode(b"stray"),
+            size: 5,
+            added: vec![],
+            removed: vec![],
+            created_at: Timestamp::now_utc(),
+            rejoin_intents: vec![],
+            removed_reasons: vec![],
+        };
+        let ad = current_ad(&setup.harness, setup.channel_id()).await;
+        let at = |epoch: i64| {
+            request(
+                &setup.owner.device_id,
+                &setup.group_id,
+                epoch,
+                &ad,
+                vec![],
+                vec![],
+            )
+        };
+        let owner = &setup.owner;
+
+        insert_stray(db, &stray(1)).await;
+        assert_won(
+            submit(
+                &setup.harness,
+                &owner.user,
+                &owner.session,
+                &setup.group_id,
+                at(1),
+            )
+            .await,
+            "the first Text commit over a stray",
+        );
+        assert_eq!(served_commits(&setup).await, vec![(1, at(1).commit)]);
+        let winning = assert_lost(
+            submit(
+                &setup.harness,
+                &owner.user,
+                &owner.session,
+                &setup.group_id,
+                at(1),
+            )
+            .await,
+            "an identical resubmit",
+        );
+        assert_eq!(winning.commit, at(1).commit);
+        assert_eq!(winning.committer.user_id, owner.user.id);
+
+        insert_stray(db, &stray(2)).await;
+        assert_eq!(
+            served_commits(&setup).await,
+            vec![(1, at(1).commit)],
+            "a stray is never served"
+        );
+        assert_won(
+            submit(
+                &setup.harness,
+                &owner.user,
+                &owner.session,
+                &setup.group_id,
+                at(2),
+            )
+            .await,
+            "a later Text commit over a stray",
+        );
+        assert_eq!(
+            served_commits(&setup).await,
+            vec![(1, at(1).commit), (2, at(2).commit)]
         );
     }
 

@@ -1157,22 +1157,44 @@ impl Message {
     /// Driver half of the stored-shape check: `channel` is the result of a
     /// channel read made inside `insert_message`, immediately before the write
     ///
-    /// A missing channel (`NotFound`) is unprotected: `protected` exists only
-    /// on a channel document, so a message whose channel does not exist is in
-    /// no protected channel. Any other read error refuses the insert (fails
-    /// closed).
+    /// A Thread is judged by its parent (W2 audit B1): a thread is never
+    /// protected itself, but one left under a protected parent (a failed
+    /// delete after `create_thread`'s refused hold) must take no plaintext.
+    /// So for a Thread the driver also reads the parent and passes it as
+    /// `parent`; a Thread with no `parent` read refuses the insert.
+    ///
+    /// A missing channel or parent (`NotFound`) is unprotected: `protected`
+    /// exists only on a channel document, so a message whose channel does
+    /// not exist is in no protected channel. Any other read error refuses
+    /// the insert (fails closed).
     ///
     /// This check alone is check-then-act against `protect_channel`, which is
     /// check-then-act too ("no messages exist", then set `protected`). The
     /// drivers close the race themselves: Reference holds `channels` across
     /// this check and the write; Mongo follows the insert with a write to the
     /// channel document filtered on `protected != true` and undoes the insert
-    /// if it matches nothing (see `messages/ops/mongodb.rs`).
-    pub(crate) fn validate_protected_insert(&self, channel: Result<Channel>) -> Result<()> {
+    /// if it matches nothing (see `messages/ops/mongodb.rs`). A thread's
+    /// parent needs no such hold: protect refuses a channel that has threads
+    /// (decision 13 (W2)), and the thread read here exists.
+    pub(crate) fn validate_protected_insert(
+        &self,
+        channel: Result<Channel>,
+        parent: Option<Result<Channel>>,
+    ) -> Result<()> {
+        fn protected_or_missing(channel: Result<Channel>) -> Result<bool> {
+            match channel {
+                Ok(channel) => Ok(channel.is_protected()),
+                Err(error) if matches!(error.error_type, ErrorType::NotFound) => Ok(false),
+                Err(error) => Err(error),
+            }
+        }
+
         let channel_protected = match channel {
-            Ok(channel) => channel.is_protected(),
-            Err(error) if matches!(error.error_type, ErrorType::NotFound) => false,
-            Err(error) => return Err(error),
+            Ok(Channel::Thread { .. }) => match parent {
+                Some(parent) => protected_or_missing(parent)?,
+                None => return Err(create_error!(InternalError)),
+            },
+            channel => protected_or_missing(channel)?,
         };
 
         self.validate_protected_shape(channel_protected)
@@ -2803,6 +2825,144 @@ mod encrypted_payload_tests {
             .await
             .expect("a missing channel is not protected");
         });
+    }
+
+    const PARENT_OF_ORPHAN: &str = "01J9Z3K4M5N6P7Q8R9S0T1V2W7";
+    const ORPHAN_THREAD: &str = "01J9Z3K4M5N6P7Q8R9S0T1V2W8";
+    const OPEN_THREAD: &str = "01J9Z3K4M5N6P7Q8R9S0T1V2W9";
+    const PARENTLESS_THREAD: &str = "01J9Z3K4M5N6P7Q8R9S0T1V2WA";
+
+    fn thread(id: &str, parent: &str) -> Channel {
+        serde_json::from_value(serde_json::json!({
+            "channel_type": "Thread",
+            "_id": id,
+            "server": SERVER,
+            "parent_channel": parent,
+            "name": "thread",
+            "creator": "01HZXBBBBBBBBBBBBBBBBBBBBB",
+        }))
+        .expect("thread")
+    }
+
+    /// W2 audit B1: the floor judges a Thread by its parent. A thread left
+    /// under a protected parent (a failed delete after `create_thread`'s
+    /// refused hold) takes no plaintext and no system row; under an open
+    /// parent, or with no parent at all, it takes plaintext as before. Run
+    /// under REFERENCE and MONGODB.
+    ///
+    /// Control: the floor's parent resolution removed (a Thread judged on
+    /// its own flag, always false) → the plaintext insert into the orphan
+    /// lands.
+    #[tokio::test]
+    async fn insert_message_judges_a_thread_by_its_parent() {
+        database_test!(|db| async move {
+            db.insert_channel(&text_channel(PARENT_OF_ORPHAN, true))
+                .await
+                .expect("protected parent");
+            db.insert_channel(&text_channel(OPEN_CHANNEL, false))
+                .await
+                .expect("open parent");
+            for (id, parent) in [
+                (ORPHAN_THREAD, PARENT_OF_ORPHAN),
+                (OPEN_THREAD, OPEN_CHANNEL),
+                (PARENTLESS_THREAD, MISSING_CHANNEL),
+            ] {
+                db.insert_channel(&thread(id, parent))
+                    .await
+                    .expect("thread");
+            }
+
+            // Plaintext into the orphan: refused, not stored
+            let plaintext = plaintext_message("01JA0000000000000000000T01", ORPHAN_THREAD);
+            assert_field_refused(db.insert_message(&plaintext).await, "content");
+            assert!(db.fetch_message(&plaintext.id).await.is_err());
+
+            // A system row (pin notice, thread notices) is refused too
+            let system = SystemMessage::MessagePinned {
+                id: plaintext.id.clone(),
+                by: "01HZXBBBBBBBBBBBBBBBBBBBBB".to_string(),
+            }
+            .into_message(ORPHAN_THREAD.to_string());
+            assert_field_refused(db.insert_message(&system).await, "system");
+            assert!(db.fetch_message(&system.id).await.is_err());
+
+            // A forwarded snapshot, the plaintext a forward carries
+            let mut forwarded = plaintext_message("01JA0000000000000000000T02", ORPHAN_THREAD);
+            forwarded.content = None;
+            forwarded.forwarded = Some(ForwardedSnapshot {
+                message_id: "01JA0000000000000000000T09".to_string(),
+                channel_id: OPEN_CHANNEL.to_string(),
+                server_id: Some(SERVER.to_string()),
+                author_id: None,
+                content: Some("hi".to_string()),
+                attachments: vec![],
+                original_sent_at: 0,
+            });
+            assert_field_refused(db.insert_message(&forwarded).await, "forwarded");
+            assert!(db.fetch_message(&forwarded.id).await.is_err());
+
+            // Under an open parent, or with no parent: plaintext as before
+            for (id, channel) in [
+                ("01JA0000000000000000000T03", OPEN_THREAD),
+                ("01JA0000000000000000000T04", PARENTLESS_THREAD),
+            ] {
+                db.insert_message(&plaintext_message(id, channel))
+                    .await
+                    .unwrap_or_else(|error| panic!("plaintext into {channel}: {error:?}"));
+                assert!(db.fetch_message(id).await.is_ok(), "{id} stored");
+            }
+
+            // Ciphertext into a thread under an open parent: refused, as in
+            // any unprotected channel
+            let mut misplaced = protected_message();
+            misplaced.id = "01JA0000000000000000000T05".to_string();
+            misplaced.channel = OPEN_THREAD.to_string();
+            assert_field_refused(db.insert_message(&misplaced).await, "encrypted");
+        });
+    }
+
+    /// The pure half of B1: a Thread without its parent read fails closed,
+    /// and a parent read error other than `NotFound` refuses
+    #[test]
+    fn validate_protected_insert_needs_a_thread_parent() {
+        let row = plaintext_message("01JA0000000000000000000T06", ORPHAN_THREAD);
+
+        let error = row
+            .validate_protected_insert(Ok(thread(ORPHAN_THREAD, PARENT_OF_ORPHAN)), None)
+            .expect_err("a thread with no parent read is refused");
+        assert!(
+            matches!(error.error_type, ErrorType::InternalError),
+            "{:?}",
+            error.error_type
+        );
+
+        let error = row
+            .validate_protected_insert(
+                Ok(thread(ORPHAN_THREAD, PARENT_OF_ORPHAN)),
+                Some(Err(create_error!(DatabaseError {
+                    operation: "find_one".to_string(),
+                    collection: "channels".to_string()
+                }))),
+            )
+            .expect_err("a failed parent read refuses");
+        assert!(
+            matches!(error.error_type, ErrorType::DatabaseError { .. }),
+            "{:?}",
+            error.error_type
+        );
+
+        assert_field_refused(
+            row.validate_protected_insert(
+                Ok(thread(ORPHAN_THREAD, PARENT_OF_ORPHAN)),
+                Some(Ok(text_channel(PARENT_OF_ORPHAN, true))),
+            ),
+            "content",
+        );
+        row.validate_protected_insert(
+            Ok(thread(ORPHAN_THREAD, PARENT_OF_ORPHAN)),
+            Some(Err(create_error!(NotFound))),
+        )
+        .expect("a missing parent is not protected");
     }
 
     /// Rounds of the insert-vs-protect race per sweep, each on a fresh channel

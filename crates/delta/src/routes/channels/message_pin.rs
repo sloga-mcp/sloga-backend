@@ -21,10 +21,11 @@ pub async fn message_pin(
     msg: Reference<'_>,
 ) -> Result<EmptyResponse> {
     let channel = target.as_channel(db).await?;
+    // Threads inherit their parent channel's permission overrides (a DM is
+    // its own target, read here only for the protected check below).
+    let permission_channel = channel.permission_target(db).await?.into_owned();
 
     if !matches!(channel, Channel::DirectMessage { .. }) {
-        // Threads inherit their parent channel's permission overrides.
-        let permission_channel = channel.permission_target(db).await?.into_owned();
         let mut query = DatabasePermissionQuery::new(db, &user).channel(&permission_channel);
         let permissions = calculate_channel_permissions(&mut query).await;
         permissions.throw_if_lacking_channel_permission(ChannelPermission::ManageMessages)?;
@@ -51,8 +52,10 @@ pub async fn message_pin(
         .await?;
 
     // A protected channel stores no plaintext rows, so the pin stands but
-    // its system message is not sent (decision 16): the route still succeeds
-    if !channel.is_protected() && message.encrypted.is_none() {
+    // its system message is not sent (decision 16): the route still succeeds.
+    // A thread is judged by its parent (W2 audit B1).
+    if !channel.is_protected() && !permission_channel.is_protected() && message.encrypted.is_none()
+    {
         SystemMessage::MessagePinned {
             id: message.id.clone(),
             by: user.id.clone(),
@@ -439,5 +442,51 @@ mod test {
                 .expect("the message");
             assert_eq!(stored.pinned, None, "{}", id);
         }
+    }
+
+    /// W2 audit B1: decision 16 judges a thread by its parent. A pin in a
+    /// thread left under a protected parent (stored directly, its row
+    /// written before the flag) stands, with no system message.
+    ///
+    /// Control: the `2acdf5f0` route (judges the thread itself) → the
+    /// system message reaches the floor, which refuses it, and the route
+    /// answers 400.
+    #[test]
+    fn pin_in_a_thread_under_a_protected_parent_sends_no_system_message() {
+        crate::util::test::rt()
+            .block_on(pin_in_a_thread_under_a_protected_parent_sends_no_system_message_case())
+    }
+
+    async fn pin_in_a_thread_under_a_protected_parent_sends_no_system_message_case() {
+        let mut harness = TestHarness::new().await;
+        let (_, session, owner) = harness.new_user().await;
+        let (server, parent) = harness.new_protectable_channel(&owner).await;
+        let thread = Channel::Thread {
+            id: Ulid::new().to_string(),
+            server: server.id.clone(),
+            parent_channel: parent.id().to_string(),
+            name: "Thread".to_string(),
+            creator: owner.id.clone(),
+            origin_message_id: None,
+            last_message_id: None,
+            archived: false,
+            archived_timestamp: None,
+            auto_archive_minutes: 0,
+            locked: false,
+            applied_tags: vec![],
+        };
+        harness.db.insert_channel(&thread).await.expect("thread");
+
+        let stray = Message {
+            id: Ulid::new().to_string(),
+            channel: thread.id().to_string(),
+            author: owner.id.clone(),
+            content: Some("Stray".to_string()),
+            ..Default::default()
+        };
+        harness.db.insert_message(&stray).await.expect("message");
+        protect_under_stored_rows(&harness.db, parent.id()).await;
+
+        assert_pinned_silently(&mut harness, &session.token, thread.id(), &stray.id).await;
     }
 }

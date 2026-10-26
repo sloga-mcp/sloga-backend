@@ -130,8 +130,10 @@ async fn fetch_text_commits(
     super::require_text_gate(TextGate::Available).await?;
     super::require_seated(db, &group.channel_id, &user.id).await?;
 
+    // Text-marked rows only (R22): an unmarked row under the group id is a
+    // Call-plane stray and is never served as a Text commit
     let commits = db
-        .fetch_mls_commits_from(&group.id, from_epoch, MAX_COMMITS_PER_FETCH)
+        .fetch_mls_text_commits_from(&group.id, from_epoch, MAX_COMMITS_PER_FETCH)
         .await?;
 
     // `into_commit_info` fills each rejoin intent's `channel_id` from the
@@ -894,8 +896,8 @@ mod tests {
     /// Decision 1 (W2) invariant on this route: for every caller class and
     /// for a valid and a MALFORMED request, a Text group whose channel the
     /// caller cannot view, and one whose channel was deleted, answer EXACTLY
-    /// as a group id the server does not know (the full body, `location`
-    /// included)
+    /// as a group id the server does not know (the full serialized body,
+    /// which carries no `location`)
     async fn hidden_and_deleted_text_groups_answer_as_unknown() {
         let oracle = oracle_fixture().await;
         let db = &oracle.harness.db;
@@ -1085,11 +1087,12 @@ mod tests {
 
         match db {
             Database::Reference(reference) => {
-                reference
-                    .mls_commits
-                    .lock()
-                    .await
-                    .insert(row_id.clone(), old);
+                // In place, under whatever key the driver stored the row
+                // (its Text marker is the key, R22)
+                let mut commits = reference.mls_commits.lock().await;
+                let mut rows = commits.values_mut().filter(|row| row.id == row_id);
+                *rows.next().expect("the stored row") = old;
+                assert!(rows.next().is_none(), "one row at the id");
             }
             Database::MongoDb(mongo) => {
                 let result = mongo

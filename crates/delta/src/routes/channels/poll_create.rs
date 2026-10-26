@@ -790,7 +790,7 @@ mod protected_test {
     }
 
     /// Decision 18 (W2): a caller who cannot view the channel gets the
-    /// pre-W2 answer, byte-identical (incl. `location`) for a protected and
+    /// pre-W2 answer, byte-identical (type, status, body) for a protected and
     /// an ordinary channel
     #[test]
     fn protected_poll_non_viewer_gets_the_pre_w2_error() {

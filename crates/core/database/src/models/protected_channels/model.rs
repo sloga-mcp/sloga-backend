@@ -697,8 +697,9 @@ impl SeatListWriteDecision {
 /// Order (4.3, W0-fix8): parse (step 1) first; then the version rule
 /// (step 4), where a byte-identical re-PUT returns the stored row
 /// IMMEDIATELY, before the signer-leaf check (5b), the seat claims (7) and
-/// the handover append (8); only then 5b, the growth flag (decision 5
-/// (W2)), 7 and 8. Route-side checks (authorization, session binding,
+/// the handover append (8); only then the removed-users refusal (C1,
+/// `seat_list_removed_users`), 5b, the growth flag (decision 5 (W2)), 7
+/// and 8. Route-side checks (authorization, session binding,
 /// signature, bots and staff, the `device_cap` ceiling) are not repeated
 /// here. Server membership of every user in `claimed` and, on protect, the
 /// owner are claimed by the driver in the same transaction (decision 13
@@ -745,6 +746,15 @@ pub fn plan_seat_list_write(input: &SeatListWriteInput<'_>) -> Result<SeatListWr
                 return Err(invalid("seat list version must be stored version + 1"));
             }
         }
+    }
+
+    // C1 (W2 audit, decision 2): a list that still names a user the server
+    // removed since the stored list is refused before any claim, whatever
+    // the growth flag says (see `seat_list_removed_users`). A genesis list
+    // has no stored list, so protect never answers it.
+    let removed = seat_list_removed_users(&body, input.stored, input.seats)?;
+    if !removed.is_empty() {
+        return Err(create_error!(SeatListNamesRemovedUsers { users: removed }));
     }
 
     // Step 5b: when the channel has an open Text group, the signer device
@@ -911,6 +921,68 @@ pub fn plan_seat_list_write(input: &SeatListWriteInput<'_>) -> Result<SeatListWr
         pending_added,
         seat_list_ad_sha256,
     }))
+}
+
+/// C1 (W2 audit; decision 2, confirmed by the user 2026-10-04: a removed or
+/// re-invited member is not re-seated until the owner re-seats them): the
+/// users `body` names whose seat the SERVER released since the stored list
+/// landed, sorted. A server-forced release (kick, ban, leaving the server,
+/// account deletion: `release_channel_seats_for_user`, 6.3) never edits the
+/// signed list, so the owner's client keeps naming the user; without this
+/// check its next list (adding someone else, say) would reactivate that seat
+/// silently once the user rejoins. Such a list is refused with
+/// `SeatListNamesRemovedUsers { users }`: the client lands a list without
+/// them first, and adding one back later is an ordinary claim (the growth
+/// path, with its dialog).
+///
+/// Why the release is read from the rows and not stored on them: every list
+/// write reconciles the seat rows to the list, so a seat the planner
+/// releases (the owner's own unseat) is off that list, and a later list
+/// naming the user again reactivates the seat. A RELEASED seat whose user
+/// the STORED list still names was therefore released by the forced
+/// primitive after that list landed, and by nothing else. That also holds
+/// when the removal commits between a seat PUT's snapshot and its commit
+/// (the PUT writes no row of a user it keeps), where comparing a release
+/// time with the list's time would not. Cooldown expiry changes nothing:
+/// an expired seat whose user the stored list names is still removed.
+///
+/// A listed user with NO seat row is reported too (re-review L3): a landed
+/// list has an active row for every user it names (genesis claims them
+/// all, and a list naming a new user lands only by claiming it), so a
+/// missing row can only mean the row was removed after the removal, by a
+/// future released or expired seat sweep, say. Treating it as "never
+/// seated" would make the no-row branch of step 7 a fresh claim and undo
+/// this check silently. Only an ACTIVE row clears a listed user.
+///
+/// The signer is never reported: the signer is always seated (4.1), so
+/// refusing it would wedge every later list, and the signer naming itself is
+/// the owner's own act. A stored body that no longer parses is corrupt data
+/// and fails closed.
+pub fn seat_list_removed_users(
+    body: &SeatListBody,
+    stored: Option<&SeatList>,
+    seats: &[ChannelSeat],
+) -> Result<Vec<String>> {
+    let Some(stored) = stored else {
+        return Ok(vec![]);
+    };
+    let still_listed: BTreeSet<String> = SeatListBody::parse(&stored.body)?
+        .seats
+        .into_iter()
+        .collect();
+
+    // `body.seats` is sorted and unique (4.1), so the result is too
+    Ok(body
+        .seats
+        .iter()
+        .filter(|user_id| **user_id != body.signer_user_id && still_listed.contains(*user_id))
+        .filter(|user_id| {
+            !seats
+                .iter()
+                .any(|seat| seat.user_id == **user_id && seat.is_active())
+        })
+        .cloned()
+        .collect())
 }
 
 /// Validate a Text group create request against the newest seat list and

@@ -405,8 +405,9 @@ mod protected {
         let (status, body) = roll(&f.harness, &f.member_session, &channel_id, &nonce).await;
         assert_eq!(status, Status::BadRequest, "{body}");
         assert_eq!(body["type"], "ChannelProtected", "{body}");
-        // The body never carries the error's `location`, so it cannot tell
-        // the route's refusal from the database floor's
+        // The route's own refusal: the database floor would answer
+        // `ProtectedFieldRefused` for the roll's content instead. The body
+        // never carries the error's `location`.
         assert!(
             body.get("location").is_none(),
             "the body must not carry the error location: {}",

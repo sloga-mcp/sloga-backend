@@ -23,12 +23,33 @@ use revolt_result::{create_error, Result};
 /// status. Worth calling even where the rule already held transitively — for
 /// saved messages in particular the owner holds `SendMessage`, so a permission
 /// check alone fails OPEN.
+///
+/// This form judges `channel` alone, so a thread under a protected parent
+/// passes it. Callers that have resolved the permission target use
+/// [`ensure_interactions_allowed_in`]; this one is kept for the two modal
+/// routes, which run it before their permission calculation (the accepted
+/// decision 18 exemption).
 pub fn ensure_interactions_allowed(channel: &Channel) -> Result<()> {
+    ensure_interactions_allowed_in(channel, channel)
+}
+
+/// [`ensure_interactions_allowed`] for a resolved channel: `channel` is the
+/// one the interaction lives in and `permission_channel` its permission
+/// target (`Channel::permission_target`; a thread's parent, otherwise the
+/// channel itself). The structural exclusions read `channel`; the protected
+/// refusal reads either, so a thread under a protected parent refuses too
+/// (W2 audit B1).
+pub fn ensure_interactions_allowed_in(
+    channel: &Channel,
+    permission_channel: &Channel,
+) -> Result<()> {
     match channel {
         Channel::Forum { .. } | Channel::DirectMessage { .. } | Channel::SavedMessages { .. } => {
             Err(create_error!(InvalidOperation))
         }
-        _ if channel.is_protected() => Err(create_error!(ChannelProtected)),
+        _ if channel.is_protected() || permission_channel.is_protected() => {
+            Err(create_error!(ChannelProtected))
+        }
         _ => Ok(()),
     }
 }
@@ -40,7 +61,46 @@ mod tests {
     use revolt_database::{Channel, ForumLayout, ForumSortOrder};
     use revolt_result::ErrorType;
 
-    use super::ensure_interactions_allowed;
+    use super::{ensure_interactions_allowed, ensure_interactions_allowed_in};
+
+    fn thread() -> Channel {
+        Channel::Thread {
+            id: "thread".to_string(),
+            server: "server".to_string(),
+            parent_channel: "channel".to_string(),
+            name: "thread".to_string(),
+            creator: "user".to_string(),
+            origin_message_id: None,
+            last_message_id: None,
+            archived: false,
+            archived_timestamp: None,
+            auto_archive_minutes: 0,
+            locked: false,
+            applied_tags: vec![],
+        }
+    }
+
+    /// W2 audit B1: a thread is judged by its permission target, so one
+    /// under a protected parent refuses; under an open parent it is allowed
+    ///
+    /// Control: the `permission_channel` arm dropped → the first assertion
+    /// fails.
+    #[test]
+    fn thread_under_a_protected_parent_refuses_interactions() {
+        assert!(matches!(
+            ensure_interactions_allowed_in(&thread(), &text_channel(true))
+                .err()
+                .map(|error| error.error_type),
+            Some(ErrorType::ChannelProtected)
+        ));
+        assert!(ensure_interactions_allowed_in(&thread(), &text_channel(false)).is_ok());
+        assert!(matches!(
+            ensure_interactions_allowed_in(&text_channel(true), &text_channel(true))
+                .err()
+                .map(|error| error.error_type),
+            Some(ErrorType::ChannelProtected)
+        ));
+    }
 
     fn text_channel(protected: bool) -> Channel {
         Channel::TextChannel {

@@ -409,4 +409,78 @@ mod tests {
         );
         assert!(leading_context.is_empty(), "{leading_context:?}");
     }
+
+    /// W2 audit C10: a message whose channel no longer exists is skipped
+    /// like a deleted one, and the report is still filed with the next live
+    /// message as its evidence. Run under REFERENCE and MONGODB.
+    ///
+    /// Control: `create_system` fails the report on a skipped snapshot (its
+    /// `Ok(None)` and `NotFound` arms returning an error) → this test fails.
+    #[tokio::test]
+    async fn create_system_skips_a_message_whose_channel_is_gone() {
+        database_test!(|db| async move {
+            let user = User {
+                id: ulid::Ulid::new().to_string(),
+                username: "spammer".to_string(),
+                discriminator: "0001".to_string(),
+                ..Default::default()
+            };
+            let other_author = ulid::Ulid::new().to_string();
+            let live_channel = ulid::Ulid::new().to_string();
+            let gone_channel = ulid::Ulid::new().to_string();
+            db.insert_channel(&Channel::DirectMessage {
+                id: live_channel.clone(),
+                active: true,
+                recipients: vec![user.id.clone(), other_author],
+                last_message_id: None,
+            })
+            .await
+            .unwrap();
+
+            // Inserted while no channel row exists: the floor takes a
+            // missing channel as unprotected
+            let mk = |channel: &str| Message {
+                id: ulid::Ulid::new().to_string(),
+                channel: channel.to_string(),
+                author: user.id.clone(),
+                content: Some("buy cheap followers".to_string()),
+                ..Default::default()
+            };
+            let orphaned = mk(&gone_channel);
+            let live = mk(&live_channel);
+            for row in [&orphaned, &live] {
+                db.insert_message(row).await.unwrap();
+            }
+
+            let report_id = ulid::Ulid::new().to_string();
+            Report::create_system(
+                &db,
+                report_id.clone(),
+                &user,
+                &[orphaned.id.clone(), live.id.clone()],
+                String::new(),
+            )
+            .await
+            .expect("the report is filed although a channel is gone");
+
+            let report = db.fetch_report(&report_id).await.unwrap();
+            match &report.content {
+                ReportedContent::User { message_id, .. } => {
+                    assert_eq!(message_id.as_deref(), Some(live.id.as_str()))
+                }
+                content => panic!("expected a user report, got {content:?}"),
+            }
+
+            let snapshots = db.fetch_snapshots_by_report(&report_id).await.unwrap();
+            let message_ids: Vec<&str> = snapshots
+                .iter()
+                .filter_map(|snapshot| match &snapshot.content {
+                    SnapshotContent::Message { message, .. } => Some(message.id.as_str()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(message_ids, vec![live.id.as_str()], "{snapshots:?}");
+            assert_eq!(snapshots.len(), 2, "the user and the live message");
+        });
+    }
 }

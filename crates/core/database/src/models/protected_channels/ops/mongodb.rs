@@ -55,6 +55,7 @@ const COL_GROUPS: &str = "mls_groups";
 const COL_COMMITS: &str = "mls_commits";
 const COL_JOIN_INTENTS: &str = "mls_join_intents";
 const COL_MESSAGES: &str = "messages";
+const COL_E2EE_QUEUE: &str = "e2ee_queue";
 
 // `txn_serial` is a serialization counter written by `MongoDb::touch`. It
 // exists only so a transaction that merely READS a document can still write
@@ -827,8 +828,11 @@ impl MongoDb {
 
     /// M9: delete the Call squat at a Text create's id with its Call-plane
     /// dependents keyed by that id (the `sweep_mls_groups` cascade: commits,
-    /// join intents, the group), inside the create's transaction.
-    /// KeyPackages are keyed by device, never by group, so none go.
+    /// join intents, the group), inside the create's transaction, and the
+    /// E2EE envelopes queued for that id (A6, W2 audit): left queued, they
+    /// would reach the Text group's members as that group's commits and
+    /// Welcomes. KeyPackages are keyed by device, never by group, so none
+    /// go.
     async fn evict_call_squat(&self, session: &mut ClientSession, group_id: &str) -> Attempt<()> {
         let result = self
             .col::<Document>(COL_GROUPS)
@@ -852,6 +856,11 @@ impl MongoDb {
             .session(&mut *session)
             .await
             .map_err(db_err("delete_many", COL_JOIN_INTENTS))?;
+        self.col::<Document>(COL_E2EE_QUEUE)
+            .delete_many(doc! { "group_id": group_id })
+            .session(&mut *session)
+            .await
+            .map_err(db_err("delete_many", COL_E2EE_QUEUE))?;
         Ok(())
     }
 
@@ -1015,20 +1024,34 @@ impl MongoDb {
         session: &mut ClientSession,
         server_id: &str,
     ) -> Attempt<Vec<String>> {
+        self.projected_channel_ids(session, COL_ENTITLEMENTS, doc! { "server_id": server_id })
+            .await
+    }
+
+    /// The `channel_id` of every `collection` row matching `filter`, read
+    /// through a projection so no other field is ever decoded (WA#6, C9). A
+    /// row whose `channel_id` is not a string fails the read
+    /// (`DatabaseError`): a caller can never act on fewer rows than match.
+    async fn projected_channel_ids(
+        &self,
+        session: &mut ClientSession,
+        collection: &'static str,
+        filter: Document,
+    ) -> Attempt<Vec<String>> {
         let mut cursor = self
-            .col::<Document>(COL_ENTITLEMENTS)
-            .find(doc! { "server_id": server_id })
+            .col::<Document>(collection)
+            .find(filter)
             .projection(doc! { "channel_id": 1 })
             .session(&mut *session)
             .await
-            .map_err(db_err("find", COL_ENTITLEMENTS))?;
+            .map_err(db_err("find", collection))?;
 
         let mut channel_ids = Vec::new();
         while let Some(row) = cursor.next(&mut *session).await {
-            let row = row.map_err(db_err("find", COL_ENTITLEMENTS))?;
+            let row = row.map_err(db_err("find", collection))?;
             let channel_id = row
                 .get_str("channel_id")
-                .map_err(|_| create_database_error!("find", COL_ENTITLEMENTS))?;
+                .map_err(|_| create_database_error!("find", collection))?;
             channel_ids.push(channel_id.to_string());
         }
         Ok(channel_ids)
@@ -1059,16 +1082,21 @@ impl MongoDb {
 
         let mut affected = BTreeSet::new();
 
+        // C9 (W2 audit): neither the seats nor the groups are decoded. Each
+        // filter is read once for the affected channel ids (a projection)
+        // and written once with `update_many`; both run in this snapshot,
+        // so they match the same rows.
         let mut seat_filter = doc! { "user_id": user_id, "released_at": null };
         if let Some(scope) = &scope {
             seat_filter.insert("channel_id", doc! { "$in": scope });
         }
-        let seats: Vec<ChannelSeat> =
-            find_all(&self.col(COL_SEATS), seat_filter, session, COL_SEATS).await?;
-        for seat in seats {
+        let seat_channels = self
+            .projected_channel_ids(session, COL_SEATS, seat_filter.clone())
+            .await?;
+        if !seat_channels.is_empty() {
             self.col::<Document>(COL_SEATS)
-                .update_one(
-                    doc! { "_id": &seat.id, "released_at": null },
+                .update_many(
+                    seat_filter,
                     doc! {
                         "$set": {
                             "released_at": timestamp_bson(&now),
@@ -1078,31 +1106,28 @@ impl MongoDb {
                 )
                 .session(&mut *session)
                 .await
-                .map_err(db_err("update_one", COL_SEATS))?;
-            affected.insert(seat.channel_id);
+                .map_err(db_err("update_many", COL_SEATS))?;
         }
+        affected.extend(seat_channels);
 
+        // One pending removal per group: a group already holding one for
+        // this user is not matched
         let mut group_filter = doc! {
             "open": true,
             "kind": KIND_TEXT,
-            "members.user_id": user_id
+            "members.user_id": user_id,
+            "pending_removals.user_id": { "$ne": user_id }
         };
         if let Some(scope) = &scope {
             group_filter.insert("channel_id", doc! { "$in": scope });
         }
-        let groups: Vec<MlsGroup> =
-            find_all(&self.col(COL_GROUPS), group_filter, session, COL_GROUPS).await?;
-        for group in groups {
-            if group
-                .pending_removals
-                .iter()
-                .any(|pending| pending.user_id == user_id)
-            {
-                continue;
-            }
+        let group_channels = self
+            .projected_channel_ids(session, COL_GROUPS, group_filter.clone())
+            .await?;
+        if !group_channels.is_empty() {
             self.col::<Document>(COL_GROUPS)
-                .update_one(
-                    doc! { "_id": &group.id, "open": true, "kind": KIND_TEXT },
+                .update_many(
+                    group_filter,
                     doc! {
                         "$push": {
                             "pending_removals": {
@@ -1114,15 +1139,15 @@ impl MongoDb {
                 )
                 .session(&mut *session)
                 .await
-                .map_err(db_err("update_one", COL_GROUPS))?;
-            affected.insert(group.channel_id);
+                .map_err(db_err("update_many", COL_GROUPS))?;
         }
+        affected.extend(group_channels);
 
         Ok(affected.into_iter().collect())
     }
 
     async fn delete_attempt(&self, session: &mut ClientSession, channel_id: &str) -> Attempt<()> {
-        // FIRST operation: the Text groups this cascade closes
+        // FIRST operation: the Text groups this cascade deletes
         self.claim_groups_first(
             session,
             doc! { "channel_id": channel_id, "kind": KIND_TEXT },
@@ -1154,19 +1179,14 @@ impl MongoDb {
         .await?;
         let group_ids: Vec<String> = groups.into_iter().map(|group| group.id).collect();
 
+        // C7 (W2 audit): the Text group rows go too, open or closed. The
+        // typed read above is kept on purpose: a Text group that does not
+        // decode still fails the cascade (and with it the delete) closed.
         self.col::<Document>(COL_GROUPS)
-            .update_many(
-                doc! { "channel_id": channel_id, "kind": KIND_TEXT, "open": true },
-                doc! {
-                    "$set": {
-                        "open": false,
-                        "closed_at": timestamp_bson(&Timestamp::now_utc())
-                    }
-                },
-            )
+            .delete_many(doc! { "channel_id": channel_id, "kind": KIND_TEXT })
             .session(&mut *session)
             .await
-            .map_err(db_err("update_many", COL_GROUPS))?;
+            .map_err(db_err("delete_many", COL_GROUPS))?;
 
         if !group_ids.is_empty() {
             self.col::<Document>(COL_COMMITS)
@@ -1214,6 +1234,27 @@ impl AbstractProtectedChannels for MongoDb {
             COL_ENTITLEMENTS,
             doc! { "channel_id": channel_id }
         )
+    }
+
+    async fn fetch_entitled_channel_ids(&self, server_id: &str) -> Result<Vec<String>> {
+        use futures::StreamExt;
+
+        let mut cursor = self
+            .col::<Document>(COL_ENTITLEMENTS)
+            .find(doc! { "server_id": server_id })
+            .projection(doc! { "channel_id": 1 })
+            .await
+            .map_err(|_| create_database_error!("find", COL_ENTITLEMENTS))?;
+
+        let mut channel_ids = BTreeSet::new();
+        while let Some(row) = cursor.next().await {
+            let row = row.map_err(|_| create_database_error!("find", COL_ENTITLEMENTS))?;
+            let channel_id = row
+                .get_str("channel_id")
+                .map_err(|_| create_database_error!("find", COL_ENTITLEMENTS))?;
+            channel_ids.insert(channel_id.to_string());
+        }
+        Ok(channel_ids.into_iter().collect())
     }
 
     async fn fetch_channel_seats(&self, channel_id: &str) -> Result<Vec<ChannelSeat>> {

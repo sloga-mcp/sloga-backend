@@ -516,6 +516,36 @@ mod test {
         message
     }
 
+    /// A plaintext row by `author` in thread `channel_id`, stored raw past
+    /// the driver's floor (which judges a thread by its protected parent),
+    /// as only a failed thread clean-up could leave one behind
+    async fn insert_plaintext_raw(db: &Database, channel_id: &str, author: &str) -> Message {
+        let message = Message {
+            id: Ulid::new().to_string(),
+            channel: channel_id.to_string(),
+            author: author.to_string(),
+            content: Some("Test message".to_string()),
+            ..Default::default()
+        };
+        match db {
+            Database::Reference(reference) => {
+                reference
+                    .messages
+                    .lock()
+                    .await
+                    .insert(message.id.clone(), message.clone());
+            }
+            Database::MongoDb(mongo) => {
+                mongo
+                    .col::<Message>("messages")
+                    .insert_one(&message)
+                    .await
+                    .expect("raw message row");
+            }
+        }
+        message
+    }
+
     /// Mark `channel_id` protected under its stored plaintext rows, raw, as
     /// the R15 compensation window can leave a stray behind
     async fn protect_under_stored_rows(db: &Database, channel_id: &str) {
@@ -717,7 +747,7 @@ mod test {
 
         let protected = harness.new_protected_channel(&owner, &session, &[]).await;
         let thread = insert_thread(&harness.db, &protected.channel, &owner).await;
-        let message = insert_plaintext(&harness.db, thread.id(), &owner.id).await;
+        let message = insert_plaintext_raw(&harness.db, thread.id(), &owner.id).await;
 
         assert_refused_untouched(&mut harness, &session, &owner, thread.id(), &message.id).await;
     }
@@ -791,7 +821,7 @@ mod test {
         protect_under_stored_rows(&harness.db, flipped.id()).await;
 
         let thread = insert_thread(&harness.db, &protected.channel, &owner).await;
-        let threaded = insert_plaintext(&harness.db, thread.id(), &owner.id).await;
+        let threaded = insert_plaintext_raw(&harness.db, thread.id(), &owner.id).await;
 
         let unprotected = harness.new_channel(&protected.server).await;
         let plaintext = insert_plaintext(&harness.db, unprotected.id(), &owner.id).await;

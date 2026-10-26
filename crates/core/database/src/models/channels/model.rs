@@ -434,6 +434,42 @@ pub fn client_gate_is_set(nsfw: bool, spoiler: bool, description: Option<&str>) 
     nsfw || spoiler || description_has_password_gate(description)
 }
 
+/// `create_thread`'s cleanup after a refused parent hold (W2 audit B1):
+/// delete the just-inserted thread row, retrying once
+///
+/// A row left behind is a thread under a protected parent: the database
+/// floor and the routes refuse plaintext into it, but it still names a
+/// channel nobody can use, so every failed attempt is reported (ids only,
+/// never the thread's name). Returns the last delete error if both fail.
+async fn delete_refused_thread<F, Fut>(
+    mut delete: F,
+    thread_id: &str,
+    parent_id: &str,
+) -> Result<()>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<()>>,
+{
+    let mut attempt = 1;
+    loop {
+        match delete().await {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                revolt_config::capture_message(
+                    &format!(
+                        "create_thread could not delete thread {thread_id} after its parent {parent_id} refused the hold (attempt {attempt} of 2)"
+                    ),
+                    revolt_config::Level::Error,
+                );
+                if attempt == 2 {
+                    return Err(error);
+                }
+                attempt += 1;
+            }
+        }
+    }
+}
+
 #[allow(clippy::disallowed_methods)]
 impl Channel {
     /* /// Create a channel
@@ -657,7 +693,7 @@ impl Channel {
         // thread, so an announcement ahead of the hold would leave a
         // plaintext-named thread under a protected parent until reconnect.
         if let Err(error) = db.hold_thread_parent_unprotected(&parent_id).await {
-            db.delete_channel(&channel).await?;
+            delete_refused_thread(|| db.delete_channel(&channel), &id, &parent_id).await?;
             return Err(error);
         }
 
@@ -2508,7 +2544,14 @@ mod tests {
                 snapshot.text_group.is_none(),
                 "the Text group is still open"
             );
-            assert!(!db.fetch_mls_group(&group.id).await.unwrap().open);
+            // The delete removes the Text group row itself, not just closes it
+            assert!(
+                matches!(
+                    db.fetch_mls_group(&group.id).await,
+                    Err(error) if matches!(error.error_type, ErrorType::NotFound)
+                ),
+                "the Text group row survived the delete"
+            );
             assert!(
                 db.fetch_mls_commits_from(&group.id, 0, 10)
                     .await
@@ -2897,6 +2940,79 @@ mod tests {
         assert!(
             elsewhere.is_empty(),
             "the password marker is spelled outside {THIS_FILE}: {elsewhere:?}"
+        );
+    }
+
+    /// W2 audit B1 (c): `create_thread`'s cleanup after a refused hold
+    /// retries a failed delete once and stops after two attempts
+    ///
+    /// Control: the retry removed (one attempt) → the "fails once" case
+    /// returns the error.
+    #[tokio::test]
+    async fn refused_thread_delete_is_retried_once() {
+        use revolt_result::ErrorType;
+        use std::cell::Cell;
+
+        for (failures, expect_ok, expect_calls) in [(0, true, 1), (1, true, 2), (2, false, 2)] {
+            let calls = Cell::new(0);
+            let outcome = super::delete_refused_thread(
+                || {
+                    calls.set(calls.get() + 1);
+                    let call = calls.get();
+                    async move {
+                        if call <= failures {
+                            Err(create_database_error!("delete_one", "channels"))
+                        } else {
+                            Ok(())
+                        }
+                    }
+                },
+                "thread",
+                "parent",
+            )
+            .await;
+
+            assert_eq!(
+                outcome.is_ok(),
+                expect_ok,
+                "{failures} failures: {outcome:?}"
+            );
+            if let Err(error) = outcome {
+                assert!(
+                    matches!(error.error_type, ErrorType::DatabaseError { .. }),
+                    "{:?}",
+                    error.error_type
+                );
+            }
+            assert_eq!(calls.get(), expect_calls, "{failures} failures");
+        }
+    }
+
+    /// The wiring of the above: in `create_thread` the refused hold deletes
+    /// through `delete_refused_thread`, and no bare `delete_channel` is left
+    #[test]
+    fn create_thread_cleans_up_through_the_retrying_delete() {
+        let source = include_str!("model.rs");
+        let start = source
+            .find("pub async fn create_thread(")
+            .expect("create_thread");
+        let end = start
+            + source[start..]
+                .find("pub async fn create_forum_post(")
+                .expect("create_forum_post");
+        let body = &source[start..end];
+
+        let hold = body
+            .find("db.hold_thread_parent_unprotected(&parent_id).await")
+            .expect("the hold");
+        let cleanup = body
+            .find("delete_refused_thread(|| db.delete_channel(&channel), &id, &parent_id).await?;")
+            .expect("the retrying cleanup");
+        assert!(hold < cleanup, "the cleanup follows the hold");
+        assert_eq!(
+            body.matches(".delete_channel(").count(),
+            1,
+            "one delete site"
         );
     }
 }

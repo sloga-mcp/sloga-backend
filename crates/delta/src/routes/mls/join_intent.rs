@@ -1421,7 +1421,7 @@ mod tests {
     /// WA#1, RR#1, RR2#1: for every caller class and a valid or malformed
     /// body, a Text group whose channel the caller cannot view, and one
     /// whose channel was deleted, answer EXACTLY as a group id the server
-    /// does not know (the full body, `location` included)
+    /// does not know (the full serialized body, which carries no `location`)
     async fn hidden_and_deleted_text_groups_answer_as_unknown() {
         let oracle = oracle_fixture().await;
         let db = &oracle.harness.db;

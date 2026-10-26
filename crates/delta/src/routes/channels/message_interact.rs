@@ -59,8 +59,9 @@ pub async fn message_interact(
     // A protected channel carries only ciphertext: no bot may be addressed
     // there. Refused after the permission checks (a caller who cannot view
     // the channel learns nothing about the flag) and before the interaction
-    // insert and the event to the bot.
-    crate::util::interactions::ensure_interactions_allowed(&channel)?;
+    // insert and the event to the bot. A thread is judged by its parent
+    // too (W2 audit B1).
+    crate::util::interactions::ensure_interactions_allowed_in(&channel, &permission_channel)?;
 
     // Archived / locked threads are read-only: clicking would create an
     // interaction whose response is guaranteed to be rejected — fail early.
@@ -732,5 +733,53 @@ mod test {
         let body: serde_json::Value = serde_json::from_str(&on_open.1).expect("error body");
         assert_eq!(body["type"], "MissingPermission");
         assert_eq!(on_protected, on_open);
+    }
+
+    /// W2 audit B1: a thread is judged by its parent. A click on a bot
+    /// message in a thread left under a protected parent (stored directly,
+    /// the message written before the flag) is refused with
+    /// `ChannelProtected`, writes no interaction and wakes no bot.
+    ///
+    /// Control: the `2acdf5f0` helper call (the thread judged alone) → the
+    /// click is accepted and an interaction row is written.
+    #[test]
+    fn interact_in_a_thread_under_a_protected_parent_is_refused() {
+        crate::util::test::rt()
+            .block_on(interact_in_a_thread_under_a_protected_parent_is_refused_case())
+    }
+
+    async fn interact_in_a_thread_under_a_protected_parent_is_refused_case() {
+        let harness = TestHarness::new().await;
+        let (_, session, user) = harness.new_user().await;
+        let (server, _) = harness.new_server(&user).await;
+        let (bot, _) = setup_bot(&harness, &user, &server).await;
+
+        let parent = harness.new_channel(&server).await;
+        let orphan = Channel::Thread {
+            id: ulid::Ulid::new().to_string(),
+            server: server.id.clone(),
+            parent_channel: parent.id().to_string(),
+            name: "Thread".to_string(),
+            creator: user.id.clone(),
+            origin_message_id: None,
+            last_message_id: None,
+            archived: false,
+            archived_timestamp: None,
+            auto_archive_minutes: 0,
+            locked: false,
+            applied_tags: vec![],
+        };
+        harness.db.insert_channel(&orphan).await.expect("thread");
+        let stray = insert_bot_message(&harness, orphan.id(), &bot.id).await;
+        protect_under_stored_rows(&harness.db, parent.id()).await;
+
+        let (_, presence_session) = revolt_presence::create_session(&bot.id, 0).await;
+        let refused = click(&harness, &session.token, orphan.id(), &stray.id).await;
+        revolt_presence::delete_session(&bot.id, presence_session).await;
+
+        assert_eq!(refused.0, Status::BadRequest, "body: {}", refused.1);
+        let refused_body: serde_json::Value = serde_json::from_str(&refused.1).expect("error body");
+        assert_eq!(refused_body["type"], "ChannelProtected");
+        assert_eq!(interactions_in(&harness.db, orphan.id()).await, 0);
     }
 }

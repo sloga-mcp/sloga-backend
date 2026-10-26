@@ -55,8 +55,8 @@ pub async fn fetch_text_group(
 }
 
 /// The one `NotFound` this route answers, for a missing channel, a channel
-/// the caller cannot view and a channel with no open Text group alike: one
-/// source site, so the body's `location` never tells them apart
+/// the caller cannot view and a channel with no open Text group alike (one
+/// source site; error locations no longer serialize, so this is hygiene)
 fn no_text_group() -> Error {
     create_error!(NotFound)
 }

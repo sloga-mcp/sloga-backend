@@ -19,8 +19,9 @@ mod reference;
 /// or, in the Reference driver, while holding its collection locks in the
 /// order `channels -> messages -> channel_entitlements -> servers ->
 /// server_members -> channel_seat_lists -> channel_seats -> mls_groups ->
-/// mls_commits -> mls_join_intents -> e2ee_identities` (the 2.5 (d) order
-/// with five collections prefixed; see `ops/reference.rs`). On Mongo, a
+/// mls_commits -> mls_join_intents -> e2ee_identities -> e2ee_queue` (the
+/// 2.5 (d) order with five collections prefixed and one appended; see
+/// `ops/reference.rs`). On Mongo, a
 /// transaction that only READS a document it depends on also writes it
 /// (`txn_serial`), so the dependency cannot write-skew: Text create writes
 /// the seat-list row it binds, and a seat claim writes the entitlement whose
@@ -56,6 +57,17 @@ pub trait AbstractProtectedChannels: Sync + Send {
         &self,
         channel_id: &str,
     ) -> Result<Option<ChannelEntitlement>>;
+
+    /// The channel ids of every entitlement whose `server_id` is
+    /// `server_id`, sorted and unique (C4, W2 audit). Mongo reads them
+    /// through a `channel_id` projection, so an undecodable entitlement row
+    /// does not fail it (the WA#6 pattern); a row whose `channel_id` is not
+    /// a string does (`DatabaseError`), because a caller that enumerates a
+    /// server's protected channels must never skip one. `Server::delete`
+    /// and the ownership-transfer refusal walk these ids together with
+    /// `server.channels`, so a protected channel missing from that list is
+    /// neither left behind nor transferable.
+    async fn fetch_entitled_channel_ids(&self, server_id: &str) -> Result<Vec<String>>;
 
     /// Every seat row of a channel (active, cooling and expired)
     async fn fetch_channel_seats(&self, channel_id: &str) -> Result<Vec<ChannelSeat>>;
@@ -105,7 +117,12 @@ pub trait AbstractProtectedChannels: Sync + Send {
     /// `pending_removals`. A byte-identical re-PUT of the stored row returns
     /// `unchanged: true` before any other check and writes nothing.
     ///
-    /// After that return: with `allow_claims == false` (the growth flag is
+    /// After that return, and before the growth flag is looked at: a list
+    /// that still names a user the server removed since the stored list
+    /// (C1, see `seat_list_removed_users`) is refused with
+    /// `SeatListNamesRemovedUsers` naming them, and writes nothing.
+    ///
+    /// Then: with `allow_claims == false` (the growth flag is
     /// off, decision 5 (W2)) a list that claims or reactivates any seat is
     /// `FeatureDisabled { feature: "protected_channels" }`, while a
     /// removal-only or `device_cap`-only list still lands. Every newly
@@ -130,7 +147,9 @@ pub trait AbstractProtectedChannels: Sync + Send {
     /// same channel and the generation its generation + 1, and the
     /// superseded group is closed with a `superseded_by` back-pointer. At
     /// most one open Text group per channel: a racing creator gets
-    /// `Conflict` with the open Text group.
+    /// `Conflict` with the open Text group. A Call squat at the derived id
+    /// (M9) is evicted in the same unit with its commits, join intents and
+    /// queued E2EE envelopes (`group_id` = that id; A6, W2 audit).
     async fn create_text_mls_group(
         &self,
         group: &MlsGroup,
@@ -143,6 +162,14 @@ pub trait AbstractProtectedChannels: Sync + Send {
     /// `server_id = Some` limits it to that server's channels (by the
     /// entitlement's `server_id`); `None` covers every channel. Idempotent.
     /// Returns the affected channel ids (sorted).
+    ///
+    /// The release never decodes a whole seat or group document (C9, W2
+    /// audit): Mongo reads only `channel_id` through a projection and
+    /// writes with `update_many` on the same filter, so a row carrying a
+    /// field no typed read decodes still releases (and the user can still
+    /// be kicked, banned or join). A row whose `channel_id` is not a string
+    /// fails it closed. A list that still names a user released here is
+    /// refused (`SeatListNamesRemovedUsers`, see `seat_list_removed_users`).
     async fn release_channel_seats_for_user(
         &self,
         user_id: &str,
@@ -151,7 +178,10 @@ pub trait AbstractProtectedChannels: Sync + Send {
     ) -> Result<Vec<String>>;
 
     /// Delete cascade (7.5): remove the channel's entitlement, seats and
-    /// seat list, close its open Text group, and delete the commits and
-    /// join intents of every Text group of the channel, in one transaction
+    /// seat list, and every Text group of the channel (open or closed) with
+    /// its commits and join intents, in one transaction. The Text group rows
+    /// are deleted, not only closed (C7, W2 audit): the channel goes with
+    /// this cascade and its Text group ids derive from its id, so no row is
+    /// ever read again.
     async fn delete_protected_channel_data(&self, channel_id: &str) -> Result<()>;
 }

@@ -97,6 +97,9 @@ protecting a channel that already has messages.
 does not react to a seated member losing ViewChannel (see 6.4); the owner sees "seated without
 access" and must unseat by hand.
 
+**HOLD (W2 audit A2, #178):** no flag-on of `[features.protected_channels]` at all, beta
+included, before residual R24 (the Call-create oracle, 1.3) is fixed in S2.
+
 ### 1.2 Trust model
 
 The server is a **Delivery Service plus directory**: it stores ciphertext, arbitrates one
@@ -305,6 +308,14 @@ A hostile or compromised server (or an operator with database access):
   (plaintext still refused) with no seats or group (no encrypted send either), and a retry
   completes the deletion (the protected cascade is idempotent: deleting rows that are
   already gone is a no-op).
+  **Narrowed in the W2 audit fix round (C4, C8; #180).** `Server::delete` now runs the
+  cascade over the UNION of `server.channels` and the channel ids of the server's
+  entitlements (`fetch_entitled_channel_ids`, a `channel_id` projection). Protect needs an
+  entitlement, so a protected channel missing from `server.channels` is cleaned too, and
+  the orphan case above no longer arises for any channel protect could have flagged. The
+  partial-cleanup case stands (C8): a server delete that fails part way leaves the
+  channels already cleaned `protected: true` with no entitlement, seat list or group
+  (plaintext and encrypted sends both refused). The repair is to retry the server delete.
 - **R21. One join-intent payload for both planes (W2c, #168; S2).** Call and Text join
   intents sign the same `acutest:e2ee:mls-join:v1` payload
   (`mls_join_intent_payload(user_id, device_id, group_id, key_package_ref)`), which carries
@@ -325,6 +336,16 @@ A hostile or compromised server (or an operator with database access):
   the next Text commit; this document does not confirm that for a stray at a later epoch.
   OPEN for the W2 audit: whether the eviction must also fence late Call commits, or a sweep
   is needed.
+  **FIXED in the W2 audit fix round (A1, #177).** The W2 audit confirmed the attack on Mongo
+  (the Call commit insert is not transactional, so a stray survives or races the eviction)
+  and that it chains through every generation. Text commit rows are now MARKED in storage,
+  and every Text read and check considers marked rows only; an unmarked row at a Text id is
+  replaced inside the Text commit transaction (2.5 "Text commit marker"). A stray can no
+  longer win a Text epoch or be served by the Text fetch. What remains: (a) a Text row
+  written before the marker existed (dev databases only; nothing shipped) reads as unmarked,
+  so it is never served and is replaced if its epoch is committed again (a backfill
+  migration is a followup); (b) a stray at an epoch the Text group never reaches stays in
+  `mls_commits` until the Text prune deletes it (2.5, R9), unread by every route.
 - **R23. Revoked devices keep their leaves and their cap slot until removed (W2c, #171;
   S2 beta BLOCKER, item 2).** `E2EEIdentity::revoke_device` (also run on logout and session
   revocation) deletes the identity, KeyPackages and queued envelopes, but adds NO pending
@@ -337,6 +358,27 @@ A hostile or compromised server (or an operator with database access):
   who revoked a device and set up a new one can be refused `DeviceCapReached` until that
   leaf leaves through one of those cases. S2 makes revocation add a pending removal (beta
   blocker).
+- **R24. A Call create is an oracle on hidden protected channels (W2 audit A2, #178; S2;
+  HOLD, 1.1).** Text group ids are public functions of the channel id (3.1), and
+  `POST /mls/groups` with a CALL kind takes any client-chosen id. A caller who cannot view
+  channel X can still compute `text_group_id(X, g)` and create a Call group at it: the
+  answer (`Created` vs `InvalidOperation`; with `supersedes`, `NotFound` vs
+  `FailedValidation`) tells whether hidden X has a Text group at generation `g`, so whether
+  X is protected and how many successors it has had. This breaks the goal of decision 1
+  (6.1 invariant: a non-viewer learns nothing about a hidden channel) for that one route;
+  no content leaks. The root fix is S2's:
+  bind the 3.1 derivation to material only a viewer holds (for example the hash of the
+  genesis seat list), which also removes the squat (B47) and R22 at the root. It changes
+  the native derivation and the 5.5 vectors, so it is not in S1. **No flag-on, beta
+  included, before R24 is fixed.**
+- **R25. The `Active` entitlement predicate is checked in the route only (W2 audit A4,
+  #178; S5).** Text group create, a new device's join intent and every commit with `added`
+  require an `Active` entitlement (6.1), but the route reads it outside the driver
+  transaction that applies the change. An entitlement that stops being `Active` between
+  that read and the transaction lets at most the one racing create or Add per request land.
+  S1 writes no state but `Active` (2.2), so in S1 the window is small; S5, which adds
+  `Grace`, `Frozen` and `Deleted`, replaces these predicates and must move the check into
+  the transactions.
 
 ---
 
@@ -457,6 +499,9 @@ a hash check there either wedges the repair loop or silently reverts concurrent 
   Inside the transaction, in order:
   0. **existing-row check (DECISION (W0-fix7); position pinned in W0-fix8):** if a commit row
      already exists at `{group}:{epoch}`, return `Lost { winning: <that row> }` immediately.
+     Since the W2 audit fix round (#177) only a TEXT-MARKED row counts, in the route and in
+     the driver ("Text commit marker" below); an unmarked row there is a stray, replaced in
+     step 3.
      **Exact order (route and driver):**
      1. ACCESS checks first: the caller is not a bot; the session is bound to the
         submitting device (`assert_bound_session`); and the caller passes the commit-fetch
@@ -478,9 +523,15 @@ a hash check there either wedges the repair loop or silently reverts concurrent 
   2. check `open`, `current_epoch == e - 1`, `seat_list_ad_sha256 == SHA-256(AD)` (else
      `stale_seat_list`), `pending_removals` (Adds refused while non-empty), the Remove rule
      (6.1), the enforced device cap and the 100-leaf cap, and the revoked-identity lookups the
-     Remove rule needs (see "Revoked-identity lookup" below);
-  3. `insert_one` the commit row (its unique `_id` still arbitrates a racing same-epoch insert:
-     a duplicate-key abort returns `Lost` with the winning row);
+     Remove rule needs (see "Revoked-identity lookup" below). The two caps answer the route's
+     own types, `DeviceCapReached { max }` and `MlsCallFull { max: 100 }` (W2 audit A5,
+     #177; they were `FailedValidation`), so a race only this re-check catches looks the
+     same to the client;
+  3. delete an UNMARKED row at `{group}:{epoch}` if there is one (#177; logged once the
+     transaction commits as `AUDIT mls_text_stray_replaced group=<id> epoch=<n>`, ids only),
+     then `insert_one` the commit row and mark it (its unique `_id` still arbitrates a racing
+     same-epoch insert: a duplicate-key abort retries, and the next attempt's step 0 returns
+     `Lost` with the winning row);
   4. a field-level `update_one` filtered on
      `{ _id, open: true, current_epoch: e - 1, seat_list_ad_sha256: h }` with
      `$set { current_epoch: e, members: <roster computed from the group read in step 1> }`
@@ -495,6 +546,30 @@ a hash check there either wedges the repair loop or silently reverts concurrent 
 
   Then commit the transaction. A Text commit needs no repair loop: the insert, the effects and
   the intent consumption are atomic.
+
+**Text commit marker (W2 audit A1, R22 fix, #177).** Commit rows of both planes share one
+id space, `{group_id}:{epoch}`, so a Call-plane row that lands at a Text group's id (R22)
+must never count as a Text commit. The marker is STORAGE-LEVEL, not a field of `MlsCommit`
+(a new struct field would have broken every `MlsCommit` literal in other lanes' files):
+
+- **Mongo** stamps `kind: "Text"` on the `mls_commits` document, inside the Text commit
+  transaction, right after the typed insert. `MlsCommit` decoding ignores the key. Call rows
+  and rows written before the marker are unmarked.
+- **Reference** stores a Text row under the map key `text:{group}:{epoch}` and every other
+  row under its plain id; the stored `MlsCommit::id` stays `{group}:{epoch}`, so readers of
+  the values (sweeps, prunes, cascades, the Call-plane fetch) are unaffected.
+
+`fetch_mls_text_commits_from(group, from_epoch, limit)` (both drivers) returns marked rows
+only. It is the read behind the route's step 0 check, the route's re-read of a `Won` commit
+(for its stored `rejoin_intents`), and the Text commit fetch (6.1); the driver's step 0
+reads marked rows only too. `fetch_mls_commits_from` stays the Call plane's read (every row
+under the id). In the other direction, Mongo's Call-path `Lost` reads (stale epoch and
+duplicate key) skip Text-marked rows, so a Call submitter whose group read raced a squat
+eviction never receives a Text commit as its winner (Reference's Call path reads plain keys
+only, so it never sees a Text row). Cost: two extra Mongo writes per Text commit (the
+stray delete, a no-op when there is none, and the marker). The marker is invisible in the
+type, so a future rewrite of the commit row through a typed `replace_one` would drop it;
+none exists today. Residuals: R22 (a) and (b) (1.3).
 
 **`member_added` (DECISION (W0-fix5))**: a new Text-only `MlsGroup` field
 `member_added: Vec<MlsMemberAdded { user_id, device_id, epoch: i64, at: Timestamp }>`
@@ -630,9 +705,10 @@ commit at that epoch.
   which the bridge treats like any 5xx: it re-PUTs the same bytes (4.9).
 - **(d) Reference driver: lock order** (extended in W0-fix5, W1 and W2) `channels ->
   messages -> channel_entitlements -> servers -> server_members -> channel_seat_lists ->
-  channel_seats -> mls_groups -> mls_commits -> mls_join_intents -> e2ee_identities` (the
-  per-collection mutexes in `drivers/reference.rs`). Every path that holds more than one of
-  these takes them in this order and holds them for the whole operation.
+  channel_seats -> mls_groups -> mls_commits -> mls_join_intents -> e2ee_identities ->
+  e2ee_queue` (the per-collection mutexes in `drivers/reference.rs`; `e2ee_queue` appended
+  in the W2 audit fix round for the A6 eviction, 3.1, #178). Every path that holds more than
+  one of these takes them in this order and holds them for the whole operation.
   - The Text commit path takes `channel_seat_lists` (read), `mls_groups`, `mls_commits`,
     `mls_join_intents` (rule-6 lookup and consumption) and `e2ee_identities` (revoked
     lookup).
@@ -670,6 +746,13 @@ commit at that epoch.
     through the driver and returns `ChannelProtected`, nothing else. A publish before the
     hold would leave a phantom thread under a protected parent in bonfire's thread cache
     until reconnect.
+    **Clean-up retry (W2 audit B1 (c), #182).** The delete goes through
+    `delete_refused_thread`: every failed attempt is reported to Sentry (thread and parent
+    ids only, never the name) and the delete is retried ONCE. If both attempts fail, the
+    route returns the delete's error instead of `ChannelProtected`, and the thread row
+    stays: the only way a thread under a protected parent can exist. It was never announced
+    and has no member, and the database floor and every route judge it by its parent
+    (#182), so it takes no plaintext.
   - **Gate:** unpaced MONGODB race tests (seat PUT vs kick, protect vs kick, protect vs
     `create_thread`, protect vs ownership transfer) resolve EVERY round without
     `DatabaseError`.
@@ -750,6 +833,14 @@ commit at that epoch.
   `attachments`, `masquerade`, `replies`, `mentions`, `role_mentions`, `sticker_ids`,
   `system`, `components`, `poll`, `command_context`, `webhook`, `thread_id` are all
   `None`/empty and `interactions` is default. Anything else is refused.
+- **A thread is judged by its parent at the floor (W2 audit B1 (a), #182).**
+  `validate_protected_insert(channel, parent)`: for a `Thread`, both drivers also read the
+  parent and judge the insert on the PARENT's flag (Reference: under the same `channels`
+  lock as the thread read; Mongo: a parent fetch). Rules: a Thread with no parent read
+  refuses the insert (`InternalError`); a parent (or channel) that does not exist
+  (`NotFound`) is unprotected; any other read error refuses (fails closed). No hold is
+  needed on the parent: protect refuses a channel that has threads (#143). Before this the
+  floor read only `message.channel`, and a thread is never protected itself.
 
 ### 2.7 Migration (revision 75, `LATEST_REVISION` 76)
 
@@ -778,8 +869,14 @@ adding a revision. A DEV database that ran this branch before the renumber (its 
 then revision 73) is stored at revision 74: it now runs upstream's revision 74 (payments)
 and revision 75, but SKIPS upstream's revision 73 (the `server_audit_log` collection, its
 indexes and the ViewAuditLog grant). Reset such a database's migration document to
-revision 72, or drop the database. The partial filter relies on `encrypted` being OMITTED
-(never `null`) when absent; W1's test `message_without_encrypted_omits_the_key` pins that.
+revision 72, or drop the database. **(W2 audit C5, #181)** That trap now fails LOUD: right
+before the revision-75 block, a database stored at revision 74 WITHOUT a
+`server_audit_log` collection panics (as the payments block does), naming the dev-database
+trap and the fix (`db.migrations.updateOne({}, { $set: { revision: 72 } })` and restart,
+or drop the database), and leaves the stored revision at 74. Upstream's own revision 74
+always has the collection (its revision 73 creates it) and runs on. The partial filter
+relies on `encrypted` being OMITTED (never `null`) when absent; W1's test
+`message_without_encrypted_omits_the_key` pins that.
 Re-check that no other branch has claimed revision 75 before W2 lands.
 
 Then `LATEST_REVISION = 76`. `init.rs` (fresh databases) creates `open_channel_kind_group`
@@ -832,6 +929,18 @@ call_creator=<id>` (ids only). A Text row at the id still answers as before
 (`InvalidOperation` / `Conflict`), and a Call row at a NON-derived id is never evicted (the
 create is refused and nothing is deleted). Residuals: orphan Call commits landing after the
 eviction (R22); one join-intent payload for both planes (R21).
+**W2 audit fix round.** (a) A6 (#178): the eviction also deletes the E2EE envelopes queued
+for the evicted id (queued envelope rows whose `group_id` is that id), in the same unit; left
+queued, they would reach the Text group's members as that group's commits and Welcomes.
+KeyPackages are keyed by device, never by group, so none are deleted. (b) R22 is fixed by
+the Text commit marker (2.5, #177): a Call row landing at the evicted id after the eviction
+can no longer win a Text epoch or be served. (c) A3 (#177): the Reference driver's Call
+`create_mls_group` no longer overwrites an id that already exists, whatever its kind,
+channel or state; it answers `InvalidOperation`, as Mongo's `_id` insert does. On the
+`supersedes` path Reference refuses before closing the predecessor, while Mongo closes it
+and then fails on `_id` (the Mongo Call path is unchanged by this round). (d) The
+id being public also makes a Call create an ORACLE on a hidden channel's protected status
+(R24, S2, with the HOLD of 1.1).
 
 Only the device that signed the channel's CURRENT seat list (the owner's pinned device) may
 create a text group or a successor (**DECISION (W0-fix)**, 6.1).
@@ -1461,6 +1570,36 @@ The server is not the trust anchor, but it validates so garbage never reaches cl
    re-protect while the stored list is still version 1 (7.2, **DECISION (W1.5)**, N3).
    (W2, #134: both retries also run before the growth gate, so a retry still succeeds with
    the flag off.)
+4b. **No silent re-seat of a removed user (W2 audit C1, DECISION (W2 fix), #179; decision
+   2, the user's 2026-10-04 rule that a removed or re-invited member is not re-seated until
+   the owner re-seats them).** A server-forced release (kick, ban, leaving the server,
+   account deletion; 6.3) releases the seat row but never edits the signed list, so the
+   owner's client keeps naming the user. Without this step, the owner's next list (adding
+   someone else, say) would reactivate that seat with no growth dialog once the user
+   rejoined. Rule: a submitted list is refused when it names a user, other than the signer,
+   whom the STORED list also names and whose seat row is RELEASED (not active, cooling or
+   expired alike). Answer: 400 `SeatListNamesRemovedUsers { users }` (7.6), the sorted ids,
+   and nothing is written or claimed.
+   - Why the rows and not a stored release reason (the contract proposed a
+     `release_reason` field; none was added): every list write reconciles the seat rows to
+     the list, so a seat the list planner releases (the owner's own unseat) is OFF the list
+     that released it. A released row whose user the stored list still names was therefore
+     released by the server-forced primitive after that list landed, and by nothing else.
+     That also holds when the removal commits between a PUT's read and its transaction,
+     where comparing a release time with the list's time would not.
+   - Consequences: a VOLUNTARY leave of the server followed by a rejoin is refused the same
+     way (fail closed: a leave is a server-forced release like a kick); the owner's own
+     unseat followed by a later re-add is NOT refused (the stored list no longer names the
+     user, so the re-add is an ordinary claim through the growth dialog). The signer is
+     never reported (the signer is always seated, 4.1; refusing it would wedge every later
+     list). A stored body that no longer parses fails closed.
+   - Where: the driver's planner (`plan_seat_list_write`, `seat_list_removed_users`)
+     decides it inside the write transaction, after step 4 (so a byte-identical re-PUT, N3,
+     still answers its stored success) and before 5b, the growth flag and the claims of
+     step 7. The route's validator runs the same check first, after its retry return and
+     before the step 5 eligibility rules, only so a removed user who has NOT rejoined gets
+     the same typed answer (step 5 would answer a bare `FailedValidation`). Protect never
+     answers it: the genesis list has no stored list.
 5. Every seated user is a member of the server, not a bot, not staff; the signer is seated.
    **Seating eligibility (DECISION (W2), #136).** The ROUTE checks this step; the data layer
    does not.
@@ -1719,8 +1858,21 @@ A seat list is ADOPTED only if all hold, checked in this order (W0-fix3):
 - `_sign` refuses (`SeatListBehind`) when the server's current list, as passed by the
   bridge, is not byte-identical to the device's stored verified list. The owner must verify
   the newest list first (`_seat_list_verify`), so it never signs a successor to a list it
-  has not verified. This is the only remaining use of `SeatListBehind` (3.12 no longer uses
-  it).
+  has not verified. This is the only remaining use of `SeatListBehind` by `_sign` (3.12 no
+  longer uses it). **(W4 plan D24, #185)** `_seat_list_verify` also answers `SeatListBehind`
+  when the list it is given is of an older group generation than the state this device
+  holds; the bridge keeps its held state and shows `resecuring` (9.1, 9.2). Recorded from
+  the W4 plan; the native side is W3's and is not in this tree.
+- **`SeatListNamesRemovedUsers { users }` on a seat PUT (W2 audit C1, #179; W3
+  `_seat_list_sign` and W4 MUST handle it).** It is a non-429 4xx, so it RESOLVES the
+  publish: the bridge never re-sends those bytes (they can never land). The owner's client
+  signs the SAME next version (the refused list never landed, so `stored + 1` is still
+  free) from the same base, WITHOUT the named users, and publishes that (removal only: no
+  growth dialog, unless the same change also adds someone). The owner acknowledges the
+  removal (the audit's decided fix): the UI says the server removed those users, rather
+  than dropping them unannounced. Adding one of them back is a later, separate list, an
+  ordinary growth add with the native dialog of this section. The frontend needs the usual
+  `ErrorType` cast for the new variant (7.6).
 
 ---
 
@@ -2091,13 +2243,13 @@ any caller class, learns nothing (the invariant above; 7.4 "Refusal placement").
 | Create or successor (`POST /mls/groups`, `kind: Text`) | Channel protected; entitlement `Active`; **the caller is the CURRENT seat list's `signer_user_id` and the session is bound to its `signer_device_id`** (the owner's pinned device; not "any seated member", **DECISION (W0-fix)**); `generation` present, `<= 63`, and `group_id == group_id(channel, generation)` (3.1); without `supersedes` the generation is `0`, with `supersedes` it is the superseded Text group's generation + 1 and the superseded group belongs to this channel; growth gate (7.1). Skips the voice/presence checks of call create. The caller must also be **seated** (`NotSeated`; W2 lane B5, #159). Exact order and errors: see "Text group create (W2 lane B5)" below this table |
 | Join intent | Caller **seated**; device session-bound; growth gate. Rejoin = this `(user, device)` is already a member (device-aware lookup, replacing `member_device_of`). A new device is refused when the user's member devices already equal the **enforced** device cap, `min(signed-list cap, entitlement cap)` (2.5; W0-fix5, was "effective"). **(W2 lane B3, #161)** A NEW device (not a rejoin) also needs an `Active` entitlement and a stored seat list (else `InvalidOperation`: a new device is an Add to come, and Adds need an Active entitlement); over the cap is `DeviceCapReached { max }`. The count is every member device of the user in the group, a revoked device whose leaf is still there included (R23). A rejoin is exempt from the cap. There is NO early 100-leaf check on Text (the Call path refuses `MlsCallFull` at join): the 100-leaf cap is enforced on the Add commit (`MlsCallFull`, inside the commit transaction) and by every admitter natively (`TextGroupFull`). A closed (superseded) group answers `NotFound` after the seat check. The route never closes a Text group |
 | KeyPackage claim (group is Text) | Claimer is a current member device AND seated (else `NotSeated`); growth gate. Each target must be seated and hold ViewChannel, else that target's status is `NotFound` |
-| Every Text commit: existing-row check (W0-fix7; position pinned W0-fix8) | In BOTH the route and the driver: AFTER the access checks (not a bot; `assert_bound_session` for the submitting device; seated AND ViewChannel, the commit-fetch authorization) and BEFORE every validity check (membership, AD, Remove/Add rules, growth gate, `pending_removal`), a commit row already at `{group}:{epoch}` returns `Lost { winning: <that row> }` (409). This makes an identical-bytes resubmit idempotent without letting an unauthorized caller read commit rows (2.5 step 0) |
+| Every Text commit: existing-row check (W0-fix7; position pinned W0-fix8) | In BOTH the route and the driver: AFTER the access checks (not a bot; `assert_bound_session` for the submitting device; seated AND ViewChannel, the commit-fetch authorization) and BEFORE every validity check (membership, AD, Remove/Add rules, growth gate, `pending_removal`), a commit row already at `{group}:{epoch}` returns `Lost { winning: <that row> }` (409). This makes an identical-bytes resubmit idempotent without letting an unauthorized caller read commit rows (2.5 step 0). **(#177)** Only a Text-marked row counts; an unmarked (Call-plane) row at the id is replaced by the commit transaction (2.5 "Text commit marker") |
 | Every Text commit (W0-fix2, W0-fix3) | The MLS framing prefix parses (3.12.2, else `FailedValidation`), and its `authenticated_data` is byte-identical to the `commit_ad` of the newest stored seat list (else `ProtectedChannelResecuring { reason: "stale_seat_list" }`). The route pre-checks; the binding check is **inside the Text commit transaction** (Mongo multi-document transaction; Reference lock order), via `seat_list_ad_sha256` (2.5, 3.12.2; W0-fix4). Applies to Add, Remove and Update commits alike, including with the flag off |
 | Commit with `added` | Committer is a current member device. **Refused while `pending_removals` is non-empty** (`ProtectedChannelResecuring { reason: "pending_removal" }`, **DECISION (W0-fix3)**, so a joiner never receives a roster with an unseated user). Every added device: **not already a member, and not also listed in `removed`** (no same-commit Remove + re-Add of one device in S1, **DECISION (W0-fix7)**; matches today's `commits_submit.rs` refusal and the driver's "added device already a member"); registered E2EE device; its user **seated AND has ViewChannel** (the friend/DM-eligibility OR is dropped for Text); per-user device count within the **enforced device cap = min(signed-list cap, effective entitlement cap)** (inside the commit transaction, 2.5); total leaves `<= 100`. Growth gate |
 | Commit `removed` list (any Text commit; W0-fix3 main-session decision, amended W0-fix4) | The exact rule is 3.12.2 "Remove rule". **The current list signer's device can be removed ONLY in the rejoin case** (a stored, verified, outstanding rejoin intent from that device, copied into the commit's `rejoin_intents`), regardless of every other case. Every other removed device must be one of: a device of the committer's own user other than the committing device; a device of a `pending_removals` user; a device whose E2EE identity was revoked (looked up inside the transaction); ONLY when the committer is the current list signer's device, a device of a user absent from the newest signed list; or a device with an outstanding rejoin intent. Anything else is `FailedValidation`. Checked in the route and inside the commit transaction. **Enforceable only together with the receiver declaration binding (3.12.3 step 6)** |
 | Commit with only `removed` or an Update | Committer is a current member device. No seat-list signature is needed for a removal, but the Remove rule above applies. Allowed with the flag off |
 | `pending_removals` clearing | After a won commit, every pending entry whose user has no remaining member device is removed from the list |
-| Commit fetch | Caller seated and has ViewChannel. Answers 200 with the stored commits from `from_epoch` upward; a pruned gap is a missing leading epoch, never a 404 (R9, #164). Every returned `MlsCommitInfo` carries all four declarations: `committer`, `added`, `removed` and `rejoin_intents` (#163) |
+| Commit fetch | Caller seated and has ViewChannel. Answers 200 with the stored commits from `from_epoch` upward; a pruned gap is a missing leading epoch, never a 404 (R9, #164). Every returned `MlsCommitInfo` carries all four declarations: `committer`, `added`, `removed` and `rejoin_intents` (#163). **(#177)** Only Text-marked rows are returned (`fetch_mls_text_commits_from`), so a Call-plane stray at the group's id is never served |
 | Ctl pipe (`POST /mls/groups/:id/messages`) | Refused for Text groups (`InvalidOperation`) |
 | Encrypted send | 7.3 |
 
@@ -2168,6 +2320,13 @@ would change the Call path's answers (decision 1 keeps it byte-identical).
   `own_user` > `rejoin`. It is ADVISORY ONLY: the server is untrusted, the field never
   changes admission, and native does not use it for forced-removal memory in S1 (6.2). Call
   commits never carry it (always empty, never serialized). S2 may consume it.
+  **Route-time view (W2 audit A7, #178).** The reasons are computed by the submit route
+  from ITS reads (the group, the newest seat list, the pending removals, the stored rejoin
+  intents and identities), not re-derived inside the commit transaction. A state change
+  between those reads and the transaction (a pending removal cleared, an identity
+  re-registered) can leave a stored reason that no longer matches what the transaction
+  saw. Admission is unaffected (the transaction re-checks the Remove rule itself); only the
+  advisory label can be stale, which is one more reason no client may act on it in S1.
 
 ### 6.2 Client side (native; W3). The real trust decisions.
 
@@ -2178,7 +2337,7 @@ would change the Call path's answers (decision 1 keeps it byte-identical).
 | Process a commit that adds or removes | Runs AFTER the embedded list has been adopted (3.12.3 step 6). Every added leaf passes the leaf acceptance rule (3.2), its user is on the newest held list, it is not in forced-removal memory, and the per-user `device_cap` and 100-leaf cap hold. The actual adds, removes and committer equal the server-recorded declarations (W0-fix4). A Remove of the owner's pinned signing device is accepted only with a verified rejoin intent from that device in `rejoin_intents` (W0-fix4). A failure takes the **poisoned-epoch / successor path** (loud), NOT a per-device rejoin (**DECISION (W0-fix3)**) |
 | Process a Welcome (`_process`) | Outstanding join intent for this group (else `MlsUnsolicitedWelcome`); group id equals `group_id(intended channel, generation)` for the generation recorded with the join intent (`ChannelMismatch`); every leaf verified; the newest list's signer holds a leaf (4.4 step 5; else `SignerLeafMissing`, resecuring, retry the join, W0-fix4). A leaf user absent from the newest held list does NOT refuse the Welcome (W0-fix3): verdict `roster_mismatch`, shield `resecuring` for 60 s, then `unverified` (3.12.3 "Welcome during a pending unseat") |
 | Remove (`_remove`) | No seat-list signature needed. The bridge only stages Removes the 6.1 Remove rule allows from this device: its own user's OTHER devices (never itself; OpenMLS refuses self-removal), `pending_removals` users, revoked devices, (owner device only) off-list users, and devices with a verified outstanding rejoin intent. **It never stages a Remove of the owner's pinned signing device except in the rejoin case** (W0-fix4). Native refuses a forbidden target with `NotOwner`. **(W2c, #169; W3 D26)** S1 native does not stage a revoked-ONLY Remove (a device covered by no case but "revoked"): the DS still allows that case (3.12.2 rule 4), but no S1 client builds it until S2's signed revocation (R23) |
-| Forced-removal memory (REWRITTEN in W2c, #169; mirrors W3 D26) | Native records `(channel, user, list_version)` in `mls_text_forced_removals` ONLY for a Remove that meets ALL of: (1) the removed user is ON the newest verified list (an off-list user needs no memory: the list already refuses them); (2) it removes that user's LAST leaf in the group (a user who keeps another device was not forced out); (3) it is NOT a rejoin-case Remove justified by a verified rejoin intent from that device (3.12.3 step 6; the device rejoins next, 6.3 "Owner signing device rejoin", so memory there would refuse the very rejoin the flow needs); (4) it is NOT an own-user Remove (a device of the committer's own user, e.g. 6.3 handover step 6). Such a user is not re-admitted until a list with a **higher** version includes them, and a visible marker is shown (9.3). Native IGNORES the server's advisory `removed_reasons` (6.1) for this decision in S1: it decides from the commit it verified and the list it holds (fail closed: no server hint widens or narrows it). A `revoked` hint earns no exemption and no memory of its own: native records nothing on the strength of "revoked" until S2 adds a signed revocation (S1 native never stages a revoked-only Remove; `e2ee_text_remove` drops `revoked_devices`, W3 D26). This replaces the W0 wording "any Remove of a user still on the list", which contradicted 6.3 (an owner-device rejoin Remove would have barred the owner's own device from re-admission) |
+| Forced-removal memory (REWRITTEN in W2c, #169; mirrors W3 D26) | Native records `(channel, user, list_version)` in `mls_text_forced_removals` ONLY for a Remove that meets ALL of: (1) the removed user is ON the newest verified list (an off-list user needs no memory: the list already refuses them); (2) it removes that user's LAST leaf in the group (a user who keeps another device was not forced out); (3) it is NOT a rejoin-case Remove justified by a verified rejoin intent from that device (3.12.3 step 6; the device rejoins next, 6.3 "Owner signing device rejoin", so memory there would refuse the very rejoin the flow needs); (4) it is NOT an own-user Remove (a device of the committer's own user, e.g. 6.3 handover step 6). Such a user is not re-admitted until a list with a **higher** version includes them, and a visible marker is shown (9.3). Native IGNORES the server's advisory `removed_reasons` (6.1) for this decision in S1: it decides from the commit it verified and the list it holds (fail closed: no server hint widens or narrows it). A `revoked` hint earns no exemption and no memory of its own: native records nothing on the strength of "revoked" until S2 adds a signed revocation (S1 native never stages a revoked-only Remove; `e2ee_text_remove` drops `revoked_devices`, W3 D26). This replaces the W0 wording "any Remove of a user still on the list", which contradicted 6.3 (an owner-device rejoin Remove would have barred the owner's own device from re-admission). **Server half (W2 audit C1, #179):** a server-forced release does not edit the signed list, so the newest list can still name the removed user; the DS now refuses a NEW list that still names a user whose seat the server released (`SeatListNamesRemovedUsers`, 4.3 step 4b), so the owner's own client cannot re-seat them silently either. The owner first lands a list without them; seating them again is a later growth add, whose native dialog is the owner's explicit decision. Native's memory rule is unchanged: such a later list has a higher version and names the user, so it clears the memory |
 | Encrypt | 3.8: refused on any roster member off the newest list or locally removed (`RosterMismatch`), owner pin changed, not seated, Update ceiling |
 | Decrypt | 3.9 |
 | Call commands | `mls_call_*` / `e2ee_call_*` refuse text group ids (`WrongGroupKind`); text commands refuse call ids |
@@ -2248,6 +2407,29 @@ delete, and again after it. `Member::remove`, in order:
    user's live socket from the server's channels and threads, and no retry path would ever
    send it later (a retried kick fails the member lookup);
 6. then the second release's error, if any, is returned (500, never "removed").
+   **(W2 audit C3, #181)** It is now handed back as a distinguishable outcome:
+   `Member::remove_with_outcome` returns `Ok(RemovalOutcome::Removed)` or
+   `Ok(RemovalOutcome::ReleasePending(error))` (the membership is gone and
+   `ServerMemberLeave` went out, but the second release failed), and `Err` only for a
+   removal that did not go through (steps 1 to 3). `Member::remove` keeps its signature
+   (`remove_with_outcome(..).await?.into_result()`).
+
+**Callers' follow-ups (W2 audit C3, #181).** Before, a failed second release returned
+through the caller's `?`, after the membership was gone, so the caller skipped its own
+follow-ups for good (a retry fails the member lookup). Now each caller runs them first:
+
+- **kick** (`member_remove.rs`): `remove_with_outcome(..).await?` (a FIRST-release, thread
+  or soft-delete failure still returns at once: the kick did not happen, nothing to record),
+  then the audit entry, then the eviction from every call in the server, then
+  `removal.into_result()?`;
+- **leave** (`server_delete.rs`): the same, with the eviction (whose own failure is
+  reported and never fails the leave) before the kept error is returned;
+- **ban** (`ban_create.rs`): see "Ban order" below; it also keeps a FIRST-release error,
+  because the ban is already durable.
+
+An eviction error in a kick answers that error, and the kept release error is then not in
+the response (it was the second release's; the seat shows to the owner as
+`seated_without_access`, and a ban or a rejoin releases it).
 
 Consequences, stated so W3 and operators do not misread them:
 
@@ -2270,26 +2452,53 @@ Consequences, stated so W3 and operators do not misread them:
   precedes the eviction and the purge, so neither failing can skip it. An "already banned"
   retry answers success at step 2 and re-runs steps 3 to 6, which is how a failed release,
   eviction or purge is completed.
+  **Amended by the W2 audit C3 (#181).** Step 3's removal error (first release, thread
+  loop, soft delete, or `ReleasePending`) and step 4's release error are KEPT
+  (`let removed = ...; let released = ...;`), not returned. The order is now: (1) rank
+  check; (2) ban persisted; (3) removal, error kept; then the audit entry for a ban this
+  request created, whatever the removal answered; (4) the unconditional release, error
+  kept; (5) the eviction (`?`: an eviction error answers first, ahead of the kept ones);
+  then `removed?; released?;`; (6) the purge. So a failed
+  removal or release no longer skips the audit record or the eviction; it still skips the
+  purge until the "already banned" retry, which records no second entry. Upstream's
+  source-text pins in `ban_create.rs` and `member_remove.rs` were amended minimally to
+  match (the REMOVE needle is now the `remove_with_outcome(..)` call; the release is
+  `let released = ...;`).
 - **A thread-loop failure** (step 2, after the first release landed) leaves the member in
   place but UNSEATED: the seats are released and the pending removals added, the membership
   and the remaining thread rows are kept, and the route answers 5xx. That fails closed (the
   user can no longer send or be added), and a retry is idempotent: the first release finds
   nothing left to release, and the loop resumes on the thread rows that remain (W2a audit,
   #155).
-- **A persistent FIRST-release failure** (for example an undecodable seat row) makes the
-  member unkickable and unbannable: a ban is persisted but the membership is kept. The
-  operator repair is to fix or delete the corrupt seat row, then retry the kick or ban.
-  **(#155)** It blocks JOINS too: `Member::create` runs the same release first (below), so a
-  corrupt seat row of a user also makes that user's joins of the server fail until the same
-  repair. A corrupt ENTITLEMENT row of another channel no longer blocks any of these: the
-  release scoped to a server reads only the channel ids of that server's entitlements (a
-  `{ channel_id: 1 }` projection), never decoding whole entitlement rows (WA#6).
+- **A persistent FIRST-release failure** makes the member unkickable and unbannable: a ban
+  is persisted but the membership is kept (since #181 the ban's audit entry is recorded
+  and the eviction runs anyway). The operator repair is to fix or delete the corrupt row,
+  then retry the kick or ban. **(#155)** It blocks JOINS too: `Member::create` runs the same
+  release first (below), so the same repair is needed before that user can join. A corrupt
+  ENTITLEMENT row of another channel no longer blocks any of these: the release scoped to a
+  server reads only the channel ids of that server's entitlements (a `{ channel_id: 1 }`
+  projection), never decoding whole entitlement rows (WA#6).
+  **Narrowed by the W2 audit C9 (#180).** The W2 text named "an undecodable seat row" as
+  the example; that is STALE. The release no longer decodes seat or group documents
+  either: Mongo reads only `channel_id` through a projection for each filter (active seats
+  of the user; open Text groups holding a device of the user with no pending removal for
+  them yet) and writes each with one `update_many` on the same filter, in the same
+  snapshot. A seat or group row carrying an unknown or malformed field (a corrupt
+  `seated_at`, say) now releases normally. What still fails the release, closed, is a
+  matching row whose `channel_id` is not a string (the release can never act on fewer
+  rows than match) or a database error.
 - **Rejoin.** `Member::create` releases first
   (`release_channel_seats_for_user(user, Some(server), now)`, error returned) BEFORE it
   inserts the membership: a non-member never legitimately holds a seat. Without it, a rejoin
   by invite after a failed second release would quietly hand decryption access back and
   erase the owner's `seated_without_access` signal. A re-invited member is therefore not
   re-seated until the owner re-seats them (confirmed by the user, 2026-10-04).
+  **"Re-seats them" means an explicit growth add (W2 audit C1, #179).** The W2 audit found
+  the gap in that rule: the release kept the user on the signed list, so the owner's NEXT
+  list for any reason (adding Carol) reactivated the rejoined user's seat with no dialog
+  naming them. The DS now refuses such a list (`SeatListNamesRemovedUsers`, 4.3 step 4b);
+  the owner lands a list without the removed user first, and seating them again is a
+  separate growth add (4.9).
 - `User::delete` releases before `clear_memberships`. No feature flag gates any removal
   path (7.1). **(#155)** crond's account deletion (`delete_accounts`) isolates each
   account's error (logged and reported to Sentry with ids only; the account is retried on
@@ -2300,6 +2509,17 @@ Consequences, stated so W3 and operators do not misread them:
   skipped, NOT marked deleted, stays due and is retried from the start next run (every step
   is safe to re-run; a user left partly deleted is finished then); the accounts after it
   still go ahead.
+  **(W2 audit C6, C11; #181)** `User::delete` now runs a SECOND release right after
+  `clear_memberships` (decision-11 symmetry with `Member::remove`: a seat PUT that landed
+  between the first release and `clear_memberships` could have seated the user again). It
+  fails closed: the deletion stops with the memberships gone, the account is not marked
+  deleted, and crond's next run releases first again. Unlike `Member::remove`'s, its error
+  is returned at once (`clear_memberships` sends no leave event that must go out first).
+  crond's Sentry report of a skipped account (`capture_message`) now carries the account id
+  and the failing step in its message (crond has no Sentry scope API of its own; ids only,
+  no account content), so each failing account is its own issue. The hourly retry never
+  escalates: an account that keeps failing reports once an hour, indefinitely, with no
+  attempt cap and no alert beyond that event; an operator watching Sentry is the backstop.
 
 The owner is never a server-forced-removal target (W0-fix4 correction; the round-3 "owner
 account deletion" exception is deleted because it cannot happen). The owner cannot be kicked
@@ -2586,7 +2806,9 @@ not the channel topic.
 `ResponseChannelSeats` (below). Validation 4.3. Errors: `NotOwner`, `FeatureDisabled` (adds
 with the flag off), `SeatCapReached { max }`, `FailedValidation` (body, version, cap,
 signature), `IsBot`, `InvalidOperation` (staff), `NotAuthenticated` (session not bound to the
-signer device).
+signer device), and (W2 audit C1, #179) `SeatListNamesRemovedUsers { users }` (400): the
+list still names users the server removed since the stored list (4.3 step 4b). Protect
+never answers it.
 **Seating eligibility errors (DECISION (W2), #136, #155).** On the seat PUT and on protect's
 genesis list, a listed user who does not exist, is not a server member, or (newly claimed
 only) lacks ViewChannel is refused with `FailedValidation`, the same answer the driver gives
@@ -2782,17 +3004,40 @@ Server checks, in this one order (the same order 7.1 states):
   `validate_protected_send`, re-exported from the crate root), shared by the route and the
   `create_from_api_with_id` defense in depth (2.6).
 - A send into a thread whose parent is protected is refused. No such thread can exist
-  (2.5 "Race closure", #143), so this is defense in depth.
+  (2.5 "Race closure", #143), so this is defense in depth. **(#182)** Exactly: one can exist
+  only when `create_thread`'s clean-up delete fails twice (2.5 "Clean-up retry"); the
+  database floor then judges its inserts by the parent (2.6).
 
 The server never verifies `sig` (it cannot rebuild the payload: `ts` and `replies` are inside
 the ciphertext).
 
 ### 7.4 Routes that refuse on protected channels (`ChannelProtected`)
 
+**A thread is judged by its parent (W2 audit B1 (b), #182).** Every route in this list that
+can be reached in a thread judges the PERMISSION TARGET's flag (`channel.is_protected() ||
+permission_channel.is_protected()`, where `permission_channel` is the thread's parent), so
+a thread left under a protected parent (2.5 "Clean-up retry") takes no plaintext and leaks
+none. This covers the forward source and destination, the four interaction paths (slash
+create, autocomplete, `message_interact`, interaction responses, through
+`ensure_interactions_allowed_in(&channel, &permission_channel)`), the two modal routes
+(below), pin and unpin system messages, events import and calendar events, scheduled
+messages, roll, poll and softres, and the read paths of 7.5.
+
 - Message edit (all edits, S1).
 - Forward from a protected channel, and forward into one.
-- Crosspost from or to a protected channel.
-- Scheduled messages (create).
+- Crosspost from or to a protected channel. **Follows are not reaped (W2 audit B4,
+  #184):** a crosspost from an announcement channel SKIPS a follower channel that is
+  protected (logged with ids only) and delivers to the others; the follow and its webhook
+  are KEPT, unlike a dead target's, which is reaped. A follow created before the target was
+  protected therefore stays listed and is skipped on every crosspost; `follow_create`
+  refuses a new one (below). Accepted: the follow carries no plaintext, and reaping it
+  would be a silent change to the follower's settings.
+- Scheduled messages (create). **Placement (W2 audit B9, #184):** the refusal runs after
+  the route's permission checks, `SendMessage` and then the payload-specific ones
+  (`Masquerade`, `ManageRole` for a colour, `SendEmbeds`, `UploadFiles`, the interactions
+  validation), and before the nonce and attachment claims and the insert. Those checks
+  depend only on the caller's permissions and the payload, never on the `protected` flag,
+  so their answers leak nothing about protection (decision 18 holds).
   **Delivery fails closed too (W2 lane B30, #175).** A row scheduled BEFORE the channel was
   protected (or into a thread whose parent was protected since) carries a plaintext
   payload. crond's `scheduled_messages` delivery refuses it: after the author's
@@ -2804,6 +3049,8 @@ the ciphertext).
   and its attachments are released; nothing is inserted or broadcast. The database floor
   would refuse the insert anyway, but only after the attachments were repointed, and it
   reads only the thread, never its parent (open W2 audit item: the floor's thread gap).
+  **(#182)** The floor's thread gap is closed: the floor now judges a thread by its parent
+  (2.6, W2 audit B1).
 - Webhooks: create on, and execute into, a protected channel (including the GitHub
   execute route); (W2) editing a webhook's message in one (`webhook_edit_message.rs`): a
   webhook created before protect survives it, and its edit would otherwise broadcast
@@ -2815,12 +3062,33 @@ the ciphertext).
 - System messages: none are written into a protected channel (join/leave/pin/rename notices
   are suppressed, not errors). **DECISION (W0):** pin and unpin themselves stay allowed; only
   their system message is suppressed. **DECISION (W2), #146:** pin and unpin on a protected
-  channel suppress the system message and never fail on its account.
+  channel suppress the system message and never fail on its account. **Strays stay
+  pinnable (W2 audit B7, #184):** pin and unpin read the row through the driver, which does
+  not filter, so a stray plaintext row (R15) can be pinned or unpinned; no system message
+  is written (the channel, or a thread's parent, is protected, or the row carries
+  `encrypted`), and the pinned listing still drops the stray (it reads through
+  `fetch_with_users`, 7.5). Accepted: pinning a stray reveals nothing and the row stays
+  deletable.
 - `thread_create.rs`, `follow_create.rs`.
 - (The W0 line "Forum posts (if the target is protected)" is removed in W2, #147: only a
   server `TextChannel` can be protected (2.1), so a forum is never protected, and a thread
-  can never exist under a protected parent (2.5 "Race closure").)
-- Voice join, and any edit adding `voice` or the announcement flag.
+  can never exist under a protected parent (2.5 "Race closure").) **(#182)** Except after a
+  twice-failed clean-up delete (2.5 "Clean-up retry"); every route then judges it by its
+  parent (above).
+- (W2 audit B2, #183) Calendar events: creating an event attached to a protected channel
+  (or to a thread under one), and moving an event to one, are refused `ChannelProtected`,
+  after `require_event_channel_view` (decision 18: a caller who cannot view the channel
+  gets the pre-W2 answer). An event's name and description are plaintext the server would
+  show in the channel. Events import refuses a protected target the same way.
+- Voice join, and any edit adding `voice` or the announcement flag. **Voice join's answers
+  (W2 audit B6, #184):** the route now checks `Connect` BEFORE it reads the voice shape,
+  then refuses a protected channel by name (`ChannelProtected`), then answers
+  `NotAVoiceChannel` for any other channel without voice. Upstream answered
+  `NotAVoiceChannel` before `Connect`, so two answers changed: a protected channel (which
+  never carries voice) answers `ChannelProtected` instead of `NotAVoiceChannel` to a caller
+  with `Connect`; and a caller WITHOUT `Connect` on any non-voice channel now gets
+  `MissingPermission` instead of `NotAVoiceChannel`, so a caller who cannot connect learns
+  nothing of the channel's shape. Both refuse before any tear-down, mint or record.
 - `Channel::update` with `protected: Some(false)`.
 - **Server ownership transfer** (**DECISION (W0-fix)**): every path that changes
   `Server.owner` (`DataEditServer.owner` in `server_edit.rs`, and the privileged/staff
@@ -2832,7 +3100,13 @@ the ciphertext).
   **DECISION (W2), #144:** `server_edit` refuses a CHANGED `owner` with `ChannelProtected`
   while any channel of the server is protected. It checks each of the server's channel ids
   and tolerates a dangling id (a missing channel is not protected). Its race with protect
-  is residual R16.
+  is residual R16. **(W2 audit C4, #180)** The ids checked are the UNION of
+  `server.channels` and the channel ids of the server's entitlements, so a protected
+  channel missing from `server.channels` still blocks the transfer; a failure to list the
+  entitlements is returned (never "none protected"). **(W2 audit B5, #184)** The
+  `X-MFA-Ticket` request guard claims (burns) the ticket before the route body runs, so a
+  transfer refused with `ChannelProtected` costs the caller that ticket, exactly as a
+  `NotOwner` refusal always has. Accepted: the ticket is single-use by design.
 - Search: protected messages are never indexed; a search scoped to a protected channel
   returns no results.
 
@@ -2853,6 +3127,10 @@ pre-W2 error and learns nothing about a hidden channel's protected status.
   `interactions/modal_submit.rs` call `ensure_interactions_allowed` BEFORE their permission
   calculation. Reaching them requires a valid interaction id from that channel, a
   capability only a current or former viewer holds, so their order is left as is.
+  **(#182)** Both now ALSO call `ensure_interactions_allowed_in(&channel,
+  &permission_channel)` right after their `SendMessage` check, so a thread under a
+  protected parent is refused too; that second check follows the permission check, as
+  decision 18 asks.
 
 The kind-dispatch leak of 6.1 (#131) is accepted for authorized viewers only. Since #155
 and #156 the MLS routes enforce that too: for any caller (member, bot, unbound session), a
@@ -2886,6 +3164,15 @@ unknown-group answer (6.1 invariant).
   - The safety-snapshot builder (`SnapshotContent::generate_from_message`, reached from
     `report_content.rs`) filters its context the same way and yields nothing for a
     non-servable REPORTED message; a failed channel read fails closed.
+    **(W2 audit B3 and C10, #183)** A channel (or a thread's parent) that no longer
+    exists (`NotFound`) now gives NO server-side copy, like a stray, and the user's report
+    is still filed without it; before, such a report failed (404). Any other read error
+    still fails closed. A thread is judged by its parent here too (#182).
+    `create_system`'s matching missing-channel skip now has its test.
+  - **A thread is judged by its parent (W2 audit B1 (b), #182):** the single fetch, the
+    history query and the search (pinned listing included) pass `channel.is_protected() ||
+    permission_channel.is_protected()` as `channel_protected`, so a stray in a thread
+    under a protected parent is dropped too.
   - A single fetch of a stray is `NotFound`. A search with a query on a protected channel
     returns nothing; the pinned listing keeps working.
   - The drivers' fetch paths are untouched, so `message_delete` can still find and remove
@@ -2897,6 +3184,15 @@ unknown-group answer (6.1 invariant).
   `TextChannel`, unconditionally (an unprotected channel can still hold an entitlement), as
   the last cascade step before the delete event and the row delete. `Server::delete` loops
   over the server's channel ids.
+  **Amended by the W2 audit C7 and C4 (#180).** `delete_protected_channel_data` now
+  DELETES every Text group row of the channel, open or closed (successors included), with
+  their commits and join intents, instead of closing the open one: the channel goes with
+  the cascade and its Text group ids derive from its id, so nothing would ever read them
+  again. The typed read of those groups is kept on purpose: a Text group that does not
+  decode fails the cascade (and the delete) closed. `Server::delete` loops over the union
+  of `server.channels` and the channel ids of the server's entitlements (R20). A server
+  delete that fails part way is repaired by retrying it (R20, C8). Sweeping expired and
+  released seat rows is a followup (S2/S5 retention).
 - **Events**: **DECISION (W0):** S1 adds no new websocket events. Clients refresh
   `GET .../seats` and `GET .../text_group` on channel open, on every processed commit, on every
   `ProtectedChannelResecuring` error and every 60 s while the channel is open. S2 adds push
@@ -2926,6 +3222,7 @@ unknown-group answer (6.1 invariant).
 | `ChannelProtected` | none | 400 |
 | `ProtectedFieldRefused` | `field: String` | 400 |
 | `DeviceCapReached` (W2, #137) | `max: usize` | 400 |
+| `SeatListNamesRemovedUsers` (W2 audit C1, #179) | `users: Vec<String>` (sorted user ids) | 400 |
 
 `DuplicateNonce` (409, existing, `util/idempotency.rs`) is reused for a protected `cid`
 replay (3.10, #153). `MlsCallFull { max }` (existing) is reused for the Text 100-leaf cap
@@ -3084,7 +3381,7 @@ No variant carries key material (invariant 6). Plan-pinned: `UnknownEpoch`, `Bad
 | `NotOwner` | `channel_id` | seat list sign, handover sign, text group create; `_remove` of a forbidden target; processing a commit that Removes the owner's pinned device by another sender (poisoned path, 3.12.3 step 6) |
 | `SeatListRollback` | `channel_id, have: i64, got: i64` | seat list verify |
 | `SeatListEquivocation` | `channel_id, version: i64` | seat list verify; commit-AD pre-check (nothing decrypted, poisoned path) |
-| `SeatListBehind` | `channel_id, have: i64, need: i64` | `_seat_list_sign` only: the server's current list (passed by the bridge) is not the stored verified one (4.9). W0-fix2 removed its `_process` and `_encrypt` uses |
+| `SeatListBehind` | `channel_id, have: i64, need: i64` | `_seat_list_sign`: the server's current list (passed by the bridge) is not the stored verified one (4.9). W0-fix2 removed its `_process` and `_encrypt` uses. Also `_seat_list_verify` for a list of an older group generation than the held state (W4 plan D24, #185; shield `resecuring`, 9.2; recorded from the W4 plan, not verified in this tree) |
 | `SeatListInvalid` | `channel_id, reason: SeatListRejection` (closed: `malformed`, `wrong_channel`, `unsorted`, `duplicate`, `signer_not_seated`, `signer_mismatch`, `too_many_seats`) | seat list verify; commit-AD pre-check (nothing decrypted, poisoned path). An AD that does not parse at all is `SeatListInvalid { reason: malformed }` (3.12.3 step 2) |
 | `RemovedSender` | `user_id, device_id, epoch` | decrypt step 9 |
 | `Replay` | `cid, first_message_id` | decrypt step 10 |
@@ -3176,8 +3473,9 @@ they produce markers (9.3). First match wins:
 
    These fall through to the following steps.
 7. `native.verdict` in {`no_group`, `joining`, `poisoned`, `no_seat_list`},
-   `serverGroup.pending_removals` non-empty, or `native.epoch` behind
-   `serverGroup.current_epoch`: `resecuring`.
+   `serverGroup.pending_removals` non-empty, `native.epoch` behind
+   `serverGroup.current_epoch`, or (W4 plan D24, #185) `seatListError ==
+   "seat_list_behind"` from `_seat_list_verify`: `resecuring`.
 8. `native.verdict == "ok"`: `protected`.
 9. Anything else: `unverified` (fail closed).
 
@@ -3206,6 +3504,7 @@ re-securing notice; `not_seated` shows "Ask the owner for a seat"; `not_availabl
 | Server | `DuplicateNonce` (409) on a protected send (W2, #153; was `InvalidOperation` before W2) | unchanged | treated as "possibly delivered", whichever path answered (the nonce cache or the durable index): the bridge refetches the channel to confirm, never re-encrypts under a new `cid` and never retries with plaintext (3.10) |
 | Server | `ProtectedFieldRefused { field }` | unchanged | "This message couldn't be sent securely." Never retried, never downgraded to plaintext; reported to Sentry as a client defect |
 | Server | `FeatureDisabled { feature: "protected_channels" }` | unchanged | Owner controls hidden; growth actions: "Protected channels are unavailable right now." |
+| Server | `SeatListNamesRemovedUsers { users }` on `PUT .../seats` (W2 audit C1, #179) | owner seat UI, unchanged shield | "{names} were removed from the server, so they no longer have a seat. Save the member list without them; you can add them back afterwards." The bridge never re-sends those bytes; it re-signs the same next version without the named users (4.9). Re-adding is an ordinary growth add with the native dialog |
 | Native | `UnknownEpoch` (`epoch < oldest_held`) | message marker (gray) | "Sent before this device joined." |
 | Native | `UnknownEpoch` (`epoch > current`) | `resecuring` | catch up commits, retry once; if still unknown, red marker "Couldn't decrypt this message." |
 | Native | `UnknownSender`, `BadSig` (message) | message marker (red) | "Couldn't verify the sender. This message may be forged." |
@@ -3230,7 +3529,8 @@ re-securing notice; `not_seated` shows "Ask the owner for a seat"; `not_availabl
 | Native | `UpdateRequired` | transparent | bridge commits `_update`, retries |
 | Native | `TextGroupFull` | admitting member: none; joiner stays `resecuring` | "This protected channel is full." |
 | Native | `MalformedTextPayload` | message marker (red) | "Unreadable message." |
-| Native | `SeatListBehind` (only from `_seat_list_sign`, W0-fix2) | owner seat UI, unchanged shield | "The member list changed since you last loaded it. Reloading..." The bridge verifies the current `GET .../seats` list and lets the owner redo the change |
+| Native | `SeatListBehind` from `_seat_list_sign` (W0-fix2) | owner seat UI, unchanged shield | "The member list changed since you last loaded it. Reloading..." The bridge verifies the current `GET .../seats` list and lets the owner redo the change |
+| Native | `SeatListBehind` from `_seat_list_verify` (the list is of an older group generation than the held state; W4 plan D24, #185) | `resecuring` (9.1 step 7), never `unverified` | "Re-securing this channel..." The bridge KEEPS its held state (nothing is adopted or wiped) and re-reads `GET .../seats` on its normal refresh (7.5) |
 | Native | `BadSig` / `SeatListInvalid` / `SeatListEquivocation` from the commit-AD pre-check (3.12.3) | `unverified` (9.1 step 3) | "This channel's member list failed verification." Nothing was decrypted; the group takes the successor path |
 | Native | `MlsGroupNotFound` on decrypt (the message names a group this device holds no state for) | message marker (gray) | "Sent with a key this device never had." |
 | Native | `MlsGroupNotFound` on encrypt or state | `resecuring` | the bridge enters the join flow |
@@ -3288,7 +3588,12 @@ string goes through lingui.
   #172): device revocation adds a pending removal, and a signed revocation that native may
   act on (R23; a BETA BLOCKER); a Welcome store and refetch route (7.2); a per-plane
   join-intent context (R21); any use of the advisory `removed_reasons` (6.1); the seat-list
-  body `v:2` (4.1).
+  body `v:2` (4.1). Added in the W2 audit fix round (#177 to #180): binding the 3.1 Text
+  group id derivation to viewer-only material, closing the Call-create oracle (R24; a
+  HOLD on any flag-on, beta included, 1.1); moving the `Active` entitlement predicate into
+  the transactions (R25, with S5); followups: a backfill that marks Text commit rows
+  written before the marker (R22 (a)), and a retention sweep of expired and released seat
+  rows (7.5).
 - **S3:** attachments (persistent ciphertext blobs, storage allowance, large files).
 - **S4:** history sharing (owner setting), the "protected from here" divider, opt-in wipe,
   protecting an existing channel, text tables in key backup.
@@ -4086,9 +4391,14 @@ stand in the plan; #150 onward record lane findings.
      failure makes the member unkickable and unbannable until an operator fixes or deletes
      the corrupt seat row. `Member::create` releases before inserting the membership;
      `User::delete` releases before `clear_memberships`; no flag gates removal (6.3).
+     Amended by #181 (the kept error is `RemovalOutcome::ReleasePending`, callers record
+     and evict first; `User::delete` gains a second release) and #180 (the release decodes
+     no seat or group row, so "corrupt seat row" now means one whose `channel_id` is not a
+     string).
 142. DECISION (W2), decision 12: `Channel::delete` calls `delete_protected_channel_data` for
      every `TextChannel`, unconditionally, as the last cascade before the event and the row
-     delete; `Server::delete` loops over channel ids (7.5).
+     delete; `Server::delete` loops over channel ids (7.5). Amended by #180 (Text group rows
+     deleted, not closed; the server loop covers entitled channels too).
 143. DECISION (W2), decision 13 [A#2, A#3, R#8]: race closure. Protect refuses a channel
      with threads and claims the `servers` document filtered on the owner (`NotOwner`);
      protect and the seat PUT claim each newly claimed or reactivated user's
@@ -4100,7 +4410,8 @@ stand in the plan; #150 onward record lane findings.
 144. DECISION (W2), decision 14 [A#10]: `server_edit` refuses a changed `owner` with
      `ChannelProtected` while any channel of the server is protected (per channel id,
      tolerating a dangling id). New residual R16 records both race orders with protect; it
-     fails closed and loud (1.3, 6.3, 7.4).
+     fails closed and loud (1.3, 6.3, 7.4). Amended by #180 (the ids include the server's
+     entitled channels) and #184 (the refused transfer burns the MFA ticket).
 145. DECISION (W2), decision 15 [A#1, R#9]: durable `cid` replay refusal. A partial unique
      index `channel_nonce_encrypted_unique` on `messages { channel, nonce }` over rows with
      `encrypted`, folded into the unshipped revision 75 and built from one spec; both
@@ -4109,7 +4420,7 @@ stand in the plan; #150 onward record lane findings.
      collection-wide build and dev databases that ran the pre-renumber revision 73 (2.7,
      3.10).
 146. DECISION (W2), decision 16: pin and unpin on a protected channel suppress the system
-     message and never fail (7.4).
+     message and never fail (7.4). Amended by #184 (a stray stays pinnable).
 147. DECISION (W2), decision 17 [A#18, R#2]: doc fixes. The impossible "Forum posts"
      refusal line is removed; suspension/disabling is residual R17 and the kept seat rows of
      deleted accounts are R18; a 7.1 row records that pruning is unaffected by both flags
@@ -4126,7 +4437,9 @@ stand in the plan; #150 onward record lane findings.
      owner/permission check), so an unauthorized caller gets the pre-W2 error. Accepted
      exemption: `interactions/modal.rs` and `modal_submit.rs` call
      `ensure_interactions_allowed` first (reachable only with a valid interaction id from
-     that channel). #147's leak acceptance is for authorized viewers only (7.4).
+     that channel). #147's leak acceptance is for authorized viewers only (7.4). Amended by
+     #182 (both modal routes also judge a thread's parent, after their `SendMessage`
+     check).
 149. DECISION (W2), decision 19 [R#12, PA#9]: bonfire's reveal of a CACHED hidden channel
      re-reads it through `reveal_channels` (fresh visibility; nothing emitted if hidden
      again or unreadable), so the revealed `ChannelCreate` carries `protected`; protect and
@@ -4276,7 +4589,8 @@ Where this document and the code disagreed, the code was taken as the truth unle
      (both planes' join intents sign the same `acutest:e2ee:mls-join:v1` payload; a
      per-plane context is S2) and R22 (orphan Call commits landing at an evicted id after
      the eviction; they share the Text group's `{group}:{epoch}` id space; open for the W2
-     audit) (1.3, 3.1, 10).
+     audit) (1.3, 3.1, 10). R22 FIXED by #177; the eviction also deletes queued envelopes
+     (#178); the id's publicity is also the R24 oracle (#178).
 169. DECISION (W2c), lane B48 (addendum item 5): advisory `removed_reasons` on Text commit
      rows, `MlsCommitInfo` and envelopes (reason priority `pending_removal` > `off_list` >
      `revoked` > `own_user` > `rejoin`; skip if empty; never on Call; never changes
@@ -4285,7 +4599,8 @@ Where this document and the code disagreed, the code was taken as the truth unle
      `removed_reasons` in S1; "revoked" earns no memory until S2's signed revocation, and S1
      native never stages a revoked-only Remove. Resolves the contradiction with 6.3's owner
      signing device rejoin (6.1, 6.2, 8.1, 10). At base `4206add3` the field is not yet in
-     the code: lane B48 lands it in the same wave.
+     the code: lane B48 lands it in the same wave. Amended by #178 (the reasons are the
+     route-time view, A7).
 170. DECISION (W2c), addendum item 5: 7.2 no longer promises a Welcome refetch. No route
      stores or serves Welcomes; a lost Welcome is R5 and ends in the loud 9.1 step 6d state;
      a Welcome store is S2 (7.2, 10).
@@ -4299,7 +4614,8 @@ Where this document and the code disagreed, the code was taken as the truth unle
      unconditional top-level statement after the ban is persisted, the membership removed
      and the audit entry recorded, and before the call eviction and the purge (6.3 "Ban
      order"); crond's account deletion isolates every step of each account (6.3, extends
-     #155 (c)).
+     #155 (c)). Amended by #181 (the ban keeps its removal and release errors, records,
+     evicts, then returns them).
 174. DECISION (W2c), b6 lane B43 (addendum item 6): the daily crond task
      `prune_mls_text_commits` (0 days = keep forever and the primitive is never called; a
      window past the earliest time prunes nothing; no flag is read; Call commits untouched)
@@ -4307,9 +4623,124 @@ Where this document and the code disagreed, the code was taken as the truth unle
 175. DECISION (W2c), b6 lane B30 (addendum item 6): scheduled-message delivery fails closed
      on a protected channel or a thread under one, after the author re-checks and before
      any attachment, embed or insert work; the row ends `Failed` and its attachments are
-     released (7.4).
+     released (7.4). The floor's thread gap it noted is closed by #182.
 176. W2c index maintenance: #131, #156 and #157 annotated with #158; 1.3 gains R21 to R23;
      10 gains the W2c S2 items.
+
+Added in the W2 audit fix round (doc lane; addendum `protected-channels-w2fix-addendum.md`,
+base `2acdf5f0`; findings A1 to A8, B1 to B9 and C1 to C11 of the W2 wave audit on
+`ab530457..2acdf5f0`, built by lanes F1 to F4). Where this document and the code disagreed,
+the code was taken as the truth.
+
+177. DECISION (W2 fix), lane F1 [A1 (= C2), A3, A5]: R22 is FIXED with a STORAGE-LEVEL Text
+     commit marker, not an `MlsCommit` field (a deviation from the addendum's `kind`
+     field, which would have broken struct literals in other lanes' files): Mongo stamps
+     `kind: "Text"` on the commit document inside the Text commit transaction; Reference
+     keys a Text row `text:{group}:{epoch}`. New trait method
+     `fetch_mls_text_commits_from` (marked rows only) backs the route's step 0 check, its
+     re-read of a `Won` row and the Text commit fetch; the driver's step 0 reads marked rows
+     only. An unmarked row at the id is deleted inside the transaction before the insert,
+     with `AUDIT mls_text_stray_replaced group=<id> epoch=<n>` (ids only; Mongo logs after
+     the commit). Beyond the addendum: Mongo's Call-path `Lost` reads skip Text-marked rows.
+     Residuals (R22 (a), (b)): a Text row written before the marker (dev only) reads as
+     unmarked (never served, replaced on landing; backfill = followup); a stray at an epoch
+     never reached lingers until the Text prune. A5: the transaction's cap refusals are the
+     route's types (`MlsCallFull { max: 100 }`, `DeviceCapReached { max }`), not
+     `FailedValidation`. A3: Reference's Call `create_mls_group` refuses an id that already
+     exists (`InvalidOperation`, Mongo's answer) instead of overwriting it. A8: the stale
+     "`location` is part of the body" comments in the MLS routes are fixed (the last one,
+     `text_group.rs`, by the orchestrator); the Text create's entitlement check reads
+     `is_active()` (1.3, 2.5, 3.1, 6.1).
+178. DECISION (W2 fix), audit lens A [A2, A4, A6, A7]: (a) A2 is new residual R24 (a Call
+     create at `text_group_id(X, g)` tells a NON-viewer whether hidden channel X is
+     protected and how many successors it has); the root fix is S2's (bind the 3.1
+     derivation to viewer-only material, e.g. the genesis seat-list hash; it also removes
+     B47 and R22 at the root; native and vectors change, so not S1); new HOLD in 1.1: NO
+     flag-on, beta included, before R24 is fixed. (b) A4 is new residual R25 (the `Active`
+     entitlement predicate is checked in the route only; one racing Add or create can land;
+     S5 moves it into the transactions). (c) A6: the squat eviction also deletes the
+     envelopes queued for the evicted id (both drivers; Reference lock order gains
+     `e2ee_queue`). (d) A7: `removed_reasons` is the submit route's view, advisory only
+     (1.1, 1.3, 2.5 (d), 3.1, 6.1, 10).
+179. DECISION (W2 fix), lane F2 [C1, decision 2]: no silent re-seat of a removed user. A
+     seat PUT whose list names a user (other than the signer) whom the stored list also
+     names and whose seat row is released is refused 400 `SeatListNamesRemovedUsers {
+     users }` (new `ErrorType`, sorted ids, all status-mapping files), writing and claiming
+     nothing. No `release_reason` field was added (deviation from the addendum): every list
+     write reconciles the seat rows to the list, so such a row can only have been released
+     by the server-forced primitive. Checked by the driver's planner after 4.3 step 4 (N3
+     and the byte-identical re-PUT still answer success) and before 5b, the growth flag
+     and the claims; and first by the route's validator, after its retry return and before
+     the step 5 eligibility rules (so a user who has not rejoined gets the same answer).
+     A voluntary leave and rejoin is refused the same way (fail closed); the owner's own
+     unseat and a later re-add is not; the signer is never reported; protect never answers
+     it. W3 (`_seat_list_sign`) and W4 MUST map it: never re-send the refused bytes;
+     re-sign the same next version without those users; re-add only through the growth
+     dialog; the frontend `ErrorType` cast (4.3, 4.9, 6.2, 6.3, 7.2, 7.6, 9.2).
+180. DECISION (W2 fix), lane F2 [C4, C7, C8, C9]: (a) C4: `Server::delete` and the
+     ownership-transfer refusal walk the union of `server.channels` and the channel ids of
+     the server's entitlements (`fetch_entitled_channel_ids`, a projection); R20's orphan
+     case is closed for every channel protect can flag. (b) C7: the delete cascade deletes
+     every Text group row of the channel, open or closed, with its commits and join intents
+     (expired and released seat sweeps are a followup). (c) C8: a server delete that fails
+     part way leaves the cleaned channels protected with no entitlement, list or group
+     (fail closed); retry the delete (R20). (d) C9: the seat release reads only
+     `channel_id` through projections and writes with `update_many`, so a seat or group row
+     with an undecodable field still releases; 6.3's "undecodable seat row blocks kicks,
+     bans and joins" is stale and replaced (a row whose `channel_id` is not a string still
+     fails closed) (1.3, 6.3, 7.4, 7.5).
+181. DECISION (W2 fix), lane F3 [C3, C5, C6, C11]: (a) C3: `Member::remove_with_outcome`
+     returns `RemovalOutcome::{Removed, ReleasePending(error)}` (`remove` keeps its
+     signature); the kick records its audit entry and evicts, and the leave evicts, BEFORE
+     either returns a kept release error, while a first-release failure on kick or leave
+     still returns at once (nothing happened); the ban keeps any removal or release
+     error, records its audit entry once, evicts, then returns them and skips the purge
+     until the retry. Upstream's source-text
+     pins in `ban_create.rs` and `member_remove.rs` amended minimally. (b) C5: a database at
+     revision 74 without `server_audit_log` panics loudly before revision 75, naming the
+     dev-database trap and the fix (reset to 72). (c) C6: `User::delete` runs a second
+     release after `clear_memberships`, fail closed. (d) C11: crond's Sentry report of a
+     skipped account carries the account id and the step; the hourly retry never escalates
+     (2.7, 6.3).
+182. DECISION (W2 fix), lane F4 [B1, B8]: a thread is judged by its parent everywhere. (a)
+     The DB floor `validate_protected_insert(channel, parent)`: a Thread is judged on its
+     parent's flag (no parent read: refuse; parent `NotFound`: unprotected; any other read
+     error: refuse; Reference under the `channels` lock, Mongo a parent fetch). (b) Every
+     route judges the permission target: forward (source and destination), the four
+     interaction paths (`ensure_interactions_allowed_in`), the two modal routes (added by
+     the orchestrator after their `SendMessage` check), pin and unpin system messages,
+     events import, calendar events, scheduled messages, roll, poll, softres, and the
+     fetch, query and search reads plus the safety snapshot. (c) `create_thread`'s
+     clean-up after a refused hold is `delete_refused_thread`: Sentry (ids only) on every
+     failure and one retry; if both fail it returns the delete error and the row stays,
+     the only way such a thread can exist. B8: stale `location` comments fixed (2.5, 2.6,
+     7.3, 7.4, 7.5).
+183. DECISION (W2 fix), lane F4 [B2, B3, C10]: (a) B2: creating a calendar event on a
+     protected channel (or a thread under one) and moving an event to one are refused
+     `ChannelProtected`, after `require_event_channel_view` (decision 18). (b) B3 and C10:
+     a report of a message whose channel (or thread parent) is gone files WITHOUT the
+     server-side copy (it failed with 404 before); other read errors fail closed;
+     `create_system`'s missing-channel skip gains its test (7.4, 7.5).
+184. DECISION (W2 fix), audit lens B, documented behavior [B4, B5, B6, B7, B9]: (a) B4: a
+     crosspost skips a protected follower but never reaps the follow or its webhook. (b)
+     B5: a transfer refused with `ChannelProtected` burns the MFA ticket (the request
+     guard claims it), as `NotOwner` always did. (c) B6: voice join checks `Connect` before
+     reading the voice shape, then answers `ChannelProtected` for a protected channel, then
+     `NotAVoiceChannel`; a caller without `Connect` on a non-voice channel now gets
+     `MissingPermission` (upstream answered `NotAVoiceChannel` first). (d) B7: a stray
+     stays pinnable and unpinnable, with no system message; the pinned listing drops it.
+     (e) B9: the scheduled-message refusal follows the payload permission checks
+     (masquerade, colour, embeds, files, interactions), which do not depend on the flag
+     (7.4).
+185. DECISION (W2 fix), from W4 (2026-10-24, plan D24): `_seat_list_verify` can answer
+     `SeatListBehind` (a list of an older group generation than the held state); the
+     bridge keeps its held state and the shield is `resecuring` (9.1 step 7 and a new 9.2
+     row), never `unverified`. 4.9's and 8.4's "`_seat_list_sign` only" wording is
+     corrected. Recorded from the W4 plan; the native side is W3's and is not verified in
+     this tree (4.9, 8.4, 9.1, 9.2).
+186. W2 fix-round index maintenance: #141, #142, #144, #146, #148, #168, #169, #173 and
+     #175 annotated in place; 1.1 gains the R24 HOLD; 1.3 gains R24 and R25, R20 is
+     narrowed and R22 marked fixed; 10 gains the fix-round S2 items.
 
 ---
 

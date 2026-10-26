@@ -1,5 +1,5 @@
 use revolt_models::v0::{MessageSort, ReportedMessageSnapshot};
-use revolt_result::Result;
+use revolt_result::{ErrorType, Result};
 
 use crate::{Database, Message, MessageFilter, MessageQuery, MessageTimePeriod, Server, User};
 
@@ -60,6 +60,14 @@ fn retain_servable(messages: &mut Vec<Message>, channel_protected: bool) {
     });
 }
 
+/// The protected flag a row of `channel_id` is judged by: the channel's own,
+/// or for a thread its parent's (the permission target). `NotFound` when
+/// either is missing; any other read error as is.
+async fn message_channel_protected(db: &Database, channel_id: &str) -> Result<bool> {
+    let channel = db.fetch_channel(channel_id).await?;
+    Ok(channel.permission_target(db).await?.is_protected())
+}
+
 /// Report a row left out of a safety snapshot (ids only)
 fn report_dropped_row(message: &Message) {
     revolt_config::capture_message(
@@ -78,8 +86,10 @@ impl SnapshotContent {
     /// both context lists (R15 backstop, design 7.5), and a reported message
     /// without `encrypted` gives `None`, so no snapshot embeds a stray
     /// plaintext row and none of its attachments are returned. Ciphertext
-    /// rows are kept as stored. A failed channel read is an error, never a
-    /// snapshot with unfiltered rows.
+    /// rows are kept as stored. A thread's rows are judged by its parent. A
+    /// channel (or thread parent) that no longer exists gives `None` too;
+    /// any other failed channel read is an error, never a snapshot with
+    /// unfiltered rows.
     pub async fn generate_from_message(
         db: &Database,
         message: Message,
@@ -118,8 +128,15 @@ impl SnapshotContent {
 
         // Read the flag after every row it judges (the reported message was
         // read by the caller): protect is one-way, so a row read while the
-        // channel was already protected is judged as protected
-        let channel_protected = db.fetch_channel(&message.channel).await?.is_protected();
+        // channel was already protected is judged as protected. A thread is
+        // judged by its parent (W2 audit B1). A channel (or a thread's
+        // parent) that no longer exists gives no server copy, like a stray
+        // (W2 audit B3): the report is still filed without it.
+        let channel_protected = match message_channel_protected(db, &message.channel).await {
+            Ok(protected) => protected,
+            Err(error) if matches!(error.error_type, ErrorType::NotFound) => return Ok(None),
+            Err(error) => return Err(error),
+        };
         if !message.is_servable(channel_protected) {
             report_dropped_row(&message);
             return Ok(None);
@@ -187,7 +204,6 @@ impl SnapshotContent {
 #[cfg(test)]
 mod tests {
     use iso8601_timestamp::Timestamp;
-    use revolt_result::ErrorType;
 
     use crate::{Channel, Database, DmGuard, EncryptedPayload, Message, SnapshotContent, User};
 
@@ -424,7 +440,9 @@ mod tests {
     /// cannot call a row read under protection unprotected; read first, a
     /// protect landing in between would let a stray into the snapshot. No
     /// fault injection can land a protect between two awaits, hence source
-    /// order.
+    /// order. (W2 audit B1/B3: the read moved into
+    /// `message_channel_protected`, which also reads a thread's parent, and
+    /// its `NotFound` now gives `None`; the order pinned here is unchanged.)
     #[test]
     fn channel_flag_is_read_after_the_rows_it_judges() {
         let source = include_str!("model.rs");
@@ -443,9 +461,10 @@ mod tests {
             .collect();
         assert_eq!(fetches.len(), 2, "two context fetches");
         let flag = body
-            .find("db.fetch_channel(&message.channel).await?.is_protected();")
-            .expect("the flag read, failing closed");
-        assert_eq!(body.matches(".fetch_channel(").count(), 1);
+            .find("let channel_protected = match message_channel_protected(db, &message.channel).await {")
+            .expect("the flag read");
+        assert_eq!(body.matches("message_channel_protected(").count(), 1);
+        assert_eq!(body.matches(".fetch_channel(").count(), 0);
         let judged = [
             "if !message.is_servable(channel_protected) {",
             "retain_servable(&mut prior_context, channel_protected);",
@@ -463,25 +482,90 @@ mod tests {
         );
     }
 
-    /// A failed channel read fails closed: an error, never a snapshot with
-    /// unfiltered rows. (An undecodable channel row cannot stand in for a
-    /// database error here: debug builds unwrap inside `query!`.)
+    /// W2 audit B3: a message whose channel no longer exists gives no
+    /// server copy (`None`, as a stray does) instead of failing the report;
+    /// so does a thread whose parent is gone. This used to be an error
+    /// (`NotFound`), which failed the whole user report. Any other failed
+    /// channel read is still an error; an undecodable channel row cannot
+    /// stand in for one here (debug builds unwrap inside `query!`).
+    ///
+    /// Control: the `NotFound` arm removed (the `2acdf5f0` read with `?`) →
+    /// `generate_from_message` errors.
     #[tokio::test]
-    async fn failed_channel_read_is_an_error() {
+    async fn missing_channel_gives_no_snapshot() {
         database_test!(|db| async move {
             for id in [PRIOR_STRAY, REPORTED, LEADING_STRAY] {
                 insert_raw(&db, &plaintext_row(id, MISSING_CHANNEL)).await;
             }
-
-            let reported = db.fetch_message(REPORTED).await.expect("reported row");
-            let error = SnapshotContent::generate_from_message(&db, reported)
+            db.insert_channel(&thread(PARENTLESS_THREAD, MISSING_CHANNEL))
                 .await
-                .expect_err("no channel, no snapshot");
-            assert!(
-                matches!(error.error_type, ErrorType::NotFound),
-                "expected NotFound, got {:?}",
-                error.error_type
-            );
+                .expect("thread");
+            insert_raw(&db, &plaintext_row(THREAD_ROW, PARENTLESS_THREAD)).await;
+
+            for id in [REPORTED, THREAD_ROW] {
+                let reported = db.fetch_message(id).await.expect("reported row");
+                let snapshot = SnapshotContent::generate_from_message(&db, reported)
+                    .await
+                    .unwrap_or_else(|error| panic!("{id}: not an error: {error:?}"));
+                assert!(snapshot.is_none(), "{id}: no channel, no server copy");
+            }
         });
+    }
+
+    /// W2 audit B1: a thread's rows are judged by its parent, so a thread
+    /// left under a protected parent snapshots no plaintext row; a thread
+    /// under an open parent keeps its rows (positive control)
+    ///
+    /// Control: the flag read on the thread itself (no `permission_target`)
+    /// → the orphan's stray is snapshotted.
+    #[tokio::test]
+    async fn thread_rows_are_judged_by_the_parent() {
+        database_test!(|db| async move {
+            db.insert_channel(&text_channel(PROTECTED_CHANNEL, true))
+                .await
+                .expect("protected parent");
+            db.insert_channel(&text_channel(OPEN_CHANNEL, false))
+                .await
+                .expect("open parent");
+            db.insert_channel(&thread(ORPHAN_THREAD, PROTECTED_CHANNEL))
+                .await
+                .expect("orphan thread");
+            db.insert_channel(&thread(OPEN_THREAD, OPEN_CHANNEL))
+                .await
+                .expect("open thread");
+
+            insert_raw(&db, &plaintext_row(THREAD_ROW, ORPHAN_THREAD)).await;
+            let stray = db.fetch_message(THREAD_ROW).await.expect("raw stray row");
+            let snapshot = SnapshotContent::generate_from_message(&db, stray)
+                .await
+                .expect("a stray is not an error");
+            assert!(snapshot.is_none(), "no snapshot embeds the orphan's stray");
+
+            let open_row = plaintext_row(OPEN_THREAD_ROW, OPEN_THREAD);
+            db.insert_message(&open_row).await.expect("plaintext row");
+            let (snapshot, _) = SnapshotContent::generate_from_message(&db, open_row)
+                .await
+                .expect("snapshot")
+                .expect("an open parent serves the thread's rows");
+            assert_eq!(snapshot_ids(&snapshot).0, OPEN_THREAD_ROW);
+        });
+    }
+
+    const ORPHAN_THREAD: &str = "01JB0SNAPTHREAD00000000000";
+    const OPEN_THREAD: &str = "01JB0SNAPTHREAD00000000001";
+    const PARENTLESS_THREAD: &str = "01JB0SNAPTHREAD00000000002";
+    const THREAD_ROW: &str = "01JB0000000000000000000010";
+    const OPEN_THREAD_ROW: &str = "01JB0000000000000000000011";
+
+    fn thread(id: &str, parent: &str) -> Channel {
+        serde_json::from_value(serde_json::json!({
+            "channel_type": "Thread",
+            "_id": id,
+            "server": SERVER,
+            "parent_channel": parent,
+            "name": "thread",
+            "creator": AUTHOR,
+        }))
+        .expect("thread")
     }
 }

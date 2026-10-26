@@ -562,6 +562,113 @@ mod test {
         assert!(!world.is_seated(&world.newcomer).await);
     }
 
+    /// C1 (W2 audit; decision 2, confirmed by the user 2026-10-04: a removed
+    /// or re-invited member is not re-seated until the owner re-seats them).
+    /// The member is kicked (the real `Member::remove`) and rejoins by
+    /// invite; the blind member LEAVES of their own accord and does not come
+    /// back. The owner's client still lists both, so its next list (adding
+    /// the newcomer) is refused 400 `SeatListNamesRemovedUsers` with both ids
+    /// and nothing is written: the rejoined member is answered by the driver
+    /// as well, the one who has not rejoined by the validator ahead of its
+    /// membership rule (else a bare `FailedValidation`). The list without
+    /// them lands; a later list naming the member again seats them, as an
+    /// ordinary claim. Control: the check removed from the validator and the
+    /// planner (the first list lands and seats the kicked member again).
+    #[test]
+    fn a_list_still_naming_a_removed_member_is_refused() {
+        crate::util::test::rt().block_on(Box::pin(
+            a_list_still_naming_a_removed_member_is_refused_case(),
+        ))
+    }
+
+    async fn a_list_still_naming_a_removed_member_is_refused_case() {
+        let world = Box::pin(world()).await;
+        let db = &world.harness.db;
+
+        db.fetch_member(&world.server.id, &world.member.id)
+            .await
+            .expect("the member")
+            .remove(db, &world.server, RemovalIntention::Kick, true)
+            .await
+            .expect("the kick");
+        world
+            .harness
+            .join_server(&world.server, &world.member)
+            .await;
+        db.fetch_member(&world.server.id, &world.blind.id)
+            .await
+            .expect("the blind member")
+            .remove(db, &world.server, RemovalIntention::Leave, true)
+            .await
+            .expect("the leave");
+        assert!(db
+            .fetch_member(&world.server.id, &world.member.id)
+            .await
+            .is_ok());
+        assert!(db
+            .fetch_member(&world.server.id, &world.blind.id)
+            .await
+            .is_err());
+
+        let stale = world.growth();
+        let answer = put(
+            &world.harness,
+            &world.owner_session,
+            world.channel.id(),
+            &stale,
+        )
+        .await;
+        assert_eq!(answer.0, Status::BadRequest, "{:?}", answer);
+        let mut removed = vec![world.member.id.clone(), world.blind.id.clone()];
+        removed.sort();
+        assert_eq!(
+            body(&answer),
+            serde_json::json!({ "type": "SeatListNamesRemovedUsers", "users": removed }),
+            "{:?}",
+            answer
+        );
+        assert_eq!(world.stored().await.version, 1);
+        assert!(!world.is_seated(&world.newcomer).await);
+        assert!(!world.is_seated(&world.member).await);
+
+        // The rejoined member alone, through the driver as well
+        let rejoined = world.list(2, &[&world.owner.id, &world.member.id, &world.newcomer.id]);
+        let answer = put(
+            &world.harness,
+            &world.owner_session,
+            world.channel.id(),
+            &rejoined,
+        )
+        .await;
+        let value = assert_error(&answer, "SeatListNamesRemovedUsers", "rejoined member");
+        assert_eq!(value["users"], serde_json::json!([world.member.id]));
+        assert!(!world.is_seated(&world.member).await);
+
+        // The list without them lands
+        let without = world.list(2, &[&world.owner.id, &world.newcomer.id]);
+        let answer = put(
+            &world.harness,
+            &world.owner_session,
+            world.channel.id(),
+            &without,
+        )
+        .await;
+        assert_ok(&answer, "list without the removed members");
+        assert!(world.is_seated(&world.newcomer).await);
+
+        // Then the rejoined member is seated again as an ordinary claim
+        let again = world.list(3, &[&world.owner.id, &world.member.id, &world.newcomer.id]);
+        let answer = put(
+            &world.harness,
+            &world.owner_session,
+            world.channel.id(),
+            &again,
+        )
+        .await;
+        assert_ok(&answer, "re-seat after a list without them");
+        assert!(world.is_seated(&world.member).await);
+    }
+
     /// Design 7.1: with E2EE off the seat PUT is refused for the owner too,
     /// before the list is looked at
     #[test]

@@ -56,8 +56,9 @@ pub async fn interaction_create(
     // A protected channel carries only ciphertext: no bot may be addressed
     // there. Refused after the permission check (a caller who cannot send
     // here learns nothing about the flag) and before slowmode, the
-    // interaction insert and the event to the bot.
-    crate::util::interactions::ensure_interactions_allowed(&channel)?;
+    // interaction insert and the event to the bot. A thread is judged by
+    // its parent too (W2 audit B1).
+    crate::util::interactions::ensure_interactions_allowed_in(&channel, &permission_channel)?;
 
     // Archived or locked threads reject invocations exactly like messages.
     crate::util::threads::ensure_thread_writable(&channel, &permissions)?;
@@ -584,5 +585,88 @@ mod test {
         );
         assert_eq!(on_protected.0, on_open.0);
         assert_eq!(on_protected.1, on_open.1);
+    }
+
+    /// A thread under `parent`, stored directly: under a protected parent it
+    /// stands for the thread `create_thread` leaves behind when its delete
+    /// after a refused hold fails (W2 audit B1)
+    async fn thread_under(harness: &TestHarness, parent: &Channel, creator: &str) -> Channel {
+        let thread = Channel::Thread {
+            id: ulid::Ulid::new().to_string(),
+            server: parent.server().expect("a server channel").to_string(),
+            parent_channel: parent.id().to_string(),
+            name: "Thread".to_string(),
+            creator: creator.to_string(),
+            origin_message_id: None,
+            last_message_id: None,
+            archived: false,
+            archived_timestamp: None,
+            auto_archive_minutes: 0,
+            locked: false,
+            applied_tags: vec![],
+        };
+        harness.db.insert_channel(&thread).await.expect("thread");
+        thread
+    }
+
+    /// W2 audit B1: a thread is judged by its parent. An invocation in a
+    /// thread under a protected parent is refused with `ChannelProtected`
+    /// and never reaches the bot; the same invocation in a thread under an
+    /// open parent does (positive control and event marker).
+    ///
+    /// Control: the `2acdf5f0` helper call (the thread judged alone) → the
+    /// invocation in the orphan reaches the bot.
+    #[test]
+    fn invoke_in_a_thread_under_a_protected_parent_is_refused() {
+        crate::util::test::rt()
+            .block_on(invoke_in_a_thread_under_a_protected_parent_is_refused_case())
+    }
+
+    async fn invoke_in_a_thread_under_a_protected_parent_is_refused_case() {
+        let mut harness = TestHarness::new().await;
+        let (_, session, user) = harness.new_user().await;
+        let protected = harness.new_protected_channel(&user, &session, &[]).await;
+        let orphan = thread_under(&harness, &protected.channel, &user.id).await;
+        let open = harness.new_channel(&protected.server).await;
+        let open_thread = thread_under(&harness, &open, &user.id).await;
+
+        let (bot, _) = Bot::create(&harness.db, TestHarness::rand_string(), &user, None)
+            .await
+            .expect("`Bot`");
+        let bot_user = harness.db.fetch_user(&bot.id).await.expect("bot user");
+        harness.join_server(&protected.server, &bot_user).await;
+        let command = register_command(
+            &harness,
+            &session.token,
+            &bot.id,
+            json!({ "name": "ping", "description": "Ping" }),
+        )
+        .await;
+
+        let (_, presence_session) = revolt_presence::create_session(&bot.id, 0).await;
+        let refused = invoke(&harness, &session.token, orphan.id(), &command.id).await;
+        let allowed = invoke(&harness, &session.token, open_thread.id(), &command.id).await;
+        revolt_presence::delete_session(&bot.id, presence_session).await;
+
+        assert_eq!(refused.0, Status::BadRequest, "body: {}", refused.1);
+        assert_eq!(refused.1["type"], "ChannelProtected");
+        assert_eq!(allowed.0, Status::Ok, "body: {}", allowed.1);
+        let allowed_id = allowed.1["interaction_id"]
+            .as_str()
+            .expect("interaction id")
+            .to_string();
+
+        let bot_topic = format!("{}!", bot.id);
+        harness
+            .wait_for_event(&bot_topic, |event| match event {
+                EventV1::InteractionCreate { interaction } => interaction.id == allowed_id,
+                _ => false,
+            })
+            .await;
+        let orphan_id = orphan.id().to_string();
+        harness.assert_no_buffered_event(&bot_topic, |event| match event {
+            EventV1::InteractionCreate { interaction } => interaction.channel_id == orphan_id,
+            _ => false,
+        });
     }
 }

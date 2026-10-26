@@ -3,8 +3,8 @@ use revolt_database::{
     is_valid_device_id, is_valid_group_id,
     util::reference::Reference,
     voice::{get_voice_state, UserVoiceChannel},
-    Channel, ChannelEntitlementState, Database, MlsGroup, MlsGroupCreateOutcome, MlsGroupKind,
-    MlsMemberDevice, Session, User, MAX_TEXT_GROUP_GENERATION,
+    Channel, Database, MlsGroup, MlsGroupCreateOutcome, MlsGroupKind, MlsMemberDevice, Session,
+    User, MAX_TEXT_GROUP_GENERATION,
 };
 use revolt_models::v0;
 use revolt_result::{create_error, ErrorType, Result};
@@ -193,7 +193,7 @@ async fn create_text_group(
         return Err(create_error!(InvalidOperation));
     }
     match db.fetch_channel_entitlement(channel.id()).await? {
-        Some(entitlement) if entitlement.state == ChannelEntitlementState::Active => {}
+        Some(entitlement) if entitlement.is_active() => {}
         _ => return Err(create_error!(InvalidOperation)),
     }
     super::require_seated(db, channel.id(), &user.id).await?;
@@ -279,8 +279,8 @@ async fn viewable_channel(db: &Database, user: &User, channel_id: &str) -> Optio
 
 /// The answer a Text create gets for a channel the caller cannot view or
 /// that does not exist: the shared caller checks, then `NotFound`, from this
-/// one site, so the two cases carry the same body, `location` included,
-/// for every caller class and under every flag
+/// one site, so the two cases give the same answer (status and body; the
+/// body carries no `location`) for every caller class and under every flag
 async fn as_missing_channel<T>(db: &Database, user: &User, session: &Session) -> Result<T> {
     super::require_mls_caller(db, user, Some(session)).await?;
     Err(create_error!(NotFound))
@@ -1316,7 +1316,7 @@ mod tests {
     /// Decisions 1, 17 and 18 (W2): for every caller class, a Text create
     /// naming a channel the caller cannot view (protected or not) or one
     /// that does not exist (deleted or never created) gets ONE answer, the
-    /// same body (`location` included) and status, for a valid and a
+    /// same body (which carries no `location`) and status, for a valid and a
     /// malformed request, under every flag set
     async fn hidden_and_missing_channels_answer_alike() {
         let config = revolt_config::config().await;

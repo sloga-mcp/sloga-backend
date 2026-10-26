@@ -1471,7 +1471,9 @@ impl User {
     /// - releases the user's seat in every protected channel (and queues
     ///   their removal from each open Text group) BEFORE clearing their
     ///   server memberships; a failed release aborts the deletion with the
-    ///   memberships intact
+    ///   memberships intact. A second release after the memberships are
+    ///   cleared catches a seat granted in between; its failure aborts the
+    ///   deletion too
     /// - clears relationships
     pub async fn delete(&mut self, db: &Database) -> Result<()> {
         for bot in db.fetch_bots_by_user(&self.id).await? {
@@ -1493,6 +1495,15 @@ impl User {
         db.release_channel_seats_for_user(&self.id, None, Timestamp::now_utc())
             .await?;
         db.clear_memberships(&self.id).await?;
+        // Second release, as `Member::remove` runs one (decision 11 (W2),
+        // audit C6): a seat PUT that landed between the first release and
+        // `clear_memberships` could have seated the user again. It fails
+        // closed: the deletion stops with the memberships gone, the account
+        // is not marked deleted, and the retry (crond's next run) releases
+        // first again. Unlike `Member::remove`'s, its error is not kept:
+        // `clear_memberships` sends no leave event that has to go out first.
+        db.release_channel_seats_for_user(&self.id, None, Timestamp::now_utc())
+            .await?;
         // Calendar cascade (slice F): `clear_memberships` bypasses `Member::remove`,
         // so the per-server RSVP cascade never runs — drop every RSVP row the account
         // holds, or attendee lists would keep a ghost user id forever.
@@ -2457,6 +2468,107 @@ mod tests {
             assert!(seats
                 .iter()
                 .any(|seat| seat.user_id == SEATED && seat.is_active()));
+        });
+    }
+
+    /// The SECOND release, after `clear_memberships` (decision 11 (W2)
+    /// symmetry, audit C6), fails closed: with the first release's group
+    /// claim let through and the next one refused, the deletion answers the
+    /// release's error with the memberships already cleared (so the failing
+    /// release is the one AFTER them) and the seat released by the first.
+    /// Once the claim goes through again, a retried deletion succeeds.
+    /// Mongo only: the reference store cannot fail a write. Mutations: the
+    /// second release dropped or its error dropped (the first deletion
+    /// succeeds); both releases before `clear_memberships` (the memberships
+    /// survive the error).
+    #[cfg(feature = "mongodb")]
+    #[tokio::test]
+    async fn delete_fails_closed_when_the_second_seat_release_fails() {
+        use protected::{CHANNEL, SEATED};
+
+        database_test!(|db| async move {
+            let crate::Database::MongoDb(mongo) = &db else {
+                return;
+            };
+            use bson::{doc, Document};
+            use revolt_result::ErrorType;
+
+            const GROUP: &str = "01C6DELETEGROUP";
+
+            let mut user = protected::seated_user(&db).await;
+
+            let device = crate::MlsMemberDevice {
+                user_id: SEATED.to_string(),
+                device_id: "01C6DEVICE".to_string(),
+            };
+            mongo
+                .col::<crate::MlsGroup>("mls_groups")
+                .insert_one(&crate::MlsGroup {
+                    id: GROUP.to_string(),
+                    channel_id: CHANNEL.to_string(),
+                    open: true,
+                    created_by: device.clone(),
+                    created_at: iso8601_timestamp::Timestamp::now_utc(),
+                    current_epoch: 0,
+                    members: vec![device],
+                    closed_at: None,
+                    superseded_by: None,
+                    kind: crate::MlsGroupKind::Text,
+                    generation: Some(0),
+                    seat_list_ad_sha256: None,
+                    pending_removals: vec![],
+                    member_added: vec![],
+                })
+                .await
+                .unwrap();
+
+            // Every release opens by claiming the open Text groups the user
+            // is in (`$inc` of `txn_serial`); this validator lets the first
+            // claim through and refuses the second
+            let validator = |validator: Document| {
+                doc! {
+                    "collMod": "mls_groups",
+                    "validator": validator,
+                    "validationLevel": "strict",
+                    "validationAction": "error",
+                }
+            };
+            mongo
+                .db()
+                .run_command(validator(doc! { "$or": [
+                    { "txn_serial": { "$exists": false } },
+                    { "txn_serial": { "$lte": 1_i64 } },
+                ] }))
+                .await
+                .unwrap();
+
+            let err = user
+                .delete(&db)
+                .await
+                .expect_err("a failed second release must fail the deletion");
+            assert!(
+                matches!(
+                    &err.error_type,
+                    ErrorType::DatabaseError { collection, .. } if collection == "mls_groups"
+                ),
+                "{err:?}"
+            );
+            assert!(
+                db.fetch_all_memberships(SEATED).await.unwrap().is_empty(),
+                "the failing release must be the one after `clear_memberships`"
+            );
+            let seats = db.fetch_channel_seats(CHANNEL).await.unwrap();
+            assert!(
+                seats
+                    .iter()
+                    .any(|seat| seat.user_id == SEATED && !seat.is_active()),
+                "the first release reached the seat: {seats:?}"
+            );
+
+            mongo.db().run_command(validator(doc! {})).await.unwrap();
+            user.delete(&db)
+                .await
+                .expect("the retried deletion succeeds");
         });
     }
 }

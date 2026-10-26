@@ -6,7 +6,7 @@ use revolt_database::{
     },
     voice::{remove_user_from_server_voice, VoiceClient},
     AuditLogAction, AuditLogChange, AuditLogDraft, AuditLogEntry, AuditValue, Database, Message,
-    RemovalIntention, ServerBan, User,
+    RemovalIntention, RemovalOutcome, ServerBan, User,
 };
 use revolt_models::v0;
 use std::time::{Duration, SystemTime};
@@ -70,12 +70,14 @@ pub async fn ban(
     // 4. The target's seats in the server's protected channels are released,
     //    member or not (protected channels 6.3).
     // 5. The target is evicted from every call in the server, member or not.
+    //    A failed removal or release (step 3 or 4) is answered only now, so
+    //    it skips neither the record nor the eviction (audit C3).
     // 6. Their recent messages are deleted, if asked.
     //
-    // A retried ban re-runs steps 3 to 6, which is how an eviction or a
-    // release that failed is completed: step 2 answers "already banned" as a
-    // success for that. The retry writes no second audit entry: only a ban
-    // this request created is recorded.
+    // A retried ban re-runs steps 3 to 6, which is how an eviction, a
+    // removal or a release that failed is completed: step 2 answers "already
+    // banned" as a success for that. The retry writes no second audit entry:
+    // only a ban this request created is recorded.
     let member = match target.as_member(db, &server.id).await {
         Ok(member) => Some(member),
         Err(error) if !matches!(error.error_type, ErrorType::NotFound) => return Err(error),
@@ -125,15 +127,22 @@ pub async fn ban(
         Err(error) => return Err(error),
     };
 
-    if let Some(member) = member {
-        member
-            .remove(db, &server, RemovalIntention::Ban, false)
-            .await?;
-    }
+    // Kept, not returned yet (protected channels 6.3, audit C3): the ban is
+    // durable, so a removal that failed, at its first seat release or at
+    // its second, must not skip the audit record (the retry sees no new ban
+    // and could never write it) or the eviction. It is answered after both.
+    let removed = match member {
+        Some(member) => member
+            .remove_with_outcome(db, &server, RemovalIntention::Ban, false)
+            .await
+            .and_then(RemovalOutcome::into_result),
+        None => Ok(()),
+    };
 
-    // After the ban is durable and the member removed, before the eviction,
-    // whose error is answered with the ban already standing. The purge
-    // window is recorded only when a purge was asked for.
+    // After the ban is durable and the member removed (or the removal's
+    // error kept), before the eviction, whose error is answered with the ban
+    // already standing. The purge window is recorded only when a purge was
+    // asked for.
     if newly_banned {
         AuditLogEntry::record(
             db,
@@ -169,15 +178,23 @@ pub async fn ban(
     // repair), and an "already banned" retry runs it again. It follows the
     // audit record, so a failed release cannot lose the entry (the retry
     // sees no new ban). It precedes the eviction and the purge, so neither
-    // failing can skip it. Scoped by the server's entitlements, never by
-    // `server.channels`.
-    db.release_channel_seats_for_user(target.id, Some(&server.id), Timestamp::now_utc())
-        .await?;
+    // failing can skip it. Its error is kept, like the removal's, so it
+    // cannot skip the eviction either (audit C3). Scoped by the server's
+    // entitlements, never by `server.channels`.
+    let released = db
+        .release_channel_seats_for_user(target.id, Some(&server.id), Timestamp::now_utc())
+        .await;
 
     // Outside the member check (S-3 F-4): a hit-and-run spammer who already
     // left can still hold a connection. Every call in the server is reached,
     // not only the one the per-server pointer names (S-3 F-3).
     remove_user_from_server_voice(db, voice_client, &server, target.id).await?;
+
+    // The kept errors, the removal's first: the ban is durable, recorded
+    // and the target evicted. The retry ("already banned") completes the
+    // removal, the release and the purge.
+    removed?;
+    released?;
 
     // We do this outside the member check so we can sweep hit-and-run spammers who already left.
     if let Some(seconds) = data.delete_message_seconds {
@@ -194,7 +211,7 @@ pub async fn ban(
 }
 
 #[cfg(test)]
-mod test {
+pub(crate) mod test {
     use crate::util::test::TestHarness;
     use iso8601_timestamp::Timestamp;
     use revolt_database::{
@@ -206,7 +223,7 @@ mod test {
             UserVoiceChannel,
         },
         AuditLogAction, AuditLogChange, AuditLogEntry, AuditValue, Channel, ChannelSeat, Database,
-        Member, Message, PartialMember, Server,
+        Member, Message, MlsGroup, MlsGroupKind, MlsMemberDevice, MongoDb, PartialMember, Server,
     };
     use revolt_models::v0;
     use revolt_permissions::{ChannelPermission, OverrideField};
@@ -1484,13 +1501,13 @@ mod test {
             .block_on(a_failed_release_answers_an_error_after_the_ban_and_its_record_case())
     }
 
-    /// A release that fails (an undecodable seat row) answers an error with
+    /// A release that fails (its seat write refused) answers an error with
     /// the ban durable and its audit entry written: the release follows the
     /// record, so the retry, which sees no new ban, does not have to write
-    /// it. Once the row is repaired the retry releases and records nothing
-    /// more. The target was never a member, so the ban's own release is the
-    /// only one. MONGODB only: the reference store cannot hold an undecodable
-    /// row. Mutations: the release moved above the audit record; the
+    /// it. Once the write goes through again the retry releases and records
+    /// nothing more. The target was never a member, so the ban's own release
+    /// is the only one. MONGODB only: the reference store cannot fail a
+    /// write. Mutations: the release moved above the audit record; the
     /// release's error dropped.
     async fn a_failed_release_answers_an_error_after_the_ban_and_its_record_case() {
         use revolt_database::mongodb::bson::{doc, Document};
@@ -1504,25 +1521,31 @@ mod test {
         let (server, channel) = harness.new_protectable_channel(&owner).await;
         harness.grant_entitlement(&channel, 10, None).await;
 
-        // `seated_at` is not a timestamp, so every read of the row fails
-        let seat_id = ChannelSeat::composite_id(channel.id(), &target.id);
+        // An active seat whose release is refused: a collection validator
+        // admits no `channel_seats` row with `released_at` set. (An
+        // undecodable row no longer fails a release: since C9 the release
+        // projects and `update_many`s, decoding no row.)
+        seat_raw(&harness.db, channel.id(), &target.id).await;
+        let seat_validator = |validator: Document| {
+            doc! {
+                "collMod": "channel_seats",
+                "validator": validator,
+                "validationLevel": "strict",
+                "validationAction": "error",
+            }
+        };
         mongo
-            .col::<Document>("channel_seats")
-            .insert_one(doc! {
-                "_id": &seat_id,
-                "channel_id": channel.id(),
-                "user_id": &target.id,
-                "seated_at": true,
-            })
+            .db()
+            .run_command(seat_validator(doc! { "released_at": null }))
             .await
-            .expect("the corrupt seat row");
+            .expect("the seat validator");
         assert!(
             harness
                 .db
                 .release_channel_seats_for_user(&target.id, Some(&server.id), Timestamp::now_utc())
                 .await
                 .is_err(),
-            "precondition: the corrupt row fails a release"
+            "precondition: the refused seat write fails a release"
         );
 
         let response = ban_user(
@@ -1550,13 +1573,13 @@ mod test {
             Some("corrupt")
         );
 
-        // The operator repair (6.3): the row fixed, then the ban retried
+        // The fault cleared (the operator repair of 6.3), then the ban
+        // retried
         mongo
-            .col::<Document>("channel_seats")
-            .delete_one(doc! { "_id": &seat_id })
+            .db()
+            .run_command(seat_validator(doc! {}))
             .await
-            .expect("the corrupt row deleted");
-        seat_raw(&harness.db, channel.id(), &target.id).await;
+            .expect("the seat validator lifted");
 
         let response = ban_user(&harness, &session_a.token, &server.id, &target.id, "repair").await;
         ban_answered(response, "the retry after the repair").await;
@@ -1569,6 +1592,198 @@ mod test {
             entries.len(),
             1,
             "the retry after the repair records no second ban: {entries:?}"
+        );
+    }
+
+    // ---- protected channels: a removal whose seat release fails (C3) -------
+    //
+    // A fault in the seat rows (a refused seat write) fails the FIRST
+    // release of a removal, before the membership goes. These two helpers
+    // fail a LATER one: every seat release opens by claiming the open Text groups the
+    // user is in (`$inc` of `txn_serial`), and a collection validator on
+    // `mls_groups` refuses that claim once it is armed. Shared with the
+    // kick and leave tests (`member_remove.rs`, `server_delete.rs`).
+
+    /// An open Text group `group_id` in `channel_id` with one device of each
+    /// of `user_ids` as members, written straight to the store
+    pub(crate) async fn text_group_raw(
+        mongo: &MongoDb,
+        group_id: &str,
+        channel_id: &str,
+        user_ids: &[&str],
+    ) {
+        let device = |user_id: &str| MlsMemberDevice {
+            user_id: user_id.to_string(),
+            device_id: format!("{user_id}DEV"),
+        };
+        let group = MlsGroup {
+            id: group_id.to_string(),
+            channel_id: channel_id.to_string(),
+            open: true,
+            created_by: device(user_ids[0]),
+            created_at: Timestamp::now_utc(),
+            current_epoch: 0,
+            members: user_ids.iter().map(|user_id| device(user_id)).collect(),
+            closed_at: None,
+            superseded_by: None,
+            kind: MlsGroupKind::Text,
+            generation: Some(0),
+            seat_list_ad_sha256: None,
+            pending_removals: vec![],
+            member_added: vec![],
+        };
+        mongo
+            .col::<MlsGroup>("mls_groups")
+            .insert_one(&group)
+            .await
+            .expect("raw text group");
+    }
+
+    /// From here on the NEXT claim of `group_id` goes through and the one
+    /// after it fails: the validator refuses a `txn_serial` past its current
+    /// value plus one. A failed claim is rolled back with its transaction,
+    /// so this arms it again for the next pair; `{}` lifts it.
+    pub(crate) async fn fail_the_claim_after_next(mongo: &MongoDb, group_id: &str) {
+        use revolt_database::mongodb::bson::{doc, Document};
+
+        let serial = mongo
+            .col::<Document>("mls_groups")
+            .find_one(doc! { "_id": group_id })
+            .await
+            .expect("the group read")
+            .expect("the group")
+            .get_i64("txn_serial")
+            .unwrap_or(0);
+        set_group_validator(
+            mongo,
+            doc! { "$or": [
+                { "txn_serial": { "$exists": false } },
+                { "txn_serial": { "$lte": serial + 1 } },
+            ] },
+        )
+        .await;
+    }
+
+    pub(crate) async fn set_group_validator(
+        mongo: &MongoDb,
+        validator: revolt_database::mongodb::bson::Document,
+    ) {
+        use revolt_database::mongodb::bson::doc;
+
+        mongo
+            .db()
+            .run_command(doc! {
+                "collMod": "mls_groups",
+                "validator": validator,
+                "validationLevel": "strict",
+                "validationAction": "error",
+            })
+            .await
+            .expect("collMod mls_groups");
+    }
+
+    // Compile-only without RabbitMQ and Redis: see the section note above.
+    #[test]
+    fn a_failed_removal_release_still_records_and_evicts_then_fails_the_ban() {
+        crate::util::test::rt()
+            .block_on(a_failed_removal_release_still_records_and_evicts_then_fails_the_ban_case())
+    }
+
+    /// A member is banned and the removal's second seat release fails (and
+    /// so does the ban's own release, the claim staying refused): the ban
+    /// is durable, so its `member_ban_add` entry is written and the target
+    /// torn down from the server's calls, THEN the error is answered (500).
+    /// Before audit C3 the removal's error returned first, and the entry
+    /// was lost for good: the retry sees "already banned". Once the claim
+    /// goes through again the retry answers the ban, releases, and records
+    /// nothing more. MONGODB only. Control: the route's
+    /// `.remove(..).await?` of 2acdf5f0 (no entry, no eviction).
+    async fn a_failed_removal_release_still_records_and_evicts_then_fails_the_ban_case() {
+        use revolt_database::mongodb::bson::doc;
+
+        const GROUP: &str = "01C3BANGROUP";
+
+        let harness = TestHarness::new().await;
+        let Database::MongoDb(mongo) = &harness.db else {
+            return;
+        };
+        let (_a, session_a, owner) = harness.new_user().await;
+        let (_b, _session_b, target) = harness.new_user().await;
+        let protected = harness
+            .new_protected_channel(&owner, &session_a, &[&target])
+            .await;
+        let server_id = protected.server.id.clone();
+        text_group_raw(
+            mongo,
+            GROUP,
+            protected.channel.id(),
+            &[&owner.id, &target.id],
+        )
+        .await;
+
+        let channel = voice_channel(&harness, &protected.server, "Ended").await;
+        let uvc = UserVoiceChannel::from_channel(&channel);
+        join_recorded(&uvc, &target.id, "PA_ban_c3", &target.id).await;
+        assert_ghost_present(&uvc, &target.id, 1).await;
+
+        fail_the_claim_after_next(mongo, GROUP).await;
+        let response = ban_user(&harness, &session_a.token, &server_id, &target.id, "c3").await;
+        let status = response.status();
+        let body = response.into_string().await.unwrap_or_default();
+        let (recorded, listed, member, pointer) = voice_traces(&uvc, &target.id).await;
+        delete_channel_voice_state(&uvc, &[target.id.clone()])
+            .await
+            .expect("cleanup");
+
+        assert_eq!(
+            status,
+            Status::InternalServerError,
+            "the failed release is answered: {body}"
+        );
+        assert!(body.contains("DatabaseError"), "{}", body);
+        assert!(
+            harness.db.fetch_ban(&server_id, &target.id).await.is_ok(),
+            "the ban is durable"
+        );
+        assert!(
+            recorded.is_empty() && !listed && !member && !pointer,
+            "the banned member is evicted before the error is answered, left: recorded {:?}, \
+             vc {}, vc_members {}, pointer {}",
+            recorded,
+            listed,
+            member,
+            pointer
+        );
+        assert!(
+            harness
+                .db
+                .fetch_member(&server_id, &target.id)
+                .await
+                .is_err(),
+            "precondition: the removal went through (its second release failed)"
+        );
+        let entries = audit_entries(&harness, &server_id).await;
+        assert_eq!(entries.len(), 1, "the ban is recorded: {entries:?}");
+        assert_eq!(
+            ban_entry(&entries, &owner.id, &target.id).reason.as_deref(),
+            Some("c3")
+        );
+
+        // The claim goes through again: the retry is an ordinary
+        // "already banned" success, and records nothing more
+        set_group_validator(mongo, doc! {}).await;
+        let response = ban_user(&harness, &session_a.token, &server_id, &target.id, "retry").await;
+        let ban = ban_answered(response, "the retry").await;
+        assert_eq!(ban.reason.as_deref(), Some("c3"), "the existing ban");
+        assert_released(
+            &seat_of(&harness.db, protected.channel.id(), &target.id).await,
+            "the banned member's seat",
+        );
+        let entries = audit_entries(&harness, &server_id).await;
+        assert_eq!(
+            entries.len(),
+            1,
+            "the retry records no second ban: {entries:?}"
         );
     }
 
@@ -1619,12 +1834,14 @@ mod test {
     const RANK: &str = "return Err(create_error!(NotElevated));";
     const FETCH: &str = "let ban = match db.fetch_ban(&server.id, target.id).await \u{7b}";
     const CREATE: &str = "ServerBan::create(db, &server, target.id, data.reason).await";
-    const REMOVE: &str = ".remove(db, &server, RemovalIntention::Ban, false) .await?;";
+    const REMOVE: &str = ".remove_with_outcome(db, &server, RemovalIntention::Ban, false) .await \
+         .and_then(RemovalOutcome::into_result),";
     const GUARD: &str = "if newly_banned \u{7b} AuditLogEntry::record(";
-    const RELEASE: &str = "db.release_channel_seats_for_user(target.id, Some(&server.id), \
-         Timestamp::now_utc()) .await?;";
+    const RELEASE: &str = "let released = db .release_channel_seats_for_user(target.id, \
+         Some(&server.id), Timestamp::now_utc()) .await;";
     const EVICT: &str =
         "remove_user_from_server_voice(db, voice_client, &server, target.id).await?;";
+    const KEPT: &str = "removed?; released?;";
     const PURGE: &str = "Message::bulk_delete_by_author_since(";
 
     /// AFK S-3 D-2 / P2-2: rank check, ban persisted, membership removed,
@@ -1632,10 +1849,13 @@ mod test {
     /// delete, in that order, each exactly once, and the single-pointer
     /// removal gone. The release follows the record (a failed release must
     /// not lose the entry: the retry sees no new ban) and precedes the
-    /// eviction and the purge (neither failing may skip it). Mutations: the
-    /// rank check moved below the persist; the persist moved back to the end;
-    /// the eviction moved before the membership removal or removed; the
-    /// release moved above the record, below the purge, or removed.
+    /// eviction and the purge (neither failing may skip it). The removal's
+    /// and the release's errors are kept and answered only after the
+    /// eviction (audit C3), each exactly once. Mutations: the rank check
+    /// moved below the persist; the persist moved back to the end; the
+    /// eviction moved before the membership removal or removed; the release
+    /// moved above the record, below the purge, or removed; a kept error
+    /// answered before the record or the eviction.
     #[test]
     fn the_ban_runs_its_steps_in_order() {
         let body = route_body();
@@ -1644,8 +1864,17 @@ mod test {
             1,
             "the ban releases the target's seats once: {body}"
         );
+        for kept in ["removed?;", "released?;"] {
+            assert_eq!(
+                body.matches(kept).count(),
+                1,
+                "a kept error is answered once, after the eviction (`{kept}`): {body}"
+            );
+        }
         let mut last = 0;
-        for needle in [RANK, FETCH, CREATE, REMOVE, GUARD, RELEASE, EVICT, PURGE] {
+        for needle in [
+            RANK, FETCH, CREATE, REMOVE, GUARD, RELEASE, EVICT, KEPT, PURGE,
+        ] {
             assert_eq!(
                 body.matches(needle).count(),
                 1,

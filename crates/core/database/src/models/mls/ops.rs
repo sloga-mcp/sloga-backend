@@ -162,9 +162,12 @@ pub trait AbstractMls: Sync + Send {
     /// `channel_seat_lists -> channel_seats -> mls_groups -> mls_commits ->
     /// mls_join_intents -> e2ee_identities`). In order:
     ///
-    /// 0. a commit row already at `{group}:{epoch}` returns
+    /// 0. a TEXT-MARKED commit row already at `{group}:{epoch}` returns
     ///    `Lost { winning }` BEFORE any validity check (idempotent
-    ///    resubmit). The route's ACCESS checks must already have run.
+    ///    resubmit). The route's ACCESS checks must already have run. An
+    ///    unmarked row at that id is not this plane's (R22: a Call-plane
+    ///    stray left by a squat at the derived id) and never answers here;
+    ///    see step 3.
     /// 1. read the group (`kind: Text`), the channel's newest seat list,
     ///    the removed devices' stored join intents and E2EE identities;
     /// 2. validity: open; committer is a member (`ProtectedChannelResecuring
@@ -177,7 +180,12 @@ pub trait AbstractMls: Sync + Send {
     ///    write-conflicts) and on the newest seat list; the enforced device
     ///    cap `min(signed, entitlement_device_cap)`; the
     ///    [`MAX_MLS_TEXT_GROUP_MEMBERS`] leaf cap;
-    /// 3. insert the commit row (with `rejoin_intents` filled);
+    /// 3. delete an unmarked row at `{group}:{epoch}` (R22 stray; logged as
+    ///    `AUDIT mls_text_stray_replaced`, ids only), then insert the commit
+    ///    row (with `rejoin_intents` filled) Text-marked. The marker is
+    ///    storage-level, not a field of [`MlsCommit`]: Mongo stores
+    ///    `kind: "Text"` on the document, Reference keys the row under
+    ///    `text:{group}:{epoch}`;
     /// 4. field-level group update filtered on `{ _id, open, kind: Text,
     ///    current_epoch: e - 1, seat_list_ad_sha256: ad_sha256 }`: `$set`
     ///    `current_epoch`, `members`, `member_added`; `$pull` every pending
@@ -204,8 +212,23 @@ pub trait AbstractMls: Sync + Send {
     ) -> Result<MlsCommitOutcome>;
 
     /// Gap refetch: stored winning commits with epoch >= `from_epoch`,
-    /// ascending, bounded by `limit`
+    /// ascending, bounded by `limit`. Every row under the group id, marked
+    /// or not: the CALL plane's read. Text routes use
+    /// [`AbstractMls::fetch_mls_text_commits_from`].
     async fn fetch_mls_commits_from(
+        &self,
+        group_id: &str,
+        from_epoch: i64,
+        limit: i64,
+    ) -> Result<Vec<MlsCommit>>;
+
+    /// Text-group gap refetch and existing-row read (design §2.5 step 0,
+    /// §6.1 "Commit fetch"): as [`AbstractMls::fetch_mls_commits_from`],
+    /// but ONLY rows [`AbstractMls::insert_mls_text_commit`] wrote
+    /// (Text-marked). An unmarked row under a Text group's id (R22: a
+    /// Call-plane stray, or a Text row written before the marker existed)
+    /// is never served.
+    async fn fetch_mls_text_commits_from(
         &self,
         group_id: &str,
         from_epoch: i64,
@@ -461,8 +484,12 @@ pub(crate) fn plan_mls_text_commit(
         .collect();
     members.extend(commit.added.iter().cloned());
 
+    // The same typed errors the submit route answers for the same checks
+    // (A5), so a race that only this re-check catches looks the same
     if members.len() > MAX_MLS_TEXT_GROUP_MEMBERS {
-        return Err(failed("group is at the E2EE roster ceiling"));
+        return Err(create_error!(MlsCallFull {
+            max: MAX_MLS_TEXT_GROUP_MEMBERS
+        }));
     }
 
     // Enforced device cap, for every user this commit adds a device for
@@ -474,7 +501,7 @@ pub(crate) fn plan_mls_text_commit(
                 .filter(|member| member.user_id == added.user_id)
                 .count();
             if devices > cap as usize {
-                return Err(failed("user is at the device cap"));
+                return Err(create_error!(DeviceCapReached { max: cap as usize }));
             }
         }
     }

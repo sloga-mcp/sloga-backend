@@ -69,9 +69,10 @@ impl MongoDb {
             revolt_config::capture_error(&error);
         }
 
-        // Report the protected refusal when that is what happened
+        // Report the protected refusal when that is what happened. Only a
+        // TextChannel is held, so there is no thread parent to read.
         if held.is_ok() {
-            message.validate_protected_insert(self.fetch_channel(&message.channel).await)?;
+            message.validate_protected_insert(self.fetch_channel(&message.channel).await, None)?;
         }
 
         Err(create_database_error!("update_one", COL_CHANNELS))
@@ -179,7 +180,14 @@ impl AbstractMessages for MongoDb {
                 ..
             })
         );
-        message.validate_protected_insert(channel)?;
+        // A thread is judged by its parent (W2 audit B1)
+        let parent = match &channel {
+            Ok(Channel::Thread { parent_channel, .. }) => {
+                Some(self.fetch_channel(parent_channel).await)
+            }
+            _ => None,
+        };
+        message.validate_protected_insert(channel, parent)?;
 
         self.insert_one(COL, &message).await.map_err(|error| {
             if is_protected_nonce_duplicate(&error) {

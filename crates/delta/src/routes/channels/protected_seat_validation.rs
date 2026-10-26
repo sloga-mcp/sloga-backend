@@ -9,14 +9,16 @@
 //! statement itself). The driver re-parses the body and owns step 4 (the
 //! version rule and the byte-identical retry), 5b (signer leaf), 7 (claims,
 //! releases, slot cap, the membership claim of newly claimed users) and the
-//! step 8 append and chain bound.
+//! step 8 append and chain bound. The removed-users refusal (C1,
+//! `SeatListNamesRemovedUsers`) is the driver's, read here first only so a
+//! removed user who has not rejoined gets the same answer.
 
 use std::collections::BTreeSet;
 
 use revolt_database::{
-    is_genesis_reprotect, seat_list_channel_server, util::permissions::perms, Channel, Database,
-    E2EEIdentity, HandoverBody, SeatListBody, SeatListSubmission, SeatListWriteKind, Server,
-    Session, User,
+    is_genesis_reprotect, seat_list_channel_server, seat_list_removed_users,
+    util::permissions::perms, Channel, Database, E2EEIdentity, HandoverBody, SeatListBody,
+    SeatListSubmission, SeatListWriteKind, Server, Session, User,
 };
 use revolt_models::v0;
 use revolt_permissions::{calculate_channel_permissions, ChannelPermission};
@@ -137,11 +139,12 @@ async fn validate(
     // inside its transaction, and a stored version never decreases, so a
     // submission identical to a stored row can only ever be answered
     // `unchanged`, never applied.
-    let retry = match (kind, db.fetch_seat_list(channel.id()).await?) {
+    let stored = db.fetch_seat_list(channel.id()).await?;
+    let retry = match (kind, &stored) {
         (SeatListWriteKind::Put, Some(stored)) => {
             stored.body == submission.body && stored.signature == submission.signature
         }
-        (SeatListWriteKind::Protect, Some(stored)) => is_genesis_reprotect(&submission, &stored),
+        (SeatListWriteKind::Protect, Some(stored)) => is_genesis_reprotect(&submission, stored),
         (_, None) => false,
     };
     if retry {
@@ -150,6 +153,20 @@ async fn validate(
             body,
             retry,
         });
+    }
+
+    // C1 (W2 audit, decision 2): a list still naming a user the server
+    // removed since the stored list is refused before the step 5 rules, so
+    // the owner gets the same typed answer whether that user has rejoined or
+    // not (not rejoined, step 5 would answer a bare `FailedValidation`). The
+    // driver decides it again inside its transaction; this read only picks
+    // the answer. A genesis list has no stored list to check against.
+    if kind == SeatListWriteKind::Put {
+        let seats = db.fetch_channel_seats(channel.id()).await?;
+        let removed = seat_list_removed_users(&body, stored.as_ref(), &seats)?;
+        if !removed.is_empty() {
+            return Err(create_error!(SeatListNamesRemovedUsers { users: removed }));
+        }
     }
 
     // Step 5 and decision 6 (W2)

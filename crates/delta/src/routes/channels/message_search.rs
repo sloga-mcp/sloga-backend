@@ -56,8 +56,10 @@ pub async fn search(
     // Decision 9 (W2): a protected channel holds no text the server can
     // search, so a content search there finds nothing, and answers so
     // without reading a message. The pinned listing below still runs; it
-    // drops any stray plaintext row in `fetch_with_users`.
-    if query.is_some() && channel.is_protected() {
+    // drops any stray plaintext row in `fetch_with_users`. A thread is
+    // judged by its parent (W2 audit B1).
+    let channel_protected = channel.is_protected() || permission_channel.is_protected();
+    if query.is_some() && channel_protected {
         return Ok(Json(no_matches(include_users, channel.server())));
     }
 
@@ -80,7 +82,7 @@ pub async fn search(
         &user,
         include_users,
         channel.server(),
-        channel.is_protected(),
+        channel_protected,
     )
     .await
     .map(Json)
@@ -551,6 +553,66 @@ mod tests {
     fn non_viewers_get_the_same_answer_protected_or_not() {
         crate::util::test::rt().block_on(Box::pin(
             non_viewers_get_the_same_answer_protected_or_not_case(),
+        ))
+    }
+
+    /// W2 audit B1: a thread is judged by its parent. In a thread left
+    /// under a protected parent (stored directly) holding a pinned stray
+    /// that matches the query, a content search answers nothing and the
+    /// pinned listing drops the stray.
+    ///
+    /// Control: the `2acdf5f0` route (the thread's own flag) → the content
+    /// search serves the stray.
+    async fn a_search_in_a_thread_under_a_protected_parent_serves_no_stray_case() {
+        let fixture = Box::pin(fixture()).await;
+        let harness = &fixture.harness;
+        let orphan = Channel::Thread {
+            id: Ulid::new().to_string(),
+            server: fixture.protected.server.id.clone(),
+            parent_channel: fixture.protected.channel.id().to_string(),
+            name: "Thread".to_string(),
+            creator: fixture.owner.id.clone(),
+            origin_message_id: None,
+            last_message_id: None,
+            archived: false,
+            archived_timestamp: None,
+            auto_archive_minutes: 0,
+            locked: false,
+            applied_tags: vec![],
+        };
+        harness.db.insert_channel(&orphan).await.expect("thread");
+        let stray = Message {
+            id: Ulid::new().to_string(),
+            channel: orphan.id().to_string(),
+            author: fixture.owner.id.clone(),
+            content: Some(format!("a thread stray {NEEDLE}")),
+            pinned: Some(true),
+            ..Default::default()
+        };
+        insert_raw(&harness.db, &stray).await;
+        assert_eq!(
+            driver_matches(&harness.db, orphan.id()).await,
+            vec![stray.id.clone()],
+            "the driver itself matches the stray"
+        );
+
+        for options in [json!({ "query": NEEDLE }), json!({ "pinned": true })] {
+            let answer = search(
+                harness,
+                &fixture.owner_session,
+                orphan.id(),
+                options.clone(),
+            )
+            .await;
+            assert_eq!(answer.0, Status::Ok, "{}: {:?}", options, answer);
+            assert_eq!(body(&answer), json!([]), "{}", options);
+        }
+    }
+
+    #[test]
+    fn a_search_in_a_thread_under_a_protected_parent_serves_no_stray() {
+        crate::util::test::rt().block_on(Box::pin(
+            a_search_in_a_thread_under_a_protected_parent_serves_no_stray_case(),
         ))
     }
 }

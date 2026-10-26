@@ -37,9 +37,12 @@ pub async fn fetch(
 
     // A protected channel serves only encrypted rows; a stray plaintext row
     // (R15, decision 9 (W2)) answers exactly as a message from another
-    // channel does, from this one site
+    // channel does, from this one site. A thread is judged by its parent
+    // (W2 audit B1).
     let message = msg.as_message(db).await?;
-    if message.channel != channel.id() || !message.is_servable(channel.is_protected()) {
+    if message.channel != channel.id()
+        || !message.is_servable(channel.is_protected() || permission_channel.is_protected())
+    {
         return Err(create_error!(NotFound));
     }
 
@@ -297,5 +300,51 @@ mod test {
             let answer = get(&harness, &session, channel_id, message_id).await;
             assert_eq!(answer, baseline, "{}", case);
         }
+    }
+
+    /// W2 audit B1: a thread is judged by its parent. A plaintext row in a
+    /// thread left under a protected parent (stored directly, the row
+    /// written before the flag) is served until the parent is protected,
+    /// then answers `NotFound`, byte-identical to a foreign message.
+    ///
+    /// Control: the `2acdf5f0` route (the thread's own flag) → the row is
+    /// still served after the flag.
+    #[test]
+    fn stray_in_a_thread_under_a_protected_parent_is_not_served() {
+        crate::util::test::rt()
+            .block_on(stray_in_a_thread_under_a_protected_parent_is_not_served_case())
+    }
+
+    async fn stray_in_a_thread_under_a_protected_parent_is_not_served_case() {
+        let harness = TestHarness::new().await;
+        let (_, session, author) = harness.new_user().await;
+        let (server, parent) = harness.new_protectable_channel(&author).await;
+        let thread = Channel::Thread {
+            id: Ulid::new().to_string(),
+            server: server.id.clone(),
+            parent_channel: parent.id().to_string(),
+            name: "Thread".to_string(),
+            creator: author.id.clone(),
+            origin_message_id: None,
+            last_message_id: None,
+            archived: false,
+            archived_timestamp: None,
+            auto_archive_minutes: 0,
+            locked: false,
+            applied_tags: vec![],
+        };
+        harness.db.insert_channel(&thread).await.expect("thread");
+        let stray = insert_plaintext(&harness.db, &thread, &author.id).await;
+        let foreign = insert_plaintext(&harness.db, &parent, &author.id).await;
+
+        let before = get(&harness, &session, thread.id(), &stray.id).await;
+        assert_eq!(before.0, Status::Ok, "{:?}", before);
+
+        protect_under_stored_rows(&harness.db, parent.id()).await;
+
+        let stray_answer = get(&harness, &session, thread.id(), &stray.id).await;
+        assert_eq!(stray_answer.0, Status::NotFound, "{:?}", stray_answer);
+        let foreign_answer = get(&harness, &session, thread.id(), &foreign.id).await;
+        assert_eq!(stray_answer, foreign_answer);
     }
 }

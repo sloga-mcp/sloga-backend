@@ -6,7 +6,11 @@
 //!
 //! `channels -> messages -> channel_entitlements -> servers ->
 //!  server_members -> channel_seat_lists -> channel_seats -> mls_groups
-//!  -> mls_commits -> mls_join_intents -> e2ee_identities`
+//!  -> mls_commits -> mls_join_intents -> e2ee_identities -> e2ee_queue`
+//!
+//! `e2ee_queue` is APPENDED (A6, W2 audit: the M9 eviction deletes the
+//! squat's queued envelopes); every other Reference path takes that lock
+//! alone.
 //!
 //! The doc's order starts at `channel_seat_lists`. `channels` (protect sets
 //! the flag atomically with the genesis list, and refuses a channel with
@@ -190,6 +194,16 @@ impl AbstractProtectedChannels for ReferenceDb {
             .values()
             .find(|entitlement| entitlement.channel_id == channel_id)
             .cloned())
+    }
+
+    async fn fetch_entitled_channel_ids(&self, server_id: &str) -> Result<Vec<String>> {
+        let entitlements = self.channel_entitlements.lock().await;
+        let channel_ids: BTreeSet<String> = entitlements
+            .values()
+            .filter(|entitlement| entitlement.server_id == server_id)
+            .map(|entitlement| entitlement.channel_id.clone())
+            .collect();
+        Ok(channel_ids.into_iter().collect())
     }
 
     async fn fetch_channel_seats(&self, channel_id: &str) -> Result<Vec<ChannelSeat>> {
@@ -403,9 +417,11 @@ impl AbstractProtectedChannels for ReferenceDb {
     ) -> Result<MlsGroupCreateOutcome> {
         let seat_lists = self.channel_seat_lists.lock().await;
         let mut groups = self.mls_groups.lock().await;
-        // M9: a Call squat at this id goes with its commits and join intents
+        // M9: a Call squat at this id goes with its commits, join intents
+        // and queued envelopes (A6)
         let mut commits = self.mls_commits.lock().await;
         let mut intents = self.mls_join_intents.lock().await;
+        let mut queue = self.e2ee_queue.lock().await;
 
         let list = seat_lists.get(&group.channel_id).ok_or_else(|| {
             create_error!(FailedValidation {
@@ -446,8 +462,10 @@ impl AbstractProtectedChannels for ReferenceDb {
 
         // A row already at the id: a Call squat at a derived id is evicted
         // (M9, see `is_derived_text_group_id`) with its Call-plane
-        // dependents (the `sweep_mls_groups` cascade; KeyPackages are keyed
-        // by device, not group); any other row is refused as before
+        // dependents (the `sweep_mls_groups` cascade, plus the envelopes
+        // queued for the id (A6), which would otherwise reach the Text
+        // group's members as that group's; KeyPackages are keyed by device,
+        // not group); any other row is refused as before
         let evicted = match groups.get(&prepared.id) {
             None => None,
             Some(taken)
@@ -461,6 +479,7 @@ impl AbstractProtectedChannels for ReferenceDb {
             groups.remove(&prepared.id);
             commits.retain(|_, commit| commit.group_id != prepared.id);
             intents.retain(|_, intent| intent.group_id != prepared.id);
+            queue.retain(|_, envelope| envelope.group_id.as_deref() != Some(prepared.id.as_str()));
         }
 
         if let Some(superseded) = supersedes.and_then(|id| groups.get_mut(id)) {
@@ -547,17 +566,13 @@ impl AbstractProtectedChannels for ReferenceDb {
         seat_lists.remove(channel_id);
         seats.retain(|_, seat| seat.channel_id != channel_id);
 
-        let now = Timestamp::now_utc();
-        let mut text_group_ids = BTreeSet::new();
-        for group in groups.values_mut() {
-            if group.channel_id == channel_id && group.kind == MlsGroupKind::Text {
-                text_group_ids.insert(group.id.clone());
-                if group.open {
-                    group.open = false;
-                    group.closed_at = Some(now);
-                }
-            }
-        }
+        // C7: the Text group rows go too, open or closed
+        let text_group_ids: BTreeSet<String> = groups
+            .values()
+            .filter(|group| group.channel_id == channel_id && group.kind == MlsGroupKind::Text)
+            .map(|group| group.id.clone())
+            .collect();
+        groups.retain(|id, _| !text_group_ids.contains(id));
 
         commits.retain(|_, commit| !text_group_ids.contains(&commit.group_id));
         intents.retain(|_, intent| !text_group_ids.contains(&intent.group_id));

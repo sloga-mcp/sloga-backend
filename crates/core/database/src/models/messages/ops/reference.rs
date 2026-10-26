@@ -1,6 +1,6 @@
 use crate::{
-    AppendMessage, FieldsMessage, Message, MessageQuery, MessageTimePeriod, PartialMessage,
-    ReferenceDb,
+    AppendMessage, Channel, FieldsMessage, Message, MessageQuery, MessageTimePeriod,
+    PartialMessage, ReferenceDb,
 };
 use indexmap::IndexSet;
 use revolt_models::v0::{MessageSort, UNREAD_COUNT_CAP};
@@ -28,12 +28,20 @@ impl AbstractMessages for ReferenceDb {
     /// checked first and stays a `DatabaseError`.
     async fn insert_message(&self, message: &Message) -> Result<()> {
         let channels = self.channels.lock().await;
-        message.validate_protected_insert(
+        let read = |id: &str| {
             channels
-                .get(&message.channel)
+                .get(id)
                 .cloned()
-                .ok_or_else(|| create_error!(NotFound)),
-        )?;
+                .ok_or_else(|| create_error!(NotFound))
+        };
+        let channel = read(&message.channel);
+        // A thread is judged by its parent (W2 audit B1), read under the
+        // same `channels` lock
+        let parent = match &channel {
+            Ok(Channel::Thread { parent_channel, .. }) => Some(read(parent_channel)),
+            _ => None,
+        };
+        message.validate_protected_insert(channel, parent)?;
 
         let mut messages = self.messages.lock().await;
         if messages.contains_key(&message.id) {

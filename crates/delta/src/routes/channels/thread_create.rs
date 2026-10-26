@@ -312,7 +312,7 @@ mod test {
     }
 
     /// Decision 18 (W2): a member who cannot view the channel gets the
-    /// pre-W2 `MissingPermission`, byte-identical (`location` included) for
+    /// pre-W2 `MissingPermission`, byte-identical (type, status, body) for
     /// a protected and an unprotected channel, from both routes.
     ///
     /// Control: the refusal moved above the permission calculation.

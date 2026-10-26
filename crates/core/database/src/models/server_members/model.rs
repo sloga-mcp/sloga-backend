@@ -86,6 +86,31 @@ auto_derived!(
     }
 );
 
+/// What a removal that went through left the caller to answer (protected
+/// channels 6.3, decision 11 (W2))
+#[derive(Debug)]
+#[must_use = "a pending release is an error the caller must return after its own follow-ups"]
+pub enum RemovalOutcome {
+    /// The member is removed and both seat releases succeeded
+    Removed,
+    /// The member is removed (the membership is gone and `ServerMemberLeave`
+    /// went out), but the second seat release failed. The caller still runs
+    /// its own follow-ups (audit entry, voice eviction), then returns this
+    /// error: the removal fails (500, never "removed").
+    ReleasePending(revolt_result::Error),
+}
+
+impl RemovalOutcome {
+    /// `Ok` once removed with every seat released, the kept release error
+    /// otherwise
+    pub fn into_result(self) -> Result<()> {
+        match self {
+            RemovalOutcome::Removed => Ok(()),
+            RemovalOutcome::ReleasePending(error) => Err(error),
+        }
+    }
+}
+
 impl Default for Member {
     fn default() -> Self {
         Self {
@@ -287,6 +312,11 @@ impl Member {
     }
 
     /// Remove member from server
+    ///
+    /// A failed second seat release is returned as the error, once the
+    /// removal is complete. A caller with follow-ups of its own (an audit
+    /// entry, a voice eviction) uses [`Member::remove_with_outcome`] instead,
+    /// so the release error cannot make it skip them.
     pub async fn remove(
         self,
         db: &Database,
@@ -294,6 +324,24 @@ impl Member {
         intention: RemovalIntention,
         silent: bool,
     ) -> Result<()> {
+        self.remove_with_outcome(db, server, intention, silent)
+            .await?
+            .into_result()
+    }
+
+    /// Remove member from server. `Err` means the removal did not happen,
+    /// or stopped part way before the membership was gone (the first seat
+    /// release, the thread cascade or the soft delete failed): a retry runs
+    /// it again. A removal that went through answers
+    /// [`RemovalOutcome::ReleasePending`] when its second seat release
+    /// failed: the caller runs its own follow-ups, then returns that error.
+    pub async fn remove_with_outcome(
+        self,
+        db: &Database,
+        server: &Server,
+        intention: RemovalIntention,
+        silent: bool,
+    ) -> Result<RemovalOutcome> {
         // Protected channels (6.3, decision 11 (W2)), first release: the user's
         // seats in this server's protected channels, plus a pending removal on
         // each open Text group they are in. It runs before every other step, so
@@ -331,7 +379,8 @@ impl Member {
         // membership claim matches nothing). The result is kept, not returned
         // yet: `ServerMemberLeave` below is the only thing that unsubscribes the
         // removed user's live socket, so it must go out once the membership is
-        // gone. The error is returned at the very end.
+        // gone. The error is handed back at the very end, as
+        // `RemovalOutcome::ReleasePending`.
         let released = db
             .release_channel_seats_for_user(
                 &self.id.user,
@@ -395,12 +444,16 @@ impl Member {
         }
 
         // A failed second release fails the removal (500, never "removed"),
-        // though the membership is gone and the leave event went out. The seat
-        // shows to the owner as `seated_without_access`; a ban releases it with
-        // no member needed, and a rejoin releases it first (`Member::create`).
-        released?;
-
-        Ok(())
+        // though the membership is gone and the leave event went out. It is
+        // handed back, not returned, so the caller's own follow-ups (the kick
+        // and ban audit entries, every voice eviction) still run first. The
+        // seat shows to the owner as `seated_without_access`; a ban releases
+        // it with no member needed, and a rejoin releases it first
+        // (`Member::create`).
+        Ok(match released {
+            Ok(_) => RemovalOutcome::Removed,
+            Err(error) => RemovalOutcome::ReleasePending(error),
+        })
     }
 }
 
@@ -414,7 +467,8 @@ mod tests {
 
     use crate::{
         Channel, ChannelEntitlement, ChannelEntitlementSource, ChannelEntitlementState,
-        ChannelSeat, Database, Member, PartialMember, RemovalIntention, Server, User,
+        ChannelSeat, Database, Member, PartialMember, RemovalIntention, RemovalOutcome, Server,
+        User,
     };
 
     #[tokio::test]
@@ -766,11 +820,11 @@ mod tests {
         });
     }
 
-    /// A first release that fails (an undecodable seat row) fails the removal
+    /// A first release that fails (its seat write refused) fails the removal
     /// with no side effect: the membership and the thread rows stay, so no
     /// `ThreadMemberLeave` went out (each one follows a successful thread
-    /// leave). MONGODB only: the reference store cannot hold an undecodable
-    /// row. Mutation: the first release placed after the thread loop.
+    /// leave). MONGODB only: the reference store cannot fail a write.
+    /// Mutation: the first release placed after the thread loop.
     #[cfg(feature = "mongodb")]
     #[tokio::test]
     async fn a_failed_first_release_leaves_the_member_and_thread_rows_intact() {
@@ -813,15 +867,19 @@ mod tests {
                 assert!(db.join_thread_if_absent(thread_id, &user.id).await.unwrap());
             }
 
-            // `seated_at` is not a timestamp, so every read of the row fails
+            // An active seat whose release is refused: a collection
+            // validator admits no `channel_seats` row with `released_at` set.
+            // (An undecodable row no longer fails a release: since C9 the
+            // release projects and `update_many`s, decoding no row.)
             entitle(&db, SEATED_HERE, &server.id).await;
+            seat_raw(&db, SEATED_HERE, &user.id).await;
             mongo
-                .col::<bson::Document>("channel_seats")
-                .insert_one(bson::doc! {
-                    "_id": ChannelSeat::composite_id(SEATED_HERE, &user.id),
-                    "channel_id": SEATED_HERE,
-                    "user_id": &user.id,
-                    "seated_at": true,
+                .db()
+                .run_command(bson::doc! {
+                    "collMod": "channel_seats",
+                    "validator": { "released_at": null },
+                    "validationLevel": "strict",
+                    "validationAction": "error",
                 })
                 .await
                 .unwrap();
@@ -830,7 +888,7 @@ mod tests {
                 .await;
             assert!(
                 precondition.is_err(),
-                "precondition: the corrupt row fails a release"
+                "precondition: the refused seat write fails a release"
             );
 
             let removed = member
@@ -864,14 +922,202 @@ mod tests {
         });
     }
 
-    /// `Member::remove`'s body: comment lines dropped, and whitespace kept
-    /// only between two identifier characters, so the needles below do not
-    /// depend on line breaks or a trailing comma
-    fn remove_body() -> String {
+    /// An open Text group `group_id` in `channel_id` with one device of each
+    /// of `user_ids` as members, written straight to the store
+    #[cfg(feature = "mongodb")]
+    async fn text_group_raw(
+        mongo: &crate::MongoDb,
+        group_id: &str,
+        channel_id: &str,
+        user_ids: &[&str],
+    ) {
+        use crate::{MlsGroup, MlsGroupKind, MlsMemberDevice};
+
+        let device = |user_id: &str| MlsMemberDevice {
+            user_id: user_id.to_string(),
+            device_id: format!("{user_id}DEV"),
+        };
+        let group = MlsGroup {
+            id: group_id.to_string(),
+            channel_id: channel_id.to_string(),
+            open: true,
+            created_by: device(user_ids[0]),
+            created_at: Timestamp::now_utc(),
+            current_epoch: 0,
+            members: user_ids.iter().map(|user_id| device(user_id)).collect(),
+            closed_at: None,
+            superseded_by: None,
+            kind: MlsGroupKind::Text,
+            generation: Some(0),
+            seat_list_ad_sha256: None,
+            pending_removals: vec![],
+            member_added: vec![],
+        };
+        mongo
+            .col::<MlsGroup>("mls_groups")
+            .insert_one(&group)
+            .await
+            .unwrap();
+    }
+
+    /// From here on the NEXT claim of `group_id` goes through and the one
+    /// after it fails. Every seat release opens by claiming the open Text
+    /// groups the user is in (`$inc` of `txn_serial`, protected_channels
+    /// `claim_groups_first`); a collection validator refuses a `txn_serial`
+    /// past its current value plus one, so the claim after next aborts its
+    /// release's transaction. The failed claim is rolled back, so calling
+    /// this again arms it for the next pair of releases.
+    #[cfg(feature = "mongodb")]
+    async fn fail_the_claim_after_next(mongo: &crate::MongoDb, group_id: &str) {
+        let serial = mongo
+            .col::<bson::Document>("mls_groups")
+            .find_one(bson::doc! { "_id": group_id })
+            .await
+            .unwrap()
+            .expect("the group")
+            .get_i64("txn_serial")
+            .unwrap_or(0);
+        mongo
+            .db()
+            .run_command(bson::doc! {
+                "collMod": "mls_groups",
+                "validator": { "$or": [
+                    { "txn_serial": { "$exists": false } },
+                    { "txn_serial": { "$lte": serial + 1 } },
+                ] },
+                "validationLevel": "strict",
+                "validationAction": "error",
+            })
+            .await
+            .unwrap();
+    }
+
+    /// A SECOND release that fails (its group claim refused, after the
+    /// first release's claim went through) completes the removal and hands
+    /// the error back (decision 11 (W2), audit C3): the membership and the
+    /// thread rows are gone and the first release reached the seat;
+    /// `remove_with_outcome` answers `ReleasePending` with the release's
+    /// error, so a caller can run its follow-ups first, and `remove` answers
+    /// that error. MONGODB only: the reference store cannot fail a write.
+    /// Mutations: the second release returned with `?` (`Err`, not
+    /// `ReleasePending`); the kept result mapped to `Removed`.
+    #[cfg(feature = "mongodb")]
+    #[tokio::test]
+    async fn a_failed_second_release_completes_the_removal_and_hands_the_error_back() {
+        const GROUP: &str = "01MRPGROUP";
+
+        database_test!(|db| async move {
+            let Database::MongoDb(mongo) = &db else {
+                return;
+            };
+
+            let owner = User::create(&db, "01MRP Owner".to_string(), None, None)
+                .await
+                .unwrap();
+            let kicked = User::create(&db, "01MRP Kicked".to_string(), None, None)
+                .await
+                .unwrap();
+            let leaving = User::create(&db, "01MRP Leaving".to_string(), None, None)
+                .await
+                .unwrap();
+            let server = Server::create(&db, new_server("01MRP S"), &owner, false)
+                .await
+                .unwrap()
+                .0;
+
+            let kicked_member = Member::create(&db, &server, &kicked, None).await.unwrap().0;
+            let leaving_member = Member::create(&db, &server, &leaving, None)
+                .await
+                .unwrap()
+                .0;
+            db.insert_channel(&Channel::Thread {
+                id: "01MRPTHREAD".to_string(),
+                server: server.id.clone(),
+                parent_channel: "01MRPPARENT".to_string(),
+                name: "thread".to_string(),
+                creator: owner.id.clone(),
+                origin_message_id: None,
+                last_message_id: None,
+                archived: false,
+                archived_timestamp: None,
+                auto_archive_minutes: Channel::default_auto_archive_minutes(),
+                locked: false,
+                applied_tags: vec![],
+            })
+            .await
+            .unwrap();
+            assert!(db
+                .join_thread_if_absent("01MRPTHREAD", &kicked.id)
+                .await
+                .unwrap());
+
+            entitle(&db, SEATED_HERE, &server.id).await;
+            seat_raw(&db, SEATED_HERE, &kicked.id).await;
+            seat_raw(&db, SEATED_HERE, &leaving.id).await;
+            text_group_raw(mongo, GROUP, SEATED_HERE, &[&kicked.id, &leaving.id]).await;
+
+            let is_group_error = |error: &revolt_result::Error| {
+                matches!(
+                    &error.error_type,
+                    ErrorType::DatabaseError { collection, .. } if collection == "mls_groups"
+                )
+            };
+
+            fail_the_claim_after_next(mongo, GROUP).await;
+            let outcome = kicked_member
+                .remove_with_outcome(&db, &server, RemovalIntention::Kick, false)
+                .await
+                .expect("the removal went through");
+            let error = match outcome {
+                RemovalOutcome::ReleasePending(error) => error,
+                RemovalOutcome::Removed => {
+                    panic!("a failed second release must be handed back, not dropped")
+                }
+            };
+            assert!(
+                is_group_error(&error),
+                "the second release's error: {error:?}"
+            );
+            assert!(
+                db.fetch_member(&server.id, &kicked.id).await.is_err(),
+                "the membership is gone"
+            );
+            assert!(
+                db.fetch_joined_thread_ids(&kicked.id, &server.id)
+                    .await
+                    .unwrap()
+                    .is_empty(),
+                "the thread rows are gone"
+            );
+            assert!(
+                !seat_of(&db, SEATED_HERE, &kicked.id).await.is_active(),
+                "the first release reached the seat"
+            );
+
+            fail_the_claim_after_next(mongo, GROUP).await;
+            let error = leaving_member
+                .remove(&db, &server, RemovalIntention::Leave, false)
+                .await
+                .expect_err("`remove` answers the kept error");
+            assert!(
+                is_group_error(&error),
+                "the second release's error: {error:?}"
+            );
+            assert!(
+                db.fetch_member(&server.id, &leaving.id).await.is_err(),
+                "the membership is gone"
+            );
+        });
+    }
+
+    /// The body of `fn_name` in this file: comment lines dropped, and
+    /// whitespace kept only between two identifier characters, so the
+    /// needles below do not depend on line breaks or a trailing comma
+    fn fn_body(fn_name: &str) -> String {
         const SOURCE: &str = include_str!("model.rs");
         let at = SOURCE
-            .find("pub async fn remove(")
-            .expect("remove is defined");
+            .find(&format!("pub async fn {fn_name}("))
+            .expect("the fn is defined");
         let open = at + SOURCE[at..].find('{').expect("a body");
         let mut depth = 0usize;
         let mut close = None;
@@ -911,14 +1157,22 @@ mod tests {
         body.replace(",)", ")")
     }
 
-    /// Decision 11 (W2) on `remove`'s text. Fault injection cannot reach the
-    /// SECOND release (a corrupt row fails the first one first), so its
-    /// handling is held here. In order: the first release, returned, before
-    /// the thread loop; the soft delete; the second release KEPT (no `?`, no
-    /// `.ok()`); the leave event; the kept result returned as the last
-    /// statement before `Ok(())`, with nothing between the two able to return
-    /// early. Exactly two releases, and no feature flag. Mutations: `?` on the
-    /// second release; the kept result dropped.
+    /// `Member::remove_with_outcome`'s body, as [`fn_body`] gives it
+    fn remove_body() -> String {
+        fn_body("remove_with_outcome")
+    }
+
+    /// Decision 11 (W2) on `remove_with_outcome`'s text: the ORDER, which
+    /// no single fault can show (the behaviour of a failed first and of a
+    /// failed second release is driven for real by the two MONGODB tests
+    /// above). In order: the first release, returned, before the thread
+    /// loop; the soft delete; the second release KEPT (no `?`, no `.ok()`);
+    /// the leave event; the kept result handed back as the last statement,
+    /// `ReleasePending` for its error, with nothing between the two able to
+    /// return early. Exactly two releases, and no feature flag. `remove` is
+    /// the outcome turned back into a `Result`, so every other caller still
+    /// answers the kept error. Mutations: `?` on the second release; the
+    /// kept result dropped; `remove` mapping the pending error to `Ok`.
     #[test]
     fn remove_releases_first_and_returns_the_kept_second_release_last() {
         const CALL: &str = "release_channel_seats_for_user(";
@@ -927,6 +1181,12 @@ mod tests {
         const THREADS: &str = "fetch_joined_thread_ids(";
         const SOFT_DELETE: &str = "db.soft_delete_member(&self.id).await?;";
         const LEAVE: &str = "EventV1::ServerMemberLeave";
+
+        assert_eq!(
+            fn_body("remove"),
+            "{self.remove_with_outcome(db,server,intention,silent).await?.into_result()}",
+            "`remove` must answer the outcome as a Result, the kept error included"
+        );
 
         let body = remove_body();
         assert_eq!(
@@ -993,12 +1253,15 @@ mod tests {
             "the leave event follows the second release: {body}"
         );
 
-        // 5. The kept result is the last statement before `Ok(())`, and nothing
-        // between the two can return early and skip the leave event
-        let tail = format!("{kept}?;Ok(())}}");
+        // 5. The kept result is handed back as the last statement, and
+        // nothing between the two can return early and skip the leave event
+        let tail = format!(
+            "Ok(match {kept}{{Ok(_)=>RemovalOutcome::Removed,\
+             Err(error)=>RemovalOutcome::ReleasePending(error),}})}}"
+        );
         assert!(
             body.ends_with(&tail),
-            "the kept second release must be returned last, before `Ok(())`: {body}"
+            "the kept second release must be handed back last, as `ReleasePending`: {body}"
         );
         let between = &body[second_end..body.len() - tail.len()];
         assert!(between.contains(LEAVE), "the leave event is in between");

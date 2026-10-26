@@ -68,6 +68,13 @@ fn kind_filter(kind: MlsGroupKind) -> Bson {
     }
 }
 
+/// The storage-level Text marker on an `mls_commits` document (R22): the
+/// Text commit transaction sets `kind: "Text"` on every row it writes;
+/// [`MlsCommit`] has no such field (decoding ignores it), so a Call row and
+/// a row written before the marker existed are unmarked. Values come from
+/// [`kind_filter`]: `Text` matches marked rows only, `Call` everything else.
+const COMMIT_KIND_FIELD: &str = "kind";
+
 /// Why one attempt of the Text commit transaction did not commit
 enum TextAttemptError {
     /// A definitive refusal or result error: abort and return it
@@ -85,8 +92,9 @@ enum TextAttemptError {
 enum TextAttemptOutcome {
     /// Step 0 found a row: abort (nothing was written) and return it
     Existing(MlsCommit),
-    /// Every write is staged: commit the transaction, then report `Won`
-    Staged,
+    /// Every write is staged: commit the transaction, then report `Won`.
+    /// `replaced_stray`: the attempt deleted an unmarked row at the id
+    Staged { replaced_stray: bool },
 }
 
 fn mongo_error(
@@ -234,11 +242,15 @@ impl MongoDb {
     ) -> std::result::Result<TextAttemptOutcome, TextAttemptError> {
         let id = MlsCommit::composite_id(&commit.group_id, commit.epoch);
 
-        // Step 0: an existing row at {group}:{epoch} is returned before any
-        // validity check (idempotent resubmit, W0-fix7/8)
+        // Step 0: an existing TEXT-MARKED row at {group}:{epoch} is returned
+        // before any validity check (idempotent resubmit, W0-fix7/8). An
+        // unmarked row there is a Call-plane stray (R22), replaced in step 3
         let existing = self
             .col::<MlsCommit>(COL_COMMITS)
-            .find_one(doc! { "_id": &id })
+            .find_one(doc! {
+                "_id": &id,
+                COMMIT_KIND_FIELD: kind_filter(MlsGroupKind::Text)
+            })
             .session(&mut *session)
             .await
             .map_err(mongo_error("find_one", COL_COMMITS))?;
@@ -354,8 +366,24 @@ impl MongoDb {
             })
             .collect();
 
-        // Step 3: the commit row. Its unique _id still arbitrates a racing
-        // same-epoch insert
+        // Step 3: an unmarked row at the id goes first (R22: a Call-plane
+        // stray must never win a Text epoch), in this transaction, so a
+        // refused or aborted commit leaves it as it was
+        let replaced_stray = self
+            .col::<Document>(COL_COMMITS)
+            .delete_one(doc! {
+                "_id": &id,
+                COMMIT_KIND_FIELD: kind_filter(MlsGroupKind::Call)
+            })
+            .session(&mut *session)
+            .await
+            .map_err(mongo_error("delete_one", COL_COMMITS))?
+            .deleted_count
+            > 0;
+
+        // Then the commit row. Its unique _id still arbitrates a racing
+        // same-epoch insert. Typed insert (the Int64 timestamp encoding of
+        // every other row), then the marker in the same transaction
         match self
             .col::<MlsCommit>(COL_COMMITS)
             .insert_one(&plan.stored)
@@ -365,6 +393,19 @@ impl MongoDb {
             Ok(_) => {}
             Err(error) if is_duplicate_key(&error) => return Err(TextAttemptError::Retry),
             Err(error) => return Err(TextAttemptError::Mongo(error, "insert_one", COL_COMMITS)),
+        }
+        let marked = self
+            .col::<Document>(COL_COMMITS)
+            .update_one(
+                doc! { "_id": &id },
+                doc! { "$set": { COMMIT_KIND_FIELD: kind_filter(MlsGroupKind::Text) } },
+            )
+            .session(&mut *session)
+            .await
+            .map_err(mongo_error("update_one", COL_COMMITS))?
+            .matched_count;
+        if marked == 0 {
+            return Err(TextAttemptError::Retry);
         }
 
         // Step 4: field-level effects, filtered on the state just validated
@@ -415,7 +456,7 @@ impl MongoDb {
                 .map_err(mongo_error("delete_many", COL_JOIN_INTENTS))?;
         }
 
-        Ok(TextAttemptOutcome::Staged)
+        Ok(TextAttemptOutcome::Staged { replaced_stray })
     }
 }
 
@@ -778,12 +819,18 @@ impl AbstractMls for MongoDb {
             return Err(create_error!(NotFound));
         }
 
+        // Both Lost reads exclude Text-marked rows: a Call submitter whose
+        // group read raced a squat eviction (R22) never receives a Text
+        // commit as its winner
         if commit.epoch <= group.current_epoch {
             let winning: Option<MlsCommit> = query!(
                 self,
                 find_one,
                 COL_COMMITS,
-                doc! { "_id": MlsCommit::composite_id(&commit.group_id, commit.epoch) }
+                doc! {
+                    "_id": MlsCommit::composite_id(&commit.group_id, commit.epoch),
+                    COMMIT_KIND_FIELD: kind_filter(MlsGroupKind::Call)
+                }
             )?;
             let winning = winning.ok_or_else(|| create_error!(NotFound))?;
             return Ok(MlsCommitOutcome::Lost { winning });
@@ -833,7 +880,10 @@ impl AbstractMls for MongoDb {
                     self,
                     find_one,
                     COL_COMMITS,
-                    doc! { "_id": &commit.id }
+                    doc! {
+                        "_id": &commit.id,
+                        COMMIT_KIND_FIELD: kind_filter(MlsGroupKind::Call)
+                    }
                 )?;
                 let winning = winning.ok_or_else(|| create_error!(NotFound))?;
 
@@ -887,7 +937,7 @@ impl AbstractMls for MongoDb {
                     let _ = session.abort_transaction().await;
                     return Ok(MlsCommitOutcome::Lost { winning });
                 }
-                Ok(TextAttemptOutcome::Staged) => {
+                Ok(TextAttemptOutcome::Staged { replaced_stray }) => {
                     // Commit, retrying the commit itself on
                     // UnknownTransactionCommitResult (commitTransaction is
                     // idempotent). A transient error retries the whole
@@ -896,7 +946,17 @@ impl AbstractMls for MongoDb {
                     let mut retry_whole = false;
                     for _ in 0..TEXT_COMMIT_ATTEMPTS {
                         match session.commit_transaction().await {
-                            Ok(()) => return Ok(MlsCommitOutcome::Won),
+                            Ok(()) => {
+                                // Only once the replacement is durable
+                                if replaced_stray {
+                                    log::warn!(
+                                        "AUDIT mls_text_stray_replaced group={} epoch={}",
+                                        commit.group_id,
+                                        commit.epoch
+                                    );
+                                }
+                                return Ok(MlsCommitOutcome::Won);
+                            }
                             Err(error)
                                 if error.contains_label(UNKNOWN_TRANSACTION_COMMIT_RESULT) =>
                             {
@@ -949,6 +1009,34 @@ impl AbstractMls for MongoDb {
             .find(doc! {
                 "group_id": group_id,
                 "epoch": { "$gte": from_epoch }
+            })
+            .with_options(
+                FindOptions::builder()
+                    .sort(doc! { "epoch": 1 })
+                    .limit(limit)
+                    .build(),
+            )
+            .await
+            .map_err(|_| create_database_error!("find", COL_COMMITS))?
+            .filter_map(|s| async { s.ok() })
+            .collect::<Vec<MlsCommit>>()
+            .await)
+    }
+
+    async fn fetch_mls_text_commits_from(
+        &self,
+        group_id: &str,
+        from_epoch: i64,
+        limit: i64,
+    ) -> Result<Vec<MlsCommit>> {
+        // Text-marked rows only (R22): an unmarked row under a Text group's
+        // id is never served
+        Ok(self
+            .col::<MlsCommit>(COL_COMMITS)
+            .find(doc! {
+                "group_id": group_id,
+                "epoch": { "$gte": from_epoch },
+                COMMIT_KIND_FIELD: kind_filter(MlsGroupKind::Text)
             })
             .with_options(
                 FindOptions::builder()

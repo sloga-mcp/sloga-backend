@@ -188,6 +188,7 @@ impl<'r> Responder<'r, 'static> for Error {
             ErrorType::DeviceCapReached { .. } => Status::BadRequest,
             ErrorType::ChannelProtected => Status::BadRequest,
             ErrorType::ProtectedFieldRefused { .. } => Status::BadRequest,
+            ErrorType::SeatListNamesRemovedUsers { .. } => Status::BadRequest,
         };
 
         // The body no longer carries the location, so log it for server
@@ -289,5 +290,33 @@ mod tests {
         keys.sort_unstable();
         // The error's `location` stays out of the body
         assert_eq!(keys, ["max", "type"]);
+    }
+
+    /// C1 (W2 audit): 400, the removed user ids in `users`, nothing else in
+    /// the body; `axum.rs` pins the same answer
+    #[rocket::async_test]
+    async fn seat_list_names_removed_users_is_bad_request_with_users_in_body() {
+        let client = AsyncClient::untracked(rocket::build())
+            .await
+            .expect("local rocket client");
+        let request = client.get("/");
+        let mut response = crate::create_error!(SeatListNamesRemovedUsers {
+            users: vec!["01HZXBBBBBBBBBBBBBBBBBBBBB".to_string()],
+        })
+        .respond_to(request.inner())
+        .expect("error responder");
+
+        assert_eq!(response.status(), Status::BadRequest);
+        assert_eq!(response.content_type(), Some(ContentType::JSON));
+
+        let body = response.body_mut().to_string().await.expect("body");
+        let body: serde_json::Value = serde_json::from_str(&body).expect("JSON body");
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "type": "SeatListNamesRemovedUsers",
+                "users": ["01HZXBBBBBBBBBBBBBBBBBBBBB"],
+            })
+        );
     }
 }
