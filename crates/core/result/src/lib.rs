@@ -383,6 +383,39 @@ pub enum ErrorType {
     PaymentPending,
     /// The payment provider failed or returned an unusable response
     PaymentProviderError,
+
+    // ? Protected channel errors
+    /// The channel's Text group is mid-resecure; the client refreshes its
+    /// seats and text group, then retries. `reason` is one of
+    /// `pending_removal`, `stale_epoch`, `stale_group`, `not_member`,
+    /// `stale_seat_list`.
+    ProtectedChannelResecuring {
+        reason: String,
+    },
+    /// The caller is not on the channel's current seat list
+    NotSeated,
+    /// The seat list would exceed the per-channel seat ceiling
+    SeatCapReached {
+        max: usize,
+    },
+    /// The user already holds as many member devices in the channel's Text
+    /// group as the enforced device cap allows
+    DeviceCapReached {
+        max: usize,
+    },
+    /// The route is refused on a protected channel
+    ChannelProtected,
+    /// The request sets a field a protected channel does not accept
+    ProtectedFieldRefused {
+        field: String,
+    },
+    /// The submitted seat list still names users the server removed from
+    /// the channel (kick, ban, leaving the server, account deletion) since
+    /// the stored list. The owner's client publishes a list without them
+    /// first; adding one back later is an ordinary seat claim.
+    SeatListNamesRemovedUsers {
+        users: Vec<String>,
+    },
 }
 
 #[macro_export]
@@ -557,5 +590,36 @@ mod tests {
             other => panic!("unexpected error type {other:?}"),
         }
         assert!(decoded.location.is_empty());
+    }
+
+    /// C1 (W2 audit): the type the owner's client keys on, and the users it
+    /// must leave out of its next list, survive a round trip
+    #[cfg(feature = "serde")]
+    #[test]
+    fn seat_list_names_removed_users_round_trips() {
+        let error = create_error!(SeatListNamesRemovedUsers {
+            users: vec![
+                "01HZXBBBBBBBBBBBBBBBBBBBBB".to_string(),
+                "01HZXCCCCCCCCCCCCCCCCCCCCC".to_string(),
+            ],
+        });
+
+        let value = serde_json::to_value(&error).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "type": "SeatListNamesRemovedUsers",
+                "users": ["01HZXBBBBBBBBBBBBBBBBBBBBB", "01HZXCCCCCCCCCCCCCCCCCCCCC"],
+            })
+        );
+
+        let decoded = serde_json::from_value::<crate::Error>(value).unwrap();
+        match decoded.error_type {
+            ErrorType::SeatListNamesRemovedUsers { users } => assert_eq!(
+                users,
+                ["01HZXBBBBBBBBBBBBBBBBBBBBB", "01HZXCCCCCCCCCCCCCCCCCCCCC"]
+            ),
+            other => panic!("unexpected error type {other:?}"),
+        }
     }
 }

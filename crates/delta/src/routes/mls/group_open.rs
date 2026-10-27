@@ -1,4 +1,4 @@
-use revolt_database::{util::reference::Reference, Database, User};
+use revolt_database::{util::reference::Reference, Database, MlsGroupKind, User};
 use revolt_models::v0;
 use revolt_result::{create_error, Result};
 use rocket::{serde::json::Json, State};
@@ -26,7 +26,7 @@ pub async fn open_group(
     super::require_channel_access(db, &user, &channel).await?;
 
     let group = db
-        .fetch_open_mls_group_for_channel(&channel.id())
+        .fetch_open_mls_group_for_channel(&channel.id(), MlsGroupKind::Call)
         .await?
         .ok_or_else(|| create_error!(NotFound))?;
 

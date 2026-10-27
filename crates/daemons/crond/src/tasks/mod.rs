@@ -22,6 +22,7 @@ pub mod prune_mfa_tickets;
 pub mod prune_remote_control_grants;
 pub mod prune_mls_groups;
 pub mod prune_mls_key_packages;
+pub mod prune_mls_text_commits;
 pub mod prune_upload_sessions;
 pub mod qualify_referrals;
 pub mod scheduled_messages;

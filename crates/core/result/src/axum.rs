@@ -176,6 +176,14 @@ impl IntoResponse for Error {
             ErrorType::CipherTierInvalid => StatusCode::BAD_REQUEST,
             ErrorType::PaymentPending => StatusCode::CONFLICT,
             ErrorType::PaymentProviderError => StatusCode::BAD_GATEWAY,
+
+            ErrorType::ProtectedChannelResecuring { .. } => StatusCode::CONFLICT,
+            ErrorType::NotSeated => StatusCode::FORBIDDEN,
+            ErrorType::SeatCapReached { .. } => StatusCode::BAD_REQUEST,
+            ErrorType::DeviceCapReached { .. } => StatusCode::BAD_REQUEST,
+            ErrorType::ChannelProtected => StatusCode::BAD_REQUEST,
+            ErrorType::ProtectedFieldRefused { .. } => StatusCode::BAD_REQUEST,
+            ErrorType::SeatListNamesRemovedUsers { .. } => StatusCode::BAD_REQUEST,
         };
 
         // The body no longer carries the location, so log it for server
@@ -190,7 +198,16 @@ impl IntoResponse for Error {
 
 #[cfg(test)]
 mod tests {
-    use axum::response::IntoResponse;
+    use std::{
+        future::Future,
+        pin::pin,
+        task::{Context, Poll, Waker},
+    };
+
+    use axum::{
+        http::{header, StatusCode},
+        response::IntoResponse,
+    };
 
     use crate::{create_error, Error};
 
@@ -228,5 +245,74 @@ mod tests {
             let name = format!("{:?}", error.error_type);
             assert_eq!(error.into_response().status().as_u16(), code, "{name}");
         }
+    }
+
+    /// Polls a future that must already be complete: an error response body
+    /// is held in memory, so collecting it never waits
+    fn ready<F: Future>(future: F) -> F::Output {
+        let mut future = pin!(future);
+        let mut context = Context::from_waker(Waker::noop());
+        match future.as_mut().poll(&mut context) {
+            Poll::Ready(output) => output,
+            Poll::Pending => panic!("in-memory response body was not ready"),
+        }
+    }
+
+    #[test]
+    fn device_cap_reached_is_bad_request_with_max_in_body() {
+        let response = crate::create_error!(DeviceCapReached { max: 5 }).into_response();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .map(|value| value.as_bytes()),
+            Some(&b"application/json"[..])
+        );
+
+        let body = ready(axum::body::to_bytes(response.into_body(), usize::MAX)).expect("body");
+        let body: serde_json::Value = serde_json::from_slice(&body).expect("JSON body");
+        assert_eq!(body["type"], "DeviceCapReached");
+        assert_eq!(body["max"], 5);
+
+        let mut keys: Vec<&str> = body
+            .as_object()
+            .expect("JSON object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        // The error's `location` stays out of the body
+        assert_eq!(keys, ["max", "type"]);
+    }
+
+    /// C1 (W2 audit): 400, the removed user ids in `users`, nothing else in
+    /// the body; `rocket.rs` pins the same answer
+    #[test]
+    fn seat_list_names_removed_users_is_bad_request_with_users_in_body() {
+        let response = crate::create_error!(SeatListNamesRemovedUsers {
+            users: vec!["01HZXBBBBBBBBBBBBBBBBBBBBB".to_string()],
+        })
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .map(|value| value.as_bytes()),
+            Some(&b"application/json"[..])
+        );
+
+        let body = ready(axum::body::to_bytes(response.into_body(), usize::MAX)).expect("body");
+        let body: serde_json::Value = serde_json::from_slice(&body).expect("JSON body");
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "type": "SeatListNamesRemovedUsers",
+                "users": ["01HZXBBBBBBBBBBBBBBBBBBBBB"],
+            })
+        );
     }
 }

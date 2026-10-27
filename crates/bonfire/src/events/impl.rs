@@ -720,7 +720,10 @@ impl State {
                     channel.apply_options(data.clone().into());
                 }
 
-                if !self.cache.channels.contains_key(id) {
+                // Whether the copy below is the cached one, patched with this
+                // update, rather than a row read just now.
+                let from_cache = self.cache.channels.contains_key(id);
+                if !from_cache {
                     if let Ok(channel) = db.fetch_channel(id).await {
                         self.cache.channels.insert(id.clone(), channel);
                     }
@@ -729,7 +732,22 @@ impl State {
                 if let Some(channel) = self.cache.channels.get(id) {
                     let can_view = self.cache.can_view_channel(db, channel).await;
                     if could_view != can_view {
-                        if can_view {
+                        if can_view && from_cache {
+                            // A channel cached while hidden may have missed
+                            // changes no event carried (a protect that was
+                            // stored but never published), so announce the
+                            // stored row, not the cached copy. reveal_channels
+                            // re-reads it, re-checks visibility on it, caches
+                            // and subscribes it. If the row is hidden after
+                            // all, or cannot be read, nothing is announced and
+                            // the event is dropped, as for an update hidden
+                            // before and after.
+                            let revealed = self.reveal_channels(db, vec![id.clone()]).await;
+                            let Some(create) = revealed.into_iter().next() else {
+                                return false;
+                            };
+                            *event = create;
+                        } else if can_view {
                             queue_add = Some(id.clone());
                             *event = EventV1::ChannelCreate(channel.clone().into());
                         } else {
@@ -1128,6 +1146,7 @@ mod tests {
             voice: None,
             slowmode: None,
             announcement: None,
+            protected: false,
         };
         db.insert_channel(&hidden).await.expect("insert hidden");
 
@@ -1145,6 +1164,7 @@ mod tests {
             voice: None,
             slowmode: None,
             announcement: None,
+            protected: false,
         };
         db.insert_channel(&visible).await.expect("insert visible");
 
@@ -1246,6 +1266,7 @@ mod tests {
             voice: None,
             slowmode: None,
             announcement: None,
+            protected: false,
         }
     }
 
@@ -1489,6 +1510,7 @@ mod tests {
             voice: None,
             slowmode: None,
             announcement: None,
+            protected: false,
         }
     }
 
@@ -2741,5 +2763,142 @@ mod tests {
             "the flush must subscribe S's member topic: {add:?}"
         );
         assert!(state.member_topics.contains(&member_topic(SERVER_S)));
+    }
+
+    /// `private_channel` as stored once it was protected.
+    fn protected_private_channel() -> Channel {
+        let mut channel = private_channel();
+        if let Channel::TextChannel { protected, .. } = &mut channel {
+            *protected = true;
+        }
+        channel
+    }
+
+    /// A role-less member whose socket cached `PRIVATE_S` while it was
+    /// hidden (as a hidden ChannelUpdate leaves it: cached, unsubscribed),
+    /// before it was protected. The protect stored the row but its
+    /// ChannelUpdate never reached this socket, so the copy lacks
+    /// `protected`.
+    async fn stale_hidden_private_state() -> State {
+        let mut state = private_channel_state(&[], &[text_channel(TEXT_S, SERVER_S)]).await;
+        state
+            .cache
+            .channels
+            .insert(PRIVATE_S.to_string(), private_channel());
+        state
+    }
+
+    /// The override update that opens `PRIVATE_S` to everyone.
+    fn open_private_channel() -> EventV1 {
+        EventV1::ChannelUpdate {
+            id: PRIVATE_S.to_string(),
+            data: v0::PartialChannel {
+                default_permissions: Some(OverrideField { a: 0, d: 0 }),
+                ..Default::default()
+            },
+            clear: vec![],
+        }
+    }
+
+    /// An override that reveals a channel cached while hidden must announce
+    /// the stored row: the cached copy can lack `protected`, and a client
+    /// told about the channel without it never pins it as protected.
+    #[tokio::test]
+    #[allow(clippy::disallowed_methods)]
+    async fn cached_channel_reveal_announces_the_stored_row() {
+        let db = test_db().await;
+        for channel in [text_channel(TEXT_S, SERVER_S), protected_private_channel()] {
+            db.insert_channel(&channel).await.expect("insert channel");
+        }
+        let mut state = stale_hidden_private_state().await;
+        assert!(!state.subscribed.read().await.contains(PRIVATE_S));
+
+        // As the route does it: write the row, then publish the update.
+        db.update_channel(
+            PRIVATE_S,
+            &PartialChannel {
+                default_permissions: Some(OverrideField { a: 0, d: 0 }),
+                ..Default::default()
+            },
+            vec![],
+        )
+        .await
+        .expect("update channel");
+
+        let mut event = open_private_channel();
+        assert!(state.handle_incoming_event_v1(&db, &mut event).await);
+
+        let EventV1::ChannelCreate(channel) = &event else {
+            panic!("the update must become a ChannelCreate: {event:?}");
+        };
+        let channel: Channel = channel.clone().into();
+        assert_eq!(channel.id(), PRIVATE_S);
+        assert!(
+            channel.is_protected(),
+            "the revealed channel must carry protected: {channel:?}"
+        );
+        assert!(
+            state
+                .cache
+                .channels
+                .get(PRIVATE_S)
+                .is_some_and(Channel::is_protected),
+            "the stored row must replace the cached copy"
+        );
+        assert!(state.subscribed.read().await.contains(PRIVATE_S));
+        let (add, _) = queued_changes(state.apply_state().await);
+        assert_eq!(add, vec![PRIVATE_S.to_string()], "one Redis subscribe");
+    }
+
+    /// The update says the channel opened, but the stored row is hidden
+    /// again (a later override closed it). Nothing is announced and the
+    /// channel stays unsubscribed.
+    #[tokio::test]
+    #[allow(clippy::disallowed_methods)]
+    async fn cached_channel_reveal_of_a_row_hidden_again_is_dropped() {
+        let db = test_db().await;
+        for channel in [text_channel(TEXT_S, SERVER_S), protected_private_channel()] {
+            db.insert_channel(&channel).await.expect("insert channel");
+        }
+        let mut state = stale_hidden_private_state().await;
+
+        let mut event = open_private_channel();
+        assert!(
+            !state.handle_incoming_event_v1(&db, &mut event).await,
+            "a channel hidden on its stored row must not be revealed: {event:?}"
+        );
+        assert!(!state.subscribed.read().await.contains(PRIVATE_S));
+        assert!(
+            state
+                .cache
+                .channels
+                .get(PRIVATE_S)
+                .is_some_and(Channel::is_protected),
+            "the stored row must replace the cached copy"
+        );
+        let (add, _) = queued_changes(state.apply_state().await);
+        assert!(add.is_empty(), "no Redis subscribe: {add:?}");
+    }
+
+    /// The stored row cannot be read (the channel is gone). Nothing is
+    /// announced, and the ghost is dropped from the cache.
+    #[tokio::test]
+    #[allow(clippy::disallowed_methods)]
+    async fn cached_channel_reveal_of_an_unreadable_row_is_dropped() {
+        let db = test_db().await;
+        db.insert_channel(&text_channel(TEXT_S, SERVER_S))
+            .await
+            .expect("insert channel");
+        let mut state = stale_hidden_private_state().await;
+
+        let mut event = open_private_channel();
+        assert!(
+            !state.handle_incoming_event_v1(&db, &mut event).await,
+            "an unreadable channel must not be revealed: {event:?}"
+        );
+        assert!(!state.subscribed.read().await.contains(PRIVATE_S));
+        assert!(!state.cache.channels.contains_key(PRIVATE_S));
+        let (add, _) = queued_changes(state.apply_state().await);
+        assert!(add.is_empty(), "no Redis subscribe: {add:?}");
     }
 }

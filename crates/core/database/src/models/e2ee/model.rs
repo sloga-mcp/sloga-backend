@@ -3,7 +3,7 @@ use ed25519_dalek::{Signature, VerifyingKey};
 use iso8601_timestamp::Timestamp;
 use revolt_result::Result;
 
-use crate::{events::client::EventV1, Database};
+use crate::{events::client::EventV1, Database, MlsJoinIntent, MlsMemberDevice, MlsRemovedReason};
 
 /// Current (and minimum accepted) E2EE protocol version.
 ///
@@ -178,8 +178,67 @@ auto_derived!(
         /// MLS epoch this envelope establishes (mls_commit/mls_welcome only)
         #[serde(skip_serializing_if = "Option::is_none")]
         pub epoch: Option<i64>,
+        /// Text `mls_commit` only: the committing device, copied from the
+        /// stored commit row (protected channels design §3.12.3 step 6,
+        /// §8.1). Every declaration field is absent on Call commits,
+        /// Welcomes and ctl envelopes, so those rows keep their earlier
+        /// shape, and rows queued before the fields existed still
+        /// deserialize
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub committer: Option<MlsMemberDevice>,
+        /// Text `mls_commit` only: devices the commit added
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub added: Vec<MlsMemberDevice>,
+        /// Text `mls_commit` only: devices the commit removed
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub removed: Vec<MlsMemberDevice>,
+        /// Text `mls_commit` only: the commit row's `rejoin_intents`, in
+        /// wire form
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub rejoin_intents: Vec<MlsEnvelopeRejoinIntent>,
+        /// Text `mls_commit` only: the commit row's advisory
+        /// `removed_reasons` (B48; never read for admission)
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub removed_reasons: Vec<MlsRemovedReason>,
     }
 );
+
+auto_derived!(
+    /// A rejoin intent declared on a queued Text `mls_commit` envelope
+    /// (protected channels design §8.1), in the wire form of native
+    /// `wire::MlsJoinRequest`. The stored intent row has no channel id, so
+    /// the channel of the commit's group is filled in when the envelope is
+    /// built; `_id` and `created_at` are not carried.
+    pub struct MlsEnvelopeRejoinIntent {
+        /// Group the intent targets
+        pub group_id: String,
+        /// Channel of that group
+        pub channel_id: String,
+        /// Joining user
+        pub user_id: String,
+        /// Joining device
+        pub device_id: String,
+        /// KeyPackage reference the joiner nominated
+        pub key_package_ref: String,
+        /// Join-intent signature
+        pub signature: String,
+    }
+);
+
+impl MlsEnvelopeRejoinIntent {
+    /// Wire form of a stored join intent; `channel_id` is the channel of the
+    /// commit's group
+    pub fn from_join_intent(intent: &MlsJoinIntent, channel_id: &str) -> Self {
+        MlsEnvelopeRejoinIntent {
+            group_id: intent.group_id.clone(),
+            channel_id: channel_id.to_string(),
+            user_id: intent.user_id.clone(),
+            device_id: intent.device_id.clone(),
+            key_package_ref: intent.key_package_ref.clone(),
+            signature: intent.signature.clone(),
+        }
+    }
+}
 
 /// Ciphertext blobs above this size expire 24 hours after upload; smaller
 /// blobs follow the 30-day envelope TTL (slice 3.5, blob lifecycle).
@@ -688,6 +747,187 @@ impl E2EESignedKey {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod envelope_shape_tests {
+    use iso8601_timestamp::Timestamp;
+
+    use revolt_models::v0;
+
+    use super::{E2EEContentType, E2EEEnvelope, MlsEnvelopeRejoinIntent};
+    use crate::{MlsJoinIntent, MlsMemberDevice, MlsRemovalReason, MlsRemovedReason};
+
+    /// A queued Call `mls_commit` row exactly as `996641f1` serialized it
+    const CALL_COMMIT_ROW_AT_996641F1: &str = r#"{"_id":"01JA0000000000000000000ENV","recipient_user_id":"01JA00000000000000000USERB","recipient_device_id":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","sender_user_id":"01JA00000000000000000USERA","sender_device_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","protocol_version":1,"sequence":0,"ciphertext":"Y29tbWl0","timestamp":"1970-01-01T00:00:00.000Z","content_type":"mls_commit","group_id":"0000000000000000000000000000000000000000000000000000000000000001","epoch":4}"#;
+
+    /// The BSON keys of that row at `996641f1`, in order
+    const CALL_COMMIT_ROW_KEYS_AT_996641F1: [&str; 12] = [
+        "_id",
+        "recipient_user_id",
+        "recipient_device_id",
+        "sender_user_id",
+        "sender_device_id",
+        "protocol_version",
+        "sequence",
+        "ciphertext",
+        "timestamp",
+        "content_type",
+        "group_id",
+        "epoch",
+    ];
+
+    fn call_commit_row() -> E2EEEnvelope {
+        E2EEEnvelope {
+            id: "01JA0000000000000000000ENV".to_string(),
+            recipient_user_id: "01JA00000000000000000USERB".to_string(),
+            recipient_device_id: "b".repeat(32),
+            sender_user_id: "01JA00000000000000000USERA".to_string(),
+            sender_device_id: "a".repeat(32),
+            protocol_version: 1,
+            sequence: 0,
+            ciphertext: "Y29tbWl0".to_string(),
+            timestamp: Timestamp::UNIX_EPOCH,
+            content_type: E2EEContentType::MlsCommit,
+            group_id: Some(format!("{}1", "0".repeat(63))),
+            epoch: Some(4),
+            committer: None,
+            added: vec![],
+            removed: vec![],
+            rejoin_intents: vec![],
+            removed_reasons: vec![],
+        }
+    }
+
+    fn device(user_id: &str, fill: &str) -> MlsMemberDevice {
+        MlsMemberDevice {
+            user_id: user_id.to_string(),
+            device_id: fill.repeat(32),
+        }
+    }
+
+    fn join_intent() -> MlsJoinIntent {
+        MlsJoinIntent {
+            id: MlsJoinIntent::composite_id(
+                &format!("{}1", "0".repeat(63)),
+                "01JA00000000000000000USERB",
+                &"b".repeat(32),
+            ),
+            group_id: format!("{}1", "0".repeat(63)),
+            user_id: "01JA00000000000000000USERB".to_string(),
+            device_id: "b".repeat(32),
+            key_package_ref: "a3ByZWY".to_string(),
+            signature: "c2ln".to_string(),
+            created_at: Timestamp::UNIX_EPOCH,
+        }
+    }
+
+    fn text_commit_row() -> E2EEEnvelope {
+        E2EEEnvelope {
+            committer: Some(device("01JA00000000000000000USERA", "a")),
+            added: vec![device("01JA00000000000000000USERC", "c")],
+            removed: vec![device("01JA00000000000000000USERB", "b")],
+            rejoin_intents: vec![MlsEnvelopeRejoinIntent::from_join_intent(
+                &join_intent(),
+                "01JA0000000000000000CHANNEL",
+            )],
+            removed_reasons: vec![MlsRemovedReason {
+                user_id: "01JA00000000000000000USERB".to_string(),
+                device_id: "b".repeat(32),
+                reason: MlsRemovalReason::Rejoin,
+            }],
+            ..call_commit_row()
+        }
+    }
+
+    /// Decision 1: a Call row is stored exactly as before
+    #[test]
+    fn call_commit_row_serializes_like_996641f1() {
+        let row = call_commit_row();
+        assert_eq!(
+            serde_json::to_string(&row).unwrap(),
+            CALL_COMMIT_ROW_AT_996641F1
+        );
+
+        let document = bson::to_document(&row).unwrap();
+        let keys: Vec<&str> = document.keys().map(String::as_str).collect();
+        assert_eq!(keys, CALL_COMMIT_ROW_KEYS_AT_996641F1);
+        assert_eq!(bson::from_document::<E2EEEnvelope>(document).unwrap(), row);
+    }
+
+    /// [A#14] A row queued before the declarations existed still
+    /// deserializes, from JSON and from a BSON document without the keys
+    #[test]
+    fn row_queued_before_declarations_still_deserializes() {
+        let parsed: E2EEEnvelope = serde_json::from_str(CALL_COMMIT_ROW_AT_996641F1)
+            .expect("a row without declaration keys must deserialize");
+        assert_eq!(parsed, call_commit_row());
+
+        let mut document = bson::to_document(&text_commit_row()).unwrap();
+        for key in [
+            "committer",
+            "added",
+            "removed",
+            "rejoin_intents",
+            "removed_reasons",
+        ] {
+            assert!(document.remove(key).is_some(), "{key} was not stored");
+        }
+        assert_eq!(
+            bson::from_document::<E2EEEnvelope>(document).unwrap(),
+            call_commit_row()
+        );
+    }
+
+    /// Decision 7: a Text commit row stores every declaration and delivers
+    /// it on the v0 envelope, `rejoin_intents` in wire form
+    #[test]
+    fn text_commit_row_carries_the_declarations() {
+        let row = text_commit_row();
+        let document = bson::to_document(&row).unwrap();
+        assert_eq!(bson::from_document::<E2EEEnvelope>(document).unwrap(), row);
+
+        let delivered: v0::E2EEMessage = row.into();
+        assert_eq!(
+            delivered.committer,
+            Some(v0::MlsMemberDevice {
+                user_id: "01JA00000000000000000USERA".to_string(),
+                device_id: "a".repeat(32),
+            })
+        );
+        assert_eq!(delivered.added.len(), 1);
+        assert_eq!(delivered.added[0].user_id, "01JA00000000000000000USERC");
+        assert_eq!(delivered.removed.len(), 1);
+        assert_eq!(delivered.removed[0].user_id, "01JA00000000000000000USERB");
+        assert_eq!(
+            delivered.rejoin_intents,
+            vec![join_intent().into_rejoin_intent_info("01JA0000000000000000CHANNEL")]
+        );
+        assert_eq!(
+            delivered.removed_reasons,
+            vec![v0::MlsRemovedReasonInfo {
+                user_id: "01JA00000000000000000USERB".to_string(),
+                device_id: "b".repeat(32),
+                reason: v0::MlsRemovalReason::Rejoin,
+            }]
+        );
+    }
+
+    /// A Call row delivers the 996641f1 envelope (no declaration keys)
+    #[test]
+    fn call_commit_row_delivers_no_declarations() {
+        let delivered: v0::E2EEMessage = call_commit_row().into();
+        let value = serde_json::to_value(&delivered).unwrap();
+        for key in [
+            "committer",
+            "added",
+            "removed",
+            "rejoin_intents",
+            "removed_reasons",
+        ] {
+            assert!(value.get(key).is_none(), "{key} on a Call envelope");
+        }
     }
 }
 

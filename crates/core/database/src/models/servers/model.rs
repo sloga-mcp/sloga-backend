@@ -280,6 +280,24 @@ impl Server {
         // forever and the owners can never re-spend them.
         db.deallocate_all_server_boosts_for_server(&self.id).await?;
 
+        // Protected-channel cascade (design 7.5, decision 12 (W2)): this path
+        // never runs Channel::delete, so each channel's entitlement, seats,
+        // seat list, Text groups and commits go here. Every id, protected
+        // or not (an unprotected channel can hold an entitlement), and never
+        // flag-gated; a dangling id is a no-op, the primitive never reads the
+        // channel row. The ids are `self.channels` together with the
+        // channels of the server's entitlements (C4, W2 audit), so a
+        // protected channel missing from the list is not left behind. Last
+        // of the cascades, so an earlier failure cannot strip a server that
+        // survives, and before the broadcast and the row delete, so a failure
+        // here aborts the deletion without announcing it.
+        let mut protected_ids: std::collections::BTreeSet<String> =
+            self.channels.iter().cloned().collect();
+        protected_ids.extend(db.fetch_entitled_channel_ids(&self.id).await?);
+        for channel_id in &protected_ids {
+            db.delete_protected_channel_data(channel_id).await?;
+        }
+
         EventV1::ServerDelete {
             id: self.id.clone(),
         }
@@ -1205,6 +1223,7 @@ mod tests {
             voice: None,
             slowmode: None,
             announcement: None,
+            protected: false,
         }
     }
 
@@ -1450,5 +1469,385 @@ mod tests {
                 .expect("W2A-ii: the post channel must survive its starter's purge");
             assert!(matches!(post, Channel::Thread { .. }), "{post:?}");
         });
+    }
+}
+
+/// `Server::delete`'s protected-channel cascade (decision 12 (W2)). The
+/// `database_test!` tests run under `TEST_DB=REFERENCE` and
+/// `TEST_DB=MONGODB` (never without `TEST_DB`: that is production).
+#[cfg(test)]
+mod protected_delete_tests {
+    use iso8601_timestamp::{Duration, Timestamp};
+    use revolt_models::v0::{self, DataCreateServer, DataCreateServerChannel};
+    use revolt_result::ErrorType;
+    use ulid::Ulid;
+
+    use crate::{
+        Channel, ChannelEntitlement, ChannelEntitlementSource, ChannelEntitlementState, Database,
+        Member, MemberCompositeKey, MlsGroup, MlsGroupKind, MlsMemberDevice, PartialServer,
+        SeatListBody, SeatListSubmission, Server, User,
+    };
+
+    const DEVICE: &str = "00112233445566778899aabbccddeeff";
+
+    /// Whole milliseconds: Mongo stores Int64 milliseconds
+    fn now() -> Timestamp {
+        Timestamp::UNIX_EPOCH
+            .checked_add(Duration::milliseconds(1_790_812_800_000))
+            .expect("timestamp")
+    }
+
+    fn entitlement(channel_id: &str, server_id: &str) -> ChannelEntitlement {
+        ChannelEntitlement {
+            id: Ulid::new().to_string(),
+            channel_id: channel_id.to_string(),
+            server_id: server_id.to_string(),
+            source: ChannelEntitlementSource::AdminGrant,
+            slot_cap: 10,
+            device_cap: None,
+            state: ChannelEntitlementState::Active,
+            granted_by: "admin".to_string(),
+            created_at: now(),
+        }
+    }
+
+    /// A server owned by a fresh user who is also its member (protect claims
+    /// both, decision 13 (W2)), listing two TextChannels and a dangling id.
+    /// Returns the server re-fetched, as the delete route holds a fetched
+    /// one, the owner, and the two channel ids.
+    async fn fixture(db: &Database) -> (Server, User, String, String) {
+        let owner = User::create(db, "ProtectedOwner".to_string(), None, None)
+            .await
+            .expect("`User`");
+        let (mut server, _) = Server::create(
+            db,
+            DataCreateServer {
+                name: "Server".to_string(),
+                description: None,
+                nsfw: None,
+            },
+            &owner,
+            false,
+        )
+        .await
+        .expect("`Server`");
+        db.insert_or_merge_member(&Member {
+            id: MemberCompositeKey {
+                server: server.id.clone(),
+                user: owner.id.clone(),
+            },
+            ..Default::default()
+        })
+        .await
+        .expect("`Member`");
+
+        let mut ids = vec![];
+        for name in ["protected", "plain"] {
+            let channel = Channel::create_server_channel(
+                db,
+                &mut server,
+                DataCreateServerChannel {
+                    channel_type: v0::LegacyServerChannelType::Text,
+                    name: name.to_string(),
+                    ..Default::default()
+                },
+                true,
+            )
+            .await
+            .expect("`Channel`");
+            ids.push(channel.id().to_string());
+        }
+
+        let dangling = Ulid::new().to_string();
+        db.update_server(
+            &server.id,
+            &PartialServer {
+                channels: Some(vec![ids[0].clone(), ids[1].clone(), dangling.clone()]),
+                ..Default::default()
+            },
+            vec![],
+        )
+        .await
+        .expect("channels");
+        let server = db.fetch_server(&server.id).await.expect("`Server`");
+        assert_eq!(server.channels, [ids[0].clone(), ids[1].clone(), dangling]);
+
+        let plain = ids.pop().expect("plain");
+        let protected = ids.pop().expect("protected");
+        (server, owner, protected, plain)
+    }
+
+    /// One protected channel (entitlement, genesis list seating the owner,
+    /// open Text group), one unprotected channel holding an entitlement, and
+    /// a dangling id: the delete succeeds and leaves no protected-channel
+    /// data behind for either channel. Control: the cascade loop removed.
+    #[tokio::test]
+    async fn delete_removes_protected_data_of_every_listed_channel() {
+        database_test!(|db| async move {
+            let (server, owner, protected, plain) = fixture(&db).await;
+
+            for channel_id in [&protected, &plain] {
+                db.upsert_channel_entitlement(&entitlement(channel_id, &server.id), now())
+                    .await
+                    .expect("entitlement");
+            }
+            let submission = SeatListSubmission {
+                body: SeatListBody {
+                    channel_id: protected.clone(),
+                    version: 1,
+                    device_cap: 5,
+                    issued_at: 1_790_812_800_000,
+                    signer_user_id: owner.id.clone(),
+                    signer_device_id: DEVICE.to_string(),
+                    seats: vec![owner.id.clone()],
+                }
+                .build()
+                .expect("body"),
+                // Canonical unpadded b64 of 64 bytes; the data layer checks
+                // only the encoding
+                signature: format!("B{}", "A".repeat(85)),
+                signer_device_id: DEVICE.to_string(),
+                handover: None,
+            };
+            db.protect_channel(&protected, &submission, now())
+                .await
+                .expect("protect");
+            let creator = MlsMemberDevice {
+                user_id: owner.id.clone(),
+                device_id: DEVICE.to_string(),
+            };
+            let group = MlsGroup {
+                id: "dd".repeat(32),
+                channel_id: protected.clone(),
+                open: true,
+                created_by: creator.clone(),
+                created_at: now(),
+                current_epoch: 0,
+                members: vec![creator],
+                closed_at: None,
+                superseded_by: None,
+                // Server-owned Text fields: create_text_mls_group sets them
+                kind: MlsGroupKind::Call,
+                generation: Some(0),
+                seat_list_ad_sha256: None,
+                pending_removals: vec![],
+                member_added: vec![],
+            };
+            db.create_text_mls_group(&group, None)
+                .await
+                .expect("Text group");
+
+            // The data is really there, so the assertions below cannot pass
+            // vacuously
+            for channel_id in [&protected, &plain] {
+                assert!(db
+                    .fetch_channel_entitlement(channel_id)
+                    .await
+                    .expect("entitlement")
+                    .is_some());
+            }
+            assert_eq!(
+                db.fetch_channel_seats(&protected)
+                    .await
+                    .expect("seats")
+                    .len(),
+                1
+            );
+            assert!(db
+                .fetch_seat_list(&protected)
+                .await
+                .expect("list")
+                .is_some());
+            let snapshot = db
+                .fetch_seat_list_snapshot(&protected)
+                .await
+                .expect("snapshot");
+            assert_eq!(
+                snapshot.text_group.map(|group| group.id),
+                Some(group.id.clone())
+            );
+
+            let server_id = server.id.clone();
+            server.delete(&db).await.expect("delete");
+
+            for channel_id in [&protected, &plain] {
+                assert!(
+                    db.fetch_channel_entitlement(channel_id)
+                        .await
+                        .expect("entitlement")
+                        .is_none(),
+                    "entitlement of {channel_id} survived the server delete"
+                );
+                assert!(db
+                    .fetch_channel_seats(channel_id)
+                    .await
+                    .expect("seats")
+                    .is_empty());
+                assert!(db
+                    .fetch_seat_list(channel_id)
+                    .await
+                    .expect("list")
+                    .is_none());
+                let snapshot = db
+                    .fetch_seat_list_snapshot(channel_id)
+                    .await
+                    .expect("snapshot");
+                assert!(snapshot.list.is_none());
+                assert!(snapshot.text_group.is_none());
+            }
+            assert!(db
+                .fetch_channel_seats_for_user(&owner.id)
+                .await
+                .expect("seats")
+                .is_empty());
+            // C7 (W2 audit): the Text group row is deleted, not only closed
+            let result = db.fetch_mls_group(&group.id).await;
+            assert!(
+                result
+                    .as_ref()
+                    .is_err_and(|error| matches!(error.error_type, ErrorType::NotFound)),
+                "the Text group row survived the server delete: {result:?}"
+            );
+            assert!(db.fetch_server(&server_id).await.is_err());
+        });
+    }
+
+    /// C4 (W2 audit): a protected channel missing from `server.channels`
+    /// (the list is a plain array any edit rewrites) is still cleaned: the
+    /// cascade walks the channels of the server's entitlements too.
+    /// Control: the loop over `self.channels` only.
+    #[tokio::test]
+    async fn delete_removes_protected_data_of_an_entitled_channel_missing_from_the_list() {
+        database_test!(|db| async move {
+            let (server, owner, protected, plain) = fixture(&db).await;
+            db.upsert_channel_entitlement(&entitlement(&protected, &server.id), now())
+                .await
+                .expect("entitlement");
+            let submission = SeatListSubmission {
+                body: SeatListBody {
+                    channel_id: protected.clone(),
+                    version: 1,
+                    device_cap: 5,
+                    issued_at: 1_790_812_800_000,
+                    signer_user_id: owner.id.clone(),
+                    signer_device_id: DEVICE.to_string(),
+                    seats: vec![owner.id.clone()],
+                }
+                .build()
+                .expect("body"),
+                signature: format!("B{}", "A".repeat(85)),
+                signer_device_id: DEVICE.to_string(),
+                handover: None,
+            };
+            db.protect_channel(&protected, &submission, now())
+                .await
+                .expect("protect");
+
+            // The protected channel drops out of the server's list
+            db.update_server(
+                &server.id,
+                &PartialServer {
+                    channels: Some(vec![plain.clone()]),
+                    ..Default::default()
+                },
+                vec![],
+            )
+            .await
+            .expect("channels");
+            let server = db.fetch_server(&server.id).await.expect("`Server`");
+            assert_eq!(server.channels, [plain]);
+            assert!(db
+                .fetch_seat_list(&protected)
+                .await
+                .expect("list")
+                .is_some());
+
+            server.delete(&db).await.expect("delete");
+
+            assert!(
+                db.fetch_channel_entitlement(&protected)
+                    .await
+                    .expect("entitlement")
+                    .is_none(),
+                "the unlisted channel's entitlement survived the server delete"
+            );
+            assert!(db
+                .fetch_channel_seats(&protected)
+                .await
+                .expect("seats")
+                .is_empty());
+            assert!(db
+                .fetch_seat_list(&protected)
+                .await
+                .expect("list")
+                .is_none());
+        });
+    }
+
+    /// Fail closed: a cascade that errors aborts the delete, so the server
+    /// row survives. MONGODB only: Reference cannot hold an undecodable row,
+    /// so under REFERENCE this test asserts nothing. Control: the cascade's
+    /// error swallowed.
+    #[tokio::test]
+    async fn a_failed_protected_cascade_keeps_the_server() {
+        database_test!(|db| async move {
+            #[cfg(feature = "mongodb")]
+            if let Database::MongoDb(mongo) = &db {
+                let (server, _, protected, _) = fixture(&db).await;
+                // A Text group of the channel that cannot decode
+                mongo
+                    .col::<bson::Document>("mls_groups")
+                    .insert_one(bson::doc! {
+                        "_id": "ee".repeat(32),
+                        "channel_id": &protected,
+                        "kind": "Text",
+                    })
+                    .await
+                    .expect("corrupt group");
+
+                let server_id = server.id.clone();
+                let error = server.delete(&db).await.expect_err("the cascade must fail");
+                assert!(
+                    matches!(
+                        error.error_type,
+                        revolt_result::ErrorType::DatabaseError { .. }
+                    ),
+                    "{error:?}"
+                );
+                db.fetch_server(&server_id)
+                    .await
+                    .expect("a failed cascade must keep the server row");
+            }
+        });
+    }
+
+    /// The cascade runs after the other cascades and before the broadcast
+    /// and the row delete (what a database test cannot observe: the event).
+    /// Control: the loop moved below `EventV1::ServerDelete`.
+    #[test]
+    fn delete_runs_the_protected_cascade_before_the_broadcast() {
+        const SOURCE: &str = include_str!("model.rs");
+
+        let at = SOURCE
+            .find("pub async fn delete(self, db: &Database) -> Result<()> {")
+            .expect("Server::delete");
+        let end = at
+            + SOURCE[at..]
+                .find("\n    }\n")
+                .expect("the end of Server::delete");
+        let body = &SOURCE[at..end];
+
+        let position = |needle: &str| {
+            assert_eq!(body.matches(needle).count(), 1, "`{needle}`: {body}");
+            body.find(needle).expect("counted above")
+        };
+        let boosts = position("db.deallocate_all_server_boosts_for_server(&self.id).await?;");
+        let cascade = position("db.delete_protected_channel_data(channel_id).await?;");
+        let event = position("EventV1::ServerDelete {");
+        let row = position("db.delete_server(&self.id).await");
+
+        assert!(boosts < cascade, "{body}");
+        assert!(cascade < event, "{body}");
+        assert!(event < row, "{body}");
     }
 }

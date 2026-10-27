@@ -6,6 +6,35 @@ use crate::mongodb::bson::doc;
 use crate::mongodb::options::CreateCollectionOptions;
 use crate::MongoDb;
 
+/// Name of the `messages` index that makes a protected-channel message's
+/// client message id single-use per channel
+pub(crate) const PROTECTED_NONCE_INDEX_NAME: &str = "channel_nonce_encrypted_unique";
+
+/// The durable `cid` replay guard (docs/protected-channels-design.md 3.10,
+/// W2 Decision 15): at most one message carrying `encrypted` per
+/// `(channel, nonce)`, as one element of a `createIndexes` "indexes" array.
+///
+/// `nonce` is the message-level client message id (the ULID the AAD binds),
+/// NOT `encrypted.nonce`, the AEAD nonce. Plaintext messages never carry
+/// `encrypted` (it is skipped when `None`), so the partial filter leaves them
+/// outside the index and their nonces unconstrained.
+///
+/// The one spec for this file, revision 75 and the tests, which run on
+/// un-migrated databases and must build exactly this index.
+pub(crate) fn protected_nonce_index() -> bson::Document {
+    doc! {
+        "key": {
+            "channel": 1_i32,
+            "nonce": 1_i32
+        },
+        "name": PROTECTED_NONCE_INDEX_NAME,
+        "unique": true,
+        "partialFilterExpression": {
+            "encrypted": { "$exists": true }
+        }
+    }
+}
+
 pub async fn create_database(db: &MongoDb) {
     info!("Creating database.");
     let db = db.db();
@@ -239,6 +268,18 @@ pub async fn create_database(db: &MongoDb) {
             .unwrap_or_else(|error| panic!("Failed to create {collection} collection: {error}"));
     }
 
+    db.create_collection("channel_entitlements")
+        .await
+        .expect("Failed to create channel_entitlements collection.");
+
+    db.create_collection("channel_seats")
+        .await
+        .expect("Failed to create channel_seats collection.");
+
+    db.create_collection("channel_seat_lists")
+        .await
+        .expect("Failed to create channel_seat_lists collection.");
+
     db.run_command(doc! {
         "createIndexes": "users",
         "indexes": [
@@ -299,6 +340,8 @@ pub async fn create_database(db: &MongoDb) {
                 },
                 "name": "channel_pinned_compound"
             },
+            // ENFORCES one protected-channel message per (channel, nonce).
+            protected_nonce_index(),
         ]
     })
     .await
@@ -678,6 +721,46 @@ pub async fn create_database(db: &MongoDb) {
     })
     .await
     .expect("Failed to create server_boosts index.");
+
+    db.run_command(doc! {
+        "createIndexes": "channel_entitlements",
+        "indexes": [
+            // ENFORCES at most one entitlement per channel.
+            {
+                "key": {
+                    "channel_id": 1_i32
+                },
+                "name": "channel_id",
+                "unique": true
+            }
+        ]
+    })
+    .await
+    .expect("Failed to create channel_entitlements index.");
+
+    db.run_command(doc! {
+        "createIndexes": "channel_seats",
+        "indexes": [
+            // Serves the per-channel seat count and listing.
+            {
+                "key": {
+                    "channel_id": 1_i32
+                },
+                "name": "channel_id"
+            },
+            // Serves per-user seat lookups and cascades.
+            {
+                "key": {
+                    "user_id": 1_i32
+                },
+                "name": "user_id"
+            }
+        ]
+    })
+    .await
+    .expect("Failed to create channel_seats index.");
+
+    // channel_seat_lists is keyed by `_id` (the channel id) only.
 
     db.run_command(doc! {
         "createIndexes": "discord_import_jobs",
@@ -1195,14 +1278,18 @@ pub async fn create_database(db: &MongoDb) {
         "createIndexes": "mls_groups",
         "indexes": [
             // The channel-scoped create-race arbitration (media-E2EE plan
-            // §1.2/A5): at most ONE open group per channel; racing creators
-            // are settled by this partial unique index, never by group_id
-            // (racing creators derive DIFFERENT group ids).
+            // §1.2/A5): at most ONE open group per channel PER KIND (Call,
+            // Text; protected-channels design 2.5, 2.7); racing creators are
+            // settled by this partial unique index, never by group_id
+            // (racing creators derive DIFFERENT group ids). Fresh databases
+            // never had the old per-channel `open_channel_group` index;
+            // revision 75 replaces it on existing ones.
             {
                 "key": {
-                    "channel_id": 1_i32
+                    "channel_id": 1_i32,
+                    "kind": 1_i32
                 },
-                "name": "open_channel_group",
+                "name": "open_channel_kind_group",
                 "unique": true,
                 "partialFilterExpression": { "open": true }
             }

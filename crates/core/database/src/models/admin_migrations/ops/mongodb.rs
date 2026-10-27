@@ -5,6 +5,8 @@ use super::AbstractMigrations;
 mod init;
 mod scripts;
 
+pub(crate) use init::{protected_nonce_index, PROTECTED_NONCE_INDEX_NAME};
+
 #[async_trait]
 impl AbstractMigrations for MongoDb {
     #[cfg(test)]

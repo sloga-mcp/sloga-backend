@@ -52,6 +52,12 @@ pub async fn interaction_autocomplete(
     let permissions = calculate_channel_permissions(&mut query).await;
     permissions.throw_if_lacking_channel_permission(ChannelPermission::SendMessage)?;
 
+    // A protected channel never wakes a bot: refused before the interaction
+    // row and the event below. Not before the permission check, so a caller
+    // who cannot send here learns nothing about the channel's protection.
+    // A thread is judged by its parent too (W2 audit B1).
+    crate::util::interactions::ensure_interactions_allowed_in(&channel, &permission_channel)?;
+
     crate::util::threads::ensure_thread_writable(&channel, &permissions)?;
 
     let command = db.fetch_command(&data.command_id).await?;
@@ -167,7 +173,8 @@ pub async fn interaction_autocomplete(
 #[cfg(test)]
 mod test {
     use crate::{rocket, util::test::TestHarness};
-    use revolt_database::{Bot, Member};
+    use revolt_database::events::client::EventV1;
+    use revolt_database::{Bot, Member, Server, User};
     use revolt_models::v0;
     use rocket::http::{ContentType, Header, Status};
     use serde_json::json;
@@ -354,5 +361,263 @@ mod test {
             .dispatch()
             .await;
         assert_eq!(response.status(), Status::BadRequest);
+    }
+
+    /// A bot owned by `owner`, joined to `server`, with one command whose
+    /// only option opted into autocomplete. Returns the bot and command ids.
+    async fn autocomplete_bot(
+        harness: &TestHarness,
+        owner: &User,
+        owner_token: &str,
+        server: &Server,
+    ) -> (String, String) {
+        let (bot, _) = Bot::create(&harness.db, TestHarness::rand_string(), owner, None)
+            .await
+            .expect("`Bot`");
+        let bot_user = harness.db.fetch_user(&bot.id).await.expect("bot user");
+        harness.join_server(server, &bot_user).await;
+
+        let response = harness
+            .client
+            .post(format!("/bots/{}/commands", bot.id))
+            .header(Header::new("x-session-token", owner_token.to_string()))
+            .header(ContentType::JSON)
+            .body(
+                json!({
+                    "name": "play",
+                    "description": "Play a track",
+                    "options": [{
+                        "name": "track",
+                        "description": "Which track",
+                        "kind": "String",
+                        "autocomplete": true
+                    }]
+                })
+                .to_string(),
+            )
+            .dispatch()
+            .await;
+        assert_eq!(response.status(), Status::Ok);
+        let command: v0::ApplicationCommand = response.into_json().await.expect("`Command`");
+        (bot.id, command.id)
+    }
+
+    /// Ask for suggestions on `track`; returns the status and the raw body.
+    async fn request_autocomplete(
+        harness: &TestHarness,
+        token: &str,
+        channel_id: &str,
+        command_id: &str,
+    ) -> (Status, String) {
+        let response = harness
+            .client
+            .post(format!("/channels/{channel_id}/interactions/autocomplete"))
+            .header(Header::new("x-session-token", token.to_string()))
+            .header(ContentType::JSON)
+            .body(
+                json!({
+                    "command_id": command_id,
+                    "focused_option": "track",
+                    "options": { "track": "blu" }
+                })
+                .to_string(),
+            )
+            .dispatch()
+            .await;
+        let status = response.status();
+        let body = response.into_string().await.unwrap_or_default();
+        (status, body)
+    }
+
+    /// Publish a marker on `user_id`'s private topic and wait for it. The
+    /// harness reads every topic through one subscription and redis pub/sub
+    /// is FIFO on it, so once the marker is seen, anything the request
+    /// published to that topic is in the buffer for `assert_no_buffered_event`.
+    async fn flush_with_marker(harness: &mut TestHarness, user_id: &str) {
+        let marker = ulid::Ulid::new().to_string();
+
+        EventV1::ChannelAck {
+            id: ulid::Ulid::new().to_string(),
+            user: user_id.to_string(),
+            message_id: marker.clone(),
+        }
+        .private(user_id.to_string())
+        .await;
+
+        harness
+            .wait_for_event(&format!("{user_id}!"), |event| match event {
+                EventV1::ChannelAck { message_id, .. } => message_id == &marker,
+                _ => false,
+            })
+            .await;
+    }
+
+    #[test]
+    fn autocomplete_refused_in_protected_channel() {
+        crate::util::test::rt().block_on(autocomplete_refused_in_protected_channel_case())
+    }
+
+    async fn autocomplete_refused_in_protected_channel_case() {
+        let mut harness = TestHarness::new().await;
+        let (_, session, owner) = harness.new_user().await;
+        let protected = harness.new_protected_channel(&owner, &session, &[]).await;
+        let channel_id = protected.channel.id().to_string();
+        let (bot_id, command_id) =
+            autocomplete_bot(&harness, &owner, &session.token, &protected.server).await;
+
+        // The bot is online, so without the refusal this request would get
+        // all the way to the interaction row and the event to the bot.
+        let (_, presence_session) = revolt_presence::create_session(&bot_id, 0).await;
+        let (status, body) =
+            request_autocomplete(&harness, &session.token, &channel_id, &command_id).await;
+        revolt_presence::delete_session(&bot_id, presence_session).await;
+
+        assert_eq!(status, Status::BadRequest, "{}", body);
+        let error: serde_json::Value = serde_json::from_str(&body).expect("error body");
+        assert_eq!(error["type"], "ChannelProtected", "{}", body);
+
+        // No event reached the bot
+        flush_with_marker(&mut harness, &bot_id).await;
+        harness.assert_no_buffered_event(&format!("{bot_id}!"), |event| {
+            matches!(event, EventV1::InteractionCreate { .. })
+        });
+    }
+
+    #[test]
+    fn autocomplete_reaches_bot_in_unprotected_channel() {
+        crate::util::test::rt().block_on(autocomplete_reaches_bot_in_unprotected_channel_case())
+    }
+
+    async fn autocomplete_reaches_bot_in_unprotected_channel_case() {
+        let mut harness = TestHarness::new().await;
+        let (_, session, owner) = harness.new_user().await;
+        let (server, channel) = harness.new_protectable_channel(&owner).await;
+        let channel_id = channel.id().to_string();
+        let (bot_id, command_id) =
+            autocomplete_bot(&harness, &owner, &session.token, &server).await;
+
+        let (_, presence_session) = revolt_presence::create_session(&bot_id, 0).await;
+        let (status, body) =
+            request_autocomplete(&harness, &session.token, &channel_id, &command_id).await;
+        revolt_presence::delete_session(&bot_id, presence_session).await;
+
+        assert_eq!(status, Status::Ok, "{}", body);
+        let created: v0::CreateInteractionResponse =
+            serde_json::from_str(&body).expect("`CreateInteractionResponse`");
+
+        harness
+            .db
+            .fetch_interaction(&created.interaction_id)
+            .await
+            .expect("the interaction row");
+
+        let event = harness
+            .wait_for_event(&format!("{bot_id}!"), |event| match event {
+                EventV1::InteractionCreate { interaction } => {
+                    interaction.id == created.interaction_id
+                }
+                _ => false,
+            })
+            .await;
+        match event {
+            EventV1::InteractionCreate { interaction } => {
+                assert_eq!(interaction.channel_id, channel_id)
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn autocomplete_outsider_error_hides_protection() {
+        crate::util::test::rt().block_on(autocomplete_outsider_error_hides_protection_case())
+    }
+
+    async fn autocomplete_outsider_error_hides_protection_case() {
+        let harness = TestHarness::new().await;
+        let (_, owner_session, owner) = harness.new_user().await;
+        let protected = harness
+            .new_protected_channel(&owner, &owner_session, &[])
+            .await;
+        let (other_server, unprotected) = harness.new_protectable_channel(&owner).await;
+        let (_, protected_command) =
+            autocomplete_bot(&harness, &owner, &owner_session.token, &protected.server).await;
+        autocomplete_bot(&harness, &owner, &owner_session.token, &other_server).await;
+
+        // Not a member of either server: fails the permission check first,
+        // with the same error whether or not the channel is protected.
+        let (_, session, _) = harness.new_user().await;
+        let (protected_status, protected_body) = request_autocomplete(
+            &harness,
+            &session.token,
+            protected.channel.id(),
+            &protected_command,
+        )
+        .await;
+        let (unprotected_status, unprotected_body) = request_autocomplete(
+            &harness,
+            &session.token,
+            unprotected.id(),
+            &protected_command,
+        )
+        .await;
+
+        assert!(
+            protected_status.class().is_client_error(),
+            "{}",
+            protected_body
+        );
+        assert_eq!(protected_status, unprotected_status);
+        assert_eq!(protected_body, unprotected_body);
+        let error: serde_json::Value = serde_json::from_str(&protected_body).expect("error body");
+        assert_ne!(error["type"], "ChannelProtected", "{}", protected_body);
+    }
+
+    /// W2 audit B1: a thread is judged by its parent. Suggestions asked in a
+    /// thread left under a protected parent (stored directly) are refused
+    /// with `ChannelProtected` and wake no bot.
+    ///
+    /// Control: the `2acdf5f0` helper call (the thread judged alone) → the
+    /// request reaches the bot.
+    #[test]
+    fn autocomplete_refused_in_a_thread_under_a_protected_parent() {
+        crate::util::test::rt()
+            .block_on(autocomplete_refused_in_a_thread_under_a_protected_parent_case())
+    }
+
+    async fn autocomplete_refused_in_a_thread_under_a_protected_parent_case() {
+        let mut harness = TestHarness::new().await;
+        let (_, session, owner) = harness.new_user().await;
+        let protected = harness.new_protected_channel(&owner, &session, &[]).await;
+        let orphan = revolt_database::Channel::Thread {
+            id: ulid::Ulid::new().to_string(),
+            server: protected.server.id.clone(),
+            parent_channel: protected.channel.id().to_string(),
+            name: "Thread".to_string(),
+            creator: owner.id.clone(),
+            origin_message_id: None,
+            last_message_id: None,
+            archived: false,
+            archived_timestamp: None,
+            auto_archive_minutes: 0,
+            locked: false,
+            applied_tags: vec![],
+        };
+        harness.db.insert_channel(&orphan).await.expect("thread");
+        let (bot_id, command_id) =
+            autocomplete_bot(&harness, &owner, &session.token, &protected.server).await;
+
+        let (_, presence_session) = revolt_presence::create_session(&bot_id, 0).await;
+        let (status, body) =
+            request_autocomplete(&harness, &session.token, orphan.id(), &command_id).await;
+        revolt_presence::delete_session(&bot_id, presence_session).await;
+
+        assert_eq!(status, Status::BadRequest, "{}", body);
+        let error: serde_json::Value = serde_json::from_str(&body).expect("error body");
+        assert_eq!(error["type"], "ChannelProtected", "{}", body);
+
+        flush_with_marker(&mut harness, &bot_id).await;
+        harness.assert_no_buffered_event(&format!("{bot_id}!"), |event| {
+            matches!(event, EventV1::InteractionCreate { .. })
+        });
     }
 }

@@ -81,6 +81,15 @@ pub trait AbstractChannels: Sync + Send {
 
     // Delete a channel
     async fn delete_channel(&self, channel_id: &Channel) -> Result<()>;
+
+    /// Hold a thread's parent while it is not protected (decision 13 (W2)).
+    /// `create_thread` calls it right after inserting the thread row. Mongo
+    /// writes the parent (`$inc` of `txn_serial`, filtered on `protected`
+    /// not being true), so a protect whose transaction read "no threads"
+    /// before the insert write-conflicts and re-reads; Reference checks the
+    /// flag under the `channels` lock, which protect holds throughout. A
+    /// protected parent is `ChannelProtected`, a missing one `NotFound`.
+    async fn hold_thread_parent_unprotected(&self, parent_id: &str) -> Result<()>;
 }
 
 #[cfg(test)]
@@ -277,6 +286,7 @@ mod tests {
             voice: None,
             slowmode: None,
             announcement: None,
+            protected: false,
         }
     }
 
@@ -431,6 +441,87 @@ mod tests {
                 got,
                 vec![cutoff.clone(), new_dm.clone()],
                 "expected only the DMs at or after the cutoff"
+            );
+        });
+    }
+
+    /// Mongo's `txn_serial` of a channel document (`None`: never written);
+    /// always `None` under REFERENCE, which has no such counter
+    async fn channel_txn_serial(db: &crate::Database, channel_id: &str) -> Option<i64> {
+        match db {
+            crate::Database::Reference(_) => None,
+            #[cfg(feature = "mongodb")]
+            crate::Database::MongoDb(mongo) => mongo
+                .col::<bson::Document>("channels")
+                .find_one(doc! { "_id": channel_id })
+                .await
+                .unwrap()
+                .expect("channel document")
+                .get_i64("txn_serial")
+                .ok(),
+        }
+    }
+
+    /// Decision 13 (W2): an unprotected parent is held (Mongo writes its
+    /// `txn_serial`), a protected one is refused with `ChannelProtected` and
+    /// left unwritten, a missing one is `NotFound`.
+    ///
+    /// Controls: the `"protected": { "$ne": true }` filter dropped
+    /// (MongoDB), the `is_protected()` arm dropped (Reference).
+    #[tokio::test]
+    async fn thread_parent_hold_refuses_a_protected_parent() {
+        database_test!(|db| async move {
+            use revolt_result::ErrorType;
+
+            let (open, protected) = ("01HOLDOPENPARENT", "01HOLDPROTECTEDPARENT");
+            db.insert_channel(&tidbp_text_channel(open)).await.unwrap();
+            let mut stored = tidbp_text_channel(protected);
+            if let Channel::TextChannel {
+                protected: flag, ..
+            } = &mut stored
+            {
+                *flag = true;
+            }
+            db.insert_channel(&stored).await.unwrap();
+
+            let mongo = !matches!(db, crate::Database::Reference(_));
+            let serial = |n: i64| mongo.then_some(n);
+
+            assert_eq!(channel_txn_serial(&db, open).await, None);
+            db.hold_thread_parent_unprotected(open)
+                .await
+                .expect("an unprotected parent is held");
+            assert_eq!(channel_txn_serial(&db, open).await, serial(1));
+            db.hold_thread_parent_unprotected(open)
+                .await
+                .expect("and held again");
+            assert_eq!(channel_txn_serial(&db, open).await, serial(2));
+            assert!(!db.fetch_channel(open).await.unwrap().is_protected());
+
+            let result = db.hold_thread_parent_unprotected(protected).await;
+            assert!(
+                matches!(
+                    &result,
+                    Err(error) if matches!(error.error_type, ErrorType::ChannelProtected)
+                ),
+                "a protected parent: {result:?}"
+            );
+            assert_eq!(
+                channel_txn_serial(&db, protected).await,
+                None,
+                "a refused hold writes nothing"
+            );
+            assert!(db.fetch_channel(protected).await.unwrap().is_protected());
+
+            let result = db
+                .hold_thread_parent_unprotected("01HOLDMISSINGPARENT")
+                .await;
+            assert!(
+                matches!(
+                    &result,
+                    Err(error) if matches!(error.error_type, ErrorType::NotFound)
+                ),
+                "a missing parent: {result:?}"
             );
         });
     }

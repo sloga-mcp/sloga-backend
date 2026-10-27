@@ -114,6 +114,7 @@ async fn main() {
         cron_task_wrapper(prune_mls_groups::task, db.clone(), amqp.clone()),
         cron_task_wrapper(prune_remote_control_grants::task, db.clone(), amqp.clone()),
         cron_task_wrapper(prune_mls_key_packages::task, db.clone(), amqp.clone()),
+        cron_task_wrapper(prune_mls_text_commits::task, db.clone(), amqp.clone()),
         cron_task_wrapper(prune_upload_sessions::task, db.clone(), amqp.clone()),
         cron_task_wrapper(event_reminders::task, db.clone(), amqp.clone()),
         cron_task_wrapper(poll_expiry::task, db.clone(), amqp.clone()),

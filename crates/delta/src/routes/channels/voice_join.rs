@@ -81,14 +81,26 @@ pub async fn call(
 
     let channel = target.as_channel(db).await?;
 
-    let Some(voice_info) = channel.voice() else {
-        return Err(create_error!(NotAVoiceChannel));
-    };
-
     let mut permissions = perms(db, &user).channel(&channel);
 
     let current_permissions = calculate_channel_permissions(&mut permissions).await;
     current_permissions.throw_if_lacking_channel_permission(ChannelPermission::Connect)?;
+
+    // A protected channel is refused by name (decision 18 (W2)), after
+    // Connect, so a caller who cannot connect gets the same error whether
+    // or not the channel is protected, and before the voice shape is read
+    // or anything is torn down, minted or recorded. It carries no voice
+    // today (`Channel::update` refuses one), so without this it would
+    // answer `NotAVoiceChannel`. Keyed on the channel alone, never on a
+    // feature flag. The voice shape is read after Connect for the same
+    // reason: a caller who cannot connect learns nothing of the channel.
+    if channel.is_protected() {
+        return Err(create_error!(ChannelProtected));
+    }
+
+    let Some(voice_info) = channel.voice() else {
+        return Err(create_error!(NotAVoiceChannel));
+    };
 
     let user_voice_channel = UserVoiceChannel::from_channel(&channel);
 
@@ -613,6 +625,11 @@ mod test {
                     members,
                     closed_at: None,
                     superseded_by: None,
+                    kind: revolt_database::MlsGroupKind::Call,
+                    generation: None,
+                    seat_list_ad_sha256: None,
+                    pending_removals: vec![],
+                    member_added: vec![],
                 },
                 None,
             )
@@ -713,6 +730,11 @@ mod test {
                     members,
                     closed_at: None,
                     superseded_by: None,
+                    kind: revolt_database::MlsGroupKind::Call,
+                    generation: None,
+                    seat_list_ad_sha256: None,
+                    pending_removals: vec![],
+                    member_added: vec![],
                 },
                 None,
             )
@@ -2100,6 +2122,176 @@ mod test {
             delete_channel_voice_state(voice, &[user.id.clone(), other.id.clone()])
                 .await
                 .expect("cleanup");
+        }
+    }
+
+    // ---- protected channels (W2 decision 18) ------------------------------
+
+    /// `join_call`'s status and raw body, as `join_call` sends the request.
+    async fn join_status_and_body(
+        harness: &TestHarness,
+        session_token: &str,
+        channel_id: &str,
+        force_disconnect: bool,
+    ) -> (Status, String) {
+        let response = join_call(harness, session_token, channel_id, force_disconnect).await;
+        let status = response.status();
+        (status, response.into_string().await.unwrap_or_default())
+    }
+
+    // Needs RabbitMQ and Redis, as every route test in this module does.
+    #[test]
+    fn join_call_refuses_a_protected_channel_before_any_side_effect() {
+        crate::util::test::rt()
+            .block_on(join_call_refuses_a_protected_channel_before_any_side_effect_case())
+    }
+
+    /// A protected channel never carries voice (`Channel::update` refuses
+    /// it), so before W2 a join answered `NotAVoiceChannel`. With Connect it
+    /// is now refused by name, `ChannelProtected`, and the refusal comes
+    /// before the force-disconnect: the owner's ghost in an ended call
+    /// elsewhere keeps its records and state, no `VoiceChannelLeave` reaches
+    /// that channel's topic (proven against a marker published after the
+    /// join), and no node or session record is written for the protected
+    /// channel. An unprotected text channel still answers `NotAVoiceChannel`,
+    /// and the same request into an unprotected voice channel gets past the
+    /// refusal and the kick to the (unreachable) SFU, tearing the ghost down
+    /// with its Leave, so the negatives above could have seen one.
+    async fn join_call_refuses_a_protected_channel_before_any_side_effect_case() {
+        use revolt_database::voice::get_voice_participant_session;
+
+        let mut harness = TestHarness::new().await;
+        let (_account, session, owner) = harness.new_user().await;
+
+        let protected = harness.new_protected_channel(&owner, &session, &[]).await;
+        assert!(
+            protected.channel.is_protected() && protected.channel.voice().is_none(),
+            "the fixture is a protected channel with no voice"
+        );
+        let unprotected = harness.new_channel(&protected.server).await;
+        assert!(!unprotected.is_protected() && unprotected.voice().is_none());
+
+        let ghost = voice_channel(&harness, &owner, &[]).await;
+        let ghost_voice = UserVoiceChannel::from_channel(&ghost);
+        join_recorded(&ghost_voice, &owner.id, "PA_protected_ghost", &owner.id).await;
+        let before = voice_traces(&ghost_voice, &owner.id).await;
+        assert_eq!(before.0.len(), 1, "the ghost has one recorded connection");
+        assert!(before.1 && before.2 && before.3, "the ghost has state");
+
+        let (status, body) =
+            join_status_and_body(&harness, &session.token, protected.channel.id(), true).await;
+        assert_eq!(status, Status::BadRequest, "{}", body);
+        assert!(body.contains("\"type\":\"ChannelProtected\""), "{}", body);
+
+        assert_eq!(
+            voice_traces(&ghost_voice, &owner.id).await,
+            before,
+            "a refused join must tear nothing down"
+        );
+        assert_eq!(
+            get_voice_participant_session(protected.channel.id(), &owner.id)
+                .await
+                .expect("record read"),
+            None,
+            "a refused join records no session"
+        );
+        assert!(
+            get_channel_node(protected.channel.id())
+                .await
+                .expect("node read")
+                .is_none(),
+            "a refused join pins no node"
+        );
+
+        let marker = ulid::Ulid::new().to_string();
+        EventV1::ChannelAck {
+            id: ghost.id().to_string(),
+            user: owner.id.clone(),
+            message_id: marker.clone(),
+        }
+        .p(ghost.id().to_string())
+        .await;
+        harness
+            .wait_for_event(ghost.id(), |event| {
+                matches!(event, EventV1::ChannelAck { message_id, .. } if message_id == &marker)
+            })
+            .await;
+        harness.assert_no_buffered_event(ghost.id(), |event| {
+            matches!(event, EventV1::VoiceChannelLeave { .. })
+        });
+
+        let (status, body) =
+            join_status_and_body(&harness, &session.token, unprotected.id(), true).await;
+        assert_eq!(status, Status::BadRequest, "{}", body);
+        assert!(body.contains("\"type\":\"NotAVoiceChannel\""), "{}", body);
+
+        let open = voice_channel(&harness, &owner, &[]).await;
+        force_join_past_the_disconnect(&harness, &session.token, &open).await;
+        harness
+            .wait_for_event(ghost.id(), |event| {
+                matches!(
+                    event,
+                    EventV1::VoiceChannelLeave { id, user: left }
+                        if id == ghost.id() && left == &owner.id
+                )
+            })
+            .await;
+
+        for voice in [&ghost_voice, &UserVoiceChannel::from_channel(&open)] {
+            delete_channel_voice_state(voice, &[owner.id.clone()])
+                .await
+                .expect("cleanup");
+        }
+    }
+
+    // Needs RabbitMQ and Redis, as every route test in this module does.
+    #[test]
+    fn join_call_answers_a_caller_without_connect_alike_protected_or_not() {
+        crate::util::test::rt()
+            .block_on(join_call_answers_a_caller_without_connect_alike_protected_or_not_case())
+    }
+
+    /// Decision 18 (W2): a caller who fails Connect gets the same answer,
+    /// byte for byte (the body never carries the error's `location`), from a
+    /// protected channel and an unprotected one of the same server, so the
+    /// refusal tells a caller who cannot connect nothing about the channel.
+    /// Control: the refusal moved above the permission calculation (the
+    /// protected join answers `ChannelProtected`).
+    async fn join_call_answers_a_caller_without_connect_alike_protected_or_not_case() {
+        let harness = TestHarness::new().await;
+        let (_account, session, owner) = harness.new_user().await;
+        let (_account_o, outsider_session, _outsider) = harness.new_user().await;
+
+        let protected = harness.new_protected_channel(&owner, &session, &[]).await;
+        let unprotected = harness.new_channel(&protected.server).await;
+
+        for force_disconnect in [false, true] {
+            let refused = join_status_and_body(
+                &harness,
+                &outsider_session.token,
+                protected.channel.id(),
+                force_disconnect,
+            )
+            .await;
+            let plain = join_status_and_body(
+                &harness,
+                &outsider_session.token,
+                unprotected.id(),
+                force_disconnect,
+            )
+            .await;
+            assert_eq!(
+                refused, plain,
+                "a caller without Connect must not tell the two apart"
+            );
+            assert_eq!(refused.0, Status::Forbidden, "{}", refused.1);
+            assert!(
+                refused.1.contains("\"type\":\"MissingPermission\"")
+                    && refused.1.contains("Connect")
+                    && !refused.1.contains("\"location\""),
+                "{}",
+                refused.1
+            );
         }
     }
 }

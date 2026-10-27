@@ -18,6 +18,11 @@ events_enabled = true
 remote_control = true
 screen_leg = true
 
+# Protected channels growth ON for the route tests (needs e2ee_enabled above).
+# An explicit header: a bare key under [features] is silently ignored.
+[features.protected_channels]
+enabled = true
+
 [api.smtp]
 host = "localhost"
 username = "smtp"

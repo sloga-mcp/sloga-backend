@@ -15,7 +15,7 @@ mod interactions;
 mod invites;
 mod kofi;
 mod lookup;
-mod mls;
+pub(crate) mod mls;
 mod onboard;
 mod payments;
 mod policy;

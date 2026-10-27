@@ -1,6 +1,7 @@
 #![allow(deprecated)]
 use super::{File, UserVoiceState};
 
+use iso8601_timestamp::Timestamp;
 use revolt_permissions::{Override, OverrideField};
 use std::collections::{HashMap, HashSet};
 
@@ -141,6 +142,15 @@ auto_derived!(
             /// ordinary text channel.
             #[serde(skip_serializing_if = "Option::is_none")]
             announcement: Option<bool>,
+
+            /// Whether this channel is a protected (end-to-end encrypted)
+            /// channel. One-way: once true it is never false. Only
+            /// `PUT /channels/:id/protect` sets it; no edit route can.
+            #[cfg_attr(
+                feature = "serde",
+                serde(skip_serializing_if = "crate::if_false", default)
+            )]
+            protected: bool,
         },
         /// Thread belonging to a server text channel
         Thread {
@@ -389,6 +399,8 @@ auto_derived!(
         pub applied_tags: Option<Vec<String>>,
         #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
         pub announcement: Option<bool>,
+        #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+        pub protected: Option<bool>,
     }
 
     /// Optional fields on channel object
@@ -790,6 +802,161 @@ auto_derived!(
         pub duration: u64,
         pub retry_after: u64,
     }
+
+    /// Where a channel entitlement came from (protected channels design
+    /// §2.2). S1 mints `AdminGrant` only; the others are reserved for S5.
+    pub enum ChannelEntitlementSource {
+        AdminGrant,
+        Prot,
+        Crowdfund,
+    }
+
+    /// Lifecycle state of a channel entitlement (design §2.2). S1 uses
+    /// `Active` only; the others are reserved for S5.
+    pub enum ChannelEntitlementState {
+        Active,
+        Grace,
+        Frozen,
+        Deleted,
+    }
+
+    /// The admin-granted right to protect one channel (design §2.2)
+    pub struct ChannelEntitlement {
+        /// Unique Id
+        #[cfg_attr(feature = "serde", serde(rename = "_id"))]
+        pub id: String,
+        /// Channel this entitlement belongs to
+        pub channel_id: String,
+        /// Server the channel belongs to
+        pub server_id: String,
+        /// How the entitlement was obtained
+        pub source: ChannelEntitlementSource,
+        /// Most seats in use (active + cooling) at once, `1..=100`
+        pub slot_cap: u32,
+        /// Per-user device cap; absent = the configured default, `0` =
+        /// unlimited (still bounded by the 100-leaf cap)
+        #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+        pub device_cap: Option<u32>,
+        /// Lifecycle state
+        pub state: ChannelEntitlementState,
+        /// Privileged user that granted it
+        pub granted_by: String,
+        /// When it was first granted
+        pub created_at: Timestamp,
+    }
+
+    /// Privileged: grant (or update) a channel entitlement
+    /// (`PUT /channels/:channel_id/protected_entitlement`, design §7.2)
+    #[cfg_attr(feature = "validator", derive(validator::Validate))]
+    pub struct DataGrantChannelEntitlement {
+        /// Most seats in use at once
+        #[cfg_attr(feature = "validator", validate(range(min = 1, max = 100)))]
+        pub slot_cap: u32,
+        /// Per-user device cap; absent = the configured default, `0` =
+        /// unlimited
+        #[cfg_attr(
+            feature = "serde",
+            serde(default, skip_serializing_if = "Option::is_none")
+        )]
+        pub device_cap: Option<u32>,
+    }
+
+    /// An owner handover statement and its signature (design §2.4, §4.6)
+    pub struct SignedHandover {
+        /// Exact canonical handover body (design §4.6)
+        pub body: String,
+        /// b64 Ed25519 signature by the `from` device
+        pub signature: String,
+    }
+
+    /// An owner-signed seat list as submitted to protect (the genesis list)
+    /// or `PUT /channels/:channel_id/seats` (design §4.1, §7.2)
+    pub struct DataSeatList {
+        /// Exact canonical body (design §4.1), byte-for-byte as signed
+        pub body: String,
+        /// b64 Ed25519 signature over `body`
+        pub signature: String,
+        /// The signing device; must equal the body's `signer_device_id`
+        pub signer_device_id: String,
+        /// Handover statement to append to the stored chain
+        #[cfg_attr(
+            feature = "serde",
+            serde(default, skip_serializing_if = "Option::is_none")
+        )]
+        pub handover: Option<SignedHandover>,
+    }
+
+    /// Protect a channel (`PUT /channels/:channel_id/protect`, design §7.2)
+    pub struct DataProtectChannel {
+        /// The genesis seat list (`version: 1`)
+        pub seat_list: DataSeatList,
+    }
+
+    /// The channel's newest stored seat list (design §2.4, §7.2)
+    pub struct ChannelSeatListInfo {
+        /// The body's version
+        pub version: i64,
+        /// Exact canonical body, byte-for-byte as signed
+        pub body: String,
+        /// b64 Ed25519 signature over `body`
+        pub signature: String,
+        /// The body's `signer_user_id`
+        pub signer_user_id: String,
+        /// The body's `signer_device_id`
+        pub signer_device_id: String,
+        /// Append-only owner handover chain
+        pub handovers: Vec<SignedHandover>,
+    }
+
+    /// One active seat (design §7.2)
+    pub struct ChannelSeatInfo {
+        /// Seated user
+        pub user_id: String,
+        /// Last time the seat became active
+        pub seated_at: Timestamp,
+        /// Whether the seated user has lost ViewChannel. Serialized only
+        /// when the caller is the server owner; absent otherwise
+        #[cfg_attr(
+            feature = "serde",
+            serde(default, skip_serializing_if = "Option::is_none")
+        )]
+        pub seated_without_access: Option<bool>,
+    }
+
+    /// One released seat still counting against the slot cap (design §2.3,
+    /// §7.2)
+    pub struct ChannelSeatCoolingInfo {
+        /// User whose seat was released
+        pub user_id: String,
+        /// When the seat was released
+        pub released_at: Timestamp,
+        /// When the seat stops counting against the slot cap
+        pub cooldown_until: Timestamp,
+    }
+
+    /// Seat state of a channel (`GET` and `PUT /channels/:channel_id/seats`,
+    /// design §7.2). The list and the epoch come from one snapshot read.
+    pub struct ResponseChannelSeats {
+        /// Newest seat list; `null` only for a channel that is not protected
+        pub list: Option<ChannelSeatListInfo>,
+        /// The open Text group's `current_epoch`; `null` without one
+        pub as_of_epoch: Option<i64>,
+        /// The open Text group's id; `null` without one
+        pub as_of_group_id: Option<String>,
+        /// Ceiling a newly signed list may use (the effective entitlement
+        /// cap); `null` without an entitlement
+        pub entitlement_device_cap: Option<u32>,
+        /// The entitlement's slot cap; `null` without an entitlement
+        pub slot_cap: Option<u32>,
+        /// The enforced per-user device cap; `null` without a list
+        pub device_cap: Option<u32>,
+        /// Seats in use (active + cooling)
+        pub seats_used: u32,
+        /// Active seats
+        pub seats: Vec<ChannelSeatInfo>,
+        /// Released seats still cooling down
+        pub cooling: Vec<ChannelSeatCoolingInfo>,
+    }
 );
 
 /// Default auto-archive duration for threads, in minutes
@@ -891,5 +1058,82 @@ mod tests {
         let data: DataJoinCall =
             serde_json::from_str(r#"{"force_disconnect":true,"rejoin":true}"#).unwrap();
         assert_eq!(data.rejoin, Some(true));
+    }
+}
+
+#[cfg(test)]
+mod protected_dto_tests {
+    use super::{
+        ChannelEntitlement, ChannelEntitlementSource, ChannelEntitlementState,
+        DataGrantChannelEntitlement, DataProtectChannel, DataSeatList, ResponseChannelSeats,
+    };
+
+    /// The 7.2 `GET .../seats` example as the server owner sees it, with
+    /// concrete values in its placeholders
+    const SEATS_EXAMPLE_OWNER: &str = r#"{"list":{"version":3,"body":"sloga-seat-list-v1\nv:1\n...","signature":"c2ln","signer_user_id":"01JA00000000000000000USERA","signer_device_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","handovers":[{"body":"sloga-owner-handover-v1\n...","signature":"aG8"}]},"as_of_epoch":7,"as_of_group_id":"0000000000000000000000000000000000000000000000000000000000000001","entitlement_device_cap":5,"slot_cap":10,"device_cap":5,"seats_used":4,"seats":[{"user_id":"01JA00000000000000000USERA","seated_at":"2026-10-04T12:00:00.000Z","seated_without_access":false}],"cooling":[{"user_id":"01JA00000000000000000USERB","released_at":"2026-10-01T12:00:00.000Z","cooldown_until":"2026-10-15T12:00:00.000Z"}]}"#;
+
+    /// The same response as any other member sees it
+    const SEATS_EXAMPLE_MEMBER: &str = r#"{"list":{"version":3,"body":"sloga-seat-list-v1\nv:1\n...","signature":"c2ln","signer_user_id":"01JA00000000000000000USERA","signer_device_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","handovers":[{"body":"sloga-owner-handover-v1\n...","signature":"aG8"}]},"as_of_epoch":7,"as_of_group_id":"0000000000000000000000000000000000000000000000000000000000000001","entitlement_device_cap":5,"slot_cap":10,"device_cap":5,"seats_used":4,"seats":[{"user_id":"01JA00000000000000000USERA","seated_at":"2026-10-04T12:00:00.000Z"}],"cooling":[{"user_id":"01JA00000000000000000USERB","released_at":"2026-10-01T12:00:00.000Z","cooldown_until":"2026-10-15T12:00:00.000Z"}]}"#;
+
+    /// A channel that is not protected and has no open Text group
+    const SEATS_UNPROTECTED: &str = r#"{"list":null,"as_of_epoch":null,"as_of_group_id":null,"entitlement_device_cap":null,"slot_cap":null,"device_cap":null,"seats_used":0,"seats":[],"cooling":[]}"#;
+
+    #[test]
+    fn channel_seats_response_round_trips_the_example() {
+        for example in [SEATS_EXAMPLE_OWNER, SEATS_EXAMPLE_MEMBER, SEATS_UNPROTECTED] {
+            let parsed: ResponseChannelSeats = serde_json::from_str(example).unwrap();
+            assert_eq!(serde_json::to_string(&parsed).unwrap(), example);
+        }
+
+        let owner: ResponseChannelSeats = serde_json::from_str(SEATS_EXAMPLE_OWNER).unwrap();
+        assert_eq!(owner.seats[0].seated_without_access, Some(false));
+        assert_eq!(owner.list.as_ref().unwrap().handovers.len(), 1);
+
+        // Decision 6: the field is only on the wire when the route sets it
+        let mut member = owner;
+        member.seats[0].seated_without_access = None;
+        assert_eq!(
+            serde_json::to_string(&member).unwrap(),
+            SEATS_EXAMPLE_MEMBER
+        );
+    }
+
+    #[test]
+    fn seat_list_bodies_round_trip() {
+        let genesis = r#"{"seat_list":{"body":"sloga-seat-list-v1\nv:1\n...","signature":"c2ln","signer_device_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}"#;
+        let parsed: DataProtectChannel = serde_json::from_str(genesis).unwrap();
+        assert_eq!(parsed.seat_list.handover, None);
+        assert_eq!(serde_json::to_string(&parsed).unwrap(), genesis);
+
+        let with_handover = r#"{"body":"sloga-seat-list-v1\nv:1\n...","signature":"c2ln","signer_device_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","handover":{"body":"sloga-owner-handover-v1\n...","signature":"aG8"}}"#;
+        let parsed: DataSeatList = serde_json::from_str(with_handover).unwrap();
+        assert_eq!(parsed.handover.as_ref().unwrap().signature, "aG8");
+        assert_eq!(serde_json::to_string(&parsed).unwrap(), with_handover);
+
+        // Unknown keys are ignored, like every neighboring request body
+        let extra = with_handover.replacen('{', r#"{"future":1,"#, 1);
+        assert_eq!(
+            serde_json::from_str::<DataSeatList>(&extra).unwrap(),
+            parsed
+        );
+    }
+
+    #[test]
+    fn entitlement_bodies_round_trip() {
+        let grant = r#"{"slot_cap":10}"#;
+        let parsed: DataGrantChannelEntitlement = serde_json::from_str(grant).unwrap();
+        assert_eq!(parsed.device_cap, None);
+        assert_eq!(serde_json::to_string(&parsed).unwrap(), grant);
+
+        let grant = r#"{"slot_cap":10,"device_cap":0}"#;
+        let parsed: DataGrantChannelEntitlement = serde_json::from_str(grant).unwrap();
+        assert_eq!(parsed.device_cap, Some(0));
+        assert_eq!(serde_json::to_string(&parsed).unwrap(), grant);
+
+        let entitlement = r#"{"_id":"01JA00000000000000000000ENT","channel_id":"01JA0000000000000000CHANNEL","server_id":"01JA00000000000000000SERVER","source":"AdminGrant","slot_cap":10,"device_cap":3,"state":"Active","granted_by":"01JA00000000000000000ADMIN0","created_at":"2026-10-04T12:00:00.000Z"}"#;
+        let parsed: ChannelEntitlement = serde_json::from_str(entitlement).unwrap();
+        assert_eq!(parsed.source, ChannelEntitlementSource::AdminGrant);
+        assert_eq!(parsed.state, ChannelEntitlementState::Active);
+        assert_eq!(serde_json::to_string(&parsed).unwrap(), entitlement);
     }
 }

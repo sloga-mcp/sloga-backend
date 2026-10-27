@@ -97,6 +97,15 @@ pub async fn import_legacy_events(
     let channel = db.fetch_channel(&data.channel).await?;
     require_event_channel_view(db, &user, &server.id, &channel).await?;
 
+    // A protected channel's history is ciphertext the server can't read; any
+    // plaintext row left in it is a stray that must never be served. Refused
+    // after the view check, so a non-viewer gets the same answer either way.
+    // A thread is judged by its parent (W2 audit B1), the target the view
+    // check just resolved.
+    if channel.is_protected() || channel.permission_target(db).await?.is_protected() {
+        return Err(create_error!(ChannelProtected));
+    }
+
     // Dedup set: everything this server already imported (finding M5), extended with
     // this run's inserts so a duplicate tag within one scan imports once.
     let mut seen = db.fetch_imported_source_ids(&server.id).await?;
@@ -257,4 +266,300 @@ pub async fn import_legacy_events(
         scanned,
         truncated,
     }))
+}
+
+#[cfg(test)]
+mod test {
+    use crate::{rocket, util::test::TestHarness};
+    use revolt_database::{
+        events::client::EventV1, Channel, Database, Message, PartialChannel, PartialMember, Role,
+        Server,
+    };
+    use revolt_models::v0;
+    use revolt_permissions::{ChannelPermission, OverrideField};
+    use rocket::http::{ContentType, Header, Status};
+    use serde_json::{json, Value};
+    use ulid::Ulid;
+
+    /// Mark `channel_id` protected under its stored plaintext rows, raw, as
+    /// the R15 compensation window can leave a stray behind
+    async fn protect_under_stored_rows(db: &Database, channel_id: &str) {
+        match db {
+            Database::Reference(reference) => {
+                match reference.channels.lock().await.get_mut(channel_id) {
+                    Some(Channel::TextChannel { protected, .. }) => *protected = true,
+                    other => panic!("expected a text channel, got {:?}", other),
+                }
+            }
+            Database::MongoDb(mongo) => {
+                use revolt_database::mongodb::bson::{doc, Document};
+
+                let result = mongo
+                    .col::<Document>("channels")
+                    .update_one(
+                        doc! { "_id": channel_id },
+                        doc! { "$set": { "protected": true } },
+                    )
+                    .await
+                    .expect("raw protect");
+                assert_eq!(result.matched_count, 1);
+            }
+        }
+
+        assert!(db
+            .fetch_channel(channel_id)
+            .await
+            .expect("channel")
+            .is_protected());
+    }
+
+    /// Store one tagged legacy event row in `channel_id`, returning its id
+    async fn insert_tagged(
+        harness: &TestHarness,
+        channel_id: &str,
+        author: &str,
+        title: &str,
+    ) -> String {
+        let id = Ulid::new().to_string();
+        harness
+            .db
+            .insert_message(&Message {
+                id: id.clone(),
+                channel: channel_id.to_string(),
+                author: author.to_string(),
+                content: Some(format!(
+                    r#"[ACUTEST_EVENT]:{{"title":"{}","start":"2030-03-01T18:00:00.000Z"}}"#,
+                    title
+                )),
+                ..Default::default()
+            })
+            .await
+            .expect("message");
+        id
+    }
+
+    async fn import(
+        harness: &TestHarness,
+        token: &str,
+        server_id: &str,
+        channel_id: &str,
+    ) -> (Status, Value) {
+        let response = harness
+            .client
+            .post(format!("/events/server/{}/import", server_id))
+            .header(Header::new("x-session-token", token.to_string()))
+            .header(ContentType::JSON)
+            .body(json!({ "channel": channel_id }).to_string())
+            .dispatch()
+            .await;
+        let status = response.status();
+        let body = response.into_json::<Value>().await.expect("json body");
+        (status, body)
+    }
+
+    fn is_create_titled(title: &'static str) -> impl Fn(&EventV1) -> bool {
+        move |event| matches!(event, EventV1::CalendarEventCreate { event } if event.title == title)
+    }
+
+    /// A protected source channel is refused (decision 9, R15): a stray
+    /// plaintext `[ACUTEST_EVENT]:` row in it is never turned into a calendar
+    /// event, nothing is stored and no event is published. The same row in an
+    /// unprotected channel of the same server imports (positive control, and
+    /// the marker that proves the refused run published nothing).
+    ///
+    /// Control: the `is_protected()` refusal dropped.
+    #[test]
+    fn import_refuses_a_protected_source_channel() {
+        crate::util::test::rt().block_on(import_refuses_a_protected_source_channel_case())
+    }
+
+    async fn import_refuses_a_protected_source_channel_case() {
+        let mut harness = TestHarness::new().await;
+        let (_, session, owner) = harness.new_user().await;
+        let (server, _) = harness.new_server(&owner).await;
+        harness.join_server(&server, &owner).await;
+        let protected = harness.new_channel(&server).await;
+        let server = harness.db.fetch_server(&server.id).await.expect("server");
+        let open = harness.new_channel(&server).await;
+        let token = session.token.to_string();
+
+        insert_tagged(&harness, protected.id(), &owner.id, "Stray").await;
+        protect_under_stored_rows(&harness.db, protected.id()).await;
+        let kept = insert_tagged(&harness, open.id(), &owner.id, "Kept").await;
+
+        let (status, body) = import(&harness, &token, &server.id, protected.id()).await;
+        assert_eq!(body["type"], "ChannelProtected", "{}", body);
+        assert_ne!(status, Status::Ok);
+        assert!(
+            harness
+                .db
+                .fetch_imported_source_ids(&server.id)
+                .await
+                .expect("imported ids")
+                .is_empty(),
+            "the refused run stored an event"
+        );
+
+        // Positive control on the unprotected channel: exactly its one row.
+        let (status, body) = import(&harness, &token, &server.id, open.id()).await;
+        assert_eq!(status, Status::Ok, "{}", body);
+        let result: v0::ImportResult = serde_json::from_value(body).expect("import result");
+        assert_eq!(result.imported, 1);
+        assert_eq!(result.scanned, 1);
+
+        let stored = harness
+            .db
+            .fetch_imported_source_ids(&server.id)
+            .await
+            .expect("imported ids");
+        assert_eq!(stored.into_iter().collect::<Vec<_>>(), vec![kept]);
+
+        // Redis pub/sub is FIFO per subscription: once the later "Kept" create
+        // is observed, anything the refused run published is buffered too.
+        harness
+            .wait_for_event(&server.id, is_create_titled("Kept"))
+            .await;
+        harness.assert_no_buffered_event(&server.id, is_create_titled("Stray"));
+    }
+
+    /// Decision 18: a manager without ViewChannel on the source channel gets
+    /// the pre-W2 answer, byte-identical for a protected and an unprotected
+    /// channel, so the refusal reveals nothing about a hidden channel.
+    #[test]
+    fn import_non_viewer_answer_is_identical_protected_or_not() {
+        crate::util::test::rt()
+            .block_on(import_non_viewer_answer_is_identical_protected_or_not_case())
+    }
+
+    async fn import_non_viewer_answer_is_identical_protected_or_not_case() {
+        let harness = TestHarness::new().await;
+        let (_, _, owner) = harness.new_user().await;
+        let (_, manager_session, manager) = harness.new_user().await;
+        let (server, _) = harness.new_server(&owner).await;
+        harness.join_server(&server, &owner).await;
+        let manager_member = harness.join_server(&server, &manager).await;
+
+        // Server-wide ManageChannel through a role: manager authority.
+        let role = Role {
+            id: Ulid::new().to_string(),
+            name: "Mgr".to_string(),
+            permissions: OverrideField {
+                a: ChannelPermission::ManageChannel as i64,
+                d: 0,
+            },
+            colour: None,
+            hoist: false,
+            rank: 1,
+            icon: None,
+        };
+        harness
+            .db
+            .insert_role(&server.id, &role)
+            .await
+            .expect("role");
+        harness
+            .db
+            .update_member(
+                &manager_member.id,
+                &PartialMember {
+                    roles: Some(vec![role.id.clone()]),
+                    ..Default::default()
+                },
+                vec![],
+            )
+            .await
+            .expect("assign role");
+
+        // Two channels the manager can't view; one is then protected.
+        let mut answers = Vec::new();
+        for protect in [true, false] {
+            let server: Server = harness.db.fetch_server(&server.id).await.expect("server");
+            let mut channel = harness.new_channel(&server).await;
+            channel
+                .update(
+                    &harness.db,
+                    PartialChannel {
+                        default_permissions: Some(OverrideField {
+                            a: 0,
+                            d: ChannelPermission::ViewChannel as i64,
+                        }),
+                        ..Default::default()
+                    },
+                    vec![],
+                )
+                .await
+                .expect("deny view");
+            insert_tagged(&harness, channel.id(), &owner.id, "Hidden").await;
+            if protect {
+                protect_under_stored_rows(&harness.db, channel.id()).await;
+            }
+
+            let (status, body) = import(
+                &harness,
+                &manager_session.token.to_string(),
+                &server.id,
+                channel.id(),
+            )
+            .await;
+            // The pre-W2 answer for a hidden source channel (upstream's
+            // `require_event_channel_view`)
+            assert_eq!(body["type"], "NotFound", "{}", body);
+            answers.push((status, body.to_string()));
+        }
+
+        assert_eq!(answers[0], answers[1]);
+        assert!(harness
+            .db
+            .fetch_imported_source_ids(&server.id)
+            .await
+            .expect("imported ids")
+            .is_empty());
+    }
+
+    /// W2 audit B1: a thread is judged by its parent. A tagged row in a
+    /// thread left under a protected parent (stored directly, the row
+    /// written before the flag) is never imported: `ChannelProtected`,
+    /// nothing stored.
+    ///
+    /// Control: the `2acdf5f0` route (the thread's own flag) → the row is
+    /// imported.
+    #[test]
+    fn import_refuses_a_thread_under_a_protected_parent() {
+        crate::util::test::rt().block_on(import_refuses_a_thread_under_a_protected_parent_case())
+    }
+
+    async fn import_refuses_a_thread_under_a_protected_parent_case() {
+        let harness = TestHarness::new().await;
+        let (_, session, owner) = harness.new_user().await;
+        let (server, _) = harness.new_server(&owner).await;
+        harness.join_server(&server, &owner).await;
+        let parent = harness.new_channel(&server).await;
+        let thread = Channel::Thread {
+            id: Ulid::new().to_string(),
+            server: server.id.clone(),
+            parent_channel: parent.id().to_string(),
+            name: "Thread".to_string(),
+            creator: owner.id.clone(),
+            origin_message_id: None,
+            last_message_id: None,
+            archived: false,
+            archived_timestamp: None,
+            auto_archive_minutes: 0,
+            locked: false,
+            applied_tags: vec![],
+        };
+        harness.db.insert_channel(&thread).await.expect("thread");
+        insert_tagged(&harness, thread.id(), &owner.id, "Stray").await;
+        protect_under_stored_rows(&harness.db, parent.id()).await;
+
+        let (status, body) = import(&harness, &session.token, &server.id, thread.id()).await;
+        assert_eq!(status, Status::BadRequest, "{}", body);
+        assert_eq!(body["type"], "ChannelProtected", "{}", body);
+        assert!(harness
+            .db
+            .fetch_imported_source_ids(&server.id)
+            .await
+            .expect("imported ids")
+            .is_empty());
+    }
 }

@@ -196,6 +196,11 @@ pub async fn send_messages(
             content_type: revolt_database::E2EEContentType::Olm,
             group_id: None,
             epoch: None,
+            committer: None,
+            added: vec![],
+            removed: vec![],
+            rejoin_intents: vec![],
+            removed_reasons: vec![],
         };
 
         receipts.push(v0::E2EEDeliveryReceipt {

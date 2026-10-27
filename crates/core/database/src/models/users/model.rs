@@ -1468,6 +1468,12 @@ impl User {
     /// Deletes the user along with:
     /// - deletes owned bots, servers and messages
     /// - removes user from all groups
+    /// - releases the user's seat in every protected channel (and queues
+    ///   their removal from each open Text group) BEFORE clearing their
+    ///   server memberships; a failed release aborts the deletion with the
+    ///   memberships intact. A second release after the memberships are
+    ///   cleared catches a seat granted in between; its failure aborts the
+    ///   deletion too
     /// - clears relationships
     pub async fn delete(&mut self, db: &Database) -> Result<()> {
         for bot in db.fetch_bots_by_user(&self.id).await? {
@@ -1479,7 +1485,25 @@ impl User {
         }
 
         self.remove_from_all_groups(db).await?;
+
+        // Protected channels (design 6.3): `clear_memberships` bypasses
+        // `Member::remove`, so release here, across every server (`None`),
+        // and before the memberships go, so a failure never leaves a
+        // non-member holding a seat. Servers this account owns, and their
+        // protected channels, were deleted above. The released seat rows
+        // are kept.
+        db.release_channel_seats_for_user(&self.id, None, Timestamp::now_utc())
+            .await?;
         db.clear_memberships(&self.id).await?;
+        // Second release, as `Member::remove` runs one (decision 11 (W2),
+        // audit C6): a seat PUT that landed between the first release and
+        // `clear_memberships` could have seated the user again. It fails
+        // closed: the deletion stops with the memberships gone, the account
+        // is not marked deleted, and the retry (crond's next run) releases
+        // first again. Unlike `Member::remove`'s, its error is not kept:
+        // `clear_memberships` sends no leave event that has to go out first.
+        db.release_channel_seats_for_user(&self.id, None, Timestamp::now_utc())
+            .await?;
         // Calendar cascade (slice F): `clear_memberships` bypasses `Member::remove`,
         // so the per-server RSVP cascade never runs — drop every RSVP row the account
         // holds, or attendee lists would keep a ghost user id forever.
@@ -2231,6 +2255,320 @@ mod tests {
                 User::from_token(&db, &bot.token, UserHint::Any).await,
                 "Any",
             );
+        });
+    }
+
+    /// Fixtures for the protected-channel cascade of `User::delete`
+    /// (design 6.3)
+    mod protected {
+        use std::collections::HashMap;
+
+        use iso8601_timestamp::{Duration, Timestamp};
+
+        use crate::{
+            Channel, ChannelEntitlement, ChannelEntitlementSource, ChannelEntitlementState,
+            Database, Member, MemberCompositeKey, SeatListBody, SeatListSubmission, Server, User,
+        };
+
+        pub const CHANNEL: &str = "01J9Z3K4M5N6P7Q8R9S0T1V2W3";
+        pub const SERVER: &str = "01HZXSERVERSERVERSERVERSER";
+        /// Owns `SERVER` and signs its seat list
+        pub const OWNER: &str = "01HZXAAAAAAAAAAAAAAAAAAAAA";
+        /// A seated member of `SERVER` who owns nothing: the deleted account
+        pub const SEATED: &str = "01HZXBBBBBBBBBBBBBBBBBBBBB";
+        const OWNER_DEVICE: &str = "00112233445566778899aabbccddeeff";
+
+        /// Fixed, whole-millisecond time: Mongo stores Int64 milliseconds
+        fn at_base() -> Timestamp {
+            Timestamp::UNIX_EPOCH
+                .checked_add(Duration::milliseconds(1_790_812_800_000))
+                .unwrap()
+        }
+
+        /// `SERVER` (owned by `OWNER`, members `OWNER` and `SEATED`) with
+        /// `CHANNEL` protected and both users seated. Returns the stored
+        /// `SEATED` user.
+        pub async fn seated_user(db: &Database) -> User {
+            let server: Server = serde_json::from_value(serde_json::json!({
+                "_id": SERVER,
+                "owner": OWNER,
+                "name": "protected",
+                "channels": [CHANNEL],
+                "default_permissions": 0,
+            }))
+            .unwrap();
+            db.insert_server(&server).await.unwrap();
+
+            for user in [OWNER, SEATED] {
+                db.insert_or_merge_member(&Member {
+                    id: MemberCompositeKey {
+                        server: SERVER.to_string(),
+                        user: user.to_string(),
+                    },
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            }
+
+            db.insert_channel(&Channel::TextChannel {
+                id: CHANNEL.to_string(),
+                server: SERVER.to_string(),
+                name: "protected".to_string(),
+                description: None,
+                icon: None,
+                last_message_id: None,
+                default_permissions: None,
+                role_permissions: HashMap::new(),
+                nsfw: false,
+                spoiler: false,
+                voice: None,
+                slowmode: None,
+                announcement: None,
+                protected: false,
+            })
+            .await
+            .unwrap();
+
+            db.upsert_channel_entitlement(
+                &ChannelEntitlement {
+                    id: ulid::Ulid::new().to_string(),
+                    channel_id: CHANNEL.to_string(),
+                    server_id: SERVER.to_string(),
+                    source: ChannelEntitlementSource::AdminGrant,
+                    slot_cap: 10,
+                    device_cap: None,
+                    state: ChannelEntitlementState::Active,
+                    granted_by: "admin".to_string(),
+                    created_at: at_base(),
+                },
+                at_base(),
+            )
+            .await
+            .unwrap();
+
+            let submission = SeatListSubmission {
+                body: SeatListBody {
+                    channel_id: CHANNEL.to_string(),
+                    version: 1,
+                    device_cap: 5,
+                    issued_at: 1_790_812_800_000,
+                    signer_user_id: OWNER.to_string(),
+                    signer_device_id: OWNER_DEVICE.to_string(),
+                    seats: vec![OWNER.to_string(), SEATED.to_string()],
+                }
+                .build()
+                .unwrap(),
+                // The DB layer checks only the encoding: canonical unpadded
+                // b64 of 64 bytes
+                signature: format!("B{}", "A".repeat(85)),
+                signer_device_id: OWNER_DEVICE.to_string(),
+                handover: None,
+            };
+            db.protect_channel(CHANNEL, &submission, at_base())
+                .await
+                .unwrap();
+
+            let user = User {
+                id: SEATED.to_string(),
+                username: "Seated".to_string(),
+                discriminator: "1001".to_string(),
+                last_acknowledged_policy_change: at_base(),
+                ..Default::default()
+            };
+            db.insert_user(&user).await.unwrap();
+
+            let seats = db.fetch_channel_seats(CHANNEL).await.unwrap();
+            assert_eq!(seats.len(), 2);
+            assert!(seats.iter().all(|seat| seat.is_active()));
+
+            user
+        }
+    }
+
+    #[tokio::test]
+    async fn delete_releases_protected_seats_and_clears_memberships() {
+        use protected::{CHANNEL, OWNER, SEATED, SERVER};
+
+        database_test!(|db| async move {
+            let mut user = protected::seated_user(&db).await;
+
+            user.delete(&db).await.unwrap();
+
+            let seats = db.fetch_channel_seats(CHANNEL).await.unwrap();
+            let seat = |user_id: &str| {
+                seats
+                    .iter()
+                    .find(|seat| seat.user_id == user_id)
+                    .expect("seat rows are kept")
+            };
+            assert!(
+                !seat(SEATED).is_active(),
+                "a deleted account still holds an active seat"
+            );
+            assert!(seat(SEATED).cooldown_until.is_some());
+            assert!(seat(OWNER).is_active(), "another user's seat was released");
+
+            assert!(db.fetch_all_memberships(SEATED).await.unwrap().is_empty());
+            assert!(db.fetch_member(SERVER, OWNER).await.is_ok());
+        });
+    }
+
+    /// A release that fails aborts the deletion before the memberships are
+    /// cleared. Mongo only: the Reference driver cannot hold an undecodable
+    /// row, so there the test returns early.
+    #[cfg(feature = "mongodb")]
+    #[tokio::test]
+    async fn delete_keeps_memberships_when_the_seat_release_fails() {
+        use protected::{CHANNEL, SEATED};
+
+        database_test!(|db| async move {
+            let crate::Database::MongoDb(mongo) = &db else {
+                return;
+            };
+            use bson::{doc, Document};
+            use revolt_result::ErrorType;
+
+            let mut user = protected::seated_user(&db).await;
+
+            // An Int32 `channel_id` cannot decode into `ChannelSeat`, and the
+            // row matches the unscoped release's `{user_id, released_at: null}`
+            // filter. Its channel id is not `CHANNEL`, so `fetch_channel_seats`
+            // below never reads it.
+            mongo
+                .col::<Document>("channel_seats")
+                .insert_one(doc! {
+                    "_id": "corrupt",
+                    "channel_id": 5_i32,
+                    "user_id": SEATED,
+                    "seated_at": 0_i64,
+                })
+                .await
+                .expect("insert the undecodable seat row");
+
+            let err = user
+                .delete(&db)
+                .await
+                .expect_err("an undecodable seat row must fail the deletion");
+            assert!(
+                matches!(
+                    &err.error_type,
+                    ErrorType::DatabaseError { operation, collection }
+                        if operation == "find" && collection == "channel_seats"
+                ),
+                "{err:?}"
+            );
+
+            assert_eq!(
+                db.fetch_all_memberships(SEATED).await.unwrap().len(),
+                1,
+                "memberships were cleared although the seat release failed"
+            );
+            let seats = db.fetch_channel_seats(CHANNEL).await.unwrap();
+            assert!(seats
+                .iter()
+                .any(|seat| seat.user_id == SEATED && seat.is_active()));
+        });
+    }
+
+    /// The SECOND release, after `clear_memberships` (decision 11 (W2)
+    /// symmetry, audit C6), fails closed: with the first release's group
+    /// claim let through and the next one refused, the deletion answers the
+    /// release's error with the memberships already cleared (so the failing
+    /// release is the one AFTER them) and the seat released by the first.
+    /// Once the claim goes through again, a retried deletion succeeds.
+    /// Mongo only: the reference store cannot fail a write. Mutations: the
+    /// second release dropped or its error dropped (the first deletion
+    /// succeeds); both releases before `clear_memberships` (the memberships
+    /// survive the error).
+    #[cfg(feature = "mongodb")]
+    #[tokio::test]
+    async fn delete_fails_closed_when_the_second_seat_release_fails() {
+        use protected::{CHANNEL, SEATED};
+
+        database_test!(|db| async move {
+            let crate::Database::MongoDb(mongo) = &db else {
+                return;
+            };
+            use bson::{doc, Document};
+            use revolt_result::ErrorType;
+
+            const GROUP: &str = "01C6DELETEGROUP";
+
+            let mut user = protected::seated_user(&db).await;
+
+            let device = crate::MlsMemberDevice {
+                user_id: SEATED.to_string(),
+                device_id: "01C6DEVICE".to_string(),
+            };
+            mongo
+                .col::<crate::MlsGroup>("mls_groups")
+                .insert_one(&crate::MlsGroup {
+                    id: GROUP.to_string(),
+                    channel_id: CHANNEL.to_string(),
+                    open: true,
+                    created_by: device.clone(),
+                    created_at: iso8601_timestamp::Timestamp::now_utc(),
+                    current_epoch: 0,
+                    members: vec![device],
+                    closed_at: None,
+                    superseded_by: None,
+                    kind: crate::MlsGroupKind::Text,
+                    generation: Some(0),
+                    seat_list_ad_sha256: None,
+                    pending_removals: vec![],
+                    member_added: vec![],
+                })
+                .await
+                .unwrap();
+
+            // Every release opens by claiming the open Text groups the user
+            // is in (`$inc` of `txn_serial`); this validator lets the first
+            // claim through and refuses the second
+            let validator = |validator: Document| {
+                doc! {
+                    "collMod": "mls_groups",
+                    "validator": validator,
+                    "validationLevel": "strict",
+                    "validationAction": "error",
+                }
+            };
+            mongo
+                .db()
+                .run_command(validator(doc! { "$or": [
+                    { "txn_serial": { "$exists": false } },
+                    { "txn_serial": { "$lte": 1_i64 } },
+                ] }))
+                .await
+                .unwrap();
+
+            let err = user
+                .delete(&db)
+                .await
+                .expect_err("a failed second release must fail the deletion");
+            assert!(
+                matches!(
+                    &err.error_type,
+                    ErrorType::DatabaseError { collection, .. } if collection == "mls_groups"
+                ),
+                "{err:?}"
+            );
+            assert!(
+                db.fetch_all_memberships(SEATED).await.unwrap().is_empty(),
+                "the failing release must be the one after `clear_memberships`"
+            );
+            let seats = db.fetch_channel_seats(CHANNEL).await.unwrap();
+            assert!(
+                seats
+                    .iter()
+                    .any(|seat| seat.user_id == SEATED && !seat.is_active()),
+                "the first release reached the seat: {seats:?}"
+            );
+
+            mongo.db().run_command(validator(doc! {})).await.unwrap();
+            user.delete(&db)
+                .await
+                .expect("the retried deletion succeeds");
         });
     }
 }

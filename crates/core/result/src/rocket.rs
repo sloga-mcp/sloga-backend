@@ -181,6 +181,14 @@ impl<'r> Responder<'r, 'static> for Error {
             ErrorType::CipherTierInvalid => Status::BadRequest,
             ErrorType::PaymentPending => Status::Conflict,
             ErrorType::PaymentProviderError => Status::BadGateway,
+
+            ErrorType::ProtectedChannelResecuring { .. } => Status::Conflict,
+            ErrorType::NotSeated => Status::Forbidden,
+            ErrorType::SeatCapReached { .. } => Status::BadRequest,
+            ErrorType::DeviceCapReached { .. } => Status::BadRequest,
+            ErrorType::ChannelProtected => Status::BadRequest,
+            ErrorType::ProtectedFieldRefused { .. } => Status::BadRequest,
+            ErrorType::SeatListNamesRemovedUsers { .. } => Status::BadRequest,
         };
 
         // The body no longer carries the location, so log it for server
@@ -203,7 +211,11 @@ impl<'r> Responder<'r, 'static> for Error {
 
 #[cfg(test)]
 mod tests {
-    use rocket::{local::blocking::Client, response::Responder};
+    use rocket::{
+        http::{ContentType, Status},
+        local::{asynchronous::Client as AsyncClient, blocking::Client},
+        response::Responder,
+    };
 
     use crate::{create_error, Error};
 
@@ -249,5 +261,62 @@ mod tests {
             let response = error.respond_to(request.inner()).unwrap();
             assert_eq!(response.status().code, code, "{name}");
         }
+    }
+
+    #[rocket::async_test]
+    async fn device_cap_reached_is_bad_request_with_max_in_body() {
+        let client = AsyncClient::untracked(rocket::build())
+            .await
+            .expect("local rocket client");
+        let request = client.get("/");
+        let mut response = crate::create_error!(DeviceCapReached { max: 5 })
+            .respond_to(request.inner())
+            .expect("error responder");
+
+        assert_eq!(response.status(), Status::BadRequest);
+        assert_eq!(response.content_type(), Some(ContentType::JSON));
+
+        let body = response.body_mut().to_string().await.expect("body");
+        let body: serde_json::Value = serde_json::from_str(&body).expect("JSON body");
+        assert_eq!(body["type"], "DeviceCapReached");
+        assert_eq!(body["max"], 5);
+
+        let mut keys: Vec<&str> = body
+            .as_object()
+            .expect("JSON object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        // The error's `location` stays out of the body
+        assert_eq!(keys, ["max", "type"]);
+    }
+
+    /// C1 (W2 audit): 400, the removed user ids in `users`, nothing else in
+    /// the body; `axum.rs` pins the same answer
+    #[rocket::async_test]
+    async fn seat_list_names_removed_users_is_bad_request_with_users_in_body() {
+        let client = AsyncClient::untracked(rocket::build())
+            .await
+            .expect("local rocket client");
+        let request = client.get("/");
+        let mut response = crate::create_error!(SeatListNamesRemovedUsers {
+            users: vec!["01HZXBBBBBBBBBBBBBBBBBBBBB".to_string()],
+        })
+        .respond_to(request.inner())
+        .expect("error responder");
+
+        assert_eq!(response.status(), Status::BadRequest);
+        assert_eq!(response.content_type(), Some(ContentType::JSON));
+
+        let body = response.body_mut().to_string().await.expect("body");
+        let body: serde_json::Value = serde_json::from_str(&body).expect("JSON body");
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "type": "SeatListNamesRemovedUsers",
+                "users": ["01HZXBBBBBBBBBBBBBBBBBBBBB"],
+            })
+        );
     }
 }

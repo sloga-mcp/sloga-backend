@@ -11,6 +11,7 @@ mod control_request;
 mod channel_delete;
 mod channel_edit;
 mod channel_fetch;
+mod channel_protect;
 mod command_list;
 mod follow_create;
 mod follow_delete;
@@ -50,8 +51,12 @@ mod poll_end;
 mod poll_fetch;
 mod poll_vote;
 mod poll_voters;
+mod protected_entitlement_grant;
+pub(crate) mod protected_seat_validation;
 mod scheduled_message_delete;
 mod scheduled_messages_list;
+mod seats_fetch;
+mod seats_put;
 mod softres_create;
 mod softres_export;
 mod softres_fetch;
@@ -157,5 +162,136 @@ pub fn routes() -> (Vec<Route>, OpenApi) {
         softres_manage::softres_lock,
         softres_manage::softres_unlock,
         softres_export::softres_export,
+        protected_entitlement_grant::grant_entitlement,
+        channel_protect::protect_channel,
+        seats_put::put_seats,
+        seats_fetch::fetch_seats,
     ]
+}
+
+/// OpenAPI completeness for every route protected channels added (W2c C1):
+/// each one is in the generated spec under its path and method, with its
+/// tag, and Rocket gets the handler. A route left out of the
+/// `openapi_get_routes_spec!` list is neither documented nor mounted.
+#[cfg(test)]
+mod protected_openapi_completeness {
+    use revolt_rocket_okapi::revolt_okapi::openapi3::{OpenApi, Operation};
+    use rocket::Route;
+
+    #[derive(Clone, Copy, Debug)]
+    enum Method {
+        Get,
+        Put,
+        Post,
+    }
+
+    /// (method, path relative to the mount point, handler name, tag)
+    const CHANNELS: &[(Method, &str, &str, &str)] = &[
+        (
+            Method::Put,
+            "/{target}/protected_entitlement",
+            "grant_entitlement",
+            "E2EE",
+        ),
+        (Method::Put, "/{target}/protect", "protect_channel", "E2EE"),
+        (Method::Put, "/{target}/seats", "put_seats", "E2EE"),
+        (Method::Get, "/{target}/seats", "fetch_seats", "E2EE"),
+    ];
+
+    /// The MLS routes W2 gave a Text path (mounted under `/mls`)
+    const MLS: &[(Method, &str, &str, &str)] = &[
+        (
+            Method::Put,
+            "/key_packages",
+            "publish_key_packages",
+            "MLS",
+        ),
+        (
+            Method::Post,
+            "/key_packages/claim",
+            "claim_key_packages",
+            "MLS",
+        ),
+        (Method::Post, "/groups", "create_group", "MLS"),
+        (
+            Method::Post,
+            "/groups/{group_id}/join_intent",
+            "join_intent",
+            "MLS",
+        ),
+        (
+            Method::Post,
+            "/groups/{group_id}/commits",
+            "submit_commit",
+            "MLS",
+        ),
+        (
+            Method::Get,
+            "/groups/{group_id}/commits",
+            "fetch_commits",
+            "MLS",
+        ),
+        (
+            Method::Post,
+            "/groups/{group_id}/messages",
+            "send_message",
+            "MLS",
+        ),
+        (
+            Method::Get,
+            "/channels/{channel_id}/text_group",
+            "fetch_text_group",
+            "MLS",
+        ),
+    ];
+
+    fn operation<'a>(spec: &'a OpenApi, method: Method, path: &str) -> Option<&'a Operation> {
+        let item = spec.paths.get(path)?;
+        match method {
+            Method::Get => item.get.as_ref(),
+            Method::Put => item.put.as_ref(),
+            Method::Post => item.post.as_ref(),
+        }
+    }
+
+    fn assert_complete(
+        area: &str,
+        (routes, spec): (Vec<Route>, OpenApi),
+        expected: &[(Method, &str, &str, &str)],
+    ) {
+        let paths: Vec<&String> = spec.paths.keys().collect();
+        for (method, path, handler, tag) in expected {
+            // Edition 2018: a one-argument panic! does not interpolate, so
+            // every message here passes its arguments explicitly
+            let operation = operation(&spec, *method, path).unwrap_or_else(|| {
+                panic!(
+                    "{}: {:?} {} is missing from the OpenAPI spec; paths: {:?}",
+                    area, method, path, paths
+                )
+            });
+            assert!(
+                operation.tags.iter().any(|t| t == tag),
+                "{area}: {method:?} {path} is not tagged {tag}: {:?}",
+                operation.tags
+            );
+            assert!(
+                routes
+                    .iter()
+                    .any(|route| route.name.as_deref() == Some(*handler)),
+                "{}: handler {} is not mounted",
+                area,
+                handler
+            );
+        }
+    }
+
+    #[test]
+    fn every_protected_channel_route_is_in_the_openapi_spec() {
+        assert_complete("/channels", super::routes(), CHANNELS);
+    }
+
+    #[test]
+    fn every_mls_text_route_is_in_the_openapi_spec() {
+        assert_complete("/mls", crate::routes::mls::routes(), MLS);
+    }
 }

@@ -206,6 +206,13 @@ impl AbstractChannels for ReferenceDb {
     ) -> Result<()> {
         let mut channels = self.channels.lock().await;
         if let Some(channel_data) = channels.get_mut(id) {
+            // Re-checked against the STORED channel under the lock: the
+            // caller's copy can be stale across a concurrent protect
+            // (design 7.4; the MongoDB driver filters the write instead).
+            if channel.sets_field_refused_on_protected() && channel_data.is_protected() {
+                return Err(create_error!(ChannelProtected));
+            }
+
             channel_data.apply_options(channel.to_owned());
             channel_data.remove_fields(remove);
             Ok(())
@@ -298,6 +305,18 @@ impl AbstractChannels for ReferenceDb {
             Ok(())
         } else {
             Err(create_error!(NotFound))
+        }
+    }
+
+    /// Checked under the `channels` lock, which protect holds for its whole
+    /// check-and-write: a protect either saw the inserted thread or has
+    /// already set the flag read here.
+    async fn hold_thread_parent_unprotected(&self, parent_id: &str) -> Result<()> {
+        let channels = self.channels.lock().await;
+        match channels.get(parent_id) {
+            Some(parent) if parent.is_protected() => Err(create_error!(ChannelProtected)),
+            Some(_) => Ok(()),
+            None => Err(create_error!(NotFound)),
         }
     }
 }

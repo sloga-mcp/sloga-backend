@@ -49,8 +49,14 @@ pub async fn kick(
         return Err(create_error!(NotElevated));
     }
 
-    member
-        .remove(db, &server, RemovalIntention::Kick, false)
+    // An error here is a kick that did not happen (the membership is still
+    // in place, nothing to record or evict: a retry runs it all again). A
+    // kick that went through but whose second seat release failed is handed
+    // back as `ReleasePending` (protected channels 6.3, decision 11 (W2)):
+    // the membership is gone, so the record and the eviction below still
+    // run, and the release's error is answered after them.
+    let removal = member
+        .remove_with_outcome(db, &server, RemovalIntention::Kick, false)
         .await?;
 
     // Recorded once the kick is durable and BEFORE the eviction: a failed
@@ -80,6 +86,11 @@ pub async fn kick(
     // eviction. The recovery is a ban, which evicts non-members too.
     remove_user_from_server_voice(db, voice_client, &server, member_id.id).await?;
 
+    // A failed second seat release fails the kick (500), now that it is
+    // recorded and the target evicted. The seat it left shows to the owner
+    // as `seated_without_access`; a ban releases it, and so does a rejoin.
+    removal.into_result()?;
+
     Ok(EmptyResponse)
 }
 
@@ -93,8 +104,8 @@ mod test {
             get_voice_channel_members, is_in_voice_channel, record_voice_connection,
             recorded_voice_connections, set_channel_node, UserVoiceChannel,
         },
-        AuditLogAction, AuditLogEntry, Channel, Member, PartialMember, PartialRole, Role, Server,
-        User,
+        AuditLogAction, AuditLogEntry, Channel, Database, Member, PartialMember, PartialRole, Role,
+        Server, User,
     };
     use revolt_models::v0;
     use revolt_permissions::{ChannelPermission, OverrideField};
@@ -587,6 +598,91 @@ mod test {
         assert!(audit_entries(&harness, &server.id).await.is_empty());
     }
 
+    // ---- protected channels: a failed second seat release (6.3, C3) -------
+
+    // Compile-only without RabbitMQ and Redis: see the section note above.
+    #[test]
+    fn a_failed_second_release_still_records_and_evicts_then_fails_the_kick() {
+        crate::util::test::rt()
+            .block_on(a_failed_second_release_still_records_and_evicts_then_fails_the_kick_case())
+    }
+
+    /// A kick whose second seat release fails (its Text group claim refused
+    /// after the first release's went through) has removed the membership,
+    /// so a retried kick answers NotFound and could never record or evict:
+    /// the `member_kick` entry is written and the target torn down from the
+    /// server's calls, THEN the release's error is answered (500). MONGODB
+    /// only: the reference store cannot fail a write. Control: the route's
+    /// `.remove(..).await?` of 2acdf5f0 (no entry, no eviction).
+    async fn a_failed_second_release_still_records_and_evicts_then_fails_the_kick_case() {
+        use crate::routes::servers::ban_create::test::{fail_the_claim_after_next, text_group_raw};
+
+        const GROUP: &str = "01C3KICKGROUP";
+
+        let harness = TestHarness::new().await;
+        let Database::MongoDb(mongo) = &harness.db else {
+            return;
+        };
+        let (_a, session_a, owner) = harness.new_user().await;
+        let (_b, _session_b, target) = harness.new_user().await;
+        let protected = harness
+            .new_protected_channel(&owner, &session_a, &[&target])
+            .await;
+        let server_id = protected.server.id.clone();
+        text_group_raw(
+            mongo,
+            GROUP,
+            protected.channel.id(),
+            &[&owner.id, &target.id],
+        )
+        .await;
+
+        let channel = voice_channel(&harness, &protected.server, "Ended").await;
+        let uvc = UserVoiceChannel::from_channel(&channel);
+        join_recorded(&uvc, &target.id, "PA_kick_c3", &target.id).await;
+        assert_eq!(
+            voice_traces(&uvc, &target.id).await,
+            (1, true, true, true),
+            "the ghost is in place"
+        );
+
+        fail_the_claim_after_next(mongo, GROUP).await;
+        let response = kick(&harness, &session_a.token, &server_id, &target.id).await;
+        let status = response.status();
+        let body = response.into_string().await.unwrap_or_default();
+        let traces = voice_traces(&uvc, &target.id).await;
+        delete_channel_voice_state(&uvc, &[target.id.clone()])
+            .await
+            .expect("cleanup");
+
+        assert_eq!(
+            status,
+            Status::InternalServerError,
+            "the failed release is answered: {body}"
+        );
+        assert!(body.contains("DatabaseError"), "{}", body);
+        assert!(
+            harness
+                .db
+                .fetch_member(&server_id, &target.id)
+                .await
+                .is_err(),
+            "precondition: the kick went through (the second release, not the first, failed)"
+        );
+        let kicks: Vec<AuditLogEntry> = audit_entries(&harness, &server_id)
+            .await
+            .into_iter()
+            .filter(|entry| entry.action == AuditLogAction::MemberKick)
+            .collect();
+        assert_eq!(kicks.len(), 1, "the kick is recorded: {:?}", kicks);
+        assert_eq!(kicks[0].target.as_deref(), Some(target.id.as_str()));
+        assert_eq!(
+            traces,
+            (0, false, false, false),
+            "the kicked member is evicted before the error is answered"
+        );
+    }
+
     // ---- the kick's order, pinned on its text (AFK S-3 D-2) ----------------
 
     /// `kick`'s body, comment lines dropped and whitespace collapsed.
@@ -623,18 +719,22 @@ mod test {
 
     /// AFK S-3 D-2: rank check, membership removed, then the eviction from
     /// every call in the server, each once, `?`-propagated, and the
-    /// single-pointer removal gone. Mutations: the eviction moved above the
-    /// membership removal; the eviction removed.
+    /// single-pointer removal gone. Protected channels 6.3 (audit C3): the
+    /// removal's kept seat-release error is answered only after the
+    /// eviction. Mutations: the eviction moved above the membership removal;
+    /// the eviction removed; the kept error answered before the eviction.
     #[test]
     fn the_kick_removes_the_membership_then_evicts() {
         const RANK: &str = "return Err(create_error!(NotElevated));";
-        const REMOVE: &str = ".remove(db, &server, RemovalIntention::Kick, false) .await?;";
+        const REMOVE: &str =
+            ".remove_with_outcome(db, &server, RemovalIntention::Kick, false) .await?;";
         const EVICT: &str =
             "remove_user_from_server_voice(db, voice_client, &server, member_id.id).await?;";
+        const RELEASED: &str = "removal.into_result()?; Ok(EmptyResponse)";
 
         let body = route_body();
         let mut last = 0;
-        for needle in [RANK, REMOVE, EVICT] {
+        for needle in [RANK, REMOVE, EVICT, RELEASED] {
             assert_eq!(
                 body.matches(needle).count(),
                 1,
@@ -665,7 +765,8 @@ mod test {
     fn the_kick_validates_the_reason_first_and_records_before_the_eviction() {
         const VALIDATE: &str = "let reason = reason.validated()?;";
         const RANK: &str = "return Err(create_error!(NotElevated));";
-        const REMOVE: &str = ".remove(db, &server, RemovalIntention::Kick, false) .await?;";
+        const REMOVE: &str =
+            ".remove_with_outcome(db, &server, RemovalIntention::Kick, false) .await?;";
         const RECORD: &str = "AuditLogEntry::record(";
         const EVICT: &str =
             "remove_user_from_server_voice(db, voice_client, &server, member_id.id).await?;";

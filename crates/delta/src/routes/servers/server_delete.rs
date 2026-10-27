@@ -42,9 +42,12 @@ pub async fn delete(
         // The membership is removed FIRST (AFK S-3 S6A-1), as a kick and a
         // ban do, so a rejoin racing the eviction below is refused by the
         // join-time Connect re-check (S-3 D-3), which also closes the
-        // sibling-token window of WB-7.
-        member
-            .remove(
+        // sibling-token window of WB-7. An error here is a leave that did not
+        // happen (a retry runs it again); a leave whose second seat release
+        // failed is handed back as `ReleasePending` (protected channels 6.3,
+        // audit C3) and answered after the eviction below.
+        let removal = member
+            .remove_with_outcome(
                 db,
                 &server,
                 RemovalIntention::Leave,
@@ -77,7 +80,11 @@ pub async fn delete(
             }
         }
 
-        Ok(())
+        // A failed second seat release fails the leave (500, never "left"),
+        // now that the user is evicted: the membership is gone and a retried
+        // leave answers NotFound, so the eviction could not run later. The
+        // seat it left is released by a rejoin or a ban.
+        removal.into_result()
     }
     .map(|_| EmptyResponse)
 }
@@ -93,7 +100,7 @@ mod test {
             record_voice_connection, recorded_voice_connections, set_channel_node,
             UserVoiceChannel,
         },
-        Channel, Member, Server,
+        Channel, Database, Member, Server,
     };
     use revolt_models::v0;
     use rocket::http::{Header, Status};
@@ -351,6 +358,84 @@ mod test {
         assert_eq!(traces, (0, false, false, false), "nothing was written");
     }
 
+    // ---- protected channels: a failed second seat release (6.3, C3) -------
+
+    // Compile-only without RabbitMQ and Redis: see the section note above.
+    #[test]
+    fn a_failed_second_release_still_evicts_then_fails_the_leave() {
+        crate::util::test::rt()
+            .block_on(a_failed_second_release_still_evicts_then_fails_the_leave_case())
+    }
+
+    /// A leave whose second seat release fails (its Text group claim
+    /// refused after the first release's went through) has removed the
+    /// membership, so a retried leave answers NotFound and could never
+    /// evict: the user is torn down from the server's calls, THEN the
+    /// release's error is answered (500, never "left"). MONGODB only: the
+    /// reference store cannot fail a write. Control: the route's
+    /// `.remove(..).await?` of 2acdf5f0 (no eviction).
+    async fn a_failed_second_release_still_evicts_then_fails_the_leave_case() {
+        use crate::routes::servers::ban_create::test::{fail_the_claim_after_next, text_group_raw};
+
+        const GROUP: &str = "01C3LEAVEGROUP";
+
+        let harness = TestHarness::new().await;
+        let Database::MongoDb(mongo) = &harness.db else {
+            return;
+        };
+        let (_a, session_a, owner) = harness.new_user().await;
+        let (_b, session_b, leaver) = harness.new_user().await;
+        let protected = harness
+            .new_protected_channel(&owner, &session_a, &[&leaver])
+            .await;
+        let server_id = protected.server.id.clone();
+        text_group_raw(
+            mongo,
+            GROUP,
+            protected.channel.id(),
+            &[&owner.id, &leaver.id],
+        )
+        .await;
+
+        let channel = voice_channel(&harness, &protected.server, "Ended").await;
+        let uvc = UserVoiceChannel::from_channel(&channel);
+        join_recorded(&uvc, &leaver.id, "PA_leave_c3", &leaver.id).await;
+        assert_eq!(
+            voice_traces(&uvc, &leaver.id).await,
+            (1, true, true, true),
+            "the ghost is in place"
+        );
+
+        fail_the_claim_after_next(mongo, GROUP).await;
+        let response = leave(&harness, &session_b.token, &server_id).await;
+        let status = response.status();
+        let body = response.into_string().await.unwrap_or_default();
+        let traces = voice_traces(&uvc, &leaver.id).await;
+        delete_channel_voice_state(&uvc, &[leaver.id.clone()])
+            .await
+            .expect("cleanup");
+
+        assert_eq!(
+            status,
+            Status::InternalServerError,
+            "the failed release is answered: {body}"
+        );
+        assert!(body.contains("DatabaseError"), "{}", body);
+        assert!(
+            harness
+                .db
+                .fetch_member(&server_id, &leaver.id)
+                .await
+                .is_err(),
+            "precondition: the leave went through (the second release, not the first, failed)"
+        );
+        assert_eq!(
+            traces,
+            (0, false, false, false),
+            "the user is evicted before the error is answered"
+        );
+    }
+
     // ---- the leave's order, pinned on its text (AFK S-3 D-2, S6A-1) --------
 
     /// `delete`'s body, comment lines dropped and whitespace collapsed.
@@ -392,21 +477,23 @@ mod test {
     /// propagated; and the single-pointer removal is gone. The report is
     /// pinned here because no route test observes it: an `InternalError` was
     /// already reported where it arose, anything else goes through
-    /// `to_internal_error()` once. Mutations: the eviction moved back above
-    /// the membership removal; its error propagated with `?`; the report
-    /// dropped; the report made unconditional (an `InternalError` reported
-    /// twice).
+    /// `to_internal_error()` once. Protected channels 6.3 (audit C3): the
+    /// removal's kept seat-release error is the branch's answer, after the
+    /// eviction. Mutations: the eviction moved back above the membership
+    /// removal; its error propagated with `?`; the report dropped; the
+    /// report made unconditional (an `InternalError` reported twice); the
+    /// kept error answered before the eviction or dropped.
     #[test]
     fn a_leave_removes_the_membership_before_evicting() {
         const BRANCH: &str = "server.delete(db).await \u{7d} else \u{7b}";
-        const REMOVE: &str = "member .remove( db, &server, RemovalIntention::Leave, \
+        const REMOVE: &str = "member .remove_with_outcome( db, &server, RemovalIntention::Leave, \
                               options.leave_silently.unwrap_or_default(), ) .await?;";
         const EVICT: &str = "if let Err(error) = \
                              remove_user_from_server_voice(db, voice_client, &server, &user.id).await \
                              \u{7b}";
         const REPORT: &str = "if !matches!(error.error_type, ErrorType::InternalError) \u{7b} \
                               let _ = Err::<(), _>(error).to_internal_error(); \u{7d} \u{7d} \
-                              Ok(()) \u{7d}";
+                              removal.into_result() \u{7d}";
 
         let body = route_body();
         let mut last = 0;

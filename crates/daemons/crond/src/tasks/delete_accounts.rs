@@ -18,7 +18,9 @@
 //! (`engine::unlink_account_payments`, run even without a payments config):
 //! when either fails, the account is NOT deleted this run. It stays due, so
 //! the next hourly run tries the whole cascade again; once the account is
-//! marked deleted nothing would ever unlink its orders.
+//! marked deleted nothing would ever unlink its orders. Any other failed
+//! step of one account (reading its user, `User::delete`, marking it
+//! deleted) is handled the same way, so it never stops the rest of the run.
 //!
 //! The Stripe secret key is only handed to the client; it is never logged.
 
@@ -44,7 +46,9 @@ pub async fn task(db: Database, _: revolt_database::AMQP) -> Result<()> {
         let accounts = db.fetch_accounts_due_for_deletion().await?;
         let count = accounts.len();
 
-        if !accounts.is_empty() {
+        let deleted = if accounts.is_empty() {
+            0
+        } else {
             let payments = payments_settings().await.map(|s| {
                 let stripe = ReqwestStripe::new(s.secret_key.clone());
                 (s, stripe)
@@ -53,10 +57,10 @@ pub async fn task(db: Database, _: revolt_database::AMQP) -> Result<()> {
                 .as_ref()
                 .map(|(s, stripe)| (s, stripe as &dyn StripeApi));
 
-            delete_accounts(&db, payments, accounts).await?;
-        }
+            delete_accounts(&db, payments, accounts).await?
+        };
 
-        log::info!("Deleted {count} accounts.");
+        log::info!("Deleted {deleted} of {count} accounts due for deletion.");
 
         sleep(Duration::from_hours(1)).await
     }
@@ -96,12 +100,12 @@ async fn payments_settings() -> Option<PaymentsSettings> {
 }
 
 /// Delete `accounts`: the payments cascade first, then the user, then the
-/// account
+/// account. The number deleted (see [`delete_accounts_with`])
 async fn delete_accounts(
     db: &Database,
     payments: Payments<'_>,
     accounts: Vec<Account>,
-) -> Result<()> {
+) -> Result<usize> {
     delete_accounts_with(db, accounts, |user_id| async move {
         payments_cascade(db, payments, &user_id).await
     })
@@ -109,19 +113,35 @@ async fn delete_accounts(
 }
 
 /// [`delete_accounts`] with the payments cascade passed in (tests inject a
-/// failing one). An account whose cascade fails is skipped, not deleted:
-/// it stays due and the next run tries again.
+/// failing one). The number of accounts deleted.
+///
+/// Each account is isolated: when any of its steps fails (reading the user,
+/// the cascade, `User::delete`, marking the account deleted), the failure is
+/// logged and reported with the account id only, the account is skipped, not
+/// marked deleted, and stays due, so the next run tries it again from the
+/// start; the accounts after it still go ahead. One account that cannot be
+/// deleted (for example one whose protected-channel seat release fails on an
+/// undecodable seat row, design 6.3) must not hold up every deletion queued
+/// behind it. Every step is safe to run again on that retry.
 async fn delete_accounts_with<F, Fut>(
     db: &Database,
     accounts: Vec<Account>,
     cascade: F,
-) -> Result<()>
+) -> Result<usize>
 where
     F: Fn(String) -> Fut,
     Fut: Future<Output = Result<()>>,
 {
+    let mut deleted = 0;
+
     for mut account in accounts {
-        let mut user = db.fetch_user(&account.id).await?;
+        let mut user = match db.fetch_user(&account.id).await {
+            Ok(user) => user,
+            Err(err) => {
+                skip_account(&account.id, "its user could not be read", &err);
+                continue;
+            }
+        };
 
         // Before `User::delete`: the open orders are still linked to the
         // user, so they can be found, voided and refunded
@@ -132,15 +152,61 @@ where
                  {err:?}",
                 user.id
             );
-            revolt_config::capture_error(&err);
+            report_skip(
+                &account.id,
+                "its payment orders could not be unlinked or its membership deleted",
+                &err,
+            );
             continue;
         }
 
-        user.delete(db).await?;
-        account.mark_deleted(db).await?;
+        // A failure part way through can leave the user partly deleted (its
+        // bots and owned servers gone, say); the retry runs it again
+        if let Err(err) = user.delete(db).await {
+            skip_account(&account.id, "deleting its user failed", &err);
+            continue;
+        }
+
+        if let Err(err) = account.mark_deleted(db).await {
+            skip_account(
+                &account.id,
+                "its user was deleted but the account could not be marked deleted",
+                &err,
+            );
+            continue;
+        }
+
+        deleted += 1;
     }
 
-    Ok(())
+    Ok(deleted)
+}
+
+/// Log and report (account id only, never account content) that the
+/// deletion of `account_id` failed at `step` and is retried next run
+fn skip_account(account_id: &str, step: &str, err: &revolt_result::Error) {
+    log::error!(
+        "Account deletion of {account_id}: {step}; not marking the account deleted this run, \
+         retrying next run: {err:?}"
+    );
+    report_skip(account_id, step, err);
+}
+
+/// Report to Sentry that the deletion of `account_id` was skipped at
+/// `step`. The event carries the account id (audit C11: the error alone
+/// does not say which account to look at) and the error, and nothing else
+/// of the account. crond has no Sentry scope API of its own, so the id goes
+/// in the message; one account failing hourly reports once an hour.
+fn report_skip(account_id: &str, step: &str, err: &revolt_result::Error) {
+    revolt_config::capture_message(
+        &skip_report(account_id, step, err),
+        revolt_config::Level::Error,
+    );
+}
+
+/// The Sentry message of [`report_skip`]
+fn skip_report(account_id: &str, step: &str, err: &revolt_result::Error) -> String {
+    format!("Account deletion of {account_id} skipped, retried next run: {step}: {err:?}")
 }
 
 /// The payments cascade for `user_id`. The voids are best-effort (logged by
@@ -164,6 +230,7 @@ async fn payments_cascade(db: &Database, payments: Payments<'_>, user_id: &str) 
 mod tests {
     use iso8601_timestamp::Timestamp;
     use revolt_config::{ApiStripe, FeaturePayments};
+    use revolt_database::test_teardown::TestDatabaseGuard;
     use revolt_database::{
         DatabaseInfo, DeletionInfo, EmailVerification, OrderState, PaymentOrder, User, VoidReason,
     };
@@ -533,5 +600,242 @@ mod tests {
             .await
             .unwrap();
         assert_deleted(&db, "u1").await;
+    }
+
+    /// A fresh database on the driver `TEST_DB` names (it must be set:
+    /// `DatabaseInfo::Test` panics without it rather than reach the
+    /// configured database), in the harness name shape the guard drops when
+    /// the test ends, panics included
+    async fn test_db() -> (Database, TestDatabaseGuard) {
+        let suffix = 1_000_000 + (ulid::Ulid::new().random() % 9_000_000);
+        let db = DatabaseInfo::Test(format!("revolt_test_{suffix}"))
+            .connect()
+            .await
+            .expect("test database");
+        let guard = TestDatabaseGuard::arm(&db).await;
+        (db, guard)
+    }
+
+    /// The accounts due for deletion, in the order of `ids` (the failing
+    /// account first, so a run that stops at it never reaches the others)
+    async fn due_in_order(db: &Database, ids: &[&str]) -> Vec<Account> {
+        let mut due = db.fetch_accounts_due_for_deletion().await.unwrap();
+        due.sort_by_key(|account| ids.iter().position(|id| *id == account.id));
+        assert_eq!(
+            due.iter().map(|a| a.id.as_str()).collect::<Vec<_>>(),
+            ids,
+            "the accounts due for deletion"
+        );
+        due
+    }
+
+    /// The account `id` was not marked deleted and is still due
+    async fn assert_still_due(db: &Database, id: &str) {
+        assert!(
+            matches!(
+                db.fetch_account(id).await.unwrap().deletion,
+                Some(DeletionInfo::Scheduled { .. })
+            ),
+            "{id} is still scheduled for deletion"
+        );
+        let due = db.fetch_accounts_due_for_deletion().await.unwrap();
+        assert!(due.iter().any(|a| a.id == id), "{id} is still due");
+    }
+
+    async fn assert_not_anonymised(db: &Database, id: &str) {
+        let user = db.fetch_user(id).await.unwrap();
+        assert_eq!(
+            user.flags.unwrap_or_default() & UserFlags::Deleted as i32,
+            0,
+            "{id} is not anonymised"
+        );
+    }
+
+    /// An account whose user cannot be read (here it has none) is skipped
+    /// and stays due; the account after it is still deleted, and the next
+    /// run deletes the skipped one once its user can be read. Both drivers.
+    #[tokio::test]
+    async fn an_unreadable_user_does_not_block_the_next_account() {
+        let (db, _guard) = test_db().await;
+        schedule_deletion(&db, "u1").await;
+        insert_user(&db, "u2").await;
+        schedule_deletion(&db, "u2").await;
+
+        let due = due_in_order(&db, &["u1", "u2"]).await;
+        let deleted = delete_accounts_with(&db, due, |_| async { Ok(()) }).await;
+
+        assert_deleted(&db, "u2").await;
+        assert_eq!(deleted.unwrap(), 1, "only u2 was deleted");
+        assert_still_due(&db, "u1").await;
+
+        insert_user(&db, "u1").await;
+        let due = due_in_order(&db, &["u1"]).await;
+        let deleted = delete_accounts_with(&db, due, |_| async { Ok(()) }).await;
+        assert_eq!(deleted.unwrap(), 1);
+        assert_deleted(&db, "u1").await;
+    }
+
+    /// `User::delete` fails for one account: an undecodable `channel_seats`
+    /// row of that user makes its protected-channel seat release fail
+    /// (design 6.3). That account is skipped, not anonymised, and stays due;
+    /// the account after it is still deleted. The next run retries it (and
+    /// fails again while the row is corrupt); once the row is repaired, the
+    /// next run deletes it. Mongo only: the Reference driver cannot hold an
+    /// undecodable row, so there the test returns early.
+    #[tokio::test]
+    async fn a_failed_seat_release_does_not_block_the_next_account() {
+        use revolt_database::mongodb::bson::{doc, Document};
+        use revolt_result::ErrorType;
+
+        let (db, _guard) = test_db().await;
+        let Database::MongoDb(mongo) = &db else {
+            eprintln!(
+                "NOTE a_failed_seat_release_does_not_block_the_next_account: Mongo only, \
+                 skipped under TEST_DB=REFERENCE"
+            );
+            return;
+        };
+        insert_user(&db, "u1").await;
+        insert_user(&db, "u2").await;
+        schedule_deletion(&db, "u1").await;
+        schedule_deletion(&db, "u2").await;
+
+        // An Int32 `channel_id` cannot decode into `ChannelSeat`, and the
+        // row matches the unscoped release's `{user_id, released_at: null}`
+        let seats = mongo.col::<Document>("channel_seats");
+        seats
+            .insert_one(doc! {
+                "_id": "corrupt",
+                "channel_id": 5_i32,
+                "user_id": "u1",
+                "seated_at": 0_i64,
+            })
+            .await
+            .expect("insert the undecodable seat row");
+        let err = db
+            .release_channel_seats_for_user("u1", None, Timestamp::now_utc())
+            .await
+            .expect_err("u1's seat release fails");
+        assert!(
+            matches!(
+                &err.error_type,
+                ErrorType::DatabaseError { collection, .. } if collection == "channel_seats"
+            ),
+            "{err:?}"
+        );
+
+        let due = due_in_order(&db, &["u1", "u2"]).await;
+        let deleted = delete_accounts_with(&db, due, |_| async { Ok(()) }).await;
+
+        assert_deleted(&db, "u2").await;
+        assert_eq!(deleted.unwrap(), 1, "only u2 was deleted");
+        assert_not_anonymised(&db, "u1").await;
+        assert_still_due(&db, "u1").await;
+
+        // Retried next run; the row is still corrupt, so it is kept again
+        let due = due_in_order(&db, &["u1"]).await;
+        let deleted = delete_accounts_with(&db, due, |_| async { Ok(()) }).await;
+        assert_eq!(deleted.unwrap(), 0);
+        assert_not_anonymised(&db, "u1").await;
+        assert_still_due(&db, "u1").await;
+
+        // The operator repair (design 6.3): delete the corrupt row
+        seats
+            .delete_one(doc! { "_id": "corrupt" })
+            .await
+            .expect("delete the corrupt seat row");
+        let due = due_in_order(&db, &["u1"]).await;
+        let deleted = delete_accounts_with(&db, due, |_| async { Ok(()) }).await;
+        assert_eq!(deleted.unwrap(), 1);
+        assert_deleted(&db, "u1").await;
+    }
+
+    /// Marking one account deleted fails after its user was deleted
+    /// (injected: a unique `email_normalised` index, as production has, and
+    /// another account already holding the `Deleted User <id>` address
+    /// `Account::mark_deleted` writes). That account stays due and the
+    /// account after it is still deleted; the next run runs the whole
+    /// deletion again, `User::delete` included, and marks it deleted. Mongo
+    /// only: a Reference save never fails, so there the test returns early.
+    #[tokio::test]
+    async fn a_failed_mark_deleted_does_not_block_the_next_account() {
+        use revolt_database::mongodb::{
+            bson::{doc, Document},
+            options::IndexOptions,
+            IndexModel,
+        };
+
+        let (db, _guard) = test_db().await;
+        let Database::MongoDb(mongo) = &db else {
+            eprintln!(
+                "NOTE a_failed_mark_deleted_does_not_block_the_next_account: Mongo only, \
+                 skipped under TEST_DB=REFERENCE"
+            );
+            return;
+        };
+        insert_user(&db, "u1").await;
+        insert_user(&db, "u2").await;
+        schedule_deletion(&db, "u1").await;
+        schedule_deletion(&db, "u2").await;
+
+        let accounts = mongo.col::<Document>("accounts");
+        accounts
+            .create_index(
+                IndexModel::builder()
+                    .keys(doc! { "email_normalised": 1 })
+                    .options(IndexOptions::builder().unique(true).build())
+                    .build(),
+            )
+            .await
+            .expect("unique email_normalised index");
+        accounts
+            .insert_one(doc! { "_id": "decoy", "email_normalised": "Deleted User u1" })
+            .await
+            .expect("insert the decoy account");
+
+        let due = due_in_order(&db, &["u1", "u2"]).await;
+        let deleted = delete_accounts_with(&db, due, |_| async { Ok(()) }).await;
+
+        assert_deleted(&db, "u2").await;
+        assert_eq!(deleted.unwrap(), 1, "only u2 was deleted");
+        assert_still_due(&db, "u1").await;
+
+        accounts
+            .delete_one(doc! { "_id": "decoy" })
+            .await
+            .expect("delete the decoy account");
+        let due = due_in_order(&db, &["u1"]).await;
+        let deleted = delete_accounts_with(&db, due, |_| async { Ok(()) }).await;
+        assert_eq!(deleted.unwrap(), 1);
+        assert_deleted(&db, "u1").await;
+    }
+
+    /// Audit C11: the Sentry report of a skipped account names the account
+    /// (the error alone does not) and the step, and carries the error.
+    /// Both skip paths (the payments cascade and `skip_account`) report
+    /// through `report_skip`. Mutation: the id dropped from the message.
+    #[test]
+    fn a_skipped_account_is_reported_with_its_id() {
+        let err = create_error!(InternalError);
+        let report = skip_report("01ACCOUNTID", "deleting its user failed", &err);
+        for needle in ["01ACCOUNTID", "deleting its user failed", "InternalError"] {
+            assert!(
+                report.contains(needle),
+                "the report must carry `{needle}`: {report}"
+            );
+        }
+
+        const SOURCE: &str = include_str!("delete_accounts.rs");
+        let shipping = &SOURCE[..SOURCE.find("#[cfg(test)]").expect("the tests")];
+        assert_eq!(
+            shipping.matches("report_skip(").count(),
+            3,
+            "the cascade branch and `skip_account` report through `report_skip` \
+             (plus its definition): {shipping}"
+        );
+        assert!(
+            !shipping.contains("capture_error("),
+            "no skip may be reported without the account id"
+        );
     }
 }
