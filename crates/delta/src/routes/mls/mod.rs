@@ -604,6 +604,7 @@ mod protected_gates {
             signer_user_id: owner.id.clone(),
             signer_device_id: OWNER_DEVICE.to_string(),
             seats: vec![owner.id.clone()],
+            v2: None,
         }
         .build()
         .expect("seat list body");

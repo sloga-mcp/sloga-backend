@@ -335,6 +335,8 @@ impl AbstractProtectedChannels for ReferenceDb {
             seats: &channel_seats,
             text_group: text_group.as_ref(),
             allow_claims: true,
+            // W1-2 wires formats_v2 from config
+            formats_v2: false,
             now,
         })?;
         check_members(&members, &server_id, &decision)?;
@@ -389,6 +391,8 @@ impl AbstractProtectedChannels for ReferenceDb {
             seats: &channel_seats,
             text_group: text_group.as_ref(),
             allow_claims,
+            // W1-2 wires formats_v2 from config
+            formats_v2: false,
             now,
         })?;
         // Claims need an active entitlement (the planner refused

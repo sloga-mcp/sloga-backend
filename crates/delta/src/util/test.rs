@@ -899,6 +899,7 @@ impl TestE2EEDevice {
             signer_user_id: self.user_id.clone(),
             signer_device_id: self.device_id.clone(),
             seats: seats.iter().map(|seat| seat.as_ref().to_string()).collect(),
+            v2: None,
         }
         .build()
         .expect("a canonical seat list body");

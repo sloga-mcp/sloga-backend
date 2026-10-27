@@ -11,17 +11,24 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering::SeqCst};
 use std::time::Instant;
 
+use base64::{engine::general_purpose::STANDARD_NO_PAD, Engine as _};
 use iso8601_timestamp::{Duration, Timestamp};
 use revolt_result::ErrorType;
 use sha2::{Digest, Sha256};
 
 use crate::{
-    channel_seats_used, seat_list_removed_users, Channel, ChannelEntitlement,
-    ChannelEntitlementSource, ChannelEntitlementState, ChannelSeat, Database, E2EEContentType,
-    E2EEEnvelope, HandoverBody, Member, MemberCompositeKey, MlsGroup, MlsGroupCreateOutcome,
-    MlsGroupKind, MlsMemberDevice, SeatList, SeatListBody, SeatListSubmission, SeatReleaseCause,
-    Server, SignedAuthority, SignedHandover, E2EE_PROTOCOL_VERSION, MAX_SEAT_LIST_HANDOVERS,
-    PROTECTED_SCOPE_SEATS, PROTECTED_SCOPE_TEXT_GROUP, SEAT_COOLDOWN_DAYS,
+    channel_seats_used, check_removal_reason, check_seat_list_authority, check_seat_list_v2_lines,
+    plan_seat_list_write, resolve_signer_lost, seat_list_removed_users, text_group_id_v2,
+    text_group_id_v2_input, AuthorityOwnerDevice, AuthorityUserDevice, Channel, ChannelAuthority,
+    ChannelAuthorityBody, ChannelEntitlement, ChannelEntitlementSource, ChannelEntitlementState,
+    ChannelSeat, Database, E2EEContentType, E2EEEnvelope, HandoverBody, Member, MemberCompositeKey,
+    MlsGroup, MlsGroupCreateOutcome, MlsGroupKind, MlsMemberDevice, MlsPendingDeviceRemoval,
+    MlsSignerLost, MlsSignerLostCause, SeatList, SeatListBody, SeatListHistory, SeatListPreHistory,
+    SeatListSubmission, SeatListV2Lines, SeatListWriteDecision, SeatListWriteInput,
+    SeatListWriteKind, SeatListWritePlan, SeatReleaseCause, Server, SignedAuthority,
+    SignedHandover, SignerLostResolution, SuccessionStatement, TextJoinPayload,
+    E2EE_PROTOCOL_VERSION, MAX_COMMIT_AD_LEN, MAX_SEAT_LIST_HANDOVERS, PROTECTED_SCOPE_SEATS,
+    PROTECTED_SCOPE_TEXT_GROUP, SEAT_COOLDOWN_DAYS,
 };
 
 // Section 5.1 inputs
@@ -94,6 +101,7 @@ fn body_with(version: i64, issued_at: i64, seats: &[&str]) -> String {
         signer_user_id: USER_A.to_string(),
         signer_device_id: DEVICE_A.to_string(),
         seats: seats.iter().map(|seat| seat.to_string()).collect(),
+        v2: None,
     }
     .build()
     .unwrap()
@@ -231,6 +239,7 @@ fn submit_in(channel_id: &str, version: i64, seats: &[&str]) -> SeatListSubmissi
             signer_user_id: USER_A.to_string(),
             signer_device_id: DEVICE_A.to_string(),
             seats: seats.iter().map(|seat| seat.to_string()).collect(),
+            v2: None,
         }
         .build()
         .unwrap(),
@@ -412,6 +421,7 @@ fn seat_list_body_matches_the_5_3_vector() {
         signer_device_id: DEVICE_A.to_string(),
         // the builder sorts (5.3 is built from `seats_unsorted`)
         seats: vec![USER_C.to_string(), USER_A.to_string(), USER_B.to_string()],
+        v2: None,
     }
     .build()
     .unwrap();
@@ -1871,6 +1881,7 @@ async fn seat_claims_need_the_growth_flag_but_retries_and_removals_do_not() {
                 signer_user_id: USER_A.to_string(),
                 signer_device_id: DEVICE_A.to_string(),
                 seats: vec![USER_A.to_string()],
+                v2: None,
             }
             .build()
             .unwrap(),
@@ -1942,6 +1953,7 @@ async fn protect_needs_the_owner_and_every_claim_needs_a_member() {
                 signer_user_id: USER_B.to_string(),
                 signer_device_id: DEVICE_B.to_string(),
                 seats: vec![USER_B.to_string()],
+                v2: None,
             }
             .build()
             .unwrap(),
@@ -3779,4 +3791,2129 @@ fn seat_list_authority_is_absent_when_empty() {
 fn protected_scopes_are_the_wire_strings() {
     assert_eq!(PROTECTED_SCOPE_SEATS, "seats");
     assert_eq!(PROTECTED_SCOPE_TEXT_GROUP, "text_group");
+}
+
+// ---------------------------------------------------------------------------
+// S2 (W1-1b): the 5.8 `tv2:` vectors and the 4.3 "S2 additions" rules
+// ---------------------------------------------------------------------------
+
+// `tv:inputs` seeds (5.1) and `tv2:inputs` (5.8)
+const OWNER_SEED: &str = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
+const MEMBER_SEED: &str = "202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f";
+const NEW_OWNER_SEED: &str = "808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9f";
+const CID: &str = "01JA0000000000000000000MSG";
+const GROUP_SALT: &str = "a0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebf";
+const SEAT_V2_VERSION: i64 = 4;
+const SEAT_V2_DEVICE_CAP: u32 = 5;
+const SEAT_V2_ISSUED_AT: i64 = 1_790_812_860_000;
+const AUTHORITY_VERSION: i64 = 1;
+const AUTHORITY_ISSUED_AT: i64 = 1_790_812_860_000;
+const AUTHORITY_DELEGATE_MAX_DEVICE_CAP: u32 = 5;
+const JOIN_GENERATION: u32 = 0;
+const JOIN_KEY_PACKAGE_REF: &str = "S2JvaW5LZXlQYWNrYWdlUmVmVjE+/0123456789";
+const JOIN_ISSUED_AT: i64 = 1_790_812_870_000;
+const SUCCESSION_RANK: u8 = 1;
+const SUCCESSION_ISSUED_AT: i64 = 1_790_812_880_000;
+const EXTRA1_SEED: &str = "c0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedf";
+const EXTRA2_SEED: &str = "e0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff";
+
+// Section 5.2 member key; `MAX` of the 5.8 worst case
+const MEMBER_IDENTITY_KEY: &str = "Kay64UG8yvCyLhqU000LxzYeUm0L/hLIl5S8kyKWbdc";
+const MAX_INT: i64 = 9_007_199_254_740_991;
+
+// The `tv2:` expected values, copied verbatim from 5.8. Each test rebuilds
+// the value from the inputs above and compares.
+const TV2_AUTHORITY_BODY: &str = "sloga-channel-authority-v1\nv:1\nchannel_id:01J9Z3K4M5N6P7Q8R9S0T1V2W3\nversion:1\nowner_user_id:01HZXAAAAAAAAAAAAAAAAAAAAA\nsigner_device_id:00112233445566778899aabbccddeeff\nissued_at:1790812860000\nowner_devices:00112233445566778899aabbccddeeff.A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg,0123456789abcdef0123456789abcdef.zRSzf5VulTGU/3+3Oz2B3MVh1hp1OAlLfD4aZD7l86o\ndelegates:01HZXBBBBBBBBBBBBBBBBBBBBB.ffeeddccbbaa99887766554433221100.Kay64UG8yvCyLhqU000LxzYeUm0L/hLIl5S8kyKWbdc\ndelegate_scope:seat\ndelegate_max_device_cap:5\nsuccessors:01HZXBBBBBBBBBBBBBBBBBBBBB.ffeeddccbbaa99887766554433221100.Kay64UG8yvCyLhqU000LxzYeUm0L/hLIl5S8kyKWbdc\nprev:";
+const TV2_AUTHORITY_BODY_SHA256: &str =
+    "0277b8d50e6322568380e1fede0ee1a7a03ae70444420445e86d10e99dc7cd71";
+const TV2_AUTHORITY_SIGNATURE: &str =
+    "xRMnLtvVVtb5tra2OK01NOd+gCbkWfTqnQSYJThQ1Wlc5Cv2XObDdLXviQH/kji2qjWDRj7PMWDTfqkQusupAA";
+const TV2_SEAT_LIST_V2_BODY: &str = "sloga-seat-list-v2\nv:2\nchannel_id:01J9Z3K4M5N6P7Q8R9S0T1V2W3\nversion:4\ndevice_cap:5\nissued_at:1790812860000\nsigner_user_id:01HZXAAAAAAAAAAAAAAAAAAAAA\nsigner_device_id:00112233445566778899aabbccddeeff\nseats:01HZXAAAAAAAAAAAAAAAAAAAAA,01HZXBBBBBBBBBBBBBBBBBBBBB,01HZXCCCCCCCCCCCCCCCCCCCCC\nauthority:0277b8d50e6322568380e1fede0ee1a7a03ae70444420445e86d10e99dc7cd71\nhistory:visible\nhistory_boundary:\npre_history:kept\ngroup_salt:a0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebf";
+const TV2_SEAT_LIST_V2_BODY_SHA256: &str =
+    "6822d2c987006383581ee0cf0c5fd758dd3785bb2c214d514332dd7eed336806";
+const TV2_SEAT_LIST_V2_SIGNATURE: &str =
+    "2fpKyQ7i80lUPxe8a4K8CjJAeoRR1xH4s3owXpN4L92AeR2ot0pcaRD/qLR8bbH97vLzYNNQ/5jP+M6GXybwAg";
+const TV2_GROUP_ID_V2_INPUT_G0_HEX: [&str; 4] = [
+    "0013736c6f67612d746578742d67726f75702d7632",
+    "001a30314a395a334b344d354e365037513852395330543156325733",
+    "0000000000000000",
+    "0020a0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebf",
+];
+const TV2_GROUP_ID_V2_G0: &str = "6036022873e9088d763291333fd3aad4eed2efa4ad97edc74349494d0fa24ac3";
+const TV2_GROUP_ID_V2_G1: &str = "f5d67f0df1e16b362c46ede8a927a8cb63b95ddca63822da6d691475b56fe81f";
+const TV2_GROUP_ID_V2_G64: &str =
+    "787025fd12b11b64a85630a1fa261c420d919691633a6ab349a51173c671eb95";
+const TV2_GROUP_ID_V2_G65535: &str =
+    "c6e859ede61183b2d91d57c50484667f004a96e931dc5cbc38d614674ae5e4c3";
+const TV2_COMMIT_AD_V2_HEX: [&str; 8] = [
+    "0017736c6f67612d746578742d636f6d6d69742d61642d7632",
+    "01e8736c6f67612d736561742d6c6973742d76320a763a320a6368616e6e656c5f69643a30314a395a334b344d354e3650375138523953305431563257330a76657273696f6e3a340a6465766963655f6361703a350a6973737565645f61743a313739303831323836303030300a7369676e65725f757365725f69643a3031485a584141414141414141414141414141414141414141410a7369676e65725f6465766963655f69643a30303131323233333434353536363737383839396161626263636464656566660a73656174733a3031485a584141414141414141414141414141414141414141412c3031485a584242424242424242424242424242424242424242422c3031485a584343434343434343434343434343434343434343430a617574686f726974793a303237376238643530653633323235363833383065316665646530656531613761303361653730343434343230343435653836643130653939646337636437310a686973746f72793a76697369626c650a686973746f72795f626f756e646172793a0a7072655f686973746f72793a6b6570740a67726f75705f73616c743a61306131613261336134613561366137613861396161616261636164616561666230623162326233623462356236623762386239626162626263626462656266",
+    "0040d9fa4ac90ee2f349543f17bc6b82bc0a32407a8451d711f8b37a305e93782fdd80791da8b74a5c6910ffa8b47c6db1fdeef2f360d350ff98cff8ce865f26f002",
+    "0001",
+    "017f736c6f67612d6f776e65722d68616e646f7665722d76310a763a310a6368616e6e656c5f69643a30314a395a334b344d354e3650375138523953305431563257330a66726f6d5f757365725f69643a3031485a584141414141414141414141414141414141414141410a66726f6d5f6465766963655f69643a30303131323233333434353536363737383839396161626263636464656566660a66726f6d5f6964656e746974795f6b65793a41364548762f504f454c3464634e3059353076416d57666b316a436270513166486479475a424a564d62670a746f5f757365725f69643a3031485a584141414141414141414141414141414141414141410a746f5f6465766963655f69643a30313233343536373839616263646566303132333435363738396162636465660a746f5f6964656e746974795f6b65793a7a52537a663556756c5447552f332b334f7a3242334d5668316870314f416c4c664434615a44376c38366f0a6973737565645f61743a31373930383132383030303030",
+    "004024a9d8b5a88afe2ded612c55ef55e85f2cfd9745da0ec588873a02bbcb3d22e4dd9859965f904db68121a6dfaff604af844fa7a92dbf919100d025fa82247a04",
+    "0282736c6f67612d6368616e6e656c2d617574686f726974792d76310a763a310a6368616e6e656c5f69643a30314a395a334b344d354e3650375138523953305431563257330a76657273696f6e3a310a6f776e65725f757365725f69643a3031485a584141414141414141414141414141414141414141410a7369676e65725f6465766963655f69643a30303131323233333434353536363737383839396161626263636464656566660a6973737565645f61743a313739303831323836303030300a6f776e65725f646576696365733a30303131323233333434353536363737383839396161626263636464656566662e41364548762f504f454c3464634e3059353076416d57666b316a436270513166486479475a424a564d62672c30313233343536373839616263646566303132333435363738396162636465662e7a52537a663556756c5447552f332b334f7a3242334d5668316870314f416c4c664434615a44376c38366f0a64656c6567617465733a3031485a584242424242424242424242424242424242424242422e66666565646463636262616139393838373736363535343433333232313130302e4b61793634554738797643794c6871553030304c787a5965556d304c2f684c496c3553386b794b576264630a64656c65676174655f73636f70653a736561740a64656c65676174655f6d61785f6465766963655f6361703a350a737563636573736f72733a3031485a584242424242424242424242424242424242424242422e66666565646463636262616139393838373736363535343433333232313130302e4b61793634554738797643794c6871553030304c787a5965556d304c2f684c496c3553386b794b576264630a707265763a",
+    "0040c513272edbd556d6f9b6b6b638ad3534e77e8026e459f4ea9d0498253850d5695ce42bf65ce6c374b5ef8901ff9238b6aa3583463ecf3160d37ea910bacba900",
+];
+const TV2_COMMIT_AD_V2_SHA256: &str =
+    "38495363a9d10a817ed464523a1d17852f6c634008124118d6ff814397299d46";
+const TV2_TEXT_JOIN_BODY: &str = "sloga-text-join-v1\nv:1\nuser_id:01HZXBBBBBBBBBBBBBBBBBBBBB\ndevice_id:ffeeddccbbaa99887766554433221100\nchannel_id:01J9Z3K4M5N6P7Q8R9S0T1V2W3\ngeneration:0\ngroup_id:6036022873e9088d763291333fd3aad4eed2efa4ad97edc74349494d0fa24ac3\nkey_package_ref:S2JvaW5LZXlQYWNrYWdlUmVmVjE+/0123456789\nissued_at:1790812870000";
+const TV2_TEXT_JOIN_SIGNATURE: &str =
+    "l6DoK5goYia40tveyilADPFzJ46y8uVz/IUGtdn3DuybteG/t0xU1Hfur8G0siBGCbEVQNxzNiGKayHnCjKABw";
+const TV2_SUCCESSION_BODY: &str = "sloga-owner-succession-v1\nv:1\nchannel_id:01J9Z3K4M5N6P7Q8R9S0T1V2W3\nfrom_user_id:01HZXAAAAAAAAAAAAAAAAAAAAA\nfrom_identity_key:A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg\nto_user_id:01HZXBBBBBBBBBBBBBBBBBBBBB\nto_device_id:ffeeddccbbaa99887766554433221100\nto_identity_key:Kay64UG8yvCyLhqU000LxzYeUm0L/hLIl5S8kyKWbdc\nauthority_sha256:0277b8d50e6322568380e1fede0ee1a7a03ae70444420445e86d10e99dc7cd71\nrank:1\nissued_at:1790812880000";
+const TV2_SUCCESSION_SIGNATURE: &str =
+    "FTQqMwVpolS3sn+iveaRPZwuthYIbGn1P99OBmLp1OpCrcOYSG8C3o90XFn1LsqMt3yxRBiJqtHkW+6mOEZhCw";
+const TV2_WORST_COMMIT_AD_V2_LEN: &str = "14112";
+const TV2_WORST_COMMIT_AD_V2_SHA256: &str =
+    "745d6adff648976eb588bab96cb005001819f66858b6556bba5f59bf3dcd68c1";
+
+fn unhex(value: &str) -> Vec<u8> {
+    (0..value.len())
+        .step_by(2)
+        .map(|index| u8::from_str_radix(&value[index..index + 2], 16).unwrap())
+        .collect()
+}
+
+fn signing_key(seed_hex: &str) -> ed25519_dalek::SigningKey {
+    ed25519_dalek::SigningKey::from_bytes(&unhex(seed_hex).try_into().unwrap())
+}
+
+/// b64 of the Ed25519 public key of a seed (5.2)
+fn identity_key_of(seed_hex: &str) -> String {
+    STANDARD_NO_PAD.encode(signing_key(seed_hex).verifying_key().as_bytes())
+}
+
+/// b64 Ed25519 signature by a seed (deterministic, so the 5.8 signatures
+/// are reproducible)
+fn sign_b64(seed_hex: &str, message: &str) -> String {
+    use ed25519_dalek::Signer;
+    STANDARD_NO_PAD.encode(signing_key(seed_hex).sign(message.as_bytes()).to_bytes())
+}
+
+fn hex32(n: u32) -> String {
+    format!("{n:032x}")
+}
+
+/// Refused with `FailedValidation` by the rule whose message contains
+/// `needle`, so a rule's test fails when that rule is gone even if another
+/// rule refuses the input. Every failure names `case`.
+fn assert_refused<T: std::fmt::Debug>(result: revolt_result::Result<T>, needle: &str, case: &str) {
+    match result {
+        Err(error) => match error.error_type {
+            ErrorType::FailedValidation { error } => assert!(
+                error.contains(needle),
+                "{case}: refused with {error:?}, expected {needle:?}"
+            ),
+            other => panic!("{case}: expected FailedValidation, got {other:?}"),
+        },
+        Ok(value) => panic!("{case}: expected a refusal, got {value:?}"),
+    }
+}
+
+fn is_resecuring(error: &revolt_result::Error) -> bool {
+    matches!(&error.error_type, ErrorType::ProtectedChannelResecuring { reason } if reason == "owner_device_lost")
+}
+
+/// `body` with the value of its one `label:` line replaced
+fn with_line(body: &str, label: &str, value: &str) -> String {
+    let prefix = format!("{label}:");
+    let mut found = 0;
+    let lines: Vec<String> = body
+        .split('\n')
+        .map(|line| {
+            if line.starts_with(&prefix) {
+                found += 1;
+                format!("{prefix}{value}")
+            } else {
+                line.to_string()
+            }
+        })
+        .collect();
+    assert_eq!(found, 1, "{label}");
+    lines.join("\n")
+}
+
+fn owner_device(device_id: &str, identity_key: &str) -> AuthorityOwnerDevice {
+    AuthorityOwnerDevice {
+        device_id: device_id.to_string(),
+        identity_key: identity_key.to_string(),
+    }
+}
+
+fn user_device(user_id: &str, device_id: &str, identity_key: &str) -> AuthorityUserDevice {
+    AuthorityUserDevice {
+        user_id: user_id.to_string(),
+        device_id: device_id.to_string(),
+        identity_key: identity_key.to_string(),
+    }
+}
+
+/// The 5.8 authority from its inputs; the owner devices are given out of
+/// order (the builder sorts)
+fn vector_authority() -> ChannelAuthorityBody {
+    ChannelAuthorityBody {
+        channel_id: CHANNEL.to_string(),
+        version: AUTHORITY_VERSION,
+        owner_user_id: USER_A.to_string(),
+        signer_device_id: DEVICE_A.to_string(),
+        issued_at: AUTHORITY_ISSUED_AT,
+        owner_devices: vec![
+            owner_device(DEVICE_A2, &identity_key_of(NEW_OWNER_SEED)),
+            owner_device(DEVICE_A, &identity_key_of(OWNER_SEED)),
+        ],
+        delegates: vec![user_device(USER_B, DEVICE_B, &identity_key_of(MEMBER_SEED))],
+        delegate_max_device_cap: AUTHORITY_DELEGATE_MAX_DEVICE_CAP,
+        successors: vec![user_device(USER_B, DEVICE_B, &identity_key_of(MEMBER_SEED))],
+        prev: None,
+    }
+}
+
+/// The 5.8 seat list v2 (5.3's seats, unsorted: the builder sorts)
+fn vector_seat_list_v2(authority_sha256: &str) -> SeatListBody {
+    SeatListBody {
+        channel_id: CHANNEL.to_string(),
+        version: SEAT_V2_VERSION,
+        device_cap: SEAT_V2_DEVICE_CAP,
+        issued_at: SEAT_V2_ISSUED_AT,
+        signer_user_id: USER_A.to_string(),
+        signer_device_id: DEVICE_A.to_string(),
+        seats: vec![USER_C.to_string(), USER_A.to_string(), USER_B.to_string()],
+        v2: Some(SeatListV2Lines {
+            authority_sha256: Some(authority_sha256.to_string()),
+            // `seat_v2_history`, `seat_v2_pre_history`
+            history: SeatListHistory::Visible,
+            history_boundary: None,
+            pre_history: SeatListPreHistory::Kept,
+            group_salt: GROUP_SALT.to_string(),
+        }),
+    }
+}
+
+/// The 5.8 AD v2 row: the v2 list, the 5.4 handover and the 5.8 authority,
+/// every signature computed from its seed
+fn vector_v2_row() -> SeatList {
+    let authority = ChannelAuthority::build(&vector_authority()).unwrap();
+    let body = vector_seat_list_v2(&ChannelAuthority::sha256(&authority))
+        .build()
+        .unwrap();
+    SeatList {
+        id: CHANNEL.to_string(),
+        version: SEAT_V2_VERSION,
+        signature: sign_b64(OWNER_SEED, &body),
+        body,
+        signer_user_id: USER_A.to_string(),
+        signer_device_id: DEVICE_A.to_string(),
+        handovers: vec![SignedHandover {
+            body: VECTOR_HANDOVER_BODY.to_string(),
+            signature: sign_b64(OWNER_SEED, VECTOR_HANDOVER_BODY),
+        }],
+        updated_at: at(0),
+        authority: Some(SignedAuthority {
+            signature: sign_b64(OWNER_SEED, &authority),
+            body: authority,
+        }),
+    }
+}
+
+/// Chain entries of filler bodies (the AD builder never parses chain
+/// entries, as in S1) that bring an AD of `base_len` bytes to `target`
+fn filler_chain(base_len: usize, target: usize) -> Vec<SignedHandover> {
+    let mut remaining = target - base_len;
+    let mut chain = Vec::new();
+    while remaining > 0 {
+        assert!(remaining > 68, "filler chain cannot hit {target} exactly");
+        let len = (remaining - 68).min(1024);
+        chain.push(SignedHandover {
+            body: "x".repeat(len),
+            signature: signature(chain.len() as i64),
+        });
+        remaining -= 68 + len;
+    }
+    assert!(chain.len() <= MAX_SEAT_LIST_HANDOVERS);
+    chain
+}
+
+#[test]
+fn s2_seeds_give_the_5_2_identity_keys() {
+    assert_eq!(identity_key_of(OWNER_SEED), OWNER_IDENTITY_KEY);
+    assert_eq!(identity_key_of(NEW_OWNER_SEED), NEW_OWNER_IDENTITY_KEY);
+    assert_eq!(identity_key_of(MEMBER_SEED), MEMBER_IDENTITY_KEY);
+}
+
+#[test]
+fn authority_matches_the_5_8_vector() {
+    let body = ChannelAuthority::build(&vector_authority()).unwrap();
+    assert_eq!(body, TV2_AUTHORITY_BODY);
+    assert_eq!(ChannelAuthority::sha256(&body), TV2_AUTHORITY_BODY_SHA256);
+    assert_eq!(sign_b64(OWNER_SEED, &body), TV2_AUTHORITY_SIGNATURE);
+
+    let mut sorted = vector_authority();
+    sorted.owner_devices.reverse();
+    assert_eq!(ChannelAuthority::parse(TV2_AUTHORITY_BODY).unwrap(), sorted);
+}
+
+#[test]
+fn seat_list_v2_matches_the_5_8_vector() {
+    let authority = ChannelAuthority::build(&vector_authority()).unwrap();
+    let authority_sha256 = ChannelAuthority::sha256(&authority);
+    let unsorted = vector_seat_list_v2(&authority_sha256);
+    let body = unsorted.build().unwrap();
+    assert_eq!(body, TV2_SEAT_LIST_V2_BODY);
+    assert_eq!(unsorted.build_v2().unwrap(), TV2_SEAT_LIST_V2_BODY);
+    assert_eq!(
+        hex(&Sha256::digest(body.as_bytes())),
+        TV2_SEAT_LIST_V2_BODY_SHA256
+    );
+    assert_eq!(sign_b64(OWNER_SEED, &body), TV2_SEAT_LIST_V2_SIGNATURE);
+
+    // `parse` dispatches on the context line; `parse_v1` refuses v2 bytes
+    let parsed = SeatListBody::parse(TV2_SEAT_LIST_V2_BODY).unwrap();
+    assert_eq!(
+        parsed,
+        SeatListBody {
+            seats: vec![USER_A.to_string(), USER_B.to_string(), USER_C.to_string()],
+            ..unsorted
+        }
+    );
+    assert_eq!(
+        SeatListBody::parse_v2(TV2_SEAT_LIST_V2_BODY).unwrap(),
+        parsed
+    );
+    assert_refused(
+        SeatListBody::parse_v1(TV2_SEAT_LIST_V2_BODY),
+        "exactly 9 lines",
+        "v2 bytes through parse_v1",
+    );
+}
+
+/// v1 byte identity: an S1 body still parses as v1 (no v2 lines) and builds
+/// back to the same bytes; `build_v2` refuses it
+#[test]
+fn s1_bodies_still_parse_as_v1_and_rebuild_byte_identical() {
+    let parsed = SeatListBody::parse(VECTOR_BODY).unwrap();
+    assert_eq!(parsed.v2, None);
+    assert_eq!(SeatListBody::parse_v1(VECTOR_BODY).unwrap(), parsed);
+    assert_eq!(parsed.build().unwrap(), VECTOR_BODY);
+    assert_refused(
+        SeatListBody::parse_v2(VECTOR_BODY),
+        "exactly 14 lines",
+        "v1 bytes through parse_v2",
+    );
+    assert_refused(
+        parsed.build_v2(),
+        "v2 lines missing",
+        "build_v2 of a v1 body",
+    );
+}
+
+#[test]
+fn seat_list_v2_body_refuses_every_non_canonical_form() {
+    let base = TV2_SEAT_LIST_V2_BODY;
+    let mut swapped: Vec<&str> = base.split('\n').collect();
+    swapped.swap(10, 12);
+    let swapped = swapped.join("\n");
+
+    let cases: Vec<(&str, String, &str)> = vec![
+        ("trailing LF", format!("{base}\n"), "exactly 14 lines"),
+        ("CR", base.replacen('\n', "\r\n", 1), "contains CR"),
+        (
+            "13 lines",
+            base.rsplit_once('\n').unwrap().0.to_string(),
+            "exactly 14 lines",
+        ),
+        (
+            "v2 context, v:1",
+            base.replace("\nv:2\n", "\nv:1\n"),
+            "context or format version",
+        ),
+        (
+            "v1 context, v:2, 14 lines",
+            base.replace("sloga-seat-list-v2", "sloga-seat-list-v1"),
+            "exactly 9 lines",
+        ),
+        (
+            "v1 context, v:2, 9 lines",
+            VECTOR_BODY.replace("\nv:1\n", "\nv:2\n"),
+            "context or format version",
+        ),
+        (
+            "authority charset",
+            with_line(base, "authority", &TV2_AUTHORITY_BODY_SHA256.to_uppercase()),
+            "seat list authority",
+        ),
+        (
+            "authority length",
+            with_line(base, "authority", &TV2_AUTHORITY_BODY_SHA256[..63]),
+            "seat list authority",
+        ),
+        (
+            "history value",
+            with_line(base, "history", "shown"),
+            "seat list history",
+        ),
+        (
+            "boundary charset",
+            with_line(base, "history_boundary", &CID.to_lowercase()),
+            "seat list history_boundary",
+        ),
+        (
+            "pre_history value",
+            with_line(base, "pre_history", "gone"),
+            "seat list pre_history",
+        ),
+        (
+            "wiped without a boundary",
+            with_line(base, "pre_history", "wiped"),
+            "wiped without a boundary",
+        ),
+        (
+            "empty salt",
+            with_line(base, "group_salt", ""),
+            "seat list group_salt",
+        ),
+        (
+            "salt charset",
+            with_line(base, "group_salt", &GROUP_SALT.to_uppercase()),
+            "seat list group_salt",
+        ),
+        ("lines out of order", swapped, "seat list label"),
+        (
+            "seats unsorted",
+            with_line(base, "seats", &format!("{USER_B},{USER_A},{USER_C}")),
+            "not sorted and unique",
+        ),
+    ];
+    for (case, body, needle) in &cases {
+        assert_ne!(body, base, "{case} changed nothing");
+        assert_refused(SeatListBody::parse(body), needle, case);
+    }
+
+    // Format-valid: an empty authority line, `hidden`, a boundary with `wiped`
+    for valid in [
+        with_line(base, "authority", ""),
+        with_line(base, "history", "hidden"),
+        with_line(
+            &with_line(base, "history_boundary", CID),
+            "pre_history",
+            "wiped",
+        ),
+    ] {
+        assert!(SeatListBody::parse(&valid).is_ok(), "{valid}");
+    }
+}
+
+#[test]
+fn channel_authority_refuses_every_format_violation() {
+    let base = TV2_AUTHORITY_BODY;
+    let a = format!("{DEVICE_A}.{OWNER_IDENTITY_KEY}");
+    let a2 = format!("{DEVICE_A2}.{NEW_OWNER_IDENTITY_KEY}");
+    let entry = |user: &str, n: u32| format!("{user}.{}.{MEMBER_IDENTITY_KEY}", hex32(n));
+    let joined = |entries: Vec<String>| entries.join(",");
+    let hash = "ab".repeat(32);
+
+    let cases: Vec<(&str, String, &str)> = vec![
+        ("trailing LF", format!("{base}\n"), "exactly 13 lines"),
+        ("CR", base.replacen('\n', "\r\n", 1), "contains CR"),
+        (
+            "12 lines",
+            base.rsplit_once('\n').unwrap().0.to_string(),
+            "exactly 13 lines",
+        ),
+        (
+            "context",
+            base.replace("sloga-channel-authority-v1", "sloga-channel-authority-v2"),
+            "context or format version",
+        ),
+        (
+            "format version",
+            base.replace("\nv:1\n", "\nv:2\n"),
+            "context or format version",
+        ),
+        (
+            "over 3072 bytes",
+            with_line(base, "delegates", &"x".repeat(3100)),
+            "too long",
+        ),
+        (
+            "label",
+            base.replace("owner_user_id:", "owner_user:"),
+            "authority label",
+        ),
+        (
+            "channel charset",
+            with_line(base, "channel_id", &CHANNEL.to_lowercase()),
+            "authority channel_id",
+        ),
+        (
+            "version 0",
+            with_line(base, "version", "0"),
+            "authority version",
+        ),
+        (
+            "version leading zero",
+            with_line(base, "version", "01"),
+            "authority version",
+        ),
+        (
+            "version above 2^53 - 1",
+            with_line(base, "version", "9007199254740992"),
+            "authority version",
+        ),
+        (
+            "owner charset",
+            with_line(base, "owner_user_id", &USER_A.to_lowercase()),
+            "authority owner_user_id",
+        ),
+        (
+            "signer device charset",
+            with_line(base, "signer_device_id", &DEVICE_A.to_uppercase()),
+            "authority signer_device_id",
+        ),
+        (
+            "issued_at above 2^53 - 1",
+            with_line(base, "issued_at", "9007199254740992"),
+            "authority issued_at",
+        ),
+        (
+            "no owner device",
+            with_line(base, "owner_devices", ""),
+            "owner_devices count",
+        ),
+        (
+            "six owner devices",
+            with_line(
+                base,
+                "owner_devices",
+                &joined(
+                    (0..6)
+                        .map(|n| format!("{}.{OWNER_IDENTITY_KEY}", hex32(n)))
+                        .collect(),
+                ),
+            ),
+            "owner_devices count",
+        ),
+        (
+            "owner devices unsorted",
+            with_line(base, "owner_devices", &format!("{a2},{a}")),
+            "owner_devices not sorted",
+        ),
+        (
+            "owner device twice",
+            with_line(
+                base,
+                "owner_devices",
+                &format!("{a},{DEVICE_A}.{NEW_OWNER_IDENTITY_KEY}"),
+            ),
+            "device id twice",
+        ),
+        (
+            "owner identity key twice",
+            with_line(
+                base,
+                "owner_devices",
+                &format!("{a},{DEVICE_A2}.{OWNER_IDENTITY_KEY}"),
+            ),
+            "owner identity key twice",
+        ),
+        (
+            "signer device not an owner device",
+            with_line(base, "signer_device_id", DEVICE_B),
+            "no owner_devices entry",
+        ),
+        (
+            "owner entry shape",
+            with_line(base, "owner_devices", &format!("{USER_A}.{a}")),
+            "entry shape",
+        ),
+        (
+            "owner entry key",
+            with_line(
+                base,
+                "owner_devices",
+                &format!("{DEVICE_A}.{}", &OWNER_IDENTITY_KEY[..42]),
+            ),
+            "entry charset",
+        ),
+        (
+            "empty entry",
+            with_line(base, "owner_devices", &format!("{a},,{a2}")),
+            "empty entry",
+        ),
+        (
+            "owner as delegate",
+            with_line(base, "delegates", &entry(USER_A, 1)),
+            "names the owner",
+        ),
+        (
+            "delegates unsorted",
+            with_line(
+                base,
+                "delegates",
+                &format!("{},{}", entry(USER_C, 2), entry(USER_B, 1)),
+            ),
+            "delegates not sorted",
+        ),
+        (
+            "delegate device twice",
+            with_line(
+                base,
+                "delegates",
+                &format!("{},{}", entry(USER_B, 1), entry(USER_C, 1)),
+            ),
+            "device id twice",
+        ),
+        (
+            "eleven delegates",
+            with_line(
+                base,
+                "delegates",
+                &joined((0..11).map(|n| entry(&numbered_user(n), n)).collect()),
+            ),
+            "too many entries",
+        ),
+        (
+            "delegate entry shape",
+            with_line(base, "delegates", &format!("{USER_B}.{DEVICE_B}")),
+            "entry shape",
+        ),
+        (
+            "delegate scope",
+            with_line(base, "delegate_scope", "all"),
+            "authority delegate_scope",
+        ),
+        (
+            "empty delegate scope",
+            with_line(base, "delegate_scope", ""),
+            "authority delegate_scope",
+        ),
+        (
+            "delegate cap above u32",
+            with_line(base, "delegate_max_device_cap", "4294967296"),
+            "delegate_max_device_cap",
+        ),
+        (
+            "owner as successor",
+            with_line(base, "successors", &entry(USER_A, 1)),
+            "names the owner",
+        ),
+        (
+            "six successor users",
+            with_line(
+                base,
+                "successors",
+                &joined((0..6).map(|n| entry(&numbered_user(n), n)).collect()),
+            ),
+            "more than 5 successor users",
+        ),
+        (
+            "successors not contiguous",
+            with_line(
+                base,
+                "successors",
+                &format!(
+                    "{},{},{}",
+                    entry(USER_B, 1),
+                    entry(USER_C, 2),
+                    entry(USER_B, 3)
+                ),
+            ),
+            "not contiguous",
+        ),
+        (
+            "successor devices unsorted",
+            with_line(
+                base,
+                "successors",
+                &format!("{},{}", entry(USER_B, 2), entry(USER_B, 1)),
+            ),
+            "successor devices not sorted",
+        ),
+        (
+            "eleven successors",
+            with_line(
+                base,
+                "successors",
+                &joined((0..11).map(|n| entry(&numbered_user(n / 3), n)).collect()),
+            ),
+            "too many entries",
+        ),
+        (
+            "prev at version 1",
+            with_line(base, "prev", &hash),
+            "exactly at version 1",
+        ),
+        (
+            "no prev at version 2",
+            with_line(base, "version", "2"),
+            "exactly at version 1",
+        ),
+        (
+            "prev charset",
+            with_line(
+                &with_line(base, "version", "2"),
+                "prev",
+                &hash.to_uppercase(),
+            ),
+            "authority prev",
+        ),
+    ];
+    for (case, body, needle) in &cases {
+        assert_ne!(body, base, "{case} changed nothing");
+        assert_refused(ChannelAuthority::parse(body), needle, case);
+    }
+
+    // The bounds are inclusive: 5 owner devices, 10 delegates, 5 successor
+    // users with 2 devices each, the u32 cap, empty lists
+    let five_owner_devices = joined(
+        [
+            (hex32(1), MEMBER_IDENTITY_KEY.to_string()),
+            (hex32(2), identity_key_of(EXTRA1_SEED)),
+            (hex32(3), identity_key_of(EXTRA2_SEED)),
+            (DEVICE_A.to_string(), OWNER_IDENTITY_KEY.to_string()),
+            (DEVICE_A2.to_string(), NEW_OWNER_IDENTITY_KEY.to_string()),
+        ]
+        .iter()
+        .map(|(device, key)| format!("{device}.{key}"))
+        .collect(),
+    );
+    let valid = [
+        with_line(base, "owner_devices", &five_owner_devices),
+        with_line(
+            base,
+            "delegates",
+            &joined((0..10).map(|n| entry(&numbered_user(n), n)).collect()),
+        ),
+        with_line(
+            base,
+            "successors",
+            &joined((0..10).map(|n| entry(&numbered_user(n / 2), n)).collect()),
+        ),
+        with_line(base, "delegate_max_device_cap", "4294967295"),
+        with_line(&with_line(base, "delegates", ""), "successors", ""),
+        with_line(
+            &with_line(base, "version", "9007199254740991"),
+            "prev",
+            &hash,
+        ),
+    ];
+    for body in &valid {
+        assert!(ChannelAuthority::parse(body).is_ok(), "{body}");
+    }
+}
+
+#[test]
+fn text_group_id_v2_matches_the_5_8_vectors() {
+    let input = text_group_id_v2_input(CHANNEL, 0, GROUP_SALT).unwrap();
+    assert_eq!(input.len(), 91);
+    assert_eq!(hex(&input), TV2_GROUP_ID_V2_INPUT_G0_HEX.concat());
+    for (generation, expected) in [
+        (0, TV2_GROUP_ID_V2_G0),
+        (1, TV2_GROUP_ID_V2_G1),
+        (64, TV2_GROUP_ID_V2_G64),
+        (65_535, TV2_GROUP_ID_V2_G65535),
+    ] {
+        assert_eq!(
+            text_group_id_v2(CHANNEL, generation, GROUP_SALT).unwrap(),
+            expected,
+            "g = {generation}"
+        );
+    }
+
+    // The v1 derivation never stands in for a v2 id (3.1.1 control)
+    assert_ne!(derived_group_id(CHANNEL, 0), TV2_GROUP_ID_V2_G0);
+
+    assert_refused(
+        text_group_id_v2(CHANNEL, 65_536, GROUP_SALT),
+        "text group generation",
+        "g = 65536",
+    );
+    assert_refused(
+        text_group_id_v2(CHANNEL, 0, &GROUP_SALT.to_uppercase()),
+        "text group salt",
+        "uppercase salt",
+    );
+    assert_refused(
+        text_group_id_v2(CHANNEL, 0, &GROUP_SALT[..62]),
+        "text group salt",
+        "short salt",
+    );
+    assert_refused(
+        text_group_id_v2(&CHANNEL.to_lowercase(), 0, GROUP_SALT),
+        "text group channel id",
+        "lowercase channel",
+    );
+}
+
+#[test]
+fn commit_ad_v2_matches_the_5_8_vector() {
+    let row = vector_v2_row();
+    assert_eq!(row.handovers[0].signature, VECTOR_HANDOVER_SIGNATURE);
+
+    let ad = row.commit_ad_v2().unwrap();
+    assert_eq!(ad.len(), 1744);
+    assert_eq!(hex(&ad), TV2_COMMIT_AD_V2_HEX.concat());
+    assert_eq!(hex(&Sha256::digest(&ad)), TV2_COMMIT_AD_V2_SHA256);
+
+    // `commit_ad` dispatches a v2 row to the v2 AD, and the group hash
+    // follows it (3.12.1: `seat_list_ad_sha256` hashes the v2 bytes)
+    assert!(row.is_v2());
+    assert_eq!(row.commit_ad().unwrap(), ad);
+    assert_eq!(row.commit_ad_sha256().unwrap(), TV2_COMMIT_AD_V2_SHA256);
+}
+
+/// v1 byte identity of the AD: an S1 row stays on the v1 AD (5.7), and a v1
+/// row never carries an authority
+#[test]
+fn commit_ad_v1_rows_keep_the_s1_bytes_and_carry_no_authority() {
+    let row = SeatList {
+        id: CHANNEL.to_string(),
+        version: 3,
+        body: VECTOR_BODY.to_string(),
+        signer_user_id: USER_A.to_string(),
+        signer_device_id: DEVICE_A.to_string(),
+        signature: VECTOR_SIGNATURE.to_string(),
+        handovers: vec![SignedHandover {
+            body: VECTOR_HANDOVER_BODY.to_string(),
+            signature: VECTOR_HANDOVER_SIGNATURE.to_string(),
+        }],
+        updated_at: at(0),
+        authority: None,
+    };
+    assert!(!row.is_v2());
+    assert_eq!(
+        hex(&row.commit_ad().unwrap()),
+        VECTOR_COMMIT_AD_HEX.concat()
+    );
+    assert_refused(
+        row.commit_ad_v2(),
+        "exactly 14 lines",
+        "v1 row through the v2 AD",
+    );
+
+    let with_authority = SeatList {
+        authority: vector_v2_row().authority,
+        ..row
+    };
+    assert_refused(
+        with_authority.commit_ad(),
+        "carries no authority",
+        "v1 row with an authority",
+    );
+}
+
+#[test]
+fn commit_ad_v2_refuses_an_authority_that_does_not_match_its_line() {
+    let row = vector_v2_row();
+    let no_line = SeatListBody {
+        v2: Some(SeatListV2Lines {
+            authority_sha256: None,
+            ..vector_seat_list_v2("").v2.unwrap()
+        }),
+        ..vector_seat_list_v2("")
+    }
+    .build()
+    .unwrap();
+
+    let missing = SeatList {
+        authority: None,
+        ..row.clone()
+    };
+    assert_refused(missing.commit_ad_v2(), "disagree", "a line, no authority");
+
+    let extra = SeatList {
+        body: no_line.clone(),
+        ..row.clone()
+    };
+    assert_refused(extra.commit_ad_v2(), "disagree", "an authority, no line");
+
+    let mut other = row.clone();
+    other.authority.as_mut().unwrap().body = ChannelAuthority::build(&ChannelAuthorityBody {
+        issued_at: AUTHORITY_ISSUED_AT + 1,
+        ..vector_authority()
+    })
+    .unwrap();
+    assert_refused(
+        other.commit_ad_v2(),
+        "does not match the seat list",
+        "authority hash differs from the line",
+    );
+
+    let mut short = row.clone();
+    short.authority.as_mut().unwrap().signature = "AAAA".to_string();
+    assert_refused(short.commit_ad_v2(), "signature length", "short signature");
+
+    // Neither: two empty fields close the AD
+    let neither = SeatList {
+        body: no_line,
+        authority: None,
+        ..row
+    };
+    let ad = neither.commit_ad_v2().unwrap();
+    assert_eq!(&ad[ad.len() - 4..], &[0, 0, 0, 0]);
+}
+
+/// 3.12.1: an AD of exactly 16383 bytes passes and one of 16384 is refused
+#[test]
+fn commit_ad_v2_is_refused_above_16383_bytes() {
+    let mut row = vector_v2_row();
+    row.handovers.clear();
+    let base = row.commit_ad_v2().unwrap().len();
+
+    row.handovers = filler_chain(base, MAX_COMMIT_AD_LEN);
+    assert_eq!(row.commit_ad_v2().unwrap().len(), MAX_COMMIT_AD_LEN);
+
+    row.handovers = filler_chain(base, MAX_COMMIT_AD_LEN + 1);
+    assert_refused(row.commit_ad_v2(), "commit ad too long", "16384 bytes");
+}
+
+/// 3.12.1 / 5.8 worst case: authority 2836 bytes, list 3161, 16 succession
+/// statements of 429, AD 14112 bytes and its SHA-256
+#[test]
+fn worst_case_commit_ad_v2_matches_the_5_8_vector() {
+    let member_key = identity_key_of(MEMBER_SEED);
+    let vector_authority_sha256 =
+        ChannelAuthority::sha256(&ChannelAuthority::build(&vector_authority()).unwrap());
+
+    let authority = ChannelAuthorityBody {
+        channel_id: CHANNEL.to_string(),
+        version: MAX_INT,
+        owner_user_id: USER_A.to_string(),
+        signer_device_id: DEVICE_A.to_string(),
+        issued_at: MAX_INT,
+        owner_devices: vec![
+            owner_device(DEVICE_A, &identity_key_of(OWNER_SEED)),
+            owner_device(DEVICE_A2, &identity_key_of(NEW_OWNER_SEED)),
+            owner_device(&hex32(1), &member_key),
+            owner_device(&hex32(2), &identity_key_of(EXTRA1_SEED)),
+            owner_device(&hex32(3), &identity_key_of(EXTRA2_SEED)),
+        ],
+        delegates: (0..=9)
+            .map(|i| user_device(&format!("01HZXD{i:020}"), &hex32(16 + i), &member_key))
+            .collect(),
+        delegate_max_device_cap: u32::MAX,
+        successors: (0..=4)
+            .flat_map(|u| {
+                let user = format!("01HZXW{u:020}");
+                [
+                    user_device(&user, &hex32(32 + 2 * u), &member_key),
+                    user_device(&user, &hex32(33 + 2 * u), &member_key),
+                ]
+            })
+            .collect(),
+        prev: Some(vector_authority_sha256),
+    };
+    let authority_body = ChannelAuthority::build(&authority).unwrap();
+    assert_eq!(authority_body.len(), 2836);
+    let authority_sha256 = ChannelAuthority::sha256(&authority_body);
+
+    let mut seats = vec![USER_A.to_string()];
+    seats.extend((0..=98).map(|i| format!("01HZXS{i:020}")));
+    let list = SeatListBody {
+        channel_id: CHANNEL.to_string(),
+        version: MAX_INT,
+        device_cap: u32::MAX,
+        issued_at: MAX_INT,
+        signer_user_id: USER_A.to_string(),
+        signer_device_id: DEVICE_A.to_string(),
+        seats,
+        v2: Some(SeatListV2Lines {
+            authority_sha256: Some(authority_sha256.clone()),
+            history: SeatListHistory::Visible,
+            history_boundary: Some(CID.to_string()),
+            pre_history: SeatListPreHistory::Wiped,
+            group_salt: GROUP_SALT.to_string(),
+        }),
+    };
+    let list_body = list.build().unwrap();
+    assert_eq!(list_body.len(), 3161);
+
+    let chain: Vec<SignedHandover> = (0..=15)
+        .map(|i| {
+            let body = SuccessionStatement {
+                channel_id: CHANNEL.to_string(),
+                from_user_id: USER_A.to_string(),
+                from_identity_key: identity_key_of(OWNER_SEED),
+                to_user_id: format!("01HZXT{i:020}"),
+                to_device_id: hex32(i),
+                to_identity_key: member_key.clone(),
+                authority_sha256: authority_sha256.clone(),
+                rank: 5,
+                issued_at: MAX_INT,
+            }
+            .build()
+            .unwrap();
+            assert_eq!(body.len(), 429);
+            SignedHandover {
+                signature: sign_b64(MEMBER_SEED, &body),
+                body,
+            }
+        })
+        .collect();
+
+    let row = SeatList {
+        id: CHANNEL.to_string(),
+        version: MAX_INT,
+        signature: sign_b64(OWNER_SEED, &list_body),
+        body: list_body,
+        signer_user_id: USER_A.to_string(),
+        signer_device_id: DEVICE_A.to_string(),
+        handovers: chain,
+        updated_at: at(0),
+        authority: Some(SignedAuthority {
+            signature: sign_b64(OWNER_SEED, &authority_body),
+            body: authority_body,
+        }),
+    };
+    let ad = row.commit_ad_v2().unwrap();
+    assert_eq!(ad.len().to_string(), TV2_WORST_COMMIT_AD_V2_LEN);
+    assert_eq!(hex(&Sha256::digest(&ad)), TV2_WORST_COMMIT_AD_V2_SHA256);
+
+    // Format-valid, but S2 refuses its boundary and `wiped` (4.3 step 4c)
+    assert!(check_seat_list_v2_lines(&list, None).is_err());
+}
+
+fn vector_text_join() -> TextJoinPayload {
+    TextJoinPayload {
+        user_id: USER_B.to_string(),
+        device_id: DEVICE_B.to_string(),
+        channel_id: CHANNEL.to_string(),
+        generation: JOIN_GENERATION,
+        group_id: text_group_id_v2(CHANNEL, JOIN_GENERATION, GROUP_SALT).unwrap(),
+        key_package_ref: JOIN_KEY_PACKAGE_REF.to_string(),
+        issued_at: JOIN_ISSUED_AT,
+    }
+}
+
+#[test]
+fn text_join_payload_matches_the_5_8_vector() {
+    let body = vector_text_join().build().unwrap();
+    assert_eq!(body, TV2_TEXT_JOIN_BODY);
+    assert_eq!(sign_b64(MEMBER_SEED, &body), TV2_TEXT_JOIN_SIGNATURE);
+}
+
+#[test]
+fn text_join_payload_refuses_out_of_charset_inputs() {
+    let good = vector_text_join();
+    let cases: Vec<(&str, TextJoinPayload, &str)> = vec![
+        (
+            "generation 65536",
+            TextJoinPayload {
+                generation: 65_536,
+                ..good.clone()
+            },
+            "text join generation",
+        ),
+        (
+            "user charset",
+            TextJoinPayload {
+                user_id: USER_B.to_lowercase(),
+                ..good.clone()
+            },
+            "text join user or channel id",
+        ),
+        (
+            "channel charset",
+            TextJoinPayload {
+                channel_id: CHANNEL[..25].to_string(),
+                ..good.clone()
+            },
+            "text join user or channel id",
+        ),
+        (
+            "device charset",
+            TextJoinPayload {
+                device_id: DEVICE_B.to_uppercase(),
+                ..good.clone()
+            },
+            "text join device id",
+        ),
+        (
+            "group id charset",
+            TextJoinPayload {
+                group_id: good.group_id.to_uppercase(),
+                ..good.clone()
+            },
+            "text join group id",
+        ),
+        (
+            "empty key_package_ref",
+            TextJoinPayload {
+                key_package_ref: String::new(),
+                ..good.clone()
+            },
+            "text join key_package_ref",
+        ),
+        (
+            "key_package_ref separator",
+            TextJoinPayload {
+                key_package_ref: "a.b".to_string(),
+                ..good.clone()
+            },
+            "text join key_package_ref",
+        ),
+        (
+            "key_package_ref of 65 chars",
+            TextJoinPayload {
+                key_package_ref: "A".repeat(65),
+                ..good.clone()
+            },
+            "text join key_package_ref",
+        ),
+        (
+            "negative issued_at",
+            TextJoinPayload {
+                issued_at: -1,
+                ..good.clone()
+            },
+            "text join issued_at",
+        ),
+        (
+            "issued_at above 2^53 - 1",
+            TextJoinPayload {
+                issued_at: MAX_INT + 1,
+                ..good.clone()
+            },
+            "text join issued_at",
+        ),
+    ];
+    for (case, payload, needle) in cases {
+        assert_refused(payload.build(), needle, case);
+    }
+
+    // The bounds are inclusive
+    assert!(TextJoinPayload {
+        generation: 65_535,
+        issued_at: MAX_INT,
+        key_package_ref: "A".repeat(64),
+        ..good
+    }
+    .build()
+    .is_ok());
+}
+
+fn vector_succession() -> SuccessionStatement {
+    SuccessionStatement {
+        channel_id: CHANNEL.to_string(),
+        from_user_id: USER_A.to_string(),
+        from_identity_key: identity_key_of(OWNER_SEED),
+        to_user_id: USER_B.to_string(),
+        to_device_id: DEVICE_B.to_string(),
+        to_identity_key: identity_key_of(MEMBER_SEED),
+        authority_sha256: ChannelAuthority::sha256(
+            &ChannelAuthority::build(&vector_authority()).unwrap(),
+        ),
+        rank: SUCCESSION_RANK,
+        issued_at: SUCCESSION_ISSUED_AT,
+    }
+}
+
+#[test]
+fn succession_statement_matches_the_5_8_vector() {
+    let body = vector_succession().build().unwrap();
+    assert_eq!(body, TV2_SUCCESSION_BODY);
+    assert_eq!(sign_b64(MEMBER_SEED, &body), TV2_SUCCESSION_SIGNATURE);
+    assert_eq!(
+        SuccessionStatement::parse(TV2_SUCCESSION_BODY).unwrap(),
+        vector_succession()
+    );
+}
+
+#[test]
+fn succession_statement_refuses_every_format_violation() {
+    let base = TV2_SUCCESSION_BODY;
+    let cases: Vec<(&str, String, &str)> = vec![
+        ("trailing LF", format!("{base}\n"), "exactly 11 lines"),
+        ("CR", base.replacen('\n', "\r\n", 1), "contains CR"),
+        (
+            "context",
+            base.replace("sloga-owner-succession-v1", "sloga-owner-handover-v1"),
+            "context or format version",
+        ),
+        (
+            "format version",
+            base.replace("\nv:1\n", "\nv:2\n"),
+            "context or format version",
+        ),
+        (
+            "over 1024 bytes",
+            with_line(base, "to_identity_key", &"x".repeat(1100)),
+            "too long",
+        ),
+        (
+            "label",
+            base.replace("\nrank:", "\nrnk:"),
+            "succession label",
+        ),
+        ("rank 0", with_line(base, "rank", "0"), "succession rank"),
+        ("rank 6", with_line(base, "rank", "6"), "succession rank"),
+        (
+            "rank leading zero",
+            with_line(base, "rank", "01"),
+            "succession rank",
+        ),
+        (
+            "authority hash charset",
+            with_line(
+                base,
+                "authority_sha256",
+                &TV2_AUTHORITY_BODY_SHA256.to_uppercase(),
+            ),
+            "succession authority_sha256",
+        ),
+        (
+            "device charset",
+            with_line(base, "to_device_id", &DEVICE_B.to_uppercase()),
+            "succession device id",
+        ),
+        (
+            "key charset",
+            with_line(base, "from_identity_key", &OWNER_IDENTITY_KEY[..42]),
+            "succession identity key",
+        ),
+        (
+            "user charset",
+            with_line(base, "to_user_id", &USER_B.to_lowercase()),
+            "succession user or channel id",
+        ),
+        (
+            "issued_at above 2^53 - 1",
+            with_line(base, "issued_at", "9007199254740992"),
+            "succession issued_at",
+        ),
+    ];
+    for (case, body, needle) in &cases {
+        assert_ne!(body, base, "{case} changed nothing");
+        assert_refused(SuccessionStatement::parse(body), needle, case);
+    }
+    assert!(SuccessionStatement::parse(&with_line(base, "rank", "5")).is_ok());
+}
+
+// --- 4.3 S2 rules: helpers ---------------------------------------------------
+
+fn v2_lines(salt: &str) -> SeatListV2Lines {
+    SeatListV2Lines {
+        authority_sha256: None,
+        history: SeatListHistory::Visible,
+        history_boundary: None,
+        pre_history: SeatListPreHistory::Kept,
+        group_salt: salt.to_string(),
+    }
+}
+
+/// A v2 body (signer A on `signer_device`)
+fn v2_body_by(signer_device: &str, version: i64, seats: &[&str], lines: SeatListV2Lines) -> String {
+    SeatListBody {
+        channel_id: CHANNEL.to_string(),
+        version,
+        device_cap: 5,
+        issued_at: 1_790_812_800_000,
+        signer_user_id: USER_A.to_string(),
+        signer_device_id: signer_device.to_string(),
+        seats: seats.iter().map(|seat| seat.to_string()).collect(),
+        v2: Some(lines),
+    }
+    .build()
+    .unwrap()
+}
+
+fn v2_body(version: i64, seats: &[&str], lines: SeatListV2Lines) -> String {
+    v2_body_by(DEVICE_A, version, seats, lines)
+}
+
+fn submit_v2(
+    version: i64,
+    seats: &[&str],
+    lines: SeatListV2Lines,
+    authority: Option<SignedAuthority>,
+) -> SeatListSubmission {
+    SeatListSubmission {
+        body: v2_body(version, seats, lines),
+        signature: signature(version),
+        signer_device_id: DEVICE_A.to_string(),
+        handover: None,
+        authority,
+    }
+}
+
+/// The stored row a submission would become (no chain)
+fn stored_row(submission: &SeatListSubmission) -> SeatList {
+    let body = SeatListBody::parse(&submission.body).unwrap();
+    SeatList {
+        id: CHANNEL.to_string(),
+        version: body.version,
+        body: submission.body.clone(),
+        signer_user_id: body.signer_user_id,
+        signer_device_id: body.signer_device_id,
+        signature: submission.signature.clone(),
+        handovers: vec![],
+        updated_at: at(0),
+        authority: submission.authority.clone(),
+    }
+}
+
+fn active_seats(users: &[&str]) -> Vec<ChannelSeat> {
+    users
+        .iter()
+        .map(|user| ChannelSeat {
+            id: ChannelSeat::composite_id(CHANNEL, user),
+            channel_id: CHANNEL.to_string(),
+            user_id: user.to_string(),
+            seated_at: at(0),
+            released_at: None,
+            cooldown_until: None,
+            release_cause: None,
+            keys_received_at: None,
+        })
+        .collect()
+}
+
+/// The planner as a driver calls it (no open Text group, claims allowed)
+fn plan(
+    kind: SeatListWriteKind,
+    submission: &SeatListSubmission,
+    stored: Option<&SeatList>,
+    seats: &[ChannelSeat],
+    formats_v2: bool,
+) -> revolt_result::Result<SeatListWriteDecision> {
+    let entitlement = entitlement(100);
+    plan_seat_list_write(&SeatListWriteInput {
+        kind,
+        channel_id: CHANNEL,
+        submission,
+        stored,
+        entitlement: Some(&entitlement),
+        seats,
+        text_group: None,
+        allow_claims: true,
+        formats_v2,
+        now: at(1),
+    })
+}
+
+fn applied(decision: SeatListWriteDecision) -> SeatListWritePlan {
+    match decision {
+        SeatListWriteDecision::Apply(plan) => plan,
+        other => panic!("expected a write, got {other:?}"),
+    }
+}
+
+// --- 4.3 step 1 (format; #218) -----------------------------------------------
+
+#[test]
+fn step1_protect_takes_a_v2_genesis_only_with_formats_v2_on() {
+    let genesis = submit_v2(1, &[USER_A], v2_lines(GROUP_SALT), None);
+    let landed = applied(plan(SeatListWriteKind::Protect, &genesis, None, &[], true).unwrap());
+    assert!(landed.row.is_v2());
+    assert_refused(
+        plan(SeatListWriteKind::Protect, &genesis, None, &[], false),
+        "a v2 genesis list needs formats_v2",
+        "v2 genesis, flag off",
+    );
+}
+
+#[test]
+fn step1_protect_takes_a_v1_genesis_only_with_formats_v2_off() {
+    let genesis = submit(1, &[USER_A]);
+    let landed = applied(plan(SeatListWriteKind::Protect, &genesis, None, &[], false).unwrap());
+    assert!(!landed.row.is_v2());
+    assert_refused(
+        plan(SeatListWriteKind::Protect, &genesis, None, &[], true),
+        "must be v2 while formats_v2 is on",
+        "v1 genesis, flag on",
+    );
+}
+
+#[test]
+fn step1_a_v1_list_never_replaces_a_v2_list() {
+    let stored = stored_row(&submit_v2(1, &[USER_A, USER_B], v2_lines(GROUP_SALT), None));
+    let seats = active_seats(&[USER_A, USER_B]);
+    for formats_v2 in [false, true] {
+        assert_refused(
+            plan(
+                SeatListWriteKind::Put,
+                &submit(2, &[USER_A, USER_B]),
+                Some(&stored),
+                &seats,
+                formats_v2,
+            ),
+            "a v1 seat list cannot replace a v2 list",
+            &format!("v1 over v2, formats_v2 = {formats_v2}"),
+        );
+    }
+}
+
+/// #218: a channel already on v2 keeps v2 with the flag off: a removal-only
+/// PUT lands and a byte-identical re-PUT answers its stored success
+#[test]
+fn step1_a_v2_channel_keeps_working_with_formats_v2_off() {
+    let genesis = submit_v2(1, &[USER_A, USER_B], v2_lines(GROUP_SALT), None);
+    let stored = stored_row(&genesis);
+    let seats = active_seats(&[USER_A, USER_B]);
+
+    let removal = submit_v2(2, &[USER_A], v2_lines(GROUP_SALT), None);
+    let landed = applied(
+        plan(
+            SeatListWriteKind::Put,
+            &removal,
+            Some(&stored),
+            &seats,
+            false,
+        )
+        .unwrap(),
+    );
+    assert_eq!(landed.released, vec![USER_B.to_string()]);
+    assert!(landed.row.is_v2());
+    assert_eq!(
+        landed.seat_list_ad_sha256,
+        hex(&Sha256::digest(landed.row.commit_ad_v2().unwrap()))
+    );
+
+    assert!(matches!(
+        plan(
+            SeatListWriteKind::Put,
+            &genesis,
+            Some(&stored),
+            &seats,
+            false
+        ),
+        Ok(SeatListWriteDecision::Unchanged(_))
+    ));
+}
+
+#[test]
+fn step1_a_v1_to_v2_upgrade_needs_formats_v2() {
+    let stored = stored_row(&submit(1, &[USER_A, USER_B]));
+    let seats = active_seats(&[USER_A, USER_B]);
+    let upgrade = submit_v2(2, &[USER_A, USER_B], v2_lines(GROUP_SALT), None);
+
+    assert_refused(
+        plan(
+            SeatListWriteKind::Put,
+            &upgrade,
+            Some(&stored),
+            &seats,
+            false,
+        ),
+        "a v2 seat list over a v1 list needs formats_v2",
+        "upgrade, flag off",
+    );
+    let landed = applied(
+        plan(
+            SeatListWriteKind::Put,
+            &upgrade,
+            Some(&stored),
+            &seats,
+            true,
+        )
+        .unwrap(),
+    );
+    assert!(landed.row.is_v2());
+
+    // A v1 channel may stay on v1 with the flag on (#232)
+    assert!(matches!(
+        plan(
+            SeatListWriteKind::Put,
+            &submit(2, &[USER_A, USER_B]),
+            Some(&stored),
+            &seats,
+            true
+        ),
+        Ok(SeatListWriteDecision::Apply(_))
+    ));
+}
+
+// --- 4.3 step 3b (authority; #215, #225) -------------------------------------
+
+/// An authority over the owner devices A and A2, signed by `signer_device_id`
+fn test_authority(
+    version: i64,
+    signer_device_id: &str,
+    prev: Option<String>,
+) -> ChannelAuthorityBody {
+    ChannelAuthorityBody {
+        channel_id: CHANNEL.to_string(),
+        version,
+        owner_user_id: USER_A.to_string(),
+        signer_device_id: signer_device_id.to_string(),
+        issued_at: AUTHORITY_ISSUED_AT,
+        owner_devices: vec![
+            owner_device(DEVICE_A, OWNER_IDENTITY_KEY),
+            owner_device(DEVICE_A2, NEW_OWNER_IDENTITY_KEY),
+        ],
+        delegates: vec![],
+        delegate_max_device_cap: 0,
+        successors: vec![],
+        prev,
+    }
+}
+
+fn signed_authority(authority: &ChannelAuthorityBody) -> SignedAuthority {
+    SignedAuthority {
+        body: ChannelAuthority::build(authority).unwrap(),
+        signature: signature(authority.version),
+    }
+}
+
+fn lines_naming(authority: &SignedAuthority) -> SeatListV2Lines {
+    SeatListV2Lines {
+        authority_sha256: Some(ChannelAuthority::sha256(&authority.body)),
+        ..v2_lines(GROUP_SALT)
+    }
+}
+
+/// A parsed v2 body signed by A's `signer_device`, naming `authority`
+fn body_naming(
+    version: i64,
+    signer_device: &str,
+    authority: Option<&SignedAuthority>,
+) -> SeatListBody {
+    let lines = authority
+        .map(lines_naming)
+        .unwrap_or_else(|| v2_lines(GROUP_SALT));
+    SeatListBody::parse(&v2_body_by(signer_device, version, &[USER_A], lines)).unwrap()
+}
+
+/// A stored v2 row (version 1, by A's first device) carrying `authority`
+fn stored_with(authority: Option<&SignedAuthority>) -> SeatList {
+    SeatList {
+        id: CHANNEL.to_string(),
+        version: 1,
+        body: body_naming(1, DEVICE_A, authority).build().unwrap(),
+        signer_user_id: USER_A.to_string(),
+        signer_device_id: DEVICE_A.to_string(),
+        signature: signature(1),
+        handovers: vec![],
+        updated_at: at(0),
+        authority: authority.cloned(),
+    }
+}
+
+#[test]
+fn step3b_a_first_authority_is_version_1_and_returns_the_signer_entry_key() {
+    let a1 = signed_authority(&test_authority(1, DEVICE_A, None));
+    let change = check_seat_list_authority(&body_naming(1, DEVICE_A, Some(&a1)), Some(&a1), None)
+        .unwrap()
+        .expect("a first authority is a change");
+    assert_eq!(change.authority.version, 1);
+    assert_eq!(change.signer_identity_key, OWNER_IDENTITY_KEY);
+
+    // Over a stored v1 list (no authority) too; by the other owner device,
+    // its entry's key is the one the route must check
+    let v1 = stored_row(&submit(1, &[USER_A]));
+    let by_a2 = signed_authority(&test_authority(1, DEVICE_A2, None));
+    let change = check_seat_list_authority(
+        &body_naming(2, DEVICE_A2, Some(&by_a2)),
+        Some(&by_a2),
+        Some(&v1),
+    )
+    .unwrap()
+    .expect("a change");
+    assert_eq!(change.signer_identity_key, NEW_OWNER_IDENTITY_KEY);
+
+    // No line, no authority, nothing stored: nothing to check
+    assert_eq!(
+        check_seat_list_authority(&body_naming(1, DEVICE_A, None), None, None).unwrap(),
+        None
+    );
+}
+
+#[test]
+fn step3b_a_non_empty_line_needs_its_authority() {
+    let a1 = signed_authority(&test_authority(1, DEVICE_A, None));
+    assert_refused(
+        check_seat_list_authority(&body_naming(1, DEVICE_A, Some(&a1)), None, None),
+        "line without an authority",
+        "line, no authority",
+    );
+}
+
+#[test]
+fn step3b_an_authority_needs_its_line() {
+    let a1 = signed_authority(&test_authority(1, DEVICE_A, None));
+    assert_refused(
+        check_seat_list_authority(&body_naming(1, DEVICE_A, None), Some(&a1), None),
+        "authority without a seat list authority line",
+        "v2 body with an empty line",
+    );
+    let v1 = SeatListBody::parse(&body_with(1, 1_790_812_800_000, &[USER_A])).unwrap();
+    assert_refused(
+        check_seat_list_authority(&v1, Some(&a1), None),
+        "authority without a seat list authority line",
+        "v1 body",
+    );
+}
+
+#[test]
+fn step3b_the_line_never_empties_over_a_stored_authority() {
+    let a1 = signed_authority(&test_authority(1, DEVICE_A, None));
+    assert_refused(
+        check_seat_list_authority(
+            &body_naming(2, DEVICE_A, None),
+            None,
+            Some(&stored_with(Some(&a1))),
+        ),
+        "drops the stored authority",
+        "empty line over a stored authority",
+    );
+}
+
+#[test]
+fn step3b_the_authority_hashes_to_the_line() {
+    let a1 = signed_authority(&test_authority(1, DEVICE_A, None));
+    let other = signed_authority(&ChannelAuthorityBody {
+        issued_at: AUTHORITY_ISSUED_AT + 1,
+        ..test_authority(1, DEVICE_A, None)
+    });
+    assert_refused(
+        check_seat_list_authority(&body_naming(1, DEVICE_A, Some(&a1)), Some(&other), None),
+        "does not match the seat list authority line",
+        "hash differs",
+    );
+}
+
+#[test]
+fn step3b_the_authority_names_the_route_channel() {
+    let elsewhere = signed_authority(&ChannelAuthorityBody {
+        channel_id: "01J9Z3K4M5N6P7Q8R9S0T1V2W4".to_string(),
+        ..test_authority(1, DEVICE_A, None)
+    });
+    assert_refused(
+        check_seat_list_authority(
+            &body_naming(1, DEVICE_A, Some(&elsewhere)),
+            Some(&elsewhere),
+            None,
+        ),
+        "channel_id does not match",
+        "another channel",
+    );
+}
+
+#[test]
+fn step3b_the_authority_owner_is_the_list_signer() {
+    let foreign = signed_authority(&ChannelAuthorityBody {
+        owner_user_id: USER_B.to_string(),
+        ..test_authority(1, DEVICE_A, None)
+    });
+    assert_refused(
+        check_seat_list_authority(
+            &body_naming(1, DEVICE_A, Some(&foreign)),
+            Some(&foreign),
+            None,
+        ),
+        "owner is not the seat list signer",
+        "another owner",
+    );
+}
+
+#[test]
+fn step3b_a_changed_authority_is_signed_by_the_list_signer_device() {
+    let by_a2 = signed_authority(&test_authority(1, DEVICE_A2, None));
+    assert_refused(
+        check_seat_list_authority(&body_naming(1, DEVICE_A, Some(&by_a2)), Some(&by_a2), None),
+        "signed by the list's signer device",
+        "authority by A2 on a list by A",
+    );
+}
+
+/// #225: a list from another listed owner device may carry the stored
+/// authority unchanged; it is not a change and is not re-verified
+#[test]
+fn step3b_an_unchanged_authority_rides_on_another_owner_devices_list() {
+    let a1 = signed_authority(&test_authority(1, DEVICE_A, None));
+    let stored = stored_with(Some(&a1));
+    assert_eq!(
+        check_seat_list_authority(
+            &body_naming(2, DEVICE_A2, Some(&a1)),
+            Some(&a1),
+            Some(&stored)
+        )
+        .unwrap(),
+        None
+    );
+
+    // Same body, another signature: a change, refused (same version)
+    let resigned = SignedAuthority {
+        signature: signature(9),
+        ..a1.clone()
+    };
+    assert_refused(
+        check_seat_list_authority(
+            &body_naming(2, DEVICE_A, Some(&resigned)),
+            Some(&resigned),
+            Some(&stored),
+        ),
+        "version must be the stored version + 1",
+        "re-signed authority",
+    );
+}
+
+#[test]
+fn step3b_a_change_is_the_stored_version_plus_1() {
+    let a1 = signed_authority(&test_authority(1, DEVICE_A, None));
+    let stored = stored_with(Some(&a1));
+    let after_a1 = Some(ChannelAuthority::sha256(&a1.body));
+
+    let skipped = signed_authority(&test_authority(3, DEVICE_A, after_a1.clone()));
+    let same_version = signed_authority(&ChannelAuthorityBody {
+        issued_at: AUTHORITY_ISSUED_AT + 1,
+        ..test_authority(1, DEVICE_A, None)
+    });
+    for (case, authority, stored) in [
+        ("a skipped version", &skipped, Some(&stored)),
+        (
+            "the same version, another body",
+            &same_version,
+            Some(&stored),
+        ),
+        (
+            "a first authority above version 1",
+            &signed_authority(&test_authority(2, DEVICE_A, after_a1.clone())),
+            None,
+        ),
+    ] {
+        assert_refused(
+            check_seat_list_authority(
+                &body_naming(2, DEVICE_A, Some(authority)),
+                Some(authority),
+                stored,
+            ),
+            "version must be the stored version + 1",
+            case,
+        );
+    }
+
+    // Never lower: a stored version 3 refuses a version 2
+    let a3 = signed_authority(&test_authority(3, DEVICE_A, Some("ab".repeat(32))));
+    let lower = signed_authority(&test_authority(
+        2,
+        DEVICE_A,
+        Some(ChannelAuthority::sha256(&a3.body)),
+    ));
+    assert_refused(
+        check_seat_list_authority(
+            &body_naming(2, DEVICE_A, Some(&lower)),
+            Some(&lower),
+            Some(&stored_with(Some(&a3))),
+        ),
+        "version must be the stored version + 1",
+        "a lower version",
+    );
+
+    // The next version naming the stored body is accepted
+    let a2 = signed_authority(&test_authority(2, DEVICE_A, after_a1));
+    assert!(check_seat_list_authority(
+        &body_naming(2, DEVICE_A, Some(&a2)),
+        Some(&a2),
+        Some(&stored)
+    )
+    .unwrap()
+    .is_some());
+}
+
+#[test]
+fn step3b_a_change_names_the_stored_authority_as_prev() {
+    let a1 = signed_authority(&test_authority(1, DEVICE_A, None));
+    let wrong_prev = signed_authority(&test_authority(2, DEVICE_A, Some("ab".repeat(32))));
+    assert_refused(
+        check_seat_list_authority(
+            &body_naming(2, DEVICE_A, Some(&wrong_prev)),
+            Some(&wrong_prev),
+            Some(&stored_with(Some(&a1))),
+        ),
+        "prev must name the stored authority",
+        "prev names another body",
+    );
+}
+
+#[test]
+fn step3b_the_authority_signature_is_64_bytes_of_b64() {
+    let short = SignedAuthority {
+        signature: "AAAA".to_string(),
+        ..signed_authority(&test_authority(1, DEVICE_A, None))
+    };
+    assert_refused(
+        check_seat_list_authority(&body_naming(1, DEVICE_A, Some(&short)), Some(&short), None),
+        "signature length",
+        "short signature",
+    );
+}
+
+/// Step 3b runs in the planner, and the landed row carries the authority
+/// its AD v2 binds
+#[test]
+fn step3b_runs_in_the_planner_and_the_row_carries_the_authority() {
+    let a1 = signed_authority(&test_authority(1, DEVICE_A, None));
+    let genesis = submit_v2(1, &[USER_A], lines_naming(&a1), Some(a1.clone()));
+    let landed = applied(plan(SeatListWriteKind::Protect, &genesis, None, &[], true).unwrap());
+    assert_eq!(landed.row.authority, Some(a1.clone()));
+    let ad = landed.row.commit_ad_v2().unwrap();
+    assert_eq!(landed.seat_list_ad_sha256, hex(&Sha256::digest(&ad)));
+    assert!(ad.ends_with(&crate::decode_signature_b64(&a1.signature).unwrap()));
+
+    let without = SeatListSubmission {
+        authority: None,
+        ..genesis
+    };
+    assert_refused(
+        plan(SeatListWriteKind::Protect, &without, None, &[], true),
+        "line without an authority",
+        "planner, line without an authority",
+    );
+}
+
+// --- 4.3 step 4c (immutable and one-way lines) -------------------------------
+
+/// A stored v2 row with the given lines (a boundary or `wiped` row stands
+/// for S4 data; S2 never writes one)
+fn stored_v2(lines: SeatListV2Lines) -> SeatList {
+    stored_row(&submit_v2(1, &[USER_A], lines, None))
+}
+
+fn next_v2(lines: SeatListV2Lines) -> SeatListBody {
+    SeatListBody::parse(&v2_body(2, &[USER_A], lines)).unwrap()
+}
+
+fn with_boundary(lines: SeatListV2Lines, pre_history: SeatListPreHistory) -> SeatListV2Lines {
+    SeatListV2Lines {
+        history_boundary: Some(CID.to_string()),
+        pre_history,
+        ..lines
+    }
+}
+
+#[test]
+fn step4c_group_salt_is_immutable() {
+    let stored = stored_v2(v2_lines(GROUP_SALT));
+    assert_refused(
+        check_seat_list_v2_lines(&next_v2(v2_lines(&"5".repeat(64))), Some(&stored)),
+        "group_salt is immutable",
+        "another salt",
+    );
+    assert!(check_seat_list_v2_lines(&next_v2(v2_lines(GROUP_SALT)), Some(&stored)).is_ok());
+}
+
+#[test]
+fn step4c_history_boundary_is_immutable() {
+    let stored = stored_v2(with_boundary(
+        v2_lines(GROUP_SALT),
+        SeatListPreHistory::Kept,
+    ));
+    assert_refused(
+        check_seat_list_v2_lines(&next_v2(v2_lines(GROUP_SALT)), Some(&stored)),
+        "history_boundary is immutable",
+        "boundary dropped",
+    );
+}
+
+#[test]
+fn step4c_pre_history_never_goes_from_wiped_to_kept() {
+    let stored = stored_v2(with_boundary(
+        v2_lines(GROUP_SALT),
+        SeatListPreHistory::Wiped,
+    ));
+    assert_refused(
+        check_seat_list_v2_lines(&next_v2(v2_lines(GROUP_SALT)), Some(&stored)),
+        "cannot go from wiped to kept",
+        "wiped to kept",
+    );
+}
+
+/// Until S4: `wiped` is refused on every path (genesis included), so `kept`
+/// to `wiped` is refused on the PUT
+#[test]
+fn step4c_pre_history_wiped_is_refused_until_s4() {
+    let wiped = next_v2(with_boundary(
+        v2_lines(GROUP_SALT),
+        SeatListPreHistory::Wiped,
+    ));
+    assert_refused(
+        check_seat_list_v2_lines(&wiped, None),
+        "pre_history wiped is refused until S4",
+        "wiped genesis",
+    );
+    let stored = stored_v2(with_boundary(
+        v2_lines(GROUP_SALT),
+        SeatListPreHistory::Kept,
+    ));
+    assert_refused(
+        check_seat_list_v2_lines(&wiped, Some(&stored)),
+        "pre_history wiped is refused until S4",
+        "kept to wiped",
+    );
+}
+
+#[test]
+fn step4c_history_boundary_is_refused_until_s4() {
+    let boundary = next_v2(with_boundary(
+        v2_lines(GROUP_SALT),
+        SeatListPreHistory::Kept,
+    ));
+    assert_refused(
+        check_seat_list_v2_lines(&boundary, None),
+        "history_boundary is refused until S4",
+        "boundary genesis",
+    );
+    let stored = stored_v2(with_boundary(
+        v2_lines(GROUP_SALT),
+        SeatListPreHistory::Kept,
+    ));
+    assert_refused(
+        check_seat_list_v2_lines(&boundary, Some(&stored)),
+        "history_boundary is refused until S4",
+        "same boundary as stored",
+    );
+}
+
+/// 4.1.1 / PA-18: a stored v1 list is the predecessor `{ authority: empty,
+/// history: hidden, history_boundary: empty, pre_history: kept }`: any salt
+/// and any `history` (#222), but no boundary
+#[test]
+fn step4c_a_stored_v1_list_is_the_v2_predecessor() {
+    let stored = stored_row(&submit(1, &[USER_A]));
+    for history in [SeatListHistory::Visible, SeatListHistory::Hidden] {
+        let lines = SeatListV2Lines {
+            history,
+            ..v2_lines(&"5".repeat(64))
+        };
+        assert!(check_seat_list_v2_lines(&next_v2(lines), Some(&stored)).is_ok());
+    }
+    assert_refused(
+        check_seat_list_v2_lines(
+            &next_v2(with_boundary(
+                v2_lines(GROUP_SALT),
+                SeatListPreHistory::Kept,
+            )),
+            Some(&stored),
+        ),
+        "history_boundary is refused until S4",
+        "a boundary over v1",
+    );
+}
+
+#[test]
+fn step4c_history_may_change_either_way() {
+    for (from, to) in [
+        (SeatListHistory::Visible, SeatListHistory::Hidden),
+        (SeatListHistory::Hidden, SeatListHistory::Visible),
+    ] {
+        let stored = stored_v2(SeatListV2Lines {
+            history: from,
+            ..v2_lines(GROUP_SALT)
+        });
+        let next = next_v2(SeatListV2Lines {
+            history: to,
+            ..v2_lines(GROUP_SALT)
+        });
+        assert!(check_seat_list_v2_lines(&next, Some(&stored)).is_ok());
+    }
+}
+
+/// 4c runs in the planner AFTER the byte-identical return of step 4
+#[test]
+fn step4c_runs_in_the_planner_after_the_retry_return() {
+    let stored_submission = submit_v2(
+        1,
+        &[USER_A],
+        with_boundary(v2_lines(GROUP_SALT), SeatListPreHistory::Kept),
+        None,
+    );
+    let stored = stored_row(&stored_submission);
+    let seats = active_seats(&[USER_A]);
+    assert!(matches!(
+        plan(
+            SeatListWriteKind::Put,
+            &stored_submission,
+            Some(&stored),
+            &seats,
+            true
+        ),
+        Ok(SeatListWriteDecision::Unchanged(_))
+    ));
+    assert_refused(
+        plan(
+            SeatListWriteKind::Put,
+            &submit_v2(2, &[USER_A], v2_lines(&"5".repeat(64)), None),
+            Some(&stored),
+            &seats,
+            true,
+        ),
+        "group_salt is immutable",
+        "planner, new salt",
+    );
+}
+
+// --- 4.3 step 4d (removal reason) --------------------------------------------
+
+#[test]
+fn step4d_a_release_needs_a_non_empty_reason() {
+    let released = vec![USER_B.to_string()];
+    for reason in [None, Some(""), Some("  \t")] {
+        let error = check_removal_reason(&released, reason).unwrap_err();
+        assert!(
+            matches!(error.error_type, ErrorType::RemovalReasonRequired),
+            "{reason:?}"
+        );
+    }
+    assert!(check_removal_reason(&released, Some("left the team")).is_ok());
+
+    // Nothing released (a retry, a growth-only list): no reason needed
+    assert!(check_removal_reason(&[], None).is_ok());
+}
+
+// --- 4.3 step 7 (`signer_lost`; #222, #224) ----------------------------------
+
+/// An open Text group whose `signer_lost` names A's first device
+fn signer_lost_group(members: &[&str]) -> MlsGroup {
+    let mut group = text_group(0x07, &device(USER_A, DEVICE_A2), 1);
+    group.members = members.iter().map(|id| device(USER_A, id)).collect();
+    group.signer_lost = Some(MlsSignerLost {
+        user_id: USER_A.to_string(),
+        device_id: DEVICE_A.to_string(),
+        cause: MlsSignerLostCause::DeviceRevoked,
+        at: at(0),
+    });
+    group
+}
+
+/// An authority change by A2 whose `owner_devices` drops or keeps A
+fn recovery_authority(keeps_lost: bool) -> ChannelAuthorityBody {
+    let mut authority = test_authority(2, DEVICE_A2, Some("ab".repeat(32)));
+    if !keeps_lost {
+        authority
+            .owner_devices
+            .retain(|device| device.device_id != DEVICE_A);
+    }
+    authority
+}
+
+#[test]
+fn step7_nothing_to_resolve_without_signer_lost() {
+    let list = body_naming(2, DEVICE_A2, None);
+    assert_eq!(
+        resolve_signer_lost(None, &list, None, at(1)).unwrap(),
+        SignerLostResolution::NotLost
+    );
+    let group = text_group(0x07, &device(USER_A, DEVICE_A), 1);
+    assert_eq!(
+        resolve_signer_lost(Some(&group), &list, None, at(1)).unwrap(),
+        SignerLostResolution::NotLost
+    );
+}
+
+#[test]
+fn step7_another_device_without_an_authority_change_is_refused() {
+    let group = signer_lost_group(&[DEVICE_A, DEVICE_A2]);
+    let error = resolve_signer_lost(Some(&group), &body_naming(2, DEVICE_A2, None), None, at(1))
+        .unwrap_err();
+    assert!(is_resecuring(&error), "{error:?}");
+}
+
+#[test]
+fn step7_an_authority_still_listing_the_lost_device_is_refused() {
+    let group = signer_lost_group(&[DEVICE_A, DEVICE_A2]);
+    let error = resolve_signer_lost(
+        Some(&group),
+        &body_naming(2, DEVICE_A2, None),
+        Some(&recovery_authority(true)),
+        at(1),
+    )
+    .unwrap_err();
+    assert!(is_resecuring(&error), "{error:?}");
+}
+
+#[test]
+fn step7_a_list_by_the_lost_device_itself_is_refused() {
+    let group = signer_lost_group(&[DEVICE_A, DEVICE_A2]);
+    let error = resolve_signer_lost(
+        Some(&group),
+        &body_naming(2, DEVICE_A, None),
+        Some(&recovery_authority(false)),
+        at(1),
+    )
+    .unwrap_err();
+    assert!(is_resecuring(&error), "{error:?}");
+}
+
+#[test]
+fn step7_a_qualifying_list_clears_and_queues_the_lost_leaf() {
+    let group = signer_lost_group(&[DEVICE_A, DEVICE_A2]);
+    assert_eq!(
+        resolve_signer_lost(
+            Some(&group),
+            &body_naming(2, DEVICE_A2, None),
+            Some(&recovery_authority(false)),
+            at(1),
+        )
+        .unwrap(),
+        SignerLostResolution::Clear {
+            pending_device: Some(MlsPendingDeviceRemoval {
+                user_id: USER_A.to_string(),
+                device_id: DEVICE_A.to_string(),
+                created_at: at(1),
+            })
+        }
+    );
+}
+
+/// #224: a lost device that holds no leaf (a recovery successor) is only
+/// cleared; an entry nobody can remove would freeze every send
+#[test]
+fn step7_a_lost_device_without_a_leaf_is_only_cleared() {
+    let group = signer_lost_group(&[DEVICE_A2]);
+    assert_eq!(
+        resolve_signer_lost(
+            Some(&group),
+            &body_naming(2, DEVICE_A2, None),
+            Some(&recovery_authority(false)),
+            at(1),
+        )
+        .unwrap(),
+        SignerLostResolution::Clear {
+            pending_device: None
+        }
+    );
+}
+
+#[test]
+fn step7_an_already_pending_lost_device_is_not_queued_twice() {
+    let mut group = signer_lost_group(&[DEVICE_A, DEVICE_A2]);
+    group.pending_device_removals = vec![MlsPendingDeviceRemoval {
+        user_id: USER_A.to_string(),
+        device_id: DEVICE_A.to_string(),
+        created_at: at(0),
+    }];
+    assert_eq!(
+        resolve_signer_lost(
+            Some(&group),
+            &body_naming(2, DEVICE_A2, None),
+            Some(&recovery_authority(false)),
+            at(1),
+        )
+        .unwrap(),
+        SignerLostResolution::Clear {
+            pending_device: None
+        }
+    );
+}
+
+// --- AD size in the planner (3.12.1) -----------------------------------------
+
+#[test]
+fn the_planner_refuses_a_row_whose_ad_v2_exceeds_16383_bytes() {
+    let mut stored = stored_row(&submit_v2(1, &[USER_A], v2_lines(GROUP_SALT), None));
+    let next = submit_v2(2, &[USER_A], v2_lines(GROUP_SALT), None);
+    let base = stored_row(&next).commit_ad_v2().unwrap().len();
+    let seats = active_seats(&[USER_A]);
+
+    stored.handovers = filler_chain(base, MAX_COMMIT_AD_LEN);
+    let landed =
+        applied(plan(SeatListWriteKind::Put, &next, Some(&stored), &seats, false).unwrap());
+    assert_eq!(landed.row.commit_ad().unwrap().len(), MAX_COMMIT_AD_LEN);
+
+    stored.handovers = filler_chain(base, MAX_COMMIT_AD_LEN + 1);
+    assert_refused(
+        plan(SeatListWriteKind::Put, &next, Some(&stored), &seats, false),
+        "commit ad too long",
+        "16384-byte AD",
+    );
 }

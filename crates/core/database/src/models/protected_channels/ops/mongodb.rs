@@ -759,6 +759,8 @@ impl MongoDb {
             seats: &seats,
             text_group: text_group.as_ref(),
             allow_claims,
+            // W1-2 wires formats_v2 from config
+            formats_v2: false,
             now,
         })?;
 

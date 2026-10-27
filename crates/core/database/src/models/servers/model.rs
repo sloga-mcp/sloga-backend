@@ -1600,6 +1600,7 @@ mod protected_delete_tests {
                     signer_user_id: owner.id.clone(),
                     signer_device_id: DEVICE.to_string(),
                     seats: vec![owner.id.clone()],
+                    v2: None,
                 }
                 .build()
                 .expect("body"),
@@ -1736,6 +1737,7 @@ mod protected_delete_tests {
                     signer_user_id: owner.id.clone(),
                     signer_device_id: DEVICE.to_string(),
                     seats: vec![owner.id.clone()],
+                    v2: None,
                 }
                 .build()
                 .expect("body"),

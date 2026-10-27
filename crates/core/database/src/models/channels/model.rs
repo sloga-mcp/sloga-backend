@@ -2193,6 +2193,7 @@ mod tests {
                 signer_user_id: owner.to_string(),
                 signer_device_id: PC_DEVICE.to_string(),
                 seats: vec![owner.to_string()],
+                v2: None,
             }
             .build()
             .unwrap(),

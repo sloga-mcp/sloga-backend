@@ -2356,6 +2356,7 @@ mod tests {
                     signer_user_id: OWNER.to_string(),
                     signer_device_id: OWNER_DEVICE.to_string(),
                     seats: vec![OWNER.to_string(), SEATED.to_string()],
+                    v2: None,
                 }
                 .build()
                 .unwrap(),

@@ -634,6 +634,7 @@ mod tests {
                 signer_user_id: self.signer_user.to_string(),
                 signer_device_id: self.signer_device.to_string(),
                 seats: self.seats.iter().map(|seat| seat.to_string()).collect(),
+                v2: None,
             }
             .build()
             .expect("body");

@@ -1,5 +1,8 @@
 //! Protected channels: entitlements, seats and the owner-signed seat list
 //! (`docs/protected-channels-design.md` sections 2.2 to 2.5, 4.1, 4.3, 3.12.1).
+//! S2 adds the v2 formats (4.1.1 list, 4.10 authority, 4.11 succession, 3.13
+//! Text join payload, 3.1.1 group id, 3.12.1 AD v2) and the pure 4.3 "S2
+//! additions" rule checks.
 //!
 //! The server is not the trust anchor for any of this. Members trust the
 //! owner-signed seat list under the owner key pinned on their devices. The
@@ -23,7 +26,10 @@ use iso8601_timestamp::{Duration, Timestamp};
 use revolt_result::Result;
 use sha2::{Digest, Sha256};
 
-use crate::{Channel, MlsGroup, MlsGroupKind, MlsMemberAdded, MlsPendingRemoval};
+use crate::{
+    is_valid_group_id, is_valid_key_package_ref, Channel, MlsGroup, MlsGroupKind, MlsMemberAdded,
+    MlsPendingDeviceRemoval, MlsPendingRemoval,
+};
 
 /// How long a released seat keeps counting against the slot cap (2.3)
 pub const SEAT_COOLDOWN_DAYS: i64 = 14;
@@ -50,6 +56,29 @@ pub const MAX_COMMIT_AD_LEN: usize = 16383;
 /// Highest Text group generation (6.1)
 pub const MAX_TEXT_GROUP_GENERATION: u32 = 63;
 
+/// Highest generation the v2 formats carry (3.1.1, 3.13; S2-D33, #204).
+/// `MAX_TEXT_GROUP_GENERATION` is raised to it together with the
+/// `groups_create` route, whose S1 cap message and tests pin 63.
+pub const MAX_TEXT_GROUP_GENERATION_V2: u32 = 65_535;
+
+/// Byte limit of a channel authority body (4.10)
+pub const MAX_CHANNEL_AUTHORITY_LEN: usize = 3072;
+
+/// Byte limit of an owner succession statement (4.11)
+pub const MAX_SUCCESSION_BODY_LEN: usize = 1024;
+
+/// `owner_devices` entries of an authority, `1..=5` (4.10)
+pub const MAX_AUTHORITY_OWNER_DEVICES: usize = 5;
+
+/// `delegates` entries of an authority, `0..=10` (4.10)
+pub const MAX_AUTHORITY_DELEGATES: usize = 10;
+
+/// `successors` entries of an authority, `0..=10` (4.10)
+pub const MAX_AUTHORITY_SUCCESSORS: usize = 10;
+
+/// Distinct users among an authority's `successors`, ranks `1..=5` (4.10)
+pub const MAX_AUTHORITY_SUCCESSOR_USERS: usize = 5;
+
 /// `2^53 - 1`: the bound on every canonical integer that must survive JSON (0.2)
 pub const MAX_CANONICAL_INT: i64 = 9_007_199_254_740_991;
 
@@ -61,6 +90,25 @@ pub const CONTEXT_HANDOVER: &str = "sloga-owner-handover-v1";
 
 /// Commit `authenticated_data` context field (3.12.1, WIRE FORMAT, never rename)
 pub const CONTEXT_COMMIT_AD: &str = "sloga-text-commit-ad-v1";
+
+/// Seat-list body v2 context line (0.4, 4.1.1, WIRE FORMAT, never rename)
+pub const CONTEXT_SEAT_LIST_V2: &str = "sloga-seat-list-v2";
+
+/// Text group id v2 derivation context (0.4, 3.1.1, WIRE FORMAT, never rename)
+pub const CONTEXT_TEXT_GROUP_V2: &str = "sloga-text-group-v2";
+
+/// Channel authority context line (0.4, 4.10, WIRE FORMAT, never rename)
+pub const CONTEXT_CHANNEL_AUTHORITY: &str = "sloga-channel-authority-v1";
+
+/// Commit AD v2 context field (0.4, 3.12.1, WIRE FORMAT, never rename)
+pub const CONTEXT_COMMIT_AD_V2: &str = "sloga-text-commit-ad-v2";
+
+/// Text join payload context line (0.4, 3.13, WIRE FORMAT, never rename)
+pub const CONTEXT_TEXT_JOIN: &str = "sloga-text-join-v1";
+
+/// Owner succession statement context line (0.4, 4.11, WIRE FORMAT, never
+/// rename)
+pub const CONTEXT_OWNER_SUCCESSION: &str = "sloga-owner-succession-v1";
 
 /// `ProtectedChannelChanged.scope` item: the seat list or seats changed (7.5)
 pub const PROTECTED_SCOPE_SEATS: &str = "seats";
@@ -317,7 +365,7 @@ pub fn channel_seats_used(seats: &[ChannelSeat], now: Timestamp) -> usize {
 // Canonical seat-list body (4.1)
 // ---------------------------------------------------------------------------
 
-/// A parsed seat-list body (4.1)
+/// A parsed seat-list body (4.1, and 4.1.1 when `v2` is set)
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SeatListBody {
     pub channel_id: String,
@@ -328,6 +376,54 @@ pub struct SeatListBody {
     pub signer_device_id: String,
     /// Sorted ascending by byte value, unique, contains the signer
     pub seats: Vec<String>,
+    /// S2: the five v2 lines; `None` is a v1 body (4.1.1)
+    pub v2: Option<SeatListV2Lines>,
+}
+
+/// The `history:` line of a v2 seat list (4.1.1; S4's, carried in S2)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SeatListHistory {
+    Visible,
+    Hidden,
+}
+
+/// The `pre_history:` line of a v2 seat list (4.1.1; S4's, carried in S2)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SeatListPreHistory {
+    Kept,
+    Wiped,
+}
+
+/// Lines 10 to 14 of a v2 seat-list body (4.1.1)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SeatListV2Lines {
+    /// Lowercase hex SHA-256 of the channel authority body (4.10); `None`
+    /// for an empty `authority:` line
+    pub authority_sha256: Option<String>,
+    pub history: SeatListHistory,
+    /// A message id (ULID); `None` for an empty line
+    pub history_boundary: Option<String>,
+    pub pre_history: SeatListPreHistory,
+    /// 64 lowercase hex (32 bytes), the 3.1.1 group id salt
+    pub group_salt: String,
+}
+
+impl SeatListHistory {
+    fn as_str(self) -> &'static str {
+        match self {
+            SeatListHistory::Visible => "visible",
+            SeatListHistory::Hidden => "hidden",
+        }
+    }
+}
+
+impl SeatListPreHistory {
+    fn as_str(self) -> &'static str {
+        match self {
+            SeatListPreHistory::Kept => "kept",
+            SeatListPreHistory::Wiped => "wiped",
+        }
+    }
 }
 
 /// ULID, Crockford base32, uppercase, 26 chars (0.1)
@@ -361,99 +457,146 @@ fn labeled<'a>(line: &'a str, label: &str) -> Option<&'a str> {
     line.strip_prefix(label)?.strip_prefix(':')
 }
 
+/// `len` lowercase hex chars
+fn is_lower_hex(value: &str, len: usize) -> bool {
+    value.len() == len
+        && value
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// Lowercase hex SHA-256 of `bytes`
+fn sha256_hex(bytes: &[u8]) -> String {
+    to_hex(&Sha256::digest(bytes))
+}
+
+/// Whether a canonical body's first line is `context` (format dispatch only;
+/// the strict parser of that format decides validity)
+fn has_context(body: &str, context: &str) -> bool {
+    body.split('\n').next() == Some(context)
+}
+
 impl SeatListBody {
-    /// Strict parse (4.1, including the W0-fix3 bounds). Refuses anything
+    /// Strict, VERSION-DISPATCHING parse: the context line picks the format
+    /// (4.1 or 4.1.1) and that format's parser is strict. Every reader of a
+    /// stored body uses this, so a v2 row keeps working wherever only the
+    /// shared lines (seats, `device_cap`, signer) are read. Which format a
+    /// WRITE may carry is 4.3 step 1 (`check_seat_list_format`).
+    pub fn parse(body: &str) -> Result<SeatListBody> {
+        if has_context(body, CONTEXT_SEAT_LIST_V2) {
+            SeatListBody::parse_v2(body)
+        } else {
+            SeatListBody::parse_v1(body)
+        }
+    }
+
+    /// Strict v1 parse (4.1, including the W0-fix3 bounds). Refuses anything
     /// that is not the one valid byte string for its content: nothing is
     /// trimmed, normalized or re-sorted.
-    pub fn parse(body: &str) -> Result<SeatListBody> {
-        if body.len() > MAX_SEAT_LIST_BODY_LEN {
-            return Err(invalid("seat list body too long"));
-        }
-        if body.contains('\r') {
-            return Err(invalid("seat list body contains CR"));
-        }
-
-        let lines: Vec<&str> = body.split('\n').collect();
-        if lines.len() != 9 {
-            return Err(invalid("seat list body must have exactly 9 lines"));
-        }
+    pub fn parse_v1(body: &str) -> Result<SeatListBody> {
+        let lines = seat_list_lines(body, 9)?;
         if lines[0] != CONTEXT_SEAT_LIST || lines[1] != "v:1" {
             return Err(invalid("seat list context or format version"));
         }
+        parse_seat_list_shared(&lines)
+    }
+
+    /// Strict v2 parse (4.1.1): the nine v1 lines under the v2 context and
+    /// `v:2`, then `authority`, `history`, `history_boundary`,
+    /// `pre_history` and `group_salt`. `wiped` with an empty boundary is
+    /// malformed (4.1.1, 4.4.1 rule 3). A boundary and `wiped` are otherwise
+    /// format-valid; S2's refusal of them is 4.3 step 4c.
+    pub fn parse_v2(body: &str) -> Result<SeatListBody> {
+        let lines = seat_list_lines(body, 14)?;
+        if lines[0] != CONTEXT_SEAT_LIST_V2 || lines[1] != "v:2" {
+            return Err(invalid("seat list context or format version"));
+        }
+        let mut parsed = parse_seat_list_shared(&lines)?;
 
         let field = |index: usize, label: &str| {
             labeled(lines[index], label).ok_or_else(|| invalid("seat list label"))
         };
 
-        let channel_id = field(2, "channel_id")?;
-        if !is_valid_ulid_id(channel_id) {
-            return Err(invalid("seat list channel_id"));
+        let authority_sha256 = match field(9, "authority")? {
+            "" => None,
+            hash if is_lower_hex(hash, 64) => Some(hash.to_string()),
+            _ => return Err(invalid("seat list authority")),
+        };
+        let history = match field(10, "history")? {
+            "visible" => SeatListHistory::Visible,
+            "hidden" => SeatListHistory::Hidden,
+            _ => return Err(invalid("seat list history")),
+        };
+        let history_boundary = match field(11, "history_boundary")? {
+            "" => None,
+            boundary if is_valid_ulid_id(boundary) => Some(boundary.to_string()),
+            _ => return Err(invalid("seat list history_boundary")),
+        };
+        let pre_history = match field(12, "pre_history")? {
+            "kept" => SeatListPreHistory::Kept,
+            "wiped" => SeatListPreHistory::Wiped,
+            _ => return Err(invalid("seat list pre_history")),
+        };
+        if pre_history == SeatListPreHistory::Wiped && history_boundary.is_none() {
+            return Err(invalid("seat list pre_history wiped without a boundary"));
+        }
+        let group_salt = field(13, "group_salt")?;
+        if !is_lower_hex(group_salt, 64) {
+            return Err(invalid("seat list group_salt"));
         }
 
-        let version = parse_canonical_decimal(field(3, "version")?)
-            .filter(|version| (1..=MAX_CANONICAL_INT as u64).contains(version))
-            .ok_or_else(|| invalid("seat list version"))? as i64;
-
-        let device_cap = parse_canonical_decimal(field(4, "device_cap")?)
-            .and_then(|cap| u32::try_from(cap).ok())
-            .ok_or_else(|| invalid("seat list device_cap"))?;
-
-        let issued_at = parse_canonical_decimal(field(5, "issued_at")?)
-            .filter(|at| *at <= MAX_CANONICAL_INT as u64)
-            .ok_or_else(|| invalid("seat list issued_at"))? as i64;
-
-        let signer_user_id = field(6, "signer_user_id")?;
-        if !is_valid_ulid_id(signer_user_id) {
-            return Err(invalid("seat list signer_user_id"));
-        }
-
-        let signer_device_id = field(7, "signer_device_id")?;
-        if !is_valid_device_id_hex(signer_device_id) {
-            return Err(invalid("seat list signer_device_id"));
-        }
-
-        let seats_line = field(8, "seats")?;
-        if seats_line.is_empty() {
-            return Err(invalid("seat list has no seats"));
-        }
-        let seats: Vec<String> = seats_line.split(',').map(str::to_string).collect();
-        if seats.len() > MAX_SEAT_LIST_SEATS {
-            return Err(invalid("seat list has too many seats"));
-        }
-        if !seats.iter().all(|seat| is_valid_ulid_id(seat)) {
-            return Err(invalid("seat list seat id"));
-        }
-        // Strictly ascending by byte value = sorted AND unique
-        if !seats
-            .windows(2)
-            .all(|pair| pair[0].as_bytes() < pair[1].as_bytes())
-        {
-            return Err(invalid("seat list seats not sorted and unique"));
-        }
-        if !seats.iter().any(|seat| seat == signer_user_id) {
-            return Err(invalid("seat list signer is not seated"));
-        }
-
-        Ok(SeatListBody {
-            channel_id: channel_id.to_string(),
-            version,
-            device_cap,
-            issued_at,
-            signer_user_id: signer_user_id.to_string(),
-            signer_device_id: signer_device_id.to_string(),
-            seats,
-        })
+        parsed.v2 = Some(SeatListV2Lines {
+            authority_sha256,
+            history,
+            history_boundary,
+            pre_history,
+            group_salt: group_salt.to_string(),
+        });
+        Ok(parsed)
     }
 
-    /// Canonical builder (4.1): sorts and de-duplicates `seats`, then
-    /// re-parses its own output so it can never emit a body `parse` refuses.
+    /// Canonical builder: v1 (4.1) when `v2` is `None`, else v2 (4.1.1).
+    /// Sorts and de-duplicates `seats`, then re-parses its own output so it
+    /// can never emit a body `parse` refuses.
     pub fn build(&self) -> Result<String> {
+        if self.v2.is_some() {
+            return self.build_v2();
+        }
+
+        let body = format!("{CONTEXT_SEAT_LIST}\nv:1\n{}", self.shared_lines());
+
+        SeatListBody::parse_v1(&body)?;
+        Ok(body)
+    }
+
+    /// Canonical v2 builder (4.1.1); refuses a body without `v2` lines
+    pub fn build_v2(&self) -> Result<String> {
+        let Some(lines) = &self.v2 else {
+            return Err(invalid("seat list v2 lines missing"));
+        };
+
+        let body = format!(
+            "{CONTEXT_SEAT_LIST_V2}\nv:2\n{}\nauthority:{}\nhistory:{}\nhistory_boundary:{}\npre_history:{}\ngroup_salt:{}",
+            self.shared_lines(),
+            lines.authority_sha256.as_deref().unwrap_or_default(),
+            lines.history.as_str(),
+            lines.history_boundary.as_deref().unwrap_or_default(),
+            lines.pre_history.as_str(),
+            lines.group_salt
+        );
+
+        SeatListBody::parse_v2(&body)?;
+        Ok(body)
+    }
+
+    /// Lines 3 to 9, shared by both formats, with `seats` sorted and unique
+    fn shared_lines(&self) -> String {
         let mut seats = self.seats.clone();
         seats.sort();
         seats.dedup();
 
-        let body = format!(
-            "{CONTEXT_SEAT_LIST}\nv:1\nchannel_id:{}\nversion:{}\ndevice_cap:{}\nissued_at:{}\nsigner_user_id:{}\nsigner_device_id:{}\nseats:{}",
+        format!(
+            "channel_id:{}\nversion:{}\ndevice_cap:{}\nissued_at:{}\nsigner_user_id:{}\nsigner_device_id:{}\nseats:{}",
             self.channel_id,
             self.version,
             self.device_cap,
@@ -461,11 +604,95 @@ impl SeatListBody {
             self.signer_user_id,
             self.signer_device_id,
             seats.join(",")
-        );
-
-        SeatListBody::parse(&body)?;
-        Ok(body)
+        )
     }
+}
+
+/// Size, CR and line-count checks shared by both seat-list formats
+fn seat_list_lines(body: &str, count: usize) -> Result<Vec<&str>> {
+    if body.len() > MAX_SEAT_LIST_BODY_LEN {
+        return Err(invalid("seat list body too long"));
+    }
+    if body.contains('\r') {
+        return Err(invalid("seat list body contains CR"));
+    }
+
+    let lines: Vec<&str> = body.split('\n').collect();
+    if lines.len() != count {
+        return Err(invalid(if count == 9 {
+            "seat list body must have exactly 9 lines"
+        } else {
+            "seat list body must have exactly 14 lines"
+        }));
+    }
+    Ok(lines)
+}
+
+/// Lines 3 to 9 (4.1), identical in both formats
+fn parse_seat_list_shared(lines: &[&str]) -> Result<SeatListBody> {
+    let field = |index: usize, label: &str| {
+        labeled(lines[index], label).ok_or_else(|| invalid("seat list label"))
+    };
+
+    let channel_id = field(2, "channel_id")?;
+    if !is_valid_ulid_id(channel_id) {
+        return Err(invalid("seat list channel_id"));
+    }
+
+    let version = parse_canonical_decimal(field(3, "version")?)
+        .filter(|version| (1..=MAX_CANONICAL_INT as u64).contains(version))
+        .ok_or_else(|| invalid("seat list version"))? as i64;
+
+    let device_cap = parse_canonical_decimal(field(4, "device_cap")?)
+        .and_then(|cap| u32::try_from(cap).ok())
+        .ok_or_else(|| invalid("seat list device_cap"))?;
+
+    let issued_at = parse_canonical_decimal(field(5, "issued_at")?)
+        .filter(|at| *at <= MAX_CANONICAL_INT as u64)
+        .ok_or_else(|| invalid("seat list issued_at"))? as i64;
+
+    let signer_user_id = field(6, "signer_user_id")?;
+    if !is_valid_ulid_id(signer_user_id) {
+        return Err(invalid("seat list signer_user_id"));
+    }
+
+    let signer_device_id = field(7, "signer_device_id")?;
+    if !is_valid_device_id_hex(signer_device_id) {
+        return Err(invalid("seat list signer_device_id"));
+    }
+
+    let seats_line = field(8, "seats")?;
+    if seats_line.is_empty() {
+        return Err(invalid("seat list has no seats"));
+    }
+    let seats: Vec<String> = seats_line.split(',').map(str::to_string).collect();
+    if seats.len() > MAX_SEAT_LIST_SEATS {
+        return Err(invalid("seat list has too many seats"));
+    }
+    if !seats.iter().all(|seat| is_valid_ulid_id(seat)) {
+        return Err(invalid("seat list seat id"));
+    }
+    // Strictly ascending by byte value = sorted AND unique
+    if !seats
+        .windows(2)
+        .all(|pair| pair[0].as_bytes() < pair[1].as_bytes())
+    {
+        return Err(invalid("seat list seats not sorted and unique"));
+    }
+    if !seats.iter().any(|seat| seat == signer_user_id) {
+        return Err(invalid("seat list signer is not seated"));
+    }
+
+    Ok(SeatListBody {
+        channel_id: channel_id.to_string(),
+        version,
+        device_cap,
+        issued_at,
+        signer_user_id: signer_user_id.to_string(),
+        signer_device_id: signer_device_id.to_string(),
+        seats,
+        v2: None,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -573,6 +800,550 @@ impl HandoverBody {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Canonical channel authority (4.10, S2)
+// ---------------------------------------------------------------------------
+
+/// An `owner_devices` entry: `device_id "." b64 identity key` (4.10)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthorityOwnerDevice {
+    pub device_id: String,
+    pub identity_key: String,
+}
+
+/// A `delegates` or `successors` entry:
+/// `user_id "." device_id "." b64 identity key` (4.10)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthorityUserDevice {
+    pub user_id: String,
+    pub device_id: String,
+    pub identity_key: String,
+}
+
+/// A parsed channel authority body (4.10). The `v:1` format line and the
+/// fixed `delegate_scope:seat` line are checked by `parse` and not kept.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChannelAuthorityBody {
+    pub channel_id: String,
+    pub version: i64,
+    pub owner_user_id: String,
+    /// The `owner_devices` entry whose key signs this authority
+    pub signer_device_id: String,
+    pub issued_at: i64,
+    /// `1..=5` entries, sorted by the bytes of the whole entry
+    pub owner_devices: Vec<AuthorityOwnerDevice>,
+    /// `0..=10` entries, sorted by the bytes of the whole entry
+    pub delegates: Vec<AuthorityUserDevice>,
+    pub delegate_max_device_cap: u32,
+    /// `0..=10` entries in RANK order (at most 5 users, each user's entries
+    /// contiguous and sorted by device id)
+    pub successors: Vec<AuthorityUserDevice>,
+    /// Lowercase hex SHA-256 of the previous authority body; `None` exactly
+    /// when `version` is 1
+    pub prev: Option<String>,
+}
+
+/// The channel authority format (4.10): parse, build and hash
+pub struct ChannelAuthority;
+
+impl AuthorityOwnerDevice {
+    fn entry(&self) -> String {
+        format!("{}.{}", self.device_id, self.identity_key)
+    }
+}
+
+impl AuthorityUserDevice {
+    fn entry(&self) -> String {
+        format!("{}.{}.{}", self.user_id, self.device_id, self.identity_key)
+    }
+}
+
+/// Split a `,`-joined entry line; an empty line has no entries, and an
+/// empty entry is malformed
+fn authority_entries(line: &str) -> Result<Vec<&str>> {
+    if line.is_empty() {
+        return Ok(vec![]);
+    }
+    let entries: Vec<&str> = line.split(',').collect();
+    if entries.iter().any(|entry| entry.is_empty()) {
+        return Err(invalid("authority empty entry"));
+    }
+    Ok(entries)
+}
+
+/// Parse a `user_id.device_id.key` line (delegates, successors): charsets,
+/// at most `max` entries, no device id twice, no entry for the owner user
+fn authority_user_devices(
+    line: &str,
+    max: usize,
+    owner_user_id: &str,
+) -> Result<Vec<AuthorityUserDevice>> {
+    let entries = authority_entries(line)?;
+    if entries.len() > max {
+        return Err(invalid("authority has too many entries"));
+    }
+
+    let mut parsed: Vec<AuthorityUserDevice> = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let parts: Vec<&str> = entry.split('.').collect();
+        let [user_id, device_id, identity_key] = parts[..] else {
+            return Err(invalid("authority entry shape"));
+        };
+        if !is_valid_ulid_id(user_id)
+            || !is_valid_device_id_hex(device_id)
+            || !is_valid_identity_key_b64(identity_key)
+        {
+            return Err(invalid("authority entry charset"));
+        }
+        if user_id == owner_user_id {
+            return Err(invalid(
+                "authority names the owner as delegate or successor",
+            ));
+        }
+        if parsed.iter().any(|other| other.device_id == device_id) {
+            return Err(invalid("authority device id twice in one line"));
+        }
+        parsed.push(AuthorityUserDevice {
+            user_id: user_id.to_string(),
+            device_id: device_id.to_string(),
+            identity_key: identity_key.to_string(),
+        });
+    }
+    Ok(parsed)
+}
+
+/// Strictly ascending by the bytes of the whole entry: sorted, no duplicate
+fn entries_strictly_sorted(entries: &[String]) -> bool {
+    entries
+        .windows(2)
+        .all(|pair| pair[0].as_bytes() < pair[1].as_bytes())
+}
+
+impl ChannelAuthority {
+    /// Strict parse (4.10): exactly 13 lines in order, no trailing LF, no
+    /// CR, at most 3072 bytes, and every format rule: charsets; `owner_devices`
+    /// non-empty, sorted, with no device id or identity key twice and an
+    /// entry for `signer_device_id`; `delegates` sorted with no device id
+    /// twice; no delegate or successor entry for the owner user;
+    /// `delegate_scope` exactly `seat`; `successors` naming at most 5
+    /// distinct users, each user's entries contiguous and sorted by device
+    /// id; `prev` empty exactly when `version` is 1.
+    pub fn parse(body: &str) -> Result<ChannelAuthorityBody> {
+        if body.len() > MAX_CHANNEL_AUTHORITY_LEN {
+            return Err(invalid("authority body too long"));
+        }
+        if body.contains('\r') {
+            return Err(invalid("authority body contains CR"));
+        }
+
+        let lines: Vec<&str> = body.split('\n').collect();
+        if lines.len() != 13 {
+            return Err(invalid("authority body must have exactly 13 lines"));
+        }
+        if lines[0] != CONTEXT_CHANNEL_AUTHORITY || lines[1] != "v:1" {
+            return Err(invalid("authority context or format version"));
+        }
+
+        let field = |index: usize, label: &str| {
+            labeled(lines[index], label).ok_or_else(|| invalid("authority label"))
+        };
+
+        let channel_id = field(2, "channel_id")?;
+        if !is_valid_ulid_id(channel_id) {
+            return Err(invalid("authority channel_id"));
+        }
+        let version = parse_canonical_decimal(field(3, "version")?)
+            .filter(|version| (1..=MAX_CANONICAL_INT as u64).contains(version))
+            .ok_or_else(|| invalid("authority version"))? as i64;
+        let owner_user_id = field(4, "owner_user_id")?;
+        if !is_valid_ulid_id(owner_user_id) {
+            return Err(invalid("authority owner_user_id"));
+        }
+        let signer_device_id = field(5, "signer_device_id")?;
+        if !is_valid_device_id_hex(signer_device_id) {
+            return Err(invalid("authority signer_device_id"));
+        }
+        let issued_at = parse_canonical_decimal(field(6, "issued_at")?)
+            .filter(|at| *at <= MAX_CANONICAL_INT as u64)
+            .ok_or_else(|| invalid("authority issued_at"))? as i64;
+
+        // owner_devices
+        let entries = authority_entries(field(7, "owner_devices")?)?;
+        if entries.is_empty() || entries.len() > MAX_AUTHORITY_OWNER_DEVICES {
+            return Err(invalid("authority owner_devices count"));
+        }
+        let mut owner_devices: Vec<AuthorityOwnerDevice> = Vec::with_capacity(entries.len());
+        for entry in &entries {
+            let parts: Vec<&str> = entry.split('.').collect();
+            let [device_id, identity_key] = parts[..] else {
+                return Err(invalid("authority entry shape"));
+            };
+            if !is_valid_device_id_hex(device_id) || !is_valid_identity_key_b64(identity_key) {
+                return Err(invalid("authority entry charset"));
+            }
+            if owner_devices
+                .iter()
+                .any(|other| other.device_id == device_id)
+            {
+                return Err(invalid("authority device id twice in one line"));
+            }
+            if owner_devices
+                .iter()
+                .any(|other| other.identity_key == identity_key)
+            {
+                return Err(invalid("authority owner identity key twice"));
+            }
+            owner_devices.push(AuthorityOwnerDevice {
+                device_id: device_id.to_string(),
+                identity_key: identity_key.to_string(),
+            });
+        }
+        if !entries_strictly_sorted(&owner_devices.iter().map(|d| d.entry()).collect::<Vec<_>>()) {
+            return Err(invalid("authority owner_devices not sorted"));
+        }
+        if !owner_devices
+            .iter()
+            .any(|device| device.device_id == signer_device_id)
+        {
+            return Err(invalid(
+                "authority signer_device_id has no owner_devices entry",
+            ));
+        }
+
+        // delegates
+        let delegates = authority_user_devices(
+            field(8, "delegates")?,
+            MAX_AUTHORITY_DELEGATES,
+            owner_user_id,
+        )?;
+        if !entries_strictly_sorted(&delegates.iter().map(|d| d.entry()).collect::<Vec<_>>()) {
+            return Err(invalid("authority delegates not sorted"));
+        }
+
+        if field(9, "delegate_scope")? != "seat" {
+            return Err(invalid("authority delegate_scope"));
+        }
+
+        let delegate_max_device_cap =
+            parse_canonical_decimal(field(10, "delegate_max_device_cap")?)
+                .and_then(|cap| u32::try_from(cap).ok())
+                .ok_or_else(|| invalid("authority delegate_max_device_cap"))?;
+
+        // successors: rank order of users; within a user, contiguous and
+        // sorted by device id
+        let successors = authority_user_devices(
+            field(11, "successors")?,
+            MAX_AUTHORITY_SUCCESSORS,
+            owner_user_id,
+        )?;
+        let mut ranked_users: Vec<&str> = Vec::new();
+        for (index, entry) in successors.iter().enumerate() {
+            let previous = index.checked_sub(1).map(|prev| &successors[prev]);
+            match previous {
+                Some(previous) if previous.user_id == entry.user_id => {
+                    if previous.device_id.as_bytes() >= entry.device_id.as_bytes() {
+                        return Err(invalid("authority successor devices not sorted"));
+                    }
+                }
+                _ => {
+                    if ranked_users.contains(&entry.user_id.as_str()) {
+                        return Err(invalid("authority successor entries not contiguous"));
+                    }
+                    ranked_users.push(&entry.user_id);
+                }
+            }
+        }
+        if ranked_users.len() > MAX_AUTHORITY_SUCCESSOR_USERS {
+            return Err(invalid("authority names more than 5 successor users"));
+        }
+
+        let prev = match field(12, "prev")? {
+            "" => None,
+            hash if is_lower_hex(hash, 64) => Some(hash.to_string()),
+            _ => return Err(invalid("authority prev")),
+        };
+        if prev.is_none() != (version == 1) {
+            return Err(invalid("authority prev must be empty exactly at version 1"));
+        }
+
+        Ok(ChannelAuthorityBody {
+            channel_id: channel_id.to_string(),
+            version,
+            owner_user_id: owner_user_id.to_string(),
+            signer_device_id: signer_device_id.to_string(),
+            issued_at,
+            owner_devices,
+            delegates,
+            delegate_max_device_cap,
+            successors,
+            prev,
+        })
+    }
+
+    /// Canonical builder (4.10): sorts `owner_devices` and `delegates` by
+    /// their entry bytes, keeps `successors` in the given RANK order, then
+    /// re-parses its own output so it can never emit a body `parse` refuses.
+    pub fn build(authority: &ChannelAuthorityBody) -> Result<String> {
+        let mut owner_devices: Vec<String> = authority
+            .owner_devices
+            .iter()
+            .map(AuthorityOwnerDevice::entry)
+            .collect();
+        owner_devices.sort();
+        let mut delegates: Vec<String> = authority
+            .delegates
+            .iter()
+            .map(AuthorityUserDevice::entry)
+            .collect();
+        delegates.sort();
+        let successors: Vec<String> = authority
+            .successors
+            .iter()
+            .map(AuthorityUserDevice::entry)
+            .collect();
+
+        let body = format!(
+            "{CONTEXT_CHANNEL_AUTHORITY}\nv:1\nchannel_id:{}\nversion:{}\nowner_user_id:{}\nsigner_device_id:{}\nissued_at:{}\nowner_devices:{}\ndelegates:{}\ndelegate_scope:seat\ndelegate_max_device_cap:{}\nsuccessors:{}\nprev:{}",
+            authority.channel_id,
+            authority.version,
+            authority.owner_user_id,
+            authority.signer_device_id,
+            authority.issued_at,
+            owner_devices.join(","),
+            delegates.join(","),
+            authority.delegate_max_device_cap,
+            successors.join(","),
+            authority.prev.as_deref().unwrap_or_default()
+        );
+
+        ChannelAuthority::parse(&body)?;
+        Ok(body)
+    }
+
+    /// Lowercase hex SHA-256 of the exact body bytes: the value of a v2
+    /// list's `authority:` line and of the next authority's `prev`
+    pub fn sha256(body: &str) -> String {
+        sha256_hex(body.as_bytes())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Canonical owner succession statement (4.11, [S2b] format only)
+// ---------------------------------------------------------------------------
+
+/// A parsed owner succession statement (4.11). S2a never emits, appends or
+/// walks one; the format is pinned here so one bump covers S2b.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SuccessionStatement {
+    pub channel_id: String,
+    pub from_user_id: String,
+    /// b64 Ed25519 public key of the owner being succeeded
+    pub from_identity_key: String,
+    pub to_user_id: String,
+    pub to_device_id: String,
+    /// b64 Ed25519 public key of the successor device (the signer)
+    pub to_identity_key: String,
+    /// Lowercase hex SHA-256 of the authority naming the successor
+    pub authority_sha256: String,
+    /// `1..=5`
+    pub rank: u8,
+    pub issued_at: i64,
+}
+
+impl SuccessionStatement {
+    /// Strict parse (4.11): exactly 11 lines, no trailing LF, no CR, at most
+    /// 1024 bytes
+    pub fn parse(body: &str) -> Result<SuccessionStatement> {
+        if body.len() > MAX_SUCCESSION_BODY_LEN {
+            return Err(invalid("succession body too long"));
+        }
+        if body.contains('\r') {
+            return Err(invalid("succession body contains CR"));
+        }
+
+        let lines: Vec<&str> = body.split('\n').collect();
+        if lines.len() != 11 {
+            return Err(invalid("succession body must have exactly 11 lines"));
+        }
+        if lines[0] != CONTEXT_OWNER_SUCCESSION || lines[1] != "v:1" {
+            return Err(invalid("succession context or format version"));
+        }
+
+        let field = |index: usize, label: &str| {
+            labeled(lines[index], label).ok_or_else(|| invalid("succession label"))
+        };
+        let ulid = |index: usize, label: &str| {
+            field(index, label).and_then(|value| {
+                if is_valid_ulid_id(value) {
+                    Ok(value.to_string())
+                } else {
+                    Err(invalid("succession user or channel id"))
+                }
+            })
+        };
+        let key = |index: usize, label: &str| {
+            field(index, label).and_then(|value| {
+                if is_valid_identity_key_b64(value) {
+                    Ok(value.to_string())
+                } else {
+                    Err(invalid("succession identity key"))
+                }
+            })
+        };
+
+        let channel_id = ulid(2, "channel_id")?;
+        let from_user_id = ulid(3, "from_user_id")?;
+        let from_identity_key = key(4, "from_identity_key")?;
+        let to_user_id = ulid(5, "to_user_id")?;
+        let to_device_id = field(6, "to_device_id")?;
+        if !is_valid_device_id_hex(to_device_id) {
+            return Err(invalid("succession device id"));
+        }
+        let to_identity_key = key(7, "to_identity_key")?;
+        let authority_sha256 = field(8, "authority_sha256")?;
+        if !is_lower_hex(authority_sha256, 64) {
+            return Err(invalid("succession authority_sha256"));
+        }
+        let rank = parse_canonical_decimal(field(9, "rank")?)
+            .filter(|rank| (1..=MAX_AUTHORITY_SUCCESSOR_USERS as u64).contains(rank))
+            .ok_or_else(|| invalid("succession rank"))? as u8;
+        let issued_at = parse_canonical_decimal(field(10, "issued_at")?)
+            .filter(|at| *at <= MAX_CANONICAL_INT as u64)
+            .ok_or_else(|| invalid("succession issued_at"))? as i64;
+
+        Ok(SuccessionStatement {
+            channel_id,
+            from_user_id,
+            from_identity_key,
+            to_user_id,
+            to_device_id: to_device_id.to_string(),
+            to_identity_key,
+            authority_sha256: authority_sha256.to_string(),
+            rank,
+            issued_at,
+        })
+    }
+
+    /// Canonical builder (4.11); re-parses its own output
+    pub fn build(&self) -> Result<String> {
+        let body = format!(
+            "{CONTEXT_OWNER_SUCCESSION}\nv:1\nchannel_id:{}\nfrom_user_id:{}\nfrom_identity_key:{}\nto_user_id:{}\nto_device_id:{}\nto_identity_key:{}\nauthority_sha256:{}\nrank:{}\nissued_at:{}",
+            self.channel_id,
+            self.from_user_id,
+            self.from_identity_key,
+            self.to_user_id,
+            self.to_device_id,
+            self.to_identity_key,
+            self.authority_sha256,
+            self.rank,
+            self.issued_at
+        );
+
+        SuccessionStatement::parse(&body)?;
+        Ok(body)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Text join payload (3.13, S2) and Text group id v2 (3.1.1, S2)
+// ---------------------------------------------------------------------------
+
+/// The signed fields of a Text join or rejoin intent on a v2 channel (3.13).
+/// Ed25519 by the joining device's identity key; the route verifies.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TextJoinPayload {
+    pub user_id: String,
+    pub device_id: String,
+    pub channel_id: String,
+    /// `0..=65535`
+    pub generation: u32,
+    /// 64 lowercase hex
+    pub group_id: String,
+    /// 1 to 64 chars of `[A-Za-z0-9+/]` (`is_valid_key_package_ref`)
+    pub key_package_ref: String,
+    /// Milliseconds, `0..=2^53 - 1`
+    pub issued_at: i64,
+}
+
+impl TextJoinPayload {
+    /// The exact payload bytes (9 labeled lines, no trailing LF). Refuses
+    /// any out-of-charset or out-of-bounds input; nothing is escaped.
+    pub fn build(&self) -> Result<String> {
+        if !is_valid_ulid_id(&self.user_id) || !is_valid_ulid_id(&self.channel_id) {
+            return Err(invalid("text join user or channel id"));
+        }
+        if !is_valid_device_id_hex(&self.device_id) {
+            return Err(invalid("text join device id"));
+        }
+        if self.generation > MAX_TEXT_GROUP_GENERATION_V2 {
+            return Err(invalid("text join generation"));
+        }
+        if !is_valid_group_id(&self.group_id) {
+            return Err(invalid("text join group id"));
+        }
+        if !is_valid_key_package_ref(&self.key_package_ref) {
+            return Err(invalid("text join key_package_ref"));
+        }
+        if !(0..=MAX_CANONICAL_INT).contains(&self.issued_at) {
+            return Err(invalid("text join issued_at"));
+        }
+
+        Ok(format!(
+            "{CONTEXT_TEXT_JOIN}\nv:1\nuser_id:{}\ndevice_id:{}\nchannel_id:{}\ngeneration:{}\ngroup_id:{}\nkey_package_ref:{}\nissued_at:{}",
+            self.user_id,
+            self.device_id,
+            self.channel_id,
+            self.generation,
+            self.group_id,
+            self.key_package_ref,
+            self.issued_at
+        ))
+    }
+}
+
+/// The 91-byte hash input of `text_group_id_v2` (3.1.1):
+/// `field("sloga-text-group-v2") || field(channel_id) || u64_be(g) ||
+/// field(salt)`, `field(x) = u16_be(len(x)) || x`, the salt being the 32 raw
+/// bytes the list's `group_salt:` line encodes
+pub fn text_group_id_v2_input(
+    channel_id: &str,
+    generation: u32,
+    group_salt_hex: &str,
+) -> Result<Vec<u8>> {
+    if !is_valid_ulid_id(channel_id) {
+        return Err(invalid("text group channel id"));
+    }
+    if generation > MAX_TEXT_GROUP_GENERATION_V2 {
+        return Err(invalid("text group generation"));
+    }
+    if !is_lower_hex(group_salt_hex, 64) {
+        return Err(invalid("text group salt"));
+    }
+    let salt: Vec<u8> = (0..32)
+        .map(|index| u8::from_str_radix(&group_salt_hex[index * 2..index * 2 + 2], 16))
+        .collect::<std::result::Result<_, _>>()
+        .map_err(|_| invalid("text group salt"))?;
+
+    let mut input = Vec::with_capacity(91);
+    push_ad_field(&mut input, CONTEXT_TEXT_GROUP_V2.as_bytes())?;
+    push_ad_field(&mut input, channel_id.as_bytes())?;
+    input.extend_from_slice(&u64::from(generation).to_be_bytes());
+    push_ad_field(&mut input, &salt)?;
+    Ok(input)
+}
+
+/// Text group id v2 (3.1.1, S2-D1b): lowercase hex SHA-256 of
+/// `text_group_id_v2_input`. The v1 derivation (3.1) is untouched; a
+/// group's derivation is fixed by the list format its channel holds when it
+/// is created.
+pub fn text_group_id_v2(channel_id: &str, generation: u32, group_salt_hex: &str) -> Result<String> {
+    Ok(sha256_hex(&text_group_id_v2_input(
+        channel_id,
+        generation,
+        group_salt_hex,
+    )?))
+}
+
 /// Decode a b64 (standard alphabet, unpadded, canonical) Ed25519 signature
 /// to its raw 64 bytes (0.1). Refuses padding, whitespace, the URL-safe
 /// alphabet and non-canonical trailing bits.
@@ -602,11 +1373,67 @@ fn to_hex(bytes: &[u8]) -> String {
 }
 
 impl SeatList {
+    /// Whether the stored body is a v2 body (4.1.1), by its context line
+    pub fn is_v2(&self) -> bool {
+        has_context(&self.body, CONTEXT_SEAT_LIST_V2)
+    }
+
     /// The commit `authenticated_data` every Text commit must carry while
-    /// this row is the newest list (3.12.1): context, body, raw signature,
-    /// `u16_be` handover count, then each handover body and raw signature,
-    /// every field `u16_be(len) || bytes`.
+    /// this row is the newest list (3.12.1). DISPATCHES by the body's
+    /// format: a v2 row gets `commit_ad_v2`; a v1 row gets the v1 AD,
+    /// byte-identical to S1: context, body, raw signature, `u16_be` handover
+    /// count, then each handover body and raw signature, every field
+    /// `u16_be(len) || bytes`. A v1 row never carries an authority (2.4).
     pub fn commit_ad(&self) -> Result<Vec<u8>> {
+        if self.is_v2() {
+            return self.commit_ad_v2();
+        }
+        if self.authority.is_some() {
+            return Err(invalid("a v1 seat list carries no authority"));
+        }
+        self.commit_ad_with(CONTEXT_COMMIT_AD)
+    }
+
+    /// The v2 commit AD (3.12.1 "AD v2", S2-D3): the v1 layout under the v2
+    /// context, then `field(authority body) || field(raw authority
+    /// signature)`, both empty when the list's `authority:` line is empty.
+    /// Refuses a body that is not a strict v2 body, one empty and one
+    /// non-empty authority side, an authority whose SHA-256 is not the
+    /// line, and an AD over 16383 bytes.
+    pub fn commit_ad_v2(&self) -> Result<Vec<u8>> {
+        let line = SeatListBody::parse_v2(&self.body)?
+            .v2
+            .and_then(|lines| lines.authority_sha256);
+
+        let mut out = self.commit_ad_with(CONTEXT_COMMIT_AD_V2)?;
+        match (line, &self.authority) {
+            (None, None) => {
+                push_ad_field(&mut out, &[])?;
+                push_ad_field(&mut out, &[])?;
+            }
+            (Some(line), Some(authority)) => {
+                if authority.body.len() > MAX_CHANNEL_AUTHORITY_LEN {
+                    return Err(invalid("authority body too long"));
+                }
+                if ChannelAuthority::sha256(&authority.body) != line {
+                    return Err(invalid("authority does not match the seat list"));
+                }
+                push_ad_field(&mut out, authority.body.as_bytes())?;
+                push_ad_field(&mut out, &decode_signature_b64(&authority.signature)?)?;
+            }
+            _ => return Err(invalid("seat list authority line and authority disagree")),
+        }
+
+        if out.len() > MAX_COMMIT_AD_LEN {
+            return Err(invalid("commit ad too long"));
+        }
+        Ok(out)
+    }
+
+    /// The layout both AD versions share: `context`, body, raw signature,
+    /// `u16_be` chain count, then each chain entry body and raw signature.
+    /// Checks the 16383-byte total for what it built.
+    fn commit_ad_with(&self, context: &str) -> Result<Vec<u8>> {
         if self.body.len() > MAX_SEAT_LIST_BODY_LEN {
             return Err(invalid("seat list body too long"));
         }
@@ -615,7 +1442,7 @@ impl SeatList {
         }
 
         let mut out = Vec::new();
-        push_ad_field(&mut out, CONTEXT_COMMIT_AD.as_bytes())?;
+        push_ad_field(&mut out, context.as_bytes())?;
         push_ad_field(&mut out, self.body.as_bytes())?;
         push_ad_field(&mut out, &decode_signature_b64(&self.signature)?)?;
         out.extend_from_slice(&(self.handovers.len() as u16).to_be_bytes());
@@ -634,9 +1461,10 @@ impl SeatList {
     }
 
     /// Lowercase hex SHA-256 of `commit_ad()`: the open Text group's
-    /// `seat_list_ad_sha256` while this row is the newest list (2.5)
+    /// `seat_list_ad_sha256` while this row is the newest list (2.5); the v2
+    /// bytes for a v2 row (3.12.1)
     pub fn commit_ad_sha256(&self) -> Result<String> {
-        Ok(to_hex(&Sha256::digest(self.commit_ad()?)))
+        Ok(sha256_hex(&self.commit_ad()?))
     }
 }
 
@@ -670,6 +1498,10 @@ pub struct SeatListWriteInput<'a> {
     /// Whether the list may claim seats (the growth flag, decision 5 (W2));
     /// protect always passes `true`, its route is growth-gated
     pub allow_claims: bool,
+    /// S2 `formats_v2` (7.1, #218): whether this write may ENTER v2 (a v2
+    /// genesis, a v1-to-v2 upgrade). A channel whose stored list is v2 keeps
+    /// v2 whatever it says (4.3 step 1).
+    pub formats_v2: bool,
     pub now: Timestamp,
 }
 
@@ -733,16 +1565,24 @@ impl SeatListWriteDecision {
 
 /// Plan a protect (genesis) or seat PUT: the database-side parts of 4.3.
 ///
-/// Order (4.3, W0-fix8): parse (step 1) first; then the version rule
-/// (step 4), where a byte-identical re-PUT returns the stored row
-/// IMMEDIATELY, before the signer-leaf check (5b), the seat claims (7) and
-/// the handover append (8); only then the removed-users refusal (C1,
-/// `seat_list_removed_users`), 5b, the growth flag (decision 5 (W2)), 7
-/// and 8. Route-side checks (authorization, session binding,
-/// signature, bots and staff, the `device_cap` ceiling) are not repeated
+/// Order (4.3, W0-fix8): parse (step 1) first, with the S2 format rule
+/// (`check_seat_list_format`) and the authority structure (step 3b,
+/// `check_seat_list_authority`); then the version rule (step 4), where a
+/// byte-identical re-PUT returns the stored row IMMEDIATELY, before the S2
+/// immutable and one-way lines (4c, `check_seat_list_v2_lines`), the
+/// signer-leaf check (5b), the seat claims (7) and the handover append (8);
+/// only then the removed-users refusal (C1, `seat_list_removed_users`), 5b,
+/// the growth flag (decision 5 (W2)), 7 and 8. Route-side checks
+/// (authorization, session binding, signature, the authority's signer key
+/// and signature, bots and staff, the `device_cap` ceiling) are not repeated
 /// here. Server membership of every user in `claimed` and, on protect, the
 /// owner are claimed by the driver in the same transaction (decision 13
 /// (W2)).
+///
+/// Not wired here yet, because the planner does not hold their inputs or
+/// the drivers do not write their outputs: 4d (`check_removal_reason`, the
+/// reason header) and the step 7 `signer_lost` resolution
+/// (`resolve_signer_lost`), and the step 7 `release_cause`.
 pub fn plan_seat_list_write(input: &SeatListWriteInput<'_>) -> Result<SeatListWriteDecision> {
     let submission = input.submission;
     let now = input.now;
@@ -759,6 +1599,13 @@ pub fn plan_seat_list_write(input: &SeatListWriteInput<'_>) -> Result<SeatListWr
         ));
     }
     decode_signature_b64(&submission.signature)?;
+
+    // Step 1 (S2, #218): which format this write may carry
+    check_seat_list_format(input.kind, &body, input.stored, input.formats_v2)?;
+
+    // Step 3b (S2): the authority's structure, `version`, `prev` and signer
+    // device; the route verifies its signer key and signature
+    check_seat_list_authority(&body, submission.authority.as_ref(), input.stored)?;
 
     // Step 4: version rule
     match (input.kind, input.stored) {
@@ -786,6 +1633,9 @@ pub fn plan_seat_list_write(input: &SeatListWriteInput<'_>) -> Result<SeatListWr
             }
         }
     }
+
+    // Step 4c (S2): immutable and one-way v2 lines, after the retry return
+    check_seat_list_v2_lines(&body, input.stored)?;
 
     // C1 (W2 audit, decision 2): a list that still names a user the server
     // removed since the stored list is refused before any claim, whatever
@@ -947,8 +1797,12 @@ pub fn plan_seat_list_write(input: &SeatListWriteInput<'_>) -> Result<SeatListWr
         signature: submission.signature.clone(),
         handovers,
         updated_at: now,
-        authority: None,
+        // Step 3b passed: present exactly when the body's `authority:` line
+        // is non-empty, and its hash is that line
+        authority: submission.authority.clone(),
     };
+    // AD size (3.12.1): `commit_ad` refuses a row whose AD would exceed
+    // 16383 bytes, before any write
     let seat_list_ad_sha256 = row.commit_ad_sha256()?;
 
     seat_rows.sort_by(|a, b| a.id.cmp(&b.id));
@@ -1025,6 +1879,279 @@ pub fn seat_list_removed_users(
         })
         .cloned()
         .collect())
+}
+
+// ---------------------------------------------------------------------------
+// 4.3 "S2 additions": pure rule checks
+// ---------------------------------------------------------------------------
+
+/// 4.3 step 1, S2 (#218): `formats_v2` governs only ENTRY into v2. Over a
+/// stored v2 list only a v2 body is accepted, whatever the flag says (so a
+/// removal-only PUT keeps working with the flag off); over a stored v1 list
+/// a v2 body (the upgrade) needs the flag. Protect takes a v2 genesis only
+/// while the flag is on and a v1 genesis only while it is off. Every refusal
+/// is `FailedValidation`.
+pub fn check_seat_list_format(
+    kind: SeatListWriteKind,
+    body: &SeatListBody,
+    stored: Option<&SeatList>,
+    formats_v2: bool,
+) -> Result<()> {
+    let submitted_v2 = body.v2.is_some();
+    match (kind, stored) {
+        (SeatListWriteKind::Protect, _) => {
+            if submitted_v2 && !formats_v2 {
+                return Err(invalid("a v2 genesis list needs formats_v2"));
+            }
+            if !submitted_v2 && formats_v2 {
+                return Err(invalid("a genesis list must be v2 while formats_v2 is on"));
+            }
+        }
+        (SeatListWriteKind::Put, Some(stored)) if stored.is_v2() => {
+            if !submitted_v2 {
+                return Err(invalid("a v1 seat list cannot replace a v2 list"));
+            }
+        }
+        (SeatListWriteKind::Put, _) => {
+            if submitted_v2 && !formats_v2 {
+                return Err(invalid("a v2 seat list over a v1 list needs formats_v2"));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// A CHANGED channel authority accepted by 4.3 step 3b, for the route to
+/// finish: `signer_identity_key` (the `owner_devices` entry of the PUT's
+/// signer device) must be that device's directory key, and the authority's
+/// signature must verify under it (`verify_payload`, as for step 3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChannelAuthorityChange {
+    pub authority: ChannelAuthorityBody,
+    pub signer_identity_key: String,
+}
+
+/// 4.3 step 3b (S2; #215, #225), the structural half. The `authority:` line
+/// and the carried authority come together: a non-empty line without an
+/// authority, an authority without a line (a v1 body included), and an
+/// empty line over a stored non-empty authority are refused. A carried
+/// authority parses (4.10), hashes to the line, names the route channel and
+/// the list's signer user. If it is byte-identical (body and signature) to
+/// the stored one it is no change and is not re-verified (`Ok(None)`): a
+/// list from another listed owner device may carry it unchanged. Otherwise
+/// it is a change: its `signer_device_id` is the list's signer device, its
+/// `version` the stored one's + 1 (1 when none is stored; so never lower),
+/// and its `prev` the stored body's SHA-256 (empty when none). The change is
+/// returned for the route's key and signature checks. Signer ELIGIBILITY is
+/// the members' decision (4.4.1, #210 (e)). Every refusal is
+/// `FailedValidation`; a stored authority that no longer parses fails
+/// closed.
+pub fn check_seat_list_authority(
+    body: &SeatListBody,
+    submitted: Option<&SignedAuthority>,
+    stored: Option<&SeatList>,
+) -> Result<Option<ChannelAuthorityChange>> {
+    let line = body
+        .v2
+        .as_ref()
+        .and_then(|lines| lines.authority_sha256.as_deref());
+    let stored_authority = stored.and_then(|stored| stored.authority.as_ref());
+
+    let (line, submitted) = match (line, submitted) {
+        (None, None) => {
+            if stored_authority.is_some() {
+                return Err(invalid("seat list drops the stored authority"));
+            }
+            return Ok(None);
+        }
+        (None, Some(_)) => return Err(invalid("authority without a seat list authority line")),
+        (Some(_), None) => return Err(invalid("seat list authority line without an authority")),
+        (Some(line), Some(submitted)) => (line, submitted),
+    };
+
+    let authority = ChannelAuthority::parse(&submitted.body)?;
+    decode_signature_b64(&submitted.signature)?;
+    if ChannelAuthority::sha256(&submitted.body) != line {
+        return Err(invalid(
+            "authority does not match the seat list authority line",
+        ));
+    }
+    if authority.channel_id != body.channel_id {
+        return Err(invalid("authority channel_id does not match the channel"));
+    }
+    if authority.owner_user_id != body.signer_user_id {
+        return Err(invalid("authority owner is not the seat list signer"));
+    }
+
+    if stored_authority == Some(submitted) {
+        return Ok(None);
+    }
+
+    // A change (#225: only a change names the PUT's signer device)
+    if authority.signer_device_id != body.signer_device_id {
+        return Err(invalid(
+            "a changed authority must be signed by the list's signer device",
+        ));
+    }
+    let (expected_version, expected_prev) = match stored_authority {
+        Some(stored) => (
+            ChannelAuthority::parse(&stored.body)?
+                .version
+                .checked_add(1),
+            Some(ChannelAuthority::sha256(&stored.body)),
+        ),
+        None => (Some(1), None),
+    };
+    if Some(authority.version) != expected_version {
+        return Err(invalid("authority version must be the stored version + 1"));
+    }
+    if authority.prev != expected_prev {
+        return Err(invalid("authority prev must name the stored authority"));
+    }
+
+    let signer_identity_key = authority
+        .owner_devices
+        .iter()
+        .find(|device| device.device_id == body.signer_device_id)
+        .map(|device| device.identity_key.clone())
+        .ok_or_else(|| invalid("authority signer_device_id has no owner_devices entry"))?;
+    Ok(Some(ChannelAuthorityChange {
+        authority,
+        signer_identity_key,
+    }))
+}
+
+/// 4.3 step 4c (S2): immutable and one-way lines of a v2 list. Until S4 a
+/// non-empty `history_boundary` and `pre_history:wiped` are refused on
+/// every path, protect included (so `kept` to `wiped` is refused on the
+/// PUT). Against a stored v2 list: `group_salt` and `history_boundary`
+/// equal, and `pre_history` never `wiped` to `kept`. A stored v1 list
+/// counts as the 4.1.1 predecessor `{ authority: empty, history: hidden,
+/// history_boundary: empty, pre_history: kept }`, so the first v2 list may
+/// pick any salt and any `history` (#222) but sets no boundary. `history`
+/// is free either way. Not here, each enforced once elsewhere: a v1 body
+/// over a stored v2 list (step 1, `check_seat_list_format`) and the
+/// authority never emptied nor lowered (step 3b,
+/// `check_seat_list_authority`). Every refusal is `FailedValidation`; a
+/// stored v2 body that no longer parses fails closed.
+pub fn check_seat_list_v2_lines(body: &SeatListBody, stored: Option<&SeatList>) -> Result<()> {
+    let Some(lines) = &body.v2 else {
+        return Ok(());
+    };
+
+    // Against a stored v2 list. Genesis and the v1 predecessor have no salt
+    // and no boundary to keep and are `kept`, so nothing here applies.
+    if let Some(stored) = stored.filter(|stored| stored.is_v2()) {
+        let previous = SeatListBody::parse_v2(&stored.body)?
+            .v2
+            .ok_or_else(|| create_error!(InternalError))?;
+
+        if previous.pre_history == SeatListPreHistory::Wiped
+            && lines.pre_history == SeatListPreHistory::Kept
+        {
+            return Err(invalid("pre_history cannot go from wiped to kept"));
+        }
+        if lines.group_salt != previous.group_salt {
+            return Err(invalid("group_salt is immutable"));
+        }
+        if lines.history_boundary != previous.history_boundary {
+            return Err(invalid("history_boundary is immutable"));
+        }
+    }
+
+    // S4 has not shipped: a signed `wiped` with no wipe behind it would be
+    // false, and no path may set a boundary yet
+    if lines.pre_history == SeatListPreHistory::Wiped {
+        return Err(invalid("pre_history wiped is refused until S4"));
+    }
+    if lines.history_boundary.is_some() {
+        return Err(invalid("history_boundary is refused until S4"));
+    }
+    Ok(())
+}
+
+/// 4.3 step 4d (S2-D20): a seat write whose planner releases anyone needs a
+/// non-empty `X-Audit-Log-Reason` (a whitespace-only one counts as empty),
+/// else `RemovalReasonRequired`. Checked against the planner's `released`
+/// set AFTER step 4, so the retry of a list that landed (an `Unchanged`
+/// decision, nothing released) succeeds without the header. Not wired into
+/// `plan_seat_list_write`: the drivers do not pass the reason yet, and
+/// refusing every release without it would break today's PUTs.
+pub fn check_removal_reason(released: &[String], reason: Option<&str>) -> Result<()> {
+    if !released.is_empty() && reason.is_none_or(|reason| reason.trim().is_empty()) {
+        return Err(create_error!(RemovalReasonRequired));
+    }
+    Ok(())
+}
+
+/// What a seat-list write does to the open Text group's `signer_lost`
+/// (4.3 step 7, S2-D17d)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SignerLostResolution {
+    /// No open Text group, or it carries no `signer_lost`: nothing to do
+    NotLost,
+    /// Clear `signer_lost` in the same transaction and append
+    /// `pending_device` (if any) to `pending_device_removals`
+    Clear {
+        /// The lost device, ONLY if it still holds a leaf in the open group
+        /// and is not already pending (#224)
+        pending_device: Option<MlsPendingDeviceRemoval>,
+    },
+}
+
+/// 4.3 step 7 additions (S2-D17d; #222, #224). While the open Text group
+/// carries `signer_lost`, a list signed by ANOTHER device clears it only
+/// when it carries an authority CHANGE (`authority_change`, step 3b's
+/// result: a version above the stored one) whose `owner_devices` omits the
+/// lost device; the lost device is then queued for removal only if it holds
+/// a leaf in the open group (a recovery successor never contains it, and an
+/// entry nobody can remove would freeze every send). Any other list is
+/// refused with `ProtectedChannelResecuring { reason: "owner_device_lost" }`
+/// and nothing is written: landing it would leave `signer_lost` set under a
+/// live signer. That includes a list signed by the lost device itself,
+/// which the doc does not name: the device was revoked, so the route never
+/// lets it sign, and refusing here fails closed if one gets through. Not
+/// wired into `plan_seat_list_write`: the drivers do not write the
+/// resolution yet (W1-2).
+pub fn resolve_signer_lost(
+    text_group: Option<&MlsGroup>,
+    body: &SeatListBody,
+    authority_change: Option<&ChannelAuthorityBody>,
+    now: Timestamp,
+) -> Result<SignerLostResolution> {
+    let Some(group) = text_group else {
+        return Ok(SignerLostResolution::NotLost);
+    };
+    let Some(lost) = &group.signer_lost else {
+        return Ok(SignerLostResolution::NotLost);
+    };
+
+    let another_device =
+        body.signer_user_id != lost.user_id || body.signer_device_id != lost.device_id;
+    let omits_lost = authority_change.is_some_and(|authority| {
+        !authority
+            .owner_devices
+            .iter()
+            .any(|device| device.device_id == lost.device_id)
+    });
+    if !another_device || !omits_lost {
+        return Err(create_error!(ProtectedChannelResecuring {
+            reason: "owner_device_lost".to_string()
+        }));
+    }
+
+    let holds_leaf = group.has_member(&lost.user_id, &lost.device_id);
+    let already = group
+        .pending_device_removals
+        .iter()
+        .any(|pending| pending.user_id == lost.user_id && pending.device_id == lost.device_id);
+    Ok(SignerLostResolution::Clear {
+        pending_device: (holds_leaf && !already).then(|| MlsPendingDeviceRemoval {
+            user_id: lost.user_id.clone(),
+            device_id: lost.device_id.clone(),
+            created_at: now,
+        }),
+    })
 }
 
 /// Validate a Text group create request against the newest seat list and
