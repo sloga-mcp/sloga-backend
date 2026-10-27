@@ -7,7 +7,7 @@
 //! `TEST_DB=REFERENCE` and `TEST_DB=MONGODB` (never run without `TEST_DB`:
 //! that is production).
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering::SeqCst};
 use std::time::Instant;
 
@@ -18,15 +18,16 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     channel_seats_used, check_removal_reason, check_seat_list_authority, check_seat_list_v2_lines,
-    plan_seat_list_write, resolve_signer_lost, seat_list_removed_users, text_group_id_v2,
-    text_group_id_v2_input, AuthorityOwnerDevice, AuthorityUserDevice, Channel, ChannelAuthority,
-    ChannelAuthorityBody, ChannelEntitlement, ChannelEntitlementSource, ChannelEntitlementState,
-    ChannelSeat, Database, E2EEContentType, E2EEEnvelope, HandoverBody, Member, MemberCompositeKey,
-    MlsGroup, MlsGroupCreateOutcome, MlsGroupKind, MlsMemberDevice, MlsPendingDeviceRemoval,
-    MlsSignerLost, MlsSignerLostCause, SeatList, SeatListBody, SeatListHistory, SeatListPreHistory,
-    SeatListSubmission, SeatListV2Lines, SeatListWriteDecision, SeatListWriteInput,
-    SeatListWriteKind, SeatListWritePlan, SeatReleaseCause, Server, SignedAuthority,
-    SignedHandover, SignerLostResolution, SuccessionStatement, TextJoinPayload,
+    plan_seat_list_write, resolve_signer_lost, retain_member_pending_device_removals,
+    seat_list_removed_users, text_group_id_v2, text_group_id_v2_input, AuthorityOwnerDevice,
+    AuthorityUserDevice, Channel, ChannelAuthority, ChannelAuthorityBody, ChannelEntitlement,
+    ChannelEntitlementSource, ChannelEntitlementState, ChannelSeat, Database, E2EEContentType,
+    E2EEEnvelope, HandoverBody, Member, MemberCompositeKey, MlsGroup, MlsGroupCreateOutcome,
+    MlsGroupKind, MlsMemberAdded, MlsMemberDevice, MlsPendingDeviceRemoval, MlsPendingRemoval,
+    MlsRejoinReadd, MlsSignerLost, MlsSignerLostCause, SeatList, SeatListBody, SeatListHistory,
+    SeatListPreHistory, SeatListSubmission, SeatListV2Lines, SeatListWriteDecision,
+    SeatListWriteInput, SeatListWriteKind, SeatListWritePlan, SeatReleaseCause, Server,
+    SignedAuthority, SignedHandover, SignerLostResolution, SuccessionStatement, TextJoinPayload,
     E2EE_PROTOCOL_VERSION, MAX_COMMIT_AD_LEN, MAX_SEAT_LIST_HANDOVERS, PROTECTED_SCOPE_SEATS,
     PROTECTED_SCOPE_TEXT_GROUP, SEAT_COOLDOWN_DAYS,
 };
@@ -799,6 +800,17 @@ async fn released_seats_count_against_the_cap_until_the_cooldown_ends() {
         db.put_seat_list(CHANNEL, &submit(2, &[USER_A, USER_B]), true, at(0))
             .await
             .unwrap();
+        // S2 (2.3, S2-D21): B holds a device in the Text group, so its
+        // releases cool; a seat whose user never received the keys frees at
+        // once (`an_unused_seat_frees_its_slot_at_once_on_every_release_path`)
+        let group = text_group(0xcc, &device(USER_A, DEVICE_A), 0);
+        db.create_text_mls_group(&group, None).await.unwrap();
+        set_group_members(
+            &db,
+            &group.id,
+            vec![device(USER_A, DEVICE_A), device(USER_B, DEVICE_B)],
+        )
+        .await;
 
         let outcome = db
             .put_seat_list(CHANNEL, &submit(3, &[USER_A]), true, at(0))
@@ -5086,6 +5098,7 @@ fn plan(
         text_group: None,
         allow_claims: true,
         formats_v2,
+        text_group_users: &BTreeSet::new(),
         now: at(1),
     })
 }
@@ -5916,4 +5929,968 @@ fn the_planner_refuses_a_row_whose_ad_v2_exceeds_16383_bytes() {
         "commit ad too long",
         "16384-byte AD",
     );
+}
+
+// ---------------------------------------------------------------------------
+// S2 (W1-2): release causes, release primitives, device revocation, the
+// 2.5 clearing rule and the 4.3 step-7 `signer_lost` write
+// ---------------------------------------------------------------------------
+
+const DEVICE_C: &str = "c0c1c2c3c4c5c6c7c8c9cacbcccdcecf";
+
+/// The channel's open Text group
+async fn open_group(db: &Database, channel_id: &str) -> MlsGroup {
+    db.fetch_seat_list_snapshot(channel_id)
+        .await
+        .unwrap()
+        .text_group
+        .expect("an open Text group")
+}
+
+/// `user`'s seat row in `channel_id`
+async fn seat_of(db: &Database, channel_id: &str, user: &str) -> ChannelSeat {
+    db.fetch_channel_seats(channel_id)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|seat| seat.user_id == user)
+        .expect("a seat row")
+}
+
+/// Test-only edit of a stored group on both drivers (the commit paths that
+/// really write these fields belong to another lane)
+async fn edit_group(db: &Database, group_id: &str, edit: impl FnOnce(&mut MlsGroup)) {
+    match db {
+        Database::Reference(reference) => {
+            edit(
+                reference
+                    .mls_groups
+                    .lock()
+                    .await
+                    .get_mut(group_id)
+                    .expect("group"),
+            );
+        }
+        #[cfg(feature = "mongodb")]
+        Database::MongoDb(mongo) => {
+            let collection = mongo.col::<MlsGroup>("mls_groups");
+            let mut group = collection
+                .find_one(doc! { "_id": group_id })
+                .await
+                .unwrap()
+                .expect("group");
+            edit(&mut group);
+            let result = collection
+                .replace_one(doc! { "_id": group_id }, &group)
+                .await
+                .unwrap();
+            assert_eq!(result.matched_count, 1);
+        }
+    }
+}
+
+/// Test-only edit of a seat row on both drivers (the Text commit stamps
+/// `keys_received_at`; that path belongs to another lane)
+async fn edit_seat(
+    db: &Database,
+    channel_id: &str,
+    user: &str,
+    edit: impl FnOnce(&mut ChannelSeat),
+) {
+    let id = ChannelSeat::composite_id(channel_id, user);
+    match db {
+        Database::Reference(reference) => {
+            edit(
+                reference
+                    .channel_seats
+                    .lock()
+                    .await
+                    .get_mut(&id)
+                    .expect("seat"),
+            );
+        }
+        #[cfg(feature = "mongodb")]
+        Database::MongoDb(mongo) => {
+            let collection = mongo.col::<ChannelSeat>("channel_seats");
+            let mut seat = collection
+                .find_one(doc! { "_id": &id })
+                .await
+                .unwrap()
+                .expect("seat");
+            edit(&mut seat);
+            let result = collection
+                .replace_one(doc! { "_id": &id }, &seat)
+                .await
+                .unwrap();
+            assert_eq!(result.matched_count, 1);
+        }
+    }
+}
+
+/// Test-only overwrite of the stored seat-list row on both drivers (the
+/// test config keeps `formats_v2` off, so no route can enter v2)
+async fn replace_seat_list(db: &Database, row: &SeatList) {
+    match db {
+        Database::Reference(reference) => {
+            reference
+                .channel_seat_lists
+                .lock()
+                .await
+                .insert(row.id.clone(), row.clone());
+        }
+        #[cfg(feature = "mongodb")]
+        Database::MongoDb(mongo) => {
+            let result = mongo
+                .col::<SeatList>("channel_seat_lists")
+                .replace_one(doc! { "_id": &row.id }, row)
+                .await
+                .unwrap();
+            assert_eq!(result.matched_count, 1);
+        }
+    }
+}
+
+/// A v1 list of CHANNEL signed by A's `signer_device`
+fn submit_by(signer_device: &str, version: i64, seats: &[&str]) -> SeatListSubmission {
+    let mut body = SeatListBody::parse(&body_with(version, 1_790_812_800_000, seats)).unwrap();
+    body.signer_device_id = signer_device.to_string();
+    SeatListSubmission {
+        body: body.build().unwrap(),
+        signature: signature(version),
+        signer_device_id: signer_device.to_string(),
+        handover: None,
+        authority: None,
+    }
+}
+
+/// `signer_lost` naming A's `device_id`, recorded on day `days`
+fn lost(device_id: &str, days: i64) -> MlsSignerLost {
+    MlsSignerLost {
+        user_id: USER_A.to_string(),
+        device_id: device_id.to_string(),
+        cause: MlsSignerLostCause::DeviceRevoked,
+        at: at(days),
+    }
+}
+
+fn pending_device(user: &str, device_id: &str, days: i64) -> MlsPendingDeviceRemoval {
+    MlsPendingDeviceRemoval {
+        user_id: user.to_string(),
+        device_id: device_id.to_string(),
+        created_at: at(days),
+    }
+}
+
+/// CHANNEL protected with `seats` (cap 10) and its generation-0 Text group,
+/// created by A's first device, holding `members`; returns the group id
+async fn protected_with_group(
+    db: &Database,
+    seats: &[&str],
+    members: Vec<MlsMemberDevice>,
+) -> String {
+    setup(db, 10).await;
+    db.protect_channel(CHANNEL, &submit(1, seats), at(0))
+        .await
+        .unwrap();
+    let group = text_group(0xcc, &device(USER_A, DEVICE_A), 0);
+    db.create_text_mls_group(&group, None).await.unwrap();
+    set_group_members(db, &group.id, members).await;
+    group.id
+}
+
+fn pending_users(group: &MlsGroup) -> Vec<&str> {
+    group
+        .pending_removals
+        .iter()
+        .map(|pending| pending.user_id.as_str())
+        .collect()
+}
+
+/// 2.3 (S2-D21, O-4): the release terms, and a re-seat clearing both S2
+/// fields
+#[test]
+fn a_release_cools_only_once_the_keys_were_received_and_a_reseat_clears_both() {
+    let mut seat = active_seats(&[USER_B]).remove(0);
+    seat.release(at(1), SeatReleaseCause::OwnerUnseat, false)
+        .unwrap();
+    assert_eq!(
+        seat.release_cause,
+        Some(SeatReleaseCause::DeviceNeverJoined)
+    );
+    assert_eq!(seat.cooldown_until, None);
+    assert!(!seat.counts_against_cap(at(1)));
+
+    // Stamped by the commit: cools, whatever the cause
+    seat.reactivate(at(2));
+    seat.keys_received_at = Some(at(2));
+    seat.release(at(3), SeatReleaseCause::AccessLost, false)
+        .unwrap();
+    assert_eq!(seat.release_cause, Some(SeatReleaseCause::AccessLost));
+    assert_eq!(seat.cooldown_until, Some(at(3 + SEAT_COOLDOWN_DAYS)));
+
+    // A re-seat overwrites both; the pre-S2 fallback still cools
+    seat.reactivate(at(4));
+    assert_eq!(seat.release_cause, None);
+    assert_eq!(seat.keys_received_at, None);
+    seat.release(at(5), SeatReleaseCause::ServerRemoval, true)
+        .unwrap();
+    assert_eq!(seat.release_cause, Some(SeatReleaseCause::ServerRemoval));
+    assert!(seat.is_cooling(at(5)));
+}
+
+/// 2.5 "Clearing" (#224), pure: only entries whose (user, device) holds a
+/// leaf survive
+#[test]
+fn clearing_keeps_only_pending_device_entries_whose_device_holds_a_leaf() {
+    let mut group = text_group(0x07, &device(USER_A, DEVICE_A), 0);
+    group.members = vec![device(USER_A, DEVICE_A), device(USER_B, DEVICE_B)];
+    group.pending_device_removals = vec![
+        pending_device(USER_B, DEVICE_B, 0),
+        pending_device(USER_B, DEVICE_C, 0),
+        // A member's device id under another user is not that member
+        pending_device(USER_C, DEVICE_B, 0),
+    ];
+    retain_member_pending_device_removals(&mut group);
+    assert_eq!(
+        group.pending_device_removals,
+        vec![pending_device(USER_B, DEVICE_B, 0)]
+    );
+}
+
+/// 6.3 "Reconciler": `release_channel_seat` is a compare-and-set on
+/// `{ active, seated_at }`; a mismatch writes nothing, so a stale reconcile
+/// never undoes an owner re-seat. Control: drop the `seated_at` filter.
+#[tokio::test]
+async fn release_channel_seat_is_a_compare_and_set_on_seated_at() {
+    database_test!(|db| async move {
+        protected_with_group(
+            &db,
+            &[USER_A, USER_B],
+            vec![device(USER_A, DEVICE_A), device(USER_B, DEVICE_B)],
+        )
+        .await;
+        edit_seat(&db, CHANNEL, USER_B, |seat| {
+            seat.keys_received_at = Some(at(0))
+        })
+        .await;
+
+        // A wrong `seated_at`: nothing written
+        assert!(!db
+            .release_channel_seat(CHANNEL, USER_B, at(5), SeatReleaseCause::AccessLost, at(1))
+            .await
+            .unwrap());
+        assert!(seat_of(&db, CHANNEL, USER_B).await.is_active());
+        assert!(open_group(&db, CHANNEL).await.pending_removals.is_empty());
+
+        // The read `seated_at`: released with its cause, cooling, one entry
+        assert!(db
+            .release_channel_seat(CHANNEL, USER_B, at(0), SeatReleaseCause::AccessLost, at(1))
+            .await
+            .unwrap());
+        let seat = seat_of(&db, CHANNEL, USER_B).await;
+        assert_eq!(seat.released_at, Some(at(1)));
+        assert_eq!(seat.release_cause, Some(SeatReleaseCause::AccessLost));
+        assert_eq!(seat.cooldown_until, Some(at(1 + SEAT_COOLDOWN_DAYS)));
+        let group = open_group(&db, CHANNEL).await;
+        assert_eq!(pending_users(&group), vec![USER_B]);
+        assert_eq!(group.signer_lost, None);
+
+        // Already released: false, no second entry, nothing rewritten
+        assert!(!db
+            .release_channel_seat(CHANNEL, USER_B, at(0), SeatReleaseCause::AccessLost, at(2))
+            .await
+            .unwrap());
+        assert_eq!(open_group(&db, CHANNEL).await.pending_removals.len(), 1);
+        assert_eq!(seat_of(&db, CHANNEL, USER_B).await.released_at, Some(at(1)));
+
+        // The owner re-seats B (C1: a list without B lands first); a
+        // reconcile that read the old seat now matches nothing
+        db.put_seat_list(CHANNEL, &submit(2, &[USER_A]), true, at(2))
+            .await
+            .unwrap();
+        db.put_seat_list(CHANNEL, &submit(3, &[USER_A, USER_B]), true, at(2))
+            .await
+            .unwrap();
+        let seat = seat_of(&db, CHANNEL, USER_B).await;
+        assert_eq!(seat.seated_at, at(2));
+        assert_eq!(seat.release_cause, None, "a re-seat clears the cause");
+        assert_eq!(seat.keys_received_at, None, "a re-seat clears the stamp");
+        assert!(!db
+            .release_channel_seat(CHANNEL, USER_B, at(0), SeatReleaseCause::AccessLost, at(3))
+            .await
+            .unwrap());
+        assert!(seat_of(&db, CHANNEL, USER_B).await.is_active());
+
+        // No row at all
+        assert!(!db
+            .release_channel_seat(CHANNEL, USER_C, at(0), SeatReleaseCause::AccessLost, at(3))
+            .await
+            .unwrap());
+    });
+}
+
+/// S2-D15 through `release_channel_seat`: releasing the user who signed the
+/// stored list (the reconciler never does, #222) sets `signer_lost` naming
+/// the signer device and never queues the signer; another user's release
+/// still queues. Control: queue the signer instead.
+#[tokio::test]
+async fn a_reconciler_release_of_the_list_signer_sets_signer_lost_never_an_entry() {
+    database_test!(|db| async move {
+        protected_with_group(
+            &db,
+            &[USER_A, USER_B],
+            vec![device(USER_A, DEVICE_A), device(USER_B, DEVICE_B)],
+        )
+        .await;
+
+        assert!(db
+            .release_channel_seat(CHANNEL, USER_A, at(0), SeatReleaseCause::AccessLost, at(1))
+            .await
+            .unwrap());
+        let group = open_group(&db, CHANNEL).await;
+        assert!(group.pending_removals.is_empty());
+        assert_eq!(group.signer_lost, Some(lost(DEVICE_A, 1)));
+        let seat = seat_of(&db, CHANNEL, USER_A).await;
+        assert_eq!(seat.release_cause, Some(SeatReleaseCause::AccessLost));
+        assert!(seat.is_cooling(at(2)));
+
+        assert!(db
+            .release_channel_seat(CHANNEL, USER_B, at(0), SeatReleaseCause::AccessLost, at(2))
+            .await
+            .unwrap());
+        let group = open_group(&db, CHANNEL).await;
+        assert_eq!(pending_users(&group), vec![USER_B]);
+        assert_eq!(group.signer_lost, Some(lost(DEVICE_A, 1)));
+    });
+}
+
+/// S2-D15 through the forced release (kick, ban, leave, deletion): the list
+/// signer gets `signer_lost`, never an entry, with `ServerRemoval`.
+/// Control: queue the signer instead.
+#[tokio::test]
+async fn a_forced_release_of_the_list_signer_sets_signer_lost_never_an_entry() {
+    database_test!(|db| async move {
+        protected_with_group(
+            &db,
+            &[USER_A, USER_B],
+            vec![device(USER_A, DEVICE_A), device(USER_B, DEVICE_B)],
+        )
+        .await;
+
+        assert_eq!(
+            db.release_channel_seats_for_user(USER_A, Some(SERVER), at(1))
+                .await
+                .unwrap(),
+            vec![CHANNEL]
+        );
+        let group = open_group(&db, CHANNEL).await;
+        assert!(group.pending_removals.is_empty());
+        assert_eq!(group.signer_lost, Some(lost(DEVICE_A, 1)));
+        let seat = seat_of(&db, CHANNEL, USER_A).await;
+        assert_eq!(seat.release_cause, Some(SeatReleaseCause::ServerRemoval));
+        assert!(seat.is_cooling(at(2)));
+
+        // Idempotent; another user's forced release queues as before
+        assert!(db
+            .release_channel_seats_for_user(USER_A, None, at(2))
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            db.release_channel_seats_for_user(USER_B, None, at(2))
+                .await
+                .unwrap(),
+            vec![CHANNEL]
+        );
+        let group = open_group(&db, CHANNEL).await;
+        assert_eq!(pending_users(&group), vec![USER_B]);
+        assert_eq!(group.signer_lost, Some(lost(DEVICE_A, 1)));
+    });
+}
+
+/// 2.3 (S2-D21): a release while the user never received the keys (no
+/// stamp, never in any of the channel's Text groups) writes
+/// `DeviceNeverJoined` and frees the slot at once, on every release path.
+/// Control: always cool.
+#[tokio::test]
+async fn an_unused_seat_frees_its_slot_at_once_on_every_release_path() {
+    database_test!(|db| async move {
+        setup(&db, 2).await;
+        db.protect_channel(CHANNEL, &submit(1, &[USER_A, USER_B]), at(0))
+            .await
+            .unwrap();
+        let assert_freed = |seat: ChannelSeat| {
+            assert_eq!(
+                seat.release_cause,
+                Some(SeatReleaseCause::DeviceNeverJoined),
+                "{}",
+                seat.user_id
+            );
+            assert_eq!(seat.cooldown_until, None, "{}", seat.user_id);
+        };
+
+        // The owner's unseat; the slot is free at once (cap 2)
+        let outcome = db
+            .put_seat_list(CHANNEL, &submit(2, &[USER_A]), true, at(1))
+            .await
+            .unwrap();
+        assert_eq!(outcome.released, vec![USER_B]);
+        assert_freed(seat_of(&db, CHANNEL, USER_B).await);
+        db.put_seat_list(CHANNEL, &submit(3, &[USER_A, USER_C]), true, at(1))
+            .await
+            .unwrap();
+
+        // The reconciler's release
+        assert!(db
+            .release_channel_seat(CHANNEL, USER_C, at(1), SeatReleaseCause::AccessLost, at(2))
+            .await
+            .unwrap());
+        assert_freed(seat_of(&db, CHANNEL, USER_C).await);
+
+        // The forced release, with a Text group that never held B
+        db.put_seat_list(CHANNEL, &submit(4, &[USER_A]), true, at(2))
+            .await
+            .unwrap();
+        db.put_seat_list(CHANNEL, &submit(5, &[USER_A, USER_B]), true, at(2))
+            .await
+            .unwrap();
+        db.create_text_mls_group(&text_group(0xcc, &device(USER_A, DEVICE_A), 0), None)
+            .await
+            .unwrap();
+        assert_eq!(
+            db.release_channel_seats_for_user(USER_B, Some(SERVER), at(3))
+                .await
+                .unwrap(),
+            vec![CHANNEL]
+        );
+        assert_freed(seat_of(&db, CHANNEL, USER_B).await);
+        assert_eq!(
+            channel_seats_used(&db.fetch_channel_seats(CHANNEL).await.unwrap(), at(3)),
+            1
+        );
+    });
+}
+
+/// 2.3: once the keys count as received the slot cools 14 days on every
+/// path: a member device in the open group (owner unseat), a past
+/// `member_added` in a CLOSED generation only (forced release; the pre-S2
+/// fallback), the commit's `keys_received_at` stamp (the reconciler)
+#[tokio::test]
+async fn a_used_seat_cools_on_every_release_path() {
+    database_test!(|db| async move {
+        let owner = device(USER_A, DEVICE_A);
+        let user_d = numbered_user(4);
+        setup(&db, 10).await;
+        insert_members(&db, SERVER, &[user_d.as_str()]).await;
+        db.protect_channel(
+            CHANNEL,
+            &submit(1, &[user_d.as_str(), USER_A, USER_B, USER_C]),
+            at(0),
+        )
+        .await
+        .unwrap();
+
+        // C was added in generation 0 and has not rejoined generation 1
+        let first = text_group(0xcc, &owner, 0);
+        db.create_text_mls_group(&first, None).await.unwrap();
+        edit_group(&db, &first.id, |group| {
+            group.member_added.push(MlsMemberAdded {
+                user_id: USER_C.to_string(),
+                device_id: DEVICE_C.to_string(),
+                epoch: 1,
+                at: at(0),
+            })
+        })
+        .await;
+        let successor = text_group(0xdd, &owner, 1);
+        db.create_text_mls_group(&successor, Some(&first.id))
+            .await
+            .unwrap();
+        set_group_members(
+            &db,
+            &successor.id,
+            vec![owner.clone(), device(USER_B, DEVICE_B)],
+        )
+        .await;
+        edit_seat(&db, CHANNEL, &user_d, |seat| {
+            seat.keys_received_at = Some(at(0))
+        })
+        .await;
+
+        let outcome = db
+            .put_seat_list(
+                CHANNEL,
+                &submit(2, &[user_d.as_str(), USER_A, USER_C]),
+                true,
+                at(1),
+            )
+            .await
+            .unwrap();
+        assert_eq!(outcome.released, vec![USER_B]);
+        let seat = seat_of(&db, CHANNEL, USER_B).await;
+        assert_eq!(seat.release_cause, Some(SeatReleaseCause::OwnerUnseat));
+        assert_eq!(seat.cooldown_until, Some(at(1 + SEAT_COOLDOWN_DAYS)));
+
+        db.release_channel_seats_for_user(USER_C, Some(SERVER), at(2))
+            .await
+            .unwrap();
+        let seat = seat_of(&db, CHANNEL, USER_C).await;
+        assert_eq!(seat.release_cause, Some(SeatReleaseCause::ServerRemoval));
+        assert_eq!(seat.cooldown_until, Some(at(2 + SEAT_COOLDOWN_DAYS)));
+
+        assert!(db
+            .release_channel_seat(CHANNEL, &user_d, at(0), SeatReleaseCause::AccessLost, at(3))
+            .await
+            .unwrap());
+        let seat = seat_of(&db, CHANNEL, &user_d).await;
+        assert_eq!(seat.release_cause, Some(SeatReleaseCause::AccessLost));
+        assert_eq!(seat.cooldown_until, Some(at(3 + SEAT_COOLDOWN_DAYS)));
+    });
+}
+
+/// The `race_channel(n)` channels for `n` in `range`, each protected
+/// (genesis A) with an open Text group created by A's first device and
+/// holding `members(index)`
+async fn channels_with_groups(
+    db: &Database,
+    count: u32,
+    members: impl Fn(usize) -> Vec<MlsMemberDevice>,
+) -> Vec<String> {
+    server_ready(db).await;
+    let owner = device(USER_A, DEVICE_A);
+    let channels: Vec<String> = (1..=count).map(race_channel).collect();
+    for (index, channel_id) in channels.iter().enumerate() {
+        protected_in(db, channel_id, 10).await;
+        let mut group = text_group(0xa0 + index as u8, &owner, 0);
+        group.channel_id = channel_id.clone();
+        db.create_text_mls_group(&group, None).await.unwrap();
+        set_group_members(db, &group.id, members(index)).await;
+    }
+    channels
+}
+
+/// 6.3 "Device revocation", the pending pass: every OPEN Text group holding
+/// the device gets one entry; a repeat adds nothing and returns nothing
+#[tokio::test]
+async fn a_device_revocation_queues_the_device_in_every_open_group_holding_it() {
+    database_test!(|db| async move {
+        let channels = channels_with_groups(&db, 3, |index| {
+            let mut members = vec![device(USER_A, DEVICE_A)];
+            if index < 2 {
+                members.push(device(USER_B, DEVICE_B));
+            }
+            members
+        })
+        .await;
+
+        assert_eq!(
+            db.add_pending_device_removal(USER_B, DEVICE_B, at(1))
+                .await
+                .unwrap(),
+            channels[..2].to_vec()
+        );
+        for (index, channel_id) in channels.iter().enumerate() {
+            let group = open_group(&db, channel_id).await;
+            let expected = if index < 2 {
+                vec![pending_device(USER_B, DEVICE_B, 1)]
+            } else {
+                vec![]
+            };
+            assert_eq!(group.pending_device_removals, expected, "{channel_id}");
+            assert_eq!(group.signer_lost, None, "{channel_id}");
+            assert!(group.pending_removals.is_empty(), "{channel_id}");
+        }
+
+        assert!(db
+            .add_pending_device_removal(USER_B, DEVICE_B, at(2))
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            open_group(&db, &channels[0]).await.pending_device_removals,
+            vec![pending_device(USER_B, DEVICE_B, 1)]
+        );
+        assert!(db
+            .add_pending_device_removal(USER_B, DEVICE_C, at(2))
+            .await
+            .unwrap()
+            .is_empty());
+    });
+}
+
+/// S2-D15 (#222) through the revocation pass: the device that signed a
+/// channel's stored list sets that open group's `signer_lost`, whether or
+/// not it still holds a leaf there, and is never queued; another owner
+/// device is queued as usual. Control: queue the signer instead.
+#[tokio::test]
+async fn a_device_revocation_of_the_list_signer_sets_signer_lost_never_an_entry() {
+    database_test!(|db| async move {
+        let channels = channels_with_groups(&db, 2, |index| {
+            // The second channel: the signer device holds no leaf any more
+            if index == 0 {
+                vec![device(USER_A, DEVICE_A), device(USER_A, DEVICE_A2)]
+            } else {
+                vec![device(USER_A, DEVICE_A2)]
+            }
+        })
+        .await;
+
+        assert_eq!(
+            db.add_pending_device_removal(USER_A, DEVICE_A, at(1))
+                .await
+                .unwrap(),
+            channels
+        );
+        for channel_id in &channels {
+            let group = open_group(&db, channel_id).await;
+            assert_eq!(group.signer_lost, Some(lost(DEVICE_A, 1)), "{channel_id}");
+            assert!(group.pending_device_removals.is_empty(), "{channel_id}");
+        }
+
+        // A repeat keeps the first `signer_lost`
+        assert!(db
+            .add_pending_device_removal(USER_A, DEVICE_A, at(2))
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            open_group(&db, &channels[0]).await.signer_lost,
+            Some(lost(DEVICE_A, 1))
+        );
+
+        // The owner's other device did not sign: an entry
+        assert_eq!(
+            db.add_pending_device_removal(USER_A, DEVICE_A2, at(2))
+                .await
+                .unwrap(),
+            channels
+        );
+        assert_eq!(
+            open_group(&db, &channels[1]).await.pending_device_removals,
+            vec![pending_device(USER_A, DEVICE_A2, 2)]
+        );
+    });
+}
+
+/// 2.5 "Clearing" (#224): every seat-list write drops the open group's
+/// `pending_device_removals` entries whose device holds no leaf, keeps the
+/// others, and leaves the field absent once empty. Control: skip it.
+#[tokio::test]
+async fn every_seat_list_write_drops_pending_device_entries_of_non_members() {
+    database_test!(|db| async move {
+        let group_id = protected_with_group(
+            &db,
+            &[USER_A, USER_B],
+            vec![device(USER_A, DEVICE_A), device(USER_B, DEVICE_B)],
+        )
+        .await;
+        edit_group(&db, &group_id, |group| {
+            group.pending_device_removals = vec![
+                pending_device(USER_B, DEVICE_B, 0),
+                pending_device(USER_B, DEVICE_C, 0),
+                pending_device(USER_C, DEVICE_C, 0),
+            ]
+        })
+        .await;
+
+        db.put_seat_list(CHANNEL, &submit(2, &[USER_A, USER_B]), true, at(1))
+            .await
+            .unwrap();
+        assert_eq!(
+            open_group(&db, CHANNEL).await.pending_device_removals,
+            vec![pending_device(USER_B, DEVICE_B, 0)]
+        );
+
+        // B's device leaves; the next write drops the last entry
+        set_group_members(&db, &group_id, vec![device(USER_A, DEVICE_A)]).await;
+        db.put_seat_list(CHANNEL, &submit(3, &[USER_A, USER_B]), true, at(2))
+            .await
+            .unwrap();
+        assert!(open_group(&db, CHANNEL)
+            .await
+            .pending_device_removals
+            .is_empty());
+        #[cfg(feature = "mongodb")]
+        if let Database::MongoDb(mongo) = &db {
+            let row = mongo
+                .col::<bson::Document>("mls_groups")
+                .find_one(doc! { "_id": &group_id })
+                .await
+                .unwrap()
+                .expect("the group");
+            assert!(!row.contains_key("pending_device_removals"));
+        }
+    });
+}
+
+/// #213: a successor create COPIES `signer_lost` and starts with both
+/// pending lists empty; no create takes the S2 fields from the request.
+/// Control: skip the copy.
+#[tokio::test]
+async fn a_successor_copies_signer_lost_and_starts_with_empty_pending_lists() {
+    database_test!(|db| async move {
+        setup(&db, 10).await;
+        db.protect_channel(CHANNEL, &submit(1, &[USER_A, USER_B]), at(0))
+            .await
+            .unwrap();
+        let owner = device(USER_A, DEVICE_A);
+
+        let mut first = text_group(0xcc, &owner, 0);
+        first.signer_lost = Some(lost(DEVICE_A2, 0));
+        first.pending_device_removals = vec![pending_device(USER_A, DEVICE_A, 0)];
+        first.rejoin_readd = vec![MlsRejoinReadd {
+            user_id: USER_B.to_string(),
+            device_id: DEVICE_B.to_string(),
+            at: at(0),
+        }];
+        db.create_text_mls_group(&first, None).await.unwrap();
+        let stored = open_group(&db, CHANNEL).await;
+        assert_eq!(stored.signer_lost, None);
+        assert!(stored.pending_device_removals.is_empty());
+        assert!(stored.rejoin_readd.is_empty());
+
+        edit_group(&db, &first.id, |group| {
+            group.members.push(device(USER_B, DEVICE_B));
+            group.signer_lost = Some(lost(DEVICE_A, 0));
+            group.pending_removals = vec![MlsPendingRemoval {
+                user_id: USER_B.to_string(),
+                created_at: at(0),
+            }];
+            group.pending_device_removals = vec![pending_device(USER_B, DEVICE_B, 0)];
+        })
+        .await;
+
+        let successor = text_group(0xdd, &owner, 1);
+        assert!(matches!(
+            db.create_text_mls_group(&successor, Some(&first.id))
+                .await
+                .unwrap(),
+            MlsGroupCreateOutcome::Created
+        ));
+        let stored = open_group(&db, CHANNEL).await;
+        assert_eq!(stored.id, successor.id);
+        assert_eq!(stored.signer_lost, Some(lost(DEVICE_A, 0)));
+        assert!(stored.pending_removals.is_empty());
+        assert!(stored.pending_device_removals.is_empty());
+    });
+}
+
+/// 4.3 step 7 (#222): while the open group carries `signer_lost`, a list
+/// without an authority change omitting the lost device is
+/// `ProtectedChannelResecuring { owner_device_lost }` and writes nothing,
+/// whether another device or the lost one signed it; the byte-identical
+/// retry of the stored list still answers first. Control: drop the refusal.
+#[tokio::test]
+async fn while_signer_lost_is_set_a_list_without_a_recovery_authority_is_refused() {
+    database_test!(|db| async move {
+        let group_id = protected_with_group(
+            &db,
+            &[USER_A, USER_B],
+            vec![
+                device(USER_A, DEVICE_A),
+                device(USER_A, DEVICE_A2),
+                device(USER_B, DEVICE_B),
+            ],
+        )
+        .await;
+        edit_group(&db, &group_id, |group| {
+            group.signer_lost = Some(lost(DEVICE_A, 0))
+        })
+        .await;
+        let before = open_group(&db, CHANNEL).await;
+
+        for signer_device in [DEVICE_A2, DEVICE_A] {
+            let error = db
+                .put_seat_list(
+                    CHANNEL,
+                    &submit_by(signer_device, 2, &[USER_A]),
+                    true,
+                    at(1),
+                )
+                .await
+                .unwrap_err();
+            assert!(is_resecuring(&error), "{signer_device}: {error:?}");
+        }
+        assert_eq!(
+            db.fetch_seat_list(CHANNEL).await.unwrap().unwrap().version,
+            1
+        );
+        assert!(seat_of(&db, CHANNEL, USER_B).await.is_active());
+        assert_eq!(open_group(&db, CHANNEL).await, before);
+
+        assert!(
+            db.put_seat_list(CHANNEL, &submit(1, &[USER_A, USER_B]), true, at(1))
+                .await
+                .unwrap()
+                .unchanged
+        );
+    });
+}
+
+/// 4.3 step 7 (#222, #224): a list from another owner device carrying an
+/// authority change that omits the lost device clears `signer_lost` in its
+/// own write and queues the lost device, which still holds a leaf. The
+/// stored v2 row is written directly: the test config keeps `formats_v2`
+/// off, and a stored v2 list keeps v2 whatever the flag says (step 1).
+#[tokio::test]
+async fn a_recovery_list_clears_signer_lost_and_queues_the_lost_leaf() {
+    database_test!(|db| async move {
+        let group_id = protected_with_group(
+            &db,
+            &[USER_A, USER_B],
+            vec![
+                device(USER_A, DEVICE_A),
+                device(USER_A, DEVICE_A2),
+                device(USER_B, DEVICE_B),
+            ],
+        )
+        .await;
+        let first = signed_authority(&test_authority(1, DEVICE_A, None));
+        replace_seat_list(
+            &db,
+            &SeatList {
+                id: CHANNEL.to_string(),
+                version: 1,
+                body: v2_body_by(DEVICE_A, 1, &[USER_A, USER_B], lines_naming(&first)),
+                signer_user_id: USER_A.to_string(),
+                signer_device_id: DEVICE_A.to_string(),
+                signature: signature(1),
+                handovers: vec![],
+                updated_at: at(0),
+                authority: Some(first.clone()),
+            },
+        )
+        .await;
+        edit_group(&db, &group_id, |group| {
+            group.signer_lost = Some(lost(DEVICE_A, 0))
+        })
+        .await;
+
+        let mut recovery =
+            test_authority(2, DEVICE_A2, Some(ChannelAuthority::sha256(&first.body)));
+        recovery
+            .owner_devices
+            .retain(|owner| owner.device_id != DEVICE_A);
+        let recovery = signed_authority(&recovery);
+        let submission = SeatListSubmission {
+            body: v2_body_by(DEVICE_A2, 2, &[USER_A, USER_B], lines_naming(&recovery)),
+            signature: signature(2),
+            signer_device_id: DEVICE_A2.to_string(),
+            handover: None,
+            authority: Some(recovery),
+        };
+        let outcome = db
+            .put_seat_list(CHANNEL, &submission, true, at(1))
+            .await
+            .unwrap();
+        assert!(outcome.signer_lost_cleared);
+        let group = open_group(&db, CHANNEL).await;
+        assert_eq!(group.signer_lost, None);
+        assert_eq!(
+            group.pending_device_removals,
+            vec![pending_device(USER_A, DEVICE_A, 1)]
+        );
+        assert_eq!(
+            db.fetch_seat_list(CHANNEL)
+                .await
+                .unwrap()
+                .unwrap()
+                .signer_device_id,
+            DEVICE_A2
+        );
+    });
+}
+
+/// 6.3 "Sweep" (S2-D14): the channels holding an ACTIVE seat, paged in id
+/// order strictly after `after`
+#[tokio::test]
+async fn channels_with_active_seats_page_in_channel_order() {
+    database_test!(|db| async move {
+        server_ready(&db).await;
+        let channels: Vec<String> = (1..=4).map(race_channel).collect();
+        for channel_id in &channels {
+            protected_in(&db, channel_id, 10).await;
+        }
+        // The third channel's only seat is released
+        assert!(db
+            .release_channel_seat(
+                &channels[2],
+                USER_A,
+                at(0),
+                SeatReleaseCause::AccessLost,
+                at(1)
+            )
+            .await
+            .unwrap());
+        let active = [&channels[0], &channels[1], &channels[3]];
+
+        assert_eq!(
+            db.fetch_channels_with_active_seats(None, 10).await.unwrap(),
+            active.map(String::clone).to_vec()
+        );
+        assert_eq!(
+            db.fetch_channels_with_active_seats(None, 2).await.unwrap(),
+            active[..2]
+                .iter()
+                .map(|id| id.to_string())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            db.fetch_channels_with_active_seats(Some(channels[1].clone()), 2)
+                .await
+                .unwrap(),
+            vec![channels[3].clone()]
+        );
+        assert!(db
+            .fetch_channels_with_active_seats(Some(channels[3].clone()), 2)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(db
+            .fetch_channels_with_active_seats(None, 0)
+            .await
+            .unwrap()
+            .is_empty());
+    });
+}
+
+/// 7.1 (#218): both drivers read `formats_v2` from the config. Protect
+/// takes a v2 genesis exactly when it is on, and a seat PUT the v1-to-v2
+/// upgrade. The suite runs it with the test config (off); run it once more
+/// with `REVOLT__FEATURES__PROTECTED_CHANNELS__FORMATS_V2=true` for the on
+/// side.
+#[tokio::test]
+async fn protect_and_put_read_formats_v2_from_the_config() {
+    database_test!(|db| async move {
+        let formats_v2 = revolt_config::config()
+            .await
+            .features
+            .protected_channels
+            .formats_v2;
+        setup(&db, 10).await;
+        let v1 = submit(1, &[USER_A]);
+        let v2 = submit_v2(1, &[USER_A], v2_lines(GROUP_SALT), None);
+        let (refused, accepted) = if formats_v2 { (&v1, &v2) } else { (&v2, &v1) };
+
+        let error = db
+            .protect_channel(CHANNEL, refused, at(0))
+            .await
+            .unwrap_err();
+        assert!(is_failed_validation(&error), "{error:?}");
+        db.protect_channel(CHANNEL, accepted, at(0)).await.unwrap();
+        assert_eq!(
+            db.fetch_seat_list(CHANNEL).await.unwrap().unwrap().is_v2(),
+            formats_v2
+        );
+
+        // The upgrade over a stored v1 list
+        replace_seat_list(&db, &stored_row(&v1)).await;
+        let upgrade = submit_v2(2, &[USER_A], v2_lines(GROUP_SALT), None);
+        let result = db.put_seat_list(CHANNEL, &upgrade, true, at(1)).await;
+        if formats_v2 {
+            assert!(result.unwrap().list.is_v2());
+        } else {
+            assert!(is_failed_validation(&result.unwrap_err()));
+        }
+    });
 }

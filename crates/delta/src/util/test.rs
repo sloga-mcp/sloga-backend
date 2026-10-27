@@ -14,9 +14,10 @@ use revolt_database::{
 };
 use revolt_database::{
     seat_list_channel_server, ChannelEntitlement, ChannelEntitlementSource,
-    ChannelEntitlementState, E2EEIdentity, E2EESignedKey, EncryptedPayload, HandoverBody, MlsGroup,
-    MlsGroupCreateOutcome, MlsGroupKind, MlsMemberDevice, SeatListBody, SeatListSubmission,
-    SeatListWriteOutcome, CONTEXT_HANDOVER, E2EE_PROTOCOL_VERSION, E2EE_SIGN_CONTEXT_FALLBACK,
+    ChannelEntitlementState, ChannelSeat, E2EEIdentity, E2EESignedKey, EncryptedPayload,
+    HandoverBody, MlsGroup, MlsGroupCreateOutcome, MlsGroupKind, MlsMemberDevice, SeatListBody,
+    SeatListSubmission, SeatListWriteOutcome, CONTEXT_HANDOVER, E2EE_PROTOCOL_VERSION,
+    E2EE_SIGN_CONTEXT_FALLBACK,
 };
 use revolt_database::{util::idempotency::IdempotencyKey, Role};
 use revolt_database::{Account, EmailVerification, Session};
@@ -1129,6 +1130,43 @@ impl TestHarness {
             entitlement,
             owner_device,
             seat_list: protect.seat_list,
+        }
+    }
+
+    /// Stamp `user_id`'s seat in `channel_id` with `keys_received_at`, as
+    /// the Text commit adding the user's first device does (design 2.3),
+    /// written straight to the store. Any later release of the seat then
+    /// cools 14 days; without the stamp (or a Text-group device) it frees at
+    /// once as `DeviceNeverJoined` (S2-D21).
+    pub async fn mark_keys_received(&self, channel_id: &str, user_id: &str) {
+        let id = ChannelSeat::composite_id(channel_id, user_id);
+        let now = Timestamp::now_utc();
+        match &self.db {
+            Database::Reference(reference) => {
+                reference
+                    .channel_seats
+                    .lock()
+                    .await
+                    .get_mut(&id)
+                    .expect("the seat row")
+                    .keys_received_at = Some(now);
+            }
+            Database::MongoDb(mongo) => {
+                use revolt_database::mongodb::bson::doc;
+
+                let collection = mongo.col::<ChannelSeat>("channel_seats");
+                let mut seat = collection
+                    .find_one(doc! { "_id": &id })
+                    .await
+                    .expect("the seat read")
+                    .expect("the seat row");
+                seat.keys_received_at = Some(now);
+                let result = collection
+                    .replace_one(doc! { "_id": &id }, &seat)
+                    .await
+                    .expect("the seat write");
+                assert_eq!(result.matched_count, 1, "the seat row");
+            }
         }
     }
 

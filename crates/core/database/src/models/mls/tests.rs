@@ -11,8 +11,10 @@ use crate::{
     mls_text_enforced_device_cap, ChannelEntitlement, ChannelEntitlementSource,
     ChannelEntitlementState, ChannelSeat, Database, E2EEContentType, E2EEEnvelope, E2EEIdentity,
     E2EESignedKey, MlsCommit, MlsCommitOutcome, MlsGroup, MlsGroupCreateOutcome, MlsGroupKind,
-    MlsJoinIntent, MlsKeyPackage, MlsMemberAdded, MlsMemberDevice, MlsPendingRemoval, SeatList,
-    SeatListBody, SeatListSubmission, E2EE_PROTOCOL_VERSION,
+    MlsJoinIntent, MlsKeyPackage, MlsMemberAdded, MlsMemberDevice, MlsPendingDeviceRemoval,
+    MlsPendingRemoval, MlsRejoinReadd, MlsRemovalReason, MlsSignerLost, MlsSignerLostCause,
+    SeatList, SeatListBody, SeatListSubmission, E2EE_PROTOCOL_VERSION,
+    TEXT_REJOIN_OUTSTANDING_WINDOW_SECONDS,
 };
 
 fn group_id(seed: u8) -> String {
@@ -833,10 +835,12 @@ fn seconds_from_now(seconds: i64) -> Timestamp {
     }
 }
 
-/// A Text group to seed: `members` hold leaves (each added an hour ago,
-/// except `no_added_entry`), the newest stored seat list is signed by
-/// `signer` and seats `seats`, every member device has a live E2EE identity
-/// except `revoked`
+/// A Text group to seed: `members` hold leaves (each added `added_secs_ago`,
+/// an hour by default, except `no_added_entry`), the newest stored seat
+/// list is signed by `signer` and seats `seats`, every member device has a
+/// live E2EE identity except `revoked`. S2: `pending_devices` are stored as
+/// `pending_device_removals` as given (a non-member entry included), and
+/// `signer_lost` marks the signer's device lost.
 struct TextSeed {
     seed: u8,
     signer: MlsMemberDevice,
@@ -847,6 +851,9 @@ struct TextSeed {
     revoked: Vec<MlsMemberDevice>,
     no_added_entry: Vec<MlsMemberDevice>,
     created_at: Timestamp,
+    added_secs_ago: i64,
+    pending_devices: Vec<MlsMemberDevice>,
+    signer_lost: bool,
 }
 
 fn text_seed(
@@ -865,6 +872,9 @@ fn text_seed(
         revoked: vec![],
         no_added_entry: vec![],
         created_at: Timestamp::now_utc(),
+        added_secs_ago: 3600,
+        pending_devices: vec![],
+        signer_lost: false,
     }
 }
 
@@ -1102,6 +1112,7 @@ async fn seed_text_group(db: &Database, seed: &TextSeed) -> TextFixture {
     // The one source of truth for the AD hash (shared with the seat PUT)
     let hash = genesis.commit_ad_sha256().expect("genesis hash");
     let an_hour_ago = seconds_from_now(-3600);
+    let added_at = seconds_from_now(-seed.added_secs_ago);
 
     let group = MlsGroup {
         id: group_id(seed.seed),
@@ -1132,11 +1143,24 @@ async fn seed_text_group(db: &Database, seed: &TextSeed) -> TextFixture {
                 user_id: member.user_id.clone(),
                 device_id: member.device_id.clone(),
                 epoch: 0,
-                at: an_hour_ago,
+                at: added_at,
             })
             .collect(),
-        pending_device_removals: vec![],
-        signer_lost: None,
+        pending_device_removals: seed
+            .pending_devices
+            .iter()
+            .map(|device| MlsPendingDeviceRemoval {
+                user_id: device.user_id.clone(),
+                device_id: device.device_id.clone(),
+                created_at: an_hour_ago,
+            })
+            .collect(),
+        signer_lost: seed.signer_lost.then(|| MlsSignerLost {
+            user_id: seed.signer.user_id.clone(),
+            device_id: seed.signer.device_id.clone(),
+            cause: MlsSignerLostCause::DeviceRevoked,
+            at: an_hour_ago,
+        }),
         rejoin_readd: vec![],
     };
 
@@ -1271,6 +1295,71 @@ async fn assert_untouched(db: &Database, fixture: &TextFixture, epoch: i64) {
         .await
         .unwrap()
         .is_empty());
+}
+
+/// Register the E2EE identity of devices a test ADDS (S2-D17c: the Text
+/// commit transaction refuses an added device with no identity)
+async fn register_identities(db: &Database, devices: &[&MlsMemberDevice]) {
+    for device in devices {
+        if db
+            .fetch_e2ee_identity(&device.user_id, &device.device_id)
+            .await
+            .is_err()
+        {
+            db.insert_e2ee_identity(&identity_row(device))
+                .await
+                .expect("identity");
+        }
+    }
+}
+
+/// The stored Text-marked commit row at `epoch`
+async fn stored_text_commit(db: &Database, group: &str, epoch: i64) -> MlsCommit {
+    db.fetch_mls_text_commits_from(group, epoch, 1)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|row| row.epoch == epoch)
+        .expect("the stored Text commit")
+}
+
+/// The stored advisory reasons of a commit row, as (device, reason)
+fn reasons_of(row: &MlsCommit) -> Vec<(MlsMemberDevice, MlsRemovalReason)> {
+    row.removed_reasons
+        .iter()
+        .map(|entry| {
+            (
+                MlsMemberDevice {
+                    user_id: entry.user_id.clone(),
+                    device_id: entry.device_id.clone(),
+                },
+                entry.reason,
+            )
+        })
+        .collect()
+}
+
+/// A user's seat row in a channel
+async fn seat_of(db: &Database, channel_id: &str, user_id: &str) -> ChannelSeat {
+    db.fetch_channel_seats(channel_id)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|seat| seat.user_id == user_id)
+        .expect("the seat row")
+}
+
+/// A Text group document as stored, BSON keys included (Mongo only)
+#[cfg(feature = "mongodb")]
+async fn raw_document(db: &Database, collection: &str, id: &str) -> Option<bson::Document> {
+    match db {
+        Database::Reference(_) => None,
+        Database::MongoDb(mongo) => mongo
+            .col::<bson::Document>(collection)
+            .find_one(bson::doc! { "_id": id })
+            .await
+            .expect("raw read"),
+    }
 }
 
 #[tokio::test]
@@ -1594,6 +1683,7 @@ async fn text_commit_with_a_stale_ad_is_refused_and_writes_nothing() {
         let bob = text_device(BOB, 1);
         let fixture =
             seed_text_group(&db, &text_seed(21, &alice, &[alice.clone()], &[ALICE, BOB])).await;
+        register_identities(&db, &[&bob]).await;
 
         // The joiner's intent must survive an aborted Add
         db.upsert_mls_join_intent(&rejoin_intent(
@@ -1925,6 +2015,7 @@ async fn seat_release_racing_a_text_add_never_admits_a_released_user() {
 
         let alice = text_device(ALICE, 1);
         let carol = text_device(CAROL, 1);
+        register_identities(&db, &[&carol]).await;
         let mut won_rounds = 0;
         let mut refused_rounds = 0;
 
@@ -2254,11 +2345,11 @@ async fn rejoin_remove_of_the_signer_device_is_one_shot_per_add() {
 
         let alice = text_device(ALICE, 1);
         let bob = text_device(BOB, 1);
-        let fixture = seed_text_group(
-            &db,
-            &text_seed(70, &alice, &[alice.clone(), bob.clone()], &[ALICE, BOB]),
-        )
-        .await;
+        // Added three days ago, so an intent older than the Text window is
+        // still newer than the Add: refused by the window alone
+        let mut seed = text_seed(70, &alice, &[alice.clone(), bob.clone()], &[ALICE, BOB]);
+        seed.added_secs_ago = 3 * 86400;
+        let fixture = seed_text_group(&db, &seed).await;
         let group = fixture.group.id.clone();
         let remove_alice = |epoch: i64, at: Timestamp| {
             text_commit(&fixture, epoch, &bob, vec![], vec![alice.clone()], at)
@@ -2274,10 +2365,18 @@ async fn rejoin_remove_of_the_signer_device_is_one_shot_per_add() {
             "no intent",
         );
 
-        // A stale intent (> 30 s): refused
-        db.upsert_mls_join_intent(&rejoin_intent(&group, &alice, seconds_from_now(-60)))
-            .await
-            .unwrap();
+        // A stale intent: refused. S2 (S2-D28) replaced the 30 s Text
+        // window with `text_rejoin_window_secs` (24 h by default), so a
+        // 60 s-old intent is now outstanding (tested in
+        // `text_rule_6_uses_the_configured_text_window`); this one is a
+        // minute past the 24 h window
+        db.upsert_mls_join_intent(&rejoin_intent(
+            &group,
+            &alice,
+            seconds_from_now(-(TEXT_REJOIN_OUTSTANDING_WINDOW_SECONDS + 60)),
+        ))
+        .await
+        .unwrap();
         assert_failed_validation(
             db.insert_mls_text_commit(&remove_alice(1, Timestamp::now_utc()), &fixture.hash, 0)
                 .await,
@@ -2386,6 +2485,7 @@ async fn text_add_rules_refuse_readd_members_unseated_and_pending() {
         let bob = text_device(BOB, 1);
         let bob2 = text_device(BOB, 2);
         let carol = text_device(CAROL, 1);
+        register_identities(&db, &[&bob2]).await;
         let commit = |fixture: &TextFixture,
                       epoch: i64,
                       by: &MlsMemberDevice,
@@ -2487,6 +2587,7 @@ async fn text_device_cap_is_enforced_inside_the_commit() {
 
         let alice = text_device(ALICE, 1);
         let bob = |n: u8| text_device(BOB, n);
+        register_identities(&db, &[&bob(2), &bob(3)]).await;
         let add_bob = |fixture: &TextFixture, epoch: i64, n: u8| {
             text_commit(
                 fixture,
@@ -2595,20 +2696,31 @@ async fn call_path_preserves_text_fields_and_never_touches_text_groups() {
             epoch: 0,
             at: seconds_from_now(-60),
         }];
+        // ... and every S2 field
+        call.pending_device_removals = vec![MlsPendingDeviceRemoval {
+            user_id: ulid(DAVE),
+            device_id: "d".repeat(32),
+            created_at: seconds_from_now(-60),
+        }];
+        call.signer_lost = Some(MlsSignerLost {
+            user_id: ulid(EVE),
+            device_id: "e".repeat(32),
+            cause: MlsSignerLostCause::DeviceRevoked,
+            at: seconds_from_now(-60),
+        });
+        call.rejoin_readd = vec![MlsRejoinReadd {
+            user_id: ulid(CAROL),
+            device_id: "c".repeat(32),
+            at: seconds_from_now(-60),
+        }];
         db.create_mls_group(&call, None).await.unwrap();
         let before = db.fetch_mls_group(&call.id).await.unwrap();
+        #[cfg(feature = "mongodb")]
+        let raw_before = raw_document(&db, "mls_groups", &call.id).await;
 
+        let call_commit = make_commit(&call.id, 1, &alice, vec![bob.clone()], vec![], "add");
         assert!(matches!(
-            db.insert_mls_commit(&make_commit(
-                &call.id,
-                1,
-                &alice,
-                vec![bob.clone()],
-                vec![],
-                "add"
-            ))
-            .await
-            .unwrap(),
+            db.insert_mls_commit(&call_commit).await.unwrap(),
             MlsCommitOutcome::Won
         ));
 
@@ -2621,6 +2733,48 @@ async fn call_path_preserves_text_fields_and_never_touches_text_groups() {
         expected.current_epoch = after.current_epoch;
         expected.members = after.members.clone();
         assert_eq!(after, expected);
+
+        // S2 (§2.5 "S2 additions"): the stored Call row is exactly the
+        // submitted one, with no Text-only field (no `welcome`, no
+        // declarations), and on Mongo the group document keeps exactly its
+        // keys, each byte-identical except `current_epoch` and `members`
+        let stored_call = db.fetch_mls_commits_from(&call.id, 1, 1).await.unwrap();
+        assert_eq!(stored_call.len(), 1);
+        assert_eq!(stored_call[0].welcome, None);
+        assert!(stored_call[0].removed_reasons.is_empty());
+        assert!(stored_call[0].rejoin_intents.is_empty());
+        #[cfg(feature = "mongodb")]
+        if let Some(raw_commit) =
+            raw_document(&db, "mls_commits", &MlsCommit::composite_id(&call.id, 1)).await
+        {
+            assert_eq!(
+                raw_commit.keys().collect::<Vec<_>>(),
+                [
+                    "_id",
+                    "group_id",
+                    "epoch",
+                    "committer",
+                    "commit",
+                    "size",
+                    "added",
+                    "removed",
+                    "created_at"
+                ],
+                "a Call commit row carries no Text-only key"
+            );
+            let mut raw_after = raw_document(&db, "mls_groups", &call.id)
+                .await
+                .expect("raw group");
+            let mut raw_before = raw_before.expect("raw group");
+            for changed in ["current_epoch", "members"] {
+                raw_after.remove(changed);
+                raw_before.remove(changed);
+            }
+            assert_eq!(
+                raw_after, raw_before,
+                "the Call commit rewrote another field"
+            );
+        }
 
         // The Call path refuses a Text group outright
         let fixture = seed_text_group(
@@ -2840,5 +2994,1033 @@ async fn a_call_create_never_overwrites_an_existing_group_id() {
             "Call create at a closed Call group's id",
         );
         assert_eq!(db.fetch_mls_group(&closed.id).await.unwrap(), stored);
+    });
+}
+
+// ---------------------------------------------------------------------------
+// S2 Delivery Service rules in the Text commit transaction (design §2.5 "S2
+// additions" and "Clearing", §6.1 "S2 additions to the Delivery Service
+// rules"). Every test runs under both drivers.
+// ---------------------------------------------------------------------------
+
+/// Rule 3a (S2-D17a): ANY committer may remove a device listed in
+/// `pending_device_removals`, labelled `pending_device`; never the current
+/// list signer's device (rule 1), even if it were listed; a device of the
+/// same user that is not listed stays protected
+#[tokio::test]
+async fn text_rule_3a_lets_any_committer_remove_a_pending_device() {
+    database_test!(|db| async move {
+        db.migrate_database().await.expect("schema");
+
+        let alice = text_device(ALICE, 1);
+        let bob = text_device(BOB, 1);
+        let carol = text_device(CAROL, 1);
+        let carol2 = text_device(CAROL, 2);
+        let mut seed = text_seed(
+            130,
+            &alice,
+            &[alice.clone(), bob.clone(), carol.clone(), carol2.clone()],
+            &[ALICE, BOB, CAROL],
+        );
+        // The signer's device is listed only to prove rule 1 still wins
+        // (a release primitive never queues it, S2-D15)
+        seed.pending_devices = vec![carol2.clone(), alice.clone()];
+        let fixture = seed_text_group(&db, &seed).await;
+        let remove = |epoch: i64, by: &MlsMemberDevice, target: &MlsMemberDevice| {
+            text_commit(
+                &fixture,
+                epoch,
+                by,
+                vec![],
+                vec![target.clone()],
+                Timestamp::now_utc(),
+            )
+        };
+
+        // Bob is not carol's user, not the signer, and carol is seated with
+        // a live identity: only rule 3a admits this
+        assert_won(
+            db.insert_mls_text_commit(&remove(1, &bob, &carol2), &fixture.hash, 0)
+                .await,
+            "rule 3a by an unrelated member",
+        );
+        let row = stored_text_commit(&db, &fixture.group.id, 1).await;
+        assert_eq!(
+            reasons_of(&row),
+            vec![(carol2.clone(), MlsRemovalReason::PendingDevice)]
+        );
+        let group = db.fetch_mls_group(&fixture.group.id).await.unwrap();
+        assert!(!group.has_member(&carol2.user_id, &carol2.device_id));
+        assert_eq!(
+            group
+                .pending_device_removals
+                .iter()
+                .map(|pending| (pending.user_id.clone(), pending.device_id.clone()))
+                .collect::<Vec<_>>(),
+            vec![(alice.user_id.clone(), alice.device_id.clone())],
+            "the removed device's entry is cleared, the member's stays"
+        );
+
+        // The same user's unlisted device: no rule admits it
+        assert_failed_validation(
+            db.insert_mls_text_commit(&remove(2, &bob, &carol), &fixture.hash, 0)
+                .await,
+            "unlisted device of the same user",
+        );
+        // The signer's device, listed or not: rule 1
+        assert_failed_validation(
+            db.insert_mls_text_commit(&remove(2, &bob, &alice), &fixture.hash, 0)
+                .await,
+            "the signer's device through rule 3a",
+        );
+        assert_untouched(&db, &fixture, 1).await;
+    });
+}
+
+/// Add-clears-pending (S2-D17b): an Add is allowed only when the same
+/// commit removes EVERY member device that either pending list names; a
+/// partial clear is `pending_removal` and writes nothing
+#[tokio::test]
+async fn text_add_clears_pending_only_when_every_named_device_goes() {
+    database_test!(|db| async move {
+        db.migrate_database().await.expect("schema");
+
+        let alice = text_device(ALICE, 1);
+        let bob = text_device(BOB, 1);
+        let bob2 = text_device(BOB, 2);
+        let carol = text_device(CAROL, 1);
+        let carol2 = text_device(CAROL, 2);
+        let dave = text_device(DAVE, 1);
+        let mut seed = text_seed(
+            131,
+            &alice,
+            &[
+                alice.clone(),
+                bob.clone(),
+                bob2.clone(),
+                carol.clone(),
+                carol2.clone(),
+            ],
+            &[ALICE, BOB, CAROL, DAVE],
+        );
+        seed.pending = vec![CAROL];
+        seed.pending_devices = vec![bob2.clone()];
+        let fixture = seed_text_group(&db, &seed).await;
+        register_identities(&db, &[&dave]).await;
+        let add_dave = |removed: &[&MlsMemberDevice]| {
+            text_commit(
+                &fixture,
+                1,
+                &alice,
+                vec![dave.clone()],
+                removed.iter().map(|device| (*device).clone()).collect(),
+                Timestamp::now_utc(),
+            )
+        };
+
+        for (removed, case) in [
+            (vec![], "nothing removed"),
+            (vec![&carol], "one of the pending user's devices"),
+            (
+                vec![&carol, &carol2],
+                "the pending user but not the pending device",
+            ),
+            (
+                vec![&carol2, &bob2],
+                "the pending device but not every user device",
+            ),
+        ] {
+            assert_resecuring(
+                db.insert_mls_text_commit(&add_dave(&removed), &fixture.hash, 0)
+                    .await,
+                "pending_removal",
+                case,
+            );
+        }
+        assert_untouched(&db, &fixture, 0).await;
+
+        // The full clear and the Add in one commit
+        assert_won(
+            db.insert_mls_text_commit(&add_dave(&[&carol, &carol2, &bob2]), &fixture.hash, 0)
+                .await,
+            "Add with every pending device removed",
+        );
+        let group = db.fetch_mls_group(&fixture.group.id).await.unwrap();
+        assert!(group.has_member(&dave.user_id, &dave.device_id));
+        assert!(group.pending_removals.is_empty());
+        assert!(group.pending_device_removals.is_empty());
+        let row = stored_text_commit(&db, &fixture.group.id, 1).await;
+        assert_eq!(
+            reasons_of(&row),
+            vec![
+                (carol.clone(), MlsRemovalReason::PendingRemoval),
+                (carol2.clone(), MlsRemovalReason::PendingRemoval),
+                (bob2.clone(), MlsRemovalReason::PendingDevice),
+            ]
+        );
+    });
+}
+
+/// `signer_lost` (S2-D17d): other users' Adds are refused with
+/// `owner_device_lost`; the signer USER's Adds, Removes and Updates go on;
+/// the lost device's leaf still counts toward the cap (#212); no commit
+/// clears the flag
+#[tokio::test]
+async fn signer_lost_refuses_other_users_adds_only() {
+    database_test!(|db| async move {
+        db.migrate_database().await.expect("schema");
+
+        let alice = text_device(ALICE, 1);
+        let alice2 = text_device(ALICE, 2);
+        let alice3 = text_device(ALICE, 3);
+        let bob = text_device(BOB, 1);
+        let bob3 = text_device(BOB, 3);
+        let carol = text_device(CAROL, 1);
+        let mut seed = text_seed(
+            132,
+            &alice,
+            &[alice.clone(), bob.clone(), bob3.clone()],
+            &[ALICE, BOB, CAROL],
+        );
+        seed.signer_lost = true;
+        seed.device_cap = 2;
+        let fixture = seed_text_group(&db, &seed).await;
+        // carol's Add passes every other rule, so only signer_lost refuses it
+        register_identities(&db, &[&alice2, &alice3, &carol]).await;
+        let commit = |epoch: i64,
+                      by: &MlsMemberDevice,
+                      added: &[&MlsMemberDevice],
+                      removed: &[&MlsMemberDevice]| {
+            text_commit(
+                &fixture,
+                epoch,
+                by,
+                added.iter().map(|device| (*device).clone()).collect(),
+                removed.iter().map(|device| (*device).clone()).collect(),
+                Timestamp::now_utc(),
+            )
+        };
+
+        assert_resecuring(
+            db.insert_mls_text_commit(&commit(1, &bob, &[&carol], &[]), &fixture.hash, 0)
+                .await,
+            "owner_device_lost",
+            "another user's Add",
+        );
+        assert_resecuring(
+            db.insert_mls_text_commit(&commit(1, &bob, &[&alice2, &carol], &[]), &fixture.hash, 0)
+                .await,
+            "owner_device_lost",
+            "a mixed Add",
+        );
+        assert_untouched(&db, &fixture, 0).await;
+
+        assert_won(
+            db.insert_mls_text_commit(&commit(1, &bob, &[], &[]), &fixture.hash, 0)
+                .await,
+            "an Update",
+        );
+        assert_won(
+            db.insert_mls_text_commit(&commit(2, &bob, &[], &[&bob3]), &fixture.hash, 0)
+                .await,
+            "a Remove",
+        );
+        assert_won(
+            db.insert_mls_text_commit(&commit(3, &bob, &[&alice2], &[]), &fixture.hash, 0)
+                .await,
+            "the signer user's replacement device",
+        );
+        // alice's lost device and alice2 hold two leaves: a third is over
+        // the cap of 2 (the lost leaf is not excluded)
+        let refused = refusal_type(
+            db.insert_mls_text_commit(&commit(4, &bob, &[&alice3], &[]), &fixture.hash, 0)
+                .await,
+            "a third device of the signer user",
+        );
+        assert!(
+            matches!(refused, ErrorType::DeviceCapReached { max: 2 }),
+            "the lost leaf counts: {refused:?}"
+        );
+
+        let group = db.fetch_mls_group(&fixture.group.id).await.unwrap();
+        assert_eq!(group.current_epoch, 3);
+        assert_eq!(
+            group
+                .signer_lost
+                .as_ref()
+                .map(|lost| lost.device_id.clone()),
+            Some(alice.device_id.clone()),
+            "only the seat-list write of 4.3 step 7 clears it"
+        );
+    });
+}
+
+/// The added-identity claim (S2-D17c): an added device whose E2EE identity
+/// is absent inside the transaction is refused (`FailedValidation`, nothing
+/// written); a registered one is admitted, and on Mongo its identity
+/// document was CLAIMED (`txn_serial` bumped), not just read
+#[tokio::test]
+async fn text_add_requires_and_claims_the_added_identity() {
+    database_test!(|db| async move {
+        db.migrate_database().await.expect("schema");
+        reference_note(
+            &db,
+            "text_add_requires_and_claims_the_added_identity",
+            "the identity write claim",
+        );
+
+        let alice = text_device(ALICE, 1);
+        let bob = text_device(BOB, 1);
+        let bob2 = text_device(BOB, 2);
+        let fixture = seed_text_group(
+            &db,
+            &text_seed(133, &alice, &[alice.clone(), bob.clone()], &[ALICE, BOB]),
+        )
+        .await;
+        let add_bob2 = text_commit(
+            &fixture,
+            1,
+            &alice,
+            vec![bob2.clone()],
+            vec![],
+            Timestamp::now_utc(),
+        );
+
+        assert_failed_validation(
+            db.insert_mls_text_commit(&add_bob2, &fixture.hash, 0).await,
+            "an unregistered added device",
+        );
+        assert_untouched(&db, &fixture, 0).await;
+
+        register_identities(&db, &[&bob2]).await;
+        assert_won(
+            db.insert_mls_text_commit(&add_bob2, &fixture.hash, 0).await,
+            "a registered added device",
+        );
+
+        #[cfg(feature = "mongodb")]
+        if let Some(identity) = raw_document(
+            &db,
+            "e2ee_identity",
+            &E2EEIdentity::composite_id(&bob2.user_id, &bob2.device_id),
+        )
+        .await
+        {
+            assert_eq!(
+                identity.get_i64("txn_serial").ok(),
+                Some(1),
+                "the added identity is claimed by a write"
+            );
+        }
+        // The claim leaves the identity readable and unchanged
+        let stored = db
+            .fetch_e2ee_identity(&bob2.user_id, &bob2.device_id)
+            .await
+            .expect("identity");
+        assert_eq!(stored.ed25519_key, "ed25519");
+    });
+}
+
+/// `removed_reasons` are stamped INSIDE the transaction from its own reads,
+/// with the S2 rank (`pending_removal` > `rejoin` > `own_user` >
+/// `pending_device` > `revoked` > `idle` > `off_list`), whatever the
+/// submitter sent. Every pair below is ranked the other way by the S1
+/// order. An admitting rejoin intent is copied and consumed even when
+/// another rule admits too
+#[tokio::test]
+async fn removed_reasons_are_stamped_in_the_transaction_with_the_s2_rank() {
+    database_test!(|db| async move {
+        db.migrate_database().await.expect("schema");
+
+        let alice = text_device(ALICE, 1);
+        let bob = text_device(BOB, 1);
+        let bob2 = text_device(BOB, 2);
+        let bob3 = text_device(BOB, 3);
+        let carol = text_device(CAROL, 1);
+        let eve = text_device(EVE, 1);
+        let mut seed = text_seed(
+            134,
+            &alice,
+            &[
+                alice.clone(),
+                bob.clone(),
+                bob2.clone(),
+                bob3.clone(),
+                carol.clone(),
+                eve.clone(),
+            ],
+            &[ALICE, BOB, CAROL],
+        );
+        seed.revoked = vec![bob2.clone(), eve.clone()];
+        seed.pending = vec![CAROL];
+        let fixture = seed_text_group(&db, &seed).await;
+        let group = fixture.group.id.clone();
+        let remove = |epoch: i64, by: &MlsMemberDevice, target: &MlsMemberDevice| {
+            let mut commit = text_commit(
+                &fixture,
+                epoch,
+                by,
+                vec![],
+                vec![target.clone()],
+                Timestamp::now_utc(),
+            );
+            // A submitter's label is never stored
+            commit.removed_reasons = vec![crate::MlsRemovedReason {
+                user_id: target.user_id.clone(),
+                device_id: target.device_id.clone(),
+                reason: MlsRemovalReason::Idle,
+            }];
+            commit
+        };
+
+        // own_user + revoked (S1: revoked)
+        assert_won(
+            db.insert_mls_text_commit(&remove(1, &bob, &bob2), &fixture.hash, 0)
+                .await,
+            "own_user + revoked",
+        );
+        assert_eq!(
+            reasons_of(&stored_text_commit(&db, &group, 1).await),
+            vec![(bob2.clone(), MlsRemovalReason::OwnUser)]
+        );
+
+        // off_list + revoked, by the signer (S1: off_list)
+        assert_won(
+            db.insert_mls_text_commit(&remove(2, &alice, &eve), &fixture.hash, 0)
+                .await,
+            "off_list + revoked",
+        );
+        assert_eq!(
+            reasons_of(&stored_text_commit(&db, &group, 2).await),
+            vec![(eve.clone(), MlsRemovalReason::Revoked)]
+        );
+
+        // rejoin + own_user (S1: own_user, and the intent kept)
+        let intent = rejoin_intent(&group, &bob3, seconds_from_now(-5));
+        db.upsert_mls_join_intent(&intent).await.unwrap();
+        assert_won(
+            db.insert_mls_text_commit(&remove(3, &bob, &bob3), &fixture.hash, 0)
+                .await,
+            "rejoin + own_user",
+        );
+        let row = stored_text_commit(&db, &group, 3).await;
+        assert_eq!(
+            reasons_of(&row),
+            vec![(bob3.clone(), MlsRemovalReason::Rejoin)]
+        );
+        assert_eq!(row.rejoin_intents.len(), 1);
+        assert_eq!(row.rejoin_intents[0].id, intent.id);
+
+        // pending_removal + rejoin: pending_removal still wins
+        let intent = rejoin_intent(&group, &carol, seconds_from_now(-5));
+        db.upsert_mls_join_intent(&intent).await.unwrap();
+        assert_won(
+            db.insert_mls_text_commit(&remove(4, &bob, &carol), &fixture.hash, 0)
+                .await,
+            "pending_removal + rejoin",
+        );
+        let row = stored_text_commit(&db, &group, 4).await;
+        assert_eq!(
+            reasons_of(&row),
+            vec![(carol.clone(), MlsRemovalReason::PendingRemoval)]
+        );
+        assert_eq!(row.rejoin_intents.len(), 1);
+        assert!(db
+            .fetch_mls_join_intents_for_group(&group)
+            .await
+            .unwrap()
+            .is_empty());
+    });
+}
+
+/// Rule 6 on Text uses `text_rejoin_window_secs` (24 h by default, S2-D28),
+/// not the 30 s Call window
+#[tokio::test]
+async fn text_rule_6_uses_the_configured_text_window() {
+    database_test!(|db| async move {
+        db.migrate_database().await.expect("schema");
+
+        let alice = text_device(ALICE, 1);
+        let bob = text_device(BOB, 1);
+        let seed_for = |seed: u8| {
+            let mut seed = text_seed(seed, &alice, &[alice.clone(), bob.clone()], &[ALICE, BOB]);
+            seed.added_secs_ago = 3 * 86400;
+            seed
+        };
+        let remove_bob = |fixture: &TextFixture| {
+            text_commit(
+                fixture,
+                1,
+                &alice,
+                vec![],
+                vec![bob.clone()],
+                Timestamp::now_utc(),
+            )
+        };
+
+        // A minute old: past the Call window, well inside the Text one
+        let fixture = seed_text_group(&db, &seed_for(135)).await;
+        db.upsert_mls_join_intent(&rejoin_intent(
+            &fixture.group.id,
+            &bob,
+            seconds_from_now(-60),
+        ))
+        .await
+        .unwrap();
+        assert_won(
+            db.insert_mls_text_commit(&remove_bob(&fixture), &fixture.hash, 0)
+                .await,
+            "a 60 s old Text intent",
+        );
+        assert_eq!(
+            reasons_of(&stored_text_commit(&db, &fixture.group.id, 1).await),
+            vec![(bob.clone(), MlsRemovalReason::Rejoin)]
+        );
+
+        // A minute past the Text window, still newer than the Add
+        let fixture = seed_text_group(&db, &seed_for(136)).await;
+        db.upsert_mls_join_intent(&rejoin_intent(
+            &fixture.group.id,
+            &bob,
+            seconds_from_now(-(TEXT_REJOIN_OUTSTANDING_WINDOW_SECONDS + 60)),
+        ))
+        .await
+        .unwrap();
+        assert_failed_validation(
+            db.insert_mls_text_commit(&remove_bob(&fixture), &fixture.hash, 0)
+                .await,
+            "an intent past the Text window",
+        );
+        assert_untouched(&db, &fixture, 0).await;
+    });
+}
+
+/// `rejoin_readd` (S2-D32): a rule-6 eviction writes an entry for the
+/// device, any other Remove writes none, and that device's re-Add consumes
+/// it
+#[tokio::test]
+async fn rejoin_readd_is_written_by_the_eviction_and_consumed_by_the_readd() {
+    database_test!(|db| async move {
+        db.migrate_database().await.expect("schema");
+
+        let alice = text_device(ALICE, 1);
+        let bob = text_device(BOB, 1);
+        let bob2 = text_device(BOB, 2);
+        let fixture = seed_text_group(
+            &db,
+            &text_seed(
+                137,
+                &alice,
+                &[alice.clone(), bob.clone(), bob2.clone()],
+                &[ALICE, BOB],
+            ),
+        )
+        .await;
+        let group = fixture.group.id.clone();
+        let entries = |group: &MlsGroup| -> Vec<(String, String)> {
+            group
+                .rejoin_readd
+                .iter()
+                .map(|entry| (entry.user_id.clone(), entry.device_id.clone()))
+                .collect()
+        };
+
+        db.upsert_mls_join_intent(&rejoin_intent(&group, &alice, seconds_from_now(-5)))
+            .await
+            .unwrap();
+        assert_won(
+            db.insert_mls_text_commit(
+                &text_commit(
+                    &fixture,
+                    1,
+                    &bob,
+                    vec![],
+                    vec![alice.clone()],
+                    Timestamp::now_utc(),
+                ),
+                &fixture.hash,
+                0,
+            )
+            .await,
+            "rule-6 eviction",
+        );
+        let after_eviction = db.fetch_mls_group(&group).await.unwrap();
+        assert_eq!(
+            entries(&after_eviction),
+            vec![(alice.user_id.clone(), alice.device_id.clone())]
+        );
+
+        // An own-user Remove is no eviction
+        assert_won(
+            db.insert_mls_text_commit(
+                &text_commit(
+                    &fixture,
+                    2,
+                    &bob,
+                    vec![],
+                    vec![bob2.clone()],
+                    seconds_from_now(1),
+                ),
+                &fixture.hash,
+                0,
+            )
+            .await,
+            "own-user Remove",
+        );
+        assert_eq!(
+            db.fetch_mls_group(&group).await.unwrap().rejoin_readd,
+            after_eviction.rejoin_readd
+        );
+
+        // The re-Add consumes it; an emptied list is stored as absent
+        assert_won(
+            db.insert_mls_text_commit(
+                &text_commit(
+                    &fixture,
+                    3,
+                    &bob,
+                    vec![alice.clone()],
+                    vec![],
+                    seconds_from_now(2),
+                ),
+                &fixture.hash,
+                0,
+            )
+            .await,
+            "re-Add",
+        );
+        assert!(db
+            .fetch_mls_group(&group)
+            .await
+            .unwrap()
+            .rejoin_readd
+            .is_empty());
+        #[cfg(feature = "mongodb")]
+        if let Some(raw) = raw_document(&db, "mls_groups", &group).await {
+            assert!(!raw.contains_key("rejoin_readd"));
+        }
+    });
+}
+
+/// `keys_received_at` (design §2.3): the Text commit transaction sets it on
+/// the user's active seat row when the user's first device is added, and
+/// never moves it on a later Add; other users' seat rows are untouched
+#[tokio::test]
+async fn keys_received_at_is_stamped_once_when_the_first_device_is_added() {
+    database_test!(|db| async move {
+        db.migrate_database().await.expect("schema");
+
+        let alice = text_device(ALICE, 1);
+        let bob = text_device(BOB, 1);
+        let carol = text_device(CAROL, 1);
+        let carol2 = text_device(CAROL, 2);
+        let fixture = seed_text_group(
+            &db,
+            &text_seed(
+                138,
+                &alice,
+                &[alice.clone(), bob.clone()],
+                &[ALICE, BOB, CAROL],
+            ),
+        )
+        .await;
+        register_identities(&db, &[&carol, &carol2]).await;
+        let channel = fixture.channel_id.clone();
+        assert_eq!(
+            seat_of(&db, &channel, &carol.user_id)
+                .await
+                .keys_received_at,
+            None
+        );
+
+        // An Update sets nothing
+        assert_won(
+            db.insert_mls_text_commit(
+                &text_commit(&fixture, 1, &alice, vec![], vec![], Timestamp::now_utc()),
+                &fixture.hash,
+                0,
+            )
+            .await,
+            "an Update",
+        );
+        assert_eq!(
+            seat_of(&db, &channel, &carol.user_id)
+                .await
+                .keys_received_at,
+            None
+        );
+
+        assert_won(
+            db.insert_mls_text_commit(
+                &text_commit(
+                    &fixture,
+                    2,
+                    &alice,
+                    vec![carol.clone()],
+                    vec![],
+                    Timestamp::now_utc(),
+                ),
+                &fixture.hash,
+                0,
+            )
+            .await,
+            "carol's first device",
+        );
+        let first = seat_of(&db, &channel, &carol.user_id)
+            .await
+            .keys_received_at
+            .expect("set by the first Add");
+
+        assert_won(
+            db.insert_mls_text_commit(
+                &text_commit(
+                    &fixture,
+                    3,
+                    &alice,
+                    vec![carol2.clone()],
+                    vec![],
+                    seconds_from_now(5),
+                ),
+                &fixture.hash,
+                0,
+            )
+            .await,
+            "carol's second device",
+        );
+        assert_eq!(
+            seat_of(&db, &channel, &carol.user_id)
+                .await
+                .keys_received_at,
+            Some(first),
+            "a later Add never moves it"
+        );
+        assert_eq!(
+            seat_of(&db, &channel, &bob.user_id).await.keys_received_at,
+            None
+        );
+    });
+}
+
+/// Clearing (2.5, #224): after EVERY won commit, an Update included, every
+/// `pending_device_removals` entry whose device holds no leaf is dropped,
+/// and an entry whose device is a member is kept until that device goes
+#[tokio::test]
+async fn clearing_drops_pending_device_entries_without_a_leaf_after_every_commit() {
+    database_test!(|db| async move {
+        db.migrate_database().await.expect("schema");
+
+        let alice = text_device(ALICE, 1);
+        let bob = text_device(BOB, 1);
+        let bob2 = text_device(BOB, 2);
+        let ghost = text_device(BOB, 9);
+        let mut seed = text_seed(
+            139,
+            &alice,
+            &[alice.clone(), bob.clone(), bob2.clone()],
+            &[ALICE, BOB],
+        );
+        seed.pending_devices = vec![ghost.clone(), bob2.clone()];
+        let fixture = seed_text_group(&db, &seed).await;
+        let pending = |group: &MlsGroup| -> Vec<(String, String)> {
+            group
+                .pending_device_removals
+                .iter()
+                .map(|entry| (entry.user_id.clone(), entry.device_id.clone()))
+                .collect()
+        };
+
+        assert_won(
+            db.insert_mls_text_commit(
+                &text_commit(&fixture, 1, &alice, vec![], vec![], Timestamp::now_utc()),
+                &fixture.hash,
+                0,
+            )
+            .await,
+            "an Update",
+        );
+        assert_eq!(
+            pending(&db.fetch_mls_group(&fixture.group.id).await.unwrap()),
+            vec![(bob2.user_id.clone(), bob2.device_id.clone())],
+            "the non-member entry is dropped, the member's kept"
+        );
+
+        assert_won(
+            db.insert_mls_text_commit(
+                &text_commit(
+                    &fixture,
+                    2,
+                    &alice,
+                    vec![],
+                    vec![bob2.clone()],
+                    Timestamp::now_utc(),
+                ),
+                &fixture.hash,
+                0,
+            )
+            .await,
+            "rule 3a removes the listed member",
+        );
+        assert!(pending(&db.fetch_mls_group(&fixture.group.id).await.unwrap()).is_empty());
+    });
+}
+
+/// The stored Welcome (S2-D29): stored on the commit row as given, served
+/// by `fetch_mls_text_welcome` from the NEWEST Text-marked row that added
+/// the device (never an unmarked Call-plane row, never another device's);
+/// `fetch_mls_text_oldest_epoch` is the oldest Text-marked epoch, moving
+/// up with retention pruning
+#[tokio::test]
+async fn welcome_is_stored_as_given_and_served_per_device() {
+    database_test!(|db| async move {
+        db.migrate_database().await.expect("schema");
+
+        let alice = text_device(ALICE, 1);
+        let bob = text_device(BOB, 1);
+        let bob2 = text_device(BOB, 2);
+        let fixture = seed_text_group(
+            &db,
+            &text_seed(140, &alice, &[alice.clone(), bob.clone()], &[ALICE, BOB]),
+        )
+        .await;
+        register_identities(&db, &[&bob2]).await;
+        let group = fixture.group.id.clone();
+        let with_welcome = |mut commit: MlsCommit, welcome: &str| {
+            commit.welcome = Some(welcome.to_string());
+            commit
+        };
+
+        assert_eq!(db.fetch_mls_text_oldest_epoch(&group).await.unwrap(), None);
+        assert!(db
+            .fetch_mls_text_welcome(&group, &bob2.user_id, &bob2.device_id)
+            .await
+            .unwrap()
+            .is_none());
+
+        // An unmarked (Call-plane) row at epoch 0 that "added" bob2
+        insert_raw_commit(
+            &db,
+            &make_commit(&group, 0, &alice, vec![bob2.clone()], vec![], "stray"),
+        )
+        .await;
+
+        // Epoch 1 adds bob2 with a Welcome (50 minutes ago: pruned below)
+        assert_won(
+            db.insert_mls_text_commit(
+                &with_welcome(
+                    text_commit(
+                        &fixture,
+                        1,
+                        &alice,
+                        vec![bob2.clone()],
+                        vec![],
+                        seconds_from_now(-3000),
+                    ),
+                    "d2VsY29tZTE",
+                ),
+                &fixture.hash,
+                0,
+            )
+            .await,
+            "Add with a Welcome",
+        );
+        assert_eq!(
+            stored_text_commit(&db, &group, 1).await.welcome.as_deref(),
+            Some("d2VsY29tZTE"),
+            "stored as given"
+        );
+        let served = db
+            .fetch_mls_text_welcome(&group, &bob2.user_id, &bob2.device_id)
+            .await
+            .unwrap()
+            .expect("the Welcome row");
+        assert_eq!(
+            (served.epoch, served.welcome.as_deref()),
+            (1, Some("d2VsY29tZTE"))
+        );
+
+        // Removed (own user) and re-added: the newest row serves
+        assert_won(
+            db.insert_mls_text_commit(
+                &text_commit(
+                    &fixture,
+                    2,
+                    &bob,
+                    vec![],
+                    vec![bob2.clone()],
+                    Timestamp::now_utc(),
+                ),
+                &fixture.hash,
+                0,
+            )
+            .await,
+            "remove bob2",
+        );
+        assert_won(
+            db.insert_mls_text_commit(
+                &with_welcome(
+                    text_commit(
+                        &fixture,
+                        3,
+                        &bob,
+                        vec![bob2.clone()],
+                        vec![],
+                        seconds_from_now(1),
+                    ),
+                    "d2VsY29tZTM",
+                ),
+                &fixture.hash,
+                0,
+            )
+            .await,
+            "re-add bob2",
+        );
+        let served = db
+            .fetch_mls_text_welcome(&group, &bob2.user_id, &bob2.device_id)
+            .await
+            .unwrap()
+            .expect("the newest Welcome row");
+        assert_eq!(
+            (served.epoch, served.welcome.as_deref()),
+            (3, Some("d2VsY29tZTM"))
+        );
+
+        // Never another device's or another user's row
+        for (user_id, device_id) in [
+            (bob.user_id.clone(), bob.device_id.clone()),
+            (alice.user_id.clone(), bob2.device_id.clone()),
+        ] {
+            assert!(db
+                .fetch_mls_text_welcome(&group, &user_id, &device_id)
+                .await
+                .unwrap()
+                .is_none());
+        }
+
+        // The unmarked epoch-0 row is not the oldest Text epoch
+        assert_eq!(
+            db.fetch_mls_text_oldest_epoch(&group).await.unwrap(),
+            Some(1)
+        );
+        db.prune_mls_text_commits(seconds_from_now(-60))
+            .await
+            .unwrap();
+        assert_eq!(
+            db.fetch_mls_text_oldest_epoch(&group).await.unwrap(),
+            Some(2)
+        );
+        let served = db
+            .fetch_mls_text_welcome(&group, &bob2.user_id, &bob2.device_id)
+            .await
+            .unwrap()
+            .expect("still the newest row");
+        assert_eq!(served.epoch, 3);
+    });
+}
+
+/// S2-D17c with the revocation of 6.3 (pending pass, identity delete,
+/// pending pass again): every ordering of a device revocation and an Add of
+/// that device ends with the device NOT a member, or a member that a
+/// pending device entry names. Even rounds revoke strictly first (the Add
+/// must be refused); odd rounds race the two. A real race only under
+/// MONGODB (the Add's identity claim write-conflicts with the delete);
+/// under REFERENCE the mutexes serialize them
+#[tokio::test]
+async fn device_revocation_racing_a_text_add_never_leaves_an_unqueued_member() {
+    database_test!(|db| async move {
+        db.migrate_database().await.expect("schema");
+        reference_note(
+            &db,
+            "device_revocation_racing_a_text_add_never_leaves_an_unqueued_member",
+            "the concurrent revocation/Add interleaving",
+        );
+
+        let alice = text_device(ALICE, 1);
+        let bob = text_device(BOB, 1);
+        let bob2 = text_device(BOB, 2);
+        let mut won_rounds = 0;
+        let mut refused_rounds = 0;
+
+        for round in 0..24u8 {
+            let fixture = seed_text_group(
+                &db,
+                &text_seed(
+                    150 + round,
+                    &alice,
+                    &[alice.clone(), bob.clone()],
+                    &[ALICE, BOB],
+                ),
+            )
+            .await;
+            // The previous round revoked it
+            register_identities(&db, &[&bob2]).await;
+            let add = text_commit(
+                &fixture,
+                1,
+                &alice,
+                vec![bob2.clone()],
+                vec![],
+                Timestamp::now_utc(),
+            );
+            let revoke = {
+                let db = db.clone();
+                let bob2 = bob2.clone();
+                move || async move {
+                    db.add_pending_device_removal(
+                        &bob2.user_id,
+                        &bob2.device_id,
+                        Timestamp::now_utc(),
+                    )
+                    .await?;
+                    db.delete_e2ee_device(&bob2.user_id, &bob2.device_id)
+                        .await?;
+                    db.add_pending_device_removal(
+                        &bob2.user_id,
+                        &bob2.device_id,
+                        Timestamp::now_utc(),
+                    )
+                    .await
+                }
+            };
+
+            let outcome = if round % 2 == 0 {
+                revoke().await.expect("revocation");
+                db.insert_mls_text_commit(&add, &fixture.hash, 0).await
+            } else {
+                let adder = {
+                    let db = db.clone();
+                    let hash = fixture.hash.clone();
+                    tokio::spawn(async move { db.insert_mls_text_commit(&add, &hash, 0).await })
+                };
+                let revoker = tokio::spawn(revoke());
+                revoker.await.expect("join").expect("revocation");
+                adder.await.expect("join")
+            };
+
+            let group = db.fetch_mls_group(&fixture.group.id).await.unwrap();
+            match outcome {
+                Ok(MlsCommitOutcome::Won) => {
+                    won_rounds += 1;
+                    assert!(
+                        round % 2 == 1,
+                        "round {round}: Add after the revocation WON"
+                    );
+                }
+                Err(error) if matches!(error.error_type, ErrorType::FailedValidation { .. }) => {
+                    refused_rounds += 1;
+                    assert!(!group.has_member(&bob2.user_id, &bob2.device_id));
+                }
+                other => panic!("round {round}: unexpected outcome {other:?}"),
+            }
+
+            assert!(
+                !group.has_member(&bob2.user_id, &bob2.device_id)
+                    || group.pending_device_removals.iter().any(|pending| {
+                        pending.user_id == bob2.user_id && pending.device_id == bob2.device_id
+                    }),
+                "round {round}: the revoked device is a member with no pending entry"
+            );
+        }
+
+        eprintln!("revocation vs Add: {won_rounds} Add-first, {refused_rounds} refused");
     });
 }

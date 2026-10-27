@@ -467,8 +467,8 @@ mod tests {
 
     use crate::{
         Channel, ChannelEntitlement, ChannelEntitlementSource, ChannelEntitlementState,
-        ChannelSeat, Database, Member, PartialMember, RemovalIntention, RemovalOutcome, Server,
-        User,
+        ChannelSeat, Database, Member, PartialMember, RemovalIntention, RemovalOutcome,
+        SeatReleaseCause, Server, User,
     };
 
     #[tokio::test]
@@ -704,6 +704,40 @@ mod tests {
         }
     }
 
+    /// Stamp the seat's `keys_received_at` in the store, as the Text commit
+    /// adding the user's first device does (2.3): a forced release of it
+    /// then cools 14 days instead of freeing it (S2-D21)
+    async fn mark_keys_received(db: &Database, channel_id: &str, user_id: &str) {
+        let id = ChannelSeat::composite_id(channel_id, user_id);
+        let now = Timestamp::now_utc();
+        match db {
+            Database::Reference(reference) => {
+                reference
+                    .channel_seats
+                    .lock()
+                    .await
+                    .get_mut(&id)
+                    .expect("a seat row")
+                    .keys_received_at = Some(now);
+            }
+            #[cfg(feature = "mongodb")]
+            Database::MongoDb(mongo) => {
+                let collection = mongo.col::<ChannelSeat>("channel_seats");
+                let mut seat = collection
+                    .find_one(bson::doc! { "_id": &id })
+                    .await
+                    .unwrap()
+                    .expect("a seat row");
+                seat.keys_received_at = Some(now);
+                let result = collection
+                    .replace_one(bson::doc! { "_id": &id }, &seat)
+                    .await
+                    .unwrap();
+                assert_eq!(result.matched_count, 1);
+            }
+        }
+    }
+
     /// The user's seat row in `channel_id`
     async fn seat_of(db: &Database, channel_id: &str, user_id: &str) -> ChannelSeat {
         db.fetch_channel_seats_for_user(user_id)
@@ -715,8 +749,9 @@ mod tests {
     }
 
     /// A kick releases the member's seat in that server's protected channels
-    /// (active to cooling) and leaves their seat in another server alone.
-    /// Mutation: both releases removed from `remove`.
+    /// (active to cooling: the member had received the keys) and leaves
+    /// their seat in another server alone. Mutation: both releases removed
+    /// from `remove`.
     #[tokio::test]
     async fn a_kick_releases_the_seat_in_that_server_only() {
         database_test!(|db| async move {
@@ -746,6 +781,7 @@ mod tests {
             entitle(&db, SEATED_ELSEWHERE, &other_server.id).await;
             seat_raw(&db, SEATED_HERE, &user.id).await;
             seat_raw(&db, SEATED_ELSEWHERE, &user.id).await;
+            mark_keys_received(&db, SEATED_HERE, &user.id).await;
 
             member
                 .remove(&db, &server, RemovalIntention::Kick, false)
@@ -768,6 +804,47 @@ mod tests {
             assert!(
                 db.fetch_member(&server.id, &user.id).await.is_err(),
                 "the member is removed"
+            );
+        });
+    }
+
+    /// 2.3 (S2-D21): a kick releases a seat whose user never received the
+    /// keys with `DeviceNeverJoined` and no cooldown, so the slot is free at
+    /// once
+    #[tokio::test]
+    async fn a_kick_frees_a_never_joined_seat_at_once() {
+        database_test!(|db| async move {
+            let owner = User::create(&db, "01MRN Owner".to_string(), None, None)
+                .await
+                .unwrap();
+            let user = User::create(&db, "01MRN Member".to_string(), None, None)
+                .await
+                .unwrap();
+            let server = Server::create(&db, new_server("01MRN S"), &owner, false)
+                .await
+                .unwrap()
+                .0;
+
+            let member = Member::create(&db, &server, &user, None).await.unwrap().0;
+            entitle(&db, SEATED_HERE, &server.id).await;
+            seat_raw(&db, SEATED_HERE, &user.id).await;
+
+            member
+                .remove(&db, &server, RemovalIntention::Kick, false)
+                .await
+                .unwrap();
+
+            let released = seat_of(&db, SEATED_HERE, &user.id).await;
+            assert!(!released.is_active(), "released: {released:?}");
+            assert_eq!(
+                released.release_cause,
+                Some(SeatReleaseCause::DeviceNeverJoined),
+                "{released:?}"
+            );
+            assert_eq!(released.cooldown_until, None, "{released:?}");
+            assert!(
+                !released.is_cooling(Timestamp::now_utc()),
+                "a never-joined seat must not cool: {released:?}"
             );
         });
     }

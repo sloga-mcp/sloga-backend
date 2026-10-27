@@ -221,7 +221,8 @@ mod tests {
     use revolt_config::ProtectedChannelFeatures;
     use revolt_database::{
         iso8601_timestamp::Timestamp, BotInformation, Channel, ChannelSeat, MemberCompositeKey,
-        PartialChannel, PartialMember, PartialUser, SeatListSnapshot, Session, User,
+        PartialChannel, PartialMember, PartialUser, SeatListSnapshot, SeatReleaseCause, Session,
+        User,
     };
     use revolt_models::v0;
     use revolt_permissions::{ChannelPermission, OverrideField};
@@ -332,7 +333,8 @@ mod tests {
     /// - `blind`: seated, lost ViewChannel through a role override;
     /// - `gone`: seated, no longer a server member (a failed second
     ///   release, 6.3);
-    /// - `leaver`: unseated by the v2 list, so cooling.
+    /// - `leaver`: had received the keys, unseated by the v2 list, so
+    ///   cooling.
     ///
     /// Viewers who are NOT the owner: `member`, a staff account (granted
     /// everything by the permission calculus) and a bot.
@@ -365,6 +367,9 @@ mod tests {
         let server_id = protected.server.id.clone();
         harness
             .new_text_group(&protected.channel, &protected.owner_device, 0, None)
+            .await;
+        harness
+            .mark_keys_received(protected.channel.id(), &leaver.id)
             .await;
         let v2 = protected.owner_device.seat_list(
             protected.channel.id(),
@@ -676,6 +681,32 @@ mod tests {
             );
             assert_eq!(response.seats_used, 2);
         }
+    }
+
+    /// 2.3 (S2-D21): a seat released before its user received the keys
+    /// (`DeviceNeverJoined`, no cooldown) is free: neither listed as
+    /// cooling nor counted
+    #[test]
+    fn a_never_joined_release_is_not_cooling() {
+        let now = at("2026-10-20T00:00:00.000Z");
+        let mut never_joined = seat("never_joined", Some("2026-10-19T00:00:00.000Z"), None);
+        never_joined.release_cause = Some(SeatReleaseCause::DeviceNeverJoined);
+        let response = project_seats(
+            SeatListSnapshot {
+                list: None,
+                text_group: None,
+            },
+            None,
+            vec![seat("active", None, None), never_joined],
+            None,
+            &ProtectedChannelFeatures::default(),
+            now,
+        )
+        .expect("projected");
+
+        assert!(response.cooling.is_empty(), "{:?}", response.cooling);
+        assert_eq!(response.seats.len(), 1);
+        assert_eq!(response.seats_used, 1);
     }
 
     /// Decision 5 (W2): the read keeps working with growth off, unchanged

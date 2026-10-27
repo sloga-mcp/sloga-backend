@@ -3244,8 +3244,10 @@ mod tests {
     }
 
     /// B48: when several rules admit one device the strongest is stamped,
-    /// `pending_removal` > `off_list` > `revoked` > `own_user` > `rejoin`.
-    /// Admission is unchanged: every one of these commits wins
+    /// in the design §6.1 S2 order `pending_removal` > `rejoin` >
+    /// `own_user` > `pending_device` > `revoked` > `idle` > `off_list`
+    /// (stamped by the driver inside the commit transaction). Admission is
+    /// unchanged: every one of these commits wins
     #[test]
     fn the_strongest_admitting_rule_is_stamped() {
         crate::util::test::rt().block_on(the_strongest_admitting_rule_is_stamped_case())
@@ -3265,6 +3267,15 @@ mod tests {
             session: committer.session.clone(),
             device_id: own_other.device_id,
         };
+        let own_rejoining = setup
+            .harness
+            .new_e2ee_device(&committer.user, &Ulid::new().to_string(), 0x63)
+            .await;
+        let own_rejoining = Party {
+            user: committer.user.clone(),
+            session: committer.session.clone(),
+            device_id: own_rejoining.device_id,
+        };
         let pending_revoked = &setup.members[1];
         let pending_off_list = &setup.members[2];
         let off_list_revoked = &setup.members[3];
@@ -3275,6 +3286,7 @@ mod tests {
                 vec![
                     committer.device(),
                     own_other.device(),
+                    own_rejoining.device(),
                     pending_revoked.device(),
                     pending_off_list.device(),
                     off_list_revoked.device(),
@@ -3282,10 +3294,10 @@ mod tests {
                 vec![],
             )
             .await,
-            "five Adds",
+            "six Adds",
         );
 
-        // revoked + own_user: the committer's own revoked device
+        // own_user + revoked: the committer's own revoked device
         assert!(db
             .delete_e2ee_device(&committer.user.id, &own_other.device_id)
             .await
@@ -3295,8 +3307,37 @@ mod tests {
             committer,
             owner,
             &own_other,
-            MlsRemovalReason::Revoked,
-            "revoked over own_user",
+            MlsRemovalReason::OwnUser,
+            "own_user over revoked",
+        )
+        .await;
+
+        // rejoin + own_user: the committer's own live device on its fresh
+        // intent (the S2 order puts rejoin above own_user)
+        db.upsert_mls_join_intent(&MlsJoinIntent {
+            id: MlsJoinIntent::composite_id(
+                &setup.group_id,
+                &own_rejoining.user.id,
+                &own_rejoining.device_id,
+            ),
+            group_id: setup.group_id.clone(),
+            user_id: own_rejoining.user.id.clone(),
+            device_id: own_rejoining.device_id.clone(),
+            key_package_ref: "own-rejoin-key-package".to_string(),
+            signature: "own-rejoin-signature".to_string(),
+            created_at: Timestamp::now_utc(),
+            generation: None,
+            issued_at: None,
+        })
+        .await
+        .expect("the rejoin intent");
+        assert_removal_stamped(
+            &setup,
+            committer,
+            owner,
+            &own_rejoining,
+            MlsRemovalReason::Rejoin,
+            "rejoin over own_user",
         )
         .await;
 
@@ -3344,7 +3385,7 @@ mod tests {
         )
         .await;
 
-        // off_list + revoked, by the signer's device, no pending entry
+        // revoked + off_list, by the signer's device, no pending entry
         setup
             .harness
             .put_seats_with_db(
@@ -3367,8 +3408,8 @@ mod tests {
             owner,
             committer,
             off_list_revoked,
-            MlsRemovalReason::OffList,
-            "off_list over revoked",
+            MlsRemovalReason::Revoked,
+            "revoked over off_list",
         )
         .await;
     }

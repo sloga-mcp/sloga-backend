@@ -2267,7 +2267,8 @@ mod tests {
 
         use crate::{
             Channel, ChannelEntitlement, ChannelEntitlementSource, ChannelEntitlementState,
-            Database, Member, MemberCompositeKey, SeatListBody, SeatListSubmission, Server, User,
+            ChannelSeat, Database, Member, MemberCompositeKey, SeatListBody, SeatListSubmission,
+            Server, User,
         };
 
         pub const CHANNEL: &str = "01J9Z3K4M5N6P7Q8R9S0T1V2W3";
@@ -2386,6 +2387,40 @@ mod tests {
 
             user
         }
+
+        /// Stamp `SEATED`'s `keys_received_at` in the store, as the Text
+        /// commit adding the user's first device does (2.3): a forced
+        /// release of the seat then cools 14 days instead of freeing it
+        /// (S2-D21)
+        pub async fn mark_keys_received(db: &Database) {
+            let id = ChannelSeat::composite_id(CHANNEL, SEATED);
+            match db {
+                Database::Reference(reference) => {
+                    reference
+                        .channel_seats
+                        .lock()
+                        .await
+                        .get_mut(&id)
+                        .expect("a seat row")
+                        .keys_received_at = Some(at_base());
+                }
+                #[cfg(feature = "mongodb")]
+                Database::MongoDb(mongo) => {
+                    let collection = mongo.col::<ChannelSeat>("channel_seats");
+                    let mut seat = collection
+                        .find_one(bson::doc! { "_id": &id })
+                        .await
+                        .unwrap()
+                        .expect("a seat row");
+                    seat.keys_received_at = Some(at_base());
+                    let result = collection
+                        .replace_one(bson::doc! { "_id": &id }, &seat)
+                        .await
+                        .unwrap();
+                    assert_eq!(result.matched_count, 1);
+                }
+            }
+        }
     }
 
     #[tokio::test]
@@ -2394,6 +2429,7 @@ mod tests {
 
         database_test!(|db| async move {
             let mut user = protected::seated_user(&db).await;
+            protected::mark_keys_received(&db).await;
 
             user.delete(&db).await.unwrap();
 
@@ -2413,6 +2449,36 @@ mod tests {
 
             assert!(db.fetch_all_memberships(SEATED).await.unwrap().is_empty());
             assert!(db.fetch_member(SERVER, OWNER).await.is_ok());
+        });
+    }
+
+    /// 2.3 (S2-D21): deleting an account whose seat never received the keys
+    /// releases it with `DeviceNeverJoined` and no cooldown
+    #[tokio::test]
+    async fn delete_frees_a_never_joined_seat_at_once() {
+        use protected::{CHANNEL, OWNER, SEATED};
+
+        database_test!(|db| async move {
+            let mut user = protected::seated_user(&db).await;
+
+            user.delete(&db).await.unwrap();
+
+            let seats = db.fetch_channel_seats(CHANNEL).await.unwrap();
+            let seat = |user_id: &str| {
+                seats
+                    .iter()
+                    .find(|seat| seat.user_id == user_id)
+                    .expect("seat rows are kept")
+            };
+            assert!(!seat(SEATED).is_active(), "{:?}", seat(SEATED));
+            assert_eq!(
+                seat(SEATED).release_cause,
+                Some(crate::SeatReleaseCause::DeviceNeverJoined),
+                "{:?}",
+                seat(SEATED)
+            );
+            assert_eq!(seat(SEATED).cooldown_until, None, "{:?}", seat(SEATED));
+            assert!(seat(OWNER).is_active(), "another user's seat was released");
         });
     }
 

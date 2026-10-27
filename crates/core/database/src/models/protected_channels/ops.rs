@@ -3,7 +3,7 @@ use revolt_result::Result;
 
 use crate::{
     ChannelEntitlement, ChannelSeat, MlsGroup, MlsGroupCreateOutcome, SeatList, SeatListSnapshot,
-    SeatListSubmission, SeatListWriteOutcome,
+    SeatListSubmission, SeatListWriteOutcome, SeatReleaseCause,
 };
 
 #[cfg(feature = "mongodb")]
@@ -129,6 +129,14 @@ pub trait AbstractProtectedChannels: Sync + Send {
     /// claimed or reactivated user must be a member of the entitlement's
     /// server (its membership is claimed, else `FailedValidation`;
     /// decision 13 (W2)).
+    ///
+    /// S2: `formats_v2` is read from the config. While the open Text group
+    /// carries `signer_lost`, a list that does not resolve it (4.3 step 7)
+    /// is `ProtectedChannelResecuring { reason: "owner_device_lost" }` and
+    /// writes nothing; one that does clears it in the same transaction.
+    /// Every write also drops the open group's `pending_device_removals`
+    /// entries whose device holds no leaf (2.5 "Clearing"), and every seat
+    /// it releases gets `OwnerUnseat` (or `DeviceNeverJoined`, 2.3).
     async fn put_seat_list(
         &self,
         channel_id: &str,
@@ -150,6 +158,10 @@ pub trait AbstractProtectedChannels: Sync + Send {
     /// `Conflict` with the open Text group. A Call squat at the derived id
     /// (M9) is evicted in the same unit with its commits, join intents and
     /// queued E2EE envelopes (`group_id` = that id; A6, W2 audit).
+    ///
+    /// S2 (#213): the new group starts with both pending lists empty and
+    /// no `rejoin_readd`; a successor COPIES the superseded group's
+    /// `signer_lost`, so only the 4.3 step-7 list write ever clears it.
     async fn create_text_mls_group(
         &self,
         group: &MlsGroup,
@@ -163,6 +175,12 @@ pub trait AbstractProtectedChannels: Sync + Send {
     /// entitlement's `server_id`); `None` covers every channel. Idempotent.
     /// Returns the affected channel ids (sorted).
     ///
+    /// S2: each release writes `release_cause = ServerRemoval` and the 14-day
+    /// cooldown, or `DeviceNeverJoined` and no cooldown when the user never
+    /// received the keys (2.3, `ChannelSeat::release`). Where the user signed
+    /// the channel's stored list, the open group gets `signer_lost` instead
+    /// of a pending removal (S2-D15, `plan_release_group_effect`).
+    ///
     /// The release never decodes a whole seat or group document (C9, W2
     /// audit): Mongo reads only `channel_id` through a projection and
     /// writes with `update_many` on the same filter, so a row carrying a
@@ -175,6 +193,62 @@ pub trait AbstractProtectedChannels: Sync + Send {
         user_id: &str,
         server_id: Option<&str>,
         now: Timestamp,
+    ) -> Result<Vec<String>>;
+
+    /// The reconciler's per-channel compare-and-set release (6.3
+    /// "Reconciler"), in one transaction: the seat `{channel_id}:{user_id}`
+    /// is released only while it is active AND its `seated_at` equals
+    /// `expected_seated_at` (so a stale reconcile never undoes an owner
+    /// re-seat); otherwise `false` and nothing is written. The release
+    /// writes `cause` and the cooldown, or `DeviceNeverJoined` and no
+    /// cooldown when the user never received the keys (2.3). A user with a
+    /// member device in the open Text group gets one pending removal (none
+    /// if one is pending).
+    ///
+    /// Called on the user who signed the stored list (the reconciler never
+    /// does that, #222, but the primitive must not wedge): the seat is
+    /// released and the open group gets `signer_lost` naming the list's
+    /// signer device instead of an entry (S2-D15). Sends pause on it and the
+    /// 4.3 step-7 recovery list (another owner device, an authority omitting
+    /// that device) clears it and, naming the signer, reactivates the seat
+    /// (a cooling seat takes no new slot); a pending entry for the signer
+    /// would instead block every Add for good.
+    ///
+    /// Mongo claims the open Text group first; Reference takes
+    /// `channel_seat_lists -> channel_seats -> mls_groups` (a suffix of the
+    /// 2.5 (d) order). `true` when the seat was released.
+    async fn release_channel_seat(
+        &self,
+        channel_id: &str,
+        user_id: &str,
+        expected_seated_at: Timestamp,
+        cause: SeatReleaseCause,
+        now: Timestamp,
+    ) -> Result<bool>;
+
+    /// The pending pass of a device revocation (6.3 "Device revocation",
+    /// S2-D17a), in one transaction: every OPEN Text group holding the
+    /// device gets one `pending_device_removals` entry (idempotent), except
+    /// on a channel whose stored list that device signed, where the open
+    /// group gets `signer_lost { cause: DeviceRevoked }` instead (if not
+    /// set; whether or not the device still holds a leaf), never an entry
+    /// (S2-D15). The signer is read inside the same claimed transaction
+    /// (#222). Returns the channel ids whose group this call wrote (sorted;
+    /// empty on a repeat). Not gated on `formats_v2`: the caller is.
+    async fn add_pending_device_removal(
+        &self,
+        user_id: &str,
+        device_id: &str,
+        now: Timestamp,
+    ) -> Result<Vec<String>>;
+
+    /// One page of the channel ids holding at least one ACTIVE seat, sorted
+    /// ascending, strictly after `after`, at most `limit` (`limit <= 0`:
+    /// empty). The protected-access sweep pages it (6.3, S2-D14).
+    async fn fetch_channels_with_active_seats(
+        &self,
+        after: Option<String>,
+        limit: i64,
     ) -> Result<Vec<String>>;
 
     /// Delete cascade (7.5): remove the channel's entitlement, seats and

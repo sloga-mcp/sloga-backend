@@ -85,7 +85,8 @@ mod test {
 
     use revolt_database::{
         events::client::EventV1, BotInformation, Channel, MemberCompositeKey, PartialChannel,
-        PartialMember, PartialUser, RemovalIntention, SeatList, Server, Session, User,
+        PartialMember, PartialUser, RemovalIntention, SeatList, SeatReleaseCause, Server, Session,
+        User,
     };
     use revolt_models::v0;
     use revolt_permissions::{ChannelPermission, OverrideField};
@@ -435,6 +436,11 @@ mod test {
         )
         .await;
         assert_ok(&first, "first PUT");
+        // The member had received the keys, so the leave cools the seat
+        world
+            .harness
+            .mark_keys_received(world.channel.id(), &world.member.id)
+            .await;
 
         let member = db
             .fetch_member(&world.server.id, &world.member.id)
@@ -500,7 +506,8 @@ mod test {
     }
 
     /// Decision 5 (W2): with the growth flag off a list that only removes
-    /// seats is applied; the removed seat starts cooling
+    /// seats is applied; the removed seat (its user had received the keys)
+    /// starts cooling
     #[test]
     fn a_removal_only_put_with_growth_off_lands() {
         crate::util::test::rt().block_on(Box::pin(async {
@@ -515,6 +522,10 @@ mod test {
     async fn a_removal_only_put_with_growth_off_lands_case() {
         let world = Box::pin(world()).await;
         let next = world.list(2, &[&world.owner.id, &world.member.id]);
+        world
+            .harness
+            .mark_keys_received(world.channel.id(), &world.blind.id)
+            .await;
 
         let answer = put(
             &world.harness,
@@ -530,6 +541,49 @@ mod test {
         assert_eq!(value["seats_used"], 3, "{}", answer.1);
         assert_eq!(world.stored().await.version, 2);
         assert!(!world.is_seated(&world.blind).await);
+    }
+
+    /// 2.3 (S2-D21): the owner unseating a user who never received the keys
+    /// frees the slot at once: released as `DeviceNeverJoined` with no
+    /// cooldown, so not listed as cooling and not counted
+    #[test]
+    fn unseating_a_never_joined_user_frees_the_slot_at_once() {
+        crate::util::test::rt().block_on(Box::pin(
+            unseating_a_never_joined_user_frees_the_slot_at_once_case(),
+        ))
+    }
+
+    async fn unseating_a_never_joined_user_frees_the_slot_at_once_case() {
+        let world = Box::pin(world()).await;
+        let next = world.list(2, &[&world.owner.id, &world.member.id]);
+
+        let answer = put(
+            &world.harness,
+            &world.owner_session,
+            world.channel.id(),
+            &next,
+        )
+        .await;
+        let value = assert_ok(&answer, "removal of a never-joined user");
+        assert_eq!(value["list"]["version"], 2, "{}", answer.1);
+        assert!(cooling_of(&value).is_empty(), "{}", answer.1);
+        assert_eq!(value["seats_used"], 2, "{}", answer.1);
+        let seat = world
+            .harness
+            .db
+            .fetch_channel_seats(world.channel.id())
+            .await
+            .expect("read")
+            .into_iter()
+            .find(|seat| seat.user_id == world.blind.id)
+            .expect("the seat row is kept");
+        assert!(!seat.is_active(), "{seat:?}");
+        assert_eq!(
+            seat.release_cause,
+            Some(SeatReleaseCause::DeviceNeverJoined),
+            "{seat:?}"
+        );
+        assert_eq!(seat.cooldown_until, None, "{seat:?}");
     }
 
     /// Decision 5 (W2): with the growth flag off a list that claims a seat

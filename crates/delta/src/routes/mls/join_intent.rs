@@ -474,12 +474,13 @@ mod tests {
         }
     }
 
-    /// A device id of `user` that is in no directory (a leaf only)
-    fn synthetic_device(user: &User, index: u32) -> MlsMemberDevice {
-        MlsMemberDevice {
-            user_id: user.id.clone(),
-            device_id: format!("{:032x}", 0xd0_0000 + index),
-        }
+    /// A leaf of a device of `user` registered with the key for `seed` and
+    /// bound to no session: an Add requires a registered identity (S2-D17c)
+    async fn registered_leaf(harness: &TestHarness, user: &User, seed: u8) -> MlsMemberDevice {
+        let device = harness
+            .new_e2ee_device(user, &Ulid::new().to_string(), seed)
+            .await;
+        leaf(&device)
     }
 
     /// A fresh session of `account`, with a new device bound to it
@@ -858,13 +859,11 @@ mod tests {
         assert_eq!(FIXTURE_DEVICE_CAP, 5);
 
         // The owner holds 4 member devices: a fifth is accepted
-        let group = add_to_group(
-            harness,
-            &group_id,
-            owner_device,
-            (1..=3).map(|i| synthetic_device(&text.owner, i)).collect(),
-        )
-        .await;
+        let mut owner_leaves = Vec::new();
+        for seed in 0x01..=0x03 {
+            owner_leaves.push(registered_leaf(harness, &text.owner, seed).await);
+        }
+        let group = add_to_group(harness, &group_id, owner_device, owner_leaves).await;
         assert_eq!(group.member_devices_of(&text.owner.id).count(), 4);
         let (fifth_session, fifth) =
             new_bound_device(harness, &text.owner_account, &text.owner, 0x05).await;
@@ -918,7 +917,10 @@ mod tests {
             harness,
             &group_id,
             owner_device,
-            vec![leaf(&text.member_device), synthetic_device(&text.member, 1)],
+            vec![
+                leaf(&text.member_device),
+                registered_leaf(harness, &text.member, 0x21).await,
+            ],
         )
         .await;
         assert_eq!(group.member_devices_of(&text.member.id).count(), 2);

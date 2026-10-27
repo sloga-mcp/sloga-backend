@@ -223,7 +223,8 @@ pub(crate) mod test {
             UserVoiceChannel,
         },
         AuditLogAction, AuditLogChange, AuditLogEntry, AuditValue, Channel, ChannelSeat, Database,
-        Member, Message, MlsGroup, MlsGroupKind, MlsMemberDevice, MongoDb, PartialMember, Server,
+        Member, Message, MlsGroup, MlsGroupKind, MlsMemberDevice, MongoDb, PartialMember,
+        SeatReleaseCause, Server,
     };
     use revolt_models::v0;
     use revolt_permissions::{ChannelPermission, OverrideField};
@@ -1334,8 +1335,9 @@ pub(crate) mod test {
             .block_on(a_ban_releases_the_targets_seats_in_that_server_only_case())
     }
 
-    /// A seated member is banned: their seat in the server's protected
-    /// channel is released and cooling. Their seat in another server's
+    /// A seated member who had received the keys is banned: their seat in
+    /// the server's protected channel is released and cooling. Their seat
+    /// in another server's
     /// protected channel, and the owner's seat, stay active. Mutations: every
     /// release dropped (the ban's and `Member::remove`'s); the release
     /// unscoped (`None`).
@@ -1349,6 +1351,9 @@ pub(crate) mod test {
         let (_elsewhere, elsewhere) = harness.new_protectable_channel(&owner).await;
         harness.grant_entitlement(&elsewhere, 10, None).await;
         seat_raw(&harness.db, elsewhere.id(), &target.id).await;
+        harness
+            .mark_keys_received(protected.channel.id(), &target.id)
+            .await;
         assert!(
             seat_of(&harness.db, protected.channel.id(), &target.id)
                 .await
@@ -1391,8 +1396,9 @@ pub(crate) mod test {
     }
 
     /// A former member still seated (the membership gone, the seat left
-    /// behind, as by a removal whose second release failed) is banned: the
-    /// ban releases the seat with no member to remove, and records the ban.
+    /// behind, as by a removal whose second release failed; the keys
+    /// received) is banned: the ban releases the seat with no member to
+    /// remove, and records the ban.
     /// Mutations: the ban's release dropped; the release moved inside the
     /// member check.
     async fn a_ban_releases_a_former_members_seat_case() {
@@ -1426,6 +1432,9 @@ pub(crate) mod test {
                 .is_active(),
             "precondition: the former member is still seated"
         );
+        harness
+            .mark_keys_received(protected.channel.id(), &target.id)
+            .await;
 
         let response = ban_user(
             &harness,
@@ -1465,6 +1474,10 @@ pub(crate) mod test {
             .new_protected_channel(&owner, &session_a, &[&target])
             .await;
         let server_id = protected.server.id.clone();
+        // The target had received the keys, in both channels below
+        harness
+            .mark_keys_received(protected.channel.id(), &target.id)
+            .await;
 
         let response = ban_user(&harness, &session_a.token, &server_id, &target.id, "first").await;
         ban_answered(response, "the first ban").await;
@@ -1479,6 +1492,7 @@ pub(crate) mod test {
         let later = harness.new_channel(&server).await;
         harness.grant_entitlement(&later, 10, None).await;
         seat_raw(&harness.db, later.id(), &target.id).await;
+        harness.mark_keys_received(later.id(), &target.id).await;
 
         let response = ban_user(&harness, &session_a.token, &server_id, &target.id, "second").await;
         let ban = ban_answered(response, "banning an already banned user").await;
@@ -1493,6 +1507,47 @@ pub(crate) mod test {
             entries.len(),
             1,
             "an already-banned retry must write no second audit entry: {entries:?}"
+        );
+    }
+
+    // Compile-only without RabbitMQ and Redis: see the section note above.
+    #[test]
+    fn a_ban_frees_a_never_joined_seat_at_once() {
+        crate::util::test::rt().block_on(a_ban_frees_a_never_joined_seat_at_once_case())
+    }
+
+    /// 2.3 (S2-D21): banning a seated member who never received the keys
+    /// releases the seat as `DeviceNeverJoined` with no cooldown, so the
+    /// slot is free at once
+    async fn a_ban_frees_a_never_joined_seat_at_once_case() {
+        let harness = TestHarness::new().await;
+        let (_a, session_a, owner) = harness.new_user().await;
+        let (_b, _session_b, target) = harness.new_user().await;
+        let protected = harness
+            .new_protected_channel(&owner, &session_a, &[&target])
+            .await;
+
+        let response = ban_user(
+            &harness,
+            &session_a.token,
+            &protected.server.id,
+            &target.id,
+            "never joined",
+        )
+        .await;
+        ban_answered(response, "banning a never-joined member").await;
+
+        let seat = seat_of(&harness.db, protected.channel.id(), &target.id).await;
+        assert!(!seat.is_active(), "released: {seat:?}");
+        assert_eq!(
+            seat.release_cause,
+            Some(SeatReleaseCause::DeviceNeverJoined),
+            "{seat:?}"
+        );
+        assert_eq!(seat.cooldown_until, None, "{seat:?}");
+        assert!(
+            !seat.is_cooling(Timestamp::now_utc()),
+            "a never-joined seat must not cool: {seat:?}"
         );
     }
 

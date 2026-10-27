@@ -27,11 +27,27 @@ pub const MAX_MLS_GROUP_MEMBERS: usize = 100;
 /// as [`MAX_MLS_GROUP_MEMBERS`]; raising it is S10.
 pub const MAX_MLS_TEXT_GROUP_MEMBERS: usize = 100;
 
-/// How old a stored rejoin intent may be and still justify a rule-6
-/// (rejoin) Remove inside the Text commit transaction (design §3.12.2).
-/// Mirrors the route constant `REJOIN_OUTSTANDING_WINDOW_SECONDS` in
-/// `delta/src/routes/mls/mod.rs`; the two must stay equal.
+/// The Call rejoin window (design §3.12.2): how old a stored Call rejoin
+/// intent may be. Mirrors the route constant
+/// `REJOIN_OUTSTANDING_WINDOW_SECONDS` in `delta/src/routes/mls/mod.rs`;
+/// the two must stay equal. Also the floor of the Text window
+/// ([`mls_text_rejoin_window_seconds`]).
 pub const MLS_REJOIN_OUTSTANDING_WINDOW_SECONDS: i64 = 30;
+
+/// The default Text rejoin window (design §6.1 "S2 additions", S2-D28):
+/// a Text join or rejoin intent stays outstanding 24 h, in the route and
+/// in the Text commit transaction's rule 6. The configured value is
+/// `features.protected_channels.text_rejoin_window_secs`, whose default
+/// must equal this.
+pub const TEXT_REJOIN_OUTSTANDING_WINDOW_SECONDS: i64 = 86400;
+
+/// The Text rule-6 window for a configured `text_rejoin_window_secs`,
+/// clamped to at least the Call window (30 s)
+pub fn mls_text_rejoin_window_seconds(configured: u64) -> i64 {
+    i64::try_from(configured)
+        .unwrap_or(i64::MAX)
+        .max(MLS_REJOIN_OUTSTANDING_WINDOW_SECONDS)
+}
 
 /// Enforced per-user device cap for a Text group (design §2.5, W0-fix3):
 /// `min(signed-list device_cap, effective entitlement cap)` where `0` means
@@ -256,7 +272,8 @@ auto_derived!(
 
 auto_derived!(
     /// Which Remove rule (design §3.12.2) admitted a removed device of a
-    /// Text commit, as the route found it. Stored and served snake_case.
+    /// Text commit, as the commit transaction found it. Stored and served
+    /// snake_case.
     /// ADVISORY ONLY: it never changes admission, and receivers decide from
     /// signed material (the server is untrusted)
     #[derive(Copy, Hash)]
@@ -284,11 +301,27 @@ auto_derived!(
     }
 );
 
+/// Rank of a Remove rule for the advisory `removed_reasons` (design §6.1
+/// "S2 additions", RR#S2-4): the highest-ranked admitting rule is stamped,
+/// `pending_removal` > `rejoin` > `own_user` > `pending_device` >
+/// `revoked` > `idle` > `off_list`. `Unknown` is decode-only and never wins.
+pub fn removal_reason_rank(reason: MlsRemovalReason) -> u8 {
+    match reason {
+        MlsRemovalReason::PendingRemoval => 7,
+        MlsRemovalReason::Rejoin => 6,
+        MlsRemovalReason::OwnUser => 5,
+        MlsRemovalReason::PendingDevice => 4,
+        MlsRemovalReason::Revoked => 3,
+        MlsRemovalReason::Idle => 2,
+        MlsRemovalReason::OffList => 1,
+        MlsRemovalReason::Unknown => 0,
+    }
+}
+
 auto_derived!(
     /// The advisory reason for one device a Text commit removed: the
-    /// STRONGEST rule that admitted it (S1 order: `pending_removal` >
-    /// `off_list` > `revoked` > `own_user` > `rejoin`; design §6.1 gives
-    /// the S2 order, adopted by the submit route in W2)
+    /// highest-ranked rule that admitted it ([`removal_reason_rank`]),
+    /// stamped inside the Text commit transaction from its own reads
     pub struct MlsRemovedReason {
         /// Removed user
         pub user_id: String,
@@ -358,8 +391,9 @@ auto_derived!(
         /// filters its group update on it (design §3.12.2).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub seat_list_ad_sha256: Option<String>,
-        /// Text only: users whose devices must be removed. Add commits are
-        /// refused while non-empty; an entry is cleared by the commit that
+        /// Text only: users whose devices must be removed. An Add commit
+        /// must remove every member device of every entry (S2
+        /// Add-clears-pending); an entry is cleared by the commit that
         /// leaves the user with no member device.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         pub pending_removals: Vec<MlsPendingRemoval>,
@@ -455,8 +489,9 @@ auto_derived!(
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         pub rejoin_intents: Vec<MlsJoinIntent>,
         /// Text only: one advisory reason per removed device, stamped by
-        /// the submit route (B48). Never read for admission; always empty
-        /// on Call commits, so a Call row keeps its earlier shape, and a row
+        /// the Text commit transaction (B48; S2 replaces the route-time
+        /// view, #222). Never read for admission; always empty on Call
+        /// commits, so a Call row keeps its earlier shape, and a row
         /// written before the field existed reads as empty.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         pub removed_reasons: Vec<MlsRemovedReason>,
@@ -797,6 +832,55 @@ mod s2_shape_tests {
             serde_json::from_value::<MlsSignerLostCause>(serde_json::json!("device_revoked"))
                 .unwrap(),
             MlsSignerLostCause::DeviceRevoked
+        );
+    }
+}
+
+#[cfg(test)]
+mod s2_rule_tests {
+    use super::{
+        mls_text_rejoin_window_seconds, removal_reason_rank, MlsRemovalReason,
+        MLS_REJOIN_OUTSTANDING_WINDOW_SECONDS, TEXT_REJOIN_OUTSTANDING_WINDOW_SECONDS,
+    };
+
+    /// Design §6.1 (RR#S2-4): `pending_removal` > `rejoin` > `own_user` >
+    /// `pending_device` > `revoked` > `idle` > `off_list`, and `Unknown`
+    /// below all of them
+    #[test]
+    fn removal_reason_rank_is_the_s2_order() {
+        let order = [
+            MlsRemovalReason::PendingRemoval,
+            MlsRemovalReason::Rejoin,
+            MlsRemovalReason::OwnUser,
+            MlsRemovalReason::PendingDevice,
+            MlsRemovalReason::Revoked,
+            MlsRemovalReason::Idle,
+            MlsRemovalReason::OffList,
+            MlsRemovalReason::Unknown,
+        ];
+        for pair in order.windows(2) {
+            assert!(
+                removal_reason_rank(pair[0]) > removal_reason_rank(pair[1]),
+                "{:?} must outrank {:?}",
+                pair[0],
+                pair[1]
+            );
+        }
+    }
+
+    /// The Text window is the configured value, never below the Call
+    /// window, and its default is the config default
+    #[test]
+    fn text_rejoin_window_is_clamped_to_the_call_window() {
+        assert_eq!(mls_text_rejoin_window_seconds(0), 30);
+        assert_eq!(mls_text_rejoin_window_seconds(29), 30);
+        assert_eq!(mls_text_rejoin_window_seconds(31), 31);
+        assert_eq!(mls_text_rejoin_window_seconds(86400), 86400);
+        assert_eq!(mls_text_rejoin_window_seconds(u64::MAX), i64::MAX);
+        assert_eq!(MLS_REJOIN_OUTSTANDING_WINDOW_SECONDS, 30);
+        assert_eq!(
+            revolt_config::ProtectedChannelFeatures::default().text_rejoin_window_secs,
+            TEXT_REJOIN_OUTSTANDING_WINDOW_SECONDS as u64
         );
     }
 }

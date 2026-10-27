@@ -36,10 +36,11 @@ use serde::de::DeserializeOwned;
 use crate::{
     channel_seats_used, check_channel_protectable, check_text_first_generation,
     check_text_successor, is_genesis_reprotect, plan_seat_list_write, prepare_text_group,
-    seat_cooldown_until, seat_list_channel_server, Channel, ChannelEntitlement, ChannelSeat,
-    MlsGroup, MlsGroupCreateOutcome, MongoDb, SeatList, SeatListBody, SeatListSnapshot,
-    SeatListSubmission, SeatListWriteDecision, SeatListWriteInput, SeatListWriteKind,
-    SeatListWriteOutcome, MAX_CHANNEL_SLOT_CAP,
+    report_signer_lost, seat_list_channel_server, seat_release_terms, Channel, ChannelEntitlement,
+    ChannelSeat, MlsGroup, MlsGroupCreateOutcome, MlsPendingDeviceRemoval, MlsSignerLost,
+    MlsSignerLostCause, MongoDb, SeatList, SeatListBody, SeatListSnapshot, SeatListSubmission,
+    SeatListWriteDecision, SeatListWriteInput, SeatListWriteKind, SeatListWriteOutcome,
+    SeatReleaseCause, MAX_CHANNEL_SLOT_CAP,
 };
 
 use super::reference::{is_derived_text_group_id, log_call_squat_evicted};
@@ -187,6 +188,39 @@ fn timestamp_bson(at: &Timestamp) -> Bson {
             .whole_milliseconds() as i64,
     )
 }
+
+/// A hand-built `pending_device_removals` entry
+fn pending_device_bson(pending: &MlsPendingDeviceRemoval) -> Document {
+    doc! {
+        "user_id": &pending.user_id,
+        "device_id": &pending.device_id,
+        "created_at": timestamp_bson(&pending.created_at)
+    }
+}
+
+/// A serde enum (`SeatReleaseCause`, `MlsSignerLostCause`) as its stored
+/// snake_case string
+fn enum_bson<T: serde::Serialize>(value: &T) -> Attempt<Bson> {
+    bson::to_bson(value).map_err(|_| TxnFail::Refuse(create_error!(InternalError)))
+}
+
+/// A hand-built `signer_lost`
+fn signer_lost_bson(lost: &MlsSignerLost) -> Attempt<Document> {
+    Ok(doc! {
+        "user_id": &lost.user_id,
+        "device_id": &lost.device_id,
+        "cause": enum_bson(&lost.cause)?,
+        "at": timestamp_bson(&lost.at)
+    })
+}
+
+/// Whether a projected row carries a non-null `field`
+fn has_value(row: &Document, field: &str) -> bool {
+    !matches!(row.get(field), None | Some(Bson::Null))
+}
+
+/// The `signer_lost` values a transaction set, reported once it commits
+type LostSigners = Vec<(String, MlsSignerLost)>;
 
 /// Back off before retrying a whole transaction. A write conflict fails
 /// fast while the winning transaction is still open, so an immediate retry
@@ -576,6 +610,29 @@ impl MongoDb {
                     .collect();
                 update.insert("$push", doc! { "pending_removals": { "$each": entries } });
             }
+            // 2.5 "Clearing" and the step-7 resolution: the claimed group's
+            // whole new list (an empty list is unset, as typed writes omit
+            // it) and `signer_lost`
+            let mut unset = Document::new();
+            match &plan.pending_device_removals {
+                Some(pending) if pending.is_empty() => {
+                    unset.insert("pending_device_removals", "");
+                }
+                Some(pending) => {
+                    let entries: Vec<Document> = pending.iter().map(pending_device_bson).collect();
+                    update
+                        .get_document_mut("$set")
+                        .map_err(|_| TxnFail::Refuse(create_error!(InternalError)))?
+                        .insert("pending_device_removals", entries);
+                }
+                None => {}
+            }
+            if plan.clear_signer_lost {
+                unset.insert("signer_lost", "");
+            }
+            if !unset.is_empty() {
+                update.insert("$unset", unset);
+            }
 
             let result = self
                 .col::<Document>(COL_GROUPS)
@@ -663,6 +720,7 @@ impl MongoDb {
         channel_id: &str,
         submission: &SeatListSubmission,
         allow_claims: bool,
+        formats_v2: bool,
         now: Timestamp,
     ) -> Attempt<SeatListWriteOutcome> {
         // N3 is decided before anything is written (claim order below)
@@ -749,6 +807,7 @@ impl MongoDb {
         )
         .await?;
         let text_group = self.find_open_text_group(session, channel_id).await?;
+        let text_group_users = self.text_group_user_ids(session, channel_id).await?;
 
         let decision = plan_seat_list_write(&SeatListWriteInput {
             kind,
@@ -759,8 +818,8 @@ impl MongoDb {
             seats: &seats,
             text_group: text_group.as_ref(),
             allow_claims,
-            // W1-2 wires formats_v2 from config
-            formats_v2: false,
+            formats_v2,
+            text_group_users: &text_group_users,
             now,
         })?;
 
@@ -905,6 +964,8 @@ impl MongoDb {
             .find_open_text_group(session, &group.channel_id)
             .await?;
 
+        // #213: a successor carries the superseded group's `signer_lost`
+        let mut carried_signer_lost = None;
         match supersedes {
             Some(superseded_id) => {
                 let superseded: MlsGroup = self
@@ -915,6 +976,7 @@ impl MongoDb {
                     .map_err(db_err("find_one", COL_GROUPS))?
                     .ok_or_else(|| TxnFail::Refuse(create_error!(NotFound)))?;
                 check_text_successor(&superseded, group)?;
+                carried_signer_lost = superseded.signer_lost;
                 if let Some(open) = open.filter(|open| open.id != superseded_id) {
                     return Ok((
                         MlsGroupCreateOutcome::Conflict {
@@ -939,7 +1001,8 @@ impl MongoDb {
             }
         }
 
-        let prepared = prepare_text_group(group, &list)?;
+        let mut prepared = prepare_text_group(group, &list)?;
+        prepared.signer_lost = carried_signer_lost;
 
         // The group binds this list's AD hash, so the create must serialize
         // with every seat-list write (2.5 (c)): write the list row, filtered
@@ -1059,15 +1122,150 @@ impl MongoDb {
         Ok(channel_ids)
     }
 
+    /// `text_group_user_ids` of `channel_id` (the 2.3 no-cooldown
+    /// fallback), read through `distinct` so no group is decoded
+    async fn text_group_user_ids(
+        &self,
+        session: &mut ClientSession,
+        channel_id: &str,
+    ) -> Attempt<BTreeSet<String>> {
+        let mut users = BTreeSet::new();
+        for field in ["members.user_id", "member_added.user_id"] {
+            let values = self
+                .col::<Document>(COL_GROUPS)
+                .distinct(field, doc! { "channel_id": channel_id, "kind": KIND_TEXT })
+                .session(&mut *session)
+                .await
+                .map_err(db_err("distinct", COL_GROUPS))?;
+            users.extend(
+                values
+                    .into_iter()
+                    .filter_map(|value| value.as_str().map(str::to_string)),
+            );
+        }
+        Ok(users)
+    }
+
+    /// Of `channel_ids`, those where `user_id` holds or per `member_added`
+    /// ever held a device in a Text group (the same fallback, per channel)
+    async fn channels_with_text_group_user(
+        &self,
+        session: &mut ClientSession,
+        channel_ids: &[String],
+        user_id: &str,
+    ) -> Attempt<BTreeSet<String>> {
+        if channel_ids.is_empty() {
+            return Ok(BTreeSet::new());
+        }
+        Ok(self
+            .projected_channel_ids(
+                session,
+                COL_GROUPS,
+                doc! {
+                    "channel_id": { "$in": channel_ids },
+                    "kind": KIND_TEXT,
+                    "$or": [{ "members.user_id": user_id }, { "member_added.user_id": user_id }]
+                },
+            )
+            .await?
+            .into_iter()
+            .collect())
+    }
+
+    /// The stored lists matching `filter` as `(channel_id, signer_user_id,
+    /// signer_device_id)`, read through a projection (no list is decoded).
+    /// A row missing either signer field fails the read closed.
+    async fn stored_signers(
+        &self,
+        session: &mut ClientSession,
+        filter: Document,
+    ) -> Attempt<Vec<(String, String, String)>> {
+        let mut cursor = self
+            .col::<Document>(COL_SEAT_LISTS)
+            .find(filter)
+            .projection(doc! { "signer_user_id": 1, "signer_device_id": 1 })
+            .session(&mut *session)
+            .await
+            .map_err(db_err("find", COL_SEAT_LISTS))?;
+
+        let mut signers = Vec::new();
+        while let Some(row) = cursor.next(&mut *session).await {
+            let row = row.map_err(db_err("find", COL_SEAT_LISTS))?;
+            let field = |name: &str| {
+                row.get_str(name)
+                    .map(str::to_string)
+                    .map_err(|_| create_database_error!("find", COL_SEAT_LISTS))
+            };
+            signers.push((
+                field("_id")?,
+                field("signer_user_id")?,
+                field("signer_device_id")?,
+            ));
+        }
+        Ok(signers)
+    }
+
+    /// Release the seats matching `filter` (each must be active) on the
+    /// 2.3 terms; returns the matched count
+    async fn release_seats_matching(
+        &self,
+        session: &mut ClientSession,
+        filter: Document,
+        keys_received: bool,
+        cause: SeatReleaseCause,
+        now: Timestamp,
+    ) -> Attempt<u64> {
+        let (cause, cooldown_until) = seat_release_terms(keys_received, cause, now)?;
+        let mut set = doc! {
+            "released_at": timestamp_bson(&now),
+            "release_cause": enum_bson(&cause)?
+        };
+        let mut update = Document::new();
+        match cooldown_until {
+            Some(until) => {
+                set.insert("cooldown_until", timestamp_bson(&until));
+            }
+            None => {
+                update.insert("$unset", doc! { "cooldown_until": "" });
+            }
+        }
+        update.insert("$set", set);
+        let result = self
+            .col::<Document>(COL_SEATS)
+            .update_many(filter, update)
+            .session(&mut *session)
+            .await
+            .map_err(db_err("update_many", COL_SEATS))?;
+        Ok(result.matched_count)
+    }
+
+    /// Set `signer_lost` on the open Text group matching `filter` (which
+    /// must require `signer_lost: null`); whether it matched
+    async fn set_signer_lost(
+        &self,
+        session: &mut ClientSession,
+        filter: Document,
+        lost: &MlsSignerLost,
+    ) -> Attempt<bool> {
+        let result = self
+            .col::<Document>(COL_GROUPS)
+            .update_one(
+                filter,
+                doc! { "$set": { "signer_lost": signer_lost_bson(lost)? } },
+            )
+            .session(&mut *session)
+            .await
+            .map_err(db_err("update_one", COL_GROUPS))?;
+        Ok(result.matched_count > 0)
+    }
+
     async fn release_attempt(
         &self,
         session: &mut ClientSession,
         user_id: &str,
         server_id: Option<&str>,
         now: Timestamp,
-    ) -> Attempt<Vec<String>> {
-        let cooldown_until = seat_cooldown_until(now)?;
-
+    ) -> Attempt<(Vec<String>, LostSigners)> {
         // Groups this release may append a pending removal to, written
         // first (see `claim_groups_first`). Unscoped, this is the very
         // first operation; scoped, it follows the one entitlement read.
@@ -1096,21 +1294,57 @@ impl MongoDb {
             .projected_channel_ids(session, COL_SEATS, seat_filter.clone())
             .await?;
         if !seat_channels.is_empty() {
-            self.col::<Document>(COL_SEATS)
-                .update_many(
-                    seat_filter,
+            // 2.3: the stamped seats cool, and so do the others whose user
+            // is or was in one of the channel's Text groups; the rest free
+            // at once. Two filtered writes, still decoding nothing.
+            let mut stamped_filter = seat_filter.clone();
+            stamped_filter.insert("keys_received_at", doc! { "$ne": null });
+            let stamped = self
+                .projected_channel_ids(session, COL_SEATS, stamped_filter)
+                .await?;
+            let unstamped: Vec<String> = seat_channels
+                .iter()
+                .filter(|channel_id| !stamped.contains(channel_id))
+                .cloned()
+                .collect();
+            let in_group = self
+                .channels_with_text_group_user(session, &unstamped, user_id)
+                .await?;
+            let (cool, free): (Vec<String>, Vec<String>) =
+                seat_channels.iter().cloned().partition(|channel_id| {
+                    stamped.contains(channel_id) || in_group.contains(channel_id)
+                });
+            for (channels, keys_received) in [(cool, true), (free, false)] {
+                if channels.is_empty() {
+                    continue;
+                }
+                self.release_seats_matching(
+                    session,
                     doc! {
-                        "$set": {
-                            "released_at": timestamp_bson(&now),
-                            "cooldown_until": timestamp_bson(&cooldown_until)
-                        }
+                        "user_id": user_id,
+                        "released_at": null,
+                        "channel_id": { "$in": channels }
                     },
+                    keys_received,
+                    SeatReleaseCause::ServerRemoval,
+                    now,
                 )
-                .session(&mut *session)
-                .await
-                .map_err(db_err("update_many", COL_SEATS))?;
+                .await?;
+            }
         }
         affected.extend(seat_channels);
+
+        // S2-D15: a channel whose stored list this user signed gets
+        // `signer_lost` (read in this snapshot), never an entry
+        let mut list_filter = doc! { "signer_user_id": user_id };
+        if let Some(scope) = &scope {
+            list_filter.insert("_id", doc! { "$in": scope });
+        }
+        let signed = self.stored_signers(session, list_filter).await?;
+        let signed_channels: Vec<&str> = signed
+            .iter()
+            .map(|(channel_id, _, _)| channel_id.as_str())
+            .collect();
 
         // One pending removal per group: a group already holding one for
         // this user is not matched
@@ -1120,8 +1354,15 @@ impl MongoDb {
             "members.user_id": user_id,
             "pending_removals.user_id": { "$ne": user_id }
         };
+        let mut channel_filter = Document::new();
         if let Some(scope) = &scope {
-            group_filter.insert("channel_id", doc! { "$in": scope });
+            channel_filter.insert("$in", scope);
+        }
+        if !signed_channels.is_empty() {
+            channel_filter.insert("$nin", &signed_channels);
+        }
+        if !channel_filter.is_empty() {
+            group_filter.insert("channel_id", channel_filter);
         }
         let group_channels = self
             .projected_channel_ids(session, COL_GROUPS, group_filter.clone())
@@ -1145,7 +1386,225 @@ impl MongoDb {
         }
         affected.extend(group_channels);
 
-        Ok(affected.into_iter().collect())
+        let mut lost_signers = Vec::new();
+        for (channel_id, signer_user, signer_device) in signed {
+            let lost = MlsSignerLost {
+                user_id: signer_user,
+                device_id: signer_device,
+                cause: MlsSignerLostCause::DeviceRevoked,
+                at: now,
+            };
+            let filter = doc! {
+                "channel_id": &channel_id,
+                "open": true,
+                "kind": KIND_TEXT,
+                "members.user_id": user_id,
+                "signer_lost": null
+            };
+            if self.set_signer_lost(session, filter, &lost).await? {
+                affected.insert(channel_id.clone());
+                lost_signers.push((channel_id, lost));
+            }
+        }
+
+        Ok((affected.into_iter().collect(), lost_signers))
+    }
+
+    async fn release_seat_attempt(
+        &self,
+        session: &mut ClientSession,
+        channel_id: &str,
+        user_id: &str,
+        expected_seated_at: Timestamp,
+        cause: SeatReleaseCause,
+        now: Timestamp,
+    ) -> Attempt<(bool, LostSigners)> {
+        // FIRST write: the open Text group this release may append to
+        self.claim_groups_first(
+            session,
+            doc! { "channel_id": channel_id, "open": true, "kind": KIND_TEXT },
+        )
+        .await?;
+
+        // The compare-and-set: active, and seated when the caller read it.
+        // Projected, so a seat carrying a field no typed read decodes still
+        // releases (C9).
+        let cas = doc! {
+            "_id": ChannelSeat::composite_id(channel_id, user_id),
+            "released_at": null,
+            "seated_at": timestamp_bson(&expected_seated_at)
+        };
+        let Some(seat) = self
+            .col::<Document>(COL_SEATS)
+            .find_one(cas.clone())
+            .projection(doc! { "keys_received_at": 1 })
+            .session(&mut *session)
+            .await
+            .map_err(db_err("find_one", COL_SEATS))?
+        else {
+            return Ok((false, vec![]));
+        };
+        let keys_received = has_value(&seat, "keys_received_at")
+            || !self
+                .channels_with_text_group_user(session, &[channel_id.to_string()], user_id)
+                .await?
+                .is_empty();
+        if self
+            .release_seats_matching(session, cas, keys_received, cause, now)
+            .await?
+            == 0
+        {
+            return Err(TxnFail::Retry {
+                operation: "update_many",
+                collection: COL_SEATS,
+            });
+        }
+
+        let open_member = doc! {
+            "channel_id": channel_id,
+            "open": true,
+            "kind": KIND_TEXT,
+            "members.user_id": user_id
+        };
+        let signer = self
+            .stored_signers(session, doc! { "_id": channel_id })
+            .await?
+            .pop();
+        match signer {
+            Some((_, signer_user, signer_device)) if signer_user == user_id => {
+                // S2-D15: never an entry for the list signer
+                let lost = MlsSignerLost {
+                    user_id: signer_user,
+                    device_id: signer_device,
+                    cause: MlsSignerLostCause::DeviceRevoked,
+                    at: now,
+                };
+                let mut filter = open_member;
+                filter.insert("signer_lost", Bson::Null);
+                if self.set_signer_lost(session, filter, &lost).await? {
+                    return Ok((true, vec![(channel_id.to_string(), lost)]));
+                }
+            }
+            _ => {
+                let mut filter = open_member;
+                filter.insert("pending_removals.user_id", doc! { "$ne": user_id });
+                self.col::<Document>(COL_GROUPS)
+                    .update_one(
+                        filter,
+                        doc! {
+                            "$push": {
+                                "pending_removals": {
+                                    "user_id": user_id,
+                                    "created_at": timestamp_bson(&now)
+                                }
+                            }
+                        },
+                    )
+                    .session(&mut *session)
+                    .await
+                    .map_err(db_err("update_one", COL_GROUPS))?;
+            }
+        }
+        Ok((true, vec![]))
+    }
+
+    async fn device_removal_attempt(
+        &self,
+        session: &mut ClientSession,
+        user_id: &str,
+        device_id: &str,
+        now: Timestamp,
+    ) -> Attempt<(Vec<String>, LostSigners)> {
+        // FIRST write: the open Text groups holding the device (#222: the
+        // signer read below is then inside this claimed snapshot)
+        let holds = doc! { "$elemMatch": { "user_id": user_id, "device_id": device_id } };
+        self.claim_groups_first(
+            session,
+            doc! { "open": true, "kind": KIND_TEXT, "members": holds.clone() },
+        )
+        .await?;
+
+        let mut touched = BTreeSet::new();
+        let mut lost_signers = Vec::new();
+
+        // S2-D15: the channels whose stored list this device signed get
+        // `signer_lost`, whether or not it still holds a leaf, never an
+        // entry. A PUT moving the signer writes the group too, so it
+        // conflicts with this transaction.
+        let signed: Vec<String> = self
+            .stored_signers(
+                session,
+                doc! { "signer_user_id": user_id, "signer_device_id": device_id },
+            )
+            .await?
+            .into_iter()
+            .map(|(channel_id, _, _)| channel_id)
+            .collect();
+        if !signed.is_empty() {
+            let filter = doc! {
+                "channel_id": { "$in": &signed },
+                "open": true,
+                "kind": KIND_TEXT,
+                "signer_lost": null
+            };
+            let channels = self
+                .projected_channel_ids(session, COL_GROUPS, filter.clone())
+                .await?;
+            if !channels.is_empty() {
+                let lost = MlsSignerLost {
+                    user_id: user_id.to_string(),
+                    device_id: device_id.to_string(),
+                    cause: MlsSignerLostCause::DeviceRevoked,
+                    at: now,
+                };
+                self.col::<Document>(COL_GROUPS)
+                    .update_many(
+                        filter,
+                        doc! { "$set": { "signer_lost": signer_lost_bson(&lost)? } },
+                    )
+                    .session(&mut *session)
+                    .await
+                    .map_err(db_err("update_many", COL_GROUPS))?;
+                for channel_id in channels {
+                    touched.insert(channel_id.clone());
+                    lost_signers.push((channel_id, lost.clone()));
+                }
+            }
+        }
+
+        // Every other open group holding the device: one entry, idempotent
+        let mut filter = doc! {
+            "open": true,
+            "kind": KIND_TEXT,
+            "members": holds,
+            "pending_device_removals": {
+                "$not": { "$elemMatch": { "user_id": user_id, "device_id": device_id } }
+            }
+        };
+        if !signed.is_empty() {
+            filter.insert("channel_id", doc! { "$nin": &signed });
+        }
+        let channels = self
+            .projected_channel_ids(session, COL_GROUPS, filter.clone())
+            .await?;
+        if !channels.is_empty() {
+            let entry = pending_device_bson(&MlsPendingDeviceRemoval {
+                user_id: user_id.to_string(),
+                device_id: device_id.to_string(),
+                created_at: now,
+            });
+            self.col::<Document>(COL_GROUPS)
+                .update_many(
+                    filter,
+                    doc! { "$push": { "pending_device_removals": entry } },
+                )
+                .session(&mut *session)
+                .await
+                .map_err(db_err("update_many", COL_GROUPS))?;
+            touched.extend(channels);
+        }
+
+        Ok((touched.into_iter().collect(), lost_signers))
     }
 
     async fn delete_attempt(&self, session: &mut ClientSession, channel_id: &str) -> Attempt<()> {
@@ -1288,12 +1747,18 @@ impl AbstractProtectedChannels for MongoDb {
         submission: &SeatListSubmission,
         now: Timestamp,
     ) -> Result<SeatListWriteOutcome> {
+        let formats_v2 = revolt_config::config()
+            .await
+            .features
+            .protected_channels
+            .formats_v2;
         run_transaction!(self, |session| self.seat_list_write_attempt(
             &mut session,
             SeatListWriteKind::Protect,
             channel_id,
             submission,
             true,
+            formats_v2,
             now
         ))
     }
@@ -1305,12 +1770,18 @@ impl AbstractProtectedChannels for MongoDb {
         allow_claims: bool,
         now: Timestamp,
     ) -> Result<SeatListWriteOutcome> {
+        let formats_v2 = revolt_config::config()
+            .await
+            .features
+            .protected_channels
+            .formats_v2;
         run_transaction!(self, |session| self.seat_list_write_attempt(
             &mut session,
             SeatListWriteKind::Put,
             channel_id,
             submission,
             allow_claims,
+            formats_v2,
             now
         ))
     }
@@ -1337,12 +1808,91 @@ impl AbstractProtectedChannels for MongoDb {
         server_id: Option<&str>,
         now: Timestamp,
     ) -> Result<Vec<String>> {
-        run_transaction!(self, |session| self.release_attempt(
+        let (affected, lost_signers) = run_transaction!(self, |session| self.release_attempt(
             &mut session,
             user_id,
             server_id,
             now
-        ))
+        ))?;
+        for (channel_id, lost) in &lost_signers {
+            report_signer_lost("server_removal", channel_id, lost);
+        }
+        Ok(affected)
+    }
+
+    async fn release_channel_seat(
+        &self,
+        channel_id: &str,
+        user_id: &str,
+        expected_seated_at: Timestamp,
+        cause: SeatReleaseCause,
+        now: Timestamp,
+    ) -> Result<bool> {
+        let (released, lost_signers) = run_transaction!(self, |session| self
+            .release_seat_attempt(
+                &mut session,
+                channel_id,
+                user_id,
+                expected_seated_at,
+                cause,
+                now
+            ))?;
+        for (channel_id, lost) in &lost_signers {
+            report_signer_lost("release_channel_seat", channel_id, lost);
+        }
+        Ok(released)
+    }
+
+    async fn add_pending_device_removal(
+        &self,
+        user_id: &str,
+        device_id: &str,
+        now: Timestamp,
+    ) -> Result<Vec<String>> {
+        let (touched, lost_signers) = run_transaction!(self, |session| self
+            .device_removal_attempt(&mut session, user_id, device_id, now))?;
+        for (channel_id, lost) in &lost_signers {
+            report_signer_lost("device_revoked", channel_id, lost);
+        }
+        Ok(touched)
+    }
+
+    async fn fetch_channels_with_active_seats(
+        &self,
+        after: Option<String>,
+        limit: i64,
+    ) -> Result<Vec<String>> {
+        use futures::StreamExt;
+
+        if limit <= 0 {
+            return Ok(vec![]);
+        }
+        let mut filter = doc! { "released_at": null };
+        if let Some(after) = &after {
+            filter.insert("channel_id", doc! { "$gt": after });
+        }
+        let mut cursor = self
+            .col::<Document>(COL_SEATS)
+            .aggregate(vec![
+                doc! { "$match": filter },
+                doc! { "$group": { "_id": "$channel_id" } },
+                doc! { "$sort": { "_id": 1 } },
+                doc! { "$limit": limit },
+            ])
+            .await
+            .map_err(|_| create_database_error!("aggregate", COL_SEATS))?;
+
+        // A seat whose `channel_id` is not a string fails the page closed:
+        // the sweep must never skip a channel silently
+        let mut channel_ids = Vec::new();
+        while let Some(row) = cursor.next().await {
+            let row = row.map_err(|_| create_database_error!("aggregate", COL_SEATS))?;
+            let channel_id = row
+                .get_str("_id")
+                .map_err(|_| create_database_error!("aggregate", COL_SEATS))?;
+            channel_ids.push(channel_id.to_string());
+        }
+        Ok(channel_ids)
     }
 
     async fn delete_protected_channel_data(&self, channel_id: &str) -> Result<()> {

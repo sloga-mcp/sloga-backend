@@ -4,8 +4,9 @@ use iso8601_timestamp::Timestamp;
 use revolt_result::Result;
 
 use crate::{
-    ChannelSeat, E2EEIdentity, MlsCommit, MlsCommitOutcome, MlsGroup, MlsGroupCreateOutcome,
-    MlsGroupKind, MlsJoinIntent, MlsKeyPackage, ReferenceDb, MAX_MLS_GROUP_MEMBERS,
+    mls_text_rejoin_window_seconds, ChannelSeat, E2EEIdentity, MlsCommit, MlsCommitOutcome,
+    MlsGroup, MlsGroupCreateOutcome, MlsGroupKind, MlsJoinIntent, MlsKeyPackage, ReferenceDb,
+    MAX_MLS_GROUP_MEMBERS,
 };
 
 use super::plan_mls_text_commit;
@@ -415,8 +416,16 @@ impl crate::AbstractMls for ReferenceDb {
         // Mongo transaction). channel_seats is held so a seat release
         // (which takes it) can never interleave with the added users' seat
         // check.
+        let rejoin_window_seconds = mls_text_rejoin_window_seconds(
+            revolt_config::config()
+                .await
+                .features
+                .protected_channels
+                .text_rejoin_window_secs,
+        );
+
         let seat_lists = self.channel_seat_lists.lock().await;
-        let seats = self.channel_seats.lock().await;
+        let mut seats = self.channel_seats.lock().await;
         let mut groups = self.mls_groups.lock().await;
         let mut commits = self.mls_commits.lock().await;
         let mut intents = self.mls_join_intents.lock().await;
@@ -468,6 +477,14 @@ impl crate::AbstractMls for ReferenceDb {
             })
             .map(|added| added.user_id.clone())
             .collect();
+        // The added devices' identities, under the e2ee_identities lock, so
+        // a revocation (which takes it) cannot interleave (S2-D17c)
+        let added_identities: HashSet<String> = commit
+            .added
+            .iter()
+            .map(|added| E2EEIdentity::composite_id(&added.user_id, &added.device_id))
+            .filter(|identity_id| identities.contains_key(identity_id))
+            .collect();
 
         // Step 2: every validity check
         let plan = plan_mls_text_commit(
@@ -479,6 +496,8 @@ impl crate::AbstractMls for ReferenceDb {
             &stored_intents,
             &revoked_identities,
             &active_seat_users,
+            &added_identities,
+            rejoin_window_seconds,
         )?;
 
         // Steps 3 to 5 (the filter of step 4 is the state just validated
@@ -499,6 +518,21 @@ impl crate::AbstractMls for ReferenceDb {
         group
             .pending_removals
             .retain(|pending| !plan.cleared_pending.contains(&pending.user_id));
+        group.pending_device_removals = plan.pending_device_removals;
+        if let Some(rejoin_readd) = plan.rejoin_readd {
+            group.rejoin_readd = rejoin_readd;
+        }
+
+        // The user's first device received the keys (design §2.3)
+        for user_id in &plan.keys_received_users {
+            if let Some(seat) =
+                seats.get_mut(&ChannelSeat::composite_id(&group.channel_id, user_id))
+            {
+                if seat.is_active() && seat.keys_received_at.is_none() {
+                    seat.keys_received_at = Some(commit.created_at);
+                }
+            }
+        }
 
         for intent_id in &plan.consumed_intent_ids {
             intents.remove(intent_id);
@@ -547,6 +581,40 @@ impl crate::AbstractMls for ReferenceDb {
         result.sort_by_key(|commit| commit.epoch);
         result.truncate(limit.max(0) as usize);
         Ok(result)
+    }
+
+    async fn fetch_mls_text_welcome(
+        &self,
+        group_id: &str,
+        user_id: &str,
+        device_id: &str,
+    ) -> Result<Option<MlsCommit>> {
+        // Text-marked rows only, the newest that added the device
+        let commits = self.mls_commits.lock().await;
+        Ok(commits
+            .iter()
+            .filter(|(key, commit)| {
+                key.starts_with(TEXT_COMMIT_KEY_PREFIX)
+                    && commit.group_id == group_id
+                    && commit
+                        .added
+                        .iter()
+                        .any(|added| added.user_id == user_id && added.device_id == device_id)
+            })
+            .map(|(_, commit)| commit)
+            .max_by_key(|commit| commit.epoch)
+            .cloned())
+    }
+
+    async fn fetch_mls_text_oldest_epoch(&self, group_id: &str) -> Result<Option<i64>> {
+        let commits = self.mls_commits.lock().await;
+        Ok(commits
+            .iter()
+            .filter(|(key, commit)| {
+                key.starts_with(TEXT_COMMIT_KEY_PREFIX) && commit.group_id == group_id
+            })
+            .map(|(_, commit)| commit.epoch)
+            .min())
     }
 
     async fn upsert_mls_join_intent(

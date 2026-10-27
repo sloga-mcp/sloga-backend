@@ -12,9 +12,9 @@ use revolt_result::Result;
 use futures::StreamExt;
 
 use crate::{
-    AbstractMls, ChannelSeat, E2EEIdentity, MlsCommit, MlsCommitOutcome, MlsGroup,
-    MlsGroupCreateOutcome, MlsGroupKind, MlsJoinIntent, MlsKeyPackage, MlsMemberAdded, MongoDb,
-    SeatList, MAX_MLS_GROUP_MEMBERS,
+    mls_text_rejoin_window_seconds, AbstractMls, ChannelSeat, E2EEIdentity, MlsCommit,
+    MlsCommitOutcome, MlsGroup, MlsGroupCreateOutcome, MlsGroupKind, MlsJoinIntent, MlsKeyPackage,
+    MlsMemberAdded, MlsRejoinReadd, MongoDb, SeatList, MAX_MLS_GROUP_MEMBERS,
 };
 
 use super::plan_mls_text_commit;
@@ -31,7 +31,9 @@ const COL_SEAT_LISTS: &str = "channel_seat_lists";
 /// seat row (conflict marker; no seat field is changed)
 const COL_SEATS: &str = "channel_seats";
 /// Owned by the E2EE models (`e2ee/ops/mongodb.rs`, `COL_IDENTITY`); the
-/// collection name is SINGULAR. Read here for the revoked-identity lookup
+/// collection name is SINGULAR. Read here for the revoked-identity lookup;
+/// an ADDED device's identity document only gets a `txn_serial` bump (the
+/// S2-D17c claim; no identity field is changed)
 const COL_E2EE_IDENTITY: &str = "e2ee_identity";
 
 /// Whole-transaction attempts for a Text commit (design §2.5 (a))
@@ -239,6 +241,7 @@ impl MongoDb {
         commit: &MlsCommit,
         ad_sha256: &str,
         entitlement_device_cap: u32,
+        rejoin_window_seconds: i64,
     ) -> std::result::Result<TextAttemptOutcome, TextAttemptError> {
         let id = MlsCommit::composite_id(&commit.group_id, commit.epoch);
 
@@ -335,6 +338,31 @@ impl MongoDb {
             }
         }
 
+        // Each ADDED device's identity is claimed, not just read (S2-D17c,
+        // the #143 pattern): a revocation deletes that document, so only a
+        // write here makes it write-conflict with this Add. Absent = not
+        // registered (refused by the planner)
+        let mut added_identities: HashSet<String> = HashSet::new();
+        for added in &commit.added {
+            let identity_id = E2EEIdentity::composite_id(&added.user_id, &added.device_id);
+            if added_identities.contains(&identity_id) {
+                continue;
+            }
+            let matched = self
+                .col::<Document>(COL_E2EE_IDENTITY)
+                .update_one(
+                    doc! { "_id": &identity_id },
+                    doc! { "$inc": { "txn_serial": 1_i64 } },
+                )
+                .session(&mut *session)
+                .await
+                .map_err(mongo_error("update_one", COL_E2EE_IDENTITY))?
+                .matched_count;
+            if matched > 0 {
+                added_identities.insert(identity_id);
+            }
+        }
+
         // Step 2: every validity check
         let plan = plan_mls_text_commit(
             &group,
@@ -345,6 +373,8 @@ impl MongoDb {
             &stored_intents,
             &revoked_identities,
             &active_seat_users,
+            &added_identities,
+            rejoin_window_seconds,
         )
         .map_err(TextAttemptError::Refused)?;
 
@@ -365,6 +395,18 @@ impl MongoDb {
                 })
             })
             .collect();
+        let rejoin_readd: Option<Vec<Bson>> = plan.rejoin_readd.as_ref().map(|entries| {
+            entries
+                .iter()
+                .map(|entry: &MlsRejoinReadd| {
+                    Bson::Document(doc! {
+                        "user_id": &entry.user_id,
+                        "device_id": &entry.device_id,
+                        "at": timestamp_bson(&entry.at)
+                    })
+                })
+                .collect()
+        });
 
         // Step 3: an unmarked row at the id goes first (R22: a Call-plane
         // stray must never win a Text epoch), in this transaction, so a
@@ -408,23 +450,51 @@ impl MongoDb {
             return Err(TextAttemptError::Retry);
         }
 
-        // Step 4: field-level effects, filtered on the state just validated
-        let mut update = doc! {
-            "$set": {
-                "current_epoch": commit.epoch,
-                "members": members,
-                "member_added": member_added
-            }
+        // Step 4: field-level effects, filtered on the state just validated.
+        // `rejoin_readd` is written only when the commit changes it, and an
+        // emptied list is unset (an absent key = empty, as the serde skip)
+        let mut set = doc! {
+            "current_epoch": commit.epoch,
+            "members": members,
+            "member_added": member_added
         };
+        let mut update = Document::new();
+        match rejoin_readd {
+            Some(entries) if entries.is_empty() => {
+                update.insert("$unset", doc! { "rejoin_readd": "" });
+            }
+            Some(entries) => {
+                set.insert("rejoin_readd", entries);
+            }
+            None => {}
+        }
+        update.insert("$set", set);
+
+        // Clearing: the user-level entries whose user has no member device
+        // left, and (2.5 "Clearing", #224) the device entries whose device
+        // holds no leaf after this commit
+        let mut pull = Document::new();
         if !plan.cleared_pending.is_empty() {
-            update.insert(
-                "$pull",
-                doc! {
-                    "pending_removals": {
-                        "user_id": { "$in": &plan.cleared_pending }
-                    }
-                },
+            pull.insert(
+                "pending_removals",
+                doc! { "user_id": { "$in": &plan.cleared_pending } },
             );
+        }
+        if !plan.cleared_pending_devices.is_empty() {
+            let pairs: Vec<Document> = plan
+                .cleared_pending_devices
+                .iter()
+                .map(|device| {
+                    doc! {
+                        "user_id": &device.user_id,
+                        "device_id": &device.device_id
+                    }
+                })
+                .collect();
+            pull.insert("pending_device_removals", doc! { "$or": pairs });
+        }
+        if !pull.is_empty() {
+            update.insert("$pull", pull);
         }
 
         let matched = self
@@ -445,6 +515,23 @@ impl MongoDb {
             .matched_count;
         if matched == 0 {
             return Err(TextAttemptError::Retry);
+        }
+
+        // The user's first device received the keys (design §2.3): set on
+        // the active seat row once, never overwritten by a later Add
+        for user_id in &plan.keys_received_users {
+            self.col::<Document>(COL_SEATS)
+                .update_one(
+                    doc! {
+                        "_id": ChannelSeat::composite_id(&group.channel_id, user_id),
+                        "released_at": Bson::Null,
+                        "keys_received_at": Bson::Null
+                    },
+                    doc! { "$set": { "keys_received_at": timestamp_bson(&commit.created_at) } },
+                )
+                .session(&mut *session)
+                .await
+                .map_err(mongo_error("update_one", COL_SEATS))?;
         }
 
         // Step 5: consume the added devices' intents and every rule-6 intent
@@ -908,6 +995,14 @@ impl AbstractMls for MongoDb {
         // atomic. A seat-list write touches the same group document, so
         // write-conflict detection serializes the two; the loser retries
         // and sees the other's result.
+        let rejoin_window_seconds = mls_text_rejoin_window_seconds(
+            revolt_config::config()
+                .await
+                .features
+                .protected_channels
+                .text_rejoin_window_secs,
+        );
+
         for attempt in 0..TEXT_COMMIT_ATTEMPTS {
             if attempt > 0 {
                 #[cfg(test)]
@@ -928,7 +1023,13 @@ impl AbstractMls for MongoDb {
                 .map_err(|_| create_database_error!("start_transaction", COL_COMMITS))?;
 
             let attempt = self
-                .text_commit_attempt(&mut session, commit, ad_sha256, entitlement_device_cap)
+                .text_commit_attempt(
+                    &mut session,
+                    commit,
+                    ad_sha256,
+                    entitlement_device_cap,
+                    rejoin_window_seconds,
+                )
                 .await;
 
             match attempt {
@@ -1049,6 +1150,47 @@ impl AbstractMls for MongoDb {
             .filter_map(|s| async { s.ok() })
             .collect::<Vec<MlsCommit>>()
             .await)
+    }
+
+    async fn fetch_mls_text_welcome(
+        &self,
+        group_id: &str,
+        user_id: &str,
+        device_id: &str,
+    ) -> Result<Option<MlsCommit>> {
+        // Text-marked rows only, the newest that added the device (the
+        // `text_welcome_lookup` index: group_id, added.device_id)
+        self.col::<MlsCommit>(COL_COMMITS)
+            .find_one(doc! {
+                "group_id": group_id,
+                "added": { "$elemMatch": { "user_id": user_id, "device_id": device_id } },
+                COMMIT_KIND_FIELD: kind_filter(MlsGroupKind::Text)
+            })
+            .sort(doc! { "epoch": -1 })
+            .await
+            .map_err(|_| create_database_error!("find_one", COL_COMMITS))
+    }
+
+    async fn fetch_mls_text_oldest_epoch(&self, group_id: &str) -> Result<Option<i64>> {
+        let oldest = self
+            .col::<Document>(COL_COMMITS)
+            .find_one(doc! {
+                "group_id": group_id,
+                COMMIT_KIND_FIELD: kind_filter(MlsGroupKind::Text)
+            })
+            .sort(doc! { "epoch": 1 })
+            .projection(doc! { "epoch": 1 })
+            .await
+            .map_err(|_| create_database_error!("find_one", COL_COMMITS))?;
+
+        match oldest {
+            None => Ok(None),
+            Some(document) => match document.get("epoch") {
+                Some(Bson::Int64(epoch)) => Ok(Some(*epoch)),
+                Some(Bson::Int32(epoch)) => Ok(Some(i64::from(*epoch))),
+                _ => Err(create_database_error!("find_one", COL_COMMITS)),
+            },
+        }
     }
 
     async fn upsert_mls_join_intent(

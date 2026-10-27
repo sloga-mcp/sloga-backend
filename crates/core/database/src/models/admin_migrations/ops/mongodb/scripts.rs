@@ -26,7 +26,7 @@ struct MigrationInfo {
     revision: i32,
 }
 
-pub const LATEST_REVISION: i32 = 76; // MUST BE +1 to last migration
+pub const LATEST_REVISION: i32 = 78; // MUST BE +1 to last migration
 
 pub async fn migrate_database(db: &MongoDb) {
     let migrations = db.col::<Document>("migrations");
@@ -3038,6 +3038,35 @@ pub async fn run_migrations(db: &MongoDb, revision: i32) -> i32 {
             .expect("Failed to create messages channel_nonce_encrypted_unique index.");
     }
 
+    // Block number reassigned at land time per the merge steward (design 2.7).
+    if revision <= 77 {
+        info!("Running migration [revision 77 / 26-10-2026]: Add the channel_seats active-seat sweep index and the mls_commits Text Welcome lookup index (protected channels S2)");
+
+        // Indexes only: every S2 field is an additive serde default
+        // (docs/protected-channels-design.md 2.7 "S2 migration block").
+        // Built from the same specs as init.rs, because the test database is
+        // not migrated. Both collections exist from revisions 75 and 55, and
+        // createIndexes would create them anyway. A re-run is a no-op when
+        // key, name and options already match; a same-named index with any
+        // other key, or this key under another name, fails createIndexes and
+        // panics, so the revision is not advanced over it.
+        db.db()
+            .run_command(doc! {
+                "createIndexes": "channel_seats",
+                "indexes": [super::init::active_seats_index()]
+            })
+            .await
+            .expect("Failed to create channel_seats active_seats_by_channel index.");
+
+        db.db()
+            .run_command(doc! {
+                "createIndexes": "mls_commits",
+                "indexes": [super::init::text_welcome_index()]
+            })
+            .await
+            .expect("Failed to create mls_commits text_welcome_lookup index.");
+    }
+
     // Reminder to update LATEST_REVISION when adding new migrations.
     LATEST_REVISION.max(revision)
 }
@@ -3598,18 +3627,19 @@ mod afk_backfill_tests {
     }
 
     #[test]
-    fn latest_revision_is_76() {
+    fn latest_revision_is_78() {
         assert_eq!(
-            LATEST_REVISION, 76,
-            "the AFK backfill is revision 72, the ViewAuditLog backfill 73, the payments collections 74, protected channels 75"
+            LATEST_REVISION, 78,
+            "the AFK backfill is revision 72, the ViewAuditLog backfill 73, the payments collections 74, protected channels 75, protected channels S2 77 (76 is reserved for S5)"
         );
     }
 
-    /// The AFK backfill was the last migration when it landed; revision 75
-    /// (protected channels) now is. The 72, 73, 74 and 75 guards are pinned
-    /// to exactly one block each, and the last one to `LATEST_REVISION - 1`.
+    /// The AFK backfill was the last migration when it landed; revision 77
+    /// (protected channels S2) now is. The 72, 73, 74, 75 and 77 guards are
+    /// pinned to exactly one block each, and the last one to
+    /// `LATEST_REVISION - 1`.
     #[test]
-    fn backfill_is_guarded_by_revision_72_and_revision_75_is_the_last_migration() {
+    fn backfill_is_guarded_by_revision_72_and_revision_77_is_the_last_migration() {
         let guards: Vec<i32> = shipping()
             .match_indices("if revision <= ")
             .map(|(at, needle)| {
@@ -3641,6 +3671,11 @@ mod afk_backfill_tests {
             "exactly one `if revision <= 75` block"
         );
         assert_eq!(
+            guards.iter().filter(|guard| **guard == 77).count(),
+            1,
+            "exactly one `if revision <= 77` block"
+        );
+        assert_eq!(
             guards.iter().max(),
             Some(&(LATEST_REVISION - 1)),
             "LATEST_REVISION MUST BE +1 to the last migration"
@@ -3655,11 +3690,11 @@ mod afk_backfill_tests {
     /// a TOP-LEVEL statement of `run_migrations`, a sibling of the 70 and 71
     /// blocks, never inside one of them. Nested inside the 71 block, a
     /// database already at 72 would skip the backfill forever, and every
-    /// other pin in this module would still pass. The revision-73, 74 and 75
-    /// guards carry the same trap one, two and three blocks later, so each is
-    /// pinned the same way against the block before it.
+    /// other pin in this module would still pass. The revision-73, 74, 75 and
+    /// 77 guards carry the same trap one, two, three and four blocks later, so
+    /// each is pinned the same way against the block before it.
     #[test]
-    fn revision_72_to_75_guards_are_top_level_siblings_of_the_previous_block() {
+    fn revision_72_to_77_guards_are_top_level_siblings_of_the_previous_block() {
         let depth_at = |at: usize| -> i64 {
             shipping()[..at]
                 .chars()
@@ -3679,13 +3714,14 @@ mod afk_backfill_tests {
             );
             shipping().find(&needle).expect("the guard")
         };
-        let (at_70, at_71, at_72, at_73, at_74, at_75) = (
+        let (at_70, at_71, at_72, at_73, at_74, at_75, at_77) = (
             guard(70),
             guard(71),
             guard(72),
             guard(73),
             guard(74),
             guard(75),
+            guard(77),
         );
 
         let open_71 = at_71 + format!("if revision <= 71 {OPEN}").len() - 1;
@@ -3735,6 +3771,19 @@ mod afk_backfill_tests {
             "the revision 75 guard must come after the 74 block closes"
         );
 
+        // And on S2: nested inside the 75 block, the S2 indexes would never
+        // be built on a database already at 76 (S1 shipped).
+        let open_75 = at_75 + format!("if revision <= 75 {OPEN}").len() - 1;
+        let block_75 = braced(shipping(), open_75);
+        assert!(
+            !block_75.contains("if revision <= 77"),
+            "the revision 77 guard must not be nested inside the 75 block"
+        );
+        assert!(
+            at_77 > open_75 + block_75.len(),
+            "the revision 77 guard must come after the 75 block closes"
+        );
+
         let body = shipping()
             .find("pub async fn run_migrations(")
             .expect("run_migrations");
@@ -3747,10 +3796,13 @@ mod afk_backfill_tests {
                 depth_at(at_72),
                 depth_at(at_73),
                 depth_at(at_74),
-                depth_at(at_75)
+                depth_at(at_75),
+                depth_at(at_77)
             ),
-            (top_level, top_level, top_level, top_level, top_level, top_level),
-            "the 70, 71, 72, 73, 74 and 75 guards must all sit at the top level of run_migrations"
+            (
+                top_level, top_level, top_level, top_level, top_level, top_level, top_level
+            ),
+            "the 70, 71, 72, 73, 74, 75 and 77 guards must all sit at the top level of run_migrations"
         );
     }
 
@@ -3811,6 +3863,52 @@ mod afk_backfill_tests {
             "the new index must exist before the old one is dropped"
         );
         assert!(drop < collections, "the mls_groups steps run first");
+    }
+
+    /// The `if revision <= 77` block of `run_migrations`.
+    fn protected_s2_block() -> &'static str {
+        let needle = format!("if revision <= 77 {OPEN}");
+        let at = shipping()
+            .find(&needle)
+            .expect("the revision 77 migration block");
+        braced(shipping(), at + needle.len() - 1)
+    }
+
+    /// docs/protected-channels-design.md 2.7 "S2 migration block": the
+    /// block creates exactly the two S2 indexes, each on its own collection,
+    /// from the specs init.rs uses (the test database is not migrated), and
+    /// touches no data. The specs themselves are pinned against MongoDB by
+    /// `init_creates_the_s2_indexes` and
+    /// `revision_77_creates_the_s2_indexes_and_is_rerunnable`.
+    #[test]
+    fn revision_77_and_init_build_the_s2_indexes_from_the_shared_specs() {
+        let block: String = protected_s2_block()
+            .chars()
+            .filter(|ch| !ch.is_whitespace())
+            .collect();
+        for step in [
+            "\"createIndexes\":\"channel_seats\",\"indexes\":[super::init::active_seats_index()]",
+            "\"createIndexes\":\"mls_commits\",\"indexes\":[super::init::text_welcome_index()]",
+        ] {
+            assert_eq!(block.matches(step).count(), 1, "exactly one `{step}`");
+        }
+        assert_eq!(block.matches("\"createIndexes\"").count(), 2, "two steps");
+        for needle in ["update_", "delete_", "insert_", "drop", ".ok()", "$set"] {
+            assert!(
+                !block.contains(needle),
+                "the S2 block builds indexes only, and panics on failure; found {needle}"
+            );
+        }
+
+        const INIT: &str = include_str!("init.rs");
+        let init = &INIT[..INIT.find("#[cfg(test)]").unwrap_or(INIT.len())];
+        for needle in ["active_seats_index(),", "text_welcome_index(),"] {
+            assert_eq!(
+                init.matches(needle).count(),
+                1,
+                "init.rs must build `{needle}` exactly once"
+            );
+        }
     }
 
     /// A re-run of revision 75 (a panic later in the block leaves the
@@ -4334,9 +4432,9 @@ mod tests {
                 .await
                 .expect("insert servers");
 
-            // Revisions 74 and 75 run after it (they touch no server); the
+            // Revisions 74, 75 and 77 run after it (they touch no server); the
             // return is LATEST_REVISION.
-            assert_eq!(super::run_migrations(&mongo, 73).await, 76);
+            assert_eq!(super::run_migrations(&mongo, 73).await, 78);
 
             let fetch = |id: String| {
                 let servers = servers.clone();
@@ -4393,7 +4491,7 @@ mod tests {
             );
 
             // Re-running is a no-op.
-            assert_eq!(super::run_migrations(&mongo, 73).await, 76);
+            assert_eq!(super::run_migrations(&mongo, 73).await, 78);
             for want in &expected {
                 let id = want.get_str("_id").expect("_id");
                 assert_eq!(
@@ -4464,8 +4562,8 @@ mod tests {
                 .await
                 .expect("insert a claimed number");
 
-            assert_eq!(super::run_migrations(&mongo, 74).await, 76);
-            assert_eq!(super::run_migrations(&mongo, 74).await, 76, "a re-run");
+            assert_eq!(super::run_migrations(&mongo, 74).await, 78);
+            assert_eq!(super::run_migrations(&mongo, 74).await, 78, "a re-run");
 
             assert_eq!(numbers.count_documents(doc! {}).await.expect("count"), 1000);
             assert_eq!(
@@ -4605,7 +4703,7 @@ mod tests {
     /// with a message naming the trap and the fix (reset to 72), and the
     /// protected-channels revision does not run. The same database WITH the
     /// collection (upstream's own revision 74) migrates to the latest.
-    /// Control: the check removed (the first run returns 76).
+    /// Control: the check removed (the first run returns 78).
     #[tokio::test]
     async fn revision_74_without_the_audit_log_is_refused_as_the_dev_database_trap() {
         use futures::FutureExt;
@@ -4666,7 +4764,7 @@ mod tests {
                 .expect("create server_audit_log");
             assert_eq!(
                 super::run_migrations(&mongo, 74).await,
-                76,
+                78,
                 "upstream's revision 74 (with server_audit_log) migrates"
             );
         }
@@ -5112,6 +5210,315 @@ mod tests {
                     .await
                     .unwrap_or_else(|error| panic!("{why} must insert: {error:?}"));
             }
+        }
+
+        db.drop_database().await;
+        guard.disarm();
+    }
+
+    /// The index named `name` on `collection`, read back through
+    /// `listIndexes`; `None` when there is none.
+    async fn named_index(mongo: &crate::MongoDb, collection: &str, name: &str) -> Option<Document> {
+        let listed = mongo
+            .db()
+            .run_command(doc! { "listIndexes": collection })
+            .await
+            .expect("listIndexes");
+        listed
+            .get_document("cursor")
+            .and_then(|cursor| cursor.get_array("firstBatch"))
+            .expect("a listIndexes first batch")
+            .iter()
+            .find_map(|index| match index {
+                Bson::Document(index) if index.get_str("name").ok() == Some(name) => {
+                    Some(index.clone())
+                }
+                _ => None,
+            })
+    }
+
+    /// `index` is a plain ascending index on exactly `want`, in that order,
+    /// with no option beyond its name (not unique, not partial, not sparse).
+    fn assert_plain_index(index: &Document, want: &[&str]) {
+        // Ordered: key order is part of an index's identity.
+        let key: Vec<(&str, &Bson)> = index
+            .get_document("key")
+            .expect("key")
+            .iter()
+            .map(|(field, order)| (field.as_str(), order))
+            .collect();
+        let ascending = Bson::Int32(1);
+        let expected: Vec<(&str, &Bson)> = want.iter().map(|field| (*field, &ascending)).collect();
+        assert_eq!(key, expected, "the key, in order: {index:?}");
+        let mut options: Vec<&str> = index
+            .keys()
+            .map(String::as_str)
+            .filter(|field| !matches!(*field, "v" | "key" | "name" | "ns"))
+            .collect();
+        options.sort_unstable();
+        assert!(options.is_empty(), "no index options: {index:?}");
+    }
+
+    /// The two S2 indexes (docs/protected-channels-design.md 2.7 "S2
+    /// migration block"), spelled out here rather than read from the shared
+    /// specs, so a drift in `active_seats_index()` or `text_welcome_index()`
+    /// fails.
+    async fn assert_has_the_s2_indexes(mongo: &crate::MongoDb) {
+        let seats = named_index(mongo, "channel_seats", "active_seats_by_channel")
+            .await
+            .expect("channel_seats must carry active_seats_by_channel");
+        assert_plain_index(&seats, &["released_at", "channel_id"]);
+
+        let welcome = named_index(mongo, "mls_commits", "text_welcome_lookup")
+            .await
+            .expect("mls_commits must carry text_welcome_lookup");
+        assert_plain_index(&welcome, &["group_id", "added.device_id"]);
+    }
+
+    /// A fresh database (init.rs) carries both S2 indexes beside the
+    /// existing ones.
+    #[tokio::test]
+    async fn init_creates_the_s2_indexes() {
+        // Named by hand for the same 63-character reason as above.
+        let db = crate::DatabaseInfo::Test("migration_init_s2_indexes".to_string())
+            .connect()
+            .await
+            .expect("Database connection failed.");
+        db.drop_database().await;
+        let guard = crate::test_teardown::TestDatabaseGuard::arm(&db).await;
+
+        {
+            #[allow(irrefutable_let_patterns)]
+            let Database::MongoDb(mongo) = db.clone() else {
+                // Indexes exist only on MongoDB.
+                db.drop_database().await;
+                guard.disarm();
+                return;
+            };
+
+            super::super::init::create_database(&mongo).await;
+            assert_has_the_s2_indexes(&mongo).await;
+
+            for (collection, want) in [
+                (
+                    "channel_seats",
+                    vec!["_id_", "active_seats_by_channel", "channel_id", "user_id"],
+                ),
+                (
+                    "mls_commits",
+                    vec!["_id_", "group_epoch", "text_welcome_lookup"],
+                ),
+            ] {
+                let mut names = mongo
+                    .col::<Document>(collection)
+                    .list_index_names()
+                    .await
+                    .expect("list indexes");
+                names.sort_unstable();
+                assert_eq!(names, want, "{collection} indexes");
+            }
+        }
+
+        db.drop_database().await;
+        guard.disarm();
+    }
+
+    /// Revision 77 on a database in the revision-76 shape (S1 shipped, with
+    /// seat rows and commits already stored, `added` an array) builds both
+    /// S2 indexes, returns LATEST_REVISION, and a second run (the stored
+    /// revision unadvanced after a crash) is a no-op over them.
+    #[tokio::test]
+    async fn revision_77_creates_the_s2_indexes_and_is_rerunnable() {
+        // Named by hand for the same 63-character reason as above.
+        let db = crate::DatabaseInfo::Test("migration_rev77_s2_indexes".to_string())
+            .connect()
+            .await
+            .expect("Database connection failed.");
+        db.drop_database().await;
+        let guard = crate::test_teardown::TestDatabaseGuard::arm(&db).await;
+
+        {
+            #[allow(irrefutable_let_patterns)]
+            let Database::MongoDb(mongo) = db.clone() else {
+                // The migration scripts are MongoDB-only.
+                db.drop_database().await;
+                guard.disarm();
+                return;
+            };
+
+            // The revision-76 shape: revision 75's channel_seats indexes and
+            // revision 55's mls_commits index, over existing rows.
+            mongo
+                .db()
+                .run_command(doc! {
+                    "createIndexes": "channel_seats",
+                    "indexes": [
+                        { "key": { "channel_id": 1_i32 }, "name": "channel_id" },
+                        { "key": { "user_id": 1_i32 }, "name": "user_id" }
+                    ]
+                })
+                .await
+                .expect("create the revision-75 seat indexes");
+            mongo
+                .db()
+                .run_command(doc! {
+                    "createIndexes": "mls_commits",
+                    "indexes": [
+                        { "key": { "group_id": 1_i32, "epoch": 1_i32 }, "name": "group_epoch" }
+                    ]
+                })
+                .await
+                .expect("create the revision-55 commit index");
+            mongo
+                .col::<Document>("channel_seats")
+                .insert_many(vec![
+                    doc! { "_id": "S1", "channel_id": "C1", "user_id": "U1" },
+                    doc! { "_id": "S2", "channel_id": "C1", "user_id": "U2", "released_at": "2026-10-01T00:00:00Z" },
+                ])
+                .await
+                .expect("insert seats");
+            mongo
+                .col::<Document>("mls_commits")
+                .insert_many(vec![
+                    doc! { "_id": "G:1", "group_id": "G", "epoch": 1_i64, "added": [
+                        { "user_id": "U1", "device_id": "D1" },
+                        { "user_id": "U2", "device_id": "D2" }
+                    ] },
+                    doc! { "_id": "G:2", "group_id": "G", "epoch": 2_i64, "added": [] },
+                ])
+                .await
+                .expect("insert commits");
+
+            assert_eq!(super::run_migrations(&mongo, 76).await, 78);
+            assert_has_the_s2_indexes(&mongo).await;
+
+            // A database S5 migrated first (stored at 77) runs it too, and a
+            // re-run over the built indexes succeeds.
+            assert_eq!(super::run_migrations(&mongo, 77).await, 78, "a re-run");
+            assert_has_the_s2_indexes(&mongo).await;
+
+            for (collection, want) in [
+                (
+                    "channel_seats",
+                    vec!["_id_", "active_seats_by_channel", "channel_id", "user_id"],
+                ),
+                (
+                    "mls_commits",
+                    vec!["_id_", "group_epoch", "text_welcome_lookup"],
+                ),
+            ] {
+                let mut names = mongo
+                    .col::<Document>(collection)
+                    .list_index_names()
+                    .await
+                    .expect("list indexes");
+                names.sort_unstable();
+                assert_eq!(names, want, "{collection} indexes");
+            }
+
+            // A database already at LATEST_REVISION runs nothing.
+            assert_eq!(super::run_migrations(&mongo, 78).await, 78);
+        }
+
+        db.drop_database().await;
+        guard.disarm();
+    }
+
+    /// An index that is not the S2 spec under an S2 name, or the S2 key
+    /// under another name, makes revision 77 panic from the step that owns
+    /// it, so the revision is never advanced over it.
+    #[tokio::test]
+    async fn revision_77_refuses_a_conflicting_s2_index() {
+        use futures::FutureExt;
+
+        let db = crate::DatabaseInfo::Test("migration_rev77_s2_conflict".to_string())
+            .connect()
+            .await
+            .expect("Database connection failed.");
+        db.drop_database().await;
+        let guard = crate::test_teardown::TestDatabaseGuard::arm(&db).await;
+
+        {
+            #[allow(irrefutable_let_patterns)]
+            let Database::MongoDb(mongo) = db.clone() else {
+                // The migration scripts are MongoDB-only.
+                db.drop_database().await;
+                guard.disarm();
+                return;
+            };
+
+            let create = |collection: &'static str, index: Document| {
+                let mongo = mongo.clone();
+                async move {
+                    mongo
+                        .db()
+                        .run_command(doc! { "createIndexes": collection, "indexes": [index] })
+                        .await
+                        .expect("create the conflicting index");
+                }
+            };
+            let drop = |collection: &'static str, name: &'static str| {
+                let mongo = mongo.clone();
+                async move {
+                    mongo
+                        .db()
+                        .run_command(doc! { "dropIndexes": collection, "index": name })
+                        .await
+                        .expect("drop the conflicting index");
+                }
+            };
+            let refused_by = |step: &'static str| {
+                let mongo = mongo.clone();
+                async move {
+                    let migration = std::panic::AssertUnwindSafe(super::run_migrations(&mongo, 76))
+                        .catch_unwind()
+                        .await;
+                    let Err(payload) = migration else {
+                        panic!("revision 77 must refuse a conflicting index ({step})");
+                    };
+                    let message = payload
+                        .downcast_ref::<String>()
+                        .map(String::as_str)
+                        .or_else(|| payload.downcast_ref::<&str>().copied())
+                        .unwrap_or_default()
+                        .to_string();
+                    assert!(
+                        message.starts_with(&format!("Failed to create {step} index.")),
+                        "the panic must come from the {step} step: {message}"
+                    );
+                }
+            };
+
+            // The S2 name over the wrong key order.
+            create(
+                "channel_seats",
+                doc! { "key": { "channel_id": 1_i32, "released_at": 1_i32 }, "name": "active_seats_by_channel" },
+            )
+            .await;
+            refused_by("channel_seats active_seats_by_channel").await;
+            drop("channel_seats", "active_seats_by_channel").await;
+
+            // The S2 key under another name.
+            create(
+                "channel_seats",
+                doc! { "key": { "released_at": 1_i32, "channel_id": 1_i32 }, "name": "released_channel" },
+            )
+            .await;
+            refused_by("channel_seats active_seats_by_channel").await;
+            drop("channel_seats", "released_channel").await;
+
+            // The S2 name over the wrong field.
+            create(
+                "mls_commits",
+                doc! { "key": { "group_id": 1_i32, "added.user_id": 1_i32 }, "name": "text_welcome_lookup" },
+            )
+            .await;
+            refused_by("mls_commits text_welcome_lookup").await;
+            drop("mls_commits", "text_welcome_lookup").await;
+
+            // With the conflicts gone, the block runs.
+            assert_eq!(super::run_migrations(&mongo, 76).await, 78);
+            assert_has_the_s2_indexes(&mongo).await;
         }
 
         db.drop_database().await;

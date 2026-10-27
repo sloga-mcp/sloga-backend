@@ -4,9 +4,11 @@ use iso8601_timestamp::{Duration, Timestamp};
 use revolt_result::Result;
 
 use crate::{
-    mls_text_enforced_device_cap, MlsCommit, MlsCommitOutcome, MlsGroup, MlsGroupCreateOutcome,
-    MlsGroupKind, MlsJoinIntent, MlsKeyPackage, MlsMemberAdded, MlsMemberDevice, SeatList,
-    SeatListBody, MAX_MLS_TEXT_GROUP_MEMBERS, MLS_REJOIN_OUTSTANDING_WINDOW_SECONDS,
+    mls_text_enforced_device_cap, removal_reason_rank, retain_member_pending_device_removals,
+    E2EEIdentity, MlsCommit, MlsCommitOutcome, MlsGroup, MlsGroupCreateOutcome, MlsGroupKind,
+    MlsJoinIntent, MlsKeyPackage, MlsMemberAdded, MlsMemberDevice, MlsPendingDeviceRemoval,
+    MlsRejoinReadd, MlsRemovalReason, MlsRemovedReason, SeatList, SeatListBody,
+    MAX_MLS_TEXT_GROUP_MEMBERS,
 };
 
 #[cfg(feature = "mongodb")]
@@ -169,27 +171,38 @@ pub trait AbstractMls: Sync + Send {
     ///    stray left by a squat at the derived id) and never answers here;
     ///    see step 3.
     /// 1. read the group (`kind: Text`), the channel's newest seat list,
-    ///    the removed devices' stored join intents and E2EE identities;
+    ///    the removed devices' stored join intents and E2EE identities, and
+    ///    CLAIM the added devices' E2EE identities (S2-D17c; Mongo: `$inc
+    ///    txn_serial` on each identity document, so a concurrent revocation
+    ///    write-conflicts with the Add);
     /// 2. validity: open; committer is a member (`ProtectedChannelResecuring
     ///    { reason: "not_member" }`); `epoch == current_epoch + 1`;
-    ///    `seat_list_ad_sha256 == ad_sha256` (`stale_seat_list`); the
-    ///    Remove rule; Adds refused while `pending_removals` is non-empty
-    ///    (`pending_removal`), every added device not already a member, not
-    ///    also removed, its user's `channel_seats` row ACTIVE (`NotSeated`;
-    ///    Mongo: a conditional write on that row, so a racing seat release
-    ///    write-conflicts) and on the newest seat list; the enforced device
-    ///    cap `min(signed, entitlement_device_cap)`; the
-    ///    [`MAX_MLS_TEXT_GROUP_MEMBERS`] leaf cap;
+    ///    `seat_list_ad_sha256 == ad_sha256` (`stale_seat_list`); while
+    ///    `signer_lost` is set, an Add of any user but the signer user
+    ///    (`owner_device_lost`); Add-clears-pending: an Add must remove every
+    ///    member device either pending list names (`pending_removal`); the
+    ///    Remove rule (rules 1 to 6 and 3a, the Text rule-6 window from
+    ///    `text_rejoin_window_secs`); every added device not already a
+    ///    member, not also removed, its user's `channel_seats` row ACTIVE
+    ///    (`NotSeated`; Mongo: a conditional write on that row, so a racing
+    ///    seat release write-conflicts), on the newest seat list, and its
+    ///    identity present (`FailedValidation`); the enforced device cap
+    ///    `min(signed, entitlement_device_cap)` over every post-commit leaf;
+    ///    the [`MAX_MLS_TEXT_GROUP_MEMBERS`] leaf cap;
     /// 3. delete an unmarked row at `{group}:{epoch}` (R22 stray; logged as
     ///    `AUDIT mls_text_stray_replaced`, ids only), then insert the commit
-    ///    row (with `rejoin_intents` filled) Text-marked. The marker is
-    ///    storage-level, not a field of [`MlsCommit`]: Mongo stores
-    ///    `kind: "Text"` on the document, Reference keys the row under
-    ///    `text:{group}:{epoch}`;
+    ///    row (with `rejoin_intents` and `removed_reasons` filled, `welcome`
+    ///    as given) Text-marked. The marker is storage-level, not a field
+    ///    of [`MlsCommit`]: Mongo stores `kind: "Text"` on the document,
+    ///    Reference keys the row under `text:{group}:{epoch}`;
     /// 4. field-level group update filtered on `{ _id, open, kind: Text,
     ///    current_epoch: e - 1, seat_list_ad_sha256: ad_sha256 }`: `$set`
-    ///    `current_epoch`, `members`, `member_added`; `$pull` every pending
-    ///    removal whose user has no member device left;
+    ///    `current_epoch`, `members`, `member_added`, and `rejoin_readd`
+    ///    when it changes (a rule-6 eviction writes an entry, the device's
+    ///    re-Add consumes it); `$pull` every pending removal whose user has
+    ///    no member device left and every pending device entry whose device
+    ///    holds no leaf (2.5 "Clearing"); `keys_received_at` set on each
+    ///    added user's active seat row that has none;
     /// 5. delete the join intents of every added device and of every
     ///    rule-6-consumed intent.
     ///
@@ -202,8 +215,9 @@ pub trait AbstractMls: Sync + Send {
     /// protected-channels `run_transaction!` pattern).
     /// `entitlement_device_cap` is the channel's effective entitlement
     /// device cap (`0` = unlimited). `commit.created_at`
-    /// is "now" for the rejoin window and `member_added.at`. The submitted
-    /// `commit.rejoin_intents` is ignored and replaced.
+    /// is "now" for the rejoin window, `member_added.at`, `rejoin_readd`
+    /// and `keys_received_at`. The submitted `commit.rejoin_intents` and
+    /// `commit.removed_reasons` are ignored and replaced.
     async fn insert_mls_text_commit(
         &self,
         commit: &MlsCommit,
@@ -234,6 +248,23 @@ pub trait AbstractMls: Sync + Send {
         from_epoch: i64,
         limit: i64,
     ) -> Result<Vec<MlsCommit>>;
+
+    /// The Welcome route's read (design §7.2, S2-D29): the NEWEST
+    /// Text-marked commit row of the group whose `added` holds `(user_id,
+    /// device_id)`, Welcome included, or `None`. The route still checks
+    /// that the device is a member whose `member_added.epoch` is that
+    /// row's epoch. Nothing but the Welcome route may serve the row's
+    /// `welcome`.
+    async fn fetch_mls_text_welcome(
+        &self,
+        group_id: &str,
+        user_id: &str,
+        device_id: &str,
+    ) -> Result<Option<MlsCommit>>;
+
+    /// The oldest stored Text-marked commit epoch of the group (design
+    /// §6.1 "Commit fetch", S2-D30), or `None` when it has none
+    async fn fetch_mls_text_oldest_epoch(&self, group_id: &str) -> Result<Option<i64>>;
 
     /// Store (or refresh) a join intent, keyed by (group, user, device).
     /// Returns the previous intent for the key, if any (rate-limit anchor).
@@ -278,6 +309,16 @@ pub(crate) struct MlsTextCommitPlan {
     pub member_added: Vec<MlsMemberAdded>,
     /// Pending-removal users to clear (no member device left)
     pub cleared_pending: Vec<String>,
+    /// `pending_device_removals` after the commit (2.5 "Clearing", #224)
+    pub pending_device_removals: Vec<MlsPendingDeviceRemoval>,
+    /// The pending device entries the clearing dropped (Mongo `$pull`s them)
+    pub cleared_pending_devices: Vec<MlsMemberDevice>,
+    /// `rejoin_readd` after the commit, `Some` only when the commit
+    /// changes it (S2-D32)
+    pub rejoin_readd: Option<Vec<MlsRejoinReadd>>,
+    /// The added users, once each: their active seat row gets
+    /// `keys_received_at` when it has none (design §2.3)
+    pub keys_received_users: Vec<String>,
     /// Join-intent row ids to delete (added devices + rule-6 consumed)
     pub consumed_intent_ids: Vec<String>,
 }
@@ -314,6 +355,13 @@ fn resecuring(reason: &str) -> revolt_result::Error {
 ///   (Mongo: a conditional write on the seat row; Reference: the
 ///   `channel_seats` lock), because a forced release leaves the user on
 ///   the SIGNED list and writes no document the commit otherwise writes.
+/// - `added_identities`: `E2EEIdentity` composite ids of the ADDED devices
+///   whose identity row was found PRESENT (and, on Mongo, claimed) inside
+///   the atomic unit (S2-D17c). Positive evidence: a device the caller did
+///   not look up counts as unregistered.
+/// - `rejoin_window_seconds`: the Text rule-6 window
+///   ([`crate::mls_text_rejoin_window_seconds`] of the configured
+///   `text_rejoin_window_secs`).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn plan_mls_text_commit(
     group: &MlsGroup,
@@ -324,6 +372,8 @@ pub(crate) fn plan_mls_text_commit(
     stored_intents: &[MlsJoinIntent],
     revoked_identities: &HashSet<String>,
     active_seat_users: &HashSet<String>,
+    added_identities: &HashSet<String>,
+    rejoin_window_seconds: i64,
 ) -> Result<MlsTextCommitPlan> {
     if group.kind != MlsGroupKind::Text {
         return Err(create_error!(InvalidOperation));
@@ -388,22 +438,59 @@ pub(crate) fn plan_mls_text_commit(
         }
     }
 
-    // Adds are refused while any removal is pending (W0-fix3), so a joiner
-    // never receives a roster with an unseated user
-    if !commit.added.is_empty() && !group.pending_removals.is_empty() {
-        return Err(resecuring("pending_removal"));
+    let removes = |user_id: &str, device_id: &str| {
+        commit
+            .removed
+            .iter()
+            .any(|removed| removed.user_id == user_id && removed.device_id == device_id)
+    };
+
+    if !commit.added.is_empty() {
+        // While the list signer's device is lost, only the signer USER's
+        // devices may be added (S2-D17d): growth stays frozen while the lost
+        // device still holds a leaf and receives every new epoch's secrets
+        if let Some(lost) = &group.signer_lost {
+            if commit
+                .added
+                .iter()
+                .any(|added| added.user_id != lost.user_id)
+            {
+                return Err(resecuring("owner_device_lost"));
+            }
+        }
+
+        // Add-clears-pending (S2-D17b): an Add must remove, in the same
+        // commit, every member device that either pending list names, so a
+        // joiner never receives a roster with a device that must go. A
+        // partial clear is refused. An entry naming no member is satisfied
+        // (the clearing rule drops it)
+        let users_cleared = group.pending_removals.iter().all(|pending| {
+            group
+                .member_devices_of(&pending.user_id)
+                .all(|device| removes(&device.user_id, &device.device_id))
+        });
+        let devices_cleared = group.pending_device_removals.iter().all(|pending| {
+            !group.has_member(&pending.user_id, &pending.device_id)
+                || removes(&pending.user_id, &pending.device_id)
+        });
+        if !users_cleared || !devices_cleared {
+            return Err(resecuring("pending_removal"));
+        }
     }
 
-    // Remove rule (design §3.12.2)
+    // Remove rule (design §3.12.2, rule 3a of §6.1 "S2 additions"). Every
+    // admitting rule is evaluated and the highest-ranked one is stamped as
+    // the advisory reason, from THIS transaction's reads (#222)
     let committer = &commit.committer;
     let committer_is_signer = committer.user_id == signed.signer_user_id
         && committer.device_id == signed.signer_device_id;
     let window_start = commit
         .created_at
-        .checked_sub(Duration::seconds(MLS_REJOIN_OUTSTANDING_WINDOW_SECONDS))
+        .checked_sub(Duration::seconds(rejoin_window_seconds))
         .ok_or_else(|| failed("invalid commit time"))?;
 
     let mut rejoin_intents: Vec<MlsJoinIntent> = Vec::new();
+    let mut removed_reasons: Vec<MlsRemovedReason> = Vec::with_capacity(commit.removed.len());
     for removed in &commit.removed {
         if !group.has_member(&removed.user_id, &removed.device_id) {
             return Err(failed("removed device is not a member"));
@@ -416,23 +503,37 @@ pub(crate) fn plan_mls_text_commit(
         let is_signer_device = removed.user_id == signed.signer_user_id
             && removed.device_id == signed.signer_device_id;
 
-        // Rules 2 to 5 never apply to the current list signer's device
-        let other_rule = !is_signer_device
-            && (removed.user_id == committer.user_id
-                || group.has_pending_removal(&removed.user_id)
-                || revoked_identities.contains(&crate::E2EEIdentity::composite_id(
-                    &removed.user_id,
-                    &removed.device_id,
-                ))
-                || (committer_is_signer && !seated(&removed.user_id)));
-
-        if other_rule {
-            continue;
+        // Rules 2 to 5 and 3a never apply to the current list signer's
+        // device (rule 1)
+        let mut admitting: Vec<MlsRemovalReason> = Vec::new();
+        if !is_signer_device {
+            if group.has_pending_removal(&removed.user_id) {
+                admitting.push(MlsRemovalReason::PendingRemoval);
+            }
+            if removed.user_id == committer.user_id {
+                admitting.push(MlsRemovalReason::OwnUser);
+            }
+            if group.pending_device_removals.iter().any(|pending| {
+                pending.user_id == removed.user_id && pending.device_id == removed.device_id
+            }) {
+                admitting.push(MlsRemovalReason::PendingDevice);
+            }
+            if revoked_identities.contains(&E2EEIdentity::composite_id(
+                &removed.user_id,
+                &removed.device_id,
+            )) {
+                admitting.push(MlsRemovalReason::Revoked);
+            }
+            if committer_is_signer && !seated(&removed.user_id) {
+                admitting.push(MlsRemovalReason::OffList);
+            }
         }
 
-        // Rule 6 (rejoin): a stored intent signed by THIS device, outstanding
-        // (<= 30 s old) and created strictly after the device's latest Add.
-        // No `member_added` entry = refused (never "added at time zero")
+        // Rule 6 (rejoin), for every device: a stored intent signed by THIS
+        // device, outstanding (within the Text window) and created strictly
+        // after the device's latest Add. No `member_added` entry = refused
+        // (never "added at time zero"). An admitting intent is copied into
+        // the row and consumed, so it evicts exactly once
         let intent_id =
             MlsJoinIntent::composite_id(&group.id, &removed.user_id, &removed.device_id);
         let added_at = group
@@ -446,15 +547,22 @@ pub(crate) fn plan_mls_text_commit(
                 && intent.user_id == removed.user_id
                 && intent.device_id == removed.device_id
         });
-
-        match (intent, added_at) {
-            (Some(intent), Some(added_at))
-                if intent.created_at >= window_start && intent.created_at > added_at =>
-            {
+        if let (Some(intent), Some(added_at)) = (intent, added_at) {
+            if intent.created_at >= window_start && intent.created_at > added_at {
+                admitting.push(MlsRemovalReason::Rejoin);
                 rejoin_intents.push(intent.clone());
             }
-            _ => return Err(failed("removal not permitted")),
         }
+
+        let reason = admitting
+            .into_iter()
+            .max_by_key(|reason| removal_reason_rank(*reason))
+            .ok_or_else(|| failed("removal not permitted"))?;
+        removed_reasons.push(MlsRemovedReason {
+            user_id: removed.user_id.clone(),
+            device_id: removed.device_id.clone(),
+            reason,
+        });
     }
 
     // Add rules (design §6.1 "Commit with added"). ViewChannel and
@@ -472,6 +580,15 @@ pub(crate) fn plan_mls_text_commit(
         }
         if !seated(&added.user_id) {
             return Err(failed("added user is not seated"));
+        }
+        // The added-identity claim (S2-D17c): with the revocation's second
+        // pending pass, every ordering of a revocation and an Add ends with
+        // no member or a pending entry
+        if !added_identities.contains(&E2EEIdentity::composite_id(
+            &added.user_id,
+            &added.device_id,
+        )) {
+            return Err(failed("added device is not registered"));
         }
     }
 
@@ -492,7 +609,9 @@ pub(crate) fn plan_mls_text_commit(
         }));
     }
 
-    // Enforced device cap, for every user this commit adds a device for
+    // Enforced device cap, for every user this commit adds a device for,
+    // over EVERY post-commit leaf of that user (#212: no exclusion, exactly
+    // as every receiver counts; a lost signer device still counts)
     let cap = mls_text_enforced_device_cap(signed.device_cap, entitlement_device_cap);
     if cap != 0 {
         for added in &commit.added {
@@ -538,6 +657,53 @@ pub(crate) fn plan_mls_text_commit(
         .map(|pending| pending.user_id.clone())
         .collect();
 
+    // Clearing (2.5, #224): every pending device entry whose device holds
+    // no leaf after this commit goes
+    let mut after = MlsGroup {
+        members: members.clone(),
+        ..group.clone()
+    };
+    retain_member_pending_device_removals(&mut after);
+    let pending_device_removals = after.pending_device_removals;
+    let cleared_pending_devices: Vec<MlsMemberDevice> = group
+        .pending_device_removals
+        .iter()
+        .filter(|pending| !pending_device_removals.contains(pending))
+        .map(|pending| MlsMemberDevice {
+            user_id: pending.user_id.clone(),
+            device_id: pending.device_id.clone(),
+        })
+        .collect();
+
+    // rejoin_readd (S2-D32): a device's re-Add consumes its entry; a rule-6
+    // eviction writes one (an added device is never also removed, so the
+    // two never touch the same device)
+    let mut rejoin_readd = group.rejoin_readd.clone();
+    rejoin_readd.retain(|entry| {
+        !commit
+            .added
+            .iter()
+            .any(|added| added.user_id == entry.user_id && added.device_id == entry.device_id)
+    });
+    for intent in &rejoin_intents {
+        rejoin_readd.retain(|entry| {
+            !(entry.user_id == intent.user_id && entry.device_id == intent.device_id)
+        });
+        rejoin_readd.push(MlsRejoinReadd {
+            user_id: intent.user_id.clone(),
+            device_id: intent.device_id.clone(),
+            at: commit.created_at,
+        });
+    }
+    let rejoin_readd = (rejoin_readd != group.rejoin_readd).then_some(rejoin_readd);
+
+    let mut keys_received_users: Vec<String> = Vec::new();
+    for added in &commit.added {
+        if !keys_received_users.contains(&added.user_id) {
+            keys_received_users.push(added.user_id.clone());
+        }
+    }
+
     let mut consumed_intent_ids: Vec<String> = commit
         .added
         .iter()
@@ -545,15 +711,22 @@ pub(crate) fn plan_mls_text_commit(
         .collect();
     consumed_intent_ids.extend(rejoin_intents.iter().map(|intent| intent.id.clone()));
 
+    // The Welcome is stored as given (S2-D29); the declarations the
+    // transaction derives replace the submitted ones
     let mut stored = commit.clone();
     stored.id = MlsCommit::composite_id(&commit.group_id, commit.epoch);
     stored.rejoin_intents = rejoin_intents;
+    stored.removed_reasons = removed_reasons;
 
     Ok(MlsTextCommitPlan {
         stored,
         members,
         member_added,
         cleared_pending,
+        pending_device_removals,
+        cleared_pending_devices,
+        rejoin_readd,
+        keys_received_users,
         consumed_intent_ids,
     })
 }

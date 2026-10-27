@@ -37,12 +37,13 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     channel_seats_used, check_channel_protectable, check_text_first_generation,
-    check_text_successor, is_genesis_reprotect, plan_seat_list_write, prepare_text_group,
-    seat_cooldown_until, seat_list_channel_server, Channel, ChannelEntitlement, ChannelSeat,
-    Member, MemberCompositeKey, MlsGroup, MlsGroupCreateOutcome, MlsGroupKind, MlsPendingRemoval,
-    ReferenceDb, SeatList, SeatListBody, SeatListSnapshot, SeatListSubmission,
+    check_text_successor, is_genesis_reprotect, plan_device_removal_effect,
+    plan_release_group_effect, plan_seat_list_write, prepare_text_group, report_signer_lost,
+    seat_list_channel_server, text_group_user_ids, Channel, ChannelEntitlement, ChannelSeat,
+    DeviceRemovalEffect, Member, MemberCompositeKey, MlsGroup, MlsGroupCreateOutcome, MlsGroupKind,
+    ReferenceDb, ReleaseGroupEffect, SeatList, SeatListBody, SeatListSnapshot, SeatListSubmission,
     SeatListWriteDecision, SeatListWriteInput, SeatListWriteKind, SeatListWriteOutcome,
-    MAX_CHANNEL_SLOT_CAP,
+    SeatReleaseCause, MAX_CHANNEL_SLOT_CAP,
 };
 
 use super::AbstractProtectedChannels;
@@ -138,7 +139,40 @@ fn apply_decision(
         group
             .pending_removals
             .extend(plan.pending_added.iter().cloned());
+        if let Some(pending) = &plan.pending_device_removals {
+            group.pending_device_removals = pending.clone();
+        }
+        if plan.clear_signer_lost {
+            group.signer_lost = None;
+        }
     }
+}
+
+/// Apply a release primitive's effect on one open Text group (S2-D15);
+/// `true` when the group was written
+fn apply_release_effect(group: &mut MlsGroup, effect: ReleaseGroupEffect, path: &str) -> bool {
+    match effect {
+        ReleaseGroupEffect::Nothing => false,
+        ReleaseGroupEffect::PendingRemoval(pending) => {
+            group.pending_removals.push(pending);
+            true
+        }
+        ReleaseGroupEffect::SignerLost(lost) => {
+            report_signer_lost(path, &group.channel_id, &lost);
+            group.signer_lost = Some(lost);
+            true
+        }
+    }
+}
+
+/// The stored list's signer `(user, device)` of `channel_id`
+fn stored_signer<'a>(
+    seat_lists: &'a HashMap<String, SeatList>,
+    channel_id: &str,
+) -> Option<(&'a str, &'a str)> {
+    seat_lists
+        .get(channel_id)
+        .map(|list| (list.signer_user_id.as_str(), list.signer_device_id.as_str()))
 }
 
 #[async_trait]
@@ -252,6 +286,12 @@ impl AbstractProtectedChannels for ReferenceDb {
         submission: &SeatListSubmission,
         now: Timestamp,
     ) -> Result<SeatListWriteOutcome> {
+        let formats_v2 = revolt_config::config()
+            .await
+            .features
+            .protected_channels
+            .formats_v2;
+
         let mut channels = self.channels.lock().await;
         let messages = self.messages.lock().await;
         let entitlements = self.channel_entitlements.lock().await;
@@ -325,6 +365,7 @@ impl AbstractProtectedChannels for ReferenceDb {
             .values()
             .find(|group| is_open_text_group_of(group, channel_id))
             .cloned();
+        let text_group_users = text_group_user_ids(groups.values(), channel_id);
 
         let decision = plan_seat_list_write(&SeatListWriteInput {
             kind: SeatListWriteKind::Protect,
@@ -335,8 +376,8 @@ impl AbstractProtectedChannels for ReferenceDb {
             seats: &channel_seats,
             text_group: text_group.as_ref(),
             allow_claims: true,
-            // W1-2 wires formats_v2 from config
-            formats_v2: false,
+            formats_v2,
+            text_group_users: &text_group_users,
             now,
         })?;
         check_members(&members, &server_id, &decision)?;
@@ -362,6 +403,12 @@ impl AbstractProtectedChannels for ReferenceDb {
         allow_claims: bool,
         now: Timestamp,
     ) -> Result<SeatListWriteOutcome> {
+        let formats_v2 = revolt_config::config()
+            .await
+            .features
+            .protected_channels
+            .formats_v2;
+
         let entitlements = self.channel_entitlements.lock().await;
         let members = self.server_members.lock().await;
         let mut seat_lists = self.channel_seat_lists.lock().await;
@@ -381,6 +428,7 @@ impl AbstractProtectedChannels for ReferenceDb {
             .values()
             .find(|group| is_open_text_group_of(group, channel_id))
             .cloned();
+        let text_group_users = text_group_user_ids(groups.values(), channel_id);
 
         let decision = plan_seat_list_write(&SeatListWriteInput {
             kind: SeatListWriteKind::Put,
@@ -391,8 +439,8 @@ impl AbstractProtectedChannels for ReferenceDb {
             seats: &channel_seats,
             text_group: text_group.as_ref(),
             allow_claims,
-            // W1-2 wires formats_v2 from config
-            formats_v2: false,
+            formats_v2,
+            text_group_users: &text_group_users,
             now,
         })?;
         // Claims need an active entitlement (the planner refused
@@ -462,7 +510,11 @@ impl AbstractProtectedChannels for ReferenceDb {
             }
         }
 
-        let prepared = prepare_text_group(group, list)?;
+        let mut prepared = prepare_text_group(group, list)?;
+        // #213: a successor carries `signer_lost` over
+        if let Some(superseded) = supersedes.and_then(|id| groups.get(id)) {
+            prepared.signer_lost = superseded.signer_lost.clone();
+        }
 
         // A row already at the id: a Call squat at a derived id is evicted
         // (M9, see `is_derived_text_group_id`) with its Call-plane
@@ -508,9 +560,8 @@ impl AbstractProtectedChannels for ReferenceDb {
         server_id: Option<&str>,
         now: Timestamp,
     ) -> Result<Vec<String>> {
-        let cooldown_until = seat_cooldown_until(now)?;
-
         let entitlements = self.channel_entitlements.lock().await;
+        let seat_lists = self.channel_seat_lists.lock().await;
         let mut seats = self.channel_seats.lock().await;
         let mut groups = self.mls_groups.lock().await;
 
@@ -529,33 +580,122 @@ impl AbstractProtectedChannels for ReferenceDb {
 
         let mut affected = BTreeSet::new();
 
-        for seat in seats.values_mut() {
+        // Plan every seat first, so a failure writes nothing
+        let mut released = Vec::new();
+        for seat in seats.values() {
             if seat.user_id == user_id && seat.is_active() && in_scope(&seat.channel_id) {
-                seat.released_at = Some(now);
-                seat.cooldown_until = Some(cooldown_until);
-                affected.insert(seat.channel_id.clone());
+                let in_text_group =
+                    text_group_user_ids(groups.values(), &seat.channel_id).contains(user_id);
+                let mut seat = seat.clone();
+                seat.release(now, SeatReleaseCause::ServerRemoval, in_text_group)?;
+                released.push(seat);
             }
+        }
+        for seat in released {
+            affected.insert(seat.channel_id.clone());
+            seats.insert(seat.id.clone(), seat);
         }
 
         for group in groups.values_mut() {
-            if group.open
-                && group.kind == MlsGroupKind::Text
-                && in_scope(&group.channel_id)
-                && group.members.iter().any(|member| member.user_id == user_id)
-                && !group
-                    .pending_removals
-                    .iter()
-                    .any(|pending| pending.user_id == user_id)
-            {
-                group.pending_removals.push(MlsPendingRemoval {
-                    user_id: user_id.to_string(),
-                    created_at: now,
-                });
-                affected.insert(group.channel_id.clone());
+            if group.open && group.kind == MlsGroupKind::Text && in_scope(&group.channel_id) {
+                let signer = stored_signer(&seat_lists, &group.channel_id);
+                let effect = plan_release_group_effect(group, user_id, signer, now);
+                if apply_release_effect(group, effect, "server_removal") {
+                    affected.insert(group.channel_id.clone());
+                }
             }
         }
 
         Ok(affected.into_iter().collect())
+    }
+
+    async fn release_channel_seat(
+        &self,
+        channel_id: &str,
+        user_id: &str,
+        expected_seated_at: Timestamp,
+        cause: SeatReleaseCause,
+        now: Timestamp,
+    ) -> Result<bool> {
+        let seat_lists = self.channel_seat_lists.lock().await;
+        let mut seats = self.channel_seats.lock().await;
+        let mut groups = self.mls_groups.lock().await;
+
+        let id = ChannelSeat::composite_id(channel_id, user_id);
+        let Some(seat) = seats
+            .get(&id)
+            .filter(|seat| seat.is_active() && seat.seated_at == expected_seated_at)
+        else {
+            return Ok(false);
+        };
+
+        let in_text_group = text_group_user_ids(groups.values(), channel_id).contains(user_id);
+        let mut seat = seat.clone();
+        seat.release(now, cause, in_text_group)?;
+        seats.insert(id, seat);
+
+        if let Some(group) = groups
+            .values_mut()
+            .find(|group| is_open_text_group_of(group, channel_id))
+        {
+            let signer = stored_signer(&seat_lists, channel_id);
+            let effect = plan_release_group_effect(group, user_id, signer, now);
+            apply_release_effect(group, effect, "release_channel_seat");
+        }
+        Ok(true)
+    }
+
+    async fn add_pending_device_removal(
+        &self,
+        user_id: &str,
+        device_id: &str,
+        now: Timestamp,
+    ) -> Result<Vec<String>> {
+        let seat_lists = self.channel_seat_lists.lock().await;
+        let mut groups = self.mls_groups.lock().await;
+
+        let mut touched = BTreeSet::new();
+        for group in groups.values_mut() {
+            if !(group.open && group.kind == MlsGroupKind::Text) {
+                continue;
+            }
+            let signer = stored_signer(&seat_lists, &group.channel_id);
+            match plan_device_removal_effect(group, user_id, device_id, signer, now) {
+                None => {}
+                Some(DeviceRemovalEffect::Pending(pending)) => {
+                    group.pending_device_removals.push(pending);
+                    touched.insert(group.channel_id.clone());
+                }
+                Some(DeviceRemovalEffect::SignerLost(lost)) => {
+                    report_signer_lost("device_revoked", &group.channel_id, &lost);
+                    group.signer_lost = Some(lost);
+                    touched.insert(group.channel_id.clone());
+                }
+            }
+        }
+        Ok(touched.into_iter().collect())
+    }
+
+    async fn fetch_channels_with_active_seats(
+        &self,
+        after: Option<String>,
+        limit: i64,
+    ) -> Result<Vec<String>> {
+        let Ok(limit) = usize::try_from(limit) else {
+            return Ok(vec![]);
+        };
+        let seats = self.channel_seats.lock().await;
+        let channel_ids: BTreeSet<&str> = seats
+            .values()
+            .filter(|seat| seat.is_active())
+            .map(|seat| seat.channel_id.as_str())
+            .filter(|channel_id| after.as_deref().is_none_or(|after| *channel_id > after))
+            .collect();
+        Ok(channel_ids
+            .into_iter()
+            .take(limit)
+            .map(str::to_string)
+            .collect())
     }
 
     async fn delete_protected_channel_data(&self, channel_id: &str) -> Result<()> {

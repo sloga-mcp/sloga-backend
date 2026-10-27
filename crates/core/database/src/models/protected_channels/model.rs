@@ -28,7 +28,7 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     is_valid_group_id, is_valid_key_package_ref, Channel, MlsGroup, MlsGroupKind, MlsMemberAdded,
-    MlsPendingDeviceRemoval, MlsPendingRemoval,
+    MlsPendingDeviceRemoval, MlsPendingRemoval, MlsSignerLost, MlsSignerLostCause,
 };
 
 /// How long a released seat keeps counting against the slot cap (2.3)
@@ -286,6 +286,8 @@ pub struct SeatListWriteOutcome {
     pub released: Vec<String>,
     /// Users added to the open Text group's `pending_removals` (sorted)
     pub pending_removals_added: Vec<String>,
+    /// S2: the write cleared the open Text group's `signer_lost` (4.3 step 7)
+    pub signer_lost_cleared: bool,
 }
 
 /// The seat list together with the channel's open Text group, read in ONE
@@ -332,19 +334,197 @@ impl ChannelSeat {
         self.is_active() || self.is_cooling(now)
     }
 
-    /// Release this seat at `now`, starting the 14-day cooldown
-    pub fn release(&mut self, now: Timestamp) -> Result<()> {
+    /// Whether the user's keys count as received for the 2.3 no-cooldown
+    /// rule: `keys_received_at` is set, or (a pre-S2 seat, or a commit that
+    /// has not stamped it) `in_text_group`, the user holds or per
+    /// `member_added` ever held a device in one of the channel's Text groups
+    /// (`text_group_user_ids`)
+    pub fn keys_received(&self, in_text_group: bool) -> bool {
+        self.keys_received_at.is_some() || in_text_group
+    }
+
+    /// Release this seat at `now` for `cause` (2.3). A seat whose user never
+    /// received the keys (`keys_received`) frees at once (S2-D21): the cause
+    /// becomes `DeviceNeverJoined` and no cooldown starts. Otherwise the
+    /// 14-day cooldown starts, whatever the cause (O-4).
+    pub fn release(
+        &mut self,
+        now: Timestamp,
+        cause: SeatReleaseCause,
+        in_text_group: bool,
+    ) -> Result<()> {
+        let (cause, cooldown_until) =
+            seat_release_terms(self.keys_received(in_text_group), cause, now)?;
         self.released_at = Some(now);
-        self.cooldown_until = Some(seat_cooldown_until(now)?);
+        self.cooldown_until = cooldown_until;
+        self.release_cause = Some(cause);
         Ok(())
     }
 
-    /// Make this seat active again at `now`
+    /// Make this seat active again at `now`. A re-seat overwrites the last
+    /// release's cause and the keys stamp (2.3): the audit log is the
+    /// history.
     pub fn reactivate(&mut self, now: Timestamp) {
         self.seated_at = now;
         self.released_at = None;
         self.cooldown_until = None;
+        self.release_cause = None;
+        self.keys_received_at = None;
     }
+}
+
+/// The stored `(release_cause, cooldown_until)` of a release at `now` (2.3):
+/// `cause` and `now + 14 days` once the keys were received, else
+/// `DeviceNeverJoined` and no cooldown (S2-D21). `ChannelSeat::release` and
+/// the Mongo filtered releases both take it from here.
+pub fn seat_release_terms(
+    keys_received: bool,
+    cause: SeatReleaseCause,
+    now: Timestamp,
+) -> Result<(SeatReleaseCause, Option<Timestamp>)> {
+    if keys_received {
+        Ok((cause, Some(seat_cooldown_until(now)?)))
+    } else {
+        Ok((SeatReleaseCause::DeviceNeverJoined, None))
+    }
+}
+
+/// The users that hold, or per `member_added` ever held, a device in any
+/// Text group (open or closed) of `channel_id`: the 2.3 pre-S2 fallback of
+/// `ChannelSeat::keys_received`. Closed generations count so a user who has
+/// not rejoined a successor yet still cools (the fail-safe direction).
+pub fn text_group_user_ids<'a>(
+    groups: impl IntoIterator<Item = &'a MlsGroup>,
+    channel_id: &str,
+) -> BTreeSet<String> {
+    groups
+        .into_iter()
+        .filter(|group| group.channel_id == channel_id && group.kind == MlsGroupKind::Text)
+        .flat_map(|group| {
+            group
+                .members
+                .iter()
+                .map(|member| member.user_id.clone())
+                .chain(group.member_added.iter().map(|added| added.user_id.clone()))
+        })
+        .collect()
+}
+
+/// What a release primitive does to the channel's open Text group for the
+/// user it released (2.5 S2-D15, 6.3)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReleaseGroupEffect {
+    /// The user has no member device, or the group already carries the
+    /// entry (or `signer_lost`)
+    Nothing,
+    /// Append this user-level pending removal
+    PendingRemoval(MlsPendingRemoval),
+    /// The user signed the current list: set `signer_lost` (never an entry)
+    SignerLost(MlsSignerLost),
+}
+
+/// 2.5 "Release primitives never queue the signer" (S2-D15), the user-level
+/// half shared by the forced release and `release_channel_seat`: a released
+/// user with a member device in the open group gets one pending removal,
+/// unless the user signed the stored list (`signer`, its user and device),
+/// whose entry would wedge every send and Add (rule 1 lets the signer device
+/// go only in the rejoin case). That group gets `signer_lost` instead, naming
+/// the list's signer device. The stored cause is `DeviceRevoked`, the only
+/// one S2a stores (the doc's user-level cause is [S2b]); the 4.3 step-7
+/// recovery clears it exactly as for a revoked device.
+pub fn plan_release_group_effect(
+    group: &MlsGroup,
+    user_id: &str,
+    signer: Option<(&str, &str)>,
+    now: Timestamp,
+) -> ReleaseGroupEffect {
+    if !group.members.iter().any(|member| member.user_id == user_id) {
+        return ReleaseGroupEffect::Nothing;
+    }
+    match signer {
+        Some((signer_user, signer_device)) if signer_user == user_id => {
+            if group.signer_lost.is_some() {
+                ReleaseGroupEffect::Nothing
+            } else {
+                ReleaseGroupEffect::SignerLost(MlsSignerLost {
+                    user_id: signer_user.to_string(),
+                    device_id: signer_device.to_string(),
+                    cause: MlsSignerLostCause::DeviceRevoked,
+                    at: now,
+                })
+            }
+        }
+        _ => {
+            if group
+                .pending_removals
+                .iter()
+                .any(|pending| pending.user_id == user_id)
+            {
+                ReleaseGroupEffect::Nothing
+            } else {
+                ReleaseGroupEffect::PendingRemoval(MlsPendingRemoval {
+                    user_id: user_id.to_string(),
+                    created_at: now,
+                })
+            }
+        }
+    }
+}
+
+/// What `add_pending_device_removal` does to one open Text group (6.3
+/// "Device revocation", S2-D15, #222). `signer` is the stored list's signer
+/// (user, device), read in the same claimed transaction. The device that
+/// signed the current list sets `signer_lost` (if not already set) whether
+/// or not it still holds a leaf, never an entry; any other device that holds
+/// a leaf gets one `pending_device_removals` entry (idempotent).
+pub fn plan_device_removal_effect(
+    group: &MlsGroup,
+    user_id: &str,
+    device_id: &str,
+    signer: Option<(&str, &str)>,
+    now: Timestamp,
+) -> Option<DeviceRemovalEffect> {
+    if signer == Some((user_id, device_id)) {
+        return group.signer_lost.is_none().then(|| {
+            DeviceRemovalEffect::SignerLost(MlsSignerLost {
+                user_id: user_id.to_string(),
+                device_id: device_id.to_string(),
+                cause: MlsSignerLostCause::DeviceRevoked,
+                at: now,
+            })
+        });
+    }
+    let already = group
+        .pending_device_removals
+        .iter()
+        .any(|pending| pending.user_id == user_id && pending.device_id == device_id);
+    (group.has_member(user_id, device_id) && !already).then(|| {
+        DeviceRemovalEffect::Pending(MlsPendingDeviceRemoval {
+            user_id: user_id.to_string(),
+            device_id: device_id.to_string(),
+            created_at: now,
+        })
+    })
+}
+
+/// A write `plan_device_removal_effect` asks for
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DeviceRemovalEffect {
+    /// Append to `pending_device_removals`
+    Pending(MlsPendingDeviceRemoval),
+    /// Set `signer_lost`
+    SignerLost(MlsSignerLost),
+}
+
+/// Log and report (ids only) a `signer_lost` a release or revocation set
+/// (2.5, S2-D15)
+pub fn report_signer_lost(path: &str, channel_id: &str, lost: &MlsSignerLost) {
+    let message = format!(
+        "protected channel signer lost: path={path} channel={channel_id} user={} device={}",
+        lost.user_id, lost.device_id
+    );
+    log::warn!("{message}");
+    revolt_config::capture_message(&message, revolt_config::Level::Warning);
 }
 
 /// `now + SEAT_COOLDOWN_DAYS`
@@ -1502,6 +1682,8 @@ pub struct SeatListWriteInput<'a> {
     /// genesis, a v1-to-v2 upgrade). A channel whose stored list is v2 keeps
     /// v2 whatever it says (4.3 step 1).
     pub formats_v2: bool,
+    /// `text_group_user_ids` of the channel (the 2.3 no-cooldown fallback)
+    pub text_group_users: &'a BTreeSet<String>,
     pub now: Timestamp,
 }
 
@@ -1519,6 +1701,11 @@ pub struct SeatListWritePlan {
     pub pending_added: Vec<MlsPendingRemoval>,
     /// New `seat_list_ad_sha256` for the open Text group
     pub seat_list_ad_sha256: String,
+    /// The open Text group's whole new `pending_device_removals` when it
+    /// changes (2.5 "Clearing", 4.3 step 7); `None` leaves the field as is
+    pub pending_device_removals: Option<Vec<MlsPendingDeviceRemoval>>,
+    /// Unset the open Text group's `signer_lost` (4.3 step 7)
+    pub clear_signer_lost: bool,
 }
 
 impl SeatListWritePlan {
@@ -1534,6 +1721,7 @@ impl SeatListWritePlan {
                 .iter()
                 .map(|pending| pending.user_id.clone())
                 .collect(),
+            signer_lost_cleared: self.clear_signer_lost,
         }
     }
 }
@@ -1557,6 +1745,7 @@ impl SeatListWriteDecision {
                 claimed: vec![],
                 released: vec![],
                 pending_removals_added: vec![],
+                signer_lost_cleared: false,
             },
             SeatListWriteDecision::Apply(plan) => plan.outcome(),
         }
@@ -1579,10 +1768,11 @@ impl SeatListWriteDecision {
 /// owner are claimed by the driver in the same transaction (decision 13
 /// (W2)).
 ///
-/// Not wired here yet, because the planner does not hold their inputs or
-/// the drivers do not write their outputs: 4d (`check_removal_reason`, the
-/// reason header) and the step 7 `signer_lost` resolution
-/// (`resolve_signer_lost`), and the step 7 `release_cause`.
+/// Step 7 (S2) is wired: the `signer_lost` resolution (`resolve_signer_lost`,
+/// refusing before any claim), every release's `release_cause` and the 2.3
+/// no-cooldown rule (`ChannelSeat::release`), and the 2.5 "Clearing" of the
+/// open group's `pending_device_removals`. Not wired, because the planner
+/// does not hold its input: 4d (`check_removal_reason`, the reason header).
 pub fn plan_seat_list_write(input: &SeatListWriteInput<'_>) -> Result<SeatListWriteDecision> {
     let submission = input.submission;
     let now = input.now;
@@ -1605,7 +1795,8 @@ pub fn plan_seat_list_write(input: &SeatListWriteInput<'_>) -> Result<SeatListWr
 
     // Step 3b (S2): the authority's structure, `version`, `prev` and signer
     // device; the route verifies its signer key and signature
-    check_seat_list_authority(&body, submission.authority.as_ref(), input.stored)?;
+    let authority_change =
+        check_seat_list_authority(&body, submission.authority.as_ref(), input.stored)?;
 
     // Step 4: version rule
     match (input.kind, input.stored) {
@@ -1656,6 +1847,16 @@ pub fn plan_seat_list_write(input: &SeatListWriteInput<'_>) -> Result<SeatListWr
         }
     }
 
+    // Step 7 (S2, #222): while the open group carries `signer_lost`, only a
+    // list from another device with an authority change omitting the lost
+    // device lands; any other is refused here, before anything is planned
+    let signer_lost = resolve_signer_lost(
+        input.text_group,
+        &body,
+        authority_change.as_ref().map(|change| &change.authority),
+        now,
+    )?;
+
     // Step 7: claims and releases, reconciling the seat rows to the list
     let desired: BTreeSet<&str> = body.seats.iter().map(String::as_str).collect();
     let mut seat_rows = Vec::new();
@@ -1697,7 +1898,8 @@ pub fn plan_seat_list_write(input: &SeatListWriteInput<'_>) -> Result<SeatListWr
     for seat in input.seats {
         if seat.is_active() && !desired.contains(seat.user_id.as_str()) {
             let mut seat = seat.clone();
-            seat.release(now)?;
+            let in_text_group = input.text_group_users.contains(&seat.user_id);
+            seat.release(now, SeatReleaseCause::OwnerUnseat, in_text_group)?;
             released.push(seat.user_id.clone());
             seat_rows.push(seat);
         }
@@ -1772,6 +1974,25 @@ pub fn plan_seat_list_write(input: &SeatListWriteInput<'_>) -> Result<SeatListWr
         }
     }
 
+    // 2.5 "Clearing" (#224) in every seat-list write, then the step-7
+    // resolution: clear `signer_lost` and queue the lost device only if it
+    // holds a leaf (`resolve_signer_lost` decided that)
+    let mut pending_device_removals = None;
+    let clear_signer_lost = matches!(signer_lost, SignerLostResolution::Clear { .. });
+    if let Some(group) = input.text_group {
+        let mut cleared = group.clone();
+        retain_member_pending_device_removals(&mut cleared);
+        if let SignerLostResolution::Clear {
+            pending_device: Some(pending),
+        } = signer_lost
+        {
+            cleared.pending_device_removals.push(pending);
+        }
+        if cleared.pending_device_removals != group.pending_device_removals {
+            pending_device_removals = Some(cleared.pending_device_removals);
+        }
+    }
+
     // Step 8: handover append (route verified the statement itself)
     let mut handovers = input
         .stored
@@ -1816,6 +2037,8 @@ pub fn plan_seat_list_write(input: &SeatListWriteInput<'_>) -> Result<SeatListWr
         released,
         pending_added,
         seat_list_ad_sha256,
+        pending_device_removals,
+        clear_signer_lost,
     }))
 }
 
@@ -2110,9 +2333,9 @@ pub enum SignerLostResolution {
 /// and nothing is written: landing it would leave `signer_lost` set under a
 /// live signer. That includes a list signed by the lost device itself,
 /// which the doc does not name: the device was revoked, so the route never
-/// lets it sign, and refusing here fails closed if one gets through. Not
-/// wired into `plan_seat_list_write`: the drivers do not write the
-/// resolution yet (W1-2).
+/// lets it sign, and refusing here fails closed if one gets through.
+/// `plan_seat_list_write` runs it after step 5b and the drivers write the
+/// resolution in the list's transaction.
 pub fn resolve_signer_lost(
     text_group: Option<&MlsGroup>,
     body: &SeatListBody,
@@ -2154,10 +2377,25 @@ pub fn resolve_signer_lost(
     })
 }
 
+/// 2.5 "Clearing" (#224): drop every `pending_device_removals` entry whose
+/// device holds no leaf in `group`. An entry for a device that is not a
+/// member is one no commit can satisfy, and rule 3a would refuse every Add
+/// behind it. Every write that changes `members` or the list calls this in
+/// the same transaction.
+pub fn retain_member_pending_device_removals(group: &mut MlsGroup) {
+    let pending = std::mem::take(&mut group.pending_device_removals);
+    group.pending_device_removals = pending
+        .into_iter()
+        .filter(|pending| group.has_member(&pending.user_id, &pending.device_id))
+        .collect();
+}
+
 /// Validate a Text group create request against the newest seat list and
 /// fill in the server-owned Text fields (2.5, 6.1): `kind = Text`,
-/// `seat_list_ad_sha256` from `list`, no pending removals, and the
-/// creator's `member_added` entry at epoch 0.
+/// `seat_list_ad_sha256` from `list`, no pending removals of either kind,
+/// no `signer_lost` and no `rejoin_readd` (S2; a successor create copies
+/// the superseded group's `signer_lost` itself, #213), and the creator's
+/// `member_added` entry at epoch 0.
 pub fn prepare_text_group(group: &MlsGroup, list: &SeatList) -> Result<MlsGroup> {
     match group.generation {
         Some(generation) if generation <= MAX_TEXT_GROUP_GENERATION => {}
@@ -2185,6 +2423,9 @@ pub fn prepare_text_group(group: &MlsGroup, list: &SeatList) -> Result<MlsGroup>
     prepared.kind = MlsGroupKind::Text;
     prepared.seat_list_ad_sha256 = Some(list.commit_ad_sha256()?);
     prepared.pending_removals = vec![];
+    prepared.pending_device_removals = vec![];
+    prepared.signer_lost = None;
+    prepared.rejoin_readd = vec![];
     prepared.member_added = vec![MlsMemberAdded {
         user_id: group.created_by.user_id.clone(),
         device_id: group.created_by.device_id.clone(),

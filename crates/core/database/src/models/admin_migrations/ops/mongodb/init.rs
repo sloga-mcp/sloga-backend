@@ -35,6 +35,45 @@ pub(crate) fn protected_nonce_index() -> bson::Document {
     }
 }
 
+/// Name of the `channel_seats` index the reconciler sweep pages active
+/// seats through
+pub(crate) const ACTIVE_SEATS_INDEX_NAME: &str = "active_seats_by_channel";
+
+/// Serves the reconciler sweep that pages the channels with active seats
+/// (docs/protected-channels-design.md 2.7 "S2 migration block", 6.3): an
+/// active seat has no `released_at` (omitted, matched as `null`), so the
+/// sweep's equality on the leading field lands on the active rows, ordered
+/// by channel.
+///
+/// The one spec for this file, the S2 migration block and the tests.
+pub(crate) fn active_seats_index() -> bson::Document {
+    doc! {
+        "key": {
+            "released_at": 1_i32,
+            "channel_id": 1_i32
+        },
+        "name": ACTIVE_SEATS_INDEX_NAME
+    }
+}
+
+/// Name of the `mls_commits` index the Text Welcome route looks up through
+pub(crate) const TEXT_WELCOME_INDEX_NAME: &str = "text_welcome_lookup";
+
+/// Serves the Welcome route's "newest commit in this group that added this
+/// device" (docs/protected-channels-design.md 2.7 "S2 migration block",
+/// 7.2). `added` is an array, so this is a multikey index.
+///
+/// The one spec for this file, the S2 migration block and the tests.
+pub(crate) fn text_welcome_index() -> bson::Document {
+    doc! {
+        "key": {
+            "group_id": 1_i32,
+            "added.device_id": 1_i32
+        },
+        "name": TEXT_WELCOME_INDEX_NAME
+    }
+}
+
 pub async fn create_database(db: &MongoDb) {
     info!("Creating database.");
     let db = db.db();
@@ -754,7 +793,9 @@ pub async fn create_database(db: &MongoDb) {
                     "user_id": 1_i32
                 },
                 "name": "user_id"
-            }
+            },
+            // Serves the reconciler sweep over active seats (S2).
+            active_seats_index(),
         ]
     })
     .await
@@ -1308,7 +1349,9 @@ pub async fn create_database(db: &MongoDb) {
                     "epoch": 1_i32
                 },
                 "name": "group_epoch"
-            }
+            },
+            // Serves the Text Welcome lookup (S2).
+            text_welcome_index(),
         ]
     })
     .await
