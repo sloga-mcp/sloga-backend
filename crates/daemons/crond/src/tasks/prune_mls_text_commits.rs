@@ -144,6 +144,9 @@ mod tests {
             seat_list_ad_sha256: (kind == MlsGroupKind::Text).then(|| "ab".repeat(32)),
             pending_removals: vec![],
             member_added: vec![],
+            pending_device_removals: vec![],
+            signer_lost: None,
+            rejoin_readd: vec![],
         }
     }
 
@@ -161,6 +164,7 @@ mod tests {
             created_at,
             rejoin_intents: vec![],
             removed_reasons: vec![],
+            welcome: None,
         }
     }
 

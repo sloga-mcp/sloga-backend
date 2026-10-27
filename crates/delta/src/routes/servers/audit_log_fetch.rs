@@ -30,8 +30,10 @@ fn targets_a_user(action: AuditLogAction) -> bool {
         | AuditLogAction::MemberMove
         | AuditLogAction::MemberDisconnect
         | AuditLogAction::MessageDelete
-        | AuditLogAction::ServerOwnerTransfer => true,
+        | AuditLogAction::ServerOwnerTransfer
+        | AuditLogAction::ProtectedSeatRelease => true,
         AuditLogAction::MessageBulkDelete
+        | AuditLogAction::ProtectedSeatsUpdate
         | AuditLogAction::ChannelCreate
         | AuditLogAction::ChannelUpdate
         | AuditLogAction::ChannelDelete

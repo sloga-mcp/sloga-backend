@@ -232,6 +232,7 @@ mod tests {
             created_at: at,
             rejoin_intents: vec![],
             removed_reasons: vec![],
+            welcome: None,
         }
     }
 
@@ -357,6 +358,8 @@ mod tests {
             key_package_ref: "rejoin-ref".to_string(),
             signature: member_device.sign("rejoin intent"),
             created_at: seconds_ago(5),
+            generation: None,
+            issued_at: None,
         };
         db.upsert_mls_join_intent(&intent)
             .await
@@ -402,6 +405,9 @@ mod tests {
             seat_list_ad_sha256: None,
             pending_removals: vec![],
             member_added: vec![],
+            pending_device_removals: vec![],
+            signer_lost: None,
+            rejoin_readd: vec![],
         };
         assert!(matches!(
             db.create_mls_group(&call_group, None)

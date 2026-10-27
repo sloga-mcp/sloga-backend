@@ -847,6 +847,13 @@ pub enum EventV1 {
         /// relay events from an older delta during rollout.
         #[serde(default)]
         rejoin: bool,
+        /// Text join payload only (protected channels design §3.13): the
+        /// signed generation. Absent on Call intents and S1 intents.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        generation: Option<u32>,
+        /// Text join payload only (design §3.13): the signed issue time (ms)
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        issued_at: Option<i64>,
     },
 
     /// Live push of an MLS commit envelope (media E2EE).
@@ -1279,5 +1286,55 @@ mod tests {
             other => panic!("decoded to another event: {other:?}"),
         }
         assert_eq!(serde_json::to_string(&event).expect("serializes"), wire);
+    }
+
+    /// The join request exactly as an S1 build (dafb3433) sends it
+    const JOIN_REQUESTED_S1: &str = r#"{"type":"MlsJoinRequested","group_id":"G","channel_id":"C","user_id":"U","device_id":"D","key_package_ref":"a3ByZWY","signature":"c2ln","rejoin":false}"#;
+
+    /// S2 (design §3.13): `generation` and `issued_at` are absent when
+    /// `None`, so an S1-shaped event is byte-identical on the wire and an
+    /// S1 payload decodes with both `None`; set values travel under their
+    /// exact keys
+    #[test]
+    fn mls_join_requested_text_fields_are_absent_when_empty() {
+        let event = serde_json::from_str::<EventV1>(JOIN_REQUESTED_S1).expect("deserializes");
+        match &event {
+            EventV1::MlsJoinRequested {
+                generation,
+                issued_at,
+                rejoin,
+                ..
+            } => {
+                assert_eq!((*generation, *issued_at, *rejoin), (None, None, false));
+            }
+            other => panic!("decoded to another event: {other:?}"),
+        }
+        assert_eq!(
+            serde_json::to_string(&event).expect("serializes"),
+            JOIN_REQUESTED_S1
+        );
+
+        let text = EventV1::MlsJoinRequested {
+            group_id: "G".to_string(),
+            channel_id: "C".to_string(),
+            user_id: "U".to_string(),
+            device_id: "D".to_string(),
+            key_package_ref: "a3ByZWY".to_string(),
+            signature: "c2ln".to_string(),
+            rejoin: true,
+            generation: Some(3),
+            issued_at: Some(1_790_812_800_000),
+        };
+        let wire = serde_json::to_value(&text).expect("serializes");
+        assert_eq!(wire["generation"], 3);
+        assert_eq!(wire["issued_at"], 1_790_812_800_000i64);
+        match serde_json::from_value::<EventV1>(wire).expect("deserializes") {
+            EventV1::MlsJoinRequested {
+                generation,
+                issued_at,
+                ..
+            } => assert_eq!((generation, issued_at), (Some(3), Some(1_790_812_800_000))),
+            other => panic!("round-tripped to another event: {other:?}"),
+        }
     }
 }

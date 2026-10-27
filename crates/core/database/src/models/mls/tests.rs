@@ -42,6 +42,9 @@ fn make_group(id: &str, channel_id: &str, creator: &MlsMemberDevice) -> MlsGroup
         seat_list_ad_sha256: None,
         pending_removals: vec![],
         member_added: vec![],
+        pending_device_removals: vec![],
+        signer_lost: None,
+        rejoin_readd: vec![],
     }
 }
 
@@ -65,6 +68,7 @@ fn make_commit(
         created_at: Timestamp::now_utc(),
         rejoin_intents: vec![],
         removed_reasons: vec![],
+        welcome: None,
     }
 }
 
@@ -612,6 +616,8 @@ async fn group_sweep_cascades_to_commits_and_intents() {
             key_package_ref: "ref0".to_string(),
             signature: "c2ln".to_string(),
             created_at: Timestamp::now_utc(),
+            generation: None,
+            issued_at: None,
         })
         .await
         .unwrap();
@@ -674,6 +680,8 @@ async fn admission_consumes_the_added_devices_join_intent() {
             key_package_ref: "ref0".to_string(),
             signature: "c2ln".to_string(),
             created_at: Timestamp::now_utc(),
+            generation: None,
+            issued_at: None,
         };
 
         let group = make_group(&group_id(1), "channel_consume_a", &creator);
@@ -892,6 +900,7 @@ fn seat_list_row(
         signature: "A".repeat(86),
         handovers: vec![],
         updated_at: Timestamp::now_utc(),
+        authority: None,
     }
 }
 
@@ -912,6 +921,8 @@ async fn store_genesis_seat_list(db: &Database, row: &SeatList) {
             seated_at: Timestamp::now_utc(),
             released_at: None,
             cooldown_until: None,
+            release_cause: None,
+            keys_received_at: None,
         })
         .collect();
 
@@ -984,6 +995,7 @@ async fn try_put_next_seat_list(
                 signature: row.signature.clone(),
                 signer_device_id: signer.device_id.clone(),
                 handover: None,
+                authority: None,
             },
             true,
             Timestamp::now_utc(),
@@ -1123,6 +1135,9 @@ async fn seed_text_group(db: &Database, seed: &TextSeed) -> TextFixture {
                 at: an_hour_ago,
             })
             .collect(),
+        pending_device_removals: vec![],
+        signer_lost: None,
+        rejoin_readd: vec![],
     };
 
     insert_raw_group(db, &group).await;
@@ -1190,6 +1205,8 @@ fn rejoin_intent(group: &str, member: &MlsMemberDevice, at: Timestamp) -> MlsJoi
             at.duration_since(Timestamp::UNIX_EPOCH).whole_seconds()
         ),
         created_at: at,
+        generation: None,
+        issued_at: None,
     }
 }
 

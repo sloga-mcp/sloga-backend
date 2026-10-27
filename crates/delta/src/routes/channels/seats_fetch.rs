@@ -614,6 +614,8 @@ mod tests {
             seated_at: at("2026-09-01T00:00:00.000Z"),
             released_at: released_at.map(at),
             cooldown_until: cooldown_until.map(at),
+            release_cause: None,
+            keys_received_at: None,
         }
     }
 

@@ -1130,6 +1130,8 @@ impl From<crate::AuditLogAction> for AuditLogAction {
             crate::AuditLogAction::RoleRanksUpdate => AuditLogAction::RoleRanksUpdate,
             crate::AuditLogAction::ServerUpdate => AuditLogAction::ServerUpdate,
             crate::AuditLogAction::ServerOwnerTransfer => AuditLogAction::ServerOwnerTransfer,
+            crate::AuditLogAction::ProtectedSeatsUpdate => AuditLogAction::ProtectedSeatsUpdate,
+            crate::AuditLogAction::ProtectedSeatRelease => AuditLogAction::ProtectedSeatRelease,
             crate::AuditLogAction::Unknown => AuditLogAction::Unknown,
         }
     }
@@ -1163,6 +1165,8 @@ impl From<AuditLogAction> for crate::AuditLogAction {
             AuditLogAction::RoleRanksUpdate => crate::AuditLogAction::RoleRanksUpdate,
             AuditLogAction::ServerUpdate => crate::AuditLogAction::ServerUpdate,
             AuditLogAction::ServerOwnerTransfer => crate::AuditLogAction::ServerOwnerTransfer,
+            AuditLogAction::ProtectedSeatsUpdate => crate::AuditLogAction::ProtectedSeatsUpdate,
+            AuditLogAction::ProtectedSeatRelease => crate::AuditLogAction::ProtectedSeatRelease,
             AuditLogAction::Unknown => crate::AuditLogAction::Unknown,
         }
     }
@@ -2458,6 +2462,17 @@ impl From<crate::MlsRemovalReason> for MlsRemovalReason {
             crate::MlsRemovalReason::OffList => MlsRemovalReason::OffList,
             crate::MlsRemovalReason::Revoked => MlsRemovalReason::Revoked,
             crate::MlsRemovalReason::Rejoin => MlsRemovalReason::Rejoin,
+            crate::MlsRemovalReason::PendingDevice => MlsRemovalReason::PendingDevice,
+            crate::MlsRemovalReason::Idle => MlsRemovalReason::Idle,
+            crate::MlsRemovalReason::Unknown => MlsRemovalReason::Unknown,
+        }
+    }
+}
+
+impl From<crate::MlsSignerLostCause> for MlsSignerLostCause {
+    fn from(value: crate::MlsSignerLostCause) -> Self {
+        match value {
+            crate::MlsSignerLostCause::DeviceRevoked => MlsSignerLostCause::DeviceRevoked,
         }
     }
 }
@@ -2668,6 +2683,8 @@ impl From<DataSeatList> for crate::SeatListSubmission {
             signature: value.signature,
             signer_device_id: value.signer_device_id,
             handover: value.handover.map(Into::into),
+            // Placeholder: `value.authority` is wired in S2-W1-3
+            authority: None,
         }
     }
 }
@@ -2682,6 +2699,17 @@ impl From<crate::SeatList> for ChannelSeatListInfo {
             signer_device_id: value.signer_device_id,
             handovers: value.handovers.into_iter().map(Into::into).collect(),
             authority: None,
+        }
+    }
+}
+
+impl From<crate::SeatReleaseCause> for SeatReleaseCauseInfo {
+    fn from(value: crate::SeatReleaseCause) -> Self {
+        match value {
+            crate::SeatReleaseCause::OwnerUnseat => SeatReleaseCauseInfo::OwnerUnseat,
+            crate::SeatReleaseCause::ServerRemoval => SeatReleaseCauseInfo::ServerRemoval,
+            crate::SeatReleaseCause::AccessLost => SeatReleaseCauseInfo::AccessLost,
+            crate::SeatReleaseCause::DeviceNeverJoined => SeatReleaseCauseInfo::DeviceNeverJoined,
         }
     }
 }
@@ -2767,6 +2795,92 @@ mod protected_channel_bridge_tests {
                 epoch: 5,
                 at: Timestamp::UNIX_EPOCH,
             }],
+            pending_device_removals: vec![],
+            signer_lost: None,
+            rejoin_readd: vec![],
+        }
+    }
+
+    /// S2-D29: a stored Welcome never reaches the wire commit. The
+    /// bridged `MlsCommitInfo` has no `welcome` key and carries none of its
+    /// bytes, whatever else the row holds
+    #[test]
+    fn commit_info_never_carries_the_welcome() {
+        let welcome = "V0VMQ09NRVNFQ1JFVEJZVEVT".to_string();
+        let commit = crate::MlsCommit {
+            id: crate::MlsCommit::composite_id(&format!("{}1", "0".repeat(63)), 8),
+            group_id: format!("{}1", "0".repeat(63)),
+            epoch: 8,
+            committer: device("01JA00000000000000000USERA", "a"),
+            commit: "Y29tbWl0".to_string(),
+            size: 6,
+            added: vec![device("01JA00000000000000000USERC", "c")],
+            removed: vec![],
+            created_at: Timestamp::UNIX_EPOCH,
+            rejoin_intents: vec![],
+            removed_reasons: vec![],
+            welcome: Some(welcome.clone()),
+        };
+        assert!(serde_json::to_string(&commit).unwrap().contains(&welcome));
+
+        let without = crate::MlsCommit {
+            welcome: None,
+            ..commit.clone()
+        };
+        let info = commit.into_commit_info("01JA0000000000000000CHANNEL");
+        let json = serde_json::to_string(&info).unwrap();
+        assert!(!json.contains("welcome"), "{json}");
+        assert!(!json.contains(&welcome), "{json}");
+        assert_eq!(
+            info,
+            without.into_commit_info("01JA0000000000000000CHANNEL")
+        );
+    }
+
+    /// New stored enum values map onto their v0 counterparts (W1-0 names)
+    #[test]
+    fn s2_stored_enums_map_to_v0() {
+        for (stored, wire) in [
+            (
+                crate::MlsRemovalReason::PendingDevice,
+                v0::MlsRemovalReason::PendingDevice,
+            ),
+            (crate::MlsRemovalReason::Idle, v0::MlsRemovalReason::Idle),
+            (
+                crate::MlsRemovalReason::Unknown,
+                v0::MlsRemovalReason::Unknown,
+            ),
+        ] {
+            assert_eq!(v0::MlsRemovalReason::from(stored), wire);
+        }
+        assert_eq!(
+            v0::MlsSignerLostCause::from(crate::MlsSignerLostCause::DeviceRevoked),
+            v0::MlsSignerLostCause::DeviceRevoked
+        );
+        for (stored, wire) in [
+            (
+                crate::SeatReleaseCause::OwnerUnseat,
+                v0::SeatReleaseCauseInfo::OwnerUnseat,
+            ),
+            (
+                crate::SeatReleaseCause::ServerRemoval,
+                v0::SeatReleaseCauseInfo::ServerRemoval,
+            ),
+            (
+                crate::SeatReleaseCause::AccessLost,
+                v0::SeatReleaseCauseInfo::AccessLost,
+            ),
+            (
+                crate::SeatReleaseCause::DeviceNeverJoined,
+                v0::SeatReleaseCauseInfo::DeviceNeverJoined,
+            ),
+        ] {
+            assert_eq!(v0::SeatReleaseCauseInfo::from(stored), wire);
+            // Same snake_case value on the stored and the wire enum
+            assert_eq!(
+                serde_json::to_value(stored).unwrap(),
+                serde_json::to_value(wire).unwrap()
+            );
         }
     }
 
@@ -2830,6 +2944,7 @@ mod protected_channel_bridge_tests {
             signature: "c2ln".to_string(),
             handovers: submission.handover.into_iter().collect(),
             updated_at: Timestamp::UNIX_EPOCH,
+            authority: None,
         }
         .into();
         assert_eq!(list.version, 3);
@@ -2846,6 +2961,8 @@ mod protected_channel_bridge_tests {
             seated_at: Timestamp::UNIX_EPOCH,
             released_at: None,
             cooldown_until: None,
+            release_cause: None,
+            keys_received_at: None,
         };
         assert_eq!(seat.clone().into_seat_info().seated_without_access, None);
         assert_eq!(seat.into_cooling_info(), None);

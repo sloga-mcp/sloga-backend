@@ -62,6 +62,12 @@ pub const CONTEXT_HANDOVER: &str = "sloga-owner-handover-v1";
 /// Commit `authenticated_data` context field (3.12.1, WIRE FORMAT, never rename)
 pub const CONTEXT_COMMIT_AD: &str = "sloga-text-commit-ad-v1";
 
+/// `ProtectedChannelChanged.scope` item: the seat list or seats changed (7.5)
+pub const PROTECTED_SCOPE_SEATS: &str = "seats";
+
+/// `ProtectedChannelChanged.scope` item: the open Text group changed (7.5)
+pub const PROTECTED_SCOPE_TEXT_GROUP: &str = "text_group";
+
 /// Length of an Ed25519 signature in unpadded b64 (0.1)
 const SIGNATURE_B64_LEN: usize = 86;
 
@@ -129,6 +135,26 @@ auto_derived!(
         /// `released_at + 14 days`; the seat counts against the cap until then
         #[serde(skip_serializing_if = "Option::is_none")]
         pub cooldown_until: Option<Timestamp>,
+        /// S2: why the seat was last released (2.3)
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub release_cause: Option<SeatReleaseCause>,
+        /// S2: when the user's first device was added to the Text group (2.3)
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub keys_received_at: Option<Timestamp>,
+    }
+
+    /// Why a seat was released (2.3, S2). Stored snake_case.
+    #[derive(Copy, Hash)]
+    #[serde(rename_all = "snake_case")]
+    pub enum SeatReleaseCause {
+        /// The owner's seat list unseated the user
+        OwnerUnseat,
+        /// A server-forced path (kick, ban, leave, account deletion)
+        ServerRemoval,
+        /// The reconciler found the user lost access to the channel
+        AccessLost,
+        /// Released before any of the user's devices received the keys
+        DeviceNeverJoined,
     }
 
     /// An owner handover statement and its signature (2.4, 4.6)
@@ -136,6 +162,14 @@ auto_derived!(
         /// Exact canonical handover body (4.6)
         pub body: String,
         /// b64 Ed25519 signature by the `from` device
+        pub signature: String,
+    }
+
+    /// A channel authority and its signature (2.4, 4.10, S2)
+    pub struct SignedAuthority {
+        /// Exact canonical authority body (4.10)
+        pub body: String,
+        /// b64 Ed25519 signature over `body`
         pub signature: String,
     }
 
@@ -160,6 +194,9 @@ auto_derived!(
         pub handovers: Vec<SignedHandover>,
         /// When this row was last written
         pub updated_at: Timestamp,
+        /// S2: the channel authority a v2 body names (2.4); never on a v1 row
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub authority: Option<SignedAuthority>,
     }
 );
 
@@ -184,6 +221,8 @@ pub struct SeatListSubmission {
     pub signer_device_id: String,
     /// Handover statement to append (already verified by the route, 4.3 step 8)
     pub handover: Option<SignedHandover>,
+    /// S2: the channel authority of a v2 list (4.3 step 3b)
+    pub authority: Option<SignedAuthority>,
 }
 
 /// What a protect or seat PUT did
@@ -797,6 +836,8 @@ pub fn plan_seat_list_write(input: &SeatListWriteInput<'_>) -> Result<SeatListWr
                     seated_at: now,
                     released_at: None,
                     cooldown_until: None,
+                    release_cause: None,
+                    keys_received_at: None,
                 });
                 claimed.push(user_id.to_string());
             }
@@ -906,6 +947,7 @@ pub fn plan_seat_list_write(input: &SeatListWriteInput<'_>) -> Result<SeatListWr
         signature: submission.signature.clone(),
         handovers,
         updated_at: now,
+        authority: None,
     };
     let seat_list_ad_sha256 = row.commit_ad_sha256()?;
 

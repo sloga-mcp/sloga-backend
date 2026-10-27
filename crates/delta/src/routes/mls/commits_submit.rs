@@ -251,6 +251,7 @@ async fn submit_call_commit(
         rejoin_intents: vec![],
         // Nor removal reasons (Text-only, B48): never serialized for Call
         removed_reasons: vec![],
+        welcome: None,
     };
 
     // The CAS — one winner per epoch; membership, epoch monotonicity, the
@@ -510,6 +511,7 @@ async fn submit_text_commit(
         // Filled by the commit transaction from the stored intents
         rejoin_intents: vec![],
         removed_reasons,
+        welcome: None,
     };
 
     match db
@@ -605,14 +607,21 @@ async fn submit_text_commit(
 
 /// Rank of a Remove rule for the advisory `removed_reasons` (B48): the
 /// strongest admitting rule is stamped, `pending_removal` > `off_list` >
-/// `revoked` > `own_user` > `rejoin`
+/// `revoked` > `own_user` > `rejoin` (the S1 order, kept until W2 adopts
+/// the design §6.1 S2 order). The S2 reasons are not stamped yet; they rank
+/// below `rejoin` and `own_user`, as in §6.1 (a label native can derive is
+/// never hidden by one it cannot), with `pending_device` above `idle`.
 fn removal_priority(reason: MlsRemovalReason) -> u8 {
     match reason {
-        MlsRemovalReason::PendingRemoval => 5,
-        MlsRemovalReason::OffList => 4,
-        MlsRemovalReason::Revoked => 3,
-        MlsRemovalReason::OwnUser => 2,
-        MlsRemovalReason::Rejoin => 1,
+        MlsRemovalReason::PendingRemoval => 7,
+        MlsRemovalReason::OffList => 6,
+        MlsRemovalReason::Revoked => 5,
+        MlsRemovalReason::OwnUser => 4,
+        MlsRemovalReason::Rejoin => 3,
+        MlsRemovalReason::PendingDevice => 2,
+        MlsRemovalReason::Idle => 1,
+        // Decode-only: never produced server-side, so it never wins
+        MlsRemovalReason::Unknown => 0,
     }
 }
 
@@ -908,6 +917,30 @@ mod tests {
     };
 
     type Submitted = Result<Arbitrated<v0::ResponseSubmitMlsCommit>>;
+
+    /// The S1 stamping order is unchanged by the S2 variants (W1); the S2
+    /// reasons rank below every S1 reason and `Unknown` never wins
+    #[test]
+    fn removal_priority_keeps_the_s1_order() {
+        let order = [
+            MlsRemovalReason::PendingRemoval,
+            MlsRemovalReason::OffList,
+            MlsRemovalReason::Revoked,
+            MlsRemovalReason::OwnUser,
+            MlsRemovalReason::Rejoin,
+            MlsRemovalReason::PendingDevice,
+            MlsRemovalReason::Idle,
+            MlsRemovalReason::Unknown,
+        ];
+        for pair in order.windows(2) {
+            assert!(
+                super::removal_priority(pair[0]) > super::removal_priority(pair[1]),
+                "{:?} must outrank {:?}",
+                pair[0],
+                pair[1]
+            );
+        }
+    }
 
     /// A user, one of their sessions and a device bound to it
     struct Party {
@@ -1646,6 +1679,7 @@ mod tests {
                     created_at: Timestamp::now_utc(),
                     rejoin_intents: vec![],
                     removed_reasons: vec![],
+                    welcome: None,
                 },
                 &stored.commit_ad_sha256().expect("hash"),
                 FIXTURE_DEVICE_CAP,
@@ -1793,6 +1827,7 @@ mod tests {
             created_at: Timestamp::now_utc(),
             rejoin_intents: vec![],
             removed_reasons: vec![],
+            welcome: None,
         };
         let ad = current_ad(&setup.harness, setup.channel_id()).await;
         let at = |epoch: i64| {
@@ -2137,6 +2172,7 @@ mod tests {
             signature: next.signature,
             handovers: vec![],
             updated_at: Timestamp::now_utc(),
+            authority: None,
         }
         .commit_ad_sha256()
         .expect("hash");
@@ -2698,6 +2734,8 @@ mod tests {
             key_package_ref: "rejoin-key-package".to_string(),
             signature: "rejoin-signature".to_string(),
             created_at: Timestamp::now_utc(),
+            generation: None,
+            issued_at: None,
         };
         db.upsert_mls_join_intent(&intent)
             .await
@@ -2879,6 +2917,8 @@ mod tests {
             key_package_ref: "rejoin-key-package".to_string(),
             signature: "rejoin-signature".to_string(),
             created_at,
+            generation: None,
+            issued_at: None,
         };
         db.upsert_mls_join_intent(&intent(before_add))
             .await
@@ -3140,6 +3180,8 @@ mod tests {
             key_package_ref: "rejoin-key-package".to_string(),
             signature: "rejoin-signature".to_string(),
             created_at: Timestamp::now_utc(),
+            generation: None,
+            issued_at: None,
         })
         .await
         .expect("the rejoin intent");
@@ -3372,6 +3414,9 @@ mod tests {
             seat_list_ad_sha256: None,
             pending_removals: vec![],
             member_added: vec![],
+            pending_device_removals: vec![],
+            signer_lost: None,
+            rejoin_readd: vec![],
         };
         assert!(matches!(
             db.create_mls_group(&group, None).await.expect("call group"),
@@ -3538,6 +3583,9 @@ mod tests {
             seat_list_ad_sha256: None,
             pending_removals: vec![],
             member_added: vec![],
+            pending_device_removals: vec![],
+            signer_lost: None,
+            rejoin_readd: vec![],
         };
         assert!(matches!(
             db.create_mls_group(&group, None).await.expect("call group"),

@@ -658,6 +658,8 @@ fn rejoin_outstanding_policy_requires_every_member_fresh() {
             key_package_ref: "ref0".to_string(),
             signature: "c2ln".to_string(),
             created_at: now.checked_sub(Duration::seconds(age_seconds)).unwrap(),
+            generation: None,
+            issued_at: None,
         }
     }
 

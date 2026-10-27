@@ -19,8 +19,9 @@ use crate::{
     channel_seats_used, seat_list_removed_users, Channel, ChannelEntitlement,
     ChannelEntitlementSource, ChannelEntitlementState, ChannelSeat, Database, E2EEContentType,
     E2EEEnvelope, HandoverBody, Member, MemberCompositeKey, MlsGroup, MlsGroupCreateOutcome,
-    MlsGroupKind, MlsMemberDevice, SeatList, SeatListBody, SeatListSubmission, Server,
-    SignedHandover, E2EE_PROTOCOL_VERSION, MAX_SEAT_LIST_HANDOVERS, SEAT_COOLDOWN_DAYS,
+    MlsGroupKind, MlsMemberDevice, SeatList, SeatListBody, SeatListSubmission, SeatReleaseCause,
+    Server, SignedAuthority, SignedHandover, E2EE_PROTOCOL_VERSION, MAX_SEAT_LIST_HANDOVERS,
+    PROTECTED_SCOPE_SEATS, PROTECTED_SCOPE_TEXT_GROUP, SEAT_COOLDOWN_DAYS,
 };
 
 // Section 5.1 inputs
@@ -104,6 +105,7 @@ fn submit(version: i64, seats: &[&str]) -> SeatListSubmission {
         signature: signature(version),
         signer_device_id: DEVICE_A.to_string(),
         handover: None,
+        authority: None,
     }
 }
 
@@ -131,6 +133,9 @@ fn text_group(id_byte: u8, creator: &MlsMemberDevice, generation: u32) -> MlsGro
         seat_list_ad_sha256: None,
         pending_removals: vec![],
         member_added: vec![],
+        pending_device_removals: vec![],
+        signer_lost: None,
+        rejoin_readd: vec![],
     }
 }
 
@@ -232,6 +237,7 @@ fn submit_in(channel_id: &str, version: i64, seats: &[&str]) -> SeatListSubmissi
         signature: signature(version),
         signer_device_id: DEVICE_A.to_string(),
         handover: None,
+        authority: None,
     }
 }
 
@@ -490,6 +496,7 @@ fn commit_ad_matches_the_5_7_vector() {
             signature: VECTOR_HANDOVER_SIGNATURE.to_string(),
         }],
         updated_at: at(0),
+        authority: None,
     };
 
     let ad = row.commit_ad().unwrap();
@@ -955,6 +962,7 @@ async fn racing_seat_claims_never_exceed_the_cap() {
                     signature: signature(task),
                     signer_device_id: DEVICE_A.to_string(),
                     handover: None,
+                    authority: None,
                 };
                 db.put_seat_list(CHANNEL, &submission, true, at(0)).await
             }));
@@ -1388,6 +1396,8 @@ async fn delete_cascade_removes_the_protected_channel_data() {
             key_package_ref: "cmVm".to_string(),
             signature: signature(1),
             created_at: at(0),
+            generation: None,
+            issued_at: None,
         })
         .await
         .unwrap();
@@ -1587,6 +1597,7 @@ async fn text_commit_stream(
             created_at: Timestamp::now_utc(),
             rejoin_intents: vec![],
             removed_reasons: vec![],
+            welcome: None,
         };
         match db.insert_mls_text_commit(&commit, &hash, 0).await {
             Ok(crate::MlsCommitOutcome::Won) => {
@@ -1866,6 +1877,7 @@ async fn seat_claims_need_the_growth_flag_but_retries_and_removals_do_not() {
             signature: signature(4),
             signer_device_id: DEVICE_A.to_string(),
             handover: None,
+            authority: None,
         };
         let outcome = db
             .put_seat_list(CHANNEL, &capped, false, at(2))
@@ -1936,6 +1948,7 @@ async fn protect_needs_the_owner_and_every_claim_needs_a_member() {
             signature: signature(1),
             signer_device_id: DEVICE_B.to_string(),
             handover: None,
+            authority: None,
         };
         let error = db
             .protect_channel(CHANNEL, &by_member, at(0))
@@ -2173,6 +2186,8 @@ fn removed_users_are_read_from_the_rows_not_from_release_times() {
         seated_at: at(0),
         released_at: released.map(at),
         cooldown_until: released.map(|days| at(days + SEAT_COOLDOWN_DAYS)),
+        release_cause: None,
+        keys_received_at: None,
     };
     let unseated = numbered_user(901);
     let stored = SeatList {
@@ -2184,6 +2199,7 @@ fn removed_users_are_read_from_the_rows_not_from_release_times() {
         signature: signature(2),
         handovers: vec![],
         updated_at: at(5),
+        authority: None,
     };
     let seats = vec![
         row(USER_A, Some(1)),
@@ -2227,6 +2243,7 @@ fn a_listed_user_with_no_seat_row_is_reported_as_removed() {
         signature: signature(2),
         handovers: vec![],
         updated_at: at(5),
+        authority: None,
     };
     let active = |user_id: &str| ChannelSeat {
         id: ChannelSeat::composite_id(CHANNEL, user_id),
@@ -2235,6 +2252,8 @@ fn a_listed_user_with_no_seat_row_is_reported_as_removed() {
         seated_at: at(0),
         released_at: None,
         cooldown_until: None,
+        release_cause: None,
+        keys_received_at: None,
     };
     // The signer has no row either: still never reported
     let seats = vec![active(USER_B)];
@@ -3029,6 +3048,9 @@ fn call_group(group_id: &str, call_channel: &str) -> MlsGroup {
         seat_list_ad_sha256: None,
         pending_removals: vec![],
         member_added: vec![],
+        pending_device_removals: vec![],
+        signer_lost: None,
+        rejoin_readd: vec![],
     }
 }
 
@@ -3045,6 +3067,7 @@ fn call_commit(group_id: &str, epoch: i64) -> crate::MlsCommit {
         created_at: Timestamp::now_utc(),
         rejoin_intents: vec![],
         removed_reasons: vec![],
+        welcome: None,
     }
 }
 
@@ -3086,6 +3109,8 @@ async fn squat(db: &Database, group_id: &str, call_channel: &str) {
         key_package_ref: "cmVm".to_string(),
         signature: signature(1),
         created_at: at(0),
+        generation: None,
+        issued_at: None,
     })
     .await
     .unwrap();
@@ -3204,6 +3229,7 @@ async fn assert_text_commit_wins(db: &Database, channel_id: &str, committer: &Ml
         created_at: Timestamp::now_utc(),
         rejoin_intents: vec![],
         removed_reasons: vec![],
+        welcome: None,
     };
     let outcome = db
         .insert_mls_text_commit(&commit, &group.seat_list_ad_sha256.unwrap(), 0)
@@ -3668,4 +3694,89 @@ async fn a_text_create_claims_the_squat_row_before_the_squatter_can_starve_it() 
         );
         assert_text_group_replaced_the_squat(&db, &group_id, &channel_id, 0, &owner).await;
     });
+}
+
+/// A cooling seat row exactly as an S1 build (dafb3433) stores it
+const SEAT_S1: &str = r#"{"_id":"01J9Z3K4M5N6P7Q8R9S0T1V2W3:01HZXBBBBBBBBBBBBBBBBBBBBB","channel_id":"01J9Z3K4M5N6P7Q8R9S0T1V2W3","user_id":"01HZXBBBBBBBBBBBBBBBBBBBBB","seated_at":"2026-10-04T12:00:00.000Z","released_at":"2026-10-05T12:00:00.000Z","cooldown_until":"2026-10-19T12:00:00.000Z"}"#;
+
+/// A seat list row exactly as an S1 build (dafb3433) stores it
+const SEAT_LIST_S1: &str = r#"{"_id":"01J9Z3K4M5N6P7Q8R9S0T1V2W3","version":3,"body":"body","signer_user_id":"01HZXAAAAAAAAAAAAAAAAAAAAA","signer_device_id":"00112233445566778899aabbccddeeff","signature":"c2ln","handovers":[{"body":"handover","signature":"aG8"}],"updated_at":"2026-10-04T12:00:00.000Z"}"#;
+
+/// Decodes `s1`, checks it is byte-identical on re-encode (JSON) and has
+/// the same keys as a BSON document, and returns it
+fn s1_round_trip<T>(s1: &str) -> T
+where
+    T: serde::Serialize + serde::de::DeserializeOwned + PartialEq + std::fmt::Debug,
+{
+    let parsed: T = serde_json::from_str(s1).expect("an S1 row decodes");
+    assert_eq!(serde_json::to_string(&parsed).unwrap(), s1);
+
+    let expected: serde_json::Map<String, serde_json::Value> = serde_json::from_str(s1).unwrap();
+    let document = bson::to_document(&parsed).unwrap();
+    assert_eq!(
+        document.keys().collect::<Vec<_>>(),
+        expected.keys().collect::<Vec<_>>(),
+        "the stored BSON keys are the S1 keys"
+    );
+    assert_eq!(bson::from_document::<T>(document).unwrap(), parsed);
+    parsed
+}
+
+/// S2 (2.3): `release_cause` and `keys_received_at` are absent when `None`,
+/// so an S1 seat row decodes and re-encodes byte-identical; set values are
+/// stored snake_case under their exact keys
+#[test]
+fn seat_s2_fields_are_absent_when_empty() {
+    let seat: ChannelSeat = s1_round_trip(SEAT_S1);
+    assert_eq!(seat.release_cause, None);
+    assert_eq!(seat.keys_received_at, None);
+
+    for (cause, wire) in [
+        (SeatReleaseCause::OwnerUnseat, "owner_unseat"),
+        (SeatReleaseCause::ServerRemoval, "server_removal"),
+        (SeatReleaseCause::AccessLost, "access_lost"),
+        (SeatReleaseCause::DeviceNeverJoined, "device_never_joined"),
+    ] {
+        let s2 = ChannelSeat {
+            release_cause: Some(cause),
+            keys_received_at: Some(seat.seated_at),
+            ..seat.clone()
+        };
+        let value = serde_json::to_value(&s2).unwrap();
+        assert_eq!(value["release_cause"], wire);
+        assert_eq!(value["keys_received_at"], value["seated_at"]);
+        assert_eq!(serde_json::from_value::<ChannelSeat>(value).unwrap(), s2);
+        let document = bson::to_document(&s2).unwrap();
+        assert_eq!(document.get_str("release_cause").unwrap(), wire);
+        assert_eq!(bson::from_document::<ChannelSeat>(document).unwrap(), s2);
+    }
+}
+
+/// S2 (2.4): `authority` is absent when `None`, so an S1 seat list row
+/// decodes and re-encodes byte-identical; a set authority round-trips
+#[test]
+fn seat_list_authority_is_absent_when_empty() {
+    let list: SeatList = s1_round_trip(SEAT_LIST_S1);
+    assert_eq!(list.authority, None);
+
+    let s2 = SeatList {
+        authority: Some(SignedAuthority {
+            body: "authority".to_string(),
+            signature: "YXV0aA".to_string(),
+        }),
+        ..list
+    };
+    let value = serde_json::to_value(&s2).unwrap();
+    assert_eq!(value["authority"]["body"], "authority");
+    assert_eq!(value["authority"]["signature"], "YXV0aA");
+    let document = bson::to_document(&s2).unwrap();
+    assert!(document.contains_key("authority"));
+    assert_eq!(bson::from_document::<SeatList>(document).unwrap(), s2);
+}
+
+/// `ProtectedChannelChanged.scope` items (7.5): the exact wire strings
+#[test]
+fn protected_scopes_are_the_wire_strings() {
+    assert_eq!(PROTECTED_SCOPE_SEATS, "seats");
+    assert_eq!(PROTECTED_SCOPE_TEXT_GROUP, "text_group");
 }

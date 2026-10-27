@@ -820,6 +820,8 @@ mod envelope_shape_tests {
             key_package_ref: "a3ByZWY".to_string(),
             signature: "c2ln".to_string(),
             created_at: Timestamp::UNIX_EPOCH,
+            generation: None,
+            issued_at: None,
         }
     }
 

@@ -132,6 +132,9 @@ pub async fn create_group(
         seat_list_ad_sha256: None,
         pending_removals: vec![],
         member_added: vec![],
+        pending_device_removals: vec![],
+        signer_lost: None,
+        rejoin_readd: vec![],
     };
 
     match db.create_mls_group(&group, data.supersedes.as_deref()).await? {
@@ -241,6 +244,9 @@ async fn create_text_group(
         seat_list_ad_sha256: None,
         pending_removals: vec![],
         member_added: vec![],
+        pending_device_removals: vec![],
+        signer_lost: None,
+        rejoin_readd: vec![],
     };
 
     match db

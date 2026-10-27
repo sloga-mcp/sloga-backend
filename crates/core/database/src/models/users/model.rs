@@ -2364,6 +2364,7 @@ mod tests {
                 signature: format!("B{}", "A".repeat(85)),
                 signer_device_id: OWNER_DEVICE.to_string(),
                 handover: None,
+                authority: None,
             };
             db.protect_channel(CHANNEL, &submission, at_base())
                 .await
@@ -2518,6 +2519,9 @@ mod tests {
                     seat_list_ad_sha256: None,
                     pending_removals: vec![],
                     member_added: vec![],
+                    pending_device_removals: vec![],
+                    signer_lost: None,
+                    rejoin_readd: vec![],
                 })
                 .await
                 .unwrap();

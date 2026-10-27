@@ -198,6 +198,63 @@ auto_derived!(
 );
 
 auto_derived!(
+    /// A single member device that must leave a Text group (design §2.5,
+    /// S2-D17a). A separate list from `pending_removals`, so an older binary
+    /// ignores it instead of reading it as user-wide.
+    pub struct MlsPendingDeviceRemoval {
+        /// User of the device
+        pub user_id: String,
+        /// Device to be removed
+        pub device_id: String,
+        /// When the pending removal was recorded
+        pub created_at: Timestamp,
+    }
+);
+
+auto_derived!(
+    /// Why the current seat list's signer device is lost, AS STORED (design
+    /// §2.5, #222). Only `device_revoked` is ever stored; the v0
+    /// `account_unavailable` is derived at read time from the signer user's
+    /// account flags and never written.
+    #[derive(Copy, Hash)]
+    #[serde(rename_all = "snake_case")]
+    pub enum MlsSignerLostCause {
+        /// The signer device was revoked
+        DeviceRevoked,
+    }
+);
+
+auto_derived!(
+    /// The device that signed the channel's current seat list is lost
+    /// (design §2.5, S2-D17d). Copied into every successor created while
+    /// set; cleared only by the 4.3 step-7 seat-list write.
+    pub struct MlsSignerLost {
+        /// Signer user
+        pub user_id: String,
+        /// Signer device
+        pub device_id: String,
+        /// Why it is lost
+        pub cause: MlsSignerLostCause,
+        /// When it was recorded
+        pub at: Timestamp,
+    }
+);
+
+auto_derived!(
+    /// A device evicted under rule 6 (rejoin) whose re-Add counts as
+    /// recovery (design §2.5, S2-D32). Written by the eviction, consumed by
+    /// that device's re-Add.
+    pub struct MlsRejoinReadd {
+        /// Evicted user
+        pub user_id: String,
+        /// Evicted device
+        pub device_id: String,
+        /// When the eviction was recorded
+        pub at: Timestamp,
+    }
+);
+
+auto_derived!(
     /// Which Remove rule (design §3.12.2) admitted a removed device of a
     /// Text commit, as the route found it. Stored and served snake_case.
     /// ADVISORY ONLY: it never changes admission, and receivers decide from
@@ -216,13 +273,22 @@ auto_derived!(
         Revoked,
         /// Rule 6: the device's own outstanding rejoin intent
         Rejoin,
+        /// Rule 3a (S2): the device itself is pending removal
+        PendingDevice,
+        /// [S2b] Rule 7: the device has been idle past the configured window
+        Idle,
+        /// A value this build does not know (#219), so a row written by a
+        /// newer binary still decodes. Decode-only: never stamped
+        #[serde(other)]
+        Unknown,
     }
 );
 
 auto_derived!(
     /// The advisory reason for one device a Text commit removed: the
-    /// STRONGEST rule that admitted it (`pending_removal` > `off_list` >
-    /// `revoked` > `own_user` > `rejoin`)
+    /// STRONGEST rule that admitted it (S1 order: `pending_removal` >
+    /// `off_list` > `revoked` > `own_user` > `rejoin`; design §6.1 gives
+    /// the S2 order, adopted by the submit route in W2)
     pub struct MlsRemovedReason {
         /// Removed user
         pub user_id: String,
@@ -300,6 +366,15 @@ auto_derived!(
         /// Text only: when each member device was last added (rule 6).
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         pub member_added: Vec<MlsMemberAdded>,
+        /// Text only (S2): single devices that must be removed (rule 3a).
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub pending_device_removals: Vec<MlsPendingDeviceRemoval>,
+        /// Text only (S2): the current list's signer device is lost.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub signer_lost: Option<MlsSignerLost>,
+        /// Text only (S2): rule-6 evictions whose re-Add is recovery.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub rejoin_readd: Vec<MlsRejoinReadd>,
     }
 );
 
@@ -385,6 +460,12 @@ auto_derived!(
         /// written before the field existed reads as empty.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         pub removed_reasons: Vec<MlsRemovedReason>,
+        /// Text only (S2-D29): the commit's Welcome, unpadded standard
+        /// base64, stored on commits with `added`. NEVER part of
+        /// `MlsCommitInfo` or the commit fetch; only the Welcome route
+        /// serves it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub welcome: Option<String>,
     }
 );
 
@@ -421,6 +502,12 @@ auto_derived!(
         pub signature: String,
         /// Server-stamped submission time (rate-limit anchor)
         pub created_at: Timestamp,
+        /// Text join payload only (design §3.13): the signed generation
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub generation: Option<u32>,
+        /// Text join payload only (design §3.13): the signed issue time (ms)
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub issued_at: Option<i64>,
     }
 );
 
@@ -491,6 +578,7 @@ mod removed_reasons_shape_tests {
             created_at: Timestamp::UNIX_EPOCH,
             rejoin_intents: vec![],
             removed_reasons: vec![],
+            welcome: None,
         }
     }
 
@@ -527,5 +615,188 @@ mod removed_reasons_shape_tests {
 
         assert!(document.remove("removed_reasons").is_some());
         assert_eq!(bson::from_document::<MlsCommit>(document).unwrap(), call);
+    }
+}
+
+#[cfg(test)]
+mod s2_shape_tests {
+    use iso8601_timestamp::Timestamp;
+
+    use super::{
+        MlsCommit, MlsGroup, MlsJoinIntent, MlsPendingDeviceRemoval, MlsRejoinReadd,
+        MlsRemovalReason, MlsSignerLost, MlsSignerLostCause,
+    };
+
+    /// A Text group exactly as an S1 build (dafb3433) stores it
+    const GROUP_S1: &str = r#"{"_id":"0000000000000000000000000000000000000000000000000000000000000001","channel_id":"01JA0000000000000000CHANNEL","open":true,"created_by":{"user_id":"01JA00000000000000000USERA","device_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},"created_at":"2026-10-04T12:00:00.000Z","current_epoch":7,"members":[{"user_id":"01JA00000000000000000USERA","device_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}],"kind":"Text","generation":2,"seat_list_ad_sha256":"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff","pending_removals":[{"user_id":"01JA00000000000000000USERB","created_at":"2026-10-04T12:00:00.000Z"}],"member_added":[{"user_id":"01JA00000000000000000USERA","device_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","epoch":5,"at":"2026-10-04T12:00:00.000Z"}]}"#;
+
+    /// A Text commit exactly as an S1 build (dafb3433) stores it
+    const COMMIT_S1: &str = r#"{"_id":"0000000000000000000000000000000000000000000000000000000000000001:8","group_id":"0000000000000000000000000000000000000000000000000000000000000001","epoch":8,"committer":{"user_id":"01JA00000000000000000USERA","device_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},"commit":"Y29tbWl0","size":6,"added":[{"user_id":"01JA00000000000000000USERC","device_id":"cccccccccccccccccccccccccccccccc"}],"removed":[],"created_at":"2026-10-04T12:00:00.000Z"}"#;
+
+    /// A join intent exactly as an S1 build (dafb3433) stores it
+    const INTENT_S1: &str = r#"{"_id":"0000000000000000000000000000000000000000000000000000000000000001:01JA00000000000000000USERC:cccccccccccccccccccccccccccccccc","group_id":"0000000000000000000000000000000000000000000000000000000000000001","user_id":"01JA00000000000000000USERC","device_id":"cccccccccccccccccccccccccccccccc","key_package_ref":"a3ByZWY","signature":"c2ln","created_at":"2026-10-04T12:00:00.000Z"}"#;
+
+    fn at() -> Timestamp {
+        serde_json::from_str(r#""2026-10-04T13:00:00.000Z""#).unwrap()
+    }
+
+    /// Decodes `s1`, checks it is byte-identical on re-encode (JSON) and
+    /// has the same keys as a BSON document, and returns it
+    fn s1_round_trip<T>(s1: &str) -> T
+    where
+        T: serde::Serialize + serde::de::DeserializeOwned + PartialEq + std::fmt::Debug,
+    {
+        let parsed: T = serde_json::from_str(s1).expect("an S1 row decodes");
+        assert_eq!(serde_json::to_string(&parsed).unwrap(), s1);
+
+        let expected: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_str(s1).unwrap();
+        let document = bson::to_document(&parsed).unwrap();
+        assert_eq!(
+            document.keys().collect::<Vec<_>>(),
+            expected.keys().collect::<Vec<_>>(),
+            "the stored BSON keys are the S1 keys"
+        );
+        assert_eq!(bson::from_document::<T>(document).unwrap(), parsed);
+        parsed
+    }
+
+    /// S2 group fields: an S1 row decodes with them empty and re-encodes
+    /// byte-identical; when set they are stored under their exact keys
+    #[test]
+    fn group_s2_fields_are_absent_when_empty() {
+        let group: MlsGroup = s1_round_trip(GROUP_S1);
+        assert!(group.pending_device_removals.is_empty());
+        assert_eq!(group.signer_lost, None);
+        assert!(group.rejoin_readd.is_empty());
+
+        let s2 = MlsGroup {
+            pending_device_removals: vec![MlsPendingDeviceRemoval {
+                user_id: "01JA00000000000000000USERB".to_string(),
+                device_id: "b".repeat(32),
+                created_at: at(),
+            }],
+            signer_lost: Some(MlsSignerLost {
+                user_id: "01JA00000000000000000USERA".to_string(),
+                device_id: "a".repeat(32),
+                cause: MlsSignerLostCause::DeviceRevoked,
+                at: at(),
+            }),
+            rejoin_readd: vec![MlsRejoinReadd {
+                user_id: "01JA00000000000000000USERC".to_string(),
+                device_id: "c".repeat(32),
+                at: at(),
+            }],
+            ..group.clone()
+        };
+        let value = serde_json::to_value(&s2).unwrap();
+        assert_eq!(
+            value["pending_device_removals"][0]["device_id"],
+            "b".repeat(32)
+        );
+        assert_eq!(value["signer_lost"]["cause"], "device_revoked");
+        assert_eq!(value["rejoin_readd"][0]["device_id"], "c".repeat(32));
+        assert_eq!(serde_json::from_value::<MlsGroup>(value).unwrap(), s2);
+
+        let document = bson::to_document(&s2).unwrap();
+        for key in ["pending_device_removals", "signer_lost", "rejoin_readd"] {
+            assert!(document.contains_key(key), "{key} is stored when set");
+        }
+        assert_eq!(bson::from_document::<MlsGroup>(document).unwrap(), s2);
+    }
+
+    /// `welcome`: an S1 commit row decodes with none and re-encodes
+    /// byte-identical; a stored Welcome round-trips
+    #[test]
+    fn commit_welcome_is_absent_when_empty() {
+        let commit: MlsCommit = s1_round_trip(COMMIT_S1);
+        assert_eq!(commit.welcome, None);
+
+        let with = MlsCommit {
+            welcome: Some("d2VsY29tZQ".to_string()),
+            ..commit
+        };
+        let document = bson::to_document(&with).unwrap();
+        assert_eq!(document.get_str("welcome").unwrap(), "d2VsY29tZQ");
+        assert_eq!(bson::from_document::<MlsCommit>(document).unwrap(), with);
+    }
+
+    /// Join intent `generation` / `issued_at`: an S1 row decodes with none
+    /// and re-encodes byte-identical; set values round-trip
+    #[test]
+    fn join_intent_text_fields_are_absent_when_empty() {
+        let intent: MlsJoinIntent = s1_round_trip(INTENT_S1);
+        assert_eq!(intent.generation, None);
+        assert_eq!(intent.issued_at, None);
+
+        let text = MlsJoinIntent {
+            generation: Some(0),
+            issued_at: Some(1_790_812_800_000),
+            ..intent
+        };
+        let value = serde_json::to_value(&text).unwrap();
+        assert_eq!(value["generation"], 0);
+        assert_eq!(value["issued_at"], 1_790_812_800_000i64);
+        let document = bson::to_document(&text).unwrap();
+        assert_eq!(
+            bson::from_document::<MlsJoinIntent>(document).unwrap(),
+            text
+        );
+    }
+
+    /// Every reason the server can stamp, and its stored value
+    const KNOWN_REASONS: [(MlsRemovalReason, &str); 7] = [
+        (MlsRemovalReason::OwnUser, "own_user"),
+        (MlsRemovalReason::PendingRemoval, "pending_removal"),
+        (MlsRemovalReason::OffList, "off_list"),
+        (MlsRemovalReason::Revoked, "revoked"),
+        (MlsRemovalReason::Rejoin, "rejoin"),
+        (MlsRemovalReason::PendingDevice, "pending_device"),
+        (MlsRemovalReason::Idle, "idle"),
+    ];
+
+    /// #219: every known reason round-trips; a value this build does not
+    /// know decodes as `Unknown` instead of failing the commit row
+    #[test]
+    fn removal_reasons_round_trip_and_unknown_decodes() {
+        for (reason, wire) in KNOWN_REASONS {
+            assert_eq!(serde_json::to_value(reason).unwrap(), wire);
+            assert_eq!(
+                serde_json::from_value::<MlsRemovalReason>(serde_json::json!(wire)).unwrap(),
+                reason
+            );
+        }
+
+        for unknown in ["user_removed", "PendingDevice", ""] {
+            assert_eq!(
+                serde_json::from_value::<MlsRemovalReason>(serde_json::json!(unknown)).unwrap(),
+                MlsRemovalReason::Unknown,
+                "{unknown:?}"
+            );
+        }
+
+        let with_future = COMMIT_S1.replace(
+            r#""removed":[]"#,
+            r#""removed":[],"removed_reasons":[{"user_id":"01JA00000000000000000USERB","device_id":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","reason":"from_the_future"}]"#,
+        );
+        let commit: MlsCommit = serde_json::from_str(&with_future).unwrap();
+        assert_eq!(commit.removed_reasons[0].reason, MlsRemovalReason::Unknown);
+        let document = bson::to_document(&commit).unwrap();
+        let commit = bson::from_document::<MlsCommit>(document).unwrap();
+        assert_eq!(commit.removed_reasons[0].reason, MlsRemovalReason::Unknown);
+    }
+
+    /// #222: the stored signer-lost cause is `device_revoked` only
+    #[test]
+    fn signer_lost_cause_is_snake_case() {
+        assert_eq!(
+            serde_json::to_value(MlsSignerLostCause::DeviceRevoked).unwrap(),
+            "device_revoked"
+        );
+        assert_eq!(
+            serde_json::from_value::<MlsSignerLostCause>(serde_json::json!("device_revoked"))
+                .unwrap(),
+            MlsSignerLostCause::DeviceRevoked
+        );
     }
 }

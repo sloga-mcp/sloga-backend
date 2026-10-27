@@ -682,6 +682,8 @@ mod tests {
             seated_at: Timestamp::now_utc(),
             released_at: None,
             cooldown_until: None,
+            release_cause: None,
+            keys_received_at: None,
         };
         match db {
             Database::Reference(reference) => {
@@ -952,6 +954,9 @@ mod tests {
             seat_list_ad_sha256: None,
             pending_removals: vec![],
             member_added: vec![],
+            pending_device_removals: vec![],
+            signer_lost: None,
+            rejoin_readd: vec![],
         };
         mongo
             .col::<MlsGroup>("mls_groups")

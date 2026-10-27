@@ -336,6 +336,8 @@ fn join_intent_row(group: &MlsGroup, user_id: &str, data: &v0::DataMlsJoinIntent
         key_package_ref: data.key_package_ref.clone(),
         signature: data.signature.clone(),
         created_at: Timestamp::now_utc(),
+        generation: None,
+        issued_at: None,
     }
 }
 
@@ -390,6 +392,8 @@ async fn fan_out_join_requested(
             key_package_ref: data.key_package_ref.clone(),
             signature: data.signature.clone(),
             rejoin,
+            generation: None,
+            issued_at: None,
         }
         .private(member_user)
         .await;
@@ -527,6 +531,7 @@ mod tests {
                     created_at: Timestamp::now_utc(),
                     rejoin_intents: vec![],
                     removed_reasons: vec![],
+                    welcome: None,
                 },
                 &hash,
                 0,
