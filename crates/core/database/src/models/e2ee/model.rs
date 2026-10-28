@@ -1,9 +1,15 @@
+use std::collections::BTreeSet;
+use std::future::Future;
+
 use base64::{engine::general_purpose::STANDARD_NO_PAD, Engine};
 use ed25519_dalek::{Signature, VerifyingKey};
 use iso8601_timestamp::Timestamp;
 use revolt_result::Result;
 
-use crate::{events::client::EventV1, Database, MlsJoinIntent, MlsMemberDevice, MlsRemovedReason};
+use crate::{
+    events::client::EventV1, Database, MlsJoinIntent, MlsMemberDevice, MlsRemovedReason,
+    PROTECTED_SCOPE_TEXT_GROUP,
+};
 
 /// Current (and minimum accepted) E2EE protocol version.
 ///
@@ -643,15 +649,112 @@ impl E2EEIdentity {
     /// Revoke a device: delete its identity, one-time keys and queued
     /// envelopes, then notify. Idempotent; returns whether the device existed.
     ///
+    /// While `[features.protected_channels] formats_v2` is on, the delete
+    /// sits between two pending passes (6.3 "Device revocation", S2-D17a,
+    /// #219): every open Text group holding the device queues it for
+    /// removal (or gets `signer_lost` if it signed the channel's list,
+    /// S2-D15), and each channel written gets `ProtectedChannelChanged`.
+    /// A failed pending pass fails the revocation closed. With the flag
+    /// off this is the S1 revocation.
+    ///
     /// Wired into: `DELETE /e2ee/keys/{device}`, session revocation/logout
-    /// (`Session::delete`) and the account-deletion cascade (`User::delete`).
+    /// (`Session::delete`), every sign-out-everywhere path
+    /// (`Account::delete_all_sessions`, behind `Account::disable`) and the
+    /// same-session predecessor sweep (key publish, bonfire device claim).
     pub async fn revoke_device(db: &Database, user_id: &str, device_id: &str) -> Result<bool> {
+        let formats_v2 = revolt_config::config()
+            .await
+            .features
+            .protected_channels
+            .formats_v2;
+
+        Self::revoke_device_publishing(db, user_id, device_id, formats_v2, |topic, event| {
+            event.p(topic)
+        })
+        .await
+    }
+
+    /// [`Self::revoke_device`] with the flag and the publish of the
+    /// `ProtectedChannelChanged` events passed in (`publish(topic, event)`;
+    /// the topic is the channel id: viewers only, 7.5). The channels the
+    /// passes wrote are announced even when a later step fails: a repeat
+    /// pass returns only new writes, so a retry would never announce them.
+    pub(crate) async fn revoke_device_publishing<F, Fut>(
+        db: &Database,
+        user_id: &str,
+        device_id: &str,
+        formats_v2: bool,
+        mut publish: F,
+    ) -> Result<bool>
+    where
+        F: FnMut(String, EventV1) -> Fut,
+        Fut: Future<Output = ()>,
+    {
+        let mut changed = BTreeSet::new();
+        let result = async {
+            if formats_v2 {
+                // (1) Before the delete: a failure leaves the device intact
+                Self::pending_device_pass(db, user_id, device_id, &mut changed).await?;
+            }
+            Self::delete_revoked_device(db, user_id, device_id, formats_v2, &mut changed).await
+        }
+        .await;
+
+        for channel_id in changed {
+            publish(
+                channel_id.clone(),
+                EventV1::ProtectedChannelChanged {
+                    id: channel_id,
+                    scope: vec![PROTECTED_SCOPE_TEXT_GROUP.to_string()],
+                },
+            )
+            .await;
+        }
+
+        result
+    }
+
+    /// One pending pass of a revocation: `add_pending_device_removal`
+    /// (both drivers, one claimed transaction), collecting the channels it
+    /// wrote into `changed`
+    pub(crate) async fn pending_device_pass(
+        db: &Database,
+        user_id: &str,
+        device_id: &str,
+        changed: &mut BTreeSet<String>,
+    ) -> Result<()> {
+        changed.extend(
+            db.add_pending_device_removal(user_id, device_id, Timestamp::now_utc())
+                .await?,
+        );
+        Ok(())
+    }
+
+    /// The S1 revocation (delete, KeyPackages, `E2EEDeviceDelete`) with,
+    /// while `formats_v2` is on, the second pending pass between the
+    /// KeyPackage delete and the broadcast: it catches a Text commit that
+    /// added the device after the first pass. If that pass fails the device
+    /// is already gone; the broadcast still runs (a retry finds nothing to
+    /// delete and would never send it) and the error is returned.
+    pub(crate) async fn delete_revoked_device(
+        db: &Database,
+        user_id: &str,
+        device_id: &str,
+        formats_v2: bool,
+        changed: &mut BTreeSet<String>,
+    ) -> Result<bool> {
         let existed = db.delete_e2ee_device(user_id, device_id).await?;
 
         // A revoked device's MLS KeyPackages must leave the directory with
         // it — a claim against a dead device would brick the joiner's
         // Welcome (media E2EE, slice 6)
         db.delete_mls_key_packages(user_id, device_id).await?;
+
+        let second_pass = if formats_v2 {
+            Self::pending_device_pass(db, user_id, device_id, changed).await
+        } else {
+            Ok(())
+        };
 
         if existed {
             Self::broadcast_device_change(
@@ -665,7 +768,7 @@ impl E2EEIdentity {
             .await;
         }
 
-        Ok(existed)
+        second_pass.map(|()| existed)
     }
 
     /// Revoke every device bound to a given session (session revoked, token
