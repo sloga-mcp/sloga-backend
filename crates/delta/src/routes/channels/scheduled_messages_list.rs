@@ -61,6 +61,7 @@ mod test {
                 interactions: None,
                 components: None,
                 sticker_ids: None,
+                encrypted: None,
                 flags: None,
             },
             status: ScheduledMessageStatus::Pending,

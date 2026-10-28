@@ -53,6 +53,17 @@ pub async fn edit(
         return Err(create_error!(CannotEditMessage));
     }
 
+    // Protected messages are never edited (design 7.4). Refused after the
+    // permission and author checks (decision 18), before any embed claim,
+    // write or event. A thread under a protected parent is refused as the
+    // send route refuses it.
+    if channel.is_protected()
+        || message.encrypted.is_some()
+        || (matches!(channel, Channel::Thread { .. }) && permission_channel.is_protected())
+    {
+        return Err(create_error!(ChannelProtected));
+    }
+
     // Anti-spam: an edit puts new text in front of the DM peer just like a
     // send does ("hi" to many strangers, then each one edited into the scam),
     // so a DM edit that brings new content or embeds faces the same pause
@@ -143,13 +154,15 @@ pub async fn edit(
 mod test {
     use std::time::{Duration, Instant};
 
-    use crate::util::test::TestHarness;
+    use crate::{rocket, util::test::TestHarness};
     use iso8601_timestamp::Timestamp;
     use revolt_config::config;
     use revolt_database::{
-        util::antispam, Channel, DmGuard, Member, Report, Session, SYSTEM_USER_ID,
+        events::client::EventV1, util::antispam, Channel, Database, DmGuard, File, Member, Message,
+        Metadata, PartialChannel, Report, Session, User, SYSTEM_USER_ID,
     };
     use revolt_models::v0::{self, ReportedContent};
+    use revolt_permissions::{ChannelPermission, OverrideField};
     use rocket::http::{ContentType, Header, Status};
     use serde_json::{json, Value};
     use ulid::Ulid;
@@ -401,5 +414,464 @@ mod test {
         )
         .await;
         assert_eq!(status, Status::Ok, "{response}");
+    }
+
+    /// The route's full answer: status and body
+    async fn edit_message(
+        harness: &TestHarness,
+        session: &Session,
+        channel_id: &str,
+        message_id: &str,
+        data: &Value,
+    ) -> (Status, String) {
+        let response = harness
+            .client
+            .patch(format!("/channels/{channel_id}/messages/{message_id}"))
+            .header(Header::new("x-session-token", session.token.clone()))
+            .header(ContentType::JSON)
+            .body(data.to_string())
+            .dispatch()
+            .await;
+        let status = response.status();
+        (status, response.into_string().await.unwrap_or_default())
+    }
+
+    #[track_caller]
+    fn body(answer: &(Status, String)) -> Value {
+        serde_json::from_str(&answer.1).unwrap_or_else(|_| panic!("not JSON: {:?}", answer))
+    }
+
+    /// An edit that would claim `attachment` for an embed
+    fn edit_with_embed(attachment: &str) -> Value {
+        json!({
+            "content": "edited",
+            "embeds": [{ "title": "embed", "media": attachment }]
+        })
+    }
+
+    /// The stored row, whole
+    async fn stored(harness: &TestHarness, message_id: &str) -> Value {
+        serde_json::to_value(
+            harness
+                .db
+                .fetch_message(message_id)
+                .await
+                .expect("the stored message"),
+        )
+        .expect("message JSON")
+    }
+
+    /// Whether `attachment` has been claimed by anything
+    async fn is_claimed(harness: &TestHarness, attachment: &str) -> bool {
+        harness
+            .db
+            .fetch_attachment("attachments", attachment)
+            .await
+            .expect("the attachment")
+            .used_for
+            .is_some()
+    }
+
+    /// An unclaimed file in the `attachments` bucket, as Autumn leaves an
+    /// upload
+    async fn upload_attachment(harness: &TestHarness, uploader: &User) -> String {
+        let id = Ulid::new().to_string();
+        harness
+            .db
+            .insert_attachment(&File {
+                id: id.clone(),
+                tag: "attachments".to_string(),
+                filename: "embed.png".to_string(),
+                hash: None,
+                uploaded_at: Some(Timestamp::now_utc()),
+                uploader_id: Some(uploader.id.clone()),
+                used_for: None,
+                deleted: None,
+                reported: None,
+                metadata: Metadata::File,
+                content_type: "application/octet-stream".to_string(),
+                size: 10,
+                message_id: None,
+                user_id: None,
+                server_id: None,
+                object_id: None,
+            })
+            .await
+            .expect("insert attachment");
+        id
+    }
+
+    /// A plaintext row by `author` in `channel_id`, stored through the driver
+    async fn insert_plaintext(db: &Database, channel_id: &str, author: &str) -> Message {
+        let message = Message {
+            id: Ulid::new().to_string(),
+            channel: channel_id.to_string(),
+            author: author.to_string(),
+            content: Some("Test message".to_string()),
+            ..Default::default()
+        };
+        db.insert_message(&message)
+            .await
+            .expect("Failed to store test plaintext message");
+        message
+    }
+
+    /// A plaintext row by `author` in thread `channel_id`, stored raw past
+    /// the driver's floor (which judges a thread by its protected parent),
+    /// as only a failed thread clean-up could leave one behind
+    async fn insert_plaintext_raw(db: &Database, channel_id: &str, author: &str) -> Message {
+        let message = Message {
+            id: Ulid::new().to_string(),
+            channel: channel_id.to_string(),
+            author: author.to_string(),
+            content: Some("Test message".to_string()),
+            ..Default::default()
+        };
+        match db {
+            Database::Reference(reference) => {
+                reference
+                    .messages
+                    .lock()
+                    .await
+                    .insert(message.id.clone(), message.clone());
+            }
+            Database::MongoDb(mongo) => {
+                mongo
+                    .col::<Message>("messages")
+                    .insert_one(&message)
+                    .await
+                    .expect("raw message row");
+            }
+        }
+        message
+    }
+
+    /// Mark `channel_id` protected under its stored plaintext rows, raw, as
+    /// the R15 compensation window can leave a stray behind
+    async fn protect_under_stored_rows(db: &Database, channel_id: &str) {
+        match db {
+            Database::Reference(reference) => {
+                match reference.channels.lock().await.get_mut(channel_id) {
+                    Some(Channel::TextChannel { protected, .. }) => *protected = true,
+                    other => panic!("expected a text channel, got {:?}", other),
+                }
+            }
+            Database::MongoDb(mongo) => {
+                use revolt_database::mongodb::bson::{doc, Document};
+
+                let result = mongo
+                    .col::<Document>("channels")
+                    .update_one(
+                        doc! { "_id": channel_id },
+                        doc! { "$set": { "protected": true } },
+                    )
+                    .await
+                    .expect("raw protect");
+                assert_eq!(result.matched_count, 1);
+            }
+        }
+
+        assert!(db
+            .fetch_channel(channel_id)
+            .await
+            .expect("channel")
+            .is_protected());
+    }
+
+    /// A thread under `parent`, stored through the driver
+    async fn insert_thread(db: &Database, parent: &Channel, creator: &User) -> Channel {
+        let server = match parent {
+            Channel::TextChannel { server, .. } => server.clone(),
+            other => panic!("expected a text channel, got {:?}", other),
+        };
+        let thread = Channel::Thread {
+            id: Ulid::new().to_string(),
+            server,
+            parent_channel: parent.id().to_string(),
+            name: "Thread".to_string(),
+            creator: creator.id.clone(),
+            origin_message_id: None,
+            last_message_id: None,
+            archived: false,
+            archived_timestamp: None,
+            auto_archive_minutes: 0,
+            locked: false,
+            applied_tags: vec![],
+        };
+        db.insert_channel(&thread).await.expect("thread");
+        thread
+    }
+
+    async fn deny(harness: &TestHarness, channel_id: &str, permission: ChannelPermission) {
+        let mut channel = harness
+            .db
+            .fetch_channel(channel_id)
+            .await
+            .expect("the channel");
+        channel
+            .update(
+                &harness.db,
+                PartialChannel {
+                    default_permissions: Some(OverrideField {
+                        a: 0,
+                        d: permission as i64,
+                    }),
+                    ..Default::default()
+                },
+                vec![],
+            )
+            .await
+            .expect("deny");
+    }
+
+    /// Publish a marker `ChannelAck` on `user`'s private topic and wait for
+    /// it: redis pub/sub is FIFO on the harness's one subscription, so
+    /// anything the edit published before it is buffered once it is seen
+    async fn flush_with_marker(harness: &mut TestHarness, user: &str, channel_id: &str) {
+        let marker = Ulid::new().to_string();
+
+        EventV1::ChannelAck {
+            id: channel_id.to_string(),
+            user: user.to_string(),
+            message_id: marker.clone(),
+        }
+        .private(user.to_string())
+        .await;
+
+        harness
+            .wait_for_event(&format!("{user}!"), |event| match event {
+                EventV1::ChannelAck { message_id, .. } => message_id == &marker,
+                _ => false,
+            })
+            .await;
+    }
+
+    /// `author`'s edit of their own message is refused with
+    /// `ChannelProtected` from this route, and leaves no trace: the row is
+    /// unchanged, the embed's attachment unclaimed, no `MessageUpdate`
+    async fn assert_refused_untouched(
+        harness: &mut TestHarness,
+        session: &Session,
+        author: &User,
+        channel_id: &str,
+        message_id: &str,
+    ) {
+        let before = stored(harness, message_id).await;
+        let attachment = upload_attachment(harness, author).await;
+
+        let answer = edit_message(
+            harness,
+            session,
+            channel_id,
+            message_id,
+            &edit_with_embed(&attachment),
+        )
+        .await;
+        assert_eq!(answer.0, Status::BadRequest, "{:?}", answer);
+        let value = body(&answer);
+        assert_eq!(value["type"], "ChannelProtected", "{}", answer.1);
+        assert!(
+            value.get("location").is_none(),
+            "the body must not carry the error location: {}",
+            answer.1
+        );
+
+        assert_eq!(stored(harness, message_id).await, before, "row changed");
+        assert!(
+            !is_claimed(harness, &attachment).await,
+            "the embed's attachment was claimed"
+        );
+
+        flush_with_marker(harness, &author.id, channel_id).await;
+        harness.assert_no_buffered_event(channel_id, |event| match event {
+            EventV1::MessageUpdate { id, .. } => id == message_id,
+            _ => false,
+        });
+    }
+
+    #[test]
+    fn protected_edit_of_an_encrypted_message_is_refused() {
+        crate::util::test::rt().block_on(protected_edit_of_an_encrypted_message_is_refused_case())
+    }
+
+    async fn protected_edit_of_an_encrypted_message_is_refused_case() {
+        let mut harness = TestHarness::new().await;
+        let (_, session, owner) = harness.new_user().await;
+
+        let protected = harness.new_protected_channel(&owner, &session, &[]).await;
+        let group = harness
+            .new_text_group(&protected.channel, &protected.owner_device, 0, None)
+            .await;
+        let message = harness
+            .new_encrypted_message(&protected.channel, &protected.owner_device, &group)
+            .await;
+        assert_eq!(message.author, owner.id);
+
+        assert_refused_untouched(
+            &mut harness,
+            &session,
+            &owner,
+            protected.channel.id(),
+            &message.id,
+        )
+        .await;
+    }
+
+    #[test]
+    fn protected_edit_of_a_plaintext_stray_is_refused() {
+        crate::util::test::rt().block_on(protected_edit_of_a_plaintext_stray_is_refused_case())
+    }
+
+    async fn protected_edit_of_a_plaintext_stray_is_refused_case() {
+        // R15: a plaintext row left in a channel protected after it was
+        // stored is not editable either
+        let mut harness = TestHarness::new().await;
+        let (_, session, owner) = harness.new_user().await;
+
+        let (_, channel) = harness.new_protectable_channel(&owner).await;
+        let stray = insert_plaintext(&harness.db, channel.id(), &owner.id).await;
+        protect_under_stored_rows(&harness.db, channel.id()).await;
+
+        assert_refused_untouched(&mut harness, &session, &owner, channel.id(), &stray.id).await;
+    }
+
+    #[test]
+    fn protected_edit_in_a_thread_under_a_protected_parent_is_refused() {
+        crate::util::test::rt()
+            .block_on(protected_edit_in_a_thread_under_a_protected_parent_is_refused_case())
+    }
+
+    async fn protected_edit_in_a_thread_under_a_protected_parent_is_refused_case() {
+        let mut harness = TestHarness::new().await;
+        let (_, session, owner) = harness.new_user().await;
+
+        let protected = harness.new_protected_channel(&owner, &session, &[]).await;
+        let thread = insert_thread(&harness.db, &protected.channel, &owner).await;
+        let message = insert_plaintext_raw(&harness.db, thread.id(), &owner.id).await;
+
+        assert_refused_untouched(&mut harness, &session, &owner, thread.id(), &message.id).await;
+    }
+
+    #[test]
+    fn edit_in_an_unprotected_channel_is_applied() {
+        crate::util::test::rt().block_on(edit_in_an_unprotected_channel_is_applied_case())
+    }
+
+    async fn edit_in_an_unprotected_channel_is_applied_case() {
+        // The positive control for the refusals above: the same request
+        // edits an ordinary message, claims the attachment and fans out
+        let mut harness = TestHarness::new().await;
+        let (_, session, author) = harness.new_user().await;
+
+        let (server, channels) = harness.new_server(&author).await;
+        let (channel, _, message) = harness.new_message(&author, &server, channels).await;
+        assert!(!channel.is_protected());
+        let attachment = upload_attachment(&harness, &author).await;
+
+        let answer = edit_message(
+            &harness,
+            &session,
+            channel.id(),
+            &message.id,
+            &edit_with_embed(&attachment),
+        )
+        .await;
+        assert_eq!(answer.0, Status::Ok, "{:?}", answer);
+        assert_eq!(body(&answer)["content"], "edited", "{}", answer.1);
+
+        let row = stored(&harness, &message.id).await;
+        assert_eq!(row["content"], "edited");
+        assert!(row["edited"].is_string(), "{}", row);
+        assert!(is_claimed(&harness, &attachment).await);
+
+        harness
+            .wait_for_event(channel.id(), |event| match event {
+                EventV1::MessageUpdate { id, .. } => id == &message.id,
+                _ => false,
+            })
+            .await;
+    }
+
+    #[test]
+    fn unauthorized_editors_get_the_same_answer_protected_or_not() {
+        crate::util::test::rt()
+            .block_on(unauthorized_editors_get_the_same_answer_protected_or_not_case())
+    }
+
+    async fn unauthorized_editors_get_the_same_answer_protected_or_not_case() {
+        // Decision 18 (W2): a caller who fails the route's authorization
+        // (SendMessage, then authorship) gets the pre-W2 answer, whatever
+        // the channel's protection or the row's shape
+        let harness = TestHarness::new().await;
+        let (_, owner_session, owner) = harness.new_user().await;
+        let (_, session, member) = harness.new_user().await;
+
+        let protected = harness
+            .new_protected_channel(&owner, &owner_session, &[])
+            .await;
+        let group = harness
+            .new_text_group(&protected.channel, &protected.owner_device, 0, None)
+            .await;
+        let encrypted = harness
+            .new_encrypted_message(&protected.channel, &protected.owner_device, &group)
+            .await;
+
+        let flipped = harness.new_channel(&protected.server).await;
+        let stray = insert_plaintext(&harness.db, flipped.id(), &owner.id).await;
+        protect_under_stored_rows(&harness.db, flipped.id()).await;
+
+        let thread = insert_thread(&harness.db, &protected.channel, &owner).await;
+        let threaded = insert_plaintext_raw(&harness.db, thread.id(), &owner.id).await;
+
+        let unprotected = harness.new_channel(&protected.server).await;
+        let plaintext = insert_plaintext(&harness.db, unprotected.id(), &owner.id).await;
+
+        harness.join_server(&protected.server, &member).await;
+
+        let data = json!({ "content": "edited" });
+        let cases = [
+            ("encrypted", protected.channel.id(), &encrypted.id),
+            ("stray", flipped.id(), &stray.id),
+            ("thread", thread.id(), &threaded.id),
+        ];
+
+        // Not the author
+        let baseline =
+            edit_message(&harness, &session, unprotected.id(), &plaintext.id, &data).await;
+        assert_ne!(baseline.0, Status::Ok, "{:?}", baseline);
+        assert_eq!(
+            body(&baseline)["type"],
+            "CannotEditMessage",
+            "{}",
+            baseline.1
+        );
+        for (case, channel_id, message_id) in cases {
+            let answer = edit_message(&harness, &session, channel_id, message_id, &data).await;
+            assert_eq!(answer, baseline, "not the author: {}", case);
+        }
+
+        // No SendMessage (a thread takes its parent's permissions)
+        for channel_id in [protected.channel.id(), flipped.id(), unprotected.id()] {
+            deny(&harness, channel_id, ChannelPermission::SendMessage).await;
+        }
+        let baseline =
+            edit_message(&harness, &session, unprotected.id(), &plaintext.id, &data).await;
+        assert_eq!(baseline.0, Status::Forbidden, "{:?}", baseline);
+        assert_eq!(
+            body(&baseline)["type"],
+            "MissingPermission",
+            "{}",
+            baseline.1
+        );
+        for (case, channel_id, message_id) in cases {
+            let answer = edit_message(&harness, &session, channel_id, message_id, &data).await;
+            assert_eq!(answer, baseline, "no SendMessage: {}", case);
+        }
+
+        // Nothing above reached a row
+        for (case, _, message_id) in cases {
+            let row = stored(&harness, message_id).await;
+            assert!(row["edited"].is_null(), "{}: {}", case, row);
+        }
     }
 }

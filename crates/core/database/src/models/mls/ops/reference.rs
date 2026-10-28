@@ -1,10 +1,26 @@
+use std::collections::HashSet;
+
 use iso8601_timestamp::Timestamp;
 use revolt_result::Result;
 
 use crate::{
-    MlsCommit, MlsCommitOutcome, MlsGroup, MlsGroupCreateOutcome, MlsJoinIntent, MlsKeyPackage,
-    ReferenceDb, MAX_MLS_GROUP_MEMBERS,
+    ChannelSeat, E2EEIdentity, MlsCommit, MlsCommitOutcome, MlsGroup, MlsGroupCreateOutcome,
+    MlsGroupKind, MlsJoinIntent, MlsKeyPackage, ReferenceDb, MAX_MLS_GROUP_MEMBERS,
 };
+
+use super::plan_mls_text_commit;
+
+/// The Reference form of the storage-level Text marker (R22; Mongo stores
+/// `kind: "Text"` on the document): a row the Text commit transaction wrote
+/// is keyed `text:{group}:{epoch}` in `mls_commits`, every other row under
+/// its plain id. The stored [`MlsCommit::id`] stays `{group}:{epoch}`, so a
+/// reader of the values (sweeps, prunes, cascades, the Call-plane fetch) is
+/// unaffected; only a keyed lookup tells the two apart.
+const TEXT_COMMIT_KEY_PREFIX: &str = "text:";
+
+fn text_commit_key(id: &str) -> String {
+    format!("{TEXT_COMMIT_KEY_PREFIX}{id}")
+}
 
 #[async_trait]
 impl crate::AbstractMls for ReferenceDb {
@@ -168,6 +184,12 @@ impl crate::AbstractMls for ReferenceDb {
         group: &MlsGroup,
         supersedes: Option<&str>,
     ) -> Result<MlsGroupCreateOutcome> {
+        // Call groups only: Text groups are created by
+        // `create_text_mls_group` (protected-channels models)
+        if group.kind != MlsGroupKind::Call {
+            return Err(create_error!(InvalidOperation));
+        }
+
         // Single Mutex = the whole arbitration is atomic (the Reference
         // equivalent of the Mongo partial unique index, plan §1.2)
         let mut groups = self.mls_groups.lock().await;
@@ -179,9 +201,21 @@ impl crate::AbstractMls for ReferenceDb {
                         error: "superseded group belongs to another channel".to_string()
                     }));
                 }
+                Some(old) if old.kind != group.kind => {
+                    return Err(create_error!(FailedValidation {
+                        error: "superseded group is of another kind".to_string()
+                    }));
+                }
                 Some(old) if !old.open => {
                     // Someone else already superseded it — conflict with the
                     // channel's actual open group, if any
+                }
+                // The successor's id is taken (A3): Mongo's insert fails on
+                // `_id` after its close, and with the predecessor closed it
+                // finds no open group, so it answers InvalidOperation. Same
+                // answer here, refused before the close
+                Some(_) if groups.contains_key(&group.id) => {
+                    return Err(create_error!(InvalidOperation));
                 }
                 Some(_) => {
                     let old = groups
@@ -200,14 +234,23 @@ impl crate::AbstractMls for ReferenceDb {
             }
         }
 
-        if let Some(open) = groups
-            .values()
-            .find(|existing| existing.channel_id == group.channel_id && existing.open)
-        {
+        // Keyed by (channel_id, kind): a channel's Call and Text groups
+        // coexist (design §2.7)
+        if let Some(open) = groups.values().find(|existing| {
+            existing.channel_id == group.channel_id && existing.kind == group.kind && existing.open
+        }) {
             return Ok(MlsGroupCreateOutcome::Conflict {
                 open_group_id: open.id.clone(),
                 channel_id: open.channel_id.clone(),
             });
+        }
+
+        // An id that already exists is never overwritten (A3), whatever its
+        // kind, channel or state: Mongo's `_id` insert fails and, with no
+        // open group of this kind on the channel (checked above), answers
+        // InvalidOperation
+        if groups.contains_key(&group.id) {
+            return Err(create_error!(InvalidOperation));
         }
 
         groups.insert(group.id.clone(), group.clone());
@@ -225,11 +268,12 @@ impl crate::AbstractMls for ReferenceDb {
     async fn fetch_open_mls_group_for_channel(
         &self,
         channel_id: &str,
+        kind: MlsGroupKind,
     ) -> Result<Option<MlsGroup>> {
         let groups = self.mls_groups.lock().await;
         Ok(groups
             .values()
-            .find(|group| group.channel_id == channel_id && group.open)
+            .find(|group| group.channel_id == channel_id && group.kind == kind && group.open)
             .cloned())
     }
 
@@ -238,6 +282,11 @@ impl crate::AbstractMls for ReferenceDb {
         let group = groups
             .get_mut(group_id)
             .ok_or_else(|| create_error!(NotFound))?;
+
+        // Call groups only: a Text group is refused and left untouched
+        if group.kind != MlsGroupKind::Call {
+            return Err(create_error!(InvalidOperation));
+        }
 
         if !group.open {
             return Ok(false);
@@ -256,6 +305,11 @@ impl crate::AbstractMls for ReferenceDb {
         let group = groups
             .get_mut(&commit.group_id)
             .ok_or_else(|| create_error!(NotFound))?;
+
+        // Call path only: Text commits go through insert_mls_text_commit
+        if group.kind != MlsGroupKind::Call {
+            return Err(create_error!(InvalidOperation));
+        }
 
         if !group.open {
             return Err(create_error!(FailedValidation {
@@ -348,6 +402,111 @@ impl crate::AbstractMls for ReferenceDb {
         Ok(MlsCommitOutcome::Won)
     }
 
+    async fn insert_mls_text_commit(
+        &self,
+        commit: &MlsCommit,
+        ad_sha256: &str,
+        entitlement_device_cap: u32,
+    ) -> Result<MlsCommitOutcome> {
+        // Lock order (design §2.5 (d)): channel_seat_lists -> channel_seats
+        // -> mls_groups -> mls_commits -> mls_join_intents -> e2ee_identities,
+        // every lock held for the whole operation, so the read, the checks
+        // and the writes are one atomic unit (the Reference form of the
+        // Mongo transaction). channel_seats is held so a seat release
+        // (which takes it) can never interleave with the added users' seat
+        // check.
+        let seat_lists = self.channel_seat_lists.lock().await;
+        let seats = self.channel_seats.lock().await;
+        let mut groups = self.mls_groups.lock().await;
+        let mut commits = self.mls_commits.lock().await;
+        let mut intents = self.mls_join_intents.lock().await;
+        let identities = self.e2ee_identities.lock().await;
+
+        // Step 0: an existing TEXT-MARKED row wins before any validity
+        // check. An unmarked row at the id (R22 stray) is replaced in step 3
+        let id = MlsCommit::composite_id(&commit.group_id, commit.epoch);
+        if let Some(winning) = commits.get(&text_commit_key(&id)) {
+            return Ok(MlsCommitOutcome::Lost {
+                winning: winning.clone(),
+            });
+        }
+
+        // Step 1: one consistent read
+        let group = groups
+            .get_mut(&commit.group_id)
+            .ok_or_else(|| create_error!(NotFound))?;
+        let seat_list = seat_lists.get(&group.channel_id);
+        let stored_intents: Vec<MlsJoinIntent> = commit
+            .removed
+            .iter()
+            .filter_map(|removed| {
+                intents
+                    .get(&MlsJoinIntent::composite_id(
+                        &group.id,
+                        &removed.user_id,
+                        &removed.device_id,
+                    ))
+                    .cloned()
+            })
+            .collect();
+        let revoked_identities: HashSet<String> = commit
+            .removed
+            .iter()
+            .map(|removed| E2EEIdentity::composite_id(&removed.user_id, &removed.device_id))
+            .filter(|identity_id| !identities.contains_key(identity_id))
+            .collect();
+        let active_seat_users: HashSet<String> = commit
+            .added
+            .iter()
+            .filter(|added| {
+                seats
+                    .get(&ChannelSeat::composite_id(
+                        &group.channel_id,
+                        &added.user_id,
+                    ))
+                    .is_some_and(|seat| seat.is_active())
+            })
+            .map(|added| added.user_id.clone())
+            .collect();
+
+        // Step 2: every validity check
+        let plan = plan_mls_text_commit(
+            group,
+            commit,
+            ad_sha256,
+            seat_list,
+            entitlement_device_cap,
+            &stored_intents,
+            &revoked_identities,
+            &active_seat_users,
+        )?;
+
+        // Steps 3 to 5 (the filter of step 4 is the state just validated
+        // under the same locks). An unmarked row at the id never wins a
+        // Text epoch (R22): it goes, then the marked row is stored
+        if commits.remove(&id).is_some() {
+            log::warn!(
+                "AUDIT mls_text_stray_replaced group={} epoch={}",
+                commit.group_id,
+                commit.epoch
+            );
+        }
+        commits.insert(text_commit_key(&id), plan.stored);
+
+        group.current_epoch = commit.epoch;
+        group.members = plan.members;
+        group.member_added = plan.member_added;
+        group
+            .pending_removals
+            .retain(|pending| !plan.cleared_pending.contains(&pending.user_id));
+
+        for intent_id in &plan.consumed_intent_ids {
+            intents.remove(intent_id);
+        }
+
+        Ok(MlsCommitOutcome::Won)
+    }
+
     async fn fetch_mls_commits_from(
         &self,
         group_id: &str,
@@ -359,6 +518,30 @@ impl crate::AbstractMls for ReferenceDb {
             .values()
             .filter(|commit| commit.group_id == group_id && commit.epoch >= from_epoch)
             .cloned()
+            .collect();
+
+        result.sort_by_key(|commit| commit.epoch);
+        result.truncate(limit.max(0) as usize);
+        Ok(result)
+    }
+
+    async fn fetch_mls_text_commits_from(
+        &self,
+        group_id: &str,
+        from_epoch: i64,
+        limit: i64,
+    ) -> Result<Vec<MlsCommit>> {
+        // Text-marked rows only (R22): an unmarked row under a Text group's
+        // id is never served
+        let commits = self.mls_commits.lock().await;
+        let mut result: Vec<MlsCommit> = commits
+            .iter()
+            .filter(|(key, commit)| {
+                key.starts_with(TEXT_COMMIT_KEY_PREFIX)
+                    && commit.group_id == group_id
+                    && commit.epoch >= from_epoch
+            })
+            .map(|(_, commit)| commit.clone())
             .collect();
 
         result.sort_by_key(|commit| commit.epoch);
@@ -395,13 +578,16 @@ impl crate::AbstractMls for ReferenceDb {
         let mut commits = self.mls_commits.lock().await;
         let mut intents = self.mls_join_intents.lock().await;
 
+        // Text groups are never swept (design §2.5): their commits age out
+        // through prune_mls_text_commits instead
         let swept: Vec<String> = groups
             .values()
             .filter(|group| {
-                group
-                    .closed_at
-                    .is_some_and(|closed_at| closed_at < closed_threshold)
-                    || group.created_at < created_threshold
+                group.kind == MlsGroupKind::Call
+                    && (group
+                        .closed_at
+                        .is_some_and(|closed_at| closed_at < closed_threshold)
+                        || group.created_at < created_threshold)
             })
             .map(|group| group.id.clone())
             .collect();
@@ -413,5 +599,23 @@ impl crate::AbstractMls for ReferenceDb {
         intents.retain(|_, intent| !swept.contains(&intent.group_id));
 
         Ok(swept.len())
+    }
+
+    async fn prune_mls_text_commits(&self, older_than: Timestamp) -> Result<u64> {
+        // Lock order: groups then commits
+        let groups = self.mls_groups.lock().await;
+        let mut commits = self.mls_commits.lock().await;
+
+        let text_groups: HashSet<&str> = groups
+            .values()
+            .filter(|group| group.kind == MlsGroupKind::Text)
+            .map(|group| group.id.as_str())
+            .collect();
+
+        let before = commits.len();
+        commits.retain(|_, commit| {
+            !(text_groups.contains(commit.group_id.as_str()) && commit.created_at < older_than)
+        });
+        Ok((before - commits.len()) as u64)
     }
 }

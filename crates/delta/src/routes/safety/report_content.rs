@@ -120,17 +120,22 @@ pub async fn report_content(
 
             // Additionally snapshot server-readable content when available.
             // Best-effort: the report must go through even if the server
-            // cannot read the message (E2EE) or it was already deleted.
+            // cannot read the message (E2EE) or it was already deleted. A
+            // plaintext row stored in a protected channel (R15) gives no
+            // server copy, so the report is filed on the reporter's snapshot
+            // alone, as for a deleted message.
             let mut files = vec![];
             if let Ok(message) = db.fetch_message(id).await {
                 if message.author == user.id {
                     return Err(create_error!(CannotReportYourself));
                 }
 
-                let (snapshot, message_files) =
-                    SnapshotContent::generate_from_message(db, message).await?;
-                snapshots.push(snapshot);
-                files = message_files;
+                if let Some((snapshot, message_files)) =
+                    SnapshotContent::generate_from_message(db, message).await?
+                {
+                    snapshots.push(snapshot);
+                    files = message_files;
+                }
             }
 
             (snapshots, files)
@@ -174,11 +179,15 @@ pub async fn report_content(
                 });
             }
 
+            // A context message stored as plaintext in a protected channel
+            // (R15) gives no server copy; the user report is still filed
             if let Some(message) = message {
-                let (message_snapshot, message_files) =
-                    SnapshotContent::generate_from_message(db, message).await?;
-                snapshots.push(message_snapshot);
-                files = [files, message_files].concat();
+                if let Some((message_snapshot, message_files)) =
+                    SnapshotContent::generate_from_message(db, message).await?
+                {
+                    snapshots.push(message_snapshot);
+                    files = [files, message_files].concat();
+                }
             }
 
             (snapshots, files)
@@ -229,7 +238,7 @@ pub async fn report_content(
 #[cfg(test)]
 mod test {
     use crate::{rocket, util::test::TestHarness};
-    use revolt_database::{PartialUser, SnapshotContent};
+    use revolt_database::{Channel, Database, PartialUser, SnapshotContent};
     use rocket::http::{ContentType, Header, Status};
     use serde_json::json;
 
@@ -526,6 +535,160 @@ mod test {
         assert!(matches!(
             &snapshots[0].content,
             SnapshotContent::ReporterMessage { .. }
+        ));
+    }
+
+    /// Mark `channel_id` protected under its stored plaintext rows, raw, as
+    /// the R15 compensation window can leave a stray behind
+    async fn protect_under_stored_rows(db: &Database, channel_id: &str) {
+        match db {
+            Database::Reference(reference) => {
+                match reference.channels.lock().await.get_mut(channel_id) {
+                    Some(Channel::TextChannel { protected, .. }) => *protected = true,
+                    other => panic!("expected a text channel, got {:?}", other),
+                }
+            }
+            Database::MongoDb(mongo) => {
+                use revolt_database::mongodb::bson::{doc, Document};
+
+                let result = mongo
+                    .col::<Document>("channels")
+                    .update_one(
+                        doc! { "_id": channel_id },
+                        doc! { "$set": { "protected": true } },
+                    )
+                    .await
+                    .expect("raw protect");
+                assert_eq!(result.matched_count, 1);
+            }
+        }
+
+        assert!(db
+            .fetch_channel(channel_id)
+            .await
+            .expect("channel")
+            .is_protected());
+    }
+
+    #[test]
+    fn report_of_a_stray_plaintext_row_is_filed_without_a_server_copy() {
+        crate::util::test::rt()
+            .block_on(report_of_a_stray_plaintext_row_is_filed_without_a_server_copy_case())
+    }
+
+    async fn report_of_a_stray_plaintext_row_is_filed_without_a_server_copy_case() {
+        // R15 backstop, decision 9 (W2) [R#4]: the server never snapshots a
+        // plaintext row stored in a protected channel, but the report itself
+        // is still filed on the reporter-supplied snapshot.
+        let harness = TestHarness::new().await;
+        let (_, session, reporter) = harness.new_user().await;
+        let (_, _, author) = harness.new_user().await;
+
+        let (server, channels) = harness.new_server(&author).await;
+        let (channel, _, message) = harness.new_message(&author, &server, channels).await;
+        protect_under_stored_rows(&harness.db, channel.id()).await;
+
+        let response = harness
+            .client
+            .post("/safety/report")
+            .header(ContentType::JSON)
+            .header(Header::new("x-session-token", session.token.to_string()))
+            .body(
+                json!({
+                    "content": {
+                        "type": "Message",
+                        "id": message.id,
+                        "report_reason": "SpamAbuse"
+                    },
+                    "message_snapshot": {
+                        "message": {
+                            "id": message.id,
+                            "channel": channel.id(),
+                            "author": author.id,
+                            "content": "Test message"
+                        }
+                    }
+                })
+                .to_string(),
+            )
+            .dispatch()
+            .await;
+
+        assert_eq!(response.status(), Status::NoContent);
+
+        let reports = harness.db.fetch_reports(None).await.expect("reports");
+        let report = reports
+            .iter()
+            .find(|report| report.author_id == reporter.id)
+            .expect("report to be persisted");
+
+        let snapshots = harness
+            .db
+            .fetch_snapshots_by_report(&report.id)
+            .await
+            .expect("snapshots");
+
+        // Only the reporter-supplied snapshot; the stray is never embedded
+        assert_eq!(snapshots.len(), 1);
+        assert!(matches!(
+            &snapshots[0].content,
+            SnapshotContent::ReporterMessage { .. }
+        ));
+    }
+
+    #[test]
+    fn user_report_citing_a_stray_plaintext_row_is_filed_without_it() {
+        crate::util::test::rt()
+            .block_on(user_report_citing_a_stray_plaintext_row_is_filed_without_it_case())
+    }
+
+    async fn user_report_citing_a_stray_plaintext_row_is_filed_without_it_case() {
+        let harness = TestHarness::new().await;
+        let (_, session, reporter) = harness.new_user().await;
+        let (_, _, author) = harness.new_user().await;
+
+        let (server, channels) = harness.new_server(&author).await;
+        let (channel, _, message) = harness.new_message(&author, &server, channels).await;
+        protect_under_stored_rows(&harness.db, channel.id()).await;
+
+        let response = harness
+            .client
+            .post("/safety/report")
+            .header(ContentType::JSON)
+            .header(Header::new("x-session-token", session.token.to_string()))
+            .body(
+                json!({
+                    "content": {
+                        "type": "User",
+                        "id": author.id,
+                        "report_reason": "SpamAbuse",
+                        "message_id": message.id
+                    }
+                })
+                .to_string(),
+            )
+            .dispatch()
+            .await;
+
+        assert_eq!(response.status(), Status::NoContent);
+
+        let reports = harness.db.fetch_reports(None).await.expect("reports");
+        let report = reports
+            .iter()
+            .find(|report| report.author_id == reporter.id)
+            .expect("report to be persisted");
+
+        let snapshots = harness
+            .db
+            .fetch_snapshots_by_report(&report.id)
+            .await
+            .expect("snapshots");
+
+        // The reported user only; the cited stray is never embedded
+        assert_eq!(snapshots.len(), 1);
+        assert!(matches!(
+            &snapshots[0].content,
+            SnapshotContent::User(reported) if reported.id == author.id
         ));
     }
 }

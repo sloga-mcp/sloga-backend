@@ -5,6 +5,7 @@ use super::AbstractMigrations;
 mod init;
 mod scripts;
 
+pub(crate) use init::{protected_nonce_index, PROTECTED_NONCE_INDEX_NAME};
 /// The Prot tests install the real migration indexes
 #[cfg(test)]
 pub(crate) use scripts::{create_prot_indexes, PROT_COLLECTIONS};

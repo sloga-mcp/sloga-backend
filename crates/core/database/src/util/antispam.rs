@@ -863,6 +863,15 @@ mod tests {
     ) {
         for peer in peers {
             let channel = Ulid::new().to_string();
+            // A real DM has its channel row; the report snapshot reads it
+            db.insert_channel(&crate::Channel::DirectMessage {
+                id: channel.clone(),
+                active: true,
+                recipients: vec![author.id.clone(), peer.clone()],
+                last_message_id: None,
+            })
+            .await
+            .unwrap();
             let sent = message(&channel, &author.id, text);
             db.insert_message(&sent).await.unwrap();
             observe_dm_message(db, cfg, author, &channel, peer, &sent).await;

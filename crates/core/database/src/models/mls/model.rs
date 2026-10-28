@@ -22,6 +22,28 @@ use iso8601_timestamp::Timestamp;
 /// fan-out and Welcome size.
 pub const MAX_MLS_GROUP_MEMBERS: usize = 100;
 
+/// Leaf ceiling for a protected-channel Text group, counting every device
+/// (protected channels design §2.5). Derived from the same Welcome budget
+/// as [`MAX_MLS_GROUP_MEMBERS`]; raising it is S10.
+pub const MAX_MLS_TEXT_GROUP_MEMBERS: usize = 100;
+
+/// How old a stored rejoin intent may be and still justify a rule-6
+/// (rejoin) Remove inside the Text commit transaction (design §3.12.2).
+/// Mirrors the route constant `REJOIN_OUTSTANDING_WINDOW_SECONDS` in
+/// `delta/src/routes/mls/mod.rs`; the two must stay equal.
+pub const MLS_REJOIN_OUTSTANDING_WINDOW_SECONDS: i64 = 30;
+
+/// Enforced per-user device cap for a Text group (design §2.5, W0-fix3):
+/// `min(signed-list device_cap, effective entitlement cap)` where `0` means
+/// unlimited in EITHER operand, so `min(0, x) = x` and only `min(0, 0) = 0`
+/// (unlimited, still bounded by [`MAX_MLS_TEXT_GROUP_MEMBERS`]).
+pub fn mls_text_enforced_device_cap(signed: u32, entitlement: u32) -> u32 {
+    match (signed, entitlement) {
+        (0, other) | (other, 0) => other,
+        (signed, entitlement) => signed.min(entitlement),
+    }
+}
+
 /// Domain-separation context for the MLS leaf-credential binding: the
 /// payload signed by the device identity key that binds an MLS signature
 /// public key to a slice-5 device identity.
@@ -133,17 +155,98 @@ impl MlsKeyPackage {
 }
 
 auto_derived!(
-    /// A per-call MLS group registered with the delivery service.
+    /// What an MLS group secures (protected channels design §2.5).
+    /// Serialized as `"Call"` / `"Text"`. A stored group without the field
+    /// (written before it existed) is a Call group.
+    #[derive(Default, Copy, Hash)]
+    pub enum MlsGroupKind {
+        /// Per-call media E2EE group (slice 6)
+        #[default]
+        Call,
+        /// Protected text channel group (protected channels S1)
+        Text,
+    }
+);
+
+auto_derived!(
+    /// A user whose devices must leave a Text group (server-forced removal
+    /// or owner unseat, design §2.5 / §6.3). While any entry exists, Add
+    /// commits are refused (`pending_removal`).
+    pub struct MlsPendingRemoval {
+        /// User whose member devices are to be removed
+        pub user_id: String,
+        /// When the pending removal was recorded
+        pub created_at: Timestamp,
+    }
+);
+
+auto_derived!(
+    /// When a member device of a Text group was last added (design §2.5,
+    /// W0-fix5). Rule 6 (rejoin) of the Remove rule only counts an intent
+    /// created AFTER `at`; a device with no entry can never be evicted
+    /// under rule 6.
+    pub struct MlsMemberAdded {
+        /// Added user
+        pub user_id: String,
+        /// Added device
+        pub device_id: String,
+        /// Epoch the Add established (0 = the creator at group create)
+        pub epoch: i64,
+        /// Server-stamped time of the Add
+        pub at: Timestamp,
+    }
+);
+
+auto_derived!(
+    /// Which Remove rule (design §3.12.2) admitted a removed device of a
+    /// Text commit, as the route found it. Stored and served snake_case.
+    /// ADVISORY ONLY: it never changes admission, and receivers decide from
+    /// signed material (the server is untrusted)
+    #[derive(Copy, Hash)]
+    #[serde(rename_all = "snake_case")]
+    pub enum MlsRemovalReason {
+        /// Rule 2: the committer's own user
+        OwnUser,
+        /// Rule 3: the device's user is pending removal
+        PendingRemoval,
+        /// Rule 5: the device's user is off the newest seat list and the
+        /// committer is the list signer's device
+        OffList,
+        /// Rule 4: the device has no registered identity
+        Revoked,
+        /// Rule 6: the device's own outstanding rejoin intent
+        Rejoin,
+    }
+);
+
+auto_derived!(
+    /// The advisory reason for one device a Text commit removed: the
+    /// STRONGEST rule that admitted it (`pending_removal` > `off_list` >
+    /// `revoked` > `own_user` > `rejoin`)
+    pub struct MlsRemovedReason {
+        /// Removed user
+        pub user_id: String,
+        /// Removed device
+        pub device_id: String,
+        /// The strongest admitting rule
+        pub reason: MlsRemovalReason,
+    }
+);
+
+auto_derived!(
+    /// An MLS group registered with the delivery service: a per-call media
+    /// group (`kind: Call`) or a protected text channel group (`kind: Text`).
     ///
     /// This collection is a documented metadata extension (plan §5.6): the
     /// server learns that a call in `channel_id` has an E2EE group, its
     /// epoch counter, and the (user, device) membership set asserted by
     /// committers — never group secrets or cryptographic roster structure.
     ///
-    /// At most ONE open group exists per channel at any time (partial unique
-    /// index on `channel_id` where `open` — the create-race arbitration,
-    /// plan §1.2/A5). The successor flow (poisoned-epoch recovery, §1.4)
-    /// closes the old group and creates the new one in one driver call.
+    /// At most ONE open group of each kind exists per channel at any time
+    /// (partial unique index on `(channel_id, kind)` where `open` — the
+    /// create-race arbitration, plan §1.2/A5, design §2.7). The successor
+    /// flow (poisoned-epoch recovery, §1.4) closes the old group and
+    /// creates the new one in one driver call.
     pub struct MlsGroup {
         /// Client-derived group id (64 lowercase hex chars)
         #[serde(rename = "_id")]
@@ -173,6 +276,30 @@ auto_derived!(
         /// Successor group id when closed via the poisoned-epoch flow
         #[serde(skip_serializing_if = "Option::is_none")]
         pub superseded_by: Option<String>,
+        /// Call or Text. Every write path keys open-group lookups by
+        /// `(channel_id, kind)`; Call paths never touch Text groups.
+        #[serde(default)]
+        pub kind: MlsGroupKind,
+        /// Text only: the group-id generation (design §3.1). `Some(g)` on
+        /// every Text group, `None` on Call groups.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub generation: Option<u32>,
+        /// Text only: [`crate::SeatList::commit_ad_sha256`] (lowercase hex
+        /// SHA-256 of the `commit_ad`) of the channel's newest stored seat
+        /// list, the single source of truth for this value.
+        /// `Some` on every open Text group; written in the same transaction
+        /// as every seat-list row change; the Text commit transaction
+        /// filters its group update on it (design §3.12.2).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub seat_list_ad_sha256: Option<String>,
+        /// Text only: users whose devices must be removed. Add commits are
+        /// refused while non-empty; an entry is cleared by the commit that
+        /// leaves the user with no member device.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub pending_removals: Vec<MlsPendingRemoval>,
+        /// Text only: when each member device was last added (rule 6).
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub member_added: Vec<MlsMemberAdded>,
     }
 );
 
@@ -184,9 +311,33 @@ impl MlsGroup {
             .any(|member| member.user_id == user_id && member.device_id == device_id)
     }
 
-    /// The member entry for a user, if any device of theirs is in the group
+    /// The member entry for a user, if any device of theirs is in the group.
+    /// Call groups only hold one device per user; on a Text group this is
+    /// only the FIRST device — use [`MlsGroup::member_devices_of`] there.
     pub fn member_device_of(&self, user_id: &str) -> Option<&MlsMemberDevice> {
         self.members.iter().find(|member| member.user_id == user_id)
+    }
+
+    /// Every member device of a user (Text groups allow several)
+    pub fn member_devices_of<'a>(
+        &'a self,
+        user_id: &'a str,
+    ) -> impl Iterator<Item = &'a MlsMemberDevice> + 'a {
+        self.members
+            .iter()
+            .filter(move |member| member.user_id == user_id)
+    }
+
+    /// Whether this is a protected-channel Text group
+    pub fn is_text(&self) -> bool {
+        self.kind == MlsGroupKind::Text
+    }
+
+    /// Whether a user has a pending removal on this group
+    pub fn has_pending_removal(&self, user_id: &str) -> bool {
+        self.pending_removals
+            .iter()
+            .any(|pending| pending.user_id == user_id)
     }
 }
 
@@ -221,6 +372,19 @@ auto_derived!(
         pub removed: Vec<MlsMemberDevice>,
         /// Server-stamped submission time
         pub created_at: Timestamp,
+        /// Text only: copies of the stored signed join intents that
+        /// justified a rule-6 (rejoin) Remove in this commit (design §2.5,
+        /// W0-fix4). Filled by the driver inside the Text commit
+        /// transaction, never taken from the submitter; always empty on
+        /// Call commits.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub rejoin_intents: Vec<MlsJoinIntent>,
+        /// Text only: one advisory reason per removed device, stamped by
+        /// the submit route (B48). Never read for admission; always empty
+        /// on Call commits, so a Call row keeps its earlier shape, and a row
+        /// written before the field existed reads as empty.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub removed_reasons: Vec<MlsRemovedReason>,
     }
 );
 
@@ -299,3 +463,69 @@ auto_derived!(
         },
     }
 );
+
+#[cfg(test)]
+mod removed_reasons_shape_tests {
+    use iso8601_timestamp::Timestamp;
+
+    use super::{MlsCommit, MlsMemberDevice, MlsRemovalReason, MlsRemovedReason};
+
+    fn device(user_id: &str, fill: &str) -> MlsMemberDevice {
+        MlsMemberDevice {
+            user_id: user_id.to_string(),
+            device_id: fill.repeat(32),
+        }
+    }
+
+    fn call_row() -> MlsCommit {
+        let group_id = format!("{}1", "0".repeat(63));
+        MlsCommit {
+            id: MlsCommit::composite_id(&group_id, 2),
+            group_id,
+            epoch: 2,
+            committer: device("01JA00000000000000000USERA", "a"),
+            commit: "Y29tbWl0".to_string(),
+            size: 6,
+            added: vec![],
+            removed: vec![device("01JA00000000000000000USERB", "b")],
+            created_at: Timestamp::UNIX_EPOCH,
+            rejoin_intents: vec![],
+            removed_reasons: vec![],
+        }
+    }
+
+    /// B48: a row without reasons (every Call row) stores no
+    /// `removed_reasons` key; a Text row stores them snake_case; a row
+    /// written before the field existed reads as empty
+    #[test]
+    fn removed_reasons_are_stored_only_when_present() {
+        let call = call_row();
+        let document = bson::to_document(&call).unwrap();
+        assert!(!document.contains_key("removed_reasons"));
+        assert_eq!(bson::from_document::<MlsCommit>(document).unwrap(), call);
+
+        let text = MlsCommit {
+            removed_reasons: vec![MlsRemovedReason {
+                user_id: "01JA00000000000000000USERB".to_string(),
+                device_id: "b".repeat(32),
+                reason: MlsRemovalReason::PendingRemoval,
+            }],
+            ..call_row()
+        };
+        let mut document = bson::to_document(&text).unwrap();
+        let stored = document
+            .get_array("removed_reasons")
+            .expect("the reasons are stored");
+        assert_eq!(
+            stored[0].as_document().unwrap().get_str("reason").unwrap(),
+            "pending_removal"
+        );
+        assert_eq!(
+            bson::from_document::<MlsCommit>(document.clone()).unwrap(),
+            text
+        );
+
+        assert!(document.remove("removed_reasons").is_some());
+        assert_eq!(bson::from_document::<MlsCommit>(document).unwrap(), call);
+    }
+}

@@ -30,6 +30,10 @@ const RETENTION_MS: i64 = 24 * 60 * 60 * 1000;
 const DM_PAUSED_REASON: &str =
     "your direct messages to people who haven't written back to you are paused pending review";
 
+/// Failure reason for a row whose channel (or a thread's parent) was
+/// protected after it was scheduled.
+const CHANNEL_PROTECTED_REASON: &str = "the channel is now end-to-end encrypted";
+
 fn now_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -258,6 +262,25 @@ async fn deliver(
         return Err("you no longer have permission to send messages here".to_string());
     }
 
+    // A scheduled payload is plaintext, so a channel protected since the row
+    // was scheduled (or a thread whose parent was) refuses it. Delta refuses
+    // scheduling into one; this covers rows queued before the protect.
+    // After the membership and SendMessage re-checks, so an author who left
+    // or can no longer see the channel gets the same reason as for any
+    // other channel and learns nothing about protection (decision 18 (W2)).
+    // Before any attachment hand-over, embed work or insert: the database
+    // floor also refuses the insert, but only after the attachments were
+    // repointed at a message that is never written, and it reads only the
+    // thread, never its parent.
+    if channel.is_protected() || permission_channel.is_protected() {
+        log::info!(
+            "Dropped scheduled message {} to {}: the channel is protected",
+            row.id,
+            row.channel
+        );
+        return Err(CHANNEL_PROTECTED_REASON.to_string());
+    }
+
     // Archived or locked threads reject scheduled sends exactly like live
     // ones (same rule as delta's ensure_thread_writable).
     if let Channel::Thread {
@@ -454,8 +477,8 @@ mod tests {
     use super::*;
     use iso8601_timestamp::Timestamp;
     use revolt_database::{
-        DatabaseInfo, DmGuard, MessageFilter, MessageQuery, MessageTimePeriod, Relationship,
-        RelationshipStatus,
+        DatabaseInfo, DmGuard, Member, MemberCompositeKey, MessageFilter, MessageQuery,
+        MessageTimePeriod, Metadata, PartialChannel, Relationship, RelationshipStatus, Server,
     };
 
     fn make_user(username: &str, relations: Option<Vec<Relationship>>) -> User {
@@ -500,6 +523,7 @@ mod tests {
                 interactions: None,
                 components: None,
                 sticker_ids: None,
+                encrypted: None,
                 flags: None,
             },
             status: ScheduledMessageStatus::Sending,
@@ -699,6 +723,320 @@ mod tests {
                 row.failure_reason
             );
             assert!(find_delivered(&db, &row).await.is_some());
+        });
+    }
+
+    /// A server owned by its author (so every permission holds and only the
+    /// protected check can refuse), the author's member row, and an ordinary
+    /// text channel in it. `thread` adds a thread under that channel and
+    /// returns it as the target instead.
+    #[allow(clippy::disallowed_methods)]
+    async fn server_fixture(db: &Database, thread: bool) -> (User, Channel, Channel) {
+        let author = make_user("protected-author", None);
+        db.insert_user(&author).await.unwrap();
+
+        let (server, _) = Server::create(
+            db,
+            v0::DataCreateServer {
+                name: "protected".to_string(),
+                ..Default::default()
+            },
+            &author,
+            false,
+        )
+        .await
+        .expect("Server::create");
+        db.insert_or_merge_member(&Member {
+            id: MemberCompositeKey {
+                server: server.id.clone(),
+                user: author.id.clone(),
+            },
+            ..Default::default()
+        })
+        .await
+        .expect("insert_or_merge_member");
+
+        let parent = Channel::TextChannel {
+            id: Ulid::new().to_string(),
+            server: server.id.clone(),
+            name: "text".to_string(),
+            description: None,
+            icon: None,
+            last_message_id: None,
+            default_permissions: None,
+            role_permissions: Default::default(),
+            nsfw: false,
+            spoiler: false,
+            voice: None,
+            slowmode: None,
+            announcement: None,
+            protected: false,
+        };
+        db.insert_channel(&parent).await.unwrap();
+
+        let target = if thread {
+            let thread = Channel::Thread {
+                id: Ulid::new().to_string(),
+                server: server.id.clone(),
+                parent_channel: parent.id().to_string(),
+                name: "thread".to_string(),
+                creator: author.id.clone(),
+                origin_message_id: None,
+                last_message_id: None,
+                archived: false,
+                archived_timestamp: None,
+                auto_archive_minutes: Channel::default_auto_archive_minutes(),
+                locked: false,
+                applied_tags: vec![],
+            };
+            db.insert_channel(&thread).await.unwrap();
+            thread
+        } else {
+            parent.clone()
+        };
+
+        (author, parent, target)
+    }
+
+    /// Store a pending row for `target` carrying one attachment claimed
+    /// against the row id, as delta's schedule route leaves it. Returns the
+    /// row and the attachment id.
+    async fn schedule_with_attachment(
+        db: &Database,
+        author: &User,
+        target: &Channel,
+    ) -> (ScheduledMessage, String) {
+        let mut row = claimed_row(author, target.id());
+        row.status = ScheduledMessageStatus::Pending;
+        row.server = target.server().map(str::to_string);
+
+        let attachment = Ulid::new().to_string();
+        db.insert_attachment(&File {
+            id: attachment.clone(),
+            tag: "attachments".to_string(),
+            filename: "witness.txt".to_string(),
+            hash: None,
+            uploaded_at: None,
+            uploader_id: None,
+            used_for: None,
+            deleted: None,
+            reported: None,
+            metadata: Metadata::File,
+            content_type: "text/plain".to_string(),
+            size: 1,
+            message_id: None,
+            user_id: None,
+            server_id: None,
+            object_id: None,
+        })
+        .await
+        .expect("insert_attachment");
+        File::use_attachment(db, &attachment, &row.id, &author.id)
+            .await
+            .expect("use_attachment");
+        row.data.attachments = Some(vec![attachment.clone()]);
+
+        db.insert_scheduled_message(&row)
+            .await
+            .expect("insert_scheduled_message");
+        (row, attachment)
+    }
+
+    /// Protect `channel` after the fact, as the protect route's final write
+    /// does (the route's own preconditions are not under test here).
+    async fn protect(db: &Database, channel: &Channel) {
+        db.update_channel(
+            channel.id(),
+            &PartialChannel {
+                protected: Some(true),
+                ..Default::default()
+            },
+            vec![],
+        )
+        .await
+        .expect("update_channel");
+        assert!(db.fetch_channel(channel.id()).await.unwrap().is_protected());
+    }
+
+    /// Claim and settle a stored row exactly as the task loop does, and
+    /// return the row as stored afterwards.
+    async fn claim_and_settle(db: &Database, row: &ScheduledMessage) -> ScheduledMessage {
+        assert!(db
+            .claim_scheduled_message(&row.id)
+            .await
+            .expect("claim_scheduled_message"));
+
+        settle(db, None, row, now_ms(), &AntispamFeatures::default()).await;
+
+        db.fetch_scheduled_message(&row.id)
+            .await
+            .expect("fetch_scheduled_message")
+    }
+
+    /// A refused row: Failed with the protected reason, nothing stored in
+    /// the channel, and the attachment still claimed by the ROW (never
+    /// handed over to a message id) and released into the deletion sweep.
+    ///
+    /// The reason and the claim are what tell this refusal apart from the
+    /// database floor's: without the early check the attachment is
+    /// repointed first and the row fails with the send's error instead.
+    async fn assert_refused_as_protected(
+        db: &Database,
+        settled: &ScheduledMessage,
+        attachment: &str,
+    ) {
+        assert!(
+            matches!(settled.status, ScheduledMessageStatus::Failed),
+            "row ended {:?}: {:?}",
+            settled.status,
+            settled.failure_reason
+        );
+        assert_eq!(
+            settled.failure_reason.as_deref(),
+            Some(CHANNEL_PROTECTED_REASON)
+        );
+        assert!(
+            find_delivered(db, settled).await.is_none(),
+            "a plaintext scheduled message reached a protected channel"
+        );
+        let stored = db
+            .fetch_messages(MessageQuery {
+                limit: Some(50),
+                filter: MessageFilter {
+                    channel: Some(settled.channel.clone()),
+                    ..Default::default()
+                },
+                time_period: MessageTimePeriod::Absolute {
+                    before: None,
+                    after: None,
+                    sort: None,
+                },
+            })
+            .await
+            .expect("fetch_messages");
+        assert!(stored.is_empty(), "messages were written: {stored:?}");
+
+        let file = db
+            .fetch_attachment("attachments", attachment)
+            .await
+            .expect("fetch_attachment");
+        assert_eq!(
+            file.used_for.as_ref().map(|used_for| used_for.id.as_str()),
+            Some(settled.id.as_str()),
+            "the attachment was handed over before the refusal"
+        );
+        assert_eq!(file.deleted, Some(true), "the attachment was not released");
+    }
+
+    /// Named control for B30: with the protected check removed, the row
+    /// fails on the send instead (another reason) after its attachment was
+    /// repointed at the minted message id.
+    #[test]
+    fn scheduled_row_for_a_channel_protected_after_scheduling_fails_closed() {
+        rt().block_on(async {
+            let db = Database::Reference(Default::default());
+            let (author, parent, target) = server_fixture(&db, false).await;
+            let (row, attachment) = schedule_with_attachment(&db, &author, &target).await;
+            protect(&db, &parent).await;
+
+            let settled = claim_and_settle(&db, &row).await;
+
+            assert_refused_as_protected(&db, &settled, &attachment).await;
+        });
+    }
+
+    /// A thread is never itself protected, so its parent decides. Without
+    /// the check nothing else refuses this one: the database floor reads
+    /// only the thread.
+    #[test]
+    fn scheduled_row_for_a_thread_under_a_protected_parent_fails_closed() {
+        rt().block_on(async {
+            let db = Database::Reference(Default::default());
+            let (author, parent, target) = server_fixture(&db, true).await;
+            assert!(matches!(target, Channel::Thread { .. }));
+            let (row, attachment) = schedule_with_attachment(&db, &author, &target).await;
+            protect(&db, &parent).await;
+
+            let settled = claim_and_settle(&db, &row).await;
+
+            assert_refused_as_protected(&db, &settled, &attachment).await;
+        });
+    }
+
+    /// An author removed from the server gets today's membership reason for
+    /// a protected channel too, never the protected one: the check sits
+    /// below the membership re-check (decision 18 (W2)). Placement control:
+    /// the protected check moved above the membership re-check.
+    #[test]
+    fn removed_author_row_for_a_protected_channel_fails_as_a_non_member() {
+        rt().block_on(async {
+            let db = Database::Reference(Default::default());
+            let (author, parent, target) = server_fixture(&db, false).await;
+            let (row, attachment) = schedule_with_attachment(&db, &author, &target).await;
+            protect(&db, &parent).await;
+            db.force_delete_member(&MemberCompositeKey {
+                server: parent.server().expect("server channel").to_string(),
+                user: author.id.clone(),
+            })
+            .await
+            .expect("force_delete_member");
+
+            let settled = claim_and_settle(&db, &row).await;
+
+            assert!(
+                matches!(settled.status, ScheduledMessageStatus::Failed),
+                "row ended {:?}: {:?}",
+                settled.status,
+                settled.failure_reason
+            );
+            assert_eq!(
+                settled.failure_reason.as_deref(),
+                Some("you are no longer a member of the server")
+            );
+            assert!(find_delivered(&db, &settled).await.is_none());
+            let file = db
+                .fetch_attachment("attachments", &attachment)
+                .await
+                .expect("fetch_attachment");
+            assert_eq!(
+                file.used_for.as_ref().map(|used_for| used_for.id.as_str()),
+                Some(settled.id.as_str())
+            );
+            assert_eq!(file.deleted, Some(true));
+        });
+    }
+
+    /// The fixture above, never protected: the row is delivered and its
+    /// attachment handed over to the delivered message, so the refusals
+    /// above are the protect's doing and not the fixture's.
+    #[test]
+    fn scheduled_row_for_an_ordinary_server_channel_delivers() {
+        rt().block_on(async {
+            let db = Database::Reference(Default::default());
+            for thread in [false, true] {
+                let (author, _, target) = server_fixture(&db, thread).await;
+                let (row, attachment) = schedule_with_attachment(&db, &author, &target).await;
+
+                let settled = claim_and_settle(&db, &row).await;
+
+                assert!(
+                    matches!(settled.status, ScheduledMessageStatus::Sent),
+                    "thread {thread}: row ended {:?}: {:?}",
+                    settled.status,
+                    settled.failure_reason
+                );
+                let message = delivered_id(&db, &settled).await;
+                let file = db
+                    .fetch_attachment("attachments", &attachment)
+                    .await
+                    .expect("fetch_attachment");
+                assert_eq!(
+                    file.used_for.map(|used_for| used_for.id),
+                    Some(message),
+                    "thread {thread}"
+                );
+                assert_ne!(file.deleted, Some(true), "thread {thread}");
+            }
         });
     }
 

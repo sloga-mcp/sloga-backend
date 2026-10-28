@@ -100,6 +100,10 @@ pub async fn interaction_modal(
     let permissions = calculate_channel_permissions(&mut query).await;
     permissions.throw_if_lacking_channel_permission(ChannelPermission::SendMessage)?;
 
+    // A thread is judged by its parent: a thread under a protected channel
+    // takes no bot traffic either
+    crate::util::interactions::ensure_interactions_allowed_in(&channel, &permission_channel)?;
+
     crate::util::threads::ensure_thread_writable(&channel, &permissions)?;
 
     // The submission is its own interaction. Its token is generated here but
@@ -521,5 +525,202 @@ mod test {
             .expect("submission row");
         assert!(!submission.submitted);
         assert!(submission.submitted_values.is_empty());
+    }
+
+    /// A thread under `parent`, stored directly. Under a protected parent it
+    /// stands for the thread `create_thread` leaves behind when its delete
+    /// after a refused hold fails (W2 audit B1).
+    async fn thread_under(
+        harness: &TestHarness,
+        parent: &revolt_database::Channel,
+        creator: &str,
+    ) -> revolt_database::Channel {
+        let thread = revolt_database::Channel::Thread {
+            id: ulid::Ulid::new().to_string(),
+            server: parent.server().expect("a server channel").to_string(),
+            parent_channel: parent.id().to_string(),
+            name: "Thread".to_string(),
+            creator: creator.to_string(),
+            origin_message_id: None,
+            last_message_id: None,
+            archived: false,
+            archived_timestamp: None,
+            auto_archive_minutes: 0,
+            locked: false,
+            applied_tags: vec![],
+        };
+        harness.db.insert_channel(&thread).await.expect("thread");
+        thread
+    }
+
+    /// How many interaction rows are stored for `channel_id`
+    async fn interactions_in(db: &revolt_database::Database, channel_id: &str) -> u64 {
+        match db {
+            revolt_database::Database::Reference(reference) => reference
+                .interactions
+                .lock()
+                .await
+                .values()
+                .filter(|interaction| interaction.channel_id == channel_id)
+                .count() as u64,
+            revolt_database::Database::MongoDb(mongo) => {
+                use revolt_database::mongodb::bson::{doc, Document};
+
+                mongo
+                    .col::<Document>("interactions")
+                    .count_documents(doc! { "channel_id": channel_id })
+                    .await
+                    .expect("count interactions")
+            }
+        }
+    }
+
+    async fn open_modal(
+        harness: &TestHarness,
+        bot: &Bot,
+        interaction_id: &str,
+        token: &str,
+    ) -> (Status, String) {
+        let response = harness
+            .client
+            .post(format!("/interactions/{interaction_id}/modal"))
+            .header(Header::new("x-bot-token", bot.token.clone()))
+            .header(ContentType::JSON)
+            .body(modal_body(token).to_string())
+            .dispatch()
+            .await;
+        let status = response.status();
+        (status, response.into_string().await.unwrap_or_default())
+    }
+
+    /// W2 audit B1 (re-review L1): a thread is judged by its parent. Opening
+    /// a form on an interaction in a thread left under a protected parent is
+    /// refused with `ChannelProtected` after the bot's permission check: no
+    /// submission row, the source slot unclaimed, no `InteractionModalOpen`
+    /// to the user. The same request in a thread under an open parent opens
+    /// the form (positive control).
+    ///
+    /// Control: the `ensure_interactions_allowed_in` line removed → the form
+    /// opens in the orphan.
+    #[test]
+    fn modal_open_in_a_thread_under_a_protected_parent_is_refused() {
+        crate::util::test::rt()
+            .block_on(modal_open_in_a_thread_under_a_protected_parent_is_refused_case())
+    }
+
+    async fn modal_open_in_a_thread_under_a_protected_parent_is_refused_case() {
+        use revolt_database::events::client::EventV1;
+
+        let mut harness = TestHarness::new().await;
+        let (_, session, user) = harness.new_user().await;
+        let protected = harness.new_protected_channel(&user, &session, &[]).await;
+        let orphan = thread_under(&harness, &protected.channel, &user.id).await;
+        let open = harness.new_channel(&protected.server).await;
+        let open_thread = thread_under(&harness, &open, &user.id).await;
+        let (bot, _) = setup_bot(&harness, &user, &protected.server).await;
+
+        let source = command_row("tok-orphan", &bot.id, &user.id, orphan.id());
+        harness
+            .db
+            .insert_interaction(&source)
+            .await
+            .expect("interaction");
+
+        let refused = open_modal(&harness, &bot, &source.id, "tok-orphan").await;
+        assert_eq!(refused.0, Status::BadRequest, "{:?}", refused);
+        let error: serde_json::Value = serde_json::from_str(&refused.1).expect("JSON");
+        assert_eq!(error["type"], "ChannelProtected", "{}", refused.1);
+
+        let stored = harness
+            .db
+            .fetch_interaction(&source.id)
+            .await
+            .expect("interaction");
+        assert!(!stored.responded, "a refused form must not claim the slot");
+        assert_eq!(
+            interactions_in(&harness.db, orphan.id()).await,
+            1,
+            "no submission row was written"
+        );
+
+        // Positive control, and the marker: published after the refusal, so
+        // once its `InteractionModalOpen` is seen anything the refused
+        // request published to the user is buffered too
+        let twin = command_row("tok-open", &bot.id, &user.id, open_thread.id());
+        harness.db.insert_interaction(&twin).await.expect("twin");
+        let opened = open_modal(&harness, &bot, &twin.id, "tok-open").await;
+        assert_eq!(opened.0, Status::Ok, "{:?}", opened);
+        let twin_id = twin.id.clone();
+        harness
+            .wait_for_event(&format!("{}!", user.id), |event| match event {
+                EventV1::InteractionModalOpen { source_id, .. } => source_id == &twin_id,
+                _ => false,
+            })
+            .await;
+        let source_id = source.id.clone();
+        harness.assert_no_buffered_event(&format!("{}!", user.id), |event| match event {
+            EventV1::InteractionModalOpen { source_id: id, .. } => id == &source_id,
+            _ => false,
+        });
+    }
+
+    /// Decision 18 (W2): a bot that may not send in the parent gets the
+    /// pre-W2 answer, byte-identical (type, status, body) for a thread under
+    /// a protected parent and one under an open parent.
+    #[test]
+    fn modal_open_without_permission_is_identical_protected_or_not() {
+        crate::util::test::rt()
+            .block_on(modal_open_without_permission_is_identical_protected_or_not_case())
+    }
+
+    async fn modal_open_without_permission_is_identical_protected_or_not_case() {
+        use revolt_database::PartialChannel;
+        use revolt_permissions::{ChannelPermission, OverrideField};
+
+        let harness = TestHarness::new().await;
+        let (_, session, user) = harness.new_user().await;
+        let protected = harness.new_protected_channel(&user, &session, &[]).await;
+        let open = harness.new_channel(&protected.server).await;
+        let (bot, _) = setup_bot(&harness, &user, &protected.server).await;
+
+        let mut answers = Vec::new();
+        for parent in [&protected.channel, &open] {
+            let thread = thread_under(&harness, parent, &user.id).await;
+            let mut parent = harness
+                .db
+                .fetch_channel(parent.id())
+                .await
+                .expect("the parent");
+            parent
+                .update(
+                    &harness.db,
+                    PartialChannel {
+                        default_permissions: Some(OverrideField {
+                            a: 0,
+                            d: ChannelPermission::SendMessage as i64,
+                        }),
+                        ..Default::default()
+                    },
+                    vec![],
+                )
+                .await
+                .expect("deny send");
+
+            let source = command_row("tok-perm", &bot.id, &user.id, thread.id());
+            harness
+                .db
+                .insert_interaction(&source)
+                .await
+                .expect("interaction");
+            answers.push(open_modal(&harness, &bot, &source.id, "tok-perm").await);
+        }
+
+        assert_eq!(answers[1].0, Status::Forbidden, "{:?}", answers[1]);
+        assert!(
+            answers[1].1.contains("MissingPermission"),
+            "{}",
+            answers[1].1
+        );
+        assert_eq!(answers[0], answers[1]);
     }
 }

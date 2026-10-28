@@ -35,6 +35,9 @@ fn now_ms() -> i64 {
 /// (it fires as the daemon, not as a user request burst).
 ///
 /// Pending scheduled messages are strictly private to their author.
+///
+/// A protected channel (or a thread under one) refuses scheduling, and an
+/// encrypted payload is refused on every channel.
 #[openapi(tag = "Messaging")]
 #[post("/<target>/scheduled_messages", data = "<data>")]
 pub async fn message_schedule(
@@ -58,6 +61,16 @@ pub async fn message_schedule(
         message: mut payload,
         scheduled_at,
     } = data;
+
+    // An encrypted payload is bound to the group and epoch it was sealed
+    // under, so it cannot wait in a queue; it is refused on every channel.
+    // This depends on the request alone, so it tells a caller nothing about
+    // the channel.
+    if payload.encrypted.is_some() {
+        return Err(create_error!(ProtectedFieldRefused {
+            field: "encrypted".to_string()
+        }));
+    }
 
     // Delivery window: between 30 seconds and 30 days out.
     let now = now_ms();
@@ -133,10 +146,6 @@ pub async fn message_schedule(
         return Err(create_error!(InvalidOperation));
     }
 
-    // NOTE: E2EE exclusion (scheduled messages are stored plaintext) is
-    // enforced client-side by the composer, matching message_send — the
-    // server cannot reliably know a conversation's encryption state.
-
     let permission_channel = channel.permission_target(db).await?.into_owned();
     let mut query = DatabasePermissionQuery::new(db, &user).channel(&permission_channel);
     let permissions = calculate_channel_permissions(&mut query).await;
@@ -165,6 +174,16 @@ pub async fn message_schedule(
         interactions.validate(db, &permissions).await?;
     }
 
+    // A scheduled message is stored plaintext and delivered later as
+    // plaintext, so a protected channel (or a thread under one) refuses it.
+    // After the permission checks, so a caller who cannot view the channel
+    // gets the same answer for a protected channel as for any other
+    // (decision 18 (W2)); before the nonce and attachment claims and the
+    // insert.
+    if channel.is_protected() || permission_channel.is_protected() {
+        return Err(create_error!(ChannelProtected));
+    }
+
     // A paused account may not queue DMs to strangers who never wrote
     // back. Checked before the nonce, attachments or row are touched;
     // delivery checks again, as a pause can start in between.
@@ -186,11 +205,7 @@ pub async fn message_schedule(
     }
 
     let per_user = config.features.limits.global.scheduled_messages_per_user;
-    if db
-        .count_pending_scheduled_messages(&user.id, None)
-        .await?
-        >= per_user
-    {
+    if db.count_pending_scheduled_messages(&user.id, None).await? >= per_user {
         return Err(create_error!(TooManyScheduledMessages { max: per_user }));
     }
 
@@ -260,12 +275,15 @@ pub async fn message_schedule(
 mod test {
     use crate::{rocket, util::test::TestHarness};
     use iso8601_timestamp::Timestamp;
-    use revolt_database::{Channel, DmGuard, Member, Message, User};
+    use revolt_database::{
+        events::client::EventV1, Channel, DmGuard, Member, Message, PartialChannel, Session, User,
+    };
     use revolt_models::v0;
+    use revolt_permissions::{ChannelPermission, OverrideField};
     use revolt_result::{Error, ErrorType};
     use rocket::http::{ContentType, Header, Status};
     use rocket::local::asynchronous::LocalResponse;
-    use serde_json::json;
+    use serde_json::{json, Value};
     use std::time::{SystemTime, UNIX_EPOCH};
     use ulid::Ulid;
 
@@ -398,6 +416,7 @@ mod test {
                         interactions: None,
                         components: None,
                         sticker_ids: None,
+                        encrypted: None,
                         flags: None,
                     },
                     status: revolt_database::ScheduledMessageStatus::Pending,
@@ -585,5 +604,228 @@ mod test {
             .await
             .unwrap();
         assert_eq!(rows.len(), 1);
+    }
+
+    /// POST a schedule as `session`. Returns the status and the JSON body
+    /// (`Null` when there is none).
+    async fn schedule(
+        harness: &TestHarness,
+        session: &Session,
+        channel_id: &str,
+        body: &Value,
+    ) -> (Status, Value) {
+        let response = harness
+            .client
+            .post(format!("/channels/{channel_id}/scheduled_messages"))
+            .header(Header::new("x-session-token", session.token.to_string()))
+            .header(ContentType::JSON)
+            .body(body.to_string())
+            .dispatch()
+            .await;
+        let status = response.status();
+        let body = response.into_json::<Value>().await.unwrap_or(Value::Null);
+        (status, body)
+    }
+
+    async fn pending_rows(harness: &TestHarness, channel_id: &str, user: &User) -> usize {
+        harness
+            .db
+            .fetch_scheduled_messages_by_author(channel_id, &user.id)
+            .await
+            .expect("scheduled messages")
+            .len()
+    }
+
+    async fn deny_view(harness: &TestHarness, channel: &Channel) {
+        channel
+            .clone()
+            .update(
+                &harness.db,
+                PartialChannel {
+                    default_permissions: Some(OverrideField {
+                        a: 0,
+                        d: ChannelPermission::ViewChannel as i64,
+                    }),
+                    ..Default::default()
+                },
+                vec![],
+            )
+            .await
+            .expect("deny view");
+    }
+
+    fn thread_under(parent: &Channel, server_id: &str, creator: &User) -> Channel {
+        Channel::Thread {
+            id: Ulid::new().to_string(),
+            server: server_id.to_string(),
+            parent_channel: parent.id().to_string(),
+            name: "Thread".to_string(),
+            creator: creator.id.clone(),
+            origin_message_id: None,
+            last_message_id: None,
+            archived: false,
+            archived_timestamp: None,
+            auto_archive_minutes: 0,
+            locked: false,
+            applied_tags: vec![],
+        }
+    }
+
+    /// A protected channel, and a thread under one, refuse scheduling with
+    /// `ChannelProtected`: no row, no `MessageScheduled`, and the nonce is
+    /// not consumed. The same request then succeeds on an ordinary channel.
+    #[test]
+    fn schedule_refused_on_a_protected_channel() {
+        crate::util::test::rt().block_on(Box::pin(schedule_refused_on_a_protected_channel_case()))
+    }
+
+    async fn schedule_refused_on_a_protected_channel_case() {
+        let mut harness = TestHarness::new().await;
+        let (_, owner_session, owner) = harness.new_user().await;
+        let protected = harness
+            .new_protected_channel(&owner, &owner_session, &[])
+            .await;
+        let ordinary = harness.new_channel(&protected.server).await;
+        let thread = thread_under(&protected.channel, &protected.server.id, &owner);
+        harness.db.insert_channel(&thread).await.expect("thread");
+
+        let body = json!({
+            "content": "see you tomorrow",
+            "nonce": Ulid::new().to_string(),
+            "scheduled_at": in_ms(60 * 60 * 1000)
+        });
+
+        for (channel_id, case) in [
+            (protected.channel.id(), "a protected channel"),
+            (thread.id(), "a thread under a protected channel"),
+        ] {
+            let answer = schedule(&harness, &owner_session, channel_id, &body).await;
+            assert_eq!(answer.0, Status::BadRequest, "{case}: {}", answer.1);
+            assert_eq!(answer.1["type"], "ChannelProtected", "{case}: {}", answer.1);
+            assert_eq!(
+                pending_rows(&harness, channel_id, &owner).await,
+                0,
+                "{case}"
+            );
+        }
+
+        // Positive control, with the same nonce: the refusals consumed none
+        let answer = schedule(&harness, &owner_session, ordinary.id(), &body).await;
+        assert_eq!(answer.0, Status::Ok, "an ordinary channel: {}", answer.1);
+        assert_eq!(pending_rows(&harness, ordinary.id(), &owner).await, 1);
+
+        // The ordinary row's event is the marker: anything the refused
+        // requests published is buffered by the time it arrives.
+        let topic = format!("{}!", owner.id);
+        let ordinary_id = ordinary.id().to_string();
+        harness
+            .wait_for_event(&topic, |event| {
+                matches!(event, EventV1::MessageScheduled { message } if message.channel == ordinary_id)
+            })
+            .await;
+        harness.assert_no_buffered_event(&topic, |event| {
+            matches!(event, EventV1::MessageScheduled { message } if message.channel != ordinary_id)
+        });
+    }
+
+    /// Decision 18 (W2): a caller who cannot view the channel gets the
+    /// pre-W2 answer, byte-identical for a protected and an ordinary channel
+    #[test]
+    fn schedule_non_viewer_same_answer_protected_or_not() {
+        crate::util::test::rt().block_on(Box::pin(
+            schedule_non_viewer_same_answer_protected_or_not_case(),
+        ))
+    }
+
+    async fn schedule_non_viewer_same_answer_protected_or_not_case() {
+        let harness = TestHarness::new().await;
+        let (_, owner_session, owner) = harness.new_user().await;
+        let (_, member_session, member) = harness.new_user().await;
+        let protected = harness
+            .new_protected_channel(&owner, &owner_session, &[&member])
+            .await;
+        let ordinary = harness.new_channel(&protected.server).await;
+        deny_view(&harness, &protected.channel).await;
+        deny_view(&harness, &ordinary).await;
+
+        let body = json!({
+            "content": "see you tomorrow",
+            "scheduled_at": in_ms(60 * 60 * 1000)
+        });
+        let protected_answer =
+            schedule(&harness, &member_session, protected.channel.id(), &body).await;
+        let ordinary_answer = schedule(&harness, &member_session, ordinary.id(), &body).await;
+
+        assert_eq!(
+            ordinary_answer.0,
+            Status::Forbidden,
+            "{}",
+            ordinary_answer.1
+        );
+        assert_eq!(
+            ordinary_answer.1["type"], "MissingPermission",
+            "{}",
+            ordinary_answer.1
+        );
+        assert_eq!(protected_answer, ordinary_answer);
+        assert_eq!(
+            pending_rows(&harness, protected.channel.id(), &member).await,
+            0
+        );
+    }
+
+    /// An encrypted payload is refused with `ProtectedFieldRefused` on an
+    /// ordinary channel and on a protected one, alone or beside content,
+    /// and stores nothing
+    #[test]
+    fn schedule_refuses_encrypted_on_any_channel() {
+        crate::util::test::rt().block_on(Box::pin(schedule_refuses_encrypted_on_any_channel_case()))
+    }
+
+    async fn schedule_refuses_encrypted_on_any_channel_case() {
+        let harness = TestHarness::new().await;
+        let (_, owner_session, owner) = harness.new_user().await;
+        let protected = harness
+            .new_protected_channel(&owner, &owner_session, &[])
+            .await;
+        let ordinary = harness.new_channel(&protected.server).await;
+        let group = harness
+            .new_text_group(&protected.channel, &protected.owner_device, 0, None)
+            .await;
+        let payload = protected.owner_device.encrypted_payload(&group);
+
+        let alone = json!({
+            "encrypted": payload,
+            "scheduled_at": in_ms(60 * 60 * 1000)
+        });
+        let with_content = json!({
+            "content": "see you tomorrow",
+            "encrypted": payload,
+            "scheduled_at": in_ms(60 * 60 * 1000)
+        });
+
+        for (channel_id, body, case) in [
+            (ordinary.id(), &alone, "ordinary, a payload alone"),
+            (
+                ordinary.id(),
+                &with_content,
+                "ordinary, a payload and content",
+            ),
+            (protected.channel.id(), &alone, "protected, a payload alone"),
+        ] {
+            let answer = schedule(&harness, &owner_session, channel_id, body).await;
+            assert_eq!(answer.0, Status::BadRequest, "{case}: {}", answer.1);
+            assert_eq!(
+                answer.1["type"], "ProtectedFieldRefused",
+                "{case}: {}",
+                answer.1
+            );
+            assert_eq!(answer.1["field"], "encrypted", "{case}: {}", answer.1);
+            assert_eq!(
+                pending_rows(&harness, channel_id, &owner).await,
+                0,
+                "{case}"
+            );
+        }
     }
 }

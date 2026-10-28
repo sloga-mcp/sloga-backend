@@ -133,6 +133,15 @@ auto_derived!(
             /// other servers' channels can follow (crosspost fan-out).
             #[serde(skip_serializing_if = "Option::is_none")]
             announcement: Option<bool>,
+
+            /// Whether this is a protected (end-to-end encrypted) channel.
+            ///
+            /// One-way: once true it is never false again. Only the protect
+            /// route sets it; no client edit can set or clear it (it is not
+            /// in `FieldsChannel`), and `Channel::update` refuses a partial
+            /// that would lower it.
+            #[serde(skip_serializing_if = "crate::if_false", default)]
+            protected: bool,
         },
         /// Thread belonging to a server text channel
         Thread {
@@ -340,6 +349,10 @@ auto_derived!(
         pub applied_tags: Option<Vec<String>>,
         #[serde(skip_serializing_if = "Option::is_none")]
         pub announcement: Option<bool>,
+        /// Only ever `Some(true)` on the wire: `Channel::update` refuses
+        /// `Some(false)` on a protected channel and drops it on any other.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub protected: Option<bool>,
     }
 
     /// Optional fields on channel object
@@ -351,6 +364,19 @@ auto_derived!(
         Tags,
     }
 );
+
+impl PartialChannel {
+    /// Whether this partial sets a field a protected channel never takes:
+    /// any `voice`, or `announcement: Some(true)` (design 7.4).
+    ///
+    /// `Channel::update` refuses it against the caller's copy of the
+    /// channel, and both drivers' `update_channel` refuse it again against
+    /// the STORED channel in the same write, because the caller's copy can
+    /// be stale across a concurrent protect.
+    pub fn sets_field_refused_on_protected(&self) -> bool {
+        self.voice.is_some() || self.announcement == Some(true)
+    }
+}
 
 /// Opening marker of the line that carries a channel's password hash inside
 /// its `description`.
@@ -408,6 +434,42 @@ pub fn client_gate_is_set(nsfw: bool, spoiler: bool, description: Option<&str>) 
     nsfw || spoiler || description_has_password_gate(description)
 }
 
+/// `create_thread`'s cleanup after a refused parent hold (W2 audit B1):
+/// delete the just-inserted thread row, retrying once
+///
+/// A row left behind is a thread under a protected parent: the database
+/// floor and the routes refuse plaintext into it, but it still names a
+/// channel nobody can use, so every failed attempt is reported (ids only,
+/// never the thread's name). Returns the last delete error if both fail.
+async fn delete_refused_thread<F, Fut>(
+    mut delete: F,
+    thread_id: &str,
+    parent_id: &str,
+) -> Result<()>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<()>>,
+{
+    let mut attempt = 1;
+    loop {
+        match delete().await {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                revolt_config::capture_message(
+                    &format!(
+                        "create_thread could not delete thread {thread_id} after its parent {parent_id} refused the hold (attempt {attempt} of 2)"
+                    ),
+                    revolt_config::Level::Error,
+                );
+                if attempt == 2 {
+                    return Err(error);
+                }
+                attempt += 1;
+            }
+        }
+    }
+}
+
 #[allow(clippy::disallowed_methods)]
 impl Channel {
     /* /// Create a channel
@@ -460,6 +522,7 @@ impl Channel {
                 voice: data.voice.map(|voice| voice.into()),
                 slowmode: None,
                 announcement: data.announcement.filter(|v| *v),
+                protected: false,
             },
             v0::LegacyServerChannelType::Voice => Channel::TextChannel {
                 id: id.clone(),
@@ -475,6 +538,7 @@ impl Channel {
                 voice: Some(data.voice.unwrap_or_default().into()),
                 slowmode: None,
                 announcement: None,
+                protected: false,
             },
             v0::LegacyServerChannelType::Forum => Channel::Forum {
                 id: id.clone(),
@@ -619,6 +683,19 @@ impl Channel {
         };
 
         db.insert_channel(&channel).await?;
+
+        // Hold the parent while it is not protected (decision 13 (W2)),
+        // before anything else learns of the thread. A protect that read "no
+        // threads" before the insert either conflicts with this hold and
+        // then reads the thread, or has already committed, in which case the
+        // hold refuses and the row is deleted again: no membership, no
+        // event, no stamp, no system message. Bonfire caches every announced
+        // thread, so an announcement ahead of the hold would leave a
+        // plaintext-named thread under a protected parent until reconnect.
+        if let Err(error) = db.hold_thread_parent_unprotected(&parent_id).await {
+            delete_refused_thread(|| db.delete_channel(&channel), &id, &parent_id).await?;
+            return Err(error);
+        }
 
         // Auto-join the creator.
         db.join_thread_if_absent(&id, &creator.id).await?;
@@ -957,6 +1034,55 @@ impl Channel {
         }
     }
 
+    /// Whether this is a protected (end-to-end encrypted) channel. Only a
+    /// server `TextChannel` can be one; every other variant answers `false`.
+    pub fn is_protected(&self) -> bool {
+        matches!(
+            self,
+            Channel::TextChannel {
+                protected: true,
+                ..
+            }
+        )
+    }
+
+    /// Hold the protected-channel invariants (design 2.1, 7.4) over a
+    /// partial before `update` applies or writes any of it, and return the
+    /// partial to write.
+    ///
+    /// - `protected: Some(false)` on a protected channel is refused
+    ///   (`ChannelProtected`). On any other channel the flag is already
+    ///   false, so it is dropped rather than written: a caller holding a
+    ///   stale copy must never write false over a concurrent protect.
+    /// - `protected: Some(true)` is refused (`InvalidOperation`, as the
+    ///   protect route) unless this is a server `TextChannel` with no voice
+    ///   that is not an announcement channel.
+    /// - A channel that is, or becomes, protected refuses any `voice` and
+    ///   `announcement: Some(true)` (`ChannelProtected`).
+    fn guard_protected_partial(&self, mut partial: PartialChannel) -> Result<PartialChannel> {
+        let requested = partial.protected;
+        match requested {
+            Some(false) if self.is_protected() => return Err(create_error!(ChannelProtected)),
+            Some(false) => partial.protected = None,
+            Some(true) => match self {
+                Channel::TextChannel {
+                    voice: None,
+                    announcement,
+                    ..
+                } if *announcement != Some(true) => {}
+                _ => return Err(create_error!(InvalidOperation)),
+            },
+            None => {}
+        }
+
+        let protected_after = self.is_protected() || partial.protected == Some(true);
+        if protected_after && partial.sets_field_refused_on_protected() {
+            return Err(create_error!(ChannelProtected));
+        }
+
+        Ok(partial)
+    }
+
     /// Gets this channel's voice information
     pub fn voice(&self) -> Option<Cow<VoiceInformation>> {
         match self {
@@ -1066,6 +1192,9 @@ impl Channel {
         partial: PartialChannel,
         remove: Vec<FieldsChannel>,
     ) -> Result<()> {
+        // Before anything is mutated, written or broadcast.
+        let partial = self.guard_protected_partial(partial)?;
+
         for field in &remove {
             self.remove_field(field);
         }
@@ -1209,6 +1338,7 @@ impl Channel {
                 voice,
                 slowmode,
                 announcement,
+                protected,
                 ..
             } => {
                 if let Some(v) = partial.name {
@@ -1249,6 +1379,12 @@ impl Channel {
 
                 if let Some(v) = partial.announcement {
                     *announcement = Some(v);
+                }
+
+                // One-way (design 2.1): a partial can raise the flag, never
+                // lower it.
+                if partial.protected == Some(true) {
+                    *protected = true;
                 }
             }
             Self::Thread {
@@ -1545,6 +1681,17 @@ impl Channel {
             Server::clear_afk_channel_if_pointing_at(db, server, &id).await?;
         }
 
+        // Cascade: the channel's protected data (entitlement, seats, seat
+        // list, Text groups closed, their commits and join intents; design
+        // 7.5, decision 12 (W2)). Every TextChannel, protected or not: an
+        // entitlement is granted before the channel is protected, and may
+        // never be used. Last before the broadcast and the row delete, so a
+        // failure leaves the channel in place and unannounced, and the
+        // delete can be retried.
+        if let Channel::TextChannel { .. } = self {
+            db.delete_protected_channel_data(&id).await?;
+        }
+
         EventV1::ChannelDelete { id: id.clone() }.p(id).await;
         // TODO: missing functionality:
         // - group invites
@@ -1691,6 +1838,730 @@ mod tests {
         assert!(off.voice().is_none());
     }
 
+    // ---- Protected channels (design 2.1, 7.4) ------------------------------
+
+    fn text_channel(protected: bool) -> crate::Channel {
+        crate::Channel::TextChannel {
+            id: "T".to_string(),
+            server: "S".to_string(),
+            name: "text".to_string(),
+            description: None,
+            icon: None,
+            last_message_id: None,
+            default_permissions: None,
+            role_permissions: std::collections::HashMap::new(),
+            nsfw: false,
+            spoiler: false,
+            voice: None,
+            slowmode: None,
+            announcement: None,
+            protected,
+        }
+    }
+
+    fn refused_with(
+        result: revolt_result::Result<crate::PartialChannel>,
+        want: fn(&revolt_result::ErrorType) -> bool,
+    ) -> bool {
+        matches!(result, Err(error) if want(&error.error_type))
+    }
+
+    /// The flag is one-way: `Some(false)` on a protected channel is refused
+    /// with `ChannelProtected`, and `apply_options` never lowers it.
+    ///
+    /// Controls: the `Some(false) if self.is_protected()` arm removed (the
+    /// refusal), `*protected = v` in place of the raise-only apply.
+    #[test]
+    fn protected_flag_is_one_way() {
+        use crate::PartialChannel;
+        use revolt_result::ErrorType;
+
+        let lower = || PartialChannel {
+            protected: Some(false),
+            ..Default::default()
+        };
+
+        let protected = text_channel(true);
+        assert!(protected.is_protected());
+        assert!(refused_with(
+            protected.guard_protected_partial(lower()),
+            |e| matches!(e, ErrorType::ChannelProtected)
+        ));
+
+        // Not protected: false is already the value, and is dropped rather
+        // than written over a possibly concurrent protect.
+        let open = text_channel(false);
+        assert!(!open.is_protected());
+        let written = open.guard_protected_partial(lower()).expect("no-op");
+        assert_eq!(written.protected, None);
+
+        // Raising is idempotent on a protected channel.
+        let raise = || PartialChannel {
+            protected: Some(true),
+            ..Default::default()
+        };
+        assert_eq!(
+            protected
+                .guard_protected_partial(raise())
+                .unwrap()
+                .protected,
+            Some(true)
+        );
+
+        // apply_options raises and never lowers.
+        let mut channel = text_channel(false);
+        channel.apply_options(raise());
+        assert!(channel.is_protected());
+        channel.apply_options(lower());
+        assert!(channel.is_protected(), "apply_options lowered the flag");
+    }
+
+    /// Only a server `TextChannel` with no voice that is not an announcement
+    /// channel can be protected, and a protected channel takes no voice and
+    /// no announcement flag.
+    ///
+    /// Controls: the `voice: None` pattern widened to `..`, the
+    /// `protected_after` check removed.
+    #[test]
+    fn protected_flag_kind_and_field_rules() {
+        use crate::{Channel, PartialChannel, VoiceInformation};
+        use revolt_result::ErrorType;
+
+        let raise = || PartialChannel {
+            protected: Some(true),
+            ..Default::default()
+        };
+        let invalid = |e: &ErrorType| matches!(e, ErrorType::InvalidOperation);
+        let refused = |e: &ErrorType| matches!(e, ErrorType::ChannelProtected);
+
+        assert!(text_channel(false).guard_protected_partial(raise()).is_ok());
+
+        let mut voiced = text_channel(false);
+        if let Channel::TextChannel { voice, .. } = &mut voiced {
+            *voice = Some(VoiceInformation::default());
+        }
+        assert!(refused_with(
+            voiced.guard_protected_partial(raise()),
+            invalid
+        ));
+
+        let mut announcing = text_channel(false);
+        if let Channel::TextChannel { announcement, .. } = &mut announcing {
+            *announcement = Some(true);
+        }
+        assert!(refused_with(
+            announcing.guard_protected_partial(raise()),
+            invalid
+        ));
+
+        let group = Channel::Group {
+            id: "G".to_string(),
+            name: "group".to_string(),
+            owner: "O".to_string(),
+            description: None,
+            recipients: vec![],
+            icon: None,
+            last_message_id: None,
+            permissions: None,
+            nsfw: false,
+            spoiler: false,
+            voice: None,
+        };
+        assert!(!group.is_protected());
+        assert!(refused_with(
+            group.guard_protected_partial(raise()),
+            invalid
+        ));
+
+        let dm = Channel::DirectMessage {
+            id: "D".to_string(),
+            active: true,
+            recipients: vec![],
+            last_message_id: None,
+        };
+        assert!(refused_with(dm.guard_protected_partial(raise()), invalid));
+
+        let add_voice = || PartialChannel {
+            voice: Some(VoiceInformation::default()),
+            ..Default::default()
+        };
+        let add_announcement = || PartialChannel {
+            announcement: Some(true),
+            ..Default::default()
+        };
+        let protected = text_channel(true);
+        assert!(refused_with(
+            protected.guard_protected_partial(add_voice()),
+            refused
+        ));
+        assert!(refused_with(
+            protected.guard_protected_partial(add_announcement()),
+            refused
+        ));
+        // Protecting and adding voice in one partial is refused too.
+        assert!(refused_with(
+            text_channel(false).guard_protected_partial(PartialChannel {
+                protected: Some(true),
+                voice: Some(VoiceInformation::default()),
+                ..Default::default()
+            }),
+            refused
+        ));
+        // An unprotected channel keeps both edits.
+        assert!(text_channel(false)
+            .guard_protected_partial(add_voice())
+            .is_ok());
+        assert!(text_channel(false)
+            .guard_protected_partial(add_announcement())
+            .is_ok());
+    }
+
+    /// The stored shape: absent when false (existing documents need no
+    /// migration), `true` when set.
+    #[test]
+    fn protected_flag_serde() {
+        let open = serde_json::to_value(text_channel(false)).unwrap();
+        assert!(open.get("protected").is_none(), "{open}");
+        let back: crate::Channel = serde_json::from_value(open).unwrap();
+        assert!(!back.is_protected());
+
+        let set = serde_json::to_value(text_channel(true)).unwrap();
+        assert_eq!(set.get("protected"), Some(&serde_json::Value::Bool(true)));
+        let back: crate::Channel = serde_json::from_value(set).unwrap();
+        assert!(back.is_protected());
+    }
+
+    /// The voice / announcement refusal holds against the STORED channel,
+    /// not only the caller's copy: an edit holding a stale, unprotected copy
+    /// of a channel that was protected meanwhile is refused by the write
+    /// itself, and nothing is written. Runs on whichever driver `TEST_DB`
+    /// names.
+    ///
+    /// Controls: the `"protected": { "$ne": true }` filter dropped
+    /// (MongoDB), the `is_protected()` re-check dropped (Reference).
+    #[tokio::test]
+    async fn protected_refusal_holds_against_a_stale_copy() {
+        database_test!(|db| async move {
+            use crate::{PartialChannel, VoiceInformation};
+            use revolt_result::ErrorType;
+
+            let add_voice = || PartialChannel {
+                voice: Some(VoiceInformation::default()),
+                ..Default::default()
+            };
+            let add_announcement = || PartialChannel {
+                announcement: Some(true),
+                ..Default::default()
+            };
+
+            // Unprotected: both edits still go through.
+            let mut open = text_channel(false);
+            db.insert_channel(&open).await.expect("insert");
+            open.update(&db, add_voice(), vec![])
+                .await
+                .expect("voice on an unprotected channel");
+            let stored = db.fetch_channel("T").await.expect("fetch");
+            assert!(stored.voice().is_some(), "{stored:?}");
+
+            // A second channel. The caller's copy is taken before it is
+            // protected; the protect lands in the store only.
+            let mut stale = text_channel(false);
+            if let crate::Channel::TextChannel { id, .. } = &mut stale {
+                *id = "P".to_string();
+            }
+            db.insert_channel(&stale).await.expect("insert");
+            db.update_channel(
+                "P",
+                &PartialChannel {
+                    protected: Some(true),
+                    ..Default::default()
+                },
+                vec![],
+            )
+            .await
+            .expect("protect");
+            assert!(!stale.is_protected(), "the caller's copy is stale");
+
+            for partial in [add_voice(), add_announcement()] {
+                let result = stale.clone().update(&db, partial.clone(), vec![]).await;
+                assert!(
+                    matches!(
+                        &result,
+                        Err(error) if matches!(error.error_type, ErrorType::ChannelProtected)
+                    ),
+                    "{partial:?} on a stored-protected channel: {result:?}"
+                );
+            }
+
+            let stored = db.fetch_channel("P").await.expect("fetch");
+            assert!(stored.is_protected(), "{stored:?}");
+            let crate::Channel::TextChannel {
+                voice,
+                announcement,
+                ..
+            } = &stored
+            else {
+                panic!("{stored:?}");
+            };
+            assert_eq!(voice, &None, "voice was written");
+            assert_ne!(announcement, &Some(true), "announcement was written");
+        });
+    }
+
+    // ---- Protected channels: thread race and delete cascade (W2) -----------
+
+    /// The signer's device in every seat list below
+    const PC_DEVICE: &str = "00112233445566778899aabbccddeeff";
+
+    fn pc_user(n: u32) -> String {
+        format!("01HZX{n:021}")
+    }
+
+    fn pc_channel_id(n: u32) -> String {
+        format!("01J9Z3K4M5N6P7Q8R9S0T{n:05}")
+    }
+
+    /// Fixed, whole-millisecond time (Mongo stores Int64 milliseconds)
+    fn pc_now() -> iso8601_timestamp::Timestamp {
+        iso8601_timestamp::Timestamp::UNIX_EPOCH
+            .checked_add(iso8601_timestamp::Duration::milliseconds(1_790_812_800_000))
+            .unwrap()
+    }
+
+    /// `server_id`, owned by `owner` (protect claims it), with `owner` as a
+    /// member (protect claims the membership of every seated user)
+    async fn pc_server(db: &crate::Database, server_id: &str, owner: &str) {
+        use crate::{Member, MemberCompositeKey, Server};
+
+        let server: Server = serde_json::from_value(serde_json::json!({
+            "_id": server_id,
+            "owner": owner,
+            "name": "protected",
+            "channels": [],
+            "default_permissions": 0,
+        }))
+        .unwrap();
+        db.insert_server(&server).await.unwrap();
+        db.insert_or_merge_member(&Member {
+            id: MemberCompositeKey {
+                server: server_id.to_string(),
+                user: owner.to_string(),
+            },
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    }
+
+    /// An unprotected TextChannel of `server_id` with an active entitlement
+    async fn pc_entitled_channel(db: &crate::Database, channel_id: &str, server_id: &str) {
+        use crate::{ChannelEntitlement, ChannelEntitlementSource, ChannelEntitlementState};
+
+        let mut channel = text_channel(false);
+        if let crate::Channel::TextChannel { id, server, .. } = &mut channel {
+            *id = channel_id.to_string();
+            *server = server_id.to_string();
+        }
+        db.insert_channel(&channel).await.unwrap();
+        db.upsert_channel_entitlement(
+            &ChannelEntitlement {
+                id: ulid::Ulid::new().to_string(),
+                channel_id: channel_id.to_string(),
+                server_id: server_id.to_string(),
+                source: ChannelEntitlementSource::AdminGrant,
+                slot_cap: 10,
+                device_cap: None,
+                state: ChannelEntitlementState::Active,
+                granted_by: "admin".to_string(),
+                created_at: pc_now(),
+            },
+            pc_now(),
+        )
+        .await
+        .unwrap();
+    }
+
+    /// The genesis seat list of `channel_id`, seating only its signer
+    /// `owner` (the database layer checks the signature's encoding only)
+    fn pc_genesis(channel_id: &str, owner: &str) -> crate::SeatListSubmission {
+        crate::SeatListSubmission {
+            body: crate::SeatListBody {
+                channel_id: channel_id.to_string(),
+                version: 1,
+                device_cap: 5,
+                issued_at: 1_790_812_800_000,
+                signer_user_id: owner.to_string(),
+                signer_device_id: PC_DEVICE.to_string(),
+                seats: vec![owner.to_string()],
+            }
+            .build()
+            .unwrap(),
+            signature: format!("B{}", "A".repeat(85)),
+            signer_device_id: PC_DEVICE.to_string(),
+            handover: None,
+        }
+    }
+
+    /// Every stored thread membership row of `user_id`, whether or not its
+    /// thread still exists (`fetch_joined_thread_ids` drops rows whose
+    /// thread is gone, so it cannot see a row left behind by a deleted one)
+    async fn raw_thread_memberships(db: &crate::Database, user_id: &str) -> Vec<String> {
+        match db {
+            crate::Database::Reference(reference) => reference
+                .thread_members
+                .lock()
+                .await
+                .keys()
+                .filter(|key| key.user == user_id)
+                .map(|key| key.thread.clone())
+                .collect(),
+            #[cfg(feature = "mongodb")]
+            crate::Database::MongoDb(mongo) => {
+                use futures::TryStreamExt;
+
+                mongo
+                    .col::<bson::Document>("thread_members")
+                    .find(doc! { "_id.user": user_id })
+                    .await
+                    .unwrap()
+                    .try_collect::<Vec<bson::Document>>()
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .map(|row| {
+                        row.get_document("_id")
+                            .and_then(|key| key.get_str("thread"))
+                            .unwrap()
+                            .to_string()
+                    })
+                    .collect()
+            }
+        }
+    }
+
+    /// Rounds of the thread race below (fresh channels every round)
+    const THREAD_RACE_ROUNDS: u32 = 10;
+
+    /// Channels per round. The protects run through them in order and the
+    /// thread creations in reverse, so the two streams cross once per round
+    /// without any pacing: the channels the protects reach first end
+    /// protected, the rest end with a thread, and the crossing is the race.
+    const THREAD_RACE_STREAM: u32 = 8;
+
+    /// Decision 13 (W2) [R#8]: protect racing `create_thread` on the same
+    /// parent. Every parent ends either with its thread (and the protect
+    /// refused with `InvalidOperation`) or protected (and the creation
+    /// refused with `ChannelProtected`), never both and never a
+    /// `DatabaseError`. A refused creation leaves no thread row, no thread
+    /// membership (raw rows included) and no `ChannelCreate` on the server
+    /// topic. Run it under MONGODB (the race is real there); it holds under
+    /// REFERENCE too. Needs Redis at `REDIS_URI`.
+    ///
+    /// Controls: the hold dropped (a protected parent keeps a thread); the
+    /// hold moved below the auto-join and the publish (a refused creation
+    /// announced its thread, and under REFERENCE left a membership row).
+    #[tokio::test]
+    async fn create_thread_racing_a_protect_never_leaves_a_thread_under_a_protected_parent() {
+        database_test!(|db| async move {
+            use crate::{events::client::EventV1, Channel, User};
+            use futures::StreamExt;
+            use revolt_result::ErrorType;
+            use std::time::Duration;
+
+            // A fresh server id is a fresh topic: nothing else publishes to it
+            let server_id = ulid::Ulid::new().to_string();
+            let owner = pc_user(1);
+            pc_server(&db, &server_id, &owner).await;
+
+            let mut pubsub = redis_kiss::open_pubsub_connection()
+                .await
+                .expect("pubsub connection");
+            pubsub.subscribe(&server_id).await.expect("subscribe");
+
+            let mut won_threads: Vec<String> = Vec::new();
+            let mut protects_won = 0;
+            for round in 0..THREAD_RACE_ROUNDS {
+                let mut parents = Vec::new();
+                let mut creators = Vec::new();
+                for index in 0..THREAD_RACE_STREAM {
+                    let channel_id = pc_channel_id(round * 100 + index);
+                    pc_entitled_channel(&db, &channel_id, &server_id).await;
+                    parents.push(db.fetch_channel(&channel_id).await.unwrap());
+                    creators.push(User {
+                        id: pc_user(1_000 + round * 100 + index),
+                        username: "creator".to_string(),
+                        discriminator: "0001".to_string(),
+                        ..Default::default()
+                    });
+                }
+
+                // Back to back, no pacing. The thread stream holds the
+                // parent copies read before any protect, as a route would.
+                let protects = async {
+                    let mut outcomes = Vec::new();
+                    for parent in &parents {
+                        let genesis = pc_genesis(parent.id(), &owner);
+                        outcomes.push(db.protect_channel(parent.id(), &genesis, pc_now()).await);
+                    }
+                    outcomes
+                };
+                let threads = async {
+                    let mut outcomes: Vec<_> = parents.iter().map(|_| None).collect();
+                    for index in (0..parents.len()).rev() {
+                        let created = Channel::create_thread(
+                            &db,
+                            &parents[index],
+                            &creators[index],
+                            None,
+                            revolt_models::v0::DataCreateThread {
+                                name: "race".to_string(),
+                                auto_archive_minutes: None,
+                            },
+                        )
+                        .await;
+                        outcomes[index] = Some(created);
+                    }
+                    outcomes
+                };
+                let (protected, created) = if round % 2 == 0 {
+                    tokio::join!(protects, threads)
+                } else {
+                    let (created, protected) = tokio::join!(threads, protects);
+                    (protected, created)
+                };
+
+                for (index, (protect, create)) in protected.into_iter().zip(created).enumerate() {
+                    let parent = parents[index].id();
+                    let creator = &creators[index].id;
+                    let create = create.expect("every creation ran");
+                    let parent_protected = db.fetch_channel(parent).await.unwrap().is_protected();
+                    let threads: Vec<String> = db
+                        .fetch_threads_by_parent(parent)
+                        .await
+                        .unwrap()
+                        .iter()
+                        .map(|thread| thread.id().to_string())
+                        .collect();
+                    let joined = db
+                        .fetch_joined_thread_ids(creator, &server_id)
+                        .await
+                        .unwrap();
+                    let memberships = raw_thread_memberships(&db, creator).await;
+
+                    match (protect, create) {
+                        (Err(refused), Ok(thread)) => {
+                            assert!(
+                                matches!(refused.error_type, ErrorType::InvalidOperation),
+                                "round {round} channel {index}: protect lost with {refused:?}"
+                            );
+                            assert!(!parent_protected, "round {round} channel {index}");
+                            let thread_id = vec![thread.id().to_string()];
+                            assert_eq!(threads, thread_id, "round {round} channel {index}");
+                            assert_eq!(joined, thread_id, "round {round} channel {index}");
+                            assert_eq!(memberships, thread_id, "round {round} channel {index}");
+                            won_threads.push(thread.id().to_string());
+                        }
+                        (Ok(_), Err(refused)) => {
+                            assert!(
+                                matches!(refused.error_type, ErrorType::ChannelProtected),
+                                "round {round} channel {index}: creation lost with {refused:?}"
+                            );
+                            assert!(parent_protected, "round {round} channel {index}");
+                            assert!(
+                                threads.is_empty(),
+                                "round {round} channel {index}: a thread row under a protected parent: {threads:?}"
+                            );
+                            assert!(
+                                joined.is_empty(),
+                                "round {round} channel {index}: joined {joined:?}"
+                            );
+                            assert!(
+                                memberships.is_empty(),
+                                "round {round} channel {index}: a refused creation left membership rows {memberships:?}"
+                            );
+                            protects_won += 1;
+                        }
+                        other => panic!("round {round} channel {index}: {other:?}"),
+                    }
+                }
+            }
+
+            eprintln!(
+                "protect vs create_thread: {protects_won} protects won, {} threads won",
+                won_threads.len()
+            );
+            assert!(
+                protects_won > 0 && !won_threads.is_empty(),
+                "one-sided race: {protects_won} protects won, {} threads won",
+                won_threads.len()
+            );
+
+            // Every ChannelCreate on the server topic is a thread that won.
+            // A marker published last bounds the wait.
+            let marker = ulid::Ulid::new().to_string();
+            EventV1::ChannelDelete { id: marker.clone() }
+                .p(server_id.clone())
+                .await;
+            let mut announced = Vec::new();
+            let mut stream = pubsub.on_message();
+            loop {
+                let message = tokio::time::timeout(Duration::from_secs(5), stream.next())
+                    .await
+                    .expect("the marker must arrive within 5 s (is Redis at REDIS_URI up?)")
+                    .expect("the subscription ended");
+                match redis_kiss::decode_payload::<EventV1>(&message) {
+                    Ok(EventV1::ChannelDelete { id }) if id == marker => break,
+                    Ok(EventV1::ChannelCreate(channel)) => announced.push(channel.id().to_string()),
+                    _ => {}
+                }
+            }
+            announced.sort();
+            won_threads.sort();
+            assert_eq!(
+                announced, won_threads,
+                "a ChannelCreate was published for a thread that does not exist"
+            );
+        });
+    }
+
+    /// Decision 12 (W2): deleting a TextChannel removes its protected data
+    /// (entitlement, seats, seat list, Text group closed, commits), and so
+    /// does deleting an unprotected channel that only holds an entitlement.
+    /// Runs on whichever driver `TEST_DB` names.
+    ///
+    /// Controls: the `delete_protected_channel_data` call skipped; the call
+    /// made for protected channels only (the entitled channel keeps its
+    /// entitlement).
+    #[tokio::test]
+    async fn deleting_a_text_channel_removes_its_protected_data() {
+        database_test!(|db| async move {
+            use crate::{MlsCommit, MlsCommitOutcome, MlsGroup, MlsGroupKind, MlsMemberDevice};
+            use revolt_result::ErrorType;
+
+            let server_id = ulid::Ulid::new().to_string();
+            let owner = pc_user(1);
+            pc_server(&db, &server_id, &owner).await;
+            let (protected, entitled) = (pc_channel_id(1), pc_channel_id(2));
+            pc_entitled_channel(&db, &protected, &server_id).await;
+            pc_entitled_channel(&db, &entitled, &server_id).await;
+            db.protect_channel(&protected, &pc_genesis(&protected, &owner), pc_now())
+                .await
+                .unwrap();
+
+            // The owner's open Text group, with one commit
+            let owner_device = MlsMemberDevice {
+                user_id: owner.clone(),
+                device_id: PC_DEVICE.to_string(),
+            };
+            let group = MlsGroup {
+                id: "dd".repeat(32),
+                channel_id: protected.clone(),
+                open: true,
+                created_by: owner_device.clone(),
+                created_at: pc_now(),
+                current_epoch: 0,
+                members: vec![owner_device.clone()],
+                closed_at: None,
+                superseded_by: None,
+                // Server-owned Text fields: create_text_mls_group sets them
+                kind: MlsGroupKind::Call,
+                generation: Some(0),
+                seat_list_ad_sha256: None,
+                pending_removals: vec![],
+                member_added: vec![],
+            };
+            db.create_text_mls_group(&group, None).await.unwrap();
+            let list = db
+                .fetch_seat_list(&protected)
+                .await
+                .unwrap()
+                .expect("the genesis list");
+            let commit = MlsCommit {
+                id: MlsCommit::composite_id(&group.id, 1),
+                group_id: group.id.clone(),
+                epoch: 1,
+                committer: owner_device.clone(),
+                commit: "commit".to_string(),
+                size: 6,
+                added: vec![],
+                removed: vec![],
+                created_at: pc_now(),
+                rejoin_intents: vec![],
+                removed_reasons: vec![],
+            };
+            let outcome = db
+                .insert_mls_text_commit(&commit, &list.commit_ad_sha256().unwrap(), 0)
+                .await
+                .unwrap();
+            assert!(matches!(outcome, MlsCommitOutcome::Won), "{outcome:?}");
+
+            // Everything the cascade must remove is there first
+            for channel_id in [&protected, &entitled] {
+                assert!(db
+                    .fetch_channel_entitlement(channel_id)
+                    .await
+                    .unwrap()
+                    .is_some());
+            }
+            assert!(!db.fetch_channel_seats(&protected).await.unwrap().is_empty());
+            let snapshot = db.fetch_seat_list_snapshot(&protected).await.unwrap();
+            assert!(snapshot.list.is_some() && snapshot.text_group.is_some());
+            assert_eq!(
+                db.fetch_mls_commits_from(&group.id, 0, 10)
+                    .await
+                    .unwrap()
+                    .len(),
+                1
+            );
+
+            for channel_id in [&protected, &entitled] {
+                db.fetch_channel(channel_id)
+                    .await
+                    .unwrap()
+                    .delete(&db)
+                    .await
+                    .expect("delete");
+            }
+
+            for channel_id in [&protected, &entitled] {
+                assert!(
+                    db.fetch_channel_entitlement(channel_id)
+                        .await
+                        .unwrap()
+                        .is_none(),
+                    "{channel_id}: the entitlement survived the delete"
+                );
+                assert!(db.fetch_channel_seats(channel_id).await.unwrap().is_empty());
+                let result = db.fetch_channel(channel_id).await;
+                assert!(
+                    matches!(&result, Err(error) if matches!(error.error_type, ErrorType::NotFound)),
+                    "{channel_id}: {result:?}"
+                );
+            }
+            let snapshot = db.fetch_seat_list_snapshot(&protected).await.unwrap();
+            assert!(snapshot.list.is_none(), "the seat list survived the delete");
+            assert!(
+                snapshot.text_group.is_none(),
+                "the Text group is still open"
+            );
+            // The delete removes the Text group row itself, not just closes it
+            assert!(
+                matches!(
+                    db.fetch_mls_group(&group.id).await,
+                    Err(error) if matches!(error.error_type, ErrorType::NotFound)
+                ),
+                "the Text group row survived the delete"
+            );
+            assert!(
+                db.fetch_mls_commits_from(&group.id, 0, 10)
+                    .await
+                    .unwrap()
+                    .is_empty(),
+                "the commits survived the delete"
+            );
+        });
+    }
+
     // ---- Client gates (wave BG) --------------------------------------------
 
     /// The server's reading of the password gate is the client's
@@ -1783,6 +2654,7 @@ mod tests {
                 voice: Some(VoiceInformation::default()),
                 slowmode: None,
                 announcement: None,
+                protected: false,
             };
             let forum = Channel::Forum {
                 id: "F".to_string(),
@@ -2068,6 +2940,79 @@ mod tests {
         assert!(
             elsewhere.is_empty(),
             "the password marker is spelled outside {THIS_FILE}: {elsewhere:?}"
+        );
+    }
+
+    /// W2 audit B1 (c): `create_thread`'s cleanup after a refused hold
+    /// retries a failed delete once and stops after two attempts
+    ///
+    /// Control: the retry removed (one attempt) → the "fails once" case
+    /// returns the error.
+    #[tokio::test]
+    async fn refused_thread_delete_is_retried_once() {
+        use revolt_result::ErrorType;
+        use std::cell::Cell;
+
+        for (failures, expect_ok, expect_calls) in [(0, true, 1), (1, true, 2), (2, false, 2)] {
+            let calls = Cell::new(0);
+            let outcome = super::delete_refused_thread(
+                || {
+                    calls.set(calls.get() + 1);
+                    let call = calls.get();
+                    async move {
+                        if call <= failures {
+                            Err(create_database_error!("delete_one", "channels"))
+                        } else {
+                            Ok(())
+                        }
+                    }
+                },
+                "thread",
+                "parent",
+            )
+            .await;
+
+            assert_eq!(
+                outcome.is_ok(),
+                expect_ok,
+                "{failures} failures: {outcome:?}"
+            );
+            if let Err(error) = outcome {
+                assert!(
+                    matches!(error.error_type, ErrorType::DatabaseError { .. }),
+                    "{:?}",
+                    error.error_type
+                );
+            }
+            assert_eq!(calls.get(), expect_calls, "{failures} failures");
+        }
+    }
+
+    /// The wiring of the above: in `create_thread` the refused hold deletes
+    /// through `delete_refused_thread`, and no bare `delete_channel` is left
+    #[test]
+    fn create_thread_cleans_up_through_the_retrying_delete() {
+        let source = include_str!("model.rs");
+        let start = source
+            .find("pub async fn create_thread(")
+            .expect("create_thread");
+        let end = start
+            + source[start..]
+                .find("pub async fn create_forum_post(")
+                .expect("create_forum_post");
+        let body = &source[start..end];
+
+        let hold = body
+            .find("db.hold_thread_parent_unprotected(&parent_id).await")
+            .expect("the hold");
+        let cleanup = body
+            .find("delete_refused_thread(|| db.delete_channel(&channel), &id, &parent_id).await?;")
+            .expect("the retrying cleanup");
+        assert!(hold < cleanup, "the cleanup follows the hold");
+        assert_eq!(
+            body.matches(".delete_channel(").count(),
+            1,
+            "one delete site"
         );
     }
 }

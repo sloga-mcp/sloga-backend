@@ -1,3 +1,5 @@
+use iso8601_timestamp::Timestamp;
+
 auto_derived!(
     /// A (user, device) pair — the unit of MLS group membership, KeyPackage
     /// claims and envelope fan-out (media E2EE)
@@ -102,12 +104,77 @@ auto_derived!(
         pub results: Vec<MlsClaimResult>,
     }
 
-    /// Register a per-call MLS group (plan §1.2)
+    /// What an MLS group secures (protected channels design §2.5). Groups
+    /// stored before this field existed are call groups.
+    #[derive(Default)]
+    pub enum MlsGroupKind {
+        /// Per-call media E2EE group
+        #[default]
+        Call,
+        /// Protected text channel group
+        Text,
+    }
+
+    /// A stored signed join intent that justified a rejoin-case Remove,
+    /// carried on a commit (protected channels design §8.1). The wire shape
+    /// is exactly native `wire::MlsJoinRequest`. `channel_id` is not part of
+    /// the stored row: the server fills it from the group's channel. The
+    /// signature does not cover `channel_id`; receivers check it against the
+    /// commit's own group and channel.
+    pub struct MlsRejoinIntentInfo {
+        /// Group the intent targets
+        pub group_id: String,
+        /// Channel of that group
+        pub channel_id: String,
+        /// Joining user
+        pub user_id: String,
+        /// Joining device
+        pub device_id: String,
+        /// KeyPackage reference the joiner nominated
+        pub key_package_ref: String,
+        /// Join-intent signature
+        pub signature: String,
+    }
+
+    /// Which Remove rule (protected channels design §3.12.2) the server
+    /// found admitting a removed device. Several rules can admit one
+    /// device; the strongest is stamped: `pending_removal` > `off_list` >
+    /// `revoked` > `own_user` > `rejoin`. ADVISORY ONLY: the server is
+    /// untrusted, so receivers decide from signed material
+    #[derive(Copy)]
+    #[serde(rename_all = "snake_case")]
+    pub enum MlsRemovalReason {
+        /// The device belongs to the committer's own user
+        OwnUser,
+        /// The device's user is pending removal from the group
+        PendingRemoval,
+        /// The device's user is off the newest seat list and the committer
+        /// is the list signer's device
+        OffList,
+        /// The device has no registered identity
+        Revoked,
+        /// The device's own outstanding rejoin intent
+        Rejoin,
+    }
+
+    /// The server's advisory reason for one device a Text commit removed
+    pub struct MlsRemovedReasonInfo {
+        /// Removed user
+        pub user_id: String,
+        /// Removed device
+        pub device_id: String,
+        /// The strongest admitting rule
+        pub reason: MlsRemovalReason,
+    }
+
+    /// Register an MLS group: a per-call group (plan §1.2) or a protected
+    /// channel's Text group (protected channels design §7.2)
     pub struct DataCreateMlsGroup {
         /// Client-derived group id: 64 lowercase hex chars
-        /// (`hash(channel_id || call_start_ulid)`)
+        /// (`hash(channel_id || call_start_ulid)` for a call group, design
+        /// §3.1 for a Text group)
         pub group_id: String,
-        /// Channel whose call this group secures
+        /// Channel this group secures
         pub channel_id: String,
         /// The creating device
         pub device_id: String,
@@ -115,6 +182,14 @@ auto_derived!(
         /// group and register the new one in its place
         #[serde(default)]
         pub supersedes: Option<String>,
+        /// Group kind. Absent means `Call`, so existing callers (and their
+        /// request bodies) are unchanged
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub kind: Option<MlsGroupKind>,
+        /// Text only: the group-id generation (design §3.1). Required for
+        /// `Text`, refused for `Call`
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub generation: Option<u32>,
     }
 
     /// Response to registering a group — 200 on create, 409 on conflict
@@ -183,6 +258,14 @@ auto_derived!(
         pub added: Vec<MlsMemberDevice>,
         /// Devices removed by the commit
         pub removed: Vec<MlsMemberDevice>,
+        /// Signed join intents that justified a rejoin-case Remove in this
+        /// commit (Text groups only; always empty on Call commits)
+        #[serde(default)]
+        pub rejoin_intents: Vec<MlsRejoinIntentInfo>,
+        /// Text groups only: one advisory reason per removed device
+        /// (absent = empty; never present on Call commits)
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub removed_reasons: Vec<MlsRemovedReasonInfo>,
     }
 
     /// Response to a commit submission — 200 on win, 409 on lose (the loser
@@ -227,4 +310,143 @@ auto_derived!(
         /// Current roster size (device count) — pre-join cap warning input
         pub member_count: usize,
     }
+
+    /// A user whose devices must leave a Text group (protected channels
+    /// design §2.5, §7.2)
+    pub struct MlsPendingRemovalInfo {
+        /// User whose member devices are to be removed
+        pub user_id: String,
+        /// When the pending removal was recorded
+        pub created_at: Timestamp,
+    }
+
+    /// A member device's latest Add to a Text group (design §7.2
+    /// `member_added`, W0-fix7). A liveness aid for the joining bridge only
+    pub struct MlsMemberAddedInfo {
+        /// Added user
+        pub user_id: String,
+        /// Added device
+        pub device_id: String,
+        /// Epoch the Add established (0 = the creator at group create)
+        pub epoch: i64,
+        /// Server-stamped time of the Add
+        pub at: Timestamp,
+    }
+
+    /// The channel's open Text group
+    /// (`GET /mls/channels/:channel_id/text_group`, design §7.2)
+    pub struct ResponseTextGroup {
+        /// Text group id (64 lowercase hex chars)
+        pub group_id: String,
+        /// Channel the group secures
+        pub channel_id: String,
+        /// Group-id generation (design §3.1); joiners check exactly this one
+        pub generation: u32,
+        /// Highest arbitrated epoch
+        pub current_epoch: i64,
+        /// Member devices
+        pub members: Vec<MlsMemberDevice>,
+        /// Users whose devices must be removed before any Add
+        pub pending_removals: Vec<MlsPendingRemovalInfo>,
+        /// Each member device's latest Add
+        pub member_added: Vec<MlsMemberAddedInfo>,
+    }
 );
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        DataCreateMlsGroup, MlsCommitInfo, MlsGroupKind, MlsRemovalReason, MlsRemovedReasonInfo,
+        ResponseTextGroup,
+    };
+
+    /// The 7.2 text group example, with concrete values in its placeholders
+    const TEXT_GROUP_EXAMPLE: &str = r#"{"group_id":"0000000000000000000000000000000000000000000000000000000000000001","channel_id":"01JA0000000000000000CHANNEL","generation":0,"current_epoch":7,"members":[{"user_id":"01JA00000000000000000USERA","device_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}],"pending_removals":[{"user_id":"01JA00000000000000000USERB","created_at":"2026-10-04T12:00:00.000Z"}],"member_added":[{"user_id":"01JA00000000000000000USERA","device_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","epoch":5,"at":"2026-10-04T11:00:00.000Z"}]}"#;
+
+    /// A group-create body exactly as `996641f1` serialized it
+    const CREATE_AT_996641F1: &str = r#"{"group_id":"0000000000000000000000000000000000000000000000000000000000000001","channel_id":"01JA0000000000000000CHANNEL","device_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","supersedes":null}"#;
+
+    #[test]
+    fn text_group_response_round_trips_the_example() {
+        let parsed: ResponseTextGroup = serde_json::from_str(TEXT_GROUP_EXAMPLE).unwrap();
+        assert_eq!(parsed.generation, 0);
+        assert_eq!(parsed.current_epoch, 7);
+        assert_eq!(parsed.pending_removals.len(), 1);
+        assert_eq!(parsed.member_added[0].epoch, 5);
+        assert_eq!(serde_json::to_string(&parsed).unwrap(), TEXT_GROUP_EXAMPLE);
+    }
+
+    /// An existing caller's body (no `kind`, no `generation`) still parses as
+    /// a call group create, and a call create serializes as it did before
+    #[test]
+    fn create_group_kind_and_generation_are_optional() {
+        let parsed: DataCreateMlsGroup = serde_json::from_str(CREATE_AT_996641F1).unwrap();
+        assert_eq!(parsed.kind, None);
+        assert_eq!(parsed.generation, None);
+        assert_eq!(serde_json::to_string(&parsed).unwrap(), CREATE_AT_996641F1);
+
+        let text = DataCreateMlsGroup {
+            kind: Some(MlsGroupKind::Text),
+            generation: Some(0),
+            ..parsed
+        };
+        let value = serde_json::to_value(&text).unwrap();
+        assert_eq!(value["kind"], "Text");
+        assert_eq!(value["generation"], 0);
+        assert_eq!(
+            serde_json::from_value::<DataCreateMlsGroup>(value).unwrap(),
+            text
+        );
+
+        // Unknown keys are ignored, like every neighboring request body
+        let extra = CREATE_AT_996641F1.replace("\"supersedes\"", "\"future\":1,\"supersedes\"");
+        assert!(serde_json::from_str::<DataCreateMlsGroup>(&extra).is_ok());
+    }
+
+    /// A commit info exactly as `4206add3` serialized it (no
+    /// `removed_reasons` key)
+    const COMMIT_INFO_AT_4206ADD3: &str = r#"{"group_id":"0000000000000000000000000000000000000000000000000000000000000001","epoch":2,"committer":{"user_id":"01JA00000000000000000USERA","device_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},"commit":"Y29tbWl0","added":[],"removed":[{"user_id":"01JA00000000000000000USERB","device_id":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}],"rejoin_intents":[]}"#;
+
+    /// B48: an empty `removed_reasons` is never serialized (Call commits keep
+    /// the earlier shape), an old body without it parses as empty, and each
+    /// reason is snake_case on the wire
+    #[test]
+    fn removed_reasons_are_optional_and_snake_case() {
+        let parsed: MlsCommitInfo = serde_json::from_str(COMMIT_INFO_AT_4206ADD3).unwrap();
+        assert!(parsed.removed_reasons.is_empty());
+        assert_eq!(
+            serde_json::to_string(&parsed).unwrap(),
+            COMMIT_INFO_AT_4206ADD3
+        );
+
+        for (reason, wire) in [
+            (MlsRemovalReason::OwnUser, "own_user"),
+            (MlsRemovalReason::PendingRemoval, "pending_removal"),
+            (MlsRemovalReason::OffList, "off_list"),
+            (MlsRemovalReason::Revoked, "revoked"),
+            (MlsRemovalReason::Rejoin, "rejoin"),
+        ] {
+            let info = MlsCommitInfo {
+                removed_reasons: vec![MlsRemovedReasonInfo {
+                    user_id: "01JA00000000000000000USERB".to_string(),
+                    device_id: "b".repeat(32),
+                    reason,
+                }],
+                ..parsed.clone()
+            };
+            let value = serde_json::to_value(&info).unwrap();
+            assert_eq!(
+                value["removed_reasons"],
+                serde_json::json!([{
+                    "user_id": "01JA00000000000000000USERB",
+                    "device_id": "b".repeat(32),
+                    "reason": wire
+                }])
+            );
+            assert_eq!(
+                serde_json::from_value::<MlsCommitInfo>(value).unwrap(),
+                info
+            );
+        }
+    }
+}

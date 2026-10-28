@@ -2,6 +2,7 @@
 
 Status: **DRAFT** (design accepted 2026-07-06, implementation not scheduled — post-launch flagship feature)
 Prerequisite: message reporting must ship first, designed around reporter-side reports (see §9).
+Amended 2026-10-01: the §1 server-channel non-goal now carves out opt-in Protected channels ([`docs/protected-channels-design.md`](protected-channels-design.md)); pointers added in §2 and §4. Everything else here still covers DMs and group DMs only.
 
 ## 1. Goal and non-goals
 
@@ -10,8 +11,15 @@ only ever relays ciphertext it cannot read, and deletes it after delivery. The
 operator (us) is cryptographically unable to read these conversations.
 
 **Non-goals (deliberately out of scope):**
-- E2EE for server channels — they are semi-public spaces; E2EE there costs
-  search, embeds, and moderation while buying little. Channels stay plaintext.
+- E2EE for ordinary server channels — they are semi-public spaces; E2EE there
+  costs search, embeds, and moderation while buying little. Ordinary channels
+  stay plaintext. The one exception is opt-in, paid **Protected channels**
+  (owner-seated, slot-capped, one MLS group per channel, native apps only),
+  which accept those costs explicitly: no server-side search, no embeds, no
+  bots or webhooks, and reports via reporter-side disclosure (§9) in a later
+  slice. Unlike DM envelopes, their ciphertext IS stored server-side as channel
+  message history. Specified in
+  [`docs/protected-channels-design.md`](protected-channels-design.md).
 - E2EE in the web client — the server serves the JS, so a compromised server
   could exfiltrate keys; browser E2EE is security theater. Native apps only
   (Tauri desktop, Android).
@@ -23,7 +31,9 @@ operator (us) is cryptographically unable to read these conversations.
   - DMs become E2EE *when the other party has also opted in*.
   - No DM history on new devices; server-side DM history ends.
   - E2EE DMs are unreadable in the web client (shown as "🔒 available on your
-    desktop and mobile apps"). Web login itself still works for servers/channels.
+    desktop and mobile apps"). Web login itself still works for servers/channels
+    (except Protected channels, which are native-only; see
+    [`docs/protected-channels-design.md`](protected-channels-design.md)).
   - We cannot recover encrypted messages. Ever.
 - **Mixed pairs fall back:** a DM is encrypted iff both sides are opted in and
   have published keys; otherwise plaintext, with a per-conversation lock/unlock
@@ -72,7 +82,8 @@ deletes from `e2ee_queue`. Push notifications carry no preview for E2EE
 messages ("New message" only) — FCM data values must be strings (known gotcha).
 
 The existing `messages` collection is untouched; E2EE DMs simply never write
-to it.
+to it. (Protected channels differ: they store ciphertext-only messages in
+`messages`; see [`docs/protected-channels-design.md`](protected-channels-design.md).)
 
 ## 5. Client changes (frontend + native shells)
 

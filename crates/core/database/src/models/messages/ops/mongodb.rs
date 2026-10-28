@@ -1,6 +1,7 @@
 use bson::{to_bson, Document};
 use futures::try_join;
 use futures::StreamExt;
+use mongodb::error::{ErrorKind, WriteFailure};
 use mongodb::options::{FindOptions, Hint};
 use revolt_models::v0::{MessageSort, UNREAD_COUNT_CAP};
 use revolt_result::Result;
@@ -8,14 +9,75 @@ use std::collections::{HashMap, HashSet};
 use std::time::SystemTime;
 use ulid::Ulid;
 
+use crate::models::admin_migrations::PROTECTED_NONCE_INDEX_NAME;
 use crate::{
-    AppendMessage, DocumentId, FieldsMessage, IntoDocumentPath, Message, MessageQuery,
-    MessageTimePeriod, MongoDb, PartialMessage,
+    AbstractChannels, AppendMessage, Channel, DocumentId, FieldsMessage, IntoDocumentPath, Message,
+    MessageQuery, MessageTimePeriod, MongoDb, PartialMessage,
 };
 
 use super::{AbstractMessages, ThreadStats, UnreadSummary, UNREAD_SCAN_WINDOW};
 
 static COL: &str = "messages";
+static COL_CHANNELS: &str = "channels";
+
+/// Whether `error` is a duplicate key on the protected replay index
+/// (`PROTECTED_NONCE_INDEX_NAME`, W2 Decision 15) and on nothing else
+///
+/// Matched on the index name the server puts in its E11000 message
+/// (`... collection: <ns> index: <name> dup key: { ... }`), read at the first
+/// ` index: ` so a key value can never supply the name. A duplicate `_id`,
+/// or a duplicate on any other index, is not a replay and stays a
+/// `DatabaseError`.
+fn is_protected_nonce_duplicate(error: &mongodb::error::Error) -> bool {
+    let ErrorKind::Write(WriteFailure::WriteError(write)) = error.kind.as_ref() else {
+        return false;
+    };
+
+    write.code == 11000
+        && write
+            .message
+            .split_once(" index: ")
+            .and_then(|(_, rest)| rest.strip_prefix(PROTECTED_NONCE_INDEX_NAME))
+            .is_some_and(|rest| rest.starts_with(" dup key"))
+}
+
+impl MongoDb {
+    /// The post-insert half of `insert_message`'s protect race guard: a
+    /// field-level `$inc` of the channel's `txn_serial` (the serialization
+    /// counter `protected_channels/ops/mongodb.rs` uses; never read, no
+    /// other field touched), filtered on `protected != true`. If it matches
+    /// nothing, or its outcome is unknown, the message is deleted again and
+    /// the insert refused (fails closed).
+    async fn hold_channel_unprotected(&self, message: &Message) -> Result<()> {
+        let held = self
+            .col::<Document>(COL_CHANNELS)
+            .update_one(
+                doc! { "_id": &message.channel, "protected": { "$ne": true } },
+                doc! { "$inc": { "txn_serial": 1_i64 } },
+            )
+            .await;
+
+        if matches!(&held, Ok(result) if result.matched_count == 1) {
+            return Ok(());
+        }
+
+        if let Err(error) = self
+            .col::<Document>(COL)
+            .delete_one(doc! { "_id": &message.id })
+            .await
+        {
+            revolt_config::capture_error(&error);
+        }
+
+        // Report the protected refusal when that is what happened. Only a
+        // TextChannel is held, so there is no thread parent to read.
+        if held.is_ok() {
+            message.validate_protected_insert(self.fetch_channel(&message.channel).await, None)?;
+        }
+
+        Err(create_database_error!("update_one", COL_CHANNELS))
+    }
+}
 
 /// Name of the `{author: 1}` index on `messages`. MUST match the copies in
 /// `init.rs` and `scripts.rs`.
@@ -84,8 +146,63 @@ fn thread_stats_pipeline(channel_ids: &[String]) -> Vec<Document> {
 #[async_trait]
 impl AbstractMessages for MongoDb {
     /// Insert a new message into the database
+    ///
+    /// Refuses a message that breaks the protected-channel stored shape
+    /// (design 2.6), judged on a channel read made here, just before the write.
+    ///
+    /// The read alone is check-then-act against `protect_channel` (which
+    /// reads "no messages" and writes the channel). So after inserting into
+    /// an unprotected text channel, this writes the channel document too,
+    /// filtered on `protected != true`:
+    /// - this write first: protect's transaction later writes the same
+    ///   document, write-conflicts, retries, and its new snapshot sees the
+    ///   message (inserted before this write), so protect refuses;
+    /// - protect's write first (committed, or uncommitted, in which case
+    ///   this write waits for it): the filter matches nothing, the message
+    ///   is deleted again and the insert is refused.
+    ///
+    /// Not one transaction: every send into a busy channel would write the
+    /// same channel document transactionally and conflict with every other
+    /// send. A plain write just serializes behind them.
+    ///
+    /// A second message carrying `encrypted` under a `(channel, nonce)`
+    /// already stored hits the partial unique index
+    /// `PROTECTED_NONCE_INDEX_NAME` and is refused with `DuplicateNonce`, the
+    /// answer the in-memory nonce cache gives (W2 Decision 15). Any other
+    /// insert error, a duplicate `_id` included, is a `DatabaseError`.
     async fn insert_message(&self, message: &Message) -> Result<()> {
-        query!(self, insert_one, COL, &message).map(|_| ())
+        let channel = self.fetch_channel(&message.channel).await;
+        // Only an unprotected server text channel can become protected (2.1)
+        let guard = matches!(
+            &channel,
+            Ok(Channel::TextChannel {
+                protected: false,
+                ..
+            })
+        );
+        // A thread is judged by its parent (W2 audit B1)
+        let parent = match &channel {
+            Ok(Channel::Thread { parent_channel, .. }) => {
+                Some(self.fetch_channel(parent_channel).await)
+            }
+            _ => None,
+        };
+        message.validate_protected_insert(channel, parent)?;
+
+        self.insert_one(COL, &message).await.map_err(|error| {
+            if is_protected_nonce_duplicate(&error) {
+                create_error!(DuplicateNonce)
+            } else {
+                revolt_config::capture_internal_error!(error);
+                create_database_error!("insert_one", COL)
+            }
+        })?;
+
+        if guard {
+            self.hold_channel_unprotected(message).await?;
+        }
+
+        Ok(())
     }
 
     /// Fetch a message by its id
@@ -764,6 +881,7 @@ impl MongoDb {
 mod tests {
     use bson::{doc, Bson};
 
+    use crate::models::admin_migrations::protected_nonce_index;
     use crate::{Message, SystemMessage, ThreadStats};
 
     use super::thread_stats_pipeline;
@@ -1015,9 +1133,12 @@ mod tests {
                 return;
             };
 
-            // `database_test!` hands over an un-migrated database. These two
+            // `database_test!` hands over an un-migrated database. These
             // MUST match the `messages` indexes in `init.rs`; the pinned one
-            // also leads with `channel`, so the planner has a real choice.
+            // and the protected nonce one also lead with `channel`, so the
+            // planner has a real choice. The nonce index is partial on
+            // `encrypted: {$exists: true}`, which the stats match does not
+            // imply, so it must never be the one chosen.
             mongo
                 .db()
                 .run_command(doc! {
@@ -1025,6 +1146,7 @@ mod tests {
                     "indexes": [
                         { "key": { "channel": 1_i32, "_id": 1_i32 }, "name": "channel_id_compound" },
                         { "key": { "channel": 1_i32, "pinned": 1_i32 }, "name": "channel_pinned_compound" },
+                        protected_nonce_index(),
                     ]
                 })
                 .await
@@ -1067,6 +1189,424 @@ mod tests {
                     .any(|(stage, _)| stage == "FETCH" || stage == "COLLSCAN"),
                 "the stats query must not touch documents: {stages:?}\n{explain:?}"
             );
+        });
+    }
+}
+
+/// `hold_channel_unprotected` driven directly, so each branch runs on every
+/// run (the insert-vs-protect race test in `messages/model.rs` only reaches
+/// the protect-first branch when its timing lands there). Mongo only: under
+/// `TEST_DB=REFERENCE` these return early; Reference closes the race by
+/// holding `channels` instead.
+#[cfg(test)]
+mod protect_hold_tests {
+    use bson::Document;
+    use revolt_result::ErrorType;
+
+    use crate::{AbstractChannels, AbstractMessages, Channel, Database, Message, MongoDb};
+
+    use super::{COL, COL_CHANNELS};
+
+    const CHANNEL: &str = "01J9Z3K4M5N6P7Q8R9S0T1V2W3";
+    const MESSAGE: &str = "01JA0000000000000000000H01";
+
+    /// Seeded on the channel so "not incremented" is read off a stored
+    /// value, not off an absent field
+    const SERIAL: i64 = 5;
+
+    /// An unprotected server text channel, inserted through the driver;
+    /// then `protected` (if `protect`) and `txn_serial` written raw, as a
+    /// protect committing after `insert_message`'s channel read would; then
+    /// a plaintext row inserted raw, as `insert_message`'s insert step does.
+    /// Returns that message.
+    async fn setup(mongo: &MongoDb, protect: bool) -> Message {
+        let channel: Channel = serde_json::from_value(serde_json::json!({
+            "channel_type": "TextChannel",
+            "_id": CHANNEL,
+            "server": "01J9Z3K4M5N6P7Q8R9S0T1V2W6",
+            "name": "general",
+        }))
+        .expect("text channel");
+        assert!(!channel.is_protected());
+        mongo.insert_channel(&channel).await.expect("channel");
+
+        let set = if protect {
+            doc! { "protected": true, "txn_serial": SERIAL }
+        } else {
+            doc! { "txn_serial": SERIAL }
+        };
+        let written = mongo
+            .col::<Document>(COL_CHANNELS)
+            .update_one(doc! { "_id": CHANNEL }, doc! { "$set": set })
+            .await
+            .expect("raw channel write");
+        assert_eq!(written.matched_count, 1);
+        assert_eq!(
+            mongo
+                .fetch_channel(CHANNEL)
+                .await
+                .expect("channel")
+                .is_protected(),
+            protect
+        );
+
+        let message = Message {
+            id: MESSAGE.to_string(),
+            channel: CHANNEL.to_string(),
+            author: "01HZXBBBBBBBBBBBBBBBBBBBBB".to_string(),
+            content: Some("hi".to_string()),
+            ..Default::default()
+        };
+        mongo
+            .col::<Message>(COL)
+            .insert_one(&message)
+            .await
+            .expect("raw message row");
+        assert!(row_exists(mongo).await);
+
+        message
+    }
+
+    async fn channel_doc(mongo: &MongoDb) -> Document {
+        mongo
+            .col::<Document>(COL_CHANNELS)
+            .find_one(doc! { "_id": CHANNEL })
+            .await
+            .expect("channel read")
+            .expect("channel")
+    }
+
+    async fn row_exists(mongo: &MongoDb) -> bool {
+        mongo
+            .col::<Document>(COL)
+            .find_one(doc! { "_id": MESSAGE })
+            .await
+            .expect("message read")
+            .is_some()
+    }
+
+    /// Protect committed first: the guard write matches nothing, the row is
+    /// deleted again, the plaintext refusal is reported, and the channel
+    /// document is left exactly as protect wrote it
+    #[tokio::test]
+    async fn hold_channel_unprotected_deletes_the_row_once_protect_committed() {
+        database_test!(|db| async move {
+            let Database::MongoDb(mongo) = &db else {
+                eprintln!(
+                    "NOTE: hold_channel_unprotected_deletes_the_row_once_protect_committed runs on MONGODB only; skipped on REFERENCE"
+                );
+                return;
+            };
+            let message = setup(mongo, true).await;
+
+            let error = mongo
+                .hold_channel_unprotected(&message)
+                .await
+                .expect_err("a protected channel refuses the insert");
+            match error.error_type {
+                ErrorType::ProtectedFieldRefused { ref field } => assert_eq!(field, "content"),
+                other => panic!("expected ProtectedFieldRefused {{ content }}, got {other:?}"),
+            }
+
+            assert!(!row_exists(mongo).await, "plaintext row left behind");
+            let fetched = mongo.fetch_message(MESSAGE).await.map(|_| ());
+            assert!(
+                matches!(
+                    fetched.as_ref().map_err(|e| &e.error_type),
+                    Err(ErrorType::NotFound)
+                ),
+                "expected NotFound, got {fetched:?}"
+            );
+
+            let channel = channel_doc(mongo).await;
+            assert_eq!(channel.get_bool("protected").ok(), Some(true));
+            assert_eq!(channel.get_i64("txn_serial").ok(), Some(SERIAL));
+        });
+    }
+
+    /// Still unprotected: the guard write holds the channel (`txn_serial` up
+    /// by exactly one) and the row stays
+    #[tokio::test]
+    async fn hold_channel_unprotected_keeps_the_row_in_an_unprotected_channel() {
+        database_test!(|db| async move {
+            let Database::MongoDb(mongo) = &db else {
+                eprintln!(
+                    "NOTE: hold_channel_unprotected_keeps_the_row_in_an_unprotected_channel runs on MONGODB only; skipped on REFERENCE"
+                );
+                return;
+            };
+            let message = setup(mongo, false).await;
+
+            mongo
+                .hold_channel_unprotected(&message)
+                .await
+                .expect("an unprotected channel holds");
+
+            assert!(row_exists(mongo).await, "row deleted from an open channel");
+            assert_eq!(
+                mongo.fetch_message(MESSAGE).await.expect("stored").content,
+                message.content
+            );
+
+            let channel = channel_doc(mongo).await;
+            assert!(!channel.contains_key("protected"));
+            assert_eq!(channel.get_i64("txn_serial").ok(), Some(SERIAL + 1));
+        });
+    }
+}
+
+/// The durable `cid` replay guard (W2 Decision 15), driven straight through
+/// `insert_message` so the in-memory nonce cache is not in the path. The
+/// test database is un-migrated, so each test builds the index from the one
+/// spec `init.rs` and revision 75 use. Mongo only: under `TEST_DB=REFERENCE`
+/// these return early; the Reference emulation has its own tests in
+/// `reference.rs`.
+#[cfg(test)]
+mod nonce_index_tests {
+    use base64::{engine::general_purpose::STANDARD_NO_PAD, Engine as _};
+    use revolt_result::{ErrorType, Result};
+
+    use crate::models::admin_migrations::protected_nonce_index;
+    use crate::{
+        AbstractChannels, AbstractMessages, Channel, Database, EncryptedPayload, Message, MongoDb,
+    };
+
+    const PROTECTED: &str = "01J9Z3K4M5N6P7Q8R9S0T1V2W3";
+    const PROTECTED_OTHER: &str = "01J9Z3K4M5N6P7Q8R9S0T1V2W4";
+    const PLAINTEXT: &str = "01J9Z3K4M5N6P7Q8R9S0T1V2W5";
+    const SERVER: &str = "01J9Z3K4M5N6P7Q8R9S0T1V2W6";
+    const AUTHOR: &str = "01HZXBBBBBBBBBBBBBBBBBBBBB";
+
+    /// Client message ids (`Message.nonce`), ULIDs as a protected send needs
+    const CID: &str = "01JA0000000000000000000C01";
+    const CID_OTHER: &str = "01JA0000000000000000000C02";
+
+    async fn create_nonce_index(mongo: &MongoDb) {
+        mongo
+            .db()
+            .run_command(doc! {
+                "createIndexes": "messages",
+                "indexes": [protected_nonce_index()]
+            })
+            .await
+            .expect("create the replay index");
+    }
+
+    async fn text_channel(mongo: &MongoDb, id: &str, protected: bool) {
+        let channel: Channel = serde_json::from_value(serde_json::json!({
+            "channel_type": "TextChannel",
+            "_id": id,
+            "server": SERVER,
+            "name": "general",
+            "protected": protected,
+        }))
+        .expect("text channel");
+        assert_eq!(channel.is_protected(), protected);
+        mongo.insert_channel(&channel).await.expect("channel");
+    }
+
+    /// A structurally valid payload (design 2.6); `seed` varies the AEAD
+    /// nonce, so a replay is never caught on `encrypted.nonce` by accident
+    fn payload(seed: u8) -> EncryptedPayload {
+        EncryptedPayload {
+            v: EncryptedPayload::VERSION,
+            group_id: "ab".repeat(32),
+            epoch: 0,
+            sender_device_id: "cd".repeat(16),
+            nonce: STANDARD_NO_PAD.encode([seed; EncryptedPayload::NONCE_BYTES]),
+            ciphertext: STANDARD_NO_PAD.encode([seed; EncryptedPayload::CIPHERTEXT_MIN_BYTES]),
+            sig: STANDARD_NO_PAD.encode([seed; EncryptedPayload::SIG_BYTES]),
+            franking: None,
+        }
+    }
+
+    fn encrypted(id: &str, channel: &str, cid: &str, seed: u8) -> Message {
+        Message {
+            id: id.to_string(),
+            channel: channel.to_string(),
+            author: AUTHOR.to_string(),
+            nonce: Some(cid.to_string()),
+            encrypted: Some(payload(seed)),
+            ..Default::default()
+        }
+    }
+
+    fn plaintext(id: &str, cid: &str) -> Message {
+        Message {
+            id: id.to_string(),
+            channel: PLAINTEXT.to_string(),
+            author: AUTHOR.to_string(),
+            nonce: Some(cid.to_string()),
+            content: Some("hi".to_string()),
+            ..Default::default()
+        }
+    }
+
+    fn assert_duplicate_nonce(result: Result<()>) {
+        let error = result.expect_err("a replayed (channel, nonce) must be refused");
+        assert!(
+            matches!(error.error_type, ErrorType::DuplicateNonce),
+            "expected DuplicateNonce, got {:?}",
+            error.error_type
+        );
+    }
+
+    fn assert_insert_database_error(result: Result<()>) {
+        let error = result.expect_err("a duplicate _id must be refused");
+        match error.error_type {
+            ErrorType::DatabaseError {
+                ref operation,
+                ref collection,
+            } => {
+                assert_eq!(operation, "insert_one");
+                assert_eq!(collection, "messages");
+            }
+            other => panic!("expected DatabaseError, got {other:?}"),
+        }
+    }
+
+    async fn assert_not_stored(mongo: &MongoDb, id: &str) {
+        let fetched = mongo.fetch_message(id).await.map(|_| ());
+        assert!(
+            matches!(
+                fetched.as_ref().map_err(|e| &e.error_type),
+                Err(ErrorType::NotFound)
+            ),
+            "expected NotFound for {id}, got {fetched:?}"
+        );
+    }
+
+    /// A second protected message under a stored `(channel, nonce)` is
+    /// `DuplicateNonce` and leaves no row; a new nonce, or the same nonce in
+    /// another channel, is not a replay
+    #[tokio::test]
+    async fn insert_message_refuses_a_replayed_protected_nonce() {
+        database_test!(|db| async move {
+            let Database::MongoDb(mongo) = &db else {
+                eprintln!(
+                    "NOTE: insert_message_refuses_a_replayed_protected_nonce runs on MONGODB only; skipped on REFERENCE"
+                );
+                return;
+            };
+            create_nonce_index(mongo).await;
+            text_channel(mongo, PROTECTED, true).await;
+            text_channel(mongo, PROTECTED_OTHER, true).await;
+
+            let first = encrypted("01JA0000000000000000000M01", PROTECTED, CID, 1);
+            mongo
+                .insert_message(&first)
+                .await
+                .expect("the first protected message");
+
+            // A fresh id and a fresh AEAD nonce: the message nonce alone is the key
+            let replay = encrypted("01JA0000000000000000000M02", PROTECTED, CID, 2);
+            assert_duplicate_nonce(mongo.insert_message(&replay).await);
+            assert_not_stored(mongo, &replay.id).await;
+            assert_eq!(
+                mongo.fetch_message(&first.id).await.expect("kept"),
+                first,
+                "the first message must be untouched"
+            );
+
+            mongo
+                .insert_message(&encrypted(
+                    "01JA0000000000000000000M03",
+                    PROTECTED,
+                    CID_OTHER,
+                    3,
+                ))
+                .await
+                .expect("a new nonce in the same channel");
+            mongo
+                .insert_message(&encrypted(
+                    "01JA0000000000000000000M04",
+                    PROTECTED_OTHER,
+                    CID,
+                    4,
+                ))
+                .await
+                .expect("the same nonce in another channel");
+        });
+    }
+
+    /// The index is partial on `encrypted`: plaintext messages sharing a
+    /// `(channel, nonce)` are both stored
+    #[tokio::test]
+    async fn insert_message_lets_plaintext_messages_share_a_nonce() {
+        database_test!(|db| async move {
+            let Database::MongoDb(mongo) = &db else {
+                eprintln!(
+                    "NOTE: insert_message_lets_plaintext_messages_share_a_nonce runs on MONGODB only; skipped on REFERENCE"
+                );
+                return;
+            };
+            create_nonce_index(mongo).await;
+            text_channel(mongo, PLAINTEXT, false).await;
+
+            let first = plaintext("01JA0000000000000000000P01", CID);
+            let second = plaintext("01JA0000000000000000000P02", CID);
+            mongo
+                .insert_message(&first)
+                .await
+                .expect("the first plaintext message");
+            mongo
+                .insert_message(&second)
+                .await
+                .expect("a plaintext message reusing the nonce");
+
+            for message in [&first, &second] {
+                assert_eq!(
+                    mongo.fetch_message(&message.id).await.expect("stored"),
+                    *message
+                );
+            }
+        });
+    }
+
+    /// A duplicate `_id` is also an 11000, but on `_id_`: it stays a
+    /// `DatabaseError`, never `DuplicateNonce`
+    #[tokio::test]
+    async fn insert_message_keeps_a_duplicate_id_a_database_error() {
+        database_test!(|db| async move {
+            let Database::MongoDb(mongo) = &db else {
+                eprintln!(
+                    "NOTE: insert_message_keeps_a_duplicate_id_a_database_error runs on MONGODB only; skipped on REFERENCE"
+                );
+                return;
+            };
+            create_nonce_index(mongo).await;
+            text_channel(mongo, PROTECTED, true).await;
+            text_channel(mongo, PLAINTEXT, false).await;
+
+            let first = encrypted("01JA0000000000000000000M01", PROTECTED, CID, 1);
+            mongo
+                .insert_message(&first)
+                .await
+                .expect("the first protected message");
+            // Only `_id` collides: the nonce is new
+            assert_insert_database_error(
+                mongo
+                    .insert_message(&encrypted(
+                        "01JA0000000000000000000M01",
+                        PROTECTED,
+                        CID_OTHER,
+                        2,
+                    ))
+                    .await,
+            );
+            assert_eq!(mongo.fetch_message(&first.id).await.expect("kept"), first);
+
+            let stored = plaintext("01JA0000000000000000000P01", CID);
+            mongo
+                .insert_message(&stored)
+                .await
+                .expect("the first plaintext message");
+            assert_insert_database_error(
+                mongo
+                    .insert_message(&plaintext("01JA0000000000000000000P01", CID_OTHER))
+                    .await,
+            );
+            assert_eq!(mongo.fetch_message(&stored.id).await.expect("kept"), stored);
         });
     }
 }
