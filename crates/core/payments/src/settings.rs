@@ -1,7 +1,8 @@
 //! Validated payments settings, read from `[features.payments]` and `[api.stripe]`
+//! (and, for Prot, `[features.boosts.protection]`)
 
 use chrono::DateTime;
-use revolt_config::{ApiStripe, FeaturePayments, Settings};
+use revolt_config::{ApiStripe, FeaturePayments, ProtPackConfig, ProtectionFeatures, Settings};
 use revolt_result::{create_error, Result};
 
 use crate::catalog::CIPHER_CAP_MAX;
@@ -179,8 +180,213 @@ impl PaymentsSettings {
 }
 
 /// Exactly two uppercase ASCII letters
-fn is_country_code(code: &str) -> bool {
+pub(crate) fn is_country_code(code: &str) -> bool {
     code.len() == 2 && code.bytes().all(|b| b.is_ascii_uppercase())
+}
+
+/// Smallest Prot purchase Stripe takes in USD, in cents
+const PROT_MIN_CENTS: i64 = 50;
+
+/// Ceiling on `prot_exact_max_cents`, in cents
+const PROT_MAX_CENTS: i64 = 1_000_000;
+
+/// The Prot sale and wallet settings, checked once
+///
+/// Kept apart from [`PaymentsSettings`] (which the payments tests build as
+/// full literals). Like it, a config that cannot be trusted is an error,
+/// never a silent default: checkout refuses, and fulfilment falls back to
+/// [`ProtSalesSettings::closed`] (sales closed, the shipped blocked list).
+#[derive(Clone, Debug)]
+pub struct ProtSalesSettings {
+    /// `features.boosts.protection.enabled`
+    pub enabled: bool,
+    /// `features.boosts.protection.cipher_grants_enabled`
+    pub cipher_grants_enabled: bool,
+    /// `features.boosts.protection.wallet_cap`
+    pub wallet_cap: i64,
+    /// `features.boosts.protection.contribute_hold_hours`
+    pub contribute_hold_hours: u32,
+    /// `features.payments.prot_sales_open`
+    pub sales_open: bool,
+    /// `features.payments.prot_packs`
+    pub packs: Vec<ProtPackConfig>,
+    /// `features.payments.prot_exact_min_cents`
+    pub exact_min_cents: i64,
+    /// `features.payments.prot_exact_max_cents`
+    pub exact_max_cents: i64,
+    /// Countries Prot is not sold to, ISO 3166-1 alpha-2, uppercase
+    /// (`features.payments.prot_blocked_countries`)
+    pub blocked_countries: Vec<String>,
+    /// `features.payments.prot_success_url`
+    pub success_url: String,
+    /// `features.payments.prot_cancel_url`
+    pub cancel_url: String,
+    /// `features.payments.prot_shell_return_url` (success and cancel)
+    pub shell_return_url: String,
+}
+
+impl ProtSalesSettings {
+    /// Build from the two config sections
+    ///
+    /// Err(InternalError), logged naming the key, when: a pack id is not
+    /// "p" + digits or is duplicated; a pack has cents < 50, prot < cents
+    /// or cents > `prot_exact_max_cents`; the exact bounds are not
+    /// 50 <= min <= max <= 1,000,000; `wallet_cap` < 1; a blocked country
+    /// is not two uppercase letters; a return URL is not https://.
+    pub fn from_parts(payments: &FeaturePayments, protection: &ProtectionFeatures) -> Result<Self> {
+        let (min, max) = (payments.prot_exact_min_cents, payments.prot_exact_max_cents);
+        if !(PROT_MIN_CENTS..=max).contains(&min) || max > PROT_MAX_CENTS {
+            log::error!(
+                "[features.payments] prot_exact_min_cents = {min}, prot_exact_max_cents = {max}: \
+                 need {PROT_MIN_CENTS} <= min <= max <= {PROT_MAX_CENTS}"
+            );
+            return Err(create_error!(InternalError));
+        }
+
+        for (i, pack) in payments.prot_packs.iter().enumerate() {
+            let id = &pack.id;
+            if !is_pack_id(id) {
+                log::error!("[features.payments] prot_packs: id {id:?} is not \"p\" + digits");
+                return Err(create_error!(InternalError));
+            }
+            if payments.prot_packs[..i].iter().any(|other| other.id == *id) {
+                log::error!("[features.payments] prot_packs: id {id:?} is listed twice");
+                return Err(create_error!(InternalError));
+            }
+            if !(PROT_MIN_CENTS..=max).contains(&pack.cents) || pack.prot < pack.cents {
+                log::error!(
+                    "[features.payments] prot_packs: pack {id:?} ({} cents, {} Prot) needs \
+                     {PROT_MIN_CENTS} <= cents <= prot_exact_max_cents ({max}) and prot >= cents",
+                    pack.cents,
+                    pack.prot
+                );
+                return Err(create_error!(InternalError));
+            }
+        }
+
+        if protection.wallet_cap < 1 {
+            log::error!(
+                "[features.boosts.protection] wallet_cap = {} must be at least 1",
+                protection.wallet_cap
+            );
+            return Err(create_error!(InternalError));
+        }
+
+        // As for Cipher: a typo would silently sell to a country meant to be
+        // blocked, so the whole config is refused instead
+        if let Some(bad) = payments
+            .prot_blocked_countries
+            .iter()
+            .find(|code| !is_country_code(code))
+        {
+            log::error!(
+                "[features.payments] prot_blocked_countries: {bad:?} is not an ISO 3166-1 \
+                 alpha-2 code in uppercase"
+            );
+            return Err(create_error!(InternalError));
+        }
+
+        for (key, url) in [
+            ("prot_success_url", &payments.prot_success_url),
+            ("prot_cancel_url", &payments.prot_cancel_url),
+            ("prot_shell_return_url", &payments.prot_shell_return_url),
+        ] {
+            if !url.starts_with("https://") {
+                log::error!("[features.payments] {key} = {url:?} is not an https:// URL");
+                return Err(create_error!(InternalError));
+            }
+        }
+
+        Ok(Self::unchecked(payments, protection))
+    }
+
+    /// Build from the loaded config
+    pub fn from_config(c: &Settings) -> Result<Self> {
+        Self::from_parts(&c.features.payments, &c.features.boosts.protection)
+    }
+
+    /// Build from the current config
+    pub async fn load() -> Result<Self> {
+        Self::from_config(&revolt_config::config().await)
+    }
+
+    /// The shipped defaults with sales closed and Cipher grants off. Never
+    /// fails: it is built without the checks (`from_parts` of the defaults
+    /// is pinned valid by a test).
+    pub fn closed() -> Self {
+        let mut closed =
+            Self::unchecked(&FeaturePayments::default(), &ProtectionFeatures::default());
+        closed.sales_open = false;
+        closed.cipher_grants_enabled = false;
+        closed
+    }
+
+    /// [`Self::load`], else [`Self::closed`], logged at error level as
+    /// `PROT_CONFIG_INVALID` (the check that failed is logged by `from_parts`)
+    pub async fn load_or_closed() -> Self {
+        match Self::load().await {
+            Ok(ps) => ps,
+            Err(_) => {
+                log::error!(
+                    "payments: PROT_CONFIG_INVALID: the Prot settings do not validate; Prot sales \
+                     are closed and Cipher grants off until they do"
+                );
+                Self::closed()
+            }
+        }
+    }
+
+    /// Whether a Prot checkout may start: payments on, Prot on, Prot sales open
+    pub fn checkout_open(&self, s: &PaymentsSettings) -> bool {
+        s.enabled && self.enabled && self.sales_open
+    }
+
+    /// Whether Cipher members are credited their founding Prot
+    pub fn grants_active(&self) -> bool {
+        self.enabled && self.cipher_grants_enabled
+    }
+
+    /// Whether Prot is not sold to `country` (compared without regard to
+    /// case, as [`PaymentsSettings::region_blocked`])
+    pub fn region_blocked(&self, country: &str) -> bool {
+        self.blocked_countries
+            .iter()
+            .any(|blocked| blocked.eq_ignore_ascii_case(country))
+    }
+
+    /// The pack on sale with this id
+    pub fn pack(&self, id: &str) -> Option<&ProtPackConfig> {
+        self.packs.iter().find(|pack| pack.id == id)
+    }
+
+    /// `contribute_hold_hours` in milliseconds
+    pub fn hold_ms(&self) -> i64 {
+        i64::from(self.contribute_hold_hours) * 3_600_000
+    }
+
+    /// Copy the config sections as they are
+    fn unchecked(payments: &FeaturePayments, protection: &ProtectionFeatures) -> Self {
+        Self {
+            enabled: protection.enabled,
+            cipher_grants_enabled: protection.cipher_grants_enabled,
+            wallet_cap: protection.wallet_cap,
+            contribute_hold_hours: protection.contribute_hold_hours,
+            sales_open: payments.prot_sales_open,
+            packs: payments.prot_packs.clone(),
+            exact_min_cents: payments.prot_exact_min_cents,
+            exact_max_cents: payments.prot_exact_max_cents,
+            blocked_countries: payments.prot_blocked_countries.clone(),
+            success_url: payments.prot_success_url.clone(),
+            cancel_url: payments.prot_cancel_url.clone(),
+            shell_return_url: payments.prot_shell_return_url.clone(),
+        }
+    }
+}
+
+/// "p" followed by one or more ASCII digits
+fn is_pack_id(id: &str) -> bool {
+    id.strip_prefix('p')
+        .is_some_and(|digits| !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
 }
 
 /// Parse `cipher_sales_close_at`: "" → None; otherwise an RFC 3339 instant
@@ -459,5 +665,206 @@ mod tests {
         let unset = format!("{:?}", settings(""));
         assert!(unset.contains(r#"secret_key: "<unset>""#), "{unset}");
         assert!(unset.contains(r#"webhook_secret: "<unset>""#), "{unset}");
+    }
+
+    // --- Prot ----------------------------------------------------------
+
+    fn prot_on() -> ProtectionFeatures {
+        ProtectionFeatures {
+            enabled: true,
+            cipher_grants_enabled: true,
+            ..ProtectionFeatures::default()
+        }
+    }
+
+    fn pack(id: &str, cents: i64, prot: i64) -> ProtPackConfig {
+        ProtPackConfig {
+            id: id.to_string(),
+            cents,
+            prot,
+        }
+    }
+
+    fn assert_prot_internal_error(result: Result<ProtSalesSettings>) {
+        match result {
+            Err(err) => assert!(
+                matches!(err.error_type, ErrorType::InternalError),
+                "expected InternalError, got {:?}",
+                err.error_type
+            ),
+            Ok(ps) => panic!("expected InternalError, got {ps:?}"),
+        }
+    }
+
+    #[test]
+    fn prot_defaults_are_valid_and_closed() {
+        let ps = ProtSalesSettings::from_parts(
+            &FeaturePayments::default(),
+            &ProtectionFeatures::default(),
+        )
+        .unwrap();
+        assert!(!ps.enabled);
+        assert!(!ps.sales_open);
+        assert!(!ps.grants_active());
+        assert_eq!(ps.wallet_cap, 100_000);
+        assert_eq!(ps.hold_ms(), 72 * 3_600_000);
+        assert_eq!((ps.exact_min_cents, ps.exact_max_cents), (50, 50_000));
+        assert_eq!(ps.pack("p25"), Some(&pack("p25", 2500, 2600)));
+        assert_eq!(ps.pack("p1000"), None);
+        // The EU and the UK, like Cipher, plus Norway, Iceland and
+        // Liechtenstein
+        assert_eq!(ps.blocked_countries.len(), 31);
+        for code in ["DE", "fr", "GB", "NO", "is", "LI"] {
+            assert!(ps.region_blocked(code), "{code}");
+        }
+        for code in ["US", "CH", ""] {
+            assert!(!ps.region_blocked(code), "{code}");
+        }
+    }
+
+    #[test]
+    fn prot_closed_is_the_defaults_with_sales_and_grants_off() {
+        let closed = ProtSalesSettings::closed();
+        assert!(!closed.sales_open);
+        assert!(!closed.grants_active());
+        assert_eq!(
+            closed.blocked_countries,
+            FeaturePayments::default().prot_blocked_countries
+        );
+        assert_eq!(closed.packs, FeaturePayments::default().prot_packs);
+    }
+
+    #[test]
+    fn prot_switches() {
+        let open = FeaturePayments {
+            prot_sales_open: true,
+            ..FeaturePayments::default()
+        };
+        let ps = ProtSalesSettings::from_parts(&open, &prot_on()).unwrap();
+        let mut s = settings("");
+        assert!(ps.checkout_open(&s));
+        assert!(ps.grants_active());
+
+        s.enabled = false;
+        assert!(!ps.checkout_open(&s), "payments off");
+
+        let s = settings("");
+        let closed =
+            ProtSalesSettings::from_parts(&FeaturePayments::default(), &prot_on()).unwrap();
+        assert!(!closed.checkout_open(&s), "Prot sales closed");
+
+        let off = ProtSalesSettings::from_parts(&open, &ProtectionFeatures::default()).unwrap();
+        assert!(!off.checkout_open(&s), "Prot off");
+        assert!(!off.grants_active());
+
+        let no_grants = ProtSalesSettings::from_parts(
+            &open,
+            &ProtectionFeatures {
+                enabled: true,
+                ..ProtectionFeatures::default()
+            },
+        )
+        .unwrap();
+        assert!(no_grants.checkout_open(&s));
+        assert!(!no_grants.grants_active(), "grants have their own switch");
+    }
+
+    #[test]
+    fn prot_packs_must_be_well_formed() {
+        let with = |packs: Vec<ProtPackConfig>| FeaturePayments {
+            prot_packs: packs,
+            ..FeaturePayments::default()
+        };
+        for bad in [
+            vec![pack("25", 2500, 2600)],
+            vec![pack("p", 2500, 2600)],
+            vec![pack("P25", 2500, 2600)],
+            vec![pack("p2a", 2500, 2600)],
+            vec![pack("p25 ", 2500, 2600)],
+            vec![pack("p25", 2500, 2600), pack("p25", 1000, 1000)],
+            vec![pack("p1", 49, 49)],
+            vec![pack("p2", 1000, 999)],
+            vec![pack("p3", 50_001, 60_000)],
+        ] {
+            assert_prot_internal_error(ProtSalesSettings::from_parts(&with(bad), &prot_on()));
+        }
+
+        let ps = ProtSalesSettings::from_parts(
+            &with(vec![pack("p1", 50, 50), pack("p500", 50_000, 50_000)]),
+            &prot_on(),
+        )
+        .unwrap();
+        assert_eq!(ps.packs.len(), 2);
+
+        // No packs: only pay-exact is on sale
+        assert!(ProtSalesSettings::from_parts(&with(vec![]), &prot_on()).is_ok());
+    }
+
+    #[test]
+    fn prot_exact_bounds_and_wallet_cap() {
+        let bounds = |min: i64, max: i64| FeaturePayments {
+            prot_exact_min_cents: min,
+            prot_exact_max_cents: max,
+            prot_packs: vec![],
+            ..FeaturePayments::default()
+        };
+        for (min, max) in [(49, 50_000), (100, 99), (50, 1_000_001), (0, 0), (-1, 50)] {
+            assert_prot_internal_error(ProtSalesSettings::from_parts(
+                &bounds(min, max),
+                &prot_on(),
+            ));
+        }
+        for (min, max) in [(50, 50), (50, 1_000_000), (500, 600)] {
+            assert!(ProtSalesSettings::from_parts(&bounds(min, max), &prot_on()).is_ok());
+        }
+
+        // A pack dearer than the exact ceiling is refused
+        let packs_over = FeaturePayments {
+            prot_exact_max_cents: 5_000,
+            ..FeaturePayments::default()
+        };
+        assert_prot_internal_error(ProtSalesSettings::from_parts(&packs_over, &prot_on()));
+
+        for cap in [0, -1] {
+            let protection = ProtectionFeatures {
+                wallet_cap: cap,
+                ..prot_on()
+            };
+            assert_prot_internal_error(ProtSalesSettings::from_parts(
+                &FeaturePayments::default(),
+                &protection,
+            ));
+        }
+    }
+
+    #[test]
+    fn prot_blocked_countries_and_urls_are_checked() {
+        for bad in ["de", "DEU", "", " DE"] {
+            let payments = FeaturePayments {
+                prot_blocked_countries: vec!["FR".to_string(), bad.to_string()],
+                ..FeaturePayments::default()
+            };
+            assert_prot_internal_error(ProtSalesSettings::from_parts(&payments, &prot_on()));
+        }
+
+        // Its own list, independent of Cipher's
+        let payments = FeaturePayments {
+            prot_blocked_countries: vec!["US".to_string()],
+            ..FeaturePayments::default()
+        };
+        let ps = ProtSalesSettings::from_parts(&payments, &prot_on()).unwrap();
+        assert!(ps.region_blocked("us"));
+        assert!(!ps.region_blocked("DE"));
+
+        let urls: [fn(&mut FeaturePayments); 3] = [
+            |p: &mut FeaturePayments| p.prot_success_url = "http://app.test/s".to_string(),
+            |p: &mut FeaturePayments| p.prot_cancel_url = String::new(),
+            |p: &mut FeaturePayments| p.prot_shell_return_url = "sloga.gg/prot/".to_string(),
+        ];
+        for change in urls {
+            let mut payments = FeaturePayments::default();
+            change(&mut payments);
+            assert_prot_internal_error(ProtSalesSettings::from_parts(&payments, &prot_on()));
+        }
     }
 }
