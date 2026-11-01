@@ -2276,3 +2276,145 @@ async fn flag_off_rejects_every_route_case() {
         "text send"
     );
 }
+
+// Sibling-device close (mls-call-sibling-device-wedge plan §3, §4): the pure
+// verdict the join-intent route reads before closing a call group whose sole
+// leaf is the joiner's own stale sibling device, and the live set it reads.
+// `join_intent_signature_one_device_and_rate_limit` above keeps asserting the
+// sibling 400 on purpose: the harness pins no channel node, so the route gets
+// no SFU listing (`live == None` → Refuse) and that test doubles as the
+// listing-absent control for the route. It must not be "fixed" to expect the
+// close.
+
+#[test]
+fn sibling_verdict_closes_only_when_an_answered_listing_lacks_the_sibling() {
+    use std::collections::HashSet;
+
+    use super::join_intent::{sibling_verdict, SiblingVerdict};
+
+    fn live(pairs: &[(&str, &str)]) -> HashSet<(String, String)> {
+        pairs
+            .iter()
+            .map(|(user, device)| (user.to_string(), device.to_string()))
+            .collect()
+    }
+
+    // No listing (no node pinned, no room, or a listing error) → never close
+    // on an SFU that did not answer
+    assert_eq!(sibling_verdict("a", "d1", None), SiblingVerdict::Refuse);
+
+    // The sibling still holds a live seat (e.g. a failed eviction) → refuse
+    assert_eq!(
+        sibling_verdict("a", "d1", Some(&live(&[("a", "d1")]))),
+        SiblingVerdict::Refuse
+    );
+
+    // An answered listing without the sibling → the sole leaf is unservable
+    assert_eq!(
+        sibling_verdict("a", "d1", Some(&live(&[]))),
+        SiblingVerdict::CloseUnservable
+    );
+
+    // The joiner's own seat (same user, another device) is not the sibling
+    assert_eq!(
+        sibling_verdict("a", "d1", Some(&live(&[("a", "d2")]))),
+        SiblingVerdict::CloseUnservable
+    );
+
+    // Another user's device with the same id string is not the sibling: the
+    // (user, device) pair must match, not the device alone
+    assert_eq!(
+        sibling_verdict("a", "d1", Some(&live(&[("b", "d1")]))),
+        SiblingVerdict::CloseUnservable
+    );
+}
+
+#[test]
+fn live_member_devices_keeps_only_device_qualified_primaries() {
+    use std::collections::HashSet;
+
+    use revolt_database::voice::screen_leg_identity;
+
+    use super::join_intent::live_member_devices;
+
+    fn listed(identities: &[&str]) -> HashSet<(String, String)> {
+        live_member_devices(identities.iter().map(|identity| identity.to_string()))
+    }
+
+    fn pair(user: &str, device: &str) -> (String, String) {
+        (user.to_string(), device.to_string())
+    }
+
+    let user = "01KX7HASD9FHBYA3XGKA5YACYX";
+    let device = "4208aa7e9ff58761b2d7a5d6c45f7383";
+    let primary = format!("{user}:{device}");
+    // The real leg grammar, never a hand-written literal:
+    // `{user}:{device}:screen`, and `{user}::screen` for a bare primary
+    let leg = screen_leg_identity(&primary);
+    let bare_leg = screen_leg_identity(user);
+
+    // A device-qualified primary is a live seat
+    assert_eq!(
+        listed(&[primary.as_str()]),
+        HashSet::from([pair(user, device)])
+    );
+
+    // A screen leg is a helper of its owner, never a seat
+    assert!(listed(&[leg.as_str()]).is_empty(), "{:?} kept", leg);
+    assert!(
+        listed(&[bare_leg.as_str()]).is_empty(),
+        "{:?} kept",
+        bare_leg
+    );
+
+    // A bare (non-device-qualified) identity names no device
+    assert!(listed(&[user]).is_empty(), "{:?} kept", user);
+
+    // Malformed: an empty segment, or anything but exactly two segments
+    for malformed in ["", ":", "a:", ":d", "a:b:c", "a:b:c:d"] {
+        assert!(listed(&[malformed]).is_empty(), "{:?} kept", malformed);
+    }
+
+    // Duplicates collapse, and a mixed listing yields exactly its seats
+    assert_eq!(
+        listed(&[
+            primary.as_str(),
+            leg.as_str(),
+            user,
+            bare_leg.as_str(),
+            "b:d9",
+            "b:",
+            ":d9",
+            "a:b:c:d",
+            primary.as_str(),
+            "b:d9",
+        ]),
+        HashSet::from([pair(user, device), pair("b", "d9")])
+    );
+}
+
+#[test]
+fn sibling_screen_leg_alone_is_not_a_live_seat() {
+    use revolt_database::voice::screen_leg_identity;
+
+    use super::join_intent::{live_member_devices, sibling_verdict, SiblingVerdict};
+
+    let user = "01KX7HASD9FHBYA3XGKA5YACYX";
+    let sibling = "4208aa7e9ff58761b2d7a5d6c45f7383";
+    let primary = format!("{user}:{sibling}");
+
+    // Only the sibling's screen leg is listed: a leg holds no leaf and no
+    // roster slot, so it cannot serve the join → close
+    let leg_only = live_member_devices(vec![screen_leg_identity(&primary)]);
+    assert_eq!(
+        sibling_verdict(user, sibling, Some(&leg_only)),
+        SiblingVerdict::CloseUnservable
+    );
+
+    // Control: the same listing plus the sibling's primary → refuse
+    let with_primary = live_member_devices(vec![screen_leg_identity(&primary), primary]);
+    assert_eq!(
+        sibling_verdict(user, sibling, Some(&with_primary)),
+        SiblingVerdict::Refuse
+    );
+}
