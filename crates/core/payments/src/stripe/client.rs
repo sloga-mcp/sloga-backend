@@ -108,6 +108,12 @@ pub struct CheckoutSessionParams {
     pub expires_at_secs: i64,
     /// Stripe Tax on, prices tax-inclusive (`api.stripe.automatic_tax`)
     pub automatic_tax: bool,
+    /// `custom_text[terms_of_service_acceptance][message]`
+    /// (catalog::sku_consent_message)
+    pub consent_message: String,
+    /// `line_items[0][price_data][product_data][tax_code]` when
+    /// automatic_tax (catalog::sku_tax_code)
+    pub tax_code: String,
 }
 
 /// A Checkout Session as Stripe reports it
@@ -378,6 +384,18 @@ pub const TERMS_ACCEPTANCE_MESSAGE: &str = "I agree to the \
 /// Stripe tax code for a Cipher: General - Electronically Supplied Services
 pub const CIPHER_TAX_CODE: &str = "txcd_10000000";
 
+/// What the buyer ticks at a Prot checkout. DRAFT, owned by P3 (attorney);
+/// the final wording is a one-constant change before `prot_sales_open` is
+/// flipped. ASCII, <= 1200 chars, one Markdown link (Stripe's custom_text
+/// rules, checked like `TERMS_ACCEPTANCE_MESSAGE`).
+pub const PROT_TERMS_ACCEPTANCE_MESSAGE: &str = "I agree to the \
+    [Terms of Service](https://sloga.gg/legal/terms.html). My Prot is supplied as soon as my \
+    payment goes through, and it is non-refundable except where the law requires.";
+
+/// Stripe tax code for Prot. PLACEHOLDER = the Cipher code until P2
+/// (accountant) names the stored-value treatment.
+pub const PROT_TAX_CODE: &str = "txcd_10000000";
+
 /// Form body for `POST /v1/checkout/sessions`, in Stripe's bracket notation.
 /// No `payment_method_types`: since API version 2026-09-30.endive Stripe
 /// refuses it and takes the payment methods from the Dashboard (Settings,
@@ -389,8 +407,10 @@ pub const CIPHER_TAX_CODE: &str = "txcd_10000000";
 /// currency (a session settled in another currency would not match the
 /// order, and fulfilment refunds it).
 ///
-/// The buyer must accept the Terms of Service, with the 14-day refund
-/// promise as the checkbox text ([`TERMS_ACCEPTANCE_MESSAGE`]).
+/// The buyer must accept the Terms of Service, with the SKU's checkbox
+/// text (`consent_message`: [`TERMS_ACCEPTANCE_MESSAGE`], the 14-day refund
+/// promise, for a Cipher; [`PROT_TERMS_ACCEPTANCE_MESSAGE`] for Prot). With
+/// `automatic_tax` the line item carries the SKU's `tax_code`.
 /// Operator note: Stripe refuses `consent_collection[terms_of_service]`
 /// until a Terms of Service URL is set in the Dashboard (Settings, Public
 /// details); until then every checkout fails with `PaymentProviderError`
@@ -435,7 +455,7 @@ pub fn checkout_form(p: &CheckoutSessionParams) -> Vec<(String, String)> {
         ),
         (
             "custom_text[terms_of_service_acceptance][message]",
-            TERMS_ACCEPTANCE_MESSAGE.to_string(),
+            p.consent_message.clone(),
         ),
     ]
     .into_iter()
@@ -448,7 +468,7 @@ pub fn checkout_form(p: &CheckoutSessionParams) -> Vec<(String, String)> {
                 ("line_items[0][price_data][tax_behavior]", "inclusive"),
                 (
                     "line_items[0][price_data][product_data][tax_code]",
-                    CIPHER_TAX_CODE,
+                    p.tax_code.as_str(),
                 ),
             ]
             .map(|(key, value)| (key.to_string(), value.to_string())),
@@ -1428,6 +1448,8 @@ mod tests {
             cancel_url: "https://sloga.gg/cipher".to_string(),
             expires_at_secs: 1_729_002_100,
             automatic_tax: false,
+            consent_message: TERMS_ACCEPTANCE_MESSAGE.to_string(),
+            tax_code: CIPHER_TAX_CODE.to_string(),
         }
     }
 
@@ -1524,6 +1546,147 @@ mod tests {
         let mut other = params();
         other.expires_at_secs += 1;
         assert_ne!(checkout_form(&params()), checkout_form(&other));
+    }
+
+    #[test]
+    fn prot_terms_acceptance_message_fits_stripe() {
+        // Stripe's limits on custom_text messages (the wording is a draft,
+        // so its exact length is not pinned)
+        assert!(PROT_TERMS_ACCEPTANCE_MESSAGE.chars().count() <= 1200);
+        assert!(PROT_TERMS_ACCEPTANCE_MESSAGE.is_ascii());
+        // One Markdown link, to the published Terms
+        assert_eq!(PROT_TERMS_ACCEPTANCE_MESSAGE.matches("](").count(), 1);
+        assert!(PROT_TERMS_ACCEPTANCE_MESSAGE
+            .contains("[Terms of Service](https://sloga.gg/legal/terms.html)"));
+        // Prot wording, never the Cipher refund promise
+        assert!(PROT_TERMS_ACCEPTANCE_MESSAGE.contains("Prot"));
+        assert!(!PROT_TERMS_ACCEPTANCE_MESSAGE.contains("Cipher"));
+        assert!(!PROT_TERMS_ACCEPTANCE_MESSAGE.contains("14 days"));
+        assert_ne!(PROT_TERMS_ACCEPTANCE_MESSAGE, TERMS_ACCEPTANCE_MESSAGE);
+        // The continuation lines leave single spaces only
+        assert!(!PROT_TERMS_ACCEPTANCE_MESSAGE.contains("  "));
+        assert!(!PROT_TERMS_ACCEPTANCE_MESSAGE.contains('\n'));
+    }
+
+    #[test]
+    fn checkout_form_sends_the_params_consent_message_and_tax_code() {
+        // Values unlike any constant, so the form can only have taken them
+        // from the params
+        let custom = CheckoutSessionParams {
+            automatic_tax: true,
+            consent_message: "I agree to the [Terms](https://example.test/terms).".to_string(),
+            tax_code: "txcd_20030000".to_string(),
+            ..params()
+        };
+        let cipher = checkout_form(&CheckoutSessionParams {
+            automatic_tax: true,
+            ..params()
+        });
+        let form = checkout_form(&custom);
+
+        // The same keys in the same order; only those two values differ
+        let keys: Vec<&String> = form.iter().map(|(key, _)| key).collect();
+        let cipher_keys: Vec<&String> = cipher.iter().map(|(key, _)| key).collect();
+        assert_eq!(keys, cipher_keys);
+        let changed: Vec<(&str, &str)> = form
+            .iter()
+            .zip(&cipher)
+            .filter(|(sent, base)| sent != base)
+            .map(|((key, value), _)| (key.as_str(), value.as_str()))
+            .collect();
+        assert_eq!(
+            changed,
+            vec![
+                (
+                    "custom_text[terms_of_service_acceptance][message]",
+                    "I agree to the [Terms](https://example.test/terms)."
+                ),
+                (
+                    "line_items[0][price_data][product_data][tax_code]",
+                    "txcd_20030000"
+                ),
+            ]
+        );
+
+        // Without Stripe Tax no tax code is sent at all
+        let untaxed = checkout_form(&CheckoutSessionParams {
+            automatic_tax: false,
+            ..custom.clone()
+        });
+        assert!(!untaxed.iter().any(|(key, _)| key.contains("tax")));
+    }
+
+    #[test]
+    fn prot_checkout_form_carries_the_prot_consent_text_and_tax_code() {
+        let form = checkout_form(&CheckoutSessionParams {
+            automatic_tax: true,
+            product_name: "2,600 Prot".to_string(),
+            consent_message: PROT_TERMS_ACCEPTANCE_MESSAGE.to_string(),
+            tax_code: PROT_TAX_CODE.to_string(),
+            ..params()
+        });
+        let value = |key: &str| {
+            form.iter()
+                .find(|(sent, _)| sent == key)
+                .map(|(_, value)| value.as_str())
+        };
+        assert_eq!(
+            value("custom_text[terms_of_service_acceptance][message]"),
+            Some(PROT_TERMS_ACCEPTANCE_MESSAGE)
+        );
+        assert_eq!(
+            value("line_items[0][price_data][product_data][tax_code]"),
+            Some(PROT_TAX_CODE)
+        );
+        // Consent stays required for Prot too
+        assert_eq!(
+            value("consent_collection[terms_of_service]"),
+            Some("required")
+        );
+    }
+
+    #[tokio::test]
+    async fn mock_records_the_consent_message_and_tax_code() {
+        let stripe = MockStripe::new();
+        let prot = CheckoutSessionParams {
+            automatic_tax: true,
+            consent_message: PROT_TERMS_ACCEPTANCE_MESSAGE.to_string(),
+            tax_code: PROT_TAX_CODE.to_string(),
+            ..params()
+        };
+        stripe
+            .create_checkout_session(&prot, &prot.order_id)
+            .await
+            .unwrap();
+        let recorded = stripe.checkout_params();
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].consent_message, PROT_TERMS_ACCEPTANCE_MESSAGE);
+        assert_eq!(recorded[0].tax_code, PROT_TAX_CODE);
+        assert_eq!(recorded[0], prot);
+
+        // A retry under the same key cannot swap the checkbox text or the
+        // tax code
+        let swapped_text = CheckoutSessionParams {
+            consent_message: TERMS_ACCEPTANCE_MESSAGE.to_string(),
+            ..prot.clone()
+        };
+        let swapped_code = CheckoutSessionParams {
+            tax_code: "txcd_20030000".to_string(),
+            ..prot.clone()
+        };
+        for swapped in [swapped_text, swapped_code] {
+            let replay = stripe
+                .create_checkout_session(&swapped, &prot.order_id)
+                .await;
+            let code = match &replay {
+                Err(StripeError::Api {
+                    status: 400, code, ..
+                }) => code.as_deref(),
+                _ => None,
+            };
+            assert_eq!(code, Some("idempotency_error"), "{replay:?}");
+        }
+        assert_eq!(stripe.checkout_params().len(), 1);
     }
 
     #[test]

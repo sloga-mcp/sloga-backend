@@ -1,9 +1,11 @@
 use revolt_result::Result;
+use std::collections::HashMap;
 
 use crate::CipherMembership;
 use crate::ReferenceDb;
 
 use super::AbstractCipherMemberships;
+use super::MEMBERSHIPS_PAGE_MAX;
 
 #[async_trait]
 impl AbstractCipherMemberships for ReferenceDb {
@@ -97,5 +99,51 @@ impl AbstractCipherMemberships for ReferenceDb {
 
         memberships.remove(user_id);
         Ok(true)
+    }
+
+    async fn fetch_cipher_memberships_page(
+        &self,
+        after_user_id: Option<&str>,
+        limit: i64,
+    ) -> Result<Vec<CipherMembership>> {
+        // Refused as on MongoDB
+        if !(1..=MEMBERSHIPS_PAGE_MAX).contains(&limit) {
+            return Err(create_error!(InternalError));
+        }
+
+        let memberships = self.cipher_memberships.lock().await;
+        let mut rows: Vec<CipherMembership> = memberships
+            .values()
+            .filter(|row| after_user_id.is_none_or(|after| row.user_id.as_str() > after))
+            .cloned()
+            .collect();
+
+        // Byte order, as Mongo compares the string `_id`s
+        rows.sort_by(|a, b| a.user_id.cmp(&b.user_id));
+        rows.truncate(limit.try_into().unwrap_or(usize::MAX));
+        Ok(rows)
+    }
+}
+
+/// The Reference twin of bump_cipher_membership_version_in, on a map the caller has locked
+///
+/// Changes only `version`, to `expected + 1`, when the user's row is at
+/// `expected`; false when the version moved or the row is gone (never
+/// inserts). A version that cannot be bumped any further is false too (the
+/// MongoDB method errors there; neither is reachable in practice).
+pub(crate) fn bump_cipher_membership_version_locked(
+    memberships: &mut HashMap<String, CipherMembership>,
+    user_id: &str,
+    expected: u64,
+) -> bool {
+    match memberships.get_mut(user_id) {
+        Some(row) if row.version == expected => match expected.checked_add(1) {
+            Some(next) => {
+                row.version = next;
+                true
+            }
+            None => false,
+        },
+        _ => false,
     }
 }

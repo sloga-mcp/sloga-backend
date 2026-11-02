@@ -3038,7 +3038,27 @@ pub async fn run_migrations(db: &MongoDb, revision: i32) -> i32 {
             .expect("Failed to create messages channel_nonce_encrypted_unique index.");
     }
 
-    // Block number reassigned at land time per the merge steward (design 2.7).
+    // The Prot ledger follows the protected-channels block (revision 75) as
+    // its own top-level guard, never nested in it: a database already at 75
+    // runs this block and the ones after it.
+    if revision <= 76 {
+        info!("Running migration [revision 76 / 22-10-2026]: Create prot_accounts / prot_ledger collections (Prot wallet ledger)");
+
+        // Same contract as revision 74: panics on failure (the unique key index is what stops a
+        // posting from being applied twice), and every step is idempotent, so the next boot
+        // re-runs the whole block.
+        for collection in PROT_COLLECTIONS {
+            db.db().create_collection(collection).await.ok();
+        }
+
+        create_prot_indexes(&db.db())
+            .await
+            .expect("Failed to create Prot indexes.");
+    }
+
+    // Protected channels S2 is revision 77 (LATEST_REVISION 78), a top-level
+    // sibling after the Prot ledger's revision 76 (LATEST 77, deployed), so a
+    // database already at 77 runs only this block (design 2.7).
     if revision <= 77 {
         info!("Running migration [revision 77 / 26-10-2026]: Add the channel_seats active-seat sweep index and the mls_commits Text Welcome lookup index (protected channels S2)");
 
@@ -3079,6 +3099,85 @@ pub const PAYMENT_COLLECTIONS: [&str; 4] = [
     "cipher_numbers",
     "cipher_memberships",
 ];
+
+/// The Prot collections (revision 76). Created by both the migration and `init.rs`. S5b grows the array.
+pub const PROT_COLLECTIONS: [&str; 2] = ["prot_accounts", "prot_ledger"];
+
+/// Revision 76: the Prot indexes, shared by the migration and `init.rs` (same shape as
+/// create_payment_indexes). Re-running is a no-op.
+///
+/// `prot_accounts` needs nothing beyond `_id`: accounts are only ever read
+/// and written by id.
+pub async fn create_prot_indexes(
+    db: &crate::mongodb::Database,
+) -> Result<(), crate::mongodb::error::Error> {
+    db.run_command(doc! {
+        "createIndexes": "prot_ledger",
+        "indexes": [
+            // ENFORCES one row per idempotency key: a posting retried after
+            // a crash, a duplicate webhook or a second sweep finds the row
+            // it already wrote instead of moving the Prot twice.
+            {
+                "key": {
+                    "key": 1_i32
+                },
+                "name": "prot_ledger_key_unique",
+                "unique": true
+            },
+            // Serves an account's history, newest first (the debit side).
+            {
+                "key": {
+                    "debit": 1_i32,
+                    "_id": -1_i32
+                },
+                "name": "prot_ledger_debit_id"
+            },
+            // Serves an account's history, newest first (the credit side).
+            {
+                "key": {
+                    "credit": 1_i32,
+                    "_id": -1_i32
+                },
+                "name": "prot_ledger_credit_id"
+            },
+            // Serves the purchase hold: an account's recent credits of a
+            // kind, by time.
+            {
+                "key": {
+                    "credit": 1_i32,
+                    "kind": 1_i32,
+                    "created_at": 1_i32
+                },
+                "name": "prot_ledger_credit_kind_created"
+            },
+            // Serves the rows of one payment order (credit, clawback).
+            // Partial: most rows have no order.
+            {
+                "key": {
+                    "ref.order_id": 1_i32
+                },
+                "name": "prot_ledger_order",
+                "partialFilterExpression": {
+                    "ref.order_id": { "$type": "string" }
+                }
+            },
+            // Serves the rows of one Cipher membership (what the founding
+            // Prot sync has posted). Partial for the same reason.
+            {
+                "key": {
+                    "ref.membership_order_id": 1_i32
+                },
+                "name": "prot_ledger_membership",
+                "partialFilterExpression": {
+                    "ref.membership_order_id": { "$type": "string" }
+                }
+            }
+        ]
+    })
+    .await?;
+
+    Ok(())
+}
 
 /// The seeded `cipher_numbers` table holds numbers 1 through this. Fixed
 /// rather than read from `features.payments.cipher_cap`: migrations read no
@@ -3630,13 +3729,13 @@ mod afk_backfill_tests {
     fn latest_revision_is_78() {
         assert_eq!(
             LATEST_REVISION, 78,
-            "the AFK backfill is revision 72, the ViewAuditLog backfill 73, the payments collections 74, protected channels 75, protected channels S2 77 (76 is reserved for S5)"
+            "the AFK backfill is revision 72, the ViewAuditLog backfill 73, the payments collections 74, protected channels 75, the Prot collections 76, protected channels S2 77"
         );
     }
 
     /// The AFK backfill was the last migration when it landed; revision 77
-    /// (protected channels S2) now is. The 72, 73, 74, 75 and 77 guards are
-    /// pinned to exactly one block each, and the last one to
+    /// (protected channels S2) now is. The 72, 73, 74, 75, 76 and 77 guards
+    /// are pinned to exactly one block each, and the last one to
     /// `LATEST_REVISION - 1`.
     #[test]
     fn backfill_is_guarded_by_revision_72_and_revision_77_is_the_last_migration() {
@@ -3671,6 +3770,11 @@ mod afk_backfill_tests {
             "exactly one `if revision <= 75` block"
         );
         assert_eq!(
+            guards.iter().filter(|guard| **guard == 76).count(),
+            1,
+            "exactly one `if revision <= 76` block"
+        );
+        assert_eq!(
             guards.iter().filter(|guard| **guard == 77).count(),
             1,
             "exactly one `if revision <= 77` block"
@@ -3690,9 +3794,9 @@ mod afk_backfill_tests {
     /// a TOP-LEVEL statement of `run_migrations`, a sibling of the 70 and 71
     /// blocks, never inside one of them. Nested inside the 71 block, a
     /// database already at 72 would skip the backfill forever, and every
-    /// other pin in this module would still pass. The revision-73, 74, 75 and
-    /// 77 guards carry the same trap one, two, three and four blocks later, so
-    /// each is pinned the same way against the block before it.
+    /// other pin in this module would still pass. The revision-73, 74, 75, 76
+    /// and 77 guards carry the same trap one to five blocks later, so each is
+    /// pinned the same way against the block before it.
     #[test]
     fn revision_72_to_77_guards_are_top_level_siblings_of_the_previous_block() {
         let depth_at = |at: usize| -> i64 {
@@ -3714,13 +3818,14 @@ mod afk_backfill_tests {
             );
             shipping().find(&needle).expect("the guard")
         };
-        let (at_70, at_71, at_72, at_73, at_74, at_75, at_77) = (
+        let (at_70, at_71, at_72, at_73, at_74, at_75, at_76, at_77) = (
             guard(70),
             guard(71),
             guard(72),
             guard(73),
             guard(74),
             guard(75),
+            guard(76),
             guard(77),
         );
 
@@ -3771,17 +3876,35 @@ mod afk_backfill_tests {
             "the revision 75 guard must come after the 74 block closes"
         );
 
-        // And on S2: nested inside the 75 block, the S2 indexes would never
-        // be built on a database already at 76 (S1 shipped).
+        // On the Prot ledger: nested inside the 75 block, the Prot
+        // collections would never be created on a database already at 76
+        // (S1 shipped). `prot_migration_tests` pins the same pair.
         let open_75 = at_75 + format!("if revision <= 75 {OPEN}").len() - 1;
         let block_75 = braced(shipping(), open_75);
+        assert!(
+            !block_75.contains("if revision <= 76"),
+            "the revision 76 guard must not be nested inside the 75 block"
+        );
+        assert!(
+            at_76 > open_75 + block_75.len(),
+            "the revision 76 guard must come after the 75 block closes"
+        );
         assert!(
             !block_75.contains("if revision <= 77"),
             "the revision 77 guard must not be nested inside the 75 block"
         );
+
+        // And on S2: nested inside the 76 block, the S2 indexes would never
+        // be built on a database already at 77 (the Prot ledger shipped).
+        let open_76 = at_76 + format!("if revision <= 76 {OPEN}").len() - 1;
+        let block_76 = braced(shipping(), open_76);
         assert!(
-            at_77 > open_75 + block_75.len(),
-            "the revision 77 guard must come after the 75 block closes"
+            !block_76.contains("if revision <= 77"),
+            "the revision 77 guard must not be nested inside the 76 block"
+        );
+        assert!(
+            at_77 > open_76 + block_76.len(),
+            "the revision 77 guard must come after the 76 block closes"
         );
 
         let body = shipping()
@@ -3797,12 +3920,14 @@ mod afk_backfill_tests {
                 depth_at(at_73),
                 depth_at(at_74),
                 depth_at(at_75),
+                depth_at(at_76),
                 depth_at(at_77)
             ),
             (
-                top_level, top_level, top_level, top_level, top_level, top_level, top_level
+                top_level, top_level, top_level, top_level, top_level, top_level, top_level,
+                top_level
             ),
-            "the 70, 71, 72, 73, 74, 75 and 77 guards must all sit at the top level of run_migrations"
+            "the 70, 71, 72, 73, 74, 75, 76 and 77 guards must all sit at the top level of run_migrations"
         );
     }
 
@@ -4432,9 +4557,12 @@ mod tests {
                 .await
                 .expect("insert servers");
 
-            // Revisions 74, 75 and 77 run after it (they touch no server); the
+            // Revisions 74 to 77 run after it (they touch no server); the
             // return is LATEST_REVISION.
-            assert_eq!(super::run_migrations(&mongo, 73).await, 78);
+            assert_eq!(
+                super::run_migrations(&mongo, 73).await,
+                super::LATEST_REVISION
+            );
 
             let fetch = |id: String| {
                 let servers = servers.clone();
@@ -4491,7 +4619,10 @@ mod tests {
             );
 
             // Re-running is a no-op.
-            assert_eq!(super::run_migrations(&mongo, 73).await, 78);
+            assert_eq!(
+                super::run_migrations(&mongo, 73).await,
+                super::LATEST_REVISION
+            );
             for want in &expected {
                 let id = want.get_str("_id").expect("_id");
                 assert_eq!(
@@ -4562,8 +4693,15 @@ mod tests {
                 .await
                 .expect("insert a claimed number");
 
-            assert_eq!(super::run_migrations(&mongo, 74).await, 78);
-            assert_eq!(super::run_migrations(&mongo, 74).await, 78, "a re-run");
+            assert_eq!(
+                super::run_migrations(&mongo, 74).await,
+                super::LATEST_REVISION
+            );
+            assert_eq!(
+                super::run_migrations(&mongo, 74).await,
+                super::LATEST_REVISION,
+                "a re-run"
+            );
 
             assert_eq!(numbers.count_documents(doc! {}).await.expect("count"), 1000);
             assert_eq!(
@@ -4703,7 +4841,8 @@ mod tests {
     /// with a message naming the trap and the fix (reset to 72), and the
     /// protected-channels revision does not run. The same database WITH the
     /// collection (upstream's own revision 74) migrates to the latest.
-    /// Control: the check removed (the first run returns 78).
+    /// Control: the check removed (the first run returns the latest
+    /// revision).
     #[tokio::test]
     async fn revision_74_without_the_audit_log_is_refused_as_the_dev_database_trap() {
         use futures::FutureExt;
@@ -4764,7 +4903,7 @@ mod tests {
                 .expect("create server_audit_log");
             assert_eq!(
                 super::run_migrations(&mongo, 74).await,
-                78,
+                super::LATEST_REVISION,
                 "upstream's revision 74 (with server_audit_log) migrates"
             );
         }
@@ -5210,6 +5349,154 @@ mod tests {
                     .await
                     .unwrap_or_else(|error| panic!("{why} must insert: {error:?}"));
             }
+        }
+
+        db.drop_database().await;
+        guard.disarm();
+    }
+
+    /// Revision 76 must create the Prot collections and every S5a index
+    /// with its exact name and spec, starting from a database at 75 (after
+    /// the protected-channels block), and be a no-op when
+    /// re-run over a populated ledger. Control: drop `"unique": true` from
+    /// `prot_ledger_key_unique` and the spec check fails; past it, the
+    /// second posting with one key would be accepted.
+    #[tokio::test]
+    async fn revision_76_creates_the_prot_indexes() {
+        // One index as listIndexes reports it: name, key fields in order,
+        // unique, partial filter.
+        type Spec = (String, Vec<(String, Bson)>, bool, Option<Document>);
+
+        // Every index of `collection`, sorted by name.
+        async fn specs(mongo: &crate::MongoDb, collection: &str) -> Vec<Spec> {
+            let reply = mongo
+                .db()
+                .run_command(doc! { "listIndexes": collection })
+                .await
+                .expect("listIndexes");
+            let mut specs: Vec<Spec> = reply
+                .get_document("cursor")
+                .and_then(|cursor| cursor.get_array("firstBatch"))
+                .expect("the first batch")
+                .iter()
+                .map(|index| {
+                    let index = index.as_document().expect("an index document");
+                    (
+                        index.get_str("name").expect("name").to_string(),
+                        index
+                            .get_document("key")
+                            .expect("key")
+                            .iter()
+                            .map(|(field, order)| (field.clone(), order.clone()))
+                            .collect(),
+                        index.get_bool("unique").unwrap_or(false),
+                        index.get_document("partialFilterExpression").ok().cloned(),
+                    )
+                })
+                .collect();
+            specs.sort_by(|a, b| a.0.cmp(&b.0));
+            specs
+        }
+
+        fn spec(name: &str, key: &[(&str, i32)], unique: bool, partial: Option<Document>) -> Spec {
+            (
+                name.to_string(),
+                key.iter()
+                    .map(|(field, order)| (field.to_string(), Bson::Int32(*order)))
+                    .collect(),
+                unique,
+                partial,
+            )
+        }
+
+        // Named by hand for the same 63-character reason as revision 70's.
+        let db = crate::DatabaseInfo::Test("migration_rev76_prot".to_string())
+            .connect()
+            .await
+            .expect("Database connection failed.");
+        db.drop_database().await;
+        let guard = crate::test_teardown::TestDatabaseGuard::arm(&db).await;
+
+        {
+            #[allow(irrefutable_let_patterns)]
+            let Database::MongoDb(mongo) = db.clone() else {
+                // The migration scripts are MongoDB-only.
+                db.drop_database().await;
+                guard.disarm();
+                return;
+            };
+
+            assert_eq!(
+                super::run_migrations(&mongo, 75).await,
+                super::LATEST_REVISION
+            );
+
+            let want_ledger = vec![
+                spec("_id_", &[("_id", 1)], false, None),
+                spec(
+                    "prot_ledger_credit_id",
+                    &[("credit", 1), ("_id", -1)],
+                    false,
+                    None,
+                ),
+                spec(
+                    "prot_ledger_credit_kind_created",
+                    &[("credit", 1), ("kind", 1), ("created_at", 1)],
+                    false,
+                    None,
+                ),
+                spec(
+                    "prot_ledger_debit_id",
+                    &[("debit", 1), ("_id", -1)],
+                    false,
+                    None,
+                ),
+                spec("prot_ledger_key_unique", &[("key", 1)], true, None),
+                spec(
+                    "prot_ledger_membership",
+                    &[("ref.membership_order_id", 1)],
+                    false,
+                    Some(doc! { "ref.membership_order_id": { "$type": "string" } }),
+                ),
+                spec(
+                    "prot_ledger_order",
+                    &[("ref.order_id", 1)],
+                    false,
+                    Some(doc! { "ref.order_id": { "$type": "string" } }),
+                ),
+            ];
+            let want_accounts = vec![spec("_id_", &[("_id", 1)], false, None)];
+
+            assert_eq!(specs(&mongo, "prot_ledger").await, want_ledger);
+            assert_eq!(specs(&mongo, "prot_accounts").await, want_accounts);
+
+            // The unique key is what stops one posting from landing twice.
+            let ledger = mongo.col::<Document>("prot_ledger");
+            ledger
+                .insert_many(vec![
+                    doc! { "_id": "R1", "key": "purchase:O1", "ref": { "order_id": "O1" } },
+                    doc! { "_id": "R2", "key": "purchase:O2" },
+                    doc! { "_id": "R3", "key": "adjust:A1" },
+                ])
+                .await
+                .expect("three postings with distinct keys, two without an order");
+            assert!(
+                ledger
+                    .insert_one(doc! { "_id": "R4", "key": "purchase:O1" })
+                    .await
+                    .is_err(),
+                "a second posting with one key"
+            );
+
+            // Re-running over a populated ledger changes nothing.
+            assert_eq!(
+                super::run_migrations(&mongo, 75).await,
+                super::LATEST_REVISION,
+                "a re-run"
+            );
+            assert_eq!(specs(&mongo, "prot_ledger").await, want_ledger);
+            assert_eq!(specs(&mongo, "prot_accounts").await, want_accounts);
+            assert_eq!(ledger.count_documents(doc! {}).await.expect("count"), 3);
         }
 
         db.drop_database().await;
@@ -5686,6 +5973,143 @@ mod payments_migration_tests {
                 rule.contains(needle),
                 "the rule must check {needle}: {rule}"
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod prot_migration_tests {
+    const SOURCE: &str = include_str!("scripts.rs");
+    const INIT: &str = include_str!("init.rs");
+    const OPEN: char = '\u{7b}';
+    const CLOSE: char = '\u{7d}';
+
+    /// Everything above the first test module: the shipping source.
+    fn shipping(source: &'static str) -> &'static str {
+        let end = source.find("#[cfg(test)]").unwrap_or(source.len());
+        &source[..end]
+    }
+
+    /// Text from the brace at `open` through its matching close.
+    fn braced(text: &str, open: usize) -> &str {
+        let mut depth = 0i64;
+        for (i, ch) in text[open..].char_indices() {
+            if ch == OPEN {
+                depth += 1;
+            } else if ch == CLOSE {
+                depth -= 1;
+                if depth == 0 {
+                    return &text[open..=open + i];
+                }
+            }
+        }
+        panic!("unbalanced braces from byte {open}");
+    }
+
+    /// Brace depth of the shipping source at byte `at`.
+    fn depth_at(at: usize) -> i64 {
+        shipping(SOURCE)[..at]
+            .chars()
+            .map(|ch| match ch {
+                OPEN => 1,
+                CLOSE => -1,
+                _ => 0,
+            })
+            .sum()
+    }
+
+    /// Where the one guard for `revision` starts, and its opening brace.
+    fn guard(revision: i32) -> (usize, usize) {
+        let needle = format!("if revision <= {revision} {OPEN}");
+        let text = shipping(SOURCE);
+        assert_eq!(text.matches(&needle).count(), 1, "exactly one `{needle}`");
+        let at = text.find(&needle).expect("the guard");
+        (at, at + needle.len() - 1)
+    }
+
+    /// The revision 76 guard carries the nesting trap the 72 to 74 guards
+    /// are pinned against: nested inside the 74 block, a database already
+    /// at 75 would skip the Prot collections forever. It names 74 and 76
+    /// only, so S1's revision 75 block can land between them without
+    /// touching this test.
+    #[test]
+    fn revision_76_guard_is_a_top_level_sibling_after_the_74_block() {
+        let text = shipping(SOURCE);
+        let (at_74, open_74) = guard(74);
+        let (at_76, _) = guard(76);
+
+        let block_74 = braced(text, open_74);
+        assert!(
+            !block_74.contains("if revision <= 76"),
+            "the revision 76 guard must not be nested inside the 74 block"
+        );
+        assert!(
+            at_76 > open_74 + block_74.len(),
+            "the revision 76 guard must come after the 74 block closes"
+        );
+
+        let body = text
+            .find("pub async fn run_migrations(")
+            .expect("run_migrations");
+        let body_open = body + text[body..].find(OPEN).expect("its body");
+        let top_level = depth_at(body_open) + 1;
+        assert_eq!(
+            (depth_at(at_74), depth_at(at_76)),
+            (top_level, top_level),
+            "the 74 and 76 guards must both sit at the top level of run_migrations"
+        );
+    }
+
+    /// With the protected-channels block (revision 75) landed, the 76 guard
+    /// is also pinned against it: nested inside the 75 block, a database
+    /// already at 76 would never create the Prot collections.
+    #[test]
+    fn revision_76_guard_comes_after_the_75_block() {
+        let text = shipping(SOURCE);
+        let (_, open_75) = guard(75);
+        let (at_76, _) = guard(76);
+
+        let block_75 = braced(text, open_75);
+        assert!(
+            !block_75.contains("if revision <= 76"),
+            "the revision 76 guard must not be nested inside the 75 block"
+        );
+        assert!(
+            at_76 > open_75 + block_75.len(),
+            "the revision 76 guard must come after the 75 block closes"
+        );
+    }
+
+    /// Same contract as revision 74: the block creates the collections and
+    /// indexes through the shared helpers, and a failure panics so delta
+    /// never serves the ledger without its unique key.
+    #[test]
+    fn the_prot_block_runs_the_shared_helpers() {
+        let (_, open) = guard(76);
+        let block = braced(shipping(SOURCE), open);
+        for needle in [
+            "in PROT_COLLECTIONS",
+            "create_prot_indexes(&db.db())",
+            ".expect(\"Failed to create Prot indexes.\")",
+        ] {
+            assert!(
+                block.contains(needle),
+                "the revision 76 block must contain {needle}"
+            );
+        }
+    }
+
+    /// Fresh databases skip the migrations, so init.rs must build the same
+    /// Prot schema through the same helpers.
+    #[test]
+    fn init_builds_the_prot_schema_through_the_shared_helpers() {
+        let init = shipping(INIT);
+        for needle in [
+            "in PROT_COLLECTIONS",
+            "create_prot_indexes(&db)",
+            ".expect(\"Failed to create Prot indexes.\")",
+        ] {
+            assert!(init.contains(needle), "init.rs must contain {needle}");
         }
     }
 }

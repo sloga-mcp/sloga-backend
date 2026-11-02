@@ -1055,6 +1055,15 @@ pub enum EventV1 {
         job_id: String,
         error: String,
     },
+
+    /// The session user's Prot wallet balance changed. Published ONLY on the
+    /// user's private topic; never on the User object other people see.
+    ProtBalanceUpdate {
+        balance: i64,
+        /// The wallet account's `version` as read after the posting (section 4.2 step 4);
+        /// clients drop an update whose version is <= the newest they hold
+        version: u64,
+    },
 }
 
 /// Redis topic that reaches exactly one session's bonfire connection
@@ -1335,6 +1344,37 @@ mod tests {
                 ..
             } => assert_eq!((generation, issued_at), (Some(3), Some(1_790_812_800_000))),
             other => panic!("round-tripped to another event: {other:?}"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod prot_tests {
+    use super::EventV1;
+
+    /// The client reads exactly `{ type, balance, version }` (stoat.js
+    /// `events/v1.ts`). A rename, or a variant moved under another tag,
+    /// still compiles here and silently stops the wallet updating.
+    #[test]
+    fn the_prot_balance_update_wire_shape_is_type_balance_version() {
+        let event = EventV1::ProtBalanceUpdate {
+            balance: -250,
+            version: 7,
+        };
+        assert_eq!(
+            serde_json::to_value(&event).expect("serializes"),
+            serde_json::json!({ "type": "ProtBalanceUpdate", "balance": -250, "version": 7 })
+        );
+
+        match serde_json::from_str::<EventV1>(
+            r#"{"type":"ProtBalanceUpdate","balance":1200,"version":3}"#,
+        )
+        .expect("deserializes")
+        {
+            EventV1::ProtBalanceUpdate { balance, version } => {
+                assert_eq!((balance, version), (1200, 3))
+            }
+            other => panic!("deserialized to another event: {other:?}"),
         }
     }
 }
