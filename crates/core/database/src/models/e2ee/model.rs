@@ -228,6 +228,12 @@ auto_derived!(
         pub key_package_ref: String,
         /// Join-intent signature
         pub signature: String,
+        /// Text join payload only (design §3.13): the signed generation
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub generation: Option<u32>,
+        /// Text join payload only (design §3.13): the signed issue time (ms)
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub issued_at: Option<i64>,
     }
 );
 
@@ -242,6 +248,8 @@ impl MlsEnvelopeRejoinIntent {
             device_id: intent.device_id.clone(),
             key_package_ref: intent.key_package_ref.clone(),
             signature: intent.signature.clone(),
+            generation: intent.generation,
+            issued_at: intent.issued_at,
         }
     }
 }

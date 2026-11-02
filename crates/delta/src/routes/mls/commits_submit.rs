@@ -2778,6 +2778,8 @@ mod tests {
                 device_id: setup.owner.device_id.clone(),
                 key_package_ref: intent.key_package_ref.clone(),
                 signature: intent.signature.clone(),
+                generation: None,
+                issued_at: None,
             }]
         );
     }

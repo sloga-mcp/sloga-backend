@@ -2496,8 +2496,8 @@ impl From<crate::MlsEnvelopeRejoinIntent> for MlsRejoinIntentInfo {
             device_id: value.device_id,
             key_package_ref: value.key_package_ref,
             signature: value.signature,
-            generation: None,
-            issued_at: None,
+            generation: value.generation,
+            issued_at: value.issued_at,
         }
     }
 }
@@ -2550,8 +2550,8 @@ impl crate::MlsJoinIntent {
             device_id: self.device_id,
             key_package_ref: self.key_package_ref,
             signature: self.signature,
-            generation: None,
-            issued_at: None,
+            generation: self.generation,
+            issued_at: self.issued_at,
         }
     }
 }
@@ -2597,8 +2597,32 @@ impl From<crate::MlsMemberAdded> for MlsMemberAddedInfo {
     }
 }
 
+impl From<crate::MlsPendingDeviceRemoval> for MlsPendingDeviceRemovalInfo {
+    fn from(value: crate::MlsPendingDeviceRemoval) -> Self {
+        MlsPendingDeviceRemovalInfo {
+            user_id: value.user_id,
+            device_id: value.device_id,
+            created_at: value.created_at,
+        }
+    }
+}
+
+impl From<crate::MlsSignerLost> for MlsSignerLostInfo {
+    fn from(value: crate::MlsSignerLost) -> Self {
+        MlsSignerLostInfo {
+            user_id: value.user_id,
+            device_id: value.device_id,
+            cause: value.cause.into(),
+            at: value.at,
+        }
+    }
+}
+
 impl crate::MlsGroup {
-    /// The text-group state response (protected channels design §7.2).
+    /// The text-group state response for an UNSEATED caller (protected
+    /// channels design §7.2, R24): `join_requests`,
+    /// `pending_device_removals` and `signer_lost` stay empty, so the body
+    /// is the S1 one whatever the row holds.
     /// `None` unless this is a Text group with a generation, so a Call group
     /// (or a corrupt Text row) can never be served as one.
     pub fn into_text_group_response(self) -> Option<ResponseTextGroup> {
@@ -2617,6 +2641,74 @@ impl crate::MlsGroup {
             join_requests: Vec::new(),
             pending_device_removals: Vec::new(),
             signer_lost: None,
+        })
+    }
+
+    /// The text-group state response for a SEATED caller (design §6.3
+    /// "Async Text join", §7.2): the unseated response plus
+    /// `join_requests`, `pending_device_removals` and `signer_lost`.
+    ///
+    /// The route decides that the caller is seated and passes the stored
+    /// intents of seated users that are still outstanding. Of those, only
+    /// intents of THIS group that are newer than their device's
+    /// `member_added.at` become `join_requests` (an older one is the intent
+    /// that Add consumed), with `rejoin` set when the device holds a leaf.
+    /// They are sorted by `created_at`, then device id, then user id.
+    ///
+    /// `signer_account_unavailable` is the route's read-time check of the
+    /// signer user's account flags (#222): it reports a stored `signer_lost`
+    /// with the cause `account_unavailable` and never creates one.
+    pub fn into_text_group_response_for_seated(
+        mut self,
+        intents: Vec<crate::MlsJoinIntent>,
+        signer_account_unavailable: bool,
+    ) -> Option<ResponseTextGroup> {
+        let mut join_requests: Vec<MlsJoinRequestInfo> = intents
+            .into_iter()
+            .filter(|intent| intent.group_id == self.id)
+            .filter(|intent| {
+                !self.member_added.iter().any(|added| {
+                    added.user_id == intent.user_id
+                        && added.device_id == intent.device_id
+                        && added.at >= intent.created_at
+                })
+            })
+            .map(|intent| MlsJoinRequestInfo {
+                rejoin: self.has_member(&intent.user_id, &intent.device_id),
+                user_id: intent.user_id,
+                device_id: intent.device_id,
+                generation: intent.generation,
+                key_package_ref: intent.key_package_ref,
+                signature: intent.signature,
+                issued_at: intent.issued_at,
+                created_at: intent.created_at,
+            })
+            .collect();
+        join_requests.sort_by(|a, b| {
+            a.created_at
+                .cmp(&b.created_at)
+                .then_with(|| a.device_id.cmp(&b.device_id))
+                .then_with(|| a.user_id.cmp(&b.user_id))
+        });
+
+        let pending_device_removals: Vec<MlsPendingDeviceRemovalInfo> =
+            std::mem::take(&mut self.pending_device_removals)
+                .into_iter()
+                .map(Into::into)
+                .collect();
+        let signer_lost = self.signer_lost.take().map(|lost| {
+            let mut info = MlsSignerLostInfo::from(lost);
+            if signer_account_unavailable {
+                info.cause = MlsSignerLostCause::AccountUnavailable;
+            }
+            info
+        });
+
+        Some(ResponseTextGroup {
+            join_requests,
+            pending_device_removals,
+            signer_lost,
+            ..self.into_text_group_response()?
         })
     }
 }
@@ -2676,6 +2768,24 @@ impl From<SignedHandover> for crate::SignedHandover {
     }
 }
 
+impl From<crate::SignedAuthority> for SignedAuthority {
+    fn from(value: crate::SignedAuthority) -> Self {
+        SignedAuthority {
+            body: value.body,
+            signature: value.signature,
+        }
+    }
+}
+
+impl From<SignedAuthority> for crate::SignedAuthority {
+    fn from(value: SignedAuthority) -> Self {
+        crate::SignedAuthority {
+            body: value.body,
+            signature: value.signature,
+        }
+    }
+}
+
 impl From<DataSeatList> for crate::SeatListSubmission {
     fn from(value: DataSeatList) -> Self {
         crate::SeatListSubmission {
@@ -2683,8 +2793,7 @@ impl From<DataSeatList> for crate::SeatListSubmission {
             signature: value.signature,
             signer_device_id: value.signer_device_id,
             handover: value.handover.map(Into::into),
-            // Placeholder: `value.authority` is wired in S2-W1-3
-            authority: None,
+            authority: value.authority.map(Into::into),
         }
     }
 }
@@ -2698,7 +2807,7 @@ impl From<crate::SeatList> for ChannelSeatListInfo {
             signer_user_id: value.signer_user_id,
             signer_device_id: value.signer_device_id,
             handovers: value.handovers.into_iter().map(Into::into).collect(),
-            authority: None,
+            authority: value.authority.map(Into::into),
         }
     }
 }
@@ -2725,13 +2834,26 @@ impl crate::ChannelSeat {
         }
     }
 
-    /// A cooling seat entry; `None` for a seat that was never released
+    /// A cooling seat entry; `None` for a seat that was never released.
+    /// `cause` is left unset: it is for the server owner only (design
+    /// §7.2), so only [`Self::into_owner_cooling_info`] carries it.
     pub fn into_cooling_info(self) -> Option<ChannelSeatCoolingInfo> {
         Some(ChannelSeatCoolingInfo {
             user_id: self.user_id,
             released_at: self.released_at?,
             cooldown_until: self.cooldown_until?,
             cause: None,
+        })
+    }
+
+    /// A cooling seat entry for the server owner: [`Self::into_cooling_info`]
+    /// with `cause` from the stored `release_cause` (absent on a row
+    /// released before S2)
+    pub fn into_owner_cooling_info(self) -> Option<ChannelSeatCoolingInfo> {
+        let cause = self.release_cause.map(Into::into);
+        Some(ChannelSeatCoolingInfo {
+            cause,
+            ..self.into_cooling_info()?
         })
     }
 }
@@ -2988,5 +3110,814 @@ mod protected_channel_bridge_tests {
         assert_eq!(entitlement.device_cap, Some(3));
         assert_eq!(entitlement.state, v0::ChannelEntitlementState::Active);
         assert_eq!(entitlement.granted_by, "01JA00000000000000000ADMIN0");
+    }
+
+    // --- S2-W1-3: join-intent carriers, text group, seat list ----------------
+
+    const CHANNEL: &str = "01JA0000000000000000CHANNEL";
+    const USER_A: &str = "01JA00000000000000000USERA";
+    const USER_B: &str = "01JA00000000000000000USERB";
+    const USER_C: &str = "01JA00000000000000000USERC";
+    const USER_D: &str = "01JA00000000000000000USERD";
+    const JOIN_ISSUED_AT: i64 = 1_790_812_870_000;
+
+    fn group_id() -> String {
+        format!("{}1", "0".repeat(63))
+    }
+
+    fn ms(n: i64) -> Timestamp {
+        Timestamp::UNIX_EPOCH
+            .checked_add(iso8601_timestamp::Duration::milliseconds(n))
+            .unwrap()
+    }
+
+    /// A stored join intent; `text` gives it the 3.13 Text join fields
+    fn intent(
+        group_id: &str,
+        user_id: &str,
+        fill: &str,
+        created_ms: i64,
+        text: bool,
+    ) -> crate::MlsJoinIntent {
+        crate::MlsJoinIntent {
+            id: crate::MlsJoinIntent::composite_id(group_id, user_id, &fill.repeat(32)),
+            group_id: group_id.to_string(),
+            user_id: user_id.to_string(),
+            device_id: fill.repeat(32),
+            key_package_ref: "a3ByZWY".to_string(),
+            signature: "c2ln".to_string(),
+            created_at: ms(created_ms),
+            generation: text.then_some(2),
+            issued_at: text.then_some(JOIN_ISSUED_AT),
+        }
+    }
+
+    /// USER_B's S1 intent on every carrier, exactly as S1 serialized it
+    fn s1_intent_json() -> String {
+        format!(
+            r#"{{"group_id":"{}","channel_id":"{CHANNEL}","user_id":"{USER_B}","device_id":"{}","key_package_ref":"a3ByZWY","signature":"c2ln"}}"#,
+            group_id(),
+            "b".repeat(32)
+        )
+    }
+
+    /// The same intent with the Text join fields appended
+    fn text_intent_json() -> String {
+        format!(
+            r#"{{"group_id":"{}","channel_id":"{CHANNEL}","user_id":"{USER_B}","device_id":"{}","key_package_ref":"a3ByZWY","signature":"c2ln","generation":2,"issued_at":{JOIN_ISSUED_AT}}}"#,
+            group_id(),
+            "b".repeat(32)
+        )
+    }
+
+    /// 3.13 carrier: the stored intent's `into_rejoin_intent_info` (commit
+    /// fetch, `MlsCommitInfo.rejoin_intents`)
+    #[test]
+    fn commit_rejoin_intent_carries_the_text_join_fields() {
+        let s1 = intent(&group_id(), USER_B, "b", 0, false).into_rejoin_intent_info(CHANNEL);
+        assert_eq!(serde_json::to_string(&s1).unwrap(), s1_intent_json());
+
+        let text = intent(&group_id(), USER_B, "b", 0, true).into_rejoin_intent_info(CHANNEL);
+        assert_eq!(
+            (text.generation, text.issued_at),
+            (Some(2), Some(JOIN_ISSUED_AT))
+        );
+        let json = serde_json::to_string(&text).unwrap();
+        assert_eq!(json, text_intent_json());
+        assert_eq!(
+            serde_json::from_str::<v0::MlsRejoinIntentInfo>(&json).unwrap(),
+            text
+        );
+    }
+
+    /// The commit wire form fills its rejoin intents through that carrier
+    #[test]
+    fn commit_info_carries_the_text_join_fields() {
+        let commit = crate::MlsCommit {
+            id: crate::MlsCommit::composite_id(&group_id(), 8),
+            group_id: group_id(),
+            epoch: 8,
+            committer: device(USER_A, "a"),
+            commit: "Y29tbWl0".to_string(),
+            size: 6,
+            added: vec![],
+            removed: vec![device(USER_B, "b")],
+            created_at: Timestamp::UNIX_EPOCH,
+            rejoin_intents: vec![intent(&group_id(), USER_B, "b", 0, true)],
+            removed_reasons: vec![],
+            welcome: None,
+        };
+        let info = commit.into_commit_info(CHANNEL);
+        assert_eq!(
+            serde_json::to_string(&info.rejoin_intents[0]).unwrap(),
+            text_intent_json()
+        );
+    }
+
+    /// 3.13 carrier: the queued envelope's `MlsEnvelopeRejoinIntent`, as
+    /// stored (JSON and BSON) and as delivered (`MlsRejoinIntentInfo`)
+    #[test]
+    fn envelope_rejoin_intent_carries_the_text_join_fields() {
+        let s1 = crate::MlsEnvelopeRejoinIntent::from_join_intent(
+            &intent(&group_id(), USER_B, "b", 0, false),
+            CHANNEL,
+        );
+        assert_eq!(serde_json::to_string(&s1).unwrap(), s1_intent_json());
+        let document = bson::to_document(&s1).unwrap();
+        let keys: Vec<&str> = document.keys().map(String::as_str).collect();
+        assert_eq!(
+            keys,
+            [
+                "group_id",
+                "channel_id",
+                "user_id",
+                "device_id",
+                "key_package_ref",
+                "signature"
+            ]
+        );
+        assert_eq!(
+            serde_json::to_string(&v0::MlsRejoinIntentInfo::from(s1)).unwrap(),
+            s1_intent_json()
+        );
+
+        let text = crate::MlsEnvelopeRejoinIntent::from_join_intent(
+            &intent(&group_id(), USER_B, "b", 0, true),
+            CHANNEL,
+        );
+        assert_eq!(
+            (text.generation, text.issued_at),
+            (Some(2), Some(JOIN_ISSUED_AT))
+        );
+        assert_eq!(serde_json::to_string(&text).unwrap(), text_intent_json());
+        let document = bson::to_document(&text).unwrap();
+        assert_eq!(
+            bson::from_document::<crate::MlsEnvelopeRejoinIntent>(document).unwrap(),
+            text
+        );
+        assert_eq!(
+            serde_json::from_str::<crate::MlsEnvelopeRejoinIntent>(&s1_intent_json()).unwrap(),
+            crate::MlsEnvelopeRejoinIntent {
+                generation: None,
+                issued_at: None,
+                ..text.clone()
+            }
+        );
+    }
+
+    /// The delivered form of a Text envelope intent keeps both fields
+    #[test]
+    fn delivered_envelope_intent_carries_the_text_join_fields() {
+        let text = crate::MlsEnvelopeRejoinIntent::from_join_intent(
+            &intent(&group_id(), USER_B, "b", 0, true),
+            CHANNEL,
+        );
+        let delivered = v0::MlsRejoinIntentInfo::from(text);
+        assert_eq!(
+            (delivered.generation, delivered.issued_at),
+            (Some(2), Some(JOIN_ISSUED_AT))
+        );
+        assert_eq!(
+            serde_json::to_string(&delivered).unwrap(),
+            text_intent_json()
+        );
+    }
+
+    /// The `text_group()` fixture's response exactly as S1 served it
+    fn s1_text_group_json() -> String {
+        format!(
+            r#"{{"group_id":"{}","channel_id":"{CHANNEL}","generation":2,"current_epoch":7,"members":[{{"user_id":"{USER_A}","device_id":"{a}"}}],"pending_removals":[{{"user_id":"{USER_B}","created_at":"1970-01-01T00:00:00.000Z"}}],"member_added":[{{"user_id":"{USER_A}","device_id":"{a}","epoch":5,"at":"1970-01-01T00:00:00.000Z"}}]}}"#,
+            group_id(),
+            a = "a".repeat(32)
+        )
+    }
+
+    /// `text_group()` carrying every S2 server list
+    fn s2_text_group() -> crate::MlsGroup {
+        crate::MlsGroup {
+            pending_device_removals: vec![crate::MlsPendingDeviceRemoval {
+                user_id: USER_C.to_string(),
+                device_id: "c".repeat(32),
+                created_at: ms(3),
+            }],
+            signer_lost: Some(crate::MlsSignerLost {
+                user_id: USER_A.to_string(),
+                device_id: "e".repeat(32),
+                cause: crate::MlsSignerLostCause::DeviceRevoked,
+                at: ms(4),
+            }),
+            rejoin_readd: vec![crate::MlsRejoinReadd {
+                user_id: USER_B.to_string(),
+                device_id: "b".repeat(32),
+                at: ms(5),
+            }],
+            ..text_group()
+        }
+    }
+
+    /// R24, #222: the unseated response is the S1 body byte-for-byte, even
+    /// over a row holding every S2 list
+    #[test]
+    fn unseated_text_group_is_the_s1_body() {
+        assert_eq!(
+            serde_json::to_string(&text_group().into_text_group_response().unwrap()).unwrap(),
+            s1_text_group_json()
+        );
+        assert_eq!(
+            serde_json::to_string(&s2_text_group().into_text_group_response().unwrap()).unwrap(),
+            s1_text_group_json()
+        );
+        // A seated caller of a group with nothing pending gets it too
+        assert_eq!(
+            serde_json::to_string(
+                &text_group()
+                    .into_text_group_response_for_seated(vec![], true)
+                    .unwrap()
+            )
+            .unwrap(),
+            s1_text_group_json()
+        );
+    }
+
+    /// The seated response serves the pending device removals and the
+    /// stored `signer_lost` cause
+    #[test]
+    fn seated_text_group_carries_the_s2_lists() {
+        let response = s2_text_group()
+            .into_text_group_response_for_seated(vec![], false)
+            .unwrap();
+        assert_eq!(
+            response.pending_device_removals,
+            vec![v0::MlsPendingDeviceRemovalInfo {
+                user_id: USER_C.to_string(),
+                device_id: "c".repeat(32),
+                created_at: ms(3),
+            }]
+        );
+        assert_eq!(
+            response.signer_lost,
+            Some(v0::MlsSignerLostInfo {
+                user_id: USER_A.to_string(),
+                device_id: "e".repeat(32),
+                cause: v0::MlsSignerLostCause::DeviceRevoked,
+                at: ms(4),
+            })
+        );
+        let value = serde_json::to_value(&response).unwrap();
+        assert_eq!(
+            value["pending_device_removals"],
+            serde_json::json!([{
+                "user_id": USER_C,
+                "device_id": "c".repeat(32),
+                "created_at": "1970-01-01T00:00:00.003Z",
+            }])
+        );
+        assert_eq!(
+            value["signer_lost"],
+            serde_json::json!({
+                "user_id": USER_A,
+                "device_id": "e".repeat(32),
+                "cause": "device_revoked",
+                "at": "1970-01-01T00:00:00.004Z",
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<v0::ResponseTextGroup>(value).unwrap(),
+            response
+        );
+
+        // Everything else is the unseated response
+        assert_eq!(
+            v0::ResponseTextGroup {
+                join_requests: vec![],
+                pending_device_removals: vec![],
+                signer_lost: None,
+                ..response
+            },
+            s2_text_group().into_text_group_response().unwrap()
+        );
+    }
+
+    /// #222: `account_unavailable` is derived at read time from the
+    /// route's flag; it relabels a stored `signer_lost` and never makes one
+    #[test]
+    fn signer_account_unavailable_relabels_the_stored_cause() {
+        let response = s2_text_group()
+            .into_text_group_response_for_seated(vec![], true)
+            .unwrap();
+        let lost = response.signer_lost.expect("the stored signer_lost");
+        assert_eq!(lost.cause, v0::MlsSignerLostCause::AccountUnavailable);
+        assert_eq!(
+            (lost.user_id.as_str(), lost.device_id, lost.at),
+            (USER_A, "e".repeat(32), ms(4))
+        );
+        assert_eq!(
+            serde_json::to_value(lost.cause).unwrap(),
+            serde_json::json!("account_unavailable")
+        );
+
+        let none = text_group()
+            .into_text_group_response_for_seated(vec![], true)
+            .unwrap();
+        assert_eq!(none.signer_lost, None);
+    }
+
+    /// #203: join requests come only from THIS group's intents; another
+    /// group's intent is never served
+    #[test]
+    fn join_requests_never_carry_another_groups_intent() {
+        let other = format!("{}2", "0".repeat(63));
+        let response = text_group()
+            .into_text_group_response_for_seated(
+                vec![
+                    intent(&other, USER_C, "c", 30, true),
+                    intent(&group_id(), USER_B, "b", 20, true),
+                    intent(&other, USER_D, "d", 10, false),
+                ],
+                false,
+            )
+            .unwrap();
+        let devices: Vec<&str> = response
+            .join_requests
+            .iter()
+            .map(|request| request.device_id.as_str())
+            .collect();
+        assert_eq!(devices, ["b".repeat(32)]);
+    }
+
+    /// Join requests: every signed field copied, `rejoin` = holds a leaf,
+    /// sorted by `created_at`, then device id
+    #[test]
+    fn join_requests_copy_the_intent_and_sort() {
+        let response = text_group()
+            .into_text_group_response_for_seated(
+                vec![
+                    intent(&group_id(), USER_B, "b", 20, true),
+                    intent(&group_id(), USER_D, "9", 20, false),
+                    // USER_A's member device, after its Add at t = 0
+                    intent(&group_id(), USER_A, "a", 10, true),
+                ],
+                false,
+            )
+            .unwrap();
+        assert_eq!(
+            response.join_requests,
+            vec![
+                v0::MlsJoinRequestInfo {
+                    user_id: USER_A.to_string(),
+                    device_id: "a".repeat(32),
+                    generation: Some(2),
+                    key_package_ref: "a3ByZWY".to_string(),
+                    signature: "c2ln".to_string(),
+                    issued_at: Some(JOIN_ISSUED_AT),
+                    created_at: ms(10),
+                    rejoin: true,
+                },
+                v0::MlsJoinRequestInfo {
+                    user_id: USER_D.to_string(),
+                    device_id: "9".repeat(32),
+                    generation: None,
+                    key_package_ref: "a3ByZWY".to_string(),
+                    signature: "c2ln".to_string(),
+                    issued_at: None,
+                    created_at: ms(20),
+                    rejoin: false,
+                },
+                v0::MlsJoinRequestInfo {
+                    user_id: USER_B.to_string(),
+                    device_id: "b".repeat(32),
+                    generation: Some(2),
+                    key_package_ref: "a3ByZWY".to_string(),
+                    signature: "c2ln".to_string(),
+                    issued_at: Some(JOIN_ISSUED_AT),
+                    created_at: ms(20),
+                    rejoin: false,
+                },
+            ]
+        );
+
+        // Exact rows: an S1 intent omits the Text join fields
+        let value = serde_json::to_value(&response).unwrap();
+        assert_eq!(
+            value["join_requests"][0],
+            serde_json::json!({
+                "user_id": USER_A,
+                "device_id": "a".repeat(32),
+                "generation": 2,
+                "key_package_ref": "a3ByZWY",
+                "signature": "c2ln",
+                "issued_at": JOIN_ISSUED_AT,
+                "created_at": "1970-01-01T00:00:00.010Z",
+                "rejoin": true,
+            })
+        );
+        assert_eq!(
+            value["join_requests"][1],
+            serde_json::json!({
+                "user_id": USER_D,
+                "device_id": "9".repeat(32),
+                "key_package_ref": "a3ByZWY",
+                "signature": "c2ln",
+                "created_at": "1970-01-01T00:00:00.020Z",
+                "rejoin": false,
+            })
+        );
+    }
+
+    /// 6.3: an intent no newer than its device's `member_added.at` is the
+    /// one that Add consumed and is not a join request
+    #[test]
+    fn join_requests_skip_intents_the_latest_add_consumed() {
+        let group = crate::MlsGroup {
+            member_added: vec![crate::MlsMemberAdded {
+                user_id: USER_A.to_string(),
+                device_id: "a".repeat(32),
+                epoch: 5,
+                at: ms(10),
+            }],
+            ..text_group()
+        };
+        for (created, served) in [(9, false), (10, false), (11, true)] {
+            let response = group
+                .clone()
+                .into_text_group_response_for_seated(
+                    vec![intent(&group_id(), USER_A, "a", created, true)],
+                    false,
+                )
+                .unwrap();
+            assert_eq!(
+                response.join_requests.len(),
+                usize::from(served),
+                "{created}"
+            );
+        }
+    }
+
+    /// Only a Text group with a generation is served to a seated caller
+    #[test]
+    fn seated_response_is_none_for_a_call_or_corrupt_group() {
+        let intents = || vec![intent(&group_id(), USER_B, "b", 20, true)];
+        let call = crate::MlsGroup {
+            kind: crate::MlsGroupKind::Call,
+            ..s2_text_group()
+        };
+        assert_eq!(
+            call.into_text_group_response_for_seated(intents(), true),
+            None
+        );
+        let corrupt = crate::MlsGroup {
+            generation: None,
+            ..s2_text_group()
+        };
+        assert_eq!(
+            corrupt.into_text_group_response_for_seated(intents(), true),
+            None
+        );
+    }
+
+    fn signed_authority() -> crate::SignedAuthority {
+        crate::SignedAuthority {
+            body: "sloga-channel-authority-v1\nv:1".to_string(),
+            signature: "YXV0aA".to_string(),
+        }
+    }
+
+    /// `SignedAuthority` both ways, and the submitted authority reaches the
+    /// `SeatListSubmission` the drivers write
+    #[test]
+    fn seat_list_authority_is_carried_both_ways() {
+        let wire: v0::SignedAuthority = signed_authority().into();
+        assert_eq!(
+            wire,
+            v0::SignedAuthority {
+                body: "sloga-channel-authority-v1\nv:1".to_string(),
+                signature: "YXV0aA".to_string(),
+            }
+        );
+        assert_eq!(
+            crate::SignedAuthority::from(wire.clone()),
+            signed_authority()
+        );
+
+        let submission: crate::SeatListSubmission = v0::DataSeatList {
+            body: "body".to_string(),
+            signature: "c2ln".to_string(),
+            signer_device_id: "a".repeat(32),
+            handover: None,
+            authority: Some(wire.clone()),
+        }
+        .into();
+        assert_eq!(submission.authority, Some(signed_authority()));
+
+        let stored = crate::SeatList {
+            id: CHANNEL.to_string(),
+            version: 2,
+            body: "body".to_string(),
+            signer_user_id: USER_A.to_string(),
+            signer_device_id: "a".repeat(32),
+            signature: "c2ln".to_string(),
+            handovers: vec![],
+            updated_at: Timestamp::UNIX_EPOCH,
+            authority: Some(signed_authority()),
+        };
+        let list: v0::ChannelSeatListInfo = stored.clone().into();
+        assert_eq!(list.authority, Some(wire));
+
+        // An S1 row serves no `authority` key
+        let s1: v0::ChannelSeatListInfo = crate::SeatList {
+            authority: None,
+            ..stored
+        }
+        .into();
+        assert!(serde_json::to_value(&s1)
+            .unwrap()
+            .get("authority")
+            .is_none());
+    }
+
+    /// `cause` is the owner's only: the default cooling entry never carries
+    /// it, the owner's carries the stored `release_cause`
+    #[test]
+    fn cooling_cause_is_only_on_the_owner_entry() {
+        let released = crate::ChannelSeat {
+            id: crate::ChannelSeat::composite_id(CHANNEL, USER_B),
+            channel_id: CHANNEL.to_string(),
+            user_id: USER_B.to_string(),
+            seated_at: Timestamp::UNIX_EPOCH,
+            released_at: Some(ms(1)),
+            cooldown_until: Some(ms(2)),
+            release_cause: Some(crate::SeatReleaseCause::AccessLost),
+            keys_received_at: Some(ms(0)),
+        };
+
+        let viewer = released.clone().into_cooling_info().unwrap();
+        assert_eq!(viewer.cause, None);
+        assert!(serde_json::to_value(&viewer)
+            .unwrap()
+            .get("cause")
+            .is_none());
+
+        let owner = released.clone().into_owner_cooling_info().unwrap();
+        assert_eq!(owner.cause, Some(v0::SeatReleaseCauseInfo::AccessLost));
+        assert_eq!(
+            serde_json::to_value(&owner).unwrap()["cause"],
+            serde_json::json!("access_lost")
+        );
+        assert_eq!(
+            v0::ChannelSeatCoolingInfo {
+                cause: None,
+                ..owner
+            },
+            viewer
+        );
+
+        // A row released before S2 has no cause; a seat never released has
+        // no cooling entry at all
+        let pre_s2 = crate::ChannelSeat {
+            release_cause: None,
+            ..released.clone()
+        };
+        assert_eq!(pre_s2.into_owner_cooling_info().unwrap().cause, None);
+        let active = crate::ChannelSeat {
+            released_at: None,
+            cooldown_until: None,
+            ..released
+        };
+        assert_eq!(active.into_owner_cooling_info(), None);
+    }
+}
+
+/// 🔴 S2-W1-3: an authority submitted on the v0 `DataSeatList` is converted
+/// by the bridge and stored by the seat PUT byte-identical, on both drivers
+/// (never run without `TEST_DB`: that is production)
+#[cfg(test)]
+mod seat_list_authority_driver_tests {
+    use std::collections::HashMap;
+
+    use base64::{engine::general_purpose::STANDARD_NO_PAD, Engine as _};
+    use iso8601_timestamp::Timestamp;
+    use revolt_models::v0;
+
+    // Section 5.1 inputs (as in `protected_channels/tests.rs`)
+    const CHANNEL: &str = "01J9Z3K4M5N6P7Q8R9S0T1V2W3";
+    const SERVER: &str = "01HZXSERVERSERVERSERVERSER";
+    const USER_A: &str = "01HZXAAAAAAAAAAAAAAAAAAAAA";
+    const DEVICE_A: &str = "00112233445566778899aabbccddeeff";
+    const OWNER_IDENTITY_KEY: &str = "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg";
+    const GROUP_SALT: &str = "a0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebf";
+    const ISSUED_AT: i64 = 1_790_812_800_000;
+
+    /// A canonical unpadded b64 encoding of 64 bytes (the database layer
+    /// checks only the encoding; the route verifies signatures)
+    fn signature(fill: u8) -> String {
+        STANDARD_NO_PAD.encode([fill; 64])
+    }
+
+    /// Authority `version` over owner device A, chained to `prev`
+    fn authority(version: i64, prev: Option<&v0::SignedAuthority>) -> v0::SignedAuthority {
+        let body = crate::ChannelAuthority::build(&crate::ChannelAuthorityBody {
+            channel_id: CHANNEL.to_string(),
+            version,
+            owner_user_id: USER_A.to_string(),
+            signer_device_id: DEVICE_A.to_string(),
+            issued_at: ISSUED_AT + version,
+            owner_devices: vec![crate::AuthorityOwnerDevice {
+                device_id: DEVICE_A.to_string(),
+                identity_key: OWNER_IDENTITY_KEY.to_string(),
+            }],
+            delegates: vec![],
+            delegate_max_device_cap: 0,
+            successors: vec![],
+            prev: prev.map(|prev| crate::ChannelAuthority::sha256(&prev.body)),
+        })
+        .unwrap();
+        v0::SignedAuthority {
+            body,
+            signature: signature(0x80 + version as u8),
+        }
+    }
+
+    /// A list seating A, signed by A's device; `v2` picks the body format
+    fn seat_list(
+        version: i64,
+        v2: bool,
+        authority: Option<v0::SignedAuthority>,
+    ) -> v0::DataSeatList {
+        let lines = crate::SeatListV2Lines {
+            authority_sha256: authority
+                .as_ref()
+                .map(|authority| crate::ChannelAuthority::sha256(&authority.body)),
+            history: crate::SeatListHistory::Visible,
+            history_boundary: None,
+            pre_history: crate::SeatListPreHistory::Kept,
+            group_salt: GROUP_SALT.to_string(),
+        };
+        let body = crate::SeatListBody {
+            channel_id: CHANNEL.to_string(),
+            version,
+            device_cap: 5,
+            issued_at: ISSUED_AT,
+            signer_user_id: USER_A.to_string(),
+            signer_device_id: DEVICE_A.to_string(),
+            seats: vec![USER_A.to_string()],
+            v2: v2.then_some(lines),
+        }
+        .build()
+        .unwrap();
+        v0::DataSeatList {
+            body,
+            signature: signature(version as u8),
+            signer_device_id: DEVICE_A.to_string(),
+            handover: None,
+            authority,
+        }
+    }
+
+    async fn setup(db: &crate::Database) {
+        let server: crate::Server = serde_json::from_value(serde_json::json!({
+            "_id": SERVER,
+            "owner": USER_A,
+            "name": "protected",
+            "channels": [],
+            "default_permissions": 0,
+        }))
+        .unwrap();
+        db.insert_server(&server).await.unwrap();
+        db.insert_or_merge_member(&crate::Member {
+            id: crate::MemberCompositeKey {
+                server: SERVER.to_string(),
+                user: USER_A.to_string(),
+            },
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        db.insert_channel(&crate::Channel::TextChannel {
+            id: CHANNEL.to_string(),
+            server: SERVER.to_string(),
+            name: "protected".to_string(),
+            description: None,
+            icon: None,
+            last_message_id: None,
+            default_permissions: None,
+            role_permissions: HashMap::new(),
+            nsfw: false,
+            spoiler: false,
+            voice: None,
+            slowmode: None,
+            announcement: None,
+            protected: false,
+        })
+        .await
+        .unwrap();
+        db.upsert_channel_entitlement(
+            &crate::ChannelEntitlement {
+                id: ulid::Ulid::new().to_string(),
+                channel_id: CHANNEL.to_string(),
+                server_id: SERVER.to_string(),
+                source: crate::ChannelEntitlementSource::AdminGrant,
+                slot_cap: 10,
+                device_cap: None,
+                state: crate::ChannelEntitlementState::Active,
+                granted_by: "admin".to_string(),
+                created_at: Timestamp::now_utc(),
+            },
+            Timestamp::now_utc(),
+        )
+        .await
+        .unwrap();
+    }
+
+    /// Test-only overwrite of the stored genesis with its v2 form: with the
+    /// test config's `formats_v2` off, no driver path enters v2
+    async fn store_v2_genesis(db: &crate::Database) {
+        let genesis = seat_list(1, true, None);
+        let row = crate::SeatList {
+            id: CHANNEL.to_string(),
+            version: 1,
+            body: genesis.body,
+            signer_user_id: USER_A.to_string(),
+            signer_device_id: DEVICE_A.to_string(),
+            signature: genesis.signature,
+            handovers: vec![],
+            updated_at: Timestamp::now_utc(),
+            authority: None,
+        };
+        match db {
+            crate::Database::Reference(reference) => {
+                reference
+                    .channel_seat_lists
+                    .lock()
+                    .await
+                    .insert(row.id.clone(), row);
+            }
+            #[cfg(feature = "mongodb")]
+            crate::Database::MongoDb(mongo) => {
+                let result = mongo
+                    .col::<crate::SeatList>("channel_seat_lists")
+                    .replace_one(doc! { "_id": CHANNEL }, &row)
+                    .await
+                    .unwrap();
+                assert_eq!(result.matched_count, 1);
+            }
+        }
+    }
+
+    async fn put(db: &crate::Database, list: v0::DataSeatList) -> crate::SeatList {
+        let submission: crate::SeatListSubmission = list.into();
+        db.put_seat_list(CHANNEL, &submission, true, Timestamp::now_utc())
+            .await
+            .unwrap();
+        db.fetch_seat_list(CHANNEL).await.unwrap().unwrap()
+    }
+
+    fn assert_stored(stored: &crate::SeatList, submitted: &v0::SignedAuthority) {
+        let authority = stored.authority.as_ref().expect("the stored authority");
+        assert_eq!(authority.body.as_bytes(), submitted.body.as_bytes());
+        assert_eq!(
+            authority.signature.as_bytes(),
+            submitted.signature.as_bytes()
+        );
+        let served: v0::ChannelSeatListInfo = stored.clone().into();
+        assert_eq!(served.authority.as_ref(), Some(submitted));
+    }
+
+    #[tokio::test]
+    async fn a_submitted_authority_is_stored_byte_identical() {
+        database_test!(|db| async move {
+            let formats_v2 = revolt_config::config()
+                .await
+                .features
+                .protected_channels
+                .formats_v2;
+            setup(&db).await;
+            let genesis: crate::SeatListSubmission = seat_list(1, formats_v2, None).into();
+            db.protect_channel(CHANNEL, &genesis, Timestamp::now_utc())
+                .await
+                .unwrap();
+            if !formats_v2 {
+                store_v2_genesis(&db).await;
+            }
+            assert_eq!(
+                db.fetch_seat_list(CHANNEL)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .authority,
+                None
+            );
+
+            // The first authority
+            let first = authority(1, None);
+            let stored = put(&db, seat_list(2, true, Some(first.clone()))).await;
+            assert_eq!(stored.version, 2);
+            assert_stored(&stored, &first);
+
+            // A changed authority (version + 1, `prev` = the stored one)
+            let second = authority(2, Some(&first));
+            let stored = put(&db, seat_list(3, true, Some(second.clone()))).await;
+            assert_eq!(stored.version, 3);
+            assert_stored(&stored, &second);
+        });
     }
 }
