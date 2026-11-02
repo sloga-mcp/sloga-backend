@@ -2817,3 +2817,255 @@ async fn root_advertises_split_support_case() {
         serde_json::json!({ "split_from": true })
     );
 }
+
+/// D4 + D5 (audit MAJOR-1): the split publication deletes the old device's
+/// live-claim lock when THIS session holds it, so the splitting session's
+/// acknowledgement gate falls back to the old row's binding, `""`, and is
+/// refused. A lock another session holds is left alone. Over the Redis the
+/// harness uses; the gate is the one bonfire applies
+/// (`e2ee_claim_lock::session_may_act`)
+#[test]
+fn split_releases_the_old_devices_claim_lock() {
+    crate::util::test::rt().block_on(split_releases_the_old_devices_claim_lock_case())
+}
+
+async fn split_releases_the_old_devices_claim_lock_case() {
+    use revolt_database::e2ee_claim_lock::{
+        acquire, holder, lock_key, lock_value, session_may_act, Acquire,
+    };
+
+    let harness = TestHarness::new().await;
+    let (account, session, user) = harness.new_user().await;
+    let twin = account
+        .create_session(&harness.db, "twin".to_string())
+        .await
+        .unwrap();
+    let third = account
+        .create_session(&harness.db, "third".to_string())
+        .await
+        .unwrap();
+    let ttl = std::time::Duration::from_secs(60);
+
+    let old = publish_device(&harness, &account.id, &session.token, 2).await;
+    let theirs = publish_device(&harness, &account.id, &twin.token, 2).await;
+    let old_key = lock_key(&user.id, &old.device_id);
+    let their_key = lock_key(&user.id, &theirs.device_id);
+    for (key, session_id) in [(&old_key, &session.id), (&their_key, &twin.id)] {
+        assert_eq!(
+            acquire(key, &lock_value(session_id, "c1"), session_id, ttl)
+                .await
+                .expect("redis"),
+            Acquire::Acquired
+        );
+    }
+
+    let binding = |device_id: String| {
+        let db = harness.db.clone();
+        let user_id = user.id.clone();
+        async move {
+            db.fetch_e2ee_identity(&user_id, &device_id)
+                .await
+                .ok()
+                .map(|row| row.last_session_id)
+        }
+    };
+    assert!(
+        session_may_act(holder(&old_key).await, &session.id, binding(old.device_id.clone())).await,
+        "the claiming session may ack before the split"
+    );
+
+    let new = TestDevice::new();
+    let (status, body) = put_keys(
+        &harness,
+        &account.id,
+        &session.token,
+        true,
+        &new.split_bundle(&old, &session.id),
+    )
+    .await;
+    assert_eq!(status, Status::Ok, "{body}");
+
+    assert_eq!(
+        holder(&old_key).await.expect("redis"),
+        None,
+        "the split left the old device's lock"
+    );
+    assert_eq!(binding(old.device_id.clone()).await.as_deref(), Some(""));
+    assert!(
+        !session_may_act(holder(&old_key).await, &session.id, binding(old.device_id.clone())).await,
+        "the splitting session may still ack for the old device"
+    );
+
+    // A split by another session from a device the twin holds: the twin's
+    // lock and binding stay
+    let other_new = TestDevice::new();
+    let (status, body) = put_keys(
+        &harness,
+        &account.id,
+        &third.token,
+        true,
+        &other_new.split_bundle(&theirs, &third.id),
+    )
+    .await;
+    assert_eq!(status, Status::Ok, "{body}");
+    assert_eq!(
+        holder(&their_key).await.expect("redis"),
+        Some(lock_value(&twin.id, "c1"))
+    );
+    assert_eq!(
+        binding(theirs.device_id.clone()).await.as_deref(),
+        Some(twin.id.as_str())
+    );
+}
+
+/// D5 (audit MINOR-5): `split_from` reaches the account's own devices only;
+/// a DM peer gets the same device-added event without it
+#[test]
+fn split_from_reaches_the_private_topic_only() {
+    crate::util::test::rt().block_on(split_from_reaches_the_private_topic_only_case())
+}
+
+async fn split_from_reaches_the_private_topic_only_case() {
+    use revolt_database::{events::client::EventV1, Channel};
+
+    let mut harness = TestHarness::new().await;
+    let (account, session, user) = harness.new_user().await;
+    let (_, _, peer) = harness.new_user().await;
+    let dm_id = ulid::Ulid::new().to_string();
+    harness
+        .db
+        .insert_channel(&Channel::DirectMessage {
+            id: dm_id.clone(),
+            active: true,
+            recipients: vec![user.id.clone(), peer.id.clone()],
+            last_message_id: None,
+        })
+        .await
+        .unwrap();
+
+    let old = publish_device(&harness, &account.id, &session.token, 2).await;
+    let new = TestDevice::new();
+    let (status, body) = put_keys(
+        &harness,
+        &account.id,
+        &session.token,
+        true,
+        &new.split_bundle(&old, &session.id),
+    )
+    .await;
+    assert_eq!(status, Status::Ok, "{body}");
+
+    let is_new = |event: &EventV1| {
+        matches!(
+            event,
+            EventV1::E2EEDeviceCreate { device_id, .. } if device_id == &new.device_id
+        )
+    };
+    for (topic, expected) in [
+        (format!("{}!", user.id), Some(old.device_id.clone())),
+        (dm_id.clone(), None),
+    ] {
+        match harness.wait_for_event(&topic, is_new).await {
+            EventV1::E2EEDeviceCreate {
+                user_id,
+                split_from,
+                ..
+            } => {
+                assert_eq!(user_id, user.id, "{topic}");
+                assert_eq!(split_from, expected, "{topic}");
+            }
+            other => panic!("{}: {:?}", topic, other),
+        }
+    }
+}
+
+/// D5 (audit MINOR-1): a split publication runs proof, tombstone check,
+/// unbind (+ lock release), insert, broadcast, sweep, in that order, and
+/// the sweep spares `split_from` explicitly
+#[test]
+fn split_publication_runs_in_the_pinned_order() {
+    use crate::util::test::{statement_at, without_comments, without_whitespace};
+
+    let code = without_whitespace(&without_comments(include_str!("publish_keys.rs")));
+    let at = |needle: &str| {
+        assert_eq!(code.matches(needle).count(), 1, "`{}` must appear once", needle);
+        code.find(needle).unwrap()
+    };
+
+    let order = [
+        at("old.verify_split_proof("),
+        at(".is_e2ee_device_removed(&user.id,&identity.device_id)"),
+        statement_at(
+            &code,
+            "E2EEIdentity::unbind_session_if(db,&user.id,old_device_id,&session.id).await?;",
+        ),
+        at("e2ee_claim_lock::release_held_by_session(&key,&session.id)"),
+        statement_at(&code, "db.insert_e2ee_identity(&identity).await?;"),
+        at("E2EEIdentity::broadcast_device_change("),
+        at("E2EEIdentity::revoke_same_session_predecessors(db,&user.id,&session.id,&identity.device_id,split_from.as_deref(),)"),
+    ];
+    for pair in order.windows(2) {
+        assert!(pair[0] < pair[1], "out of order: {:?}", order);
+    }
+}
+
+/// D8 (audit MINOR-3): the removal route writes the tombstone BEFORE it
+/// deletes anything, fails on a failed write, and tombstones only an id
+/// that is one of the caller's devices
+#[test]
+fn removal_writes_the_tombstone_before_the_delete() {
+    use crate::util::test::{statement_at, without_comments, without_whitespace};
+
+    let code = without_whitespace(&without_comments(include_str!("revoke_device.rs")));
+    let exists = statement_at(&code, "db.fetch_e2ee_identity(&user.id,&device_id).await?;");
+    let tombstone = code
+        .find("db.upsert_e2ee_removed_device(")
+        .expect("the tombstone");
+    let written = code[tombstone..]
+        .find(".await?;")
+        .map(|end| tombstone + end)
+        .expect("a failed tombstone write fails the route");
+    let delete = code
+        .find("E2EEIdentity::revoke_device(db,&user.id,&device_id).await?")
+        .expect("the delete");
+
+    assert_eq!(code.matches("E2EEIdentity::revoke_device(").count(), 1, "{}", code);
+    assert!(exists < tombstone, "existence is checked first");
+    assert!(written < delete, "the tombstone is written before the delete");
+}
+
+/// D8: removing an id that is none of the caller's devices is NotFound and
+/// leaves no tombstone behind
+#[test]
+fn removal_of_an_unknown_device_writes_no_tombstone() {
+    crate::util::test::rt().block_on(removal_of_an_unknown_device_writes_no_tombstone_case())
+}
+
+async fn removal_of_an_unknown_device_writes_no_tombstone_case() {
+    let harness = TestHarness::new().await;
+    let (account, session, user) = harness.new_user().await;
+    let (account_b, session_b, user_b) = harness.new_user().await;
+    publish_device(&harness, &account.id, &session.token, 1).await;
+    let foreign = publish_device(&harness, &account_b.id, &session_b.token, 1).await;
+
+    for device_id in [TestDevice::new().device_id, foreign.device_id.clone()] {
+        let (status, body) =
+            delete_device(&harness, &account.id, &session.token, &device_id).await;
+        assert_eq!(status, Status::NotFound, "{body}");
+        assert!(!harness
+            .db
+            .is_e2ee_device_removed(&user.id, &device_id)
+            .await
+            .unwrap());
+    }
+    assert!(!harness
+        .db
+        .is_e2ee_device_removed(&user_b.id, &foreign.device_id)
+        .await
+        .unwrap());
+    assert!(harness
+        .db
+        .fetch_e2ee_identity(&user_b.id, &foreign.device_id)
+        .await
+        .is_ok());
+}

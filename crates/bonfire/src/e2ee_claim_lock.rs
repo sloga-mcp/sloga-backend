@@ -7,22 +7,25 @@
 //! session on another connection (a reconnect overlap) takes it over.
 //!
 //! Every write is a compare-and-set in Lua, so a connection can only extend
-//! or delete its own value: a refresh after a takeover cannot steal the lock
-//! back, and a late release cannot free a successor's lock. Redis being
-//! unavailable fails open to the old last-writer-wins behaviour (owner
-//! decision O4); the lock protects availability and integrity between the
-//! user's own installs, not confidentiality.
+//! or delete its own session's lock: a refresh after another session took
+//! the device cannot steal it back, and a late release cannot free a
+//! successor's lock. Redis being unavailable fails open to the old
+//! last-writer-wins behaviour (owner decision O4); the lock protects
+//! availability and integrity between the user's own installs, not
+//! confidentiality.
+//!
+//! The key format and the scripts live in
+//! `revolt_database::e2ee_claim_lock`, shared with delta's split
+//! publication, which releases the old device's lock.
 
 use std::{
     future::Future,
-    sync::LazyLock,
     time::{Duration, Instant},
 };
 
-use redis_kiss::{
-    get_connection,
-    redis::{FromRedisValue, Script},
-    AsyncCommands,
+use revolt_database::e2ee_claim_lock::{self as shared, session_may_act};
+pub use revolt_database::e2ee_claim_lock::{
+    holder_session, lock_key, lock_value, Acquire, LockError, Refresh,
 };
 
 /// How long the lock outlives the socket's idle timeout. A connection that
@@ -33,9 +36,6 @@ pub const CLAIM_LOCK_GRACE: Duration = Duration::from_secs(30);
 /// Least time between two refreshes driven by inbound frames
 pub const CLAIM_LOCK_REFRESH_INTERVAL: Duration = Duration::from_secs(15);
 
-/// Bound on one Redis round trip; a slower one counts as a Redis error
-const LOCK_OP_TIMEOUT: Duration = Duration::from_secs(2);
-
 /// `reason` of a claim refused because another session holds the lock
 pub const REASON_HELD_ELSEWHERE: &str = "held_elsewhere";
 
@@ -45,35 +45,6 @@ pub const REASON_REMOVED: &str = "removed";
 /// Lock TTL for a socket dropped after `idle_timeout` of silence
 pub fn claim_lock_ttl(idle_timeout: Duration) -> Duration {
     idle_timeout + CLAIM_LOCK_GRACE
-}
-
-/// Redis key of the live claim on (user, device)
-pub fn lock_key(user_id: &str, device_id: &str) -> String {
-    format!("e2ee_claim:{user_id}:{device_id}")
-}
-
-/// Lock value naming one connection of one session
-pub fn lock_value(session_id: &str, conn_id: &str) -> String {
-    format!("{session_id}:{conn_id}")
-}
-
-/// The session part of a lock value: everything before the last `:`.
-/// Connection ids never contain one. Must match `ACQUIRE_LUA`.
-pub fn holder_session(value: &str) -> &str {
-    value.rsplit_once(':').map_or(value, |(session, _)| session)
-}
-
-/// A lock operation that could not reach a verdict
-#[derive(Debug)]
-pub struct LockError(pub String);
-
-/// Outcome of one acquire attempt
-#[derive(Debug, PartialEq, Eq)]
-pub enum Acquire {
-    /// The lock was absent, or held by the same session; it is ours now
-    Acquired,
-    /// Another session holds it; the full lock value
-    HeldBy(String),
 }
 
 /// The compare-and-set operations on the lock. Implemented over Redis by
@@ -90,13 +61,15 @@ pub trait ClaimLockStore: Clone + Send + Sync + 'static {
         ttl: Duration,
     ) -> impl Future<Output = Result<Acquire, LockError>> + Send;
 
-    /// Reset `key`'s TTL iff it still holds `value`; whether it did
+    /// Set `key` to `value` with a fresh `ttl` iff its holder's session is
+    /// `session_id`; an absent `key` is reported, not recreated
     fn refresh(
         &self,
         key: &str,
         value: &str,
+        session_id: &str,
         ttl: Duration,
-    ) -> impl Future<Output = Result<bool, LockError>> + Send;
+    ) -> impl Future<Output = Result<Refresh, LockError>> + Send;
 
     /// Delete `key` iff it still holds `value`; whether it did
     fn release(
@@ -109,77 +82,9 @@ pub trait ClaimLockStore: Clone + Send + Sync + 'static {
     fn holder(&self, key: &str) -> impl Future<Output = Result<Option<String>, LockError>> + Send;
 }
 
-/// `KEYS[1]` the lock key; `ARGV[1]` our value, `ARGV[2]` our session id,
-/// `ARGV[3]` the TTL in milliseconds. Returns `{1, ""}` when the lock is
-/// ours (it was absent or our session's), `{0, holder}` when another
-/// session holds it. The session part is cut at the last `:`, as in
-/// [`holder_session`].
-const ACQUIRE_LUA: &str = r#"
-local current = redis.call('GET', KEYS[1])
-if current then
-  local holder = string.match(current, '^(.*):[^:]*$') or current
-  if holder ~= ARGV[2] then
-    return {0, current}
-  end
-end
-redis.call('SET', KEYS[1], ARGV[1], 'PX', ARGV[3])
-return {1, ''}
-"#;
-
-/// `KEYS[1]` the lock key; `ARGV[1]` our value, `ARGV[2]` the TTL in
-/// milliseconds. Extends the TTL only while the value is still ours.
-const REFRESH_LUA: &str = r#"
-if redis.call('GET', KEYS[1]) == ARGV[1] then
-  return redis.call('PEXPIRE', KEYS[1], ARGV[2])
-end
-return 0
-"#;
-
-/// `KEYS[1]` the lock key; `ARGV[1]` our value. Deletes only our own value.
-const RELEASE_LUA: &str = r#"
-if redis.call('GET', KEYS[1]) == ARGV[1] then
-  return redis.call('DEL', KEYS[1])
-end
-return 0
-"#;
-
-/// `Script` sends EVALSHA and loads the source on NOSCRIPT
-static ACQUIRE: LazyLock<Script> = LazyLock::new(|| Script::new(ACQUIRE_LUA));
-static REFRESH: LazyLock<Script> = LazyLock::new(|| Script::new(REFRESH_LUA));
-static RELEASE: LazyLock<Script> = LazyLock::new(|| Script::new(RELEASE_LUA));
-
 /// The lock in the shared Redis that presence and slowmode already use
 #[derive(Clone, Copy, Debug, Default)]
 pub struct RedisClaimLock;
-
-/// Run `script` under [`LOCK_OP_TIMEOUT`]. The connection is taken out of
-/// the pool (`into_inner`), so one cut off by the timeout mid-reply is
-/// dropped rather than handed to the next caller.
-async fn invoke<T: FromRedisValue + Send>(
-    script: &Script,
-    key: &str,
-    args: &[&str],
-) -> Result<T, LockError> {
-    let work = async {
-        let mut conn = get_connection()
-            .await
-            .map_err(|err| LockError(format!("{err:?}")))?
-            .into_inner();
-        let mut invocation = script.prepare_invoke();
-        invocation.key(key);
-        for arg in args {
-            invocation.arg(*arg);
-        }
-        invocation
-            .invoke_async::<_, T>(&mut conn)
-            .await
-            .map_err(|err| LockError(err.to_string()))
-    };
-
-    tokio::time::timeout(LOCK_OP_TIMEOUT, work)
-        .await
-        .unwrap_or_else(|_| Err(LockError("timed out".to_string())))
-}
 
 impl ClaimLockStore for RedisClaimLock {
     async fn acquire(
@@ -189,42 +94,25 @@ impl ClaimLockStore for RedisClaimLock {
         session_id: &str,
         ttl: Duration,
     ) -> Result<Acquire, LockError> {
-        let ttl_ms = ttl.as_millis().to_string();
-        let (taken, holder): (i64, String) =
-            invoke(&ACQUIRE, key, &[value, session_id, &ttl_ms]).await?;
-
-        Ok(if taken == 1 {
-            Acquire::Acquired
-        } else {
-            Acquire::HeldBy(holder)
-        })
+        shared::acquire(key, value, session_id, ttl).await
     }
 
-    async fn refresh(&self, key: &str, value: &str, ttl: Duration) -> Result<bool, LockError> {
-        let ttl_ms = ttl.as_millis().to_string();
-        let refreshed: i64 = invoke(&REFRESH, key, &[value, &ttl_ms]).await?;
-        Ok(refreshed == 1)
+    async fn refresh(
+        &self,
+        key: &str,
+        value: &str,
+        session_id: &str,
+        ttl: Duration,
+    ) -> Result<Refresh, LockError> {
+        shared::refresh(key, value, session_id, ttl).await
     }
 
     async fn release(&self, key: &str, value: &str) -> Result<bool, LockError> {
-        let released: i64 = invoke(&RELEASE, key, &[value]).await?;
-        Ok(released == 1)
+        shared::release(key, value).await
     }
 
     async fn holder(&self, key: &str) -> Result<Option<String>, LockError> {
-        let work = async {
-            let mut conn = get_connection()
-                .await
-                .map_err(|err| LockError(format!("{err:?}")))?
-                .into_inner();
-            conn.get::<_, Option<String>>(key)
-                .await
-                .map_err(|err| LockError(err.to_string()))
-        };
-
-        tokio::time::timeout(LOCK_OP_TIMEOUT, work)
-            .await
-            .unwrap_or_else(|_| Err(LockError("timed out".to_string())))
+        shared::holder(key).await
     }
 }
 
@@ -271,7 +159,7 @@ impl<S: ClaimLockStore> ConnectionClaim<S> {
         Self::with_conn_id(store, user_id, session_id, &conn_id, ttl)
     }
 
-    fn with_conn_id(
+    pub(crate) fn with_conn_id(
         store: S,
         user_id: &str,
         session_id: &str,
@@ -336,38 +224,84 @@ impl<S: ClaimLockStore> ConnectionClaim<S> {
 
     /// Refresh the held lock if the last refresh is at least
     /// [`CLAIM_LOCK_REFRESH_INTERVAL`] old (driven by inbound frames)
-    pub async fn refresh_if_due(&mut self, now: Instant) {
+    pub async fn refresh_if_due<F, Fut>(&mut self, now: Instant, bound_session: F)
+    where
+        F: FnOnce(String) -> Fut,
+        Fut: Future<Output = Option<String>>,
+    {
         let due = self.held.as_ref().is_some_and(|held| {
             now.saturating_duration_since(held.last_refresh) >= CLAIM_LOCK_REFRESH_INTERVAL
         });
         if due {
-            self.refresh(now).await;
+            self.refresh(now, bound_session).await;
         }
     }
 
-    /// Refresh the held lock now (the ping tick). Compare-and-set only: a
-    /// lock another connection took over is let go, never taken back.
-    pub async fn refresh(&mut self, now: Instant) {
+    /// Refresh the held lock now (the ping tick), compare-and-set on the
+    /// SESSION:
+    /// - our session holds it, on this connection or on a sibling that took
+    ///   it over: it holds this connection's value again, with a fresh TTL;
+    /// - another session holds it: let go, never taken back;
+    /// - absent (a sibling of this session took it over and then closed,
+    ///   or it expired): taken again only while `bound_session(device)`
+    ///   (the device row's `last_session_id`, awaited only then) is still
+    ///   this session. A split publication unbinds the old device and
+    ///   deletes its lock on purpose, and must not see it come back.
+    pub async fn refresh<F, Fut>(&mut self, now: Instant, bound_session: F)
+    where
+        F: FnOnce(String) -> Fut,
+        Fut: Future<Output = Option<String>>,
+    {
         let Some(held) = self.held.as_mut() else {
             return;
         };
 
         // Stamped even on an error, so an outage is not retried per frame
         held.last_refresh = now;
-        match self.store.refresh(&held.key, &self.value, self.ttl).await {
-            Ok(true) => {}
-            Ok(false) => {
-                debug!(
-                    "E2EE claim lock no longer ours: user={} device={} session={}",
-                    self.user_id, held.device_id, self.session_id
-                );
-                self.held = None;
+        let key = held.key.clone();
+        let device_id = held.device_id.clone();
+
+        let outcome = self
+            .store
+            .refresh(&key, &self.value, &self.session_id, self.ttl)
+            .await;
+        match outcome {
+            Ok(Refresh::Extended) => {}
+            Ok(Refresh::HeldElsewhere) => self.let_go(&device_id, "held by another session"),
+            Ok(Refresh::Absent) => {
+                let bound = bound_session(device_id.clone()).await;
+                if bound.as_deref() != Some(self.session_id.as_str()) {
+                    self.let_go(&device_id, "absent and no longer bound to this session");
+                    return;
+                }
+
+                match self
+                    .store
+                    .acquire(&key, &self.value, &self.session_id, self.ttl)
+                    .await
+                {
+                    Ok(Acquire::Acquired) => {}
+                    Ok(Acquire::HeldBy(_)) => self.let_go(&device_id, "taken by another session"),
+                    Err(err) => warn!(
+                        "E2EE claim lock re-take failed: user={} device={} session={}: {}",
+                        self.user_id, device_id, self.session_id, err.0
+                    ),
+                }
             }
             Err(err) => warn!(
                 "E2EE claim lock refresh failed: user={} device={} session={}: {}",
-                self.user_id, held.device_id, self.session_id, err.0
+                self.user_id, device_id, self.session_id, err.0
             ),
         }
+    }
+
+    /// Stop holding the lock without touching it
+    fn let_go(&mut self, device_id: &str, why: &str) {
+        debug!(
+            "E2EE claim lock no longer ours ({}): user={} device={} session={}",
+            why, self.user_id, device_id, self.session_id
+        );
+        self.held = None;
     }
 
     /// Release the held lock (compare-and-delete)
@@ -393,17 +327,15 @@ impl<S: ClaimLockStore> ConnectionClaim<S> {
     where
         F: Future<Output = Option<String>>,
     {
-        match self.store.holder(&lock_key(&self.user_id, device_id)).await {
-            Ok(Some(value)) => holder_session(&value) == self.session_id,
-            Ok(None) => bound_session.await.as_deref() == Some(self.session_id.as_str()),
-            Err(err) => {
-                debug!(
-                    "E2EE claim lock unreadable, checking the device binding: user={} device={}: {}",
-                    self.user_id, device_id, err.0
-                );
-                bound_session.await.as_deref() == Some(self.session_id.as_str())
-            }
+        let lock = self.store.holder(&lock_key(&self.user_id, device_id)).await;
+        if let Err(err) = &lock {
+            debug!(
+                "E2EE claim lock unreadable, checking the device binding: user={} device={}: {}",
+                self.user_id, device_id, err.0
+            );
         }
+
+        session_may_act(lock, &self.session_id, bound_session).await
     }
 }
 
@@ -435,60 +367,75 @@ impl<S: ClaimLockStore> Drop for ConnectionClaim<S> {
     }
 }
 
+/// In-memory lock with the scripts' semantics and a clock the test moves;
+/// shared with the worker tests in `websocket.rs`
 #[cfg(test)]
-mod tests {
+pub(crate) mod fake {
     use std::{
         collections::HashMap,
-        sync::{
-            atomic::{AtomicBool, AtomicUsize, Ordering},
-            Arc, Mutex,
-        },
+        sync::{Arc, Mutex},
+        time::{Duration, Instant},
     };
 
-    use super::*;
+    use super::{holder_session, Acquire, ClaimLockStore, LockError, Refresh};
 
-    const TTL: Duration = Duration::from_secs(150);
-
-    /// In-memory lock with the scripts' semantics and a clock the test moves
     #[derive(Clone)]
-    struct FakeLock(Arc<Mutex<FakeState>>);
+    pub(crate) struct FakeLock(pub(crate) Arc<Mutex<FakeState>>);
 
-    struct FakeState {
-        now: Instant,
-        entries: HashMap<String, (String, Instant)>,
-        failing: bool,
-        refreshes: usize,
+    pub(crate) struct FakeState {
+        pub(crate) now: Instant,
+        pub(crate) entries: HashMap<String, (String, Instant)>,
+        pub(crate) failing: bool,
+        pub(crate) refreshes: usize,
+        pub(crate) acquires: usize,
     }
 
     impl FakeLock {
-        fn new() -> Self {
+        pub(crate) fn new() -> Self {
             FakeLock(Arc::new(Mutex::new(FakeState {
                 now: Instant::now(),
                 entries: HashMap::new(),
                 failing: false,
                 refreshes: 0,
+                acquires: 0,
             })))
         }
 
-        fn now(&self) -> Instant {
+        pub(crate) fn now(&self) -> Instant {
             self.0.lock().unwrap().now
         }
 
-        fn advance(&self, by: Duration) {
+        pub(crate) fn advance(&self, by: Duration) {
             self.0.lock().unwrap().now += by;
         }
 
-        fn fail(&self, failing: bool) {
+        pub(crate) fn fail(&self, failing: bool) {
             self.0.lock().unwrap().failing = failing;
         }
 
-        fn refreshes(&self) -> usize {
+        pub(crate) fn refreshes(&self) -> usize {
             self.0.lock().unwrap().refreshes
         }
 
-        fn get(&self, key: &str) -> Option<String> {
+        /// How many acquire calls reached the store, failing ones included
+        pub(crate) fn acquires(&self) -> usize {
+            self.0.lock().unwrap().acquires
+        }
+
+        pub(crate) fn get(&self, key: &str) -> Option<String> {
             let mut state = self.0.lock().unwrap();
             state.live(key)
+        }
+
+        /// Set `key` to `value` with `ttl`, as another node would
+        pub(crate) fn put(&self, key: &str, value: &str, ttl: Duration) {
+            let mut state = self.0.lock().unwrap();
+            let expires = state.now + ttl;
+            state.entries.insert(key.to_string(), (value.to_string(), expires));
+        }
+
+        pub(crate) fn remove(&self, key: &str) {
+            self.0.lock().unwrap().entries.remove(key);
         }
     }
 
@@ -524,6 +471,7 @@ mod tests {
             ttl: Duration,
         ) -> Result<Acquire, LockError> {
             let mut state = self.0.lock().unwrap();
+            state.acquires += 1;
             state.check()?;
             if let Some(current) = state.live(key) {
                 if holder_session(&current) != session_id {
@@ -535,16 +483,27 @@ mod tests {
             Ok(Acquire::Acquired)
         }
 
-        async fn refresh(&self, key: &str, value: &str, ttl: Duration) -> Result<bool, LockError> {
+        async fn refresh(
+            &self,
+            key: &str,
+            value: &str,
+            session_id: &str,
+            ttl: Duration,
+        ) -> Result<Refresh, LockError> {
             let mut state = self.0.lock().unwrap();
             state.check()?;
             state.refreshes += 1;
-            if state.live(key).as_deref() == Some(value) {
-                let expires = state.now + ttl;
-                state.entries.insert(key.to_string(), (value.to_string(), expires));
-                return Ok(true);
+            match state.live(key) {
+                None => Ok(Refresh::Absent),
+                Some(current) if holder_session(&current) != session_id => {
+                    Ok(Refresh::HeldElsewhere)
+                }
+                Some(_) => {
+                    let expires = state.now + ttl;
+                    state.entries.insert(key.to_string(), (value.to_string(), expires));
+                    Ok(Refresh::Extended)
+                }
             }
-            Ok(false)
         }
 
         async fn release(&self, key: &str, value: &str) -> Result<bool, LockError> {
@@ -563,6 +522,21 @@ mod tests {
             Ok(state.live(key))
         }
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        Arc,
+    };
+
+    use redis_kiss::{get_connection, AsyncCommands};
+
+    use super::fake::FakeLock;
+    use super::*;
+
+    const TTL: Duration = Duration::from_secs(150);
 
     fn conn(lock: &FakeLock, session: &str, conn_id: &str) -> ConnectionClaim<FakeLock> {
         ConnectionClaim::with_conn_id(lock.clone(), "U", session, conn_id, TTL)
@@ -583,6 +557,12 @@ mod tests {
             polled.store(true, Ordering::SeqCst);
             session
         }
+    }
+
+    /// The refresh's device-binding lookup: every device bound to `session`
+    fn bound_to(session: Option<&str>) -> impl FnOnce(String) -> std::future::Ready<Option<String>> {
+        let session = session.map(str::to_string);
+        move |_device| std::future::ready(session)
     }
 
     #[test]
@@ -650,25 +630,28 @@ mod tests {
 
         assert!(first.acquire("D", lock.now()).await.is_accepted());
         lock.advance(TTL - Duration::from_secs(1));
-        first.refresh(lock.now()).await;
+        first.refresh(lock.now(), bound_to(Some("S1"))).await;
         lock.advance(Duration::from_secs(2));
         assert!(!other.acquire("D", lock.now()).await.is_accepted());
         assert_eq!(lock.get(&key("D")).as_deref(), Some("S1:c1"));
     }
 
+    /// Another SESSION took the device (after this connection's lock
+    /// expired): a refresh neither steals it back nor extends it
     #[tokio::test]
     async fn d4_refresh_after_a_takeover_does_not_steal() {
         let lock = FakeLock::new();
         let mut old = conn(&lock, "S1", "c1");
-        let mut new = conn(&lock, "S1", "c2");
+        let mut new = conn(&lock, "S2", "c2");
 
         assert!(old.acquire("D", lock.now()).await.is_accepted());
-        lock.advance(Duration::from_secs(10));
+        lock.advance(TTL);
         assert!(new.acquire("D", lock.now()).await.is_accepted());
 
         lock.advance(Duration::from_secs(20));
-        old.refresh(lock.now()).await;
-        assert_eq!(lock.get(&key("D")).as_deref(), Some("S1:c2"));
+        // Even while the row still names the old session
+        old.refresh(lock.now(), bound_to(Some("S1"))).await;
+        assert_eq!(lock.get(&key("D")).as_deref(), Some("S2:c2"));
 
         // Nor did it extend the successor's TTL, which still runs from the
         // takeover
@@ -677,8 +660,71 @@ mod tests {
 
         // Having let go, the old connection stops refreshing
         let before = lock.refreshes();
-        old.refresh(lock.now()).await;
+        old.refresh(lock.now(), bound_to(Some("S1"))).await;
         assert_eq!(lock.refreshes(), before);
+    }
+
+    /// Audit MINOR-6a: a sibling connection of the SAME session took the
+    /// lock over. While it lives, our refresh re-asserts our value; once it
+    /// closed and released, our refresh takes the lock again (the device is
+    /// still bound to our session), so no other session can slip in
+    #[tokio::test]
+    async fn d4_refresh_reasserts_over_a_sibling_of_the_same_session() {
+        let lock = FakeLock::new();
+        let mut old = conn(&lock, "S1", "c1");
+        let mut sibling = conn(&lock, "S1", "c2");
+        let mut other = conn(&lock, "S2", "c3");
+
+        assert!(old.acquire("D", lock.now()).await.is_accepted());
+        assert!(sibling.acquire("D", lock.now()).await.is_accepted());
+        assert_eq!(lock.get(&key("D")).as_deref(), Some("S1:c2"));
+
+        lock.advance(Duration::from_secs(30));
+        old.refresh(lock.now(), bound_to(Some("S1"))).await;
+        assert_eq!(lock.get(&key("D")).as_deref(), Some("S1:c1"), "re-asserted");
+
+        // The sibling's release cannot delete the value we re-asserted
+        sibling.release().await;
+        assert_eq!(lock.get(&key("D")).as_deref(), Some("S1:c1"));
+
+        // Another sibling takes it over and closes, deleting its own value
+        let mut sibling = conn(&lock, "S1", "c4");
+        assert!(sibling.acquire("D", lock.now()).await.is_accepted());
+        sibling.release().await;
+        assert_eq!(lock.get(&key("D")), None);
+
+        // Ours is taken again
+        old.refresh(lock.now(), bound_to(Some("S1"))).await;
+        assert_eq!(lock.get(&key("D")).as_deref(), Some("S1:c1"), "re-taken");
+        assert!(!other.acquire("D", lock.now()).await.is_accepted());
+
+        // And it lasts a full TTL from that refresh
+        lock.advance(TTL - Duration::from_secs(1));
+        assert_eq!(lock.get(&key("D")).as_deref(), Some("S1:c1"));
+    }
+
+    /// Audit MINOR-6a with MAJOR-1: an absent lock is taken again only while
+    /// the device is still bound to this session. A split publication
+    /// unbinds the old device (bound to `""`) and deletes its lock; the
+    /// refresh must not bring it back
+    #[tokio::test]
+    async fn d4_refresh_does_not_retake_an_unbound_device() {
+        for binding in [Some(""), Some("S2"), None] {
+            let lock = FakeLock::new();
+            let mut ours = conn(&lock, "S1", "c1");
+            assert!(ours.acquire("D", lock.now()).await.is_accepted());
+            lock.remove(&key("D"));
+
+            let acquires = lock.acquires();
+            ours.refresh(lock.now(), bound_to(binding)).await;
+            assert_eq!(lock.get(&key("D")), None, "binding {binding:?}");
+            assert_eq!(lock.acquires(), acquires, "binding {binding:?}");
+
+            // Let go: later refreshes do nothing
+            let refreshes = lock.refreshes();
+            ours.refresh(lock.now(), bound_to(Some("S1"))).await;
+            assert_eq!(lock.refreshes(), refreshes, "binding {binding:?}");
+        }
     }
 
     #[tokio::test]
@@ -688,14 +734,14 @@ mod tests {
         assert!(first.acquire("D", lock.now()).await.is_accepted());
 
         lock.advance(CLAIM_LOCK_REFRESH_INTERVAL - Duration::from_secs(1));
-        first.refresh_if_due(lock.now()).await;
+        first.refresh_if_due(lock.now(), bound_to(Some("S1"))).await;
         assert_eq!(lock.refreshes(), 0);
 
         lock.advance(Duration::from_secs(1));
-        first.refresh_if_due(lock.now()).await;
+        first.refresh_if_due(lock.now(), bound_to(Some("S1"))).await;
         assert_eq!(lock.refreshes(), 1);
 
-        first.refresh_if_due(lock.now()).await;
+        first.refresh_if_due(lock.now(), bound_to(Some("S1"))).await;
         assert_eq!(lock.refreshes(), 1);
     }
 
@@ -767,7 +813,7 @@ mod tests {
         assert!(!first.may_act("D", bound(Some("S2"), &polled)).await);
 
         // A refresh or release during the outage is harmless
-        first.refresh(lock.now()).await;
+        first.refresh(lock.now(), bound_to(Some("S1"))).await;
         first.release().await;
         lock.fail(false);
         assert_eq!(lock.get(&key("D")).as_deref(), Some("S2:c2"));
@@ -865,26 +911,48 @@ mod tests {
             );
             assert_eq!(redis.holder(&key).await.expect("holder").as_deref(), Some("S1:c4"));
 
-            // A stale refresh neither steals nor extends
+            // Another session's refresh neither steals nor extends
             let _: () = conn.pexpire(&key, 5_000).await.expect("pexpire");
-            assert!(!redis.refresh(&key, "S1:c1", ttl).await.expect("refresh"));
+            assert_eq!(
+                redis.refresh(&key, "S2:c2", "S2", ttl).await.expect("refresh"),
+                Refresh::HeldElsewhere
+            );
             assert_eq!(redis.holder(&key).await.expect("holder").as_deref(), Some("S1:c4"));
             let pttl: i64 = conn.pttl(&key).await.expect("pttl");
             assert!(pttl > 0 && pttl <= 5_000, "a stale refresh extended the TTL: {pttl}");
 
+            // A sibling connection of the holder's session re-asserts its own
+            // value with a fresh TTL (audit MINOR-6a)
+            assert_eq!(
+                redis.refresh(&key, "S1:c1", "S1", ttl).await.expect("refresh"),
+                Refresh::Extended
+            );
+            assert_eq!(redis.holder(&key).await.expect("holder").as_deref(), Some("S1:c1"));
+            let pttl: i64 = conn.pttl(&key).await.expect("pttl");
+            assert!(pttl > 5_000 && pttl <= ttl.as_millis() as i64, "pttl {pttl}");
+
             // The holder's refresh extends
-            assert!(redis.refresh(&key, "S1:c4", ttl).await.expect("refresh"));
+            let _: () = conn.pexpire(&key, 5_000).await.expect("pexpire");
+            assert_eq!(
+                redis.refresh(&key, "S1:c1", "S1", ttl).await.expect("refresh"),
+                Refresh::Extended
+            );
             let pttl: i64 = conn.pttl(&key).await.expect("pttl");
             assert!(pttl > 5_000 && pttl <= ttl.as_millis() as i64, "pttl {pttl}");
 
             // A stale release deletes nothing; the holder's deletes
-            assert!(!redis.release(&key, "S1:c1").await.expect("release"));
-            assert_eq!(redis.holder(&key).await.expect("holder").as_deref(), Some("S1:c4"));
-            assert!(redis.release(&key, "S1:c4").await.expect("release"));
+            assert!(!redis.release(&key, "S1:c4").await.expect("release"));
+            assert_eq!(redis.holder(&key).await.expect("holder").as_deref(), Some("S1:c1"));
+            assert!(redis.release(&key, "S1:c1").await.expect("release"));
             assert_eq!(redis.holder(&key).await.expect("holder").as_deref(), None);
 
-            // Absent: refresh and release are no-ops, acquire takes it
-            assert!(!redis.refresh(&key, "S1:c4", ttl).await.expect("refresh"));
+            // Absent: refresh reports it and creates nothing, release is a
+            // no-op, acquire takes it
+            assert_eq!(
+                redis.refresh(&key, "S1:c1", "S1", ttl).await.expect("refresh"),
+                Refresh::Absent
+            );
+            assert_eq!(redis.holder(&key).await.expect("holder").as_deref(), None);
             assert!(!redis.release(&key, "S1:c4").await.expect("release"));
             assert_eq!(
                 redis.acquire(&key, "S2:c2", "S2", ttl).await.expect("acquire"),

@@ -25,20 +25,25 @@ pub async fn revoke_device(
 ) -> Result<Json<v0::ResponseRevokeE2EEDevice>> {
     super::require_e2ee_enabled().await?;
 
-    // Scoped to the session's user: only your own devices can be revoked
-    if !E2EEIdentity::revoke_device(db, &user.id, &device_id).await? {
-        return Err(create_error!(NotFound));
-    }
+    // Scoped to the session's user: only your own devices can be revoked.
+    // An id that is none of them gets no tombstone
+    db.fetch_e2ee_identity(&user.id, &device_id).await?;
 
     // Explicit removal only (multi-device D8): session revocation goes
     // through `E2EEIdentity::revoke_device` without this, so a device that
-    // logged out can still re-enroll
+    // logged out can still re-enroll. Written BEFORE the delete: a failed
+    // write removes nothing, where the other order would leave a deleted
+    // device that its install can publish again
     db.upsert_e2ee_removed_device(&E2EERemovedDevice::new(
         &user.id,
         &device_id,
         Timestamp::now_utc(),
     ))
     .await?;
+
+    if !E2EEIdentity::revoke_device(db, &user.id, &device_id).await? {
+        return Err(create_error!(NotFound));
+    }
 
     // Counted after the delete: the client clears the account-wide
     // `e2ee_enabled` flag only when no device is left (plan D7)

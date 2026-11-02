@@ -634,7 +634,9 @@ impl E2EEIdentity {
     /// old, shared device's) Ed25519 identity key signed the move to
     /// `new_device_id` with identity key `new_ed25519`, from `session_id`.
     /// The session is bound into the payload so a captured proof cannot be
-    /// replayed from another session.
+    /// replayed from another session. `proof` is unpadded standard base64
+    /// of the 64-byte signature, like every other signature here; a padded
+    /// one is refused.
     pub fn verify_split_proof(
         &self,
         new_device_id: &str,
@@ -721,12 +723,30 @@ impl E2EEIdentity {
     /// Broadcast a device-list change to the account's other devices (private
     /// topic) and to DM peers (each direct-message channel topic) — device
     /// changes are loud, both add and remove
+    ///
+    /// `E2EEDeviceCreate.split_from` is for the account's own devices only
+    /// (multi-device D5): the twin re-claims on it. Peers get the same
+    /// event without it, so they learn of a new device and nothing about
+    /// which of the user's devices it left.
     pub async fn broadcast_device_change(db: &Database, user_id: &str, event: EventV1) {
-        event.clone().private(user_id.to_string()).await;
+        let peer_event = match &event {
+            EventV1::E2EEDeviceCreate {
+                user_id,
+                device_id,
+                split_from: Some(_),
+            } => EventV1::E2EEDeviceCreate {
+                user_id: user_id.clone(),
+                device_id: device_id.clone(),
+                split_from: None,
+            },
+            _ => event.clone(),
+        };
+
+        event.private(user_id.to_string()).await;
 
         if let Ok(channels) = db.find_direct_messages(user_id).await {
             for channel in channels {
-                event.clone().p(channel.id().to_string()).await;
+                peer_event.clone().p(channel.id().to_string()).await;
             }
         }
     }
@@ -793,11 +813,18 @@ impl E2EEIdentity {
     /// not server-enforced. A COPIED session token that enables E2EE on a
     /// second install revokes the first install's device — loud and
     /// recoverable; token sharing is outside the supported model.
+    ///
+    /// `also_keep` is never swept either: a split publication passes its
+    /// `split_from` (multi-device D5), the device a twin install still
+    /// uses. The publication unbinds it first, so the sweep would not
+    /// match it anyway; the explicit exclusion keeps it safe from a
+    /// binding that changed in between. A device claim passes `None`.
     pub async fn revoke_same_session_predecessors(
         db: &Database,
         user_id: &str,
         session_id: &str,
         keep_device_id: &str,
+        also_keep: Option<&str>,
     ) {
         let Ok(identities) = db.fetch_e2ee_identities(user_id).await else {
             // Best-effort: an unreadable listing = no sweep this cycle
@@ -806,6 +833,7 @@ impl E2EEIdentity {
 
         for identity in identities {
             if identity.device_id != keep_device_id
+                && also_keep != Some(identity.device_id.as_str())
                 && identity.last_session_id == session_id
             {
                 // Best-effort per row; the broadcast inside revoke_device
@@ -1211,6 +1239,54 @@ mod multi_device_tests {
                 db.delete_all_e2ee_removed_devices("user_tomb").await.unwrap(),
                 0
             );
+        });
+    }
+
+    /// Multi-device D5 (audit MINOR-6b): the predecessor sweep spares the
+    /// kept device and `also_keep`, even while both are still bound to the
+    /// sweeping session, and revokes every other row bound to it
+    #[tokio::test]
+    async fn predecessor_sweep_spares_also_keep() {
+        database_test!(|db| async move {
+            let user = "user_sweep";
+            let [kept, split_from, predecessor, elsewhere] = std::array::from_fn(|n| {
+                let mut identity = make_device(user).identity;
+                identity.last_session_id = if n == 3 { "S2" } else { "S1" }.to_string();
+                identity
+            });
+            for identity in [&kept, &split_from, &predecessor, &elsewhere] {
+                db.insert_e2ee_identity(identity).await.unwrap();
+            }
+
+            E2EEIdentity::revoke_same_session_predecessors(
+                &db,
+                user,
+                "S1",
+                &kept.device_id,
+                Some(&split_from.device_id),
+            )
+            .await;
+
+            for (identity, survives) in [
+                (&kept, true),
+                (&split_from, true),
+                (&predecessor, false),
+                (&elsewhere, true),
+            ] {
+                assert_eq!(
+                    db.fetch_e2ee_identity(user, &identity.device_id).await.is_ok(),
+                    survives,
+                    "device {} (bound to {})",
+                    identity.device_id,
+                    identity.last_session_id
+                );
+            }
+
+            // Without `also_keep` the same row is an ordinary predecessor
+            E2EEIdentity::revoke_same_session_predecessors(&db, user, "S1", &kept.device_id, None)
+                .await;
+            assert!(db.fetch_e2ee_identity(user, &split_from.device_id).await.is_err());
+            assert!(db.fetch_e2ee_identity(user, &kept.device_id).await.is_ok());
         });
     }
 

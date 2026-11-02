@@ -7037,6 +7037,7 @@ dependencies = [
  "async-tungstenite",
  "base64 0.21.7",
  "bincode",
+ "ed25519-dalek",
  "fred",
  "futures",
  "log",
