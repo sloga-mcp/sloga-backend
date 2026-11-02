@@ -185,6 +185,19 @@ impl IntoResponse for Error {
             ErrorType::ChannelProtected => StatusCode::BAD_REQUEST,
             ErrorType::ProtectedFieldRefused { .. } => StatusCode::BAD_REQUEST,
             ErrorType::SeatListNamesRemovedUsers { .. } => StatusCode::BAD_REQUEST,
+            ErrorType::InsufficientProt { .. } => StatusCode::CONFLICT,
+            ErrorType::ProtDisabled => StatusCode::BAD_REQUEST,
+            ErrorType::ProtSalesClosed => StatusCode::FORBIDDEN,
+            ErrorType::ProtPackInvalid => StatusCode::BAD_REQUEST,
+            ErrorType::ProtWalletCap { .. } => StatusCode::CONFLICT,
+            ErrorType::ProtHeldPurchase => StatusCode::FORBIDDEN,
+            ErrorType::ProtTankFrozen => StatusCode::FORBIDDEN,
+            ErrorType::ProtGoalClosed => StatusCode::CONFLICT,
+            ErrorType::ProtNotEligible => StatusCode::FORBIDDEN,
+            ErrorType::ProtTierBelowSeats => StatusCode::CONFLICT,
+            ErrorType::ProtIdempotencyConflict => StatusCode::CONFLICT,
+            ErrorType::ProtReplicaSetRequired => StatusCode::SERVICE_UNAVAILABLE,
+            ErrorType::ProtRegionUnavailable => StatusCode::BAD_REQUEST,
         };
 
         // The body no longer carries the location, so log it for server
@@ -325,5 +338,36 @@ mod tests {
                 "users": ["01HZXBBBBBBBBBBBBBBBBBBBBB"],
             })
         );
+    }
+
+    /// Pins the Prot errors' statuses; `rocket.rs` pins the same table
+    #[test]
+    fn prot_error_statuses() {
+        let cases: [(Error, u16); 13] = [
+            (
+                create_error!(InsufficientProt {
+                    needed: 500,
+                    available: 120,
+                }),
+                409,
+            ),
+            (create_error!(ProtDisabled), 400),
+            (create_error!(ProtSalesClosed), 403),
+            (create_error!(ProtPackInvalid), 400),
+            (create_error!(ProtWalletCap { max: 100_000 }), 409),
+            (create_error!(ProtHeldPurchase), 403),
+            (create_error!(ProtTankFrozen), 403),
+            (create_error!(ProtGoalClosed), 409),
+            (create_error!(ProtNotEligible), 403),
+            (create_error!(ProtTierBelowSeats), 409),
+            (create_error!(ProtIdempotencyConflict), 409),
+            (create_error!(ProtReplicaSetRequired), 503),
+            (create_error!(ProtRegionUnavailable), 400),
+        ];
+
+        for (error, code) in cases {
+            let name = format!("{:?}", error.error_type);
+            assert_eq!(error.into_response().status().as_u16(), code, "{name}");
+        }
     }
 }

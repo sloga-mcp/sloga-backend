@@ -1,5 +1,6 @@
 use super::scripts::{
-    create_payment_indexes, seed_cipher_numbers_table, LATEST_REVISION, PAYMENT_COLLECTIONS,
+    create_payment_indexes, create_prot_indexes, seed_cipher_numbers_table, LATEST_REVISION,
+    PAYMENT_COLLECTIONS, PROT_COLLECTIONS,
 };
 
 use crate::mongodb::bson::doc;
@@ -43,7 +44,7 @@ pub(crate) const E2EE_REMOVED_DEVICES_COLLECTION: &str = "e2ee_removed_devices";
 /// the pair unique; the named index also serves the account-deletion
 /// cascade, which deletes by `user_id`.
 ///
-/// The one spec for this file and revision 76.
+/// The one spec for this file and revision 77.
 pub(crate) fn e2ee_removed_devices_index() -> bson::Document {
     doc! {
         "key": {
@@ -303,6 +304,12 @@ pub async fn create_database(db: &MongoDb) {
     db.create_collection("channel_seat_lists")
         .await
         .expect("Failed to create channel_seat_lists collection.");
+    // Prot wallet ledger (revision 76).
+    for collection in PROT_COLLECTIONS {
+        db.create_collection(collection)
+            .await
+            .unwrap_or_else(|error| panic!("Failed to create {collection} collection: {error}"));
+    }
 
     db.run_command(doc! {
         "createIndexes": "users",
@@ -1209,7 +1216,7 @@ pub async fn create_database(db: &MongoDb) {
     .await
     .unwrap();
 
-    // The same spec revision 76 builds
+    // The same spec revision 77 builds
     db.run_command(doc! {
         "createIndexes": E2EE_REMOVED_DEVICES_COLLECTION,
         "indexes": [e2ee_removed_devices_index()]
@@ -1432,6 +1439,11 @@ pub async fn create_database(db: &MongoDb) {
     seed_cipher_numbers_table(&db)
         .await
         .expect("Failed to seed cipher_numbers.");
+
+    // Prot. The same helper revision 76 runs.
+    create_prot_indexes(&db)
+        .await
+        .expect("Failed to create Prot indexes.");
 
     info!("Created database.");
 }
