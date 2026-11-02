@@ -173,6 +173,7 @@ impl<'r> Responder<'r, 'static> for Error {
             ErrorType::IncorrectData { .. } => Status::BadRequest,
             ErrorType::MlsCallFull { .. } => Status::Conflict,
             ErrorType::VideoCallFull { .. } => Status::Conflict,
+            ErrorType::E2EEDeviceRemoved => Status::Forbidden,
 
             ErrorType::PaymentsDisabled => Status::BadRequest,
             ErrorType::CipherSalesClosed => Status::Forbidden,
@@ -261,6 +262,18 @@ mod tests {
             let response = error.respond_to(request.inner()).unwrap();
             assert_eq!(response.status().code, code, "{name}");
         }
+    }
+
+    /// A removed E2EE device is a 403 refusal of an authenticated caller,
+    /// not a 401; `axum.rs` pins the same answer
+    #[test]
+    fn e2ee_device_removed_is_forbidden() {
+        let client = Client::untracked(rocket::build()).unwrap();
+        let request = client.get("/");
+        let response = create_error!(E2EEDeviceRemoved)
+            .respond_to(request.inner())
+            .unwrap();
+        assert_eq!(response.status(), Status::Forbidden);
     }
 
     #[rocket::async_test]

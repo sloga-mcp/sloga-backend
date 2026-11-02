@@ -366,6 +366,12 @@ pub enum ErrorType {
         max: usize,
     },
 
+    // ? E2EE device errors
+    /// The E2EE device id was removed from the account (`DELETE
+    /// /e2ee/keys/{device}`) and can never be published again; the install
+    /// sets up a new device instead (multi-device plan D8)
+    E2EEDeviceRemoved,
+
     // ? Payment and Cipher errors
     /// Payments are switched off in the config (`[features.payments]`)
     PaymentsDisabled,
@@ -529,6 +535,15 @@ mod tests {
             value,
             serde_json::json!({ "type": "CipherRegionUnavailable" })
         );
+    }
+
+    /// The type the client keys its "set this device up again" prompt on
+    /// (multi-device D8)
+    #[cfg(feature = "serde")]
+    #[test]
+    fn device_removed_error_serializes_by_name() {
+        let value = serde_json::to_value(create_error!(E2EEDeviceRemoved)).unwrap();
+        assert_eq!(value, serde_json::json!({ "type": "E2EEDeviceRemoved" }));
     }
 
     #[cfg(feature = "serde")]

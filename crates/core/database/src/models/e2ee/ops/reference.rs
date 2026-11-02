@@ -2,7 +2,8 @@ use iso8601_timestamp::Timestamp;
 use revolt_result::Result;
 
 use crate::{
-    AbstractE2EE, E2EEBackup, E2EEBlob, E2EEEnvelope, E2EEIdentity, E2EEOneTimeKey, ReferenceDb,
+    AbstractE2EE, E2EEBackup, E2EEBlob, E2EEEnvelope, E2EEIdentity, E2EEOneTimeKey,
+    E2EERemovedDevice, ReferenceDb,
 };
 
 #[async_trait]
@@ -61,6 +62,23 @@ impl AbstractE2EE for ReferenceDb {
         identity.last_session_id = session_id.to_string();
         identity.last_seen_at = at;
         Ok(())
+    }
+
+    async fn unbind_e2ee_identity_session_if(
+        &self,
+        user_id: &str,
+        device_id: &str,
+        session_id: &str,
+    ) -> Result<bool> {
+        // Check-and-set under the mutex, matching Mongo's filtered update
+        let mut identities = self.e2ee_identities.lock().await;
+        match identities.get_mut(&E2EEIdentity::composite_id(user_id, device_id)) {
+            Some(identity) if identity.last_session_id == session_id => {
+                identity.last_session_id = String::new();
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
     }
 
     async fn delete_e2ee_device(&self, user_id: &str, device_id: &str) -> Result<bool> {
@@ -344,5 +362,25 @@ impl AbstractE2EE for ReferenceDb {
         let before = backups.len();
         backups.retain(|_, backup| backup.user_id != user_id);
         Ok(before - backups.len())
+    }
+
+    async fn upsert_e2ee_removed_device(&self, removed: &E2EERemovedDevice) -> Result<()> {
+        let mut tombstones = self.e2ee_removed_devices.lock().await;
+        tombstones
+            .entry(removed.id.clone())
+            .or_insert_with(|| removed.clone());
+        Ok(())
+    }
+
+    async fn is_e2ee_device_removed(&self, user_id: &str, device_id: &str) -> Result<bool> {
+        let tombstones = self.e2ee_removed_devices.lock().await;
+        Ok(tombstones.contains_key(&E2EERemovedDevice::composite_id(user_id, device_id)))
+    }
+
+    async fn delete_all_e2ee_removed_devices(&self, user_id: &str) -> Result<usize> {
+        let mut tombstones = self.e2ee_removed_devices.lock().await;
+        let before = tombstones.len();
+        tombstones.retain(|_, tombstone| tombstone.user_id != user_id);
+        Ok(before - tombstones.len())
     }
 }

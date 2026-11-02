@@ -35,6 +35,26 @@ pub(crate) fn protected_nonce_index() -> bson::Document {
     }
 }
 
+/// Collection of E2EE device removal tombstones (multi-device plan D8)
+pub(crate) const E2EE_REMOVED_DEVICES_COLLECTION: &str = "e2ee_removed_devices";
+
+/// At most one removal tombstone per `(user_id, device_id)`, as one element
+/// of a `createIndexes` "indexes" array. The composite `_id` already makes
+/// the pair unique; the named index also serves the account-deletion
+/// cascade, which deletes by `user_id`.
+///
+/// The one spec for this file and revision 76.
+pub(crate) fn e2ee_removed_devices_index() -> bson::Document {
+    doc! {
+        "key": {
+            "user_id": 1_i32,
+            "device_id": 1_i32
+        },
+        "name": "user_device",
+        "unique": true
+    }
+}
+
 pub async fn create_database(db: &MongoDb) {
     info!("Creating database.");
     let db = db.db();
@@ -164,6 +184,10 @@ pub async fn create_database(db: &MongoDb) {
     db.create_collection("e2ee_queue")
         .await
         .expect("Failed to create e2ee_queue collection.");
+
+    db.create_collection(E2EE_REMOVED_DEVICES_COLLECTION)
+        .await
+        .expect("Failed to create e2ee_removed_devices collection.");
 
     db.create_collection("mls_key_packages")
         .await
@@ -1184,6 +1208,14 @@ pub async fn create_database(db: &MongoDb) {
     })
     .await
     .unwrap();
+
+    // The same spec revision 76 builds
+    db.run_command(doc! {
+        "createIndexes": E2EE_REMOVED_DEVICES_COLLECTION,
+        "indexes": [e2ee_removed_devices_index()]
+    })
+    .await
+    .expect("Failed to create e2ee_removed_devices index.");
 
     db.run_command(doc! {
         "createIndexes": "calendar_events",

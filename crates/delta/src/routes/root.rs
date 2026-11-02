@@ -162,6 +162,16 @@ pub struct ProtectedChannelsFeature {
     pub default_device_cap: u32,
 }
 
+/// # E2EE Capabilities
+#[derive(Serialize, JsonSchema, Debug)]
+pub struct E2EEFeature {
+    /// Whether a first key publication accepts `split_from` (an install
+    /// that shares a device with another install becomes a separate
+    /// device). Clients offer the split only when this is true: an older
+    /// server would revoke the shared device instead
+    pub split_from: bool,
+}
+
 /// # Feature Configuration
 #[derive(Serialize, JsonSchema, Debug)]
 pub struct RevoltFeatures {
@@ -206,6 +216,8 @@ pub struct RevoltFeatures {
     pub boosts: BoostsFeature,
     /// Protected channels configuration
     pub protected_channels: ProtectedChannelsFeature,
+    /// E2EE server capabilities
+    pub e2ee: E2EEFeature,
 }
 
 /// # Limits For Users
@@ -449,6 +461,8 @@ pub async fn root() -> Result<Json<RevoltConfig>> {
                 enabled: config.features.e2ee_enabled && config.features.protected_channels.enabled,
                 default_device_cap: config.features.protected_channels.default_device_cap,
             },
+            // A capability of this build, not a setting
+            e2ee: E2EEFeature { split_from: true },
         },
         ws: config.hosts.events,
         app: config.hosts.app,

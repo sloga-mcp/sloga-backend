@@ -33,6 +33,12 @@ fn check_signed_key(key: &v0::E2EESignedKey) -> Result<()> {
 /// republishing may only rotate the fallback key and add one-time keys; a
 /// fresh identity requires revoking the device and enrolling a new one.
 ///
+/// A first publication may carry `split_from` + `split_proof`: the install
+/// leaves a device it shared with another install and becomes this new
+/// device. The old device is unbound from this session, not revoked. A
+/// device id removed with `DELETE /e2ee/keys/{device}` cannot be published
+/// again.
+///
 /// All signatures are verified server-side as a hygiene check; clients MUST
 /// still verify them on fetch — the server is outside the trust boundary.
 #[openapi(tag = "E2EE")]
@@ -52,6 +58,8 @@ pub async fn publish_keys(
 
     let data = data.into_inner();
     let replace_one_time_keys = data.replace_one_time_keys;
+    let split_from = data.split_from;
+    let split_proof = data.split_proof;
 
     // Structural validation before any crypto
     if !is_valid_device_id(&data.device_id) {
@@ -134,6 +142,11 @@ pub async fn publish_keys(
         // already-consumed public keys and wedge the device's peers
         existing.assert_bound_session(&session.id)?;
 
+        // A split creates a device; it is never part of a republish
+        if split_from.is_some() || split_proof.is_some() {
+            return Err(create_error!(InvalidOperation));
+        }
+
         // Identity keys are immutable per device: a differing key is a
         // substitution attempt (or a reinstall that must enroll fresh)
         if existing.ed25519_key != identity.ed25519_key
@@ -173,9 +186,60 @@ pub async fn publish_keys(
             return Err(create_error!(InvalidToken));
         }
 
+        // A device id removed with `DELETE /e2ee/keys/{device}` stays
+        // removed (multi-device D8); the install sets up a new device
+        if db
+            .is_e2ee_device_removed(&user.id, &identity.device_id)
+            .await?
+        {
+            return Err(create_error!(E2EEDeviceRemoved));
+        }
+
+        // Split (multi-device D5): the old device, one of THIS user's rows,
+        // must have signed the move to this device id and identity key from
+        // this session. Every check runs before any write
+        match (&split_from, &split_proof) {
+            (None, None) => {}
+            (Some(old_device_id), Some(proof)) => {
+                let old = if is_valid_device_id(old_device_id) {
+                    db.fetch_e2ee_identity(&user.id, old_device_id).await.ok()
+                } else {
+                    None
+                };
+
+                let verified = old.is_some_and(|old| {
+                    old.verify_split_proof(
+                        &identity.device_id,
+                        &identity.ed25519_key,
+                        &session.id,
+                        proof,
+                    )
+                });
+
+                if !verified {
+                    return Err(create_error!(InvalidCredentials));
+                }
+            }
+            (Some(_), None) => return Err(create_error!(InvalidCredentials)),
+            (None, Some(_)) => return Err(create_error!(InvalidOperation)),
+        }
+
         // Uniqueness of (user_id, device_id) is index-enforced; a concurrent
         // duplicate publish loses the race here
         db.insert_e2ee_identity(&identity).await?;
+
+        // Release the old device from this session only (one filtered
+        // update, so a twin that re-bound it keeps its binding). It runs
+        // before the sweep below: once it is bound to "", the sweep (which
+        // matches rows bound to this session) leaves it alone
+        let unbind = match &split_from {
+            Some(old_device_id) => {
+                E2EEIdentity::unbind_session_if(db, &user.id, old_device_id, &session.id)
+                    .await
+                    .map(|_| ())
+            }
+            None => Ok(()),
+        };
 
         // Device-list changes are loud: notify the account's other devices
         // and DM peers
@@ -185,9 +249,16 @@ pub async fn publish_keys(
             EventV1::E2EEDeviceCreate {
                 user_id: user.id.clone(),
                 device_id: identity.device_id.clone(),
+                split_from: split_from.clone(),
             },
         )
         .await;
+
+        // A failed unbind may leave the old device bound to this session,
+        // and the sweep would then revoke the device the twin still uses:
+        // fail the publish instead. The client keeps the old device; the
+        // new row is an orphan that this session's next claim sweeps
+        unbind?;
 
         // Same-session predecessor sweep (device-lifecycle fixes §2): a
         // first publication from this session proves any OTHER identity
