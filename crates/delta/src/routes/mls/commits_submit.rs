@@ -38,7 +38,7 @@ use super::{
 /// commit from the device its session is bound to; a commit row already at
 /// the epoch answers before any validity check; the commit's
 /// `authenticated_data` must be the channel's newest stored seat list;
-/// Adds need the growth flag, an Active entitlement and eligible, seated
+/// Adds need the growth flag, an Active or Grace entitlement and eligible, seated
 /// targets within the device and leaf caps; Removes follow the Remove rule.
 /// Its commit envelopes carry the declarations (`committer`, `added`,
 /// `removed`, `rejoin_intents`) receivers bind the commit to.
@@ -334,7 +334,7 @@ async fn submit_call_commit(
 ///    idempotent after the group, the seat list or the growth flag moved on
 ///    (W0-fix8, §11);
 /// 5. validity: open; the AD binding; for Adds the growth gate, an Active
-///    entitlement and no pending removal; the Remove rule; the Add targets
+///    or Grace entitlement and no pending removal; the Remove rule; the Add targets
 ///    and caps. The commit transaction checks them again on its own read,
 ///    and that check is the one that binds.
 async fn submit_text_commit(
@@ -443,13 +443,15 @@ async fn submit_text_commit(
         .collect();
 
     // Growth is Adds only: Remove and Update commits go on with the flag
-    // off (decision 5 (W2)). Adds also need an Active entitlement
-    // (decision 7) and no pending removal (W0-fix3).
+    // off (decision 5 (W2)) and in every entitlement state, Frozen and
+    // Deleted included (S5b). Adds also need an entitlement that allows text
+    // traffic, Active or Grace (decision 7, S5b D14), and no pending removal
+    // (W0-fix3).
     if !added.is_empty() {
         super::require_text_gate(TextGate::Growth).await?;
         if !entitlement
             .as_ref()
-            .is_some_and(|entitlement| entitlement.is_active())
+            .is_some_and(|entitlement| entitlement.allows_text_traffic())
         {
             return Err(create_error!(InvalidOperation));
         }
@@ -2643,6 +2645,99 @@ mod tests {
             commit_next(&setup, &setup.owner, vec![], vec![revoked.device()]).await,
             "a Remove without an entitlement",
         );
+    }
+
+    /// S5b D14: in Grace a seated member's new device is still added
+    #[test]
+    fn grace_allows_adds_of_seated_devices() {
+        crate::util::test::rt().block_on(grace_allows_adds_of_seated_devices_case())
+    }
+
+    async fn grace_allows_adds_of_seated_devices_case() {
+        let setup = setup(1).await;
+        let db = setup.db();
+        set_entitlement(db, setup.channel_id(), Some(ChannelEntitlementState::Grace)).await;
+
+        let member = &setup.members[0];
+        assert_won(
+            commit_next(&setup, &setup.owner, vec![member.device()], vec![]).await,
+            "an Add in Grace",
+        );
+        assert!(db
+            .fetch_mls_group(&setup.group_id)
+            .await
+            .expect("the group")
+            .has_member(&member.user.id, &member.device_id));
+    }
+
+    /// Never-plaintext and removal safety (S5b): Remove and Update commits
+    /// are never gated on the entitlement, in Frozen and Deleted too, while
+    /// an Add in the same state is refused
+    #[test]
+    fn remove_and_update_commits_pass_in_frozen_and_deleted() {
+        crate::util::test::rt()
+            .block_on(remove_and_update_commits_pass_in_frozen_and_deleted_case())
+    }
+
+    async fn remove_and_update_commits_pass_in_frozen_and_deleted_case() {
+        let setup = setup(3).await;
+        let db = setup.db();
+        assert_won(
+            commit_next(
+                &setup,
+                &setup.owner,
+                vec![setup.members[0].device(), setup.members[1].device()],
+                vec![],
+            )
+            .await,
+            "two Adds while Active",
+        );
+
+        for (state, revoked) in [
+            (ChannelEntitlementState::Frozen, &setup.members[0]),
+            (ChannelEntitlementState::Deleted, &setup.members[1]),
+        ] {
+            let case = format!("{state:?}");
+            set_entitlement(db, setup.channel_id(), Some(state)).await;
+
+            let error = refusal(
+                commit_next(
+                    &setup,
+                    &setup.owner,
+                    vec![setup.members[2].device()],
+                    vec![],
+                )
+                .await,
+                &case,
+            );
+            assert!(
+                matches!(error.error_type, ErrorType::InvalidOperation),
+                "{}: {:?}",
+                case,
+                error
+            );
+            assert_route_refusal(&error, &case);
+
+            assert_won(
+                commit_next(&setup, &setup.owner, vec![], vec![]).await,
+                &format!("an Update, {case}"),
+            );
+
+            // A Remove (a revoked device, rule 4)
+            assert!(db
+                .delete_e2ee_device(&revoked.user.id, &revoked.device_id)
+                .await
+                .expect("revoke"));
+            assert_won(
+                commit_next(&setup, &setup.owner, vec![], vec![revoked.device()]).await,
+                &format!("a Remove, {case}"),
+            );
+            assert!(!db
+                .fetch_mls_group(&setup.group_id)
+                .await
+                .expect("the group")
+                .has_member(&revoked.user.id, &revoked.device_id));
+        }
     }
 
     // ---------------------------------------------------------------------

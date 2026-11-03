@@ -275,6 +275,13 @@ async fn claim_for_text_group(
 
     super::require_text_gate(TextGate::Growth).await?;
     super::require_seated(db, &group.channel_id, &user.id).await?;
+    // A claim is for an Add, so Frozen and Deleted refuse it like the Add
+    // (S5b D14). A missing entitlement passes, as in S1
+    if let Some(entitlement) = db.fetch_channel_entitlement(&group.channel_id).await? {
+        if !entitlement.allows_text_traffic() {
+            return Err(create_error!(InvalidOperation));
+        }
+    }
 
     // A claim admits a device into an OPEN group, and only a current member
     // device admits (decision 7 (W2))
@@ -453,8 +460,8 @@ async fn claim_text_target(
 mod tests {
     use iso8601_timestamp::{Duration, Timestamp};
     use revolt_database::{
-        BotInformation, Database, MemberCompositeKey, MlsKeyPackage, PartialChannel, PartialUser,
-        RelationshipStatus, Session, User,
+        BotInformation, ChannelEntitlementState, Database, MemberCompositeKey, MlsKeyPackage,
+        PartialChannel, PartialUser, RelationshipStatus, Session, User,
     };
     use revolt_models::v0;
     use revolt_permissions::{ChannelPermission, OverrideField};
@@ -1362,5 +1369,130 @@ mod tests {
         let body: serde_json::Value = serde_json::from_str(&answer.1).expect("JSON");
         assert_eq!(body["feature"], "protected_channels", "{}", answer.1);
         assert_eq!(packages_left(db, &member_device).await, 1);
+    }
+
+    /// Set the channel's entitlement state, raw (S1 has no primitive for it)
+    async fn set_entitlement_state(
+        db: &Database,
+        channel_id: &str,
+        state: ChannelEntitlementState,
+    ) {
+        match db {
+            Database::Reference(reference) => {
+                let mut found = 0;
+                for entitlement in reference.channel_entitlements.lock().await.values_mut() {
+                    if entitlement.channel_id == channel_id {
+                        entitlement.state = state.clone();
+                        found += 1;
+                    }
+                }
+                assert_eq!(found, 1);
+            }
+            Database::MongoDb(mongo) => {
+                use revolt_database::mongodb::bson::{doc, to_bson, Document};
+
+                let result = mongo
+                    .col::<Document>("channel_entitlements")
+                    .update_one(
+                        doc! { "channel_id": channel_id },
+                        doc! { "$set": { "state": to_bson(&state).expect("a state") } },
+                    )
+                    .await
+                    .expect("raw state write");
+                assert_eq!(result.matched_count, 1);
+            }
+        }
+
+        let entitlement = db
+            .fetch_channel_entitlement(channel_id)
+            .await
+            .expect("entitlement read")
+            .expect("an entitlement");
+        assert_eq!(entitlement.state, state);
+    }
+
+    /// S5b D14: in Grace a member device still claims a seated member's
+    /// device, to add it
+    #[test]
+    fn grace_allows_a_key_package_claim() {
+        crate::util::test::rt().block_on(grace_allows_a_key_package_claim_case())
+    }
+
+    async fn grace_allows_a_key_package_claim_case() {
+        let harness = TestHarness::new().await;
+        let db = &harness.db;
+        let (_, owner_session, owner) = harness.new_user().await;
+        let (_, member_session, member) = harness.new_user().await;
+        let protected = harness
+            .new_protected_channel(&owner, &owner_session, &[&member])
+            .await;
+        let group = harness
+            .new_text_group(&protected.channel, &protected.owner_device, 0, None)
+            .await;
+        let member_device = harness
+            .new_e2ee_device(&member, &member_session.id, MEMBER_DEVICE_SEED)
+            .await;
+        publish(db, &member_device, "member-0", false).await;
+
+        set_entitlement_state(db, protected.channel.id(), ChannelEntitlementState::Grace).await;
+        let (status, body) = claim_http(
+            &harness,
+            &owner_session,
+            &claim_body(
+                &protected.owner_device.device_id,
+                &group.id,
+                &[(&member.id, &member_device.device_id)],
+            ),
+        )
+        .await;
+        assert_eq!(tags(&served(status, &body, "grace")), ["Claimed"]);
+        assert_eq!(packages_left(db, &member_device).await, 0);
+    }
+
+    /// Frozen and Deleted refuse a claim before any package is consumed; the
+    /// entitlement is the only thing in the way
+    #[test]
+    fn frozen_refuses_a_key_package_claim() {
+        crate::util::test::rt().block_on(frozen_refuses_a_key_package_claim_case())
+    }
+
+    async fn frozen_refuses_a_key_package_claim_case() {
+        let harness = TestHarness::new().await;
+        let db = &harness.db;
+        let (_, owner_session, owner) = harness.new_user().await;
+        let (_, member_session, member) = harness.new_user().await;
+        let protected = harness
+            .new_protected_channel(&owner, &owner_session, &[&member])
+            .await;
+        let group = harness
+            .new_text_group(&protected.channel, &protected.owner_device, 0, None)
+            .await;
+        let member_device = harness
+            .new_e2ee_device(&member, &member_session.id, MEMBER_DEVICE_SEED)
+            .await;
+        publish(db, &member_device, "member-0", false).await;
+        let body = claim_body(
+            &protected.owner_device.device_id,
+            &group.id,
+            &[(&member.id, &member_device.device_id)],
+        );
+
+        for state in [
+            ChannelEntitlementState::Frozen,
+            ChannelEntitlementState::Deleted,
+        ] {
+            let case = format!("{state:?}");
+            set_entitlement_state(db, protected.channel.id(), state).await;
+            let answer = claim_http(&harness, &owner_session, &body).await;
+            refused(&answer, Status::BadRequest, "InvalidOperation", &case);
+            assert_eq!(packages_left(db, &member_device).await, 1, "{}", case);
+        }
+
+        set_entitlement_state(db, protected.channel.id(), ChannelEntitlementState::Active).await;
+        let (status, response) = claim_http(&harness, &owner_session, &body).await;
+        assert_eq!(
+            tags(&served(status, &response, "active again")),
+            ["Claimed"]
+        );
     }
 }

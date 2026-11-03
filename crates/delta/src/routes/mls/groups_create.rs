@@ -165,9 +165,9 @@ pub async fn create_group(
 /// 3. request validation, the checks on the body alone;
 /// 4. the growth gate (Text create is growth, decision 5 (W2));
 /// 5. the 6.1 create rules: the channel is protected, its entitlement is
-///    `Active`, the caller is seated, the caller is the current seat list's
-///    signer creating from its signer device with this session bound to that
-///    device, and the successor rule.
+///    `Active` or `Grace` (S5b D14), the caller is seated, the caller is the
+///    current seat list's signer creating from its signer device with this
+///    session bound to that device, and the successor rule.
 ///
 /// The media flag, the voice channel and call presence play no part. Only
 /// `create_text_mls_group` is called, which re-checks the signer, the
@@ -193,7 +193,7 @@ async fn create_text_group(
         return Err(create_error!(InvalidOperation));
     }
     match db.fetch_channel_entitlement(channel.id()).await? {
-        Some(entitlement) if entitlement.is_active() => {}
+        Some(entitlement) if entitlement.allows_text_traffic() => {}
         _ => return Err(create_error!(InvalidOperation)),
     }
     super::require_seated(db, channel.id(), &user.id).await?;
@@ -1126,7 +1126,6 @@ mod tests {
             .expect("re-grant");
 
         for state in [
-            ChannelEntitlementState::Grace,
             ChannelEntitlementState::Frozen,
             ChannelEntitlementState::Deleted,
         ] {
@@ -1142,6 +1141,61 @@ mod tests {
         // The entitlement was the only thing in the way
         set_entitlement(db, channel_id, Some(ChannelEntitlementState::Active)).await;
         assert_created(fixture.create_as_owner(request).await, "active again");
+    }
+
+    /// S5b D14: Grace keeps text traffic going, so the owner's device still
+    /// creates the successor generation (and Frozen still refuses the next)
+    #[test]
+    fn grace_allows_a_successor_generation() {
+        crate::util::test::rt().block_on(grace_allows_a_successor_generation_case())
+    }
+
+    async fn grace_allows_a_successor_generation_case() {
+        let fixture = fixture().await;
+        let db = fixture.db();
+        let first = fixture
+            .harness
+            .new_text_group(
+                &fixture.protected.channel,
+                &fixture.protected.owner_device,
+                0,
+                None,
+            )
+            .await;
+
+        set_entitlement(
+            db,
+            fixture.channel_id(),
+            Some(ChannelEntitlementState::Grace),
+        )
+        .await;
+        let request = fixture.owner_request(Some(1), Some(first.id.as_str()));
+        assert_created(fixture.create_as_owner(request.clone()).await, "grace");
+        let successor = db
+            .fetch_mls_group(&request.group_id)
+            .await
+            .expect("the successor");
+        assert_eq!(successor.generation, Some(1));
+        assert!(successor.open);
+        let first = db
+            .fetch_mls_group(&first.id)
+            .await
+            .expect("the first group");
+        assert!(!first.open);
+
+        set_entitlement(
+            db,
+            fixture.channel_id(),
+            Some(ChannelEntitlementState::Frozen),
+        )
+        .await;
+        let next = fixture.owner_request(Some(2), Some(request.group_id.as_str()));
+        assert_refused(
+            fixture.create_as_owner(next.clone()).await,
+            "InvalidOperation",
+            "frozen",
+        );
+        assert_no_group(db, &next.group_id, "frozen").await;
     }
 
     #[test]

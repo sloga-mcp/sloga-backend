@@ -33,6 +33,7 @@ pub async fn message_pin(
         // Archived/locked threads reject participation.
         crate::util::threads::ensure_thread_writable(&channel, &permissions)?;
     }
+    crate::util::prot_gate::refuse_if_tank_frozen(db, &channel, &permission_channel).await?;
 
     let mut message = msg.as_message_in_channel(db, channel.id()).await?;
 

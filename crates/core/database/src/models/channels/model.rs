@@ -1689,6 +1689,7 @@ impl Channel {
         // failure leaves the channel in place and unannounced, and the
         // delete can be retried.
         if let Channel::TextChannel { .. } = self {
+            crate::prot_settle_channel_on_delete(db, &id).await?;
             db.delete_protected_channel_data(&id).await?;
         }
 

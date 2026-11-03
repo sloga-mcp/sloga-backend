@@ -294,6 +294,7 @@ impl Server {
         let mut protected_ids: std::collections::BTreeSet<String> =
             self.channels.iter().cloned().collect();
         protected_ids.extend(db.fetch_entitled_channel_ids(&self.id).await?);
+        crate::prot_settle_server_on_delete(db, &self.id, &protected_ids).await?;
         for channel_id in &protected_ids {
             db.delete_protected_channel_data(channel_id).await?;
         }
@@ -1849,5 +1850,99 @@ mod protected_delete_tests {
         assert!(boosts < cascade, "{body}");
         assert!(cascade < event, "{body}");
         assert!(event < row, "{body}");
+    }
+
+    /// Prot settlement (S5b 6.8) runs once the ids are collected and before
+    /// the cascade erases the entitlements it settles, so a settlement error
+    /// aborts the delete with nothing erased or announced. Control: the
+    /// settlement call moved below the cascade loop.
+    #[test]
+    fn server_delete_settles_before_the_protected_cascade() {
+        const SOURCE: &str = include_str!("model.rs");
+
+        let at = SOURCE
+            .find("pub async fn delete(self, db: &Database) -> Result<()> {")
+            .expect("Server::delete");
+        let end = at
+            + SOURCE[at..]
+                .find("\n    }\n")
+                .expect("the end of Server::delete");
+        let body = &SOURCE[at..end];
+
+        let position = |needle: &str| {
+            assert_eq!(body.matches(needle).count(), 1, "`{needle}`: {body}");
+            body.find(needle).expect("counted above")
+        };
+        let ids = position("protected_ids.extend(db.fetch_entitled_channel_ids(&self.id).await?);");
+        let settle =
+            position("crate::prot_settle_server_on_delete(db, &self.id, &protected_ids).await?;");
+        let cascade = position("db.delete_protected_channel_data(channel_id).await?;");
+        let event = position("EventV1::ServerDelete {");
+
+        assert!(ids < settle, "{body}");
+        assert!(settle < cascade, "{body}");
+        assert!(cascade < event, "{body}");
+    }
+
+    /// A grant over a tank-backed (`Crowdfund` or `Prot`) entitlement is
+    /// refused in both drivers and leaves the row as it was, so a grant can
+    /// never rewrite a tank's `slot_cap` (S5b 6.6); an `AdminGrant` row is
+    /// still re-granted. Control: the source check removed from a driver.
+    #[tokio::test]
+    async fn admin_grant_refuses_a_crowdfund_entitlement() {
+        database_test!(|db| async move {
+            let server_id = Ulid::new().to_string();
+            for source in [
+                ChannelEntitlementSource::Crowdfund,
+                ChannelEntitlementSource::Prot,
+            ] {
+                let channel_id = Ulid::new().to_string();
+                let tank_backed = ChannelEntitlement {
+                    source,
+                    slot_cap: 5,
+                    granted_by: "sys:tank".to_string(),
+                    ..entitlement(&channel_id, &server_id)
+                };
+                db.upsert_channel_entitlement(&tank_backed, now())
+                    .await
+                    .expect("tank-backed entitlement");
+
+                let grant = ChannelEntitlement {
+                    slot_cap: 2,
+                    ..entitlement(&channel_id, &server_id)
+                };
+                let error = db
+                    .upsert_channel_entitlement(&grant, now())
+                    .await
+                    .expect_err("a grant over a tank-backed entitlement");
+                assert!(
+                    matches!(error.error_type, ErrorType::InvalidOperation),
+                    "{error:?}"
+                );
+                assert_eq!(
+                    db.fetch_channel_entitlement(&channel_id)
+                        .await
+                        .expect("fetch")
+                        .as_ref(),
+                    Some(&tank_backed)
+                );
+            }
+
+            let channel_id = Ulid::new().to_string();
+            let granted = entitlement(&channel_id, &server_id);
+            db.upsert_channel_entitlement(&granted, now())
+                .await
+                .expect("grant");
+            let regrant = ChannelEntitlement {
+                slot_cap: 2,
+                ..entitlement(&channel_id, &server_id)
+            };
+            let stored = db
+                .upsert_channel_entitlement(&regrant, now())
+                .await
+                .expect("re-grant");
+            assert_eq!(stored.slot_cap, 2);
+            assert_eq!(stored.id, granted.id);
+        });
     }
 }

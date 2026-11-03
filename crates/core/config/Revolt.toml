@@ -495,6 +495,7 @@ afk_auto_move = true
 # withdraw_cutoff_hours = 48
 # contribute_hold_hours = 72      # Prot bought this recently can't be contributed; 0 = no hold
 # wallet_cap = 100000             # most Prot one wallet may hold
+# max_launch_goal_days = 365      # longest launch goal (at most 3650)
 
 [features.antispam]
 # Ships OFF; prod enables it in Revolt.overrides.toml under [features.antispam], then restarts delta AND crond.

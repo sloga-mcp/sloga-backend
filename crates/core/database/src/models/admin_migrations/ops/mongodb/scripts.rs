@@ -26,7 +26,7 @@ struct MigrationInfo {
     revision: i32,
 }
 
-pub const LATEST_REVISION: i32 = 77; // MUST BE +1 to last migration
+pub const LATEST_REVISION: i32 = 80; // MUST BE +1 to last migration
 
 pub async fn migrate_database(db: &MongoDb) {
     let migrations = db.col::<Document>("migrations");
@@ -3056,6 +3056,33 @@ pub async fn run_migrations(db: &MongoDb, revision: i32) -> i32 {
             .expect("Failed to create Prot indexes.");
     }
 
+    // The Prot fuel tanks (S5b) follow the Prot ledger block as their own
+    // top-level guard. 77 is e2ee add-device's and 78 protected-channels
+    // S2's; a database at 79 runs only this block.
+    //
+    // Migration chain (steward renumber, 2026-11-02): add-device `<= 77` /
+    // 78, S2 `<= 78` / 79, this block `<= 79` / 80, S4 `<= 80` / 81, S6
+    // `<= 81` / 82. Blocks land in ascending number, and a block is never
+    // numbered at or below the LATEST_REVISION of anything already landed
+    // or deployed. Further renumbering is the steward's alone; it touches
+    // only this guard, LATEST_REVISION, the latest-revision pin and the
+    // `revision_79_*` test names and literals.
+    if revision <= 79 {
+        info!("Running migration [revision 79 / 01-11-2026]: Create Prot tank, goal and pledge collections (Prot fuel tanks)");
+
+        // Same contract as revision 76: panics on failure (the unique target
+        // and open-goal keys are what stop a second tank or a second open
+        // goal), and every step is idempotent, so the next boot re-runs the
+        // whole block.
+        for collection in PROT_TANK_COLLECTIONS {
+            db.db().create_collection(collection).await.ok();
+        }
+
+        create_prot_tank_indexes(&db.db())
+            .await
+            .expect("Failed to create Prot tank indexes.");
+    }
+
     // Reminder to update LATEST_REVISION when adding new migrations.
     LATEST_REVISION.max(revision)
 }
@@ -3069,8 +3096,19 @@ pub const PAYMENT_COLLECTIONS: [&str; 4] = [
     "cipher_memberships",
 ];
 
-/// The Prot collections (revision 76). Created by both the migration and `init.rs`. S5b grows the array.
+/// The Prot collections (revision 76). Created by both the migration and `init.rs`. Never grown:
+/// block 76 may already have run, so S5b's collections are `PROT_TANK_COLLECTIONS` (revision 79).
 pub const PROT_COLLECTIONS: [&str; 2] = ["prot_accounts", "prot_ledger"];
+
+/// The Prot fuel tank collections (revision 79). Created by both the migration and `init.rs`.
+pub const PROT_TANK_COLLECTIONS: [&str; 6] = [
+    "prot_pledges",
+    "prot_tanks",
+    "prot_goals",
+    "prot_notices",
+    "prot_contributor_prefs",
+    "prot_runtime",
+];
 
 /// Revision 76: the Prot indexes, shared by the migration and `init.rs` (same shape as
 /// create_payment_indexes). Re-running is a no-op.
@@ -3139,6 +3177,199 @@ pub async fn create_prot_indexes(
                 "name": "prot_ledger_membership",
                 "partialFilterExpression": {
                     "ref.membership_order_id": { "$type": "string" }
+                }
+            }
+        ]
+    })
+    .await?;
+
+    Ok(())
+}
+
+/// Revision 79: the Prot fuel tank indexes, shared by the migration and `init.rs` (same shape as
+/// create_prot_indexes). Re-running is a no-op.
+///
+/// `prot_notices`, `prot_contributor_prefs` and `prot_runtime` need nothing beyond `_id`: each is
+/// only ever read and written by id.
+pub async fn create_prot_tank_indexes(
+    db: &crate::mongodb::Database,
+) -> Result<(), crate::mongodb::error::Error> {
+    db.run_command(doc! {
+        "createIndexes": "prot_ledger",
+        "indexes": [
+            // Serves a tank's history, newest first. Partial: most rows
+            // have no tank.
+            {
+                "key": {
+                    "ref.tank_id": 1_i32,
+                    "_id": -1_i32
+                },
+                "name": "prot_ledger_tank_id",
+                "partialFilterExpression": {
+                    "ref.tank_id": { "$type": "string" }
+                }
+            },
+            // Serves a tank's rows debited from one account, oldest first
+            // (one contributor's lots). Partial for the same reason.
+            {
+                "key": {
+                    "ref.tank_id": 1_i32,
+                    "debit": 1_i32,
+                    "created_at": 1_i32
+                },
+                "name": "prot_ledger_tank_debit_created",
+                "partialFilterExpression": {
+                    "ref.tank_id": { "$type": "string" }
+                }
+            },
+            // Serves the rows of one pledge (hold, capture, returns,
+            // clawback). Partial: most rows have no pledge.
+            {
+                "key": {
+                    "ref.pledge_id": 1_i32
+                },
+                "name": "prot_ledger_pledge",
+                "partialFilterExpression": {
+                    "ref.pledge_id": { "$type": "string" }
+                }
+            }
+        ]
+    })
+    .await?;
+
+    db.run_command(doc! {
+        "createIndexes": "prot_pledges",
+        "indexes": [
+            // Serves a goal's pledges in a state (capture, returns, the
+            // pledge drain).
+            {
+                "key": {
+                    "goal_id": 1_i32,
+                    "state": 1_i32
+                },
+                "name": "prot_pledges_goal_state"
+            },
+            // Serves a user's pledges in a state, newest first (account
+            // deletion, the clawback drain).
+            {
+                "key": {
+                    "user_id": 1_i32,
+                    "state": 1_i32,
+                    "_id": -1_i32
+                },
+                "name": "prot_pledges_user_state"
+            }
+        ]
+    })
+    .await?;
+
+    db.run_command(doc! {
+        "createIndexes": "prot_tanks",
+        "indexes": [
+            // ENFORCES one tank per target: a launch retried after a crash
+            // finds the tank it already made instead of making a second.
+            {
+                "key": {
+                    "target_key": 1_i32
+                },
+                "name": "prot_tanks_target_unique",
+                "unique": true
+            },
+            // Serves the clock's due burns: a stage, oldest unbilled day
+            // first.
+            {
+                "key": {
+                    "stage": 1_i32,
+                    "next_burn_day": 1_i32
+                },
+                "name": "prot_tanks_stage_next_burn"
+            },
+            // Serves the clock's paging over the tanks in a stage.
+            {
+                "key": {
+                    "stage": 1_i32,
+                    "_id": 1_i32
+                },
+                "name": "prot_tanks_stage_id"
+            },
+            // Serves the purge passes over ended tanks.
+            {
+                "key": {
+                    "stage": 1_i32,
+                    "purge_passes": 1_i32,
+                    "_id": 1_i32
+                },
+                "name": "prot_tanks_stage_purge"
+            },
+            // Serves a server's tanks (server delete, ownership transfer).
+            {
+                "key": {
+                    "server_id": 1_i32
+                },
+                "name": "prot_tanks_server"
+            }
+        ]
+    })
+    .await?;
+
+    db.run_command(doc! {
+        "createIndexes": "prot_goals",
+        "indexes": [
+            // Serves the goals sweep: open goals past their deadline.
+            {
+                "key": {
+                    "state": 1_i32,
+                    "deadline_at": 1_i32
+                },
+                "name": "prot_goals_state_deadline"
+            },
+            // Serves the goals sweep: funded goals past their launch window.
+            {
+                "key": {
+                    "state": 1_i32,
+                    "launch_deadline_at": 1_i32
+                },
+                "name": "prot_goals_state_launch_deadline"
+            },
+            // Serves the goals sweep: the 7-day returns after a launch.
+            {
+                "key": {
+                    "state": 1_i32,
+                    "launched_at": 1_i32
+                },
+                "name": "prot_goals_state_launched"
+            },
+            // Serves a server's goals in a state.
+            {
+                "key": {
+                    "server_id": 1_i32,
+                    "state": 1_i32
+                },
+                "name": "prot_goals_server_state"
+            },
+            // Serves a tank's upgrade goals in a state. Partial: launch
+            // goals have no tank until they launch.
+            {
+                "key": {
+                    "tank_id": 1_i32,
+                    "state": 1_i32
+                },
+                "name": "prot_goals_tank_state",
+                "partialFilterExpression": {
+                    "tank_id": { "$type": "string" }
+                }
+            },
+            // ENFORCES one open launch goal per server and one open upgrade
+            // goal per tank. Partial: the key is unset once a goal closes,
+            // so closed goals never collide.
+            {
+                "key": {
+                    "open_key": 1_i32
+                },
+                "name": "prot_goals_open_key_unique",
+                "unique": true,
+                "partialFilterExpression": {
+                    "open_key": { "$type": "string" }
                 }
             }
         ]
@@ -3695,10 +3926,10 @@ mod afk_backfill_tests {
     }
 
     #[test]
-    fn latest_revision_is_77() {
+    fn latest_revision_is_80() {
         assert_eq!(
-            LATEST_REVISION, 77,
-            "the AFK backfill is revision 72, the ViewAuditLog backfill 73, the payments collections 74, protected channels 75, the Prot collections 76"
+            LATEST_REVISION, 80,
+            "the AFK backfill is revision 72, the ViewAuditLog backfill 73, the payments collections 74, protected channels 75, the Prot collections 76, the Prot tanks 79 (77 is e2ee add-device's, 78 protected-channels S2's)"
         );
     }
 
@@ -5338,6 +5569,24 @@ mod tests {
                     false,
                     Some(doc! { "ref.order_id": { "$type": "string" } }),
                 ),
+                spec(
+                    "prot_ledger_pledge",
+                    &[("ref.pledge_id", 1)],
+                    false,
+                    Some(doc! { "ref.pledge_id": { "$type": "string" } }),
+                ),
+                spec(
+                    "prot_ledger_tank_debit_created",
+                    &[("ref.tank_id", 1), ("debit", 1), ("created_at", 1)],
+                    false,
+                    Some(doc! { "ref.tank_id": { "$type": "string" } }),
+                ),
+                spec(
+                    "prot_ledger_tank_id",
+                    &[("ref.tank_id", 1), ("_id", -1)],
+                    false,
+                    Some(doc! { "ref.tank_id": { "$type": "string" } }),
+                ),
             ];
             let want_accounts = vec![spec("_id_", &[("_id", 1)], false, None)];
 
@@ -5371,6 +5620,279 @@ mod tests {
             assert_eq!(specs(&mongo, "prot_ledger").await, want_ledger);
             assert_eq!(specs(&mongo, "prot_accounts").await, want_accounts);
             assert_eq!(ledger.count_documents(doc! {}).await.expect("count"), 3);
+        }
+
+        db.drop_database().await;
+        guard.disarm();
+    }
+
+    /// Revision 79 must create the Prot tank collections and every S5b index
+    /// with its exact name and spec, starting from a database at 78 (the Prot
+    /// ledger already built), leave the S5a ledger indexes as they were, and
+    /// be a no-op when re-run. Control: drop `prot_tanks_target_unique` and
+    /// the spec check fails; past it, a second tank for one target would be
+    /// accepted.
+    #[tokio::test]
+    async fn revision_79_creates_the_prot_tank_indexes() {
+        // One index as listIndexes reports it: name, key fields in order,
+        // unique, partial filter.
+        type Spec = (String, Vec<(String, Bson)>, bool, Option<Document>);
+
+        // Every index of `collection`, sorted by name.
+        async fn specs(mongo: &crate::MongoDb, collection: &str) -> Vec<Spec> {
+            let reply = mongo
+                .db()
+                .run_command(doc! { "listIndexes": collection })
+                .await
+                .expect("listIndexes");
+            let mut specs: Vec<Spec> = reply
+                .get_document("cursor")
+                .and_then(|cursor| cursor.get_array("firstBatch"))
+                .expect("the first batch")
+                .iter()
+                .map(|index| {
+                    let index = index.as_document().expect("an index document");
+                    (
+                        index.get_str("name").expect("name").to_string(),
+                        index
+                            .get_document("key")
+                            .expect("key")
+                            .iter()
+                            .map(|(field, order)| (field.clone(), order.clone()))
+                            .collect(),
+                        index.get_bool("unique").unwrap_or(false),
+                        index.get_document("partialFilterExpression").ok().cloned(),
+                    )
+                })
+                .collect();
+            specs.sort_by(|a, b| a.0.cmp(&b.0));
+            specs
+        }
+
+        fn spec(name: &str, key: &[(&str, i32)], unique: bool, partial: Option<Document>) -> Spec {
+            (
+                name.to_string(),
+                key.iter()
+                    .map(|(field, order)| (field.to_string(), Bson::Int32(*order)))
+                    .collect(),
+                unique,
+                partial,
+            )
+        }
+
+        // Named by hand for the same 63-character reason as revision 70's.
+        let db = crate::DatabaseInfo::Test("migration_rev79_prot_tank".to_string())
+            .connect()
+            .await
+            .expect("Database connection failed.");
+        db.drop_database().await;
+        let guard = crate::test_teardown::TestDatabaseGuard::arm(&db).await;
+
+        {
+            #[allow(irrefutable_let_patterns)]
+            let Database::MongoDb(mongo) = db.clone() else {
+                // The migration scripts are MongoDB-only.
+                db.drop_database().await;
+                guard.disarm();
+                return;
+            };
+
+            // A database at 78 already holds the revision 76 ledger.
+            for collection in super::PROT_COLLECTIONS {
+                mongo
+                    .db()
+                    .create_collection(collection)
+                    .await
+                    .expect("create a Prot collection");
+            }
+            super::create_prot_indexes(&mongo.db())
+                .await
+                .expect("the revision 76 indexes");
+            let ledger_before = specs(&mongo, "prot_ledger").await;
+
+            assert_eq!(
+                super::run_migrations(&mongo, 78).await,
+                super::LATEST_REVISION
+            );
+
+            let collections = mongo
+                .db()
+                .list_collection_names()
+                .await
+                .expect("list collections");
+            for name in super::PROT_TANK_COLLECTIONS {
+                assert!(
+                    collections.iter().any(|collection| collection == name),
+                    "{name} missing from {collections:?}"
+                );
+            }
+
+            // The S5a ledger indexes stay, the three tank ones join them.
+            let mut want_ledger = ledger_before.clone();
+            want_ledger.extend([
+                spec(
+                    "prot_ledger_pledge",
+                    &[("ref.pledge_id", 1)],
+                    false,
+                    Some(doc! { "ref.pledge_id": { "$type": "string" } }),
+                ),
+                spec(
+                    "prot_ledger_tank_debit_created",
+                    &[("ref.tank_id", 1), ("debit", 1), ("created_at", 1)],
+                    false,
+                    Some(doc! { "ref.tank_id": { "$type": "string" } }),
+                ),
+                spec(
+                    "prot_ledger_tank_id",
+                    &[("ref.tank_id", 1), ("_id", -1)],
+                    false,
+                    Some(doc! { "ref.tank_id": { "$type": "string" } }),
+                ),
+            ]);
+            want_ledger.sort_by(|a, b| a.0.cmp(&b.0));
+            let want_pledges = vec![
+                spec("_id_", &[("_id", 1)], false, None),
+                spec(
+                    "prot_pledges_goal_state",
+                    &[("goal_id", 1), ("state", 1)],
+                    false,
+                    None,
+                ),
+                spec(
+                    "prot_pledges_user_state",
+                    &[("user_id", 1), ("state", 1), ("_id", -1)],
+                    false,
+                    None,
+                ),
+            ];
+            let want_tanks = vec![
+                spec("_id_", &[("_id", 1)], false, None),
+                spec("prot_tanks_server", &[("server_id", 1)], false, None),
+                spec(
+                    "prot_tanks_stage_id",
+                    &[("stage", 1), ("_id", 1)],
+                    false,
+                    None,
+                ),
+                spec(
+                    "prot_tanks_stage_next_burn",
+                    &[("stage", 1), ("next_burn_day", 1)],
+                    false,
+                    None,
+                ),
+                spec(
+                    "prot_tanks_stage_purge",
+                    &[("stage", 1), ("purge_passes", 1), ("_id", 1)],
+                    false,
+                    None,
+                ),
+                spec("prot_tanks_target_unique", &[("target_key", 1)], true, None),
+            ];
+            let want_goals = vec![
+                spec("_id_", &[("_id", 1)], false, None),
+                spec(
+                    "prot_goals_open_key_unique",
+                    &[("open_key", 1)],
+                    true,
+                    Some(doc! { "open_key": { "$type": "string" } }),
+                ),
+                spec(
+                    "prot_goals_server_state",
+                    &[("server_id", 1), ("state", 1)],
+                    false,
+                    None,
+                ),
+                spec(
+                    "prot_goals_state_deadline",
+                    &[("state", 1), ("deadline_at", 1)],
+                    false,
+                    None,
+                ),
+                spec(
+                    "prot_goals_state_launch_deadline",
+                    &[("state", 1), ("launch_deadline_at", 1)],
+                    false,
+                    None,
+                ),
+                spec(
+                    "prot_goals_state_launched",
+                    &[("state", 1), ("launched_at", 1)],
+                    false,
+                    None,
+                ),
+                spec(
+                    "prot_goals_tank_state",
+                    &[("tank_id", 1), ("state", 1)],
+                    false,
+                    Some(doc! { "tank_id": { "$type": "string" } }),
+                ),
+            ];
+            let want_id_only = vec![spec("_id_", &[("_id", 1)], false, None)];
+            let wanted: Vec<(&str, Vec<Spec>)> = vec![
+                ("prot_ledger", want_ledger),
+                ("prot_pledges", want_pledges),
+                ("prot_tanks", want_tanks),
+                ("prot_goals", want_goals),
+                ("prot_notices", want_id_only.clone()),
+                ("prot_contributor_prefs", want_id_only.clone()),
+                ("prot_runtime", want_id_only),
+            ];
+            for (collection, want) in &wanted {
+                assert_eq!(
+                    &specs(&mongo, collection).await,
+                    want,
+                    "{collection} indexes"
+                );
+            }
+
+            // The unique target key is what stops a second tank for one
+            // channel.
+            let tanks = mongo.col::<Document>("prot_tanks");
+            tanks
+                .insert_one(doc! { "_id": "T1", "target_key": "channel:C1" })
+                .await
+                .expect("the first tank for C1");
+            assert!(
+                tanks
+                    .insert_one(doc! { "_id": "T2", "target_key": "channel:C1" })
+                    .await
+                    .is_err(),
+                "a second tank for one target"
+            );
+
+            // One open goal per key; closed goals (no key) never collide.
+            let goals = mongo.col::<Document>("prot_goals");
+            goals
+                .insert_many(vec![
+                    doc! { "_id": "G1", "open_key": "launch:S1" },
+                    doc! { "_id": "G2", "server_id": "S1" },
+                    doc! { "_id": "G3", "server_id": "S1" },
+                ])
+                .await
+                .expect("one open goal and two closed ones");
+            assert!(
+                goals
+                    .insert_one(doc! { "_id": "G4", "open_key": "launch:S1" })
+                    .await
+                    .is_err(),
+                "a second open goal with one key"
+            );
+
+            // Re-running over populated collections changes nothing.
+            assert_eq!(
+                super::run_migrations(&mongo, 78).await,
+                super::LATEST_REVISION,
+                "a re-run"
+            );
+            for (collection, want) in &wanted {
+                assert_eq!(
+                    &specs(&mongo, collection).await,
+                    want,
+                    "{collection} indexes after a re-run"
+                );
+            }
+            assert_eq!(tanks.count_documents(doc! {}).await.expect("count"), 1);
+            assert_eq!(goals.count_documents(doc! {}).await.expect("count"), 3);
         }
 
         db.drop_database().await;
@@ -5673,6 +6195,72 @@ mod prot_migration_tests {
             "in PROT_COLLECTIONS",
             "create_prot_indexes(&db)",
             ".expect(\"Failed to create Prot indexes.\")",
+        ] {
+            assert!(init.contains(needle), "init.rs must contain {needle}");
+        }
+    }
+
+    /// The revision 79 guard carries the same nesting trap: nested inside
+    /// the 76 block, a database already at 77, 78 or 79 would skip the Prot
+    /// tank collections forever. It names 76 and 79 only, so e2ee
+    /// add-device's revision 77 block and protected-channels S2's 78 can
+    /// land between them without touching this test.
+    #[test]
+    fn revision_79_guard_is_a_top_level_sibling_after_the_76_block() {
+        let text = shipping(SOURCE);
+        let (at_76, open_76) = guard(76);
+        let (at_79, _) = guard(79);
+
+        let block_76 = braced(text, open_76);
+        assert!(
+            !block_76.contains("if revision <= 79"),
+            "the revision 79 guard must not be nested inside the 76 block"
+        );
+        assert!(
+            at_79 > open_76 + block_76.len(),
+            "the revision 79 guard must come after the 76 block closes"
+        );
+
+        let body = text
+            .find("pub async fn run_migrations(")
+            .expect("run_migrations");
+        let body_open = body + text[body..].find(OPEN).expect("its body");
+        let top_level = depth_at(body_open) + 1;
+        assert_eq!(
+            (depth_at(at_76), depth_at(at_79)),
+            (top_level, top_level),
+            "the 76 and 79 guards must both sit at the top level of run_migrations"
+        );
+    }
+
+    /// Same contract as revision 76: the block creates the tank collections
+    /// and indexes through the shared helpers, and a failure panics so delta
+    /// never serves a tank without its unique target key.
+    #[test]
+    fn the_prot_tank_block_runs_the_shared_helpers() {
+        let (_, open) = guard(79);
+        let block = braced(shipping(SOURCE), open);
+        for needle in [
+            "in PROT_TANK_COLLECTIONS",
+            "create_prot_tank_indexes(&db.db())",
+            ".expect(\"Failed to create Prot tank indexes.\")",
+        ] {
+            assert!(
+                block.contains(needle),
+                "the revision 79 block must contain {needle}"
+            );
+        }
+    }
+
+    /// Fresh databases skip the migrations, so init.rs must build the same
+    /// Prot tank schema through the same helpers.
+    #[test]
+    fn init_builds_the_prot_tank_schema_through_the_shared_helpers() {
+        let init = shipping(INIT);
+        for needle in [
+            "in PROT_TANK_COLLECTIONS",
+            "create_prot_tank_indexes(&db)",
+            ".expect(\"Failed to create Prot tank indexes.\")",
         ] {
             assert!(init.contains(needle), "init.rs must contain {needle}");
         }

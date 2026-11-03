@@ -153,6 +153,7 @@ pub async fn edit(
     if let Some(owner) = &data.owner {
         if owner != &server.owner {
             refuse_while_any_channel_is_protected(db, &server).await?;
+            crate::util::prot_gate::refuse_owner_change_with_prot(db, &server.id).await?;
         }
     }
 
@@ -1914,5 +1915,114 @@ mod test {
                 .unwrap_or_else(|| panic!("the route lost `{}`: {}", later, body));
             assert!(at < write, "the refusal must precede `{}`: {}", later, body);
         }
+    }
+
+    /// S5b 6.9: an OPEN Prot goal blocks the transfer the way a protected
+    /// channel does (400 `ChannelProtected`, ownership unchanged), with no
+    /// channel protected yet; a non-owner still gets `NotOwner`. Once the
+    /// goal is closed the same transfer lands. Control: drop the
+    /// `refuse_owner_change_with_prot` call (the first transfer lands).
+    #[test]
+    fn owner_transfer_refused_with_an_open_goal() {
+        crate::util::test::rt().block_on(owner_transfer_refused_with_an_open_goal_case())
+    }
+
+    async fn owner_transfer_refused_with_an_open_goal_case() {
+        use revolt_database::ProtGoal;
+        use std::time::{SystemTime, UNIX_EPOCH};
+        use ulid::Ulid;
+
+        let harness = TestHarness::new().await;
+        let (owner_account, owner_session, owner) = harness.new_user().await;
+        let (member_account, member_session, member) = harness.new_user().await;
+        let (server, channel) = harness.new_protectable_channel(&owner).await;
+        assert!(!channel.is_protected());
+        harness.join_server(&server, &member).await;
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("after the epoch")
+            .as_millis() as i64;
+        let goal = harness
+            .db
+            .create_prot_goal(&ProtGoal {
+                id: Ulid::new().to_string(),
+                kind: v0::ProtGoalKind::Launch,
+                server_id: server.id.clone(),
+                channel_id: None,
+                tank_id: None,
+                created_by: owner.id.clone(),
+                create_nonce: Ulid::new().to_string(),
+                slots: 10,
+                days: Some(30),
+                daily_cost: 40,
+                base_daily_cost: None,
+                target_prot: 1_200,
+                pledged_total: 0,
+                state: v0::ProtGoalState::Funding,
+                deadline_at: now + 30 * 86_400_000,
+                funded_at: None,
+                launch_deadline_at: None,
+                launched_at: None,
+                closed_at: None,
+                refund7_done: false,
+                open_key: Some(format!("launch:{}", server.id)),
+                version: 0,
+                created_at: now,
+                updated_at: now,
+            })
+            .await
+            .expect("an open launch goal");
+
+        let (status, body) = edit_with_ticket(
+            &harness,
+            &server.id,
+            &member_session,
+            &member_account.id,
+            json!({ "owner": member.id }),
+        )
+        .await;
+        assert_eq!(status, Status::Forbidden, "{body}");
+        let error: serde_json::Value = serde_json::from_str(&body).expect("an error body");
+        assert_eq!(error["type"], "NotOwner", "{body}");
+
+        let (status, body) = edit_with_ticket(
+            &harness,
+            &server.id,
+            &owner_session,
+            &owner_account.id,
+            json!({ "owner": member.id, "name": "Renamed" }),
+        )
+        .await;
+        assert_eq!(status, Status::BadRequest, "{body}");
+        let error: serde_json::Value = serde_json::from_str(&body).expect("an error body");
+        assert_eq!(error["type"], "ChannelProtected", "{body}");
+        let stored = harness.db.fetch_server(&server.id).await.expect("`Server`");
+        assert_eq!(stored.owner, owner.id, "ownership must not move");
+        assert_eq!(stored.name, server.name, "nothing in the request may land");
+
+        harness
+            .db
+            .close_prot_goal(&goal.id, v0::ProtGoalState::Cancelled, now)
+            .await
+            .expect("the goal closes");
+        assert!(harness
+            .db
+            .fetch_open_prot_goals_by_server(&server.id)
+            .await
+            .expect("the open goals")
+            .is_empty());
+
+        let (status, body) = edit_with_ticket(
+            &harness,
+            &server.id,
+            &owner_session,
+            &owner_account.id,
+            json!({ "owner": member.id }),
+        )
+        .await;
+        assert_eq!(status, Status::Ok, "{body}");
+        let stored = harness.db.fetch_server(&server.id).await.expect("`Server`");
+        assert_eq!(stored.owner, member.id);
     }
 }

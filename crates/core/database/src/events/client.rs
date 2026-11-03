@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 
 use std::collections::HashMap;
 
+use revolt_models::v0;
 use revolt_models::v0::{
     AnnotationStroke, AppendMessage, Channel, ChannelFollow, ChannelSlowmode, ChannelUnread, ChannelVoiceState, CommandChoice, E2EEMessage,
     Emoji, Event, EventRsvp, FieldsChannel, FieldsMember, FieldsMessage, FieldsRole, FieldsServer, FieldsUser,
@@ -1045,6 +1046,16 @@ pub enum EventV1 {
         /// clients drop an update whose version is <= the newest they hold
         version: u64,
     },
+
+    /// A Protected channel's fuel tank changed (stage, balance, tier). Published on
+    /// the CHANNEL topic (`.p(channel_id)`), so only sockets subscribed to the
+    /// channel (its viewers) receive it. `tank: None` = the channel has no tank
+    /// any more (an abandoned launch).
+    ProtTankUpdate {
+        channel: String,
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        tank: Option<v0::ProtTankSummary>,
+    },
 }
 
 /// Redis topic that reaches exactly one session's bonfire connection
@@ -1262,6 +1273,78 @@ mod prot_tests {
         {
             EventV1::ProtBalanceUpdate { balance, version } => {
                 assert_eq!((balance, version), (1200, 3))
+            }
+            other => panic!("deserialized to another event: {other:?}"),
+        }
+    }
+
+    /// The client reads `{ type, channel, tank? }` (stoat.js `events/v1.ts`);
+    /// an abandoned launch sends no `tank` key at all (not `null`)
+    #[test]
+    fn the_prot_tank_update_wire_shape() {
+        use revolt_models::v0::{ProtTankStage, ProtTankSummary};
+
+        let summary = ProtTankSummary {
+            tank_id: "01TANK".to_string(),
+            channel_id: "01CHANNEL".to_string(),
+            stage: ProtTankStage::Grace,
+            slot_tier: 10,
+            pending_slot_tier: None,
+            daily_cost: 40,
+            balance: -40,
+            protected_until: None,
+            grace_ends_at: Some(1_793_923_200_000),
+            deletes_at: None,
+            launched_at: Some(1_793_491_200_000),
+            version: 5,
+            balance_version: 8,
+        };
+        let event = EventV1::ProtTankUpdate {
+            channel: "01CHANNEL".to_string(),
+            tank: Some(summary.clone()),
+        };
+        assert_eq!(
+            serde_json::to_value(&event).expect("serializes"),
+            serde_json::json!({
+                "type": "ProtTankUpdate",
+                "channel": "01CHANNEL",
+                "tank": {
+                    "tank_id": "01TANK",
+                    "channel_id": "01CHANNEL",
+                    "stage": "Grace",
+                    "slot_tier": 10,
+                    "daily_cost": 40,
+                    "balance": -40,
+                    "grace_ends_at": 1_793_923_200_000i64,
+                    "launched_at": 1_793_491_200_000i64,
+                    "version": 5,
+                    "balance_version": 8
+                }
+            })
+        );
+
+        let removed = EventV1::ProtTankUpdate {
+            channel: "01CHANNEL".to_string(),
+            tank: None,
+        };
+        assert_eq!(
+            serde_json::to_value(&removed).expect("serializes"),
+            serde_json::json!({ "type": "ProtTankUpdate", "channel": "01CHANNEL" })
+        );
+
+        match serde_json::from_str::<EventV1>(r#"{"type":"ProtTankUpdate","channel":"C1"}"#)
+            .expect("deserializes")
+        {
+            EventV1::ProtTankUpdate { channel, tank } => {
+                assert_eq!((channel.as_str(), tank), ("C1", None))
+            }
+            other => panic!("deserialized to another event: {other:?}"),
+        }
+        match serde_json::from_value::<EventV1>(serde_json::to_value(&event).unwrap())
+            .expect("deserializes")
+        {
+            EventV1::ProtTankUpdate { channel, tank } => {
+                assert_eq!((channel, tank), ("01CHANNEL".to_string(), Some(summary)))
             }
             other => panic!("deserialized to another event: {other:?}"),
         }

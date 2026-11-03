@@ -243,14 +243,14 @@ async fn text_join_intent(
 /// W0-fix3): `min(signed-list device_cap, effective entitlement cap)`, `0`
 /// meaning unlimited in either operand, so `0` here is unlimited too.
 ///
-/// A new device is an Add to come, and an Add needs an Active entitlement
-/// (§6.1 errors), so a missing or inactive one refuses the new device here
-/// rather than at the admitter's commit.
+/// A new device is an Add to come, and an Add needs an Active or Grace
+/// entitlement (§6.1 errors, S5b D14), so a missing, Frozen or Deleted one
+/// refuses the new device here rather than at the admitter's commit.
 async fn enforced_device_cap(db: &Database, channel_id: &str) -> Result<u32> {
     let entitlement = db
         .fetch_channel_entitlement(channel_id)
         .await?
-        .filter(|entitlement| entitlement.is_active())
+        .filter(|entitlement| entitlement.allows_text_traffic())
         .ok_or_else(|| create_error!(InvalidOperation))?;
     let seat_list = db
         .fetch_seat_list(channel_id)
@@ -1039,6 +1039,121 @@ mod tests {
         );
 
         // A rejoin only needs a Remove, which never needs the entitlement
+        post(
+            db,
+            &text.owner,
+            &text.owner_session,
+            group_id,
+            signed_intent(&text.protected.owner_device, group_id, "o1"),
+        )
+        .await
+        .expect("a rejoin");
+    }
+
+    /// Set the channel's entitlement state, raw (S1 has no primitive for it)
+    async fn set_entitlement_state(
+        db: &Database,
+        channel_id: &str,
+        state: ChannelEntitlementState,
+    ) {
+        match db {
+            Database::Reference(reference) => {
+                let mut found = 0;
+                for entitlement in reference.channel_entitlements.lock().await.values_mut() {
+                    if entitlement.channel_id == channel_id {
+                        entitlement.state = state.clone();
+                        found += 1;
+                    }
+                }
+                assert_eq!(found, 1);
+            }
+            Database::MongoDb(mongo) => {
+                use revolt_database::mongodb::bson::{doc, to_bson, Document};
+
+                let result = mongo
+                    .col::<Document>("channel_entitlements")
+                    .update_one(
+                        doc! { "channel_id": channel_id },
+                        doc! { "$set": { "state": to_bson(&state).expect("a state") } },
+                    )
+                    .await
+                    .expect("raw state write");
+                assert_eq!(result.matched_count, 1);
+            }
+        }
+
+        let entitlement = db
+            .fetch_channel_entitlement(channel_id)
+            .await
+            .expect("entitlement read")
+            .expect("an entitlement");
+        assert_eq!(entitlement.state, state);
+    }
+
+    /// S5b D14 (the cross-branch pin against S2-D32): in Grace a seated
+    /// member's NEW device may still ask to join, so it can be added
+    #[test]
+    fn grace_allows_a_join_intent() {
+        crate::util::test::rt().block_on(grace_allows_a_join_intent_case())
+    }
+
+    async fn grace_allows_a_join_intent_case() {
+        let text = text_fixture().await;
+        let db = &text.harness.db;
+        let group_id = &text.group.id;
+
+        set_entitlement_state(
+            db,
+            text.protected.channel.id(),
+            ChannelEntitlementState::Grace,
+        )
+        .await;
+        post(
+            db,
+            &text.member,
+            &text.member_session,
+            group_id,
+            signed_intent(&text.member_device, group_id, "m1"),
+        )
+        .await
+        .expect("a new device's intent in Grace");
+        assert_eq!(
+            stored_intents(db, group_id).await,
+            vec![(text.member.id.clone(), text.member_device.device_id.clone())]
+        );
+    }
+
+    /// Deleted refuses a new device as Frozen does, and still takes a rejoin
+    #[test]
+    fn a_deleted_entitlement_refuses_new_devices_only() {
+        crate::util::test::rt().block_on(a_deleted_entitlement_refuses_new_devices_only_case())
+    }
+
+    async fn a_deleted_entitlement_refuses_new_devices_only_case() {
+        let text = text_fixture().await;
+        let db = &text.harness.db;
+        let group_id = &text.group.id;
+
+        set_entitlement_state(
+            db,
+            text.protected.channel.id(),
+            ChannelEntitlementState::Deleted,
+        )
+        .await;
+        refused(
+            post(
+                db,
+                &text.member,
+                &text.member_session,
+                group_id,
+                signed_intent(&text.member_device, group_id, "m1"),
+            )
+            .await,
+            "InvalidOperation",
+            "a new device",
+        );
+        assert!(stored_intents(db, group_id).await.is_empty());
+
         post(
             db,
             &text.owner,

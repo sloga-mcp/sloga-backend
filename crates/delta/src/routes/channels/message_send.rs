@@ -287,6 +287,7 @@ async fn check_protected_send(
 ) -> Result<()> {
     // 0. The text plane's kill switch
     require_protected_available().await?;
+    crate::util::prot_gate::refuse_if_tank_frozen(db, channel, channel).await?;
 
     // 1. No `Idempotency-Key` (3.10: the message `nonce` is the replay key),
     // then the one allowlist and the payload's structure (2.6)
