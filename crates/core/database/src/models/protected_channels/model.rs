@@ -362,14 +362,28 @@ impl ChannelSeat {
     }
 
     /// Make this seat active again at `now`. A re-seat overwrites the last
-    /// release's cause and the keys stamp (2.3): the audit log is the
-    /// history.
+    /// release's cause (2.3): the audit log is the history.
+    ///
+    /// The keys stamp depends on the seat (S2-W1 wave audit F-1). A seat
+    /// still cooling at `now` was released with the keys received (only
+    /// that release cools) and comes back on the slot it already used (the
+    /// planner counts no new one), so it stays received: the stamp is kept,
+    /// or set to the release time when the release cooled on the
+    /// `text_group_user_ids` fallback alone, which a later Remove commit can
+    /// empty. Its next release cools again; clearing here would let one slot
+    /// rotate among any number of users, each unseat freeing it at once. A
+    /// seat whose release did not cool, or whose cooldown has ended, is a new
+    /// slot use and starts unstamped.
     pub fn reactivate(&mut self, now: Timestamp) {
+        self.keys_received_at = if self.is_cooling(now) {
+            self.keys_received_at.or(self.released_at)
+        } else {
+            None
+        };
         self.seated_at = now;
         self.released_at = None;
         self.cooldown_until = None;
         self.release_cause = None;
-        self.keys_received_at = None;
     }
 }
 
@@ -1869,7 +1883,9 @@ pub fn plan_seat_list_write(input: &SeatListWriteInput<'_>) -> Result<SeatListWr
             Some(seat) if seat.is_active() => {}
             Some(seat) => {
                 // A cooling seat is reactivated without consuming another
-                // slot (2.3 DECISION (W0)); an expired one is a new slot
+                // slot (2.3 DECISION (W0)) and stays keys-received, so its
+                // next release cools (`reactivate`, F-1); an expired one is
+                // a new slot
                 if !seat.is_cooling(now) {
                     new_slots += 1;
                 }

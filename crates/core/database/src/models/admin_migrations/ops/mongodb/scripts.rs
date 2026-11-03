@@ -26,7 +26,7 @@ struct MigrationInfo {
     revision: i32,
 }
 
-pub const LATEST_REVISION: i32 = 78; // MUST BE +1 to last migration
+pub const LATEST_REVISION: i32 = 79; // MUST BE +1 to last migration
 
 pub async fn migrate_database(db: &MongoDb) {
     let migrations = db.col::<Document>("migrations");
@@ -3056,11 +3056,13 @@ pub async fn run_migrations(db: &MongoDb, revision: i32) -> i32 {
             .expect("Failed to create Prot indexes.");
     }
 
-    // Protected channels S2 is revision 77 (LATEST_REVISION 78), a top-level
-    // sibling after the Prot ledger's revision 76 (LATEST 77, deployed), so a
-    // database already at 77 runs only this block (design 2.7).
-    if revision <= 77 {
-        info!("Running migration [revision 77 / 26-10-2026]: Add the channel_seats active-seat sweep index and the mls_commits Text Welcome lookup index (protected channels S2)");
+    // Protected channels S2 = 78/79, lands after add-device (77/78) and S5a
+    // (76/77); the steward sequences numbers at land time. A top-level
+    // sibling after the Prot ledger's revision 76 block, so a database at 77
+    // or 78 runs only this block (design 2.7). Add-device's `<= 77` block is
+    // not on this branch: the gap at 77 is expected.
+    if revision <= 78 {
+        info!("Running migration [revision 78 / 26-10-2026]: Add the channel_seats active-seat sweep index and the mls_commits Text Welcome lookup index (protected channels S2)");
 
         // Indexes only: every S2 field is an additive serde default
         // (docs/protected-channels-design.md 2.7 "S2 migration block").
@@ -3726,19 +3728,20 @@ mod afk_backfill_tests {
     }
 
     #[test]
-    fn latest_revision_is_78() {
+    fn latest_revision_is_79() {
         assert_eq!(
-            LATEST_REVISION, 78,
-            "the AFK backfill is revision 72, the ViewAuditLog backfill 73, the payments collections 74, protected channels 75, the Prot collections 76, protected channels S2 77"
+            LATEST_REVISION, 79,
+            "the AFK backfill is revision 72, the ViewAuditLog backfill 73, the payments collections 74, protected channels 75, the Prot collections 76, add-device 77 (not on this branch), protected channels S2 78"
         );
     }
 
-    /// The AFK backfill was the last migration when it landed; revision 77
-    /// (protected channels S2) now is. The 72, 73, 74, 75, 76 and 77 guards
-    /// are pinned to exactly one block each, and the last one to
-    /// `LATEST_REVISION - 1`.
+    /// The AFK backfill was the last migration when it landed; revision 78
+    /// (protected channels S2) now is. The 72, 73, 74, 75, 76 and 78 guards
+    /// are pinned to exactly one block each, the last one to
+    /// `LATEST_REVISION - 1`, and no block is guarded by 77 (add-device's
+    /// number, which this branch does not carry).
     #[test]
-    fn backfill_is_guarded_by_revision_72_and_revision_77_is_the_last_migration() {
+    fn backfill_is_guarded_by_revision_72_and_revision_78_is_the_last_migration() {
         let guards: Vec<i32> = shipping()
             .match_indices("if revision <= ")
             .map(|(at, needle)| {
@@ -3776,8 +3779,13 @@ mod afk_backfill_tests {
         );
         assert_eq!(
             guards.iter().filter(|guard| **guard == 77).count(),
+            0,
+            "no `if revision <= 77` block: 77 is add-device's, not S2's"
+        );
+        assert_eq!(
+            guards.iter().filter(|guard| **guard == 78).count(),
             1,
-            "exactly one `if revision <= 77` block"
+            "exactly one `if revision <= 78` block"
         );
         assert_eq!(
             guards.iter().max(),
@@ -3795,10 +3803,11 @@ mod afk_backfill_tests {
     /// blocks, never inside one of them. Nested inside the 71 block, a
     /// database already at 72 would skip the backfill forever, and every
     /// other pin in this module would still pass. The revision-73, 74, 75, 76
-    /// and 77 guards carry the same trap one to five blocks later, so each is
-    /// pinned the same way against the block before it.
+    /// and 78 guards carry the same trap one to five blocks later, so each is
+    /// pinned the same way against the block before it (S2's 78 against the
+    /// 76 block: add-device's 77 is not on this branch).
     #[test]
-    fn revision_72_to_77_guards_are_top_level_siblings_of_the_previous_block() {
+    fn revision_72_to_76_and_78_guards_are_top_level_siblings_of_the_previous_block() {
         let depth_at = |at: usize| -> i64 {
             shipping()[..at]
                 .chars()
@@ -3818,7 +3827,7 @@ mod afk_backfill_tests {
             );
             shipping().find(&needle).expect("the guard")
         };
-        let (at_70, at_71, at_72, at_73, at_74, at_75, at_76, at_77) = (
+        let (at_70, at_71, at_72, at_73, at_74, at_75, at_76, at_78) = (
             guard(70),
             guard(71),
             guard(72),
@@ -3826,7 +3835,7 @@ mod afk_backfill_tests {
             guard(74),
             guard(75),
             guard(76),
-            guard(77),
+            guard(78),
         );
 
         let open_71 = at_71 + format!("if revision <= 71 {OPEN}").len() - 1;
@@ -3890,21 +3899,22 @@ mod afk_backfill_tests {
             "the revision 76 guard must come after the 75 block closes"
         );
         assert!(
-            !block_75.contains("if revision <= 77"),
-            "the revision 77 guard must not be nested inside the 75 block"
+            !block_75.contains("if revision <= 78"),
+            "the revision 78 guard must not be nested inside the 75 block"
         );
 
         // And on S2: nested inside the 76 block, the S2 indexes would never
-        // be built on a database already at 77 (the Prot ledger shipped).
+        // be built on a database already at 77 (the Prot ledger shipped) or
+        // 78 (add-device migrated first).
         let open_76 = at_76 + format!("if revision <= 76 {OPEN}").len() - 1;
         let block_76 = braced(shipping(), open_76);
         assert!(
-            !block_76.contains("if revision <= 77"),
-            "the revision 77 guard must not be nested inside the 76 block"
+            !block_76.contains("if revision <= 78"),
+            "the revision 78 guard must not be nested inside the 76 block"
         );
         assert!(
-            at_77 > open_76 + block_76.len(),
-            "the revision 77 guard must come after the 76 block closes"
+            at_78 > open_76 + block_76.len(),
+            "the revision 78 guard must come after the 76 block closes"
         );
 
         let body = shipping()
@@ -3921,13 +3931,13 @@ mod afk_backfill_tests {
                 depth_at(at_74),
                 depth_at(at_75),
                 depth_at(at_76),
-                depth_at(at_77)
+                depth_at(at_78)
             ),
             (
                 top_level, top_level, top_level, top_level, top_level, top_level, top_level,
                 top_level
             ),
-            "the 70, 71, 72, 73, 74, 75, 76 and 77 guards must all sit at the top level of run_migrations"
+            "the 70, 71, 72, 73, 74, 75, 76 and 78 guards must all sit at the top level of run_migrations"
         );
     }
 
@@ -3990,12 +4000,12 @@ mod afk_backfill_tests {
         assert!(drop < collections, "the mls_groups steps run first");
     }
 
-    /// The `if revision <= 77` block of `run_migrations`.
+    /// The `if revision <= 78` block of `run_migrations`.
     fn protected_s2_block() -> &'static str {
-        let needle = format!("if revision <= 77 {OPEN}");
+        let needle = format!("if revision <= 78 {OPEN}");
         let at = shipping()
             .find(&needle)
-            .expect("the revision 77 migration block");
+            .expect("the revision 78 migration block");
         braced(shipping(), at + needle.len() - 1)
     }
 
@@ -4557,8 +4567,8 @@ mod tests {
                 .await
                 .expect("insert servers");
 
-            // Revisions 74 to 77 run after it (they touch no server); the
-            // return is LATEST_REVISION.
+            // Revisions 74 to 76 and 78 run after it (they touch no server);
+            // the return is LATEST_REVISION.
             assert_eq!(
                 super::run_migrations(&mongo, 73).await,
                 super::LATEST_REVISION
@@ -5610,14 +5620,16 @@ mod tests {
         guard.disarm();
     }
 
-    /// Revision 77 on a database in the revision-76 shape (S1 shipped, with
-    /// seat rows and commits already stored, `added` an array) builds both
-    /// S2 indexes, returns LATEST_REVISION, and a second run (the stored
-    /// revision unadvanced after a crash) is a no-op over them.
+    /// Revision 78 on a database in the revision-77 shape (S1 and the Prot
+    /// ledger shipped, with seat rows and commits already stored, `added` an
+    /// array) builds both S2 indexes and returns LATEST_REVISION. A database
+    /// add-device migrated first (stored at 78) runs the block too, a second
+    /// run (the stored revision unadvanced after a crash) is a no-op over
+    /// them, and a database at 79 runs nothing.
     #[tokio::test]
-    async fn revision_77_creates_the_s2_indexes_and_is_rerunnable() {
+    async fn revision_78_creates_the_s2_indexes_and_is_rerunnable() {
         // Named by hand for the same 63-character reason as above.
-        let db = crate::DatabaseInfo::Test("migration_rev77_s2_indexes".to_string())
+        let db = crate::DatabaseInfo::Test("migration_rev78_s2_indexes".to_string())
             .connect()
             .await
             .expect("Database connection failed.");
@@ -5633,7 +5645,7 @@ mod tests {
                 return;
             };
 
-            // The revision-76 shape: revision 75's channel_seats indexes and
+            // The revision-77 shape: revision 75's channel_seats indexes and
             // revision 55's mls_commits index, over existing rows.
             mongo
                 .db()
@@ -5676,12 +5688,33 @@ mod tests {
                 .await
                 .expect("insert commits");
 
-            assert_eq!(super::run_migrations(&mongo, 76).await, 78);
+            let drop_s2_indexes = || {
+                let mongo = mongo.clone();
+                async move {
+                    for (collection, name) in [
+                        ("channel_seats", "active_seats_by_channel"),
+                        ("mls_commits", "text_welcome_lookup"),
+                    ] {
+                        mongo
+                            .db()
+                            .run_command(doc! { "dropIndexes": collection, "index": name })
+                            .await
+                            .expect("drop an S2 index");
+                    }
+                }
+            };
+
+            assert_eq!(super::run_migrations(&mongo, 77).await, 79);
             assert_has_the_s2_indexes(&mongo).await;
 
-            // A database S5 migrated first (stored at 77) runs it too, and a
-            // re-run over the built indexes succeeds.
-            assert_eq!(super::run_migrations(&mongo, 77).await, 78, "a re-run");
+            // A database add-device migrated first (stored at 78) runs the
+            // block: dropped, both indexes come back.
+            drop_s2_indexes().await;
+            assert_eq!(super::run_migrations(&mongo, 78).await, 79);
+            assert_has_the_s2_indexes(&mongo).await;
+
+            // A re-run over the built indexes succeeds.
+            assert_eq!(super::run_migrations(&mongo, 78).await, 79, "a re-run");
             assert_has_the_s2_indexes(&mongo).await;
 
             for (collection, want) in [
@@ -5703,8 +5736,22 @@ mod tests {
                 assert_eq!(names, want, "{collection} indexes");
             }
 
-            // A database already at LATEST_REVISION runs nothing.
-            assert_eq!(super::run_migrations(&mongo, 78).await, 78);
+            // A database already at LATEST_REVISION runs nothing: with the
+            // S2 indexes dropped, they stay gone.
+            drop_s2_indexes().await;
+            assert_eq!(super::run_migrations(&mongo, 79).await, 79);
+            for (collection, want) in [
+                ("channel_seats", vec!["_id_", "channel_id", "user_id"]),
+                ("mls_commits", vec!["_id_", "group_epoch"]),
+            ] {
+                let mut names = mongo
+                    .col::<Document>(collection)
+                    .list_index_names()
+                    .await
+                    .expect("list indexes");
+                names.sort_unstable();
+                assert_eq!(names, want, "{collection} indexes at 79");
+            }
         }
 
         db.drop_database().await;
@@ -5712,13 +5759,13 @@ mod tests {
     }
 
     /// An index that is not the S2 spec under an S2 name, or the S2 key
-    /// under another name, makes revision 77 panic from the step that owns
+    /// under another name, makes revision 78 panic from the step that owns
     /// it, so the revision is never advanced over it.
     #[tokio::test]
-    async fn revision_77_refuses_a_conflicting_s2_index() {
+    async fn revision_78_refuses_a_conflicting_s2_index() {
         use futures::FutureExt;
 
-        let db = crate::DatabaseInfo::Test("migration_rev77_s2_conflict".to_string())
+        let db = crate::DatabaseInfo::Test("migration_rev78_s2_conflict".to_string())
             .connect()
             .await
             .expect("Database connection failed.");
@@ -5757,11 +5804,11 @@ mod tests {
             let refused_by = |step: &'static str| {
                 let mongo = mongo.clone();
                 async move {
-                    let migration = std::panic::AssertUnwindSafe(super::run_migrations(&mongo, 76))
+                    let migration = std::panic::AssertUnwindSafe(super::run_migrations(&mongo, 78))
                         .catch_unwind()
                         .await;
                     let Err(payload) = migration else {
-                        panic!("revision 77 must refuse a conflicting index ({step})");
+                        panic!("revision 78 must refuse a conflicting index ({step})");
                     };
                     let message = payload
                         .downcast_ref::<String>()
@@ -5804,7 +5851,7 @@ mod tests {
             drop("mls_commits", "text_welcome_lookup").await;
 
             // With the conflicts gone, the block runs.
-            assert_eq!(super::run_migrations(&mongo, 76).await, 78);
+            assert_eq!(super::run_migrations(&mongo, 78).await, 79);
             assert_has_the_s2_indexes(&mongo).await;
         }
 

@@ -6106,10 +6106,10 @@ fn pending_users(group: &MlsGroup) -> Vec<&str> {
         .collect()
 }
 
-/// 2.3 (S2-D21, O-4): the release terms, and a re-seat clearing both S2
-/// fields
+/// 2.3 (S2-D21, O-4): the release terms, and a re-seat while cooling
+/// clearing the cause but keeping the stamp (F-1)
 #[test]
-fn a_release_cools_only_once_the_keys_were_received_and_a_reseat_clears_both() {
+fn a_release_cools_only_once_the_keys_were_received_and_a_cooling_reseat_keeps_them() {
     let mut seat = active_seats(&[USER_B]).remove(0);
     seat.release(at(1), SeatReleaseCause::OwnerUnseat, false)
         .unwrap();
@@ -6128,10 +6128,10 @@ fn a_release_cools_only_once_the_keys_were_received_and_a_reseat_clears_both() {
     assert_eq!(seat.release_cause, Some(SeatReleaseCause::AccessLost));
     assert_eq!(seat.cooldown_until, Some(at(3 + SEAT_COOLDOWN_DAYS)));
 
-    // A re-seat overwrites both; the pre-S2 fallback still cools
+    // A re-seat while cooling overwrites the cause, keeps the stamp (F-1)
     seat.reactivate(at(4));
     assert_eq!(seat.release_cause, None);
-    assert_eq!(seat.keys_received_at, None);
+    assert_eq!(seat.keys_received_at, Some(at(2)));
     seat.release(at(5), SeatReleaseCause::ServerRemoval, true)
         .unwrap();
     assert_eq!(seat.release_cause, Some(SeatReleaseCause::ServerRemoval));
@@ -6214,7 +6214,7 @@ async fn release_channel_seat_is_a_compare_and_set_on_seated_at() {
         let seat = seat_of(&db, CHANNEL, USER_B).await;
         assert_eq!(seat.seated_at, at(2));
         assert_eq!(seat.release_cause, None, "a re-seat clears the cause");
-        assert_eq!(seat.keys_received_at, None, "a re-seat clears the stamp");
+        assert_eq!(seat.keys_received_at, Some(at(0)), "cooling: kept");
         assert!(!db
             .release_channel_seat(CHANNEL, USER_B, at(0), SeatReleaseCause::AccessLost, at(3))
             .await
@@ -6893,4 +6893,172 @@ async fn protect_and_put_read_formats_v2_from_the_config() {
             assert!(is_failed_validation(&result.unwrap_err()));
         }
     });
+}
+
+/// 2.3 S2-D21 / O-4 (S2-W1 wave audit F-1), the exploit sequence: B's
+/// device received the keys (the stamp), the owner unseats B (cools 14
+/// days), B is in no Text group (as once a Remove commit dropped its
+/// `member_added`), the owner re-seats B while it cools (no new slot) and
+/// unseats B again. That release cools as well, so the slot stays used and
+/// cannot rotate to C. Control: clear the stamp on every reactivation.
+#[tokio::test]
+async fn a_reseat_while_cooling_keeps_the_slot_used_so_the_next_unseat_cools() {
+    database_test!(|db| async move {
+        setup(&db, 2).await;
+        db.protect_channel(CHANNEL, &submit(1, &[USER_A, USER_B]), at(0))
+            .await
+            .unwrap();
+        edit_seat(&db, CHANNEL, USER_B, |seat| {
+            seat.keys_received_at = Some(at(0))
+        })
+        .await;
+
+        let outcome = db
+            .put_seat_list(CHANNEL, &submit(2, &[USER_A]), true, at(1))
+            .await
+            .unwrap();
+        assert_eq!(outcome.released, vec![USER_B]);
+        let seat = seat_of(&db, CHANNEL, USER_B).await;
+        assert_eq!(seat.release_cause, Some(SeatReleaseCause::OwnerUnseat));
+        assert!(seat.is_cooling(at(2)));
+
+        // The re-seat reactivates the cooling row and keeps the stamp
+        let outcome = db
+            .put_seat_list(CHANNEL, &submit(3, &[USER_A, USER_B]), true, at(2))
+            .await
+            .unwrap();
+        assert_eq!(outcome.claimed, vec![USER_B]);
+        let seat = seat_of(&db, CHANNEL, USER_B).await;
+        assert!(seat.is_active());
+        assert_eq!(seat.keys_received_at, Some(at(0)));
+
+        // The second unseat cools from now; it is not `DeviceNeverJoined`
+        let outcome = db
+            .put_seat_list(CHANNEL, &submit(4, &[USER_A]), true, at(3))
+            .await
+            .unwrap();
+        assert_eq!(outcome.released, vec![USER_B]);
+        let seat = seat_of(&db, CHANNEL, USER_B).await;
+        assert_eq!(seat.release_cause, Some(SeatReleaseCause::OwnerUnseat));
+        assert_eq!(seat.cooldown_until, Some(at(3 + SEAT_COOLDOWN_DAYS)));
+        assert_eq!(
+            channel_seats_used(&db.fetch_channel_seats(CHANNEL).await.unwrap(), at(4)),
+            2
+        );
+
+        // So the slot does not pass to C
+        let error = db
+            .put_seat_list(CHANNEL, &submit(5, &[USER_A, USER_C]), true, at(4))
+            .await
+            .unwrap_err();
+        assert!(is_seat_cap(&error, 2), "{error:?}");
+    });
+}
+
+/// F-1 counter-test: a re-seat after a release that did not cool (the user
+/// never received the keys) is a new slot use, and its next unseat still
+/// frees at once. Control: carry or set the stamp on every reactivation.
+#[tokio::test]
+async fn a_reseat_after_a_never_joined_release_still_frees_at_once() {
+    database_test!(|db| async move {
+        setup(&db, 2).await;
+        db.protect_channel(CHANNEL, &submit(1, &[USER_A, USER_B]), at(0))
+            .await
+            .unwrap();
+        let assert_freed = |seat: ChannelSeat| {
+            assert_eq!(
+                seat.release_cause,
+                Some(SeatReleaseCause::DeviceNeverJoined)
+            );
+            assert_eq!(seat.cooldown_until, None);
+        };
+
+        db.put_seat_list(CHANNEL, &submit(2, &[USER_A]), true, at(1))
+            .await
+            .unwrap();
+        assert_freed(seat_of(&db, CHANNEL, USER_B).await);
+
+        let outcome = db
+            .put_seat_list(CHANNEL, &submit(3, &[USER_A, USER_B]), true, at(1))
+            .await
+            .unwrap();
+        assert_eq!(outcome.claimed, vec![USER_B]);
+        assert_eq!(seat_of(&db, CHANNEL, USER_B).await.keys_received_at, None);
+
+        db.put_seat_list(CHANNEL, &submit(4, &[USER_A]), true, at(2))
+            .await
+            .unwrap();
+        assert_freed(seat_of(&db, CHANNEL, USER_B).await);
+        assert_eq!(
+            channel_seats_used(&db.fetch_channel_seats(CHANNEL).await.unwrap(), at(2)),
+            1
+        );
+    });
+}
+
+/// F-1 counter-test: a re-seat after the cooldown ended is a new slot use
+/// and starts unstamped, so with no keys received since, its next unseat
+/// frees at once. Control: keep the stamp once the cooldown has ended.
+#[tokio::test]
+async fn a_reseat_after_the_cooldown_ended_starts_unstamped() {
+    database_test!(|db| async move {
+        setup(&db, 2).await;
+        db.protect_channel(CHANNEL, &submit(1, &[USER_A, USER_B]), at(0))
+            .await
+            .unwrap();
+        edit_seat(&db, CHANNEL, USER_B, |seat| {
+            seat.keys_received_at = Some(at(0))
+        })
+        .await;
+
+        db.put_seat_list(CHANNEL, &submit(2, &[USER_A]), true, at(1))
+            .await
+            .unwrap();
+        let seat = seat_of(&db, CHANNEL, USER_B).await;
+        assert_eq!(seat.cooldown_until, Some(at(1 + SEAT_COOLDOWN_DAYS)));
+
+        let expired = at(1 + SEAT_COOLDOWN_DAYS + 1);
+        assert!(!seat.is_cooling(expired));
+        let outcome = db
+            .put_seat_list(CHANNEL, &submit(3, &[USER_A, USER_B]), true, expired)
+            .await
+            .unwrap();
+        assert_eq!(outcome.claimed, vec![USER_B]);
+        assert_eq!(seat_of(&db, CHANNEL, USER_B).await.keys_received_at, None);
+
+        let later = at(1 + SEAT_COOLDOWN_DAYS + 2);
+        db.put_seat_list(CHANNEL, &submit(4, &[USER_A]), true, later)
+            .await
+            .unwrap();
+        let seat = seat_of(&db, CHANNEL, USER_B).await;
+        assert_eq!(
+            seat.release_cause,
+            Some(SeatReleaseCause::DeviceNeverJoined)
+        );
+        assert_eq!(seat.cooldown_until, None);
+        assert_eq!(
+            channel_seats_used(&db.fetch_channel_seats(CHANNEL).await.unwrap(), later),
+            1
+        );
+    });
+}
+
+/// F-1, pure: a seat that cooled on the `text_group_user_ids` fallback alone
+/// (no stamp) and is re-seated while cooling gets its release time as the
+/// stamp, so its next release cools even once a Remove commit took the user
+/// out of every Text group. Control: keep the stamp without that fallback.
+#[test]
+fn a_cooling_reseat_of_a_fallback_release_stamps_the_release_time() {
+    let mut seat = active_seats(&[USER_B]).remove(0);
+    seat.release(at(1), SeatReleaseCause::OwnerUnseat, true)
+        .unwrap();
+    assert_eq!(seat.keys_received_at, None);
+    assert!(seat.is_cooling(at(2)));
+
+    seat.reactivate(at(2));
+    assert_eq!(seat.keys_received_at, Some(at(1)));
+    seat.release(at(3), SeatReleaseCause::OwnerUnseat, false)
+        .unwrap();
+    assert_eq!(seat.release_cause, Some(SeatReleaseCause::OwnerUnseat));
+    assert_eq!(seat.cooldown_until, Some(at(3 + SEAT_COOLDOWN_DAYS)));
 }

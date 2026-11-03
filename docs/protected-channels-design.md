@@ -598,7 +598,10 @@ fields (serde default, omitted when `None`; no data migration):
   would bypass slot cooldowns.
 - `channel_seats._id = {channel}:{user}`, so a re-seat overwrites `release_cause` and
   `keys_received_at`; the `ProtectedSeatsUpdate` and `ProtectedSeatRelease` audit entries
-  (7.5) are the history (S9 needs seat-at-time).
+  (7.5) are the history (S9 needs seat-at-time). Re-seating a seat that is still cooling
+  keeps `keys_received_at` (the slot was already used; a cooling seat with no stamp gets
+  its release time), so its next release cools again; only a re-seat after a no-cooldown
+  release or after the cooldown expired clears it (#233).
 - Suspension never releases a seat (`Suspended` is not a cause; R17).
 
 ### 2.4 `channel_seat_lists` (new collection, both drivers)
@@ -6717,6 +6720,13 @@ Added in the S2-W0 second fix round (targeted re-review NEEDS CHANGE, 2026-10-26
      (one successor). Chosen over a v2-id recovery successor (the server verifies a create's
      id against the stored list, which on a v1 channel has no salt) and over "g + 1 then g +
      2" (4.9).
+233. DECISION (S2-W1 wave audit F-1): re-seating a seat that is still cooling keeps it
+     keys-received (`keys_received_at` kept, or set to the release time when the release
+     cooled on the `member_added` fallback alone), so its next release cools 14 days.
+     Clearing the stamp let one slot rotate among any number of key-receiving users, each
+     second unseat freeing it at once as `DeviceNeverJoined`. A re-seat after a no-cooldown
+     release or after the cooldown expired is a new slot use and clears the stamp. Amends
+     #205, #206 (2.3).
 
 ---
 
