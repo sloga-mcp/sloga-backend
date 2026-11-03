@@ -8,7 +8,7 @@ use revolt_database::{
     SeatListBody, Session, User, MAX_MLS_GROUP_MEMBERS,
 };
 use revolt_models::v0;
-use revolt_result::{create_error, Result};
+use revolt_result::{create_error, ErrorType, Result};
 use rocket::{serde::json::Json, State};
 use rocket_empty::EmptyResponse;
 
@@ -65,6 +65,12 @@ pub(crate) fn sibling_verdict(
         }
         Some(_) => SiblingVerdict::CloseUnservable,
     }
+}
+
+/// Whether the sibling's registration read says its identity row is gone,
+/// by error type. A read error is no evidence either way. Pure.
+pub(crate) fn sibling_registration_gone<T>(registration: &Result<T>) -> bool {
+    matches!(registration, Err(error) if matches!(error.error_type, ErrorType::NotFound))
 }
 
 /// The member devices among SFU participant identities, as (user, device).
@@ -196,9 +202,11 @@ async fn call_join_intent(
     // (sibling-device plan §3): the only leaf-holder is this user's own
     // device, evicted by this newer join, so nobody is left to admit
     // anyone. Mirroring the solo-stale close below, close the group, on
-    // positive evidence only: the SFU answered and the sibling is not in
-    // the call. NotFound sends the joiner straight to CREATE through the
-    // client's not_found arm. Anything else keeps the 400.
+    // positive evidence only: the sibling's registration is gone (a removed
+    // device, checked before the SFU is asked), or the SFU answered and the
+    // sibling is not in the call. NotFound sends the joiner straight to
+    // CREATE through the client's not_found arm. Anything else, a failed
+    // registration read included, keeps the 400.
     // SAME device already a member = a REJOIN: the device wiped its local
     // group state (rejoin-fresh) but its stale leaf is still in the roster,
     // and it can never remove itself (RFC 9420 forbids self-removal). Fan
@@ -210,6 +218,17 @@ async fn call_join_intent(
         if existing.device_id != data.device_id {
             if revolt_config::config().await.features.mls_sibling_close && group.members.len() == 1
             {
+                let registration = db.fetch_e2ee_identity(&user.id, &existing.device_id).await;
+                if sibling_registration_gone(&registration) {
+                    db.close_mls_group(&group.id).await?;
+                    log::info!(
+                        "mls: closed call group {} in channel {}: sole leaf was a removed sibling",
+                        group.id,
+                        group.channel_id
+                    );
+                    return Err(create_error!(NotFound));
+                }
+
                 let live = live_call_devices(voice_client, &group.channel_id).await;
                 if sibling_verdict(&user.id, &existing.device_id, live.as_ref())
                     == SiblingVerdict::CloseUnservable
@@ -1706,11 +1725,11 @@ mod tests {
             User,
         };
         use revolt_models::v0;
-        use revolt_result::Result;
+        use revolt_result::{create_database_error, create_error, Result};
         use rocket_empty::EmptyResponse;
         use ulid::Ulid;
 
-        use super::super::call_join_intent;
+        use super::super::{call_join_intent, sibling_registration_gone};
         use super::{leaf, new_bound_device, refused, signed_intent, stored_intents};
         use crate::util::test::{TestE2EEDevice, TestHarness};
 
@@ -2070,6 +2089,22 @@ mod tests {
             assert!(stored_intents(db, &group.id).await.is_empty());
         }
 
+        /// Delete A's identity row (and its keys) through the driver
+        /// primitive, the state a device removal leaves behind
+        async fn remove_sibling(fixture: &Sibling) {
+            let db = &fixture.harness.db;
+            let (user_id, device_id) = (&fixture.user.id, &fixture.sibling.device_id);
+            assert!(db
+                .delete_e2ee_device(user_id, device_id)
+                .await
+                .expect("delete the sibling's row"));
+            refused(
+                db.fetch_e2ee_identity(user_id, device_id).await,
+                "NotFound",
+                "the removed sibling's row",
+            );
+        }
+
         #[test]
         fn a_sole_stale_sibling_closes_the_group() {
             crate::util::test::rt().block_on(a_sole_stale_sibling_closes_the_group_case())
@@ -2105,6 +2140,13 @@ mod tests {
             let fixture = sibling_fixture().await;
             let db = &fixture.harness.db;
             let group = call_group(&fixture, vec![leaf(&fixture.sibling)]).await;
+
+            // The sibling is still registered: its row is no evidence, and
+            // the listing decides
+            assert!(db
+                .fetch_e2ee_identity(&fixture.user.id, &fixture.sibling.device_id)
+                .await
+                .is_ok());
 
             // The sibling still holds its seat (a failed eviction) and the
             // joiner is not listed, so only the sibling's own seat can
@@ -2302,6 +2344,122 @@ mod tests {
                 .await;
                 assert_eq!(seen, vec![]);
                 assert_sibling_refusal(result, "the kill switch off");
+                assert!(is_open(db, &group.id).await);
+                assert!(stored_intents(db, &group.id).await.is_empty());
+            })
+        }
+
+        #[test]
+        fn only_a_missing_row_reads_as_a_removed_sibling() {
+            assert!(sibling_registration_gone::<()>(&Err(create_error!(
+                NotFound
+            ))));
+            assert!(!sibling_registration_gone(&Ok(())));
+            assert!(!sibling_registration_gone::<()>(&Err(
+                create_database_error!("find_one", "e2ee_identities")
+            )));
+            assert!(!sibling_registration_gone::<()>(&Err(create_error!(
+                InternalError
+            ))));
+        }
+
+        #[test]
+        fn a_sole_removed_sibling_closes_the_group() {
+            crate::util::test::rt().block_on(a_sole_removed_sibling_closes_the_group_case())
+        }
+
+        async fn a_sole_removed_sibling_closes_the_group_case() {
+            let fixture = sibling_fixture().await;
+            let db = &fixture.harness.db;
+            let group = call_group(&fixture, vec![leaf(&fixture.sibling)]).await;
+            remove_sibling(&fixture).await;
+
+            // No node pinned, so the SFU has no answer to give: the missing
+            // registration alone closes the group, and the SFU is not asked
+            let (result, seen) = join(
+                &fixture,
+                &group,
+                intent(&fixture, &group),
+                false,
+                vec![listed(stale_sibling_listing(&fixture))],
+            )
+            .await;
+            assert_eq!(seen, vec![]);
+            assert_closed(db, &group, result).await;
+
+            // Pinned, with the sibling's seat still listed (a listing alone
+            // would refuse): the missing registration closes it first, and
+            // the SFU is still not asked
+            let group = call_group(&fixture, vec![leaf(&fixture.sibling)]).await;
+            let sibling = format!("{}:{}", fixture.user.id, fixture.sibling.device_id);
+            let (result, seen) = join(
+                &fixture,
+                &group,
+                intent(&fixture, &group),
+                true,
+                vec![listed(listing(&[sibling.as_str()]))],
+            )
+            .await;
+            assert_eq!(seen, vec![]);
+            assert_closed(db, &group, result).await;
+        }
+
+        #[test]
+        fn a_removed_sibling_beside_another_member_is_refused() {
+            crate::util::test::rt()
+                .block_on(a_removed_sibling_beside_another_member_is_refused_case())
+        }
+
+        async fn a_removed_sibling_beside_another_member_is_refused_case() {
+            let fixture = sibling_fixture().await;
+            let db = &fixture.harness.db;
+            let other = MlsMemberDevice {
+                user_id: Ulid::new().to_string(),
+                device_id: format!("{:032x}", 0xf0_0003),
+            };
+            let group = call_group(&fixture, vec![leaf(&fixture.sibling), other]).await;
+            remove_sibling(&fixture).await;
+
+            // Another user's leaf still holds the group, which members
+            // repair by removing the sibling's leaf: never a close
+            let (result, seen) = join(
+                &fixture,
+                &group,
+                intent(&fixture, &group),
+                true,
+                vec![listed(listing(&[]))],
+            )
+            .await;
+            assert_eq!(seen, vec![]);
+            assert_sibling_refusal(result, "a removed sibling beside another member");
+            assert!(is_open(db, &group.id).await);
+            assert!(stored_intents(db, &group.id).await.is_empty());
+        }
+
+        #[test]
+        fn the_sibling_close_off_keeps_the_refusal_for_a_removed_sibling() {
+            crate::util::test::rt().block_on(async {
+                revolt_config::overwrite_config(|settings| {
+                    settings.features.mls_sibling_close = false;
+                })
+                .await;
+
+                let fixture = sibling_fixture().await;
+                let db = &fixture.harness.db;
+                let group = call_group(&fixture, vec![leaf(&fixture.sibling)]).await;
+                remove_sibling(&fixture).await;
+
+                // A sole removed sibling, which closes with the flag on
+                let (result, seen) = join(
+                    &fixture,
+                    &group,
+                    intent(&fixture, &group),
+                    false,
+                    vec![listed(stale_sibling_listing(&fixture))],
+                )
+                .await;
+                assert_eq!(seen, vec![]);
+                assert_sibling_refusal(result, "the kill switch off, a removed sibling");
                 assert!(is_open(db, &group.id).await);
                 assert!(stored_intents(db, &group.id).await.is_empty());
             })

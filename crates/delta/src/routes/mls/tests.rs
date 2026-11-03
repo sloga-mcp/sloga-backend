@@ -1273,19 +1273,24 @@ async fn join_intent_signature_one_device_and_rate_limit_case() {
     assert_eq!(response.status(), Status::BadRequest);
 
     // A member's OWN device signalling intent is refused (one-device rule:
-    // the creator's user already has a live leaf)
+    // the creator's user already has a live leaf). The second device is on
+    // its own session so the first stays registered.
+    let session_a2 = account_a
+        .create_session(&harness.db, String::new())
+        .await
+        .expect("second session");
     let second_device = enroll_mls_device(
         &harness,
         &account_a.id,
         &user_a.id,
-        &session_a.token,
+        &session_a2.token,
         &["a20"],
         None,
     )
     .await;
     let response = post_json(
         &harness,
-        &session_a,
+        &session_a2,
         format!("/mls/groups/{gid}/join_intent"),
         serde_json::to_string(&v0::DataMlsJoinIntent {
             device_id: second_device.device.device_id.clone(),
