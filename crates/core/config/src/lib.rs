@@ -1492,6 +1492,8 @@ pub struct ProtectionFeatures {
     pub contribute_hold_hours: u32,
     /// Most Prot one wallet may hold
     pub wallet_cap: i64,
+    /// Longest launch goal, in days (S5b; at most 3650)
+    pub max_launch_goal_days: u32,
 }
 
 impl Default for ProtectionFeatures {
@@ -1527,6 +1529,7 @@ impl Default for ProtectionFeatures {
             withdraw_cutoff_hours: 48,
             contribute_hold_hours: 72,
             wallet_cap: 100000,
+            max_launch_goal_days: 365,
         }
     }
 }
@@ -3887,7 +3890,7 @@ mod prot_config_tests {
 
         // Every key is in the block, or the comparison below proves little
         let documented = block.lines().filter(|line| line.contains(" = ")).count();
-        assert_eq!(documented, 20, "the documented block lists every key");
+        assert_eq!(documented, 21, "the documented block lists every key");
 
         let protection = settings(&[block.as_str()]).features.boosts.protection;
         let expected = ProtectionFeatures::default();
@@ -3905,6 +3908,7 @@ mod prot_config_tests {
         assert!(!protection.cipher_grants_enabled);
         let expected = ProtectionFeatures {
             enabled: true,
+            self_serve_enabled: true,
             ..Default::default()
         };
         assert_eq!(format!("{protection:?}"), format!("{expected:?}"));

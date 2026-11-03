@@ -43,6 +43,7 @@ prot_sales_open = true
 # the Cipher tests never post Prot; grant tests pass their own settings.
 [features.boosts.protection]
 enabled = true
+self_serve_enabled = true
 
 [api.stripe]
 secret_key = "sk_test_dummy"

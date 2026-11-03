@@ -172,6 +172,9 @@ impl AbstractProtectedChannels for ReferenceDb {
             .values()
             .find(|existing| existing.channel_id == entitlement.channel_id)
         {
+            Some(existing) if existing.source != crate::ChannelEntitlementSource::AdminGrant => {
+                return Err(create_error!(InvalidOperation));
+            }
             Some(existing) => ChannelEntitlement {
                 slot_cap: entitlement.slot_cap,
                 device_cap: entitlement.device_cap,

@@ -99,8 +99,10 @@ pub async fn prot_me(db: &State<Database>, user: User) -> Result<Json<v0::ProtMe
         return Err(create_error!(IsBot));
     }
 
-    // Gated on `[features.boosts.protection] enabled` (the engine answers
-    // ProtDisabled). Only the session user's own wallet is read.
+    // Readable while `[features.boosts.protection] enabled` is off (owner
+    // answer, S5b contracts section 25): a read-only view of a balance that
+    // still binds. Checkout keeps every gate. Only the session user's own
+    // wallet is read; a config that fails validation still refuses.
     let ps = ProtSalesSettings::load().await?;
     Ok(Json(
         engine::prot::prot_me(db, &ps, &user.id, now_ms()).await?,
@@ -602,8 +604,8 @@ mod tests {
     }
 
     /// Payments off, Prot off, or the Prot sale closed: refused before any
-    /// order is stored or Stripe is called, and @me answers ProtDisabled
-    /// while Prot is off.
+    /// order is stored or Stripe is called, while @me still answers with
+    /// Prot off (S5b contracts section 25).
     ///
     /// The routes read the config through `load()`, and `overwrite_config`
     /// works once per process, so it cannot be flipped for one test. This
@@ -654,15 +656,82 @@ mod tests {
             }
         }
 
-        match engine::prot::prot_me(&harness.db, &prot_off, &user.id, now_ms()).await {
+        if let Err(err) = engine::prot::prot_me(&harness.db, &prot_off, &user.id, now_ms()).await {
+            panic!("expected the wallet, got {:?}", err.error_type);
+        }
+
+        assert!(harness.stripe.calls().is_empty());
+        assert_eq!(orders_of(&harness.db, &user.id).await, 0);
+    }
+
+    /// @me is a read: with Prot off (S5b contracts section 25) the engine
+    /// call the route makes answers with the same wallet as with Prot on,
+    /// while a checkout is still refused. Driven through the engine for the
+    /// reason given on `prot_disabled_or_closed_is_refused`. Control:
+    /// restore the `enabled` gate in the engine's `prot_me` and this fails.
+    #[test]
+    fn prot_me_is_readable_while_prot_is_off() {
+        crate::util::test::rt().block_on(prot_me_is_readable_while_prot_is_off_case())
+    }
+
+    async fn prot_me_is_readable_while_prot_is_off_case() {
+        let harness = TestHarness::new().await;
+        let (_, _, user) = harness.new_user().await;
+        let (_, _, staff) = harness.new_user().await;
+        let payments = PaymentsSettings::load().await.expect("payments settings");
+        let ps = open_prot_settings().await;
+        let mut prot_off = ps.clone();
+        prot_off.enabled = false;
+
+        engine::prot::admin_prot_adjust(
+            &harness.db,
+            &staff.id,
+            &v0::DataProtAdjust {
+                user: user.id.clone(),
+                amount: 700,
+                nonce: "readable-while-off".to_string(),
+            },
+            "test credit".to_string(),
+            now_ms(),
+        )
+        .await
+        .expect("the credit");
+
+        let now = now_ms();
+        let on = engine::prot::prot_me(&harness.db, &ps, &user.id, now)
+            .await
+            .expect("@me with Prot on");
+        let off = match engine::prot::prot_me(&harness.db, &prot_off, &user.id, now).await {
+            Ok(me) => me,
+            Err(err) => panic!(
+                "expected the wallet with Prot off, got {:?}",
+                err.error_type
+            ),
+        };
+        assert_eq!(off, on);
+        assert_eq!((off.balance, off.held), (700, 0));
+        assert_eq!(off.recent.len(), 1);
+
+        // Buying stays refused while Prot is off
+        let result = engine::prot::create_prot_checkout(
+            &harness.db,
+            &*harness.stripe,
+            &payments,
+            &prot_off,
+            &user.id,
+            ProtChoice::Pack("p25".to_string()),
+            v0::CipherReturnTo::Web,
+            now_ms(),
+        )
+        .await;
+        match result {
             Err(err) => assert!(
                 matches!(err.error_type, ErrorType::ProtDisabled),
                 "{:?}",
                 err.error_type
             ),
-            Ok(me) => panic!("expected ProtDisabled, got {:?}", me),
+            Ok(url) => panic!("expected ProtDisabled, got a checkout URL {}", url),
         }
-
         assert!(harness.stripe.calls().is_empty());
         assert_eq!(orders_of(&harness.db, &user.id).await, 0);
     }

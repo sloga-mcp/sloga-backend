@@ -622,6 +622,9 @@ impl MongoDb {
 
         match existing {
             Some(existing) => {
+                if existing.source != crate::ChannelEntitlementSource::AdminGrant {
+                    return Err(TxnFail::Refuse(create_error!(InvalidOperation)));
+                }
                 let stored = ChannelEntitlement {
                     slot_cap: entitlement.slot_cap,
                     device_cap: entitlement.device_cap,

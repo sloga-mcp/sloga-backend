@@ -18,7 +18,8 @@ use crate::{
     MFATicket
 };
 use crate::{
-    CipherMembership, CipherNumber, PaymentEvent, PaymentOrder, ProtAccount, ProtLedgerEntry,
+    CipherMembership, CipherNumber, PaymentEvent, PaymentOrder, ProtAccount, ProtContributorPref,
+    ProtGoal, ProtLedgerEntry, ProtNotice, ProtPledge, ProtRuntime, ProtTank,
 };
 
 database_derived!(
@@ -92,5 +93,18 @@ database_derived!(
         pub prot_ledger: Arc<Mutex<HashMap<String, ProtLedgerEntry>>>,
         /// Keyed by account id (`user:{id}`; S5b adds `tank:`/`hold:`)
         pub prot_accounts: Arc<Mutex<HashMap<String, ProtAccount>>>,
+        // S5b fuel tanks and goals; lock order: models/prot/mod.rs
+        /// Keyed by `_id` (pledge ULID)
+        pub prot_pledges: Arc<Mutex<HashMap<String, ProtPledge>>>,
+        /// Keyed by `_id` (goal ULID)
+        pub prot_goals: Arc<Mutex<HashMap<String, ProtGoal>>>,
+        /// Keyed by `_id` (tank ULID)
+        pub prot_tanks: Arc<Mutex<HashMap<String, ProtTank>>>,
+        /// The singleton under key "runtime"
+        pub prot_runtime: Arc<Mutex<HashMap<String, ProtRuntime>>>,
+        /// Keyed by the notice key (`_id`)
+        pub prot_notices: Arc<Mutex<HashMap<String, ProtNotice>>>,
+        /// Keyed by "{server_id}:{user_id}"
+        pub prot_contributor_prefs: Arc<Mutex<HashMap<String, ProtContributorPref>>>,
     }
 );

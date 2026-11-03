@@ -3,7 +3,9 @@ mod mongodb;
 mod reference;
 
 #[cfg(all(test, feature = "mongodb"))]
-pub(crate) use self::mongodb::{create_prot_indexes, PROT_COLLECTIONS};
+pub(crate) use self::mongodb::{
+    create_prot_indexes, create_prot_tank_indexes, PROT_COLLECTIONS, PROT_TANK_COLLECTIONS,
+};
 #[cfg(feature = "mongodb")]
 pub(crate) use mongodb::{protected_nonce_index, PROTECTED_NONCE_INDEX_NAME};
 

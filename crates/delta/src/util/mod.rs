@@ -2,6 +2,7 @@ pub mod boosts;
 pub mod dice;
 pub mod interactions;
 pub mod polls;
+pub mod prot_gate;
 pub mod ratelimits;
 pub mod slowmode;
 pub mod softres;
