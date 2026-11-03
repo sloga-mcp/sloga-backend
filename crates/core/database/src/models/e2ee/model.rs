@@ -759,7 +759,21 @@ impl E2EEIdentity {
     ///
     /// Never writes an [`E2EERemovedDevice`] tombstone: only the removal
     /// route does, so a device revoked with its session can re-enroll.
+    ///
+    /// A revoked device leaves any call it is in (its `user:device` seat
+    /// and screen legs, best-effort, after the broadcast).
     pub async fn revoke_device(db: &Database, user_id: &str, device_id: &str) -> Result<bool> {
+        Self::revoke_device_inner(db, user_id, device_id, true).await
+    }
+
+    /// [`Self::revoke_device`], with the call-seat eviction only when
+    /// `evict`. Only the same-session predecessor sweep passes `false`.
+    async fn revoke_device_inner(
+        db: &Database,
+        user_id: &str,
+        device_id: &str,
+        #[cfg_attr(not(feature = "voice"), allow(unused_variables))] evict: bool,
+    ) -> Result<bool> {
         let existed = db.delete_e2ee_device(user_id, device_id).await?;
 
         // A revoked device's MLS KeyPackages must leave the directory with
@@ -777,6 +791,14 @@ impl E2EEIdentity {
                 },
             )
             .await;
+        }
+
+        // Only a device this call removed; without the `voice` feature
+        // the binary has no voice client and revocation stops here
+        #[cfg(feature = "voice")]
+        if existed && evict {
+            let voice_client = crate::voice::VoiceClient::from_revolt_config().await;
+            crate::voice::evict_revoked_device(&voice_client, user_id, device_id).await;
         }
 
         Ok(existed)
@@ -837,8 +859,10 @@ impl E2EEIdentity {
                 && identity.last_session_id == session_id
             {
                 // Best-effort per row; the broadcast inside revoke_device
-                // keeps every successful removal loud
-                let _ = Self::revoke_device(db, user_id, &identity.device_id).await;
+                // keeps every successful removal loud. A predecessor is
+                // this same install under its old id, possibly still
+                // seated in a call, so its seat stays
+                let _ = Self::revoke_device_inner(db, user_id, &identity.device_id, false).await;
             }
         }
     }
@@ -1311,5 +1335,106 @@ mod multi_device_tests {
                 .await
                 .expect("a revoked (not removed) id re-enrolls");
         });
+    }
+}
+
+#[cfg(test)]
+mod revoke_eviction_wiring_tests {
+    /// The body of `async fn fn_name` in this file: comment lines dropped,
+    /// and whitespace kept only between two identifier characters, so the
+    /// needles below do not depend on line breaks or a trailing comma
+    fn fn_body(fn_name: &str) -> String {
+        const SOURCE: &str = include_str!("model.rs");
+        let header = format!("async fn {fn_name}(");
+        assert_eq!(SOURCE.matches(&header).count(), 1, "{header}");
+        let at = SOURCE.find(&header).expect("the fn is defined");
+        let open = at + SOURCE[at..].find('{').expect("a body");
+        let mut depth = 0usize;
+        let mut close = None;
+        for (i, ch) in SOURCE[open..].char_indices() {
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        close = Some(open + i);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let text = SOURCE[open..=close.expect("a closed body")]
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        let ident = |ch: char| ch.is_alphanumeric() || ch == '_';
+        let chars: Vec<char> = text.chars().collect();
+        let mut body = String::new();
+        for (i, &ch) in chars.iter().enumerate() {
+            if !ch.is_whitespace() {
+                body.push(ch);
+                continue;
+            }
+            let before = body.chars().last();
+            let after = chars[i + 1..].iter().copied().find(|c| !c.is_whitespace());
+            if before.is_some_and(ident) && after.is_some_and(ident) {
+                body.push(' ');
+            }
+        }
+        body.replace(",)", ")")
+    }
+
+    /// Every public revocation evicts: `revoke_device` is the evicting
+    /// inner call and nothing else, and the session path goes through it
+    #[test]
+    fn public_revocation_takes_the_evicting_path() {
+        assert_eq!(
+            fn_body("revoke_device"),
+            "{Self::revoke_device_inner(db,user_id,device_id,true).await}"
+        );
+        let session = fn_body("revoke_devices_for_session");
+        assert!(
+            session.contains("Self::revoke_device(db,user_id,&identity.device_id).await?;"),
+            "{session}"
+        );
+    }
+
+    /// The same-session predecessor sweep keeps the seat: it reaches the
+    /// inner revocation with `false`, and never the public one
+    #[test]
+    fn predecessor_sweep_takes_the_non_evicting_path() {
+        let sweep = fn_body("revoke_same_session_predecessors");
+        assert_eq!(
+            sweep
+                .matches("Self::revoke_device_inner(db,user_id,&identity.device_id,false).await;")
+                .count(),
+            1,
+            "{sweep}"
+        );
+        assert_eq!(sweep.matches("revoke_device_inner(").count(), 1, "{sweep}");
+        assert_eq!(sweep.matches("revoke_device(").count(), 0, "{sweep}");
+    }
+
+    /// In the inner revocation the eviction follows the broadcast, runs
+    /// only for a device this call removed and only when asked, and sits
+    /// behind the `voice` feature
+    #[test]
+    fn eviction_follows_the_broadcast_and_is_gated() {
+        let inner = fn_body("revoke_device_inner");
+        let evict = "#[cfg(feature=\"voice\")]if existed&&evict{\
+                     let voice_client=crate::voice::VoiceClient::from_revolt_config().await;\
+                     crate::voice::evict_revoked_device(&voice_client,user_id,device_id).await;}";
+        assert_eq!(inner.matches(evict).count(), 1, "{inner}");
+        assert_eq!(inner.matches("evict_revoked_device(").count(), 1, "{inner}");
+
+        let broadcast = inner
+            .find("if existed{Self::broadcast_device_change(")
+            .expect("the broadcast");
+        let eviction = inner.find(evict).expect("the eviction");
+        let done = inner.find("Ok(existed)").expect("the result");
+        assert!(broadcast < eviction && eviction < done, "{inner}");
     }
 }

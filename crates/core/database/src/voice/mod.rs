@@ -30,8 +30,10 @@ use revolt_result::{create_error, Result, ToRevoltError};
 pub mod afk_idle;
 pub mod annotations;
 pub mod remote_control;
+mod revoked_device;
 pub mod watch;
 mod voice_client;
+pub use revoked_device::evict_revoked_device;
 pub use voice_client::{
     screen_leg_participant_permissions, EvictionFailure, VoiceClient, MOVE_TOKEN_TTL,
     SFU_BREAKER_WINDOW, SFU_CALL_TIMEOUT,
@@ -19919,8 +19921,13 @@ mod tests {
                         // D1's binding changes now, after the plan read it.
                         match change {
                             "revoked" => {
-                                rt().block_on(crate::E2EEIdentity::revoke_device(&db, &user, "D1"))
+                                // The identity row a revocation deletes, deleted
+                                // directly: the re-read sees only the row, and the
+                                // revocation's own SFU calls are not under test.
+                                let existed = rt()
+                                    .block_on(db.delete_e2ee_device(&user, "D1"))
                                     .expect("the revocation");
+                                assert!(existed, "D1's identity row was there to delete");
                             }
                             "rebound" => {
                                 rt().block_on(db.update_e2ee_identity_session(

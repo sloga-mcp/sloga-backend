@@ -405,6 +405,8 @@ e2ee_enabled = true
 # Media E2EE (calls): MLS delivery service + KeyPackage directory (requires e2ee_enabled).
 # Production-enabled 2026-07-14; kept true here for durability across reprovisions.
 media_e2ee_enabled = true
+# Kill switch: close a call's MLS group held only by a departed sibling device; restart delta.
+mls_sibling_close = true
 # Enable push notifications for mass pings (everyone, online, roles)
 # When false this will still ping in-client but will not send notifications from pushd
 mass_mentions_send_notifications = true

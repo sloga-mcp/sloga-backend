@@ -1941,6 +1941,16 @@ pub struct Features {
     #[serde(default)]
     pub media_e2ee_enabled: bool,
 
+    /// Kill switch for the media-E2EE call path (mls-call-sibling-device-wedge
+    /// plan). When a user's other device is the ONLY member of a call's MLS
+    /// group and is no longer in the call, delta closes the group so the
+    /// joining device re-creates it; false restores the plain 400. ON by
+    /// default, and the default lives in the embedded `Revolt.toml`:
+    /// `#[serde(default)]` alone would make it `false`. Read once per
+    /// process, so flipping it needs a delta restart.
+    #[serde(default)]
+    pub mls_sibling_close: bool,
+
     /// Operator flag for the server calendar/events routes
     #[serde(default)]
     pub events_enabled: bool,
@@ -2516,6 +2526,58 @@ mod e2ee_claim_lock_switch_tests {
             Some(("REVOLT__FEATURES__E2EE__CLAIM_LOCK", "false")),
         );
         assert!(!settings.features.e2ee.claim_lock);
+    }
+}
+
+#[cfg(test)]
+mod mls_sibling_close_tests {
+    use config::{Config, Environment, File, FileFormat};
+
+    use super::Settings;
+
+    fn embedded() -> File<config::FileSourceString, FileFormat> {
+        File::from_str(include_str!("../Revolt.toml"), FileFormat::Toml)
+    }
+
+    /// The sole-stale-sibling close is ON unless an operator turns it off.
+    /// `#[serde(default)]` on a `bool` is `false`, so the `true` has to come
+    /// from the embedded `Revolt.toml`, the first source every process loads.
+    #[test]
+    fn the_embedded_default_turns_the_close_on() {
+        let settings: Settings = Config::builder()
+            .add_source(embedded())
+            .build()
+            .expect("the embedded Revolt.toml builds")
+            .try_deserialize()
+            .expect("the embedded Revolt.toml deserializes");
+
+        assert!(settings.features.mls_sibling_close);
+    }
+
+    /// And the override turns it off (double underscores). The environment
+    /// source is configured exactly as `CONFIG_BUILDER` does, with the
+    /// variable supplied in-process rather than set on the test process.
+    #[test]
+    fn the_environment_override_turns_the_close_off() {
+        let settings: Settings = Config::builder()
+            .add_source(embedded())
+            .add_source(
+                Environment::with_prefix("REVOLT")
+                    .separator("__")
+                    .source(Some(
+                        [(
+                            "REVOLT__FEATURES__MLS_SIBLING_CLOSE".to_string(),
+                            "false".to_string(),
+                        )]
+                        .into(),
+                    )),
+            )
+            .build()
+            .expect("the config builds")
+            .try_deserialize()
+            .expect("the config deserializes");
+
+        assert!(!settings.features.mls_sibling_close);
     }
 }
 
