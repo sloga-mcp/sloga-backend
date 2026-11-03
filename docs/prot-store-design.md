@@ -1206,14 +1206,14 @@ would mint real Prot.
 
 ## 16. Rollout and land order
 
-- **Migration:** its own top-level block `if revision <= 80` with `LATEST_REVISION = 81` (confirmed by the merge
+- **Migration:** its own top-level block `if revision <= 81` with `LATEST_REVISION = 82` (confirmed by the merge
   steward on 2026-11-01). It creates `prot_store_intents`, `prot_store_purchases` and `prot_store_cursors` and the
   indexes of section 3.4 through the shared `PROT_STORE_COLLECTIONS` / `create_prot_store_indexes` (also called from
   `init.rs`), and panics on failure: the unique token index is what makes a token one-time. Every step is idempotent,
   so the next boot re-runs the whole block. A database at 77..=80 runs only the blocks it has not run. S6 adds no
   `prot_ledger` index.
-- **Land order:** S2 (`<= 77` / 78) -> S5b (`<= 78` / 79) -> S4 (`<= 79` / 80) -> S6 (`<= 80` / 81). If S6 is ready
-  before S4, the steward decides; S6 never renumbers itself. Queue file: "migration block <= 80 / LATEST 81, lands
+- **Land order:** add-device (`<= 77` / 78) -> S2 (`<= 78` / 79) -> S5b (`<= 79` / 80) -> S4 (`<= 80` / 81) -> S6 (`<= 81` / 82). If S6 is ready
+  before S4, the steward decides; S6 never renumbers itself. Queue file: "migration block <= 81 / LATEST 82, lands
   after S5b (and S4 if it lands first)", LIVE-PAYMENTS deploy, delta + crond together.
 - Until it lands, this branch's binaries run only against throwaway databases: a stamp of 81 would make any lower
   block that has not landed yet never run.
