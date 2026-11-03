@@ -4,13 +4,15 @@
 //! `e2ee_claim:{user}:{device}` = `{session}:{conn}` names the one SESSION
 //! live on a device. Bonfire takes, refreshes and releases it per
 //! connection; delta's split publication (plan D5) deletes the old
-//! device's lock when this session holds it. Both go through this module,
-//! so the format and the scripts cannot drift apart.
+//! device's lock when this session holds it, and its device removal reads
+//! the locks to decide who may remove a device ([`decide_revoke`]). All of
+//! them go through this module, so the format and the scripts cannot drift
+//! apart.
 //!
 //! Every write is a Lua compare-and-set, so a caller only extends, takes
 //! over or deletes a lock its own session holds. Callers treat a
 //! [`LockError`] as "Redis could not decide" and fail open (owner decision
-//! O4).
+//! O4); the device removal instead falls back to the database's bindings.
 
 use std::{future::Future, sync::LazyLock, time::Duration};
 
@@ -247,6 +249,103 @@ where
     }
 }
 
+/// The removal route's read of the removed device's lock
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RevokeLock {
+    /// The lock is switched off (`[features.e2ee] claim_lock = false`):
+    /// nothing was read
+    Off,
+    /// Redis could not answer
+    Unreadable,
+    /// No lock
+    Absent,
+    /// The session part of the lock's value
+    HeldBy(String),
+}
+
+impl RevokeLock {
+    /// Whether the lock was read; the other own devices' locks are read only
+    /// then
+    pub fn is_readable(&self) -> bool {
+        matches!(self, RevokeLock::Absent | RevokeLock::HeldBy(_))
+    }
+}
+
+/// Read `key` for the removal route; nothing at all while `claim_lock` is off
+pub async fn read_for_revoke(claim_lock: bool, key: &str) -> RevokeLock {
+    if !claim_lock {
+        return RevokeLock::Off;
+    }
+
+    match holder(key).await {
+        Ok(Some(value)) => RevokeLock::HeldBy(holder_session(&value).to_string()),
+        Ok(None) => RevokeLock::Absent,
+        Err(_) => RevokeLock::Unreadable,
+    }
+}
+
+/// Whether `session_id` holds the live lock of one of `devices` (the
+/// account's other devices). A lock that cannot be read counts as not held.
+pub async fn session_holds_any<'a>(
+    user_id: &str,
+    devices: impl IntoIterator<Item = &'a str>,
+    session_id: &str,
+) -> bool {
+    for device_id in devices {
+        if let Ok(Some(value)) = holder(&lock_key(user_id, device_id)).await {
+            if holder_session(&value) == session_id {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// What `DELETE /e2ee/keys/{device}` knows when it decides, all of it read
+/// before anything is written
+#[derive(Debug, Clone)]
+pub struct RevokeFacts<'a> {
+    /// The calling session
+    pub caller_session: &'a str,
+    /// The removed device's lock
+    pub lock: RevokeLock,
+    /// The removed device row's `last_session_id`
+    pub bound_session: &'a str,
+    /// Whether that session still exists (false for `""`)
+    pub bound_session_exists: bool,
+    /// Whether the caller holds the live lock of another of the account's
+    /// devices; read only when [`RevokeLock::is_readable`]
+    pub caller_holds_another_lock: bool,
+    /// Whether another of the account's device rows is bound to the caller
+    pub another_row_bound_to_caller: bool,
+}
+
+/// Whether the caller may remove the device (multi-device addendum A1):
+/// - the lock is held by the caller: yes;
+/// - held by another session: only if the caller holds the live lock of
+///   another of the account's devices;
+/// - absent: that, or the row is bound to the caller, or its binding is
+///   dead (`""` or a session that no longer exists);
+/// - unreadable, or switched off: from the database alone, the row is
+///   bound to the caller, its binding is dead, or another of the account's
+///   rows is bound to the caller.
+///
+/// A refusal writes nothing.
+pub fn decide_revoke(facts: &RevokeFacts) -> bool {
+    let bound_to_caller = facts.bound_session == facts.caller_session;
+    let binding_dead = facts.bound_session.is_empty() || !facts.bound_session_exists;
+
+    match &facts.lock {
+        RevokeLock::HeldBy(holder) => {
+            holder == facts.caller_session || facts.caller_holds_another_lock
+        }
+        RevokeLock::Absent => facts.caller_holds_another_lock || bound_to_caller || binding_dead,
+        RevokeLock::Unreadable | RevokeLock::Off => {
+            bound_to_caller || binding_dead || facts.another_row_bound_to_caller
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -332,6 +431,114 @@ mod tests {
 
         if let Ok(mut conn) = get_connection().await.map(|conn| conn.into_inner()) {
             let _: Result<(), _> = conn.del(&key).await;
+        }
+        if let Err(panic) = result {
+            std::panic::resume_unwind(panic.into_panic());
+        }
+    }
+
+    /// Addendum A1, every row of its table. `S` calls, `H` is the other
+    /// install's live session, `""` an unbound row
+    #[test]
+    fn revoke_decision_table() {
+        use RevokeLock::{Absent, HeldBy, Off, Unreadable};
+
+        let held = |session: &str| HeldBy(session.to_string());
+        // (row, lock, bound, bound session exists, S holds another lock,
+        //  another row bound to S, allowed)
+        let cases: Vec<(&str, RevokeLock, &str, bool, bool, bool, bool)> = vec![
+            // Refused twin, wiped or not: the other install holds the lock,
+            // whatever the row says
+            ("twin, lock elsewhere", held("H"), "H", true, false, false, false),
+            ("twin, lock elsewhere, row names S", held("H"), "S", true, false, false, false),
+            ("twin, lock elsewhere, dead binding", held("H"), "", false, false, false, false),
+            ("twin, lock elsewhere, own row bound", held("H"), "H", true, false, true, false),
+            // Twin retrying after the holder's lock lapsed: absent, bound to
+            // the holder's live session
+            ("twin, lock lapsed", Absent, "H", true, false, false, false),
+            // Twin bound to an orphan or predecessor row, no live lock
+            ("orphan row, lock elsewhere", held("H"), "H", true, false, true, false),
+            ("orphan row, lock absent", Absent, "H", true, false, true, false),
+            // The holder disabling its own device
+            ("holder", held("S"), "S", true, false, false, true),
+            ("holder, row moved", held("S"), "H", true, false, false, true),
+            // Another own device removing T (S holds that device's lock)
+            ("other device, lock elsewhere", held("H"), "H", true, true, false, true),
+            ("other device, lock absent", Absent, "H", true, true, false, true),
+            // T offline and bound to S, or its binding dead
+            ("offline, bound to S", Absent, "S", true, false, false, true),
+            ("offline, unbound", Absent, "", false, false, false, true),
+            ("offline, bound to a gone session", Absent, "G", false, false, false, true),
+            // Accepted regression: no live device, T's session alive
+            ("no live device, T's session alive", Absent, "H", true, false, false, false),
+            // Redis down: the database decides
+            ("redis down, bound to S", Unreadable, "S", true, false, false, true),
+            ("redis down, unbound", Unreadable, "", false, false, false, true),
+            ("redis down, gone session", Unreadable, "G", false, false, false, true),
+            ("redis down, own row bound", Unreadable, "H", true, false, true, true),
+            ("redis down, bound elsewhere", Unreadable, "H", true, false, false, false),
+            ("redis down, lock claim ignored", Unreadable, "H", true, true, false, false),
+            // Switched off: the same database rule, no lock read
+            ("off, bound to S", Off, "S", true, false, false, true),
+            ("off, dead binding", Off, "", false, false, false, true),
+            ("off, own row bound", Off, "H", true, false, true, true),
+            ("off, bound elsewhere", Off, "H", true, false, false, false),
+            ("off, lock claim ignored", Off, "H", true, true, false, false),
+        ];
+
+        for (row, lock, bound, exists, holds, own_row, allowed) in cases {
+            let facts = RevokeFacts {
+                caller_session: "S",
+                lock,
+                bound_session: bound,
+                bound_session_exists: exists,
+                caller_holds_another_lock: holds,
+                another_row_bound_to_caller: own_row,
+            };
+            assert_eq!(decide_revoke(&facts), allowed, "{row}: {facts:?}");
+        }
+    }
+
+    /// The removal route's lock reads against Redis: switched off it reads
+    /// nothing (a lock left in Redis is not seen), and only a lock the
+    /// caller's SESSION holds counts as holding another device
+    #[tokio::test]
+    async fn revoke_lock_reads_against_redis() {
+        static RUN: AtomicUsize = AtomicUsize::new(0);
+        let user = format!(
+            "aatest{:016x}{}",
+            rand::random::<u64>(),
+            RUN.fetch_add(1, Ordering::SeqCst)
+        );
+        let keys = [lock_key(&user, "T"), lock_key(&user, "D")];
+        let ttl = Duration::from_secs(30);
+
+        let task_user = user.clone();
+        let outcome = async move {
+            let user = task_user;
+            let target = lock_key(&user, "T");
+
+            assert_eq!(read_for_revoke(true, &target).await, RevokeLock::Absent);
+            assert_eq!(acquire(&target, "H:c1", "H", ttl).await.expect("acquire"), Acquire::Acquired);
+            assert_eq!(read_for_revoke(true, &target).await, RevokeLock::HeldBy("H".into()));
+            assert_eq!(read_for_revoke(false, &target).await, RevokeLock::Off);
+
+            assert!(!session_holds_any(&user, ["D"], "S").await, "no lock on D");
+            assert_eq!(
+                acquire(&lock_key(&user, "D"), "S:c2", "S", ttl).await.expect("acquire"),
+                Acquire::Acquired
+            );
+            assert!(session_holds_any(&user, ["X", "D"], "S").await);
+            assert!(!session_holds_any(&user, ["D"], "S2").await, "another session");
+            assert!(!session_holds_any(&user, ["T"], "S").await, "T is H's");
+            assert!(!session_holds_any(&user, [], "S").await);
+        };
+        let result = tokio::spawn(outcome).await;
+
+        if let Ok(mut conn) = get_connection().await.map(|conn| conn.into_inner()) {
+            for key in &keys {
+                let _: Result<(), _> = conn.del(key).await;
+            }
         }
         if let Err(panic) = result {
             std::panic::resume_unwind(panic.into_panic());

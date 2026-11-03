@@ -12,7 +12,12 @@
 //! successor's lock. Redis being unavailable fails open to the old
 //! last-writer-wins behaviour (owner decision O4); the lock protects
 //! availability and integrity between the user's own installs, not
-//! confidentiality.
+//! confidentiality. A claim accepted that way takes the lock on a later
+//! refresh once Redis answers.
+//!
+//! `[features.e2ee] claim_lock = false` is the emergency switch: no lock is
+//! written or read, every verified claim is accepted, and acks and drains
+//! follow the device row's binding alone.
 //!
 //! The key format and the scripts live in
 //! `revolt_database::e2ee_claim_lock`, shared with delta's split
@@ -121,8 +126,12 @@ impl ClaimLockStore for RedisClaimLock {
 pub enum ClaimDecision {
     /// This connection holds the lock
     Accepted,
-    /// Redis could not decide; accepted without a lock (owner decision O4)
+    /// Redis could not decide; accepted without a lock (owner decision O4).
+    /// The next refresh tries to take it again
     FailedOpen,
+    /// The lock is switched off (`[features.e2ee] claim_lock = false`);
+    /// accepted, nothing read or written
+    LockOff,
     /// Another session holds the lock; refuse with `held_elsewhere`
     HeldElsewhere { holder_session: String },
 }
@@ -141,6 +150,14 @@ struct Held {
     last_refresh: Instant,
 }
 
+/// An accepted claim whose acquire failed open, to be taken on a later
+/// refresh
+#[derive(Debug)]
+struct Retry {
+    device_id: String,
+    last_attempt: Instant,
+}
+
 /// One connection's side of the lock. Dropping it releases whatever it
 /// still holds, so every exit of the connection worker releases.
 pub struct ConnectionClaim<S: ClaimLockStore> {
@@ -149,14 +166,30 @@ pub struct ConnectionClaim<S: ClaimLockStore> {
     session_id: String,
     value: String,
     ttl: Duration,
+    /// `[features.e2ee] claim_lock`; off, the store is never touched
+    lock_enabled: bool,
     held: Option<Held>,
+    retry: Option<Retry>,
 }
 
 impl<S: ClaimLockStore> ConnectionClaim<S> {
-    /// A connection of `session_id` with a fresh random connection id
-    pub fn new(store: S, user_id: &str, session_id: &str, ttl: Duration) -> Self {
+    /// A connection of `session_id` with a fresh random connection id.
+    /// With `lock_enabled` false (the kill switch) it neither writes nor
+    /// reads the lock.
+    pub fn new(
+        store: S,
+        user_id: &str,
+        session_id: &str,
+        ttl: Duration,
+        lock_enabled: bool,
+    ) -> Self {
         let conn_id = format!("{:016x}", rand::random::<u64>());
-        Self::with_conn_id(store, user_id, session_id, &conn_id, ttl)
+        Self::with_conn_id(store, user_id, session_id, &conn_id, ttl).lock_enabled(lock_enabled)
+    }
+
+    pub(crate) fn lock_enabled(mut self, enabled: bool) -> Self {
+        self.lock_enabled = enabled;
+        self
     }
 
     pub(crate) fn with_conn_id(
@@ -172,7 +205,9 @@ impl<S: ClaimLockStore> ConnectionClaim<S> {
             session_id: session_id.to_string(),
             value: lock_value(session_id, conn_id),
             ttl,
+            lock_enabled: true,
             held: None,
+            retry: None,
         }
     }
 
@@ -180,6 +215,12 @@ impl<S: ClaimLockStore> ConnectionClaim<S> {
     /// before: a keyless token must learn nothing about who holds it). A
     /// lock this connection holds on another device is released first.
     pub async fn acquire(&mut self, device_id: &str, now: Instant) -> ClaimDecision {
+        if !self.lock_enabled {
+            return ClaimDecision::LockOff;
+        }
+
+        // A new claim replaces any pending retry
+        self.retry = None;
         if self
             .held
             .as_ref()
@@ -217,6 +258,14 @@ impl<S: ClaimLockStore> ConnectionClaim<S> {
                     "E2EE claim lock unavailable, accepting without it: user={} device={} session={}: {}",
                     self.user_id, device_id, self.session_id, err.0
                 );
+                // Taken on a later refresh once Redis answers, so the
+                // device does not stay lockless for the connection's life
+                if self.held.is_none() {
+                    self.retry = Some(Retry {
+                        device_id: device_id.to_string(),
+                        last_attempt: now,
+                    });
+                }
                 ClaimDecision::FailedOpen
             }
         }
@@ -231,6 +280,8 @@ impl<S: ClaimLockStore> ConnectionClaim<S> {
     {
         let due = self.held.as_ref().is_some_and(|held| {
             now.saturating_duration_since(held.last_refresh) >= CLAIM_LOCK_REFRESH_INTERVAL
+        }) || self.retry.as_ref().is_some_and(|retry| {
+            now.saturating_duration_since(retry.last_attempt) >= CLAIM_LOCK_REFRESH_INTERVAL
         });
         if due {
             self.refresh(now, bound_session).await;
@@ -247,12 +298,16 @@ impl<S: ClaimLockStore> ConnectionClaim<S> {
     ///   (the device row's `last_session_id`, awaited only then) is still
     ///   this session. A split publication unbinds the old device and
     ///   deletes its lock on purpose, and must not see it come back.
+    ///
+    /// Holding nothing after a claim that failed open, it tries the acquire
+    /// again, under the same binding condition.
     pub async fn refresh<F, Fut>(&mut self, now: Instant, bound_session: F)
     where
         F: FnOnce(String) -> Fut,
         Fut: Future<Output = Option<String>>,
     {
         let Some(held) = self.held.as_mut() else {
+            self.retry_acquire(now, bound_session).await;
             return;
         };
 
@@ -295,6 +350,66 @@ impl<S: ClaimLockStore> ConnectionClaim<S> {
         }
     }
 
+    /// The acquire of a claim that failed open, again: taken if the lock is
+    /// free (or our session's) and the device is still bound to this
+    /// session; given up once another session holds it or the binding
+    /// moved; kept for the next refresh while Redis still errors
+    async fn retry_acquire<F, Fut>(&mut self, now: Instant, bound_session: F)
+    where
+        F: FnOnce(String) -> Fut,
+        Fut: Future<Output = Option<String>>,
+    {
+        let Some(retry) = self.retry.as_mut() else {
+            return;
+        };
+        retry.last_attempt = now;
+        let device_id = retry.device_id.clone();
+
+        let bound = bound_session(device_id.clone()).await;
+        if bound.as_deref() != Some(self.session_id.as_str()) {
+            self.retry = None;
+            debug!(
+                "E2EE claim lock retry dropped (no longer bound to this session): user={} device={} session={}",
+                self.user_id, device_id, self.session_id
+            );
+            return;
+        }
+
+        let key = lock_key(&self.user_id, &device_id);
+        match self
+            .store
+            .acquire(&key, &self.value, &self.session_id, self.ttl)
+            .await
+        {
+            Ok(Acquire::Acquired) => {
+                self.retry = None;
+                info!(
+                    "E2EE claim lock taken after failing open: user={} device={} session={}",
+                    self.user_id, device_id, self.session_id
+                );
+                self.held = Some(Held {
+                    device_id,
+                    key,
+                    last_refresh: now,
+                });
+            }
+            Ok(Acquire::HeldBy(value)) => {
+                self.retry = None;
+                info!(
+                    "E2EE claim lock retry found it held: user={} device={} holder_session={} session={}",
+                    self.user_id,
+                    device_id,
+                    holder_session(&value),
+                    self.session_id
+                );
+            }
+            Err(err) => warn!(
+                "E2EE claim lock still unavailable: user={} device={} session={}: {}",
+                self.user_id, device_id, self.session_id, err.0
+            ),
+        }
+    }
+
     /// Stop holding the lock without touching it
     fn let_go(&mut self, device_id: &str, why: &str) {
         debug!(
@@ -304,8 +419,10 @@ impl<S: ClaimLockStore> ConnectionClaim<S> {
         self.held = None;
     }
 
-    /// Release the held lock (compare-and-delete)
+    /// Release the held lock (compare-and-delete); a pending retry is
+    /// dropped
     pub async fn release(&mut self) {
+        self.retry = None;
         let Some(held) = self.held.take() else {
             return;
         };
@@ -323,10 +440,18 @@ impl<S: ClaimLockStore> ConnectionClaim<S> {
     /// when the lock is absent or unreadable, `bound_session` (the device
     /// row's `last_session_id`, only awaited then) is ours. Sessions are
     /// compared, not connections, so a reconnect overlap keeps its rights.
+    ///
+    /// With the lock switched off it is not read at all and the binding
+    /// alone decides: a lock left in Redis from before the switch grants
+    /// nothing.
     pub async fn may_act<F>(&self, device_id: &str, bound_session: F) -> bool
     where
         F: Future<Output = Option<String>>,
     {
+        if !self.lock_enabled {
+            return session_may_act(Ok(None), &self.session_id, bound_session).await;
+        }
+
         let lock = self.store.holder(&lock_key(&self.user_id, device_id)).await;
         if let Err(err) = &lock {
             debug!(
@@ -388,6 +513,8 @@ pub(crate) mod fake {
         pub(crate) failing: bool,
         pub(crate) refreshes: usize,
         pub(crate) acquires: usize,
+        /// Every store call, failing ones included
+        pub(crate) calls: usize,
     }
 
     impl FakeLock {
@@ -398,7 +525,13 @@ pub(crate) mod fake {
                 failing: false,
                 refreshes: 0,
                 acquires: 0,
+                calls: 0,
             })))
+        }
+
+        /// How many store calls (acquire, refresh, release, holder) were made
+        pub(crate) fn calls(&self) -> usize {
+            self.0.lock().unwrap().calls
         }
 
         pub(crate) fn now(&self) -> Instant {
@@ -472,6 +605,7 @@ pub(crate) mod fake {
         ) -> Result<Acquire, LockError> {
             let mut state = self.0.lock().unwrap();
             state.acquires += 1;
+            state.calls += 1;
             state.check()?;
             if let Some(current) = state.live(key) {
                 if holder_session(&current) != session_id {
@@ -491,6 +625,7 @@ pub(crate) mod fake {
             ttl: Duration,
         ) -> Result<Refresh, LockError> {
             let mut state = self.0.lock().unwrap();
+            state.calls += 1;
             state.check()?;
             state.refreshes += 1;
             match state.live(key) {
@@ -508,6 +643,7 @@ pub(crate) mod fake {
 
         async fn release(&self, key: &str, value: &str) -> Result<bool, LockError> {
             let mut state = self.0.lock().unwrap();
+            state.calls += 1;
             state.check()?;
             if state.live(key).as_deref() == Some(value) {
                 state.entries.remove(key);
@@ -518,6 +654,7 @@ pub(crate) mod fake {
 
         async fn holder(&self, key: &str) -> Result<Option<String>, LockError> {
             let mut state = self.0.lock().unwrap();
+            state.calls += 1;
             state.check()?;
             Ok(state.live(key))
         }
@@ -862,6 +999,112 @@ mod tests {
             assert_eq!(polled.load(Ordering::SeqCst), consulted, "DB consulted: {label}");
         }
         lock.fail(false);
+    }
+
+    /// Addendum A3(b): with the lock switched off a connection never touches
+    /// the store: a claim another session holds is accepted, nothing is
+    /// refreshed or released, and the ack gate is the device binding alone,
+    /// so a lock left in Redis grants nothing
+    #[tokio::test]
+    async fn lock_off_never_touches_the_store() {
+        let lock = FakeLock::new();
+        lock.put(&key("D"), "S2:c2", TTL);
+        let mut off = conn(&lock, "S1", "c1").lock_enabled(false);
+
+        let decision = off.acquire("D", lock.now()).await;
+        assert_eq!(decision, ClaimDecision::LockOff);
+        assert!(decision.is_accepted());
+
+        lock.advance(CLAIM_LOCK_REFRESH_INTERVAL);
+        off.refresh_if_due(lock.now(), bound_to(Some("S1"))).await;
+        off.refresh(lock.now(), bound_to(Some("S1"))).await;
+
+        // A stale lock naming this session: the binding (S2) decides
+        lock.put(&key("D"), "S1:c1", TTL);
+        let polled = Arc::new(AtomicBool::new(false));
+        assert!(!off.may_act("D", bound(Some("S2"), &polled)).await);
+        assert!(polled.load(Ordering::SeqCst), "the binding was not consulted");
+        assert!(off.may_act("D", bound(Some("S1"), &polled)).await);
+
+        off.release().await;
+        drop(off);
+        tokio::task::yield_now().await;
+        assert_eq!(lock.calls(), 0, "the switched-off connection used the store");
+        assert_eq!(lock.get(&key("D")).as_deref(), Some("S1:c1"));
+
+        // The same stale lock does grant rights while the lock is on
+        let on = conn(&lock, "S1", "c3");
+        assert!(on.may_act("D", bound(Some("S2"), &polled)).await);
+    }
+
+    /// Addendum A3 m2: a claim whose acquire failed open takes the lock on
+    /// the next refresh once Redis answers, and keeps trying while it does
+    /// not
+    #[tokio::test]
+    async fn failed_open_acquire_is_taken_on_the_next_refresh() {
+        let lock = FakeLock::new();
+        let mut first = conn(&lock, "S1", "c1");
+        let mut other = conn(&lock, "S2", "c2");
+
+        lock.fail(true);
+        assert_eq!(first.acquire("D", lock.now()).await, ClaimDecision::FailedOpen);
+
+        // Still down at the first tick: nothing taken, the retry is kept
+        first.refresh(lock.now(), bound_to(Some("S1"))).await;
+        lock.fail(false);
+        assert_eq!(lock.get(&key("D")), None);
+
+        // Inbound frames retry at most once per refresh interval
+        let acquires = lock.acquires();
+        first.refresh_if_due(lock.now(), bound_to(Some("S1"))).await;
+        assert_eq!(lock.acquires(), acquires, "retried before the interval");
+        lock.advance(CLAIM_LOCK_REFRESH_INTERVAL);
+        first.refresh_if_due(lock.now(), bound_to(Some("S1"))).await;
+        assert_eq!(lock.get(&key("D")).as_deref(), Some("S1:c1"), "not taken");
+        assert!(!other.acquire("D", lock.now()).await.is_accepted());
+
+        // Held now, so it is refreshed like any held lock
+        lock.advance(TTL - Duration::from_secs(1));
+        first.refresh(lock.now(), bound_to(Some("S1"))).await;
+        lock.advance(Duration::from_secs(2));
+        assert_eq!(lock.get(&key("D")).as_deref(), Some("S1:c1"));
+
+        // And the ping tick alone retakes it too
+        let mut second = conn(&lock, "S3", "c3");
+        lock.fail(true);
+        assert_eq!(second.acquire("E", lock.now()).await, ClaimDecision::FailedOpen);
+        lock.fail(false);
+        second.refresh(lock.now(), bound_to(Some("S3"))).await;
+        assert_eq!(lock.get(&key("E")).as_deref(), Some("S3:c3"));
+    }
+
+    /// The retry gives up, writing nothing, once another session holds the
+    /// lock or the device is no longer bound to this session
+    #[tokio::test]
+    async fn failed_open_retry_gives_up_on_another_holder_or_binding() {
+        for (case, binding) in [("held", Some("S1")), ("unbound", Some("")), ("moved", Some("S2"))] {
+            let lock = FakeLock::new();
+            let mut ours = conn(&lock, "S1", "c1");
+            lock.fail(true);
+            assert_eq!(ours.acquire("D", lock.now()).await, ClaimDecision::FailedOpen);
+            lock.fail(false);
+            if case == "held" {
+                lock.put(&key("D"), "S2:c2", TTL);
+            }
+
+            ours.refresh(lock.now(), bound_to(binding)).await;
+            let expected = (case == "held").then(|| "S2:c2".to_string());
+            assert_eq!(lock.get(&key("D")), expected, "{case}");
+
+            // Given up: later refreshes try nothing
+            let calls = lock.calls();
+            lock.remove(&key("D"));
+            lock.advance(CLAIM_LOCK_REFRESH_INTERVAL);
+            ours.refresh(lock.now(), bound_to(Some("S1"))).await;
+            ours.refresh_if_due(lock.now(), bound_to(Some("S1"))).await;
+            assert_eq!(lock.calls(), calls, "{case}: retried after giving up");
+            assert_eq!(lock.get(&key("D")), None, "{case}");
+        }
     }
 
     /// The Lua scripts against the Redis the bonfire tests already use

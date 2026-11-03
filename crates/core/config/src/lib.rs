@@ -1896,6 +1896,34 @@ impl ProtectedChannelFeatures {
     }
 }
 
+/// `[features.e2ee]`: E2EE switches read at process start. Flipping one
+/// needs a RESTART of delta AND bonfire (config is frozen into each process
+/// at first access).
+#[derive(Deserialize, Debug, Clone)]
+pub struct E2EEFeatures {
+    /// The live-claim lock per device (multi-device plan D4). ON unless set
+    /// false: a config without the key, or without the table, keeps the
+    /// lock. Off, bonfire neither writes nor reads locks (acks and drains
+    /// follow the device row's binding alone) and delta's device removal
+    /// decides from the database alone
+    #[serde(default = "E2EEFeatures::default_claim_lock")]
+    pub claim_lock: bool,
+}
+
+impl Default for E2EEFeatures {
+    fn default() -> Self {
+        Self {
+            claim_lock: Self::default_claim_lock(),
+        }
+    }
+}
+
+impl E2EEFeatures {
+    fn default_claim_lock() -> bool {
+        true
+    }
+}
+
 #[derive(Deserialize, Debug, Clone)]
 pub struct Features {
     pub limits: FeaturesLimitsCollection,
@@ -1982,6 +2010,11 @@ pub struct Features {
     /// the flip-requires-restart caveat and flag-off semantics)
     #[serde(default)]
     pub protected_channels: ProtectedChannelFeatures,
+
+    /// E2EE switches (see E2EEFeatures docs); a missing table keeps every
+    /// default
+    #[serde(default)]
+    pub e2ee: E2EEFeatures,
 
     #[serde(default)]
     pub advanced: FeaturesAdvanced,
@@ -2412,6 +2445,77 @@ mod afk_auto_move_tests {
             .expect("the config deserializes");
 
         assert!(!settings.features.afk_auto_move);
+    }
+}
+
+#[cfg(test)]
+mod e2ee_claim_lock_switch_tests {
+    use config::{Config, Environment, File, FileFormat};
+
+    use super::Settings;
+
+    const EMBEDDED: &str = include_str!("../Revolt.toml");
+    const TABLE: &str = "[features.e2ee]\n";
+
+    fn build(toml: &str, env: Option<(&str, &str)>) -> Settings {
+        let mut builder = Config::builder().add_source(File::from_str(toml, FileFormat::Toml));
+        if let Some((key, value)) = env {
+            builder = builder.add_source(
+                Environment::with_prefix("REVOLT")
+                    .separator("__")
+                    .source(Some([(key.to_string(), value.to_string())].into())),
+            );
+        }
+        builder
+            .build()
+            .expect("the config builds")
+            .try_deserialize()
+            .expect("the config deserializes")
+    }
+
+    /// The embedded Revolt.toml with its `[features.e2ee]` table cut out
+    /// (up to the next table header)
+    fn embedded_without_the_table() -> String {
+        let start = EMBEDDED.find(TABLE).expect("the embedded table");
+        let end = EMBEDDED[start + TABLE.len()..]
+            .find("\n[")
+            .map_or(EMBEDDED.len(), |at| start + TABLE.len() + at + 1);
+        let cut = format!("{}{}", &EMBEDDED[..start], &EMBEDDED[end..]);
+        assert!(!cut.contains("claim_lock"), "the cut left the key behind");
+        cut
+    }
+
+    #[test]
+    fn the_embedded_config_keeps_the_lock_on() {
+        assert!(build(EMBEDDED, None).features.e2ee.claim_lock);
+    }
+
+    /// A prod override file (or any config) without the key keeps the lock:
+    /// the serde default is true, not bool's false
+    #[test]
+    fn a_config_without_the_key_keeps_the_lock_on() {
+        let without_table = embedded_without_the_table();
+        assert!(build(&without_table, None).features.e2ee.claim_lock);
+
+        let empty_table = format!("{without_table}\n{TABLE}");
+        assert!(build(&empty_table, None).features.e2ee.claim_lock);
+    }
+
+    /// The documented emergency switch (double underscores)
+    #[test]
+    fn the_environment_override_turns_the_lock_off() {
+        let settings = build(
+            EMBEDDED,
+            Some(("REVOLT__FEATURES__E2EE__CLAIM_LOCK", "false")),
+        );
+        assert!(!settings.features.e2ee.claim_lock);
+        assert!(settings.features.e2ee_enabled, "the E2EE flag itself is untouched");
+
+        let settings = build(
+            &embedded_without_the_table(),
+            Some(("REVOLT__FEATURES__E2EE__CLAIM_LOCK", "false")),
+        );
+        assert!(!settings.features.e2ee.claim_lock);
     }
 }
 

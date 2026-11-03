@@ -174,6 +174,7 @@ impl<'r> Responder<'r, 'static> for Error {
             ErrorType::MlsCallFull { .. } => Status::Conflict,
             ErrorType::VideoCallFull { .. } => Status::Conflict,
             ErrorType::E2EEDeviceRemoved => Status::Forbidden,
+            ErrorType::E2EEDeviceHeldElsewhere => Status::Forbidden,
 
             ErrorType::PaymentsDisabled => Status::BadRequest,
             ErrorType::CipherSalesClosed => Status::Forbidden,
@@ -284,6 +285,17 @@ mod tests {
         let client = Client::untracked(rocket::build()).unwrap();
         let request = client.get("/");
         let response = create_error!(E2EEDeviceRemoved)
+            .respond_to(request.inner())
+            .unwrap();
+        assert_eq!(response.status(), Status::Forbidden);
+    }
+
+    /// A refused device removal is a 403 as well; `axum.rs` pins the same
+    #[test]
+    fn e2ee_device_held_elsewhere_is_forbidden() {
+        let client = Client::untracked(rocket::build()).unwrap();
+        let request = client.get("/");
+        let response = create_error!(E2EEDeviceHeldElsewhere)
             .respond_to(request.inner())
             .unwrap();
         assert_eq!(response.status(), Status::Forbidden);

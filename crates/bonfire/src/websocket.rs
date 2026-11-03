@@ -1034,12 +1034,14 @@ async fn worker(
     let mut e2ee_proven_device: Option<String> = None;
 
     // Live-claim lock on the proven device (multi-device D4). Dropped with
-    // the worker, which releases it on every exit.
+    // the worker, which releases it on every exit. Switched off
+    // (`[features.e2ee] claim_lock`), it neither writes nor reads the lock.
     let mut e2ee_claim = ConnectionClaim::new(
         RedisClaimLock,
         &user_id,
         &session_id,
         claim_lock_ttl(keep_alive.idle_timeout),
+        revolt_config.features.e2ee.claim_lock,
     );
     // The refresh's device-binding lookup, when the lock went absent
     let bound_user: &str = &user_id;
@@ -2075,6 +2077,13 @@ mod tests {
                 }
             }
 
+            /// A connection with the claim lock switched off
+            fn lock_off(lock: &FakeLock, session: &str, conn_id: &str) -> Conn {
+                let mut conn = Conn::new(lock, session, conn_id);
+                conn.claim = conn.claim.lock_enabled(false);
+                conn
+            }
+
             /// `E2EEProveDevice` for `device` with `signature`, against a
             /// pending challenge for `challenged` (none when `None`)
             async fn prove(
@@ -2338,6 +2347,43 @@ mod tests {
                 refused(Some(REASON_HELD_ELSEWHERE))
             );
             assert_eq!(lock.acquires(), 1);
+        }
+
+        /// Addendum A3(b): with the lock switched off, a verified claim is
+        /// accepted even while another session holds the lock, no lock is
+        /// written, and an ack counts only from the session the row is
+        /// bound to: one from any other session is dropped, and a lock left
+        /// in Redis naming it changes nothing
+        #[tokio::test]
+        async fn lock_off_worker_accepts_and_gates_acks_on_the_binding() {
+            let db = reference().await;
+            let lock = FakeLock::new();
+            let device = Device::new(&db, "S2", true).await;
+            lock.put(&device.key(), "S2:x", TTL);
+            let mut first = Conn::lock_off(&lock, "S1", "a");
+            let mut second = Conn::lock_off(&lock, "S2", "b");
+
+            assert_eq!(first.prove_valid(&db, &lock, &device).await, ACCEPTED);
+            assert_eq!(device.bound(&db).await, "S1");
+            assert_eq!(lock.get(&device.key()).as_deref(), Some("S2:x"), "a lock was written");
+
+            // The other session claims it back; the first one's ack is dropped
+            assert_eq!(second.prove_valid(&db, &lock, &device).await, ACCEPTED);
+            assert_eq!(device.bound(&db).await, "S2");
+            let envelope = device.queue(&db).await;
+            assert!(!first.ack(&db, &[envelope.clone()]).await);
+            assert_eq!(device.queued(&db).await, 1, "an unbound session's ack deleted it");
+
+            // A stale lock naming the first session grants it nothing
+            lock.put(&device.key(), "S1:a", TTL);
+            assert!(!first.ack(&db, &[envelope.clone()]).await);
+            assert_eq!(device.queued(&db).await, 1, "a stale lock granted ack rights");
+            assert_eq!(lock.calls(), 0, "the switched-off worker used the lock");
+
+            // The bound session's ack is honoured
+            assert!(second.ack(&db, &[envelope]).await);
+            assert_eq!(device.queued(&db).await, 0);
+            assert_eq!(lock.calls(), 0, "the switched-off worker used the lock");
         }
 
         /// D8: `reason: "removed"` only when the claimed device's row is

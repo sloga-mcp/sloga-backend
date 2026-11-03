@@ -970,17 +970,27 @@ async fn unbound_session_is_refused_on_e2ee_routes_case() {
     .await;
     assert_eq!(response.status(), Status::Ok);
 
-    // MFA-gated revocation from the unbound session: allowed (recovery
-    // path for a lost or stolen device)
-    let ticket = mfa_ticket(&harness, &account_a.id).await;
-    let response = harness
-        .client
-        .delete(format!("/e2ee/keys/{}", device_a.device_id))
-        .header(Header::new("x-session-token", web.token.clone()))
-        .header(Header::new("X-MFA-Ticket", ticket))
-        .dispatch()
-        .await;
-    assert_eq!(response.status(), Status::Ok);
+    // MFA-gated removal from the unbound session, of a device whose own
+    // session is still alive: refused (multi-device addendum A1). A lost or
+    // stolen device is removed from another device, by logging out its
+    // session, or by starting fresh
+    let (status, body) =
+        delete_device(&harness, &account_a.id, &web.token, &device_a.device_id).await;
+    assert_eq!(status, Status::Forbidden, "{body}");
+    assert_eq!(body["type"], "E2EEDeviceHeldElsewhere", "{body}");
+    assert!(harness
+        .db
+        .fetch_e2ee_identity(&user_a.id, &device_a.device_id)
+        .await
+        .is_ok());
+
+    // Logging out its session takes the row with it (session revocation)
+    session_a.delete(&harness.db).await.unwrap();
+    assert!(harness
+        .db
+        .fetch_e2ee_identity(&user_a.id, &device_a.device_id)
+        .await
+        .is_err());
 }
 
 /// A device claim proven over the events connection (bonfire) rebinds the
@@ -2645,25 +2655,29 @@ async fn revoke_reports_the_devices_left_case() {
     let (account_b, session_b, _user_b) = harness.new_user().await;
     publish_device(&harness, &account_b.id, &session_b.token, 1).await;
 
-    let mut devices = vec![publish_device(&harness, &account.id, &session.token, 1).await];
+    // Each removed by the session it is bound to (addendum A1)
+    let mut devices = vec![(
+        session.token.clone(),
+        publish_device(&harness, &account.id, &session.token, 1).await,
+    )];
     for name in ["two", "three"] {
         let other = account
             .create_session(&harness.db, name.to_string())
             .await
             .unwrap();
-        devices.push(publish_device(&harness, &account.id, &other.token, 1).await);
+        let device = publish_device(&harness, &account.id, &other.token, 1).await;
+        devices.push((other.token, device));
     }
 
-    for (device, left) in devices.iter().zip([2u32, 1, 0]) {
-        let (status, body) =
-            delete_device(&harness, &account.id, &session.token, &device.device_id).await;
+    for ((token, device), left) in devices.iter().zip([2u32, 1, 0]) {
+        let (status, body) = delete_device(&harness, &account.id, token, &device.device_id).await;
         assert_eq!(status, Status::Ok, "{body}");
         assert_eq!(body, serde_json::json!({ "remaining_devices": left }));
     }
 
     // Already gone: NotFound, as before
     let (status, _) =
-        delete_device(&harness, &account.id, &session.token, &devices[2].device_id).await;
+        delete_device(&harness, &account.id, &session.token, &devices[2].1.device_id).await;
     assert_eq!(status, Status::NotFound);
 }
 
@@ -3009,15 +3023,33 @@ fn split_publication_runs_in_the_pinned_order() {
     }
 }
 
-/// D8 (audit MINOR-3): the removal route writes the tombstone BEFORE it
-/// deletes anything, fails on a failed write, and tombstones only an id
-/// that is one of the caller's devices
+/// D8 (audit MINOR-3) + addendum A1: the removal route checks the device
+/// is one of the caller's, then decides who may remove it (a refusal
+/// returns before any write but the flag), then writes the tombstone BEFORE
+/// it deletes anything, and fails on a failed write
 #[test]
 fn removal_writes_the_tombstone_before_the_delete() {
     use crate::util::test::{statement_at, without_comments, without_whitespace};
 
     let code = without_whitespace(&without_comments(include_str!("revoke_device.rs")));
-    let exists = statement_at(&code, "db.fetch_e2ee_identity(&user.id,&device_id).await?;");
+    // The route body only, not the helpers after it
+    let code = code[..code.find("asyncfnmay_revoke(").expect("the decision helper")].to_string();
+    let exists = code
+        .find("lettarget=db.fetch_e2ee_identity(&user.id,&device_id).await?;")
+        .expect("existence is checked");
+    let decision = code
+        .find("if!may_revoke(db,&user.id,&session.id,&target).await?{")
+        .expect("the decision");
+    let refusal = statement_at(&code, "returnErr(create_error!(E2EEDeviceHeldElsewhere));");
+    let refusal_body = &code[decision..refusal];
+    for write in ["upsert_", "revoke_device(", "delete_", "insert_"] {
+        assert!(
+            !refusal_body.contains(write),
+            "the refusal path writes `{}`: {}",
+            write, refusal_body
+        );
+    }
+    assert!(refusal_body.contains("reassert_e2ee_enabled(db,&mutuser).await;"));
     let tombstone = code
         .find("db.upsert_e2ee_removed_device(")
         .expect("the tombstone");
@@ -3030,7 +3062,10 @@ fn removal_writes_the_tombstone_before_the_delete() {
         .expect("the delete");
 
     assert_eq!(code.matches("E2EEIdentity::revoke_device(").count(), 1, "{}", code);
-    assert!(exists < tombstone, "existence is checked first");
+    assert_eq!(code.matches("may_revoke(").count(), 1, "{}", code);
+    assert!(exists < decision, "existence is checked first");
+    assert!(decision < refusal, "the decision comes before the refusal");
+    assert!(refusal < tombstone, "the decision comes before the tombstone");
     assert!(written < delete, "the tombstone is written before the delete");
 }
 
@@ -3068,4 +3103,304 @@ async fn removal_of_an_unknown_device_writes_no_tombstone_case() {
         .fetch_e2ee_identity(&user_b.id, &foreign.device_id)
         .await
         .is_ok());
+}
+
+// ========================================================================
+// Who may remove a device (multi-device addendum A1). Locks are taken in
+// the Redis the harness uses, as bonfire takes them on an accepted claim
+// ========================================================================
+
+/// Take `device_id`'s live-claim lock for `session_id`
+async fn hold_claim_lock(user_id: &str, device_id: &str, session_id: &str) {
+    use revolt_database::e2ee_claim_lock::{acquire, lock_key, lock_value, Acquire};
+
+    assert_eq!(
+        acquire(
+            &lock_key(user_id, device_id),
+            &lock_value(session_id, "c1"),
+            session_id,
+            std::time::Duration::from_secs(60),
+        )
+        .await
+        .expect("redis"),
+        Acquire::Acquired
+    );
+}
+
+/// Set the device row's `last_session_id`, as a proven claim does
+async fn bind_device(harness: &TestHarness, user_id: &str, device_id: &str, session_id: &str) {
+    harness
+        .db
+        .update_e2ee_identity_session(
+            user_id,
+            device_id,
+            session_id,
+            revolt_database::iso8601_timestamp::Timestamp::now_utc(),
+        )
+        .await
+        .expect("bind");
+}
+
+/// The removal was refused as `E2EEDeviceHeldElsewhere` and removed nothing
+async fn assert_removal_refused(
+    harness: &TestHarness,
+    user_id: &str,
+    device_id: &str,
+    (status, body): (Status, serde_json::Value),
+    case: &str,
+) {
+    assert_eq!(status, Status::Forbidden, "{case}: {body}");
+    assert_eq!(body["type"], "E2EEDeviceHeldElsewhere", "{case}: {body}");
+    assert!(
+        harness.db.fetch_e2ee_identity(user_id, device_id).await.is_ok(),
+        "{}: the identity row was removed",
+        case
+    );
+    assert_eq!(
+        harness
+            .db
+            .count_e2ee_one_time_keys(user_id, device_id)
+            .await
+            .unwrap(),
+        1,
+        "{case}: one-time keys were removed"
+    );
+    assert!(
+        !harness
+            .db
+            .is_e2ee_device_removed(user_id, device_id)
+            .await
+            .unwrap(),
+        "{}: a refused removal left a tombstone",
+        case
+    );
+}
+
+/// The removal went through: row gone, tombstone written
+async fn assert_removal_allowed(
+    harness: &TestHarness,
+    user_id: &str,
+    device_id: &str,
+    (status, body): (Status, serde_json::Value),
+    case: &str,
+) {
+    assert_eq!(status, Status::Ok, "{case}: {body}");
+    assert!(
+        harness.db.fetch_e2ee_identity(user_id, device_id).await.is_err(),
+        "{}: the identity row is still there",
+        case
+    );
+    assert!(
+        harness
+            .db
+            .is_e2ee_device_removed(user_id, device_id)
+            .await
+            .unwrap(),
+        "{}: no tombstone",
+        case
+    );
+}
+
+/// A1 rule 1 + 4: a session other than the lock's holder, wiped or not, and
+/// whatever the row says, is refused while another session holds the lock.
+/// Nothing is removed and the account flag the caller cleared just before
+/// is set again
+#[test]
+fn removal_by_a_twin_while_the_lock_is_held_elsewhere_is_refused() {
+    crate::util::test::rt()
+        .block_on(removal_by_a_twin_while_the_lock_is_held_elsewhere_is_refused_case())
+}
+
+async fn removal_by_a_twin_while_the_lock_is_held_elsewhere_is_refused_case() {
+    let harness = TestHarness::new().await;
+    let (account, holder, user) = harness.new_user().await;
+    let twin = account
+        .create_session(&harness.db, "twin".to_string())
+        .await
+        .unwrap();
+
+    let device = publish_device(&harness, &account.id, &holder.token, 1).await;
+    hold_claim_lock(&user.id, &device.device_id, &holder.id).await;
+
+    // The twin cleared the account flag just before its removal call
+    harness
+        .db
+        .update_user(
+            &user.id,
+            &revolt_database::PartialUser {
+                e2ee_enabled: Some(false),
+                ..Default::default()
+            },
+            vec![],
+        )
+        .await
+        .unwrap();
+    assert!(!harness.db.fetch_user(&user.id).await.unwrap().e2ee_enabled);
+
+    let refused = delete_device(&harness, &account.id, &twin.token, &device.device_id).await;
+    assert_removal_refused(&harness, &user.id, &device.device_id, refused, "unbound twin").await;
+    assert!(
+        harness.db.fetch_user(&user.id).await.unwrap().e2ee_enabled,
+        "the refusal did not re-assert e2ee_enabled"
+    );
+
+    // The lock decides over the row: still refused with the row naming the twin
+    bind_device(&harness, &user.id, &device.device_id, &twin.id).await;
+    let refused = delete_device(&harness, &account.id, &twin.token, &device.device_id).await;
+    assert_removal_refused(&harness, &user.id, &device.device_id, refused, "bound twin").await;
+}
+
+/// A1 rule 1(b): a twin retrying after the holder's lock lapsed (lock
+/// absent) is refused while the row is bound to the holder's live session
+#[test]
+fn removal_by_a_twin_after_the_lock_lapsed_is_refused() {
+    crate::util::test::rt().block_on(removal_by_a_twin_after_the_lock_lapsed_is_refused_case())
+}
+
+async fn removal_by_a_twin_after_the_lock_lapsed_is_refused_case() {
+    let harness = TestHarness::new().await;
+    let (account, holder, user) = harness.new_user().await;
+    let twin = account
+        .create_session(&harness.db, "twin".to_string())
+        .await
+        .unwrap();
+
+    let device = publish_device(&harness, &account.id, &holder.token, 1).await;
+    let refused = delete_device(&harness, &account.id, &twin.token, &device.device_id).await;
+    assert_removal_refused(&harness, &user.id, &device.device_id, refused, "lapsed").await;
+    assert_eq!(
+        harness
+            .db
+            .fetch_e2ee_identity(&user.id, &device.device_id)
+            .await
+            .unwrap()
+            .last_session_id,
+        holder.id
+    );
+}
+
+/// A1 rule 1(a): a row bound to the caller (an orphan split row, an
+/// unswept predecessor) is no proof of another device; only a live lock
+/// on one is
+#[test]
+fn removal_by_a_session_with_only_an_orphan_row_is_refused() {
+    crate::util::test::rt().block_on(removal_by_a_session_with_only_an_orphan_row_is_refused_case())
+}
+
+async fn removal_by_a_session_with_only_an_orphan_row_is_refused_case() {
+    let harness = TestHarness::new().await;
+    let (account, holder, user) = harness.new_user().await;
+    let twin = account
+        .create_session(&harness.db, "twin".to_string())
+        .await
+        .unwrap();
+
+    let device = publish_device(&harness, &account.id, &holder.token, 1).await;
+    let orphan = publish_device(&harness, &account.id, &twin.token, 1).await;
+    assert_eq!(
+        harness
+            .db
+            .fetch_e2ee_identity(&user.id, &orphan.device_id)
+            .await
+            .unwrap()
+            .last_session_id,
+        twin.id
+    );
+
+    let refused = delete_device(&harness, &account.id, &twin.token, &device.device_id).await;
+    assert_removal_refused(&harness, &user.id, &device.device_id, refused, "lock absent").await;
+
+    hold_claim_lock(&user.id, &device.device_id, &holder.id).await;
+    let refused = delete_device(&harness, &account.id, &twin.token, &device.device_id).await;
+    assert_removal_refused(&harness, &user.id, &device.device_id, refused, "lock held").await;
+}
+
+/// A1 rule 1: the lock's holder removes its own device, whatever the row
+/// names
+#[test]
+fn removal_by_the_lock_holder_is_allowed() {
+    crate::util::test::rt().block_on(removal_by_the_lock_holder_is_allowed_case())
+}
+
+async fn removal_by_the_lock_holder_is_allowed_case() {
+    let harness = TestHarness::new().await;
+    let (account, holder, user) = harness.new_user().await;
+    let other = account
+        .create_session(&harness.db, "other".to_string())
+        .await
+        .unwrap();
+
+    let device = publish_device(&harness, &account.id, &holder.token, 1).await;
+    hold_claim_lock(&user.id, &device.device_id, &holder.id).await;
+    bind_device(&harness, &user.id, &device.device_id, &other.id).await;
+
+    let allowed = delete_device(&harness, &account.id, &holder.token, &device.device_id).await;
+    assert_removal_allowed(&harness, &user.id, &device.device_id, allowed, "holder").await;
+}
+
+/// A1 rule 1(a), plan D7: a session live on another of the account's
+/// devices removes a device another session holds, or one with no lock
+#[test]
+fn removal_from_another_live_device_is_allowed() {
+    crate::util::test::rt().block_on(removal_from_another_live_device_is_allowed_case())
+}
+
+async fn removal_from_another_live_device_is_allowed_case() {
+    let harness = TestHarness::new().await;
+    let (account, phone, user) = harness.new_user().await;
+    let laptop = account
+        .create_session(&harness.db, "laptop".to_string())
+        .await
+        .unwrap();
+
+    let ours = publish_device(&harness, &account.id, &laptop.token, 1).await;
+    hold_claim_lock(&user.id, &ours.device_id, &laptop.id).await;
+
+    let held = publish_device(&harness, &account.id, &phone.token, 1).await;
+    hold_claim_lock(&user.id, &held.device_id, &phone.id).await;
+    let allowed = delete_device(&harness, &account.id, &laptop.token, &held.device_id).await;
+    assert_removal_allowed(&harness, &user.id, &held.device_id, allowed, "held").await;
+
+    let offline = publish_device(&harness, &account.id, &phone.token, 1).await;
+    let allowed = delete_device(&harness, &account.id, &laptop.token, &offline.device_id).await;
+    assert_removal_allowed(&harness, &user.id, &offline.device_id, allowed, "offline").await;
+
+    // Once its own device is removed, the lock left on it proves nothing
+    let remote = publish_device(&harness, &account.id, &phone.token, 1).await;
+    let allowed = delete_device(&harness, &account.id, &laptop.token, &ours.device_id).await;
+    assert_removal_allowed(&harness, &user.id, &ours.device_id, allowed, "own").await;
+    let refused = delete_device(&harness, &account.id, &laptop.token, &remote.device_id).await;
+    assert_removal_refused(&harness, &user.id, &remote.device_id, refused, "stale lock").await;
+}
+
+/// A1 rule 1(b): an offline device (no lock) is removed by the session it
+/// is bound to, or by anyone once its binding is dead
+#[test]
+fn removal_of_an_offline_device_bound_to_the_caller_or_dead_is_allowed() {
+    crate::util::test::rt()
+        .block_on(removal_of_an_offline_device_bound_to_the_caller_or_dead_is_allowed_case())
+}
+
+async fn removal_of_an_offline_device_bound_to_the_caller_or_dead_is_allowed_case() {
+    let harness = TestHarness::new().await;
+    let (account, session, user) = harness.new_user().await;
+    let other = account
+        .create_session(&harness.db, "other".to_string())
+        .await
+        .unwrap();
+
+    let own = publish_device(&harness, &account.id, &session.token, 1).await;
+    let allowed = delete_device(&harness, &account.id, &session.token, &own.device_id).await;
+    assert_removal_allowed(&harness, &user.id, &own.device_id, allowed, "bound").await;
+
+    for (case, binding) in [
+        ("unbound", String::new()),
+        ("gone", ulid::Ulid::new().to_string()),
+    ] {
+        let device = publish_device(&harness, &account.id, &other.token, 1).await;
+        bind_device(&harness, &user.id, &device.device_id, &binding).await;
+        let allowed =
+            delete_device(&harness, &account.id, &session.token, &device.device_id).await;
+        assert_removal_allowed(&harness, &user.id, &device.device_id, allowed, case).await;
+    }
 }

@@ -560,6 +560,16 @@ prot_success_url = "https://app.sloga.gg/settings?prot=success"
 prot_cancel_url = "https://app.sloga.gg/settings?prot=cancel"
 prot_shell_return_url = "https://sloga.gg/prot/thanks/"
 
+[features.e2ee]
+# Live-claim lock per E2EE device (multi-device plan D4). ON by default, and a
+# config without the key keeps it on. Emergency switch only: false (here under
+# an explicit [features.e2ee] header in Revolt.overrides.toml, or
+# REVOLT__FEATURES__E2EE__CLAIM_LOCK=false) and RESTART delta AND bonfire.
+# Off, bonfire takes no locks and acks follow the device row's binding alone,
+# and delta's device removal decides from the database alone; the lock's
+# protections between a user's own installs are gone while it is off.
+claim_lock = true
+
 # --- Protected channels (protected-channels design §7.1) ---
 # The feature ships DARK: all keys below default in code to the values shown,
 # with enabled = false. To turn it on, put the block in Revolt.overrides.toml

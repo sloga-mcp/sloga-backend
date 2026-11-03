@@ -371,6 +371,10 @@ pub enum ErrorType {
     /// /e2ee/keys/{device}`) and can never be published again; the install
     /// sets up a new device instead (multi-device plan D8)
     E2EEDeviceRemoved,
+    /// `DELETE /e2ee/keys/{device}` refused: another session is live on the
+    /// device, or this session cannot show it is the device or another of
+    /// the account's devices. Nothing was removed
+    E2EEDeviceHeldElsewhere,
 
     // ? Payment and Cipher errors
     /// Payments are switched off in the config (`[features.payments]`)
@@ -579,6 +583,14 @@ mod tests {
     fn device_removed_error_serializes_by_name() {
         let value = serde_json::to_value(create_error!(E2EEDeviceRemoved)).unwrap();
         assert_eq!(value, serde_json::json!({ "type": "E2EEDeviceRemoved" }));
+    }
+
+    /// The type the client keys its "this app shares a device" copy on
+    #[cfg(feature = "serde")]
+    #[test]
+    fn device_held_elsewhere_error_serializes_by_name() {
+        let value = serde_json::to_value(create_error!(E2EEDeviceHeldElsewhere)).unwrap();
+        assert_eq!(value, serde_json::json!({ "type": "E2EEDeviceHeldElsewhere" }));
     }
 
     #[cfg(feature = "serde")]
