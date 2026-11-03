@@ -65,6 +65,14 @@
 //!   country Stripe permanently refuses to report is waited on for
 //!   [`CARD_COUNTRY_WAIT_MS`] after payment, then the billing country alone
 //!   decides (logged `CARD_COUNTRY_UNAVAILABLE`)
+//! - Prot orders (packs and pay-exact, see [`prot`]) share the leases, the
+//!   session checks and every void above, with `prot_blocked_countries` as
+//!   their list and no sale close date. A paid one is credited to the
+//!   buyer's wallet once (`purchase:{order_id}` in the ledger), not while a
+//!   dispute on it is open; a refund or a lost dispute claws it back. A
+//!   Cipher refund inside the window is undone only while the membership's
+//!   Prot is unspent (see `window_refund_plan`), and every Cipher revoke or
+//!   undo claws back what is still posted (`clawback:{order_id}`)
 
 use revolt_database::{
     CipherMembership, CipherRevokeReason, Database, FieldsUser, OrderState, PartialUser,
@@ -72,15 +80,22 @@ use revolt_database::{
 };
 use revolt_models::v0::{
     CipherMe, CipherMembershipView, CipherPendingView, CipherReturnTo, CipherStats, CipherTier,
-    Sku, UserFlags,
+    ProductFamily, Sku, UserFlags,
 };
 use revolt_result::{create_error, ErrorType, Result};
 use ulid::Ulid;
 
 use crate::catalog;
 use crate::dispatch::{dispute_kind, refund_facts};
-use crate::settings::PaymentsSettings;
+use crate::settings::{PaymentsSettings, ProtSalesSettings};
 use crate::stripe::{CheckoutSession, CheckoutSessionParams, StripeApi, StripeError};
+
+/// Prot orders (packs and pay-exact) and the Cipher founding Prot: the ledger
+/// side of checkout, fulfilment and reversal. Prot orders share every lease,
+/// session check and void with Cipher; only the "already applied?" test, the
+/// apply step and the reversal of a Fulfilled order branch on
+/// [`ProductFamily`].
+pub mod prot;
 
 /// How long a worker holds an order; longer than the worst-case chain of
 /// Stripe calls (each has a 10 s timeout)
@@ -609,12 +624,14 @@ pub async fn create_cipher_checkout(
     // still blocked: each one would be paid, voided and refunded again, at
     // a Stripe fee each time. A void of that kind still finishing (Paid,
     // the reason recorded) counts too. Not with an empty list (nothing is
-    // blocked), and not for long: see `region_refusal_holds`.
+    // blocked), and not for long: see `region_refusal_holds`. Only Cipher
+    // voids count: a Prot void was judged on Prot's own list.
     if !s.blocked_countries.is_empty()
         && db
             .fetch_payment_orders_by_user(user_id, &[OrderState::Voided, OrderState::Paid])
             .await?
             .iter()
+            .filter(|o| o.sku.family() == ProductFamily::Cipher)
             .any(|o| region_refusal_holds(s, o, now_ms))
     {
         return Err(create_error!(CipherRegionUnavailable));
@@ -649,14 +666,20 @@ pub async fn create_cipher_checkout(
                 return Err(create_error!(CipherSoldOut));
             }
         }
+        // `quote` builds Cipher SKUs only
+        Sku::ProtPack { .. } | Sku::ProtExact { .. } => return Err(create_error!(InternalError)),
     }
 
-    // One live order per user. SessionFailed, Expired and stale Creating
-    // orders never block.
+    // One live Cipher order per user (a Prot checkout has its own).
+    // SessionFailed, Expired and stale Creating orders never block.
     let live = db
         .fetch_payment_orders_by_user(user_id, &[OrderState::Creating, OrderState::Pending])
         .await?;
-    for order in live.iter().rev() {
+    for order in live
+        .iter()
+        .rev()
+        .filter(|o| o.sku.family() == ProductFamily::Cipher)
+    {
         match order.state {
             OrderState::Pending if order.session_expires_at.is_some_and(|at| at > now_ms) => {
                 return match &order.checkout_url {
@@ -709,14 +732,33 @@ pub async fn create_cipher_checkout(
     result
 }
 
-/// Create the Stripe session for a leased Creating order and move it to
-/// Pending (or SessionFailed)
+/// Create the Stripe session for a leased Creating Cipher order (the Cipher
+/// return URLs) and move it to Pending (or SessionFailed)
 async fn start_session(
     db: &Database,
     stripe: &dyn StripeApi,
     s: &PaymentsSettings,
     leased: &mut Leased,
     return_to: CipherReturnTo,
+) -> Result<String> {
+    let (success_url, cancel_url) = match return_to {
+        CipherReturnTo::Web => (s.success_url_web.clone(), s.cancel_url_web.clone()),
+        CipherReturnTo::Shell => (s.success_url_shell.clone(), s.cancel_url_shell.clone()),
+    };
+    start_session_with_urls(db, stripe, s, leased, success_url, cancel_url).await
+}
+
+/// Create the Stripe session for a leased Creating order with these return
+/// URLs and move it to Pending (or SessionFailed). The consent text and the
+/// tax code come from the order's SKU ([`catalog::sku_consent_message`],
+/// [`catalog::sku_tax_code`]).
+async fn start_session_with_urls(
+    db: &Database,
+    stripe: &dyn StripeApi,
+    s: &PaymentsSettings,
+    leased: &mut Leased,
+    success_url: String,
+    cancel_url: String,
 ) -> Result<String> {
     let order = &leased.order;
     let Some(user_id) = order.user_id.clone() else {
@@ -725,10 +767,6 @@ async fn start_session(
 
     // Derived from the stored order, so a retry sends identical params
     let expires_at_secs = order.created_at.div_euclid(1000) + SESSION_TTL_SECS;
-    let (success_url, cancel_url) = match return_to {
-        CipherReturnTo::Web => (s.success_url_web.clone(), s.cancel_url_web.clone()),
-        CipherReturnTo::Shell => (s.success_url_shell.clone(), s.cancel_url_shell.clone()),
-    };
     let params = CheckoutSessionParams {
         order_id: order.id.clone(),
         user_id,
@@ -739,6 +777,8 @@ async fn start_session(
         cancel_url,
         expires_at_secs,
         automatic_tax: s.automatic_tax,
+        consent_message: catalog::sku_consent_message(&order.sku).to_string(),
+        tax_code: catalog::sku_tax_code(&order.sku).to_string(),
     };
     let order_id = order.id.clone();
 
@@ -991,26 +1031,50 @@ async fn fulfil_locked(
         return void_for_deleted_account(db, stripe, leased, Some(&user_id), now_ms).await;
     }
 
+    // Everything above and every void below is shared by both families;
+    // only the "already applied?" test and the apply step branch on it
+    let family = leased.order.sku.family();
+
     // 2. Already applied? (a resume after a crash must neither refund nor
-    //    re-number, so this runs before the preconditions)
-    let membership = db.fetch_cipher_membership(&user_id).await?;
-    let applied = membership
-        .as_ref()
-        .is_some_and(|m| m.orders.contains(&leased.order.id));
+    //    re-number, so this runs before the preconditions). Cipher: the
+    //    membership lists the order; Prot: its purchase ledger row exists.
+    let membership = match family {
+        ProductFamily::Cipher => db.fetch_cipher_membership(&user_id).await?,
+        ProductFamily::Prot => None,
+    };
+    let applied = match family {
+        ProductFamily::Cipher => membership
+            .as_ref()
+            .is_some_and(|m| m.orders.contains(&leased.order.id)),
+        ProductFamily::Prot => prot::purchase_applied(db, &leased.order.id).await?,
+    };
 
     if applied {
         // Applied by a worker that crashed. The order's disputes are the
         // truth: every dispute event since was recorded on the order first.
-        set_dispute_listing(db, &user_id, &leased.order.id, is_disputed(&leased.order)).await?;
+        if family == ProductFamily::Cipher {
+            set_dispute_listing(db, &user_id, &leased.order.id, is_disputed(&leased.order)).await?;
+        }
     } else {
+        // Each family has its own list of countries it is not sold to. Prot
+        // reads it here (fulfilment's settings are Cipher's), failing closed
+        // to the shipped list when the Prot config does not validate.
+        let (product, blocked) = match family {
+            ProductFamily::Cipher => ("Cipher", s.blocked_countries.clone()),
+            ProductFamily::Prot => (
+                "Prot",
+                ProtSalesSettings::load_or_closed().await.blocked_countries,
+            ),
+        };
+
         // Not sold to the buyer's billing country: refunded, no number
         // claimed. No country reported (a session completed without the
         // billing address) is fulfilled; checkout requires the address, so
         // that is logged for a look.
         match session.billing_country.as_deref() {
-            Some(country) if s.region_blocked(country) => {
+            Some(country) if country_blocked(&blocked, country) => {
                 log::warn!(
-                    "payments: order {} was paid from billing country {country}, where Cipher \
+                    "payments: order {} was paid from billing country {country}, where {product} \
                      is not sold; voiding and refunding it",
                     leased.order.id
                 );
@@ -1034,16 +1098,16 @@ async fn fulfil_locked(
         // after the payment, lets the billing country decide alone, and
         // only when there is one: with neither country known, it stays an
         // error.
-        if !s.blocked_countries.is_empty() {
+        if !blocked.is_empty() {
             match stripe.get_payment_charge(&payment_intent).await {
                 Ok(charge) => {
                     if let Some(country) = charge
                         .card_country
-                        .filter(|country| s.region_blocked(country))
+                        .filter(|country| country_blocked(&blocked, country))
                     {
                         log::warn!(
                             "payments: order {} was paid with a card issued in {country}, where \
-                             Cipher is not sold; voiding and refunding it",
+                             {product} is not sold; voiding and refunding it",
                             leased.order.id
                         );
                         return void_for_region(db, stripe, leased, country, now_ms).await;
@@ -1111,16 +1175,27 @@ async fn fulfil_locked(
             return void_paid(db, stripe, leased, VoidReason::Reversed, now_ms).await;
         }
 
-        // 4. + 5. Number and membership
-        if let Applied::Void(reason) =
-            apply_membership(db, s, &leased.order, &user_id, now_ms).await?
-        {
-            return void_paid(db, stripe, leased, reason, now_ms).await;
+        // 4. + 5. Cipher: number and membership. Prot: the wallet credit
+        //    (`purchase:{order_id}`, idempotent)
+        match family {
+            ProductFamily::Cipher => {
+                if let Applied::Void(reason) =
+                    apply_membership(db, s, &leased.order, &user_id, now_ms).await?
+                {
+                    return void_paid(db, stripe, leased, reason, now_ms).await;
+                }
+            }
+            ProductFamily::Prot => {
+                prot::apply_purchase(db, &leased.order, &user_id, now_ms).await?;
+            }
         }
     }
 
-    // 6. Public badge, only if the order is still ours as we read it
-    publish_badge(db, leased, &user_id).await?;
+    // 6. Public badge, only if the order is still ours as we read it (Prot
+    //    has none)
+    if family == ProductFamily::Cipher {
+        publish_badge(db, leased, &user_id).await?;
+    }
 
     // 7. Fulfilled, then any reversal that arrived first
     write(db, leased, move |o| {
@@ -1144,7 +1219,20 @@ async fn fulfil_locked(
         .await?;
     }
 
+    // The founding Prot of the membership, while Cipher grants are on. It
+    // never fails the fulfilment: the hourly sweep posts whatever it missed.
+    if family == ProductFamily::Cipher {
+        Box::pin(prot::sync_after_cipher_fulfil(db, &user_id, now_ms)).await;
+    }
+
     Ok(FulfilOutcome::Fulfilled)
+}
+
+/// Whether `country` is on a family's list of countries it is not sold to
+/// (compared without regard to case, as [`PaymentsSettings::region_blocked`])
+fn country_blocked(list: &[String], country: &str) -> bool {
+    list.iter()
+        .any(|blocked| blocked.eq_ignore_ascii_case(country))
 }
 
 /// Fulfil step 6: publish the badge from the membership, but only while
@@ -1329,13 +1417,17 @@ async fn number_release_pending(db: &Database, m: &CipherMembership) -> Result<b
 }
 
 /// Plan Fulfil step 3: why a paid order no longer applies, if it does not.
-/// The sale close is judged on when the order was created, not now.
+/// The Cipher sale close is judged on when the order was created, not now;
+/// it never applies to Prot. A Prot order is not credited while a dispute
+/// on its payment is open (the void waits for it, see [`void_paid`]).
 fn precondition_failure(
     s: &PaymentsSettings,
     order: &PaymentOrder,
     membership: Option<&CipherMembership>,
 ) -> Option<VoidReason> {
-    if s.close_at_ms.is_some_and(|close| order.created_at >= close) {
+    if order.sku.family() == ProductFamily::Cipher
+        && s.close_at_ms.is_some_and(|close| order.created_at >= close)
+    {
         return Some(VoidReason::SalesClosed);
     }
 
@@ -1350,6 +1442,11 @@ fn precondition_failure(
             }
             _ => Some(VoidReason::Stale),
         },
+        // Not `is_disputed`: a pending lost dispute must reach the
+        // `reversal_pending` void and be recorded Reversed
+        Sku::ProtPack { .. } | Sku::ProtExact { .. } => {
+            (!order.open_disputes.is_empty()).then_some(VoidReason::DisputeOpen)
+        }
     }
 }
 
@@ -1492,6 +1589,14 @@ async fn apply_membership(
             );
             Err(create_error!(InternalError))
         }
+        // Fulfilment credits a Prot order through `prot::apply_purchase`
+        Sku::ProtPack { .. } | Sku::ProtExact { .. } => {
+            log::error!(
+                "payments: Prot order {} reached the Cipher membership step",
+                order.id
+            );
+            Err(create_error!(InternalError))
+        }
     }
 }
 
@@ -1579,6 +1684,11 @@ async fn void_paid(
 /// membership after the deletion removed it; a membership of `buyer` that
 /// lists this order is deleted here. Only a row listing this order is
 /// touched, so a wrong `buyer` deletes nothing.
+///
+/// The Prot counterpart: a Prot order whose purchase credit landed after
+/// the deletion's forfeit (and whose second pass then failed) is clawed
+/// back from `buyer`'s wallet before the refund (`clawback:{order_id}`, once),
+/// so the refunded Prot is never left in a dead wallet.
 async fn void_for_deleted_account(
     db: &Database,
     stripe: &dyn StripeApi,
@@ -1587,6 +1697,23 @@ async fn void_for_deleted_account(
     now_ms: i64,
 ) -> Result<FulfilOutcome> {
     if let Some(user_id) = buyer {
+        if leased.order.sku.family() == ProductFamily::Prot
+            && prot::purchase_applied(db, &leased.order.id).await?
+        {
+            log::warn!(
+                "payments: Prot order {} was credited to deleted account {user_id}; clawing it \
+                 back before the refund",
+                leased.order.id
+            );
+            Box::pin(prot::clawback_purchase(
+                db,
+                &leased.order.id,
+                user_id,
+                now_ms,
+            ))
+            .await?;
+        }
+
         let holds_order = db
             .fetch_cipher_membership(user_id)
             .await?
@@ -2076,6 +2203,12 @@ async fn reverse_fulfilled(
         write(db, leased, move |o| o.open_disputes = open).await?;
     }
 
+    // A Prot order is in no membership: its reversal claws the purchase back
+    // from the wallet instead
+    if leased.order.sku.family() == ProductFamily::Prot {
+        return prot::reverse_prot_fulfilled(db, leased, kind, now_ms).await;
+    }
+
     // A lost dispute always retires the number (the refund rule), even one
     // first seen already lost while a release a refund decided is still
     // pending: that release is dropped, and the dispute is applied below
@@ -2178,6 +2311,12 @@ async fn reverse_fulfilled(
         return Err(create_error!(InternalError));
     }
 
+    // Revoked: whatever Prot of the membership is still posted is clawed
+    // back (what is already spent is recorded as the row's shortfall)
+    if matches!(kind, ReverseKind::Refund | ReverseKind::DisputeLost) {
+        Box::pin(prot::clawback_cipher_order(db, &user_id, &order_id, now_ms)).await?;
+    }
+
     sync_user_badge(db, &user_id).await?;
 
     if matches!(kind, ReverseKind::Refund | ReverseKind::DisputeLost) {
@@ -2222,6 +2361,16 @@ async fn unlisted_reversal(
     if !matches!(kind, ReverseKind::Refund | ReverseKind::DisputeLost) {
         return no_membership_to_reverse(db, leased).await;
     }
+
+    // A rollback that stopped between its membership write and its
+    // clawback is finished here (a no-op once the clawback row exists)
+    Box::pin(prot::clawback_cipher_order(
+        db,
+        user_id,
+        &leased.order.id,
+        now_ms,
+    ))
+    .await?;
 
     sync_user_badge(db, user_id).await?;
     write(db, leased, move |o| {
@@ -2277,7 +2426,42 @@ enum WindowRefund {
 ///   it is refused here.
 ///
 /// A lost dispute never comes here: it always revokes and retires.
+///
+/// Once the membership has Prot posted from the ledger, the undo also needs
+/// that Prot unspent: see [`window_refund_plan`], which wraps this rule.
 async fn window_refund_plan(
+    db: &Database,
+    order: &PaymentOrder,
+    m: &CipherMembership,
+    refund: Option<RefundFacts>,
+) -> Result<Option<WindowRefund>> {
+    let plan = window_refund_plan_cipher(db, order, m, refund).await?;
+    // The Prot the membership keeps after the undo
+    let target = match plan {
+        Some(WindowRefund::Downgrade { from }) => i64::from(catalog::tier_prot(from)),
+        Some(WindowRefund::Release) => 0,
+        // The membership is left as it is, so nothing is clawed back (a
+        // case handled by hand, with POST /admin/prot/adjust for its Prot)
+        Some(WindowRefund::RefundOnly) | None => return Ok(plan),
+    };
+
+    // The hypothetical clawback (Terms section 7: only if none of that
+    // Cipher's Prot has been spent): no shortfall recorded on any order of
+    // the membership, and the wallet holds what the undo claws back
+    if !prot::window_clawback_covered(db, m, target).await? {
+        log::warn!(
+            "payments: order {} is refunded within the window but its Prot is not fully \
+             unspent; revoking and retiring",
+            order.id
+        );
+        return Ok(None);
+    }
+    Ok(plan)
+}
+
+/// The Cipher part of [`window_refund_plan`]: the rule above as it stood
+/// before the ledger
+async fn window_refund_plan_cipher(
     db: &Database,
     order: &PaymentOrder,
     m: &CipherMembership,
@@ -2353,6 +2537,9 @@ async fn window_refund_plan(
                 }
             }
         }
+        // No membership lists a Prot order (its reversal branches off in
+        // `reverse_fulfilled` before this)
+        Sku::ProtPack { .. } | Sku::ProtExact { .. } => Ok(None),
     }
 }
 
@@ -2432,6 +2619,11 @@ async fn refund_within_window(
                 {
                     continue;
                 }
+
+                // Back to the `from` grant: the upgrade's difference is
+                // clawed back. A stop before this is finished by the
+                // redelivery (`unlisted_reversal`).
+                Box::pin(prot::clawback_cipher_order(db, user_id, &order_id, now_ms)).await?;
 
                 sync_user_badge(db, user_id).await?;
                 mark_refunded(db, leased, now_ms).await?;
@@ -2533,12 +2725,23 @@ async fn finish_number_release_locked(
                 continue;
             }
 
-            // Revoked by staff or for a lost dispute, Prot credited, or a
-            // dispute opened on one of its orders (an upgrade, recorded
-            // under that order's lease; or this order, recorded on it by
+            // Revoked, so nothing of its Prot stays posted: clawed back now.
+            // A row written now bumped the membership version, so the row is
+            // read again before the delete below; the next pass finds the
+            // clawback done and writes nothing.
+            if Box::pin(prot::clawback_cipher_order(db, &user_id, &order_id, now_ms)).await? {
+                continue;
+            }
+
+            // Revoked by staff or for a lost dispute, Prot credited (the
+            // legacy mark, or Prot of the membership already spent when a
+            // clawback ran: a shortfall on any of its orders), or a dispute
+            // opened on one of its orders (an upgrade, recorded under that
+            // order's lease; or this order, recorded on it by
             // `reverse_fulfilled`), since the decision: the number stays
             // retired
             if m.prot_posted_at.is_some()
+                || prot::membership_shortfall(db, &m).await? > 0
                 || m.revoke_reason != Some(CipherRevokeReason::Refund)
                 || !m.disputed_orders.is_empty()
                 || is_disputed(&leased.order)
@@ -2886,10 +3089,12 @@ pub async fn cipher_me(db: &Database, user_id: &str, now_ms: i64) -> Result<Ciph
             prot_grant: m.prot_grant,
         });
 
+    // A pending Prot checkout is shown by the wallet, not here
     let pending = db
         .fetch_payment_orders_by_user(user_id, &[OrderState::Pending])
         .await?
         .into_iter()
+        .filter(|o| o.sku.family() == ProductFamily::Cipher)
         .filter_map(|o| {
             let expires_at = o.session_expires_at?;
             (expires_at > now_ms && o.checkout_url.is_some()).then_some(CipherPendingView {
@@ -9155,6 +9360,1241 @@ mod tests {
                 .await
                 .unwrap();
         }
+        drop_db(&db).await;
+    }
+
+    // --- Prot (S5a) ------------------------------------------------------
+
+    use revolt_database::{
+        prot_key_admin, prot_key_cipher_founding, prot_key_cipher_upgrade, prot_key_clawback,
+        prot_key_purchase, prot_user_account, ProtAmount, ProtLedgerEntry, ProtPosting, ProtRef,
+        PROT_SYS_ADJUST,
+    };
+    use revolt_models::v0::ProtEntryKind;
+
+    use crate::catalog::ProtChoice;
+    use crate::stripe::{checkout_form, PROT_TAX_CODE, PROT_TERMS_ACCEPTANCE_MESSAGE};
+
+    /// Prot on, its sales open and Cipher grants on. The fulfil hook reads
+    /// the test config, where grants are off, so grant tests sync with
+    /// these settings by hand (as the hourly sweep does)
+    fn prot_settings() -> ProtSalesSettings {
+        ProtSalesSettings::from_parts(
+            &revolt_config::FeaturePayments {
+                prot_sales_open: true,
+                ..Default::default()
+            },
+            &revolt_config::ProtectionFeatures {
+                enabled: true,
+                cipher_grants_enabled: true,
+                ..Default::default()
+            },
+        )
+        .unwrap()
+    }
+
+    /// The upward Cipher sync with grants on
+    async fn sync_prot(db: &Database, user: &str, at: i64) {
+        prot::sync_cipher_prot(db, &prot_settings(), user, at)
+            .await
+            .unwrap();
+    }
+
+    async fn wallet(db: &Database, user: &str) -> i64 {
+        db.fetch_prot_account(&prot_user_account(user))
+            .await
+            .unwrap()
+            .map_or(0, |account| account.balance)
+    }
+
+    async fn ledger_row(db: &Database, key: &str) -> Option<ProtLedgerEntry> {
+        db.fetch_prot_entry_by_key(key).await.unwrap()
+    }
+
+    /// The `clawback:{order_id}` row: (amount, requested, shortfall)
+    async fn clawed(db: &Database, order_id: &str) -> Option<(i64, Option<i64>, Option<i64>)> {
+        ledger_row(db, &prot_key_clawback(order_id))
+            .await
+            .map(|row| {
+                assert_eq!(row.kind, ProtEntryKind::Clawback);
+                (row.amount, row.requested, row.shortfall)
+            })
+    }
+
+    /// An admin debit of the wallet (in S5a the only way Prot is spent)
+    async fn admin_debit(db: &Database, user: &str, amount: i64, nonce: &str, at: i64) {
+        let posting = ProtPosting {
+            key: prot_key_admin("staff", nonce),
+            kind: ProtEntryKind::AdminAdjust,
+            debit: prot_user_account(user),
+            credit: PROT_SYS_ADJUST.to_string(),
+            amount: ProtAmount::Exact(amount),
+            debit_floor: 0,
+            actor: "staff".to_string(),
+            reference: ProtRef::default(),
+            reason: Some("spent in a test".to_string()),
+            created_at: at,
+        };
+        db.apply_prot_posting(&posting).await.unwrap();
+    }
+
+    fn p25() -> ProtChoice {
+        ProtChoice::Pack("p25".to_string())
+    }
+
+    /// Order ids are ULIDs, which order by the millisecond only, and the
+    /// clawback tells an order of an older membership incarnation by
+    /// `order_id < orders[0]`: a later order of the same membership is made
+    /// in a later millisecond, as it always is outside a test
+    fn next_millisecond() {
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+
+    /// Start a Prot checkout at `now`; the Pending order it created
+    async fn prot_checkout(
+        db: &Database,
+        stripe: &MockStripe,
+        s: &PaymentsSettings,
+        user: &str,
+        choice: ProtChoice,
+        now: i64,
+    ) -> PaymentOrder {
+        let url = prot::create_prot_checkout(
+            db,
+            stripe,
+            s,
+            &prot_settings(),
+            user,
+            choice,
+            CipherReturnTo::Web,
+            now,
+        )
+        .await
+        .unwrap();
+        db.fetch_payment_orders_by_user(user, &[OrderState::Pending])
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|o| o.checkout_url.as_deref() == Some(url.as_str()))
+            .expect("the Prot checkout's Pending order")
+    }
+
+    /// Prot checkout, pay and fulfil; the Fulfilled order
+    async fn buy_pack(
+        db: &Database,
+        stripe: &MockStripe,
+        s: &PaymentsSettings,
+        user: &str,
+        choice: ProtChoice,
+        payment_intent: &str,
+        now: i64,
+    ) -> PaymentOrder {
+        let pending = prot_checkout(db, stripe, s, user, choice, now).await;
+        let session = pay(stripe, &pending, payment_intent);
+        assert_eq!(
+            fulfil_order(db, stripe, s, &pending.id, &session, now)
+                .await
+                .unwrap(),
+            FulfilOutcome::Fulfilled
+        );
+        let fulfilled = order(db, &pending.id).await;
+        assert_eq!(fulfilled.state, OrderState::Fulfilled);
+        fulfilled
+    }
+
+    /// A Prot order as stored, never put through checkout
+    fn stored_prot_order(id: &str, user: &str, sku: Sku) -> PaymentOrder {
+        PaymentOrder {
+            id: id.to_string(),
+            user_id: Some(user.to_string()),
+            provider: PaymentProvider::Stripe,
+            amount_cents: catalog::sku_cents(&sku).unwrap(),
+            sku,
+            currency: "usd".to_string(),
+            checkout_session_id: None,
+            checkout_url: None,
+            session_expires_at: None,
+            payment_intent_id: Some("pi_stored".to_string()),
+            state: OrderState::Fulfilled,
+            void_reason: None,
+            region_blocked_country: None,
+            reversal_pending: None,
+            refund_settling_since: None,
+            open_disputes: vec![],
+            lease_until: None,
+            version: 0,
+            created_at: NOW,
+            paid_at: Some(NOW),
+            fulfilled_at: Some(NOW),
+            reversed_at: None,
+        }
+    }
+
+    // --- Prot: Cipher checkouts are unchanged ---------------------------
+
+    #[tokio::test]
+    async fn cipher_checkouts_send_todays_consent_text_and_tax_code_byte_for_byte() {
+        let db = test_db().await;
+        let stripe = MockStripe::new();
+        let s = settings();
+        insert_user(&db, "u1").await;
+
+        let first = buy(&db, &stripe, &s, "u1", CipherTier::T99, "pi_1", NOW).await;
+        let up = buy(&db, &stripe, &s, "u1", CipherTier::T149, "pi_up", NOW + DAY).await;
+
+        // Written out, not read from the constant: this is what buyers have
+        // agreed to since the sale opened
+        let consent = "I agree to the [Terms of Service](https://sloga.gg/legal/terms.html). My \
+                       Cipher badge is supplied as soon as my payment goes through, and I can ask \
+                       for a full refund within 14 days.";
+
+        let recorded = stripe.checkout_params();
+        assert_eq!(recorded.len(), 2);
+        let cases = [
+            (
+                &recorded[0],
+                &first,
+                "9900",
+                "Cipher founding supporter ($99)",
+                "1760002100",
+            ),
+            (
+                &recorded[1],
+                &up,
+                "5000",
+                "Cipher upgrade ($99 to $149)",
+                "1760088500",
+            ),
+        ];
+        for (params, order, cents, name, expires) in cases {
+            assert_eq!(params.order_id, order.id);
+            assert_eq!(params.consent_message, consent);
+            assert_eq!(params.tax_code, "txcd_10000000");
+
+            let pairs = |list: &[(&str, &str)]| -> Vec<(String, String)> {
+                list.iter()
+                    .map(|(key, value)| (key.to_string(), value.to_string()))
+                    .collect()
+            };
+            let untaxed = pairs(&[
+                ("mode", "payment"),
+                ("adaptive_pricing[enabled]", "false"),
+                ("line_items[0][quantity]", "1"),
+                ("line_items[0][price_data][currency]", "usd"),
+                ("line_items[0][price_data][unit_amount]", cents),
+                ("line_items[0][price_data][product_data][name]", name),
+                ("client_reference_id", "u1"),
+                ("metadata[order_id]", order.id.as_str()),
+                ("payment_intent_data[metadata][order_id]", order.id.as_str()),
+                ("success_url", "https://app.test/settings?cipher=success"),
+                ("cancel_url", "https://app.test/settings?cipher=cancel"),
+                ("expires_at", expires),
+                ("billing_address_collection", "required"),
+                ("consent_collection[terms_of_service]", "required"),
+                ("custom_text[terms_of_service_acceptance][message]", consent),
+            ]);
+            assert_eq!(checkout_form(params), untaxed);
+
+            let mut taxed = untaxed.clone();
+            taxed.extend(pairs(&[
+                ("automatic_tax[enabled]", "true"),
+                ("line_items[0][price_data][tax_behavior]", "inclusive"),
+                (
+                    "line_items[0][price_data][product_data][tax_code]",
+                    "txcd_10000000",
+                ),
+            ]));
+            let with_tax = CheckoutSessionParams {
+                automatic_tax: true,
+                ..params.clone()
+            };
+            assert_eq!(checkout_form(&with_tax), taxed);
+        }
+        drop_db(&db).await;
+    }
+
+    #[tokio::test]
+    async fn prot_checkouts_send_the_prot_consent_text_and_tax_code() {
+        let db = test_db().await;
+        let stripe = MockStripe::new();
+        let s = settings();
+        insert_user(&db, "u1").await;
+
+        let pending = prot_checkout(&db, &stripe, &s, "u1", p25(), NOW).await;
+        assert_eq!(
+            pending.sku,
+            Sku::ProtPack {
+                pack: "p25".to_string(),
+                prot: 2600,
+                cents: 2500,
+            }
+        );
+        assert_eq!(pending.amount_cents, 2500);
+
+        let recorded = stripe.checkout_params();
+        assert_eq!(recorded.len(), 1);
+        let params = &recorded[0];
+        assert_eq!(params.order_id, pending.id);
+        assert_eq!(params.consent_message, PROT_TERMS_ACCEPTANCE_MESSAGE);
+        assert_eq!(params.tax_code, PROT_TAX_CODE);
+        assert_eq!(params.product_name, "2,600 Prot");
+        assert_eq!(params.amount_cents, 2500);
+        assert_eq!(params.success_url, prot_settings().success_url);
+        assert_eq!(params.cancel_url, prot_settings().cancel_url);
+        drop_db(&db).await;
+    }
+
+    // --- Prot: one shared fulfilment path -------------------------------
+
+    #[tokio::test]
+    async fn a_pack_paid_from_a_blocked_country_is_voided_and_refunded_and_never_credited() {
+        let db = test_db().await;
+        let stripe = MockStripe::new();
+        let s = settings();
+        for user in ["u1", "u2", "u3"] {
+            insert_user(&db, user).await;
+        }
+
+        // u1: billed to DE. u2: billed to the US with a card issued in FR.
+        let billed = prot_checkout(&db, &stripe, &s, "u1", p25(), NOW).await;
+        let session = pay_from(&stripe, &billed, "pi_de", Some("DE"));
+        assert_eq!(
+            fulfil_order(&db, &stripe, &s, &billed.id, &session, NOW)
+                .await
+                .unwrap(),
+            FulfilOutcome::Voided(VoidReason::RegionUnavailable)
+        );
+
+        let carded = prot_checkout(&db, &stripe, &s, "u2", p25(), NOW).await;
+        let session = pay_from(&stripe, &carded, "pi_fr", Some("US"));
+        stripe.set_payment_charge(paid_by("pi_fr", "card", Some("FR")));
+        assert_eq!(
+            fulfil_order(&db, &stripe, &s, &carded.id, &session, NOW)
+                .await
+                .unwrap(),
+            FulfilOutcome::Voided(VoidReason::RegionUnavailable)
+        );
+
+        for (user, voided, pi, country) in [
+            ("u1", &billed, "pi_de", "DE"),
+            ("u2", &carded, "pi_fr", "FR"),
+        ] {
+            let stored = order(&db, &voided.id).await;
+            assert_eq!(stored.state, OrderState::Voided);
+            assert_eq!(stored.void_reason, Some(VoidReason::RegionUnavailable));
+            assert_eq!(stored.region_blocked_country.as_deref(), Some(country));
+            assert!(refund_keys(&stripe)
+                .contains(&(pi.to_string(), Some(format!("void-{}", voided.id)))));
+            // Never credited
+            assert_eq!(ledger_row(&db, &prot_key_purchase(&voided.id)).await, None);
+            assert_eq!(wallet(&db, user).await, 0);
+        }
+        assert_eq!(stripe.refund_count(), 2);
+
+        // A redelivery refunds and credits nothing more
+        let session = pay_from(&stripe, &billed, "pi_de", Some("DE"));
+        assert_eq!(
+            fulfil_order(&db, &stripe, &s, &billed.id, &session, NOW + 1)
+                .await
+                .unwrap(),
+            FulfilOutcome::Voided(VoidReason::RegionUnavailable)
+        );
+        assert_eq!(stripe.refund_count(), 2);
+        assert_eq!(wallet(&db, "u1").await, 0);
+
+        // u3: billed to and paid from the US, credited once
+        let pending = prot_checkout(&db, &stripe, &s, "u3", p25(), NOW).await;
+        let session = pay_from(&stripe, &pending, "pi_us", Some("US"));
+        stripe.set_payment_charge(paid_by("pi_us", "card", Some("US")));
+        assert_eq!(
+            fulfil_order(&db, &stripe, &s, &pending.id, &session, NOW)
+                .await
+                .unwrap(),
+            FulfilOutcome::Fulfilled
+        );
+        let credit = ledger_row(&db, &prot_key_purchase(&pending.id))
+            .await
+            .expect("the purchase row");
+        assert_eq!(credit.kind, ProtEntryKind::Purchase);
+        assert_eq!(credit.amount, 2600);
+        assert_eq!(wallet(&db, "u3").await, 2600);
+        // No membership, no number, no badge
+        assert_eq!(maybe_membership(&db, "u3").await, None);
+        assert_eq!(db.count_claimed_cipher_numbers().await.unwrap(), 0);
+        assert_eq!(badge(&db, "u3").await, None);
+        drop_db(&db).await;
+    }
+
+    #[tokio::test]
+    async fn a_pack_bought_after_the_cipher_sale_closes_is_credited() {
+        let db = test_db().await;
+        let stripe = MockStripe::new();
+        let s = PaymentsSettings {
+            close_at_ms: Some(NOW + DAY),
+            ..settings()
+        };
+        insert_user(&db, "u1").await;
+
+        let at = NOW + 2 * DAY;
+        assert!(matches!(
+            error_type(try_checkout(&db, &stripe, &s, "u1", at).await),
+            ErrorType::CipherSalesClosed
+        ));
+
+        let pending = prot_checkout(&db, &stripe, &s, "u1", ProtChoice::ExactCents(1234), at).await;
+        let session = pay(&stripe, &pending, "pi_1");
+        assert_eq!(
+            fulfil_order(&db, &stripe, &s, &pending.id, &session, at)
+                .await
+                .unwrap(),
+            FulfilOutcome::Fulfilled
+        );
+        assert_eq!(wallet(&db, "u1").await, 1234);
+        assert_eq!(
+            ledger_row(&db, &prot_key_purchase(&pending.id))
+                .await
+                .map(|row| row.amount),
+            Some(1234)
+        );
+        assert_eq!(stripe.refund_count(), 0);
+        drop_db(&db).await;
+    }
+
+    #[tokio::test]
+    async fn a_pending_pack_and_a_pending_cipher_checkout_never_block_each_other() {
+        let db = test_db().await;
+        let stripe = MockStripe::new();
+        let s = settings();
+        insert_user(&db, "u1").await;
+        insert_user(&db, "u2").await;
+
+        // u1: a pack checkout open, then a Cipher one
+        let pack = prot_checkout(&db, &stripe, &s, "u1", p25(), NOW).await;
+        let cipher = checkout(&db, &stripe, &s, "u1", CipherTier::T99, NOW + 1).await;
+        assert_ne!(pack.id, cipher.id);
+        // Each family still has one live order: asking again returns its URL
+        assert_eq!(
+            Some(try_checkout(&db, &stripe, &s, "u1", NOW + 2).await.unwrap()),
+            cipher.checkout_url
+        );
+        let again = prot::create_prot_checkout(
+            &db,
+            &stripe,
+            &s,
+            &prot_settings(),
+            "u1",
+            p25(),
+            CipherReturnTo::Web,
+            NOW + 3,
+        )
+        .await
+        .unwrap();
+        assert_eq!(Some(again), pack.checkout_url);
+
+        // u2: the other way round
+        let cipher = checkout(&db, &stripe, &s, "u2", CipherTier::T149, NOW).await;
+        let pack = prot_checkout(&db, &stripe, &s, "u2", p25(), NOW + 1).await;
+        assert_ne!(pack.id, cipher.id);
+        let same = checkout(&db, &stripe, &s, "u2", CipherTier::T149, NOW + 2).await;
+        assert_eq!(same.id, cipher.id);
+        // Two sessions per buyer at most, one per family
+        assert_eq!(stripe.checkout_params().len(), 4);
+        drop_db(&db).await;
+    }
+
+    #[tokio::test]
+    async fn cipher_me_shows_only_a_pending_cipher_checkout() {
+        let db = test_db().await;
+        let stripe = MockStripe::new();
+        let s = settings();
+        insert_user(&db, "u1").await;
+
+        // Only a pack checkout open: no Cipher checkout to show
+        let pack = prot_checkout(&db, &stripe, &s, "u1", p25(), NOW).await;
+        let me = cipher_me(&db, "u1", NOW + 1).await.unwrap();
+        assert_eq!(me.pending, None);
+        assert_eq!(me.membership, None);
+
+        // Once a Cipher checkout is open too, that one is shown
+        let cipher = checkout(&db, &stripe, &s, "u1", CipherTier::T99, NOW + 2).await;
+        let me = cipher_me(&db, "u1", NOW + 3).await.unwrap();
+        assert_eq!(
+            me.pending.map(|p| (p.order_id, p.sku)),
+            Some((cipher.id.clone(), cipher.sku.clone()))
+        );
+        assert!(pack.session_expires_at.is_some_and(|at| at > NOW + 3));
+        drop_db(&db).await;
+    }
+
+    #[tokio::test]
+    async fn a_prot_region_void_never_blocks_a_cipher_checkout() {
+        let db = test_db().await;
+        let stripe = MockStripe::new();
+        let s = settings();
+        insert_user(&db, "u1").await;
+
+        let pending = prot_checkout(&db, &stripe, &s, "u1", p25(), NOW).await;
+        let session = pay_from(&stripe, &pending, "pi_de", Some("DE"));
+        assert_eq!(
+            fulfil_order(&db, &stripe, &s, &pending.id, &session, NOW)
+                .await
+                .unwrap(),
+            FulfilOutcome::Voided(VoidReason::RegionUnavailable)
+        );
+        assert!(s.region_blocked("DE"), "DE is on the Cipher list too");
+
+        // The Cipher refusal reads Cipher voids only
+        try_checkout(&db, &stripe, &s, "u1", NOW + DAY)
+            .await
+            .unwrap();
+        drop_db(&db).await;
+    }
+
+    #[tokio::test]
+    async fn a_paid_pack_waits_on_an_open_dispute_and_a_pending_lost_one_voids_it() {
+        let db = test_db().await;
+        let stripe = MockStripe::new();
+        let s = settings();
+        insert_user(&db, "u1").await;
+        insert_user(&db, "u2").await;
+
+        // u1: a dispute opened before the completion is handled: not
+        // credited, not refunded, left Paid until the dispute closes
+        let pending = prot_checkout(&db, &stripe, &s, "u1", p25(), NOW).await;
+        on_dispute(&db, &pending.id, "dp_1", ReverseKind::DisputeOpened, NOW)
+            .await
+            .unwrap();
+        let session = pay(&stripe, &pending, "pi_1");
+        assert_eq!(
+            fulfil_order(&db, &stripe, &s, &pending.id, &session, NOW)
+                .await
+                .unwrap(),
+            FulfilOutcome::VoidDeferred(VoidReason::DisputeOpen)
+        );
+        assert_eq!(order(&db, &pending.id).await.state, OrderState::Paid);
+        assert_eq!(wallet(&db, "u1").await, 0);
+        assert_eq!(ledger_row(&db, &prot_key_purchase(&pending.id)).await, None);
+
+        // Won: the next attempt credits it
+        on_dispute(&db, &pending.id, "dp_1", ReverseKind::DisputeWon, NOW + 1)
+            .await
+            .unwrap();
+        assert_eq!(
+            fulfil_order(&db, &stripe, &s, &pending.id, &session, NOW + 2)
+                .await
+                .unwrap(),
+            FulfilOutcome::Fulfilled
+        );
+        assert_eq!(wallet(&db, "u1").await, 2600);
+
+        // u2: lost before the completion is handled. The lost id is no
+        // longer open, so this is the recorded reversal, voided Reversed
+        // without a refund (the money is already gone)
+        let pending = prot_checkout(&db, &stripe, &s, "u2", p25(), NOW).await;
+        on_dispute(&db, &pending.id, "dp_2", ReverseKind::DisputeOpened, NOW)
+            .await
+            .unwrap();
+        on_dispute(&db, &pending.id, "dp_2", ReverseKind::DisputeLost, NOW + 1)
+            .await
+            .unwrap();
+        let session = pay(&stripe, &pending, "pi_2");
+        assert_eq!(
+            fulfil_order(&db, &stripe, &s, &pending.id, &session, NOW + 2)
+                .await
+                .unwrap(),
+            FulfilOutcome::Voided(VoidReason::Reversed)
+        );
+        assert_eq!(wallet(&db, "u2").await, 0);
+        assert_eq!(ledger_row(&db, &prot_key_purchase(&pending.id)).await, None);
+        assert_eq!(stripe.refund_count(), 0);
+        drop_db(&db).await;
+    }
+
+    #[tokio::test]
+    async fn a_refunded_or_lost_pack_is_clawed_back_and_recorded_refunded() {
+        let db = test_db().await;
+        let stripe = MockStripe::new();
+        let s = settings();
+        insert_user(&db, "u1").await;
+        insert_user(&db, "u2").await;
+
+        // u1: refunded by the owner
+        let bought = buy_pack(&db, &stripe, &s, "u1", p25(), "pi_1", NOW).await;
+        assert_eq!(wallet(&db, "u1").await, 2600);
+        assert_eq!(
+            refund(&db, &bought.id, NOW + DAY).await,
+            ReverseOutcome::Applied
+        );
+        let refunded = order(&db, &bought.id).await;
+        assert_eq!(refunded.state, OrderState::Refunded);
+        assert_eq!(refunded.reversed_at, Some(NOW + DAY));
+        assert_eq!(
+            clawed(&db, &bought.id).await,
+            Some((2600, Some(2600), Some(0)))
+        );
+        assert_eq!(wallet(&db, "u1").await, 0);
+        assert_eq!(maybe_membership(&db, "u1").await, None);
+        // A redelivery claws nothing more
+        assert_eq!(
+            refund(&db, &bought.id, NOW + DAY + 1).await,
+            ReverseOutcome::NoOp
+        );
+        assert_eq!(wallet(&db, "u1").await, 0);
+
+        // u2: a dispute opened (nothing moves), then lost
+        let bought = buy_pack(
+            &db,
+            &stripe,
+            &s,
+            "u2",
+            ProtChoice::ExactCents(1234),
+            "pi_2",
+            NOW,
+        )
+        .await;
+        assert_eq!(
+            on_dispute(&db, &bought.id, "dp_1", ReverseKind::DisputeOpened, NOW + 1)
+                .await
+                .unwrap(),
+            ReverseOutcome::NoOp
+        );
+        assert_eq!(wallet(&db, "u2").await, 1234);
+        assert_eq!(
+            on_dispute(&db, &bought.id, "dp_1", ReverseKind::DisputeLost, NOW + 2)
+                .await
+                .unwrap(),
+            ReverseOutcome::Applied
+        );
+        assert_eq!(order(&db, &bought.id).await.state, OrderState::Refunded);
+        assert_eq!(
+            clawed(&db, &bought.id).await,
+            Some((1234, Some(1234), Some(0)))
+        );
+        assert_eq!(wallet(&db, "u2").await, 0);
+        assert_eq!(stripe.refund_count(), 0, "we never refund a reversal");
+        drop_db(&db).await;
+    }
+
+    #[tokio::test]
+    async fn prot_orders_never_reach_the_cipher_membership_steps() {
+        let db = test_db().await;
+        // The Cipher sale closed a day before the order was made
+        let s = PaymentsSettings {
+            close_at_ms: Some(NOW - DAY),
+            ..settings()
+        };
+        insert_user(&db, "u1").await;
+        let exact = stored_prot_order("01PROTORDER", "u1", Sku::ProtExact { prot: 1234 });
+
+        // The sale close is Cipher's only; an open dispute holds the credit,
+        // a pending lost one does not (it is voided Reversed)
+        assert_eq!(precondition_failure(&s, &exact, None), None);
+        let disputed = PaymentOrder {
+            open_disputes: vec!["dp_1".to_string()],
+            ..exact.clone()
+        };
+        assert_eq!(
+            precondition_failure(&s, &disputed, None),
+            Some(VoidReason::DisputeOpen)
+        );
+        let lost = PaymentOrder {
+            reversal_pending: Some(ReversalPending::DisputeLost),
+            ..exact.clone()
+        };
+        assert_eq!(precondition_failure(&s, &lost, None), None);
+        let cipher = PaymentOrder {
+            sku: Sku::CipherNew {
+                tier: CipherTier::T99,
+            },
+            ..exact.clone()
+        };
+        assert_eq!(
+            precondition_failure(&s, &cipher, None),
+            Some(VoidReason::SalesClosed)
+        );
+
+        // Never written into a membership
+        assert!(matches!(
+            error_type(
+                apply_membership(&db, &s, &exact, "u1", NOW)
+                    .await
+                    .map(|_| ())
+            ),
+            ErrorType::InternalError
+        ));
+        assert_eq!(maybe_membership(&db, "u1").await, None);
+
+        // Never planned by the 14-day rule, even on a membership listing it
+        let m = CipherMembership {
+            user_id: "u1".to_string(),
+            number: 1,
+            tier: CipherTier::T99,
+            prot_grant: catalog::tier_prot(CipherTier::T99),
+            orders: vec![exact.id.clone()],
+            disputed_orders: vec![],
+            granted_at: NOW,
+            revoked_at: None,
+            revoke_reason: None,
+            prot_posted_at: None,
+            version: 0,
+        };
+        let made = full_refund(NOW + DAY);
+        assert_eq!(
+            window_refund_plan_cipher(&db, &exact, &m, made)
+                .await
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            window_refund_plan(&db, &exact, &m, made).await.unwrap(),
+            None
+        );
+        drop_db(&db).await;
+    }
+
+    // --- Prot: Cipher founding Prot -------------------------------------
+
+    #[tokio::test]
+    async fn a_cipher_fulfil_posts_no_prot_while_grants_are_off() {
+        let db = test_db().await;
+        let stripe = MockStripe::new();
+        let s = settings();
+        insert_user(&db, "u1").await;
+
+        // The test config has Prot on and Cipher grants off
+        let first = buy(&db, &stripe, &s, "u1", CipherTier::T99, "pi_1", NOW).await;
+        let up = buy(&db, &stripe, &s, "u1", CipherTier::T149, "pi_up", NOW + DAY).await;
+        assert!(db
+            .fetch_prot_entries_by_membership(&first.id)
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(wallet(&db, "u1").await, 0);
+
+        // Grants on: the membership's current grant, once
+        sync_prot(&db, "u1", NOW + 2 * DAY).await;
+        sync_prot(&db, "u1", NOW + 2 * DAY + 1).await;
+        let founding = ledger_row(&db, &prot_key_cipher_founding("u1", 1, &first.id))
+            .await
+            .expect("the founding row");
+        assert_eq!(founding.kind, ProtEntryKind::CipherFounding);
+        assert_eq!(founding.amount, 33_000);
+        assert_eq!(founding.reference.order_id.as_deref(), Some(up.id.as_str()));
+        assert_eq!(wallet(&db, "u1").await, 33_000);
+        drop_db(&db).await;
+    }
+
+    #[tokio::test]
+    async fn a_shortfall_on_an_upgrade_refund_stops_the_window_release_of_the_number() {
+        let db = test_db().await;
+        let stripe = MockStripe::new();
+        let s = settings();
+        insert_user(&db, "u1").await;
+        insert_user(&db, "u2").await;
+
+        let first = buy(&db, &stripe, &s, "u1", CipherTier::T99, "pi_1", NOW).await;
+        next_millisecond();
+        let up = buy(&db, &stripe, &s, "u1", CipherTier::T299, "pi_up", NOW + DAY).await;
+        assert!(first.id < up.id);
+        sync_prot(&db, "u1", NOW + DAY).await;
+        assert_eq!(wallet(&db, "u1").await, 75_000);
+        admin_debit(&db, "u1", 75_000, "spend-all", NOW + DAY + 1).await;
+        assert_eq!(wallet(&db, "u1").await, 0);
+
+        // The upgrade refunded outside its window: revoked, and the clawback
+        // finds the wallet empty
+        let late = NOW + DAY + REFUND_RELEASE_WINDOW_MS + REFUND_GRACE_MS + 1;
+        assert_eq!(refund(&db, &up.id, late).await, ReverseOutcome::Applied);
+        let m = membership(&db, "u1").await;
+        assert_eq!(m.revoke_reason, Some(CipherRevokeReason::Refund));
+        assert_eq!(
+            clawed(&db, &up.id).await,
+            Some((0, Some(75_000), Some(75_000)))
+        );
+
+        // Then the purchase's own refund, made inside its window, arrives
+        // late: the shortfall on the upgrade keeps the number retired
+        assert_eq!(
+            refund_with(&db, &first.id, full_refund(NOW + 3 * DAY), late + DAY).await,
+            ReverseOutcome::Applied
+        );
+        let m = membership(&db, "u1").await;
+        assert!(!m.is_active());
+        assert_eq!(m.number, 1);
+        assert_eq!(
+            db.fetch_cipher_number_by_order(&first.id).await.unwrap(),
+            Some(1)
+        );
+        assert_eq!(order(&db, &first.id).await.state, OrderState::Refunded);
+        assert_eq!(clawed(&db, &first.id).await, None, "nothing left to claw");
+        assert_eq!(badge(&db, "u1").await, None);
+
+        // #1 stays retired
+        buy(
+            &db,
+            &stripe,
+            &s,
+            "u2",
+            CipherTier::T99,
+            "pi_2",
+            late + 2 * DAY,
+        )
+        .await;
+        assert_eq!(membership(&db, "u2").await.number, 2);
+        drop_db(&db).await;
+    }
+
+    #[tokio::test]
+    async fn a_partial_upgrade_refund_shortfall_stops_the_window_release_of_the_number() {
+        let db = test_db().await;
+        let stripe = MockStripe::new();
+        let s = settings();
+        insert_user(&db, "u1").await;
+        insert_user(&db, "u2").await;
+
+        // Day 0: T99, credited 16,500. Day 2: T149, credited 16,500 more.
+        let o1 = buy(&db, &stripe, &s, "u1", CipherTier::T99, "pi_1", NOW).await;
+        sync_prot(&db, "u1", NOW).await;
+        next_millisecond();
+        let o2 = buy(
+            &db,
+            &stripe,
+            &s,
+            "u1",
+            CipherTier::T149,
+            "pi_2",
+            NOW + 2 * DAY,
+        )
+        .await;
+        assert!(o1.id < o2.id);
+        sync_prot(&db, "u1", NOW + 2 * DAY).await;
+        assert_eq!(wallet(&db, "u1").await, 33_000);
+        assert_eq!(
+            ledger_row(&db, &prot_key_cipher_upgrade("u1", 1, &o1.id, 1))
+                .await
+                .map(|row| row.amount),
+            Some(16_500)
+        );
+        admin_debit(&db, "u1", 1_000, "spend-some", NOW + 3 * DAY).await;
+
+        // Day 5: o2 refunded in part, which revokes the whole membership
+        let partial = Some(RefundFacts {
+            refunded_at_ms: NOW + 5 * DAY,
+            full: false,
+            status: RefundStatus::Succeeded,
+        });
+        assert_eq!(
+            refund_with(&db, &o2.id, partial, NOW + 5 * DAY).await,
+            ReverseOutcome::Applied
+        );
+        assert_eq!(
+            membership(&db, "u1").await.revoke_reason,
+            Some(CipherRevokeReason::Refund)
+        );
+        assert_eq!(
+            clawed(&db, &o2.id).await,
+            Some((32_000, Some(33_000), Some(1_000)))
+        );
+        assert_eq!(wallet(&db, "u1").await, 0);
+
+        // Day 6: o1 refunded in full inside its window. Nothing is left to
+        // claw for o1, but the membership's shortfall keeps the number
+        assert_eq!(
+            refund(&db, &o1.id, NOW + 6 * DAY).await,
+            ReverseOutcome::Applied
+        );
+        assert!(maybe_membership(&db, "u1").await.is_some());
+        assert_eq!(
+            db.fetch_cipher_number_by_order(&o1.id).await.unwrap(),
+            Some(1)
+        );
+        assert_eq!(clawed(&db, &o1.id).await, None);
+        assert_eq!(order(&db, &o1.id).await.state, OrderState::Refunded);
+
+        buy(
+            &db,
+            &stripe,
+            &s,
+            "u2",
+            CipherTier::T99,
+            "pi_3",
+            NOW + 7 * DAY,
+        )
+        .await;
+        assert_eq!(membership(&db, "u2").await.number, 2);
+        drop_db(&db).await;
+    }
+
+    #[tokio::test]
+    async fn a_covered_window_release_claws_back_the_grant_and_frees_the_number() {
+        let db = test_db().await;
+        let stripe = MockStripe::new();
+        let s = settings();
+        insert_user(&db, "u1").await;
+
+        let first = buy(&db, &stripe, &s, "u1", CipherTier::T99, "pi_1", NOW).await;
+        let up = buy(&db, &stripe, &s, "u1", CipherTier::T149, "pi_up", NOW + DAY).await;
+        sync_prot(&db, "u1", NOW + DAY).await;
+        assert_eq!(wallet(&db, "u1").await, 33_000);
+
+        // Inside the window with the whole grant unspent: released as before,
+        // everything posted for the membership clawed back under the
+        // purchase's key (the upgrade is refunded with it)
+        assert_eq!(
+            refund(&db, &first.id, NOW + 2 * DAY).await,
+            ReverseOutcome::Applied
+        );
+        assert_eq!(maybe_membership(&db, "u1").await, None);
+        assert_eq!(
+            db.fetch_cipher_number_by_order(&first.id).await.unwrap(),
+            None
+        );
+        assert_eq!(db.count_claimed_cipher_numbers().await.unwrap(), 0);
+        assert_eq!(
+            clawed(&db, &first.id).await,
+            Some((33_000, Some(33_000), Some(0)))
+        );
+        assert_eq!(wallet(&db, "u1").await, 0);
+        assert_eq!(order(&db, &up.id).await.state, OrderState::Refunded);
+        assert_eq!(
+            refund(&db, &up.id, NOW + 2 * DAY + 1).await,
+            ReverseOutcome::NoOp
+        );
+        assert_eq!(clawed(&db, &up.id).await, None);
+
+        // Bought again: a new incarnation (its own base order), credited again
+        let again = buy(
+            &db,
+            &stripe,
+            &s,
+            "u1",
+            CipherTier::T99,
+            "pi_2",
+            NOW + 3 * DAY,
+        )
+        .await;
+        assert_eq!(membership(&db, "u1").await.number, 1);
+        sync_prot(&db, "u1", NOW + 3 * DAY).await;
+        assert_eq!(
+            ledger_row(&db, &prot_key_cipher_founding("u1", 1, &again.id))
+                .await
+                .map(|row| row.amount),
+            Some(16_500)
+        );
+        assert_eq!(wallet(&db, "u1").await, 16_500);
+        drop_db(&db).await;
+    }
+
+    #[tokio::test]
+    async fn an_uncovered_window_refund_revokes_retires_and_claws_what_is_left() {
+        let db = test_db().await;
+        let stripe = MockStripe::new();
+        let s = settings();
+        insert_user(&db, "u1").await;
+        insert_user(&db, "u2").await;
+
+        let bought = buy(&db, &stripe, &s, "u1", CipherTier::T99, "pi_1", NOW).await;
+        sync_prot(&db, "u1", NOW).await;
+        admin_debit(&db, "u1", 1_000, "spend-some", NOW + DAY).await;
+        assert_eq!(wallet(&db, "u1").await, 15_500);
+
+        assert_eq!(
+            refund(&db, &bought.id, NOW + 3 * DAY).await,
+            ReverseOutcome::Applied
+        );
+        let m = membership(&db, "u1").await;
+        assert_eq!(m.revoke_reason, Some(CipherRevokeReason::Refund));
+        assert_eq!(
+            db.fetch_cipher_number_by_order(&bought.id).await.unwrap(),
+            Some(1)
+        );
+        let row = db
+            .fetch_cipher_number_row_by_order(&bought.id)
+            .await
+            .unwrap()
+            .expect("the number row");
+        assert_eq!(row.release_pending_at, None, "no release was decided");
+        assert_eq!(
+            clawed(&db, &bought.id).await,
+            Some((15_500, Some(16_500), Some(1_000)))
+        );
+        assert_eq!(wallet(&db, "u1").await, 0);
+
+        buy(
+            &db,
+            &stripe,
+            &s,
+            "u2",
+            CipherTier::T99,
+            "pi_2",
+            NOW + 4 * DAY,
+        )
+        .await;
+        assert_eq!(membership(&db, "u2").await.number, 2);
+        drop_db(&db).await;
+    }
+
+    #[tokio::test]
+    async fn a_release_whose_clawback_falls_short_keeps_the_number_retired() {
+        let db = test_db().await;
+        let stripe = MockStripe::new();
+        let s = settings();
+        insert_user(&db, "u1").await;
+        insert_user(&db, "u2").await;
+
+        let bought = buy(&db, &stripe, &s, "u1", CipherTier::T149, "pi_1", NOW).await;
+        sync_prot(&db, "u1", NOW).await;
+
+        // A worker decided the release while the wallet covered the grant
+        // and stopped after revoking; Prot was spent before it is finished
+        release_decided(&db, "u1", &bought.id, NOW + DAY, true).await;
+        admin_debit(&db, "u1", 500, "spend-race", NOW + DAY + 1).await;
+
+        assert_eq!(
+            refund(&db, &bought.id, NOW + DAY + 2).await,
+            ReverseOutcome::Applied
+        );
+        assert_eq!(
+            clawed(&db, &bought.id).await,
+            Some((32_500, Some(33_000), Some(500)))
+        );
+        let m = membership(&db, "u1").await;
+        assert_eq!(m.revoke_reason, Some(CipherRevokeReason::Refund));
+        assert_eq!(
+            db.fetch_cipher_number_by_order(&bought.id).await.unwrap(),
+            Some(1)
+        );
+        let row = db
+            .fetch_cipher_number_row_by_order(&bought.id)
+            .await
+            .unwrap()
+            .expect("the number row");
+        assert_eq!(row.release_pending_at, None, "the release was dropped");
+        assert_eq!(order(&db, &bought.id).await.state, OrderState::Refunded);
+        assert_eq!(wallet(&db, "u1").await, 0);
+
+        buy(
+            &db,
+            &stripe,
+            &s,
+            "u2",
+            CipherTier::T99,
+            "pi_2",
+            NOW + 2 * DAY,
+        )
+        .await;
+        assert_eq!(membership(&db, "u2").await.number, 2);
+        drop_db(&db).await;
+    }
+
+    #[tokio::test]
+    async fn a_window_downgrade_claws_the_grant_difference_and_a_reupgrade_is_credited_again() {
+        let db = test_db().await;
+        let stripe = MockStripe::new();
+        let s = settings();
+        insert_user(&db, "u1").await;
+
+        let first = buy(&db, &stripe, &s, "u1", CipherTier::T99, "pi_1", NOW).await;
+        sync_prot(&db, "u1", NOW).await;
+        next_millisecond();
+        let up = buy(&db, &stripe, &s, "u1", CipherTier::T299, "pi_up", NOW + DAY).await;
+        assert!(first.id < up.id);
+        sync_prot(&db, "u1", NOW + DAY).await;
+        assert_eq!(wallet(&db, "u1").await, 75_000);
+        assert_eq!(
+            ledger_row(&db, &prot_key_cipher_upgrade("u1", 1, &first.id, 1))
+                .await
+                .map(|row| row.amount),
+            Some(58_500)
+        );
+
+        // Rolled back to T99: exactly the upgrade's difference clawed back
+        assert_eq!(
+            refund(&db, &up.id, NOW + 2 * DAY).await,
+            ReverseOutcome::Applied
+        );
+        let m = membership(&db, "u1").await;
+        assert!(m.is_active());
+        assert_eq!((m.number, m.tier), (1, CipherTier::T99));
+        let row = ledger_row(&db, &prot_key_clawback(&up.id))
+            .await
+            .expect("the clawback row");
+        assert_eq!(
+            (row.amount, row.requested, row.shortfall),
+            (58_500, Some(58_500), Some(0))
+        );
+        assert_eq!(
+            row.reference.membership_order_id.as_deref(),
+            Some(first.id.as_str())
+        );
+        assert_eq!(wallet(&db, "u1").await, 16_500);
+        // A redelivery claws nothing more
+        assert_eq!(
+            refund(&db, &up.id, NOW + 2 * DAY + 1).await,
+            ReverseOutcome::NoOp
+        );
+        assert_eq!(wallet(&db, "u1").await, 16_500);
+
+        // Upgraded to the same tier again: credited again, under the next seq
+        buy(
+            &db,
+            &stripe,
+            &s,
+            "u1",
+            CipherTier::T299,
+            "pi_up2",
+            NOW + 3 * DAY,
+        )
+        .await;
+        sync_prot(&db, "u1", NOW + 3 * DAY).await;
+        assert_eq!(
+            ledger_row(&db, &prot_key_cipher_upgrade("u1", 1, &first.id, 2))
+                .await
+                .map(|row| row.amount),
+            Some(58_500)
+        );
+        assert_eq!(wallet(&db, "u1").await, 75_000);
+        sync_prot(&db, "u1", NOW + 3 * DAY + 1).await;
+        assert_eq!(wallet(&db, "u1").await, 75_000);
+        drop_db(&db).await;
+    }
+
+    #[tokio::test]
+    async fn a_window_downgrade_whose_prot_is_spent_revokes_and_retires() {
+        let db = test_db().await;
+        let stripe = MockStripe::new();
+        let s = settings();
+        insert_user(&db, "u1").await;
+
+        let first = buy(&db, &stripe, &s, "u1", CipherTier::T99, "pi_1", NOW).await;
+        next_millisecond();
+        let up = buy(&db, &stripe, &s, "u1", CipherTier::T149, "pi_up", NOW + DAY).await;
+        assert!(first.id < up.id);
+        sync_prot(&db, "u1", NOW + DAY).await;
+        admin_debit(&db, "u1", 20_000, "spend-most", NOW + DAY + 1).await;
+        assert_eq!(wallet(&db, "u1").await, 13_000);
+
+        // Inside the upgrade's window, but the 16,500 it granted is not all
+        // there: revoke + retire, and everything still posted is clawed
+        assert_eq!(
+            refund(&db, &up.id, NOW + 2 * DAY).await,
+            ReverseOutcome::Applied
+        );
+        let m = membership(&db, "u1").await;
+        assert!(!m.is_active());
+        assert_eq!(m.revoke_reason, Some(CipherRevokeReason::Refund));
+        assert_eq!((m.number, m.tier), (1, CipherTier::T149));
+        assert_eq!(
+            db.fetch_cipher_number_by_order(&first.id).await.unwrap(),
+            Some(1)
+        );
+        assert_eq!(badge(&db, "u1").await, None);
+        assert_eq!(
+            clawed(&db, &up.id).await,
+            Some((13_000, Some(33_000), Some(20_000)))
+        );
+        assert_eq!(wallet(&db, "u1").await, 0);
+        assert_eq!(order(&db, &up.id).await.state, OrderState::Refunded);
+        drop_db(&db).await;
+    }
+
+    #[tokio::test]
+    async fn a_rollback_stopped_before_its_clawback_is_clawed_back_by_the_redelivery() {
+        let db = test_db().await;
+        let stripe = MockStripe::new();
+        let s = settings();
+        insert_user(&db, "u1").await;
+
+        let first = buy(&db, &stripe, &s, "u1", CipherTier::T99, "pi_1", NOW).await;
+        next_millisecond();
+        let up = buy(&db, &stripe, &s, "u1", CipherTier::T299, "pi_up", NOW + DAY).await;
+        assert!(first.id < up.id);
+        sync_prot(&db, "u1", NOW + DAY).await;
+        assert_eq!(wallet(&db, "u1").await, 75_000);
+
+        // The rollback was written, then the worker died before its clawback
+        change_membership(&db, "u1", |m| {
+            m.tier = CipherTier::T99;
+            m.prot_grant = catalog::tier_prot(CipherTier::T99);
+            m.orders = vec![first.id.clone()];
+        })
+        .await;
+
+        assert_eq!(
+            refund(&db, &up.id, NOW + 2 * DAY).await,
+            ReverseOutcome::NoOp
+        );
+        assert_eq!(order(&db, &up.id).await.state, OrderState::Refunded);
+        assert_eq!(
+            clawed(&db, &up.id).await,
+            Some((58_500, Some(58_500), Some(0)))
+        );
+        assert_eq!(wallet(&db, "u1").await, 16_500);
+        assert!(membership(&db, "u1").await.is_active());
+        drop_db(&db).await;
+    }
+
+    #[tokio::test]
+    async fn a_lost_dispute_on_a_replaced_incarnation_claws_nothing_from_the_current_one() {
+        let db = test_db().await;
+        let stripe = MockStripe::new();
+        let s = settings();
+        insert_user(&db, "u1").await;
+
+        // The first incarnation, credited, then revoked by staff (outside
+        // the engine, so its order stays Fulfilled)
+        let old = buy(&db, &stripe, &s, "u1", CipherTier::T99, "pi_1", NOW).await;
+        sync_prot(&db, "u1", NOW).await;
+        change_membership(&db, "u1", |m| {
+            m.revoked_at = Some(NOW + DAY);
+            m.revoke_reason = Some(CipherRevokeReason::Admin);
+        })
+        .await;
+
+        // Bought again: the row is replaced, with a new base order
+        next_millisecond();
+        let new = buy(
+            &db,
+            &stripe,
+            &s,
+            "u1",
+            CipherTier::T149,
+            "pi_2",
+            NOW + 2 * DAY,
+        )
+        .await;
+        assert!(old.id < new.id);
+        assert_eq!(membership(&db, "u1").await.orders, vec![new.id.clone()]);
+        sync_prot(&db, "u1", NOW + 2 * DAY).await;
+        assert_eq!(wallet(&db, "u1").await, 49_500);
+
+        // Its refund (after its window) stopped right after the revoke,
+        // before its clawback
+        let late = NOW + 2 * DAY + REFUND_RELEASE_WINDOW_MS + REFUND_GRACE_MS + 1;
+        change_membership(&db, "u1", revoked_for_refund(late)).await;
+
+        // A dispute lost on the OLD order: nothing of the current
+        // incarnation is clawed for it
+        assert_eq!(
+            on_dispute(&db, &old.id, "dp_1", ReverseKind::DisputeLost, late + DAY)
+                .await
+                .unwrap(),
+            ReverseOutcome::NoOp
+        );
+        assert_eq!(order(&db, &old.id).await.state, OrderState::Refunded);
+        assert_eq!(clawed(&db, &old.id).await, None);
+        assert_eq!(wallet(&db, "u1").await, 49_500);
+
+        // The redelivered refund claws the current incarnation, under its key
+        assert_eq!(
+            refund_with(&db, &new.id, full_refund(late), late + 2 * DAY).await,
+            ReverseOutcome::Applied
+        );
+        assert_eq!(
+            clawed(&db, &new.id).await,
+            Some((33_000, Some(33_000), Some(0)))
+        );
+        assert_eq!(wallet(&db, "u1").await, 16_500);
         drop_db(&db).await;
     }
 }

@@ -4,6 +4,7 @@ pub use rocket::http::Status;
 pub use rocket::response::Redirect;
 use rocket::{Build, Rocket};
 
+mod admin;
 mod bots;
 mod channels;
 mod discover;
@@ -68,6 +69,7 @@ pub fn mount(config: Settings, mut rocket: Rocket<Build>) -> Rocket<Build> {
             "/referrals" => referrals::routes(),
             "/kofi" => kofi::routes(),
             "/payments" => payments::routes(),
+            "/admin" => admin::routes(),
             "/sync" => sync::routes(),
             "/webhooks" => webhooks::routes()
         };
@@ -102,6 +104,7 @@ pub fn mount(config: Settings, mut rocket: Rocket<Build>) -> Rocket<Build> {
             "/referrals" => referrals::routes(),
             "/kofi" => kofi::routes(),
             "/payments" => payments::routes(),
+            "/admin" => admin::routes(),
             "/sync" => sync::routes()
         };
     }

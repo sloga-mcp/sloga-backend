@@ -808,6 +808,12 @@ pub enum EventV1 {
     E2EEDeviceCreate {
         user_id: String,
         device_id: String,
+        /// The device this one was split from (multi-device D5): an install
+        /// that shared `split_from` with another install became a separate
+        /// device. The other install re-claims `split_from` on seeing it.
+        /// Absent on an ordinary new device
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        split_from: Option<String>,
     },
 
     /// A user's E2EE device was revoked
@@ -864,6 +870,12 @@ pub enum EventV1 {
     E2EEClaimResult {
         device_id: String,
         accepted: bool,
+        /// Why a claim was refused (multi-device D4, D8): `held_elsewhere`
+        /// (another session holds the device's live claim) or `removed`
+        /// (the device was removed from the account). Absent otherwise;
+        /// older clients ignore it
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
     },
 
     /// A poll's aggregate counts changed (vote cast, replaced or retracted).
@@ -1035,6 +1047,15 @@ pub enum EventV1 {
     DiscordImportFailed {
         job_id: String,
         error: String,
+    },
+
+    /// The session user's Prot wallet balance changed. Published ONLY on the
+    /// user's private topic; never on the User object other people see.
+    ProtBalanceUpdate {
+        balance: i64,
+        /// The wallet account's `version` as read after the posting (section 4.2 step 4);
+        /// clients drop an update whose version is <= the newest they hold
+        version: u64,
     },
 }
 
@@ -1225,5 +1246,133 @@ mod tests {
     #[test]
     fn session_topic_prefixes_the_session_id() {
         assert_eq!(session_topic("abc"), "session:abc");
+    }
+
+    /// Multi-device D4: a claim result carries `reason` only when set. An
+    /// accepted (or old-style refused) result keeps its earlier wire shape,
+    /// and a result relayed without the key still deserializes
+    #[test]
+    fn the_claim_result_carries_reason_only_when_set() {
+        let plain = EventV1::E2EEClaimResult {
+            device_id: "a".repeat(32),
+            accepted: true,
+            reason: None,
+        };
+        let wire = serde_json::to_value(&plain).expect("serializes");
+        assert!(wire.get("reason").is_none(), "an unset reason is absent: {wire}");
+        assert_eq!(
+            wire,
+            serde_json::json!({
+                "type": "E2EEClaimResult",
+                "device_id": "a".repeat(32),
+                "accepted": true,
+            })
+        );
+
+        let refused = EventV1::E2EEClaimResult {
+            device_id: "a".repeat(32),
+            accepted: false,
+            reason: Some("held_elsewhere".to_string()),
+        };
+        let wire = serde_json::to_value(&refused).expect("serializes");
+        assert_eq!(
+            wire.get("reason").and_then(|value| value.as_str()),
+            Some("held_elsewhere"),
+            "{wire}"
+        );
+
+        for (value, expected) in [
+            (wire, Some("held_elsewhere")),
+            (
+                serde_json::json!({ "type": "E2EEClaimResult", "device_id": "d", "accepted": false }),
+                None,
+            ),
+        ] {
+            match serde_json::from_value::<EventV1>(value).expect("deserializes") {
+                EventV1::E2EEClaimResult { reason, .. } => {
+                    assert_eq!(reason.as_deref(), expected)
+                }
+                other => panic!("round-tripped to another event: {other:?}"),
+            }
+        }
+    }
+
+    /// Multi-device D5 (audit M3): a device-create event carries
+    /// `split_from` only for a split, so an ordinary new device keeps its
+    /// earlier wire shape, and an event without the key still deserializes
+    #[test]
+    fn the_device_create_event_carries_split_from_only_when_set() {
+        let added = EventV1::E2EEDeviceCreate {
+            user_id: "U".to_string(),
+            device_id: "b".repeat(32),
+            split_from: None,
+        };
+        let wire = serde_json::to_value(&added).expect("serializes");
+        assert_eq!(
+            wire,
+            serde_json::json!({
+                "type": "E2EEDeviceCreate",
+                "user_id": "U",
+                "device_id": "b".repeat(32),
+            })
+        );
+
+        let split = EventV1::E2EEDeviceCreate {
+            user_id: "U".to_string(),
+            device_id: "b".repeat(32),
+            split_from: Some("a".repeat(32)),
+        };
+        let wire = serde_json::to_value(&split).expect("serializes");
+        assert_eq!(
+            wire.get("split_from").and_then(|value| value.as_str()),
+            Some("a".repeat(32).as_str()),
+            "{wire}"
+        );
+
+        for (value, expected) in [
+            (wire, Some("a".repeat(32))),
+            (
+                serde_json::json!({ "type": "E2EEDeviceCreate", "user_id": "U", "device_id": "d" }),
+                None,
+            ),
+        ] {
+            match serde_json::from_value::<EventV1>(value).expect("deserializes") {
+                EventV1::E2EEDeviceCreate { split_from, .. } => {
+                    assert_eq!(split_from, expected)
+                }
+                other => panic!("round-tripped to another event: {other:?}"),
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod prot_tests {
+    use super::EventV1;
+
+    /// The client reads exactly `{ type, balance, version }` (stoat.js
+    /// `events/v1.ts`). A rename, or a variant moved under another tag,
+    /// still compiles here and silently stops the wallet updating.
+    #[test]
+    fn the_prot_balance_update_wire_shape_is_type_balance_version() {
+        let event = EventV1::ProtBalanceUpdate {
+            balance: -250,
+            version: 7,
+        };
+        assert_eq!(
+            serde_json::to_value(&event).expect("serializes"),
+            serde_json::json!({ "type": "ProtBalanceUpdate", "balance": -250, "version": 7 })
+        );
+
+        match serde_json::from_str::<EventV1>(
+            r#"{"type":"ProtBalanceUpdate","balance":1200,"version":3}"#,
+        )
+        .expect("deserializes")
+        {
+            EventV1::ProtBalanceUpdate { balance, version } => {
+                assert_eq!((balance, version), (1200, 3))
+            }
+            other => panic!("deserialized to another event: {other:?}"),
+        }
     }
 }

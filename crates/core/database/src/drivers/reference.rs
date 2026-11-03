@@ -7,6 +7,7 @@ use crate::{
     ChannelFollow, ChannelSeat, ChannelUnread,
     AuditLogEntry, DiscordImportJob, Donation, DonationClaimCode,
     E2EEBackup, E2EEBlob, E2EEEnvelope, E2EEIdentity, E2EEOneTimeKey, Emoji, EventRsvp,
+    E2EERemovedDevice,
     EventRsvpKey, File, FileHash, Interaction, Invite, Member, MemberCompositeKey, Message,
     MlsCommit, MlsGroup, MlsJoinIntent, MlsKeyPackage, PolicyChange, Poll, PollVote,
     RatelimitEvent, Referral, ReferralCode, ReminderSent, RemoteControlAuditEntry,
@@ -17,7 +18,9 @@ use crate::{
     ThreadMemberCompositeKey, UploadSession, User, UserSettings, Webhook, Account, AccountInvite, Session,
     MFATicket
 };
-use crate::{CipherMembership, CipherNumber, PaymentEvent, PaymentOrder};
+use crate::{
+    CipherMembership, CipherNumber, PaymentEvent, PaymentOrder, ProtAccount, ProtLedgerEntry,
+};
 
 database_derived!(
     /// Reference implementation
@@ -78,6 +81,7 @@ database_derived!(
         pub e2ee_queue: Arc<Mutex<HashMap<String, E2EEEnvelope>>>,
         pub e2ee_blobs: Arc<Mutex<HashMap<String, E2EEBlob>>>,
         pub e2ee_backups: Arc<Mutex<HashMap<String, E2EEBackup>>>,
+        pub e2ee_removed_devices: Arc<Mutex<HashMap<String, E2EERemovedDevice>>>,
         pub mls_key_packages: Arc<Mutex<HashMap<String, MlsKeyPackage>>>,
         pub mls_groups: Arc<Mutex<HashMap<String, MlsGroup>>>,
         pub mls_commits: Arc<Mutex<HashMap<String, MlsCommit>>>,
@@ -86,5 +90,9 @@ database_derived!(
         pub payment_orders: Arc<Mutex<HashMap<String, PaymentOrder>>>,
         pub cipher_numbers: Arc<Mutex<HashMap<u32, CipherNumber>>>,
         pub cipher_memberships: Arc<Mutex<HashMap<String, CipherMembership>>>,
+        /// Keyed by the ledger row's `key` (the idempotency key), NOT `_id`
+        pub prot_ledger: Arc<Mutex<HashMap<String, ProtLedgerEntry>>>,
+        /// Keyed by account id (`user:{id}`; S5b adds `tank:`/`hold:`)
+        pub prot_accounts: Arc<Mutex<HashMap<String, ProtAccount>>>,
     }
 );

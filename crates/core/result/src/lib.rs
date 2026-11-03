@@ -366,6 +366,12 @@ pub enum ErrorType {
         max: usize,
     },
 
+    // ? E2EE device errors
+    /// The E2EE device id was removed from the account (`DELETE
+    /// /e2ee/keys/{device}`) and can never be published again; the install
+    /// sets up a new device instead (multi-device plan D8)
+    E2EEDeviceRemoved,
+
     // ? Payment and Cipher errors
     /// Payments are switched off in the config (`[features.payments]`)
     PaymentsDisabled,
@@ -416,6 +422,41 @@ pub enum ErrorType {
     SeatListNamesRemovedUsers {
         users: Vec<String>,
     },
+    // ? Prot errors
+    /// The Prot account holds less than the debit needs
+    InsufficientProt {
+        needed: i64,
+        available: i64,
+    },
+    /// Prot is switched off in the config
+    ProtDisabled,
+    /// Prot sales are not open (`prot_sales_open`)
+    ProtSalesClosed,
+    /// The requested Prot pack is not valid (unknown pack, exact amount out
+    /// of range, or both or neither of pack and exact amount given)
+    ProtPackInvalid,
+    /// The purchase would take the wallet over its cap
+    ProtWalletCap {
+        max: i64,
+    },
+    /// Prot bought within the hold period (`contribute_hold_hours`) cannot
+    /// go into a tank or a pledge yet
+    ProtHeldPurchase,
+    /// The tank is frozen
+    ProtTankFrozen,
+    /// The goal no longer takes pledges
+    ProtGoalClosed,
+    /// The caller cannot do this with Prot right now (for example a checkout
+    /// while a payment dispute is open)
+    ProtNotEligible,
+    /// The requested tier is below the seats already in use
+    ProtTierBelowSeats,
+    /// The idempotency key was used before with a different payload
+    ProtIdempotencyConflict,
+    /// The Prot ledger needs MongoDB running as a replica set (transactions)
+    ProtReplicaSetRequired,
+    /// Prot is not sold in the caller's country
+    ProtRegionUnavailable,
 }
 
 #[macro_export]
@@ -531,6 +572,15 @@ mod tests {
         );
     }
 
+    /// The type the client keys its "set this device up again" prompt on
+    /// (multi-device D8)
+    #[cfg(feature = "serde")]
+    #[test]
+    fn device_removed_error_serializes_by_name() {
+        let value = serde_json::to_value(create_error!(E2EEDeviceRemoved)).unwrap();
+        assert_eq!(value, serde_json::json!({ "type": "E2EEDeviceRemoved" }));
+    }
+
     #[cfg(feature = "serde")]
     #[test]
     fn sec009_serialized_error_with_fields_has_no_location() {
@@ -621,5 +671,31 @@ mod tests {
             ),
             other => panic!("unexpected error type {other:?}"),
         }
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn prot_errors_serialize_by_name_with_fields() {
+        let error = create_error!(InsufficientProt {
+            needed: 500,
+            available: 120,
+        });
+        let value = serde_json::to_value(&error).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({ "type": "InsufficientProt", "needed": 500, "available": 120 })
+        );
+
+        let value = serde_json::to_value(create_error!(ProtWalletCap { max: 100_000 })).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({ "type": "ProtWalletCap", "max": 100_000 })
+        );
+
+        let value = serde_json::to_value(create_error!(ProtRegionUnavailable)).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({ "type": "ProtRegionUnavailable" })
+        );
     }
 }

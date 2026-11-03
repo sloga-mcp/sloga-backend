@@ -127,6 +127,7 @@ pub mod util;
 pub use models::*;
 
 pub mod events;
+pub mod e2ee_claim_lock;
 #[cfg(feature = "tasks")]
 pub mod tasks;
 

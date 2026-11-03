@@ -28,6 +28,31 @@ auto_derived!(
             /// Tier being bought
             to: CipherTier,
         },
+        /// A Prot pack. `prot` and `cents` are stamped by the server from
+        /// `[features.payments] prot_packs` at checkout, so a later config
+        /// change never alters what this order credits.
+        ProtPack {
+            /// Pack id from the config (`p5`, `p10`, `p25`, `p50`, `p100`)
+            pack: String,
+            /// Prot credited (bonus included)
+            prot: i64,
+            /// Price in US cents
+            cents: i64,
+        },
+        /// Pay-exact Prot: `prot` Prot for `prot` cents
+        ProtExact {
+            /// Prot credited, which is also the price in US cents
+            prot: i64,
+        },
+    }
+
+    /// Product family of a SKU; checkout, fulfilment and reversal branch on it
+    #[derive(Copy)]
+    pub enum ProductFamily {
+        /// `CipherNew` and `CipherUpgrade`
+        Cipher,
+        /// `ProtPack` and `ProtExact`
+        Prot,
     }
 
     /// Public Cipher badge on a user
@@ -114,6 +139,15 @@ auto_derived!(
     }
 );
 
+impl Sku {
+    pub fn family(&self) -> ProductFamily {
+        match self {
+            Sku::CipherNew { .. } | Sku::CipherUpgrade { .. } => ProductFamily::Cipher,
+            Sku::ProtPack { .. } | Sku::ProtExact { .. } => ProductFamily::Prot,
+        }
+    }
+}
+
 #[cfg(all(test, feature = "serde"))]
 mod tests {
     use super::*;
@@ -173,5 +207,62 @@ mod tests {
             pending: None,
         };
         assert_eq!(serde_json::to_string(&me).unwrap(), "{}");
+    }
+
+    #[test]
+    fn prot_skus_are_tagged_by_type() {
+        let pack = Sku::ProtPack {
+            pack: "p25".to_string(),
+            prot: 2600,
+            cents: 2500,
+        };
+        assert_eq!(
+            serde_json::to_string(&pack).unwrap(),
+            r#"{"type":"ProtPack","pack":"p25","prot":2600,"cents":2500}"#
+        );
+        let exact = Sku::ProtExact { prot: 1234 };
+        assert_eq!(
+            serde_json::to_string(&exact).unwrap(),
+            r#"{"type":"ProtExact","prot":1234}"#
+        );
+
+        let read: Sku =
+            serde_json::from_str(r#"{"type":"ProtPack","pack":"p25","prot":2600,"cents":2500}"#)
+                .unwrap();
+        assert_eq!(read, pack);
+        let read: Sku = serde_json::from_str(r#"{"type":"ProtExact","prot":1234}"#).unwrap();
+        assert_eq!(read, exact);
+
+        // A pack without its stamped amounts is not a pack
+        assert!(serde_json::from_str::<Sku>(r#"{"type":"ProtPack","pack":"p25"}"#).is_err());
+    }
+
+    #[test]
+    fn every_sku_names_its_family() {
+        assert_eq!(
+            Sku::CipherNew {
+                tier: CipherTier::T99
+            }
+            .family(),
+            ProductFamily::Cipher
+        );
+        assert_eq!(
+            Sku::CipherUpgrade {
+                from: CipherTier::T99,
+                to: CipherTier::T149,
+            }
+            .family(),
+            ProductFamily::Cipher
+        );
+        assert_eq!(
+            Sku::ProtPack {
+                pack: "p5".to_string(),
+                prot: 500,
+                cents: 500,
+            }
+            .family(),
+            ProductFamily::Prot
+        );
+        assert_eq!(Sku::ProtExact { prot: 50 }.family(), ProductFamily::Prot);
     }
 }

@@ -173,6 +173,7 @@ impl<'r> Responder<'r, 'static> for Error {
             ErrorType::IncorrectData { .. } => Status::BadRequest,
             ErrorType::MlsCallFull { .. } => Status::Conflict,
             ErrorType::VideoCallFull { .. } => Status::Conflict,
+            ErrorType::E2EEDeviceRemoved => Status::Forbidden,
 
             ErrorType::PaymentsDisabled => Status::BadRequest,
             ErrorType::CipherSalesClosed => Status::Forbidden,
@@ -189,6 +190,19 @@ impl<'r> Responder<'r, 'static> for Error {
             ErrorType::ChannelProtected => Status::BadRequest,
             ErrorType::ProtectedFieldRefused { .. } => Status::BadRequest,
             ErrorType::SeatListNamesRemovedUsers { .. } => Status::BadRequest,
+            ErrorType::InsufficientProt { .. } => Status::Conflict,
+            ErrorType::ProtDisabled => Status::BadRequest,
+            ErrorType::ProtSalesClosed => Status::Forbidden,
+            ErrorType::ProtPackInvalid => Status::BadRequest,
+            ErrorType::ProtWalletCap { .. } => Status::Conflict,
+            ErrorType::ProtHeldPurchase => Status::Forbidden,
+            ErrorType::ProtTankFrozen => Status::Forbidden,
+            ErrorType::ProtGoalClosed => Status::Conflict,
+            ErrorType::ProtNotEligible => Status::Forbidden,
+            ErrorType::ProtTierBelowSeats => Status::Conflict,
+            ErrorType::ProtIdempotencyConflict => Status::Conflict,
+            ErrorType::ProtReplicaSetRequired => Status::ServiceUnavailable,
+            ErrorType::ProtRegionUnavailable => Status::BadRequest,
         };
 
         // The body no longer carries the location, so log it for server
@@ -263,6 +277,18 @@ mod tests {
         }
     }
 
+    /// A removed E2EE device is a 403 refusal of an authenticated caller,
+    /// not a 401; `axum.rs` pins the same answer
+    #[test]
+    fn e2ee_device_removed_is_forbidden() {
+        let client = Client::untracked(rocket::build()).unwrap();
+        let request = client.get("/");
+        let response = create_error!(E2EEDeviceRemoved)
+            .respond_to(request.inner())
+            .unwrap();
+        assert_eq!(response.status(), Status::Forbidden);
+    }
+
     #[rocket::async_test]
     async fn device_cap_reached_is_bad_request_with_max_in_body() {
         let client = AsyncClient::untracked(rocket::build())
@@ -318,5 +344,40 @@ mod tests {
                 "users": ["01HZXBBBBBBBBBBBBBBBBBBBBB"],
             })
         );
+    }
+
+    /// Pins the Prot errors' statuses; `axum.rs` pins the same table
+    #[test]
+    fn prot_error_statuses() {
+        let client = Client::untracked(rocket::build()).unwrap();
+        let request = client.get("/");
+
+        let cases: [(Error, u16); 13] = [
+            (
+                create_error!(InsufficientProt {
+                    needed: 500,
+                    available: 120,
+                }),
+                409,
+            ),
+            (create_error!(ProtDisabled), 400),
+            (create_error!(ProtSalesClosed), 403),
+            (create_error!(ProtPackInvalid), 400),
+            (create_error!(ProtWalletCap { max: 100_000 }), 409),
+            (create_error!(ProtHeldPurchase), 403),
+            (create_error!(ProtTankFrozen), 403),
+            (create_error!(ProtGoalClosed), 409),
+            (create_error!(ProtNotEligible), 403),
+            (create_error!(ProtTierBelowSeats), 409),
+            (create_error!(ProtIdempotencyConflict), 409),
+            (create_error!(ProtReplicaSetRequired), 503),
+            (create_error!(ProtRegionUnavailable), 400),
+        ];
+
+        for (error, code) in cases {
+            let name = format!("{:?}", error.error_type);
+            let response = error.respond_to(request.inner()).unwrap();
+            assert_eq!(response.status().code, code, "{name}");
+        }
     }
 }
