@@ -440,6 +440,13 @@ screen_leg = false
 # delta refuses new idle claims (PUT /channels/{id}/afk_idle answers
 # InvalidOperation) and the crond sweep moves nobody.
 afk_auto_move = true
+# Encrypted calls on iOS (ios-call-e2ee phase 2, D14), advertised to clients
+# as features.ios_call_e2ee on GET /. ON by default (the field's serde default
+# is true as well, so a config without this line also reads ON). This is the
+# kill switch for a bad iOS build: set it false in Revolt.overrides.toml under
+# an explicit [features] header, or REVOLT__FEATURES__IOS_CALL_E2EE=false, and
+# RESTART delta. Global for iOS; never per user or per channel.
+ios_call_e2ee = true
 
 # --- Server boosts (Discord-style) ---
 # The feature ships DARK: all keys below default in code to the values shown,

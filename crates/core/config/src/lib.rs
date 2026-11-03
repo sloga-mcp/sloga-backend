@@ -1896,6 +1896,12 @@ impl ProtectedChannelFeatures {
     }
 }
 
+/// Serde default for `Features::ios_call_e2ee` and its advert on `GET /`: a
+/// missing value reads ON
+pub fn default_ios_call_e2ee() -> bool {
+    true
+}
+
 #[derive(Deserialize, Debug, Clone)]
 pub struct Features {
     pub limits: FeaturesLimitsCollection,
@@ -1954,6 +1960,18 @@ pub struct Features {
     /// back on.
     #[serde(default)]
     pub afk_auto_move: bool,
+
+    /// Kill switch for encrypted calls on iOS (ios-call-e2ee phase 2, D14),
+    /// advertised on `GET /` as `features.ios_call_e2ee`. ON by default, and
+    /// the default holds twice: the embedded `Revolt.toml` sets it, and the
+    /// serde default is `true`, so a config that never mentions the key
+    /// still reads ON (an unreadable switch must never turn encryption off).
+    /// Global for iOS, never per user or per channel. Turn it off with
+    /// `REVOLT__FEATURES__IOS_CALL_E2EE=false` (double underscores) or under
+    /// `[features]` in `Revolt.overrides.toml`, then RESTART delta: config
+    /// sources are frozen into the process at first access.
+    #[serde(default = "default_ios_call_e2ee")]
+    pub ios_call_e2ee: bool,
 
     /// Optional server id that every newly-onboarded user is automatically
     /// added to (a "Welcome" / landing-spot server). Empty/unset disables the
@@ -2412,6 +2430,98 @@ mod afk_auto_move_tests {
             .expect("the config deserializes");
 
         assert!(!settings.features.afk_auto_move);
+    }
+}
+
+// The iOS call switch (D14). Built from in-process sources only, the way
+// CONFIG_BUILDER layers them, so no local override file or environment
+// variable can skew the result.
+#[cfg(test)]
+mod ios_call_e2ee_tests {
+    use config::{Config, ConfigBuilder, Environment, File, FileFormat};
+
+    use super::Settings;
+
+    fn embedded() -> File<config::FileSourceString, FileFormat> {
+        File::from_str(include_str!("../Revolt.toml"), FileFormat::Toml)
+    }
+
+    fn settings(builder: ConfigBuilder<config::builder::DefaultState>) -> Settings {
+        builder
+            .build()
+            .expect("the config builds")
+            .try_deserialize()
+            .expect("the config deserializes")
+    }
+
+    fn with_env(name: &str, value: &str) -> Settings {
+        settings(
+            Config::builder().add_source(embedded()).add_source(
+                Environment::with_prefix("REVOLT")
+                    .separator("__")
+                    .source(Some([(name.to_string(), value.to_string())].into())),
+            ),
+        )
+    }
+
+    #[test]
+    fn the_embedded_default_is_on() {
+        assert!(
+            settings(Config::builder().add_source(embedded()))
+                .features
+                .ios_call_e2ee
+        );
+    }
+
+    /// A config that never mentions the key reads ON (the serde default),
+    /// so losing the line can never turn encryption off
+    #[test]
+    fn a_missing_key_reads_on() {
+        let stripped = include_str!("../Revolt.toml")
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("ios_call_e2ee"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let config = Config::builder()
+            .add_source(File::from_str(&stripped, FileFormat::Toml))
+            .build()
+            .expect("the stripped config builds");
+
+        // The key must really be gone, or this test proves nothing
+        assert!(config.get_bool("features.ios_call_e2ee").is_err());
+
+        let settings: Settings = config
+            .try_deserialize()
+            .expect("a config without ios_call_e2ee deserializes");
+        assert!(settings.features.ios_call_e2ee);
+    }
+
+    #[test]
+    fn the_overrides_file_turns_it_off() {
+        let settings = settings(Config::builder().add_source(embedded()).add_source(
+            File::from_str("[features]\nios_call_e2ee = false\n", FileFormat::Toml),
+        ));
+        assert!(!settings.features.ios_call_e2ee);
+    }
+
+    #[test]
+    fn the_environment_override_turns_it_off() {
+        assert!(
+            !with_env("REVOLT__FEATURES__IOS_CALL_E2EE", "false")
+                .features
+                .ios_call_e2ee
+        );
+    }
+
+    /// The single-underscore form is dropped without a warning, so it
+    /// leaves the switch ON
+    #[test]
+    fn a_single_underscore_prefix_is_ignored() {
+        assert!(
+            with_env("REVOLT_FEATURES__IOS_CALL_E2EE", "false")
+                .features
+                .ios_call_e2ee
+        );
     }
 }
 

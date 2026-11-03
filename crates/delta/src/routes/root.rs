@@ -262,6 +262,10 @@ pub struct RevoltFeatures {
     pub import_sources: ImportSourcesFeature,
     /// Whether remote desktop control during screen share is enabled
     pub remote_control: bool,
+    /// Whether encrypted calls are allowed on iOS (kill switch). Always
+    /// sent; a reader that finds it missing must treat it as true
+    #[serde(default = "revolt_config::default_ios_call_e2ee")]
+    pub ios_call_e2ee: bool,
     /// Whether this server is invite only
     pub invite_only: bool,
     /// File server service configuration
@@ -415,8 +419,12 @@ pub struct RevoltConfig {
 #[openapi(tag = "Core")]
 #[get("/")]
 pub async fn root() -> Result<Json<RevoltConfig>> {
-    let config = config().await;
+    Ok(Json(root_config(config().await)))
+}
 
+/// The body of `GET /` for a config. Kept apart from the route so tests can
+/// check the wire shape without a database
+pub fn root_config(config: Settings) -> RevoltConfig {
     // Same overlay as `User::limits()`, so the advertised perk limits always
     // match the enforced ones.
     let perk = config.features.limits.perk.as_ref().map(|p| {
@@ -431,7 +439,7 @@ pub async fn root() -> Result<Json<RevoltConfig>> {
     // Built before the literal below, which moves fields out of `config`
     let prot = prot_feature(&config);
 
-    Ok(Json(RevoltConfig {
+    RevoltConfig {
         revolt: env!("CARGO_PKG_VERSION").to_string(),
         features: RevoltFeatures {
             captcha: CaptchaFeature {
@@ -459,6 +467,7 @@ pub async fn root() -> Result<Json<RevoltConfig>> {
             // surfaced in RevoltFeatures at all, so this is net-new
             // plumbing, not a mirror of an existing pattern.
             remote_control: config.features.remote_control,
+            ios_call_e2ee: config.features.ios_call_e2ee,
             invite_only: config.api.registration.invite_only,
             autumn: Feature {
                 enabled: !config.hosts.autumn.is_empty(),
@@ -548,7 +557,7 @@ pub async fn root() -> Result<Json<RevoltConfig>> {
                 .unwrap_or_else(|| "<failed to generate>")
                 .to_string(),
         },
-    }))
+    }
 }
 
 #[cfg(test)]
@@ -1036,5 +1045,37 @@ mod test {
             body["features"]["boosts"]["purchases_enabled"],
             config.features.boosts.purchases_enabled
         );
+    }
+
+    fn ios_call_e2ee_json(config: revolt_config::Settings) -> serde_json::Value {
+        serde_json::to_value(super::root_config(config)).unwrap()["features"]["ios_call_e2ee"]
+            .clone()
+    }
+
+    /// The iOS call switch (D14) is always on the wire as a bool under
+    /// `features.ios_call_e2ee`, carries the configured value, and the
+    /// node's own config leaves it ON
+    #[test]
+    fn root_advertises_ios_call_e2ee() {
+        let config = crate::util::test::rt().block_on(revolt_config::config());
+        assert!(config.features.ios_call_e2ee, "the node's default is ON");
+        assert_eq!(ios_call_e2ee_json(config.clone()), serde_json::json!(true));
+
+        let mut off = config;
+        off.features.ios_call_e2ee = false;
+        assert_eq!(ios_call_e2ee_json(off), serde_json::json!(false));
+    }
+
+    /// The published schema tells a generated client that a missing value
+    /// means ON
+    #[test]
+    fn schema_reads_a_missing_ios_call_e2ee_as_on() {
+        let schema = serde_json::to_value(schemars::schema_for!(super::RevoltFeatures)).unwrap();
+        let field = &schema["properties"]["ios_call_e2ee"];
+        assert_eq!(field["type"], "boolean");
+        assert_eq!(field["default"], true);
+        let required = schema["required"].as_array().expect("required list");
+        assert!(required.contains(&serde_json::json!("remote_control")));
+        assert!(!required.contains(&serde_json::json!("ios_call_e2ee")));
     }
 }
