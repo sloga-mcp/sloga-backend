@@ -2234,6 +2234,12 @@ impl ProtTxnBody for BeginSettlementBody {
             v0::ProtTankStage::Settling => return Ok(Some(tank)),
             v0::ProtTankStage::Deleted | v0::ProtTankStage::Terminated => return Ok(None),
         };
+        // Expiry only from Frozen, read in this transaction: a top-up that
+        // reactivated the tank since the clock's read never lets an expiry
+        // delete an Active or Grace channel (contracts 26, W5 (ii))
+        if self.cause == ProtSettleCause::Expiry && tank.stage != v0::ProtTankStage::Frozen {
+            return Ok(None);
+        }
 
         let mut after = tank.clone();
         after.stage = v0::ProtTankStage::Settling;

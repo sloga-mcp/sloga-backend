@@ -19,9 +19,13 @@ revolt-database = { workspace = true }
 revolt-models = { workspace = true }
 revolt-config = { workspace = true }
 revolt-result = { workspace = true }
+revolt-permissions = { workspace = true }
 
 # Async Language Features
 async-trait = { workspace = true }
+
+# Async runtime (the tank-update coalescer's trailing publish)
+tokio = { workspace = true, features = ["rt", "time"] }
 
 # Web Requests
 reqwest = { workspace = true, features = ["json", "form"] }

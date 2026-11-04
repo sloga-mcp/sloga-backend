@@ -46,6 +46,10 @@ const TICKET_ROUTES: &[(&str, &str)] = &[
     ),
     ("admin/prot_adjust.rs", "foreign_ticket_admin_prot_adjust"),
     ("admin/prot_orders.rs", "foreign_ticket_admin_prot_orders"),
+    (
+        "admin/prot_terminate.rs",
+        "foreign_ticket_admin_prot_terminate",
+    ),
     ("e2ee/delete_backup.rs", "foreign_ticket_delete_backup"),
     ("e2ee/get_backup.rs", "foreign_ticket_get_backup"),
     ("e2ee/publish_keys.rs", "foreign_ticket_publish_keys"),
@@ -877,6 +881,45 @@ async fn foreign_ticket_admin_prot_orders_case() {
     assert_eq!(status, Status::Forbidden, "admin_prot_orders");
     pair.assert_unchanged("admin_prot_orders", &before).await;
     pair.assert_ticket_kept("admin_prot_orders").await;
+}
+
+#[test]
+fn foreign_ticket_admin_prot_terminate() {
+    rt().block_on(foreign_ticket_admin_prot_terminate_case())
+}
+
+/// POST /admin/prot/tanks/:id/terminate would end a channel's tank and
+/// forfeit its Prot as the victim. With the binding gone the handler
+/// answers 404 for this unknown id; the guard must refuse first.
+async fn foreign_ticket_admin_prot_terminate_case() {
+    let mut pair = pair().await;
+    pair.victim_user
+        .update(
+            &pair.harness.db,
+            PartialUser {
+                privileged: Some(true),
+                ..Default::default()
+            },
+            vec![],
+        )
+        .await
+        .expect("promote the victim");
+    let before = victim_state(&pair).await;
+
+    let status = pair
+        .forged(
+            pair.harness
+                .client
+                .post(format!("/admin/prot/tanks/{}/terminate", ulid::Ulid::new()))
+                .header(Header::new("X-Audit-Log-Reason", "abuse")),
+        )
+        .dispatch()
+        .await
+        .status();
+
+    assert_eq!(status, Status::Forbidden, "admin_prot_terminate");
+    pair.assert_unchanged("admin_prot_terminate", &before).await;
+    pair.assert_ticket_kept("admin_prot_terminate").await;
 }
 
 // ------------------------------------------------------------------------

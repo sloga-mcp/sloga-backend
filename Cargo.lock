@@ -7373,6 +7373,7 @@ dependencies = [
  "revolt-config",
  "revolt-database",
  "revolt-models",
+ "revolt-permissions",
  "revolt-result",
  "serde",
  "serde_json",

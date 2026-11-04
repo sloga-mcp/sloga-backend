@@ -69,6 +69,11 @@ pub async fn protect_channel(
     let outcome = db
         .protect_channel(channel.id(), &validated.submission, Timestamp::now_utc())
         .await?;
+    // Prot (S5b 6.7, BR2): a crowdfunded channel's Launching tank captures
+    // its pledges once the protect has committed, a retry (`unchanged`)
+    // included. It never fails the protect, which has landed: an error is
+    // logged and the goals sweep captures later.
+    revolt_payments::engine::tank::on_protect_landed(db, channel.id()).await;
     if !outcome.unchanged {
         log::info!(
             "AUDIT channel_protect: actor={} channel={} server={} seats={}",
@@ -929,5 +934,197 @@ mod test {
             );
         }
         println!("protect vs kick: {}/{} protects landed", landed, ROUNDS);
+    }
+
+    /// The pledge that funds [`crowdfunded_setup`]'s launch goal
+    const PLEDGED: i64 = 1_200;
+
+    /// [`setup`] without its admin grant: instead the owner funds a launch
+    /// goal of the server alone and launches it onto the channel (S5b 8.6),
+    /// so the channel holds a Crowdfund entitlement and a Launching tank and
+    /// the pledge is still Held. The goal's id and the pledge's id.
+    async fn crowdfunded_setup() -> (Setup, String, String) {
+        use revolt_config::ProtectionFeatures;
+        use revolt_database::{
+            prot_key_admin, prot_user_account, ProtAmount, ProtGoal, ProtLaunchInput,
+            ProtPledgeInput, ProtPosting, ProtRef, ProtTankRules, PROT_SYS_ADJUST,
+        };
+
+        let harness = TestHarness::new().await;
+        let (_, owner_session, owner) = harness.new_user().await;
+        let (_, member_session, member) = harness.new_user().await;
+        let (server, channel) = harness.new_protectable_channel(&owner).await;
+        harness.join_server(&server, &member).await;
+        let owner_device = harness
+            .new_e2ee_device(&owner, &owner_session.id, OWNER_DEVICE_SEED)
+            .await;
+
+        let db = &harness.db;
+        let rules = ProtTankRules::from_config(&ProtectionFeatures::default())
+            .expect("the default Prot config is valid");
+        let now = revolt_database::now_ms();
+        let goal = db
+            .create_prot_goal(&ProtGoal {
+                id: Ulid::new().to_string(),
+                kind: v0::ProtGoalKind::Launch,
+                server_id: server.id.clone(),
+                channel_id: None,
+                tank_id: None,
+                created_by: owner.id.clone(),
+                create_nonce: Ulid::new().to_string(),
+                slots: FIXTURE_SLOT_CAP,
+                days: Some(30),
+                daily_cost: rules.daily_cost(FIXTURE_SLOT_CAP).expect("a slot tier"),
+                base_daily_cost: None,
+                target_prot: PLEDGED,
+                pledged_total: 0,
+                state: v0::ProtGoalState::Funding,
+                deadline_at: now + 30 * 86_400_000,
+                funded_at: None,
+                launch_deadline_at: None,
+                launched_at: None,
+                closed_at: None,
+                refund7_done: false,
+                open_key: Some(format!("launch:{}", server.id)),
+                version: 0,
+                created_at: now,
+                updated_at: now,
+            })
+            .await
+            .expect("a launch goal");
+
+        // An admin credit, not a purchase, so none of it is held back (D17)
+        db.apply_prot_posting(&ProtPosting {
+            key: prot_key_admin("01ADMIN0000000000000000000", &Ulid::new().to_string()),
+            kind: v0::ProtEntryKind::AdminAdjust,
+            debit: PROT_SYS_ADJUST.to_string(),
+            credit: prot_user_account(&owner.id),
+            amount: ProtAmount::Exact(PLEDGED),
+            debit_floor: 0,
+            actor: "01ADMIN0000000000000000000".to_string(),
+            reference: ProtRef::default(),
+            reason: Some("protect hook test".to_string()),
+            created_at: now,
+        })
+        .await
+        .expect("the owner's Prot");
+        let pledged = db
+            .pledge_prot(&ProtPledgeInput {
+                user_id: owner.id.clone(),
+                goal_id: goal.id.clone(),
+                amount: PLEDGED,
+                nonce: Ulid::new().to_string(),
+                rules: rules.clone(),
+                now,
+            })
+            .await
+            .expect("the owner funds the goal");
+        assert!(pledged.funded_now);
+
+        let (launched, tank) = db
+            .launch_prot_goal(&ProtLaunchInput {
+                goal_id: goal.id.clone(),
+                channel_id: channel.id().to_string(),
+                owner_id: owner.id.clone(),
+                rules,
+                now,
+            })
+            .await
+            .expect("the goal launches onto the channel");
+        assert_eq!(launched.state, v0::ProtGoalState::Launching);
+        assert_eq!(tank.stage, v0::ProtTankStage::Launching);
+
+        let setup = Setup {
+            harness,
+            owner,
+            owner_session,
+            owner_device,
+            member,
+            member_session,
+            server_id: server.id,
+            channel,
+        };
+        (setup, goal.id, pledged.pledge.id)
+    }
+
+    /// Whether the launch has been captured: the goal Launched, the tank
+    /// Active and the pledge Captured in full. Anything else (the tank
+    /// still Launching) fails the test.
+    async fn assert_captured(harness: &TestHarness, channel_id: &str, goal: &str, pledge: &str) {
+        let db = &harness.db;
+        let tank = db
+            .fetch_prot_tank_by_channel(channel_id)
+            .await
+            .expect("read the tank")
+            .expect("the tank");
+        assert_eq!(tank.stage, v0::ProtTankStage::Active, "{:?}", tank);
+        let goal = db
+            .fetch_prot_goal(goal)
+            .await
+            .expect("read the goal")
+            .expect("the goal");
+        assert_eq!(goal.state, v0::ProtGoalState::Launched, "{:?}", goal);
+        let pledge = db
+            .fetch_prot_pledge(pledge)
+            .await
+            .expect("read the pledge")
+            .expect("the pledge");
+        assert_eq!(
+            (pledge.state, pledge.captured),
+            (v0::ProtPledgeState::Captured, PLEDGED),
+            "{:?}",
+            pledge
+        );
+    }
+
+    /// S5b 6.7: the protect route captures a crowdfunded channel's launch
+    /// pledges right after the protect commits. Control: drop the
+    /// `on_protect_landed` call (the tank stays Launching).
+    #[test]
+    fn protect_captures_the_launch_pledges() {
+        crate::util::test::rt().block_on(Box::pin(protect_captures_the_launch_pledges_case()))
+    }
+
+    async fn protect_captures_the_launch_pledges_case() {
+        let (setup, goal, pledge) = crowdfunded_setup().await;
+        let channel_id = setup.channel_id();
+
+        let answer = protect(
+            &setup.harness,
+            &setup.owner_session,
+            &channel_id,
+            &setup.genesis(),
+        )
+        .await;
+        assert_protected_answer(&setup.harness, &answer, &channel_id).await;
+        assert_captured(&setup.harness, &channel_id, &goal, &pledge).await;
+    }
+
+    /// S5b 6.7 on N3: a protect that landed without its answer (through the
+    /// database here, so nothing captured) is retried with the same bytes;
+    /// the `unchanged` retry captures too. Control: run the hook only when
+    /// `!outcome.unchanged` (the tank stays Launching).
+    #[test]
+    fn an_identical_retry_captures_the_launch_pledges() {
+        crate::util::test::rt().block_on(Box::pin(an_identical_retry_captures_case()))
+    }
+
+    async fn an_identical_retry_captures_case() {
+        let (setup, goal, pledge) = crowdfunded_setup().await;
+        let channel_id = setup.channel_id();
+        let data = setup.genesis();
+        setup.harness.protect_with_db(&setup.channel, &data).await;
+        let tank = setup
+            .harness
+            .db
+            .fetch_prot_tank_by_channel(&channel_id)
+            .await
+            .expect("read the tank")
+            .expect("the tank");
+        assert_eq!(tank.stage, v0::ProtTankStage::Launching);
+
+        let answer = protect(&setup.harness, &setup.owner_session, &channel_id, &data).await;
+        assert_protected_answer(&setup.harness, &answer, &channel_id).await;
+        assert_captured(&setup.harness, &channel_id, &goal, &pledge).await;
     }
 }

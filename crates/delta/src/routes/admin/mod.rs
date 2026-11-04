@@ -5,15 +5,20 @@
 //! collection: each call logs an `AUDIT ...` line, and a write is also
 //! recorded by its own ledger row (actor and reason). The Prot routes are
 //! not gated on `[features.boosts.protection]`, so support can inspect and
-//! correct wallets while Prot is switched off.
+//! correct wallets, and end a tank for abuse, while Prot is switched off.
 use revolt_rocket_okapi::revolt_okapi::openapi3::OpenApi;
 use rocket::Route;
 
 mod prot_adjust;
 mod prot_orders;
+mod prot_terminate;
 
 pub fn routes() -> (Vec<Route>, OpenApi) {
-    openapi_get_routes_spec![prot_orders::fetch_prot_order, prot_adjust::adjust_prot]
+    openapi_get_routes_spec![
+        prot_orders::fetch_prot_order,
+        prot_adjust::adjust_prot,
+        prot_terminate::terminate_prot_tank,
+    ]
 }
 
 /// Whether `value` looks like an id the server hands out or a client nonce:
