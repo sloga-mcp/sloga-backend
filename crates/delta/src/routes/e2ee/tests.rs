@@ -3032,8 +3032,46 @@ fn removal_writes_the_tombstone_before_the_delete() {
     use crate::util::test::{statement_at, without_comments, without_whitespace};
 
     let code = without_whitespace(&without_comments(include_str!("revoke_device.rs")));
+    let helper = code.find("asyncfnmay_revoke(").expect("the decision helper");
+    let reassert = code
+        .find("asyncfnreassert_e2ee_enabled(")
+        .expect("the flag helper");
+    assert!(helper < reassert, "the decision helper comes before the flag helper");
+
+    // Every call in a helper whose name starts with a write verb
+    let writes = |body: &str| -> Vec<String> {
+        const VERBS: [&str; 12] = [
+            "upsert", "insert", "update", "delete", "revoke", "save", "set", "remove", "release",
+            "acquire", "unbind", "replace",
+        ];
+        body.match_indices('(')
+            .filter_map(|(at, _)| {
+                let start = body[..at]
+                    .rfind(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                    .map_or(0, |end| end + 1);
+                let name = &body[start..at];
+                VERBS
+                    .iter()
+                    .any(|verb| name == *verb || name.starts_with(&format!("{verb}_")))
+                    .then(|| name.to_string())
+            })
+            .collect()
+    };
+
+    // The decision reads only (the extraction does see its reads)
+    let decide = &code[helper..reassert];
+    for read in ["read_for_revoke(", "fetch_e2ee_identities(", "fetch_session(", "decide_revoke("] {
+        assert!(decide.contains(read), "the decision helper lost `{}`", read);
+    }
+    assert_eq!(writes(decide), Vec::<String>::new(), "the decision helper writes");
+
+    // The refusal's flag helper writes exactly one thing: the user's flag
+    let flag = &code[reassert..];
+    assert_eq!(writes(flag), vec!["update".to_string()], "the flag helper's writes");
+    assert_eq!(flag.matches("user.update(db,partial,vec![]).await").count(), 1);
+
     // The route body only, not the helpers after it
-    let code = code[..code.find("asyncfnmay_revoke(").expect("the decision helper")].to_string();
+    let code = code[..helper].to_string();
     let exists = code
         .find("lettarget=db.fetch_e2ee_identity(&user.id,&device_id).await?;")
         .expect("existence is checked");
