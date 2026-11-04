@@ -1,10 +1,11 @@
-use revolt_config::{config, Settings};
+use revolt_config::{config, ProtectionFeatures, Settings};
+use revolt_database::{ProtTankRules, PROT_SLOT_TIERS};
 use revolt_models::v0;
 use revolt_payments::settings::{PaymentsSettings, ProtSalesSettings};
 use revolt_result::Result;
 use rocket::serde::json::Json;
 use serde::Serialize;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
 
@@ -72,6 +73,66 @@ pub struct ProtFeature {
     pub exact_min_cents: i64,
     pub exact_max_cents: i64,
     pub wallet_cap: i64,
+    /// Tank rules the client previews prices with (the server computes every price)
+    pub tank: ProtTankFeature,
+}
+
+/// # Prot Tank Rules
+///
+/// `[features.boosts.protection]` as validated by `ProtTankRules`. A config
+/// the engine would refuse is advertised as zeros and false with no tier
+/// costs, so `min_contribution: 0` makes the client hide contribute.
+#[derive(Serialize, JsonSchema, Debug, Clone)]
+pub struct ProtTankFeature {
+    /// Prot per day for a protected channel, keyed by slot tier ("10".."100")
+    pub channel_daily_cost: BTreeMap<String, i64>,
+    /// Smallest contribution or pledge, in Prot
+    pub min_contribution: i64,
+    pub min_launch_goal_days: u32,
+    pub max_launch_goal_days: u32,
+    pub launch_goal_deadline_days: u32,
+    pub withdraw_cutoff_hours: u32,
+    /// Prot bought in the last this many hours can't go into a tank or a pledge
+    pub contribute_hold_hours: u32,
+    pub grace_days: u32,
+    pub freeze_days: u32,
+    /// Whether a channel whose tank stays empty past its freeze is deleted
+    pub deletion_enabled: bool,
+}
+
+/// The tank rules to advertise, from the same `ProtTankRules::from_config`
+/// the engine validates with
+pub fn prot_tank_feature_from(protection: &ProtectionFeatures) -> ProtTankFeature {
+    let Ok(rules) = ProtTankRules::from_config(protection) else {
+        return ProtTankFeature {
+            channel_daily_cost: BTreeMap::new(),
+            min_contribution: 0,
+            min_launch_goal_days: 0,
+            max_launch_goal_days: 0,
+            launch_goal_deadline_days: 0,
+            withdraw_cutoff_hours: 0,
+            contribute_hold_hours: 0,
+            grace_days: 0,
+            freeze_days: 0,
+            deletion_enabled: false,
+        };
+    };
+
+    ProtTankFeature {
+        channel_daily_cost: PROT_SLOT_TIERS
+            .iter()
+            .filter_map(|&slots| Some((slots.to_string(), rules.daily_cost(slots)?)))
+            .collect(),
+        min_contribution: rules.min_contribution,
+        min_launch_goal_days: rules.min_launch_goal_days,
+        max_launch_goal_days: rules.max_launch_goal_days,
+        launch_goal_deadline_days: rules.launch_goal_deadline_days,
+        withdraw_cutoff_hours: rules.withdraw_cutoff_hours,
+        contribute_hold_hours: rules.contribute_hold_hours,
+        grace_days: rules.grace_days,
+        freeze_days: rules.freeze_days,
+        deletion_enabled: rules.deletion_enabled,
+    }
 }
 
 /// # Bot-Based Import Source
@@ -176,6 +237,9 @@ pub fn import_sources_feature(config: &Settings) -> ImportSourcesFeature {
 /// is advertised closed: no packs, sales and grants off.
 pub fn prot_feature_from(config: &Settings) -> ProtFeature {
     let protection = &config.features.boosts.protection;
+    // Independent of the sale config: a broken pack list still advertises
+    // the tank rules, and a broken tank config the sale
+    let tank = prot_tank_feature_from(protection);
     let Ok(prot) = ProtSalesSettings::from_config(config) else {
         return ProtFeature {
             enabled: protection.enabled,
@@ -186,6 +250,7 @@ pub fn prot_feature_from(config: &Settings) -> ProtFeature {
             exact_min_cents: config.features.payments.prot_exact_min_cents,
             exact_max_cents: config.features.payments.prot_exact_max_cents,
             wallet_cap: protection.wallet_cap,
+            tank,
         };
     };
 
@@ -209,6 +274,7 @@ pub fn prot_feature_from(config: &Settings) -> ProtFeature {
         exact_min_cents: prot.exact_min_cents,
         exact_max_cents: prot.exact_max_cents,
         wallet_cap: prot.wallet_cap,
+        tank,
     }
 }
 
@@ -908,6 +974,18 @@ mod test {
                 "exact_min_cents": 50,
                 "exact_max_cents": 50000,
                 "wallet_cap": 100000,
+                "tank": {
+                    "channel_daily_cost": { "10": 40, "25": 90, "50": 160, "100": 280 },
+                    "min_contribution": 50,
+                    "min_launch_goal_days": 30,
+                    "max_launch_goal_days": 365,
+                    "launch_goal_deadline_days": 30,
+                    "withdraw_cutoff_hours": 48,
+                    "contribute_hold_hours": 72,
+                    "grace_days": 5,
+                    "freeze_days": 25,
+                    "deletion_enabled": false,
+                },
             })
         );
 
@@ -1035,6 +1113,144 @@ mod test {
         assert_eq!(
             body["features"]["boosts"]["purchases_enabled"],
             config.features.boosts.purchases_enabled
+        );
+    }
+
+    /// `prot_settings()` with every advertised tank key set explicitly, each
+    /// different from its default, so the advert is proved to carry the
+    /// configured values
+    fn prot_tank_settings() -> revolt_config::Settings {
+        let mut config = prot_settings();
+        let protection = &mut config.features.boosts.protection;
+        protection.channel_daily_cost = revolt_config::ProtTierCosts {
+            t10: 41,
+            t25: 91,
+            t50: 161,
+            t100: 281,
+        };
+        protection.grace_days = 4;
+        protection.freeze_days = 20;
+        protection.final_warning_day = 15;
+        protection.warn_days = vec![5, 2];
+        protection.min_reactivation_days = 2;
+        protection.launch_goal_deadline_days = 21;
+        protection.launch_window_days = 5;
+        protection.launch_seat_window_days = 5;
+        protection.min_contribution = 75;
+        protection.min_launch_goal_days = 14;
+        protection.max_launch_goal_days = 180;
+        protection.withdraw_cutoff_hours = 36;
+        protection.contribute_hold_hours = 48;
+        protection.deletion_enabled = true;
+        config
+    }
+
+    fn prot_tank_json() -> serde_json::Value {
+        serde_json::json!({
+            "channel_daily_cost": { "10": 41, "25": 91, "50": 161, "100": 281 },
+            "min_contribution": 75,
+            "min_launch_goal_days": 14,
+            "max_launch_goal_days": 180,
+            "launch_goal_deadline_days": 21,
+            "withdraw_cutoff_hours": 36,
+            "contribute_hold_hours": 48,
+            "grace_days": 4,
+            "freeze_days": 20,
+            "deletion_enabled": true,
+        })
+    }
+
+    /// The tank rules ride in both of the builder's literals: beside a valid
+    /// sale and beside a sale config that fails to validate
+    #[test]
+    fn prot_feature_advertises_the_tank_rules() {
+        assert_eq!(prot_json(&prot_tank_settings())["tank"], prot_tank_json());
+
+        let mut config = prot_tank_settings();
+        config.features.payments.prot_exact_min_cents = 10;
+        let json = prot_json(&config);
+        assert_eq!(json["packs"], serde_json::json!([]));
+        assert_eq!(json["tank"], prot_tank_json());
+    }
+
+    /// A tank config the engine would refuse is advertised as zeros and false
+    /// with no tier costs, and leaves the sale advert alone
+    #[test]
+    fn prot_feature_tank_is_zeroed_when_the_tank_config_is_invalid() {
+        type Break = fn(&mut revolt_config::Settings);
+        let cases: [(&str, Break); 6] = [
+            ("tier costs not increasing", |c| {
+                c.features.boosts.protection.channel_daily_cost.t25 = 41
+            }),
+            ("zero grace days", |c| {
+                c.features.boosts.protection.grace_days = 0
+            }),
+            ("final warning after the freeze", |c| {
+                c.features.boosts.protection.final_warning_day = 24
+            }),
+            ("zero minimum contribution", |c| {
+                c.features.boosts.protection.min_contribution = 0
+            }),
+            ("launch goal over ten years", |c| {
+                c.features.boosts.protection.max_launch_goal_days = 3651
+            }),
+            ("withdraw cutoff past the goal deadline", |c| {
+                c.features.boosts.protection.withdraw_cutoff_hours = 21 * 24
+            }),
+        ];
+        for (name, break_config) in cases {
+            let mut config = prot_tank_settings();
+            break_config(&mut config);
+            let json = prot_json(&config);
+            assert_eq!(
+                json["tank"],
+                serde_json::json!({
+                    "channel_daily_cost": {},
+                    "min_contribution": 0,
+                    "min_launch_goal_days": 0,
+                    "max_launch_goal_days": 0,
+                    "launch_goal_deadline_days": 0,
+                    "withdraw_cutoff_hours": 0,
+                    "contribute_hold_hours": 0,
+                    "grace_days": 0,
+                    "freeze_days": 0,
+                    "deletion_enabled": false,
+                }),
+                "{name}"
+            );
+            assert_eq!(json["sales_open"], true, "{name}");
+            assert_eq!(json["packs"].as_array().map(Vec::len), Some(2), "{name}");
+        }
+    }
+
+    /// `GET /` carries the tank rules of the node's config, and the test
+    /// node's tank config validates (the S5b tests rely on it)
+    #[test]
+    fn root_serves_the_prot_tank_rules() {
+        crate::util::test::rt().block_on(root_serves_the_prot_tank_rules_case())
+    }
+
+    async fn root_serves_the_prot_tank_rules_case() {
+        let harness = crate::util::test::TestHarness::new().await;
+        let response = harness.client.get("/").dispatch().await;
+        assert_eq!(response.status(), Status::Ok);
+        let body: serde_json::Value =
+            serde_json::from_str(&response.into_string().await.unwrap()).unwrap();
+        let config = revolt_config::config().await;
+        let tank = &body["features"]["prot"]["tank"];
+        assert_eq!(
+            *tank,
+            serde_json::to_value(super::prot_tank_feature_from(
+                &config.features.boosts.protection
+            ))
+            .unwrap()
+        );
+        assert!(tank["min_contribution"].as_i64() >= Some(1), "{}", tank);
+        assert_eq!(
+            tank["channel_daily_cost"]
+                .as_object()
+                .map(serde_json::Map::len),
+            Some(4)
         );
     }
 }

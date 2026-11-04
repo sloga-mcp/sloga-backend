@@ -3,9 +3,9 @@
 //! per route.
 //!
 //! The Frozen refusal (carry-forward 8) covers the routes that add to a
-//! channel: send, react, pin and unpin. Deletes, bulk deletes, reaction
-//! removal, acks and typing never call it (BR6): removal must always be
-//! possible, and typing writes nothing.
+//! channel: send, react and pin. Unpins, deletes, bulk deletes, reaction
+//! removal, acks and typing never call it (BR6, owner answer 6): removal
+//! must always be possible, and typing writes nothing.
 
 use revolt_database::{Channel, Database};
 use revolt_result::{create_error, Result};
@@ -286,8 +286,11 @@ mod tests {
         assert_eq!(f.stored_messages().await, 3);
     }
 
-    /// 6.2: react, pin and unpin refuse a Frozen or Deleted entitlement and
-    /// change nothing; Grace reacts and pins, Active unpins
+    /// 6.2: react and pin refuse a Frozen or Deleted entitlement and change
+    /// nothing; Grace reacts and pins. An unpin is a removal (owner answer
+    /// 6), so it lands in Frozen and Deleted as it does in Active. Control:
+    /// put the `refuse_if_tank_frozen` call back into `message_unpin.rs` (the
+    /// Frozen unpin answers 403)
     #[test]
     fn frozen_react_and_pin_are_refused() {
         crate::util::test::rt().block_on(Box::pin(frozen_react_and_pin_are_refused_case()))
@@ -339,13 +342,32 @@ mod tests {
 
         for state in STOPPED {
             f.set_state(state.clone()).await;
-            assert_frozen(
+            assert_status(
                 &f.call(Method::Delete, &pin, None).await,
+                Status::NoContent,
                 &format!("unpin, {state:?}"),
+            );
+            let stored = db.fetch_message(&message.id).await.expect("the message");
+            assert!(
+                !stored.pinned.unwrap_or_default(),
+                "{:?}: the unpin did not land",
+                state
+            );
+
+            // Pinning it again stays refused until the state allows traffic
+            assert_frozen(
+                &f.call(Method::Post, &pin, None).await,
+                &format!("pin again, {state:?}"),
+            );
+            f.set_state(ChannelEntitlementState::Grace).await;
+            assert_status(
+                &f.call(Method::Post, &pin, None).await,
+                Status::NoContent,
+                &format!("pin again after {state:?}, Grace"),
             );
         }
         let stored = db.fetch_message(&message.id).await.expect("the message");
-        assert!(stored.pinned.unwrap_or_default(), "a stopped unpin landed");
+        assert!(stored.pinned.unwrap_or_default());
 
         f.set_state(ChannelEntitlementState::Active).await;
         assert_status(

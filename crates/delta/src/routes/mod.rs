@@ -20,6 +20,7 @@ pub(crate) mod mls;
 mod onboard;
 mod payments;
 mod policy;
+mod prot;
 mod push;
 mod referrals;
 mod root;
@@ -69,6 +70,7 @@ pub fn mount(config: Settings, mut rocket: Rocket<Build>) -> Rocket<Build> {
             "/referrals" => referrals::routes(),
             "/kofi" => kofi::routes(),
             "/payments" => payments::routes(),
+            "/prot" => prot::routes(),
             "/admin" => admin::routes(),
             "/sync" => sync::routes(),
             "/webhooks" => webhooks::routes()
@@ -104,6 +106,7 @@ pub fn mount(config: Settings, mut rocket: Rocket<Build>) -> Rocket<Build> {
             "/referrals" => referrals::routes(),
             "/kofi" => kofi::routes(),
             "/payments" => payments::routes(),
+            "/prot" => prot::routes(),
             "/admin" => admin::routes(),
             "/sync" => sync::routes()
         };

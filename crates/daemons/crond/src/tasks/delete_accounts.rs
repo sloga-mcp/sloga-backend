@@ -31,6 +31,13 @@
 //! forfeit must succeed too: when it fails the account is not marked deleted
 //! and stays due, and the next run repeats the cascade and the forfeit.
 //!
+//! The user's held pledges are forfeited between the two
+//! (`engine::prot::forfeit_held_pledges_on_deletion`, S5b 9.6): after the
+//! cascade, which cancels the goals of the owner's own servers and so
+//! returns those pledges to the wallet, and before the wallet forfeit, which
+//! takes them with the rest. A failure there is handled like a failed
+//! wallet forfeit.
+//!
 //! The Stripe secret key is only handed to the client; it is never logged.
 
 use std::time::Duration;
@@ -133,9 +140,10 @@ async fn delete_accounts(
 /// undecodable seat row, design 6.3) must not hold up every deletion queued
 /// behind it. Every step is safe to run again on that retry.
 ///
-/// The Prot wallet is forfeited after `User::delete` and before the
-/// account is marked deleted; when the forfeit fails the account is
-/// skipped the same way (that run has already anonymised the user).
+/// The held Prot pledges and then the Prot wallet are forfeited after
+/// `User::delete` and before the account is marked deleted; when either
+/// forfeit fails the account is skipped the same way (that run has already
+/// anonymised the user).
 async fn delete_accounts_with<F, Fut>(
     db: &Database,
     accounts: Vec<Account>,
@@ -177,6 +185,20 @@ where
         // bots and owned servers gone, say); the retry runs it again
         if let Err(err) = user.delete(db).await {
             skip_account(&account.id, "deleting its user failed", &err);
+            continue;
+        }
+
+        // Prot (D11, S5b 9.6): the held pledges leave their holds AFTER the delete cascade (the
+        // goals of the owner's own servers were cancelled there, which returned those pledges to
+        // the wallet) and before the wallet forfeit below, which takes what came back. Same
+        // failure rule as the wallet forfeit.
+        let now = revolt_database::now_ms();
+        if let Err(err) = engine::prot::forfeit_held_pledges_on_deletion(db, &user.id, now).await {
+            skip_account(
+                &account.id,
+                "its held Prot pledges could not be forfeited",
+                &err,
+            );
             continue;
         }
 
@@ -273,6 +295,12 @@ mod tests {
         PROT_SYS_FORFEITED, PROT_SYS_ISSUED,
     };
     use revolt_models::v0::{DataCreateServer, ProtEntryKind};
+
+    use revolt_database::{
+        prot_hold_account, prot_key_forfeit_hold, prot_key_pledge_return, ProtGoal, ProtPledge,
+        ProtPledgeInput, ProtTankRules,
+    };
+    use revolt_models::v0::{ProtGoalKind, ProtGoalState, ProtPledgeState};
 
     use super::*;
 
@@ -1122,5 +1150,215 @@ mod tests {
             .await
             .unwrap()
             .is_none());
+    }
+
+    /// Support credits `amount` Prot to `user`'s wallet by hand: not a
+    /// purchase, so none of it is held back from a pledge (D17)
+    async fn credit_by_admin(db: &Database, user: &str, nonce: &str, amount: i64) {
+        db.apply_prot_posting(&ProtPosting {
+            key: prot_key_admin("01ADMIN0000000000000000000", nonce),
+            kind: ProtEntryKind::AdminAdjust,
+            debit: PROT_SYS_ADJUST.to_string(),
+            credit: prot_user_account(user),
+            amount: ProtAmount::Exact(amount),
+            debit_floor: 0,
+            actor: "01ADMIN0000000000000000000".to_string(),
+            reference: ProtRef::default(),
+            reason: Some("credited by hand".to_string()),
+            created_at: revolt_database::now_ms(),
+        })
+        .await
+        .unwrap();
+    }
+
+    /// A new server `owner` owns and its Funding launch goal (target 5,000)
+    async fn open_launch_goal(
+        db: &Database,
+        owner: &str,
+        rules: &ProtTankRules,
+    ) -> (Server, ProtGoal) {
+        let user = db.fetch_user(owner).await.unwrap();
+        let (server, _) = Server::create(
+            db,
+            DataCreateServer {
+                name: format!("{owner}'s"),
+                description: None,
+                nsfw: None,
+            },
+            &user,
+            true,
+        )
+        .await
+        .unwrap();
+
+        let now = revolt_database::now_ms();
+        let goal = db
+            .create_prot_goal(&ProtGoal {
+                id: ulid::Ulid::new().to_string(),
+                kind: ProtGoalKind::Launch,
+                server_id: server.id.clone(),
+                channel_id: None,
+                tank_id: None,
+                created_by: owner.to_string(),
+                create_nonce: ulid::Ulid::new().to_string(),
+                slots: 10,
+                days: Some(30),
+                daily_cost: rules.daily_cost(10).expect("a slot tier"),
+                base_daily_cost: None,
+                target_prot: 5_000,
+                pledged_total: 0,
+                state: ProtGoalState::Funding,
+                deadline_at: now + 30 * 86_400_000,
+                funded_at: None,
+                launch_deadline_at: None,
+                launched_at: None,
+                closed_at: None,
+                refund7_done: false,
+                open_key: Some(format!("launch:{}", server.id)),
+                version: 0,
+                created_at: now,
+                updated_at: now,
+            })
+            .await
+            .unwrap();
+        (server, goal)
+    }
+
+    /// `user` pledges `amount` from the wallet into `goal`; the Held pledge
+    async fn pledge(
+        db: &Database,
+        user: &str,
+        goal: &ProtGoal,
+        amount: i64,
+        rules: &ProtTankRules,
+    ) -> ProtPledge {
+        let outcome = db
+            .pledge_prot(&ProtPledgeInput {
+                user_id: user.to_string(),
+                goal_id: goal.id.clone(),
+                amount,
+                nonce: ulid::Ulid::new().to_string(),
+                rules: rules.clone(),
+                now: revolt_database::now_ms(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(outcome.pledge.state, ProtPledgeState::Held);
+        outcome.pledge
+    }
+
+    async fn pledge_now(db: &Database, id: &str) -> ProtPledge {
+        db.fetch_prot_pledge(id).await.unwrap().expect("the pledge")
+    }
+
+    async fn goal_now(db: &Database, id: &str) -> ProtGoal {
+        db.fetch_prot_goal(id).await.unwrap().expect("the goal")
+    }
+
+    /// Everything the forfeit passes took out of `user`'s wallet
+    async fn forfeited_from_wallet(db: &Database, user: &str) -> i64 {
+        db.fetch_prot_entries_by_account(&prot_user_account(user), None, 100)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|row| row.kind == ProtEntryKind::Forfeit)
+            .map(|row| row.amount)
+            .sum()
+    }
+
+    /// S5b 9.6 (D11): the held pledges are forfeited AFTER the delete
+    /// cascade and before the wallet. u1 pledged into the launch goal of
+    /// its own server and into the goal of u2's server. The cascade deletes
+    /// u1's server and cancels its goal, which RETURNS that pledge to the
+    /// wallet; only the pledge into u2's goal is forfeited from its hold,
+    /// and the wallet forfeit then takes what came back with the rest. u2's
+    /// own pledge is untouched. Both drivers. Control: forfeit the held
+    /// pledges before `user.delete` (the own-goal pledge is then Forfeited
+    /// from its hold, never Returned).
+    #[tokio::test]
+    async fn account_deletion_forfeits_held_pledges_after_the_cascade() {
+        let (db, _teardown) = migrated_test_db().await;
+        insert_user(&db, "u1").await;
+        insert_user(&db, "u2").await;
+        let rules = ProtTankRules::from_config(&revolt_config::ProtectionFeatures::default())
+            .expect("the default Prot config is valid");
+        let (own_server, own_goal) = open_launch_goal(&db, "u1", &rules).await;
+        let (_, other_goal) = open_launch_goal(&db, "u2", &rules).await;
+
+        credit_by_admin(&db, "u1", "u1", 1_500).await;
+        credit_by_admin(&db, "u2", "u2", 400).await;
+        let own = pledge(&db, "u1", &own_goal, 700, &rules).await;
+        let other = pledge(&db, "u1", &other_goal, 300, &rules).await;
+        let theirs = pledge(&db, "u2", &other_goal, 400, &rules).await;
+        assert_eq!(wallet(&db, "u1").await, 500);
+        schedule_deletion(&db, "u1").await;
+
+        let accounts = db.fetch_accounts_due_for_deletion().await.unwrap();
+        assert_eq!(accounts.len(), 1);
+        delete_accounts(&db, None, accounts).await.unwrap();
+
+        assert_deleted(&db, "u1").await;
+        assert!(
+            db.fetch_server(&own_server.id).await.is_err(),
+            "the owned server is deleted"
+        );
+
+        // The cascade cancelled the own server's goal and returned that
+        // pledge to the wallet; it never left its hold any other way
+        assert_eq!(
+            goal_now(&db, &own_goal.id).await.state,
+            ProtGoalState::Cancelled
+        );
+        assert_eq!(
+            pledge_now(&db, &own.id).await.state,
+            ProtPledgeState::Returned
+        );
+        let returned = db
+            .fetch_prot_entry_by_key(&prot_key_pledge_return(&own.id))
+            .await
+            .unwrap()
+            .expect("the pledge return");
+        assert_eq!(
+            (returned.kind, returned.amount),
+            (ProtEntryKind::PledgeReturn, 700)
+        );
+        assert!(
+            db.fetch_prot_entry_by_key(&prot_key_forfeit_hold(&own.id))
+                .await
+                .unwrap()
+                .is_none(),
+            "a pledge the cascade returned is never forfeited from its hold"
+        );
+
+        // The pledge into u2's goal left its hold to sys:forfeited
+        assert_eq!(
+            pledge_now(&db, &other.id).await.state,
+            ProtPledgeState::Forfeited
+        );
+        let row = db
+            .fetch_prot_entry_by_key(&prot_key_forfeit_hold(&other.id))
+            .await
+            .unwrap()
+            .expect("the forfeit-hold row");
+        assert_eq!((row.kind, row.amount), (ProtEntryKind::ForfeitHold, 300));
+        assert_eq!(row.debit, prot_hold_account(&other_goal.id));
+        assert_eq!(row.credit, PROT_SYS_FORFEITED);
+
+        // The wallet forfeit took the returned 700 with the 500 left
+        assert_eq!(wallet(&db, "u1").await, 0);
+        assert_eq!(forfeited_from_wallet(&db, "u1").await, 1_200);
+
+        // u2's pledge, and the goal it funds, are untouched
+        let theirs = pledge_now(&db, &theirs.id).await;
+        assert_eq!(
+            (theirs.state, theirs.remaining),
+            (ProtPledgeState::Held, 400)
+        );
+        let other_goal = goal_now(&db, &other_goal.id).await;
+        assert_eq!(
+            (other_goal.state, other_goal.pledged_total),
+            (ProtGoalState::Funding, 400)
+        );
+        assert_eq!(wallet(&db, "u2").await, 0);
     }
 }

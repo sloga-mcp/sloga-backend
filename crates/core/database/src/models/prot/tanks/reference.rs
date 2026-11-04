@@ -2334,15 +2334,21 @@ impl AbstractProtTanks for ReferenceDb {
             return Ok(None);
         };
         let traffic_stops = match tank.stage {
+            // Resume, whatever the cause
+            v0::ProtTankStage::Settling => return Ok(Some(tank)),
+            v0::ProtTankStage::Deleted | v0::ProtTankStage::Terminated => return Ok(None),
+            // Expiry only from Frozen (contracts 26, W5 (ii)): a top-up that
+            // reactivated the tank after the clock read it never lets an
+            // expiry delete an Active or Grace channel
+            _ if cause == ProtSettleCause::Expiry && tank.stage != v0::ProtTankStage::Frozen => {
+                return Ok(None)
+            }
             v0::ProtTankStage::Active | v0::ProtTankStage::Grace | v0::ProtTankStage::Frozen => {
                 true
             }
             // A delete of a never-launched tank: the entitlement is left to
             // the goal close or the capture (9.4)
             v0::ProtTankStage::Launching => false,
-            // Resume
-            v0::ProtTankStage::Settling => return Ok(Some(tank)),
-            v0::ProtTankStage::Deleted | v0::ProtTankStage::Terminated => return Ok(None),
         };
         let next = ProtTank {
             stage: v0::ProtTankStage::Settling,

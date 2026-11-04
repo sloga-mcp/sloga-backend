@@ -31,7 +31,6 @@ pub async fn message_unpin(
             .await
             .throw_if_lacking_channel_permission(ChannelPermission::ManageMessages)?;
     }
-    crate::util::prot_gate::refuse_if_tank_frozen(db, &channel, &permission_channel).await?;
 
     let mut message = msg.as_message_in_channel(db, channel.id()).await?;
 

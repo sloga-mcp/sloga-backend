@@ -2864,6 +2864,89 @@ mod tests {
         });
     }
 
+    /// Contracts 26 W5 (ii): an expiry begins only from Frozen. A top-up that
+    /// reactivates the tank after the clock read it Frozen must not let the
+    /// expiry delete the channel; an owner's delete still begins.
+    #[tokio::test]
+    async fn expiry_settlement_refuses_a_reactivated_tank() {
+        database_test!(|db| async move {
+            setup(&db).await;
+            let rules = rules();
+            let tank = frozen_tank(&db, &rules).await;
+            fund(&db, D, 500).await;
+            let outcome = contribute(&db, D, &tank.id, 500, at(12, 13), &rules)
+                .await
+                .unwrap();
+            assert!(matches!(
+                outcome,
+                ProtContributeOutcome::Applied {
+                    stage_changed: true,
+                    ..
+                }
+            ));
+
+            // Active: refused, nothing written
+            let active = self::tank(&db, &tank.id).await;
+            assert_eq!(active.stage, v0::ProtTankStage::Active);
+            assert!(db
+                .begin_prot_settlement(&tank.id, ProtSettleCause::Expiry, at(12, 14))
+                .await
+                .unwrap()
+                .is_none());
+            let after = self::tank(&db, &tank.id).await;
+            assert_eq!((after.stage, after.version), (active.stage, active.version));
+            assert_eq!(after.settle_cause, None);
+            assert_eq!(
+                entitlement_state(&db, CHANNEL).await,
+                Some(crate::ChannelEntitlementState::Active)
+            );
+
+            // Grace: refused as well
+            set_tank_balance(&db, &tank.id, 30).await;
+            let outcome = burn(&db, &tank.id, 13, &rules).await;
+            assert!(
+                matches!(outcome, ProtBurnOutcome::EnteredGrace { .. }),
+                "{outcome:?}"
+            );
+            let grace = self::tank(&db, &tank.id).await;
+            assert!(db
+                .begin_prot_settlement(&tank.id, ProtSettleCause::Expiry, at(13, 1))
+                .await
+                .unwrap()
+                .is_none());
+            assert_eq!(self::tank(&db, &tank.id).await.version, grace.version);
+            assert_eq!(
+                entitlement_state(&db, CHANNEL).await,
+                Some(crate::ChannelEntitlementState::Grace)
+            );
+
+            // The owner's delete still begins; a later expiry call only sees
+            // the settlement under way (resume, no write)
+            let begun = db
+                .begin_prot_settlement(&tank.id, ProtSettleCause::OwnerDelete, at(13, 2))
+                .await
+                .unwrap()
+                .expect("an owner delete begins from Grace");
+            assert_eq!(begun.stage, v0::ProtTankStage::Settling);
+            assert_eq!(begun.settle_cause, Some(ProtSettleCause::OwnerDelete));
+            assert_eq!(
+                entitlement_state(&db, CHANNEL).await,
+                Some(crate::ChannelEntitlementState::Frozen)
+            );
+            let resumed = db
+                .begin_prot_settlement(&tank.id, ProtSettleCause::Expiry, at(13, 3))
+                .await
+                .unwrap()
+                .expect("the settlement under way");
+            assert_eq!(resumed.version, begun.version);
+            let settling = self::tank(&db, &tank.id).await;
+            assert_eq!(
+                (settling.version, settling.settle_cause),
+                (begun.version, Some(ProtSettleCause::OwnerDelete))
+            );
+        });
+    }
+
     /// Text-plane rows written directly (their own routes need a full MLS
     /// handshake); `kind` decides the group's plane
     async fn insert_group_rows(
@@ -2942,17 +3025,8 @@ mod tests {
         database_test!(|db| async move {
             setup(&db).await;
             let rules = rules();
-            insert_server(&db, SERVER).await;
-            let (_, tank) = launched(
-                &db,
-                SERVER,
-                CHANNEL,
-                10,
-                &[(A, 600), (B, 600)],
-                at(0, 13),
-                &rules,
-            )
-            .await;
+            // An expiry begins only from Frozen (contracts 26, W5 (ii))
+            let tank = frozen_tank(&db, &rules).await;
 
             for (seed, author) in [(1, OWNER), (2, A), (3, OWNER)] {
                 db.insert_message(&ciphertext_message(CHANNEL, author, seed))
@@ -3029,11 +3103,10 @@ mod tests {
             .await
             .unwrap();
 
-            set_tank_balance(&db, &tank.id, 0).await;
-            db.begin_prot_settlement(&tank.id, ProtSettleCause::Expiry, at(1, 1))
+            db.begin_prot_settlement(&tank.id, ProtSettleCause::Expiry, at(36, 1))
                 .await
                 .unwrap();
-            db.settle_prot_tank(&tank.id, at(1, 2)).await.unwrap();
+            db.settle_prot_tank(&tank.id, at(36, 2)).await.unwrap();
             let seats_before = db.fetch_channel_seats(CHANNEL).await.unwrap();
             assert!(!seats_before.is_empty());
 

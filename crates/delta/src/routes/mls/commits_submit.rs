@@ -336,7 +336,12 @@ async fn submit_call_commit(
 /// 5. validity: open; the AD binding; for Adds the growth gate, an Active
 ///    or Grace entitlement and no pending removal; the Remove rule; the Add targets
 ///    and caps. The commit transaction checks them again on its own read,
-///    and that check is the one that binds.
+///    and that check is the one that binds, except for the growth gate and
+///    the entitlement state: the transaction is handed only the entitlement's
+///    device cap, so the state is checked here and nowhere else. Residual
+///    (S5b BR7): an Add checked in Grace can still commit right after the
+///    clock writes Frozen. It only adds a seated member's device, so it
+///    costs policy, not confidentiality.
 async fn submit_text_commit(
     db: &Database,
     user: User,

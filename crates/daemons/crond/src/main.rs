@@ -133,6 +133,8 @@ async fn main() {
         cron_task_wrapper(antispam_daily::task, db.clone(), amqp.clone()),
         cron_task_wrapper(payments_reconcile::task, db.clone(), amqp.clone()),
         cron_task_wrapper(prot_cipher_backfill::task, db.clone(), amqp.clone()),
+        cron_task_wrapper(prot_tank_clock::task, db.clone(), amqp.clone()),
+        cron_task_wrapper(prot_goals::task, db.clone(), amqp.clone()),
     );
 }
 
@@ -182,5 +184,46 @@ mod tests {
             "revolt_crond",
             Level::Trace
         ));
+    }
+
+    /// `main.rs` without its tests
+    fn shipped_main() -> &'static str {
+        const SOURCE: &str = include_str!("main.rs");
+        &SOURCE[..SOURCE.find("#[cfg(test)]").expect("the tests")]
+    }
+
+    /// `module::task` is registered exactly once, inside `join!(`, and named
+    /// nowhere else. The needle is built from the module name, so this file
+    /// never spells it out (the task modules' own pins count it in the whole
+    /// of `main.rs`). These pins live here, not in the task module, so they
+    /// survive the module being dropped with its registration.
+    fn assert_registered_once(module: &str) {
+        let main = shipped_main();
+        let start = main.find("join!(").expect("main.rs has a join!(");
+        let end = start + main[start..].find(");").expect("join!( is closed");
+        let task = format!("{module}::task");
+        let registration = format!("cron_task_wrapper({task}, db.clone(), amqp.clone()),");
+
+        assert_eq!(
+            main[start..end]
+                .lines()
+                .filter(|line| line.trim() == registration)
+                .count(),
+            1,
+            "main.rs must register {task} exactly once inside join!("
+        );
+        assert_eq!(main.matches(task.as_str()).count(), 1, "{task}");
+    }
+
+    /// S5b 13.3: the hourly fuel-tank clock runs
+    #[test]
+    fn prot_tank_clock_is_registered_once() {
+        assert_registered_once("prot_tank_clock");
+    }
+
+    /// S5b 13.3: the goal sweep (the capture backstop, 6.7) runs
+    #[test]
+    fn prot_goals_is_registered_once() {
+        assert_registered_once("prot_goals");
     }
 }

@@ -450,6 +450,14 @@ impl<'a> RatelimitResolver<Request<'a>> for DeltaRatelimits {
                 // order per user bounds a user with many sessions
                 // independently of this counter.
                 ("payments", _, _) => ("payments", None),
+                // Prot tank and goal writes (contribute, pledge, withdraw,
+                // goals, tier, contributor prefs) move Prot or open and
+                // close goals, so they share one tight counter keyed per
+                // session, NOT per channel or goal: spreading writes across
+                // tanks must spend the same budget. Reads (the tank, goals)
+                // stay on "any". The admin routes sit under /admin and the
+                // wallet under /payments, so neither reaches this arm.
+                ("prot", _, method) if method != Method::Get => ("prot_write", None),
                 _ => ("any", None),
             }
         } else {
@@ -613,6 +621,11 @@ impl<'a> RatelimitResolver<Request<'a>> for DeltaRatelimits {
             // Public sale counter: responses carry `max-age=30`, so a page
             // left open costs about one request per 30 s.
             "payments_stats" => 20,
+            // Prot tank and goal writes: a pledge, a hide-name toggle and one
+            // retry fit one window. The plan's 10 per 60 s can't be expressed
+            // in the fixed 10 s window; 3 per window (the checkout precedent)
+            // caps a script at 18 per minute.
+            "prot_write" => 3,
             _ => 20,
         }
     }
@@ -1145,6 +1158,170 @@ mod tests {
             client.get("/payments/prot/@me").dispatch().status(),
             Status::TooManyRequests
         );
+    }
+
+    #[rocket::get("/channels/<_channel_id>/tank")]
+    fn prot_tank(_channel_id: &str) {}
+
+    #[rocket::post("/channels/<_channel_id>/contribute")]
+    fn prot_contribute(_channel_id: &str) {}
+
+    #[rocket::put("/channels/<_channel_id>/tier")]
+    fn prot_tier(_channel_id: &str) {}
+
+    #[rocket::post("/goals/<_goal_id>/pledges")]
+    fn prot_pledge(_goal_id: &str) {}
+
+    #[rocket::delete("/goals/<_goal_id>/pledges/<_pledge_id>")]
+    fn prot_withdraw(_goal_id: &str, _pledge_id: &str) {}
+
+    #[rocket::put("/servers/<_server_id>/contributor")]
+    fn prot_contributor(_server_id: &str) {}
+
+    #[rocket::post("/prot/tanks/<_tank_id>/terminate")]
+    fn admin_prot_terminate(_tank_id: &str) {}
+
+    /// The Prot tank and goal routes, on the same database-free Rocket as
+    /// `client()`
+    fn prot_tank_client() -> Client {
+        let rocket = rocket::build()
+            .manage(RatelimitStorage::new(DeltaRatelimits))
+            .attach(RatelimitFairing)
+            .mount("/", revolt_ratelimits::rocket::routes())
+            .mount("/sync", rocket::routes![sync_settings])
+            .mount("/payments", rocket::routes![prot_checkout])
+            .mount("/admin", rocket::routes![admin_prot_terminate])
+            .mount(
+                "/prot",
+                rocket::routes![
+                    prot_tank,
+                    prot_contribute,
+                    prot_tier,
+                    prot_pledge,
+                    prot_withdraw,
+                    prot_contributor
+                ],
+            );
+        Client::untracked(rocket).expect("rocket builds without a database")
+    }
+
+    /// Every POST, PUT and DELETE under /prot resolves to `prot_write`
+    /// (limit 3, one counter per session whatever the channel, server or
+    /// goal), every GET stays on `any`, and the Prot admin and wallet routes
+    /// keep their buckets
+    #[test]
+    fn prot_routes_use_the_prot_buckets() {
+        use revolt_ratelimits::ratelimiter::RatelimitResolver;
+
+        let client = prot_tank_client();
+
+        // The resolver, including the versioned prefix: every route of the
+        // Prot router
+        let writes = [
+            ("POST", "/channels/01CHN/contribute"),
+            ("PUT", "/channels/01CHN/tier"),
+            ("POST", "/channels/01CHN/goals"),
+            ("POST", "/servers/01SRV/goals"),
+            ("PUT", "/servers/01SRV/contributor"),
+            ("POST", "/goals/01GOL/pledges"),
+            ("DELETE", "/goals/01GOL/pledges/01PLG"),
+            ("POST", "/goals/01GOL/cancel"),
+            ("POST", "/goals/01GOL/launch"),
+        ];
+        let reads = [
+            "/channels/01CHN/tank",
+            "/servers/01SRV/goals",
+            "/goals/01GOL",
+        ];
+        for prefix in ["/prot", "/0.8/prot"] {
+            for (method, route) in writes {
+                let path = format!("{prefix}{route}");
+                let request = match method {
+                    "POST" => client.post(path.as_str()),
+                    "PUT" => client.put(path.as_str()),
+                    _ => client.delete(path.as_str()),
+                };
+                assert_eq!(
+                    DeltaRatelimits.resolve_bucket(&*request),
+                    ("prot_write", None),
+                    "{method} {path}"
+                );
+            }
+            for route in reads {
+                let path = format!("{prefix}{route}");
+                assert_eq!(
+                    DeltaRatelimits.resolve_bucket(&*client.get(path.as_str())),
+                    ("any", None),
+                    "GET {path}"
+                );
+            }
+        }
+        for (method, path, expected) in [
+            ("POST", "/admin/prot/tanks/01TNK/terminate", "any"),
+            ("POST", "/0.8/admin/prot/tanks/01TNK/terminate", "any"),
+            ("POST", "/payments/prot/checkout", "payments"),
+            ("GET", "/payments/prot/@me", "payments_me"),
+        ] {
+            let request = match method {
+                "POST" => client.post(path),
+                _ => client.get(path),
+            };
+            assert_eq!(
+                DeltaRatelimits.resolve_bucket(&*request),
+                (expected, None),
+                "{method} {path}"
+            );
+        }
+        assert_eq!(DeltaRatelimits.resolve_bucket_limit("prot_write"), 3);
+
+        // Through the fairing: limit 3, one counter for every write route
+        // and every target, distinct from the reads and from checkout
+        let contribute = client.post("/prot/channels/01AAA/contribute").dispatch();
+        assert_eq!(contribute.status(), Status::Ok);
+        assert_eq!(limit(&contribute), 3);
+        let tank = client.get("/prot/channels/01AAA/tank").dispatch();
+        assert_eq!(tank.status(), Status::Ok);
+        assert_eq!(limit(&tank), 20);
+        assert_ne!(
+            bucket(&tank),
+            bucket(&contribute),
+            "reading a tank must not spend the write budget"
+        );
+        let any = client.get("/sync/settings").dispatch();
+        assert_eq!(bucket(&tank), bucket(&any));
+
+        // A different channel, method and route (and the versioned prefix,
+        // which 404s here after the fairing has counted it) spend the same
+        // counter
+        let tier = client.put("/prot/channels/01BBB/tier").dispatch();
+        assert_eq!(tier.status(), Status::Ok);
+        assert_eq!(bucket(&tier), bucket(&contribute));
+        let versioned = client.post("/0.8/prot/goals/01GOL/pledges").dispatch();
+        assert_eq!(limit(&versioned), 3);
+        assert_eq!(bucket(&versioned), bucket(&contribute));
+
+        // Three writes fill the window; the fourth is refused, whatever the
+        // route
+        for request in [
+            client.delete("/prot/goals/01GOL/pledges/01PLG"),
+            client.put("/prot/servers/01SRV/contributor"),
+            client.post("/prot/goals/01OTHER/pledges"),
+        ] {
+            assert_eq!(request.dispatch().status(), Status::TooManyRequests);
+        }
+
+        // The reads, checkout and the admin route keep their own budgets
+        assert_eq!(
+            client.get("/prot/channels/01AAA/tank").dispatch().status(),
+            Status::Ok
+        );
+        let checkout = client.post("/payments/prot/checkout").dispatch();
+        assert_eq!(checkout.status(), Status::Ok);
+        assert_eq!(limit(&checkout), 3);
+        assert_ne!(bucket(&checkout), bucket(&contribute));
+        let terminate = client.post("/admin/prot/tanks/01TNK/terminate").dispatch();
+        assert_eq!(terminate.status(), Status::Ok);
+        assert_eq!(bucket(&terminate), bucket(&any));
     }
 
     #[test]
